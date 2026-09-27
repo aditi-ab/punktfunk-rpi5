@@ -246,7 +246,7 @@ impl Overlay for SkiaOverlay {
         // The console is built before the presenter, so the codec row starts optimistic.
         // This is the first moment the real device can answer, and it runs before any frame.
         if let Some(shell) = &mut self.shell {
-            shell.av1_ok = shared.av1_decode;
+            shell.device.av1_ok = shared.av1_decode;
         }
 
         let typeface = match_first_family(

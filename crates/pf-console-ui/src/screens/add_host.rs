@@ -73,7 +73,7 @@ impl AddHostScreen {
 
     /// A press outside the tray closes it; the row underneath is not activated.
     pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
-        if self.editing.is_some() && !ctx.deck {
+        if self.editing.is_some() && !ctx.device.deck {
             if !self.keyboard.covers(p) {
                 if p.press() {
                     self.editing = None;
@@ -184,7 +184,7 @@ impl AddHostScreen {
         fx: &mut Outbox,
     ) -> Option<MenuPulse> {
         if let Some(_field) = self.editing {
-            if ctx.deck {
+            if ctx.device.deck {
                 // Steam owns typing on Deck; the pad only dismisses the field.
                 return match ev {
                     MenuEvent::Back | MenuEvent::Confirm => {
@@ -277,7 +277,7 @@ impl AddHostScreen {
 
     pub(crate) fn hints(&self, ctx: &Ctx) -> Vec<Hint> {
         if self.editing.is_some() {
-            if ctx.deck {
+            if ctx.device.deck {
                 return vec![
                     Hint::new(HintKey::Key("STEAM + X"), "Keyboard"),
                     Hint::new(HintKey::Confirm, "Done"),
@@ -313,7 +313,9 @@ impl AddHostScreen {
             k,
         );
 
-        let seat = self.keyboard.seat(self.editing.is_some() && !ctx.deck, dt);
+        let seat = self
+            .keyboard
+            .seat(self.editing.is_some() && !ctx.device.deck, dt);
         let tray_h = if seat > 0.0 {
             (Keyboard::tray_height() + 12.0) * k * seat
         } else {
@@ -373,36 +375,12 @@ mod tests {
     use crate::screens::Nav;
     use pf_client_core::trust::Settings;
 
-    fn ctx<'a>(
-        settings: &'a mut Settings,
-        pads: &'a [pf_client_core::menu_nav::PadInfo],
-        library: &'a crate::library::LibraryShared,
-        deck: bool,
-    ) -> Ctx<'a> {
-        Ctx {
-            hosts: &[],
-            library,
-            settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads,
-            deck,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
-        }
-    }
-
     /// The field's plate carries on into the keyboard: it starts row-wide, then lands on a key.
     #[test]
     fn the_plate_glides_from_the_field_into_the_keyboard() {
         let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
-        let mut c = ctx(&mut settings, &[], &library, false);
+        let mut c = Ctx::test(&mut settings, &library);
         let mut s = AddHostScreen::new();
         let mut fx = Outbox::default();
         let fonts = crate::theme::build_fonts().unwrap();
@@ -433,7 +411,7 @@ mod tests {
     fn end_to_end_add_flow() {
         let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
-        let mut c = ctx(&mut settings, &[], &library, false);
+        let mut c = Ctx::test(&mut settings, &library);
         let mut s = AddHostScreen::new();
         let mut fx = Outbox::default();
 
@@ -485,7 +463,7 @@ mod tests {
             1.0,
             1.0 / 60.0,
             &fonts,
-            &mut ctx(&mut settings, &[], &library, false),
+            &mut Ctx::test(&mut settings, &library),
         );
         let row = s.list.row_rect(0).expect("the form drew");
         let drag = Pointer {
@@ -506,7 +484,14 @@ mod tests {
     fn deck_mode_never_uses_the_grid() {
         let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
-        let mut c = ctx(&mut settings, &[], &library, true);
+        let deck = crate::screens::Device {
+            deck: true,
+            ..crate::screens::Device::test()
+        };
+        let mut c = Ctx {
+            device: &deck,
+            ..Ctx::test(&mut settings, &library)
+        };
         let mut s = AddHostScreen::new();
         let mut fx = Outbox::default();
         s.list.cursor = 1;

@@ -1643,7 +1643,11 @@ impl LibraryScreen {
             None => grid_cell(this.cursor.max(0) as usize),
         };
         tree.set_focus((!this.quiet).then(|| games::zone_id(this.zone, field)));
-        let cheap = super::settings::reduce_ui_res(ctx.settings, ctx.platform, ctx.fallback_ui);
+        let cheap = super::settings::reduce_ui_res(
+            ctx.settings,
+            ctx.device.platform,
+            ctx.device.fallback_ui,
+        );
         if bleed {
             tree.paint_focus(canvas, frame, k as f32, dt, cheap);
         } else {
@@ -2128,28 +2132,6 @@ mod tests {
         (s, library)
     }
 
-    fn ctx<'a>(
-        library: &'a LibraryShared,
-        settings: &'a mut pf_client_core::trust::Settings,
-    ) -> Ctx<'a> {
-        Ctx {
-            hosts: &[],
-            library,
-            settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &[],
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "test",
-            t: 0.0,
-        }
-    }
-
     fn press(
         s: &mut LibraryScreen,
         library: &LibraryShared,
@@ -2157,7 +2139,7 @@ mod tests {
         ev: MenuEvent,
     ) -> (Option<MenuPulse>, Outbox) {
         let mut fx = Outbox::default();
-        let pulse = s.menu(ev, &mut ctx(library, settings), &mut fx);
+        let pulse = s.menu(ev, &mut Ctx::test(settings, library), &mut fx);
         (pulse, fx)
     }
 
@@ -2166,7 +2148,7 @@ mod tests {
         library: &LibraryShared,
         settings: &mut pf_client_core::trust::Settings,
     ) -> Vec<HintKey> {
-        s.hints(&ctx(library, settings))
+        s.hints(&Ctx::test(settings, library))
             .iter()
             .map(|h| h.key)
             .collect()
@@ -2241,7 +2223,7 @@ mod tests {
         );
         press(&mut s, &library, &mut settings, down());
         assert_eq!(s.zone, Zone::Grid);
-        s.adopt_settings(&ctx(&library, &mut settings));
+        s.adopt_settings(&Ctx::test(&mut settings, &library));
         assert_eq!(s.sort, crate::collate::SortKey::Title);
         assert_eq!(
             s.game(1).map(|g| g.title.as_str()),
@@ -2277,7 +2259,7 @@ mod tests {
         assert_eq!(s.zone, Zone::Bar(7));
         press(&mut s, &library, &mut settings, MenuEvent::Confirm);
         assert_eq!(settings.library_view, LibraryView::Grid.id());
-        s.adopt_settings(&ctx(&library, &mut settings));
+        s.adopt_settings(&Ctx::test(&mut settings, &library));
         assert_eq!(s.view_mode, LibraryView::Grid);
         assert!(s.snap_scroll, "a new arrangement seats rather than glides");
         assert_eq!(s.applied(), [0, 7]);
@@ -2291,22 +2273,26 @@ mod tests {
         let mut settings = shelf_settings();
         // The leading tile is the desktop, and it speaks the caption it draws.
         assert_eq!(
-            s.announcement(&ctx(&library, &mut settings)).as_deref(),
+            s.announcement(&Ctx::test(&mut settings, &library))
+                .as_deref(),
             Some("Desktop")
         );
         press(&mut s, &library, &mut settings, right());
         assert_eq!(
-            s.announcement(&ctx(&library, &mut settings)).as_deref(),
+            s.announcement(&Ctx::test(&mut settings, &library))
+                .as_deref(),
             Some("Zeta")
         );
         press(&mut s, &library, &mut settings, up());
         assert_eq!(
-            s.announcement(&ctx(&library, &mut settings)).as_deref(),
+            s.announcement(&Ctx::test(&mut settings, &library))
+                .as_deref(),
             Some("Sort Default, selected")
         );
         press(&mut s, &library, &mut settings, right());
         assert_eq!(
-            s.announcement(&ctx(&library, &mut settings)).as_deref(),
+            s.announcement(&Ctx::test(&mut settings, &library))
+                .as_deref(),
             Some("Sort A–Z")
         );
     }
@@ -2534,8 +2520,8 @@ mod tests {
                 })
                 .collect()
         };
-        s.adopt_settings(&ctx(&library, &mut settings));
-        let (bands, before) = s.bands(&ctx(&library, &mut settings));
+        s.adopt_settings(&Ctx::test(&mut settings, &library));
+        let (bands, before) = s.bands(&Ctx::test(&mut settings, &library));
         let sections: Vec<_> = bands.iter().map(|b| b.section).collect();
         use crate::library::Section;
         assert_eq!(
@@ -2550,8 +2536,8 @@ mod tests {
         assert!(!s.view.iter().any(|&i| s.games[i].launcher));
 
         settings.library_sections = "-launchers".into();
-        s.adopt_settings(&ctx(&library, &mut settings));
-        let (bands, _) = s.bands(&ctx(&library, &mut settings));
+        s.adopt_settings(&Ctx::test(&mut settings, &library));
+        let (bands, _) = s.bands(&Ctx::test(&mut settings, &library));
         assert!(bands.iter().all(|b| b.section != Section::Launchers));
         assert!(
             s.view.iter().any(|&i| s.games[i].launcher),
@@ -2849,7 +2835,7 @@ mod tests {
                 1.0,
                 1.0 / 60.0,
                 &fonts,
-                &mut ctx(library, settings),
+                &mut Ctx::test(settings, library),
             );
         }
         if let Ok(dir) = std::env::var("PF_GRID_DUMP") {
@@ -2926,7 +2912,7 @@ mod tests {
         let mut fx = Outbox::default();
         s.menu(
             MenuEvent::Move(MenuDir::Down),
-            &mut ctx(&library, &mut settings),
+            &mut Ctx::test(&mut settings, &library),
             &mut fx,
         );
         grid_frames(&mut s, &library, &mut settings, 120, "pan-3");
@@ -3343,7 +3329,7 @@ mod tests {
             scale: Some(2.25),
         };
         let mut s = games_tab(LibraryView::Grid, &full());
-        s.platform = crate::platform::Platform::Apple;
+        s.device.platform = crate::platform::Platform::Apple;
         let phone = |s: &mut Shell, frames: usize, name: &str| {
             let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
             for _ in 0..frames {

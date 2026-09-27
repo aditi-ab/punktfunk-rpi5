@@ -208,24 +208,11 @@ mod tests {
     #[test]
     fn toggling_sends_set_pin_for_the_focused_host() {
         let mut settings = Settings::default();
-        let pads = Vec::new();
         let library = crate::library::LibraryShared::default();
         let hosts = [host("aa", true, None), host("bb", true, None)];
         let mut ctx = Ctx {
             hosts: &hosts,
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
+            ..Ctx::test(&mut settings, &library)
         };
         let mut s = PinHostsScreen::new("p1".into(), "Work".into());
         let mut fx = Outbox::default();
@@ -253,25 +240,12 @@ mod tests {
     #[test]
     fn state_reads_from_the_models_pinned_rows() {
         let mut settings = Settings::default();
-        let pads = Vec::new();
         let library = crate::library::LibraryShared::default();
         // Primary "aa" plus a pinned-card row for p1: Confirm on the primary unpins.
         let hosts = [host("aa", true, None), host("aa\0p1", true, Some("p1"))];
         let mut ctx = Ctx {
             hosts: &hosts,
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
+            ..Ctx::test(&mut settings, &library)
         };
         let mut s = PinHostsScreen::new("p1".into(), "Work".into());
         assert_eq!(host_indices(&ctx).len(), 1);

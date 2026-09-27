@@ -179,7 +179,7 @@ fn run_verb(verb: Verb, h: &HostRow, ctx: &mut Ctx, fx: &mut Outbox) {
     match verb {
         Verb::Pair => fx.push(Screen::Pair(super::pair::PairScreen::new(
             h,
-            ctx.device_name,
+            &ctx.device.name,
         ))),
         Verb::Games => fx.tab = Some(crate::shell::Tab::Games),
         Verb::ConnectWith => fx.push(Screen::CardMenu(CardMenu::connect_with(h))),
@@ -450,7 +450,7 @@ impl HomeScreen {
                         fx.toast = Some("Scanning for hosts…".into());
                     }
                     Slot::Host(h) if !h.paired => fx.push(Screen::Pair(
-                        super::pair::PairScreen::new(h, ctx.device_name),
+                        super::pair::PairScreen::new(h, &ctx.device.name),
                     )),
                     Slot::Host(h) if !h.online && h.can_wake => {
                         // Wake first; the overlay connects once the host answers.
@@ -641,7 +641,11 @@ impl HomeScreen {
         ctx: &mut Ctx,
     ) {
         self.reconcile(ctx.hosts);
-        let reduced = super::settings::reduce_ui_res(ctx.settings, ctx.platform, ctx.fallback_ui);
+        let reduced = super::settings::reduce_ui_res(
+            ctx.settings,
+            ctx.device.platform,
+            ctx.device.fallback_ui,
+        );
         self.anim
             .step(f64::from(self.cursor), SPRING_K, SPRING_C, dt);
         self.anim.settle(f64::from(self.cursor), 0.001, 0.01);
@@ -1278,26 +1282,13 @@ mod tests {
             host("unpaired", false, true, false),
             host("asleep", true, false, true),
         ];
-        let pads: Vec<pf_client_core::menu_nav::PadInfo> = Vec::new();
 
         let mut s = HomeScreen::new();
         let mut fx = Outbox::default();
         let library = crate::library::LibraryShared::default();
         let mut ctx = Ctx {
             hosts: &hosts,
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "test",
-            t: 0.0,
+            ..Ctx::test(&mut settings, &library)
         };
         s.menu(MenuEvent::Confirm, &mut ctx, &mut fx);
         assert!(fx.connect.is_some());
@@ -1327,23 +1318,16 @@ mod tests {
     fn down_reaches_the_verbs_and_every_verb_is_one_press_away() {
         let mut settings = ctx_settings();
         let hosts = [host("paired", true, true, false)];
-        let pads: Vec<pf_client_core::menu_nav::PadInfo> = Vec::new();
         let library = crate::library::LibraryShared::default();
+        let device = crate::screens::Device {
+            platform: crate::platform::Platform::Android,
+            fallback_ui: true,
+            ..crate::screens::Device::test()
+        };
         let mut ctx = Ctx {
             hosts: &hosts,
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Android,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: true,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "test",
-            t: 0.0,
+            device: &device,
+            ..Ctx::test(&mut settings, &library)
         };
         let mut s = HomeScreen::new();
         let mut go = |s: &mut HomeScreen, ev: MenuEvent| {
@@ -1430,23 +1414,10 @@ mod tests {
             bitrate_kbps: None,
         });
         let hosts = [pinned];
-        let pads: Vec<pf_client_core::menu_nav::PadInfo> = Vec::new();
         let library = crate::library::LibraryShared::default();
         let mut ctx = Ctx {
             hosts: &hosts,
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "test",
-            t: 0.0,
+            ..Ctx::test(&mut settings, &library)
         };
         let mut s = HomeScreen::new();
         let mut fx = Outbox::default();
@@ -1465,23 +1436,10 @@ mod tests {
             running: "Elden Ring".into(),
             ..host("busy", true, true, false)
         }];
-        let pads: Vec<pf_client_core::menu_nav::PadInfo> = Vec::new();
         let library = crate::library::LibraryShared::default();
         let mut ctx = Ctx {
             hosts: &hosts,
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "test",
-            t: 0.0,
+            ..Ctx::test(&mut settings, &library)
         };
         let mut s = HomeScreen::new();
         let mut fx = Outbox::default();
@@ -1494,24 +1452,8 @@ mod tests {
     #[test]
     fn add_tile_is_always_last() {
         let mut settings = ctx_settings();
-        let pads: Vec<pf_client_core::menu_nav::PadInfo> = Vec::new();
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "test",
-            t: 0.0,
-        };
+        let mut ctx = Ctx::test(&mut settings, &library);
         let mut s = HomeScreen::new();
         let mut fx = Outbox::default();
         s.menu(MenuEvent::Confirm, &mut ctx, &mut fx);
@@ -1531,23 +1473,10 @@ mod tests {
             ..host("busy", true, true, false)
         };
         let hosts = [idle, busy];
-        let pads: Vec<pf_client_core::menu_nav::PadInfo> = Vec::new();
         let library = crate::library::LibraryShared::default();
         let ctx = Ctx {
             hosts: &hosts,
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "test",
-            t: 0.0,
+            ..Ctx::test(&mut settings, &library)
         };
         let confirm = |s: &HomeScreen| {
             s.hints(&ctx)
@@ -1574,23 +1503,10 @@ mod tests {
             host("c", true, true, false),
             host("d", true, true, false),
         ];
-        let pads: Vec<pf_client_core::menu_nav::PadInfo> = Vec::new();
         let library = crate::library::LibraryShared::default();
         let mut ctx = Ctx {
             hosts: &hosts,
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "test",
-            t: 0.0,
+            ..Ctx::test(&mut settings, &library)
         };
         let fonts = crate::theme::build_fonts().unwrap();
         let mut surface = skia_safe::surfaces::raster_n32_premul((1280, 800)).unwrap();

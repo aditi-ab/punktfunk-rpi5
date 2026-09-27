@@ -42,19 +42,13 @@ pub(crate) enum Bg {
     Form,
 }
 
-/// Per-event screen context. `settings` is mut — the settings screen persists in place.
-pub struct Ctx<'a> {
-    pub hosts: &'a [HostRow],
-    /// Live library slot; the top screen owns it.
-    pub library: &'a LibraryShared,
-    pub settings: &'a mut trust::Settings,
-    /// Persistence for `settings` and the preset catalog. A settings change goes through
-    /// [`Ctx::write`].
-    pub store: &'a dyn crate::store::SettingsStore,
+/// This device, from [`crate::shell::ConsoleOptions`]. Fixed for the shell's life but for
+/// `av1_ok`, which the overlay corrects before the first frame.
+#[derive(Clone, Debug)]
+pub struct Device {
     pub platform: crate::platform::Platform,
     /// This device's own screen ([`crate::shell::ConsoleOptions::screen`]).
     pub screen: Option<crate::shell::DeviceScreen>,
-    pub pads: &'a [PadInfo],
     /// Steam Deck: never draw our keyboard — Steam's types via SDL text input.
     pub deck: bool,
     /// A TV: no clipboard to copy to, no phone sensors ([`crate::shell::ConsoleOptions::tv`]).
@@ -69,9 +63,57 @@ pub struct Ctx<'a> {
     /// False marks the codec row's AV1 value unsupported: the Hello never asks for it.
     pub av1_ok: bool,
     /// Name the host stores this client under when pairing.
-    pub device_name: &'a str,
+    pub name: String,
+}
+
+/// Per-event screen context. `settings` is mut — the settings screen persists in place.
+pub struct Ctx<'a> {
+    pub hosts: &'a [HostRow],
+    /// Live library slot; the top screen owns it.
+    pub library: &'a LibraryShared,
+    pub settings: &'a mut trust::Settings,
+    /// Persistence for `settings` and the preset catalog. A settings change goes through
+    /// [`Ctx::write`].
+    pub store: &'a dyn crate::store::SettingsStore,
+    pub pads: &'a [PadInfo],
+    pub device: &'a Device,
     /// Shell clock in seconds (spinners, pulses).
     pub t: f64,
+}
+
+#[cfg(test)]
+impl Device {
+    /// A desktop that decodes everything, named `test`.
+    pub(crate) fn test() -> Device {
+        Device {
+            platform: crate::platform::Platform::Desktop,
+            screen: None,
+            deck: false,
+            tv: false,
+            fallback_ui: false,
+            pyrowave_ok: true,
+            av1_ok: true,
+            name: "test".into(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl<'a> Ctx<'a> {
+    /// [`Device::test`] over the file store, with no hosts or pads. Tests override the rest
+    /// by struct update.
+    pub(crate) fn test(settings: &'a mut trust::Settings, library: &'a LibraryShared) -> Ctx<'a> {
+        static DESKTOP: std::sync::LazyLock<Device> = std::sync::LazyLock::new(Device::test);
+        Ctx {
+            hosts: &[],
+            library,
+            settings,
+            store: crate::store::file_store(),
+            pads: &[],
+            device: &DESKTOP,
+            t: 0.0,
+        }
+    }
 }
 
 impl Ctx<'_> {

@@ -440,8 +440,10 @@ impl ShortcutEditorScreen {
             return;
         }
         ctx.write(|c| {
-            let mut cfg =
-                OverlayConfig::parse(&c.settings.overlay_actions, ring_platform(c.platform));
+            let mut cfg = OverlayConfig::parse(
+                &c.settings.overlay_actions,
+                ring_platform(c.device.platform),
+            );
             apply_draft(&mut cfg, &self.draft);
             c.settings.overlay_actions = cfg.to_json();
             true
@@ -455,8 +457,10 @@ impl ShortcutEditorScreen {
             return;
         };
         ctx.write(|c| {
-            let mut cfg =
-                OverlayConfig::parse(&c.settings.overlay_actions, ring_platform(c.platform));
+            let mut cfg = OverlayConfig::parse(
+                &c.settings.overlay_actions,
+                ring_platform(c.device.platform),
+            );
             remove_shortcut(&mut cfg, &id);
             c.settings.overlay_actions = cfg.to_json();
             true
@@ -548,7 +552,7 @@ impl ShortcutEditorScreen {
         fx: &mut Outbox,
     ) -> Option<MenuPulse> {
         if self.editing_name {
-            if ctx.deck {
+            if ctx.device.deck {
                 return match ev {
                     MenuEvent::Back | MenuEvent::Confirm => {
                         self.editing_name = false;
@@ -593,7 +597,7 @@ impl ShortcutEditorScreen {
     }
 
     pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
-        if self.editing_name && !ctx.deck {
+        if self.editing_name && !ctx.device.deck {
             if !self.keyboard.covers(p) {
                 if p.press() {
                     self.editing_name = false;
@@ -642,7 +646,7 @@ impl ShortcutEditorScreen {
 
     pub(crate) fn hints(&self, ctx: &Ctx) -> Vec<Hint> {
         if self.editing_name {
-            if ctx.deck {
+            if ctx.device.deck {
                 return vec![
                     Hint::new(HintKey::Key("STEAM + X"), "Keyboard"),
                     Hint::new(HintKey::Confirm, "Done"),
@@ -726,7 +730,9 @@ impl ShortcutEditorScreen {
         );
 
         // Shrink the list by whichever tray is seated so the edited row stays in view.
-        let seat_kb = self.keyboard.seat(self.editing_name && !ctx.deck, dt);
+        let seat_kb = self
+            .keyboard
+            .seat(self.editing_name && !ctx.device.deck, dt);
         let seat_keys = self.keys.seat(self.picking_key, dt);
         let tray_h = (Keyboard::tray_height() + 12.0) * k * seat_kb
             + (KeyTray::tray_height() + 12.0) * k * seat_keys;

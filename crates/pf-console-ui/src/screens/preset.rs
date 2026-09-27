@@ -298,7 +298,7 @@ impl PresetName {
                 self.editing = false;
                 return Some(MenuPulse::Confirm);
             }
-            if ctx.deck {
+            if ctx.device.deck {
                 return match ev {
                     MenuEvent::Confirm => self.save(ctx, fx),
                     _ => None,
@@ -335,7 +335,7 @@ impl PresetName {
     }
 
     pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
-        if self.editing && !ctx.deck {
+        if self.editing && !ctx.device.deck {
             if !self.keyboard.covers(p) {
                 if p.press() {
                     self.editing = false;
@@ -401,7 +401,7 @@ impl PresetName {
     }
 
     pub(crate) fn hints(&self, ctx: &Ctx) -> Vec<Hint> {
-        match (self.editing, ctx.deck) {
+        match (self.editing, ctx.device.deck) {
             (true, true) => vec![
                 Hint::new(HintKey::Key("STEAM + X"), "Keyboard"),
                 Hint::new(HintKey::Confirm, "Save"),
@@ -433,7 +433,7 @@ impl PresetName {
              cards it is pinned to.",
         );
         let below = blurb(canvas, fonts, text, rect, k);
-        let seat = self.keyboard.seat(self.editing && !ctx.deck, dt);
+        let seat = self.keyboard.seat(self.editing && !ctx.device.deck, dt);
         let tray_h = if seat > 0.0 {
             (Keyboard::tray_height() + 12.0) * k * seat
         } else {
@@ -616,22 +616,7 @@ mod tests {
     fn with_ctx<R>(f: impl FnOnce(&mut Ctx) -> R) -> R {
         let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &[],
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
-        };
+        let mut ctx = Ctx::test(&mut settings, &library);
         f(&mut ctx)
     }
 

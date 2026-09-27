@@ -985,22 +985,7 @@ mod tests {
         crate::screens::settings::tests::fake_home();
         let library = crate::library::LibraryShared::default();
         let mut settings = pf_client_core::trust::Settings::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &[],
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "test",
-            t: 0.0,
-        };
+        let mut ctx = Ctx::test(&mut settings, &library);
         let mut s = CustomizeScreen::new();
         let mut fx = Outbox::default();
         let mut press = |s: &mut CustomizeScreen, ev| s.menu(ev, &mut ctx, &mut fx);
@@ -1024,20 +1009,8 @@ mod tests {
         let store = crate::store::file_store();
         let mut settings = pf_client_core::trust::Settings::default();
         let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
             store,
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &[],
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "test",
-            t: 0.0,
+            ..Ctx::test(&mut settings, &library)
         };
         let writes: [fn(&mut Ctx); 3] = [
             |c| store_sort(crate::collate::SortKey::Title, c),

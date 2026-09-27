@@ -640,14 +640,14 @@ impl SettingsScreen {
             return;
         }
         ctx.write(|c| {
-            let ceiling_mbps = bitrate_ceiling_kbps(c.platform) / 1_000;
+            let ceiling_mbps = bitrate_ceiling_kbps(c.device.platform) / 1_000;
             c.settings.bitrate_kbps = mbps.min(ceiling_mbps) * 1000;
             true
         });
     }
 
     fn custom_menu(&mut self, ev: MenuEvent, ctx: &mut Ctx) -> Option<MenuPulse> {
-        if ctx.deck {
+        if ctx.device.deck {
             // Steam types via `text_input`; the pad only commits.
             return match ev {
                 MenuEvent::Back | MenuEvent::Confirm => {
@@ -702,7 +702,7 @@ impl SettingsScreen {
                 .1
                 .iter()
                 .copied()
-                .filter(|id| row_on(*id, ctx.platform) && row_applies(*id, ctx))
+                .filter(|id| row_on(*id, ctx.device.platform) && row_applies(*id, ctx))
                 .collect();
         }
         if self.presets.is_empty() {
@@ -800,7 +800,7 @@ impl SettingsScreen {
 
     /// Strip first: pills sit above the list, so a press there is never a row.
     pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
-        if self.custom_bitrate.is_some() && !ctx.deck {
+        if self.custom_bitrate.is_some() && !ctx.device.deck {
             if !self.keyboard.covers(p) {
                 if p.press() {
                     self.commit_custom(ctx);
@@ -1000,7 +1000,9 @@ impl SettingsScreen {
             // its own screen: that host sends no sections yet.
             RowId::Licenses => {
                 return match msg {
-                    ListMsg::Activate if ctx.platform == crate::platform::Platform::WebOS => {
+                    ListMsg::Activate
+                        if ctx.device.platform == crate::platform::Platform::WebOS =>
+                    {
                         fx.cmds.push(crate::model::ConsoleCmd::OpenPlatformScreen {
                             id: crate::platform::PlatformScreen::Licenses.id().to_string(),
                         });
@@ -1054,7 +1056,7 @@ impl SettingsScreen {
 
     pub(crate) fn hints(&self, ctx: &Ctx) -> Vec<Hint> {
         if self.custom_bitrate.is_some() {
-            if ctx.deck {
+            if ctx.device.deck {
                 return vec![
                     Hint::new(HintKey::Key("STEAM + X"), "Keyboard"),
                     Hint::new(HintKey::Confirm, "Done"),
@@ -1124,7 +1126,7 @@ impl SettingsScreen {
     ) {
         self.seat = self
             .keyboard
-            .seat(self.custom_bitrate.is_some() && !ctx.deck, dt);
+            .seat(self.custom_bitrate.is_some() && !ctx.device.deck, dt);
         self.sync_presets(ctx);
         let list_rect = self.list_rect(rect, k);
         let ids = self.row_ids(ctx);
@@ -1288,15 +1290,19 @@ pub fn row_applies(id: RowId, ctx: &Ctx) -> bool {
     match id {
         RowId::SmoothBuffer => ctx.settings.present_priority == "smooth",
         // Needs `fallback_ui`; otherwise off strands the user with no UI.
-        RowId::GamepadUi => ctx.fallback_ui,
+        RowId::GamepadUi => ctx.device.fallback_ui,
         // Hidden unless fallback_ui and the switch above is on. Sits below that
         // switch so the cursor is never on a row that vanishes. An Android TV
         // ignores the value (`GamepadUi.kt`: the tv term alone satisfies the OR);
         // webOS obeys it — a Magic Remote with no pad is why its cursor UI exists.
-        RowId::GamepadUiMode => ctx.fallback_ui && extra_bool(ctx.settings, GAMEPAD_UI_KEY, true),
+        RowId::GamepadUiMode => {
+            ctx.device.fallback_ui && extra_bool(ctx.settings, GAMEPAD_UI_KEY, true)
+        }
         // The phone's own motor, gyro and SC2 dongle: only a handheld sends its screen
         // (`ConsoleOptions::screen`), so a TV or a Mac never offers them.
-        RowId::PhoneRumble | RowId::PhoneGyro | RowId::Sc2Passthrough => ctx.screen.is_some(),
+        RowId::PhoneRumble | RowId::PhoneGyro | RowId::Sc2Passthrough => {
+            ctx.device.screen.is_some()
+        }
         // A Mac window has no background session; Android and the other Apple devices do.
         RowId::BackgroundKeepAlive => backgroundable(ctx),
         RowId::BackgroundTimeout => {
@@ -1316,7 +1322,9 @@ pub fn row_applies(id: RowId, ctx: &Ctx) -> bool {
 }
 
 fn backgroundable(ctx: &Ctx) -> bool {
-    ctx.platform != crate::platform::Platform::Apple || ctx.screen.is_some() || ctx.tv
+    ctx.device.platform != crate::platform::Platform::Apple
+        || ctx.device.screen.is_some()
+        || ctx.device.tv
 }
 
 /// Where a launch will actually land, named. Not the stored value: with no default host
@@ -1349,15 +1357,8 @@ pub fn row_spec(
             library: ctx.library,
             settings: &mut resolved,
             store: ctx.store,
-            platform: ctx.platform,
-            screen: None,
             pads: ctx.pads,
-            deck: ctx.deck,
-            tv: ctx.tv,
-            fallback_ui: ctx.fallback_ui,
-            pyrowave_ok: ctx.pyrowave_ok,
-            av1_ok: ctx.av1_ok,
-            device_name: ctx.device_name,
+            device: ctx.device,
             t: ctx.t,
         };
         let value = row_spec_base(id, &under, presets).value.unwrap_or_default();
@@ -1483,7 +1484,7 @@ pub(crate) fn preset_rows(ctx: &Ctx) -> Vec<(&'static str, RowId)> {
     (TABS.iter())
         .flat_map(|(tab, rows)| rows.iter().map(move |id| (*tab, *id)))
         .filter(|(_, id)| preset_field(*id).is_some())
-        .filter(|(_, id)| row_on(*id, ctx.platform) && row_applies(*id, ctx))
+        .filter(|(_, id)| row_on(*id, ctx.device.platform) && row_applies(*id, ctx))
         .collect()
 }
 
@@ -1616,7 +1617,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
             "Resolution",
             if s.match_window {
                 "Match window".into()
-            } else if safe_area(s, ctx.platform) {
+            } else if safe_area(s, ctx.device.platform) {
                 "Native (safe area)".into()
             } else if s.width == 0 {
                 "Native".into()
@@ -1625,11 +1626,11 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
             },
         ),
         RowId::Aspect => {
-            let fams = families(ctx.screen);
+            let fams = families(ctx.device.screen);
             (
                 None,
                 "Aspect ratio",
-                fams[family(s, &fams, ctx.platform)].label.into(),
+                fams[family(s, &fams, ctx.device.platform)].label.into(),
             )
         }
         RowId::Refresh => (
@@ -1674,12 +1675,12 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         RowId::Codec => (
             None,
             "Video codec",
-            if s.codec == "pyrowave" && !ctx.pyrowave_ok {
+            if s.codec == "pyrowave" && !ctx.device.pyrowave_ok {
                 "PyroWave (unsupported)".into()
-            } else if s.codec == "av1" && !ctx.av1_ok {
+            } else if s.codec == "av1" && !ctx.device.av1_ok {
                 "AV1 (unsupported)".into()
             } else {
-                label_for(codecs(ctx.platform), &s.codec).into()
+                label_for(codecs(ctx.device.platform), &s.codec).into()
             },
         ),
         // Migrate before lookup or a legacy store (`vulkan`/`vaapi`) shows "—".
@@ -1788,7 +1789,12 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         RowId::ReduceUiResolution => (
             None,
             "Reduce interface resolution",
-            on_off(reduce_ui_res(s, ctx.platform, ctx.fallback_ui)).into(),
+            on_off(reduce_ui_res(
+                s,
+                ctx.device.platform,
+                ctx.device.fallback_ui,
+            ))
+            .into(),
         ),
         RowId::LibraryView => (
             None,
@@ -1923,7 +1929,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
 /// One-line explainer. Platform so Android is not taught desktop-only chords.
 pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
     use crate::platform::Platform;
-    let platform = ctx.platform;
+    let platform = ctx.device.platform;
     match id {
         RowId::Resolution => {
             "The host creates a virtual display at exactly this size — no scaling. \
@@ -1952,11 +1958,11 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
         RowId::Compositor => {
             "Which compositor drives the virtual output — honored only if available on the host."
         }
-        RowId::Codec if ctx.settings.codec == "pyrowave" && !ctx.pyrowave_ok => {
+        RowId::Codec if ctx.settings.codec == "pyrowave" && !ctx.device.pyrowave_ok => {
             "This device can't decode PyroWave — it needs a Vulkan 1.3 GPU, which most TV \
              boxes don't have. The session streams HEVC instead."
         }
-        RowId::Codec if ctx.settings.codec == "av1" && !ctx.av1_ok => {
+        RowId::Codec if ctx.settings.codec == "av1" && !ctx.device.av1_ok => {
             "This device has no hardware AV1 decoder, so the client never asks for AV1 — \
              the session streams HEVC instead."
         }
@@ -2128,7 +2134,7 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
         RowId::BackgroundKeepAlive => {
             "Audio and the connection stay live when you switch away; video pauses."
         }
-        RowId::BackgroundTimeout if ctx.tv => {
+        RowId::BackgroundTimeout if ctx.device.tv => {
             "Ends a session left in the background after this long."
         }
         RowId::BackgroundTimeout => "Ends a backgrounded session so it can't run down the battery.",
@@ -2251,8 +2257,8 @@ fn audio_format_label(value: &str) -> &'static str {
 /// Step (`wrap=false`, clamp; `None` = boundary) or cycle (`wrap=true`).
 /// Toggles: left = off, right = on. A no-op is a boundary.
 pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
-    let platform = ctx.platform;
-    let fams = families(ctx.screen);
+    let platform = ctx.device.platform;
+    let fams = families(ctx.device.screen);
     let s = &mut *ctx.settings;
     match id {
         RowId::Resolution => {
@@ -2456,7 +2462,7 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         RowId::ReduceUiResolution => toggle_extra(
             s,
             reduce_ui_key(platform),
-            reduce_ui_default(platform, ctx.fallback_ui),
+            reduce_ui_default(platform, ctx.device.fallback_ui),
             delta,
             wrap,
         ),
@@ -2597,8 +2603,10 @@ pub(crate) mod tests {
     /// row has to say so or "Automatic" streams as DualSense with nothing explaining it.
     #[test]
     fn a_bound_preset_marks_the_row_it_overrides() {
-        let (mut settings, pads) = ctx_parts();
-        settings.gamepad = "auto".into();
+        let mut settings = Settings {
+            gamepad: "auto".into(),
+            ..Settings::default()
+        };
         let library = crate::library::LibraryShared::default();
         let desk = crate::model::HostRow {
             addr: "10.0.0.7".into(),
@@ -2613,19 +2621,7 @@ pub(crate) mod tests {
         let hosts = [desk];
         let ctx = Ctx {
             hosts: &hosts,
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
+            ..Ctx::test(&mut settings, &library)
         };
         let presets = vec![("p1".to_string(), "Living room".to_string())];
         let overrides = std::collections::HashMap::from([(
@@ -2650,6 +2646,50 @@ pub(crate) mod tests {
         assert!(
             !spec.dot && spec.note.is_none(),
             "a row the preset leaves alone carries no marker"
+        );
+    }
+
+    /// A preset's Aspect note names the pinned size's shape among this device's own, as the
+    /// row itself does.
+    #[test]
+    fn a_preset_aspect_note_labels_against_the_devices_shapes() {
+        let mut settings = Settings::default();
+        let library = crate::library::LibraryShared::default();
+        let hosts = [crate::model::HostRow {
+            bound_preset: Some(crate::model::PresetChip {
+                id: "p1".into(),
+                name: "Living room".into(),
+                accent: None,
+                bitrate_kbps: None,
+            }),
+            ..crate::model::HostRow::fixture("bb", "Desk")
+        }];
+        let phone = crate::screens::Device {
+            platform: crate::platform::Platform::Android,
+            screen: Some(crate::shell::DeviceScreen {
+                full: (3216, 1440),
+                safe: (3088, 1440),
+            }),
+            ..crate::screens::Device::test()
+        };
+        let ctx = Ctx {
+            hosts: &hosts,
+            device: &phone,
+            ..Ctx::test(&mut settings, &library)
+        };
+        let presets = vec![("p1".to_string(), "Living room".to_string())];
+        let overrides = std::collections::HashMap::from([(
+            "p1".to_string(),
+            SettingsOverlay {
+                width: Some(3216),
+                height: Some(1440),
+                ..Default::default()
+            },
+        )]);
+        let spec = row_spec(RowId::Aspect, &ctx, &presets, &overrides);
+        assert_eq!(
+            spec.note.as_deref(),
+            Some("Preset \u{201c}Living room\u{201d} on Desk: Screen")
         );
     }
 
@@ -2699,10 +2739,6 @@ pub(crate) mod tests {
         assert_eq!(REFRESH[0], 0, "index 0 must stay Automatic");
     }
 
-    fn ctx_parts() -> (Settings, Vec<pf_client_core::menu_nav::PadInfo>) {
-        (Settings::default(), Vec::new())
-    }
-
     /// Throwaway config dir: the screens read the preset catalog and the known hosts
     /// straight off it, and a test must not see the developer's own. Settings go through
     /// `store::file_store`, which in tests is per-thread and in memory.
@@ -2739,24 +2775,9 @@ pub(crate) mod tests {
         let fonts = crate::theme::build_fonts().unwrap();
         let h = 800i32;
         let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
-        let (mut settings, pads) = ctx_parts();
+        let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
-        };
+        let mut ctx = Ctx::test(&mut settings, &library);
         let k = f64::from(h) / 800.0;
         let rect = Rect::from_ltrb(0.0, 64.0, w as f32, h as f32 - 86.0);
         let dt = 1.0 / 60.0;
@@ -2774,24 +2795,9 @@ pub(crate) mod tests {
     }
 
     fn with_ctx(f: impl FnOnce(&mut Ctx)) {
-        let (mut settings, pads) = ctx_parts();
+        let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
-        };
+        let mut ctx = Ctx::test(&mut settings, &library);
         f(&mut ctx);
     }
 
@@ -2825,8 +2831,18 @@ pub(crate) mod tests {
     /// the same place that client's store and the shell's backdrop read.
     #[test]
     fn the_row_writes_the_platforms_own_key() {
-        with_ctx(|ctx| {
-            ctx.platform = crate::platform::Platform::WebOS;
+        let mut settings = Settings::default();
+        let library = crate::library::LibraryShared::default();
+        let webos = crate::screens::Device {
+            platform: crate::platform::Platform::WebOS,
+            ..crate::screens::Device::test()
+        };
+        let mut c = Ctx {
+            device: &webos,
+            ..Ctx::test(&mut settings, &library)
+        };
+        {
+            let ctx = &mut c;
             assert!(adjust(RowId::ReduceUiResolution, -1, false, ctx));
             assert_eq!(
                 ctx.settings
@@ -2839,10 +2855,19 @@ pub(crate) mod tests {
                 .settings
                 .extra
                 .contains_key("android.reduce_ui_resolution"));
-
-            // A phone defaults off, so stepping right writes an explicit On.
-            ctx.platform = crate::platform::Platform::Android;
-            ctx.fallback_ui = true;
+        }
+        // A phone defaults off, so stepping right writes an explicit On.
+        let phone = crate::screens::Device {
+            platform: crate::platform::Platform::Android,
+            fallback_ui: true,
+            ..crate::screens::Device::test()
+        };
+        let mut c = Ctx {
+            device: &phone,
+            ..c
+        };
+        {
+            let ctx = &mut c;
             assert!(adjust(RowId::ReduceUiResolution, 1, false, ctx));
             assert_eq!(
                 ctx.settings
@@ -2851,7 +2876,7 @@ pub(crate) mod tests {
                     .and_then(|v| v.as_bool()),
                 Some(true)
             );
-        });
+        }
     }
 
     #[test]
@@ -2897,25 +2922,10 @@ pub(crate) mod tests {
         let mut s = SettingsScreen::with_presets(Vec::new());
         rendered(&mut s);
         let first = s.list.row_rect(0).expect("the list drew its rows");
-        let (mut settings, pads) = ctx_parts();
+        let mut settings = Settings::default();
         crate::store::file_store().save(&settings); // `apply_row` rebases on the store
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
-        };
+        let mut ctx = Ctx::test(&mut settings, &library);
         assert_eq!(s.row_ids(&ctx)[0], RowId::Aspect);
         let mut fx = Outbox::default();
         assert_eq!(ctx.settings.width, 0);
@@ -2946,24 +2956,9 @@ pub(crate) mod tests {
     /// Speaker row: stored `"mix"` reads Off; a step writes only `"pad"` / `"off"`.
     #[test]
     fn controller_audio_rows_follow_forwarding_and_speak_the_gtk_dialect() {
-        let (mut settings, pads) = ctx_parts();
+        let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
-        };
+        let mut ctx = Ctx::test(&mut settings, &library);
         assert!(ctx.settings.pad_haptics);
         assert_eq!(ctx.settings.pad_speaker, "pad");
         assert!(adjust(RowId::PadHaptics, 1, true, &mut ctx));
@@ -2982,24 +2977,9 @@ pub(crate) mod tests {
 
     #[test]
     fn adjust_clamps_and_activate_wraps() {
-        let (mut settings, pads) = ctx_parts();
+        let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
-        };
+        let mut ctx = Ctx::test(&mut settings, &library);
         // Native (index 0): left refuses; right is Match window, then sizes.
         assert!(!adjust(RowId::Resolution, -1, false, &mut ctx));
         assert!(adjust(RowId::Resolution, 1, false, &mut ctx));
@@ -3026,26 +3006,19 @@ pub(crate) mod tests {
     /// moves off it by one step instead of snapping to Native.
     #[test]
     fn android_resolution_row_carries_the_safe_area_mode() {
-        let (mut settings, pads) = ctx_parts();
+        let mut settings = Settings::default();
         settings
             .extra
             .insert(device_keys::SAFE_AREA_MODE.into(), true.into());
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
+        let device = crate::screens::Device {
             platform: crate::platform::Platform::Android,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
             fallback_ui: true,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
+            ..crate::screens::Device::test()
+        };
+        let mut ctx = Ctx {
+            device: &device,
+            ..Ctx::test(&mut settings, &library)
         };
         let value = |ctx: &Ctx| row_spec(RowId::Resolution, ctx, &[], &Default::default()).value;
         let safe = |ctx: &Ctx| extra_bool(ctx.settings, device_keys::SAFE_AREA_MODE, false);
@@ -3070,24 +3043,9 @@ pub(crate) mod tests {
     /// Resolution row then steps inside that family only.
     #[test]
     fn aspect_row_switches_family_at_nearest_height() {
-        let (mut settings, pads) = ctx_parts();
+        let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
-        };
+        let mut ctx = Ctx::test(&mut settings, &library);
         let size = |ctx: &Ctx| (ctx.settings.width, ctx.settings.height);
         assert_eq!(
             row_spec(RowId::Aspect, &ctx, &[], &Default::default())
@@ -3119,26 +3077,19 @@ pub(crate) mod tests {
     /// (safe area) reads as the latter.
     #[test]
     fn a_phone_leads_the_aspect_row_with_its_own_shapes() {
-        let (mut settings, pads) = ctx_parts();
+        let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
+        let device = crate::screens::Device {
             platform: crate::platform::Platform::Android,
             screen: Some(crate::shell::DeviceScreen {
                 full: (3216, 1440),
                 safe: (3088, 1440),
             }),
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
+            ..crate::screens::Device::test()
+        };
+        let mut ctx = Ctx {
+            device: &device,
+            ..Ctx::test(&mut settings, &library)
         };
         let aspect = |ctx: &Ctx| {
             row_spec(RowId::Aspect, ctx, &[], &Default::default())
@@ -3164,25 +3115,12 @@ pub(crate) mod tests {
 
     #[test]
     fn toggles_read_left_off_right_on() {
-        let (mut settings, pads) = ctx_parts();
-        settings.mic_enabled = false;
-        let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
+        let mut settings = Settings {
+            mic_enabled: false,
+            ..Settings::default()
         };
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx::test(&mut settings, &library);
         assert!(
             !adjust(RowId::Mic, -1, false, &mut ctx),
             "already off = thud"
@@ -3195,26 +3133,13 @@ pub(crate) mod tests {
 
     #[test]
     fn echo_cancellation_follows_the_microphone() {
-        let (mut settings, pads) = ctx_parts();
-        settings.mic_enabled = false;
+        let mut settings = Settings {
+            mic_enabled: false,
+            ..Settings::default()
+        };
         assert!(settings.echo_cancel, "it ships on");
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
-        };
+        let mut ctx = Ctx::test(&mut settings, &library);
         assert!(!row_spec(RowId::EchoCancel, &ctx, &[], &Default::default()).enabled);
         assert!(
             !adjust(RowId::EchoCancel, -1, false, &mut ctx),
@@ -3234,28 +3159,27 @@ pub(crate) mod tests {
     /// The TV's codec row wraps from H.264 back to Automatic: no AV1, no PyroWave.
     #[test]
     fn webos_offers_only_the_codecs_ndl_decodes() {
-        let (mut settings, pads) = ctx_parts();
-        settings.codec = "h264".into();
+        let mut settings = Settings {
+            codec: "h264".into(),
+            ..Settings::default()
+        };
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
+        let device = crate::screens::Device {
             platform: crate::platform::Platform::WebOS,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
             fallback_ui: true,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
+            ..crate::screens::Device::test()
+        };
+        let mut ctx = Ctx {
+            device: &device,
+            ..Ctx::test(&mut settings, &library)
         };
         assert!(adjust(RowId::Codec, 1, true, &mut ctx));
         assert_eq!(ctx.settings.codec, "auto");
-        ctx.platform = crate::platform::Platform::Desktop;
+        let desktop = crate::screens::Device::test();
+        let mut ctx = Ctx {
+            device: &desktop,
+            ..ctx
+        };
         ctx.settings.codec = "h264".into();
         assert!(adjust(RowId::Codec, 1, true, &mut ctx));
         assert_eq!(ctx.settings.codec, "av1");
@@ -3265,24 +3189,20 @@ pub(crate) mod tests {
     /// reads: the value and the line under the list. The other codecs are untouched.
     #[test]
     fn pyrowave_reads_unsupported_where_the_gpu_cannot_decode_it() {
-        let (mut settings, pads) = ctx_parts();
-        settings.codec = "pyrowave".into();
+        let mut settings = Settings {
+            codec: "pyrowave".into(),
+            ..Settings::default()
+        };
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
+        let device = crate::screens::Device {
             platform: crate::platform::Platform::Android,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
             pyrowave_ok: false,
             av1_ok: false,
-            device_name: "t",
-            t: 0.0,
+            ..crate::screens::Device::test()
+        };
+        let ctx = Ctx {
+            device: &device,
+            ..Ctx::test(&mut settings, &library)
         };
         let value = row_spec(RowId::Codec, &ctx, &[], &Default::default())
             .value
@@ -3300,7 +3220,14 @@ pub(crate) mod tests {
         assert!(!detail(RowId::Codec, &ctx).contains("PyroWave"));
 
         ctx.settings.codec = "pyrowave".into();
-        ctx.pyrowave_ok = true;
+        let decodes = crate::screens::Device {
+            pyrowave_ok: true,
+            ..device.clone()
+        };
+        let ctx = Ctx {
+            device: &decodes,
+            ..ctx
+        };
         assert_eq!(
             row_spec(RowId::Codec, &ctx, &[], &Default::default())
                 .value
@@ -3313,24 +3240,18 @@ pub(crate) mod tests {
     /// says "AV1" is the bug (#1138): the value and the line under it both say it lost.
     #[test]
     fn av1_reads_unsupported_without_a_hardware_decoder() {
-        let (mut settings, pads) = ctx_parts();
-        settings.codec = "av1".into();
+        let mut settings = Settings {
+            codec: "av1".into(),
+            ..Settings::default()
+        };
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
+        let device = crate::screens::Device {
             av1_ok: false,
-            device_name: "t",
-            t: 0.0,
+            ..crate::screens::Device::test()
+        };
+        let ctx = Ctx {
+            device: &device,
+            ..Ctx::test(&mut settings, &library)
         };
         let value = row_spec(RowId::Codec, &ctx, &[], &Default::default())
             .value
@@ -3349,7 +3270,11 @@ pub(crate) mod tests {
         assert!(!detail(RowId::Codec, &ctx).contains("AV1"));
 
         ctx.settings.codec = "av1".into();
-        ctx.av1_ok = true;
+        let decodes = crate::screens::Device::test();
+        let ctx = Ctx {
+            device: &decodes,
+            ..ctx
+        };
         assert_eq!(
             row_spec(RowId::Codec, &ctx, &[], &Default::default())
                 .value
@@ -3360,26 +3285,13 @@ pub(crate) mod tests {
 
     #[test]
     fn bitrate_dims_under_pyrowave() {
-        let (mut settings, pads) = ctx_parts();
-        settings.codec = "pyrowave".into();
-        settings.bitrate_kbps = 80_000;
-        let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
+        let mut settings = Settings {
+            codec: "pyrowave".into(),
+            bitrate_kbps: 80_000,
+            ..Settings::default()
         };
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx::test(&mut settings, &library);
         assert!(!row_spec(RowId::Bitrate, &ctx, &[], &Default::default()).enabled);
         assert!(
             !adjust(RowId::Bitrate, 1, false, &mut ctx),
@@ -3395,25 +3307,10 @@ pub(crate) mod tests {
 
     #[test]
     fn smoothness_buffer_is_offered_only_under_smoothness() {
-        let (mut settings, pads) = ctx_parts();
+        let mut settings = Settings::default();
         assert_eq!(settings.present_priority, "latency", "the shipped default");
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
-        };
+        let mut ctx = Ctx::test(&mut settings, &library);
         let mut s = SettingsScreen::with_presets(Vec::new());
         s.tab = TABS
             .iter()
@@ -3466,27 +3363,14 @@ pub(crate) mod tests {
     fn a_shrinking_list_pulls_the_cursor_back() {
         // Seat the STORE with the shrunken list: `apply_row` rebases on it.
         fake_home();
-        let (mut settings, pads) = ctx_parts();
-        settings.present_priority = "latency".into();
+        let mut settings = Settings {
+            present_priority: "latency".into(),
+            ..Settings::default()
+        };
         crate::store::file_store().save(&settings);
         settings.present_priority = "smooth".into();
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
-        };
+        let mut ctx = Ctx::test(&mut settings, &library);
         let mut s = SettingsScreen::with_presets(Vec::new());
         s.tab = TABS
             .iter()
@@ -3504,25 +3388,10 @@ pub(crate) mod tests {
 
     #[test]
     fn touch_mode_steps_and_wraps() {
-        let (mut settings, pads) = ctx_parts();
+        let mut settings = Settings::default();
         assert_eq!(settings.touch_mode, "trackpad");
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
-        };
+        let mut ctx = Ctx::test(&mut settings, &library);
         assert!(
             !adjust(RowId::Touch, -1, false, &mut ctx),
             "already first = thud"
@@ -3540,25 +3409,10 @@ pub(crate) mod tests {
 
     #[test]
     fn mouse_mode_steps_and_wraps() {
-        let (mut settings, pads) = ctx_parts();
+        let mut settings = Settings::default();
         assert_eq!(settings.mouse_mode, "capture");
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
-        };
+        let mut ctx = Ctx::test(&mut settings, &library);
         assert!(
             !adjust(RowId::Mouse, -1, false, &mut ctx),
             "already first = thud"
@@ -3573,25 +3427,12 @@ pub(crate) mod tests {
     /// Off-ladder must not snap to Automatic (index 0). Step to the neighbour.
     #[test]
     fn an_off_ladder_rate_steps_to_its_neighbour() {
-        let (mut settings, pads) = ctx_parts();
-        settings.bitrate_kbps = 12_345;
-        let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
+        let mut settings = Settings {
+            bitrate_kbps: 12_345,
+            ..Settings::default()
         };
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx::test(&mut settings, &library);
         assert!(adjust(RowId::Bitrate, 1, false, &mut ctx));
         assert_eq!(ctx.settings.bitrate_kbps, 15_000, "the rung above");
         ctx.settings.bitrate_kbps = 12_345;
@@ -3606,25 +3447,13 @@ pub(crate) mod tests {
 
     #[test]
     fn a_typed_bitrate_is_stored_and_clamped() {
-        let (mut settings, pads) = ctx_parts();
+        let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
         // Snapshot, not the file store: this test saves.
         let store = crate::store::SnapshotStore::new(settings.clone(), Vec::new());
         let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
             store: &store,
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
+            ..Ctx::test(&mut settings, &library)
         };
         let mut s = SettingsScreen::with_presets(Vec::new());
         let mut fx = Outbox::default();
@@ -3668,7 +3497,7 @@ pub(crate) mod tests {
 
     #[test]
     fn preset_rows_navigate_instead_of_editing() {
-        let (mut settings, pads) = ctx_parts();
+        let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
         let mut pinned = crate::model::HostRow {
             key: crate::model::pinned_key("aa", "p1"),
@@ -3687,19 +3516,7 @@ pub(crate) mod tests {
         }];
         let mut ctx = Ctx {
             hosts: &hosts,
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
+            ..Ctx::test(&mut settings, &library)
         };
         let mut s = SettingsScreen::with_presets(vec![
             ("p1".into(), "Work".into()),
@@ -3741,24 +3558,9 @@ pub(crate) mod tests {
     /// With no presets the tab still offers New preset, which opens the name screen.
     #[test]
     fn empty_catalog_offers_a_new_preset() {
-        let (mut settings, pads) = ctx_parts();
+        let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
-        };
+        let mut ctx = Ctx::test(&mut settings, &library);
         let mut s = SettingsScreen::with_presets(Vec::new());
         s.tab = PRESETS_TAB;
         let ids = s.row_ids(&ctx);
@@ -3775,24 +3577,9 @@ pub(crate) mod tests {
 
     #[test]
     fn the_quick_actions_row_opens_the_editor_and_steps_nothing() {
-        let (mut settings, pads) = ctx_parts();
+        let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
-        };
+        let mut ctx = Ctx::test(&mut settings, &library);
         let row = row_spec(RowId::QuickActions, &ctx, &[], &Default::default());
         assert!(row.value.is_none(), "an action row");
         assert_eq!(row.label, "Quick actions");
@@ -3893,8 +3680,18 @@ pub(crate) mod tests {
 
     #[test]
     fn android_rows_live_in_extra() {
-        with_ctx(|ctx| {
-            ctx.platform = crate::platform::Platform::Android;
+        let mut settings = Settings::default();
+        let library = crate::library::LibraryShared::default();
+        let android = crate::screens::Device {
+            platform: crate::platform::Platform::Android,
+            ..crate::screens::Device::test()
+        };
+        let mut c = Ctx {
+            device: &android,
+            ..Ctx::test(&mut settings, &library)
+        };
+        {
+            let ctx = &mut c;
             let before = ctx.settings.clone();
             assert!(extra_bool(ctx.settings, device_keys::LOW_LATENCY, true));
             assert!(adjust(RowId::LowLatency, 1, true, ctx));
@@ -3910,28 +3707,42 @@ pub(crate) mod tests {
             let mut after = ctx.settings.clone();
             after.extra = before.extra.clone();
             assert_eq!(after, before);
-        });
+        }
     }
 
     #[test]
     fn console_off_switch_needs_a_fallback_ui() {
-        with_ctx(|ctx| {
-            ctx.platform = crate::platform::Platform::Android;
-            assert!(
-                !row_applies(RowId::GamepadUi, ctx),
-                "a TV offers no off switch"
-            );
-            assert!(!row_applies(RowId::GamepadUiMode, ctx));
-            ctx.fallback_ui = true;
-            assert!(row_applies(RowId::GamepadUi, ctx));
-            assert!(row_applies(RowId::GamepadUiMode, ctx));
-            set_extra_bool(ctx.settings, GAMEPAD_UI_KEY, false);
-            assert!(row_applies(RowId::GamepadUi, ctx));
-            assert!(
-                !row_applies(RowId::GamepadUiMode, ctx),
-                "the mode row decides nothing while the switch above it is off"
-            );
-        });
+        let mut settings = Settings::default();
+        let library = crate::library::LibraryShared::default();
+        let tv = crate::screens::Device {
+            platform: crate::platform::Platform::Android,
+            ..crate::screens::Device::test()
+        };
+        let ctx = Ctx {
+            device: &tv,
+            ..Ctx::test(&mut settings, &library)
+        };
+        assert!(
+            !row_applies(RowId::GamepadUi, &ctx),
+            "a TV offers no off switch"
+        );
+        assert!(!row_applies(RowId::GamepadUiMode, &ctx));
+        let phone = crate::screens::Device {
+            fallback_ui: true,
+            ..tv.clone()
+        };
+        let ctx = Ctx {
+            device: &phone,
+            ..ctx
+        };
+        assert!(row_applies(RowId::GamepadUi, &ctx));
+        assert!(row_applies(RowId::GamepadUiMode, &ctx));
+        set_extra_bool(ctx.settings, GAMEPAD_UI_KEY, false);
+        assert!(row_applies(RowId::GamepadUi, &ctx));
+        assert!(
+            !row_applies(RowId::GamepadUiMode, &ctx),
+            "the mode row decides nothing while the switch above it is off"
+        );
     }
 
     /// webOS bounds its own slider at 200 Mbps and clamps the document to it, so the shell
@@ -3951,8 +3762,17 @@ pub(crate) mod tests {
         );
 
         // Stepping up from the rung below the cap lands ON it and goes no further.
-        with_ctx(|ctx| {
-            ctx.platform = Platform::WebOS;
+        let mut settings = Settings::default();
+        let library = crate::library::LibraryShared::default();
+        let webos = crate::screens::Device {
+            platform: Platform::WebOS,
+            ..crate::screens::Device::test()
+        };
+        {
+            let ctx = &mut Ctx {
+                device: &webos,
+                ..Ctx::test(&mut settings, &library)
+            };
             ctx.settings.bitrate_kbps = 150_000;
             assert!(adjust(RowId::Bitrate, 1, false, ctx));
             assert_eq!(ctx.settings.bitrate_kbps, 200_000);
@@ -3964,7 +3784,7 @@ pub(crate) mod tests {
             // Down still works, so the cap is a ceiling and not a trap.
             assert!(adjust(RowId::Bitrate, -1, false, ctx));
             assert_eq!(ctx.settings.bitrate_kbps, 150_000);
-        });
+        }
 
         // The same step on a desktop keeps climbing.
         with_ctx(|ctx| {
@@ -4037,24 +3857,9 @@ pub(crate) mod tests {
 
     #[test]
     fn shoulders_cycle_tabs_and_keep_each_cursor() {
-        let (mut settings, pads) = ctx_parts();
+        let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
-        };
+        let mut ctx = Ctx::test(&mut settings, &library);
         let mut s = SettingsScreen::with_presets(Vec::new());
         let mut fx = Outbox::default();
         assert_eq!(s.tab, 0);
@@ -4076,24 +3881,9 @@ pub(crate) mod tests {
     /// TV remotes have no shoulders and no Tab key: Up from row 0 focuses the strip.
     #[test]
     fn dpad_alone_reaches_every_tab() {
-        let (mut settings, pads) = ctx_parts();
+        let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
-        };
+        let mut ctx = Ctx::test(&mut settings, &library);
         let mut s = SettingsScreen::with_presets(Vec::new());
         let mut fx = Outbox::default();
         assert_eq!(s.list.cursor, 0);
@@ -4121,26 +3911,11 @@ pub(crate) mod tests {
     #[test]
     fn audio_format_ships_off_and_follows_the_channel_count() {
         use pf_client_core::audio_format::{AUDIO_FORMAT_LOSSLESS_48, AUDIO_FORMAT_LOSSLESS_96};
-        let (mut settings, pads) = ctx_parts();
+        let mut settings = Settings::default();
         assert_eq!(settings.audio_format, AUDIO_FORMAT_OPUS, "off by default");
         assert_eq!(settings.audio_channels, 2, "…and the gate starts open");
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
-        };
+        let mut ctx = Ctx::test(&mut settings, &library);
         let mut s = SettingsScreen::with_presets(Vec::new());
         s.tab = TABS
             .iter()
@@ -4200,24 +3975,9 @@ pub(crate) mod tests {
 
     #[test]
     fn palette_row_names_the_pick_and_opens_the_cards() {
-        let (mut settings, pads) = ctx_parts();
+        let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
-        };
+        let mut ctx = Ctx::test(&mut settings, &library);
         assert_eq!(ctx.settings.ui_palette, "violet", "the brand default ships");
         assert_eq!(
             row_spec(RowId::Palette, &ctx, &[], &Default::default())
@@ -4265,23 +4025,11 @@ pub(crate) mod tests {
             Settings::default(),
             Vec::new(),
         ));
-        let (mut settings, pads) = ctx_parts();
+        let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
         let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
             store: store.as_ref(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
+            ..Ctx::test(&mut settings, &library)
         };
         let value = |ctx: &Ctx| {
             row_spec(RowId::StartIn, ctx, &[], &Default::default())
@@ -4330,14 +4078,22 @@ pub(crate) mod tests {
     #[test]
     fn the_phone_rows_need_the_phones_screen() {
         let phone_rows = [RowId::PhoneRumble, RowId::PhoneGyro, RowId::Sc2Passthrough];
-        with_ctx(|ctx| {
-            assert!(phone_rows.iter().all(|id| !row_applies(*id, ctx)));
-            ctx.screen = Some(crate::shell::DeviceScreen {
+        let mut settings = Settings::default();
+        let library = crate::library::LibraryShared::default();
+        let ctx = Ctx::test(&mut settings, &library);
+        assert!(phone_rows.iter().all(|id| !row_applies(*id, &ctx)));
+        let phone = crate::screens::Device {
+            screen: Some(crate::shell::DeviceScreen {
                 full: (2796, 1290),
                 safe: (2796, 1290),
-            });
-            assert!(phone_rows.iter().all(|id| row_applies(*id, ctx)));
-        });
+            }),
+            ..crate::screens::Device::test()
+        };
+        let ctx = Ctx {
+            device: &phone,
+            ..ctx
+        };
+        assert!(phone_rows.iter().all(|id| row_applies(*id, &ctx)));
     }
 
     /// An OS that answers takes the row's place; no answer puts the row back.
@@ -4359,10 +4115,27 @@ pub(crate) mod tests {
     #[test]
     fn the_background_rows_follow_the_device() {
         use crate::platform::Platform;
-        with_ctx(|ctx| {
-            ctx.platform = Platform::Apple;
-            assert!(!row_applies(RowId::BackgroundKeepAlive, ctx), "a Mac");
-            ctx.tv = true;
+        let mut settings = Settings::default();
+        let library = crate::library::LibraryShared::default();
+        let mac = crate::screens::Device {
+            platform: Platform::Apple,
+            ..crate::screens::Device::test()
+        };
+        let c = Ctx {
+            device: &mac,
+            ..Ctx::test(&mut settings, &library)
+        };
+        assert!(!row_applies(RowId::BackgroundKeepAlive, &c), "a Mac");
+        let apple_tv = crate::screens::Device {
+            tv: true,
+            ..mac.clone()
+        };
+        let mut c = Ctx {
+            device: &apple_tv,
+            ..c
+        };
+        {
+            let ctx = &mut c;
             assert!(row_applies(RowId::BackgroundKeepAlive, ctx), "an Apple TV");
             assert!(!row_applies(RowId::BackgroundTimeout, ctx), "switch off");
             assert!(adjust(RowId::BackgroundKeepAlive, 1, true, ctx));
@@ -4374,13 +4147,19 @@ pub(crate) mod tests {
                 !adjust(RowId::BackgroundTimeout, 1, false, ctx),
                 "30 is the top"
             );
-            ctx.platform = Platform::Android;
-            ctx.tv = false;
-            assert!(
-                row_applies(RowId::BackgroundKeepAlive, ctx),
-                "an Android phone"
-            );
-        });
+        }
+        let android = crate::screens::Device {
+            platform: Platform::Android,
+            ..crate::screens::Device::test()
+        };
+        let c = Ctx {
+            device: &android,
+            ..c
+        };
+        assert!(
+            row_applies(RowId::BackgroundKeepAlive, &c),
+            "an Android phone"
+        );
     }
 
     /// The two row-to-field maps agree: a row names an overlay field exactly when an overlay

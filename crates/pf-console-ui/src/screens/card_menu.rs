@@ -476,7 +476,7 @@ impl CardMenu {
                 _ => {}
             }
         }
-        let actions = self.actions(ctx.store, ctx.tv);
+        let actions = self.actions(ctx.store, ctx.device.tv);
         let (msg, pulse) = self.list.menu(ev, actions.len());
         self.dispatch(msg, pulse, &actions, ctx, fx)
     }
@@ -493,7 +493,7 @@ impl CardMenu {
                 self.strip_focus = false;
             }
         }
-        let actions = self.actions(ctx.store, ctx.tv);
+        let actions = self.actions(ctx.store, ctx.device.tv);
         let (msg, pulse) = self.list.pointer(p, actions.len());
         if matches!(msg, ListMsg::None) && pulse.is_none() {
             return false;
@@ -594,7 +594,7 @@ impl CardMenu {
             }
             Action::Pair => fx.replace(Screen::Pair(super::pair::PairScreen::new(
                 self.host(),
-                ctx.device_name,
+                &ctx.device.name,
             ))),
             Action::AddHost => {
                 let host = self.host();
@@ -824,7 +824,7 @@ impl CardMenu {
         };
         let strip_top = list_rect.top;
         list_rect.top += strip_h as f32;
-        let actions = self.actions(ctx.store, ctx.tv);
+        let actions = self.actions(ctx.store, ctx.device.tv);
         let rows: Vec<RowSpec> = actions
             .iter()
             .map(|&a| {
@@ -934,22 +934,7 @@ mod tests {
         fake_home();
         let mut settings = crate::store::file_store().load();
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &[],
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "test",
-            t: 0.0,
-        };
+        let mut ctx = Ctx::test(&mut settings, &library);
         f(&mut ctx)
     }
 

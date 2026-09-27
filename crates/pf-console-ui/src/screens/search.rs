@@ -102,7 +102,7 @@ impl SearchScreen {
                 self.editing = false;
                 return Some(MenuPulse::Confirm);
             }
-            if ctx.deck {
+            if ctx.device.deck {
                 // Steam types on a Deck; the pad only searches or dismisses.
                 return match ev {
                     MenuEvent::Confirm => self.search(fx),
@@ -137,7 +137,7 @@ impl SearchScreen {
 
     /// A press outside the tray closes it; the row underneath is not activated.
     pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
-        if self.editing && !ctx.deck {
+        if self.editing && !ctx.device.deck {
             if !self.keyboard.covers(p) {
                 if p.press() {
                     self.editing = false;
@@ -192,7 +192,7 @@ impl SearchScreen {
     }
 
     pub(crate) fn hints(&self, ctx: &Ctx) -> Vec<Hint> {
-        match (self.editing, ctx.deck) {
+        match (self.editing, ctx.device.deck) {
             (true, true) => vec![
                 Hint::new(HintKey::Key("STEAM + X"), "Keyboard"),
                 Hint::new(HintKey::Confirm, "Search"),
@@ -226,7 +226,7 @@ impl SearchScreen {
             rect,
             k,
         );
-        let seat = self.keyboard.seat(self.editing && !ctx.deck, dt);
+        let seat = self.keyboard.seat(self.editing && !ctx.device.deck, dt);
         let tray_h = if seat > 0.0 {
             (Keyboard::tray_height() + 12.0) * k * seat
         } else {
@@ -271,21 +271,13 @@ mod tests {
     fn with_ctx<R>(deck: bool, f: impl FnOnce(&mut Ctx) -> R) -> R {
         let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &[],
+        let device = crate::screens::Device {
             deck,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
+            ..crate::screens::Device::test()
+        };
+        let mut ctx = Ctx {
+            device: &device,
+            ..Ctx::test(&mut settings, &library)
         };
         f(&mut ctx)
     }

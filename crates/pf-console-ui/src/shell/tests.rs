@@ -1906,7 +1906,7 @@ fn dump_console_screens() {
     // Android + keys: OK/↩ badges, section pointer, hidden Y/X, remote chip. Platform
     // flip is legends-only; the stack was built desktop.
     dump(&mut s, 30, 8, "_remote-settle", true);
-    s.platform = crate::platform::Platform::Android;
+    s.device.platform = crate::platform::Platform::Android;
     s.note_input_source(crate::console::InputSource::Keys);
     dump(&mut s, 40, 8, "11-home-remote", false);
     s.handle_menu(MenuEvent::Tertiary);
@@ -2053,7 +2053,7 @@ fn store_shots() {
             stack,
         )
         .unwrap();
-        s.platform = crate::platform::Platform::Android;
+        s.device.platform = crate::platform::Platform::Android;
         s.settings.ui_palette = "violet".into();
         s.fake_clock = Some((0.0, 1.0 / 60.0));
         s
@@ -3261,7 +3261,7 @@ fn dump_phone_home() {
     };
     let (mut s, console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
     s.fake_clock = Some((0.0, 1.0 / 60.0));
-    s.platform = crate::platform::Platform::Apple;
+    s.device.platform = crate::platform::Platform::Apple;
     let dump = |s: &mut Shell, frames: usize, name: &str| {
         let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
         for _ in 0..frames {
@@ -3277,7 +3277,7 @@ fn dump_phone_home() {
     dump(&mut s, 60, "p0-no-hosts");
     let (mut s, console, library) = shell(vec![Screen::Home(HomeScreen::new())]);
     s.fake_clock = Some((0.0, 1.0 / 60.0));
-    s.platform = crate::platform::Platform::Apple;
+    s.device.platform = crate::platform::Platform::Apple;
     dump(&mut s, 60, "p1-home-empty");
     let games = (0..8)
         .map(|i| crate::library::LibraryGame {

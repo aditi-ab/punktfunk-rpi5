@@ -168,7 +168,7 @@ impl PairScreen {
         fx: &mut Outbox,
     ) -> Option<MenuPulse> {
         if self.editing.is_some() {
-            if ctx.deck {
+            if ctx.device.deck {
                 return match ev {
                     MenuEvent::Back | MenuEvent::Confirm => {
                         self.editing = None;
@@ -215,7 +215,7 @@ impl PairScreen {
     /// Raised keyboard is modal: hits on it stay here; a press outside closes it rather
     /// than reaching the row underneath.
     pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
-        if self.editing.is_some() && !ctx.deck {
+        if self.editing.is_some() && !ctx.device.deck {
             if !self.keyboard.covers(p) {
                 if p.press() {
                     self.editing = None;
@@ -281,7 +281,7 @@ impl PairScreen {
                             port: self.port,
                             pin: self.pin.trim().to_string(),
                             device_name: if self.device.trim().is_empty() {
-                                ctx.device_name.to_string()
+                                ctx.device.name.clone()
                             } else {
                                 self.device.trim().to_string()
                             },
@@ -303,7 +303,7 @@ impl PairScreen {
 
     pub(crate) fn hints(&self, ctx: &Ctx) -> Vec<Hint> {
         if self.editing.is_some() {
-            if ctx.deck {
+            if ctx.device.deck {
                 return vec![
                     Hint::new(HintKey::Key("STEAM + X"), "Keyboard"),
                     Hint::new(HintKey::Confirm, "Done"),
@@ -339,7 +339,9 @@ impl PairScreen {
         };
         let below = blurb(canvas, fonts, intro, rect, k);
 
-        let seat = self.keyboard.seat(self.editing.is_some() && !ctx.deck, dt);
+        let seat = self
+            .keyboard
+            .seat(self.editing.is_some() && !ctx.device.deck, dt);
         let tray_h = if seat > 0.0 {
             (Keyboard::tray_height() + 12.0) * k * seat
         } else {
@@ -463,26 +465,17 @@ mod tests {
     #[test]
     fn pair_submits_with_pin_and_device_fallback() {
         let mut settings = Settings::default();
-        let pads = Vec::new();
         let library = crate::library::LibraryShared::default();
+        let device = crate::screens::Device {
+            name: "living-room-deck".into(),
+            ..crate::screens::Device::test()
+        };
         let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "living-room-deck",
-            t: 0.0,
+            device: &device,
+            ..Ctx::test(&mut settings, &library)
         };
         let mut s = PairScreen::new(&host(), "living-room-deck");
-        s.device.clear(); // empty field falls back to `ctx.device_name`
+        s.device.clear(); // empty field falls back to `&ctx.device.name`
         s.editing = Some(Field::Pin);
         s.text_input("1234");
         s.edit_key(crate::input::Key::Return);
@@ -505,23 +498,14 @@ mod tests {
         let mut host = host();
         host.fp_hex = "abcd".into();
         let mut settings = Settings::default();
-        let pads = Vec::new();
         let library = crate::library::LibraryShared::default();
+        let device = crate::screens::Device {
+            name: "deck".into(),
+            ..crate::screens::Device::test()
+        };
         let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "deck",
-            t: 0.0,
+            device: &device,
+            ..Ctx::test(&mut settings, &library)
         };
         let mut s = PairScreen::new(&host, "deck");
         assert_eq!(s.roles().len(), 4, "Request Access + PIN + Device + Pair");

@@ -281,24 +281,11 @@ mod tests {
     #[test]
     fn choosing_a_preset_binds_and_no_default_clears() {
         let mut settings = Settings::default();
-        let pads = Vec::new();
         let library = crate::library::LibraryShared::default();
         let hosts = [host(Some("p1"))];
         let mut ctx = Ctx {
             hosts: &hosts,
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
+            ..Ctx::test(&mut settings, &library)
         };
         let mut s = screen();
         let mut fx = Outbox::default();
@@ -332,24 +319,11 @@ mod tests {
     #[test]
     fn re_choosing_the_current_binding_is_a_boundary_not_a_command() {
         let mut settings = Settings::default();
-        let pads = Vec::new();
         let library = crate::library::LibraryShared::default();
         let hosts = [host(Some("p1"))];
         let mut ctx = Ctx {
             hosts: &hosts,
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
+            ..Ctx::test(&mut settings, &library)
         };
         let mut s = screen();
         let mut fx = Outbox::default();
@@ -362,19 +336,7 @@ mod tests {
         let mut settings = Settings::default();
         let mut ctx = Ctx {
             hosts: &hosts,
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
+            ..Ctx::test(&mut settings, &library)
         };
         let mut s = screen();
         let mut fx = Outbox::default();
@@ -388,7 +350,6 @@ mod tests {
     #[test]
     fn a_title_binds_its_own_preset_and_reads_its_own_checkmark() {
         let mut settings = Settings::default();
-        let pads = Vec::new();
         let library = crate::library::LibraryShared::default();
         // Host bound to p1, title already bound to p2 — the two must not be confused.
         let mut row = host(Some("p1"));
@@ -397,19 +358,7 @@ mod tests {
         let hosts = [row];
         let mut ctx = Ctx {
             hosts: &hosts,
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
+            ..Ctx::test(&mut settings, &library)
         };
         let mut s = BindPresetScreen::for_game(
             "aa".into(),
