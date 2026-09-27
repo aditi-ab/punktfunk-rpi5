@@ -11,6 +11,7 @@ use pf_bitstream::h264::AuPlan;
 use pf_bitstream::h264::PicId;
 use pf_bitstream::h264::RefPic;
 
+use crate::slots::Removals;
 use crate::slots::SlotError;
 use crate::slots::SlotMap;
 
@@ -239,22 +240,9 @@ pub fn plan_to_vk(
         );
     }
 
-    // Mutations last (fn docs). Removals are not applied here.
-    // The AU's own picture can appear in `removed`: a non-reference with no
-    // free frame buffer is stored-and-evicted in one plan. Assign it, then
-    // release immediately — deferring would hand the caller the decode target.
-    let setup_evicted = plan.dpb.removed.contains(&setup_id);
-    let release_after_decode: Vec<PicId> = plan
-        .dpb
-        .removed
-        .iter()
-        .copied()
-        .filter(|id| *id != setup_id)
-        .collect();
-    let setup_slot = slots.assign(setup_id)?;
-    if setup_evicted {
-        slots.release(setup_id);
-    }
+    // Mutations last (fn docs). Removals are deferred, not applied here.
+    let (setup_slot, release_after_decode) =
+        slots.commit_setup(setup_id, &plan.dpb.removed, Removals::Defer)?;
 
     Ok(DecodePlanVk {
         std_pic,

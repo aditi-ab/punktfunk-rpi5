@@ -22,6 +22,7 @@ use pf_bitstream::h265::RefPic;
 use pf_bitstream::h265::RefRpsIdxError;
 use tracing::trace;
 
+use crate::slots::Removals;
 use crate::slots::SlotError;
 use crate::slots::SlotMap;
 
@@ -338,23 +339,8 @@ pub fn plan_to_vk_h265(
         );
     }
 
-    // Mutations last. Removals first (they were real regardless of this AU),
-    // then setup; release immediately if this plan already evicted the stored
-    // picture — the slot must still exist for the decode itself.
-    let setup_evicted = plan.dpb.removed.contains(&setup_id);
-    for &id in &plan.dpb.removed {
-        if id == setup_id {
-            continue;
-        }
-        if !slots.release(id) {
-            // Reachable only when the caller skipped an AU's plan through this map.
-            trace!(id, "DpbUpdate removed an id this SlotMap never assigned");
-        }
-    }
-    let setup_slot = slots.assign(setup_id)?;
-    if setup_evicted {
-        slots.release(setup_id);
-    }
+    // Mutations last. Removals first: they were real regardless of this AU.
+    let (setup_slot, _) = slots.commit_setup(setup_id, &plan.dpb.removed, Removals::ReleaseNow)?;
 
     Ok(DecodePlanVkH265 {
         std_pic,

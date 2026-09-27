@@ -32,6 +32,7 @@ use crate::va::VA_PICTURE_H264_SHORT_TERM_REFERENCE;
 use crate::va::VA_SLICE_DATA_FLAG_ALL;
 use crate::SlotError;
 use crate::SlotMap;
+use pf_bitstream::slots::Removals;
 
 /// H.264 DPB ceiling and `reference_frames` length. Overflow is a malformed
 /// plan, not an expressiveness limit.
@@ -359,19 +360,7 @@ pub fn plan_to_va(
         slices.push(rec);
     }
 
-    // A non-reference picture with no free frame buffer is stored and evicted in
-    // one plan. Assign so the decode has a surface, then release.
-    let setup_evicted = plan.dpb.removed.contains(&setup_id);
-    for &id in &plan.dpb.removed {
-        if id == setup_id {
-            continue;
-        }
-        let _ = slots.release(id);
-    }
-    let setup_slot = slots.assign(setup_id)?;
-    if setup_evicted {
-        slots.release(setup_id);
-    }
+    let (setup_slot, _) = slots.commit_setup(setup_id, &plan.dpb.removed, Removals::ReleaseNow)?;
 
     let curr_pic = VaPictureH264 {
         picture_id: setup_surface,

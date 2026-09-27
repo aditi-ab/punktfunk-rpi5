@@ -24,6 +24,7 @@ use std::ops::Range;
 use pf_bitstream::h264::AuPlan;
 use pf_bitstream::h264::PicId;
 use pf_bitstream::h264::RefPic;
+use pf_bitstream::slots::Removals;
 use pf_bitstream::slots::SlotError;
 use pf_bitstream::slots::SlotMap;
 use tracing::trace;
@@ -385,22 +386,9 @@ pub fn plan_to_dxva(
 
     let slice_ranges: Vec<Range<usize>> = plan.slices.iter().map(|s| s.data.clone()).collect();
 
-    // Mutations last (fn docs). Removals are not applied here.
-    // The AU's own picture can appear in `removed`: a non-reference with no
-    // free frame buffer is stored-and-evicted in one plan. Assign it, then
-    // release immediately — deferring would hand the caller the decode target.
-    let setup_evicted = plan.dpb.removed.contains(&setup_id);
-    let release_after_decode: Vec<PicId> = plan
-        .dpb
-        .removed
-        .iter()
-        .copied()
-        .filter(|id| *id != setup_id)
-        .collect();
-    let setup_slot = slots.assign(setup_id)?;
-    if setup_evicted {
-        slots.release(setup_id);
-    }
+    // Mutations last (fn docs). Removals are deferred, not applied here.
+    let (setup_slot, release_after_decode) =
+        slots.commit_setup(setup_id, &plan.dpb.removed, Removals::Defer)?;
     // AssociatedFlag is the bottom-field flag; 0 under the progressive envelope.
     pp.CurrPic = PicEntry::new(setup_slot, false);
 

@@ -26,6 +26,7 @@ use pf_bitstream::h265::AuPlan;
 use pf_bitstream::h265::PicId;
 use pf_bitstream::h265::RefPic;
 use pf_bitstream::h265::RefRpsIdxError;
+use pf_bitstream::slots::Removals;
 use pf_bitstream::slots::SlotError;
 use pf_bitstream::slots::SlotMap;
 use tracing::trace;
@@ -516,23 +517,9 @@ pub fn plan_to_dxva_h265(
 
     let slice_ranges: Vec<Range<usize>> = plan.slices.iter().map(|s| s.data.clone()).collect();
 
-    // Mutations last, after every fallible step. Removals first — they were real
-    // regardless of this AU's fate — then the setup assignment, released
-    // immediately when this plan already evicted the stored picture (the surface
-    // must still exist for the decode itself).
-    let setup_evicted = plan.dpb.removed.contains(&setup_id);
-    for &id in &plan.dpb.removed {
-        if id == setup_id {
-            continue;
-        }
-        if !slots.release(id) {
-            trace!(id, "DpbUpdate removed an id this SlotMap never assigned");
-        }
-    }
-    let setup_slot = slots.assign(setup_id)?;
-    if setup_evicted {
-        slots.release(setup_id);
-    }
+    // Mutations last, after every fallible step. Removals first: they were real
+    // regardless of this AU's fate.
+    let (setup_slot, _) = slots.commit_setup(setup_id, &plan.dpb.removed, Removals::ReleaseNow)?;
     pp.CurrPic = PicEntry::new(setup_slot, false);
 
     Ok(DecodePlanDxvaH265 {

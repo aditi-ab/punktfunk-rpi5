@@ -37,6 +37,7 @@ use crate::va_h265::VA_PICTURE_HEVC_RPS_ST_CURR_AFTER;
 use crate::va_h265::VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE;
 use crate::SlotError;
 use crate::SlotMap;
+use pf_bitstream::slots::Removals;
 
 /// Everything one HEVC `vaRenderPicture` sequence needs.
 #[derive(Debug, Clone)]
@@ -339,18 +340,7 @@ pub fn plan_to_va_h265(
     }
 
     // Slot mutations only after every fallible step has passed.
-
-    let setup_evicted = plan.dpb.removed.contains(&setup_id);
-    for &id in &plan.dpb.removed {
-        if id == setup_id {
-            continue;
-        }
-        let _ = slots.release(id);
-    }
-    let setup_slot = slots.assign(setup_id)?;
-    if setup_evicted {
-        slots.release(setup_id);
-    }
+    let (setup_slot, _) = slots.commit_setup(setup_id, &plan.dpb.removed, Removals::ReleaseNow)?;
     let pic_params = VaPictureParameterBufferHEVC {
         curr_pic: VaPictureHEVC {
             picture_id: setup_surface,
