@@ -397,6 +397,35 @@ mod tests {
         assert!(verify(&bent, &nonce, &s).is_err());
     }
 
+    /// The `Hello` a browser opens a session with.
+    fn hello(name: &str, launch: Option<&str>) -> Hello {
+        use punktfunk_core::config::{CompositorPref, GamepadPref};
+        Hello {
+            abi_version: punktfunk_core::WIRE_VERSION,
+            mode: punktfunk_core::Mode {
+                width: 1280,
+                height: 720,
+                refresh_hz: 60,
+            },
+            compositor: CompositorPref::Auto,
+            gamepad: GamepadPref::Auto,
+            bitrate_kbps: 0,
+            name: Some(name.into()),
+            launch: launch.map(Into::into),
+            video_caps: 0,
+            audio_channels: 2,
+            video_codecs: 0,
+            preferred_codec: 0,
+            display_hdr: None,
+            client_caps: 0,
+            max_shard_payload: 0,
+            audio_rate_hz: punktfunk_core::audio::SAMPLE_RATE_HZ,
+            audio_bits: punktfunk_core::audio::pcm::BITS_16,
+            audio_layout: 0,
+            video_fit: 0,
+        }
+    }
+
     /// One browser dial over loopback WebTransport, up to admission. The browser's end is
     /// returned too: dropping it would close the session under the test.
     async fn admit_over_loopback(
@@ -466,37 +495,12 @@ mod tests {
     /// and the console's approval admits this same connection.
     #[tokio::test]
     async fn an_unpaired_browser_knocks_and_approval_admits_it() {
-        use punktfunk_core::config::{CompositorPref, GamepadPref};
         let np = store("knock");
         let s = serving(np.clone());
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
         let fp_hex = hex::encode(sha256(&key.subject_public_key_info()));
-        let hello = Hello {
-            abi_version: punktfunk_core::WIRE_VERSION,
-            mode: punktfunk_core::Mode {
-                width: 1280,
-                height: 720,
-                refresh_hz: 60,
-            },
-            compositor: CompositorPref::Auto,
-            gamepad: GamepadPref::Auto,
-            bitrate_kbps: 0,
-            name: Some("Safari on Mac".into()),
-            launch: None,
-            video_caps: 0,
-            audio_channels: 2,
-            video_codecs: 0,
-            preferred_codec: 0,
-            display_hdr: None,
-            client_caps: 0,
-            max_shard_payload: 0,
-            audio_rate_hz: punktfunk_core::audio::SAMPLE_RATE_HZ,
-            audio_bits: punktfunk_core::audio::pcm::BITS_16,
-            audio_layout: 0,
-            video_fit: 0,
-        };
-
-        let (_browser, admitted) = admit_over_loopback(&s, &key, &hello.encode()).await;
+        let first = hello("Safari on Mac", None).encode();
+        let (_browser, admitted) = admit_over_loopback(&s, &key, &first).await;
         let label = admitted.knock.expect("an unpaired device knocks");
         assert_eq!(label, "Safari on Mac");
 
@@ -523,5 +527,57 @@ mod tests {
             0,
             "the admitted session holds its slot again"
         );
+    }
+
+    /// A browser reads why the host refused it: WebKit shows a page nothing of a close reason, so
+    /// the typed refusal rides a stream. Here the device may not launch titles, and asks to.
+    #[tokio::test]
+    async fn a_browser_reads_why_its_launch_was_refused() {
+        use punktfunk_core::quic::{Refused, GRANT_ALL, GRANT_LAUNCH};
+        let np = store("refused");
+        let s = serving(np.clone());
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let no_launch = crate::native_pairing::Access {
+            grants: GRANT_ALL & !GRANT_LAUNCH,
+            expires_unix: None,
+            until_disconnect: false,
+        };
+        let fp_hex = hex::encode(sha256(&key.subject_public_key_info()));
+        np.add_with_access("Enrico's browser", &fp_hex, Some(no_launch))
+            .unwrap();
+
+        let first = hello("Safari on Mac", Some("steam:570")).encode();
+        let (browser, admitted) = admit_over_loopback(&s, &key, &first).await;
+        let Admitted {
+            link,
+            tx,
+            rx,
+            first,
+            ..
+        } = admitted;
+        let SessionLink::Web(host, _) = &link else {
+            unreachable!("a browser's link")
+        };
+        let plane = DataPlane::Web(WebTransportPlane::new(host.clone()));
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = sem.try_acquire_owned().unwrap();
+        let session = crate::native::run_admitted(
+            link.clone(),
+            CtlSend::Web(tx),
+            CtlRecv::Web(rx),
+            first,
+            &s.host,
+            plane,
+            permit,
+        );
+        let read = async {
+            let mut uni = browser.accept_uni().await.unwrap();
+            Refused::decode(&read_msg(&mut uni).await.unwrap()).unwrap()
+        };
+        let (ended, said) = tokio::join!(session, read);
+        assert!(ended.is_err(), "the session is refused");
+        let why = RejectReason::LaunchNotPermitted;
+        assert_eq!(said.code, why.close_code());
+        assert_eq!(said.reason, why.to_string());
     }
 }

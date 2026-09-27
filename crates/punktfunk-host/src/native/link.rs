@@ -171,6 +171,15 @@ impl SessionLink {
         self.quic().close(code.into(), reason);
     }
 
+    /// Close with a typed code and its reason. A browser is never shown a close reason, so it
+    /// gets the same code and text on a stream first.
+    pub(crate) async fn refuse(&self, code: u32, reason: &str) {
+        if let SessionLink::Web(c, _) = self {
+            crate::webtransport::refuse(c, code, reason).await;
+        }
+        self.close(code, reason.as_bytes());
+    }
+
     /// Resolves when the peer is gone.
     pub(crate) async fn closed(&self) -> LinkClosed {
         LinkClosed::from(self.quic().closed().await)

@@ -388,7 +388,7 @@ async fn session(
 
 /// Say why on a fresh unidirectional stream, then give the browser a moment to read it. The
 /// close that follows carries no retransmit, so the wait is what makes the message arrive.
-async fn refuse(connection: &wtransport::Connection, code: u32, reason: &str) {
+pub(crate) async fn refuse(connection: &wtransport::Connection, code: u32, reason: &str) {
     let msg = punktfunk_core::quic::Refused {
         code,
         reason: reason.to_string(),
