@@ -16,14 +16,14 @@
 
 use super::policy::{intra_refresh_period, intra_refresh_requested, ltr_test_force_at};
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
-use crate::retrieve::Ready;
+use crate::retrieve::{AuQueue, FirstAuLog, RetrieveThread};
 use anyhow::{anyhow, bail, Context, Result};
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use windows::core::{w, Interface, PCWSTR};
 use windows::Win32::Foundation::{HMODULE, LUID};
 use windows::Win32::Graphics::Direct3D11::{
@@ -584,7 +584,7 @@ unsafe fn get_prop_i64(comp: *mut sys::AmfComponent, name: PCWSTR) -> Option<i64
 const RING: usize = 6;
 
 /// Process-wide count of successful `Init`s. A climbing number with no following first-AU log
-/// ([`Inner::note_first_au`]) is a silent VCN-session wedge.
+/// ([`FirstAuLog`]) is a silent VCN-session wedge.
 static AMF_CONTEXTS_OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// How long the retrieve thread lets `QueryOutput` block before it looks at the stop flag. The
@@ -592,91 +592,39 @@ static AMF_CONTEXTS_OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// on an idle encoder.
 const QUERY_TIMEOUT_MS: i64 = 50;
 
-/// What the retrieve thread and the encode thread share. The component is deliberately not in
-/// here: AMF documents `SubmitInput` and `QueryOutput` as a thread pair, so only the two queues
-/// need a lock, and it is never held across a `QueryOutput`.
-#[derive(Default)]
-struct Out {
-    /// `(pts_ns, forced-IDR, recovery-anchor)` in submit order — `submit` pushes, the retrieve
-    /// thread pops. Its length is the surfaces AMF still holds, which is what back-pressure reads.
-    pending: VecDeque<(u64, bool, bool)>,
-    /// Finished AUs waiting for `poll`.
-    ready: VecDeque<EncodedFrame>,
-    /// First typed `QueryOutput` failure. `poll` surfaces it so the caller resets, exactly as it
-    /// did when the call was on the encode thread.
-    err: Option<String>,
-}
+/// What the retrieve thread and the encode thread share: `(pts_ns, forced-IDR, recovery-anchor)`
+/// per submitted frame. The component is deliberately not in here: AMF documents `SubmitInput` and
+/// `QueryOutput` as a thread pair, so only the queue needs a lock, and it is never held across a
+/// `QueryOutput`.
+type OutQueue = AuQueue<(u64, bool, bool)>;
 
-/// The retrieve thread and its signal. It owns every `QueryOutput` on the component, so the
-/// encode thread never waits on VCN — it takes finished AUs off a queue, and a caller that parks
-/// on handles takes [`Ready`] instead.
+/// The retrieve thread and its queue. The thread owns every `QueryOutput` on the component, so
+/// the encode thread never waits on VCN — it takes finished AUs off the queue, and a caller that
+/// parks on handles takes the queue's signal instead.
 ///
 /// Dropping this stops and joins, which must happen before the component is terminated under it:
 /// [`Inner`] declares it first for exactly that reason, and [`AmfEncoder::reset`] stops it by
 /// hand around the in-place re-Init.
 struct Retrieve {
-    out: Arc<Mutex<Out>>,
-    have: Arc<Ready>,
-    stop: Arc<AtomicBool>,
-    join: Option<std::thread::JoinHandle<()>>,
+    q: Arc<OutQueue>,
+    thread: RetrieveThread,
 }
 
 impl Retrieve {
     /// Start a thread draining `comp`. `blocking` says `QueryTimeout` took, so the loop parks in
     /// `QueryOutput` instead of sampling.
     fn start(comp: *mut sys::AmfComponent, props: &CodecProps, blocking: bool) -> Result<Self> {
-        let out: Arc<Mutex<Out>> = Arc::default();
-        let have = Arc::new(Ready::new().ok_or_else(|| anyhow!("AMF: no completion event"))?);
-        let stop = Arc::new(AtomicBool::new(false));
+        let q = Arc::new(OutQueue::new("AMF")?);
         let (comp, odt, okm) = (
             comp as usize,
             props.output_data_type.0 as usize,
             props.output_key_max,
         );
-        let (t_out, t_have, t_stop) = (out.clone(), have.clone(), stop.clone());
-        let join = std::thread::Builder::new()
-            .name("punktfunk-amf-out".into())
-            .spawn(move || retrieve_loop(comp, odt, okm, blocking, t_out, t_have, t_stop))
-            .context("spawn AMF retrieve thread")?;
-        Ok(Self {
-            out,
-            have,
-            stop,
-            join: Some(join),
-        })
-    }
-
-    /// Surfaces AMF still holds — the back-pressure reading.
-    fn in_flight(&self) -> usize {
-        lock(&self.out).pending.len()
-    }
-
-    /// Retire the thread and wait for it to leave `QueryOutput`. Idempotent; the queues survive
-    /// so a caller can inspect them, and [`Self::reset_queues`] is what empties them.
-    fn stop_and_join(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
-    }
-
-    /// Forfeit everything owed — a re-Init voids the reference chain, so the AUs behind it are
-    /// no longer decodable against what the client holds.
-    fn reset_queues(&self) {
-        let mut g = lock(&self.out);
-        g.pending.clear();
-        g.ready.clear();
-        g.err = None;
-        self.have.clear();
-    }
-}
-
-impl Drop for Retrieve {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
+        let t_q = q.clone();
+        let thread = RetrieveThread::spawn("punktfunk-amf-out", move |stop| {
+            retrieve_loop(comp, odt, okm, blocking, &t_q, &stop)
+        })?;
+        Ok(Self { q, thread })
     }
 }
 
@@ -688,9 +636,8 @@ fn retrieve_loop(
     output_data_type: usize,
     output_key_max: i64,
     blocking: bool,
-    out: Arc<Mutex<Out>>,
-    have: Arc<Ready>,
-    stop: Arc<AtomicBool>,
+    q: &OutQueue,
+    stop: &AtomicBool,
 ) {
     pf_frame::thread_qos::boost_thread_priority(false);
     let comp = comp as *mut sys::AmfComponent;
@@ -700,26 +647,27 @@ fn retrieve_loop(
         // anything terminates it; this thread makes every `QueryOutput` call on it.
         match unsafe { drain_one_output(comp, odt, output_key_max) } {
             Ok(DrainOutcome::Frame { data, key_prop }) => {
-                let mut g = lock(&out);
+                let mut g = q.lock();
                 // An AU with no submit behind it would pair every later AU with the wrong
                 // pts, keyframe flag and anchor; that is a reset, never a renumbering.
                 let Some((pts_ns, forced, recovery_anchor)) = g.pending.pop_front() else {
-                    g.err
-                        .get_or_insert_with(|| "AMF produced an AU with no submit pending".into());
-                    have.set();
+                    q.fail(&mut g, || {
+                        "AMF produced an AU with no submit pending".into()
+                    });
                     return;
                 };
-                g.ready.push_back(EncodedFrame {
-                    data,
-                    pts_ns,
-                    keyframe: key_prop || forced,
-                    recovery_anchor,
-                    recovery_point: false,
-                    recovery_close: false,
-                    chunk_aligned: false,
-                });
-                // Under the lock, so it cannot race the clear `poll` does when it empties.
-                have.set();
+                q.publish(
+                    &mut g,
+                    EncodedFrame {
+                        data,
+                        pts_ns,
+                        keyframe: key_prop || forced,
+                        recovery_anchor,
+                        recovery_point: false,
+                        recovery_close: false,
+                        chunk_aligned: false,
+                    },
+                );
             }
             // `flush` owns the queue across a drain; a clear here could land on a frame queued
             // behind the Drain. EOF repeats on every call while the component sits drained and
@@ -737,9 +685,7 @@ fn retrieve_loop(
                 }
             }
             Err(e) => {
-                let mut g = lock(&out);
-                g.err.get_or_insert_with(|| format!("{e:#}"));
-                have.set();
+                q.fail(&mut q.lock(), || format!("{e:#}"));
                 return;
             }
         }
@@ -774,54 +720,7 @@ struct Inner {
     held: VecDeque<ID3D11Texture2D>,
     /// Last `*InHDRMetadata` pushed to this component — re-push on change or rebuild.
     hdr_pushed: Option<pf_frame::HdrMeta>,
-    /// Gates the one-shot first-AU log. Absence after a context-created line is a VCN wedge.
-    first_au_logged: bool,
-}
-
-impl Inner {
-    /// One-shot first-AU log. Pairs a context-created line with proof VCN actually encodes.
-    fn note_first_au(&mut self, au: &EncodedFrame) {
-        if !self.first_au_logged {
-            self.first_au_logged = true;
-            tracing::info!(
-                bytes = au.data.len(),
-                keyframe = au.keyframe,
-                "AMF produced its first AU on this context"
-            );
-        }
-    }
-
-    /// The oldest finished AU, or the retrieve thread's failure. Clears the signal as the queue
-    /// empties — under the same lock the thread sets it under, so the two cannot cross.
-    fn pop_ready(&mut self) -> Result<Option<EncodedFrame>> {
-        let mut g = lock(&self.retrieve.out);
-        if let Some(e) = g.err.take() {
-            bail!("{e}");
-        }
-        let au = g.ready.pop_front();
-        if g.ready.is_empty() {
-            self.retrieve.have.clear();
-        }
-        Ok(au)
-    }
-
-    /// [`Self::pop_ready`], waiting up to `wait_ms` for the thread to produce one. The bounded
-    /// wait every caller of `poll` already expected, now a handle wait rather than a sample loop.
-    fn take_ready(&mut self, wait_ms: u32) -> Result<Option<EncodedFrame>> {
-        if let Some(au) = self.pop_ready()? {
-            return Ok(Some(au));
-        }
-        if !self.retrieve.have.wait(wait_ms) {
-            return Ok(None);
-        }
-        self.pop_ready()
-    }
-}
-
-/// The queue lock, poison-tolerant: a retrieve thread that panicked leaves the AUs it already
-/// handed over readable, and its error field is what tells `poll` to reset.
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|p| p.into_inner())
+    first_au: FirstAuLog,
 }
 
 pub struct AmfEncoder {
@@ -1330,7 +1229,7 @@ impl AmfEncoder {
                 next: 0,
                 held: VecDeque::new(),
                 hdr_pushed: None,
-                first_au_logged: false,
+                first_au: FirstAuLog::new("AMF produced its first AU on this context"),
             });
             Ok(())
         }
@@ -1726,25 +1625,10 @@ impl AmfEncoder {
         // a wedge. No progress for the whole budget is a genuine wedge.
         // In place, the caller's declared depth is the bound; copying, it is our own ring.
         let cap = in_place.unwrap_or(RING);
-        if inner.retrieve.in_flight() >= cap {
-            let deadline = std::time::Instant::now() + INPUT_DRAIN_BUDGET;
-            // The retrieve thread is what frees a slot now; this only waits for it, and a whole
-            // budget with no progress is the same wedge it always was.
-            while inner.retrieve.in_flight() >= cap {
-                if let Some(e) = lock(&inner.retrieve.out).err.take() {
-                    bail!("{e}");
-                }
-                if std::time::Instant::now() >= deadline {
-                    bail!(
-                        "AMF produced no output for {} ms with {} frame(s) in flight — \
-                         wedged (escalating to reset)",
-                        INPUT_DRAIN_BUDGET.as_millis(),
-                        inner.retrieve.in_flight()
-                    );
-                }
-                std::thread::sleep(std::time::Duration::from_micros(250));
-            }
-        }
+        inner
+            .retrieve
+            .q
+            .wait_until(INPUT_DRAIN_BUDGET, "AMF output", |o| o.pending.len() < cap)?;
         let slot = inner.next % RING;
         inner.next += 1;
         // SAFETY: `src`/`dst` are same-format, same-size, same-device (ring rebuilt on device
@@ -1873,7 +1757,10 @@ impl AmfEncoder {
             // Queued before the component takes the frame: the retrieve thread can pop for it the
             // moment SubmitInput returns, so a push after that races an empty queue. A refusal
             // below takes the entry back off.
-            lock(&inner.retrieve.out)
+            inner
+                .retrieve
+                .q
+                .lock()
                 .pending
                 .push_back((captured.pts_ns, forced, recovery_anchor));
             let mut r = ((*(*inner.comp.0).vtbl).submit_input)(inner.comp.0, surf.0);
@@ -1892,7 +1779,7 @@ impl AmfEncoder {
             }
             // NEED_MORE_INPUT = accepted; no AU owed for this submit alone.
             if !matches!(r, sys::AMF_OK | sys::AMF_NEED_MORE_INPUT) {
-                lock(&inner.retrieve.out).pending.pop_back();
+                inner.retrieve.q.lock().pending.pop_back();
                 if r == sys::AMF_INPUT_FULL {
                     bail!("AMF SubmitInput stayed AMF_INPUT_FULL past the drain budget — wedged");
                 }
@@ -2018,9 +1905,9 @@ impl Encoder for AmfEncoder {
             // The same bound as before, now spent on the retrieve thread's event rather than on
             // a sample loop, so nothing else on this thread waits behind it.
             let budget_ms = (750 / self.fps.max(1)).clamp(1, 12);
-            let au = inner.take_ready(budget_ms)?;
+            let au = inner.retrieve.q.take_ready(budget_ms)?;
             if let Some(au) = &au {
-                inner.note_first_au(au);
+                inner.first_au.note(au);
             }
             au
         };
@@ -2034,7 +1921,7 @@ impl Encoder for AmfEncoder {
     /// The retrieve thread's signal, once a component exists. Before the lazy open there is
     /// nothing to wait on, which a caller reads as "no completion signal" and polls instead.
     fn ready_event(&self) -> Option<isize> {
-        self.inner.as_ref().map(|i| i.retrieve.have.raw())
+        self.inner.as_ref().map(|i| i.retrieve.q.raw())
     }
 
     /// Take the caller's promise about its own texture ring. At 2 or more this skips the
@@ -2081,8 +1968,8 @@ impl Encoder for AmfEncoder {
             .expect("inner is Some — checked above and not cleared since");
         // Stop and join before Terminate: the retrieve thread is inside `QueryOutput` on this
         // very component, and a re-Init under it would run against a terminated one.
-        inner.retrieve.stop_and_join();
-        inner.retrieve.reset_queues(); // owed AUs forfeited; rebuilt stream restarts at IDR
+        inner.retrieve.thread.stop_and_join();
+        inner.retrieve.q.reset(); // owed AUs forfeited; rebuilt stream restarts at IDR
         inner.held.clear(); // the joined thread proves nothing is reading them
         inner.next = 0; // the rebuilt component's first frame is `opening` again
         inner.hdr_pushed = None; // re-Init'd component needs HDR metadata again
@@ -2214,10 +2101,10 @@ impl Encoder for AmfEncoder {
         // frame submitted after this can be paired with one. Past the budget the component is
         // at end-of-stream, so what is still owed never comes: those entries are stale.
         let deadline = std::time::Instant::now() + INPUT_DRAIN_BUDGET;
-        while inner.retrieve.in_flight() > 0 && std::time::Instant::now() < deadline {
+        while inner.retrieve.q.in_flight() > 0 && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_micros(250));
         }
-        let stale = std::mem::take(&mut lock(&inner.retrieve.out).pending).len();
+        let stale = std::mem::take(&mut inner.retrieve.q.lock().pending).len();
         if stale > 0 {
             tracing::warn!(stale, "AMF drain left frames without an AU");
         }
