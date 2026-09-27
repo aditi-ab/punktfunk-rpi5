@@ -1474,39 +1474,7 @@ fn pw_thread(
                     if ud.tx.try_send(samples).is_err() && ud.active.load(Ordering::Relaxed) {
                         ud.stats.dropped_chunks += 1;
                     }
-                    if ud.last_stats.elapsed() >= crate::audio::capture_policy::STATS_EVERY {
-                        let (peak_db, rms_db, delivered_pct) =
-                            ud.stats.summary(ud.last_stats.elapsed(), ud.rate_hz);
-                        if ud.stats.dropped_chunks > 0 {
-                            tracing::warn!(
-                                dropped_chunks = ud.stats.dropped_chunks,
-                                "the audio encode thread could not keep up — captured audio was \
-                                 DROPPED; the stream will click and everything after it shifts"
-                            );
-                        }
-                        tracing::info!(
-                            peak_db = format!("{peak_db:.1}"),
-                            rms_db = format!("{rms_db:.1}"),
-                            delivered_pct = format!("{delivered_pct:.0}"),
-                            // Shape of the `delivered_pct` shortfall: one long
-                            // hole and three hundred short ones share a percentage.
-                            gaps = ud.stats.gaps,
-                            max_gap_ms = ud.stats.max_gap_ms(),
-                            // Buckets under 20/50/100 ms and ≥ 100 ms, plus the
-                            // audio they cost. `gaps=60` does not distinguish them.
-                            gap_hist = %ud.stats.gap_hist(),
-                            missing_ms = ud.stats.missing_ms(),
-                            // Time our node was not in the graph. `gaps` cannot
-                            // see it; without this a pause and a starve match.
-                            pauses = ud.stats.pauses,
-                            paused_ms = ud.stats.paused_ms(),
-                            missed_dequeues = ud.stats.missed_dequeues,
-                            dropped_chunks = ud.stats.dropped_chunks,
-                            "desktop audio capture"
-                        );
-                        ud.stats = Default::default();
-                        ud.last_stats = std::time::Instant::now();
-                    }
+                    ud.stats.flush_window(&mut ud.last_stats, ud.rate_hz, None);
                 }));
                 if outcome.is_err() {
                     tracing::error!("panic in pipewire audio callback — chunk dropped");

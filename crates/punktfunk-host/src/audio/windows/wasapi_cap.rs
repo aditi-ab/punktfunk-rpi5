@@ -16,7 +16,7 @@
 //!
 //! Pin: `design/hi-res-audio.md`, [`super::wiring_plan`], [`super::audio_control`].
 
-use super::capture_policy::{CaptureStats, FightDamper, FIGHT_BACKOFF, STATS_EVERY};
+use super::capture_policy::{CaptureStats, FightDamper, FIGHT_BACKOFF};
 use super::{audio_control, voice_route, wiring_plan, AudioCapturer, SAMPLE_RATE};
 use anyhow::{anyhow, Context, Result};
 use std::collections::VecDeque;
@@ -434,6 +434,63 @@ fn default_render(en: &DeviceEnumerator) -> Option<(Device, String)> {
     Some((d, id))
 }
 
+/// The endpoint to loopback-capture, as `(device, name, id)`: the plan's when `bind_plan`,
+/// else the default render. Echo guard: the plan reserves `mic_render` for the virtual mic,
+/// and capturing it streams the client's voice back to them, so a default that is the mic
+/// falls back to the plan's loopback, or refuses.
+fn choose_endpoint(
+    plan: &audio_control::WiredPlan,
+    bind_plan: bool,
+    en: &DeviceEnumerator,
+) -> Result<(Device, String, String)> {
+    let wiring = &plan.wiring;
+    if bind_plan {
+        let Some(ep) = wiring.loopback_render.clone() else {
+            // Typed: the plan is a pure function of the set, so wait on the fingerprint.
+            return Err(PlanUnsatisfiable::from_plan(plan).into());
+        };
+        let d = audio_control::open_endpoint(&ep)?;
+        return Ok((d, ep.0, ep.1));
+    }
+    let (default, id) =
+        default_render(en).context("default render endpoint (loopback needs a render device)")?;
+    let default_is_mic = wiring
+        .mic_render
+        .as_ref()
+        .is_some_and(|(_, mic_id)| *mic_id == id);
+    if !default_is_mic {
+        let name = default.get_friendlyname().unwrap_or_default();
+        return Ok((default, name, id));
+    }
+    let Some(lb) = wiring.loopback_render.clone() else {
+        // Not [`PlanUnsatisfiable`]: Follow's inputs include the default, which the
+        // operator can change without a topology change (esp. `PUNKTFUNK_KEEP_DEFAULT`).
+        anyhow::bail!(
+            "the default render endpoint is reserved for the virtual mic (capturing it \
+             would echo the client's voice back) — {}",
+            wiring_plan::describe_no_loopback(&plan.renders, wiring)
+        );
+    };
+    tracing::warn!(mic = %wiring.mic_render.as_ref().unwrap().0, loopback = %lb.0,
+        "default render endpoint is the virtual-mic target — loopback-capturing the plan's \
+         endpoint instead");
+    let d = audio_control::open_endpoint(&lb)?;
+    Ok((d, lb.0, lb.1))
+}
+
+/// The rate to open at. The shared-mode mix format is authoritative: `AUTOCONVERTPCM`
+/// succeeds on an upward request and returns interpolated samples, so never pad above the
+/// engine. The floor is [`SAMPLE_RATE`], not the engine: libopus takes 8/12/16/24/48 kHz
+/// only, so a 44.1 kHz endpoint still opens at 48 kHz. An unreadable mix format declines
+/// hi-res, which can't cost a working 48 kHz session.
+fn settle_open_rate(engine_hz: Option<u32>, requested: u32) -> u32 {
+    match engine_hz {
+        Some(hz) if hz > 0 && requested > hz.max(SAMPLE_RATE) => hz.max(SAMPLE_RATE),
+        None => SAMPLE_RATE,
+        _ => requested,
+    }
+}
+
 /// One endpoint open + capture loop. First open: [`FIRST_OPEN_ATTEMPTS`] then fatal via `ready`.
 /// Later: capped backoff, or an endpoint-set wait for [`PlanUnsatisfiable`].
 #[allow(clippy::too_many_arguments)]
@@ -498,42 +555,7 @@ fn capture_once(
     let plan_fp = plan.fingerprint;
 
     let en = DeviceEnumerator::new().context("DeviceEnumerator")?;
-    // Echo guard: the plan reserves `mic_render` for the virtual mic. Capturing it streams
-    // the client's voice back to them — fall back to the plan's loopback, or refuse.
-    let (device, dev_name, dev_id) = if bind_plan {
-        let Some(ep) = wiring.loopback_render.clone() else {
-            // Typed: the plan is a pure function of the set, so wait on the fingerprint.
-            return Err(PlanUnsatisfiable::from_plan(&plan).into());
-        };
-        let d = audio_control::open_endpoint(&ep)?;
-        (d, ep.0, ep.1)
-    } else {
-        let (default, id) = default_render(&en)
-            .context("default render endpoint (loopback needs a render device)")?;
-        let default_is_mic = wiring
-            .mic_render
-            .as_ref()
-            .is_some_and(|(_, mic_id)| *mic_id == id);
-        if default_is_mic {
-            let Some(lb) = wiring.loopback_render.clone() else {
-                // Not [`PlanUnsatisfiable`]: Follow's inputs include the default, which the
-                // operator can change without a topology change (esp. `PUNKTFUNK_KEEP_DEFAULT`).
-                anyhow::bail!(
-                    "the default render endpoint is reserved for the virtual mic (capturing it \
-                     would echo the client's voice back) — {}",
-                    wiring_plan::describe_no_loopback(&plan.renders, wiring)
-                );
-            };
-            tracing::warn!(mic = %wiring.mic_render.as_ref().unwrap().0, loopback = %lb.0,
-                "default render endpoint is the virtual-mic target — loopback-capturing the plan's \
-                 endpoint instead");
-            let d = audio_control::open_endpoint(&lb)?;
-            (d, lb.0, lb.1)
-        } else {
-            let name = default.get_friendlyname().unwrap_or_default();
-            (default, name, id)
-        }
-    };
+    let (device, dev_name, dev_id) = choose_endpoint(&plan, bind_plan, &en)?;
 
     let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;
     let mut engine = audio_client.get_mixformat().ok();
@@ -570,36 +592,25 @@ fn capture_once(
                  count; set its speaker configuration in Windows' sound settings for surround");
         }
     }
-    // Mix format is authoritative in shared mode. `AUTOCONVERTPCM` succeeds on an upward
-    // request and returns interpolated samples — never pad; open at the engine rate.
-    // Floor is [`SAMPLE_RATE`], not the engine: libopus takes 8/12/16/24/48 kHz only, so a
-    // 44.1 kHz endpoint still opens at 48 kHz. `rate_hz > hz.max(SAMPLE_RATE)` is both rules.
     let engine_hz = engine.as_ref().map(|f| f.get_samplespersec());
-    let open_hz = match engine_hz {
-        Some(hz) if hz > 0 && rate_hz > hz.max(SAMPLE_RATE) => {
-            let settled = hz.max(SAMPLE_RATE);
-            tracing::info!(
-                device = %dev_name,
-                engine_hz = hz,
-                requested = rate_hz,
-                opening_at = settled,
-                "engine rate is below the requested capture rate — hi-res declined; opening at \
-                 the engine rate rather than letting WASAPI autoconvert upsample it (set this \
-                 endpoint's rate in Windows' device properties to raise it)"
-            );
-            settled
-        }
-        // Unreadable mix format: declining hi-res cannot cost a working 48 kHz session.
-        None if rate_hz != SAMPLE_RATE => {
-            tracing::info!(
-                device = %dev_name,
-                requested = rate_hz,
-                "endpoint mix format unreadable — hi-res declined; opening at the legacy rate"
-            );
-            SAMPLE_RATE
-        }
-        _ => rate_hz,
-    };
+    let open_hz = settle_open_rate(engine_hz, rate_hz);
+    match engine_hz {
+        _ if open_hz == rate_hz => {}
+        Some(hz) => tracing::info!(
+            device = %dev_name,
+            engine_hz = hz,
+            requested = rate_hz,
+            opening_at = open_hz,
+            "engine rate is below the requested capture rate — hi-res declined; opening at \
+             the engine rate rather than letting WASAPI autoconvert upsample it (set this \
+             endpoint's rate in Windows' device properties to raise it)"
+        ),
+        None => tracing::info!(
+            device = %dev_name,
+            requested = rate_hz,
+            "endpoint mix format unreadable — hi-res declined; opening at the legacy rate"
+        ),
+    }
     // Before Initialize can fail — `sample_rate()` already has a decided answer.
     opened_rate.store(open_hz, Ordering::Relaxed);
     // Autoconvert matches the engine mix to this layout. `dwChannelMask` pins wire order
@@ -811,35 +822,9 @@ fn capture_once(
                 stats.dropped_chunks += 1;
             }
         }
-        if last_stats.elapsed() >= STATS_EVERY {
-            let (peak_db, rms_db, delivered_pct) = stats.summary(last_stats.elapsed(), open_hz);
-            if stats.dropped_chunks > 0 {
-                tracing::warn!(
-                    device = %dev_name,
-                    dropped_chunks = stats.dropped_chunks,
-                    "the audio encode thread could not keep up — captured audio was DROPPED; the \
-                     stream will click and everything after it shifts"
-                );
-            }
-            tracing::info!(
-                device = %dev_name,
-                peak_db = format!("{peak_db:.1}"),
-                rms_db = format!("{rms_db:.1}"),
-                delivered_pct = format!("{delivered_pct:.0}"),
-                // Shape of whatever `delivered_pct` is short by. From WASAPI discontinuity, not
-                // callback cadence — an idle-then-resume endpoint is not a gap. See [`LOOPBACK_IDLE_AFTER`].
-                gaps = stats.gaps,
-                max_gap_ms = stats.max_gap_ms(),
-                // Bucket counts (<20/50/100 ms, ≥100 ms) and total cost; same fields as Linux.
-                gap_hist = %stats.gap_hist(),
-                missing_ms = stats.missing_ms(),
-                missed_dequeues = stats.missed_dequeues,
-                dropped_chunks = stats.dropped_chunks,
-                "desktop audio capture"
-            );
-            last_stats = Instant::now();
-            stats = CaptureStats::default();
-        }
+        // Gaps here come from WASAPI discontinuity, not callback cadence: an idle-then-resume
+        // endpoint is not a gap ([`LOOPBACK_IDLE_AFTER`]).
+        stats.flush_window(&mut last_stats, open_hz, Some(dev_name.as_str()));
 
         // Default render id changed — operator picked a different output mid-stream. A seat has
         // no operator default: the box's is somebody else's, and following it streams their audio.
@@ -1068,6 +1053,18 @@ mod tests {
         }
         // A seat is `keep_default` by construction (`audio_control::keep_default_devices`).
         assert_eq!(binding(TargetMode::Assert, true, true), (true, false));
+    }
+
+    /// Never above the engine, never below what libopus takes, and legacy when unreadable.
+    #[test]
+    fn the_open_rate_never_upsamples_past_the_engine() {
+        assert_eq!(settle_open_rate(Some(48_000), 96_000), 48_000);
+        assert_eq!(settle_open_rate(Some(44_100), 96_000), SAMPLE_RATE);
+        assert_eq!(settle_open_rate(Some(192_000), 96_000), 96_000);
+        assert_eq!(settle_open_rate(Some(44_100), 44_100), 44_100);
+        assert_eq!(settle_open_rate(Some(0), 96_000), 96_000);
+        assert_eq!(settle_open_rate(None, 96_000), SAMPLE_RATE);
+        assert_eq!(settle_open_rate(None, SAMPLE_RATE), SAMPLE_RATE);
     }
 
     /// Live loopback round trip. Skipped unless `PUNKTFUNK_WASAPI_LIVE=1` and a render endpoint exists.
