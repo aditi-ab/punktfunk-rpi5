@@ -12,6 +12,7 @@
 //! DRM backend, or VirtualBackend since KWin 6.5.6.
 
 use super::{Mode, VirtualDisplay, VirtualOutput};
+use crate::proc::StopFlag;
 use crate::wl_pump::{pump_until, sync_barrier, Pumped, SyncDone};
 use anyhow::{anyhow, bail, Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -289,7 +290,7 @@ impl VirtualDisplay for KwinDisplay {
         } else {
             POINTER_EMBEDDED
         };
-        let spawn_vout = |w: u32, h: u32| -> Result<(u32, Arc<AtomicBool>)> {
+        let spawn_vout = |w: u32, h: u32| -> Result<(u32, StopFlag)> {
             let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
             let stop = Arc::new(AtomicBool::new(false));
             let stop_thread = stop.clone();
@@ -300,6 +301,9 @@ impl VirtualDisplay for KwinDisplay {
                     virtual_output_thread(w, h, name_thread, pointer_mode, setup_tx, stop_thread)
                 })
                 .context("spawn KWin virtual-output thread")?;
+            // Built before the wait so every error arm stops the worker, which on a timeout
+            // is still inside `await_created` holding a half-built output.
+            let stop = StopFlag(stop);
             match setup_rx.recv_timeout(OPENER_BUDGET) {
                 Ok(Ok(v)) => Ok((v, stop)),
                 // Report as-is. The wrapper below prepends the "permanent, do not retry"
@@ -317,13 +321,7 @@ impl VirtualDisplay for KwinDisplay {
                      ~/.config/kwinoutputconfig.json, or a display config it refused to apply) \
                      reports the same. kwin_wayland's own journal says which"
                 ),
-                Err(_) => {
-                    // `StopGuard` is only built on success, so nothing else will flip
-                    // `stop`. The worker is still inside `await_created` holding a
-                    // half-built output KWin keeps alive for this connection.
-                    stop.store(true, Ordering::Relaxed);
-                    bail!("timed out creating the KWin virtual output")
-                }
+                Err(_) => bail!("timed out creating the KWin virtual output"),
             }
         };
         // `stream_virtual_output` has no refresh; the PipeWire offer (including the
@@ -399,7 +397,7 @@ impl VirtualDisplay for KwinDisplay {
                         "KWin rejected the custom mode — recreating the virtual output at the real \
                          size (60 Hz ceiling on this KWin)"
                     );
-                    stop.store(true, Ordering::Relaxed);
+                    stop.0.store(true, Ordering::Relaxed);
                     // Let KWin retire the doomed output before re-using its name.
                     std::thread::sleep(Duration::from_millis(300));
                     let (nid, st) = spawn_vout(width, height)?;
@@ -424,7 +422,7 @@ impl VirtualDisplay for KwinDisplay {
         };
         let disabled = self.apply_topology(&name, &our_prefix, final_dims, &pre_enabled);
         // Stash restore on the group, not this session's keepalive: a per-session
-        // `StopGuard` would re-enable physicals when the FIRST exclusive member drops
+        // keepalive would re-enable physicals when the FIRST exclusive member drops
         // under a still-live sibling. Empty ⇒ nothing to restore.
         let prepared = (!disabled.is_empty()).then(|| {
             let disabled = disabled.clone();
@@ -455,7 +453,8 @@ impl VirtualDisplay for KwinDisplay {
         let mut out = VirtualOutput::owned(
             node_id,
             Some((final_dims.0, final_dims.1, achieved_hz)),
-            Box::new(StopGuard { stop }),
+            // Dropping it releases the output: the worker's Wayland connection goes with it.
+            Box::new(stop),
         );
         out.expect_exact_dims = expect_exact_dims;
         out.input_output = Some(our_prefix);
@@ -1239,19 +1238,6 @@ fn apply_virtual_primary_only(ours: &str) {
     }
 }
 
-/// Dropping this releases the KWin virtual output: it flips the keepalive thread's
-/// `stop`, which drops the Wayland connection. Topology restore lives on the registry
-/// group and runs when the last member drops, before this keepalive is dropped.
-struct StopGuard {
-    stop: Arc<AtomicBool>,
-}
-
-impl Drop for StopGuard {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-    }
-}
-
 #[derive(Default)]
 struct State {
     screencast: Option<Screencast>,
@@ -1435,15 +1421,12 @@ pub(crate) fn stream_existing_output(
             }
         })
         .context("spawn KWin monitor-mirror thread")?;
+    // Built before the wait so a timeout stops the recording too.
+    let stop = StopFlag(stop);
     let node_id = match setup_rx.recv_timeout(OPENER_BUDGET) {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => bail!("KWin monitor mirror failed: {e}"),
-        Err(_) => {
-            // Same leak as the virtual-output opener: `StopOnDrop` only owns `stop` on
-            // success, so without this the mirror thread keeps recording until its budget.
-            stop.store(true, Ordering::Relaxed);
-            bail!("timed out recording the KWin output {connector:?}")
-        }
+        Err(_) => bail!("timed out recording the KWin output {connector:?}"),
     };
     Ok(crate::mirror::MirrorStream {
         node_id,
@@ -1452,17 +1435,8 @@ pub(crate) fn stream_existing_output(
         // Not an xdg-portal session: the `zkde_screencast` pointer mode was asked of
         // KWin directly, so the request is the answer.
         cursor_mode: None,
-        keepalive: Box::new(StopOnDrop(stop)),
+        keepalive: Box::new(stop),
     })
-}
-
-/// Stops the mirror thread (and thus the recording) when the capturer drops it.
-struct StopOnDrop(Arc<AtomicBool>);
-
-impl Drop for StopOnDrop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
-    }
 }
 
 /// The refusal for a registry without `zkde_screencast`, naming the path KWin read and

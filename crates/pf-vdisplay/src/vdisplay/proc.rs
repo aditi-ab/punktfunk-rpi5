@@ -195,6 +195,15 @@ fn timed_out(cmd: &Command, budget: Duration) -> Error {
     )
 }
 
+/// Sets its flag on drop: the keepalive whose drop stops the worker thread parked on the flag.
+pub(crate) struct StopFlag(pub(crate) std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for StopFlag {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// The calling process's real uid.
 ///
 /// Session/gamescope lookups that derive `/run/user/<uid>` (or filter `/proc` to "our"
