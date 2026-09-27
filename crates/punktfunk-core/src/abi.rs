@@ -3240,34 +3240,10 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble(
     high: *mut u16,
     timeout_ms: u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        match c
-            .inner
-            .next_rumble(std::time::Duration::from_millis(timeout_ms as u64))
-        {
-            Ok((p, l, h)) => {
-                // SAFETY: each out-param is optional; null-checked before write.
-                unsafe {
-                    if !pad.is_null() {
-                        *pad = p;
-                    }
-                    if !low.is_null() {
-                        *low = l;
-                    }
-                    if !high.is_null() {
-                        *high = h;
-                    }
-                }
-                PunktfunkStatus::Ok
-            }
-            Err(e) => e.status(),
-        }
-    })
+    // SAFETY: pointers forwarded unchanged; `next_rumble2` skips a null `ttl_ms`.
+    unsafe {
+        punktfunk_connection_next_rumble2(c, pad, low, high, std::ptr::null_mut(), timeout_ms)
+    }
 }
 
 /// `*ttl_ms` sentinel from [`punktfunk_connection_next_rumble2`] when the host sent
@@ -3348,37 +3324,19 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble_cmd(
     backstop_ms: *mut u32,
     timeout_ms: u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        match c
-            .inner
-            .next_rumble_command(std::time::Duration::from_millis(timeout_ms as u64))
-        {
-            Ok(cmd) => {
-                // SAFETY: each out-param is optional; null-checked before write.
-                unsafe {
-                    if !pad.is_null() {
-                        *pad = cmd.pad;
-                    }
-                    if !low.is_null() {
-                        *low = cmd.low;
-                    }
-                    if !high.is_null() {
-                        *high = cmd.high;
-                    }
-                    if !backstop_ms.is_null() {
-                        *backstop_ms = cmd.backstop_ms;
-                    }
-                }
-                PunktfunkStatus::Ok
-            }
-            Err(e) => e.status(),
-        }
-    })
+    // SAFETY: pointers forwarded unchanged; `next_rumble_cmd2` skips null trigger out-params.
+    unsafe {
+        punktfunk_connection_next_rumble_cmd2(
+            c,
+            pad,
+            low,
+            high,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            backstop_ms,
+            timeout_ms,
+        )
+    }
 }
 
 /// [`punktfunk_connection_next_rumble_cmd`] plus Xbox impulse-trigger motors.
