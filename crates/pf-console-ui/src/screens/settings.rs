@@ -16,7 +16,8 @@ use crate::pointer::Pointer;
 use crate::screens::{home, Ctx, Outbox, Screen};
 use crate::theme::Fonts;
 use crate::widgets::{
-    column, permits, Charset, KeyMsg, Keyboard, ListMsg, MenuList, RowSpec, TabStrip, TAB_STRIP_H,
+    column, entry_hints, field_key, permits, type_text, Charset, Entry, Keyboard, ListMsg,
+    MenuList, RowSpec, TabStrip, TAB_STRIP_H,
 };
 use pf_client_core::audio_format::{AUDIO_FORMATS, AUDIO_FORMAT_OPUS};
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
@@ -656,44 +657,30 @@ impl SettingsScreen {
         crate::screens::EditField::new("Bitrate in Mbps", self.custom_bitrate.as_deref()?, true)
     }
 
-    /// SDL text. Digits only; four chars is 2000 Mbps, the ceiling.
-    pub(crate) fn text_input(&mut self, text: &str) {
-        for ch in text.chars() {
-            self.type_char(ch);
+    /// Digits only; four is 2000 Mbps, the ceiling.
+    fn admits(text: &str, ch: char) -> bool {
+        permits(Charset::Digits, ch) && text.chars().count() < 4
+    }
+
+    /// SDL text into the bitrate field.
+    pub(crate) fn text_input(&mut self, typed: &str) {
+        if let Some(text) = self.custom_bitrate.as_mut() {
+            type_text(text, typed, Self::admits);
         }
     }
 
-    fn type_char(&mut self, ch: char) -> bool {
-        let Some(buf) = self.custom_bitrate.as_mut() else {
+    /// Every way out of the field commits it: the typed number is the setting.
+    pub(crate) fn edit_key(&mut self, key: crate::input::Key, ctx: &mut Ctx) -> bool {
+        let Some(text) = self.custom_bitrate.as_mut() else {
             return false;
         };
-        if !permits(Charset::Digits, ch) || buf.chars().count() >= 4 {
+        let Some(entry) = field_key(key, text) else {
             return false;
+        };
+        if entry != Entry::Stay {
+            self.commit_custom(ctx);
         }
-        buf.push(ch);
         true
-    }
-
-    fn backspace(&mut self) -> bool {
-        self.custom_bitrate.as_mut().and_then(String::pop).is_some()
-    }
-
-    pub(crate) fn edit_key(&mut self, key: crate::input::Key, ctx: &mut Ctx) -> bool {
-        use crate::input::Key as K;
-        if self.custom_bitrate.is_none() {
-            return false;
-        }
-        match key {
-            K::Backspace => {
-                self.backspace();
-                true
-            }
-            K::Return | K::Escape => {
-                self.commit_custom(ctx);
-                true
-            }
-            _ => false,
-        }
     }
 
     /// Close the field. Empty or `0` is an abandoned edit, not Automatic (the first rung).
@@ -715,38 +702,14 @@ impl SettingsScreen {
     }
 
     fn custom_menu(&mut self, ev: MenuEvent, ctx: &mut Ctx) -> Option<MenuPulse> {
-        if ctx.device.deck {
-            // Steam types via `text_input`; the pad only commits.
-            return match ev {
-                MenuEvent::Back | MenuEvent::Confirm => {
-                    self.commit_custom(ctx);
-                    Some(MenuPulse::Confirm)
-                }
-                _ => None,
-            };
+        let text = self.custom_bitrate.as_mut()?;
+        let (entry, pulse) = self
+            .keyboard
+            .edit_menu(ev, ctx.device.deck, text, Self::admits);
+        if entry != Entry::Stay {
+            self.commit_custom(ctx);
         }
-        let (msg, pulse) = self.keyboard.menu(ev);
-        match msg {
-            KeyMsg::Type(c) => {
-                if self.type_char(c) {
-                    Some(MenuPulse::Move)
-                } else {
-                    Some(MenuPulse::Boundary)
-                }
-            }
-            KeyMsg::Backspace => {
-                if self.backspace() {
-                    Some(MenuPulse::Move)
-                } else {
-                    Some(MenuPulse::Boundary)
-                }
-            }
-            KeyMsg::Done => {
-                self.commit_custom(ctx);
-                Some(MenuPulse::Confirm)
-            }
-            KeyMsg::None => pulse,
-        }
+        pulse
     }
 
     /// The catalog as the store has it now, on the Presets tab.
@@ -868,24 +831,12 @@ impl SettingsScreen {
 
     /// Strip first: pills sit above the list, so a press there is never a row.
     pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
-        if self.custom_bitrate.is_some() && !ctx.device.deck {
-            if !self.keyboard.covers(p) {
-                if p.press() {
-                    self.commit_custom(ctx);
-                    return true;
-                }
+        if let Some(text) = self.custom_bitrate.as_mut().filter(|_| !ctx.device.deck) {
+            let Some(entry) = self.keyboard.edit_pointer(p, text, Self::admits) else {
                 return false;
-            }
-            let (msg, _) = self.keyboard.pointer(p);
-            match msg {
-                KeyMsg::Type(c) => {
-                    self.type_char(c);
-                }
-                KeyMsg::Backspace => {
-                    self.backspace();
-                }
-                KeyMsg::Done => self.commit_custom(ctx),
-                KeyMsg::None => {}
+            };
+            if entry != Entry::Stay {
+                self.commit_custom(ctx);
             }
             return true;
         }
@@ -1124,18 +1075,7 @@ impl SettingsScreen {
 
     pub(crate) fn hints(&self, ctx: &Ctx) -> Vec<Hint> {
         if self.custom_bitrate.is_some() {
-            if ctx.device.deck {
-                return vec![
-                    Hint::new(HintKey::Key("STEAM + X"), "Keyboard"),
-                    Hint::new(HintKey::Confirm, "Done"),
-                    Hint::new(HintKey::Back, "Done"),
-                ];
-            }
-            return vec![
-                Hint::new(HintKey::Confirm, "Type"),
-                Hint::new(HintKey::Tertiary, "Delete"),
-                Hint::new(HintKey::Back, "Done"),
-            ];
+            return entry_hints(ctx.device.deck, "Done");
         }
         // Strip-focused: hints describe the D-pad, not the rows.
         if self.strip_focus {

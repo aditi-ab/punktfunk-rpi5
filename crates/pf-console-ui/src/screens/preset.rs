@@ -13,7 +13,9 @@ use crate::model::ConsoleCmd;
 use crate::pointer::Pointer;
 use crate::screens::{Ctx, EditField, Outbox, Screen};
 use crate::theme::Fonts;
-use crate::widgets::{blurb, KeyMsg, Keyboard, ListMsg, MenuList, RowSpec};
+use crate::widgets::{
+    blurb, entry_hints, field_key, type_text, Entry, Keyboard, ListMsg, MenuList, RowSpec,
+};
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use pf_client_core::presets::SettingsOverlay;
 use skia_safe::{Canvas, Rect};
@@ -248,43 +250,39 @@ impl PresetName {
         self.editing.then_some(field)
     }
 
-    fn type_char(&mut self, ch: char) -> bool {
-        if !self.editing || ch.is_control() || self.name.chars().count() >= 40 {
-            return false;
+    /// A name is up to 40 printable characters.
+    fn admits(text: &str, ch: char) -> bool {
+        !ch.is_control() && text.chars().count() < 40
+    }
+
+    /// Typing clears a taken-name error; deleting leaves it up.
+    fn typed(&mut self, before: usize) {
+        if self.name.len() > before {
+            self.error = None;
         }
-        self.name.push(ch);
-        self.error = None;
-        true
     }
 
-    fn backspace(&mut self) -> bool {
-        self.editing && self.name.pop().is_some()
-    }
-
-    pub(crate) fn text_input(&mut self, text: &str) {
-        for ch in text.chars() {
-            self.type_char(ch);
+    pub(crate) fn text_input(&mut self, typed: &str) {
+        if self.editing {
+            let before = self.name.len();
+            type_text(&mut self.name, typed, Self::admits);
+            self.typed(before);
         }
     }
 
     /// Return closes the keyboard onto Save; the next Return saves.
     pub(crate) fn edit_key(&mut self, key: crate::input::Key) -> bool {
-        use crate::input::Key as K;
         if !self.editing {
             return false;
         }
-        match key {
-            K::Backspace => {
-                self.backspace();
-                true
-            }
-            K::Return | K::Escape => {
-                self.editing = false;
-                self.list.cursor = 1;
-                true
-            }
-            _ => false,
+        let Some(entry) = field_key(key, &mut self.name) else {
+            return false;
+        };
+        if entry != Entry::Stay {
+            self.editing = false;
+            self.list.cursor = 1;
         }
+        true
     }
 
     pub(crate) fn menu(
@@ -294,29 +292,17 @@ impl PresetName {
         fx: &mut Outbox,
     ) -> Option<MenuPulse> {
         if self.editing {
-            if ev == MenuEvent::Back {
-                self.editing = false;
-                return Some(MenuPulse::Confirm);
-            }
-            if ctx.device.deck {
-                return match ev {
-                    MenuEvent::Confirm => self.save(ctx, fx),
-                    _ => None,
-                };
-            }
-            let (msg, pulse) = self.keyboard.menu(ev);
-            let moved = |ok: bool| {
-                Some(if ok {
-                    MenuPulse::Move
-                } else {
-                    MenuPulse::Boundary
-                })
-            };
-            return match msg {
-                KeyMsg::Type(c) => moved(self.type_char(c)),
-                KeyMsg::Backspace => moved(self.backspace()),
-                KeyMsg::Done => self.save(ctx, fx),
-                KeyMsg::None => pulse,
+            let before = self.name.len();
+            let (entry, pulse) =
+                (self.keyboard).edit_menu(ev, ctx.device.deck, &mut self.name, Self::admits);
+            self.typed(before);
+            return match entry {
+                Entry::Stay => pulse,
+                Entry::Close => {
+                    self.editing = false;
+                    pulse
+                }
+                Entry::Done => self.save(ctx, fx),
             };
         }
         if ev == MenuEvent::Back {
@@ -336,24 +322,16 @@ impl PresetName {
 
     pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
         if self.editing && !ctx.device.deck {
-            if !self.keyboard.covers(p) {
-                if p.press() {
-                    self.editing = false;
-                    return true;
-                }
-                return false;
-            }
-            match self.keyboard.pointer(p).0 {
-                KeyMsg::Type(c) => {
-                    self.type_char(c);
-                }
-                KeyMsg::Backspace => {
-                    self.backspace();
-                }
-                KeyMsg::Done => {
+            let before = self.name.len();
+            let entry = (self.keyboard).edit_pointer(p, &mut self.name, Self::admits);
+            self.typed(before);
+            match entry {
+                None => return false,
+                Some(Entry::Stay) => {}
+                Some(Entry::Close) => self.editing = false,
+                Some(Entry::Done) => {
                     self.save(ctx, fx);
                 }
-                KeyMsg::None => {}
             }
             return true;
         }
@@ -401,22 +379,13 @@ impl PresetName {
     }
 
     pub(crate) fn hints(&self, ctx: &Ctx) -> Vec<Hint> {
-        match (self.editing, ctx.device.deck) {
-            (true, true) => vec![
-                Hint::new(HintKey::Key("STEAM + X"), "Keyboard"),
-                Hint::new(HintKey::Confirm, "Save"),
-                Hint::new(HintKey::Back, "Done"),
-            ],
-            (true, false) => vec![
-                Hint::new(HintKey::Confirm, "Type"),
-                Hint::new(HintKey::Tertiary, "Delete"),
-                Hint::new(HintKey::Back, "Done"),
-            ],
-            (false, _) => vec![
-                Hint::new(HintKey::Confirm, "Select"),
-                Hint::new(HintKey::Back, "Cancel"),
-            ],
+        if self.editing {
+            return entry_hints(ctx.device.deck, "Save");
         }
+        vec![
+            Hint::new(HintKey::Confirm, "Select"),
+            Hint::new(HintKey::Back, "Cancel"),
+        ]
     }
 
     pub(crate) fn render(

@@ -7,7 +7,9 @@ use crate::model::HostRow;
 use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox, Screen};
 use crate::theme::Fonts;
-use crate::widgets::{blurb, KeyMsg, Keyboard, ListMsg, MenuList, RowSpec};
+use crate::widgets::{
+    blurb, entry_hints, field_key, type_text, Entry, Keyboard, ListMsg, MenuList, RowSpec,
+};
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Image, Rect};
 use std::collections::HashMap;
@@ -53,42 +55,30 @@ impl SearchScreen {
             .flatten()
     }
 
-    fn type_char(&mut self, ch: char) -> bool {
-        if !self.editing || ch.is_control() {
-            return false;
-        }
-        self.query.push(ch);
-        true
+    /// A query takes any printable character.
+    fn admits(_: &str, ch: char) -> bool {
+        !ch.is_control()
     }
 
-    fn backspace(&mut self) -> bool {
-        self.editing && self.query.pop().is_some()
-    }
-
-    pub(crate) fn text_input(&mut self, text: &str) {
-        for ch in text.chars() {
-            self.type_char(ch);
+    pub(crate) fn text_input(&mut self, typed: &str) {
+        if self.editing {
+            type_text(&mut self.query, typed, Self::admits);
         }
     }
 
     /// Return closes the keyboard onto the Search row; the next Return searches.
     pub(crate) fn edit_key(&mut self, key: crate::input::Key) -> bool {
-        use crate::input::Key as K;
         if !self.editing {
             return false;
         }
-        match key {
-            K::Backspace => {
-                self.backspace();
-                true
-            }
-            K::Return | K::Escape => {
-                self.editing = false;
-                self.list.cursor = 1;
-                true
-            }
-            _ => false,
+        let Some(entry) = field_key(key, &mut self.query) else {
+            return false;
+        };
+        if entry != Entry::Stay {
+            self.editing = false;
+            self.list.cursor = 1;
         }
+        true
     }
 
     pub(crate) fn menu(
@@ -98,30 +88,17 @@ impl SearchScreen {
         fx: &mut Outbox,
     ) -> Option<MenuPulse> {
         if self.editing {
-            if ev == MenuEvent::Back {
-                self.editing = false;
-                return Some(MenuPulse::Confirm);
-            }
-            if ctx.device.deck {
-                // Steam types on a Deck; the pad only searches or dismisses.
-                return match ev {
-                    MenuEvent::Confirm => self.search(fx),
-                    _ => None,
-                };
-            }
-            let (msg, pulse) = self.keyboard.menu(ev);
-            let moved = |ok: bool| {
-                Some(if ok {
-                    MenuPulse::Move
-                } else {
-                    MenuPulse::Boundary
-                })
-            };
-            return match msg {
-                KeyMsg::Type(c) => moved(self.type_char(c)),
-                KeyMsg::Backspace => moved(self.backspace()),
-                KeyMsg::Done => self.search(fx),
-                KeyMsg::None => pulse,
+            let deck = ctx.device.deck;
+            let (entry, pulse) = self
+                .keyboard
+                .edit_menu(ev, deck, &mut self.query, Self::admits);
+            return match entry {
+                Entry::Stay => pulse,
+                Entry::Close => {
+                    self.editing = false;
+                    pulse
+                }
+                Entry::Done => self.search(fx),
             };
         }
         if ev == MenuEvent::Back {
@@ -138,24 +115,15 @@ impl SearchScreen {
     /// A press outside the tray closes it; the row underneath is not activated.
     pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
         if self.editing && !ctx.device.deck {
-            if !self.keyboard.covers(p) {
-                if p.press() {
-                    self.editing = false;
-                    return true;
-                }
+            let Some(entry) = self.keyboard.edit_pointer(p, &mut self.query, Self::admits) else {
                 return false;
-            }
-            match self.keyboard.pointer(p).0 {
-                KeyMsg::Type(c) => {
-                    self.type_char(c);
-                }
-                KeyMsg::Backspace => {
-                    self.backspace();
-                }
-                KeyMsg::Done => {
+            };
+            match entry {
+                Entry::Stay => {}
+                Entry::Close => self.editing = false,
+                Entry::Done => {
                     self.search(fx);
                 }
-                KeyMsg::None => {}
             }
             return true;
         }
@@ -192,22 +160,13 @@ impl SearchScreen {
     }
 
     pub(crate) fn hints(&self, ctx: &Ctx) -> Vec<Hint> {
-        match (self.editing, ctx.device.deck) {
-            (true, true) => vec![
-                Hint::new(HintKey::Key("STEAM + X"), "Keyboard"),
-                Hint::new(HintKey::Confirm, "Search"),
-                Hint::new(HintKey::Back, "Done"),
-            ],
-            (true, false) => vec![
-                Hint::new(HintKey::Confirm, "Type"),
-                Hint::new(HintKey::Tertiary, "Delete"),
-                Hint::new(HintKey::Back, "Done"),
-            ],
-            (false, _) => vec![
-                Hint::new(HintKey::Confirm, "Select"),
-                Hint::new(HintKey::Back, "Cancel"),
-            ],
+        if self.editing {
+            return entry_hints(ctx.device.deck, "Search");
         }
+        vec![
+            Hint::new(HintKey::Confirm, "Select"),
+            Hint::new(HintKey::Back, "Cancel"),
+        ]
     }
 
     pub(crate) fn render(
