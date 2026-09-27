@@ -296,11 +296,7 @@ impl PortalCapturer {
         let join = thread::Builder::new()
             .name("punktfunk-portal".into())
             .spawn(move || {
-                if anchored {
-                    portal_thread_remote_desktop(setup_tx, quit_rx, want_metadata_cursor)
-                } else {
-                    portal_thread(setup_tx, quit_rx, want_metadata_cursor)
-                }
+                portal_thread(setup_tx, quit_rx, want_metadata_cursor, anchored);
                 // After the fn closed its portal session, so `Drop`'s
                 // `recv_timeout` means the cast is gone. Covers early returns.
                 let _ = done_tx.send(());
@@ -1131,7 +1127,7 @@ impl Drop for PortalCapturer {
 // not per-frame. `gnome_hdr_monitor_active` is re-exported from `lib.rs`.
 mod portal;
 pub use portal::gnome_hdr_monitor_active;
-use portal::{portal_thread, portal_thread_remote_desktop};
+use portal::portal_thread;
 
 // PipeWire consumer (`!Send`, owns its thread). Directory `mod pipewire`
 // resolves to `linux/pipewire.rs`; `super` inside still means `linux`.
