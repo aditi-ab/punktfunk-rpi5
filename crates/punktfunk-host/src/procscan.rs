@@ -20,9 +20,9 @@ pub use linux::Scanner;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub(crate) use windows::process_image;
-#[cfg(windows)]
 pub use windows::Scanner;
+#[cfg(windows)]
+pub(crate) use windows::{process_image, processes};
 
 /// Adopted process: pid plus a start stamp that pins that pid to *this* process.
 ///
