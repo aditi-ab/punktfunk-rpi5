@@ -3233,6 +3233,7 @@ dependencies = [
  "nvidia-video-codec-sdk",
  "openh264",
  "pf-capture",
+ "pf-encode-core",
  "pf-encode-win",
  "pf-frame",
  "pf-gpu",
@@ -3251,6 +3252,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-encode-core"
+version = "0.40.0"
+dependencies = [
+ "anyhow",
+ "nvidia-video-codec-sdk",
+ "pf-driver-proto",
+ "pf-frame",
+ "pyrowave-sys",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "pf-encode-win"
 version = "0.40.0"
 dependencies = [
@@ -3258,10 +3272,9 @@ dependencies = [
  "libvpl-sys",
  "nvidia-video-codec-sdk",
  "pf-bitstream",
- "pf-driver-proto",
+ "pf-encode-core",
  "pf-frame",
  "pyrowave-sys",
- "serde_json",
  "tracing",
  "tracing-subscriber",
  "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",

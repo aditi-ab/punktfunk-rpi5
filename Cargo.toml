@@ -29,6 +29,7 @@ members = [
     "crates/pf-frame",
     "crates/pf-win-display",
     "crates/pf-encode",
+    "crates/pf-encode-core",
     "crates/pf-encode-win",
     "crates/pf-capture",
     "crates/pf-inject",

@@ -17,8 +17,10 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::{Mutex, OnceLock};
 
-// The Windows backends, the `Encoder` contract, and the pieces the Linux
-// backends share with them. One namespace: `pf_encode::*` is unchanged.
+// The `Encoder` contract and the pieces every backend shares, plus the Windows
+// backends, which re-export the same contract. One namespace: `pf_encode::*`.
+pub use pf_encode_core::*;
+#[cfg(target_os = "windows")]
 pub use pf_encode_win::*;
 
 // Backend selection, one module per OS: what the resolved backend opens and can encode. Each
@@ -485,8 +487,8 @@ pub fn resolve_windows_backend(
     }
 }
 
-// `#[path]` keeps `crate::*` names flat. The Windows backends and the shared
-// NVENC/RFI/policy/PyroWave-wire modules arrive through the `pf_encode_win` glob.
+// `#[path]` keeps `crate::*` names flat. The shared NVENC/RFI/policy/PyroWave-wire
+// modules arrive through the `pf_encode_core` glob, the Windows backends through `pf_encode_win`.
 // Direct-SDK NVENC (CUDA). `.so` at runtime, so `--features nvenc` is safe
 // on a driver-less/AMD box. See `design/linux-direct-nvenc.md`.
 #[cfg(all(target_os = "linux", feature = "nvenc"))]

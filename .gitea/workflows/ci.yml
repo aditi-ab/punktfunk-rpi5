@@ -346,12 +346,15 @@ jobs:
       # `--features punktfunk-host/nvenc,punktfunk-host/vulkan-encode` WITHOUT
       # `--no-default-features`, so the .deb carries nvenc + vulkan-encode + pyrowave together, and
       # that combination is what deserves the lint. The bare crate lints on its own.
+      #
+      # pf-encode-core rides along under the same feature names: its NVENC session and Vulkan
+      # Video tests compile under no other feature set.
       - name: Clippy + test the feature-gated Linux encode backends
         run: |
-          cargo clippy -p pf-encode --all-targets --locked \
+          cargo clippy -p pf-encode -p pf-encode-core --all-targets --locked \
             --features nvenc,vulkan-encode,pyrowave -- -D warnings
           cargo clippy -p pf-encode --all-targets --locked -- -D warnings
-          cargo test -p pf-encode --locked --features nvenc,vulkan-encode,pyrowave
+          cargo test -p pf-encode -p pf-encode-core --locked --features nvenc,vulkan-encode,pyrowave
 
       - name: C ABI harness (standalone link proof)
         run: bash crates/punktfunk-core/tests/c/run.sh

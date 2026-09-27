@@ -116,7 +116,8 @@ HDR over the virtual display.
 | `crates/punktfunk-host` | The host: sessions, both protocol planes, management API, game library, CLI |
 | `crates/pf-vdisplay` | Virtual outputs, one backend per compositor plus the Windows driver backend |
 | `crates/pf-capture` | PipeWire portal capture (Linux) and driver push (Windows) behind `Capturer` |
-| `crates/pf-encode`, `pf-encode-win` | Encoder backends on Linux and Windows behind one `Encoder` trait |
+| `crates/pf-encode-core` | The `Encoder` trait and the policy every backend shares |
+| `crates/pf-encode`, `pf-encode-win` | Encoder backends on Linux and Windows |
 | `crates/punktfunk-encode-worker` | Separate binary that runs PyroWave at raised GPU priority |
 | `crates/pf-zerocopy` | CUDA, EGL and Vulkan dmabuf import and fence sync (Linux) |
 | `crates/pf-inject` | Keyboard, mouse, pen and virtual-gamepad injection |

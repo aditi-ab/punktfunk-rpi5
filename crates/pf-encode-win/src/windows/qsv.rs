@@ -2079,7 +2079,7 @@ mod tests {
     #[test]
     #[ignore = "requires an Intel GPU with QSV — run manually on the Intel VM (9200)"]
     fn qsv_ltr_anchor_soak() {
-        use crate::smoke_pattern::{nv12_scroll_frame, Soak};
+        use crate::{smoke_d3d11::nv12_scroll_frame, smoke_pattern::Soak};
         use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
         use windows::Win32::Graphics::Direct3D11::{
             D3D11CreateDevice, ID3D11Device, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,

@@ -6,7 +6,7 @@ x64.
 
 Everything below the platform seam lives in sibling crates — [`punktfunk-core`](../punktfunk-core/)
 for the wire format, `pf-vdisplay` for the virtual outputs, `pf-capture`, `pf-encode`,
-`pf-encode-win`, `pf-inject`, `pf-zerocopy`. This crate is the session orchestration, the two
+`pf-encode-core`, `pf-encode-win`, `pf-inject`, `pf-zerocopy`. This crate is the session orchestration, the two
 protocol planes, the management API and the game library around them. Each module's `//!` is its own
 map; browse `src/` rather than trusting a list here.
 
