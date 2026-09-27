@@ -447,9 +447,9 @@ pub(crate) const CELL_RAMP: [f64; 16] = [
 pub const PALETTES: [Palette; 36] = [
     // --- dark fields (white ink) ---
     Palette {
-        // The brand default: a bright periwinkle field with lavender pools, still white ink.
+        // The brand default: the website's deep-violet ground, lit by its brand violets.
         id: "violet", name: "Violet", stops: None,
-        ground: (0.510, 0.470, 0.960), accent: (0.525, 0.471, 0.961), light: false,
+        ground: (0.129, 0.094, 0.431), accent: (0.525, 0.471, 0.961), light: false,
     },
     Palette {
         // First two stops are (0,0,0): OLED pixels off, not dark grey. Ground is black so calm lifts to nothing.
@@ -810,9 +810,16 @@ pub(crate) fn mesh_colors_of(stops: &[(f64, f64, f64)]) -> [(f64, f64, f64); 16]
     })
 }
 
-/// The brand default's field ramp: the mockup's lavender → periwinkle → magenta.
-pub const VIOLET_FIELD: [(f64, f64, f64); 3] =
-    [(0.80, 0.60, 0.98), (0.47, 0.44, 1.00), (0.98, 0.12, 0.62)];
+/// The brand default's field ramp: the website's surfaces, dark first — `--neutral-accent`
+/// `#0e093a`, `--neutral` `#21186e`, `--neutral-highlight` `#302593`, `--brand` `#6c5bf3`,
+/// `--brand-light` `#a79ff8` (punktfunk-website `src/styles/globals.css`).
+pub const VIOLET_FIELD: [(f64, f64, f64); 5] = [
+    (0.055, 0.035, 0.227),
+    (0.129, 0.094, 0.431),
+    (0.188, 0.145, 0.576),
+    (0.424, 0.357, 0.953),
+    (0.655, 0.624, 0.973),
+];
 
 /// An sRGB colour in OKLab, as the field's gradient mixes it.
 fn oklab((r, g, b): (f64, f64, f64)) -> (f64, f64, f64) {
