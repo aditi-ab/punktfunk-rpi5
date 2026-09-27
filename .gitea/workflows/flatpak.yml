@@ -72,7 +72,25 @@ env:
 
 jobs:
   build-publish:
-    runs-on: ubuntu-24.04
+    name: build-publish (${{ matrix.arch }})
+    # One leg per architecture, each built natively: flatpak-builder runs the build in a sandbox
+    # of the target arch, so aarch64 needs an arm64 runner (label `linux-arm64`), not a cross
+    # toolchain. x86_64 keeps its unsuffixed file names; the Decky fallback reads them.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            image: 192.168.1.58:5010/punktfunk-flatpak-ci:latest
+            suffix: ''
+          - arch: aarch64
+            runner: linux-arm64
+            image: 192.168.1.58:5010/punktfunk-flatpak-ci-arm64:latest
+            suffix: '-aarch64'
+    runs-on: ${{ matrix.runner }}
+    # The aarch64 leg must never hold back the x86_64 canary while it is unproven on hardware.
+    continue-on-error: ${{ matrix.arch == 'aarch64' }}
     timeout-minutes: 120
     container:
       # ci/flatpak-ci.Dockerfile — Fedora 43 with flatpak + flatpak-builder + ostree + node,
@@ -99,7 +117,7 @@ jobs:
       # default bridge failed too, while the host netns — no embedded resolver in the
       # path at all — works every time). Host networking also means this job no
       # longer needs the nsswitch surgery below to be lucky.
-      image: 192.168.1.58:5010/punktfunk-flatpak-ci:latest
+      image: ${{ matrix.image }}
       options: --privileged --network host
     steps:
       # DNS fix — MUST run before any network step. fedora:43's nsswitch.conf is
@@ -185,8 +203,8 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .flatpak-builder
-          key: flatpak-builder-state-v2-${{ hashFiles('Cargo.lock', 'packaging/flatpak/**') }}
-          restore-keys: flatpak-builder-state-v2-
+          key: flatpak-builder-state-v2-${{ matrix.arch }}-${{ hashFiles('Cargo.lock', 'packaging/flatpak/**') }}
+          restore-keys: flatpak-builder-state-v2-${{ matrix.arch }}-
 
       # A restore that dies mid-archive leaves a partial tree, and flatpak-builder then fails on
       # the half-written OSTree repo (`opendir(refs/heads)`). Start cold instead.
@@ -210,7 +228,7 @@ jobs:
             *)      ALIAS=canary ;;
           esac
           echo "VERSION=$PF_VERSION" >> "$GITHUB_ENV"
-          echo "BUNDLE=punktfunk-client-${PF_VERSION}.flatpak" >> "$GITHUB_ENV"
+          echo "BUNDLE=punktfunk-client-${PF_VERSION}${{ matrix.suffix }}.flatpak" >> "$GITHUB_ENV"
           echo "FLATPAK_BRANCH=$PF_CHANNEL" >> "$GITHUB_ENV"
           echo "ALIAS=$ALIAS" >> "$GITHUB_ENV"
           echo "flatpak version $PF_VERSION -> branch '$PF_CHANNEL' alias '$ALIAS'"
@@ -251,9 +269,9 @@ jobs:
         # repo therefore produces a single-branch summary that CLOBBERS the other channel on the
         # server — the exact bug that made `app/io.unom.Punktfunk/x86_64/stable` unresolvable
         # ("No such ref") after a canary main-push overwrote the post-release summary, even though
-        # the stable commit's objects were still on disk. Fix: seed every published channel into
-        # the local repo first; the build below then only ADDS this run's commit and the
-        # regenerated+signed summary keeps both channels.
+        # the stable commit's objects were still on disk. Fix: seed every published channel, of
+        # every arch, into the local repo first; the build below then only ADDS this run's commit
+        # and the regenerated+signed summary keeps every ref.
         #
         # HOW, and why not the rsync this replaces. Mirroring the whole published repo down over
         # ssh transferred the entire thing every run, because the local repo starts empty and has
@@ -282,17 +300,18 @@ jobs:
           # clobber the other channel (the bug described above).
           if bash scripts/ci/retry.sh 5 curl -fsS -o /dev/null "$REPO_URL/repo/summary"; then
             for ref in $(bash scripts/ci/retry.sh 5 ostree --repo="$PWD/repo" remote refs unom); do
-              case "$ref" in unom:app/$APP_ID/x86_64/*) ;; *) continue ;; esac
+              case "$ref" in unom:app/$APP_ID/*) ;; *) continue ;; esac
               bash scripts/ci/retry.sh 5 ostree --repo="$PWD/repo" pull --mirror --depth=0 \
                 unom "${ref#unom:}"
             done
+            echo "SEEDED=1" >> "$GITHUB_ENV"
           elif [ "$(curl -sS -o /dev/null -w '%{http_code}' "$REPO_URL/repo/summary")" = 404 ]; then
             echo "::warning::no published repo at $REPO_URL (first publish) — continuing fresh"
           else
             echo "::error::$REPO_URL/repo/summary unreachable — refusing to build a summary that would drop a channel"
             exit 1
           fi
-          echo "seeded refs:"; ls "$PWD/repo/refs/heads/app/$APP_ID/x86_64/" 2>/dev/null || echo "  (none)"
+          echo "seeded refs:"; ls -d "$PWD/repo/refs/heads/app/$APP_ID"/*/* 2>/dev/null || echo "  (none)"
 
       - name: Prefetch deps + sources (retried — the network phase, split off the build)
         run: |
@@ -388,7 +407,7 @@ jobs:
           # here is commit-pinned (see the manifest), so "don't update" is a semantic no-op.
           # Anything genuinely missing still downloads, so a cold state dir self-heals.
           #
-          # --default-branch=$FLATPAK_BRANCH pins the ref to app/io.unom.Punktfunk/x86_64/<branch>
+          # --default-branch=$FLATPAK_BRANCH pins the ref to app/io.unom.Punktfunk/<arch>/<branch>
           # (canary or stable) so the matching hosted .flatpakref resolves deterministically
           # (manifest sets no branch).
           flatpak-builder --user --force-clean --disable-rofiles-fuse \
@@ -419,11 +438,12 @@ jobs:
           # 2) Channel alias (stable release -> latest/, canary main build -> canary/) for the
           #    Decky fallback + scripts. The generic registry rejects re-uploading an existing
           #    version/file (409), so delete the prior alias file first (ignore 404 on run #1).
+          AFILE="punktfunk-client${{ matrix.suffix }}.flatpak"
           curl -fsS -o /dev/null --user "enricobuehler:$TOKEN" -X DELETE \
-            "$BASE/$ALIAS/punktfunk-client.flatpak" || true
+            "$BASE/$ALIAS/$AFILE" || true
           curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$BUNDLE" \
-            "$BASE/$ALIAS/punktfunk-client.flatpak"
-          echo "published $BASE/$ALIAS/punktfunk-client.flatpak"
+            "$BASE/$ALIAS/$AFILE"
+          echo "published $BASE/$ALIAS/$AFILE"
 
       # Sign the OSTree repo flatpak-builder already produced and publish it to flatpak.unom.io on
       # unom-1, so users get `flatpak update` (the single-file bundle above has no remote). Mirrors
@@ -455,12 +475,28 @@ jobs:
           # fails the pull with "GPG verification enabled, but no signatures found".
           flatpak build-sign "$PWD/repo" "$APP_ID" "$FLATPAK_BRANCH" \
             --gpg-sign="$KEYID" --gpg-homedir="$GNUPGHOME"
+          # Re-pull every other ref: the other arch's leg, or a tag run, may have published since
+          # the seed, and a summary built from the seed would roll that commit back.
+          # ponytail: two publishes inside the same minute can still drop one; a remote flock fixes it.
+          if [ -n "${SEEDED:-}" ]; then
+            # Assigned first so a failed listing aborts the publish; a bare `for … in $(…)` would not.
+            REFS=$(bash scripts/ci/retry.sh 5 ostree --repo="$PWD/repo" remote refs unom)
+            for ref in $REFS; do
+              case "$ref" in
+                "unom:app/$APP_ID/${{ matrix.arch }}/$FLATPAK_BRANCH") continue ;;
+                unom:app/$APP_ID/*) ;;
+                *) continue ;;
+              esac
+              bash scripts/ci/retry.sh 5 ostree --repo="$PWD/repo" pull --mirror --depth=0 \
+                unom "${ref#unom:}"
+            done
+          fi
           flatpak build-update-repo --generate-static-deltas \
             --gpg-sign="$KEYID" --gpg-homedir="$GNUPGHOME" "$PWD/repo"
           # The regenerated summary advertises exactly these refs — must include EVERY channel that
           # has ever published (the seed step ensures the other channel's commit is present). If this
           # ever shows only one branch on a repo that had two, the seed didn't run — investigate.
-          echo "published summary advertises:"; ls "$PWD/repo/refs/heads/app/$APP_ID/x86_64/" 2>/dev/null || echo "  (none)"
+          echo "published summary advertises:"; ls -d "$PWD/repo/refs/heads/app/$APP_ID"/*/* 2>/dev/null || echo "  (none)"
           # 2) Build the install descriptors (GPGKey = the committed public key, base64).
           GPGKEY="$(base64 -w0 packaging/flatpak/unom-flatpak.gpg)"
           rm -rf site && mkdir -p site

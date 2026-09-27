@@ -94,7 +94,7 @@ env:
 
 jobs:
   builders:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner || 'ubuntu-24.04' }}
     timeout-minutes: 60
     strategy:
       matrix:
@@ -135,6 +135,11 @@ jobs:
           # manifest means bumping this Dockerfile's ARGs in the same commit.
           - image: punktfunk-flatpak-ci
             dockerfile: ci/flatpak-ci.Dockerfile
+          # The same builder for flatpak.yml's aarch64 leg, built natively on the arm64 runner:
+          # flatpak-builder runs its sandbox in the target arch.
+          - image: punktfunk-flatpak-ci-arm64
+            dockerfile: ci/flatpak-ci.Dockerfile
+            runner: linux-arm64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

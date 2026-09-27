@@ -95,9 +95,16 @@ ARCH=aarch64 bash packaging/flatpak/build-flatpak.sh
 `ARCH` defaults to this machine's, and the bundle name now carries the architecture so an x86_64
 and an aarch64 build can coexist in `dist/`. This is **not** a cross-compile: flatpak-builder runs
 the build in a sandbox for the target arch, so building aarch64 anywhere but an arm64 machine
-needs qemu binfmt and is very slow. Not yet verified end to end — the manifest is correct by
-construction and the Skia hash was checked against the published archive, but no aarch64 flatpak
-has been built.
+needs qemu binfmt and is very slow.
+
+CI builds aarch64 as a second leg of `flatpak.yml`, on a runner labelled `linux-arm64`, in the
+image `punktfunk-flatpak-ci-arm64` (a `docker.yml` `builders` row that runs on that runner). Both legs publish
+into the same OSTree repo, so the `.flatpakref` installs the right arch on its own. The bundle is
+`punktfunk-client-<version>-aarch64.flatpak`, and the alias is `<channel>/punktfunk-client-aarch64.flatpak`.
+The leg is `continue-on-error` and never holds back x86_64.
+
+The runner is a VM on the macOS CI Mac mini (unom/infra `runners/home-runner-arm-1`). It sits on
+the LAN, so it pulls the builder from the LAN registry and uses ci-core's cache like the amd64 fleet.
 
 ## Manifest
 
