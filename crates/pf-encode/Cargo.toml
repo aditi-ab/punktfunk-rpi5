@@ -56,7 +56,7 @@ libc = "0.2"
 rustix = { version = "1", features = ["fs"] }
 # Vulkan bindings for the raw Vulkan-Video encode + PyroWave compute backends (feature-gated below;
 # the dep stays unconditional to mirror the host's Linux target — unused-but-declared is harmless).
-ash = "0.38"
+ash = { workspace = true }
 # `libnvidia-encode.so.1` is dlopen'd at runtime for the direct-SDK NVENC/CUDA backend.
 libloading = "0.9"
 # Direct-SDK NVENC (raw `sys::nvEncodeAPI` types; entry points resolved at runtime). `ci-check` =

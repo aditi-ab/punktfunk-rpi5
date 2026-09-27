@@ -25,7 +25,7 @@ libloading = "0.9"
 khronos-egl = { version = "6", features = ["dynamic"] }
 # Vulkan bridge for LINEAR dmabufs (gamescope): VK_EXT_external_memory_dma_buf import,
 # GPU-copy into an exportable allocation, export OPAQUE_FD → cuImportExternalMemory.
-ash = "0.38"
+ash = { workspace = true }
 # The isolated import worker's control protocol: small serde_json blobs over a Unix socket
 # (SCM_RIGHTS carries the fds; pixels never cross the socket).
 serde = { version = "1", features = ["derive"] }

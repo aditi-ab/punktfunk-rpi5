@@ -9,8 +9,7 @@ members = [
     "crates/punktfunk-encode-worker",
     "crates/punktfunk-tray",
     "crates/punktfunk-setup",
-    # The Windows installer wizard (WinUI 3 over the same engine). Stub bin off-Windows;
-    # shares clients/windows' windows-reactor pin, bumped together.
+    # The Windows installer wizard (WinUI 3 over the same engine). Stub bin off-Windows.
     "crates/punktfunk-setup-win",
     "crates/pf-bitstream",
     "crates/pf-bitstream/vendor/cros-codecs",
@@ -87,6 +86,42 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 authors = ["unom"]
 repository = "https://git.unom.io/unom/punktfunk"
+
+# Pins every member must share. A member adds `optional` and its own features on top; cargo
+# unions them with the entry's.
+[workspace.dependencies]
+# The TLS stack runs on aws-lc-rs. rustls, quinn, rcgen and ureq each pick a backend on their own
+# and default to ring, so each entry turns defaults off and names aws-lc-rs. quinn's list is its
+# default set with `rustls-ring` swapped out; ureq takes `rustls-no-provider` because its `rustls`
+# feature pulls ring. `prefer-post-quantum` leads with the X25519MLKEM768 hybrid; ring has no
+# ML-KEM. `prebuilt-nasm` keeps aws-lc-sys building on Windows without NASM.
+aws-lc-rs = { version = "1.18", features = ["prebuilt-nasm"] }
+quinn = { version = "0.11", default-features = false, features = [
+    "log",
+    "platform-verifier",
+    "runtime-tokio",
+    "rustls-aws-lc-rs",
+    "bloom",
+] }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std"] }
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
+
+# microsoft/windows-rs at one verified commit: windows-reactor is unpublished (0.0.0), and
+# `windows` comes from the same rev so its `windows-core` unifies with reactor's. Re-run
+# clients/windows' tests/reactor_semantics.rs on every bump. Host crates declare crates.io
+# `windows = "0.62"` inline: cargo can't rename a workspace entry per member.
+windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
+windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
+windows-reactor-setup = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
+test_reactor = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
+
+windows-sys = "0.61"
+
+# One generation owns every Vulkan handle, including the ones sdl3's `ash` feature types.
+ash = "0.38"
+# The vendored parser snapshot the decode crates share.
+cros-codecs = { path = "crates/pf-bitstream/vendor/cros-codecs" }
 
 # The `unsafe` discipline the `packaging/windows/drivers/*` crates already run, extended to the
 # workspace. `unsafe fn` marks a CONTRACT the caller must uphold; it is not a licence for the whole

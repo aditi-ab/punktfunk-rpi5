@@ -33,7 +33,7 @@ pf-vkdecode = { path = "../pf-vkdecode" }
 # start and fail into a clean error; on Windows vulkan-1.dll is a GPU-driver component).
 # `ash` on sdl3 types SDL_Vulkan_CreateSurface with ash 0.38 handles so the surface
 # hands over without transmutes.
-ash = { version = "0.38", features = ["loaded"] }
+ash = { workspace = true, features = ["loaded"] }
 
 async-channel = "2"
 anyhow = "1"
@@ -59,7 +59,7 @@ sdl3 = { version = "0.18", features = ["hidapi", "ash", "build-from-source"] }
 # bar/taskbar (WM_SETICON) and the shared AppUserModelID for unpackaged runs, so the
 # shell and the session window group as ONE taskbar app across the visibility handoff. Gdi: the
 # window's monitor, the key for the HDR volume lookup.
-windows-sys = { version = "0.61", features = [
+windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Storage_Packaging_Appx",

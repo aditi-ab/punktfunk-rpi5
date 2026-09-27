@@ -127,9 +127,8 @@ pf-client-core = { path = "../../../crates/pf-client-core", default-features = f
 # The PyroWave lane's own Vulkan: device bring-up, swapchain on the `SurfaceView`, and the
 # planar CSC pipeline (`src/pyro/`). `loaded` dlopens libvulkan.so at RUNTIME rather than
 # linking it, which is what keeps the `.so` loading on a device with no Vulkan at all — there
-# the probe simply answers no and the client never advertises the codec. Same pinned version as
-# pf-client-core/pf-presenter so one ash generation owns the handles.
-ash = { version = "0.38", features = ["loaded"] }
+# the probe simply answers no and the client never advertises the codec.
+ash = { workspace = true, features = ["loaded"] }
 # `gl` + `textlayout` = the prebuilt key `gl-jpegd-jpege-pdf-textlayout` (verify
 # `DOWNLOAD AND INSTALL SUCCEEDED` in the build log on every bump — see pf-console-ui/Cargo.toml).
 skia-safe = { version = "0.99", features = ["gl", "textlayout"] }

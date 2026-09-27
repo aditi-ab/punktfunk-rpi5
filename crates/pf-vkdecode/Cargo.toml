@@ -9,12 +9,11 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-ash = "0.38"
+ash = { workspace = true }
 # Direct dependency on the vendored parser crate, not just pf-bitstream: the parameter-set
 # conversion consumes the parser's `Sps`/`Pps` types wholesale (pf-bitstream re-exports only
-# `Level`/`SliceHeader`), and the same path means the one crate instance the workspace already
-# builds — no duplicate types.
-cros-codecs = { path = "../pf-bitstream/vendor/cros-codecs" }
+# `Level`/`SliceHeader`).
+cros-codecs = { workspace = true }
 pf-bitstream = { path = "../pf-bitstream" }
 tracing = "0.1"
 

@@ -31,27 +31,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Ed25519 over the exact manifest bytes — the same primitive the plugin-store index uses, on the
 # workspace's one crypto backend. aws-lc-rs's API is ring-compatible, so the call sites are
-# unchanged apart from the crate name.
-#
-# `prebuilt-nasm` is what lets aws-lc-sys build on Windows x86_64 without NASM installed. rustls
-# enables it for its own dependents, but a build that selects THIS crate without one that turns on
-# rustls's `aws_lc_rs` feature — `cargo test -p pf-update-check` is exactly that, since its only
-# rustls comes from ureq's ring-flavoured dependency — would get no enabler and fail on the CI
-# runner. Naming it here makes the crate build standalone instead of relying on who else is in
-# the selection.
-aws-lc-rs = { version = "1", features = ["prebuilt-nasm"], optional = true }
+# unchanged apart from the crate name. The workspace entry's `prebuilt-nasm` matters here:
+# `cargo test -p pf-update-check` selects no rustls `aws_lc_rs` that would enable it, and without
+# it aws-lc-sys wants NASM on Windows x86_64.
+aws-lc-rs = { workspace = true, optional = true }
 # Feature selection matched to ureq's (and punktfunk-host's) on purpose — 0.23's default-on
 # `simd-unsafe` engine stays off, so a currency bump doesn't quietly add unsafe SIMD to the tree.
 base64 = { version = "0.23", default-features = false, features = ["std"], optional = true }
 # Small, sync, bundles webpki roots — no system cert store dependency, which matters on the
 # Deck (Decky's embedded Python has no usable roots either; see clients/decky/main.py).
-# ⚠ `rustls-no-provider`, NEVER the default `rustls` feature — that one pulls `_ring`, which would
-# put the ring backend back into a tree that has deliberately moved to aws-lc-rs.
-ureq = { version = "3", default-features = false, optional = true, features = [
-    "rustls-no-provider",
-    "rustls-webpki-roots",
-    "gzip",
-] }
+ureq = { workspace = true, optional = true, features = ["gzip"] }
 
 [dev-dependencies]
 tempfile = "3"

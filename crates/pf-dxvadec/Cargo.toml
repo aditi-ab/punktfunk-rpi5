@@ -14,9 +14,8 @@ repository.workspace = true
 bytemuck = { version = "1.25", features = ["derive", "min_const_generics"] }
 # Direct dependency on the vendored parser crate, not just pf-bitstream: the picture-parameter
 # conversion consumes the parser's `Sps`/`Pps` types wholesale (pf-bitstream re-exports only
-# `Level`/`SliceHeader`), and the same path means the one crate instance the workspace already
-# builds — no duplicate types.
-cros-codecs = { path = "../pf-bitstream/vendor/cros-codecs" }
+# `Level`/`SliceHeader`).
+cros-codecs = { workspace = true }
 pf-bitstream = { path = "../pf-bitstream" }
 tracing = "0.1"
 

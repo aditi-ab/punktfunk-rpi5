@@ -29,11 +29,11 @@ pf-bitstream = { path = "../pf-bitstream" }
 log = "0.4"
 tracing = { version = "0.1", default-features = false, features = ["std", "log"] }
 # The demo host: a quinn endpoint on its own runtime and a fresh self-signed certificate,
-# Opus silence on the audio plane. Same pins as core, so cargo unifies each build.
+# Opus silence on the audio plane.
 opus = { version = "0.3", optional = true }
-quinn = { version = "0.11", optional = true, default-features = false }
+quinn = { workspace = true, optional = true }
 rand = { version = "0.9", optional = true }
-rcgen = { version = "0.14", optional = true, default-features = false, features = ["aws_lc_rs", "pem"] }
+rcgen = { workspace = true, optional = true }
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros", "time"] }
 
 [lints]

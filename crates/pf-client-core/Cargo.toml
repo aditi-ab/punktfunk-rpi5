@@ -125,19 +125,11 @@ mdns-sd = { version = "0.21", optional = true }
 # Game-library fetch from the host's management API over mTLS + fingerprint pinning.
 # `ureq` is small + sync (the host uses it too) and its rustls unifies with the
 # workspace's (quinn's) 0.23; the pinning verifier mirrors core's private `PinVerify`.
-# ⚠ `rustls-no-provider`, NEVER the default `rustls` feature: that one pulls `_ring`, which would
-# put the ring backend back into a tree that has moved to aws-lc-rs. Same spelling everywhere.
-ureq = { version = "3", default-features = false, optional = true, features = [
-    "rustls-no-provider",
-    "rustls-webpki-roots",
-    "gzip",
-] }
+ureq = { workspace = true, optional = true, features = ["gzip"] }
 # Signed update-manifest fetch/verify + the install-kind ladder, shared with the host so one
 # trust rule serves both (crates/pf-update-check).
 pf-update-check = { path = "../pf-update-check", optional = true }
-# aws-lc-rs backend + PQ hybrid key exchange, matching punktfunk-core (see its Cargo.toml for
-# why every crate that names a rustls backend has to name the same one).
-rustls = { version = "0.23", default-features = false, optional = true, features = ["aws_lc_rs", "prefer-post-quantum", "logging", "std", "tls12"] }
+rustls = { workspace = true, optional = true, features = ["logging", "tls12"] }
 # Art-cache keys (`art_cache`): the SHA-256 of a poster URL. Already in the tree —
 # punktfunk-core's `tls` hashes certificates with the same version.
 sha2 = "0.11"
@@ -208,10 +200,10 @@ pf-dxvadec = { path = "../pf-dxvadec", optional = true }
 winreg = { version = "0.56", optional = true }
 sdl3 = { version = "0.18", features = ["hidapi", "build-from-source"], optional = true }
 # D3D11 decode-device plumbing (video_d3d11.rs): device/adapter selection, DXVA probes, and
-# the shared NT-handle hand-off ring `video_d3d11_native` fills. Same pinned rev as
-# clients/windows so `windows-core` unifies with windows-reactor's. Not the only windows-rs
-# here — `wasapi` pulls the crates.io copy too; clients/windows/Cargo.toml says why it stays.
-windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc", optional = true, features = [
+# the shared NT-handle hand-off ring `video_d3d11_native` fills. The workspace entry's git rev,
+# so `windows-core` unifies with windows-reactor's. `wasapi` pulls the crates.io copy too;
+# clients/windows/Cargo.toml says why it stays.
+windows = { workspace = true, optional = true, features = [
     # Features are header-named since windows-rs generates from the SDK headers directly
     # (#4689) — one feature per header, replacing the old `Win32_*` namespace features.
     "d3d11",
@@ -259,11 +251,10 @@ pf-bitstream = { path = "../pf-bitstream", features = ["test-vectors"] }
 # Windows, and the JNI client's own swapchain on Android (pyrowave-sys covers all three;
 # it is an empty stub elsewhere). Its own target table rather than the desktop one above,
 # because Android takes this crate `--no-default-features` — no decode ladder, no session
-# pump, just the wavelet lane. `ash` only wraps the owner's existing raw handles (same
-# pinned version as pf-presenter).
+# pump, just the wavelet lane. `ash` only wraps the owner's existing raw handles.
 [target.'cfg(any(target_os = "linux", windows, target_os = "android"))'.dependencies]
 pyrowave-sys = { path = "../pyrowave-sys", optional = true }
-ash = { version = "0.38", optional = true }
+ash = { workspace = true, optional = true }
 
 [features]
 # `desktop` separates the full Linux/Windows stack — session pump, the native decode ladder,
