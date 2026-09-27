@@ -60,7 +60,11 @@ pub use crate::sei::RecoveryPointHevc;
 pub mod conceal;
 mod refs;
 
+pub use refs::CurrentRefs;
 pub use refs::RefRpsIdxError;
+pub use refs::RpsError;
+pub use refs::RPS_SET_LEN;
+pub use refs::RPS_UNUSED;
 
 /// Everything a backend needs to submit one access unit.
 #[derive(Debug, Clone)]

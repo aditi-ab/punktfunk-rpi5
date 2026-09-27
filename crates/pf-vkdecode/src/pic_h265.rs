@@ -20,6 +20,8 @@ use pf_bitstream::h265::AuPlan;
 use pf_bitstream::h265::PicId;
 use pf_bitstream::h265::RefPic;
 use pf_bitstream::h265::RefRpsIdxError;
+use pf_bitstream::h265::RpsError;
+use pf_bitstream::h265::RPS_UNUSED;
 use tracing::trace;
 
 use crate::slots::Removals;
@@ -187,6 +189,15 @@ impl From<SlotError> for PlanToVkH265Error {
     }
 }
 
+impl From<RpsError> for PlanToVkH265Error {
+    fn from(err: RpsError) -> Self {
+        match err {
+            RpsError::SetOverflow { set, len } => PlanToVkH265Error::RpsSetOverflow { set, len },
+            RpsError::OutsideRps(id) => PlanToVkH265Error::ReferenceOutsideRps(id),
+        }
+    }
+}
+
 impl From<RefRpsIdxError> for PlanToVkH265Error {
     fn from(err: RefRpsIdxError) -> Self {
         PlanToVkH265Error::RefRpsIdx(err)
@@ -231,64 +242,37 @@ pub fn plan_to_vk_h265(
         });
     }
 
-    // Union of the three current RPS sets, first appearance first. A picture
-    // appears once even if concealment resolved two entries to the same id.
-    let mut refs: Vec<VkRefH265> = Vec::new();
-    let mut index_arrays = [[UNUSED_RPS_ENTRY; H265_RPS_LIST_SIZE]; 3];
-    let sets: [(&'static str, &[RefPic]); 3] = [
-        ("RefPicSetStCurrBefore", &plan.rps.st_curr_before),
-        ("RefPicSetStCurrAfter", &plan.rps.st_curr_after),
-        ("RefPicSetLtCurr", &plan.rps.lt_curr),
-    ];
-    for (array, (name, set)) in index_arrays.iter_mut().zip(sets) {
-        if set.len() > H265_RPS_LIST_SIZE {
-            return Err(PlanToVkH265Error::RpsSetOverflow {
-                set: name,
-                len: set.len(),
-            });
-        }
-        for (position, rp) in set.iter().enumerate() {
-            let entry = match refs.iter().position(|existing| existing.id == rp.id) {
-                Some(index) => {
-                    // Duplicate across sets: bind once. If any occurrence is
-                    // long-term, mark it so — hardware treats LT refs differently
-                    // (no MV scaling, POC-LSB matching).
-                    if rp.is_long_term {
-                        refs[index].std.flags.set_used_for_long_term_reference(1);
-                    }
-                    refs[index].slot
-                }
-                None => {
-                    let slot = slots
-                        .slot_of(rp.id)
-                        .ok_or(PlanToVkH265Error::UnresolvedReference(rp.id))?;
-                    refs.push(VkRefH265 {
-                        slot,
-                        std: ref_info(rp),
-                        id: rp.id,
-                    });
-                    slot
-                }
-            };
-            // DPB slot index, not a `refs` position. Slots ≤ 17, so never 0xFF.
-            debug_assert_ne!(entry, UNUSED_RPS_ENTRY, "a real DPB slot is never 0xFF");
-            array[position] = entry;
-        }
+    // The current sets bind once per picture. If any occurrence is long-term,
+    // mark it so: hardware treats LT refs differently (no MV scaling, POC-LSB
+    // matching).
+    let current = plan.current_rps_refs()?;
+    let mut refs: Vec<VkRefH265> = Vec::with_capacity(current.refs.len());
+    for (rp, long_term) in &current.refs {
+        let slot = slots
+            .slot_of(rp.id)
+            .ok_or(PlanToVkH265Error::UnresolvedReference(rp.id))?;
+        let mut std = ref_info(rp);
+        std.flags
+            .set_used_for_long_term_reference(u32::from(*long_term));
+        refs.push(VkRefH265 {
+            slot,
+            std,
+            id: rp.id,
+        });
     }
-
-    for slice in &plan.slices {
-        for rp in slice.ref_list0.iter().chain(&slice.ref_list1) {
-            if !refs.iter().any(|existing| existing.id == rp.id) {
-                return Err(PlanToVkH265Error::ReferenceOutsideRps(rp.id));
-            }
-        }
-    }
+    // DPB slot indices, not `refs` positions. Slots ≤ 17, so never 0xFF.
+    let index_arrays = current.index.map(|set| {
+        set.map(|position| match position {
+            RPS_UNUSED => UNUSED_RPS_ENTRY,
+            position => refs[usize::from(position)].slot,
+        })
+    });
 
     // The *Foll* pictures bind after the current sets, as FFmpeg's Vulkan hwaccel
     // binds them. A picture this AU retires is no reference: skipping it keeps the
     // setup slot, assigned below from freed slots, out of the list.
-    for rp in &plan.dpb_refs {
-        if plan.dpb.removed.contains(&rp.id) || refs.iter().any(|r| r.id == rp.id) {
+    for rp in &current.foll {
+        if plan.dpb.removed.contains(&rp.id) {
             continue;
         }
         match slots.slot_of(rp.id) {
