@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod control;
-mod frame_channel;
+pub(crate) mod frame_channel;
 mod pad_mouse;
 mod pairing;
 mod planes;
