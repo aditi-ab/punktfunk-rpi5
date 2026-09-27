@@ -116,6 +116,8 @@ object SkiaConsole {
     /** A completed load left no identity — the keystore threw or never answered. Main-thread only. */
     private var identityFailed = false
     private val identityLoading = AtomicBoolean(false)
+    /** A link that arrived before the first identity load ended; replayed once it has. Main-thread only. */
+    private var parkedLink: String? = null
     private var discovery: HostDiscovery? = null
     private var discovered: List<DiscoveredHost> = emptyList()
 
@@ -415,11 +417,15 @@ object SkiaConsole {
         discovery = HostDiscovery.shared(app).also { it.addNetworkListener(onNetworkChanged) }
         resumeDiscovery()
         // Commands from the console, drained on a short cadence once the identity load ends:
-        // a start entry queues its shelf fetch or desktop dial before that.
+        // a start entry queues its shelf fetch or desktop dial before that, and a cold-start
+        // link waits in `parkedLink`.
         main.post(object : Runnable {
             override fun run() {
                 if (handle == 0L) return
-                if (identityLoaded) drainCommands()
+                if (identityLoaded) {
+                    parkedLink?.let { parkedLink = null; handleDeepLink(it) }
+                    drainCommands()
+                }
                 main.postDelayed(this, 100)
             }
         })
@@ -519,9 +525,14 @@ object SkiaConsole {
      * decision — or that named the host by a guessable label or address — is a notice here. A link
      * may never establish trust, the console's Pair screen is reached from the host's tile rather
      * than from a URL, and the console draws no prompt this shell could ask a question through.
+     * A cold start delivers the link before the identity load ends; it waits for that.
      */
     fun handleDeepLink(url: String) {
         if (handle == 0L) return
+        if (!identityLoaded) {
+            parkedLink = url
+            return
+        }
         val parsed = io.unom.punktfunk.kit.link.DeepLinks.parse(url)
         if (parsed is io.unom.punktfunk.kit.link.DeepLinkResult.Refused) {
             if (parsed.error != io.unom.punktfunk.kit.link.LinkError.NOT_OUR_SCHEME) notice(parsed.message())
