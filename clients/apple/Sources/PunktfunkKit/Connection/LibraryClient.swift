@@ -461,6 +461,12 @@ public enum LibraryClient {
         }
     }
 
+    /// Build and cache the TLS identity ahead of the first request. Blocking Keychain work:
+    /// call off the main actor, so the callers on it find the pair built.
+    public static func warmIdentity(_ identity: ClientIdentity) {
+        _ = try? ClientTLS.makeIdentity(certPEM: identity.certPEM, keyPEM: identity.keyPEM)
+    }
+
     /// One request against the host — a GET, or a POST when `body` is given — with transport
     /// failures mapped onto `LibraryError`.
     static func send(
