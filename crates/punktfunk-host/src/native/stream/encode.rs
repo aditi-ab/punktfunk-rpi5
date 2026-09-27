@@ -431,6 +431,43 @@ impl StreamState {
         );
     }
 
+    /// The AU-level fields for the AU just taken, from its `inflight` stamps
+    /// `(capture, submit, deadline)`. On the driver the host submits nothing: the stages are
+    /// the driver's own, and its per-AU present time (`pts_ns`) beats the tick's clock, which
+    /// would give every AU of a burst the same one.
+    fn au_meta(
+        &self,
+        st: &Stamps,
+        (cap_ns, sub_ns, deadline): (u64, u64, std::time::Instant),
+        pts_ns: u64,
+        flags: u32,
+        wait_us: u32,
+    ) -> AuMeta {
+        let d = if st.owed {
+            driver_stages(&*self.enc)
+        } else {
+            AuStages::host((now_ns().saturating_sub(sub_ns) / 1000) as u32, st.queue_us)
+        };
+        AuMeta {
+            capture_ns: if st.owed && pts_ns > 0 {
+                pts_ns
+            } else {
+                cap_ns
+            },
+            flags,
+            frame_index: self.au_seq,
+            deadline,
+            encode_us: d.encode_us,
+            queue_us: d.queue_us,
+            cap_us: st.cap_us,
+            submit_us: st.submit_us,
+            wait_us,
+            repeat: st.repeat,
+            was_measured: st.measure,
+            driver: d.driver,
+        }
+    }
+
     /// Stream one AU's chunks as they land. `Au` = a whole AU went out (the caller polls again
     /// while owed frames remain); `Nothing` = the encoder has no more output this tick.
     fn poll_chunked(&mut self, st: &Stamps, resend_meta: &mut bool) -> Polled {
@@ -473,38 +510,16 @@ impl StreamState {
                 self.bringup.mark("first_au");
             }
             let last = c.last;
-            let (cap_ns, sub_ns, deadline) = *self.inflight.front().expect("inflight non-empty");
+            let inflight = *self.inflight.front().expect("inflight non-empty");
             let wait_total_us = t_wait.elapsed().as_micros() as u32;
-            // On the driver the host submits nothing: the stages are the driver's own stamps,
-            // or its present → arrival lump, and the tick's queue age means nothing.
-            let d = if st.owed {
-                driver_stages(&*self.enc)
-            } else {
-                AuStages::host((now_ns().saturating_sub(sub_ns) / 1000) as u32, st.queue_us)
-            };
-            // The driver stamps each AU with its own present time; the tick's clock
-            // would give every AU of a burst the same one.
-            let capture_ns = if st.owed && c.pts_ns > 0 {
-                c.pts_ns
-            } else {
-                cap_ns
-            };
+            let wait_us = if st.measure { wait_total_us } else { 0 };
+            let meta = self.au_meta(st, inflight, c.pts_ns, flags, wait_us);
+            let encode_us = meta.encode_us;
             let msg = ChunkMsg {
                 data: c.data,
                 first: c.first,
                 last,
-                capture_ns,
-                flags,
-                frame_index: self.au_seq,
-                deadline,
-                encode_us: d.encode_us,
-                queue_us: d.queue_us,
-                cap_us: st.cap_us,
-                submit_us: st.submit_us,
-                wait_us: if st.measure { wait_total_us } else { 0 },
-                repeat: st.repeat,
-                was_measured: st.measure,
-                driver: d.driver,
+                meta,
             };
             if self.frame_tx.send(SendMsg::Chunk(msg)).is_err() {
                 return Polled::SendGone;
@@ -518,7 +533,7 @@ impl StreamState {
                     if self.sent % 120 == 0 {
                         tracing::info!(
                             first_slice_us = first_chunk_us,
-                            encode_us = d.encode_us,
+                            encode_us,
                             "streamed AU (sampled): first slice handed to send at \
                              first_slice_us; encode finished at encode_us"
                         );
@@ -549,7 +564,7 @@ impl StreamState {
             Err(e) => return Polled::Failed(e),
         };
         self.watchdog.on_au();
-        let (cap_ns, sub_ns, deadline) = self.inflight.pop_front().expect("inflight non-empty");
+        let inflight = self.inflight.pop_front().expect("inflight non-empty");
         let caps = self.enc.caps();
         let flags = au_flags(
             &caps,
@@ -562,32 +577,9 @@ impl StreamState {
             &self.counters.link,
         );
         self.send_hdr_meta(au.keyframe, resend_meta);
-        // As in the chunked arm: the driver's stamps, not a host submit that never happened.
-        let d = if st.owed {
-            driver_stages(&*self.enc)
-        } else {
-            AuStages::host((now_ns().saturating_sub(sub_ns) / 1000) as u32, st.queue_us)
-        };
-        // As in the chunked arm: the driver's per-AU present time over the tick's clock.
-        let capture_ns = if st.owed && au.pts_ns > 0 {
-            au.pts_ns
-        } else {
-            cap_ns
-        };
         let msg = FrameMsg {
+            meta: self.au_meta(st, inflight, au.pts_ns, flags, wait_us),
             data: au.data,
-            capture_ns,
-            flags,
-            frame_index: self.au_seq,
-            deadline,
-            encode_us: d.encode_us,
-            queue_us: d.queue_us,
-            cap_us: st.cap_us,
-            submit_us: st.submit_us,
-            wait_us,
-            repeat: st.repeat,
-            was_measured: st.measure,
-            driver: d.driver,
         };
         self.bringup.mark("first_au");
         if self.frame_tx.send(SendMsg::Frame(msg)).is_err() {
@@ -802,18 +794,20 @@ impl StreamState {
             let encode_us = (now_ns().saturating_sub(sub_ns) / 1000) as u32;
             let msg = FrameMsg {
                 data: au.data,
-                capture_ns: cap_ns,
-                flags,
-                frame_index: self.au_seq,
-                deadline,
-                encode_us,
-                queue_us: 0,
-                cap_us: 0,
-                submit_us: 0,
-                wait_us: 0,
-                repeat: false,
-                was_measured: false,
-                driver: None,
+                meta: AuMeta {
+                    capture_ns: cap_ns,
+                    flags,
+                    frame_index: self.au_seq,
+                    deadline,
+                    encode_us,
+                    queue_us: 0,
+                    cap_us: 0,
+                    submit_us: 0,
+                    wait_us: 0,
+                    repeat: false,
+                    was_measured: false,
+                    driver: None,
+                },
             };
             if self.frame_tx.send(SendMsg::Frame(msg)).is_err() {
                 break;

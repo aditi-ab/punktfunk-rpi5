@@ -6,9 +6,10 @@
 
 use super::*;
 
-/// One encoded AU handed to the send thread. Encode of N+1 overlaps transmit of N.
-pub(super) struct FrameMsg {
-    pub(super) data: Vec<u8>,
+/// The AU-level fields of one encoded AU: the same on its whole-AU message and on every
+/// chunk of a streamed one.
+#[derive(Clone, Copy)]
+pub(super) struct AuMeta {
     pub(super) capture_ns: u64,
     pub(super) flags: u32,
     /// Predicted at submit as `au_seq + inflight`; stamped on the wire so RFI stays 1:1 across rebuilds.
@@ -31,29 +32,24 @@ pub(super) struct FrameMsg {
     pub(super) driver: Option<crate::stats_recorder::DriverSample>,
 }
 
+/// One encoded AU handed to the send thread. Encode of N+1 overlaps transmit of N.
+pub(super) struct FrameMsg {
+    pub(super) data: Vec<u8>,
+    pub(super) meta: AuMeta,
+}
+
 /// Whole AU, or one slice-boundary chunk of a streamed AU (seal/pace while the encoder still runs).
 pub(super) enum SendMsg {
     Frame(FrameMsg),
     Chunk(ChunkMsg),
 }
 
-/// One encoder chunk of a streamed AU. AU-level fields match on every chunk; splits matter on `last`.
+/// One encoder chunk of a streamed AU. Splits matter on `last`.
 pub(super) struct ChunkMsg {
     pub(super) data: Vec<u8>,
     pub(super) first: bool,
     pub(super) last: bool,
-    pub(super) capture_ns: u64,
-    pub(super) flags: u32,
-    pub(super) frame_index: u32,
-    pub(super) deadline: std::time::Instant,
-    pub(super) encode_us: u32,
-    pub(super) queue_us: u32,
-    pub(super) cap_us: u32,
-    pub(super) submit_us: u32,
-    pub(super) wait_us: u32,
-    pub(super) repeat: bool,
-    pub(super) was_measured: bool,
-    pub(super) driver: Option<crate::stats_recorder::DriverSample>,
+    pub(super) meta: AuMeta,
 }
 
 /// Open streamed AU: incremental sealer plus pace aggregation across per-chunk flushes.
@@ -75,7 +71,8 @@ fn handle_chunk(
     burst_cap: Option<usize>,
     pace_rate_bps: u64,
     max_spread: std::time::Duration,
-) -> Result<Option<(FrameMsg, PaceStat)>> {
+) -> Result<Option<(AuMeta, PaceStat)>> {
+    let m = c.meta;
     if c.first {
         if open.take().is_some() {
             // Rebuild forfeits the in-flight AU; sentinel packets are already on the wire.
@@ -84,20 +81,20 @@ fn handle_chunk(
             );
         }
         // USER_FLAG_SLICE_STREAM only toward a client that negotiated streamed AUs AND multi-slice.
-        let flags = c.flags
+        let flags = m.flags
             | if slice_wire {
                 punktfunk_core::packet::USER_FLAG_SLICE_STREAM
             } else {
                 0
             }
-            | if c.repeat {
+            | if m.repeat {
                 punktfunk_core::packet::USER_FLAG_REPEAT
             } else {
                 0
             };
         *open = Some(StreamedOpen {
             au: session
-                .begin_streamed_frame_at(c.capture_ns, flags, c.frame_index)
+                .begin_streamed_frame_at(m.capture_ns, flags, m.frame_index)
                 .map_err(|e| anyhow!("begin_streamed_frame: {e:?}"))?,
             spread_us: 0,
             paced: false,
@@ -126,7 +123,7 @@ fn handle_chunk(
         let stat = pace_sealed(
             session,
             wires,
-            c.deadline,
+            m.deadline,
             s.burst_left.or(burst_cap),
             pace_rate_bps,
             max_spread,
@@ -147,32 +144,121 @@ fn handle_chunk(
     let stat = pace_sealed(
         session,
         tail,
-        c.deadline,
+        m.deadline,
         s.burst_left.or(burst_cap),
         pace_rate_bps,
         max_spread,
     )?;
     Ok(Some((
-        FrameMsg {
-            data: Vec::new(),
-            capture_ns: c.capture_ns,
-            flags: c.flags,
-            frame_index: c.frame_index,
-            deadline: c.deadline,
-            encode_us: c.encode_us,
-            queue_us: c.queue_us,
-            cap_us: c.cap_us,
-            submit_us: c.submit_us,
-            wait_us: c.wait_us,
-            repeat: c.repeat,
-            was_measured: c.was_measured,
-            driver: c.driver,
-        },
+        m,
         PaceStat {
             spread_us: s.spread_us.saturating_add(stat.spread_us),
             paced: s.paced || stat.paced,
         },
     )))
+}
+
+/// One 2 s window of per-AU send timings, read by the perf line and the stats recorder.
+#[derive(Default)]
+struct SendWindow {
+    encode_us: Vec<u32>,
+    pace_us: Vec<u32>,
+    /// Capture → fully sent; probes excluded.
+    host_us: Vec<u32>,
+    cap_us: Vec<u32>,
+    submit_us: Vec<u32>,
+    wait_us: Vec<u32>,
+    queue_us: Vec<u32>,
+    driver: crate::stats_recorder::DriverStages,
+    paced: u64,
+    immediate: u64,
+    new: u64,
+    repeats: u64,
+}
+
+impl SendWindow {
+    fn record(&mut self, m: &AuMeta, stat: &PaceStat, host_us: Option<u32>) {
+        self.encode_us.push(m.encode_us);
+        self.pace_us.push(stat.spread_us);
+        self.host_us.extend(host_us);
+        if m.was_measured {
+            match m.driver {
+                Some(d) => self.driver.note(d),
+                None => {
+                    self.cap_us.push(m.cap_us);
+                    self.submit_us.push(m.submit_us);
+                    if !m.repeat {
+                        self.queue_us.push(m.queue_us);
+                    }
+                }
+            }
+            self.wait_us.push(m.wait_us);
+        }
+        if m.repeat {
+            self.repeats += 1;
+        } else {
+            self.new += 1;
+        }
+        if stat.paced {
+            self.paced += 1;
+        } else {
+            self.immediate += 1;
+        }
+    }
+
+    /// The recorder's stages: the driver path's own, then the copy and the send; else the
+    /// host's.
+    fn stages(&mut self) -> Vec<crate::stats_recorder::StageTiming> {
+        use crate::stats_recorder::stage;
+        match self.driver.stages() {
+            Some(mut s) => {
+                s.extend([
+                    stage("copy", &mut self.wait_us),
+                    stage("send", &mut self.pace_us),
+                ]);
+                s
+            }
+            None => vec![
+                stage("queue", &mut self.queue_us),
+                stage("capture", &mut self.cap_us),
+                stage("submit", &mut self.submit_us),
+                stage("encode", &mut self.wait_us),
+                stage("send", &mut self.pace_us),
+            ],
+        }
+    }
+
+    /// Capture → sent `(p50, p99)`; `None` when no AU went out.
+    fn host(&mut self) -> Option<(f32, f32)> {
+        (!self.host_us.is_empty()).then(|| {
+            (
+                percentile(&mut self.host_us, 0.50) as f32,
+                percentile(&mut self.host_us, 0.99) as f32,
+            )
+        })
+    }
+}
+
+/// 0xCF, stamped against the same capture anchor the wire pts carries. On the driver, queue
+/// is its pool wait and encode its encode; the client's residual is hand-off, copy and seal.
+fn send_host_timing(
+    tc: &crate::native::link::SessionLink,
+    m: &AuMeta,
+    stat: &PaceStat,
+    host_us: u32,
+    phase: &PhaseCtl,
+) {
+    let t = punktfunk_core::quic::HostTiming {
+        pts_ns: m.capture_ns,
+        host_us,
+        stages: Some(punktfunk_core::quic::HostStages {
+            queue_us: m.queue_us,
+            encode_us: m.encode_us,
+            pace_us: stat.spread_us,
+        }),
+        applied_phase_ns: Some(phase.applied_ns().clamp(i32::MIN as i64, i32::MAX as i64) as i32),
+    };
+    let _ = tc.send_datagram(punktfunk_core::quic::encode_host_timing_datagram(&t));
 }
 
 /// Inputs the send thread needs for the 2 s web-console sample.
@@ -266,21 +352,9 @@ pub(super) fn send_loop(
     let mut last_wire = std::time::Instant::now();
     let (mut wire_sent, mut wire_dropped) = (0u64, 0u64);
     let mut last_send_dropped = 0u64;
-    let mut encode_us: Vec<u32> = Vec::new();
-    let mut pace_us: Vec<u32> = Vec::new();
-    let (mut paced_frames, mut immediate_frames) = (0u64, 0u64);
+    let mut win = SendWindow::default();
     let mut sid: Option<(u64, u32)> = None;
-    // Capture → fully sent per AU.
-    let mut host_v: Vec<u32> = Vec::new();
-    let mut driver = crate::stats_recorder::DriverStages::default();
     let mut last_driver_dropped = stats.driver_dropped.load(Ordering::Relaxed);
-    let (mut cap_v, mut submit_v, mut wait_v, mut queue_v): (
-        Vec<u32>,
-        Vec<u32>,
-        Vec<u32>,
-        Vec<u32>,
-    ) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    let (mut new_frames, mut repeat_frames) = (0u64, 0u64);
     let mut streamed: Option<StreamedOpen> = None;
     let mut burst: Option<ProbeBurst> = None;
     let mut link_gso = false;
@@ -345,24 +419,24 @@ pub(super) fn send_loop(
                     crate::send_pacing::MAX_PACE_SPREAD
                 };
                 let outcome = match send_msg {
-                    SendMsg::Frame(msg) => paced_submit(
+                    SendMsg::Frame(FrameMsg { data, meta: m }) => paced_submit(
                         &mut session,
-                        &msg.data,
-                        msg.capture_ns,
+                        &data,
+                        m.capture_ns,
                         // HOST_CAP2_REPEAT_MARK makes the bit's absence mean "new content".
-                        msg.flags
-                            | if msg.repeat {
+                        m.flags
+                            | if m.repeat {
                                 punktfunk_core::packet::USER_FLAG_REPEAT
                             } else {
                                 0
                             },
-                        msg.frame_index,
-                        msg.deadline,
+                        m.frame_index,
+                        m.deadline,
                         burst_cap,
                         pace_rate,
                         max_spread,
                     )
-                    .map(|stat| Some((msg, stat))),
+                    .map(|stat| Some((m, stat))),
                     SendMsg::Chunk(c) => handle_chunk(
                         &mut session,
                         &mut streamed,
@@ -375,35 +449,15 @@ pub(super) fn send_loop(
                 };
                 match outcome {
                     Ok(None) => {}
-                    Ok(Some((msg, stat))) => {
-                        if msg.flags & FLAG_PROBE as u32 == 0 {
+                    Ok(Some((m, stat))) => {
+                        let probe = m.flags & FLAG_PROBE as u32 != 0;
+                        if !probe {
                             stats.bringup.finish("first_packet");
                         }
-                        let probe = msg.flags & FLAG_PROBE as u32 != 0;
-                        let host_us = (now_ns().saturating_sub(msg.capture_ns) / 1000)
+                        let host_us = (now_ns().saturating_sub(m.capture_ns) / 1000)
                             .min(u32::MAX as u64) as u32;
-                        // Stamp 0xCF now against the same capture anchor the wire pts carries.
-                        if let Some(tc) = &timing_conn {
-                            if !probe {
-                                let t = punktfunk_core::quic::HostTiming {
-                                    pts_ns: msg.capture_ns,
-                                    host_us,
-                                    // On the driver: queue = its pool wait, encode = its encode,
-                                    // and the client's residual is hand-off + copy + seal.
-                                    stages: Some(punktfunk_core::quic::HostStages {
-                                        queue_us: msg.queue_us,
-                                        encode_us: msg.encode_us,
-                                        pace_us: stat.spread_us,
-                                    }),
-                                    applied_phase_ns: Some(
-                                        phase.applied_ns().clamp(i32::MIN as i64, i32::MAX as i64)
-                                            as i32,
-                                    ),
-                                };
-                                let _ = tc.send_datagram(
-                                    punktfunk_core::quic::encode_host_timing_datagram(&t),
-                                );
-                            }
+                        if let Some(tc) = timing_conn.as_ref().filter(|_| !probe) {
+                            send_host_timing(tc, &m, &stat, host_us, &phase);
                         }
                         // EWMA (3:1): a single AU's spread must not flip the split-arbiter verdict.
                         {
@@ -416,35 +470,8 @@ pub(super) fn send_loop(
                             send_spread_us.store(next, Ordering::Relaxed);
                         }
                         if perf || stats.rec.is_armed() {
-                            encode_us.push(msg.encode_us);
-                            pace_us.push(stat.spread_us);
-                            if !probe {
-                                host_v.push(host_us);
-                            }
-                            if msg.was_measured {
-                                // The driver path's own stages, then the copy and the send.
-                                if let Some(d) = msg.driver {
-                                    driver.note(d);
-                                } else {
-                                    cap_v.push(msg.cap_us);
-                                    submit_v.push(msg.submit_us);
-                                    if !msg.repeat {
-                                        queue_v.push(msg.queue_us);
-                                    }
-                                }
-                                wait_v.push(msg.wait_us);
-                            }
-                            if msg.repeat {
-                                repeat_frames += 1;
-                            } else {
-                                new_frames += 1;
-                            }
+                            win.record(&m, &stat, (!probe).then_some(host_us));
                             wire.sample();
-                            if stat.paced {
-                                paced_frames += 1;
-                            } else {
-                                immediate_frames += 1;
-                            }
                         }
                     }
                     Err(e) => {
@@ -496,13 +523,13 @@ pub(super) fn send_loop(
                     tx_mbps = format!("{tx_mbps:.0}"),
                     send_dropped = s.packets_send_dropped - last_send_dropped,
                     send_dropped_total = s.packets_send_dropped,
-                    encode_us_p50 = percentile(&mut encode_us, 0.50),
-                    encode_us_p99 = percentile(&mut encode_us, 0.99),
-                    pace_us_p50 = percentile(&mut pace_us, 0.50),
-                    pace_us_p99 = percentile(&mut pace_us, 0.99),
-                    pace_us_max = pace_us.last().copied().unwrap_or(0),
-                    immediate_frames,
-                    paced_frames,
+                    encode_us_p50 = percentile(&mut win.encode_us, 0.50),
+                    encode_us_p99 = percentile(&mut win.encode_us, 0.99),
+                    pace_us_p50 = percentile(&mut win.pace_us, 0.50),
+                    pace_us_p99 = percentile(&mut win.pace_us, 0.99),
+                    pace_us_max = win.pace_us.last().copied().unwrap_or(0),
+                    immediate_frames = win.immediate,
+                    paced_frames = win.paced,
                     window_ms = format!("{:.0}", secs * 1000.0),
                     fec_ms = format!("{:.2}", sp.fec_ns as f64 / 1e6),
                     seal_ms = format!("{:.2}", sp.seal_ns as f64 / 1e6),
@@ -527,26 +554,8 @@ pub(super) fn send_loop(
                         &stats.client,
                     )
                 });
-                use crate::stats_recorder::stage;
-                let stages = match driver.stages() {
-                    Some(mut s) => {
-                        s.extend([stage("copy", &mut wait_v), stage("send", &mut pace_us)]);
-                        s
-                    }
-                    None => vec![
-                        stage("queue", &mut queue_v),
-                        stage("capture", &mut cap_v),
-                        stage("submit", &mut submit_v),
-                        stage("encode", &mut wait_v),
-                        stage("send", &mut pace_us),
-                    ],
-                };
-                let host = (!host_v.is_empty()).then(|| {
-                    (
-                        percentile(&mut host_v, 0.50) as f32,
-                        percentile(&mut host_v, 0.99) as f32,
-                    )
-                });
+                let stages = win.stages();
+                let host = win.host();
                 let (fec_us, seal_us, sock_us) = match seal_perf.filter(|p| p.frames > 0) {
                     Some(p) => {
                         let per_frame = |ns: u64| Some(ns as f32 / p.frames as f32 / 1000.0);
@@ -565,11 +574,12 @@ pub(super) fn send_loop(
                     fec_us,
                     seal_us,
                     sock_us,
-                    fps: (new_frames as f64 / secs) as f32,
-                    repeat_fps: (repeat_frames as f64 / secs) as f32,
+                    fps: (win.new as f64 / secs) as f32,
+                    repeat_fps: (win.repeats as f64 / secs) as f32,
                     mbps: tx_mbps as f32,
                     bitrate_kbps: stats.bitrate_kbps.load(Ordering::Relaxed),
-                    frames_dropped: driver
+                    frames_dropped: win
+                        .driver
                         .active()
                         .then(|| driver_dropped.saturating_sub(last_driver_dropped) as u32),
                     packets_dropped: None,
@@ -586,21 +596,10 @@ pub(super) fn send_loop(
                 stats.rec.push_sample(session_id, sample);
             }
             last_driver_dropped = driver_dropped;
-            host_v.clear();
-            driver.reset();
+            win = SendWindow::default();
             last_perf = std::time::Instant::now();
             last_bytes = s.bytes_sent;
             last_send_dropped = s.packets_send_dropped;
-            encode_us.clear();
-            pace_us.clear();
-            cap_v.clear();
-            submit_v.clear();
-            wait_v.clear();
-            queue_v.clear();
-            paced_frames = 0;
-            immediate_frames = 0;
-            new_frames = 0;
-            repeat_frames = 0;
         }
     }
     // Stop, teardown, or a dead channel mid-burst: report what went out, leave nothing armed.
@@ -611,7 +610,77 @@ pub(super) fn send_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::pace_rate_bps;
+    use super::{pace_rate_bps, AuMeta, PaceStat, SendWindow};
+
+    /// A host AU feeds the host stages and a driver AU the driver's. A repeat never counts
+    /// toward the queue stage, and a probe never toward capture → sent.
+    #[test]
+    fn a_send_window_files_each_au_under_its_own_stages() {
+        let meta = AuMeta {
+            capture_ns: 0,
+            flags: 0,
+            frame_index: 0,
+            deadline: std::time::Instant::now(),
+            encode_us: 900,
+            queue_us: 300,
+            cap_us: 100,
+            submit_us: 200,
+            wait_us: 400,
+            repeat: false,
+            was_measured: true,
+            driver: None,
+        };
+        let stat = PaceStat {
+            spread_us: 50,
+            paced: true,
+        };
+        let names = |w: &mut SendWindow| -> Vec<String> {
+            w.stages().into_iter().map(|s| s.name).collect()
+        };
+        let mut w = SendWindow::default();
+        w.record(&meta, &stat, Some(1_000));
+        let repeat = AuMeta {
+            repeat: true,
+            queue_us: 9_999,
+            ..meta
+        };
+        w.record(
+            &repeat,
+            &PaceStat {
+                paced: false,
+                ..stat
+            },
+            None,
+        );
+        let unmeasured = AuMeta {
+            was_measured: false,
+            ..meta
+        };
+        w.record(&unmeasured, &stat, Some(2_000));
+        assert_eq!((w.new, w.repeats, w.paced, w.immediate), (2, 1, 2, 1));
+        assert_eq!(
+            (w.queue_us.len(), w.cap_us.len(), w.encode_us.len()),
+            (1, 2, 3)
+        );
+        assert_eq!(w.host_us, [1_000, 2_000]);
+        assert_eq!(
+            names(&mut w),
+            ["queue", "capture", "submit", "encode", "send"]
+        );
+
+        let mut d = SendWindow::default();
+        let lump = crate::stats_recorder::DriverSample::Lump(Some(700));
+        d.record(
+            &AuMeta {
+                driver: Some(lump),
+                ..meta
+            },
+            &stat,
+            None,
+        );
+        assert!(d.cap_us.is_empty() && d.host().is_none());
+        assert_eq!(names(&mut d), ["driver", "copy", "send"]);
+    }
 
     #[test]
     fn the_link_rate_only_ever_raises_the_pace() {

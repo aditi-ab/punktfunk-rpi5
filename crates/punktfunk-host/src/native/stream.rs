@@ -31,7 +31,7 @@ pub(crate) use self::phase_lock::PhaseCtl;
 pub(super) use self::pipeline::{prepare_display, PrepHandle, PreparedDisplay};
 // `control.rs` bounds its spacing exemption by the same step length.
 pub(crate) use self::ramp::RAMP_STEP_MAX_MS;
-use self::send::{send_loop, ChunkMsg, FrameMsg, SendMsg, SendStats};
+use self::send::{send_loop, AuMeta, ChunkMsg, FrameMsg, SendMsg, SendStats};
 // `native.rs` asks before offering a mid-stream reconfig.
 pub(crate) use self::send::reconfig_allowed;
 use self::session_watch::{session_watch_enabled, session_watcher_loop, SessionSwitch};

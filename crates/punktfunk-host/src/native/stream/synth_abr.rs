@@ -508,21 +508,23 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
             };
             let msg = FrameMsg {
                 data: test_frame(au_seq, len),
-                capture_ns: now_ns(),
-                flags,
-                frame_index: au_seq,
-                deadline: due + interval,
-                // A plausible encode: half a frame budget, which is what a GPU that is not
-                // the bottleneck reads. The client's encode-stage detector needs a number
-                // in the right decade, not a model.
-                encode_us: (500_000 / fps).max(1),
-                queue_us: 0,
-                cap_us: 0,
-                submit_us: 0,
-                wait_us: 0,
-                repeat: shot == Shot::Repeat,
-                was_measured: true,
-                driver: None,
+                meta: AuMeta {
+                    capture_ns: now_ns(),
+                    flags,
+                    frame_index: au_seq,
+                    deadline: due + interval,
+                    // A plausible encode: half a frame budget, which is what a GPU that is not
+                    // the bottleneck reads. The client's encode-stage detector needs a number
+                    // in the right decade, not a model.
+                    encode_us: (500_000 / fps).max(1),
+                    queue_us: 0,
+                    cap_us: 0,
+                    submit_us: 0,
+                    wait_us: 0,
+                    repeat: shot == Shot::Repeat,
+                    was_measured: true,
+                    driver: None,
+                },
             };
             if frame_tx.send(SendMsg::Frame(msg)).is_err() {
                 break;
