@@ -2588,3 +2588,23 @@ fn a_pinned_plate_lands_in_device_space_under_an_inset() {
         "the sections' plate sits above the tabs': {sections:?} vs {tabs:?}"
     );
 }
+
+/// A screen's explainer rides the shell's bottom tray: the tray reaches in by the band's
+/// height while there is a line to show, and not at all once there is none.
+#[test]
+fn an_explainer_reaches_the_shells_tray_in() {
+    let mut settings = pf_client_core::trust::Settings::default();
+    let library = LibraryShared::default();
+    let ctx = crate::screens::Ctx::test(&mut settings, &library);
+    let band = (0.0, crate::widgets::FOOT_DETAIL_H as f32);
+    let customize = Screen::Customize(crate::screens::library::CustomizeScreen::new());
+    assert!(customize.foot(&ctx).is_some());
+    assert_eq!(customize.pinned(1.0, &ctx), band);
+    // No saved host to pin to: the screen says so mid-list and explains nothing below.
+    let pin = Screen::PinHosts(crate::screens::pin_hosts::PinHostsScreen::new(
+        "p1".into(),
+        "Work".into(),
+    ));
+    assert_eq!(pin.foot(&ctx), None);
+    assert_eq!(pin.pinned(1.0, &ctx), (0.0, 0.0));
+}

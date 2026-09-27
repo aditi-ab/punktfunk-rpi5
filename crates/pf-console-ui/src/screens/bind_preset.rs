@@ -10,7 +10,7 @@ use crate::model::ConsoleCmd;
 use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox};
 use crate::theme::{fg, Fonts, W};
-use crate::widgets::{ListMsg, MenuList, RowSpec};
+use crate::widgets::{ListMsg, MenuList, RowSpec, FOOT_DETAIL_H};
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Rect};
 
@@ -185,13 +185,11 @@ impl BindPresetScreen {
             );
             return;
         }
-        // 34 px band under the list for the explainer, matching settings detail text.
-        let detail_h = 34.0 * k;
         let list_rect = Rect::from_ltrb(
             rect.left,
             rect.top,
             rect.right,
-            rect.bottom - detail_h as f32,
+            rect.bottom - (FOOT_DETAIL_H * k) as f32,
         );
         let bound = self.bound(ctx);
         let rows: Vec<RowSpec> = (0..self.len())
@@ -233,21 +231,17 @@ impl BindPresetScreen {
             .collect();
         self.list
             .render(canvas, list_rect, &rows, fonts, k, dt, true);
-        let detail = if self.game.is_some() {
-            "What this title streams with, overriding the host's default. A pinned card still keeps its own."
+    }
+
+    /// The explainer under the list, once there is a list.
+    pub(crate) fn foot(&self) -> Option<&'static str> {
+        if self.presets.is_empty() {
+            None
+        } else if self.game.is_some() {
+            Some("What this title streams with, overriding the host's default. A pinned card still keeps its own.")
         } else {
-            "What a plain press on this host's tile connects with. Pinned cards keep their own."
-        };
-        fonts.centered(
-            canvas,
-            detail,
-            W::Regular,
-            13.0 * k,
-            fg(0.55),
-            cx,
-            f64::from(rect.bottom) - detail_h + 6.0 * k,
-            f64::from(rect.width()) * 0.8,
-        );
+            Some("What a plain press on this host's tile connects with. Pinned cards keep their own.")
+        }
     }
 }
 

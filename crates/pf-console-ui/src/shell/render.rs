@@ -510,12 +510,13 @@ impl LayerEnv<'_> {
         // With focus on the tabs, a root's plate fades out. A root's target count says if
         // focus can enter.
         crate::el::set_dormant(self.strip_focus && band == Band::Strip);
-        let mut pinned_pic = None;
+        let (mut pinned, mut pinned_pic) = ((0.0, 0.0), None);
         let targets = crate::el::census(|| {
             screen.render(canvas, self.content, self.k, self.dt, self.fonts, &mut ctx);
             // Pinned chrome is recorded, not drawn: it goes over the trays, in place, so
             // a slide or a zoom never carries it. Its targets still count here.
-            if screen.pinned(self.k) != (0.0, 0.0) {
+            pinned = screen.pinned(self.k, &ctx);
+            if pinned != (0.0, 0.0) {
                 let mut rec = PictureRecorder::new();
                 let rc = rec.begin_recording(device_edges, false);
                 rc.set_matrix(&base);
@@ -545,7 +546,7 @@ impl LayerEnv<'_> {
             band,
             title,
             hints,
-            pinned: screen.pinned(self.k),
+            pinned,
             pinned_pic,
         }
     }

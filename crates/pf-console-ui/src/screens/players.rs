@@ -266,37 +266,9 @@ impl PlayersScreen {
         self.tree.paint_focus(canvas, frame, k as f32, dt, cheap);
     }
 
-    /// The explainer's band reaches the shell's tray in: grant rows run under it on a
-    /// short screen.
-    pub(crate) fn pinned(&self, k: f64) -> (f32, f32) {
-        (0.0, (crate::widgets::FOOT_DETAIL_H * k) as f32)
-    }
-
-    /// What the focus is, on the shell's tray after the trays.
-    pub(crate) fn render_pinned(
-        &mut self,
-        canvas: &Canvas,
-        rect: Rect,
-        k: f64,
-        fonts: &Fonts,
-        ctx: &Ctx,
-    ) {
-        let detail = detail(self.focused(ctx), ctx, &self.others);
-        let h = (crate::widgets::FOOT_DETAIL_H * k) as f32;
-        crate::widgets::Foot {
-            detail: Some(&detail),
-            ..Default::default()
-        }
-        .paint(
-            canvas,
-            fonts,
-            Rect::from_ltrb(rect.left, rect.bottom - h, rect.right, rect.bottom),
-            (
-                f64::from(rect.left) + edge(k),
-                f64::from(rect.right) - edge(k),
-            ),
-            k,
-        );
+    /// What the focus is. Grant rows run under it on a short screen.
+    pub(crate) fn foot(&self, ctx: &Ctx) -> String {
+        detail(self.focused(ctx), ctx, &self.others)
     }
 }
 

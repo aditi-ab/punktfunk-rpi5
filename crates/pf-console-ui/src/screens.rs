@@ -33,6 +33,7 @@ use crate::theme::Fonts;
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use pf_client_core::{menu_nav::PadInfo, trust};
 use skia_safe::{Canvas, Rect};
+use std::borrow::Cow;
 
 /// Backdrop the shell crossfades on push/pop.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -497,14 +498,25 @@ impl Screen {
         }
     }
 
+    /// One explainer line under the list, painted on the shell's bottom tray.
+    pub(crate) fn foot(&self, ctx: &Ctx) -> Option<Cow<'static, str>> {
+        match self {
+            Screen::Grants(s) => Some(s.foot().into()),
+            Screen::Players(s) => Some(s.foot(ctx).into()),
+            Screen::PinHosts(s) => s.foot(ctx).map(Cow::from),
+            Screen::BindPreset(s) => s.foot().map(Cow::from),
+            Screen::Customize(s) => Some(s.foot().into()),
+            _ => None,
+        }
+    }
+
     /// How far past the content's top and bottom edges the shell's trays reach in, px:
     /// the depth of a screen's own pinned chrome, so one ramp covers it with the band's.
-    pub(crate) fn pinned(&self, k: f64) -> (f32, f32) {
+    pub(crate) fn pinned(&self, k: f64, ctx: &Ctx) -> (f32, f32) {
         match self {
             Screen::Library(s) => s.pinned(k),
-            Screen::Players(s) => s.pinned(k),
             Screen::Settings(s) => s.pinned(k),
-            Screen::Grants(s) => s.pinned(k),
+            _ if self.foot(ctx).is_some() => (0.0, (crate::widgets::FOOT_DETAIL_H * k) as f32),
             _ => (0.0, 0.0),
         }
     }
@@ -522,10 +534,25 @@ impl Screen {
     ) {
         match self {
             Screen::Library(s) => s.render_pinned(canvas, rect, k, fonts, ctx),
-            Screen::Players(s) => s.render_pinned(canvas, rect, k, fonts, ctx),
             Screen::Settings(s) => s.render_pinned(canvas, rect, k, dt, fonts, ctx),
-            Screen::Grants(s) => s.render_pinned(canvas, rect, k, fonts),
-            _ => {}
+            _ => {
+                let Some(detail) = self.foot(ctx) else {
+                    return;
+                };
+                let h = (crate::widgets::FOOT_DETAIL_H * k) as f32;
+                let edge = crate::theme::edge(k);
+                crate::widgets::Foot {
+                    detail: Some(&detail),
+                    ..Default::default()
+                }
+                .paint(
+                    canvas,
+                    fonts,
+                    Rect::from_ltrb(rect.left, rect.bottom - h, rect.right, rect.bottom),
+                    (f64::from(rect.left) + edge, f64::from(rect.right) - edge),
+                    k,
+                );
+            }
         }
     }
 

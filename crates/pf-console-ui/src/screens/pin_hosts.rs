@@ -10,7 +10,7 @@ use crate::model::ConsoleCmd;
 use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox};
 use crate::theme::{fg, Fonts, W};
-use crate::widgets::{ListMsg, MenuList, RowSpec};
+use crate::widgets::{ListMsg, MenuList, RowSpec, FOOT_DETAIL_H};
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Rect};
 
@@ -141,13 +141,11 @@ impl PinHostsScreen {
             );
             return;
         }
-        // Detail band under the list; 34 matches the settings screen.
-        let detail_h = 34.0 * k;
         let list_rect = Rect::from_ltrb(
             rect.left,
             rect.top,
             rect.right,
-            rect.bottom - detail_h as f32,
+            rect.bottom - (FOOT_DETAIL_H * k) as f32,
         );
         let rows: Vec<RowSpec> = indices
             .iter()
@@ -172,16 +170,13 @@ impl PinHostsScreen {
             .collect();
         self.list
             .render(canvas, list_rect, &rows, fonts, k, dt, true);
-        fonts.centered(
-            canvas,
+    }
+
+    /// The explainer under the list, once there is a list.
+    pub(crate) fn foot(&self, ctx: &Ctx) -> Option<&'static str> {
+        (!host_indices(ctx).is_empty()).then_some(
             "A pinned preset appears as its own card on the host — one press connects with it.",
-            W::Regular,
-            13.0 * k,
-            fg(0.55),
-            cx,
-            f64::from(rect.bottom) - detail_h + 6.0 * k,
-            f64::from(rect.width()) * 0.8,
-        );
+        )
     }
 }
 

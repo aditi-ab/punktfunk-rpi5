@@ -951,8 +951,8 @@ impl CustomizeScreen {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
-        let note_h = 34.0 * k;
-        let list = Rect::from_ltrb(rect.left, rect.top, rect.right, rect.bottom - note_h as f32);
+        let foot = (crate::widgets::FOOT_DETAIL_H * k) as f32;
+        let list = Rect::from_ltrb(rect.left, rect.top, rect.right, rect.bottom - foot);
         let rows: Vec<RowSpec> = crate::library::sections(&ctx.settings.library_sections)
             .iter()
             .enumerate()
@@ -961,16 +961,10 @@ impl CustomizeScreen {
             })
             .collect();
         self.list.render(canvas, list, &rows, fonts, k, dt, true);
-        fonts.centered(
-            canvas,
-            "The Games tab shows these in this order. An empty section stays hidden.",
-            W::Regular,
-            13.0 * k,
-            fg(0.55),
-            f64::from(rect.center_x()),
-            f64::from(rect.bottom) - note_h + 6.0 * k,
-            f64::from(rect.width()) * 0.8,
-        );
+    }
+
+    pub(crate) fn foot(&self) -> &'static str {
+        "The Games tab shows these in this order. An empty section stays hidden."
     }
 }
 
