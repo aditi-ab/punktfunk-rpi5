@@ -139,9 +139,9 @@ public enum DefaultsKey {
     public static let smoothBuffer = "punktfunk.smoothBuffer"
     /// macOS: V-Sync the stream's presents — each decoded frame flips on the next display vsync
     /// (evenly paced, no tearing under direct scanout) instead of as soon as the GPU finishes
-    /// (lowest latency — the default, OFF, on fixed and ProMotion panels alike).
-    /// PUNKTFUNK_PRESENT_MODE=immediate|vsync|slot overrides that path for A/B. Resolved once per
-    /// session; see Stage2Pipeline's header.
+    /// (lowest latency — the default, OFF). Adaptive-refresh Macs present sparse input immediately
+    /// and dense input once per link target. PUNKTFUNK_PRESENT_MODE=immediate|vsync|slot overrides
+    /// that path for A/B. Resolved once per session; see Stage2Pipeline's header.
     public static let vsync = "punktfunk.vsync"
     /// macOS: present WINDOWED sessions in lockstep with the system compositor (the DCP
     /// "mismatched swapID's" kernel-panic mitigation — see SessionPresenter.windowedPresentMode

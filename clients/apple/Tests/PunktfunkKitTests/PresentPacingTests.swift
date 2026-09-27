@@ -378,9 +378,45 @@ final class PresentPacingTests: XCTestCase {
     }
     #endif
 
-    // MARK: - pf-present glass metrics
+    // MARK: - macOS adaptive display
 
     #if os(macOS)
+    func testAdaptiveSlotPacingResolution() {
+        XCTAssertTrue(SessionPresenter.adaptiveSlotPaced(
+            adaptiveSync: true, priority: .latency, pacing: .arrival))
+        XCTAssertFalse(SessionPresenter.adaptiveSlotPaced(
+            adaptiveSync: false, priority: .latency, pacing: .arrival))
+        XCTAssertFalse(SessionPresenter.adaptiveSlotPaced(
+            adaptiveSync: true, priority: .smooth(buffer: 2), pacing: .arrival))
+        XCTAssertFalse(SessionPresenter.adaptiveSlotPaced(
+            adaptiveSync: true, priority: .latency, pacing: .glass))
+    }
+
+    func testAdaptiveSlotRegimeUsesSparseImmediateAndDenseSlots() {
+        var sparse = AdaptiveSlotRegime()
+        XCTAssertTrue(sparse.update(ptsNs: 1_000_000_000))
+        XCTAssertFalse(sparse.update(ptsNs: 1_028_571_429))
+        XCTAssertFalse(sparse.update(ptsNs: 1_028_571_429), "a put-back is not a new sample")
+
+        var dense = AdaptiveSlotRegime()
+        XCTAssertTrue(dense.update(ptsNs: 1_000_000_000))
+        XCTAssertTrue(dense.update(ptsNs: 1_016_666_667))
+
+        var hitched = AdaptiveSlotRegime()
+        XCTAssertTrue(hitched.update(ptsNs: 1_000_000_000))
+        XCTAssertTrue(hitched.update(ptsNs: 1_008_333_333))
+        XCTAssertTrue(hitched.update(ptsNs: 1_058_333_333), "one capped hitch keeps slots")
+
+        var recoveryPts: UInt64 = 1_028_571_429
+        for _ in 0..<4 {
+            recoveryPts += 16_666_667
+            _ = sparse.update(ptsNs: recoveryPts)
+        }
+        XCTAssertTrue(sparse.isSlotted, "sustained 60 fps returns to slots")
+    }
+
+    // MARK: - pf-present glass metrics
+
     /// Fixed 240 Hz: intervals are multiples of the refresh. Adaptive 24–120 Hz with an 8.33 ms
     /// step: 1 = the fastest refresh, 3 = 25 ms, 4 = 33 ms — the 35 fps alternation.
     func testPanelGridUnits() {
