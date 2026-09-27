@@ -155,6 +155,86 @@ pub fn input_test() -> Result<()> {
     anyhow::bail!("input-test requires Linux")
 }
 
+/// What decides HDR on this box: the monitor's colour mode, gamescope's PQ capture and
+/// knob, the encoder's 10-bit profiles, and the verdict for each plane.
+#[cfg(target_os = "linux")]
+pub fn hdr_probe() -> Result<()> {
+    let monitor_hdr = pf_capture::gnome_hdr_monitor_active();
+    let hevc10 = crate::encode::can_encode_10bit(crate::encode::Codec::H265);
+    let av110 = crate::encode::can_encode_10bit(crate::encode::Codec::Av1);
+    let gs_binary_hdr = pf_vdisplay::gamescope_hdr_available(None);
+    let gs_knob = pf_host_config::config().gamescope_hdr;
+    let compositor = crate::vdisplay::detect().ok();
+    println!("monitor in BT.2100 (HDR) colour mode: {monitor_hdr}");
+    println!("gamescope offers 10-bit PQ capture:   {gs_binary_hdr}");
+    println!("PUNKTFUNK_GAMESCOPE_HDR:              {gs_knob}");
+    // In-node cursor lets the session take the zero-CSC encode source; otherwise a
+    // full-frame blend. Invisible until you compare two streams, so print it here.
+    println!(
+        "gamescope paints the cursor in-node:  {}",
+        pf_vdisplay::gamescope_composites_cursor(None)
+    );
+    println!("encoder Main10 (HEVC): {hevc10}");
+    println!("encoder 10-bit (AV1):  {av110}");
+    println!(
+        "native-plane HDR on the resolved compositor ({}): {}",
+        compositor.map_or("none".to_string(), |c| format!("{c:?}")),
+        crate::capture::capturer_supports_hdr_for(compositor, None)
+    );
+    println!(
+        "GameStream HDR capable (PUNKTFUNK_10BIT + a capable source + encoder): {}",
+        crate::gamestream::host_hdr_capable()
+    );
+    Ok(())
+}
+
+/// Connector names `PUNKTFUNK_CAPTURE_MONITOR` takes — available before the mgmt API is up.
+#[cfg(target_os = "linux")]
+pub fn list_monitors() -> Result<()> {
+    let compositor = crate::vdisplay::detect()?;
+    let monitors = crate::vdisplay::monitors::list(compositor)
+        .with_context(|| format!("enumerate monitors on {compositor:?}"))?;
+    if monitors.is_empty() {
+        println!("{compositor:?}: no monitors");
+        return Ok(());
+    }
+    let pinned = crate::vdisplay::capture_monitor();
+    println!("{compositor:?}:");
+    for m in &monitors {
+        let mut tags = Vec::new();
+        if m.primary {
+            tags.push("primary");
+        }
+        if !m.enabled {
+            tags.push("disabled");
+        }
+        if m.managed {
+            tags.push("punktfunk virtual display");
+        }
+        if pinned
+            .as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case(&m.connector))
+        {
+            tags.push("PINNED");
+        }
+        println!(
+            "  {:<12} {:>13} at +{},+{}  scale {}  {}{}",
+            m.connector,
+            m.mode_label(),
+            m.x,
+            m.y,
+            m.scale,
+            m.description,
+            if tags.is_empty() {
+                String::new()
+            } else {
+                format!("  [{}]", tags.join(", "))
+            }
+        );
+    }
+    Ok(())
+}
+
 /// Virtual DualSense via UHID: Cross, left-stick sweep, print kernel HID output. No session.
 ///
 /// `evtest`, `/dev/input/by-id/*Punktfunk*`, `wpctl status`. `--edge` is 054C:0DF2 and
