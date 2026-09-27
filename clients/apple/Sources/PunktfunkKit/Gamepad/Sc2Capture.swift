@@ -50,9 +50,7 @@
 // the main actor, and a source's reports are dropped until its claim lands (a few frames at
 // ~66 Hz — idempotent state, nothing missed).
 
-#if os(macOS)
-import AppKit
-#else
+#if !os(macOS)
 import UIKit
 #endif
 import Foundation
@@ -117,9 +115,8 @@ public final class Sc2Capture {
     /// and die with `releaseSource`.
     private var sources: [UInt64: PadSource] = [:]
     private var stopped = false
-    /// App inactive → BLE is released and the slot freed; resume re-acquires (the recommended
-    /// backgrounding behavior for a CoreBluetooth central). A USB pad is exempt — see the
-    /// resign observer in `start()`.
+    /// iOS/tvOS app inactive → BLE is released and the slot freed; resume re-acquires (the
+    /// recommended backgrounding behavior for a CoreBluetooth central). Never set on macOS.
     private var suspended = false
 
     /// The cross-client controller escape chord, read off this capture's own hardware mask —
@@ -222,11 +219,12 @@ public final class Sc2Capture {
         #endif
     }
 
-    /// Begin acquisition (main actor: it registers the app-lifecycle observers). Wire slots
-    /// are claimed later, on each source's first state report.
     /// The one capture that holds the controller: a second would open the same link twice.
     @MainActor private static weak var running: Sc2Capture?
 
+    /// Begin acquisition. Wire slots are claimed later, on each source's first state report.
+    /// A Mac app keeps its HID and Bluetooth access while inactive, so focus changes leave the
+    /// capture and its host slots alone. iOS and tvOS release BLE while inactive.
     @MainActor
     public func start() {
         guard Self.running == nil || Self.running === self else {
@@ -243,34 +241,24 @@ public final class Sc2Capture {
         lock.unlock()
         // Take the hardware off the menu-nav reader (iOS): one peripheral, one central.
         manager.holdSc2Hardware(true)
-        #if os(macOS)
-        let resign = NSApplication.willResignActiveNotification
-        let activate = NSApplication.didBecomeActiveNotification
-        #else
-        let resign = UIApplication.willResignActiveNotification
-        let activate = UIApplication.didBecomeActiveNotification
-        #endif
+        #if !os(macOS)
         // Both observers run on main, where `start` put this object; the weak reference crosses
         // no thread.
         nonisolated(unsafe) weak let weakSelf = self
         observers.append(NotificationCenter.default.addObserver(
-            forName: resign, object: nil, queue: .main
+            forName: UIApplication.willResignActiveNotification, object: nil, queue: .main
         ) { _ in
             guard let self = weakSelf else { return }
-            // A wired or Puck pad keeps streaming across focus changes: on macOS this
-            // notification fires whenever another window takes focus, and dropping the
-            // capture there kills the pad mid-game. The radio rationale below is BLE's alone.
-            if self.currentTransport == .usb { return }
             self.lock.lock()
             self.suspended = true
             self.lock.unlock()
-            // Release BLE while backgrounded (and the slot with it — a host pad frozen on the
-            // last raw state would otherwise hold its buttons for the whole background stay).
+            // The slot goes with the radio: a host pad frozen on the last raw state would hold
+            // its buttons for the whole background stay.
             self.releaseAll(reason: "app inactive")
             self.stopTransport()
         })
         observers.append(NotificationCenter.default.addObserver(
-            forName: activate, object: nil, queue: .main
+            forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
         ) { _ in
             guard let self = weakSelf else { return }
             self.lock.lock()
@@ -279,6 +267,7 @@ public final class Sc2Capture {
             self.lock.unlock()
             if !dead { self.startTransport() } // reacquire; the first report re-claims a slot
         })
+        #endif
         startTransport()
     }
 
@@ -299,9 +288,7 @@ public final class Sc2Capture {
         releaseAll(reason: "transport switch")
         #if os(macOS)
         if Sc2UsbLink.attached() {
-            // Exactly one link runs, so the other stops FIRST — re-picking after an
-            // unplug-while-unfocused would otherwise leave the idle link acquiring in the
-            // background and double-feed the pad when it comes back.
+            // Exactly one link runs, so the other stops FIRST: two would double-feed the pad.
             link.stop()
             lock.lock()
             transport = .usb
