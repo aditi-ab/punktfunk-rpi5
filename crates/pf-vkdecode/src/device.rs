@@ -353,6 +353,7 @@ impl DecodeDevice {
 
     /// `VK_KHR_external_memory_fd` entry points. The caller enabled the extension when
     /// it asked for a dma-buf export; without it the calls fail cleanly.
+    #[cfg(unix)]
     pub(crate) fn external_memory_fd(&self) -> ash::khr::external_memory_fd::Device {
         ash::khr::external_memory_fd::Device::new(&self.instance, &self.device)
     }
