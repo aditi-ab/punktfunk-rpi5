@@ -119,7 +119,7 @@ fn run(why: &'static str) {
     // takes, whichever seat asks. Only a spawn of its own can be stood up ahead of a connect.
     let route = crate::vdisplay::resolve_gamescope_route(Compositor::Gamescope, true);
     if !matches!(route, Some(GamescopeRoute::Spawn))
-        || !super::compositor::session_is_isolated(Compositor::Gamescope, route.as_ref())
+        || !crate::compositor_route::session_is_isolated(Compositor::Gamescope, route.as_ref())
     {
         tracing::info!(
             why,

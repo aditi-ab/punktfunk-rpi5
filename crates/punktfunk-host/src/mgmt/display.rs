@@ -131,7 +131,7 @@ pub(crate) fn display_settings_state() -> DisplaySettingsState {
         "layout".into(),
     ];
     // `game_session: dedicated` routes a launch to its own headless gamescope
-    // (`native/compositor.rs`), so without the binary the axis stores and does nothing.
+    // (`compositor_route.rs`), so without the binary the axis stores and does nothing.
     // Probed once: `available()` forks `gamescope --version` and walks /proc, and an
     // install mid-run is a host restart away either way.
     if gamescope_present() {

@@ -13,6 +13,7 @@ use super::video::{FrameType, VideoPacketizer};
 use super::VIDEO_PORT;
 use crate::capture::{self, Capturer, FastSyntheticCapturer};
 use crate::encode::{self, Codec};
+use crate::native::stream::state::{encode_stalled, MAX_CAPTURE_REBUILDS, MAX_ENCODER_RESETS};
 use anyhow::{Context, Result};
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -344,11 +345,19 @@ fn run(
             });
         }
         // Re-runnable: the encode loop calls it again on a mid-stream capture loss.
-        let (mut capturer, compositor, gamescope_route) =
-            open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit)?;
-        // Only Linux `launch_is_nested` reads it; gamescope does not exist on Windows.
+        let GsSource {
+            mut capturer,
+            compositor,
+            route: gamescope_route,
+            nested_launch_started,
+            #[cfg(target_os = "linux")]
+            seat,
+            #[cfg(target_os = "linux")]
+            lease,
+        } = open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit, true)?;
+        // Only Linux `launch_is_nested` reads them; gamescope does not exist on Windows.
         #[cfg(not(target_os = "linux"))]
-        let _ = &gamescope_route;
+        let _ = (&gamescope_route, nested_launch_started);
         // GameStream holds a real display; without this, Windows `admit` budgets cannot see it.
         // `None` identity is the anonymous slot. Dropped at the end of `run`.
         let _admission_guard = crate::vdisplay::admission::register(
@@ -433,13 +442,19 @@ fn run(
                     .and_then(|ws| crate::library::adopt_launch_workspace(compositor, ws));
                 None
             }
-            Some(_) if crate::vdisplay::launch_is_nested(compositor, gamescope_route.as_ref()) => {
+            // Nested only when this acquire spawned gamescope with `cmd` as its primary child. A
+            // keep-alive reuse spawned nothing, so it falls through and launches into its seat.
+            Some(_)
+                if crate::vdisplay::launch_is_nested(compositor, gamescope_route.as_ref())
+                    && nested_launch_started =>
+            {
                 spawned_now = true;
                 None
             }
             Some(cmd) => {
                 let own = target.as_ref().is_some_and(|t| t.own_workspace);
-                match crate::library::launch_session_command(compositor, cmd, None, own, None) {
+                let seat = seat.as_deref();
+                match crate::library::launch_session_command(compositor, cmd, seat, own, None) {
                     Ok(mut spawned) => {
                         spawned_now = true;
                         launch_workspace = spawned.workspace.take();
@@ -540,11 +555,39 @@ fn run(
                 ),
             )
         });
-        // Re-detect the live compositor so a Desktop↔Game switch is followed in place, with its
-        // own cursor blend. WxH is locked at ANNOUNCE — a resolution change cannot follow.
-        let rebuild = || {
-            open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit)
-                .map(|(c, comp, route)| (c, gs_cursor_blend(comp, route.as_ref(), &cfg)))
+        // The output the stream captures now, for a re-attach after a loss that leaves it up.
+        #[cfg(target_os = "linux")]
+        let attached = std::cell::RefCell::new((compositor, gamescope_route.clone(), lease));
+        // A handed-back keepalive re-attaches to its output first: on KWin every create is a new
+        // virtual output, and a burst of them wedges the compositor. Otherwise re-detect the live
+        // compositor so a Desktop↔Game switch is followed. WxH is locked at ANNOUNCE.
+        let rebuild = |keepalive: Option<Box<dyn Send>>| {
+            #[cfg(target_os = "linux")]
+            if let Some(keepalive) = keepalive {
+                let (c, route, lease) = attached.borrow().clone();
+                if let Some(lease) = lease {
+                    match gs_capture_output(lease.into_output(keepalive), &cfg, c, route.as_ref()) {
+                        Ok(capturer) => {
+                            tracing::info!(
+                                "gamestream: capture loss — re-attached to the live output, no new \
+                                 display"
+                            );
+                            return Ok((capturer, gs_cursor_blend(c, route.as_ref(), &cfg)));
+                        }
+                        Err(e) => tracing::warn!(error = %format!("{e:#}"),
+                            "gamestream: re-attach to the live output failed — creating another"),
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = keepalive;
+            let s = open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit, false)?;
+            let blend = gs_cursor_blend(s.compositor, s.route.as_ref(), &cfg);
+            #[cfg(target_os = "linux")]
+            {
+                *attached.borrow_mut() = (s.compositor, s.route, s.lease);
+            }
+            Ok((s.capturer, blend))
         };
         return stream_body(
             &mut capturer,
@@ -683,15 +726,13 @@ fn open_gs_mirror_source(
     metadata_cursor: bool,
 ) -> Result<Box<dyn Capturer>> {
     // Enumerate against the compositor that is up now — Desktop↔Game may have switched.
-    let active = crate::vdisplay::detect_active_session();
-    crate::vdisplay::observe_session_instance(&active);
-    crate::vdisplay::apply_session_env(&active);
-    let compositor = crate::vdisplay::compositor_for_kind(active.kind)
-        .map(Ok)
-        .unwrap_or_else(crate::vdisplay::detect)
-        .context("detect compositor")?;
-    // Mirror streams an existing head: no gamescope sub-mode, no route.
-    crate::inject::set_backend_id(crate::vdisplay::input_backend_id(compositor));
+    // Mirror streams an existing head: no gamescope sub-mode, and no session to stand up.
+    let (compositor, _) = crate::compositor_route::resolve_compositor(
+        punktfunk_core::config::CompositorPref::Auto,
+        false,
+        false,
+        false,
+    )?;
     let mut vd = crate::vdisplay::open_mirror(compositor, connector)?;
     vd.set_hw_cursor(metadata_cursor);
     // Panel runs at the owner's mode; the client scales. Pass the client's anyway.
@@ -814,7 +855,25 @@ fn blend_capable_metadata_cursor(cfg: &StreamConfig) -> bool {
     }
 }
 
-/// Virtual-display source at the client's mode. Re-run on mid-stream capture loss to follow a
+/// An opened virtual source.
+struct GsSource {
+    capturer: Box<dyn Capturer>,
+    compositor: crate::vdisplay::Compositor,
+    route: Option<crate::vdisplay::GamescopeRoute>,
+    /// This acquire spawned gamescope with the launch as its primary child. A keep-alive reuse
+    /// spawned nothing.
+    nested_launch_started: bool,
+    /// The gamescope seat a launch that did not nest goes to. `None` off a gamescope spawn.
+    #[cfg(target_os = "linux")]
+    seat: Option<String>,
+    /// The output, for a re-attach after a capture loss that leaves it up. `None` for a portal fd.
+    #[cfg(target_os = "linux")]
+    lease: Option<crate::capture::OutputLease>,
+}
+
+/// Virtual-display source at the client's mode. The app's own `compositor` wins; otherwise the
+/// native plane's [`crate::compositor_route::resolve_compositor`] picks, pin included. Only a
+/// connect (`revive`) may revive a session. Re-run on mid-stream capture loss to follow a
 /// Desktop↔Game switch. Does not launch the app — a rebuild must not re-spawn it. The capturer
 /// owns the output keepalive; the factory is dropped here.
 fn open_gs_virtual_source(
@@ -823,44 +882,23 @@ fn open_gs_virtual_source(
     // Resolved once by the caller so a rebuild cannot re-resolve to something different.
     launch: Option<&GsApp>,
     quit: &Arc<AtomicBool>,
-) -> Result<(
-    Box<dyn Capturer>,
-    crate::vdisplay::Compositor,
-    Option<crate::vdisplay::GamescopeRoute>,
-)> {
+    revive: bool,
+) -> Result<GsSource> {
     let (compositor, gamescope_route) = if let Some(c) = app.and_then(|a| a.compositor) {
         // Still resolve a route, or `create` falls through to a bare spawn on a managed box.
         let r = crate::vdisplay::resolve_gamescope_route(c, false);
         (c, r)
     } else {
-        // Windows has one backend; skip Linux `detect()`, which bails there.
-        #[cfg(target_os = "windows")]
-        {
-            (crate::vdisplay::Compositor::Windows, None)
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            crate::vdisplay::cancel_pending_tv_restore();
-            let active = crate::vdisplay::detect_active_session();
-            // Fold an idle-time Game↔Desktop instance change into the epoch before acquire.
-            crate::vdisplay::observe_session_instance(&active);
-            crate::vdisplay::apply_session_env(&active);
-            // Gate on a resolved command so an unresolvable entry falls back to auto routing.
-            // Host policy only: a Moonlight cert is not a console device, same as admission.
-            let has_launch = launch.and_then(|t| t.command.as_deref()).is_some();
-            if crate::vdisplay::wants_dedicated_game_session(has_launch, None) {
-                let c = crate::vdisplay::Compositor::Gamescope;
-                crate::inject::set_backend_id(crate::vdisplay::input_backend_id(c));
-                (c, crate::vdisplay::resolve_gamescope_route(c, true))
-            } else {
-                let c = crate::vdisplay::compositor_for_kind(active.kind)
-                    .map(Ok)
-                    .unwrap_or_else(crate::vdisplay::detect)
-                    .context("detect compositor")?;
-                crate::inject::set_backend_id(crate::vdisplay::input_backend_id(c));
-                (c, crate::vdisplay::resolve_gamescope_route(c, false))
-            }
-        }
+        // Gate on a resolved command so an unresolvable entry falls back to auto routing.
+        // Host policy only: a Moonlight cert is not a console device, same as admission.
+        let has_launch = launch.and_then(|t| t.command.as_deref()).is_some();
+        // No per-session injector on this plane: input always takes the shared backend.
+        crate::compositor_route::resolve_compositor(
+            punktfunk_core::config::CompositorPref::Auto,
+            crate::vdisplay::wants_dedicated_game_session(has_launch, None),
+            false,
+            revive,
+        )?
     };
     let mut vd = crate::vdisplay::open(compositor).context("open virtual display")?;
     vd.set_hw_cursor(host_composites_metadata_cursor(compositor, &cfg));
@@ -891,10 +929,33 @@ fn open_gs_virtual_source(
         None,
     )
     .context("create virtual output at client resolution")?;
-    let plan = gs_session_plan(
-        &cfg,
-        gs_cursor_blend(compositor, gamescope_route.as_ref(), &cfg),
-    );
+    let nested_launch_started = vd.nested_launch_started();
+    #[cfg(target_os = "linux")]
+    let seat = vout.seat.clone();
+    #[cfg(target_os = "linux")]
+    let lease = crate::capture::OutputLease::of(&vout);
+    let capturer = gs_capture_output(vout, &cfg, compositor, gamescope_route.as_ref())?;
+    Ok(GsSource {
+        capturer,
+        compositor,
+        route: gamescope_route,
+        nested_launch_started,
+        #[cfg(target_os = "linux")]
+        seat,
+        #[cfg(target_os = "linux")]
+        lease,
+    })
+}
+
+/// An active capturer on `vout` at this session's plan. On gamescope it also blends the XFixes
+/// pointer when the node carries none.
+fn gs_capture_output(
+    vout: crate::vdisplay::VirtualOutput,
+    cfg: &StreamConfig,
+    compositor: crate::vdisplay::Compositor,
+    route: Option<&crate::vdisplay::GamescopeRoute>,
+) -> Result<Box<dyn Capturer>> {
+    let plan = gs_session_plan(cfg, gs_cursor_blend(compositor, route, cfg));
     #[cfg(target_os = "linux")]
     let cursor_seat = vout.seat.clone();
     let mut capturer = capture::capture_virtual_output(
@@ -911,14 +972,14 @@ fn open_gs_virtual_source(
     #[cfg(target_os = "linux")]
     if crate::session_plan::gamescope_cursor_for(
         compositor == crate::vdisplay::Compositor::Gamescope,
-        gamescope_route.as_ref(),
+        route,
     ) {
         capturer.attach_gamescope_cursor(Arc::new(move || {
             pf_vdisplay::gamescope_xwayland_cursor_targets(cursor_seat.as_deref())
         }));
     }
     capturer.set_active(true);
-    Ok((capturer, compositor, gamescope_route))
+    Ok(capturer)
 }
 
 /// Shared [`SessionPlan`](crate::session_plan::SessionPlan) at this plane's shape: 4:2:0,
@@ -1215,8 +1276,9 @@ fn keyframe_coalesce_window(frame_interval: Duration) -> Duration {
     (frame_interval * 2).max(Duration::from_millis(100))
 }
 
-/// Re-opens the virtual source on capture loss: the new capturer and its `cursor_blend`.
-type GsRebuild<'a> = &'a dyn Fn() -> Result<(Box<dyn Capturer>, bool)>;
+/// Re-opens the virtual source on capture loss: the new capturer and its `cursor_blend`. Takes
+/// the old capturer's keepalive when the loss left its display up.
+type GsRebuild<'a> = &'a dyn Fn(Option<Box<dyn Send>>) -> Result<(Box<dyn Capturer>, bool)>;
 
 /// Encode loop over a borrowed capturer. Send is a dedicated thread so a send spike cannot
 /// stall capture/encode.
@@ -1370,11 +1432,9 @@ fn stream_body(
     let mut supports_rfi = enc.caps().supports_rfi;
 
     // A delivered frame clears this; a permanently dead source ends the stream after the cap.
-    const MAX_REBUILDS: u32 = 5;
     let mut rebuilds: u32 = 0;
-    // Submit/poll failure or a silent stall rebuilds in place (native `reset_stalled_encoder`).
+    // Submit/poll failure or a stall rebuilds in place (native `reset_stalled_encoder`).
     // `last_au_at` is the silent-wedge watchdog: poll returning `None` forever never errors.
-    const MAX_ENCODER_RESETS: u32 = 5;
     let mut encoder_resets: u32 = 0;
     let mut last_au_at = Instant::now();
 
@@ -1421,7 +1481,7 @@ fn stream_body(
                     return Err(e).context("capture frame");
                 };
                 rebuilds += 1;
-                if rebuilds > MAX_REBUILDS {
+                if rebuilds > MAX_CAPTURE_REBUILDS {
                     return Err(e).context("capture lost — rebuild attempts exhausted");
                 }
                 tracing::warn!(error = %format!("{e:#}"), rebuild = rebuilds,
@@ -1445,10 +1505,14 @@ fn stream_body(
                     Duration::from_secs(40)
                 };
                 let rebuild_deadline = loss_at + budget;
+                // The import side broke under a live display: re-attach instead of creating one.
+                let mut keepalive = e
+                    .downcast_ref::<pf_capture::DisplayStillAlive>()
+                    .and_then(|_| capturer.take_keepalive());
                 let new_cap = loop {
                     let _probe = (loss_at.elapsed() < PROBE_HOLDOFF)
                         .then(crate::vdisplay::rebuild_probe_scope);
-                    match rebuild() {
+                    match rebuild(keepalive.take()) {
                         Ok((c, blend)) => {
                             cursor_blend = blend;
                             plan = gs_session_plan(&cfg, blend);
@@ -1691,9 +1755,20 @@ fn stream_body(
                 }
             }
         }
-        // Poll error, or no AU while frames are owed. Window scales so low-fps cannot false-trip.
-        let stall_window = Duration::from_secs(2).max(frame_interval * 8);
-        if poll_err.is_some() || (enc_inflight > 0 && last_au_at.elapsed() >= stall_window) {
+        // Poll error, or the native loop's stall rule. The driver path drains at depth 1.
+        let depth = if owed.is_some() {
+            1
+        } else {
+            capturer.pipeline_depth().max(1)
+        };
+        if poll_err.is_some()
+            || encode_stalled(
+                enc_inflight as usize,
+                last_au_at.elapsed(),
+                depth,
+                frame_interval,
+            )
+        {
             let why = match &poll_err {
                 Some(e) => format!("poll failed: {e:#}"),
                 None => format!(

@@ -134,6 +134,8 @@ mod inject {
     pub(crate) use pf_inject::*;
 }
 mod client_logs;
+// Compositor + gamescope route for a connect, shared by the native and GameStream planes.
+mod compositor_route;
 // Re-`Hello::launch` must not start a second copy — design/session-game-lifetime.md.
 mod launchreg;
 mod library;
