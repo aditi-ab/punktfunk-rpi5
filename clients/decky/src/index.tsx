@@ -7,6 +7,7 @@
 // focuses it (see steam.ts), and stand in front of the trust decision that gates it.
 import {
   ButtonItem,
+  ConfirmModal,
   Field,
   Navigation,
   PanelSection,
@@ -28,7 +29,7 @@ import {
   FaSyncAlt,
   FaTv,
 } from "react-icons/fa";
-import { hostAction, killStream, streamRunning } from "./backend";
+import { endGame, hostAction, killStream, streamRunning } from "./backend";
 import { PluginErrorBoundary } from "./boundary";
 import {
   applyUpdate,
@@ -52,6 +53,7 @@ import {
 import { OsMark } from "./os-icon";
 import {
   ensureGamepadUiShortcut,
+  lastGameStream,
   launchGamepadUi,
   recreateShortcuts,
   removeGameShortcuts,
@@ -118,6 +120,23 @@ async function pressHost(action: "guide" | "qam"): Promise<void> {
       body: r.error === "no-stream" ? "No stream is running" : "Couldn't reach the stream",
     });
   }
+}
+
+/** End the title the last game-page stream launched, then the stream — only once the host says
+ *  the game is gone. A refusal keeps the stream and shows the host's sentence. */
+async function endStreamedGame(): Promise<void> {
+  const last = lastGameStream();
+  if (!last) {
+    return;
+  }
+  const r = await endGame(last.ref, last.gameId).catch(() => ({
+    ok: false as const,
+    notice: "Couldn't reach the Punktfunk client.",
+  }));
+  if (r.ok) {
+    stopStream();
+  }
+  toaster.toast({ title: "Punktfunk", body: r.notice || (r.ok ? `Ended ${last.title}.` : "Couldn't end the game.") });
 }
 
 /** The line under a host's name: where it is, whether it's up, and how far trust has got. */
@@ -337,6 +356,27 @@ const QamPanel: FC = () => {
               Quick access on host
             </ButtonItem>
           </PanelSectionRow>
+          {lastGameStream() && (
+            <PanelSectionRow>
+              <ButtonItem
+                layout="below"
+                description={`Close ${lastGameStream()?.title} on the host, then end the stream. Unsaved progress is lost.`}
+                onClick={() =>
+                  showModal(
+                    <ConfirmModal
+                      strTitle={`End ${lastGameStream()?.title}?`}
+                      strDescription="Unsaved progress in the game is lost."
+                      strOKButtonText="End game"
+                      onOK={() => void endStreamedGame()}
+                    />,
+                  )
+                }
+              >
+                <FaStopCircle style={{ marginRight: "0.5em" }} />
+                End game
+              </ButtonItem>
+            </PanelSectionRow>
+          )}
         </PanelSection>
       )}
 

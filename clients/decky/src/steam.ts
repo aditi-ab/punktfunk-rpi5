@@ -342,6 +342,32 @@ const STORAGE_KEY_UI = "punktfunk:uiAppId";
 // The shortcut the most recent launch ran under — the one Force-stop must end. It may be the
 // generic stream shortcut or a per-game one; without this the panel could only stop the former.
 const STORAGE_KEY_LAST_LAUNCH = "punktfunk:lastLaunchAppId";
+/** `{ref, gameId, title}` of the last game-page stream: what the panel's End game ends. */
+const STORAGE_KEY_LAST_GAME = "punktfunk:lastGameStream";
+
+export type GameStreamRef = { ref: string; gameId: string; title: string };
+
+/** The host and title the last game-page stream launched; `null` after a plain stream. */
+export function lastGameStream(): GameStreamRef | null {
+  try {
+    const v = localStorage.getItem(STORAGE_KEY_LAST_GAME);
+    return v ? (JSON.parse(v) as GameStreamRef) : null;
+  } catch {
+    return null;
+  }
+}
+
+function setLastGameStream(v: GameStreamRef | null): void {
+  try {
+    if (v) {
+      localStorage.setItem(STORAGE_KEY_LAST_GAME, JSON.stringify(v));
+    } else {
+      localStorage.removeItem(STORAGE_KEY_LAST_GAME);
+    }
+  } catch {
+    /* ignore */
+  }
+}
 // `punktfunk:gameShortcut:<steam appid>` → the per-game shortcut's appId.
 const GAME_KEY_PREFIX = "punktfunk:gameShortcut:";
 
@@ -961,6 +987,7 @@ function safeClientBin(bin: string | undefined): bin is string {
 export async function launchStream(ref: string, opts: LaunchOpts = {}): Promise<void> {
   validateLaunch(ref, opts);
   const { appId, runner, clientBin } = await ensureStreamShortcut();
+  setLastGameStream(opts.gameId ? { ref, gameId: opts.gameId, title: opts.gameId } : null);
   runShortcut(appId, launchOptions(ref, runner, clientBin, opts));
 }
 
@@ -979,6 +1006,7 @@ export async function launchGameStream(
   const full = { ...opts, gameId: `steam:${steamAppId}` };
   validateLaunch(ref, full);
   const { appId, runner, clientBin } = await ensureGameShortcut(steamAppId, title, iconHash);
+  setLastGameStream({ ref, gameId: full.gameId, title });
   runShortcut(appId, launchOptions(ref, runner, clientBin, full));
 }
 
