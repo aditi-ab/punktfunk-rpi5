@@ -276,7 +276,7 @@ public enum LibraryClient {
     /// presents `identity` (its persistent cert/key PEM — the same identity the host paired over
     /// QUIC), and the host's self-signed cert is pinned by `hostFingerprint` (SHA-256 of its DER,
     /// the value the client already trusts). No bearer token — a paired client is authorized by
-    /// its certificate. `hostFingerprint == nil` ⇒ TOFU (accept the presented host cert).
+    /// its certificate. `hostFingerprint == nil` throws `unauthorized`: an unpaired host is never trusted.
     public static func fetch(
         address: String,
         port: UInt16 = punktfunkDefaultMgmtPort,
@@ -480,6 +480,8 @@ public enum LibraryClient {
                 identity: identity, pinnedHostFingerprint: hostFingerprint)
         } catch MgmtTransportError.pinMismatch {
             throw LibraryError.pinMismatch
+        } catch MgmtTransportError.unpinned {
+            throw LibraryError.unauthorized
         } catch MgmtTransportError.timedOut {
             throw LibraryError.unreachable("timed out")
         } catch let error as MgmtTransportError {

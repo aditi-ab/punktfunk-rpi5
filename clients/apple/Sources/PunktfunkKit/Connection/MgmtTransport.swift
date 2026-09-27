@@ -32,6 +32,8 @@ enum MgmtTransportError: Error, Sendable {
     /// The host's certificate did not hash to the pinned fingerprint — an impostor, or a host
     /// that was reinstalled/re-keyed since pairing.
     case pinMismatch
+    /// No fingerprint to pin: the host is unpaired, so nothing it presents can be verified.
+    case unpinned
     case connection(String)
     case timedOut
     case tooLarge
@@ -44,7 +46,7 @@ enum MgmtTransport {
     static let maxResponseBytes = 16 * 1024 * 1024
 
     /// `GET https://host:port/path`, authenticated by mTLS (`identity`) and pinned by
-    /// `pinnedHostFingerprint` (nil = trust-on-first-use, matching the QUIC connect's semantics).
+    /// `pinnedHostFingerprint`. A nil pin throws `unpinned` before any socket opens.
     ///
     /// Runs over a pooled keep-alive connection. A connection the host has since dropped is
     /// indistinguishable from a live one until we write to it, so a REUSED connection that fails
@@ -95,8 +97,8 @@ enum MgmtTransport {
         guard let nwPort = NWEndpoint.Port(rawValue: port) else {
             throw MgmtTransportError.invalidPort(port)
         }
-        let pin = pinnedHostFingerprint
-        let key = "\(unbracketed(host)):\(port):\(pin.map(hex) ?? "tofu")"
+        guard let pin = pinnedHostFingerprint else { throw MgmtTransportError.unpinned }
+        let key = "\(unbracketed(host)):\(port):\(hex(pin))"
         var lastError: Error = MgmtTransportError.connection("no attempt made")
 
         // The pool holds up to `maxPerHost` sockets and the host can have half-closed all of
@@ -241,7 +243,7 @@ final class MgmtConnection: @unchecked Sendable {
     /// `MgmtTransport.get` — only a connection the host may have dropped since is worth retrying.
     var hasServedRequest: Bool { servedRequest }
 
-    init(host: String, port: NWEndpoint.Port, identity: SecIdentity, pin: Data?) {
+    init(host: String, port: NWEndpoint.Port, identity: SecIdentity, pin: Data) {
         self.host = host
         self.port = port.rawValue
         let options = NWProtocolTLS.Options()
@@ -263,10 +265,6 @@ final class MgmtConnection: @unchecked Sendable {
             else {
                 rejected.value = true
                 complete(false)
-                return
-            }
-            guard let pin else {
-                complete(true) // trust-on-first-use: no pin recorded for this host yet
                 return
             }
             let fingerprint = Data(SHA256.hash(data: SecCertificateCopyData(leaf) as Data))
