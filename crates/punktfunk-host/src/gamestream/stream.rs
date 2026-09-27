@@ -13,7 +13,9 @@ use super::video::{FrameType, VideoPacketizer};
 use super::VIDEO_PORT;
 use crate::capture::{self, Capturer, FastSyntheticCapturer};
 use crate::encode::{self, Codec};
-use crate::native::stream::state::{encode_stalled, MAX_CAPTURE_REBUILDS, MAX_ENCODER_RESETS};
+use crate::encode_recovery::{
+    EncoderWatchdog, RebuildBudget, MAX_CAPTURE_REBUILDS, MAX_ENCODER_RESETS,
+};
 use anyhow::{Context, Result};
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1427,9 +1429,7 @@ fn stream_body(
     // A delivered frame clears this; a permanently dead source ends the stream after the cap.
     let mut rebuilds: u32 = 0;
     // Submit/poll failure or a stall rebuilds in place (native `reset_stalled_encoder`).
-    // `last_au_at` is the silent-wedge watchdog: poll returning `None` forever never errors.
-    let mut encoder_resets: u32 = 0;
-    let mut last_au_at = Instant::now();
+    let mut watchdog = EncoderWatchdog::new();
 
     // Without RFI each request is a full IDR. One IDR resolves pending loss; NVENC
     // invalidate is never rate-limited.
@@ -1479,32 +1479,18 @@ fn stream_body(
                 }
                 tracing::warn!(error = %format!("{e:#}"), rebuild = rebuilds,
                     "gamestream: capture lost — rebuilding source in place (following a session switch)");
-                // Attach-only holdoff: right after a capture loss the session detection can still
-                // be STALE, and a rebuild acting on a stale "Gaming" answer restarts
-                // gamescope-session.target — on SteamOS that steals the seat back from the session
-                // the user just switched to. Until it lapses, builds attach to live outputs only.
-                const PROBE_HOLDOFF: Duration = Duration::from_secs(4);
-                // A managed/attach gamescope (re)launch legitimately takes up to 45 s (the Steam
-                // Big Picture cold start), so a flat 40 s expires INSIDE the first attempt — a
-                // single-shot failure where a second, warm attempt would have succeeded.
-                // `detect_active_session` answers `none` off Linux, where gamescope does not exist.
-                let loss_at = Instant::now();
-                let budget = if crate::vdisplay::compositor_for_kind(
+                // The budget follows the session live at the loss; `detect_active_session`
+                // answers `none` off Linux, where gamescope does not exist.
+                let budget = RebuildBudget::start();
+                let live = crate::vdisplay::compositor_for_kind(
                     crate::vdisplay::detect_active_session().kind,
-                ) == Some(crate::vdisplay::Compositor::Gamescope)
-                {
-                    Duration::from_secs(100)
-                } else {
-                    Duration::from_secs(40)
-                };
-                let rebuild_deadline = loss_at + budget;
+                );
                 // The import side broke under a live display: re-attach instead of creating one.
                 let mut keepalive = e
                     .downcast_ref::<pf_capture::DisplayStillAlive>()
                     .and_then(|_| capturer.take_keepalive());
                 let new_cap = loop {
-                    let _probe = (loss_at.elapsed() < PROBE_HOLDOFF)
-                        .then(crate::vdisplay::rebuild_probe_scope);
+                    let _probe = budget.probe_scope();
                     match rebuild(keepalive.take()) {
                         Ok((c, blend)) => {
                             cursor_blend = blend;
@@ -1512,8 +1498,7 @@ fn stream_body(
                             break c;
                         }
                         Err(e2) => {
-                            if !running.load(Ordering::SeqCst) || Instant::now() >= rebuild_deadline
-                            {
+                            if !running.load(Ordering::SeqCst) || budget.expired(live) {
                                 return Err(e2)
                                     .context("capture lost — no source within the rebuild budget");
                             }
@@ -1544,6 +1529,7 @@ fn stream_body(
                 next_frame = Instant::now();
                 // Old encoder died with in-flight AUs; numbering restarts at `au_seq`.
                 enc_inflight = 0;
+                watchdog.on_au();
                 tracing::info!("gamestream: source rebuilt — stream continues");
                 continue;
             }
@@ -1589,18 +1575,14 @@ fn stream_body(
                     last_keyframe = Some(Instant::now());
                     // Old encoder died with in-flight AUs; numbering restarts at `au_seq`.
                     enc_inflight = 0;
-                    encoder_resets = 0;
-                    last_au_at = Instant::now();
+                    watchdog.on_au();
                 }
                 Err(e) => {
                     // First failed open is a settling driver; spend the shared reset budget.
-                    encoder_resets += 1;
-                    if encoder_resets > MAX_ENCODER_RESETS {
+                    let Some(backoff) = watchdog.spend(frame_interval) else {
                         return Err(e).context("reopen encoder at the source's new mode");
-                    }
-                    let backoff = frame_interval
-                        .max(Duration::from_millis(100u64 << (encoder_resets - 1).min(4)));
-                    tracing::warn!(error = %format!("{e:#}"), reset = encoder_resets,
+                    };
+                    tracing::warn!(error = %format!("{e:#}"), reset = watchdog.resets(),
                         max = MAX_ENCODER_RESETS,
                         "gamestream: reopening the encoder at the source's new mode failed — retrying");
                     next_frame = Instant::now() + backoff;
@@ -1661,27 +1643,22 @@ fn stream_body(
             None => enc.submit_indexed(&frame, au_seq.wrapping_add(enc_inflight)),
         };
         if let Err(e) = submitted {
-            encoder_resets += 1;
-            if encoder_resets > MAX_ENCODER_RESETS || !enc.reset() {
+            let Some(backoff) = watchdog.recover(frame_interval, || enc.reset()) else {
                 tracing::error!(
                     error = %format!("{e:#}"),
-                    resets = encoder_resets,
+                    resets = watchdog.resets(),
                     "encoder did not recover after repeated in-place rebuilds — ending the \
                      stream (see the error above for the cause)"
                 );
                 return Err(e).context("encoder submit");
-            }
+            };
             // Owed AUs died with the discarded state. IDR bypasses coalesce: the client must resync.
             enc_inflight = 0;
             enc.request_keyframe();
             last_keyframe = Some(Instant::now());
-            last_au_at = Instant::now();
-            tracing::warn!(error = %format!("{e:#}"), reset = encoder_resets,
+            tracing::warn!(error = %format!("{e:#}"), reset = watchdog.resets(),
                 max = MAX_ENCODER_RESETS,
                 "encoder submit failed — encoder rebuilt in place, forcing an IDR");
-            // Five instant retries burn out inside one driver hiccup.
-            let backoff =
-                frame_interval.max(Duration::from_millis(100u64 << (encoder_resets - 1).min(4)));
             next_frame = Instant::now() + backoff;
             std::thread::sleep(backoff);
             continue;
@@ -1711,8 +1688,7 @@ fn stream_body(
             let idx = au_seq.wrapping_add(aus.len() as u32);
             aus.push((au.data, ft, idx));
             enc_inflight = enc_inflight.saturating_sub(1);
-            last_au_at = Instant::now();
-            encoder_resets = 0;
+            watchdog.on_au();
         }
         let t_pkt = tick.elapsed();
 
@@ -1748,41 +1724,27 @@ fn stream_body(
                 }
             }
         }
-        // Poll error, or the native loop's stall rule. The driver path drains at depth 1.
+        // Poll error, or the shared stall rule. The driver path drains at depth 1.
         let depth = if owed.is_some() {
             1
         } else {
             capturer.pipeline_depth().max(1)
         };
-        if poll_err.is_some()
-            || encode_stalled(
-                enc_inflight as usize,
-                last_au_at.elapsed(),
-                depth,
-                frame_interval,
-            )
-        {
+        let stalled = watchdog.stalled(enc_inflight as usize, depth, frame_interval);
+        if poll_err.is_some() || stalled.is_some() {
             let why = match &poll_err {
                 Some(e) => format!("poll failed: {e:#}"),
-                None => format!(
-                    "no AU for {} ms with {} frame(s) owed",
-                    last_au_at.elapsed().as_millis(),
-                    enc_inflight
-                ),
+                None => stalled.unwrap_or_default(),
             };
-            encoder_resets += 1;
-            if encoder_resets > MAX_ENCODER_RESETS || !enc.reset() {
+            let Some(backoff) = watchdog.recover(frame_interval, || enc.reset()) else {
                 return Err(poll_err.unwrap_or_else(|| anyhow::anyhow!("{why}")))
                     .context("encoder stalled — in-place rebuild unavailable or exhausted");
-            }
+            };
             enc_inflight = 0;
             enc.request_keyframe();
             last_keyframe = Some(Instant::now());
-            last_au_at = Instant::now();
-            tracing::warn!(reset = encoder_resets, max = MAX_ENCODER_RESETS, %why,
+            tracing::warn!(reset = watchdog.resets(), max = MAX_ENCODER_RESETS, %why,
                 "encode stall detected — encoder rebuilt in place, forcing an IDR");
-            let backoff =
-                frame_interval.max(Duration::from_millis(100u64 << (encoder_resets - 1).min(4)));
             next_frame = Instant::now() + backoff;
             std::thread::sleep(backoff);
             continue;

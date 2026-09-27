@@ -23,7 +23,7 @@ mod recovery;
 mod resize;
 mod send;
 mod session_watch;
-pub(crate) mod state;
+mod state;
 mod synth_abr;
 use self::phase_lock::{phase_lock_enabled, PhaseController};
 // `native.rs` builds it and `control.rs` holds it: the 0xCF ACK hold crosses the module.

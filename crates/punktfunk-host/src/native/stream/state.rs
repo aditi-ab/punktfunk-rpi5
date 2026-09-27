@@ -18,25 +18,6 @@ use super::cursor::settle_portal_cursor;
 use super::pipeline::{build_pipeline_with_retry, Pipeline};
 use super::*;
 
-/// Non-blocking poll returning None forever while submits succeed. 2 s also sizes the backlog bound.
-const ENCODE_STALL_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
-/// In-place encoder rebuilds and capture-loss rebuilds before a session ends. GameStream shares them.
-pub(crate) const MAX_ENCODER_RESETS: u32 = 5;
-pub(crate) const MAX_CAPTURE_REBUILDS: u32 = 5;
-
-/// Frames are owed and no AU came for the stall window, or more are owed than that window can
-/// explain past the pipeline `depth`. The window stretches to eight intervals so a low frame
-/// rate cannot false-trip. GameStream's encode loop uses the same rule.
-pub(crate) fn encode_stalled(
-    inflight: usize,
-    since_au: std::time::Duration,
-    depth: usize,
-    interval: std::time::Duration,
-) -> bool {
-    let window = ENCODE_STALL_WINDOW.max(interval * 8);
-    let backlog = depth + (window.as_secs_f64() / interval.as_secs_f64().max(1e-6)).ceil() as usize;
-    inflight > 0 && (since_au >= window || inflight > backlog)
-}
 /// (capture_ns, submit_ns, send deadline) per frame handed to the encoder and not yet polled.
 pub(super) type Inflight = std::collections::VecDeque<(u64, u64, std::time::Instant)>;
 
@@ -73,8 +54,7 @@ pub(super) struct StreamState {
     pub(super) capture_rebuilds: u32,
     /// Topology re-assert generation this loop last saw. Only Windows IDD-push moves it.
     pub(super) seen_reassert_gen: u64,
-    pub(super) encoder_resets: u32,
-    pub(super) last_au_at: std::time::Instant,
+    pub(super) watchdog: crate::encode_recovery::EncoderWatchdog,
     pub(super) last_hdr_meta: Option<pf_frame::HdrMeta>,
     pub(super) inflight: Inflight,
     /// NEW source frames / REPEATS / cursor REGENS since `diag_at`. Logged every 2 s under `PUNKTFUNK_PERF`.
@@ -288,8 +268,7 @@ impl StreamState {
             self.lease = p.lease;
         }
         self.inflight.clear();
-        self.last_au_at = std::time::Instant::now();
-        self.encoder_resets = 0;
+        self.watchdog.on_au();
     }
 
     pub(super) fn adopt_reframe(&self, reframe: punktfunk_core::video_fit::Reframe) {
@@ -1084,8 +1063,7 @@ impl StreamState {
             wire_frame_open: false,
             capture_rebuilds: 0,
             seen_reassert_gen: crate::windows::idd::topology_reassert_gen(),
-            encoder_resets: 0,
-            last_au_at: now,
+            watchdog: crate::encode_recovery::EncoderWatchdog::new(),
             last_hdr_meta: None,
             inflight: Inflight::new(),
             diag_new: 0,

@@ -114,6 +114,7 @@ mod encode {
         Ok(())
     }
 }
+mod encode_recovery;
 // Who else holds an NVENC session (NVML); names the neighbour when a stream falls behind.
 mod encoder_sessions;
 mod events;
