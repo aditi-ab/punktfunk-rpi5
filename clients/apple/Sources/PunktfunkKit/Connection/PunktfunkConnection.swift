@@ -200,7 +200,7 @@ public extension PunktfunkConnection {
 
     /// Send a Wake-on-LAN magic packet to wake a sleeping host. `macs` are the host's NIC MAC(s)
     /// (`aa:bb:cc:dd:ee:ff`, learned from its mDNS `mac` TXT while awake); malformed entries are
-    /// skipped. `lastKnownIP`, when set, is additionally unicast. The core broadcasts to every
+    /// skipped. `lastKnownIP`, when an IPv4 address, is additionally unicast. The core broadcasts to every
     /// interface's subnet-directed broadcast + 255.255.255.255 on ports 9/7, repeated.
     ///
     /// Returns true if at least one datagram went out. Does blocking sends — call OFF the main
