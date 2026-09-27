@@ -523,7 +523,7 @@ impl PresentHealth {
             Rung::Hardware(_) if shown => self.hw_fails = 0,
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             Rung::PyroWave if shown => self.pyro_warned = false,
-            Rung::Software => self.cpu_warned = false,
+            Rung::Software if shown => self.cpu_warned = false,
             _ => {}
         }
     }
@@ -906,6 +906,19 @@ mod tests {
         assert!(h.demoted);
         assert!(!h.failed(hw, &e), "a demoted decoder is told once");
         assert!(!h.demote());
+    }
+
+    /// A stale swapchain drops the frame: it is not the recovery that re-arms a last
+    /// rung's warning.
+    #[test]
+    fn a_stale_present_keeps_a_last_rung_quiet() {
+        let e = anyhow::anyhow!("upload");
+        let mut h = PresentHealth::default();
+        assert!(!h.failed(Rung::Software, &e));
+        h.presented(Rung::Software, false);
+        assert!(h.cpu_warned, "stale is not a recovery");
+        h.presented(Rung::Software, true);
+        assert!(!h.cpu_warned);
     }
 
     /// The audio plane chases only a plausible video leg.
