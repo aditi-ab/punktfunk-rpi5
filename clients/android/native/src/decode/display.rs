@@ -8,7 +8,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::latency::now_realtime_ns;
+use super::latency::{now_realtime_ns, take_by_pts};
 use super::RENDERED_CAP;
 
 /// `CLOCK_MONOTONIC` now in nanoseconds — the base of the `systemNano` render timestamp the
@@ -48,10 +48,10 @@ pub(super) struct DisplayTracker {
     /// Always-on latch/display accumulator for the presenter's 1 Hz `pf-present` line —
     /// independent of the HUD gate, so a HUD-off A/B stays measurable from logcat.
     meter: Arc<super::presenter::PresentMeter>,
-    /// `(pts_us, decoded_real_ns, released_real_ns)` of frames released with `render = true`, in
+    /// `(pts_us, (decoded_real_ns, released_real_ns))` of frames released with `render = true`, in
     /// release order, awaiting their callback. Pushed on EVERY render (no HUD gate — the ring is
     /// a 64-tuple bound and the latch metric wants to exist when nobody is watching).
-    rendered: Mutex<VecDeque<(u64, i128, i128)>>,
+    rendered: Mutex<VecDeque<(u64, (i128, i128))>>,
 }
 
 impl DisplayTracker {
@@ -77,7 +77,7 @@ impl DisplayTracker {
             .rendered
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        g.push_back((pts_us, decoded_ns, released_ns));
+        g.push_back((pts_us, (decoded_ns, released_ns)));
         if g.len() > RENDERED_CAP {
             g.pop_front(); // render callbacks stopped coming (allowed under load) — evict
         }
@@ -180,25 +180,14 @@ unsafe extern "C" fn on_frame_rendered(
     let t = unsafe { &*(userdata as *const DisplayTracker) };
     let displayed_ns = now_realtime_ns() - (now_monotonic_ns() - system_nano as i128);
     let pts_us = media_time_us.max(0) as u64;
-    // Pair the frame back to its release record, evicting older entries (their callbacks were
-    // dropped by the platform) — same monotonic-eviction discipline as `note_decoded_pts`.
-    let mut paired = None;
-    {
-        let mut g = t
+    // Pair the frame back to its release record; older entries' callbacks were dropped.
+    let paired = take_by_pts(
+        &mut t
             .rendered
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while let Some(&(p, d, r)) = g.front() {
-            if p > pts_us {
-                break; // future frame — leave it for its own callback
-            }
-            g.pop_front();
-            if p == pts_us {
-                paired = Some((d, r));
-                break;
-            }
-        }
-    }
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        pts_us,
+    );
     // Clamped to (0, 10 s) like the e2e sample: a vendor's first render callbacks can carry a
     // garbage `system_nano` (observed on-glass: an epoch-sized latch max on the session's first
     // window), and one such sample would poison every max/percentile it lands in.

@@ -19,7 +19,7 @@ use super::display::{
     reported_dataspace, DisplayTracker,
 };
 use super::latency::{
-    note_decoded_pts, note_received_frame, now_realtime_ns, take_flags, take_stamp,
+    note_decoded_pts, note_received_frame, now_realtime_ns, take_by_pts, take_flags,
 };
 use super::presenter::{presenter_disabled_by_sysprop, PresentMeter, PresentPriority, Presenter};
 use super::setup::{
@@ -1088,7 +1088,7 @@ impl State {
             } else {
                 None
             };
-            let queued = take_stamp(&mut self.queued_stamps, o.pts_us);
+            let queued = take_by_pts(&mut self.queued_stamps, o.pts_us);
             let codec_us = queued.map(|q| ((o.decoded_ns - q).max(0) / 1000) as u64);
             let feed_us = match (queued, received_ns) {
                 (Some(q), Some(r)) => Some(((q - r).max(0) / 1000) as u64),
