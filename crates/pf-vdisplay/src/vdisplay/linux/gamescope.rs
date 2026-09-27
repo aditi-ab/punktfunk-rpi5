@@ -16,6 +16,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "gamescope/argv.rs"]
+mod argv;
 #[path = "gamescope/discovery.rs"]
 mod discovery;
 #[path = "gamescope/heads.rs"]
@@ -26,6 +28,7 @@ pub(crate) mod sandbox;
 pub(crate) mod seat;
 #[path = "gamescope/splash.rs"]
 mod splash;
+use argv::{argv_u32, gamescope_argvs, gamescope_output_size};
 use discovery::{
     check_gamescope_version, find_gamescope_eis_socket, find_gamescope_node, gamescope_bin,
     gamescope_can_composite_external_overlay, gamescope_can_offer_refresh_rates,
@@ -1494,38 +1497,6 @@ fn ensure_box_gamescope_mode(mode: Mode, hdr: bool) -> Result<u32> {
     }
 }
 
-/// Compositor argv from `/proc/<pid>/cmdline`. Basename `ends_with("gamescope")` — `/proc/…/exe`
-/// is often unreadable, and `==` would miss `punktfunk-gamescope` while still excluding helpers.
-fn gamescope_argvs() -> Vec<Vec<String>> {
-    crate::proc::pids()
-        .filter_map(|(_, path)| {
-            let raw = std::fs::read(path.join("cmdline")).ok()?;
-            let args: Vec<String> = raw
-                .split(|&b| b == 0)
-                .filter(|s| !s.is_empty())
-                .map(|s| String::from_utf8_lossy(s).into_owned())
-                .collect();
-            let a0 = args.first()?;
-            a0.rsplit('/')
-                .next()
-                .unwrap_or(a0)
-                .ends_with("gamescope")
-                .then_some(args)
-        })
-        .collect()
-}
-
-/// `-W`/`-H` of one argv. `None` if either is missing — also the compositor vs helper filter.
-fn gamescope_output_size(argv: &[String]) -> Option<(u32, u32)> {
-    match (
-        argv_u32(argv, &["-W", "--output-width"]),
-        argv_u32(argv, &["-H", "--output-height"]),
-    ) {
-        (Some(w), Some(h)) => Some((w, h)),
-        _ => None,
-    }
-}
-
 /// Three states: Game Mode routinely runs a session compositor plus a nested per-title gamescope.
 /// Collapsing unknown with a different size would restart the box unit and kill the running game.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1583,15 +1554,6 @@ fn any_output_size_is(argvs: &[Vec<String>], target: (u32, u32)) -> bool {
     argvs
         .iter()
         .any(|argv| gamescope_output_size(argv) == Some(target))
-}
-
-fn argv_u32(argv: &[String], names: &[&str]) -> Option<u32> {
-    argv.iter().enumerate().find_map(|(i, a)| {
-        names
-            .contains(&a.as_str())
-            .then(|| argv.get(i + 1).and_then(|v| v.parse().ok()))
-            .flatten()
-    })
 }
 
 /// Headless `--nested-refresh` is the session's only refresh (defaults to 60 Hz). The wrapper can
@@ -4554,6 +4516,11 @@ mod tests {
         );
         assert_eq!(
             gamescope_output_size(&argv("gamescope --output-width 800 --output-height 600")),
+            Some((800, 600))
+        );
+        // getopt_long also takes `--flag=value`, the spelling `heads` already reads.
+        assert_eq!(
+            gamescope_output_size(&argv("gamescope --output-width=800 --output-height=600")),
             Some((800, 600))
         );
         assert_eq!(gamescope_output_size(&argv("gamescope -W 2560")), None);
