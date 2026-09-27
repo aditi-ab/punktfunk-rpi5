@@ -136,6 +136,15 @@ final class CommandChordTests: XCTestCase {
         XCTAssertEqual(InputCapture.keyCodeToVK[126], 0x26) // Up arrow (⌃↑ Mission Control)
     }
 
+    /// A Mac JIS board sends the VKs an iPad sends for the same keys: kVK_JIS_* → HID usage.
+    func testTheJISKeysMapLikeTheHIDPath() {
+        let kvkToHID: [UInt16: Int] = [0x5D: 0x89, 0x5E: 0x87, 0x5F: 0x85, 0x68: 0x90, 0x66: 0x91]
+        for (kvk, hid) in kvkToHID {
+            XCTAssertNotNil(InputCapture.hidToVK[hid])
+            XCTAssertEqual(InputCapture.keyCodeToVK[kvk], InputCapture.hidToVK[hid], "kVK \(kvk)")
+        }
+    }
+
     private func keyEvent(_ keyCode: UInt16, _ flags: NSEvent.ModifierFlags) -> NSEvent? {
         NSEvent.keyEvent(
             with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0,
