@@ -19,7 +19,7 @@ use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::Result;
 use punktfunk_core::input::GamepadFrame;
 use punktfunk_core::quic::RichInput;
-use std::sync::atomic::{fence, AtomicU32, Ordering};
+use std::sync::atomic::{fence, Ordering};
 use std::time::Duration;
 
 // Driver maps this same struct; `offset_of!` so a layout change is a compile error.
@@ -38,6 +38,7 @@ const OFF_RUMBLE_SEQ: usize = core::mem::offset_of!(XusbShm, rumble_seq);
 const OFF_RUMBLE: usize = core::mem::offset_of!(XusbShm, rumble_large); // large @28, small @29
 const OFF_DRIVER_PROTO: usize = core::mem::offset_of!(XusbShm, driver_proto);
 const OFF_PAD_INDEX: usize = core::mem::offset_of!(XusbShm, pad_index);
+const OFF_MAGIC: usize = core::mem::offset_of!(XusbShm, magic);
 
 /// INF hardware ids. `pf_xusb` installs the `xinputhid` UpperFilters string WGI admits on;
 /// PnP fails a devnode whose filter service is missing, so without it the pad takes the
@@ -69,13 +70,10 @@ impl XusbWinPad {
     fn open(index: u8) -> Result<XusbWinPad> {
         let boot_name = pf_driver_proto::gamepad::xusb_boot_name(index);
         let mut channel = PadChannel::create(boot_name.clone(), SHM_SIZE)?;
-        let base = channel.data_base();
         // Index first; magic LAST. The driver rejects the section until magic is set.
-        // SAFETY: base points at SHM_SIZE writable bytes; OFF_PAD_INDEX is in range.
-        unsafe {
-            std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
-            std::ptr::write_unaligned(base as *mut u32, SHM_MAGIC);
-        }
+        let shm = channel.data();
+        shm.store_u32(OFF_PAD_INDEX, index.into(), Ordering::Relaxed);
+        shm.store_u32(OFF_MAGIC, SHM_MAGIC, Ordering::Relaxed);
         // `?` so PadSlots retries; a swallowed failure latched a phantom pad for the session.
         let hwid = xusb_hwid();
         let (sw, instance_id) = create_swdevice(&SwDeviceProfile {
@@ -110,45 +108,36 @@ impl XusbWinPad {
     /// Write XInput state (low-16 buttons); `packet` last so XInput sees a coherent snapshot.
     fn write_state(&mut self, st: &XboxState) {
         self.packet = self.packet.wrapping_add(1);
-        let base = self.channel.data_base();
-        // SAFETY: `base` is the mapped `SHM_SIZE` section; every `OFF_*` is in range.
-        // Single owner (`&mut self`). `packet` LAST: `Release` fence then `Release`
-        // store so an `Acquire` load never sees a torn body on ARM64 (x86-TSO: plain
-        // stores). `OFF_PACKET` (== 4) is 4-aligned off the page-aligned base.
-        unsafe {
-            std::ptr::write_unaligned(base.add(OFF_BUTTONS) as *mut u16, st.buttons as u16);
-            *base.add(OFF_LT) = st.left_trigger;
-            *base.add(OFF_RT) = st.right_trigger;
-            std::ptr::write_unaligned(base.add(OFF_LX) as *mut i16, st.ls_x);
-            std::ptr::write_unaligned(base.add(OFF_LY) as *mut i16, st.ls_y);
-            std::ptr::write_unaligned(base.add(OFF_RX) as *mut i16, st.rs_x);
-            std::ptr::write_unaligned(base.add(OFF_RY) as *mut i16, st.rs_y);
-            fence(Ordering::Release);
-            (*(base.add(OFF_PACKET) as *const AtomicU32)).store(self.packet, Ordering::Release);
-        }
+        let shm = self.channel.data();
+        shm.write_bytes(OFF_BUTTONS, &(st.buttons as u16).to_ne_bytes());
+        shm.write_bytes(OFF_LT, &[st.left_trigger]);
+        shm.write_bytes(OFF_RT, &[st.right_trigger]);
+        shm.write_bytes(OFF_LX, &st.ls_x.to_ne_bytes());
+        shm.write_bytes(OFF_LY, &st.ls_y.to_ne_bytes());
+        shm.write_bytes(OFF_RX, &st.rs_x.to_ne_bytes());
+        shm.write_bytes(OFF_RY, &st.rs_y.to_ne_bytes());
+        // `packet` LAST: `Release` fence then `Release` store, so an `Acquire` load never sees a
+        // torn body on ARM64 (x86-TSO: plain stores).
+        fence(Ordering::Release);
+        shm.store_u32(OFF_PACKET, self.packet, Ordering::Release);
     }
 
     /// New rumble `(large, small)` if `rumble_seq` moved. Also pumps handle delivery and attach.
     fn service(&mut self) -> Option<(u8, u8)> {
         self.channel.pump();
-        let base = self.channel.data_base();
-        // SAFETY: base points at SHM_SIZE bytes.
-        let proto = unsafe { std::ptr::read_unaligned(base.add(OFF_DRIVER_PROTO) as *const u32) };
-        self.attach.observe(proto);
-        // SAFETY: base points at SHM_SIZE bytes; `OFF_RUMBLE_SEQ` (== 24) is 4-aligned off the
-        // page-aligned base, so the `AtomicU32` view is valid. The driver bumps `rumble_seq` AFTER
-        // writing the rumble bytes, so an `Acquire` load here orders the `rumble_large`/`rumble_small`
-        // reads below after it — a fresh seq guarantees a coherent snapshot of the rumble bytes on a
-        // weakly-ordered core (ARM64). On x86-TSO it is a plain load.
-        let seq =
-            unsafe { (*(base.add(OFF_RUMBLE_SEQ) as *const AtomicU32)).load(Ordering::Acquire) };
+        let shm = self.channel.data();
+        self.attach
+            .observe(shm.load_u32(OFF_DRIVER_PROTO, Ordering::Relaxed));
+        // The driver bumps `rumble_seq` AFTER writing the rumble bytes, so this Acquire load
+        // orders the byte reads below after it: a fresh seq means a coherent snapshot on ARM64.
+        let seq = shm.load_u32(OFF_RUMBLE_SEQ, Ordering::Acquire);
         if seq == self.last_rumble_seq {
             return None;
         }
         self.last_rumble_seq = seq;
-        // SAFETY: rumble bytes at OFF_RUMBLE / OFF_RUMBLE+1.
-        let (large, small) = unsafe { (*base.add(OFF_RUMBLE), *base.add(OFF_RUMBLE + 1)) };
-        Some((large, small))
+        let mut rumble = [0u8; 2];
+        shm.read_bytes(OFF_RUMBLE, &mut rumble);
+        Some((rumble[0], rumble[1]))
     }
 }
 

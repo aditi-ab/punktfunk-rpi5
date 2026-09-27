@@ -626,11 +626,12 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
     unsafe { call_unsafe_wdf_function_binding!(WdfFdoInitSetFilter, device_init) };
 
     // The ticker starts once the device is up and is joined at removal, before its queue goes.
-    // SAFETY: a zeroed callbacks struct is valid with every callback unset; Size + two fields follow.
-    let mut pnp: WDF_PNPPOWER_EVENT_CALLBACKS = unsafe { core::mem::zeroed() };
-    pnp.Size = core::mem::size_of::<WDF_PNPPOWER_EVENT_CALLBACKS>() as ULONG;
-    pnp.EvtDeviceSelfManagedIoInit = Some(evt_self_managed_io_init);
-    pnp.EvtDeviceSelfManagedIoCleanup = Some(evt_self_managed_io_cleanup);
+    let mut pnp = WDF_PNPPOWER_EVENT_CALLBACKS {
+        Size: core::mem::size_of::<WDF_PNPPOWER_EVENT_CALLBACKS>() as ULONG,
+        EvtDeviceSelfManagedIoInit: Some(evt_self_managed_io_init),
+        EvtDeviceSelfManagedIoCleanup: Some(evt_self_managed_io_cleanup),
+        ..Default::default()
+    };
     // SAFETY: device_init is the framework's live init struct, not yet consumed by WdfDeviceCreate.
     unsafe {
         call_unsafe_wdf_function_binding!(

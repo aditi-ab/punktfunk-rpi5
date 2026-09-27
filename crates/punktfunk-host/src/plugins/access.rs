@@ -391,9 +391,7 @@ fn write_owned(canonical: &Path, _operator: bool, policy: &PathPolicy, facts: Pa
     if !policy.home.as_os_str().is_empty() && within(canonical, &policy.home) {
         return true;
     }
-    // SAFETY: geteuid has no preconditions and touches no memory.
-    let euid = unsafe { libc::geteuid() };
-    facts.owner_uid == Some(euid)
+    facts.owner_uid == Some(crate::geteuid())
 }
 
 #[cfg(not(any(unix, windows)))]

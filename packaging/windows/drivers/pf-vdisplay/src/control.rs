@@ -249,7 +249,7 @@ fn set_cursor_channel(owner: u32, request: Request) {
         Ok(()) => request.complete(STATUS_SUCCESS),
         Err(ch) => {
             dbglog!(
-                "[pf-vd] SET_CURSOR_CHANNEL: no hw-cursor monitor with target_id {} — rejecting",
+                "[pf-vd] SET_CURSOR_CHANNEL: channel for target_id {} not adopted — rejecting",
                 req.target_id
             );
             // NOT adopted: the host's error path reaps the duplicated handle remotely.

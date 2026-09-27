@@ -7,8 +7,8 @@
 //! Pinning: `size_of` / `offset_of` against the C totals, plus
 //! `size == last_field_offset + last_field_size` so tail padding cannot hide.
 //! Bitfields are plain integers; `pack` builders encode MSVC's LSB-up order.
-//! Construction is `const fn zeroed()`, not `mem::zeroed`. The crate's only
-//! `unsafe` is [`as_bytes`], sealed to these `#[repr(C)]` PODs.
+//! Construction is `const fn zeroed()`, not `mem::zeroed`. Byte views are
+//! `bytemuck` casts: deriving `Pod` rejects padding at compile time.
 //!
 //! `dxva.h` uses 1-byte packing. Five of six structs match natural alignment;
 //! `{UINT, UINT, USHORT}` slice records are **10 bytes packed, 12 naturally**.
@@ -22,6 +22,7 @@
 // line a translation against dxva.h / libavcodec `dxva2_*.c`.
 #![allow(non_snake_case)]
 
+use bytemuck::{Pod, Zeroable};
 use std::mem::align_of;
 use std::mem::offset_of;
 use std::mem::size_of;
@@ -37,7 +38,7 @@ pub const BITSTREAM_ALIGN: usize = 128;
 /// `DXVA_PicEntry_H264` / `DXVA_PicEntry_HEVC` — one byte in both specs:
 /// `Index7Bits : 7` (D3D11VA `ArraySlice` / [`crate::SlotMap`] DPB slot) then
 /// `AssociatedFlag : 1` (bottom field on `CurrPic`, long-term on a ref list).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Pod, Zeroable)]
 #[repr(C)]
 pub struct PicEntry(pub u8);
 
@@ -65,7 +66,7 @@ impl PicEntry {
 ///
 /// `CHAR` members are `i8`: MSVC `CHAR` is signed, and QP / chroma offsets
 /// are negative in real streams.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
 #[repr(C)]
 pub struct PicParamsH264 {
     pub wFrameWidthInMbsMinus1: u16,
@@ -207,7 +208,7 @@ impl H264BitFields {
 ///
 /// Old ATI/AMD UVD wanted raster (`FF_DXVA2_WORKAROUND_SCALING_LIST_ZIGZAG`);
 /// not implemented — hosts encode flat lists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
 #[repr(C)]
 pub struct QmatrixH264 {
     pub bScalingLists4x4: [[u8; 16]; 6],
@@ -230,7 +231,7 @@ impl QmatrixH264 {
 ///
 /// Short format only. Long format (`DXVA_Slice_H264_Long`) is refused at
 /// decoder creation; the ladder then uses FFmpeg.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Pod, Zeroable)]
 #[repr(C, packed)]
 pub struct SliceH264Short {
     /// Byte offset of the slice's **start code** within the bitstream buffer.
@@ -245,7 +246,7 @@ pub struct SliceH264Short {
 
 /// `DXVA_PicParams_HEVC`. 232 bytes; field offsets in the `const` proofs below.
 /// `CHAR` members are `i8` (QP / deblock offsets are signed).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
 #[repr(C)]
 pub struct PicParamsHevc {
     pub PicWidthInMinCbsY: u16,
@@ -473,7 +474,7 @@ impl HevcPictureFlags {
 /// 0..3 in coded (diagonal) order. sizeId 3 has two matrices (HEVC matrixId
 /// 0 and 3), so `[k]` is the parser's `scaling_list_32x32[k * 3]`. DC entries
 /// are `scaling_list_dc_coef_minus8 + 8`, the ScalingFactor DC, not the delta.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
 #[repr(C)]
 pub struct QmatrixHevc {
     pub ucScalingLists0: [[u8; 16]; 6],
@@ -500,7 +501,7 @@ impl QmatrixHevc {
 /// `DXVA_Slice_HEVC_Short`. Byte-for-byte the H.264 short record; separate
 /// type because the specs define them separately. 10 bytes packed, same
 /// reason as [`SliceH264Short`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Pod, Zeroable)]
 #[repr(C, packed)]
 pub struct SliceHevcShort {
     pub BSNALunitDataLocation: u32,
@@ -630,47 +631,16 @@ const _: () = {
     assert!(size_of::<SliceHevcShort>() == offset_of!(SliceHevcShort, wBadSliceChopping) + 2);
 };
 
-mod sealed {
-    /// Sealed: only this module's `#[repr(C)]` PODs may use [`super::as_bytes`].
-    pub trait DxvaBuffer: Copy + 'static {}
-}
-
-pub use sealed::DxvaBuffer;
-
-impl DxvaBuffer for PicParamsH264 {}
-impl DxvaBuffer for QmatrixH264 {}
-impl DxvaBuffer for SliceH264Short {}
-impl DxvaBuffer for PicParamsHevc {}
-impl DxvaBuffer for QmatrixHevc {}
-impl DxvaBuffer for SliceHevcShort {}
-
-/// Bytes for `memcpy` into the `GetDecoderBuffer` mapping.
-///
-/// Sound because every implementor is `#[repr(C)]` POD from `zeroed()`, so
-/// padding the driver reads is zero, matching reserved-byte rules.
-pub fn as_bytes<T: DxvaBuffer>(value: &T) -> &[u8] {
-    // SAFETY: `T: DxvaBuffer` is a sealed trait implemented only for this
-    // module's `#[repr(C)]` structs, none of which contains a pointer, a
-    // reference, or any type with a niche or a `Drop`. Their entire
-    // `size_of::<T>()` byte range — payload and padding alike — is therefore
-    // initialized memory owned by `value`, and the returned slice borrows it for
-    // exactly `value`'s lifetime, so nothing can mutate or free it while the
-    // slice is alive. The alignment requirement is trivially met (the slice is
-    // `u8`), and `size_of::<T>()` never exceeds `isize::MAX`.
-    unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
+/// Bytes for `memcpy` into the `GetDecoderBuffer` mapping. `Pod` means no
+/// padding, so every byte the driver reads is a field the builder wrote.
+pub fn as_bytes<T: Pod>(value: &T) -> &[u8] {
+    bytemuck::bytes_of(value)
 }
 
 /// Slice-control bytes: `n` packed records with no gap. Relies on
 /// [`SliceH264Short`] / [`SliceHevcShort`] being 10-byte packed.
-pub fn slice_bytes<T: DxvaBuffer>(values: &[T]) -> &[u8] {
-    // SAFETY: the same POD argument as `as_bytes`, extended over a slice: the
-    // elements are contiguous with `size_of::<T>()` stride by the definition of
-    // a Rust slice, every byte of every element is initialized (POD built from
-    // `zeroed()`), and the borrow ties the byte view to `values`. The length
-    // cannot overflow `isize::MAX`: it is the size of a live allocation.
-    unsafe {
-        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
-    }
+pub fn slice_bytes<T: Pod>(values: &[T]) -> &[u8] {
+    bytemuck::cast_slice(values)
 }
 
 #[cfg(test)]

@@ -18,11 +18,9 @@
 // built. SetDisplayConfig is serialized under the manager lock;
 // retry_set_display_config binds the input desktop.
 //
-// UNION READS. modeInfoIdx / advanced-color `.value` overlay a u32 with a
-// same-sized POD bitfield — every bit pattern is valid; modes.get(idx) is
-// correctness. sourceMode is discriminated by sibling infoType; every read is
-// guarded by infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE on the same
-// DISPLAYCONFIG_MODE_INFO. Move that guard and the access is unjustified.
+// UNION READS go through `mode_idxs` (a POD u32; modes.get(idx) is correctness)
+// and `source_mode`/`source_mode_mut`, which check infoType first. Device-info
+// packets go through `ccd_info`.
 use std::mem::size_of;
 
 use windows::core::{HSTRING, PCWSTR};
@@ -39,9 +37,10 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SDI, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SDTVDONGLE,
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SVIDEO, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED,
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EXTERNAL, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_RATIONAL,
-    DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE, DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY,
-    QDC_ALL_PATHS, QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_FORCE_MODE_ENUMERATION,
-    SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
+    DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE, DISPLAYCONFIG_SOURCE_MODE,
+    DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY, QDC_ALL_PATHS, QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES,
+    SDC_APPLY, SDC_FORCE_MODE_ENUMERATION, SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND,
+    SDC_USE_SUPPLIED_DISPLAY_CONFIG,
 };
 use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, POINTL};
 use windows::Win32::Graphics::Gdi::{
@@ -65,6 +64,36 @@ pub(crate) fn path_target_key(p: &DISPLAYCONFIG_PATH_INFO) -> CcdTargetKey {
         p.targetInfo.adapterId.HighPart,
         p.targetInfo.id,
     )
+}
+
+/// `p`'s (source, target) indices into its mode array. An inactive path carries
+/// `DISPLAYCONFIG_PATH_MODE_IDX_INVALID`, so index with `get`.
+fn mode_idxs(p: &DISPLAYCONFIG_PATH_INFO) -> (u32, u32) {
+    // SAFETY: `modeInfoIdx` overlays a same-sized POD bitfield; every bit pattern is a valid u32.
+    unsafe {
+        (
+            p.sourceInfo.Anonymous.modeInfoIdx,
+            p.targetInfo.Anonymous.modeInfoIdx,
+        )
+    }
+}
+
+/// `m`'s source mode; `None` for a target or desktop-image entry.
+fn source_mode(m: &DISPLAYCONFIG_MODE_INFO) -> Option<&DISPLAYCONFIG_SOURCE_MODE> {
+    if m.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
+        return None;
+    }
+    // SAFETY: `infoType == SOURCE`, checked above, makes `sourceMode` the live union arm.
+    Some(unsafe { &m.Anonymous.sourceMode })
+}
+
+/// [`source_mode`], writable.
+fn source_mode_mut(m: &mut DISPLAYCONFIG_MODE_INFO) -> Option<&mut DISPLAYCONFIG_SOURCE_MODE> {
+    if m.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
+        return None;
+    }
+    // SAFETY: `infoType == SOURCE`, checked above, makes `sourceMode` the live union arm.
+    Some(unsafe { &mut m.Anonymous.sourceMode })
 }
 
 /// How a CCD read failed. A QUERY FAILURE is a distinct answer from an empty topology, and no
@@ -538,23 +567,18 @@ pub fn set_active_mode_ccd(key: CcdTargetKey, mode: Mode) -> bool {
         tracing::warn!(target = %key, "ccd mode set: no active path for this target");
         return false;
     };
-    // SAFETY: the CCD contract at the top of this file — on an ACTIVE path the union carries
-    // `modeInfoIdx`, and this path came back from `QDC_ONLY_ACTIVE_PATHS`.
-    let src_idx = unsafe { paths[pi].sourceInfo.Anonymous.modeInfoIdx } as usize;
-    if src_idx >= modes.len() || modes[src_idx].infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
+    let (src_idx, tgt_idx) = mode_idxs(&paths[pi]);
+    let Some(sm) = modes.get_mut(src_idx as usize).and_then(source_mode_mut) else {
         tracing::warn!(target = %key, "ccd mode set: the path carries no source mode to rewrite");
         return false;
-    }
-    // The `infoType` guard above is what makes `sourceMode` the live arm of this union; move it
-    // and these writes land on a target mode instead.
-    modes[src_idx].Anonymous.sourceMode.width = mode.width;
-    modes[src_idx].Anonymous.sourceMode.height = mode.height;
+    };
+    sm.width = mode.width;
+    sm.height = mode.height;
     // Supply the target timing too. Leaving it out makes the OS search for a workable one and
     // answer ERROR_BAD_CONFIGURATION (0x64a) when it cannot; these are the numbers the driver
     // advertises for this mode, so the search is not needed. `v_sync_freq_divider` is 1 for a
     // target mode, per the DDI contract the driver builds its own mode list against.
-    // SAFETY: the CCD contract — an ACTIVE path carries `modeInfoIdx` in this union.
-    let tgt_idx = unsafe { paths[pi].targetInfo.Anonymous.modeInfoIdx } as usize;
+    let tgt_idx = tgt_idx as usize;
     if tgt_idx < modes.len() && modes[tgt_idx].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_TARGET {
         let region = DISPLAYCONFIG_2DREGION {
             cx: mode.width,
@@ -915,19 +939,11 @@ pub fn target_inventory_checked() -> Result<Vec<TargetInventory>, CcdError> {
             );
             hdr = ccd_info::advanced_color_bits(t.adapterId, t.id).map(hdr_active);
             sdr_white_level = ccd_info::sdr_white_level(t.adapterId, t.id);
-            // SAFETY: POD union — `modeInfoIdx` overlays a same-sized bitfield;
-            // every bit pattern is valid. Bounds-checked index below.
-            let idx = unsafe { p.sourceInfo.Anonymous.modeInfoIdx } as usize;
-            if let Some(m) = modes.get(idx) {
-                if m.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
-                    // SAFETY: `infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE`
-                    // on this same entry is the discriminant for `sourceMode`.
-                    let sm = unsafe { m.Anonymous.sourceMode };
-                    x = sm.position.x;
-                    y = sm.position.y;
-                    width = sm.width;
-                    height = sm.height;
-                }
+            if let Some(sm) = modes.get(mode_idxs(p).0 as usize).and_then(source_mode) {
+                x = sm.position.x;
+                y = sm.position.y;
+                width = sm.width;
+                height = sm.height;
             }
             gdi_name = ccd_info::source_gdi_name(p.sourceInfo.adapterId, p.sourceInfo.id)
                 .unwrap_or_default();
@@ -1377,20 +1393,11 @@ fn keep_only_supplied(
             continue;
         }
         let mut q = *p;
-        q.sourceInfo.Anonymous.modeInfoIdx = remap_mode_idx(
-            // SAFETY: POD union — `modeInfoIdx` overlays a same-sized bitfield.
-            unsafe { q.sourceInfo.Anonymous.modeInfoIdx },
-            modes,
-            &mut out_modes,
-            &mut remap,
-        );
-        q.targetInfo.Anonymous.modeInfoIdx = remap_mode_idx(
-            // SAFETY: POD union — `modeInfoIdx` overlays a same-sized bitfield.
-            unsafe { q.targetInfo.Anonymous.modeInfoIdx },
-            modes,
-            &mut out_modes,
-            &mut remap,
-        );
+        let (src_idx, tgt_idx) = mode_idxs(&q);
+        q.sourceInfo.Anonymous.modeInfoIdx =
+            remap_mode_idx(src_idx, modes, &mut out_modes, &mut remap);
+        q.targetInfo.Anonymous.modeInfoIdx =
+            remap_mode_idx(tgt_idx, modes, &mut out_modes, &mut remap);
         out_paths.push(q);
     }
     (out_paths, out_modes)
@@ -1429,22 +1436,14 @@ fn anchor_kept_sources_at_origin(
         if p.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
             continue;
         }
-        // SAFETY: POD union — `modeInfoIdx` overlays a same-sized bitfield;
-        // every bit pattern is valid. Index is bounds-checked below.
-        let idx = unsafe { p.sourceInfo.Anonymous.modeInfoIdx } as usize;
-        let Some(m) = modes.get(idx) else { continue };
-        if m.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE && !idxs.contains(&idx) {
+        let idx = mode_idxs(p).0 as usize;
+        if modes.get(idx).and_then(source_mode).is_some() && !idxs.contains(&idx) {
             idxs.push(idx);
         }
     }
     let positions: Vec<(i32, i32)> = idxs
         .iter()
-        .map(|&i| {
-            // SAFETY: `idxs` was filtered on
-            // `infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE` when built.
-            let pos = unsafe { modes[i].Anonymous.sourceMode.position };
-            (pos.x, pos.y)
-        })
+        .filter_map(|&i| source_mode(&modes[i]).map(|sm| (sm.position.x, sm.position.y)))
         .collect();
     if positions.contains(&(0, 0)) {
         return; // kept set already holds the primary
@@ -1454,10 +1453,10 @@ fn anchor_kept_sources_at_origin(
         return; // no pinned sources — SDC_ALLOW_CHANGES places them
     };
     for &i in &idxs {
-        // SAFETY: same `idxs`, same `infoType == SOURCE` filter.
-        let sm = unsafe { &mut modes[i].Anonymous.sourceMode };
-        sm.position.x -= ax;
-        sm.position.y -= ay;
+        if let Some(sm) = source_mode_mut(&mut modes[i]) {
+            sm.position.x -= ax;
+            sm.position.y -= ay;
+        }
     }
     tracing::info!(
         "display isolate (CCD): kept source(s) re-anchored onto the desktop origin (primary) — the doomed display held (0,0) delta=({},{})",
@@ -1472,23 +1471,12 @@ fn anchor_kept_sources_at_origin(
 /// cursor sits on ONE of them, and a cursor wiggle only dirties that one — a sibling display's
 /// kick must first know where to send the cursor (Stage W3 on-glass finding).
 pub fn source_desktop_rect(key: CcdTargetKey) -> Option<(i32, i32, i32, i32)> {
-    // SAFETY: `query_active_config` is this module's own CCD helper: it takes nothing and returns owned
-    // `Vec`s built from a fresh `QueryDisplayConfig`, so it has no caller obligation at all.
     let (paths, modes) = query_active_config()?;
     for p in &paths {
         if path_target_key(p) != key || p.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
             continue;
         }
-        // SAFETY: POD union — `modeInfoIdx` overlays a same-sized bitfield;
-        // every bit pattern is valid. Index is bounds-checked below.
-        let idx = unsafe { p.sourceInfo.Anonymous.modeInfoIdx } as usize;
-        let m = modes.get(idx)?;
-        if m.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
-            return None;
-        }
-        // SAFETY: `infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE` on this
-        // same entry is the discriminant for `sourceMode`.
-        let sm = unsafe { m.Anonymous.sourceMode };
+        let sm = source_mode(modes.get(mode_idxs(p).0 as usize)?)?;
         return Some((
             sm.position.x,
             sm.position.y,
@@ -1537,16 +1525,9 @@ pub fn desktop_bounds() -> Option<(i32, i32, i32, i32)> {
         if p.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
             continue;
         }
-        // SAFETY: POD union — `modeInfoIdx` overlays a same-sized bitfield;
-        // every bit pattern is valid. Index is bounds-checked below.
-        let idx = unsafe { p.sourceInfo.Anonymous.modeInfoIdx } as usize;
-        let Some(m) = modes.get(idx) else { continue };
-        if m.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
+        let Some(sm) = modes.get(mode_idxs(p).0 as usize).and_then(source_mode) else {
             continue;
-        }
-        // SAFETY: `infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE` on this
-        // same entry is the discriminant for `sourceMode`.
-        let sm = unsafe { m.Anonymous.sourceMode };
+        };
         let (x0, y0) = (sm.position.x, sm.position.y);
         let (x1, y1) = (x0 + sm.width as i32, y0 + sm.height as i32);
         acc = Some(match acc {
@@ -1577,19 +1558,14 @@ pub fn apply_source_positions(positions: &[(CcdTargetKey, i32, i32)]) {
         let Some(&(_, x, y)) = positions.iter().find(|(t, _, _)| *t == path_target_key(p)) else {
             continue;
         };
-        // SAFETY: POD union — `modeInfoIdx` overlays a same-sized bitfield;
-        // every bit pattern is valid. Index is bounds-checked below.
-        let idx = unsafe { p.sourceInfo.Anonymous.modeInfoIdx } as usize;
+        let idx = mode_idxs(p).0 as usize;
         if !done.insert(idx) {
             continue;
         }
-        let Some(m) = modes.get_mut(idx) else {
+        let Some(sm) = modes.get_mut(idx).and_then(source_mode_mut) else {
             continue;
         };
-        if m.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
-            continue;
-        }
-        m.Anonymous.sourceMode.position = POINTL { x, y };
+        sm.position = POINTL { x, y };
         moved += 1;
     }
     if moved == 0 {
@@ -1639,14 +1615,7 @@ pub fn set_virtual_primary_ccd(keep: CcdTargetKey) -> Option<SavedConfig> {
         if path_target_key(p) != keep {
             return None;
         }
-        // SAFETY: POD union — `modeInfoIdx` overlays a same-sized bitfield;
-        // every bit pattern is valid. Index is bounds-checked below.
-        let idx = unsafe { p.sourceInfo.Anonymous.modeInfoIdx } as usize;
-        let m = modes.get(idx)?;
-        // SAFETY: POD u32 union read — `then_some` is eager, so `sourceMode.width`
-        // is read even when infoType is not SOURCE. Every u32 bit pattern is valid.
-        let width = unsafe { m.Anonymous.sourceMode.width } as i32;
-        (m.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE).then_some(width)
+        source_mode(modes.get(mode_idxs(p).0 as usize)?).map(|sm| sm.width as i32)
     })?;
     let others = paths.len().saturating_sub(1);
 
@@ -1656,25 +1625,18 @@ pub fn set_virtual_primary_ccd(keep: CcdTargetKey) -> Option<SavedConfig> {
     let mut next_x = virt_width;
     let mut done = std::collections::HashSet::new();
     for p in paths.iter() {
-        // SAFETY: POD union — `modeInfoIdx` overlays a same-sized bitfield;
-        // every bit pattern is valid. Index is bounds-checked below.
-        let idx = unsafe { p.sourceInfo.Anonymous.modeInfoIdx } as usize;
+        let idx = mode_idxs(p).0 as usize;
         if !done.insert(idx) {
             continue;
         }
-        let Some(m) = modes.get_mut(idx) else {
+        let Some(sm) = modes.get_mut(idx).and_then(source_mode_mut) else {
             continue;
         };
-        if m.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
-            continue;
-        }
         if path_target_key(p) == keep {
-            // (A union field ASSIGNMENT needs no `unsafe` — only reads do.)
-            m.Anonymous.sourceMode.position = POINTL { x: 0, y: 0 };
+            sm.position = POINTL { x: 0, y: 0 };
         } else {
-            // SAFETY: `infoType == SOURCE` checked immediately above; `width` is a u32.
-            let w = unsafe { m.Anonymous.sourceMode.width } as i32;
-            m.Anonymous.sourceMode.position = POINTL { x: next_x, y: 0 };
+            let w = sm.width as i32;
+            sm.position = POINTL { x: next_x, y: 0 };
             next_x += w;
         }
     }
@@ -1790,14 +1752,7 @@ fn prune_saved_config_for_targets(
             continue;
         }
         let mut p = *p;
-        // SAFETY: POD union — `modeInfoIdx` overlays a same-sized bitfield;
-        // every bit pattern is valid. Used as bounds-checked indices.
-        let (src_idx, tgt_idx) = unsafe {
-            (
-                p.sourceInfo.Anonymous.modeInfoIdx,
-                p.targetInfo.Anonymous.modeInfoIdx,
-            )
-        };
+        let (src_idx, tgt_idx) = mode_idxs(&p);
         p.sourceInfo.Anonymous.modeInfoIdx = take(src_idx, &mut new_modes, &mut remap);
         p.targetInfo.Anonymous.modeInfoIdx = take(tgt_idx, &mut new_modes, &mut remap);
         kept.push(p);
@@ -2052,17 +2007,6 @@ mod prune_saved_config_tests {
         CcdTargetKey::from_luid_parts(luid_low, 0, target_id)
     }
 
-    fn indices(p: &DISPLAYCONFIG_PATH_INFO) -> (u32, u32) {
-        // SAFETY: POD union — `modeInfoIdx` overlays a same-sized bitfield;
-        // every bit pattern is valid.
-        unsafe {
-            (
-                p.sourceInfo.Anonymous.modeInfoIdx,
-                p.targetInfo.Anonymous.modeInfoIdx,
-            )
-        }
-    }
-
     #[test]
     fn everything_attached_survives_with_dense_indices() {
         let paths = vec![path(1, 100, 0, 1), path(1, 200, 2, 3)];
@@ -2072,8 +2016,8 @@ mod prune_saved_config_tests {
         assert_eq!(dropped, 0);
         assert_eq!(kept.len(), 2);
         assert_eq!(new_modes.len(), 4);
-        assert_eq!(indices(&kept[0]), (0, 1));
-        assert_eq!(indices(&kept[1]), (2, 3));
+        assert_eq!(mode_idxs(&kept[0]), (0, 1));
+        assert_eq!(mode_idxs(&kept[1]), (2, 3));
         assert_eq!(new_modes[3].id, 13, "mode entries follow their paths");
     }
 
@@ -2092,7 +2036,7 @@ mod prune_saved_config_tests {
             "the dropped path's modes must not orphan"
         );
         assert_eq!((new_modes[0].id, new_modes[1].id), (10, 11));
-        assert_eq!(indices(&kept[0]), (0, 1));
+        assert_eq!(mode_idxs(&kept[0]), (0, 1));
     }
 
     #[test]
@@ -2103,8 +2047,8 @@ mod prune_saved_config_tests {
         let (kept, new_modes, dropped) = prune_saved_config_for_targets(&paths, &modes, &avail);
         assert_eq!(dropped, 0);
         assert_eq!(new_modes.len(), 3);
-        let (a_src, _) = indices(&kept[0]);
-        let (b_src, _) = indices(&kept[1]);
+        let (a_src, _) = mode_idxs(&kept[0]);
+        let (b_src, _) = mode_idxs(&kept[1]);
         assert_eq!(a_src, b_src, "shared source mode keeps one table entry");
     }
 
@@ -2117,7 +2061,7 @@ mod prune_saved_config_tests {
         assert_eq!(dropped, 0);
         assert!(new_modes.is_empty());
         assert_eq!(
-            indices(&kept[0]),
+            mode_idxs(&kept[0]),
             (
                 DISPLAYCONFIG_PATH_MODE_IDX_INVALID,
                 DISPLAYCONFIG_PATH_MODE_IDX_INVALID

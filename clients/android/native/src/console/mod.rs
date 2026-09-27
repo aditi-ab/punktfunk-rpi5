@@ -127,15 +127,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleSurf
         let Some(h) = CONSOLES.get(handle) else {
             return Ok(());
         };
-        // SAFETY: `env`/`surface` are valid JNI pointers for this call; the raw casts bridge the
-        // jni-sys version skew between the `jni` and vendored `ndk` crates (see nativeStartVideo).
-        let window = unsafe {
-            ndk::native_window::NativeWindow::from_surface(
-                env.get_raw() as *mut _,
-                surface.as_raw() as *mut _,
-            )
-        };
-        match window {
+        // SAFETY: Kotlin declares `surface` a non-null `Surface`.
+        match unsafe { crate::window_from_surface(env, &surface) } {
             Some(w) => h.shared.send(Cmd::SurfaceCreated(w)),
             None => log::error!("console: no ANativeWindow from Surface"),
         }

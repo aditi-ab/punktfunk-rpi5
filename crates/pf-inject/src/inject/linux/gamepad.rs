@@ -12,13 +12,15 @@
 //! file's own.
 
 use crate::pad_slots::PadSlots;
+use crate::uapi;
 use crate::uinput_abi::{
-    ioctl_ptr, AbsInfo, InputEventRaw, InputId, UinputDevice, EV_ABS, EV_KEY, EV_SYN, SYN_REPORT,
-    UI_SET_EVBIT, UI_SET_FFBIT, UI_SET_KEYBIT,
+    AbsInfo, InputId, UinputDevice, EV_ABS, EV_KEY, EV_SYN, SYN_REPORT, UI_SET_EVBIT, UI_SET_FFBIT,
+    UI_SET_KEYBIT,
 };
 use anyhow::Result;
 use punktfunk_core::input::{gamepad, GamepadFrame, MAX_PADS};
 use std::collections::HashMap;
+use std::os::fd::AsFd;
 use std::time::{Duration, Instant};
 
 const UI_BEGIN_FF_UPLOAD: libc::c_ulong = 0xc068_55c8;
@@ -121,9 +123,9 @@ impl Default for PadIdentity {
     }
 }
 
-/// `struct ff_effect` (48 bytes; the union starts 8-aligned at offset 16).
+/// `struct ff_effect` (48 bytes; the union starts at offset 16).
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct FfEffect {
     type_: u16,
     id: i16,
@@ -138,7 +140,7 @@ struct FfEffect {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct UinputFfUpload {
     request_id: u32,
     retval: i32,
@@ -147,7 +149,7 @@ struct UinputFfUpload {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct UinputFfErase {
     request_id: u32,
     retval: i32,
@@ -160,6 +162,12 @@ const _: () = {
     assert!(std::mem::size_of::<UinputFfUpload>() == 104);
     assert!(std::mem::size_of::<UinputFfErase>() == 12);
 };
+
+// SAFETY: `#[repr(C)]` integers and byte arrays; the sizes above are the field sums, so
+// neither struct has padding.
+unsafe impl uapi::Pod for UinputFfUpload {}
+// SAFETY: as `UinputFfUpload`.
+unsafe impl uapi::Pod for UinputFfErase {}
 
 /// Played-effect window: `replay.delay` of silence, then `replay.length` of rumble.
 #[derive(Clone, Copy)]
@@ -353,31 +361,16 @@ impl VirtualPad {
 
     /// Non-blocking FF protocol on this pad's fd. `Some` when mixed `(low, high)` changed.
     fn pump_ff(&mut self) -> Option<(u16, u16)> {
-        let raw = self.dev.raw_fd();
-        let mut buf = [0u8; std::mem::size_of::<InputEventRaw>()];
-        loop {
-            // SAFETY: `raw` is the live non-blocking uinput fd. `buf` is a local
-            // `[u8; size_of::<InputEventRaw>()]`; `read` writes at most `buf.len()` bytes.
-            // The buffer outlives this synchronous call and is borrowed uniquely.
-            let n = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-            if n != buf.len() as isize {
-                break; // EAGAIN / short read — queue drained
-            }
-            // SAFETY: `buf` is exactly `size_of::<InputEventRaw>()` bytes and fully written by
-            // the `read` above. `read_unaligned` because `[u8]` is 1-aligned and `InputEventRaw`
-            // needs 8 (`timeval`); a plain `ptr::read` would be UB.
-            let ev: InputEventRaw =
-                unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const InputEventRaw) };
-            match (ev.type_, ev.code) {
+        let fd = self.dev.as_fd();
+        while let Some((type_, code, value)) = self.dev.read_event() {
+            match (type_, code) {
                 (EV_UINPUT, UI_FF_UPLOAD) => {
                     self.ff.note_activity();
-                    // SAFETY: `UinputFfUpload` is `#[repr(C)]` over integers and two `FfEffect`s
-                    // (integers + `[u8; 32]`); all-zero is valid for every field (no
-                    // bool/NonZero/enum/reference niche). `request_id` is set below; the ioctl
-                    // fills the rest.
-                    let mut up: UinputFfUpload = unsafe { std::mem::zeroed() };
-                    up.request_id = ev.value as u32;
-                    if ioctl_ptr(raw, UI_BEGIN_FF_UPLOAD, &mut up, "UI_BEGIN_FF_UPLOAD").is_ok() {
+                    let mut up = UinputFfUpload {
+                        request_id: value as u32,
+                        ..Default::default()
+                    };
+                    if uapi::ioctl_with(fd, UI_BEGIN_FF_UPLOAD, &mut up).is_ok() {
                         let e = up.effect;
                         // ff-core assigns a slot before uinput sees the request. A local
                         // counter would fight the kernel's id space.
@@ -399,29 +392,29 @@ impl VirtualPad {
                         }
                         up.effect.id = e.id; // hand the assigned slot back to the kernel
                         up.retval = 0;
-                        let _ = ioctl_ptr(raw, UI_END_FF_UPLOAD, &mut up, "UI_END_FF_UPLOAD");
+                        let _ = uapi::ioctl_with(fd, UI_END_FF_UPLOAD, &mut up);
                     }
                 }
                 (EV_UINPUT, UI_FF_ERASE) => {
                     self.ff.note_activity();
-                    // SAFETY: `UinputFfErase` is `#[repr(C)]` over three integer fields; all-zero
-                    // is valid for each. `request_id` is set below; the ioctl fills `effect_id`.
-                    let mut er: UinputFfErase = unsafe { std::mem::zeroed() };
-                    er.request_id = ev.value as u32;
-                    if ioctl_ptr(raw, UI_BEGIN_FF_ERASE, &mut er, "UI_BEGIN_FF_ERASE").is_ok() {
+                    let mut er = UinputFfErase {
+                        request_id: value as u32,
+                        ..Default::default()
+                    };
+                    if uapi::ioctl_with(fd, UI_BEGIN_FF_ERASE, &mut er).is_ok() {
                         self.ff.effects.remove(&(er.effect_id as i16));
                         er.retval = 0;
-                        let _ = ioctl_ptr(raw, UI_END_FF_ERASE, &mut er, "UI_END_FF_ERASE");
+                        let _ = uapi::ioctl_with(fd, UI_END_FF_ERASE, &mut er);
                     }
                 }
                 (EV_FF, FF_GAIN) => {
                     self.ff.note_activity();
-                    self.ff.gain = (ev.value as u32).min(0xFFFF);
+                    self.ff.gain = (value as u32).min(0xFFFF);
                 }
                 (EV_FF, code) => {
                     self.ff.note_activity();
                     if let Some(e) = self.ff.effects.get_mut(&(code as i16)) {
-                        e.playing = (ev.value != 0).then(|| e.window(Instant::now()));
+                        e.playing = (value != 0).then(|| e.window(Instant::now()));
                     }
                 }
                 _ => {}
@@ -517,7 +510,8 @@ impl GamepadManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::AsRawFd;
+    use crate::uinput_abi::input_event;
+    use std::io::Write;
     use std::time::Duration;
 
     /// Every key the generic pad emits is the row `gamepad-button-vectors.json` gives its
@@ -583,7 +577,6 @@ mod tests {
     /// and the kernel-assigned id. `EVIOCSFF` BLOCKS until the uinput owner answers
     /// `UI_FF_UPLOAD` — the caller must not be the thread running [`VirtualPad::pump_ff`].
     fn evdev_rumble(node: &str, strong: u16, weak: u16) -> std::io::Result<(std::fs::File, i16)> {
-        use std::io::Write as _;
         let mut f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -596,18 +589,9 @@ mod tests {
         eff[18..20].copy_from_slice(&weak.to_ne_bytes());
         // EVIOCSFF = _IOW('E', 0x80, struct ff_effect)
         let req: libc::c_ulong = (1 << 30) | (48 << 16) | (0x45 << 8) | 0x80;
-        // SAFETY: EVIOCSFF reads/writes the 48-byte `ff_effect` behind `f`; `eff` is
-        // exactly `sizeof(struct ff_effect)` and outlives the synchronous call.
-        let rc = unsafe { libc::ioctl(f.as_raw_fd(), req, eff.as_mut_ptr()) };
-        if rc < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+        uapi::ioctl_with(f.as_fd(), req, &mut eff)?;
         let id = i16::from_ne_bytes([eff[2], eff[3]]);
-        let mut ev = [0u8; 24]; // struct input_event: timeval 16, type u16, code u16, value s32
-        ev[16..18].copy_from_slice(&EV_FF.to_ne_bytes());
-        ev[18..20].copy_from_slice(&(id as u16).to_ne_bytes());
-        ev[20..24].copy_from_slice(&1i32.to_ne_bytes()); // play
-        f.write_all(&ev)?;
+        f.write_all(&input_event(EV_FF, id as u16, 1))?; // play
         Ok((f, id))
     }
 

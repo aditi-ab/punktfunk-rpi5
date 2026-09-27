@@ -162,60 +162,41 @@ struct ChoreoApi {
 impl ChoreoApi {
     /// Resolve from `libandroid.so`. `None` when even the baseline symbols are missing.
     fn resolve() -> Option<ChoreoApi> {
-        // SAFETY: dlopen of the always-mapped libandroid.so (refcount bump, never closed); each
-        // dlsym is null-checked before the transmute to its fn-pointer type.
+        // SAFETY: dlopen of the always-mapped libandroid.so (refcount bump, never closed; null is
+        // checked). Each `sym` type is the NDK header's signature for that name.
         unsafe {
             let lib = libc::dlopen(c"libandroid.so".as_ptr(), libc::RTLD_NOW);
             if lib.is_null() {
                 return None;
             }
-            let sym = |name: &std::ffi::CStr| {
-                let p = libc::dlsym(lib, name.as_ptr());
-                (!p.is_null()).then_some(p)
-            };
-            let get_instance = sym(c"AChoreographer_getInstance")?;
-            let post_vsync = sym(c"AChoreographer_postVsyncCallback");
-            let post_frame64 = sym(c"AChoreographer_postFrameCallback64");
-            post_vsync.or(post_frame64)?; // neither post entry point — no clock on this device
+            use crate::sym;
+            let post_vsync = sym(lib, c"AChoreographer_postVsyncCallback");
+            let post_frame64 = sym(lib, c"AChoreographer_postFrameCallback64");
+            // Neither post entry point — no clock on this device.
+            if post_vsync.is_none() && post_frame64.is_none() {
+                return None;
+            }
             Some(ChoreoApi {
-                get_instance: std::mem::transmute::<
-                    *mut c_void,
-                    unsafe extern "C" fn() -> *mut c_void,
-                >(get_instance),
-                post_vsync: post_vsync.map(|p| std::mem::transmute::<*mut c_void, PostVsyncCallback>(p)),
-                post_frame64: post_frame64
-                    .map(|p| std::mem::transmute::<*mut c_void, PostFrameCallback64>(p)),
-                fcd_frame_time: sym(c"AChoreographerFrameCallbackData_getFrameTimeNanos").map(|p| {
-                    std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*const c_void) -> i64>(p)
-                }),
-                fcd_timelines_len: sym(c"AChoreographerFrameCallbackData_getFrameTimelinesLength")
-                    .map(|p| {
-                        std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*const c_void) -> usize>(
-                            p,
-                        )
-                    }),
+                get_instance: sym(lib, c"AChoreographer_getInstance")?,
+                post_vsync,
+                post_frame64,
+                fcd_frame_time: sym(lib, c"AChoreographerFrameCallbackData_getFrameTimeNanos"),
+                fcd_timelines_len: sym(
+                    lib,
+                    c"AChoreographerFrameCallbackData_getFrameTimelinesLength",
+                ),
                 fcd_preferred_index: sym(
+                    lib,
                     c"AChoreographerFrameCallbackData_getPreferredFrameTimelineIndex",
-                )
-                .map(|p| {
-                    std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*const c_void) -> usize>(p)
-                }),
+                ),
                 fcd_expected_present: sym(
+                    lib,
                     c"AChoreographerFrameCallbackData_getFrameTimelineExpectedPresentationTimeNanos",
-                )
-                .map(|p| {
-                    std::mem::transmute::<
-                        *mut c_void,
-                        unsafe extern "C" fn(*const c_void, usize) -> i64,
-                    >(p)
-                }),
-                fcd_deadline: sym(c"AChoreographerFrameCallbackData_getFrameTimelineDeadlineNanos")
-                    .map(|p| {
-                        std::mem::transmute::<
-                            *mut c_void,
-                            unsafe extern "C" fn(*const c_void, usize) -> i64,
-                        >(p)
-                    }),
+                ),
+                fcd_deadline: sym(
+                    lib,
+                    c"AChoreographerFrameCallbackData_getFrameTimelineDeadlineNanos",
+                ),
             })
         }
     }

@@ -62,14 +62,14 @@ pub struct ImportSupport {
     pub p010: bool,
 }
 
-/// Planar slots on this vendor? A planar D3D11 import device-losts on NVIDIA however
-/// it is consumed, so NVIDIA stays on the RGB ring. `PUNKTFUNK_D3D11_PLANAR=0|1`
-/// overrides it both ways.
+/// Planar slots on this vendor? A planar D3D11 import loses the Vulkan device on NVIDIA
+/// and on Intel however it is consumed, so both stay on the RGB ring.
+/// `PUNKTFUNK_D3D11_PLANAR=0|1` overrides it both ways.
 pub fn planar_allowed(vendor_id: u32) -> bool {
     match std::env::var("PUNKTFUNK_D3D11_PLANAR").as_deref() {
         Ok("0") => false,
         Ok("1") => true,
-        _ => vendor_id != 0x10DE,
+        _ => !matches!(vendor_id, 0x10DE | 0x8086),
     }
 }
 
@@ -183,19 +183,21 @@ impl ImportCache {
         Ok(imported)
     }
 
-    /// Destroy every import of a generation other than `generation`. Call only after the
-    /// in-flight fence: a ring rebuild retires its slots while the last frame of the old
-    /// generation may still be on the GPU.
-    pub fn retire_stale(&mut self, device: &ash::Device, generation: u32) {
+    /// Destroy every import of a generation other than `generation`; `true` if any went. Call
+    /// only after the in-flight fence: a ring rebuild retires its slots while the last frame of
+    /// the old generation may still be on the GPU.
+    pub fn retire_stale(&mut self, device: &ash::Device, generation: u32) -> bool {
         let (keep, stale): (Vec<_>, Vec<_>) = self
             .entries
             .drain(..)
             .partition(|e| e.generation == generation);
         self.entries = keep;
+        let retired = !stale.is_empty();
         for e in stale {
             // SAFETY: the caller's fence wait; no submit references these objects.
             unsafe { destroy(device, e.imported) };
         }
+        retired
     }
 
     /// Call only after a device wait-idle (`Presenter::drop`).

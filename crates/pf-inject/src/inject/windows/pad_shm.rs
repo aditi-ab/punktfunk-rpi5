@@ -7,7 +7,7 @@
 use super::gamepad_raii::{
     create_swdevice, DriverAttach, PadChannel, ProofTransport, SwDevice, SwDeviceProfile,
 };
-use crate::pad_shm_ring::{driver_marks, publish_input, stamp, OutputDrain, INPUT_SLOT, SHM_SIZE};
+use crate::pad_shm_ring::{driver_marks, publish_input, stamp, OutputDrain, SHM_SIZE};
 use anyhow::Result;
 use std::time::Duration;
 
@@ -37,9 +37,8 @@ impl ShmPad {
     ) -> Result<ShmPad> {
         let boot_name = pf_driver_proto::gamepad::pad_boot_name(index);
         let mut channel = PadChannel::create(boot_name.clone(), SHM_SIZE)?;
-        // SAFETY: the channel maps SHM_SIZE writable bytes; every pad's neutral report fits the
-        // 64-byte input slot.
-        unsafe { stamp(channel.data_base(), devtype, index, neutral) };
+        // Ring version 2: this host drains the v2.2 long ring.
+        stamp(channel.data(), devtype, index, 2, neutral);
         // `?`: PadSlots retries a failed create; a swallowed one latched a pad with no devnode.
         let (sw, instance_id) = create_swdevice(profile)?;
         // Duplicate into the process serving this devnode, not the pid the LocalService-writable
@@ -67,12 +66,10 @@ impl ShmPad {
         })
     }
 
-    /// Publish one input report. The driver's timer copies the whole slot; there is no
-    /// change-detect on this plane.
+    /// Publish one input report, cut to the input slot. The driver's timer copies the whole
+    /// slot; there is no change-detect on this plane.
     pub(super) fn publish(&mut self, report: &[u8]) {
-        let report = &report[..report.len().min(INPUT_SLOT)];
-        // SAFETY: the channel maps a live SHM_SIZE section; `report` fits the input slot.
-        unsafe { publish_input(self.channel.data_base(), &mut self.input_gen, report) };
+        publish_input(self.channel.data(), &mut self.input_gen, report);
     }
 
     /// One service tick: pump channel delivery, feed the attach watcher, then hand every output
@@ -80,12 +77,10 @@ impl ShmPad {
     /// ring overflow, which the caller forwards as `PadFeedback::resync`.
     pub(super) fn poll(&mut self, per_report: impl FnMut(&[u8], bool)) -> bool {
         self.channel.pump();
-        let base = self.channel.data_base();
-        // SAFETY: the channel's section is live and SHM_SIZE bytes.
-        let (proto, rev) = unsafe { driver_marks(base) };
+        let shm = self.channel.data();
+        let (proto, rev) = driver_marks(shm);
         self.attach.observe_pad(proto, rev);
-        // SAFETY: as above.
-        unsafe { self.drain.drain_tagged(base, per_report) }
+        self.drain.drain_tagged(shm, per_report)
     }
 
     /// The bootstrap mailbox this pad's driver attaches through, for log lines.

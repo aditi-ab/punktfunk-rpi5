@@ -240,7 +240,7 @@ pub unsafe fn query_location_index(device: WDFDEVICE) -> u32 {
 /// driver that must know *which* device it is at descriptor time has to read it here.
 ///
 /// # Safety
-/// `device` must be the live `WDFDEVICE` created in the current `EvtDeviceAdd`.
+/// `device` must be a live `WDFDEVICE`.
 pub unsafe fn query_hardware_ids(device: WDFDEVICE) -> String {
     let mut mem: wdk_sys::WDFMEMORY = core::ptr::null_mut();
     // SAFETY: `device` is live per this fn's contract; property = HardwareID; pool ignored in UMDF;

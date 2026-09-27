@@ -174,8 +174,7 @@ impl HooksConfig {
 fn secret_file_complaint(path: &std::path::Path) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(path).ok()?;
-    // SAFETY: geteuid has no preconditions and touches no memory.
-    let euid = unsafe { libc::geteuid() };
+    let euid = crate::geteuid();
     if meta.uid() != euid && meta.uid() != 0 {
         return Some(format!(
             "owned by uid {} (host runs as uid {euid})",
@@ -521,8 +520,7 @@ fn exec_path_check(cmd: &str) -> Result<(), String> {
     if tokens.is_empty() {
         return Err("empty command".into());
     }
-    // SAFETY: geteuid has no preconditions and touches no memory.
-    let euid = unsafe { libc::geteuid() };
+    let euid = crate::geteuid();
     for token in &tokens {
         if !token.starts_with('/') {
             continue;
@@ -618,6 +616,8 @@ pub(crate) fn running_as_system() -> bool {
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.is_err() {
         return true; // fail closed
     }
+    // SAFETY: the open succeeded, so `token` is a handle this frame alone owns.
+    let token = unsafe { windows::core::Owned::new(token) };
     // TOKEN_USER is align-8; `[u8; 256]` is align-1 — a `&TOKEN_USER` into it is UB if
     // the slot is misaligned. Keep 256 BYTES: `[u64; 32]` would pass `len()`=32 to
     // GetTokenInformation and misclassify a 44-byte console TOKEN_USER as SYSTEM.
@@ -628,17 +628,13 @@ pub(crate) fn running_as_system() -> bool {
     // SAFETY: `buf` is a writable local of the length passed; `len` is a live out-param.
     let got = unsafe {
         GetTokenInformation(
-            token,
+            *token,
             TokenUser,
             Some(buf.0.as_mut_ptr().cast()),
             std::mem::size_of_val(&buf) as u32,
             &mut len,
         )
     };
-    // SAFETY: the token handle came from OpenProcessToken and is not used after this.
-    unsafe {
-        let _ = windows::Win32::Foundation::CloseHandle(token);
-    }
     if got.is_err() {
         return true; // fail closed
     }

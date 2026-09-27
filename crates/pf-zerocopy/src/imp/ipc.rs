@@ -14,10 +14,15 @@
 //! encode worker is a **separate file** — a shared inode would share the file
 //! capability — so it passes its own path to [`spawn_worker`].
 
+use rustix::net::{
+    AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
+    SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketFlags, SocketType,
+};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::fs::File;
-use std::io;
+use std::io::{self, IoSlice, IoSliceMut};
+use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -33,67 +38,37 @@ pub const MAX_MSG: usize = 64 * 1024;
 /// allocation-free on the single-fd hot path.
 pub const MAX_FDS: usize = 4;
 
-/// `u64` for the 8-byte `cmsghdr` alignment. `CMSG_SPACE(MAX_FDS * 4) = 32` on
-/// 64-bit Linux; 64 bytes doubles that so a larger header still fits.
-/// `cmsg_store_is_large_enough` asserts it.
-type CmsgStore = [u64; 8];
+/// `CMSG_SPACE` of [`MAX_FDS`] fds.
+const CMSG_RECV: usize = rustix::cmsg_aligned_space!(ScmRights(MAX_FDS));
 
-/// Kernel control-message size for `n` fds. `CMSG_SPACE` is size arithmetic;
-/// libc marks it `unsafe` anyway.
-fn cmsg_space(n: usize) -> usize {
-    // SAFETY: `CMSG_SPACE` performs alignment arithmetic on its argument and touches no memory.
-    unsafe { libc::CMSG_SPACE((n * std::mem::size_of::<RawFd>()) as u32) as usize }
-}
+/// Receive control space for exactly [`MAX_FDS`] fds. Aligned for `cmsghdr`, so none of it
+/// is lost to alignment: a peer sending more trips `MSG_CTRUNC` instead of landing them.
+#[repr(C, align(8))]
+struct CmsgStore([MaybeUninit<u8>; CMSG_RECV]);
 
 /// A CLOEXEC `SOCK_SEQPACKET` socketpair — `(host_end, worker_end)`.
 pub fn socketpair_seqpacket() -> io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [0i32; 2];
-    // SAFETY: `socketpair` writes two fds into this live 2-element array and
-    // reads no other Rust memory. On success each fd is fresh, so each
-    // `OwnedFd::from_raw_fd` takes sole ownership of a distinct descriptor.
-    unsafe {
-        if libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
-            0,
-            fds.as_mut_ptr(),
-        ) != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok((OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])))
-    }
+    Ok(rustix::net::socketpair(
+        AddressFamily::UNIX,
+        SocketType::SEQPACKET,
+        SocketFlags::CLOEXEC,
+        None,
+    )?)
 }
 
 /// `SO_RCVTIMEO`. A hung worker then fails [`recv`] with `WouldBlock` instead
-/// of wedging the calling thread. `None` clears the timeout.
+/// of wedging the calling thread. `None`, or under a microsecond, clears the timeout.
 pub fn set_recv_timeout(sock: BorrowedFd, timeout: Option<Duration>) -> io::Result<()> {
-    let tv = match timeout {
-        Some(d) => libc::timeval {
-            tv_sec: d.as_secs() as libc::time_t,
-            tv_usec: d.subsec_micros() as libc::suseconds_t,
-        },
-        None => libc::timeval {
-            tv_sec: 0,
-            tv_usec: 0,
-        },
-    };
-    // SAFETY: `setsockopt(SO_RCVTIMEO)` reads `size_of::<timeval>()` bytes
-    // from live stack `tv` for this call; `sock` is the caller's live socket.
-    // Nothing is retained.
-    let r = unsafe {
-        libc::setsockopt(
-            sock.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            &tv as *const libc::timeval as *const libc::c_void,
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        )
-    };
-    if r != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    // Whole microseconds, as `timeval` holds them: rustix rounds a sub-µs part up, and
+    // 999_999.5 µs rounds to a `tv_usec` of 1_000_000, which the kernel refuses (EDOM).
+    let timeout = timeout
+        .map(|d| Duration::from_micros(d.as_micros() as u64))
+        .filter(|d| !d.is_zero());
+    Ok(rustix::net::sockopt::set_socket_timeout(
+        sock,
+        rustix::net::sockopt::Timeout::Recv,
+        timeout,
+    )?)
 }
 
 /// Single-fd fast path over [`send_fds`].
@@ -133,45 +108,22 @@ pub fn send_fds<T: Serialize>(sock: BorrowedFd, msg: &T, fds: &[BorrowedFd]) -> 
             "worker ipc message too large",
         ));
     }
-    let mut iov = libc::iovec {
-        iov_base: body.as_ptr() as *mut libc::c_void,
-        iov_len: body.len(),
-    };
-    let mut cmsg_store: CmsgStore = [0; 8];
-    // SAFETY: `mhdr` is a plain-old-data C struct for which all-zero is a valid value.
-    let mut mhdr: libc::msghdr = unsafe { std::mem::zeroed() };
-    mhdr.msg_iov = &mut iov;
-    mhdr.msg_iovlen = 1;
-    if !fds.is_empty() {
-        let bytes = (fds.len() * std::mem::size_of::<RawFd>()) as u32;
-        debug_assert!(cmsg_space(fds.len()) <= std::mem::size_of_val(&cmsg_store));
-        mhdr.msg_control = cmsg_store.as_mut_ptr() as *mut libc::c_void;
-        // SAFETY: `CMSG_SPACE`/`CMSG_LEN` are size arithmetic. `CMSG_FIRSTHDR`
-        // returns a pointer into live, 8-aligned `cmsg_store` (non-null:
-        // `msg_controllen` ≥ one cmsghdr). The store is `CMSG_SPACE(MAX_FDS*4)`
-        // and `fds.len() <= MAX_FDS` was checked, so header plus each
-        // `write_unaligned` through `CMSG_DATA` stay in bounds for `sendmsg`.
-        unsafe {
-            mhdr.msg_controllen = libc::CMSG_SPACE(bytes) as _;
-            let c = libc::CMSG_FIRSTHDR(&mhdr);
-            (*c).cmsg_level = libc::SOL_SOCKET;
-            (*c).cmsg_type = libc::SCM_RIGHTS;
-            (*c).cmsg_len = libc::CMSG_LEN(bytes) as _;
-            let data = libc::CMSG_DATA(c) as *mut RawFd;
-            for (i, fd) in fds.iter().enumerate() {
-                std::ptr::write_unaligned(data.add(i), fd.as_raw_fd());
-            }
-        }
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS))];
+    let mut control = SendAncillaryBuffer::new(&mut space);
+    if !fds.is_empty() && !control.push(SendAncillaryMessage::ScmRights(fds)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "worker ipc: descriptors do not fit the control buffer",
+        ));
     }
-    // SAFETY: `sock` is the caller's live socket. `mhdr` points at live `iov`
-    // (`body` outlives the call) and, when fds are passed, at `cmsg_store`.
-    // `sendmsg` only reads. The kernel dups the fds; `BorrowedFd`s stay with
-    // the caller.
-    let n = unsafe { libc::sendmsg(sock.as_raw_fd(), &mhdr, libc::MSG_NOSIGNAL) };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if n as usize != body.len() {
+    // The kernel dups the fds; the `BorrowedFd`s stay with the caller.
+    let n = rustix::net::sendmsg(
+        sock,
+        &[IoSlice::new(&body)],
+        &mut control,
+        SendFlags::NOSIGNAL,
+    )?;
+    if n != body.len() {
         return Err(io::Error::new(
             io::ErrorKind::WriteZero,
             "short sendmsg on SEQPACKET socket",
@@ -198,28 +150,17 @@ pub fn recv_fds<T: DeserializeOwned>(
     buf: &mut Vec<u8>,
 ) -> io::Result<(T, Vec<OwnedFd>)> {
     buf.resize(MAX_MSG, 0);
-    let mut iov = libc::iovec {
-        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
-        iov_len: buf.len(),
-    };
-    let mut cmsg_store: CmsgStore = [0; 8];
-    // SAFETY: `mhdr` is a plain-old-data C struct for which all-zero is a valid value.
-    let mut mhdr: libc::msghdr = unsafe { std::mem::zeroed() };
-    mhdr.msg_iov = &mut iov;
-    mhdr.msg_iovlen = 1;
-    mhdr.msg_control = cmsg_store.as_mut_ptr() as *mut libc::c_void;
-    // Cap control space at MAX_FDS, not the store's full size: excess fds are
-    // dropped by the kernel and flagged `MSG_CTRUNC` (checked below). Do not
-    // trust the peer's count.
-    debug_assert!(cmsg_space(MAX_FDS) <= std::mem::size_of_val(&cmsg_store));
-    mhdr.msg_controllen = cmsg_space(MAX_FDS) as _;
-    // SAFETY: `sock` is the caller's live socket. `recvmsg` writes ≤ `iov_len`
-    // into live `buf` and ≤ `msg_controllen` into live, 8-aligned `cmsg_store`
-    // (asserted large enough). `MSG_CMSG_CLOEXEC` sets CLOEXEC on received fds.
-    let n = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut mhdr, libc::MSG_CMSG_CLOEXEC) };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    // Control space for MAX_FDS only: excess fds are dropped by the kernel and
+    // flagged `MSG_CTRUNC` (checked below). Do not trust the peer's count.
+    let mut store = CmsgStore([MaybeUninit::uninit(); CMSG_RECV]);
+    let mut control = RecvAncillaryBuffer::new(&mut store.0);
+    let msg = rustix::net::recvmsg(
+        sock,
+        &mut [IoSliceMut::new(buf)],
+        &mut control,
+        RecvFlags::CMSG_CLOEXEC,
+    )?;
+    let n = msg.bytes;
     if n == 0 {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -227,43 +168,26 @@ pub fn recv_fds<T: DeserializeOwned>(
         ));
     }
     // Own every received fd before any early return; dropping `got` on error
-    // closes them. Collecting after a `MSG_CTRUNC` check would leak.
+    // closes them (so would `control`'s drop, for any left undrained).
     let mut got: Vec<OwnedFd> = Vec::new();
-    // SAFETY: `CMSG_FIRSTHDR`/`CMSG_NXTHDR` walk the kernel-written control
-    // area inside `cmsg_store`, bounded by `mhdr.msg_controllen`; each
-    // non-null is a complete in-bounds `cmsghdr`. An `SCM_RIGHTS` payload is
-    // `cmsg_len - CMSG_LEN(0)` bytes of `RawFd`s in that cmsg, so each
-    // `read_unaligned` is in bounds. Each fd is a fresh descriptor; each
-    // `OwnedFd::from_raw_fd` takes sole ownership (no alias, no double-close).
-    unsafe {
-        let mut c = libc::CMSG_FIRSTHDR(&mhdr);
-        while !c.is_null() {
-            if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
-                let payload = ((*c).cmsg_len as usize).saturating_sub(libc::CMSG_LEN(0) as usize);
-                let data = libc::CMSG_DATA(c) as *const RawFd;
-                for i in 0..payload / std::mem::size_of::<RawFd>() {
-                    let fd = std::ptr::read_unaligned(data.add(i));
-                    if fd >= 0 {
-                        got.push(OwnedFd::from_raw_fd(fd));
-                    }
-                }
-            }
-            c = libc::CMSG_NXTHDR(&mhdr, c);
+    for m in control.drain() {
+        if let RecvAncillaryMessage::ScmRights(fds) = m {
+            got.extend(fds);
         }
     }
-    if mhdr.msg_flags & libc::MSG_CTRUNC != 0 {
+    if msg.flags.contains(ReturnFlags::CTRUNC) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("worker ipc message carried more than {MAX_FDS} descriptors"),
         ));
     }
-    if mhdr.msg_flags & libc::MSG_TRUNC != 0 {
+    if msg.flags.contains(ReturnFlags::TRUNC) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "worker ipc message truncated",
         ));
     }
-    let msg = serde_json::from_slice(&buf[..n as usize])
+    let msg = serde_json::from_slice(&buf[..n])
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok((msg, got))
 }
@@ -402,22 +326,6 @@ pub fn adopt_spawned_socket(args: &[String]) -> anyhow::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// A dma-buf's `(st_dev, st_ino)`. The kernel gives each dma-buf a unique inode for its
-/// lifetime, so the key survives a fresh dup per frame and `SCM_RIGHTS` re-numbering.
-pub fn dmabuf_inode(fd: impl AsRawFd) -> io::Result<(u64, u64)> {
-    // SAFETY: `libc::stat` is plain-old-data for which all-zero is a valid value, so
-    // `mem::zeroed()` is a sound initializer. `fstat` only reads the fd number (a closed one
-    // fails with EBADF) and writes into the live, correctly-sized `&mut st`, which is read
-    // only after the return value is checked.
-    unsafe {
-        let mut st: libc::stat = std::mem::zeroed();
-        if libc::fstat(fd.as_raw_fd(), &mut st) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok((st.st_dev as u64, st.st_ino as u64))
-    }
-}
-
 /// Parked children not yet exited (a worker exits on socket EOF after the
 /// last in-flight frame). Swept on spawn and drop so they do not linger as
 /// zombies past one generation.
@@ -506,14 +414,27 @@ mod tests {
         (pr, pw)
     }
 
+    /// A peer bypassing `send_fds` with one fd too many: the receive store holds exactly
+    /// `MAX_FDS`, so the kernel truncates and `recv_fds` refuses the message.
     #[test]
-    fn cmsg_store_is_large_enough() {
-        assert!(
-            cmsg_space(MAX_FDS) <= std::mem::size_of::<CmsgStore>(),
-            "CMSG_SPACE({MAX_FDS} fds) = {} > store {}",
-            cmsg_space(MAX_FDS),
-            std::mem::size_of::<CmsgStore>()
-        );
+    fn recv_refuses_more_than_max_fds() {
+        let (a, b) = socketpair_seqpacket().unwrap();
+        let pipes: Vec<_> = (0..MAX_FDS + 1).map(|_| std::io::pipe().unwrap()).collect();
+        let fds: Vec<BorrowedFd> = pipes.iter().map(|(pr, _)| pr.as_fd()).collect();
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS + 1))];
+        let mut control = SendAncillaryBuffer::new(&mut space);
+        assert!(control.push(SendAncillaryMessage::ScmRights(&fds)));
+        let body = serde_json::to_vec(&msg("over")).unwrap();
+        rustix::net::sendmsg(
+            a.as_fd(),
+            &[IoSlice::new(&body)],
+            &mut control,
+            SendFlags::NOSIGNAL,
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        let err = recv_fds::<Msg>(b.as_fd(), &mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -631,6 +552,17 @@ mod tests {
         drop(b);
         let err = send(a.as_fd(), &msg("gone"), None).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    /// A remainder just under a whole second must not round into an invalid `tv_usec`.
+    #[test]
+    fn recv_timeout_takes_any_remainder() {
+        let (a, _b) = socketpair_seqpacket().unwrap();
+        for d in [Duration::new(0, 999_999_500), Duration::new(4, 999_999_999)] {
+            set_recv_timeout(a.as_fd(), Some(d)).unwrap();
+        }
+        set_recv_timeout(a.as_fd(), Some(Duration::from_nanos(500))).unwrap();
+        set_recv_timeout(a.as_fd(), None).unwrap();
     }
 
     #[test]

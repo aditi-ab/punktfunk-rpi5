@@ -112,6 +112,35 @@ impl UserData {
         drop(stale);
         requeued
     }
+
+    /// Requeue a buffer this `.process` publishes nothing from. One the book still lists was
+    /// re-sent while held (PipeWire < 1.6): its hold is purged first, so the stale release
+    /// no-ops and the buffer rejoins once, and `resent` asks for the covering IDR.
+    ///
+    /// # Safety
+    /// Loop thread; `buf` was dequeued from the live `stream` and is not yet requeued.
+    pub(super) unsafe fn requeue_unpublished(
+        &self,
+        stream: *mut pw::sys::pw_stream,
+        buf: *mut pw::sys::pw_buffer,
+    ) {
+        let held = self
+            .defer
+            .book
+            .lock()
+            .map(|mut b| {
+                let held = b.contains(buf as usize);
+                b.purge(buf as usize);
+                held
+            })
+            .unwrap_or(false);
+        if held {
+            self.signals.resent.fetch_add(1, Ordering::Relaxed);
+        }
+        // SAFETY: the caller's contract is `hand_back`'s; the purge above leaves no hold that
+        // would queue `buf` a second time.
+        unsafe { hand_back(self.sync.as_deref(), stream, buf) };
+    }
 }
 
 /// How many buffers the producer allocated for this stream.

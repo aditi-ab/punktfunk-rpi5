@@ -10,7 +10,8 @@
 //!
 //! Pin: `ioctl_number_matches_dma_buf_h`, `poll_readable_reports_the_truth`.
 
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
+use rustix::event::{PollFd, PollFlags, Timespec};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 use std::time::{Duration, Instant};
 
 // linux/dma-buf.h: DMA_BUF_BASE is 'b' (0x62). _IOWR = dir(3)<<30 | size<<16 | base<<8 | nr.
@@ -40,18 +41,17 @@ pub enum WaitOutcome {
     TimedOut,
 }
 
-/// Snapshot the producer's pending writes on `dmabuf_fd` into an owned sync_file.
+/// Snapshot the producer's pending writes on `dmabuf` into an owned sync_file.
 /// `None` when the kernel attached no fence. `Err` when the kernel lacks the ioctl.
-pub fn export_sync_file(dmabuf_fd: RawFd) -> std::io::Result<Option<OwnedFd>> {
+pub fn export_sync_file(dmabuf: BorrowedFd<'_>) -> std::io::Result<Option<OwnedFd>> {
     let mut req = DmaBufExportSyncFile {
         flags: DMA_BUF_SYNC_READ,
         fd: -1,
     };
-    // SAFETY: `dmabuf_fd` is a live borrowed dmabuf; we never close it.
-    // The ioctl size is `size_of::<DmaBufExportSyncFile>()`. `&mut req` is a
-    // live `#[repr(C)]` value the kernel reads (`flags`) and writes (`fd`);
-    // it outlives this call and is not aliased.
-    let r = unsafe { libc::ioctl(dmabuf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &mut req) };
+    // SAFETY: `dmabuf` is open for the borrow; we never close it. The ioctl size is
+    // `size_of::<DmaBufExportSyncFile>()`. `&mut req` is a live `#[repr(C)]` value the kernel
+    // reads (`flags`) and writes (`fd`); it outlives this call and is not aliased.
+    let r = unsafe { libc::ioctl(dmabuf.as_raw_fd(), DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &mut req) };
     if r < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -64,85 +64,69 @@ pub fn export_sync_file(dmabuf_fd: RawFd) -> std::io::Result<Option<OwnedFd>> {
 
 /// Wait for a sync_file (from [`export_sync_file`]) to signal. Negative `timeout_ms`
 /// is infinite.
-pub fn wait_sync_file(sync_fd: RawFd, timeout_ms: i32) -> std::io::Result<WaitOutcome> {
-    poll_readable(sync_fd, timeout_ms)
+pub fn wait_sync_file(sync: BorrowedFd<'_>, timeout_ms: i32) -> std::io::Result<WaitOutcome> {
+    poll_readable(sync, timeout_ms)
 }
 
-/// Wait for producer writes on `dmabuf_fd`. Negative `timeout_ms` is infinite.
+/// Wait for producer writes on `dmabuf`. Negative `timeout_ms` is infinite.
 /// `Err` if the ioctl or poll failed (kernel lacks `EXPORT_SYNC_FILE`).
-pub fn wait_read_ready(dmabuf_fd: RawFd, timeout_ms: i32) -> std::io::Result<WaitOutcome> {
-    match export_sync_file(dmabuf_fd)? {
+pub fn wait_read_ready(dmabuf: BorrowedFd<'_>, timeout_ms: i32) -> std::io::Result<WaitOutcome> {
+    match export_sync_file(dmabuf)? {
         None => Ok(WaitOutcome::NoFence),
-        Some(sync) => poll_readable(sync.as_raw_fd(), timeout_ms),
+        Some(sync) => poll_readable(sync.as_fd(), timeout_ms),
     }
+}
+
+/// One `poll` of `fd`: whether `POLLIN` arrived within `timeout` (`None` waits forever).
+/// `EINTR` comes back as `Interrupted`.
+fn poll_once(fd: BorrowedFd<'_>, timeout: Option<&Timespec>) -> std::io::Result<bool> {
+    let mut pfd = [PollFd::from_borrowed_fd(fd, PollFlags::IN)];
+    if rustix::event::poll(&mut pfd, timeout)? == 0 {
+        return Ok(false);
+    }
+    let revents = pfd[0].revents();
+    if revents.contains(PollFlags::IN) {
+        return Ok(true);
+    }
+    // POLLERR/POLLNVAL without POLLIN — the fd is broken, not signaled.
+    Err(std::io::Error::other(format!(
+        "poll(sync_file) revents {:#x} without POLLIN",
+        revents.bits()
+    )))
 }
 
 /// Poll `fd` for `POLLIN`. Already readable at the probe is [`WaitOutcome::NoFence`].
 /// Negative `timeout_ms` is infinite. Retry `EINTR` with the remaining budget —
 /// skipping the wait would sample a still-in-flight buffer.
-fn poll_readable(fd: RawFd, timeout_ms: i32) -> std::io::Result<WaitOutcome> {
-    let mut pfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
+fn poll_readable(fd: BorrowedFd<'_>, timeout_ms: i32) -> std::io::Result<WaitOutcome> {
+    let zero = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
     };
     let probed = loop {
-        // SAFETY: `pfd` is one live `pollfd`; `nfds == 1`. `fd` is the caller's
-        // live sync_file. `poll` reads `fd`/`events`, writes `revents`; `pfd`
-        // outlives this timeout-0 probe and is not aliased.
-        let r = unsafe { libc::poll(&mut pfd, 1, 0) };
-        if r >= 0 {
-            break r;
-        }
-        let e = std::io::Error::last_os_error();
-        if e.raw_os_error() != Some(libc::EINTR) {
-            return Err(e);
+        match poll_once(fd, Some(&zero)) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            other => break other?,
         }
     };
-    if probed > 0 {
-        if pfd.revents & libc::POLLIN != 0 {
-            return Ok(WaitOutcome::NoFence);
-        }
-        // POLLERR/POLLNVAL without POLLIN — the fd is broken, not signaled.
-        return Err(std::io::Error::other(format!(
-            "poll(sync_file) revents {:#x} without POLLIN",
-            pfd.revents
-        )));
+    if probed {
+        return Ok(WaitOutcome::NoFence);
     }
     let deadline =
         (timeout_ms >= 0).then(|| Instant::now() + Duration::from_millis(timeout_ms as u64));
     loop {
         let remaining = match deadline {
-            None => -1, // poll's "no timeout"
+            None => None, // no timeout
             Some(d) => match d.checked_duration_since(Instant::now()) {
                 None => return Ok(WaitOutcome::TimedOut),
-                // +1: round up so a sub-millisecond remainder still waits instead of busy-polling.
-                Some(rem) => (rem.as_millis() as i32).saturating_add(1),
+                Some(rem) => Some(Timespec::try_from(rem).map_err(std::io::Error::other)?),
             },
         };
-        pfd.revents = 0;
-        // SAFETY: same live single-element `pfd` (`revents` reset above), `nfds == 1`.
-        // `fd` stays open until the caller returns. `poll` reads `fd`/`events`,
-        // writes `revents`, and returns before `pfd` ends.
-        let r = unsafe { libc::poll(&mut pfd, 1, remaining) };
-        match r {
-            0 => return Ok(WaitOutcome::TimedOut),
-            r if r > 0 => {
-                if pfd.revents & libc::POLLIN != 0 {
-                    return Ok(WaitOutcome::Signaled);
-                }
-                // POLLERR/POLLNVAL without POLLIN — the fd is broken, not signaled.
-                return Err(std::io::Error::other(format!(
-                    "poll(sync_file) revents {:#x} without POLLIN",
-                    pfd.revents
-                )));
-            }
-            _ => {
-                let e = std::io::Error::last_os_error();
-                if e.raw_os_error() != Some(libc::EINTR) {
-                    return Err(e);
-                }
-            }
+        match poll_once(fd, remaining.as_ref()) {
+            Ok(false) => return Ok(WaitOutcome::TimedOut),
+            Ok(true) => return Ok(WaitOutcome::Signaled),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
         }
     }
 }
@@ -161,17 +145,10 @@ mod tests {
     #[test]
     fn poll_readable_reports_the_truth() {
         use std::io::Write;
-        use std::os::fd::AsRawFd;
 
         let (r, mut w) = std::io::pipe().unwrap();
-        assert_eq!(
-            poll_readable(r.as_raw_fd(), 10).unwrap(),
-            WaitOutcome::TimedOut
-        );
+        assert_eq!(poll_readable(r.as_fd(), 10).unwrap(), WaitOutcome::TimedOut);
         w.write_all(b"x").unwrap();
-        assert_eq!(
-            poll_readable(r.as_raw_fd(), 10).unwrap(),
-            WaitOutcome::NoFence
-        );
+        assert_eq!(poll_readable(r.as_fd(), 10).unwrap(), WaitOutcome::NoFence);
     }
 }

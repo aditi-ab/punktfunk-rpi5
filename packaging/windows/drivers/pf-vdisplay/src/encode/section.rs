@@ -23,7 +23,8 @@ use super::thread::EncodeThread;
 use crate::worker::OwnedHandle;
 
 /// The mapped section and the ready event, owned. The view is bounds-checked
-/// ([`MappedView`]); the section handle is closed once the view holds the section.
+/// ([`MappedView`]); the section handle is closed once the view holds the section. `Send` and
+/// `Sync` come from its fields: [`MappedView`] and [`OwnedHandle`] prove their own.
 pub struct AuSection {
     view: MappedView,
     event: OwnedHandle,
@@ -31,12 +32,6 @@ pub struct AuSection {
     heap_offset: u32,
     heap_bytes: u32,
 }
-
-// SAFETY: the raw view pointer is a mapped section alive until `Drop`; every cross-thread
-// access goes through the atomic views below, and the handles are process-wide tokens.
-unsafe impl Send for AuSection {}
-// SAFETY: as above — shared references only reach atomic views of the mapping.
-unsafe impl Sync for AuSection {}
 
 impl AuSection {
     /// Map `section` and adopt both handles. `Err` means NOTHING was adopted: the values are

@@ -45,49 +45,33 @@ struct Api {
 /// Resolve the ADPF entry points + the process manager, or `None` on API < 33 (symbols absent) or if
 /// the manager is unavailable.
 fn resolve_api() -> Option<Api> {
-    // SAFETY: `dlopen` of an always-present system library with a NUL-terminated name; it returns
-    // null on failure (checked below). `libandroid.so` is already mapped into every app process, so
-    // this only bumps its refcount — we intentionally never `dlclose` (process-lifetime handle).
-    let lib = unsafe { libc::dlopen(c"libandroid.so".as_ptr(), libc::RTLD_NOW) };
-    if lib.is_null() {
-        return None;
-    }
-    // SAFETY: `dlsym` on the valid handle above with NUL-terminated symbol names; each returns null
-    // when the symbol is absent (device API < 33), which we check before transmuting the non-null
-    // pointer to its fn-pointer type (layout-compatible; a resolved symbol is a valid code address).
+    // SAFETY: `libandroid.so` is mapped into every app process, so `dlopen` only bumps its
+    // refcount (never closed — a process-lifetime handle; null is checked). Each `sym` type is the
+    // NDK header's signature for that name. A required symbol absent = API < 33 = no ADPF.
     unsafe {
-        let get_manager = libc::dlsym(lib, c"APerformanceHint_getManager".as_ptr());
-        let create_session = libc::dlsym(lib, c"APerformanceHint_createSession".as_ptr());
-        let report = libc::dlsym(lib, c"APerformanceHint_reportActualWorkDuration".as_ptr());
-        let update_target = libc::dlsym(lib, c"APerformanceHint_updateTargetWorkDuration".as_ptr());
-        let close = libc::dlsym(lib, c"APerformanceHint_closeSession".as_ptr());
-        if get_manager.is_null()
-            || create_session.is_null()
-            || report.is_null()
-            || update_target.is_null()
-            || close.is_null()
-        {
-            return None; // device API < 33 — no ADPF
+        let lib = libc::dlopen(c"libandroid.so".as_ptr(), libc::RTLD_NOW);
+        if lib.is_null() {
+            return None;
         }
-        let get_manager = std::mem::transmute::<*mut c_void, GetManagerFn>(get_manager);
+        let get_manager: GetManagerFn = crate::sym(lib, c"APerformanceHint_getManager")?;
+        let create_session = crate::sym(lib, c"APerformanceHint_createSession")?;
+        let report = crate::sym(lib, c"APerformanceHint_reportActualWorkDuration")?;
+        let update_target = crate::sym(lib, c"APerformanceHint_updateTargetWorkDuration")?;
+        let close = crate::sym(lib, c"APerformanceHint_closeSession")?;
         let manager = get_manager();
         if manager.is_null() {
             return None;
         }
-        // Optional (API 35): resolve if present, else `None` — the session still works without it.
-        let set_prefer_power_efficiency =
-            libc::dlsym(lib, c"APerformanceHint_setPreferPowerEfficiency".as_ptr());
-        let set_prefer_power_efficiency = (!set_prefer_power_efficiency.is_null()).then(|| {
-            std::mem::transmute::<*mut c_void, SetPreferPowerEfficiencyFn>(
-                set_prefer_power_efficiency,
-            )
-        });
         Some(Api {
-            create_session: std::mem::transmute::<*mut c_void, CreateSessionFn>(create_session),
-            report: std::mem::transmute::<*mut c_void, ReportFn>(report),
-            update_target: std::mem::transmute::<*mut c_void, UpdateTargetFn>(update_target),
-            close: std::mem::transmute::<*mut c_void, CloseFn>(close),
-            set_prefer_power_efficiency,
+            create_session,
+            report,
+            update_target,
+            close,
+            // API 35; the session works without it.
+            set_prefer_power_efficiency: crate::sym(
+                lib,
+                c"APerformanceHint_setPreferPowerEfficiency",
+            ),
             manager,
         })
     }

@@ -27,19 +27,22 @@ use windows::{
     core::w,
 };
 
-/// Carries a raw handle or pointer across a thread spawn.
+/// Carries a raw handle across a thread spawn: a WDF/IddCx handle (`*mut T`) or a Win32
+/// [`HANDLE`]. Nothing else is `Send` through it.
 ///
-/// Win32 and IddCx handles are `*mut c_void` and so `!Send`, but they are plain process-wide
-/// values whose lifetime the framework — not the compiler — governs. Rebind the WHOLE wrapper
-/// inside the closure (`let x = x;`) before touching `.0`: disjoint closure captures would
-/// otherwise capture the `!Send` field itself and defeat the wrapper.
+/// Those handles are `!Send`, but they are plain process-wide values whose lifetime the
+/// framework — not the compiler — governs. Rebind the WHOLE wrapper inside the closure
+/// (`let x = x;`) before touching `.0`: disjoint closure captures would otherwise capture the
+/// `!Send` field itself and defeat the wrapper.
 pub struct Sendable<T>(pub T);
-// SAFETY: see the type doc — the wrapped raw value has one user at a time, and the owner that
-// handed it over outlives the thread borrowing it.
-unsafe impl<T> Send for Sendable<T> {}
-// SAFETY: a shared `&Sendable<T>` yields only by-value copies of an opaque handle that is
-// never dereferenced in Rust; the DDIs it is passed to are the synchronisation point.
-unsafe impl<T> Sync for Sendable<T> {}
+// SAFETY: an opaque framework handle, never dereferenced in Rust; the owner that handed it
+// over outlives the thread using it, and the DDIs it is passed to do their own locking.
+unsafe impl<T> Send for Sendable<*mut T> {}
+// SAFETY: a shared `&Sendable<*mut T>` yields only by-value copies of that opaque handle.
+unsafe impl<T> Sync for Sendable<*mut T> {}
+// SAFETY: a Win32 handle is a process-wide token, not thread-affine; the owner that handed it
+// over closes it only after the thread using it has joined.
+unsafe impl Send for Sendable<HANDLE> {}
 
 /// A Win32 handle this process owns; `Drop` closes it exactly once.
 pub struct OwnedHandle(HANDLE);
@@ -96,6 +99,9 @@ pub struct OwnedView {
     /// Never read: held so it closes AFTER the unmap in `Drop` (field order).
     _mapping: OwnedHandle,
 }
+// SAFETY: a mapped view is process-wide, not thread-affine; this value is its only unmapper, so
+// moving it to the thread that reads the view moves the whole ownership.
+unsafe impl Send for OwnedView {}
 
 impl OwnedView {
     // unsafe-fn-no-op-ok: same transfer as OwnedHandle::from_raw, plus mapped-exactly-once --

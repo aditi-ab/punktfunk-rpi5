@@ -143,9 +143,9 @@ impl Vpp {
         })
     }
 
-    /// Release the context and config. No `Drop`: the display is the caller's, and
-    /// it must outlive this call.
-    pub fn destroy(&self, display: &Display) {
+    /// Release the context and config; consuming `self` makes it run once. No `Drop`:
+    /// the display is the caller's, and it must outlive this call.
+    pub fn destroy(self, display: &Display) {
         // SAFETY: both ids were created on this display in `new`; destroyed once,
         // context before config.
         unsafe {

@@ -364,7 +364,7 @@ impl Glass {
         if self.surface.is_some() {
             self.detach();
         }
-        match self.egl.window_surface(w.ptr().as_ptr().cast()) {
+        match self.egl.window_surface(&w) {
             Ok(s) => {
                 if self.gpu.is_none() {
                     self.gpu = Some(Gpu::new(&self.egl, cache_bytes)?);

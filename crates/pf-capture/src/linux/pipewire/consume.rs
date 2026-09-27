@@ -12,7 +12,7 @@ use crate::linux::sync_timeline::{plane_count, SyncPoints};
 use crate::{CapturedFrame, DmabufFrame, FramePayload, PixelFormat};
 use pipewire as pw;
 use pw::spa;
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -221,6 +221,22 @@ fn dmabuf_len(fd: i32) -> u64 {
     }
 }
 
+/// `data`'s fd, borrowed for as long as `data` is. `None` when the data carries no fd.
+fn data_fd(data: &pw::spa::buffer::Data) -> Option<BorrowedFd<'_>> {
+    let fd = RawFd::try_from(data.as_raw().fd)
+        .ok()
+        .filter(|&fd| fd >= 0)?;
+    // SAFETY: `data` borrows a `spa_data` of a buffer this side holds; its fd stays open
+    // while that borrow lives, and a non-negative fd is a valid `BorrowedFd`.
+    Some(unsafe { BorrowedFd::borrow_raw(fd) })
+}
+
+/// A CLOEXEC dup of `data`'s fd, so a published frame keeps the dmabuf past the requeue.
+/// `None`: the data carries no fd, or the process is out of descriptors.
+fn dup_data_fd(data: &pw::spa::buffer::Data) -> Option<OwnedFd> {
+    data_fd(data)?.try_clone_to_owned().ok()
+}
+
 /// Whether the selected GPU's driver rounds a linear import pitch: iHD does; an unknown
 /// selection is treated as one, a CPU copy being the cheaper mistake.
 fn linear_pitch_rounds() -> bool {
@@ -275,6 +291,9 @@ pub(super) fn consume_frame(
     if ud.signals.broken.load(Ordering::Relaxed) {
         return;
     }
+    // Read before `datas` below borrows the same array mutably.
+    // SAFETY: `spa_buf` is the buffer this callback holds.
+    let sync_points = unsafe { SyncPoints::of(spa_buf) };
     // SAFETY: the dequeued buffer stays held for this callback. We reject counts outside the
     // one/two-plane formats this function supports before using PipeWire's array pointer;
     // the sync datas behind the planes never enter the slice.
@@ -298,7 +317,7 @@ pub(super) fn consume_frame(
 
     let pts_ns = stamp_frame(ud, hdr_pts_ns);
     if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf {
-        wait_render_fence(ud, spa_buf, datas[0].fd());
+        wait_render_fence(ud, sync_points, data_fd(&datas[0]));
     }
     let arrival = Arrival {
         datas,
@@ -383,23 +402,25 @@ fn stamp_frame(ud: &mut UserData, hdr_pts_ns: Option<i64>) -> u64 {
     stamp.pts_ns
 }
 
-/// Wait out the producer's render before anything reads the dmabuf `fd`, and tally the wait.
+/// Wait out the producer's render before anything reads the dmabuf `plane`, and tally the wait.
 ///
-/// The render is fenced at the acquire point when the stream negotiated explicit sync, else
+/// The render is fenced at `sync`'s acquire point when the stream negotiated explicit sync, else
 /// by the dmabuf's implicit fence (none on NVIDIA: a stale frame can be read). 100 ms is a
 /// guard: past it the producer is wedged, not slow. A CPU wait on the loop thread; a GPU
 /// semaphore import would free it, and the `PUNKTFUNK_PERF` line says whether that is owed.
-fn wait_render_fence(ud: &mut UserData, spa_buf: *mut spa::sys::spa_buffer, fd: RawFd) {
+fn wait_render_fence(ud: &mut UserData, sync: Option<SyncPoints>, plane: Option<BorrowedFd<'_>>) {
     let t0 = std::time::Instant::now();
-    // SAFETY: `spa_buf` is the buffer this callback holds.
-    let explicit = ud.sync.as_ref().zip(unsafe { SyncPoints::of(spa_buf) });
+    let explicit = ud.sync.as_ref().zip(sync);
     let waited = match &explicit {
         Some((dev, p)) => dev.wait(
             p.acquire_fd,
             p.acquire_point,
             std::time::Duration::from_millis(100),
         ),
-        None => pf_zerocopy::dmabuf_fence::wait_read_ready(fd, 100),
+        None => match plane {
+            Some(plane) => pf_zerocopy::dmabuf_fence::wait_read_ready(plane, 100),
+            None => Err(std::io::Error::from_raw_os_error(libc::EBADF)),
+        },
     };
     ud.fence_wait.record(t0.elapsed().as_micros() as u64);
     match waited {
@@ -532,18 +553,10 @@ fn try_passthrough(ud: &mut UserData, a: &Arrival) -> bool {
         // frame is published only under a hold, so the producer can never rewrite a
         // DMA-BUF the encoder still reads. No hold — shallow pool or
         // PUNKTFUNK_ZEROCOPY_HOLD=0 — is a safe CPU fallback, never an unsafe publish.
-
-        // SAFETY: `datas[0].fd()` is the dmabuf fd owned by the live PipeWire buffer (valid
-        // for this callback). `fcntl(fd, F_DUPFD_CLOEXEC, 0)` reads only the integer fd,
-        // touches no Rust memory, and returns a fresh independent CLOEXEC duplicate (or -1).
-        // The original stays owned by PipeWire; the dup is a new fd we own (checked >= 0).
-        let dup = unsafe { libc::fcntl(datas[0].fd(), libc::F_DUPFD_CLOEXEC, 0) };
-        if dup < 0 {
+        let Some(dup) = dup_data_fd(&datas[0]) else {
             break 'passthrough PassthroughFallback::DupFailed;
-        }
+        };
         let Some(hold) = ud.try_defer(a.pw_buf, a.stream) else {
-            // SAFETY: `dup` is ours and was not published.
-            unsafe { libc::close(dup) };
             // A shortage, not a broken frame: drop it as the import lane does — the slot
             // keeps its frame, the next arrival takes the hold that comes back. The CPU
             // copy on this thread starves the requeues that would end the shortage; a
@@ -562,11 +575,7 @@ fn try_passthrough(ud: &mut UserData, a: &Arrival) -> bool {
             pts_ns: a.pts_ns,
             format: fmt,
             payload: FramePayload::Dmabuf(DmabufFrame {
-                // SAFETY: `dup` is the fresh fd `fcntl(F_DUPFD_CLOEXEC)` just returned
-                // (checked `dup >= 0`); nothing else owns it, so `OwnedFd` takes sole
-                // ownership and closes it exactly once on drop — no alias, no
-                // double-close.
-                fd: unsafe { OwnedFd::from_raw_fd(dup) },
+                fd: dup,
                 fourcc,
                 modifier: ud.modifier,
                 offset,
@@ -595,7 +604,8 @@ fn try_passthrough(ud: &mut UserData, a: &Arrival) -> bool {
                 h,
                 offset,
                 stride,
-                fd_size = dmabuf_len(dup),
+                // The held buffer's own fd: the consumer may already have closed the dup.
+                fd_size = dmabuf_len(datas[0].fd()),
                 modifier = ud.modifier,
                 fourcc = format_args!("{:#010x}", fourcc),
                 source = match fmt {
@@ -640,10 +650,7 @@ fn try_gpu_hold(ud: &mut UserData, a: &Arrival) -> bool {
                     offset: datas[0].chunk().offset(),
                     stride: datas[0].chunk().stride().max(0) as u32,
                 };
-                // SAFETY: `fd` is the producer's open dmabuf for this buffer; F_DUPFD_CLOEXEC
-                // only creates a second descriptor.
-                let dup = unsafe { libc::fcntl(datas[0].fd(), libc::F_DUPFD_CLOEXEC, 0) };
-                if dup >= 0 {
+                if let Some(dup) = dup_data_fd(&datas[0]) {
                     if let Some(hold) = ud.try_defer(a.pw_buf, a.stream) {
                         ud.publish(CapturedFrame {
                             provenance: Default::default(),
@@ -652,8 +659,7 @@ fn try_gpu_hold(ud: &mut UserData, a: &Arrival) -> bool {
                             pts_ns: a.pts_ns,
                             format: fmt,
                             payload: FramePayload::Dmabuf(DmabufFrame {
-                                // SAFETY: `dup` is a fresh descriptor this frame owns.
-                                fd: unsafe { OwnedFd::from_raw_fd(dup) },
+                                fd: dup,
                                 fourcc,
                                 modifier: ud.modifier,
                                 offset: plane.offset,
@@ -667,8 +673,6 @@ fn try_gpu_hold(ud: &mut UserData, a: &Arrival) -> bool {
                         });
                         return true;
                     }
-                    // SAFETY: `dup` is ours and nothing else saw it.
-                    unsafe { libc::close(dup) };
                     if holds_possible(zerocopy_hold_enabled(), ud.pool.live) {
                         ud.held_drops += 1;
                         return true;

@@ -8,17 +8,20 @@
 //! over `WM_COPYDATA` and exits.
 //!
 //! A URL must never be silently dropped, which is why the hand-off retries while the primary's
-//! window is still coming up, and why a hand-off that ultimately fails falls back to running
-//! this instance normally rather than exiting quietly.
+//! receiver window is still coming up, waits for the receiver to accept the link, and falls back
+//! to running this instance normally rather than exiting quietly.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
-use windows::Win32::commctrl::{DefSubclassProc, SetWindowSubclass};
+use windows::Win32::libloaderapi::GetModuleHandleW;
 use windows::Win32::minwindef::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::synchapi::{CreateMutexW, ReleaseMutex};
 use windows::Win32::windef::HWND;
 use windows::Win32::winnt::HANDLE;
-use windows::Win32::winuser::{FindWindowW, SendMessageW, COPYDATASTRUCT, WM_COPYDATA};
+use windows::Win32::winuser::{
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowExW, GetMessageW, RegisterClassW,
+    SendMessageW, COPYDATASTRUCT, HWND_MESSAGE, MSG, WM_COPYDATA, WNDCLASSW,
+};
 
 /// The single-instance mutex. Named per the design; deliberately not `Global\` — one shell per
 /// user session is the rule, and a second desktop user gets their own.
@@ -27,8 +30,8 @@ const MUTEX_NAME: windows::core::PCWSTR = windows::core::w!("unom.punktfunk.clie
 /// Tags our `WM_COPYDATA` so a stray message from anything else is ignored rather than parsed.
 const COPYDATA_URL: usize = 0x7066_0001; // 'pf' + 1
 
-/// Subclass id for the receiver hook.
-const SUBCLASS_ID: usize = 0x7066_0002;
+/// Window class of the primary's message-only receiver; later instances find it by this name.
+const RECEIVER_CLASS: windows::core::PCWSTR = windows::core::w!("unom.punktfunk.deeplink");
 
 /// URLs delivered by another instance, waiting for the app's poll to pick them up. A queue
 /// rather than a single slot: two shortcuts double-clicked in quick succession are two links,
@@ -73,12 +76,12 @@ pub(crate) fn claim_primary() -> bool {
         let handle = CreateMutexW(None, true, MUTEX_NAME);
         // A second window is preferable to dropping the activation when ownership is unknowable.
         if handle.0.is_null() {
-            let e = windows::Win32::errhandlingapi::GetLastError();
-            tracing::warn!(error = e, "single instance mutex; continuing as primary");
+            let e = std::io::Error::last_os_error();
+            tracing::warn!(error = %e, "single instance mutex; continuing as primary");
             return true;
         }
-        let already = windows::Win32::errhandlingapi::GetLastError()
-            == windows::Win32::winerror::ERROR_ALREADY_EXISTS as u32;
+        let already = std::io::Error::last_os_error().raw_os_error()
+            == Some(windows::Win32::winerror::ERROR_ALREADY_EXISTS);
         if already {
             close_handle(handle);
             return false;
@@ -104,67 +107,100 @@ pub(crate) fn release_primary() {
     }
 }
 
-/// Hand `url` to the running shell. Retries briefly: the primary may still be creating its
-/// window when a second launch lands (a double-clicked shortcut while the app is starting is
-/// the ordinary case), and giving up in that window would drop the link.
+/// Hand `url` to the running shell's receiver. Retries briefly: the primary may still be starting
+/// when a second launch lands (a double-clicked shortcut while the app is starting is the
+/// ordinary case), and giving up then would drop the link.
 ///
-/// `false` = the primary never answered, and the caller should just run normally.
+/// Only a reply of 1 counts: that is `wnd_proc` confirming the link is queued.
+/// `false` = the primary never accepted it, and the caller should just run normally.
 pub(crate) fn forward_to_primary(url: &str) -> bool {
     let wide: Vec<u16> = url.encode_utf16().collect();
+    let data = COPYDATASTRUCT {
+        dwData: COPYDATA_URL,
+        cbData: (wide.len() * 2) as u32,
+        lpData: wide.as_ptr() as *mut _,
+    };
     for attempt in 0..20 {
-        // SAFETY: `FindWindowW` takes static literals. The `COPYDATASTRUCT` points at `wide`, a
-        // local that outlives the call because `SendMessage` is synchronous — the receiver has
-        // finished with the buffer before it returns, which is precisely why this is not `Post`.
-        unsafe {
-            let hwnd = FindWindowW(None, windows::core::w!("Punktfunk"));
-            if !hwnd.0.is_null() {
-                let data = COPYDATASTRUCT {
-                    dwData: COPYDATA_URL,
-                    cbData: (wide.len() * 2) as u32,
-                    lpData: wide.as_ptr() as *mut _,
-                };
-                // SendMessage, not Post: the buffer must stay alive until the receiver has
-                // copied it, which only a synchronous send guarantees.
-                SendMessageW(
+        // SAFETY: `FindWindowExW` takes static literals. `data` points at `wide`; both outlive
+        // `SendMessageW`, which returns only after the receiver has copied the payload. That is
+        // why this is a send, not a post.
+        let accepted = unsafe {
+            let hwnd = FindWindowExW(Some(HWND_MESSAGE), None, RECEIVER_CLASS, None);
+            !hwnd.0.is_null()
+                && SendMessageW(
                     hwnd,
                     WM_COPYDATA as u32,
                     WPARAM(0),
                     LPARAM(&data as *const _ as isize),
-                );
-                tracing::info!(attempt, "handed the link to the running shell");
-                return true;
-            }
+                )
+                .0 == 1
+        };
+        if accepted {
+            tracing::info!(attempt, "handed the link to the running shell");
+            return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(150));
     }
-    tracing::warn!("no running shell answered; opening this link here instead");
+    tracing::warn!("no running shell accepted the link; opening it here instead");
     false
 }
 
-/// Start listening for links from later instances. Idempotent, and safe to call before the
-/// window exists — it retries on its own thread until the shell window can be found.
+/// Start listening for links from later instances on a thread of their own.
 pub(crate) fn install_receiver() {
     std::thread::Builder::new()
         .name("pf-deeplink-receiver".into())
-        .spawn(|| {
-            for _ in 0..200 {
-                // SAFETY: `FindWindowW` takes static literals, and `SetWindowSubclass` is given
-                // our own `wnd_proc` plus a plain id; the window handle is one the OS just returned.
-                unsafe {
-                    let hwnd = FindWindowW(None, windows::core::w!("Punktfunk"));
-                    if !hwnd.0.is_null() {
-                        // Subclassing (rather than replacing the window proc) is what lets the
-                        // WinUI window keep behaving as itself; the same mechanism the stream
-                        // input hooks already use.
-                        let _ = SetWindowSubclass(hwnd, Some(wnd_proc), SUBCLASS_ID, 0);
-                        return;
-                    }
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            tracing::warn!("shell window never appeared; links from other instances won't arrive");
-        })
+        .spawn(run_receiver)
         .ok();
+}
+
+/// Register the receiver class, create its message-only window and pump its messages.
+///
+/// The window belongs to the calling thread, so `wnd_proc` runs here and the WinUI window and UI
+/// thread take no part. Runs once per process: a second class registration fails.
+fn run_receiver() {
+    // SAFETY: `class` and its static name are live across `RegisterClassW`, and `wnd_proc` has
+    // the `WNDPROC` signature. The window is created, pumped and dispatched on this one thread;
+    // `msg` is a local that `GetMessageW` fills before `DispatchMessageW` reads it.
+    unsafe {
+        let instance = GetModuleHandleW(None);
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(wnd_proc),
+            hInstance: instance,
+            lpszClassName: RECEIVER_CLASS,
+            ..Default::default()
+        };
+        let hwnd = if RegisterClassW(&class).0 == 0 {
+            HWND::default()
+        } else {
+            CreateWindowExW(
+                0,
+                RECEIVER_CLASS,
+                None,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                Some(instance),
+                None,
+            )
+        };
+        if hwnd.0.is_null() {
+            let e = std::io::Error::last_os_error();
+            tracing::warn!(
+                error = %e,
+                "deep link receiver did not start; links from other instances won't arrive"
+            );
+            return;
+        }
+        let mut msg = MSG::default();
+        // 0 is WM_QUIT and -1 an error; both end the loop.
+        while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+            DispatchMessageW(&msg);
+        }
+    }
 }
 
 /// Decode an OS-marshalled UTF-16 payload without assuming its byte pointer is u16-aligned.
@@ -182,17 +218,15 @@ fn decode_utf16_payload(payload: &[u8]) -> Option<String> {
     Some(String::from_utf16_lossy(&wide))
 }
 
-/// Receive tagged `WM_COPYDATA` links and pass every other window message through.
+/// The receiver's window procedure: queue tagged `WM_COPYDATA` links, default everything else.
 ///
-/// Null metadata or data pointers are ignored. Payloads are first bounded as bytes, then decoded
-/// without imposing u16 alignment on the buffer Windows marshalled into this process.
+/// Returns 1 only for a queued link. Null metadata or data pointers are ignored. Payloads are
+/// bounded as bytes, then decoded without imposing u16 alignment on the marshalled buffer.
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
-    _id: usize,
-    _data: usize,
 ) -> LRESULT {
     if msg == WM_COPYDATA as u32 && lparam.0 != 0 {
         // SAFETY: Windows keeps the marshalled `COPYDATASTRUCT` live for this synchronous handler.
@@ -215,7 +249,7 @@ unsafe extern "system" fn wnd_proc(
         }
     }
     // SAFETY: forwarding the OS parameters unchanged is required for messages we do not consume.
-    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
 /// Take everything delivered since the last call — the app polls this and routes each one.

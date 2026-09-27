@@ -20,7 +20,8 @@ use windows::Win32::Foundation::LUID;
 ///
 /// # Safety
 /// `header` must return that first field, so a pointer to the packet is a pointer to the
-/// header the OS reads `size_of::<Self>()` bytes behind.
+/// header the OS reads `size_of::<Self>()` bytes behind. Every field is integer data, so any
+/// bytes the OS leaves are a valid `Self`.
 unsafe trait Packet: Default {
     const TYPE: DISPLAYCONFIG_DEVICE_INFO_TYPE;
     fn header(&mut self) -> &mut DISPLAYCONFIG_DEVICE_INFO_HEADER;
@@ -28,8 +29,9 @@ unsafe trait Packet: Default {
 
 macro_rules! packet {
     ($t:ty, $ty:expr) => {
-        // SAFETY: every `windows` `DISPLAYCONFIG_*` packet is `#[repr(C)]` plain data that
-        // starts with `header: DISPLAYCONFIG_DEVICE_INFO_HEADER`.
+        const _: () = assert!(std::mem::offset_of!($t, header) == 0);
+        // SAFETY: every `windows` `DISPLAYCONFIG_*` packet is `#[repr(C)]` integer data that
+        // starts with `header: DISPLAYCONFIG_DEVICE_INFO_HEADER` (asserted above).
         unsafe impl Packet for $t {
             const TYPE: DISPLAYCONFIG_DEVICE_INFO_TYPE = $ty;
             fn header(&mut self) -> &mut DISPLAYCONFIG_DEVICE_INFO_HEADER {

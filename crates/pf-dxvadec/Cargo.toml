@@ -9,6 +9,9 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Byte views of the DXVA buffers. `Pod` rejects padding at compile time; `min_const_generics`
+# covers `[u8; 810]` in the H.264 picture parameters.
+bytemuck = { version = "1.25", features = ["derive", "min_const_generics"] }
 # Direct dependency on the vendored parser crate, not just pf-bitstream: the picture-parameter
 # conversion consumes the parser's `Sps`/`Pps` types wholesale (pf-bitstream re-exports only
 # `Level`/`SliceHeader`), and the same path means the one crate instance the workspace already

@@ -95,16 +95,16 @@ pub(super) fn install_render_callback(
         *mut c_void,
     ) -> ndk_sys::media_status_t;
     // SAFETY: `dlopen` of `libmediandk.so`, which the `ndk` media wrapper already links — always
-    // mapped, so this only bumps its refcount (never closed — process-lifetime handle). `dlsym`
-    // returns null when the symbol is absent (device below API 33), checked before transmuting the
-    // non-null pointer to its fn-pointer type.
+    // mapped, so this only bumps its refcount (never closed — process-lifetime handle; null is
+    // checked). The `sym` type is the NDK header's signature; absent = API < 33.
     let set_on_frame_rendered = unsafe {
         let lib = libc::dlopen(c"libmediandk.so".as_ptr(), libc::RTLD_NOW);
         if lib.is_null() {
             return None;
         }
-        let sym = libc::dlsym(lib, c"AMediaCodec_setOnFrameRenderedCallback".as_ptr());
-        if sym.is_null() {
+        let Some(set) =
+            crate::sym::<SetOnFrameRenderedFn>(lib, c"AMediaCodec_setOnFrameRenderedCallback")
+        else {
             // No confirmed present ⇒ no `display` stage AND no reference for the audio plane's A/V
             // sync, which then stays inert and leaves the ring exactly as it was. The release
             // instant is NOT substituted: releases target a future vsync, so it runs a whole latch
@@ -114,8 +114,8 @@ pub(super) fn install_render_callback(
                 "decode: no render callback on this API level (<33) — no display stage, no A/V sync"
             );
             return None;
-        }
-        std::mem::transmute::<*mut c_void, SetOnFrameRenderedFn>(sym)
+        };
+        set
     };
     let ud = Arc::into_raw(tracker.clone());
     // SAFETY: `codec.as_ptr()` is the live codec this thread owns; `ud` outlives the registration

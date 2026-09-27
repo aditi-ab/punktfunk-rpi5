@@ -159,9 +159,10 @@ impl H265ProfileChain {
         }
     }
 
-    /// Wire the internal `p_next` chain and hand out the profile root. Do not move
-    /// `self` while the returned reference (or any pointer taken from it) lives.
-    pub(crate) fn wire(&mut self) -> &vk::VideoProfileInfoKHR<'static> {
+    /// Wire the internal `p_next` chain and hand out the profile root. The root, and
+    /// any copy of it, borrows `self`; a raw pointer from it must not outlive `self`
+    /// in place.
+    pub(crate) fn wire(&mut self) -> &vk::VideoProfileInfoKHR<'_> {
         self.usage.p_next = (&self.h265 as *const vk::VideoDecodeH265ProfileInfoKHR<'_>).cast();
         self.profile.p_next = (&self.usage as *const vk::VideoDecodeUsageInfoKHR<'_>).cast();
         &self.profile

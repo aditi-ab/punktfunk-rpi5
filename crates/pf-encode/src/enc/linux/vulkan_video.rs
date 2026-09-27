@@ -26,7 +26,7 @@ use ash::vk;
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::os::fd::AsRawFd;
+use std::os::fd::AsFd;
 
 const NV12: vk::Format = vk::Format::G8_B8R8_2PLANE_420_UNORM;
 /// 10-bit 4:2:0 picture/DPB. `3PACK16` stores each 10-bit sample in the HIGH bits of a 16-bit
@@ -2100,11 +2100,8 @@ impl VulkanVideoEncoder {
         cw: u32,
         ch: u32,
     ) -> Result<(vk::Image, vk::ImageView, bool)> {
-        let key = match pf_zerocopy::ipc::dmabuf_inode(d.fd.as_raw_fd()) {
-            Ok(key) => key,
-            // fstat failed → uncacheable sentinel; still owned by the cache and freed on evict/Drop.
-            Err(_) => (u64::MAX, self.enc_count),
-        };
+        // fstat failed → uncacheable sentinel; still owned by the cache and freed on evict/Drop.
+        let key = pf_zerocopy::fd_identity(d.fd.as_fd()).unwrap_or((u64::MAX, self.enc_count));
         if let Some(pos) = self.import_cache.iter().position(|e| e.key == key) {
             let e = &self.import_cache[pos];
             if e.extent == (cw, ch) {

@@ -52,6 +52,8 @@ serde = { version = "1", features = ["derive"] }
 # pf-vdisplay driver encodes, and it needs a render adapter to exist at all.
 openh264 = "0.9"
 libc = "0.2"
+# `memfd_create` without a raw-fd adoption.
+rustix = { version = "1", features = ["fs"] }
 # Vulkan bindings for the raw Vulkan-Video encode + PyroWave compute backends (feature-gated below;
 # the dep stays unconditional to mirror the host's Linux target — unused-but-declared is harmless).
 ash = "0.38"

@@ -2046,8 +2046,11 @@ uint32_t punktfunk_abi_version(void);
 // 3 (info) is the usual default; debug/trace is per-packet. `cb == NULL` detaches.
 // `Unsupported` if another `log` backend is already installed. Idempotent.
 //
+// Detaching or replacing stops new callbacks but does not wait for ones already running.
+//
 // # Safety
-// Non-null `cb` stays valid until the next NULL call; `user` stays valid for every callback.
+// `cb` and `user` stay valid until every thread that may log has stopped, not just until
+// the next call here.
 PunktfunkStatus punktfunk_set_log_callback(uint8_t max_level, PunktfunkLogCb cb, void *user);
 
 // Wake-on-LAN magic packet. `macs` is `mac_count` contiguous 6-byte MACs.
@@ -2125,7 +2128,7 @@ PunktfunkStatus punktfunk_set_input_callback(PunktfunkSession *s,
 // Returns the count dispatched (≥ 0), or a negative [`PunktfunkStatus`] on error.
 //
 // # Safety
-// `s` is a valid host handle.
+// `s` is a valid host handle. The callback must not free `s`: the drain uses it again.
 int32_t punktfunk_host_poll_input(PunktfunkSession *s);
 
 // Copy session counters into `*out`.

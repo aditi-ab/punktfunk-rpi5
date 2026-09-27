@@ -1,9 +1,10 @@
 //! Shared NVENC session config for the Windows D3D11 and Linux CUDA backends.
 //!
-//! Owns codec GUIDs, slice / sub-frame / split arbitration, the process-lifetime
-//! bitrate-ceiling cache, range-RFI policy, and the low-latency `NV_ENC_CONFIG`
-//! author. Entry-table load, device bind, surface register, and Windows async
-//! retrieve stay in those backends. Sibling of [`super::nvenc_status`].
+//! Owns the entry table ([`EncodeApi`]), the bitstream lock guard, codec GUIDs,
+//! slice / sub-frame / split arbitration, the process-lifetime bitrate-ceiling
+//! cache, range-RFI policy, and the low-latency `NV_ENC_CONFIG` author. Library
+//! load, device bind, surface register, and Windows async retrieve stay in those
+//! backends. Sibling of [`super::nvenc_status`].
 //!
 //! Union reads, borrows, and bitfield setters sit in their own `unsafe` blocks
 //! and name the codec arm they rely on. Plain union-arm writes are safe by
@@ -17,6 +18,7 @@
 
 use super::Codec;
 use nvidia_video_codec_sdk::sys::nvEncodeAPI as nv;
+use std::ffi::c_void;
 
 /// `NVENCSTATUS` → `Result` without the SDK `safe` module (these backends must
 /// not pull it in). Callers fold the raw status through [`super::nvenc_status`].
@@ -30,6 +32,320 @@ impl NvStatusExt for nv::NVENCSTATUS {
             err => Err(err),
         }
     }
+}
+
+// The SDK's bindgen `Default` zero-fills, but `frameFieldMode` and `pictureStruct` start at 1,
+// so `..Default::default()` builds an invalid enum. Seed these three structs from here instead.
+const FRAME_MODE: nv::NV_ENC_PARAMS_FRAME_FIELD_MODE =
+    nv::NV_ENC_PARAMS_FRAME_FIELD_MODE::NV_ENC_PARAMS_FRAME_FIELD_MODE_FRAME;
+const PIC_FRAME: nv::NV_ENC_PIC_STRUCT = nv::NV_ENC_PIC_STRUCT::NV_ENC_PIC_STRUCT_FRAME;
+
+/// All-zero `NV_ENC_CONFIG` with a progressive `frameFieldMode`.
+pub fn seed_config() -> nv::NV_ENC_CONFIG {
+    let mut c = std::mem::MaybeUninit::<nv::NV_ENC_CONFIG>::zeroed();
+    // SAFETY: `c` is live; forcing the field writes and reads nothing.
+    unsafe { force_frame_mode(c.as_mut_ptr()) };
+    // SAFETY: `frameFieldMode` is the struct's only enum without a 0 variant, set above.
+    unsafe { c.assume_init() }
+}
+
+/// All-zero `NV_ENC_PRESET_CONFIG` around [`seed_config`].
+pub fn seed_preset_config() -> nv::NV_ENC_PRESET_CONFIG {
+    let mut p = std::mem::MaybeUninit::<nv::NV_ENC_PRESET_CONFIG>::zeroed();
+    // SAFETY: an in-bounds field of live `p`; no read.
+    let cfg = unsafe { &raw mut (*p.as_mut_ptr()).presetCfg };
+    // SAFETY: `cfg` is that field, aligned and writable.
+    unsafe { cfg.write(seed_config()) };
+    // SAFETY: `presetCfg` holds the only zero-invalid enum, now set.
+    unsafe { p.assume_init() }
+}
+
+/// All-zero `NV_ENC_PIC_PARAMS` with a frame `pictureStruct`.
+pub fn seed_pic_params() -> nv::NV_ENC_PIC_PARAMS {
+    let mut p = std::mem::MaybeUninit::<nv::NV_ENC_PIC_PARAMS>::zeroed();
+    // SAFETY: an in-bounds field of live `p`; no read.
+    let field = unsafe { &raw mut (*p.as_mut_ptr()).pictureStruct };
+    // SAFETY: `field` is aligned and writable.
+    unsafe { field.write(PIC_FRAME) };
+    // SAFETY: `pictureStruct` is the struct's only enum without a 0 variant, set above.
+    unsafe { p.assume_init() }
+}
+
+/// All-zero `NV_ENC_LOCK_BITSTREAM` with a frame `pictureStruct` (the driver overwrites it).
+pub fn seed_lock_bitstream() -> nv::NV_ENC_LOCK_BITSTREAM {
+    let mut l = std::mem::MaybeUninit::<nv::NV_ENC_LOCK_BITSTREAM>::zeroed();
+    // SAFETY: an in-bounds field of live `l`; no read.
+    let field = unsafe { &raw mut (*l.as_mut_ptr()).pictureStruct };
+    // SAFETY: `field` is aligned and writable.
+    unsafe { field.write(PIC_FRAME) };
+    // SAFETY: `pictureStruct` is the struct's only enum without a 0 variant, set above.
+    unsafe { l.assume_init() }
+}
+
+/// Make `cfg` progressive without reading it. Run it on a driver-filled preset before the
+/// copy: a driver may leave `frameFieldMode` 0. These encoders only send frames.
+///
+/// # Safety
+/// `cfg` points at a live, writable `NV_ENC_CONFIG`.
+pub unsafe fn force_frame_mode(cfg: *mut nv::NV_ENC_CONFIG) {
+    // SAFETY: per the contract; `&raw mut` forms no reference to the maybe-invalid value.
+    let field = unsafe { &raw mut (*cfg).frameFieldMode };
+    // SAFETY: `field` is aligned and writable.
+    unsafe { field.write(FRAME_MODE) };
+}
+
+/// `NvEncodeAPIGetMaxSupportedVersion`.
+pub type GetMaxSupportedVersion = unsafe extern "C" fn(*mut u32) -> nv::NVENCSTATUS;
+/// `NvEncodeAPICreateInstance`.
+pub type CreateInstance =
+    unsafe extern "C" fn(*mut nv::NV_ENCODE_API_FUNCTION_LIST) -> nv::NVENCSTATUS;
+type UnlockBitstream = unsafe extern "C" fn(*mut c_void, nv::NV_ENC_OUTPUT_PTR) -> nv::NVENCSTATUS;
+
+/// The `NV_ENCODE_API_FUNCTION_LIST` entries the backends call, unwrapped at load. Never the
+/// SDK's `ENCODE_API`: its static externs import the driver library at process load, and the
+/// all-vendor binary must start on AMD/Intel.
+pub struct EncodeApi {
+    pub open_encode_session_ex: unsafe extern "C" fn(
+        *mut nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS,
+        *mut *mut c_void,
+    ) -> nv::NVENCSTATUS,
+    pub initialize_encoder:
+        unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_INITIALIZE_PARAMS) -> nv::NVENCSTATUS,
+    pub reconfigure_encoder:
+        unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_RECONFIGURE_PARAMS) -> nv::NVENCSTATUS,
+    pub destroy_encoder: unsafe extern "C" fn(*mut c_void) -> nv::NVENCSTATUS,
+    pub get_encode_caps: unsafe extern "C" fn(
+        *mut c_void,
+        nv::GUID,
+        *mut nv::NV_ENC_CAPS_PARAM,
+        *mut core::ffi::c_int,
+    ) -> nv::NVENCSTATUS,
+    pub get_encode_guid_count: unsafe extern "C" fn(*mut c_void, *mut u32) -> nv::NVENCSTATUS,
+    pub get_encode_guids:
+        unsafe extern "C" fn(*mut c_void, *mut nv::GUID, u32, *mut u32) -> nv::NVENCSTATUS,
+    pub get_encode_preset_config_ex: unsafe extern "C" fn(
+        *mut c_void,
+        nv::GUID,
+        nv::GUID,
+        nv::NV_ENC_TUNING_INFO,
+        *mut nv::NV_ENC_PRESET_CONFIG,
+    ) -> nv::NVENCSTATUS,
+    pub create_bitstream_buffer: unsafe extern "C" fn(
+        *mut c_void,
+        *mut nv::NV_ENC_CREATE_BITSTREAM_BUFFER,
+    ) -> nv::NVENCSTATUS,
+    pub destroy_bitstream_buffer:
+        unsafe extern "C" fn(*mut c_void, nv::NV_ENC_OUTPUT_PTR) -> nv::NVENCSTATUS,
+    pub lock_bitstream:
+        unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_LOCK_BITSTREAM) -> nv::NVENCSTATUS,
+    pub unlock_bitstream: UnlockBitstream,
+    pub register_resource:
+        unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_REGISTER_RESOURCE) -> nv::NVENCSTATUS,
+    pub unregister_resource:
+        unsafe extern "C" fn(*mut c_void, nv::NV_ENC_REGISTERED_PTR) -> nv::NVENCSTATUS,
+    pub map_input_resource:
+        unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_MAP_INPUT_RESOURCE) -> nv::NVENCSTATUS,
+    pub unmap_input_resource:
+        unsafe extern "C" fn(*mut c_void, nv::NV_ENC_INPUT_PTR) -> nv::NVENCSTATUS,
+    pub encode_picture:
+        unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_PIC_PARAMS) -> nv::NVENCSTATUS,
+    #[cfg(windows)]
+    pub register_async_event:
+        unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_EVENT_PARAMS) -> nv::NVENCSTATUS,
+    #[cfg(windows)]
+    pub unregister_async_event:
+        unsafe extern "C" fn(*mut c_void, *mut nv::NV_ENC_EVENT_PARAMS) -> nv::NVENCSTATUS,
+    pub invalidate_ref_frames: unsafe extern "C" fn(*mut c_void, u64) -> nv::NVENCSTATUS,
+    /// `NvEncSetIOCudaStreams`. The two `NV_ENC_CUSTREAM_PTR` args are pointers *to* `CUstream`
+    /// values, not the streams themselves.
+    #[cfg(target_os = "linux")]
+    pub set_io_cuda_streams: unsafe extern "C" fn(
+        *mut c_void,
+        nv::NV_ENC_CUSTREAM_PTR,
+        nv::NV_ENC_CUSTREAM_PTR,
+    ) -> nv::NVENCSTATUS,
+}
+
+impl EncodeApi {
+    /// Check the driver's API version against these headers, then unwrap its entry table. An
+    /// older driver or an unfilled entry is `Err`, never a panic.
+    ///
+    /// # Safety
+    /// Both pointers are the driver library's exports of those names, and the library stays
+    /// loaded while the table lives.
+    pub unsafe fn from_exports(
+        get_version: GetMaxSupportedVersion,
+        create_instance: CreateInstance,
+    ) -> Result<Self, String> {
+        let mut version = 0u32;
+        // SAFETY: per the contract; the call writes one u32 into the live local.
+        unsafe { get_version(&mut version) }
+            .nv_ok()
+            .map_err(|e| format!("NvEncodeAPIGetMaxSupportedVersion: {e:?}"))?;
+        let (major, minor) = (version >> 4, version & 0xf);
+        if (major, minor) < (nv::NVENCAPI_MAJOR_VERSION, nv::NVENCAPI_MINOR_VERSION) {
+            return Err(format!(
+                "driver NVENC API {major}.{minor} is older than the host's headers {}.{} — \
+                 update the NVIDIA driver",
+                nv::NVENCAPI_MAJOR_VERSION,
+                nv::NVENCAPI_MINOR_VERSION
+            ));
+        }
+        let mut list = nv::NV_ENCODE_API_FUNCTION_LIST {
+            version: nv::NV_ENCODE_API_FUNCTION_LIST_VER,
+            ..Default::default()
+        };
+        // SAFETY: per the contract; the call fills the live, version-set `list`.
+        unsafe { create_instance(&mut list) }
+            .nv_ok()
+            .map_err(|e| format!("NvEncodeAPICreateInstance: {e:?}"))?;
+        const MISSING: &str = "NvEncodeAPICreateInstance left an entry point unfilled";
+        Ok(Self {
+            open_encode_session_ex: list.nvEncOpenEncodeSessionEx.ok_or(MISSING)?,
+            initialize_encoder: list.nvEncInitializeEncoder.ok_or(MISSING)?,
+            reconfigure_encoder: list.nvEncReconfigureEncoder.ok_or(MISSING)?,
+            destroy_encoder: list.nvEncDestroyEncoder.ok_or(MISSING)?,
+            get_encode_caps: list.nvEncGetEncodeCaps.ok_or(MISSING)?,
+            get_encode_guid_count: list.nvEncGetEncodeGUIDCount.ok_or(MISSING)?,
+            get_encode_guids: list.nvEncGetEncodeGUIDs.ok_or(MISSING)?,
+            get_encode_preset_config_ex: list.nvEncGetEncodePresetConfigEx.ok_or(MISSING)?,
+            create_bitstream_buffer: list.nvEncCreateBitstreamBuffer.ok_or(MISSING)?,
+            destroy_bitstream_buffer: list.nvEncDestroyBitstreamBuffer.ok_or(MISSING)?,
+            lock_bitstream: list.nvEncLockBitstream.ok_or(MISSING)?,
+            unlock_bitstream: list.nvEncUnlockBitstream.ok_or(MISSING)?,
+            register_resource: list.nvEncRegisterResource.ok_or(MISSING)?,
+            unregister_resource: list.nvEncUnregisterResource.ok_or(MISSING)?,
+            map_input_resource: list.nvEncMapInputResource.ok_or(MISSING)?,
+            unmap_input_resource: list.nvEncUnmapInputResource.ok_or(MISSING)?,
+            encode_picture: list.nvEncEncodePicture.ok_or(MISSING)?,
+            #[cfg(windows)]
+            register_async_event: list.nvEncRegisterAsyncEvent.ok_or(MISSING)?,
+            #[cfg(windows)]
+            unregister_async_event: list.nvEncUnregisterAsyncEvent.ok_or(MISSING)?,
+            invalidate_ref_frames: list.nvEncInvalidateRefFrames.ok_or(MISSING)?,
+            #[cfg(target_os = "linux")]
+            set_io_cuda_streams: list.nvEncSetIOCudaStreams.ok_or(MISSING)?,
+        })
+    }
+}
+
+/// One `NV_ENC_CAPS` value for `codec`; 0 on error (unqueryable = unsupported).
+///
+/// # Safety
+/// `enc` is a live session.
+pub unsafe fn encode_cap(
+    api: &EncodeApi,
+    enc: *mut c_void,
+    codec: nv::GUID,
+    which: nv::NV_ENC_CAPS,
+) -> i32 {
+    let mut param = nv::NV_ENC_CAPS_PARAM {
+        version: nv::NV_ENC_CAPS_PARAM_VER,
+        capsToQuery: which,
+        reserved: [0; 62],
+    };
+    let mut val: i32 = 0;
+    // SAFETY: per the contract; `param` (version set) and `val` are live locals.
+    match unsafe { (api.get_encode_caps)(enc, codec, &mut param, &mut val) }.nv_ok() {
+        Ok(()) => val,
+        Err(_) => 0,
+    }
+}
+
+/// `sliceOffsets` entries for a `width`×`height` session: one per 16×16 macroblock
+/// (`nvEncodeAPI.h`: "Array size must be equal to size of frame in MBs").
+pub fn slice_offsets_len(width: u32, height: u32) -> usize {
+    width.div_ceil(16) as usize * height.div_ceil(16) as usize
+}
+
+/// One locked output bitstream: [`Self::bytes`] stay readable until it unlocks, on drop or
+/// through [`Self::unlock`] when the caller needs the status.
+pub struct BitstreamLock {
+    unlock_bitstream: UnlockBitstream,
+    enc: *mut c_void,
+    bs: nv::NV_ENC_OUTPUT_PTR,
+    lock: nv::NV_ENC_LOCK_BITSTREAM,
+}
+
+impl BitstreamLock {
+    /// `nvEncLockBitstream` on `bs`. Blocks until the encode finishes unless `do_not_wait`,
+    /// which samples the slices written so far. `slice_offsets` receives their offsets.
+    ///
+    /// # Safety
+    /// `enc` is a live session and `bs` one of its bitstream buffers with an encode submitted;
+    /// both outlive the guard. `slice_offsets`, when given, is [`slice_offsets_len`] long for
+    /// the session's frame size.
+    pub unsafe fn new(
+        api: &EncodeApi,
+        enc: *mut c_void,
+        bs: nv::NV_ENC_OUTPUT_PTR,
+        do_not_wait: bool,
+        slice_offsets: Option<&mut [u32]>,
+    ) -> Result<Self, nv::NVENCSTATUS> {
+        let mut lock = nv::NV_ENC_LOCK_BITSTREAM {
+            version: nv::NV_ENC_LOCK_BITSTREAM_VER,
+            outputBitstream: bs,
+            sliceOffsets: slice_offsets
+                .filter(|s| !s.is_empty())
+                .map_or(std::ptr::null_mut(), |s| s.as_mut_ptr()),
+            ..seed_lock_bitstream()
+        };
+        lock.set_doNotWait(u32::from(do_not_wait));
+        // SAFETY: per the contract; `lock` is a live, version-set local, and the driver writes
+        // the offsets during this call only.
+        unsafe { (api.lock_bitstream)(enc, &mut lock) }.nv_ok()?;
+        Ok(Self {
+            unlock_bitstream: api.unlock_bitstream,
+            enc,
+            bs,
+            lock,
+        })
+    }
+
+    /// The driver's output fields (`numSlices`, `frameIdx`, ...).
+    pub fn info(&self) -> &nv::NV_ENC_LOCK_BITSTREAM {
+        &self.lock
+    }
+
+    /// IDR or I picture.
+    pub fn keyframe(&self) -> bool {
+        matches!(
+            self.lock.pictureType,
+            nv::NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR | nv::NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_I
+        )
+    }
+
+    /// The bytes written so far (all of them after a blocking lock).
+    pub fn bytes(&self) -> &[u8] {
+        let len = self.lock.bitstreamSizeInBytes as usize;
+        if len == 0 || self.lock.bitstreamBufferPtr.is_null() {
+            return &[];
+        }
+        // SAFETY: a successful lock maps `len` bytes at `bitstreamBufferPtr` until unlock, and
+        // unlock takes the guard by value, so it cannot run while this borrow lives.
+        unsafe { std::slice::from_raw_parts(self.lock.bitstreamBufferPtr.cast::<u8>(), len) }
+    }
+
+    /// Unlock now and report the status.
+    pub fn unlock(self) -> Result<(), nv::NVENCSTATUS> {
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `bs` is locked on the live `enc` (`new`); `ManuallyDrop` skips the second
+        // unlock in `Drop`.
+        unsafe { (this.unlock_bitstream)(this.enc, this.bs) }.nv_ok()
+    }
+}
+
+impl Drop for BitstreamLock {
+    fn drop(&mut self) {
+        // SAFETY: `bs` is locked on the live `enc` (`new`) and this is its only unlock.
+        let _ = unsafe { (self.unlock_bitstream)(self.enc, self.bs) };
+    }
+}
+
+/// Whether the chunked sampler's `emitted` bytes (`shadow`) are not a byte-exact prefix of the
+/// finished AU. `emitted > full.len()` is checked first: the prefix slice would be ill-formed.
+pub fn prefix_diverged(shadow: &[u8], emitted: usize, full: &[u8]) -> bool {
+    emitted > full.len() || shadow != &full[..emitted]
 }
 
 /// NVENC codec GUID. PyroWave never opens this backend.
@@ -585,21 +901,37 @@ mod tests {
     }
 
     #[test]
-    fn hevc_444_still_takes_the_frext_path() {
-        // Do not `mem::zeroed` `NV_ENC_CONFIG`: `frameFieldMode`/`mvPrecision`
-        // discriminants start at 1, so all-zero is invalid and Rust aborts.
-        // Production seeds from `Default` then overwrites from the driver's preset.
+    fn seeds_carry_valid_enums() {
+        assert_eq!(seed_config().frameFieldMode, FRAME_MODE);
+        assert_eq!(seed_preset_config().presetCfg.frameFieldMode, FRAME_MODE);
+        assert_eq!(seed_pic_params().pictureStruct, PIC_FRAME);
+        assert_eq!(seed_lock_bitstream().pictureStruct, PIC_FRAME);
+    }
 
-        // SAFETY: `apply_low_latency_config` only writes into the caller's config (union writes
-        // included) and makes no driver calls, so this is pure in-memory work.
-        let cfg = unsafe {
-            let mut cfg = nv::NV_ENC_CONFIG {
-                version: nv::NV_ENC_CONFIG_VER,
-                ..Default::default()
-            };
-            apply_low_latency_config(&mut cfg, low_latency_cfg(Codec::H265, true, 10));
-            cfg
+    /// A 1080p frame is 68 macroblock rows, not 67: the partial row counts.
+    #[test]
+    fn slice_offsets_cover_every_macroblock() {
+        assert_eq!(slice_offsets_len(1920, 1080), 120 * 68);
+        assert_eq!(slice_offsets_len(3840, 2160), 240 * 135);
+        assert_eq!(slice_offsets_len(1, 1), 1);
+    }
+
+    #[test]
+    fn prefix_check_catches_overrun_and_mismatch() {
+        let full = [1u8, 2, 3, 4];
+        assert!(!prefix_diverged(&[1, 2], 2, &full));
+        assert!(!prefix_diverged(&[], 0, &full));
+        assert!(prefix_diverged(&[1, 9], 2, &full));
+        assert!(prefix_diverged(&[1, 2, 3, 4, 5], 5, &full));
+    }
+
+    #[test]
+    fn hevc_444_still_takes_the_frext_path() {
+        let mut cfg = nv::NV_ENC_CONFIG {
+            version: nv::NV_ENC_CONFIG_VER,
+            ..seed_config()
         };
+        apply_low_latency_config(&mut cfg, low_latency_cfg(Codec::H265, true, 10));
         assert_eq!(cfg.profileGUID, nv::NV_ENC_HEVC_PROFILE_FREXT_GUID);
         // SAFETY: an HEVC session's union arm is `hevcConfig` — the one this path wrote.
         unsafe { assert_eq!(cfg.encodeCodecConfig.hevcConfig.chromaFormatIDC(), 3) };
@@ -609,15 +941,11 @@ mod tests {
 
     #[test]
     fn av1_never_takes_the_hevc_444_union_write() {
-        // SAFETY: as above — pure in-memory config authoring, no driver involvement.
-        let cfg = unsafe {
-            let mut cfg = nv::NV_ENC_CONFIG {
-                version: nv::NV_ENC_CONFIG_VER,
-                ..Default::default()
-            };
-            apply_low_latency_config(&mut cfg, low_latency_cfg(Codec::Av1, true, 10));
-            cfg
+        let mut cfg = nv::NV_ENC_CONFIG {
+            version: nv::NV_ENC_CONFIG_VER,
+            ..seed_config()
         };
+        apply_low_latency_config(&mut cfg, low_latency_cfg(Codec::Av1, true, 10));
         // HEVC FREXT on an AV1 session is INVALID_PARAM at open.
         assert_ne!(
             cfg.profileGUID,
@@ -1078,6 +1406,16 @@ pub fn wave_rows(height: u32) -> u32 {
     height.div_ceil(32)
 }
 
+/// Frames a forced intra refresh wave takes on a `codec` session of `height` at `fps`; 0 when
+/// the wave is off. AV1 never waves: NVENC codes every AV1 frame to load its entropy state from
+/// the last, so a sweep cannot heal a loss. AV1 answers with an anchor or an IDR.
+pub fn session_wave_cycle(codec: Codec, height: u32, fps: u32) -> u32 {
+    if !crate::rfi::wave_enabled() || codec == Codec::Av1 {
+        return 0;
+    }
+    crate::rfi::wave_cycle(wave_rows(height), fps, 256, crate::rfi::pinned_cycle())
+}
+
 /// Shared `NV_ENC_INITIALIZE_PARAMS` (P1/ULL, PTD, session dims/rate) pointing
 /// at `cfg`. The returned struct borrows `cfg` as a raw pointer; keep `cfg`
 /// alive across the NVENC call. Open and in-place reconfigure must present
@@ -1124,13 +1462,9 @@ pub fn build_init_params(
 
 /// Low-latency NVENC config onto a **preset-seeded** `cfg`: CBR, infinite GOP,
 /// P-only, ~1-frame VBV, per-codec tier/level, chroma + bit depth, colour
-/// signaling, RFI DPB. Caller seeds from the P1/ULL preset (needs the
-/// per-platform entry table).
-///
-/// # Safety
-/// Writes codec-config union fields on `cfg`, which must be a valid,
-/// preset-seeded `NV_ENC_CONFIG` whose active arm matches [`LowLatencyConfig::codec`].
-pub unsafe fn apply_low_latency_config(cfg: &mut nv::NV_ENC_CONFIG, c: LowLatencyConfig) {
+/// signaling, RFI DPB. Caller seeds from the P1/ULL preset for
+/// [`LowLatencyConfig::codec`], which names the union arm every access here uses.
+pub fn apply_low_latency_config(cfg: &mut nv::NV_ENC_CONFIG, c: LowLatencyConfig) {
     cfg.gopLength = nv::NVENC_INFINITE_GOPLENGTH;
     cfg.frameIntervalP = 1;
     cfg.rcParams.rateControlMode = nv::NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;

@@ -1,6 +1,6 @@
 //! Host-lifetime virtual-display ownership: one process-wide refcount machine
 //! (Idle / Active / Lingering / Pinned), the linger timer, and a typed
-//! [`OwnedHandle`] control device.
+//! [`ControlDevice`].
 //!
 //! [`VirtualDisplayManager`] is the singleton ([`vdm`]). The session holds a
 //! [`MonitorLease`]; `Drop` releases the slot's refcount. A stale lease — its
@@ -12,7 +12,7 @@
 //! Evidence: `design/display-management.md`.
 
 use std::collections::BTreeMap;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -28,6 +28,7 @@ use windows::Win32::System::Threading::{
 };
 
 use super::{DisplayOwnership, Mode, VirtualOutput};
+use crate::driver::ControlDevice;
 use pf_win_display::win_display::{
     count_other_active, force_extend_topology, isolate_displays_ccd, isolate_displays_ccd_checked,
     resolve_gdi_name, restore_displays_ccd, set_active_mode, set_virtual_primary_ccd,
@@ -408,7 +409,7 @@ struct Pinger {
 /// handle open for the process lifetime.
 #[derive(Default)]
 struct DeviceSlot {
-    current: Option<Arc<OwnedHandle>>,
+    current: Option<Arc<ControlDevice>>,
     /// A global orphan reap is eligible only on the first unreserved open.
     /// Reopens and seats mode can overlap monitors owned elsewhere.
     opened_once: bool,
@@ -513,7 +514,7 @@ pub fn hw_cursor_capable() -> bool {
 /// (and every closure it builds) holds the `Arc` for as long as it may
 /// issue IOCTLs; the handle closes when the last holder drains. `None`
 /// before the first backend open.
-pub fn control_device_handle() -> Option<Arc<OwnedHandle>> {
+pub fn control_device_handle() -> Option<Arc<ControlDevice>> {
     VDM.get().and_then(VirtualDisplayManager::device_handle)
 }
 
@@ -571,13 +572,6 @@ fn is_device_gone(e: &anyhow::Error) -> bool {
     GONE.contains(&w.code().0)
 }
 
-/// Transient raw `HANDLE` of an Arc-held control device. Sound only while
-/// the borrowed `Arc` is held — every use site has the owning clone alive
-/// across the call, so a concurrent retire cannot close it mid-IOCTL.
-fn dev_raw(dev: &OwnedHandle) -> HANDLE {
-    HANDLE(dev.as_raw_handle())
-}
-
 impl VirtualDisplayManager {
     pub(crate) fn backend_name(&self) -> &'static str {
         self.driver.name()
@@ -588,7 +582,7 @@ impl VirtualDisplayManager {
     /// a seat cannot reap a sibling's and this needs no reservation gate. The
     /// returned `Arc` keeps each IOCTL's handle alive across concurrent
     /// retirement.
-    fn ensure_device(&self) -> Result<Arc<OwnedHandle>> {
+    fn ensure_device(&self) -> Result<Arc<ControlDevice>> {
         let mut slot = self.device.lock().unwrap();
         if let Some(d) = &slot.current {
             return Ok(d.clone());
@@ -612,7 +606,7 @@ impl VirtualDisplayManager {
 
     /// Live control device for the pinger/linger threads. `None` before the
     /// first open, or between a retire and the next reopen.
-    fn device_handle(&self) -> Option<Arc<OwnedHandle>> {
+    fn device_handle(&self) -> Option<Arc<ControlDevice>> {
         self.device.lock().unwrap().current.clone()
     }
 
@@ -694,11 +688,7 @@ impl VirtualDisplayManager {
                     old_target = %old_key,
                     "IDD-push reconnect — preempting the kept (lingering/pinned) monitor, recreating a fresh one"
                 );
-                // SAFETY: `teardown_removed` requires `dev` to be a valid control handle; the `dev`
-                // Arc `ensure_device()` returned above is held across this call, so the handle stays
-                // open even against a concurrent retire. `mon` was just removed from the map, so it
-                // is exclusively owned here — no aliasing.
-                unsafe { self.teardown_removed(dev_raw(&dev), &mut inner, mon) };
+                self.teardown_removed(&dev, &mut inner, mon);
                 // Let the OS finish the ASYNC monitor departure before the next ADD; a back-to-back
                 // REMOVE→ADD races the teardown and the ADD IOCTL is rejected under reconnect churn.
                 // Verified-state wait, ceiling = the old fixed 400 ms settle (latency plan P0.3).
@@ -726,11 +716,7 @@ impl VirtualDisplayManager {
                     wudf_pid = mon.wudf_pid,
                     "virtual monitor's WUDFHost is gone — preempting the dead monitor, recreating"
                 );
-                // SAFETY: `teardown_removed` requires a valid control handle; the `dev` Arc
-                // `ensure_device()` returned above is held across this call, so the handle stays
-                // open even against a concurrent retire. `mon` was just removed from the map, so it
-                // is exclusively owned here — no aliasing.
-                unsafe { self.teardown_removed(dev_raw(&dev), &mut inner, mon) };
+                self.teardown_removed(&dev, &mut inner, mon);
                 // Same async-departure settle as the reconnect preempt above (verified wait, P0.3).
                 let _ = wait_target_departed(old_key, Duration::from_millis(400));
             }
@@ -758,10 +744,7 @@ impl VirtualDisplayManager {
                         else {
                             unreachable!("just matched Active");
                         };
-                        // SAFETY: the `dev` Arc `ensure_device()` returned above is held across
-                        // this call (so the handle stays open); the CCD waits inside run under
-                        // the held `state` lock (this fn's discipline).
-                        match unsafe { self.resize_in_place(dev_raw(&dev), mon, mode) } {
+                        match self.resize_in_place(&dev, mon, mode) {
                             Ok(()) => {
                                 // +1 ref for the new (build-then-drop) lease;
                                 // generation untouched so the old lease stays valid.
@@ -798,12 +781,7 @@ impl VirtualDisplayManager {
                 let Some(SlotState::Active { mon, refs }) = inner.slots.remove(&slot) else {
                     unreachable!("just matched Active");
                 };
-                // SAFETY: the `dev` Arc `ensure_device()` returned above is held across this call
-                // (so the handle stays open); `re_add` touches the live topology under the held
-                // `state` lock. `mon` is owned here (removed from the map).
-                let new_mon = match unsafe {
-                    self.re_add(dev_raw(&dev), &mut inner, slot, &mon, mode, client_hdr)
-                } {
+                let new_mon = match self.re_add(&dev, &mut inner, slot, &mon, mode, client_hdr) {
                     ReAdd::Arrived(m) => *m,
                     ReAdd::RolledBack {
                         mon: recovered,
@@ -902,12 +880,8 @@ impl VirtualDisplayManager {
             );
         }
 
-        // SAFETY: `create_monitor` requires `dev` to be a valid control handle; the `dev` Arc
-        // `ensure_device()` returned above is held across this call (so the handle stays open even
-        // against a concurrent retire), and we hold the `state` lock.
-        let mut mon = match unsafe {
-            self.create_monitor(dev_raw(&dev), mode, slot, client_hdr, hw_cursor, &mut inner)
-        } {
+        let mut mon = match self.create_monitor(&dev, mode, slot, client_hdr, hw_cursor, &mut inner)
+        {
             // Cached device died under us. Retire, reopen, retry once so a
             // reconnect after driver restart does not burn a failed session.
             Err(e) if is_device_gone(&e) => {
@@ -916,18 +890,7 @@ impl VirtualDisplayManager {
                 tracing::info!(
                     "virtual-display control device reopened — retrying the monitor create"
                 );
-                // SAFETY: the `dev` Arc the reopening `ensure_device` just returned is
-                // held across this call, and the `state` lock is still held.
-                unsafe {
-                    self.create_monitor(
-                        dev_raw(&dev),
-                        mode,
-                        slot,
-                        client_hdr,
-                        hw_cursor,
-                        &mut inner,
-                    )?
-                }
+                self.create_monitor(&dev, mode, slot, client_hdr, hw_cursor, &mut inner)?
             }
             r => r?,
         };
@@ -986,21 +949,16 @@ impl VirtualDisplayManager {
                 let mut gone_streak = 0u32;
                 while !stop_t.load(Ordering::Relaxed) {
                     if let Some(h) = vdm().device_handle() {
-                        // SAFETY: `ping` requires `dev` to be a valid control handle. The `h` Arc
-                        // from `device_handle()` is held across this call, so the handle stays open
-                        // even if it is retired concurrently — at worst the IOCTL fails (the retire
-                        // drops only the manager's reference; see `DeviceSlot`). The pinger thread
-                        // only spins while the `&'static` manager singleton lives.
-                        match unsafe { vdm().driver.ping(dev_raw(&h)) } {
+                        // The `h` Arc keeps a concurrently retired handle open: at worst the
+                        // IOCTL fails (see `DeviceSlot`).
+                        match vdm().driver.ping(&h) {
                             Ok(()) => {
                                 warned = false;
                                 gone_streak = 0;
                                 // The driver's lines ride the keepalive: this thread already
                                 // holds the only handle open for the whole device lifetime, so
                                 // the encoder's diagnostics reach the log even between sessions.
-                                // SAFETY: `h` is the same live handle the ping just used, held
-                                // across this call by the Arc.
-                                unsafe { vdm().driver.drain_log(dev_raw(&h)) };
+                                vdm().driver.drain_log(&h);
                             }
                             Err(e) if is_device_gone(&e) => {
                                 gone_streak += 1;
@@ -1365,12 +1323,9 @@ impl VirtualDisplayManager {
     /// rejected because it could enter another process's reserved range.
     /// `Monitor.mode` records the committed mode while `requested_mode` retains
     /// the negotiated value for the join/resize gate.
-    ///
-    /// # Safety
-    /// `dev` must be the live control handle.
-    unsafe fn create_monitor(
+    fn create_monitor(
         &'static self,
-        dev: HANDLE,
+        dev: &ControlDevice,
         mut mode: Mode,
         slot: u32,
         client_hdr: Option<pf_frame::HdrMeta>,
@@ -1416,14 +1371,9 @@ impl VirtualDisplayManager {
             } else {
                 None
             };
-        // SAFETY: `create_monitor`'s own `# Safety` contract guarantees `dev` is the live control
-        // handle; we forward it unchanged to `add_monitor`, whose precondition is exactly that.
-        // `render_pin` is an `Option<LUID>` by value (plain `Copy`), so no borrowed memory
-        // crosses the call.
-        let added = unsafe {
+        let added =
             self.driver
-                .add_monitor(dev, mode, render_pin, preferred_id, client_hdr, hw_cursor)?
-        };
+                .add_monitor(dev, mode, render_pin, preferred_id, client_hdr, hw_cursor)?;
         // A taken `preferred_monitor_id` is not refused by the driver: it falls back to the
         // lowest free connector across the whole device. Losing DPI persistence that way is
         // survivable, so an unreserved host still takes what it is given, exactly as before.
@@ -1436,9 +1386,8 @@ impl VirtualDisplayManager {
             .is_some_and(|max| added.resolved_monitor_id > max);
         if missed_seat_slot || crossed_out_of_range {
             let resolved_id = added.resolved_monitor_id;
-            // SAFETY: `dev` is the live handle by this function's contract. The successful ADD
-            // returned `added.key`, which identifies the fallback monitor removed here.
-            let cleanup = unsafe { self.driver.remove_monitor(dev, &added.key) };
+            // `added.key` names the fallback monitor the successful ADD created.
+            let cleanup = self.driver.remove_monitor(dev, &added.key);
             let reason = match slot_plan.seat_slot() {
                 Some(slot) => format!("this seat's connector {slot}"),
                 None => format!(
@@ -1686,10 +1635,8 @@ impl VirtualDisplayManager {
     /// (`IOCTL_UPDATE_MODES`, protocol v4), re-enumerate, CCD/GDI force-set.
     /// Target id, GDI name, DPI, swap-chain worker and frame stash survive.
     /// On failure `mon` is untouched and the caller falls back to [`re_add`].
-    ///
-    /// # Safety
-    /// `dev` must be the live control handle; CCD/GDI runs under the `state` lock.
-    unsafe fn resize_in_place(&self, dev: HANDLE, mon: &mut Monitor, mode: Mode) -> Result<()> {
+    /// Call under the `state` lock: CCD/GDI runs inside.
+    fn resize_in_place(&self, dev: &ControlDevice, mon: &mut Monitor, mode: Mode) -> Result<()> {
         let gdi = mon
             .gdi_name
             .clone()
@@ -1723,9 +1670,7 @@ impl VirtualDisplayManager {
                 target = mon.target_id,
                 "virtual-display: updating the live monitor's modes for an in-place resize"
             );
-            // SAFETY: `dev` is the live control handle (this fn's contract); `update_modes`
-            // forwards it to a synchronous IOCTL with owned/borrowed locals only.
-            unsafe { self.driver.update_modes(dev, &mon.key, mode) }?;
+            self.driver.update_modes(dev, &mon.key, mode)?;
             pf_win_display::win_display::force_mode_reenumeration();
             if !pf_win_display::win_display::wait_mode_advertised(
                 &gdi,
@@ -1789,12 +1734,9 @@ impl VirtualDisplayManager {
     /// The rebuilt `Monitor` keeps the old `generation` so outstanding leases
     /// still match. Group restore snapshot is preserved (not a first-member
     /// create). Caller owns the slot's `Monitor` + `refs` across this call.
-    ///
-    /// # Safety
-    /// `dev` must be the live control handle; touches live CCD/GDI topology.
-    unsafe fn re_add(
+    fn re_add(
         &'static self,
-        dev: HANDLE,
+        dev: &ControlDevice,
         inner: &mut MgrInner,
         slot: u32,
         old: &Monitor,
@@ -1814,10 +1756,7 @@ impl VirtualDisplayManager {
         // Bare REMOVE (no topology restore, pinger stays up). Frees the
         // preferred id so ADD can reuse it. Best-effort: ADD still proceeds
         // on REMOVE failure (driver reaps a stale same-id monitor anyway).
-
-        // SAFETY: `dev` is the live control handle (this fn's contract); `&old.key` borrows the
-        // still-owned `MonitorKey`, alive across the synchronous IOCTL.
-        if let Err(e) = unsafe { self.driver.remove_monitor(dev, &old.key) } {
+        if let Err(e) = self.driver.remove_monitor(dev, &old.key) {
             tracing::warn!(
                 old_target = old.target_id,
                 "re-arrival REMOVE failed (continuing to ADD): {e:#}"
@@ -1833,12 +1772,10 @@ impl VirtualDisplayManager {
             "re-arrival: old monitor departure settle"
         );
         let render_pin = resolve_render_pin();
-        // SAFETY: `dev` is the live control handle; `render_pin`/`client_hdr` are owned `Copy`/`Option`
-        // values passed by value — no borrow crosses the call.
-        let (added, mut mode, rollback_err) = match unsafe {
-            self.driver
-                .add_monitor(dev, mode, render_pin, slot, client_hdr, old.hw_cursor)
-        } {
+        let first = self
+            .driver
+            .add_monitor(dev, mode, render_pin, slot, client_hdr, old.hw_cursor);
+        let (added, mut mode, rollback_err) = match first {
             Ok(a) => (a, mode, None),
             Err(e) => {
                 // Old monitor already REMOVEd. Re-ADD at its requested mode
@@ -1851,17 +1788,14 @@ impl VirtualDisplayManager {
                     error = %format!("{e:#}"),
                     "re-arrival ADD failed — rolling back to the previous mode"
                 );
-                // SAFETY: `dev` is the live control handle; args are owned `Copy`/`Option`.
-                match unsafe {
-                    self.driver.add_monitor(
-                        dev,
-                        old.requested_mode,
-                        render_pin,
-                        slot,
-                        client_hdr,
-                        old.hw_cursor,
-                    )
-                } {
+                match self.driver.add_monitor(
+                    dev,
+                    old.requested_mode,
+                    render_pin,
+                    slot,
+                    client_hdr,
+                    old.hw_cursor,
+                ) {
                     Ok(a) => (a, old.requested_mode, Some(e)),
                     Err(e2) => {
                         tracing::error!(
@@ -2039,10 +1973,7 @@ impl VirtualDisplayManager {
     /// Tear down `mon`, already removed from `inner.slots`. Last member: stop
     /// the pinger and restore group topology. Non-last: re-issue isolate over
     /// the shrunk set. Then REMOVE. Consumes `mon`.
-    ///
-    /// # Safety
-    /// `dev` must be the live control handle.
-    unsafe fn teardown_removed(&self, dev: HANDLE, inner: &mut MgrInner, mon: Monitor) {
+    fn teardown_removed(&self, dev: &ControlDevice, inner: &mut MgrInner, mon: Monitor) {
         // Runs under the `state` lock, so a REMOVE/CCD-restore that never
         // returns blocks every future `acquire` with nothing in the log.
         // One ERROR after 10 s turns that silent wedge into a diagnosis.
@@ -2088,11 +2019,7 @@ impl VirtualDisplayManager {
                 ShrinkAction::Nothing => {}
             }
         }
-        // SAFETY: `teardown_removed`'s own `# Safety` contract guarantees `dev` is the live control
-        // handle, and `remove_monitor` requires exactly that. `&mon.key` borrows the `MonitorKey`
-        // inside the still-owned `mon`, alive for this synchronous IOCTL, so the pointer the driver
-        // reads stays valid.
-        if let Err(e) = unsafe { self.driver.remove_monitor(dev, &mon.key) } {
+        if let Err(e) = self.driver.remove_monitor(dev, &mon.key) {
             // Device died under this monitor — retire so the next session reopens.
             if is_device_gone(&e) {
                 self.invalidate_device(&e);
@@ -2182,11 +2109,7 @@ impl VirtualDisplayManager {
                         quit_now,
                         "virtual-display: last session left — tearing down now, no linger"
                     );
-                    // SAFETY: `teardown_removed` requires `dev` to be the live control handle; the
-                    // `dev` Arc from `device_handle()` (the `Some` checked above) is held across
-                    // this call, so the handle stays open. `mon` was moved out of the map under the
-                    // `state` lock, so it is exclusively owned here — no aliasing.
-                    unsafe { self.teardown_removed(dev_raw(&dev), &mut inner, mon) };
+                    self.teardown_removed(&dev, &mut inner, mon);
                 }
                 None => {
                     inner.slots.insert(
@@ -2231,11 +2154,7 @@ impl VirtualDisplayManager {
                             old_target = mon.target_id,
                             "IDD-push setup: force-preempting the stuck-Active prior monitor (its IddCx swap-chain is dead)"
                         );
-                        // SAFETY: `teardown_removed` requires `dev` to be the live control handle;
-                        // the `dev` Arc from `device_handle()` (the `Some` checked above) is held
-                        // across this call, so the handle stays open. `mon` was moved out of the
-                        // map under the `state` lock, so it is exclusively owned here — no aliasing.
-                        unsafe { self.teardown_removed(dev_raw(&dev), &mut inner, mon) };
+                        self.teardown_removed(&dev, &mut inner, mon);
                         // Async departure before the next ADD (same 400 ms
                         // ceiling as acquire's Lingering-preempt).
                         thread::sleep(Duration::from_millis(400));
@@ -2297,13 +2216,7 @@ impl VirtualDisplayManager {
                                 // first let a concurrent acquire ADD + isolate
                                 // while this REMOVE/restore was in flight; the
                                 // late restore then de-isolated the new session.
-
-                                // SAFETY: `teardown_removed` requires a valid control handle; the `dev`
-                                // Arc from `self.device_handle()` is held across this call, so the
-                                // handle stays open (a concurrent retire drops only the manager's
-                                // reference; see `DeviceSlot`). `mon` was moved out of the map under
-                                // the lock, so it is exclusively owned here.
-                                unsafe { self.teardown_removed(dev_raw(&dev), &mut g, mon) };
+                                self.teardown_removed(&dev, &mut g, mon);
                             }
                         }
                     }
@@ -2485,11 +2398,7 @@ impl VirtualDisplayManager {
             if let Some(SlotState::Lingering { mon, .. } | SlotState::Pinned { mon }) =
                 inner.slots.remove(&k)
             {
-                // SAFETY: `teardown_removed` needs a live control handle; the `dev` Arc from
-                // `device_handle()` is held across this call, so the handle stays open (see
-                // `DeviceSlot`). `mon` was moved out of the map under the `state` lock, so it is
-                // exclusively owned here — no aliasing.
-                unsafe { self.teardown_removed(dev_raw(&dev), &mut inner, mon) };
+                self.teardown_removed(&dev, &mut inner, mon);
                 released += 1;
             }
         }

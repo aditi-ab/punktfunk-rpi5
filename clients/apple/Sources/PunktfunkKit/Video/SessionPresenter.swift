@@ -295,11 +295,15 @@ final class SessionPresenter {
         self.adaptiveSync = adaptiveSync
         builtAdaptive = adaptiveSync()
         restart = { [weak self] layer in
-            self?.start(
+            guard let self else { return }
+            // The Pencil reports proximity on its edges only, so the new pipeline is told here.
+            let boost = interactionBoost
+            start(
                 connection: connection, baseLayer: layer, endToEndMeter: endToEndMeter,
                 makeDisplayLink: makeDisplayLink,
                 onFrame: onFrame, onSessionEnd: onSessionEnd, onDecodedSize: onDecodedSize,
                 onFrameHDR: onFrameHDR, adaptiveSync: adaptiveSync)
+            setInteractionBoost(boost)
         }
 
         // Explicit decode stays default so loss recovery and decode metering survive. Presentation
@@ -400,6 +404,16 @@ final class SessionPresenter {
         }
     }
 
+    /// Pen-proximity panel-rate boost pass-through (Stage2Pipeline.setInteractionBoost):
+    /// deadline pacing only — under arrival/glass the staged hint feeds no link, so this
+    /// is a no-op there. Kept here so a rebuilt pipeline starts boosted. MAIN thread.
+    func setInteractionBoost(_ on: Bool) {
+        interactionBoost = on
+        stage2?.setInteractionBoost(on)
+    }
+
+    private var interactionBoost = false
+
     /// Hint the display link with the stream's cadence. On iOS/tvOS a range is always required:
     /// without one, ProMotion devices cap CADisplayLink at 60 Hz (iPhones additionally need
     /// `CADisableMinimumFrameDurationOnPhone` in Info.plist), so a 120 fps stream would present
@@ -412,13 +426,6 @@ final class SessionPresenter {
     /// drop its physical refresh to match the content. VRR off falls back to a fixed floor:
     /// iOS keeps 30 Hz; macOS pins the link at the stream rate (see `frameRateRange`).
     /// Re-applied from `layout` so a mid-session `Reconfigure` picks up a new refresh.
-    /// Pen-proximity panel-rate boost pass-through (Stage2Pipeline.setInteractionBoost):
-    /// deadline pacing only — under arrival/glass the staged hint feeds no link, so this
-    /// is a no-op there. MAIN thread.
-    func setInteractionBoost(_ on: Bool) {
-        stage2?.setInteractionBoost(on)
-    }
-
     private func syncFrameRate(hz: UInt32) {
         guard hz > 0 else { return }
         // Deadline pacing: the hint goes to the pipeline's CAMetalDisplayLink instead (staged;
@@ -621,6 +628,7 @@ final class SessionPresenter {
         restart = nil
         baseLayer = nil
         contentSize = nil // a new session re-derives it from its first frame
+        interactionBoost = false
         pump?.stop()
         pump = nil
         stage2Link?.invalidate()

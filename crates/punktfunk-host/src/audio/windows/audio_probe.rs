@@ -18,14 +18,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use wasapi::{Direction, SampleType, StreamMode, WaveFormat};
-use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    SetupDiEnumDeviceInfo, SetupDiOpenDevRegKey, DICS_FLAG_GLOBAL, DIREG_DEV,
-};
-use windows::Win32::System::Registry::{
-    RegCloseKey, RegQueryValueExW, RegSetValueExW, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD,
-    REG_VALUE_TYPE,
-};
 
 /// `Device Parameters` stamp. `cleanup` and
 /// [`devnode_cleanup`](super::devnode_cleanup) match this so a probe node cannot
@@ -332,102 +324,18 @@ fn write_probe_marker(
     set: &da::DevInfoSet,
     did: &mut windows::Win32::Devices::DeviceAndDriverInstallation::SP_DEVINFO_DATA,
 ) -> Result<()> {
-    // SAFETY: live set + element; DIREG_DEV opens (or the create below mints) the devnode's
-    // Device Parameters key.
-    let opened = unsafe {
-        SetupDiOpenDevRegKey(
-            set.0,
-            did,
-            DICS_FLAG_GLOBAL.0,
-            0,
-            DIREG_DEV,
-            KEY_SET_VALUE.0,
-        )
-    };
-    let hkey = match opened {
-        Ok(k) => k,
-        // SAFETY: same set + element; a fresh devnode has no Device Parameters key yet.
-        Err(_) => unsafe {
-            windows::Win32::Devices::DeviceAndDriverInstallation::SetupDiCreateDevRegKeyW(
-                set.0,
-                did,
-                DICS_FLAG_GLOBAL.0,
-                0,
-                DIREG_DEV,
-                None,
-                PCWSTR::null(),
-            )
-        }
-        .context("create the probe devnode's Device Parameters key")?,
-    };
-    let name = HSTRING::from(PROBE_MARKER);
-    // SAFETY: the value name is NUL-terminated and outlives the call; the DWORD bytes travel
-    // with the slice.
-    let rc = unsafe {
-        RegSetValueExW(
-            hkey,
-            PCWSTR(name.as_ptr()),
-            None,
-            REG_DWORD,
-            Some(&1u32.to_le_bytes()),
-        )
-    };
-    // SAFETY: closing the key opened/created above, exactly once.
-    unsafe {
-        let _ = RegCloseKey(hkey);
-    }
-    rc.ok().context("write PunktfunkAudioProbe")
+    da::write_devparam_dword(set, did, PROBE_MARKER, 1)
 }
 
 fn probe_devnodes() -> Result<Vec<(String, u32)>> {
     let set = da::media_class_devs()?;
-    let mut out = Vec::new();
-    for i in 0.. {
-        let mut did = da::devinfo_data();
-        // SAFETY: live set; `did` is a live out-param with cbSize set.
-        if unsafe { SetupDiEnumDeviceInfo(set.0, i, &mut did) }.is_err() {
-            break;
-        }
-        // SAFETY: live set + element; read-only open of the Device Parameters key.
-        let Ok(hkey) = (unsafe {
-            SetupDiOpenDevRegKey(
-                set.0,
-                &did,
-                DICS_FLAG_GLOBAL.0,
-                0,
-                DIREG_DEV,
-                KEY_QUERY_VALUE.0,
-            )
-        }) else {
-            continue;
-        };
-        let name = HSTRING::from(PROBE_MARKER);
-        let mut ty = REG_VALUE_TYPE(0);
-        let mut data = [0u8; 4];
-        let mut len = data.len() as u32;
-        // SAFETY: the value name is NUL-terminated; out-params are live locals; the buffer
-        // length travels in `len`.
-        let rc = unsafe {
-            RegQueryValueExW(
-                hkey,
-                PCWSTR(name.as_ptr()),
-                None,
-                Some(&mut ty),
-                Some(data.as_mut_ptr()),
-                Some(&mut len),
-            )
-        };
-        // SAFETY: closing the key opened above, exactly once.
-        unsafe {
-            let _ = RegCloseKey(hkey);
-        }
-        if rc.is_ok() && ty == REG_DWORD && len == 4 {
-            if let Some(inst) = da::instance_id(&set, &did) {
-                out.push((inst, u32::from_le_bytes(data)));
-            }
-        }
-    }
-    Ok(out)
+    Ok(set
+        .iter()
+        .filter_map(|did| {
+            let marker = da::read_devparam_dword(&set, &did, PROBE_MARKER)?;
+            Some((da::instance_id(&set, &did)?, marker))
+        })
+        .collect())
 }
 
 fn cleanup() -> Result<()> {

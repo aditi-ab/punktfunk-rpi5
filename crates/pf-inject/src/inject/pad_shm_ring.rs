@@ -1,17 +1,19 @@
 //! Host half of a Windows pad's `PadShm` DATA section: the stamp order, the input seqlock
 //! and the output-ring reader.
 //!
-//! Only raw pointers and atomics over [`pf_driver_proto::gamepad::PadShm`] offsets, so the
-//! reader's tests run on every OS. The section itself, its sealed delivery and the devnode
-//! live in `windows/`.
+//! Every access goes through [`SectionView`], which checks bounds and alignment, so a test
+//! buffer stands in for the section and the reader's tests run on every OS. The section
+//! itself, its sealed delivery and the devnode live in `windows/`.
 
 use pf_driver_proto::gamepad::PadShm;
-use std::sync::atomic::{fence, AtomicU32, Ordering};
+use std::marker::PhantomData;
+use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 
 /// Byte size of [`PadShm`]. Offsets and magic come from the same struct so a layout change
 /// is a compile error; the driver maps that type too.
 pub(crate) const SHM_SIZE: usize = core::mem::size_of::<PadShm>();
 pub(crate) const SHM_MAGIC: u32 = pf_driver_proto::gamepad::PAD_MAGIC; // "PFDS"
+const OFF_MAGIC: usize = core::mem::offset_of!(PadShm, magic);
 pub(crate) const OFF_INPUT: usize = core::mem::offset_of!(PadShm, input);
 pub(crate) const OFF_OUT_SEQ: usize = core::mem::offset_of!(PadShm, out_seq);
 pub(crate) const OFF_OUTPUT: usize = core::mem::offset_of!(PadShm, output);
@@ -32,42 +34,106 @@ const OFF_INPUT_GEN: usize = core::mem::offset_of!(PadShm, input_gen);
 /// The input slot's size; a longer report would overrun into `out_seq`.
 pub(crate) const INPUT_SLOT: usize = 64;
 
-/// Stamp a fresh section for the driver: device type, pad index, ring version `2` and the
-/// neutral report, then the magic last. The driver trusts nothing before the magic, and a
-/// device type it reads late enumerates the pad as a DualSense. `2` means this host drains
-/// the v2.2 long ring; a v2.1 driver reads it as a boolean and stays on 8-slot math.
-///
-/// # Safety
-/// `base` points at a live, writable [`PadShm`] mapping; `neutral` fits the input slot.
-pub(crate) unsafe fn stamp(base: *mut u8, devtype: u8, index: u8, neutral: &[u8]) {
-    debug_assert!(
-        neutral.len() <= INPUT_SLOT,
-        "neutral report overruns the input slot"
-    );
-    // SAFETY: the caller's contract; every offset is inside the section.
-    unsafe {
-        *base.add(OFF_DEVTYPE) = devtype;
-        std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
-        std::ptr::write_unaligned(base.add(OFF_OUT_RING_VER) as *mut u32, 2);
-        std::ptr::copy_nonoverlapping(neutral.as_ptr(), base.add(OFF_INPUT), neutral.len());
-        std::ptr::write_unaligned(base as *mut u32, SHM_MAGIC);
+/// Bounds-checked view of a mapped section, borrowed from whatever keeps it mapped.
+/// Words the driver also writes go through aligned atomics; report bodies are plain copies,
+/// ordered by the sequence word or seqlock around them. Every accessor panics out of range.
+#[derive(Clone, Copy)]
+pub(crate) struct SectionView<'a> {
+    base: *mut u8,
+    len: usize,
+    _mapping: PhantomData<&'a [u8]>,
+}
+
+impl<'a> SectionView<'a> {
+    /// # Safety
+    /// `base..base + len` stays mapped and writable for `'a`, and no Rust reference overlaps it.
+    // unsafe-fn-no-op-ok: the contract is the mapping's lifetime, checked by every accessor.
+    pub(crate) unsafe fn from_raw(base: *mut u8, len: usize) -> SectionView<'a> {
+        SectionView {
+            base,
+            len,
+            _mapping: PhantomData,
+        }
     }
+
+    /// A test buffer standing in for a section.
+    #[cfg(test)]
+    fn over(buf: &'a mut [u32]) -> SectionView<'a> {
+        SectionView {
+            base: buf.as_mut_ptr().cast(),
+            len: std::mem::size_of_val(buf),
+            _mapping: PhantomData,
+        }
+    }
+
+    /// `len` bytes at `off`, asserted inside the view.
+    fn range(&self, off: usize, len: usize) -> *mut u8 {
+        let end = off.checked_add(len);
+        assert!(
+            end.is_some_and(|e| e <= self.len),
+            "section range {off}+{len} out of bounds"
+        );
+        self.base.wrapping_add(off)
+    }
+
+    /// The atomic word at `off`, asserted in bounds and aligned.
+    fn word<T>(&self, off: usize) -> *const T {
+        let p = self.range(off, size_of::<T>());
+        assert!(
+            p as usize % align_of::<T>() == 0,
+            "section word {off} misaligned"
+        );
+        p.cast()
+    }
+
+    pub(crate) fn load_u32(&self, off: usize, order: Ordering) -> u32 {
+        // SAFETY: `word` proved an aligned word inside the live mapping; both sides touch it
+        // only atomically.
+        unsafe { (*self.word::<AtomicU32>(off)).load(order) }
+    }
+
+    pub(crate) fn store_u32(&self, off: usize, value: u32, order: Ordering) {
+        // SAFETY: as `load_u32`.
+        unsafe { (*self.word::<AtomicU32>(off)).store(value, order) }
+    }
+
+    pub(crate) fn store_u64(&self, off: usize, value: u64, order: Ordering) {
+        // SAFETY: as `load_u32`, for an 8-aligned word.
+        unsafe { (*self.word::<AtomicU64>(off)).store(value, order) }
+    }
+
+    pub(crate) fn write_bytes(&self, off: usize, src: &[u8]) {
+        let dst = self.range(off, src.len());
+        // SAFETY: `range` proved `dst` inside the live mapping, which no Rust reference
+        // overlaps; `src` is a separate allocation.
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) }
+    }
+
+    pub(crate) fn read_bytes(&self, off: usize, dst: &mut [u8]) {
+        let src = self.range(off, dst.len());
+        // SAFETY: as `write_bytes`, copying the other way.
+        unsafe { std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), dst.len()) }
+    }
+}
+
+/// Stamp a fresh section for the driver: device type, pad index, ring version and the neutral
+/// report, then the magic last. The driver trusts nothing before the magic, and a device type
+/// it reads late enumerates the pad as a DualSense. Ring version `2` means this host drains
+/// the v2.2 long ring (a v2.1 driver reads it as a boolean and stays on 8-slot math); `0`
+/// leaves the driver on the legacy slot. A neutral report past the input slot is cut to it.
+pub(crate) fn stamp(shm: SectionView<'_>, devtype: u8, index: u8, ring_ver: u32, neutral: &[u8]) {
+    shm.write_bytes(OFF_DEVTYPE, &[devtype]);
+    shm.store_u32(OFF_PAD_INDEX, index.into(), Ordering::Relaxed);
+    shm.store_u32(OFF_OUT_RING_VER, ring_ver, Ordering::Relaxed);
+    shm.write_bytes(OFF_INPUT, &neutral[..neutral.len().min(INPUT_SLOT)]);
+    shm.store_u32(OFF_MAGIC, SHM_MAGIC, Ordering::Relaxed);
 }
 
 /// `(driver_proto, driver_rev)` from a pad section. The driver stamps the revision first and the
 /// protocol with Release, so a revision read after a nonzero protocol is the driver's.
-///
-/// # Safety
-/// `base` points at a live, mapped [`PadShm`].
-pub(crate) unsafe fn driver_marks(base: *mut u8) -> (u32, u32) {
-    // SAFETY: the caller's contract; both offsets are 4-aligned fields inside the section.
-    unsafe {
-        let proto = (*(base.add(OFF_DRIVER_PROTO) as *const AtomicU32)).load(Ordering::Acquire);
-        (
-            proto,
-            std::ptr::read_volatile(base.add(OFF_DRIVER_REV) as *const u32),
-        )
-    }
+pub(crate) fn driver_marks(shm: SectionView<'_>) -> (u32, u32) {
+    let proto = shm.load_u32(OFF_DRIVER_PROTO, Ordering::Acquire);
+    (proto, shm.load_u32(OFF_DRIVER_REV, Ordering::Relaxed))
 }
 
 /// Publish one HID input report into the section's input slot under the v2.3 seqlock.
@@ -78,29 +144,17 @@ pub(crate) unsafe fn driver_marks(base: *mut u8) -> (u32, u32) {
 /// `generation` goes odd before the body and even after. The driver samples either side of its
 /// read and retries on disagreement. The `Release` fence keeps body stores below the odd marker;
 /// the `Release` store publishes them ahead of even. Both are no-ops on x86-TSO, load-bearing on ARM64.
-///
-/// # Safety
-/// `base` must point at a live mapped pad section of at least [`SHM_SIZE`] bytes, and `report`
-/// must be no longer than [`INPUT_SLOT`].
-pub(crate) unsafe fn publish_input(base: *mut u8, generation: &mut u32, report: &[u8]) {
-    debug_assert!(report.len() <= INPUT_SLOT, "report overruns the input slot");
+/// A report past [`INPUT_SLOT`] is cut to it.
+pub(crate) fn publish_input(shm: SectionView<'_>, generation: &mut u32, report: &[u8]) {
     // Odd: a report is in flight.
     *generation = generation.wrapping_add(1);
-    // SAFETY: the caller guarantees `base` maps the section; `OFF_INPUT_GEN` is 4-aligned off the
-    // page-aligned base and sits in the v2 legacy region every driver generation maps.
-    unsafe {
-        (*(base.add(OFF_INPUT_GEN) as *const AtomicU32)).store(*generation, Ordering::Relaxed)
-    };
+    shm.store_u32(OFF_INPUT_GEN, *generation, Ordering::Relaxed);
     // Ordered, not ordering: keeps the body stores below from being hoisted above the odd marker.
     fence(Ordering::Release);
-    // SAFETY: the caller guarantees the mapping and that `report` fits the slot at OFF_INPUT.
-    unsafe { std::ptr::copy_nonoverlapping(report.as_ptr(), base.add(OFF_INPUT), report.len()) };
+    shm.write_bytes(OFF_INPUT, &report[..report.len().min(INPUT_SLOT)]);
     // Even: the slot holds a whole report again.
     *generation = generation.wrapping_add(1);
-    // SAFETY: as the first store.
-    unsafe {
-        (*(base.add(OFF_INPUT_GEN) as *const AtomicU32)).store(*generation, Ordering::Release)
-    };
+    shm.store_u32(OFF_INPUT_GEN, *generation, Ordering::Release);
 }
 
 /// Drain of a pad section's output plane: the lossless report ring when the driver publishes one
@@ -140,19 +194,14 @@ impl OutputDrain {
     /// report did not carry. Overflow salvage and the pre-ring path both read that untagged slot, so
     /// `feature` is always `false` there — a FEATURE that lands on overflow or on an old driver
     /// replays as OUTPUT until the next ring-fed poll.
-    ///
-    /// # Safety
-    /// `base` points at a live, mapped [`PadShm`] of [`SHM_SIZE`] bytes.
-    pub(crate) unsafe fn drain_tagged(
+    pub(crate) fn drain_tagged(
         &mut self,
-        base: *mut u8,
+        shm: SectionView<'_>,
         mut per_report: impl FnMut(&[u8], bool),
     ) -> bool {
-        // SAFETY: base points at SHM_SIZE bytes; `OFF_RING_HEAD` is 4-aligned off the
-        // page-aligned base. The driver bumps `ring_head` AFTER writing the slot, so an Acquire
-        // load orders the slot copies below.
-        let head =
-            unsafe { (*(base.add(OFF_RING_HEAD) as *const AtomicU32)).load(Ordering::Acquire) };
+        // The driver bumps `ring_head` AFTER writing the slot, so an Acquire load orders the
+        // slot copies below.
+        let head = shm.load_u32(OFF_RING_HEAD, Ordering::Acquire);
         if self.ring_live || head != 0 {
             self.ring_live = true;
             if head == self.tail {
@@ -161,10 +210,7 @@ impl OutputDrain {
             // Driver's slot-math modulo (0 = pre-v2.2, hardcodes 8). Loaded after Acquire on
             // `ring_head`; restamped before every bump. Out-of-range clamps to v2.1 so offsets
             // stay inside the v2.2 ring.
-            // SAFETY: `OFF_OUT_RING_LEN` is 4-aligned off the page-aligned base.
-            let echo = unsafe {
-                (*(base.add(OFF_OUT_RING_LEN) as *const AtomicU32)).load(Ordering::Relaxed)
-            };
+            let echo = shm.load_u32(OFF_OUT_RING_LEN, Ordering::Relaxed);
             let ring_len = if (1..=OUT_RING_LEN_V22).contains(&echo) {
                 echo
             } else {
@@ -179,23 +225,14 @@ impl OutputDrain {
                     [([0u8; 64], 0usize, false); pf_driver_proto::gamepad::OUT_RING_LEN_V22_USIZE];
                 for (k, buf) in bufs.iter_mut().enumerate().take(n) {
                     let idx = (self.tail.wrapping_add(k as u32) % ring_len) as usize;
+                    // idx < `ring_len` ≤ OUT_RING_LEN_V22: the last slot ends at 4064 ≤ SHM_SIZE.
                     let slot = OFF_OUT_RING + idx * OUT_SLOT_SIZE;
-                    // SAFETY: slot .. slot+OUT_SLOT_SIZE is inside the SHM_SIZE section (idx <
-                    // `ring_len` ≤ OUT_RING_LEN_V22, whose last slot ends at 4064 ≤ SHM_SIZE);
-                    // the len field is 4-aligned (`OFF_OUT_RING` == 256, `OUT_SLOT_SIZE` == 68).
-                    let raw_len = unsafe { std::ptr::read_unaligned(base.add(slot) as *const u32) };
+                    let raw_len = shm.load_u32(slot, Ordering::Relaxed);
                     buf.2 = pf_driver_proto::triton::out_is_feature(raw_len);
                     buf.1 = (pf_driver_proto::triton::out_len(raw_len) as usize).min(64);
-                    // SAFETY: the slot's data region is slot+4 .. slot+4+64, inside the section;
-                    // `buf.0` is a live local 64-byte array.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(base.add(slot + 4), buf.0.as_mut_ptr(), buf.1)
-                    };
+                    shm.read_bytes(slot + 4, &mut buf.0[..buf.1]);
                 }
-                // SAFETY: as the first `ring_head` load above.
-                let head2 = unsafe {
-                    (*(base.add(OFF_RING_HEAD) as *const AtomicU32)).load(Ordering::Acquire)
-                };
+                let head2 = shm.load_u32(OFF_RING_HEAD, Ordering::Acquire);
                 if head2.wrapping_sub(self.tail) <= ring_len {
                     for (data, len, feature) in bufs.iter().take(n) {
                         if *len > 0 {
@@ -209,24 +246,19 @@ impl OutputDrain {
             // Overflow or lapped mid-copy: skip to the freshest head and salvage the untagged
             // latest-report slot (driver dual-publishes every report there). No seqlock; parser
             // gates drop most tears, caller resync silences planes the salvage does not assert.
-            // SAFETY: as the first `ring_head` load above.
-            self.tail =
-                unsafe { (*(base.add(OFF_RING_HEAD) as *const AtomicU32)).load(Ordering::Acquire) };
+            self.tail = shm.load_u32(OFF_RING_HEAD, Ordering::Acquire);
             let mut out = [0u8; 64];
-            // SAFETY: the legacy output slot is OFF_OUTPUT..OFF_OUTPUT+64 within the section.
-            unsafe { std::ptr::copy_nonoverlapping(base.add(OFF_OUTPUT), out.as_mut_ptr(), 64) };
+            shm.read_bytes(OFF_OUTPUT, &mut out);
             per_report(&out, false);
             return true;
         }
         // Pre-ring driver: latest-report slot + seq, coalescing. No feature tag on this slot.
-        // SAFETY: `OFF_OUT_SEQ` is 4-aligned off the page-aligned base; Acquire pairs with the
-        // driver's publish-then-bump store order.
-        let seq = unsafe { (*(base.add(OFF_OUT_SEQ) as *const AtomicU32)).load(Ordering::Acquire) };
+        // Acquire pairs with the driver's publish-then-bump store order.
+        let seq = shm.load_u32(OFF_OUT_SEQ, Ordering::Acquire);
         if seq != self.last_out_seq {
             self.last_out_seq = seq;
             let mut out = [0u8; 64];
-            // SAFETY: output slot is OFF_OUTPUT..OFF_OUTPUT+64 within the section.
-            unsafe { std::ptr::copy_nonoverlapping(base.add(OFF_OUTPUT), out.as_mut_ptr(), 64) };
+            shm.read_bytes(OFF_OUTPUT, &mut out);
             per_report(&out, false);
         }
         false
@@ -239,10 +271,6 @@ mod tests {
 
     fn section() -> Vec<u32> {
         vec![0u32; SHM_SIZE / 4]
-    }
-
-    fn base(buf: &mut [u32]) -> *mut u8 {
-        buf.as_mut_ptr() as *mut u8
     }
 
     /// v2.1 dual write: legacy slot + seq, then ring slot (8-slot math, no length echo), then head.
@@ -303,6 +331,24 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn section_view_refuses_a_range_past_its_end() {
+        let mut buf = [0u32; 2];
+        SectionView::over(&mut buf).write_bytes(4, &[0; 8]);
+    }
+
+    /// An oversize report is cut to the 64-byte slot, never spilling into `out_seq`.
+    #[test]
+    fn publish_input_stays_inside_the_input_slot() {
+        let mut buf = section();
+        let mut generation = 0;
+        publish_input(SectionView::over(&mut buf), &mut generation, &[0xAB; 80]);
+        assert_eq!(generation, 2);
+        assert_eq!(read32(&mut buf, OFF_OUT_SEQ), 0);
+        assert_eq!(bytes_mut(&mut buf)[OFF_INPUT + 63], 0xAB);
+    }
+
+    #[test]
     fn byte_view_stays_within_the_source_slice() {
         let mut buf = [0u32; 2];
         assert_eq!(bytes_mut(&mut buf).len(), 2 * size_of::<u32>());
@@ -318,8 +364,7 @@ mod tests {
 
     fn collect(d: &mut OutputDrain, buf: &mut [u32]) -> (Vec<Vec<u8>>, bool) {
         let mut got = Vec::new();
-        // SAFETY: `buf` is a live SHM_SIZE-byte section.
-        let resync = unsafe { d.drain_tagged(base(buf), |b, _| got.push(b.to_vec())) };
+        let resync = d.drain_tagged(SectionView::over(buf), |b, _| got.push(b.to_vec()));
         (got, resync)
     }
 
@@ -327,8 +372,7 @@ mod tests {
     #[test]
     fn stamp_writes_every_field_the_driver_reads() {
         let mut buf = section();
-        // SAFETY: `buf` is a live SHM_SIZE-byte section.
-        unsafe { stamp(base(&mut buf), 7, 3, &[0x42, 0x01]) };
+        stamp(SectionView::over(&mut buf), 7, 3, 2, &[0x42, 0x01]);
         let b = bytes_mut(&mut buf);
         assert_eq!(b[OFF_DEVTYPE], 7);
         assert_eq!(&b[OFF_INPUT..OFF_INPUT + 2], &[0x42, 0x01]);
@@ -346,12 +390,9 @@ mod tests {
         publish_tagged(&mut buf, &[0x01, 0x87, 0x03, 0x09, 0x00, 0x00]);
         let mut got = Vec::new();
         let mut d = OutputDrain::new();
-        // SAFETY: `buf` is a live SHM_SIZE-byte section.
-        unsafe {
-            d.drain_tagged(base(&mut buf), |bytes, feature| {
-                got.push((bytes.to_vec(), feature));
-            })
-        };
+        d.drain_tagged(SectionView::over(&mut buf), |bytes, feature| {
+            got.push((bytes.to_vec(), feature));
+        });
         assert_eq!(got[0], (vec![0x80, 0x00, 0xFF], false));
         assert_eq!(got[1].0, vec![0x01, 0x87, 0x03, 0x09, 0x00, 0x00]);
         assert!(got[1].1);

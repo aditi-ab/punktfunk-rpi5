@@ -353,11 +353,6 @@ type Egl = egl::DynamicInstance<egl::EGL1_5>;
 /// Headless GBM EGLDisplay plus a surfaceless desktop-GL context. Lives on the capture thread;
 /// the GL context is made current there once and never released.
 pub struct EglImporter {
-    egl: Egl,
-    display: egl::Display,
-    no_ctx: egl::Context,
-    _gl_ctx: egl::Context,
-    egl_image_target: EglImageTargetFn,
     /// One tiled convert per [`cuda::PlaneLayout`], indexed by it and recreated on a size
     /// change. Kept apart so an RGB fallback mid-stream does not rebuild the NV12 one.
     converts: [Option<GlConvert>; 3],
@@ -366,8 +361,15 @@ pub struct EglImporter {
     linear_pool: Option<cuda::BufferPool>,
     /// NV12 twin of [`linear_pool`](Self::linear_pool). Separate because a session may fall back to RGB mid-stream.
     linear_nv12_pool: Option<cuda::BufferPool>,
-    /// Last on purpose: `EglImporter` has no `Drop`, so fields drop in declaration order.
-    /// Blits / CUDA / Vulkan must release against a live GBM display.
+    /// `EglImporter` has no `Drop`, so fields drop in declaration order. The EGL handles below
+    /// drop after the converts / CUDA / Vulkan above: `egl` owns the libEGL mapping their `Drop`s
+    /// call through.
+    egl_image_target: EglImageTargetFn,
+    no_ctx: egl::Context,
+    _gl_ctx: egl::Context,
+    display: egl::Display,
+    egl: Egl,
+    /// Last: everything above releases against a live GBM display.
     _gbm: GbmDevice,
 }
 
@@ -493,15 +495,15 @@ impl EglImporter {
             "zero-copy EGL importer ready (GBM platform + GL texture interop, dma_buf_import + modifiers)"
         );
         Ok(EglImporter {
-            egl,
-            display,
-            no_ctx,
-            _gl_ctx: gl_ctx,
-            egl_image_target,
             converts: [None, None, None],
             vk: None,
             linear_pool: None,
             linear_nv12_pool: None,
+            egl_image_target,
+            no_ctx,
+            _gl_ctx: gl_ctx,
+            display,
+            egl,
             _gbm: gbm,
         })
     }

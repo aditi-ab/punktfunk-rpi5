@@ -224,6 +224,12 @@ use std::path::PathBuf;
 /// only `warn!`, so `error` there costs nothing else. The ring keeps them regardless.
 const DEFAULT_LOG_FILTER: &str = "info,zbus::proxy=error";
 
+// POSIX `geteuid`: no arguments, no memory, cannot fail — so `safe` for every caller.
+#[cfg(unix)]
+unsafe extern "C" {
+    safe fn geteuid() -> u32;
+}
+
 fn main() {
     // Before any `ureq` agent (cover-art, webhooks, catalog, updates).
     punktfunk_core::tls::install_default_provider();

@@ -32,6 +32,13 @@ pub use cuda::DeviceBuffer;
 pub use egl::{DmabufPlane, EglImporter};
 pub use proto::{ConvertOut, ConvertSrc, CursorRect, ImportKind};
 
+/// `(st_dev, st_ino)` of an open fd. Stable across dups and `SCM_RIGHTS` re-numbering; a
+/// dma-buf keeps its inode for life, so import caches key on it.
+pub fn fd_identity(fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<(u64, u64)> {
+    let st = rustix::fs::fstat(fd)?;
+    Ok((st.st_dev as u64, st.st_ino as u64))
+}
+
 /// Parse a `PUNKTFUNK_*` boolean. Unrecognised spellings return `None` (the
 /// flag's default), not false: `TRUE` as "off" inverted host-wide defaults.
 fn flag_opt(name: &str) -> Option<bool> {

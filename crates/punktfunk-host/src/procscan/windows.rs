@@ -14,6 +14,7 @@
 use super::{ProcRef, START_SLACK_SECS};
 use crate::library::DetectSpec;
 use std::path::{Path, PathBuf};
+use windows::core::Owned;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -70,7 +71,7 @@ impl Scanner {
             .map(|d| d.canonicalize().unwrap_or_else(|_| d.to_path_buf()));
 
         let mut out = Vec::new();
-        for pid in snapshot_pids() {
+        for (pid, ..) in processes() {
             // pid 0 (System Idle) and 4 (System) are neither openable nor ever a game.
             if pid <= 4 {
                 continue;
@@ -115,7 +116,10 @@ impl Scanner {
     /// `(pid, parent)` for every process. A parent pid can outlive its process and be reused, so
     /// only roots already known to be live are followed.
     pub fn parents(&self) -> Vec<(u32, u32)> {
-        snapshot_parents()
+        processes()
+            .into_iter()
+            .map(|(pid, parent, _)| (pid, parent))
+            .collect()
     }
 
     /// Pid still present **and** creation time unchanged (rule 2). Windows reuses
@@ -159,53 +163,32 @@ pub fn steam_running_hint(appid: u32) -> Option<bool> {
     saw_key.then_some(false)
 }
 
-fn snapshot_pids() -> Vec<u32> {
+/// `(pid, parent pid, image base name)` for every process in one Toolhelp snapshot.
+/// `szExeFile` is the module base name, not a path. Empty when the snapshot fails.
+pub(crate) fn processes() -> Vec<(u32, u32, String)> {
     let mut out = Vec::new();
-    // SAFETY: `entry` is zeroed with `dwSize` set before the first read (`szExeFile`
-    // has no usable `Default`). The snapshot handle is closed on every exit path.
+    // SAFETY: `Owned` closes the snapshot on every path. `entry` carries `dwSize` before the
+    // first read, and `szExeFile` is read up to its first NUL.
     unsafe {
         let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
             return out;
         };
+        let snap = Owned::new(snap);
         let mut entry = PROCESSENTRY32W {
             dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-            ..std::mem::zeroed()
+            ..Default::default()
         };
-        if Process32FirstW(snap, &mut entry).is_ok() {
-            loop {
-                out.push(entry.th32ProcessID);
-                if Process32NextW(snap, &mut entry).is_err() {
-                    break;
-                }
-            }
+        let mut more = Process32FirstW(*snap, &mut entry).is_ok();
+        while more {
+            let name = &entry.szExeFile;
+            let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+            out.push((
+                entry.th32ProcessID,
+                entry.th32ParentProcessID,
+                String::from_utf16_lossy(&name[..len]),
+            ));
+            more = Process32NextW(*snap, &mut entry).is_ok();
         }
-        let _ = CloseHandle(snap);
-    }
-    out
-}
-
-/// `(pid, parent)` for every process in one Toolhelp snapshot.
-fn snapshot_parents() -> Vec<(u32, u32)> {
-    let mut out = Vec::new();
-    // SAFETY: as in `snapshot_pids` — `entry` is zeroed with `dwSize` set before the first read,
-    // and the snapshot handle is closed on every exit path.
-    unsafe {
-        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
-            return out;
-        };
-        let mut entry = PROCESSENTRY32W {
-            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-            ..std::mem::zeroed()
-        };
-        if Process32FirstW(snap, &mut entry).is_ok() {
-            loop {
-                out.push((entry.th32ProcessID, entry.th32ParentProcessID));
-                if Process32NextW(snap, &mut entry).is_err() {
-                    break;
-                }
-            }
-        }
-        let _ = CloseHandle(snap);
     }
     out
 }

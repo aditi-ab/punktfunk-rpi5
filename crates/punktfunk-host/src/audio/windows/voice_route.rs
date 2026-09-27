@@ -266,19 +266,13 @@ fn owe(exe: &str, target: &str) {
 }
 
 /// `(pid, lowercase exe name)`: every process of each voice app, in this host's session.
-/// Toolhelp, as `procscan` does. Never on the capture thread.
+/// One Toolhelp snapshot ([`crate::procscan::processes`]). Never on the capture thread.
 ///
 /// The pin is keyed by the app, so one pid that answers is enough, but it may not be the
 /// first: an Electron app plays from a child process. Another session's process is left
 /// out: the console user's helper can't pin it.
 fn voice_processes(apps: &[String]) -> Vec<(u32, String)> {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-        TH32CS_SNAPPROCESS,
-    };
     use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
-    use windows::Win32::System::Threading::GetCurrentProcessId;
     let session_of = |pid: u32| {
         let mut s = 0u32;
         // SAFETY: `s` is a live local out-param for this synchronous call.
@@ -286,41 +280,16 @@ fn voice_processes(apps: &[String]) -> Vec<(u32, String)> {
             .ok()
             .map(|()| s)
     };
-    // SAFETY: takes no arguments and returns this process's id by value.
-    let ours = session_of(unsafe { GetCurrentProcessId() });
-    let mut out = Vec::new();
-    // SAFETY: `entry` is zeroed with `dwSize` set before the first read; the snapshot handle
-    // is closed on every exit path; `szExeFile` is read up to its first NUL.
-    unsafe {
-        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
-            return out;
-        };
-        let mut entry = PROCESSENTRY32W {
-            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-            ..std::mem::zeroed()
-        };
-        if Process32FirstW(snap, &mut entry).is_ok() {
-            loop {
-                let len = entry
-                    .szExeFile
-                    .iter()
-                    .position(|&c| c == 0)
-                    .unwrap_or(entry.szExeFile.len());
-                let exe = String::from_utf16_lossy(&entry.szExeFile[..len]).to_ascii_lowercase();
-                let pid = entry.th32ProcessID;
-                if pf_host_config::voice_app_matches([exe.as_str()], apps)
-                    && (ours.is_none() || session_of(pid) == ours)
-                {
-                    out.push((pid, exe));
-                }
-                if Process32NextW(snap, &mut entry).is_err() {
-                    break;
-                }
-            }
-        }
-        let _ = CloseHandle(snap);
-    }
-    out
+    let ours = session_of(std::process::id());
+    crate::procscan::processes()
+        .into_iter()
+        .filter_map(|(pid, _, exe)| {
+            let exe = exe.to_ascii_lowercase();
+            (pf_host_config::voice_app_matches([exe.as_str()], apps)
+                && (ours.is_none() || session_of(pid) == ours))
+                .then_some((pid, exe))
+        })
+        .collect()
 }
 
 /// Run `voice-route <args>` as the console user, windowless, and wait for its verdict.
@@ -514,14 +483,14 @@ struct IAudioPolicyConfigFactoryVtbl {
         u32,
         u32,
         u32,
-        *mut c_void,
+        windows::core::Ref<'_, windows::core::HSTRING>,
     ) -> windows::core::HRESULT,
     get_persisted_default_audio_endpoint: unsafe extern "system" fn(
         *mut c_void,
         u32,
         u32,
         u32,
-        *mut *mut c_void,
+        *mut windows::core::HSTRING,
     ) -> windows::core::HRESULT,
     clear_all_persisted_application_default_endpoints:
         unsafe extern "system" fn(*mut c_void) -> windows::core::HRESULT,
@@ -554,21 +523,32 @@ const _: () = {
     );
     assert!(size_of::<IAudioPolicyConfigFactoryVtbl>() == 28 * size_of::<P>());
     // The HSTRING handle is passed by value: one pointer.
-    assert!(size_of::<windows::core::HSTRING>() == size_of::<P>());
+    assert!(size_of::<windows::core::Ref<windows::core::HSTRING>>() == size_of::<P>());
 };
 
-/// A live `IAudioPolicyConfigFactory`, released on drop.
-struct AudioPolicyConfig {
-    raw: *mut c_void,
+/// The IID changed in Windows 11 21H2; both name the same table.
+const IID_WIN11: windows::core::GUID =
+    windows::core::GUID::from_u128(0xab3d4648_e242_459f_b02f_541c70306324);
+const IID_WIN10: windows::core::GUID =
+    windows::core::GUID::from_u128(0x2a59116d_6c4f_45e0_a74f_707e3fef9258);
+
+/// A live `IAudioPolicyConfigFactory`; the `IUnknown` inside releases it on drop.
+#[repr(transparent)]
+#[derive(Clone)]
+struct AudioPolicyConfig(windows::core::IUnknown);
+
+// SAFETY: one COM pointer (transparent over `IUnknown`) to an object whose table starts with
+// `IAudioPolicyConfigFactoryVtbl`, the layout the asserts pin, under either IID.
+unsafe impl windows::core::Interface for AudioPolicyConfig {
+    type Vtable = IAudioPolicyConfigFactoryVtbl;
+    const IID: windows::core::GUID = IID_WIN11;
 }
 
 impl AudioPolicyConfig {
-    /// The IID changed in Windows 11 21H2; the newer one is tried first.
+    /// The newer IID is tried first.
     fn activate() -> Result<AudioPolicyConfig> {
-        use windows::core::{IInspectable, Interface, GUID, HSTRING};
+        use windows::core::{IInspectable, Interface, HSTRING};
         use windows::Win32::System::WinRT::RoGetActivationFactory;
-        const IID_WIN11: GUID = GUID::from_u128(0xab3d4648_e242_459f_b02f_541c70306324);
-        const IID_WIN10: GUID = GUID::from_u128(0x2a59116d_6c4f_45e0_a74f_707e3fef9258);
         let class = HSTRING::from("Windows.Media.Internal.AudioPolicyConfig");
         // SAFETY: `class` is a live HSTRING; the factory is an owned IInspectable released by
         // its Drop.
@@ -576,18 +556,14 @@ impl AudioPolicyConfig {
             .map_err(|e| anyhow!("RoGetActivationFactory(AudioPolicyConfig): {e}"))?;
         for iid in [IID_WIN11, IID_WIN10] {
             let mut raw: *mut c_void = std::ptr::null_mut();
-            // SAFETY: QueryInterface on a live factory; a non-null result is an owned reference
-            // this struct releases exactly once in Drop.
+            // SAFETY: QueryInterface on a live factory; `raw` is a live local out-param.
             if unsafe { factory.query(&iid, &mut raw) }.is_ok() && !raw.is_null() {
-                return Ok(AudioPolicyConfig { raw });
+                // SAFETY: `raw` is one owned reference to an object with this table; `from_raw`
+                // adopts it.
+                return Ok(unsafe { AudioPolicyConfig::from_raw(raw) });
             }
         }
         bail!("IAudioPolicyConfigFactory: neither the Windows 11 nor the Windows 10 interface answered")
-    }
-
-    fn vtbl(&self) -> &IAudioPolicyConfigFactoryVtbl {
-        // SAFETY: `raw` is a live COM pointer whose first word is the vtable the asserts pin.
-        unsafe { &**(self.raw as *const *const IAudioPolicyConfigFactoryVtbl) }
     }
 
     /// Write `pid`'s render pin on each role (console, multimedia, communications): a device
@@ -595,21 +571,19 @@ impl AudioPolicyConfig {
     /// audio on the communications role, and a pin that skipped it would leave exactly the
     /// voices in the stream.
     fn set_persisted_render(&self, pid: u32, paths: [Option<&str>; 3]) -> Result<()> {
+        use windows::core::{Interface, Ref, HSTRING};
         for (role, path) in paths.iter().enumerate() {
-            let hs = path.map(windows::core::HSTRING::from);
-            // SAFETY: HSTRING is one pointer (asserted above); the copy is the handle, which `hs`
-            // keeps alive across the call. Null = "default", as the Sound settings page writes.
-            let handle: *mut c_void = hs.as_ref().map_or(std::ptr::null_mut(), |h| unsafe {
-                std::mem::transmute_copy(h)
-            });
-            // SAFETY: live factory (`vtbl` above); eRender = 0; eConsole..eCommunications = 0..=2.
+            // Empty is the null HSTRING: "default", as the Sound settings page writes.
+            let hs = path.map(HSTRING::from).unwrap_or_default();
+            // SAFETY: live factory; the call borrows `hs`, which outlives it. eRender = 0;
+            // eConsole..eCommunications = 0..=2.
             let hr = unsafe {
-                (self.vtbl().set_persisted_default_audio_endpoint)(
-                    self.raw,
+                (self.vtable().set_persisted_default_audio_endpoint)(
+                    self.as_raw(),
                     pid,
                     0,
                     role as u32,
-                    handle,
+                    Ref::from(&hs),
                 )
             };
             hr.ok().map_err(|e| {
@@ -621,36 +595,28 @@ impl AudioPolicyConfig {
 
     /// `pid`'s current render pin per role, as the device interface path; `None` is "default".
     fn get_persisted_render(&self, pid: u32) -> Result<[Option<String>; 3]> {
+        use windows::core::{Interface, HSTRING};
         let mut out: [Option<String>; 3] = Default::default();
         for (role, slot) in out.iter_mut().enumerate() {
-            let mut raw: *mut c_void = std::ptr::null_mut();
-            // SAFETY: live factory; `raw` is a local out-param that receives an owned HSTRING.
+            let mut hs = HSTRING::new();
+            // SAFETY: live factory; `hs` is a null HSTRING the call overwrites with one owned
+            // reference (null = "default"), which its Drop releases.
             let hr = unsafe {
-                (self.vtbl().get_persisted_default_audio_endpoint)(
-                    self.raw,
+                (self.vtable().get_persisted_default_audio_endpoint)(
+                    self.as_raw(),
                     pid,
                     0,
                     role as u32,
-                    &mut raw,
+                    &mut hs,
                 )
             };
             hr.ok().map_err(|e| {
                 anyhow!("GetPersistedDefaultAudioEndpoint(pid {pid}, role {role}): {e}")
             })?;
-            // SAFETY: the call handed over one HSTRING reference (null = empty); HSTRING is one
-            // pointer (asserted above) and its Drop releases that reference exactly once.
-            let hs: windows::core::HSTRING = unsafe { std::mem::transmute(raw) };
             let path = hs.to_string_lossy();
             *slot = (!path.is_empty()).then_some(path);
         }
         Ok(out)
-    }
-}
-
-impl Drop for AudioPolicyConfig {
-    fn drop(&mut self) {
-        // SAFETY: `raw` is the owned reference `activate` took; released exactly once.
-        unsafe { (self.vtbl().release)(self.raw) };
     }
 }
 

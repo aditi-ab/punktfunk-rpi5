@@ -15,12 +15,13 @@
 
 use super::channel_proof;
 pub(super) use super::channel_proof::ProofTransport;
+use crate::pad_shm_ring::SectionView;
 use crate::pad_slots::PadCreateFault;
 use anyhow::{anyhow, Context, Result};
 use pf_driver_proto::gamepad::{PadBootstrap, BOOT_MAGIC, GAMEPAD_PROTO_VERSION};
 use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{fence, AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use windows::core::{w, GUID, HRESULT, HSTRING, PCWSTR};
@@ -62,6 +63,8 @@ pub(super) struct Shm {
     /// Duplication source for the sealed channel.
     handle: OwnedHandle,
     view: MEMORY_MAPPED_VIEW_ADDRESS,
+    /// Bytes mapped at `view`.
+    len: usize,
 }
 
 /// SDDL `SECURITY_ATTRIBUTES` plus the `LocalAlloc`'d descriptor it points at.
@@ -190,12 +193,21 @@ impl Shm {
             // SAFETY: `view` points at `size` writable bytes (just mapped).
             unsafe { core::ptr::write_bytes(view.Value as *mut u8, 0, size) };
         }
-        Ok((Shm { handle, view }, existed))
+        Ok((
+            Shm {
+                handle,
+                view,
+                len: size,
+            },
+            existed,
+        ))
     }
 
-    /// Mapped base. Stable for this `Shm`'s lifetime — `MapViewOfFile` pins the address.
-    pub(super) fn base(&self) -> *mut u8 {
-        self.view.Value as *mut u8
+    /// The mapping, stable for this `Shm`'s lifetime (`MapViewOfFile` pins the address).
+    pub(super) fn view(&self) -> SectionView<'_> {
+        // SAFETY: `MapViewOfFile` mapped `len` RW bytes at `view`; `Drop` unmaps them only after
+        // this borrow ends. The shared bytes are only reached through the view's raw accessors.
+        unsafe { SectionView::from_raw(self.view.Value.cast(), self.len) }
     }
 
     fn raw_handle(&self) -> HANDLE {
@@ -356,18 +368,19 @@ impl PadChannel {
             &HSTRING::from(boot_name.as_str()),
             core::mem::size_of::<PadBootstrap>(),
         )?;
-        let base = boot.base();
-        // SAFETY: `base` is the live, page-aligned mailbox view (>= size_of::<PadBootstrap>()); the
-        // field offsets are pinned by the proto's asserts and naturally aligned, so the atomic views
-        // are valid. `host_proto` is published BEFORE `magic` (Release) — a driver that observes the
-        // magic (Acquire) sees the version.
-        unsafe {
-            (*(base.add(core::mem::offset_of!(PadBootstrap, host_proto)) as *const AtomicU32))
-                .store(GAMEPAD_PROTO_VERSION, Ordering::Relaxed);
-            fence(Ordering::Release);
-            (*(base.add(core::mem::offset_of!(PadBootstrap, magic)) as *const AtomicU32))
-                .store(BOOT_MAGIC, Ordering::Release);
-        }
+        // `host_proto` before `magic` (Release): a driver that sees the magic sees the version.
+        let mailbox = boot.view();
+        mailbox.store_u32(
+            core::mem::offset_of!(PadBootstrap, host_proto),
+            GAMEPAD_PROTO_VERSION,
+            Ordering::Relaxed,
+        );
+        fence(Ordering::Release);
+        mailbox.store_u32(
+            core::mem::offset_of!(PadBootstrap, magic),
+            BOOT_MAGIC,
+            Ordering::Release,
+        );
         created_names().push(boot_name.clone());
         Ok(PadChannel {
             data,
@@ -395,8 +408,9 @@ impl Drop for PadChannel {
 }
 
 impl PadChannel {
-    pub(super) fn data_base(&self) -> *mut u8 {
-        self.data.base()
+    /// The DATA section this channel delivers.
+    pub(super) fn data(&self) -> SectionView<'_> {
+        self.data.view()
     }
 
     pub(super) fn boot_name(&self) -> &str {
@@ -404,10 +418,7 @@ impl PadChannel {
     }
 
     fn boot_load(&self, off: usize) -> u32 {
-        // SAFETY: the mailbox view is live (owned by `self.boot`), page-aligned, and every
-        // `PadBootstrap` u32 field offset is 4-aligned (proto asserts), so the atomic view is valid;
-        // no reference into the shared region outlives the load.
-        unsafe { (*(self.boot.base().add(off) as *const AtomicU32)).load(Ordering::Acquire) }
+        self.boot.view().load_u32(off, Ordering::Acquire)
     }
 
     /// Bind to the `SwDeviceCreate` instance so [`Self::pump`] can ask for a channel proof.
@@ -613,20 +624,26 @@ impl PadChannel {
             .context("DuplicateHandle(gamepad DATA section) into the driver's WUDFHost")?;
         }
         let value = remote.0 as usize as u64;
-        let base = self.boot.base();
         let seq = BOOT_SEQ.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: live, page-aligned mailbox view; `data_handle` is 8-aligned and `handle_pid`/
-        // `handle_seq` 4-aligned (proto asserts). The handle value + owning pid are published BEFORE
-        // the seq (Release) — a driver that observes the new seq (Acquire) sees a complete delivery.
-        unsafe {
-            (*(base.add(core::mem::offset_of!(PadBootstrap, data_handle)) as *const AtomicU64))
-                .store(value, Ordering::Relaxed);
-            (*(base.add(core::mem::offset_of!(PadBootstrap, handle_pid)) as *const AtomicU32))
-                .store(pid, Ordering::Relaxed);
-            fence(Ordering::Release);
-            (*(base.add(core::mem::offset_of!(PadBootstrap, handle_seq)) as *const AtomicU32))
-                .store(seq, Ordering::Release);
-        }
+        // Handle value + owning pid before the seq (Release): a driver that sees the new seq
+        // (Acquire) sees a complete delivery.
+        let mailbox = self.boot.view();
+        mailbox.store_u64(
+            core::mem::offset_of!(PadBootstrap, data_handle),
+            value,
+            Ordering::Relaxed,
+        );
+        mailbox.store_u32(
+            core::mem::offset_of!(PadBootstrap, handle_pid),
+            pid,
+            Ordering::Relaxed,
+        );
+        fence(Ordering::Release);
+        mailbox.store_u32(
+            core::mem::offset_of!(PadBootstrap, handle_seq),
+            seq,
+            Ordering::Release,
+        );
         Ok((seq, process))
     }
 
@@ -774,19 +791,20 @@ pub(super) fn create_swdevice(p: &SwDeviceProfile) -> Result<(SwDevice, Option<S
         [0, 0, 0, 0, 0, 0, 0, p.container_index],
     );
 
-    // SAFETY: zeroed then the fields we use are set; cbSize identifies the struct version. The id
-    // buffers and `container` outlive SwDeviceCreate (we wait on the event before return).
-    let mut info: SW_DEVICE_CREATE_INFO = unsafe { std::mem::zeroed() };
-    info.cbSize = std::mem::size_of::<SW_DEVICE_CREATE_INFO>() as u32;
-    info.pszInstanceId = PCWSTR(instid.as_ptr());
-    info.pszzHardwareIds = PCWSTR(hwids.as_ptr());
-    info.pszzCompatibleIds = compat
-        .as_ref()
-        .map_or(PCWSTR::null(), |c| PCWSTR(c.as_ptr()));
-    info.pContainerId = &container;
-    info.pszDeviceDescription = PCWSTR(desc.as_ptr());
-    info.pszDeviceLocation = PCWSTR(loc.as_ptr());
-    info.CapabilityFlags = 0x0000_000B; // DriverRequired | SilentInstall | Removable
+    // The id buffers and `container` outlive SwDeviceCreate (we wait on the event before return).
+    let info = SW_DEVICE_CREATE_INFO {
+        cbSize: size_of::<SW_DEVICE_CREATE_INFO>() as u32,
+        pszInstanceId: PCWSTR(instid.as_ptr()),
+        pszzHardwareIds: PCWSTR(hwids.as_ptr()),
+        pszzCompatibleIds: compat
+            .as_ref()
+            .map_or(PCWSTR::null(), |c| PCWSTR(c.as_ptr())),
+        pContainerId: &container,
+        CapabilityFlags: 0x0000_000B, // DriverRequired | SilentInstall | Removable
+        pszDeviceDescription: PCWSTR(desc.as_ptr()),
+        pszDeviceLocation: PCWSTR(loc.as_ptr()),
+        ..Default::default()
+    };
 
     // SAFETY: a manual-reset, initially-unsignaled, unnamed event.
     let event = unsafe { CreateEventW(None, true, false, PCWSTR::null())? };

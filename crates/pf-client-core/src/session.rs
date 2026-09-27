@@ -107,17 +107,18 @@ pub struct SessionParams {
     /// Overlay vocabulary this launch resolved: Standard (`false`) or Advanced. Rides per
     /// launch like the tier, so a browse-mode presenter adopts a change made between streams.
     pub advanced_stats: bool,
-    /// Advertise `CLIENT_CAP_PHASE_LOCK`: the presenter has real on-glass latch stamps
-    /// (`VK_KHR_present_wait`) and will feed [`latch_grid`](Self::latch_grid). Never
-    /// set without present timing — the host arms on report receipt.
+    /// Advertise `CLIENT_CAP_PHASE_LOCK` and feed [`latch_grid`](Self::latch_grid). The
+    /// desktop leaves it off: the lock moves the wait for the latch into the host's hold
+    /// and costs 3–4 ms end to end on an iGPU at 4K. Never set without present timing.
     pub phase_lock: bool,
     pub latch_grid: Arc<LatchGrid>,
 }
 
 /// Presenter → pump latch grid (the `force_software` pattern the other way). The
-/// presenter's 1 Hz fold writes an on-glass latch plus panel period; the pump folds
-/// AU arrivals against them into the ~1 Hz `PhaseReport`. All zeros until the first
-/// fold — and forever without present timing — so the pump stays quiet then.
+/// presenter writes an on-glass latch, the panel period and what a frame needs before
+/// its latch; the pump folds AU arrivals against them into the ~1 Hz `PhaseReport`.
+/// All zeros until the first fold — and forever without present timing — so the pump
+/// stays quiet then.
 #[derive(Default)]
 pub struct LatchGrid {
     /// Recent on-glass latch (client `CLOCK_REALTIME` ns — same domain as AU arrivals).
@@ -125,6 +126,8 @@ pub struct LatchGrid {
     pub anchor_ns: std::sync::atomic::AtomicU64,
     /// Panel latch period (ns). `0` = no grid yet.
     pub period_ns: std::sync::atomic::AtomicU64,
+    /// Hand-over to latch, as the presenter learned it (ns). `0` = the host's lead covers it.
+    pub need_ns: std::sync::atomic::AtomicU64,
 }
 
 /// Host, pin, launch, and budget for one dial.
@@ -201,7 +204,8 @@ impl SessionParams {
             height,
             ..mode
         };
-        let phase_lock = probes.vulkan.as_ref().is_some_and(|v| v.present_timing);
+        // Off on the desktop (see the field). The report path stays for a client that asks.
+        let phase_lock = false;
         let caps_444 = settings.enable_444 && probes.hevc_444_hardware;
         let advertise_hdr = settings.hdr_enabled && probes.hdr_enabled;
         // The host writes the volume into its display's EDID, so it rides only with HDR on.
@@ -812,7 +816,7 @@ fn spawn_plane_threads(
     }
 }
 
-/// How the pump learns a hardware decode finished, for the once-per-window decode sample.
+/// How the pump waits a hardware decode to completion before it hands the frame on.
 enum HwDone {
     /// Vulkan Video: the picture's timeline semaphore reaches `value`.
     Timeline(u64, u64),
@@ -943,10 +947,11 @@ fn pump(
     // Live host↔client clock offset, loaded per frame so mid-stream re-syncs keep
     // capture-clock latency honest — never cached at session start.
     let clock_offset_live = connector.clock_offset_shared();
-    // Every received AU's arrival stamp, folded per stats window against the latch
-    // grid into the ~1 Hz PhaseReport. 256 ≈ 2 s at 120 Hz.
+    // Every received AU's arrival stamp and decode time, folded per stats window against
+    // the latch grid into the ~1 Hz PhaseReport. 256 ≈ 2 s at 120 Hz.
     let latch_grid = params.latch_grid.clone();
     let mut phase_arrivals: Vec<u64> = Vec::new();
+    let mut phase_decodes: Vec<u64> = Vec::new();
     let mut last_applied_phase: Option<i32> = None;
     // `PUNKTFUNK_DEBUG_RECONFIGURE=WxH@HZ:SECS` — request one mid-stream mode
     // switch N seconds in, so a headless session can exercise the resize path.
@@ -968,9 +973,6 @@ fn pump(
     let mut pin_noticed = false;
     // The last launch verdict turned into a notice: each verdict is said once.
     let mut launch_told: Option<punktfunk_core::quic::LaunchOutcome> = None;
-    // One fence-waited decode sample per window on the async rung: a per-frame wait
-    // would serialize decode to 1/latency.
-    let mut fence_sampled = false;
     // Report decode stage to ABR only when armed. Constant for the session.
     let wants_decode = connector.wants_decode_latency();
     // What actually decoded the last frame — VAAPI can demote mid-session.
@@ -1180,17 +1182,14 @@ fn pump(
                             let (width, height) = image.dimensions();
                             tracing::info!(width, height, path = dec_path, "first frame decoded");
                         }
-                        // Travels with the frame so the presenter can measure `display`.
-                        let decoded_ns = now_ns();
-                        connector.hud().note_decoded(frame.pts_ns, decoded_ns);
-                        // Ship first, then the decode stat. Vulkan returns at submission;
-                        // a per-frame fence wait serializes to 1/decode_latency. One
-                        // honest sample per window. Polling would quantize by a whole
-                        // frame interval (8.3 ms at 120 Hz vs ~0.1–2 ms decodes).
+                        // Hardware rungs return at submission. Wait the decode's own fence
+                        // here, on the pump: i915 raises the media engine's clock only for
+                        // a thread that waits (a 4K decode on a Meteor Lake Arc takes 6.8 ms
+                        // unboosted, 2.7 boosted), and `decoded_ns` then means complete.
+                        // 50 ms bounds a wedged pipeline; the presenter waits the GPU too.
                         let hw_fence = match &image {
                             // Native rung: decode signals `semaphore_value` when pixels
-                            // are ready (presenter write-back is `+ 1`). Wait measures
-                            // received→decode-complete.
+                            // are ready (presenter write-back is `+ 1`).
                             DecodedImage::NativeVk(f) => {
                                 HwDone::Timeline(f.semaphore, f.semaphore_value)
                             }
@@ -1204,6 +1203,23 @@ fn pump(
                                 .map_or(HwDone::Cpu, HwDone::SyncFile),
                             _ => HwDone::Cpu,
                         };
+                        match hw_fence {
+                            HwDone::Timeline(sem, value) => {
+                                decoder.wait_hw_decoded(sem, value, 50_000_000);
+                            }
+                            #[cfg(target_os = "linux")]
+                            HwDone::SyncFile(fd) => {
+                                use std::os::fd::AsFd as _;
+                                let _ = pf_zerocopy::dmabuf_fence::wait_sync_file(fd.as_fd(), 50);
+                            }
+                            HwDone::Cpu => {}
+                        }
+                        // Travels with the frame so the presenter can measure `display`.
+                        let decoded_ns = now_ns();
+                        connector.hud().note_decoded(frame.pts_ns, decoded_ns);
+                        if params.phase_lock && phase_decodes.len() < 256 {
+                            phase_decodes.push(decoded_ns.saturating_sub(received_ns));
+                        }
                         if present {
                             // A displaced frame decoded and was never shown: newest wins.
                             if let Ok(Some(_)) = frame_tx.force_send(DecodedFrame {
@@ -1215,44 +1231,13 @@ fn pump(
                             }
                         } else {
                             // Withhold this frame so the presenter redraws the last good
-                            // picture. `hw_fence` still samples (handle stays valid).
+                            // picture.
                             tracing::trace!("holding last frame — awaiting post-loss re-anchor");
                         }
-                        match hw_fence {
-                            // `decoded_ns` is a submission stamp here, so GPU decode sits
-                            // inside `display` and this sample re-counts it.
-                            HwDone::Timeline(sem, value) => {
-                                if !fence_sampled && decoder.wait_hw_decoded(sem, value, 50_000_000)
-                                {
-                                    fence_sampled = true;
-                                    let us = now_ns().saturating_sub(received_ns) / 1000;
-                                    connector.hud().note_decode_us(us, true);
-                                }
-                            }
-                            #[cfg(target_os = "linux")]
-                            HwDone::SyncFile(fd) => {
-                                use std::os::fd::AsRawFd as _;
-                                if !fence_sampled
-                                    && pf_zerocopy::dmabuf_fence::wait_sync_file(fd.as_raw_fd(), 50)
-                                        .is_ok_and(|o| {
-                                            o != pf_zerocopy::dmabuf_fence::WaitOutcome::TimedOut
-                                        })
-                                {
-                                    fence_sampled = true;
-                                    let us = now_ns().saturating_sub(received_ns) / 1000;
-                                    connector.hud().note_decode_us(us, true);
-                                }
-                            }
-                            HwDone::Cpu => {
-                                let us = decoded_ns.saturating_sub(received_ns) / 1000;
-                                connector.hud().note_decode_us(us, false);
-                            }
-                        }
-                        // ABR: decoder-backlog every frame, using the CPU-side stamp.
-                        // Exact for sync paths; received→submit for async Vulkan — the
-                        // backpressure the controller needs, without the fence wait.
+                        // Received → pixels done, every frame; the ABR's decoder-backlog too.
+                        let us = decoded_ns.saturating_sub(received_ns) / 1000;
+                        connector.hud().note_decode_us(us, false);
                         if wants_decode {
-                            let us = decoded_ns.saturating_sub(received_ns) / 1000;
                             connector.report_decode_us(us.min(u32::MAX as u64) as u32);
                         }
                     }
@@ -1395,18 +1380,25 @@ fn pump(
                 let period = latch_grid.period_ns.load(Ordering::Relaxed);
                 let anchor = latch_grid.anchor_ns.load(Ordering::Relaxed);
                 if period > 0 && anchor > 0 {
+                    // The instant an arrival must beat: the latch less the window's p75
+                    // decode and what the presenter needs. The host aims its lead at it.
+                    phase_decodes.sort_unstable();
+                    let decode = phase_decodes
+                        .get(phase_decodes.len() * 3 / 4)
+                        .copied()
+                        .unwrap_or(0);
+                    let need = latch_grid.need_ns.load(Ordering::Relaxed);
+                    let ready_by = anchor as i128 - phase_shift_ns(need, decode, period) as i128;
                     let leads_us: Vec<u64> = phase_arrivals
                         .iter()
-                        .map(|a| {
-                            ((anchor as i128 - *a as i128).rem_euclid(period as i128) / 1000) as u64
-                        })
+                        .map(|a| ((ready_by - *a as i128).rem_euclid(period as i128) / 1000) as u64)
                         .collect();
                     if let Some((lead_ns, coherence)) =
                         punktfunk_core::phase::circular_latch(&leads_us, period as i64)
                     {
-                        // Extrapolate the (possibly ~1 s old) anchor to the next latch
+                        // Extrapolate the (possibly ~1 s old) instant to the next one
                         // at or after now, then express it on the host clock.
-                        let (now, p, a) = (now_ns() as i128, period as i128, anchor as i128);
+                        let (now, p, a) = (now_ns() as i128, period as i128, ready_by);
                         let k = ((now - a).max(0) + p - 1) / p;
                         let offset = clock_offset_live.load(Ordering::Relaxed) as i128;
                         connector.report_phase(
@@ -1419,13 +1411,13 @@ fn pump(
                     }
                 }
                 phase_arrivals.clear();
+                phase_decodes.clear();
             }
             let _ = ev_tx.try_send(SessionEvent::DecodeFacts(DecodeFacts {
                 decoder: dec_path,
                 health: decoder.decode_health(),
             }));
             window_start = Instant::now();
-            fence_sampled = false;
         }
     };
 
@@ -1725,9 +1717,25 @@ fn parse_debug_reconfigure(s: &str) -> Option<(Mode, Duration)> {
     Some((mode, Duration::from_secs(secs_s.trim().parse().ok()?)))
 }
 
+/// How far before its latch an arrival has to land: decode plus what the presenter needs.
+/// Held 3 ms under a period, the room the host's own lead takes.
+fn phase_shift_ns(need_ns: u64, decode_ns: u64, period_ns: u64) -> u64 {
+    need_ns
+        .saturating_add(decode_ns)
+        .min(period_ns.saturating_sub(3_000_000))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_phase_shift_adds_decode_to_the_need_below_a_period() {
+        assert_eq!(phase_shift_ns(0, 0, 16_666_666), 0);
+        assert_eq!(phase_shift_ns(6_000_000, 500_000, 16_666_666), 6_500_000);
+        assert_eq!(phase_shift_ns(6_000_000, 9_000_000, 8_333_333), 5_333_333);
+        assert_eq!(phase_shift_ns(1_000_000, 0, 2_000_000), 0);
+    }
 
     /// Every spelling the env-var doc promises has to land on the right side of
     /// `CLIENT_CAP_AUDIO_HIRES`.

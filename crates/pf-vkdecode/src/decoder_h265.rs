@@ -65,6 +65,8 @@ pub struct H265 {
     /// Over-declared-level warning has fired. Once per decoder: the condition is
     /// a property of the stream's SPS, so repeating it per AU is noise.
     level_clamp_warned: bool,
+    /// [`VkH265Decoder::refuse_multi_slice`].
+    single_slice: bool,
 }
 
 /// Native Vulkan Video H.265 decoder.
@@ -127,8 +129,16 @@ impl VkDecoder<H265> {
             caps: None,
             recovery_watch: RecoveryWatch::new(),
             level_clamp_warned: false,
+            single_slice: false,
         };
         Ok(Self::with_codec(dev, lock, codec))
+    }
+
+    /// Refuse a picture with more than one slice segment before it reaches the driver.
+    /// For a driver that faults on one; the refusal is a device fact
+    /// ([`VkDecodeError::is_device_fact`]), so the owner's next rung takes the stream.
+    pub fn refuse_multi_slice(&mut self) {
+        self.codec.single_slice = true;
     }
 
     /// Ask whether the device can host a stream of this (chroma, bit-depth)
@@ -227,6 +237,7 @@ impl VkDecoder<H265> {
         recovery: RecoveryMark,
         decode_order: u64,
     ) -> Result<Option<DecodedVkFrame>, VkDecodeError> {
+        crate::caps::require_segments(self.codec.single_slice, plan.slices.len())?;
         self.ensure_state(plan)?;
 
         // Stream VPS, or the fallback identity when the join missed the VPS

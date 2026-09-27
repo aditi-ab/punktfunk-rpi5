@@ -187,6 +187,18 @@ unsafe fn key(raw: u64) -> usize {
     unsafe { *(raw as usize as *const usize) }
 }
 
+/// Pick one field of the instance chain `raw` dispatches through. `None` when that chain was
+/// never hooked, or the map is poisoned.
+///
+/// # Safety
+/// `raw` must be a live dispatchable handle of an instance chain (`VkInstance` or
+/// `VkPhysicalDevice`) — the contract of [`key`].
+unsafe fn lookup<T>(raw: u64, pick: impl FnOnce(&InstanceData) -> Option<T>) -> Option<T> {
+    // SAFETY: `raw` is a live dispatchable handle per this function's contract.
+    let k = unsafe { key(raw) };
+    instances().lock().ok()?.get(&k).and_then(pick)
+}
+
 /// Reinterpret a function address as the loader's type-erased void-function pointer.
 ///
 /// # Safety
@@ -615,14 +627,9 @@ unsafe extern "system" fn layer_gipa(
     if instance == vk::Instance::null() {
         return None;
     }
-    let next = {
-        let g = instances().lock().ok()?;
-        // SAFETY: `instance` is non-null, and vkGetInstanceProcAddr's valid-usage rules make a
-        // non-null instance argument a live instance handle — a dispatchable object whose first
-        // word is the dispatch key.
-        g.get(&unsafe { key(instance.as_raw()) })
-            .map(|d| d.next_gipa)
-    };
+    // SAFETY: `instance` is non-null, and vkGetInstanceProcAddr's valid-usage rules make a
+    // non-null instance argument a live instance handle.
+    let next = unsafe { lookup(instance.as_raw(), |d| Some(d.next_gipa)) };
     // SAFETY: `next` is the down-chain GetInstanceProcAddr captured from the loader's link at
     // create_instance for this very chain; `p_name` is still valid NUL-terminated.
     next.and_then(|gipa| unsafe { gipa(instance, p_name) })
@@ -656,13 +663,8 @@ unsafe extern "system" fn layer_gpdpa(
     if instance == vk::Instance::null() {
         return None;
     }
-    let next = {
-        let g = instances().lock().ok()?;
-        // SAFETY: `instance` is non-null and (per the caller's contract) a live instance
-        // handle — a dispatchable object whose first word is the dispatch key.
-        g.get(&unsafe { key(instance.as_raw()) })
-            .and_then(|d| d.next_gpdpa)
-    };
+    // SAFETY: `instance` is non-null and (per the caller's contract) a live instance handle.
+    let next = unsafe { lookup(instance.as_raw(), |d| d.next_gpdpa) };
     // SAFETY: `next` is the down-chain GPDPA captured from the loader's link at create_instance
     // for this very chain; `p_name` is still valid NUL-terminated.
     next.and_then(|gpdpa| unsafe { gpdpa(instance, p_name) })
@@ -869,14 +871,11 @@ unsafe extern "system" fn create_device(
         (gipa, gdpa)
     };
 
-    let inst = instances()
-        .lock()
-        .ok()
-        // SAFETY: vkCreateDevice requires `pdev` to be a live physical-device handle — a
-        // dispatchable object sharing its instance's dispatch table, so its first word is the
-        // same dispatch key create_instance stored.
-        .and_then(|g| g.get(&unsafe { key(pdev.as_raw()) }).map(|d| d.instance))
-        .unwrap_or(vk::Instance::null());
+    // SAFETY: vkCreateDevice requires `pdev` to be a live physical-device handle — a
+    // dispatchable object sharing its instance's dispatch table, so its first word is the same
+    // dispatch key create_instance stored.
+    let inst =
+        unsafe { lookup(pdev.as_raw(), |d| Some(d.instance)) }.unwrap_or(vk::Instance::null());
 
     // SAFETY: `next_gipa` is the loader-supplied down-chain GIPA for this create call, `inst` is
     // the (possibly null) instance owning `pdev`, and FnCreateDevice mirrors vkCreateDevice's
@@ -909,13 +908,8 @@ unsafe extern "system" fn create_win32_surface(
     p_alloc: *const c_void,
     p_surface: *mut vk::SurfaceKHR,
 ) -> vk::Result {
-    let down = instances().lock().ok().and_then(|g| {
-        // SAFETY: vkCreateWin32SurfaceKHR requires `inst` to be a live instance handle — a
-        // dispatchable object whose first word is the dispatch key.
-        g.get(&unsafe { key(inst.as_raw()) })
-            .and_then(|d| d.create_win32_surface)
-    });
-    let down = match down {
+    // SAFETY: vkCreateWin32SurfaceKHR requires `inst` to be a live instance handle.
+    let down = match unsafe { lookup(inst.as_raw(), |d| d.create_win32_surface) } {
         Some(f) => f,
         None => return vk::Result::ERROR_EXTENSION_NOT_PRESENT,
     };
@@ -944,13 +938,8 @@ unsafe extern "system" fn destroy_surface(
     if let Ok(mut m) = surface_hwnds().lock() {
         m.remove(&surface.as_raw());
     }
-    let down = instances().lock().ok().and_then(|g| {
-        // SAFETY: vkDestroySurfaceKHR requires `inst` to be a live instance handle — a
-        // dispatchable object whose first word is the dispatch key.
-        g.get(&unsafe { key(inst.as_raw()) })
-            .and_then(|d| d.destroy_surface)
-    });
-    if let Some(f) = down {
+    // SAFETY: vkDestroySurfaceKHR requires `inst` to be a live instance handle.
+    if let Some(f) = unsafe { lookup(inst.as_raw(), |d| d.destroy_surface) } {
         // SAFETY: `f` is the down-chain vkDestroySurfaceKHR resolved for this instance at
         // create time; forwarding the caller's own arguments unchanged.
         unsafe { f(inst, surface, p_alloc) };
@@ -968,13 +957,9 @@ unsafe extern "system" fn get_surface_formats(
     if p_count.is_null() {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
-    let down = instances().lock().ok().and_then(|g| {
-        // SAFETY: vkGetPhysicalDeviceSurfaceFormatsKHR requires `pdev` to be a live
-        // physical-device handle — a dispatchable object whose first word is the dispatch key.
-        g.get(&unsafe { key(pdev.as_raw()) })
-            .and_then(|d| d.get_surface_formats)
-    });
-    let down = match down {
+    // SAFETY: vkGetPhysicalDeviceSurfaceFormatsKHR requires `pdev` to be a live physical-device
+    // handle.
+    let down = match unsafe { lookup(pdev.as_raw(), |d| d.get_surface_formats) } {
         Some(f) => f,
         None => return vk::Result::ERROR_INITIALIZATION_FAILED,
     };
@@ -1040,13 +1025,9 @@ unsafe extern "system" fn get_surface_formats2(
     if p_info.is_null() || p_count.is_null() {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
-    let down = instances().lock().ok().and_then(|g| {
-        // SAFETY: vkGetPhysicalDeviceSurfaceFormats2KHR requires `pdev` to be a live
-        // physical-device handle — a dispatchable object whose first word is the dispatch key.
-        g.get(&unsafe { key(pdev.as_raw()) })
-            .and_then(|d| d.get_surface_formats2)
-    });
-    let down = match down {
+    // SAFETY: vkGetPhysicalDeviceSurfaceFormats2KHR requires `pdev` to be a live physical-device
+    // handle.
+    let down = match unsafe { lookup(pdev.as_raw(), |d| d.get_surface_formats2) } {
         Some(f) => f,
         None => return vk::Result::ERROR_INITIALIZATION_FAILED,
     };

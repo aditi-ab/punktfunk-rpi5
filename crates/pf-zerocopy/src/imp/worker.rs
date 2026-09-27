@@ -359,7 +359,7 @@ impl ImportBackend for EglBackend {
                 message: "SetCursor without a memfd".into(),
             };
         };
-        let r = MappedFd::new(fd.as_raw_fd(), len as usize)
+        let r = MappedFd::new(fd.as_fd(), len as usize)
             .and_then(|m| self.importer.set_cursor(serial, w, h, m.bytes()));
         match r {
             Ok(()) => Reply::Done,
@@ -408,19 +408,28 @@ struct MappedFd {
     len: usize,
 }
 impl MappedFd {
-    fn new(fd: i32, len: usize) -> Result<MappedFd> {
+    /// Map the first `len` bytes of `fd`. A `len` past the file's end is refused: touching a
+    /// mapped page beyond it is a SIGBUS, not an error.
+    fn new(fd: BorrowedFd<'_>, len: usize) -> Result<MappedFd> {
         if len == 0 {
             bail!("empty cursor memfd");
         }
-        // SAFETY: a fresh read-only private mapping of `len` bytes of `fd`; the pointer is
-        // checked below and unmapped in `Drop`.
+        let size = rustix::fs::fstat(fd)
+            .context("fstat(cursor memfd)")?
+            .st_size;
+        if u64::try_from(size).unwrap_or(0) < len as u64 {
+            bail!("cursor memfd holds {size} bytes, message says {len}");
+        }
+        // SAFETY: a fresh read-only private mapping of `len` bytes of `fd`, which holds at least
+        // that many (checked above; the host seals it against shrinking). The pointer is checked
+        // below and unmapped in `Drop`.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 len,
                 libc::PROT_READ,
                 libc::MAP_PRIVATE,
-                fd,
+                fd.as_raw_fd(),
                 0,
             )
         };
@@ -502,8 +511,8 @@ mod tests {
     /// `st_ino` of an open fd. SCM_RIGHTS preserves identity while re-numbering the descriptor;
     /// the dispatch test asserts the arrived fd is the one the host sent, not just that JSON
     /// claimed one.
-    fn fd_ino(fd: impl AsRawFd) -> u64 {
-        ipc::dmabuf_inode(fd).expect("fstat").1
+    fn fd_ino(fd: impl AsFd) -> u64 {
+        crate::imp::fd_identity(fd.as_fd()).expect("fstat").1
     }
 
     struct MockBackend {
@@ -518,7 +527,7 @@ mod tests {
         }
         fn import(&mut self, req: &ImportReq, fd: Option<OwnedFd>) -> Reply {
             let received = match &fd {
-                Some(f) => format!("ino:{}", fd_ino(f.as_raw_fd())),
+                Some(f) => format!("ino:{}", fd_ino(f)),
                 None => "none".into(),
             };
             let _ = self.calls.send(format!(
@@ -610,7 +619,7 @@ mod tests {
         // SCM_RIGHTS must deliver a live fd with the sender's identity. `serve` dropping it
         // (`backend.import(&req, None)`) is only caught here.
         let (pr, _pw) = std::io::pipe().unwrap();
-        let sent_ino = fd_ino(pr.as_fd().as_raw_fd());
+        let sent_ino = fd_ino(&pr);
         ipc::send(host.as_fd(), &import_req(3, true), Some(pr.as_fd())).unwrap();
         let (reply, _) = ipc::recv::<Reply>(host.as_fd(), &mut buf).unwrap();
         assert_eq!(reply, Reply::Frame { id: 2, desc: None });

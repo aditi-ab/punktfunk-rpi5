@@ -10,11 +10,11 @@
 //! `vdisplay::apply_session_env`). Missing protocol is `BackendUnavailable`.
 
 use std::collections::HashMap;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use wayland_client::backend::ObjectId;
 use wayland_client::protocol::wl_registry;
 use wayland_client::protocol::wl_seat::WlSeat;
@@ -328,13 +328,12 @@ impl ClipboardBackend {
                 .context("format not offered by the host clipboard")?;
             (sel.offer.clone(), wl)
         };
-        let (read_fd, write_fd) = make_pipe()?;
-        offer.receive(wl_mime, write_fd.as_fd());
+        let (reader, writer) = std::io::pipe().context("pipe")?;
+        offer.receive(wl_mime, writer.as_fd());
         self.conn.flush().context("flush receive")?;
         // Drop our write end so the pipe EOFs when the source closes its dup.
-        drop(write_fd);
-        // Unique pipe read end; `File` owns it and closes on drop.
-        super::read_capped(std::fs::File::from(read_fd)).context("read clipboard transfer")
+        drop(writer);
+        super::read_capped(reader).context("read clipboard transfer")
     }
 }
 
@@ -395,21 +394,6 @@ fn dispatch_loop(
         }
     }
     let _ = state.tx.send(ClipEvent::Closed);
-}
-
-fn make_pipe() -> Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [0 as libc::c_int; 2];
-    // SAFETY: `pipe2` fully initializes the 2-element `fds` on success (returns 0); on failure (-1)
-    // we bail before reading it. Each returned fd is fresh and owned by exactly one `OwnedFd`.
-    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-    if rc < 0 {
-        return Err(anyhow!("pipe2 failed: {}", std::io::Error::last_os_error()));
-    }
-    // SAFETY: `fds[0]`/`fds[1]` are the fresh, uniquely-owned pipe ends from the checked `pipe2`.
-    let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-    // SAFETY: as above for the write end.
-    let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-    Ok((read_fd, write_fd))
 }
 
 /// Ignored live tests. Needs `wl-clipboard` and a `data-control` compositor.

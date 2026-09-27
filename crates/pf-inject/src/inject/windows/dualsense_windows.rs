@@ -15,12 +15,11 @@ use super::dualsense_proto::{
 };
 use super::gamepad_raii::{create_swdevice, PadChannel, ProofTransport, SwDeviceProfile};
 use super::pad_shm::ShmPad;
-use crate::pad_shm_ring::{
-    OFF_DEVTYPE, OFF_INPUT, OFF_OUTPUT, OFF_OUT_SEQ, OFF_PAD_INDEX, SHM_MAGIC, SHM_SIZE,
-};
+use crate::pad_shm_ring::{stamp, OFF_OUTPUT, OFF_OUT_SEQ, SHM_SIZE};
 use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::Result;
 use punktfunk_core::quic::RichInput;
+use std::sync::atomic::Ordering;
 
 /// One virtual DualSense or Edge: a `pf_pad_<index>` / `pf_edge_<index>` devnode plus the sealed
 /// channel. Public because it is `PadProto::Pad`.
@@ -180,16 +179,14 @@ impl PadProto for DsWinProto {
 pub fn deck_spike_hold(index: u8, secs: u64) -> Result<()> {
     let boot_name = pf_driver_proto::gamepad::pad_boot_name(index);
     let mut channel = PadChannel::create(boot_name, SHM_SIZE)?;
-    let base = channel.data_base();
-    let neutral = super::steam_proto::neutral_deck_report();
-    // SAFETY: base points at SHM_SIZE writable bytes; the OFF_* offsets are in range. Device-type
-    // FIRST, magic LAST. No ring version: the spike reads the legacy output slot.
-    unsafe {
-        *base.add(OFF_DEVTYPE) = pf_driver_proto::gamepad::DEVTYPE_STEAMDECK;
-        std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
-        std::ptr::write_unaligned(base.add(OFF_INPUT) as *mut [u8; 64], neutral);
-        std::ptr::write_unaligned(base as *mut u32, SHM_MAGIC);
-    }
+    // Ring version 0: the spike reads only the legacy output slot.
+    stamp(
+        channel.data(),
+        pf_driver_proto::gamepad::DEVTYPE_STEAMDECK,
+        index,
+        0,
+        &super::steam_proto::neutral_deck_report(),
+    );
     let (_sw, spike_instance_id) = create_swdevice(&SwDeviceProfile {
         instance: &format!("pf_deckspike_{index}"),
         container_tag: 0x5046_4453, // "PFDS"
@@ -220,20 +217,11 @@ pub fn deck_spike_hold(index: u8, secs: u64) -> Result<()> {
     let mut last_out_seq = 0u32;
     while std::time::Instant::now() < deadline {
         channel.pump();
-        // SAFETY: base points at SHM_SIZE bytes; OFF_OUT_SEQ is in range.
-        let seq =
-            unsafe { std::ptr::read_unaligned(channel.data_base().add(OFF_OUT_SEQ) as *const u32) };
+        let seq = channel.data().load_u32(OFF_OUT_SEQ, Ordering::Relaxed);
         if seq != last_out_seq {
             last_out_seq = seq;
             let mut out = [0u8; 16];
-            // SAFETY: output slot is OFF_OUTPUT..OFF_OUTPUT+64 within the section.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    channel.data_base().add(OFF_OUTPUT),
-                    out.as_mut_ptr(),
-                    16,
-                )
-            };
+            channel.data().read_bytes(OFF_OUTPUT, &mut out);
             println!("  output report from a client (Steam?): {out:02x?}");
         }
         std::thread::sleep(std::time::Duration::from_millis(50));

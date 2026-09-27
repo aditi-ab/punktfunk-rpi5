@@ -624,9 +624,10 @@ pub struct MfEncoder {
     resets_without_output: u32,
 }
 
-// SAFETY: COM interfaces and D3D11 handles are not auto-`Send`. The session moves the
-// encoder onto one encode thread and drives it there; the immediate context, the MFT, and
-// its event generator are never touched from another thread.
+// SAFETY: COM interfaces are not auto-`Send`. Every call on this encoder runs on the one thread
+// that owns it. `EventSink::Invoke` reaches the MFT from MF worker threads; the async MFT is
+// free-threaded for exactly that, and all state the two sides share sits behind `Shared::q`.
+// The immediate context the MFT also uses is multithread-protected in `ensure_inner`.
 unsafe impl Send for MfEncoder {}
 
 impl MfEncoder {

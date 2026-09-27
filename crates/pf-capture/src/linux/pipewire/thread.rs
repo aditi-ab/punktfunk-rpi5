@@ -716,7 +716,7 @@ fn on_process(stream: &pw::stream::Stream, ud: &mut UserData) {
     if !birth_gate(ud) {
         // SAFETY: `newest` was dequeued from this stream and not yet requeued;
         // requeued exactly once here, then never touched (mirrors the null path).
-        unsafe { hand_back(ud.sync.as_deref(), stream.as_raw_ptr(), newest) };
+        unsafe { ud.requeue_unpublished(stream.as_raw_ptr(), newest) };
         return;
     }
     // PipeWire dispatches from a C trampoline with no catch_unwind; a panic across that
@@ -818,7 +818,7 @@ fn drain_to_newest(
         }
         // SAFETY: `newest` was dequeued from this stream and not yet requeued; we immediately
         // overwrite it, so the requeued pointer is never touched again.
-        unsafe { hand_back(ud.sync.as_deref(), stream.as_raw_ptr(), newest) };
+        unsafe { ud.requeue_unpublished(stream.as_raw_ptr(), newest) };
         newest = next;
         drained += 1;
     }

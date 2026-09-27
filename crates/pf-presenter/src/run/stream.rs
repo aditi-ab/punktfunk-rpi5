@@ -76,6 +76,7 @@ impl StreamState {
             cadence: CadenceProbe::new(),
             mode_period_ns: 1_000_000_000 / u64::from(native_refresh_hz.max(1)),
             margin_ns: 0,
+            need: punktfunk_core::phase::LatchNeed::default(),
             busy_on: crate::vk::BusyOn::Fence,
             last_displayed_ns: 0,
             last_slot_ns: 0,

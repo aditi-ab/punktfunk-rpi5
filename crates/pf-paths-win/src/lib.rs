@@ -194,8 +194,8 @@ unsafe fn sid_in(sid: windows::Win32::Security::PSID, sids: &[Vec<u8>]) -> Optio
 
 /// SYSTEM, `BUILTIN\Administrators`, and TrustedInstaller (owns `%ProgramFiles%`).
 fn privileged_sids() -> Result<Vec<Vec<u8>>> {
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::core::{Owned, PCWSTR};
+    use windows::Win32::Foundation::HLOCAL;
     use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
     use windows::Win32::Security::{GetLengthSid, PSID};
 
@@ -211,15 +211,12 @@ fn privileged_sids() -> Result<Vec<Vec<u8>>> {
         // SAFETY: `wide` is NUL-terminated and outlives the call; psid is a live out-param.
         unsafe { ConvertStringSidToSidW(PCWSTR(wide.as_ptr()), &mut psid) }
             .map_err(|e| other(format!("ConvertStringSidToSidW({s}): {e}")))?;
+        // SAFETY: ConvertStringSidToSidW allocates with LocalAlloc; `Owned` frees it once.
+        let _psid = unsafe { Owned::new(HLOCAL(psid.0)) };
         // SAFETY: psid is a valid SID; copy it out so the caller owns plain bytes.
         let len = unsafe { GetLengthSid(psid) } as usize;
         // SAFETY: GetLengthSid just measured exactly `len` readable bytes at `psid`.
-        let bytes = unsafe { std::slice::from_raw_parts(psid.0 as *const u8, len) }.to_vec();
-        // SAFETY: ConvertStringSidToSidW allocates with LocalAlloc.
-        unsafe {
-            let _ = LocalFree(Some(HLOCAL(psid.0)));
-        }
-        Ok(bytes)
+        Ok(unsafe { std::slice::from_raw_parts(psid.0 as *const u8, len) }.to_vec())
     })
     .collect()
 }
@@ -237,7 +234,8 @@ pub fn is_admin_owned(path: &Path) -> Option<bool> {
 /// A per-user install (`PUNKTFUNK_CONFIG_DIR` into a profile) legitimately owns its own
 /// secrets; only a *foreign* unprivileged owner is a plant.
 fn current_user_sid() -> Option<Vec<u8>> {
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::core::Owned;
+    use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Security::{
         GetLengthSid, GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER,
     };
@@ -245,44 +243,42 @@ fn current_user_sid() -> Option<Vec<u8>> {
 
     let mut token = HANDLE::default();
     // SAFETY: GetCurrentProcess returns a pseudo-handle needing no close; `token` is a live
-    // out-param, closed below on every path.
+    // out-param.
     unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.ok()?;
-    let sid = (|| {
-        let mut len = 0u32;
-        // Sizing call: fails with ERROR_INSUFFICIENT_BUFFER and sets `len`.
-        // SAFETY: the null buffer with len 0 is the documented sizing form.
-        unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut len) }.ok();
-        if len == 0 {
-            return None;
-        }
-        let mut buf = vec![0u8; len as usize];
-        // SAFETY: `buf` holds exactly the `len` bytes the sizing call asked for.
-        unsafe {
-            GetTokenInformation(
-                token,
-                TokenUser,
-                Some(buf.as_mut_ptr().cast()),
-                len,
-                &mut len,
-            )
-        }
-        .ok()?;
-        // SAFETY: on success `buf` starts with a TOKEN_USER whose Sid points inside it.
-        let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-        if sid.is_invalid() {
-            return None;
-        }
-        // SAFETY: `sid` is valid; GetLengthSid measures exactly the readable bytes, which
-        // live until `buf` drops at the end of this closure.
-        let n = unsafe { GetLengthSid(sid) } as usize;
-        // SAFETY: `n` bytes at `sid` are readable and copied out before `buf` drops.
-        Some(unsafe { std::slice::from_raw_parts(sid.0 as *const u8, n) }.to_vec())
-    })();
-    // SAFETY: `token` came from OpenProcessToken and is not used after this.
-    unsafe {
-        let _ = CloseHandle(token);
+    // SAFETY: the open succeeded, so `token` is a handle this frame alone owns.
+    let token = unsafe { Owned::new(token) };
+    let mut len = 0u32;
+    // Sizing call: fails with ERROR_INSUFFICIENT_BUFFER and sets `len`.
+    // SAFETY: the null buffer with len 0 is the documented sizing form.
+    unsafe { GetTokenInformation(*token, TokenUser, None, 0, &mut len) }.ok();
+    if len == 0 {
+        return None;
     }
-    sid
+    let mut buf = vec![0u8; len as usize];
+    // SAFETY: `buf` holds exactly the `len` bytes the sizing call asked for.
+    unsafe {
+        GetTokenInformation(
+            *token,
+            TokenUser,
+            Some(buf.as_mut_ptr().cast()),
+            len,
+            &mut len,
+        )
+    }
+    .ok()?;
+    // SAFETY: on success `buf` starts with a TOKEN_USER whose Sid points inside it. A
+    // `Vec<u8>` is only byte-aligned, so the struct is read unaligned.
+    let sid = unsafe { buf.as_ptr().cast::<TOKEN_USER>().read_unaligned() }
+        .User
+        .Sid;
+    if sid.is_invalid() {
+        return None;
+    }
+    // SAFETY: `sid` is valid; GetLengthSid measures exactly the readable bytes, which live
+    // until `buf` drops.
+    let n = unsafe { GetLengthSid(sid) } as usize;
+    // SAFETY: `n` bytes at `sid` are readable and copied out before `buf` drops.
+    Some(unsafe { std::slice::from_raw_parts(sid.0 as *const u8, n) }.to_vec())
 }
 
 /// True when `path`'s owner is the account this process runs as.

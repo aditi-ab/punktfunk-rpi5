@@ -126,6 +126,8 @@ final class SessionModel: ObservableObject {
     #if os(macOS)
     /// Every window's live connection: a Cmd+Q runs no window's teardown.
     private static var liveConnections: [ObjectIdentifier: PunktfunkConnection] = [:]
+    /// Teardowns still running off-main. Closing the last window quits the app under them.
+    private static let closing = DispatchGroup()
 
     /// App quit: end each live session as a deliberate quit, before the process goes.
     static func quitAll() {
@@ -134,6 +136,8 @@ final class SessionModel: ObservableObject {
             conn.close()
         }
         liveConnections.removeAll()
+        // A close waits out plane polls of 100–200 ms. 3 s bounds a wedged one.
+        _ = closing.wait(timeout: .now() + 3)
     }
     #endif
     /// The launched title whose game is not up yet: its cover flies out of the shelf tile at the
@@ -900,10 +904,17 @@ final class SessionModel: ObservableObject {
         #endif
         clipboardEnabled = false
         if let conn = connection {
+            #if os(macOS)
+            let closing = Self.closing
+            closing.enter()
+            #endif
             // Drain-thread teardown waits the pullers out and close() waits out in-flight
             // polls + joins the Rust worker threads — keep all of it off the main actor,
             // in this order (no poll left on any plane when the handle is freed).
             Task.detached {
+                #if os(macOS)
+                defer { closing.leave() }
+                #endif
                 audio?.stop()
                 feedback?.stop()
                 #if !os(tvOS)

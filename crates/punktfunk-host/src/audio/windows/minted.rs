@@ -621,18 +621,7 @@ fn stamp_identity(endpoint_id: &str, identity: &'static AudioIdentity, role: Rol
 /// Finds the devnode carrying this identity's exact role and optional seat marker pair.
 fn find_role_devnode(identity: &AudioIdentity, role: Role) -> Result<Option<String>> {
     let set = da::media_class_devs()?;
-    for i in 0.. {
-        let mut did = da::devinfo_data();
-        // SAFETY: live set; `did` is a live out-param with cbSize set.
-        if unsafe {
-            windows::Win32::Devices::DeviceAndDriverInstallation::SetupDiEnumDeviceInfo(
-                set.0, i, &mut did,
-            )
-        }
-        .is_err()
-        {
-            break;
-        }
+    for did in set.iter() {
         if markers_match(
             identity,
             role,
@@ -650,16 +639,9 @@ fn find_role_devnode(identity: &AudioIdentity, role: Role) -> Result<Option<Stri
 /// Recovers a console `ROOT\MEDIA\NNNN` with this hwid and no ownership marker.
 /// Steam's own nodes use another instance prefix; any marked Punktfunk family stays untouched.
 fn adopt_console_orphan_devnode(role: Role, hwid: &str) -> Result<Option<String>> {
-    use windows::Win32::Devices::DeviceAndDriverInstallation::{
-        SetupDiEnumDeviceInfo, SPDRP_HARDWAREID,
-    };
+    use windows::Win32::Devices::DeviceAndDriverInstallation::SPDRP_HARDWAREID;
     let set = da::media_class_devs()?;
-    for i in 0.. {
-        let mut did = da::devinfo_data();
-        // SAFETY: live set; `did` is a live out-param with cbSize set.
-        if unsafe { SetupDiEnumDeviceInfo(set.0, i, &mut did) }.is_err() {
-            break; // ERROR_NO_MORE_ITEMS
-        }
+    for mut did in set.iter() {
         let Some(inst) = da::instance_id(&set, &did) else {
             continue;
         };
@@ -693,9 +675,7 @@ fn adopt_console_orphan_devnode(role: Role, hwid: &str) -> Result<Option<String>
 
 /// Hardware id + INF for one Steam streaming driver: prefer an installed `oemNN.inf` Windows already trusts, else Steam's driver directory.
 pub(crate) fn discover_driver(needle: &str, inf_name: &str) -> Result<(String, String)> {
-    use windows::Win32::Devices::DeviceAndDriverInstallation::{
-        SetupDiEnumDeviceInfo, SPDRP_HARDWAREID,
-    };
+    use windows::Win32::Devices::DeviceAndDriverInstallation::SPDRP_HARDWAREID;
     let steam_dir_inf = || -> Option<String> {
         let w = super::wasapi_mic::steam_driver_inf_path(inf_name)?;
         let s = String::from_utf16_lossy(&w)
@@ -704,12 +684,7 @@ pub(crate) fn discover_driver(needle: &str, inf_name: &str) -> Result<(String, S
         std::path::Path::new(&s).exists().then_some(s)
     };
     let set = da::media_class_devs()?;
-    for i in 0.. {
-        let mut did = da::devinfo_data();
-        // SAFETY: live set; `did` is a live out-param with cbSize set.
-        if unsafe { SetupDiEnumDeviceInfo(set.0, i, &mut did) }.is_err() {
-            break;
-        }
+    for did in set.iter() {
         let Some(hwid) = da::devnode_multi_sz_prop(&set, &did, SPDRP_HARDWAREID)
             .into_iter()
             .find(|h| h.to_lowercase().contains(needle))

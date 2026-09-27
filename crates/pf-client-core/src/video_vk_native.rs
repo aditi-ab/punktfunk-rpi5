@@ -580,8 +580,12 @@ impl NativeVulkanDecoder {
                 // Shape with no pf-vkdecode picture format (4:2:2, 12-bit) needs no driver.
                 let wanted = picture_format("HEVC", stream)?;
                 // SAFETY: the handle contract stated directly above.
-                let d = unsafe { VkH265Decoder::new(&handles, lock) }
+                let mut d = unsafe { VkH265Decoder::new(&handles, lock) }
                     .map_err(|e| anyhow!("VkH265Decoder init: {e}"))?;
+                // A host may cut a second slice whatever the caps asked for.
+                if !crate::video::multi_slice_decodable(Some(vk.vendor_id)) {
+                    d.refuse_multi_slice();
+                }
                 // Does this driver advertise that format for this profile? Same query
                 // `ensure_state` would run at the first AU — only the timing differs.
                 let depth = stream

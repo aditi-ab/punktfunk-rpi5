@@ -21,8 +21,8 @@
 
 use super::audio_control;
 use super::devnode_api::{
-    bind_driver, create_media_devnode, devinfo_data, devnode_inf_path, devnode_multi_sz_prop,
-    instance_id, media_class_devs, pv_blob, pv_bytes, pv_clsid, pv_guid, pv_lpwstr, pv_string,
+    bind_driver, create_media_devnode, devnode_inf_path, devnode_multi_sz_prop, instance_id,
+    media_class_devs, pv_blob, pv_bytes, pv_clsid, pv_guid, pv_lpwstr, pv_string,
     read_devparam_dword, wide, write_devparam_dword, DevInfoSet,
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -30,17 +30,14 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
-use windows::core::{GUID, HSTRING, PCWSTR, PWSTR};
-use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    SetupDiEnumDeviceInfo, SPDRP_HARDWAREID, SP_DEVINFO_DATA,
-};
+use windows::core::{Owned, GUID, HSTRING, PCWSTR, PWSTR};
+use windows::Win32::Devices::DeviceAndDriverInstallation::{SPDRP_HARDWAREID, SP_DEVINFO_DATA};
 use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::Media::Audio::{
     IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
 };
-use windows::Win32::System::Com::StructuredStorage::PropVariantClear;
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL, STGM_READ, STGM_READWRITE};
-use windows::Win32::System::Registry::{RegCloseKey, KEY_QUERY_VALUE, KEY_SET_VALUE};
+use windows::Win32::System::Registry::{KEY_QUERY_VALUE, KEY_SET_VALUE};
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 
 /// Data1 of the per-pad container GUID. Must equal pf-inject's `container_tag`
@@ -296,7 +293,7 @@ pub(crate) fn endpoint_guid_part(endpoint_id: &str) -> Result<&str> {
 // `windows 0.62` Drop for PROPVARIANT is PropVariantClear. These variants
 // borrow Rust-owned memory (Vec<u16>, &GUID, &'static [u8]); a drop would
 // CoTaskMemFree it. ManuallyDrop: never clear borrows. GetValue-owned
-// variants ARE cleared, in `stamp_served`.
+// variants clear on drop.
 
 fn devnode_pad_index(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<u32> {
     read_devparam_dword(set, did, PAD_INDEX_VALUE)
@@ -305,12 +302,7 @@ fn devnode_pad_index(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<u32> {
 /// Find the devnode for `pad_index`. DeviceDesc only survives until the INF installs.
 fn find_devnode(pad_index: u8) -> Result<Option<String>> {
     let set = media_class_devs()?;
-    for i in 0.. {
-        let mut did = devinfo_data();
-        // SAFETY: live set; `did` is a live out-param with cbSize set.
-        if unsafe { SetupDiEnumDeviceInfo(set.0, i, &mut did) }.is_err() {
-            break; // ERROR_NO_MORE_ITEMS
-        }
+    for did in set.iter() {
         let Some(inst) = instance_id(&set, &did) else {
             continue;
         };
@@ -340,12 +332,7 @@ fn write_pad_index(set: &DevInfoSet, did: &mut SP_DEVINFO_DATA, pad_index: u8) -
 /// back to Steam's driver directory when none exists yet.
 fn resolve_sss_inf() -> Result<String> {
     let set = media_class_devs()?;
-    for i in 0.. {
-        let mut did = devinfo_data();
-        // SAFETY: live set; `did` is a live out-param with cbSize set.
-        if unsafe { SetupDiEnumDeviceInfo(set.0, i, &mut did) }.is_err() {
-            break;
-        }
+    for did in set.iter() {
         if !devnode_multi_sz_prop(&set, &did, SPDRP_HARDWAREID)
             .iter()
             .any(|h| h.eq_ignore_ascii_case(SSS_HWID))
@@ -485,21 +472,16 @@ pub(super) fn probe_activation(endpoint_id: &str) {
 }
 
 fn stamp_served(store: &IPropertyStore, s: &Stamp) -> bool {
-    // SAFETY: the key is a valid PROPERTYKEY; GetValue returns an owned variant that is
-    // cleared below, exactly once.
-    let Ok(mut pv) = (unsafe { store.GetValue(&s.key) }) else {
+    // SAFETY: the key is a valid PROPERTYKEY; GetValue returns an owned variant that clears
+    // on drop.
+    let Ok(pv) = (unsafe { store.GetValue(&s.key) }) else {
         return false;
     };
-    let matches = match &s.value {
+    match &s.value {
         StampValue::Str(v) => pv_string(&pv).is_some_and(|got| got == *v),
         StampValue::Container(g) => pv_guid(&pv) == Some(*g),
         StampValue::Format(wfx) => pv_bytes(&pv).is_some_and(|got| got == wfx[..]),
-    };
-    // SAFETY: `pv` owns store-allocated memory; cleared exactly once, then dropped inert.
-    unsafe {
-        let _ = PropVariantClear(&mut pv);
     }
-    matches
 }
 
 fn set_store_value(store: &IPropertyStore, s: &Stamp) -> Result<()> {
@@ -593,7 +575,7 @@ pub(crate) fn write_stamps(endpoint_id: &str, stamps: &[Stamp]) -> Result<()> {
 /// back. Resolve principals by SID, never by name — localized Windows
 /// fails account-name lookups. Works as SYSTEM; a dev run fails here.
 fn grant_system_full_control(subkey_path: &str) -> Result<()> {
-    use windows::Win32::Foundation::{LocalFree, HANDLE, HLOCAL};
+    use windows::Win32::Foundation::{HANDLE, HLOCAL};
     use windows::Win32::Security::Authorization::{
         GetSecurityInfo, SetEntriesInAclW, SetSecurityInfo, EXPLICIT_ACCESS_W, GRANT_ACCESS,
         NO_MULTIPLE_TRUSTEE, SE_REGISTRY_KEY, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
@@ -625,10 +607,11 @@ fn grant_system_full_control(subkey_path: &str) -> Result<()> {
         format!("open {subkey_path} for WRITE_DAC (owner-implicit right — requires SYSTEM)")
     })?;
     let handle = HANDLE(hkey.0);
+    // SAFETY: the open succeeded, so `hkey` is a key this frame alone owns; `Owned` closes it.
+    let _hkey = unsafe { Owned::new(hkey) };
     let mut old_dacl: *mut ACL = std::ptr::null_mut();
     let mut sd = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: live handle; out-params are live locals; the returned descriptor is LocalFree'd
-    // below.
+    // SAFETY: live handle; out-params are live locals.
     let gs = unsafe {
         GetSecurityInfo(
             handle,
@@ -641,71 +624,62 @@ fn grant_system_full_control(subkey_path: &str) -> Result<()> {
             Some(&mut sd),
         )
     };
-    let result = (|| -> Result<()> {
-        gs.ok().context("GetSecurityInfo(DACL)")?;
-        let mut sid = [0u8; SECURITY_MAX_SID_SIZE as usize];
-        let mut cb = sid.len() as u32;
-        // SAFETY: the buffer is SECURITY_MAX_SID_SIZE, the documented maximum SID size.
-        unsafe {
-            CreateWellKnownSid(
-                WinLocalSystemSid,
-                None,
-                Some(PSID(sid.as_mut_ptr().cast())),
-                &mut cb,
-            )
-        }
-        .context("CreateWellKnownSid(S-1-5-18)")?;
-        let ea = EXPLICIT_ACCESS_W {
-            grfAccessPermissions: KEY_ALL_ACCESS.0,
-            grfAccessMode: GRANT_ACCESS,
-            grfInheritance: CONTAINER_INHERIT_ACE,
-            Trustee: TRUSTEE_W {
-                pMultipleTrustee: std::ptr::null_mut(),
-                MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
-                TrusteeForm: TRUSTEE_IS_SID,
-                TrusteeType: TRUSTEE_IS_USER,
-                ptstrName: PWSTR(sid.as_mut_ptr().cast()),
-            },
-        };
-        let mut new_dacl: *mut ACL = std::ptr::null_mut();
-        // SAFETY: one live entry whose SID buffer outlives the call; old_dacl is the (possibly
-        // null) DACL GetSecurityInfo returned, still owned by `sd`.
-        unsafe {
-            SetEntriesInAclW(
-                Some(&[ea]),
-                (!old_dacl.is_null()).then_some(old_dacl as *const ACL),
-                &mut new_dacl,
-            )
-        }
-        .ok()
-        .context("SetEntriesInAclW")?;
-        // SAFETY: new_dacl is the ACL SetEntriesInAclW just allocated; freed right after.
-        let ss = unsafe {
-            SetSecurityInfo(
-                handle,
-                SE_REGISTRY_KEY,
-                DACL_SECURITY_INFORMATION,
-                None,
-                None,
-                Some(new_dacl),
-                None,
-            )
-        };
-        // SAFETY: LocalFree of the SetEntriesInAclW allocation, exactly once.
-        unsafe {
-            let _ = LocalFree(Some(HLOCAL(new_dacl.cast())));
-        }
-        ss.ok().context("SetSecurityInfo(DACL)")
-    })();
-    // SAFETY: free the descriptor GetSecurityInfo allocated (skipped when null) and close the
-    // key opened above, each exactly once.
+    // SAFETY: `sd` is null or the LocalAlloc'd descriptor just returned, which `old_dacl` points
+    // into; `Owned` frees it once, after the last use of either.
+    let _sd = unsafe { Owned::new(HLOCAL(sd.0)) };
+    gs.ok().context("GetSecurityInfo(DACL)")?;
+    let mut sid = [0u8; SECURITY_MAX_SID_SIZE as usize];
+    let mut cb = sid.len() as u32;
+    // SAFETY: the buffer is SECURITY_MAX_SID_SIZE, the documented maximum SID size.
     unsafe {
-        if !sd.0.is_null() {
-            let _ = LocalFree(Some(HLOCAL(sd.0)));
-        }
-        let _ = RegCloseKey(hkey);
+        CreateWellKnownSid(
+            WinLocalSystemSid,
+            None,
+            Some(PSID(sid.as_mut_ptr().cast())),
+            &mut cb,
+        )
     }
-    result
+    .context("CreateWellKnownSid(S-1-5-18)")?;
+    let ea = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: KEY_ALL_ACCESS.0,
+        grfAccessMode: GRANT_ACCESS,
+        grfInheritance: CONTAINER_INHERIT_ACE,
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_USER,
+            ptstrName: PWSTR(sid.as_mut_ptr().cast()),
+        },
+    };
+    let mut new_dacl: *mut ACL = std::ptr::null_mut();
+    // SAFETY: one live entry whose SID buffer outlives the call; old_dacl is the (possibly
+    // null) DACL GetSecurityInfo returned, still owned by `sd`.
+    unsafe {
+        SetEntriesInAclW(
+            Some(&[ea]),
+            (!old_dacl.is_null()).then_some(old_dacl as *const ACL),
+            &mut new_dacl,
+        )
+    }
+    .ok()
+    .context("SetEntriesInAclW")?;
+    // SAFETY: `new_dacl` is the ACL SetEntriesInAclW just allocated; `Owned` frees it once.
+    let _new_dacl = unsafe { Owned::new(HLOCAL(new_dacl.cast())) };
+    // SAFETY: live handle; `new_dacl` stays allocated for the call.
+    unsafe {
+        SetSecurityInfo(
+            handle,
+            SE_REGISTRY_KEY,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(new_dacl),
+            None,
+        )
+    }
+    .ok()
+    .context("SetSecurityInfo(DACL)")
 }
 
 /// MMDevices hive from the id (`{0.0.1.…}` = capture, else render). Render is
@@ -762,15 +736,10 @@ pub(crate) fn served_blob(endpoint_id: &str, key: &PROPERTYKEY) -> Option<Vec<u8
     let dev = open_mmdevice(endpoint_id).ok()?;
     // SAFETY: read-only property store on a COM-initialized thread.
     let store = unsafe { dev.OpenPropertyStore(STGM_READ) }.ok()?;
-    // SAFETY: the key is a valid PROPERTYKEY; GetValue returns an owned variant that is
-    // cleared below, exactly once.
-    let mut pv = unsafe { store.GetValue(key) }.ok()?;
-    let out = pv_bytes(&pv);
-    // SAFETY: `pv` owns store-allocated memory; cleared exactly once, then dropped inert.
-    unsafe {
-        let _ = PropVariantClear(&mut pv);
-    }
-    out
+    // SAFETY: the key is a valid PROPERTYKEY; GetValue returns an owned variant that clears
+    // on drop.
+    let pv = unsafe { store.GetValue(key) }.ok()?;
+    pv_bytes(&pv)
 }
 
 /// Idempotent pad-audio provision for one slot: reuse or create the devnode,

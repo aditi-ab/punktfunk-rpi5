@@ -186,7 +186,7 @@ crates/punktfunk-host/src/identity.rs:3
 crates/punktfunk-host/src/library/art.rs:2
 crates/punktfunk-host/src/main.rs:1
 crates/punktfunk-host/src/mgmt/tests.rs:3
-crates/punktfunk-host/src/native.rs:4
+crates/punktfunk-host/src/native.rs:2
 crates/punktfunk-host/src/windows/service/host_env.rs:1
 packaging/windows/drivers/pf-vdisplay/src/encode/thread.rs:1
 BASELINE

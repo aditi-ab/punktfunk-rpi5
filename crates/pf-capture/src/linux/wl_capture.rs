@@ -668,21 +668,17 @@ fn run(
                     Err(e) => bail!("GPU import of the captured dmabuf failed: {e:#}"),
                 }
             } else {
-                // SAFETY: `bo.fd` is the pool's live dmabuf fd; `F_DUPFD_CLOEXEC` reads
-                // only the integer and returns an independent CLOEXEC duplicate (or -1,
-                // checked). The dup is what the frame owns and closes; the pool keeps its own.
-                let dup = unsafe { libc::fcntl(bo.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-                if dup < 0 {
-                    bail!("F_DUPFD_CLOEXEC on the capture dmabuf failed — raise the host's NOFILE");
-                }
+                // The frame owns and closes the dup; the pool keeps its own fd.
+                let fd = bo
+                    .fd
+                    .try_clone()
+                    .context("dup the capture dmabuf (raise the host's NOFILE)")?;
                 let hold: pf_frame::FrameHold = Arc::new(BufHold {
                     list: free.clone(),
                     idx,
                 });
                 FramePayload::Dmabuf(DmabufFrame {
-                    // SAFETY: `dup` is the fresh fd just checked `>= 0`; nothing else owns
-                    // it, so `OwnedFd` closes it exactly once.
-                    fd: unsafe { std::os::fd::FromRawFd::from_raw_fd(dup) },
+                    fd,
                     fourcc,
                     modifier,
                     offset: bo.offset,

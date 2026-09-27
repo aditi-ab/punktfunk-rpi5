@@ -12,7 +12,7 @@ use super::dxgi::WinCaptureTarget;
 use super::{CapturedFrame, Capturer, FramePayload, PixelFormat};
 use crate::cursor_witness::CursorWitness;
 use anyhow::{bail, Context, Result};
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -83,6 +83,11 @@ struct MappedSection {
     view: MEMORY_MAPPED_VIEW_ADDRESS,
 }
 
+// SAFETY: `!Send` only through the view pointer. The mapping is process-wide, so its one
+// owner may use, unmap and close it from any thread; the driver's concurrent writes arrive
+// through the section's atomics. Not `Sync`.
+unsafe impl Send for MappedSection {}
+
 impl MappedSection {
     /// View base; valid only while this section lives.
     fn ptr<T>(&self) -> *mut T {
@@ -105,18 +110,15 @@ impl Drop for MappedSection {
 /// Path only — not our UMDF host, and not authorization. Callers judge
 /// sufficiency (`design/idd-push-security.md`). A token/session check
 /// false-negatives: genuine host and spawned copy are both session 0
-/// LocalService.
-///
-/// # Safety
-/// `process` must carry `PROCESS_QUERY_LIMITED_INFORMATION`.
-pub unsafe fn verify_is_wudfhost(process: HANDLE, wudf_pid: u32, what: &str) -> Result<()> {
+/// LocalService. A `process` without `PROCESS_QUERY_LIMITED_INFORMATION` fails the query.
+pub fn verify_is_wudfhost(process: BorrowedHandle<'_>, wudf_pid: u32, what: &str) -> Result<()> {
     let mut buf = [0u16; 512];
     let mut len = buf.len() as u32;
-    // SAFETY: `process` carries QUERY_LIMITED; `buf`/`len` are a valid out-buffer.
+    // SAFETY: `process` is a live borrowed handle; `buf`/`len` are a valid out-buffer.
     // On success `len` is the UTF-16 unit count written (no NUL).
     unsafe {
         QueryFullProcessImageNameW(
-            process,
+            HANDLE(process.as_raw_handle()),
             PROCESS_NAME_WIN32,
             PWSTR(buf.as_mut_ptr()),
             &mut len,
@@ -149,19 +151,18 @@ pub fn open_wudfhost(pid: u32, what: &str) -> Result<OwnedHandle> {
         bail!("no WUDFHost pid for the {what} sections");
     }
     // SAFETY: `pid` is a copy. The handle (`?`-checked) is owned solely here and moved into
-    // `OwnedHandle` (single owner, closes on drop); `verify_is_wudfhost` borrows it for the
-    // synchronous check and forms no lasting alias.
-    unsafe {
+    // `OwnedHandle` (single owner, closes on drop).
+    let process = unsafe {
         let h = OpenProcess(
             PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
             false,
             pid,
         )
         .with_context(|| format!("OpenProcess(PROCESS_DUP_HANDLE) on the {what} pid"))?;
-        let process = OwnedHandle::from_raw_handle(h.0 as _);
-        verify_is_wudfhost(HANDLE(process.as_raw_handle()), pid, what)?;
-        Ok(process)
-    }
+        OwnedHandle::from_raw_handle(h.0 as _)
+    };
+    verify_is_wudfhost(process.as_handle(), pid, what)?;
+    Ok(process)
 }
 
 // The frame-delivery endpoint: `try_consume` and the `Capturer` surface.
@@ -325,10 +326,6 @@ pub struct IddPushCapturer {
     _display_wake: Option<pf_frame::session_tuning::DisplayWakeRequest>,
     _keepalive: Box<dyn Send>,
 }
-// SAFETY: `!Send` only through the cursor section's mapped-view pointer. Created, used and
-// dropped on the capture thread, and the driver's writes into that section arrive through its
-// own seqlock. `Send` moves ownership with no concurrent access; we do not claim `Sync`.
-unsafe impl Send for IddPushCapturer {}
 
 #[cfg(test)]
 mod tests {

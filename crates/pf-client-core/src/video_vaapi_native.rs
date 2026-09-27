@@ -18,7 +18,7 @@
 //! `PUNKTFUNK_DECODER=native-vaapi`. Evidence: `video::native_evidence` and the
 //! ignored tests in this file.
 
-use std::os::fd::AsRawFd as _;
+use std::os::fd::AsFd as _;
 use std::os::fd::FromRawFd as _;
 use std::os::fd::OwnedFd;
 use std::os::raw::c_int;
@@ -1399,7 +1399,7 @@ fn export(
     }
     let mut sync_fds = Vec::with_capacity(fds.len());
     for fd in &fds {
-        match pf_zerocopy::dmabuf_fence::export_sync_file(fd.as_raw_fd()) {
+        match pf_zerocopy::dmabuf_fence::export_sync_file(fd.as_fd()) {
             Ok(Some(sync)) => sync_fds.push(sync),
             Ok(None) => {}
             Err(e) => {
@@ -2260,7 +2260,7 @@ mod tests {
                     None => fence_outcomes[0] += 1,
                     Some(fd) => {
                         let w = std::time::Instant::now();
-                        let slot = match wait_sync_file(fd.as_raw_fd(), 100) {
+                        let slot = match wait_sync_file(fd.as_fd(), 100) {
                             Ok(WaitOutcome::Signaled) => 1,
                             Ok(WaitOutcome::NoFence) => 2,
                             _ => 3,

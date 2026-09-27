@@ -158,3 +158,38 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleAvai
 ) -> jni::sys::jboolean {
     cfg!(target_os = "android")
 }
+
+/// The symbol `name` in the `dlopen` handle `lib`, as the fn-pointer type `F`; `None` when absent.
+///
+/// # Safety
+/// `lib` is a live `dlopen` handle, and `F` is the `extern "C" fn` type of the symbol's C
+/// signature. The size assert only rules out a non-pointer `F`.
+#[cfg(target_os = "android")]
+pub(crate) unsafe fn sym<F: Copy>(lib: *mut std::ffi::c_void, name: &std::ffi::CStr) -> Option<F> {
+    const { assert!(size_of::<F>() == size_of::<*mut std::ffi::c_void>()) };
+    // SAFETY: `lib` is live (caller) and `name` is NUL-terminated.
+    let p = unsafe { libc::dlsym(lib, name.as_ptr()) };
+    // SAFETY: a non-null symbol is a code address, and `F` is a pointer-sized fn type matching
+    // its signature (caller).
+    (!p.is_null()).then(|| unsafe { std::mem::transmute_copy::<*mut std::ffi::c_void, F>(&p) })
+}
+
+/// The `ANativeWindow` behind a Java `Surface`, holding its own reference; `None` when the
+/// Surface has no window.
+///
+/// # Safety
+/// `surface` is a non-null `android.view.Surface`.
+#[cfg(target_os = "android")]
+pub(crate) unsafe fn window_from_surface(
+    env: &jni::Env<'_>,
+    surface: &JObject<'_>,
+) -> Option<ndk::native_window::NativeWindow> {
+    // SAFETY: `env` is this thread's live JNIEnv and `surface` a live Surface reference (caller).
+    // The casts bridge the jni-sys 0.4 (`jni`) / 0.3 (vendored `ndk`) pointer types.
+    unsafe {
+        ndk::native_window::NativeWindow::from_surface(
+            env.get_raw() as *mut _,
+            surface.as_raw() as *mut _,
+        )
+    }
+}

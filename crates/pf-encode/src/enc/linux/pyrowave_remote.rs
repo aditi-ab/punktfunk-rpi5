@@ -289,7 +289,7 @@ impl Link {
 
 /// Dmabuf identity across frames: its inode, the key the zerocopy importer uses too.
 fn dmabuf_key(fd: BorrowedFd) -> io::Result<u64> {
-    ipc::dmabuf_inode(fd).map(|(_, ino)| ino)
+    Ok(pf_zerocopy::fd_identity(fd)?.1)
 }
 
 #[derive(Debug)]
