@@ -344,7 +344,9 @@ pub struct Presenter {
     /// `flip` diagnostic: when it started; the lane owns even periods, the swapchain odd.
     #[cfg(target_os = "linux")]
     native_flip: Option<std::time::Instant>,
-    /// An overlay is up that the lane cannot show: frames go through the swapchain.
+    /// An overlay is up that the lane cannot show: frames go through the swapchain. Only the
+    /// Linux lane reads it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     overlay_blocks_native: bool,
     /// The last frame shown went through the native lane, not the swapchain.
     native_last: bool,
