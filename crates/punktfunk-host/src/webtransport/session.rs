@@ -580,4 +580,22 @@ mod tests {
         assert_eq!(said.code, why.close_code());
         assert_eq!(said.reason, why.to_string());
     }
+
+    /// A browser's close code reaches the session: `QUIT_CLOSE_CODE` is how a player ends the
+    /// title rather than leaving it running.
+    #[tokio::test]
+    async fn a_browser_link_reports_the_close_code() {
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let s = serving(store("closed"));
+        let fp_hex = hex::encode(sha256(&key.subject_public_key_info()));
+        s.plane.pairing.add("Enrico's browser", &fp_hex).unwrap();
+        let (browser, admitted) = admit_over_loopback(&s, &key, b"hello").await;
+        let quit = punktfunk_core::quic::QUIT_CLOSE_CODE;
+        browser.close(wtransport::VarInt::from_u32(quit), b"");
+        let closed =
+            tokio::time::timeout(std::time::Duration::from_secs(5), admitted.link.closed())
+                .await
+                .expect("the close reaches the host");
+        assert!(closed.closed_with(quit), "{closed}");
+    }
 }
