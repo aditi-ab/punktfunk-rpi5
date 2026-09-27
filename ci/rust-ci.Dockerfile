@@ -27,25 +27,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # dlopens the loader), so neither the build nor deb.yml's dpkg-shlibdeps ever asks for it.
     && rm -rf /var/lib/apt/lists/*
 
-# bun — builds the punktfunk-web console in deb.yml (which runs the web build in THIS image).
-# ci.yml's web/docs jobs use the oven/bun image instead, so this is only for the deb job.
-#
-# A PINNED release asset, checked by SHA-256 — never `curl https://bun.sh/install | bash`.
-# build-web-deb.sh VENDORS this very binary into the punktfunk-web .deb, so the installer would be
-# upstream code choosing bytes a signing job then publishes. ONE bun across the repo: same version,
-# asset and sum as deb.yml and rpm.yml — bump BUN_VERSION and BUN_SHA together (the sums are in the
-# release's SHASUMS256.txt). `-baseline` on purpose: it needs no AVX2, so the bun we ship starts on
-# every x86-64 box — something the auto-detecting installer never promised, since it reads the
-# BUILDER's CPU, not the user's.
-ARG BUN_VERSION=1.4.2
-ARG BUN_SHA=c678040f14fe0440eb839d37cbd0ce4c051a32da72806ac97de6a6aab6bf728f
-RUN curl -fsSL -o /tmp/bun.zip \
-      "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64-baseline.zip" \
-    && echo "${BUN_SHA}  /tmp/bun.zip" | sha256sum -c - \
-    && unzip -q -o -j /tmp/bun.zip '*/bun' -d /tmp \
-    && install -m0755 /tmp/bun /usr/local/bin/bun \
-    && rm -f /tmp/bun.zip /tmp/bun \
-    && bun --version
+# bun — builds the punktfunk-web console in deb.yml, which vendors it into punktfunk-bun.
+# ci.yml's web/docs jobs use the oven/bun image instead. The pin lives in ci/bun.env.
+COPY bun.env install-bun.sh /tmp/
+RUN sh /tmp/install-bun.sh && rm /tmp/bun.env /tmp/install-bun.sh
 
 # libcuda link stub: the NVIDIA userspace library (no kernel module needed) provides
 # every cuXxx symbol. On 26.04 the package already ships the libcuda.so dev symlink;

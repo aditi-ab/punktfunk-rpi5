@@ -99,6 +99,8 @@ on:
       - 'scripts/ci/gitea-release.sh'
       - 'scripts/ci/pf-version.sh'
       - 'scripts/ci/retry.sh'
+      - 'ci/bun.env'
+      - 'ci/install-bun.sh'
       - '.gitea/workflows/arch.yml'
     # Single project version: a `vX.Y.Z` tag is THE release. main publishes to the
     # `punktfunk-canary` pacman repo as X.Y.Z-0.<run#> (sorts below the eventual X.Y.Z-1),
@@ -171,17 +173,6 @@ jobs:
             git nodejs rust clang cmake ninja nasm pkgconf python vulkan-headers \
             gtk4 libadwaita sdl3 pipewire wayland libxkbcommon opus libei \
             mesa libglvnd unzip libarchive || echo "::warning::pacman guard failed (stale image db?) — proceeding with baked packages"
-          # The PKGBUILD vendors this bun, so it is the pinned asset from arch-ci.Dockerfile, fetched
-          # here when the image's bun is missing or another version (bootstrap lag). Never [extra]'s
-          # rolling bun and never bun.sh's installer. Bump with the Dockerfile's BUN_VERSION/BUN_SHA.
-          [ "$(bun --version 2>/dev/null)" = 1.4.2 ] || {
-            curl -fsSL -o /tmp/bun.zip \
-              "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64-baseline.zip"
-            echo "c678040f14fe0440eb839d37cbd0ce4c051a32da72806ac97de6a6aab6bf728f  /tmp/bun.zip" | sha256sum -c -
-            unzip -q -o -j /tmp/bun.zip '*/bun' -d /tmp
-            install -m0755 /tmp/bun /usr/local/bin/bun
-          }
-          bun --version
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -189,6 +180,13 @@ jobs:
           # way it can carry inputs the tag predates) and its SOURCE from the tag. Empty string
           # = checkout's own default, i.e. the triggering ref, for every other trigger.
           ref: ${{ github.event.inputs.release_tag }}
+
+      # The PKGBUILD vendors this bun, so it is the pin in ci/bun.env, never [extra]'s rolling bun.
+      # Baked into arch-ci; the script heals an image that lags the pin. A rebuilt tag older than
+      # the script runs on the image's bun.
+      - name: Pinned bun (no-op once the image bakes it)
+        run: |
+          if [ -f ci/install-bun.sh ]; then sh ci/install-bun.sh; else bun --version; fi
 
       # Cache cargo's git dir too, not just the registry: the workspace includes
       # clients/windows, whose windows-reactor/windows deps are git-pinned — cargo must CLONE

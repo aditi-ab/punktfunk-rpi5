@@ -15,7 +15,7 @@ cd "$ROOTDIR"
 
 # Map deb arch → bun's release arch tag.
 DEB_ARCH="${DEB_ARCH:-$(dpkg --print-architecture)}"
-BUN_VERSION="${BUN_VERSION:-1.4.2}"
+BUN_VERSION="${BUN_VERSION:-$(sed -n 's/^BUN_VERSION=//p' ci/bun.env)}"
 case "$DEB_ARCH" in
   amd64) BUN_ARCH=x64 ;;
   arm64) BUN_ARCH=aarch64 ;;

@@ -127,6 +127,8 @@ on:
       - 'scripts/ci/pf-version.sh'
       - 'scripts/ci/retry.sh'
       - 'ci/skia-binaries.sh'
+      - 'ci/bun.env'
+      - 'ci/install-bun.sh'
       - '.gitea/workflows/deb.yml'
     # Single project version: a `vX.Y.Z` tag is THE release for every platform (see
     # docs-site channels.md). The old version-shadow (a client tag shipping a host package
@@ -289,28 +291,10 @@ jobs:
         # (our Bun.serve TLS entry), so prove the build IS a bun bundle and serves /login.
         # No TLS env here, so the custom entry binds plain HTTP — the smoke curl stays simple.
         run: |
-          # bun builds AND runs the console. Baked into the rust-ci image; fetched here too when the
-          # image's bun is missing or another version (docker.yml bootstrap lag).
-          #
-          # A PINNED release asset, checked by SHA-256 — never `curl https://bun.sh/install | bash`.
-          # build-bun-deb.sh VENDORS this very binary into the punktfunk-bun .deb (BUN_BIN, below),
-          # so an install script piped into root's shell is upstream code choosing bytes we then
-          # publish under REGISTRY_TOKEN. Not in Debian/Ubuntu, so a pin is the only option here.
-          # ONE bun across the repo: same version and asset as rpm.yml, arch.yml, the CI images
-          # and the Nix overlay in flake.nix; windows-host.yml pins the same release. Bump them
-          # together (the sums are in the release's SHASUMS256.txt). `-baseline` on
-          # purpose: it needs no AVX2, so the bun we ship starts on every x86-64 box — something the
-          # auto-detecting installer never promised, since it reads the BUILDER's CPU, not the user's.
-          [ "$(bun --version 2>/dev/null)" = 1.4.2 ] || {
-            apt-get install -y --no-install-recommends unzip
-            BUN_VER=bun-v1.4.2
-            BUN_SHA=c678040f14fe0440eb839d37cbd0ce4c051a32da72806ac97de6a6aab6bf728f
-            curl -fsSL -o /tmp/bun.zip \
-              "https://github.com/oven-sh/bun/releases/download/$BUN_VER/bun-linux-x64-baseline.zip"
-            echo "$BUN_SHA  /tmp/bun.zip" | sha256sum -c -
-            unzip -q -o -j /tmp/bun.zip '*/bun' -d /tmp
-            install -m0755 /tmp/bun /usr/local/bin/bun
-          }
+          # bun builds AND runs the console, and build-bun-deb.sh vendors it into punktfunk-bun
+          # (BUN_BIN, below). Baked into the rust-ci image; the script heals an image that lags the
+          # pin in ci/bun.env (docker.yml bootstrap lag).
+          sh ci/install-bun.sh
           export PATH="$HOME/.bun/bin:$PATH"
           cd web
           # --ignore-scripts, like every other web install in CI (ci.yml, web-screenshots.yml,
