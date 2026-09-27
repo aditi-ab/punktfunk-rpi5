@@ -41,16 +41,20 @@ use crate::caps::query_caps;
 use crate::caps::DecodeCaps;
 use crate::caps::DecodeProfile;
 use crate::caps_av1::Av1ProfileKey;
-use crate::decoder::build_frame;
-use crate::decoder::settle_dpb_ids;
-use crate::decoder::wait_timeline;
+use crate::decoder::core::build_frame;
+use crate::decoder::core::build_scope;
+use crate::decoder::core::reset_slot_bindings;
+use crate::decoder::core::settle_dpb_ids;
+use crate::decoder::core::sync_slot_bindings;
+use crate::decoder::core::wait_timeline;
+use crate::decoder::core::OpRing;
+use crate::decoder::core::PendingPic;
+use crate::decoder::core::RecoveryLatch;
+use crate::decoder::core::RetiredPool;
+use crate::decoder::core::ScopeRef;
 use crate::decoder::DecodeStatus;
 use crate::decoder::DecodedVkFrame;
-use crate::decoder::OpRing;
-use crate::decoder::PendingPic;
-use crate::decoder::RetiredPool;
 use crate::decoder::VkDecodeError;
-use crate::decoder_h265::RecoveryLatch;
 use crate::device::DecodeDevice;
 use crate::device::DeviceHandles;
 use crate::device::QueueLock;
@@ -1378,47 +1382,6 @@ fn coded_extent(plan: &AuPlan) -> vk::Extent2D {
     }
 }
 
-/// Empty DPB residency, slot→picture, and cached ref info together. Leaving ref
-/// info would let [`build_scope_av1`] bind a slot the planner no longer knows.
-/// Returns the pool pictures the cleared bindings pinned.
-fn reset_slot_bindings(
-    slots: &mut SlotMap,
-    slot_image: &mut [Option<usize>],
-    slot_refs: &mut [Option<hh::StdVideoDecodeAV1ReferenceInfo>],
-) -> Vec<usize> {
-    // `held` borrows the map that `release` mutates.
-    for (_slot, id) in slots.held().collect::<Vec<_>>() {
-        slots.release(id);
-    }
-    let unbound = slot_image.iter_mut().filter_map(Option::take).collect();
-    for cached in slot_refs.iter_mut() {
-        *cached = None;
-    }
-    unbound
-}
-
-/// Coincide: unbind slots the ledger no longer holds, and the setup slot's
-/// previous image, before it binds fresh. Pictures stay pending/held on those
-/// flags ([`crate::images`]). A referenced slot must still bind after this.
-fn sync_slot_bindings(
-    slots: &SlotMap,
-    slot_image: &mut [Option<usize>],
-    setup_slot: u8,
-) -> Vec<usize> {
-    let mut held = vec![false; slot_image.len()];
-    for (slot, _id) in slots.held() {
-        held[usize::from(slot)] = true;
-    }
-    let setup = usize::from(setup_slot);
-    let mut unbound = Vec::new();
-    for (slot, binding) in slot_image.iter_mut().enumerate() {
-        if binding.is_some() && (!held[slot] || slot == setup) {
-            unbound.extend(binding.take());
-        }
-    }
-    unbound
-}
-
 fn slot_view(state: &SessionStateAv1, slot: u8) -> Option<vk::ImageView> {
     match &state.dpb {
         Some(dpb) => Some(dpb.dpb_view(slot)),
@@ -1426,43 +1389,22 @@ fn slot_view(state: &SessionStateAv1, slot: u8) -> Option<vk::ImageView> {
     }
 }
 
-/// One bound-slot entry. `-1` is the setup activation. No derived `Eq`: the Std
-/// bindgen struct has none; tests compare the fields that matter.
-#[derive(Debug, Clone, Copy)]
-struct ScopeEntryAv1 {
-    slot_index: i32,
-    view: vk::ImageView,
-    std: hh::StdVideoDecodeAV1ReferenceInfo,
+impl ScopeRef for VkRefAv1 {
+    type Std = hh::StdVideoDecodeAV1ReferenceInfo;
+    fn slot(&self) -> u8 {
+        self.slot
+    }
+    fn std(&self) -> Self::Std {
+        self.std
+    }
 }
 
-/// Bound-slot list: `refs` in order (decode-op prefix), other held slots, then
-/// setup as `-1`. Fail closed: a named slot with no image, or a name not in
-/// `refs` (every non-negative `referenceNameSlotIndices` entry must equal some
-/// `pReferenceSlots` `slotIndex`).
-#[allow(clippy::too_many_arguments)]
-fn build_scope_av1(
-    refs: &[VkRefAv1],
-    reference_name_slot_indices: &[i32],
-    held_slots: impl Iterator<Item = u8>,
-    setup_slot: u8,
-    setup_view: vk::ImageView,
-    setup_ref: hh::StdVideoDecodeAV1ReferenceInfo,
-    slot_refs: &[Option<hh::StdVideoDecodeAV1ReferenceInfo>],
-    view_of: impl Fn(u8) -> Option<vk::ImageView>,
-) -> Result<(Vec<ScopeEntryAv1>, usize), VkDecodeError> {
-    let mut scope: Vec<ScopeEntryAv1> = Vec::with_capacity(refs.len() + slot_refs.len() + 1);
-    for r in refs {
-        match view_of(r.slot) {
-            Some(view) => scope.push(ScopeEntryAv1 {
-                slot_index: i32::from(r.slot),
-                view,
-                std: r.std,
-            }),
-            None => return Err(VkDecodeError::UnboundReferenceSlot { slot: r.slot }),
-        }
-    }
-    let reference_count = scope.len();
-    for name in reference_name_slot_indices {
+/// Every non-negative `referenceNameSlotIndices` entry must equal some
+/// `pReferenceSlots` `slotIndex`, i.e. one of `refs`, or the driver reads a
+/// slot this op never bound. Runs after [`build_scope`], whose refs pass fails
+/// first on an unbound reference.
+fn check_reference_names(refs: &[VkRefAv1], names: &[i32]) -> Result<(), VkDecodeError> {
+    for name in names {
         if *name == REFERENCE_NAME_UNUSED {
             continue;
         }
@@ -1475,32 +1417,7 @@ fn build_scope_av1(
             return Err(VkDecodeError::UnboundReferenceSlot { slot });
         }
     }
-    for slot in held_slots {
-        if slot == setup_slot || refs.iter().any(|r| r.slot == slot) {
-            continue;
-        }
-        match (
-            slot_refs.get(usize::from(slot)).copied().flatten(),
-            view_of(slot),
-        ) {
-            (Some(std), Some(view)) => scope.push(ScopeEntryAv1 {
-                slot_index: i32::from(slot),
-                view,
-                std,
-            }),
-            // Every held slot was a setup slot once.
-            _ => trace!(
-                slot,
-                "held slot without reference info/binding — left unbound"
-            ),
-        }
-    }
-    scope.push(ScopeEntryAv1 {
-        slot_index: -1,
-        view: setup_view,
-        std: setup_ref,
-    });
-    Ok((scope, reference_count))
+    Ok(())
 }
 
 /// Record one AV1 decode op and submit under the queue lock. Image waits per the
@@ -1540,9 +1457,8 @@ unsafe fn record_and_submit_av1(
             .dpb_view(vk_plan.setup_slot)
     };
     let held_slots: Vec<u8> = state.slots.held().map(|(slot, _id)| slot).collect();
-    let (scope, reference_count) = build_scope_av1(
+    let (scope, reference_count) = build_scope(
         &vk_plan.refs,
-        &vk_plan.reference_name_slot_indices,
         held_slots.into_iter(),
         vk_plan.setup_slot,
         setup_view,
@@ -1550,6 +1466,7 @@ unsafe fn record_and_submit_av1(
         &state.slot_refs,
         |slot| slot_view(state, slot),
     )?;
+    check_reference_names(&vk_plan.refs, &vk_plan.reference_name_slot_indices)?;
 
     let begin_info =
         vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -1656,7 +1573,7 @@ unsafe fn record_and_submit_av1(
         *slot_info = (*slot_info).push_next(dpb_info);
     }
     // Decode-op prefix: this frame's refs in plan order. Names are DPB slots,
-    // not list indices; every named slot is in this prefix (`build_scope_av1`).
+    // not list indices; every named slot is in this prefix (`check_reference_names`).
     let decode_refs: Vec<vk::VideoReferenceSlotInfoKHR<'_>> =
         begin_slots[..reference_count].to_vec();
 
@@ -1805,143 +1722,37 @@ mod tests {
     }
 
     #[test]
-    fn the_scopes_leading_entries_are_the_refs_in_plan_order() {
-        // `refs` is first-appearance order, not slot/name order. Do not sort:
-        // `pReferenceSlots` is exactly this prefix.
-        let refs = vec![vk_ref(5, 40), vk_ref(1, 60), vk_ref(3, 8)];
-        let slot_refs = vec![Some(std_ref(0, 1)); 9];
-        let (scope, reference_count) = build_scope_av1(
-            &refs,
-            &names(&[5, 1, 3, 5, 1, 3, 5]),
-            [1u8, 3, 5, 7].into_iter(),
-            2,
-            fake_view(2),
-            std_ref(50, 0),
-            &slot_refs,
-            |slot| Some(fake_view(slot)),
-        )
-        .unwrap();
-
-        assert_eq!(reference_count, 3, "exactly this frame's references lead");
-        assert_eq!(
-            scope[..reference_count]
-                .iter()
-                .map(|e| e.slot_index)
-                .collect::<Vec<_>>(),
-            vec![5, 1, 3],
-            "plan order, not slot order"
-        );
-        for (entry, r) in scope.iter().zip(&refs) {
-            assert_eq!(entry.view, fake_view(r.slot));
-            assert_eq!(entry.std.OrderHint, r.std.OrderHint);
-        }
-
-        assert_eq!(scope[3].slot_index, 7);
-        let last = scope.last().unwrap();
-        assert_eq!(
-            last.slot_index, -1,
-            "the setup slot binds its resource without a current association"
-        );
-        assert_eq!(last.view, fake_view(2));
-        assert_eq!(last.std.OrderHint, 50);
-        assert_eq!(
-            scope.len(),
-            5,
-            "3 refs + 1 other held slot + the activation"
-        );
-    }
-
-    #[test]
-    fn a_reference_slot_without_a_bound_image_fails_the_whole_op() {
-        let refs = vec![vk_ref(4, 10), vk_ref(6, 20)];
-        let slot_refs = vec![Some(std_ref(0, 1)); 9];
-        let err = build_scope_av1(
-            &refs,
-            &names(&[4, 6]),
-            [4u8, 6].into_iter(),
-            0,
-            fake_view(0),
-            std_ref(30, 1),
-            &slot_refs,
-            |slot| (slot != 6).then(|| fake_view(slot)),
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, VkDecodeError::UnboundReferenceSlot { slot: 6 }),
-            "{err}"
-        );
-    }
-
-    #[test]
     fn a_reference_name_pointing_outside_the_bound_slots_fails_the_whole_op() {
         let refs = vec![vk_ref(4, 10)];
-        let slot_refs = vec![Some(std_ref(0, 1)); 9];
-        let err = build_scope_av1(
-            &refs,
-            &names(&[4, 7]),
-            [4u8, 7].into_iter(),
-            0,
-            fake_view(0),
-            std_ref(30, 1),
-            &slot_refs,
-            |slot| Some(fake_view(slot)),
-        )
-        .unwrap_err();
         assert!(
-            matches!(err, VkDecodeError::UnboundReferenceSlot { slot: 7 }),
-            "{err}"
+            matches!(
+                check_reference_names(&refs, &names(&[4, 7])),
+                Err(VkDecodeError::UnboundReferenceSlot { slot: 7 })
+            ),
+            "name 7 is not one of this frame's bound references"
+        );
+        assert!(
+            matches!(
+                check_reference_names(&refs, &[-2, -1, -1, -1, -1, -1, -1]),
+                Err(VkDecodeError::UnboundReferenceSlot { slot: u8::MAX })
+            ),
+            "a negative name other than UNUSED names no slot"
         );
 
         let refs = vec![vk_ref(4, 10), vk_ref(7, 11)];
-        let (_scope, reference_count) = build_scope_av1(
-            &refs,
-            &names(&[4, 7]),
-            [4u8, 7].into_iter(),
-            0,
-            fake_view(0),
-            std_ref(30, 1),
-            &slot_refs,
-            |slot| Some(fake_view(slot)),
-        )
-        .unwrap();
-        assert_eq!(reference_count, 2);
-    }
-
-    #[test]
-    fn held_slots_are_bound_once_and_the_setup_slot_never_twice() {
-        let refs = vec![vk_ref(3, 12)];
-        let slot_refs = vec![Some(std_ref(99, 1)); 9];
-        let (scope, reference_count) = build_scope_av1(
-            &refs,
-            &names(&[3, 3, 3, 3, 3, 3, 3]),
-            [1u8, 2, 3].into_iter(),
-            2,
-            fake_view(2),
-            std_ref(24, 1),
-            &slot_refs,
-            |slot| Some(fake_view(slot)),
-        )
-        .unwrap();
-        assert_eq!(reference_count, 1);
-        let indices: Vec<i32> = scope.iter().map(|e| e.slot_index).collect();
-        assert_eq!(indices, vec![3, 1, -1]);
-        assert_eq!(
-            indices.iter().filter(|&&i| i == 3).count(),
-            1,
-            "a referenced slot is bound exactly once even when seven names use it"
-        );
+        assert!(check_reference_names(&refs, &names(&[4, 7])).is_ok());
         assert!(
-            !indices.contains(&2),
-            "the setup slot is bound only as the -1 activation entry"
+            check_reference_names(&refs, &names(&[])).is_ok(),
+            "all seven UNUSED is a key frame"
         );
     }
 
     #[test]
     fn a_key_frames_scope_is_the_activation_entry_alone() {
         let slot_refs: Vec<Option<hh::StdVideoDecodeAV1ReferenceInfo>> = vec![None; 9];
-        let (scope, reference_count) = build_scope_av1(
-            &[],
-            &names(&[]),
+        let no_refs: [VkRefAv1; 0] = [];
+        let (scope, reference_count) = build_scope(
+            &no_refs,
             std::iter::empty(),
             0,
             fake_view(0),
@@ -1954,35 +1765,6 @@ mod tests {
         assert_eq!(
             scope.iter().map(|e| e.slot_index).collect::<Vec<_>>(),
             vec![-1]
-        );
-    }
-
-    #[test]
-    fn resetting_the_slot_bindings_frees_every_ledger_and_hands_back_the_pinned_images() {
-        let mut slots = SlotMap::new(NUM_REF_SLOTS);
-        slots.assign(100).unwrap();
-        slots.assign(200).unwrap();
-        let mut slot_image: Vec<Option<usize>> = vec![Some(7), Some(8), None, None];
-        let mut slot_refs: Vec<Option<hh::StdVideoDecodeAV1ReferenceInfo>> =
-            vec![Some(std_ref(10, 1)); 4];
-
-        let unbound = reset_slot_bindings(&mut slots, &mut slot_image, &mut slot_refs);
-        assert_eq!(
-            unbound,
-            vec![7, 8],
-            "the pool pictures the stale bindings pinned go back on the free list"
-        );
-        assert_eq!(slots.active(), 0);
-        assert_eq!(
-            slots.capacity(),
-            REQUIRED_SLOTS as usize,
-            "capacity survives — no session rebuild"
-        );
-        assert!(slot_image.iter().all(Option::is_none));
-        assert!(
-            slot_refs.iter().all(Option::is_none),
-            "cached reference info goes too, or build_scope_av1 could bind a slot \
-             the planner no longer knows about"
         );
     }
 
@@ -2527,7 +2309,8 @@ mod tests {
         assert_eq!(frames, 274);
     }
 
-    /// Vector through convert + [`sync_slot_bindings`] + [`build_scope_av1`].
+    /// Vector through convert + [`sync_slot_bindings`] + [`build_scope`] +
+    /// [`check_reference_names`].
     /// A referenced slot must still bind the picture it was decoded into —
     /// bound to the setup picture is also wrong, and silent on the GPU.
     #[test]
@@ -2595,9 +2378,8 @@ mod tests {
                 }
 
                 let held_slots: Vec<u8> = slots.held().map(|(slot, _id)| slot).collect();
-                let (scope, reference_count) = build_scope_av1(
+                let (scope, reference_count) = build_scope(
                     &vk.refs,
-                    &vk.reference_name_slot_indices,
                     held_slots.iter().copied(),
                     vk.setup_slot,
                     image_view(dst),
@@ -2605,6 +2387,10 @@ mod tests {
                     &slot_refs,
                     |slot| slot_image[usize::from(slot)].map(image_view),
                 )
+                .and_then(|scope| {
+                    check_reference_names(&vk.refs, &vk.reference_name_slot_indices)?;
+                    Ok(scope)
+                })
                 .unwrap_or_else(|e| {
                     panic!(
                         "frame {frames}: {e}\n  setup_slot={setup} setup_id={setup_id}\n  \

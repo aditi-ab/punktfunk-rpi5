@@ -3,14 +3,8 @@
 //! Each AU is planned, converted, packed into the bitstream ring, recorded
 //! (bound DPB slots, one-time session RESET, a `RESULT_STATUS_ONLY` query
 //! around `vkCmdDecodeVideoKHR`), then submitted under the caller's
-//! [`QueueLock`] with a per-picture timeline signal.
-//!
-//! Decode targets come from a picture pool decoupled from DPB slots
-//! ([`crate::images`]). A slot binds a free picture at activation so a delivered
-//! picture is never a decode target while the consumer reads it. The decoder
-//! signals `value+1` at write; the presenter waits, samples, restores layout,
-//! and signals `value+1` again; [`VkH264Decoder::release_frame`] reports that
-//! write-back before the picture's next use.
+//! [`QueueLock`] with a per-picture timeline signal. The pool and timeline
+//! contract is [`crate::decoder`]'s.
 //!
 //! Every decode op has a query slot. [`VkH264Decoder::poll_status`] reads it
 //! without waiting; a non-COMPLETE result is the concealment signal. FFmpeg
@@ -25,12 +19,8 @@ use std::collections::VecDeque;
 use ash::vk;
 use ash::vk::native as hh;
 use pf_bitstream::h264::AuPlan;
-use pf_bitstream::h264::ColourDescription;
-use pf_bitstream::h264::DisplayCrop;
-use pf_bitstream::h264::DpbUpdate;
 use pf_bitstream::h264::H264Planner;
 use pf_bitstream::h264::PicId;
-use pf_bitstream::h264::PlanError;
 use pf_bitstream::h264::PlanWarning;
 use tracing::debug;
 use tracing::trace;
@@ -38,29 +28,35 @@ use tracing::warn;
 
 use crate::caps::derive_caps;
 use crate::caps::query_caps;
-use crate::caps::CapsError;
 use crate::caps::DecodeCaps;
 use crate::caps::DecodeProfile;
 use crate::caps::NV12;
-use crate::device::AllocError;
+use crate::decoder::core::build_frame;
+use crate::decoder::core::build_scope;
+use crate::decoder::core::reset_slot_bindings;
+use crate::decoder::core::settle_dpb;
+use crate::decoder::core::sync_slot_bindings;
+use crate::decoder::core::wait_timeline;
+use crate::decoder::core::OpRing;
+use crate::decoder::core::PendingPic;
+use crate::decoder::core::RecoveryLatch;
+use crate::decoder::core::RetiredPool;
+use crate::decoder::core::ScopeRef;
+use crate::decoder::DecodeStatus;
+use crate::decoder::DecodedVkFrame;
+use crate::decoder::VkDecodeError;
 use crate::device::DecodeDevice;
-use crate::device::DeviceError;
 use crate::device::DeviceHandles;
 use crate::device::QueueLock;
 use crate::device::QueueSubmitGuard;
 use crate::images::plan_pools;
 use crate::images::DpbPool;
 use crate::images::PicturePool;
-use crate::images::HOLD_HEADROOM;
 use crate::params::level_to_std;
 use crate::params::ParamsError;
-use crate::params_av1::ParamsAv1Error;
-use crate::params_h265::H265ParamsError;
 use crate::pic::plan_to_vk;
 use crate::pic::DecodePlanVk;
 use crate::pic::PlanToVkError;
-use crate::pic_av1::PlanToVkAv1Error;
-use crate::pic_h265::PlanToVkH265Error;
 use crate::ring::pack_slices;
 use crate::ring::BitstreamRing;
 use crate::ring::RingLayout;
@@ -69,496 +65,8 @@ use crate::ring::INITIAL_SLOT_SIZE;
 use crate::ring::RING_SLOTS;
 use crate::session::ParamsAction;
 use crate::session::SessionConfig;
-use crate::session::SessionError;
 use crate::session::VideoSession;
 use crate::slots::SlotMap;
-
-/// 5 s: longer than a real decode, finite against a wedged driver. Matches the
-/// encoder fence budget so session recovery is never parked forever.
-const DECODE_TIMEOUT_NS: u64 = 5_000_000_000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DecodeStatus {
-    Pending,
-    Ok,
-    /// Error, recycled query, or device lost: content is unproven; conceal
-    /// (`want_keyframe`).
-    Failed,
-}
-
-/// Display-ready pool picture; the decoder does not touch it until
-/// [`VkH264Decoder::release_frame`].
-///
-/// Pixels ready when `semaphore` reaches [`Self::value`]. A sampler must, in
-/// the same submission that waits `value`, signal `value + 1` after reads and
-/// layout restore, then `release_frame(frame, true)`. Drop unsampled with
-/// `false`. Release every frame once, including stale-generation ones (graveyard).
-#[derive(Debug, Clone)]
-pub struct DecodedVkFrame {
-    pub image: vk::Image,
-    /// Caps-resolved `output_format` of the session that decoded this picture;
-    /// [`Self::view`] aliases it. Do not assume 8-bit 4:2:0: H.265 Main 10 is
-    /// [`crate::P010`], RExt 4:4:4 is [`crate::YUV444_8`] / [`crate::YUV444_10`],
-    /// and a renegotiation can change format mid-stream. [`crate::plane_formats`]
-    /// maps this to [`Self::plane_views`].
-    pub format: vk::Format,
-    pub view: vk::ImageView,
-    /// Presenter sampler views; formats from [`crate::plane_formats`] on
-    /// [`Self::format`].
-    pub plane_views: [vk::ImageView; 2],
-    /// Array layer this picture occupies; 0 when its backing image is private.
-    pub layer: u32,
-    /// Layout at the semaphore signal, and the layout the consumer must restore
-    /// after sampling: `VIDEO_DECODE_DPB_KHR` (coincide) or `VIDEO_DECODE_DST_KHR`.
-    pub layout: vk::ImageLayout,
-    /// Allocated extent (`pictureAccessGranularity`-aligned). UV-scale math
-    /// divides by this (1088-row class); display region is [`Self::crop`].
-    pub coded_width: u32,
-    pub coded_height: u32,
-    pub crop: DisplayCrop,
-    /// Active-SPS colour; per frame like [`Self::crop`]. A new SPS can switch
-    /// HDR mid-stream. Unspecified VUI is inferred by pf-bitstream.
-    pub colour: ColourDescription,
-    pub semaphore: vk::Semaphore,
-    pub value: u64,
-    pub poc: i32,
-    pub is_idr: bool,
-    /// Recovery-point SEI for this AU (and any outstanding one before it); see
-    /// [`crate::recovery`]. `NONE` when the stream carries none.
-    ///
-    /// [`Self::is_idr`] cannot answer for intra-refresh: the wave never emits an
-    /// IDR, so a consumer freezing on loss has no decoder-visible clean point.
-    pub recovery: crate::recovery::RecoveryMark,
-    /// Decode-order ordinal stamped at plan time (1 for the first picture).
-    /// Survives session rebuilds: it describes the stream, not Vulkan objects.
-    /// Delivery order is not decode order; compare against the ordinal current
-    /// at freeze-arm so a flushed pre-loss picture cannot lift the freeze.
-    pub decode_order: u64,
-    /// Whole prediction chain was fully available
-    /// ([`pf_bitstream::h264::PicturePlan::references_clean`]). `true` for
-    /// IDR/IRAP/key and any picture whose chain is clean; `false` once this AU
-    /// or an ancestor needed concealment.
-    ///
-    /// Corroborates a host `USER_FLAG_RECOVERY_ANCHOR`: the host infers
-    /// known-good from what the client received; this is what actually decoded.
-    /// Ignore if you have no such claim to check.
-    pub references_clean: bool,
-    pub query_slot: u32,
-    /// Submission ordinal: the query slot is stale if re-armed since.
-    pub submission: u64,
-    pub picture: u32,
-    /// Session generation; `release_frame` routes by this (current vs graveyard).
-    pub generation: u64,
-}
-
-/// Decode failure. Never panics; device loss is first-class so the session
-/// layer can tear down and rebuild.
-#[derive(Debug)]
-pub enum VkDecodeError {
-    Plan(PlanError),
-    /// H.265 plan failure. `h265::PlanError::RaslSkipped` is not this: the
-    /// decoder answers `Ok(None)` for a RASL after an open-GOP join.
-    PlanH265(pf_bitstream::h265::PlanError),
-    /// Parameter set has no Std representation (stream-integrity failure).
-    Params(ParamsError),
-    /// H.265 parameter set has no Std representation, or the stream sits
-    /// outside the envelope (chroma / bit depth / profile). Refused rather
-    /// than half-converted.
-    ParamsH265(H265ParamsError),
-    PlanAv1(pf_bitstream::av1::PlanError),
-    ConvertAv1(PlanToVkAv1Error),
-    /// AV1 sequence header has no Std representation, or the stream sits
-    /// outside the envelope (sampling / bit depth / profile).
-    ParamsAv1(ParamsAv1Error),
-    /// Tile groups could not be split into `pTileOffsets` ranges. Refused
-    /// rather than submitting the whole OBU as tiles ([`crate::decoder_av1`]).
-    TilesAv1(crate::decoder_av1::Av1TileError),
-    /// Named a reference slot the planner no longer holds. Fatal: the planner
-    /// compacting survivors into `AuPlan::refs` would make later names resolve
-    /// to the wrong picture. `ref_index` is LAST_FRAME=0 … ALTREF_FRAME=6.
-    MissingReferenceAv1 {
-        slot: u8,
-        ref_index: u8,
-    },
-    /// Every frame of this temporal unit was skipped while waiting for a key
-    /// after a failure. Same kind as [`pf_bitstream::h264::PlanError::AwaitingIdr`]:
-    /// an error per AU, so the consumer's demotion streak can fire. `Ok(None)`
-    /// would reset that streak once per inter frame and never demote.
-    AwaitingKeyAv1,
-    /// Plan-to-Vulkan conversion. `CapacityMismatch` is consumed by rebuild and
-    /// surfaces only if the rebuilt session still mismatches.
-    Convert(PlanToVkError),
-    ConvertH265(PlanToVkH265Error),
-    /// Device cannot host any session (demote to the next rung).
-    Caps(CapsError),
-    Device(DeviceError),
-    Unsupported(String),
-    /// Vulkan call failed (anything but device loss).
-    Vk(vk::Result),
-    /// `VK_ERROR_DEVICE_LOST`. Later calls fail fast until the owner rebuilds.
-    DeviceLost,
-    /// Bounded GPU wait expired; fatal for this decoder instance.
-    Timeout(&'static str),
-    /// Picture pool exhausted: consumer holds more than [`HOLD_HEADROOM`]
-    /// unreleased frames while the DPB is full. AU planned but not decoded;
-    /// release frames and request a keyframe.
-    NoFreeSlot,
-    /// A referenced DPB slot binds no image. Fatal on all three codecs.
-    ///
-    /// H.265/AV1 name slots by index, so dropping one silently re-points later
-    /// names. H.264 has no such arrays but hardware still decodes against the
-    /// unbound slot. Safe only because [`crate::decoder_h265::RecoveryLatch`]
-    /// flushes to the next IRAP/IDR.
-    UnboundReferenceSlot {
-        slot: u8,
-    },
-    /// Frame's generation has no retired pool (double release, or outlived the
-    /// graveyard entry).
-    StaleFrame {
-        frame_generation: u64,
-        current_generation: u64,
-    },
-    NoMemoryType {
-        type_bits: u32,
-        flags: vk::MemoryPropertyFlags,
-    },
-}
-
-impl std::fmt::Display for VkDecodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            VkDecodeError::Plan(e) => write!(f, "AU planning failed: {e}"),
-            VkDecodeError::PlanH265(e) => write!(f, "H.265 AU planning failed: {e}"),
-            VkDecodeError::Params(e) => write!(f, "parameter-set conversion failed: {e}"),
-            VkDecodeError::ParamsH265(e) => {
-                write!(f, "H.265 parameter-set conversion failed: {e}")
-            }
-            VkDecodeError::PlanAv1(e) => write!(f, "AV1 AU planning failed: {e}"),
-            VkDecodeError::ConvertAv1(e) => write!(f, "AV1 plan conversion failed: {e}"),
-            VkDecodeError::ParamsAv1(e) => {
-                write!(f, "AV1 sequence-header conversion failed: {e}")
-            }
-            VkDecodeError::TilesAv1(e) => write!(f, "AV1 tile split failed: {e}"),
-            VkDecodeError::MissingReferenceAv1 { slot, ref_index } => {
-                write!(
-                    f,
-                    "AV1 reference name {ref_index} points at slot {slot}, which holds \
-                     no picture — the surviving references would renumber"
-                )
-            }
-            VkDecodeError::AwaitingKeyAv1 => write!(
-                f,
-                "every frame of this AV1 temporal unit was skipped — the decoder is \
-                 waiting for the next key frame after a failure"
-            ),
-            VkDecodeError::Convert(e) => write!(f, "plan conversion failed: {e}"),
-            VkDecodeError::ConvertH265(e) => write!(f, "H.265 plan conversion failed: {e}"),
-            VkDecodeError::Caps(e) => write!(f, "decode capabilities unusable: {e}"),
-            VkDecodeError::Device(e) => write!(f, "device handles rejected: {e}"),
-            VkDecodeError::Unsupported(what) => write!(f, "outside device caps: {what}"),
-            VkDecodeError::Vk(r) => write!(f, "Vulkan call failed: {r:?}"),
-            VkDecodeError::DeviceLost => write!(f, "GPU device lost (VK_ERROR_DEVICE_LOST)"),
-            VkDecodeError::Timeout(what) => {
-                write!(f, "GPU wait expired after {DECODE_TIMEOUT_NS} ns: {what}")
-            }
-            VkDecodeError::NoFreeSlot => {
-                write!(
-                    f,
-                    "picture pool exhausted — more than {HOLD_HEADROOM} delivered frames \
-                     are unreleased (release_frame owed)"
-                )
-            }
-            VkDecodeError::UnboundReferenceSlot { slot } => {
-                write!(
-                    f,
-                    "DPB slot {slot} is referenced by this AU but binds no image — \
-                     the H.265 RPS index arrays would point at the wrong pictures"
-                )
-            }
-            VkDecodeError::StaleFrame {
-                frame_generation,
-                current_generation,
-            } => {
-                write!(
-                    f,
-                    "frame from session generation {frame_generation} (current \
-                     {current_generation}) has no retired pool — double release?"
-                )
-            }
-            VkDecodeError::NoMemoryType { type_bits, flags } => {
-                write!(
-                    f,
-                    "no memory type satisfies bits {type_bits:#x} with {flags:?}"
-                )
-            }
-        }
-    }
-}
-
-impl VkDecodeError {
-    /// The device cannot host this codec at all: every AU refuses the same way, so a
-    /// failure streak only delays the rung below.
-    pub fn is_device_fact(&self) -> bool {
-        matches!(self, VkDecodeError::Caps(_))
-    }
-
-    /// Nothing was fed: the planner waits for an IDR, or for the parameter sets a
-    /// decoder built mid-GOP has not seen. Idle, not a refusal. H.26x reads the
-    /// planner's own rule; AV1's wait is this decoder's.
-    pub fn awaits_idr(&self) -> bool {
-        match self {
-            VkDecodeError::Plan(e) => e.awaits_idr(),
-            VkDecodeError::PlanH265(e) => e.awaits_idr(),
-            VkDecodeError::AwaitingKeyAv1 => true,
-            _ => false,
-        }
-    }
-}
-
-impl std::error::Error for VkDecodeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            VkDecodeError::Plan(e) => Some(e),
-            VkDecodeError::PlanH265(e) => Some(e),
-            VkDecodeError::Params(e) => Some(e),
-            VkDecodeError::ParamsH265(e) => Some(e),
-            VkDecodeError::Convert(e) => Some(e),
-            VkDecodeError::ConvertH265(e) => Some(e),
-            VkDecodeError::PlanAv1(e) => Some(e),
-            VkDecodeError::ConvertAv1(e) => Some(e),
-            VkDecodeError::ParamsAv1(e) => Some(e),
-            VkDecodeError::TilesAv1(e) => Some(e),
-            VkDecodeError::Caps(e) => Some(e),
-            VkDecodeError::Device(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<vk::Result> for VkDecodeError {
-    fn from(r: vk::Result) -> Self {
-        if r == vk::Result::ERROR_DEVICE_LOST {
-            VkDecodeError::DeviceLost
-        } else {
-            VkDecodeError::Vk(r)
-        }
-    }
-}
-
-impl From<PlanError> for VkDecodeError {
-    fn from(e: PlanError) -> Self {
-        VkDecodeError::Plan(e)
-    }
-}
-
-impl From<ParamsError> for VkDecodeError {
-    fn from(e: ParamsError) -> Self {
-        VkDecodeError::Params(e)
-    }
-}
-
-impl From<H265ParamsError> for VkDecodeError {
-    fn from(e: H265ParamsError) -> Self {
-        VkDecodeError::ParamsH265(e)
-    }
-}
-
-impl From<ParamsAv1Error> for VkDecodeError {
-    fn from(e: ParamsAv1Error) -> Self {
-        VkDecodeError::ParamsAv1(e)
-    }
-}
-
-impl From<PlanToVkAv1Error> for VkDecodeError {
-    fn from(e: PlanToVkAv1Error) -> Self {
-        VkDecodeError::ConvertAv1(e)
-    }
-}
-
-impl From<CapsError> for VkDecodeError {
-    fn from(e: CapsError) -> Self {
-        VkDecodeError::Caps(e)
-    }
-}
-
-impl From<DeviceError> for VkDecodeError {
-    fn from(e: DeviceError) -> Self {
-        VkDecodeError::Device(e)
-    }
-}
-
-impl From<SessionError> for VkDecodeError {
-    fn from(e: SessionError) -> Self {
-        match e {
-            SessionError::Vk(r) => VkDecodeError::from(r),
-            SessionError::Params(p) => VkDecodeError::Params(p),
-            SessionError::ParamsH265(p) => VkDecodeError::ParamsH265(p),
-            SessionError::ParamsAv1(p) => VkDecodeError::ParamsAv1(p),
-            SessionError::NoMemoryType { type_bits, flags } => {
-                VkDecodeError::NoMemoryType { type_bits, flags }
-            }
-        }
-    }
-}
-
-impl From<AllocError> for VkDecodeError {
-    fn from(e: AllocError) -> Self {
-        match e {
-            AllocError::Vk(r) => VkDecodeError::from(r),
-            AllocError::NoMemoryType { type_bits, flags } => {
-                VkDecodeError::NoMemoryType { type_bits, flags }
-            }
-        }
-    }
-}
-
-/// Query and command pools. Query slots cycle per submission (checked against
-/// [`DecodedVkFrame::submission`]); command buffers cycle within the bitstream
-/// ring's in-flight bound. This type owns and destroys the Vulkan objects.
-///
-/// `query_pool` is `None` without `queryResultStatusSupport`: recording a
-/// RESULT_STATUS query is invalid there (RADV hangs the VCN ring). Verdicts
-/// then fall back to timeline completion.
-pub(crate) struct OpRing {
-    device: ash::Device,
-    pub(crate) query_pool: Option<vk::QueryPool>,
-    pub(crate) query_count: u32,
-    cmd_pool: vk::CommandPool,
-    pub(crate) cmds: Vec<vk::CommandBuffer>,
-}
-
-impl OpRing {
-    /// # Safety
-    ///
-    /// `dev` wraps live handles ([`DeviceHandles`] contract).
-    pub(crate) unsafe fn create(
-        dev: &DecodeDevice,
-        decode_profile: DecodeProfile,
-        query_count: u32,
-        cmd_count: u32,
-    ) -> Result<Self, vk::Result> {
-        let query_pool = if dev.result_status_queries() {
-            let mut chain = decode_profile.chain();
-            // SAFETY: fn contract. `chain` outlives the call, and the helper's
-            // SIGNATURE — not a comment — is what keeps it immobile across it.
-            Some(unsafe { Self::create_status_query_pool(dev, chain.wire(), query_count)? })
-        } else {
-            debug!(
-                "decode family lacks queryResultStatusSupport — no per-op status \
-                 queries on this driver (verdicts fall back to timeline completion)"
-            );
-            None
-        };
-
-        let destroy_query = |pool: Option<vk::QueryPool>| {
-            if let Some(pool) = pool {
-                // SAFETY: destroying the just-created query pool (unwind path).
-                unsafe { dev.ash().destroy_query_pool(pool, None) };
-            }
-        };
-        let pool_ci = vk::CommandPoolCreateInfo::default()
-            .queue_family_index(dev.decode_qf())
-            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-        // SAFETY: live device; unwind destroys the query pool on failure.
-        let cmd_pool = match unsafe { dev.ash().create_command_pool(&pool_ci, None) } {
-            Ok(p) => p,
-            Err(e) => {
-                destroy_query(query_pool);
-                return Err(e);
-            }
-        };
-        let alloc = vk::CommandBufferAllocateInfo::default()
-            .command_pool(cmd_pool)
-            .command_buffer_count(cmd_count);
-        // SAFETY: live device + the pool created above; unwind destroys both pools
-        // (destroying the command pool frees any allocated buffers).
-        let cmds = match unsafe { dev.ash().allocate_command_buffers(&alloc) } {
-            Ok(c) => c,
-            Err(e) => {
-                // SAFETY: destroying the command pool created above.
-                unsafe { dev.ash().destroy_command_pool(cmd_pool, None) };
-                destroy_query(query_pool);
-                return Err(e);
-            }
-        };
-        Ok(Self {
-            device: dev.ash().clone(),
-            query_pool,
-            query_count,
-            cmd_pool,
-            cmds,
-        })
-    }
-
-    /// RESULT_STATUS query pool against `profile`.
-    ///
-    /// Split out so the profile borrow outlives `vkCreateQueryPool`.
-    /// `push_next` would clobber the profile's own `p_next`; the chain is a raw
-    /// `*const`, which ends the borrow the moment it is taken. A `&` parameter
-    /// holds it for the whole call.
-    ///
-    /// # Safety
-    ///
-    /// `dev` wraps live handles ([`DeviceHandles`] contract).
-    unsafe fn create_status_query_pool(
-        dev: &DecodeDevice,
-        profile: &vk::VideoProfileInfoKHR<'_>,
-        query_count: u32,
-    ) -> Result<vk::QueryPool, vk::Result> {
-        let mut query_ci = vk::QueryPoolCreateInfo::default()
-            .query_type(vk::QueryType::RESULT_STATUS_ONLY_KHR)
-            .query_count(query_count);
-        // Manual chain: `push_next` would clobber the profile's own `p_next`.
-        query_ci.p_next = std::ptr::from_ref(profile).cast();
-        // SAFETY: fn contract; `query_ci` roots the wired chain for the call, and
-        // `profile` is borrowed for the whole of this body so the chain cannot move
-        // out from under that pointer. The video profile chained in satisfies the
-        // "same profile as the session" rule for queries used inside a coding scope.
-        unsafe { dev.ash().create_query_pool(&query_ci, None) }
-    }
-}
-
-impl Drop for OpRing {
-    fn drop(&mut self) {
-        // SAFETY: own handles on the contract-live device; the owning decoder
-        // drains GPU work before dropping state. Destroying the command pool frees
-        // its buffers; both destroys ignore NULL.
-        unsafe {
-            self.device.destroy_command_pool(self.cmd_pool, None);
-            if let Some(pool) = self.query_pool {
-                self.device.destroy_query_pool(pool, None);
-            }
-        }
-    }
-}
-
-/// Decoded picture waiting for its output verdict, plus the fields its
-/// [`DecodedVkFrame`] needs. Codec-agnostic; the H.265 decoder uses the same map.
-pub(crate) struct PendingPic {
-    pub(crate) image: usize,
-    pub(crate) submission: u64,
-    pub(crate) query_slot: u32,
-    pub(crate) timeline_value: u64,
-    pub(crate) crop: DisplayCrop,
-    pub(crate) colour: ColourDescription,
-    pub(crate) poc: i32,
-    pub(crate) is_idr: bool,
-    /// Folded at plan time (the codec's counting unit is known only there).
-    /// Display order is not decode order; see [`DecodedVkFrame::recovery`].
-    pub(crate) recovery: crate::recovery::RecoveryMark,
-    /// See [`DecodedVkFrame::decode_order`].
-    pub(crate) decode_order: u64,
-    /// From the plan at decode time; display order is not decode order. See
-    /// [`DecodedVkFrame::references_clean`].
-    pub(crate) references_clean: bool,
-}
-
-/// Retired generation's picture pool. Lives until release tokens return, then
-/// the pool dies.
-pub(crate) struct RetiredPool {
-    pub(crate) generation: u64,
-    pub(crate) pool: PicturePool,
-}
 
 /// One session generation. Extent / DPB / profile renegotiation retires it.
 struct SessionState {
@@ -609,8 +117,8 @@ pub struct VkH264Decoder {
     /// rebuilds: a fact about the stream, not Vulkan objects. Distinct from
     /// [`Self::recovery`] (DPB-recovery latch).
     recovery_watch: crate::recovery::RecoveryWatch,
-    /// Post-failure DPB recovery owed; see [`crate::decoder_h265::RecoveryLatch`].
-    recovery: crate::decoder_h265::RecoveryLatch,
+    /// Post-failure DPB recovery owed; see [`RecoveryLatch`].
+    recovery: RecoveryLatch,
     /// Pictures planned so far — stamped as [`DecodedVkFrame::decode_order`].
     /// Survives session rebuilds for the same reason the watch does.
     decoded: u64,
@@ -803,17 +311,10 @@ impl VkH264Decoder {
             // Clear the setup slot's previous binding before it binds fresh.
             let setup = usize::from(vk_plan.setup_slot);
             if state.dpb.is_none() {
-                let mut held = vec![false; state.slot_image.len()];
-                for (slot, _id) in state.slots.held() {
-                    held[usize::from(slot)] = true;
-                }
-                for (slot, binding) in state.slot_image.iter_mut().enumerate() {
-                    if let Some(picture) = *binding {
-                        if !held[slot] || slot == setup {
-                            state.pool.pictures[picture].bound = false;
-                            *binding = None;
-                        }
-                    }
+                let unbound =
+                    sync_slot_bindings(&state.slots, &mut state.slot_image, vk_plan.setup_slot);
+                for picture in unbound {
+                    state.pool.pictures[picture].bound = false;
                 }
             }
 
@@ -1277,7 +778,7 @@ impl VkH264Decoder {
     /// After a post-planning failure three ledgers disagree: the planner DPB,
     /// [`SlotMap`], and slot→picture bindings. [`Self::flush`] settles the first
     /// (and still delivers pictures that reached output);
-    /// [`crate::decoder_h265::reset_slot_bindings`] empties the other two.
+    /// [`reset_slot_bindings`] empties the other two.
     /// Images a consumer holds stay pinned by `held`, as across a rebuild.
     ///
     /// Not a session rebuild: session, pools, and ring are still valid.
@@ -1285,7 +786,7 @@ impl VkH264Decoder {
         debug!("recovering from a failed AU — flushing the H.264 DPB to the next IDR");
         self.flush();
         if let Some(state) = &mut self.state {
-            let unbound = crate::decoder_h265::reset_slot_bindings(
+            let unbound = reset_slot_bindings(
                 &mut state.slots,
                 &mut state.slot_image,
                 &mut state.slot_refs,
@@ -1531,105 +1032,13 @@ fn std_profile_for(plan: &AuPlan) -> Result<hh::StdVideoH264ProfileIdc, VkDecode
     }
 }
 
-/// Build the delivered frame for one settled pending picture (pending → held).
-///
-/// Takes the pool and the two mode facts rather than a `SessionState` so both
-/// codecs share it. [`DecodedVkFrame::format`] comes off the pool, which
-/// stamped it from the `caps.output_format` its images were created with.
-pub(crate) fn build_frame(
-    pool: &mut PicturePool,
-    coincide: bool,
-    image_extent: vk::Extent2D,
-    entry: &PendingPic,
-    generation: u64,
-) -> DecodedVkFrame {
-    let format = pool.format;
-    let picture = &mut pool.pictures[entry.image];
-    picture.pending = false;
-    picture.held += 1;
-    DecodedVkFrame {
-        image: picture.image,
-        format,
-        view: picture.view,
-        plane_views: picture.plane_views,
-        layer: picture.layer,
-        layout: if coincide {
-            vk::ImageLayout::VIDEO_DECODE_DPB_KHR
-        } else {
-            vk::ImageLayout::VIDEO_DECODE_DST_KHR
-        },
-        coded_width: image_extent.width,
-        coded_height: image_extent.height,
-        crop: entry.crop,
-        colour: entry.colour,
-        semaphore: picture.semaphore,
-        value: entry.timeline_value,
-        poc: entry.poc,
-        is_idr: entry.is_idr,
-        recovery: entry.recovery,
-        decode_order: entry.decode_order,
-        references_clean: entry.references_clean,
-        query_slot: entry.query_slot,
-        submission: entry.submission,
-        picture: entry.image as u32,
-        generation,
+impl ScopeRef for crate::pic::VkRef {
+    type Std = hh::StdVideoDecodeH264ReferenceInfo;
+    fn slot(&self) -> u8 {
+        self.slot
     }
-}
-
-/// Split one [`DpbUpdate`]: `outputs` (bump order) become deliverable;
-/// `removed` ids that never reached output are returned so their images are
-/// freed. Codec-agnostic (H.265 uses the same [`DpbUpdate`]).
-pub(crate) fn settle_dpb<F>(pending: &mut BTreeMap<PicId, F>, dpb: &DpbUpdate) -> (Vec<F>, Vec<F>) {
-    settle_dpb_ids(pending, &dpb.outputs, &dpb.removed)
-}
-
-/// [`settle_dpb`] over the two id lists directly.
-///
-/// AV1 declares its own [`pf_bitstream::av1::DpbUpdate`] — structurally the
-/// same, a distinct type. Settling at the id lists lets all three codecs share
-/// one implementation.
-pub(crate) fn settle_dpb_ids<F>(
-    pending: &mut BTreeMap<PicId, F>,
-    outputs: &[PicId],
-    removed: &[PicId],
-) -> (Vec<F>, Vec<F>) {
-    let mut ready = Vec::new();
-    for id in outputs {
-        match pending.remove(id) {
-            Some(entry) => ready.push(entry),
-            // Ids planned before this decoder existed, or dropped across a
-            // rebuild: display-order gaps, not errors.
-            None => trace!(id, "output id without a pending picture"),
-        }
-    }
-    let dropped = removed.iter().filter_map(|id| pending.remove(id)).collect();
-    (ready, dropped)
-}
-
-/// Bounded timeline wait (no-op for the never-signalled value 0).
-///
-/// # Safety
-///
-/// `device` is live and `semaphore` is a live timeline semaphore on it.
-pub(crate) unsafe fn wait_timeline(
-    device: &ash::Device,
-    semaphore: vk::Semaphore,
-    value: u64,
-    what: &'static str,
-) -> Result<(), VkDecodeError> {
-    if value == 0 {
-        return Ok(());
-    }
-    let semaphores = [semaphore];
-    let values = [value];
-    let info = vk::SemaphoreWaitInfo::default()
-        .semaphores(&semaphores)
-        .values(&values);
-    // SAFETY: fn contract; the info arrays are locals outliving the call.
-    match unsafe { device.wait_semaphores(&info, DECODE_TIMEOUT_NS) } {
-        Ok(()) => Ok(()),
-        Err(vk::Result::TIMEOUT) => Err(VkDecodeError::Timeout(what)),
-        Err(e) => Err(VkDecodeError::from(e)),
+    fn std(&self) -> Self::Std {
+        self.std
     }
 }
 
@@ -1764,10 +1173,10 @@ unsafe fn record_and_submit(
     };
     // Scope: this AU's references, then other held slots (stay bound so
     // associations persist), then setup as activation (slot index -1 binds
-    // without a current association). Shared with H.265 `build_scope` so the
-    // fail-closed layout cannot drift.
+    // without a current association). Shared `build_scope` keeps the
+    // fail-closed layout one implementation.
     let held: Vec<u8> = state.slots.held().map(|(slot, _id)| slot).collect();
-    let (scope, reference_count) = crate::decoder_h265::build_scope(
+    let (scope, reference_count) = build_scope(
         &vk_plan.refs,
         held.into_iter(),
         vk_plan.setup_slot,
@@ -1951,7 +1360,7 @@ mod tests {
     fn an_h264_reference_slot_without_a_bound_image_fails_the_whole_op() {
         let refs = vec![h264_ref(1, 10), h264_ref(3, 20)];
         let slot_refs = vec![Some(h264_std_ref(0)); 8];
-        let err = crate::decoder_h265::build_scope(
+        let err = build_scope(
             &refs,
             [1u8, 3].into_iter(),
             0,
@@ -1975,7 +1384,7 @@ mod tests {
         // Two references (slots 1, 3); slots 5 and 6 are held but not referenced.
         let refs = vec![h264_ref(1, 10), h264_ref(3, 20)];
         let slot_refs = vec![Some(h264_std_ref(77)); 8];
-        let (scope, reference_count) = crate::decoder_h265::build_scope(
+        let (scope, reference_count) = build_scope(
             &refs,
             [1u8, 3, 5, 6].into_iter(),
             0,
@@ -1999,42 +1408,6 @@ mod tests {
             scope.iter().map(|e| e.slot_index).collect::<Vec<_>>(),
             vec![1, 3, 5, 6, -1]
         );
-    }
-
-    #[test]
-    fn settle_dpb_readies_outputs_in_order_and_returns_never_output_removals() {
-        let mut pending: BTreeMap<PicId, u32> = BTreeMap::new();
-        pending.insert(1, 100);
-        pending.insert(2, 200);
-        pending.insert(3, 300);
-
-        // 1 outputs and is removed (normal bump). 2 is removed without output
-        // (`no_output_of_prior_pics`): free its image, do not leak in the map.
-        let update = DpbUpdate {
-            stored: Some(3),
-            outputs: vec![1],
-            removed: vec![1, 2],
-        };
-        let (ready, dropped) = settle_dpb(&mut pending, &update);
-        assert_eq!(ready, vec![100]);
-        assert_eq!(dropped, vec![200]);
-        assert_eq!(
-            pending.keys().copied().collect::<Vec<_>>(),
-            vec![3],
-            "the still-buffered picture stays pending"
-        );
-
-        let mut pending: BTreeMap<PicId, u32> = BTreeMap::new();
-        pending.insert(5, 500);
-        pending.insert(4, 400);
-        let update = DpbUpdate {
-            stored: None,
-            outputs: vec![5, 99, 4],
-            removed: vec![],
-        };
-        let (ready, dropped) = settle_dpb(&mut pending, &update);
-        assert_eq!(ready, vec![500, 400], "bump order, not id order");
-        assert!(dropped.is_empty());
     }
 
     #[test]

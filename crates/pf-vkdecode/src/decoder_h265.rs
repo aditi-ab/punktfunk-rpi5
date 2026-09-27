@@ -14,7 +14,7 @@
 //! Annex-B prefix). A RASL after an open-GOP CRA is not an error (8.1.3 NOTE).
 //!
 //! Pool, ring, op ring, pending/ready/graveyard, and `settle_dpb`/`build_frame`
-//! are shared with [`crate::VkH264Decoder`]. Codec dispatch is the client's.
+//! are shared ([`crate::decoder`]). Codec dispatch is the client's.
 
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
@@ -35,14 +35,19 @@ use crate::caps::query_caps;
 use crate::caps::DecodeCaps;
 use crate::caps::DecodeProfile;
 use crate::caps_h265::H265ProfileKey;
-use crate::decoder::build_frame;
-use crate::decoder::settle_dpb;
-use crate::decoder::wait_timeline;
+use crate::decoder::core::build_frame;
+use crate::decoder::core::build_scope;
+use crate::decoder::core::reset_slot_bindings;
+use crate::decoder::core::settle_dpb;
+use crate::decoder::core::sync_slot_bindings;
+use crate::decoder::core::wait_timeline;
+use crate::decoder::core::OpRing;
+use crate::decoder::core::PendingPic;
+use crate::decoder::core::RecoveryLatch;
+use crate::decoder::core::RetiredPool;
+use crate::decoder::core::ScopeRef;
 use crate::decoder::DecodeStatus;
 use crate::decoder::DecodedVkFrame;
-use crate::decoder::OpRing;
-use crate::decoder::PendingPic;
-use crate::decoder::RetiredPool;
 use crate::decoder::VkDecodeError;
 use crate::device::DecodeDevice;
 use crate::device::DeviceHandles;
@@ -96,41 +101,6 @@ struct SessionStateH265 {
     coded_extent: vk::Extent2D,
     /// Granularity-aligned allocation extent (picture resources and frames).
     image_extent: vk::Extent2D,
-}
-
-/// Set when an AU fails after planning has already advanced. The next `decode`
-/// consumes it and flushes to the next IRAP before planning anything new.
-///
-/// Fail closed: `RefPicSetStCurr*`/`LtCurr` are indices into this op's
-/// reference array, so dropping a missing binding re-points every later index
-/// at the wrong picture. By the time that error returns, `plan_to_vk_h265` has
-/// already mutated [`SlotMap`] and coincide sync has cleared the setup image,
-/// so planner and slots both claim picture N is resident with no image holding
-/// it — every later AU then fails [`build_scope`] with `UnboundReferenceSlot`.
-///
-/// Recovery is a flush to the next IRAP (`H265Planner::flush` plus
-/// [`reset_slot_bindings`]), not reference substitution. Own type so the
-/// latch/consume cycle is testable without a device ([`crate::session::ResetArm`]).
-#[derive(Debug, Default)]
-pub(crate) struct RecoveryLatch(bool);
-
-impl RecoveryLatch {
-    /// Record that recovery is owed. Idempotent: two failures in a row still owe
-    /// exactly one flush.
-    pub(crate) fn latch(&mut self) {
-        self.0 = true;
-    }
-
-    /// Whether recovery is owed, clearing the latch — once per failure run, not
-    /// on every later decode.
-    pub(crate) fn take(&mut self) -> bool {
-        std::mem::take(&mut self.0)
-    }
-
-    /// Whether recovery is owed, without consuming it (state snapshots).
-    pub(crate) fn is_latched(&self) -> bool {
-        self.0
-    }
 }
 
 /// Native Vulkan Video H.265 decoder. Public surface matches [`crate::VkH264Decoder`].
@@ -392,17 +362,10 @@ impl VkH265Decoder {
         // the setup slot's previous binding is cleared before it binds fresh.
         let setup = usize::from(vk_plan.setup_slot);
         if state.dpb.is_none() {
-            let mut held = vec![false; state.slot_image.len()];
-            for (slot, _id) in state.slots.held() {
-                held[usize::from(slot)] = true;
-            }
-            for (slot, binding) in state.slot_image.iter_mut().enumerate() {
-                if let Some(picture) = *binding {
-                    if !held[slot] || slot == setup {
-                        state.pool.pictures[picture].bound = false;
-                        *binding = None;
-                    }
-                }
+            let unbound =
+                sync_slot_bindings(&state.slots, &mut state.slot_image, vk_plan.setup_slot);
+            for picture in unbound {
+                state.pool.pictures[picture].bound = false;
             }
         }
 
@@ -1113,68 +1076,6 @@ fn profile_key_for(plan: &AuPlan) -> Result<H265ProfileKey, VkDecodeError> {
     .map_err(VkDecodeError::ParamsH265)
 }
 
-/// Empty the three per-slot ledgers a recovery resets: DPB residency,
-/// slot→picture bindings, and cached per-slot reference info. Returns the pool
-/// picture indices the cleared bindings were pinning, for the caller to unbind.
-/// Pure over the ledgers so recovery is testable without a device.
-///
-/// All three empty together: leftover reference info would let [`build_scope`]
-/// bind a slot the planner no longer knows. Generic over the cached Std type
-/// so H.264 uses this same function (`SlotMap` is already shared).
-pub(crate) fn reset_slot_bindings<S>(
-    slots: &mut SlotMap,
-    slot_image: &mut [Option<usize>],
-    slot_refs: &mut [Option<S>],
-) -> Vec<usize> {
-    // `release` is the only way a slot is freed ([`SlotMap`]); collect because
-    // `held` borrows the map the releases mutate.
-    for (_slot, id) in slots.held().collect::<Vec<_>>() {
-        slots.release(id);
-    }
-    let unbound = slot_image.iter_mut().filter_map(Option::take).collect();
-    for cached in slot_refs.iter_mut() {
-        *cached = None;
-    }
-    unbound
-}
-
-/// Picture resource view for DPB `slot`: bound pool picture layer (coincide)
-/// or DPB array layer (distinct).
-fn slot_view(state: &SessionStateH265, slot: u8) -> Option<vk::ImageView> {
-    match &state.dpb {
-        Some(dpb) => Some(dpb.dpb_view(slot)),
-        None => state.slot_image[usize::from(slot)].map(|p| state.pool.pictures[p].view),
-    }
-}
-
-/// One bound-slot list entry: DPB slot index (`-1` for the setup activation),
-/// picture resource view, and that slot's codec reference info.
-/// No derived equality: the Std bindgen struct has none; tests compare fields.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ScopeEntry<S> {
-    pub(crate) slot_index: i32,
-    pub(crate) view: vk::ImageView,
-    pub(crate) std: S,
-}
-
-/// One of this AU's references as [`build_scope`] sees it: a DPB slot and the
-/// codec reference info to bind with it.
-///
-/// H.264 and H.265 share one builder so "refuse to guess" has a single
-/// implementation. AV1 keeps its own ([`crate::decoder_av1`]): its reference
-/// array is indexed by name and may hold holes, so the walk is a different
-/// algorithm. Folding it in would be a mode flag, which is how the two drift.
-pub(crate) trait ScopeRef {
-    type Std: Copy;
-    fn slot(&self) -> u8;
-    fn std(&self) -> Self::Std;
-}
-
-/// [`build_scope`]'s answer: bound-slot list, and how many leading entries are
-/// this AU's own references (the prefix the decode op takes as its reference
-/// array — ordering note in `build_scope`).
-pub(crate) type Scope<R> = (Vec<ScopeEntry<<R as ScopeRef>::Std>>, usize);
-
 impl ScopeRef for crate::pic_h265::VkRefH265 {
     type Std = hh::StdVideoDecodeH265ReferenceInfo;
     fn slot(&self) -> u8 {
@@ -1185,79 +1086,13 @@ impl ScopeRef for crate::pic_h265::VkRefH265 {
     }
 }
 
-impl ScopeRef for crate::pic::VkRef {
-    type Std = ash::vk::native::StdVideoDecodeH264ReferenceInfo;
-    fn slot(&self) -> u8 {
-        self.slot
+/// Picture resource view for DPB `slot`: bound pool picture layer (coincide)
+/// or DPB array layer (distinct).
+fn slot_view(state: &SessionStateH265, slot: u8) -> Option<vk::ImageView> {
+    match &state.dpb {
+        Some(dpb) => Some(dpb.dpb_view(slot)),
+        None => state.slot_image[usize::from(slot)].map(|p| state.pool.pictures[p].view),
     }
-    fn std(&self) -> Self::Std {
-        self.std
-    }
-}
-
-/// Build the coding scope's bound-slot list and how many leading entries are
-/// this AU's references.
-///
-/// Layout: (1) every `refs` entry in order — the decode op takes this prefix;
-/// (2) every other still-held slot, so its association survives the scope;
-/// (3) the setup slot as the activation entry, slot index `-1`.
-///
-/// A reference whose slot binds no image is a hard error, never a skip.
-/// H.265 `RefPicSetStCurr*`/`LtCurr` name DPB slots, and every named slot is
-/// one of `refs` ([`crate::pic_h265`]); dropping an entry leaves hardware a
-/// named slot this op never bound.
-///
-/// `reference_count` is captured the instant the `refs` loop ends, before the
-/// held-slot pass appends. The decode op takes `scope[..reference_count]` as
-/// its reference list; a count after the second pass could hand it a
-/// still-held slot this AU does not reference.
-pub(crate) fn build_scope<R: ScopeRef>(
-    refs: &[R],
-    held_slots: impl Iterator<Item = u8>,
-    setup_slot: u8,
-    setup_view: vk::ImageView,
-    setup_ref: R::Std,
-    slot_refs: &[Option<R::Std>],
-    view_of: impl Fn(u8) -> Option<vk::ImageView>,
-) -> Result<Scope<R>, VkDecodeError> {
-    let mut scope: Vec<ScopeEntry<R::Std>> = Vec::with_capacity(refs.len() + slot_refs.len() + 1);
-    for r in refs {
-        match view_of(r.slot()) {
-            Some(view) => scope.push(ScopeEntry {
-                slot_index: i32::from(r.slot()),
-                view,
-                std: r.std(),
-            }),
-            None => return Err(VkDecodeError::UnboundReferenceSlot { slot: r.slot() }),
-        }
-    }
-    let reference_count = scope.len();
-    for slot in held_slots {
-        if slot == setup_slot || refs.iter().any(|r| r.slot() == slot) {
-            continue;
-        }
-        match (
-            slot_refs.get(usize::from(slot)).copied().flatten(),
-            view_of(slot),
-        ) {
-            (Some(std), Some(view)) => scope.push(ScopeEntry {
-                slot_index: i32::from(slot),
-                view,
-                std,
-            }),
-            // Every held slot was a setup slot once; leave unbound rather than fake.
-            _ => trace!(
-                slot,
-                "held slot without reference info/binding — left unbound"
-            ),
-        }
-    }
-    scope.push(ScopeEntry {
-        slot_index: -1,
-        view: setup_view,
-        std: setup_ref,
-    });
-    Ok((scope, reference_count))
 }
 
 /// Record one H.265 decode op into the chosen command buffer and submit it under
@@ -1540,10 +1375,7 @@ unsafe fn record_and_submit_h265(
 
 #[cfg(test)]
 mod tests {
-    use ash::vk::Handle as _;
-
     use super::*;
-    use crate::pic_h265::VkRefH265;
 
     /// Reference-info carrying the two fields the assertions read.
     fn std_ref(poc: i32, long_term: bool) -> hh::StdVideoDecodeH265ReferenceInfo {
@@ -1554,246 +1386,6 @@ mod tests {
         std.flags
             .set_used_for_long_term_reference(u32::from(long_term));
         std
-    }
-
-    fn vk_ref(slot: u8, poc: i32, long_term: bool) -> VkRefH265 {
-        VkRefH265 {
-            slot,
-            std: std_ref(poc, long_term),
-            id: u64::from(slot) + 100,
-        }
-    }
-
-    /// Distinguishable fake view per slot. Never dereferenced; the scope only
-    /// carries handles.
-    fn fake_view(slot: u8) -> vk::ImageView {
-        vk::ImageView::from_raw(u64::from(slot) + 1)
-    }
-
-    #[test]
-    fn the_scopes_leading_entries_are_the_refs_in_plan_order() {
-        // Plan refs are in RPS set order (StCurrBefore, StCurrAfter, LtCurr),
-        // not slot order. Std index arrays point at positions in that order, so
-        // the scope must not sort or dedup them.
-        let refs = vec![
-            vk_ref(5, 40, false),
-            vk_ref(1, 60, false),
-            vk_ref(3, 8, true),
-        ];
-        let slot_refs = vec![Some(std_ref(0, false)); 8];
-        let (scope, reference_count) = build_scope(
-            &refs,
-            [1u8, 3, 5, 7].into_iter(),
-            2,
-            fake_view(2),
-            std_ref(50, false),
-            &slot_refs,
-            |slot| Some(fake_view(slot)),
-        )
-        .unwrap();
-
-        assert_eq!(reference_count, 3, "exactly this AU's references lead");
-        assert_eq!(
-            scope[..reference_count]
-                .iter()
-                .map(|e| e.slot_index)
-                .collect::<Vec<_>>(),
-            vec![5, 1, 3],
-            "plan order, not slot order — the RPS index arrays depend on it"
-        );
-        for (entry, r) in scope.iter().zip(&refs) {
-            assert_eq!(entry.view, fake_view(r.slot));
-            assert_eq!(entry.std.PicOrderCntVal, r.std.PicOrderCntVal);
-            assert_eq!(
-                entry.std.flags.used_for_long_term_reference(),
-                r.std.flags.used_for_long_term_reference(),
-                "the long-term marking rides with the binding"
-            );
-        }
-
-        assert_eq!(scope[3].slot_index, 7);
-        let last = scope.last().unwrap();
-        assert_eq!(
-            last.slot_index, -1,
-            "the setup slot binds its resource without a current association"
-        );
-        assert_eq!(last.view, fake_view(2));
-        assert_eq!(last.std.PicOrderCntVal, 50);
-        assert_eq!(
-            scope.len(),
-            5,
-            "3 refs + 1 other held slot + the activation"
-        );
-    }
-
-    #[test]
-    fn a_reference_slot_without_a_bound_image_fails_the_whole_op() {
-        // Compacting past it would shift every later RefPicSetStCurr* index
-        // onto the wrong picture. Fail closed.
-        let refs = vec![vk_ref(4, 10, false), vk_ref(6, 20, false)];
-        let slot_refs = vec![Some(std_ref(0, false)); 8];
-        let err = build_scope(
-            &refs,
-            [4u8, 6].into_iter(),
-            0,
-            fake_view(0),
-            std_ref(30, false),
-            &slot_refs,
-            |slot| (slot != 6).then(|| fake_view(slot)),
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, VkDecodeError::UnboundReferenceSlot { slot: 6 }),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn held_slots_are_bound_once_and_the_setup_slot_never_twice() {
-        // Slot 3 is both a reference and still held; slot 2 is setup and also
-        // held. Neither may appear twice: a duplicate slot index in one coding
-        // scope is invalid, and a second entry for a reference would also
-        // break the index arrays.
-        let refs = vec![vk_ref(3, 12, false)];
-        let slot_refs = vec![Some(std_ref(99, false)); 8];
-        let (scope, reference_count) = build_scope(
-            &refs,
-            [1u8, 2, 3].into_iter(),
-            2,
-            fake_view(2),
-            std_ref(24, false),
-            &slot_refs,
-            |slot| Some(fake_view(slot)),
-        )
-        .unwrap();
-        assert_eq!(reference_count, 1);
-        let indices: Vec<i32> = scope.iter().map(|e| e.slot_index).collect();
-        assert_eq!(indices, vec![3, 1, -1]);
-        assert_eq!(
-            indices.iter().filter(|&&i| i == 3).count(),
-            1,
-            "a referenced slot is bound exactly once"
-        );
-        assert!(
-            !indices.contains(&2),
-            "the setup slot is bound only as the -1 activation entry"
-        );
-    }
-
-    #[test]
-    fn a_held_slot_with_no_cached_reference_info_is_left_unbound_not_faked() {
-        // Only reachable if a slot was never a setup slot on this session.
-        // Drop it rather than bind zeroed reference info (POC 0, short-term).
-        let refs: Vec<VkRefH265> = Vec::new();
-        let mut slot_refs: Vec<Option<hh::StdVideoDecodeH265ReferenceInfo>> = vec![None; 4];
-        slot_refs[1] = Some(std_ref(7, false));
-        let (scope, reference_count) = build_scope(
-            &refs,
-            [1u8, 3].into_iter(),
-            0,
-            fake_view(0),
-            std_ref(9, false),
-            &slot_refs,
-            |slot| Some(fake_view(slot)),
-        )
-        .unwrap();
-        assert_eq!(reference_count, 0, "an IRAP references nothing");
-        assert_eq!(
-            scope.iter().map(|e| e.slot_index).collect::<Vec<_>>(),
-            vec![1, -1],
-            "slot 3 had no cached info and is simply not bound"
-        );
-    }
-
-    #[test]
-    fn a_post_mutation_failure_wedges_every_later_au_until_the_ledgers_are_reset() {
-        // AU planned, slot assigned, setup image unbound, then decode failed.
-        // Planner and SlotMap still claim the picture is resident.
-        let mut slots = SlotMap::new(3);
-        slots.assign(100).unwrap(); // slot 0, bound
-        slots.assign(200).unwrap(); // slot 1, bound
-        slots.assign(300).unwrap(); // slot 2, this AU's setup — binding cleared
-        let mut slot_image: Vec<Option<usize>> = vec![Some(7), Some(8), None, None];
-        let mut slot_refs: Vec<Option<hh::StdVideoDecodeH265ReferenceInfo>> =
-            vec![Some(std_ref(10, false)); 4];
-
-        // Later AUs that reference slot 2 fail closed (RPS index arrays).
-        let err = build_scope(
-            &[vk_ref(2, 30, false)],
-            [0u8, 1, 2].into_iter(),
-            0,
-            fake_view(0),
-            std_ref(40, false),
-            &slot_refs,
-            |slot| slot_image[usize::from(slot)].map(|_| fake_view(slot)),
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, VkDecodeError::UnboundReferenceSlot { slot: 2 }),
-            "{err}"
-        );
-
-        let unbound = reset_slot_bindings(&mut slots, &mut slot_image, &mut slot_refs);
-        assert_eq!(
-            unbound,
-            vec![7, 8],
-            "the pool pictures the stale bindings pinned go back on the free list"
-        );
-        assert_eq!(slots.active(), 0, "no picture is DPB-resident any more");
-        assert_eq!(
-            slots.capacity(),
-            4,
-            "capacity survives — no session rebuild"
-        );
-        assert!(slot_image.iter().all(Option::is_none));
-        assert!(
-            slot_refs.iter().all(Option::is_none),
-            "cached reference info goes too, or build_scope could bind a slot the \
-             planner no longer knows about"
-        );
-
-        let setup_slot = slots.assign(400).unwrap();
-        assert_eq!(setup_slot, 0, "the freed slots are assignable again");
-        slot_image[usize::from(setup_slot)] = Some(9);
-        // Empty slice needs its element type named: `build_scope` is generic
-        // over the two codecs' reference types.
-        let no_refs: [VkRefH265; 0] = [];
-        let (scope, reference_count) = build_scope(
-            &no_refs,
-            slots.held().map(|(slot, _id)| slot),
-            setup_slot,
-            fake_view(setup_slot),
-            std_ref(0, false),
-            &slot_refs,
-            |slot| slot_image[usize::from(slot)].map(|_| fake_view(slot)),
-        )
-        .unwrap();
-        assert_eq!(reference_count, 0, "an IRAP references nothing");
-        assert_eq!(
-            scope.iter().map(|e| e.slot_index).collect::<Vec<_>>(),
-            vec![-1],
-            "only the setup activation entry — the stream is decoding again"
-        );
-    }
-
-    #[test]
-    fn the_recovery_latch_is_owed_once_and_consumed_by_exactly_one_decode() {
-        // Two failures in a row still owe one flush; the decode that performs
-        // it clears the debt. Otherwise every later decode would re-flush and
-        // the stream could never build a DPB again.
-        let mut latch = RecoveryLatch::default();
-        assert!(!latch.is_latched(), "a fresh decoder owes nothing");
-        assert!(!latch.take());
-
-        latch.latch();
-        latch.latch();
-        assert!(
-            latch.is_latched(),
-            "visible in debug_snapshot before it runs"
-        );
-        assert!(latch.take(), "the next decode recovers");
-        assert!(!latch.is_latched());
-        assert!(!latch.take(), "and the one after that just decodes");
     }
 
     #[test]
