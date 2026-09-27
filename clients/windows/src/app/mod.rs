@@ -373,6 +373,7 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     let (probed, set_probed) = cx.use_async_state(HashMap::<String, bool>::new());
     // Library fetch/art state (thread-driven → root; see `library::start_fetch`).
     let (library, set_library) = cx.use_async_state(library::LibraryState::default());
+    let (end_game, set_end_game) = cx.use_async_state(library::EndGameUi::default());
     // Where a bare launch opens (design/default-host.md). Once per process, before the poll
     // below can deliver anything: a link queued at startup is explicit intent and wins, and
     // `pending()` reads the queue WITHOUT draining it so the router still gets it.
@@ -744,6 +745,8 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
             library::LibraryProps {
                 svc,
                 state: library,
+                end_game,
+                set_end_game,
             },
         ),
         // The stream runs in the punktfunk-session child's own window; this screen is a
