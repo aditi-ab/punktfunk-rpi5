@@ -135,11 +135,13 @@ fn present_seat_display(stop: HANDLE) {
     if let Some((id, ..)) = made
         && let Some(object) = crate::registry::find(|m| m.id == id).and_then(|m| m.object())
     {
-        let mut path = pod_init!(iddcx::IDDCX_DISPLAYCONFIGPATH2);
-        path.Size = core::mem::size_of::<iddcx::IDDCX_DISPLAYCONFIGPATH2>() as u32;
-        path.Flags = iddcx::IDDCX_DISPLAYCONFIGPATH2_FLAGS::IDDCX_DISPLAYCONFIGPATH2_FLAGS_MODE_VALID
-            | iddcx::IDDCX_DISPLAYCONFIGPATH2_FLAGS::IDDCX_DISPLAYCONFIGPATH2_FLAGS_MONITOR_SCALE_FACTOR_VALID;
-        path.MonitorObject = object;
+        let mut path = iddcx::IDDCX_DISPLAYCONFIGPATH2 {
+            Size: core::mem::size_of::<iddcx::IDDCX_DISPLAYCONFIGPATH2>() as u32,
+            Flags: iddcx::IDDCX_DISPLAYCONFIGPATH2_FLAGS::IDDCX_DISPLAYCONFIGPATH2_FLAGS_MODE_VALID
+                | iddcx::IDDCX_DISPLAYCONFIGPATH2_FLAGS::IDDCX_DISPLAYCONFIGPATH2_FLAGS_MONITOR_SCALE_FACTOR_VALID,
+            MonitorObject: object,
+            ..Default::default()
+        };
         path.Mode.Resolution.cx = w;
         path.Mode.Resolution.cy = h;
         path.Mode.Rotation = 1; // DISPLAYCONFIG_ROTATION_IDENTITY
@@ -191,22 +193,22 @@ pub unsafe extern "C" fn device_cleanup(_object: WDFOBJECT) {
 
 /// One `IDDCX_MONITOR_MODE` (SDR) for the description mode list.
 fn monitor_mode(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_MONITOR_MODE {
-    let mut mode = pod_init!(iddcx::IDDCX_MONITOR_MODE);
-    mode.Size = core::mem::size_of::<iddcx::IDDCX_MONITOR_MODE>() as u32;
-    mode.Origin = iddcx::IDDCX_MONITOR_MODE_ORIGIN::IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
-    mode.MonitorVideoSignalInfo = crate::monitor::display_info(width, height, refresh_rate);
-    mode
+    iddcx::IDDCX_MONITOR_MODE {
+        Size: core::mem::size_of::<iddcx::IDDCX_MONITOR_MODE>() as u32,
+        Origin: iddcx::IDDCX_MONITOR_MODE_ORIGIN::IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR,
+        MonitorVideoSignalInfo: crate::monitor::display_info(width, height, refresh_rate),
+    }
 }
 
 /// One `IDDCX_MONITOR_MODE2`: the SDR mode plus the per-mode wire bit-depth, which is what makes the
 /// OS offer HDR10 modes on this monitor.
 fn monitor_mode2(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_MONITOR_MODE2 {
-    let mut mode = pod_init!(iddcx::IDDCX_MONITOR_MODE2);
-    mode.Size = core::mem::size_of::<iddcx::IDDCX_MONITOR_MODE2>() as u32;
-    mode.Origin = iddcx::IDDCX_MONITOR_MODE_ORIGIN::IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
-    mode.MonitorVideoSignalInfo = crate::monitor::display_info(width, height, refresh_rate);
-    mode.BitsPerComponent = crate::monitor::wire_bits();
-    mode
+    iddcx::IDDCX_MONITOR_MODE2 {
+        Size: core::mem::size_of::<iddcx::IDDCX_MONITOR_MODE2>() as u32,
+        Origin: iddcx::IDDCX_MONITOR_MODE_ORIGIN::IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR,
+        MonitorVideoSignalInfo: crate::monitor::display_info(width, height, refresh_rate),
+        BitsPerComponent: crate::monitor::wire_bits(),
+    }
 }
 
 /// The body both `EvtIddCxParseMonitorDescription` variants share: the EDID serial selects the
@@ -482,7 +484,7 @@ pub unsafe extern "C" fn query_target_info(
 ) -> NTSTATUS {
     // SAFETY: p_out is the framework's (uninitialised) out buffer; zero then set the one field we report.
     unsafe {
-        core::ptr::write(p_out, pod_init!(iddcx::IDARG_OUT_QUERYTARGET_INFO));
+        core::ptr::write(p_out, iddcx::IDARG_OUT_QUERYTARGET_INFO::default());
         (*p_out).TargetCaps = iddcx::IDDCX_TARGET_CAPS::IDDCX_TARGET_CAPS_HIGH_COLOR_SPACE;
     }
     STATUS_SUCCESS

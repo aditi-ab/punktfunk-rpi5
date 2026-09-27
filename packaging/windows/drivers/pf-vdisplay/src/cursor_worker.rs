@@ -223,9 +223,9 @@ fn run_worker(monitor_v: usize, view_v: usize, data_v: isize, stop: HANDLE, cell
             ShapeBufferSizeInBytes: CURSOR_SHAPE_BYTES as u32,
             pShapeBuffer: shape_buf.as_mut_ptr(),
         };
-        // SAFETY: zero-init is a valid OUT arg (the OS writes every field it reports). v3: the
-        // base query DDI slot is stubbed to NOT_SUPPORTED on current IddCx.
-        let mut out: iddcx::IDARG_OUT_QUERY_HWCURSOR3 = unsafe { core::mem::zeroed() };
+        // Zeroed, the OS writes every field it reports. v3: the base query DDI slot is stubbed
+        // to NOT_SUPPORTED on current IddCx.
+        let mut out = iddcx::IDARG_OUT_QUERY_HWCURSOR3::default();
         // SAFETY: `monitor` is live (departure drops this worker FIRST), args outlive the call.
         let st =
             unsafe { wdk_iddcx::IddCxMonitorQueryHardwareCursor3(monitor, &in_args, &mut out) };
@@ -264,7 +264,7 @@ fn run_worker(monitor_v: usize, view_v: usize, data_v: isize, stop: HANDLE, cell
             dbglog!(
                 "[pf-vd] cursor SHAPE id={} type={} {}x{} vis={} posvalid={}",
                 out.CursorShapeInfo.ShapeId,
-                out.CursorShapeInfo.CursorType as u32,
+                out.CursorShapeInfo.CursorType,
                 out.CursorShapeInfo.Width,
                 out.CursorShapeInfo.Height,
                 out.IsCursorVisible,
@@ -294,7 +294,7 @@ fn run_worker(monitor_v: usize, view_v: usize, data_v: isize, stop: HANDLE, cell
             if out.IsCursorShapeUpdated != 0 && visible {
                 let info = &out.CursorShapeInfo;
                 let stamp = CursorShm {
-                    cursor_type: info.CursorType as u32,
+                    cursor_type: info.CursorType,
                     width: info.Width,
                     height: info.Height,
                     pitch: info.Pitch,

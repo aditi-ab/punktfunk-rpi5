@@ -28,9 +28,11 @@ pub unsafe extern "system" fn driver_entry(
     // PyroWave's Vulkan instance hangs in session 0 without these.
     crate::encode::thread::disable_implicit_vulkan_layers();
     crate::log::install_tracing_bridge();
-    let mut config = pod_init!(WDF_DRIVER_CONFIG);
-    config.Size = core::mem::size_of::<WDF_DRIVER_CONFIG>() as ULONG;
-    config.EvtDriverDeviceAdd = Some(driver_add);
+    let mut config = WDF_DRIVER_CONFIG {
+        Size: core::mem::size_of::<WDF_DRIVER_CONFIG>() as ULONG,
+        EvtDriverDeviceAdd: Some(driver_add),
+        ..Default::default()
+    };
     // SAFETY: driver + registry_path are loader-provided; config is valid for the call.
     let st = unsafe {
         call_unsafe_wdf_function_binding!(
@@ -49,9 +51,11 @@ pub unsafe extern "system" fn driver_entry(
 extern "C" fn driver_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) -> NTSTATUS {
     dbglog!("[pf-vd] driver_add");
     // Defer adapter creation to the first D0 entry.
-    let mut pnp = pod_init!(WDF_PNPPOWER_EVENT_CALLBACKS);
-    pnp.Size = core::mem::size_of::<WDF_PNPPOWER_EVENT_CALLBACKS>() as ULONG;
-    pnp.EvtDeviceD0Entry = Some(callbacks::device_d0_entry);
+    let mut pnp = WDF_PNPPOWER_EVENT_CALLBACKS {
+        Size: core::mem::size_of::<WDF_PNPPOWER_EVENT_CALLBACKS>() as ULONG,
+        EvtDeviceD0Entry: Some(callbacks::device_d0_entry),
+        ..Default::default()
+    };
     // SAFETY: init is the framework-provided device-init; pnp is valid for the call.
     unsafe {
         call_unsafe_wdf_function_binding!(WdfDeviceInitSetPnpPowerEventCallbacks, init, &mut pnp);
@@ -61,11 +65,13 @@ extern "C" fn driver_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) -> NTSTA
     // crashed host's monitors depart at once instead of after the watchdog window. Set before
     // IddCx's own init: should the class extension take the slot, the silence watchdog still
     // covers a dead host.
-    let mut files = pod_init!(wdk_sys::WDF_FILEOBJECT_CONFIG);
-    files.Size = core::mem::size_of::<wdk_sys::WDF_FILEOBJECT_CONFIG>() as ULONG;
-    files.EvtFileCleanup = Some(crate::watchdog::evt_file_cleanup);
-    files.AutoForwardCleanupClose = wdk_sys::_WDF_TRI_STATE::WdfUseDefault;
-    files.FileObjectClass = wdk_sys::_WDF_FILEOBJECT_CLASS::WdfFileObjectWdfCannotUseFsContexts;
+    let mut files = wdk_sys::WDF_FILEOBJECT_CONFIG {
+        Size: core::mem::size_of::<wdk_sys::WDF_FILEOBJECT_CONFIG>() as ULONG,
+        EvtFileCleanup: Some(crate::watchdog::evt_file_cleanup),
+        AutoForwardCleanupClose: wdk_sys::_WDF_TRI_STATE::WdfUseDefault,
+        FileObjectClass: wdk_sys::_WDF_FILEOBJECT_CLASS::WdfFileObjectWdfCannotUseFsContexts,
+        ..Default::default()
+    };
     // SAFETY: init is the framework-provided device-init; files is valid for the call.
     unsafe {
         call_unsafe_wdf_function_binding!(
@@ -77,31 +83,30 @@ extern "C" fn driver_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) -> NTSTA
     }
 
     // Build the IddCx client config and wire the SDR callbacks. `.Size` = size_of (1.10 structs, 1.10 fw).
-    let mut cfg = pod_init!(iddcx::IDD_CX_CLIENT_CONFIG);
-    cfg.Size = core::mem::size_of::<iddcx::IDD_CX_CLIENT_CONFIG>() as u32;
-    cfg.EvtIddCxAdapterInitFinished = Some(callbacks::adapter_init_finished);
-    cfg.EvtIddCxParseMonitorDescription = Some(callbacks::parse_monitor_description);
-    cfg.EvtIddCxMonitorGetDefaultDescriptionModes = Some(callbacks::monitor_get_default_modes);
-    cfg.EvtIddCxMonitorQueryTargetModes = Some(callbacks::monitor_query_modes);
-    cfg.EvtIddCxAdapterCommitModes = Some(callbacks::adapter_commit_modes);
-    // STEP 7 (HDR): the *2 mode DDIs + the gamma/HDR-metadata/query-target-info callbacks. The adapter
-    // caps now set CAN_PROCESS_FP16 (adapter.rs), which OBLIGATES this whole set — without them the OS
-    // rejects the adapter at init ("Failed to get adapter"). The proven oracle (entry.rs) registers the *2
-    // variants ALONGSIDE the v1 callbacks above (NOT instead of them) — the OS prefers the *2 on IddCx
-    // 1.10 and falls back to v1 down-level — so we replicate exactly: keep both. The framework no longer
-    // rejects the *2 set because the FP16 cap is now present (the only reason STEP 3 had to drop them).
-    cfg.EvtIddCxParseMonitorDescription2 = Some(callbacks::parse_monitor_description2);
-    cfg.EvtIddCxMonitorQueryTargetModes2 = Some(callbacks::monitor_query_modes2);
-    cfg.EvtIddCxAdapterCommitModes2 = Some(callbacks::adapter_commit_modes2);
-    cfg.EvtIddCxAdapterQueryTargetInfo = Some(callbacks::query_target_info);
-    cfg.EvtIddCxMonitorSetDefaultHdrMetaData = Some(callbacks::set_default_hdr_metadata);
-    cfg.EvtIddCxMonitorSetGammaRamp = Some(callbacks::set_gamma_ramp);
-    cfg.EvtIddCxMonitorAssignSwapChain = Some(callbacks::assign_swap_chain);
-    cfg.EvtIddCxMonitorUnassignSwapChain = Some(callbacks::unassign_swap_chain);
-    // Obligated for a remote-session adapter (the seat devnode's role); harmless on the console,
-    // where the OS never calls it because every monitor ships an EDID.
-    cfg.EvtIddCxMonitorGetPhysicalSize = Some(callbacks::monitor_get_physical_size);
-    cfg.EvtIddCxDeviceIoControl = Some(callbacks::device_io_control);
+    let cfg = iddcx::IDD_CX_CLIENT_CONFIG {
+        Size: core::mem::size_of::<iddcx::IDD_CX_CLIENT_CONFIG>() as u32,
+        EvtIddCxAdapterInitFinished: Some(callbacks::adapter_init_finished),
+        EvtIddCxParseMonitorDescription: Some(callbacks::parse_monitor_description),
+        EvtIddCxMonitorGetDefaultDescriptionModes: Some(callbacks::monitor_get_default_modes),
+        EvtIddCxMonitorQueryTargetModes: Some(callbacks::monitor_query_modes),
+        EvtIddCxAdapterCommitModes: Some(callbacks::adapter_commit_modes),
+        // The *2 mode DDIs and the HDR callbacks. CAN_PROCESS_FP16 (adapter.rs) obligates this set:
+        // without it the OS rejects the adapter at init. The OS prefers *2 on IddCx 1.10 and falls
+        // back to the v1 callbacks above down-level, so both stay registered.
+        EvtIddCxParseMonitorDescription2: Some(callbacks::parse_monitor_description2),
+        EvtIddCxMonitorQueryTargetModes2: Some(callbacks::monitor_query_modes2),
+        EvtIddCxAdapterCommitModes2: Some(callbacks::adapter_commit_modes2),
+        EvtIddCxAdapterQueryTargetInfo: Some(callbacks::query_target_info),
+        EvtIddCxMonitorSetDefaultHdrMetaData: Some(callbacks::set_default_hdr_metadata),
+        EvtIddCxMonitorSetGammaRamp: Some(callbacks::set_gamma_ramp),
+        EvtIddCxMonitorAssignSwapChain: Some(callbacks::assign_swap_chain),
+        EvtIddCxMonitorUnassignSwapChain: Some(callbacks::unassign_swap_chain),
+        // Obligated for a remote-session adapter (the seat devnode's role); harmless on the console,
+        // where the OS never calls it because every monitor ships an EDID.
+        EvtIddCxMonitorGetPhysicalSize: Some(callbacks::monitor_get_physical_size),
+        EvtIddCxDeviceIoControl: Some(callbacks::device_io_control),
+        ..Default::default()
+    };
 
     // SAFETY: init is the framework device-init; cfg is fully populated + sized. (Links IddCxStub.)
     let status = unsafe { wdk_iddcx::IddCxDeviceInitConfig(init, &cfg) };
@@ -115,12 +120,14 @@ extern "C" fn driver_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INIT) -> NTSTA
     // monitor's swap-chain worker on device removal (PnP / unload) so the worker threads don't linger
     // into teardown. Execution/Synchronization must be spelled out — a zeroed field is *Invalid*, not
     // InheritFromParent. No context type; nothing reads state back off the WDFDEVICE.
-    let mut dev_attr = pod_init!(wdk_sys::WDF_OBJECT_ATTRIBUTES);
-    dev_attr.Size = core::mem::size_of::<wdk_sys::WDF_OBJECT_ATTRIBUTES>() as u32;
-    dev_attr.ExecutionLevel = wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent;
-    dev_attr.SynchronizationScope =
-        wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent;
-    dev_attr.EvtCleanupCallback = Some(callbacks::device_cleanup);
+    let mut dev_attr = wdk_sys::WDF_OBJECT_ATTRIBUTES {
+        Size: core::mem::size_of::<wdk_sys::WDF_OBJECT_ATTRIBUTES>() as u32,
+        ExecutionLevel: wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent,
+        SynchronizationScope:
+            wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent,
+        EvtCleanupCallback: Some(callbacks::device_cleanup),
+        ..Default::default()
+    };
     // SAFETY: init configured above; dev_attr is a valid attributes block.
     let status = unsafe {
         call_unsafe_wdf_function_binding!(WdfDeviceCreate, &mut init, &mut dev_attr, &mut device)

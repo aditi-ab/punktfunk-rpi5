@@ -39,10 +39,12 @@ pub unsafe fn driver_create(
     registry_path: PCUNICODE_STRING,
     evt_device_add: PFN_WDF_DRIVER_DEVICE_ADD,
 ) -> NTSTATUS {
-    // SAFETY: a zeroed WDF_DRIVER_CONFIG is a valid all-null config; Size + the callback follow.
-    let mut config: WDF_DRIVER_CONFIG = unsafe { core::mem::zeroed() };
-    config.Size = core::mem::size_of::<WDF_DRIVER_CONFIG>() as ULONG;
-    config.EvtDriverDeviceAdd = evt_device_add;
+    // Size and the callback over an all-null config.
+    let mut config = WDF_DRIVER_CONFIG {
+        Size: core::mem::size_of::<WDF_DRIVER_CONFIG>() as ULONG,
+        EvtDriverDeviceAdd: evt_device_add,
+        ..Default::default()
+    };
     // SAFETY: `driver`/`registry_path` are the loader's pointers per this fn's contract; the
     // config is valid and outlives the call.
     unsafe {
@@ -65,14 +67,15 @@ pub unsafe fn create_default_queue(
     device: WDFDEVICE,
     evt_io_device_control: PFN_WDF_IO_QUEUE_IO_DEVICE_CONTROL,
 ) -> Result<WDFQUEUE, NTSTATUS> {
-    // SAFETY: zeroed config then fields set; Size matches the struct.
-    let mut qcfg: WDF_IO_QUEUE_CONFIG = unsafe { core::mem::zeroed() };
-    qcfg.Size = core::mem::size_of::<WDF_IO_QUEUE_CONFIG>() as ULONG;
-    qcfg.DispatchType = WDF_IO_QUEUE_DISPATCH_PARALLEL;
-    qcfg.PowerManaged = WDF_USE_DEFAULT;
-    qcfg.DefaultQueue = 1;
-    qcfg.EvtIoDeviceControl = evt_io_device_control;
-    // WDF_IO_QUEUE_CONFIG_INIT sets this to (ULONG)-1 (unlimited); mem::zeroed left it 0,
+    let mut qcfg = WDF_IO_QUEUE_CONFIG {
+        Size: core::mem::size_of::<WDF_IO_QUEUE_CONFIG>() as ULONG,
+        DispatchType: WDF_IO_QUEUE_DISPATCH_PARALLEL,
+        PowerManaged: WDF_USE_DEFAULT,
+        DefaultQueue: 1,
+        EvtIoDeviceControl: evt_io_device_control,
+        ..Default::default()
+    };
+    // WDF_IO_QUEUE_CONFIG_INIT sets this to (ULONG)-1 (unlimited); the zeroed default is 0,
     // which on a parallel queue means present ZERO requests → EvtIoDeviceControl never fires.
     qcfg.Settings.Parallel.NumberOfPresentedRequests = u32::MAX;
     let mut queue: WDFQUEUE = core::ptr::null_mut();
@@ -95,11 +98,12 @@ pub unsafe fn create_default_queue(
 /// # Safety
 /// `device` must be the live device of the current `EvtDeviceAdd`.
 pub unsafe fn create_manual_queue(device: WDFDEVICE) -> Result<WDFQUEUE, NTSTATUS> {
-    // SAFETY: zeroed config then fields set.
-    let mut mcfg: WDF_IO_QUEUE_CONFIG = unsafe { core::mem::zeroed() };
-    mcfg.Size = core::mem::size_of::<WDF_IO_QUEUE_CONFIG>() as ULONG;
-    mcfg.DispatchType = WDF_IO_QUEUE_DISPATCH_MANUAL;
-    mcfg.PowerManaged = WDF_USE_DEFAULT;
+    let mut mcfg = WDF_IO_QUEUE_CONFIG {
+        Size: core::mem::size_of::<WDF_IO_QUEUE_CONFIG>() as ULONG,
+        DispatchType: WDF_IO_QUEUE_DISPATCH_MANUAL,
+        PowerManaged: WDF_USE_DEFAULT,
+        ..Default::default()
+    };
     let mut queue: WDFQUEUE = core::ptr::null_mut();
     // SAFETY: `device` is live per the contract; config valid; attributes null; queue receives
     // the handle.
@@ -127,19 +131,20 @@ pub unsafe fn create_periodic_timer(
     evt_timer: PFN_WDF_TIMER,
     period_ms: u32,
 ) -> Result<WDFTIMER, NTSTATUS> {
-    // SAFETY: zeroed config then fields set.
-    let mut tcfg: WDF_TIMER_CONFIG = unsafe { core::mem::zeroed() };
-    tcfg.Size = core::mem::size_of::<WDF_TIMER_CONFIG>() as ULONG;
-    tcfg.EvtTimerFunc = evt_timer;
-    tcfg.Period = period_ms;
-    tcfg.AutomaticSerialization = 1;
-    // SAFETY: a zeroed WDF_OBJECT_ATTRIBUTES is a valid all-null attributes struct; Size + the
-    // fields used follow.
-    let mut tattr: WDF_OBJECT_ATTRIBUTES = unsafe { core::mem::zeroed() };
-    tattr.Size = core::mem::size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG;
-    tattr.ParentObject = parent;
-    tattr.ExecutionLevel = WDF_EXECUTION_LEVEL_INHERIT;
-    tattr.SynchronizationScope = WDF_SYNCHRONIZATION_SCOPE_INHERIT;
+    let mut tcfg = WDF_TIMER_CONFIG {
+        Size: core::mem::size_of::<WDF_TIMER_CONFIG>() as ULONG,
+        EvtTimerFunc: evt_timer,
+        Period: period_ms,
+        AutomaticSerialization: 1,
+        ..Default::default()
+    };
+    let mut tattr = WDF_OBJECT_ATTRIBUTES {
+        Size: core::mem::size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG,
+        ParentObject: parent,
+        ExecutionLevel: WDF_EXECUTION_LEVEL_INHERIT,
+        SynchronizationScope: WDF_SYNCHRONIZATION_SCOPE_INHERIT,
+        ..Default::default()
+    };
     let mut timer: WDFTIMER = core::ptr::null_mut();
     // SAFETY: config + attributes valid; timer receives the handle.
     let st = unsafe {

@@ -73,30 +73,31 @@ pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     // Firmware/hardware version (telemetry). The oracle points BOTH at one IDDCX_ENDPOINT_VERSION.
     // `version` is a stack local read synchronously by IddCxAdapterInitAsync (same as the oracle). `.Size`
     // is `size_of` throughout — these are the IddCx 1.10 structs and the framework here is 1.10 (= upstream).
-    let mut version = pod_init!(iddcx::IDDCX_ENDPOINT_VERSION);
-    version.Size = core::mem::size_of::<iddcx::IDDCX_ENDPOINT_VERSION>() as u32;
-    version.MajorVer = env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap_or(0);
-    version.MinorVer = env!("CARGO_PKG_VERSION_MINOR").parse().unwrap_or(0);
-    version.Build = env!("CARGO_PKG_VERSION_PATCH").parse().unwrap_or(0);
+    let mut version = iddcx::IDDCX_ENDPOINT_VERSION {
+        Size: core::mem::size_of::<iddcx::IDDCX_ENDPOINT_VERSION>() as u32,
+        MajorVer: env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap_or(0),
+        MinorVer: env!("CARGO_PKG_VERSION_MINOR").parse().unwrap_or(0),
+        Build: env!("CARGO_PKG_VERSION_PATCH").parse().unwrap_or(0),
+        ..Default::default()
+    };
 
     // Endpoint diagnostics. `pEndPointModelName` must be a non-empty string, and `w!` is what keeps
     // the three name pointers 'static — IddCx reads them after this frame. GammaSupport MUST be set:
     // a zeroed value is IDDCX_FEATURE_IMPLEMENTATION_UNINITIALIZED (0), which the framework's adapter
     // Validate rejects with INVALID_PARAMETER — set it to NONE (1) like upstream.
-    let mut diag = pod_init!(iddcx::IDDCX_ENDPOINT_DIAGNOSTIC_INFO);
-    diag.Size = core::mem::size_of::<iddcx::IDDCX_ENDPOINT_DIAGNOSTIC_INFO>() as u32;
-    diag.GammaSupport = iddcx::IDDCX_FEATURE_IMPLEMENTATION::IDDCX_FEATURE_IMPLEMENTATION_NONE;
-    diag.TransmissionType = iddcx::IDDCX_TRANSMISSION_TYPE::IDDCX_TRANSMISSION_TYPE_WIRED_OTHER;
-    diag.pEndPointFriendlyName = w!("Punktfunk Virtual Display Adapter").as_ptr();
-    diag.pEndPointManufacturerName = w!("Punktfunk").as_ptr();
-    diag.pEndPointModelName = w!("Virtual Display").as_ptr();
-    // SAFETY: `version` is a stack local that outlives this `init_adapter` call; IddCxAdapterInitAsync
-    // (below) reads through these pointers SYNCHRONOUSLY, before `version` drops — the pointer never escapes.
-    diag.pFirmwareVersion = (&raw mut version).cast();
-    diag.pHardwareVersion = (&raw mut version).cast();
+    let mut diag = iddcx::IDDCX_ENDPOINT_DIAGNOSTIC_INFO {
+        Size: core::mem::size_of::<iddcx::IDDCX_ENDPOINT_DIAGNOSTIC_INFO>() as u32,
+        GammaSupport: iddcx::IDDCX_FEATURE_IMPLEMENTATION::IDDCX_FEATURE_IMPLEMENTATION_NONE,
+        TransmissionType: iddcx::IDDCX_TRANSMISSION_TYPE::IDDCX_TRANSMISSION_TYPE_WIRED_OTHER,
+        pEndPointFriendlyName: w!("Punktfunk Virtual Display Adapter").as_ptr(),
+        pEndPointManufacturerName: w!("Punktfunk").as_ptr(),
+        pEndPointModelName: w!("Virtual Display").as_ptr(),
+        // SAFETY: `version` is a stack local that outlives this `init_adapter` call; IddCxAdapterInitAsync
+        // (below) reads through these pointers SYNCHRONOUSLY, before `version` drops — the pointer never escapes.
+        pFirmwareVersion: (&raw mut version).cast(),
+        pHardwareVersion: (&raw mut version).cast(),
+    };
 
-    let mut caps = pod_init!(iddcx::IDDCX_ADAPTER_CAPS);
-    caps.Size = core::mem::size_of::<iddcx::IDDCX_ADAPTER_CAPS>() as u32;
     // STEP 7 (HDR): declare we can process FP16 (scRGB) desktop surfaces — this is what marks the virtual
     // monitor advanced-color-capable (→ the host sees display_hdr=true → the "Use HDR" toggle appears). The
     // ONLY reason STEP 3 rejected this flag was setting it WITHOUT the obligated *2/HDR DDIs; those are now
@@ -104,7 +105,11 @@ pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     // query_target_info/set_default_hdr_metadata/set_gamma_ramp). The proven oracle sets exactly this flag
     // with the INF still at UmdfExtensions=IddCx0102. GammaSupport stays NONE (set above). Enum is bindgen
     // ModuleConsts — the variant is a plain-int const assignable straight to the `Flags` field.
-    caps.Flags = iddcx::IDDCX_ADAPTER_FLAGS::IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16;
+    let mut caps = iddcx::IDDCX_ADAPTER_CAPS {
+        Size: core::mem::size_of::<iddcx::IDDCX_ADAPTER_CAPS>() as u32,
+        Flags: iddcx::IDDCX_ADAPTER_FLAGS::IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16,
+        ..Default::default()
+    };
     // IddCx roles are exclusive, so the role is per DEVICE and the hardware id decides it. The
     // shipped console devnode is `Root\pf_vdisplay` and structurally cannot take the seat branch
     // below (`design/windows-seat-display-tier.md`).
@@ -160,17 +165,19 @@ pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     // The adapter WDF object's attributes. Execution/Synchronization must be spelled out: a zeroed
     // field is *Invalid*, not InheritFromParent. No context type — nothing reads adapter state off
     // the WDF object; the handle lives in [`ADAPTER`].
-    let mut attr = pod_init!(wdk_sys::WDF_OBJECT_ATTRIBUTES);
-    attr.Size = core::mem::size_of::<wdk_sys::WDF_OBJECT_ATTRIBUTES>() as u32;
-    attr.ExecutionLevel = wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent;
-    attr.SynchronizationScope =
-        wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent;
+    let mut attr = wdk_sys::WDF_OBJECT_ATTRIBUTES {
+        Size: core::mem::size_of::<wdk_sys::WDF_OBJECT_ATTRIBUTES>() as u32,
+        ExecutionLevel: wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent,
+        SynchronizationScope:
+            wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent,
+        ..Default::default()
+    };
     let init = iddcx::IDARG_IN_ADAPTER_INIT {
         WdfDevice: device,
         pCaps: &raw mut caps,
         ObjectAttributes: &raw mut attr,
     };
-    let mut out = pod_init!(iddcx::IDARG_OUT_ADAPTER_INIT);
+    let mut out = iddcx::IDARG_OUT_ADAPTER_INIT::default();
     INIT_PENDING.store(true, Ordering::Release);
     // SAFETY: `init`/`out` are valid local storage; IddCxAdapterInitAsync reads the caps synchronously
     // (the adapter object itself is delivered later via adapter_init_finished). Called once per device.
@@ -238,10 +245,11 @@ pub fn set_render_adapter(owner: u32, luid_low: u32, luid_high: i32) -> NTSTATUS
         return crate::STATUS_ACCESS_DENIED;
     }
     *crate::registry::lock(&RENDER_PIN) = Some((packed, owner));
-    let mut in_args = pod_init!(iddcx::IDARG_IN_ADAPTERSETRENDERADAPTER);
-    in_args.PreferredRenderAdapter = wdk_sys::LUID {
-        LowPart: luid_low,
-        HighPart: luid_high,
+    let in_args = iddcx::IDARG_IN_ADAPTERSETRENDERADAPTER {
+        PreferredRenderAdapter: wdk_sys::LUID {
+            LowPart: luid_low,
+            HighPart: luid_high,
+        },
     };
     dbglog!("[pf-vd] set_render_adapter -> {luid_high:08x}:{luid_low:08x}");
     // SAFETY: `adapter` is the stashed IddCx adapter; `in_args` is valid local storage read synchronously.

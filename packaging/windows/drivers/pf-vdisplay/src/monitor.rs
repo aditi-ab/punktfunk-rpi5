@@ -460,20 +460,22 @@ fn signal_info(
         cx: width,
         cy: height,
     };
-    let mut si = pod_init!(wdk_sys::DISPLAYCONFIG_VIDEO_SIGNAL_INFO);
-    si.pixelRate = n.pixel_rate;
-    si.hSyncFreq = wdk_sys::DISPLAYCONFIG_RATIONAL {
-        Numerator: n.h_sync_num,
-        Denominator: 1,
+    let mut si = wdk_sys::DISPLAYCONFIG_VIDEO_SIGNAL_INFO {
+        pixelRate: n.pixel_rate,
+        hSyncFreq: wdk_sys::DISPLAYCONFIG_RATIONAL {
+            Numerator: n.h_sync_num,
+            Denominator: 1,
+        },
+        vSyncFreq: wdk_sys::DISPLAYCONFIG_RATIONAL {
+            Numerator: n.v_sync_num,
+            Denominator: 1,
+        },
+        totalSize: region,
+        activeSize: region,
+        scanLineOrdering:
+            wdk_sys::DISPLAYCONFIG_SCANLINE_ORDERING::DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE,
+        ..Default::default()
     };
-    si.vSyncFreq = wdk_sys::DISPLAYCONFIG_RATIONAL {
-        Numerator: n.v_sync_num,
-        Denominator: 1,
-    };
-    si.totalSize = region;
-    si.activeSize = region;
-    si.scanLineOrdering =
-        wdk_sys::DISPLAYCONFIG_SCANLINE_ORDERING::DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
     // union { AdditionalSignalInfo bitfield | videoStandard:u32 } — the proto packs the
     // vSyncFreqDivider into bits 16..21 of the "other" video standard.
     si.__bindgen_anon_1.videoStandard = n.video_standard;
@@ -491,12 +493,13 @@ pub fn display_info(
 
 /// `IDDCX_TARGET_MODE` for a scan-out mode (vSyncFreqDivider = 1, per the DDI contract).
 pub fn target_mode(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_TARGET_MODE {
-    let mut tm = pod_init!(iddcx::IDDCX_TARGET_MODE);
-    tm.Size = core::mem::size_of::<iddcx::IDDCX_TARGET_MODE>() as u32;
-    tm.TargetVideoSignalInfo = wdk_sys::DISPLAYCONFIG_TARGET_MODE {
-        targetVideoSignalInfo: signal_info(width, height, refresh_rate, 1),
-    };
-    tm
+    iddcx::IDDCX_TARGET_MODE {
+        Size: core::mem::size_of::<iddcx::IDDCX_TARGET_MODE>() as u32,
+        TargetVideoSignalInfo: wdk_sys::DISPLAYCONFIG_TARGET_MODE {
+            targetVideoSignalInfo: signal_info(width, height, refresh_rate, 1),
+        },
+        ..Default::default()
+    }
 }
 
 /// Wire bit-depth advertised per mode in the `*2` (HDR) mode DDIs. STEP 7: advertise BOTH 8 and 10 bpc
@@ -508,12 +511,12 @@ pub fn target_mode(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_T
 pub fn wire_bits() -> iddcx::IDDCX_WIRE_BITS_PER_COMPONENT {
     let rgb = iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_8
         | iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_10;
-    let mut w = pod_init!(iddcx::IDDCX_WIRE_BITS_PER_COMPONENT);
-    w.Rgb = rgb;
-    w.YCbCr444 = iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_NONE;
-    w.YCbCr422 = iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_NONE;
-    w.YCbCr420 = iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_NONE;
-    w
+    iddcx::IDDCX_WIRE_BITS_PER_COMPONENT {
+        Rgb: rgb,
+        YCbCr444: iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_NONE,
+        YCbCr422: iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_NONE,
+        YCbCr420: iddcx::IDDCX_BITS_PER_COMPONENT::IDDCX_BITS_PER_COMPONENT_NONE,
+    }
 }
 
 /// `IDDCX_TARGET_MODE2` for a scan-out mode (HDR `*2` path): builds the v1 [`target_mode`] and copies its
@@ -521,11 +524,12 @@ pub fn wire_bits() -> iddcx::IDDCX_WIRE_BITS_PER_COMPONENT {
 /// zeroed.
 pub fn target_mode2(width: u32, height: u32, refresh_rate: u32) -> iddcx::IDDCX_TARGET_MODE2 {
     let m1 = target_mode(width, height, refresh_rate);
-    let mut tm = pod_init!(iddcx::IDDCX_TARGET_MODE2);
-    tm.Size = core::mem::size_of::<iddcx::IDDCX_TARGET_MODE2>() as u32;
-    tm.TargetVideoSignalInfo = m1.TargetVideoSignalInfo;
-    tm.BitsPerComponent = wire_bits();
-    tm
+    iddcx::IDDCX_TARGET_MODE2 {
+        Size: core::mem::size_of::<iddcx::IDDCX_TARGET_MODE2>() as u32,
+        TargetVideoSignalInfo: m1.TargetVideoSignalInfo,
+        BitsPerComponent: wire_bits(),
+        ..Default::default()
+    }
 }
 
 /// Adopt a hardware-cursor channel delivery (`IOCTL_SET_CURSOR_CHANNEL`, proto v5): create the
@@ -738,33 +742,37 @@ pub fn create_monitor(
     // EDID (serial = id) describes the monitor; the OS calls back into parse_monitor_description.
     // The session's own mode becomes the preferred-timing DTD when it fits the encoding.
     let mut edid = pf_driver_proto::edid::generate(id, client_lum, Some((width, height, refresh)));
-    let mut desc = pod_init!(iddcx::IDDCX_MONITOR_DESCRIPTION);
-    desc.Size = core::mem::size_of::<iddcx::IDDCX_MONITOR_DESCRIPTION>() as u32;
-    desc.Type = iddcx::IDDCX_MONITOR_DESCRIPTION_TYPE::IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
-    desc.DataSize = edid.len() as u32;
-    // SAFETY: `edid` is a local array that outlives this `create_monitor` call; IddCxMonitorCreate
-    // (below) reads through `pData` SYNCHRONOUSLY, before `edid` drops — the pointer never escapes.
-    desc.pData = edid.as_mut_ptr().cast();
+    let desc = iddcx::IDDCX_MONITOR_DESCRIPTION {
+        Size: core::mem::size_of::<iddcx::IDDCX_MONITOR_DESCRIPTION>() as u32,
+        Type: iddcx::IDDCX_MONITOR_DESCRIPTION_TYPE::IDDCX_MONITOR_DESCRIPTION_TYPE_EDID,
+        DataSize: edid.len() as u32,
+        // SAFETY: `edid` is a local array that outlives this `create_monitor` call; IddCxMonitorCreate
+        // (below) reads through `pData` SYNCHRONOUSLY, before `edid` drops — the pointer never escapes.
+        pData: edid.as_mut_ptr().cast(),
+    };
 
-    let mut info = pod_init!(iddcx::IDDCX_MONITOR_INFO);
-    info.Size = core::mem::size_of::<iddcx::IDDCX_MONITOR_INFO>() as u32;
-    info.MonitorContainerId = container_guid(id);
-    info.MonitorType =
-        wdk_sys::DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY::DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
-    info.ConnectorIndex = id;
-    info.MonitorDescription = desc;
+    let mut info = iddcx::IDDCX_MONITOR_INFO {
+        Size: core::mem::size_of::<iddcx::IDDCX_MONITOR_INFO>() as u32,
+        MonitorContainerId: container_guid(id),
+        MonitorType:
+            wdk_sys::DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY::DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI,
+        ConnectorIndex: id,
+        MonitorDescription: desc,
+    };
 
-    let mut attr = pod_init!(wdk_sys::WDF_OBJECT_ATTRIBUTES);
-    attr.Size = core::mem::size_of::<wdk_sys::WDF_OBJECT_ATTRIBUTES>() as u32;
-    attr.ExecutionLevel = wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent;
-    attr.SynchronizationScope =
-        wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent;
+    let mut attr = wdk_sys::WDF_OBJECT_ATTRIBUTES {
+        Size: core::mem::size_of::<wdk_sys::WDF_OBJECT_ATTRIBUTES>() as u32,
+        ExecutionLevel: wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent,
+        SynchronizationScope:
+            wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent,
+        ..Default::default()
+    };
 
     let create_in = iddcx::IDARG_IN_MONITORCREATE {
         ObjectAttributes: &raw mut attr,
         pMonitorInfo: &raw mut info,
     };
-    let mut create_out = pod_init!(iddcx::IDARG_OUT_MONITORCREATE);
+    let mut create_out = iddcx::IDARG_OUT_MONITORCREATE::default();
     // SAFETY: adapter is a valid IddCx adapter; create_in points to valid local storage read synchronously.
     let st = unsafe { wdk_iddcx::IddCxMonitorCreate(adapter, &create_in, &mut create_out) };
     dbglog!("[pf-vd] IddCxMonitorCreate(id={id}) -> {st:#x}");
@@ -776,7 +784,7 @@ pub fn create_monitor(
     let _ = monitor.object.set(Sendable(object));
 
     // Tell the OS the monitor is plugged in.
-    let mut arrival_out = pod_init!(iddcx::IDARG_OUT_MONITORARRIVAL);
+    let mut arrival_out = iddcx::IDARG_OUT_MONITORARRIVAL::default();
     // SAFETY: `object` is the just-created IddCx monitor handle.
     let st = unsafe { wdk_iddcx::IddCxMonitorArrival(object, &mut arrival_out) };
     dbglog!("[pf-vd] IddCxMonitorArrival(id={id}) -> {st:#x}");
@@ -867,10 +875,11 @@ pub fn update_monitor_modes(
     let mut targets: Vec<iddcx::IDDCX_TARGET_MODE2> = flatten(&new_modes)
         .map(|item| target_mode2(item.width, item.height, item.refresh_rate))
         .collect();
-    let mut in_args = pod_init!(iddcx::IDARG_IN_UPDATEMODES2);
-    in_args.Reason = iddcx::IDDCX_UPDATE_REASON::IDDCX_UPDATE_REASON_OTHER;
-    in_args.TargetModeCount = targets.len() as u32;
-    in_args.pTargetModes = targets.as_mut_ptr();
+    let in_args = iddcx::IDARG_IN_UPDATEMODES2 {
+        Reason: iddcx::IDDCX_UPDATE_REASON::IDDCX_UPDATE_REASON_OTHER,
+        TargetModeCount: targets.len() as u32,
+        pTargetModes: targets.as_mut_ptr(),
+    };
     // SAFETY: `object` is a live IddCx monitor handle (arrived — checked above) and `_ddi` holds
     // its teardown and departure off until this call returns. `in_args` points at valid local
     // storage (`targets` outlives the synchronous DDI call).

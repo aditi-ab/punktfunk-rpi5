@@ -55,20 +55,24 @@ static TIMER: Mutex<Option<SendTimer>> = Mutex::new(None);
 /// is what bounds the timer's life to the device's: a re-init gets a fresh timer, and no tick can
 /// run after the framework has deleted the device.
 pub fn create(device: WDFDEVICE) -> NTSTATUS {
-    let mut cfg = pod_init!(WDF_TIMER_CONFIG);
-    cfg.Size = core::mem::size_of::<WDF_TIMER_CONFIG>() as ULONG;
-    cfg.EvtTimerFunc = Some(evt_timer);
-    cfg.Period = TICK_MS;
     // AutomaticSerialization stays FALSE (the zeroed default): the tick reaps monitors, which joins
     // the swap-chain workers, and serializing that against the device's callbacks would park that
     // join in front of them.
-    let mut attr = pod_init!(WDF_OBJECT_ATTRIBUTES);
-    attr.Size = core::mem::size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG;
-    attr.ParentObject = device.cast();
-    // Zeroed leaves these at 0 (Invalid) → set them like WDF_OBJECT_ATTRIBUTES_INIT.
-    attr.ExecutionLevel = wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent;
-    attr.SynchronizationScope =
-        wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent;
+    let mut cfg = WDF_TIMER_CONFIG {
+        Size: core::mem::size_of::<WDF_TIMER_CONFIG>() as ULONG,
+        EvtTimerFunc: Some(evt_timer),
+        Period: TICK_MS,
+        ..Default::default()
+    };
+    let mut attr = WDF_OBJECT_ATTRIBUTES {
+        Size: core::mem::size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG,
+        ParentObject: device.cast(),
+        // Zeroed leaves these at 0 (Invalid) → set them like WDF_OBJECT_ATTRIBUTES_INIT.
+        ExecutionLevel: wdk_sys::_WDF_EXECUTION_LEVEL::WdfExecutionLevelInheritFromParent,
+        SynchronizationScope:
+            wdk_sys::_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeInheritFromParent,
+        ..Default::default()
+    };
     let mut timer: WDFTIMER = core::ptr::null_mut();
     // SAFETY: cfg + attr are fully initialised locals; `timer` receives the created handle.
     let status = unsafe {

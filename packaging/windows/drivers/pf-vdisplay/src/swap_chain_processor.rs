@@ -219,9 +219,9 @@ impl SwapChainProcessor {
                 return;
             }
         };
-        // Built zeroed + field-assigned (driver style) — robust against a bindgen field-set difference.
-        let mut set_device = pod_init!(IDARG_IN_SWAPCHAINSETDEVICE);
-        set_device.pDevice = dxgi_device.as_raw().cast();
+        let set_device = IDARG_IN_SWAPCHAINSETDEVICE {
+            pDevice: dxgi_device.as_raw().cast(),
+        };
         // One shot: a failure here means the OS already unassigned this swap-chain, and
         // DXGI_ERROR_ACCESS_LOST on that handle never recovers. Returning lets the thread epilogue
         // delete it so the OS mints a fresh one — the reassign is what succeeds.
@@ -243,8 +243,9 @@ impl SwapChainProcessor {
         // while our borrowed device reference is still alive (IddCx uses it synchronously); the
         // DDI may still decline (e.g. E_NOTIMPL on pre-WDDM-3.0 hardware).
         if rt_gpu_enabled() {
-            let mut rt = pod_init!(IDARG_IN_SETREALTIMEGPUPRIORITY);
-            rt.pDevice = dxgi_device.as_raw().cast();
+            let rt = IDARG_IN_SETREALTIMEGPUPRIORITY {
+                pDevice: dxgi_device.as_raw().cast(),
+            };
             // SAFETY: driver is loaded; `swap_chain` is the live assigned swap-chain whose
             // device bind just succeeded; `rt.pDevice` is that same bound DXGI device,
             // alive across the synchronous call; `rt` points to valid local storage.
@@ -303,16 +304,15 @@ impl SwapChainProcessor {
             // keeps the GPU surface (out.MetaData.pSurface), which the fused pass below reads.
             // Built zeroed + field-assigned (driver style) so a bindgen field-set difference
             // can't break a positional struct literal.
-            let mut in_args = pod_init!(IDARG_IN_RELEASEANDACQUIREBUFFER2);
+            let mut in_args = IDARG_IN_RELEASEANDACQUIREBUFFER2::default();
             #[allow(clippy::cast_possible_truncation)]
             {
                 in_args.Size = size_of::<IDARG_IN_RELEASEANDACQUIREBUFFER2>() as u32;
             }
             in_args.AcquireSystemMemoryBuffer = 0;
-            // `pod_init!` (zeroed, not `::default()`) — consistent with every other IddCx out-struct
-            // in this driver, and robust whether or not bindgen derives `Default` for this type (its
-            // `MetaData` field carries a raw `pSurface` pointer + union which can suppress the derive).
-            let mut buffer = pod_init!(IDARG_OUT_RELEASEANDACQUIREBUFFER2);
+            // Zeroed: bindgen (`derive_default`) derives `Default` or, for a raw pointer or a
+            // union such as `MetaData`'s, emits one that zero-fills.
+            let mut buffer = IDARG_OUT_RELEASEANDACQUIREBUFFER2::default();
             // SAFETY: driver is loaded; `swap_chain` is valid; in/out point to valid local storage.
             let hr: NTSTATUS = unsafe {
                 wdk_iddcx::IddCxSwapChainReleaseAndAcquireBuffer2(
