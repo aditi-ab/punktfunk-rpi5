@@ -312,19 +312,37 @@ pub const fn wasapi_channel_mask(channels: u8) -> u32 {
     }
 }
 
-/// PipeWire / SPA `enum spa_audio_channel` positions in wire order — identical to the host
-/// capture side (`punktfunk-host` `audio::linux::spa_positions`): FL=3 FR=4 FC=5 LFE=6 SL=7
-/// SR=8 RL=12 RR=13. Identity routing: the client sets these on its playback node so PipeWire
-/// maps each wire slot to the matching speaker (and downmixes when the sink has fewer).
-pub fn spa_positions(channels: u8) -> &'static [u32] {
-    const STEREO: [u32; 2] = [3, 4]; // FL FR
-    const C51: [u32; 6] = [3, 4, 5, 6, 12, 13]; // FL FR FC LFE RL RR
-    const C71: [u32; 8] = [3, 4, 5, 6, 12, 13, 7, 8]; // FL FR FC LFE RL RR SL SR
+/// PipeWire / SPA `enum spa_audio_channel` ids and names in wire order: MONO=2 FL=3 FR=4
+/// FC=5 LFE=6 SL=7 SR=8 RL=12 RR=13. Names are what `spa_audio_parse_position` accepts. The
+/// host's capture node and the client's playback node both read this one list, so a wire slot
+/// always lands on the matching speaker. Counts other than 1, 6 and 8 get stereo.
+pub fn spa_channel_order(channels: u8) -> &'static [(u32, &'static str)] {
+    const MONO: (u32, &str) = (2, "MONO");
+    const FL: (u32, &str) = (3, "FL");
+    const FR: (u32, &str) = (4, "FR");
+    const FC: (u32, &str) = (5, "FC");
+    const LFE: (u32, &str) = (6, "LFE");
+    const SL: (u32, &str) = (7, "SL");
+    const SR: (u32, &str) = (8, "SR");
+    const RL: (u32, &str) = (12, "RL");
+    const RR: (u32, &str) = (13, "RR");
     match channels {
-        6 => &C51,
-        8 => &C71,
-        _ => &STEREO,
+        1 => &[MONO],
+        6 => &[FL, FR, FC, LFE, RL, RR],
+        8 => &[FL, FR, FC, LFE, RL, RR, SL, SR],
+        _ => &[FL, FR],
     }
+}
+
+/// [`spa_channel_order`] as the 64-slot (`SPA_AUDIO_MAX_CHANNELS`) position array of a
+/// format pod. Slots past the count stay 0, unset. Identity routing: PipeWire maps each wire
+/// slot to its speaker and downmixes when the sink has fewer.
+pub fn spa_positions(channels: u8) -> [u32; 64] {
+    let mut pos = [0u32; 64];
+    for (slot, (id, _)) in pos.iter_mut().zip(spa_channel_order(channels)) {
+        *slot = *id;
+    }
+    pos
 }
 
 #[cfg(test)]
@@ -541,14 +559,24 @@ mod tests {
         assert_eq!(wasapi_channel_mask(8).count_ones(), 8);
     }
 
+    /// Pod form and property form of the channel map are the same layout, in wire order. A
+    /// disagreement would swap channels with nothing in the log.
     #[test]
     fn spa_positions_match_wire_order() {
-        assert_eq!(spa_positions(2), &[3, 4]);
-        assert_eq!(spa_positions(6), &[3, 4, 5, 6, 12, 13]);
-        assert_eq!(spa_positions(8), &[3, 4, 5, 6, 12, 13, 7, 8]);
-        assert_eq!(spa_positions(2).len(), 2);
-        assert_eq!(spa_positions(6).len(), 6);
-        assert_eq!(spa_positions(8).len(), 8);
+        let ids =
+            |ch: u8| -> Vec<u32> { spa_channel_order(ch).iter().map(|(id, _)| *id).collect() };
+        assert_eq!(ids(1), [2]);
+        assert_eq!(ids(2), [3, 4]);
+        assert_eq!(ids(6), [3, 4, 5, 6, 12, 13]);
+        assert_eq!(ids(8), [3, 4, 5, 6, 12, 13, 7, 8]);
+        for ch in [1u8, 2, 6, 8] {
+            let pod = spa_positions(ch);
+            assert_eq!(pod[..ch as usize], ids(ch)[..], "{ch} channels");
+            assert!(
+                pod[ch as usize..].iter().all(|&p| p == 0),
+                "unset past the count"
+            );
+        }
     }
 
     /// A tone fed into wire channel N comes back out on channel N for stereo / 5.1 / 7.1.

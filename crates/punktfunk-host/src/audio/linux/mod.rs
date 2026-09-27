@@ -28,6 +28,7 @@ mod stream_sink;
 
 use super::{AudioCapturer, MicBackendStats, VirtualMic, SAMPLE_RATE};
 use anyhow::{anyhow, Context, Result};
+use punktfunk_core::audio::{spa_channel_order, spa_positions};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
@@ -376,44 +377,14 @@ impl AudioCapturer for PwAudioCapturer {
     }
 }
 
-/// GameStream surround order FL FR FC LFE RL RR [SL SR] as
-/// `(enum spa_audio_channel, name)` pairs. Format pods ([`spa_positions`]) and
-/// `audio.position` ([`spa_position_names`]) are two views of this list; a
-/// disagreement would accept audio in one layout and hand it on in another.
-///
-/// `enum spa_audio_channel` (spa/param/audio/raw.h): MONO=2 FL=3 FR=4 FC=5
-/// LFE=6 SL=7 SR=8 RL=12 RR=13. Names are what `spa_audio_parse_position` accepts.
-fn channel_order(channels: u32) -> &'static [(u32, &'static str)] {
-    const MONO: (u32, &str) = (2, "MONO");
-    const FL: (u32, &str) = (3, "FL");
-    const FR: (u32, &str) = (4, "FR");
-    const FC: (u32, &str) = (5, "FC");
-    const LFE: (u32, &str) = (6, "LFE");
-    const SL: (u32, &str) = (7, "SL");
-    const SR: (u32, &str) = (8, "SR");
-    const RL: (u32, &str) = (12, "RL");
-    const RR: (u32, &str) = (13, "RR");
-    match channels {
-        1 => &[MONO],
-        2 => &[FL, FR],
-        6 => &[FL, FR, FC, LFE, RL, RR],
-        8 => &[FL, FR, FC, LFE, RL, RR, SL, SR],
-        _ => unreachable!("validated in open()"),
-    }
-}
-
-fn spa_positions(channels: u32) -> [u32; 64] {
-    let mut pos = [0u32; 64];
-    for (slot, (id, _)) in pos.iter_mut().zip(channel_order(channels)) {
-        *slot = *id;
-    }
-    pos
-}
-
-/// [`channel_order`] as `audio.position` (`"[ FL FR ]"`) — the null-sink
-/// adapter is configured by properties, not a format pod.
+/// [`spa_channel_order`] as `audio.position` (`"[ FL FR ]"`) — the null-sink
+/// adapter is configured by properties, not a format pod. [`spa_positions`] is
+/// the pod view of the same list.
 fn spa_position_names(channels: u32) -> String {
-    let names: Vec<&str> = channel_order(channels).iter().map(|(_, n)| *n).collect();
+    let names: Vec<&str> = spa_channel_order(channels as u8)
+        .iter()
+        .map(|(_, n)| *n)
+        .collect();
     format!("[ {} ]", names.join(" "))
 }
 
@@ -849,7 +820,7 @@ fn mic_pw_thread(
         info.set_format(AudioFormat::F32LE);
         info.set_rate(SAMPLE_RATE);
         info.set_channels(channels);
-        info.set_position(spa_positions(channels));
+        info.set_position(spa_positions(channels as u8));
         let obj = pw::spa::pod::Object {
             type_: pw::spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
             id: pw::spa::param::ParamType::EnumFormat.as_raw(),
@@ -1522,7 +1493,7 @@ fn pw_thread(
         info.set_format(AudioFormat::F32LE);
         info.set_rate(rate_hz);
         info.set_channels(channels);
-        info.set_position(spa_positions(channels));
+        info.set_position(spa_positions(channels as u8));
         let obj = pw::spa::pod::Object {
             type_: pw::spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
             id: pw::spa::param::ParamType::EnumFormat.as_raw(),
@@ -1649,23 +1620,10 @@ mod tests {
         assert!(!CaptureMode::Monitor.owns_sink());
     }
 
-    /// Pod form and property form of the channel map are the same layout.
-    /// A disagreement would swap channels with nothing in the log.
+    /// These exact strings are what PipeWire parses.
     #[test]
-    fn channel_map_views_agree() {
-        for ch in [1u32, 2, 6, 8] {
-            let ids = spa_positions(ch);
-            let order = channel_order(ch);
-            assert_eq!(order.len(), ch as usize, "{ch} channels");
-            for (i, (id, _)) in order.iter().enumerate() {
-                assert_eq!(ids[i], *id, "channel {i} of {ch}");
-            }
-            assert!(
-                ids[ch as usize..].iter().all(|&p| p == 0),
-                "positions past the channel count stay unset"
-            );
-        }
-        // These exact strings are what PipeWire parses.
+    fn channel_map_names_parse() {
+        assert_eq!(spa_position_names(1), "[ MONO ]");
         assert_eq!(spa_position_names(2), "[ FL FR ]");
         assert_eq!(spa_position_names(6), "[ FL FR FC LFE RL RR ]");
         assert_eq!(spa_position_names(8), "[ FL FR FC LFE RL RR SL SR ]");
