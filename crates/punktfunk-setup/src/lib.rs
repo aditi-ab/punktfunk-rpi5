@@ -12,6 +12,8 @@ pub mod choices;
 pub mod demo;
 pub mod exec;
 pub mod facts;
+#[cfg(test)]
+pub(crate) mod fixtures;
 pub mod plan;
 pub mod platform;
 pub mod report;

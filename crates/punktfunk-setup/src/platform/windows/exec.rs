@@ -798,31 +798,11 @@ fn to_utf16le_bom(text: &str) -> Vec<u8> {
 mod tests {
     use super::super::choices::WinChoices;
     use super::super::plan::{self, Artifact};
-    use super::super::{FakeNet, TaskState, WinFacts, WinInstall};
+    use super::super::{FakeNet, WinFacts, WinInstall};
     use super::*;
+    use crate::fixtures::fresh_win as fresh_facts;
     use crate::seam::FakeRunner;
     use crate::ui::Plain;
-
-    fn fresh_facts() -> WinFacts {
-        WinFacts {
-            os_build: 26200,
-            arch: "x64".into(),
-            installed: None,
-            host_env_present: false,
-            web_password_present: false,
-            mgmt_bind_set: false,
-            competing_hosts: vec![],
-            mgmt_port_in_use: false,
-            networks: vec![],
-            steam_audio_drivers: true,
-            tray_autostart: false,
-            vulkan_layer_registered: false,
-            web_task: TaskState::Absent,
-            scripting_task: TaskState::Absent,
-            inno_uninstaller: false,
-            client_installed: None,
-        }
-    }
 
     fn executor<'a>(
         run: &'a FakeRunner,

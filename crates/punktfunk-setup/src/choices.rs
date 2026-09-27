@@ -201,50 +201,8 @@ fn resolve_channel(facts: &Facts, pinned: Option<Channel>) -> (Channel, Option<C
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::facts::{Family, Firewall, Nvidia, OsRelease};
-
-    /// A box with nothing on it, which every case below varies one field of.
-    fn fresh(id: &str, family: Family) -> Facts {
-        Facts {
-            os: OsRelease {
-                id: id.into(),
-                id_like: String::new(),
-                version_id: String::new(),
-                pretty: id.into(),
-            },
-            family,
-            omarchy: id == "omarchy",
-            docs_page: String::new(),
-            host_punt: None,
-            has_flatpak_client: false,
-            rpm_group: None,
-            floor: None,
-            couch_box: id == "bazzite" || id == "nobara",
-            graphical_seat: true,
-            desktop_sessions: true,
-            sunshine_active: false,
-            current_channel: None,
-            installed_pf: vec![],
-            missing: vec!["host".into(), "web-console".into(), "plugin-runner".into()],
-            host_version: None,
-            has_web_server: false,
-            has_omarchy_bin: false,
-            has_ujust: false,
-            in_input_group: false,
-            in_punktfunk_group: false,
-            has_input_group: true,
-            nvidia: Nvidia::Absent,
-            firewall: Firewall::None,
-            systemd_pid1: true,
-            user_manager: true,
-            web_unit_present: true,
-            web_password_present: false,
-            web_bind: None,
-            scripting_unit_disabled: false,
-            ip: Some("192.168.1.10".into()),
-            user: "pf".into(),
-        }
-    }
+    use crate::facts::Family;
+    use crate::fixtures::fresh_facts as fresh;
 
     /// One grammar for `--web-bind` and `/WEBBIND`; only the caller's strictness differs.
     #[test]
