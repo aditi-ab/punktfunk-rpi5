@@ -112,7 +112,8 @@ HDR over the virtual display.
 
 | Path | What |
 |---|---|
-| `crates/punktfunk-core` | Wire format, FEC, crypto, pacing, the QUIC control plane (`quic` feature) and the C ABI |
+| `crates/punktfunk-core` | Wire format, FEC, crypto, pacing and the QUIC control plane (`quic` feature) |
+| `crates/punktfunk-ffi` | The C ABI over the core, and the demo-mode loopback host |
 | `crates/punktfunk-host` | The host: sessions, both protocol planes, management API, game library, CLI |
 | `crates/pf-vdisplay` | Virtual outputs, one backend per compositor plus the Windows driver backend |
 | `crates/pf-capture` | PipeWire portal capture (Linux) and driver push (Windows) behind `Capturer` |
@@ -156,8 +157,8 @@ git dependencies.
 ## Design invariants
 
 - **One core, linked everywhere.** Protocol, FEC and crypto live once in `punktfunk-core`, behind a
-  versioned C ABI. `punktfunk_abi_version()` and `PunktfunkConfig.struct_size` let an embedder
-  detect a mismatch instead of corrupting a struct.
+  versioned C ABI (`punktfunk-ffi`). `punktfunk_abi_version()` and `PunktfunkConfig.struct_size`
+  let an embedder detect a mismatch instead of corrupting a struct.
 - **No async on the hot path.** The per-frame pipeline runs on native threads. `tokio` and `quinn`
   sit behind the off-by-default `quic` feature and serve the control plane only.
 - **The host never scales a virtual display.** Each session gets an output at the client's

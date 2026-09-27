@@ -217,6 +217,9 @@ fun registerCargoNdk(taskName: String, release: Boolean) =
         description = "cargo-ndk build of punktfunk-client-android (${if (release) "release" else "debug"})"
         dependsOn(fetchSkiaBinaries) // skia-bindings must only see digest-verified archives (H-2)
         workingDir = repoRoot
+        // cargo-ndk only adds to jniLibs. Empty it first, so no library an older tree built ships.
+        val jniLibs = file("src/main/jniLibs")
+        doFirst { jniLibs.deleteRecursively() }
         cargoNdkEnvironment()
         // Resolve cargo by ABSOLUTE path: Gradle's Exec resolves command[0] via the JVM's
         // inherited PATH, NOT the environment("PATH", …) set above (that only reaches the spawned
@@ -233,7 +236,7 @@ fun registerCargoNdk(taskName: String, release: Boolean) =
             // what actually enforces the floor; >28 entry points must be dlsym-resolved (see
             // decode::try_set_frame_rate, decode::install_render_callback, adpf).
             "--platform", "28",
-            "-o", file("src/main/jniLibs").absolutePath,
+            "-o", jniLibs.absolutePath,
             "build", "-p", "punktfunk-client-android",
         )
         if (release) cmd += "--release"

@@ -54,6 +54,7 @@ on:
       - 'crates/pf-win-display/**'
       - 'crates/pf-zerocopy/**'
       - 'crates/punktfunk-core/**'
+      - 'crates/punktfunk-ffi/**'
       - 'crates/punktfunk-encode-worker/**'
       - 'crates/punktfunk-host/**'
       - 'crates/punktfunk-tray/**'

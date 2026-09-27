@@ -11,7 +11,7 @@
 
 use crate::audio;
 use crate::video::{DecodedFrame, DecodedImage, Decoder};
-use punktfunk_core::client::{FrameOrder, NativeClient};
+use punktfunk_core::client::{ConnectParams, FrameOrder, NativeClient};
 use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
 use punktfunk_core::reanchor::{GateVerdict, ReanchorGate};
 use punktfunk_core::PunktfunkError;
@@ -612,43 +612,44 @@ fn dial(
     // This pair is the request: core derives the cap from it being specified, so
     // `None` must reach the wire as unspecified, not as an explicit 48 000/16.
     let (audio_rate_hz, audio_bits) = hires.unwrap_or(AUDIO_FORMAT_UNSPECIFIED);
-    // Per dial: a session without a preset must not name the last one's.
-    punktfunk_core::client::set_session_preset(params.preset_id.as_deref().and_then(|id| {
-        punktfunk_core::quic::SessionPreset::new(id, params.preset.as_deref().unwrap_or(""))
-    }));
-    NativeClient::connect_with_audio_format(
-        &params.host,
-        params.port,
-        params.mode,
-        params.compositor,
-        params.gamepad,
-        plan.bitrate_kbps,
-        plan.video_caps,
-        params.audio_channels,
+    NativeClient::connect(ConnectParams {
+        compositor: params.compositor,
+        gamepad: params.gamepad,
+        bitrate_kbps: plan.bitrate_kbps,
+        video_caps: plan.video_caps,
+        audio_channels: params.audio_channels,
         audio_rate_hz,
         audio_bits,
         // Legacy coupling: this client decodes either, and only NDL-class sinks need the other.
-        punktfunk_core::audio::AudioLayout::Legacy,
-        params.video_fit,
-        plan.advertised_codecs,
-        plan.preferred,
+        audio_layout: punktfunk_core::audio::AudioLayout::Legacy,
+        video_fit: params.video_fit,
+        video_codecs: plan.advertised_codecs,
+        preferred_codec: plan.preferred,
         // Env hatch wins so an A/B run can pin an exact peak (`PUNKTFUNK_CLIENT_PEAK_NITS`).
-        punktfunk_core::client::display_hdr_env_override().or(params.display_hdr),
-        client_caps(params, plan.pad_audio_on),
+        display_hdr: punktfunk_core::client::display_hdr_env_override().or(params.display_hdr),
+        client_caps: client_caps(params, plan.pad_audio_on),
         // Slice-progressive delivery: off — every rung here is fed whole AUs.
-        false,
-        params.launch.clone(),
+        frame_parts: false,
+        launch: params.launch.clone(),
         // Host's trust-store label. Without it every no-PIN "request access" knock
         // showed as the fingerprint placeholder "device abcd1234".
-        Some(crate::trust::device_name()),
-        params.pin,
-        Some(params.identity.clone()),
-        params.connect_timeout,
+        name: Some(crate::trust::device_name()),
+        pin: params.pin,
+        identity: Some(params.identity.clone()),
+        preset: params.preset_id.as_deref().and_then(|id| {
+            punktfunk_core::quic::SessionPreset::new(id, params.preset.as_deref().unwrap_or(""))
+        }),
         // Session stop flag, so cancel reaches a dial that has not landed. Without
         // it this parks the pump for the whole budget (185 s on a request-access
         // connect the host holds pending) and cancel cannot be answered until return.
-        Some(stop.clone()),
-    )
+        cancel: Some(stop.clone()),
+        ..ConnectParams::new(
+            &params.host,
+            params.port,
+            params.mode,
+            params.connect_timeout,
+        )
+    })
     .map(Arc::new)
     .map_err(|e| {
         let trust_rejected = matches!(e, PunktfunkError::Crypto);

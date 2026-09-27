@@ -11,10 +11,9 @@
 # NET_ADMIN, so this is a local/on-demand rig and never a CI gate.
 #
 # PUNKTFUNK_ABR_PROBE=0 and the other ABR environment knobs pass through, which
-# is how the startup-burst control run is taken. PF_RIG_SKIP_BUILD=1 reuses the
-# binaries from the last run; PF_RIG_RECOVERY_MS sets how long the host takes to
-# answer a keyframe request. PUNKTFUNK_PERF=1 puts the host's send-loop
-# percentiles in its log, for reading a standing delay at a low rate.
+# is how the startup-burst control run is taken. PF_RIG_RECOVERY_MS sets how long
+# the host takes to answer a keyframe request. PUNKTFUNK_PERF=1 puts the host's
+# send-loop percentiles in its log, for reading a standing delay at a low rate.
 set -euo pipefail
 
 PROFILE=${1:?usage: run.sh <profile> [seconds]}
@@ -36,7 +35,7 @@ env_args=(-e PF_RIG_OUT=/out)
 for k in PUNKTFUNK_ABR_PROBE PUNKTFUNK_ABR_PROBE_KBPS PUNKTFUNK_ABR_MAX_MBPS \
          PUNKTFUNK_FEC_PCT \
          PUNKTFUNK_PACE_FACTOR PUNKTFUNK_PACE_BURST_KB PF_RIG_RECOVERY_MS \
-         PF_RIG_SKIP_BUILD PF_RIG_KEYFRAME_ANSWER PF_RIG_IDR_PCT PF_RIG_DECODER_HOLD \
+         PF_RIG_KEYFRAME_ANSWER PF_RIG_IDR_PCT PF_RIG_DECODER_HOLD \
          PF_RIG_BRINGUP_MS PF_RIG_NO_RAMP PF_RIG_POLICE_BURST_KB \
          PUNKTFUNK_PERF RUST_LOG; do
   if [ -n "${!k:-}" ]; then env_args+=(-e "$k=${!k}"); fi

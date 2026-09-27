@@ -20,21 +20,16 @@
 //! drops the same classes; the gate runs after the controller-mouse fold, so those pads need
 //! only the pointer grant.
 
-use super::super::pad_mouse::{PadMouse, PadMouseShared, TICK};
+use super::super::pad_mouse::{PadMouse, TICK};
 use super::*;
 use crate::input::scroll::ScrollOutput;
 use crate::input::{GamepadSnapshot, MAX_PADS};
-use std::sync::atomic::AtomicBool;
 
-/// What the controller-mouse translator reads beside the input queue.
+/// What the input task reads beside its queue.
 pub(super) struct MouseArgs {
-    pub(super) shared: Arc<PadMouseShared>,
-    /// Live grants: pointer and key outputs each need theirs.
-    pub(super) grants: Arc<AtomicU32>,
-    /// Current stream mode; pointer speed scales with its height.
-    pub(super) mode: Arc<std::sync::Mutex<Mode>>,
-    /// Live invert-scroll toggle ([`NativeClient::set_invert_scroll`]).
-    pub(super) scroll_invert: Arc<AtomicBool>,
+    /// Live grants (pointer and key outputs each need theirs), the stream mode pointer speed
+    /// scales with, the invert-scroll toggle, the pad-mouse request and pad-audio caps.
+    pub(super) client: Arc<ClientShared>,
     /// Host advertised `HOST_CAP2_SCROLL`: normalized events go out unchanged.
     pub(super) normalized_scroll: bool,
 }
@@ -44,10 +39,11 @@ pub(super) struct MouseArgs {
 /// the old-host `MouseScroll` conversion each happen exactly once.
 fn send_input(conn: &quinn::Connection, out: &mut ScrollOutput, args: &MouseArgs, ev: InputEvent) {
     let invert = args
+        .client
         .scroll_invert
         .load(std::sync::atomic::Ordering::Relaxed);
     if let Some(ev) = out.prepare(ev, invert) {
-        send_granted(conn, &args.grants, ev);
+        send_granted(conn, &args.client.access_grants, ev);
     }
 }
 
@@ -80,11 +76,14 @@ fn sync_mouse(
     pads: &mut [Option<GamepadSnapshot>; MAX_PADS],
     dirty: &mut [bool; MAX_PADS],
 ) {
-    let grants = args.grants.load(std::sync::atomic::Ordering::Relaxed);
+    let grants = args
+        .client
+        .access_grants
+        .load(std::sync::atomic::Ordering::Relaxed);
     if grants & crate::quic::GRANT_POINTER == 0 {
-        args.shared.clear_all();
+        args.client.pad_mouse.clear_all();
     }
-    let want = args.shared.active(grants);
+    let want = args.client.pad_mouse.active(grants);
     let on = mouse.on_mask();
     for idx in 0..MAX_PADS {
         let bit = 1u16 << idx;
@@ -138,13 +137,13 @@ pub(super) async fn run(
     // HOST_CAP_PAD_AUDIO: only then do arrivals carry flags 8/9. An older host
     // reads the whole flags word as the pad index and would drop the kind.
     pad_audio: bool,
-    // bit0 haptics, bit1 speaker. Fed by [`NativeClient::set_pad_audio_caps`] and
-    // by arrival events that already carry the bits.
-    pad_audio_caps: std::sync::Arc<[std::sync::atomic::AtomicU8; crate::input::MAX_PADS]>,
     mouse_args: MouseArgs,
 ) {
     use crate::input::InputKind;
     use std::sync::atomic::Ordering;
+    // bit0 haptics, bit1 speaker. Fed by [`NativeClient::set_pad_audio_caps`] and
+    // by arrival events that already carry the bits.
+    let pad_audio_caps = &mouse_args.client.pad_audio_caps;
     let mut mouse = PadMouse::default();
     // One seam for every outbound input event: Scroll stays whole toward a
     // normalized host, converts once to MouseScroll against an older one, and
@@ -197,14 +196,14 @@ pub(super) async fn run(
                     if matches!(ev.kind, InputKind::GamepadButton | InputKind::GamepadAxis)
                         && mouse.is_on(idx)
                     {
-                        flush_dirty(&conn, &mouse_args.grants, &mut pads, &mut seq, &mut dirty);
-                        let grants = mouse_args.grants.load(Ordering::Relaxed);
+                        flush_dirty(&conn, &mouse_args.client.access_grants, &mut pads, &mut seq, &mut dirty);
+                        let grants = mouse_args.client.access_grants.load(Ordering::Relaxed);
                         send_all(&conn, &mut scroll_out, &mouse_args, mouse.fold(idx, &ev, grants));
                         continue;
                     }
                     if ev.kind == InputKind::GamepadRemove && mouse.is_on(idx) {
                         send_all(&conn, &mut scroll_out, &mouse_args, mouse.leave(idx));
-                        mouse_args.shared.clear(idx);
+                        mouse_args.client.pad_mouse.clear(idx);
                     }
                     if gamepad_snapshots
                         && matches!(ev.kind, InputKind::GamepadButton | InputKind::GamepadAxis)
@@ -221,7 +220,7 @@ pub(super) async fn run(
                         continue;
                     }
                     // Anything else goes out behind the snapshots folded so far.
-                    flush_dirty(&conn, &mouse_args.grants, &mut pads, &mut seq, &mut dirty);
+                    flush_dirty(&conn, &mouse_args.client.access_grants, &mut pads, &mut seq, &mut dirty);
                     if gamepad_snapshots && ev.kind == InputKind::GamepadRemove && idx < MAX_PADS {
                         // Seq-stamped removal in the shared seq space so no reorder resurrects
                         // the pad. Arm the burst; drop owed arrival (a re-plug sends its own).
@@ -234,7 +233,7 @@ pub(super) async fn run(
                             flags: crate::input::encode_gamepad_remove(idx as u8, seq[idx]),
                             ..ev
                         };
-                        send_granted(&conn, &mouse_args.grants, rem);
+                        send_granted(&conn, &mouse_args.client.access_grants, rem);
                         continue;
                     }
                     if gamepad_snapshots && ev.kind == InputKind::GamepadArrival {
@@ -254,24 +253,24 @@ pub(super) async fn run(
                                 flags: arrival_flags(idx),
                                 ..ev
                             };
-                            send_granted(&conn, &mouse_args.grants, arr);
+                            send_granted(&conn, &mouse_args.client.access_grants, arr);
                             continue;
                         }
                     }
                     send_input(&conn, &mut scroll_out, &mouse_args, ev);
                 }
-                flush_dirty(&conn, &mouse_args.grants, &mut pads, &mut seq, &mut dirty);
+                flush_dirty(&conn, &mouse_args.client.access_grants, &mut pads, &mut seq, &mut dirty);
                 if !mouse.moving() {
                     last_mouse_tick = None;
                 }
                 let live = (0..MAX_PADS)
                     .filter(|&i| pads[i].is_some() || arrival[i].is_some())
                     .fold(0u16, |m, i| m | 1 << i);
-                mouse_args.shared.set_live(live);
+                mouse_args.client.pad_mouse.set_live(live);
             }
-            _ = mouse_args.shared.changed.notified() => {
+            _ = mouse_args.client.pad_mouse.changed.notified() => {
                 sync_mouse(&conn, &mut mouse, &mouse_args, &mut scroll_out, &mut pads, &mut dirty);
-                flush_dirty(&conn, &mouse_args.grants, &mut pads, &mut seq, &mut dirty);
+                flush_dirty(&conn, &mouse_args.client.access_grants, &mut pads, &mut seq, &mut dirty);
                 if !mouse.moving() {
                     last_mouse_tick = None;
                 }
@@ -280,8 +279,8 @@ pub(super) async fn run(
                 let now = std::time::Instant::now();
                 let dt = last_mouse_tick.map_or(TICK, |t| now.duration_since(t));
                 last_mouse_tick = Some(now);
-                let height = mouse_args.mode.lock().map(|m| m.height).unwrap_or(0);
-                let grants = mouse_args.grants.load(Ordering::Relaxed);
+                let height = mouse_args.client.mode.lock().map(|m| m.height).unwrap_or(0);
+                let grants = mouse_args.client.access_grants.load(Ordering::Relaxed);
                 send_all(&conn, &mut scroll_out, &mouse_args, mouse.tick(dt.as_secs_f64(), height, grants));
             }
             _ = refresh.tick() => {
@@ -309,7 +308,7 @@ pub(super) async fn run(
                                 y: 0,
                                 flags: arrival_flags(idx),
                             };
-                            send_granted(&conn, &mouse_args.grants, arr);
+                            send_granted(&conn, &mouse_args.client.access_grants, arr);
                         } else {
                             arrival_owed[idx] = 0;
                         }
@@ -328,10 +327,10 @@ pub(super) async fn run(
                             y: 0,
                             flags: crate::input::encode_gamepad_remove(idx as u8, seq[idx]),
                         };
-                        send_granted(&conn, &mouse_args.grants, rem);
+                        send_granted(&conn, &mouse_args.client.access_grants, rem);
                     }
                 }
-                flush_dirty(&conn, &mouse_args.grants, &mut pads, &mut seq, &mut dirty);
+                flush_dirty(&conn, &mouse_args.client.access_grants, &mut pads, &mut seq, &mut dirty);
             }
         }
     }
@@ -341,7 +340,6 @@ pub(super) async fn run(
 mod tests {
     use super::*;
     use crate::input::{gamepad, InputEvent, InputKind};
-    use std::sync::atomic::AtomicU8;
 
     async fn loopback() -> (quinn::Endpoint, quinn::Connection, quinn::Connection) {
         let server = crate::quic::endpoint::server("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -361,20 +359,19 @@ mod tests {
         (server, client_conn, host_conn)
     }
 
-    fn mouse_args(shared: &Arc<PadMouseShared>) -> MouseArgs {
-        granted_args(shared, crate::quic::GRANT_ALL)
+    fn client(grants: u32) -> Arc<ClientShared> {
+        let c = ClientShared::new(Mode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+        });
+        c.access_grants.store(grants, Ordering::Relaxed);
+        Arc::new(c)
     }
 
-    fn granted_args(shared: &Arc<PadMouseShared>, grants: u32) -> MouseArgs {
+    fn mouse_args(client: &Arc<ClientShared>) -> MouseArgs {
         MouseArgs {
-            shared: shared.clone(),
-            grants: Arc::new(AtomicU32::new(grants)),
-            mode: Arc::new(std::sync::Mutex::new(Mode {
-                width: 1920,
-                height: 1080,
-                refresh_hz: 60,
-            })),
-            scroll_invert: Arc::new(AtomicBool::new(false)),
+            client: client.clone(),
             normalized_scroll: true,
         }
     }
@@ -423,9 +420,8 @@ mod tests {
     async fn a_mouse_pad_goes_neutral_and_its_buttons_become_keys() {
         let (_server, client_conn, host_conn) = loopback().await;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let caps = Arc::new(std::array::from_fn(|_| AtomicU8::new(0)));
-        let shared = Arc::new(PadMouseShared::default());
-        let task = tokio::spawn(run(client_conn, rx, true, false, caps, mouse_args(&shared)));
+        let client = client(crate::quic::GRANT_ALL);
+        let task = tokio::spawn(run(client_conn, rx, true, false, mouse_args(&client)));
 
         tx.send(button(gamepad::BTN_A, 0)).unwrap();
         let held = next_event(&host_conn, &[]).await;
@@ -434,7 +430,7 @@ mod tests {
             gamepad::BTN_A
         );
 
-        shared.request(1);
+        client.pad_mouse.request(1);
         // A refresh of the held A may still be in flight; the neutral snapshot follows it.
         loop {
             let snap = GamepadSnapshot::from_event(&next_event(&host_conn, &[]).await)
@@ -453,9 +449,13 @@ mod tests {
         let other = next_event(&host_conn, &[0]).await;
         let other = GamepadSnapshot::from_event(&other).expect("pad 1 forwards");
         assert_eq!((other.pad, other.buttons), (1, gamepad::BTN_A));
-        assert_eq!(shared.live(), 0b11, "both pads are live on the host");
+        assert_eq!(
+            client.pad_mouse.live(),
+            0b11,
+            "both pads are live on the host"
+        );
 
-        shared.request(0);
+        client.pad_mouse.request(0);
         let up = next_event(&host_conn, &[0, 1]).await;
         assert_eq!(
             (up.kind, up.code),
@@ -470,10 +470,8 @@ mod tests {
     async fn a_key_without_the_keyboard_grant_stays_off_the_wire() {
         let (_server, client_conn, host_conn) = loopback().await;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let caps = Arc::new(std::array::from_fn(|_| AtomicU8::new(0)));
-        let shared = Arc::new(PadMouseShared::default());
-        let args = granted_args(&shared, crate::quic::GRANT_GAMEPAD);
-        let task = tokio::spawn(run(client_conn, rx, true, false, caps, args));
+        let client = client(crate::quic::GRANT_GAMEPAD);
+        let task = tokio::spawn(run(client_conn, rx, true, false, mouse_args(&client)));
 
         tx.send(key_down(0x41)).unwrap();
         tx.send(button(gamepad::BTN_A, 0)).unwrap();
@@ -489,18 +487,9 @@ mod tests {
     async fn a_pad_without_the_gamepad_grant_only_reaches_the_host_as_a_mouse() {
         let (_server, client_conn, host_conn) = loopback().await;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let caps = Arc::new(std::array::from_fn(|_| AtomicU8::new(0)));
-        let shared = Arc::new(PadMouseShared::default());
-        shared.request(1);
-        let grants = crate::quic::GRANT_POINTER | crate::quic::GRANT_KEYBOARD;
-        let task = tokio::spawn(run(
-            client_conn,
-            rx,
-            true,
-            false,
-            caps,
-            granted_args(&shared, grants),
-        ));
+        let client = client(crate::quic::GRANT_POINTER | crate::quic::GRANT_KEYBOARD);
+        client.pad_mouse.request(1);
+        let task = tokio::spawn(run(client_conn, rx, true, false, mouse_args(&client)));
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         tx.send(button(gamepad::BTN_B, 0)).unwrap();
@@ -524,9 +513,8 @@ mod tests {
     async fn one_pad_report_leaves_as_one_snapshot() {
         let (_server, client_conn, host_conn) = loopback().await;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let caps = Arc::new(std::array::from_fn(|_| AtomicU8::new(0)));
-        let shared = Arc::new(PadMouseShared::default());
-        let task = tokio::spawn(run(client_conn, rx, true, false, caps, mouse_args(&shared)));
+        let client = client(crate::quic::GRANT_ALL);
+        let task = tokio::spawn(run(client_conn, rx, true, false, mouse_args(&client)));
         let axes = [
             (gamepad::AXIS_LS_X, 1_000),
             (gamepad::AXIS_LS_Y, -2_000),

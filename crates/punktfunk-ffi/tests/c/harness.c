@@ -1,7 +1,7 @@
 /*
- * punktfunk-core C ABI harness — M1 acceptance.
+ * punktfunk C ABI harness — M1 acceptance.
  *
- * Proves the core links from C and round-trips encoded access units through the full
+ * Proves the C ABI links from C and round-trips encoded access units through the full
  * packetize -> FEC -> in-process loopback (with deterministic packet loss) -> FEC
  * recover -> reassemble path, recovering every byte exactly.
  *
@@ -9,6 +9,7 @@
  */
 #include "punktfunk_core.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,18 +31,21 @@ static PunktfunkConfig make_config(uint32_t role, uint32_t drop_period) {
 }
 
 int main(void) {
-    printf("punktfunk-core C ABI harness (abi_version=%u)\n", punktfunk_abi_version());
+    printf("punktfunk C ABI harness (abi_version=%u)\n", punktfunk_abi_version());
 
-    /* PunktfunkConnectOpts (v35): the C compiler must agree with Rust's const-asserted layout —
-     * 104 bytes on 64-bit / 76 on 32-bit, NO tail padding (the growth contract: an appended field
+    /* PunktfunkConnectOpts (v41): the C compiler must agree with Rust's const-asserted layout —
+     * 120 bytes on 64-bit / 84 on 32-bit, NO tail padding (the growth contract: an appended field
      * may never land in bytes an older caller's sizeof already covered, and C leaves padding
-     * unspecified, which is what `reserved0` exists to prevent) — and the size-prefix guard must
-     * reject an undersized struct as a status, not a read. The declaration sits behind the
-     * header's quic guard; the staticlib this harness links always carries quic (see the
-     * -lopus/Security link line), so the check only needs the define. */
+     * unspecified, which is what `reserved0` exists to prevent), with `video_fit` in the byte a
+     * v35-v40 caller zeroed as `reserved0` — and the size-prefix guard must reject an undersized
+     * struct as a status, not a read. The declaration sits behind the header's quic guard; the
+     * staticlib this harness links always carries quic (see the -lopus/Security link line), so
+     * the check only needs the define. */
 #ifdef PUNKTFUNK_FEATURE_QUIC
-    if (sizeof(PunktfunkConnectOpts) != (sizeof(void *) == 8 ? 104u : 76u)) {
-        fprintf(stderr, "FAIL: PunktfunkConnectOpts is %zu bytes\n", sizeof(PunktfunkConnectOpts));
+    if (sizeof(PunktfunkConnectOpts) != (sizeof(void *) == 8 ? 120u : 84u)
+        || offsetof(PunktfunkConnectOpts, video_fit) != (sizeof(void *) == 8 ? 100u : 72u)) {
+        fprintf(stderr, "FAIL: PunktfunkConnectOpts is %zu bytes, video_fit at %zu\n",
+                sizeof(PunktfunkConnectOpts), offsetof(PunktfunkConnectOpts, video_fit));
         return 1;
     }
     {

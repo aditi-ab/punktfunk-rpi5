@@ -38,9 +38,9 @@ pub(crate) const MAX_CONCEAL_MS: u32 = 50;
 /// [`MAX_CONCEAL_MS`] as a packet count at `frame_us`: 10 at 5 ms, 25 at 2 ms. Floors at 1 so a
 /// zero cap cannot disable concealment.
 ///
-/// `pub(crate)` so the PCM decoder in `abi.rs` can size its no-realloc buffer from the same
-/// frame length. Buffer and cap must agree on how many frames can arrive at once.
-pub(crate) const fn max_conceal_packets(frame_us: u32) -> u32 {
+/// Public so the C ABI's PCM decoder (`punktfunk-ffi`) can size its no-realloc buffer from the
+/// same frame length. Buffer and cap must agree on how many frames can arrive at once.
+pub const fn max_conceal_packets(frame_us: u32) -> u32 {
     let us = if frame_us == 0 {
         FRAME_MS * 1000
     } else {

@@ -598,8 +598,8 @@ impl Ds5Feedback {
     /// `ucMicLightMode`: USB report byte 9.
     const MIC_LED: usize = 9 - Self::REPORT_ID_LEN;
     const LED_RGB: usize = 45 - Self::REPORT_ID_LEN;
-    /// Mode byte plus 10 parameters — same width as `PUNKTFUNK_HID_EFFECT_MAX`.
-    const TRIGGER_LEN: usize = punktfunk_core::abi::PUNKTFUNK_HID_EFFECT_MAX as usize;
+    /// Mode byte plus 10 parameters: the wire's trigger-effect clamp.
+    const TRIGGER_LEN: usize = punktfunk_core::quic::TRIGGER_EFFECT_MAX;
 
     fn trigger_packet(which: u8, effect: &[u8]) -> [u8; 47] {
         let mut p = [0u8; 47];

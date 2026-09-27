@@ -15,7 +15,7 @@ fallback that also runs locally and is committed as a baseline.
 By default it covers the WHOLE workspace, which is what the root file must be (the host and
 the desktop clients ship out of it). `--packages <name>[,<name>…]` restricts it to the transitive
 dependency closure of the named workspace members instead — the Apple and Android clients link
-exactly one Rust crate each (`punktfunk-core`, and the JNI bridge over it), so a workspace-wide
+exactly one Rust crate each (`punktfunk-ffi`, and the JNI bridge over the core), so a workspace-wide
 copy attributed them things they do not contain: FFmpeg, the NVENC SDK, GTK, windows-rs. Listing a
 dependency that is not there is not a licence violation, but it is a false statement in a file
 whose entire job is to be true.
