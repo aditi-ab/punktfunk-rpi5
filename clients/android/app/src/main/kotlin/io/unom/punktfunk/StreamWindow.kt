@@ -92,7 +92,7 @@ internal class StreamWindow(
     }
 
     private fun logPanel(why: String) {
-        val d = activity?.display ?: return
+        val d = runCatching { activity?.display }.getOrNull() ?: return // API 30; hidden below
         Log.i("pf.display", "panel $why mode=${d.mode.refreshRate} render=${d.refreshRate}")
     }
 
