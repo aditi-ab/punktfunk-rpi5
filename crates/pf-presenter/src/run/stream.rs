@@ -384,86 +384,82 @@ pub(super) fn toggle_pad_mouse(c: &NativeClient, ring_opener: Option<u8>) {
     }
 }
 
-/// Run one ring command against the live session (stats tier, keyboard, system buttons and
-/// controller mouse are the loop's own and are handled at the call site).
-pub(super) fn ring_command(
-    cmd: RingCommand,
-    st: &mut StreamState,
-    window: &mut sdl3::video::Window,
-    mouse: &sdl3::mouse::MouseUtil,
-    inhibit_shortcuts: bool,
-) {
-    match cmd {
-        RingCommand::EndStream => {
-            st.request_quit();
-            apply_capture(window, mouse, false, false, inhibit_shortcuts, 0);
-        }
-        RingCommand::DisconnectLinger => {
-            // Leave without the quit close code: the host lingers for a reconnect.
-            if let Some(cap) = &mut st.capture {
-                cap.release(true);
+impl Shell {
+    /// Run one ring command against the live session (stats tier, keyboard, system buttons
+    /// and controller mouse are the loop's own and are handled at the call site).
+    pub(super) fn ring_command(&mut self, cmd: RingCommand, st: &mut StreamState) {
+        match cmd {
+            RingCommand::EndStream => {
+                st.request_quit();
+                self.capture_off();
             }
-            st.handle.stop.store(true, Ordering::SeqCst);
-            apply_capture(window, mouse, false, false, inhibit_shortcuts, 0);
-        }
-        RingCommand::ToggleMic => {
-            st.handle.mic.toggle();
-        }
-        RingCommand::ToggleScrollInvert => {
-            if let Some(c) = st
-                .connector
-                .as_ref()
-                .filter(|c| c.access_grants() & punktfunk_core::quic::GRANT_POINTER != 0)
-            {
-                c.set_invert_scroll(!c.invert_scroll());
-            }
-        }
-        RingCommand::CycleTouchMode => {
-            let accepts_touch = st
-                .connector
-                .as_ref()
-                .is_some_and(|c| c.host_caps2() & punktfunk_core::quic::HOST_CAP2_TOUCH != 0);
-            if let Some(cap) = &mut st.capture {
-                let next = match (cap.touch_mode(), accepts_touch) {
-                    (TouchMode::Trackpad, _) => TouchMode::Pointer,
-                    (TouchMode::Pointer, true) => TouchMode::Touch,
-                    (TouchMode::Pointer, false) | (TouchMode::Touch, _) => TouchMode::Off,
-                    (TouchMode::Off, _) => TouchMode::Trackpad,
-                };
-                cap.set_touch_mode(next);
-            }
-        }
-        RingCommand::RequestMode {
-            width,
-            height,
-            refresh_hz,
-        } => {
-            if let Some(c) = &st.connector {
-                if let Err(e) = c.request_mode(punktfunk_core::config::Mode {
-                    width,
-                    height,
-                    refresh_hz,
-                }) {
-                    tracing::warn!(error = %e, "ring: mode request");
-                }
-            }
-        }
-        RingCommand::Shortcut(keys) => {
-            let vks: Vec<u8> = keys
-                .iter()
-                .filter_map(|k| pf_client_core::overlay_actions::key_vk(k))
-                .collect();
-            if vks.len() == keys.len() {
+            RingCommand::DisconnectLinger => {
+                // Leave without the quit close code: the host lingers for a reconnect.
                 if let Some(cap) = &mut st.capture {
-                    cap.send_chord(&vks);
+                    cap.release(true);
+                }
+                st.handle.stop.store(true, Ordering::SeqCst);
+                self.capture_off();
+            }
+            RingCommand::ToggleMic => {
+                st.handle.mic.toggle();
+            }
+            RingCommand::ToggleScrollInvert => {
+                if let Some(c) = st
+                    .connector
+                    .as_ref()
+                    .filter(|c| c.access_grants() & punktfunk_core::quic::GRANT_POINTER != 0)
+                {
+                    c.set_invert_scroll(!c.invert_scroll());
                 }
             }
+            RingCommand::CycleTouchMode => {
+                let accepts_touch = st
+                    .connector
+                    .as_ref()
+                    .is_some_and(|c| c.host_caps2() & punktfunk_core::quic::HOST_CAP2_TOUCH != 0);
+                if let Some(cap) = &mut st.capture {
+                    let next = match (cap.touch_mode(), accepts_touch) {
+                        (TouchMode::Trackpad, _) => TouchMode::Pointer,
+                        (TouchMode::Pointer, true) => TouchMode::Touch,
+                        (TouchMode::Pointer, false) | (TouchMode::Touch, _) => TouchMode::Off,
+                        (TouchMode::Off, _) => TouchMode::Trackpad,
+                    };
+                    cap.set_touch_mode(next);
+                }
+            }
+            RingCommand::RequestMode {
+                width,
+                height,
+                refresh_hz,
+            } => {
+                if let Some(c) = &st.connector {
+                    if let Err(e) = c.request_mode(punktfunk_core::config::Mode {
+                        width,
+                        height,
+                        refresh_hz,
+                    }) {
+                        tracing::warn!(error = %e, "ring: mode request");
+                    }
+                }
+            }
+            RingCommand::Shortcut(keys) => {
+                let vks: Vec<u8> = keys
+                    .iter()
+                    .filter_map(|k| pf_client_core::overlay_actions::key_vk(k))
+                    .collect();
+                if vks.len() == keys.len() {
+                    if let Some(cap) = &mut st.capture {
+                        cap.send_chord(&vks);
+                    }
+                }
+            }
+            RingCommand::CycleStats
+            | RingCommand::Keyboard
+            | RingCommand::TapButton(_)
+            | RingCommand::TogglePadMouse
+            | RingCommand::ToggleStreamMute => {}
         }
-        RingCommand::CycleStats
-        | RingCommand::Keyboard
-        | RingCommand::TapButton(_)
-        | RingCommand::TogglePadMouse
-        | RingCommand::ToggleStreamMute => {}
     }
 }
 

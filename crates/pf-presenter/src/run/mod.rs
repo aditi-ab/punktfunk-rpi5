@@ -25,7 +25,7 @@ use crate::present_pace::{
 use crate::touch::{Abs, Act};
 use crate::vk::{FrameInput, Presented, Presenter};
 use anyhow::{Context as _, Result};
-use pf_client_core::gamepad::{GamepadService, SelectChord};
+use pf_client_core::gamepad::{GamepadPump, GamepadService, MenuEvent, SelectChord};
 use pf_client_core::orchestrate::{emit, SessionLine};
 use pf_client_core::session::{self, DecodeFacts, SessionEvent, SessionHandle, SessionParams};
 use pf_client_core::trust::{MouseMode, PresentPriority, StatsVerbosity, TouchMode};
@@ -200,6 +200,63 @@ enum ModeCtl<'a> {
 /// Pure wake-up: the loop drains the frame channel regardless of why it woke.
 struct FrameWake;
 
+/// What setup builds and every pass of the loop reads, across streams. Field order is
+/// drop order: the overlay before the presenter it renders on, the presenter before the
+/// window, the SDL context last.
+struct Shell {
+    overlay_damage: OverlayDamage,
+    /// Ring Keyboard slot: hold text input on, which summons Steam's OSK under gamescope.
+    ring_keyboard: bool,
+    /// SDL text input tracks overlay editing (IME / Steam OSK). Toggled edge-wise —
+    /// start/stop are not free on Wayland.
+    text_input_on: bool,
+    overlay_frame: Option<OverlayFrame>,
+    stats_verbosity: StatsVerbosity,
+    fullscreen: bool,
+    mouse: sdl3::mouse::MouseUtil,
+    event_pump: sdl3::EventPump,
+    /// Native display mode — the `0 = native` fallback for the requested stream mode.
+    native: Mode,
+    /// Window focus and the gamescope overlay OR into one mask pushed on an edge.
+    /// Kept as separate inputs: either would otherwise clear the other's mask.
+    focus_lost: bool,
+    mask_applied: bool,
+    /// Gaming Mode's Steam menu / QAM drive the same physical pad we forward, and
+    /// gamescope never takes our X focus away, so SDL's background-input gate cannot
+    /// fire there. `None` everywhere else, where window focus is the signal.
+    #[cfg(target_os = "linux")]
+    overlay_focus: Option<pf_client_core::overlay_focus::OverlayFocus>,
+    menu_rx: async_channel::Receiver<MenuEvent>,
+    disconnect_rx: async_channel::Receiver<()>,
+    /// Last audio-mute mask drawn and when it changed: a local mute's badge is timed off it.
+    audio_mute_at: Instant,
+    audio_mute_seen: u8,
+    /// The pad whose Select+A opened the ring; `None` for a keyboard, touch or closed ring.
+    ring_opener: Option<u8>,
+    /// Ring pad ownership, edge-tracked: open masks the pads (a held trigger is released
+    /// on the host) and polls them into menu events; close re-adopts them.
+    ring_was_open: bool,
+    chord_rx: async_channel::Receiver<(u8, SelectChord)>,
+    escape_rx: async_channel::Receiver<()>,
+    pump: GamepadPump,
+    gamepad: GamepadService,
+    overlay: Option<Box<dyn Overlay>>,
+    /// `PUNKTFUNK_OSD_SCALE` on top of the display DPI: a preference, read once.
+    osd_scale_pref: f32,
+    /// `false` under `PUNKTFUNK_PRESENTER=arrival`: no glass gate, no presenter window line.
+    pacing_active: bool,
+    present_priority: PresentPriority,
+    presenter: Presenter,
+    scroll_routing: crate::scroll_routing::ScrollRouting,
+    window: sdl3::video::Window,
+    sdl_events: sdl3::EventSubsystem,
+    sdl_video: sdl3::VideoSubsystem,
+    _sdl: sdl3::Sdl,
+    opts: SessionOpts,
+    /// Browse mode: the console idles between streams.
+    browse: bool,
+}
+
 /// Decoded frame plus when the source cadence says it is due on glass. Due time is
 /// from the arrival process the store saw, not from whatever survived it.
 struct Paced {
@@ -369,228 +426,36 @@ struct StreamState {
     params: SessionParams,
 }
 
-fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>> {
-    // Before any window exists: unpackaged runs adopt the shell's AppUserModelID so
-    // shell⇄session windows group as one taskbar app (MSIX identity wins).
-    #[cfg(windows)]
-    crate::win32::set_app_user_model_id();
-    // This thread presents and forwards input; a late wake is a missed refresh.
-    pf_client_core::audio_rt::boost_and_log("presenter");
-    sdl3::hint::set("SDL_JOYSTICK_THREAD", "1");
-    // Hold Valve HIDAPI off before SDL_Init: the Deck driver clears digital mappings
-    // at enumeration. A hint set after `sdl.gamepad()` only detaches a driver that
-    // already killed the trackpad-mouse. They are still enabled for an attached session.
-    pf_client_core::gamepad::preinit_disable_valve_hidapi();
-    // Touch is forwarded as real touch below. Left on, SDL's mouse-from-touch synthesis
-    // warps a synthetic mouse; under relative lock that is a large positive delta that
-    // walks the host cursor into the corner.
-    sdl3::hint::set("SDL_TOUCH_MOUSE_EVENTS", "0");
-    // Wayland `app_id` (and X11 WM_CLASS) so compositors match io.unom.Punktfunk.desktop.
-    // Without it SDL uses a generic identity and the session window gets the default icon.
-    sdl3::hint::set("SDL_APP_ID", "io.unom.Punktfunk");
-    // `PUNKTFUNK_DRM_CARD=<n>` → SDL's KMSDRM device index. SDL takes the first card
-    // it can open, often the wrong one on a multi-GPU box. Detecting "already mastered"
-    // needs the ioctl that taking master is, so this stays an explicit operator choice.
-    if let Ok(card) = std::env::var("PUNKTFUNK_DRM_CARD") {
-        if card.chars().all(|c| c.is_ascii_digit()) && !card.is_empty() {
-            tracing::info!(
-                card,
-                "PUNKTFUNK_DRM_CARD: pinning SDL's KMSDRM device index"
-            );
-            sdl3::hint::set("SDL_KMSDRM_DEVICE_INDEX", &card);
-        } else {
-            tracing::warn!(
-                card,
-                "PUNKTFUNK_DRM_CARD must be a card NUMBER (e.g. 0) — ignoring"
-            );
-        }
-    }
-    let sdl = sdl3::init().context("SDL init")?;
-    let video = sdl.video().context("SDL video")?;
-    let events = sdl.event().context("SDL events")?;
-    events
-        .register_custom_event::<FrameWake>()
-        .map_err(|e| anyhow::anyhow!("register FrameWake event: {e}"))?;
-    let mut window = {
-        // Match-window: open at the persisted last size so the first connect's mode
-        // matches the glass. 1280×720 is the fallback.
-        let (ww, wh) = opts.window_size.unwrap_or((1280, 720));
-        let mut b = video.window(&opts.window_title, ww.max(320), wh.max(200));
-        match opts.window_pos {
-            Some((x, y)) => b.position(x, y),
-            None => b.position_centered(),
-        };
-        // HIGH_PIXEL_DENSITY: backbuffer in the panel's real pixels. Without it SDL
-        // leaves a Wayland surface at buffer scale 1, so a fractionally scaled output
-        // builds the swapchain in points. The flag only widens `size_in_pixels()`;
-        // `size()` stays logical (persisted size and SDL mouse coords).
-        b.resizable().vulkan().high_pixel_density();
-        if opts.fullscreen {
-            b.fullscreen();
-        }
-        b.build().context("SDL window")?
-    };
-    // SDL wheel input remains the fallback when native Wayland capture is unavailable.
-    let mut scroll_routing = crate::scroll_routing::ScrollRouting::new(&window);
-    // Exe-embedded icon onto the title bar/taskbar; a no-op for exes that embed none.
-    #[cfg(windows)]
-    crate::win32::stamp_window_icon(&window);
-    let instance_exts = window
-        .vulkan_instance_extensions()
-        .map_err(|e| anyhow::anyhow!("vulkan instance extensions: {e}"))?;
-    let mut presenter = Presenter::new(
-        &window,
-        &instance_exts,
-        crate::vk::PresentPref {
-            vsync: opts.vsync,
-            allow_vrr: opts.allow_vrr,
-            fullscreen: opts.fullscreen,
-            // `vrr_fifo_opt_in` and `fifo_latest_ready` are resolved inside `Presenter::new`.
-            // `..Default` keeps this site from breaking when the struct learns another field.
-            ..Default::default()
-        },
-    )
-    .context("vulkan presenter")?;
-    presenter.set_video_fit(opts.video_fit);
-    // A valid black frame immediately — the window is honest while the connect runs.
-    presenter.present(&window, FrameInput::Redraw, None)?;
-
-    // `PUNKTFUNK_PRESENTER=arrival` forces the latency drain without a rebuild.
-    let arrival_override = std::env::var("PUNKTFUNK_PRESENTER").ok().as_deref() == Some("arrival");
-    let present_priority = if arrival_override {
-        tracing::info!("PUNKTFUNK_PRESENTER=arrival — presentation pacing disabled");
-        PresentPriority::Latency
-    } else {
-        opts.present_priority
-    };
-    let pacing_active = !arrival_override;
-    let present_debug = std::env::var_os("PUNKTFUNK_PRESENT_DEBUG").is_some();
-    // Present completions wake the loop like decoded frames: a glass-gate reopen or a
-    // smoothness slot must not wait out the event timeout.
-    {
-        let sender = events.event_sender();
-        presenter.set_present_wake(Box::new(move || {
-            let _ = sender.push_custom_event(FrameWake);
-        }));
-    }
-    // Browse is "ready" the moment the library window presents — there may never be a
-    // stream. Single mode announces on the first video frame instead.
-    if opts.json_status && matches!(mode, ModeCtl::Browse(_)) {
-        emit(SessionLine::Ready);
-    }
-
-    // Operator preference on top of the display DPI. Read once (a preference, not
-    // session state); the DPI part is re-read per frame.
-    let osd_scale_pref = std::env::var("PUNKTFUNK_OSD_SCALE")
-        .ok()
-        .and_then(|s| s.trim().parse::<f32>().ok())
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .unwrap_or(1.0);
-
-    let mut overlay = opts.overlay.take();
-    if let Some(o) = overlay.as_mut() {
-        if let Err(e) = o.init(&presenter.shared_device()) {
-            if matches!(mode, ModeCtl::Browse(_)) {
-                return Err(e).context("console UI init (required for --browse)");
-            }
-            tracing::warn!(error = %format!("{e:#}"),
-                "console-UI overlay init failed — continuing without it");
-            overlay = None;
-        }
-    }
-
-    let gamepad_subsystem = sdl.gamepad().context("SDL gamepad")?;
-    let (gamepad, mut pump) = GamepadService::pumped(gamepad_subsystem);
-    let escape_rx = gamepad.escape_events();
-    let chord_rx = gamepad.chord_events();
-    // A Select chord eats the button pressed with Select, so it is only worth claiming where
-    // the overlay it drives exists — a build without the console UI leaves A and X to the game.
-    gamepad.set_chords_live(overlay.is_some());
-    // Ring pad ownership, edge-tracked: open masks the pads (a held trigger is released
-    // on the host) and polls them into menu events; close re-adopts them.
-    let mut ring_was_open = false;
-    // The pad whose Select+A opened the ring; `None` for a keyboard, touch or closed ring.
-    let mut ring_opener: Option<u8> = None;
-    // Last audio-mute mask drawn and when it changed: a local mute's badge is timed off it.
-    let mut audio_mute_seen: u8 = 0;
-    let mut audio_mute_at = Instant::now();
-    let disconnect_rx = gamepad.disconnect_events();
-    let menu_rx = gamepad.menu_events();
-    if matches!(mode, ModeCtl::Browse(_)) {
-        // Menu mode for the launcher's lifetime (an attached session supersedes translation).
-        gamepad.set_menu_mode(true);
-    }
-    // Gaming Mode's Steam menu / QAM drive the same physical pad we forward, and
-    // gamescope never takes our X focus away, so SDL's background-input gate cannot
-    // fire there. `None` everywhere else, where window focus is the signal.
-    #[cfg(target_os = "linux")]
-    let overlay_focus = pf_client_core::overlay_focus::OverlayFocus::start();
-    // Window focus and the gamescope overlay OR into one mask pushed on an edge.
-    // Kept as separate inputs: either would otherwise clear the other's mask.
-    let mut focus_lost = false;
-    let mut mask_applied = false;
-
-    // Native display mode — the `0 = native` fallback for the requested stream mode.
-    let native = window
-        .get_display()
-        .and_then(|d| d.get_mode())
-        .map(|m| native_mode(m.w, m.h, m.pixel_density, m.refresh_rate))
-        .ok()
-        // A zero-sized mode is as useless as no mode. Without this filter a display
-        // that reports 0×0 streams a 0×0 request.
-        .filter(|m: &Mode| m.width > 0 && m.height > 0)
-        .unwrap_or(Mode {
-            width: 1920,
-            height: 1080,
-            refresh_hz: 60,
-        });
-
+fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>> {
+    let mut sh = Shell::open(opts, matches!(mode, ModeCtl::Browse(_)))?;
     let mut stream: Option<StreamState> = match &mut mode {
         ModeCtl::Single(build) => {
             let force_software = Arc::new(AtomicBool::new(false));
             let mut params = build(
-                &gamepad,
-                native,
-                window_display_hdr(&window),
+                &sh.gamepad,
+                sh.native,
+                window_display_hdr(&sh.window),
                 force_software.clone(),
-                presenter.vulkan_decode(),
+                sh.presenter.vulkan_decode(),
             );
-            if opts.match_window.is_some() {
+            if sh.opts.match_window.is_some() {
                 apply_match_window(
                     &mut params,
-                    &window,
-                    opts.render_scale,
-                    opts.render_scale_max_dim,
+                    &sh.window,
+                    sh.opts.render_scale,
+                    sh.opts.render_scale_max_dim,
                 );
             }
             Some(StreamState::new(
                 params,
                 force_software,
-                events.event_sender(),
-                present_priority,
-                native.refresh_hz,
+                sh.sdl_events.event_sender(),
+                sh.present_priority,
+                sh.native.refresh_hz,
             ))
         }
         ModeCtl::Browse(_) => None,
     };
-
-    let mut event_pump = sdl
-        .event_pump()
-        .map_err(|e| anyhow::anyhow!("SDL event pump: {e}"))?;
-    let mouse = sdl.mouse();
-
-    let mut fullscreen = opts.fullscreen;
-    // Latched for the loop's life: `opts` is borrowed mutably for its callbacks at
-    // several `apply_capture` sites.
-    let inhibit_shortcuts = opts.inhibit_shortcuts;
-    let mut stats_verbosity = opts.stats_verbosity;
-    let mut overlay_frame: Option<OverlayFrame> = None;
-    // SDL text input tracks overlay editing (IME / Steam OSK). Toggled edge-wise —
-    // start/stop are not free on Wayland.
-    let mut text_input_on = false;
-    // Ring Keyboard slot: hold text input on, which summons Steam's OSK under gamescope.
-    let mut ring_keyboard = false;
-    let mut overlay_damage = OverlayDamage::default();
 
     let outcome = 'main: loop {
         // Block in SDL's wait: input/window events and decoded frames (FrameWake) all
@@ -599,30 +464,30 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         let timeout = stream
             .as_ref()
             .map_or(Duration::from_millis(15), |st| st.wake_timeout());
-        let first = event_pump.wait_event_timeout(timeout);
+        let first = sh.event_pump.wait_event_timeout(timeout);
         let mut queued: Vec<Event> = Vec::new();
         if let Some(e) = first {
             queued.push(e);
         }
-        while let Some(e) = event_pump.poll_event() {
+        while let Some(e) = sh.event_pump.poll_event() {
             queued.push(e);
         }
-        scroll_routing.begin(
+        sh.scroll_routing.begin(
             stream.as_ref().and_then(|s| s.capture.as_ref()),
-            overlay.as_deref(),
+            sh.overlay.as_deref(),
         );
         for event in queued {
             // Console UI sees input first: a consumed event never reaches capture/forwarding.
-            if let Some(o) = overlay.as_mut() {
+            if let Some(o) = sh.overlay.as_mut() {
                 if o.handle_event(&event) {
-                    scroll_routing.consumed(&event);
+                    sh.scroll_routing.consumed(&event);
                     continue;
                 }
                 // Mouse/touch: console hit-tests in its own pixel space. Consumed while
                 // the console is up; ignored while streaming (those belong to `Capture`).
-                if let Some(input) = overlay_pointer(&event, &window) {
+                if let Some(input) = overlay_pointer(&event, &sh.window) {
                     if o.handle_pointer(input) {
-                        scroll_routing.consumed(&event);
+                        sh.scroll_routing.consumed(&event);
                         continue;
                     }
                 }
@@ -636,42 +501,28 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 }
                 Event::Window { win_event, .. } => match win_event {
                     WindowEvent::FocusLost => {
-                        scroll_routing.focus_lost();
+                        sh.scroll_routing.focus_lost();
                         if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                             if cap.release(false) {
-                                apply_capture(
-                                    &mut window,
-                                    &mouse,
-                                    false,
-                                    false,
-                                    inhibit_shortcuts,
-                                    0,
-                                );
+                                sh.capture_off();
                                 tracing::info!("focus lost — input released");
                             }
                         }
                         // Controllers go with keyboard and mouse. SDL already stops
                         // delivering presses here, but nothing zeroed what the host still
                         // believes is held — masking flushes it neutral.
-                        focus_lost = true;
+                        sh.focus_lost = true;
                     }
                     WindowEvent::FocusGained => {
                         // Unlike capture, the controller mask has no "the user meant it"
                         // variant — it only mirrors who owns the pad — so regaining focus
                         // always lifts its half.
-                        focus_lost = false;
+                        sh.focus_lost = false;
                         // An auto-release (Alt-Tab) undoes itself; a chord release stays
                         // until the user opts in. With the ring up the grab waits for its close.
                         if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
-                            if cap.should_reengage() && cap.engage() && !ring_was_open {
-                                apply_capture(
-                                    &mut window,
-                                    &mouse,
-                                    true,
-                                    cap.desktop(),
-                                    inhibit_shortcuts,
-                                    cap.grants(),
-                                );
+                            if cap.should_reengage() && cap.engage() && !sh.ring_was_open {
+                                sh.capture_on(cap);
                                 tracing::info!("focus gained — input recaptured");
                             }
                         }
@@ -681,24 +532,28 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         // A refused fullscreen swapchain costs the fullscreen, not the
                         // stream: fall back to the geometry that was already working.
                         // A windowed failure still propagates — no smaller state to fall back to.
-                        if let Err(e) = presenter.recreate_swapchain(&window) {
-                            if !fullscreen {
+                        if let Err(e) = sh.presenter.recreate_swapchain(&sh.window) {
+                            if !sh.fullscreen {
                                 return Err(e);
                             }
                             tracing::warn!(
                                 error = format!("{e:#}"),
                                 "swapchain recreate failed — leaving fullscreen"
                             );
-                            fullscreen = false;
-                            if let Err(e) = window.set_fullscreen(false) {
+                            sh.fullscreen = false;
+                            if let Err(e) = sh.window.set_fullscreen(false) {
                                 tracing::warn!(error = %e, "fullscreen exit failed");
                             }
                             continue;
                         }
-                        presenter.present(&window, FrameInput::Redraw, overlay_frame.as_ref())?;
+                        sh.presenter.present(
+                            &sh.window,
+                            FrameInput::Redraw,
+                            sh.overlay_frame.as_ref(),
+                        )?;
                         // Match-window: restamp the debounce. The request fires once
                         // ~400 ms pass with no further size events, never per drag-frame.
-                        if opts.match_window.is_some() {
+                        if sh.opts.match_window.is_some() {
                             if let Some(st) = stream.as_mut() {
                                 st.resize_pending = Some(Instant::now());
                             }
@@ -708,11 +563,15 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     // the old panel. A 60 Hz-seeded clock must not keep pacing a 144 Hz panel.
                     WindowEvent::DisplayChanged(..) => {
                         if let Some(st) = stream.as_mut() {
-                            st.relearn_grid(&window);
+                            st.relearn_grid(&sh.window);
                         }
                     }
                     WindowEvent::Exposed => {
-                        presenter.present(&window, FrameInput::Redraw, overlay_frame.as_ref())?;
+                        sh.presenter.present(
+                            &sh.window,
+                            FrameInput::Redraw,
+                            sh.overlay_frame.as_ref(),
+                        )?;
                     }
                     _ => {}
                 },
@@ -723,9 +582,9 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         DisplayEvent::CurrentModeChanged | DisplayEvent::DesktopModeChanged,
                     display,
                     ..
-                } if window.get_display().is_ok_and(|d| d == display) => {
+                } if sh.window.get_display().is_ok_and(|d| d == display) => {
                     if let Some(st) = stream.as_mut() {
-                        st.relearn_grid(&window);
+                        st.relearn_grid(&sh.window);
                     }
                 }
                 // Windows never auto-repeats injected input, so a held key needs these.
@@ -757,23 +616,9 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                             if cap.captured() {
                                 cap.release(true);
-                                apply_capture(
-                                    &mut window,
-                                    &mouse,
-                                    false,
-                                    false,
-                                    inhibit_shortcuts,
-                                    0,
-                                );
+                                sh.capture_off();
                             } else if cap.engage() {
-                                apply_capture(
-                                    &mut window,
-                                    &mouse,
-                                    true,
-                                    cap.desktop(),
-                                    inhibit_shortcuts,
-                                    cap.grants(),
-                                );
+                                sh.capture_on(cap);
                             }
                             tracing::info!(captured = cap.captured(), "chord: release/engage");
                         }
@@ -788,14 +633,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                                 match cap.toggle_desktop() {
                                     Some(desktop) => {
                                         if cap.captured() {
-                                            apply_capture(
-                                                &mut window,
-                                                &mouse,
-                                                true,
-                                                desktop,
-                                                inhibit_shortcuts,
-                                                cap.grants(),
-                                            );
+                                            sh.capture_on(cap);
                                         }
                                         flipped = true;
                                         tracing::info!(desktop, "chord: mouse mode");
@@ -818,20 +656,20 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         if let Some(st) = &mut stream {
                             tracing::info!("chord: disconnect");
                             st.request_quit();
-                            apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts, 0);
+                            sh.capture_off();
                         }
                         continue;
                     }
                     if chord && key(Keycode::S, Scancode::S) {
-                        bump_stats_tier(&mut stats_verbosity, &mut stream);
-                        tracing::info!(tier = ?stats_verbosity, "chord: stats verbosity");
+                        bump_stats_tier(&mut sh.stats_verbosity, &mut stream);
+                        tracing::info!(tier = ?sh.stats_verbosity, "chord: stats verbosity");
                         continue;
                     }
                     // Quick-action ring at the window centre (a locked pointer has no
                     // position worth opening at).
                     if chord && key(Keycode::O, Scancode::O) {
-                        if let (Some(o), true) = (overlay.as_mut(), stream.is_some()) {
-                            let (pw, ph) = window.size_in_pixels();
+                        if let (Some(o), true) = (sh.overlay.as_mut(), stream.is_some()) {
+                            let (pw, ph) = sh.window.size_in_pixels();
                             o.ring_input(RingInput::Toggle {
                                 x: pw as f32 / 2.0,
                                 y: ph as f32 / 2.0,
@@ -858,10 +696,10 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     let alt_enter =
                         sc == Scancode::Return && keymod.intersects(Mod::LALTMOD | Mod::RALTMOD);
                     if sc == Scancode::F11 || alt_enter {
-                        fullscreen = !fullscreen;
-                        tracing::debug!(fullscreen, "fullscreen toggle");
-                        if let Err(e) = window.set_fullscreen(fullscreen) {
-                            tracing::warn!(error = %e, fullscreen, "fullscreen toggle failed");
+                        sh.fullscreen = !sh.fullscreen;
+                        tracing::debug!(fullscreen = sh.fullscreen, "fullscreen toggle");
+                        if let Err(e) = sh.window.set_fullscreen(sh.fullscreen) {
+                            tracing::warn!(error = %e, fullscreen = sh.fullscreen, "fullscreen toggle failed");
                         }
                         continue;
                     }
@@ -891,12 +729,12 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                                 // Before the first decoded frame there is nothing to map
                                 // onto — dropped, like touch.
                                 if let Some(video) = video {
-                                    let (lw, lh) = window.size();
+                                    let (lw, lh) = sh.window.size();
                                     let nx = x / lw.max(1) as f32;
                                     let ny = y / lh.max(1) as f32;
                                     cap.on_motion_abs(finger_to_frame(
-                                        opts.video_fit,
-                                        window.size_in_pixels(),
+                                        sh.opts.video_fit,
+                                        sh.window.size_in_pixels(),
                                         video,
                                         nx,
                                         ny,
@@ -932,14 +770,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             // access covers neither pointer nor keyboard — the click then
                             // does nothing.
                             if cap.engage() {
-                                apply_capture(
-                                    &mut window,
-                                    &mouse,
-                                    true,
-                                    cap.desktop(),
-                                    inhibit_shortcuts,
-                                    cap.grants(),
-                                );
+                                sh.capture_on(cap);
                             }
                         } else {
                             cap.on_button_down(mouse_btn);
@@ -953,7 +784,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 }
                 Event::MouseWheel { x, y, .. } => {
                     // The overlay consumes SDL wheels before native/fallback routing.
-                    scroll_routing.wheel(stream.as_mut().and_then(|s| s.capture.as_mut()), x, y);
+                    sh.scroll_routing
+                        .wheel(stream.as_mut().and_then(|s| s.capture.as_mut()), x, y);
                 }
                 // Touchscreen fingers → the session's touch model. `x`/`y` are
                 // window-normalized; only DIRECT devices (an INDIRECT trackpad drives
@@ -976,20 +808,25 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             }
                             st.touch_mouse.fingers_seen = true;
                         }
-                        if ring_finger(&mut overlay, &window, FingerPhase::Down, x, y) {
+                        if ring_finger(&mut sh.overlay, &sh.window, FingerPhase::Down, x, y) {
                             continue;
                         }
                         for act in dispatch_finger(
                             FingerPhase::Down,
-                            &window,
+                            &sh.window,
                             &mut stream,
                             finger_id,
                             x,
                             y,
                             timestamp,
-                            opts.video_fit,
+                            sh.opts.video_fit,
                         ) {
-                            on_touch_act(act, &mut stats_verbosity, &mut stream, &mut overlay);
+                            on_touch_act(
+                                act,
+                                &mut sh.stats_verbosity,
+                                &mut stream,
+                                &mut sh.overlay,
+                            );
                         }
                     } else if let Some(st) = stream.as_mut() {
                         // A finger from a device SDL does not call a touchscreen: ignored,
@@ -1014,20 +851,25 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     ..
                 } => {
                     if is_direct_touch(touch_id) {
-                        if ring_finger(&mut overlay, &window, FingerPhase::Move, x, y) {
+                        if ring_finger(&mut sh.overlay, &sh.window, FingerPhase::Move, x, y) {
                             continue;
                         }
                         for act in dispatch_finger(
                             FingerPhase::Move,
-                            &window,
+                            &sh.window,
                             &mut stream,
                             finger_id,
                             x,
                             y,
                             timestamp,
-                            opts.video_fit,
+                            sh.opts.video_fit,
                         ) {
-                            on_touch_act(act, &mut stats_verbosity, &mut stream, &mut overlay);
+                            on_touch_act(
+                                act,
+                                &mut sh.stats_verbosity,
+                                &mut stream,
+                                &mut sh.overlay,
+                            );
                         }
                     }
                 }
@@ -1042,36 +884,41 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     if is_direct_touch(touch_id) {
                         // The lift also reaches the engine, so it never keeps a finger
                         // that is gone.
-                        ring_finger(&mut overlay, &window, FingerPhase::Up, x, y);
+                        ring_finger(&mut sh.overlay, &sh.window, FingerPhase::Up, x, y);
                         for act in dispatch_finger(
                             FingerPhase::Up,
-                            &window,
+                            &sh.window,
                             &mut stream,
                             finger_id,
                             x,
                             y,
                             timestamp,
-                            opts.video_fit,
+                            sh.opts.video_fit,
                         ) {
-                            on_touch_act(act, &mut stats_verbosity, &mut stream, &mut overlay);
+                            on_touch_act(
+                                act,
+                                &mut sh.stats_verbosity,
+                                &mut stream,
+                                &mut sh.overlay,
+                            );
                         }
                     }
                 }
                 // FrameWake (and any other user event): pure wake-up — the frame drain
                 // runs this iteration either way.
                 Event::User { .. } => {}
-                other => pump.handle_event(other),
+                other => sh.pump.handle_event(other),
             }
         }
         // Native events forward only when capture owns the entire SDL batch.
-        scroll_routing.finish(
+        sh.scroll_routing.finish(
             stream.as_mut().and_then(|s| s.capture.as_mut()),
-            overlay.as_deref(),
+            sh.overlay.as_deref(),
         );
         // Who owns the pad: capture, window focus, and Gaming Mode's overlay signal.
         // Edge-triggered so an open QAM does not re-flush the pads every iteration.
         #[cfg(target_os = "linux")]
-        let overlay_now = overlay_focus.as_ref().is_some_and(|of| of.is_open());
+        let overlay_now = sh.overlay_focus.as_ref().is_some_and(|of| of.is_open());
         #[cfg(not(target_os = "linux"))]
         let overlay_now = false;
         // Remembered, not applied: the ring is a third owner of this same mask and is only
@@ -1081,8 +928,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             .as_ref()
             .and_then(|st| st.capture.as_ref())
             .map(Capture::captured);
-        let want_mask_ui = ui_wants_pad_mask(focus_lost, overlay_now, capture_active);
-        pump.tick();
+        let want_mask_ui = ui_wants_pad_mask(sh.focus_lost, overlay_now, capture_active);
+        sh.pump.tick();
         // One coalesced MouseMove per iteration — pure motion must reach the host
         // without waiting for a click/key to flush it.
         if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
@@ -1095,15 +942,15 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             // host px) over what the backend scales a cursor by itself, so the pointer is the
             // size it has in the picture, as on Apple. Stretch keeps the shape undistorted.
             let cursor_scale = st.last_video.map_or(1.0, |video| {
-                let p = video_fit::place(opts.video_fit, window.size_in_pixels(), video);
-                p.scale_x.min(p.scale_y) as f32 / cursor_surface_scale(&window)
+                let p = video_fit::place(sh.opts.video_fit, sh.window.size_in_pixels(), video);
+                p.scale_x.min(p.scale_y) as f32 / cursor_surface_scale(&sh.window)
             });
             if let (Some(chan), Some(c)) = (st.cursor_chan.as_mut(), st.connector.as_ref()) {
                 let desktop_active = st
                     .capture
                     .as_ref()
                     .is_some_and(|cap| cap.captured() && cap.desktop());
-                chan.pump(c, &mouse, desktop_active, cursor_scale);
+                chan.pump(c, &sh.mouse, desktop_active, cursor_scale);
                 // We draw the pointer while released (a released cursor over a composited one is
                 // a frozen twin), in desktop mode, or relative on the host's hint: only the state
                 // it keeps forwarding can clear the hint. Without the pointer grant the host
@@ -1136,35 +983,28 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 }
                 if !st.hint_override && st.hint_since.elapsed() >= HINT_SETTLE {
                     let video = st.last_video;
-                    let over_us = !hint || mouse.focused_window_id() == Some(window.id());
+                    let over_us = !hint || sh.mouse.focused_window_id() == Some(sh.window.id());
                     if let Some(cap) = st.capture.as_mut() {
                         if cap.captured()
                             && !cap.buttons_held()
                             && over_us
-                            && !ring_was_open
+                            && !sh.ring_was_open
                             && cap.set_desktop(!hint)
                         {
-                            apply_capture(
-                                &mut window,
-                                &mouse,
-                                true,
-                                cap.desktop(),
-                                inhibit_shortcuts,
-                                cap.grants(),
-                            );
+                            sh.capture_on(cap);
                             if cap.desktop() {
                                 // Reappear where the host last had the pointer so the
                                 // hand-back is seamless.
                                 if let Some(video) = video {
                                     let (wx, wy) = content_to_window(
-                                        opts.video_fit,
-                                        window.size(),
-                                        window.size_in_pixels(),
+                                        sh.opts.video_fit,
+                                        sh.window.size(),
+                                        sh.window.size_in_pixels(),
                                         video,
                                         hs.x,
                                         hs.y,
                                     );
-                                    mouse.warp_mouse_in_window(&window, wx, wy);
+                                    sh.mouse.warp_mouse_in_window(&sh.window, wx, wy);
                                 }
                             }
                             tracing::info!(
@@ -1177,7 +1017,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 // Something else moved the pointer we draw (controller mouse, a trackpad
                 // gesture, an app warping it): once the user's own mouse has been still for
                 // longer than a round trip, the local cursor goes where the host put it.
-                let over_us = mouse.focused_window_id() == Some(window.id());
+                let over_us = sh.mouse.focused_window_id() == Some(sh.window.id());
                 let still = st.last_user_motion.elapsed() >= FOLLOW_HOST_AFTER;
                 if let (Some(cap), Some(video)) = (st.capture.as_mut(), st.last_video) {
                     let drifted = cap.last_abs().is_some_and(|(x, y)| {
@@ -1191,44 +1031,44 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         && drifted
                     {
                         let (wx, wy) = content_to_window(
-                            opts.video_fit,
-                            window.size(),
-                            window.size_in_pixels(),
+                            sh.opts.video_fit,
+                            sh.window.size(),
+                            sh.window.size_in_pixels(),
                             video,
                             hs.x,
                             hs.y,
                         );
                         st.warp_echo_until = Instant::now() + WARP_ECHO;
-                        mouse.warp_mouse_in_window(&window, wx, wy);
+                        sh.mouse.warp_mouse_in_window(&sh.window, wx, wy);
                         cap.followed_host((hs.x, hs.y));
                     }
                 }
             }
         }
 
-        let want_text = overlay.as_ref().is_some_and(|o| o.text_input_active());
-        if want_text != text_input_on {
-            text_input_on = want_text;
-            let ti = video.text_input();
+        let want_text = sh.overlay.as_ref().is_some_and(|o| o.text_input_active());
+        if want_text != sh.text_input_on {
+            sh.text_input_on = want_text;
+            let ti = sh.sdl_video.text_input();
             if want_text {
-                ti.start(&window);
+                ti.start(&sh.window);
             } else {
-                ti.stop(&window);
+                ti.stop(&sh.window);
             }
         }
 
         // Select chords on a pad. `Select+A` puts the ring at the window centre, where its
         // highlight starts on the centre so `Select+A` then `A` opens the sheet; `Select+X`
         // steps the stats tier, the same move the keyboard chord and the dial's own slot make.
-        while let Ok((pad, chord)) = chord_rx.try_recv() {
-            if overlay.is_none() || stream.is_none() {
+        while let Ok((pad, chord)) = sh.chord_rx.try_recv() {
+            if sh.overlay.is_none() || stream.is_none() {
                 continue;
             }
             match chord {
                 SelectChord::Ring => {
-                    if let Some(o) = overlay.as_mut() {
-                        ring_opener = Some(pad);
-                        let (pw, ph) = window.size_in_pixels();
+                    if let Some(o) = sh.overlay.as_mut() {
+                        sh.ring_opener = Some(pad);
+                        let (pw, ph) = sh.window.size_in_pixels();
                         o.ring_input(RingInput::Toggle {
                             x: pw as f32 / 2.0,
                             y: ph as f32 / 2.0,
@@ -1236,8 +1076,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     }
                 }
                 SelectChord::Stats => {
-                    bump_stats_tier(&mut stats_verbosity, &mut stream);
-                    tracing::info!(tier = ?stats_verbosity, "chord: stats verbosity");
+                    bump_stats_tier(&mut sh.stats_verbosity, &mut stream);
+                    tracing::info!(tier = ?sh.stats_verbosity, "chord: stats verbosity");
                 }
             }
         }
@@ -1245,14 +1085,15 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         // pad belongs to the overlay: masked off the wire, polled into menu events. The
         // three gates that keep pad input off client UI flip together.
         let ring_open = stream.is_some()
-            && overlay
+            && sh
+                .overlay
                 .as_ref()
                 .is_some_and(|o| o.ring_open() || o.holds_stream());
-        if ring_open != ring_was_open {
-            ring_was_open = ring_open;
-            gamepad.set_ring_nav(ring_open);
+        if ring_open != sh.ring_was_open {
+            sh.ring_was_open = ring_open;
+            sh.gamepad.set_ring_nav(ring_open);
             if !ring_open {
-                ring_opener = None;
+                sh.ring_opener = None;
             }
             // The ring eats every pointer event, so a button already down would stay pressed
             // on the host without a flush. It also needs a pointer to aim with: under a lock
@@ -1263,24 +1104,23 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     cap.flush_held();
                 }
                 if cap.captured() {
-                    let (on, desktop, grants) = if ring_open {
-                        (false, false, 0)
+                    if ring_open {
+                        sh.capture_off();
                     } else {
-                        (true, cap.desktop(), cap.grants())
-                    };
-                    apply_capture(&mut window, &mouse, on, desktop, inhibit_shortcuts, grants);
+                        sh.capture_on(cap);
+                    }
                 }
             }
         }
         // One owner for the mask: any gate that wants the pads keeps them masked.
         let want_mask = want_mask_ui || ring_open;
-        if want_mask != mask_applied {
-            mask_applied = want_mask;
-            gamepad.set_masked(want_mask);
+        if want_mask != sh.mask_applied {
+            sh.mask_applied = want_mask;
+            sh.gamepad.set_masked(want_mask);
         }
         if ring_open {
-            while let Ok(ev) = menu_rx.try_recv() {
-                if let Some(o) = overlay.as_mut() {
+            while let Ok(ev) = sh.menu_rx.try_recv() {
+                if let Some(o) = sh.overlay.as_mut() {
                     o.handle_menu(ev);
                 }
             }
@@ -1289,26 +1129,26 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         // Controller escape chord: release capture and leave fullscreen. Gamescope has
         // nothing to release into and no pointer to click back with, while a release masks
         // the pads — there the chord only starts the disconnect hold.
-        while escape_rx.try_recv().is_ok() {
+        while sh.escape_rx.try_recv().is_ok() {
             if in_gamescope() {
                 continue;
             }
             if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                 if cap.release(true) {
-                    apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts, 0);
+                    sh.capture_off();
                 }
             }
-            if fullscreen && !opts.fullscreen {
-                fullscreen = false;
-                let _ = window.set_fullscreen(false);
+            if sh.fullscreen && !sh.opts.fullscreen {
+                sh.fullscreen = false;
+                let _ = sh.window.set_fullscreen(false);
             }
         }
         // Escape chord held past the threshold: the controller's disconnect.
-        if disconnect_rx.try_recv().is_ok() {
+        if sh.disconnect_rx.try_recv().is_ok() {
             if let Some(st) = &mut stream {
                 tracing::info!("controller chord: disconnect");
                 st.request_quit();
-                apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts, 0);
+                sh.capture_off();
             }
         }
 
@@ -1317,15 +1157,15 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             // flight, so B can cancel the dial. Once attached, the worker forwards raw
             // input instead.
             if stream.as_ref().is_none_or(|s| s.connector.is_none()) {
-                while let Ok(ev) = menu_rx.try_recv() {
-                    if let Some(o) = overlay.as_mut() {
+                while let Ok(ev) = sh.menu_rx.try_recv() {
+                    if let Some(o) = sh.overlay.as_mut() {
                         if let Some(pulse) = o.handle_menu(ev) {
-                            gamepad.menu_rumble(pulse);
+                            sh.gamepad.menu_rumble(pulse);
                         }
                     }
                 }
             }
-            if let Some(action) = overlay.as_mut().and_then(|o| o.take_action()) {
+            if let Some(action) = sh.overlay.as_mut().and_then(|o| o.take_action()) {
                 match action {
                     OverlayAction::CancelConnect => {
                         if let Some(st) = &mut stream {
@@ -1339,7 +1179,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     // The console already toasted "Link copied"; a clipboard SDL refuses
                     // is a log line, not a contradiction of the toast.
                     OverlayAction::CopyText(text) => {
-                        if let Err(e) = video.clipboard().set_clipboard_text(&text) {
+                        if let Err(e) = sh.sdl_video.clipboard().set_clipboard_text(&text) {
                             tracing::warn!(error = %e, "copying to the clipboard");
                         }
                     }
@@ -1347,27 +1187,27 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         let force_software = Arc::new(AtomicBool::new(false));
                         match on_action(
                             action,
-                            &gamepad,
-                            native,
-                            window_display_hdr(&window),
+                            &sh.gamepad,
+                            sh.native,
+                            window_display_hdr(&sh.window),
                             force_software.clone(),
-                            presenter.vulkan_decode(),
+                            sh.presenter.vulkan_decode(),
                         ) {
                             ActionOutcome::Handled => {}
                             ActionOutcome::Start(mut params) => {
-                                if opts.match_window.is_some() {
+                                if sh.opts.match_window.is_some() {
                                     apply_match_window(
                                         &mut params,
-                                        &window,
-                                        opts.render_scale,
-                                        opts.render_scale_max_dim,
+                                        &sh.window,
+                                        sh.opts.render_scale,
+                                        sh.opts.render_scale_max_dim,
                                     );
                                 }
                                 // Adopt the tier this launch resolved. The console outlives
                                 // every stream. Not in `StreamState::new`: a codec-fallback
                                 // retry rebuilds from a clone of these params and would snap
                                 // the overlay back, undoing a chord the user had just made.
-                                stats_verbosity = params.stats_verbosity;
+                                sh.stats_verbosity = params.stats_verbosity;
                                 // A live pump here would be detached by the assignment —
                                 // `StreamState` has no `Drop`, so its thread would keep
                                 // decoding onto the shared Vulkan device. Every other
@@ -1382,11 +1222,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                                 stream = Some(StreamState::new(
                                     *params,
                                     force_software,
-                                    events.event_sender(),
-                                    present_priority,
-                                    native.refresh_hz,
+                                    sh.sdl_events.event_sender(),
+                                    sh.present_priority,
+                                    sh.native.refresh_hz,
                                 ));
-                                if let Some(o) = overlay.as_mut() {
+                                if let Some(o) = sh.overlay.as_mut() {
                                     o.session_phase(SessionPhase::Connecting);
                                 }
                             }
@@ -1423,7 +1263,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     pf_client_core::host_actions::refresh(&host_addr, c.mgmt_port(), &st.fp_hex);
                     // The resolved rate — a `0 = native` request becomes a real number
                     // here, last moment before frames start arriving.
-                    st.source_interval_ns = frame_interval_ns(m.refresh_hz, native.refresh_hz);
+                    st.source_interval_ns = frame_interval_ns(m.refresh_hz, sh.native.refresh_hz);
                     tracing::info!(mode = %st.mode_line, "connected");
                     // Which touch devices SDL sees. Under gamescope this is the tell
                     // for whether Steam Input hands the touchscreen through as touch:
@@ -1433,17 +1273,17 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         gamescope = in_gamescope(),
                         "touch devices"
                     );
-                    window
-                        .set_title(&format!("{} · {}", opts.window_title, st.mode_line))
+                    sh.window
+                        .set_title(&format!("{} · {}", sh.opts.window_title, st.mode_line))
                         .ok();
-                    gamepad.attach(c.clone());
+                    sh.gamepad.attach(c.clone());
                     st.clock_offset = Some(c.clock_offset_shared());
                     st.video_e2e = Some(c.video_e2e_shared());
                     // gamescope's EIS grants only a relative pointer — absolute would be
                     // dropped, so desktop mode is pinned off. Auto (a host that never
                     // said) stays allowed.
                     let abs_ok = c.resolved_compositor != CompositorPref::Gamescope;
-                    if opts.mouse_mode == MouseMode::Desktop && !abs_ok {
+                    if sh.opts.mouse_mode == MouseMode::Desktop && !abs_ok {
                         tracing::info!(
                             "desktop mouse mode unavailable on a gamescope host \
                              (relative-only input) — using capture"
@@ -1455,7 +1295,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     // Passthrough needs a host that injects touch. Without the bit every
                     // contact would vanish with no error, so the session runs the trackpad
                     // model and the notice says so.
-                    let touch_mode = if opts.touch_mode == TouchMode::Touch
+                    let touch_mode = if sh.opts.touch_mode == TouchMode::Touch
                         && c.host_caps2() & punktfunk_core::quic::HOST_CAP2_TOUCH == 0
                     {
                         st.session_notice = Some((
@@ -1464,27 +1304,20 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         ));
                         TouchMode::Trackpad
                     } else {
-                        opts.touch_mode
+                        sh.opts.touch_mode
                     };
                     let mut cap = Capture::new(
                         c.clone(),
                         touch_mode,
-                        opts.invert_scroll,
-                        opts.mouse_mode,
+                        sh.opts.invert_scroll,
+                        sh.opts.mouse_mode,
                         abs_ok,
                         st.access.grants,
                     );
                     // Capture engages when the stream starts unless access covers neither
                     // pointer nor keyboard, where `engage` refuses and the pointer stays free.
                     if cap.engage() {
-                        apply_capture(
-                            &mut window,
-                            &mouse,
-                            true,
-                            cap.desktop(),
-                            inhibit_shortcuts,
-                            cap.grants(),
-                        );
+                        sh.capture_on(&cap);
                     }
                     st.capture = Some(cap);
                     st.cursor_chan = Some(crate::cursor::CursorChannel::new(&c));
@@ -1492,10 +1325,10 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     // library address, which the binary persists so it survives without mDNS.
                     let mgmt_port = c.mgmt_port();
                     st.connector = Some(c);
-                    if let Some(f) = opts.on_connected.as_mut() {
+                    if let Some(f) = sh.opts.on_connected.as_mut() {
                         f(fingerprint, mgmt_port);
                     }
-                    if let Some(o) = overlay.as_mut() {
+                    if let Some(o) = sh.overlay.as_mut() {
                         o.session_phase(SessionPhase::Streaming);
                     }
                 }
@@ -1517,25 +1350,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         cap.set_grants(access.grants);
                         if cap.captured() {
                             // With the ring up the pointer stays the ring's; its close re-applies.
-                            if cap.can_capture() && !ring_was_open {
-                                apply_capture(
-                                    &mut window,
-                                    &mouse,
-                                    true,
-                                    cap.desktop(),
-                                    inhibit_shortcuts,
-                                    cap.grants(),
-                                );
+                            if cap.can_capture() && !sh.ring_was_open {
+                                sh.capture_on(cap);
                             } else if !cap.can_capture() {
                                 cap.release(false);
-                                apply_capture(
-                                    &mut window,
-                                    &mouse,
-                                    false,
-                                    false,
-                                    inhibit_shortcuts,
-                                    0,
-                                );
+                                sh.capture_off();
                             }
                         }
                     }
@@ -1556,8 +1375,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         if let Some(st) = stream.take() {
                             st.shutdown();
                         }
-                        apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts, 0);
-                        if let Some(o) = overlay.as_mut() {
+                        sh.capture_off();
+                        if let Some(o) = sh.overlay.as_mut() {
                             if canceled {
                                 o.session_phase(SessionPhase::Ended(None));
                             } else {
@@ -1568,20 +1387,20 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     }
                 },
                 SessionEvent::Ended(reason) => {
-                    gamepad.detach();
+                    sh.gamepad.detach();
                     if let Some(cap) = &mut st.capture {
                         cap.release(true);
                     }
-                    apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts, 0);
+                    sh.capture_off();
                     match &mode {
                         ModeCtl::Single(_) => break 'main Some(Outcome::Ended(reason)),
                         ModeCtl::Browse(_) => {
-                            window.set_title(&opts.window_title).ok();
+                            sh.window.set_title(&sh.opts.window_title).ok();
                             let canceled = st.canceled;
                             if let Some(st) = stream.take() {
                                 st.shutdown();
                             }
-                            if let Some(o) = overlay.as_mut() {
+                            if let Some(o) = sh.overlay.as_mut() {
                                 o.session_phase(SessionPhase::Ended(if canceled {
                                     None
                                 } else {
@@ -1607,11 +1426,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         retry_caps,
                         "decode ladder exhausted — reconnecting with reduced codec caps"
                     );
-                    gamepad.detach();
+                    sh.gamepad.detach();
                     if let Some(cap) = &mut st.capture {
                         cap.release(true);
                     }
-                    apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts, 0);
+                    sh.capture_off();
                     // Widen the exclusion rather than replace it: a second fallback must
                     // not re-offer what the first already ruled out.
                     let mut params = st.params.clone();
@@ -1624,12 +1443,12 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     }
                     // Then the window follower on top, so a retry lands on the size the
                     // window is now.
-                    if opts.match_window.is_some() {
+                    if sh.opts.match_window.is_some() {
                         apply_match_window(
                             &mut params,
-                            &window,
-                            opts.render_scale,
-                            opts.render_scale_max_dim,
+                            &sh.window,
+                            sh.opts.render_scale,
+                            sh.opts.render_scale_max_dim,
                         );
                     }
                     // A fresh demote flag, like `ActionOutcome::Start` — never the old
@@ -1643,15 +1462,15 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     if let Some(st) = stream.take() {
                         st.shutdown();
                     }
-                    if let Some(o) = overlay.as_mut() {
+                    if let Some(o) = sh.overlay.as_mut() {
                         o.session_phase(SessionPhase::Reconnecting(&msg));
                     }
                     stream = Some(StreamState::new(
                         params,
                         force_software,
-                        events.event_sender(),
-                        present_priority,
-                        native.refresh_hz,
+                        sh.sdl_events.event_sender(),
+                        sh.present_priority,
+                        sh.native.refresh_hz,
                     ));
                     break;
                 }
@@ -1661,16 +1480,16 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         // HUD/title follow the live mode slot on any accepted switch — also when the
         // match-window follower is off (another trigger, or a host-side rollback).
         if let Some(st) = stream.as_mut() {
-            hud_mode_tick(st, &mut window, &opts.window_title);
+            hud_mode_tick(st, &mut sh.window, &sh.opts.window_title);
         }
-        if let Some(persist) = opts.match_window.as_mut() {
+        if let Some(persist) = sh.opts.match_window.as_mut() {
             if let Some(st) = stream.as_mut() {
                 resize_tick(
                     st,
-                    &mut window,
+                    &mut sh.window,
                     persist.as_mut(),
-                    opts.render_scale,
-                    opts.render_scale_max_dim,
+                    sh.opts.render_scale,
+                    sh.opts.render_scale_max_dim,
                 );
             }
         }
@@ -1685,7 +1504,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             cap.tick(sdl3::timer::ticks() as f64);
         }
         let mut ring_cmds = Vec::new();
-        if let (Some(o), true) = (overlay.as_mut(), stream.is_some()) {
+        if let (Some(o), true) = (sh.overlay.as_mut(), stream.is_some()) {
             while let Some(cmd) = o.take_ring_command() {
                 ring_cmds.push(cmd);
             }
@@ -1694,12 +1513,12 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             tracing::info!(?cmd, "ring");
             match cmd {
                 RingCommand::CycleStats => {
-                    bump_stats_tier(&mut stats_verbosity, &mut stream);
+                    bump_stats_tier(&mut sh.stats_verbosity, &mut stream);
                 }
-                RingCommand::Keyboard => ring_keyboard = !ring_keyboard,
+                RingCommand::Keyboard => sh.ring_keyboard = !sh.ring_keyboard,
                 RingCommand::TogglePadMouse => {
                     if let Some(c) = stream.as_ref().and_then(|st| st.connector.as_ref()) {
-                        toggle_pad_mouse(c, ring_opener);
+                        toggle_pad_mouse(c, sh.ring_opener);
                     }
                 }
                 RingCommand::ToggleStreamMute => {
@@ -1710,10 +1529,10 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 }
                 // The pad worker owns the wire index and the owed release, so this one is
                 // the service's, not `ring_command`'s.
-                RingCommand::TapButton(bit) => gamepad.tap_button(bit),
+                RingCommand::TapButton(bit) => sh.gamepad.tap_button(bit),
                 other => {
                     if let Some(st) = stream.as_mut() {
-                        ring_command(other, st, &mut window, &mouse, inhibit_shortcuts);
+                        sh.ring_command(other, st);
                     }
                 }
             }
@@ -1729,14 +1548,14 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             }
         }
 
-        if let Some(o) = overlay.as_mut() {
-            let (pw, ph) = window.size_in_pixels();
+        if let Some(o) = sh.overlay.as_mut() {
+            let (pw, ph) = sh.window.size_in_pixels();
             let (stats, hint) = match &stream {
                 Some(st) if st.connector.is_some() => {
                     // No "click to capture" over a session with nothing to capture for.
                     let hint = match &st.capture {
                         Some(cap) if !cap.captured() && cap.can_capture() => {
-                            Some(if gamepad.active().is_some() {
+                            Some(if sh.gamepad.active().is_some() {
                                 HINT_WITH_PAD
                             } else {
                                 HINT_KEYBOARD
@@ -1745,7 +1564,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         _ => None,
                     };
                     (
-                        (stats_verbosity != StatsVerbosity::Off && !st.osd.is_empty())
+                        (sh.stats_verbosity != StatsVerbosity::Off && !st.osd.is_empty())
                             .then_some(st.osd.as_slice()),
                         hint,
                     )
@@ -1756,7 +1575,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             // goes away is chrome, so it rides the stats tier. `None` for a full-control
             // permanent session — what a host that never sent access looks like.
             let access_chip = match &stream {
-                Some(st) if st.connector.is_some() && stats_verbosity != StatsVerbosity::Off => {
+                Some(st) if st.connector.is_some() && sh.stats_verbosity != StatsVerbosity::Off => {
                     st.access.chip_text(Instant::now())
                 }
                 _ => None,
@@ -1765,8 +1584,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 .as_ref()
                 .filter(|st| st.connector.is_some())
                 .and_then(|st| st.session_notice.as_ref().map(|(n, _)| n.as_str()));
-            let pad = gamepad.active();
-            let pads = gamepad.pads();
+            let pad = sh.gamepad.active();
+            let pads = sh.gamepad.pads();
             let resizing = stream
                 .as_ref()
                 .is_some_and(|st| st.connector.is_some() && st.resize_overlay.active());
@@ -1781,23 +1600,23 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 .and_then(|st| st.connector.as_ref())
                 .and_then(|c| {
                     let mask = c.audio_mute();
-                    if mask != audio_mute_seen {
-                        audio_mute_seen = mask;
-                        audio_mute_at = Instant::now();
+                    if mask != sh.audio_mute_seen {
+                        sh.audio_mute_seen = mask;
+                        sh.audio_mute_at = Instant::now();
                     }
-                    punktfunk_core::client::audio_mute_notice(mask, audio_mute_at.elapsed())
+                    punktfunk_core::client::audio_mute_notice(mask, sh.audio_mute_at.elapsed())
                 });
             let ring_facts = stream
                 .as_ref()
                 .filter(|st| st.connector.is_some())
-                .map(|st| ring_facts(st, &opts, stats_verbosity, mic_muted, ring_opener));
+                .map(|st| ring_facts(st, &sh.opts, sh.stats_verbosity, mic_muted, sh.ring_opener));
             let ctx = FrameCtx {
                 width: pw,
                 height: ph,
-                ten_bit: presenter.ten_bit(),
+                ten_bit: sh.presenter.ten_bit(),
                 // Re-read per frame: dragging to a second monitor with a different scale
                 // updates this.
-                scale: overlay_scale(window.display_scale(), osd_scale_pref),
+                scale: overlay_scale(sh.window.display_scale(), sh.osd_scale_pref),
                 stats,
                 hint,
                 access: access_chip.as_deref(),
@@ -1811,19 +1630,20 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 ring: ring_facts.as_ref(),
             };
             match o.frame(&ctx) {
-                Ok(f) => overlay_frame = f,
+                Ok(f) => sh.overlay_frame = f,
                 Err(e) => {
-                    if matches!(mode, ModeCtl::Browse(_)) {
+                    if sh.browse {
                         return Err(e).context("console UI frame (required for --browse)");
                     }
                     tracing::warn!(error = %format!("{e:#}"),
                         "overlay frame failed — disabling the console UI");
-                    overlay = None;
-                    overlay_frame = None;
+                    sh.overlay = None;
+                    sh.overlay_frame = None;
                 }
             }
         }
-        overlay_damage.rendered(overlay_frame.as_ref().map(|f| f.image));
+        sh.overlay_damage
+            .rendered(sh.overlay_frame.as_ref().map(|f| f.image));
 
         let mut presented_video = false;
         if let Some(st) = &mut stream {
@@ -1831,13 +1651,13 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             // that needs it.
             if let Some(c) = &st.connector {
                 while let Ok(m) = c.next_hdr_meta(Duration::ZERO) {
-                    presenter.set_hdr_metadata(m);
+                    sh.presenter.set_hdr_metadata(m);
                 }
             }
             // Present-wait completions drive the latch clock, the glass gate, and the
             // host-facing grid — drained every pass (a 1 Hz batch would starve all three).
-            if presenter.present_timing_active() {
-                let samples = presenter.take_presented_samples();
+            if sh.presenter.present_timing_active() {
+                let samples = sh.presenter.take_presented_samples();
                 if !samples.is_empty() {
                     let clock_offset_ns = st
                         .clock_offset
@@ -1886,7 +1706,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     // cadence as "the grid"). FIFO-family only: MAILBOX/IMMEDIATE never
                     // wait for vblank, so they would look like VRR. Else Unknown.
                     let healthy = st.last_forced == 0;
-                    if presenter.vblank_locked() {
+                    if sh.presenter.vblank_locked() {
                         st.cadence.note(&stamps, st.mode_period_ns, healthy);
                     }
                     // Phase-locked capture, the presenter's half: publish the grid the
@@ -1961,9 +1781,12 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             // FIFO glass budget: one undisplayed present in flight, so the swapchain's
             // own FIFO can never become a standing queue. Only FIFO modes queue and only
             // present timing can count; everywhere else this stays inert.
-            if pacing_active && presenter.needs_glass_gate() && presenter.present_timing_active() {
+            if sh.pacing_active
+                && sh.presenter.needs_glass_gate()
+                && sh.presenter.present_timing_active()
+            {
                 if let Some(f) = to_present.take() {
-                    if st.gate.open(presenter.presents_outstanding(), now_ns) {
+                    if st.gate.open(sh.presenter.presents_outstanding(), now_ns) {
                         to_present = Some(f);
                     } else {
                         // Parked: a newest-wins store replaces it if a fresher frame
@@ -1993,10 +1816,10 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         // session presents through the HDR10 path like the H.26x codecs.
                         st.hdr = f.color.is_pq();
                         st.hdr_untonemapped = false;
-                        match presenter.present(
-                            &window,
+                        match sh.presenter.present(
+                            &sh.window,
                             FrameInput::PyroWave(f),
-                            overlay_frame.as_ref(),
+                            sh.overlay_frame.as_ref(),
                         ) {
                             Ok(Presented::Shown) => {
                                 st.pyro_present_warned = false;
@@ -2030,8 +1853,9 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         // Last rung: a present failure has nothing left to demote to.
                         // Drop the frame and keep the session; only a lost device ends it.
                         // The borrow of `c` ends inside `map`, so a busy frame can go back whole.
-                        let outcome = presenter
-                            .present(&window, FrameInput::Cpu(&c), overlay_frame.as_ref())
+                        let outcome = sh
+                            .presenter
+                            .present(&sh.window, FrameInput::Cpu(&c), sh.overlay_frame.as_ref())
                             .map(|p| match p {
                                 Presented::Shown => Ok(true),
                                 Presented::Stale => Ok(false),
@@ -2071,14 +1895,14 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     // streak demotion are the same contract as the other hardware arms.
                     #[cfg(target_os = "linux")]
                     DecodedImage::NativeDmabuf(d)
-                        if presenter.supports_dmabuf() && !st.dmabuf_demoted =>
+                        if sh.presenter.supports_dmabuf() && !st.dmabuf_demoted =>
                     {
                         st.hdr = d.color.is_pq();
                         st.hdr_untonemapped = false;
-                        match presenter.present(
-                            &window,
+                        match sh.presenter.present(
+                            &sh.window,
                             FrameInput::Dmabuf(d),
-                            overlay_frame.as_ref(),
+                            sh.overlay_frame.as_ref(),
                         ) {
                             Ok(Presented::Shown) => {
                                 st.hw_fails = 0;
@@ -2125,13 +1949,15 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     // D3D11VA: shared-texture import, same gate + failure-streak demotion
                     // as dmabuf.
                     #[cfg(windows)]
-                    DecodedImage::D3d11(d) if presenter.supports_d3d11() && !st.dmabuf_demoted => {
+                    DecodedImage::D3d11(d)
+                        if sh.presenter.supports_d3d11() && !st.dmabuf_demoted =>
+                    {
                         st.hdr = d.color.is_pq();
                         st.hdr_untonemapped = false;
-                        match presenter.present(
-                            &window,
+                        match sh.presenter.present(
+                            &sh.window,
                             FrameInput::D3d11(d),
-                            overlay_frame.as_ref(),
+                            sh.overlay_frame.as_ref(),
                         ) {
                             Ok(Presented::Shown) => {
                                 st.hw_fails = 0;
@@ -2179,10 +2005,10 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     DecodedImage::NativeVk(v) if !st.dmabuf_demoted => {
                         st.hdr = v.color.is_pq();
                         st.hdr_untonemapped = false;
-                        match presenter.present(
-                            &window,
+                        match sh.presenter.present(
+                            &sh.window,
                             FrameInput::NativeVk(v),
-                            overlay_frame.as_ref(),
+                            sh.overlay_frame.as_ref(),
                         ) {
                             Ok(Presented::Shown) => {
                                 st.hw_fails = 0;
@@ -2213,24 +2039,24 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 };
                 if did_present {
                     presented_video = true;
-                    overlay_damage.video_presented(Instant::now());
-                    let (import_us, submit_us) = presenter.last_timings();
+                    sh.overlay_damage.video_presented(Instant::now());
+                    let (import_us, submit_us) = sh.presenter.last_timings();
                     st.win_import_us.push(import_us);
                     st.win_submit_us.push(submit_us);
-                    let (fence_us, acquire_us, present_us) = presenter.last_waits();
+                    let (fence_us, acquire_us, present_us) = sh.presenter.last_waits();
                     st.win_fence_us.push(fence_us);
                     st.win_acquire_us.push(acquire_us);
                     st.win_present_us.push(present_us);
-                    if opts.json_status && !st.ready_announced {
+                    if sh.opts.json_status && !st.ready_announced {
                         st.ready_announced = true;
                         emit(SessionLine::Ready);
                     }
-                    if presenter.present_timing_active() {
+                    if sh.presenter.present_timing_active() {
                         // Hand the frame's stamps to the present-wait waiter — e2e/display
                         // samples arrive via `take_presented_samples` with a true on-glass stamp.
-                        presenter.note_presented(pts_ns, decoded_ns);
+                        sh.presenter.note_presented(pts_ns, decoded_ns);
                         st.gate.note_present(now_ns);
-                        st.win_out_max = st.win_out_max.max(presenter.presents_outstanding());
+                        st.win_out_max = st.win_out_max.max(sh.presenter.presents_outstanding());
                     } else {
                         let displayed_ns = session::now_ns();
                         let clock_offset_ns = st
@@ -2271,7 +2097,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 let (gated, forced) = st.gate.take_counters();
                 st.last_forced = forced;
                 let present = PresentCounters {
-                    mode: presenter.present_mode_name(),
+                    mode: sh.presenter.present_mode_name(),
                     vrr: st.cadence.verdict(),
                     smoothing: st.store.is_smoothing(),
                     q_drop,
@@ -2285,7 +2111,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 st.win_acquire_us.clear();
                 st.win_present_us.clear();
                 let (pace_ms, latch_ms) =
-                    close_window(st, &presenter, &present, replaced, stats_verbosity);
+                    close_window(st, &sh.presenter, &present, replaced, sh.stats_verbosity);
                 st.win_start = Instant::now();
                 // Adaptive slot margin: start at 0 — a fixed lead is display tax — and
                 // widen one step per window whose measured latch misses demand it.
@@ -2300,8 +2126,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 }
                 // The 1 Hz presenter line, always: the field bundle's only record of where a
                 // frame went after decode and how evenly the glass stepped.
-                if pacing_active {
-                    let _ = present_debug;
+                if sh.pacing_active {
                     let cadence_health = st.pacer.health();
                     let shown: u32 = st.win_steps.iter().sum();
                     let mode_count = st.win_steps.iter().copied().max().unwrap_or(0);
@@ -2358,20 +2183,20 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         // after a mid-stream picture has gone still. An idle console hands back the same
         // image, so browsing presents only what the overlay re-rendered.
         let resize_scrim = stream.as_ref().is_some_and(|s| s.resize_overlay.active());
-        let browse_idle = matches!(mode, ModeCtl::Browse(_))
-            && stream.as_ref().is_none_or(|s| s.connector.is_none());
+        let browse_idle = sh.browse && stream.as_ref().is_none_or(|s| s.connector.is_none());
         let still_picture = stream.as_ref().is_some_and(|s| s.last_video.is_some())
-            && overlay_damage.take_due(Instant::now());
-        let browse_changed = browse_idle && overlay_damage.take_dirty();
+            && sh.overlay_damage.take_due(Instant::now());
+        let browse_changed = browse_idle && sh.overlay_damage.take_dirty();
         if !presented_video && (resize_scrim || browse_changed || still_picture) {
             // The UI owns the screen: hand the swapchain back to SDR. A finished PQ stream
             // leaves HDR10 live, and UI presents carry no frame. Not applied to
             // `resize_scrim`: that gap is still an HDR session, and flipping would rebuild
             // the swapchain twice.
             if browse_idle {
-                presenter.leave_hdr(&window)?;
+                sh.presenter.leave_hdr(&sh.window)?;
             }
-            presenter.present(&window, FrameInput::Redraw, overlay_frame.as_ref())?;
+            sh.presenter
+                .present(&sh.window, FrameInput::Redraw, sh.overlay_frame.as_ref())?;
         }
     };
 
@@ -2379,7 +2204,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
     // individual breaks. `detach` only queues; the close (flush, GamepadRemove, rumble
     // stop) runs when the pump drains it. Breaking immediately after detach leaves
     // pads unflushed and, if rumbling, still buzzing.
-    pump.shutdown();
+    sh.pump.shutdown();
     // Join the pump before the device-wide idle: its decode submissions would race
     // vkDeviceWaitIdle otherwise.
     if let Some(st) = stream.take() {
@@ -2387,8 +2212,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
     }
     // Overlay resources live on the presenter's device: quiesce the queue first, drop
     // the overlay, then the presenter tears down.
-    presenter.wait_idle();
-    drop(overlay);
+    sh.presenter.wait_idle();
+    drop(sh.overlay.take());
     Ok(outcome)
 }
 
