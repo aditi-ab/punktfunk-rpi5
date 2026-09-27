@@ -16,7 +16,9 @@ use crate::session_main::{
     arg_flag, arg_value, fullscreen_mode, parse_host_port, session_params, stats_tier, window_pos,
 };
 use pf_client_core::gamepad::is_steam_deck;
-use pf_client_core::orchestrate::{self, WakeOutcome, WAKE_RESEND_SECS, WAKE_TIMEOUT_SECS};
+use pf_client_core::orchestrate::{
+    self, emit, exit, SessionLine, WakeOutcome, WAKE_RESEND_SECS, WAKE_TIMEOUT_SECS,
+};
 use pf_client_core::{discovery, library, start, trust, wol};
 use pf_console_ui::{
     ConsoleCmd, ConsoleEntry, ConsoleHandles, ConsoleOptions, ConsoleShared, HostRow, LibraryGame,
@@ -73,7 +75,7 @@ pub fn run(target: Option<&str>) -> u8 {
         Ok(i) => i,
         Err(e) => {
             eprintln!("client identity: {e:#}");
-            return crate::session_main::EXIT_CONNECT_FAILED;
+            return exit::CONNECT_FAILED;
         }
     };
 
@@ -131,7 +133,7 @@ pub fn run(target: Option<&str>) -> u8 {
         Ok(v) => v,
         Err(e) => {
             eprintln!("console UI: {e:#}");
-            return crate::session_main::EXIT_PRESENTER_FAILED;
+            return exit::RENDERER_FAILED;
         }
     };
     let ConsoleHandles {
@@ -309,10 +311,13 @@ pub fn run(target: Option<&str>) -> u8 {
             // The shell contract's terminal line (a clean quit needs none — stdout EOF
             // already routes the shell back to its host list silently).
             if json_status {
-                crate::session_main::json_line("error", &format!("{e:#}"), Some(false));
+                emit(SessionLine::Error {
+                    msg: &format!("{e:#}"),
+                    trust_rejected: Some(false),
+                });
             }
             eprintln!("console: {e:#}");
-            crate::session_main::EXIT_PRESENTER_FAILED
+            exit::RENDERER_FAILED
         }
     }
 }

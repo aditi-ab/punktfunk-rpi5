@@ -3370,7 +3370,6 @@ dependencies = [
  "pf-zerocopy",
  "punktfunk-core",
  "sdl3",
- "serde_json",
  "tracing",
  "wayland-backend",
  "wayland-client",

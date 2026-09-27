@@ -26,6 +26,7 @@ use crate::touch::{Abs, Act};
 use crate::vk::{FrameInput, Presented, Presenter};
 use anyhow::{Context as _, Result};
 use pf_client_core::gamepad::{GamepadService, SelectChord};
+use pf_client_core::orchestrate::{emit, SessionLine};
 use pf_client_core::session::{self, DecodeFacts, SessionEvent, SessionHandle, SessionParams};
 use pf_client_core::trust::{MouseMode, PresentPriority, StatsVerbosity, TouchMode};
 use pf_client_core::video::VulkanDecodeDevice;
@@ -706,7 +707,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
     // Browse is "ready" the moment the library window presents — there may never be a
     // stream. Single mode announces on the first video frame instead.
     if opts.json_status && matches!(mode, ModeCtl::Browse(_)) {
-        println!("{{\"ready\":true}}");
+        emit(SessionLine::Ready);
     }
 
     // Operator preference on top of the display DPI. Read once (a preference, not
@@ -2453,7 +2454,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     st.win_present_us.push(present_us);
                     if opts.json_status && !st.ready_announced {
                         st.ready_announced = true;
-                        println!("{{\"ready\":true}}");
+                        emit(SessionLine::Ready);
                     }
                     if presenter.present_timing_active() {
                         // Hand the frame's stamps to the present-wait waiter — e2e/display
@@ -3491,7 +3492,10 @@ fn close_window(
     let text = hud::join(&hud::format(&snap, StatsVerbosity::Detailed, true), " | ");
     tracing::info!(target: "stats", "{text}");
     if tier != StatsVerbosity::Off {
-        print_stats(&snap, &text);
+        emit(SessionLine::Stats {
+            text: &text,
+            snap: &snap,
+        });
     }
     let split = (
         snap.pace.p50_us as f32 / 1000.0,
@@ -3508,17 +3512,6 @@ fn render_osd(st: &mut StreamState, tier: StatsVerbosity) {
         Some(s) => hud::format(s, tier, st.params.advanced_stats),
         None => Vec::new(),
     };
-}
-
-/// The stdout machine interface: the Advanced Detailed `text` for a person reading a log,
-/// and the snapshot for a program. Both are additive; readers skip what they do not know.
-fn print_stats(snap: &StatsSnapshot, text: &str) {
-    use std::io::Write as _;
-    let json = serde_json::to_string(snap).unwrap_or_default();
-    // Not `println!`: it panics on EPIPE, and the reader (the shell) can exit mid-stream.
-    let mut out = std::io::stdout().lock();
-    let _ = writeln!(out, "stats: {text}");
-    let _ = writeln!(out, "stats-json: {json}");
 }
 
 /// How the stream reaches the screen. No present arm sets `untonemapped` today; the tag

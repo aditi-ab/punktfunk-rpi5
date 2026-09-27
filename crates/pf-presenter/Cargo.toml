@@ -22,8 +22,6 @@ punktfunk-core = { path = "../punktfunk-core", default-features = false }
 # C++ in — fatal on Windows ARM64, where Granite has no SIMD path.
 pf-client-core = { path = "../pf-client-core", default-features = false, features = ["desktop"] }
 punktfunk-core = { path = "../punktfunk-core", features = ["quic", "serde"] }
-# The `stats-json:` stdout line (the overlay snapshot).
-serde_json = "1"
 # `--probe-decode` reports the driver's own video-format answers through pf-vkdecode's
 # query rather than a second copy of it — a probe that keeps its own copy is a probe
 # that eventually disagrees with the code it exists to explain (VIDEO_BASE's doc says
