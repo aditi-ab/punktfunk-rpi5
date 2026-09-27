@@ -3419,9 +3419,149 @@ impl VulkanVideoEncoder {
         );
     }
 
-    /// HEVC Std structs + begin/encode/end. A recovery anchor is an ordinary P whose
-    /// `RefPicList0` names the known-good slot; the full short-term RPS ([`build_h265_rps_s0`])
-    /// keeps all resident DPB pictures alive. Direct imports return to the producer after coding.
+    /// `(coded, source)` extents. Coded is the aligned size for app-aligned sessions (pairs
+    /// with the aligned SPS) and the render size for native NV12's true-size headers. RGB
+    /// true-extent passes the render size as the source: RADV derives firmware padding from
+    /// `srcPictureResource.codedExtent`.
+    fn coding_extents(&self) -> (vk::Extent2D, vk::Extent2D) {
+        let render = vk::Extent2D {
+            width: self.render_w,
+            height: self.render_h,
+        };
+        let coded = if self.native_nv12 {
+            render
+        } else {
+            vk::Extent2D {
+                width: self.width,
+                height: self.height,
+            }
+        };
+        let src = if self.rgb.as_ref().is_some_and(|r| r.true_extent) {
+            render
+        } else {
+            coded
+        };
+        (coded, src)
+    }
+
+    /// One rate-control layer at `bps` (average and peak alike) at the session frame rate.
+    fn rc_layer(&self, bps: u64) -> [vk::VideoEncodeRateControlLayerInfoKHR<'static>; 1] {
+        [vk::VideoEncodeRateControlLayerInfoKHR::default()
+            .average_bitrate(bps)
+            .max_bitrate(bps)
+            .frame_rate_numerator(self.fps)
+            .frame_rate_denominator(1)]
+    }
+
+    /// Rate control over `layer`, the codec's own RC struct chained at `codec_rc` by hand
+    /// (`push_next` would clobber `rc.p_next`).
+    fn rc_info<'a>(
+        &self,
+        layer: &'a [vk::VideoEncodeRateControlLayerInfoKHR<'a>],
+        codec_rc: *const c_void,
+    ) -> vk::VideoEncodeRateControlInfoKHR<'a> {
+        let mut rc = vk::VideoEncodeRateControlInfoKHR::default()
+            .rate_control_mode(self.rc_mode)
+            .layers(layer)
+            .virtual_buffer_size_in_ms(self.vbv_ms.0)
+            .initial_virtual_buffer_size_in_ms(self.vbv_ms.1);
+        rc.p_next = codec_rc;
+        rc
+    }
+
+    /// Begin, the first-frame and retarget controls, encode, end: what both codecs record once
+    /// their Std structs exist. `codec_rc` and `codec_pic` are the codec's rate-control and
+    /// picture-info structs, chained by address and alive for this call. `enc_refs` is empty
+    /// on an IDR. A direct import returns to the producer after coding ends.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn record_coding_common(
+        &self,
+        dev: &ash::Device,
+        cmd: vk::CommandBuffer,
+        query_pool: vk::QueryPool,
+        bs_buf: vk::Buffer,
+        src_img: vk::Image,
+        src_view: vk::ImageView,
+        acquire: SrcAcquire,
+        src_extent: vk::Extent2D,
+        begin_slots: &[vk::VideoReferenceSlotInfoKHR],
+        setup_slot: &vk::VideoReferenceSlotInfoKHR,
+        enc_refs: &[vk::VideoReferenceSlotInfoKHR],
+        codec_rc: *const c_void,
+        codec_pic: *const c_void,
+        mut ir_info: super::vk_intra_refresh::VideoEncodeIntraRefreshInfoKHR,
+    ) -> Result<()> {
+        use super::vk_intra_refresh as vir;
+        // Declares CURRENT state (`self.bitrate`), never a pending retarget (VUID-...-08254).
+        let layer = self.rc_layer(self.bitrate);
+        let rc = self.rc_info(&layer, codec_rc);
+
+        self.begin_encode_cmd(dev, cmd, query_pool, src_img, acquire)?;
+        let mut begin = vk::VideoBeginCodingInfoKHR::default()
+            .video_session(self.session)
+            .video_session_parameters(self.params)
+            .reference_slots(begin_slots);
+        // Declare the session's actual RC state, not `!first_frame` (`reset()` re-arms that).
+        if self.rc_installed {
+            begin.p_next = &rc as *const _ as *const c_void;
+        }
+        (self.vq_dev.fp().cmd_begin_video_coding_khr)(cmd, &begin);
+        if self.first_frame {
+            // RESET + RC install + quality. Without ENCODE_QUALITY_LEVEL RADV never sends a
+            // VCN preset op. Quality chains ahead of RC (spec: a quality-level change must
+            // carry ENCODE_RATE_CONTROL). Pending retarget folds into the install, not
+            // `self.bitrate` before recording — begin must declare the old rate after `reset()`.
+            let install_layer = self.rc_layer(self.pending_bitrate.unwrap_or(self.bitrate));
+            let install_rc = self.rc_info(&install_layer, codec_rc);
+            let mut q =
+                vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(self.quality_level);
+            q.p_next = &install_rc as *const _ as *const c_void;
+            let mut ctrl = vk::VideoCodingControlInfoKHR::default().flags(
+                vk::VideoCodingControlFlagsKHR::RESET
+                    | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
+                    | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
+            );
+            ctrl.p_next = &q as *const _ as *const c_void;
+            (self.vq_dev.fp().cmd_control_video_coding_khr)(cmd, &ctrl);
+        } else if let Some(nb) = self.pending_bitrate {
+            // Mid-stream retarget: begin declared CURRENT; this control installs NEW. No RESET.
+            let layer2 = self.rc_layer(nb);
+            let rc2 = self.rc_info(&layer2, codec_rc);
+            let mut ctrl = vk::VideoCodingControlInfoKHR::default()
+                .flags(vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL);
+            ctrl.p_next = &rc2 as *const _ as *const c_void;
+            (self.vq_dev.fp().cmd_control_video_coding_khr)(cmd, &ctrl);
+        }
+        dev.cmd_begin_query(cmd, query_pool, 0, vk::QueryControlFlags::empty());
+        let src_res = vk::VideoPictureResourceInfoKHR::default()
+            .coded_extent(src_extent)
+            .image_view_binding(src_view);
+        let mut enc = vk::VideoEncodeInfoKHR::default()
+            .dst_buffer(bs_buf)
+            .dst_buffer_offset(0)
+            .dst_buffer_range(self.bs_size)
+            .src_picture_resource(src_res)
+            .setup_reference_slot(setup_slot);
+        if !enc_refs.is_empty() {
+            enc = enc.reference_slots(enc_refs);
+        }
+        enc.p_next = codec_pic;
+        if self.wave.is_some() {
+            enc.flags |= vk::VideoEncodeFlagsKHR::from_raw(vir::ENCODE_INTRA_REFRESH_BIT);
+            ir_info.p_next = enc.p_next;
+            enc.p_next = &ir_info as *const _ as *const c_void;
+        }
+        (self.venc_dev.fp().cmd_encode_video_khr)(cmd, &enc);
+        dev.cmd_end_query(cmd, query_pool, 0);
+        (self.vq_dev.fp().cmd_end_video_coding_khr)(cmd, &vk::VideoEndCodingInfoKHR::default());
+        self.release_direct_source(dev, cmd, src_img, acquire);
+        dev.end_command_buffer(cmd)?;
+        Ok(())
+    }
+
+    /// HEVC Std structs, then [`Self::record_coding_common`]. A recovery anchor is an ordinary
+    /// P whose `RefPicList0` names the known-good slot; the full short-term RPS
+    /// ([`build_h265_rps_s0`]) keeps all resident DPB pictures alive.
     #[allow(clippy::too_many_arguments)]
     unsafe fn record_coding_h265(
         &self,
@@ -3437,30 +3577,8 @@ impl VulkanVideoEncoder {
         setup_idx: usize,
         poc: i32,
     ) -> Result<()> {
-        use super::vk_intra_refresh as vir;
         use ash::vk::native as h;
-        // Aligned size for app-aligned sessions (pairs with aligned SPS); render size for
-        // native NV12's true-size headers.
-        let ext2d = if self.native_nv12 {
-            vk::Extent2D {
-                width: self.render_w,
-                height: self.render_h,
-            }
-        } else {
-            vk::Extent2D {
-                width: self.width,
-                height: self.height,
-            }
-        };
-        // RGB true-extent: RADV derives firmware padding from `srcPictureResource.codedExtent`.
-        let src_extent = if self.rgb.as_ref().is_some_and(|r| r.true_extent) {
-            vk::Extent2D {
-                width: self.render_w,
-                height: self.render_h,
-            }
-        } else {
-            ext2d
-        };
+        let (ext2d, src_extent) = self.coding_extents();
         let ref_poc = if is_idr { 0 } else { self.slot_poc[ref_slot] };
 
         let mut pic_flags: h::StdVideoEncodeH265PictureInfoFlags = std::mem::zeroed();
@@ -3507,7 +3625,7 @@ impl VulkanVideoEncoder {
             .constant_qp(0)
             .std_slice_segment_header(&std_sh);
         let slices = [slice];
-        let mut h265_pic = vk::VideoEncodeH265PictureInfoKHR::default()
+        let h265_pic = vk::VideoEncodeH265PictureInfoKHR::default()
             .nalu_slice_segment_entries(&slices)
             .std_picture_info(&std_pic);
 
@@ -3563,115 +3681,36 @@ impl VulkanVideoEncoder {
         let begin_i = [begin_setup];
         let enc_refs = [ref_enc];
 
-        // Chained manually (`push_next` would clobber `rc.p_next`). Declares CURRENT state
-        // (`self.bitrate`), never a pending retarget (VUID-...-08254).
-        let rc_layer = [vk::VideoEncodeRateControlLayerInfoKHR::default()
-            .average_bitrate(self.bitrate)
-            .max_bitrate(self.bitrate)
-            .frame_rate_numerator(self.fps)
-            .frame_rate_denominator(1)];
         let h265_rc = vk::VideoEncodeH265RateControlInfoKHR::default()
             .flags(vk::VideoEncodeH265RateControlFlagsKHR::REGULAR_GOP)
             .gop_frame_count(u32::MAX)
             .idr_period(u32::MAX)
             .consecutive_b_frame_count(0)
             .sub_layer_count(1);
-        let mut rc = vk::VideoEncodeRateControlInfoKHR::default()
-            .rate_control_mode(self.rc_mode)
-            .layers(&rc_layer)
-            .virtual_buffer_size_in_ms(self.vbv_ms.0)
-            .initial_virtual_buffer_size_in_ms(self.vbv_ms.1);
-        rc.p_next = &h265_rc as *const _ as *const c_void;
-        let rc_ptr = &rc as *const _ as *const c_void;
-
-        self.begin_encode_cmd(dev, cmd, query_pool, src_img, acquire)?;
         let begin_slots: &[vk::VideoReferenceSlotInfoKHR] =
             if is_idr { &begin_i } else { &begin_p };
-        let mut begin = vk::VideoBeginCodingInfoKHR::default()
-            .video_session(self.session)
-            .video_session_parameters(self.params)
-            .reference_slots(begin_slots);
-        // Declare the session's actual RC state, not `!first_frame` (`reset()` re-arms that).
-        if self.rc_installed {
-            begin.p_next = rc_ptr;
-        }
-        (self.vq_dev.fp().cmd_begin_video_coding_khr)(cmd, &begin);
-        if self.first_frame {
-            // RESET + RC install + quality. Without ENCODE_QUALITY_LEVEL RADV never sends a
-            // VCN preset op. Quality chains ahead of RC (spec: a quality-level change must
-            // carry ENCODE_RATE_CONTROL). Pending retarget folds into the install, not
-            // `self.bitrate` before recording — begin must declare the old rate after `reset()`.
-            let nb = self.pending_bitrate.unwrap_or(self.bitrate);
-            let install_layer = [vk::VideoEncodeRateControlLayerInfoKHR::default()
-                .average_bitrate(nb)
-                .max_bitrate(nb)
-                .frame_rate_numerator(self.fps)
-                .frame_rate_denominator(1)];
-            let mut install_rc = vk::VideoEncodeRateControlInfoKHR::default()
-                .rate_control_mode(self.rc_mode)
-                .layers(&install_layer)
-                .virtual_buffer_size_in_ms(self.vbv_ms.0)
-                .initial_virtual_buffer_size_in_ms(self.vbv_ms.1);
-            install_rc.p_next = &h265_rc as *const _ as *const c_void;
-            let mut q =
-                vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(self.quality_level);
-            q.p_next = &install_rc as *const _ as *const c_void;
-            let mut ctrl = vk::VideoCodingControlInfoKHR::default().flags(
-                vk::VideoCodingControlFlagsKHR::RESET
-                    | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
-                    | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
-            );
-            ctrl.p_next = &q as *const _ as *const c_void;
-            (self.vq_dev.fp().cmd_control_video_coding_khr)(cmd, &ctrl);
-        } else if let Some(nb) = self.pending_bitrate {
-            // Mid-stream retarget: begin declared CURRENT; this control installs NEW. No RESET.
-            let rc_layer2 = [vk::VideoEncodeRateControlLayerInfoKHR::default()
-                .average_bitrate(nb)
-                .max_bitrate(nb)
-                .frame_rate_numerator(self.fps)
-                .frame_rate_denominator(1)];
-            let mut rc2 = vk::VideoEncodeRateControlInfoKHR::default()
-                .rate_control_mode(self.rc_mode)
-                .layers(&rc_layer2)
-                .virtual_buffer_size_in_ms(self.vbv_ms.0)
-                .initial_virtual_buffer_size_in_ms(self.vbv_ms.1);
-            rc2.p_next = &h265_rc as *const _ as *const c_void;
-            let mut ctrl = vk::VideoCodingControlInfoKHR::default()
-                .flags(vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL);
-            ctrl.p_next = &rc2 as *const _ as *const c_void;
-            (self.vq_dev.fp().cmd_control_video_coding_khr)(cmd, &ctrl);
-        }
-        dev.cmd_begin_query(cmd, query_pool, 0, vk::QueryControlFlags::empty());
-        let src_res = vk::VideoPictureResourceInfoKHR::default()
-            .coded_extent(src_extent)
-            .image_view_binding(src_view);
-        let mut enc = vk::VideoEncodeInfoKHR::default()
-            .dst_buffer(bs_buf)
-            .dst_buffer_offset(0)
-            .dst_buffer_range(self.bs_size)
-            .src_picture_resource(src_res)
-            .setup_reference_slot(&setup_slot)
-            .push_next(&mut h265_pic);
-        if !is_idr {
-            enc = enc.reference_slots(&enc_refs);
-        }
-        let mut ir_info = ir_info;
-        if self.wave.is_some() {
-            enc.flags |= vk::VideoEncodeFlagsKHR::from_raw(vir::ENCODE_INTRA_REFRESH_BIT);
-            ir_info.p_next = enc.p_next;
-            enc.p_next = &ir_info as *const _ as *const c_void;
-        }
-        (self.venc_dev.fp().cmd_encode_video_khr)(cmd, &enc);
-        dev.cmd_end_query(cmd, query_pool, 0);
-        (self.vq_dev.fp().cmd_end_video_coding_khr)(cmd, &vk::VideoEndCodingInfoKHR::default());
-        self.release_direct_source(dev, cmd, src_img, acquire);
-        dev.end_command_buffer(cmd)?;
-        Ok(())
+        let enc_refs: &[vk::VideoReferenceSlotInfoKHR] = if is_idr { &[] } else { &enc_refs };
+        self.record_coding_common(
+            dev,
+            cmd,
+            query_pool,
+            bs_buf,
+            src_img,
+            src_view,
+            acquire,
+            src_extent,
+            begin_slots,
+            &setup_slot,
+            enc_refs,
+            &h265_rc as *const _ as *const c_void,
+            &h265_pic as *const _ as *const c_void,
+            ir_info,
+        )
     }
 
-    /// AV1 Std structs + begin/encode/end. IDR, recovery and a wave start break the CDF chain;
-    /// a normal P inherits context through `ref_slot`. Virtual slots persist until refreshed,
-    /// and a direct import returns to the producer only after coding ends.
+    /// AV1 Std structs, then [`Self::record_coding_common`]. IDR, recovery and a wave start
+    /// break the CDF chain; a normal P inherits context through `ref_slot`. Virtual slots
+    /// persist until refreshed.
     #[allow(clippy::too_many_arguments)]
     unsafe fn record_coding_av1(
         &self,
@@ -3689,30 +3728,8 @@ impl VulkanVideoEncoder {
         order: i32,
     ) -> Result<()> {
         use super::vk_av1_encode as av1;
-        use super::vk_intra_refresh as vir;
         use ash::vk::native as h;
-        // Aligned size for app-aligned sessions (pairs with aligned SPS); render size for
-        // native NV12's true-size headers.
-        let ext2d = if self.native_nv12 {
-            vk::Extent2D {
-                width: self.render_w,
-                height: self.render_h,
-            }
-        } else {
-            vk::Extent2D {
-                width: self.width,
-                height: self.height,
-            }
-        };
-        // RGB true-extent: RADV derives firmware padding from `srcPictureResource.codedExtent`.
-        let src_extent = if self.rgb.as_ref().is_some_and(|r| r.true_extent) {
-            vk::Extent2D {
-                width: self.render_w,
-                height: self.render_h,
-            }
-        } else {
-            ext2d
-        };
+        let (_, src_extent) = self.coding_extents();
 
         let mut tile_flags: h::StdVideoAV1TileInfoFlags = std::mem::zeroed();
         tile_flags.set_uniform_tile_spacing_flag(1);
@@ -3855,7 +3872,7 @@ impl VulkanVideoEncoder {
         ref_begin.p_next = &ref_dpb as *const _ as *const c_void;
         // Wave frame: the reference is the previous frame, `cycle - index` of its regions
         // still dirty (VUID-10843). Absent = 0, which every non-wave frame requires.
-        let (mut ir_info, mut ref_ir) = intra_refresh_chain(self.wave);
+        let (ir_info, mut ref_ir) = intra_refresh_chain(self.wave);
         ref_ir.p_next = &ref_dpb as *const _ as *const c_void;
         let mut ref_enc = vk::VideoReferenceSlotInfoKHR::default()
             .slot_index(ref_slot as i32)
@@ -3869,12 +3886,6 @@ impl VulkanVideoEncoder {
         let begin_i = [begin_setup];
         let enc_refs = [ref_enc];
 
-        // Declares CURRENT state (`self.bitrate`); see the HEVC twin for VUID-08254.
-        let rc_layer = [vk::VideoEncodeRateControlLayerInfoKHR::default()
-            .average_bitrate(self.bitrate)
-            .max_bitrate(self.bitrate)
-            .frame_rate_numerator(self.fps)
-            .frame_rate_denominator(1)];
         let av1_rc = av1::VideoEncodeAV1RateControlInfoKHR {
             s_type: av1::stype(av1::ST_RATE_CONTROL_INFO),
             p_next: std::ptr::null(),
@@ -3884,93 +3895,25 @@ impl VulkanVideoEncoder {
             consecutive_bipredictive_frame_count: 0,
             temporal_layer_count: 1,
         };
-        let mut rc = vk::VideoEncodeRateControlInfoKHR::default()
-            .rate_control_mode(self.rc_mode)
-            .layers(&rc_layer)
-            .virtual_buffer_size_in_ms(self.vbv_ms.0)
-            .initial_virtual_buffer_size_in_ms(self.vbv_ms.1);
-        rc.p_next = &av1_rc as *const _ as *const c_void;
-        let rc_ptr = &rc as *const _ as *const c_void;
-
-        self.begin_encode_cmd(dev, cmd, query_pool, src_img, acquire)?;
         let begin_slots: &[vk::VideoReferenceSlotInfoKHR] =
             if is_idr { &begin_i } else { &begin_p };
-        let mut begin = vk::VideoBeginCodingInfoKHR::default()
-            .video_session(self.session)
-            .video_session_parameters(self.params)
-            .reference_slots(begin_slots);
-        // Declare what the session actually has, not `!first_frame`.
-        if self.rc_installed {
-            begin.p_next = rc_ptr;
-        }
-        (self.vq_dev.fp().cmd_begin_video_coding_khr)(cmd, &begin);
-        if self.first_frame {
-            // RESET + RC + quality. Pending retarget folds into the install, not the declaration.
-            let nb = self.pending_bitrate.unwrap_or(self.bitrate);
-            let install_layer = [vk::VideoEncodeRateControlLayerInfoKHR::default()
-                .average_bitrate(nb)
-                .max_bitrate(nb)
-                .frame_rate_numerator(self.fps)
-                .frame_rate_denominator(1)];
-            let mut install_rc = vk::VideoEncodeRateControlInfoKHR::default()
-                .rate_control_mode(self.rc_mode)
-                .layers(&install_layer)
-                .virtual_buffer_size_in_ms(self.vbv_ms.0)
-                .initial_virtual_buffer_size_in_ms(self.vbv_ms.1);
-            install_rc.p_next = &av1_rc as *const _ as *const c_void;
-            let mut q =
-                vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(self.quality_level);
-            q.p_next = &install_rc as *const _ as *const c_void;
-            let mut ctrl = vk::VideoCodingControlInfoKHR::default().flags(
-                vk::VideoCodingControlFlagsKHR::RESET
-                    | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
-                    | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
-            );
-            ctrl.p_next = &q as *const _ as *const c_void;
-            (self.vq_dev.fp().cmd_control_video_coding_khr)(cmd, &ctrl);
-        } else if let Some(nb) = self.pending_bitrate {
-            // Mid-stream retarget: begin declares CURRENT, this control installs NEW. No RESET.
-            let rc_layer2 = [vk::VideoEncodeRateControlLayerInfoKHR::default()
-                .average_bitrate(nb)
-                .max_bitrate(nb)
-                .frame_rate_numerator(self.fps)
-                .frame_rate_denominator(1)];
-            let mut rc2 = vk::VideoEncodeRateControlInfoKHR::default()
-                .rate_control_mode(self.rc_mode)
-                .layers(&rc_layer2)
-                .virtual_buffer_size_in_ms(self.vbv_ms.0)
-                .initial_virtual_buffer_size_in_ms(self.vbv_ms.1);
-            rc2.p_next = &av1_rc as *const _ as *const c_void;
-            let mut ctrl = vk::VideoCodingControlInfoKHR::default()
-                .flags(vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL);
-            ctrl.p_next = &rc2 as *const _ as *const c_void;
-            (self.vq_dev.fp().cmd_control_video_coding_khr)(cmd, &ctrl);
-        }
-        dev.cmd_begin_query(cmd, query_pool, 0, vk::QueryControlFlags::empty());
-        let src_res = vk::VideoPictureResourceInfoKHR::default()
-            .coded_extent(src_extent)
-            .image_view_binding(src_view);
-        let mut enc = vk::VideoEncodeInfoKHR::default()
-            .dst_buffer(bs_buf)
-            .dst_buffer_offset(0)
-            .dst_buffer_range(self.bs_size)
-            .src_picture_resource(src_res)
-            .setup_reference_slot(&setup_slot);
-        if !is_idr {
-            enc = enc.reference_slots(&enc_refs);
-        }
-        enc.p_next = &av1_pic as *const _ as *const c_void;
-        if self.wave.is_some() {
-            enc.flags |= vk::VideoEncodeFlagsKHR::from_raw(vir::ENCODE_INTRA_REFRESH_BIT);
-            ir_info.p_next = enc.p_next;
-            enc.p_next = &ir_info as *const _ as *const c_void;
-        }
-        (self.venc_dev.fp().cmd_encode_video_khr)(cmd, &enc);
-        dev.cmd_end_query(cmd, query_pool, 0);
-        (self.vq_dev.fp().cmd_end_video_coding_khr)(cmd, &vk::VideoEndCodingInfoKHR::default());
-        self.release_direct_source(dev, cmd, src_img, acquire);
-        dev.end_command_buffer(cmd)?;
-        Ok(())
+        let enc_refs: &[vk::VideoReferenceSlotInfoKHR] = if is_idr { &[] } else { &enc_refs };
+        self.record_coding_common(
+            dev,
+            cmd,
+            query_pool,
+            bs_buf,
+            src_img,
+            src_view,
+            acquire,
+            src_extent,
+            begin_slots,
+            &setup_slot,
+            enc_refs,
+            &av1_rc as *const _ as *const c_void,
+            &av1_pic as *const _ as *const c_void,
+            ir_info,
+        )
     }
 
     /// Read a completed slot's bitstream. HEVC keyframes carry VPS/SPS/PPS; AV1 opens every
