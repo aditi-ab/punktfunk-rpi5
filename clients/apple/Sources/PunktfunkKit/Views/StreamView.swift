@@ -381,6 +381,7 @@ public final class StreamLayerView: NSView {
         ) { [weak self] _ in
             self?.screenValuesStale = true
             self?.layoutPresenter()
+            self?.presenter.screenChanged()
         })
         // The same screen with a new mode, or a housing that came or went with it.
         windowObservers.append(NotificationCenter.default.addObserver(
@@ -1098,7 +1099,8 @@ public final class StreamLayerView: NSView {
             onDecodedSize: { [weak self] w, h in // resize overlay END signal (new-mode IDR dims)
                 DispatchQueue.main.async { self?.noteDecodedContentSize(width: w, height: h) }
                 overlayDecodedSize?(w, h)
-            })
+            },
+            adaptiveSync: { [weak self] in Self.isAdaptiveSync(self?.window?.screen ?? NSScreen.main) })
         // Match-window (C3): when ON, follow the window's pixel size so a windowed session streams
         // 1:1 (pixel-exact) instead of the presenter resampling a fixed-mode frame into a
         // non-matching window. The first real `layout()` feeds the initial size, so the stream
@@ -1149,6 +1151,13 @@ public final class StreamLayerView: NSView {
         if captured, desktopMouse, cursorChannelActive {
             window?.invalidateCursorRects(for: self)
         }
+    }
+
+    /// A variable-refresh screen reports a range of valid frame intervals; a fixed screen's
+    /// minimum and maximum are equal. nil is not adaptive.
+    static func isAdaptiveSync(_ screen: NSScreen?) -> Bool {
+        guard let screen else { return false }
+        return screen.maximumRefreshInterval - screen.minimumRefreshInterval > 0.001
     }
 
     /// The screen's refresh range and the step its interval moves in (0 = any interval).
