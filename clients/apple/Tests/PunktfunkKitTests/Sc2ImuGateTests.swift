@@ -1,7 +1,7 @@
 // The frozen-timestamp IMU gate's full truth table — the state machine proven against real
 // hardware (2026-06-08: a frozen non-zero IMU block drives Steam's desktop gyro-mouse; the
-// timestamp-gated passthrough is the fix), re-pinned here for the Apple side. The two
-// implementations (Sc2ImuGate.kt / Sc2ImuGate.swift) must not drift:
+// timestamp-gated passthrough is the fix), re-pinned here for the Apple side. The shared trace
+// in `clients/shared/sc2-vectors.json` holds this gate, Kotlin's and pf-client-core's together:
 // first sample frozen, ts-change → live, STALE_LIMIT (4) unchanged frames → refrozen, reset
 // re-arms, and only the 0x42/0x45 state shapes are ever touched.
 
@@ -29,6 +29,37 @@ final class Sc2ImuGateTests: XCTestCase {
 
     private func imuBlock(_ r: [UInt8]) -> [UInt8] {
         Array(r[Sc2ImuGate.imuOffset ..< Sc2ImuGate.imuOffset + Sc2ImuGate.imuLen])
+    }
+
+    /// `clients/shared/sc2-vectors.json`'s trace through one gate; pf-client-core and Kotlin
+    /// replay the same file.
+    func testTheSharedTrace() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // PunktfunkKitTests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // apple
+            .deletingLastPathComponent() // clients
+            .appendingPathComponent("shared/sc2-vectors.json")
+        let root = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        let gate = Sc2ImuGate()
+        let o = Sc2ImuGate.imuOffset
+        for (i, step) in try XCTUnwrap(root["imu_trace"] as? [[String: Any]]).enumerated() {
+            let len = try XCTUnwrap(step["len"] as? Int)
+            let ts = try UInt32(XCTUnwrap(step["ts"] as? Int))
+            var r = [UInt8](repeating: 0, count: len)
+            r[0] = try UInt8(XCTUnwrap(step["id"] as? Int))
+            for k in 0 ..< 4 { r[o + k] = UInt8((ts >> (8 * UInt32(k))) & 0xFF) }
+            let end = min(len, o + Sc2ImuGate.imuLen)
+            for k in o + 4 ..< end { r[k] = 0x11 }
+            let before = r
+            gate.apply(&r)
+            if try XCTUnwrap(step["pass"] as? Bool) {
+                XCTAssertEqual(r, before, "step \(i)")
+            } else {
+                XCTAssertEqual(Array(r[o ..< end]), [UInt8](repeating: 0, count: end - o), "step \(i)")
+            }
+        }
     }
 
     func testFirstSampleIsFrozen() {

@@ -3220,6 +3220,7 @@ name = "pf-driver-proto"
 version = "0.0.1"
 dependencies = [
  "bytemuck",
+ "serde_json",
 ]
 
 [[package]]
