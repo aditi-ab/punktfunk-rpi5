@@ -9,7 +9,7 @@
 //! Dict keys are hyphenated: `mime-types`, `session-is-owner`.
 
 use std::collections::HashMap;
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
@@ -27,9 +27,6 @@ const RD_BUS: &str = "org.gnome.Mutter.RemoteDesktop";
 const RD_PATH: &str = "/org/gnome/Mutter/RemoteDesktop";
 const RD_IFACE: &str = "org.gnome.Mutter.RemoteDesktop";
 const SESSION_IFACE: &str = "org.gnome.Mutter.RemoteDesktop.Session";
-
-/// 64 MiB; same as the wire clipboard cap.
-const CLIP_READ_CAP: u64 = 64 << 20;
 
 pub struct MutterClipboard {
     cmd_tx: mpsc::UnboundedSender<Cmd>,
@@ -266,12 +263,7 @@ async fn write_selection(session: &zbus::Proxy<'_>, serial: u32, bytes: Vec<u8>)
 
 fn read_fd_to_end(fd: OwnedFd) -> Result<Vec<u8>> {
     set_blocking(&fd)?;
-    let file = std::fs::File::from(fd);
-    let mut buf = Vec::new();
-    file.take(CLIP_READ_CAP)
-        .read_to_end(&mut buf)
-        .context("read SelectionRead fd")?;
-    Ok(buf)
+    super::read_capped(std::fs::File::from(fd)).context("read SelectionRead fd")
 }
 
 fn write_fd(fd: OwnedFd, bytes: &[u8]) -> Result<()> {

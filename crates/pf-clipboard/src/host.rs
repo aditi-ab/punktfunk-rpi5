@@ -28,6 +28,9 @@ use std::io::Write as _;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
+#[cfg(target_os = "linux")]
+use punktfunk_core::clipboard::CLIP_FETCH_CAP;
+
 pub enum ClipEvent {
     /// Empty `mimes` means cleared; bytes wait for a client fetch.
     Selection {
@@ -81,6 +84,20 @@ fn fulfill_paste(fd: OwnedFd, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = std::fs::File::from(fd);
     file.write_all(bytes)?;
     Ok(())
+}
+
+/// Blocking; reads a host selection transfer to EOF. A selection over [`CLIP_FETCH_CAP`] fails
+/// the read: its first 64 MiB is a broken file, not a smaller one.
+#[cfg(target_os = "linux")]
+fn read_capped(r: impl std::io::Read) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut buf = Vec::new();
+    r.take(CLIP_FETCH_CAP as u64 + 1).read_to_end(&mut buf)?;
+    anyhow::ensure!(
+        buf.len() <= CLIP_FETCH_CAP,
+        "clipboard selection exceeds the {CLIP_FETCH_CAP}-byte transfer cap"
+    );
+    Ok(buf)
 }
 
 pub enum HostClipboard {
@@ -329,6 +346,17 @@ pub fn wayland_offers_for(wire_mimes: &[String]) -> Vec<String> {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_selection_over_the_cap_fails_instead_of_truncating() {
+        use std::io::Read as _;
+        let cap = CLIP_FETCH_CAP as u64;
+        assert_eq!(
+            read_capped(std::io::repeat(7).take(cap)).unwrap().len(),
+            CLIP_FETCH_CAP
+        );
+        assert!(read_capped(std::io::repeat(7).take(cap + 1)).is_err());
+    }
 
     #[test]
     fn wayland_to_wire_canonicalizes_and_drops_targets() {

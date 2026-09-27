@@ -10,7 +10,6 @@
 //! `vdisplay::apply_session_env`). Missing protocol is `BackendUnavailable`.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,9 +27,6 @@ use wayland_protocols::ext::data_control::v1::client::{
 };
 
 use super::{ClipEvent, PasteResponder};
-
-/// 64 MiB, matching the wire clipboard cap. `read_to_end` would otherwise grow with the pipe.
-const CLIP_READ_CAP: u64 = 64 << 20;
 
 /// Dispatch thread writes; session thread reads for `receive()`.
 struct CurrentSelection {
@@ -337,13 +333,8 @@ impl ClipboardBackend {
         self.conn.flush().context("flush receive")?;
         // Drop our write end so the pipe EOFs when the source closes its dup.
         drop(write_fd);
-        let mut buf = Vec::new();
         // Unique pipe read end; `File` owns it and closes on drop.
-        let file = std::fs::File::from(read_fd);
-        file.take(CLIP_READ_CAP)
-            .read_to_end(&mut buf)
-            .context("read clipboard transfer")?;
-        Ok(buf)
+        super::read_capped(std::fs::File::from(read_fd)).context("read clipboard transfer")
     }
 }
 
