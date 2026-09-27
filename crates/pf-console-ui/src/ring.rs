@@ -422,6 +422,12 @@ impl Ring {
                 armed: true,
                 ..plain("end_stream", "End stream", "End")
             },
+            SlotId::EndGame => Spec {
+                armed: true,
+                enabled: f.streamed_game.is_some(),
+                reason: "No game this device launched is running here".into(),
+                ..plain("end_game", "End game", "Quit")
+            },
             SlotId::DisconnectLinger => plain(
                 "disconnect_linger",
                 "Disconnect, keep the game running",
@@ -569,6 +575,14 @@ impl Ring {
                 self.close();
                 self.pending.push_back(RingCommand::EndStream);
             }
+            SlotId::EndGame => {
+                let Some((app_id, title)) = self.facts.streamed_game.clone() else {
+                    return;
+                };
+                self.close();
+                self.pending
+                    .push_back(RingCommand::EndGame { app_id, title });
+            }
             SlotId::DisconnectLinger => {
                 self.close();
                 self.pending.push_back(RingCommand::DisconnectLinger);
@@ -620,8 +634,11 @@ impl Ring {
     }
 
     fn sheet_rows(&self) -> Vec<SheetRow> {
-        let mut rows = vec![
-            SheetRow::Slot(SlotId::EndStream),
+        let mut rows = vec![SheetRow::Slot(SlotId::EndStream)];
+        if self.facts.streamed_game.is_some() {
+            rows.push(SheetRow::Slot(SlotId::EndGame));
+        }
+        rows.extend([
             SheetRow::Slot(SlotId::DisconnectLinger),
             SheetRow::Resolution,
             SheetRow::Refresh,
@@ -634,7 +651,7 @@ impl Ring {
             SheetRow::Slot(SlotId::Stats),
             SheetRow::Slot(SlotId::Mic),
             SheetRow::Slot(SlotId::StreamMute),
-        ];
+        ]);
         rows.extend(
             self.actions()
                 .into_iter()
@@ -1636,6 +1653,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The sheet lists End game only while a game this device launched is on the stream;
+    /// firing it arms first, then asks for exactly that title.
+    #[test]
+    fn end_game_follows_the_streamed_game_and_arms_first() {
+        let mut r = Ring::new();
+        r.set_facts(&facts());
+        let listed = |r: &Ring| {
+            r.sheet_rows()
+                .iter()
+                .any(|row| matches!(row, SheetRow::Slot(SlotId::EndGame)))
+        };
+        assert!(!listed(&r), "a desktop stream has no game to end");
+        r.fire(&SlotId::EndGame);
+        assert_eq!(r.take_command(), None, "nothing to end: it says why");
+        r.set_facts(&RingFacts {
+            streamed_game: Some(("steam:570".into(), "Dota 2".into())),
+            ..facts()
+        });
+        assert!(listed(&r));
+        r.fire(&SlotId::EndGame);
+        assert_eq!(r.take_command(), None, "the first press only arms");
+        r.fire(&SlotId::EndGame);
+        assert_eq!(
+            r.take_command(),
+            Some(RingCommand::EndGame {
+                app_id: "steam:570".into(),
+                title: "Dota 2".into(),
+            })
+        );
     }
 
     #[test]

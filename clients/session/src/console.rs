@@ -680,6 +680,30 @@ impl ServiceState {
                     })
                     .ok();
             }
+            ConsoleCmd::EndGame {
+                addr,
+                mgmt,
+                fp_hex,
+                app_id,
+                title,
+            } => {
+                // Same worker-thread reason as RefreshRunning; the re-read after it is what
+                // takes the Resume badge off the poster.
+                library::invalidate_running(&fp_hex);
+                let shared = self.library.clone();
+                let identity = self.identity.clone();
+                let pin = trust::parse_hex32(&fp_hex);
+                let console = self.console.clone();
+                std::thread::Builder::new()
+                    .name("punktfunk-endgame".into())
+                    .spawn(move || {
+                        let outcome = library::end_game(&addr, mgmt, &identity, pin, &app_id);
+                        tracing::info!(app = %app_id, ?outcome, "end game");
+                        console.set_notice(outcome.notice(&title));
+                        shared.set_running(&library::fetch_running(&addr, mgmt, &identity, pin));
+                    })
+                    .ok();
+            }
             ConsoleCmd::Pair {
                 addr,
                 port,
@@ -1459,6 +1483,7 @@ fn to_model(games: &[library::GameEntry]) -> Vec<LibraryGame> {
             genres: g.genres.clone(),
             stats: g.stats,
             running: false,
+            endable: false,
         })
         .collect()
 }

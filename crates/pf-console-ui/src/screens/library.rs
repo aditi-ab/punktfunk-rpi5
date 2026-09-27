@@ -2169,6 +2169,7 @@ mod tests {
                     genres: Vec::new(),
                     stats: None,
                     running: false,
+                    endable: false,
                 })
                 .collect(),
         );
@@ -2685,6 +2686,7 @@ mod tests {
                 genres: Vec::new(),
                 stats: None,
                 running: false,
+                endable: false,
             })
             .collect();
         s.recollate();
@@ -3022,6 +3024,7 @@ mod tests {
                 genres: Vec::new(),
                 stats: None,
                 running: false,
+                endable: false,
             })
             .collect()
     }
@@ -3259,6 +3262,7 @@ mod tests {
                     genres: Vec::new(),
                     stats: None,
                     running: i == 1,
+                    endable: false,
                 })
                 .collect();
             for (i, hours) in [(2, 2), (3, 30), (5, 80)] {
