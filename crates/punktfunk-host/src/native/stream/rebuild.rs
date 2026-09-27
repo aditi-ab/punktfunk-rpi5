@@ -23,7 +23,7 @@ fn repoint_session_input(
     compositor: crate::vdisplay::Compositor,
     route: Option<&crate::vdisplay::GamescopeRoute>,
 ) {
-    match session.filter(|_| super::compositor::session_is_isolated(compositor, route)) {
+    match session.filter(|_| crate::compositor_route::session_is_isolated(compositor, route)) {
         Some(tx) => input_route.set(tx.clone()),
         None => {
             input_route.set(shared.clone());
