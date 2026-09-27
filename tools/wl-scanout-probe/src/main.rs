@@ -1223,6 +1223,11 @@ mod linux {
                     println!("    {} {}", fourcc_name(f), mods.join(" "));
                 }
             }
+            let mut all: Vec<u32> = t.formats.iter().map(|(f, _)| *f).collect();
+            all.sort_unstable();
+            all.dedup();
+            let names: Vec<String> = all.into_iter().map(fourcc_name).collect();
+            println!("    all fourccs: {}", names.join(" "));
         }
     }
 
