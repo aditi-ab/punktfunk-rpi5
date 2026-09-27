@@ -12,12 +12,16 @@ on:
     paths:
       - "crates/punktfunk-setup/**"
       - "crates/punktfunk-setup-win/**"
+      - "crates/pf-paths/**"
+      - "crates/pf-paths-win/**"
       - "data/platforms.json"
       - ".gitea/workflows/setup-windows.yml"
   pull_request:
     paths:
       - "crates/punktfunk-setup/**"
       - "crates/punktfunk-setup-win/**"
+      - "crates/pf-paths/**"
+      - "crates/pf-paths-win/**"
       - "data/platforms.json"
       - ".gitea/workflows/setup-windows.yml"
 

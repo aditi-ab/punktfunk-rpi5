@@ -23,19 +23,19 @@ ROOTDIR="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOTDIR"
 
 BIN="target/release/$PKG"
-if [ ! -x "$BIN" ]; then
-  echo "==> building $PKG (release)"
-  PUNKTFUNK_BUILD_VERSION="$VERSION" cargo build --release -p "$PKG" --locked   # stamp --version (build.rs)
-fi
 # The PyroWave encode worker — the capability-carrying half. A SEPARATE executable, never a
 # hardlink or a host subcommand: a shared inode would share the file capability and make the host
 # unidentifiable to KWin all over again (see the postinst note below). It ships in this same .deb
 # because host and worker version-check each other over their socket and fall back to the
 # in-process encoder on any mismatch, so they must move in lockstep.
 WORKER_BIN="target/release/punktfunk-encode-worker"
-if [ ! -x "$WORKER_BIN" ]; then
-  echo "==> building punktfunk-encode-worker (release)"
-  PUNKTFUNK_BUILD_VERSION="$VERSION" cargo build --release -p punktfunk-encode-worker --locked
+# Host and worker build together with the encoder features every Linux package ships (deb.yml,
+# the rpm spec, the PKGBUILD). Without them the host has no NVENC and no Vulkan encode.
+if [ ! -x "$BIN" ] || [ ! -x "$WORKER_BIN" ]; then
+  echo "==> building $PKG + punktfunk-encode-worker (release)"
+  PUNKTFUNK_BUILD_VERSION="$VERSION" cargo build --release --locked \
+    --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode \
+    -p "$PKG" -p punktfunk-encode-worker   # PUNKTFUNK_BUILD_VERSION stamps --version (build.rs)
 fi
 TRAY_BIN="target/release/punktfunk-tray"
 # ALWAYS built here, in its OWN cargo invocation — load-bearing, not tidiness, and deliberately not
