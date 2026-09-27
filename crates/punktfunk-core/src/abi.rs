@@ -5781,6 +5781,76 @@ pub unsafe extern "C" fn punktfunk_h265_concealer_release(buf: *mut u8, len: usi
     });
 }
 
+/// [`punktfunk_av1_sequence_info`]'s answer: what an `av1C` record and a colour description
+/// take from an AV1 sequence header. Colour codes are ITU-T H.273, 2 when none is coded.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct PunktfunkAv1SequenceInfo {
+    pub profile: u8,
+    pub level_idx0: u8,
+    pub tier0: u8,
+    pub high_bitdepth: bool,
+    pub twelve_bit: bool,
+    pub mono_chrome: bool,
+    pub subsampling_x: bool,
+    pub subsampling_y: bool,
+    pub chroma_sample_position: u8,
+    pub color_primaries: u8,
+    pub transfer_characteristics: u8,
+    pub matrix_coefficients: u8,
+    pub full_range: bool,
+    pub max_width: u32,
+    pub max_height: u32,
+}
+
+/// Parse the first sequence header in `data`, a low-overhead temporal unit or a run of sized
+/// OBUs. `InvalidArg` when it carries none or the header does not parse.
+///
+/// # Safety
+/// `data` points to `len` readable bytes; `out` is writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_av1_sequence_info(
+    data: *const u8,
+    len: usize,
+    out: *mut PunktfunkAv1SequenceInfo,
+) -> PunktfunkStatus {
+    guard(|| {
+        // SAFETY: caller out-param or null; `as_mut` never dereferences null.
+        let Some(out) = (unsafe { out.as_mut() }) else {
+            return PunktfunkStatus::NullPointer;
+        };
+        if data.is_null() {
+            return PunktfunkStatus::NullPointer;
+        }
+        if ffi_slice_bytes::<u8>(len).is_none() {
+            return PunktfunkStatus::InvalidArg;
+        }
+        // SAFETY: `data` is non-null and `ffi_slice_bytes` proved the extent fits a Rust slice.
+        let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+        let Some(i) = pf_bitstream::av1::sequence_info(bytes) else {
+            return PunktfunkStatus::InvalidArg;
+        };
+        *out = PunktfunkAv1SequenceInfo {
+            profile: i.profile,
+            level_idx0: i.level_idx0,
+            tier0: i.tier0,
+            high_bitdepth: i.high_bitdepth,
+            twelve_bit: i.twelve_bit,
+            mono_chrome: i.mono_chrome,
+            subsampling_x: i.subsampling_x,
+            subsampling_y: i.subsampling_y,
+            chroma_sample_position: i.chroma_sample_position,
+            color_primaries: i.color_primaries,
+            transfer_characteristics: i.transfer_characteristics,
+            matrix_coefficients: i.matrix_coefficients,
+            full_range: i.full_range,
+            max_width: i.max_width,
+            max_height: i.max_height,
+        };
+        PunktfunkStatus::Ok
+    })
+}
+
 // C wrapper for [`ReanchorGate`]. Time stays inside (`Instant::now`).
 // `arm` on loss, `on_decoded` per frame, `on_no_output` per empty AU, `poll` each tick.
 
@@ -6253,8 +6323,8 @@ mod abi_version_tests {
     #[test]
     fn abi_version_is_pinned() {
         // Current ABI. A bump must update this pin.
-        assert_eq!(crate::ABI_VERSION, 39);
-        assert_eq!(super::punktfunk_abi_version(), 39);
+        assert_eq!(crate::ABI_VERSION, 40);
+        assert_eq!(super::punktfunk_abi_version(), 40);
     }
 
     #[test]

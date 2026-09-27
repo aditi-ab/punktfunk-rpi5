@@ -15,6 +15,7 @@
 // studio range, max frame 320×180, chroma sample position 0.
 
 import CoreMedia
+import PunktfunkCore
 import VideoToolbox
 import XCTest
 @testable import PunktfunkKit
@@ -76,37 +77,34 @@ final class AV1Tests: XCTestCase {
     // MARK: - Sequence header
 
     func testSequenceHeaderParse() throws {
-        // The sequence-header OBU payload sits at bytes 4..<15 (TD 2 bytes, header+size 2 bytes).
-        let payload = Data(Self.keyframeTU[4..<15])
-        let sh = try XCTUnwrap(AV1.parseSequenceHeader(payload))
+        // The sequence-header OBU sits at bytes 2..<15, behind the 2-byte temporal delimiter.
+        let sh = try XCTUnwrap(AV1.sequenceInfo(Data(Self.keyframeTU[2..<15])))
         XCTAssertEqual(sh.profile, 0) // Main
-        XCTAssertEqual(sh.levelIdx0, 0)
+        XCTAssertEqual(sh.level_idx0, 0)
         XCTAssertEqual(sh.tier0, 0)
-        XCTAssertFalse(sh.highBitdepth)
-        XCTAssertFalse(sh.twelveBit)
-        XCTAssertFalse(sh.monochrome)
-        XCTAssertTrue(sh.subsamplingX) // profile 0 ⇒ 4:2:0
-        XCTAssertTrue(sh.subsamplingY)
-        XCTAssertEqual(sh.chromaSamplePosition, 0)
-        XCTAssertEqual(sh.colorPrimaries, 2) // no color description ⇒ unspecified
-        XCTAssertEqual(sh.transferCharacteristics, 2)
-        XCTAssertEqual(sh.matrixCoefficients, 2)
-        XCTAssertFalse(sh.fullRange)
-        XCTAssertEqual(sh.maxWidth, 320)
-        XCTAssertEqual(sh.maxHeight, 180)
+        XCTAssertFalse(sh.high_bitdepth)
+        XCTAssertFalse(sh.twelve_bit)
+        XCTAssertFalse(sh.mono_chrome)
+        XCTAssertTrue(sh.subsampling_x) // profile 0 ⇒ 4:2:0
+        XCTAssertTrue(sh.subsampling_y)
+        XCTAssertEqual(sh.chroma_sample_position, 0)
+        XCTAssertEqual(sh.color_primaries, 2) // no color description ⇒ unspecified
+        XCTAssertEqual(sh.transfer_characteristics, 2)
+        XCTAssertEqual(sh.matrix_coefficients, 2)
+        XCTAssertFalse(sh.full_range)
+        XCTAssertEqual(sh.max_width, 320)
+        XCTAssertEqual(sh.max_height, 180)
+        XCTAssertNotNil(AV1.sequenceInfo(Data(Self.keyframeTU)), "a whole temporal unit")
     }
 
     func testSequenceHeaderRejectsTruncation() {
-        // The parse consumes exactly 79 bits of this header (it stops after
-        // chroma_sample_position — the last field av1C needs), so 10 bytes suffice and the
-        // 11th only carries fields past the parse. Everything shorter must fail cleanly.
-        let payload = Data(Self.keyframeTU[4..<15])
-        for cut in 0..<10 {
+        let obu = Data(Self.keyframeTU[2..<15])
+        for cut in 0..<obu.count {
             XCTAssertNil(
-                AV1.parseSequenceHeader(payload.prefix(cut)),
+                AV1.sequenceInfo(obu.prefix(cut)),
                 "a header truncated to \(cut) bytes must not parse")
         }
-        XCTAssertNotNil(AV1.parseSequenceHeader(payload.prefix(10)))
+        XCTAssertNil(AV1.sequenceInfo(Data(Self.deltaTU)), "a delta TU carries no header")
     }
 
     // MARK: - Format description
