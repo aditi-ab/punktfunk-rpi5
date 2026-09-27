@@ -57,6 +57,9 @@ pub mod reject;
 pub mod render_scale;
 /// cbindgen:ignore
 pub mod resolutions;
+/// The rumble policy every client runs. Outside `client` because the browser, which has no
+/// quinn, runs it too.
+pub mod rumble;
 pub mod session;
 pub mod stats;
 #[cfg(feature = "tls")]

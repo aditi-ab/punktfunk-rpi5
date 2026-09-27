@@ -366,11 +366,6 @@
 #define PUNKTFUNK_AUDIO_BITS_24 24
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Two missed 500 ms legacy refreshes. A quieter host is treated as gone.
-#define PUNKTFUNK_LEGACY_STALE_MS 1000
-#endif
-
-#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Per-fetch read cap, bytes (`design/clipboard-and-file-transfer.md`). A holder that
 // streams more is a cap breach: the fetch fails rather than buffering unboundedly.
 #define PUNKTFUNK_CLIP_FETCH_CAP (64 << 20)
@@ -1274,6 +1269,9 @@
 
 // Supersample cap; still clamped per axis by [`max_dimension`].
 #define PUNKTFUNK_MAX_SCALE 4.0
+
+// Two missed 500 ms legacy refreshes. A quieter host is treated as gone.
+#define PUNKTFUNK_LEGACY_STALE_MS 1000
 
 // Stable C ABI status codes. `Ok` is 0; errors are negative so callers can
 // test `rc < 0`. Existing variants must not be renumbered — only append.

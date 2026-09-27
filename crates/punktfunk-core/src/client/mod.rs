@@ -37,7 +37,7 @@ mod planes;
 mod probe;
 mod pump;
 mod recovery;
-mod rumble;
+use crate::rumble;
 mod worker;
 
 pub use self::frame_channel::{ADAPT_REPORT_INTERVAL, FLUSH_COOLDOWN, NO_VIDEO_RETRY};
