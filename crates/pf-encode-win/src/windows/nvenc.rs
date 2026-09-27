@@ -23,8 +23,9 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use super::nvenc_core::{
-    apply_low_latency_config, build_init_params, cached_ceiling, codec_guid, plan_range_recovery,
-    resolve_slices, resolve_split_subframe, resolve_subframe, store_ceiling, subframe_env_forced,
+    apply_low_latency_config, build_init_params, cached_ceiling, codec_guid, force_frame_mode,
+    plan_range_recovery, resolve_slices, resolve_split_subframe, resolve_subframe, seed_config,
+    seed_lock_bitstream, seed_pic_params, seed_preset_config, store_ceiling, subframe_env_forced,
     wave_rows, CeilingKey, LowLatencyConfig, NvStatusExt, RangePlan,
 };
 use crate::rfi::{Wave, WaveMark};
@@ -401,7 +402,7 @@ fn retrieve_loop(
                 let mut lock = nv::NV_ENC_LOCK_BITSTREAM {
                     version: nv::NV_ENC_LOCK_BITSTREAM_VER,
                     outputBitstream: job.bs as *mut c_void,
-                    ..Default::default()
+                    ..seed_lock_bitstream()
                 };
                 match (api().lock_bitstream)(enc as *mut c_void, &mut lock).nv_ok() {
                     Ok(()) => {
@@ -947,9 +948,9 @@ impl NvencD3d11Encoder {
             version: nv::NV_ENC_PRESET_CONFIG_VER,
             presetCfg: nv::NV_ENC_CONFIG {
                 version: nv::NV_ENC_CONFIG_VER,
-                ..Default::default()
+                ..seed_config()
             },
-            ..Default::default()
+            ..seed_preset_config()
         };
         (api().get_encode_preset_config_ex)(
             enc,
@@ -960,6 +961,7 @@ impl NvencD3d11Encoder {
         )
         .nv_ok()
         .map_err(|e| nvenc_status::call_err("get_encode_preset_config_ex", e))?;
+        force_frame_mode(&raw mut preset.presetCfg);
         let mut cfg = preset.presetCfg;
 
         // Shared low-latency contract. Windows full-chroma input is packed RGB (NVENC CSCs under
@@ -1753,7 +1755,7 @@ impl Encoder for NvencD3d11Encoder {
                     .get(slot)
                     .map(|&e| e as *mut c_void)
                     .unwrap_or(ptr::null_mut()),
-                ..Default::default()
+                ..seed_pic_params()
             };
 
             // In-band HDR10 SEI on every IDR: ST.2086 mastering + CEA-861.3 CLL.
@@ -1987,7 +1989,7 @@ impl Encoder for NvencD3d11Encoder {
             let mut lock = nv::NV_ENC_LOCK_BITSTREAM {
                 version: nv::NV_ENC_LOCK_BITSTREAM_VER,
                 outputBitstream: bs,
-                ..Default::default()
+                ..seed_lock_bitstream()
             };
             (api().lock_bitstream)(self.encoder, &mut lock)
                 .nv_ok()
@@ -2070,7 +2072,7 @@ impl Encoder for NvencD3d11Encoder {
                     version: nv::NV_ENC_LOCK_BITSTREAM_VER,
                     outputBitstream: bs,
                     sliceOffsets: offsets.as_mut_ptr(),
-                    ..Default::default()
+                    ..seed_lock_bitstream()
                 };
                 lock.set_doNotWait(1);
                 if (api().lock_bitstream)(self.encoder, &mut lock)
@@ -2135,7 +2137,7 @@ impl Encoder for NvencD3d11Encoder {
             let mut lock = nv::NV_ENC_LOCK_BITSTREAM {
                 version: nv::NV_ENC_LOCK_BITSTREAM_VER,
                 outputBitstream: bs,
-                ..Default::default()
+                ..seed_lock_bitstream()
             };
             (api().lock_bitstream)(self.encoder, &mut lock)
                 .nv_ok()

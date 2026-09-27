@@ -25,9 +25,10 @@
 
 use super::nvenc_core::{
     apply_low_latency_config, build_init_params, cached_ceiling, cached_split_verdict, codec_guid,
-    plan_range_recovery, resolve_slices, resolve_split_subframe, resolve_subframe, store_ceiling,
-    store_split_verdict, subframe_env_forced, wave_rows, ArbAction, CeilingKey, LowLatencyConfig,
-    NvStatusExt, RangePlan, SplitArbiter, SplitKey,
+    force_frame_mode, plan_range_recovery, resolve_slices, resolve_split_subframe,
+    resolve_subframe, seed_config, seed_lock_bitstream, seed_pic_params, seed_preset_config,
+    store_ceiling, store_split_verdict, subframe_env_forced, wave_rows, ArbAction, CeilingKey,
+    LowLatencyConfig, NvStatusExt, RangePlan, SplitArbiter, SplitKey,
 };
 use super::nvenc_status;
 use super::{max_forced_split_mode, resolve_split_mode};
@@ -476,7 +477,7 @@ fn retrieve_loop(
             let mut lock = nv::NV_ENC_LOCK_BITSTREAM {
                 version: nv::NV_ENC_LOCK_BITSTREAM_VER,
                 outputBitstream: job.bs as *mut c_void,
-                ..Default::default()
+                ..seed_lock_bitstream()
             };
             match (api().lock_bitstream)(enc as *mut c_void, &mut lock).nv_ok() {
                 Ok(()) => {
@@ -1293,9 +1294,9 @@ impl NvencCudaEncoder {
             version: nv::NV_ENC_PRESET_CONFIG_VER,
             presetCfg: nv::NV_ENC_CONFIG {
                 version: nv::NV_ENC_CONFIG_VER,
-                ..Default::default()
+                ..seed_config()
             },
-            ..Default::default()
+            ..seed_preset_config()
         };
         (api().get_encode_preset_config_ex)(
             enc,
@@ -1306,6 +1307,7 @@ impl NvencCudaEncoder {
         )
         .nv_ok()
         .map_err(|e| nvenc_status::call_err("get_encode_preset_config_ex", e))?;
+        force_frame_mode(&raw mut preset.presetCfg);
         let mut cfg = preset.presetCfg;
 
         // Shared low-latency contract. Linux full-chroma is a YUV444 surface; AV1 input-depth
@@ -2526,7 +2528,7 @@ impl NvencCudaEncoder {
                 pictureStruct: nv::NV_ENC_PIC_STRUCT::NV_ENC_PIC_STRUCT_FRAME,
                 inputTimeStamp: pts,
                 encodePicFlags: flags,
-                ..Default::default()
+                ..seed_pic_params()
             };
 
             // HDR10 SEI on every IDR. HEVC/H.264 carry SEI; AV1 uses OBUs.
@@ -2828,7 +2830,7 @@ impl Encoder for NvencCudaEncoder {
             let mut lock = nv::NV_ENC_LOCK_BITSTREAM {
                 version: nv::NV_ENC_LOCK_BITSTREAM_VER,
                 outputBitstream: bs,
-                ..Default::default()
+                ..seed_lock_bitstream()
             };
             (api().lock_bitstream)(self.encoder, &mut lock)
                 .nv_ok()
@@ -2905,7 +2907,7 @@ impl Encoder for NvencCudaEncoder {
                     version: nv::NV_ENC_LOCK_BITSTREAM_VER,
                     outputBitstream: bs,
                     sliceOffsets: offsets.as_mut_ptr(),
-                    ..Default::default()
+                    ..seed_lock_bitstream()
                 };
                 lock.set_doNotWait(1);
                 if (api().lock_bitstream)(self.encoder, &mut lock)
@@ -2974,7 +2976,7 @@ impl Encoder for NvencCudaEncoder {
             let mut lock = nv::NV_ENC_LOCK_BITSTREAM {
                 version: nv::NV_ENC_LOCK_BITSTREAM_VER,
                 outputBitstream: bs,
-                ..Default::default()
+                ..seed_lock_bitstream()
             };
             (api().lock_bitstream)(self.encoder, &mut lock)
                 .nv_ok()
@@ -5318,7 +5320,7 @@ mod tests {
                 version: nv::NV_ENC_LOCK_BITSTREAM_VER,
                 outputBitstream: bs,
                 sliceOffsets: offsets.as_mut_ptr(),
-                ..Default::default()
+                ..seed_lock_bitstream()
             };
             lock.set_doNotWait(1);
             // SAFETY: live session; `bs` is the just-submitted bitstream. Unlock a successful

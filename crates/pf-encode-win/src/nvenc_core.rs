@@ -32,6 +32,66 @@ impl NvStatusExt for nv::NVENCSTATUS {
     }
 }
 
+// The SDK's bindgen `Default` zero-fills, but `frameFieldMode` and `pictureStruct` start at 1,
+// so `..Default::default()` builds an invalid enum. Seed these three structs from here instead.
+const FRAME_MODE: nv::NV_ENC_PARAMS_FRAME_FIELD_MODE =
+    nv::NV_ENC_PARAMS_FRAME_FIELD_MODE::NV_ENC_PARAMS_FRAME_FIELD_MODE_FRAME;
+const PIC_FRAME: nv::NV_ENC_PIC_STRUCT = nv::NV_ENC_PIC_STRUCT::NV_ENC_PIC_STRUCT_FRAME;
+
+/// All-zero `NV_ENC_CONFIG` with a progressive `frameFieldMode`.
+pub fn seed_config() -> nv::NV_ENC_CONFIG {
+    let mut c = std::mem::MaybeUninit::<nv::NV_ENC_CONFIG>::zeroed();
+    // SAFETY: `c` is live; forcing the field writes and reads nothing.
+    unsafe { force_frame_mode(c.as_mut_ptr()) };
+    // SAFETY: `frameFieldMode` is the struct's only enum without a 0 variant, set above.
+    unsafe { c.assume_init() }
+}
+
+/// All-zero `NV_ENC_PRESET_CONFIG` around [`seed_config`].
+pub fn seed_preset_config() -> nv::NV_ENC_PRESET_CONFIG {
+    let mut p = std::mem::MaybeUninit::<nv::NV_ENC_PRESET_CONFIG>::zeroed();
+    // SAFETY: an in-bounds field of live `p`; no read.
+    let cfg = unsafe { &raw mut (*p.as_mut_ptr()).presetCfg };
+    // SAFETY: `cfg` is that field, aligned and writable.
+    unsafe { cfg.write(seed_config()) };
+    // SAFETY: `presetCfg` holds the only zero-invalid enum, now set.
+    unsafe { p.assume_init() }
+}
+
+/// All-zero `NV_ENC_PIC_PARAMS` with a frame `pictureStruct`.
+pub fn seed_pic_params() -> nv::NV_ENC_PIC_PARAMS {
+    let mut p = std::mem::MaybeUninit::<nv::NV_ENC_PIC_PARAMS>::zeroed();
+    // SAFETY: an in-bounds field of live `p`; no read.
+    let field = unsafe { &raw mut (*p.as_mut_ptr()).pictureStruct };
+    // SAFETY: `field` is aligned and writable.
+    unsafe { field.write(PIC_FRAME) };
+    // SAFETY: `pictureStruct` is the struct's only enum without a 0 variant, set above.
+    unsafe { p.assume_init() }
+}
+
+/// All-zero `NV_ENC_LOCK_BITSTREAM` with a frame `pictureStruct` (the driver overwrites it).
+pub fn seed_lock_bitstream() -> nv::NV_ENC_LOCK_BITSTREAM {
+    let mut l = std::mem::MaybeUninit::<nv::NV_ENC_LOCK_BITSTREAM>::zeroed();
+    // SAFETY: an in-bounds field of live `l`; no read.
+    let field = unsafe { &raw mut (*l.as_mut_ptr()).pictureStruct };
+    // SAFETY: `field` is aligned and writable.
+    unsafe { field.write(PIC_FRAME) };
+    // SAFETY: `pictureStruct` is the struct's only enum without a 0 variant, set above.
+    unsafe { l.assume_init() }
+}
+
+/// Make `cfg` progressive without reading it. Run it on a driver-filled preset before the
+/// copy: a driver may leave `frameFieldMode` 0. These encoders only send frames.
+///
+/// # Safety
+/// `cfg` points at a live, writable `NV_ENC_CONFIG`.
+pub unsafe fn force_frame_mode(cfg: *mut nv::NV_ENC_CONFIG) {
+    // SAFETY: per the contract; `&raw mut` forms no reference to the maybe-invalid value.
+    let field = unsafe { &raw mut (*cfg).frameFieldMode };
+    // SAFETY: `field` is aligned and writable.
+    unsafe { field.write(FRAME_MODE) };
+}
+
 /// NVENC codec GUID. PyroWave never opens this backend.
 pub fn codec_guid(codec: Codec) -> nv::GUID {
     match codec {
@@ -529,17 +589,21 @@ mod tests {
     }
 
     #[test]
-    fn hevc_444_still_takes_the_frext_path() {
-        // Do not `mem::zeroed` `NV_ENC_CONFIG`: `frameFieldMode`/`mvPrecision`
-        // discriminants start at 1, so all-zero is invalid and Rust aborts.
-        // Production seeds from `Default` then overwrites from the driver's preset.
+    fn seeds_carry_valid_enums() {
+        assert_eq!(seed_config().frameFieldMode, FRAME_MODE);
+        assert_eq!(seed_preset_config().presetCfg.frameFieldMode, FRAME_MODE);
+        assert_eq!(seed_pic_params().pictureStruct, PIC_FRAME);
+        assert_eq!(seed_lock_bitstream().pictureStruct, PIC_FRAME);
+    }
 
+    #[test]
+    fn hevc_444_still_takes_the_frext_path() {
         // SAFETY: `apply_low_latency_config` only writes into the caller's config (union writes
         // included) and makes no driver calls, so this is pure in-memory work.
         let cfg = unsafe {
             let mut cfg = nv::NV_ENC_CONFIG {
                 version: nv::NV_ENC_CONFIG_VER,
-                ..Default::default()
+                ..seed_config()
             };
             apply_low_latency_config(&mut cfg, low_latency_cfg(Codec::H265, true, 10));
             cfg
@@ -557,7 +621,7 @@ mod tests {
         let cfg = unsafe {
             let mut cfg = nv::NV_ENC_CONFIG {
                 version: nv::NV_ENC_CONFIG_VER,
-                ..Default::default()
+                ..seed_config()
             };
             apply_low_latency_config(&mut cfg, low_latency_cfg(Codec::Av1, true, 10));
             cfg
