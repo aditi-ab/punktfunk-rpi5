@@ -259,11 +259,8 @@ pub(super) fn converge_runner_roots(
     if std::fs::read_to_string(&path).is_ok_and(|old| old == body) {
         return Ok(false);
     }
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    // Per process: a CLI grant and the serving host may converge at the same moment.
-    let tmp = dir.join(format!("{ROOTS_DROPIN}.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, &body).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("replace {}", path.display()))?;
+    pf_paths::replace_file(&path, body.as_bytes())
+        .with_context(|| format!("replace {}", path.display()))?;
     run_systemctl(&["daemon-reload"])?;
     run_systemctl(&["--no-block", "try-restart", UNIT])?;
     Ok(true)

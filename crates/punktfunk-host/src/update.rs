@@ -183,9 +183,8 @@ fn load_floor(path: &Path, channel: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Raise (never lower) the floor. Temp + rename so a power cut cannot half-write it; where
-/// rename cannot work it writes in place, since an unraised floor lets a replayed older
-/// manifest through.
+/// Raise (never lower) the floor through [`pf_paths::replace_file`]. Where that cannot work it
+/// writes in place, since an unraised floor lets a replayed older manifest through.
 fn store_floor(path: &Path, channel: &str, serial: u64) -> std::io::Result<()> {
     let mut file: FloorFile = std::fs::read(path)
         .ok()
@@ -197,17 +196,9 @@ fn store_floor(path: &Path, channel: &str, serial: u64) -> std::io::Result<()> {
     }
     *slot = serial;
     let bytes = serde_json::to_vec_pretty(&file)?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, &bytes)
-        .and_then(|()| std::fs::rename(&tmp, path))
-        .is_ok()
-    {
+    if pf_paths::replace_file(path, &bytes).is_ok() {
         return Ok(());
     }
-    let _ = std::fs::remove_file(&tmp);
     std::fs::write(path, &bytes)
 }
 
@@ -668,16 +659,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A temp file that cannot be renamed into place still raises the floor.
+    /// A temp file that cannot be written beside the floor still raises it.
     #[test]
-    fn floor_rises_when_the_rename_cannot_happen() {
+    fn floor_rises_when_the_temp_cannot_be_written() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("update-state.json");
+        // A 255-byte name fits, but its temp name does not: the temp write fails, as a failed
+        // rename would.
+        let path = dir.path().join(format!("{}.json", "f".repeat(250)));
         store_floor(&path, "stable", 5).unwrap();
-        // A directory on the temp name defeats the temp write, as a failed rename would.
-        std::fs::create_dir(path.with_extension("json.tmp")).unwrap();
         store_floor(&path, "stable", 9).unwrap();
         assert_eq!(load_floor(&path, "stable"), 9);
+        let files = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(files, 1, "no temp is left behind");
     }
 
     /// `last_error` and `not_published` never arrive together. The benign

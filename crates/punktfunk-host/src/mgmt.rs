@@ -109,12 +109,10 @@ pub fn publish_endpoint(bind: SocketAddr) {
 /// The 0700 config dir is the access control.
 fn write_endpoint(dir: &std::path::Path, port: u16) -> std::io::Result<std::path::PathBuf> {
     let path = dir.join(ENDPOINT_FILE);
-    // Write-then-rename: systemd may source this mid-rewrite. A torn read
+    // Replace, not write: systemd may source this mid-rewrite. A torn read
     // yields empty `PUNKTFUNK_MGMT_URL`; a set-but-blank var is not the
-    // built-in default. `rename` is atomic on Unix and replace on Windows.
-    let tmp = dir.join(format!("{ENDPOINT_FILE}.tmp"));
-    std::fs::write(&tmp, endpoint_line(port))?;
-    std::fs::rename(&tmp, &path)?;
+    // built-in default.
+    pf_paths::replace_file(&path, endpoint_line(port).as_bytes())?;
     Ok(path)
 }
 

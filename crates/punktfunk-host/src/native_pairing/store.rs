@@ -96,15 +96,10 @@ fn load(path: &Path) -> PairedClients {
         .unwrap_or_default()
 }
 
+/// Owner-only so a local user cannot inject a fingerprint.
 fn save(state: &PairedState) -> Result<()> {
-    if let Some(dir) = state.path.parent() {
-        pf_paths::create_private_dir(dir)?;
-    }
-    // Temp + rename so a crash mid-write cannot truncate the store. Owner-only so a
-    // local user cannot inject a fingerprint.
-    let tmp = state.path.with_extension("json.tmp");
-    pf_paths::write_secret_file(&tmp, &serde_json::to_vec_pretty(&state.clients)?)?;
-    std::fs::rename(&tmp, &state.path)?;
+    let bytes = serde_json::to_vec_pretty(&state.clients)?;
+    pf_paths::replace_secret_file(&state.path, &bytes)?;
     Ok(())
 }
 

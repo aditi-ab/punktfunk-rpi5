@@ -251,10 +251,7 @@ fn write_owed(owed: &BTreeMap<String, Option<String>>) {
         let _ = std::fs::remove_file(path);
         return;
     }
-    let tmp = path.with_extension("pinned.tmp");
-    let written =
-        std::fs::write(&tmp, format_owed(owed)).and_then(|()| std::fs::rename(&tmp, &path));
-    if let Err(e) = written {
+    if let Err(e) = pf_paths::replace_file(&path, format_owed(owed).as_bytes()) {
         tracing::warn!(error = %e, "voice-chat pin marker not written — a crash would leave the pins");
     }
 }
@@ -493,13 +490,8 @@ fn write_saved(saved: &BTreeMap<String, [Option<String>; 3]>) -> Result<()> {
         let _ = std::fs::remove_file(&path);
         return Ok(());
     }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    }
-    let tmp = path.with_extension("saved.tmp");
-    std::fs::write(&tmp, format_saved(saved))
-        .with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("replace {}", path.display()))
+    pf_paths::replace_file(&path, format_saved(saved).as_bytes())
+        .with_context(|| format!("replace {}", path.display()))
 }
 
 /// `Windows.Media.Internal.AudioPolicyConfig`'s factory, by slot: IUnknown, IInspectable,

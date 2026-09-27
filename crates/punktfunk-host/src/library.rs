@@ -387,6 +387,24 @@ fn collect_games() -> Vec<GameEntry> {
     games
 }
 
+/// Absent or malformed → the default. A bad file must cost its own contents, not the library.
+fn read_json_or_default<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
+            tracing::warn!(file = %path.display(), error = %e, "library file malformed — ignored");
+            T::default()
+        }),
+        Err(_) => T::default(),
+    }
+}
+
+/// Owner-only ([`pf_paths::replace_secret_file`]), like hooks.json: `library.json` carries the
+/// `prep`/`launch` commands the host runs.
+fn save_json(path: &Path, json: &str) -> Result<()> {
+    pf_paths::replace_secret_file(path, json.as_bytes())
+        .with_context(|| format!("replace {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

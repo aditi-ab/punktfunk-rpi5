@@ -358,12 +358,8 @@ impl StatsRecorder {
             link: live.link,
         };
         let bytes = serde_json::to_vec(&capture).map_err(std::io::Error::other)?;
-        // Sibling temp then rename: a crash mid-write cannot leave a half file.
         // `id` is generated (`valid_id`), so this names a child of `dir`.
-        let path = self.dir.join(format!("{}.json", meta.id));
-        let tmp = self.dir.join(format!("{}.json.tmp", meta.id));
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &path)?;
+        pf_paths::replace_file(&self.dir.join(format!("{}.json", meta.id)), &bytes)?;
         Ok(Some(meta))
     }
 

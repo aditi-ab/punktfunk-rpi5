@@ -185,12 +185,8 @@ fn save(list: Vec<Source>) -> Result<()> {
     };
     let json = serde_json::to_string_pretty(&file).context("serialize plugin-sources.json")?;
     let path = sources_path();
-    // Rename over the live file so a crash cannot leave a half-written config.
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, format!("{json}\n"))
-        .with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("replace {}", path.display()))?;
-    Ok(())
+    pf_paths::replace_file(&path, format!("{json}\n").as_bytes())
+        .with_context(|| format!("replace {}", path.display()))
 }
 
 #[cfg(test)]

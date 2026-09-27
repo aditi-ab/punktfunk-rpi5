@@ -236,13 +236,8 @@ fn apply_patch(file: &mut Map<String, Value>, patch: &Map<String, Value>) -> Res
 }
 
 fn write_file(path: &Path, file: &Map<String, Value>) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        pf_paths::create_private_dir(dir)?;
-    }
     let bytes = serde_json::to_vec_pretty(file).map_err(std::io::Error::other)?;
-    let tmp = path.with_extension("json.tmp");
-    pf_paths::write_secret_file(&tmp, &bytes)?;
-    std::fs::rename(&tmp, path)
+    pf_paths::replace_secret_file(path, &bytes)
 }
 
 /// Every key, unknown ones included, so a save from an older host keeps a newer host's keys.

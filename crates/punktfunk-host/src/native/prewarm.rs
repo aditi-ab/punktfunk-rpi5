@@ -236,16 +236,13 @@ fn read(path: &Path) -> Option<SeatRecord> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
-/// Write through a temporary and rename, so a half-written record never reads as a seat at the
-/// wrong mode — the one shape the registry would refuse to hand its parked display back for.
+/// [`pf_paths::replace_file`], so a half-written record never reads as a seat at the wrong
+/// mode — the one shape the registry would refuse to hand its parked display back for.
 fn write(id: &str, rec: &SeatRecord) -> anyhow::Result<()> {
     use anyhow::Context;
-    let path = pf_paths::seat_record(id);
     pf_paths::create_private_dir(&pf_paths::seats_dir()).context("create the seats directory")?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(rec)?).context("write the seat record")?;
-    std::fs::rename(&tmp, &path).context("replace the seat record")?;
-    Ok(())
+    pf_paths::replace_file(&pf_paths::seat_record(id), &serde_json::to_vec(rec)?)
+        .context("replace the seat record")
 }
 
 /// The 32-byte fingerprint a record names. `None` on anything that is not 64 hex digits.

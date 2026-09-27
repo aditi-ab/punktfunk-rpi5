@@ -54,25 +54,11 @@ fn stats_path() -> PathBuf {
 
 /// Malformed or absent file → no stats. Numbers are never worth an empty library.
 fn load_file() -> StatsFile {
-    match std::fs::read_to_string(stats_path()) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "library-stats.json malformed — no play stats");
-            StatsFile::default()
-        }),
-        Err(_) => StatsFile::default(),
-    }
+    read_json_or_default(&stats_path())
 }
 
 fn save_file(file: &StatsFile) -> Result<()> {
-    let dir = pf_paths::config_dir();
-    pf_paths::create_private_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let json = serde_json::to_string_pretty(file)?;
-    // Write-then-rename: a crash mid-write must not truncate the file.
-    let tmp = stats_path().with_extension("json.tmp");
-    pf_paths::write_secret_file(&tmp, json.as_bytes())
-        .with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, stats_path()).context("rename library-stats.json")?;
-    Ok(())
+    save_json(&stats_path(), &serde_json::to_string_pretty(file)?)
 }
 
 /// Load-modify-save under one lock: a launch and another game's minute flush
