@@ -1014,9 +1014,11 @@ impl NvencD3d11Encoder {
     }
 
     /// Move the live session to `mode` without an IDR. `nvEncReconfigureEncoder` accepts a
-    /// changed `splitEncodeMode` with `resetEncoder=0` and emits no keyframe.
+    /// changed `splitEncodeMode` with `resetEncoder=0` and emits no keyframe. A refusal
+    /// restores every field, so the encoder's idea of the session stays truthful.
     fn apply_split_mode(&mut self, mode: u32) -> bool {
-        let (prev_mode, prev_sub) = (self.split_mode, self.subframe_on);
+        let (prev_mode, prev_sub, prev_chunks) =
+            (self.split_mode, self.subframe_on, self.subframe_chunks);
         let (mode, subframe) = resolve_split_subframe(
             self.codec,
             mode,
@@ -1025,6 +1027,9 @@ impl NvencD3d11Encoder {
         );
         self.split_mode = mode;
         self.subframe_on = subframe;
+        // `reconfigure_bitrate` does not recompute this latch; a stale true makes
+        // `poll_chunk` busy-poll while `numSlices` never advances.
+        self.subframe_chunks = self.slices >= 2 && subframe && !self.session_async;
         if self.reconfigure_bitrate(self.bitrate_bps) {
             true
         } else {
@@ -1035,6 +1040,7 @@ impl NvencD3d11Encoder {
             );
             self.split_mode = prev_mode;
             self.subframe_on = prev_sub;
+            self.subframe_chunks = prev_chunks;
             false
         }
     }
