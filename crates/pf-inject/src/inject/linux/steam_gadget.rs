@@ -67,7 +67,7 @@ const USB_RAW_EVENT_CONTROL: u32 = 2;
 const USB_SPEED_HIGH: u8 = 3;
 
 use super::steam_proto::{
-    deck_serial, deck_unit_id, feature_reply, neutral_deck_report, RDESC_DECK_CTRL as RDESC_CTRL,
+    deck_serial, feature_reply, neutral_deck_report, RDESC_DECK_CTRL as RDESC_CTRL,
     RDESC_DECK_KBD as RDESC_KBD, RDESC_DECK_MOUSE as RDESC_MOUSE,
 };
 
@@ -254,7 +254,6 @@ impl SteamDeckGadget {
         }
 
         let serial = deck_serial(index);
-        let unit_id = deck_unit_id(index);
         let report = Arc::new(Mutex::new(neutral_deck_report()));
         let feedback = Arc::new(Mutex::new(Default::default()));
         let running = Arc::new(AtomicBool::new(true));
@@ -285,7 +284,7 @@ impl SteamDeckGadget {
                 .spawn(move || {
                     // SAFETY: `pthread_self` is always valid on the calling thread.
                     tid.store(unsafe { libc::pthread_self() } as u64, Ordering::SeqCst);
-                    control_loop(fd, running, ctrl_ep, configured, feedback, serial, unit_id);
+                    control_loop(fd, running, ctrl_ep, configured, feedback, serial);
                     done.store(true, Ordering::SeqCst);
                 })
                 .context("spawn gadget control thread")?
@@ -380,7 +379,6 @@ fn control_loop(
     configured: Arc<AtomicBool>,
     feedback: Arc<Mutex<super::steam_proto::SteamFeedback>>,
     serial: String,
-    unit_id: u32,
 ) {
     let raw = fd.0;
     let cfg = build_config();
@@ -412,7 +410,6 @@ fn control_loop(
                     &ctrl,
                     &cfg,
                     &serial,
-                    unit_id,
                     &ctrl_ep,
                     &configured,
                     &mut last_set,
@@ -438,7 +435,6 @@ fn handle_control(
     ctrl: &Setup,
     cfg: &[u8],
     serial: &str,
-    unit_id: u32,
     ctrl_ep: &std::sync::atomic::AtomicI32,
     configured: &AtomicBool,
     last_set: &mut Vec<u8>,
@@ -492,7 +488,7 @@ fn handle_control(
         match ctrl.b_request {
             0x01 => {
                 // GET_REPORT — feature reply for the last SET_REPORT
-                let resp = feature_reply(last_set, serial, unit_id);
+                let resp = feature_reply(last_set, serial);
                 let n = resp.len().min(wl);
                 ep0_write(raw, &resp[..n]);
             }
