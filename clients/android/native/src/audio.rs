@@ -17,7 +17,7 @@ use ndk::audio::{
     AudioCallbackResult, AudioContentType, AudioDirection, AudioFormat, AudioPerformanceMode,
     AudioSharingMode, AudioStream, AudioStreamBuilder, AudioUsage,
 };
-use punktfunk_core::audio::plane::{PlaneDecoder, PlaneError, PlaneFormat};
+use punktfunk_core::audio::plane::{PlaneDecoder, PlaneFormat};
 use punktfunk_core::client::{AudioPacket, NativeClient};
 use punktfunk_core::error::PunktfunkError;
 use std::collections::VecDeque;
@@ -66,8 +66,8 @@ enum DecodeExit {
     Disconnected,
     /// The connector closed: no more audio is coming, so there is nothing to reopen FOR.
     SessionClosed,
-    /// The plane cannot run at all (the decoder would not build — libopus refusing the negotiated
-    /// rate is the only way this happens today, since the PCM arm cannot fail). Reopening the
+    /// The plane cannot run at all: the Opus decoder would not build, because libopus refuses the
+    /// negotiated rate or the host named a coupling this build does not know. Reopening the
     /// DEVICE would not change that, so it is not a reason to walk the ladder again.
     Fatal,
 }
@@ -989,28 +989,17 @@ impl<'a> Plane<'a> {
         sync: &'a punktfunk_core::audio::AudioSyncCell,
     ) -> Result<Plane<'a>, DecodeExit> {
         let channels = usize::from(fmt.channels);
-        // An unknown coupling is a host defect, named once and decoded as legacy: this client
-        // asks for legacy, so a conforming host answers `0`.
-        let dec = PlaneDecoder::new(&fmt)
-            .or_else(|e| match e {
-                PlaneError::UnknownLayout(id) => {
-                    tracing::warn!(
-                        layout = id,
-                        "unknown audio layout from the host — decoding as legacy"
-                    );
-                    PlaneDecoder::new(&PlaneFormat { layout: 0, ..fmt })
-                }
-                e => Err(e),
-            })
-            .map_err(|e| {
-                log::error!(
-                    "audio: decoder init for codec={} rate={} ch={}: {e} — audio disabled",
-                    fmt.codec,
-                    fmt.rate_hz,
-                    channels,
-                );
-                DecodeExit::Fatal
-            })?;
+        // An unknown Opus coupling is refused like any other init failure: a guessed pairing
+        // plays the wrong speakers.
+        let dec = PlaneDecoder::new(&fmt).map_err(|e| {
+            log::error!(
+                "audio: decoder init for codec={} rate={} ch={}: {e} — audio disabled",
+                fmt.codec,
+                fmt.rate_hz,
+                channels,
+            );
+            DecodeExit::Fatal
+        })?;
         // Everything denominated in FRAMES is told this plane's frame: `MAX_CONCEAL_MS` caps a
         // single loss event at 50 ms of synthesized audio and derives the packet count from it;
         // the drought's wall-clock fuse and `plc_ms` are spent at the rate this session paces.
