@@ -260,30 +260,13 @@ mod tests {
 
     fn host(bound: Option<&str>) -> HostRow {
         HostRow {
-            key: "aa".into(),
-            id: None,
-            name: "Desk".into(),
-            addr: "10.0.0.9".into(),
-            port: 9777,
-            fp_hex: "aa".into(),
-            paired: true,
-            saved: true,
-            online: true,
-            mgmt_port: 47990,
-            can_wake: false,
-            clipboard_sync: false,
-            last_used: None,
-            os: String::new(),
-            actions: Vec::new(),
-            pin: None,
             bound_preset: bound.map(|id| PresetChip {
                 id: id.into(),
                 name: "Work".into(),
                 accent: None,
                 bitrate_kbps: None,
             }),
-            running: String::new(),
-            game_presets: Default::default(),
+            ..HostRow::fixture("aa", "Desk")
         }
     }
 

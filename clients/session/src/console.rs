@@ -379,24 +379,15 @@ fn seed_row(k: Option<&trust::KnownHost>, addr: &str, port: u16) -> HostRow {
 fn fake_host_row() -> HostRow {
     HostRow {
         key: "fake".into(),
-        id: None,
         name: "Demo Host".into(),
         addr: "127.0.0.1".into(),
         port: 9777,
-        fp_hex: String::new(),
         paired: true,
         saved: true,
         online: true,
         mgmt_port: library::DEFAULT_MGMT_PORT,
-        can_wake: false,
-        clipboard_sync: false,
-        last_used: None,
         os: "linux/arch/steamos".into(),
-        actions: Vec::new(),
-        pin: None,
-        bound_preset: None,
-        running: String::new(),
-        game_presets: Default::default(),
+        ..Default::default()
     }
 }
 

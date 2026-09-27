@@ -111,25 +111,10 @@ use crate::screens::settings::tests::fake_home;
 
 fn hosts() -> Vec<HostRow> {
     let base = HostRow {
-        key: String::new(),
-        id: None,
-        name: String::new(),
         addr: "10.0.0.20".into(),
-        port: 9777,
-        fp_hex: String::new(),
         paired: false,
-        saved: true,
         online: false,
-        mgmt_port: 47990,
-        can_wake: false,
-        clipboard_sync: false,
-        last_used: None,
-        os: String::new(),
-        actions: Vec::new(),
-        pin: None,
-        bound_preset: None,
-        running: String::new(),
-        game_presets: Default::default(),
+        ..HostRow::fixture("", "")
     };
     vec![
         HostRow {
@@ -2179,9 +2164,7 @@ fn store_hosts() -> Vec<HostRow> {
             format!("192.168.1.{octet}:9777")
         },
         id: paired.then(|| format!("id{octet}")),
-        name: name.into(),
         addr: format!("192.168.1.{octet}"),
-        port: 9777,
         fp_hex: if paired {
             format!("fp{octet}")
         } else {
@@ -2190,16 +2173,9 @@ fn store_hosts() -> Vec<HostRow> {
         paired,
         saved: paired,
         online,
-        mgmt_port: 47990,
         can_wake: paired && !online,
-        clipboard_sync: false,
-        last_used: None,
         os: os.into(),
-        actions: Vec::new(),
-        pin: None,
-        bound_preset: None,
-        running: String::new(),
-        game_presets: Default::default(),
+        ..HostRow::fixture("", name)
     };
     let mut hosts = vec![
         host("Living Room PC", "linux/fedora/bazzite", 21, true, true),

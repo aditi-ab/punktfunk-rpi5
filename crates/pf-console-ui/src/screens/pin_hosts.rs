@@ -194,30 +194,14 @@ mod tests {
 
     fn host(key: &str, saved: bool, pin: Option<&str>) -> HostRow {
         HostRow {
-            key: key.into(),
-            id: None,
-            name: key.into(),
-            addr: "10.0.0.9".into(),
-            port: 9777,
-            fp_hex: key.into(),
-            paired: true,
             saved,
-            online: true,
-            mgmt_port: 47990,
-            can_wake: false,
-            clipboard_sync: false,
-            last_used: None,
-            os: String::new(),
-            actions: Vec::new(),
             pin: pin.map(|id| PresetChip {
                 id: id.into(),
                 name: "Work".into(),
                 accent: None,
                 bitrate_kbps: None,
             }),
-            bound_preset: None,
-            running: String::new(),
-            game_presets: Default::default(),
+            ..HostRow::fixture(key, key)
         }
     }
 

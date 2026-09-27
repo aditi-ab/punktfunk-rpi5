@@ -2601,30 +2601,14 @@ pub(crate) mod tests {
         settings.gamepad = "auto".into();
         let library = crate::library::LibraryShared::default();
         let desk = crate::model::HostRow {
-            key: "bb".into(),
-            id: None,
-            name: "Desk".into(),
             addr: "10.0.0.7".into(),
-            port: 9777,
-            fp_hex: "bb".into(),
-            paired: true,
-            saved: true,
-            online: true,
-            mgmt_port: 47990,
-            can_wake: false,
-            clipboard_sync: false,
-            last_used: None,
-            os: String::new(),
-            actions: Vec::new(),
-            pin: None,
             bound_preset: Some(crate::model::PresetChip {
                 id: "p1".into(),
                 name: "Living room".into(),
                 accent: None,
                 bitrate_kbps: None,
             }),
-            running: String::new(),
-            game_presets: Default::default(),
+            ..crate::model::HostRow::fixture("bb", "Desk")
         };
         let hosts = [desk];
         let ctx = Ctx {
@@ -3687,30 +3671,14 @@ pub(crate) mod tests {
         let (mut settings, pads) = ctx_parts();
         let library = crate::library::LibraryShared::default();
         let mut pinned = crate::model::HostRow {
-            key: "aa\0p1".into(),
-            id: None,
-            name: "Tower".into(),
-            addr: "10.0.0.9".into(),
-            port: 9777,
-            fp_hex: "aa".into(),
-            paired: true,
-            saved: true,
-            online: true,
-            mgmt_port: 47990,
-            can_wake: false,
-            clipboard_sync: false,
-            last_used: None,
-            os: String::new(),
-            actions: Vec::new(),
+            key: crate::model::pinned_key("aa", "p1"),
             pin: Some(crate::model::PresetChip {
                 id: "p1".into(),
                 name: "Work".into(),
                 accent: None,
                 bitrate_kbps: None,
             }),
-            bound_preset: None,
-            running: String::new(),
-            game_presets: Default::default(),
+            ..crate::model::HostRow::fixture("aa", "Tower")
         };
         let hosts = [pinned.clone(), {
             pinned.key = "aa".into();

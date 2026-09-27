@@ -2241,7 +2241,6 @@ fn stand_in_games() -> Vec<crate::library::LibraryGame> {
 fn stand_in_host() -> HostRow {
     HostRow {
         key: "warm".into(),
-        id: None,
         name: "Stand-in".into(),
         addr: "127.0.0.1".into(),
         port: 9777,
@@ -2250,15 +2249,8 @@ fn stand_in_host() -> HostRow {
         saved: true,
         online: true,
         mgmt_port: 9778,
-        can_wake: false,
-        clipboard_sync: false,
-        last_used: None,
         os: "linux".into(),
-        actions: Vec::new(),
-        pin: None,
-        bound_preset: None,
-        running: String::new(),
-        game_presets: std::collections::BTreeMap::new(),
+        ..Default::default()
     }
 }
 

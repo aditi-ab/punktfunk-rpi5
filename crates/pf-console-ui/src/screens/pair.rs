@@ -453,25 +453,10 @@ mod tests {
 
     fn host() -> HostRow {
         HostRow {
-            key: "10.0.0.7:9777".into(),
-            id: None,
-            name: "Tower".into(),
             addr: "10.0.0.7".into(),
-            port: 9777,
             fp_hex: String::new(),
             paired: false,
-            saved: true,
-            online: true,
-            mgmt_port: 47990,
-            can_wake: false,
-            clipboard_sync: false,
-            last_used: None,
-            os: String::new(),
-            actions: Vec::new(),
-            pin: None,
-            bound_preset: None,
-            running: String::new(),
-            game_presets: Default::default(),
+            ..HostRow::fixture("10.0.0.7:9777", "Tower")
         }
     }
 

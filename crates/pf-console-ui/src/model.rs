@@ -25,7 +25,7 @@ pub struct PresetChip {
 
 /// Home carousel row, fully resolved by the service thread. The shell renders it
 /// verbatim.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct HostRow {
     /// Fingerprint when pinned, else `addr:port` — cursor identity across snapshot churn.
     pub key: String,
@@ -79,6 +79,26 @@ pub struct HostRow {
     /// outranks `bound_preset` at launch, which the host resolves.
     #[serde(default)]
     pub game_presets: BTreeMap<String, String>,
+}
+
+#[cfg(test)]
+impl HostRow {
+    /// A paired, saved, online host at `10.0.0.9:9777` pinned as `key`. Tests override what
+    /// they are about.
+    pub(crate) fn fixture(key: &str, name: &str) -> HostRow {
+        HostRow {
+            key: key.into(),
+            fp_hex: key.into(),
+            name: name.into(),
+            addr: "10.0.0.9".into(),
+            port: 9777,
+            mgmt_port: 47990,
+            paired: true,
+            saved: true,
+            online: true,
+            ..Default::default()
+        }
+    }
 }
 
 impl HostRow {
@@ -528,25 +548,9 @@ mod tests {
 
     fn tower() -> HostRow {
         HostRow {
-            key: "aa".into(),
-            id: None,
-            name: "Tower".into(),
             addr: "10.0.0.2".into(),
-            port: 9777,
-            fp_hex: "aa".into(),
-            paired: true,
-            saved: true,
             online: false,
-            mgmt_port: 47990,
-            can_wake: false,
-            clipboard_sync: false,
-            last_used: None,
-            os: String::new(),
-            actions: Vec::new(),
-            pin: None,
-            bound_preset: None,
-            running: String::new(),
-            game_presets: Default::default(),
+            ..HostRow::fixture("aa", "Tower")
         }
     }
 
