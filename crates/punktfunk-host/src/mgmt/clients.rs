@@ -319,6 +319,7 @@ pub(crate) async fn unpair_all_clients(State(st): State<Arc<MgmtState>>) -> Resp
 pub(crate) async fn get_pairing_status(State(st): State<Arc<MgmtState>>) -> Json<PairingStatus> {
     let pending: Vec<PendingCeremony> = st
         .app
+        .gs
         .pairing
         .pin
         .pending()
@@ -385,7 +386,13 @@ pub(crate) async fn submit_pairing_pin(
         peer_ip,
     };
     use crate::gamestream::pairing::SubmitOutcome;
-    match st.app.pairing.pin.submit(pin.to_string(), label, &target) {
+    match st
+        .app
+        .gs
+        .pairing
+        .pin
+        .submit(pin.to_string(), label, &target)
+    {
         SubmitOutcome::Delivered(_) => StatusCode::NO_CONTENT.into_response(),
         SubmitOutcome::NoWaiter => api_error(
             StatusCode::CONFLICT,

@@ -114,6 +114,7 @@ mod encode {
         Ok(())
     }
 }
+mod encode_recovery;
 // Who else holds an NVENC session (NVML); names the neighbour when a stream falls behind.
 mod encoder_sessions;
 mod events;
@@ -124,6 +125,8 @@ mod gamestream;
 #[path = "linux/gpuclocks.rs"]
 mod gpuclocks;
 mod hooks;
+// What every plane shares: host facts, session state, `serve`.
+mod host;
 // Launch holds: plugins and hooks that act before a game starts.
 mod holds;
 // Network-facing; same `forbid` as `mod mgmt`. Tests mutate process env (`set_var` is unsafe in 2024).
@@ -134,6 +137,7 @@ mod inject {
     pub(crate) use pf_inject::*;
 }
 mod client_logs;
+mod pen_sink;
 // Unix wall clock every stored deadline and event stamp reads.
 mod clock;
 // Compositor + gamescope route for a connect, shared by the native and GameStream planes.
@@ -168,6 +172,7 @@ mod procscan;
 // Plugin-reported liveness; `procscan` only sees the process table.
 mod runstate;
 mod send_pacing;
+mod session_launch;
 mod session_plan;
 // Operator policy for session⇄game binding (`session-settings.json`).
 mod session_settings;
@@ -456,7 +461,7 @@ fn real_main() -> Result<()> {
             pf_host_config::mark_started();
             // Must run before any new session touches the topology.
             windows::entry::serve_startup_recover();
-            gamestream::serve(mgmt_opts, native, gamestream)
+            host::serve(mgmt_opts, native, gamestream)
         }
         Some("detect-conflicts") => {
             let found = detect::scan();

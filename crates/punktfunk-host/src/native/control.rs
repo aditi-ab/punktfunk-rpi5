@@ -280,6 +280,8 @@ pub(super) struct Task {
         tokio::sync::mpsc::UnboundedReceiver<punktfunk_core::quic::LaunchOutcome>,
     /// Named on the per-minute `link health` line, so a journal sorts by client.
     pub(super) peer: std::net::IpAddr,
+    /// Which plane carries this session; named on grant-drop warnings.
+    pub(super) plane: crate::events::Plane,
     /// Shared block the encode and send threads bump; this task drains its link half.
     pub(super) counters: Arc<crate::session_status::SessionCounters>,
     /// Armed capture the per-minute line is also written into, so a bug report is one file.
@@ -332,6 +334,7 @@ pub(super) async fn run(task: Task) {
         mut pad_slots_rx,
         mut launch_outcome_rx,
         peer,
+        plane,
         counters,
         stats,
     } = task;
@@ -345,7 +348,7 @@ pub(super) async fn run(task: Task) {
     let mut clip_offer_closed = false;
     // First-of-class `warn!` for grant drops. A revoked client spamming the
     // gated messages must not flood the log.
-    let denied = GrantDrops::new();
+    let mut denied = crate::session_status::GrantDrops::new(plane);
     // Same closed-channel discipline as `clip_offer_closed`.
     let mut shard_change_closed = false;
     // `--open` anonymous sessions never spawn deadline/watch; the sender

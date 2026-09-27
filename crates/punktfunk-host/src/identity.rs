@@ -120,7 +120,7 @@ fn generate() -> Result<(String, String)> {
         "127.0.0.1".to_string(),
         "::1".to_string(),
     ];
-    let hn = crate::gamestream::machine_hostname();
+    let hn = crate::host::machine_hostname();
     if !hn.is_empty()
         && hn.len() <= 63
         && hn

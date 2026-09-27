@@ -23,7 +23,7 @@ mod recovery;
 mod resize;
 mod send;
 mod session_watch;
-pub(crate) mod state;
+mod state;
 mod synth_abr;
 use self::phase_lock::{phase_lock_enabled, PhaseController};
 // `native.rs` builds it and `control.rs` holds it: the 0xCF ACK hold crosses the module.
@@ -627,8 +627,9 @@ pub(super) struct SessionContext {
     pub(super) launch_target: Option<crate::library::LaunchTarget>,
     /// This session's launch record, claimed before prep and the launch hold.
     pub(super) launch_claim: Option<crate::launchreg::Claim>,
-    /// The launch clock, read before prep: a spawn's lease takes processes started after it.
-    pub(super) fresh_stamp: Option<f64>,
+    /// [`crate::session_launch::Prepared::stamp`].
+    pub(super) launch_stamp: Option<f64>,
+    pub(super) launch_owner: crate::session_launch::LaunchOwner,
     /// Where this session's launch outcome goes; the control task writes it to
     /// the client ([`punktfunk_core::quic::LaunchOutcome`]).
     pub(super) launch_outcome: crate::gamelease::OutcomeTx,

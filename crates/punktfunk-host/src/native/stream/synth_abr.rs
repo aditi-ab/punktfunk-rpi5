@@ -522,9 +522,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
                 wait_us: 0,
                 repeat: shot == Shot::Repeat,
                 was_measured: true,
-                driver: false,
-                split: false,
-                ipc_us: 0,
+                driver: None,
             };
             if frame_tx.send(SendMsg::Frame(msg)).is_err() {
                 break;

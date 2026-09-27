@@ -625,52 +625,24 @@ pub(super) enum ClientInput {
     Pen(punktfunk_core::quic::PenBatch),
 }
 
-/// Per-session stylus: [`PenTracker`](punktfunk_core::quic::PenTracker) diffs
-/// batches into transitions on a lazily-created [`crate::inject::pen::VirtualPen`].
-/// No ink → no device; the tablet dies with the session.
+/// Per-session stylus ([`crate::pen_sink::PenSink`]) plus the stroke timeout this
+/// lossy datagram plane needs.
 struct PenSession {
-    tracker: punktfunk_core::quic::PenTracker,
-    dev: Option<crate::inject::pen::VirtualPen>,
-    /// Create failed once — do not retry at 240 Hz. The tracker still consumes
-    /// batches so its state stays coherent.
-    create_failed: bool,
+    sink: crate::pen_sink::PenSink,
     last_rx: std::time::Instant,
-    /// Reused transition buffer (a batch yields a few).
-    out: Vec<punktfunk_core::quic::PenTransition>,
 }
 
 impl PenSession {
     fn new() -> PenSession {
         PenSession {
-            tracker: punktfunk_core::quic::PenTracker::default(),
-            dev: None,
-            create_failed: false,
+            sink: Default::default(),
             last_rx: std::time::Instant::now(),
-            out: Vec::new(),
         }
     }
 
     fn apply(&mut self, batch: &punktfunk_core::quic::PenBatch) {
         self.last_rx = std::time::Instant::now();
-        if self.dev.is_none() && !self.create_failed {
-            match crate::inject::pen::VirtualPen::create() {
-                Ok(d) => self.dev = Some(d),
-                Err(e) => {
-                    // Welcome advertised HOST_CAP_PEN from the same probe; permissions
-                    // can still change between then and first ink.
-                    self.create_failed = true;
-                    tracing::warn!(
-                        error = %format!("{e:#}"),
-                        "pen: virtual tablet creation failed — dropping pen input this session"
-                    );
-                }
-            }
-        }
-        self.out.clear();
-        self.tracker.apply(batch, &mut self.out);
-        if let Some(dev) = self.dev.as_mut() {
-            dev.apply_batch(&self.out);
-        }
+        self.sink.apply(batch);
     }
 
     /// Dead-client failsafe ([`PEN_TOUCH_TIMEOUT_MS`](punktfunk_core::quic::PEN_TOUCH_TIMEOUT_MS)).
@@ -678,7 +650,7 @@ impl PenSession {
     /// stationary touch, so silence means gone — do not leave the stroke down.
     /// The input loop caps recv at 100 ms while the pen is active so this runs.
     fn check_timeout(&mut self) {
-        if self.tracker.is_active()
+        if self.sink.active()
             && self.last_rx.elapsed().as_millis()
                 >= punktfunk_core::quic::PEN_TOUCH_TIMEOUT_MS as u128
         {
@@ -687,17 +659,13 @@ impl PenSession {
         }
     }
 
-    /// Lift buttons, then tip, then proximity. Session end and the timeout.
+    /// Session end and the timeout.
     fn release_all(&mut self) {
-        self.out.clear();
-        self.tracker.force_release(&mut self.out);
-        if let Some(dev) = self.dev.as_mut() {
-            dev.apply_batch(&self.out);
-        }
+        self.sink.force_release();
     }
 
     fn active(&self) -> bool {
-        self.tracker.is_active()
+        self.sink.active()
     }
 }
 

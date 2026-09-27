@@ -1,6 +1,6 @@
 //! mDNS `_nvstream._tcp.local.` so Moonlight finds the host. Manual IP add still works.
 
-use super::Host;
+use crate::host::Host;
 use anyhow::{Context, Result};
 use mdns_sd::ServiceInfo;
 use std::collections::HashMap;

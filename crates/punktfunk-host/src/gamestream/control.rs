@@ -16,8 +16,11 @@
 //! [`sync`] keeps 47999 closed until the first pairing and tears it down when the last
 //! one is removed. Pairing itself is HTTPS on nvhttp, never this port.
 
-use super::{AppState, LaunchSession, CONTROL_PORT};
+use super::{LaunchSession, CONTROL_PORT};
+use crate::events::Plane;
+use crate::host::AppState;
 use crate::inject::gamepad::GamepadManager;
+use crate::session_status::GrantDrops;
 use anyhow::{anyhow, Context, Result};
 use pf_frame::HdrMeta;
 use punktfunk_core::input::{GamepadEvent, InputEvent};
@@ -132,81 +135,6 @@ impl SessionAccess {
     }
 }
 
-/// Per-(session, grant-class) drop counts. One `warn!` per class for the whole session
-/// (per-event logging is a DoS); totals at session end. Plain integers: this thread is
-/// the only writer and reader.
-struct GrantDrops {
-    // One slot per grant bit (7 with `Power`). Power never drops input, but `idx` must
-    // stay in bounds for every `GrantClass`.
-    counts: [u64; 7],
-    warned: [bool; 7],
-}
-
-impl GrantDrops {
-    fn new() -> GrantDrops {
-        GrantDrops {
-            counts: [0; 7],
-            warned: [false; 7],
-        }
-    }
-
-    /// Slot in the fixed tables: the grant's bit position, so layout cannot drift from the wire.
-    fn idx(class: GrantClass) -> usize {
-        class.bit().trailing_zeros() as usize
-    }
-
-    /// Count one drop; log only the first of each class. Moonlight has no grants UX, so
-    /// that first warn is the only support signal.
-    fn note(&mut self, class: GrantClass) {
-        let i = Self::idx(class);
-        self.counts[i] += 1;
-        if !self.warned[i] {
-            self.warned[i] = true;
-            tracing::warn!(
-                class = ?class,
-                "gamestream: dropping client input this session's access grants don't cover — \
-                 counted; further drops of this class are silent until the session-end totals"
-            );
-        }
-    }
-
-    /// Log drop totals (if any) and reset. Call from every teardown arm.
-    fn end_of_session(&mut self) {
-        use std::fmt::Write;
-        let mut out = String::new();
-        for class in [
-            GrantClass::Gamepad,
-            GrantClass::Pointer,
-            GrantClass::Keyboard,
-            GrantClass::Clipboard,
-            GrantClass::Mic,
-            GrantClass::Launch,
-        ] {
-            let n = self.counts[Self::idx(class)];
-            if n != 0 {
-                if !out.is_empty() {
-                    out.push(' ');
-                }
-                let _ = write!(out, "{class:?}={n}");
-            }
-        }
-        if !out.is_empty() {
-            tracing::info!(drops = %out, "gamestream: access-grant drop totals for the session");
-        }
-        *self = GrantDrops::new();
-    }
-}
-
-/// Mask test between a decoded event class and its injector. Free function so tests
-/// exercise the same filter the session runs.
-fn permitted(mask: u32, class: GrantClass, drops: &mut GrantDrops) -> bool {
-    if mask & class.bit() != 0 {
-        return true;
-    }
-    drops.note(class);
-    false
-}
-
 /// The virtual Xbox pad this session presents, and the only place this plane picks a backend.
 ///
 /// Windows has two, and they are not interchangeable: XUSB registers only
@@ -257,7 +185,7 @@ impl SessionPads {
 /// Bind 47999 while any pairing exists, close it when none remain. Call wherever the
 /// paired list changes (startup, pairing phase 4, unpair); race-free via [`Gate::running`].
 pub(crate) fn sync(state: &Arc<AppState>) -> Result<()> {
-    let gate = &state.control_gate;
+    let gate = &state.gs.control_gate;
     if !gate.enabled.load(Ordering::SeqCst) {
         return Ok(());
     }
@@ -396,54 +324,25 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
     let thread = std::thread::Builder::new()
         .name("punktfunk-control".into())
         .spawn(move || {
-            let mut detected: Option<Scheme> = None;
-            // Consecutive decrypt failures for this peer; throttles the warn so a junk
-            // flood cannot spam unbounded lines.
-            let mut decrypt_fails: u64 = 0;
             // Keyboard/mouse goes to a host-lifetime injector thread, never inline: a slow
             // Wayland/libei/SendInput must not head-block ENet keepalive. The `inj_tx` clone
             // keeps `InjectorService` (non-Send compositor state) alive for this thread.
             let inj_tx = crate::inject::InjectorService::start().sender();
-            let mut pads = SessionPads::new();
-            // SS_PEN/SS_TOUCH → tablet / wire touch. Clients send these only after seeing
-            // `SS_FF_PEN_TOUCH_EVENTS` (rtsp.rs).
-            let mut pointer = super::pen::GsPointer::new();
-            // The injector outlives the peer: whatever it still holds is released when it goes.
-            let mut held = crate::inject::held::HeldInput::default();
-            // One host→client seq for every outbound message (rumble + HDR). The GCM nonce
-            // is derived from `seq`; a per-type counter would reuse (key, nonce) pairs.
-            let mut host_seq: u32 = 0;
-            // What the client last heard over HDR-mode (0x010e). A client starts in SDR.
-            let mut hdr_signalled: Option<HdrMeta> = None;
-            let mut peer: Option<PeerID> = None;
-            // Last live GCM key. Ending a session clears `launch` (where the key lives), so
-            // without this copy the termination that must go out because it ended cannot seal.
-            let mut last_key: Option<[u8; 16]> = None;
+            let mut peer = ControlPeer::new();
             // Grant mask + deadline for the launch owner; `None` while no session is live.
             let mut access: Option<SessionAccess> = None;
-            let mut drops = GrantDrops::new();
             loop {
-                // Last pairing removed while live. Send termination + disconnect (same
-                // farewell as host-side session end), flush so it reaches the wire, then
-                // exit. Dropping `host` closes the socket.
+                // Last pairing removed while live: the host-side-end farewell, flushed so it
+                // reaches the wire, then exit. Dropping `host` closes the socket.
                 if stop_seen.load(Ordering::SeqCst) {
-                    if let Some(pid) = peer {
-                        if let (Some(scheme), Some(key)) = (detected, last_key) {
-                            let pt = termination_plaintext();
-                            let wire = encrypt_control(&key, &scheme, host_seq, &pt);
-                            if let Err(e) = host.peer_mut(pid).send(0, &Packet::reliable(&wire[..]))
-                            {
-                                tracing::warn!(error = ?e, "control: termination send failed");
-                            }
-                        }
-                        host.peer_mut(pid).disconnect_later(0);
+                    if peer.farewell(&mut host) {
                         // ~100 ms (50 × 2 ms timeout) for ENet to emit termination and the
                         // disconnect handshake. Each empty receive already blocks 2 ms.
                         for _ in 0..50 {
                             while matches!(host.service(), Ok(Some(_))) {}
                         }
                     }
-                    drops.end_of_session();
+                    peer.reset(&inj_tx);
                     state.end_session("control stream stopped — last pairing removed");
                     tracing::info!(port = CONTROL_PORT, "control: stopped (no paired clients)");
                     return;
@@ -451,36 +350,7 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                 // A stolen display ends the whole session here; the host-side-ended arm
                 // below then tells the client.
                 state.end_if_preempted();
-                // Each 2 ms tick: resolve on a new owner, fold a console edit (watch poll),
-                // cut the session the tick the deadline passes. Events below read this mask.
-                let owner_fp = state.launch.lock().unwrap().and_then(|s| s.owner_fp);
-                match owner_fp {
-                    None => access = None,
-                    Some(fp) => {
-                        let fp_hex = hex::encode(fp);
-                        if access.as_ref().is_none_or(|a| a.fp_hex != fp_hex) {
-                            access = Some(SessionAccess::resolve(state.access.get(), fp_hex));
-                        } else if let Some(a) = access.as_mut() {
-                            a.poll();
-                        }
-                        if let Some(a) = access
-                            .as_ref()
-                            .filter(|a| a.expired(crate::clock::unix_secs()))
-                        {
-                            // Expiry ends the session as a decision, not a network drop.
-                            // `quit_session` clears `launch`; the host-side-ended arm then
-                            // sends TERMINATION + disconnect (GameStream has no AccessUpdate).
-                            let why = if a.revoked {
-                                "gamestream access record removed"
-                            } else {
-                                "gamestream access expired"
-                            };
-                            tracing::info!(reason = why, "gamestream: ending the session");
-                            state.quit_session(why);
-                            access = None;
-                        }
-                    }
-                }
+                tick_access(&mut access, &state);
                 loop {
                     match host.service() {
                         Ok(Some(event)) => match event {
@@ -493,7 +363,7 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                                 let from = p.address().map(|a| a.ip());
                                 if accept_connect(launch, from) {
                                     tracing::info!("control: client connected");
-                                    peer = Some(p.id());
+                                    peer.id = Some(p.id());
                                 } else {
                                     tracing::warn!(
                                         ?from,
@@ -506,23 +376,12 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                                 // Only the tracked session peer. A probe, or the old peer's
                                 // late timeout after a reconnect replaced it, must not end
                                 // the live session or clobber its input state.
-                                if peer != Some(p.id()) {
+                                if peer.id != Some(p.id()) {
                                     tracing::debug!("control: non-session peer disconnected");
                                     continue;
                                 }
                                 tracing::info!("control: client disconnected");
-                                detected = None;
-                                decrypt_fails = 0;
-                                peer = None;
-                                hdr_signalled = None;
-                                // Drop pads + tablet: destroying the uinput pen releases any
-                                // held tool/tip kernel-side.
-                                pads = SessionPads::new();
-                                pointer = super::pen::GsPointer::new();
-                                for ev in held.release() {
-                                    let _ = inj_tx.send(ev);
-                                }
-                                drops.end_of_session();
+                                peer.reset(&inj_tx);
                                 // This stream is the session's liveness. Moonlight holds it
                                 // for the whole stream; a quit or drop often sends no RTSP
                                 // TEARDOWN / `/cancel`. UDP send only errors on ICMP, so
@@ -530,14 +389,12 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                                 state.end_session("control stream disconnected");
                             }
                             Event::Receive {
-                                peer: p,
-                                channel_id,
-                                packet,
+                                peer: p, packet, ..
                             } => {
                                 // Honor only the tracked peer. The socket filter drops
                                 // non-owners once a launch is recorded; this covers the
                                 // window before the owner IP is captured.
-                                if peer != Some(p.id()) {
+                                if peer.id != Some(p.id()) {
                                     continue;
                                 }
 
@@ -546,16 +403,10 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                                 // before the next tick's resolve (or an ungoverned session).
                                 on_receive(
                                     &state,
-                                    channel_id,
                                     packet.data(),
-                                    &mut detected,
-                                    &mut decrypt_fails,
+                                    &mut peer,
                                     &inj_tx,
-                                    &mut held,
-                                    &mut pads,
-                                    &mut pointer,
                                     access.as_ref().map(|a| a.mask).unwrap_or(GRANT_ALL),
-                                    &mut drops,
                                 );
                             }
                         },
@@ -567,94 +418,186 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                     }
                 }
                 // Host-side end (`end_session` cleared `launch`): media going silent is not
-                // a signal. Send TERMINATION first — a bare disconnect reads as `-1` on the
-                // client — then `disconnect_later`. Clearing `peer` first makes this fire
-                // once; the real `Disconnect` then takes the non-session-peer branch.
-                if let Some(pid) = peer {
-                    let ended = state
-                        .launch
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .is_none();
-                    if ended {
-                        // Seal only once the scheme is known; otherwise fall through to a
-                        // bare disconnect rather than send a packet the client cannot read.
-                        if let (Some(scheme), Some(key)) = (detected, last_key) {
-                            let pt = termination_plaintext();
-                            let wire = encrypt_control(&key, &scheme, host_seq, &pt);
-                            host_seq = host_seq.wrapping_add(1);
-                            if let Err(e) = host.peer_mut(pid).send(0, &Packet::reliable(&wire[..]))
-                            {
-                                tracing::warn!(error = ?e, "control: termination send failed");
-                            }
-                        }
-                        tracing::info!("control: the session ended — telling the client");
-                        // `disconnect_later` flushes the queued termination first; a plain
-                        // `disconnect` would race it off the wire.
-                        host.peer_mut(pid).disconnect_later(0);
-                        peer = None;
-                        detected = None;
-                        decrypt_fails = 0;
-                        hdr_signalled = None;
-                        pads = SessionPads::new();
-                        pointer = super::pen::GsPointer::new();
-                        for ev in held.release() {
-                            let _ = inj_tx.send(ev);
-                        }
-                        drops.end_of_session();
-                    }
+                // a signal. Clearing the peer makes this fire once; the real `Disconnect`
+                // then takes the non-session-peer branch.
+                let ended = state
+                    .launch
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_none();
+                if ended && peer.farewell(&mut host) {
+                    tracing::info!("control: the session ended — telling the client");
+                    peer.reset(&inj_tx);
                 }
-                // Pump FF every tick (games block in EVIOCSFF until answered). Legacy GCM
-                // nonces have no direction byte, so host `host_seq` and client seq share
-                // (key, nonce) space on collision — inherent to the old wire; V2 separates
-                // them with `iv[10..12]`. Do not invent a per-type host counter to "fix" it.
-                if let (Some(pid), Some(scheme)) = (peer, detected) {
-                    let key = state.launch.lock().unwrap().map(|s| s.gcm_key);
-                    // Remember for the teardown message (see `last_key`).
-                    if key.is_some() {
-                        last_key = key;
-                    }
-                    if let Some(key) = key {
-                        let mut out: Vec<Vec<u8>> = Vec::new();
-                        // HDR-mode (0x010e / `IDX_HDR_MODE`) follows the frames the video thread
-                        // encodes, off again when they turn SDR. Stock Moonlight switches the
-                        // TV only on this cue. Sent before rumble so the client sees it first.
-                        let encoded_hdr = *state.video_hdr.lock().unwrap();
-                        if encoded_hdr != hdr_signalled {
-                            let meta = encoded_hdr.or(hdr_signalled).unwrap_or_default();
-                            let pt = hdr_mode_plaintext(encoded_hdr.is_some(), &meta);
-                            out.push(encrypt_control(&key, &scheme, host_seq, &pt));
-                            host_seq = host_seq.wrapping_add(1);
-                            tracing::info!(
-                                on = encoded_hdr.is_some(),
-                                "control: signaled HDR mode to client (0x010e)"
-                            );
-                            hdr_signalled = encoded_hdr;
-                        }
-                        // Handle motors only. `0x010B` has no trigger-rumble id on this
-                        // plane, and uinput `FF_RUMBLE` has two fields anyway.
-                        pads.pump_rumble(|index, low, high, _lt, _rt| {
-                            let pt = super::gamepad::rumble_plaintext(index, low, high);
-                            out.push(encrypt_control(&key, &scheme, host_seq, &pt));
-                            host_seq = host_seq.wrapping_add(1);
-                        });
-                        for wire in out {
-                            if let Err(e) = host.peer_mut(pid).send(0, &Packet::reliable(&wire[..]))
-                            {
-                                tracing::warn!(error = ?e, "control send failed");
-                            }
-                        }
-                    }
-                } else {
-                    // No client/scheme yet: still answer FF uploads so games do not block.
-                    pads.pump_rumble(|_, _, _, _, _| {});
-                }
+                peer.pump_outbound(&mut host, &state);
                 // ENet handshake/keepalive/retransmit pacing is the socket's 2 ms read
                 // timeout in the drain above. Do not sleep on top of it.
             }
         })
         .context("spawn control thread")?;
     Ok(Running { stop, thread })
+}
+
+/// Each 2 ms tick: resolve on a new owner, fold a console edit (watch poll), and cut the
+/// session the tick the deadline passes. Events read the mask this leaves.
+fn tick_access(access: &mut Option<SessionAccess>, state: &AppState) {
+    let owner_fp = state.launch.lock().unwrap().and_then(|s| s.owner_fp);
+    let Some(fp) = owner_fp else {
+        *access = None;
+        return;
+    };
+    let fp_hex = hex::encode(fp);
+    if access.as_ref().is_none_or(|a| a.fp_hex != fp_hex) {
+        *access = Some(SessionAccess::resolve(state.access.get(), fp_hex));
+    } else if let Some(a) = access.as_mut() {
+        a.poll();
+    }
+    if let Some(a) = access
+        .as_ref()
+        .filter(|a| a.expired(crate::clock::unix_secs()))
+    {
+        // Expiry ends the session as a decision, not a network drop. `quit_session`
+        // clears `launch`; the host-side-ended arm then sends TERMINATION + disconnect
+        // (GameStream has no AccessUpdate).
+        let why = if a.revoked {
+            "gamestream access record removed"
+        } else {
+            "gamestream access expired"
+        };
+        tracing::info!(reason = why, "gamestream: ending the session");
+        state.quit_session(why);
+        *access = None;
+    }
+}
+
+/// The connected control peer and everything scoped to it. [`ControlPeer::reset`] ends it;
+/// `host_seq` and `last_key` outlive it.
+struct ControlPeer {
+    id: Option<PeerID>,
+    /// GCM nonce scheme, locked on the first packet that authenticates.
+    scheme: Option<Scheme>,
+    /// Consecutive decrypt failures; throttles the warn so a junk flood stays bounded.
+    decrypt_fails: u64,
+    /// What the client last heard over HDR-mode (0x010e). A client starts in SDR.
+    hdr_signalled: Option<HdrMeta>,
+    pads: SessionPads,
+    /// SS_PEN/SS_TOUCH → tablet / wire touch. Clients send these only after seeing
+    /// `SS_FF_PEN_TOUCH_EVENTS` (rtsp.rs).
+    pointer: super::pen::GsPointer,
+    /// The injector outlives the peer: whatever it still holds is released when it goes.
+    held: crate::inject::held::HeldInput,
+    drops: GrantDrops,
+    /// One host→client seq for every outbound message (rumble, HDR, termination). The GCM
+    /// nonce is derived from it; a per-type counter would reuse (key, nonce) pairs.
+    host_seq: u32,
+    /// Last live GCM key. Ending a session clears `launch` (where the key lives), so without
+    /// this copy the termination that must go out because it ended cannot seal.
+    last_key: Option<[u8; 16]>,
+}
+
+impl ControlPeer {
+    fn new() -> ControlPeer {
+        ControlPeer {
+            id: None,
+            scheme: None,
+            decrypt_fails: 0,
+            hdr_signalled: None,
+            pads: SessionPads::new(),
+            pointer: super::pen::GsPointer::new(),
+            held: Default::default(),
+            drops: GrantDrops::new(Plane::Gamestream),
+            host_seq: 0,
+            last_key: None,
+        }
+    }
+
+    fn next_seq(&mut self) -> u32 {
+        let seq = self.host_seq;
+        self.host_seq = seq.wrapping_add(1);
+        seq
+    }
+
+    /// Forget the peer: drop its pads and tablet (destroying the uinput pen releases a held
+    /// tool or tip kernel-side), release what the injector still holds, log the drop totals.
+    fn reset(&mut self, inj_tx: &Sender<InputEvent>) {
+        self.id = None;
+        self.scheme = None;
+        self.decrypt_fails = 0;
+        self.hdr_signalled = None;
+        self.pads = SessionPads::new();
+        self.pointer = super::pen::GsPointer::new();
+        for ev in self.held.release() {
+            let _ = inj_tx.send(ev);
+        }
+        if let Some(totals) =
+            std::mem::replace(&mut self.drops, GrantDrops::new(Plane::Gamestream)).summary()
+        {
+            tracing::info!(drops = %totals, "gamestream: access-grant drop totals for the session");
+        }
+    }
+
+    /// TERMINATION, then `disconnect_later`, which flushes it first: a bare disconnect reads
+    /// as `-1` on the client. Sealed only once the scheme is known; otherwise the disconnect
+    /// goes alone rather than a packet the client cannot read. `false` with no peer.
+    fn farewell<S: rusty_enet::Socket>(&mut self, host: &mut Host<S>) -> bool {
+        let Some(pid) = self.id else {
+            return false;
+        };
+        if let (Some(scheme), Some(key)) = (self.scheme, self.last_key) {
+            let seq = self.next_seq();
+            let wire = encrypt_control(&key, &scheme, seq, &termination_plaintext());
+            if let Err(e) = host.peer_mut(pid).send(0, &Packet::reliable(&wire[..])) {
+                tracing::warn!(error = ?e, "control: termination send failed");
+            }
+        }
+        host.peer_mut(pid).disconnect_later(0);
+        true
+    }
+
+    /// Pump force-feedback every tick (games block in EVIOCSFF until answered) and send the
+    /// HDR-mode cue ahead of rumble. Legacy GCM nonces have no direction byte, so `host_seq`
+    /// and the client's seq share (key, nonce) space; V2 separates them with `iv[10..12]`.
+    /// Do not invent a per-type counter to "fix" it.
+    fn pump_outbound<S: rusty_enet::Socket>(&mut self, host: &mut Host<S>, state: &AppState) {
+        let (Some(pid), Some(scheme)) = (self.id, self.scheme) else {
+            // No client/scheme yet: still answer FF uploads so games do not block.
+            self.pads.pump_rumble(|_, _, _, _, _| {});
+            return;
+        };
+        let key = state.launch.lock().unwrap().map(|s| s.gcm_key);
+        let Some(key) = key else {
+            return;
+        };
+        self.last_key = Some(key);
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        // HDR-mode (0x010e / `IDX_HDR_MODE`) follows the frames the video thread encodes,
+        // off again when they turn SDR. Stock Moonlight switches the TV only on this cue.
+        let encoded_hdr = *state.gs.video_hdr.lock().unwrap();
+        if encoded_hdr != self.hdr_signalled {
+            let meta = encoded_hdr.or(self.hdr_signalled).unwrap_or_default();
+            let pt = hdr_mode_plaintext(encoded_hdr.is_some(), &meta);
+            let seq = self.next_seq();
+            out.push(encrypt_control(&key, &scheme, seq, &pt));
+            tracing::info!(
+                on = encoded_hdr.is_some(),
+                "control: signaled HDR mode to client (0x010e)"
+            );
+            self.hdr_signalled = encoded_hdr;
+        }
+        // Handle motors only. `0x010B` has no trigger-rumble id on this plane, and uinput
+        // `FF_RUMBLE` has two fields anyway.
+        let seq = &mut self.host_seq;
+        self.pads.pump_rumble(|index, low, high, _lt, _rt| {
+            let pt = super::gamepad::rumble_plaintext(index, low, high);
+            out.push(encrypt_control(&key, &scheme, *seq, &pt));
+            *seq = seq.wrapping_add(1);
+        });
+        for wire in out {
+            if let Err(e) = host.peer_mut(pid).send(0, &Packet::reliable(&wire[..])) {
+                tracing::warn!(error = ?e, "control send failed");
+            }
+        }
+    }
 }
 
 /// Lost-frame range from invalidate-reference-frames (0x0301): two LE `i64`
@@ -671,19 +614,12 @@ fn decode_rfi_range(pt: &[u8]) -> Option<(i64, i64)> {
 
 /// Decrypt one control packet (lock GCM scheme on the first authenticating one),
 /// classify against the session grant mask, inject what the grants cover.
-#[allow(clippy::too_many_arguments)]
 fn on_receive(
     state: &AppState,
-    _channel_id: u8,
     d: &[u8],
-    detected: &mut Option<Scheme>,
-    decrypt_fails: &mut u64,
+    peer: &mut ControlPeer,
     inj_tx: &Sender<InputEvent>,
-    held: &mut crate::inject::held::HeldInput,
-    pads: &mut SessionPads,
-    pointer: &mut super::pen::GsPointer,
     grants: u32,
-    drops: &mut GrantDrops,
 ) {
     let Some(key) = state.launch.lock().unwrap().map(|s| s.gcm_key) else {
         return; // control traffic before /launch — no key yet
@@ -693,23 +629,23 @@ fn on_receive(
         return;
     }
 
-    let pt = match decrypt_control(&key, d, detected) {
+    let pt = match decrypt_control(&key, d, &peer.scheme) {
         Some((scheme, pt)) => {
-            if detected.is_none() {
+            if peer.scheme.is_none() {
                 tracing::info!(?scheme, "control: GCM scheme locked in");
             }
-            *detected = Some(scheme);
-            *decrypt_fails = 0;
+            peer.scheme = Some(scheme);
+            peer.decrypt_fails = 0;
             pt
         }
         None => {
             // Log the first decrypt failure, then only at 2, 4, 8, … — a junk flood
             // must not spam one warn per packet.
-            *decrypt_fails += 1;
-            if decrypt_fails.is_power_of_two() {
+            peer.decrypt_fails += 1;
+            if peer.decrypt_fails.is_power_of_two() {
                 tracing::warn!(
                     len = d.len(),
-                    fails = *decrypt_fails,
+                    fails = peer.decrypt_fails,
                     "control: GCM decrypt failed"
                 );
             }
@@ -770,9 +706,9 @@ fn on_receive(
     // arrives, so no uinput node and no pad-audio streamer.
     if let Some(gp) = super::gamepad::decode(&pt) {
         crate::sleep_inhibit::note_input();
-        if permitted(grants, GrantClass::Gamepad, drops) {
+        if peer.drops.permitted(grants, GrantClass::Gamepad) {
             state.counters.input_rich.fetch_add(1, Ordering::Relaxed);
-            pads.handle(&gp);
+            peer.pads.handle(&gp);
         }
         return;
     }
@@ -781,9 +717,10 @@ fn on_receive(
     // touches. Pointer-class by the plane tag.
     if let Some(p) = super::input::decode_pointer(&pt) {
         crate::sleep_inhibit::note_input();
-        if permitted(grants, GrantClass::Pointer, drops) {
+        if peer.drops.permitted(grants, GrantClass::Pointer) {
             state.counters.input_rich.fetch_add(1, Ordering::Relaxed);
-            pointer.apply(&p, |ev| {
+            let held = &mut peer.held;
+            peer.pointer.apply(&p, |ev| {
                 held.note(&ev);
                 let _ = inj_tx.send(ev);
             });
@@ -820,9 +757,9 @@ fn on_receive(
     // One mask test, then the injector thread. A closed channel means the injector
     // died at startup; input is lossy, so drop silently.
     for ev in events {
-        if permitted(grants, classify(ev.kind), drops) {
+        if peer.drops.permitted(grants, classify(ev.kind)) {
             state.counters.input_events.fetch_add(1, Ordering::Relaxed);
-            held.note(&ev);
+            peer.held.note(&ev);
             let _ = inj_tx.send(ev);
         }
     }
@@ -1228,47 +1165,6 @@ mod tests {
         assert_eq!(pt[4], 0); // disabled
     }
 
-    /// Controller-only mask: pad injects, keyboard/pointer are counted-and-dropped.
-    /// `permitted` is what `on_receive` calls. Also pins the drop-count reset.
-    #[test]
-    fn controller_only_mask_passes_the_pad_and_drops_keyboard_and_pointer() {
-        use punktfunk_core::input::InputKind;
-        use punktfunk_core::quic::{classify, GrantClass, GRANT_PRESET_CONTROLLER_ONLY};
-        let mut drops = super::GrantDrops::new();
-        let mask = GRANT_PRESET_CONTROLLER_ONLY;
-        // Pad injects (creation with it — deny-at-setup is upstream of this).
-        assert!(super::permitted(
-            mask,
-            classify(InputKind::GamepadButton),
-            &mut drops
-        ));
-        assert!(!super::permitted(
-            mask,
-            classify(InputKind::KeyDown),
-            &mut drops
-        ));
-        assert!(!super::permitted(
-            mask,
-            classify(InputKind::TextInput),
-            &mut drops
-        ));
-        assert!(!super::permitted(
-            mask,
-            classify(InputKind::MouseMove),
-            &mut drops
-        ));
-        // The pen/touch plane is Pointer-class by its plane tag.
-        assert!(!super::permitted(mask, GrantClass::Pointer, &mut drops));
-        assert_eq!(
-            drops.counts[super::GrantDrops::idx(GrantClass::Keyboard)],
-            2
-        );
-        assert_eq!(drops.counts[super::GrantDrops::idx(GrantClass::Pointer)], 2);
-        assert_eq!(drops.counts[super::GrantDrops::idx(GrantClass::Gamepad)], 0);
-        drops.end_of_session();
-        assert_eq!(drops.counts, [0u64; 7]);
-    }
-
     /// No grants record at session start is ungoverned (full control, back-compat for
     /// existing pairings). A record governs; console edits fold in within one poll; "expire
     /// now" is a past deadline on the same watch. Deleting the record under a live session
@@ -1351,5 +1247,33 @@ mod tests {
         assert!(!a.revoked);
         assert!(!a.expired(now + 1_000_000));
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// Every way a peer ends — client disconnect, host-side end, last pairing removed —
+    /// releases what it still holds and forgets its scheme, while the GCM seq runs on.
+    #[test]
+    fn a_reset_peer_releases_held_input_and_keeps_the_nonce_sequence() {
+        use punktfunk_core::input::{InputEvent, InputKind};
+        let mut peer = super::ControlPeer::new();
+        peer.decrypt_fails = 3;
+        peer.last_key = Some([7; 16]);
+        assert_eq!(peer.next_seq(), 0);
+        peer.held.note(&InputEvent {
+            kind: InputKind::KeyDown,
+            _pad: [0; 3],
+            code: 30,
+            x: 0,
+            y: 0,
+            flags: 0,
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        peer.reset(&tx);
+        let ups: Vec<_> = rx.try_iter().map(|e| (e.kind, e.code)).collect();
+        assert_eq!(ups, [(InputKind::KeyUp, 30)]);
+        assert!(peer.held.is_empty());
+        assert_eq!(peer.decrypt_fails, 0);
+        assert!(peer.scheme.is_none() && peer.id.is_none());
+        assert_eq!(peer.last_key, Some([7; 16]));
+        assert_eq!(peer.next_seq(), 1);
     }
 }

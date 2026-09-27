@@ -76,6 +76,19 @@ pub enum GrantClass {
 }
 
 impl GrantClass {
+    /// Every class, in bit order. Tables indexed by [`GrantClass::bit`] size from this.
+    ///
+    /// cbindgen:ignore
+    pub const ALL: [GrantClass; 7] = [
+        Self::Gamepad,
+        Self::Pointer,
+        Self::Keyboard,
+        Self::Clipboard,
+        Self::Mic,
+        Self::Launch,
+        Self::Power,
+    ];
+
     pub fn bit(self) -> u32 {
         match self {
             Self::Gamepad => GRANT_GAMEPAD,
@@ -136,6 +149,18 @@ mod tests {
             acc |= b;
         }
         assert_eq!(acc, GRANT_ALL);
+        let classes = GrantClass::ALL.iter().fold(0, |acc, c| acc | c.bit());
+        assert_eq!(
+            classes, GRANT_ALL,
+            "GrantClass::ALL must name every grant bit"
+        );
+        for (i, c) in GrantClass::ALL.iter().enumerate() {
+            assert_eq!(
+                c.bit().trailing_zeros() as usize,
+                i,
+                "{c:?} out of bit order"
+            );
+        }
         assert_eq!(GRANT_ALL & GRANT_RESERVED, 0);
         assert_eq!(GRANT_ALL | GRANT_RESERVED, u32::MAX);
     }

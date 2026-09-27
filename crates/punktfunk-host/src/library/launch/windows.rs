@@ -681,12 +681,6 @@ pub fn launch_gamestream_command(cmd: &str) -> Result<WindowsLaunch> {
     })
 }
 
-/// Launches a GameStream `/applist` title through [`launch_title`] in this host's
-/// WTS session. Linux uses [`resolve_launch`] then [`launch_session_command`].
-pub fn launch_gamestream_library(id: &str) -> Result<WindowsLaunch> {
-    launch_title(id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

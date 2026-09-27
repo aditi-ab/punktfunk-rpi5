@@ -27,12 +27,8 @@ pub(super) struct FrameMsg {
     /// Trust this, not a re-read of `is_armed()`: a capture that arms mid-flight must not fold
     /// zeroed splits into the first window's percentiles.
     pub(super) was_measured: bool,
-    /// The Windows driver encoded this AU: `encode_us` is its present → arrival lump.
-    pub(super) driver: bool,
-    /// The driver stamped its slot, so `queue_us` is its pool wait, `encode_us` its encode and
-    /// `ipc_us` the hand-off from publish to the host's take.
-    pub(super) split: bool,
-    pub(super) ipc_us: u32,
+    /// The Windows driver encoded this AU; `queue_us`/`encode_us` are then its own stages.
+    pub(super) driver: Option<crate::stats_recorder::DriverSample>,
 }
 
 /// Whole AU, or one slice-boundary chunk of a streamed AU (seal/pace while the encoder still runs).
@@ -57,9 +53,7 @@ pub(super) struct ChunkMsg {
     pub(super) wait_us: u32,
     pub(super) repeat: bool,
     pub(super) was_measured: bool,
-    pub(super) driver: bool,
-    pub(super) split: bool,
-    pub(super) ipc_us: u32,
+    pub(super) driver: Option<crate::stats_recorder::DriverSample>,
 }
 
 /// Open streamed AU: incremental sealer plus pace aggregation across per-chunk flushes.
@@ -173,8 +167,6 @@ fn handle_chunk(
             repeat: c.repeat,
             was_measured: c.was_measured,
             driver: c.driver,
-            split: c.split,
-            ipc_us: c.ipc_us,
         },
         PaceStat {
             spread_us: s.spread_us.saturating_add(stat.spread_us),
@@ -278,13 +270,9 @@ pub(super) fn send_loop(
     let mut pace_us: Vec<u32> = Vec::new();
     let (mut paced_frames, mut immediate_frames) = (0u64, 0u64);
     let mut sid: Option<(u64, u32)> = None;
-    // Capture → fully sent per AU, and the driver path's present → arrival lump.
-    let (mut host_v, mut driver_v): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
-    let mut driver_path = false;
-    // The driver's own split of that lump, once it stamps its slots.
-    let (mut pool_v, mut denc_v, mut ipc_v): (Vec<u32>, Vec<u32>, Vec<u32>) =
-        (Vec::new(), Vec::new(), Vec::new());
-    let mut driver_split = false;
+    // Capture → fully sent per AU.
+    let mut host_v: Vec<u32> = Vec::new();
+    let mut driver = crate::stats_recorder::DriverStages::default();
     let mut last_driver_dropped = stats.driver_dropped.load(Ordering::Relaxed);
     let (mut cap_v, mut submit_v, mut wait_v, mut queue_v): (
         Vec<u32>,
@@ -434,20 +422,9 @@ pub(super) fn send_loop(
                                 host_v.push(host_us);
                             }
                             if msg.was_measured {
-                                // The driver path's stages: its split when stamped, else its
-                                // lump; then the copy and the send. A zero pool is unmeasured.
-                                if msg.driver {
-                                    driver_path = true;
-                                    if msg.split {
-                                        driver_split = true;
-                                        if msg.queue_us > 0 {
-                                            pool_v.push(msg.queue_us);
-                                        }
-                                        denc_v.push(msg.encode_us);
-                                        ipc_v.push(msg.ipc_us);
-                                    } else {
-                                        driver_v.push(msg.encode_us);
-                                    }
+                                // The driver path's own stages, then the copy and the send.
+                                if let Some(d) = msg.driver {
+                                    driver.note(d);
                                 } else {
                                     cap_v.push(msg.cap_us);
                                     submit_v.push(msg.submit_us);
@@ -539,50 +516,30 @@ pub(super) fn send_loop(
             }
             let driver_dropped = stats.driver_dropped.load(Ordering::Relaxed);
             if stats.rec.is_armed() {
-                let capture_gen = stats.rec.generation();
-                let session_id = match sid {
-                    Some((g, id)) if g == capture_gen => id,
-                    _ => {
-                        let (w, h, hz) = unpack_mode(stats.mode.load(Ordering::Relaxed));
-                        let id = stats.rec.register_session(
-                            stats.plane.as_str(),
-                            w,
-                            h,
-                            hz,
-                            stats.codec,
-                            &stats.client,
-                        );
-                        sid = Some((capture_gen, id));
-                        id
+                let session_id = stats.rec.session_id(&mut sid, || {
+                    let (w, h, hz) = unpack_mode(stats.mode.load(Ordering::Relaxed));
+                    stats.rec.register_session(
+                        stats.plane.as_str(),
+                        w,
+                        h,
+                        hz,
+                        stats.codec,
+                        &stats.client,
+                    )
+                });
+                use crate::stats_recorder::stage;
+                let stages = match driver.stages() {
+                    Some(mut s) => {
+                        s.extend([stage("copy", &mut wait_v), stage("send", &mut pace_us)]);
+                        s
                     }
-                };
-                let stage = |name: &str, v: &mut Vec<u32>| crate::stats_recorder::StageTiming {
-                    name: name.into(),
-                    p50_us: percentile(v, 0.50) as f32,
-                    p99_us: percentile(v, 0.99) as f32,
-                };
-                let stages = if driver_split {
-                    vec![
-                        stage("pool", &mut pool_v),
-                        stage("encode", &mut denc_v),
-                        stage("ipc", &mut ipc_v),
-                        stage("copy", &mut wait_v),
-                        stage("send", &mut pace_us),
-                    ]
-                } else if driver_path {
-                    vec![
-                        stage("driver", &mut driver_v),
-                        stage("copy", &mut wait_v),
-                        stage("send", &mut pace_us),
-                    ]
-                } else {
-                    vec![
+                    None => vec![
                         stage("queue", &mut queue_v),
                         stage("capture", &mut cap_v),
                         stage("submit", &mut submit_v),
                         stage("encode", &mut wait_v),
                         stage("send", &mut pace_us),
-                    ]
+                    ],
                 };
                 let host = (!host_v.is_empty()).then(|| {
                     (
@@ -612,7 +569,8 @@ pub(super) fn send_loop(
                     repeat_fps: (repeat_frames as f64 / secs) as f32,
                     mbps: tx_mbps as f32,
                     bitrate_kbps: stats.bitrate_kbps.load(Ordering::Relaxed),
-                    frames_dropped: driver_path
+                    frames_dropped: driver
+                        .active()
                         .then(|| driver_dropped.saturating_sub(last_driver_dropped) as u32),
                     packets_dropped: None,
                     send_dropped: Some(
@@ -629,12 +587,7 @@ pub(super) fn send_loop(
             }
             last_driver_dropped = driver_dropped;
             host_v.clear();
-            driver_v.clear();
-            driver_path = false;
-            pool_v.clear();
-            denc_v.clear();
-            ipc_v.clear();
-            driver_split = false;
+            driver.reset();
             last_perf = std::time::Instant::now();
             last_bytes = s.bytes_sent;
             last_send_dropped = s.packets_send_dropped;

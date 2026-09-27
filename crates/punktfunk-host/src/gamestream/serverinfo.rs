@@ -1,6 +1,7 @@
 //! The `/serverinfo` capability/status XML Moonlight GETs before pairing and each launch.
 
-use super::{Host, APP_VERSION, GFE_VERSION, SCM_HEVC, SERVER_CODEC_MODE_SUPPORT};
+use super::{APP_VERSION, GFE_VERSION, SCM_HEVC, SERVER_CODEC_MODE_SUPPORT};
+use crate::host::Host;
 
 /// GFE's advertised HEVC luma-pixel ceiling. Moonlight rejects a mode above this.
 const MAX_LUMA_PIXELS_HEVC: u64 = 1_869_449_984;
@@ -64,7 +65,7 @@ fn host_mac() -> Option<String> {
     static MAC: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
     let mut cached = MAC.lock().unwrap_or_else(|p| p.into_inner());
     if cached.is_none() {
-        *cached = super::primary_local_ip()
+        *cached = crate::host::primary_local_ip()
             .map(crate::wol::wake_macs)
             .unwrap_or_default()
             .into_iter()
