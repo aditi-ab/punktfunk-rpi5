@@ -70,7 +70,8 @@ mod wire_mtu;
 mod control;
 mod cursor_fwd;
 
-mod stream;
+// GameStream reads the encode-stall rule and reset caps from `stream::state`.
+pub(crate) mod stream;
 use stream::{
     reconfig_allowed, software_stream, synthetic_abr_stream, synthetic_stream, virtual_stream,
     SessionContext, SynthAbrContext,

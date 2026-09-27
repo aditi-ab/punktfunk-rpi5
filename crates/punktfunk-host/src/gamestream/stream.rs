@@ -13,6 +13,7 @@ use super::video::{FrameType, VideoPacketizer};
 use super::VIDEO_PORT;
 use crate::capture::{self, Capturer, FastSyntheticCapturer};
 use crate::encode::{self, Codec};
+use crate::native::stream::state::{encode_stalled, MAX_CAPTURE_REBUILDS, MAX_ENCODER_RESETS};
 use anyhow::{Context, Result};
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1388,11 +1389,9 @@ fn stream_body(
     let mut supports_rfi = enc.caps().supports_rfi;
 
     // A delivered frame clears this; a permanently dead source ends the stream after the cap.
-    const MAX_REBUILDS: u32 = 5;
     let mut rebuilds: u32 = 0;
-    // Submit/poll failure or a silent stall rebuilds in place (native `reset_stalled_encoder`).
+    // Submit/poll failure or a stall rebuilds in place (native `reset_stalled_encoder`).
     // `last_au_at` is the silent-wedge watchdog: poll returning `None` forever never errors.
-    const MAX_ENCODER_RESETS: u32 = 5;
     let mut encoder_resets: u32 = 0;
     let mut last_au_at = Instant::now();
 
@@ -1439,7 +1438,7 @@ fn stream_body(
                     return Err(e).context("capture frame");
                 };
                 rebuilds += 1;
-                if rebuilds > MAX_REBUILDS {
+                if rebuilds > MAX_CAPTURE_REBUILDS {
                     return Err(e).context("capture lost — rebuild attempts exhausted");
                 }
                 tracing::warn!(error = %format!("{e:#}"), rebuild = rebuilds,
@@ -1709,9 +1708,20 @@ fn stream_body(
                 }
             }
         }
-        // Poll error, or no AU while frames are owed. Window scales so low-fps cannot false-trip.
-        let stall_window = Duration::from_secs(2).max(frame_interval * 8);
-        if poll_err.is_some() || (enc_inflight > 0 && last_au_at.elapsed() >= stall_window) {
+        // Poll error, or the native loop's stall rule. The driver path drains at depth 1.
+        let depth = if owed.is_some() {
+            1
+        } else {
+            capturer.pipeline_depth().max(1)
+        };
+        if poll_err.is_some()
+            || encode_stalled(
+                enc_inflight as usize,
+                last_au_at.elapsed(),
+                depth,
+                frame_interval,
+            )
+        {
             let why = match &poll_err {
                 Some(e) => format!("poll failed: {e:#}"),
                 None => format!(

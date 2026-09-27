@@ -2,7 +2,7 @@
 //! the IDD pipeline-depth adaptation, and the pacing sleep. The drain after the loop is here too.
 
 use super::recovery::{reset_stalled_encoder, run_loop_stage};
-use super::state::{Flow, StreamState, Tick, ENCODE_STALL_WINDOW, MAX_ENCODER_RESETS};
+use super::state::{encode_stalled, Flow, StreamState, Tick, MAX_ENCODER_RESETS};
 use super::*;
 
 // ~20 net behind-frames (≈0.3 s) escalates; warmup skips the first ~1 s of bring-up.
@@ -627,11 +627,12 @@ impl StreamState {
     /// A poll failure, or owed frames with no AU for the stall window: rebuild the encoder in
     /// place, up to [`MAX_ENCODER_RESETS`] times.
     fn check_encode_stall(&mut self, depth: usize, poll_err: Option<anyhow::Error>) -> Result<()> {
-        let stall_window = ENCODE_STALL_WINDOW.max(self.interval * 8);
-        let stall_backlog = depth
-            + (stall_window.as_secs_f64() / self.interval.as_secs_f64().max(1e-6)).ceil() as usize;
-        let stalled = !self.inflight.is_empty()
-            && (self.last_au_at.elapsed() >= stall_window || self.inflight.len() > stall_backlog);
+        let stalled = encode_stalled(
+            self.inflight.len(),
+            self.last_au_at.elapsed(),
+            depth,
+            self.interval,
+        );
         if poll_err.is_none() && !stalled {
             return Ok(());
         }
@@ -912,6 +913,28 @@ enum Polled {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Either arm trips: silence for the window, or a backlog the window cannot explain.
+    #[test]
+    fn an_encode_stall_trips_on_silence_or_backlog() {
+        let ms = std::time::Duration::from_millis;
+        // 64 fps: a 2 s window is 128 intervals, so depth 2 bounds the backlog at 130.
+        let i = std::time::Duration::from_micros(15_625);
+        assert!(
+            !encode_stalled(0, ms(60_000), 2, i),
+            "nothing owed never stalls"
+        );
+        assert!(!encode_stalled(3, ms(1_999), 2, i));
+        assert!(encode_stalled(3, ms(2_000), 2, i));
+        assert!(!encode_stalled(130, ms(10), 2, i));
+        assert!(
+            encode_stalled(131, ms(10), 2, i),
+            "AUs trickle while the backlog grows"
+        );
+        // 2 fps: the window is eight intervals (4 s), not 2 s.
+        assert!(!encode_stalled(1, ms(3_000), 1, ms(500)));
+        assert!(encode_stalled(1, ms(4_000), 1, ms(500)));
+    }
 
     #[test]
     fn an_escalated_but_caught_up_encoder_stops_refusing_climbs() {

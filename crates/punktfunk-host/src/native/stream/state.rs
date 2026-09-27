@@ -19,9 +19,24 @@ use super::pipeline::{build_pipeline_with_retry, Pipeline};
 use super::*;
 
 /// Non-blocking poll returning None forever while submits succeed. 2 s also sizes the backlog bound.
-pub(super) const ENCODE_STALL_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
-pub(super) const MAX_ENCODER_RESETS: u32 = 5;
-pub(super) const MAX_CAPTURE_REBUILDS: u32 = 5;
+const ENCODE_STALL_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+/// In-place encoder rebuilds and capture-loss rebuilds before a session ends. GameStream shares them.
+pub(crate) const MAX_ENCODER_RESETS: u32 = 5;
+pub(crate) const MAX_CAPTURE_REBUILDS: u32 = 5;
+
+/// Frames are owed and no AU came for the stall window, or more are owed than that window can
+/// explain past the pipeline `depth`. The window stretches to eight intervals so a low frame
+/// rate cannot false-trip. GameStream's encode loop uses the same rule.
+pub(crate) fn encode_stalled(
+    inflight: usize,
+    since_au: std::time::Duration,
+    depth: usize,
+    interval: std::time::Duration,
+) -> bool {
+    let window = ENCODE_STALL_WINDOW.max(interval * 8);
+    let backlog = depth + (window.as_secs_f64() / interval.as_secs_f64().max(1e-6)).ceil() as usize;
+    inflight > 0 && (since_au >= window || inflight > backlog)
+}
 /// (capture_ns, submit_ns, send deadline) per frame handed to the encoder and not yet polled.
 pub(super) type Inflight = std::collections::VecDeque<(u64, u64, std::time::Instant)>;
 
