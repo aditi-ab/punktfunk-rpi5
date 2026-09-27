@@ -665,44 +665,6 @@ mod live_tests {
         drop(vd);
     }
 
-    /// `SeDebugPrivilege` on our token: attaching to a service process (WUDFHost runs as
-    /// LocalService) needs it even from an elevated console session.
-    fn enable_debug_privilege() -> bool {
-        use windows::core::PCWSTR;
-        use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
-        use windows::Win32::Security::{
-            AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_DEBUG_NAME,
-            SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
-        };
-        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-        // SAFETY: plain token FFI on our own process; the handle is closed here.
-        unsafe {
-            let mut tok = HANDLE::default();
-            if OpenProcessToken(
-                GetCurrentProcess(),
-                TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-                &mut tok,
-            )
-            .is_err()
-            {
-                return false;
-            }
-            let mut luid = LUID::default();
-            let ok = LookupPrivilegeValueW(PCWSTR::null(), SE_DEBUG_NAME, &mut luid).is_ok() && {
-                let tp = TOKEN_PRIVILEGES {
-                    PrivilegeCount: 1,
-                    Privileges: [LUID_AND_ATTRIBUTES {
-                        Luid: luid,
-                        Attributes: SE_PRIVILEGE_ENABLED,
-                    }],
-                };
-                AdjustTokenPrivileges(tok, false, Some(&tp), 0, None, None).is_ok()
-            };
-            let _ = CloseHandle(tok);
-            ok
-        }
-    }
-
     /// Freeze `pid` for `hold` by debugger attach (every thread stops at the attach event and
     /// stays stopped until the SAME thread detaches), on a helper thread. `attached` flips once
     /// the freeze took; kill-on-exit is off so a test panic never takes the debuggee down.
@@ -807,10 +769,8 @@ mod live_tests {
             }
         }
         assert!(warm >= 10, "no steady source before the fault (got {warm})");
-        assert!(
-            enable_debug_privilege(),
-            "SeDebugPrivilege could not be enabled"
-        );
+        // Attaching to WUDFHost (LocalService) needs it even from an elevated console.
+        pf_frame::privilege::enable("SeDebugPrivilege").expect("enable SeDebugPrivilege");
         let attached = Arc::new(AtomicBool::new(false));
         let freezer = freeze_for(pid, hold, attached.clone());
         let t_freeze = Instant::now();
