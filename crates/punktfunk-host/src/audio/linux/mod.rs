@@ -894,6 +894,409 @@ fn mic_pw_thread(
     result
 }
 
+/// Confirms a new capture quantum only once it holds for [`QUANTUM_CONFIRM`] callbacks, so
+/// one short buffer can't move the gap threshold. Per open: a host runs for days, and a
+/// process-wide latch reported the first capture then never again.
+#[derive(Default)]
+struct QuantumTracker {
+    /// Frames per callback, `0` until confirmed.
+    frames: usize,
+    /// A size seen but not yet believed, with its consecutive count.
+    candidate: Option<(usize, u8)>,
+}
+
+impl QuantumTracker {
+    /// One callback of `frames`. `Some(was)` when `frames` is newly confirmed; `was` is `0`
+    /// for the first.
+    fn observe(&mut self, frames: usize) -> Option<usize> {
+        if frames > 0 && frames != self.frames {
+            let streak = match self.candidate {
+                Some((f, c)) if f == frames => c.saturating_add(1),
+                _ => 1,
+            };
+            if streak < QUANTUM_CONFIRM {
+                self.candidate = Some((frames, streak));
+                return None;
+            }
+            self.candidate = None;
+            return Some(std::mem::replace(&mut self.frames, frames));
+        }
+        if frames == self.frames {
+            self.candidate = None;
+        }
+        None
+    }
+}
+
+/// The capture stream's state, owned by its PipeWire listener.
+struct CapUd {
+    tx: std::sync::mpsc::SyncSender<Vec<f32>>,
+    channels: u32,
+    stats: crate::audio::capture_policy::CaptureStats,
+    last_stats: std::time::Instant,
+    quantum_frames: QuantumTracker,
+    reported_sched: bool,
+    /// Last callback time, so cadence can be scored. Cleared across a state transition — a
+    /// deliberate Paused span is not one hole. Not in `stats`: stats reset every window.
+    last_cb: Option<std::time::Instant>,
+    /// Negotiated quantum; a gap is measured against this. Seeded with the ask; corrected
+    /// on first data. A 1024-frame clamp is the deal we got, not a fault.
+    quantum: Duration,
+    /// Current format, so a resume to the same one is not a real change.
+    negotiated: Option<(pipewire::spa::param::audio::AudioFormat, u32, u32)>,
+    active: Arc<AtomicBool>,
+    /// When the stream last left `Streaming`, so the span is charged to the window it
+    /// stretched. `None` while streaming.
+    paused_since: Option<std::time::Instant>,
+    /// Denominator for every frames↔time conversion. At 96 kHz a hardcoded 48 000 would
+    /// report every quantum as twice as long.
+    rate_hz: u32,
+    negotiated_rate: Arc<AtomicU32>,
+}
+
+impl CapUd {
+    fn new(
+        tx: std::sync::mpsc::SyncSender<Vec<f32>>,
+        channels: u32,
+        rate_hz: u32,
+        active: Arc<AtomicBool>,
+        negotiated_rate: Arc<AtomicU32>,
+    ) -> CapUd {
+        CapUd {
+            tx,
+            channels,
+            stats: Default::default(),
+            last_stats: std::time::Instant::now(),
+            quantum_frames: QuantumTracker::default(),
+            reported_sched: false,
+            last_cb: None,
+            quantum: Duration::from_micros(
+                capture_quantum_frames(rate_hz) as u64 * 1_000_000 / rate_hz as u64,
+            ),
+            negotiated: None,
+            active,
+            paused_since: None,
+            rate_hz,
+            negotiated_rate,
+        }
+    }
+
+    /// A state change. A Paused↔Streaming span is a gap in the stream existing, not in
+    /// delivery: scoring it would bury the sub-10 ms holes. It is still reported, charged
+    /// to the window flushed after the resume, since that window stretches by the span.
+    fn on_state(&mut self, streaming: bool) {
+        self.last_cb = None;
+        if streaming {
+            if let Some(since) = self.paused_since.take() {
+                self.stats.observe_pause(since.elapsed());
+            }
+        } else {
+            self.paused_since
+                .get_or_insert_with(std::time::Instant::now);
+        }
+    }
+
+    /// A negotiated `(format, rate, channels)`. The same one again is the graph resuming us,
+    /// not a stream change. What is reported is what was granted, not asked
+    /// (`design/hi-res-audio.md`).
+    fn on_format(
+        &mut self,
+        now: (pipewire::spa::param::audio::AudioFormat, u32, u32),
+        mode: CaptureMode,
+    ) {
+        if self.negotiated == Some(now) {
+            tracing::debug!(
+                format = ?now.0,
+                rate = now.1,
+                channels = now.2,
+                "audio format renegotiated, unchanged (the graph resumed our sink)"
+            );
+            return;
+        }
+        self.negotiated = Some(now);
+        // Rate `0` means the pod carried none: "unstated" is not a claim that it changed.
+        if now.1 != 0 {
+            self.rate_hz = now.1;
+            self.negotiated_rate.store(now.1, Ordering::Relaxed);
+        }
+        // Sink modes: we own the sink, so this IS the format apps render into. Monitor mode:
+        // PipeWire's resampler reports a clean rate whatever ran upstream; the node's own
+        // rate is a registry lookup in `monitor_rate`.
+        tracing::info!(
+            format = ?now.0,
+            rate = now.1,
+            channels = now.2,
+            mode = mode.as_str(),
+            "audio format negotiated"
+        );
+    }
+
+    /// Score a callback's arrival, before any early return: a callback that ran empty still
+    /// ran, which is different from one that never ran.
+    fn on_callback(&mut self, now: std::time::Instant) {
+        let since_last = self.last_cb.map(|t| now.duration_since(t));
+        self.last_cb = Some(now);
+        self.stats.observe_callback(since_last, self.quantum);
+        if !self.reported_sched {
+            self.reported_sched = true;
+            // The thread that actually runs this callback, once per open. The mainloop
+            // boost never reaches here.
+            let (policy, rt_priority, nice) = pf_frame::thread_qos::current_thread_sched();
+            tracing::info!(
+                policy,
+                rt_priority,
+                nice,
+                "audio capture callback scheduling"
+            );
+        }
+    }
+
+    /// One dequeued buffer, negotiated as F32LE interleaved. The graph re-plans its quantum
+    /// when anything else asks for a different latency, so the size is tracked, not latched.
+    fn on_region(&mut self, region: &[u8]) {
+        let frames = region.len() / 4 / (self.channels.max(1) as usize);
+        if let Some(was) = self.quantum_frames.observe(frames) {
+            self.note_quantum(was, frames);
+        }
+        let samples: Vec<f32> = region
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        self.stats.observe(&samples, self.channels);
+        // Lossy and non-blocking. Count only while a session is reading: a full channel
+        // under a live consumer is a click plus a permanent shift; under a parked capturer
+        // it is nothing.
+        if self.tx.try_send(samples).is_err() && self.active.load(Ordering::Relaxed) {
+            self.stats.dropped_chunks += 1;
+        }
+        self.stats
+            .flush_window(&mut self.last_stats, self.rate_hz, None);
+    }
+
+    fn note_quantum(&mut self, was: usize, frames: usize) {
+        let rate = self.rate_hz.max(1);
+        self.quantum = Duration::from_micros(frames as u64 * 1_000_000 / rate as u64);
+        let want = capture_quantum_frames(self.rate_hz) as usize;
+        let negotiated_ms = format!("{:.1}", frames as f32 * 1000.0 / rate as f32);
+        if was != 0 {
+            // Moves the gap threshold under a reader comparing windows.
+            tracing::info!(
+                previous_frames = was,
+                negotiated_frames = frames,
+                negotiated_ms,
+                "the audio graph re-planned our quantum mid-stream"
+            );
+        } else if frames > want {
+            // Asked vs granted. Stock `pipewire.conf` raises `default.clock.min-quantum` to
+            // 1024 in a VM (`cpu.vm.name` set), so a 5 ms ask becomes 21.3 ms.
+            tracing::warn!(
+                requested_frames = want,
+                negotiated_frames = frames,
+                negotiated_ms,
+                "the audio graph refused our low-latency quantum — capture \
+                 arrives in bursts this size, and the client must buffer at \
+                 least that much to play them smoothly. On a VM this is \
+                 PipeWire's `default.clock.min-quantum = 1024` rule; check \
+                 `pw-metadata -n settings`"
+            );
+        } else {
+            tracing::info!(
+                requested_frames = want,
+                negotiated_frames = frames,
+                "audio capture quantum negotiated"
+            );
+        }
+    }
+}
+
+/// The null-sink mode's `support.null-audio-sink` adapter. The server answers
+/// asynchronously: `bound` is the sink existing, `error` is no adapter factory. The
+/// core-error listener ends the thread either way.
+fn create_null_sink(
+    core: &pipewire::core::CoreRc,
+    name: &str,
+    channels: u32,
+    rate_hz: u32,
+) -> Result<(pipewire::node::Node, pipewire::proxy::ProxyListener)> {
+    use pipewire::proxy::ProxyT;
+    let mut props = pipewire::properties::PropertiesBox::new();
+    for (key, value) in null_sink_props(name, channels, rate_hz) {
+        props.insert(key, value);
+    }
+    let node = core
+        .create_object::<pipewire::node::Node>("adapter", &props)
+        .context("create the punktfunk stream sink (support.null-audio-sink)")?;
+    let listener = node
+        .upcast_ref()
+        .add_listener_local()
+        .bound(|id| {
+            tracing::debug!(node_id = id, "punktfunk stream sink registered");
+        })
+        .error(|_seq, res, message| {
+            tracing::warn!(
+                res,
+                message,
+                "the punktfunk stream sink was not created — no desktop audio \
+                 capture until it is. Set PUNKTFUNK_STREAM_SINK=stream for the 0.30 \
+                 topology (no created sink)"
+            );
+        })
+        .register();
+    Ok((node, listener))
+}
+
+/// `node.driver-id` names who clocks our group. Not in the registry announce set — needs a
+/// bind + `info`. The daemon writes the key but flushes on the next info emission, so this
+/// is last-known, not realtime.
+struct GraphDriver {
+    /// Our node, bound so its `info` — and `node.driver-id` — arrives.
+    ours: Option<(pipewire::node::Node, pipewire::node::NodeListener)>,
+    /// Last reported; log only on change.
+    driver: Option<u32>,
+}
+
+/// Name the node clocking our capture group. `expected` is our own sink in null-sink mode,
+/// the one right answer until playthrough links the host output; legacy topologies borrow
+/// a driver by design, so the line names it without judging.
+fn report_graph_driver(bridge: &host_bridge::HostBridge, expected: Option<&str>, id: u32) {
+    let driver = bridge.node_name(id).unwrap_or("<unnamed>");
+    match expected {
+        Some(sink) if driver == sink => {
+            tracing::info!(driver, driver_id = id, "audio capture graph driver")
+        }
+        Some(_) if bridge.is_host(driver) => tracing::info!(
+            driver,
+            driver_id = id,
+            "audio capture graph driver (host playthrough — the \
+             host output clocks the group)"
+        ),
+        Some(sink) => tracing::warn!(
+            driver,
+            driver_id = id,
+            expected = sink,
+            "our audio capture group is being clocked by another \
+             node — every hole in this stream is that node's \
+             scheduling, not ours. Something has linked our sink to \
+             it (a loopback from its monitor is the usual cause); a \
+             USB or USB-over-IP sound card here is the 2026-08-18 \
+             defect"
+        ),
+        None => tracing::info!(
+            driver,
+            driver_id = id,
+            "audio capture graph driver (borrowed — this topology \
+             has none of its own)"
+        ),
+    }
+}
+
+/// The capture stream's properties per [`CaptureMode`]. `node_latency` is
+/// `<quantum frames>/<rate>`, one string for every arm so they can't drift.
+fn capture_props(
+    mode: CaptureMode,
+    sink: Option<&str>,
+    capture: &str,
+    target: Option<&str>,
+    node_latency: &str,
+) -> Result<pipewire::properties::PropertiesBox> {
+    use pipewire as pw;
+    use pw::properties::properties;
+    let mut p = match mode {
+        // Monitor tap of the null sink, aimed by name so it can only be ours.
+        CaptureMode::NullSink => {
+            let name = sink.context("null-sink mode without a sink name")?;
+            let mut p = properties! {
+                *pw::keys::MEDIA_TYPE          => "Audio",
+                *pw::keys::MEDIA_CATEGORY      => "Capture",
+                *pw::keys::MEDIA_ROLE          => "Music",
+                *pw::keys::STREAM_CAPTURE_SINK => "true",
+                // A passive link does not make either end runnable. Parked,
+                // nothing playing: the group is idle and the timer parks.
+                // A game's (non-passive) link makes the sink runnable and
+                // the graph walks that through the monitor to us.
+                *pw::keys::NODE_PASSIVE        => "true",
+                // Never fall back to a hardware monitor (wrong audio, and
+                // briefly rejoining a hardware driver is this mode's defect).
+                // These two are a pair: WirePlumber reads `dont-fallback`
+                // alone as licence to destroy the stream; `linger` waits.
+                "node.dont-fallback"           => "true",
+                "node.linger"                  => "true",
+            };
+            p.insert(*pw::keys::NODE_NAME, capture);
+            // Spelled out: pipewire-rs exposes `TARGET_OBJECT` only behind
+            // `v0_3_44`. WirePlumber matches this against `node.name`.
+            p.insert("target.object", name);
+            p
+        }
+        // This stream IS the sink. Apps play into it; process() gets the mix.
+        CaptureMode::StreamSink => {
+            let name = sink.context("stream-sink mode without a sink name")?;
+            let mut p = properties! {
+                *pw::keys::MEDIA_TYPE       => "Audio",
+                *pw::keys::MEDIA_CLASS      => "Audio/Sink",
+                *pw::keys::NODE_DESCRIPTION => "Punktfunk Stream Speaker",
+                *pw::keys::NODE_VIRTUAL     => "true",
+                // Low on purpose — opposite of the mic's 3000. Parked sink
+                // must not win auto default election; routing is the claim.
+                "priority.session"          => "50",
+                // Wine churns its device at launch; each suspend/resume is a
+                // hole in a live stream. Not `node.always-process`: that
+                // would keep the callback scheduled ~200/s between sessions.
+                "session.suspend-timeout-seconds" => "0",
+            };
+            p.insert(*pw::keys::NODE_NAME, name);
+            p
+        }
+        // Default-sink monitor (system output), not a microphone, unless a
+        // `target` names another session's sink.
+        CaptureMode::Monitor => {
+            let mut p = properties! {
+                *pw::keys::MEDIA_TYPE          => "Audio",
+                *pw::keys::MEDIA_CATEGORY      => "Capture",
+                *pw::keys::MEDIA_ROLE          => "Music",
+                *pw::keys::STREAM_CAPTURE_SINK => "true",
+            };
+            p.insert(*pw::keys::NODE_NAME, capture);
+            if let Some(t) = target {
+                p.insert("target.object", t);
+            }
+            p
+        }
+    };
+    // ~5 ms quantum, one protocol frame, at the session rate.
+    p.insert(*pw::keys::NODE_LATENCY, node_latency);
+    Ok(p)
+}
+
+/// The `EnumFormat` pod: F32LE at the session rate and layout. Sink modes: this is the
+/// sink's advertised layout. Monitor mode: PipeWire's mixer up/downmixes the sink monitor;
+/// the rate is resampled, so hi-res is proven from the registry (`monitor_rate`), not from
+/// here (`design/hi-res-audio.md`).
+fn format_pod(rate_hz: u32, channels: u32) -> Result<Vec<u8>> {
+    use pipewire::spa;
+    use spa::param::audio::{AudioFormat, AudioInfoRaw};
+    let mut info = AudioInfoRaw::new();
+    info.set_format(AudioFormat::F32LE);
+    info.set_rate(rate_hz);
+    info.set_channels(channels);
+    info.set_position(spa_positions(channels));
+    let obj = spa::pod::Object {
+        type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+        id: spa::param::ParamType::EnumFormat.as_raw(),
+        properties: info.into(),
+    };
+    Ok(spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &spa::pod::Value::Object(obj),
+    )
+    .context("serialize audio format pod")?
+    .0
+    .into_inner())
+}
+
+/// The desktop-audio capture thread: the PipeWire mainloop that wires the sink, the
+/// graph-driver watch, the host bridge and the capture stream, then runs until quit.
+/// Setup errors reach the opener through `ready`.
 #[allow(clippy::too_many_arguments)]
 fn pw_thread(
     tx: std::sync::mpsc::SyncSender<Vec<f32>>,
@@ -907,9 +1310,8 @@ fn pw_thread(
     negotiated_rate: Arc<AtomicU32>,
 ) -> Result<()> {
     use pipewire as pw;
-    use pw::proxy::ProxyT;
-    use pw::{properties::properties, spa};
-    use spa::param::audio::{AudioFormat, AudioInfoRaw};
+    use pw::spa;
+    use spa::param::audio::AudioInfoRaw;
     use spa::pod::Pod;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -1008,53 +1410,19 @@ fn pw_thread(
         // `target.object` resolves; no `object.linger`, so it dies with this
         // connection — which the loop thread's exit relies on.
         let _sink_node = match mode {
-            CaptureMode::NullSink => {
-                let name = sink_name
+            CaptureMode::NullSink => Some(create_null_sink(
+                &core,
+                sink_name
                     .as_deref()
-                    .context("null-sink mode without a sink name")?;
-                let mut props = pw::properties::PropertiesBox::new();
-                for (key, value) in null_sink_props(name, channels, rate_hz) {
-                    props.insert(key, value);
-                }
-                let node = core
-                    .create_object::<pw::node::Node>("adapter", &props)
-                    .context("create the punktfunk stream sink (support.null-audio-sink)")?;
-                // Server answers asynchronously: `bound` is the sink existing
-                // (graph id for the driver diagnostic); `error` is no adapter
-                // factory. Core-error listener ends the thread either way.
-                let listener = node
-                    .upcast_ref()
-                    .add_listener_local()
-                    .bound(|id| {
-                        tracing::debug!(node_id = id, "punktfunk stream sink registered");
-                    })
-                    .error(|_seq, res, message| {
-                        tracing::warn!(
-                            res,
-                            message,
-                            "the punktfunk stream sink was not created — no desktop audio \
-                             capture until it is. Set PUNKTFUNK_STREAM_SINK=stream for the 0.30 \
-                             topology (no created sink)"
-                        );
-                    })
-                    .register();
-                Some((node, listener))
-            }
+                    .context("null-sink mode without a sink name")?,
+                channels,
+                rate_hz,
+            )?),
             _ => None,
         };
-
         // `<quantum frames>/<rate>` — both halves move so the ask stays 5 ms
         // at 48 kHz and 96 kHz. Formatted once so the property arms cannot drift.
         let node_latency = format!("{}/{}", capture_quantum_frames(rate_hz), rate_hz);
-        // `node.driver-id` names who clocks our group. Not in the registry
-        // announce set — needs a bind + `info`. The daemon writes the key but
-        // flushes on the next info emission, so this is last-known, not realtime.
-        struct GraphDriver {
-            /// Our node, bound so its `info` — and `node.driver-id` — arrives.
-            ours: Option<(pw::node::Node, pw::node::NodeListener)>,
-            /// Last reported; log only on change.
-            driver: Option<u32>,
-        }
         // Null-sink has exactly one right answer (ours), or the host output
         // once playthrough links it. Legacy topologies borrow a driver by
         // design, so the line names it without judging.
@@ -1115,40 +1483,7 @@ fn pw_thread(
                                     return;
                                 }
                                 w.driver = Some(id);
-                                let b = bridge.borrow();
-                                let driver = b.node_name(id).unwrap_or("<unnamed>");
-                                match expected.as_deref() {
-                                    Some(sink) if driver == sink => tracing::info!(
-                                        driver,
-                                        driver_id = id,
-                                        "audio capture graph driver"
-                                    ),
-                                    Some(_) if b.is_host(driver) => tracing::info!(
-                                        driver,
-                                        driver_id = id,
-                                        "audio capture graph driver (host playthrough — the \
-                                         host output clocks the group)"
-                                    ),
-                                    Some(sink) => tracing::warn!(
-                                        driver,
-                                        driver_id = id,
-                                        expected = sink,
-                                        "our audio capture group is being clocked by another \
-                                         node — every hole in this stream is that node's \
-                                         scheduling, not ours. Something has linked our sink to \
-                                         it (a loopback from its monitor is the usual cause); a \
-                                         USB or USB-over-IP sound card here is the 2026-08-18 \
-                                         defect"
-                                    ),
-                                    // Legacy topologies have no driver of their own;
-                                    // borrowing one is the design. Which one still matters.
-                                    None => tracing::info!(
-                                        driver,
-                                        driver_id = id,
-                                        "audio capture graph driver (borrowed — this topology \
-                                         has none of its own)"
-                                    ),
-                                }
+                                report_graph_driver(&bridge.borrow(), expected.as_deref(), id);
                             }
                         })
                         .register();
@@ -1163,151 +1498,24 @@ fn pw_thread(
             })
             .register();
 
-        let props = match mode {
-            // Monitor tap of the adapter above, aimed by name so it can only be ours.
-            CaptureMode::NullSink => {
-                let name = sink_name
-                    .as_deref()
-                    .context("null-sink mode without a sink name")?;
-                let mut p = properties! {
-                    *pw::keys::MEDIA_TYPE          => "Audio",
-                    *pw::keys::MEDIA_CATEGORY      => "Capture",
-                    *pw::keys::MEDIA_ROLE          => "Music",
-                    *pw::keys::STREAM_CAPTURE_SINK => "true",
-                    // A passive link does not make either end runnable. Parked,
-                    // nothing playing: the group is idle and the timer parks.
-                    // A game's (non-passive) link makes the sink runnable and
-                    // the graph walks that through the monitor to us.
-                    *pw::keys::NODE_PASSIVE        => "true",
-                    // Never fall back to a hardware monitor (wrong audio, and
-                    // briefly rejoining a hardware driver is this mode's defect).
-                    // These two are a pair: WirePlumber reads `dont-fallback`
-                    // alone as licence to destroy the stream; `linger` waits.
-                    "node.dont-fallback"           => "true",
-                    "node.linger"                  => "true",
-                };
-                p.insert(*pw::keys::NODE_NAME, capture_name.as_str());
-                // Spelled out: pipewire-rs exposes `TARGET_OBJECT` only behind
-                // `v0_3_44`. WirePlumber matches this against `node.name`.
-                p.insert("target.object", name);
-                p.insert(*pw::keys::NODE_LATENCY, node_latency.as_str());
-                p
-            }
-            // This stream IS the sink. Apps play into it; process() gets the mix.
-            CaptureMode::StreamSink => {
-                let name = sink_name
-                    .as_deref()
-                    .context("stream-sink mode without a sink name")?;
-                let mut p = properties! {
-                    *pw::keys::MEDIA_TYPE       => "Audio",
-                    *pw::keys::MEDIA_CLASS      => "Audio/Sink",
-                    *pw::keys::NODE_DESCRIPTION => "Punktfunk Stream Speaker",
-                    *pw::keys::NODE_VIRTUAL     => "true",
-                    // Low on purpose — opposite of the mic's 3000. Parked sink
-                    // must not win auto default election; routing is the claim.
-                    "priority.session"          => "50",
-                    // Wine churns its device at launch; each suspend/resume is a
-                    // hole in a live stream. Not `node.always-process`: that
-                    // would keep the callback scheduled ~200/s between sessions.
-                    "session.suspend-timeout-seconds" => "0",
-                };
-                p.insert(*pw::keys::NODE_NAME, name);
-                // ~5 ms quantum, one protocol frame. Inserted (rate is a
-                // session value) so it cannot drift from the other mode arms.
-                p.insert(*pw::keys::NODE_LATENCY, node_latency.as_str());
-                p
-            }
-            // Default-sink monitor (system output), not a microphone, unless a
-            // `target` names another session's sink.
-            CaptureMode::Monitor => {
-                let mut p = properties! {
-                    *pw::keys::MEDIA_TYPE          => "Audio",
-                    *pw::keys::MEDIA_CATEGORY      => "Capture",
-                    *pw::keys::MEDIA_ROLE          => "Music",
-                    *pw::keys::STREAM_CAPTURE_SINK => "true",
-                };
-                p.insert(*pw::keys::NODE_NAME, capture_name.as_str());
-                p.insert(*pw::keys::NODE_LATENCY, node_latency.as_str());
-                if let Some(t) = target.as_deref() {
-                    p.insert("target.object", t);
-                }
-                p
-            }
-        };
+        let props = capture_props(
+            mode,
+            sink_name.as_deref(),
+            &capture_name,
+            target.as_deref(),
+            &node_latency,
+        )?;
         let stream = pw::stream::StreamBox::new(&core, "punktfunk-audio", props)
             .context("pw audio Stream")?;
 
-        struct CapUd {
-            tx: std::sync::mpsc::SyncSender<Vec<f32>>,
-            channels: u32,
-            stats: crate::audio::capture_policy::CaptureStats,
-            last_stats: std::time::Instant,
-            /// Frames per callback, `0` until confirmed. Per-open, not a
-            /// process-wide latch: a host runs for days, and a process-wide
-            /// form reported the first capture then never again.
-            quantum_frames: usize,
-            /// Buffer size seen but not yet believed, plus consecutive agrees.
-            /// Stops one short buffer from moving the gap threshold.
-            quantum_candidate: Option<(usize, u8)>,
-            reported_sched: bool,
-            /// Last callback time, so cadence can be scored. Cleared across a
-            /// state transition — a deliberate Paused span is not one hole.
-            /// Not in `stats`: stats reset every window, cadence does not.
-            last_cb: Option<std::time::Instant>,
-            /// Negotiated quantum; a gap is measured against this. Seeded with
-            /// the ask; corrected on first data. A 1024-frame clamp is the
-            /// deal we got, not a fault.
-            quantum: Duration,
-            /// Current format, so a resume to the same one is not a real change.
-            negotiated: Option<(spa::param::audio::AudioFormat, u32, u32)>,
-            active: Arc<AtomicBool>,
-            /// When the stream last left `Streaming`, so the span is charged
-            /// to the window it stretched. `None` while streaming.
-            paused_since: Option<std::time::Instant>,
-            /// Denominator for every frames↔time conversion. At 96 kHz a
-            /// hardcoded 48 000 would report every quantum as twice as long.
-            rate_hz: u32,
-            negotiated_rate: Arc<AtomicU32>,
-        }
-        let ud = CapUd {
-            tx,
-            channels,
-            stats: Default::default(),
-            last_stats: std::time::Instant::now(),
-            quantum_frames: 0,
-            quantum_candidate: None,
-            reported_sched: false,
-            last_cb: None,
-            quantum: Duration::from_micros(
-                capture_quantum_frames(rate_hz) as u64 * 1_000_000 / rate_hz as u64,
-            ),
-            negotiated: None,
-            active,
-            paused_since: None,
-            rate_hz,
-            negotiated_rate,
-        };
+        let ud = CapUd::new(tx, channels, rate_hz, active, negotiated_rate);
         let _listener = stream
             .add_local_listener_with_user_data(ud)
             .state_changed({
                 let mainloop = mainloop.clone();
                 move |_s, ud, old, new| {
                     tracing::debug!(?old, ?new, "pipewire audio stream state");
-                    // A Paused↔Streaming span is a gap in the stream existing,
-                    // not in delivery. Scoring it would bury the sub-10 ms holes.
-                    ud.last_cb = None;
-                    // Still reported: the process-callback window stretches by
-                    // the whole span. Charge it to the window flushed after resume.
-                    match new {
-                        pw::stream::StreamState::Streaming => {
-                            if let Some(since) = ud.paused_since.take() {
-                                ud.stats.observe_pause(since.elapsed());
-                            }
-                        }
-                        _ => {
-                            ud.paused_since.get_or_insert_with(std::time::Instant::now);
-                        }
-                    }
+                    ud.on_state(matches!(new, pw::stream::StreamState::Streaming));
                     // Unrecoverable — exit so sessions reopen a fresh instance.
                     if matches!(new, pw::stream::StreamState::Error(_)) {
                         mainloop.quit();
@@ -1321,62 +1529,12 @@ fn pw_thread(
                 }
                 let mut info = AudioInfoRaw::default();
                 if info.parse(param).is_ok() {
-                    // Same format = the graph resumed us, not a stream change.
-                    // The flap stays visible in state DEBUG and gap counters.
-                    let now = (info.format(), info.rate(), info.channels());
-                    if ud.negotiated == Some(now) {
-                        tracing::debug!(
-                            format = ?now.0,
-                            rate = now.1,
-                            channels = now.2,
-                            "audio format renegotiated, unchanged (the graph resumed our sink)"
-                        );
-                        return;
-                    }
-                    ud.negotiated = Some(now);
-                    // Report what was granted, not asked (`design/hi-res-audio.md`).
-                    // Rate `0` means the pod carried none; keep the previous
-                    // value — "unstated" is not a claim that the rate changed.
-                    if now.1 != 0 {
-                        ud.rate_hz = now.1;
-                        ud.negotiated_rate.store(now.1, Ordering::Relaxed);
-                    }
-                    // Sink modes: we own the sink, so this IS the format apps
-                    // render into. Monitor mode: PipeWire's resampler reports a
-                    // clean rate whatever ran upstream; the node's own rate is
-                    // a registry lookup in `monitor_rate`.
-                    tracing::info!(
-                        format = ?info.format(),
-                        rate = info.rate(),
-                        channels = info.channels(),
-                        mode = mode.as_str(),
-                        "audio format negotiated"
-                    );
+                    ud.on_format((info.format(), info.rate(), info.channels()), mode);
                 }
             })
             .process(|stream, ud| {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // Score arrival before any early return: a callback that
-                    // ran empty still ran — different from one that never ran.
-                    let now = std::time::Instant::now();
-                    let since_last = ud.last_cb.map(|t| now.duration_since(t));
-                    ud.last_cb = Some(now);
-                    ud.stats.observe_callback(since_last, ud.quantum);
-
-                    if !ud.reported_sched {
-                        ud.reported_sched = true;
-                        // The thread that actually runs this callback, once per
-                        // open. The mainloop boost above never reaches here.
-                        let (policy, rt_priority, nice) =
-                            pf_frame::thread_qos::current_thread_sched();
-                        tracing::info!(
-                            policy,
-                            rt_priority,
-                            nice,
-                            "audio capture callback scheduling"
-                        );
-                    }
-
+                    ud.on_callback(std::time::Instant::now());
                     let Some(mut buffer) = stream.dequeue_buffer() else {
                         ud.stats.missed_dequeues += 1;
                         return;
@@ -1399,82 +1557,7 @@ fn pw_thread(
                         ud.stats.missed_dequeues += 1;
                         return;
                     }
-                    let region = &buf[offset..(offset + size).min(buf.len())];
-                    // Negotiated as F32LE; reinterpret the byte region as interleaved f32.
-                    let n = region.len() / 4;
-                    // Track the quantum the graph is handing us. It re-plans
-                    // when anything else asks for a different latency; latching
-                    // the first callback scored later gaps against a dead size.
-                    // A new size must survive `QUANTUM_CONFIRM` callbacks.
-                    let frames = n / (ud.channels.max(1) as usize);
-                    if frames > 0 && frames != ud.quantum_frames {
-                        let streak = match ud.quantum_candidate {
-                            Some((f, c)) if f == frames => c.saturating_add(1),
-                            _ => 1,
-                        };
-                        if streak < QUANTUM_CONFIRM {
-                            ud.quantum_candidate = Some((frames, streak));
-                        } else {
-                            let was = ud.quantum_frames;
-                            ud.quantum_frames = frames;
-                            ud.quantum_candidate = None;
-                            ud.quantum = Duration::from_micros(
-                                frames as u64 * 1_000_000 / ud.rate_hz.max(1) as u64,
-                            );
-                            let want = capture_quantum_frames(ud.rate_hz) as usize;
-                            let negotiated_ms =
-                                format!("{:.1}", frames as f32 * 1000.0 / ud.rate_hz.max(1) as f32);
-                            if was != 0 {
-                                // Moves the gap threshold under a reader comparing windows.
-                                tracing::info!(
-                                    previous_frames = was,
-                                    negotiated_frames = frames,
-                                    negotiated_ms,
-                                    "the audio graph re-planned our quantum mid-stream"
-                                );
-                            } else if frames > want {
-                                // Asked vs granted. Stock `pipewire.conf` raises
-                                // `default.clock.min-quantum` to 1024 in a VM
-                                // (`cpu.vm.name` set), so a 5 ms ask becomes 21.3 ms.
-                                tracing::warn!(
-                                    requested_frames = want,
-                                    negotiated_frames = frames,
-                                    negotiated_ms,
-                                    "the audio graph refused our low-latency quantum — capture \
-                                     arrives in bursts this size, and the client must buffer at \
-                                     least that much to play them smoothly. On a VM this is \
-                                     PipeWire's `default.clock.min-quantum = 1024` rule; check \
-                                     `pw-metadata -n settings`"
-                                );
-                            } else {
-                                tracing::info!(
-                                    requested_frames = want,
-                                    negotiated_frames = frames,
-                                    "audio capture quantum negotiated"
-                                );
-                            }
-                        }
-                    } else if frames == ud.quantum_frames {
-                        ud.quantum_candidate = None;
-                    }
-                    let mut samples = Vec::with_capacity(n);
-                    for i in 0..n {
-                        let b = [
-                            region[i * 4],
-                            region[i * 4 + 1],
-                            region[i * 4 + 2],
-                            region[i * 4 + 3],
-                        ];
-                        samples.push(f32::from_le_bytes(b));
-                    }
-                    ud.stats.observe(&samples, ud.channels);
-                    // Lossy and non-blocking. Count only while a session is
-                    // reading: a full channel under a live consumer is a click
-                    // plus a permanent shift; under a parked capturer it is nothing.
-                    if ud.tx.try_send(samples).is_err() && ud.active.load(Ordering::Relaxed) {
-                        ud.stats.dropped_chunks += 1;
-                    }
-                    ud.stats.flush_window(&mut ud.last_stats, ud.rate_hz, None);
+                    ud.on_region(&buf[offset..(offset + size).min(buf.len())]);
                 }));
                 if outcome.is_err() {
                     tracing::error!("panic in pipewire audio callback — chunk dropped");
@@ -1483,27 +1566,7 @@ fn pw_thread(
             .register()
             .context("register audio stream listener")?;
 
-        // F32LE at the session rate + layout. Sink modes: this is the sink's
-        // advertised layout. Monitor mode: PipeWire's mixer up/downmixes the
-        // sink monitor; the rate is resampled, so hi-res is proven from the
-        // registry (`monitor_rate`), not from here (`design/hi-res-audio.md`).
-        let mut info = AudioInfoRaw::new();
-        info.set_format(AudioFormat::F32LE);
-        info.set_rate(rate_hz);
-        info.set_channels(channels);
-        info.set_position(spa_positions(channels));
-        let obj = pw::spa::pod::Object {
-            type_: pw::spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
-            id: pw::spa::param::ParamType::EnumFormat.as_raw(),
-            properties: info.into(),
-        };
-        let values: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
-            std::io::Cursor::new(Vec::new()),
-            &pw::spa::pod::Value::Object(obj),
-        )
-        .context("serialize audio format pod")?
-        .0
-        .into_inner();
+        let values = format_pod(rate_hz, channels)?;
         let mut params = [Pod::from_bytes(&values).context("audio pod from bytes")?];
 
         // Same reason as the mic: a synchronous node that joins its driver
@@ -1638,6 +1701,69 @@ mod tests {
         assert_eq!(spa_position_names(2), "[ FL FR ]");
         assert_eq!(spa_position_names(6), "[ FL FR FC LFE RL RR ]");
         assert_eq!(spa_position_names(8), "[ FL FR FC LFE RL RR SL SR ]");
+    }
+
+    /// A new buffer size moves the gap threshold only after `QUANTUM_CONFIRM` callbacks in a
+    /// row; the confirmed size coming back resets a candidate.
+    #[test]
+    fn a_new_quantum_needs_three_callbacks_in_a_row() {
+        let mut q = QuantumTracker::default();
+        assert_eq!(q.observe(0), None, "an empty buffer is not a size");
+        assert_eq!((q.observe(240), q.observe(240)), (None, None));
+        assert_eq!(q.observe(240), Some(0), "first confirmation");
+        assert_eq!(q.observe(1024), None);
+        assert_eq!(q.observe(240), None, "the old size is back");
+        assert_eq!((q.observe(1024), q.observe(1024)), (None, None));
+        assert_eq!(q.observe(1024), Some(240), "re-planned");
+    }
+
+    /// Each mode's stream properties, read back from the dict PipeWire gets.
+    #[test]
+    fn capture_props_per_mode() {
+        pf_capture::pwinit::ensure_init();
+        let get = |mode, sink, target| {
+            let p = capture_props(mode, sink, "punktfunk-capture-1", target, "240/48000").unwrap();
+            let keys = [
+                "node.name",
+                "target.object",
+                "node.latency",
+                "node.passive",
+                "media.class",
+            ];
+            keys.map(|k| p.get(k).map(str::to_owned))
+        };
+        let s = |v: &str| Some(v.to_owned());
+        assert_eq!(
+            get(CaptureMode::NullSink, Some("punktfunk-speaker-1"), None),
+            [
+                s("punktfunk-capture-1"),
+                s("punktfunk-speaker-1"),
+                s("240/48000"),
+                s("true"),
+                None
+            ]
+        );
+        assert_eq!(
+            get(CaptureMode::StreamSink, Some("punktfunk-speaker-1"), None),
+            [
+                s("punktfunk-speaker-1"),
+                None,
+                s("240/48000"),
+                None,
+                s("Audio/Sink")
+            ]
+        );
+        assert_eq!(
+            get(CaptureMode::Monitor, None, Some("punktfunk-speaker-2")),
+            [
+                s("punktfunk-capture-1"),
+                s("punktfunk-speaker-2"),
+                s("240/48000"),
+                None,
+                None
+            ]
+        );
+        assert!(capture_props(CaptureMode::NullSink, None, "c", None, "240/48000").is_err());
     }
 
     /// Created-sink invariants. None fail loudly if they silently change.
