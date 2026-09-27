@@ -13,7 +13,7 @@
 //! - `UHID_SET_REPORT` must be answered.
 #![allow(dead_code)]
 
-use punktfunk_core::input::gamepad as gs;
+use punktfunk_core::input::{gamepad as gs, GamepadFrame};
 use punktfunk_core::quic::RichInput;
 
 /// `hid-steam` matches VID/PID on `BUS_USB`; no usage-page probe.
@@ -165,7 +165,7 @@ impl SteamState {
     }
 
     /// Zero gyro only (gravity stays). `true` if anything changed —
-    /// `PadProto::neutralize_gyro`.
+    /// `PadState::neutralize_gyro`.
     pub fn neutralize_gyro(&mut self) -> bool {
         let changed = self.gyro != [0; 3];
         self.gyro = [0; 3];
@@ -173,7 +173,7 @@ impl SteamState {
     }
 
     /// Drop trackpad + motion. A pad that took this slot inside the replug
-    /// grace must not inherit the last finger or rotation (`PadProto::clear_rich`).
+    /// grace must not inherit the last finger or rotation (`PadState::clear_rich`).
     pub fn clear_rich(&mut self) {
         let fresh = SteamState::neutral();
         self.lpad_x = fresh.lpad_x;
@@ -218,29 +218,14 @@ impl SteamState {
             rt: trigger_u16(rt),
             ..SteamState::neutral()
         };
-        let mut b = 0u64;
+        let mut b = deck_low_buttons(buttons, lt, rt);
         let set = |b: &mut u64, on: bool, m: u64| {
             if on {
                 *b |= m;
             }
         };
-        set(&mut b, on(gs::BTN_A), btn::A);
-        set(&mut b, on(gs::BTN_B), btn::B);
-        set(&mut b, on(gs::BTN_X), btn::X);
-        set(&mut b, on(gs::BTN_Y), btn::Y);
-        set(&mut b, on(gs::BTN_LB), btn::LB);
-        set(&mut b, on(gs::BTN_RB), btn::RB);
-        set(&mut b, lt > 0, btn::LT_FULL);
-        set(&mut b, rt > 0, btn::RT_FULL);
-        set(&mut b, on(gs::BTN_BACK), btn::VIEW);
-        set(&mut b, on(gs::BTN_START), btn::MENU);
-        set(&mut b, on(gs::BTN_GUIDE), btn::STEAM);
         set(&mut b, on(gs::BTN_LS_CLICK), btn::L3);
         set(&mut b, on(gs::BTN_RS_CLICK), btn::R3);
-        set(&mut b, on(gs::BTN_DPAD_UP), btn::DPAD_UP);
-        set(&mut b, on(gs::BTN_DPAD_DOWN), btn::DPAD_DOWN);
-        set(&mut b, on(gs::BTN_DPAD_LEFT), btn::DPAD_LEFT);
-        set(&mut b, on(gs::BTN_DPAD_RIGHT), btn::DPAD_RIGHT);
         // DualSense touchpad-click → Deck right-pad click (same pad apply_rich uses).
         set(&mut b, on(gs::BTN_TOUCHPAD), btn::RPAD_CLICK);
         // PADDLE1/2/3/4 = R4/L4/R5/L5 (`input::gamepad`); MISC1 = QAM.
@@ -250,6 +235,31 @@ impl SteamState {
         set(&mut b, on(gs::BTN_PADDLE4), btn::L5);
         set(&mut b, on(gs::BTN_MISC1), btn::QAM);
         s.buttons = b;
+        s
+    }
+
+    /// Fold a Deck button/stick frame over `prev`. Trackpads, motion and pad clicks arrive on
+    /// the rich plane and survive it. Clicks are their own fields, not `buttons`: the serializer
+    /// ORs them with the frame's `RPAD_CLICK`, so keeping them cannot strand wire BTN_TOUCHPAD.
+    pub fn merge_frame(prev: &SteamState, f: &GamepadFrame) -> SteamState {
+        let mut s = SteamState::from_gamepad(
+            f.buttons,
+            f.ls_x,
+            f.ls_y,
+            f.rs_x,
+            f.rs_y,
+            f.left_trigger,
+            f.right_trigger,
+        );
+        s.rpad_x = prev.rpad_x;
+        s.rpad_y = prev.rpad_y;
+        s.lpad_x = prev.lpad_x;
+        s.lpad_y = prev.lpad_y;
+        s.gyro = prev.gyro;
+        s.accel = prev.accel;
+        s.buttons |= prev.buttons & (btn::RPAD_TOUCH | btn::LPAD_TOUCH);
+        s.lpad_click = prev.lpad_click;
+        s.rpad_click = prev.rpad_click;
         s
     }
 
@@ -346,6 +356,48 @@ pub fn serialize_deck_state(r: &mut [u8; STEAM_REPORT_LEN], st: &SteamState, seq
     r[58..60].copy_from_slice(&st.rpad_pressure.to_le_bytes());
 }
 
+/// Deck state-frame encoder a transport keeps across writes: the frame sequence number.
+#[derive(Default)]
+pub struct DeckEncoder {
+    seq: u32,
+}
+
+impl DeckEncoder {
+    /// The next `ID_CONTROLLER_DECK_STATE` frame for `st`.
+    pub fn encode(&mut self, st: &SteamState) -> [u8; STEAM_REPORT_LEN] {
+        self.seq = self.seq.wrapping_add(1);
+        let mut r = [0u8; STEAM_REPORT_LEN];
+        serialize_deck_state(&mut r, st, self.seq);
+        r
+    }
+}
+
+/// Wire buttons → the Deck bits the classic Steam Controller shares with it: face, shoulders,
+/// full-pull triggers, View / Menu / Steam and the d-pad. Each model ORs its own tail on top.
+fn deck_low_buttons(buttons: u32, lt: u8, rt: u8) -> u64 {
+    let on = |bit: u32| buttons & bit != 0;
+    [
+        (on(gs::BTN_A), btn::A),
+        (on(gs::BTN_B), btn::B),
+        (on(gs::BTN_X), btn::X),
+        (on(gs::BTN_Y), btn::Y),
+        (on(gs::BTN_LB), btn::LB),
+        (on(gs::BTN_RB), btn::RB),
+        (lt > 0, btn::LT_FULL),
+        (rt > 0, btn::RT_FULL),
+        (on(gs::BTN_BACK), btn::VIEW),
+        (on(gs::BTN_START), btn::MENU),
+        (on(gs::BTN_GUIDE), btn::STEAM),
+        (on(gs::BTN_DPAD_UP), btn::DPAD_UP),
+        (on(gs::BTN_DPAD_DOWN), btn::DPAD_DOWN),
+        (on(gs::BTN_DPAD_LEFT), btn::DPAD_LEFT),
+        (on(gs::BTN_DPAD_RIGHT), btn::DPAD_RIGHT),
+    ]
+    .into_iter()
+    .filter(|&(down, _)| down)
+    .fold(0, |b, (_, m)| b | m)
+}
+
 /// Classic Steam Controller mapping. Low 16 button bits match the Deck;
 /// the SC tail (`steam_do_input_event`):
 /// - `9.7`/`10.0` = the two grips (Deck L5/R5). Wire `BTN_PADDLE2`/`BTN_PADDLE1`
@@ -377,27 +429,12 @@ pub fn sc_from_gamepad(
         rpad_y: ry,
         ..SteamState::neutral()
     };
-    let mut b = 0u64;
+    let mut b = deck_low_buttons(buttons, lt, rt);
     let set = |b: &mut u64, on: bool, m: u64| {
         if on {
             *b |= m;
         }
     };
-    set(&mut b, on(gs::BTN_A), btn::A);
-    set(&mut b, on(gs::BTN_B), btn::B);
-    set(&mut b, on(gs::BTN_X), btn::X);
-    set(&mut b, on(gs::BTN_Y), btn::Y);
-    set(&mut b, on(gs::BTN_LB), btn::LB);
-    set(&mut b, on(gs::BTN_RB), btn::RB);
-    set(&mut b, lt > 0, btn::LT_FULL);
-    set(&mut b, rt > 0, btn::RT_FULL);
-    set(&mut b, on(gs::BTN_BACK), btn::VIEW);
-    set(&mut b, on(gs::BTN_START), btn::MENU);
-    set(&mut b, on(gs::BTN_GUIDE), btn::STEAM);
-    set(&mut b, on(gs::BTN_DPAD_UP), btn::DPAD_UP);
-    set(&mut b, on(gs::BTN_DPAD_DOWN), btn::DPAD_DOWN);
-    set(&mut b, on(gs::BTN_DPAD_LEFT), btn::DPAD_LEFT);
-    set(&mut b, on(gs::BTN_DPAD_RIGHT), btn::DPAD_RIGHT);
     // Grips at Deck L5/R5 (9.7 / 10.0): wire L4/R4 (PADDLE2/PADDLE1).
     set(&mut b, on(gs::BTN_PADDLE2), btn::L5);
     set(&mut b, on(gs::BTN_PADDLE1), btn::R5);
@@ -765,6 +802,37 @@ mod tests {
         serialize_deck_state(&mut r, &merged, 0);
         let serialized = u64::from_le_bytes(r[8..16].try_into().unwrap());
         assert_ne!(serialized & btn::LPAD_CLICK, 0);
+    }
+
+    /// The SC's low button bits are the Deck's: each shared wire button lands on the same bit
+    /// under both mappers.
+    #[test]
+    fn deck_and_sc_share_the_low_buttons() {
+        for wire in [
+            gs::BTN_A,
+            gs::BTN_B,
+            gs::BTN_X,
+            gs::BTN_Y,
+            gs::BTN_LB,
+            gs::BTN_RB,
+            gs::BTN_BACK,
+            gs::BTN_START,
+            gs::BTN_GUIDE,
+            gs::BTN_DPAD_UP,
+            gs::BTN_DPAD_DOWN,
+            gs::BTN_DPAD_LEFT,
+            gs::BTN_DPAD_RIGHT,
+        ] {
+            let deck = SteamState::from_gamepad(wire, 0, 0, 0, 0, 0, 0).buttons;
+            let sc = sc_from_gamepad(wire, 0, 0, 0, 0, 0, 0).buttons;
+            assert_eq!(deck, sc, "wire {wire:#x}");
+            assert_eq!(deck.count_ones(), 1, "wire {wire:#x}");
+        }
+        let pulled = |b: u64| b & (btn::LT_FULL | btn::RT_FULL);
+        assert_eq!(
+            pulled(SteamState::from_gamepad(0, 0, 0, 0, 0, 1, 255).buttons),
+            pulled(sc_from_gamepad(0, 0, 0, 0, 0, 1, 255).buttons)
+        );
     }
 
     /// SC frame vs `ID_CONTROLLER_STATE`: 24-bit buttons, u8 triggers,

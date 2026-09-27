@@ -223,7 +223,7 @@ pub struct SteamDeckGadget {
     threads: Vec<JoinHandle<()>>,
     wakers: Vec<Waker>,
     _fd: Arc<GadgetFd>,
-    seq: u32,
+    enc: super::steam_proto::DeckEncoder,
 }
 
 impl SteamDeckGadget {
@@ -315,14 +315,12 @@ impl SteamDeckGadget {
             threads: vec![control, stream],
             wakers: vec![ctrl_waker, stream_waker],
             _fd: fd,
-            seq: 0,
+            enc: Default::default(),
         })
     }
 
     pub fn write_state(&mut self, st: &super::steam_proto::SteamState) {
-        self.seq = self.seq.wrapping_add(1);
-        let mut r = [0u8; 64];
-        super::steam_proto::serialize_deck_state(&mut r, st, self.seq);
+        let r = self.enc.encode(st);
         if let Ok(mut g) = self.report.lock() {
             *g = r;
         }

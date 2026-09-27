@@ -650,21 +650,11 @@ impl TritonUsbip {
 
     /// Push one interrupt-IN report. Continuous state newest-wins; sparse reports queue.
     pub fn write_state(&mut self, st: &TritonState) {
-        let mut report = InputReport::default();
-        if st.raw_len > 0 {
-            let len = (st.raw_len as usize)
-                .min(st.raw.len())
-                .min(report.data.len());
-            report.data[..len].copy_from_slice(&st.raw[..len]);
-            report.len = len as u8;
-        } else {
-            self.seq = self.seq.wrapping_add(1);
-            let mut s = [0u8; TRITON_STATE_LEN];
-            serialize_triton_state(&mut s, st, self.seq);
-            report.data[..TRITON_STATE_LEN].copy_from_slice(&s);
-            report.len = TRITON_STATE_LEN as u8;
-        }
-        self.reports.lock().write(report);
+        let (data, len) = st.report(&mut self.seq);
+        self.reports.lock().write(InputReport {
+            data,
+            len: len as u8,
+        });
     }
 
     pub fn service(&mut self) -> TritonUsbFeedback {

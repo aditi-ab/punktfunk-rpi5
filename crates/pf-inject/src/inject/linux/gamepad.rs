@@ -8,36 +8,26 @@
 //! [`GamepadManager::pump_rumble`] must run every tick — a game's `EVIOCSFF` BLOCKS until
 //! we answer `UI_END_FF_UPLOAD`. Mixdown is `(low, high)` for the host to send back.
 //!
-//! Ioctl numbers and struct layouts match `<linux/uinput.h>` on x86_64 (see the `size_of`
-//! asserts). `/dev/uinput` needs the udev rule and `input` group
-//! (`scripts/60-punktfunk.rules`).
+//! The uinput ABI and device live in [`crate::uinput_abi`]; the FF upload protocol is this
+//! file's own.
 
 use crate::pad_slots::PadSlots;
-use anyhow::{bail, Result};
+use crate::uinput_abi::{
+    ioctl_ptr, AbsInfo, InputEventRaw, InputId, UinputDevice, EV_ABS, EV_KEY, EV_SYN, SYN_REPORT,
+    UI_SET_EVBIT, UI_SET_FFBIT, UI_SET_KEYBIT,
+};
+use anyhow::Result;
 use punktfunk_core::input::{gamepad, GamepadFrame, MAX_PADS};
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
-// ioctls (x86_64).
-const UI_DEV_CREATE: libc::c_ulong = 0x5501;
-const UI_DEV_DESTROY: libc::c_ulong = 0x5502;
-const UI_DEV_SETUP: libc::c_ulong = 0x405c_5503;
-const UI_ABS_SETUP: libc::c_ulong = 0x401c_5504;
-const UI_SET_EVBIT: libc::c_ulong = 0x4004_5564;
-const UI_SET_KEYBIT: libc::c_ulong = 0x4004_5565;
-const UI_SET_FFBIT: libc::c_ulong = 0x4004_556b;
 const UI_BEGIN_FF_UPLOAD: libc::c_ulong = 0xc068_55c8;
 const UI_END_FF_UPLOAD: libc::c_ulong = 0x4068_55c9;
 const UI_BEGIN_FF_ERASE: libc::c_ulong = 0xc00c_55ca;
 const UI_END_FF_ERASE: libc::c_ulong = 0x400c_55cb;
 
-const EV_SYN: u16 = 0x00;
-const EV_KEY: u16 = 0x01;
-const EV_ABS: u16 = 0x03;
 const EV_FF: u16 = 0x15;
 const EV_UINPUT: u16 = 0x0101;
-const SYN_REPORT: u16 = 0;
 const UI_FF_UPLOAD: u16 = 1;
 const UI_FF_ERASE: u16 = 2;
 const FF_RUMBLE: u16 = 0x50;
@@ -131,48 +121,6 @@ impl Default for PadIdentity {
     }
 }
 
-#[repr(C)]
-struct InputId {
-    bustype: u16,
-    vendor: u16,
-    product: u16,
-    version: u16,
-}
-
-#[repr(C)]
-struct UinputSetup {
-    id: InputId,
-    name: [u8; 80],
-    ff_effects_max: u32,
-}
-
-#[repr(C)]
-#[derive(Default, Clone, Copy)]
-struct AbsInfo {
-    value: i32,
-    minimum: i32,
-    maximum: i32,
-    fuzz: i32,
-    flat: i32,
-    resolution: i32,
-}
-
-#[repr(C)]
-struct UinputAbsSetup {
-    code: u16,
-    _pad: u16,
-    absinfo: AbsInfo,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct InputEventRaw {
-    time: libc::timeval,
-    type_: u16,
-    code: u16,
-    value: i32,
-}
-
 /// `struct ff_effect` (48 bytes; the union starts 8-aligned at offset 16).
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -206,37 +154,12 @@ struct UinputFfErase {
     effect_id: u32,
 }
 
-// x86_64 `<linux/uinput.h>` layouts.
+// `<linux/uinput.h>` FF layouts, the sizes the upload/erase ioctl numbers encode.
 const _: () = {
-    assert!(std::mem::size_of::<UinputSetup>() == 92);
-    assert!(std::mem::size_of::<UinputAbsSetup>() == 28);
-    assert!(std::mem::size_of::<InputEventRaw>() == 24);
     assert!(std::mem::size_of::<FfEffect>() == 48);
     assert!(std::mem::size_of::<UinputFfUpload>() == 104);
     assert!(std::mem::size_of::<UinputFfErase>() == 12);
 };
-
-fn ioctl_int(fd: i32, req: libc::c_ulong, arg: libc::c_int, what: &str) -> Result<()> {
-    // SAFETY: callers pass UI_SET_EVBIT/KEYBIT/FFBIT/UI_DEV_CREATE/UI_DEV_DESTROY — integer
-    // ioctls whose third arg the kernel takes BY VALUE, so nothing is dereferenced through
-    // `arg`. `fd` is the live `/dev/uinput` fd; a stale fd returns EBADF, not UB.
-    if unsafe { libc::ioctl(fd, req, arg) } < 0 {
-        bail!("{what}: {}", std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn ioctl_ptr<T>(fd: i32, req: libc::c_ulong, arg: *mut T, what: &str) -> Result<()> {
-    // SAFETY: `fd` is the caller's live `/dev/uinput` fd. Call sites pass `&mut x` for a
-    // uniquely-borrowed `#[repr(C)]` `T` whose size matches the request (`UI_DEV_SETUP`
-    // 0x405c_5503 → 0x5c=92; `UI_ABS_SETUP` → 0x1c=28; FF upload/erase → 0x68/0x0c — pinned
-    // by the `size_of` asserts). The kernel copies that many bytes; the `&mut` lives for
-    // the whole synchronous call.
-    if unsafe { libc::ioctl(fd, req, arg) } < 0 {
-        bail!("{what}: {}", std::io::Error::last_os_error());
-    }
-    Ok(())
-}
 
 /// Played-effect window: `replay.delay` of silence, then `replay.length` of rumble.
 #[derive(Clone, Copy)]
@@ -339,46 +262,20 @@ impl FfState {
 }
 
 pub struct VirtualPad {
-    fd: OwnedFd,
+    dev: UinputDevice,
     ff: FfState,
 }
 
 impl VirtualPad {
     pub fn create(index: usize, identity: PadIdentity) -> Result<VirtualPad> {
-        use std::os::fd::FromRawFd;
-        // SAFETY: `c"/dev/uinput"` is a 'static NUL-terminated C string; `as_ptr()` is a
-        // valid path the kernel only reads. `open` returns a fresh fd (or -1) and retains
-        // nothing; no Rust memory is handed over except that 'static path.
-        let raw = unsafe {
-            libc::open(
-                c"/dev/uinput".as_ptr(),
-                libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            )
-        };
-        if raw < 0 {
-            bail!(
-                "open /dev/uinput: {} (install the udev rule granting the 'input' group access \
-                 — see scripts/60-punktfunk.rules — and add the user to the 'input' group)",
-                std::io::Error::last_os_error()
-            );
-        }
-        // SAFETY: `raw >= 0` (the `< 0` branch already bailed). The fd is freshly opened
-        // and not stored elsewhere. `OwnedFd` becomes the unique owner and closes it once.
-        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-
-        ioctl_int(raw, UI_SET_EVBIT, EV_KEY as i32, "UI_SET_EVBIT(EV_KEY)")?;
-        ioctl_int(raw, UI_SET_EVBIT, EV_ABS as i32, "UI_SET_EVBIT(EV_ABS)")?;
-        ioctl_int(raw, UI_SET_EVBIT, EV_FF as i32, "UI_SET_EVBIT(EV_FF)")?;
-        for (_, key) in BUTTON_MAP {
-            ioctl_int(raw, UI_SET_KEYBIT, key as i32, "UI_SET_KEYBIT")?;
-        }
-        ioctl_int(
-            raw,
-            UI_SET_FFBIT,
-            FF_RUMBLE as i32,
-            "UI_SET_FFBIT(FF_RUMBLE)",
+        let dev = UinputDevice::open()?;
+        dev.set_bits(UI_SET_EVBIT, "UI_SET_EVBIT", &[EV_KEY, EV_ABS, EV_FF])?;
+        dev.set_bits(
+            UI_SET_KEYBIT,
+            "UI_SET_KEYBIT",
+            &BUTTON_MAP.map(|(_, key)| key),
         )?;
-        ioctl_int(raw, UI_SET_FFBIT, FF_GAIN as i32, "UI_SET_FFBIT(FF_GAIN)")?;
+        dev.set_bits(UI_SET_FFBIT, "UI_SET_FFBIT", &[FF_RUMBLE, FF_GAIN])?;
 
         let stick = AbsInfo {
             minimum: -32768,
@@ -407,28 +304,17 @@ impl VirtualPad {
             (ABS_HAT0X, hat),
             (ABS_HAT0Y, hat),
         ] {
-            let mut a = UinputAbsSetup {
-                code,
-                _pad: 0,
-                absinfo: info,
-            };
-            ioctl_ptr(raw, UI_ABS_SETUP, &mut a, "UI_ABS_SETUP")?;
+            dev.abs(code, info)?;
         }
 
-        let mut setup = UinputSetup {
-            id: InputId {
-                bustype: 0x0003, // BUS_USB
-                vendor: identity.vendor,
-                product: identity.product,
-                version: identity.version,
-            },
-            name: [0; 80],
-            ff_effects_max: 16, // must be > 0 or FF uploads are never delivered
+        let id = InputId {
+            bustype: 0x0003, // BUS_USB
+            vendor: identity.vendor,
+            product: identity.product,
+            version: identity.version,
         };
-        let name = identity.name;
-        setup.name[..name.len()].copy_from_slice(name);
-        ioctl_ptr(raw, UI_DEV_SETUP, &mut setup, "UI_DEV_SETUP")?;
-        ioctl_int(raw, UI_DEV_CREATE, 0, "UI_DEV_CREATE")?;
+        // `ff_effects_max` must be > 0 or FF uploads are never delivered.
+        dev.create(id, identity.name, 16)?;
         tracing::info!(
             index,
             pad = identity.log,
@@ -436,32 +322,9 @@ impl VirtualPad {
         );
 
         Ok(VirtualPad {
-            fd,
+            dev,
             ff: FfState::new(),
         })
-    }
-
-    fn emit(&self, type_: u16, code: u16, value: i32) {
-        let ev = InputEventRaw {
-            time: libc::timeval {
-                tv_sec: 0,
-                tv_usec: 0,
-            },
-            type_,
-            code,
-            value,
-        };
-        // Best-effort: a full kernel queue drops the event; the next frame re-syncs state.
-        // SAFETY: `self.fd` is the live uinput `OwnedFd` (borrowed via `as_raw_fd`).
-        // `write` READS `size_of::<InputEventRaw>()` initialized bytes from local `ev`
-        // (`#[repr(C)]` all-integer, no padding, size 24) and retains nothing past return.
-        let _ = unsafe {
-            libc::write(
-                self.fd.as_raw_fd(),
-                &ev as *const _ as *const libc::c_void,
-                std::mem::size_of::<InputEventRaw>(),
-            )
-        };
     }
 
     pub fn apply(&mut self, f: &GamepadFrame) {
@@ -469,28 +332,28 @@ impl VirtualPad {
         // edge would stick until that button toggles again. Kernel input drops an EV_KEY
         // that already matches device state (BTN_* does not autorepeat).
         for (bit, key) in BUTTON_MAP {
-            self.emit(EV_KEY, key, ((f.buttons & bit) != 0) as i32);
+            self.dev.emit(EV_KEY, key, ((f.buttons & bit) != 0) as i32);
         }
 
         // Moonlight: +Y = up; evdev: +Y = down → negate (i32 math avoids -(-32768) overflow).
-        self.emit(EV_ABS, ABS_X, f.ls_x as i32);
-        self.emit(EV_ABS, ABS_Y, -(f.ls_y as i32));
-        self.emit(EV_ABS, ABS_RX, f.rs_x as i32);
-        self.emit(EV_ABS, ABS_RY, -(f.rs_y as i32));
-        self.emit(EV_ABS, ABS_Z, f.left_trigger as i32);
-        self.emit(EV_ABS, ABS_RZ, f.right_trigger as i32);
+        self.dev.emit(EV_ABS, ABS_X, f.ls_x as i32);
+        self.dev.emit(EV_ABS, ABS_Y, -(f.ls_y as i32));
+        self.dev.emit(EV_ABS, ABS_RX, f.rs_x as i32);
+        self.dev.emit(EV_ABS, ABS_RY, -(f.rs_y as i32));
+        self.dev.emit(EV_ABS, ABS_Z, f.left_trigger as i32);
+        self.dev.emit(EV_ABS, ABS_RZ, f.right_trigger as i32);
         let hat_x = ((f.buttons & gamepad::BTN_DPAD_RIGHT != 0) as i32)
             - ((f.buttons & gamepad::BTN_DPAD_LEFT != 0) as i32);
         let hat_y = ((f.buttons & gamepad::BTN_DPAD_DOWN != 0) as i32)
             - ((f.buttons & gamepad::BTN_DPAD_UP != 0) as i32);
-        self.emit(EV_ABS, ABS_HAT0X, hat_x);
-        self.emit(EV_ABS, ABS_HAT0Y, hat_y);
-        self.emit(EV_SYN, SYN_REPORT, 0);
+        self.dev.emit(EV_ABS, ABS_HAT0X, hat_x);
+        self.dev.emit(EV_ABS, ABS_HAT0Y, hat_y);
+        self.dev.emit(EV_SYN, SYN_REPORT, 0);
     }
 
     /// Non-blocking FF protocol on this pad's fd. `Some` when mixed `(low, high)` changed.
     fn pump_ff(&mut self) -> Option<(u16, u16)> {
-        let raw = self.fd.as_raw_fd();
+        let raw = self.dev.raw_fd();
         let mut buf = [0u8; std::mem::size_of::<InputEventRaw>()];
         loop {
             // SAFETY: `raw` is the live non-blocking uinput fd. `buf` is a local
@@ -567,14 +430,6 @@ impl VirtualPad {
 
         self.ff
             .mix(Instant::now(), crate::uhid_manager::rumble_idle_timeout())
-    }
-}
-
-impl Drop for VirtualPad {
-    fn drop(&mut self) {
-        // SAFETY: `self.fd` is still live here (`OwnedFd` closes only after this `drop`
-        // returns). UI_DEV_DESTROY takes 0 BY VALUE, so nothing is dereferenced.
-        let _ = unsafe { libc::ioctl(self.fd.as_raw_fd(), UI_DEV_DESTROY, 0) };
     }
 }
 
@@ -662,6 +517,7 @@ impl GamepadManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd;
     use std::time::Duration;
 
     /// Every key the generic pad emits is the row `gamepad-button-vectors.json` gives its

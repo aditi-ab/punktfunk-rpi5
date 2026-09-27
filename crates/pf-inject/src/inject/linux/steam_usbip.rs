@@ -435,7 +435,7 @@ pub struct SteamDeckUsbip {
     report: Arc<Mutex<[u8; 64]>>,
     feedback: Arc<Mutex<SteamFeedback>>,
     _attach: UsbipAttachment,
-    seq: u32,
+    enc: super::steam_proto::DeckEncoder,
 }
 
 impl SteamDeckUsbip {
@@ -451,14 +451,12 @@ impl SteamDeckUsbip {
             report,
             feedback,
             _attach: attach,
-            seq: 0,
+            enc: Default::default(),
         })
     }
 
     pub fn write_state(&mut self, st: &SteamState) {
-        self.seq = self.seq.wrapping_add(1);
-        let mut r = [0u8; 64];
-        super::steam_proto::serialize_deck_state(&mut r, st, self.seq);
+        let r = self.enc.encode(st);
         if let Ok(mut g) = self.report.lock() {
             *g = r;
         }

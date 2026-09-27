@@ -15,7 +15,7 @@ DualSense a near-native feel with **no external gamepad dependencies** (no ViGEm
 Shipping: the driver is one member of the in-tree driver workspace
 ([`packaging/windows/drivers/`](../../README.md)), built from source in CI, and bundled +
 `pnputil`-installed by the Windows host [installer](../../README.md). The host feeds it over a shared
-memory channel from `crates/pf-inject/src/inject/windows/dualsense_windows.rs`. The same UMDF driver also
+memory channel from `crates/pf-inject/src/inject/windows/pad_shm.rs`. The same UMDF driver also
 serves the **DualShock 4** identity per a `device_type` byte the host stamps.
 
 This README captures the driver-authoring lore — the bugs and the signing recipe that make a

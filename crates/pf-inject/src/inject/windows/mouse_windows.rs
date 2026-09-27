@@ -11,8 +11,9 @@
 //! `Global\pfmouse-boot-<index>` ([`mouse_index_for_slot`] — one host per seat, one index each).
 //! [`ensure_resident`] never drops the devnode; it dies with the host service.
 
-use super::dualsense_windows::{create_swdevice, SwDeviceProfile};
-use super::gamepad_raii::{DriverAttach, PadChannel, ProofTransport};
+use super::gamepad_raii::{
+    create_swdevice, DriverAttach, PadChannel, ProofTransport, SwDevice, SwDeviceProfile,
+};
 use anyhow::Result;
 use pf_driver_proto::mouse::{input_report, mouse_boot_name, MouseShm, MOUSE_MAGIC};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -50,7 +51,7 @@ fn mouse_index_for_slot(raw: Option<&std::ffi::OsStr>) -> u8 {
 /// Process-lifetime `pf_mouse_<index>` plus sealed `MouseShm`. Dropping it removes the pointer.
 pub struct VirtualMouse {
     /// `None` if `SwDeviceCreate` failed; injection then uses an out-of-band devnode.
-    _sw: Option<super::gamepad_raii::SwDevice>,
+    _sw: Option<SwDevice>,
     channel: PadChannel,
     attach: DriverAttach,
     seq: u32,
@@ -71,18 +72,18 @@ impl VirtualMouse {
             std::ptr::write_unaligned(base as *mut u32, MOUSE_MAGIC);
         }
         let instance = format!("pf_mouse_{index}");
-        let (hsw, instance_id) = match create_swdevice(&SwDeviceProfile {
+        let (sw, instance_id) = match create_swdevice(&SwDeviceProfile {
             instance: &instance,
             container_tag: 0x5046_4D4F, // "PFMO" — never grouped with a pad's container
             container_index: index,
             hwid: "pf_mouse",
             // Virtual identity (PF:MO). USB tokens are inert for a mouse; shared profile = one path.
-            usb_vid_pid: "VID_5046&PID_4D4F",
+            usb_vid_pid: Some("VID_5046&PID_4D4F"),
             usb_mi: None,
             description: "Punktfunk Virtual Mouse",
             enumerator: "punktfunk",
         }) {
-            Ok((h, i)) => (Some(h), i),
+            Ok((sw, id)) => (Some(sw), id),
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "SwDeviceCreate failed; falling back to an out-of-band pf_mouse devnode");
                 (None, None)
@@ -94,10 +95,9 @@ impl VirtualMouse {
             instance_id.clone(),
             ProofTransport::HidSerialString,
         );
-        let _sw = hsw.map(super::gamepad_raii::SwDevice::new);
         channel.deliver_eager(Duration::from_millis(1500));
         Ok(VirtualMouse {
-            _sw,
+            _sw: sw,
             channel,
             attach: DriverAttach::new(
                 "pf_mouse",
@@ -362,17 +362,16 @@ pub fn channel_proof_probe() -> Result<()> {
     const PROBE_INDEX: u8 = 9;
 
     println!("creating a throwaway pf_mouse devnode (pad index {PROBE_INDEX})…");
-    let (hsw, instance_id) = create_swdevice(&SwDeviceProfile {
+    let (_sw, instance_id) = create_swdevice(&SwDeviceProfile {
         instance: "pf_mouse_probe",
         container_tag: 0x5046_4D4F, // "PFMO"
         container_index: PROBE_INDEX,
         hwid: "pf_mouse",
-        usb_vid_pid: "VID_5046&PID_4D4F",
+        usb_vid_pid: Some("VID_5046&PID_4D4F"),
         usb_mi: None,
         description: "Punktfunk Virtual Mouse (channel-proof probe)",
         enumerator: "punktfunk",
     })?;
-    let _sw = super::gamepad_raii::SwDevice::new(hsw);
     let Some(instance_id) = instance_id else {
         anyhow::bail!("SwDeviceCreate reported no instance id to look the devnode up by");
     };

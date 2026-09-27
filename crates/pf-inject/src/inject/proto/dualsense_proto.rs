@@ -9,8 +9,10 @@
 //! firmware 64). A USB backend rejects a longer reply as a malicious URB and drops the device.
 //! Tests pin sizes, field offsets, paddle bits, and valid-flag gating.
 
-use punktfunk_core::input::gamepad as gs;
+use crate::sensor_clock::SensorClock;
+use punktfunk_core::input::{gamepad as gs, GamepadFrame};
 use punktfunk_core::quic::{HidOutput, RichInput};
+use std::time::Instant;
 
 // GET_REPORT during init (`0x05` calibration, `0x09` pairing, `0x20` firmware). Without these
 // hid-playstation never finishes calibration and creates no input devices. The bytes live in
@@ -135,14 +137,14 @@ impl DsState {
     }
 
     /// Zero gyro only (gravity on accel is persistent). Returns whether it changed —
-    /// `PadProto::neutralize_gyro` idle-motion watchdog.
+    /// `PadState::neutralize_gyro` idle-motion watchdog.
     pub fn neutralize_gyro(&mut self) -> bool {
         let changed = self.gyro != [0; 3];
         self.gyro = [0; 3];
         changed
     }
 
-    /// Reset touch, pad-click, and motion; leave buttons/sticks/triggers. `PadProto::clear_rich`:
+    /// Reset touch, pad-click, and motion; leave buttons/sticks/triggers. `PadState::clear_rich`:
     /// a pad that takes this slot during replug grace must not inherit the last one's contacts.
     pub fn clear_rich(&mut self) {
         let fresh = DsState::neutral();
@@ -235,6 +237,26 @@ impl DsState {
             s.buttons[2] |= btn2::MUTE;
         }
         s
+    }
+
+    /// Fold a button/stick frame over `prev`. Touch, motion and pad clicks arrive on the rich
+    /// plane and survive it. `buttons` is the frame's, after any paddle fold.
+    pub fn merge_frame(prev: &DsState, f: &GamepadFrame, buttons: u32) -> DsState {
+        DsState {
+            touch: prev.touch,
+            gyro: prev.gyro,
+            accel: prev.accel,
+            touch_click: prev.touch_click,
+            ..DsState::from_gamepad(
+                buttons,
+                f.ls_x,
+                f.ls_y,
+                f.rs_x,
+                f.rs_y,
+                f.left_trigger,
+                f.right_trigger,
+            )
+        }
     }
 
     pub fn set_dpad(&mut self, up: bool, down: bool, left: bool, right: bool) {
@@ -349,8 +371,8 @@ pub fn serialize_state(r: &mut [u8; DS_INPUT_REPORT_LEN], st: &DsState, seq: u8,
         r[22 + i * 2..24 + i * 2].copy_from_slice(&v.to_le_bytes()); // accel at struct off 21
     }
     r[28..32].copy_from_slice(&ts.to_le_bytes()); // sensor_timestamp (struct off 27)
-    pack_touch(&mut r[33..37], &st.touch[0]); // touch point 1 (struct off 32)
-    pack_touch(&mut r[37..41], &st.touch[1]); // touch point 2
+    pack_touch(&mut r[33..37], &st.touch[0], DS_TOUCH_W, DS_TOUCH_H); // point 1, struct off 32
+    pack_touch(&mut r[37..41], &st.touch[1], DS_TOUCH_W, DS_TOUCH_H);
 
     // IMU temperature: a real pad reads 0x0b–0x14 indoors.
     r[32] = 0x14;
@@ -358,6 +380,40 @@ pub fn serialize_state(r: &mut [u8; DS_INPUT_REPORT_LEN], st: &DsState, seq: u8,
     // warns), and the plug byte says USB data + power with no headset in the jack.
     r[53] = 0x2A;
     r[54] = 0x18;
+}
+
+/// Report-`0x01` encoder a DualSense keeps across writes: its sequence byte, sensor clock and
+/// the adaptive-trigger status the game armed. Each transport holds one and only moves bytes.
+pub struct DsEncoder {
+    seq: u8,
+    clock: SensorClock,
+    triggers: DsTriggers,
+}
+
+impl Default for DsEncoder {
+    fn default() -> DsEncoder {
+        DsEncoder {
+            seq: 0,
+            clock: SensorClock::dualsense(),
+            triggers: DsTriggers::default(),
+        }
+    }
+}
+
+impl DsEncoder {
+    /// The next report `0x01` for `st`.
+    pub fn encode(&mut self, st: &DsState) -> [u8; DS_INPUT_REPORT_LEN] {
+        self.seq = self.seq.wrapping_add(1);
+        let mut r = [0u8; DS_INPUT_REPORT_LEN];
+        serialize_state(&mut r, st, self.seq, self.clock.ds_ticks(Instant::now()));
+        self.triggers.stamp(&mut r, st.l2, st.r2);
+        r
+    }
+
+    /// Latch the trigger effects one feedback pass carried; later reports report against them.
+    pub fn observe(&mut self, hidout: &[HidOutput]) {
+        self.triggers.observe(hidout);
+    }
 }
 
 /// Adaptive-trigger status the game reads back: report `0x01` struct offsets 41 (R2) and 42
@@ -468,11 +524,12 @@ impl TriggerFb {
     }
 }
 
-fn pack_touch(dst: &mut [u8], t: &Touch) {
-    // byte0: bit7 = NOT active (1 = no contact), bits0-6 = contact id.
+/// One contact as the Sony 4-byte touch point, shared by DualSense and DualShock 4: byte0
+/// bit7 = NOT active, bits0-6 = id; then 12-bit X and Y. `w`/`h` are the pad's extents.
+pub(crate) fn pack_touch(dst: &mut [u8], t: &Touch, w: u16, h: u16) {
     dst[0] = (t.id & 0x7F) | if t.active { 0 } else { 0x80 };
     // The kernel advertises ABS_MT ranges 0..=W-1 / 0..=H-1 — never emit the size itself.
-    let (x, y) = (t.x.min(DS_TOUCH_W - 1), t.y.min(DS_TOUCH_H - 1));
+    let (x, y) = (t.x.min(w - 1), t.y.min(h - 1));
     dst[1] = (x & 0xFF) as u8;
     dst[2] = (((x >> 8) & 0x0F) as u8) | (((y & 0x0F) as u8) << 4);
     dst[3] = ((y >> 4) & 0xFF) as u8;
@@ -616,6 +673,25 @@ pub fn parse_ds_output(pad: u8, data: &[u8], fb: &mut DsFeedback) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each report carries the next sequence byte and the armed trigger's status.
+    #[test]
+    fn encoder_advances_the_seq_and_stamps_the_trigger_status() {
+        let mut enc = DsEncoder::default();
+        let st = DsState::neutral();
+        assert_eq!(enc.encode(&st)[7], 1);
+        enc.observe(&[HidOutput::Trigger {
+            pad: 0,
+            which: 1,
+            effect: vec![0x25, 0x04, 0x01], // Weapon, zones 2..8
+        }]);
+        let r = enc.encode(&st);
+        assert_eq!(r[7], 2);
+        assert_eq!(
+            r[42], 0x08,
+            "R2 at rest reports the armed Weapon's stop zone"
+        );
+    }
 
     /// Feature blobs match hid-playstation request sizes: calibration 41, pairing 20, firmware 64.
     /// A USB backend rejects a longer reply as a malicious URB and tears down the device.

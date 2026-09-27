@@ -24,7 +24,6 @@ pub use keymap::KEY_FLAG_SEMANTIC_VK;
 pub use keymap::vk_to_evdev;
 
 /// Dedup for HID-output reports (0xCD), shared by [`uhid_manager`].
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/hidout_dedup.rs"]
 pub mod hidout_dedup;
 
@@ -705,7 +704,6 @@ pub mod dualsense;
 pub mod dualsense_edge_windows;
 /// DualSense HID contract, shared by Linux UHID ([`dualsense`]) and Windows UMDF
 /// ([`dualsense_windows`]).
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/proto/dualsense_proto.rs"]
 pub mod dualsense_proto;
 /// Virtual DualSense over USB/IP (`vhci_hcd`) with its own USB Audio Class card — real USB
@@ -723,7 +721,6 @@ pub mod dualsense_windows;
 pub mod dualshock4;
 /// DualShock 4 HID codec, shared by Linux UHID ([`dualshock4`]) and Windows UMDF
 /// ([`dualshock4_windows`]).
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/proto/dualshock4_proto.rs"]
 pub mod dualshock4_proto;
 /// Virtual DualShock 4 via UMDF + shm (device-type 1).
@@ -767,6 +764,15 @@ pub mod pad_gate;
 /// nowhere.
 #[path = "inject/pad_pool.rs"]
 pub mod pad_pool;
+/// One sealed-channel UMDF pad ([`pad_shm::ShmPad`]): section, devnode and attach watcher, shared
+/// by every Windows HID pad identity.
+#[cfg(target_os = "windows")]
+#[path = "inject/windows/pad_shm.rs"]
+mod pad_shm;
+/// Host half of a Windows pad's `PadShm` section: stamp order, input seqlock, output-ring
+/// reader. Raw pointers and atomics only, so its tests run on every OS.
+#[path = "inject/pad_shm_ring.rs"]
+mod pad_shm_ring;
 /// Virtual-pad slot table + create lifecycle ([`pad_slots::PadSlots`]): `Vec<Option<Pad>>`,
 /// `active_mask` unplug sweep, gate-checked create.
 ///
@@ -786,7 +792,6 @@ pub mod seat_dev;
 /// `sensor_timestamp` every virtual Sony pad stamps into its input reports
 /// ([`sensor_clock::SensorClock`]) — elapsed time in DualSense 1/3 µs and DualShock 4
 /// 5.33 µs units, shared by all four backends.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/sensor_clock.rs"]
 pub mod sensor_clock;
 /// Virtual Steam Deck via UHID — kernel `hid-steam` binds it as a real Deck.
@@ -811,13 +816,11 @@ pub mod steam_gadget;
 /// Steam Controller / Steam Deck HID contract (descriptor, byte-exact Deck serializer,
 /// XInput/rich mappers, rumble parser). Linux UHID ([`steam_controller`]) and Windows UMDF
 /// ([`steam_deck_windows`]).
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/proto/steam_proto.rs"]
 pub mod steam_proto;
 /// Fallback remap of Steam-only inputs onto a non-Steam backend, plus Deck motion rescale.
 /// Shared by DualSense/DS4 (slot-less pads that must fold Steam back grips). Deck rescale
-/// is Linux-only but harmless to compile on Windows.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+/// is Linux-only but builds everywhere, so its tests run on any host.
 #[path = "inject/proto/steam_remap.rs"]
 pub mod steam_remap;
 /// Virtual Steam Deck over USB/IP (`vhci_hcd`). Steam-Input-promotable on non-SteamOS hosts
@@ -860,17 +863,20 @@ pub mod triton_usbip;
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/triton_windows.rs"]
 pub mod triton_windows;
-/// `/dev/uhid` event ABI shared by every UHID gamepad backend — constants each used to
-/// transcribe, plus field accessors that read a payload's real length.
+/// `/dev/uhid` event ABI and [`uhid_abi::UhidDevice`], the one device every UHID gamepad
+/// backend drives.
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/uhid_abi.rs"]
 pub mod uhid_abi;
-/// Stateful virtual-pad manager ([`uhid_manager::UhidManager`]) — event routing, frame
-/// merge, heartbeat, and feedback pump shared by the five UHID/UMDF backends; each supplies
-/// only its protocol via [`uhid_manager::PadProto`].
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+/// Virtual-pad manager ([`uhid_manager::UhidManager`]) — event routing, frame merge,
+/// heartbeat, and feedback pump shared by every UHID and UMDF pad, XUSB included; each
+/// supplies only its protocol via [`uhid_manager::PadProto`].
 #[path = "inject/uhid_manager.rs"]
 pub mod uhid_manager;
+/// `/dev/uinput` ABI and device shared by the uinput pad and pen.
+#[cfg(target_os = "linux")]
+#[path = "inject/linux/uinput_abi.rs"]
+mod uinput_abi;
 /// Byte-level tracing of the USB/IP socket (`PUNKTFUNK_USBIP_TRACE`). A framing bug in that
 /// stream is only visible as damage the kernel notices later, so the wire itself has to be
 /// recoverable.
