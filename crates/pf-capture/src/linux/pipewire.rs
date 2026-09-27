@@ -5,7 +5,7 @@ use super::pw_pods::{
     build_cursor_meta_param, build_default_format_obj, build_dmabuf_buffers, build_dmabuf_format,
     build_hdr_dmabuf_format, build_header_meta_param, build_mappable_buffers,
     build_shm_only_buffers, build_sync_timeline_meta_param, offer_framerate_denom, serialize_pod,
-    Pacing, HDR_FORMAT_ORDER,
+    video_raw, Extent, Pacing, HDR_FORMAT_ORDER,
 };
 use super::sync_timeline::{hand_back, plane_count, SyncDevice, SyncPoints};
 use super::{CapturedFrame, DmabufFrame, FramePayload, PixelFormat, ZeroCopyPolicy};
@@ -2392,37 +2392,14 @@ pub fn pipewire_thread(
             fh,
             "pipewire: offering a fixed BGRx format pod (PUNKTFUNK_PW_FIXED_POD)"
         );
-        pw::spa::pod::object!(
-            pw::spa::utils::SpaTypes::ObjectParamFormat,
-            pw::spa::param::ParamType::EnumFormat,
-            pw::spa::pod::property!(
-                pw::spa::param::format::FormatProperties::MediaType,
-                Id,
-                pw::spa::param::format::MediaType::Video
-            ),
-            pw::spa::pod::property!(
-                pw::spa::param::format::FormatProperties::MediaSubtype,
-                Id,
-                pw::spa::param::format::MediaSubtype::Raw
-            ),
+        video_raw(
             pw::spa::pod::property!(
                 pw::spa::param::format::FormatProperties::VideoFormat,
                 Id,
                 VideoFormat::BGRx
             ),
-            pw::spa::pod::property!(
-                pw::spa::param::format::FormatProperties::VideoSize,
-                Rectangle,
-                pw::spa::utils::Rectangle {
-                    width: fw,
-                    height: fh
-                }
-            ),
-            pw::spa::pod::property!(
-                pw::spa::param::format::FormatProperties::VideoFramerate,
-                Fraction,
-                pw::spa::utils::Fraction { num: 0, denom: 1 }
-            ),
+            Extent::Fixed(fw, fh),
+            Pacing::Producer,
         )
     } else {
         build_default_format_obj(preferred, Pacing::Producer)
