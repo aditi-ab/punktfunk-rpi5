@@ -338,18 +338,29 @@ public final class GamepadCapture {
         let pad = slots.first?.pad ?? 0
         wire.send(.gamepadButton(bit, down: true, pad: pad))
         let timer = Timer(timeInterval: Self.tapPress, repeats: false) { [weak self] _ in
-            Task { @MainActor in self?.wire?.send(.gamepadButton(bit, down: false, pad: pad)) }
+            MainActor.assumeIsolated {
+                self?.wire?.send(.gamepadButton(bit, down: false, pad: pad))
+            }
         }
         RunLoop.main.add(timer, forMode: .common)
     }
 
     /// Bring `slots` in line with the forwarded set: close any slot no longer wanted (flushing its
     /// held wire state and sending GamepadRemove first) and open any newly-forwarded controller into
-    /// its assigned wire index. A controller that stays forwarded keeps its slot untouched, so a
-    /// second pad connecting never disturbs the first. Mirrors pf-client-core's `reconcile_slots`.
+    /// its assigned wire index. A controller that stays forwarded on its index keeps its slot
+    /// untouched, so a second pad connecting never disturbs the first. Mirrors pf-client-core's
+    /// `reconcile_slots`.
+    ///
+    /// A slot whose index moved is closed and opened on the new one. Another window's session
+    /// start renumbers the pads, and the host's rumble and HID output are routed by index.
     private func reconcile(_ forwarded: [GamepadManager.DiscoveredController]) {
-        let wantIDs = Set(forwarded.map { ObjectIdentifier($0.controller) })
-        for slot in slots where !wantIDs.contains(ObjectIdentifier(slot.controller)) {
+        var wanted: [ObjectIdentifier: UInt32] = [:]
+        for dc in forwarded {
+            if let pad = manager.padIndex(for: dc) {
+                wanted[ObjectIdentifier(dc.controller)] = UInt32(pad)
+            }
+        }
+        for slot in slots where wanted[ObjectIdentifier(slot.controller)] != slot.pad {
             closeSlot(slot)
         }
         for dc in forwarded where !slots.contains(where: { $0.controller === dc.controller }) {
@@ -680,7 +691,7 @@ public final class GamepadCapture {
             if slot.tapReleaseOwed { finishTap(slot) }
             slot.selectPending = true
             let timer = Timer(timeInterval: Self.guideHold, repeats: false) { [weak self, weak slot] _ in
-                Task { @MainActor in
+                MainActor.assumeIsolated {
                     if let self, let slot { self.gestureHoldFired(slot) }
                 }
             }
@@ -716,7 +727,7 @@ public final class GamepadCapture {
         wire?.send(.gamepadButton(GamepadWire.back, down: true, pad: slot.pad))
         slot.tapReleaseOwed = true
         let timer = Timer(timeInterval: Self.tapPress, repeats: false) { [weak self, weak slot] _ in
-            Task { @MainActor in
+            MainActor.assumeIsolated {
                 if let self, let slot { self.finishTap(slot) }
             }
         }
@@ -918,7 +929,7 @@ public final class GamepadCapture {
         let held = slots.contains { $0.buttons & Self.escapeChord == Self.escapeChord }
         if held, chordTimer == nil {
             let timer = Timer(timeInterval: Self.disconnectHold, repeats: false) { [weak self] _ in
-                Task { @MainActor in self?.onDisconnectRequest?() }
+                MainActor.assumeIsolated { self?.onDisconnectRequest?() }
             }
             RunLoop.main.add(timer, forMode: .common)
             chordTimer = timer

@@ -1,6 +1,7 @@
 // Unit tests for the Annex-B ⇄ AVCC plumbing (pure byte-level; no codec involved —
 // VideoToolboxRoundTripTests covers the real-bitstream path).
 
+import CoreMedia
 import XCTest
 @testable import PunktfunkKit
 
@@ -75,5 +76,61 @@ final class AnnexBTests: XCTestCase {
         let idr = nal(type: 19, payload: [0xDD])
         let au = Data(start4) + idr
         XCTAssertNil(AnnexB.formatDescription(fromIDR: au, codec: .hevc))
+    }
+
+    /// `enter` stops the walk at a NAL's start code: everything before it has been handed to
+    /// `body`, and nothing of it or after it is.
+    func testEnterStopsTheWalkBeforeANalsPayload() {
+        let vps = nal(type: 32, payload: [0xAA])
+        let sps = nal(type: 33, payload: [0xBB])
+        let idr = nal(type: 19, payload: [0xDD, 0xDE])
+        let late = nal(type: 34, payload: [0xCC])
+        var au = Data()
+        for n in [vps, sps, idr, late] {
+            au.append(contentsOf: start4)
+            au.append(n)
+        }
+        var seen: [UInt8] = []
+        AnnexB.forEachNAL(in: au, enter: { ($0 >> 1) & 0x3F != 19 }) { base, range in
+            seen.append((base[range.lowerBound] >> 1) & 0x3F)
+            return true
+        }
+        XCTAssertEqual(seen, [32, 33])
+    }
+
+    /// The pack copies from the ranges the one scan found: parameter sets dropped, every
+    /// payload NAL kept, in order.
+    func testSampleBufferPacksEveryPayloadNal() throws {
+        let format = try XCTUnwrap(Self.anyFormat())
+        let sps = nal(type: 33, payload: [0xBB])
+        let first = nal(type: 1, payload: [0x10, 0x11, 0x12])
+        let second = nal(type: 1, payload: [0x20, 0x21])
+        var au = Data()
+        for n in [sps, first, second] {
+            au.append(contentsOf: start4)
+            au.append(n)
+        }
+        let sample = try XCTUnwrap(AnnexB.sampleBuffer(
+            au: AccessUnit(data: au, ptsNs: 0, frameIndex: 0, flags: 0, receivedNs: 0),
+            format: format, codec: .hevc))
+        let block = try XCTUnwrap(CMSampleBufferGetDataBuffer(sample))
+        var packed = Data(count: CMBlockBufferGetDataLength(block))
+        let status = packed.withUnsafeMutableBytes {
+            CMBlockBufferCopyDataBytes(
+                block, atOffset: 0, dataLength: $0.count, destination: $0.baseAddress!)
+        }
+        XCTAssertEqual(status, noErr)
+        var expected = Data([0, 0, 0, UInt8(first.count)]) + first
+        expected.append(Data([0, 0, 0, UInt8(second.count)]) + second)
+        XCTAssertEqual(packed, expected)
+    }
+
+    /// Any video format description: the pack only carries it along.
+    private static func anyFormat() -> CMVideoFormatDescription? {
+        var format: CMVideoFormatDescription?
+        CMVideoFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault, codecType: kCMVideoCodecType_HEVC, width: 16,
+            height: 16, extensions: nil, formatDescriptionOut: &format)
+        return format
     }
 }

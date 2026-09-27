@@ -122,6 +122,8 @@ struct LibraryView: View {
 
     @State private var games: [GameEntry] = []
     @State private var loading = false
+    /// Bumped by Reload and Retry: the load runs in the view's task, which leaving cancels.
+    @State private var reloadToken = 0
     /// Held back a moment, so a cache that answers at once never flashes a spinner.
     @State private var spinnerDue = false
     /// The catalogs this run has shown, by host: a shelf the filter switches back to opens on its
@@ -211,7 +213,7 @@ struct LibraryView: View {
                 guard games.isEmpty else { return }
                 if let seen = Self.shown[host.id.uuidString] { games = seen } else { loading = true }
             }
-            .task {
+            .task(id: reloadToken) {
                 if keptForDetail { keptForDetail = false } else { await load() }
             }
             .task(id: loading) {
@@ -527,11 +529,12 @@ struct LibraryView: View {
     /// Played titles, newest first, at most twelve: the shared Recent order, cut at the first
     /// title never played.
     private var recentTitles: [GameEntry] {
-        let titles = shelfGames.filter { !$0.isLauncher }
+        // Filtered first: the sort then runs over the played titles, not the shelf.
+        let titles = shelfGames.filter {
+            !$0.isLauncher && ($0.stats?.lastPlayedUnixMs ?? 0) > 0
+        }
         let order = LibraryCollation.collate(titles, sort: .recent, groupBy: nil).first?.indices ?? []
-        return Array(order.map { titles[$0] }
-            .filter { ($0.stats?.lastPlayedUnixMs ?? 0) > 0 }
-            .prefix(12))
+        return Array(order.map { titles[$0] }.prefix(12))
     }
 
     private var favoriteIDs: [String] {
@@ -544,10 +547,11 @@ struct LibraryView: View {
     /// Favorited titles, in the shelf's current sort.
     private var favoriteTitles: [GameEntry] {
         let marked = Set(favoriteIDs)
-        let titles = shelfGames
+        guard !marked.isEmpty else { return [] }
+        // Filtered first: the sort then runs over the favorites, not the shelf.
+        let titles = shelfGames.filter { marked.contains($0.id) }
         return LibraryCollation.collate(titles, sort: LibrarySortKey(stored: sortRaw), groupBy: nil)
             .flatMap(\.indices).map { titles[$0] }
-            .filter { marked.contains($0.id) }
     }
 
     private var customizeButton: some View {
@@ -763,7 +767,7 @@ struct LibraryView: View {
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: 420)
-            Button("Retry") { Task { await load() } }
+            Button("Retry") { reloadToken += 1 }
                 .glassProminentButtonStyle()
         }
         .padding()
@@ -782,7 +786,7 @@ struct LibraryView: View {
     }
 
     private var reloadButton: some View {
-        Button { Task { await load() } } label: {
+        Button { reloadToken += 1 } label: {
             Label("Reload", systemImage: "arrow.clockwise")
         }
         .disabled(loading)
@@ -939,6 +943,8 @@ struct LibraryView: View {
                 try? await Task.sleep(nanoseconds: 5 * NSEC_PER_SEC)
             }
         }
+        // Left mid-load: the next appearance loads again, so ask the host nothing more.
+        if Task.isCancelled { return }
 
         // What's up on the host right now — never fatal, and deliberately after the catalog so a
         // slow `/status` can't hold the titles back.

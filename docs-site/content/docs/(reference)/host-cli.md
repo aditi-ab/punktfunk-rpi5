@@ -45,7 +45,7 @@ punktfunk-host serve
 | `--native-port <PORT>` | `PUNKTFUNK_NATIVE_PORT` | Native QUIC port (default `9777`). |
 | `--mgmt-bind <IP:PORT>` | `PUNKTFUNK_MGMT_BIND` | Management API address (default `0.0.0.0:47990`). `127.0.0.1:47990` keeps it off the LAN, and paired clients can't browse your library. |
 | `--data-port <PORT>` | `PUNKTFUNK_DATA_PORT` | Pin the video data plane to one UDP port, to open or forward. Default: a fresh port per session. |
-| `--webtransport` | `PUNKTFUNK_WEBTRANSPORT=1` | Also accept the [browser client](/docs/running-as-a-service#the-browser-client-preview) (preview). |
+| `--webtransport` | `PUNKTFUNK_WEBTRANSPORT=1` | Also accept the [browser client](/docs/browser-client) (preview). |
 | `--webtransport-port <PORT>` | `PUNKTFUNK_WEBTRANSPORT_PORT` | Its UDP port (default `9778`). |
 | `--webtransport-bind <IP>` | `PUNKTFUNK_WEBTRANSPORT_BIND` | Its interface (default: all). |
 | `--open` | — | Serve unpaired devices. Trusted single-user setups only. With the browser client on, it also needs `PUNKTFUNK_WEBTRANSPORT_ORIGINS`, or the host refuses to start. |

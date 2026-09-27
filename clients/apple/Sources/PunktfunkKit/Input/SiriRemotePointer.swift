@@ -292,7 +292,7 @@ public final class SiriRemotePointer {
         if pressed {
             statsHoldFired = false
             let timer = Timer(timeInterval: Self.statsHold, repeats: false) { [weak self] _ in
-                Task { @MainActor in self?.statsHoldElapsed() }
+                MainActor.assumeIsolated { self?.statsHoldElapsed() }
             }
             RunLoop.main.add(timer, forMode: .common)
             playPauseTimer?.invalidate()
@@ -326,7 +326,7 @@ public final class SiriRemotePointer {
         finishRightClick()
         setButton(3, down: true)
         let timer = Timer(timeInterval: Self.tapPress, repeats: false) { [weak self] _ in
-            Task { @MainActor in self?.finishRightClick() }
+            MainActor.assumeIsolated { self?.finishRightClick() }
         }
         RunLoop.main.add(timer, forMode: .common)
         rightReleaseTimer = timer

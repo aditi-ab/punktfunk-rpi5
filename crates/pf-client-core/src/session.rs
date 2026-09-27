@@ -849,7 +849,7 @@ fn spawn_plane_threads(
     }
 }
 
-/// How the pump learns a hardware decode finished, for the once-per-window decode sample.
+/// How the pump waits a hardware decode to completion before it hands the frame on.
 enum HwDone {
     /// Vulkan Video: the picture's timeline semaphore reaches `value`.
     Timeline(u64, u64),
@@ -1075,9 +1075,6 @@ fn pump(
     let mut pin_noticed = false;
     // The last launch verdict turned into a notice: each verdict is said once.
     let mut launch_told: Option<punktfunk_core::quic::LaunchOutcome> = None;
-    // One fence-waited decode sample per window on the async rung: a per-frame wait
-    // would serialize decode to 1/latency.
-    let mut fence_sampled = false;
     // Report decode stage to ABR only when armed. Constant for the session.
     let wants_decode = connector.wants_decode_latency();
     // What actually decoded the last frame — VAAPI can demote mid-session.
@@ -1339,20 +1336,14 @@ fn pump(
                             };
                             tracing::info!(width = w, height = h, path, "first frame decoded");
                         }
-                        // Travels with the frame so the presenter can measure `display`.
-                        let decoded_ns = now_ns();
-                        connector.hud().note_decoded(frame.pts_ns, decoded_ns);
-                        if params.phase_lock && phase_decodes.len() < 256 {
-                            phase_decodes.push(decoded_ns.saturating_sub(received_ns));
-                        }
-                        // Ship first, then the decode stat. Vulkan returns at submission;
-                        // a per-frame fence wait serializes to 1/decode_latency. One
-                        // honest sample per window. Polling would quantize by a whole
-                        // frame interval (8.3 ms at 120 Hz vs ~0.1–2 ms decodes).
+                        // Hardware rungs return at submission. Wait the decode's own fence
+                        // here, on the pump: i915 raises the media engine's clock only for
+                        // a thread that waits (a 4K decode on a Meteor Lake Arc takes 6.8 ms
+                        // unboosted, 2.7 boosted), and `decoded_ns` then means complete.
+                        // 50 ms bounds a wedged pipeline; the presenter waits the GPU too.
                         let hw_fence = match &image {
                             // Native rung: decode signals `semaphore_value` when pixels
-                            // are ready (presenter write-back is `+ 1`). Wait measures
-                            // received→decode-complete.
+                            // are ready (presenter write-back is `+ 1`).
                             DecodedImage::NativeVk(f) => {
                                 HwDone::Timeline(f.semaphore, f.semaphore_value)
                             }
@@ -1366,6 +1357,23 @@ fn pump(
                                 .map_or(HwDone::Cpu, HwDone::SyncFile),
                             _ => HwDone::Cpu,
                         };
+                        match hw_fence {
+                            HwDone::Timeline(sem, value) => {
+                                decoder.wait_hw_decoded(sem, value, 50_000_000);
+                            }
+                            #[cfg(target_os = "linux")]
+                            HwDone::SyncFile(fd) => {
+                                use std::os::fd::AsFd as _;
+                                let _ = pf_zerocopy::dmabuf_fence::wait_sync_file(fd.as_fd(), 50);
+                            }
+                            HwDone::Cpu => {}
+                        }
+                        // Travels with the frame so the presenter can measure `display`.
+                        let decoded_ns = now_ns();
+                        connector.hud().note_decoded(frame.pts_ns, decoded_ns);
+                        if params.phase_lock && phase_decodes.len() < 256 {
+                            phase_decodes.push(decoded_ns.saturating_sub(received_ns));
+                        }
                         if present {
                             // A displaced frame decoded and was never shown: newest wins.
                             if let Ok(Some(_)) = frame_tx.force_send(DecodedFrame {
@@ -1377,44 +1385,13 @@ fn pump(
                             }
                         } else {
                             // Withhold this frame so the presenter redraws the last good
-                            // picture. `hw_fence` still samples (handle stays valid).
+                            // picture.
                             tracing::trace!("holding last frame — awaiting post-loss re-anchor");
                         }
-                        match hw_fence {
-                            // `decoded_ns` is a submission stamp here, so GPU decode sits
-                            // inside `display` and this sample re-counts it.
-                            HwDone::Timeline(sem, value) => {
-                                if !fence_sampled && decoder.wait_hw_decoded(sem, value, 50_000_000)
-                                {
-                                    fence_sampled = true;
-                                    let us = now_ns().saturating_sub(received_ns) / 1000;
-                                    connector.hud().note_decode_us(us, true);
-                                }
-                            }
-                            #[cfg(target_os = "linux")]
-                            HwDone::SyncFile(fd) => {
-                                use std::os::fd::AsFd as _;
-                                if !fence_sampled
-                                    && pf_zerocopy::dmabuf_fence::wait_sync_file(fd.as_fd(), 50)
-                                        .is_ok_and(|o| {
-                                            o != pf_zerocopy::dmabuf_fence::WaitOutcome::TimedOut
-                                        })
-                                {
-                                    fence_sampled = true;
-                                    let us = now_ns().saturating_sub(received_ns) / 1000;
-                                    connector.hud().note_decode_us(us, true);
-                                }
-                            }
-                            HwDone::Cpu => {
-                                let us = decoded_ns.saturating_sub(received_ns) / 1000;
-                                connector.hud().note_decode_us(us, false);
-                            }
-                        }
-                        // ABR: decoder-backlog every frame, using the CPU-side stamp.
-                        // Exact for sync paths; received→submit for async Vulkan — the
-                        // backpressure the controller needs, without the fence wait.
+                        // Received → pixels done, every frame; the ABR's decoder-backlog too.
+                        let us = decoded_ns.saturating_sub(received_ns) / 1000;
+                        connector.hud().note_decode_us(us, false);
                         if wants_decode {
-                            let us = decoded_ns.saturating_sub(received_ns) / 1000;
                             connector.report_decode_us(us.min(u32::MAX as u64) as u32);
                         }
                     }
@@ -1615,7 +1592,6 @@ fn pump(
                 health: decoder.decode_health(),
             }));
             window_start = Instant::now();
-            fence_sampled = false;
         }
     };
 
