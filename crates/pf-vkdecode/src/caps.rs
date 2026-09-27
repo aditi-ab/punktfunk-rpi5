@@ -90,15 +90,14 @@ pub struct VideoFormat {
     pub image_type: vk::ImageType,
     /// `imageTiling`. Likewise equality-compared by VUID-06811; pools create `OPTIMAL`.
     pub image_tiling: vk::ImageTiling,
-    /// Usage the query that returned this entry asked for. The query returns only
-    /// formats that support it, so it counts as supported whatever `image_usage` says.
-    /// Empty in a hand-built entry.
+    /// Usage the query that returned this entry asked for. Empty in a hand-built entry.
     pub queried: vk::ImageUsageFlags,
 }
 
 impl VideoFormat {
     /// The driver answered with a mask that lacks the usage it was asked about: one
-    /// fixed report for every query. Such a report refuses nothing.
+    /// fixed report for every query. Intel's Windows driver does this, and its decode
+    /// images read as zeros when sampled, so the mask is the truth about `SAMPLED`.
     pub fn echoed(&self) -> bool {
         !self.image_usage.contains(self.queried)
     }
@@ -273,6 +272,12 @@ pub enum CapsError {
     /// The picture has more slice segments than the owner allows this driver
     /// ([`crate::VkH265Decoder::refuse_multi_slice`]). Refused before any driver call.
     SliceSegments { segments: usize },
+    /// The driver answered the `mode` query with a mask that lacks the queried usage
+    /// ([`VideoFormat::echoed`]). Its decode images cannot be sampled.
+    EchoedReport {
+        mode: &'static str,
+        format: vk::Format,
+    },
 }
 
 /// One slice segment per picture when `single_slice` is set, any number otherwise.
@@ -332,6 +337,13 @@ impl std::fmt::Display for CapsError {
                 write!(
                     f,
                     "this driver takes one slice segment per picture, the stream sends {segments}"
+                )
+            }
+            CapsError::EchoedReport { mode, format } => {
+                write!(
+                    f,
+                    "the {mode} {format:?} report echoes the query; decode images here \
+                     read as zeros when sampled, a copy stage is needed"
                 )
             }
         }
@@ -494,13 +506,21 @@ fn pick_format(
         .ok_or(CapsError::NoFormat { mode, wanted })
 }
 
-/// Pool creation usage must sit inside what the driver advertised or was asked about.
+/// Pool creation usage must sit inside what the driver advertised. An echoed report
+/// refuses outright: Intel's Windows driver decodes into such an image, and every
+/// sample of it reads zero.
 fn require_usage(
     entry: &VideoFormat,
     usage: vk::ImageUsageFlags,
     mode: &'static str,
 ) -> Result<(), CapsError> {
-    let missing = usage & !(entry.image_usage | entry.queried);
+    if entry.echoed() {
+        return Err(CapsError::EchoedReport {
+            mode,
+            format: entry.format,
+        });
+    }
+    let missing = usage & !entry.image_usage;
     if missing.is_empty() {
         Ok(())
     } else {
@@ -514,21 +534,12 @@ fn require_usage(
     }
 }
 
-/// An echoed report with no create flags at all has not said no: the pool asks for
-/// MUTABLE_FORMAT and `vkCreateImage` is the judge. Any other report without the flag
-/// refuses.
+/// Per-plane views need `MUTABLE_FORMAT` in the driver's create-flag report.
 fn require_mutable(entry: &VideoFormat, mode: &'static str) -> Result<(), CapsError> {
     if entry
         .image_create_flags
         .contains(vk::ImageCreateFlags::MUTABLE_FORMAT)
     {
-        Ok(())
-    } else if entry.echoed() && entry.image_create_flags.is_empty() {
-        tracing::info!(
-            format = ?entry.format,
-            mode,
-            "driver echoes one format report for every query; creating with MUTABLE_FORMAT"
-        );
         Ok(())
     } else {
         Err(CapsError::NoMutableFormat {
@@ -831,11 +842,18 @@ mod tests {
     }
 
     #[test]
-    fn an_echoed_report_refuses_neither_the_queried_usage_nor_mutable_format() {
+    fn an_echoed_report_refuses_by_name() {
         let e = echoed_entry(NV12, COINCIDE_USAGE);
         assert!(e.echoed());
-        assert!(require_usage(&e, COINCIDE_USAGE, "coincide").is_ok());
-        assert!(require_mutable(&e, "coincide").is_ok());
+        let refused = require_usage(&e, COINCIDE_USAGE, "coincide").unwrap_err();
+        assert_eq!(
+            refused,
+            CapsError::EchoedReport {
+                mode: "coincide",
+                format: NV12
+            }
+        );
+        assert!(crate::VkDecodeError::Caps(refused).is_device_fact());
     }
 
     #[test]
@@ -843,13 +861,10 @@ mod tests {
         let mut e = entry(NV12, DPB_USAGE);
         e.queried = DPB_USAGE;
         assert!(!e.echoed());
+        assert!(require_usage(&e, DPB_USAGE, "DPB").is_ok());
         assert!(require_usage(&e, COINCIDE_USAGE, "coincide").is_err());
         e.image_create_flags = vk::ImageCreateFlags::empty();
         assert!(require_mutable(&e, "coincide").is_err());
-        // Echoed, but it names create flags and MUTABLE_FORMAT is not among them.
-        let mut named = echoed_entry(NV12, COINCIDE_USAGE);
-        named.image_create_flags = vk::ImageCreateFlags::ALIAS;
-        assert!(require_mutable(&named, "coincide").is_err());
     }
 
     fn radv_like() -> RawH264Caps {
