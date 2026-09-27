@@ -4,6 +4,7 @@
     "install-client",
     "pairing",
     "clients",
+    "browser-client",
     "moonlight",
     "steam-deck",
     "client-settings",

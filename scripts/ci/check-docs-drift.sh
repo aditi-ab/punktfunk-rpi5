@@ -62,7 +62,9 @@ fi
 # ---------------------------------------------------------------- gate 2: docs env vars exist
 git grep -ohE 'PUNKTFUNK_[A-Z0-9_]+' -- docs-site/content | sort -u > "$tmp/docs-vars"
 while IFS= read -r var; do
-    if ! git grep -qF "$var" -- ':!docs-site' ':!docs/releases' ':!CHANGELOG.md'; then
+    # Read by another repository; listed with its owner.
+    grep -qx "$var" scripts/ci/docs-external-env.txt && continue
+    if ! git grep -qF "$var" -- ':!docs-site' ':!docs/releases' ':!CHANGELOG.md' ':!scripts/ci/docs-external-env.txt'; then
         echo "::error::docs-site documents $var but nothing outside the docs mentions it — the knob was removed or renamed; fix the docs page"
         fail=1
     fi

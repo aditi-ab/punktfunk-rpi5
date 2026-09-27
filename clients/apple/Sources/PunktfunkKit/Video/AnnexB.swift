@@ -69,8 +69,13 @@ public enum AnnexB {
     /// start code are dropped: they're either the 4-byte-code prefix or `trailing_zero_8bits`
     /// padding, never NAL payload (emulation prevention keeps 00 00 0x out of conforming NAL
     /// bytes) — same policy as ffmpeg. The base pointer is only valid inside `body`.
+    ///
+    /// `body` runs once a NAL's END is found, so stopping there has already scanned its
+    /// payload. `enter` sees a NAL's first byte as its start code is found, and returns false
+    /// to stop the walk before that.
     static func forEachNAL(
-        in data: Data, _ body: (_ base: UnsafePointer<UInt8>, _ range: Range<Int>) -> Bool
+        in data: Data, enter: (_ first: UInt8) -> Bool = { _ in true },
+        _ body: (_ base: UnsafePointer<UInt8>, _ range: Range<Int>) -> Bool
     ) {
         data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
@@ -85,6 +90,7 @@ public enum AnnexB {
                     }
                     if start >= 0, start < codeStart, !body(base, start..<codeStart) { return }
                     start = i + 3
+                    if start < count, !enter(base[start]) { return }
                     i += 3
                 } else {
                     i += 1
@@ -117,8 +123,7 @@ public enum AnnexB {
     /// Build a format description from an IDR AU's in-band parameter sets (HEVC: VPS/SPS/PPS;
     /// H.264: SPS/PPS). Returns nil when the AU carries no parameter sets (non-IDR). Runs per
     /// AU on the pump thread: parameter sets precede the first VCL NAL in a conforming AU, so
-    /// the scan stops there — a delta frame (no leading parameter sets) costs a few byte
-    /// compares, no copies.
+    /// the scan stops at that NAL's start code. A delta frame costs a few byte compares.
     public static func formatDescription(
         fromIDR au: Data, codec: VideoCodec
     ) -> CMVideoFormatDescription? {
@@ -127,7 +132,7 @@ public enum AnnexB {
         // slice that references a dropped one undecodable — a permanent decode-error loop rather
         // than a visible failure.
         var vps: [Data] = [], sps: [Data] = [], pps: [Data] = []
-        forEachNAL(in: au) { base, range in
+        forEachNAL(in: au, enter: { !codec.isVCL($0) }) { base, range in
             let first = base[range.lowerBound]
             switch codec.nalType(first) {
             case 32 where codec == .hevc:
@@ -210,14 +215,19 @@ public enum AnnexB {
     }
 
     /// Wrap one AU as a decode-ready CMSampleBuffer. The AVCC form is packed directly into
-    /// the CMBlockBuffer's allocation (sized by a first cheap scan) — no intermediate Data.
+    /// the CMBlockBuffer's allocation, with no intermediate Data. One scan finds the payload
+    /// NALs and sizes the block; the pack copies from the ranges it found.
     public static func sampleBuffer(
         au: AccessUnit, format: CMVideoFormatDescription, codec: VideoCodec
     ) -> CMSampleBuffer? {
-        // Pass 1: byte scan only — total AVCC size of the payload (non-parameter-set) NALs.
+        var payload: [Range<Int>] = []
+        payload.reserveCapacity(8)
         var total = 0
         forEachNAL(in: au.data) { base, range in
-            if !codec.isParameterSet(base[range.lowerBound]) { total += 4 + range.count }
+            if !codec.isParameterSet(base[range.lowerBound]) {
+                total += 4 + range.count
+                payload.append(range)
+            }
             return true
         }
         // Nothing decodable (a parameter-set-only AU — our host never sends one): drop it
@@ -226,17 +236,18 @@ public enum AnnexB {
 
         return SamplePack.sample(total: total, ptsNs: au.ptsNs, format: format) { dst in
             // Length prefix + payload per NAL, straight into the block.
-            var off = 0
-            forEachNAL(in: au.data) { base, range in
-                if codec.isParameterSet(base[range.lowerBound]) { return true }
-                var len = UInt32(range.count).bigEndian
-                withUnsafeBytes(of: &len) {
-                    dst.advanced(by: off).copyMemory(from: $0.baseAddress!, byteCount: 4)
+            au.data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                guard let base = raw.baseAddress else { return }
+                var off = 0
+                for range in payload {
+                    var len = UInt32(range.count).bigEndian
+                    withUnsafeBytes(of: &len) {
+                        dst.advanced(by: off).copyMemory(from: $0.baseAddress!, byteCount: 4)
+                    }
+                    dst.advanced(by: off + 4)
+                        .copyMemory(from: base + range.lowerBound, byteCount: range.count)
+                    off += 4 + range.count
                 }
-                dst.advanced(by: off + 4)
-                    .copyMemory(from: base + range.lowerBound, byteCount: range.count)
-                off += 4 + range.count
-                return true
             }
         }
     }

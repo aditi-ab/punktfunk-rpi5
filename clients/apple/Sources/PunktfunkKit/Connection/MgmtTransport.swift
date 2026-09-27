@@ -107,7 +107,7 @@ enum MgmtTransport {
         // connection still gets exactly one attempt — retrying that only doubles a real
         // failure's latency.
         for attempt in 0...MgmtConnectionPool.maxPerHost {
-            let connection = await MgmtConnectionPool.shared.acquire(key: key) {
+            let connection = try await MgmtConnectionPool.shared.acquire(key: key) {
                 MgmtConnection(host: unbracketed(host), port: nwPort, identity: identity, pin: pin)
             }
             let wasReused = connection.hasServedRequest
@@ -157,8 +157,16 @@ actor MgmtConnectionPool {
     /// silently costs a full request timeout per socket before the retry loop gives up.
     static let maxIdle: TimeInterval = 20
 
-    func acquire(key: String, make: () -> MgmtConnection) async -> MgmtConnection {
+    /// Throws `CancellationError` for a cancelled caller, before it takes a connection. A grid
+    /// scrolled past queues a wait per tile; those must not hold the tiles on screen back.
+    func acquire(key: String, make: () -> MgmtConnection) async throws -> MgmtConnection {
+        var woken = false
         while true {
+            if Task.isCancelled {
+                // The slot this caller was woken for goes to the next in line.
+                if woken { wakeNext(key) }
+                throw CancellationError()
+            }
             if var idle = available[key], let connection = idle.popLast() {
                 available[key] = idle
                 let fresh = ProcessInfo.processInfo.systemUptime - connection.pooledAt < Self.maxIdle
@@ -179,8 +187,19 @@ actor MgmtConnectionPool {
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                 waiters[key, default: []].append(continuation)
             }
+            woken = true
         }
     }
+
+    private func wakeNext(_ key: String) {
+        guard var queue = waiters[key], !queue.isEmpty else { return }
+        let next = queue.removeFirst()
+        waiters[key] = queue
+        next.resume()
+    }
+
+    /// Callers parked on `key`, for the tests.
+    func waiting(key: String) -> Int { waiters[key]?.count ?? 0 }
 
     /// Always call this, on success AND on failure: a connection that is never returned leaks a
     /// slot, and enough leaked slots would hang every later request on the waiter queue.
@@ -194,11 +213,7 @@ actor MgmtConnectionPool {
             connection.close()
             live[key] = max(0, (live[key] ?? 1) - 1)
         }
-        if var queue = waiters[key], !queue.isEmpty {
-            let next = queue.removeFirst()
-            waiters[key] = queue
-            next.resume()
-        }
+        wakeNext(key)
     }
 
     /// Drop every connection for a host — used when a library screen goes away, so we don't sit
@@ -250,7 +265,9 @@ final class MgmtConnection: @unchecked Sendable {
     /// `MgmtTransport.get` — only a connection the host may have dropped since is worth retrying.
     var hasServedRequest: Bool { servedRequest }
 
-    init(host: String, port: NWEndpoint.Port, identity: SecIdentity, pin: Data) {
+    /// A nil `identity` presents no client certificate. Only the pool's tests pass one: they
+    /// never start the connection, and building an identity writes to the Keychain.
+    init(host: String, port: NWEndpoint.Port, identity: SecIdentity?, pin: Data) {
         self.host = host
         self.port = port.rawValue
         let options = NWProtocolTLS.Options()
@@ -258,7 +275,7 @@ final class MgmtConnection: @unchecked Sendable {
         sec_protocol_options_set_min_tls_protocol_version(sec, .TLSv12)
         // Our half of the mTLS handshake: the same paired identity the host authorizes the
         // read-only library routes by (mgmt/auth.rs `cert_may_access`).
-        if let secIdentity = sec_identity_create(identity) {
+        if let identity, let secIdentity = sec_identity_create(identity) {
             sec_protocol_options_set_local_identity(sec, secIdentity)
         }
         let rejected = RejectionFlag()

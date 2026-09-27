@@ -194,9 +194,13 @@ public final class StreamLayerView: NSView {
     /// bounds change and a resize-END has none, so without this the layer keeps its pre-resize aspect
     /// and the shader stretches the new frame into it (black bars + squish). Main-thread only.
     private var lastDecodedContentSize: CGSize?
-    /// This screen's below-the-notch mode, as of the last layout — the one input to `videoBounds`
-    /// too expensive to read per mouse event (see `layoutPresenter`). Main-thread only.
+    /// This screen's below-the-notch mode, as of the last screen change — the one input to
+    /// `videoBounds` too expensive to read per mouse event (see `layoutPresenter`).
+    /// Main-thread only.
     private var safeModePixels: (width: Int, height: Int)?
+    /// The screen, its parameters or the backing scale changed since the screen's values were
+    /// read. Main-thread only.
+    private var screenValuesStale = true
     private let cursorCapture = CursorCapture()
     private var inputCapture: InputCapture?
     private var appObservers: [NSObjectProtocol] = []
@@ -343,6 +347,7 @@ public final class StreamLayerView: NSView {
         super.viewDidMoveToWindow()
         windowObservers.forEach(NotificationCenter.default.removeObserver(_:))
         windowObservers.removeAll()
+        screenValuesStale = true
         guard let window else {
             releaseCapture()
             return
@@ -374,8 +379,17 @@ public final class StreamLayerView: NSView {
         windowObservers.append(NotificationCenter.default.addObserver(
             forName: NSWindow.didChangeScreenNotification, object: window, queue: .main
         ) { [weak self] _ in
+            self?.screenValuesStale = true
             self?.layoutPresenter()
             self?.presenter.screenChanged()
+        })
+        // The same screen with a new mode, or a housing that came or went with it.
+        windowObservers.append(NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.screenValuesStale = true
+            self?.layoutPresenter()
         })
         attemptPendingCapture()
     }
@@ -1099,10 +1113,13 @@ public final class StreamLayerView: NSView {
     /// size (bounds → backing) — it follows the window, not the box — so a resize / retina move
     /// follows. A screen-change observer re-runs this so the display-link range follows the view.
     private func layoutPresenter() {
-        // Refresh BEFORE the fit below reads it. Enumerating display modes costs ~150 µs, and
-        // `videoBounds` is read on every mouse event — that belongs on layout, not on input.
-        safeModePixels = window?.screen?.notchSafePixelSize
-        presenter.setPanel(Self.panelInfo(window?.screen ?? NSScreen.main))
+        // Refreshed BEFORE the fit below reads it, and only when the screen can have changed:
+        // enumerating display modes costs ~150 µs, and a live resize lays out twice per step.
+        if screenValuesStale {
+            screenValuesStale = window == nil // a view with no window has no screen to keep
+            safeModePixels = window?.screen?.notchSafePixelSize
+            presenter.setPanel(Self.panelInfo(window?.screen ?? NSScreen.main))
+        }
         presenter.layout(in: videoBounds, contentsScale: window?.backingScaleFactor ?? 1)
         displayLayer.videoGravity = SessionPresenter.gravity(VideoFit(name: connection?.settings.videoFit))
         // Present routing tracks the window's composited state (fullscreen transitions always
@@ -1142,6 +1159,7 @@ public final class StreamLayerView: NSView {
 
     public override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
+        screenValuesStale = true
         layoutPresenter() // backing scale changed (e.g. moved to a non-retina display)
     }
 

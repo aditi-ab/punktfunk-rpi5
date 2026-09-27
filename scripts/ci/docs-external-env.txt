@@ -1,0 +1,5 @@
+# PUNKTFUNK_* names docs-site documents that another repository reads, one per line.
+# check-docs-drift.sh gate 2 cannot find these in this tree, so it skips them.
+
+# punktfunk/client-web: the browser client's page server (deploy/compose.yaml).
+PUNKTFUNK_HOSTS

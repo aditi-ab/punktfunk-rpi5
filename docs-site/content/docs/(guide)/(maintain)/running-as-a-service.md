@@ -23,10 +23,8 @@ turn it on only on a LAN you trust ([Security](/docs/security)).
 
 ### The browser client (preview)
 
-A browser that connects runs a full session. If you leave the plane on, set **Browser origins**
-(`PUNKTFUNK_WEBTRANSPORT_ORIGINS`) to the address you load the client from — left empty, any page
-open in your browser can reach the port. `PUNKTFUNK_WEBTRANSPORT_BIND` keeps the plane on one
-interface.
+Set it up with [Browser Client](/docs/browser-client). `PUNKTFUNK_WEBTRANSPORT_BIND` keeps the
+plane on one interface.
 
 ## A desktop you log into [#a-a-desktop-you-log-into]
 
