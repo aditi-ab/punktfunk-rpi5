@@ -1040,6 +1040,8 @@ impl NvencCudaEncoder {
             w.clear_cache();
         }
         self.worker_slots.clear();
+        // `clear_cache` dropped the worker's cursor bitmap; the next frame must upload it again.
+        self.worker_cursor_serial = u64::MAX;
         self.last_raw = None;
         self.convert_sem = None;
         for &bs in &self.bitstreams {
