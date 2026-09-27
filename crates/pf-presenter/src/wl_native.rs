@@ -6,11 +6,13 @@
 //! `wp_presentation` stamps the glass for the HUD. The buffer is a VAAPI surface as decoded,
 //! or a copy of a Vulkan Video picture (`vk::export_ring`). The lane takes a picture only
 //! when the surface feedback lists its format and modifier, it is SDR, and it fills the
-//! window; anything else is declined and the Vulkan path draws that frame.
+//! window; anything else is declined and the Vulkan path draws that frame. The presenter
+//! suspends its swapchain while the lane owns the window: Mesa's explicit-sync object on the
+//! surface would make a plain dma-buf commit a fatal protocol error.
 //!
 //! Each buffer is imported once under a key and reused; the caller's hold is kept until the
-//! compositor releases the buffer. The overlay is not drawn on this lane yet, so it stays an
-//! opt-in (`PUNKTFUNK_NATIVE_SCANOUT=1`).
+//! compositor releases the buffer. The overlay rides on its own subsurface above the picture,
+//! with an empty input region. Opt-in (`PUNKTFUNK_NATIVE_SCANOUT=1`) until measured on a display.
 //!
 //! SDL owns the socket. A private queue takes this lane's events; SDL's pump reads them in
 //! and [`NativeLane::pump`] dispatches them. Presentation times arrive on CLOCK_MONOTONIC
@@ -26,7 +28,9 @@ use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 use wayland_backend::client::{Backend, ObjectId};
 use wayland_client::globals::{registry_queue_init, GlobalList, GlobalListContents};
-use wayland_client::protocol::{wl_buffer, wl_registry, wl_surface};
+use wayland_client::protocol::{
+    wl_buffer, wl_compositor, wl_region, wl_registry, wl_subcompositor, wl_subsurface, wl_surface,
+};
 use wayland_client::{delegate_noop, Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
 use wayland_protocols::wp::color_representation::v1::client::{
     wp_color_representation_manager_v1 as crm, wp_color_representation_surface_v1 as crs,
@@ -38,6 +42,7 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::{
 use wayland_protocols::wp::presentation_time::client::{
     wp_presentation, wp_presentation_feedback as pfb,
 };
+use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 const CLOCK_MONOTONIC: u32 = 1;
@@ -54,6 +59,8 @@ pub fn enabled() -> bool {
 /// What the lane did with a VAAPI frame.
 pub enum Outcome {
     Shown,
+    /// The lane owns the window but this frame's buffer is busy: the frame is skipped.
+    Dropped,
     /// Not this lane's frame (or not yet): the caller draws it through Vulkan.
     Declined(DmabufFrame),
 }
@@ -308,6 +315,28 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for LaneState {
 delegate_noop!(LaneState: ignore dmabuf::ZwpLinuxDmabufV1);
 delegate_noop!(LaneState: ignore crm::WpColorRepresentationManagerV1);
 delegate_noop!(LaneState: ignore crs::WpColorRepresentationSurfaceV1);
+delegate_noop!(LaneState: ignore wl_compositor::WlCompositor);
+delegate_noop!(LaneState: ignore wl_subcompositor::WlSubcompositor);
+delegate_noop!(LaneState: ignore wl_subsurface::WlSubsurface);
+delegate_noop!(LaneState: ignore wl_region::WlRegion);
+delegate_noop!(LaneState: ignore wl_surface::WlSurface);
+delegate_noop!(LaneState: ignore wp_viewporter::WpViewporter);
+delegate_noop!(LaneState: ignore wp_viewport::WpViewport);
+
+/// The overlay's own surface above the picture: input passes through to SDL's surface.
+struct Hud {
+    surface: wl_surface::WlSurface,
+    sub: wl_subsurface::WlSubsurface,
+    viewport: wp_viewport::WpViewport,
+    mapped: bool,
+}
+
+/// What the overlay's surface needs from the compositor.
+struct HudGlobals {
+    compositor: wl_compositor::WlCompositor,
+    subcompositor: wl_subcompositor::WlSubcompositor,
+    viewporter: wp_viewporter::WpViewporter,
+}
 
 fn monotonic_to_realtime(mono_ns: u64) -> u64 {
     let now_mono = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
@@ -332,6 +361,9 @@ pub struct NativeLane {
     /// SDL scales the buffer to the window through its viewport; without one the buffer must
     /// match the window.
     has_viewport: bool,
+    /// `None` where the compositor lacks a subcompositor or viewporter: no overlay surface.
+    hud_globals: Option<HudGlobals>,
+    hud: Option<Hud>,
     seq: usize,
     dead: bool,
     // SAFETY: field drop order keeps SDL's display alive past every borrowed proxy and queue.
@@ -387,6 +419,18 @@ impl NativeLane {
         };
         let color_repr: Option<crm::WpColorRepresentationManagerV1> =
             globals.bind(&qh, 1..=1, ()).ok();
+        let hud_globals = match (
+            globals.bind::<wl_compositor::WlCompositor, _, _>(&qh, 4..=6, ()),
+            globals.bind::<wl_subcompositor::WlSubcompositor, _, _>(&qh, 1..=1, ()),
+            globals.bind::<wp_viewporter::WpViewporter, _, _>(&qh, 1..=1, ()),
+        ) {
+            (Ok(compositor), Ok(subcompositor), Ok(viewporter)) => Some(HudGlobals {
+                compositor,
+                subcompositor,
+                viewporter,
+            }),
+            _ => None,
+        };
         // SAFETY: SDL's live wl_surface proxy on this display; the interface matches.
         let surface_id =
             unsafe { ObjectId::from_ptr(wl_surface::WlSurface::interface(), surface_ptr.cast()) }
@@ -415,6 +459,7 @@ impl NativeLane {
             scanout_pairs = state.scanout.len(),
             color_representation = color_repr.is_some(),
             viewport = !viewport_ptr.is_null(),
+            overlay_surface = hud_globals.is_some(),
             "native scanout lane armed on SDL's surface"
         );
         Ok(Some(Self {
@@ -430,10 +475,70 @@ impl NativeLane {
             repr: None,
             repr_set: None,
             has_viewport: !viewport_ptr.is_null(),
+            hud_globals,
+            hud: None,
             seq: 0,
             dead: false,
             _window: window.context(),
         }))
+    }
+
+    /// The compositor can take the overlay on its own surface above the picture.
+    pub fn overlay_supported(&self) -> bool {
+        self.hud_globals.is_some() && !self.dead
+    }
+
+    /// Show the free buffer under `key` as the overlay, scaled to the window's `logical`
+    /// size, and keep `hold` until the compositor releases it.
+    pub fn overlay_show(&mut self, key: u64, logical: (u32, u32), hold: Box<dyn Any>) -> bool {
+        if self.dead || self.slot_state(key) != SlotState::Free {
+            return false;
+        }
+        let Some(g) = &self.hud_globals else {
+            return false;
+        };
+        let hud = self.hud.get_or_insert_with(|| {
+            let surface = g.compositor.create_surface(&self.qh, ());
+            let sub = g
+                .subcompositor
+                .get_subsurface(&surface, &self.surface, &self.qh, ());
+            sub.set_position(0, 0);
+            sub.set_desync();
+            // An empty input region: the pointer stays on SDL's surface underneath.
+            let region = g.compositor.create_region(&self.qh, ());
+            surface.set_input_region(Some(&region));
+            region.destroy();
+            let viewport = g.viewporter.get_viewport(&surface, &self.qh, ());
+            Hud {
+                surface,
+                sub,
+                viewport,
+                mapped: false,
+            }
+        });
+        let Some(Import::Ready(slot)) = self.state.imports.get_mut(&key) else {
+            return false;
+        };
+        hud.viewport
+            .set_destination(logical.0.max(1) as i32, logical.1.max(1) as i32);
+        hud.surface.attach(Some(&slot.buffer), 0, 0);
+        hud.surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
+        hud.surface.commit();
+        hud.mapped = true;
+        slot.held = Some(hold);
+        self.flush();
+        true
+    }
+
+    /// Unmap the overlay's surface; the compositor releases its buffer.
+    pub fn overlay_hide(&mut self) {
+        let Some(hud) = self.hud.as_mut().filter(|h| h.mapped) else {
+            return;
+        };
+        hud.surface.attach(None, 0, 0);
+        hud.surface.commit();
+        hud.mapped = false;
+        self.flush();
     }
 
     /// Dispatch what SDL's socket reads brought for this lane. A protocol error retires the
@@ -637,37 +742,39 @@ impl NativeLane {
         self.lists(d.fourcc, d.modifier) && self.fits(d.color, (d.width, d.height), view, fit)
     }
 
-    /// A VAAPI frame as the window's buffer, its pool slot imported once. `Declined` while
-    /// the slot is importing or still held; the caller draws that frame through Vulkan.
-    pub fn present(&mut self, d: DmabufFrame, pts_ns: u64, decoded_ns: u64) -> Outcome {
+    /// Where a VAAPI frame's pool slot stands, importing it on first sight: in the
+    /// background, or with `now` on the spot (one roundtrip). `Failed` also when the lane is
+    /// dead.
+    pub fn prepare(&mut self, d: &DmabufFrame, now: bool) -> SlotState {
         self.pump();
         if self.dead {
-            return Outcome::Declined(d);
+            return SlotState::Failed;
         }
-        match self.slot_state(d.pool_key) {
-            SlotState::Unknown => {
-                let planes: Vec<_> = d
-                    .planes
-                    .iter()
-                    // SAFETY: the frame owns each fd for this call; libwayland dups it.
-                    .map(|p| (unsafe { BorrowedFd::borrow_raw(p.fd) }, p.offset, p.stride))
-                    .collect();
-                self.import(
-                    d.pool_key,
-                    (d.width, d.height),
-                    d.fourcc,
-                    d.modifier,
-                    &planes,
-                );
-                return Outcome::Declined(d);
+        if self.slot_state(d.pool_key) == SlotState::Unknown {
+            let planes: Vec<_> = d
+                .planes
+                .iter()
+                // SAFETY: the frame owns each fd for this call; libwayland dups it.
+                .map(|p| (unsafe { BorrowedFd::borrow_raw(p.fd) }, p.offset, p.stride))
+                .collect();
+            self.import(
+                d.pool_key,
+                (d.width, d.height),
+                d.fourcc,
+                d.modifier,
+                &planes,
+            );
+            if now && self.queue.roundtrip(&mut self.state).is_err() {
+                self.dead = true;
+                return SlotState::Failed;
             }
-            SlotState::Failed => {
-                self.refused(d.fourcc, d.modifier);
-                return Outcome::Declined(d);
-            }
-            SlotState::Pending | SlotState::Held => return Outcome::Declined(d),
-            SlotState::Free => {}
         }
+        self.slot_state(d.pool_key)
+    }
+
+    /// Commit a VAAPI frame whose slot [`Self::prepare`] reported free; the frame's guard
+    /// stays with the buffer until the compositor releases it.
+    pub fn commit_vaapi(&mut self, d: DmabufFrame, pts_ns: u64, decoded_ns: u64) -> bool {
         // The pump waited the decode already; a leftover sync_file costs a poll.
         for fd in &d.sync_fds {
             use std::os::fd::AsRawFd as _;
@@ -675,8 +782,7 @@ impl NativeLane {
         }
         let (key, color) = (d.pool_key, d.color);
         let DmabufFrame { guard, .. } = d;
-        self.commit(key, color, Box::new(guard), pts_ns, decoded_ns);
-        Outcome::Shown
+        self.commit(key, color, Box::new(guard), pts_ns, decoded_ns)
     }
 
     /// Frames the compositor reported on glass since the last call.
@@ -696,6 +802,15 @@ impl NativeLane {
 
 impl Drop for NativeLane {
     fn drop(&mut self) {
+        if let Some(hud) = self.hud.take() {
+            hud.viewport.destroy();
+            hud.sub.destroy();
+            hud.surface.destroy();
+        }
+        if let Some(g) = self.hud_globals.take() {
+            g.subcompositor.destroy();
+            g.viewporter.destroy();
+        }
         for import in self.state.imports.values() {
             match import {
                 Import::Ready(slot) => slot.buffer.destroy(),

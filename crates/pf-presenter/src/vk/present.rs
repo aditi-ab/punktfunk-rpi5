@@ -137,13 +137,17 @@ impl Presenter {
         if self.extent.width == 0 || self.extent.height == 0 {
             return Ok(Presented::Shown); // minimized: not Stale (Stale recreates)
         }
-        // While the native lane owns the window's buffer a swapchain redraw would paint
-        // over the picture; a real frame takes the window back.
-        if self.native_last {
+        // While the native lane owns the window a swapchain redraw would paint over the
+        // picture (and has no swapchain to paint into); a real frame takes the window back.
+        if self.native_last || self.suspended {
             if matches!(input, FrameInput::Redraw) {
                 return Ok(Presented::Shown);
             }
             self.native_last = false;
+            #[cfg(target_os = "linux")]
+            if self.suspended {
+                self.resume_swapchain(window)?;
+            }
         }
         // FIFO without present-wait: the queue is policed here rather than by blocking.
         // Give the previous submit's fence up to 1 ms (it is the frame's real gate, and a

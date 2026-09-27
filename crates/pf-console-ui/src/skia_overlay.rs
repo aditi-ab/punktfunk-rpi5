@@ -34,6 +34,7 @@ struct Slot {
     surface: Surface,
     image: avk::Image,
     view: avk::ImageView,
+    format: avk::Format,
     width: u32,
     height: u32,
     ten_bit: bool,
@@ -44,6 +45,7 @@ impl Slot {
         OverlayFrame {
             image: self.image,
             view: self.view,
+            format: self.format,
             width: self.width,
             height: self.height,
         }
@@ -720,6 +722,7 @@ impl SkiaOverlay {
             surface,
             image,
             view,
+            format: avk::Format::from_raw(image_info.format as i32),
             width,
             height,
             ten_bit,

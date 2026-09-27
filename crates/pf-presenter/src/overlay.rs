@@ -76,6 +76,8 @@ pub struct FrameCtx<'a> {
 pub struct OverlayFrame {
     pub image: vk::Image,
     pub view: vk::ImageView,
+    /// The image's format; the native Wayland lane copies it into a buffer of the same.
+    pub format: vk::Format,
     pub width: u32,
     pub height: u32,
 }

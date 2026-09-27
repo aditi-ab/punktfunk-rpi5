@@ -2063,6 +2063,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             }
         }
         overlay_damage.rendered(overlay_frame.as_ref().map(|f| f.image));
+        // The native lane shows the overlay on its own surface; the swapchain path draws it.
+        presenter.sync_native_overlay(overlay_frame.as_ref(), window.size());
 
         let mut presented_video = false;
         if let Some(st) = &mut stream {
@@ -2331,17 +2333,16 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         st.hdr = d.color.is_pq();
                         st.hdr_untonemapped = false;
                         // The native lane first: the compositor takes the dma-buf itself.
-                        let d = match presenter.present_native(d, pts_ns, decoded_ns) {
-                            crate::wl_native::Outcome::Shown => None,
-                            crate::wl_native::Outcome::Declined(d) => Some(d),
-                        };
-                        match d.map_or(Ok(Presented::Shown), |d| {
-                            presenter.present(
+                        let native = presenter.present_native(d, pts_ns, decoded_ns);
+                        match match native {
+                            crate::wl_native::Outcome::Shown => Ok(Presented::Shown),
+                            crate::wl_native::Outcome::Dropped => Ok(Presented::Stale),
+                            crate::wl_native::Outcome::Declined(d) => presenter.present(
                                 &window,
                                 FrameInput::Dmabuf(d),
                                 overlay_frame.as_ref(),
-                            )
-                        }) {
+                            ),
+                        } {
                             Ok(Presented::Shown) => {
                                 st.hw_fails = 0;
                                 true

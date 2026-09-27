@@ -320,8 +320,24 @@ pub struct Presenter {
     /// Rings built so far; keeps each ring's lane keys apart.
     #[cfg(target_os = "linux")]
     export_gen: u64,
+    /// Exportable copies of the overlay image for the lane's overlay surface.
+    #[cfg(target_os = "linux")]
+    overlay_ring: Option<export_ring::ExportRing>,
+    /// (format, width, height, feedback generation) an overlay ring could not be built for.
+    #[cfg(target_os = "linux")]
+    overlay_refused: Option<(vk::Format, u32, u32, u64)>,
+    /// The overlay image on the lane's overlay surface now.
+    #[cfg(target_os = "linux")]
+    overlay_shown: Option<vk::Image>,
+    /// An overlay is up that the lane cannot show: frames go through the swapchain.
+    overlay_blocks_native: bool,
     /// The last frame shown went through the native lane, not the swapchain.
     native_last: bool,
+    /// The swapchain and its Vulkan surface are torn down while the lane owns the window. A
+    /// Vulkan swapchain opts the window's surface into explicit sync, and a buffer committed
+    /// without its sync points is a fatal protocol error. The next non-redraw frame through
+    /// [`Presenter::present`] builds both again.
+    suspended: bool,
 }
 
 /// What the native lane did with a Vulkan Video picture.
@@ -380,21 +396,113 @@ impl Presenter {
         pts_ns: u64,
         decoded_ns: u64,
     ) -> crate::wl_native::Outcome {
-        use crate::wl_native::Outcome;
+        use crate::wl_native::{Outcome, SlotState};
         let view = (self.extent.width, self.extent.height);
-        let Some(lane) = self.native.as_mut() else {
+        let suspended = self.suspended;
+        let Some(lane) = self.native.as_mut().filter(|_| !self.overlay_blocks_native) else {
             return Outcome::Declined(d);
         };
         if !lane.takes(&d, view, self.video_fit) {
             return Outcome::Declined(d);
         }
-        match lane.present(d, pts_ns, decoded_ns) {
-            Outcome::Shown => {
-                self.native_last = true;
-                Outcome::Shown
+        // Owning the window, a new pool slot imports on the spot; before, it imports in the
+        // background while the swapchain still draws.
+        match lane.prepare(&d, suspended) {
+            SlotState::Free => {}
+            SlotState::Failed => {
+                if !lane.is_dead() {
+                    lane.refused(d.fourcc, d.modifier);
+                }
+                return Outcome::Declined(d);
             }
-            declined => declined,
+            // A buffer still on screen or still importing: skip the frame, or let the
+            // swapchain draw it while the lane is not in charge yet.
+            _ if suspended => return Outcome::Dropped,
+            _ => return Outcome::Declined(d),
         }
+        if !suspended {
+            if let Err(e) = self.suspend_swapchain() {
+                tracing::warn!(error = %format!("{e:#}"), "native scanout: swapchain suspend failed");
+                return Outcome::Declined(d);
+            }
+        }
+        let Some(lane) = self.native.as_mut() else {
+            return Outcome::Dropped;
+        };
+        if lane.commit_vaapi(d, pts_ns, decoded_ns) {
+            self.native_last = true;
+            Outcome::Shown
+        } else {
+            Outcome::Dropped
+        }
+    }
+
+    /// Hand the window to the native lane: drain our work and tear down the swapchain and its
+    /// Vulkan surface, which takes the surface's explicit-sync object with them. Nothing of
+    /// the swapchain path's is in flight after the queue drain below.
+    #[cfg(target_os = "linux")]
+    fn suspend_swapchain(&mut self) -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        self.quiesce_own()?;
+        self.acquired = None;
+        {
+            let _q = self.queue_lock.guard();
+            // SAFETY: `queue` is owned here; `queue_lock` is held so no concurrent submit.
+            unsafe { self.device.queue_wait_idle(self.queue) }
+                .context("vkQueueWaitIdle (swapchain suspend)")?;
+        }
+        if let Some(t) = &self.present_timer {
+            t.drain();
+        }
+        self.last_presented = None;
+        let (views, framebuffers) = self.overlay_pipe.take_targets();
+        // SAFETY: our fence, the queue and the present waiter are drained above, so nothing
+        // still names these objects; destroying a null swapchain or surface is a no-op.
+        unsafe {
+            for fb in framebuffers {
+                self.device.destroy_framebuffer(fb, None);
+            }
+            for v in views {
+                self.device.destroy_image_view(v, None);
+            }
+            for s in self.render_sems.drain(..) {
+                self.device.destroy_semaphore(s, None);
+            }
+            self.swap_d.destroy_swapchain(self.swapchain, None);
+            self.surface_i.destroy_surface(self.surface, None);
+        }
+        self.swapchain = vk::SwapchainKHR::null();
+        self.surface = vk::SurfaceKHR::null();
+        self.images.clear();
+        if let Some(f) = self.retired_hw.take() {
+            f.destroy(&self.device); // queue drained above: its reads are done
+        }
+        self.suspended = true;
+        tracing::info!("native scanout: the lane owns the window, swapchain suspended");
+        Ok(())
+    }
+
+    /// Take the window back from the native lane: a new Vulkan surface on SDL's window and
+    /// a swapchain on it.
+    #[cfg(target_os = "linux")]
+    fn resume_swapchain(&mut self, window: &sdl3::video::Window) -> anyhow::Result<()> {
+        // SAFETY: CREATE — `instance` is live; SDL returns a surface we own and destroy.
+        let surface = unsafe { window.vulkan_create_surface(self.instance.handle()) }
+            .map_err(|e| anyhow::anyhow!("SDL_Vulkan_CreateSurface: {e}"))?;
+        self.surface = surface;
+        self.suspended = false;
+        self.overlay_hide_native();
+        tracing::info!("native scanout: the swapchain takes the window back");
+        self.recreate_swapchain(window)
+    }
+
+    /// The overlay surface comes off when the swapchain draws the overlay itself.
+    #[cfg(target_os = "linux")]
+    fn overlay_hide_native(&mut self) {
+        if let Some(lane) = self.native.as_mut() {
+            lane.overlay_hide();
+        }
+        self.overlay_shown = None;
     }
 
     /// A Vulkan Video picture through the native lane: copied into an exportable buffer on a
@@ -425,6 +533,9 @@ impl Presenter {
     ) -> NativeVkOutcome {
         use crate::wl_native::SlotState;
         let view = (self.extent.width, self.extent.height);
+        if self.overlay_blocks_native {
+            return NativeVkOutcome::Declined(f);
+        }
         let (Some(lane), Some(hw)) = (self.native.as_mut(), self.hw.as_ref()) else {
             return NativeVkOutcome::Declined(f);
         };
@@ -473,7 +584,7 @@ impl Presenter {
                     (f.width, f.height),
                     &lane.modifiers_for(fourcc),
                     want.3,
-                    self.export_gen,
+                    export_ring::KEY_PICTURES | (self.export_gen << 8),
                 )
             };
             match built {
@@ -514,6 +625,21 @@ impl Presenter {
             return NativeVkOutcome::Declined(f);
         }
         let Some(slot) = ring.free_slot(|k| lane.slot_state(k) == SlotState::Free) else {
+            // Every buffer on screen or still importing: skip the frame, or let the swapchain
+            // draw it while the lane is not in charge yet.
+            return if self.suspended {
+                NativeVkOutcome::Dropped
+            } else {
+                NativeVkOutcome::Declined(f)
+            };
+        };
+        if !self.suspended {
+            if let Err(e) = self.suspend_swapchain() {
+                tracing::warn!(error = %format!("{e:#}"), "native scanout: swapchain suspend failed");
+                return NativeVkOutcome::Declined(f);
+            }
+        }
+        let (Some(lane), Some(ring)) = (self.native.as_mut(), self.export_ring.as_mut()) else {
             return NativeVkOutcome::Declined(f);
         };
         // SAFETY: the frame's handles live on this device while its guard is held (below);
@@ -540,6 +666,140 @@ impl Presenter {
                 } else {
                     NativeVkOutcome::Dropped
                 }
+            }
+        }
+    }
+
+    /// Once per pass, after the overlay renders: while the lane holds the window, the overlay
+    /// goes on its own surface above the picture (copied when its image changes) and comes
+    /// off when it empties. An overlay the lane cannot show sends frames back through the
+    /// swapchain, which composites it. `logical` is the window's size in surface units.
+    pub(crate) fn sync_native_overlay(
+        &mut self,
+        overlay: Option<&crate::overlay::OverlayFrame>,
+        logical: (u32, u32),
+    ) {
+        #[cfg(target_os = "linux")]
+        self.sync_native_overlay_linux(overlay, logical);
+        #[cfg(not(target_os = "linux"))]
+        let _ = (overlay, logical);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sync_native_overlay_linux(
+        &mut self,
+        overlay: Option<&crate::overlay::OverlayFrame>,
+        logical: (u32, u32),
+    ) {
+        use crate::wl_native::SlotState;
+        let Some(lane) = self.native.as_mut() else {
+            return;
+        };
+        let Some(o) = overlay else {
+            self.overlay_blocks_native = false;
+            lane.overlay_hide();
+            self.overlay_shown = None;
+            return;
+        };
+        let fourcc = export_ring::overlay_fourcc(o.format);
+        let shape = (o.format, o.width, o.height, lane.feedback_generation());
+        self.overlay_blocks_native =
+            !lane.overlay_supported() || fourcc.is_none() || self.overlay_refused == Some(shape);
+        if self.overlay_blocks_native || !self.native_last {
+            lane.overlay_hide();
+            self.overlay_shown = None;
+            return;
+        }
+        if self.overlay_shown == Some(o.image) {
+            return;
+        }
+        let (Some(fourcc), Some(hw)) = (fourcc, self.hw.as_ref()) else {
+            return;
+        };
+        if self
+            .overlay_ring
+            .as_ref()
+            .is_some_and(|r| (r.format, r.width, r.height, r.feedback_gen) != shape)
+        {
+            if let Some(old) = self.overlay_ring.take() {
+                for i in 0..old.len() {
+                    lane.forget(old.key(i));
+                }
+            }
+        }
+        if self.overlay_ring.is_none() {
+            self.export_gen += 1;
+            // SAFETY: the presenter's live, paired handles; `hw` exists only when the device
+            // enabled the dma-buf extension set the ring needs.
+            let built = unsafe {
+                export_ring::ExportRing::new(
+                    &self.instance,
+                    self.pdev,
+                    &self.device,
+                    &hw.ext_mem_fd,
+                    &self.mem_props,
+                    self.qfi,
+                    (fourcc, o.format),
+                    (o.width, o.height),
+                    &lane.modifiers_for(fourcc),
+                    shape.3,
+                    export_ring::KEY_OVERLAY | (self.export_gen << 8),
+                )
+            };
+            match built {
+                Ok(ring) => {
+                    for i in 0..ring.len() {
+                        lane.import(
+                            ring.key(i),
+                            (o.width, o.height),
+                            fourcc,
+                            ring.modifier,
+                            &ring.planes(i),
+                        );
+                    }
+                    self.overlay_ring = Some(ring);
+                }
+                Err(e) => {
+                    tracing::info!(
+                        error = %format!("{e:#}"),
+                        "native scanout: the overlay has no exportable copy target — the \
+                         swapchain draws while it is up"
+                    );
+                    self.overlay_refused = Some(shape);
+                    self.overlay_blocks_native = true;
+                    return;
+                }
+            }
+        }
+        let Some(ring) = self.overlay_ring.as_mut() else {
+            return;
+        };
+        if (0..ring.len()).any(|i| lane.slot_state(ring.key(i)) == SlotState::Failed) {
+            self.overlay_refused = Some(shape);
+            self.overlay_blocks_native = true;
+            lane.overlay_hide();
+            return;
+        }
+        // Imports still pending, or every buffer on screen: the next pass tries again.
+        let Some(slot) = ring.free_slot(|k| lane.slot_state(k) == SlotState::Free) else {
+            return;
+        };
+        // SAFETY: `o.image` is the overlay's live image in the ring's format and size, last
+        // written on this queue; `queue` is this presenter's, synchronised by `queue_lock`.
+        let copied = unsafe { ring.copy_overlay(slot, o.image, self.queue, &self.queue_lock) };
+        match copied {
+            Ok(true) => {
+                let hold = Box::new(ring.hold(slot));
+                if lane.overlay_show(ring.key(slot), logical, hold) {
+                    self.overlay_shown = Some(o.image);
+                }
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "native scanout: overlay copy failed");
+                self.overlay_refused = Some(shape);
+                self.overlay_blocks_native = true;
+                lane.overlay_hide();
             }
         }
     }
@@ -703,6 +963,7 @@ impl Drop for Presenter {
         {
             self.native.take();
             self.export_ring.take();
+            self.overlay_ring.take();
         }
         // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
         // type and live for the call, and every builder struct is a local that outlives it.

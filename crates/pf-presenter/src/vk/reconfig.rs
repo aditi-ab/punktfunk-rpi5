@@ -25,6 +25,13 @@ fn kmsdrm_swapchain_hint() -> String {
 
 impl Presenter {
     pub fn recreate_swapchain(&mut self, window: &sdl3::video::Window) -> Result<()> {
+        // The native lane owns the window: no surface to size. The next frame through the
+        // swapchain path makes both again at the size recorded here.
+        if self.suspended {
+            let (width, height) = window.size_in_pixels();
+            self.extent = vk::Extent2D { width, height };
+            return Ok(());
+        }
         self.quiesce_own()?;
         // An image acquired ahead of a present belongs to the swapchain that goes now.
         self.acquired = None;
@@ -207,6 +214,10 @@ impl Presenter {
         let Some(ext) = &self.hdr_metadata_d else {
             return;
         };
+        // Suspended for the native lane: the rebuilt swapchain gets it pushed again.
+        if self.swapchain == vk::SwapchainKHR::null() {
+            return;
+        }
         // Same generic baseline as the Windows presenter: BT.2020 + D65,
         // 1000-nit mastering, MaxCLL 1000 / MaxFALL 400.
         let m = self.hdr_meta.unwrap_or(punktfunk_core::quic::HdrMeta {

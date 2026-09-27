@@ -1,11 +1,11 @@
-//! A Vulkan Video picture copied into an exportable dma-buf for the native Wayland lane.
+//! Images copied into exportable dma-bufs for the native Wayland lane.
 //!
-//! Drivers decode only into their own optimal tiling, which no compositor imports. The ring
-//! holds a few NV12 or P010 images on a DRM modifier the compositor listed, each exported as
-//! one dma-buf, and one copy submit per frame moves both planes across. The copy waits the
-//! picture's timeline value, restores its layout and signals `value + 1`: the write-back the
-//! decoder waits before it reuses a sampled picture. The fence is waited on the CPU before
-//! the commit, so the compositor never reads a half-written buffer.
+//! Drivers decode only into their own optimal tiling, which no compositor imports. A ring
+//! holds a few images on a DRM modifier the compositor listed, each exported as one dma-buf:
+//! NV12 or P010 for Vulkan Video pictures, the overlay's RGBA for the HUD surface. A picture
+//! copy waits the picture's timeline value, restores its layout and signals `value + 1`: the
+//! write-back the decoder waits before it reuses a sampled picture. Every copy's fence is
+//! waited on the CPU before the commit, so the compositor never reads a half-written buffer.
 
 use anyhow::{bail, Context as _, Result};
 use ash::vk;
@@ -19,8 +19,10 @@ pub(crate) const DRM_FORMAT_NV12: u32 = 0x3231_564e;
 pub(crate) const DRM_FORMAT_P010: u32 = 0x3031_3050;
 /// One buffer on screen, one queued in the compositor, one being written.
 const SLOTS: usize = 3;
-/// Bit 63 marks a ring key in the lane, never a VAAPI pool key.
-const KEY_RING: u64 = 1 << 63;
+/// Bit 63 marks a picture ring's key in the lane, never a VAAPI pool key.
+pub(crate) const KEY_PICTURES: u64 = 1 << 63;
+/// Bit 62 marks an overlay ring's key.
+pub(crate) const KEY_OVERLAY: u64 = 1 << 62;
 /// A copy of a 4K picture takes well under a millisecond; this bounds a wedged queue.
 const COPY_WAIT_NS: u64 = 100_000_000;
 
@@ -31,6 +33,28 @@ pub(crate) fn fourcc_for(format: RawVkFormat) -> Option<(u32, vk::Format)> {
         vk::Format::G8_B8R8_2PLANE_420_UNORM => Some((DRM_FORMAT_NV12, f)),
         vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16 => Some((DRM_FORMAT_P010, f)),
         _ => None,
+    }
+}
+
+/// DRM fourcc of an overlay image format; its alpha is premultiplied, as Wayland expects.
+pub(crate) fn overlay_fourcc(format: vk::Format) -> Option<u32> {
+    let code = |s: &[u8; 4]| u32::from_le_bytes(*s);
+    match format {
+        vk::Format::B8G8R8A8_UNORM => Some(code(b"AR24")),
+        vk::Format::R8G8B8A8_UNORM => Some(code(b"AB24")),
+        vk::Format::A2R10G10B10_UNORM_PACK32 => Some(code(b"AR30")),
+        vk::Format::A2B10G10R10_UNORM_PACK32 => Some(code(b"AB30")),
+        vk::Format::R16G16B16A16_SFLOAT => Some(code(b"AB4H")),
+        _ => None,
+    }
+}
+
+/// Memory planes an export image of `format` has with no auxiliary planes.
+fn planes_of(format: vk::Format) -> u32 {
+    match format {
+        vk::Format::G8_B8R8_2PLANE_420_UNORM
+        | vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16 => 2,
+        _ => 1,
     }
 }
 
@@ -69,8 +93,10 @@ pub(crate) struct ExportRing {
     pub(crate) modifier: u64,
     /// The lane's feedback generation the modifier was chosen under.
     pub(crate) feedback_gen: u64,
-    /// Separates this ring's keys from an earlier ring's.
-    generation: u64,
+    /// The image format; the overlay ring rebuilds when the overlay's changes.
+    pub(crate) format: vk::Format,
+    /// [`KEY_PICTURES`] or [`KEY_OVERLAY`] plus the ring generation: keys no other ring uses.
+    key_base: u64,
 }
 
 /// `(modifier, memory planes)` the driver can create `format` with as a copy target.
@@ -164,14 +190,15 @@ impl ExportRing {
         (width, height): (u32, u32),
         wanted: &[u64],
         feedback_gen: u64,
-        generation: u64,
+        key_base: u64,
     ) -> Result<Self> {
         // SAFETY: fn contract.
         let driver = unsafe { driver_modifiers(instance, pdev, format) };
+        let planes = planes_of(format);
         let candidates: Vec<u64> = wanted
             .iter()
             .copied()
-            .filter(|m| driver.iter().any(|&(dm, planes)| dm == *m && planes == 2))
+            .filter(|m| driver.iter().any(|&(dm, p)| dm == *m && p == planes))
             // SAFETY: fn contract.
             .filter(|&m| unsafe { exportable(instance, pdev, format, m) })
             .collect();
@@ -197,7 +224,8 @@ impl ExportRing {
             height,
             modifier,
             feedback_gen,
-            generation,
+            format,
+            key_base,
         };
         let image_mod = ash::ext::image_drm_format_modifier::Device::new(instance, device);
         for _ in 0..SLOTS {
@@ -314,19 +342,19 @@ impl ExportRing {
         let planes: Vec<(u32, u32)> = [
             vk::ImageAspectFlags::MEMORY_PLANE_0_EXT,
             vk::ImageAspectFlags::MEMORY_PLANE_1_EXT,
-        ]
-        .iter()
-        .map(|&aspect| {
-            let sub = vk::ImageSubresource {
-                aspect_mask: aspect,
-                mip_level: 0,
-                array_layer: 0,
-            };
-            // SAFETY: `image` is live; memory-plane aspects are legal on a modifier image.
-            let l = unsafe { d.get_image_subresource_layout(image, sub) };
-            (l.offset as u32, l.row_pitch as u32)
-        })
-        .collect();
+        ][..planes_of(format) as usize]
+            .iter()
+            .map(|&aspect| {
+                let sub = vk::ImageSubresource {
+                    aspect_mask: aspect,
+                    mip_level: 0,
+                    array_layer: 0,
+                };
+                // SAFETY: `image` is live; memory-plane aspects are legal on a modifier image.
+                let l = unsafe { d.get_image_subresource_layout(image, sub) };
+                (l.offset as u32, l.row_pitch as u32)
+            })
+            .collect();
         let cbi = vk::CommandBufferAllocateInfo::default()
             .command_pool(self.pool)
             .level(vk::CommandBufferLevel::PRIMARY)
@@ -359,7 +387,7 @@ impl ExportRing {
     }
 
     pub(crate) fn key(&self, slot: usize) -> u64 {
-        KEY_RING | (self.generation << 8) | slot as u64
+        self.key_base | slot as u64
     }
 
     /// `(fd, offset, pitch)` per memory plane of `slot`'s dma-buf, for the lane's import.
@@ -399,6 +427,194 @@ impl ExportRing {
         queue: vk::Queue,
         lock: &QueueLock,
     ) -> Result<bool> {
+        let src = vk::Image::from_raw(frame.image);
+        let decode_layout = match frame.layout {
+            NativeVkLayout::DecodeDst => vk::ImageLayout::VIDEO_DECODE_DST_KHR,
+            NativeVkLayout::DecodeDpb => vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
+        };
+        let range = subresource(frame.layer);
+        let layers = |aspect, layer| vk::ImageSubresourceLayers {
+            aspect_mask: aspect,
+            mip_level: 0,
+            base_array_layer: layer,
+            layer_count: 1,
+        };
+        let (w, h) = (self.width, self.height);
+        let regions = [
+            vk::ImageCopy {
+                src_subresource: layers(vk::ImageAspectFlags::PLANE_0, frame.layer),
+                src_offset: offset(frame.crop_x, frame.crop_y),
+                dst_subresource: layers(vk::ImageAspectFlags::PLANE_0, 0),
+                dst_offset: vk::Offset3D::default(),
+                extent: extent(w, h),
+            },
+            vk::ImageCopy {
+                src_subresource: layers(vk::ImageAspectFlags::PLANE_1, frame.layer),
+                src_offset: offset(frame.crop_x / 2, frame.crop_y / 2),
+                dst_subresource: layers(vk::ImageAspectFlags::PLANE_1, 0),
+                dst_offset: vk::Offset3D::default(),
+                extent: extent(w / 2, h / 2),
+            },
+        ];
+        let timeline = (
+            vk::Semaphore::from_raw(frame.semaphore),
+            frame.semaphore_value,
+        );
+        let record = |d: &ash::Device, cmd: vk::CommandBuffer, dst: vk::Image| {
+            {
+                // The timeline wait sits at TRANSFER, so the chain starts there.
+                let to_src = layout_barrier(
+                    src,
+                    range,
+                    decode_layout,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::AccessFlags::empty(),
+                    vk::AccessFlags::TRANSFER_READ,
+                );
+                let back = layout_barrier(
+                    src,
+                    range,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    decode_layout,
+                    vk::AccessFlags::empty(),
+                    vk::AccessFlags::empty(),
+                );
+                // SAFETY: `cmd` is recording; `src` and `dst` are live per the contract.
+                unsafe {
+                    d.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[to_src],
+                    );
+                    d.cmd_copy_image(
+                        cmd,
+                        src,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        dst,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &regions,
+                    );
+                    d.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[back],
+                    );
+                }
+            }
+        };
+        // SAFETY: fn contract.
+        unsafe { self.run(slot, Some(timeline), queue, lock, record) }
+    }
+
+    /// Copy the overlay image (Skia's, left in SHADER_READ_ONLY_OPTIMAL on this queue) into
+    /// `slot` and wait for the copy; the image returns to that layout. Results as [`Self::copy`].
+    ///
+    /// # Safety
+    ///
+    /// `src` is live on this device, `self.width`×`self.height` in the ring's format, and
+    /// its last writer was submitted on `queue`; `queue` as in [`Self::copy`].
+    pub(crate) unsafe fn copy_overlay(
+        &mut self,
+        slot: usize,
+        src: vk::Image,
+        queue: vk::Queue,
+        lock: &QueueLock,
+    ) -> Result<bool> {
+        let range = subresource(0);
+        let region = vk::ImageCopy {
+            src_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            src_offset: vk::Offset3D::default(),
+            dst_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            dst_offset: vk::Offset3D::default(),
+            extent: extent(self.width, self.height),
+        };
+        let record = |d: &ash::Device, cmd: vk::CommandBuffer, dst: vk::Image| {
+            {
+                let to_src = layout_barrier(
+                    src,
+                    range,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                    vk::AccessFlags::TRANSFER_READ,
+                );
+                let back = layout_barrier(
+                    src,
+                    range,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::AccessFlags::empty(),
+                    vk::AccessFlags::SHADER_READ,
+                );
+                // SAFETY: `cmd` is recording; `src` and `dst` are live per the contract.
+                unsafe {
+                    // Skia's draw on this queue precedes the copy: its colour writes chain in.
+                    d.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[to_src],
+                    );
+                    d.cmd_copy_image(
+                        cmd,
+                        src,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        dst,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[region],
+                    );
+                    d.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::FRAGMENT_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[back],
+                    );
+                }
+            }
+        };
+        // SAFETY: fn contract.
+        unsafe { self.run(slot, None, queue, lock, record) }
+    }
+
+    /// One copy into `slot`: take the export image back from the compositor, let `record`
+    /// copy into it, hand it back, submit (waiting `timeline`'s value at TRANSFER and
+    /// signalling value + 1) and wait the fence. Results as [`Self::copy`].
+    ///
+    /// # Safety
+    ///
+    /// Whatever `record` names is live on this device; `queue` as in [`Self::copy`].
+    unsafe fn run(
+        &mut self,
+        slot: usize,
+        timeline: Option<(vk::Semaphore, u64)>,
+        queue: vk::Queue,
+        lock: &QueueLock,
+        record: impl FnOnce(&ash::Device, vk::CommandBuffer, vk::Image),
+    ) -> Result<bool> {
         let d = &self.device;
         let own = self.qfi;
         let s = &mut self.slots[slot];
@@ -408,126 +624,30 @@ impl ExportRing {
                 .context("an earlier copy never finished")?;
             s.in_flight = false;
         }
-        // SAFETY: the fence is unsignalled-or-idle: its submit, if any, completed above.
+        // SAFETY: the fence is idle: its submit, if any, completed above.
         unsafe { d.reset_fences(&[s.fence]) }.context("vkResetFences")?;
-        let src = vk::Image::from_raw(frame.image);
-        let decode_layout = match frame.layout {
-            NativeVkLayout::DecodeDst => vk::ImageLayout::VIDEO_DECODE_DST_KHR,
-            NativeVkLayout::DecodeDpb => vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
-        };
-        let src_range = vk::ImageSubresourceRange::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .level_count(1)
-            .base_array_layer(frame.layer)
-            .layer_count(1);
-        let dst_range = vk::ImageSubresourceRange::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .level_count(1)
-            .layer_count(1);
-        let barrier = |image, range, from, to, src_q, dst_q, src_a, dst_a| {
-            vk::ImageMemoryBarrier::default()
-                .image(image)
-                .subresource_range(range)
-                .old_layout(from)
-                .new_layout(to)
-                .src_queue_family_index(src_q)
-                .dst_queue_family_index(dst_q)
-                .src_access_mask(src_a)
-                .dst_access_mask(dst_a)
-        };
-        let qfi_ignored = vk::QUEUE_FAMILY_IGNORED;
         let foreign = vk::QUEUE_FAMILY_FOREIGN_EXT;
-        let before = [
-            // Picture: decode layout to copy source, after the timeline wait at TRANSFER.
-            barrier(
-                src,
-                src_range,
-                decode_layout,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                qfi_ignored,
-                qfi_ignored,
-                vk::AccessFlags::empty(),
-                vk::AccessFlags::TRANSFER_READ,
-            ),
-            // Export image back from the compositor; its old contents are overwritten.
-            barrier(
-                s.image,
-                dst_range,
-                vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                foreign,
-                own,
-                vk::AccessFlags::empty(),
-                vk::AccessFlags::TRANSFER_WRITE,
-            ),
-        ];
-        let after = [
-            barrier(
-                src,
-                src_range,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                decode_layout,
-                qfi_ignored,
-                qfi_ignored,
-                vk::AccessFlags::empty(),
-                vk::AccessFlags::empty(),
-            ),
-            // Hand the buffer to the compositor.
-            barrier(
-                s.image,
-                dst_range,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::ImageLayout::GENERAL,
-                own,
-                foreign,
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::empty(),
-            ),
-        ];
-        let layers = |aspect, layer| vk::ImageSubresourceLayers {
-            aspect_mask: aspect,
-            mip_level: 0,
-            base_array_layer: layer,
-            layer_count: 1,
-        };
-        let regions = [
-            vk::ImageCopy {
-                src_subresource: layers(vk::ImageAspectFlags::PLANE_0, frame.layer),
-                src_offset: vk::Offset3D {
-                    x: frame.crop_x as i32,
-                    y: frame.crop_y as i32,
-                    z: 0,
-                },
-                dst_subresource: layers(vk::ImageAspectFlags::PLANE_0, 0),
-                dst_offset: vk::Offset3D::default(),
-                extent: vk::Extent3D {
-                    width: self.width,
-                    height: self.height,
-                    depth: 1,
-                },
-            },
-            vk::ImageCopy {
-                src_subresource: layers(vk::ImageAspectFlags::PLANE_1, frame.layer),
-                src_offset: vk::Offset3D {
-                    x: (frame.crop_x / 2) as i32,
-                    y: (frame.crop_y / 2) as i32,
-                    z: 0,
-                },
-                dst_subresource: layers(vk::ImageAspectFlags::PLANE_1, 0),
-                dst_offset: vk::Offset3D::default(),
-                extent: vk::Extent3D {
-                    width: self.width / 2,
-                    height: self.height / 2,
-                    depth: 1,
-                },
-            },
-        ];
-        let sem = vk::Semaphore::from_raw(frame.semaphore);
-        let wait_values = [frame.semaphore_value];
-        let signal_values = [frame.semaphore_value + 1];
-        let sems = [sem];
-        let stages = [vk::PipelineStageFlags::TRANSFER];
-        let cmds = [s.cmd];
+        // Back from the compositor; the old contents are overwritten.
+        let acquire = layout_barrier(
+            s.image,
+            subresource(0),
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::AccessFlags::empty(),
+            vk::AccessFlags::TRANSFER_WRITE,
+        )
+        .src_queue_family_index(foreign)
+        .dst_queue_family_index(own);
+        let release = layout_barrier(
+            s.image,
+            subresource(0),
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::GENERAL,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::AccessFlags::empty(),
+        )
+        .src_queue_family_index(own)
+        .dst_queue_family_index(foreign);
         // SAFETY: the slot's command buffer is idle (fence waited above); every handle it
         // names is live per the fn contract; builders are locals outliving each call.
         unsafe {
@@ -538,21 +658,14 @@ impl ExportRing {
             )?;
             d.cmd_pipeline_barrier(
                 s.cmd,
-                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                &before,
+                &[acquire],
             );
-            d.cmd_copy_image(
-                s.cmd,
-                src,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                s.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &regions,
-            );
+            record(d, s.cmd, s.image);
             d.cmd_pipeline_barrier(
                 s.cmd,
                 vk::PipelineStageFlags::TRANSFER,
@@ -560,19 +673,29 @@ impl ExportRing {
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                &after,
+                &[release],
             );
             d.end_command_buffer(s.cmd)?;
         }
-        let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
+        let cmds = [s.cmd];
+        let sems: Vec<vk::Semaphore> = timeline.iter().map(|t| t.0).collect();
+        let wait_values: Vec<u64> = timeline.iter().map(|t| t.1).collect();
+        let signal_values: Vec<u64> = timeline.iter().map(|t| t.1 + 1).collect();
+        let stages: Vec<vk::PipelineStageFlags> = timeline
+            .iter()
+            .map(|_| vk::PipelineStageFlags::TRANSFER)
+            .collect();
+        let mut timeline_info = vk::TimelineSemaphoreSubmitInfo::default()
             .wait_semaphore_values(&wait_values)
             .signal_semaphore_values(&signal_values);
-        let submit = vk::SubmitInfo::default()
+        let mut submit = vk::SubmitInfo::default()
             .wait_semaphores(&sems)
             .wait_dst_stage_mask(&stages)
             .command_buffers(&cmds)
-            .signal_semaphores(&sems)
-            .push_next(&mut timeline);
+            .signal_semaphores(&sems);
+        if timeline.is_some() {
+            submit = submit.push_next(&mut timeline_info);
+        }
         {
             let _q = lock.guard();
             // SAFETY: fn contract (queue external sync held by `_q`); the submit's arrays
@@ -590,6 +713,51 @@ impl ExportRing {
             Err(e) => Err(e).context("vkWaitForFences (copy)"),
         }
     }
+}
+
+/// One colour subresource at array `layer`: the whole picture, every plane.
+fn subresource(layer: u32) -> vk::ImageSubresourceRange {
+    vk::ImageSubresourceRange::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .level_count(1)
+        .base_array_layer(layer)
+        .layer_count(1)
+}
+
+fn offset(x: u32, y: u32) -> vk::Offset3D {
+    vk::Offset3D {
+        x: x as i32,
+        y: y as i32,
+        z: 0,
+    }
+}
+
+fn extent(width: u32, height: u32) -> vk::Extent3D {
+    vk::Extent3D {
+        width,
+        height,
+        depth: 1,
+    }
+}
+
+/// A layout transition with no queue-family transfer.
+fn layout_barrier(
+    image: vk::Image,
+    range: vk::ImageSubresourceRange,
+    from: vk::ImageLayout,
+    to: vk::ImageLayout,
+    src_access: vk::AccessFlags,
+    dst_access: vk::AccessFlags,
+) -> vk::ImageMemoryBarrier<'static> {
+    vk::ImageMemoryBarrier::default()
+        .image(image)
+        .subresource_range(range)
+        .old_layout(from)
+        .new_layout(to)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .src_access_mask(src_access)
+        .dst_access_mask(dst_access)
 }
 
 impl Drop for ExportRing {
@@ -630,18 +798,38 @@ mod tests {
         assert_eq!(fourcc_for(yuv444), None);
     }
 
-    /// Ring keys never collide with a VAAPI pool key (high half = pool generation) and
-    /// stay distinct across ring generations.
+    /// Ring keys never collide with a VAAPI pool key (high half = pool generation), with the
+    /// other kind of ring, or across ring generations (`key_base` = kind | generation << 8).
     #[test]
     fn ring_keys_live_in_their_own_namespace() {
-        let key = |generation: u64, slot: u64| KEY_RING | (generation << 8) | slot;
-        assert_ne!(key(1, 0), key(2, 0));
-        assert_ne!(key(1, 0), key(1, 1));
-        assert!(key(1, 2) & KEY_RING != 0);
+        let key = |kind: u64, generation: u64, slot: u64| kind | (generation << 8) | slot;
+        assert_ne!(key(KEY_PICTURES, 1, 0), key(KEY_PICTURES, 2, 0));
+        assert_ne!(key(KEY_PICTURES, 1, 0), key(KEY_PICTURES, 1, 1));
+        assert_ne!(key(KEY_PICTURES, 1, 0), key(KEY_OVERLAY, 1, 0));
         assert_eq!(
-            (7u64 << 32 | 3) & KEY_RING,
+            (7u64 << 32 | 3) & (KEY_PICTURES | KEY_OVERLAY),
             0,
-            "a VAAPI pool key never sets bit 63"
+            "a VAAPI pool key never sets bit 63 or 62"
         );
+    }
+
+    /// The overlay's formats map to the DRM codes whose byte order they share.
+    #[test]
+    fn overlay_formats_name_their_drm_codes() {
+        assert_eq!(
+            overlay_fourcc(vk::Format::B8G8R8A8_UNORM),
+            Some(0x3432_5241)
+        );
+        assert_eq!(
+            overlay_fourcc(vk::Format::R8G8B8A8_UNORM),
+            Some(0x3432_4241)
+        );
+        assert_eq!(
+            overlay_fourcc(vk::Format::R16G16B16A16_SFLOAT),
+            Some(0x4834_4241)
+        );
+        assert_eq!(overlay_fourcc(vk::Format::R8_UNORM), None);
+        assert_eq!(planes_of(vk::Format::B8G8R8A8_UNORM), 1);
+        assert_eq!(planes_of(vk::Format::G8_B8R8_2PLANE_420_UNORM), 2);
     }
 }

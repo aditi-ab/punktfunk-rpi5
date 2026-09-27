@@ -723,7 +723,15 @@ impl Presenter {
             export_refused: None,
             #[cfg(target_os = "linux")]
             export_gen: 0,
+            #[cfg(target_os = "linux")]
+            overlay_ring: None,
+            #[cfg(target_os = "linux")]
+            overlay_refused: None,
+            #[cfg(target_os = "linux")]
+            overlay_shown: None,
+            overlay_blocks_native: false,
             native_last: false,
+            suspended: false,
         };
         p.recreate_swapchain(window)?;
         Ok(p)
