@@ -319,13 +319,13 @@ public final class PunktfunkConnection: @unchecked Sendable {
         /// A Windows host's only backend. The host reports it; a client never requests it.
         case windows = 6
 
-        /// Loose name parsing for env/dev hooks ("kde" and "sway" are accepted aliases,
-        /// mirroring the host's `CompositorPref::from_name`).
+        /// Loose name parsing for env/dev hooks: the same names as the host's
+        /// `CompositorPref::from_name`.
         public init?(name: String) {
-            switch name.lowercased() {
-            case "auto": self = .auto
-            case "kwin", "kde": self = .kwin
-            case "wlroots", "sway", "river": self = .wlroots
+            switch name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "auto", "detect", "default": self = .auto
+            case "kwin", "kde", "plasma": self = .kwin
+            case "wlroots", "sway", "river", "wlr": self = .wlroots
             case "mutter", "gnome": self = .mutter
             case "gamescope": self = .gamescope
             case "hyprland": self = .hyprland
@@ -378,21 +378,25 @@ public final class PunktfunkConnection: @unchecked Sendable {
         /// `Sc2Capture`, where acting on a wired pad's (truthful, but irrelevant) "no radio link"
         /// once tore the wire slot down 255 ms after it was created.
         case steamController2Puck = 10
+        /// Xbox Elite Series 2 (Windows UMDF hosts; other hosts fold it to `.xbox360`). No picker
+        /// offers it; it exists so the host's echo and the dev hook's name round-trip.
+        case xboxElite = 11
 
-        /// Loose name parsing for env/dev hooks, mirroring the host's
+        /// Loose name parsing for env/dev hooks: the same names as the host's
         /// `GamepadPref::from_name`.
         public init?(name: String) {
-            switch name.lowercased() {
+            switch name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
             case "auto", "default": self = .auto
             case "xbox", "xbox360", "x360", "uinput": self = .xbox360
-            case "dualsense", "ds", "ds5", "ps5": self = .dualSense
-            case "xboxone", "xbox-one", "xboxseries", "series": self = .xboxOne
+            case "dualsense", "ds", "ps5": self = .dualSense
+            case "xboxone", "xbox-one", "xone", "xbox1", "series", "xboxseries": self = .xboxOne
+            case "xboxelite", "xbox-elite", "elite", "xboxelite2", "elite2": self = .xboxElite
             case "dualshock4", "dualshock", "ds4", "ps4": self = .dualShock4
             case "steamdeck", "steam-deck", "deck": self = .steamDeck
             case "steamcontroller", "steam-controller", "steamcon": self = .steamController
             case "steamcontroller2", "steam-controller-2", "steamcon2", "sc2", "ibex":
                 self = .steamController2
-            case "steamcontroller2puck", "steam-controller-2-puck", "sc2puck", "sc2-puck", "puck":
+            case "steamcontroller2puck", "steam-controller-2-puck", "sc2puck", "ibexpuck":
                 self = .steamController2Puck
             case "dualsenseedge", "dualsense-edge", "edge", "dsedge": self = .dualSenseEdge
             case "switchpro", "switch-pro", "switch", "procontroller", "pro-controller":
@@ -403,7 +407,7 @@ public final class PunktfunkConnection: @unchecked Sendable {
 
         /// Whether this backend has a motion plane at all — whether a `sendMotion` sample to a
         /// host running it can reach the game, or is decoded and dropped. Mirrors the host's
-        /// `GamepadPref::has_motion`; the X-Box classes have no gyro in their HID contract.
+        /// `GamepadPref::has_motion`; no X-Box pad, Elite included, has a gyro in its HID contract.
         ///
         /// This answers for ONE backend. To ask it of a particular pad, go through
         /// `PunktfunkConnection.motionReaches(declared:)` — `resolvedGamepad` is not that pad's
@@ -417,7 +421,7 @@ public final class PunktfunkConnection: @unchecked Sendable {
         public var hasMotion: Bool {
             switch self {
             case .auto: return true // unknown; assume it can, see above
-            case .xbox360, .xboxOne: return false
+            case .xbox360, .xboxOne, .xboxElite: return false
             case .dualSense, .dualShock4, .dualSenseEdge, .switchPro,
                  .steamController, .steamDeck, .steamController2, .steamController2Puck:
                 return true

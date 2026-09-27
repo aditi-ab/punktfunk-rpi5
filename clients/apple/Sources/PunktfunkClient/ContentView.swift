@@ -256,9 +256,9 @@ struct ContentView: View {
             ) { _ in
                 Button("Cancel", role: .cancel) { model.disconnect() }
             } message: { req in
-                Text("Approve \u{201C}\(localDeviceName)\u{201D} in \(req.host.displayName)'s web "
-                    + "console (port 47992 → Pairing). This device connects automatically once you "
-                    + "approve it — no need to reconnect.")
+                Text("Approve \u{201C}\(DeviceName.current)\u{201D} in \(req.host.displayName)'s "
+                    + "web console (port 47992 → Pairing). This device connects automatically once "
+                    + "you approve it — no need to reconnect.")
             }
             // Informational deep-link outcome (unknown host, a refused preset, already
             // streaming). Not an error.
@@ -1618,15 +1618,6 @@ struct ContentView: View {
     private func pinFingerprint(_ hex: String?) -> Data? {
         guard let hex, let data = Data(hexString: hex), data.count == 32 else { return nil }
         return data
-    }
-
-    /// How the host lists this device in its approval prompt (matches PairSheet's client name).
-    private var localDeviceName: String {
-        #if os(macOS)
-        Host.current().localizedName ?? "Mac"
-        #else
-        UIDevice.current.name
-        #endif
     }
 
     // MARK: - First-run + dev hooks

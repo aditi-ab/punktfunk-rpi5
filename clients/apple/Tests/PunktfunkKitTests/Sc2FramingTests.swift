@@ -156,7 +156,7 @@ final class Sc2FramingTests: XCTestCase {
         // Both SC2 kinds carry motion (the IMU rides inside the opaque raw report), and both
         // parse from their names — the env/dev hook the host's `GamepadPref::from_name` mirrors.
         XCTAssertTrue(PunktfunkConnection.GamepadType.steamController2Puck.hasMotion)
-        XCTAssertEqual(PunktfunkConnection.GamepadType(name: "puck"), .steamController2Puck)
+        XCTAssertEqual(PunktfunkConnection.GamepadType(name: "ibexpuck"), .steamController2Puck)
         XCTAssertEqual(PunktfunkConnection.GamepadType(name: "sc2puck"), .steamController2Puck)
         XCTAssertEqual(PunktfunkConnection.GamepadType(name: "sc2"), .steamController2)
     }
