@@ -3226,6 +3226,7 @@ dependencies = [
 name = "pf-dxvadec"
 version = "0.40.0"
 dependencies = [
+ "bytemuck",
  "cros-codecs",
  "pf-bitstream",
  "pf-vkdecode",
