@@ -563,16 +563,11 @@ impl Presenter {
             t.drain();
         }
         self.last_presented = None;
-        let (views, framebuffers) = self.overlay_pipe.take_targets();
+        // The queue wait above is the GPU idle its contract asks for.
+        self.overlay_pipe.destroy_targets(&self.device);
         // SAFETY: our fence, the queue and the present waiter are drained above, so nothing
         // still names these objects; destroying a null swapchain or surface is a no-op.
         unsafe {
-            for fb in framebuffers {
-                self.device.destroy_framebuffer(fb, None);
-            }
-            for v in views {
-                self.device.destroy_image_view(v, None);
-            }
             for s in self.render_sems.drain(..) {
                 self.device.destroy_semaphore(s, None);
             }

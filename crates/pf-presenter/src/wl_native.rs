@@ -1205,8 +1205,8 @@ impl NativeLane {
     ) -> bool {
         // A leftover sync_file costs a poll.
         for fd in &d.sync_fds {
-            use std::os::fd::AsRawFd as _;
-            let _ = pf_zerocopy::dmabuf_fence::wait_sync_file(fd.as_raw_fd(), 50);
+            use std::os::fd::AsFd as _;
+            let _ = pf_zerocopy::dmabuf_fence::wait_sync_file(fd.as_fd(), 50);
         }
         let (key, color) = (d.pool_key, d.color);
         let DmabufFrame { guard, .. } = d;

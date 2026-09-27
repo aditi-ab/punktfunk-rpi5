@@ -875,9 +875,8 @@ mod linux {
             let mod_dev = ash::ext::image_drm_format_modifier::Device::new(&self.instance, d);
             let mut mp = vk::ImageDrmFormatModifierPropertiesEXT::default();
             // SAFETY: `image` is live on this device.
-            if let Err(e) =
-                unsafe { mod_dev.get_image_drm_format_modifier_properties(image, &mut mp) }
-            {
+            let got = unsafe { mod_dev.get_image_drm_format_modifier_properties(image, &mut mp) };
+            if let Err(e) = got {
                 // SAFETY: destroying the just-created, never-bound image.
                 unsafe { d.destroy_image(image, None) };
                 return Err(e).context("vkGetImageDrmFormatModifierPropertiesEXT");
@@ -1598,7 +1597,7 @@ mod linux {
                 }
             };
             let _top_repr = (layout.name == "toplevel" && fourcc != DRM_FORMAT_XR24)
-                .then(|| app.color_repr.as_ref())
+                .then_some(app.color_repr.as_ref())
                 .flatten()
                 .map(|m| {
                     let s = m.get_surface(&parent, &qh, ());
