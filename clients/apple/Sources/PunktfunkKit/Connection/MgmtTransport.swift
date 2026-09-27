@@ -153,12 +153,16 @@ actor MgmtConnectionPool {
     private var epoch: [String: UInt64] = [:]
     /// Also the retry budget: every pooled socket may be a stale keep-alive.
     static let maxPerHost = 4
+    /// Idle longer than this and a pooled socket is replaced, not trusted: a host that vanished
+    /// silently costs a full request timeout per socket before the retry loop gives up.
+    static let maxIdle: TimeInterval = 20
 
     func acquire(key: String, make: () -> MgmtConnection) async -> MgmtConnection {
         while true {
             if var idle = available[key], let connection = idle.popLast() {
                 available[key] = idle
-                if connection.isHealthy {
+                let fresh = ProcessInfo.processInfo.systemUptime - connection.pooledAt < Self.maxIdle
+                if connection.isHealthy, fresh {
                     connection.poolEpoch = epoch[key] ?? 0
                     return connection
                 }
@@ -184,6 +188,7 @@ actor MgmtConnectionPool {
         let stillCurrent = connection.poolEpoch == (epoch[key] ?? 0)
         if connection.isHealthy, stillCurrent,
            (available[key]?.count ?? 0) < Self.maxPerHost {
+            connection.pooledAt = ProcessInfo.processInfo.systemUptime
             available[key, default: []].append(connection)
         } else {
             connection.close()
@@ -237,6 +242,8 @@ final class MgmtConnection: @unchecked Sendable {
     /// The pool's checkout stamp — written and read only by `MgmtConnectionPool`, which is why
     /// it needs no queue hop.
     var poolEpoch: UInt64 = 0
+    /// When the pool last took it back (system uptime). Pool-owned, like `poolEpoch`.
+    var pooledAt: TimeInterval = 0
     /// False once the connection has failed; the pool discards these instead of handing them out.
     private(set) var isHealthy = true
     /// Has this connection completed at least one request? Drives the retry-once rule in
@@ -344,6 +351,13 @@ final class MgmtConnection: @unchecked Sendable {
         case .failed(let error):
             phase = .dead
             isHealthy = false
+            finish(.failure(mapped(error)))
+        case .waiting(let error):
+            // Refused, or no route: NWConnection would wait for a better path while the request
+            // sat out its whole timeout. Fail it now; the callers own their retries.
+            phase = .dead
+            isHealthy = false
+            connection.cancel()
             finish(.failure(mapped(error)))
         case .cancelled:
             phase = .dead
