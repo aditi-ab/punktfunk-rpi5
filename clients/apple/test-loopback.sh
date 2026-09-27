@@ -66,4 +66,4 @@ cd clients/apple
 PUNKTFUNK_LOOPBACK_PORT="$PORT" PUNKTFUNK_PAIRING_PORT="$PAIR_PORT" PUNKTFUNK_PAIRING_PIN="$PIN" \
     PUNKTFUNK_GUESS_PORT="$GUESS_PORT" PUNKTFUNK_GUESS_PIN="$GUESS_PIN" \
     PUNKTFUNK_TEST_FEEDBACK=1 \
-    swift test --filter 'LoopbackIntegrationTests|AudioDeviceSwitchTests'
+    swift test --filter 'LoopbackIntegrationTests|AudioDeviceSwitchTests|MicUplinkTests'
