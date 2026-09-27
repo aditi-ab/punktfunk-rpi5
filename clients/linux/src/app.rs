@@ -521,38 +521,22 @@ impl SimpleComponent for AppModel {
             AppMsg::SpeedTest(req) => self.speed_test(req, &sender),
             AppMsg::SendLogs(req, mgmt_port) => {
                 // Blocking network (the library agent's 5 s connect / 10 s global budgets) —
-                // a worker thread, with the outcome routed back as a Toast. Wording is the
-                // console's verbatim, so a quoted message means the same thing everywhere.
+                // a worker thread, with the outcome routed back as a Toast.
                 let identity = self.identity.clone();
-                let pin = req.fp_hex.as_deref().and_then(trust::parse_hex32);
                 let mgmt = mgmt_port.unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT);
                 self.toast(&format!("Sending logs to {}…", req.name));
                 let out = sender.input_sender().clone();
                 std::thread::Builder::new()
                     .name("punktfunk-sendlogs".into())
                     .spawn(move || {
-                        let header = format!(
-                            "punktfunk-client {} ({} {}) — client log bundle",
-                            env!("CARGO_PKG_VERSION"),
-                            std::env::consts::OS,
-                            std::env::consts::ARCH,
+                        let msg = pf_client_core::logring::send_bundle(
+                            "punktfunk-client",
+                            &req.name,
+                            &req.addr,
+                            mgmt,
+                            &identity,
+                            req.fp_hex.as_deref().unwrap_or_default(),
                         );
-                        let msg = match pf_client_core::logring::send_to_host(
-                            &req.addr, mgmt, &identity, pin, &header,
-                        ) {
-                            Ok(id) => {
-                                tracing::info!(host = %req.name, id, "client logs uploaded");
-                                format!(
-                                    "Logs sent to {} — download them from its web console's \
-                                     Logs page",
-                                    req.name
-                                )
-                            }
-                            Err(e) => {
-                                tracing::warn!(host = %req.name, error = %e, "client log upload failed");
-                                format!("Couldn't send logs — {e}")
-                            }
-                        };
                         let _ = out.send(AppMsg::Toast(msg));
                     })
                     .ok();
@@ -597,32 +581,22 @@ impl SimpleComponent for AppModel {
                     dialog.present(Some(&self.window));
                     return;
                 }
-                // Blocking network on a worker, outcome as a toast — the SendLogs recipe. A
-                // 202 is the last word: the host ends every session and acts a second later,
-                // so there is nothing to poll and nothing to undo.
+                // Blocking network on a worker, outcome as a toast — the SendLogs recipe.
                 let identity = self.identity.clone();
-                let pin = req.fp_hex.as_deref().and_then(trust::parse_hex32);
-                if let Some(fp) = req.fp_hex.as_deref() {
-                    // Whatever the host said about itself is about to be wrong.
-                    pf_client_core::host_actions::invalidate(fp);
-                }
                 self.toast(&format!("{label} — asking {}…", req.name));
                 let out = sender.input_sender().clone();
                 std::thread::Builder::new()
                     .name("punktfunk-hostaction".into())
                     .spawn(move || {
-                        let msg = match pf_client_core::host_actions::invoke(
-                            &req.addr, mgmt, &identity, pin, &action_id,
-                        ) {
-                            Ok(()) => {
-                                tracing::info!(host = %req.name, action = %action_id, "host action accepted");
-                                format!("{}: {label} — on its way", req.name)
-                            }
-                            Err(e) => {
-                                tracing::warn!(host = %req.name, action = %action_id, error = %e, "host action refused");
-                                format!("{label} failed — {e}")
-                            }
-                        };
+                        let msg = pf_client_core::host_actions::run(
+                            &req.name,
+                            &req.addr,
+                            mgmt,
+                            &identity,
+                            req.fp_hex.as_deref().unwrap_or_default(),
+                            &action_id,
+                            &label,
+                        );
                         let _ = out.send(AppMsg::Toast(msg));
                     })
                     .ok();

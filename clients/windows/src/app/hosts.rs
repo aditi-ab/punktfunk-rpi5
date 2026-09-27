@@ -923,38 +923,21 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                             }
                             let identity = svc.ctx.identity.clone();
                             let target = target.clone();
-                            if let Some(fp) = target.fp_hex.as_deref() {
-                                // Whatever the host said about itself is about to be wrong.
-                                pf_client_core::host_actions::invalidate(fp);
-                            }
                             set_status.call(format!("{label} — asking {}…", target.name));
                             let _ = std::thread::Builder::new()
                                 .name("punktfunk-hostaction".into())
                                 .spawn(move || {
-                                    let pin = target
-                                        .fp_hex
-                                        .as_deref()
-                                        .and_then(crate::trust::parse_hex32);
-                                    let mgmt = target
-                                        .mgmt_port
-                                        .unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT);
-                                    let msg = match pf_client_core::host_actions::invoke(
+                                    set_status.call(pf_client_core::host_actions::run(
+                                        &target.name,
                                         &target.addr,
-                                        mgmt,
+                                        target
+                                            .mgmt_port
+                                            .unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT),
                                         &identity,
-                                        pin,
+                                        target.fp_hex.as_deref().unwrap_or_default(),
                                         &action_id,
-                                    ) {
-                                        Ok(()) => {
-                                            tracing::info!(host = %target.name, action = %action_id, "host action accepted");
-                                            format!("{}: {label} — on its way", target.name)
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(host = %target.name, action = %action_id, error = %e, "host action refused");
-                                            format!("{label} failed — {e}")
-                                        }
-                                    };
-                                    set_status.call(msg);
+                                        &label,
+                                    ));
                                 });
                         }
                         // The preset items are dynamic, so they are matched by prefix before
@@ -1019,8 +1002,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                         MENU_SEND_LOGS => {
                             // Blocking network (the library agent's 5 s connect / 10 s global
                             // budgets) — a worker thread, with the outcome routed to the
-                            // status line. Wording is the console's verbatim, so a quoted
-                            // message means the same thing everywhere.
+                            // status line.
                             let identity = svc.ctx.identity.clone();
                             let target = target.clone();
                             let set_status = svc.set_status.clone();
@@ -1028,40 +1010,16 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                             let _ = std::thread::Builder::new()
                                 .name("punktfunk-sendlogs".into())
                                 .spawn(move || {
-                                    let header = format!(
-                                        "punktfunk-client {} ({} {}) — client log bundle",
-                                        env!("CARGO_PKG_VERSION"),
-                                        std::env::consts::OS,
-                                        std::env::consts::ARCH,
-                                    );
-                                    let pin = target
-                                        .fp_hex
-                                        .as_deref()
-                                        .and_then(crate::trust::parse_hex32);
-                                    let mgmt = target
-                                        .mgmt_port
-                                        .unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT);
-                                    let msg = match pf_client_core::logring::send_to_host(
+                                    set_status.call(pf_client_core::logring::send_bundle(
+                                        "punktfunk-client",
+                                        &target.name,
                                         &target.addr,
-                                        mgmt,
+                                        target
+                                            .mgmt_port
+                                            .unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT),
                                         &identity,
-                                        pin,
-                                        &header,
-                                    ) {
-                                        Ok(id) => {
-                                            tracing::info!(host = %target.name, id, "client logs uploaded");
-                                            format!(
-                                                "Logs sent to {} — download them from its web \
-                                                 console's Logs page",
-                                                target.name
-                                            )
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(host = %target.name, error = %e, "client log upload failed");
-                                            format!("Couldn't send logs — {e}")
-                                        }
-                                    };
-                                    set_status.call(msg);
+                                        target.fp_hex.as_deref().unwrap_or_default(),
+                                    ));
                                 });
                         }
                         MENU_SPEED => {

@@ -571,32 +571,18 @@ impl ServiceState {
                 // a worker thread keeps the service loop's host refresh alive meanwhile. The
                 // result lands as a shared-model notice; the shell toasts it on its next sync.
                 let identity = self.identity.clone();
-                let pin = trust::parse_hex32(&fp_hex);
                 let console = self.console.clone();
                 std::thread::Builder::new()
                     .name("punktfunk-sendlogs".into())
                     .spawn(move || {
-                        let header = format!(
-                            "punktfunk-session {} ({} {}) — client log bundle",
-                            env!("CARGO_PKG_VERSION"),
-                            std::env::consts::OS,
-                            std::env::consts::ARCH,
-                        );
-                        match pf_client_core::logring::send_to_host(
-                            &addr, mgmt, &identity, pin, &header,
-                        ) {
-                            Ok(id) => {
-                                tracing::info!(host = %host_name, id, "client logs uploaded");
-                                console.set_notice(format!(
-                                    "Logs sent to {host_name} — download them from its web \
-                                     console's Logs page"
-                                ));
-                            }
-                            Err(e) => {
-                                tracing::warn!(host = %host_name, error = %e, "client log upload failed");
-                                console.set_notice(format!("Couldn't send logs — {e}"));
-                            }
-                        }
+                        console.set_notice(pf_client_core::logring::send_bundle(
+                            "punktfunk-session",
+                            &host_name,
+                            &addr,
+                            mgmt,
+                            &identity,
+                            &fp_hex,
+                        ));
                     })
                     .ok();
             }
@@ -656,29 +642,15 @@ impl ServiceState {
                 label,
             } => {
                 // Same lane and budgets as SendLogs above, and the same worker-thread reason.
-                // A 202 is the last word: the host ends every session and acts a second later,
-                // so there is nothing to poll and nothing to undo — say it plainly and let the
-                // tile go dark on its own.
+                // The tile goes dark on its own once the host acts.
                 let identity = self.identity.clone();
-                let pin = trust::parse_hex32(&fp_hex);
                 let console = self.console.clone();
-                // Whatever the host said about itself is about to be wrong.
-                pf_client_core::host_actions::invalidate(&fp_hex);
                 std::thread::Builder::new()
                     .name("punktfunk-hostaction".into())
                     .spawn(move || {
-                        match pf_client_core::host_actions::invoke(
-                            &addr, mgmt, &identity, pin, &action_id,
-                        ) {
-                            Ok(()) => {
-                                tracing::info!(host = %host_name, action = %action_id, "host action accepted");
-                                console.set_notice(format!("{host_name}: {label} — on its way"));
-                            }
-                            Err(e) => {
-                                tracing::warn!(host = %host_name, action = %action_id, error = %e, "host action refused");
-                                console.set_notice(format!("{label} failed — {e}"));
-                            }
-                        }
+                        console.set_notice(pf_client_core::host_actions::run(
+                            &host_name, &addr, mgmt, &identity, &fp_hex, &action_id, &label,
+                        ));
                     })
                     .ok();
             }
