@@ -42,9 +42,7 @@ struct ConnectToHostIntent: AppIntent {
 
     func perform() async throws -> some IntentResult {
         let url = DeepLink.connect(host: host.id, launchID: launchID, preset: profile?.id).url
-        await MainActor.run {
-            NotificationCenter.default.post(name: .punktfunkOpenDeepLink, object: url as NSURL)
-        }
+        await MainActor.run { DeepLinkInbox.post(url) }
         return .result()
     }
 }
@@ -64,9 +62,7 @@ struct OpenLibraryIntent: AppIntent {
 
     func perform() async throws -> some IntentResult {
         let url = DeepLink.browse(host: host.id).url
-        await MainActor.run {
-            NotificationCenter.default.post(name: .punktfunkOpenDeepLink, object: url as NSURL)
-        }
+        await MainActor.run { DeepLinkInbox.post(url) }
         return .result()
     }
 }

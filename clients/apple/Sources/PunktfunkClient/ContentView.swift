@@ -173,10 +173,6 @@ struct ContentView: View {
     /// by `applyStartScreen` and by `handleDeepLink`, so whichever fires first on a cold start
     /// wins and the other stands down.
     @MainActor private static var startApplied = false
-    #if os(macOS)
-    /// The intent link a window already took, so every other window lets it be.
-    @MainActor private static weak var takenLink: NSURL?
-    #endif
     /// Background keep-alive (Settings → General, iOS-only). Default OFF (today's freeze-on-background
     /// is the default). When on, backgrounding a live session keeps audio + the connection alive and
     /// drops video, auto-disconnecting after `backgroundTimeoutMinutes`.
@@ -328,6 +324,9 @@ struct ContentView: View {
             DemoMode.resume(in: store)
             seedDefaultModeIfNeeded()
             autoConnectIfAsked()
+            // An intent that ran before this window subscribed. Ahead of the start screen,
+            // which stands down for a link.
+            if let link = DeepLinkInbox.takePending() { handleDeepLink(link) }
             applyStartScreen()
             #if os(iOS)
             SessionActivityController.sweepOrphans() // end any Activity a prior killed launch left
@@ -431,11 +430,11 @@ struct ContentView: View {
             // Every window hears it: the front one takes it now, another only if none did.
             let wait: TimeInterval = controlActiveState == .key ? 0 : 0.25
             DispatchQueue.main.asyncAfter(deadline: .now() + wait) {
-                guard Self.takenLink !== link else { return }
-                Self.takenLink = link
+                guard DeepLinkInbox.take(link) else { return }
                 handleDeepLink(link as URL)
             }
             #else
+            guard DeepLinkInbox.take(link) else { return }
             handleDeepLink(link as URL)
             #endif
         }
