@@ -5272,19 +5272,33 @@ unsafe fn hud_with_facts(
     if declared < std::mem::size_of::<PunktfunkHudFacts>() {
         return Err(PunktfunkStatus::InvalidArg);
     }
-    // SAFETY: non-null, and `struct_size` covers this type.
-    let f = unsafe { facts.read_unaligned() };
-    s.on_glass = f.on_glass;
-    s.shave_os_floor = f.shave_os_floor;
-    if f.audio_buffer_ms > 0 {
-        s.audio_buffer_ms = f.audio_buffer_ms;
-        s.av_offset_ms = f.av_offset_ms;
+    // SAFETY: non-null, and `struct_size` covers this type. Fields are read one at a time and
+    // the bools as bytes, so a binding that stores 2 cannot produce an invalid `bool`.
+    let (on_glass, shave_os_floor, audio_buffer_ms, av_offset_ms, preset, extras) = unsafe {
+        use std::ptr::addr_of;
+        (
+            addr_of!((*facts).on_glass).cast::<u8>().read_unaligned() != 0,
+            addr_of!((*facts).shave_os_floor)
+                .cast::<u8>()
+                .read_unaligned()
+                != 0,
+            addr_of!((*facts).audio_buffer_ms).read_unaligned(),
+            addr_of!((*facts).av_offset_ms).read_unaligned(),
+            addr_of!((*facts).preset).read_unaligned(),
+            addr_of!((*facts).extras).read_unaligned(),
+        )
+    };
+    s.on_glass = on_glass;
+    s.shave_os_floor = shave_os_floor;
+    if audio_buffer_ms > 0 {
+        s.audio_buffer_ms = audio_buffer_ms;
+        s.av_offset_ms = av_offset_ms;
     }
     // SAFETY: caller strings, NUL-terminated or null, borrowed for this call.
-    let preset = unsafe { opt_cstr(f.preset) }.map_err(|()| PunktfunkStatus::InvalidArg)?;
+    let preset = unsafe { opt_cstr(preset) }.map_err(|()| PunktfunkStatus::InvalidArg)?;
     s.preset = preset.filter(|p| !p.is_empty()).map(str::to_owned);
     // SAFETY: as above.
-    let extras = unsafe { opt_cstr(f.extras) }.map_err(|()| PunktfunkStatus::InvalidArg)?;
+    let extras = unsafe { opt_cstr(extras) }.map_err(|()| PunktfunkStatus::InvalidArg)?;
     s.extras
         .extend(extras.unwrap_or_default().lines().filter_map(|line| {
             let (code, text) = line.split_once('\t')?;
@@ -5730,15 +5744,14 @@ pub unsafe extern "C" fn punktfunk_h265_concealer_conceal(
     out_len: *mut usize,
 ) -> PunktfunkStatus {
     guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let (Some(c), Some(out_kind), Some(out_buf), Some(out_len)) = (
-            unsafe { c.as_mut() },
-            unsafe { out_kind.as_mut() },
-            unsafe { out_buf.as_mut() },
-            unsafe { out_len.as_mut() },
-        ) else {
+        // SAFETY: caller handle or null; `as_mut` never dereferences null.
+        let Some(c) = (unsafe { c.as_mut() }) else {
             return PunktfunkStatus::NullPointer;
         };
+        // Out-slots are written through the raw pointer: C may pass them uninitialised.
+        if out_kind.is_null() || out_buf.is_null() || out_len.is_null() {
+            return PunktfunkStatus::NullPointer;
+        }
         if au.is_null() && len != 0 {
             return PunktfunkStatus::NullPointer;
         }
@@ -5751,18 +5764,27 @@ pub unsafe extern "C" fn punktfunk_h265_concealer_conceal(
             // SAFETY: `au` is non-null and `ffi_slice_bytes` proved the extent fits a Rust slice.
             unsafe { std::slice::from_raw_parts(au, len) }
         };
-        *out_buf = std::ptr::null_mut();
-        *out_len = 0;
-        *out_kind = match c.inner.conceal(bytes) {
-            Concealment::Intact => PunktfunkConcealment::Intact,
+        let (kind, buf, n) = match c.inner.conceal(bytes) {
+            Concealment::Intact => (PunktfunkConcealment::Intact, std::ptr::null_mut(), 0),
             Concealment::Rewritten(v) => {
                 let boxed = v.into_boxed_slice();
-                *out_len = boxed.len();
-                *out_buf = Box::into_raw(boxed).cast::<u8>();
-                PunktfunkConcealment::Rewritten
+                let n = boxed.len();
+                (
+                    PunktfunkConcealment::Rewritten,
+                    Box::into_raw(boxed).cast::<u8>(),
+                    n,
+                )
             }
-            Concealment::Unrecoverable => PunktfunkConcealment::Unrecoverable,
+            Concealment::Unrecoverable => {
+                (PunktfunkConcealment::Unrecoverable, std::ptr::null_mut(), 0)
+            }
         };
+        // SAFETY: the three out-pointers are non-null (checked above) and writable per contract.
+        unsafe {
+            out_kind.write(kind);
+            out_buf.write(buf);
+            out_len.write(n);
+        }
         PunktfunkStatus::Ok
     })
 }
@@ -6009,13 +6031,14 @@ pub unsafe extern "C" fn punktfunk_au_admission_note(
             DecoderClass::Lenient
         };
         let step = a.note(index, gap, flags, class, verdict);
-        // SAFETY: caller out-params, each written once when non-null.
+        // SAFETY: caller out-params, each written once when non-null, through the raw pointer
+        // because C may pass them uninitialised.
         unsafe {
-            if let Some(o) = out_withhold.as_mut() {
-                *o = step.withhold;
+            if !out_withhold.is_null() {
+                out_withhold.write(step.withhold);
             }
-            if let Some(o) = out_ask_keyframe.as_mut() {
-                *o = step.ask_keyframe;
+            if !out_ask_keyframe.is_null() {
+                out_ask_keyframe.write(step.ask_keyframe);
             }
         }
         PunktfunkStatus::Ok
@@ -6385,6 +6408,22 @@ mod tests {
         assert_eq!(short.unwrap_err(), PunktfunkStatus::InvalidArg);
         // SAFETY: null facts are the documented no-op.
         assert!(unsafe { hud_with_facts(Default::default(), std::ptr::null()) }.is_ok());
+
+        // A non-C binding may store 2 in a bool byte; that reads as true, not as UB (Miri).
+        f.struct_size = std::mem::size_of::<PunktfunkHudFacts>() as u32;
+        let mut bytes = [0u8; std::mem::size_of::<PunktfunkHudFacts>()];
+        // SAFETY: a byte copy of an initialised `f` into a buffer of the same size.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (&raw const f).cast::<u8>(),
+                bytes.as_mut_ptr(),
+                bytes.len(),
+            )
+        };
+        bytes[std::mem::offset_of!(PunktfunkHudFacts, on_glass)] = 2;
+        // SAFETY: `bytes` holds `struct_size` readable bytes; the strings outlive the call.
+        let s = unsafe { hud_with_facts(Default::default(), bytes.as_ptr().cast()) }.unwrap();
+        assert!(s.on_glass);
     }
 
     #[cfg(feature = "quic")]
