@@ -206,6 +206,64 @@ unsafe fn put<T>(p: *mut T, v: T) {
     }
 }
 
+/// `Ok(())` is `Ok`; an error is its status.
+fn status_of(r: crate::Result<()>) -> PunktfunkStatus {
+    match r {
+        Ok(()) => PunktfunkStatus::Ok,
+        Err(e) => e.status(),
+    }
+}
+
+/// Borrow `len` caller bytes at `p` for this call. Null with a non-zero `len` is
+/// `NullPointer`, a length no slice can hold is `InvalidArg`, and `len == 0` never reads `p`.
+///
+/// # Safety
+/// `p` is null or readable for `len` bytes that stay unmodified while the slice lives.
+unsafe fn in_bytes<'a>(p: *const u8, len: usize) -> Result<&'a [u8], PunktfunkStatus> {
+    if p.is_null() && len != 0 {
+        return Err(PunktfunkStatus::NullPointer);
+    }
+    if ffi_slice_bytes::<u8>(len).is_none() {
+        return Err(PunktfunkStatus::InvalidArg);
+    }
+    if len == 0 {
+        return Ok(&[]);
+    }
+    // SAFETY: `p` is non-null here and readable for `len` bytes (caller contract);
+    // `ffi_slice_bytes` proved the extent fits a Rust slice.
+    Ok(unsafe { std::slice::from_raw_parts(p, len) })
+}
+
+/// [`guard`] around a borrowed connection handle `$c`; null returns `NullPointer`. A shared
+/// borrow only: plane threads pull concurrently and must never alias a `&mut`.
+#[cfg(feature = "quic")]
+macro_rules! with_conn {
+    ($c:ident => $body:block) => {
+        guard(|| {
+            // SAFETY: the calling entry point's `# Safety` makes the handle null or live;
+            // `as_ref` maps null to `None` and never dereferences it.
+            let Some($c) = (unsafe { $c.as_ref() }) else {
+                return PunktfunkStatus::NullPointer;
+            };
+            $body
+        })
+    };
+}
+
+/// [`with_conn!`] that writes `$value` into the nullable out-param `$out` and returns `Ok`.
+#[cfg(feature = "quic")]
+macro_rules! conn_out {
+    ($c:ident, $out:ident => $value:expr) => {
+        with_conn!($c => {
+            let v = $value;
+            // SAFETY: the calling entry point's `# Safety` makes `$out` null or writable for
+            // one value.
+            unsafe { put($out, v) };
+            PunktfunkStatus::Ok
+        })
+    };
+}
+
 /// Copy a SHA-256 into an optional 32-byte caller buffer; null is a no-op. Writes the array by
 /// value, never forming a slice over memory C may leave uninitialised.
 ///
@@ -517,22 +575,12 @@ pub unsafe extern "C" fn punktfunk_host_submit_frame(
             Some(s) => s,
             None => return PunktfunkStatus::NullPointer,
         };
-        if data.is_null() && len != 0 {
-            return PunktfunkStatus::NullPointer;
-        }
-        if ffi_slice_bytes::<u8>(len).is_none() {
-            return PunktfunkStatus::InvalidArg;
-        }
-        let slice = if len == 0 {
-            &[][..]
-        } else {
-            // SAFETY: `ffi_slice_bytes` proved `len` bytes fit a Rust slice; borrowed for this call.
-            unsafe { std::slice::from_raw_parts(data, len) }
+        // SAFETY: `data` is null or readable for `len` bytes (this fn's contract).
+        let slice = match unsafe { in_bytes(data, len) } {
+            Ok(b) => b,
+            Err(s) => return s,
         };
-        match s.inner.submit_frame(slice, pts_ns, flags) {
-            Ok(()) => PunktfunkStatus::Ok,
-            Err(e) => e.status(),
-        }
+        status_of(s.inner.submit_frame(slice, pts_ns, flags))
     })
 }
 
@@ -597,10 +645,7 @@ pub unsafe extern "C" fn punktfunk_send_input(
             Ok(e) => e,
             Err(status) => return status,
         };
-        match s.inner.send_input(ev) {
-            Ok(()) => PunktfunkStatus::Ok,
-            Err(e) => e.status(),
-        }
+        status_of(s.inner.send_input(ev))
     })
 }
 
@@ -2669,13 +2714,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_au(
     out: *mut PunktfunkFrame,
     timeout_ms: u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // Shared ref only: video and audio threads must not alias a `&mut`.
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         if out.is_null() {
             return PunktfunkStatus::NullPointer;
         }
@@ -2731,12 +2770,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio(
     out: *mut PunktfunkAudioPacket,
     timeout_ms: u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         if out.is_null() {
             return PunktfunkStatus::NullPointer;
         }
@@ -2776,12 +2810,7 @@ pub unsafe extern "C" fn punktfunk_connection_set_audio_muted(
     c: *mut PunktfunkConnection,
     muted: bool,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_ref` never dereferences null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         c.inner.set_audio_muted(muted);
         PunktfunkStatus::Ok
     })
@@ -2799,16 +2828,7 @@ pub unsafe extern "C" fn punktfunk_connection_audio_mute(
     c: *mut PunktfunkConnection,
     out: *mut u8,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_ref` never dereferences null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        // SAFETY: the caller passes `out` null or writable for one value.
-        unsafe { put(out, c.inner.audio_mute()) };
-        PunktfunkStatus::Ok
-    })
+    conn_out!(c, out => c.inner.audio_mute())
 }
 
 /// Host-resolved audio channel count: `2` (stereo), `6` (5.1) or `8` (7.1).
@@ -2824,16 +2844,7 @@ pub unsafe extern "C" fn punktfunk_connection_audio_channels(
     c: *mut PunktfunkConnection,
     out: *mut u8,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        // SAFETY: the caller passes `out` null or writable for one value.
-        unsafe { put(out, c.inner.audio_channels) };
-        PunktfunkStatus::Ok
-    })
+    conn_out!(c, out => c.inner.audio_channels)
 }
 
 /// Resolved sample rate. Open the device from this, not `PUNKTFUNK_AUDIO_SAMPLE_RATE_HZ`
@@ -2847,16 +2858,7 @@ pub unsafe extern "C" fn punktfunk_connection_audio_sample_rate(
     c: *mut PunktfunkConnection,
     out: *mut u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        // SAFETY: the caller passes `out` null or writable for one value.
-        unsafe { put(out, c.inner.audio_sample_rate_hz) };
-        PunktfunkStatus::Ok
-    })
+    conn_out!(c, out => c.inner.audio_sample_rate_hz)
 }
 
 /// Resolved sample depth (`16`, or `24` on lossless). Plane is
@@ -2870,16 +2872,7 @@ pub unsafe extern "C" fn punktfunk_connection_audio_bits(
     c: *mut PunktfunkConnection,
     out: *mut u8,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        // SAFETY: the caller passes `out` null or writable for one value.
-        unsafe { put(out, c.inner.audio_bits) };
-        PunktfunkStatus::Ok
-    })
+    conn_out!(c, out => c.inner.audio_bits)
 }
 
 /// Resolved frame length in µs (ladder has sub-ms rungs). `0` = use
@@ -2895,16 +2888,7 @@ pub unsafe extern "C" fn punktfunk_connection_audio_frame_us(
     c: *mut PunktfunkConnection,
     out: *mut u16,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        // SAFETY: the caller passes `out` null or writable for one value.
-        unsafe { put(out, c.inner.audio_frame_us) };
-        PunktfunkStatus::Ok
-    })
+    conn_out!(c, out => c.inner.audio_frame_us)
 }
 
 /// Why the session ended (`PUNKTFUNK_END_REASON_*`). Latches after `Closed`.
@@ -2918,16 +2902,7 @@ pub unsafe extern "C" fn punktfunk_connection_end_reason(
     c: *mut PunktfunkConnection,
     out: *mut u8,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_ref` never dereferences null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        // SAFETY: the caller passes `out` null or writable for one value.
-        unsafe { put(out, c.inner.end_reason() as u8) };
-        PunktfunkStatus::Ok
-    })
+    conn_out!(c, out => c.inner.end_reason() as u8)
 }
 
 /// One decoded audio frame from [`punktfunk_connection_next_audio_pcm`]: interleaved
@@ -2963,12 +2938,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio_pcm(
     out: *mut PunktfunkAudioPcm,
     timeout_ms: u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         if out.is_null() {
             return PunktfunkStatus::NullPointer;
         }
@@ -3017,12 +2987,7 @@ pub unsafe extern "C" fn punktfunk_connection_audio_plc(
     c: *mut PunktfunkConnection,
     out: *mut PunktfunkAudioPcm,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         if out.is_null() {
             return PunktfunkStatus::NullPointer;
         }
@@ -3116,12 +3081,7 @@ pub unsafe extern "C" fn punktfunk_connection_set_pad_audio_caps(
     pad: u8,
     audio_caps: u8,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         c.inner.set_pad_audio_caps(pad, audio_caps);
         PunktfunkStatus::Ok
     })
@@ -3139,16 +3099,8 @@ pub unsafe extern "C" fn punktfunk_connection_set_pad_mouse(
     c: *mut PunktfunkConnection,
     mask: u16,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_ref` never dereferences null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        match c.inner.set_pad_mouse(mask) {
-            Ok(()) => PunktfunkStatus::Ok,
-            Err(e) => e.status(),
-        }
+    with_conn!(c => {
+        status_of(c.inner.set_pad_mouse(mask))
     })
 }
 
@@ -3162,12 +3114,7 @@ pub unsafe extern "C" fn punktfunk_connection_set_invert_scroll(
     c: *mut PunktfunkConnection,
     invert: bool,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_ref` never dereferences null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         c.inner.set_invert_scroll(invert);
         PunktfunkStatus::Ok
     })
@@ -3183,16 +3130,7 @@ pub unsafe extern "C" fn punktfunk_connection_pad_mouse(
     c: *const PunktfunkConnection,
     mask: *mut u16,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_ref` never dereferences null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        // SAFETY: the caller passes `mask` null or writable for one value.
-        unsafe { put(mask, c.inner.pad_mouse()) };
-        PunktfunkStatus::Ok
-    })
+    conn_out!(c, mask => c.inner.pad_mouse())
 }
 
 /// Wire pad indices the host holds now, a bit per pad: declared or driven, not yet removed.
@@ -3205,16 +3143,7 @@ pub unsafe extern "C" fn punktfunk_connection_live_pads(
     c: *const PunktfunkConnection,
     mask: *mut u16,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_ref` never dereferences null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        // SAFETY: the caller passes `mask` null or writable for one value.
-        unsafe { put(mask, c.inner.live_pads()) };
-        PunktfunkStatus::Ok
-    })
+    conn_out!(c, mask => c.inner.live_pads())
 }
 
 /// Pull the next rumble update, waiting up to `timeout_ms`. Amplitudes are
@@ -3262,12 +3191,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble2(
     ttl_ms: *mut u32,
     timeout_ms: u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         match c
             .inner
             .next_rumble_ttl(std::time::Duration::from_millis(timeout_ms as u64))
@@ -3345,12 +3269,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_rumble_cmd2(
     backstop_ms: *mut u32,
     timeout_ms: u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         match c
             .inner
             .next_rumble_command(std::time::Duration::from_millis(timeout_ms as u64))
@@ -3387,12 +3306,7 @@ pub unsafe extern "C" fn punktfunk_connection_set_rumble_quirks(
     min_pulse_ms: u16,
     flags: u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         c.inner.set_rumble_quirks(
             pad,
             crate::client::ActuatorQuirks {
@@ -3419,12 +3333,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_hidout(
     out: *mut PunktfunkHidOutput,
     timeout_ms: u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         if out.is_null() {
             return PunktfunkStatus::NullPointer;
         }
@@ -3456,12 +3365,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_hdr_meta(
     out: *mut PunktfunkHdrMeta,
     timeout_ms: u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         if out.is_null() {
             return PunktfunkStatus::NullPointer;
         }
@@ -3519,12 +3423,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_cursor_shape(
     out: *mut PunktfunkCursorShape,
     timeout_ms: u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         if out.is_null() {
             return PunktfunkStatus::NullPointer;
         }
@@ -3568,12 +3467,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_cursor_state(
     out: *mut PunktfunkCursorState,
     timeout_ms: u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         if out.is_null() {
             return PunktfunkStatus::NullPointer;
         }
@@ -3609,16 +3503,8 @@ pub unsafe extern "C" fn punktfunk_connection_set_cursor_render(
     c: *mut PunktfunkConnection,
     client_draws: bool,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        match c.inner.set_cursor_render(client_draws) {
-            Ok(()) => PunktfunkStatus::Ok,
-            Err(e) => e.status(),
-        }
+    with_conn!(c => {
+        status_of(c.inner.set_cursor_render(client_draws))
     })
 }
 
@@ -3637,12 +3523,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_host_timing(
     out: *mut PunktfunkHostTiming,
     timeout_ms: u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         if out.is_null() {
             return PunktfunkStatus::NullPointer;
         }
@@ -3683,12 +3564,7 @@ pub unsafe extern "C" fn punktfunk_connection_color_info(
     full_range: *mut u8,
     bit_depth: *mut u8,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         let color = c.inner.color;
         // SAFETY: the caller passes each out-param null or writable for one value.
         unsafe {
@@ -3714,16 +3590,7 @@ pub unsafe extern "C" fn punktfunk_connection_chroma_format(
     c: *mut PunktfunkConnection,
     out: *mut u8,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        // SAFETY: the caller passes `out` null or writable for one value.
-        unsafe { put(out, c.inner.chroma_format) };
-        PunktfunkStatus::Ok
-    })
+    conn_out!(c, out => c.inner.chroma_format)
 }
 
 /// Host-resolved video codec: [`PUNKTFUNK_CODEC_H264`] / [`PUNKTFUNK_CODEC_HEVC`] /
@@ -3738,16 +3605,7 @@ pub unsafe extern "C" fn punktfunk_connection_codec(
     c: *mut PunktfunkConnection,
     out: *mut u8,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        // SAFETY: the caller passes `out` null or writable for one value.
-        unsafe { put(out, c.inner.codec) };
-        PunktfunkStatus::Ok
-    })
+    conn_out!(c, out => c.inner.codec)
 }
 
 /// Negotiated wire shard payload (Welcome, bytes). Parse-window size of a
@@ -3763,16 +3621,7 @@ pub unsafe extern "C" fn punktfunk_connection_shard_payload(
     c: *mut PunktfunkConnection,
     out: *mut u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        // SAFETY: the caller passes `out` null or writable for one value.
-        unsafe { put(out, u32::from(c.inner.shard_payload)) };
-        PunktfunkStatus::Ok
-    })
+    conn_out!(c, out => u32::from(c.inner.shard_payload))
 }
 
 /// Send one input event to the host as a QUIC datagram (non-blocking enqueue).
@@ -3786,21 +3635,13 @@ pub unsafe extern "C" fn punktfunk_connection_send_input(
     c: *mut PunktfunkConnection,
     ev: *const InputEvent,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         // SAFETY: `read_input_event` validates the tag before forming `&InputEvent` (else UB).
         let ev = match unsafe { read_input_event(ev) } {
             Ok(e) => e,
             Err(status) => return status,
         };
-        match c.inner.send_input(ev) {
-            Ok(()) => PunktfunkStatus::Ok,
-            Err(e) => e.status(),
-        }
+        status_of(c.inner.send_input(ev))
     })
 }
 
@@ -3820,29 +3661,13 @@ pub unsafe extern "C" fn punktfunk_connection_send_mic(
     seq: u32,
     pts_ns: u64,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
+    with_conn!(c => {
+        // SAFETY: `opus_data` is null or readable for `len` bytes (this fn's contract).
+        let opus = match unsafe { in_bytes(opus_data, len) } {
+            Ok(b) => b.to_vec(),
+            Err(s) => return s,
         };
-        if opus_data.is_null() && len != 0 {
-            return PunktfunkStatus::NullPointer;
-        }
-        if ffi_slice_bytes::<u8>(len).is_none() {
-            return PunktfunkStatus::InvalidArg;
-        }
-        let opus = if len == 0 {
-            Vec::new()
-        } else {
-            // SAFETY: the ABI contract supplies `len` readable bytes; `ffi_slice_bytes` proved the
-            // extent is representable by a Rust slice, copied before this call returns.
-            unsafe { std::slice::from_raw_parts(opus_data, len) }.to_vec()
-        };
-        match c.inner.send_mic(seq, pts_ns, opus) {
-            Ok(()) => PunktfunkStatus::Ok,
-            Err(e) => e.status(),
-        }
+        status_of(c.inner.send_mic(seq, pts_ns, opus))
     })
 }
 
@@ -3857,22 +3682,14 @@ pub unsafe extern "C" fn punktfunk_connection_send_rich_input(
     c: *mut PunktfunkConnection,
     rich: *const PunktfunkRichInput,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
         let rich = match unsafe { rich.as_ref() } {
             Some(r) => r,
             None => return PunktfunkStatus::NullPointer,
         };
         match rich.to_rich() {
-            Some(r) => match c.inner.send_rich_input(r) {
-                Ok(()) => PunktfunkStatus::Ok,
-                Err(e) => e.status(),
-            },
+            Some(r) => status_of(c.inner.send_rich_input(r)),
             None => PunktfunkStatus::InvalidArg,
         }
     })
@@ -3891,12 +3708,7 @@ pub unsafe extern "C" fn punktfunk_connection_send_rich_input2(
     c: *mut PunktfunkConnection,
     rich: *const PunktfunkRichInputEx,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         if rich.is_null() {
             return PunktfunkStatus::NullPointer;
         }
@@ -3908,10 +3720,7 @@ pub unsafe extern "C" fn punktfunk_connection_send_rich_input2(
         }
         // SAFETY: pointers are caller-supplied and null-checked on this path.
         match unsafe { *rich }.to_rich() {
-            Some(r) => match c.inner.send_rich_input(r) {
-                Ok(()) => PunktfunkStatus::Ok,
-                Err(e) => e.status(),
-            },
+            Some(r) => status_of(c.inner.send_rich_input(r)),
             None => PunktfunkStatus::InvalidArg,
         }
     })
@@ -3943,12 +3752,7 @@ pub unsafe extern "C" fn punktfunk_connection_send_hid_report(
     data: *const u8,
     len: usize,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         if data.is_null() {
             return PunktfunkStatus::NullPointer;
         }
@@ -3958,10 +3762,7 @@ pub unsafe extern "C" fn punktfunk_connection_send_hid_report(
         // SAFETY: caller pointer/length; borrowed for this call only. The clamp copies.
         let report =
             unsafe { std::slice::from_raw_parts(data, len.min(crate::quic::HID_REPORT_MAX)) };
-        match c.inner.send_rich_input(hid_report_rich_input(pad, report)) {
-            Ok(()) => PunktfunkStatus::Ok,
-            Err(e) => e.status(),
-        }
+        status_of(c.inner.send_rich_input(hid_report_rich_input(pad, report)))
     })
 }
 
@@ -3981,12 +3782,7 @@ pub unsafe extern "C" fn punktfunk_connection_send_pen(
     samples: *const PunktfunkPenSample,
     count: u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         if samples.is_null() {
             return PunktfunkStatus::NullPointer;
         }
@@ -4002,10 +3798,7 @@ pub unsafe extern "C" fn punktfunk_connection_send_pen(
                 None => return PunktfunkStatus::InvalidArg,
             }
         }
-        match c.inner.send_pen(&batch[..count as usize]) {
-            Ok(()) => PunktfunkStatus::Ok,
-            Err(e) => e.status(),
-        }
+        status_of(c.inner.send_pen(&batch[..count as usize]))
     })
 }
 
@@ -4022,12 +3815,7 @@ pub unsafe extern "C" fn punktfunk_connection_mode(
     height: *mut u32,
     refresh_hz: *mut u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         let mode = c.inner.mode();
         // SAFETY: the caller passes each out-param null or writable for one value.
         unsafe {
@@ -4051,16 +3839,7 @@ pub unsafe extern "C" fn punktfunk_connection_gamepad(
     c: *const PunktfunkConnection,
     gamepad: *mut u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        // SAFETY: the caller passes `gamepad` null or writable for one value.
-        unsafe { put(gamepad, c.inner.resolved_gamepad.to_u8() as u32) };
-        PunktfunkStatus::Ok
-    })
+    conn_out!(c, gamepad => c.inner.resolved_gamepad.to_u8() as u32)
 }
 
 // Shared clipboard (`design/clipboard-and-file-transfer.md`). All poll/serve
@@ -4223,16 +4002,7 @@ pub unsafe extern "C" fn punktfunk_connection_mgmt_port(
     c: *const PunktfunkConnection,
     port: *mut u16,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_ref` never dereferences null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        // SAFETY: the caller passes `port` null or writable for one value.
-        unsafe { put(port, c.inner.mgmt_port()) };
-        PunktfunkStatus::Ok
-    })
+    conn_out!(c, port => c.inner.mgmt_port())
 }
 
 /// Host capability bitfield from `Welcome` (`PUNKTFUNK_HOST_CAP_*`). Test
@@ -4247,16 +4017,7 @@ pub unsafe extern "C" fn punktfunk_connection_host_caps(
     c: *const PunktfunkConnection,
     caps: *mut u8,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        // SAFETY: the caller passes `caps` null or writable for one value.
-        unsafe { put(caps, c.inner.host_caps()) };
-        PunktfunkStatus::Ok
-    })
+    conn_out!(c, caps => c.inner.host_caps())
 }
 
 /// Second host capability byte from `Welcome` — today `PUNKTFUNK_HOST_CAP2_TOUCH`.
@@ -4270,16 +4031,7 @@ pub unsafe extern "C" fn punktfunk_connection_host_caps2(
     c: *const PunktfunkConnection,
     caps: *mut u8,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        // SAFETY: the caller passes `caps` null or writable for one value.
-        unsafe { put(caps, c.inner.host_caps2()) };
-        PunktfunkStatus::Ok
-    })
+    conn_out!(c, caps => c.inner.host_caps2())
 }
 
 /// Live `PUNKTFUNK_GRANT_*` mask (`design/per-client-access.md`). Latest
@@ -4294,16 +4046,7 @@ pub unsafe extern "C" fn punktfunk_connection_grants(
     c: *const PunktfunkConnection,
     grants: *mut u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_ref` never dereferences null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        // SAFETY: the caller passes `grants` null or writable for one value.
-        unsafe { put(grants, c.inner.access_grants()) };
-        PunktfunkStatus::Ok
-    })
+    conn_out!(c, grants => c.inner.access_grants())
 }
 
 /// Seconds until access expires. `0` = permanent. While a deadline is set the
@@ -4318,12 +4061,7 @@ pub unsafe extern "C" fn punktfunk_connection_access_expires_in(
     c: *const PunktfunkConnection,
     secs: *mut u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_ref` never dereferences null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         let remaining = c.inner.access_expires_in_secs();
         // SAFETY: the caller passes `secs` null or writable for one value.
         unsafe { put(secs, remaining) };
@@ -4348,12 +4086,7 @@ pub unsafe extern "C" fn punktfunk_connection_end_reject_said(
     out: *mut c_char,
     cap: usize,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_ref` never dereferences null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         if out.is_null() || cap == 0 {
             return PunktfunkStatus::NullPointer;
         }
@@ -4379,12 +4112,7 @@ pub unsafe extern "C" fn punktfunk_connection_launch_notice(
     out: *mut c_char,
     cap: usize,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_ref` never dereferences null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         if out.is_null() || cap == 0 {
             return PunktfunkStatus::NullPointer;
         }
@@ -4412,12 +4140,7 @@ pub unsafe extern "C" fn punktfunk_connection_end_reject(
     c: *const PunktfunkConnection,
     status: *mut i32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_ref` never dereferences null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         let value = match c.inner.end_reject() {
             Some(reason) => crate::error::PunktfunkError::Rejected(reason).status() as i32,
             None => 0,
@@ -4441,16 +4164,8 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_control(
     enabled: bool,
     flags: u8,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        match c.inner.clip_control(enabled, flags) {
-            Ok(()) => PunktfunkStatus::Ok,
-            Err(e) => e.status(),
-        }
+    with_conn!(c => {
+        status_of(c.inner.clip_control(enabled, flags))
     })
 }
 
@@ -4469,12 +4184,7 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_offer(
     kinds: *const PunktfunkClipKind,
     n: usize,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         if kinds.is_null() && n != 0 {
             return PunktfunkStatus::NullPointer;
         }
@@ -4496,10 +4206,7 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_offer(
                 });
             }
         }
-        match c.inner.clip_offer(seq, out) {
-            Ok(()) => PunktfunkStatus::Ok,
-            Err(e) => e.status(),
-        }
+        status_of(c.inner.clip_offer(seq, out))
     })
 }
 
@@ -4519,12 +4226,7 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_fetch(
     file_index: u32,
     xfer_id_out: *mut u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         // SAFETY: caller C string, NUL-terminated or null; borrowed for this call only.
         let mime = match unsafe { opt_cstr(mime) } {
             Ok(Some(s)) => s.to_string(),
@@ -4558,29 +4260,13 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_serve(
     len: usize,
     last: bool,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
+    with_conn!(c => {
+        // SAFETY: `data` is null or readable for `len` bytes (this fn's contract).
+        let bytes = match unsafe { in_bytes(data, len) } {
+            Ok(b) => b.to_vec(),
+            Err(s) => return s,
         };
-        if data.is_null() && len != 0 {
-            return PunktfunkStatus::NullPointer;
-        }
-        if ffi_slice_bytes::<u8>(len).is_none() {
-            return PunktfunkStatus::InvalidArg;
-        }
-        let bytes = if len == 0 {
-            Vec::new()
-        } else {
-            // SAFETY: the ABI contract supplies `len` readable bytes; `ffi_slice_bytes` proved the
-            // extent is representable by a Rust slice, copied before this call returns.
-            unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
-        };
-        match c.inner.clip_serve(req_id, bytes, last) {
-            Ok(()) => PunktfunkStatus::Ok,
-            Err(e) => e.status(),
-        }
+        status_of(c.inner.clip_serve(req_id, bytes, last))
     })
 }
 
@@ -4595,16 +4281,8 @@ pub unsafe extern "C" fn punktfunk_connection_clipboard_cancel(
     c: *const PunktfunkConnection,
     id: u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        match c.inner.clip_cancel(id) {
-            Ok(()) => PunktfunkStatus::Ok,
-            Err(e) => e.status(),
-        }
+    with_conn!(c => {
+        status_of(c.inner.clip_cancel(id))
     })
 }
 
@@ -4621,12 +4299,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_clipboard(
     out: *mut PunktfunkClipEvent,
     timeout_ms: u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         if out.is_null() {
             return PunktfunkStatus::NullPointer;
         }
@@ -4662,16 +4335,7 @@ pub unsafe extern "C" fn punktfunk_connection_compositor(
     c: *const PunktfunkConnection,
     compositor: *mut u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        // SAFETY: the caller passes `compositor` null or writable for one value.
-        unsafe { put(compositor, c.inner.resolved_compositor.to_u8() as u32) };
-        PunktfunkStatus::Ok
-    })
+    conn_out!(c, compositor => c.inner.resolved_compositor.to_u8() as u32)
 }
 
 /// Video encoder bitrate (kbps) the host configured — the [`punktfunk_connect_ex3`]
@@ -4686,16 +4350,7 @@ pub unsafe extern "C" fn punktfunk_connection_bitrate(
     c: *const PunktfunkConnection,
     bitrate_kbps: *mut u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        // SAFETY: the caller passes `bitrate_kbps` null or writable for one value.
-        unsafe { put(bitrate_kbps, c.inner.resolved_bitrate_kbps) };
-        PunktfunkStatus::Ok
-    })
+    conn_out!(c, bitrate_kbps => c.inner.resolved_bitrate_kbps)
 }
 
 /// Connect-time wall-clock offset, ns, host minus client. Add to a local
@@ -4709,16 +4364,7 @@ pub unsafe extern "C" fn punktfunk_connection_clock_offset_ns(
     c: *const PunktfunkConnection,
     offset_ns: *mut i64,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        // SAFETY: the caller passes `offset_ns` null or writable for one value.
-        unsafe { put(offset_ns, c.inner.clock_offset_ns) };
-        PunktfunkStatus::Ok
-    })
+    conn_out!(c, offset_ns => c.inner.clock_offset_ns)
 }
 
 /// Live wall-clock offset (updated by mid-stream re-sync). Use this for ongoing
@@ -4732,16 +4378,7 @@ pub unsafe extern "C" fn punktfunk_connection_clock_offset_now_ns(
     c: *const PunktfunkConnection,
     offset_ns: *mut i64,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        // SAFETY: the caller passes `offset_ns` null or writable for one value.
-        unsafe { put(offset_ns, c.inner.clock_offset_now_ns()) };
-        PunktfunkStatus::Ok
-    })
+    conn_out!(c, offset_ns => c.inner.clock_offset_now_ns())
 }
 
 /// Request a live mode switch. On accept, the first new-mode AU is an IDR with
@@ -4757,20 +4394,12 @@ pub unsafe extern "C" fn punktfunk_connection_request_mode(
     height: u32,
     refresh_hz: u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        match c.inner.request_mode(crate::config::Mode {
+    with_conn!(c => {
+        status_of(c.inner.request_mode(crate::config::Mode {
             width,
             height,
             refresh_hz,
-        }) {
-            Ok(()) => PunktfunkStatus::Ok,
-            Err(e) => e.status(),
-        }
+        }))
     })
 }
 
@@ -4784,16 +4413,8 @@ pub unsafe extern "C" fn punktfunk_connection_request_mode(
 pub unsafe extern "C" fn punktfunk_connection_request_keyframe(
     c: *const PunktfunkConnection,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        match c.inner.request_keyframe() {
-            Ok(()) => PunktfunkStatus::Ok,
-            Err(e) => e.status(),
-        }
+    with_conn!(c => {
+        status_of(c.inner.request_keyframe())
     })
 }
 
@@ -4809,16 +4430,8 @@ pub unsafe extern "C" fn punktfunk_connection_request_rfi(
     first_frame: u32,
     last_frame: u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        match c.inner.request_rfi(first_frame, last_frame) {
-            Ok(()) => PunktfunkStatus::Ok,
-            Err(e) => e.status(),
-        }
+    with_conn!(c => {
+        status_of(c.inner.request_rfi(first_frame, last_frame))
     })
 }
 
@@ -4834,12 +4447,7 @@ pub unsafe extern "C" fn punktfunk_connection_note_frame_index(
     frame_index: u32,
     gap_out: *mut bool,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         let gap = c.inner.note_frame_index(frame_index);
         // SAFETY: the caller passes `gap_out` null or writable for one value.
         unsafe { put(gap_out, gap > 0) };
@@ -4861,12 +4469,7 @@ pub unsafe extern "C" fn punktfunk_connection_note_frame_index_ex(
     frame_index: u32,
     gap_width_out: *mut u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         let gap = c.inner.note_frame_index(frame_index);
         // SAFETY: the caller passes `gap_width_out` null or writable for one value.
         unsafe { put(gap_width_out, gap) };
@@ -4998,12 +4601,7 @@ pub unsafe extern "C" fn punktfunk_connection_hud_decoded(
     received_ns: u64,
     decoded_ns: u64,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_ref` never dereferences null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         let hud = c.inner.hud();
         hud.note_decoded(pts_ns, decoded_ns);
         if received_ns > 0 && decoded_ns >= received_ns {
@@ -5025,12 +4623,7 @@ pub unsafe extern "C" fn punktfunk_connection_hud_displayed(
     decoded_ns: u64,
     displayed_ns: u64,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_ref` never dereferences null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         c.inner
             .hud()
             .note_displayed(pts_ns, decoded_ns, 0, displayed_ns);
@@ -5049,12 +4642,7 @@ pub unsafe extern "C" fn punktfunk_connection_hud_os_floor(
     c: *const PunktfunkConnection,
     floor_ns: u64,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_ref` never dereferences null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         c.inner.hud().note_os_floor_us(floor_ns / 1000);
         PunktfunkStatus::Ok
     })
@@ -5070,12 +4658,7 @@ pub unsafe extern "C" fn punktfunk_connection_hud_os_floor(
 pub unsafe extern "C" fn punktfunk_connection_hud_drain(
     c: *const PunktfunkConnection,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_ref` never dereferences null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         *lock_recover(&c.hud_snap) = c.inner.hud_snapshot();
         PunktfunkStatus::Ok
     })
@@ -5100,12 +4683,7 @@ pub unsafe extern "C" fn punktfunk_connection_hud_text(
     cap: usize,
     needed: *mut usize,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_ref` never dereferences null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         let snap = lock_recover(&c.hud_snap).clone();
         // SAFETY: the caller's `facts` contract, checked inside.
         let snap = match unsafe { hud_with_facts(snap, facts) } {
@@ -5136,12 +4714,7 @@ pub unsafe extern "C" fn punktfunk_connection_report_decode_us(
     c: *const PunktfunkConnection,
     us: u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         c.inner.report_decode_us(us);
         PunktfunkStatus::Ok
     })
@@ -5162,12 +4735,7 @@ pub unsafe extern "C" fn punktfunk_connection_report_phase(
     arrival_lead_ns: u32,
     coherence_milli: u16,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_ref` never dereferences null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         c.inner.report_phase(
             next_latch_host_ns,
             latch_period_ns,
@@ -5252,16 +4820,8 @@ pub unsafe extern "C" fn punktfunk_connection_speed_test(
     target_kbps: u32,
     duration_ms: u32,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
-        match c.inner.request_probe(target_kbps, duration_ms) {
-            Ok(()) => PunktfunkStatus::Ok,
-            Err(e) => e.status(),
-        }
+    with_conn!(c => {
+        status_of(c.inner.request_probe(target_kbps, duration_ms))
     })
 }
 
@@ -5277,12 +4837,7 @@ pub unsafe extern "C" fn punktfunk_connection_probe_result(
     c: *const PunktfunkConnection,
     out: *mut PunktfunkProbeResult,
 ) -> PunktfunkStatus {
-    guard(|| {
-        // SAFETY: caller handle or null; `as_mut`/`as_ref` never dereference null.
-        let c = match unsafe { c.as_ref() } {
-            Some(c) => c,
-            None => return PunktfunkStatus::NullPointer,
-        };
+    with_conn!(c => {
         if out.is_null() {
             return PunktfunkStatus::NullPointer;
         }
@@ -5411,17 +4966,10 @@ pub unsafe extern "C" fn punktfunk_h265_concealer_conceal(
         if out_kind.is_null() || out_buf.is_null() || out_len.is_null() {
             return PunktfunkStatus::NullPointer;
         }
-        if au.is_null() && len != 0 {
-            return PunktfunkStatus::NullPointer;
-        }
-        if ffi_slice_bytes::<u8>(len).is_none() {
-            return PunktfunkStatus::InvalidArg;
-        }
-        let bytes: &[u8] = if len == 0 {
-            &[]
-        } else {
-            // SAFETY: `au` is non-null and `ffi_slice_bytes` proved the extent fits a Rust slice.
-            unsafe { std::slice::from_raw_parts(au, len) }
+        // SAFETY: `au` is null or readable for `len` bytes (this fn's contract).
+        let bytes = match unsafe { in_bytes(au, len) } {
+            Ok(b) => b,
+            Err(s) => return s,
         };
         let (kind, buf, n) = match c.inner.conceal(bytes) {
             Concealment::Intact => (PunktfunkConcealment::Intact, std::ptr::null_mut(), 0),
