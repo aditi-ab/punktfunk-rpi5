@@ -6351,7 +6351,7 @@ mod tests {
             assert!(write_cstr(buf.as_mut_ptr(), 4, "abc"));
             assert!(!write_cstr(ptr::null_mut(), 4, "abc"));
         }
-        assert_eq!(buf.map(|b| b as u8), *b"abc\0");
+        assert_eq!(buf.map(|b| b.to_ne_bytes()[0]), *b"abc\0");
 
         // Byte 0 is a sentinel: the fingerprint lands at offset 1 and fills exactly 32 bytes.
         let mut fp = [0u8; 33];
