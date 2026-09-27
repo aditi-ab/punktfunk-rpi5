@@ -1,36 +1,34 @@
-//! The trust gate and session lifecycle glue: `initiate` routes a connect through the trust
-//! rules (pinned → silent, `pair=optional` → TOFU, otherwise → PIN), `connect_with` starts the
-//! session worker and drives navigation from its events, and the "request access"
+//! The trust gate and session lifecycle glue: `initiate` routes a connect through the shared
+//! `trust_route` (pinned → silent, `pair=optional` → TOFU, otherwise → PIN), `connect_with`
+//! starts the session worker and drives navigation from its events, and the "request access"
 //! (delegated-approval) flow parks an identified connect until the operator approves it.
 
 use super::lucide;
 use super::style::*;
 use super::{AppCtx, Screen, Svc, Target};
 use crate::trust::{self, KnownHosts};
-use pf_client_core::orchestrate::{CancelHandle, ConnectOutcome, WakeOutcome, WakeWait};
+use pf_client_core::orchestrate::{
+    trust_route, CancelHandle, ConnectOutcome, TrustRoute, WakeOutcome, WakeWait,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use windows_reactor::*;
 
-/// The trust gate (mirrors the GTK client's `initiate_connect`): pinned fingerprint → silent
-/// connect; known address → stored pin; advertised `pair=optional` → TOFU; otherwise → PIN
-/// pairing.
+/// A tile's plain connect, through the trust gate in [`initiate_opts`].
 pub(crate) fn initiate(
     ctx: &Arc<AppCtx>,
     target: Target,
     set_screen: &AsyncSetState<Screen>,
     set_status: &AsyncSetState<String>,
 ) {
-    initiate_opts(ctx, target, set_screen, set_status, false)
+    initiate_opts(ctx, target, None, set_screen, set_status, false)
 }
 
-/// Dial-first for a saved host that isn't advertising but has a known MAC: fire the magic packet
-/// now (fire-and-forget — harmless if it's awake, and a genuinely-asleep box is already booting
-/// while the dial times out) and dial IMMEDIATELY. mDNS absence does NOT mean unreachable — a
-/// host reached over a routed network (Tailscale/VPN/another subnet) is mDNS-blind forever, and
-/// gating the dial on presence bricked exactly those reconnects. Only a failed dial falls into
-/// the visible [`wake_and_connect`] wait.
+/// Dial-first for a saved host that isn't advertising but has a known MAC: the magic packet goes
+/// out and the dial starts at once. mDNS absence is not unreachable: a host on a routed network
+/// (Tailscale, VPN, another subnet) never advertises. Only a failed dial falls into the visible
+/// [`wake_and_connect`] wait.
 pub(crate) fn initiate_waking(
     ctx: &Arc<AppCtx>,
     target: Target,
@@ -40,12 +38,16 @@ pub(crate) fn initiate_waking(
     if ctx.settings.lock().unwrap().auto_wake {
         crate::wol::wake(&target.mac, target.addr.parse().ok());
     }
-    initiate_opts(ctx, target, set_screen, set_status, true)
+    initiate_opts(ctx, target, None, set_screen, set_status, true)
 }
 
+/// Opens the surface [`trust_route`] picks: the stored pin dials, a changed fingerprint or an
+/// unpaired host gets [`Screen::Pair`], and a new `pair=optional` host is pinned on its first
+/// connect (this shell has no TOFU confirmation screen). `launch` rides the connect.
 fn initiate_opts(
     ctx: &Arc<AppCtx>,
     target: Target,
+    launch: Option<String>,
     set_screen: &AsyncSetState<Screen>,
     set_status: &AsyncSetState<String>,
     wake_on_fail: bool,
@@ -54,32 +56,33 @@ fn initiate_opts(
     // "Streaming to X") — stash it up front, not just on the pairing route.
     *ctx.shared.target.lock().unwrap() = target.clone();
     let known = KnownHosts::load();
-    // The target's pin names its record. A discovered second OS of a dual-boot box has none
-    // yet and pairs, instead of dialling the first one's pin; only a typed address takes
-    // whatever that address answers with.
-    let pin = known
-        .resolve(target.fp_hex.as_deref(), &target.addr, target.port)
-        .and_then(|k| trust::parse_hex32(&k.fp_hex));
-
+    let fp = target.fp_hex.as_deref();
+    let pin = match trust_route(&known, fp, &target.addr, target.port, target.pair_optional) {
+        TrustRoute::Pinned(fp_hex) => trust::parse_hex32(&fp_hex),
+        TrustRoute::OfferTofu(_) => None,
+        TrustRoute::FingerprintChanged => {
+            set_status
+                .call("Host fingerprint changed — re-pair with a PIN to continue".to_string());
+            set_screen.call(Screen::Pair);
+            return;
+        }
+        TrustRoute::NeedsPairing => {
+            set_screen.call(Screen::Pair);
+            return;
+        }
+    };
     let opts = ConnectOpts {
+        launch,
         wake_on_fail,
         ..ConnectOpts::default()
     };
-    if let Some(pin) = pin {
-        connect_with(ctx, &target, Some(pin), set_screen, set_status, opts);
-    } else if target.pair_optional {
-        connect_with(ctx, &target, None, set_screen, set_status, opts); // TOFU
-    } else {
-        *ctx.shared.target.lock().unwrap() = target;
-        set_screen.call(Screen::Pair);
-    }
+    // `None` is TOFU: the spawn pins the advertised fingerprint.
+    connect_with(ctx, &target, pin, set_screen, set_status, opts);
 }
 
-/// Start a stream that launches a library title on connect (`--launch id`) — the library
-/// page's tap-to-play, and a deep link's `launch=` (which this used to drop: the link
-/// opened a plain desktop session). The library only opens for paired hosts, so the pin
-/// resolves like a normal initiate; a host forgotten mid-visit routes to the PIN ceremony
-/// instead.
+/// Start a stream that launches a library title on connect (`--launch id`): the library page's
+/// tap-to-play and a deep link's `launch=`. Same trust gate as [`initiate`], so a host forgotten
+/// mid-visit routes to the PIN ceremony.
 pub(crate) fn initiate_launch(
     ctx: &Arc<AppCtx>,
     target: Target,
@@ -87,7 +90,7 @@ pub(crate) fn initiate_launch(
     set_screen: &AsyncSetState<Screen>,
     set_status: &AsyncSetState<String>,
 ) {
-    initiate_launch_opts(ctx, target, launch, set_screen, set_status, false)
+    initiate_opts(ctx, target, Some(launch), set_screen, set_status, false)
 }
 
 /// [`initiate_launch`] with the dial-first wake of [`initiate_waking`] — a deep link's
@@ -102,44 +105,7 @@ pub(crate) fn initiate_launch_waking(
     if ctx.settings.lock().unwrap().auto_wake {
         crate::wol::wake(&target.mac, target.addr.parse().ok());
     }
-    initiate_launch_opts(ctx, target, launch, set_screen, set_status, true)
-}
-
-fn initiate_launch_opts(
-    ctx: &Arc<AppCtx>,
-    target: Target,
-    launch: String,
-    set_screen: &AsyncSetState<Screen>,
-    set_status: &AsyncSetState<String>,
-    wake_on_fail: bool,
-) {
-    *ctx.shared.target.lock().unwrap() = target.clone();
-    let known = KnownHosts::load();
-    let pin = target
-        .fp_hex
-        .as_deref()
-        .and_then(trust::parse_hex32)
-        .or_else(|| {
-            known
-                .find_by_addr(&target.addr, target.port)
-                .and_then(|k| trust::parse_hex32(&k.fp_hex))
-        });
-    let Some(pin) = pin else {
-        set_screen.call(Screen::Pair);
-        return;
-    };
-    connect_with(
-        ctx,
-        &target,
-        Some(pin),
-        set_screen,
-        set_status,
-        ConnectOpts {
-            launch: Some(launch),
-            wake_on_fail,
-            ..ConnectOpts::default()
-        },
-    );
+    initiate_opts(ctx, target, Some(launch), set_screen, set_status, true)
 }
 
 /// Tunables that differ between the normal connect and the no-PIN "request access" flow.

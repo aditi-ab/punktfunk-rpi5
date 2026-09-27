@@ -50,9 +50,8 @@ pub fn saved_request(k: &trust::KnownHost) -> ConnectRequest {
         name: k.name.clone(),
         addr: k.addr.clone(),
         port: k.port,
-        // `None`, not `Some("")`, for a record saved by address and never paired: the connect
-        // gate reads `Some` as "we hold a pin" and would skip the trust ceremony, then hand the
-        // child an empty `--fp` it refuses. Same shape the Discovered arm already uses.
+        // `None` for a record saved by address and never paired, so `card_key` keys it by
+        // address. Same shape the Discovered arm already uses.
         fp_hex: (!k.fp_hex.is_empty()).then(|| k.fp_hex.clone()),
         pair_optional: false,
         launch: None,

@@ -10,7 +10,7 @@ use crate::trust::{self, Settings};
 use crate::ui_hosts::{self, ConnectRequest, HostsMsg, HostsOutput, HostsPage};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
-use pf_client_core::orchestrate::ConnectOutcome;
+use pf_client_core::orchestrate::{trust_route, ConnectOutcome, TrustRoute};
 use pf_client_core::start;
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::config::{CompositorPref, GamepadPref};
@@ -526,59 +526,29 @@ impl AppModel {
         self.toasts.add_toast(adw::Toast::new(msg));
     }
 
-    /// The trust gate, in order: a stored fingerprint connects silently; a known address under
-    /// a new fingerprint is the impostor case and forces the PIN ceremony; an unknown host is
-    /// offered TOFU alongside PIN only when it advertises `pair=optional`, else delegated
-    /// approval or PIN.
+    /// Opens the surface [`trust_route`] picks: the stored pin dials, a changed fingerprint
+    /// gets the PIN dialog, a new `pair=optional` host gets the TOFU offer, and anything
+    /// else gets delegated approval or PIN.
     fn connect(&mut self, req: ConnectRequest, sender: &ComponentSender<Self>) {
         if self.busy {
             return;
         }
         let known = trust::KnownHosts::load();
-        match &req.fp_hex {
-            Some(fp_hex) => {
-                if known.find_by_fp(fp_hex).is_some() {
-                    let fp_hex = fp_hex.clone();
-                    sender.input(AppMsg::StartSession {
-                        req,
-                        fp_hex,
-                        tofu: false,
-                        opts: SpawnOpts::default(),
-                    });
-                } else if known.find_by_addr(&req.addr, req.port).is_some() {
-                    self.toast("Host fingerprint changed — re-pair with a PIN to continue");
-                    crate::ui_trust::pin_dialog(&self.window, sender, self.identity.clone(), req);
-                } else if req.pair_optional {
-                    crate::ui_trust::tofu_dialog(&self.window, sender, req);
-                } else {
-                    crate::ui_trust::approval_dialog(
-                        &self.window,
-                        sender,
-                        self.waiting.clone(),
-                        req,
-                    );
-                }
+        let fp = req.fp_hex.as_deref();
+        match trust_route(&known, fp, &req.addr, req.port, req.pair_optional) {
+            TrustRoute::Pinned(fp_hex) => sender.input(AppMsg::StartSession {
+                req,
+                fp_hex,
+                tofu: false,
+                opts: SpawnOpts::default(),
+            }),
+            TrustRoute::FingerprintChanged => {
+                self.toast("Host fingerprint changed — re-pair with a PIN to continue");
+                crate::ui_trust::pin_dialog(&self.window, sender, self.identity.clone(), req);
             }
-            None => {
-                // Manual entry: a known address connects on its stored pin;
-                // an unknown one must pair — never silent TOFU.
-                match known
-                    .find_by_addr(&req.addr, req.port)
-                    .map(|k| k.fp_hex.clone())
-                {
-                    Some(fp_hex) => sender.input(AppMsg::StartSession {
-                        req,
-                        fp_hex,
-                        tofu: false,
-                        opts: SpawnOpts::default(),
-                    }),
-                    None => crate::ui_trust::approval_dialog(
-                        &self.window,
-                        sender,
-                        self.waiting.clone(),
-                        req,
-                    ),
-                }
+            TrustRoute::OfferTofu(_) => crate::ui_trust::tofu_dialog(&self.window, sender, req),
+            TrustRoute::NeedsPairing => {
+                crate::ui_trust::approval_dialog(&self.window, sender, self.waiting.clone(), req);
             }
         }
     }
