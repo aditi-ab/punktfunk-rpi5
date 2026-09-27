@@ -10,10 +10,6 @@
 // Every `unsafe {}` / `unsafe impl` carries a `// SAFETY:` proof; `unsafe fn` bodies use
 // explicit blocks. Both lints are in the workspace `[workspace.lints]` tables.
 
-/// The `I915_GEM_WAIT` that keeps Intel's media engine clocked while it decodes.
-#[cfg(target_os = "linux")]
-pub mod i915_boost;
-
 #[cfg(target_os = "linux")]
 mod imp;
 #[cfg(target_os = "linux")]

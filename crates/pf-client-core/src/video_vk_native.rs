@@ -547,7 +547,7 @@ pub(crate) struct NativeVulkanDecoder {
     fault: Option<pf_vkdecode::AuFault>,
     /// Intel on i915: the GEM wait that keeps the media engine clocked (`wait_timeline`).
     #[cfg(target_os = "linux")]
-    boost: Option<pf_zerocopy::i915_boost::I915Boost>,
+    boost: Option<pf_dmabuf::i915_boost::I915Boost>,
 }
 
 // SAFETY: used strictly serially through `&mut self` from the session pump that owns
@@ -588,7 +588,7 @@ impl NativeVulkanDecoder {
         // wait, so this rung waits every decode through one, on the exported ring.
         #[cfg(target_os = "linux")]
         let boost = (vk.vendor_id == crate::video::VENDOR_INTEL && vk.dmabuf_import)
-            .then(pf_zerocopy::i915_boost::I915Boost::open)
+            .then(pf_dmabuf::i915_boost::I915Boost::open)
             .flatten();
         #[cfg(not(target_os = "linux"))]
         let boost: Option<()> = None;
