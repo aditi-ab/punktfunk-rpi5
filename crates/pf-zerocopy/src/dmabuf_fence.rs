@@ -11,7 +11,7 @@
 //! Pin: `ioctl_number_matches_dma_buf_h`, `poll_readable_reports_the_truth`.
 
 use rustix::event::{PollFd, PollFlags, Timespec};
-use std::os::fd::{AsFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 use std::time::{Duration, Instant};
 
 // linux/dma-buf.h: DMA_BUF_BASE is 'b' (0x62). _IOWR = dir(3)<<30 | size<<16 | base<<8 | nr.
@@ -41,18 +41,17 @@ pub enum WaitOutcome {
     TimedOut,
 }
 
-/// Snapshot the producer's pending writes on `dmabuf_fd` into an owned sync_file.
+/// Snapshot the producer's pending writes on `dmabuf` into an owned sync_file.
 /// `None` when the kernel attached no fence. `Err` when the kernel lacks the ioctl.
-pub fn export_sync_file(dmabuf_fd: RawFd) -> std::io::Result<Option<OwnedFd>> {
+pub fn export_sync_file(dmabuf: BorrowedFd<'_>) -> std::io::Result<Option<OwnedFd>> {
     let mut req = DmaBufExportSyncFile {
         flags: DMA_BUF_SYNC_READ,
         fd: -1,
     };
-    // SAFETY: `dmabuf_fd` is a live borrowed dmabuf; we never close it.
-    // The ioctl size is `size_of::<DmaBufExportSyncFile>()`. `&mut req` is a
-    // live `#[repr(C)]` value the kernel reads (`flags`) and writes (`fd`);
-    // it outlives this call and is not aliased.
-    let r = unsafe { libc::ioctl(dmabuf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &mut req) };
+    // SAFETY: `dmabuf` is open for the borrow; we never close it. The ioctl size is
+    // `size_of::<DmaBufExportSyncFile>()`. `&mut req` is a live `#[repr(C)]` value the kernel
+    // reads (`flags`) and writes (`fd`); it outlives this call and is not aliased.
+    let r = unsafe { libc::ioctl(dmabuf.as_raw_fd(), DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &mut req) };
     if r < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -65,16 +64,14 @@ pub fn export_sync_file(dmabuf_fd: RawFd) -> std::io::Result<Option<OwnedFd>> {
 
 /// Wait for a sync_file (from [`export_sync_file`]) to signal. Negative `timeout_ms`
 /// is infinite.
-pub fn wait_sync_file(sync_fd: RawFd, timeout_ms: i32) -> std::io::Result<WaitOutcome> {
-    // SAFETY: `sync_fd` is the caller's live sync_file, open for this synchronous call; the
-    // borrow ends with it.
-    poll_readable(unsafe { BorrowedFd::borrow_raw(sync_fd) }, timeout_ms)
+pub fn wait_sync_file(sync: BorrowedFd<'_>, timeout_ms: i32) -> std::io::Result<WaitOutcome> {
+    poll_readable(sync, timeout_ms)
 }
 
-/// Wait for producer writes on `dmabuf_fd`. Negative `timeout_ms` is infinite.
+/// Wait for producer writes on `dmabuf`. Negative `timeout_ms` is infinite.
 /// `Err` if the ioctl or poll failed (kernel lacks `EXPORT_SYNC_FILE`).
-pub fn wait_read_ready(dmabuf_fd: RawFd, timeout_ms: i32) -> std::io::Result<WaitOutcome> {
-    match export_sync_file(dmabuf_fd)? {
+pub fn wait_read_ready(dmabuf: BorrowedFd<'_>, timeout_ms: i32) -> std::io::Result<WaitOutcome> {
+    match export_sync_file(dmabuf)? {
         None => Ok(WaitOutcome::NoFence),
         Some(sync) => poll_readable(sync.as_fd(), timeout_ms),
     }

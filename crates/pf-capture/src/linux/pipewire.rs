@@ -1162,17 +1162,20 @@ fn dmabuf_len(fd: i32) -> u64 {
     }
 }
 
-/// A CLOEXEC dup of `data`'s fd, so a published frame keeps the dmabuf past the requeue.
-/// `None`: the data carries no fd, or the process is out of descriptors.
-fn dup_data_fd(data: &pw::spa::buffer::Data) -> Option<OwnedFd> {
+/// `data`'s fd, borrowed for as long as `data` is. `None` when the data carries no fd.
+fn data_fd(data: &pw::spa::buffer::Data) -> Option<BorrowedFd<'_>> {
     let fd = RawFd::try_from(data.as_raw().fd)
         .ok()
         .filter(|&fd| fd >= 0)?;
     // SAFETY: `data` borrows a `spa_data` of a buffer this side holds; its fd stays open
     // while that borrow lives, and a non-negative fd is a valid `BorrowedFd`.
-    unsafe { BorrowedFd::borrow_raw(fd) }
-        .try_clone_to_owned()
-        .ok()
+    Some(unsafe { BorrowedFd::borrow_raw(fd) })
+}
+
+/// A CLOEXEC dup of `data`'s fd, so a published frame keeps the dmabuf past the requeue.
+/// `None`: the data carries no fd, or the process is out of descriptors.
+fn dup_data_fd(data: &pw::spa::buffer::Data) -> Option<OwnedFd> {
+    data_fd(data)?.try_clone_to_owned().ok()
 }
 
 /// Whether the selected GPU's driver rounds a linear import pitch: iHD does; an unknown
@@ -1319,7 +1322,10 @@ fn consume_frame(
                 p.acquire_point,
                 std::time::Duration::from_millis(100),
             ),
-            None => pf_zerocopy::dmabuf_fence::wait_read_ready(datas[0].fd(), 100),
+            None => match data_fd(&datas[0]) {
+                Some(plane) => pf_zerocopy::dmabuf_fence::wait_read_ready(plane, 100),
+                None => Err(std::io::Error::from_raw_os_error(libc::EBADF)),
+            },
         };
         ud.fence_wait.record(t0.elapsed().as_micros() as u64);
         match waited {

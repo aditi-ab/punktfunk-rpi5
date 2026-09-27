@@ -1380,9 +1380,9 @@ fn pump(
                             }
                             #[cfg(target_os = "linux")]
                             HwDone::SyncFile(fd) => {
-                                use std::os::fd::AsRawFd as _;
+                                use std::os::fd::AsFd as _;
                                 if !fence_sampled
-                                    && pf_zerocopy::dmabuf_fence::wait_sync_file(fd.as_raw_fd(), 50)
+                                    && pf_zerocopy::dmabuf_fence::wait_sync_file(fd.as_fd(), 50)
                                         .is_ok_and(|o| {
                                             o != pf_zerocopy::dmabuf_fence::WaitOutcome::TimedOut
                                         })
