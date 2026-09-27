@@ -407,8 +407,8 @@ fn is_management_cli(args: &[String]) -> bool {
 }
 
 /// Once per process, before the subcommand: the banner, the capture anchor, the display
-/// event sink, platform preflight and the GPU driver profile. A management CLI skips the
-/// host parts.
+/// event sink, the voice-pin hooks, platform preflight and the GPU driver profile. A
+/// management CLI skips the host parts.
 fn startup(args: &[String]) {
     let management_cli = is_management_cli(args);
 
@@ -440,6 +440,14 @@ fn startup(args: &[String]) {
             events::emit(events::EventKind::DisplayReleased { count })
         }
     }));
+
+    // Once: the voice-chat pin reaches processes and the console user through the host.
+    #[cfg(target_os = "windows")]
+    let _ = audio::voice_route::HOST_HOOKS.set(audio::voice_route::HostHooks {
+        processes: procscan::processes,
+        run_hidden_as_user: interactive::run_hidden_as_current_session_user,
+        running_as_system: hooks::running_as_system,
+    });
 
     windows::entry::preflight(management_cli);
 
@@ -540,7 +548,7 @@ fn real_main() -> Result<()> {
         // `voice-route set|clear …`: the per-app output pin. The capture thread spawns it as the
         // console user, because a SYSTEM caller writes SYSTEM's app preferences, not the user's.
         #[cfg(target_os = "windows")]
-        Some("voice-route") => audio::voice_route_cli(&args[1..]),
+        Some("voice-route") => audio::voice_route::cli(&args[1..]),
         #[cfg(target_os = "linux")]
         Some("list-monitors") => devtest::list_monitors(),
         #[cfg(target_os = "linux")]

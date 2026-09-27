@@ -23,7 +23,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::sync::mpsc::{channel, Receiver};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// How often the worker looks for a voice app launched mid-session.
@@ -38,6 +38,20 @@ const REFUSED_RETRY: Duration = Duration::from_secs(60);
 
 /// Serializes the marker's read-modify-write: a worker and a clear can run at once.
 static MARKER: Mutex<()> = Mutex::new(());
+
+/// What the pin borrows from the host binary: its process scan, its console-user spawn and
+/// its SYSTEM check.
+pub(crate) struct HostHooks {
+    /// `(pid, parent pid, image base name)` of every process, one Toolhelp snapshot.
+    pub(crate) processes: fn() -> Vec<(u32, u32, String)>,
+    /// Run a command line as the console user, windowless; its exit code.
+    pub(crate) run_hidden_as_user: fn(&str, Duration) -> Result<u32>,
+    /// Whether this process runs as LocalSystem.
+    pub(crate) running_as_system: fn() -> bool,
+}
+
+/// Set once at host startup. Unset, no voice app is found, so no helper runs.
+pub(crate) static HOST_HOOKS: OnceLock<HostHooks> = OnceLock::new();
 
 pub(crate) fn wanted() -> bool {
     pf_host_config::config().audio_voice_chat == pf_host_config::VoiceChatRoute::Host
@@ -266,13 +280,16 @@ fn owe(exe: &str, target: &str) {
 }
 
 /// `(pid, lowercase exe name)`: every process of each voice app, in this host's session.
-/// One Toolhelp snapshot ([`crate::procscan::processes`]). Never on the capture thread.
+/// One Toolhelp snapshot ([`HostHooks::processes`]). Never on the capture thread.
 ///
 /// The pin is keyed by the app, so one pid that answers is enough, but it may not be the
 /// first: an Electron app plays from a child process. Another session's process is left
 /// out: the console user's helper can't pin it.
 fn voice_processes(apps: &[String]) -> Vec<(u32, String)> {
     use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    let Some(host) = HOST_HOOKS.get() else {
+        return Vec::new();
+    };
     let session_of = |pid: u32| {
         let mut s = 0u32;
         // SAFETY: `s` is a live local out-param for this synchronous call.
@@ -281,7 +298,7 @@ fn voice_processes(apps: &[String]) -> Vec<(u32, String)> {
             .map(|()| s)
     };
     let ours = session_of(std::process::id());
-    crate::procscan::processes()
+    (host.processes)()
         .into_iter()
         .filter_map(|(pid, _, exe)| {
             let exe = exe.to_ascii_lowercase();
@@ -296,6 +313,10 @@ fn voice_processes(apps: &[String]) -> Vec<(u32, String)> {
 /// In-process only when this host is not SYSTEM: SYSTEM's own write lands in SYSTEM's
 /// store, where no app of the user's looks.
 fn run_helper(args: &[&str]) -> bool {
+    // Unset, `voice_processes` found no pid to get here with.
+    let Some(host) = HOST_HOOKS.get() else {
+        return false;
+    };
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -305,8 +326,7 @@ fn run_helper(args: &[&str]) -> bool {
     };
     let quoted: Vec<String> = args.iter().map(|a| format!("\"{a}\"")).collect();
     let cmdline = format!("\"{}\" voice-route {}", exe.display(), quoted.join(" "));
-    match crate::windows::interactive::run_hidden_as_current_session_user(&cmdline, HELPER_TIMEOUT)
-    {
+    match (host.run_hidden_as_user)(&cmdline, HELPER_TIMEOUT) {
         Ok(0) => true,
         // A probe refusal is an app with no audio yet: expected, and retried later.
         Ok(code) if args.first() == Some(&"probe") => {
@@ -324,7 +344,7 @@ fn run_helper(args: &[&str]) -> bool {
             );
             false
         }
-        Err(spawn_err) if !crate::hooks::running_as_system() => {
+        Err(spawn_err) if !(host.running_as_system)() => {
             let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
             match cli(&owned) {
                 Ok(()) => true,

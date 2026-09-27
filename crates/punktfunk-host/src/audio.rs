@@ -345,18 +345,12 @@ pub fn open_virtual_mic_named(channels: u32, source: Option<&str>) -> Result<Box
 #[cfg(target_os = "windows")]
 mod windows;
 
-/// `punktfunk-host voice-route …`: writes the per-app output pins in whatever user context
-/// it runs in — the capture thread spawns it as the console user ([`windows::voice_route`]).
-#[cfg(target_os = "windows")]
-pub(crate) fn voice_route_cli(args: &[String]) -> anyhow::Result<()> {
-    windows::voice_route::cli(args)
-}
 #[cfg(target_os = "windows")]
 use self::windows as plat;
 // Flat names for the session, the devtests and the installer: `crate::audio::pad_endpoint`.
 #[cfg(target_os = "windows")]
 pub(crate) use self::windows::{
-    audio_control, audio_probe, devnode_cleanup, minted, pad_capture, pad_endpoint,
+    audio_control, audio_probe, devnode_cleanup, minted, pad_capture, pad_endpoint, voice_route,
 };
 #[cfg(target_os = "linux")]
 mod linux;
