@@ -377,6 +377,7 @@ public final class StreamLayerView: NSView {
             forName: NSWindow.didChangeScreenNotification, object: window, queue: .main
         ) { [weak self] _ in
             self?.layoutPresenter()
+            self?.presenter.screenChanged()
         })
         attemptPendingCapture()
     }
@@ -1078,7 +1079,7 @@ public final class StreamLayerView: NSView {
                 DispatchQueue.main.async { self?.noteDecodedContentSize(width: w, height: h) }
                 overlayDecodedSize?(w, h)
             },
-            adaptiveSync: Self.isAdaptiveSync(window?.screen ?? NSScreen.main))
+            adaptiveSync: { [weak self] in Self.isAdaptiveSync(self?.window?.screen ?? NSScreen.main) })
         // Match-window (C3): when ON, follow the window's pixel size so a windowed session streams
         // 1:1 (pixel-exact) instead of the presenter resampling a fixed-mode frame into a
         // non-matching window. The first real `layout()` feeds the initial size, so the stream

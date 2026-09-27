@@ -265,6 +265,9 @@ final class SessionPresenter {
     /// one here is the "black bars + stretched" resize artifact. nil until the first frame → `layout`
     /// falls back to `currentMode()`. Main-thread only.
     private var contentSize: CGSize?
+    /// The screen verdict the running pipeline chose its pacing from, and its live source.
+    private var builtAdaptive = false
+    private var adaptiveSync: () -> Bool = { false }
 
     /// Start the resolved presenter for `connection`.
     ///
@@ -274,7 +277,7 @@ final class SessionPresenter {
     /// metering; deadline pacing owns a CAMetalDisplayLink instead.
     ///
     /// Call `layout(in:contentsScale:)` after start so any Metal sublayer has valid geometry.
-    /// `adaptiveSync` is the hosting screen's fixed-vs-adaptive verdict on macOS.
+    /// `adaptiveSync` reads the hosting screen's fixed-vs-adaptive verdict on macOS, once per build.
     func start(
         connection: PunktfunkConnection,
         baseLayer: AVSampleBufferDisplayLayer,
@@ -284,11 +287,13 @@ final class SessionPresenter {
         onSessionEnd: (@Sendable () -> Void)?,
         onDecodedSize: (@Sendable (Int, Int) -> Void)? = nil,
         onFrameHDR: (@Sendable (Bool) -> Void)? = nil,
-        adaptiveSync: Bool = false
+        adaptiveSync: @escaping () -> Bool = { false }
     ) {
         stop()
         self.connection = connection
         self.baseLayer = baseLayer
+        self.adaptiveSync = adaptiveSync
+        builtAdaptive = adaptiveSync()
         restart = { [weak self] layer in
             self?.start(
                 connection: connection, baseLayer: layer, endToEndMeter: endToEndMeter,
@@ -327,7 +332,7 @@ final class SessionPresenter {
         #if os(macOS)
         let vsyncPaced = priority != .latency && pacing == .arrival
         let adaptiveSlotPaced = Self.adaptiveSlotPaced(
-            adaptiveSync: adaptiveSync, priority: priority, pacing: pacing)
+            adaptiveSync: builtAdaptive, priority: priority, pacing: pacing)
         #else
         let vsyncPaced = false
         let adaptiveSlotPaced = false
@@ -580,6 +585,13 @@ final class SessionPresenter {
         let size = contentSize
         restart(layer)
         contentSize = size // the view drops the new pipeline's repeat of this size
+    }
+
+    /// The window moved to another screen. Pacing is chosen at build time, so rebuild (one IDR)
+    /// only when the fixed-vs-adaptive verdict flipped. Main thread.
+    func screenChanged() {
+        guard restart != nil, adaptiveSync() != builtAdaptive else { return }
+        restartPresentation()
     }
 
     /// `onPresentWedged`'s cure, hopped to MAIN: a fresh pipeline, presenter and CAMetalLayer on
