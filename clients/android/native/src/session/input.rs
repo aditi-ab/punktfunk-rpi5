@@ -17,11 +17,11 @@ use punktfunk_core::quic::{
     HOST_CAP_TEXT_INPUT, PEN_ANGLE_UNKNOWN, PEN_BATCH_MAX, PEN_DISTANCE_UNKNOWN, PEN_TILT_UNKNOWN,
 };
 
-use super::{get_session, jni_guard};
+use super::{jni_guard, SESSIONS};
 
 /// Retain the keyed session for one non-blocking [`InputEvent`] send.
 fn send_event(handle: jlong, kind: InputKind, code: u32, x: i32, y: i32, flags: u32) {
-    let Some(h) = get_session(handle) else {
+    let Some(h) = SESSIONS.get(handle) else {
         return;
     };
     let _ = h.client.send_input(&InputEvent {
@@ -139,7 +139,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendNormali
         if ScrollEvent::from_event(&ev).is_none() {
             return;
         }
-        let Some(h) = get_session(handle) else {
+        let Some(h) = SESSIONS.get(handle) else {
             return;
         };
         let _ = h.client.send_input(&ev);
@@ -157,7 +157,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetInvertSc
     invert: jboolean,
 ) -> jboolean {
     jni_guard(false, || {
-        get_session(handle).is_some_and(|h| {
+        SESSIONS.get(handle).is_some_and(|h| {
             h.client.set_invert_scroll(invert);
             true
         })
@@ -229,7 +229,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeTextInputSu
     handle: jlong,
 ) -> jboolean {
     jni_guard(false, || {
-        get_session(handle).is_some_and(|h| h.client.host_caps() & HOST_CAP_TEXT_INPUT != 0)
+        SESSIONS
+            .get(handle)
+            .is_some_and(|h| h.client.host_caps() & HOST_CAP_TEXT_INPUT != 0)
     })
 }
 
@@ -243,7 +245,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeHostSupport
     handle: jlong,
 ) -> jboolean {
     jni_guard(false, || {
-        get_session(handle).is_some_and(|h| h.client.host_caps() & HOST_CAP_PEN != 0)
+        SESSIONS
+            .get(handle)
+            .is_some_and(|h| h.client.host_caps() & HOST_CAP_PEN != 0)
     })
 }
 
@@ -257,7 +261,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeHostSupport
     handle: jlong,
 ) -> jboolean {
     jni_guard(false, || {
-        get_session(handle).is_some_and(|h| h.client.host_caps2() & HOST_CAP2_TOUCH != 0)
+        SESSIONS
+            .get(handle)
+            .is_some_and(|h| h.client.host_caps2() & HOST_CAP2_TOUCH != 0)
     })
 }
 
@@ -294,7 +300,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPen(
         if samples.get_region(env, 0, flat).is_err() {
             return Ok(()); // short array — a bridge bug, never worth a crash on the input path
         }
-        let Some(h) = get_session(handle) else {
+        let Some(h) = SESSIONS.get(handle) else {
             return Ok(());
         };
         let mut batch = [PenSample::default(); PEN_BATCH_MAX];
@@ -440,7 +446,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetPadMouse
     mask: jint,
 ) -> jboolean {
     jni_guard(false, || {
-        get_session(handle).is_some_and(|h| h.client.set_pad_mouse(mask as u16).is_ok())
+        SESSIONS
+            .get(handle)
+            .is_some_and(|h| h.client.set_pad_mouse(mask as u16).is_ok())
     })
 }
 
@@ -453,7 +461,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePadMouse(
     handle: jlong,
 ) -> jint {
     jni_guard(0, || {
-        get_session(handle).map_or(0, |h| jint::from(h.client.pad_mouse()))
+        SESSIONS
+            .get(handle)
+            .map_or(0, |h| jint::from(h.client.pad_mouse()))
     })
 }
 
@@ -503,7 +513,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePadMotionRe
     declared_pref: jint,
 ) -> jboolean {
     jni_guard(false, || {
-        let Some(h) = get_session(handle) else {
+        let Some(h) = SESSIONS.get(handle) else {
             return true;
         };
         let declared = punktfunk_core::config::GamepadPref::from_u8(
@@ -565,7 +575,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPadHidR
         // SAFETY: `ptr`/`cap` describe the direct ByteBuffer's backing store, valid for this call;
         // `n` is bounded by both the buffer capacity and the fixed wire body.
         data[..n].copy_from_slice(unsafe { std::slice::from_raw_parts(ptr, n) });
-        let Some(h) = get_session(handle) else {
+        let Some(h) = SESSIONS.get(handle) else {
             return Ok(());
         };
         let _ = h.client.send_rich_input(RichInput::HidReport {
@@ -596,7 +606,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPadTouc
     y: jint,
 ) {
     jni_guard((), || {
-        let Some(h) = get_session(handle) else {
+        let Some(h) = SESSIONS.get(handle) else {
             return;
         };
         let _ = h.client.send_rich_input(RichInput::Touchpad {
@@ -629,7 +639,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPadMoti
     accel_z: jint,
 ) {
     jni_guard((), || {
-        let Some(h) = get_session(handle) else {
+        let Some(h) = SESSIONS.get(handle) else {
             return;
         };
         let c = |v: jint| (v as i64).clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16;

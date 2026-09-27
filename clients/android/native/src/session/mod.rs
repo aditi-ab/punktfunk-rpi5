@@ -103,38 +103,55 @@ pub(crate) struct SessionHandle {
     pub decoded_size: Arc<AtomicU64>,
 }
 
-static NEXT_SESSION_HANDLE: AtomicU64 = AtomicU64::new(0x1000_0000_0000_0001);
-
-fn session_handles() -> &'static Mutex<HashMap<i64, Arc<SessionHandle>>> {
-    static HANDLES: OnceLock<Mutex<HashMap<i64, Arc<SessionHandle>>>> = OnceLock::new();
-    HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
+/// A process-local table behind the opaque `jlong` keys Kotlin holds. A lookup hands out an
+/// `Arc`, so a call racing a close keeps its value until it returns; a stale key finds nothing.
+/// Each table seeds its own high prefix, so a key from one table never resolves in another.
+/// `0` is never issued and never found.
+pub(crate) struct HandleTable<T> {
+    next: AtomicU64,
+    map: OnceLock<Mutex<HashMap<i64, Arc<T>>>>,
 }
 
-pub(crate) fn insert_session(session: SessionHandle) -> i64 {
-    let session = Arc::new(session);
-    let mut handles = lock_recover(session_handles());
-    loop {
-        let handle = NEXT_SESSION_HANDLE.fetch_add(1, Ordering::Relaxed) as i64;
-        if handle != 0 && !handles.contains_key(&handle) {
-            handles.insert(handle, session);
-            return handle;
+impl<T> HandleTable<T> {
+    pub(crate) const fn new(seed: u64) -> Self {
+        HandleTable {
+            next: AtomicU64::new(seed),
+            map: OnceLock::new(),
         }
     }
+
+    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<i64, Arc<T>>> {
+        lock_recover(self.map.get_or_init(Default::default))
+    }
+
+    pub(crate) fn insert(&self, value: T) -> i64 {
+        let value = Arc::new(value);
+        let mut map = self.map();
+        loop {
+            let handle = self.next.fetch_add(1, Ordering::Relaxed) as i64;
+            if handle != 0 && !map.contains_key(&handle) {
+                map.insert(handle, value);
+                return handle;
+            }
+        }
+    }
+
+    pub(crate) fn get(&self, handle: i64) -> Option<Arc<T>> {
+        if handle == 0 {
+            return None;
+        }
+        self.map().get(&handle).cloned()
+    }
+
+    pub(crate) fn remove(&self, handle: i64) -> Option<Arc<T>> {
+        if handle == 0 {
+            return None;
+        }
+        self.map().remove(&handle)
+    }
 }
 
-pub(crate) fn get_session(handle: i64) -> Option<Arc<SessionHandle>> {
-    if handle == 0 {
-        return None;
-    }
-    lock_recover(session_handles()).get(&handle).cloned()
-}
-
-pub(crate) fn remove_session(handle: i64) -> Option<Arc<SessionHandle>> {
-    if handle == 0 {
-        return None;
-    }
-    lock_recover(session_handles()).remove(&handle)
-}
+pub(crate) static SESSIONS: HandleTable<SessionHandle> = HandleTable::new(0x1000_0000_0000_0001);
 
 /// Pack a surface's pixel size into one `u64` — so the presenter reads width and height as a
 /// single atomic load and can never see a torn pair (a new width against an old height).
@@ -278,7 +295,26 @@ fn hex32(fp: &[u8; 32]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{pack_src_crop, pack_surface_size, unpack_src_crop, unpack_surface_size};
+    use super::{
+        pack_src_crop, pack_surface_size, unpack_src_crop, unpack_surface_size, HandleTable,
+    };
+
+    /// A key resolves in its own table only until removed, and `0` never resolves.
+    #[test]
+    fn handle_table_keys_stay_in_their_table() {
+        static A: HandleTable<&str> = HandleTable::new(0x1000_0000_0000_0001);
+        static B: HandleTable<&str> = HandleTable::new(0x2000_0000_0000_0001);
+        let a = A.insert("a");
+        assert_ne!(a, 0);
+        assert_eq!(A.get(a).as_deref(), Some(&"a"));
+        assert!(
+            B.get(a).is_none(),
+            "a key from one table never resolves in another"
+        );
+        assert!(A.get(0).is_none() && A.remove(0).is_none());
+        assert_eq!(A.remove(a).as_deref(), Some(&"a"));
+        assert!(A.get(a).is_none() && A.remove(a).is_none());
+    }
 
     /// The pair the presenter reads as one atomic load must survive the round trip — including a
     /// size wider than a signed 16-bit value, which every panel this runs on now is.

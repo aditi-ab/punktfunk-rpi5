@@ -10,10 +10,7 @@ use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::{
-    get_session, hex32, insert_session, jni_guard, lock_recover, parse_hex32, remove_session,
-    SessionHandle,
-};
+use super::{hex32, jni_guard, lock_recover, parse_hex32, SessionHandle, SESSIONS};
 
 /// Machine token of the most recent `nativeConnect`/`nativePair` failure, taken (and cleared)
 /// by `nativeTakeLastError` so Kotlin can render a cause-specific message instead of the old
@@ -613,7 +610,7 @@ fn connect(req: ConnectRequest) -> jlong {
                 src_crop: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 decoded_size: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             };
-            insert_session(handle)
+            SESSIONS.insert(handle)
         }
         Err(e) => {
             log::error!("nativeConnect to {host}:{port} failed: {e}");
@@ -633,7 +630,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClose(
     _this: JObject,
     handle: jlong,
 ) {
-    jni_guard((), || drop(remove_session(handle)))
+    jni_guard((), || drop(SESSIONS.remove(handle)))
 }
 
 /// Mark an explicit user disconnect so the host skips reconnect linger.
@@ -647,7 +644,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDisconnectQ
     handle: jlong,
 ) {
     jni_guard((), || {
-        if let Some(session) = get_session(handle) {
+        if let Some(session) = SESSIONS.get(handle) {
             session.client.disconnect_quit();
         }
     })
@@ -670,7 +667,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeRequestMode
         if width <= 0 || height <= 0 || refresh_hz <= 0 {
             return false;
         }
-        let Some(session) = get_session(handle) else {
+        let Some(session) = SESSIONS.get(handle) else {
             return false;
         };
         session
@@ -692,7 +689,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeHostFingerp
     _this: JObject<'local>,
     handle: jlong,
 ) -> JString<'local> {
-    let out = get_session(handle)
+    let out = SESSIONS
+        .get(handle)
         .map(|session| hex32(&session.client.host_fingerprint))
         .unwrap_or_default();
     env.with_env(|env| env.new_string(out))
@@ -710,7 +708,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSessionEnde
     handle: jlong,
 ) -> jboolean {
     jni_guard(false, || {
-        get_session(handle).is_some_and(|session| session.client.is_session_ended())
+        SESSIONS
+            .get(handle)
+            .is_some_and(|session| session.client.is_session_ended())
     })
 }
 
@@ -725,7 +725,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeEndReason(
     handle: jlong,
 ) -> jint {
     jni_guard(0, || {
-        get_session(handle)
+        SESSIONS
+            .get(handle)
             .map(|session| session.client.end_reason() as jint)
             .unwrap_or(0)
     })
