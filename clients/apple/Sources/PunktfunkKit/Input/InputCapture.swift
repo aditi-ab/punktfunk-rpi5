@@ -270,6 +270,20 @@ public final class InputCapture {
         ) { [weak self] n in
             if let k = n.object as? GCKeyboard { self?.attach(keyboard: k) }
         })
+        #if !os(macOS)
+        // A device that drops mid-press never sends its releases, and the repeat ticker would
+        // keep typing a held key.
+        observers.append(NotificationCenter.default.addObserver(
+            forName: .GCMouseDidDisconnect, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.releaseMouseButtons()
+        })
+        observers.append(NotificationCenter.default.addObserver(
+            forName: .GCKeyboardDidDisconnect, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.releaseAll()
+        })
+        #endif
         // Focus loss: GC stops delivering, so release everything still held host-side.
         #if os(macOS)
         let resignActive = NSApplication.didResignActiveNotification
