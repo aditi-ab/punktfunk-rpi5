@@ -25,13 +25,13 @@ use cros_codecs::codec::av1::parser::SequenceHeaderObu;
 use tracing::debug;
 
 use crate::caps::DecodeCaps;
-use crate::caps_av1::Av1ProfileChain;
+use crate::caps::DecodeProfile;
 use crate::caps_av1::Av1ProfileKey;
 use crate::device::DecodeDevice;
 use crate::params_av1::sequence_to_std;
 use crate::params_av1::OwnedStdAv1SequenceHeader;
-use crate::session::bind_session_memory;
-use crate::session::ResetArm;
+use crate::session::ParametersObject;
+use crate::session::RawVideoSession;
 use crate::session::SessionError;
 
 /// What the ledger decided for one sequence-header activation.
@@ -95,17 +95,19 @@ struct StoredParamsAv1 {
     _sequence: OwnedStdAv1SequenceHeader,
 }
 
+impl ParametersObject for Option<StoredParamsAv1> {
+    fn object(&self) -> vk::VideoSessionParametersKHR {
+        self.as_ref()
+            .map_or(vk::VideoSessionParametersKHR::null(), |p| p.object)
+    }
+}
+
 pub(crate) struct VideoSessionAv1 {
-    device: ash::Device,
-    video_queue: ash::khr::video_queue::Device,
-    session: vk::VideoSessionKHR,
-    memory: Vec<vk::DeviceMemory>,
+    pub(crate) raw: RawVideoSession,
     /// `None` until the first [`Self::ensure_parameters`]: no empty form (module docs).
     parameters: Option<StoredParamsAv1>,
     ledger: ParamsLedgerAv1,
     pub(crate) config: SessionConfigAv1,
-    /// First coding scope records `VK_VIDEO_CODING_CONTROL_RESET_BIT_KHR`.
-    needs_reset: ResetArm,
 }
 
 impl VideoSessionAv1 {
@@ -119,58 +121,23 @@ impl VideoSessionAv1 {
         caps: &DecodeCaps,
         config: SessionConfigAv1,
     ) -> Result<Self, SessionError> {
-        let mut chain = Av1ProfileChain::new(config.profile);
-        let profile = chain.wire();
-        let std_header_version = caps.std_header_version;
-        let session_ci = vk::VideoSessionCreateInfoKHR::default()
-            .queue_family_index(dev.decode_qf())
-            .video_profile(profile)
-            .picture_format(caps.output_format)
-            .max_coded_extent(config.max_coded_extent)
-            .reference_picture_format(caps.dpb_format)
-            .max_dpb_slots(config.max_dpb_slots)
-            .max_active_reference_pictures(config.max_active_references)
-            .std_header_version(&std_header_version);
-        let mut session = vk::VideoSessionKHR::null();
-        // SAFETY: live device; `session_ci` roots locals (chain, header version)
-        // that outlive the call.
-        let r = unsafe {
-            (dev.video_queue().fp().create_video_session_khr)(
-                dev.ash().handle(),
-                &session_ci,
-                std::ptr::null(),
-                &mut session,
-            )
+        // SAFETY: fn contract.
+        let raw = unsafe {
+            RawVideoSession::create(
+                dev,
+                caps,
+                DecodeProfile::Av1(config.profile),
+                config.max_coded_extent,
+                config.max_dpb_slots,
+                config.max_active_references,
+            )?
         };
-        if r != vk::Result::SUCCESS {
-            return Err(SessionError::Vk(r));
-        }
-
-        let mut built = Self {
-            device: dev.ash().clone(),
-            video_queue: dev.video_queue().clone(),
-            session,
-            memory: Vec::new(),
+        Ok(Self {
+            raw,
             parameters: None,
             ledger: ParamsLedgerAv1::default(),
             config,
-            needs_reset: ResetArm::armed(),
-        };
-        // SAFETY: fn contract; on error `built` drops and unwinds the session +
-        // whatever memory was bound.
-        unsafe {
-            // BindFailure returns the allocations: park them in `built` so the
-            // early return destroys the session first. Vulkan has no partial-bind
-            // rollback.
-            match bind_session_memory(dev, session) {
-                Ok(memory) => built.memory = memory,
-                Err(failure) => {
-                    built.memory = failure.allocations;
-                    return Err(failure.error);
-                }
-            }
-        }
-        Ok(built)
+        })
     }
 
     /// Ledger action for `sequence`, no mutation. The decoder consults this
@@ -215,15 +182,19 @@ impl VideoSessionAv1 {
                 let mut av1 = vk::VideoDecodeAV1SessionParametersCreateInfoKHR::default()
                     .std_sequence_header(owned.std());
                 let ci = vk::VideoSessionParametersCreateInfoKHR::default()
-                    .video_session(self.session)
+                    .video_session(self.raw.session())
                     .push_next(&mut av1);
                 let mut fresh = vk::VideoSessionParametersKHR::null();
                 // SAFETY: live device + live session; `ci` roots locals including
                 // the OwnedStd backing, which outlives the call and the object
                 // it creates.
                 let r = unsafe {
-                    (self.video_queue.fp().create_video_session_parameters_khr)(
-                        self.device.handle(),
+                    (self
+                        .raw
+                        .video_queue()
+                        .fp()
+                        .create_video_session_parameters_khr)(
+                        self.raw.device().handle(),
                         &ci,
                         std::ptr::null(),
                         &mut fresh,
@@ -232,84 +203,31 @@ impl VideoSessionAv1 {
                 if r != vk::Result::SUCCESS {
                     return Err(SessionError::Vk(r));
                 }
-                // Destroy the old object before its backing drops: take the whole
-                // `StoredParamsAv1` so destroy runs ahead of free.
-                if let Some(old) = self.parameters.take() {
-                    // SAFETY: the fn-level contract — the caller drained every
-                    // in-flight decode before a Recreate over an existing object
-                    // reached here (checked via parameters_action +
-                    // has_parameters), so no submitted work reads the old object;
-                    // it is this session's own handle, on a live device.
-                    unsafe {
-                        (self.video_queue.fp().destroy_video_session_parameters_khr)(
-                            self.device.handle(),
-                            old.object,
-                            std::ptr::null(),
-                        );
-                    }
-                    // `old` drops here, after the object that pointed at its header.
-                }
-                self.parameters = Some(StoredParamsAv1 {
+                let fresh = Some(StoredParamsAv1 {
                     object: fresh,
                     _sequence: owned,
                 });
+                // SAFETY: the fn-level contract — the caller drained every
+                // in-flight decode before a Recreate over an existing object
+                // reached here (checked via parameters_action + has_parameters).
+                unsafe { self.raw.replace_parameters(&mut self.parameters, fresh) };
                 self.ledger.commit(action, sequence);
                 Ok(())
             }
         }
     }
 
-    pub(crate) fn session(&self) -> vk::VideoSessionKHR {
-        self.session
-    }
-
     pub(crate) fn parameters(&self) -> vk::VideoSessionParametersKHR {
-        self.parameters
-            .as_ref()
-            .map_or(vk::VideoSessionParametersKHR::null(), |p| p.object)
-    }
-
-    /// Whether the next coding scope must record the initialization RESET.
-    /// `true` once per session, only if that command buffer reaches the queue:
-    /// a record/submit failure after this returned `true` must
-    /// [`Self::re_arm_reset`], or the session stays uninitialized.
-    pub(crate) fn take_needs_reset(&mut self) -> bool {
-        self.needs_reset.take()
-    }
-
-    /// Undo a consumed [`Self::take_needs_reset`] whose RESET never reached the
-    /// queue (end/submit failed after recording it).
-    pub(crate) fn re_arm_reset(&mut self) {
-        self.needs_reset.re_arm();
+        self.parameters.object()
     }
 }
 
 impl Drop for VideoSessionAv1 {
     fn drop(&mut self) {
-        // SAFETY: all handles are this session's own on the (contract-live) device;
-        // the owning decoder drains GPU work before dropping state. A session
-        // that never got a parameters object skips that destroy. Destroy the
-        // session before freeing bound
-        // memory — Vulkan forbids freeing while the session lives, which is why
-        // BindFailure parks allocations here. Sequence-header backing drops
-        // after both, same order as `ensure_parameters`.
-        unsafe {
-            if self.parameters() != vk::VideoSessionParametersKHR::null() {
-                (self.video_queue.fp().destroy_video_session_parameters_khr)(
-                    self.device.handle(),
-                    self.parameters(),
-                    std::ptr::null(),
-                );
-            }
-            (self.video_queue.fp().destroy_video_session_khr)(
-                self.device.handle(),
-                self.session,
-                std::ptr::null(),
-            );
-            for memory in self.memory.drain(..) {
-                self.device.free_memory(memory, None);
-            }
-        }
+        // SAFETY: this session's own parameters object (NULL before the first
+        // activation); the decoder drains GPU work first. `raw` drops next and
+        // destroys the session; the sequence-header backing drops after that.
+        unsafe { self.raw.destroy_parameters(self.parameters()) };
     }
 }
 

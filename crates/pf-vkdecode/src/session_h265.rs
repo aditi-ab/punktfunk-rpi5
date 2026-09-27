@@ -17,7 +17,7 @@
 //! ([`crate::session`]).
 //!
 //! `ParamsLedgerH265` is the pure half (unit-tested); `VideoSessionH265` is the
-//! thin Vulkan half.
+//! thin Vulkan half over [`RawVideoSession`].
 
 use std::rc::Rc;
 
@@ -26,7 +26,7 @@ use ash::vk::native as hh;
 use tracing::debug;
 
 use crate::caps::DecodeCaps;
-use crate::caps_h265::H265ProfileChain;
+use crate::caps::DecodeProfile;
 use crate::caps_h265::H265ProfileKey;
 use crate::device::DecodeDevice;
 use crate::params_h265::fallback_vps_from_sps;
@@ -40,9 +40,11 @@ use crate::params_h265::OwnedStdH265Vps;
 use crate::params_h265::Pps;
 use crate::params_h265::Sps;
 use crate::params_h265::Vps;
-use crate::session::bind_session_memory;
-use crate::session::ResetArm;
+use crate::session::ParametersObject;
+use crate::session::RawVideoSession;
 use crate::session::SessionError;
+use crate::session::SetTable;
+use crate::session::SetVerdict;
 
 /// Hosts emit one VPS + one SPS + one PPS per stream; headroom absorbs id churn
 /// without recreation. Overflow recreates rather than failing.
@@ -97,63 +99,49 @@ pub enum ParamsActionH265 {
     Recreate,
 }
 
-/// Which sets the object holds, by id AND content. The parser re-parses in-band
-/// sets every IRAP, so pointer identity means nothing.
-#[derive(Debug, Default)]
+/// Which sets the object holds ([`SetTable`] per kind). The parser re-parses
+/// in-band sets every IRAP, so pointer identity means nothing.
+#[derive(Debug)]
 pub(crate) struct ParamsLedgerH265 {
-    vps: Vec<(u8, VpsSource)>,
-    sps: Vec<(u8, Rc<Sps>)>,
+    vps: SetTable<u8, VpsSource>,
+    sps: SetTable<u8, Rc<Sps>>,
     /// Keyed `(sps_id, pps_id)` — the pair Vulkan resolves a stored PPS by.
-    pps: Vec<((u8, u8), Rc<Pps>)>,
+    pps: SetTable<(u8, u8), Rc<Pps>>,
     update_seq: u32,
 }
 
+impl Default for ParamsLedgerH265 {
+    fn default() -> Self {
+        Self {
+            vps: SetTable::new(MAX_STD_VPS),
+            sps: SetTable::new(MAX_STD_SPS),
+            pps: SetTable::new(MAX_STD_PPS),
+            update_seq: 0,
+        }
+    }
+}
+
 impl ParamsLedgerH265 {
+    /// A fallback VPS and the real one under the same id are a content change.
     pub(crate) fn plan(&self, vps: &VpsSource, sps: &Rc<Sps>, pps: &Rc<Pps>) -> ParamsActionH265 {
         // The first triple creates the object. One created with no set at all
         // faults Intel's Windows driver; FFmpeg never creates one either.
         if self.vps.is_empty() && self.sps.is_empty() && self.pps.is_empty() {
             return ParamsActionH265::Recreate;
         }
-        let vps_key = vps.id();
-        let sps_key = sps.seq_parameter_set_id;
-        let pps_key = (pps.seq_parameter_set_id, pps.pic_parameter_set_id);
-
-        let stored_vps = self.vps.iter().find(|(id, _)| *id == vps_key);
-        let stored_sps = self.sps.iter().find(|(id, _)| *id == sps_key);
-        let stored_pps = self.pps.iter().find(|(id, _)| *id == pps_key);
-        // Content change under a stored id, including fallback VPS → real.
-        if let Some((_, stored)) = stored_vps {
-            if stored != vps {
-                return ParamsActionH265::Recreate;
-            }
-        }
-        if let Some((_, stored)) = stored_sps {
-            if **stored != **sps {
-                return ParamsActionH265::Recreate;
-            }
-        }
-        if let Some((_, stored)) = stored_pps {
-            if **stored != **pps {
-                return ParamsActionH265::Recreate;
-            }
-        }
-        let add_vps = stored_vps.is_none();
-        let add_sps = stored_sps.is_none();
-        let add_pps = stored_pps.is_none();
-        if !add_vps && !add_sps && !add_pps {
-            return ParamsActionH265::Current;
-        }
-        if (add_vps && self.vps.len() >= MAX_STD_VPS)
-            || (add_sps && self.sps.len() >= MAX_STD_SPS)
-            || (add_pps && self.pps.len() >= MAX_STD_PPS)
-        {
-            return ParamsActionH265::Recreate;
-        }
-        ParamsActionH265::Add {
-            add_vps,
-            add_sps,
-            add_pps,
+        let vps_verdict = self.vps.verdict(&vps.id(), vps);
+        let sps_verdict = self.sps.verdict(&sps.seq_parameter_set_id, sps);
+        let pps_verdict = self
+            .pps
+            .verdict(&(pps.seq_parameter_set_id, pps.pic_parameter_set_id), pps);
+        match vps_verdict.max(sps_verdict).max(pps_verdict) {
+            SetVerdict::Stored => ParamsActionH265::Current,
+            SetVerdict::New => ParamsActionH265::Add {
+                add_vps: vps_verdict == SetVerdict::New,
+                add_sps: sps_verdict == SetVerdict::New,
+                add_pps: pps_verdict == SetVerdict::New,
+            },
+            SetVerdict::Full | SetVerdict::Conflict => ParamsActionH265::Recreate,
         }
     }
 
@@ -167,6 +155,8 @@ impl ParamsLedgerH265 {
         sps: &Rc<Sps>,
         pps: &Rc<Pps>,
     ) {
+        let sps_key = sps.seq_parameter_set_id;
+        let pps_key = (pps.seq_parameter_set_id, pps.pic_parameter_set_id);
         match action {
             ParamsActionH265::Current => {}
             ParamsActionH265::Add {
@@ -175,29 +165,20 @@ impl ParamsLedgerH265 {
                 add_pps,
             } => {
                 if add_vps {
-                    self.vps.push((vps.id(), vps.clone()));
+                    self.vps.push(vps.id(), vps.clone());
                 }
                 if add_sps {
-                    self.sps.push((sps.seq_parameter_set_id, Rc::clone(sps)));
+                    self.sps.push(sps_key, Rc::clone(sps));
                 }
                 if add_pps {
-                    self.pps.push((
-                        (pps.seq_parameter_set_id, pps.pic_parameter_set_id),
-                        Rc::clone(pps),
-                    ));
+                    self.pps.push(pps_key, Rc::clone(pps));
                 }
                 self.update_seq += 1;
             }
             ParamsActionH265::Recreate => {
-                self.vps.clear();
-                self.sps.clear();
-                self.pps.clear();
-                self.vps.push((vps.id(), vps.clone()));
-                self.sps.push((sps.seq_parameter_set_id, Rc::clone(sps)));
-                self.pps.push((
-                    (pps.seq_parameter_set_id, pps.pic_parameter_set_id),
-                    Rc::clone(pps),
-                ));
+                self.vps.reset_to(vps.id(), vps.clone());
+                self.sps.reset_to(sps_key, Rc::clone(sps));
+                self.pps.reset_to(pps_key, Rc::clone(pps));
                 self.update_seq = 0;
             }
         }
@@ -291,22 +272,22 @@ impl StoredParamsH265 {
     }
 }
 
+impl ParametersObject for StoredParamsH265 {
+    fn object(&self) -> vk::VideoSessionParametersKHR {
+        self.object
+    }
+}
+
 pub(crate) struct VideoSessionH265 {
-    device: ash::Device,
-    video_queue: ash::khr::video_queue::Device,
-    session: vk::VideoSessionKHR,
-    memory: Vec<vk::DeviceMemory>,
+    pub(crate) raw: RawVideoSession,
     parameters: StoredParamsH265,
     ledger: ParamsLedgerH265,
     pub(crate) config: SessionConfigH265,
-    /// The session has never run a coding scope: the first one records a
-    /// `VK_VIDEO_CODING_CONTROL_RESET_BIT_KHR` control before anything else.
-    needs_reset: ResetArm,
 }
 
 impl VideoSessionH265 {
-    /// Session plus an empty parameters object. Sets arrive via
-    /// [`Self::ensure_parameters`] before the first decode.
+    /// Session with no parameters object yet: the first
+    /// [`Self::ensure_parameters`] creates it holding its triple.
     ///
     /// # Safety
     ///
@@ -316,58 +297,23 @@ impl VideoSessionH265 {
         caps: &DecodeCaps,
         config: SessionConfigH265,
     ) -> Result<Self, SessionError> {
-        let mut chain = H265ProfileChain::new(config.profile);
-        let profile = chain.wire();
-        let std_header_version = caps.std_header_version;
-        let session_ci = vk::VideoSessionCreateInfoKHR::default()
-            .queue_family_index(dev.decode_qf())
-            .video_profile(profile)
-            .picture_format(caps.output_format)
-            .max_coded_extent(config.max_coded_extent)
-            .reference_picture_format(caps.dpb_format)
-            .max_dpb_slots(config.max_dpb_slots)
-            .max_active_reference_pictures(config.max_active_references)
-            .std_header_version(&std_header_version);
-        let mut session = vk::VideoSessionKHR::null();
-        // SAFETY: live device; `session_ci` roots locals (chain, header version)
-        // that outlive the call.
-        let r = unsafe {
-            (dev.video_queue().fp().create_video_session_khr)(
-                dev.ash().handle(),
-                &session_ci,
-                std::ptr::null(),
-                &mut session,
-            )
+        // SAFETY: fn contract.
+        let raw = unsafe {
+            RawVideoSession::create(
+                dev,
+                caps,
+                DecodeProfile::H265(config.profile),
+                config.max_coded_extent,
+                config.max_dpb_slots,
+                config.max_active_references,
+            )?
         };
-        if r != vk::Result::SUCCESS {
-            return Err(SessionError::Vk(r));
-        }
-
-        let mut built = Self {
-            device: dev.ash().clone(),
-            video_queue: dev.video_queue().clone(),
-            session,
-            memory: Vec::new(),
+        Ok(Self {
+            raw,
             parameters: StoredParamsH265::none(),
             ledger: ParamsLedgerH265::default(),
             config,
-            needs_reset: ResetArm::armed(),
-        };
-        // SAFETY: fn contract; on error `built` drops and unwinds the session +
-        // whatever memory was bound.
-        unsafe {
-            // A bind failure hands allocations back: parking them in `built` is
-            // what makes the early return destroy the session before freeing
-            // them (BindFailure docs — Vulkan defines no partial-bind rollback).
-            match bind_session_memory(dev, session) {
-                Ok(memory) => built.memory = memory,
-                Err(failure) => {
-                    built.memory = failure.allocations;
-                    return Err(failure.error);
-                }
-            }
-        }
-        Ok(built)
+        })
     }
 
     /// Parameters object holding exactly `vps`/`sps`/`pps`, fused with the
@@ -396,15 +342,19 @@ impl VideoSessionH265 {
             .max_std_pps_count(MAX_STD_PPS as u32)
             .parameters_add_info(&add);
         let ci = vk::VideoSessionParametersCreateInfoKHR::default()
-            .video_session(self.session)
+            .video_session(self.raw.session())
             .push_next(&mut h265);
         let mut object = vk::VideoSessionParametersKHR::null();
         // SAFETY: fn contract; `ci` roots locals outliving the call. The Std
         // arrays and the blocks their embedded pointers address are owned by
         // `stored`, which is returned rather than dropped here.
         let r = unsafe {
-            (self.video_queue.fp().create_video_session_parameters_khr)(
-                self.device.handle(),
+            (self
+                .raw
+                .video_queue()
+                .fp()
+                .create_video_session_parameters_khr)(
+                self.raw.device().handle(),
                 &ci,
                 std::ptr::null(),
                 &mut object,
@@ -494,8 +444,12 @@ impl VideoSessionH265 {
                 // (incl. the OwnedStd backings) outliving the call — and the
                 // backings go on outliving it, adopted below.
                 let r = unsafe {
-                    (self.video_queue.fp().update_video_session_parameters_khr)(
-                        self.device.handle(),
+                    (self
+                        .raw
+                        .video_queue()
+                        .fp()
+                        .update_video_session_parameters_khr)(
+                        self.raw.device().handle(),
                         self.parameters.object,
                         &update,
                     )
@@ -531,79 +485,27 @@ impl VideoSessionH265 {
                         vec![owned_pps],
                     )?
                 };
-                // Replace first so destroy of `old` runs before its backings
-                // free — the order a driver still holding the old pointers needs.
-                let old = std::mem::replace(&mut self.parameters, fresh);
-                // The first activation has no old object. The spec lets destroy take
-                // NULL; AMD's Windows driver reads through it.
-                if old.object != vk::VideoSessionParametersKHR::null() {
-                    // SAFETY: the fn-level contract — the caller drained every
-                    // in-flight decode before a Recreate reached here (checked via
-                    // parameters_action), so no submitted work reads the old
-                    // object; it is this session's own handle, on a live device.
-                    unsafe {
-                        (self.video_queue.fp().destroy_video_session_parameters_khr)(
-                            self.device.handle(),
-                            old.object,
-                            std::ptr::null(),
-                        );
-                    }
-                }
-                // Drop only after destroy: Std blocks `old` owns must outlive
-                // the object that pointed at them.
-                drop(old);
+                // SAFETY: the fn-level contract — the caller drained every
+                // in-flight decode before a Recreate reached here (checked via
+                // parameters_action).
+                unsafe { self.raw.replace_parameters(&mut self.parameters, fresh) };
                 self.ledger.commit(action, vps, sps, pps);
                 Ok(())
             }
         }
     }
 
-    pub(crate) fn session(&self) -> vk::VideoSessionKHR {
-        self.session
-    }
-
     pub(crate) fn parameters(&self) -> vk::VideoSessionParametersKHR {
         self.parameters.object
-    }
-
-    /// Next coding scope must record the initialization RESET. `true` once per
-    /// session, only if that command buffer reaches the queue: a record/submit
-    /// failure after this returned `true` must call [`Self::re_arm_reset`].
-    pub(crate) fn take_needs_reset(&mut self) -> bool {
-        self.needs_reset.take()
-    }
-
-    pub(crate) fn re_arm_reset(&mut self) {
-        self.needs_reset.re_arm();
     }
 }
 
 impl Drop for VideoSessionH265 {
     fn drop(&mut self) {
-        // SAFETY: all handles are this session's own on a live device; the
-        // decoder drains GPU work first. A session that never decoded has no
-        // parameters object and skips that destroy. Memory bound into a session
-        // must not be freed while the session lives, so destroy the session
-        // first — a failed bind parks allocations here
-        // (`crate::session::BindFailure`). Std backings drop after this body,
-        // after the parameters object is destroyed.
-        unsafe {
-            if self.parameters.object != vk::VideoSessionParametersKHR::null() {
-                (self.video_queue.fp().destroy_video_session_parameters_khr)(
-                    self.device.handle(),
-                    self.parameters.object,
-                    std::ptr::null(),
-                );
-            }
-            (self.video_queue.fp().destroy_video_session_khr)(
-                self.device.handle(),
-                self.session,
-                std::ptr::null(),
-            );
-            for memory in self.memory.drain(..) {
-                self.device.free_memory(memory, None);
-            }
-        }
+        // SAFETY: this session's own parameters object (NULL if it never
+        // decoded); the decoder drains GPU work first. `raw` drops next and
+        // destroys the session; the Std backings drop after that.
+        unsafe { self.raw.destroy_parameters(self.parameters.object) };
     }
 }
 

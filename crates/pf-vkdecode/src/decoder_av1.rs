@@ -1695,11 +1695,11 @@ unsafe fn record_and_submit_av1(
     }
 
     let begin_coding = vk::VideoBeginCodingInfoKHR::default()
-        .video_session(state.session.session())
+        .video_session(state.session.raw.session())
         .video_session_parameters(state.session.parameters())
         .reference_slots(&begin_slots);
     // Consume RESET here; re-arm if this command buffer never reaches the queue.
-    let did_reset = state.session.take_needs_reset();
+    let did_reset = state.session.raw.take_needs_reset();
     // SAFETY: recording through end_command_buffer; pointed-to structs outlive
     // the calls; session/parameters handles are this generation's.
     let recorded: Result<(), vk::Result> = unsafe {
@@ -1724,7 +1724,7 @@ unsafe fn record_and_submit_av1(
     };
     if let Err(e) = recorded {
         if did_reset {
-            state.session.re_arm_reset();
+            state.session.raw.re_arm_reset();
         }
         return Err(VkDecodeError::from(e));
     }
@@ -1754,7 +1754,7 @@ unsafe fn record_and_submit_av1(
     if let Err(e) = result {
         // Recorded RESET never executed; the next recording must redo it.
         if did_reset {
-            state.session.re_arm_reset();
+            state.session.raw.re_arm_reset();
         }
         return Err(VkDecodeError::from(e));
     }

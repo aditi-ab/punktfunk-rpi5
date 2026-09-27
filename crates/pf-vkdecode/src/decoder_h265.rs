@@ -1466,14 +1466,14 @@ unsafe fn record_and_submit_h265(
     }
 
     let begin_coding = vk::VideoBeginCodingInfoKHR::default()
-        .video_session(state.session.session())
+        .video_session(state.session.raw.session())
         .video_session_parameters(state.session.parameters())
         .reference_slots(&begin_slots);
     // One-shot session RESET, consumed here but re-armed on every error path
     // below. A RESET recorded into a buffer that never reaches the queue
     // initialized nothing; the next successful recording must carry it or the
     // session runs uninitialized for its whole life.
-    let did_reset = state.session.take_needs_reset();
+    let did_reset = state.session.raw.take_needs_reset();
     // SAFETY: recording into the begun buffer, through end_command_buffer; every
     // pointed-to struct above is a local (or session-state field) that outlives
     // the calls; the session/parameters handles are this generation's own.
@@ -1500,7 +1500,7 @@ unsafe fn record_and_submit_h265(
     };
     if let Err(e) = recorded {
         if did_reset {
-            state.session.re_arm_reset();
+            state.session.raw.re_arm_reset();
         }
         return Err(VkDecodeError::from(e));
     }
@@ -1531,7 +1531,7 @@ unsafe fn record_and_submit_h265(
     if let Err(e) = result {
         // Recorded RESET never executed: the next recording must redo it.
         if did_reset {
-            state.session.re_arm_reset();
+            state.session.raw.re_arm_reset();
         }
         return Err(VkDecodeError::from(e));
     }
