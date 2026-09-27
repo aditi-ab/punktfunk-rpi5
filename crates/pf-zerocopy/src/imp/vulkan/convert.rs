@@ -19,7 +19,7 @@ use crate::imp::proto::{ConvertOut, ConvertSrc, CursorRect};
 use anyhow::{anyhow, bail, Context, Result};
 use ash::vk;
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd, OwnedFd};
 
 const CONVERT_SPV: &[u8] = include_bytes!("../convert_img.spv");
 /// Push constants of `convert_img.comp`: nine 32-bit words.
@@ -575,12 +575,10 @@ impl VkBridge {
             let fmt = vk_format(s.fourcc)
                 .ok_or_else(|| anyhow!("no VkFormat for dmabuf fourcc {:#x}", s.fourcc))?;
             let d = &self.device;
-            let dup = libc::dup(s.fd);
-            if dup < 0 {
-                bail!("dup(dmabuf fd)");
-            }
-            // SAFETY: `dup` came from a successful `dup` and nothing else owns it.
-            let dup = <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(dup);
+            // `s.fd` is the worker's cached dmabuf, open for this call.
+            let dup = BorrowedFd::borrow_raw(s.fd)
+                .try_clone_to_owned()
+                .context("dup(dmabuf fd)")?;
             let planes = [vk::SubresourceLayout::default()
                 .offset(u64::from(s.offset))
                 .row_pitch(u64::from(s.stride))];
@@ -1035,11 +1033,8 @@ mod tests {
         bridge
             .set_cursor(7, cw, ch, &cursor)
             .expect("cursor upload");
-        let sem = cuda::ExternalSemaphore::import_owned_timeline_fd(
-            bridge
-                .convert_timeline_fd()
-                .expect("timeline fd")
-                .into_raw_fd(),
+        let sem = cuda::ExternalSemaphore::import_timeline_fd(
+            bridge.convert_timeline_fd().expect("timeline fd"),
         )
         .expect("convert timeline into CUDA");
         let reference = |x: u32, y: u32| -> [u8; 3] {

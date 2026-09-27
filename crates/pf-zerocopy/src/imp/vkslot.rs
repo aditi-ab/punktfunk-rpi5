@@ -20,6 +20,7 @@
 use super::cuda::{self, CUdeviceptr};
 use anyhow::{anyhow, Context as _, Result};
 use ash::vk;
+use std::os::fd::{FromRawFd as _, OwnedFd};
 
 /// Bitmap edge clamp (px); same value as [`cuda::CURSOR_MAX`] and the capture side.
 pub const CURSOR_MAX: u32 = cuda::CURSOR_MAX;
@@ -419,8 +420,8 @@ impl VkSlotBlend {
     fn init_timeline(&mut self) -> Result<()> {
         // SAFETY: ash calls on the live device; CreateInfo locals outlive each
         // synchronous call. The semaphore is destroyed on every post-create
-        // failure. `import_owned_timeline_fd` takes the fd on success and
-        // closes it on failure. CUDA context is current (encoder thread).
+        // failure. The exported fd is fresh, so `OwnedFd` is its only owner.
+        // CUDA context is current (encoder thread).
         unsafe {
             let mut type_ci = vk::SemaphoreTypeCreateInfo::default()
                 .semaphore_type(vk::SemaphoreType::TIMELINE)
@@ -442,13 +443,13 @@ impl VkSlotBlend {
                     .semaphore(sem)
                     .handle_type(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD),
             ) {
-                Ok(f) => f,
+                Ok(f) => OwnedFd::from_raw_fd(f),
                 Err(e) => {
                     self.device.destroy_semaphore(sem, None);
                     return Err(e).context("vkGetSemaphoreFdKHR(timeline)");
                 }
             };
-            let cuda_sem = match cuda::ExternalSemaphore::import_owned_timeline_fd(fd) {
+            let cuda_sem = match cuda::ExternalSemaphore::import_timeline_fd(fd) {
                 Ok(c) => c,
                 Err(e) => {
                     self.device.destroy_semaphore(sem, None);
@@ -617,7 +618,8 @@ impl VkSlotBlend {
         // SAFETY: `ExternalMemoryBufferCreateInfo`/`ExportMemoryAllocateInfo`
         // declare OPAQUE_FD; `MemoryDedicatedAllocateInfo` ties memory to the
         // buffer. Infos are locals outliving each call. Failure paths destroy
-        // created objects once. `import_owned_fd` adopts the fd or closes it.
+        // created objects once. The exported fd is fresh, so `OwnedFd` is its
+        // only owner.
         unsafe {
             let d = &self.device;
             let mut ext_info = vk::ExternalMemoryBufferCreateInfo::default()
@@ -668,7 +670,7 @@ impl VkSlotBlend {
                     .memory(memory)
                     .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD),
             ) {
-                Ok(f) => f,
+                Ok(f) => OwnedFd::from_raw_fd(f),
                 Err(e) => {
                     d.free_memory(memory, None);
                     d.destroy_buffer(buffer, None);

@@ -12,6 +12,7 @@
 #![allow(non_camel_case_types, non_snake_case)]
 
 use anyhow::{bail, Result};
+use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd};
 use std::os::raw::{c_uint, c_void};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -1079,35 +1080,23 @@ pub struct ExternalDmabuf {
 unsafe impl Send for ExternalDmabuf {}
 
 impl ExternalDmabuf {
-    /// Import `fd` without consuming it: a `dup` is handed to the driver. Maps `size` bytes.
-    /// Context must be current.
-    pub fn import(fd: i32, size: u64) -> Result<ExternalDmabuf> {
-        // SAFETY: `dup` reads the integer `fd` (still owned by the caller) and returns a new fd.
-        let dup = unsafe { libc::dup(fd) };
-        if dup < 0 {
-            bail!("dup(dmabuf fd) failed");
-        }
-        Self::import_owned_fd(dup, size)
-    }
-
-    /// Import an fd the caller hands over (Vulkan `OPAQUE_FD`). Driver owns it on success; we
-    /// close it on failure.
-    pub fn import_owned_fd(dup: i32, size: u64) -> Result<ExternalDmabuf> {
+    /// Import an `OPAQUE_FD` (Vulkan-exported) as `size` bytes of mapped device memory. The
+    /// driver owns `fd` on success; a failed import drops (closes) it. Context must be current.
+    pub fn import_owned_fd(fd: OwnedFd, size: u64) -> Result<ExternalDmabuf> {
         let mut desc = CUDA_EXTERNAL_MEMORY_HANDLE_DESC {
             type_: CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
             size,
             ..Default::default()
         };
-        desc.handle[0] = dup as u32 as u64; // union member `int fd` (LE low bytes)
+        desc.handle[0] = fd.as_raw_fd() as u32 as u64; // union member `int fd` (LE low bytes)
         let mut ext: CUexternalMemory = std::ptr::null_mut();
         // SAFETY: `&desc` outlives the call (`OPAQUE_FD`, fd in union `int fd` low bytes, `size`
         // set). `&mut ext` is a live out-param. Driver takes the fd only on success. Context current.
         let r = unsafe { cuImportExternalMemory(&mut ext, &desc) };
         if r != 0 {
-            // SAFETY: import failed, so we still own `dup`; close it once. Success never closes it.
-            unsafe { libc::close(dup) };
             bail!("cuImportExternalMemory failed ({r}) — LINEAR dmabuf import unsupported?");
         }
+        let _ = fd.into_raw_fd(); // the driver owns it now
         let buf = CUDA_EXTERNAL_MEMORY_BUFFER_DESC {
             offset: 0,
             size,
@@ -1159,24 +1148,32 @@ pub struct ExternalSemaphore {
 unsafe impl Send for ExternalSemaphore {}
 
 impl ExternalSemaphore {
-    /// Import a Vulkan timeline semaphore (`vkGetSemaphoreFdKHR` OPAQUE_FD). Driver owns the fd
-    /// on success; we close it on failure. Context must be current.
-    pub fn import_owned_timeline_fd(fd: i32) -> Result<ExternalSemaphore> {
+    /// Import a Vulkan timeline semaphore (`vkGetSemaphoreFdKHR` OPAQUE_FD). The driver owns
+    /// `fd` on success; a failed import drops (closes) it. Context must be current.
+    pub fn import_timeline_fd(fd: OwnedFd) -> Result<ExternalSemaphore> {
         let mut desc = CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC {
             type_: CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_TIMELINE_SEMAPHORE_FD,
             ..Default::default()
         };
-        desc.handle[0] = fd as u32 as u64; // union member `int fd` (LE low bytes)
+        desc.handle[0] = fd.as_raw_fd() as u32 as u64; // union member `int fd` (LE low bytes)
         let mut sem: CUexternalSemaphore = std::ptr::null_mut();
         // SAFETY: `&desc` outlives the call (`TIMELINE_SEMAPHORE_FD`, fd in union `int fd` low
         // bytes). `&mut sem` is a live out-param. Context current.
         let r = unsafe { cuImportExternalSemaphore(&mut sem, &desc) };
         if r != 0 {
-            // SAFETY: import failed, so we still own `fd`; close it once.
-            unsafe { libc::close(fd) };
             bail!("cuImportExternalSemaphore failed ({r}) — timeline-semaphore fd export/import unsupported?");
         }
+        let _ = fd.into_raw_fd(); // the driver owns it now
         Ok(ExternalSemaphore { sem })
+    }
+
+    /// [`import_timeline_fd`](Self::import_timeline_fd) for a caller still holding the fd as an
+    /// integer. Takes ownership of `fd` whatever the outcome.
+    pub fn import_owned_timeline_fd(fd: i32) -> Result<ExternalSemaphore> {
+        anyhow::ensure!(fd >= 0, "import a negative timeline fd");
+        // SAFETY: the caller hands over sole ownership of the open descriptor `fd`; nothing
+        // else closes it.
+        Self::import_timeline_fd(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
     /// Enqueue a signal to `value` after prior work on this thread's copy stream. No CPU wait.
