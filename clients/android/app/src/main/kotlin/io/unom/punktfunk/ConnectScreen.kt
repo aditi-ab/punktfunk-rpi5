@@ -47,13 +47,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * Handshake budget for the no-PIN "request access" connect. Must exceed the host's approval-park
- * window (~180 s) so a slow operator approval still lands on this same parked connection rather than
- * timing the client out first. Mirrors the Linux client's 185 s.
- */
-private const val REQUEST_ACCESS_TIMEOUT_MS = 185_000
-
-/**
  * How long a host's advertised actions stay fresh before this screen asks again — the desktop's
  * `pf_client_core::host_actions::TTL`. Long on purpose: what it governs (whether this device
  * holds the Host-power grant, whether the box can suspend) changes when an operator edits
@@ -337,28 +330,9 @@ fun ConnectScreen(
         launch = launch, dialer = "touch/host-grid", timeoutMs = timeoutMs, preset = preset,
     )
 
-    // What the stream screen is handed: the settings this connect actually used, plus the HOST's
-    // clipboard decision (a property of the record, not a global). A host we never saved — a
-    // connect that failed to pin — gets the secure default: no clipboard until the user enables
-    // it for that host (security-review 2026-08-31 M-8).
-    fun session(handle: Long, record: KnownHost?, preset: StreamPreset?): ActiveSession {
-        // The session's own Welcome carries where this host serves its library. Save it now: this
-        // is the only source that does not need an mDNS advert, so it is what makes a host that
-        // moved off 47990 browsable over a VPN or when it was added by address. 0 = not
-        // advertised, and learnMgmtPort ignores it.
-        if (record != null) {
-            NativeBridge.nativeHostMgmtPort(handle).takeIf { it > 0 }?.let {
-                knownHostStore.learnMgmtPort(record, it)
-            }
-        }
-        return ActiveSession(
-            handle,
-            settings.effectiveFor(preset),
-            clipboardSync = record?.clipboardSync ?: false,
-            presetName = preset?.name,
-            hostId = record?.id,
-        )
-    }
+    // What the stream screen is handed: the settings this connect used, and the host's record.
+    fun session(handle: Long, record: KnownHost?, preset: StreamPreset?): ActiveSession =
+        SessionFactory.afterDial(handle, record, settings.effectiveFor(preset), preset, knownHostStore)
 
     // The actual dial (identity already ready). A TOFU dial (pinHex null) pins what the host
     // presented, as an unpaired known host. [onFailure] takes over an unreachable dial (the
@@ -392,13 +366,12 @@ fun ConnectScreen(
             attempt = null
             connecting = false
             if (handle != 0L) {
-                // By this dial's pin: the address may also name the other OS of a dual-boot box.
-                var record = pinHex?.let { knownHostStore.resolve(it, targetHost, targetPort) }
-                if (pinHex == null) { // TOFU: pin what we observed (unpaired)
-                    val fp = NativeBridge.nativeHostFingerprint(handle)
-                    if (fp.isNotEmpty()) {
-                        record = knownHostStore.trust(targetHost, targetPort, name, fp, paired = false)
-                    }
+                // By this dial's pin (the address may also name the other OS of a dual-boot box);
+                // a TOFU dial pins what the host presented, unpaired.
+                val record = if (pinHex != null) {
+                    knownHostStore.resolve(pinHex, targetHost, targetPort)
+                } else {
+                    SessionFactory.pinPresented(handle, targetHost, targetPort, name, paired = false, knownHostStore)
                 }
                 onConnected(session(handle, record, preset))
             } else {
@@ -538,12 +511,10 @@ fun ConnectScreen(
             if (handle != 0L) {
                 // Approved — save the host as PAIRED, pinning the fingerprint it presented, so
                 // future connects are silent (exactly like after a PIN ceremony).
-                val fp = NativeBridge.nativeHostFingerprint(handle)
-                var record = knownHostStore.resolve(fp, target.host, target.port)
-                if (fp.isNotEmpty()) {
-                    record = knownHostStore.trust(target.host, target.port, target.name, fp, paired = true)
-                    savedHosts = knownHostStore.all()
-                }
+                val record = SessionFactory.pinPresented(
+                    handle, target.host, target.port, target.name, paired = true, knownHostStore,
+                )?.also { savedHosts = knownHostStore.all() }
+                    ?: knownHostStore.resolve("", target.host, target.port)
                 onConnected(session(handle, record, preset = null))
             } else {
                 // Cause-specific: an operator denial, an approval timeout, and a request that

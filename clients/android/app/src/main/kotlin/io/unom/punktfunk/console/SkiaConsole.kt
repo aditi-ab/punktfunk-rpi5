@@ -17,6 +17,8 @@ import io.unom.punktfunk.CONNECT_TIMEOUT_MS
 import io.unom.punktfunk.ConnectErrors
 import io.unom.punktfunk.HostActions
 import io.unom.punktfunk.PresetStore
+import io.unom.punktfunk.REQUEST_ACCESS_TIMEOUT_MS
+import io.unom.punktfunk.SessionFactory
 import io.unom.punktfunk.Settings
 import io.unom.punktfunk.SettingsStore
 import io.unom.punktfunk.SpeedTestPhase
@@ -747,29 +749,17 @@ object SkiaConsole {
                     // A request-access approval, or a first TOFU-less connect: save the host as
                     // PAIRED, pinning what it presented, so the next connect is silent.
                     if (record == null || (requestAccess && !record.paired)) {
-                        val seen = NativeBridge.nativeHostFingerprint(h)
-                        if (seen.isNotEmpty()) {
-                            val name = record?.name
-                                ?: discovered.firstOrNull { it.host == addr && it.port == port }?.name
-                                ?: addr
-                            record = knownHostStore.trust(addr, port, name, seen, paired = requestAccess || record?.paired == true)
+                        val name = record?.name
+                            ?: discovered.firstOrNull { it.host == addr && it.port == port }?.name
+                            ?: addr
+                        val paired = requestAccess || record?.paired == true
+                        SessionFactory.pinPresented(h, addr, port, name, paired, knownHostStore)?.let {
+                            record = it
                             pushHosts(); pushKnownHosts()
                         }
                     }
-                    if (record != null) {
-                        NativeBridge.nativeHostMgmtPort(h).takeIf { it > 0 }?.let {
-                            knownHostStore.learnMgmtPort(record, it)
-                        }
-                    }
-                    val session = ActiveSession(
-                        h,
-                        effective,
-                        clipboardSync = record?.clipboardSync ?: false,
-                        presetName = preset?.name,
-                        hostId = record?.id,
-                        launchedFromLibrary = launchId != null,
-                        libraryPresetId = presetId,
-                    )
+                    val session = SessionFactory.afterDial(h, record, effective, preset, knownHostStore)
+                        .copy(launchedFromLibrary = launchId != null, libraryPresetId = presetId)
                     // The console learns the dial landed and keeps the screen: its launch hold
                     // is still waiting on the game. Handing the session over here instead would
                     // swap the console for the stream view mid-wait, which is the seam this
@@ -1197,9 +1187,6 @@ object SkiaConsole {
             }
         }
     }
-
-    /** The no-PIN request-access park (≥ the host's approval window) — ConnectScreen's figure. */
-    private const val REQUEST_ACCESS_TIMEOUT_MS = 185_000
 
     /** How long a host's advertised actions stay fresh before we ask again — the desktop's
      *  `pf_client_core::host_actions::TTL`. Long on purpose: what it governs changes when an
