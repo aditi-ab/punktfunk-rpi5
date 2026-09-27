@@ -21,11 +21,12 @@
 mod common;
 
 use ash::vk;
-use common::TestDecoder;
 use pf_vkdecode::DecodeStatus;
 use pf_vkdecode::DecodedVkFrame;
 use pf_vkdecode::NoopQueueLock;
 use pf_vkdecode::VkAv1Decoder;
+use pf_vkdecode::VkCodec;
+use pf_vkdecode::VkDecoder;
 use pf_vkdecode::VkH264Decoder;
 use pf_vkdecode::VkH265Decoder;
 use sha2::Digest;
@@ -498,7 +499,7 @@ impl Readback {
 
 /// Wait, read, release with the presenter write-back the readback enqueued.
 fn consume_frame(
-    decoder: &mut impl TestDecoder,
+    decoder: &mut VkDecoder<impl VkCodec>,
     readback: &Readback,
     frame: &DecodedVkFrame,
     index: usize,
@@ -532,7 +533,7 @@ fn consume_frame(
 /// frees hidden pictures and returns nothing. The shared body catches a stranded
 /// shown frame via the frame-count assert.
 fn collect_hashes(
-    decoder: &mut impl TestDecoder,
+    decoder: &mut VkDecoder<impl VkCodec>,
     readback: &Readback,
     aus: &[&[u8]],
 ) -> Vec<String> {

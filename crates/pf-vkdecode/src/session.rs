@@ -12,7 +12,9 @@
 //! the object first. Create-info plumbing stays function-local.
 //!
 //! [`ParamsLedger`] is the pure decision table; [`VideoSession`] is the Vulkan
-//! half. Pin: tests in this file; the AV1 retention case is [`crate::session_av1`].
+//! half. [`RawVideoSession`] (create, memory bind, RESET arm, destroy) and
+//! [`SetTable`] are shared with the H.265 and AV1 sessions. Pin: tests in this
+//! file; the AV1 retention case is [`crate::session_av1`].
 
 use std::rc::Rc;
 
@@ -23,7 +25,7 @@ use cros_codecs::codec::h264::parser::Sps;
 use tracing::debug;
 
 use crate::caps::DecodeCaps;
-use crate::caps::H264ProfileChain;
+use crate::caps::DecodeProfile;
 use crate::device::find_memory_type_preferring;
 use crate::device::AllocError;
 use crate::device::DecodeDevice;
@@ -50,13 +52,77 @@ pub enum ParamsAction {
     Recreate,
 }
 
-/// Sets the parameters object holds, keyed by id AND content. In-band sets
-/// re-parse every keyframe, so pointer identity is not identity.
-#[derive(Debug, Default)]
+/// One kind of parameter set a parameters object stores, keyed by id AND
+/// content. In-band sets re-parse every keyframe, so pointer identity is not
+/// identity. Each codec ledger composes one table per set kind.
+#[derive(Debug)]
+pub(crate) struct SetTable<K, V> {
+    entries: Vec<(K, V)>,
+    cap: usize,
+}
+
+/// One set's standing against its table, in precedence order: a ledger acts on
+/// the worst (`max`) verdict among its tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum SetVerdict {
+    /// Identical content stored under this id.
+    Stored,
+    /// Id not stored, and the table has room.
+    New,
+    /// Id not stored, and the table is at capacity.
+    Full,
+    /// Id stored with different content. Vulkan cannot replace a stored set.
+    Conflict,
+}
+
+impl<K: PartialEq, V: PartialEq> SetTable<K, V> {
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            cap,
+        }
+    }
+
+    pub(crate) fn verdict(&self, key: &K, value: &V) -> SetVerdict {
+        match self.entries.iter().find(|(id, _)| id == key) {
+            Some((_, stored)) if stored == value => SetVerdict::Stored,
+            Some(_) => SetVerdict::Conflict,
+            None if self.entries.len() >= self.cap => SetVerdict::Full,
+            None => SetVerdict::New,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub(crate) fn push(&mut self, key: K, value: V) {
+        self.entries.push((key, value));
+    }
+
+    /// Keep only this set: a recreated object holds just the current activation.
+    pub(crate) fn reset_to(&mut self, key: K, value: V) {
+        self.entries.clear();
+        self.entries.push((key, value));
+    }
+}
+
+/// Sets the parameters object holds ([`SetTable`] per kind).
+#[derive(Debug)]
 pub(crate) struct ParamsLedger {
-    sps: Vec<(u8, Rc<Sps>)>,
-    pps: Vec<((u8, u8), Rc<Pps>)>,
+    sps: SetTable<u8, Rc<Sps>>,
+    pps: SetTable<(u8, u8), Rc<Pps>>,
     update_seq: u32,
+}
+
+impl Default for ParamsLedger {
+    fn default() -> Self {
+        Self {
+            sps: SetTable::new(MAX_STD_SPS),
+            pps: SetTable::new(MAX_STD_PPS),
+            update_seq: 0,
+        }
+    }
 }
 
 impl ParamsLedger {
@@ -67,58 +133,39 @@ impl ParamsLedger {
         if self.sps.is_empty() && self.pps.is_empty() {
             return ParamsAction::Recreate;
         }
-        let sps_key = sps.seq_parameter_set_id;
-        let pps_key = (pps.seq_parameter_set_id, pps.pic_parameter_set_id);
-
-        let stored_sps = self.sps.iter().find(|(id, _)| *id == sps_key);
-        let stored_pps = self.pps.iter().find(|(id, _)| *id == pps_key);
-        if let Some((_, stored)) = stored_sps {
-            if **stored != **sps {
-                return ParamsAction::Recreate;
-            }
+        let sps_verdict = self.sps.verdict(&sps.seq_parameter_set_id, sps);
+        let pps_verdict = self
+            .pps
+            .verdict(&(pps.seq_parameter_set_id, pps.pic_parameter_set_id), pps);
+        match sps_verdict.max(pps_verdict) {
+            SetVerdict::Stored => ParamsAction::Current,
+            SetVerdict::New => ParamsAction::Add {
+                add_sps: sps_verdict == SetVerdict::New,
+                add_pps: pps_verdict == SetVerdict::New,
+            },
+            SetVerdict::Full | SetVerdict::Conflict => ParamsAction::Recreate,
         }
-        if let Some((_, stored)) = stored_pps {
-            if **stored != **pps {
-                return ParamsAction::Recreate;
-            }
-        }
-        let add_sps = stored_sps.is_none();
-        let add_pps = stored_pps.is_none();
-        if !add_sps && !add_pps {
-            return ParamsAction::Current;
-        }
-        if (add_sps && self.sps.len() >= MAX_STD_SPS) || (add_pps && self.pps.len() >= MAX_STD_PPS)
-        {
-            return ParamsAction::Recreate;
-        }
-        ParamsAction::Add { add_sps, add_pps }
     }
 
     /// `Add` bumps the sequence by exactly one (one Vulkan call, even if both
     /// sets). `Recreate` keeps only this pair and resets the counter to 0.
     pub(crate) fn commit(&mut self, action: ParamsAction, sps: &Rc<Sps>, pps: &Rc<Pps>) {
+        let sps_key = sps.seq_parameter_set_id;
+        let pps_key = (pps.seq_parameter_set_id, pps.pic_parameter_set_id);
         match action {
             ParamsAction::Current => {}
             ParamsAction::Add { add_sps, add_pps } => {
                 if add_sps {
-                    self.sps.push((sps.seq_parameter_set_id, Rc::clone(sps)));
+                    self.sps.push(sps_key, Rc::clone(sps));
                 }
                 if add_pps {
-                    self.pps.push((
-                        (pps.seq_parameter_set_id, pps.pic_parameter_set_id),
-                        Rc::clone(pps),
-                    ));
+                    self.pps.push(pps_key, Rc::clone(pps));
                 }
                 self.update_seq += 1;
             }
             ParamsAction::Recreate => {
-                self.sps.clear();
-                self.pps.clear();
-                self.sps.push((sps.seq_parameter_set_id, Rc::clone(sps)));
-                self.pps.push((
-                    (pps.seq_parameter_set_id, pps.pic_parameter_set_id),
-                    Rc::clone(pps),
-                ));
+                self.sps.reset_to(sps_key, Rc::clone(sps));
+                self.pps.reset_to(pps_key, Rc::clone(pps));
                 self.update_seq = 0;
             }
         }
@@ -198,15 +245,14 @@ impl From<AllocError> for SessionError {
 /// failure frees here (`allocations` empty). Bind-stage failure returns them
 /// unfreed so the caller destroys the session first ([`VideoSession`] field
 /// order).
-pub(crate) struct BindFailure {
+struct BindFailure {
     /// May be bound into the session — free only AFTER it is destroyed. Empty
     /// if the failure preceded any bind.
-    pub(crate) allocations: Vec<vk::DeviceMemory>,
-    pub(crate) error: SessionError,
+    allocations: Vec<vk::DeviceMemory>,
+    error: SessionError,
 }
 
-/// Query and bind one video session's memory. Codec-agnostic; H.264 and H.265
-/// sessions both call this.
+/// Query and bind one video session's memory ([`RawVideoSession::create`]).
 ///
 /// Bind-stage failure: adopt [`BindFailure::allocations`] and destroy the
 /// session before freeing. Allocate-stage failure already freed; empty vec.
@@ -215,7 +261,7 @@ pub(crate) struct BindFailure {
 ///
 /// `dev` wraps live handles ([`crate::DeviceHandles`] contract) and `session`
 /// is a live, not-yet-memory-bound session created on it.
-pub(crate) unsafe fn bind_session_memory(
+unsafe fn bind_session_memory(
     dev: &DecodeDevice,
     session: vk::VideoSessionKHR,
 ) -> Result<Vec<vk::DeviceMemory>, BindFailure> {
@@ -357,22 +403,22 @@ impl StoredParams {
     }
 }
 
-pub(crate) struct VideoSession {
+/// `VkVideoSessionKHR`, its bound memory, and the one-shot RESET arm. Each codec
+/// session owns one ahead of its parameters, so the session is destroyed before
+/// the Std backings drop.
+pub struct RawVideoSession {
     device: ash::Device,
     video_queue: ash::khr::video_queue::Device,
     session: vk::VideoSessionKHR,
     memory: Vec<vk::DeviceMemory>,
-    parameters: StoredParams,
-    ledger: ParamsLedger,
-    pub(crate) config: SessionConfig,
     /// First coding scope records `VK_VIDEO_CODING_CONTROL_RESET_BIT_KHR`
     /// (spec initialization). Re-arm if that recording never reaches the queue.
     needs_reset: ResetArm,
 }
 
-impl VideoSession {
-    /// Session plus an empty parameters object. Sets arrive via
-    /// [`Self::ensure_parameters`].
+impl RawVideoSession {
+    /// Session for `profile` with its memory bound. The parameters object is
+    /// the codec's.
     ///
     /// # Safety
     ///
@@ -380,19 +426,22 @@ impl VideoSession {
     pub(crate) unsafe fn create(
         dev: &DecodeDevice,
         caps: &DecodeCaps,
-        config: SessionConfig,
+        profile: DecodeProfile,
+        max_coded_extent: vk::Extent2D,
+        max_dpb_slots: u32,
+        max_active_references: u32,
     ) -> Result<Self, SessionError> {
-        let mut chain = H264ProfileChain::new(config.std_profile_idc);
-        let profile = chain.wire();
+        let mut chain = profile.chain();
+        let wired = chain.wire();
         let std_header_version = caps.std_header_version;
         let session_ci = vk::VideoSessionCreateInfoKHR::default()
             .queue_family_index(dev.decode_qf())
-            .video_profile(profile)
+            .video_profile(wired)
             .picture_format(caps.output_format)
-            .max_coded_extent(config.max_coded_extent)
+            .max_coded_extent(max_coded_extent)
             .reference_picture_format(caps.dpb_format)
-            .max_dpb_slots(config.max_dpb_slots)
-            .max_active_reference_pictures(config.max_active_references)
+            .max_dpb_slots(max_dpb_slots)
+            .max_active_reference_pictures(max_active_references)
             .std_header_version(&std_header_version);
         let mut session = vk::VideoSessionKHR::null();
         // SAFETY: live device; `session_ci` roots locals (chain, header version)
@@ -414,25 +463,157 @@ impl VideoSession {
             video_queue: dev.video_queue().clone(),
             session,
             memory: Vec::new(),
-            parameters: StoredParams::none(),
-            ledger: ParamsLedger::default(),
-            config,
             needs_reset: ResetArm::armed(),
         };
-        // SAFETY: fn contract; on error `built` drops the session and any
-        // bound memory.
-        unsafe {
-            // Bind failure: park allocations on `built` so Drop destroys the
-            // session before freeing them.
-            match bind_session_memory(dev, session) {
-                Ok(memory) => built.memory = memory,
-                Err(failure) => {
-                    built.memory = failure.allocations;
-                    return Err(failure.error);
-                }
+        // SAFETY: fn contract; `session` is live and not yet memory-bound. On
+        // error `built` drops the session and any bound memory.
+        match unsafe { bind_session_memory(dev, session) } {
+            Ok(memory) => built.memory = memory,
+            // Park allocations on `built` so Drop destroys the session first.
+            Err(failure) => {
+                built.memory = failure.allocations;
+                return Err(failure.error);
             }
         }
         Ok(built)
+    }
+
+    pub(crate) fn device(&self) -> &ash::Device {
+        &self.device
+    }
+
+    pub(crate) fn video_queue(&self) -> &ash::khr::video_queue::Device {
+        &self.video_queue
+    }
+
+    pub(crate) fn session(&self) -> vk::VideoSessionKHR {
+        self.session
+    }
+
+    /// Whether the next coding scope must record the initialization RESET.
+    /// True once per session. If that recording never reaches the queue, call
+    /// [`Self::re_arm_reset`].
+    pub(crate) fn take_needs_reset(&mut self) -> bool {
+        self.needs_reset.take()
+    }
+
+    /// Undo a consumed [`Self::take_needs_reset`] whose RESET never queued.
+    pub(crate) fn re_arm_reset(&mut self) {
+        self.needs_reset.re_arm();
+    }
+
+    /// Destroy a parameters object of this session; NULL (no object yet) is a
+    /// no-op. The spec lets destroy take NULL; AMD's Windows driver reads
+    /// through it.
+    ///
+    /// # Safety
+    ///
+    /// `object` is NULL or this session's own, and no submitted decode still
+    /// reads it.
+    pub(crate) unsafe fn destroy_parameters(&self, object: vk::VideoSessionParametersKHR) {
+        if object == vk::VideoSessionParametersKHR::null() {
+            return;
+        }
+        // SAFETY: fn contract; live device.
+        unsafe {
+            (self.video_queue.fp().destroy_video_session_parameters_khr)(
+                self.device.handle(),
+                object,
+                std::ptr::null(),
+            );
+        }
+    }
+
+    /// Install `fresh` in `slot`, destroy the object `slot` held, then drop its
+    /// Std backings — the order a driver still holding the old pointers needs.
+    ///
+    /// # Safety
+    ///
+    /// The caller drained every in-flight decode, so no submitted work reads
+    /// the old object.
+    pub(crate) unsafe fn replace_parameters<P: ParametersObject>(&self, slot: &mut P, fresh: P) {
+        let old = std::mem::replace(slot, fresh);
+        // SAFETY: fn contract; `old` is this session's own (or NULL).
+        unsafe { self.destroy_parameters(old.object()) };
+        drop(old);
+    }
+}
+
+impl Drop for RawVideoSession {
+    fn drop(&mut self) {
+        // SAFETY: this session's handles on a live device; the decoder drains GPU
+        // work first and the codec session destroyed its parameters object.
+        // Bound memory must not be freed while the session lives, so destroy the
+        // session first ([`BindFailure`]).
+        unsafe {
+            (self.video_queue.fp().destroy_video_session_khr)(
+                self.device.handle(),
+                self.session,
+                std::ptr::null(),
+            );
+            for memory in self.memory.drain(..) {
+                self.device.free_memory(memory, None);
+            }
+        }
+    }
+}
+
+/// What the shared decoder reads off a codec session.
+pub trait CodecSession {
+    fn raw_mut(&mut self) -> &mut RawVideoSession;
+    fn parameters(&self) -> vk::VideoSessionParametersKHR;
+    /// `maxActiveReferencePictures` the session was created with.
+    fn max_active_references(&self) -> u32;
+}
+
+/// A codec's stored parameters: the object handle, NULL until one exists.
+pub(crate) trait ParametersObject {
+    fn object(&self) -> vk::VideoSessionParametersKHR;
+}
+
+impl ParametersObject for StoredParams {
+    fn object(&self) -> vk::VideoSessionParametersKHR {
+        self.object
+    }
+}
+
+/// H.264 session: [`RawVideoSession`] plus the SPS/PPS parameters object.
+pub struct VideoSession {
+    raw: RawVideoSession,
+    parameters: StoredParams,
+    ledger: ParamsLedger,
+    pub(crate) config: SessionConfig,
+}
+
+impl VideoSession {
+    /// Session with no parameters object yet: the first
+    /// [`Self::ensure_parameters`] creates it holding its sets.
+    ///
+    /// # Safety
+    ///
+    /// `dev` wraps live handles ([`crate::DeviceHandles`] contract).
+    pub(crate) unsafe fn create(
+        dev: &DecodeDevice,
+        caps: &DecodeCaps,
+        config: SessionConfig,
+    ) -> Result<Self, SessionError> {
+        // SAFETY: fn contract.
+        let raw = unsafe {
+            RawVideoSession::create(
+                dev,
+                caps,
+                DecodeProfile::H264(config.std_profile_idc),
+                config.max_coded_extent,
+                config.max_dpb_slots,
+                config.max_active_references,
+            )?
+        };
+        Ok(Self {
+            raw,
+            parameters: StoredParams::none(),
+            ledger: ParamsLedger::default(),
+            config,
+        })
     }
 
     /// Parameters object holding exactly `sps` / `pps`, fused with the wrappers
@@ -457,14 +638,18 @@ impl VideoSession {
             .max_std_pps_count(MAX_STD_PPS as u32)
             .parameters_add_info(&add);
         let ci = vk::VideoSessionParametersCreateInfoKHR::default()
-            .video_session(self.session)
+            .video_session(self.raw.session())
             .push_next(&mut h264);
         let mut object = vk::VideoSessionParametersKHR::null();
         // SAFETY: fn contract; `ci` roots locals outliving the call. Std arrays
         // and the boxed blocks their embedded pointers address live in `stored`.
         let r = unsafe {
-            (self.video_queue.fp().create_video_session_parameters_khr)(
-                self.device.handle(),
+            (self
+                .raw
+                .video_queue()
+                .fp()
+                .create_video_session_parameters_khr)(
+                self.raw.device().handle(),
                 &ci,
                 std::ptr::null(),
                 &mut object,
@@ -533,8 +718,12 @@ impl VideoSession {
                 // (incl. the OwnedStd backings) outliving the call — and the
                 // backings go on outliving it, adopted below.
                 let r = unsafe {
-                    (self.video_queue.fp().update_video_session_parameters_khr)(
-                        self.device.handle(),
+                    (self
+                        .raw
+                        .video_queue()
+                        .fp()
+                        .update_video_session_parameters_khr)(
+                        self.raw.device().handle(),
                         self.parameters.object,
                         &update,
                     )
@@ -562,49 +751,28 @@ impl VideoSession {
                 // live as long as it does rather than merely across the call.
                 let fresh =
                     unsafe { self.create_parameters_object(vec![owned_sps], vec![owned_pps])? };
-                // Destroy the old object before its backings drop.
-                let old = std::mem::replace(&mut self.parameters, fresh);
-                // The first activation has no old object. The spec lets destroy take
-                // NULL; AMD's Windows driver reads through it.
-                if old.object != vk::VideoSessionParametersKHR::null() {
-                    // SAFETY: the fn-level contract — the caller drained every
-                    // in-flight decode before a Recreate reached here (checked via
-                    // parameters_action), so no submitted work reads the old
-                    // object; it is this session's own handle, on a live device.
-                    unsafe {
-                        (self.video_queue.fp().destroy_video_session_parameters_khr)(
-                            self.device.handle(),
-                            old.object,
-                            std::ptr::null(),
-                        );
-                    }
-                }
-                // Std blocks `old` owns are released only after that destroy.
-                drop(old);
+                // SAFETY: the fn-level contract — the caller drained every
+                // in-flight decode before a Recreate reached here (checked via
+                // parameters_action).
+                unsafe { self.raw.replace_parameters(&mut self.parameters, fresh) };
                 self.ledger.commit(action, sps, pps);
                 Ok(())
             }
         }
     }
+}
 
-    pub(crate) fn session(&self) -> vk::VideoSessionKHR {
-        self.session
+impl CodecSession for VideoSession {
+    fn raw_mut(&mut self) -> &mut RawVideoSession {
+        &mut self.raw
     }
 
-    pub(crate) fn parameters(&self) -> vk::VideoSessionParametersKHR {
+    fn parameters(&self) -> vk::VideoSessionParametersKHR {
         self.parameters.object
     }
 
-    /// Whether the next coding scope must record the initialization RESET.
-    /// True once per session. If that recording never reaches the queue, call
-    /// [`Self::re_arm_reset`].
-    pub(crate) fn take_needs_reset(&mut self) -> bool {
-        self.needs_reset.take()
-    }
-
-    /// Undo a consumed [`Self::take_needs_reset`] whose RESET never queued.
-    pub(crate) fn re_arm_reset(&mut self) {
-        self.needs_reset.re_arm();
+    fn max_active_references(&self) -> u32 {
+        self.config.max_active_references
     }
 }
 
@@ -628,29 +796,10 @@ impl ResetArm {
 
 impl Drop for VideoSession {
     fn drop(&mut self) {
-        // SAFETY: this session's handles on a live device; the decoder drains
-        // GPU work first. A session that never decoded has no parameters object
-        // and skips that destroy. Bound memory must not be freed while the
-        // session lives, so destroy the session first — a failed bind parks
-        // allocations here ([`BindFailure`]). Std backings drop with
-        // `parameters` after this body.
-        unsafe {
-            if self.parameters.object != vk::VideoSessionParametersKHR::null() {
-                (self.video_queue.fp().destroy_video_session_parameters_khr)(
-                    self.device.handle(),
-                    self.parameters.object,
-                    std::ptr::null(),
-                );
-            }
-            (self.video_queue.fp().destroy_video_session_khr)(
-                self.device.handle(),
-                self.session,
-                std::ptr::null(),
-            );
-            for memory in self.memory.drain(..) {
-                self.device.free_memory(memory, None);
-            }
-        }
+        // SAFETY: this session's own parameters object (NULL if it never
+        // decoded); the decoder drains GPU work first. `raw` drops next and
+        // destroys the session; the Std backings drop after that.
+        unsafe { self.raw.destroy_parameters(self.parameters.object) };
     }
 }
 
@@ -892,6 +1041,40 @@ mod tests {
             },
             "sets evicted by a recreate re-add on next activation"
         );
+    }
+
+    /// Both codec ledgers act on the worst verdict: a conflict or a full table
+    /// recreates, any new set adds, all stored is current.
+    #[test]
+    fn a_set_table_answers_stored_new_full_or_conflict() {
+        let mut table: SetTable<u8, u32> = SetTable::new(2);
+        assert_eq!(table.verdict(&0, &10), SetVerdict::New);
+        table.push(0, 10);
+        assert_eq!(table.verdict(&0, &10), SetVerdict::Stored);
+        assert_eq!(
+            table.verdict(&0, &11),
+            SetVerdict::Conflict,
+            "same id, new content"
+        );
+        table.push(1, 20);
+        assert_eq!(table.verdict(&2, &30), SetVerdict::Full);
+        assert_eq!(
+            table.verdict(&1, &20),
+            SetVerdict::Stored,
+            "a stored set is current even in a full table"
+        );
+        assert!(
+            SetVerdict::Stored < SetVerdict::New
+                && SetVerdict::New < SetVerdict::Full
+                && SetVerdict::Full < SetVerdict::Conflict
+        );
+        table.reset_to(2, 30);
+        assert_eq!(
+            table.verdict(&0, &10),
+            SetVerdict::New,
+            "a recreate keeps only the current set"
+        );
+        assert_eq!(table.verdict(&2, &30), SetVerdict::Stored);
     }
 
     #[test]

@@ -59,8 +59,8 @@ pub struct DecodePlanVkH265 {
     /// included. AU-relative, not submission-final: the recording layer packs
     /// the slice NALUs alone into the bitstream buffer and rebases these
     /// offsets (non-VCL NALUs inside the decode range hang VCN firmware — see
-    /// the slices-only packing in `decoder.rs`). Vulkan's
-    /// `pSliceSegmentOffsets` then receives the rebased offsets.
+    /// `crate::ring::pack_slices`). Vulkan's `pSliceSegmentOffsets` then
+    /// receives the rebased offsets.
     pub slice_offsets: Vec<u32>,
     /// The slot the decoded picture activates (`pSetupReferenceSlot`).
     pub setup_slot: u8,

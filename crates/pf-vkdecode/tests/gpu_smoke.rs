@@ -21,11 +21,12 @@
 mod common;
 
 use ash::vk;
-use common::TestDecoder;
 use pf_vkdecode::DecodeStatus;
 use pf_vkdecode::DecodedVkFrame;
 use pf_vkdecode::NoopQueueLock;
 use pf_vkdecode::VkAv1Decoder;
+use pf_vkdecode::VkCodec;
+use pf_vkdecode::VkDecoder;
 use pf_vkdecode::VkH264Decoder;
 use pf_vkdecode::VkH265Decoder;
 
@@ -50,7 +51,7 @@ struct Geometry {
 /// Decode [`AUS`] AUs holding [`CLIENT_HOLD`] frames; COMPLETE before each release.
 ///
 /// Shared across codecs so the AV1 leg cannot prove less than the H.264 leg.
-fn smoke(decoder: &mut impl TestDecoder, aus: &[&[u8]], geometry: &Geometry) {
+fn smoke(decoder: &mut VkDecoder<impl VkCodec>, aus: &[&[u8]], geometry: &Geometry) {
     // PF_VKD_TEST_READBACK adds TRANSFER_SRC to the picture pool. Production
     // never carries that usage; a leftover from the parity legs would pass
     // this test against a pool that is not the one we ship.
