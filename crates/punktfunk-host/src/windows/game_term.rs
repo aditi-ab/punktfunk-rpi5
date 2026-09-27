@@ -11,21 +11,21 @@
 //!
 //! Pin: [`request_close`], [`kill`]. Evidence: [`crate::gamelease`].
 
-use windows::core::PWSTR;
+use windows::core::{Owned, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_SUCCESS, HWND, LPARAM, PROPERTYKEY, RECT, WPARAM,
 };
 use windows::Win32::Storage::Packaging::Appx::{
     GetApplicationUserModelId, APPLICATION_USER_MODEL_ID_MAX_LENGTH,
 };
-use windows::Win32::System::Com::StructuredStorage::PropVariantClear;
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::StationsAndDesktops::{
-    CloseDesktop, EnumDesktopWindows, OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS,
-    DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS, HDESK,
+    CloseDesktop, EnumDesktopWindows, GetThreadDesktop, OpenInputDesktop, SetThreadDesktop,
+    DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS, HDESK,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    GetCurrentThreadId, OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_TERMINATE,
 };
 use windows::Win32::System::Variant::VT_LPWSTR;
 use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
@@ -41,41 +41,43 @@ const KILLED_EXIT_CODE: u32 = 1;
 /// spell it (same constant `pf-inject`'s `sendinput.rs` uses).
 const DESKTOP_GENERIC_ALL: u32 = 0x1000_0000;
 
-/// The `pf1-gameterm` thread is dedicated and dies after this; previous desktop is not restored,
-/// only the handle is closed.
-struct InputDesktop(HDESK);
+/// The calling thread bound to the input desktop. `Drop` rebinds the thread's previous desktop
+/// before the handle closes: `CloseDesktop` fails on a desktop a thread is still bound to.
+pub(super) struct InputDesktop {
+    desk: Owned<HDESK>,
+    prev: HDESK,
+}
 
 impl InputDesktop {
     /// `None` if the input desktop cannot be opened or bound (unprivileged, or a secure desktop).
     /// Callers skip the polite pass; the kill pass still works.
-    fn attach() -> Option<Self> {
-        // SAFETY: FFI by-value args only. `OpenInputDesktop` yields an owned `HDESK` only on `Ok`;
-        // it is installed on this thread and owned by the returned guard (closed once in `Drop`),
-        // or closed here on failure. `SetThreadDesktop` rebinds only the calling thread, which
-        // owns no windows or hooks (fresh termination thread).
+    pub(super) fn attach() -> Option<Self> {
+        // SAFETY: FFI by-value args only. `GetThreadDesktop` returns this thread's desktop, which
+        // needs no close. `OpenInputDesktop` yields an owned `HDESK` only on `Ok`, adopted by
+        // `Owned` at once. `SetThreadDesktop` rebinds only the calling thread, which owns no
+        // windows or hooks.
         unsafe {
-            let h = OpenInputDesktop(
-                DESKTOP_CONTROL_FLAGS(0),
-                false,
-                DESKTOP_ACCESS_FLAGS(DESKTOP_GENERIC_ALL),
-            )
-            .ok()?;
-            if SetThreadDesktop(h).is_ok() {
-                Some(Self(h))
-            } else {
-                let _ = CloseDesktop(h);
-                None
-            }
+            let prev = GetThreadDesktop(GetCurrentThreadId()).ok()?;
+            let desk = Owned::new(
+                OpenInputDesktop(
+                    DESKTOP_CONTROL_FLAGS(0),
+                    false,
+                    DESKTOP_ACCESS_FLAGS(DESKTOP_GENERIC_ALL),
+                )
+                .ok()?,
+            );
+            SetThreadDesktop(*desk).ok()?;
+            Some(Self { desk, prev })
         }
     }
 }
 
 impl Drop for InputDesktop {
     fn drop(&mut self) {
-        // SAFETY: `self.0` is the handle this guard owns and has not closed; `CloseDesktop` runs once
-        // here with no later use.
+        // SAFETY: `prev` was this thread's desktop before `attach` and is still open. Rebinding it
+        // releases `desk`, which its `Owned` closes after this body.
         unsafe {
-            let _ = CloseDesktop(self.0);
+            let _ = SetThreadDesktop(self.prev);
         }
     }
 }
@@ -239,8 +241,8 @@ fn hosts_one_of(hwnd: HWND, apps: &[String]) -> bool {
     }
     let mut class = [0u16; 32];
     // SAFETY: `GetClassNameW` writes at most `class.len()` units into a buffer we own. The store
-    // and the variant it returns are ours; the variant is cleared exactly once below, and its
-    // string is only read when `vt` says `VT_LPWSTR` and the pointer is non-null.
+    // and the variant it returns are ours; the variant clears on drop, and its string is only
+    // read when `vt` says `VT_LPWSTR` and the pointer is non-null.
     unsafe {
         let len = GetClassNameW(hwnd, &mut class).max(0) as usize;
         if class[..len] != *windows::core::w!("ApplicationFrameWindow").as_wide() {
@@ -249,19 +251,17 @@ fn hosts_one_of(hwnd: HWND, apps: &[String]) -> bool {
         let Ok(store) = SHGetPropertyStoreForWindow::<IPropertyStore>(hwnd) else {
             return false;
         };
-        let Ok(mut pv) = store.GetValue(&PKEY_APP_USER_MODEL_ID) else {
+        let Ok(pv) = store.GetValue(&PKEY_APP_USER_MODEL_ID) else {
             return false;
         };
         let inner = &pv.Anonymous.Anonymous;
-        let hosted = inner.vt == VT_LPWSTR
+        inner.vt == VT_LPWSTR
             && !inner.Anonymous.pwszVal.is_null()
             && inner
                 .Anonymous
                 .pwszVal
                 .to_string()
-                .is_ok_and(|app| apps.contains(&app));
-        let _ = PropVariantClear(&mut pv);
-        hosted
+                .is_ok_and(|app| apps.contains(&app))
     }
 }
 
@@ -269,13 +269,12 @@ fn hosts_one_of(hwnd: HWND, apps: &[String]) -> bool {
 /// SYSTEM must never terminate a service or another session's process on its word.
 pub fn in_our_session(pid: u32) -> bool {
     use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
-    use windows::Win32::System::Threading::GetCurrentProcessId;
     let mut ours = 0u32;
     let mut theirs = 0u32;
     // SAFETY: both out-params are live locals; the calls read a session id by pid and touch
     // no memory of ours. A failed lookup (pid gone, no access) leaves the default and fails.
     unsafe {
-        ProcessIdToSessionId(GetCurrentProcessId(), &mut ours).is_ok()
+        ProcessIdToSessionId(std::process::id(), &mut ours).is_ok()
             && ProcessIdToSessionId(pid, &mut theirs).is_ok()
             && ours == theirs
     }
