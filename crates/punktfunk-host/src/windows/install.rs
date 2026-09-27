@@ -40,6 +40,28 @@ pub(crate) fn resolve_tool(cmd: &str) -> String {
 pub(crate) fn run_quiet(cmd: &str, args: &[&str]) -> bool {
     run_code(cmd, args) == Some(0)
 }
+/// `pnputil /remove-device` by absolute path: an uninstaller must not depend on `%PATH%`.
+/// `Err` carries pnputil's exit status and message, or why it did not run.
+pub(crate) fn remove_device(instance_id: &str) -> Result<()> {
+    let o = Command::new(sys32("pnputil.exe"))
+        .args(["/remove-device", instance_id])
+        .output()
+        .context("run pnputil")?;
+    if !o.status.success() {
+        // Whichever stream pnputil wrote its reason to.
+        let msg = if o.stderr.is_empty() {
+            &o.stdout
+        } else {
+            &o.stderr
+        };
+        bail!(
+            "pnputil /remove-device {}: {}",
+            o.status,
+            String::from_utf8_lossy(msg).trim()
+        );
+    }
+    Ok(())
+}
 /// Exit code, output discarded. `None` when the tool did not launch.
 fn run_code(cmd: &str, args: &[&str]) -> Option<i32> {
     Command::new(resolve_tool(cmd))
@@ -370,10 +392,9 @@ fn pad_install_problems(
 
 fn remove_pad_devnodes() {
     for id in pad_instance_ids() {
-        if run_quiet("pnputil", &["/remove-device", &id]) {
-            println!("removed stale pad devnode {id}");
-        } else {
-            eprintln!("warning: pnputil /remove-device {id} failed");
+        match remove_device(&id) {
+            Ok(()) => println!("removed stale pad devnode {id}"),
+            Err(e) => eprintln!("warning: couldn't remove pad devnode {id}: {e:#}"),
         }
     }
 }
@@ -429,10 +450,9 @@ fn uninstall_audio_devices() -> Result<()> {
 fn uninstall_pf_vdisplay() -> Result<()> {
     // ROOT nodes first; leaving them is a ghost "punktfunk virtual display" in Device Manager.
     for id in pf_vdisplay_instance_ids() {
-        if run_quiet("pnputil", &["/remove-device", &id]) {
-            println!("removed device node {id}");
-        } else {
-            eprintln!("warning: pnputil /remove-device {id} failed");
+        match remove_device(&id) {
+            Ok(()) => println!("removed device node {id}"),
+            Err(e) => eprintln!("warning: couldn't remove device node {id}: {e:#}"),
         }
     }
     delete_store_drivers(&["pf_vdisplay"]);

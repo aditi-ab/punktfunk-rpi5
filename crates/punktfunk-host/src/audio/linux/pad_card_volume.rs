@@ -61,19 +61,15 @@ pub(crate) fn spawn_pin(pad: u8) {
     }
 }
 
-/// `Ok(0)` means the card is not in the graph yet.
+/// `Ok(0)` means the card is not in the graph yet. Matches the exact USB ids only: the
+/// usbip-minted pad always announces `device.vendor.id`/`device.product.id`, unlike the
+/// physical pads `pf_client_core::pad_audio` also matches by name.
 fn pin_pad_sinks() -> Result<usize> {
     use pipewire as pw;
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
-    static PW_INIT: std::sync::Once = std::sync::Once::new();
-    PW_INIT.call_once(pw::init);
-
-    let mainloop = pw::main_loop::MainLoopRc::new(None).context("pw MainLoop")?;
-    let context = pw::context::ContextRc::new(&mainloop, None).context("pw Context")?;
-    let core = context.connect_rc(None).context("pw connect")?;
-    let registry = core.get_registry_rc().context("pw registry")?;
+    let session = super::pw_oneshot::OneShot::connect("pad-volume", super::pw_oneshot::TIMEOUT)?;
 
     struct Sink {
         node: pw::node::Node,
@@ -87,10 +83,12 @@ fn pin_pad_sinks() -> Result<usize> {
     let sinks: Rc<RefCell<Vec<Sink>>> = Rc::default();
     let ds5_cards: Rc<RefCell<Vec<u32>>> = Rc::default();
 
-    let _reg_listener = registry
+    let _reg_listener = session
+        .registry
         .add_listener_local()
         .global({
-            let (registry, sinks, ds5_cards) = (registry.clone(), sinks.clone(), ds5_cards.clone());
+            let (registry, sinks, ds5_cards) =
+                (session.registry.clone(), sinks.clone(), ds5_cards.clone());
             move |g| {
                 let Some(props) = g.props else { return };
                 let usb_id = |k: &str| {
@@ -155,31 +153,11 @@ fn pin_pad_sinks() -> Result<usize> {
         })
         .register();
 
-    let awaited: Rc<Cell<Option<pw::spa::utils::result::AsyncSeq>>> = Rc::new(Cell::new(None));
-    let _core_listener = core
-        .add_listener_local()
-        .done({
-            let (mainloop, awaited) = (mainloop.clone(), awaited.clone());
-            move |_, seq| {
-                if awaited.get() == Some(seq) {
-                    mainloop.quit();
-                }
-            }
-        })
-        .register();
-    let round = |issue: &dyn Fn() -> Result<()>| -> Result<()> {
-        issue()?;
-        awaited.set(Some(core.sync(0).context("pw sync")?));
-        mainloop.run();
-        Ok(())
-    };
+    session.round()?; // 1: globals replay; sinks get bound
+    session.round()?; // 2: the binds' `info` events land, carrying audio.channels
 
-    round(&|| Ok(()))?; // 1: globals replay; sinks get bound
-    round(&|| Ok(()))?; // 2: the binds' `info` events land, carrying audio.channels
-
-    // `Cell`: `round` takes `Fn`; a mut counter would be `FnMut`.
-    let pinned = Cell::new(0usize);
-    round(&|| {
+    let mut pinned = 0;
+    {
         let cards = ds5_cards.borrow();
         for s in sinks.borrow().iter() {
             // Card sink only. A host-minted pad sink publishes the DualSense identity
@@ -197,11 +175,11 @@ fn pin_pad_sinks() -> Result<usize> {
                 continue;
             };
             s.node.set_param(pw::spa::param::ParamType::Props, 0, pod);
-            pinned.set(pinned.get() + 1);
+            pinned += 1;
         }
-        Ok(())
-    })?; // 3: flush the set_params before the loop and its proxies drop
-    Ok(pinned.get())
+    }
+    session.round()?; // 3: flush the set_params before the loop and its proxies drop
+    Ok(pinned)
 }
 
 fn unity_volume_pod(channels: u32) -> Result<Vec<u8>> {

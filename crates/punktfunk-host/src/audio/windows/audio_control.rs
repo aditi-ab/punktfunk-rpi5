@@ -55,11 +55,11 @@ pub(crate) fn mix_format_of(ep: &Endpoint) -> Option<MixFormat> {
 /// format. Not [`wire_now_full`] — that parks defaults, mints, and logs, none
 /// of which may happen for a session that is about to resolve to Opus.
 ///
-/// Plan inputs MUST stay in lockstep with [`wire_now_full`]: a divergence here
-/// reads the format of a device we do not capture. The real probe (not
-/// [`wiring_plan::no_formats`]) is load-bearing — narrowing demotes a candidate
-/// below real hardware. Every failure is [`CaptureRate::Unknown`] (decline):
-/// unlike the wiring plan, unknown here means we cannot prove the label.
+/// Plans from the same [`PlanInputs`] as [`wire_now_full`], so it reads the format of
+/// the device the capture will use. The real probe (not [`wiring_plan::no_formats`]) is
+/// load-bearing — narrowing demotes a candidate below real hardware. Every failure is
+/// [`CaptureRate::Unknown`] (decline): unlike the wiring plan, unknown here means we
+/// cannot prove the label.
 ///
 /// Must run on a COM-initialized thread; initializes MTA because the caller is
 /// a tokio blocking-pool thread. A repeat init returns `S_FALSE` (success).
@@ -68,26 +68,8 @@ pub(crate) fn probe_capture_rate() -> super::CaptureRate {
         tracing::debug!(error = %e, "hi-res capture-rate probe: CoInitializeEx (MTA) failed");
         return super::CaptureRate::Unknown;
     }
-    // The same enumeration `wire_now_full` plans from, per the lockstep rule above: a bare
-    // `list_endpoints` can miss a minted endpoint that is still appearing, and the probe would
-    // then read the format of a device the capture will not use. Enumeration only — minting
-    // stays out of this path, as the doc says.
-    let (renders, captures) = enumerate_including_minted();
-    let want = std::env::var("PUNKTFUNK_MIC_DEVICE")
-        .ok()
-        .map(|s| s.to_lowercase());
-    let pad_ids = pad_render_ids(&renders);
-    let wiring = plan_with_formats(
-        &renders,
-        &captures,
-        want.as_deref(),
-        host_audio_requested(),
-        &mix_format_of,
-        // Stereo: the only count hi-res carries, and the same floor `wire_now_full` plans against.
-        2,
-        &pad_ids,
-        &super::minted::minted_ids(),
-    );
+    // Enumeration only — minting stays out of this path, as the doc says.
+    let wiring = PlanInputs::read().plan(&mix_format_of);
     let Some(ep) = wiring.loopback_render else {
         tracing::debug!("hi-res capture-rate probe: no desktop-audio loopback endpoint is planned");
         return super::CaptureRate::Unknown;
@@ -149,7 +131,8 @@ pub(crate) fn playthrough_requested() -> bool {
 /// The output the operator heard before this capture parked the default on the plan's
 /// sink; `None` while nothing is parked. The voice-chat pin and playthrough target.
 pub(crate) fn parked_previous_render() -> Option<String> {
-    PARKED
+    PLAYBACK
+        .parked
         .lock()
         .unwrap()
         .as_ref()
@@ -267,6 +250,50 @@ fn enumerate_including_minted() -> (Vec<Endpoint>, Vec<Endpoint>) {
     )
 }
 
+/// Everything a wiring plan reads, gathered once so the capture-rate probe and the wiring
+/// pass cannot plan from different inputs.
+struct PlanInputs {
+    renders: Vec<Endpoint>,
+    captures: Vec<Endpoint>,
+    mic_want: Option<String>,
+    /// Pad-audio ids: platform identity the pure plan filters out of every role.
+    pad_ids: Vec<String>,
+    /// Minted Speakers/Microphone ids — empty until the provider latches.
+    minted: wiring_plan::MintedIds,
+}
+
+impl PlanInputs {
+    /// Waits for already-minted endpoints: a bare [`list_endpoints`] can miss one that is
+    /// still appearing, and the plan would pick a device the capture will not use.
+    fn read() -> PlanInputs {
+        let (renders, captures) = enumerate_including_minted();
+        PlanInputs {
+            pad_ids: pad_render_ids(&renders),
+            mic_want: std::env::var("PUNKTFUNK_MIC_DEVICE")
+                .ok()
+                .map(|s| s.to_lowercase()),
+            minted: super::minted::minted_ids(),
+            renders,
+            captures,
+        }
+    }
+
+    fn plan(&self, probe: &dyn Fn(&Endpoint) -> Option<MixFormat>) -> Wiring {
+        plan_with_formats(
+            &self.renders,
+            &self.captures,
+            self.mic_want.as_deref(),
+            host_audio_requested(),
+            probe,
+            // Stereo: the floor every session uses, and the only count a narrowing verdict
+            // can be made against without a session. Hi-res carries only stereo.
+            2,
+            &self.pad_ids,
+            &self.minted,
+        )
+    }
+}
+
 /// COM-initialized thread. Logged only when the assignment changes.
 pub(crate) fn wire_now_full(park_defaults: bool) -> WiredPlan {
     recover_orphaned_default();
@@ -275,14 +302,9 @@ pub(crate) fn wire_now_full(park_defaults: bool) -> WiredPlan {
     // from the earlier snapshot reports "no render endpoints exist at all" about endpoints this
     // same pass just created.
     super::minted::ensure_provisioned();
-    let (renders, captures) = enumerate_including_minted();
-    let fingerprint = wiring_plan::fingerprint(&renders, &captures);
-    let want = std::env::var("PUNKTFUNK_MIC_DEVICE")
-        .ok()
-        .map(|s| s.to_lowercase());
-    // Pad-audio ids: platform identity, collected here and passed into the pure plan
-    // like the candidate lists — the plan filters them out of every role.
-    let pad_ids = pad_render_ids(&renders);
+    let inputs = PlanInputs::read();
+    let (renders, captures) = (&inputs.renders, &inputs.captures);
+    let fingerprint = wiring_plan::fingerprint(renders, captures);
     // Mix formats only when parking defaults. The idle mic pump does not care which
     // loopback wins and must not activate an IAudioClient per render on every pass.
     let probe: &dyn Fn(&Endpoint) -> Option<MixFormat> = if park_defaults {
@@ -290,20 +312,7 @@ pub(crate) fn wire_now_full(park_defaults: bool) -> WiredPlan {
     } else {
         &wiring_plan::no_formats
     };
-    let wiring = plan_with_formats(
-        &renders,
-        &captures,
-        want.as_deref(),
-        host_audio_requested(),
-        probe,
-        // Stereo: the floor every session uses, and the only count a narrowing verdict
-        // can be made against without a session. Cannot-carry-stereo cannot-carry-5.1.
-        2,
-        &pad_ids,
-        // Minted Speakers/Microphone ids — empty until the provider latches.
-        // `wire_now_full` mints above, before the enumeration these are matched against.
-        &super::minted::minted_ids(),
-    );
+    let wiring = inputs.plan(probe);
     let done = |wiring: Wiring| WiredPlan {
         wiring,
         fingerprint,
@@ -342,7 +351,7 @@ pub(crate) fn wire_now_full(park_defaults: bool) -> WiredPlan {
             // is wrong when the Microphone half is already the mic reservation.
             tracing::warn!(
                 "desktop audio unavailable: {}",
-                wiring_plan::describe_no_loopback(&renders, &wiring)
+                wiring_plan::describe_no_loopback(renders, &wiring)
             );
         }
     }
@@ -364,12 +373,12 @@ pub(crate) fn wire_now_full(park_defaults: bool) -> WiredPlan {
         if default_render_id().as_deref() == Some(mic_id.as_str()) {
             // host_audio plan: real hardware first, so the new default is audible.
             match plan(
-                &renders,
-                &captures,
-                want.as_deref(),
+                renders,
+                captures,
+                inputs.mic_want.as_deref(),
                 true,
-                &pad_ids,
-                &super::minted::minted_ids(),
+                &inputs.pad_ids,
+                &inputs.minted,
             )
             .loopback_render
             {
@@ -392,11 +401,10 @@ pub(crate) fn wire_now_full(park_defaults: bool) -> WiredPlan {
     }
     // Idle, nothing parked: default on the virtual mic moves to a real microphone.
     // Session park cannot heal this — it only remembers a prev that is not already ours.
-    if !park_defaults && PARKED_REC.lock().unwrap().is_none() {
+    if !park_defaults && RECORDING.parked.lock().unwrap().is_none() {
         if let Some((mic_name, mic_id)) = &wiring.mic_capture {
             if default_capture_id().as_deref() == Some(mic_id.as_str()) {
-                if let Some((name, id)) =
-                    wiring_plan::real_capture(&captures, Some(mic_id.as_str()))
+                if let Some((name, id)) = wiring_plan::real_capture(captures, Some(mic_id.as_str()))
                 {
                     match set_default_endpoint(id) {
                         Ok(()) => tracing::info!(from = %mic_name, device = %name,
@@ -423,31 +431,86 @@ pub(crate) fn wire_now_full(park_defaults: bool) -> WiredPlan {
     done(wiring)
 }
 
-/// Parked playback default: `(previous_id, id_we_set)`. In-memory source of truth,
-/// mirrored to [`park_marker_path`] so a crash cannot leave the box on the silent sink.
-static PARKED: Mutex<Option<(String, String)>> = Mutex::new(None);
-
-/// Crash marker for [`PARKED`]: two lines, previous id then set id.
-fn park_marker_path() -> std::path::PathBuf {
-    pf_paths::config_dir().join("audio-default.prev")
+/// A default device parked for the capture's life: `(previous_id, id_we_set)` in memory,
+/// mirrored to a crash marker (two lines, previous id then set id) so a crash cannot leave
+/// the box parked. Each caller keeps its own write policy for the park itself.
+struct DefaultSlot {
+    parked: Mutex<Option<(String, String)>>,
+    /// File name under `pf_paths::config_dir()`.
+    marker: &'static str,
+    current: fn() -> Option<String>,
+    what: &'static str,
 }
 
-/// Parked recording default: `(previous_id, id_we_set)`. Twin of [`PARKED`].
-static PARKED_REC: Mutex<Option<(String, String)>> = Mutex::new(None);
+static PLAYBACK: DefaultSlot = DefaultSlot {
+    parked: Mutex::new(None),
+    marker: "audio-default.prev",
+    current: default_render_id,
+    what: "playback",
+};
 
-/// Crash marker for [`PARKED_REC`]: two lines, previous id then set id.
-fn rec_marker_path() -> std::path::PathBuf {
-    pf_paths::config_dir().join("audio-default-rec.prev")
-}
+static RECORDING: DefaultSlot = DefaultSlot {
+    parked: Mutex::new(None),
+    marker: "audio-default-rec.prev",
+    current: default_capture_id,
+    what: "recording",
+};
 
-/// Consume a park marker. Returns the previous id only if the current default is still
-/// the endpoint we set (an operator change since wins). The file is removed either way.
-fn take_marker(path: &std::path::Path, current_default: Option<String>) -> Option<String> {
-    let s = std::fs::read_to_string(path).ok()?;
-    let _ = std::fs::remove_file(path);
-    let mut lines = s.lines();
-    let (prev, set) = (lines.next()?, lines.next()?);
-    (current_default.as_deref() == Some(set)).then(|| prev.to_string())
+impl DefaultSlot {
+    fn marker_path(&self) -> std::path::PathBuf {
+        pf_paths::config_dir().join(self.marker)
+    }
+
+    /// Remember the operator default `cur` before parking on `id`. The first park stores it
+    /// unless it is `never_prev`; a plan change mid-stream keeps it and updates only what we
+    /// set. Nothing changes while `cur` already is `id`.
+    fn remember(&self, cur: Option<&str>, id: &str, never_prev: Option<&str>) {
+        if cur == Some(id) {
+            return;
+        }
+        let mut parked = self.parked.lock().unwrap();
+        match parked.as_mut() {
+            None => {
+                if let Some(prev) = cur.filter(|c| Some(*c) != never_prev) {
+                    let _ = std::fs::write(self.marker_path(), format!("{prev}\n{id}"));
+                    *parked = Some((prev.to_string(), id.to_string()));
+                }
+            }
+            Some((prev, set)) if set != id => {
+                let _ = std::fs::write(self.marker_path(), format!("{prev}\n{id}"));
+                *set = id.to_string();
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// Put the remembered default back. No-op if never parked; an operator change
+    /// mid-stream wins. COM-initialized thread (capture exit path).
+    fn restore(&self) {
+        let Some((prev, set)) = self.parked.lock().unwrap().take() else {
+            return;
+        };
+        let _ = std::fs::remove_file(self.marker_path());
+        if (self.current)().as_deref() != Some(set.as_str()) {
+            return;
+        }
+        match set_default_endpoint(&prev) {
+            Ok(()) => tracing::info!("default {} device restored after streaming", self.what),
+            Err(e) => tracing::warn!(error = %format!("{e:#}"),
+                "restore the default {} device after streaming", self.what),
+        }
+    }
+
+    /// Consume the crash marker. Returns the previous id only if the current default is still
+    /// the endpoint we set (an operator change since wins). The file is removed either way.
+    fn take_marker(&self) -> Option<String> {
+        let path = self.marker_path();
+        let s = std::fs::read_to_string(&path).ok()?;
+        let _ = std::fs::remove_file(&path);
+        let mut lines = s.lines();
+        let (prev, set) = (lines.next()?, lines.next()?);
+        ((self.current)().as_deref() == Some(set)).then(|| prev.to_string())
+    }
 }
 
 /// Current default render endpoint id. Pad-endpoint provisioning uses this so a
@@ -478,13 +541,11 @@ pub(crate) fn default_capture_id() -> Option<String> {
 fn recover_orphaned_default() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        for (path, current, what) in [
-            (park_marker_path(), default_render_id(), "playback"),
-            (rec_marker_path(), default_capture_id(), "recording"),
-        ] {
-            let Some(prev) = take_marker(&path, current) else {
+        for slot in [&PLAYBACK, &RECORDING] {
+            let Some(prev) = slot.take_marker() else {
                 continue;
             };
+            let what = slot.what;
             match set_default_endpoint(&prev) {
                 Ok(()) => tracing::info!(
                     "restored the default {what} device a previous host run left parked"
@@ -506,40 +567,19 @@ fn recover_orphaned_default() {
 /// Returns whether a device was actually put back.
 pub(crate) fn unpark_default_for_uninstall() -> bool {
     let mut restored = false;
-    for (path, current) in [
-        (park_marker_path(), default_render_id()),
-        (rec_marker_path(), default_capture_id()),
-    ] {
-        if let Some(prev) = take_marker(&path, current) {
+    for slot in [&PLAYBACK, &RECORDING] {
+        if let Some(prev) = slot.take_marker() {
             restored |= set_default_endpoint(&prev).is_ok();
         }
     }
     restored
 }
 
-/// Park playback on `id` for the capture's life. Remembers the operator default the
-/// first time (memory + crash marker). Nothing remembered if `id` already is default.
+/// Park playback on `id` for the capture's life, remembering the operator default first.
 /// The mic target is never stored as `prev` — restoring it would feed the virtual mic.
 /// Guards the race the hygiene pass in [`wire_now`] usually already closed.
 fn park_default_playback(name: &str, id: &str, changed: bool, mic_id: Option<&str>) {
-    let cur = default_render_id();
-    if cur.as_deref() != Some(id) {
-        let mut parked = PARKED.lock().unwrap();
-        match parked.as_mut() {
-            None => {
-                if let Some(prev) = cur.filter(|c| Some(c.as_str()) != mic_id) {
-                    let _ = std::fs::write(park_marker_path(), format!("{prev}\n{id}"));
-                    *parked = Some((prev, id.to_string()));
-                }
-            }
-            // Plan changed mid-stream: keep the original previous default, update what we set.
-            Some((prev, set)) if set != id => {
-                let _ = std::fs::write(park_marker_path(), format!("{prev}\n{id}"));
-                *set = id.to_string();
-            }
-            Some(_) => {}
-        }
-    }
+    PLAYBACK.remember(default_render_id().as_deref(), id, mic_id);
     match set_default_endpoint(id) {
         Ok(()) => {
             if changed {
@@ -552,27 +592,10 @@ fn park_default_playback(name: &str, id: &str, changed: bool, mic_id: Option<&st
     }
 }
 
-/// Park recording on `id` for the capture's life — [`park_default_playback`]'s twin.
-/// Remembers the operator default the first time; nothing if `id` already is default.
+/// Park recording on `id` for the capture's life, remembering the operator default first.
 fn park_default_recording(name: &str, id: &str, changed: bool) {
     let cur = default_capture_id();
-    if cur.as_deref() != Some(id) {
-        let mut parked = PARKED_REC.lock().unwrap();
-        match parked.as_mut() {
-            None => {
-                if let Some(prev) = cur.clone() {
-                    let _ = std::fs::write(rec_marker_path(), format!("{prev}\n{id}"));
-                    *parked = Some((prev, id.to_string()));
-                }
-            }
-            // Plan changed mid-stream: keep the original previous default, update what we set.
-            Some((prev, set)) if set != id => {
-                let _ = std::fs::write(rec_marker_path(), format!("{prev}\n{id}"));
-                *set = id.to_string();
-            }
-            Some(_) => {}
-        }
-    }
+    RECORDING.remember(cur.as_deref(), id, None);
     // `set_default_endpoint` is not a no-op on an unchanged default: it fires
     // SetDefaultEndpoint for all three roles. Write only when the plan changed or
     // the default drifted, or the policy store churns on every reopen.
@@ -592,7 +615,7 @@ fn park_default_recording(name: &str, id: &str, changed: bool) {
 
 /// Re-set the default playback to the endpoint we are already capturing, without a
 /// wiring pass. One `IPolicyConfig` write: the capture is bound explicitly, so a
-/// hijacked default only moves where apps render. Does not touch [`PARKED`] — the
+/// hijacked default only moves where apps render. Does not touch [`PLAYBACK`] — the
 /// operator's original default is still owed back at stream end.
 pub(crate) fn reassert_default_playback(id: &str) -> bool {
     match set_default_endpoint(id) {
@@ -604,37 +627,14 @@ pub(crate) fn reassert_default_playback(id: &str) -> bool {
     }
 }
 
-/// Inverse of [`park_default_playback`]. No-op if never parked; an operator change
-/// mid-stream wins. COM-initialized thread (capture exit path).
+/// Inverse of [`park_default_playback`]: see [`DefaultSlot::restore`].
 pub(crate) fn restore_default_playback() {
-    let Some((prev, set)) = PARKED.lock().unwrap().take() else {
-        return;
-    };
-    let _ = std::fs::remove_file(park_marker_path());
-    if default_render_id().as_deref() != Some(set.as_str()) {
-        return;
-    }
-    match set_default_endpoint(&prev) {
-        Ok(()) => tracing::info!("default playback device restored after streaming"),
-        Err(e) => tracing::warn!(error = %format!("{e:#}"),
-            "restore the default playback device after streaming"),
-    }
+    PLAYBACK.restore();
 }
 
-/// Inverse of [`park_default_recording`]. Same rules as [`restore_default_playback`].
+/// Inverse of [`park_default_recording`]: see [`DefaultSlot::restore`].
 pub(crate) fn restore_default_recording() {
-    let Some((prev, set)) = PARKED_REC.lock().unwrap().take() else {
-        return;
-    };
-    let _ = std::fs::remove_file(rec_marker_path());
-    if default_capture_id().as_deref() != Some(set.as_str()) {
-        return;
-    }
-    match set_default_endpoint(&prev) {
-        Ok(()) => tracing::info!("default recording device restored after streaming"),
-        Err(e) => tracing::warn!(error = %format!("{e:#}"),
-            "restore the default recording device after streaming"),
-    }
+    RECORDING.restore();
 }
 
 /// Endpoints reshaped for the capture's life: `(id, channels before, rate_hz)`. Each

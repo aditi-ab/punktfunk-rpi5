@@ -188,6 +188,87 @@ pub fn park_audio_capture(
     }
 }
 
+/// The parked capturer, drained, while it still fits `channels`, `rate_hz` and the audio
+/// settings. A misfit is dropped: another rate garbles the encoder and drifts the sample clock
+/// against the wire. Parking it back stays with each plane.
+pub fn take_parked_capture(
+    slot: &std::sync::Mutex<Option<Box<dyn AudioCapturer>>>,
+    channels: u32,
+    rate_hz: u32,
+) -> Option<Box<dyn AudioCapturer>> {
+    let mut cap = slot.lock().unwrap().take()?;
+    if cap.channels() == channels && cap.sample_rate() == rate_hz && cap.reusable() {
+        cap.drain(); // the previous session's buffer would play first
+        return Some(cap);
+    }
+    tracing::info!(
+        have = cap.channels(),
+        want = channels,
+        have_hz = cap.sample_rate(),
+        want_hz = rate_hz,
+        "parked audio capturer no longer fits (channels, rate or audio settings) — reopening"
+    );
+    None
+}
+
+/// How [`OpusEnc`] spends its bitrate.
+#[derive(Clone, Copy, Debug)]
+pub enum RateControl {
+    /// Every packet one size: GameStream's audio FEC shards must be equal length.
+    HardCbr,
+    /// Same average, bounded packet size. Native has no audio FEC, so CBR is only a quality tax.
+    ConstrainedVbr,
+}
+
+/// 48 kHz `LowDelay` Opus: stereo (`opus::Encoder`) or 5.1/7.1 multistream (`opus::MSEncoder`,
+/// the safe wrapper) behind one `encode_float`.
+pub enum OpusEnc {
+    Stereo(opus::Encoder),
+    Surround(opus::MSEncoder),
+}
+
+impl OpusEnc {
+    pub fn new(
+        layout: &punktfunk_core::audio::OpusLayout,
+        bitrate: i32,
+        rate: RateControl,
+    ) -> Result<OpusEnc, opus::Error> {
+        let vbr = matches!(rate, RateControl::ConstrainedVbr);
+        let app = opus::Application::LowDelay;
+        if layout.channels == 2 {
+            let mut e = opus::Encoder::new(SAMPLE_RATE, opus::Channels::Stereo, app)?;
+            e.set_bitrate(opus::Bitrate::Bits(bitrate)).ok();
+            e.set_vbr(vbr).ok();
+            if vbr {
+                e.set_vbr_constraint(true).ok();
+            }
+            Ok(OpusEnc::Stereo(e))
+        } else {
+            let mut e = opus::MSEncoder::new(
+                SAMPLE_RATE,
+                layout.streams,
+                layout.coupled,
+                layout.mapping,
+                app,
+            )?;
+            e.set_bitrate(opus::Bitrate::Bits(bitrate)).ok();
+            e.set_vbr(vbr).ok();
+            if vbr {
+                e.set_vbr_constraint(true).ok();
+            }
+            Ok(OpusEnc::Surround(e))
+        }
+    }
+
+    /// Per-channel samples come from `frame.len()` and the encoder's channel count.
+    pub fn encode_float(&mut self, frame: &[f32], out: &mut [u8]) -> Result<usize, opus::Error> {
+        match self {
+            OpusEnc::Stereo(e) => e.encode_float(frame, out),
+            OpusEnc::Surround(e) => e.encode_float(frame, out),
+        }
+    }
+}
+
 /// Inverse of [`AudioCapturer`]: a PipeWire `Audio/Source` (or Windows virtual render
 /// endpoint) the host [`push`](Self::push)es decoded client-mic PCM into. Host apps
 /// record it; silence when nothing is flowing.
@@ -352,4 +433,76 @@ pub(crate) fn playing_apps() -> Vec<String> {
 /// Read-only for the status API — never triggers a pass.
 pub(crate) fn wiring_snapshot() -> Option<wiring_plan::Wiring> {
     plat::wiring_snapshot()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use punktfunk_core::audio::{OpusLayout, LAYOUT_51, LAYOUT_STEREO};
+
+    /// One 5 ms frame: silence, or a loud 440 Hz tone on every channel.
+    fn frame(layout: &OpusLayout, loud: bool) -> Vec<f32> {
+        let ch = layout.channels as usize;
+        (0..240 * ch)
+            .map(|i| {
+                let t = (i / ch) as f32 / SAMPLE_RATE as f32;
+                if loud {
+                    0.8 * (std::f32::consts::TAU * 440.0 * t).sin()
+                } else {
+                    0.0
+                }
+            })
+            .collect()
+    }
+
+    fn packet_len(layout: &OpusLayout, rate: RateControl, loud: bool) -> usize {
+        let mut enc = OpusEnc::new(layout, layout.bitrate, rate).expect("encoder");
+        let mut out = vec![0u8; 1400];
+        // Past the first frames' codec transient.
+        (0..8)
+            .map(|_| enc.encode_float(&frame(layout, loud), &mut out).unwrap())
+            .last()
+            .unwrap()
+    }
+
+    /// GameStream's FEC needs equal packets whatever the content; native's VBR must not pad.
+    #[test]
+    fn rate_control_is_what_each_plane_asks_for() {
+        for layout in [&LAYOUT_STEREO, &LAYOUT_51] {
+            assert_eq!(
+                packet_len(layout, RateControl::HardCbr, false),
+                packet_len(layout, RateControl::HardCbr, true),
+                "{} ch CBR packets must not vary with content",
+                layout.channels
+            );
+            assert!(
+                packet_len(layout, RateControl::ConstrainedVbr, false)
+                    < packet_len(layout, RateControl::ConstrainedVbr, true),
+                "{} ch VBR must spend less on silence",
+                layout.channels
+            );
+        }
+    }
+
+    struct Parked(u32);
+    impl AudioCapturer for Parked {
+        fn next_chunk(&mut self) -> Result<Vec<f32>> {
+            Ok(Vec::new())
+        }
+        fn sample_rate(&self) -> u32 {
+            self.0
+        }
+    }
+
+    /// A capturer delivering another rate is never reused, on either plane.
+    #[test]
+    fn a_parked_capturer_at_another_rate_is_not_reused() {
+        let slot = std::sync::Mutex::new(Some(Box::new(Parked(44_100)) as Box<dyn AudioCapturer>));
+        assert!(take_parked_capture(&slot, 2, SAMPLE_RATE).is_none());
+        assert!(slot.lock().unwrap().is_none(), "the misfit is dropped");
+
+        *slot.lock().unwrap() = Some(Box::new(Parked(SAMPLE_RATE)));
+        assert!(take_parked_capture(&slot, 2, SAMPLE_RATE).is_some());
+        assert!(take_parked_capture(&slot, 2, SAMPLE_RATE).is_none());
+    }
 }
