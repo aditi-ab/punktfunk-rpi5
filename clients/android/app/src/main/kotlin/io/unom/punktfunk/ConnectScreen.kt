@@ -508,14 +508,12 @@ fun ConnectScreen(
                     // asks the host itself, at the address it advertises if it moved lease.
                     isOnline = {
                         val live = liveAdvert()
-                        withContext(Dispatchers.IO) {
-                            Presence.isSelf(
-                                pinHex ?: "",
-                                NativeBridge.nativeProbe(
-                                    live?.host ?: targetHost, live?.port ?: targetPort, 3_000,
-                                ),
-                            )
-                        }
+                        Presence.isSelf(
+                            pinHex ?: "",
+                            NativeBridge.nativeProbe(
+                                live?.host ?: targetHost, live?.port ?: targetPort, 3_000,
+                            ),
+                        )
                     },
                     onOnline = {
                         val live = liveAdvert()
@@ -860,17 +858,9 @@ fun ConnectScreen(
             connectsAfter = false,
             macs = kh.mac,
             lastIp = kh.address,
-            // "Back up" is the host answering a probe, at the address its advert claims if a cold
-            // boot moved it — never the advert alone, which a sleeping host keeps publishing.
             isOnline = {
-                val live = discovered.firstOrNull { kh.matches(it) }
-                withContext(Dispatchers.IO) {
-                    Presence.isSelf(
-                        kh,
-                        NativeBridge.nativeProbe(
-                            live?.host ?: kh.address, live?.port ?: kh.port, 3_000,
-                        ),
-                    )
+                Presence.probeSelf(kh, discovered.firstOrNull { kh.matches(it) }) { addr, port ->
+                    NativeBridge.nativeProbe(addr, port, 3_000)
                 }
             },
             onOnline = {},
