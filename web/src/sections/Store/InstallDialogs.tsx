@@ -1,6 +1,7 @@
 import { BadgeCheck, ShieldAlert, ShieldQuestion } from "lucide-react";
 import { type FC, useEffect, useState } from "react";
-import type { PendingUpdate, StoreEntry } from "@/api/store";
+import type { CatalogEntry } from "@/api/gen/model";
+import type { PendingUpdate } from "@/api/store";
 import {
 	PasswordConfirmField,
 	type PasswordFailure,
@@ -32,9 +33,9 @@ import { m } from "@/paraglide/messages";
  */
 export const InstallDialog: FC<{
 	/** The entry being confirmed, or null when the dialog is closed. */
-	entry: StoreEntry | null;
+	entry: CatalogEntry | null;
 	onCancel: () => void;
-	onConfirm: (entry: StoreEntry) => void;
+	onConfirm: (entry: CatalogEntry) => void;
 	isPending: boolean;
 }> = ({ entry, onCancel, onConfirm, isPending }) => {
 	const external = entry?.tier === "external";

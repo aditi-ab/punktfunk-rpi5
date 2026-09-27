@@ -42,10 +42,15 @@ import {
 } from "@/api/gen/native/native";
 import { getGetPairingStatusQueryKey } from "@/api/gen/pairing/pairing";
 import { getGetPluginAccessQueryKey } from "@/api/gen/plugin-access/plugin-access";
+import { getListPluginsQueryKey } from "@/api/gen/plugins/plugins";
 import { getGetRecentSessionsQueryKey } from "@/api/gen/session/session";
+import {
+	getGetPluginCatalogQueryKey,
+	getGetPluginRuntimeQueryKey,
+	getListInstalledPluginsQueryKey,
+} from "@/api/gen/store/store";
 import { getGetUpdateStatusQueryKey } from "@/api/gen/update/update";
-import { boostPluginPolling, PLUGINS_KEY } from "@/api/plugins";
-import { storeKeys } from "@/api/store";
+import { boostPluginPolling } from "@/api/plugins";
 import { HOST_EVENT_KINDS, type HostEventKind } from "@/lib/event-kinds";
 import { m } from "@/paraglide/messages";
 import { type ActivityEntry, mergeActivity } from "./activity-ring";
@@ -54,10 +59,10 @@ export type { ActivityEntry } from "./activity-ring";
 
 const STATUS = [getGetStatusQueryKey()];
 const PACKAGES = [
-	PLUGINS_KEY,
-	storeKeys.catalog,
-	storeKeys.installed,
-	storeKeys.runtime,
+	getListPluginsQueryKey(),
+	getGetPluginCatalogQueryKey(),
+	getListInstalledPluginsQueryKey(),
+	getGetPluginRuntimeQueryKey(),
 ];
 
 /**

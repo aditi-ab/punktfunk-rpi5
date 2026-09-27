@@ -1,8 +1,6 @@
-// The plugin directory the console reads to grow its nav (plugin-ui-surface §5). This is a
-// hand-written client (not orval-generated) so the nav works without regenerating the API client
-// for the new endpoints; it rides the same `/api` BFF path as every other call, so the bearer token
-// is injected server-side and the browser only ever sends its session cookie.
-import { useQuery } from "@tanstack/react-query";
+// The plugin directory the console reads to grow its nav (plugin-ui-surface §5), over the
+// generated `listPlugins` client: icons, which plugins earn a nav entry, and fast polling after
+// an install.
 import {
 	Blocks,
 	Boxes,
@@ -16,33 +14,8 @@ import {
 	Puzzle,
 	Wrench,
 } from "lucide-react";
-import { apiFetch } from "@/api/fetcher";
-
-export interface PluginUiSummary {
-	port: number;
-	icon?: string;
-	/** Serves a page to open. Absent on an older host, which means yes. */
-	page?: boolean;
-	/** Serves `/__config`, the settings form. */
-	config?: boolean;
-	/** Serves `/__game?entry=<id>`, a tab on each library entry's page. */
-	game?: boolean;
-}
-
-export interface PluginSummary {
-	id: string;
-	title: string;
-	version?: string;
-	/** Present iff the plugin serves a UI (and thus gets a nav entry). */
-	ui?: PluginUiSummary;
-	/**
-	 * What kind of plugin this is. The console keeps `"library"` and `"metadata"` OUT of the nav:
-	 * their entry point is the Library section (Game sources, Art & Metadata), and a sidebar entry
-	 * per scanner would flood it (design D5). Absent on an older host, and absent by choice for a
-	 * plugin that wants its own page anyway (rom-manager).
-	 */
-	category?: string;
-}
+import type { PluginSummary } from "@/api/gen/model";
+import { useListPlugins } from "@/api/gen/plugins/plugins";
 
 /** A game source: listed under Library → Game sources. */
 export const LIBRARY_CATEGORY = "library";
@@ -73,13 +46,10 @@ const ICONS: Record<string, LucideIcon> = {
  * component: it throws out of render, and because this runs inside the AppShell nav that takes
  * down every page of the console. `Object.hasOwn` keeps the lookup to keys we actually declared.
  */
-export const pluginIcon = (name?: string): LucideIcon => {
+export const pluginIcon = (name?: string | null): LucideIcon => {
 	if (!name || !Object.hasOwn(ICONS, name)) return Puzzle;
 	return ICONS[name] ?? Puzzle;
 };
-
-/** The query key for the plugin directory — the nav is built from it. */
-export const PLUGINS_KEY = ["plugins"] as const;
 
 const IDLE_POLL_MS = 30_000;
 const BOOST_POLL_MS = 2_000;
@@ -105,15 +75,14 @@ export function boostPluginPolling(): void {
 }
 
 /** Live plugin registrations, polled (and refetched on window focus) so the nav stays current. */
-export function usePlugins() {
-	return useQuery({
-		queryKey: PLUGINS_KEY,
-		queryFn: () => apiFetch<PluginSummary[]>("/api/v1/plugins"),
-		refetchInterval: () =>
-			Date.now() < boostUntil ? BOOST_POLL_MS : IDLE_POLL_MS,
-		refetchOnWindowFocus: true,
+export const usePlugins = () =>
+	useListPlugins({
+		query: {
+			refetchInterval: () =>
+				Date.now() < boostUntil ? BOOST_POLL_MS : IDLE_POLL_MS,
+			refetchOnWindowFocus: true,
+		},
 	});
-}
 
 /**
  * The plugins that get a **nav entry**: those serving a page, minus the library and metadata ones.

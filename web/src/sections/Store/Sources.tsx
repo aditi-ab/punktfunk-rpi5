@@ -12,13 +12,13 @@ import {
 import { motion } from "motion/react";
 import { type FC, type FormEvent, useEffect, useState } from "react";
 import { ApiError } from "@/api/fetcher";
+import type { SourceView } from "@/api/gen/model";
+import { useListPluginSources } from "@/api/gen/store/store";
 import {
 	type SourceBody,
-	type StoreSource,
 	useDeleteSource,
 	useRefreshCatalog,
 	useSetSource,
-	useStoreSources,
 } from "@/api/store";
 import { useDialogs } from "@/components/dialogs";
 import {
@@ -50,8 +50,8 @@ type SourceDraft = Omit<SourceBody, "password"> & { name: string };
 
 /** Unix seconds → a locale date-time, or "never" for a source that has never fetched.
  * Locale-aware via lib/format.ts — `toLocaleString` follows the browser, not the console. */
-const fmtFetched = (secs: number): string =>
-	secs > 0 ? fmtDateTimeSecs(secs) : m.store_source_never();
+const fmtFetched = (secs?: number | null): string =>
+	secs ? fmtDateTimeSecs(secs) : m.store_source_never();
 
 /**
  * Container: the catalog sources. Owns the source listing, the refresh-all action, and add/remove.
@@ -60,7 +60,7 @@ const fmtFetched = (secs: number): string =>
  */
 export const SourcesTab: FC = () => {
 	const { confirm } = useDialogs();
-	const sources = useStoreSources();
+	const sources = useListPluginSources();
 	const refresh = useRefreshCatalog();
 	const save = useSetSource();
 	const remove = useDeleteSource();
@@ -89,7 +89,7 @@ export const SourcesTab: FC = () => {
 		}
 	};
 
-	const onRemove = async (source: StoreSource) => {
+	const onRemove = async (source: SourceView) => {
 		const ok = await confirm({
 			title: m.store_source_remove_confirm({ name: source.name }),
 			description: m.store_source_remove_body(),
@@ -98,7 +98,7 @@ export const SourcesTab: FC = () => {
 		});
 		if (!ok) return;
 		try {
-			await remove.mutateAsync(source.name);
+			await remove.mutateAsync({ name: source.name });
 		} catch (e) {
 			// 403 is the host refusing to drop its built-in catalog — say exactly that.
 			toast.error(
@@ -113,7 +113,7 @@ export const SourcesTab: FC = () => {
 		<div className="flex flex-col gap-card">
 			<SourceList
 				sources={sources}
-				busyName={remove.isPending ? (remove.variables ?? null) : null}
+				busyName={remove.isPending ? (remove.variables?.name ?? null) : null}
 				isRefreshing={refresh.isPending}
 				onRefresh={onRefresh}
 				onRemove={onRemove}
@@ -142,7 +142,7 @@ export const SourcesTab: FC = () => {
 /** The source table: health per source, with the built-in one locked. */
 export const SourceList: FC<{
 	sources: {
-		data?: StoreSource[];
+		data?: SourceView[];
 		isLoading: boolean;
 		error: unknown;
 		refetch?: () => void;
@@ -151,7 +151,7 @@ export const SourceList: FC<{
 	busyName: string | null;
 	isRefreshing: boolean;
 	onRefresh: () => void;
-	onRemove: (source: StoreSource) => void;
+	onRemove: (source: SourceView) => void;
 }> = ({ sources, busyName, isRefreshing, onRefresh, onRemove }) => {
 	const rows = sources.data ?? [];
 	return (

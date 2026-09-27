@@ -1,7 +1,8 @@
 import { ArrowUpCircle, Ban, Circle, Package, Trash2 } from "lucide-react";
 import type { FC } from "react";
+import type { InstalledView } from "@/api/gen/model";
 import type { PluginAccessSnapshot } from "@/api/gen/model/pluginAccessSnapshot";
-import { type InstalledPlugin, useInstalledPlugins } from "@/api/store";
+import { useInstalledPlugins } from "@/api/store";
 import { QueryState } from "@/components/query-state";
 import { ROW, ROW_GAP, staggerProps } from "@/components/stagger";
 import { Button } from "@/components/ui/button";
@@ -27,9 +28,9 @@ import { SourceChip, TierBadge } from "./TierBadge";
  * access decisions; package updates and removals stay with the parent dialogs.
  */
 export const InstalledTab: FC<{
-	onUpdate: (plugin: InstalledPlugin) => void;
+	onUpdate: (plugin: InstalledView) => void;
 	onUpdateAll: () => void;
-	onUninstall: (plugin: InstalledPlugin) => void;
+	onUninstall: (plugin: InstalledView) => void;
 	/** How many plugins "Update all" would install; the button hides at zero. */
 	updateCount: number;
 	/** Package whose install/uninstall is in flight, or null — only that row's actions disable. */
@@ -66,7 +67,7 @@ export const InstalledTab: FC<{
 };
 
 const InstalledAccess: FC<{
-	plugin: InstalledPlugin;
+	plugin: InstalledView;
 	access: PluginAccessSnapshot[];
 	busy: boolean;
 	onDecision: (
@@ -92,10 +93,10 @@ const InstalledAccess: FC<{
  * Pending requests stay on the matching Library source; this list never announces them.
  */
 export const InstalledList: FC<{
-	installed: Loadable<InstalledPlugin[]>;
-	onUpdate: (plugin: InstalledPlugin) => void;
+	installed: Loadable<InstalledView[]>;
+	onUpdate: (plugin: InstalledView) => void;
 	onUpdateAll: () => void;
-	onUninstall: (plugin: InstalledPlugin) => void;
+	onUninstall: (plugin: InstalledView) => void;
 	updateCount: number;
 	busyPkg: string | null;
 	batchRunning: boolean;
@@ -159,7 +160,7 @@ export const InstalledList: FC<{
 											<div className="font-mono text-xs text-muted-foreground">
 												{p.pkg}
 											</div>
-											{p.blocked !== undefined && (
+											{p.blocked != null && (
 												<p className="mt-2 flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1 text-xs font-medium text-destructive">
 													<Ban className="mt-px size-3.5 shrink-0" />
 													<span>{m.store_blocked({ reason: p.blocked })}</span>
@@ -197,7 +198,7 @@ export const InstalledList: FC<{
 										</TableCell>
 										<TableCell className="py-4 text-right">
 											<div className="flex items-center justify-end gap-2">
-												{p.update_available !== undefined && (
+												{p.update_available != null && (
 													<Button
 														size="sm"
 														disabled={batchRunning || busyPkg === p.pkg}

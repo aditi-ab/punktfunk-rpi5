@@ -1,6 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import type { InstalledView } from "@/api/gen/model";
 import type { PluginAccessSnapshot } from "@/api/gen/model/pluginAccessSnapshot";
-import type { InstalledPlugin } from "@/api/store";
 import { InstalledList } from "@/sections/Store/Installed";
 
 // The installed-plugins list, driven straight from fixtures — it fetches nothing, so the header's
@@ -23,7 +23,7 @@ const meta = {
 export default meta;
 type Story = StoryObj<typeof meta>;
 
-const ROWS: InstalledPlugin[] = [
+const ROWS: InstalledView[] = [
 	{
 		pkg: "@punktfunk/plugin-rom-manager",
 		title: "ROM Manager",
@@ -75,7 +75,7 @@ const ACCESS: PluginAccessSnapshot[] = [
 	},
 ];
 
-const loaded = (data: InstalledPlugin[]) => ({
+const loaded = (data: InstalledView[]) => ({
 	data,
 	isLoading: false,
 	error: null,

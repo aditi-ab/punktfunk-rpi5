@@ -1,16 +1,32 @@
-// The plugin store: catalog, install/uninstall jobs, catalog sources, and the scripting runner.
-// Like `api/plugins.ts` this is a hand-written client rather than an orval-generated one — the
-// OpenAPI document is regenerated on a Linux box (punktfunk-host doesn't build on macOS), so the
-// console must not wait on a regen to talk to these endpoints. It rides the same `/api` BFF path as
-// every other call, so the bearer token is injected server-side and the browser only ever sends its
-// session cookie.
+// The plugin store's rules over the generated client (`@/api/gen/store/store`): provenance tiers,
+// update planning, job polling and re-attach, cache invalidation, and the two writes that carry the
+// console password. Those two stay hand-rolled because the BFF strips a field the spec lacks.
 import {
 	type QueryClient,
 	useMutation,
-	useQuery,
 	useQueryClient,
 } from "@tanstack/react-query";
 import { apiFetch } from "@/api/fetcher";
+import type {
+	CatalogEntry,
+	InstalledView,
+	Job,
+	JobRef,
+	SourceInput,
+} from "@/api/gen/model";
+import { getListPluginsQueryKey } from "@/api/gen/plugins/plugins";
+import {
+	getGetPluginCatalogQueryKey,
+	getGetPluginRuntimeQueryKey,
+	getListInstalledPluginsQueryKey,
+	getListPluginSourcesQueryKey,
+	useDeletePluginSource,
+	useGetPluginJob,
+	useListInstalledPlugins,
+	useListPluginJobs,
+	useRefreshPluginCatalog,
+	useSetPluginRuntime,
+} from "@/api/gen/store/store";
 import { boostPluginPolling } from "@/api/plugins";
 
 /**
@@ -25,93 +41,10 @@ import { boostPluginPolling } from "@/api/plugins";
  */
 export type StoreTier = "verified" | "external" | "unverified" | "cli";
 
-/** The tier a *catalog* entry can carry — the raw-spec/CLI tiers never appear in a catalog. */
-export type CatalogTier = Extract<StoreTier, "verified" | "external">;
-
-export interface StoreHostInfo {
-	version: string;
-	platform: string;
-}
-
-export interface StoreSource {
-	name: string;
-	url: string;
-	/** The `unom` source ships with the host: it can't be edited or removed. */
-	builtin: boolean;
-	signed: boolean;
-	/** The last fetch failed or is too old — entries may be out of date. */
-	stale: boolean;
-	/** Unix seconds of the last successful fetch. */
-	fetched_at: number;
-	error?: string;
-	entry_count: number;
-	public_key?: string;
-}
-
-export interface StoreEntry {
-	id: string;
-	pkg: string;
-	title: string;
-	description: string;
-	icon?: string;
-	author: string;
-	homepage?: string;
-	license?: string;
-	version: string;
-	/** Name of the source this entry came from — the attribution an external entry shows. */
-	source: string;
-	tier: CatalogTier;
-	reviewed_at?: string;
-	platforms: string[];
-	min_host?: string;
-	compatible: boolean;
-	incompatible_reason?: string;
-	installed_version?: string;
-	update_available: boolean;
-	blocked?: string;
-	/**
-	 * What kind of plugin this is. Browse filters on these, and the Library section's "Add a source"
-	 * rail shows exactly the `library` ones (design D5/D6). Absent on an index that predates them.
-	 */
-	categories?: string[];
-	/**
-	 * Whether the launcher this plugin scans looks installed on this host, from the index's own
-	 * existence probes (design D8). `undefined` = the entry declares no probes for this platform,
-	 * which is "unknown" and must render differently from "not installed".
-	 */
-	detected?: boolean;
-}
-
-export interface StoreCatalog {
-	host: StoreHostInfo;
-	sources: StoreSource[];
-	plugins: StoreEntry[];
-	/** An install/uninstall is already running — the host takes one at a time. */
-	busy: boolean;
-}
-
-export interface InstalledPlugin {
-	pkg: string;
-	/** Nullable in the contract (`InstalledView.version`) — a CLI-installed plugin may carry no
-	 * recorded version. Typed required here, the Installed tab rendered the literal "vundefined". */
-	version?: string | null;
-	tier: StoreTier;
-	source?: string;
-	entry_id?: string;
-	/** The plugin's runtime id — how it's keyed in the plugin directory (`api/plugins.ts`). */
-	plugin_id?: string;
-	title?: string;
-	installed_at?: string;
-	running: boolean;
-	/** The version available to update to, if any. */
-	update_available?: string;
-	blocked?: string;
-}
-
 /** An installed plugin paired with the catalog entry an update would install. */
 export interface PendingUpdate {
-	plugin: InstalledPlugin;
-	entry: StoreEntry;
+	plugin: InstalledView;
+	entry: CatalogEntry;
 }
 
 /** What "Update all" would do: the run, and what it deliberately left out of it. */
@@ -130,9 +63,9 @@ export interface UpdatePlan {
  * could offer a row badged "verified" an entry from somebody else's source at a different version.
  */
 export function catalogEntryFor(
-	plugin: InstalledPlugin,
-	entries: StoreEntry[] | undefined,
-): StoreEntry | undefined {
+	plugin: InstalledView,
+	entries: CatalogEntry[] | undefined,
+): CatalogEntry | undefined {
 	const list = entries ?? [];
 	return (
 		(plugin.source && plugin.entry_id
@@ -160,49 +93,20 @@ export function catalogEntryFor(
  * now, and updating away from it is the fix, not the risk.
  */
 export function planUpdates(
-	installed: InstalledPlugin[] | undefined,
-	entries: StoreEntry[] | undefined,
+	installed: InstalledView[] | undefined,
+	entries: CatalogEntry[] | undefined,
 ): UpdatePlan {
 	const plan: UpdatePlan = { updates: [], skipped: [] };
 	for (const plugin of installed ?? []) {
-		if (plugin.update_available === undefined) continue;
+		if (plugin.update_available == null) continue;
 		const entry = catalogEntryFor(plugin, entries);
-		if (entry?.compatible && entry.blocked === undefined) {
+		if (entry?.compatible && entry.blocked == null) {
 			plan.updates.push({ plugin, entry });
 		} else {
 			plan.skipped.push(plugin.title ?? plugin.pkg);
 		}
 	}
 	return plan;
-}
-
-export type JobKind = "install" | "uninstall";
-export type JobState = "running" | "done" | "failed";
-
-export interface StoreJob {
-	id: string;
-	kind: JobKind;
-	target: string;
-	state: JobState;
-	phase: string;
-	log: string[];
-	error?: string;
-	started_at: number;
-	finished_at?: number;
-}
-
-export interface RuntimeStatus {
-	installed: boolean;
-	enabled: boolean;
-	running: boolean;
-	unit: string;
-	principal?: string;
-	detail?: string;
-}
-
-/** What `POST /store/install` and `POST /store/uninstall` answer with (202). */
-export interface JobAccepted {
-	job: string;
 }
 
 /**
@@ -219,23 +123,9 @@ export type InstallBody =
 
 /** Adding or repointing a source is a trust-root change, so it carries the console password too
  * (stripped at the BFF — server/routes/api/v1/store/sources/[name].put.ts). */
-export interface SourceBody {
-	url: string;
-	public_key?: string;
-	password: string;
-}
+export type SourceBody = SourceInput & { password: string };
 
 const BASE = "/api/v1/store";
-
-/** Query keys, in one place so any mutation can invalidate precisely. */
-export const storeKeys = {
-	all: ["store"] as const,
-	catalog: ["store", "catalog"] as const,
-	installed: ["store", "installed"] as const,
-	sources: ["store", "sources"] as const,
-	runtime: ["store", "runtime"] as const,
-	job: (id: string) => ["store", "job", id] as const,
-};
 
 const json = (method: string, body: unknown): RequestInit => ({
 	method,
@@ -252,44 +142,17 @@ export function invalidateStore(qc: QueryClient): Promise<void> {
 	// from now — this invalidation would otherwise refetch the pre-install list and stop looking.
 	boostPluginPolling();
 	return Promise.all([
-		qc.invalidateQueries({ queryKey: storeKeys.catalog }),
-		qc.invalidateQueries({ queryKey: storeKeys.installed }),
-		qc.invalidateQueries({ queryKey: storeKeys.sources }),
-		qc.invalidateQueries({ queryKey: storeKeys.runtime }),
-		qc.invalidateQueries({ queryKey: ["plugins"] }),
+		qc.invalidateQueries({ queryKey: getGetPluginCatalogQueryKey() }),
+		qc.invalidateQueries({ queryKey: getListInstalledPluginsQueryKey() }),
+		qc.invalidateQueries({ queryKey: getListPluginSourcesQueryKey() }),
+		qc.invalidateQueries({ queryKey: getGetPluginRuntimeQueryKey() }),
+		qc.invalidateQueries({ queryKey: getListPluginsQueryKey() }),
 	]).then(() => undefined);
 }
 
-/** The merged catalog across every source, plus the sources' own health. */
-export function useStoreCatalog() {
-	return useQuery({
-		queryKey: storeKeys.catalog,
-		queryFn: () => apiFetch<StoreCatalog>(`${BASE}/catalog`),
-	});
-}
-
 /** What's installed right now, with each plugin's permanent provenance tier. */
-export function useInstalledPlugins() {
-	return useQuery({
-		queryKey: storeKeys.installed,
-		queryFn: () => apiFetch<InstalledPlugin[]>(`${BASE}/installed`),
-		refetchInterval: 30_000,
-	});
-}
-
-export function useStoreSources() {
-	return useQuery({
-		queryKey: storeKeys.sources,
-		queryFn: () => apiFetch<StoreSource[]>(`${BASE}/sources`),
-	});
-}
-
-export function useStoreRuntime() {
-	return useQuery({
-		queryKey: storeKeys.runtime,
-		queryFn: () => apiFetch<RuntimeStatus>(`${BASE}/runtime`),
-	});
-}
+export const useInstalledPlugins = () =>
+	useListInstalledPlugins({ query: { refetchInterval: 30_000 } });
 
 /**
  * A single install/uninstall job, polled once a second while it runs and left alone once it
@@ -315,17 +178,12 @@ const JOB_MAX_FAILURES = 15;
  * and the host takes one job at a time, so the next click just bounced off a 409. The host keeps
  * the list; ask it rather than remembering.
  */
-export function useStoreJobs() {
-	return useQuery({
-		queryKey: [...storeKeys.all, "jobs"] as const,
-		queryFn: () => apiFetch<StoreJob[]>(`${BASE}/jobs`),
-		// Only needed to find an orphaned job on mount; the job query itself does the live polling.
-		staleTime: 5_000,
-	});
-}
+export const useStoreJobs = () =>
+	// Only needed to find an orphaned job on mount; the job query itself does the live polling.
+	useListPluginJobs({ query: { staleTime: 5_000 } });
 
 /** The newest job that is still running, if any — what a fresh page should re-attach to. */
-export function runningJob(jobs: StoreJob[] | undefined): StoreJob | undefined {
+export function runningJob(jobs: Job[] | undefined): Job | undefined {
 	if (!jobs) return undefined;
 	// The list is oldest-first, so scan from the end for the most recent live one.
 	for (let i = jobs.length - 1; i >= 0; i--) {
@@ -336,32 +194,31 @@ export function runningJob(jobs: StoreJob[] | undefined): StoreJob | undefined {
 }
 
 export function useStoreJob(id: string | null) {
-	return useQuery({
-		queryKey: storeKeys.job(id ?? ""),
-		queryFn: () =>
-			apiFetch<StoreJob>(`${BASE}/jobs/${encodeURIComponent(id ?? "")}`),
-		enabled: id !== null,
-		refetchInterval: (q) => {
-			const state = q.state.data?.state;
-			if (state === "done" || state === "failed") return false;
-			if (q.state.fetchFailureCount > JOB_MAX_FAILURES) return false;
-			return JOB_POLL_MS;
+	return useGetPluginJob(id ?? "", {
+		query: {
+			enabled: id !== null,
+			refetchInterval: (q) => {
+				const state = q.state.data?.state;
+				if (state === "done" || state === "failed") return false;
+				if (q.state.fetchFailureCount > JOB_MAX_FAILURES) return false;
+				return JOB_POLL_MS;
+			},
+			// A job that vanished with its host is gone for good; a transient blip is not. Retry a
+			// few times per poll so a runner restart doesn't surface as an error card.
+			retry: 3,
 		},
-		// A job that vanished with its host is gone for good; a transient blip is not. Retry a few
-		// times per poll so a runner restart doesn't surface as an error card.
-		retry: 3,
 	});
 }
 
 /** Re-fetch every source's index; answers with the freshly merged catalog. */
 export function useRefreshCatalog() {
 	const qc = useQueryClient();
-	return useMutation({
-		mutationFn: () =>
-			apiFetch<StoreCatalog>(`${BASE}/refresh`, { method: "POST" }),
-		onSuccess: (catalog) => {
-			qc.setQueryData(storeKeys.catalog, catalog);
-			qc.setQueryData(storeKeys.sources, catalog.sources);
+	return useRefreshPluginCatalog({
+		mutation: {
+			onSuccess: (catalog) => {
+				qc.setQueryData(getGetPluginCatalogQueryKey(), catalog);
+				qc.setQueryData(getListPluginSourcesQueryKey(), catalog.sources);
+			},
 		},
 	});
 }
@@ -370,14 +227,7 @@ export function useRefreshCatalog() {
 export function useInstallPlugin() {
 	return useMutation({
 		mutationFn: (body: InstallBody) =>
-			apiFetch<JobAccepted>(`${BASE}/install`, json("POST", body)),
-	});
-}
-
-export function useUninstallPlugin() {
-	return useMutation({
-		mutationFn: (pkg: string) =>
-			apiFetch<JobAccepted>(`${BASE}/uninstall`, json("POST", { pkg })),
+			apiFetch<JobRef>(`${BASE}/install`, json("POST", body)),
 	});
 }
 
@@ -390,36 +240,31 @@ export function useSetSource() {
 				`${BASE}/sources/${encodeURIComponent(name)}`,
 				json("PUT", body),
 			),
-		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: storeKeys.sources });
-			qc.invalidateQueries({ queryKey: storeKeys.catalog });
-		},
+		onSuccess: () => invalidateSources(qc),
 	});
 }
 
 export function useDeleteSource() {
 	const qc = useQueryClient();
-	return useMutation({
-		mutationFn: (name: string) =>
-			apiFetch<void>(`${BASE}/sources/${encodeURIComponent(name)}`, {
-				method: "DELETE",
-			}),
-		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: storeKeys.sources });
-			qc.invalidateQueries({ queryKey: storeKeys.catalog });
-		},
+	return useDeletePluginSource({
+		mutation: { onSuccess: () => invalidateSources(qc) },
 	});
 }
+
+const invalidateSources = (qc: QueryClient) => {
+	qc.invalidateQueries({ queryKey: getListPluginSourcesQueryKey() });
+	qc.invalidateQueries({ queryKey: getGetPluginCatalogQueryKey() });
+};
 
 /** Enable or disable the plugin/script runner service. */
 export function useSetRuntime() {
 	const qc = useQueryClient();
-	return useMutation({
-		mutationFn: (enabled: boolean) =>
-			apiFetch<RuntimeStatus>(`${BASE}/runtime`, json("POST", { enabled })),
-		onSuccess: (status) => {
-			qc.setQueryData(storeKeys.runtime, status);
-			qc.invalidateQueries({ queryKey: ["plugins"] });
+	return useSetPluginRuntime({
+		mutation: {
+			onSuccess: (status) => {
+				qc.setQueryData(getGetPluginRuntimeQueryKey(), status);
+				qc.invalidateQueries({ queryKey: getListPluginsQueryKey() });
+			},
 		},
 	});
 }

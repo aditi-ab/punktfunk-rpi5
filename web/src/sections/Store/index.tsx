@@ -2,21 +2,18 @@ import Section from "@unom/ui/section";
 import { toast } from "@unom/ui/toast";
 import { type FC, useEffect, useMemo, useState } from "react";
 import { ApiError } from "@/api/fetcher";
+import type { CatalogEntry, InstalledView, Job } from "@/api/gen/model";
+import { useGetPluginCatalog, useUninstallPlugin } from "@/api/gen/store/store";
 import {
 	catalogEntryFor,
 	type InstallBody,
-	type InstalledPlugin,
 	type PendingUpdate,
 	planUpdates,
 	runningJob,
-	type StoreEntry,
-	type StoreJob,
 	type UpdatePlan,
 	useInstalledPlugins,
 	useInstallPlugin,
-	useStoreCatalog,
 	useStoreJobs,
-	useUninstallPlugin,
 } from "@/api/store";
 import { useDialogs } from "@/components/dialogs";
 import { usePasswordFailure } from "@/components/password-confirm";
@@ -65,7 +62,7 @@ export const SectionStore: FC = () => {
 	const { confirm } = useDialogs();
 	const [tab, setTab] = useState<StoreTab>("browse");
 	// The catalog entry awaiting its install confirmation, and the raw-spec dialog's open state.
-	const [target, setTarget] = useState<StoreEntry | null>(null);
+	const [target, setTarget] = useState<CatalogEntry | null>(null);
 	const [specOpen, setSpecOpen] = useState(false);
 	const specRefusal = usePasswordFailure();
 	// The job the host is running for us, if any. Cleared by the operator, not by completion — a
@@ -79,7 +76,7 @@ export const SectionStore: FC = () => {
 	);
 	const [run, setRun] = useState<UpdateRun | null>(null);
 
-	const catalog = useStoreCatalog();
+	const catalog = useGetPluginCatalog();
 	// Also queried by the Installed tab; react-query serves both from one fetch. Here it is what
 	// "Update all" counts, so the button is right even while that tab has never been opened.
 	const installed = useInstalledPlugins();
@@ -118,7 +115,7 @@ export const SectionStore: FC = () => {
 		}
 	};
 
-	const onConfirmEntry = async (entry: StoreEntry) => {
+	const onConfirmEntry = async (entry: CatalogEntry) => {
 		setTarget(null);
 		await start({ source: entry.source, id: entry.id });
 	};
@@ -144,7 +141,7 @@ export const SectionStore: FC = () => {
 
 	// An update from the Installed tab installs the CATALOG version — so it goes through the very
 	// same tier-appropriate dialog a fresh install would, warning included.
-	const onUpdate = (plugin: InstalledPlugin) => {
+	const onUpdate = (plugin: InstalledView) => {
 		const entry = catalogEntryFor(plugin, catalog.data?.plugins);
 		if (!entry) {
 			toast.error(m.store_update_no_entry());
@@ -196,7 +193,7 @@ export const SectionStore: FC = () => {
 	 * spinner; the operator would be left knowing only that something, somewhere, went wrong. So the
 	 * run stops on the evidence and says what it did not get to, which they can retry from the rows.
 	 */
-	const onJobSettled = (job: StoreJob) => {
+	const onJobSettled = (job: Job) => {
 		if (!run) return;
 		if (job.state !== "done") {
 			setRun(null);
@@ -219,7 +216,7 @@ export const SectionStore: FC = () => {
 	// 1-based, and only while a run is live — this is what turns the install card into "2 of 5".
 	const step = run ? { index: run.done + 1, total: run.total } : undefined;
 
-	const onUninstall = async (plugin: InstalledPlugin) => {
+	const onUninstall = async (plugin: InstalledView) => {
 		const ok = await confirm({
 			title: m.store_uninstall_confirm({ title: plugin.title ?? plugin.pkg }),
 			description: m.store_uninstall_body(),
@@ -228,7 +225,9 @@ export const SectionStore: FC = () => {
 		});
 		if (!ok) return;
 		try {
-			const { job } = await uninstall.mutateAsync(plugin.pkg);
+			const { job } = await uninstall.mutateAsync({
+				data: { pkg: plugin.pkg },
+			});
 			setJobId(job);
 		} catch (e) {
 			failed(e, m.store_uninstall_failed());
@@ -302,7 +301,9 @@ export const SectionStore: FC = () => {
 								onUninstall={onUninstall}
 								updateCount={plan.updates.length}
 								busyPkg={
-									uninstall.isPending ? (uninstall.variables ?? null) : null
+									uninstall.isPending
+										? (uninstall.variables?.data.pkg ?? null)
+										: null
 								}
 								batchRunning={run !== null}
 							/>
