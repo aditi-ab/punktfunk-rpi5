@@ -278,6 +278,12 @@ struct StreamState {
     win_steps: [u32; 6],
     /// Non-blocking presents that came back busy this window: [fence, acquire].
     win_busy: [u32; 2],
+    /// Hand-over to latch, learned from this stream's misses and published to the
+    /// host-facing `latch_grid`. Latency intent on a stream at panel rate only.
+    need: punktfunk_core::phase::LatchNeed,
+    /// This window's on-glass frames: the lead each had to its first latch, and whether
+    /// it landed on a later one.
+    win_leads: Vec<(i64, bool)>,
     /// What the held frame waits on. The fence paces the loop itself (the presenter waits
     /// it for a millisecond per pass), so the pass turns straight around and drains the
     /// channel first: a newer frame replaces the held one instead of queuing behind it.
@@ -437,6 +443,8 @@ impl StreamState {
             win_out_max: 0,
             win_steps: [0; 6],
             win_busy: [0; 2],
+            need: punktfunk_core::phase::LatchNeed::default(),
+            win_leads: Vec::with_capacity(256),
             busy_on: crate::vk::BusyOn::Fence,
             last_displayed_ns: 0,
             last_slot_ns: 0,
@@ -562,9 +570,10 @@ impl StreamState {
         }
         self.cadence.reset();
         self.pacer.reset();
-        // The slot margin was sized by the old panel's misses.
+        // The slot margin and the latch need were sized by the old panel's misses.
         self.margin_ns = 0;
         self.win_misses = 0;
+        self.need = punktfunk_core::phase::LatchNeed::default();
         tracing::info!(
             refresh_hz = hz,
             "display changed — relearning the latch grid"
@@ -2074,8 +2083,21 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         .as_ref()
                         .map_or(0, |o| o.load(Ordering::Relaxed));
                     let period = st.clock.period_ns();
+                    // A queue holds frames on purpose and a stream off the panel's rate
+                    // replaces them on purpose: neither miss says anything about lead.
+                    let learn_need = st.latch_grid.is_some()
+                        && !st.store.is_smoothing()
+                        && st.source_interval_ns.abs_diff(period as i64) < period / 10;
                     let mut stamps = Vec::with_capacity(samples.len());
                     for s in &samples {
+                        if learn_need {
+                            st.win_leads.extend(punktfunk_core::phase::latch_lead(
+                                st.clock.anchor_ns(),
+                                period as i64,
+                                s.decoded_ns,
+                                s.displayed_ns,
+                            ));
+                        }
                         let e2e = (s.displayed_ns as i128 + clock_offset_ns as i128
                             - s.pts_ns as i128)
                             .max(0) as u64;
@@ -2127,6 +2149,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             .store(st.clock.period_ns(), Ordering::Relaxed);
                         grid.anchor_ns
                             .store(st.clock.anchor_ns(), Ordering::Relaxed);
+                        grid.need_ns
+                            .store(st.need.need_ns() as u64, Ordering::Relaxed);
                     }
                 }
             }
@@ -2528,6 +2552,19 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         "smoothness slot margin widened (measured latch misses)"
                     );
                 }
+                // The need never shrinks: a smaller picture mid-stream keeps the larger one's.
+                let missed = st.win_leads.iter().filter(|(_, missed)| *missed).count();
+                if st.need.observe(&st.win_leads, st.clock.period_ns() as i64) {
+                    tracing::info!(
+                        need_us = st.need.need_ns() / 1000,
+                        missed,
+                        shown = st.win_leads.len(),
+                        "latch need changed (frames landed one latch late)"
+                    );
+                }
+                st.win_leads.sort_unstable();
+                let lead_us = st.win_leads.get(st.win_leads.len() / 2).map_or(0, |l| l.0) / 1000;
+                st.win_leads.clear();
                 // The 1 Hz presenter line, always: the field bundle's only record of where a
                 // frame went after decode and how evenly the glass stepped.
                 if pacing_active {
@@ -2567,6 +2604,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         present_us = queue_present.p50_us,
                         period_us = st.clock.period_ns() / 1000,
                         margin_us = st.margin_ns / 1000,
+                        // Hand-over to first latch: what it takes, the window's median,
+                        // and the frames that landed a latch later all the same.
+                        need_us = st.need.need_ns() / 1000,
+                        lead_us,
+                        missed,
                         // Cadence loop's current hold and the jitter it is sized from,
                         // plus frames whose due time had already passed when they arrived.
                         // Cumulative/instantaneous, not window sums like the counters above.

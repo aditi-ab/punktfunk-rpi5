@@ -4,6 +4,7 @@
 //! the same numbers the controller was tuned against. Pure, no features.
 //!
 //! - [`circular_latch`] — mean latch and coherence of latch samples mod a period.
+//! - [`LatchNeed`] — what a frame needs before its latch, learned from misses.
 //! - [`PanelGrid`] — learned refresh period. Finer is adopted at once; coarser
 //!   only after [`PANEL_WIDEN_STREAK`] agreeing observations.
 //! - [`CadenceClock`] — type-2 loop. Due time is `src_pts + offset + cushion`;
@@ -116,6 +117,90 @@ pub fn circular_latch(samples_us: &[u64], period_ns: i64) -> Option<(u64, u16)> 
     let mean_theta = y.atan2(x).rem_euclid(std::f64::consts::TAU);
     let mean_ns = (mean_theta / std::f64::consts::TAU * period_ns as f64) as u64;
     Some((mean_ns, (r * 1000.0) as u16))
+}
+
+/// A frame's lead to its first latch, and whether it landed on a later one. `ready_ns`
+/// is the hand-over to the presenter, `anchor_ns` any point of the latch grid. `None`
+/// without a grid.
+pub fn latch_lead(
+    anchor_ns: u64,
+    period_ns: i64,
+    ready_ns: u64,
+    displayed_ns: u64,
+) -> Option<(i64, bool)> {
+    if period_ns <= 0 || anchor_ns == 0 || displayed_ns < ready_ns {
+        return None;
+    }
+    let lead = (anchor_ns as i128 - ready_ns as i128).rem_euclid(period_ns as i128) as i64;
+    let waited = (displayed_ns - ready_ns) as i64;
+    Some((lead, waited > lead + period_ns / 2))
+}
+
+/// Past a missed lead by this much. The host's own lead target comes on top.
+const NEED_STEP_NS: i64 = 500_000;
+
+/// One raise while only some frames miss: they straddle the latch by less than the
+/// host's lead target.
+const NEED_NUDGE_NS: i64 = 1_000_000;
+
+/// A need this close to a whole period leaves the host's lead target no room.
+const NEED_HEADROOM_NS: i64 = 3_000_000;
+
+/// What a frame needs between hand-over and the latch that shows it, learned from misses.
+///
+/// A frame that had some lead to its first latch and landed on a later one needed more
+/// than that lead. A miss at a lead the need already covers is a late arrival and counts
+/// for nothing. One frame in twenty missing, two windows running, raises the need: past
+/// the misses' p75 lead when half the window missed, by a nudge when fewer did. The need
+/// only grows, since probing downward costs a missed latch per probe. Misses that would
+/// push it to a whole period are not about lead, and the need parks at zero for the
+/// stream.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LatchNeed {
+    need_ns: i64,
+    streak: u8,
+    parked: bool,
+}
+
+impl LatchNeed {
+    pub fn need_ns(&self) -> i64 {
+        self.need_ns
+    }
+
+    /// One window of [`latch_lead`] answers. `true` when the need changed.
+    pub fn observe(&mut self, frames: &[(i64, bool)], period_ns: i64) -> bool {
+        if self.parked || period_ns <= 0 {
+            return false;
+        }
+        let mut open: Vec<i64> = frames
+            .iter()
+            .filter(|(lead, missed)| *missed && *lead > self.need_ns)
+            .map(|(lead, _)| *lead)
+            .collect();
+        if open.len() * 20 < frames.len().max(20) {
+            self.streak = 0;
+            return false;
+        }
+        self.streak += 1;
+        if self.streak < 2 {
+            return false;
+        }
+        // The host takes a report or two to follow; start the count again.
+        self.streak = 0;
+        open.sort_unstable();
+        let want = if open.len() * 2 >= frames.len() {
+            open[open.len() * 3 / 4] + NEED_STEP_NS
+        } else {
+            self.need_ns + NEED_NUDGE_NS
+        };
+        if want > period_ns - NEED_HEADROOM_NS {
+            self.parked = true;
+            self.need_ns = 0;
+        } else {
+            self.need_ns = want;
+        }
+        true
+    }
 }
 
 /// Gains are shift counts (`1 >> n` per frame). Fixed-point i64 so every
@@ -868,6 +953,98 @@ mod tests {
     fn too_few_samples_report_nothing() {
         assert!(circular_latch(&[1_000; 7], P).is_none());
         assert!(circular_latch(&[1_000; 16], 0).is_none());
+    }
+}
+
+#[cfg(test)]
+mod latch_need_tests {
+    use super::*;
+
+    const P: i64 = 16_666_666;
+    const ANCHOR: u64 = 1_000_000_000;
+    const HOST_LEAD: i64 = 2_500_000;
+
+    /// A window of 60 frames that all had `lead_ns` to their latch; `missed` of them missed.
+    fn window(need: &mut LatchNeed, lead_ns: i64, missed: usize) -> bool {
+        let frames: Vec<(i64, bool)> = (0..60).map(|i| (lead_ns, i < missed)).collect();
+        need.observe(&frames, P)
+    }
+
+    #[test]
+    fn a_frame_shown_one_latch_late_reports_the_lead_it_had() {
+        let ready = ANCHOR + 3 * P as u64 - 2_000_000;
+        let first = ANCHOR + 3 * P as u64;
+        assert_eq!(
+            latch_lead(ANCHOR, P, ready, first + 150_000),
+            Some((2_000_000, false))
+        );
+        assert_eq!(
+            latch_lead(ANCHOR, P, ready, first + P as u64 + 150_000),
+            Some((2_000_000, true))
+        );
+        assert_eq!(latch_lead(0, P, ready, first), None, "no grid yet");
+    }
+
+    #[test]
+    fn steady_misses_raise_the_need_past_the_missed_lead() {
+        let mut need = LatchNeed::default();
+        assert!(!window(&mut need, 2_500_000, 60), "one window is a hiccup");
+        assert!(window(&mut need, 2_500_000, 60));
+        assert_eq!(need.need_ns(), 3_000_000);
+        // The host has not moved yet: the same misses are late arrivals now.
+        for _ in 0..5 {
+            assert!(!window(&mut need, 2_500_000, 60));
+        }
+        assert_eq!(need.need_ns(), 3_000_000);
+    }
+
+    #[test]
+    fn a_few_frames_straddling_the_latch_nudge_the_need() {
+        let mut need = LatchNeed::default();
+        window(&mut need, 2_500_000, 60);
+        window(&mut need, 2_500_000, 60);
+        assert!(!window(&mut need, 5_500_000, 6));
+        assert!(window(&mut need, 5_500_000, 6));
+        assert_eq!(need.need_ns(), 4_000_000);
+    }
+
+    #[test]
+    fn scattered_misses_teach_nothing() {
+        let mut need = LatchNeed::default();
+        for _ in 0..20 {
+            assert!(!window(&mut need, 2_500_000, 2));
+        }
+        assert_eq!(need.need_ns(), 0);
+    }
+
+    /// The host holds arrival its 2.5 ms before the ready-by instant. Frames take 8 ms;
+    /// one in ten takes 9.5 ms.
+    #[test]
+    fn the_need_settles_just_past_what_the_frames_take() {
+        let mut need = LatchNeed::default();
+        let mut lead = HOST_LEAD;
+        for _ in 0..60 {
+            let missed = match lead {
+                l if l < 8_000_000 => 60,
+                l if l < 9_500_000 => 6,
+                _ => 0,
+            };
+            window(&mut need, lead, missed);
+            lead = need.need_ns() + HOST_LEAD;
+        }
+        assert!(lead >= 9_500_000, "frames still miss at {lead} ns");
+        assert!(lead < 12_000_000, "overshot to {lead} ns");
+    }
+
+    #[test]
+    fn misses_that_no_lead_cures_park_the_need_at_zero() {
+        let mut need = LatchNeed::default();
+        for _ in 0..60 {
+            let lead = need.need_ns() + HOST_LEAD;
+            window(&mut need, lead, 60);
+        }
+        assert_eq!(need.need_ns(), 0);
+        assert!(!window(&mut need, HOST_LEAD, 60), "parked for the stream");
     }
 }
 
