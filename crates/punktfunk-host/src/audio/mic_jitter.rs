@@ -7,7 +7,7 @@
 //! adaptive target depth the backend rings prime against.
 //!
 //! Same wrapping-sequence gap rules as the client downlink's `AudioGapTracker`
-//! (punktfunk-core `audio.rs`). Downlink jitter rings own their depth; uplink
+//! (punktfunk-core `audio/recovery.rs`). Downlink jitter rings own their depth; uplink
 //! rings live in the backends and take their target from here.
 
 use super::MicFrame;

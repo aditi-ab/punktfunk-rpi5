@@ -2001,14 +2001,6 @@ typedef struct {
 } PunktfunkDemoSession;
 #endif
 
-
-
-
-
-
-
-
-
 // Frame durations the plane may negotiate, longest first.
 //
 // Every rung divides the 48 kHz family into whole samples per channel.
@@ -2020,6 +2012,14 @@ typedef struct {
 // A rung is a wire/ring size, not a duration. Advance `pts_ns` with
 // [`frame_duration_ns`] of the real sample count, never `frame_us`.
 #define PUNKTFUNK_AUDIO_FRAME_US_LADDER { 5000, 4000, 3000, 2500, 2000, 1500, 1000, }
+
+
+
+
+
+
+
+
 
 // Rest pose: 1 g along up (index 1), zeros on the other two. `[0, 0, 0]` is
 // free-fall, not "no sample". Backends that use different units rescale this
