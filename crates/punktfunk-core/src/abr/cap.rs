@@ -682,7 +682,7 @@ mod tests {
             let lifted = c.host_cap.kbps().expect("cap should still be latched");
             assert!(lifted > 794_000, "round {round}: the re-probe never lifted");
             // Host clamps the lift back to its real ceiling.
-            c.last_requested_kbps = Some(lifted);
+            c.acks.last_requested_kbps = Some(lifted);
             c.on_ack(794_000, None);
             assert_eq!(c.host_cap.kbps(), Some(794_000));
             assert_eq!(

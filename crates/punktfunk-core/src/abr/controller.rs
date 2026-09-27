@@ -222,14 +222,8 @@ pub(crate) struct BitrateController {
     /// The last bad window was the link's, and the link handed over less than
     /// it was asked for. Only then does the rate land on what was delivered.
     link_verdict: bool,
-    /// Windows left in which the damage is the last link-attributed cut's own
-    /// queue emptying. `0` = nothing to drain.
-    drain_windows: u32,
-    /// Delay level the guard is waiting to see again: what clean windows read
-    /// before the cut. `0` = none was known, so the budget ends the guard.
-    drain_ref_us: i64,
-    /// Windows the guard kept a cut off, for the line it logs when it ends.
-    drain_suppressed: u32,
+    /// The last link-attributed cut's own queue, still emptying.
+    drain: Drain,
     /// Windows left in which a second lone lost frame is ordinary damage. The
     /// blip exemption is spent once; a link losing a frame every window is
     /// not a recovery-plane event however clean each window looks.
@@ -241,16 +235,8 @@ pub(crate) struct BitrateController {
     pub(super) link_cap: LearnedCap,
     /// Previous delivered mark (`0` = none). Two within ±1/5 are a wall.
     pub(super) link_mark_kbps: u32,
-    /// What clean windows at this rate deliver: the sum and the count, reset
-    /// on every rate change because the parity floor and the content's fill
-    /// both move with the rate.
-    delivery_sum_kbps: u64,
-    delivery_windows: u32,
-    /// New-content frames those windows carried, summed beside them.
-    delivery_frames: u64,
-    /// Frames a window carried the last time a norm formed (`0` = never).
-    /// Kept across rate moves: how often the source draws is not the rate's.
-    frames_norm: u64,
+    /// What clean windows at this rate deliver, and the delay they sit at.
+    norms: RateNorms,
     /// The standing cap came from a measurement, which holds 30 % back by
     /// design. Its early lifts are that margin coming back, not a wall that
     /// moved, so they must not retire it.
@@ -265,14 +251,6 @@ pub(crate) struct BitrateController {
     link_lifted: bool,
     /// The lift in flight, and the delay the session had before it.
     lift: Option<LiftProbe>,
-    /// Shard delay of clean windows at this rate: the sum and the count, the
-    /// reference a lift is frozen against. Dropped with the delivery norm.
-    delay_sum_us: i64,
-    delay_windows: u32,
-    /// The last delay norm, kept when a rate move drops the one above. A
-    /// climb step or a cut changes the queue's occupancy, not the path's own
-    /// delay, so this is still the mark a drained queue comes back to.
-    delay_norm_us: i64,
     /// Rolling minima the relative signals are scored against.
     baselines: Baselines,
     /// One refresh interval, µs. `None` = the 120 Hz [`ENCODE_RISE_US`] defaults.
@@ -297,13 +275,8 @@ pub(crate) struct BitrateController {
     /// A share above this session's ceiling owes the link cap one early step,
     /// taken at the first window that leaves a delay to judge it against.
     share_lift: bool,
-    /// Last [`request`](Self::request). Taken (not kept) by the ack, so one
-    /// request is judged at most once.
-    pub(super) last_requested_kbps: Option<u32>,
-    /// Two identical short acks latch [`host_cap_kbps`](Self::host_cap_kbps).
-    /// One can be a failed rebuild keeping the old rate.
-    short_ack_kbps: u32,
-    short_acks: u32,
+    /// The asks the host has not answered, and its short answers.
+    pub(super) acks: AckTracker,
     /// Two consecutive decode-driven backoffs at a similar rate. Without it a
     /// decoder knee below the link ceiling is a 30–60 s sawtooth.
     pub(super) decode_cap: LearnedCap,
@@ -332,10 +305,6 @@ pub(crate) struct BitrateController {
     bad_windows: u32,
     clean_windows: u32,
     last_change: Option<Instant>,
-    /// Reaching [`MAX_UNACKED`] holds the controller until an answer lands.
-    unacked: u32,
-    /// When the oldest ask still unanswered went out.
-    first_unacked: Option<Instant>,
     /// Last ceiling-clamp target asked (`0` = none). Asked once per distinct
     /// target: a host that answers higher cannot go there.
     ceiling_ask_kbps: u32,
@@ -369,23 +338,15 @@ impl BitrateController {
             rate_verdict: false,
             rearm_windows: 0,
             link_verdict: false,
-            drain_windows: 0,
-            drain_ref_us: 0,
-            drain_suppressed: 0,
+            drain: Drain::default(),
             blip_hold: 0,
             link_cap: LearnedCap::new(),
             link_mark_kbps: 0,
-            delivery_sum_kbps: 0,
-            delivery_windows: 0,
-            delivery_frames: 0,
-            frames_norm: 0,
+            norms: RateNorms::default(),
             link_cap_measured: false,
             link_evidence: false,
             link_lifted: false,
             lift: None,
-            delay_sum_us: 0,
-            delay_windows: 0,
-            delay_norm_us: 0,
             baselines: Baselines::new(),
             frame_budget_us: None,
             encode_probe: None,
@@ -394,9 +355,7 @@ impl BitrateController {
             host_cap: LearnedCap::new(),
             share_cap: None,
             share_lift: false,
-            last_requested_kbps: None,
-            short_ack_kbps: 0,
-            short_acks: 0,
+            acks: AckTracker::default(),
             decode_cap: LearnedCap::new(),
             decode_backoff_kbps: 0,
             streak_decode_windows: 0,
@@ -411,8 +370,6 @@ impl BitrateController {
             bad_windows: 0,
             clean_windows: 0,
             last_change: None,
-            unacked: 0,
-            first_unacked: None,
             ceiling_ask_kbps: 0,
             last_reason: Reason::Clean,
             streak_cut: None,
@@ -708,18 +665,12 @@ impl BitrateController {
             if why == Some(AckReason::Cadence) {
                 // Not evidence about a rate: the encoder is behind, and the
                 // same fact the encode driver already handles. No cut, no cap.
-                self.last_requested_kbps = None;
-                self.short_acks = 0;
+                self.acks.last_requested_kbps = None;
+                self.acks.short_acks = 0;
                 self.hold_for_cadence(kbps);
-            } else if let Some(req) = self.last_requested_kbps.take() {
+            } else if let Some(req) = self.acks.last_requested_kbps.take() {
                 if kbps < req {
-                    if self.short_ack_kbps == kbps {
-                        self.short_acks += 1;
-                    } else {
-                        self.short_ack_kbps = kbps;
-                        self.short_acks = 1;
-                    }
-                    if self.short_acks >= 2 && self.host_cap.latch(kbps, self.floor_kbps) {
+                    if self.acks.on_short(kbps) && self.host_cap.latch(kbps, self.floor_kbps) {
                         tracing::info!(
                             cap_kbps = kbps,
                             reprobe_after_windows = self.host_cap.reprobe_after(),
@@ -728,7 +679,7 @@ impl BitrateController {
                         );
                     }
                 } else {
-                    self.short_acks = 0;
+                    self.acks.short_acks = 0;
                     // Granted at or above the learned cap: drop it. Crawling
                     // +12.5 % is the remaining cost of a transient latch.
                     if self.host_cap.kbps().is_some_and(|c| kbps >= c) {
@@ -751,7 +702,7 @@ impl BitrateController {
                 // The host moved the rate: a clamp, or a re-resolve nobody
                 // asked for. Either way what the old rate put on the wire
                 // says nothing about this one.
-                self.forget_rate_norms();
+                self.norms.forget();
             }
             self.current_kbps = kbps;
             // Unsolicited `BitrateChanged` can sit above our ceiling (host
@@ -759,7 +710,7 @@ impl BitrateController {
             // still binds. Without this, the step-down drags the host back.
             self.raise_ceiling(kbps);
         }
-        self.unacked = 0;
+        self.acks.unacked = 0;
     }
 
     /// The host divided a path this session shares with another
@@ -771,9 +722,9 @@ impl BitrateController {
     /// the host has already applied, so it is the rate now — reading it as a
     /// short ack instead would latch a host cap off the host's own clamp.
     fn on_share(&mut self, kbps: u32) {
-        self.unacked = 0;
-        self.last_requested_kbps = None;
-        self.short_acks = 0;
+        self.acks.unacked = 0;
+        self.acks.last_requested_kbps = None;
+        self.acks.short_acks = 0;
         // Whatever the overlay was naming, it is not what moved the rate now.
         // A share has no cause among the five the wire carries, and showing
         // the last link fault instead would be a lie.
@@ -789,7 +740,7 @@ impl BitrateController {
             self.current_kbps = kbps;
             // The host moved the rate to divide the path. What the old rate
             // put on the wire, and the delay behind it, are not this one's.
-            self.forget_rate_norms();
+            self.norms.forget();
         }
         // A share above this session's ceiling is the host saying the path has
         // room, not that this session's wall was a sibling's queue: one
@@ -809,8 +760,8 @@ impl BitrateController {
     /// CBR). Nothing to control, so retire quietly — an unanswered host is
     /// already retired the same way.
     fn on_pinned(&mut self, kbps: u32) {
-        self.last_requested_kbps = None;
-        self.unacked = 0;
+        self.acks.last_requested_kbps = None;
+        self.acks.unacked = 0;
         if kbps > 0 {
             self.current_kbps = kbps;
         }
@@ -849,7 +800,7 @@ impl BitrateController {
     /// throughput re-earns.
     pub(crate) fn on_mode_switch(&mut self) {
         self.host_cap.drop_cap();
-        self.short_acks = 0;
+        self.acks.short_acks = 0;
         self.decode_cap.drop_cap();
         self.decode_backoff_kbps = 0;
         self.streak_decode_windows = 0;
@@ -865,8 +816,8 @@ impl BitrateController {
         self.proven.clear();
         self.idle_windows = 0;
         // A frame of the new mode is a different size on the wire.
-        self.forget_rate_norms();
-        self.frames_norm = 0;
+        self.norms.forget();
+        self.norms.frames_norm = 0;
     }
 
     /// Decide whether this 750 ms window should ask for a new encoder rate.
@@ -879,17 +830,17 @@ impl BitrateController {
         if !self.enabled {
             return None;
         }
-        if self.unacked >= MAX_UNACKED {
+        if self.acks.unacked >= MAX_UNACKED {
             // No new ask until an answer lands; an older host logs every
             // unknown message. Silence past the give-up is that older host.
-            let oldest = self.first_unacked.unwrap_or(w.now);
+            let oldest = self.acks.first_unacked.unwrap_or(w.now);
             if w.now.duration_since(oldest) >= ACK_GIVE_UP {
                 self.enabled = false;
                 tracing::info!("adaptive bitrate off — host never acked a SetBitrate (older host)");
             }
             return None;
         }
-        let draining = self.note_drain(w);
+        let draining = self.drain.note(w);
         self.blip_hold = self.blip_hold.saturating_sub(1);
         let v = self.baselines.score(
             w,
@@ -900,7 +851,7 @@ impl BitrateController {
             draining,
             self.link_vouches_for(w),
             self.lift_probing(),
-            self.source_went_still(w),
+            self.norms.went_still(w),
         );
         self.last_reason = v.reason;
         self.note_activity(w.activity, v.quiet);
@@ -931,7 +882,7 @@ impl BitrateController {
             // keyframe recovery answer them as always. The host encoder's own
             // verdict is not the link's and is never guarded.
             if draining && !encode_named(w, &v) {
-                self.drain_suppressed += 1;
+                self.drain.suppressed += 1;
                 self.bad_windows = 0;
                 self.streak_decode_windows = 0;
                 return None;
@@ -1080,67 +1031,6 @@ impl BitrateController {
             && !self.short_of_offered(w, false)
     }
 
-    /// Forget what this rate looked like, on the wire and in the delay.
-    ///
-    /// Both norms are only true of the rate they were taken at: the parity
-    /// floor, the content's fill and the FEC share move with the rate, and so
-    /// does the queue behind it. The delay's last value is kept anyway: the
-    /// drain guard needs a mark to wait for.
-    fn forget_rate_norms(&mut self) {
-        if self.delivery_windows >= DELIVERY_REF_WINDOWS {
-            self.frames_norm = self.delivery_frames / u64::from(self.delivery_windows);
-        }
-        self.delivery_sum_kbps = 0;
-        self.delivery_windows = 0;
-        self.delivery_frames = 0;
-        if self.delay_windows > 0 {
-            self.delay_norm_us = self.delay_sum_us / i64::from(self.delay_windows);
-        }
-        self.delay_sum_us = 0;
-        self.delay_windows = 0;
-    }
-
-    /// What clean windows at this rate have been delivering, or `None` until
-    /// there are enough of them to mean anything.
-    fn delivery_reference(&self) -> Option<u32> {
-        (self.delivery_windows >= DELIVERY_REF_WINDOWS)
-            .then(|| (self.delivery_sum_kbps / u64::from(self.delivery_windows)) as u32)
-    }
-
-    /// One clean window's delivered wire rate. Stillness teaches nothing: a
-    /// repeat-marked, empty or still window is not this rate's norm, which is
-    /// the same exclusion the climb makes.
-    fn note_delivery(&mut self, w: &WindowSample) {
-        if w.activity.quiet() || self.source_went_still(w) {
-            return;
-        }
-        self.delivery_sum_kbps += u64::from(w.actual_kbps);
-        self.delivery_windows += 1;
-        if let WindowActivity::Active(n) = w.activity {
-            self.delivery_frames += u64::from(n);
-        }
-        if let Some(d) = w.delay {
-            self.delay_sum_us += d.mean_us;
-            self.delay_windows += 1;
-        }
-    }
-
-    /// Did the source produce under a quarter of the frames it was last seen
-    /// producing? Lost frames count as produced: the link, not the source,
-    /// took them. A source never seen busy is never still — the first window
-    /// of video is partial, not quiet.
-    fn source_went_still(&self, w: &WindowSample) -> bool {
-        let WindowActivity::Active(n) = w.activity else {
-            return false;
-        };
-        let norm = if self.delivery_windows >= DELIVERY_REF_WINDOWS {
-            self.delivery_frames / u64::from(self.delivery_windows)
-        } else {
-            self.frames_norm
-        };
-        (u64::from(n) + w.dropped) * STILL_FRAMES_DIV < norm
-    }
-
     /// Did the link hand over less than the rate it was running at?
     ///
     /// The climb's own bar, prorated by the frames that arrived: content that
@@ -1148,10 +1038,10 @@ impl BitrateController {
     /// as one would land the rate on a still picture. A source that went still
     /// is never short unless a queue is holding its frames.
     fn short_of_offered(&self, w: &WindowSample, owd_bad: bool) -> bool {
-        if !owd_bad && self.source_went_still(w) {
+        if !owd_bad && self.norms.went_still(w) {
             return false;
         }
-        if let Some(reference) = self.delivery_reference() {
+        if let Some(reference) = self.norms.delivery_reference() {
             return u64::from(w.actual_kbps) * 100
                 < u64::from(reference) * u64::from(DELIVERY_SHORT_PCT);
         }
@@ -1259,63 +1149,9 @@ impl BitrateController {
     /// back to its cap has no norm of its own when the next cut lands, and a
     /// guard with no mark to wait for spends its whole budget.
     fn arm_drain(&mut self) {
-        self.drain_windows = LINK_DRAIN_WINDOWS;
-        self.drain_ref_us = if self.delay_windows > 0 {
-            self.delay_sum_us / i64::from(self.delay_windows)
-        } else {
-            self.delay_norm_us
-        };
-        self.drain_suppressed = 0;
-    }
-
-    /// Is this window the last link-attributed cut draining the queue it
-    /// caused?
-    ///
-    /// The queue is the measure, not one window's slope: a queue still filling
-    /// reads as rising, and standing down there is what turned one cut into
-    /// four. The guard ends when the delay is back where clean windows had it
-    /// before the cut, or when its budget runs out — after that the next cut
-    /// is an ordinary one.
-    fn note_drain(&mut self, w: &WindowSample) -> bool {
-        if self.drain_windows == 0 {
-            return false;
-        }
-        let delay_us = w.delay.map_or(-1, |d| d.mean_us);
-        // A queue that is not emptying while frames are still being lost is
-        // not this cut's tail — the rate is over the wall again, or still.
-        // Damage on a falling delay is that tail, whatever form it takes.
-        let over_again = (w.dropped > 0 || w.loss_ppm >= HEAVY_LOSS_PPM)
-            && w.delay.is_none_or(|d| d.rise_us > -DRAIN_FALL_US);
-        if over_again
-            || (self.drain_ref_us > 0 && w.delay.is_some_and(|d| d.mean_us <= self.drain_ref_us))
-        {
-            self.end_drain(delay_us, !over_again);
-            return false;
-        }
-        self.drain_windows -= 1;
-        if self.drain_windows == 0 {
-            self.end_drain(delay_us, false);
-        } else {
-            tracing::debug!(
-                windows_left = self.drain_windows,
-                delay_us,
-                reference_us = self.drain_ref_us,
-                "adaptive bitrate: the queue the last cut caused is still emptying"
-            );
-        }
-        true
-    }
-
-    /// The guard is over, and says what it kept off the rate.
-    fn end_drain(&mut self, delay_us: i64, drained: bool) {
-        self.drain_windows = 0;
-        tracing::info!(
-            suppressed_windows = std::mem::take(&mut self.drain_suppressed),
-            delay_us,
-            reference_us = self.drain_ref_us,
-            drained,
-            "adaptive bitrate: the last cut's queue is done — the link is judged again"
-        );
+        let norms = &self.norms;
+        self.drain
+            .arm(norms.delay_mean_us().unwrap_or(norms.delay_norm_us));
     }
 
     /// The rate a cut is measured from: the ask still in flight, when there is
@@ -1327,7 +1163,8 @@ impl BitrateController {
     /// times took a session to 2 464 kbps where one cut would have left it at
     /// about 2 480.
     fn cut_base_kbps(&self) -> u32 {
-        self.last_requested_kbps
+        self.acks
+            .last_requested_kbps
             .map_or(self.current_kbps, |asked| asked.min(self.current_kbps))
     }
 
@@ -1342,7 +1179,7 @@ impl BitrateController {
         // and the parity floor puts 210 % on the wire at the bottom of the
         // range; dividing by the norm cancels both, and what is left is the
         // link's share of the fall.
-        let target = match self.delivery_reference() {
+        let target = match self.norms.delivery_reference() {
             Some(reference) if reference > 0 => {
                 (u64::from(delivered_kbps) * u64::from(base) / u64::from(reference)) as u32
             }
@@ -1384,7 +1221,7 @@ impl BitrateController {
         }
         if !v.bad {
             self.proven.note(w.actual_kbps);
-            self.note_delivery(w);
+            self.norms.note(w);
         }
         if v.bad {
             // What the rate is the lever for, read before the streaks move:
@@ -1495,7 +1332,7 @@ impl BitrateController {
         // left a delay to freeze. Taken any sooner it is a commitment, and
         // the host's evidence is about the path, not about this session's
         // own air — so it is the one lift that must not go unjudged.
-        if self.share_lift && self.delay_windows > 0 {
+        if self.share_lift && self.norms.delay_mean_us().is_some() {
             self.share_lift = false;
             self.link_cap.lift_now();
         }
@@ -1553,9 +1390,9 @@ impl BitrateController {
                 // not against a baseline that will learn the rise. No delay
                 // at this rate is no reference: the ordinary verdict keeps
                 // the lift, as it did before there was a probe.
-                self.lift = (self.delay_windows > 0).then(|| LiftProbe {
+                self.lift = self.norms.delay_mean_us().map(|ref_us| LiftProbe {
                     cap_kbps: from,
-                    ref_us: self.delay_sum_us / i64::from(self.delay_windows),
+                    ref_us,
                     clean: 0,
                     over: 0,
                     rising: 0,
@@ -1861,15 +1698,12 @@ impl BitrateController {
         None
     }
 
+    /// Ask the host for `kbps`. Ack is authoritative: a lost request
+    /// recomputes from the same base.
     fn request(&mut self, kbps: u32, now: Instant) -> Option<u32> {
-        self.forget_rate_norms();
+        self.norms.forget();
         self.last_change = Some(now);
-        if self.unacked == 0 {
-            self.first_unacked = Some(now);
-        }
-        self.unacked += 1;
-        self.last_requested_kbps = Some(kbps);
-        // Ack is authoritative. A lost request recomputes from the same base.
+        self.acks.on_request(kbps, now);
         Some(kbps)
     }
 
@@ -1878,8 +1712,210 @@ impl BitrateController {
     /// retires the controller. Also keeps a later unsolicited ack from being
     /// judged short against a rate we never asked for.
     pub(crate) fn on_request_dropped(&mut self) {
+        self.acks.on_dropped();
+    }
+}
+
+/// The guard that holds a second cut while the last link-attributed cut's own
+/// queue drains.
+#[derive(Default)]
+struct Drain {
+    /// Windows left in which the damage is that queue emptying. `0` = nothing
+    /// to drain.
+    windows: u32,
+    /// Delay level the guard is waiting to see again: what clean windows read
+    /// before the cut. `0` = none was known, so the budget ends the guard.
+    ref_us: i64,
+    /// Windows the guard kept a cut off, for the line it logs when it ends.
+    suppressed: u32,
+}
+
+impl Drain {
+    fn arm(&mut self, ref_us: i64) {
+        self.windows = LINK_DRAIN_WINDOWS;
+        self.ref_us = ref_us;
+        self.suppressed = 0;
+    }
+
+    /// Is this window the last link-attributed cut draining the queue it
+    /// caused?
+    ///
+    /// The queue is the measure, not one window's slope: a queue still filling
+    /// reads as rising, and standing down there is what turned one cut into
+    /// four. The guard ends when the delay is back where clean windows had it
+    /// before the cut, or when its budget runs out — after that the next cut
+    /// is an ordinary one.
+    fn note(&mut self, w: &WindowSample) -> bool {
+        if self.windows == 0 {
+            return false;
+        }
+        let delay_us = w.delay.map_or(-1, |d| d.mean_us);
+        // A queue that is not emptying while frames are still being lost is
+        // not this cut's tail — the rate is over the wall again, or still.
+        // Damage on a falling delay is that tail, whatever form it takes.
+        let over_again = (w.dropped > 0 || w.loss_ppm >= HEAVY_LOSS_PPM)
+            && w.delay.is_none_or(|d| d.rise_us > -DRAIN_FALL_US);
+        if over_again || (self.ref_us > 0 && w.delay.is_some_and(|d| d.mean_us <= self.ref_us)) {
+            self.end(delay_us, !over_again);
+            return false;
+        }
+        self.windows -= 1;
+        if self.windows == 0 {
+            self.end(delay_us, false);
+        } else {
+            tracing::debug!(
+                windows_left = self.windows,
+                delay_us,
+                reference_us = self.ref_us,
+                "adaptive bitrate: the queue the last cut caused is still emptying"
+            );
+        }
+        true
+    }
+
+    /// The guard is over, and says what it kept off the rate.
+    fn end(&mut self, delay_us: i64, drained: bool) {
+        self.windows = 0;
+        tracing::info!(
+            suppressed_windows = std::mem::take(&mut self.suppressed),
+            delay_us,
+            reference_us = self.ref_us,
+            drained,
+            "adaptive bitrate: the last cut's queue is done — the link is judged again"
+        );
+    }
+}
+
+/// What clean windows at the current rate deliver, and the delay they sit at.
+#[derive(Default)]
+struct RateNorms {
+    /// Delivered wire rate: the sum and the count, reset on every rate change
+    /// because the parity floor and the content's fill both move with the rate.
+    delivery_sum_kbps: u64,
+    delivery_windows: u32,
+    /// New-content frames those windows carried, summed beside them.
+    delivery_frames: u64,
+    /// Frames a window carried the last time a norm formed (`0` = never).
+    /// Kept across rate moves: how often the source draws is not the rate's.
+    frames_norm: u64,
+    /// Shard delay: the sum and the count, the reference a lift is frozen
+    /// against. Dropped with the delivery norm.
+    delay_sum_us: i64,
+    delay_windows: u32,
+    /// The last delay norm, kept when a rate move drops the one above. A
+    /// climb step or a cut changes the queue's occupancy, not the path's own
+    /// delay, so this is still the mark a drained queue comes back to.
+    delay_norm_us: i64,
+}
+
+impl RateNorms {
+    /// Forget what this rate looked like, on the wire and in the delay.
+    ///
+    /// Both norms are only true of the rate they were taken at: the parity
+    /// floor, the content's fill and the FEC share move with the rate, and so
+    /// does the queue behind it. The delay's last value is kept anyway: the
+    /// drain guard needs a mark to wait for.
+    fn forget(&mut self) {
+        if self.delivery_windows >= DELIVERY_REF_WINDOWS {
+            self.frames_norm = self.delivery_frames / u64::from(self.delivery_windows);
+        }
+        self.delivery_sum_kbps = 0;
+        self.delivery_windows = 0;
+        self.delivery_frames = 0;
+        if let Some(mean) = self.delay_mean_us() {
+            self.delay_norm_us = mean;
+        }
+        self.delay_sum_us = 0;
+        self.delay_windows = 0;
+    }
+
+    /// What clean windows at this rate have been delivering, or `None` until
+    /// there are enough of them to mean anything.
+    fn delivery_reference(&self) -> Option<u32> {
+        (self.delivery_windows >= DELIVERY_REF_WINDOWS)
+            .then(|| (self.delivery_sum_kbps / u64::from(self.delivery_windows)) as u32)
+    }
+
+    /// Mean shard delay of this rate's clean windows; `None` before the first.
+    fn delay_mean_us(&self) -> Option<i64> {
+        (self.delay_windows > 0).then(|| self.delay_sum_us / i64::from(self.delay_windows))
+    }
+
+    /// One clean window's delivered wire rate. Stillness teaches nothing: a
+    /// repeat-marked, empty or still window is not this rate's norm, which is
+    /// the same exclusion the climb makes.
+    fn note(&mut self, w: &WindowSample) {
+        if w.activity.quiet() || self.went_still(w) {
+            return;
+        }
+        self.delivery_sum_kbps += u64::from(w.actual_kbps);
+        self.delivery_windows += 1;
+        if let WindowActivity::Active(n) = w.activity {
+            self.delivery_frames += u64::from(n);
+        }
+        if let Some(d) = w.delay {
+            self.delay_sum_us += d.mean_us;
+            self.delay_windows += 1;
+        }
+    }
+
+    /// Did the source produce under a quarter of the frames it was last seen
+    /// producing? Lost frames count as produced: the link, not the source,
+    /// took them. A source never seen busy is never still — the first window
+    /// of video is partial, not quiet.
+    fn went_still(&self, w: &WindowSample) -> bool {
+        let WindowActivity::Active(n) = w.activity else {
+            return false;
+        };
+        let norm = if self.delivery_windows >= DELIVERY_REF_WINDOWS {
+            self.delivery_frames / u64::from(self.delivery_windows)
+        } else {
+            self.frames_norm
+        };
+        (u64::from(n) + w.dropped) * STILL_FRAMES_DIV < norm
+    }
+}
+
+/// The asks the host has not answered, and what its short answers taught.
+#[derive(Default)]
+pub(super) struct AckTracker {
+    /// Last [`request`](BitrateController::request). Taken (not kept) by the
+    /// ack, so one request is judged at most once.
+    pub(super) last_requested_kbps: Option<u32>,
+    /// Two identical short acks latch the host cap. One can be a failed
+    /// rebuild keeping the old rate.
+    short_ack_kbps: u32,
+    short_acks: u32,
+    /// Reaching [`MAX_UNACKED`] holds the controller until an answer lands.
+    unacked: u32,
+    /// When the oldest ask still unanswered went out.
+    first_unacked: Option<Instant>,
+}
+
+impl AckTracker {
+    fn on_request(&mut self, kbps: u32, now: Instant) {
+        if self.unacked == 0 {
+            self.first_unacked = Some(now);
+        }
+        self.unacked += 1;
+        self.last_requested_kbps = Some(kbps);
+    }
+
+    fn on_dropped(&mut self) {
         self.unacked = self.unacked.saturating_sub(1);
         self.last_requested_kbps = None;
+    }
+
+    /// The host answered the ask in flight with less. `true` = the second
+    /// identical short answer in a row.
+    fn on_short(&mut self, kbps: u32) -> bool {
+        if self.short_ack_kbps == kbps {
+            self.short_acks += 1;
+        } else {
+            self.short_ack_kbps = kbps;
+            self.short_acks = 1;
+        }
+        self.short_acks >= 2
     }
 }
 
@@ -1988,10 +2024,10 @@ mod tests {
                 ..WindowSample::at(ticks(start, i))
             });
         }
-        assert_eq!(c.delivery_reference(), Some(15_600));
+        assert_eq!(c.norms.delivery_reference(), Some(15_600));
         c.on_ack(40_000, None);
         assert_eq!(
-            c.delivery_reference(),
+            c.norms.delivery_reference(),
             None,
             "a different rate, a different wire"
         );
@@ -2439,7 +2475,7 @@ mod tests {
             })
             .expect("the room is there, so the session climbs");
         c.on_ack(up, None);
-        assert_eq!(c.delay_windows, 0, "the step forgot the rate's norms");
+        assert_eq!(c.norms.delay_windows, 0, "the step forgot the rate's norms");
         // The link answers the step: the queue fills, then it swallows frames.
         for dropped in [0, 4] {
             t += 1;
@@ -2451,11 +2487,11 @@ mod tests {
                 ..WindowSample::at(ticks(start, t))
             });
         }
-        assert!(c.drain_windows > 0, "a link cut arms the guard");
-        assert_eq!(c.drain_ref_us, 10_000, "the norm the step left behind");
+        assert!(c.drain.windows > 0, "a link cut arms the guard");
+        assert_eq!(c.drain.ref_us, 10_000, "the norm the step left behind");
         t += 1;
         assert!(
-            !c.note_drain(&WindowSample {
+            !c.drain.note(&WindowSample {
                 delay: Some(trend(10_000, -20_000)),
                 ..WindowSample::at(ticks(start, t))
             }),
@@ -2473,31 +2509,31 @@ mod tests {
             delay: Some(trend(mean_us, rise_us)),
             ..WindowSample::at(now)
         };
-        c.drain_windows = LINK_DRAIN_WINDOWS;
-        c.drain_ref_us = 10_000;
+        c.drain.windows = LINK_DRAIN_WINDOWS;
+        c.drain.ref_us = 10_000;
         for _ in 0..LINK_DRAIN_WINDOWS {
-            assert!(c.note_drain(&at(300_000, 40_000)), "still filling");
+            assert!(c.drain.note(&at(300_000, 40_000)), "still filling");
         }
-        assert!(!c.note_drain(&at(300_000, 40_000)), "budget spent");
+        assert!(!c.drain.note(&at(300_000, 40_000)), "budget spent");
 
-        c.drain_windows = LINK_DRAIN_WINDOWS;
+        c.drain.windows = LINK_DRAIN_WINDOWS;
         assert!(
-            !c.note_drain(&WindowSample {
+            !c.drain.note(&WindowSample {
                 dropped: 3,
                 ..at(300_000, 0)
             }),
             "a full queue still losing frames is the rate, not the tail"
         );
 
-        c.drain_windows = LINK_DRAIN_WINDOWS;
-        assert!(!c.note_drain(&at(9_000, 0)), "back where it was");
-        assert_eq!(c.drain_windows, 0, "and the guard is over");
+        c.drain.windows = LINK_DRAIN_WINDOWS;
+        assert!(!c.drain.note(&at(9_000, 0)), "back where it was");
+        assert_eq!(c.drain.windows, 0, "and the guard is over");
 
-        c.drain_windows = LINK_DRAIN_WINDOWS;
-        c.drain_ref_us = 0;
-        assert!(c.note_drain(&at(1_000, 0)), "no reference, only the budget");
+        c.drain.windows = LINK_DRAIN_WINDOWS;
+        c.drain.ref_us = 0;
+        assert!(c.drain.note(&at(1_000, 0)), "no reference, only the budget");
         assert!(
-            c.note_drain(&WindowSample::at(now)),
+            c.drain.note(&WindowSample::at(now)),
             "no delay reading is no evidence of draining"
         );
     }
@@ -2992,19 +3028,19 @@ mod tests {
                 ..WindowSample::at(ticks(start, i))
             });
         }
-        assert_eq!(c.delivery_reference(), Some(15_600));
+        assert_eq!(c.norms.delivery_reference(), Some(15_600));
         c.arm_drain();
         // An ask in flight, and a share arriving where its answer would.
-        c.last_requested_kbps = Some(18_000);
+        c.acks.last_requested_kbps = Some(18_000);
         c.on_ack(14_000, Some(AckReason::Governor));
         assert_eq!(
-            c.delivery_reference(),
+            c.norms.delivery_reference(),
             None,
             "a different rate, a different wire"
         );
         assert_eq!(c.cut_base_kbps(), 14_000, "no ask survives a share");
         assert_eq!(
-            (c.drain_windows, c.drain_ref_us),
+            (c.drain.windows, c.drain.ref_us),
             (LINK_DRAIN_WINDOWS, 10_000),
             "the guard keeps the delay it was armed on"
         );
