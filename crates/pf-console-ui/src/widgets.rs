@@ -9,8 +9,8 @@
 //! and a slip on one row does not blank the rest of the column.
 
 use crate::anim::{approach, entrances, springs, Entrance, EntranceAt, Spring, TRAY_C, TRAY_K};
+use crate::anim::{BUMP_C, BUMP_K, BUMP_V};
 use crate::el::{Axis, El, Id, Tree};
-use crate::library::{BUMP_C, BUMP_K, BUMP_V};
 use crate::pointer::{Pointer, PointerKind};
 use crate::theme::{accent, edge, fg, fill, stroke, Fonts, PanelStroke, W};
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
@@ -2489,7 +2489,7 @@ mod tests {
     /// picks them by index; the lit one is accent-filled. A handle shifts the label.
     #[test]
     fn trailing_buttons_are_hit_in_order_and_light_when_focused() {
-        crate::theme::set_ink(crate::theme::Ink::of(crate::library::palette("violet")));
+        crate::theme::set_ink(crate::theme::Ink::of(crate::palette::palette("violet")));
         let fonts = crate::theme::build_fonts().unwrap();
         let (w, h) = (900, 400);
         let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
@@ -2544,7 +2544,7 @@ mod tests {
     /// in the row band over the track counts as on it.
     #[test]
     fn slider_tracks_are_seekable_by_the_pointer() {
-        crate::theme::set_ink(crate::theme::Ink::of(crate::library::palette("violet")));
+        crate::theme::set_ink(crate::theme::Ink::of(crate::palette::palette("violet")));
         let fonts = crate::theme::build_fonts().unwrap();
         let (w, h) = (900, 300);
         let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
@@ -2575,7 +2575,7 @@ mod tests {
     /// beside the label without leaving the row.
     #[test]
     fn toggle_and_slider_rows_draw_their_controls() {
-        crate::theme::set_ink(crate::theme::Ink::of(crate::library::palette("violet")));
+        crate::theme::set_ink(crate::theme::Ink::of(crate::palette::palette("violet")));
         let fonts = crate::theme::build_fonts().unwrap();
         let (w, h) = (900, 600);
         let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();

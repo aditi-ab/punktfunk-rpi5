@@ -1,7 +1,7 @@
 //! Console-shell motion: springs for anything the user can retarget, timed
 //! choreography for fire-and-forget arrivals.
 //!
-//! [`Spring`] wraps `library::spring_advance`. Velocity carries across a
+//! [`Spring`] wraps [`spring_advance`]. Velocity carries across a
 //! retarget, so a Back mid-push turns the screen around where it is.
 //! [`SpringSpec`] and [`springs`] name a feel instead of a `k`/`c` pair.
 //!
@@ -9,7 +9,44 @@
 //! A screen holds one and asks it per item; there is no per-item state.
 //! Evidence: `spring_spec_matches_the_tray_constants`, `entrance_envelope`.
 
-use crate::library::spring_advance;
+// Semi-implicit Euler, not eased: velocity carries across retargets.
+/// Cursor chase: ζ ≈ 0.85 — settles in ~0.3 s with a whisker of overshoot.
+pub const SPRING_K: f64 = 200.0;
+pub const SPRING_C: f64 = 24.0;
+/// Boundary recoil: soft and underdamped (ζ ≈ 0.4) — a rubbery bounce, two visible
+/// wobbles, ~0.5 s to rest.
+pub const BUMP_K: f64 = 260.0;
+pub const BUMP_C: f64 = 13.0;
+
+fn spring_step(pos: f64, vel: f64, target: f64, k: f64, c: f64, dt: f64) -> (f64, f64) {
+    let vel = vel + (k * (target - pos) - c * vel) * dt;
+    (pos + vel * dt, vel)
+}
+
+/// One frame of a damped spring, in ≤ 8 ms substeps so a stalled frame stays inside the integrator's stability bound.
+pub fn spring_advance(
+    mut pos: f64,
+    mut vel: f64,
+    target: f64,
+    k: f64,
+    c: f64,
+    dt: f64,
+) -> (f64, f64) {
+    let n = (dt / 0.008).ceil().max(1.0) as usize;
+    let h = dt / n as f64;
+    for _ in 0..n {
+        (pos, vel) = spring_step(pos, vel, target, k, c, h);
+    }
+    (pos, vel)
+}
+
+/// Refused-move recoil: the kick against the push, design units/s. A velocity, not a
+/// displacement, so the list eases out and springs back rather than jumping.
+pub const BUMP_V: f64 = 380.0;
+/// Mount entrance ([`Entrance`]): arrival scale, rise (design units), yaw. Shared with the home carousel.
+pub const ENTER_SCALE: f64 = 0.96;
+pub const ENTER_RISE: f64 = 12.0;
+pub const ENTER_TURN_DEG: f64 = 62.0;
 
 pub fn ease_out_cubic(t: f64) -> f64 {
     let u = 1.0 - t.clamp(0.0, 1.0);
@@ -39,7 +76,7 @@ impl SpringSpec {
     }
 }
 
-/// Shell springs. Carousel pairs (`library::SPRING_K/C`, `BUMP_K/C`) stay raw:
+/// Shell springs. Carousel pairs ([`SPRING_K`]/[`SPRING_C`], [`BUMP_K`]/[`BUMP_C`]) stay raw:
 /// they are shared with the GTK launcher, and wrapping them as specs invites a
 /// tidy-up that retunes coverflow on both surfaces.
 pub mod springs {
@@ -247,6 +284,21 @@ impl Entrance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stay finite through a stalled frame (0.05 s).
+    #[test]
+    fn springs_converge() {
+        let (mut pos, mut vel) = (0.0, 0.0);
+        for _ in 0..120 {
+            (pos, vel) = spring_advance(pos, vel, 3.0, SPRING_K, SPRING_C, 1.0 / 60.0);
+        }
+        assert!((pos - 3.0).abs() < 0.01, "{pos}");
+        let (p, v) = spring_advance(0.0, 0.0, 1.0, BUMP_K, BUMP_C, 0.05);
+        assert!(
+            p.is_finite() && v.is_finite() && p > 0.0 && p < 2.0,
+            "{p}/{v}"
+        );
+    }
 
     #[test]
     fn ease_out_cubic_shape() {

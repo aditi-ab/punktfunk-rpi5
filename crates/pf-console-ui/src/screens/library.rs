@@ -11,14 +11,21 @@
 //! Entrance waits for neighbourhood art or 400 ms. Pin with the tests in this module.
 
 use crate::anim::{entrances, Entrance, EntranceAt, Spring};
+use crate::anim::{
+    BUMP_C, BUMP_K, BUMP_V, ENTER_RISE, ENTER_SCALE, ENTER_TURN_DEG, SPRING_C, SPRING_K,
+};
+use crate::coverflow::{
+    project, shelf_matrix, POSTER_H, RECEDE_FADE, RECEDE_SCALE, ROTATE_DEG, SHELF_CORNER,
+    SHELF_COVER_MIN, SHELF_EYE, SHELF_SPACING,
+};
 use crate::el::{Axis, El, Id, Tree};
 use crate::glyphs::{Hint, HintKey};
+use crate::grid::{
+    grid_col_hint, grid_step, step_cursor, GridDir, GridShape, StepResult, GRID_GAP, GRID_H,
+    GRID_W, JUMP,
+};
 use crate::library::{
-    grid_col_hint, grid_step, initials, project, shelf_matrix, step_cursor, store_label, GridDir,
-    GridShape, LibraryGame, LibraryPhase, LibraryShared, LibraryView, Stale, StepResult, BUMP_C,
-    BUMP_K, BUMP_V, ENTER_RISE, ENTER_SCALE, ENTER_TURN_DEG, GRID_GAP, GRID_H, GRID_W, JUMP,
-    POSTER_H, RECEDE_FADE, RECEDE_SCALE, ROTATE_DEG, SHELF_CORNER, SHELF_COVER_MIN, SHELF_EYE,
-    SHELF_SPACING, SPRING_C, SPRING_K,
+    initials, store_label, LibraryGame, LibraryPhase, LibraryShared, LibraryView, Stale,
 };
 use crate::model::{ConsoleCmd, HostRow};
 use crate::pointer::{Pointer, PointerKind};
@@ -2065,7 +2072,7 @@ struct ShelfCard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::library::POSTER_W;
+    use crate::coverflow::POSTER_W;
     use crate::screens::Screen;
     use crate::theme::{contrast, over};
 
@@ -2644,7 +2651,7 @@ mod tests {
     /// Coverless monogram vs face must contrast on every palette. Side cards overlap: alpha leaks.
     #[test]
     fn a_coverless_card_reads_on_every_palette() {
-        for p in &crate::library::PALETTES {
+        for p in &crate::palette::PALETTES {
             crate::theme::set_ink(crate::theme::Ink::of(p));
             for launcher in [false, true] {
                 let face = placeholder_face(launcher);
@@ -2653,7 +2660,7 @@ mod tests {
                 assert!(c > 3.0, "the monogram is unreadable on {}: {c:.2}:1", p.id);
             }
         }
-        crate::theme::set_ink(crate::theme::Ink::of(crate::library::palette("violet")));
+        crate::theme::set_ink(crate::theme::Ink::of(crate::palette::palette("violet")));
     }
 
     /// Stamp after draw. Arrival-order LRU drops the neighbourhood the cursor is in.

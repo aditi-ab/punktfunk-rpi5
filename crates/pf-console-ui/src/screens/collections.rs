@@ -422,7 +422,7 @@ mod tests {
     /// `fg()` is itself near-black.
     #[test]
     fn the_monogram_reads_on_every_palette() {
-        for p in &crate::library::PALETTES {
+        for p in &crate::palette::PALETTES {
             crate::theme::set_ink(crate::theme::Ink::of(p));
             let ground = Color4f::new(p.ground.0 as f32, p.ground.1 as f32, p.ground.2 as f32, 1.0);
             // Tile accent over the field, then the badge face, then the glyph. Glass
@@ -434,6 +434,6 @@ mod tests {
             let c = contrast(glyph, face);
             assert!(c > 3.0, "the monogram is unreadable on {}: {c:.2}:1", p.id);
         }
-        crate::theme::set_ink(crate::theme::Ink::of(crate::library::palette("violet")));
+        crate::theme::set_ink(crate::theme::Ink::of(crate::palette::palette("violet")));
     }
 }

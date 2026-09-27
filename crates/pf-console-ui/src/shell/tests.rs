@@ -52,8 +52,8 @@ fn the_motion_table_matches_the_shared_vectors() {
     assert_eq!(TAB_SLIDE, num("tab", "slide_fraction"));
     let e = crate::anim::entrances::CARDS;
     assert_eq!(e.stagger, num("entrance", "stagger_s"));
-    assert_eq!(crate::library::ENTER_SCALE, num("entrance", "scale"));
-    assert_eq!(crate::library::ENTER_RISE, num("entrance", "rise_dp"));
+    assert_eq!(crate::anim::ENTER_SCALE, num("entrance", "scale"));
+    assert_eq!(crate::anim::ENTER_RISE, num("entrance", "rise_dp"));
 }
 
 /// Springs are integrator-dependent: two runtimes that honour `response`/`damping` agree
@@ -1421,7 +1421,7 @@ fn toast_kinds_are_visually_distinct() {
     assert_ne!(rgb(ok_c), rgb(err_c));
 
     // Green-accented palette: Success follows it, Error must not.
-    crate::theme::set_ink(crate::theme::Ink::of(crate::library::palette("jade")));
+    crate::theme::set_ink(crate::theme::Ink::of(crate::palette::palette("jade")));
     let (ok_jade, _) = ToastKind::Success.look();
     let (err_jade, _) = ToastKind::Error.look();
     assert_ne!(

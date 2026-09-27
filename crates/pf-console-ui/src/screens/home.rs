@@ -16,11 +16,10 @@
 //! module: key-follow, confirm routing, verbs, pinned-card preset, trailing Add Host.
 
 use crate::anim::{entrances, Entrance, EntranceAt, Spring};
+use crate::anim::{BUMP_C, BUMP_K, BUMP_V, ENTER_RISE, ENTER_SCALE, SPRING_C, SPRING_K};
 use crate::el::{Axis, El, Group, Id, Tree};
 use crate::glyphs::{Hint, HintKey};
-use crate::library::{
-    step_cursor, StepResult, BUMP_C, BUMP_K, BUMP_V, ENTER_RISE, ENTER_SCALE, SPRING_C, SPRING_K,
-};
+use crate::grid::{step_cursor, StepResult};
 use crate::model::{ConsoleCmd, HostRow};
 use crate::pointer::{Pointer, PointerKind};
 use crate::screens::card_menu::CardMenu;

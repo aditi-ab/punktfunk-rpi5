@@ -39,8 +39,10 @@ pub mod bridge;
 // than growing a second order. Aliased here because every screen names `crate::collate`.
 pub(crate) use pf_client_core::collate;
 pub mod console;
+pub mod coverflow;
 pub mod el;
 pub mod glyphs;
+pub mod grid;
 pub mod icons;
 pub mod input;
 pub mod launcher_icons;
@@ -48,6 +50,7 @@ pub mod library;
 pub mod model;
 pub mod os_marks;
 pub mod os_theme;
+pub mod palette;
 pub mod platform;
 pub mod pointer;
 // In-stream ring: the desktop overlay hosts it, and so does a GL shell (webOS) through

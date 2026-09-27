@@ -9,12 +9,11 @@
 
 use crate::anim::{springs, Spring};
 use crate::glyphs::GlyphStyle;
-use crate::library::{
-    field_camera, field_motion, field_sksl, palette, LibraryShared, VIOLET_FIELD,
-};
+use crate::library::LibraryShared;
 use crate::model::{
     ConsoleBus, ConsoleCmd, ConsoleShared, HostRow, PairPhase, SpeedPhase, SpeedStatus, WakeStatus,
 };
+use crate::palette::{field_camera, field_motion, field_sksl, palette, VIOLET_FIELD};
 use crate::platform::Platform;
 #[cfg(test)]
 use crate::pointer::DRAG_TICK_DP;
