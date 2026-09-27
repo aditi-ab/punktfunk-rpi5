@@ -2330,11 +2330,18 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     {
                         st.hdr = d.color.is_pq();
                         st.hdr_untonemapped = false;
-                        match presenter.present(
-                            &window,
-                            FrameInput::Dmabuf(d),
-                            overlay_frame.as_ref(),
-                        ) {
+                        // The native lane first: the compositor takes the dma-buf itself.
+                        let d = match presenter.present_native(d, pts_ns, decoded_ns) {
+                            crate::wl_native::Outcome::Shown => None,
+                            crate::wl_native::Outcome::Declined(d) => Some(d),
+                        };
+                        match d.map_or(Ok(Presented::Shown), |d| {
+                            presenter.present(
+                                &window,
+                                FrameInput::Dmabuf(d),
+                                overlay_frame.as_ref(),
+                            )
+                        }) {
                             Ok(Presented::Shown) => {
                                 st.hw_fails = 0;
                                 true
@@ -2579,10 +2586,15 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     } else {
                         0
                     };
+                    #[cfg(target_os = "linux")]
+                    let native_zero_copy = presenter.take_native_zero_copy();
+                    #[cfg(not(target_os = "linux"))]
+                    let native_zero_copy = (0u32, 0u32);
                     tracing::info!(
                         smoothing = present.smoothing,
                         mode = present.mode,
                         vrr = present.vrr.label(),
+                        native_zero_copy = ?native_zero_copy,
                         replaced,
                         q_drop,
                         q_dry,

@@ -306,6 +306,11 @@ pub struct Presenter {
     video_fit: punktfunk_core::video_fit::VideoFit,
     /// Extent, frame size and draw path of the last logged placement.
     placement_logged: Option<(vk::Extent2D, u32, u32, &'static str)>,
+    /// Wayland lane that hands a dma-buf to the compositor as the window's own buffer.
+    #[cfg(target_os = "linux")]
+    native: Option<crate::wl_native::NativeLane>,
+    /// The last frame shown went through the native lane, not the swapchain.
+    native_last: bool,
 }
 
 impl Presenter {
@@ -338,10 +343,43 @@ impl Presenter {
         unsafe { self.device.device_wait_idle() }.ok();
     }
 
-    /// True when `VK_KHR_present_wait` drives the display stamp. The run loop then
-    /// defers e2e/display windows to [`Presenter::take_presented_samples`].
+    /// True when `VK_KHR_present_wait` or the native lane's presentation feedback drives
+    /// the display stamp. The run loop then defers e2e/display windows to
+    /// [`Presenter::take_presented_samples`].
     pub(crate) fn present_timing_active(&self) -> bool {
-        self.present_timer.is_some()
+        self.present_timer.is_some() || self.native_last
+    }
+
+    /// The native Wayland lane first: `Shown` when the compositor took the dma-buf as the
+    /// window's buffer, else the frame comes back for the swapchain path.
+    #[cfg(target_os = "linux")]
+    pub fn present_native(
+        &mut self,
+        d: pf_client_core::video::DmabufFrame,
+        pts_ns: u64,
+        decoded_ns: u64,
+    ) -> crate::wl_native::Outcome {
+        use crate::wl_native::Outcome;
+        let view = (self.extent.width, self.extent.height);
+        let Some(lane) = self.native.as_mut() else {
+            return Outcome::Declined(d);
+        };
+        if !lane.takes(&d, view, self.video_fit) {
+            return Outcome::Declined(d);
+        }
+        match lane.present(d, pts_ns, decoded_ns) {
+            Outcome::Shown => {
+                self.native_last = true;
+                Outcome::Shown
+            }
+            declined => declined,
+        }
+    }
+
+    /// (zero-copy, presented) the native lane counted since the last call.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn take_native_zero_copy(&mut self) -> (u32, u32) {
+        self.native.as_mut().map_or((0, 0), |l| l.take_zero_copy())
     }
 
     /// Claim the just-submitted present for on-glass timing. Call right after a
@@ -390,9 +428,13 @@ impl Presenter {
         )
     }
 
-    /// Active swapchain present mode for the stats overlay. Can differ from the request
-    /// when the surface does not offer it.
+    /// Active present path for the stats overlay: `native` while the compositor holds the
+    /// window's buffer, else the swapchain mode, which can differ from the request when the
+    /// surface does not offer it.
     pub(crate) fn present_mode_name(&self) -> &'static str {
+        if self.native_last {
+            return "native";
+        }
         match self.present_mode {
             vk::PresentModeKHR::MAILBOX => "mailbox",
             vk::PresentModeKHR::FIFO => "fifo",
@@ -427,11 +469,27 @@ impl Presenter {
         )
     }
 
-    pub(crate) fn take_presented_samples(&self) -> Vec<present_timing::PresentedSample> {
-        self.present_timer
+    pub(crate) fn take_presented_samples(&mut self) -> Vec<present_timing::PresentedSample> {
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        let mut out = self
+            .present_timer
             .as_ref()
             .map(|t| t.take_samples())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        #[cfg(target_os = "linux")]
+        if let Some(lane) = self.native.as_mut() {
+            out.extend(lane.take_samples().into_iter().map(|s| {
+                present_timing::PresentedSample {
+                    pts_ns: s.pts_ns,
+                    decoded_ns: s.decoded_ns,
+                    submitted_ns: s.submitted_ns,
+                    // No GPU work of ours on this lane: the whole latch is the compositor's.
+                    gpu_done_ns: s.submitted_ns,
+                    displayed_ns: s.displayed_ns,
+                }
+            }));
+        }
+        out
     }
 
     /// Device handles the overlay renders on. Valid for the presenter's lifetime; the

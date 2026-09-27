@@ -52,6 +52,8 @@ pub mod vk;
 pub mod wayland_scroll;
 #[cfg(windows)]
 mod win32;
+#[cfg(target_os = "linux")]
+pub mod wl_native;
 
 #[cfg(any(target_os = "linux", windows))]
 pub use run::{run_browse, run_session, ActionOutcome, Outcome, SessionOpts};

@@ -3377,11 +3377,13 @@ dependencies = [
  "pf-vkdecode",
  "pf-zerocopy",
  "punktfunk-core",
+ "rustix",
  "sdl3",
  "serde_json",
  "tracing",
  "wayland-backend",
  "wayland-client",
+ "wayland-protocols",
  "wayland-sys",
  "windows-sys 0.61.2",
 ]

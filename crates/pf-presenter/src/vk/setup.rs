@@ -708,6 +708,16 @@ impl Presenter {
             last_presented: None,
             video_fit: Default::default(),
             placement_logged: None,
+            #[cfg(target_os = "linux")]
+            native: if crate::wl_native::enabled() {
+                crate::wl_native::NativeLane::new(window).unwrap_or_else(|e| {
+                    tracing::warn!(error = %format!("{e:#}"), "native scanout lane unavailable");
+                    None
+                })
+            } else {
+                None
+            },
+            native_last: false,
         };
         p.recreate_swapchain(window)?;
         Ok(p)
