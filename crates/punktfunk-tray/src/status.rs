@@ -313,14 +313,10 @@ pub fn punktfunk_config_dir() -> Option<std::path::PathBuf> {
     (cfg!(target_os = "linux") || overridden).then(pf_paths::config_dir)
 }
 
-/// Sync HTTPS agent: rustls(aws-lc-rs) + `PinVerify` (Linux client `library.rs`).
+/// Sync HTTPS agent over [`punktfunk_core::tls::pinned_builder`]; `None` accepts any cert.
 fn agent(pin: Option<[u8; 32]>) -> ureq::Agent {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let cfg = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
+    let cfg = punktfunk_core::tls::pinned_builder(punktfunk_core::tls::PinVerify::new(pin))
         .expect("rustls default protocol versions")
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(punktfunk_core::tls::PinVerify::new(pin)))
         .with_no_client_auth();
     // ureq `TlsConfig` cannot install a custom verifier; wrap `ClientConfig` via punktfunk-core.
     punktfunk_core::tls::ureq_agent::agent(

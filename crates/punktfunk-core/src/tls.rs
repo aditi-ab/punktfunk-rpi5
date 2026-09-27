@@ -22,6 +22,23 @@ pub fn install_default_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
+/// A pinned client config up to its client-auth choice: the aws-lc-rs provider (mixing rustls
+/// providers panics), rustls's safe protocol versions and `verify`. Finish it with
+/// `with_no_client_auth` or `with_client_auth_cert`.
+pub fn pinned_builder(
+    verify: PinVerify,
+) -> Result<
+    rustls::ConfigBuilder<rustls::ClientConfig, rustls::client::WantsClientCert>,
+    rustls::Error,
+> {
+    Ok(rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(verify)))
+}
+
 /// SHA-256 of the certificate DER — the fingerprint clients pin. Re-exported as
 /// `crate::quic::endpoint::cert_fingerprint` for callers that already reach it there.
 pub fn cert_fingerprint(cert_der: &[u8]) -> [u8; 32] {

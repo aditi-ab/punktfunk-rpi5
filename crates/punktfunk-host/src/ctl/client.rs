@@ -267,23 +267,19 @@ fn load_token(dir: &Path) -> Result<String> {
     })
 }
 
-/// Pinned agent in the tray's shape (`punktfunk-tray/src/status.rs`), pin
-/// mandatory, observed slot wired so a mismatch is reportable.
+/// Pinned agent over [`punktfunk_core::tls::pinned_builder`], pin mandatory,
+/// observed slot wired so a mismatch is reportable.
 fn agent(
     pin: [u8; 32],
     observed: Arc<Mutex<Option<[u8; 32]>>>,
     global_timeout: Option<Duration>,
 ) -> ureq::Agent {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let tls = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .expect("rustls default protocol versions")
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(punktfunk_core::tls::PinVerify::with_observed(
-            Some(pin),
-            observed,
-        )))
-        .with_no_client_auth();
+    let tls = punktfunk_core::tls::pinned_builder(punktfunk_core::tls::PinVerify::with_observed(
+        Some(pin),
+        observed,
+    ))
+    .expect("rustls default protocol versions")
+    .with_no_client_auth();
     // ureq's `TlsConfig` has no hook for a custom verifier, so the agent takes
     // `ClientConfig` directly through the shared glue.
     punktfunk_core::tls::ureq_agent::agent(
