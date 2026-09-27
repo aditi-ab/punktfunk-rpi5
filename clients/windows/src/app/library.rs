@@ -16,6 +16,7 @@
 //! speed test's generation guard.
 
 use super::connect::{initiate_launch, initiate_waking};
+use super::embedded_png::file_uri;
 use super::lucide;
 use super::style::*;
 use super::{AppCtx, Screen, Svc};
@@ -236,10 +237,6 @@ fn store_art(dir: &Path, id: &str, bytes: &[u8]) -> Option<String> {
     let p = art_file(dir, id);
     std::fs::write(&p, bytes).ok()?;
     Some(file_uri(&p))
-}
-
-fn file_uri(p: &Path) -> String {
-    format!("file:///{}", p.display().to_string().replace('\\', "/"))
 }
 
 /// The tile overflow's only entry today — the per-GAME half of the pairing the host tiles
