@@ -12,7 +12,7 @@
 #![allow(non_camel_case_types, non_snake_case)]
 
 use anyhow::{bail, Result};
-use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd};
+use std::os::fd::{AsRawFd as _, IntoRawFd as _, OwnedFd};
 use std::os::raw::{c_uint, c_void};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -1185,15 +1185,6 @@ impl ExternalSemaphore {
         }
         let _ = fd.into_raw_fd(); // the driver owns it now
         Ok(ExternalSemaphore { sem })
-    }
-
-    /// [`import_timeline_fd`](Self::import_timeline_fd) for a caller still holding the fd as an
-    /// integer. Takes ownership of `fd` whatever the outcome.
-    pub fn import_owned_timeline_fd(fd: i32) -> Result<ExternalSemaphore> {
-        anyhow::ensure!(fd >= 0, "import a negative timeline fd");
-        // SAFETY: the caller hands over sole ownership of the open descriptor `fd`; nothing
-        // else closes it.
-        Self::import_timeline_fd(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
     /// Enqueue a signal to `value` after prior work on this thread's copy stream. No CPU wait.

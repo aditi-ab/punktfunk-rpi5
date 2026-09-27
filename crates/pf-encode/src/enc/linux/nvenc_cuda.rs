@@ -41,7 +41,7 @@ use pf_zerocopy::cuda::{self, InputSurface};
 use pf_zerocopy::vkslot::{SlotFormat, VkSlotBlend, VkSlotRef};
 use std::collections::{HashSet, VecDeque};
 use std::ffi::c_void;
-use std::os::fd::{AsRawFd, IntoRawFd};
+use std::os::fd::AsRawFd;
 use std::ptr;
 use std::sync::mpsc;
 
@@ -1897,7 +1897,7 @@ impl NvencCudaEncoder {
                 .convert_timeline()
                 .context("export the convert timeline")?;
             self.convert_sem = Some(
-                cuda::ExternalSemaphore::import_owned_timeline_fd(fd.into_raw_fd())
+                cuda::ExternalSemaphore::import_timeline_fd(fd)
                     .context("import the convert timeline")?,
             );
         }
