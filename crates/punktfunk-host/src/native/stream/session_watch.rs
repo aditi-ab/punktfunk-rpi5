@@ -21,21 +21,8 @@ pub(super) fn session_watch_enabled() -> bool {
 
 /// Bazzite or SteamOS (`ID`/`ID_LIKE`). Absent os-release (non-Linux) → false.
 fn is_steam_htpc_platform() -> bool {
-    let Ok(os) = std::fs::read_to_string("/etc/os-release") else {
-        return false;
-    };
-    os.lines().any(|line| {
-        let line = line.trim();
-        let Some(val) = line
-            .strip_prefix("ID=")
-            .or_else(|| line.strip_prefix("ID_LIKE="))
-        else {
-            return false;
-        };
-        val.trim_matches('"')
-            .split_whitespace()
-            .any(|tok| tok.eq_ignore_ascii_case("bazzite") || tok.eq_ignore_ascii_case("steamos"))
-    })
+    let os = pf_host_config::os_release::os_release();
+    os.is("bazzite") || os.is("steamos")
 }
 
 pub(super) fn session_watcher_loop(
