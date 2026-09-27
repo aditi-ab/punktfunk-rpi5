@@ -122,7 +122,7 @@ object DeepLinks {
             when {
                 key == "fp" && fp == null -> {
                     val hex = value.lowercase()
-                    if (hex.length != 64 || !hex.all { it.isDigit() || it in 'a'..'f' }) {
+                    if (hex.length != 64 || !hex.all { it in '0'..'9' || it in 'a'..'f' }) {
                         return DeepLinkResult.Refused(LinkError.BAD_FINGERPRINT)
                     }
                     fp = hex
