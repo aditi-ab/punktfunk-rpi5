@@ -272,6 +272,10 @@ pub(crate) unsafe fn merged_env_block(user_block: *const u16, strip_secrets: boo
         block.extend(e.encode_utf16());
         block.push(0);
     }
+    // An empty block is still two NULs; one would send CreateProcess reading past the end.
+    if block.is_empty() {
+        block.push(0);
+    }
     block.push(0);
     block
 }
