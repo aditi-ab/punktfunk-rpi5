@@ -42,6 +42,7 @@ classify() {
                 scripts/ci/ensure-sccache.sh|scripts/ci/install-retrying-curl.sh|\
                 scripts/ci/check-installer-behavior.sh|scripts/ci/check-install-defaults.sh|\
                 scripts/ci/check-unsafe-hygiene.sh|\
+                scripts/ci/check-workflow-paths.py|scripts/ci/cargo_graph.py|\
                 scripts/gen-third-party-notices.sh|scripts/gen-third-party-notices.py|\
                 about.toml|about.hbs|\
                 assets/os-icons/LICENSES/*|assets/launcher-icons/LICENSES/*|\
@@ -130,6 +131,8 @@ self_test() {
     check workspace-tool 'tools/loss-harness/src/main.rs' \
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     check notice-generator 'scripts/gen-third-party-notices.py' \
+        'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    check workflow-paths 'scripts/ci/cargo_graph.py' \
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     check notice-license 'assets/os-icons/LICENSES/simple-icons.txt' \
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'

@@ -30,6 +30,9 @@ import os
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ci"))
+from cargo_graph import closure  # noqa: E402
+
 LICENSE_GLOBS = ("license", "licence", "copying", "notice", "unlicense", "copyright")
 
 
@@ -109,35 +112,6 @@ VENDORED_TREES = [
 ]
 
 
-def closure(meta, roots):
-    """Package ids reachable from `roots` through `cargo metadata`'s resolve graph.
-
-    Deliberately the WHOLE resolve graph, not a per-target one: `cargo metadata` resolves
-    every `cfg()`-gated dependency of every member, so this OVER-approximates (an
-    `cfg(windows)`-only crate is reachable from a root even on a Linux build). Over-listing an
-    attribution is the safe direction; under-listing one is the failure this file exists to
-    prevent. What it does NOT do is pull in crates reachable only from OTHER workspace members,
-    which is the whole point.
-    """
-    by_name = {}
-    for p in meta["packages"]:
-        by_name.setdefault(p["name"], p["id"])
-    nodes = {n["id"]: n for n in meta.get("resolve", {}).get("nodes", [])}
-    seen, stack = set(), []
-    for r in roots:
-        pid = by_name.get(r)
-        if pid is None:
-            raise SystemExit(f"--packages: no package named {r!r} in this workspace")
-        stack.append(pid)
-    while stack:
-        pid = stack.pop()
-        if pid in seen:
-            continue
-        seen.add(pid)
-        stack.extend(nodes.get(pid, {}).get("dependencies", []))
-    return seen
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="THIRD-PARTY-NOTICES.txt")
@@ -164,6 +138,8 @@ def main():
         text=True))
     ws_members = set(meta.get("workspace_members", []))
 
+    # No --filter-platform either: a `cfg(windows)` crate stays listed for a Linux build, the
+    # safe direction for an attribution file.
     keep = None
     if args.packages.strip():
         keep = closure(meta, [n.strip() for n in args.packages.split(",") if n.strip()])

@@ -33,14 +33,13 @@ on:
     branches: [main]
     # The flatpak is the CLIENT — only rebuild when the client/core/manifest change, not on every
     # design/host push (this is a heavy flatpak-builder run). Tags (v*, the client release) build too.
-    # The bundle ships BOTH client binaries (shell + Vulkan session), so every crate in either
-    # binary's dependency closure must be listed here — including the native decode rungs, or a
-    # commit that only touches the decoder never rebuilds the bundle and the Deck canary quietly
-    # stops tracking it. pf-dxvadec is absent on purpose: it is `cfg(windows)` in pf-client-core
-    # and never enters the Linux closure (windows-client.yml carries it instead).
+    # The bundle ships the shell, the Vulkan session and the CLI, so every crate in their Linux
+    # dependency closure is listed here, or the Deck canary stops tracking it.
+    # scripts/ci/check-workflow-paths.py fails CI when one is missing.
     paths:
       - 'clients/linux/**'
       - 'clients/session/**'
+      - 'clients/cli/**'
       - 'crates/punktfunk-core/**'
       - 'crates/pf-client-core/**'
       - 'crates/pf-presenter/**'
@@ -48,6 +47,10 @@ on:
       - 'crates/pf-bitstream/**'
       - 'crates/pf-vkdecode/**'
       - 'crates/pf-vaapi/**'
+      - 'crates/pf-libva/**'
+      - 'crates/pf-zerocopy/**'
+      - 'crates/pf-update-check/**'
+      - 'crates/pyrowave-sys/**'
       - 'packaging/flatpak/**'
       - 'Cargo.lock'
       # Both halves of this job's correctness, not of the bundle's content: a change to either
