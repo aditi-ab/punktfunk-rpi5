@@ -861,63 +861,18 @@ pub fn managed_session_available() -> bool {
 /// A gamescope we didn't spawn, for this uid. Our own bare-spawns are children of this process
 /// (ppid walk), so one client's nested gamescope never makes the next client attach to it.
 pub fn foreign_gamescope_running() -> bool {
-    let uid = crate::proc::current_uid();
     let our_pid = std::process::id();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return false;
-    };
-    for e in entries.flatten() {
-        let name = e.file_name();
-        let Some(pid_str) = name.to_str() else {
-            continue;
-        };
-        let Ok(pid) = pid_str.parse::<u32>() else {
-            continue;
-        };
-        let Ok(md) = std::fs::metadata(e.path()) else {
-            continue;
-        };
-        use std::os::unix::fs::MetadataExt;
-        if md.uid() != uid {
-            continue;
-        }
+    crate::proc::own_pids().any(|(pid, path)| {
         // Resolved name: nixpkgs wraps gamescope, so the kernel reports `.gamescope-wrap`.
-        let Some(comm) = crate::proc::match_name(&e.path()) else {
-            continue;
-        };
-        if !matches!(comm.as_str(), "gamescope" | "gamescope-wl") {
-            continue;
-        }
-        // A killed gamescope its parent has not reaped serves no node to attach to.
-        if is_zombie(pid) {
-            continue;
-        }
-        if !descends_from(pid, our_pid) {
-            return true;
-        }
-    }
-    false
+        crate::proc::match_name(&path)
+            .is_some_and(|comm| matches!(comm.as_str(), "gamescope" | "gamescope-wl"))
+            // A killed gamescope its parent has not reaped serves no node to attach to.
+            && crate::proc::pid_alive(pid)
+            && !descends_from(pid, our_pid)
+    })
 }
 
-/// `/proc/<pid>/stat` state `Z`. Unreadable counts as gone.
-fn is_zombie(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .and_then(|stat| stat_state(&stat))
-        .is_none_or(|state| state == 'Z')
-}
-
-/// Field 3 follows the parenthesized comm; split after the LAST ')' (comm may contain them).
-fn stat_state(stat: &str) -> Option<char> {
-    stat.rsplit_once(')')?
-        .1
-        .split_whitespace()
-        .next()?
-        .chars()
-        .next()
-}
-
-/// Walk `/proc/<pid>/stat` ppid. Hop cap so a racing/exiting process cannot loop us.
+/// Walk the ppid chain. Hop cap so a racing/exiting process cannot loop us.
 fn descends_from(mut pid: u32, ancestor: u32) -> bool {
     for _ in 0..64 {
         if pid == ancestor {
@@ -926,14 +881,7 @@ fn descends_from(mut pid: u32, ancestor: u32) -> bool {
         if pid <= 1 {
             return false;
         }
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            return false;
-        };
-        // Field 4 (ppid) follows parenthesized comm — split after the LAST ')' (comm may contain them).
-        let Some(rest) = stat.rsplit_once(')').map(|(_, r)| r) else {
-            return false;
-        };
-        let Some(ppid) = rest.split_whitespace().nth(1).and_then(|s| s.parse().ok()) else {
+        let Some(ppid) = crate::proc::ppid(pid) else {
             return false;
         };
         pid = ppid;
@@ -1006,54 +954,26 @@ pub fn launch_into_session(
 /// gamescope, which is only right when the caller has no seat to be wrong about.
 #[cfg(target_os = "linux")]
 pub(crate) fn xwayland_cursor_targets(seat: Option<&str>) -> Vec<(String, Option<String>)> {
-    let uid = crate::proc::current_uid();
     let mut out: Vec<(String, Option<String>)> = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return out;
-    };
-    for e in entries.flatten() {
-        let name = e.file_name();
-        let Some(pid_str) = name.to_str() else {
+    for (_, path) in crate::proc::own_pids() {
+        let Some(env) = crate::proc::display_env(&path) else {
             continue;
         };
-        if !pid_str.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        let Ok(md) = std::fs::metadata(e.path()) else {
-            continue;
-        };
-        use std::os::unix::fs::MetadataExt;
-        if md.uid() != uid {
-            continue;
-        }
-        let Ok(raw) = std::fs::read(e.path().join("environ")) else {
+        // A sandboxed client rewrites the seat name to a bind path (`/run/pressure-vessel/…`), so
+        // it never matches. That is fine: the un-sandboxed members — the wrapper, `steam.sh`, the
+        // splash — all carry the real name, and one is enough.
+        let on_seat = env
+            .gamescope_wayland
+            .as_deref()
+            .is_some_and(|v| seat.is_none_or(|want| v == want));
+        let (true, Some(d)) = (on_seat, env.display) else {
             continue;
         };
-        let (mut display, mut is_gamescope, mut xauth) = (None, false, None);
-        for kv in raw.split(|&b| b == 0) {
-            let kv = String::from_utf8_lossy(kv);
-            if let Some(v) = kv.strip_prefix("GAMESCOPE_WAYLAND_DISPLAY=") {
-                // A sandboxed client rewrites this to a bind path (`/run/pressure-vessel/…`), so
-                // it never matches a seat name. That is fine: the un-sandboxed members — the
-                // wrapper, `steam.sh`, the splash — all carry the real name, and one is enough.
-                is_gamescope = seat.is_none_or(|want| v == want);
-            } else if let Some(v) = kv.strip_prefix("DISPLAY=") {
-                if !v.is_empty() {
-                    display = Some(v.to_string());
-                }
-            } else if let Some(v) = kv.strip_prefix("XAUTHORITY=") {
-                if !v.is_empty() {
-                    xauth = Some(v.to_string());
-                }
-            }
-        }
-        if let (true, Some(d)) = (is_gamescope, display) {
-            // Distinct DISPLAY only; prefer the first non-empty XAUTHORITY seen for it.
-            match out.iter_mut().find(|(dd, _)| *dd == d) {
-                Some((_, xa)) if xa.is_none() => *xa = xauth,
-                Some(_) => {}
-                None => out.push((d, xauth)),
-            }
+        // Distinct DISPLAY only; prefer the first non-empty XAUTHORITY seen for it.
+        match out.iter_mut().find(|(dd, _)| *dd == d) {
+            Some((_, xa)) if xa.is_none() => *xa = env.xauthority,
+            Some(_) => {}
+            None => out.push((d, env.xauthority)),
         }
     }
     out
@@ -1065,52 +985,13 @@ pub(crate) fn xwayland_cursor_targets(seat: Option<&str>) -> Vec<(String, Option
 fn discover_session_display_env(
     seat: Option<&str>,
 ) -> Option<(Option<String>, Option<String>, Option<String>)> {
-    let uid = crate::proc::current_uid();
-    for e in std::fs::read_dir("/proc").ok()?.flatten() {
-        let name = e.file_name();
-        let Some(pid_str) = name.to_str() else {
-            continue;
-        };
-        if !pid_str.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        let Ok(md) = std::fs::metadata(e.path()) else {
-            continue;
-        };
-        use std::os::unix::fs::MetadataExt;
-        if md.uid() != uid {
-            continue;
-        }
-        let Ok(raw) = std::fs::read(e.path().join("environ")) else {
-            continue;
-        };
-        let mut display = None;
-        let mut gs_wayland = None;
-        let mut xauth = None;
-        for kv in raw.split(|&b| b == 0) {
-            let kv = String::from_utf8_lossy(kv);
-            if let Some(v) = kv.strip_prefix("GAMESCOPE_WAYLAND_DISPLAY=") {
-                if seat.is_some_and(|want| v != want) {
-                    continue;
-                }
-                if !v.is_empty() {
-                    gs_wayland = Some(v.to_string());
-                }
-            } else if let Some(v) = kv.strip_prefix("DISPLAY=") {
-                if !v.is_empty() {
-                    display = Some(v.to_string());
-                }
-            } else if let Some(v) = kv.strip_prefix("XAUTHORITY=") {
-                if !v.is_empty() {
-                    xauth = Some(v.to_string());
-                }
-            }
-        }
-        if gs_wayland.is_some() {
-            return Some((display, gs_wayland, xauth));
-        }
-    }
-    None
+    crate::proc::own_pids().find_map(|(_, path)| {
+        let env = crate::proc::display_env(&path)?;
+        let gs_wayland = env
+            .gamescope_wayland
+            .filter(|v| seat.is_none_or(|want| v == want))?;
+        Some((env.display, Some(gs_wayland), env.xauthority))
+    })
 }
 
 /// In-memory `systemctl is-active` budget. Callers must time out into the safe answer (assume
@@ -1623,32 +1504,22 @@ fn ensure_box_gamescope_mode(mode: Mode, hdr: bool) -> Result<u32> {
 /// Compositor argv from `/proc/<pid>/cmdline`. Basename `ends_with("gamescope")` — `/proc/…/exe`
 /// is often unreadable, and `==` would miss `punktfunk-gamescope` while still excluding helpers.
 fn gamescope_argvs() -> Vec<Vec<String>> {
-    let mut found = Vec::new();
-    let Ok(dir) = std::fs::read_dir("/proc") else {
-        return found;
-    };
-    for entry in dir.flatten() {
-        let name = entry.file_name();
-        let Some(pid) = name.to_str() else { continue };
-        if !pid.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
-            continue;
-        };
-        let args: Vec<String> = raw
-            .split(|&b| b == 0)
-            .filter(|s| !s.is_empty())
-            .map(|s| String::from_utf8_lossy(s).into_owned())
-            .collect();
-        if args
-            .first()
-            .is_some_and(|a0| a0.rsplit('/').next().unwrap_or(a0).ends_with("gamescope"))
-        {
-            found.push(args);
-        }
-    }
-    found
+    crate::proc::pids()
+        .filter_map(|(_, path)| {
+            let raw = std::fs::read(path.join("cmdline")).ok()?;
+            let args: Vec<String> = raw
+                .split(|&b| b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect();
+            let a0 = args.first()?;
+            a0.rsplit('/')
+                .next()
+                .unwrap_or(a0)
+                .ends_with("gamescope")
+                .then_some(args)
+        })
+        .collect()
 }
 
 /// `-W`/`-H` of one argv. `None` if either is missing — also the compositor vs helper filter.
@@ -2561,7 +2432,7 @@ fn free_desktop_steam() -> Result<()> {
     );
     let deadline = Instant::now() + STEAM_SHUTDOWN_WAIT;
     while Instant::now() < deadline {
-        if !pid_running(pid) {
+        if !crate::proc::pid_alive(pid) {
             tracing::info!(pid, "desktop Steam exited — single instance free");
             return Ok(());
         }
@@ -2583,7 +2454,7 @@ fn desktop_steam_pid() -> Option<u32> {
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
     // Steam's own processes report comm `steam` (the ubuntu12_32 binary) or `steam.sh`; anything
     // else means the pid was recycled since Steam last ran.
-    if !matches!(comm.trim(), "steam" | "steam.sh") || !pid_running(pid) {
+    if !matches!(comm.trim(), "steam" | "steam.sh") || !crate::proc::pid_alive(pid) {
         return None;
     }
     if descends_from(pid, std::process::id()) {
@@ -2598,18 +2469,6 @@ fn desktop_steam_pid() -> Option<u32> {
 
 fn cgroup_is_punktfunk_owned(cgroup: &str) -> bool {
     cgroup.contains("punktfunk-host.service") || cgroup.contains(&format!("{SESSION_UNIT}.service"))
-}
-
-/// A zombie keeps `/proc` but has already released Steam; waiting would burn the full deadline.
-fn pid_running(pid: u32) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
-    // Field 3 (state) follows the parenthesized comm — split after the LAST ')' since comm can
-    // itself contain parentheses.
-    stat.rsplit_once(')')
-        .and_then(|(_, rest)| rest.split_whitespace().next())
-        .is_some_and(|state| state != "Z")
 }
 
 /// Keep-alive reuse never calls `create_managed_session`; skip this and a reconnect inside the
@@ -4152,7 +4011,7 @@ fn hand_launch_to_steam_when_up(
             let deadline = Instant::now() + STEAM_UP_WAIT;
             let mut up = false;
             while Instant::now() < deadline {
-                if !pid_running(gamescope) {
+                if !crate::proc::pid_alive(gamescope) {
                     tracing::info!(
                         %uri,
                         "gamescope: the session ended before its Steam was up — launch not sent"
@@ -5559,19 +5418,6 @@ mod tests {
     /// A managed session that ignored `GAMESCOPE_BIN` / the PATH shim runs a stock gamescope, and
     /// the host — already told the compositor would paint the pointer — paints none either. Only a
     /// compositor we can see, missing a flag we can name, may fail.
-    #[test]
-    fn a_zombie_reads_from_the_state_field_after_the_comm() {
-        assert_eq!(
-            super::stat_state("9846 (gamescope-wl) Z 837 9846 9846 0 -1"),
-            Some('Z')
-        );
-        assert_eq!(
-            super::stat_state("77 (odd) name)) S 1 77 77 0 -1"),
-            Some('S')
-        );
-        assert_eq!(super::stat_state("garbage"), None);
-    }
-
     #[test]
     fn spawn_flag_verification_fails_closed_only_on_evidence() {
         let argv = |s: &str| -> Vec<String> { s.split(' ').map(str::to_string).collect() };
