@@ -6,7 +6,6 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
-import android.util.Log
 import android.widget.Toast
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -35,11 +34,9 @@ import io.unom.punktfunk.kit.link.HostResolution
 import io.unom.punktfunk.kit.link.LinkError
 import io.unom.punktfunk.kit.link.LinkRoute
 import io.unom.punktfunk.kit.security.ClientIdentity
-import io.unom.punktfunk.kit.security.IDENTITY_OBTAIN_TIMEOUT_MS
-import io.unom.punktfunk.kit.security.IdentityStore
+import io.unom.punktfunk.kit.security.IdentityHolder
 import io.unom.punktfunk.kit.security.KnownHost
 import io.unom.punktfunk.kit.security.KnownHostStore
-import io.unom.punktfunk.kit.security.obtainIdentity
 import io.unom.punktfunk.models.ActiveSession
 import io.unom.punktfunk.models.PendingLinkConnect
 import io.unom.punktfunk.models.PendingTrust
@@ -48,7 +45,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Handshake budget for the no-PIN "request access" connect. Must exceed the host's approval-park
@@ -56,12 +52,6 @@ import kotlinx.coroutines.withTimeoutOrNull
  * timing the client out first. Mirrors the Linux client's 185 s.
  */
 private const val REQUEST_ACCESS_TIMEOUT_MS = 185_000
-
-private const val TAG = "pf.connect"
-
-// A failed identity load's line — distinct from "not ready", which implies a retry nothing ran.
-private const val IDENTITY_UNAVAILABLE =
-    "Couldn't create an identity — this device's secure key storage isn't working"
 
 /**
  * How long a host's advertised actions stay fresh before this screen asks again — the desktop's
@@ -179,7 +169,6 @@ fun ConnectScreen(
         onDispose { discovery.removeListener(subscriber) }
     }
 
-    val identityStore = remember { IdentityStore(context) }
     val knownHostStore = remember { KnownHostStore(context) }
     var savedHosts by remember { mutableStateOf(knownHostStore.all()) }
     // The settings-preset catalog. Read here (not in the settings screen's copy) because this is
@@ -267,42 +256,22 @@ fun ConnectScreen(
             delay(12_000)
         }
     }
-    // Mint-once on genuine first run; an Unrecoverable store (decrypt failure) surfaces here and
-    // refuses to connect — never silently shadow-minting a new identity (which would force re-pair).
-    // Tri-state — in flight / ready / failed — because a tap on any guarded action doubles as the
-    // retry: a failed load keeps its own message instead of the "not ready" line that claims one.
-    var identity by remember { mutableStateOf<ClientIdentity?>(null) }
-    var identityFailed by remember { mutableStateOf(false) }
-    var identityLoading by remember { mutableStateOf(false) }
+    // The process-wide identity load ([IdentityHolder]), mirrored into state so the effects keyed
+    // on it rerun when it lands. An Unrecoverable store refuses to connect rather than shadow-mint.
+    val identities = remember { IdentityHolder.shared(context) }
+    var identity by remember { mutableStateOf(identities.current) }
     fun loadIdentity() {
-        if (identity != null || identityLoading) return
-        identityLoading = true
         scope.launch {
-            var threw = false
-            val loaded = withTimeoutOrNull(IDENTITY_OBTAIN_TIMEOUT_MS) {
-                withContext(Dispatchers.IO) {
-                    runCatching { obtainIdentity(identityStore) }
-                        .onFailure { threw = true; Log.w(TAG, "identity unavailable", it) }
-                        .getOrNull()
-                }
-            }
-            if (loaded == null && !threw) Log.w(TAG, "identity obtain timed out")
-            identityLoading = false
-            identity = loaded
-            identityFailed = loaded == null
-            if (identityFailed) status = IDENTITY_UNAVAILABLE
+            identity = withContext(Dispatchers.IO) { identities.await() }
+            if (identity == null) status = IdentityHolder.UNAVAILABLE
         }
     }
-    // Every identity-gated action funnels here: ready → the identity; in flight → "not ready";
-    // failed → the real failure and a fresh attempt, so the reporting tap is also its retry.
+    // Every identity-gated action funnels here: ready → the identity, also when another screen's
+    // retry loaded it; else the holder's line, and a failed load is retried by this same tap.
     fun requireIdentity(): ClientIdentity? {
-        identity?.let { return it }
-        if (identityFailed) {
-            status = IDENTITY_UNAVAILABLE
-            loadIdentity()
-        } else {
-            status = "Identity not ready yet — try again in a moment"
-        }
+        (identity ?: identities.current)?.let { identity = it; return it }
+        status = identities.blockedMessage()
+        if (identities.failed) loadIdentity()
         return null
     }
     LaunchedEffect(Unit) { loadIdentity() }
