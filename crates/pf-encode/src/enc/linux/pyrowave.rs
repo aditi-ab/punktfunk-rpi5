@@ -1600,6 +1600,11 @@ impl PyroWaveEncoder {
                     return Err(e);
                 }
             };
+        // In-flight frames may still read an evicted import: idle before destroying. Only an
+        // eviction pays; the steady state (every buffer cached) never gets here.
+        if self.import_cache.len() >= IMPORT_CACHE_CAP {
+            let _ = self.device.device_wait_idle();
+        }
         while self.import_cache.len() >= IMPORT_CACHE_CAP {
             let (_, _, oi, om, ov) = self.import_cache.remove(0);
             self.device.destroy_image_view(ov, None);
