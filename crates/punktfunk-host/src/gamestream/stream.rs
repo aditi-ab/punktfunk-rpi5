@@ -352,6 +352,8 @@ fn run(
             nested_launch_started,
             #[cfg(target_os = "linux")]
             seat,
+            #[cfg(target_os = "linux")]
+            lease,
         } = open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit, true)?;
         // Only Linux `launch_is_nested` reads them; gamescope does not exist on Windows.
         #[cfg(not(target_os = "linux"))]
@@ -553,15 +555,39 @@ fn run(
                 ),
             )
         });
-        // Re-detect the live compositor so a Desktop↔Game switch is followed in place, with its
-        // own cursor blend. WxH is locked at ANNOUNCE — a resolution change cannot follow.
-        let rebuild = || {
-            open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit, false).map(|s| {
-                (
-                    s.capturer,
-                    gs_cursor_blend(s.compositor, s.route.as_ref(), &cfg),
-                )
-            })
+        // The output the stream captures now, for a re-attach after a loss that leaves it up.
+        #[cfg(target_os = "linux")]
+        let attached = std::cell::RefCell::new((compositor, gamescope_route.clone(), lease));
+        // A handed-back keepalive re-attaches to its output first: on KWin every create is a new
+        // virtual output, and a burst of them wedges the compositor. Otherwise re-detect the live
+        // compositor so a Desktop↔Game switch is followed. WxH is locked at ANNOUNCE.
+        let rebuild = |keepalive: Option<Box<dyn Send>>| {
+            #[cfg(target_os = "linux")]
+            if let Some(keepalive) = keepalive {
+                let (c, route, lease) = attached.borrow().clone();
+                if let Some(lease) = lease {
+                    match gs_capture_output(lease.into_output(keepalive), &cfg, c, route.as_ref()) {
+                        Ok(capturer) => {
+                            tracing::info!(
+                                "gamestream: capture loss — re-attached to the live output, no new \
+                                 display"
+                            );
+                            return Ok((capturer, gs_cursor_blend(c, route.as_ref(), &cfg)));
+                        }
+                        Err(e) => tracing::warn!(error = %format!("{e:#}"),
+                            "gamestream: re-attach to the live output failed — creating another"),
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = keepalive;
+            let s = open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit, false)?;
+            let blend = gs_cursor_blend(s.compositor, s.route.as_ref(), &cfg);
+            #[cfg(target_os = "linux")]
+            {
+                *attached.borrow_mut() = (s.compositor, s.route, s.lease);
+            }
+            Ok((s.capturer, blend))
         };
         return stream_body(
             &mut capturer,
@@ -840,6 +866,9 @@ struct GsSource {
     /// The gamescope seat a launch that did not nest goes to. `None` off a gamescope spawn.
     #[cfg(target_os = "linux")]
     seat: Option<String>,
+    /// The output, for a re-attach after a capture loss that leaves it up. `None` for a portal fd.
+    #[cfg(target_os = "linux")]
+    lease: Option<crate::capture::OutputLease>,
 }
 
 /// Virtual-display source at the client's mode. The app's own `compositor` wins; otherwise the
@@ -903,10 +932,30 @@ fn open_gs_virtual_source(
     let nested_launch_started = vd.nested_launch_started();
     #[cfg(target_os = "linux")]
     let seat = vout.seat.clone();
-    let plan = gs_session_plan(
-        &cfg,
-        gs_cursor_blend(compositor, gamescope_route.as_ref(), &cfg),
-    );
+    #[cfg(target_os = "linux")]
+    let lease = crate::capture::OutputLease::of(&vout);
+    let capturer = gs_capture_output(vout, &cfg, compositor, gamescope_route.as_ref())?;
+    Ok(GsSource {
+        capturer,
+        compositor,
+        route: gamescope_route,
+        nested_launch_started,
+        #[cfg(target_os = "linux")]
+        seat,
+        #[cfg(target_os = "linux")]
+        lease,
+    })
+}
+
+/// An active capturer on `vout` at this session's plan. On gamescope it also blends the XFixes
+/// pointer when the node carries none.
+fn gs_capture_output(
+    vout: crate::vdisplay::VirtualOutput,
+    cfg: &StreamConfig,
+    compositor: crate::vdisplay::Compositor,
+    route: Option<&crate::vdisplay::GamescopeRoute>,
+) -> Result<Box<dyn Capturer>> {
+    let plan = gs_session_plan(cfg, gs_cursor_blend(compositor, route, cfg));
     #[cfg(target_os = "linux")]
     let cursor_seat = vout.seat.clone();
     let mut capturer = capture::capture_virtual_output(
@@ -923,21 +972,14 @@ fn open_gs_virtual_source(
     #[cfg(target_os = "linux")]
     if crate::session_plan::gamescope_cursor_for(
         compositor == crate::vdisplay::Compositor::Gamescope,
-        gamescope_route.as_ref(),
+        route,
     ) {
         capturer.attach_gamescope_cursor(Arc::new(move || {
             pf_vdisplay::gamescope_xwayland_cursor_targets(cursor_seat.as_deref())
         }));
     }
     capturer.set_active(true);
-    Ok(GsSource {
-        capturer,
-        compositor,
-        route: gamescope_route,
-        nested_launch_started,
-        #[cfg(target_os = "linux")]
-        seat,
-    })
+    Ok(capturer)
 }
 
 /// Shared [`SessionPlan`](crate::session_plan::SessionPlan) at this plane's shape: 4:2:0,
@@ -1234,8 +1276,9 @@ fn keyframe_coalesce_window(frame_interval: Duration) -> Duration {
     (frame_interval * 2).max(Duration::from_millis(100))
 }
 
-/// Re-opens the virtual source on capture loss: the new capturer and its `cursor_blend`.
-type GsRebuild<'a> = &'a dyn Fn() -> Result<(Box<dyn Capturer>, bool)>;
+/// Re-opens the virtual source on capture loss: the new capturer and its `cursor_blend`. Takes
+/// the old capturer's keepalive when the loss left its display up.
+type GsRebuild<'a> = &'a dyn Fn(Option<Box<dyn Send>>) -> Result<(Box<dyn Capturer>, bool)>;
 
 /// Encode loop over a borrowed capturer. Send is a dedicated thread so a send spike cannot
 /// stall capture/encode.
@@ -1462,10 +1505,14 @@ fn stream_body(
                     Duration::from_secs(40)
                 };
                 let rebuild_deadline = loss_at + budget;
+                // The import side broke under a live display: re-attach instead of creating one.
+                let mut keepalive = e
+                    .downcast_ref::<pf_capture::DisplayStillAlive>()
+                    .and_then(|_| capturer.take_keepalive());
                 let new_cap = loop {
                     let _probe = (loss_at.elapsed() < PROBE_HOLDOFF)
                         .then(crate::vdisplay::rebuild_probe_scope);
-                    match rebuild() {
+                    match rebuild(keepalive.take()) {
                         Ok((c, blend)) => {
                             cursor_blend = blend;
                             plan = gs_session_plan(&cfg, blend);

@@ -145,7 +145,7 @@ pub(super) struct StreamState {
     pub(super) cur_display_gen: Option<u64>,
     /// The live output's metadata for a capture-only rebuild (`on_capture_lost`).
     #[cfg(target_os = "linux")]
-    pub(super) lease: Option<super::pipeline::OutputLease>,
+    pub(super) lease: Option<crate::capture::OutputLease>,
     /// Source can change format/size with no client Reconfigure; in-place encoder reset cannot follow.
     pub(super) enc_src: (pf_frame::PixelFormat, u32, u32),
     /// The mode a rebuild reopens at: the client's latest ask, or the source's delivered size.

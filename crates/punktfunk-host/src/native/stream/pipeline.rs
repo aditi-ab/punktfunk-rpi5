@@ -3,6 +3,8 @@
 //! rebuild path (mode switch, capture loss, bitrate fallback) goes through.
 
 use super::*;
+#[cfg(target_os = "linux")]
+use crate::capture::OutputLease;
 
 /// One built pipeline. `bitrate_kbps` is the rate the encoder actually opened at.
 pub(in crate::native) struct Pipeline {
@@ -19,57 +21,6 @@ pub(in crate::native) struct Pipeline {
     /// capture cannot re-attach (a portal remote fd is spent on the first connect).
     #[cfg(target_os = "linux")]
     pub(super) lease: Option<OutputLease>,
-}
-
-/// A live output's metadata without its keepalive: what [`capture_virtual_output`] needs to
-/// attach a second time, once the old capturer hands the keepalive back.
-#[cfg(target_os = "linux")]
-#[derive(Clone)]
-pub(in crate::native) struct OutputLease {
-    node_id: u32,
-    preferred_mode: Option<(u32, u32, u32)>,
-    ownership: pf_vdisplay::DisplayOwnership,
-    pool_gen: Option<u64>,
-    output_name: Option<String>,
-    input_output: Option<String>,
-    seat: Option<String>,
-    pid: Option<u32>,
-}
-
-#[cfg(target_os = "linux")]
-impl OutputLease {
-    /// `None` on the portal path: its remote fd cannot be re-derived from the metadata.
-    fn of(vout: &crate::vdisplay::VirtualOutput) -> Option<OutputLease> {
-        vout.remote_fd.is_none().then(|| OutputLease {
-            node_id: vout.node_id,
-            preferred_mode: vout.preferred_mode,
-            ownership: vout.ownership,
-            pool_gen: vout.pool_gen,
-            output_name: vout.output_name.clone(),
-            input_output: vout.input_output.clone(),
-            seat: vout.seat.clone(),
-            pid: vout.pid,
-        })
-    }
-
-    /// The output as a fresh capture sees it. Never a birth-size gate: the output already
-    /// sits at its mode.
-    fn into_output(self, keepalive: Box<dyn Send>) -> crate::vdisplay::VirtualOutput {
-        crate::vdisplay::VirtualOutput {
-            node_id: self.node_id,
-            remote_fd: None,
-            preferred_mode: self.preferred_mode,
-            keepalive,
-            ownership: self.ownership,
-            reused_gen: None,
-            pool_gen: self.pool_gen,
-            expect_exact_dims: false,
-            output_name: self.output_name,
-            input_output: self.input_output,
-            seat: self.seat,
-            pid: self.pid,
-        }
-    }
 }
 
 /// Display + pipeline built on the prep thread while Start RTT and hole-punch are in flight.
