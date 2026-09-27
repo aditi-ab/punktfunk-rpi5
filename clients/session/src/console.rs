@@ -511,120 +511,24 @@ impl ServiceState {
     fn handle(&mut self, cmd: ConsoleCmd) {
         match cmd {
             ConsoleCmd::FetchLibrary { addr, mgmt, fp_hex } => {
-                // Opening a library is the earliest signal that somebody intends to play, so
-                // the box is woken HERE, not at connect time. Empty with auto-wake off or no
-                // MAC on record: the fetch then asks once instead of retrying across a boot.
-                let known = trust::KnownHosts::load();
-                let macs = known
-                    .find_by_fp(&fp_hex)
-                    .or_else(|| {
-                        known
-                            .hosts
-                            .iter()
-                            .find(|h| h.fp_hex.is_empty() && h.addr == addr)
-                    })
-                    .filter(|_| trust::Settings::load().auto_wake)
-                    .map(|h| h.mac.clone())
-                    .unwrap_or_default();
-                spawn_fetch(
-                    self.library.clone(),
-                    addr,
-                    mgmt,
-                    self.identity.clone(),
-                    fp_hex.clone(),
-                    trust::parse_hex32(&fp_hex),
-                    macs,
-                );
+                self.fetch_library(addr, mgmt, fp_hex)
             }
             ConsoleCmd::RefreshRunning { addr, mgmt, fp_hex } => {
-                // The carousel behind the shelf reads a different cache for the same fact;
-                // dropping it here is what stops a tile advertising the game just quit.
-                library::invalidate_running(&fp_hex);
-                // Blocking network on a worker, like every other command here: the service
-                // loop's own host refresh must keep running while a just-ended stream's host
-                // is asked what it still has up.
-                let shared = self.library.clone();
-                let identity = self.identity.clone();
-                let pin = trust::parse_hex32(&fp_hex);
-                std::thread::Builder::new()
-                    .name("punktfunk-running".into())
-                    .spawn(move || {
-                        shared.set_running(&library::fetch_running(&addr, mgmt, &identity, pin));
-                    })
-                    .ok();
+                self.refresh_running(addr, mgmt, fp_hex)
             }
             ConsoleCmd::SendLogs {
                 addr,
                 mgmt,
                 fp_hex,
                 host_name,
-            } => {
-                // Blocking network (5 s connect / 10 s global, the library agent's budgets) —
-                // a worker thread keeps the service loop's host refresh alive meanwhile. The
-                // result lands as a shared-model notice; the shell toasts it on its next sync.
-                let identity = self.identity.clone();
-                let console = self.console.clone();
-                std::thread::Builder::new()
-                    .name("punktfunk-sendlogs".into())
-                    .spawn(move || {
-                        console.set_notice(pf_client_core::logring::send_bundle(
-                            "punktfunk-session",
-                            &host_name,
-                            &addr,
-                            mgmt,
-                            &identity,
-                            &fp_hex,
-                        ));
-                    })
-                    .ok();
-            }
+            } => self.send_logs(addr, mgmt, fp_hex, host_name),
             ConsoleCmd::SpeedTest {
                 key,
                 addr,
                 port,
                 fp_hex,
                 host_name,
-            } => {
-                // A worker like every other command here, but a long one: the probe opens
-                // its own session and bursts for two seconds. The shell already raised the
-                // takeover, so this only advances the phase and feeds its graph.
-                let identity = self.identity.clone();
-                let console = self.console.clone();
-                std::thread::Builder::new()
-                    .name("punktfunk-speedtest".into())
-                    .spawn(move || {
-                        console.advance_speed(&key, SpeedPhase::Measuring);
-                        let fp = (!fp_hex.is_empty()).then_some(fp_hex.as_str());
-                        let progress =
-                            |kbps| console.advance_speed(&key, SpeedPhase::Progress { kbps });
-                        let run = pf_client_core::speed::run_speed_probe_with;
-                        match run(&addr, port, fp, identity, progress) {
-                            Ok(r) => {
-                                tracing::info!(
-                                    host = %host_name,
-                                    kbps = r.throughput_kbps,
-                                    loss = r.loss_pct,
-                                    "speed test finished"
-                                );
-                                console.advance_speed(
-                                    &key,
-                                    SpeedPhase::Done {
-                                        throughput_kbps: r.throughput_kbps,
-                                        loss_pct: r.loss_pct,
-                                        recommended_kbps: pf_client_core::speed::recommended_kbps(
-                                            r.throughput_kbps,
-                                        ),
-                                    },
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(host = %host_name, error = %e, "speed test failed");
-                                console.advance_speed(&key, SpeedPhase::Failed(e));
-                            }
-                        }
-                    })
-                    .ok();
-            }
+            } => self.speed_test(key, addr, port, fp_hex, host_name),
             ConsoleCmd::HostAction {
                 addr,
                 mgmt,
@@ -632,172 +536,23 @@ impl ServiceState {
                 host_name,
                 action_id,
                 label,
-            } => {
-                // Same lane and budgets as SendLogs above, and the same worker-thread reason.
-                // The tile goes dark on its own once the host acts.
-                let identity = self.identity.clone();
-                let console = self.console.clone();
-                std::thread::Builder::new()
-                    .name("punktfunk-hostaction".into())
-                    .spawn(move || {
-                        console.set_notice(pf_client_core::host_actions::run(
-                            &host_name, &addr, mgmt, &identity, &fp_hex, &action_id, &label,
-                        ));
-                    })
-                    .ok();
-            }
+            } => self.host_action(addr, mgmt, fp_hex, host_name, action_id, label),
             ConsoleCmd::Pair {
                 addr,
                 port,
                 pin,
                 device_name,
-            } => {
-                // What the list calls each identity at this address (advert or store), picked
-                // once the ceremony says which one answered: both OS installs of a dual-boot
-                // box sit here, and the first row is not necessarily this one.
-                let named: Vec<(String, String)> = self
-                    .rows()
-                    .into_iter()
-                    .filter(|r| r.addr == addr && r.port == port)
-                    .map(|r| (r.fp_hex, r.name))
-                    .collect();
-                self.console.set_pair(PairPhase::Busy);
-                let console = self.console.clone();
-                let identity = self.identity.clone();
-                std::thread::Builder::new()
-                    .name("punktfunk-pair".into())
-                    .spawn(move || {
-                        match trust::pair_with_host(&addr, port, &identity, &pin, &device_name) {
-                            Ok(fp) => {
-                                let fp_hex = trust::hex(&fp);
-                                let name = named
-                                    .iter()
-                                    .find(|(f, _)| *f == fp_hex)
-                                    .or_else(|| named.iter().find(|(f, _)| f.is_empty()))
-                                    .map_or_else(|| addr.clone(), |(_, n)| n.clone());
-                                if let Err(e) =
-                                    trust::persist_host(&name, &addr, port, &fp_hex, true, &[])
-                                {
-                                    tracing::warn!(error = %format!("{e:#}"), "saving the paired host");
-                                }
-                                console.set_pair(PairPhase::Paired { key: fp_hex });
-                            }
-                            Err(e) => {
-                                // Cause-specific wording (wrong PIN vs not-armed vs unreachable
-                                // vs a typed host rejection) — shared with every other surface.
-                                console.set_pair(PairPhase::Failed(trust::pair_error_message(&e)));
-                            }
-                        }
-                    })
-                    .ok();
-            }
-            ConsoleCmd::SaveHost { name, addr, port } => {
-                let mut known = trust::KnownHosts::load();
-                // A manual entry has no pin yet: it renames the placeholder at its address or
-                // adds one. A record pinned there is another identity — the other OS of a
-                // dual-boot box — and keeps its name.
-                if let Some(h) = known
-                    .placeholder_at(&addr, port)
-                    .and_then(|i| known.hosts.get_mut(i))
-                {
-                    if !name.is_empty() {
-                        h.name = name;
-                    }
-                } else {
-                    known.hosts.push(trust::KnownHost {
-                        name: if name.is_empty() { addr.clone() } else { name },
-                        addr,
-                        port,
-                        ..Default::default()
-                    });
-                }
-                self.save_known(&known);
-                self.last_probe = Instant::now() - Duration::from_secs(60); // probe it now
-            }
+            } => self.pair(addr, port, pin, device_name),
+            ConsoleCmd::SaveHost { name, addr, port } => self.save_host(name, addr, port),
             ConsoleCmd::UpdateHost {
                 key,
                 name,
                 addr,
                 port,
-            } => {
-                let mut known = trust::KnownHosts::load();
-                let Some(h) = index_for_key(&known, &key).and_then(|i| known.hosts.get_mut(i))
-                else {
-                    tracing::warn!(%key, "edit for an unknown host — ignoring");
-                    return;
-                };
-                // Edited IN PLACE rather than removed and re-added: the fingerprint, the
-                // learned MAC, the pinned cards and the preset binding all hang off this
-                // entry, and re-adding would silently unpair a host the user only renamed.
-                h.name = if name.trim().is_empty() {
-                    addr.clone()
-                } else {
-                    name
-                };
-                h.move_to(&addr, port);
-                self.save_known(&known);
-                self.last_probe = Instant::now() - Duration::from_secs(60); // the address moved
-            }
-            ConsoleCmd::ForgetHost { key } => {
-                let mut known = trust::KnownHosts::load();
-                let Some(i) = index_for_key(&known, &key) else {
-                    tracing::warn!(%key, "forget for an unknown host — ignoring");
-                    return;
-                };
-                match orchestrate::forget_host(&mut known, i) {
-                    Ok(gone) => {
-                        tracing::info!(name = %gone.name, addr = %gone.addr, "host forgotten")
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %format!("{e:#}"), "saving known hosts");
-                        self.console.set_notice(format!("Couldn't save — {e:#}"));
-                    }
-                }
-                // It may still be advertising, in which case it comes straight back as a
-                // DISCOVERED row — unsaved and unpaired, which is the honest state.
-                self.last_probe = Instant::now() - Duration::from_secs(60);
-            }
-            ConsoleCmd::UnpairHost { key } => {
-                let mut known = trust::KnownHosts::load();
-                let Some(i) = index_for_key(&known, &key) else {
-                    tracing::warn!(%key, "unpair for an unknown host — ignoring");
-                    return;
-                };
-                let host = &mut known.hosts[i];
-                let fp = std::mem::take(&mut host.fp_hex);
-                host.paired = false;
-                let (id, name) = (host.id.clone(), host.name.clone());
-                self.save_known(&known);
-                // The catalog cache is keyed on the fingerprint just dropped; nothing reaches
-                // it again, so it goes now, as a forget's does.
-                pf_client_core::library_cache::forget(&fp);
-                // An unpaired host is no landing: the resolver skips it, and this stops a
-                // later re-pair inheriting the choice.
-                let mut settings = trust::Settings::load();
-                if start::clear_default(&mut settings, id.as_deref()) {
-                    settings.save();
-                }
-                tracing::info!(%name, "host unpaired");
-            }
-            ConsoleCmd::Wake { key, then_connect } => {
-                if let Some(c) = self.wake_cancel.take() {
-                    c.store(true, Ordering::SeqCst);
-                }
-                let Some(row) = self.rows().into_iter().find(|r| r.key == key) else {
-                    return;
-                };
-                let known = trust::KnownHosts::load();
-                let macs = index_for_key(&known, &row.key)
-                    .map(|i| known.hosts[i].mac.clone())
-                    .unwrap_or_default();
-                if macs.is_empty() {
-                    self.console.set_pair(PairPhase::Idle); // no-op; keep state sane
-                    return;
-                }
-                let cancel = Arc::new(AtomicBool::new(false));
-                self.wake_cancel = Some(cancel.clone());
-                spawn_wake(self.console.clone(), row, macs, then_connect, cancel);
-            }
+            } => self.update_host(key, name, addr, port),
+            ConsoleCmd::ForgetHost { key } => self.forget_host(key),
+            ConsoleCmd::UnpairHost { key } => self.unpair_host(key),
+            ConsoleCmd::Wake { key, then_connect } => self.wake(key, then_connect),
             ConsoleCmd::CancelWake => {
                 if let Some(c) = self.wake_cancel.take() {
                     c.store(true, Ordering::SeqCst);
@@ -830,25 +585,7 @@ impl ServiceState {
                 id,
                 name,
                 overrides,
-            } => {
-                let mut file = pf_client_core::presets::PresetsFile::load();
-                let overrides = serde_json::from_value(overrides).unwrap_or_default();
-                match file.presets.iter_mut().find(|p| p.id == id) {
-                    Some(p) => {
-                        p.name = name;
-                        p.overrides = overrides;
-                    }
-                    None => {
-                        let mut p = pf_client_core::presets::StreamPreset::new(name);
-                        p.id = id;
-                        p.overrides = overrides;
-                        file.presets.push(p);
-                    }
-                }
-                if let Err(e) = file.save() {
-                    tracing::warn!(error = %e, "preset did not save");
-                }
-            }
+            } => save_preset(id, name, overrides),
             ConsoleCmd::DeletePreset { id } => {
                 let mut file = pf_client_core::presets::PresetsFile::load();
                 file.presets.retain(|p| p.id != id);
@@ -873,70 +610,352 @@ impl ServiceState {
                 key,
                 preset_id,
                 pin,
-            } => {
-                // Presentation only (design §5.2a): order = card order, appended at the
-                // end; never touches `preset_id` (the default binding). Idempotent, so
-                // a repeated press inside one refresh window can't double-pin.
-                let mut known = trust::KnownHosts::load();
-                let idx = index_for_key(&known, &key);
-                let Some(h) = idx.and_then(|i| known.hosts.get_mut(i)) else {
-                    tracing::warn!(%key, "pin toggle for an unknown host — ignoring");
-                    return;
-                };
-                if pin && !h.pinned_presets.contains(&preset_id) {
-                    h.pinned_presets.push(preset_id);
-                } else if !pin {
-                    h.pinned_presets.retain(|id| *id != preset_id);
-                }
-                self.save_known(&known);
-                // `run` refreshes the rows right after this drain, so the carousel and
-                // the pin screen reflect the new card within the same service pass.
-            }
+            } => self.set_pin(key, preset_id, pin),
             ConsoleCmd::BindPreset {
                 key,
                 game,
                 preset_id,
-            } => {
-                // The BINDING half of the preset pair — `KnownHost::preset_id` for the
-                // host, `game_presets` for one title. `SetPin` above is the presentation
-                // half and never touches either; this never touches the pins. Same store
-                // discipline, same refresh-after-drain.
-                let mut known = trust::KnownHosts::load();
-                let idx = index_for_key(&known, &key);
-                let Some(h) = idx.and_then(|i| known.hosts.get_mut(i)) else {
-                    tracing::warn!(%key, "preset bind for an unknown host — ignoring");
-                    return;
-                };
-                let changed = match &game {
-                    Some(id) => {
-                        let moved = h.preset_for_game(id) != preset_id.as_deref();
-                        h.bind_game_preset(id, preset_id.as_deref());
-                        moved
+            } => self.bind_preset(key, game, preset_id),
+            ConsoleCmd::SetClipboard { key, on } => self.set_clipboard(key, on),
+        }
+    }
+
+    fn fetch_library(&self, addr: String, mgmt: u16, fp_hex: String) {
+        // Opening a library is the earliest signal that somebody intends to play, so
+        // the box is woken HERE, not at connect time. Empty with auto-wake off or no
+        // MAC on record: the fetch then asks once instead of retrying across a boot.
+        let known = trust::KnownHosts::load();
+        let macs = known
+            .find_by_fp(&fp_hex)
+            .or_else(|| {
+                known
+                    .hosts
+                    .iter()
+                    .find(|h| h.fp_hex.is_empty() && h.addr == addr)
+            })
+            .filter(|_| trust::Settings::load().auto_wake)
+            .map(|h| h.mac.clone())
+            .unwrap_or_default();
+        spawn_fetch(
+            self.library.clone(),
+            addr,
+            mgmt,
+            self.identity.clone(),
+            fp_hex.clone(),
+            trust::parse_hex32(&fp_hex),
+            macs,
+        );
+    }
+
+    fn refresh_running(&self, addr: String, mgmt: u16, fp_hex: String) {
+        // The carousel behind the shelf reads a different cache for the same fact;
+        // dropping it here is what stops a tile advertising the game just quit.
+        library::invalidate_running(&fp_hex);
+        // Blocking network on a worker, like every other command here: the service
+        // loop's own host refresh must keep running while a just-ended stream's host
+        // is asked what it still has up.
+        let shared = self.library.clone();
+        let identity = self.identity.clone();
+        let pin = trust::parse_hex32(&fp_hex);
+        std::thread::Builder::new()
+            .name("punktfunk-running".into())
+            .spawn(move || {
+                shared.set_running(&library::fetch_running(&addr, mgmt, &identity, pin));
+            })
+            .ok();
+    }
+
+    fn send_logs(&self, addr: String, mgmt: u16, fp_hex: String, host_name: String) {
+        // Blocking network (5 s connect / 10 s global, the library agent's budgets) —
+        // a worker thread keeps the service loop's host refresh alive meanwhile. The
+        // result lands as a shared-model notice; the shell toasts it on its next sync.
+        let identity = self.identity.clone();
+        let console = self.console.clone();
+        std::thread::Builder::new()
+            .name("punktfunk-sendlogs".into())
+            .spawn(move || {
+                console.set_notice(pf_client_core::logring::send_bundle(
+                    "punktfunk-session",
+                    &host_name,
+                    &addr,
+                    mgmt,
+                    &identity,
+                    &fp_hex,
+                ));
+            })
+            .ok();
+    }
+
+    fn speed_test(&self, key: String, addr: String, port: u16, fp_hex: String, host_name: String) {
+        // A worker like every other command here, but a long one: the probe opens
+        // its own session and bursts for two seconds. The shell already raised the
+        // takeover, so this only advances the phase and feeds its graph.
+        let identity = self.identity.clone();
+        let console = self.console.clone();
+        std::thread::Builder::new()
+            .name("punktfunk-speedtest".into())
+            .spawn(move || {
+                console.advance_speed(&key, SpeedPhase::Measuring);
+                let fp = (!fp_hex.is_empty()).then_some(fp_hex.as_str());
+                let progress = |kbps| console.advance_speed(&key, SpeedPhase::Progress { kbps });
+                let run = pf_client_core::speed::run_speed_probe_with;
+                match run(&addr, port, fp, identity, progress) {
+                    Ok(r) => {
+                        tracing::info!(
+                            host = %host_name,
+                            kbps = r.throughput_kbps,
+                            loss = r.loss_pct,
+                            "speed test finished"
+                        );
+                        console.advance_speed(
+                            &key,
+                            SpeedPhase::Done {
+                                throughput_kbps: r.throughput_kbps,
+                                loss_pct: r.loss_pct,
+                                recommended_kbps: pf_client_core::speed::recommended_kbps(
+                                    r.throughput_kbps,
+                                ),
+                            },
+                        );
                     }
-                    None => {
-                        let moved = h.preset_id != preset_id;
-                        h.preset_id = preset_id;
-                        moved
+                    Err(e) => {
+                        tracing::warn!(host = %host_name, error = %e, "speed test failed");
+                        console.advance_speed(&key, SpeedPhase::Failed(e));
                     }
-                };
-                if changed {
-                    self.save_known(&known);
                 }
-            }
-            ConsoleCmd::SetClipboard { key, on } => {
-                // Per-host clipboard trust (`KnownHost::clipboard_sync`) — the host
-                // menu's toggle. Same store discipline as the two arms above.
-                let mut known = trust::KnownHosts::load();
-                let idx = index_for_key(&known, &key);
-                let Some(h) = idx.and_then(|i| known.hosts.get_mut(i)) else {
-                    tracing::warn!(%key, "clipboard toggle for an unknown host — ignoring");
-                    return;
-                };
-                if h.clipboard_sync != on {
-                    h.clipboard_sync = on;
-                    self.save_known(&known);
+            })
+            .ok();
+    }
+
+    fn host_action(
+        &self,
+        addr: String,
+        mgmt: u16,
+        fp_hex: String,
+        host_name: String,
+        action_id: String,
+        label: String,
+    ) {
+        // Same lane and budgets as SendLogs above, and the same worker-thread reason.
+        // The tile goes dark on its own once the host acts.
+        let identity = self.identity.clone();
+        let console = self.console.clone();
+        std::thread::Builder::new()
+            .name("punktfunk-hostaction".into())
+            .spawn(move || {
+                console.set_notice(pf_client_core::host_actions::run(
+                    &host_name, &addr, mgmt, &identity, &fp_hex, &action_id, &label,
+                ));
+            })
+            .ok();
+    }
+
+    fn pair(&self, addr: String, port: u16, pin: String, device_name: String) {
+        // What the list calls each identity at this address (advert or store), picked
+        // once the ceremony says which one answered: both OS installs of a dual-boot
+        // box sit here, and the first row is not necessarily this one.
+        let named: Vec<(String, String)> = self
+            .rows()
+            .into_iter()
+            .filter(|r| r.addr == addr && r.port == port)
+            .map(|r| (r.fp_hex, r.name))
+            .collect();
+        self.console.set_pair(PairPhase::Busy);
+        let console = self.console.clone();
+        let identity = self.identity.clone();
+        std::thread::Builder::new()
+            .name("punktfunk-pair".into())
+            .spawn(move || {
+                match trust::pair_with_host(&addr, port, &identity, &pin, &device_name) {
+                    Ok(fp) => {
+                        let fp_hex = trust::hex(&fp);
+                        let name = named
+                            .iter()
+                            .find(|(f, _)| *f == fp_hex)
+                            .or_else(|| named.iter().find(|(f, _)| f.is_empty()))
+                            .map_or_else(|| addr.clone(), |(_, n)| n.clone());
+                        if let Err(e) = trust::persist_host(&name, &addr, port, &fp_hex, true, &[])
+                        {
+                            tracing::warn!(error = %format!("{e:#}"), "saving the paired host");
+                        }
+                        console.set_pair(PairPhase::Paired { key: fp_hex });
+                    }
+                    Err(e) => {
+                        // Cause-specific wording (wrong PIN vs not-armed vs unreachable
+                        // vs a typed host rejection) — shared with every other surface.
+                        console.set_pair(PairPhase::Failed(trust::pair_error_message(&e)));
+                    }
                 }
+            })
+            .ok();
+    }
+
+    fn save_host(&mut self, name: String, addr: String, port: u16) {
+        let mut known = trust::KnownHosts::load();
+        // A manual entry has no pin yet: it renames the placeholder at its address or
+        // adds one. A record pinned there is another identity — the other OS of a
+        // dual-boot box — and keeps its name.
+        if let Some(h) = known
+            .placeholder_at(&addr, port)
+            .and_then(|i| known.hosts.get_mut(i))
+        {
+            if !name.is_empty() {
+                h.name = name;
             }
+        } else {
+            known.hosts.push(trust::KnownHost {
+                name: if name.is_empty() { addr.clone() } else { name },
+                addr,
+                port,
+                ..Default::default()
+            });
+        }
+        self.save_known(&known);
+        self.last_probe = Instant::now() - Duration::from_secs(60); // probe it now
+    }
+
+    fn update_host(&mut self, key: String, name: String, addr: String, port: u16) {
+        let mut known = trust::KnownHosts::load();
+        let Some(h) = index_for_key(&known, &key).and_then(|i| known.hosts.get_mut(i)) else {
+            tracing::warn!(%key, "edit for an unknown host — ignoring");
+            return;
+        };
+        // Edited IN PLACE rather than removed and re-added: the fingerprint, the
+        // learned MAC, the pinned cards and the preset binding all hang off this
+        // entry, and re-adding would silently unpair a host the user only renamed.
+        h.name = if name.trim().is_empty() {
+            addr.clone()
+        } else {
+            name
+        };
+        h.move_to(&addr, port);
+        self.save_known(&known);
+        self.last_probe = Instant::now() - Duration::from_secs(60); // the address moved
+    }
+
+    fn forget_host(&mut self, key: String) {
+        let mut known = trust::KnownHosts::load();
+        let Some(i) = index_for_key(&known, &key) else {
+            tracing::warn!(%key, "forget for an unknown host — ignoring");
+            return;
+        };
+        match orchestrate::forget_host(&mut known, i) {
+            Ok(gone) => {
+                tracing::info!(name = %gone.name, addr = %gone.addr, "host forgotten")
+            }
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "saving known hosts");
+                self.console.set_notice(format!("Couldn't save — {e:#}"));
+            }
+        }
+        // It may still be advertising, in which case it comes straight back as a
+        // DISCOVERED row — unsaved and unpaired, which is the honest state.
+        self.last_probe = Instant::now() - Duration::from_secs(60);
+    }
+
+    fn unpair_host(&self, key: String) {
+        let mut known = trust::KnownHosts::load();
+        let Some(i) = index_for_key(&known, &key) else {
+            tracing::warn!(%key, "unpair for an unknown host — ignoring");
+            return;
+        };
+        let host = &mut known.hosts[i];
+        let fp = std::mem::take(&mut host.fp_hex);
+        host.paired = false;
+        let (id, name) = (host.id.clone(), host.name.clone());
+        self.save_known(&known);
+        // The catalog cache is keyed on the fingerprint just dropped; nothing reaches
+        // it again, so it goes now, as a forget's does.
+        pf_client_core::library_cache::forget(&fp);
+        // An unpaired host is no landing: the resolver skips it, and this stops a
+        // later re-pair inheriting the choice.
+        let mut settings = trust::Settings::load();
+        if start::clear_default(&mut settings, id.as_deref()) {
+            settings.save();
+        }
+        tracing::info!(%name, "host unpaired");
+    }
+
+    fn wake(&mut self, key: String, then_connect: bool) {
+        if let Some(c) = self.wake_cancel.take() {
+            c.store(true, Ordering::SeqCst);
+        }
+        let Some(row) = self.rows().into_iter().find(|r| r.key == key) else {
+            return;
+        };
+        let known = trust::KnownHosts::load();
+        let macs = index_for_key(&known, &row.key)
+            .map(|i| known.hosts[i].mac.clone())
+            .unwrap_or_default();
+        if macs.is_empty() {
+            self.console.set_pair(PairPhase::Idle); // no-op; keep state sane
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.wake_cancel = Some(cancel.clone());
+        spawn_wake(self.console.clone(), row, macs, then_connect, cancel);
+    }
+
+    fn set_pin(&self, key: String, preset_id: String, pin: bool) {
+        // Presentation only (design §5.2a): order = card order, appended at the
+        // end; never touches `preset_id` (the default binding). Idempotent, so
+        // a repeated press inside one refresh window can't double-pin.
+        let mut known = trust::KnownHosts::load();
+        let idx = index_for_key(&known, &key);
+        let Some(h) = idx.and_then(|i| known.hosts.get_mut(i)) else {
+            tracing::warn!(%key, "pin toggle for an unknown host — ignoring");
+            return;
+        };
+        if pin && !h.pinned_presets.contains(&preset_id) {
+            h.pinned_presets.push(preset_id);
+        } else if !pin {
+            h.pinned_presets.retain(|id| *id != preset_id);
+        }
+        self.save_known(&known);
+        // `run` refreshes the rows right after this drain, so the carousel and
+        // the pin screen reflect the new card within the same service pass.
+    }
+
+    fn bind_preset(&self, key: String, game: Option<String>, preset_id: Option<String>) {
+        // The BINDING half of the preset pair — `KnownHost::preset_id` for the
+        // host, `game_presets` for one title. `SetPin` above is the presentation
+        // half and never touches either; this never touches the pins. Same store
+        // discipline, same refresh-after-drain.
+        let mut known = trust::KnownHosts::load();
+        let idx = index_for_key(&known, &key);
+        let Some(h) = idx.and_then(|i| known.hosts.get_mut(i)) else {
+            tracing::warn!(%key, "preset bind for an unknown host — ignoring");
+            return;
+        };
+        let changed = match &game {
+            Some(id) => {
+                let moved = h.preset_for_game(id) != preset_id.as_deref();
+                h.bind_game_preset(id, preset_id.as_deref());
+                moved
+            }
+            None => {
+                let moved = h.preset_id != preset_id;
+                h.preset_id = preset_id;
+                moved
+            }
+        };
+        if changed {
+            self.save_known(&known);
+        }
+    }
+
+    fn set_clipboard(&self, key: String, on: bool) {
+        // Per-host clipboard trust (`KnownHost::clipboard_sync`) — the host
+        // menu's toggle. Same store discipline as `set_pin`.
+        let mut known = trust::KnownHosts::load();
+        let idx = index_for_key(&known, &key);
+        let Some(h) = idx.and_then(|i| known.hosts.get_mut(i)) else {
+            tracing::warn!(%key, "clipboard toggle for an unknown host — ignoring");
+            return;
+        };
+        if h.clipboard_sync != on {
+            h.clipboard_sync = on;
+            self.save_known(&known);
         }
     }
 
@@ -1208,6 +1227,26 @@ fn spawn_wake(
 /// How often to ask a host we have just sent a magic packet to, across the whole
 /// [`WAKE_TIMEOUT_SECS`] a cold box may take to POST and start serving.
 const WAKE_RETRY_EVERY: Duration = Duration::from_secs(5);
+
+fn save_preset(id: String, name: String, overrides: serde_json::Value) {
+    let mut file = pf_client_core::presets::PresetsFile::load();
+    let overrides = serde_json::from_value(overrides).unwrap_or_default();
+    match file.presets.iter_mut().find(|p| p.id == id) {
+        Some(p) => {
+            p.name = name;
+            p.overrides = overrides;
+        }
+        None => {
+            let mut p = pf_client_core::presets::StreamPreset::new(name);
+            p.id = id;
+            p.overrides = overrides;
+            file.presets.push(p);
+        }
+    }
+    if let Err(e) = file.save() {
+        tracing::warn!(error = %e, "preset did not save");
+    }
+}
 
 /// Fetch the library off the service thread, then stream poster art into the shared
 /// model as results land (the renderer drains `push_art` per frame).
