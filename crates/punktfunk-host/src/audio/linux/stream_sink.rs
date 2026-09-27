@@ -18,7 +18,7 @@
 //! a restore target (that would wedge routing on a ghost). Restore then deletes
 //! the key and WirePlumber elects from availability.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::Result;
 use std::sync::Mutex;
 
 /// `node.name` prefix for every host-owned stream sink. Full names uniqued
@@ -191,177 +191,24 @@ struct Seen {
     effective: Option<String>,
 }
 
-/// Connect, find `default` metadata, read both sink keys, set `value` on
-/// [`CONFIGURED_SINK_KEY`] (`None` deletes). Own short-lived main loop on the
-/// calling thread — claims come from session start/end, never a PW callback.
+/// Read both sink keys from `default` metadata, then set `value` on [`CONFIGURED_SINK_KEY`]
+/// (`None` deletes). Own short-lived main loop on the calling thread — claims come from
+/// session start/end, never a PW callback. The ledger lock is held across this call, so
+/// the one-shot's timeout is what bounds a sick-but-connected daemon.
 fn set_configured_sink(value: Option<&str>) -> Result<Seen> {
-    use pipewire as pw;
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    pf_capture::pwinit::ensure_init();
-    let mainloop = pw::main_loop::MainLoopRc::new(None).context("claim MainLoop")?;
-    let context = pw::context::ContextRc::new(&mainloop, None).context("claim Context")?;
-    let core = context
-        .connect_rc(None)
-        .context("claim connect (is PipeWire running in this session?)")?;
-    let registry = core.get_registry_rc().context("claim registry")?;
-
-    /// Round-trip phases: 0 = globals replaying, 1 = metadata properties
-    /// replaying, 2 = mutation flushing.
-    struct Op {
-        metadata: Option<pw::metadata::Metadata>,
-        md_listener: Option<pw::metadata::MetadataListener>,
-        previous: Option<String>,
-        effective: Option<String>,
-        phase: u8,
-        expected: Option<pw::spa::utils::result::AsyncSeq>,
-        outcome: Option<Result<()>>,
-    }
-    let op = Rc::new(RefCell::new(Op {
-        metadata: None,
-        md_listener: None,
-        previous: None,
-        effective: None,
-        phase: 0,
-        expected: None,
-        outcome: None,
-    }));
-
-    let _registry_listener = registry
-        .add_listener_local()
-        .global({
-            let op = op.clone();
-            let registry = registry.clone();
-            move |global| {
-                if global.type_ != pw::types::ObjectType::Metadata
-                    || op.borrow().metadata.is_some()
-                    || global.props.as_ref().and_then(|p| p.get("metadata.name")) != Some("default")
-                {
-                    return;
-                }
-                match registry.bind::<pw::metadata::Metadata, _>(global) {
-                    Ok(md) => {
-                        // Fresh bind replays existing properties; capture the
-                        // current configured sink before mutating it.
-                        let listener = md
-                            .add_listener_local()
-                            .property({
-                                let op = op.clone();
-                                move |subject, key, _type, value| {
-                                    if subject == 0 {
-                                        let mut o = op.borrow_mut();
-                                        match key {
-                                            Some(CONFIGURED_SINK_KEY) => {
-                                                o.previous = value.map(str::to_owned);
-                                            }
-                                            Some(EFFECTIVE_SINK_KEY) => {
-                                                o.effective = value.map(str::to_owned);
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                    0
-                                }
-                            })
-                            .register();
-                        let mut o = op.borrow_mut();
-                        o.metadata = Some(md);
-                        o.md_listener = Some(listener);
-                    }
-                    Err(e) => {
-                        op.borrow_mut().outcome = Some(Err(anyhow!("bind default metadata: {e}")));
-                    }
-                }
-            }
-        })
-        .register();
-
-    let value_owned = value.map(str::to_owned);
-    let _core_listener = core
-        .add_listener_local()
-        .done({
-            let op = op.clone();
-            let core = core.clone();
-            let mainloop = mainloop.clone();
-            move |id, seq| {
-                if id != pw::core::PW_ID_CORE {
-                    return;
-                }
-                let mut o = op.borrow_mut();
-                if o.expected != Some(seq) || o.outcome.is_some() {
-                    return;
-                }
-                match o.phase {
-                    0 => {
-                        // Globals replayed. Missing `default` metadata means no
-                        // session manager to negotiate with.
-                        if o.metadata.is_none() {
-                            o.outcome = Some(Err(anyhow!(
-                                "no 'default' metadata object (is WirePlumber running?)"
-                            )));
-                            mainloop.quit();
-                            return;
-                        }
-                        o.phase = 1;
-                        o.expected = core.sync(0).ok();
-                    }
-                    1 => {
-                        let md = o.metadata.as_ref().unwrap();
-                        md.set_property(
-                            0,
-                            CONFIGURED_SINK_KEY,
-                            value_owned.as_ref().map(|_| "Spa:String:JSON"),
-                            value_owned.as_deref(),
-                        );
-                        o.phase = 2;
-                        o.expected = core.sync(0).ok();
-                    }
-                    _ => {
-                        o.outcome = Some(Ok(()));
-                        mainloop.quit();
-                    }
-                }
-            }
-        })
-        .error({
-            let op = op.clone();
-            let mainloop = mainloop.clone();
-            move |id, _seq, res, message| {
-                op.borrow_mut().outcome.get_or_insert(Err(anyhow!(
-                    "pipewire core error id={id} res={res}: {message}"
-                )));
-                mainloop.quit();
-            }
-        })
-        .register();
-
-    // Ledger lock is held across this call — a sick-but-connected daemon must
-    // not wedge session start/end. Bail after 5 s.
-    let timer = mainloop.loop_().add_timer({
-        let op = op.clone();
-        let mainloop = mainloop.clone();
-        move |_| {
-            op.borrow_mut()
-                .outcome
-                .get_or_insert(Err(anyhow!("metadata round-trip timed out")));
-            mainloop.quit();
-        }
-    });
-    let _ = timer.update_timer(Some(std::time::Duration::from_secs(5)), None);
-
-    op.borrow_mut().expected = core.sync(0).ok();
-    mainloop.run();
-
-    let mut o = op.borrow_mut();
-    match o.outcome.take() {
-        Some(Ok(())) => Ok(Seen {
-            configured: o.previous.take(),
-            effective: o.effective.take(),
-        }),
-        Some(Err(e)) => Err(e),
-        None => Err(anyhow!("metadata loop exited unexpectedly")),
-    }
+    let session = super::pw_oneshot::OneShot::connect("claim", super::pw_oneshot::TIMEOUT)?;
+    let (metadata, mut defaults) = session.default_metadata()?;
+    metadata.set_property(
+        0,
+        CONFIGURED_SINK_KEY,
+        value.map(|_| "Spa:String:JSON"),
+        value,
+    );
+    session.round()?; // flush the write before the proxies drop
+    Ok(Seen {
+        configured: defaults.remove(CONFIGURED_SINK_KEY),
+        effective: defaults.remove(EFFECTIVE_SINK_KEY),
+    })
 }
 
 #[cfg(test)]

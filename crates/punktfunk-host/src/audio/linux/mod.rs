@@ -24,6 +24,7 @@ pub(crate) mod pad_sink;
 mod playing_apps;
 pub(crate) use playing_apps::playing_apps;
 pub(crate) mod pad_usb;
+mod pw_oneshot;
 mod stream_sink;
 
 use super::{AudioCapturer, MicBackendStats, VirtualMic, SAMPLE_RATE};
