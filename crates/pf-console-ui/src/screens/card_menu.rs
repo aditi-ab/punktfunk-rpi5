@@ -593,14 +593,15 @@ impl CardMenu {
                 fx.connect = Some(self.connect(self.host().pin.as_ref().map(|p| p.id.clone())));
                 fx.pop();
             }
-            // Rebase first: the store is a whole-file writer.
             Action::Favorite => {
                 let Subject::Game { host, game, .. } = &self.subject else {
                     return;
                 };
-                *ctx.settings = ctx.store.load();
-                let on = crate::library::toggle_favorite(ctx.settings, &host.fp_hex, &game.id);
-                ctx.store.save(ctx.settings);
+                let mut on = false;
+                ctx.write(|c| {
+                    on = crate::library::toggle_favorite(c.settings, &host.fp_hex, &game.id);
+                    true
+                });
                 fx.toast = Some(if on {
                     format!("{} is a favorite", game.title)
                 } else {
@@ -636,15 +637,15 @@ impl CardMenu {
                 fx.toast = Some(format!("Added {}", host.name));
                 fx.pop();
             }
-            // Whole-file writer: rebase on the store before mutating, or a setting another
-            // screen just wrote is reverted.
+            // Toggles what the row showed, not what the rebase reads.
             Action::MakeDefault => {
                 let on = !self.is_default(ctx.settings.default_host.as_deref());
                 let name = self.host().name.clone();
                 let id = self.host().id.clone();
-                *ctx.settings = ctx.store.load();
-                ctx.settings.default_host = on.then_some(id).flatten();
-                ctx.store.save(ctx.settings);
+                ctx.write(|c| {
+                    c.settings.default_host = on.then_some(id).flatten();
+                    true
+                });
                 let opens = start::StartIn::parse(&ctx.settings.start_in) != start::StartIn::Hosts;
                 fx.toast = Some(match (on, opens) {
                     (true, true) => format!("{name} opens on launch"),

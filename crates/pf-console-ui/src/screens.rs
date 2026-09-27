@@ -48,8 +48,8 @@ pub struct Ctx<'a> {
     /// Live library slot; the top screen owns it.
     pub library: &'a LibraryShared,
     pub settings: &'a mut trust::Settings,
-    /// Persistence for `settings` and the preset catalog. `load` immediately before a
-    /// mutation (rebase), then `save`.
+    /// Persistence for `settings` and the preset catalog. A settings change goes through
+    /// [`Ctx::write`].
     pub store: &'a dyn crate::store::SettingsStore,
     pub platform: crate::platform::Platform,
     /// This device's own screen ([`crate::shell::ConsoleOptions::screen`]).
@@ -72,6 +72,20 @@ pub struct Ctx<'a> {
     pub device_name: &'a str,
     /// Shell clock in seconds (spinners, pulses).
     pub t: f64,
+}
+
+impl Ctx<'_> {
+    /// Rebases `settings` on the store, runs `f`, and saves when `f` reports a change.
+    /// The store writes the whole file: a save without the rebase reverts another
+    /// writer's. Returns what `f` returned.
+    pub(crate) fn write(&mut self, f: impl FnOnce(&mut Self) -> bool) -> bool {
+        *self.settings = self.store.load();
+        let changed = f(self);
+        if changed {
+            self.store.save(self.settings);
+        }
+        changed
+    }
 }
 
 /// The text field a screen has open, for a host whose own keyboard types into it

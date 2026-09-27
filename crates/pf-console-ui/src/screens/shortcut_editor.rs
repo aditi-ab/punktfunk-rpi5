@@ -439,12 +439,13 @@ impl ShortcutEditorScreen {
             self.open_keys();
             return;
         }
-        *ctx.settings = ctx.store.load();
-        let mut cfg =
-            OverlayConfig::parse(&ctx.settings.overlay_actions, ring_platform(ctx.platform));
-        apply_draft(&mut cfg, &self.draft);
-        ctx.settings.overlay_actions = cfg.to_json();
-        ctx.store.save(ctx.settings);
+        ctx.write(|c| {
+            let mut cfg =
+                OverlayConfig::parse(&c.settings.overlay_actions, ring_platform(c.platform));
+            apply_draft(&mut cfg, &self.draft);
+            c.settings.overlay_actions = cfg.to_json();
+            true
+        });
         fx.toast = Some("Saved".into());
         fx.pop();
     }
@@ -453,12 +454,13 @@ impl ShortcutEditorScreen {
         let Some(id) = self.draft.id.clone() else {
             return;
         };
-        *ctx.settings = ctx.store.load();
-        let mut cfg =
-            OverlayConfig::parse(&ctx.settings.overlay_actions, ring_platform(ctx.platform));
-        remove_shortcut(&mut cfg, &id);
-        ctx.settings.overlay_actions = cfg.to_json();
-        ctx.store.save(ctx.settings);
+        ctx.write(|c| {
+            let mut cfg =
+                OverlayConfig::parse(&c.settings.overlay_actions, ring_platform(c.platform));
+            remove_shortcut(&mut cfg, &id);
+            c.settings.overlay_actions = cfg.to_json();
+            true
+        });
         fx.toast = Some("Removed".into());
         fx.pop();
     }
