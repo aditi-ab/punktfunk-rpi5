@@ -512,35 +512,9 @@ async def _run_cli(
     PyInstaller ``LD_LIBRARY_PATH`` leak breaks the flatpak's libcurl whatever binary inside the
     sandbox is being started."""
     prefix = _cli_argv()
-    if not prefix:
-        return -1, "", ""
-    proc = None
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *prefix, *args,
-            stdin=asyncio.subprocess.PIPE if stdin_text is not None else None,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env=_flatpak_env(),
-        )
-        payload = stdin_text.encode() if stdin_text is not None else None
-        out, err = await asyncio.wait_for(proc.communicate(payload), timeout=timeout)
-        rc = proc.returncode if proc.returncode is not None else -1
-        return (
-            rc,
-            (out or b"").decode("utf-8", "replace"),
-            (err or b"").decode("utf-8", "replace"),
-        )
-    except asyncio.TimeoutError:
-        decky.logger.warning("cli %s timed out", " ".join(args))
-        if proc:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-        return -1, "", ""
-    except Exception:  # noqa: BLE001
-        decky.logger.exception("cli %s failed", " ".join(args))
-        return -1, "", ""
+    return await _exec(
+        prefix and [*prefix, *args], f"cli {' '.join(args)}", timeout, stdin_text=stdin_text
+    )
 
 
 # The CLI's exit-code contract (clients/cli/src/main.rs): 0 ok, 2 connect failed, 3 trust
@@ -633,34 +607,60 @@ def _flatpak_env() -> dict:
     return env
 
 
-async def _flatpak_capture(args: list[str], timeout: float = 20.0) -> tuple[int, str]:
-    """Run ``flatpak <args>`` with the user-session env, merging stderr into stdout. Returns
-    ``(returncode, output)``; ``(-1, "")`` if the binary is missing or the call errors/times out.
-    Best-effort by design — every caller here treats a failure as "no update / can't tell"."""
-    flatpak = _flatpak()
-    if not flatpak:
-        return -1, ""
+async def _exec(
+    argv: list[str] | None,
+    label: str,
+    timeout: float,
+    *,
+    stdin_text: str | None = None,
+    merge_stderr: bool = False,
+) -> tuple[int, str, str]:
+    """Run ``argv`` with the user-session env, returning ``(returncode, stdout, stderr)`` decoded.
+    ``(-1, "", "")`` when ``argv`` is empty (nothing installed) or the call errors or times out.
+    ``merge_stderr`` folds stderr into stdout. A timed-out child is killed and reaped, so its
+    pipes close with it rather than at garbage collection."""
+    if not argv:
+        return -1, "", ""
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
-            flatpak, *args,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            *argv,
+            stdin=asyncio.subprocess.PIPE if stdin_text is not None else None,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT if merge_stderr else asyncio.subprocess.PIPE,
             env=_flatpak_env(),
         )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        payload = stdin_text.encode() if stdin_text is not None else None
+        out, err = await asyncio.wait_for(proc.communicate(payload), timeout=timeout)
         rc = proc.returncode if proc.returncode is not None else -1
-        return rc, (out or b"").decode("utf-8", "replace")
+        return (
+            rc,
+            (out or b"").decode("utf-8", "replace"),
+            (err or b"").decode("utf-8", "replace"),
+        )
     except asyncio.TimeoutError:
-        decky.logger.warning("flatpak %s timed out", " ".join(args))
+        decky.logger.warning("%s timed out", label)
         if proc:
             try:
                 proc.kill()
             except ProcessLookupError:
                 pass
-        return -1, ""
+            await proc.wait()
+        return -1, "", ""
     except Exception:  # noqa: BLE001
-        decky.logger.exception("flatpak %s failed", " ".join(args))
-        return -1, ""
+        decky.logger.exception("%s failed", label)
+        return -1, "", ""
+
+
+async def _flatpak_capture(args: list[str], timeout: float = 20.0) -> tuple[int, str]:
+    """Run ``flatpak <args>`` with the user-session env, merging stderr into stdout. Returns
+    ``(returncode, output)``; ``(-1, "")`` if the binary is missing or the call errors/times out.
+    Best-effort by design — every caller here treats a failure as "no update / can't tell"."""
+    flatpak = _flatpak()
+    rc, out, _ = await _exec(
+        flatpak and [flatpak, *args], f"flatpak {' '.join(args)}", timeout, merge_stderr=True
+    )
+    return rc, out
 
 
 async def _run_client(client_args: list[str], timeout: float = 20.0) -> tuple[int, str, str]:
@@ -674,34 +674,9 @@ async def _run_client(client_args: list[str], timeout: float = 20.0) -> tuple[in
     ``--set-host`` / ``--forget-host`` / ``--reset`` / ``--reachable``), so state is shared, not
     duplicated."""
     prefix = _client_argv()
-    if not prefix:
-        return -1, "", ""
-    argv = [*prefix, *client_args]
-    proc = None
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env=_flatpak_env(),
-        )
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        rc = proc.returncode if proc.returncode is not None else -1
-        return (
-            rc,
-            (out or b"").decode("utf-8", "replace"),
-            (err or b"").decode("utf-8", "replace"),
-        )
-    except asyncio.TimeoutError:
-        decky.logger.warning("client %s timed out", " ".join(client_args))
-        if proc:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-        return -1, "", ""
-    except Exception:  # noqa: BLE001
-        decky.logger.exception("client %s failed", " ".join(client_args))
-        return -1, "", ""
+    return await _exec(
+        prefix and [*prefix, *client_args], f"client {' '.join(client_args)}", timeout
+    )
 
 
 def _field_from(text: str, name: str) -> str:
