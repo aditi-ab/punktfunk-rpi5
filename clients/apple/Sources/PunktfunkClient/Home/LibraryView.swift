@@ -885,7 +885,10 @@ struct LibraryView: View {
         // waiting to find out whether it is needed costs more than sending it.
         let waking = !current.wakeMacs.isEmpty && PunktfunkConnection.wakeOnLANAvailable
         if waking {
-            _ = PunktfunkConnection.wakeOnLAN(macs: current.wakeMacs, lastKnownIP: current.address)
+            let (macs, address) = (current.wakeMacs, current.address)
+            DispatchQueue.global(qos: .userInitiated).async { // blocking sends — off main
+                PunktfunkConnection.wakeOnLAN(macs: macs, lastKnownIP: address)
+            }
         }
 
         // A woken box takes 20–60 s to answer, so one attempt would almost always land on a host
