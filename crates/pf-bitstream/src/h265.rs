@@ -26,7 +26,6 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::io::Cursor;
-use std::mem;
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -422,19 +421,11 @@ pub struct H265Planner {
     /// (7.4.7.1).
     last_independent_header: Option<SliceHeader>,
     next_pic_id: PicId,
-    /// Display-ready pictures queued while planning. Not cleared on a failed AU:
-    /// the next [`DpbUpdate`] carries them, so an error cannot swallow a frame.
-    pending_outputs: Vec<PicId>,
-    /// Ids the last [`DpbUpdate`] left alive: baseline for `removed`. Kept
-    /// across failed AUs so interim evictions are reported, never dropped.
-    reported_live: BTreeSet<PicId>,
-    /// The picture the last plan stored: the one a wave's close mark names.
-    last_stored: Option<PicId>,
     /// Set by [`Self::flush`]: planning resumes only at an IRAP.
     awaiting_idr: bool,
-    /// Resident pictures that came off a broken chain — the fact behind
-    /// [`PicturePlan::references_clean`]. See [`crate::clean::CleanLedger`].
-    clean: crate::clean::CleanLedger,
+    /// Outputs, `removed` baseline and the unclean marks behind
+    /// [`PicturePlan::references_clean`].
+    report: crate::report::AuReporter,
 }
 
 impl Default for H265Planner {
@@ -451,11 +442,8 @@ impl Default for H265Planner {
             first_picture_after_eos: true,
             last_independent_header: None,
             next_pic_id: 0,
-            pending_outputs: Vec::new(),
-            reported_live: BTreeSet::new(),
-            last_stored: None,
             awaiting_idr: false,
-            clean: Default::default(),
+            report: Default::default(),
         }
     }
 }
@@ -655,16 +643,17 @@ impl H265Planner {
         let cur = current
             .ok_or_else(|| PlanError::Parse("access unit contains no coded picture".into()))?;
 
-        // Ask over the slice lists, not the RPS/DPB snapshot: 8.3.2 retains
-        // pictures this AU does not use (`used_by_curr_pic` clear). An IRAP's
-        // lists are empty, so this is vacuously true (`CleanLedger`); a
-        // concealed picture's own warnings keep it unclean.
-        let references_clean = self.clean.references_clean(
+        // 8.3.2 retains pictures this AU does not use (`used_by_curr_pic`
+        // clear), so the slice lists decide. An IRAP's lists are empty, so this
+        // is vacuously true; a concealed picture's own warnings keep it unclean.
+        let concealed = warnings.iter().any(PlanWarning::is_integrity);
+        let references_clean = self.report.references_clean(
             slices
                 .iter()
                 .flat_map(|s: &SlicePlan| s.ref_list0.iter().chain(&s.ref_list1))
                 .map(|r| r.id),
-        ) && !warnings.iter().any(PlanWarning::is_integrity);
+            concealed,
+        );
         let picture = Self::picture_plan(&cur, recovery_point, references_clean);
         let rps = cur.rps_plan.clone();
         let dpb_refs = cur.dpb_refs.clone();
@@ -672,36 +661,15 @@ impl H265Planner {
         let pps = Rc::clone(&cur.first_slice_pps);
         let sps = Rc::clone(&pps.sps);
         let stored = self.finish_picture(cur)?;
-
-        // `removed` is vs what the backend last saw alive, not this call's
-        // start: a failed AU in between may have evicted pictures.
-        let live_after = self.live_ids();
-        let mut previously_live = mem::take(&mut self.reported_live);
-        previously_live.insert(stored);
-        let removed = previously_live.difference(&live_after).copied().collect();
-        self.reported_live = live_after;
-        self.last_stored = Some(stored);
-
-        // After `finish_picture` so `stored` is the real id and `live_after`
-        // reflects C.3.4/8.3.2 marking. A pre-marking write could survive an
-        // eviction. `is_integrity` is the one classification, so the ledger
-        // and the consumer cannot disagree.
-        self.clean.note_stored(
-            stored,
-            references_clean,
-            warnings.iter().any(PlanWarning::is_integrity),
-        );
-        self.clean.retain_live(self.reported_live.iter().copied());
+        let dpb = self
+            .report
+            .close(stored, self.live_ids(), references_clean, concealed);
 
         Ok(AuPlan {
             picture,
             rps,
             slices,
-            dpb: DpbUpdate {
-                stored: Some(stored),
-                outputs: mem::take(&mut self.pending_outputs),
-                removed,
-            },
+            dpb,
             dpb_refs,
             warnings,
             sps,
@@ -716,9 +684,7 @@ impl H265Planner {
     /// asks for the IDR. Every P this decoder meets names one active reference, the
     /// picture before it, so a healthy stream reads clean from the close on.
     pub fn forgive_unclean(&mut self) {
-        if let Some(id) = self.last_stored {
-            self.clean.forgive(id);
-        }
+        self.report.forgive_last();
     }
 
     /// Drain the DPB: every still-buffered picture becomes display-ready and
@@ -727,8 +693,7 @@ impl H265Planner {
     /// 8.3 decoding state is discarded; planning resumes only at an IRAP
     /// ([`PlanError::AwaitingIdr`]). Parameter sets survive (7.4.2.4).
     pub fn flush(&mut self) -> DpbUpdate {
-        let mut removed = mem::take(&mut self.reported_live);
-        removed.extend(self.live_ids());
+        let live = self.live_ids();
         self.drain_dpb();
 
         self.rps = Default::default();
@@ -740,14 +705,7 @@ impl H265Planner {
         // (8.1.3), which is what makes non-IDR re-entry sound.
         self.first_picture_after_eos = true;
         self.awaiting_idr = true;
-        // DPB is empty; resume is an IRAP, clean by construction.
-        self.clean.clear();
-
-        DpbUpdate {
-            stored: None,
-            outputs: mem::take(&mut self.pending_outputs),
-            removed: removed.into_iter().collect(),
-        }
+        self.report.flush(live)
     }
 
     /// Envelope: no interlaced video, separate-colour-plane, SCC self-reference,
@@ -835,7 +793,7 @@ impl H265Planner {
                 break;
             }
             match self.dpb.bump(false) {
-                Some(entry) => self.pending_outputs.push(entry.1),
+                Some(entry) => self.report.pending_outputs.push(entry.1),
                 None => break,
             }
         }
@@ -843,7 +801,9 @@ impl H265Planner {
 
     fn drain_dpb(&mut self) {
         let pics = self.dpb.drain();
-        self.pending_outputs.extend(pics.into_iter().map(|e| e.1));
+        self.report
+            .pending_outputs
+            .extend(pics.into_iter().map(|e| e.1));
         self.dpb.clear();
     }
 

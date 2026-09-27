@@ -20,7 +20,6 @@ use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::io::Cursor;
-use std::mem;
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -408,19 +407,11 @@ pub struct H264Planner {
     prev_pic_info: PrevPicInfo,
     max_long_term_frame_idx: MaxLongTermFrameIdx,
     next_pic_id: PicId,
-    /// Display-ready pictures. Not cleared on a failed AU: the next [`DpbUpdate`]
-    /// carries them, so an error cannot swallow a frame.
-    pending_outputs: Vec<PicId>,
-    /// Ids the last [`DpbUpdate`] left alive; baseline for `removed`.
-    /// Kept across failed AUs so interim evictions are still reported.
-    reported_live: BTreeSet<PicId>,
-    /// The picture the last plan stored: the one a wave's close mark names.
-    last_stored: Option<PicId>,
     /// Set by [`Self::flush`]; planning resumes only at an IDR.
     awaiting_idr: bool,
-    /// Resident pictures off a broken chain; backs [`PicturePlan::references_clean`].
-    /// Empty on a healthy stream. See [`crate::clean::CleanLedger`].
-    clean: crate::clean::CleanLedger,
+    /// Outputs, `removed` baseline and the unclean marks behind
+    /// [`PicturePlan::references_clean`].
+    report: crate::report::AuReporter,
 }
 
 impl H264Planner {
@@ -531,16 +522,17 @@ impl H264Planner {
         let cur = current
             .ok_or_else(|| PlanError::Parse("access unit contains no coded picture".into()))?;
 
-        // Slice reference lists, not the DPB snapshot: a resident unreferenced
-        // damaged picture does not taint this AU. An IDR has an empty list, and
-        // so does a concealed picture — its own warnings keep it unclean, so a
-        // consumer reading the bit alone cannot lift onto it.
-        let references_clean = self.clean.references_clean(
+        // An IDR has empty lists, and so does a concealed picture — its own
+        // warnings keep it unclean, so a consumer reading the bit alone cannot
+        // lift onto it.
+        let concealed = warnings.iter().any(PlanWarning::is_integrity);
+        let references_clean = self.report.references_clean(
             slices
                 .iter()
                 .flat_map(|s: &SlicePlan| s.ref_list0.iter().chain(&s.ref_list1))
                 .map(|r| r.id),
-        ) && !warnings.iter().any(PlanWarning::is_integrity);
+            concealed,
+        );
         // Before `finish_picture`: MMCO 5 rewrites stored POC after this, but
         // backends submit the 8.2.1 values.
         let picture = Self::picture_plan(&cur, recovery_point, references_clean);
@@ -549,34 +541,16 @@ impl H264Planner {
         let sps = Rc::clone(&pps.sps);
         let dpb_refs = cur.dpb_refs.clone();
         let stored = self.finish_picture(cur, &mut warnings)?;
-
-        // Delta against the last reported live set, not this call's start: a
-        // failed AU in between may have evicted pictures that still need reporting.
-        let live_after = self.live_ids();
-        let mut previously_live = mem::take(&mut self.reported_live);
-        previously_live.insert(stored);
-        let removed = previously_live.difference(&live_after).copied().collect();
-        self.reported_live = live_after;
-        self.last_stored = Some(stored);
-
-        // After `finish_picture` so `stored` and `live_after` include this AU's
-        // marking. A pre-marking write could survive an eviction. `concealed`
-        // uses [`PlanWarning::is_integrity`] so ledger and consumer agree.
-        self.clean.note_stored(
-            stored,
-            references_clean,
-            warnings.iter().any(PlanWarning::is_integrity),
-        );
-        self.clean.retain_live(self.reported_live.iter().copied());
+        // `finish_picture` can add an integrity warning; the mark reads them all.
+        let concealed = warnings.iter().any(PlanWarning::is_integrity);
+        let dpb = self
+            .report
+            .close(stored, self.live_ids(), references_clean, concealed);
 
         Ok(AuPlan {
             picture,
             slices,
-            dpb: DpbUpdate {
-                stored: Some(stored),
-                outputs: mem::take(&mut self.pending_outputs),
-                removed,
-            },
+            dpb,
             dpb_refs,
             warnings,
             sps,
@@ -591,16 +565,13 @@ impl H264Planner {
     /// asks for the IDR. Every P this decoder meets names one active reference, the
     /// picture before it, so a healthy stream reads clean from the close on.
     pub fn forgive_unclean(&mut self) {
-        if let Some(id) = self.last_stored {
-            self.clean.forgive(id);
-        }
+        self.report.forgive_last();
     }
 
     /// Drain the DPB and discard 8.2.1/8.2.5 state. Planning resumes only at
     /// an IDR ([`PlanError::AwaitingIdr`]). Parameter sets survive (7.4.1.2).
     pub fn flush(&mut self) -> DpbUpdate {
-        let mut removed = mem::take(&mut self.reported_live);
-        removed.extend(self.live_ids());
+        let live = self.live_ids();
         self.drain_dpb();
 
         self.prev_ref_pic_info = Default::default();
@@ -608,14 +579,7 @@ impl H264Planner {
         self.max_long_term_frame_idx = Default::default();
         self.negotiation_info = Default::default();
         self.awaiting_idr = true;
-        // DPB empty; next picture is an IDR, clean by construction.
-        self.clean.clear();
-
-        DpbUpdate {
-            stored: None,
-            outputs: mem::take(&mut self.pending_outputs),
-            removed: removed.into_iter().collect(),
-        }
+        self.report.flush(live)
     }
 
     /// Reject interlaced and separate-colour-plane streams; hosts never emit them.
@@ -853,12 +817,16 @@ impl H264Planner {
     /// Queue pictures C.4.5.3 bumping declares ready for output.
     fn bump_as_needed(&mut self, current_pic: &PictureData) {
         let bumped = self.dpb.bump_as_needed(current_pic);
-        self.pending_outputs.extend(bumped.into_iter().flatten());
+        self.report
+            .pending_outputs
+            .extend(bumped.into_iter().flatten());
     }
 
     fn drain_dpb(&mut self) {
         let pics = self.dpb.drain();
-        self.pending_outputs.extend(pics.into_iter().flatten());
+        self.report
+            .pending_outputs
+            .extend(pics.into_iter().flatten());
     }
 
     /// Complementary first field, if any. Always `None` under the envelope
@@ -1596,9 +1564,9 @@ impl H264Planner {
 
     fn add_to_ready_queue(&mut self, pic: PictureData, id: PicId) {
         if matches!(pic.field, Field::Frame) {
-            self.pending_outputs.push(id);
+            self.report.pending_outputs.push(id);
         } else if let FieldRank::Second(..) = pic.field_rank() {
-            self.pending_outputs.push(id);
+            self.report.pending_outputs.push(id);
         }
     }
 

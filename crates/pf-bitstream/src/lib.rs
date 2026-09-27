@@ -16,6 +16,7 @@ pub mod av1;
 pub mod clean;
 pub mod h264;
 pub mod h265;
+mod report;
 pub mod sei;
 pub mod slots;
 
