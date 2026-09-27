@@ -8,16 +8,19 @@
 //! triggers 0..255), so the copy is ~1:1.
 //!
 //! Rumble is the reverse path: `XInputSetState` → driver `SET_STATE` into the section →
-//! [`GamepadManager::pump_rumble`] onto the 0xCA plane, matching Linux `EV_FF`.
+//! [`GamepadManager::pump_rumble`] onto the 0xCA plane, matching Linux `EV_FF`. Slots, unplug
+//! and the abandoned-rumble force-off are [`UhidManager`]'s.
 
 use super::gamepad_raii::{
     create_swdevice, DriverAttach, PadChannel, ProofTransport, SwDevice, SwDeviceProfile,
 };
-use crate::pad_slots::PadSlots;
+use super::xbox_proto::XboxState;
+use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::Result;
-use punktfunk_core::input::{GamepadEvent, MAX_PADS};
+use punktfunk_core::input::GamepadFrame;
+use punktfunk_core::quic::RichInput;
 use std::sync::atomic::{fence, AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // Driver maps this same struct; `offset_of!` so a layout change is a compile error.
 use pf_driver_proto::gamepad::XusbShm;
@@ -50,8 +53,9 @@ fn xusb_hwid() -> &'static str {
     }
 }
 
-/// One virtual Xbox 360 pad: `pf_xusb_<index>` plus the sealed `XusbShm` channel.
-struct XusbWinPad {
+/// One virtual Xbox 360 pad: `pf_xusb_<index>` plus the sealed `XusbShm` channel. `pub`
+/// because it is `PadProto::Pad`.
+pub struct XusbWinPad {
     _sw: SwDevice,
     channel: PadChannel,
     attach: DriverAttach,
@@ -103,9 +107,8 @@ impl XusbWinPad {
         })
     }
 
-    /// Write XInput state; `packet` last so XInput sees a coherent snapshot.
-    #[allow(clippy::too_many_arguments)]
-    fn write_state(&mut self, buttons: u16, lt: u8, rt: u8, lx: i16, ly: i16, rx: i16, ry: i16) {
+    /// Write XInput state (low-16 buttons); `packet` last so XInput sees a coherent snapshot.
+    fn write_state(&mut self, st: &XboxState) {
         self.packet = self.packet.wrapping_add(1);
         let base = self.channel.data_base();
         // SAFETY: `base` is the mapped `SHM_SIZE` section; every `OFF_*` is in range.
@@ -113,13 +116,13 @@ impl XusbWinPad {
         // store so an `Acquire` load never sees a torn body on ARM64 (x86-TSO: plain
         // stores). `OFF_PACKET` (== 4) is 4-aligned off the page-aligned base.
         unsafe {
-            std::ptr::write_unaligned(base.add(OFF_BUTTONS) as *mut u16, buttons);
-            *base.add(OFF_LT) = lt;
-            *base.add(OFF_RT) = rt;
-            std::ptr::write_unaligned(base.add(OFF_LX) as *mut i16, lx);
-            std::ptr::write_unaligned(base.add(OFF_LY) as *mut i16, ly);
-            std::ptr::write_unaligned(base.add(OFF_RX) as *mut i16, rx);
-            std::ptr::write_unaligned(base.add(OFF_RY) as *mut i16, ry);
+            std::ptr::write_unaligned(base.add(OFF_BUTTONS) as *mut u16, st.buttons as u16);
+            *base.add(OFF_LT) = st.left_trigger;
+            *base.add(OFF_RT) = st.right_trigger;
+            std::ptr::write_unaligned(base.add(OFF_LX) as *mut i16, st.ls_x);
+            std::ptr::write_unaligned(base.add(OFF_LY) as *mut i16, st.ls_y);
+            std::ptr::write_unaligned(base.add(OFF_RX) as *mut i16, st.rs_x);
+            std::ptr::write_unaligned(base.add(OFF_RY) as *mut i16, st.rs_y);
             fence(Ordering::Release);
             (*(base.add(OFF_PACKET) as *const AtomicU32)).store(self.packet, Ordering::Release);
         }
@@ -149,133 +152,59 @@ impl XusbWinPad {
     }
 }
 
-// Shared with UHID (`uhid_manager::rumble_idle_timeout`, default 2.5 s). XInput
-// vibration is level-triggered and persists until the game writes zero, so a
-// latched rumble would drone forever. Window sits above SDL's ~2 s resend so
-// an SDL host refreshes the clock before force-off.
-/// Session Xbox 360 pads — Windows analogue of Linux uinput-xpad (`new`/`handle`/`pump_rumble`).
-pub struct GamepadManager {
-    slots: PadSlots<XusbWinPad>,
-    last_rumble: Vec<(u8, u8)>,
-    /// Last `SET_STATE` per pad. Non-zero rumble older than `rumble_idle_timeout` is forced off.
-    last_active: Vec<Instant>,
+/// Windows XUSB [`PadProto`]: frame-only state, no rich plane, no hidout. Rumble arrives as
+/// `SET_STATE` (`XINPUT_VIBRATION`: two motors, no impulse triggers).
+#[derive(Default)]
+pub struct XusbWinProto;
+
+impl PadProto for XusbWinProto {
+    type Pad = XusbWinPad;
+    type State = XboxState;
+    const LABEL: &'static str = "Xbox 360/Windows";
+    const DEVICE: &'static str = "Xbox 360";
+    const CREATE_HINT: &'static str =
+        " (install/repair: punktfunk-host.exe driver install --gamepad)";
+
+    fn open(&mut self, idx: u8) -> Result<XusbWinPad> {
+        let p = XusbWinPad::open(idx)?;
+        tracing::info!(
+            index = idx,
+            "virtual Xbox 360 created (Windows XUSB companion)"
+        );
+        Ok(p)
+    }
+
+    fn merge_frame(&self, _prev: &XboxState, f: &GamepadFrame) -> XboxState {
+        XboxState::from_frame(f)
+    }
+
+    /// XInput has no rich plane.
+    fn apply_rich(&self, _st: &mut XboxState, _rich: RichInput) {}
+
+    fn write_state(&self, pad: &mut XusbWinPad, st: &XboxState) {
+        pad.write_state(st);
+    }
+
+    /// Motors are 0..255 and the wire 0..65535, so ×257; `large` → `low`, `small` → `high`.
+    /// A moved `rumble_seq` is the game driving the plane, even at an unchanged level.
+    fn service(&self, pad: &mut XusbWinPad, _idx: u8) -> PadFeedback {
+        let r = pad.service();
+        PadFeedback {
+            rumble: r.map(|(large, small)| (large as u16 * 257, small as u16 * 257, 0, 0)),
+            hidout: Vec::new(),
+            rumble_drove: Some(r.is_some()),
+            resync: false,
+        }
+    }
 }
 
-impl Default for GamepadManager {
-    fn default() -> GamepadManager {
-        GamepadManager::new()
-    }
-}
+/// Session Xbox 360 pads — Windows analogue of Linux uinput-xpad.
+pub type GamepadManager = UhidManager<XusbWinProto>;
 
-impl GamepadManager {
-    pub fn new() -> GamepadManager {
-        GamepadManager {
-            slots: PadSlots::new(
-                "Xbox 360/Windows",
-                "Xbox 360",
-                " (install/repair: punktfunk-host.exe driver install --gamepad)",
-            ),
-            last_rumble: vec![(0, 0); MAX_PADS],
-            last_active: (0..MAX_PADS).map(|_| Instant::now()).collect(),
-        }
-    }
-
-    /// Show this session's pads to one seat alone
-    /// ([`PadSlots::expose_in`](crate::pad_slots::PadSlots::expose_in)).
-    pub fn expose_in(&mut self, dir: Option<std::path::PathBuf>) {
-        self.slots.expose_in(dir);
-    }
-
-    /// Pads actually built. Harness-only; see [`crate::uhid_manager::UhidManager::live_pads`].
-    pub fn live_pads(&self) -> usize {
-        self.slots.live()
-    }
-
-    fn ensure(&mut self, idx: usize) {
-        if self.slots.ensure(idx, XusbWinPad::open) {
-            tracing::info!(
-                index = idx,
-                "virtual Xbox 360 created (Windows XUSB companion)"
-            );
-            self.last_rumble[idx] = (0, 0);
-            self.last_active[idx] = Instant::now();
-        }
-    }
-
-    pub fn handle(&mut self, ev: &GamepadEvent) {
-        match ev {
-            GamepadEvent::Arrival { index, kind, .. } => {
-                tracing::info!(index, kind, "controller arrival (Xbox 360/Windows)");
-                self.ensure(*index as usize);
-            }
-            GamepadEvent::State(f) => {
-                let idx = f.index as usize;
-                if idx >= MAX_PADS {
-                    return;
-                }
-                // Mask bit cleared: arm grace here; the drop lands on a later `pump_rumble`.
-                // XUSB has no rich plane to clear on re-claim.
-                let swept = self.slots.sweep(f.active_mask).dropped;
-                self.reset_swept(swept);
-                if f.active_mask & (1 << idx) == 0 {
-                    return;
-                }
-                self.ensure(idx);
-                if let Some(pad) = self.slots.get_mut(idx) {
-                    pad.write_state(
-                        (f.buttons & 0xffff) as u16,
-                        f.left_trigger,
-                        f.right_trigger,
-                        f.ls_x,
-                        f.ls_y,
-                        f.rs_x,
-                        f.rs_y,
-                    );
-                }
-            }
-        }
-    }
-
-    /// Clear rumble clocks for indices a sweep or reap just dropped.
-    fn reset_swept(&mut self, swept: u16) {
-        for i in 0..MAX_PADS {
-            if swept & (1 << i) != 0 {
-                self.last_rumble[i] = (0, 0);
-                self.last_active[i] = Instant::now();
-            }
-        }
-    }
-
-    /// Relay changed rumble. Motors are 0..255, wire is 0..65535, so ×257.
-    /// `large` → `low`, `small` → `high`. Trigger args stay 0: `SET_STATE` is
-    /// `XINPUT_VIBRATION` (two motors); impulse rumble is HID/WGI only.
-    pub fn pump_rumble(&mut self, mut send: impl FnMut(u16, u16, u16, u16, u16)) {
-        // Reap unplugs whose removal frame only armed grace; else the devnode outlives the pad.
-        let swept = self.slots.reap();
-        self.reset_swept(swept);
-        for (i, pad) in self.slots.iter_mut() {
-            if let Some((large, small)) = pad.service() {
-                // Seq moved: refresh even if the level is unchanged, so a held rumble stays live.
-                self.last_active[i] = Instant::now();
-                if self.last_rumble[i] != (large, small) {
-                    self.last_rumble[i] = (large, small);
-                    send(i as u16, large as u16 * 257, small as u16 * 257, 0, 0);
-                }
-            } else if self.last_rumble[i] != (0, 0)
-                && crate::uhid_manager::rumble_idle_timeout()
-                    .is_some_and(|t| self.last_active[i].elapsed() >= t)
-            {
-                // Latched rumble, no SET_STATE for the idle window — force off.
-                tracing::info!(
-                    index = i,
-                    prev_low = self.last_rumble[i].0 as u16 * 257,
-                    prev_high = self.last_rumble[i].1 as u16 * 257,
-                    "rumble: stale residual (game stopped driving the pad) — forcing off"
-                );
-                self.last_rumble[i] = (0, 0);
-                send(i as u16, 0, 0, 0, 0);
-            }
-        }
+impl UhidManager<XusbWinProto> {
+    /// Relay changed rumble. XInput has no rich-feedback plane, so there is no hidout sink.
+    pub fn pump_rumble(&mut self, send: impl FnMut(u16, u16, u16, u16, u16)) {
+        self.pump(send, |_| {});
     }
 }
 

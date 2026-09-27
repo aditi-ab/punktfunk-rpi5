@@ -14,7 +14,7 @@
 //! lands every control on the wrong action. Reserved slots 3, 6, 9, 10 are Microsoft's — leave
 //! them empty.
 
-use punktfunk_core::input::gamepad as gs;
+use punktfunk_core::input::{gamepad as gs, GamepadFrame};
 
 /// The Series report, id included. One S and Elite publish only its first
 /// [`pf_driver_proto::xbox::input_len`] bytes, which stop before Share.
@@ -75,6 +75,19 @@ impl XboxState {
             rs_x,
             rs_y,
         }
+    }
+
+    /// A frame fully replaces the state: an Xbox pad has no rich-plane fields to keep.
+    pub fn from_frame(f: &GamepadFrame) -> XboxState {
+        XboxState::from_gamepad(
+            f.buttons,
+            f.left_trigger,
+            f.right_trigger,
+            f.ls_x,
+            f.ls_y,
+            f.rs_x,
+            f.rs_y,
+        )
     }
 }
 

@@ -279,17 +279,8 @@ impl PadProto for XboxWinProto {
         Ok(p)
     }
 
-    /// Frame fully replaces state — no rich-plane fields to preserve.
     fn merge_frame(&self, _prev: &XboxState, f: &punktfunk_core::input::GamepadFrame) -> XboxState {
-        XboxState::from_gamepad(
-            f.buttons,
-            f.left_trigger,
-            f.right_trigger,
-            f.ls_x,
-            f.ls_y,
-            f.rs_x,
-            f.rs_y,
-        )
+        XboxState::from_frame(f)
     }
 
     /// No rich plane on an Xbox pad.

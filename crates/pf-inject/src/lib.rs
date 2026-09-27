@@ -868,9 +868,9 @@ pub mod triton_windows;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/uhid_abi.rs"]
 pub mod uhid_abi;
-/// Stateful virtual-pad manager ([`uhid_manager::UhidManager`]) — event routing, frame
-/// merge, heartbeat, and feedback pump shared by the five UHID/UMDF backends; each supplies
-/// only its protocol via [`uhid_manager::PadProto`].
+/// Virtual-pad manager ([`uhid_manager::UhidManager`]) — event routing, frame merge,
+/// heartbeat, and feedback pump shared by every UHID and UMDF pad, XUSB included; each
+/// supplies only its protocol via [`uhid_manager::PadProto`].
 #[path = "inject/uhid_manager.rs"]
 pub mod uhid_manager;
 /// `/dev/uinput` ABI and device shared by the uinput pad and pen.

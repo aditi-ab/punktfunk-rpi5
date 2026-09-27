@@ -1,11 +1,11 @@
-//! Stateful virtual-pad manager ([`UhidManager`]) shared by the five backends that keep a full
-//! per-pad report (Linux UHID DualSense / DualShock 4 / Steam Deck, Windows UMDF DualSense /
-//! DualShock 4). Event routing, frame merge, rich-input, silence heartbeat, and the rumble +
-//! hidout-dedup feedback pump live here; a backend supplies only its per-controller pieces via
-//! [`PadProto`].
+//! Virtual-pad manager ([`UhidManager`]) shared by the Linux UHID/usbip pads and every Windows
+//! UMDF pad, XUSB included. Event routing, frame merge, rich-input, silence heartbeat, and the
+//! rumble + hidout-dedup feedback pump live here; a backend supplies only its per-controller
+//! pieces via [`PadProto`].
 //!
-//! Stateless backends (Linux uinput, Windows XUSB) write frames through [`PadSlots`] with no
-//! state vec, heartbeat, or rich plane. Rumble plane: `design/trigger-rumble-plane.md`.
+//! The Linux uinput pad writes frames through [`PadSlots`] itself: evdev holds the last state,
+//! so it needs no state vec, heartbeat, or rich plane. Rumble plane:
+//! `design/trigger-rumble-plane.md`.
 
 use crate::hidout_dedup::HidoutDedup;
 use crate::pad_slots::PadSlots;
@@ -202,7 +202,7 @@ impl OverflowWarn {
 ///
 /// INVARIANT: stay above SDL's ~2 s resend (`SDL_RUMBLE_RESEND_MS`). SDL-class writers re-assert
 /// a held level on that cadence because real firmware decays; that re-assert keeps a
-/// legitimately-held rumble alive here. Shared with the XUSB path via [`rumble_idle_timeout`].
+/// legitimately-held rumble alive here. Shared with the uinput FF mixer via [`rumble_idle_timeout`].
 ///
 /// KNOWN COST: `ff-memless` sends one report at start and one at stop, so a finite effect
 /// longer than this window is cut in half. The uinput path can exempt that because evdev FF
@@ -217,8 +217,8 @@ const MOTION_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Abandoned-rumble force-off window. `PUNKTFUNK_RUMBLE_IDLE_MS` overrides
 /// [`RUMBLE_IDLE_TIMEOUT`]; `0` disables. Non-zero values are floored at 2100 ms, just above
-/// SDL's ~2 s resend, so the hatch cannot cut a legitimately-held rumble. Shared by UHID/UMDF,
-/// Windows XUSB, and the Linux uinput FF mixer.
+/// SDL's ~2 s resend, so the hatch cannot cut a legitimately-held rumble. Shared by
+/// [`UhidManager`] and the Linux uinput FF mixer.
 pub(crate) fn rumble_idle_timeout() -> Option<Duration> {
     static VAL: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
     *VAL.get_or_init(|| match std::env::var("PUNKTFUNK_RUMBLE_IDLE_MS") {
