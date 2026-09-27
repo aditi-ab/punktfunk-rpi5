@@ -521,6 +521,48 @@ public protocol LibraryArtSource: Sendable {
     func close() async
 }
 
+/// One fetch per key, shared by everyone who asks while it flies, and cancelled once the last
+/// of them is. A tile scrolled past gives up its fetch; a tile still on screen keeps it.
+final class ArtFlights: @unchecked Sendable {
+    private struct Flight {
+        let task: Task<Data, Error>
+        var waiters: Int
+    }
+
+    private let lock = NSLock()
+    private var flights: [String: Flight] = [:]
+
+    func value(
+        for key: String, fetch: @escaping @Sendable () async throws -> Data
+    ) async throws -> Data {
+        let task: Task<Data, Error> = lock.withLock {
+            if var flying = flights[key] {
+                flying.waiters += 1
+                flights[key] = flying
+                return flying.task
+            }
+            let task = Task.detached(operation: fetch)
+            flights[key] = Flight(task: task, waiters: 1)
+            return task
+        }
+        defer { lock.withLock { if flights[key]?.task == task { flights[key] = nil } } }
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            lock.withLock {
+                guard var flying = flights[key], flying.task == task else { return }
+                flying.waiters -= 1
+                if flying.waiters > 0 {
+                    flights[key] = flying
+                } else {
+                    flights[key] = nil
+                    task.cancel()
+                }
+            }
+        }
+    }
+}
+
 /// Loads cover art for the library UI, routing each URL to the transport that suits its origin.
 ///
 /// A `GameEntry`'s art candidates mix two very different things: the host's own art proxy
@@ -552,8 +594,7 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
     private var cache: ArtCache? { ArtCache.shared }
     /// One fetch per cache key at a time — the same entry shown in two sections must not fetch
     /// its art twice on a cold cache. Failures are deliberately not remembered.
-    private let inflightLock = NSLock()
-    private var inflight: [String: Task<Data, Error>] = [:]
+    private let flights = ArtFlights()
 
     public init(
         address: String,
@@ -576,14 +617,7 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
         if url.scheme?.lowercased() == "data" { return try Self.inlineBytes(url) }
         let key = Self.cacheKey(for: url, hostAddress: address, hostPort: port, pin: hostFingerprint)
         if let cache, let cached = await cache.data(forKey: key) { return cached }
-        let task: Task<Data, Error> = inflightLock.withLock {
-            if let flying = inflight[key] { return flying }
-            let flying = Task.detached { try await self.fetch(url) }
-            inflight[key] = flying
-            return flying
-        }
-        defer { inflightLock.withLock { inflight[key] = nil } }
-        let fetched = try await task.value
+        let fetched = try await flights.value(for: key) { try await self.fetch(url) }
         if let cache { await cache.store(fetched, forKey: key) }
         return fetched
     }
