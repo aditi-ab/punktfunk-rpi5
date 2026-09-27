@@ -109,12 +109,10 @@ pub fn ipc_close(ptr: CUdeviceptr) {
     if ptr == 0 {
         return;
     }
+    bind_shared_ctx();
     // SAFETY: `ptr` came from `cuIpcOpenMemHandle` and is closed once by the owning cache. Context
     // is set current first: this runs from `Drop` on whichever thread holds the last reference.
     unsafe {
-        if let Some(c) = CONTEXT.get() {
-            let _ = cuCtxSetCurrent(c.0);
-        }
         let _ = cuIpcCloseMemHandle(ptr);
     }
 }
@@ -166,16 +164,35 @@ pub fn make_current() -> Result<()> {
     unsafe { ck(cuCtxSetCurrent(ctx), "cuCtxSetCurrent") }
 }
 
-/// Run `probe` on a throwaway device-0 context, then restore the shared one. Diagnostic: splits a
-/// bad shared context from a driver-wide failure. Never a hot path.
+/// Best-effort [`make_current`] for teardown: binds the shared context if one exists. `Drop`
+/// paths call it first, since they may run on a thread where it is not current.
+fn bind_shared_ctx() {
+    if let Some(c) = CONTEXT.get() {
+        // SAFETY: `c.0` is the shared context, created once and never destroyed.
+        // `cuCtxSetCurrent` binds it to this thread and takes no Rust pointer.
+        let _ = unsafe { cuCtxSetCurrent(c.0) };
+    }
+}
+
+/// Run `probe` on a throwaway device-0 context, then restore the shared one — also when `probe`
+/// panics. Diagnostic: splits a bad shared context from a driver-wide failure. Never a hot path.
 pub fn with_fresh_context<R>(probe: impl FnOnce(CUcontext) -> R) -> Result<R> {
+    /// Destroys the throwaway context and rebinds the shared one on every exit.
+    struct Fresh(CUcontext);
+    impl Drop for Fresh {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is the context `cuCtxCreate_v2` returned below, owned by this
+            // guard alone and destroyed once, here.
+            let _ = unsafe { cuCtxDestroy_v2(self.0) };
+            bind_shared_ctx();
+        }
+    }
     if cuda_api().is_none() {
         bail!("libcuda.so.1 not available");
     }
     // SAFETY: driver table present (checked above). `cuInit(0)` is idempotent. `&mut dev`/`&mut ctx`
-    // are live out-params. `ctx` is destroyed once below; creation left it current, so restore the
-    // shared context afterwards.
-    unsafe {
+    // are live out-params. `ck` bails unless `ctx` is a valid context, which `Fresh` then owns.
+    let fresh = unsafe {
         ck(cuInit(0), "cuInit")?;
         let mut dev: CUdevice = 0;
         ck(cuDeviceGet(&mut dev, 0), "cuDeviceGet")?;
@@ -184,13 +201,9 @@ pub fn with_fresh_context<R>(probe: impl FnOnce(CUcontext) -> R) -> Result<R> {
             cuCtxCreate_v2(&mut ctx, CU_CTX_SCHED_BLOCKING_SYNC, dev),
             "cuCtxCreate_v2 (diagnostic)",
         )?;
-        let r = probe(ctx);
-        let _ = cuCtxDestroy_v2(ctx);
-        if let Some(c) = CONTEXT.get() {
-            let _ = cuCtxSetCurrent(c.0);
-        }
-        Ok(r)
-    }
+        Fresh(ctx)
+    };
+    Ok(probe(fresh.0))
 }
 
 thread_local! {
@@ -461,12 +474,10 @@ impl Drop for InputSurface {
         if self.ptr == 0 {
             return;
         }
+        bind_shared_ctx();
         // SAFETY: this surface exclusively owns `self.ptr`, freed once (`ptr == 0` skips empty).
         // Context is set current first: drop may run on a thread where it isn't.
         unsafe {
-            if let Some(c) = CONTEXT.get() {
-                let _ = cuCtxSetCurrent(c.0);
-            }
             let _ = cuMemFree_v2(self.ptr);
         }
     }
@@ -482,13 +493,11 @@ struct PoolInner {
 
 impl Drop for PoolInner {
     fn drop(&mut self) {
+        bind_shared_ctx();
         // SAFETY: drops only after every `DeviceBuffer` `Arc` is gone, so `free`/`free_uv` hold
         // each allocation once and nothing still uses them. Context is set current first: drop
         // may run off the allocating thread. Each `p` came from `cuMemAllocPitch_v2`.
         unsafe {
-            if let Some(c) = CONTEXT.get() {
-                let _ = cuCtxSetCurrent(c.0);
-            }
             for &p in &self.free {
                 let _ = cuMemFree_v2(p);
             }
@@ -731,13 +740,11 @@ impl Drop for DeviceBuffer {
                 g.free_uv.push(uv_ptr);
             }
         } else {
+            bind_shared_ctx();
             // SAFETY: un-pooled: this buffer exclusively owns `self.ptr` and `self.uv`, each from
             // `cuMemAllocPitch_v2`, freed once (`ptr == 0` skipped above). Context is set current
             // first: drop may run on the encode thread, where it isn't.
             unsafe {
-                if let Some(c) = CONTEXT.get() {
-                    let _ = cuCtxSetCurrent(c.0);
-                }
                 let _ = cuMemFree_v2(self.ptr);
                 if let Some((uv_ptr, _)) = self.uv {
                     let _ = cuMemFree_v2(uv_ptr);
@@ -1042,13 +1049,11 @@ impl RegisteredTexture {
         if self.resource.is_null() {
             return;
         }
+        bind_shared_ctx();
         // SAFETY: `self.resource` is the exclusive `CUgraphicsResource` from `register_gl`;
         // nulling it after unregister makes Drop a no-op. Context is set current first: teardown
         // may run on a thread where it isn't.
         unsafe {
-            if let Some(c) = CONTEXT.get() {
-                let _ = cuCtxSetCurrent(c.0);
-            }
             let _ = cuGraphicsUnregisterResource(self.resource);
         }
         self.resource = std::ptr::null_mut();
@@ -1126,13 +1131,11 @@ impl ExternalDmabuf {
 
 impl Drop for ExternalDmabuf {
     fn drop(&mut self) {
+        bind_shared_ctx();
         // SAFETY: exclusive owner of `self.ptr` and `self.ext`, torn down once (`!= 0` / `!null`).
         // Context is set current first: drop may run off the import thread. Free the mapped buffer
         // before destroying its backing external memory.
         unsafe {
-            if let Some(c) = CONTEXT.get() {
-                let _ = cuCtxSetCurrent(c.0);
-            }
             if self.ptr != 0 {
                 let _ = cuMemFree_v2(self.ptr); // mapped buffers free like device memory
             }
@@ -1212,12 +1215,10 @@ impl ExternalSemaphore {
 
 impl Drop for ExternalSemaphore {
     fn drop(&mut self) {
+        bind_shared_ctx();
         // SAFETY: exclusive owner, destroyed once. Context is set current first: drop may run off
         // the import thread (`VkSlotBlend` quiesces the GPU first, so no in-flight signal/wait).
         unsafe {
-            if let Some(c) = CONTEXT.get() {
-                let _ = cuCtxSetCurrent(c.0);
-            }
             let _ = cuDestroyExternalSemaphore(self.sem);
         }
     }
