@@ -355,11 +355,12 @@ async fn session(
     // Slot after the handshake, as the native plane does: a full host still accepts, so the
     // browser sees a live path (keep-alive) instead of a silent dial timeout.
     let permit = sem
+        .clone()
         .acquire_owned()
         .await
         .expect("session semaphore is never closed");
     let peer = connection.remote_address();
-    match session::run(connection.clone(), serving.clone(), permit).await {
+    match session::run(connection.clone(), serving.clone(), permit, sem).await {
         Ok(crate::native::Served::Session) => tracing::info!(%peer, "browser session complete"),
         Ok(crate::native::Served::ProbeClose) => {}
         Err(e) => {

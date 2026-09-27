@@ -205,7 +205,7 @@ fn now_ns() -> u64 {
 
 /// Unix seconds. Access deadlines are stored and checked in wall time, not a cached
 /// monotonic offset, so an NTP step moves a deadline with the clock.
-fn wall_unix_now() -> i64 {
+pub(crate) fn wall_unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -1161,6 +1161,45 @@ type AudioCapSlot = Arc<std::sync::Mutex<Option<Box<dyn crate::audio::AudioCaptu
 /// the path; approval streams with no reconnect. Under the pending TTL (10 min).
 const PENDING_APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(180);
 
+/// Park an unpaired knock until the console decides, holding no session slot while it waits.
+///
+/// `Ok(Ok(_))` is an approval, with the slot taken back like any fresh client's (waits if busy).
+/// `Ok(Err(reason))` is the refusal to send. `Err` means the client left before a decision.
+pub(crate) async fn park_knock(
+    conn: &link::SessionLink,
+    np: &NativePairing,
+    label: &str,
+    fp_hex: &str,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    sem: &Arc<tokio::sync::Semaphore>,
+) -> Result<Result<tokio::sync::OwnedSemaphorePermit, punktfunk_core::reject::RejectReason>> {
+    use punktfunk_core::reject::RejectReason;
+    tracing::info!(name = %label, fingerprint = %fp_hex,
+        "unpaired device knocked — parking connection for delegated approval in the console");
+    // QUIC-validated source IP for the pending per-source cap. Knock generation makes
+    // this connection the one an approval admits — siblings must not all start a session.
+    let knock_seq = np.note_pending(label, fp_hex, Some(conn.remote_address().ip()));
+    drop(permit);
+    let decision = tokio::select! {
+        d = np.wait_for_decision(fp_hex, knock_seq, PENDING_APPROVAL_WAIT) => d,
+        _ = conn.closed() => anyhow::bail!("client disconnected before pairing approval"),
+    };
+    let reason = match decision {
+        PairingDecision::Approved => {
+            tracing::info!(name = %label, fingerprint = %fp_hex,
+                "device approved in console — admitting session (no reconnect)");
+            let permit = sem.clone().acquire_owned().await;
+            return Ok(Ok(permit.expect("session semaphore is never closed")));
+        }
+        PairingDecision::Denied => RejectReason::Denied,
+        // The device can knock again.
+        PairingDecision::TimedOut => RejectReason::ApprovalTimeout,
+        // Only the newest connection from a device is admitted on approval.
+        PairingDecision::Superseded => RejectReason::Superseded,
+    };
+    Ok(Err(reason))
+}
+
 /// A QUIC handshake that closes code 0 with no control stream is a reachability probe
 /// (`--reachable` / hosts-page pips). Log at debug, not warn.
 pub(crate) enum Served {
@@ -1320,47 +1359,13 @@ async fn serve_session(
                 gate_hello.name.as_deref().unwrap_or(""),
                 &fp_hex,
             );
-            tracing::info!(name = %label, fingerprint = %fp_hex,
-                "unpaired device knocked — parking connection for delegated approval in the console");
-            // QUIC-validated source IP for the pending per-source cap. Knock generation makes
-            // this connection the one an approval admits — siblings must not all start a session.
-            let knock_seq = np.note_pending(&label, &fp_hex, Some(peer.ip()));
-            // Parked knock must not hold an NVENC permit.
-            drop(permit);
-            let decision = tokio::select! {
-                d = np.wait_for_decision(&fp_hex, knock_seq, PENDING_APPROVAL_WAIT) => d,
-                _ = conn.closed() => anyhow::bail!("client disconnected before pairing approval"),
+            permit = match park_knock(&conn, np, &label, &fp_hex, permit, &sem).await? {
+                Ok(permit) => permit,
+                Err(reason) => {
+                    close_rejected(&conn, reason);
+                    anyhow::bail!("pairing request refused: {reason}");
+                }
             };
-            match decision {
-                PairingDecision::Approved => {
-                    tracing::info!(name = %label, fingerprint = %fp_hex,
-                        "device approved in console — admitting session (no reconnect)");
-                }
-                PairingDecision::Denied => {
-                    close_rejected(&conn, punktfunk_core::reject::RejectReason::Denied);
-                    anyhow::bail!("pairing request denied in the console")
-                }
-                PairingDecision::TimedOut => {
-                    close_rejected(&conn, punktfunk_core::reject::RejectReason::ApprovalTimeout);
-                    anyhow::bail!(
-                        "pairing request not approved within {PENDING_APPROVAL_WAIT:?} \
-                         — the device can knock again"
-                    )
-                }
-                PairingDecision::Superseded => {
-                    close_rejected(&conn, punktfunk_core::reject::RejectReason::Superseded);
-                    anyhow::bail!(
-                        "parked knock superseded by a newer connection from the same device — \
-                         only the newest is admitted on approval"
-                    )
-                }
-            }
-            // Re-acquire like any freshly accepted client (waits if busy).
-            permit = sem
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("session semaphore is never closed");
         }
     }
     // Admitted. From here the session is the same on every carrier.
