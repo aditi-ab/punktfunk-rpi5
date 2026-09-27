@@ -25,10 +25,10 @@ use cros_codecs::codec::h265::parser::Sps;
 use pf_bitstream::h265::AuPlan;
 use pf_bitstream::h265::PicId;
 use pf_bitstream::h265::RefPic;
+use pf_bitstream::slots::SlotError;
+use pf_bitstream::slots::SlotMap;
 use pf_vkdecode::num_delta_pocs_of_ref_rps_idx;
 use pf_vkdecode::RefRpsIdxError;
-use pf_vkdecode::SlotError;
-use pf_vkdecode::SlotMap;
 use tracing::trace;
 
 use crate::dxva::HevcFormatFlags;

@@ -24,8 +24,8 @@ use std::ops::Range;
 use pf_bitstream::h264::AuPlan;
 use pf_bitstream::h264::PicId;
 use pf_bitstream::h264::RefPic;
-use pf_vkdecode::SlotError;
-use pf_vkdecode::SlotMap;
+use pf_bitstream::slots::SlotError;
+use pf_bitstream::slots::SlotMap;
 use tracing::trace;
 
 use crate::dxva::H264BitFields;

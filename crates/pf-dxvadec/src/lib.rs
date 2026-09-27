@@ -12,7 +12,7 @@
 //! charges padding to the buffer only. [`pic`] / [`pic_h265`] / [`pic_av1`] fill
 //! picture parameters, matrices, and slice/tile control through a DPB [`SlotMap`].
 //!
-//! [`SlotMap`] is re-exported from [`pf_vkdecode`]: `DXVA_PicEntry::Index7Bits` is a
+//! [`SlotMap`] is re-exported from [`pf_bitstream`]: `DXVA_PicEntry::Index7Bits` is a
 //! decode-surface index with the same lifetime the map already models. Construction
 //! is field-by-field from `const fn zeroed()`, never `mem::zeroed`. The only unsafe
 //! is [`dxva::as_bytes`] / [`dxva::slice_bytes`], sealed to this crate's `#[repr(C)]`
@@ -28,6 +28,9 @@ pub mod pic;
 pub mod pic_av1;
 pub mod pic_h265;
 
+/// DPB slot ledger, re-exported from [`pf_bitstream`] (crate docs).
+pub use pf_bitstream::slots::SlotError;
+pub use pf_bitstream::slots::SlotMap;
 /// `NumDeltaPocsOfRefRpsIdx` (7.4.8), re-exported from [`pf_vkdecode`]: one
 /// derivation for both backends, tested there.
 pub use pf_vkdecode::num_delta_pocs_of_ref_rps_idx;
@@ -37,9 +40,6 @@ pub use pf_vkdecode::plan_bitstream;
 pub use pf_vkdecode::Av1Bitstream;
 pub use pf_vkdecode::Av1TileError;
 pub use pf_vkdecode::RefRpsIdxError;
-/// DPB slot ledger, re-exported from [`pf_vkdecode`] (crate docs).
-pub use pf_vkdecode::SlotError;
-pub use pf_vkdecode::SlotMap;
 
 // DXVA submit is synchronous (`BeginFrame`…`EndFrame`); there is no decoder
 // object here. Re-exports let the Windows layer name planner types without a

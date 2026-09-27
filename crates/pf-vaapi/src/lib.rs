@@ -13,7 +13,7 @@
 //! slice or tile records. [`drm`] is the one structure the DRIVER writes: the
 //! PRIME export descriptor and the plane walk a dmabuf import consumes.
 //!
-//! [`SlotMap`] is re-exported from [`pf_vkdecode`]. VAAPI's extra hop is that
+//! [`SlotMap`] is re-exported from [`pf_bitstream`]. VAAPI's extra hop is that
 //! `VAPictureH264::picture_id` is a `VASurfaceID`, not a slot index, so conversion
 //! takes the caller's surface table and stays pure. Evidence: `layout-probe.c`
 //! and the compile-time assertions in [`va`], [`va_h265`], [`va_av1`], and [`drm`].
@@ -42,9 +42,9 @@ pub mod va_h265;
 /// VideoProc: the ingest colour conversion and the dmabuf import attributes.
 pub mod vpp;
 
-/// DPB slot ledger, re-exported from [`pf_vkdecode`] (crate docs).
-pub use pf_vkdecode::SlotError;
-pub use pf_vkdecode::SlotMap;
+/// DPB slot ledger, re-exported from [`pf_bitstream`] (crate docs).
+pub use pf_bitstream::slots::SlotError;
+pub use pf_bitstream::slots::SlotMap;
 
 /// AV1 planner. ⚠ `plan_au` returns a **`Vec`**: an AV1 access unit is a temporal
 /// unit and may carry several frames, of which at most one displays.

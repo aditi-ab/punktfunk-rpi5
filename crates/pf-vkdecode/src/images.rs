@@ -26,11 +26,7 @@ use crate::device::find_memory_type_preferring;
 use crate::device::AllocError;
 use crate::device::DecodeDevice;
 
-/// Extra pictures the consumer may hold (delivered, unreleased) on top of
-/// the stream's DPB depth. Pool size is `required_slots + HOLD_HEADROOM`.
-/// 8 covers ~4–7 in-flight frames with one frame of slack; holding more
-/// is `NoFreeSlot`.
-pub const HOLD_HEADROOM: u32 = 8;
+pub use pf_bitstream::slots::HOLD_HEADROOM;
 
 /// Pool layout for one `(caps, required_slots)` pair. No GPU allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

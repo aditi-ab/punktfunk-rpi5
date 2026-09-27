@@ -39,7 +39,8 @@ pub mod ring;
 pub mod session;
 pub mod session_av1;
 pub mod session_h265;
-pub mod slots;
+/// The DPB slot ledger, shared with the DXVA and VAAPI backends.
+pub use pf_bitstream::slots;
 
 /// Ash re-export so consumers flatten [`DecodedVkFrame`] handles through this
 /// crate's `ash::vk::Handle`. Their own `ash` is optional; versions must not skew.

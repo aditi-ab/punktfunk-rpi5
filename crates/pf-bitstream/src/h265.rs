@@ -3139,7 +3139,7 @@ mod tests {
              plus the current one. A-2 would have said 16 here, because 1920x1088 = \
              2088960 luma samples fall under MaxLumaPs(L5.1) >> 2 = 2228224."
         );
-        // One slot per DPB picture plus one in flight (`pf_vkdecode::slots`).
+        // One slot per DPB picture plus one in flight (`crate::slots`).
         let slots_for = |plan: &AuPlan| plan.picture.max_dpb_frames + 1;
         assert!(
             slots_for(&at_1080p) <= VULKAN_MAX_DPB_SLOTS,

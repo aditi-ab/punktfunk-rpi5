@@ -111,10 +111,10 @@ pub fn rt_format(chroma_format_idc: u8, depth: u8) -> Result<u32, ConfigError> {
 }
 
 /// Zero-copy: a presented surface cannot be decoded into. Size the pool to DPB
-/// and the decoder stalls behind display. 8 matches `pf_vkdecode::images::HOLD_HEADROOM`.
+/// and the decoder stalls behind display. The Vulkan rung's measured headroom.
 /// Do not copy FFmpeg's `extra_hw_frames = 4`: `av_hwframe_get_buffer` blocks;
 /// this pool does not.
-pub const PRESENTER_HEADROOM: usize = 8;
+pub const PRESENTER_HEADROOM: usize = pf_bitstream::slots::HOLD_HEADROOM as usize;
 
 /// VAAPI has no driver minimum. AV1 passes [`AV1_MAX_DPB_FRAMES`] (codec constant, not a sequence header).
 pub fn surface_count(max_dpb_frames: usize) -> usize {
@@ -202,14 +202,5 @@ mod tests {
     fn the_surface_pool_covers_dpb_plus_current_plus_headroom() {
         assert_eq!(surface_count(4), 4 + 1 + PRESENTER_HEADROOM);
         assert_eq!(surface_count(16), 16 + 1 + PRESENTER_HEADROOM);
-    }
-
-    /// Pin to `pf_vkdecode` so a re-measurement moves both rungs; this pool must not go short.
-    #[test]
-    fn the_headroom_matches_the_pipeline_depth_the_vulkan_rung_measured() {
-        assert_eq!(
-            PRESENTER_HEADROOM,
-            pf_vkdecode::images::HOLD_HEADROOM as usize
-        );
     }
 }

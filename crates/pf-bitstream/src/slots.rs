@@ -1,13 +1,20 @@
-//! Maps planner [`PicId`]s to the DPB slot indices a Vulkan Video session binds
-//! images by.
+//! Maps planner [`PicId`]s to the DPB slot indices a decode backend binds
+//! pictures by: a Vulkan Video slot, a DXVA `Index7Bits`, a VAAPI surface index.
 //!
-//! pf-bitstream owns which pictures live; this ledger only translates those
+//! The planners own which pictures live; this ledger only translates those
 //! verdicts. It never evicts: [`SlotError::Full`] means a `removed` entry was
 //! missed. A silent eviction would hide that behind corrupted output.
 
-use pf_bitstream::h264::DpbUpdate;
-use pf_bitstream::h264::PicId;
 use tracing::trace;
+
+use crate::h264::DpbUpdate;
+use crate::h264::PicId;
+
+/// Extra pictures the consumer may hold (delivered, unreleased) on top of
+/// the stream's DPB depth. Pool size is `required_slots + HOLD_HEADROOM`.
+/// 8 covers ~4–7 in-flight frames with one frame of slack; holding more
+/// is `NoFreeSlot`.
+pub const HOLD_HEADROOM: u32 = 8;
 
 /// The H.264 slot ceiling: 16 reference frames plus the picture being decoded.
 const MAX_SLOTS: usize = 17;
@@ -43,19 +50,19 @@ impl std::error::Error for SlotError {}
 
 /// Per-session PicId → slot index. Feed every [`DpbUpdate`] in decode order.
 ///
-/// [`Self::apply`] releases `removed` immediately. `plan_to_vk` and
-/// `plan_to_vk_av1` assign the stored picture and return removals as
+/// [`Self::apply`] releases `removed` immediately. The H.264 and AV1
+/// converters assign the stored picture and return removals as
 /// `release_after_decode` — apply that list only after the decode is issued.
 /// Releasing first lets [`Self::assign`] recycle a slot this AU still names.
 /// Dropping the list leaks one slot per AU.
 ///
-/// `plan_to_vk_h265` applies removals internally: `H265Planner` snapshots
+/// The H.265 converters apply removals internally: `H265Planner` snapshots
 /// `dpb_refs` after `decode_rps`, so a dropped picture is never in this AU's
 /// reference lists.
 ///
-/// Slots are planner bookkeeping. The picture pool binds a fresh image on
-/// re-activation, so a delivered image is never a decode target while a
-/// consumer reads it.
+/// Slots are planner bookkeeping. The backend's picture pool binds a fresh
+/// image on re-activation, so a delivered image is never a decode target
+/// while a consumer reads it.
 #[derive(Debug, Clone)]
 pub struct SlotMap {
     slots: Vec<Option<PicId>>,
@@ -120,7 +127,7 @@ impl SlotMap {
 
     /// End DPB residency for `id`. A picture holds its slot while the planner
     /// holds it as a reference or as a decoded picture awaiting output; only a
-    /// [`DpbUpdate::removed`] entry ends that. `plan_to_vk` / `plan_to_vk_av1`
+    /// [`DpbUpdate::removed`] entry ends that. The H.264 and AV1 converters
     /// defer this via `release_after_decode` until the decode is issued.
     ///
     /// The slot becomes assignable immediately. Keeping the IMAGE out of reuse

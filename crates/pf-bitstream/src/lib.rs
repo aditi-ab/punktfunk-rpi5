@@ -17,6 +17,7 @@ pub mod clean;
 pub mod h264;
 pub mod h265;
 pub mod sei;
+pub mod slots;
 
 #[cfg(test)]
 mod plan_error_tests {
