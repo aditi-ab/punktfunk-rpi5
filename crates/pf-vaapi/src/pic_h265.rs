@@ -117,10 +117,7 @@ impl std::fmt::Display for PlanToVaH265Error {
                 write!(f, "DPB slot {slot} has no surface in a table of {surfaces}")
             }
             PlanToVaH265Error::SliceRange { slice } => {
-                write!(
-                    f,
-                    "slice {slice}: byte range is not a start-code-prefixed NAL"
-                )
+                write!(f, "slice {slice}: byte range lies outside the access unit")
             }
             PlanToVaH265Error::UnalignedSliceHeader { slice, bits } => write!(
                 f,
@@ -233,12 +230,11 @@ pub fn plan_to_va_h265(
         let hdr = &sp.header;
         let mut rec = VaSliceParameterBufferHEVC::zeroed();
 
-        let bytes = au
-            .get(sp.data.clone())
-            .ok_or(PlanToVaH265Error::SliceRange { slice: index })?;
-        let prefix = crate::pic::start_code_len(bytes)
-            .ok_or(PlanToVaH265Error::SliceRange { slice: index })?;
-        let payload = sp.data.start + prefix..sp.data.end;
+        // VAAPI takes the NAL without its start code.
+        if au.get(sp.nal.clone()).is_none() {
+            return Err(PlanToVaH265Error::SliceRange { slice: index });
+        }
+        let payload = sp.nal.clone();
         rec.slice_data_size = (payload.end - payload.start) as u32;
         rec.slice_data_offset = 0;
         rec.slice_data_flag = VA_SLICE_DATA_FLAG_ALL;

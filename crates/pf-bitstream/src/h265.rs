@@ -173,6 +173,9 @@ pub struct SlicePlan {
     /// Byte range of the slice NALU in the input AU, start code included.
     /// Hardware takes the raw bitstream, so the plan points instead of copying.
     pub data: Range<usize>,
+    /// [`Self::data`] from the NAL header on, start code dropped. The three
+    /// bytes before it are always `00 00 01`.
+    pub nal: Range<usize>,
     /// Parsed slice-segment header. For a dependent segment this is COMPLETED
     /// (7.4.7.1 inherited fields already copied); backends never see a partial.
     pub header: SliceHeader,
@@ -1231,6 +1234,7 @@ impl H265Planner {
         }
 
         Ok(SlicePlan {
+            nal: data.start + slice.nalu.offset..data.end,
             data,
             header: slice.header,
             ref_list0,

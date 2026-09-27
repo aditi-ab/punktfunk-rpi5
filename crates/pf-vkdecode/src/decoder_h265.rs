@@ -280,18 +280,18 @@ impl VkDecoder<H265> {
         // the decode range hangs VCN; parameter sets ride the session object.
         // Plan offsets are AU-relative and get rebased into the packed buffer.
         let plan_segments: Vec<std::ops::Range<usize>> =
-            plan.slices.iter().map(|s| s.data.clone()).collect();
+            plan.slices.iter().map(|s| s.nal.clone()).collect();
         // One rebased offset per slice, in plan order — same walk as
         // `vk_plan.slice_offsets`, so count and order agree by construction.
-        // `pack_slices` also trims each Annex-B prefix to three bytes; a
+        // `pack_slices` puts each NAL behind a three-byte start code; a
         // four-byte prefix shifts drivers that skip a fixed `+3 +2` off the header.
-        let Some(packed) = pack_slices(au, &plan_segments) else {
+        let Some(packed) = pack_slices(&plan_segments) else {
             return Err(VkDecodeError::Unsupported(
                 "packed slice data exceeds the u32 offsets Vulkan submits".into(),
             ));
         };
-        // SAFETY: the segments are the plan's own in-bounds slice ranges
-        // (narrowed by the prefix normalisation, so still in bounds); the
+        // SAFETY: each segment is a slice NAL plus the three start-code bytes
+        // before it, inside the plan's own in-bounds slice range; the
         // recorded offsets come from the same `pack_slices` call.
         let upload = unsafe { self.upload(au, &packed.segments)? };
         // `refs` order is the contract: RPS arrays index into the decode op's
@@ -463,11 +463,7 @@ mod tests {
         // Without a device: `pSliceSegmentOffsets` must be the rebased array
         // (one entry per slice, counted by ash from the slice length), and the
         // picture info must point at the plan's own Std struct.
-        let mut au = vec![0xAAu8; 2000];
-        for start in [40usize, 900, 1500] {
-            au[start..start + 3].copy_from_slice(&[0, 0, 1]);
-        }
-        let offsets = pack_slices(&au, &[40..900, 900..1500, 1500..2000])
+        let offsets = pack_slices(&[43..900, 903..1500, 1503..2000])
             .unwrap()
             .offsets;
         assert_eq!(offsets, vec![0, 860, 1460]);

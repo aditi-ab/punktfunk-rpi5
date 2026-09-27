@@ -75,7 +75,7 @@ pub struct DecodePlanDxvaH265 {
     /// matrices, and a driver that honours a buffer it was handed dequantizes
     /// against its contents.
     pub qmatrix: Option<QmatrixHevc>,
-    /// Byte ranges of the AU's slice-segment NALUs, start code included, in plan
+    /// Byte ranges of the AU's slice-segment NALs, start code dropped, in plan
     /// order — what [`crate::pack::pack`] takes.
     pub slice_ranges: Vec<Range<usize>>,
     pub setup_slot: u8,
@@ -488,7 +488,7 @@ pub fn plan_to_dxva_h265(
         .scaling_list_enabled_flag
         .then(|| quantization_matrices(sps, pps));
 
-    let slice_ranges: Vec<Range<usize>> = plan.slices.iter().map(|s| s.data.clone()).collect();
+    let slice_ranges: Vec<Range<usize>> = plan.slices.iter().map(|s| s.nal.clone()).collect();
 
     // Mutations last, after every fallible step. Removals first: they were real
     // regardless of this AU's fate.
@@ -1313,8 +1313,7 @@ mod tests {
             let dxva = plan_to_dxva_h265(&plan, map, i as u32 + 1).expect("convert");
             assert_eq!(dxva.slice_ranges.len(), plan.slices.len());
             for range in &dxva.slice_ranges {
-                let at = &au[range.start..];
-                assert!(at.starts_with(&[0, 0, 1]) || at.starts_with(&[0, 0, 0, 1]));
+                assert_eq!(au[range.start - 3..range.start], [0, 0, 1]);
             }
         }
     }

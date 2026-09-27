@@ -145,6 +145,9 @@ pub struct ColourDescription {
 pub struct SlicePlan {
     /// Byte range of the slice NALU in the AU, start code included. Points; does not copy.
     pub data: Range<usize>,
+    /// [`Self::data`] from the NAL header on, start code dropped. The three
+    /// bytes before it are always `00 00 01`.
+    pub nal: Range<usize>,
     pub header: SliceHeader,
     pub ref_list0: Vec<RefPic>,
     pub ref_list1: Vec<RefPic>,
@@ -1583,6 +1586,7 @@ impl H264Planner {
         }
 
         Ok(SlicePlan {
+            nal: data.start + slice.nalu.offset..data.end,
             data,
             header: slice.header,
             ref_list0,
@@ -1746,6 +1750,27 @@ mod tests {
         }
         aus.push(&stream[au_start..]);
         aus
+    }
+
+    /// `nal` starts at the NAL header whatever prefix the encoder wrote, so
+    /// the three bytes before it are always `00 00 01`.
+    #[test]
+    fn a_slices_nal_range_skips_a_three_or_four_byte_start_code() {
+        let au = split_into_aus(TEST_25FPS)[0];
+        let plan = H264Planner::new().plan_au(au).expect("plans");
+        let first = &plan.slices[0];
+        assert_eq!(first.nal.start - first.data.start, 3);
+
+        let mut four = au[..first.data.start].to_vec();
+        four.push(0);
+        four.extend_from_slice(&au[first.data.start..]);
+        let plan = H264Planner::new().plan_au(&four).expect("plans");
+        let first = &plan.slices[0];
+        assert_eq!(first.nal.start - first.data.start, 4);
+        for slice in &plan.slices {
+            assert_eq!(slice.nal.end, slice.data.end);
+            assert_eq!(four[slice.nal.start - 3..slice.nal.start], [0, 0, 1]);
+        }
     }
 
     #[test]

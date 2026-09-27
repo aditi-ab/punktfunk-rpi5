@@ -73,7 +73,7 @@ impl DxvaRef {
 pub struct DecodePlanDxva {
     pub pic_params: PicParamsH264,
     pub qmatrix: QmatrixH264,
-    /// Slice NALU byte ranges, start code included — what [`crate::pack::pack`] takes.
+    /// Slice NAL byte ranges, start code dropped — what [`crate::pack::pack`] takes.
     pub slice_ranges: Vec<Range<usize>>,
     /// Decode target surface (`CreateVideoDecoderOutputView` / `DecoderBeginFrame`).
     pub setup_slot: u8,
@@ -384,7 +384,7 @@ pub fn plan_to_dxva(
     qm.bScalingLists8x8[0] = pps.scaling_lists_8x8[0];
     qm.bScalingLists8x8[1] = pps.scaling_lists_8x8[1];
 
-    let slice_ranges: Vec<Range<usize>> = plan.slices.iter().map(|s| s.data.clone()).collect();
+    let slice_ranges: Vec<Range<usize>> = plan.slices.iter().map(|s| s.nal.clone()).collect();
 
     // Mutations last (fn docs). Removals are deferred, not applied here.
     let (setup_slot, release_after_decode) =
@@ -1008,7 +1008,7 @@ mod tests {
         for (plan, dxva) in convert_stream() {
             assert_eq!(dxva.slice_ranges.len(), plan.slices.len());
             for (range, slice) in dxva.slice_ranges.iter().zip(&plan.slices) {
-                assert_eq!(*range, slice.data);
+                assert_eq!(*range, slice.nal);
             }
         }
     }

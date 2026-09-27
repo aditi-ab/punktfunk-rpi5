@@ -790,6 +790,7 @@ mod tests {
     fn mini_slice(refs0: &[RefPic], refs1: &[RefPic]) -> SlicePlan {
         SlicePlan {
             data: 0..32,
+            nal: 3..32,
             header: SliceHeader::default(),
             ref_list0: refs0.to_vec(),
             ref_list1: refs1.to_vec(),
@@ -1078,6 +1079,7 @@ mod tests {
             },
             slices: vec![SlicePlan {
                 data: 0..32,
+                nal: 3..32,
                 header,
                 ref_list0: vec![st_ref(1, 0)],
                 ref_list1: Vec::new(),

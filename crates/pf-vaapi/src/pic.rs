@@ -80,7 +80,7 @@ pub enum PlanToVaError {
         width_mbs: u32,
         height_mbs: u32,
     },
-    /// Byte range outside the AU, or no Annex-B start code to strip.
+    /// NAL range outside the AU: a plan paired with the wrong buffer.
     SliceRange {
         slice: usize,
     },
@@ -134,10 +134,7 @@ impl std::fmt::Display for PlanToVaError {
                 "picture of {width_mbs}x{height_mbs} macroblocks is too large"
             ),
             PlanToVaError::SliceRange { slice } => {
-                write!(
-                    f,
-                    "slice {slice}: byte range is not a start-code-prefixed NAL"
-                )
+                write!(f, "slice {slice}: byte range lies outside the access unit")
             }
             PlanToVaError::SliceBitOffsetOverflow { slice, bits } => {
                 write!(
@@ -151,16 +148,6 @@ impl std::fmt::Display for PlanToVaError {
 }
 
 impl std::error::Error for PlanToVaError {}
-
-pub(crate) fn start_code_len(bytes: &[u8]) -> Option<usize> {
-    if bytes.starts_with(&[0x00, 0x00, 0x00, 0x01]) {
-        Some(4)
-    } else if bytes.starts_with(&[0x00, 0x00, 0x01]) {
-        Some(3)
-    } else {
-        None
-    }
-}
 
 fn va_ref(rp: &RefPic, surface: u32) -> VaPictureH264 {
     VaPictureH264 {
@@ -276,11 +263,11 @@ pub fn plan_to_va(
         let hdr = &sp.header;
         let mut rec = VaSliceParameterBufferH264::zeroed();
 
-        let bytes = au
-            .get(sp.data.clone())
-            .ok_or(PlanToVaError::SliceRange { slice: index })?;
-        let prefix = start_code_len(bytes).ok_or(PlanToVaError::SliceRange { slice: index })?;
-        let payload = sp.data.start + prefix..sp.data.end;
+        // VAAPI takes the NAL without its start code.
+        if au.get(sp.nal.clone()).is_none() {
+            return Err(PlanToVaError::SliceRange { slice: index });
+        }
+        let payload = sp.nal.clone();
         rec.slice_data_size = (payload.end - payload.start) as u32;
         rec.slice_data_offset = 0;
         rec.slice_data_flag = VA_SLICE_DATA_FLAG_ALL;
@@ -819,17 +806,6 @@ mod tests {
              this stream; if it no longer does, the exemption test above is passing for \
              a reason nobody has checked"
         );
-    }
-
-    #[test]
-    fn start_code_len_reads_both_prefix_forms() {
-        assert_eq!(start_code_len(&[0, 0, 1, 0x65]), Some(3));
-        assert_eq!(start_code_len(&[0, 0, 0, 1, 0x65]), Some(4));
-        // A NAL without its prefix must not look like one. The bit offset is
-        // relative to the header byte; a wrong trim shifts every slice.
-        assert_eq!(start_code_len(&[0x65, 0x88]), None);
-        assert_eq!(start_code_len(&[0, 0, 2, 1]), None);
-        assert_eq!(start_code_len(&[0, 0]), None);
     }
 
     #[test]
