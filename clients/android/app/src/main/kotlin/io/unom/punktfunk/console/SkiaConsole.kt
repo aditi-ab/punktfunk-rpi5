@@ -337,16 +337,16 @@ object SkiaConsole {
      * with a 75-minute TTL that a suspending host sends no goodbye for, so trusting it left a
      * sleeping machine reading Online and, since Wake is gated on `!online`, unwakeable.
      *
-     * Only while the console is ON SCREEN (attached): parked behind the touch UI or a stream
-     * there is nobody to show the pips to — and mid-stream the radio belongs to the session. The
-     * timer keeps ticking so probes resume within a cadence of re-attach.
+     * Only while the console is ON SCREEN (attached, the app in front): parked behind the touch
+     * UI, a stream or Home there is nobody to show the pips to — and mid-stream the radio belongs
+     * to the session. The timer keeps ticking so probes resume within a cadence of coming back.
      */
     private val sweep = object : Runnable {
         override fun run() {
             if (handle == 0L) return
             main.removeCallbacks(this)
             main.postDelayed(this, SWEEP_MS)
-            if (onConnected == null) return
+            if (onConnected == null || discovery?.appVisible == false) return
             val saved = knownHostStore.all()
             val live = discovered
             ioPool.execute {

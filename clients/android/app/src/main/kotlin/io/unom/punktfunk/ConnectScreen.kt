@@ -23,6 +23,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.withStarted
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.discovery.DiscoveredHost
@@ -240,12 +241,15 @@ fun ConnectScreen(
         discovery.addNetworkListener(onNetwork)
         onDispose { discovery.removeNetworkListener(onNetwork) }
     }
+    // Probe laps wait while the app is away: a stopped activity does not pause a coroutine.
+    val appLifecycle = (context as? LifecycleOwner)?.lifecycle
     LaunchedEffect(savedHosts, lnpGranted, networkGen) {
         if (!lnpGranted) {
             reachable = emptySet()
             return@LaunchedEffect
         }
         while (true) {
+            appLifecycle?.withStarted {}
             val saved = savedHosts
             val up = withContext(Dispatchers.IO) {
                 Presence.sweep(
@@ -330,6 +334,7 @@ fun ConnectScreen(
     LaunchedEffect(savedHosts, identity) {
         val id = identity ?: return@LaunchedEffect
         while (true) {
+            appLifecycle?.withStarted {}
             val now = android.os.SystemClock.elapsedRealtime()
             for (kh in savedHosts) {
                 if (!kh.paired || kh.fpHex.isEmpty()) continue

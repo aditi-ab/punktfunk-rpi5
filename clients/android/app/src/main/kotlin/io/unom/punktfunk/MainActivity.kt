@@ -44,6 +44,7 @@ import io.unom.punktfunk.kit.Sc2Device
 import io.unom.punktfunk.kit.SessionAccess
 import io.unom.punktfunk.kit.isExternalDevice
 import io.unom.punktfunk.kit.ringNavForKey
+import io.unom.punktfunk.kit.discovery.HostDiscovery
 import io.unom.punktfunk.kit.link.DeepLinkResult
 import io.unom.punktfunk.kit.link.DeepLinks
 import io.unom.punktfunk.kit.link.HostResolution
@@ -387,6 +388,17 @@ class MainActivity : ComponentActivity() {
      */
     private fun deepLinkFrom(intent: Intent?): String? =
         intent?.takeIf { it.action == Intent.ACTION_VIEW }?.data?.toString()
+
+    // Discovery and its Wi-Fi locks follow the app on screen, whichever shell subscribed.
+    override fun onStart() {
+        super.onStart()
+        HostDiscovery.shared(this).onAppStart()
+    }
+
+    override fun onStop() {
+        HostDiscovery.shared(this).onAppStop()
+        super.onStop()
+    }
 
     override fun onResume() {
         super.onResume()
