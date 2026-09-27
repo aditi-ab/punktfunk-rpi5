@@ -346,10 +346,10 @@ fn valid_plugin_id(id: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// A title must not smuggle escapes or newlines into a log line or the nav.
+/// A title must not smuggle escapes, newlines or bidi marks into a log line or the nav.
 fn sanitize(s: &str) -> String {
     s.chars()
-        .filter(|c| !c.is_control())
+        .filter(|&c| !c.is_control() && !crate::native_pairing::is_spoofy_char(c))
         .collect::<String>()
         .trim()
         .to_string()
@@ -685,7 +685,7 @@ mod tests {
     fn registration_validation() {
         assert!(validate(reg("ROM Manager", 49321, SECRET)).is_ok());
         let v = validate(PluginRegistration {
-            title: "Ro\u{7}m\n".into(),
+            title: "Ro\u{7}\u{202E}m\n".into(),
             version: None,
             ui: None,
             category: None,

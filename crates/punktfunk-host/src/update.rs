@@ -183,28 +183,32 @@ fn load_floor(path: &Path, channel: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Raise (never lower) the floor. Atomic tmp+rename so a power cut cannot
-/// half-write it.
-fn store_floor(path: &Path, channel: &str, serial: u64) {
+/// Raise (never lower) the floor. Temp + rename so a power cut cannot half-write it; where
+/// rename cannot work it writes in place, since an unraised floor lets a replayed older
+/// manifest through.
+fn store_floor(path: &Path, channel: &str, serial: u64) -> std::io::Result<()> {
     let mut file: FloorFile = std::fs::read(path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
     let slot = file.serial_floor.entry(channel.to_string()).or_insert(0);
     if serial <= *slot {
-        return;
+        return Ok(());
     }
     *slot = serial;
-    let Ok(bytes) = serde_json::to_vec_pretty(&file) else {
-        return;
-    };
+    let bytes = serde_json::to_vec_pretty(&file)?;
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, &bytes).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
+    if std::fs::write(&tmp, &bytes)
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .is_ok()
+    {
+        return Ok(());
     }
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::write(path, &bytes)
 }
 
 /// Is a newer build out, for an install with no published artifact to compare?
@@ -244,7 +248,9 @@ pub(crate) fn refresh_blocking() -> Result<Checked, FeedError> {
                 m.serial, floor
             )));
         }
-        store_floor(&path, channel.as_str(), m.serial);
+        if let Err(e) = store_floor(&path, channel.as_str(), m.serial) {
+            tracing::warn!(path = %path.display(), error = %e, "update serial floor not raised");
+        }
         Ok(m)
     });
 
@@ -639,11 +645,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(load_floor(&path, "stable"), 0);
-        store_floor(&path, "stable", 100);
+        store_floor(&path, "stable", 100).unwrap();
         assert_eq!(load_floor(&path, "stable"), 100);
-        store_floor(&path, "stable", 50);
+        store_floor(&path, "stable", 50).unwrap();
         assert_eq!(load_floor(&path, "stable"), 100);
-        store_floor(&path, "canary", 7);
+        store_floor(&path, "canary", 7).unwrap();
         assert_eq!(load_floor(&path, "canary"), 7);
         assert_eq!(load_floor(&path, "stable"), 100);
 
@@ -657,9 +663,21 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&path, b"not json").unwrap();
         assert_eq!(load_floor(&path, "stable"), 0);
-        store_floor(&path, "stable", 5);
+        store_floor(&path, "stable", 5).unwrap();
         assert_eq!(load_floor(&path, "stable"), 5);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A temp file that cannot be renamed into place still raises the floor.
+    #[test]
+    fn floor_rises_when_the_rename_cannot_happen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update-state.json");
+        store_floor(&path, "stable", 5).unwrap();
+        // A directory on the temp name defeats the temp write, as a failed rename would.
+        std::fs::create_dir(path.with_extension("json.tmp")).unwrap();
+        store_floor(&path, "stable", 9).unwrap();
+        assert_eq!(load_floor(&path, "stable"), 9);
     }
 
     /// `last_error` and `not_published` never arrive together. The benign

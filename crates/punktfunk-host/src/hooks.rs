@@ -1147,12 +1147,8 @@ mod tests {
 
     #[test]
     fn store_roundtrips_and_survives_corruption() {
-        let path = std::env::temp_dir().join(format!(
-            "pf-hooks-test-{}-{:p}.json",
-            std::process::id(),
-            &0u8 as *const u8
-        ));
-        let _ = std::fs::remove_file(&path);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
 
         let store = HooksStore::load_from(path.clone());
         assert!(store.get().hooks.is_empty(), "unconfigured = no hooks");
@@ -1182,17 +1178,12 @@ mod tests {
         std::fs::write(&path, b"{ not json").unwrap();
         let corrupt = HooksStore::load_from(path.clone());
         assert!(corrupt.get().hooks.is_empty());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn hand_edited_file_reloads_without_restart() {
-        let path = std::env::temp_dir().join(format!(
-            "pf-hooks-reload-test-{}-{:p}.json",
-            std::process::id(),
-            &0u8 as *const u8
-        ));
-        let _ = std::fs::remove_file(&path);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
 
         let store = HooksStore::load_from(path.clone());
         assert!(store.get().hooks.is_empty());
@@ -1351,12 +1342,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exec_runs_with_stdin_and_env_and_timeout_kills() {
-        let out = std::env::temp_dir().join(format!(
-            "pf-hook-exec-{}-{:p}.txt",
-            std::process::id(),
-            &0u8 as *const u8
-        ));
-        let _ = std::fs::remove_file(&out);
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("exec.txt");
         let ev = sample_event();
         let env = flatten_env(&ev);
         let json = serde_json::to_string(&ev).unwrap();
@@ -1372,7 +1359,6 @@ mod tests {
         let text = std::fs::read_to_string(&out).expect("hook wrote its file");
         assert!(text.starts_with("stream.started|"), "env delivered: {text}");
         assert!(text.contains("\"seq\":7"), "stdin delivered: {text}");
-        let _ = std::fs::remove_file(&out);
 
         // Timeout must kill the process group, not wait out `sleep 30`.
         let started = Instant::now();
@@ -1386,12 +1372,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn prep_runs_do_in_order_and_undo_in_reverse() {
-        let out = std::env::temp_dir().join(format!(
-            "pf-prep-test-{}-{:p}.txt",
-            std::process::id(),
-            &0u8 as *const u8
-        ));
-        let _ = std::fs::remove_file(&out);
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("prep.txt");
         let step = |do_tag: &str, undo_tag: Option<&str>| PrepCmd {
             run: format!("echo {do_tag} >> {}", out.display()),
             undo: undo_tag.map(|t| format!("echo {t} >> {}", out.display())),
@@ -1429,7 +1411,6 @@ mod tests {
         assert!(!std::fs::read_to_string(&out)
             .unwrap()
             .contains("undo-never"));
-        let _ = std::fs::remove_file(&out);
     }
 
     #[test]
@@ -1447,11 +1428,8 @@ mod tests {
     #[test]
     fn ownership_check_refuses_world_writable_scripts() {
         use std::os::unix::fs::PermissionsExt;
-        let path = std::env::temp_dir().join(format!(
-            "pf-hook-own-{}-{:p}.sh",
-            std::process::id(),
-            &0u8 as *const u8
-        ));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hook.sh");
         std::fs::write(&path, "#!/bin/sh\ntrue\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(exec_path_check(&format!("{} arg", path.display())).is_ok());
@@ -1461,7 +1439,6 @@ mod tests {
             exec_path_check(&format!("{} arg", path.display())).is_err(),
             "world-writable script must be refused"
         );
-        let _ = std::fs::remove_file(&path);
 
         // Bare command names are left to PATH; nonexistent paths are the shell's problem.
         assert!(exec_path_check("systemctl suspend").is_ok());
@@ -1473,14 +1450,9 @@ mod tests {
     fn ownership_check_sees_quoted_paths_and_writable_parents() {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::Permissions::from_mode;
-        let dir = std::env::temp_dir().join(format!(
-            "pf-hook-parent-{}-{:p}",
-            std::process::id(),
-            &0u8 as *const u8
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::set_permissions(&dir, mode(0o755)).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::set_permissions(dir, mode(0o755)).unwrap();
         let script = dir.join("my hook.sh");
         std::fs::write(&script, "#!/bin/sh\ntrue\n").unwrap();
         std::fs::set_permissions(&script, mode(0o700)).unwrap();
@@ -1503,24 +1475,19 @@ mod tests {
 
         // A writable parent can replace a well-owned script.
         std::fs::set_permissions(&script, mode(0o700)).unwrap();
-        std::fs::set_permissions(&dir, mode(0o777)).unwrap();
+        std::fs::set_permissions(dir, mode(0o777)).unwrap();
         let err = exec_path_check(&quoted).expect_err("world-writable parent must be refused");
         assert!(err.contains(&dir.display().to_string()), "names it: {err}");
-        std::fs::set_permissions(&dir, mode(0o755)).unwrap();
+        std::fs::set_permissions(dir, mode(0o755)).unwrap();
         assert!(exec_path_check(&quoted).is_ok(), "chmod go-w fixes it");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
     #[test]
     fn secret_file_permissions_are_complained_about() {
         use std::os::unix::fs::PermissionsExt;
-        let path = std::env::temp_dir().join(format!(
-            "pf-hook-secret-{}-{:p}.key",
-            std::process::id(),
-            &0u8 as *const u8
-        ));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hook.key");
         std::fs::write(&path, b"s3cret").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(secret_file_complaint(&path).is_none(), "0600 is the ask");

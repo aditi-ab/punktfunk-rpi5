@@ -1030,11 +1030,7 @@ mod session_tests {
             os_chain: "linux".into(),
             os_name: "Linux".into(),
         };
-        let stats = crate::stats_recorder::StatsRecorder::new(std::env::temp_dir().join(format!(
-            "pf-gs-endsession-{}-{:p}",
-            std::process::id(),
-            &0u8 as *const u8
-        )));
+        let stats = crate::stats_recorder::StatsRecorder::new(crate::test_support::scratch());
         // Session teardown under test is feature-independent; both `new` flavors.
         #[cfg(feature = "gamestream")]
         {
