@@ -3382,6 +3382,7 @@ dependencies = [
 name = "pf-update"
 version = "0.40.0"
 dependencies = [
+ "pf-update-check",
  "serde",
  "serde_json",
 ]

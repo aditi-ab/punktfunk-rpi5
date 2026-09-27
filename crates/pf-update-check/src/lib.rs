@@ -30,6 +30,7 @@ pub const OFFICIAL_UPDATE_KEYS: [&str; 2] = [
 ];
 
 /// [`OFFICIAL_UPDATE_KEYS`] parsed, the empty rotation slot skipped.
+#[cfg(feature = "verify")]
 pub fn pinned_keys() -> Vec<PublicKey> {
     OFFICIAL_UPDATE_KEYS
         .iter()
@@ -39,19 +40,25 @@ pub fn pinned_keys() -> Vec<PublicKey> {
 }
 
 pub mod detect;
+#[cfg(feature = "verify")]
 pub mod feed;
 pub mod floor;
+#[cfg(feature = "verify")]
 pub mod manifest;
+#[cfg(feature = "verify")]
 pub mod sig;
 pub mod version;
 
 pub use detect::{InstallKind, Product};
+#[cfg(feature = "verify")]
 pub use feed::FeedError;
+#[cfg(feature = "verify")]
 pub use manifest::{Manifest, MAX_MANIFEST_BYTES, SCHEMA};
+#[cfg(feature = "verify")]
 pub use sig::{verify_signature, PublicKey};
 pub use version::{canary_run, is_newer, triple, Channel};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "verify"))]
 mod tests {
     #[test]
     fn pinned_keys_skip_the_empty_rotation_slot() {
