@@ -10,7 +10,14 @@
 //! Negotiated counts: `2`, `6`, `8`. Anything else clamps to stereo ([`normalize_channels`]).
 //! Opus is 48 kHz; the lossless plane is a second plane — [`pcm`], `design/hi-res-audio.md`.
 
+/// cbindgen:ignore
+#[cfg(feature = "quic")]
+pub mod mic;
+/// cbindgen:ignore
+pub mod pad_mix;
 pub mod pcm;
+/// cbindgen:ignore
+pub mod plane;
 
 use std::time::Duration;
 

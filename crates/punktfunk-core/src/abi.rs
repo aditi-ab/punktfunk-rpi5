@@ -685,218 +685,82 @@ pub struct PunktfunkConnection {
     hud_snap: std::sync::Mutex<crate::hud::StatsSnapshot>,
 }
 
-/// Handshake-resolved audio format. Codec + rate together distinguish 48 kHz
-/// PCM from 48 kHz Opus. Read fresh each call; the host never changes it live.
+// Handshake-resolved audio format, read fresh each call; the host never changes it live.
 #[cfg(feature = "quic")]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct AudioFormat {
-    /// `AUDIO_CODEC_OPUS` (`0xC9`) or `AUDIO_CODEC_PCM` (`0xD3`). Selects the decoder.
-    codec: u8,
-    /// 48 000 on Opus; any [`crate::audio::pcm::rate_is_supported`] rate on PCM.
-    rate_hz: u32,
-    /// 16 or 24. PCM unpack stride. Unused on Opus (decodes to f32).
-    bits: u8,
-    /// After [`crate::audio::normalize_channels`].
-    channels: u8,
-    /// Frame length in µs. Concealment cap is a duration; this turns it into a frame count.
-    frame_us: u32,
-    /// Surround coupling, verbatim off Welcome ([`crate::audio::AudioLayout`] wire id).
-    layout: u8,
-}
+use crate::audio::plane::PlaneFormat as AudioFormat;
 
-#[cfg(feature = "quic")]
-impl AudioFormat {
-    fn of(c: &crate::client::NativeClient) -> AudioFormat {
-        AudioFormat {
-            codec: c.audio_codec,
-            // Zero rate sizes a 0-length buffer (`!pcm.is_empty()` is the sized latch)
-            // and reallocates every packet. Do not trust a peer 0.
-            rate_hz: if c.audio_sample_rate_hz == 0 {
-                crate::audio::SAMPLE_RATE_HZ
-            } else {
-                c.audio_sample_rate_hz
-            },
-            bits: c.audio_bits,
-            channels: crate::audio::normalize_channels(c.audio_channels),
-            // 0 is not a frame length. Fold to the 5 ms Opus frame.
-            frame_us: if c.audio_frame_us == 0 {
-                crate::audio::FRAME_MS * 1000
-            } else {
-                c.audio_frame_us as u32
-            },
-            layout: c.audio_layout,
-        }
-    }
-
-    /// True when this session runs the lossless `0xD3` plane rather than Opus on `0xC9`.
-    fn is_pcm(&self) -> bool {
-        self.codec == crate::quic::AUDIO_CODEC_PCM
-    }
-}
-
-/// In-core decode for either audio plane. Opus uses one [`opus::MSDecoder`];
-/// PCM unpacks with [`crate::audio::pcm::to_f32`] and conceals with [`PcmConceal`].
+/// In-core decode for either audio plane ([`crate::audio::plane::PlaneDecoder`]), plus the
+/// fixed buffer and drought bookkeeping the C surface needs on top.
 #[cfg(feature = "quic")]
 #[derive(Default)]
 struct AudioPcmState {
-    decoder: Option<opus::MSDecoder>,
+    /// Built on the first packet.
+    decoder: Option<crate::audio::plane::PlaneDecoder>,
     /// Interleaved f32. Sized once; growth would dangle the pointer handed to the embedder.
     pcm: Vec<f32>,
     /// Seq-gap tracker. Without it a lost packet is a hard click in the playout ring.
     gaps: crate::audio::AudioGapTracker,
-    /// Last real decode's per-channel samples. 0 skips concealment (nothing to size from).
+    /// Last real decode's per-channel samples, the Opus PLC unit. 0 = nothing to size from.
     frame_samples: usize,
     /// PLC frames already given during a drought. Subtract so a later gap is not covered twice.
     drought_frames: u32,
-    /// PCM-plane concealer. Unused on Opus (libopus PLC).
-    conceal_pcm: crate::audio::pcm::PcmConceal,
-    /// PCM staging. `to_f32` clears/reserves; writing into `pcm` would move the embedder pointer.
-    scratch_pcm: Vec<f32>,
 }
 
 #[cfg(feature = "quic")]
 impl AudioPcmState {
-    /// Size `pcm` once. The embedder holds a pointer into it until the next PCM
-    /// call; later `Vec` growth would dangle. Writes clamp; never extend.
-    /// `!pcm.is_empty()` is the sized latch — a zero rate would re-enter forever.
+    /// Size `pcm` once, for one longest frame plus a full concealment run at this session's
+    /// frame. The embedder holds a pointer into it until the next PCM call; growth would
+    /// dangle it, so the decoder clamps into it instead.
     fn ensure_buffer(&mut self, fmt: AudioFormat) {
         if !self.pcm.is_empty() {
             return;
         }
-        let ch = fmt.channels.max(1) as usize;
-        // Largest frame this plane can present. Opus: 120 ms. PCM: longest `FRAME_US_LADDER`
-        // rung (MTU-sized, never fragmented). Copies into `pcm` still clamp.
-        let per_ch = if fmt.is_pcm() {
-            crate::audio::pcm::samples_per_frame(
-                fmt.rate_hz,
-                crate::audio::pcm::FRAME_US_LADDER[0],
-                1,
-            )
-        } else {
-            fmt.rate_hz as usize / 1000 * 120
-        };
-        // Count from resolved frame (50 ms cap → 25×2 ms, not 10). Size from the longest
-        // ladder rung: a 2 ms session that then sends 5 ms must not truncate; cannot grow.
         let run = crate::audio::max_conceal_packets(fmt.frame_us) as usize;
-        self.pcm = vec![0f32; (1 + run) * per_ch.max(1) * ch];
+        self.pcm = vec![0f32; (1 + run) * fmt.max_frame_samples().max(1)];
         // Cap the tracker at this same run. A larger cap would silently truncate frames.
         self.gaps.set_frame_us(fmt.frame_us);
     }
 
-    /// Copy `n` scratch samples into `pcm` at `filled`. Clamp is load-bearing:
-    /// oversized datagrams truncate instead of reallocating or overrunning.
-    fn stage_scratch(&mut self, filled: usize, n: usize) -> usize {
-        let n = n.min(self.scratch_pcm.len()).min(self.pcm.len() - filled);
-        self.pcm[filled..filled + n].copy_from_slice(&self.scratch_pcm[..n]);
-        n
-    }
-
-    /// PCM half of [`decode_packet`](Self::decode_packet): unpack + [`PcmConceal`].
-    /// Same shape as Opus (conceal then real, one buffer) so the C surface does not branch.
-    fn decode_pcm_packet(
-        &mut self,
-        data: &[u8],
-        seq: u32,
-        fmt: AudioFormat,
-    ) -> Result<usize, PunktfunkStatus> {
-        let ch = fmt.channels.max(1) as usize;
-        self.ensure_buffer(fmt);
-
-        // Same drought credit as Opus: frames already handed out while the wire was quiet.
-        let missing = self
-            .gaps
-            .missing_before(seq)
-            .saturating_sub(std::mem::take(&mut self.drought_frames));
-        let mut filled = 0usize;
-        for _ in 0..missing {
-            if !self.conceal_pcm.conceal(&mut self.scratch_pcm) {
-                break; // nothing has arrived yet — nothing to build a repeat from
-            }
-            let n = self.scratch_pcm.len();
-            let staged = self.stage_scratch(filled, n);
-            filled += staged;
-            if staged < n {
-                break; // buffer full: stop rather than emit a torn frame
-            }
-        }
-
-        if data.is_empty() {
-            // PCM has no DTX. Empty is a torn datagram: do not `accept` it (that clears the
-            // last good frame). Account the slot like Opus DTX; still emit concealment owed.
-            return Ok(filled);
-        }
-        match crate::audio::pcm::to_f32(data, fmt.bits, &mut self.scratch_pcm) {
-            Some(n) => {
-                let staged = self.stage_scratch(filled, n);
-                // Conceal from the staged length (what the embedder heard), not the decoded
-                // one: keeps the source inside the fixed buffer on an oversized datagram.
-                self.conceal_pcm.accept(&self.scratch_pcm[..staged]);
-                self.frame_samples = staged / ch;
-                Ok(filled + staged)
-            }
-            // Torn datagram: keep concealment already earned, same as undecodable Opus.
-            None if filled > 0 => Ok(filled),
-            None => Err(PunktfunkStatus::BadPacket),
-        }
-    }
-
     /// Decode one packet into `pcm`. Missing seqs are concealed first, then the
     /// real frame, one interleaved buffer. Empty `data` is DTX: account the slot,
-    /// flush owed concealment, never decode (`decode_float` would fill the buffer).
-    /// `Ok(0)` = nothing to hand out.
+    /// flush owed concealment, never decode. `Ok(0)` = nothing to hand out.
     fn decode_packet(
         &mut self,
         data: &[u8],
         seq: u32,
         fmt: AudioFormat,
     ) -> Result<usize, PunktfunkStatus> {
-        if fmt.is_pcm() {
-            return self.decode_pcm_packet(data, seq, fmt);
-        }
-        let channels = fmt.channels;
-        let ch = channels as usize;
         if self.decoder.is_none() {
-            // A coupling this build does not know would pair channels wrongly, not loudly.
-            let Some(layout) = crate::audio::AudioLayout::from_wire(fmt.layout) else {
-                return Err(PunktfunkStatus::Unsupported);
-            };
-            let layout = crate::audio::layout_for(channels, layout);
-            // Negotiated rate, not a constant. libopus rejects 96 kHz; fail here, not silently.
-            match opus::MSDecoder::new(fmt.rate_hz, layout.streams, layout.coupled, layout.mapping)
-            {
-                Ok(d) => {
-                    self.ensure_buffer(fmt);
-                    self.decoder = Some(d);
-                }
-                Err(_) => return Err(PunktfunkStatus::Unsupported),
-            }
+            let dec = crate::audio::plane::PlaneDecoder::new(&fmt)
+                .map_err(|_| PunktfunkStatus::Unsupported)?;
+            self.ensure_buffer(fmt);
+            self.decoder = Some(dec);
         }
         let dec = self.decoder.as_mut().unwrap();
+        let ch = fmt.channels as usize;
 
-        // PLC the seq gap first (empty input, 50 ms cap). Subtract drought frames already in the ring.
+        // Conceal the seq gap first (50 ms cap), less drought frames already in the ring.
         let missing = self
             .gaps
             .missing_before(seq)
             .saturating_sub(std::mem::take(&mut self.drought_frames));
         let mut filled = 0usize;
-        if self.frame_samples > 0 {
-            for _ in 0..missing {
-                let plc = self.frame_samples * ch;
-                match dec.decode_float(&[], &mut self.pcm[filled..filled + plc], false) {
-                    Ok(samples) => filled += samples * ch,
-                    Err(_) => break,
-                }
+        for _ in 0..missing {
+            match dec.conceal(self.frame_samples, &mut self.pcm[filled..]) {
+                Ok(n) if n > 0 => filled += n * ch,
+                _ => break,
             }
         }
 
         if data.is_empty() {
-            // DTX: never decode; still emit concealment owed for losses before it.
             return Ok(filled);
         }
-        match dec.decode_float(data, &mut self.pcm[filled..], false) {
-            Ok(samples) => {
-                self.frame_samples = samples;
-                Ok(filled + samples * ch)
+        match dec.decode(data, &mut self.pcm[filled..]) {
+            Ok(n) => {
+                if n > 0 {
+                    self.frame_samples = n;
+                }
+                Ok(filled + n * ch)
             }
             // Undecodable: keep concealment already earned. This slot is a ring gap.
             Err(_) if filled > 0 => Ok(filled),
@@ -906,34 +770,16 @@ impl AudioPcmState {
 
     /// One drought concealment frame, no packet. `Ok(0)` before the first decode.
     fn conceal(&mut self, fmt: AudioFormat) -> Result<usize, PunktfunkStatus> {
-        if fmt.is_pcm() {
-            // PCM has no decoder/PLC. `conceal` is false before the first real frame.
-            if !self.conceal_pcm.conceal(&mut self.scratch_pcm) {
-                return Ok(0);
-            }
-            let n = self.scratch_pcm.len();
-            let staged = self.stage_scratch(0, n);
-            if staged == 0 {
-                return Ok(0);
-            }
-            self.drought_frames = self.drought_frames.saturating_add(1);
-            return Ok(staged);
-        }
-        let ch = fmt.channels as usize;
-        let plc = self.frame_samples * ch;
-        if plc == 0 {
-            return Ok(0);
-        }
         let Some(dec) = self.decoder.as_mut() else {
             return Ok(0);
         };
-        match dec.decode_float(&[], &mut self.pcm[..plc], false) {
-            Ok(samples) => {
+        match dec.conceal(self.frame_samples, &mut self.pcm) {
+            Ok(n) if n > 0 => {
                 self.drought_frames = self.drought_frames.saturating_add(1);
-                Ok(samples * ch)
+                Ok(n * fmt.channels as usize)
             }
-            // libopus declined; write nothing (same as a timeout).
-            Err(_) => Ok(0),
+            // Nothing to build from, or libopus declined: write nothing (same as a timeout).
+            _ => Ok(0),
         }
     }
 }
@@ -6659,8 +6505,8 @@ mod tests {
         }
     }
 
-    /// PCM gaps use `PcmConceal`, never libopus. No decoder is built; the conceal
-    /// frame repeats the last real one (`design/hi-res-audio.md`).
+    /// PCM gaps use `PcmConceal`, never libopus: the conceal frame repeats the last
+    /// real one (`design/hi-res-audio.md`).
     #[test]
     fn a_missing_pcm_frame_is_concealed_without_libopus() {
         let bits = crate::audio::pcm::BITS_24;
@@ -6676,10 +6522,6 @@ mod tests {
             n,
             2 * expect3.len(),
             "one concealed frame, then the real one"
-        );
-        assert!(
-            state.decoder.is_none(),
-            "a libopus decoder must never be built on the lossless plane"
         );
         // Concealed frame is the previous one faded: head matches last good sample
         // (raised cosine ~1.0), tail is silence. PLC-synthesized would match neither.
@@ -6702,7 +6544,6 @@ mod tests {
         let before = state.drought_frames;
         assert_eq!(state.conceal(PCM_48K_24), Ok(expect.len()));
         assert_eq!(state.drought_frames, before + 1);
-        assert!(state.decoder.is_none());
     }
 
     /// `pcm` must never reallocate: the embedder holds a pointer into it.
@@ -6786,11 +6627,9 @@ mod tests {
         assert!(state.decoder.is_some(), "still a libopus decoder");
         // 120 ms of Opus plus a full concealment run.
         assert_eq!(state.pcm.len(), (1 + CONCEAL_RUN as usize) * 5760 * 2);
-        // Gaps and droughts still go through libopus PLC; PcmConceal is never fed.
+        // Gaps and droughts still go through libopus PLC.
         assert_eq!(state.decode_packet(&out, 2, OPUS_48K), Ok(2 * 240 * 2));
         assert_eq!(state.conceal(OPUS_48K), Ok(240 * 2));
-        assert_eq!(state.conceal_pcm.run(), 0, "PcmConceal must be untouched");
-        assert!(state.scratch_pcm.is_empty());
 
         // Accessors report 48 kHz / 16-bit, matching `PUNKTFUNK_AUDIO_SAMPLE_RATE_HZ`.
         assert_eq!(OPUS_48K.rate_hz, crate::audio::SAMPLE_RATE_HZ);

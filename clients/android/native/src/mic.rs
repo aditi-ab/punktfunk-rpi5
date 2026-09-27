@@ -19,8 +19,8 @@ use ndk::audio::{
     AudioCallbackResult, AudioDirection, AudioFormat, AudioInputPreset, AudioPerformanceMode,
     AudioSharingMode, AudioStream, AudioStreamBuilder, SessionId,
 };
+use punktfunk_core::audio::mic::MicEncoder;
 use punktfunk_core::client::NativeClient;
-use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
@@ -40,9 +40,6 @@ type StartedCapture = (AudioStream, Receiver<Vec<f32>>, SyncSender<Vec<f32>>, i3
 
 const CHANNELS: usize = 1;
 const SAMPLE_RATE: i32 = 48_000;
-/// 10 ms per channel @ 48 kHz — half the desktop clients' 20 ms frame, trading a little Opus
-/// header overhead for one less buffered interval; the host accepts ≤ 120 ms.
-const FRAME_SAMPLES: usize = 480;
 /// Captured-chunk hand-off depth (each ~ one burst); drops on overflow (best-effort uplink).
 /// Bursts are sized in frames, so the wall-time depth is unchanged by the stereo→mono move.
 const RING_CHUNKS: usize = 64;
@@ -51,15 +48,6 @@ const RING_CHUNKS: usize = 64;
 /// each buffer a one-time grow on the capture thread, after which the steady state is
 /// allocation-free again.
 const CHUNK_CAP_SAMPLES: usize = 960; // 20 ms mono — the same wall-time as the old stereo value
-/// Opus VOIP target bitrate (mono speech; tunable).
-const MIC_BITRATE: i32 = 48_000;
-/// Encode-side self-heal threshold, in queued 10 ms frames (~60 ms): waking to more than this
-/// means the uplink stalled — and because the capture callback drops the NEWEST chunk when the
-/// channel is full, a stall otherwise converts to standing mic delay that never drains (real-time
-/// playback host-side never makes time back up). Skip to the newest few frames instead.
-const BACKLOG_MAX_FRAMES: usize = 6;
-/// What a self-heal keeps: ~20 ms of the freshest audio (one audible blip, live again).
-const BACKLOG_KEEP_FRAMES: usize = 2;
 /// Settling time between a disconnect and the reopen: a headset handing over the route.
 const REOPEN_SETTLE_MS: u64 = 250;
 /// Reopens that may find no input before the mic gives up: ~2 s, past a Bluetooth handover.
@@ -76,7 +64,7 @@ pub struct MicCapture {
     join: Option<std::thread::JoinHandle<()>>,
 }
 
-/// Why [`Uplink::run`] returned.
+/// Why [`run`] returned.
 #[derive(Debug, PartialEq, Eq)]
 enum Exit {
     Shutdown,
@@ -303,10 +291,20 @@ fn supervise(
     // decode thread opens keeps mic encode on a fast core too (the playback side's decode_loop
     // does the same). No-op below API 33.
     client.register_hot_thread();
-    let Some(mut up) = Uplink::new() else {
-        let _ = ready.send(None);
-        return;
+    // Self-heal on: the capture callback drops the NEWEST chunk when the channel is full, so a
+    // stall here would otherwise become standing mic delay the host never makes back up.
+    let mut up = match MicEncoder::new(true) {
+        Ok(up) => up,
+        Err(e) => {
+            log::error!("mic: opus encoder init: {e} — mic disabled");
+            let _ = ready.send(None);
+            return;
+        }
     };
+    // Complexity 5 roughly halves encode cost for no audible loss on speech at this rate.
+    if let Err(e) = up.encoder_mut().set_complexity(5) {
+        log::warn!("mic: opus complexity not applied: {e}");
+    }
     let captured = Arc::new(AtomicU64::new(0));
     // Chunks discarded on the capture thread (free-list empty / encoder lagging); logged
     // throttled from the encode loop.
@@ -338,7 +336,8 @@ fn supervise(
             }
             None => log::info!("mic: reopened after a disconnect (session={session_id})"),
         }
-        let exit = up.run(
+        let exit = run(
+            &mut up,
             &client,
             &rx,
             &free_tx,
@@ -367,156 +366,57 @@ fn supervise(
     );
 }
 
-/// The encode side, kept across reopens: encoder state, the sequence the host de-jitters, and
-/// the counters. Drained chunk buffers go back to the callback's free-list; the encode scratch is
-/// reused across frames (only the packet Vec handed to `send_mic` is allocated per frame).
-struct Uplink {
-    enc: opus::Encoder,
-    ring: VecDeque<f32>,
-    pcm: Vec<f32>,
-    out: Vec<u8>,
-    seq: u32,
-    sent: u64,
-    /// Frames shed by the backlog self-heal (see [`BACKLOG_MAX_FRAMES`]).
-    stale: u64,
-    /// Frames dropped unencoded because the user muted.
-    muted_frames: u64,
-    /// Loudest |sample| since the last log — tells speech from silence.
-    peak: f32,
-}
-
-impl Uplink {
-    fn new() -> Option<Uplink> {
-        let mut enc = match opus::Encoder::new(
-            SAMPLE_RATE as u32,
-            opus::Channels::Mono,
-            opus::Application::Voip,
-        ) {
-            Ok(e) => e,
-            Err(e) => {
-                log::error!("mic: opus encoder init: {e} — mic disabled");
-                return None;
-            }
-        };
-        // Speech tuning: complexity 5 roughly halves encode cost for no audible loss at this rate,
-        // and in-band FEC at an assumed 10% loss lets the host's decoder reconstruct a dropped
-        // datagram from its successor instead of playing a hole (the uplink is fire-and-forget).
-        // A refused setter leaves the encoder on libopus defaults — audible, so say which.
-        for (what, r) in [
-            ("bitrate", enc.set_bitrate(opus::Bitrate::Bits(MIC_BITRATE))),
-            ("complexity", enc.set_complexity(5)),
-            ("inband_fec", enc.set_inband_fec(true)),
-            ("packet_loss_perc", enc.set_packet_loss_perc(10)),
-        ] {
-            if let Err(e) = r {
-                log::warn!("mic: opus {what} not applied: {e}");
-            }
+/// Consumer for one stream: drain captured f32 into the encoder, which sends 10 ms mono frames
+/// with `send_mic`, until shutdown or a disconnect. Drained chunk buffers go back to the
+/// callback's free-list. A mute drops formed frames; the stream itself runs on untouched.
+#[allow(clippy::too_many_arguments)] // one call site, `supervise`
+fn run(
+    up: &mut MicEncoder,
+    client: &NativeClient,
+    rx: &Receiver<Vec<f32>>,
+    free_tx: &SyncSender<Vec<f32>>,
+    shutdown: &AtomicBool,
+    disconnected: &AtomicBool,
+    muted: &AtomicBool,
+    captured: &AtomicU64,
+    dropped: &AtomicU64,
+) -> Exit {
+    while !shutdown.load(Ordering::Relaxed) {
+        if disconnected.load(Ordering::SeqCst) {
+            return Exit::Disconnected;
         }
-        let frame = FRAME_SAMPLES * CHANNELS;
-        Some(Uplink {
-            enc,
-            ring: VecDeque::with_capacity(frame * 4),
-            pcm: vec![0f32; frame],
-            out: vec![0u8; 4000], // max Opus packet for a 10 ms frame fits easily
-            seq: 0,
-            sent: 0,
-            stale: 0,
-            muted_frames: 0,
-            peak: 0.0,
-        })
-    }
-
-    /// Consumer for one stream: drain captured f32 → accumulate → Opus `encode_float` 10 ms mono
-    /// frames → `send_mic`, until shutdown or a disconnect.
-    ///
-    /// While `muted` is set a formed frame is dropped instead of encoded (see the frame loop) — the
-    /// capture side keeps running exactly as it does unmuted, so nothing about the stream, its ring
-    /// or its backlog behaviour changes across a toggle.
-    #[allow(clippy::too_many_arguments)] // one call site, `supervise`
-    fn run(
-        &mut self,
-        client: &NativeClient,
-        rx: &Receiver<Vec<f32>>,
-        free_tx: &SyncSender<Vec<f32>>,
-        shutdown: &AtomicBool,
-        disconnected: &AtomicBool,
-        muted: &AtomicBool,
-        captured: &AtomicU64,
-        dropped: &AtomicU64,
-    ) -> Exit {
-        let frame = FRAME_SAMPLES * CHANNELS;
-        while !shutdown.load(Ordering::Relaxed) {
-            if disconnected.load(Ordering::SeqCst) {
-                return Exit::Disconnected;
-            }
-            match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(mut chunk) => {
-                    // `drain(..)` keeps the Vec's capacity; hand the emptied buffer back to the
-                    // callback's free-list (dropped only if the pool is momentarily full).
-                    self.ring.extend(chunk.drain(..));
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(mut chunk) => {
+                up.push(chunk.drain(..));
+                let _ = free_tx.try_send(chunk);
+                // Take whatever else queued while we were away, so a post-stall backlog lands as
+                // ONE lump the self-heal can size up.
+                while let Ok(mut chunk) = rx.try_recv() {
+                    up.push(chunk.drain(..));
                     let _ = free_tx.try_send(chunk);
-                    // Drain whatever else queued while we were away, so a post-stall backlog
-                    // lands as ONE lump the self-heal below can size up — chunk-at-a-time it
-                    // would be encoded (and inflicted on the host as standing delay) before it
-                    // ever looked deep.
-                    while let Ok(mut chunk) = rx.try_recv() {
-                        self.ring.extend(chunk.drain(..));
-                        let _ = free_tx.try_send(chunk);
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => continue, // wake to re-check shutdown/disconnect
-                // The callback dropped its sender: the stream is gone.
-                Err(RecvTimeoutError::Disconnected) => return Exit::Disconnected,
-            }
-            // Self-heal the latency ratchet: a stall (scheduler hiccup, a slow send) queues stale
-            // audio, and every ms of it would ride the stream as mic delay for the rest of the
-            // session. Jump to the newest ~20 ms (one audible blip), counting the shed.
-            if self.ring.len() > BACKLOG_MAX_FRAMES * frame {
-                let excess = self.ring.len() - BACKLOG_KEEP_FRAMES * frame;
-                self.ring.drain(..excess);
-                self.stale += (excess / frame) as u64;
-            }
-            while self.ring.len() >= frame {
-                // Muted: drop the frame before it becomes an Opus packet; nothing goes on the wire.
-                // `seq` does NOT advance: the host reads a seq jump as loss where a mute is a pause,
-                // so the frame after an unmute continues the chain. `peak` is what the UPLINK
-                // carried, so a dropped frame resets it.
-                if muted.load(Ordering::Relaxed) {
-                    self.ring.drain(..frame);
-                    self.muted_frames += 1;
-                    self.peak = 0.0;
-                    continue;
-                }
-                for (dst, src) in self.pcm.iter_mut().zip(self.ring.drain(..frame)) {
-                    *dst = src;
-                }
-                for &s in &self.pcm {
-                    self.peak = self.peak.max(s.abs());
-                }
-                match self.enc.encode_float(&self.pcm, &mut self.out) {
-                    Ok(len) => {
-                        let pts = punktfunk_core::quic::wall_clock_ns();
-                        let _ = client.send_mic(self.seq, pts, self.out[..len].to_vec());
-                        self.seq = self.seq.wrapping_add(1);
-                        self.sent += 1;
-                        if self.sent % 500 == 0 {
-                            log::info!(
-                                "mic: sent={} captured_frames={} dropped_chunks={} \
-                                 stale_frames={} muted_frames={} peak={:.3}",
-                                self.sent,
-                                captured.load(Ordering::Relaxed),
-                                dropped.load(Ordering::Relaxed),
-                                self.stale,
-                                self.muted_frames,
-                                self.peak,
-                            );
-                            self.peak = 0.0;
-                        }
-                    }
-                    Err(e) => log::debug!("mic: opus encode: {e}"),
                 }
             }
+            Err(RecvTimeoutError::Timeout) => continue, // wake to re-check shutdown/disconnect
+            // The callback dropped its sender: the stream is gone.
+            Err(RecvTimeoutError::Disconnected) => return Exit::Disconnected,
         }
-        Exit::Shutdown
+        let before = up.sent;
+        up.drain(muted.load(Ordering::Relaxed), |seq, pts, packet| {
+            let _ = client.send_mic(seq, pts, packet.to_vec());
+        });
+        if up.sent / 500 != before / 500 {
+            log::info!(
+                "mic: sent={} captured_frames={} dropped_chunks={} stale_frames={} \
+                 muted_frames={} peak={:.3}",
+                up.sent,
+                captured.load(Ordering::Relaxed),
+                dropped.load(Ordering::Relaxed),
+                up.stale,
+                up.muted_frames,
+                up.peak,
+            );
+            up.peak = 0.0;
+        }
     }
+    Exit::Shutdown
 }

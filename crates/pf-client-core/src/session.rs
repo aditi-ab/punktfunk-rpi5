@@ -385,127 +385,6 @@ pub fn start(params: SessionParams) -> SessionHandle {
 /// The client's present and latency clock: the same wall-clock basis the host stamps `pts_ns` in.
 pub use punktfunk_core::quic::wall_clock_ns as now_ns;
 
-/// Session audio decoder: `0xC9` Opus or `0xD3` PCM, behind one pair of methods so
-/// the pull loop is plane-agnostic. The plane is chosen once from
-/// `Welcome::audio_codec` and never changes (output device is open at a fixed
-/// format). Both planes share a header, so this type is the only thing that knows.
-/// Both arms return interleaved sample counts so the loop sizes pushes, concealment
-/// and ring reporting from one number.
-struct AudioDec {
-    /// Host-resolved channel count, to turn libopus per-channel counts into interleaved.
-    channels: usize,
-    kind: DecKind,
-}
-
-enum DecKind {
-    Stereo(opus::Decoder),
-    Surround(opus::MSDecoder),
-    /// Lossless plane: no codec state, only the negotiated depth. A lossless format has
-    /// no PLC; `PcmConceal` repeats and fades instead.
-    Pcm {
-        bits: u8,
-        conceal: punktfunk_core::audio::pcm::PcmConceal,
-    },
-}
-
-impl AudioDec {
-    /// Build for the plane the host resolved — `codec`/`rate_hz`/`bits` off Welcome,
-    /// never off what this client asked for.
-    fn new(
-        codec: u8,
-        channels: u8,
-        rate_hz: u32,
-        bits: u8,
-        layout: punktfunk_core::audio::AudioLayout,
-    ) -> Result<AudioDec, opus::Error> {
-        let ch = channels.max(1) as usize;
-        // A lossless session never reaches libopus. libopus accepts only
-        // 8/12/16/24/48 kHz, which is why the hi-res ladder is a second plane.
-        if codec == punktfunk_core::quic::AUDIO_CODEC_PCM {
-            // Depth is the unpack stride: core reads anything that is not 16 as 24, and
-            // a mismatch desyncs every sample after the first. Warn rather than refuse
-            // (silence); negotiation should never produce this.
-            if !punktfunk_core::audio::pcm::depth_is_supported(bits) {
-                tracing::warn!(
-                    bits,
-                    "the host resolved a lossless depth this plane does not define — unpacking \
-                     as 24-bit, which will be wrong if it meant anything else"
-                );
-            }
-            return Ok(AudioDec {
-                channels: ch,
-                kind: DecKind::Pcm {
-                    bits,
-                    conceal: punktfunk_core::audio::pcm::PcmConceal::new(),
-                },
-            });
-        }
-        // Opus is 48 kHz by construction. Taking the rate from Welcome (not a second
-        // literal) keeps the decoder, ring, and A/V-sync loop on the same millisecond.
-        let kind = if channels == 2 {
-            DecKind::Stereo(opus::Decoder::new(rate_hz, opus::Channels::Stereo)?)
-        } else {
-            let l = punktfunk_core::audio::layout_for(channels, layout);
-            DecKind::Surround(opus::MSDecoder::new(
-                rate_hz, l.streams, l.coupled, l.mapping,
-            )?)
-        };
-        Ok(AudioDec { channels: ch, kind })
-    }
-
-    /// Decode one arrived frame into `out`; returns interleaved sample count.
-    /// `out` is caller scratch. Opus decodes into a fixed slice, so it must already
-    /// hold the biggest frame the plane can carry. PCM hands the Vec to `pcm::to_f32`,
-    /// which grows it — a malformed oversized datagram cannot overrun there.
-    ///
-    /// Empty `input` is Opus DTX or a torn PCM datagram: `Some(0)`, nothing decoded.
-    /// libopus would read it as a loss and fill all of `out` with PLC, and
-    /// `PcmConceal::accept` would drop the frame the next loss repeats.
-    fn decode(&mut self, input: &[u8], out: &mut Vec<f32>) -> Option<usize> {
-        if input.is_empty() {
-            return Some(0);
-        }
-        let channels = self.channels;
-        match &mut self.kind {
-            DecKind::Stereo(d) => d.decode_float(input, out, false).ok().map(|n| n * channels),
-            DecKind::Surround(d) => d.decode_float(input, out, false).ok().map(|n| n * channels),
-            DecKind::Pcm { bits, conceal } => {
-                // `None` is a truncated datagram — a partial sample would desync every
-                // sample after it. The caller treats it as a lost frame.
-                let n = punktfunk_core::audio::pcm::to_f32(input, *bits, out)?;
-                conceal.accept(&out[..n]);
-                Some(n)
-            }
-        }
-    }
-
-    /// Synthesise one missing-datagram frame into `out`. `None` = nothing decoded yet;
-    /// the caller should let the ring re-prime. `interleaved` is the last good frame's
-    /// length — libopus PLC synthesises exactly the slice it is handed; PCM ignores it.
-    fn conceal(&mut self, interleaved: usize, out: &mut Vec<f32>) -> Option<usize> {
-        let channels = self.channels;
-        match &mut self.kind {
-            // Length read here is this frame's, not the previous call's — `PcmConceal`
-            // already holds the frame it repeats, and reports `false` before anything arrives.
-            DecKind::Pcm { conceal, .. } => conceal.conceal(out).then_some(out.len()),
-            libopus => {
-                // libopus PLC synthesises exactly the slice it is handed; before anything
-                // has decoded there is no frame length to ask it for.
-                let plc = interleaved.min(out.len());
-                if plc == 0 {
-                    return None;
-                }
-                let per_ch = match libopus {
-                    DecKind::Stereo(d) => d.decode_float(&[], &mut out[..plc], false).ok()?,
-                    DecKind::Surround(d) => d.decode_float(&[], &mut out[..plc], false).ok()?,
-                    DecKind::Pcm { .. } => unreachable!("the PCM arm matched above"),
-                };
-                Some(per_ch * channels)
-            }
-        }
-    }
-}
-
 // Audio-format vocabulary lives in `audio_format` so the Skia console can read it on
 // Android, where nothing else in this file compiles. Re-exported so desktop callers'
 // `session::AUDIO_FORMATS` spelling stays valid.
@@ -1633,49 +1512,38 @@ fn spawn_audio(
 ) -> Option<std::thread::JoinHandle<()>> {
     // Decoder + playback from the host-resolved format, never the request. Opening
     // the device from the request is the failure a clamping host would trigger.
-    let channels = connector.audio_channels;
+    let fmt = punktfunk_core::audio::plane::PlaneFormat::of(&connector);
     // A codec this client does not speak is refused out loud. `Welcome::decode`
     // takes `audio_codec` verbatim — folding an unknown id onto Opus would
     // Opus-decode a `0xD3` payload (noise) or wait forever for `0xC9` (silence).
     if !matches!(
-        connector.audio_codec,
+        fmt.codec,
         punktfunk_core::quic::AUDIO_CODEC_OPUS | punktfunk_core::quic::AUDIO_CODEC_PCM
     ) {
         tracing::warn!(
-            codec = connector.audio_codec,
+            codec = fmt.codec,
             "the host resolved an audio plane this client cannot decode — streaming video-only"
         );
         return None;
     }
-    let lossless = connector.audio_codec == punktfunk_core::quic::AUDIO_CODEC_PCM;
-    // Same refusal for the coupling: a wrong pairing plays, and plays the wrong speakers.
-    let Some(layout) = punktfunk_core::audio::AudioLayout::from_wire(connector.audio_layout) else {
+    // Depth is the unpack stride and anything but 16 unpacks as 24. Warn rather than refuse.
+    if fmt.is_pcm() && !punktfunk_core::audio::pcm::depth_is_supported(fmt.bits) {
         tracing::warn!(
-            layout = connector.audio_layout,
-            "the host resolved an audio layout this client cannot decode — streaming video-only"
+            bits = fmt.bits,
+            "the host resolved a lossless depth this plane does not define — unpacking \
+             as 24-bit, which will be wrong if it meant anything else"
         );
-        return None;
-    };
-    // Zero is inexpressible off the wire, but everything below divides by it and
-    // libopus refuses it. This is the one value that must not depend on a peer.
-    let rate_hz = match connector.audio_sample_rate_hz {
-        0 => punktfunk_core::audio::SAMPLE_RATE_HZ,
-        hz => hz,
-    };
-    // One protocol frame. Opus is the fixed 5 ms; lossless negotiates from path
-    // MTU, so it must be read, never assumed.
-    let frame_us = if lossless {
-        // Floor at the ladder's shortest rung. `0` could only come from a host that
-        // did not state a duration; sizing a quantum from zero is worse than 1 ms.
-        (connector.audio_frame_us as u32).max(1_000)
-    } else {
-        punktfunk_core::audio::FRAME_MS * 1000
-    };
+    }
+    // An unknown Opus coupling is refused too: a wrong pairing plays the wrong speakers.
+    let mut dec = punktfunk_core::audio::plane::PlaneDecoder::new(&fmt)
+        .map_err(|e| tracing::warn!(error = %e, "audio decoder unavailable — streaming video-only"))
+        .ok()?;
+    let (channels, rate_hz, frame_us) = (fmt.channels, fmt.rate_hz, fmt.frame_us);
     tracing::info!(
-        codec = if lossless { "pcm" } else { "opus" },
+        codec = if fmt.is_pcm() { "pcm" } else { "opus" },
         channels,
         rate_hz,
-        bits = connector.audio_bits,
+        bits = fmt.bits,
         frame_us,
         "negotiated audio format"
     );
@@ -1685,15 +1553,6 @@ fn spawn_audio(
         frame_us,
     })
     .map_err(|e| tracing::warn!(error = %e, "audio disabled"))
-    .ok()?;
-    let mut dec = AudioDec::new(
-        connector.audio_codec,
-        channels,
-        rate_hz,
-        connector.audio_bits,
-        layout,
-    )
-    .map_err(|e| tracing::warn!(error = %e, "opus decoder failed — audio disabled"))
     .ok()?;
     // A/V sync. This thread holds the packet's host capture `pts_ns`, the ring
     // depth, and the video e2e figure. `PUNKTFUNK_NO_AV_SYNC` is the escape hatch.
@@ -1708,19 +1567,9 @@ fn spawn_audio(
     let video_e2e = connector.video_e2e_shared();
     let av_offset_out = connector.audio_av_offset_shared();
     let buffer_ms_out = connector.audio_buffer_ms_shared();
-    // Interleaved samples per ms, in the resolved rate: 48×ch at protocol default,
-    // 96×ch on a 96 kHz lossless session. The old 48 kHz constant would have halved
-    // every `buffer_ms` this thread publishes, in the direction that looks healthy.
-    let per_ms = (rate_hz / 1000).max(1) as usize * channels.max(1) as usize;
-    // Decode scratch. Opus: up to 120 ms (hard bound — libopus decodes into a
-    // fixed slice), derived from the rate so it cannot silently become 60 ms.
-    // PCM: one negotiated frame; `pcm::to_f32` grows the Vec, so oversized
-    // datagrams reallocate rather than overrun.
-    let scratch = if lossless {
-        punktfunk_core::audio::pcm::samples_per_frame(rate_hz, frame_us, channels)
-    } else {
-        120 * per_ms
-    };
+    // Decode scratch: the largest frame the plane can carry. The decoder never grows it.
+    let scratch = fmt.max_frame_samples();
+    let ch = channels as usize;
     // Pull-loop tick, one protocol frame. Rounded up so a sub-millisecond rung can
     // never round to a zero-length timeout and spin.
     let frame_ms = (frame_us as u64).div_ceil(1000).max(1);
@@ -1745,6 +1594,7 @@ fn spawn_audio(
                 player.push(buf);
             };
             let mut gaps = punktfunk_core::audio::AudioGapTracker::new_at_frame_us(frame_us);
+            // Last decoded frame per channel: the PLC unit, 0 until something decodes.
             let mut frame_samples = 0usize;
             let mut av = punktfunk_core::audio::AvSync::new_at_rate(channels, rate_hz);
             if !av_sync_enabled {
@@ -1805,7 +1655,7 @@ fn spawn_audio(
                         let depth = sync_cell.depth();
                         // Published even with sync off — ring depth is what makes a
                         // "too much latency" report triageable.
-                        buffer_ms_out.store((depth / per_ms) as u32, Ordering::Relaxed);
+                        buffer_ms_out.store(fmt.samples_ms(depth), Ordering::Relaxed);
                         if av_sync_enabled {
                             let ve2e = video_e2e.load(Ordering::Relaxed);
                             let o = punktfunk_core::audio::AvSyncObservation {
@@ -1830,33 +1680,35 @@ fn spawn_audio(
                         // from decoder state; PCM repeats-and-fades — lossless has nothing
                         // to interpolate from. Gap arithmetic is codec-independent.
                         for _ in 0..gaps.missing_before(pkt.seq).saturating_sub(already) {
-                            if frame_samples == 0 {
-                                break;
-                            }
-                            if let Some(n) = dec.conceal(frame_samples, &mut pcm) {
-                                queue(&player, &pcm[..n]);
+                            match dec.conceal(frame_samples, &mut pcm) {
+                                Ok(n) if n > 0 => queue(&player, &pcm[..n * ch]),
+                                _ => break,
                             }
                         }
                         match dec.decode(&pkt.data, &mut pcm) {
                             // Empty payload: the last frame stays the concealment unit.
-                            Some(0) => {}
-                            Some(n) => {
+                            Ok(0) => {}
+                            Ok(n) => {
                                 frame_samples = n;
-                                queue(&player, &pcm[..n]);
+                                queue(&player, &pcm[..n * ch]);
                             }
                             // Opus: corrupt packet. PCM: not a whole number of samples
                             // at the negotiated depth. Either way the frame is lost.
-                            None => tracing::debug!(bytes = pkt.data.len(), "audio decode failed"),
+                            Err(e) => tracing::debug!(
+                                error = %e,
+                                bytes = pkt.data.len(),
+                                "audio decode failed"
+                            ),
                         }
                     }
                     Err(PunktfunkError::NoFrame) => {
                         // Nothing on the wire. If the ring is draining, conceal at one
                         // frame per tick — this arm fires every frame time, the rate
                         // the callback drains at. `frame_samples` is 0 until first decode.
-                        let depth_ms = (sync_cell.depth() / per_ms) as u32;
+                        let depth_ms = fmt.samples_ms(sync_cell.depth());
                         if frame_samples > 0 && drought.conceal(last_packet.elapsed(), depth_ms) {
-                            if let Some(n) = dec.conceal(frame_samples, &mut pcm) {
-                                queue(&player, &pcm[..n]);
+                            if let Ok(n @ 1..) = dec.conceal(frame_samples, &mut pcm) {
+                                queue(&player, &pcm[..n * ch]);
                             }
                             sync_cell.publish_plc_ms(drought.total_ms());
                         }
@@ -2023,82 +1875,6 @@ mod tests {
             Some((48_000, BITS_24))
         );
         assert_eq!(resolve_audio_format(Some("44100"), AUDIO_FORMAT_OPUS), None);
-    }
-
-    /// Lossless arm: interleaved counts, concealment says no before it has anything
-    /// to repeat, truncated datagram refused. A per-channel mix-up would halve every
-    /// ring push — audible as a starving ring, not an obvious failure.
-    #[test]
-    fn the_lossless_plane_decodes_and_conceals_in_interleaved_samples() {
-        use punktfunk_core::audio::pcm;
-        let mut dec = AudioDec::new(
-            punktfunk_core::quic::AUDIO_CODEC_PCM,
-            2,
-            96_000,
-            pcm::BITS_24,
-            punktfunk_core::audio::AudioLayout::Legacy,
-        )
-        .expect("the PCM arm builds no codec and cannot fail");
-        let mut out = Vec::new();
-        // Saying so makes the caller emit silence and let the ring re-prime, instead
-        // of playing an uninitialised buffer.
-        assert_eq!(dec.conceal(384, &mut out), None);
-
-        // 2 ms frame at 96 kHz/24-bit stereo — the rung the default MTU ceiling lands on.
-        let frame = pcm::samples_per_frame(96_000, 2_000, 2);
-        assert_eq!(frame, 384, "192 samples per channel, interleaved");
-        let mut wire = Vec::new();
-        pcm::from_f32(&vec![0.5f32; frame], pcm::BITS_24, &mut wire);
-        assert_eq!(
-            dec.decode(&wire, &mut out),
-            Some(frame),
-            "interleaved count"
-        );
-        assert!(out[..frame].iter().all(|s| (s - 0.5).abs() < 1e-3));
-
-        // `PcmConceal` holds the frame it repeats, at the frame's own length.
-        assert_eq!(dec.conceal(0, &mut out), Some(frame));
-
-        // Not a whole number of samples at the negotiated depth: refuse rather than
-        // decode a shifted frame.
-        assert_eq!(dec.decode(&wire[..wire.len() - 1], &mut out), None);
-
-        // A torn empty datagram decodes nothing and keeps the frame to repeat.
-        assert_eq!(dec.decode(&[], &mut out), Some(0));
-        assert_eq!(dec.conceal(0, &mut out), Some(frame));
-    }
-
-    /// Opus arm through the same methods: they return interleaved counts where
-    /// libopus counts per channel — the one place this could have halved a working plane.
-    #[test]
-    fn the_opus_plane_reports_interleaved_samples_too() {
-        let mut enc = opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Audio)
-            .expect("opus encoder");
-        let mut packet = [0u8; 4_000];
-        let silence = [0.0f32; 240 * 2];
-        let n = enc
-            .encode_float(&silence, &mut packet)
-            .expect("encode one 5 ms stereo frame");
-        let mut dec = AudioDec::new(
-            punktfunk_core::quic::AUDIO_CODEC_OPUS,
-            2,
-            48_000,
-            16,
-            punktfunk_core::audio::AudioLayout::Legacy,
-        )
-        .expect("opus decoder");
-        // Pump scratch: 120 ms — the biggest frame the Opus plane can carry.
-        let mut out = vec![0f32; 120 * 48 * 2];
-        assert_eq!(dec.decode(&packet[..n], &mut out), Some(240 * 2));
-        // DTX: no PLC, not even into the scratch.
-        out.fill(7.0);
-        assert_eq!(dec.decode(&[], &mut out), Some(0));
-        assert!(out.iter().all(|&s| s == 7.0));
-        // PLC is asked for, and answered, in the same unit.
-        assert_eq!(dec.conceal(240 * 2, &mut out), Some(240 * 2));
-        // Nothing to size PLC from is a `None`, not a panic on an empty slice.
-        let mut empty = Vec::new();
-        assert_eq!(dec.conceal(0, &mut empty), None);
     }
 
     #[test]
