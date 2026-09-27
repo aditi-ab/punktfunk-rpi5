@@ -89,9 +89,6 @@ public enum StartScreen: Equatable, Sendable {
     /// no `HostStore` — the settings footer, an App Intent, the widget. Store order, not recency:
     /// the derived rule counts paired records rather than picking a recent one.
     public static func savedHosts() -> [StoredHost] {
-        guard let data = AppGroup.defaults.data(forKey: DefaultsKey.hosts),
-            let hosts = try? JSONDecoder().decode([StoredHost].self, from: data)
-        else { return [] }
-        return hosts
+        StoredHost.loadAll(recentFirst: false)
     }
 }
