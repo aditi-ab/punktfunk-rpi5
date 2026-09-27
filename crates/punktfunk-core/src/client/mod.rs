@@ -1675,6 +1675,16 @@ impl NativeClient {
         }
     }
 
+    /// Seconds until access expires, as the C and JNI exports hand it to Swift and Kotlin.
+    /// `0` = permanent. While a deadline is set it never reads `0`: it clamps to 1 past expiry
+    /// until the host's typed close lands, so an ending session never reads as "forever".
+    pub fn access_expires_in_secs(&self) -> u32 {
+        expires_in_secs(
+            self.access_deadline_unix(),
+            crate::quic::wall_clock_ns() / 1_000_000_000,
+        )
+    }
+
     /// Mid-session [`crate::quic::AccessUpdate`] (console edit, T−5/T−1 expiry). Wake-up
     /// only: truth is already in [`access_grants`](Self::access_grants) /
     /// [`access_deadline_unix`](Self::access_deadline_unix).
@@ -1870,6 +1880,28 @@ pub fn display_hdr_env_override() -> Option<HdrMeta> {
         max_cll: 0,
         max_fall: 0,
     })
+}
+
+fn expires_in_secs(deadline_unix: Option<u64>, now_unix: u64) -> u32 {
+    deadline_unix.map_or(0, |d| {
+        u32::try_from(d.saturating_sub(now_unix))
+            .unwrap_or(u32::MAX)
+            .max(1)
+    })
+}
+
+#[cfg(test)]
+mod expires_in_tests {
+    use super::expires_in_secs;
+
+    #[test]
+    fn zero_only_means_permanent() {
+        assert_eq!(expires_in_secs(None, 100), 0);
+        assert_eq!(expires_in_secs(Some(160), 100), 60);
+        assert_eq!(expires_in_secs(Some(100), 100), 1);
+        assert_eq!(expires_in_secs(Some(50), 100), 1);
+        assert_eq!(expires_in_secs(Some(u64::MAX), 0), u32::MAX);
+    }
 }
 
 #[cfg(test)]

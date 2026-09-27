@@ -43,15 +43,12 @@ impl Default for SessionAccess {
 }
 
 impl SessionAccess {
-    /// Grants plus deadline from the connector. Core stores Unix time; this
-    /// converts it onto this process's monotonic clock.
+    /// Grants plus deadline from the connector, moved onto this process's monotonic clock.
     pub fn from_connector(c: &punktfunk_core::client::NativeClient) -> SessionAccess {
-        let deadline = c.access_deadline_unix().map(|deadline_unix| {
-            let now_unix = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs());
-            Instant::now() + Duration::from_secs(deadline_unix.saturating_sub(now_unix))
-        });
+        let deadline = match c.access_expires_in_secs() {
+            0 => None,
+            secs => Some(Instant::now() + Duration::from_secs(secs.into())),
+        };
         SessionAccess {
             grants: c.access_grants(),
             deadline,

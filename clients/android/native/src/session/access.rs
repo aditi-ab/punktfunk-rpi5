@@ -42,21 +42,10 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeAccessState
         while h.client.next_access_update(Duration::ZERO).is_ok() {
             h.access_seq.fetch_add(1, Ordering::Relaxed);
         }
-        let remaining: u64 = match h.client.access_deadline_unix() {
-            None => 0, // permanent
-            Some(deadline) => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs());
-                // ≥ 1 once a deadline exists: 0 is the "permanent" sentinel, and a deadline
-                // already past with the session still up (the host's typed close is in
-                // flight) must keep reading as "about to end", never flip to "forever".
-                deadline.saturating_sub(now).max(1)
-            }
-        };
+        let remaining = h.client.access_expires_in_secs();
         let buf: [i32; 3] = [
             h.client.access_grants() as i32,
-            remaining.min(i32::MAX as u64) as i32,
+            remaining.min(i32::MAX as u32) as i32,
             h.access_seq.load(Ordering::Relaxed) as i32,
         ];
         let arr = env.new_int_array(buf.len())?;
