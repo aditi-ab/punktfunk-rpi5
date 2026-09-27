@@ -1653,7 +1653,9 @@ mod tests {
                 rest[..plane].copy_from_slice(y_plane);
                 rest[plane..2 * plane].copy_from_slice(y_plane);
             }
-            cuda::write_plane_from_host(src.ptr, src.pitch, &bytes, src.pitch, rows)
+            // SAFETY: `src` is the live staging slot allocated above, `rows` rows of `pitch`;
+            // the test made the shared context current.
+            unsafe { cuda::write_plane_from_host(src.ptr, src.pitch, &bytes, src.pitch, rows) }
                 .expect("upload the staging slot");
             vk.reframe(&src, &dst, fmt, crop, out).expect("reframe");
             let got =

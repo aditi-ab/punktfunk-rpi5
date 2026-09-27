@@ -1801,13 +1801,18 @@ impl NvencCudaEncoder {
             {
                 let rows = fmt.rows(self.height) as usize;
                 let (src, dst_s) = (&self.ring[last.slot].surface, &self.ring[slot].surface);
-                cuda::copy_surface_to_surface(
-                    src.ptr(),
-                    dst_s.ptr(),
-                    dst_s.pitch(),
-                    rows,
-                    !ordered,
-                )
+                // SAFETY: both are this session's ring slots, live with the encoder and laid out
+                // for `fmt`; `submit_device` made the context current. An unsynced clone is
+                // stream-ordered ahead of the encode that reads it.
+                unsafe {
+                    cuda::copy_surface_to_surface(
+                        src.ptr(),
+                        dst_s.ptr(),
+                        dst_s.pitch(),
+                        rows,
+                        !ordered,
+                    )
+                }
                 .context("NVENC (Linux): clone the repeat slot")?;
                 self.last_raw = Some(mark);
                 return Ok(());
@@ -1945,12 +1950,20 @@ impl NvencCudaEncoder {
     /// stream (stream-ordered submit — gate in [`Encoder::submit`]).
     fn copy_into_slot(&self, buf: &cuda::DeviceBuffer, slot: usize, sync: bool) -> Result<()> {
         let s = &self.ring[slot].surface;
-        self.copy_into(buf, s.ptr(), s.pitch(), s.height() as u64, sync)
+        // SAFETY: the slot is this session's, laid out for `buffer_fmt` at `s.height()` rows.
+        // `submit_device` made the context current; an unsynced copy runs only stream-ordered,
+        // with the caller holding `buf` across the poll.
+        unsafe { self.copy_into(buf, s.ptr(), s.pitch(), s.height() as u64, sync) }
     }
 
     /// [`copy_into_slot`](Self::copy_into_slot) into any surface of this session's layout:
     /// planes contiguous under one `pitch`, `hh` luma rows.
-    fn copy_into(
+    ///
+    /// # Safety
+    /// The context is current, `base` is a live surface of this session's layout with `hh`
+    /// luma rows at `pitch`, `buf` describes a live capture allocation, and with `!sync` `buf`
+    /// stays valid until the encode that reads the copy completes.
+    unsafe fn copy_into(
         &self,
         buf: &cuda::DeviceBuffer,
         base: cuda::CUdeviceptr,
@@ -2059,8 +2072,12 @@ impl NvencCudaEncoder {
             let (uv_ptr, uv_pitch) = buf
                 .uv
                 .context("NV12 device buffer without a chroma plane")?;
-            cuda::write_plane_from_host(buf.ptr, buf.pitch, pixels, w, h)?;
-            cuda::write_plane_from_host(uv_ptr, uv_pitch, &pixels[w * h..], w, h / 2)?;
+            // SAFETY: `buf` is a live NV12 allocation of `w`×`h` (checked or allocated above), Y
+            // at `pitch` and UV at `uv_pitch` with `h/2` rows; the context is current (above).
+            unsafe {
+                cuda::write_plane_from_host(buf.ptr, buf.pitch, pixels, w, h)?;
+                cuda::write_plane_from_host(uv_ptr, uv_pitch, &pixels[w * h..], w, h / 2)?;
+            }
             return Ok(buf);
         }
         let packed: Cow<[u8]> = match captured.format {
@@ -2085,7 +2102,9 @@ impl NvencCudaEncoder {
             ),
             other => bail!("Linux direct-NVENC cannot upload a {other:?} CPU frame"),
         };
-        cuda::write_plane_from_host(buf.ptr, buf.pitch, &packed, w * 4, h)?;
+        // SAFETY: `buf` is a live 4-byte allocation of `w`×`h` at `pitch` (checked or allocated
+        // above); the context is current (above).
+        unsafe { cuda::write_plane_from_host(buf.ptr, buf.pitch, &packed, w * 4, h)? };
         Ok(buf)
     }
 
@@ -2214,7 +2233,11 @@ impl NvencCudaEncoder {
                 // A reframe reads the staging slot on the Vulkan queue: the copy must have landed.
                 Some(r) => {
                     let (stage, fmt) = (r.staging[slot], slot_fmt_of(self.buffer_fmt));
-                    self.copy_into(buf, stage.ptr, stage.pitch, u64::from(stage.height), true)?;
+                    // SAFETY: the staging slot is this session's, sized for its layout; the
+                    // context is current (above), and the copy is synchronous.
+                    unsafe {
+                        self.copy_into(buf, stage.ptr, stage.pitch, u64::from(stage.height), true)
+                    }?;
                     let (crop, out) = (r.crop, r.out);
                     let (vk, SlotSurface::Vk(dst)) =
                         (self.vk_blend.as_mut(), &self.ring[slot].surface)
@@ -3091,10 +3114,22 @@ mod tests {
         };
         let y = plane(w as usize, h as usize);
         let uv = plane(w as usize, h as usize / 2);
-        pf_zerocopy::cuda::write_plane_from_host(buf.ptr, buf.pitch, &y, w as usize, h as usize)
+        // SAFETY: `buf` is the live `w`×`h` NV12 allocation above, UV at `uv_pitch`; the caller
+        // made the shared context current.
+        unsafe {
+            pf_zerocopy::cuda::write_plane_from_host(
+                buf.ptr, buf.pitch, &y, w as usize, h as usize,
+            )
             .expect("upload Y plane");
-        pf_zerocopy::cuda::write_plane_from_host(uv_ptr, uv_pitch, &uv, w as usize, h as usize / 2)
+            pf_zerocopy::cuda::write_plane_from_host(
+                uv_ptr,
+                uv_pitch,
+                &uv,
+                w as usize,
+                h as usize / 2,
+            )
             .expect("upload UV plane");
+        }
         CapturedFrame {
             provenance: Default::default(),
             width: w,

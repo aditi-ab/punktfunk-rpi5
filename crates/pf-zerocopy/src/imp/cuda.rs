@@ -50,7 +50,11 @@ pub fn read_plane_to_host(
 /// Packed host→pitched-device upload. Synchronous: the direct encoder's CPU-frame path, and
 /// the benchmarks, where uninitialised device memory comes back zeroed and CBR has nothing
 /// to code.
-pub fn write_plane_from_host(
+///
+/// # Safety
+/// The context is current, and `dst_ptr` is a live allocation of `height` rows of `dst_pitch`
+/// bytes, each at least `width_bytes`.
+pub unsafe fn write_plane_from_host(
     dst_ptr: CUdeviceptr,
     dst_pitch: usize,
     src: &[u8],
@@ -75,7 +79,8 @@ pub fn write_plane_from_host(
         ..Default::default()
     };
     // SAFETY: `copy` outlives the synchronous copy. `srcHost` is `src` (≥ `width_bytes*height`);
-    // `dstDevice`/`dstPitch` are the caller's pitched plane. Sync, so `src` need not outlive return.
+    // the destination and the current context are this fn's contract. Sync, so `src` need not
+    // outlive return.
     unsafe { copy_blocking(&copy, "cuMemcpy2DAsync_v2(host->dev)") }
 }
 
@@ -895,9 +900,12 @@ pub fn copy_mapped_yuv444(
 
 /// Device→device copy of one pitched surface into another of the same layout: `rows` rows of
 /// `pitch` bytes. A repeat frame's slot is cloned this way instead of being converted again.
-/// Context must be current. `sync: false`: no CPU wait; both surfaces must stay valid until
-/// downstream stream work completes.
-pub fn copy_surface_to_surface(
+/// `sync: false` enqueues with no CPU wait.
+///
+/// # Safety
+/// The context is current, both surfaces are live allocations of `rows` rows of `pitch` bytes,
+/// and with `sync: false` both stay valid until downstream stream work completes.
+pub unsafe fn copy_surface_to_surface(
     src_ptr: CUdeviceptr,
     dst_ptr: CUdeviceptr,
     pitch: usize,
@@ -915,14 +923,19 @@ pub fn copy_surface_to_surface(
         Height: rows,
         ..Default::default()
     };
-    // SAFETY: caller: context current; both surfaces hold `pitch × rows` bytes and outlive the
-    // copy (`sync: false` shifts that to the caller).
+    // SAFETY: this fn's contract: context current, both surfaces hold `pitch × rows` bytes and
+    // outlive the copy. `copy` outlives the enqueue.
     unsafe { copy_issue(&copy, "cuMemcpy2DAsync_v2(slot->slot)", sync) }
 }
 
-/// Device→device copy of a 4-byte (BGRx) [`DeviceBuffer`] into `dst_ptr`. Context must be current.
-/// `sync: false`: no CPU wait; `src` must stay valid until downstream stream work completes.
-pub fn copy_device_to_device(
+/// Device→device copy of a 4-byte (BGRx) [`DeviceBuffer`] into `dst_ptr`. `sync: false`
+/// enqueues with no CPU wait.
+///
+/// # Safety
+/// The context is current, `src` describes a live allocation, `dst_ptr` is a live allocation of
+/// `src.height` rows of `dst_pitch` ≥ `src.width * 4` bytes, and with `sync: false` `src` stays
+/// valid until downstream stream work completes.
+pub unsafe fn copy_device_to_device(
     src: &DeviceBuffer,
     dst_ptr: CUdeviceptr,
     dst_pitch: usize,
@@ -939,15 +952,19 @@ pub fn copy_device_to_device(
         Height: src.height as usize,
         ..Default::default()
     };
-    // SAFETY: caller: context current. `copy` outlives the enqueue; `src` and `dst` are live;
-    // `width*4`×`height` fit both. `sync: false` shifts source lifetime to the caller.
+    // SAFETY: this fn's contract: context current, `src` and `dst` live, `width*4`×`height` fit
+    // both, and the source outlives an unsynced copy. `copy` outlives the enqueue.
     unsafe { copy_issue(&copy, "cuMemcpy2DAsync_v2(dev->dev)", sync) }
 }
 
 /// Copy imported NV12 into NVENC's two-plane surface (`data[0]`/`data[1]`). Y is `width`×`height`;
-/// UV is `(width/2)·2` × `height/2`. Context current. `sync: false`: `src` must stay valid until
+/// UV is `(width/2)·2` × `height/2`. `sync: false` enqueues with no CPU wait.
+///
+/// # Safety
+/// The context is current, `src` describes a live allocation, `y_dst`/`uv_dst` are live planes
+/// of those sizes at `y_pitch`/`uv_pitch`, and with `sync: false` `src` stays valid until
 /// downstream stream work completes.
-pub fn copy_nv12_to_device(
+pub unsafe fn copy_nv12_to_device(
     src: &DeviceBuffer,
     y_dst: CUdeviceptr,
     y_pitch: usize,
@@ -982,9 +999,8 @@ pub fn copy_nv12_to_device(
         Height: h / 2,
         ..Default::default()
     };
-    // SAFETY: caller: context current. `&y`/`&uv` outlive each enqueue. `src` is a live NV12
-    // buffer (`.uv` checked); `y_dst`/`uv_dst` are the caller's NVENC planes. `sync` waits both
-    // (FIFO); `sync: false` shifts source lifetime to the caller.
+    // SAFETY: this fn's contract covers the context, `src` (NV12, `.uv` checked) and both
+    // destination planes. `&y`/`&uv` outlive each enqueue; `sync` waits both (FIFO).
     unsafe {
         // Failed enqueue: drain before return. Caller drops `src` on `Err` (pool recycle); a
         // copy still in flight would race the next frame in that allocation.
@@ -1002,9 +1018,13 @@ pub fn copy_nv12_to_device(
 }
 
 /// Copy stacked YUV444 into NVENC's three-plane surface (`data[0..3]`). Each plane is
-/// `width`×`height`; source at row offsets `0/H/2H`. Context current. `sync: false`: `src` must
-/// stay valid until downstream stream work completes.
-pub fn copy_yuv444_to_device(
+/// `width`×`height`; source at row offsets `0/H/2H`. `sync: false` enqueues with no CPU wait.
+///
+/// # Safety
+/// The context is current, `src` describes a live stacked allocation, each `dsts` plane is live
+/// with `src.height` rows of its pitch ≥ `src.width`, and with `sync: false` `src` stays valid
+/// until downstream stream work completes.
+pub unsafe fn copy_yuv444_to_device(
     src: &DeviceBuffer,
     dsts: [(CUdeviceptr, usize); 3],
     sync: bool,
@@ -1024,9 +1044,9 @@ pub fn copy_yuv444_to_device(
             Height: h,
             ..Default::default()
         };
-        // SAFETY: caller: context current. `copy` outlives the enqueue. `src.ptr + pitch·h·i`
-        // is inside the live 3·H stacked allocation (`yuv444` checked); dest is the caller's
-        // NVENC plane. Drain on enqueue failure: earlier planes are queued and caller recycles
+        // SAFETY: this fn's contract covers the context and each destination plane. `copy`
+        // outlives the enqueue; `src.ptr + pitch·h·i` is inside the live 3·H stacked allocation
+        // (`yuv444` checked). Drain on enqueue failure: earlier planes are queued and caller recycles
         // `src` on `Err`.
         unsafe {
             if let Err(e) = copy_async(&copy, "cuMemcpy2DAsync_v2(yuv444 plane dev->dev)") {
@@ -1036,8 +1056,8 @@ pub fn copy_yuv444_to_device(
         }
     }
     if sync {
-        // SAFETY: one stream sync after the last enqueue covers all three planes (FIFO). Context
-        // current per the caller.
+        // SAFETY: one stream sync after the last enqueue covers all three planes (FIFO); the
+        // context is current per this fn's contract.
         unsafe { sync_copy_stream()? };
     }
     Ok(())
