@@ -511,6 +511,22 @@ impl GamepadSnapshot {
         }
     }
 
+    /// The [`GamepadFrame`] the injectors apply for wire pad `index`. The index is a
+    /// parameter so a host accumulator can keep `pad`/`seq` zero and compare states.
+    pub fn to_frame(&self, index: u8, active_mask: u16) -> GamepadFrame {
+        GamepadFrame {
+            index: i16::from(index),
+            active_mask,
+            buttons: self.buttons,
+            left_trigger: self.left_trigger,
+            right_trigger: self.right_trigger,
+            ls_x: self.ls_x,
+            ls_y: self.ls_y,
+            rs_x: self.rs_x,
+            rs_y: self.rs_y,
+        }
+    }
+
     /// True when `seq` supersedes `last` (wrapping u8, forward window of 127).
     /// `None` (nothing applied yet) always accepts.
     pub fn seq_newer(seq: u8, last: Option<u8>) -> bool {
@@ -757,6 +773,13 @@ mod tests {
         assert_eq!(s.ls_y, i16::MIN);
         assert!(!s.fold(&ev(InputKind::GamepadAxis, 99, 1)));
         assert!(!s.fold(&ev(InputKind::KeyDown, 30, 1)));
+
+        let f = s.to_frame(2, 0b0100);
+        assert_eq!((f.index, f.active_mask), (2, 0b0100));
+        assert_eq!(
+            (f.buttons, f.left_trigger, f.ls_y),
+            (gamepad::BTN_RB, 255, i16::MIN)
+        );
     }
 
     #[test]
