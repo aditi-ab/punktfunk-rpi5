@@ -308,7 +308,7 @@ pub struct HostConfig {
     pub gamescope_sdr_nits: Option<u32>,
     /// `PUNKTFUNK_GAMESCOPE_BIND` — bind patched gamescope over `/usr/bin/gamescope`
     /// in the session unit's mount namespace. `gamescope-session-plus` hardcodes
-    /// that path (`pf-vdisplay`'s `gamescope.rs`).
+    /// that path (`pf-vdisplay`'s `gamescope/bind.rs`).
     ///
     /// Three-valued. A user-unit mount namespace maps only this uid, so
     /// root-owned `/tmp/.X11-unix` reads as `nobody` and Xwayland refuses to start.
