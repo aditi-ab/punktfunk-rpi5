@@ -2,6 +2,7 @@
 //! identity. Xbox360 over uinput is the common default and stays in `Pads`.
 
 use super::*;
+use crate::inject::uhid_manager::UhidTick;
 
 /// Linux UHID/usbip Triton backend.
 type Sc2Manager = pf_inject::steam_controller2::Triton2Manager;
@@ -153,6 +154,34 @@ impl PadBackends {
         self.steamctrl2.is_some() || self.steamctrl2_puck.is_some()
     }
 
+    /// Every live UHID manager; [`Self::pump`] and [`Self::heartbeat`] both walk it. A new field
+    /// does not compile until it is listed here. The uinput `xboxone` has no heartbeat.
+    fn uhid(&mut self) -> impl Iterator<Item = &mut dyn UhidTick> {
+        let Self {
+            xboxone: _,
+            dualsense,
+            dualsense_edge,
+            dualshock4,
+            steamdeck,
+            switchpro,
+            steamctrl,
+            steamctrl2,
+            steamctrl2_puck,
+        } = self;
+        [
+            dualsense.as_mut().map(|m| m as &mut dyn UhidTick),
+            dualsense_edge.as_mut().map(|m| m as &mut dyn UhidTick),
+            dualshock4.as_mut().map(|m| m as &mut dyn UhidTick),
+            steamdeck.as_mut().map(|m| m as &mut dyn UhidTick),
+            switchpro.as_mut().map(|m| m as &mut dyn UhidTick),
+            steamctrl.as_mut().map(|m| m as &mut dyn UhidTick),
+            steamctrl2.as_mut().map(|m| m as &mut dyn UhidTick),
+            steamctrl2_puck.as_mut().map(|m| m as &mut dyn UhidTick),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
     pub(super) fn pump(
         &mut self,
         rumble: &mut impl FnMut(u16, u16, u16, u16, u16),
@@ -161,28 +190,7 @@ impl PadBackends {
         if let Some(m) = &mut self.xboxone {
             m.pump_rumble(&mut *rumble);
         }
-        if let Some(m) = &mut self.dualsense {
-            m.pump(&mut *rumble, &mut *hidout);
-        }
-        if let Some(m) = &mut self.dualsense_edge {
-            m.pump(&mut *rumble, &mut *hidout);
-        }
-        if let Some(m) = &mut self.dualshock4 {
-            m.pump(&mut *rumble, &mut *hidout);
-        }
-        if let Some(m) = &mut self.steamdeck {
-            m.pump(&mut *rumble, &mut *hidout);
-        }
-        if let Some(m) = &mut self.switchpro {
-            m.pump(&mut *rumble, &mut *hidout);
-        }
-        if let Some(m) = &mut self.steamctrl {
-            m.pump(&mut *rumble, &mut *hidout);
-        }
-        if let Some(m) = &mut self.steamctrl2_puck {
-            m.pump(&mut *rumble, &mut *hidout);
-        }
-        if let Some(m) = &mut self.steamctrl2 {
+        for m in self.uhid() {
             m.pump(&mut *rumble, &mut *hidout);
         }
     }
@@ -190,25 +198,7 @@ impl PadBackends {
     /// Re-emit HID reports so kernel/SDL do not drop a held-steady UHID pad.
     pub(super) fn heartbeat(&mut self) {
         let gap = std::time::Duration::from_millis(8);
-        if let Some(m) = &mut self.dualsense {
-            m.heartbeat(gap);
-        }
-        if let Some(m) = &mut self.dualsense_edge {
-            m.heartbeat(gap);
-        }
-        if let Some(m) = &mut self.dualshock4 {
-            m.heartbeat(gap);
-        }
-        if let Some(m) = &mut self.steamdeck {
-            m.heartbeat(gap);
-        }
-        if let Some(m) = &mut self.switchpro {
-            m.heartbeat(gap);
-        }
-        if let Some(m) = &mut self.steamctrl {
-            m.heartbeat(gap);
-        }
-        if let Some(m) = &mut self.steamctrl2 {
+        for m in self.uhid() {
             m.heartbeat(gap);
         }
     }

@@ -2,6 +2,7 @@
 //! identity. Xbox360 over XUSB is the common default and stays in `Pads`.
 
 use super::*;
+use crate::inject::uhid_manager::UhidTick;
 
 /// Windows UMDF Triton backend.
 type Sc2Manager = pf_inject::triton_windows::TritonWindowsManager;
@@ -135,39 +136,41 @@ impl PadBackends {
         self.steamctrl2.is_some()
     }
 
+    /// Every live UMDF manager; [`Self::pump`] and [`Self::heartbeat`] both walk it. A new field
+    /// does not compile until it is listed here.
+    fn uhid(&mut self) -> impl Iterator<Item = &mut dyn UhidTick> {
+        let Self {
+            steamctrl2,
+            dualsense_win,
+            xbox_hid,
+            xbox_one_hid,
+            xbox_elite_hid,
+            dualsense_edge_win,
+            dualshock4_win,
+            steamdeck_win,
+            switchpro_win,
+        } = self;
+        [
+            steamctrl2.as_mut().map(|m| m as &mut dyn UhidTick),
+            dualsense_win.as_mut().map(|m| m as &mut dyn UhidTick),
+            xbox_hid.as_mut().map(|m| m as &mut dyn UhidTick),
+            xbox_one_hid.as_mut().map(|m| m as &mut dyn UhidTick),
+            xbox_elite_hid.as_mut().map(|m| m as &mut dyn UhidTick),
+            dualsense_edge_win.as_mut().map(|m| m as &mut dyn UhidTick),
+            dualshock4_win.as_mut().map(|m| m as &mut dyn UhidTick),
+            steamdeck_win.as_mut().map(|m| m as &mut dyn UhidTick),
+            switchpro_win.as_mut().map(|m| m as &mut dyn UhidTick),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
     pub(super) fn pump(
         &mut self,
         rumble: &mut impl FnMut(u16, u16, u16, u16, u16),
         hidout: &mut impl FnMut(punktfunk_core::quic::HidOutput),
     ) {
-        if let Some(m) = &mut self.steamctrl2 {
-            m.pump(&mut *rumble, &mut *hidout);
-        }
-        // All three HID Xbox identities. Rumble only (no rich plane). Missing
-        // one is silent: the pad works and never rumbles.
-        for m in [
-            &mut self.xbox_hid,
-            &mut self.xbox_one_hid,
-            &mut self.xbox_elite_hid,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            m.pump(&mut *rumble, &mut *hidout);
-        }
-        if let Some(m) = &mut self.dualsense_win {
-            m.pump(&mut *rumble, &mut *hidout);
-        }
-        if let Some(m) = &mut self.dualsense_edge_win {
-            m.pump(&mut *rumble, &mut *hidout);
-        }
-        if let Some(m) = &mut self.dualshock4_win {
-            m.pump(&mut *rumble, &mut *hidout);
-        }
-        if let Some(m) = &mut self.steamdeck_win {
-            m.pump(&mut *rumble, &mut *hidout);
-        }
-        if let Some(m) = &mut self.switchpro_win {
+        for m in self.uhid() {
             m.pump(&mut *rumble, &mut *hidout);
         }
     }
@@ -175,22 +178,7 @@ impl PadBackends {
     /// Re-emit HID reports so a held-steady UMDF pad is not dropped.
     pub(super) fn heartbeat(&mut self) {
         let gap = std::time::Duration::from_millis(8);
-        if let Some(m) = &mut self.steamctrl2 {
-            m.heartbeat(gap);
-        }
-        if let Some(m) = &mut self.dualsense_win {
-            m.heartbeat(gap);
-        }
-        if let Some(m) = &mut self.dualsense_edge_win {
-            m.heartbeat(gap);
-        }
-        if let Some(m) = &mut self.dualshock4_win {
-            m.heartbeat(gap);
-        }
-        if let Some(m) = &mut self.steamdeck_win {
-            m.heartbeat(gap);
-        }
-        if let Some(m) = &mut self.switchpro_win {
+        for m in self.uhid() {
             m.heartbeat(gap);
         }
     }

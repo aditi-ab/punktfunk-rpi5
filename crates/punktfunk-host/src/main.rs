@@ -176,6 +176,20 @@ mod stats_recorder;
 // Signed catalogs and install jobs via the `plugins` runner — design/plugin-store.md.
 mod store;
 mod stream_marker;
+#[cfg(test)]
+mod test_support {
+    /// A fresh directory that lives until the calling test's thread ends, for a helper that
+    /// returns a path rather than a guard. The test harness runs each test on its own thread.
+    pub(crate) fn scratch() -> std::path::PathBuf {
+        thread_local!(static DIRS: std::cell::RefCell<Vec<tempfile::TempDir>> = const {
+            std::cell::RefCell::new(Vec::new())
+        });
+        let dir = tempfile::tempdir().expect("create a scratch dir");
+        let path = dir.path().to_path_buf();
+        DIRS.with_borrow_mut(|dirs| dirs.push(dir));
+        path
+    }
+}
 mod update;
 mod version;
 // The browser plane (design/web-client-implementation-plan.md Phase 1). Runtime opt-in.
