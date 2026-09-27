@@ -897,11 +897,7 @@ fn driver_store_inventory() -> Option<&'static str> {
     static SPAWN: std::sync::Once = std::sync::Once::new();
     SPAWN.call_once(|| {
         std::thread::spawn(|| {
-            // Resolve via `%SystemRoot%\System32\pnputil.exe`. SYSTEM must not search PATH /
-            // the EXE directory — a planted `pnputil.exe` beside the host would run elevated.
-            let pnputil = std::env::var("SystemRoot")
-                .map(|r| format!(r"{r}\System32\pnputil.exe"))
-                .unwrap_or_else(|_| "pnputil.exe".to_string());
+            let pnputil = pf_paths::system32("pnputil.exe");
             let inv = std::process::Command::new(&pnputil)
                 .arg("/enum-drivers")
                 .output()
