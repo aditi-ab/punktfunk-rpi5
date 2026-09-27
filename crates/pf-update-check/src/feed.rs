@@ -78,8 +78,11 @@ pub fn fetch_manifest_blocking(
     let sig_url = format!("{url}.sig");
 
     // Only the manifest GET may become [`FeedError::NotPublished`].
-    let body = read_capped(&mut agent.get(&url).call().map_err(manifest_err)?)?;
-    let sig = read_capped(&mut agent.get(&sig_url).call().map_err(fetch_err)?)?;
+    let capped = |resp: &mut ureq::http::Response<ureq::Body>| {
+        read_capped(resp, MAX_MANIFEST_BYTES).map_err(FeedError::Failed)
+    };
+    let body = capped(&mut agent.get(&url).call().map_err(manifest_err)?)?;
+    let sig = capped(&mut agent.get(&sig_url).call().map_err(fetch_err)?)?;
     let sig_text = String::from_utf8(sig)
         .map_err(|_| FeedError::Failed("signature file is not text".into()))?;
 
@@ -102,18 +105,22 @@ fn fetch_err(e: ureq::Error) -> FeedError {
     })
 }
 
-fn read_capped(resp: &mut ureq::http::Response<ureq::Body>) -> Result<Vec<u8>, FeedError> {
-    // cap+1: over-size is a length error, not a truncated body that fails the signature.
+/// The body of a signed document, at most `cap` bytes. Oversize is an error, never a truncated
+/// body that then fails its signature for the wrong reason. The plugin store reads through this.
+pub fn read_capped(
+    resp: &mut ureq::http::Response<ureq::Body>,
+    cap: usize,
+) -> Result<Vec<u8>, String> {
+    // ureq refuses a body that reaches its cap+1 limit; the length check refuses anything past
+    // `cap` that still gets through.
     let buf = resp
         .body_mut()
         .with_config()
-        .limit(MAX_MANIFEST_BYTES as u64 + 1)
+        .limit(cap as u64 + 1)
         .read_to_vec()
-        .map_err(|e| FeedError::Failed(format!("read failed: {e}")))?;
-    if buf.len() > MAX_MANIFEST_BYTES {
-        return Err(FeedError::Failed(
-            "response exceeds the manifest size cap".into(),
-        ));
+        .map_err(|e| format!("read the response body: {e}"))?;
+    if buf.len() > cap {
+        return Err(format!("response exceeds the {cap}-byte cap"));
     }
     Ok(buf)
 }
@@ -142,6 +149,21 @@ mod tests {
             assert!(!e.is_not_published(), "HTTP {code} must stay a failure");
             assert!(e.to_string().contains(&code.to_string()), "{e}");
         }
+    }
+
+    fn response(len: usize) -> ureq::http::Response<ureq::Body> {
+        ureq::http::Response::builder()
+            .status(200)
+            .body(ureq::Body::builder().data(vec![b'x'; len]))
+            .unwrap()
+    }
+
+    /// Oversize is refused whole, never truncated to the cap.
+    #[test]
+    fn read_capped_refuses_oversize() {
+        assert_eq!(read_capped(&mut response(8), 8).unwrap().len(), 8);
+        assert!(read_capped(&mut response(9), 8).is_err());
+        assert!(read_capped(&mut response(100), 8).is_err());
     }
 
     #[test]
