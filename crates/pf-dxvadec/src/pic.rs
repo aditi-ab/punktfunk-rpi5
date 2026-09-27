@@ -429,18 +429,13 @@ pub fn slice_control(records: &[crate::pack::SliceRecord]) -> Vec<SliceH264Short
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
-
-    use cros_codecs::codec::h264::nalu_writer::NaluWriter;
-    use cros_codecs::codec::h264::parser::NaluType;
     use cros_codecs::codec::h264::parser::Pps;
-    use cros_codecs::codec::h264::parser::PpsBuilder;
-    use cros_codecs::codec::h264::parser::Profile;
     use cros_codecs::codec::h264::parser::Sps;
-    use cros_codecs::codec::h264::parser::SpsBuilder;
     use cros_codecs::codec::h264::synthesizer::Synthesizer;
     use pf_bitstream::h264::H264Planner;
-    use pf_bitstream::h264::Level;
+    use pf_bitstream::testing::h264::authored_sps_pps;
+    use pf_bitstream::testing::h264::write_idr_slice;
+    use pf_bitstream::testing::h264::write_p_slice;
     use pf_bitstream::testing::split_h264_aus;
 
     use super::*;
@@ -482,95 +477,6 @@ mod tests {
             out.push((plan, dxva));
         }
         out
-    }
-
-    /// Authored 64x64 Main SPS/PPS for long-term marking (no vendored vector
-    /// carries MMCO). Slice headers are written by hand: no synthesizer exists.
-    fn authored_sps_pps() -> (Rc<Sps>, Rc<Pps>) {
-        let sps = SpsBuilder::new()
-            .seq_parameter_set_id(0)
-            .profile_idc(Profile::Main)
-            .level_idc(Level::L4)
-            .frame_mbs_only_flag(true)
-            .direct_8x8_inference_flag(true)
-            .max_num_ref_frames(4)
-            .log2_max_frame_num_minus4(0)
-            .pic_order_cnt_type(0)
-            .log2_max_pic_order_cnt_lsb_minus4(0)
-            .resolution(64, 64)
-            .build();
-        let pps = PpsBuilder::new(Rc::clone(&sps))
-            .pic_parameter_set_id(0)
-            .pic_init_qp(26)
-            .build();
-        (sps, pps)
-    }
-
-    /// One IDR slice NALU. The planner reads headers only, so no slice data
-    /// follows the rbsp stop bit.
-    fn write_idr_slice() -> Vec<u8> {
-        let mut buf = Vec::new();
-        {
-            let mut w = NaluWriter::new(&mut buf, true);
-            w.write_header(3, NaluType::SliceIdr as u8).unwrap();
-            w.write_ue(0u32).unwrap(); // first_mb_in_slice
-            w.write_ue(2u32).unwrap(); // slice_type: I
-            w.write_ue(0u32).unwrap(); // pic_parameter_set_id
-            w.write_f(4, 0u32).unwrap(); // frame_num, u(4)
-            w.write_ue(0u32).unwrap(); // idr_pic_id
-            w.write_f(4, 0u32).unwrap(); // pic_order_cnt_lsb, u(4)
-            w.write_f(1, 0u32).unwrap(); // no_output_of_prior_pics_flag
-            w.write_f(1, 0u32).unwrap(); // long_term_reference_flag
-            w.write_se(0i32).unwrap(); // slice_qp_delta
-            w.write_f(1, 1u32).unwrap(); // rbsp stop bit
-            while !w.aligned() {
-                w.write_f(1, 0u32).unwrap();
-            }
-        }
-        buf
-    }
-
-    /// One P slice NALU. `mmco_ops = None` is sliding-window; `Some` is
-    /// adaptive `(operation, arg)` pairs. The writer appends terminating op 0.
-    fn write_p_slice(
-        frame_num: u32,
-        poc_lsb: u32,
-        ref_idc: u8,
-        num_ref_idx_l0_active: u32,
-        mmco_ops: Option<&[(u32, u32)]>,
-    ) -> Vec<u8> {
-        let mut buf = Vec::new();
-        {
-            let mut w = NaluWriter::new(&mut buf, true);
-            w.write_header(ref_idc, NaluType::Slice as u8).unwrap();
-            w.write_ue(0u32).unwrap(); // first_mb_in_slice
-            w.write_ue(0u32).unwrap(); // slice_type: P
-            w.write_ue(0u32).unwrap(); // pic_parameter_set_id
-            w.write_f(4, frame_num).unwrap(); // frame_num, u(4)
-            w.write_f(4, poc_lsb).unwrap(); // pic_order_cnt_lsb, u(4)
-            w.write_f(1, 1u32).unwrap(); // num_ref_idx_active_override_flag
-            w.write_ue(num_ref_idx_l0_active - 1).unwrap();
-            w.write_f(1, 0u32).unwrap(); // ref_pic_list_modification_flag_l0
-            if ref_idc != 0 {
-                match mmco_ops {
-                    None => w.write_f(1, 0u32).map(|_| ()).unwrap(),
-                    Some(ops) => {
-                        w.write_f(1, 1u32).unwrap(); // adaptive_ref_pic_marking_mode_flag
-                        for (op, arg) in ops {
-                            w.write_ue(*op).unwrap();
-                            w.write_ue(*arg).unwrap();
-                        }
-                        w.write_ue(0u32).unwrap(); // end of the MMCO list
-                    }
-                }
-            }
-            w.write_se(0i32).unwrap(); // slice_qp_delta
-            w.write_f(1, 1u32).unwrap(); // rbsp stop bit
-            while !w.aligned() {
-                w.write_f(1, 0u32).unwrap();
-            }
-        }
-        buf
     }
 
     /// Unique pictures the AU's own slice lists name, in first-appearance order.

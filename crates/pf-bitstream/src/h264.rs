@@ -1673,8 +1673,6 @@ impl H264Planner {
 mod tests {
     use std::rc::Rc;
 
-    use cros_codecs::codec::h264::nalu_writer::NaluWriter;
-    use cros_codecs::codec::h264::parser::NaluType;
     use cros_codecs::codec::h264::parser::PpsBuilder;
     use cros_codecs::codec::h264::parser::Profile;
     use cros_codecs::codec::h264::parser::SpsBuilder;
@@ -1682,6 +1680,13 @@ mod tests {
     use cros_codecs::codec::h264::synthesizer::Synthesizer;
 
     use super::*;
+    use crate::testing::h264::authored_sps_pps;
+    use crate::testing::h264::base_sps;
+    use crate::testing::h264::param_set_au;
+    use crate::testing::h264::write_idr_slice;
+    use crate::testing::h264::write_p_slice;
+    use crate::testing::h264::write_slice;
+    use crate::testing::h264::SliceSpec;
     use crate::testing::split_h264_aus;
 
     const TEST_25FPS: &[u8] = crate::testing::H264_25FPS;
@@ -1815,31 +1820,6 @@ mod tests {
         assert!(b_slices_seen > 0, "the vector must contain B slices");
     }
 
-    /// Author parameter sets with the vendored synthesizer; write slice
-    /// headers by hand (`NaluWriter`). No slice-header synthesizer exists.
-    /// The planner reads headers only, so nothing follows the rbsp stop bit.
-    fn base_sps() -> SpsBuilder {
-        SpsBuilder::new()
-            .seq_parameter_set_id(0)
-            .profile_idc(Profile::Main)
-            .level_idc(Level::L4)
-            .frame_mbs_only_flag(true)
-            .direct_8x8_inference_flag(true)
-            .max_num_ref_frames(4)
-            .log2_max_frame_num_minus4(0)
-            .pic_order_cnt_type(0)
-            .log2_max_pic_order_cnt_lsb_minus4(0)
-    }
-
-    fn authored_sps_pps() -> (Rc<Sps>, Rc<Pps>) {
-        let sps = base_sps().resolution(64, 64).build();
-        let pps = PpsBuilder::new(Rc::clone(&sps))
-            .pic_parameter_set_id(0)
-            .pic_init_qp(26)
-            .build();
-        (sps, pps)
-    }
-
     /// Picture-level warnings, dropping [`PlanWarning::LevelDerivedDpb`].
     /// [`base_sps`] is 64×64 with no VUI restriction, so A.3.1 saturates
     /// (`MaxDpbMbs(L1)=396` / 16 MBs) and every plan carries that warning.
@@ -1848,102 +1828,6 @@ mod tests {
             .iter()
             .filter(|w| !matches!(w, PlanWarning::LevelDerivedDpb { .. }))
             .collect()
-    }
-
-    fn param_set_au(sps: &Sps, pps: &Pps) -> Vec<u8> {
-        let mut au = Vec::new();
-        Synthesizer::<'_, Sps, _>::synthesize(3, sps, &mut au, true).unwrap();
-        Synthesizer::<'_, Pps, _>::synthesize(3, pps, &mut au, true).unwrap();
-        au
-    }
-
-    fn write_idr_slice() -> Vec<u8> {
-        write_idr_slice_at(0, 0)
-    }
-
-    fn write_idr_slice_at(first_mb: u32, pps_id: u32) -> Vec<u8> {
-        let mut buf = Vec::new();
-        {
-            let mut w = NaluWriter::new(&mut buf, true);
-            w.write_header(3, NaluType::SliceIdr as u8).unwrap();
-            w.write_ue(first_mb).unwrap();
-            w.write_ue(2u32).unwrap(); // slice_type: I
-            w.write_ue(pps_id).unwrap();
-            w.write_f(4, 0u32).unwrap(); // frame_num, u(4): log2_max_frame_num_minus4 = 0
-            w.write_ue(0u32).unwrap(); // idr_pic_id
-            w.write_f(4, 0u32).unwrap(); // pic_order_cnt_lsb, u(4)
-            w.write_f(1, 0u32).unwrap(); // no_output_of_prior_pics_flag
-            w.write_f(1, 0u32).unwrap(); // long_term_reference_flag
-            w.write_se(0i32).unwrap(); // slice_qp_delta
-            w.write_f(1, 1u32).unwrap(); // rbsp stop bit
-            while !w.aligned() {
-                w.write_f(1, 0u32).unwrap();
-            }
-        }
-        buf
-    }
-
-    /// One P-slice NALU. `None` is sliding-window; `Some` is adaptive MMCO
-    /// with `(op, arg)` pairs (ops 2/4/6 take one arg). Appends terminating op 0.
-    fn write_p_slice(
-        frame_num: u32,
-        poc_lsb: u32,
-        ref_idc: u8,
-        num_ref_idx_l0_active: u32,
-        mmco_ops: Option<&[(u32, u32)]>,
-    ) -> Vec<u8> {
-        write_p_slice_at(
-            0,
-            0,
-            frame_num,
-            poc_lsb,
-            ref_idc,
-            num_ref_idx_l0_active,
-            mmco_ops,
-        )
-    }
-
-    fn write_p_slice_at(
-        first_mb: u32,
-        pps_id: u32,
-        frame_num: u32,
-        poc_lsb: u32,
-        ref_idc: u8,
-        num_ref_idx_l0_active: u32,
-        mmco_ops: Option<&[(u32, u32)]>,
-    ) -> Vec<u8> {
-        let mut buf = Vec::new();
-        {
-            let mut w = NaluWriter::new(&mut buf, true);
-            w.write_header(ref_idc, NaluType::Slice as u8).unwrap();
-            w.write_ue(first_mb).unwrap();
-            w.write_ue(0u32).unwrap(); // slice_type: P
-            w.write_ue(pps_id).unwrap();
-            w.write_f(4, frame_num).unwrap(); // frame_num, u(4)
-            w.write_f(4, poc_lsb).unwrap(); // pic_order_cnt_lsb, u(4)
-            w.write_f(1, 1u32).unwrap(); // num_ref_idx_active_override_flag
-            w.write_ue(num_ref_idx_l0_active - 1).unwrap();
-            w.write_f(1, 0u32).unwrap(); // ref_pic_list_modification_flag_l0
-            if ref_idc != 0 {
-                match mmco_ops {
-                    None => w.write_f(1, 0u32).map(|_| ()).unwrap(),
-                    Some(ops) => {
-                        w.write_f(1, 1u32).unwrap(); // adaptive_ref_pic_marking_mode_flag
-                        for (op, arg) in ops {
-                            w.write_ue(*op).unwrap();
-                            w.write_ue(*arg).unwrap();
-                        }
-                        w.write_ue(0u32).unwrap(); // memory_management_control_operation end
-                    }
-                }
-            }
-            w.write_se(0i32).unwrap(); // slice_qp_delta
-            w.write_f(1, 1u32).unwrap(); // rbsp stop bit
-            while !w.aligned() {
-                w.write_f(1, 0u32).unwrap();
-            }
-        }
-        buf
     }
 
     #[test]
@@ -2505,38 +2389,18 @@ mod tests {
         }
     }
 
-    /// MMCO 5 takes no argument (Table 7-9); [`write_p_slice`] ops all take one.
-    fn write_p_slice_mmco5(frame_num: u32, poc_lsb: u32) -> Vec<u8> {
-        let mut buf = Vec::new();
-        {
-            let mut w = NaluWriter::new(&mut buf, true);
-            w.write_header(1, NaluType::Slice as u8).unwrap();
-            w.write_ue(0u32).unwrap();
-            w.write_ue(0u32).unwrap(); // slice_type: P
-            w.write_ue(0u32).unwrap();
-            w.write_f(4, frame_num).unwrap(); // frame_num, u(4)
-            w.write_f(4, poc_lsb).unwrap(); // pic_order_cnt_lsb, u(4)
-            w.write_f(1, 1u32).unwrap(); // num_ref_idx_active_override_flag
-            w.write_ue(0u32).unwrap(); // num_ref_idx_l0_active_minus1
-            w.write_f(1, 0u32).unwrap(); // ref_pic_list_modification_flag_l0
-            w.write_f(1, 1u32).unwrap(); // adaptive_ref_pic_marking_mode_flag
-            w.write_ue(5u32).unwrap(); // memory_management_control_operation 5
-            w.write_ue(0u32).unwrap(); // memory_management_control_operation end
-            w.write_se(0i32).unwrap(); // slice_qp_delta
-            w.write_f(1, 1u32).unwrap(); // rbsp stop bit
-            while !w.aligned() {
-                w.write_f(1, 0u32).unwrap();
-            }
-        }
-        buf
-    }
-
     #[test]
     fn an_mmco_5_is_planned_with_a_rebase_warning_not_rejected() {
         let (sps, pps) = authored_sps_pps();
         let mut au0 = param_set_au(&sps, &pps);
         au0.extend(write_idr_slice());
-        let au1 = write_p_slice_mmco5(1, 2);
+        // MMCO 5 takes no argument (Table 7-9).
+        let au1 = write_slice(&SliceSpec {
+            frame_num: 1,
+            poc_lsb: 2,
+            mmco: Some(&[5]),
+            ..Default::default()
+        });
 
         let mut planner = H264Planner::new();
         let p0 = planner.plan_au(&au0).unwrap();
@@ -2752,8 +2616,14 @@ mod tests {
         let mut au = param_set_au(&sps, &pps);
         au.extend(write_idr_slice());
         // Continuation slices of another picture (non-IDR, frame_num 1); drop them.
-        au.extend(write_p_slice_at(8, 0, 1, 2, 1, 1, None));
-        au.extend(write_p_slice_at(9, 0, 1, 2, 1, 1, None));
+        for first_mb in [8, 9] {
+            au.extend(write_slice(&SliceSpec {
+                first_mb,
+                frame_num: 1,
+                poc_lsb: 2,
+                ..Default::default()
+            }));
+        }
 
         let plan = H264Planner::new().plan_au(&au).unwrap();
         assert!(plan.picture.is_idr);
@@ -2776,7 +2646,11 @@ mod tests {
         // Errors after IDR begin already drained the DPB (id0 queued):
         // continuation slice names PPS 1, which was never sent.
         let mut bad_au = write_idr_slice();
-        bad_au.extend(write_p_slice_at(8, 1, 0, 0, 1, 1, None));
+        bad_au.extend(write_slice(&SliceSpec {
+            first_mb: 8,
+            pps_id: 1,
+            ..Default::default()
+        }));
         assert!(matches!(
             planner.plan_au(&bad_au),
             Err(PlanError::NoActiveParamSet { pps_id: 1 })
@@ -2836,7 +2710,12 @@ mod tests {
 
         // PPS 3 was never sent.
         assert!(matches!(
-            planner.plan_au(&write_idr_slice_at(0, 3)),
+            planner.plan_au(&write_slice(&SliceSpec {
+                idr: true,
+                ref_idc: 3,
+                pps_id: 3,
+                ..Default::default()
+            })),
             Err(PlanError::NoActiveParamSet { pps_id: 3 })
         ));
         assert!(matches!(
@@ -2889,9 +2768,15 @@ mod tests {
         Synthesizer::<'_, Sps, _>::synthesize(3, &sps1, &mut au, true).unwrap();
         Synthesizer::<'_, Pps, _>::synthesize(3, &pps0, &mut au, true).unwrap();
         Synthesizer::<'_, Pps, _>::synthesize(3, &pps1, &mut au, true).unwrap();
-        au.extend(write_idr_slice_at(0, 0));
+        au.extend(write_idr_slice());
         // Continuation slice may legally name another PPS.
-        au.extend(write_idr_slice_at(8, 1));
+        au.extend(write_slice(&SliceSpec {
+            idr: true,
+            ref_idc: 3,
+            first_mb: 8,
+            pps_id: 1,
+            ..Default::default()
+        }));
 
         let plan = H264Planner::new().plan_au(&au).unwrap();
         assert!(picture_warnings(&plan).is_empty());

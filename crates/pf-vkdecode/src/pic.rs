@@ -261,8 +261,6 @@ mod tests {
     use std::collections::BTreeMap;
     use std::rc::Rc;
 
-    use cros_codecs::codec::h264::nalu_writer::NaluWriter;
-    use cros_codecs::codec::h264::parser::NaluType;
     use cros_codecs::codec::h264::parser::Pps;
     use cros_codecs::codec::h264::parser::PpsBuilder;
     use cros_codecs::codec::h264::parser::Profile;
@@ -271,6 +269,11 @@ mod tests {
     use cros_codecs::codec::h264::synthesizer::Synthesizer;
     use pf_bitstream::h264::H264Planner;
     use pf_bitstream::h264::Level;
+    use pf_bitstream::testing::h264::authored_sps_pps;
+    use pf_bitstream::testing::h264::write_idr_slice;
+    use pf_bitstream::testing::h264::write_p_slice;
+    use pf_bitstream::testing::h264::write_slice;
+    use pf_bitstream::testing::h264::SliceSpec;
     use pf_bitstream::testing::split_h264_aus;
 
     use super::*;
@@ -456,111 +459,20 @@ mod tests {
         assert_eq!(slots.active(), 0);
     }
 
-    /// Authored 64x64 Main SPS/PPS for long-term marking (no vendored vector
-    /// carries MMCO). Slice headers are written by hand.
-    fn authored_sps_pps() -> (Rc<Sps>, Rc<Pps>) {
-        let sps = SpsBuilder::new()
-            .seq_parameter_set_id(0)
-            .profile_idc(Profile::Main)
-            .level_idc(Level::L4)
-            .frame_mbs_only_flag(true)
-            .direct_8x8_inference_flag(true)
-            .max_num_ref_frames(4)
-            .log2_max_frame_num_minus4(0)
-            .pic_order_cnt_type(0)
-            .log2_max_pic_order_cnt_lsb_minus4(0)
-            .resolution(64, 64)
-            .build();
-        let pps = PpsBuilder::new(Rc::clone(&sps))
-            .pic_parameter_set_id(0)
-            .pic_init_qp(26)
-            .build();
-        (sps, pps)
-    }
-
-    /// One IDR slice NALU. `bottom_delta` writes `delta_pic_order_cnt_bottom`,
-    /// legal only when the referenced PPS sets
-    /// `bottom_field_pic_order_in_frame_present_flag` — writer and PPS must agree.
-    /// The planner reads headers only, so no slice data follows the rbsp stop bit.
-    fn write_idr_slice(bottom_delta: Option<i32>) -> Vec<u8> {
-        let mut buf = Vec::new();
-        {
-            let mut w = NaluWriter::new(&mut buf, true);
-            w.write_header(3, NaluType::SliceIdr as u8).unwrap();
-            w.write_ue(0u32).unwrap(); // first_mb_in_slice
-            w.write_ue(2u32).unwrap(); // slice_type: I
-            w.write_ue(0u32).unwrap(); // pic_parameter_set_id
-            w.write_f(4, 0u32).unwrap(); // frame_num, u(4): log2_max_frame_num_minus4 = 0
-            w.write_ue(7u32).unwrap(); // idr_pic_id
-            w.write_f(4, 0u32).unwrap(); // pic_order_cnt_lsb, u(4)
-            if let Some(delta) = bottom_delta {
-                w.write_se(delta).unwrap(); // delta_pic_order_cnt_bottom
-            }
-            w.write_f(1, 0u32).unwrap(); // no_output_of_prior_pics_flag
-            w.write_f(1, 0u32).unwrap(); // long_term_reference_flag
-            w.write_se(0i32).unwrap(); // slice_qp_delta
-            w.write_f(1, 1u32).unwrap(); // rbsp stop bit
-            while !w.aligned() {
-                w.write_f(1, 0u32).unwrap();
-            }
-        }
-        buf
-    }
-
-    /// One P slice NALU. `mmco_ops = None` is sliding-window; `Some` is
-    /// adaptive `(operation, arg)` pairs (ops 2/4/6 take one). The writer
-    /// appends terminating op 0. `bottom_delta` as in [`write_idr_slice`].
-    fn write_p_slice(
-        frame_num: u32,
-        poc_lsb: u32,
-        bottom_delta: Option<i32>,
-        num_ref_idx_l0_active: u32,
-        mmco_ops: Option<&[(u32, u32)]>,
-    ) -> Vec<u8> {
-        let mut buf = Vec::new();
-        {
-            let mut w = NaluWriter::new(&mut buf, true);
-            w.write_header(1, NaluType::Slice as u8).unwrap();
-            w.write_ue(0u32).unwrap(); // first_mb_in_slice
-            w.write_ue(0u32).unwrap(); // slice_type: P
-            w.write_ue(0u32).unwrap(); // pic_parameter_set_id
-            w.write_f(4, frame_num).unwrap(); // frame_num, u(4)
-            w.write_f(4, poc_lsb).unwrap(); // pic_order_cnt_lsb, u(4)
-            if let Some(delta) = bottom_delta {
-                w.write_se(delta).unwrap(); // delta_pic_order_cnt_bottom
-            }
-            w.write_f(1, 1u32).unwrap(); // num_ref_idx_active_override_flag
-            w.write_ue(num_ref_idx_l0_active - 1).unwrap();
-            w.write_f(1, 0u32).unwrap(); // ref_pic_list_modification_flag_l0
-            match mmco_ops {
-                None => w.write_f(1, 0u32).map(|_| ()).unwrap(),
-                Some(ops) => {
-                    w.write_f(1, 1u32).unwrap(); // adaptive_ref_pic_marking_mode_flag
-                    for (op, arg) in ops {
-                        w.write_ue(*op).unwrap();
-                        w.write_ue(*arg).unwrap();
-                    }
-                    w.write_ue(0u32).unwrap(); // memory_management_control_operation end
-                }
-            }
-            w.write_se(0i32).unwrap(); // slice_qp_delta
-            w.write_f(1, 1u32).unwrap(); // rbsp stop bit
-            while !w.aligned() {
-                w.write_f(1, 0u32).unwrap();
-            }
-        }
-        buf
-    }
-
     #[test]
     fn an_mmco_self_marking_sets_the_setup_lt_flag_and_later_refs_carry_it() {
         let (sps, pps) = authored_sps_pps();
         let mut au0 = Vec::new();
         Synthesizer::<'_, Sps, _>::synthesize(3, &sps, &mut au0, true).unwrap();
         Synthesizer::<'_, Pps, _>::synthesize(3, &pps, &mut au0, true).unwrap();
-        au0.extend(write_idr_slice(None));
-        let au1 = write_p_slice(1, 2, None, 1, Some(&[(4, 1), (6, 0)]));
-        let au2 = write_p_slice(2, 4, None, 2, None);
+        au0.extend(write_slice(&SliceSpec {
+            idr: true,
+            ref_idc: 3,
+            idr_pic_id: 7,
+            ..Default::default()
+        }));
+        let au1 = write_p_slice(1, 2, 1, 1, Some(&[(4, 1), (6, 0)]));
+        let au2 = write_p_slice(2, 4, 1, 2, None);
 
         let mut planner = H264Planner::new();
         let p0 = planner.plan_au(&au0).unwrap();
@@ -614,8 +526,8 @@ mod tests {
         let mut au0 = Vec::new();
         Synthesizer::<'_, Sps, _>::synthesize(3, &sps, &mut au0, true).unwrap();
         Synthesizer::<'_, Pps, _>::synthesize(3, &pps, &mut au0, true).unwrap();
-        au0.extend(write_idr_slice(None));
-        let au1 = write_p_slice(1, 2, None, 1, None);
+        au0.extend(write_idr_slice());
+        let au1 = write_p_slice(1, 2, 1, 1, None);
 
         let mut planner = H264Planner::new();
         let p0 = planner.plan_au(&au0).unwrap();
@@ -636,7 +548,7 @@ mod tests {
 
         // Next valid AU (IDR restart) still converts. Its `removed` names ids
         // this map never assigned — tolerated by design.
-        let p2 = planner.plan_au(&write_idr_slice(None)).unwrap();
+        let p2 = planner.plan_au(&write_idr_slice()).unwrap();
         let vk2 = plan_to_vk(&p2, &mut fresh, 0).unwrap();
         assert_eq!(vk2.setup_slot, 1, "the lowest free slot after the held one");
         assert_eq!(fresh.active(), 2);
@@ -670,11 +582,11 @@ mod tests {
         let mut au0 = Vec::new();
         Synthesizer::<'_, Sps, _>::synthesize(3, &sps_a, &mut au0, true).unwrap();
         Synthesizer::<'_, Pps, _>::synthesize(3, &pps_a, &mut au0, true).unwrap();
-        au0.extend(write_idr_slice(None));
+        au0.extend(write_idr_slice());
         let mut au1 = Vec::new();
         Synthesizer::<'_, Sps, _>::synthesize(3, &sps_b, &mut au1, true).unwrap();
         Synthesizer::<'_, Pps, _>::synthesize(3, &pps_b, &mut au1, true).unwrap();
-        au1.extend(write_idr_slice(None));
+        au1.extend(write_idr_slice());
 
         let mut planner = H264Planner::new();
         let p0 = planner.plan_au(&au0).unwrap();
@@ -718,7 +630,7 @@ mod tests {
         let mut au0 = Vec::new();
         Synthesizer::<'_, Sps, _>::synthesize(3, &sps, &mut au0, true).unwrap();
         Synthesizer::<'_, Pps, _>::synthesize(3, &pps, &mut au0, true).unwrap();
-        au0.extend(write_idr_slice(None));
+        au0.extend(write_idr_slice());
 
         let mut planner = H264Planner::new();
         let p0 = planner.plan_au(&au0).unwrap();
@@ -736,9 +648,7 @@ mod tests {
         bound[img0] = true;
         slot_image[usize::from(vk0.setup_slot)] = Some(img0);
 
-        let p1 = planner
-            .plan_au(&write_p_slice(1, 2, None, 1, None))
-            .unwrap();
+        let p1 = planner.plan_au(&write_p_slice(1, 2, 1, 1, None)).unwrap();
         assert!(p1.dpb.outputs.contains(&vk0.setup_id) && p1.dpb.removed.contains(&vk0.setup_id));
         let vk1 = plan_to_vk(&p1, &mut slots, 0).unwrap();
 
@@ -837,8 +747,20 @@ mod tests {
         let mut au0 = Vec::new();
         Synthesizer::<'_, Sps, _>::synthesize(3, &sps, &mut au0, true).unwrap();
         Synthesizer::<'_, Pps, _>::synthesize(3, &pps, &mut au0, true).unwrap();
-        au0.extend(write_idr_slice(Some(2))); // top 0, bottom 0 + 2
-        let au1 = write_p_slice(1, 4, Some(1), 1, None); // top 4, bottom 4 + 1
+        // top 0, bottom 0 + 2
+        au0.extend(write_slice(&SliceSpec {
+            idr: true,
+            ref_idc: 3,
+            bottom_delta: Some(2),
+            ..Default::default()
+        }));
+        // top 4, bottom 4 + 1
+        let au1 = write_slice(&SliceSpec {
+            frame_num: 1,
+            poc_lsb: 4,
+            bottom_delta: Some(1),
+            ..Default::default()
+        });
 
         let mut planner = H264Planner::new();
         let p0 = planner.plan_au(&au0).unwrap();
