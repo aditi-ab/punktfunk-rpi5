@@ -82,8 +82,9 @@ pub(crate) enum Accepted {
 pub(crate) enum SessionLink {
     /// The native plane: `punktfunk/1` over quinn.
     Quic(quinn::Connection),
-    /// The browser plane: the same protocol over one WebTransport session.
-    Web(wtransport::Connection),
+    /// The browser plane: the same protocol over one WebTransport session, and the device
+    /// fingerprint its key signature proved. `None` before admission and under `serve --open`.
+    Web(wtransport::Connection, Option<[u8; 32]>),
 }
 
 impl SessionLink {
@@ -91,7 +92,7 @@ impl SessionLink {
     fn quic(&self) -> &quinn::Connection {
         match self {
             SessionLink::Quic(c) => c,
-            SessionLink::Web(c) => c.quic_connection(),
+            SessionLink::Web(c, _) => c.quic_connection(),
         }
     }
 
@@ -114,7 +115,7 @@ impl SessionLink {
             },
             // Not the quinn connection: a WebTransport datagram carries a session-id prefix, so
             // it has to go through the layer that writes one.
-            SessionLink::Web(c) => match c.send_datagram(&payload) {
+            SessionLink::Web(c, _) => match c.send_datagram(&payload) {
                 Ok(()) => DatagramSend::Sent,
                 Err(wtransport::error::SendDatagramError::TooLarge) => DatagramSend::TooLarge,
                 Err(_) => DatagramSend::Unavailable,
@@ -130,7 +131,7 @@ impl SessionLink {
                 .await
                 .map(|b| b.to_vec())
                 .map_err(LinkClosed::from),
-            SessionLink::Web(c) => c
+            SessionLink::Web(c, _) => c
                 .receive_datagram()
                 .await
                 .map(|d| d.payload().to_vec())
@@ -143,7 +144,7 @@ impl SessionLink {
     pub(crate) fn max_datagram_size(&self) -> Option<usize> {
         match self {
             SessionLink::Quic(c) => c.max_datagram_size(),
-            SessionLink::Web(c) => c.max_datagram_size(),
+            SessionLink::Web(c, _) => c.max_datagram_size(),
         }
     }
 
@@ -190,7 +191,7 @@ impl SessionLink {
                 }
                 Err(e) => Err(anyhow::Error::new(e).context("accept control stream")),
             },
-            SessionLink::Web(c) => {
+            SessionLink::Web(c, _) => {
                 let (send, recv) = c
                     .accept_bi()
                     .await
@@ -200,27 +201,28 @@ impl SessionLink {
         }
     }
 
-    /// The quinn connection, for the two things that are still quinn-shaped: clipboard, whose
-    /// transfers are quinn streams, and the peer certificate a browser does not have.
+    /// The quinn connection, for clipboard, whose transfers are quinn streams.
     pub(crate) fn as_quic(&self) -> Option<&quinn::Connection> {
         match self {
             SessionLink::Quic(c) => Some(c),
-            SessionLink::Web(_) => None,
+            SessionLink::Web(..) => None,
         }
     }
 
-    /// The peer's client-certificate fingerprint. Always `None` for a browser: WebTransport has
-    /// no mTLS, so a browser identifies itself at the application layer instead
-    /// (`design/web-client-implementation-plan.md`, Phase 3).
+    /// The device this session is keyed by: the client certificate's fingerprint on the native
+    /// plane, the admitted device key's on the browser plane. `None` for an anonymous client.
     pub(crate) fn peer_fingerprint(&self) -> Option<[u8; 32]> {
-        punktfunk_core::quic::endpoint::peer_fingerprint(self.as_quic()?)
+        match self {
+            SessionLink::Quic(c) => punktfunk_core::quic::endpoint::peer_fingerprint(c),
+            SessionLink::Web(_, fp) => *fp,
+        }
     }
 
     /// Whether a browser is on the other end. For the few decisions that really are about the
     /// carrier: there is no second UDP plane to punch, and the capabilities that ride quinn
     /// streams are not on offer.
     pub(crate) fn is_web(&self) -> bool {
-        matches!(self, SessionLink::Web(_))
+        matches!(self, SessionLink::Web(..))
     }
 }
 
@@ -300,11 +302,5 @@ impl std::fmt::Display for LinkClosed {
 impl From<quinn::Connection> for SessionLink {
     fn from(c: quinn::Connection) -> SessionLink {
         SessionLink::Quic(c)
-    }
-}
-
-impl From<wtransport::Connection> for SessionLink {
-    fn from(c: wtransport::Connection) -> SessionLink {
-        SessionLink::Web(c)
     }
 }

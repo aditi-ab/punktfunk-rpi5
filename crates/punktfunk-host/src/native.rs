@@ -1363,9 +1363,7 @@ async fn serve_session(
                 .expect("session semaphore is never closed");
         }
     }
-    // Admitted. From here the session is the same on every carrier; the certificate's
-    // fingerprint is what this plane admitted by, and the browser plane passes its own.
-    let session_fp_hex = conn.peer_fingerprint().map(|fp| fingerprint_hex(&fp));
+    // Admitted. From here the session is the same on every carrier.
     let host = SessionHost {
         opts: Arc::clone(opts),
         audio_cap: audio_cap.clone(),
@@ -1374,17 +1372,7 @@ async fn serve_session(
         np: np_arc.clone(),
         stats,
     };
-    run_admitted(
-        conn,
-        send,
-        recv,
-        first,
-        session_fp_hex,
-        &host,
-        DataPlane::Udp,
-        permit,
-    )
-    .await
+    run_admitted(conn, send, recv, first, &host, DataPlane::Udp, permit).await
 }
 
 /// Everything a session needs from the plane that admitted it. One value, cloned per session,
@@ -1443,18 +1431,18 @@ pub(crate) enum DataPlane {
 
 /// The session proper, after admission. Carrier-agnostic: the control stream is a [`link::CtlSend`]
 /// / [`link::CtlRecv`] pair, datagrams go through [`link::SessionLink`], and video through
-/// whatever [`DataPlane`] the caller built.
-#[allow(clippy::too_many_arguments)] // one value per thing the two admission paths resolve
+/// whatever [`DataPlane`] the caller built. The device is the link's
+/// [`link::SessionLink::peer_fingerprint`], whichever plane admitted it.
 pub(crate) async fn run_admitted(
     conn: link::SessionLink,
     send: link::CtlSend,
     recv: link::CtlRecv,
     first: Vec<u8>,
-    session_fp_hex: Option<String>,
     host: &SessionHost,
     data_plane: DataPlane,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<Served> {
+    let session_fp_hex = conn.peer_fingerprint().map(|fp| fingerprint_hex(&fp));
     let SessionHost {
         opts,
         audio_cap,
@@ -1872,7 +1860,7 @@ pub(crate) async fn run_admitted(
         }
     }
 
-    // Isolated gamescope: per-session input/audio/mic. Identity is the cert-fingerprint prefix
+    // Isolated gamescope: per-session input/audio/mic. Identity is the device-fingerprint prefix
     // so keep-alive hands a kept spawn back to the same client. Minted after handshake, before
     // the input/audio threads (`compositor::session_is_isolated`).
     #[cfg(target_os = "linux")]
@@ -2294,7 +2282,7 @@ pub(crate) async fn run_admitted(
     let launch_for_dp = launch_target.as_ref().and(hello.launch.clone());
     #[cfg(not(target_os = "windows"))]
     let launch_for_dp = launch_target.as_ref().and_then(|t| t.command.clone());
-    // Stats label: cert-fingerprint prefix, else peer IP (anonymous TOFU/--open).
+    // Stats label: device-fingerprint prefix, else peer IP (anonymous, `--open`).
     let client_label = conn
         .peer_fingerprint()
         .map(|fp| fingerprint_hex(&fp)[..12].to_string())
