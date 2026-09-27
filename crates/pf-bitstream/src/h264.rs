@@ -1279,11 +1279,14 @@ impl H264Planner {
         }
         let interlaced = !sps.frame_mbs_only_flag;
         let max_num_order_frames = sps.max_num_order_frames() as usize;
-        let max_num_reorder_frames = if max_num_order_frames > max_dpb_frames {
-            0
-        } else {
-            max_num_order_frames
-        };
+        // 8.2.1.3: `pic_order_cnt_type` 2 makes output order the decoding order,
+        // whatever the VUI states. NVENC codes it and states no bound.
+        let max_num_reorder_frames =
+            if sps.pic_order_cnt_type == 2 || max_num_order_frames > max_dpb_frames {
+                0
+            } else {
+                max_num_order_frames
+            };
 
         self.dpb.set_limits(max_dpb_frames, max_num_reorder_frames);
         self.dpb.set_interlaced(interlaced);
@@ -1616,6 +1619,13 @@ impl H264Planner {
         } else {
             self.add_to_ready_queue(pic, id);
         }
+
+        // Not C.4.5.3: that outputs on a full DPB only, which shows a zero-reorder
+        // stream `max_dec_frame_buffering` pictures late.
+        let ready = self.dpb.bump_past_reorder_bound();
+        self.report
+            .pending_outputs
+            .extend(ready.into_iter().flatten());
 
         Ok(id)
     }
@@ -2823,5 +2833,66 @@ mod tests {
         assert_eq!(plan.pps.seq_parameter_set_id, pps.seq_parameter_set_id);
         assert_eq!(plan.pps.pic_init_qp_minus26, pps.pic_init_qp_minus26);
         assert!(Rc::ptr_eq(&plan.sps, &plan.pps.sps));
+    }
+
+    /// AU index each picture is shown at, minus the AU index it was decoded at.
+    /// Forty AUs cross the `frame_num` wrap and, where coded, the POC wrap.
+    fn output_lags(sps: Rc<Sps>) -> Vec<usize> {
+        let pps = PpsBuilder::new(Rc::clone(&sps))
+            .pic_parameter_set_id(0)
+            .pic_init_qp(26)
+            .build();
+        let mut planner = H264Planner::new();
+        let mut stored = Vec::new();
+        let mut lags = Vec::new();
+        for i in 0..40u32 {
+            let mut au = if i == 0 {
+                param_set_au(&sps, &pps)
+            } else {
+                Vec::new()
+            };
+            au.extend(write_slice(&SliceSpec {
+                idr: i == 0,
+                frame_num: i % 16,
+                poc_lsb: (2 * i) % 16,
+                poc_type_2: sps.pic_order_cnt_type == 2,
+                ..Default::default()
+            }));
+            let plan = planner.plan_au(&au).unwrap();
+            stored.push(plan.dpb.stored.unwrap());
+            for shown in &plan.dpb.outputs {
+                let decoded_at = stored.iter().position(|id| id == shown).unwrap();
+                lags.push(i as usize - decoded_at);
+            }
+        }
+        lags
+    }
+
+    /// A host states `max_num_reorder_frames = 0`; the session is one AU in, one
+    /// picture out.
+    #[test]
+    fn a_zero_reorder_stream_shows_each_picture_in_its_own_au() {
+        let sps = base_sps()
+            .resolution(64, 64)
+            .bitstream_restriction(0)
+            .build();
+        assert_eq!(output_lags(sps), vec![0; 40]);
+    }
+
+    /// NVENC's shape: no VUI restriction, `pic_order_cnt_type` 2. 8.2.1.3 makes
+    /// output order the decoding order, so nothing waits.
+    #[test]
+    fn poc_type_2_shows_each_picture_in_its_own_au_with_no_stated_bound() {
+        let sps = base_sps().resolution(64, 64).pic_order_cnt_type(2).build();
+        assert_eq!(output_lags(sps), vec![0; 40]);
+    }
+
+    /// No VUI restriction, `pic_order_cnt_type` 0: E.2.1 infers the bound as the
+    /// DPB depth. The spec's answer, kept for streams that may reorder.
+    #[test]
+    fn a_stream_that_states_no_bound_waits_for_a_full_dpb() {
+        let sps = base_sps().resolution(64, 64).build();
+        let depth = sps.max_dpb_frames();
+        assert_eq!(output_lags(sps), vec![depth; 40 - depth]);
     }
 }

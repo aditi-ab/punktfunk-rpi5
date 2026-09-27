@@ -283,5 +283,16 @@ in the future."
     test: `two_pictures_at_one_poc_both_leave_the_output_queue`, in the file's own test
     module. **Report upstream — not yet filed.**
 
+25. `src/codec/h264/dpb.rs` — two edits, one defect. New `Dpb::bump_past_reorder_bound`
+    outputs the lowest POC while more pictures wait than `max_num_reorder_frames`, and
+    `clear` keeps that bound as it keeps `max_num_pics`. Upstream outputs on a full DPB
+    only (C.4.5.3), so a stream that states `max_num_reorder_frames = 0` is still shown
+    `max_dec_frame_buffering` pictures late; `clear` zeroed the bound at every IDR, which
+    nothing read as a bound until now. The H.265 DPB already outputs on
+    `sps_max_num_reorder_pics` (C.5.2.3). Regression tests:
+    `a_zero_reorder_stream_shows_each_picture_in_its_own_au` and
+    `a_stream_that_states_no_bound_waits_for_a_full_dpb` in `pf-bitstream`.
+    **Report upstream — not yet filed.**
+
 Re-sync procedure: fetch the AOSP tree, re-apply this trim, diff `codec/` +
 `bitstream_utils.rs` (expect near-zero conflicts), update the commit pin above.

@@ -154,6 +154,8 @@ pub mod h264 {
         pub frame_num: u32,
         pub idr_pic_id: u32,
         pub poc_lsb: u32,
+        /// The SPS is `pic_order_cnt_type` 2, which codes no `pic_order_cnt_lsb`.
+        pub poc_type_2: bool,
         /// `delta_pic_order_cnt_bottom`: legal only when the PPS sets
         /// `bottom_field_pic_order_in_frame_present_flag`.
         pub bottom_delta: Option<i32>,
@@ -173,6 +175,7 @@ pub mod h264 {
                 frame_num: 0,
                 idr_pic_id: 0,
                 poc_lsb: 0,
+                poc_type_2: false,
                 bottom_delta: None,
                 num_ref_idx_l0_active: 1,
                 mmco: None,
@@ -197,7 +200,9 @@ pub mod h264 {
             if spec.idr {
                 w.write_ue(spec.idr_pic_id).unwrap();
             }
-            w.write_f(4, spec.poc_lsb).unwrap(); // pic_order_cnt_lsb, u(4)
+            if !spec.poc_type_2 {
+                w.write_f(4, spec.poc_lsb).unwrap(); // pic_order_cnt_lsb, u(4)
+            }
             if let Some(delta) = spec.bottom_delta {
                 w.write_se(delta).unwrap();
             }
