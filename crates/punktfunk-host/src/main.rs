@@ -121,8 +121,6 @@ mod encode {
     }
 }
 mod encode_recovery;
-// Who else holds an NVENC session (NVML); names the neighbour when a stream falls behind.
-mod encoder_sessions;
 mod events;
 // Launch, lease and liveness of a session's game; the flat names keep `crate::gamelease::*`.
 mod game;
@@ -144,16 +142,12 @@ mod identity;
 mod inject {
     pub(crate) use pf_inject::*;
 }
-mod client_logs;
 mod pen_sink;
 // Unix wall clock every stored deadline and event stamp reads.
 mod clock;
 // Compositor + gamescope route for a connect, shared by the native and GameStream planes.
 mod compositor_route;
 mod library;
-#[forbid(unsafe_code)]
-mod link_health;
-mod log_capture;
 // Network-facing secure-default surface. `not(test)` because tests mutate process env
 // (`set_var` is unsafe in 2024) and `native` has in-process C-ABI roundtrips.
 #[cfg_attr(not(test), forbid(unsafe_code))]
@@ -167,7 +161,6 @@ mod ctl;
 mod native;
 #[forbid(unsafe_code)]
 mod native_pairing;
-mod net_health;
 mod osinfo;
 // Live per-session pad tap the console's Controllers page streams.
 mod pad_feed;
@@ -175,11 +168,15 @@ mod plugins;
 mod power;
 mod send_pacing;
 mod session_plan;
-mod session_status;
 mod sleep_inhibit;
 mod slug;
 mod spike;
-mod stats_recorder;
+// Session status, stats and log capture; the flat names keep `crate::session_status::*`.
+mod telemetry;
+use telemetry::{
+    client_logs, encoder_sessions, link_health, log_capture, net_health, session_status,
+    stats_recorder,
+};
 // Signed catalogs and install jobs via the `plugins` runner — design/plugin-store.md.
 mod store;
 #[cfg(test)]
