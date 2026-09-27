@@ -37,20 +37,17 @@ pub(crate) trait VdisplayDriver: Send + Sync {
     fn name(&self) -> &'static str;
     /// `reap_orphans` permits a global `CLEAR_ALL`; only the first legacy
     /// single-owner open may set it. Reserved seats and handle reopens can
-    /// overlap live monitors. Returns the owned handle, watchdog seconds, and
+    /// overlap live monitors. Returns the control device, watchdog seconds, and
     /// protocol version.
-    fn open(&self, reap_orphans: bool) -> Result<(OwnedHandle, u32, u32)>;
+    fn open(&self, reap_orphans: bool) -> Result<(ControlDevice, u32, u32)>;
     /// Pins the IDD render GPU to `render_luid` when `Some`.
     /// `preferred_monitor_id` `0` = auto. `client_hdr` `None` = the driver's
     /// EDID CTA HDR defaults. Reply LUID is
     /// `IDARG_OUT_MONITORARRIVAL.OsAdapterLuid` — the IddCx DISPLAY adapter,
     /// not the render GPU (that is only in the shared frame header).
-    ///
-    /// # Safety
-    /// `dev` must be the live control handle from [`open`](Self::open).
-    unsafe fn add_monitor(
+    fn add_monitor(
         &self,
-        dev: HANDLE,
+        dev: &ControlDevice,
         mode: Mode,
         render_luid: Option<LUID>,
         preferred_monitor_id: u32,
@@ -60,32 +57,17 @@ pub(crate) trait VdisplayDriver: Send + Sync {
     /// In-place resize (`IOCTL_UPDATE_MODES`, protocol v4). The monitor is not
     /// departed; the caller CCD-forces the new mode afterwards. Default errs so
     /// a backend without support takes the re-arrival fallback.
-    ///
-    // unsafe-fn-no-op-ok: trait method — the "dev is live" contract binds every impl; this
-    // default body is a stub that bails.
-    /// # Safety
-    /// `dev` must be the live control handle.
-    unsafe fn update_modes(&self, dev: HANDLE, key: &MonitorKey, mode: Mode) -> Result<()> {
+    fn update_modes(&self, dev: &ControlDevice, key: &MonitorKey, mode: Mode) -> Result<()> {
         let _ = (dev, key, mode);
         anyhow::bail!("backend does not support in-place mode updates")
     }
-    /// # Safety
-    /// `dev` must be the live control handle.
-    unsafe fn remove_monitor(&self, dev: HANDLE, key: &MonitorKey) -> Result<()>;
+    fn remove_monitor(&self, dev: &ControlDevice, key: &MonitorKey) -> Result<()>;
     /// Issued every `watchdog/3` from the pinger thread.
-    ///
-    /// # Safety
-    /// `dev` must be the live control handle.
-    unsafe fn ping(&self, dev: HANDLE) -> Result<()>;
+    fn ping(&self, dev: &ControlDevice) -> Result<()>;
     /// Move the driver's diagnostic lines into this process's log; issued after each ping, since
     /// the encoder runs in WUDFHost and reports nowhere else. Defaulted to nothing, so a backend
     /// with no such channel needs no stub.
-    ///
-    // unsafe-fn-no-op-ok: trait method — the "dev is live" contract binds every impl; this
-    // default body discards it.
-    /// # Safety
-    /// `dev` must be the live control handle.
-    unsafe fn drain_log(&self, dev: HANDLE) {
+    fn drain_log(&self, dev: &ControlDevice) {
         let _ = dev;
     }
 }
@@ -100,13 +82,12 @@ mod tests {
         fn name(&self) -> &'static str {
             "fake"
         }
-        fn open(&self, _reap_orphans: bool) -> Result<(OwnedHandle, u32, u32)> {
+        fn open(&self, _reap_orphans: bool) -> Result<(ControlDevice, u32, u32)> {
             anyhow::bail!("fake driver has no control device")
         }
-        // unsafe-fn-no-op-ok: signature mandated by the trait; test stub.
-        unsafe fn add_monitor(
+        fn add_monitor(
             &self,
-            _dev: HANDLE,
+            _dev: &ControlDevice,
             _mode: Mode,
             _render_luid: Option<LUID>,
             _preferred_monitor_id: u32,
@@ -115,12 +96,10 @@ mod tests {
         ) -> Result<AddedMonitor> {
             anyhow::bail!("fake driver adds no monitors")
         }
-        // unsafe-fn-no-op-ok: signature mandated by the trait; test stub.
-        unsafe fn remove_monitor(&self, _dev: HANDLE, _key: &MonitorKey) -> Result<()> {
+        fn remove_monitor(&self, _dev: &ControlDevice, _key: &MonitorKey) -> Result<()> {
             Ok(())
         }
-        // unsafe-fn-no-op-ok: signature mandated by the trait; test stub.
-        unsafe fn ping(&self, _dev: HANDLE) -> Result<()> {
+        fn ping(&self, _dev: &ControlDevice) -> Result<()> {
             Ok(())
         }
     }
@@ -136,9 +115,8 @@ mod tests {
             height: 1080,
             refresh_hz: 60,
         };
-        // SAFETY: the defaulted `update_modes` discharges its `dev` obligation by never using it —
-        // the body discards all three arguments and errs — so the null handle is never touched.
-        let err = unsafe { d.update_modes(HANDLE::default(), &MonitorKey::Session(1), mode) }
+        let err = d
+            .update_modes(&ControlDevice::stand_in(), &MonitorKey::Session(1), mode)
             .expect_err("the default must not report success");
         assert!(
             err.to_string()
