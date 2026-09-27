@@ -719,14 +719,7 @@ pub(crate) fn dpms_other_heads(on: bool) -> Vec<String> {
 /// `dpmsStatus`). `None` when unlisted or the field is missing. A DPMS-off
 /// monitor stays listed — the readback [`dpms_one`] is built around.
 fn monitor_dpms(name: &str) -> Option<bool> {
-    let raw = hyprctl(&["-j", "monitors", "all"]).ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    parsed
-        .as_array()?
-        .iter()
-        .find(|m| m.get("name").and_then(|v| v.as_str()) == Some(name))?
-        .get("dpmsStatus")?
-        .as_bool()
+    monitor(name, true).ok()??.get("dpmsStatus")?.as_bool()
 }
 
 /// Put one monitor into `want_on`, reporting whether this call changed it.
@@ -782,12 +775,8 @@ fn lua_dpms_expr(name: &str, on: bool) -> String {
 /// Active workspace id for monitor `name` (`hyprctl -j monitors`). `None` when
 /// the monitor is already gone or the field is missing.
 fn active_workspace_id(name: &str) -> Option<i64> {
-    let raw = hyprctl(&["-j", "monitors"]).ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    parsed
-        .as_array()?
-        .iter()
-        .find(|m| m.get("name").and_then(|v| v.as_str()) == Some(name))?
+    monitor(name, false)
+        .ok()??
         .get("activeWorkspace")?
         .get("id")?
         .as_i64()
@@ -799,16 +788,12 @@ fn active_workspace_id(name: &str) -> Option<i64> {
 /// monitor, and `clients`' own `monitor` is an index that does not survive a
 /// hotplug. Empty on any failure — this list is never worth an error.
 pub(crate) fn toplevels(name: Option<&str>) -> Vec<crate::toplevels::Toplevel> {
-    let Ok(clients) = hyprctl(&["-j", "clients"]) else {
+    let Ok(clients) = hyprctl_json(&["clients"]) else {
         tracing::debug!(output = ?name, "hyprland: no client list");
         return Vec::new();
     };
-    let (Ok(clients), Ok(spaces)) = (
-        serde_json::from_str::<serde_json::Value>(&clients),
-        hyprctl(&["-j", "workspaces"])
-            .and_then(|raw| Ok(serde_json::from_str::<serde_json::Value>(&raw)?)),
-    ) else {
-        tracing::debug!(output = ?name, "hyprland: unreadable client list");
+    let Ok(spaces) = hyprctl_json(&["workspaces"]) else {
+        tracing::debug!(output = ?name, "hyprland: no workspace list");
         return Vec::new();
     };
     parse_clients(&clients, &spaces, name)
@@ -925,8 +910,7 @@ pub(crate) fn claim_workspace(name: &str, want: Option<i64>) -> Option<(i64, i64
     let id = match want {
         Some(id) => id,
         None => {
-            let raw = hyprctl(&["-j", "workspaces"]).ok()?;
-            let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+            let parsed = hyprctl_json(&["workspaces"]).ok()?;
             crate::routing::pick_workspace(&workspace_slots(&parsed, name), restore)
         }
     };
@@ -1237,20 +1221,7 @@ fn wait_head_disabled(name: &str, timeout: Duration) -> bool {
 /// plain listing drops a disabled head, so it cannot distinguish disabled
 /// from unplugged.
 fn head_is_enabled(name: &str) -> Result<Option<bool>> {
-    let out = hyprctl(&["-j", "monitors", "all"])?;
-    let monitors: serde_json::Value =
-        serde_json::from_str(&out).context("parse hyprctl -j monitors all")?;
-    let Some(arr) = monitors.as_array() else {
-        return Ok(None);
-    };
-    for m in arr {
-        if m.get("name").and_then(|n| n.as_str()) == Some(name) {
-            return Ok(Some(
-                !m.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false),
-            ));
-        }
-    }
-    Ok(None)
+    Ok(monitor(name, true)?.map(|m| !m.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false)))
 }
 
 /// How long a `disable` (or the `reload` that undoes it) has to show up in
@@ -1349,6 +1320,30 @@ fn hyprctl(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// `hyprctl -j <args>`, parsed.
+fn hyprctl_json(args: &[&str]) -> Result<serde_json::Value> {
+    let argv: Vec<&str> = std::iter::once("-j").chain(args.iter().copied()).collect();
+    let raw = hyprctl(&argv)?;
+    serde_json::from_str(&raw).with_context(|| format!("parse hyprctl -j {}", args.join(" ")))
+}
+
+/// Monitor `name` from `-j monitors`, or `-j monitors all` with `include_disabled` (the plain
+/// listing drops a disabled head). `None` when it is not listed.
+fn monitor(name: &str, include_disabled: bool) -> Result<Option<serde_json::Value>> {
+    let args: &[&str] = if include_disabled {
+        &["monitors", "all"]
+    } else {
+        &["monitors"]
+    };
+    let listed = hyprctl_json(args)?;
+    Ok(listed.as_array().and_then(|monitors| {
+        monitors
+            .iter()
+            .find(|m| m.get("name").and_then(|v| v.as_str()) == Some(name))
+            .cloned()
+    }))
+}
+
 /// `hyprctl` invocation with the live instance signature on the child.
 ///
 /// `Command::env` gives it to exactly that child. A process-wide `set_var` was
@@ -1370,9 +1365,7 @@ fn hyprctl_command(args: &[&str], sig: Option<String>) -> Command {
 /// post-transform in logical pixels, which is the space `crate::monitors`
 /// documents.
 pub(crate) fn list_monitors() -> Result<Vec<crate::monitors::PhysicalMonitor>> {
-    let raw = hyprctl(&["-j", "monitors", "all"])?;
-    let parsed: serde_json::Value =
-        serde_json::from_str(&raw).context("parse hyprctl -j monitors all")?;
+    let parsed = hyprctl_json(&["monitors", "all"])?;
     let mut out: Vec<_> = parsed
         .as_array()
         .context("hyprctl monitors: not an array")?
@@ -1464,10 +1457,7 @@ fn wait_monitor_ready(name: &str, timeout: Duration) -> Result<()> {
 /// Every monitor name, disabled included (`-j monitors all`). A leftover from
 /// a dead host may have ended up disabled; [`reclaim_leftovers_once`] must see it.
 fn monitor_names() -> Result<Vec<String>> {
-    let out = hyprctl(&["-j", "monitors", "all"])?;
-    let monitors: serde_json::Value =
-        serde_json::from_str(&out).context("parse hyprctl -j monitors all")?;
-    Ok(monitors
+    Ok(hyprctl_json(&["monitors", "all"])?
         .as_array()
         .map(|a| {
             a.iter()
@@ -1478,16 +1468,7 @@ fn monitor_names() -> Result<Vec<String>> {
 }
 
 fn monitor_exists(name: &str) -> Result<bool> {
-    let out = hyprctl(&["-j", "monitors"])?;
-    let monitors: serde_json::Value =
-        serde_json::from_str(&out).context("parse hyprctl -j monitors")?;
-    Ok(monitors
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .any(|m| m.get("name").and_then(|n| n.as_str()) == Some(name))
-        })
-        .unwrap_or(false))
+    Ok(monitor(name, false)?.is_some())
 }
 
 /// Set the client's exact mode on `name`, both config eras.
@@ -1578,27 +1559,14 @@ fn wait_exact_mode(name: &str, mode: Mode, timeout: Duration) -> bool {
 /// `(width, height)` from `hyprctl -j monitors all` (includes disabled), or
 /// `None` if absent. A fresh headless output reports `0×0` until a mode commits.
 fn monitor_size(name: &str) -> Result<Option<(u64, u64)>> {
-    let out = hyprctl(&["-j", "monitors", "all"])?;
-    let monitors: serde_json::Value =
-        serde_json::from_str(&out).context("parse hyprctl -j monitors")?;
-    let Some(arr) = monitors.as_array() else {
-        return Ok(None);
-    };
-    for m in arr {
-        if m.get("name").and_then(|n| n.as_str()) == Some(name) {
-            let w = m.get("width").and_then(|v| v.as_u64()).unwrap_or(0);
-            let h = m.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
-            return Ok(Some((w, h)));
-        }
-    }
-    Ok(None)
+    let dim = |m: &serde_json::Value, k: &str| m.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+    Ok(monitor(name, true)?.map(|m| (dim(&m, "width"), dim(&m, "height"))))
 }
 
 /// Running Hyprland `(major, minor, patch)` from `hyprctl -j version`, for a
 /// diagnostic log — the mode-rule path is version-independent.
 fn hyprland_version() -> Option<(u16, u16, u16)> {
-    let out = hyprctl(&["-j", "version"]).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&out).ok()?;
+    let json = hyprctl_json(&["version"]).ok()?;
     parse_version_tag(json.get("tag").and_then(|t| t.as_str())?)
 }
 
@@ -1621,10 +1589,7 @@ fn preflight_once() {
 }
 
 fn warn_if_permissions_enforced() {
-    let Ok(out) = hyprctl(&["-j", "getoption", "ecosystem:enforce_permissions"]) else {
-        return;
-    };
-    let on = serde_json::from_str::<serde_json::Value>(&out)
+    let on = hyprctl_json(&["getoption", "ecosystem:enforce_permissions"])
         .ok()
         .and_then(|j| j.get("int").and_then(|v| v.as_i64()))
         .is_some_and(|v| v != 0);
