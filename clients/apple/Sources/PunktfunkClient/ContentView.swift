@@ -1343,7 +1343,9 @@ struct ContentView: View {
             },
             requestMode: { w, h, hz in conn.requestMode(width: w, height: h, refreshHz: hz) },
             scrollInverted: { [model] in model.settings.invertScroll },
-            toggleScrollInversion: { [model] in model.setInvertScroll(!model.settings.invertScroll) })
+            toggleScrollInversion: { [model] in model.setInvertScroll(!model.settings.invertScroll) },
+            streamedGame: { [model] in model.streamedGame },
+            endGame: { [weak model] in model?.endStreamedGame() })
     }
     #endif
     #if os(iOS) || os(tvOS) || os(macOS)

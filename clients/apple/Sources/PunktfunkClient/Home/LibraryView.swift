@@ -113,6 +113,9 @@ struct LibraryView: View {
     /// A Play pressed on that sheet, run once the sheet is down so the session never presents
     /// over a sheet that is still leaving.
     @State private var launchAfterDetails: String?
+    /// The title End Game is asking about, and what the host said when it refused.
+    @State private var endingGame: GameEntry?
+    @State private var endGameNotice: String?
     /// The shelf went behind a full-screen details page with its catalog loaded (tvOS).
     @State private var keptForDetail = false
 
@@ -201,6 +204,22 @@ struct LibraryView: View {
             #if os(iOS) || os(macOS)
             .modifier(TitleSearch(active: inTab, text: $search))
             #endif
+            .confirmationDialog(
+                endingGame.map { "End \($0.title)?" } ?? "",
+                isPresented: Binding(get: { endingGame != nil }, set: { if !$0 { endingGame = nil } }),
+                titleVisibility: .visible,
+                presenting: endingGame
+            ) { game in
+                Button("End Game", role: .destructive) { endGame(game) }
+            } message: { _ in
+                Text("Unsaved progress in the game is lost.")
+            }
+            .alert(
+                endGameNotice ?? "",
+                isPresented: Binding(get: { endGameNotice != nil }, set: { if !$0 { endGameNotice = nil } })
+            ) {
+                Button("OK", role: .cancel) {}
+            }
             #if os(tvOS)
             // A TV's sheet is a narrow card; the details want the screen.
             .fullScreenCover(item: $detailGame, onDismiss: launchPendingTitle) { detailSheet($0) }
@@ -671,6 +690,32 @@ struct LibraryView: View {
         if LinkClipboard.isAvailable {
             Button("Copy Link", systemImage: "link") { copyLink(game) }
         }
+        if canEnd(game) {
+            Button("End Game", systemImage: "xmark.circle", role: .destructive) { endingGame = game }
+        }
+    }
+
+    /// The host runs a launch of this device's of `game`, so it lets this device end it.
+    private func canEnd(_ game: GameEntry) -> Bool {
+        game.id != LibraryCollation.desktopID && running[game.id]?.endable == true
+    }
+
+    /// Ask the host to end `game`. Gone either way drops the badge; a refusal says why.
+    private func endGame(_ game: GameEntry) {
+        guard let identity = (try? ClientIdentityStore.shared.load())?.identity,
+              let pin = host.pinnedSHA256 else { return }
+        let current = host
+        Task {
+            let outcome = await LibraryClient.endGame(
+                appID: game.id, address: current.address, port: current.effectiveMgmtPort,
+                certPEM: identity.certPEM, keyPEM: identity.keyPEM, hostFingerprint: pin)
+            if outcome.gameGone {
+                running[game.id] = nil
+                nowPlayingStore.invalidate(current)
+            } else {
+                endGameNotice = outcome.notice(title: game.title)
+            }
+        }
     }
 
     private func playLabel(_ game: GameEntry) -> String {
@@ -688,6 +733,10 @@ struct LibraryView: View {
                 detailGame = nil
             },
             onCopyLink: LinkClipboard.isAvailable ? { copyLink(game) } : nil,
+            onEndGame: canEnd(game) ? {
+                detailGame = nil
+                endingGame = game
+            } : nil,
             host: host)
             #if os(iOS)
             .presentationDetents([.medium, .large])
@@ -957,8 +1006,8 @@ struct LibraryView: View {
         running = Dictionary(
             live.filter(\.isUp).compactMap { g in g.appID.map { ($0, g) } },
             // Two sessions can have the same title up (the host admits concurrent sessions); for a
-            // Resume badge either one is the same answer.
-            uniquingKeysWith: { first, _ in first })
+            // Resume badge either one is the same answer, and the endable one carries End Game.
+            uniquingKeysWith: { first, other in other.endable == true ? other : first })
         // The host cards read the same fact from the store; hand it this answer rather than
         // letting their TTL ask the host a second time for what we just fetched. It also carries
         // the entries no badge can: a launch the host cannot track has no id to key on.
