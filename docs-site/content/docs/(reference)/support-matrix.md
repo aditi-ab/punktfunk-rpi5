@@ -338,7 +338,7 @@ Either side can be the reason one of these didn't happen:
 | **Windows host** | An installer with its own display driver. Setup has a publicly trusted signature; the drivers carry Punktfunk's own, which setup trusts on install ([About the signatures](/docs/windows-host#about-the-signatures)). NVENC is well trodden; AMF and QSV see less field use. Runs in the signed-in console session, not session 0. |
 | **GameStream / Moonlight plane** | Works, and is off until you turn on **GameStream**. Pairs over plain HTTP — trusted LAN only ([Security](/docs/security#gamestream--moonlight-compatibility-is-the-weak-crypto-path)). Presets, links, clipboard and microphone aren't on it. |
 | **Linux and Windows desktop clients** | Packaged; one codebase with the Decky plugin and the CLI. Windows ships for x64 and ARM64. |
-| **Apple client** (macOS · iOS · iPadOS · tvOS) | One universal build on TestFlight; the Mac also has a notarized DMG. No microphone or clipboard on tvOS. |
+| **Apple client** (macOS · iOS · iPadOS · tvOS) | On the App Store for iPhone, iPad and Apple TV; the Mac has a notarized DMG. Betas for all four on TestFlight. No microphone or clipboard on tvOS. |
 | **Android client** (phone · TV) | Google Play, with canary builds on its beta track, plus a sideloadable APK. |
 | **Decky plugin** (Steam Deck) | Installed from a URL, not the Decky store; updates itself and the client it launches. It starts the Linux client rather than streaming itself. |
 | **Web console** | Manages the host: dashboard, sessions, pairing, library, displays, plugins, logs, stats, settings and updates. No speed test or bitrate setting — the client apps have those. |

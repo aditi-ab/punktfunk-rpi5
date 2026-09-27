@@ -180,6 +180,16 @@ final class SessionPresenter {
         if let env, let mode = WindowedPresentMode(rawValue: env) { return mode }
         return (setting ?? true) ? .transaction : .async
     }
+
+    /// Adaptive-refresh latency sessions choose immediate sparse presents or one dense present per
+    /// display-link target: on arrival, a 120 fps stream on a ProMotion panel loses about a tenth
+    /// to a fifth of its frames, PyroWave included. Smoothness and the other presenters keep their
+    /// own pacing mechanisms.
+    static func adaptiveSlotPaced(
+        adaptiveSync: Bool, priority: PresentPriority, pacing: PresentPacing
+    ) -> Bool {
+        adaptiveSync && priority == .latency && pacing == .arrival
+    }
     #endif
 
     /// `PUNKTFUNK_GATE_DEPTH` (1…3) still overrides on iOS/tvOS so the standing-queue ladder
@@ -251,6 +261,9 @@ final class SessionPresenter {
     /// one here is the "black bars + stretched" resize artifact. nil until the first frame → `layout`
     /// falls back to `currentMode()`. Main-thread only.
     private var contentSize: CGSize?
+    /// The screen verdict the running pipeline chose its pacing from, and its live source.
+    private var builtAdaptive = false
+    private var adaptiveSync: () -> Bool = { false }
 
     /// Start the resolved presenter for `connection`.
     ///
@@ -260,6 +273,7 @@ final class SessionPresenter {
     /// metering; deadline pacing owns a CAMetalDisplayLink instead.
     ///
     /// Call `layout(in:contentsScale:)` after start so any Metal sublayer has valid geometry.
+    /// `adaptiveSync` reads the hosting screen's fixed-vs-adaptive verdict on macOS, once per build.
     func start(
         connection: PunktfunkConnection,
         baseLayer: AVSampleBufferDisplayLayer,
@@ -268,11 +282,14 @@ final class SessionPresenter {
         onFrame: (@Sendable (AccessUnit) -> Void)?,
         onSessionEnd: (@Sendable () -> Void)?,
         onDecodedSize: (@Sendable (Int, Int) -> Void)? = nil,
-        onFrameHDR: (@Sendable (Bool) -> Void)? = nil
+        onFrameHDR: (@Sendable (Bool) -> Void)? = nil,
+        adaptiveSync: @escaping () -> Bool = { false }
     ) {
         stop()
         self.connection = connection
         self.baseLayer = baseLayer
+        self.adaptiveSync = adaptiveSync
+        builtAdaptive = adaptiveSync()
         restart = { [weak self] layer in
             guard let self else { return }
             // The Pencil reports proximity on its edges only, so the new pipeline is told here.
@@ -281,7 +298,7 @@ final class SessionPresenter {
                 connection: connection, baseLayer: layer, endToEndMeter: endToEndMeter,
                 makeDisplayLink: makeDisplayLink,
                 onFrame: onFrame, onSessionEnd: onSessionEnd, onDecodedSize: onDecodedSize,
-                onFrameHDR: onFrameHDR)
+                onFrameHDR: onFrameHDR, adaptiveSync: adaptiveSync)
             setInteractionBoost(boost)
         }
 
@@ -313,8 +330,11 @@ final class SessionPresenter {
             selectedPacing, priority: priority, videoLayerCompatible: !connection.isChroma444)
         #if os(macOS)
         let vsyncPaced = priority != .latency && pacing == .arrival
+        let adaptiveSlotPaced = Self.adaptiveSlotPaced(
+            adaptiveSync: builtAdaptive, priority: priority, pacing: pacing)
         #else
         let vsyncPaced = false
+        let adaptiveSlotPaced = false
         #endif
         if choice != .stage1,
            let pipeline = Stage2Pipeline(
@@ -324,7 +344,8 @@ final class SessionPresenter {
                gateDepth: Self.gateDepth(
                    env: ProcessInfo.processInfo.environment["PUNKTFUNK_GATE_DEPTH"]),
                storePolicy: priority.storePolicy,
-               vsyncPaced: vsyncPaced) {
+               vsyncPaced: vsyncPaced,
+               adaptiveSlotPaced: adaptiveSlotPaced) {
             pipeline.onPresentWedged = { [weak self] in
                 // The presenter lives on main; the hop only carries the reference back there.
                 nonisolated(unsafe) let presenter = self
@@ -566,6 +587,13 @@ final class SessionPresenter {
         let size = contentSize
         restart(layer)
         contentSize = size // the view drops the new pipeline's repeat of this size
+    }
+
+    /// The window moved to another screen. Pacing is chosen at build time, so rebuild (one IDR)
+    /// only when the fixed-vs-adaptive verdict flipped. Main thread.
+    func screenChanged() {
+        guard restart != nil, adaptiveSync() != builtAdaptive else { return }
+        restartPresentation()
     }
 
     /// `onPresentWedged`'s cure, hopped to MAIN: a fresh pipeline, presenter and CAMetalLayer on

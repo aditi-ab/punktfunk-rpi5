@@ -172,7 +172,7 @@ Removing a client doesn't unpair it: unpair the device in the host's
 | Windows installer | **Punktfunk** in **Settings → Apps → Installed apps**, or `& "$env:LOCALAPPDATA\Programs\Punktfunk\unins000.exe" /VERYSILENT`. Portable zip: delete the folder | `%APPDATA%\punktfunk` |
 | Windows MSIX | `Get-AppxPackage unom.Punktfunk \| Remove-AppxPackage` | `%APPDATA%\punktfunk`, if present |
 | macOS | Quit it and drag it from **Applications** to the Trash | — |
-| iPhone, iPad, Apple TV | Delete the app; to leave the beta, stop testing in **TestFlight** | — |
+| iPhone, iPad, Apple TV | Delete the app; if you joined the beta, stop testing in **TestFlight** | — |
 | Android, Android TV | Uninstall from Google Play or **Settings → Apps**; leave the testing program on the Play listing if you joined canary | — |
 | Steam Deck (Decky) | Uninstall **Punktfunk** from Decky's plugin list ([Steam Deck → Uninstalling](/docs/steam-deck#uninstalling)) | The Steam shortcuts, the Steam Input template, the client and `~/.config/punktfunk` |
 | LG webOS TV | Remove it from the TV's launcher; the community [`pf-webos`](https://github.com/dyptan-io/pf-webos) project handles the rest | — |

@@ -72,7 +72,7 @@ uninstalling are [/docs/updating](https://docs.punktfunk.unom.io/docs/updating) 
 | Streaming to… | Use |
 |---|---|
 | Mac | The **Apple app** — notarized DMG, or TestFlight |
-| iPhone, iPad, Apple TV | The **Apple app** on TestFlight |
+| iPhone, iPad, Apple TV | The **Apple app** on the [App Store](https://apps.apple.com/app/id6779991756) |
 | Linux desktop / laptop | **`punktfunk-client`** — Flatpak (any distro), or apt / rpm / pacman |
 | Steam Deck | The **Decky plugin** in Gaming Mode; the Flatpak in Desktop Mode |
 | Android phone or TV | The **Android app** on Google Play |
