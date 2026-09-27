@@ -1122,8 +1122,12 @@ object SkiaConsole {
                     NativeBridge.nativeWakeOnLan(kh.mac.joinToString(","), kh.address)
                     lastPacket = System.currentTimeMillis()
                 }
-                val online = Presence.isSelf(kh, NativeBridge.nativeProbe(kh.address, kh.port, 900)) ||
-                    discovered.any { kh.matches(it) }
+                // A probe, never the advert cache: a suspended host's advert outlives it.
+                val live = discovered.firstOrNull { kh.matches(it) }
+                val online = Presence.isSelf(
+                    kh,
+                    NativeBridge.nativeProbe(live?.host ?: kh.address, live?.port ?: kh.port, 900),
+                )
                 if (wakeGen.get() != gen) return@execute
                 NativeBridge.nativeConsoleSetWake(
                     handle,
