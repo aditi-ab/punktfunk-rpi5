@@ -132,16 +132,18 @@ final class StreamPump {
                             "video: received AUs but no decodable format (missing/unparsed parameter sets) — requesting an IDR until one seeds it"
                         )
                     }
-                    let failed = layer.status == .failed
+                    let failed = layer.status == .failed || layer.requiresFlushToResumeDecoding
                     if failed {
-                        // Decode wedged hard (the cold-first-connect case — a lost/corrupt opening
-                        // IDR): flush and, unless THIS AU is the recovering IDR (re-anchored above),
-                        // re-gate on the next in-band parameter sets and keep asking — enqueuing a
-                        // delta into a failed layer can't recover it.
-                        if !wasFailed { pumpLog.warning("video: display layer .failed — flushing + re-anchoring") }
+                        // Decode wedged (a lost opening IDR, or an iOS interruption that left the
+                        // layer ignoring samples): flush and, unless THIS AU is the recovering IDR,
+                        // re-gate on the next in-band parameter sets and keep asking.
+                        if !wasFailed { pumpLog.warning("video: display layer wedged — flushing + re-anchoring") }
                         layer.flush()
                         gate.arm() // a wedged decoder is a loss — freeze until the re-anchor
-                        if idrFormat == nil { pump.requireIDR() }
+                        if idrFormat == nil {
+                            pump.requireIDR()
+                            awaitingSince = Date()
+                        }
                     }
                     wasFailed = failed
                     // A delta between a loss and its re-anchor references the lost picture; one
