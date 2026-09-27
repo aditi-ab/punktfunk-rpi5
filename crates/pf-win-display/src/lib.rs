@@ -12,6 +12,9 @@
 
 #[cfg(target_os = "windows")]
 pub mod adl_emul;
+/// Typed per-target CCD packets behind one SAFETY proof.
+#[cfg(target_os = "windows")]
+mod ccd_info;
 #[cfg(target_os = "windows")]
 pub mod display_events;
 /// Bind display-config writes to the input desktop so a UAC / lock screen can't refuse them.

@@ -28,14 +28,9 @@ use std::mem::size_of;
 use windows::core::PCWSTR;
 use windows::Win32::Devices::Display::QUERY_DISPLAY_CONFIG_FLAGS;
 use windows::Win32::Devices::Display::{
-    DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes,
-    QueryDisplayConfig, SetDisplayConfig, DISPLAYCONFIG_2DREGION,
-    DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
-    DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
-    DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE,
-    DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO,
-    DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, DISPLAYCONFIG_MODE_INFO_TYPE_TARGET,
-    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_COMPONENT_VIDEO,
+    GetDisplayConfigBufferSizes, QueryDisplayConfig, SetDisplayConfig, DISPLAYCONFIG_2DREGION,
+    DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
+    DISPLAYCONFIG_MODE_INFO_TYPE_TARGET, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_COMPONENT_VIDEO,
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_COMPOSITE_VIDEO,
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED,
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EXTERNAL, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DVI,
@@ -44,10 +39,8 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SDI, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SDTVDONGLE,
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SVIDEO, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED,
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EXTERNAL, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_RATIONAL,
-    DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE, DISPLAYCONFIG_SDR_WHITE_LEVEL,
-    DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
-    DISPLAYCONFIG_TARGET_DEVICE_NAME, DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY, QDC_ALL_PATHS,
-    QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_FORCE_MODE_ENUMERATION,
+    DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE, DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY,
+    QDC_ALL_PATHS, QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_FORCE_MODE_ENUMERATION,
     SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
 };
 use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, POINTL};
@@ -58,6 +51,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 
 use punktfunk_core::Mode;
+
+use crate::ccd_info;
 
 // The identity + inventory types live in the platform-neutral `snapshot` module (WP8) so the
 // cache rules test everywhere; re-exported here so every existing `win_display::` path still works.
@@ -246,23 +241,14 @@ pub fn activate_target_path(key: CcdTargetKey) -> bool {
 /// until the OS activates the target into the desktop topology (needs a real WDDM GPU; on a
 /// GPU-less box this stays `None` even though ADD succeeded).
 pub fn resolve_gdi_name(key: CcdTargetKey) -> Option<String> {
+    let p = active_path(key)?;
+    ccd_info::source_gdi_name(p.sourceInfo.adapterId, p.sourceInfo.id)
+}
+
+/// The active CCD path driving `key`; `None` when the query fails or the target is inactive.
+fn active_path(key: CcdTargetKey) -> Option<DISPLAYCONFIG_PATH_INFO> {
     let (paths, _modes) = query_display_config(QDC_ONLY_ACTIVE_PATHS).ok()?;
-    for p in &paths {
-        if path_target_key(p) == key {
-            let mut src = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
-            src.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-            src.header.size = size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
-            src.header.adapterId = p.sourceInfo.adapterId;
-            src.header.id = p.sourceInfo.id;
-            // SAFETY: `header.size` is this struct's size_of; the OS may touch
-            // that many bytes. The local outlives this synchronous call.
-            if unsafe { DisplayConfigGetDeviceInfo(&mut src.header) } == 0 {
-                let name = String::from_utf16_lossy(&src.viewGdiDeviceName);
-                return Some(name.trim_end_matches('\u{0}').to_string());
-            }
-        }
-    }
-    None
+    paths.into_iter().find(|p| path_target_key(p) == key)
 }
 
 /// The virtual display's CURRENT active resolution `(width, height)` via the GDI/CCD API, or `None` if the
@@ -458,34 +444,21 @@ pub fn wait_target_departed(key: CcdTargetKey, ceiling: std::time::Duration) -> 
 /// (the HDR fullscreen independent-flip otherwise storms `ACCESS_LOST` → black); re-enable on return so
 /// WGC keeps HDR on the normal desktop. Returns true on a successful `DisplayConfigSetDeviceInfo`.
 pub fn set_advanced_color(key: CcdTargetKey, enable: bool) -> bool {
-    let Ok((paths, _modes)) = query_display_config(QDC_ONLY_ACTIVE_PATHS) else {
+    let Some(p) = active_path(key) else {
+        tracing::warn!(
+            target = %key,
+            "virtual-display advanced-color: target not in active paths"
+        );
         return false;
     };
-    for p in &paths {
-        if path_target_key(p) == key {
-            let mut s = DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE::default();
-            s.header.r#type = DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE;
-            s.header.size = size_of::<DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE>() as u32;
-            s.header.adapterId = p.targetInfo.adapterId;
-            s.header.id = p.targetInfo.id;
-            s.Anonymous.value = enable as u32; // bit 0 = enableAdvancedColor
-                                               // SAFETY: `header.size` is this struct's size_of; adapterId/id copied
-                                               // from the matched path. The OS reads that many bytes and retains nothing.
-            let rc = unsafe { DisplayConfigSetDeviceInfo(&s.header) };
-            tracing::debug!(
-                target = %key,
-                enable,
-                rc,
-                "virtual-display set advanced-color (HDR) state"
-            );
-            return rc == 0;
-        }
-    }
-    tracing::warn!(
+    let rc = ccd_info::set_advanced_color_state(p.targetInfo.adapterId, p.targetInfo.id, enable);
+    tracing::debug!(
         target = %key,
-        "virtual-display advanced-color: target not in active paths"
+        enable,
+        rc,
+        "virtual-display set advanced-color (HDR) state"
     );
-    false
+    rc == 0
 }
 
 /// `DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO` bits: 1 = advancedColorEnabled, 2 = wideColorEnforced.
@@ -503,24 +476,8 @@ fn hdr_active(bits: u32) -> bool {
 /// the capture loop's poller keeps the last known value, since reading a blip as "HDR off" used to cost
 /// an HDR session TWO spurious ring recreates (false, then true again a poll later).
 pub fn advanced_color_enabled(key: CcdTargetKey) -> Option<bool> {
-    let (paths, _modes) = query_display_config(QDC_ONLY_ACTIVE_PATHS).ok()?;
-    for p in &paths {
-        if path_target_key(p) == key {
-            let mut info = DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO::default();
-            info.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
-            info.header.size = size_of::<DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO>() as u32;
-            info.header.adapterId = p.targetInfo.adapterId;
-            info.header.id = p.targetInfo.id;
-            // SAFETY: `header.size` is this struct's size_of; the OS may touch
-            // that many bytes. The local outlives this synchronous call.
-            if unsafe { DisplayConfigGetDeviceInfo(&mut info.header) } == 0 {
-                // SAFETY: POD union — `value` overlays a same-sized bitfield.
-                return Some(hdr_active(unsafe { info.Anonymous.value }));
-            }
-            return None;
-        }
-    }
-    None
+    let p = active_path(key)?;
+    ccd_info::advanced_color_bits(p.targetInfo.adapterId, p.targetInfo.id).map(hdr_active)
 }
 
 /// Re-apply the current mode with `CDS_RESET` — a same-mode write is otherwise
@@ -904,11 +861,6 @@ fn output_tech_class(tech: DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY) -> (bool, &'st
     }
 }
 
-fn utf16z_str(buf: &[u16]) -> String {
-    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    String::from_utf16_lossy(&buf[..len])
-}
-
 /// Connected targets (`QDC_ALL_PATHS`, unique by adapter+id). Read-only CCD;
 /// can serialize on the display-config lock — keep it off the capture thread. Empty on a failed
 /// query; the actor ([`crate::display_events`]) uses [`target_inventory_checked`] to tell that
@@ -938,18 +890,11 @@ pub fn target_inventory_checked() -> Result<Vec<TargetInventory>, CcdError> {
             continue;
         }
         seen.push(key);
-        let mut req = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
-        req.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
-        req.header.size = size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
-        req.header.adapterId = t.adapterId;
-        req.header.id = t.id;
-        // SAFETY: `header.size` is this struct's size_of; the OS may touch
-        // that many bytes. The local outlives this synchronous call.
-        if unsafe { DisplayConfigGetDeviceInfo(&mut req.header) } != 0 {
+        let Some(name) = ccd_info::target_name(t.adapterId, t.id) else {
             continue; // no queryable monitor — nothing to attribute
-        }
-        let monitor_device_path = utf16z_str(&req.monitorDevicePath);
-        let (mut external_physical, mut tech) = output_tech_class(req.outputTechnology);
+        };
+        let monitor_device_path = name.device_path;
+        let (mut external_physical, mut tech) = output_tech_class(name.tech);
         // Our IddCx monitor claims HDMI; connector class would call it a panel.
         let ours = is_our_virtual_display(&monitor_device_path);
         if ours {
@@ -968,29 +913,8 @@ pub fn target_inventory_checked() -> Result<Vec<TargetInventory>, CcdError> {
                 p.sourceInfo.adapterId.LowPart,
                 p.sourceInfo.adapterId.HighPart,
             );
-            let mut ac = DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO::default();
-            ac.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
-            ac.header.size = size_of::<DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO>() as u32;
-            ac.header.adapterId = t.adapterId;
-            ac.header.id = t.id;
-            // SAFETY: `header.size` is this struct's size_of; the OS may touch that many bytes.
-            // The local outlives this synchronous call.
-            if unsafe { DisplayConfigGetDeviceInfo(&mut ac.header) } == 0 {
-                // SAFETY: POD union — `value` overlays a same-sized bitfield.
-                hdr = Some(hdr_active(unsafe { ac.Anonymous.value }));
-            }
-            let mut white = DISPLAYCONFIG_SDR_WHITE_LEVEL::default();
-            white.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
-            white.header.size = size_of::<DISPLAYCONFIG_SDR_WHITE_LEVEL>() as u32;
-            white.header.adapterId = t.adapterId;
-            white.header.id = t.id;
-            // SAFETY: `header.size` is this struct's size_of; the OS may touch that many bytes.
-            // The local outlives this synchronous call.
-            if unsafe { DisplayConfigGetDeviceInfo(&mut white.header) } == 0
-                && white.SDRWhiteLevel > 0
-            {
-                sdr_white_level = Some(white.SDRWhiteLevel);
-            }
+            hdr = ccd_info::advanced_color_bits(t.adapterId, t.id).map(hdr_active);
+            sdr_white_level = ccd_info::sdr_white_level(t.adapterId, t.id);
             // SAFETY: POD union — `modeInfoIdx` overlays a same-sized bitfield;
             // every bit pattern is valid. Bounds-checked index below.
             let idx = unsafe { p.sourceInfo.Anonymous.modeInfoIdx } as usize;
@@ -1005,16 +929,8 @@ pub fn target_inventory_checked() -> Result<Vec<TargetInventory>, CcdError> {
                     height = sm.height;
                 }
             }
-            let mut src = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
-            src.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-            src.header.size = size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
-            src.header.adapterId = p.sourceInfo.adapterId;
-            src.header.id = p.sourceInfo.id;
-            // SAFETY: `header.size` is this struct's size_of; the OS may write
-            // that many bytes. The local outlives this synchronous call.
-            if unsafe { DisplayConfigGetDeviceInfo(&mut src.header) } == 0 {
-                gdi_name = utf16z_str(&src.viewGdiDeviceName);
-            }
+            gdi_name = ccd_info::source_gdi_name(p.sourceInfo.adapterId, p.sourceInfo.id)
+                .unwrap_or_default();
         }
         // mHz keeps 59.94 distinct from 60 without a float.
         let refresh_mhz = match t.refreshRate.Denominator {
@@ -1028,7 +944,7 @@ pub fn target_inventory_checked() -> Result<Vec<TargetInventory>, CcdError> {
             external_physical,
             internal_panel: tech == "internal-panel",
             tech,
-            friendly: utf16z_str(&req.monitorFriendlyDeviceName),
+            friendly: name.friendly,
             monitor_device_path,
             ours,
             gdi_name,
@@ -1599,20 +1515,12 @@ pub fn active_scanline_target() -> Option<(u32, i32, u32, bool)> {
             p.sourceInfo.id,
             false,
         );
-        let mut req = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
-        req.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
-        req.header.size = size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
-        req.header.adapterId = p.targetInfo.adapterId;
-        req.header.id = p.targetInfo.id;
-        // SAFETY: `header.size` is this struct's size_of; the local outlives
-        // this synchronous call.
-        if unsafe { DisplayConfigGetDeviceInfo(&mut req.header) } != 0 {
-            fallback.get_or_insert(candidate);
-            continue;
-        }
-        if is_our_virtual_display(&utf16z_str(&req.monitorDevicePath)) {
-            fallback.get_or_insert(candidate);
-            continue;
+        match ccd_info::target_name(p.targetInfo.adapterId, p.targetInfo.id) {
+            Some(name) if !is_our_virtual_display(&name.device_path) => {}
+            _ => {
+                fallback.get_or_insert(candidate);
+                continue;
+            }
         }
         return Some((candidate.0, candidate.1, candidate.2, true));
     }
