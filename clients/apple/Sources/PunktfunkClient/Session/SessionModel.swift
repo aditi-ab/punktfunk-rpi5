@@ -321,7 +321,6 @@ final class SessionModel: ObservableObject {
     @Published private(set) var clipboardEnabled = false
     /// The host's last `ClipState.reason` (`CLIP_REASON_*`) — why an enable was refused
     /// (backend unavailable / policy disabled / …); 0 = OK.
-    @Published private(set) var clipboardReason: UInt8 = 0
 
     // MARK: - Per-client access (design/per-client-access.md §7)
 
@@ -979,7 +978,6 @@ final class SessionModel: ObservableObject {
         clipboardSync = nil
         #endif
         clipboardEnabled = false
-        clipboardReason = 0
         if let conn = connection {
             // Drain-thread teardown waits the pullers out and close() waits out in-flight
             // polls + joins the Rust worker threads — keep all of it off the main actor,
@@ -1264,14 +1262,11 @@ final class SessionModel: ObservableObject {
     #if !os(tvOS)
     /// Create + start the session's clipboard bridge and route its host acks into the published
     /// UI state. `ClipboardSync.start()` sends the enable; the host's `.state` answer flips
-    /// `clipboardEnabled` (or leaves it false with a `clipboardReason` the UI can explain).
+    /// `clipboardEnabled`, or leaves it false.
     private func startClipboardSync(_ conn: PunktfunkConnection) {
         let sync = ClipboardSync(connection: conn)
-        sync.onState = { [weak self] enabled, _, reason in
-            Task { @MainActor in
-                self?.clipboardEnabled = enabled
-                self?.clipboardReason = reason
-            }
+        sync.onState = { [weak self] enabled, _, _ in
+            Task { @MainActor in self?.clipboardEnabled = enabled }
         }
         sync.start()
         clipboardSync = sync
@@ -1287,7 +1282,6 @@ final class SessionModel: ObservableObject {
         if let sync = clipboardSync {
             clipboardSync = nil
             clipboardEnabled = false
-            clipboardReason = 0
             Task.detached { sync.stop() }
         } else if conn.hostSupportsClipboard, conn.canUseClipboard {
             startClipboardSync(conn)

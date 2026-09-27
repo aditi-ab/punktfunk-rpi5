@@ -260,8 +260,6 @@ public final class StreamLayerView: NSView {
     private var sentClientDraws: Bool?
     /// M3 hint tracking: edge-triggered so a manual ⌃⌥⇧M isn't fought — the override latch
     /// holds until the HOST's intent next changes.
-    private var lastHint: Bool?
-    private var hintOverride = false
     /// One-shot auto-engage request (stream start, trust confirmed) — attempted as soon
     /// as the view is in a window with real bounds, then dropped, so it can never fire
     /// surprisingly later (e.g. on a resize).
@@ -718,7 +716,6 @@ public final class StreamLayerView: NSView {
         // buttons (a spurious button-up ~200 ms into every press → broke window drags). Until
         // the host exposes a real pointer-LOCK signal (ClipCursor/raw-input, not visibility),
         // the mouse model is user-driven only (⌃⌥⇧M). The hint still rides the wire, unused.
-        _ = (lastHint, hintOverride)
     }
 
     /// Decode a forwarded straight-alpha RGBA shape into a CGImage + hotspot. The on-screen SIZE is
@@ -1000,8 +997,6 @@ public final class StreamLayerView: NSView {
                 streamInputLog.info("mouse-mode chord ignored: gamescope host is relative-only")
                 return
             }
-            // A manual flip outranks the standing host hint until the hint next CHANGES.
-            self.hintOverride = true
             self.setDesktopMouse(!self.desktopMouse, reappearAt: nil)
             streamInputLog.info("chord: mouse mode \(self.desktopMouse ? "desktop" : "capture", privacy: .public)")
         }

@@ -768,14 +768,6 @@ public final class PunktfunkConnection: @unchecked Sendable {
         _ = punktfunk_connection_live_pads(h, &mask)
         return mask
     }
-    /// Anything about this session's access differs from the everyday full-and-permanent —
-    /// the chip's visibility gate: full + permanent must look exactly like today. Compared
-    /// through ``normalizedGrants(_:)`` so an old host's pre-power full mask stays chipless.
-    public var accessIsLimited: Bool {
-        Self.normalizedGrants(accessGrants) & Self.grantAll != Self.grantAll
-            || accessExpiresInSeconds != 0
-    }
-
     /// The grant bit one wire input kind needs — the Swift mirror of core's exhaustive
     /// `classify` (keys → keyboard; mouse/scroll/touch → pointer; pads → gamepad), consulted
     /// by ``send(_:)``'s courtesy filter. An unknown/future kind maps to 0 — never granted —
