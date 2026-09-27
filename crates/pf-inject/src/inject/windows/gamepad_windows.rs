@@ -10,19 +10,14 @@
 //! Rumble is the reverse path: `XInputSetState` → driver `SET_STATE` into the section →
 //! [`GamepadManager::pump_rumble`] onto the 0xCA plane, matching Linux `EV_FF`.
 
-use super::gamepad_raii::{sw_create_cb, PadChannel, SwCreateCtx};
+use super::gamepad_raii::{
+    create_swdevice, DriverAttach, PadChannel, ProofTransport, SwDevice, SwDeviceProfile,
+};
 use crate::pad_slots::PadSlots;
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use punktfunk_core::input::{GamepadEvent, MAX_PADS};
-use std::ffi::c_void;
 use std::sync::atomic::{fence, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
-use windows::core::{w, GUID, PCWSTR};
-use windows::Win32::Devices::Enumeration::Pnp::{
-    SwDeviceClose, SwDeviceCreate, HSWDEVICE, SW_DEVICE_CREATE_INFO,
-};
-use windows::Win32::Foundation::{CloseHandle, E_FAIL, WAIT_OBJECT_0};
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 // Driver maps this same struct; `offset_of!` so a layout change is a compile error.
 use pf_driver_proto::gamepad::XusbShm;
@@ -55,101 +50,11 @@ fn xusb_hwid() -> &'static str {
     }
 }
 
-/// Spawn `pf_xusb_<index>` (hardware id `hwid`, enumerator `punktfunk`). XInput finds the
-/// device by `GUID_DEVINTERFACE_XUSB`, not VID/PID, so no USB compatible-ids — but
-/// `pContainerId` must be a deterministic non-null GUID: the null sentinel trips an
-/// `xinput1_4` slot-skip. `SwDeviceClose` on drop.
-fn create_swdevice(index: u8, hwid: &str) -> Result<(HSWDEVICE, Option<String>)> {
-    let hwids: Vec<u16> = hwid.encode_utf16().chain([0u16, 0u16]).collect();
-    let instid: Vec<u16> = format!("pf_xusb_{index}")
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let desc: Vec<u16> = "Punktfunk Virtual Xbox 360 (XUSB)"
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    // Driver reads Location as the pad index so it can poll `pfxusb-boot-<index>`.
-    // Buffer must outlive `SwDeviceCreate` (it does: we wait on the event).
-    let loc: Vec<u16> = format!("{index}")
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let container = GUID::from_values(0x5046_5855, 0x0000, 0x0000, [0, 0, 0, 0, 0, 0, 0, index]);
-
-    // SAFETY: zeroed then the fields we use are set; the buffers + container outlive the call.
-    let mut info: SW_DEVICE_CREATE_INFO = unsafe { std::mem::zeroed() };
-    info.cbSize = std::mem::size_of::<SW_DEVICE_CREATE_INFO>() as u32;
-    info.pszInstanceId = PCWSTR(instid.as_ptr());
-    info.pszzHardwareIds = PCWSTR(hwids.as_ptr());
-    info.pContainerId = &container;
-    info.pszDeviceDescription = PCWSTR(desc.as_ptr());
-    info.pszDeviceLocation = PCWSTR(loc.as_ptr());
-    info.CapabilityFlags = 0x0000_000B; // DriverRequired | SilentInstall | Removable
-
-    // SAFETY: a manual-reset, initially-unsignaled, unnamed event.
-    let event = unsafe { CreateEventW(None, true, false, PCWSTR::null())? };
-    // `result` starts as E_FAIL: a zeroed HRESULT is S_OK and would mask a wait timeout.
-    // Heap, not stack: a late callback after the 10 s wait must still write live memory.
-    // Timeout leaks the box and leaves the event open so that write/SetEvent is defined.
-    let ctx = Box::into_raw(Box::new(SwCreateCtx {
-        event,
-        result: E_FAIL,
-        instance_id: [0; 128],
-    }));
-    // SAFETY: info + buffers outlive the call; `ctx` is a live heap allocation outliving every path.
-    let hsw = match unsafe {
-        SwDeviceCreate(
-            w!("punktfunk"),
-            w!("HTREE\\ROOT\\0"),
-            &info,
-            None,
-            Some(sw_create_cb),
-            Some(ctx as *const c_void),
-        )
-    } {
-        Ok(h) => h,
-        Err(e) => {
-            // SAFETY: the call failed, so no callback is pending and `ctx` is ours to reclaim.
-            unsafe {
-                drop(Box::from_raw(ctx));
-                let _ = CloseHandle(event);
-            }
-            return Err(anyhow!("SwDeviceCreate(pf_xusb) failed: {e}"));
-        }
-    };
-    // SAFETY: event valid; block until PnP finishes enumerating, then check the callback result.
-    let wait = unsafe { WaitForSingleObject(event, 10_000) };
-    if wait != WAIT_OBJECT_0 {
-        // Timeout: leak `ctx` and leave `event` open (late callback).
-        // SAFETY: hsw is the handle SwDeviceCreate returned.
-        unsafe { SwDeviceClose(hsw) };
-        return Err(anyhow!(
-            "SwDeviceCreate(pf_xusb) enumeration callback never fired (10s) — PnP may be wedged"
-        ));
-    }
-    // SAFETY: the callback signalled, so nothing else will touch `ctx`/`event`;
-    // `ctx` came from `Box::into_raw` and is reclaimed exactly once here.
-    let ctx = unsafe {
-        let _ = CloseHandle(event);
-        Box::from_raw(ctx)
-    };
-    if ctx.result.is_err() {
-        // SAFETY: hsw is the handle SwDeviceCreate returned.
-        unsafe { SwDeviceClose(hsw) };
-        return Err(anyhow!(
-            "SwDeviceCreate(pf_xusb) enumeration failed: {:?}",
-            ctx.result
-        ));
-    }
-    Ok((hsw, ctx.instance_id()))
-}
-
 /// One virtual Xbox 360 pad: `pf_xusb_<index>` plus the sealed `XusbShm` channel.
 struct XusbWinPad {
-    _sw: Option<super::gamepad_raii::SwDevice>,
+    _sw: SwDevice,
     channel: PadChannel,
-    attach: super::gamepad_raii::DriverAttach,
+    attach: DriverAttach,
     packet: u32,
     last_rumble_seq: u32,
 }
@@ -169,19 +74,24 @@ impl XusbWinPad {
         }
         // `?` so PadSlots retries; a swallowed failure latched a phantom pad for the session.
         let hwid = xusb_hwid();
-        let (hsw, instance_id) = create_swdevice(index, hwid)?;
-        channel.bind_devnode(
-            index as u32,
-            instance_id.clone(),
-            super::gamepad_raii::ProofTransport::XusbIoctl,
-        );
-        let _sw = Some(super::gamepad_raii::SwDevice::new(hsw));
+        let (sw, instance_id) = create_swdevice(&SwDeviceProfile {
+            instance: &format!("pf_xusb_{index}"),
+            container_tag: 0x5046_5855, // "PFXU"
+            container_index: index,
+            hwid,
+            // XInput finds the device by `GUID_DEVINTERFACE_XUSB`, not VID/PID.
+            usb_vid_pid: None,
+            usb_mi: None,
+            description: "Punktfunk Virtual Xbox 360 (XUSB)",
+            enumerator: "punktfunk",
+        })?;
+        channel.bind_devnode(index as u32, instance_id.clone(), ProofTransport::XusbIoctl);
         // 1500 ms: EvtDeviceAdd publishes the pid immediately; miss and `service` keeps pumping.
         channel.deliver_eager(Duration::from_millis(1500));
         Ok(XusbWinPad {
-            _sw,
+            _sw: sw,
             channel,
-            attach: super::gamepad_raii::DriverAttach::new(
+            attach: DriverAttach::new(
                 hwid,
                 "pf_xusb.inf",
                 "C:\\Windows\\ServiceProfiles\\LocalService\\AppData\\Local\\Temp\\pfxusb-driver.log",

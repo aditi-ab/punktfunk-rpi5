@@ -13,114 +13,58 @@
 //! [`parse_steam_output`] reads the same wire shape as Linux. No gamepad-mode
 //! entry pulse — that gate is Linux-evdev only.
 
-use super::dualsense_windows::{
-    create_swdevice, driver_marks, publish_input, OutputDrain, SwDeviceProfile, OFF_DEVTYPE,
-    OFF_INPUT, OFF_OUT_RING_VER, OFF_PAD_INDEX, SHM_MAGIC, SHM_SIZE,
-};
-use super::gamepad_raii::PadChannel;
-use super::steam_proto::{
-    neutral_deck_report, parse_steam_output, DeckEncoder, SteamState, STEAM_REPORT_LEN,
-};
+use super::gamepad_raii::SwDeviceProfile;
+use super::pad_shm::ShmPad;
+use super::steam_proto::{neutral_deck_report, parse_steam_output, DeckEncoder, SteamState};
 use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::Result;
 use punktfunk_core::quic::RichInput;
-use std::time::Duration;
 
 /// INF hardware id. A package rename must not touch it
 /// (`dualsense_windows::tests::hwid_matches_inf`).
 pub(super) const DECK_HWID: &str = "pf_steamdeck";
 
 /// One virtual Deck: `SwDeviceCreate`'d `pf_deck_<index>` plus the sealed
-/// channel. Drop removes the devnode and both sections. `pub` because it is
-/// `PadProto::Pad`.
+/// channel. `pub` because it is `PadProto::Pad`.
 pub struct DeckWinPad {
-    /// Devnode RAII (`SwDeviceClose` on drop).
-    _sw: Option<super::gamepad_raii::SwDevice>,
-    channel: PadChannel,
-    attach: super::gamepad_raii::DriverAttach,
+    shm: ShmPad,
     enc: DeckEncoder,
-    /// v2.3 input-seqlock generation — see `publish_input`.
-    input_gen: u32,
-    /// Ring drain (v2.1+) or legacy latest-slot seq (old driver).
-    drain: OutputDrain,
 }
 
 impl DeckWinPad {
-    /// Stamp `device_type` first and magic last, then spawn `pf_deck_<index>`
-    /// with the `MI_02` USB identity Steam's promotion gate requires.
+    /// Spawn `pf_deck_<index>` with the `MI_02` USB identity Steam's promotion gate requires.
     fn open(index: u8) -> Result<DeckWinPad> {
-        let boot_name = pf_driver_proto::gamepad::pad_boot_name(index);
-        let mut channel = PadChannel::create(boot_name.clone(), SHM_SIZE)?;
-        let base = channel.data_base();
-        // SAFETY: base points at SHM_SIZE writable bytes; the OFF_* offsets are in range.
-        unsafe {
-            *base.add(OFF_DEVTYPE) = pf_driver_proto::gamepad::DEVTYPE_STEAMDECK;
-            std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, index as u32);
-            // Ring capability `2` = "this host drains the v2.2 long ring", stamped before the
-            // magic so the driver sees it on attach (see the DualSense open path + PadShm docs).
-            std::ptr::write_unaligned(base.add(OFF_OUT_RING_VER) as *mut u32, 2);
-            std::ptr::write_unaligned(
-                base.add(OFF_INPUT) as *mut [u8; STEAM_REPORT_LEN],
-                neutral_deck_report(),
-            );
-            std::ptr::write_unaligned(base as *mut u32, SHM_MAGIC);
-        }
-        let inst = format!("pf_deck_{index}");
-        let (hsw, instance_id) = create_swdevice(&SwDeviceProfile {
-            instance: &inst,
-            container_tag: 0x5046_4453, // "PFDS"
-            container_index: index,
-            hwid: DECK_HWID,
-            usb_vid_pid: "VID_28DE&PID_1205",
-            // Wired Deck controller interface. Without this the HID child has no MI_
-            // token, hidapi reports interface 0, and Steam never claims the pad.
-            usb_mi: Some(2),
-            description: "Punktfunk Virtual Steam Deck",
-            enumerator: "punktfunk",
-        })?; // Propagate — swallowing latches the slot to a pad with no devnode.
-        let (hsw, instance_id) = (Some(hsw), instance_id);
-        // Bind the DATA section to THIS devnode, not the pid the LocalService-writable
-        // mailbox names.
-        channel.bind_devnode(
-            index as u32,
-            instance_id.clone(),
-            super::gamepad_raii::ProofTransport::HidFeatureReport,
-        );
-        let _sw = hsw.map(super::gamepad_raii::SwDevice::new);
-        // The driver must read `device_type = 3` before hidclass asks for
-        // descriptors, or the pad enumerates as DualSense.
-        channel.deliver_eager(Duration::from_millis(1500));
+        let shm = ShmPad::open(
+            index,
+            pf_driver_proto::gamepad::DEVTYPE_STEAMDECK,
+            &neutral_deck_report(),
+            &SwDeviceProfile {
+                instance: &format!("pf_deck_{index}"),
+                container_tag: 0x5046_4453, // "PFDS"
+                container_index: index,
+                hwid: DECK_HWID,
+                usb_vid_pid: Some("VID_28DE&PID_1205"),
+                // Wired Deck controller interface. Without this the HID child has no MI_
+                // token, hidapi reports interface 0, and Steam never claims the pad.
+                usb_mi: Some(2),
+                description: "Punktfunk Virtual Steam Deck",
+                enumerator: "punktfunk",
+            },
+        )?;
         Ok(DeckWinPad {
-            _sw,
-            channel,
-            attach: super::gamepad_raii::DriverAttach::new(
-                "pf_steamdeck",
-                "pf_gamepad.inf", // one INF serves every identity
-                "C:\\Windows\\ServiceProfiles\\LocalService\\AppData\\Local\\Temp\\pf_gamepad-driver.log",
-                boot_name,
-                instance_id,
-            ),
+            shm,
             enc: DeckEncoder::default(),
-            input_gen: 0,
-            drain: OutputDrain::new(),
         })
     }
 
     fn write_state(&mut self, st: &SteamState) {
         let r = self.enc.encode(st);
-        // SAFETY: `data_base()` points at a live PAD_SHM_SIZE-byte section and `r` is the 64-byte
-        // Deck state frame.
-        unsafe { publish_input(self.channel.data_base(), &mut self.input_gen, &r) };
+        self.shm.publish(&r);
     }
 
     fn service(&mut self) -> (Option<(u16, u16)>, bool) {
-        self.channel.pump();
-        // SAFETY: the channel's section is live and SHM_SIZE bytes.
-        let (proto, rev) = unsafe { driver_marks(self.channel.data_base()) };
-        self.attach.observe_pad(proto, rev);
         let mut rumble = None;
-        let base = self.channel.data_base();
-        let resync = self.drain.drain(base, |bytes| {
+        let resync = self.shm.poll(|bytes, _| {
             // Last rumble-carrying report wins. `0x8F` trackpad-haptic reports
             // carry none and must not clear it.
             if let Some(r) = parse_steam_output(bytes).rumble {

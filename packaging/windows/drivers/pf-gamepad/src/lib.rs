@@ -518,11 +518,9 @@ fn publish_output(view: &pf_umdf_util::section::MappedView, bytes: &[u8], featur
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     view.write_bytes(OFF_OUTPUT, bytes);
     let seq = view.read_u32(OFF_OUT_SEQ).wrapping_add(1);
-    // Release, not a plain write: the host loads `out_seq` with Acquire specifically to order its
-    // copy of the report bytes after it (`dualsense_windows.rs`, "Acquire pairs with the driver's
-    // publish-then-bump store order"). An Acquire load pairs with a Release store and nothing
-    // else, so as a plain write this promised the host an ordering it never actually established —
-    // on a weakly-ordered core (ARM64) the fresh seq could arrive ahead of the bytes it announces.
+    // Release pairs with the host's Acquire load of `out_seq` (`pad_shm_ring.rs`), which orders
+    // its copy of the report bytes after it. A plain write lets an ARM64 host see the new seq
+    // before the bytes it announces.
     view.store_u32(OFF_OUT_SEQ, seq, Ordering::Release);
     let len = ring_len(view);
     if len != 0 {

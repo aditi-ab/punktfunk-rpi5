@@ -764,6 +764,15 @@ pub mod pad_gate;
 /// nowhere.
 #[path = "inject/pad_pool.rs"]
 pub mod pad_pool;
+/// One sealed-channel UMDF pad ([`pad_shm::ShmPad`]): section, devnode and attach watcher, shared
+/// by every Windows HID pad identity.
+#[cfg(target_os = "windows")]
+#[path = "inject/windows/pad_shm.rs"]
+mod pad_shm;
+/// Host half of a Windows pad's `PadShm` section: stamp order, input seqlock, output-ring
+/// reader. Raw pointers and atomics only, so its tests run on every OS.
+#[path = "inject/pad_shm_ring.rs"]
+mod pad_shm_ring;
 /// Virtual-pad slot table + create lifecycle ([`pad_slots::PadSlots`]): `Vec<Option<Pad>>`,
 /// `active_mask` unplug sweep, gate-checked create.
 ///
