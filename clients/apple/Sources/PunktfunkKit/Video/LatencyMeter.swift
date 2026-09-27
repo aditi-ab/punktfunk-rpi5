@@ -17,6 +17,9 @@ import Foundation
 public final class LatencyMeter: @unchecked Sendable {
     private let lock = NSLock()
     private var samplesUs: [Int64] = []
+    /// Window cap: 17 s at 240 Hz, far past a 1 Hz drain. A meter read only through
+    /// `latestSample` is never drained, and must not grow for the whole session.
+    private static let maxSamples = 4096
     private var skewCorrected = false
     /// The most recent sample and the instant it ended, for `latestSample(asOfNs:maxAgeMs:)` —
     /// a LEVEL, not a window, so `drain` deliberately leaves both alone.
@@ -46,7 +49,7 @@ public final class LatencyMeter: @unchecked Sendable {
         // overlay's clock-suspect warning is the core's; here they are only dropped.
         guard latNs > 0, latNs < 10_000_000_000 else { return }
         lock.lock()
-        samplesUs.append(latNs / 1000)
+        if samplesUs.count < Self.maxSamples { samplesUs.append(latNs / 1000) }
         latestNs = latNs
         latestAtNs = atNs
         if offsetNs != 0 { skewCorrected = true }
