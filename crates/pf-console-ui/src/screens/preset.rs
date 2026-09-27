@@ -79,16 +79,7 @@ impl PresetMenu {
             return None;
         }
         let (msg, pulse) = self.list.menu(ev, ITEMS.len());
-        if matches!(msg, ListMsg::Adjust(_)) {
-            return Some(MenuPulse::Boundary);
-        }
-        if !matches!(msg, ListMsg::Activate) {
-            if pulse.is_some() {
-                self.armed = false;
-            }
-            return pulse;
-        }
-        self.run(ITEMS[self.list.cursor], ctx, fx)
+        self.dispatch(msg, pulse, ctx, fx)
     }
 
     pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
@@ -96,10 +87,27 @@ impl PresetMenu {
         if matches!(msg, ListMsg::None) && pulse.is_none() {
             return false;
         }
-        if matches!(msg, ListMsg::Activate) {
-            self.run(ITEMS[self.list.cursor], ctx, fx);
-        }
+        self.dispatch(msg, pulse, ctx, fx);
         true
+    }
+
+    /// Shared by pad and pointer. Arming is per row: focus on any other row disarms Delete.
+    fn dispatch(
+        &mut self,
+        msg: ListMsg,
+        pulse: Option<MenuPulse>,
+        ctx: &mut Ctx,
+        fx: &mut Outbox,
+    ) -> Option<MenuPulse> {
+        let item = ITEMS[self.list.cursor];
+        if item != Item::Delete {
+            self.armed = false;
+        }
+        match msg {
+            ListMsg::Adjust(_) => Some(MenuPulse::Boundary),
+            ListMsg::None => pulse,
+            ListMsg::Activate => self.run(item, ctx, fx),
+        }
     }
 
     fn run(&mut self, item: Item, ctx: &mut Ctx, fx: &mut Outbox) -> Option<MenuPulse> {
@@ -691,5 +699,36 @@ mod tests {
         with_ctx(|ctx| s.menu(MenuEvent::Confirm, ctx, &mut fx));
         assert_eq!(fx.cmds, vec![ConsoleCmd::DeletePreset { id: "p1".into() }]);
         assert!(matches!(fx.nav, Some(Nav::Pop)));
+    }
+
+    /// A pointer press on another row disarms Delete, as a pad move off it does.
+    #[test]
+    fn a_press_on_another_row_disarms_delete() {
+        use crate::pointer::{Pointer, PointerKind};
+        let mut s = PresetMenu::new("p1".into(), "Couch".into());
+        let fonts = crate::theme::build_fonts().unwrap();
+        let mut surface = skia_safe::surfaces::raster_n32_premul((1280, 800)).unwrap();
+        let rect = Rect::from_xywh(0.0, 0.0, 1280.0, 800.0);
+        with_ctx(|ctx| s.render(surface.canvas(), rect, 1.0, 1.0 / 60.0, &fonts, ctx));
+        let mut fx = Outbox::default();
+        let mut tap = |s: &mut PresetMenu, row: usize| {
+            let r = s.list.row_rect(row).expect("the menu drew");
+            let p = Pointer {
+                x: f64::from(r.center_x()),
+                y: f64::from(r.center_y()),
+                kind: PointerKind::Press,
+            };
+            with_ctx(|ctx| s.pointer(p, ctx, &mut fx));
+        };
+        tap(&mut s, 3);
+        tap(&mut s, 0);
+        tap(&mut s, 3);
+        assert!(
+            !fx.cmds
+                .iter()
+                .any(|c| matches!(c, ConsoleCmd::DeletePreset { .. })),
+            "Edit in between: this Delete only arms"
+        );
+        assert!(s.armed);
     }
 }

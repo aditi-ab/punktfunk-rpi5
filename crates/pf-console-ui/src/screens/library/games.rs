@@ -844,8 +844,10 @@ impl CustomizeScreen {
     }
 
     fn save(rows: &[(Section, bool)], ctx: &mut Ctx) {
-        ctx.settings.library_sections = crate::library::stored_sections(rows);
-        ctx.store.save(ctx.settings);
+        ctx.write(|c| {
+            c.settings.library_sections = crate::library::stored_sections(rows);
+            true
+        });
     }
 
     pub(crate) fn menu(
@@ -1012,5 +1014,49 @@ mod tests {
             ctx.settings.library_sections,
             "recent,-desktops,favorites,launchers,collections,games"
         );
+    }
+
+    /// Sort, view, and Customize rebase before they save: a value another writer stored
+    /// after the console's last load survives each of them.
+    #[test]
+    fn library_writes_keep_another_writers_save() {
+        let library = crate::library::LibraryShared::default();
+        let store = crate::store::file_store();
+        let mut settings = pf_client_core::trust::Settings::default();
+        let mut ctx = Ctx {
+            hosts: &[],
+            library: &library,
+            settings: &mut settings,
+            store,
+            platform: crate::platform::Platform::Desktop,
+            screen: None,
+            pads: &[],
+            deck: false,
+            tv: false,
+            fallback_ui: false,
+            pyrowave_ok: true,
+            av1_ok: true,
+            device_name: "test",
+            t: 0.0,
+        };
+        let writes: [fn(&mut Ctx); 3] = [
+            |c| store_sort(crate::collate::SortKey::Title, c),
+            |c| store_view(LibraryView::Shelf, c),
+            |c| {
+                let mut s = CustomizeScreen::new();
+                s.menu(MenuEvent::Move(MenuDir::Left), c, &mut Outbox::default());
+            },
+        ];
+        for (i, write) in writes.into_iter().enumerate() {
+            let mut other = store.load();
+            other.bitrate_kbps = 7_000 + i as u32;
+            store.save(&other);
+            write(&mut ctx);
+            assert_eq!(store.load().bitrate_kbps, 7_000 + i as u32, "write {i}");
+        }
+        let saved = store.load();
+        assert_eq!(saved.library_sort, "title");
+        assert_eq!(saved.library_view, "shelf");
+        assert!(saved.library_sections.contains("-desktops"));
     }
 }

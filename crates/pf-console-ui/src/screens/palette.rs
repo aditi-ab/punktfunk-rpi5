@@ -45,14 +45,16 @@ impl PaletteScreen {
 
     fn apply(&mut self, ctx: &mut Ctx) -> Option<MenuPulse> {
         let id = PALETTES[self.cursor].id;
-        if ctx.settings.ui_palette == id {
-            return Some(MenuPulse::Boundary);
-        }
-        // Whole-file writer: rebase before mutate or another writer's store is reverted.
-        *ctx.settings = ctx.store.load();
-        ctx.settings.ui_palette = id.to_string();
-        ctx.store.save(ctx.settings);
-        Some(MenuPulse::Confirm)
+        let changed = ctx.write(|c| {
+            let changed = c.settings.ui_palette != id;
+            c.settings.ui_palette = id.to_string();
+            changed
+        });
+        Some(if changed {
+            MenuPulse::Confirm
+        } else {
+            MenuPulse::Boundary
+        })
     }
 
     fn step(&mut self, dir: MenuDir) -> Option<MenuPulse> {
