@@ -421,18 +421,10 @@ public final class GamepadCapture {
         for element in claimed {
             element.preferredSystemGestureState = .disabled
         }
-        // The Home/PS button (→ guide; the host maps it to the DualSense PS / Xbox guide bit,
-        // BTN_MODE on the virtual xpad — the Steam-overlay button). On iOS 26 the OS opens its
-        // Game Overlay for this press regardless of the gesture claim below (the app is
-        // LSApplicationCategoryType=games, which enrolls it); the sanctioned per-controller
-        // opt-out is the USER's iOS 27+ Home-button setting. TODO(iOS 27 SDK): read
-        // `GCControllerHomeButtonSettingsManager` and surface a one-time
-        // `openControllerHomeButtonSettings(for:)` deep-link so users can hand the button to
-        // the stream — the class is Swift-only and 27.0+, so it needs the Xcode 27 SDK to
-        // even compile. Until then hold-Select is the reliable route. Driven DIRECTLY from this
-        // handler's pressed value (not via buttonMask), because the legacy
-        // `extendedGamepad.buttonHome` is unreliable/often nil even when the physical element
-        // exists. On tvOS the element is absent (reserved) → nil, the whole block no-ops.
+        // Home/PS → the host's guide (the Steam-overlay button). On macOS/iOS 27 the OS honors
+        // the claim above only for apps under Home Button Overrides (or macOS with Home Button
+        // Actions off); Settings links there (`watchHomeButton`). Driven from this handler: the
+        // legacy `extendedGamepad.buttonHome` is often nil when the element exists. tvOS: nil.
         if let home = c.physicalInputProfile.buttons[GCInputButtonHome] {
             home.pressedChangedHandler = { [weak self, weak slot] _, _, pressed in
                 MainActor.assumeIsolated { if let self, let slot { self.sendGuide(slot, down: pressed) } }

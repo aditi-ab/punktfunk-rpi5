@@ -21,6 +21,7 @@
 #if os(iOS)
 import CoreHaptics
 #endif
+import GameController
 import PunktfunkKit
 import SwiftUI
 
@@ -1006,6 +1007,18 @@ extension SettingsView {
                     selection: scoped(SettingsFields.systemButtons))
                     .disabled(!effective.gamepadForwarding)
             }
+            #if !os(tvOS)
+            if homeButtonKept, !inPresetScope, effective.gamepadForwarding,
+               effective.systemButtonsForward, #available(macOS 27.0, iOS 27.0, *) {
+                described("The system keeps the Home button, so the host never sees it. Add "
+                    + "Punktfunk to Home Button Overrides.") {
+                    Button("Home Button Settings…") {
+                        try? GCControllerHomeButtonSettingsManager()
+                            .openControllerHomeButtonSettings(for: .customizeInAppAction)
+                    }
+                }
+            }
+            #endif
             described("Hold Select for the host's guide button; keep holding for its "
                 + "quick-access menu.",
                 field: "guide_gesture") {
@@ -1070,5 +1083,24 @@ extension SettingsView {
             Text("Applies from the next session.")
                 .settingsFooter()
         }
+        #if !os(tvOS)
+        .task(id: gamepads.controllers.isEmpty) { await watchHomeButton() }
+        #endif
     }
+
+    #if !os(tvOS)
+    /// Tracks whether the OS keeps the controller's Home press (macOS/iOS 27). An app listed under
+    /// Home Button Overrides reads `.defer`, and `GamepadCapture.attach`'s gesture claim then
+    /// hands the press to the stream. The setting reads only while a controller is connected.
+    func watchHomeButton() async {
+        guard #available(macOS 27.0, iOS 27.0, *), !gamepads.controllers.isEmpty else {
+            homeButtonKept = false
+            return
+        }
+        let settings = GCControllerHomeButtonSettingsManager()
+        let read = { (try? settings.controllerHomeButtonInAppAction.action) == .systemDefault }
+        homeButtonKept = read()
+        for await _ in settings.settingsUpdates { homeButtonKept = read() }
+    }
+    #endif
 }
