@@ -1,8 +1,6 @@
-// One-shot forward to the management API, for the handful of routes that need their own handler
-// (a password gate, a rewritten body) instead of the generic `/api/**` passthrough in
-// routes/api/[...].ts. Everything about how we talk upstream is identical to the passthrough:
-// server-side bearer injection, loopback-scoped TLS relaxation, and 401 → 502 so a host-token
-// misconfiguration can't bounce a logged-in user into a redirect loop.
+// Calls to the management API. Every one goes through `mgmtFetch`, and the `/api/**` passthrough
+// in routes/api/[...].ts shares its pieces: server-side bearer injection, the loopback TLS pin,
+// and 401 → 502 so a host-token misconfiguration can't bounce a logged-in user into a redirect loop.
 import {
 	createError,
 	type H3Event,
@@ -18,6 +16,63 @@ import { loopbackTls, mgmtToken, mgmtUrl } from "./auth";
  */
 export type AllFields<T> = { [K in keyof Required<T>]: T[K] | undefined };
 
+/** `Bearer <token>` for the management API. 503 when no token is configured: the host requires
+ * one, so an empty bearer would only bounce as 401. */
+export function mgmtBearer(): string {
+	const token = mgmtToken();
+	if (!token) {
+		throw createError({
+			statusCode: 503,
+			statusMessage:
+				"management token not configured (PUNKTFUNK_MGMT_TOKEN / ~/.config/punktfunk/mgmt-token)",
+		});
+	}
+	return `Bearer ${token}`;
+}
+
+/** 502 for the management API's 401. The session gate already passed, so a 401 is the host
+ * rejecting OUR token; relayed as-is it would send the browser to /login in a loop. */
+export function assertHostTokenAccepted(res: { status: number }): void {
+	if (res.status === 401) {
+		throw createError({
+			statusCode: 502,
+			statusMessage:
+				"management API rejected the host token (check PUNKTFUNK_MGMT_TOKEN)",
+		});
+	}
+}
+
+/**
+ * One call to `path` on the management API, with the host's bearer and the loopback TLS pin.
+ * Throws 503 with no token, and 502 when the host is unreachable or rejects the token: a dead
+ * host is not a console bug, and an escaped rejection would surface as a bare 500.
+ */
+export async function mgmtFetch(
+	path: string,
+	init: RequestInit = {},
+): Promise<Response> {
+	const base = mgmtUrl();
+	const headers = new Headers(init.headers);
+	headers.set("authorization", mgmtBearer());
+	let res: Response;
+	try {
+		// `tls` is a Bun.fetch extension, pinned per request and never process-wide.
+		res = await fetch(`${base}${path}`, {
+			...init,
+			headers,
+			...loopbackTls(base),
+		});
+	} catch (cause) {
+		throw createError({
+			statusCode: 502,
+			statusMessage: "management API unreachable",
+			cause,
+		});
+	}
+	assertHostTokenAccepted(res);
+	return res;
+}
+
 /** Forward a JSON body to `path` on the management API and relay the upstream response verbatim.
  * Omit `body` for a bodiless method (GET) — a read whose RESPONSE we rewrite. */
 export async function forwardJson(
@@ -26,43 +81,15 @@ export async function forwardJson(
 	method: string,
 	body?: unknown,
 ): Promise<string> {
-	const token = mgmtToken();
-	if (!token) {
-		setResponseStatus(event, 503);
-		setResponseHeader(event, "content-type", "application/json");
-		return JSON.stringify({ error: "management token not configured" });
-	}
-	const base = mgmtUrl();
-	const init: RequestInit = {
+	const upstream = await mgmtFetch(path, {
 		method,
-		headers: {
-			authorization: `Bearer ${token}`,
-			...(body === undefined ? {} : { "content-type": "application/json" }),
-		},
-		body: body === undefined ? undefined : JSON.stringify(body),
-	};
-	// Bun.fetch extension — pinned per request, never process-wide (see routes/api/[...].ts).
-	Object.assign(init, loopbackTls(base));
-	// A dead/unstarted host makes `fetch` reject. The generic passthrough answers 502 for that, so
-	// these routes must too — an unreachable upstream is not a console bug, and letting the
-	// rejection escape would surface it as a bare 500 "Server Error".
-	let upstream: Response;
-	try {
-		upstream = await fetch(`${base}${path}`, init);
-	} catch (cause) {
-		throw createError({
-			statusCode: 502,
-			statusMessage: "management API unreachable",
-			cause,
-		});
-	}
-	if (upstream.status === 401) {
-		throw createError({
-			statusCode: 502,
-			statusMessage:
-				"management API rejected the host token (check PUNKTFUNK_MGMT_TOKEN)",
-		});
-	}
+		...(body === undefined
+			? {}
+			: {
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify(body),
+				}),
+	});
 	setResponseStatus(event, upstream.status);
 	setResponseHeader(event, "content-type", "application/json");
 	return upstream.text();
