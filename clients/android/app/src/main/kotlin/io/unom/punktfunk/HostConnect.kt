@@ -180,7 +180,7 @@ private suspend fun dial(
             // this device will not open the rate — a rate the wire has committed to cannot be
             // rescued afterwards, so the fallback has to happen before the Hello.
             audioRateHz = audioRateHz, audioBits = audioBits,
-            // What this device can decode (H.264|HEVC always, AV1 when a real decoder exists) +
+            // What this device can decode (H.264 always; HEVC and AV1 when a real decoder exists) +
             // the soft codec preference (user choice, or the Automatic AV1 rule above) — the
             // host resolves the emitted codec from both.
             videoCodecs = codecBits, preferredCodec = preferredCodec, timeoutMs = timeoutMs,
