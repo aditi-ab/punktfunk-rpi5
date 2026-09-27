@@ -65,23 +65,16 @@ concurrency:
 on:
   push:
     branches: [main]
+    # The crate lines are the Windows host + tray build closure. scripts/ci/check-workflow-paths.py
+    # fails CI when one is missing, in either leg.
     paths:
       - 'crates/punktfunk-host/**'
       - 'crates/punktfunk-core/**'
       - 'crates/punktfunk-tray/**'
-      # The encode subsystem (split out in W6) + the vendored VPL dispatcher the `qsv` feature
-      # builds — without these, encoder changes only reached this workflow via Cargo.lock luck.
+      - 'crates/pf-bitstream/**'
       - 'crates/pf-encode/**'
-      # The Windows backends themselves (NVENC/AMF/QSV/PyroWave/MF + the `Encoder` trait),
-      # split out of pf-encode so the driver can host them. Missing here, a new or changed
-      # backend reached main with no Windows build — the same Cargo.lock-luck gap as below.
       - 'crates/pf-encode-win/**'
       - 'crates/libvpl-sys/**'
-      # …and the rest of the W6 subsystem crates this build compiles. pf-encode was listed while
-      # the crates it speaks (pf-frame's CapturedFrame/PixelFormat/dxgi vocabulary, pf-gpu's
-      # adapter selection, pf-zerocopy, pf-host-config) were not, so a change that broke the
-      # Windows host through one of THEM reached main with no Windows build at all — the same
-      # Cargo.lock-luck gap the two lines above were added to close.
       - 'crates/pf-frame/**'
       - 'crates/pf-gpu/**'
       - 'crates/pf-zerocopy/**'
@@ -91,8 +84,10 @@ on:
       - 'crates/pf-vdisplay/**'
       - 'crates/pf-inject/**'
       - 'crates/pf-paths/**'
+      - 'crates/pf-paths-win/**'
       - 'crates/pf-driver-proto/**'
       - 'crates/pf-clipboard/**'
+      - 'crates/pf-update-check/**'
       - 'crates/pyrowave-sys/**'
       - 'packaging/windows/**'
       - 'scripts/windows/**'
@@ -102,16 +97,14 @@ on:
       - 'Cargo.toml'
       - '.gitea/workflows/windows-host.yml'
     tags: ['v*']
-  # Same paths as the push leg, driving the lint-only `pr-lint` job below. Until this existed the
-  # workflow ran on `main` alone, so the Windows-only half of punktfunk-host, pf-encode-win,
-  # pf-inject, pf-win-display and pf-vdisplay's Windows arm first met a compiler AFTER merge —
-  # the hole four separate paths-list patches kept re-plugging one crate at a time.
-  # Keep this list in step with the push leg above; the comments there say why each entry is here.
+  # Same paths as the push leg, driving the lint-only `pr-lint` job below, so the Windows-only
+  # code meets a compiler before merge.
   pull_request:
     paths:
       - 'crates/punktfunk-host/**'
       - 'crates/punktfunk-core/**'
       - 'crates/punktfunk-tray/**'
+      - 'crates/pf-bitstream/**'
       - 'crates/pf-encode/**'
       - 'crates/pf-encode-win/**'
       - 'crates/libvpl-sys/**'
@@ -124,8 +117,10 @@ on:
       - 'crates/pf-vdisplay/**'
       - 'crates/pf-inject/**'
       - 'crates/pf-paths/**'
+      - 'crates/pf-paths-win/**'
       - 'crates/pf-driver-proto/**'
       - 'crates/pf-clipboard/**'
+      - 'crates/pf-update-check/**'
       - 'crates/pyrowave-sys/**'
       - 'packaging/windows/**'
       - 'scripts/windows/**'

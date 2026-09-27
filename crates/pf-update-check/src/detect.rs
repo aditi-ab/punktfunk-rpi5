@@ -199,6 +199,9 @@ pub fn classify(p: &Probe, product: Product) -> (InstallKind, Channel) {
 }
 
 /// One-line, copy-pastable "how to update" hint. No placeholders.
+///
+/// The apt and dnf hints upgrade every installed `punktfunk*` package, the set pf-update's
+/// one-click apply upgrades, so the console and plugin runner move with the host.
 pub fn update_command(kind: InstallKind, product: Product) -> String {
     let bin = product.binary();
     match (kind, product) {
@@ -220,10 +223,9 @@ pub fn update_command(kind: InstallKind, product: Product) -> String {
             format!("sudo rpm-ostree update --uninstall {bin} --install {bin}   (staged; reboot to finish)")
         }
         (InstallKind::Apt, _) => {
-            format!("sudo apt update && sudo apt install --only-upgrade {bin}")
+            r"sudo apt update && sudo apt install --only-upgrade $(dpkg-query -W -f='${Package}\n' 'punktfunk*')".into()
         }
-        (InstallKind::Dnf, Product::Host) => "sudo dnf upgrade punktfunk".into(),
-        (InstallKind::Dnf, Product::Client) => "sudo dnf upgrade punktfunk-client".into(),
+        (InstallKind::Dnf, _) => "sudo dnf upgrade 'punktfunk*'".into(),
         (InstallKind::Pacman, _) => "sudo pacman -Syu".into(),
         (InstallKind::SteamosSource, _) => {
             "bash ~/punktfunk/scripts/steamdeck/update.sh --pull".into()
@@ -356,9 +358,17 @@ mod tests {
     }
 
     #[test]
-    fn hints_are_product_specific() {
-        assert!(update_command(InstallKind::Apt, Product::Client).contains("punktfunk-client"));
-        assert!(update_command(InstallKind::Apt, Product::Host).contains("punktfunk-host"));
+    fn package_hints_upgrade_every_installed_punktfunk_package() {
+        for product in [Product::Host, Product::Client] {
+            assert_eq!(
+                update_command(InstallKind::Apt, product),
+                r"sudo apt update && sudo apt install --only-upgrade $(dpkg-query -W -f='${Package}\n' 'punktfunk*')"
+            );
+            assert_eq!(
+                update_command(InstallKind::Dnf, product),
+                "sudo dnf upgrade 'punktfunk*'"
+            );
+        }
         assert!(update_command(InstallKind::Flatpak, Product::Client).contains("flatpak update"));
     }
 }

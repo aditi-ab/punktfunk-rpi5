@@ -205,8 +205,14 @@ Write-Host "==> building punktfunk-setup-client ($triple) -> $wizTarget"
 $prevTarget = $env:CARGO_TARGET_DIR
 $env:CARGO_TARGET_DIR = $wizTarget
 Push-Location $repoRoot
+# windows-reactor-setup extracts the WinAppSDK runtime into ONE cache under LOCALAPPDATA,
+# keyed by package version only: whichever arch fills it first is what every later wizard
+# build stages. A cross-built wizard therefore gets a cache of its own.
+$prevLocal = $env:LOCALAPPDATA
+if ($Arch -ne 'x64') { $env:LOCALAPPDATA = Join-Path $OutDir "reactor-cache-$Arch" }
 & cargo build --release -p punktfunk-setup-win --target $triple
 $wizExit = $LASTEXITCODE
+$env:LOCALAPPDATA = $prevLocal
 if ($wizExit -eq 0 -and $triple -ne 'x86_64-pc-windows-msvc') {
     # The packer itself runs on the (x64) runner, whatever arch it packs for.
     & cargo build --release -p punktfunk-setup-win --bin punktfunk-setup-pack --target x86_64-pc-windows-msvc
