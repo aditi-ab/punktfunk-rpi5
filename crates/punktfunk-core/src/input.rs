@@ -909,4 +909,50 @@ mod tests {
             "{path} is stale: rerun with UPDATE_VECTORS=1"
         );
     }
+
+    /// `testdata/gamepad-button-vectors.json` names every wire button with its bit; the web
+    /// Controllers page and pf-inject read the same rows.
+    #[test]
+    fn gamepad_button_vectors_match_the_wire() {
+        use gamepad::*;
+        let wire = [
+            ("DPAD_UP", BTN_DPAD_UP),
+            ("DPAD_DOWN", BTN_DPAD_DOWN),
+            ("DPAD_LEFT", BTN_DPAD_LEFT),
+            ("DPAD_RIGHT", BTN_DPAD_RIGHT),
+            ("START", BTN_START),
+            ("BACK", BTN_BACK),
+            ("LS_CLICK", BTN_LS_CLICK),
+            ("RS_CLICK", BTN_RS_CLICK),
+            ("LB", BTN_LB),
+            ("RB", BTN_RB),
+            ("GUIDE", BTN_GUIDE),
+            ("A", BTN_A),
+            ("B", BTN_B),
+            ("X", BTN_X),
+            ("Y", BTN_Y),
+            ("PADDLE1", BTN_PADDLE1),
+            ("PADDLE2", BTN_PADDLE2),
+            ("PADDLE3", BTN_PADDLE3),
+            ("PADDLE4", BTN_PADDLE4),
+            ("TOUCHPAD", BTN_TOUCHPAD),
+            ("MISC1", BTN_MISC1),
+        ];
+        let raw = include_str!("../testdata/gamepad-button-vectors.json");
+        let file: serde_json::Value = serde_json::from_str(raw).expect("vector file parses");
+        let rows = file["buttons"].as_array().expect("buttons array");
+        let mut got: Vec<(&str, u32)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r["name"].as_str().unwrap(),
+                    r["bit"].as_u64().unwrap() as u32,
+                )
+            })
+            .collect();
+        got.sort_unstable();
+        let mut want = wire.to_vec();
+        want.sort_unstable();
+        assert_eq!(got, want);
+    }
 }

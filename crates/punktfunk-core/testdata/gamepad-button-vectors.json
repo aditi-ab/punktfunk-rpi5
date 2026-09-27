@@ -1,0 +1,26 @@
+{
+  "$comment": "The gamepad wire buttons (punktfunk_core::input::gamepad BTN_*): name, bit, the evdev name the Linux virtual pad reports and, where the generic pad emits it as a key, its evdev code (pf-inject BUTTON_MAP; the D-pad is a hat). Hand-written in log order; core, pf-inject and the web Controllers page test against it.",
+  "buttons": [
+    {"name": "A", "bit": 4096, "evdev": "BTN_SOUTH", "code": 304},
+    {"name": "B", "bit": 8192, "evdev": "BTN_EAST", "code": 305},
+    {"name": "X", "bit": 16384, "evdev": "BTN_NORTH", "code": 307},
+    {"name": "Y", "bit": 32768, "evdev": "BTN_WEST", "code": 308},
+    {"name": "LB", "bit": 256, "evdev": "BTN_TL", "code": 310},
+    {"name": "RB", "bit": 512, "evdev": "BTN_TR", "code": 311},
+    {"name": "BACK", "bit": 32, "evdev": "BTN_SELECT", "code": 314},
+    {"name": "START", "bit": 16, "evdev": "BTN_START", "code": 315},
+    {"name": "GUIDE", "bit": 1024, "evdev": "BTN_MODE", "code": 316},
+    {"name": "LS_CLICK", "bit": 64, "evdev": "BTN_THUMBL", "code": 317},
+    {"name": "RS_CLICK", "bit": 128, "evdev": "BTN_THUMBR", "code": 318},
+    {"name": "DPAD_UP", "bit": 1, "evdev": "BTN_DPAD_UP", "code": null},
+    {"name": "DPAD_DOWN", "bit": 2, "evdev": "BTN_DPAD_DOWN", "code": null},
+    {"name": "DPAD_LEFT", "bit": 4, "evdev": "BTN_DPAD_LEFT", "code": null},
+    {"name": "DPAD_RIGHT", "bit": 8, "evdev": "BTN_DPAD_RIGHT", "code": null},
+    {"name": "PADDLE1", "bit": 65536, "evdev": "BTN_TRIGGER_HAPPY5", "code": 708},
+    {"name": "PADDLE2", "bit": 131072, "evdev": "BTN_TRIGGER_HAPPY6", "code": 709},
+    {"name": "PADDLE3", "bit": 262144, "evdev": "BTN_TRIGGER_HAPPY7", "code": 710},
+    {"name": "PADDLE4", "bit": 524288, "evdev": "BTN_TRIGGER_HAPPY8", "code": 711},
+    {"name": "TOUCHPAD", "bit": 1048576, "evdev": "BTN_TOUCHPAD", "code": null},
+    {"name": "MISC1", "bit": 2097152, "evdev": "BTN_MISC1", "code": null}
+  ]
+}

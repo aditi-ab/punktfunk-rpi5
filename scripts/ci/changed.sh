@@ -67,7 +67,8 @@ classify() {
             case "$path" in
                 web/*|api/openapi.json|scripts/ci/retry.sh|clients/shared/library-id-vectors.json|\
                 crates/punktfunk-host/src/library/custom.rs|\
-                crates/punktfunk-core/testdata/grant-vectors.json)
+                crates/punktfunk-core/testdata/grant-vectors.json|\
+                crates/punktfunk-core/testdata/gamepad-button-vectors.json)
                     web=true
                     ;;
             esac
@@ -149,6 +150,8 @@ self_test() {
     check launch-kinds-host 'crates/punktfunk-host/src/library/custom.rs' \
         'rust=true rust_arm64=false web=true docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     check grant-vectors 'crates/punktfunk-core/testdata/grant-vectors.json' \
+        'rust=true rust_arm64=true web=true docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    check gamepad-button-vectors 'crates/punktfunk-core/testdata/gamepad-button-vectors.json' \
         'rust=true rust_arm64=true web=true docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     check openapi 'api/openapi.json' \
         'rust=true rust_arm64=false web=true docs_site=false sdk_plugin_kit=true decky_typecheck=false'
