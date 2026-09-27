@@ -5,13 +5,8 @@
 /// change fails here rather than on the platform CI cannot run.
 #[test]
 fn published_endpoint_line_parses_the_way_both_consumers_read_it() {
-    let dir = std::env::temp_dir().join(format!(
-        "pf-mgmt-endpoint-{}-{:p}",
-        std::process::id(),
-        &0u8 as *const u8
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = super::write_endpoint(&dir, 47991).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = super::write_endpoint(dir.path(), 47991).unwrap();
     assert_eq!(path.file_name().unwrap(), super::ENDPOINT_FILE);
 
     let contents = std::fs::read_to_string(&path).unwrap();
@@ -27,8 +22,6 @@ fn published_endpoint_line_parses_the_way_both_consumers_read_it() {
     assert!(!value.contains('='));
     // Loopback whatever the listener binds: a 0.0.0.0 bind must never be echoed as a LAN URL.
     assert!(value.starts_with("https://127.0.0.1:"));
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 use super::*;
@@ -48,31 +41,19 @@ use sha2::{Digest, Sha256};
 use std::sync::atomic::Ordering;
 use tower::ServiceExt;
 
-/// Unique temp dir for the access store; never the host config dir.
+/// The access store's dir, one per call; never the host config dir.
 fn test_access_dir() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "pf-mgmt-access-{}-{:p}",
-        std::process::id(),
-        &0u8 as *const u8
-    ))
+    crate::test_support::scratch()
 }
 
-/// Unique temp dir; never the host config dir.
+/// One dir per call; never the host config dir.
 fn test_client_logs_dir() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "pf-mgmt-clientlogs-{}-{:p}",
-        std::process::id(),
-        &0u8 as *const u8
-    ))
+    crate::test_support::scratch()
 }
 
-/// Unique temp dir; never the host config dir.
+/// One dir per call; never the host config dir.
 fn test_stats() -> Arc<crate::stats_recorder::StatsRecorder> {
-    crate::stats_recorder::StatsRecorder::new(std::env::temp_dir().join(format!(
-        "pf-mgmt-stats-{}-{:p}",
-        std::process::id(),
-        &0u8 as *const u8
-    )))
+    crate::stats_recorder::StatsRecorder::new(crate::test_support::scratch())
 }
 
 fn test_state() -> Arc<AppState> {
@@ -3629,7 +3610,7 @@ async fn events_stream_catch_up_filter_resume_tail_and_dropped() {
     use crate::events::EventKind;
     let _l = EVENTS_TEST_LOCK.lock().await;
     let app = test_app(test_state(), None);
-    let uniq = format!("evt-{}-{:p}", std::process::id(), &0u8 as *const u8);
+    let uniq = format!("evt-{}", std::process::id());
     let m1 = format!("{uniq}-one");
 
     crate::events::emit(EventKind::DisplayReleased { count: 424_242 });
