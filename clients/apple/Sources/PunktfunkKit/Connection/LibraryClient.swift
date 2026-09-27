@@ -538,12 +538,16 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
     private let port: UInt16
     private let identity: SecIdentity
     private let hostFingerprint: Data?
-    /// Third-party origins only. No delegate: these are ordinary public HTTPS URLs and get the
-    /// system's normal certificate validation. No URLCache either — `ArtCache` owns the disk
-    /// persistence, so a second unmanaged copy underneath it would be pure waste.
-    private let cdn: URLSession
+    /// Third-party origins only, with the system's normal certificate validation and no URLCache
+    /// (`ArtCache` owns persistence). Process-wide and never invalidated: a fetch that outlives
+    /// `close()` would otherwise create a task on a dead session, which raises.
+    private static let cdn: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.urlCache = nil
+        return URLSession(configuration: config)
+    }()
     /// nil when the caches directory is unavailable — then we simply always fetch.
-    private let cache = ArtCache.standard()
+    private var cache: ArtCache? { ArtCache.shared }
     /// One fetch per cache key at a time — the same entry shown in two sections must not fetch
     /// its art twice on a cold cache. Failures are deliberately not remembered.
     private let inflightLock = NSLock()
@@ -560,9 +564,6 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
         self.port = port
         self.identity = try LibraryClient.clientIdentity(certPEM: certPEM, keyPEM: keyPEM)
         self.hostFingerprint = hostFingerprint
-        let config = URLSessionConfiguration.default
-        config.urlCache = nil
-        self.cdn = URLSession(configuration: config)
     }
 
     /// Image bytes for one art URL, cached on disk after the first fetch. A miss propagates the
@@ -596,10 +597,9 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
         return data
     }
 
-    /// Release this host's pooled connections and the CDN session — call when the library screen
-    /// goes away, so we don't sit on open TLS sockets the user is finished with.
+    /// Release this host's pooled connections — call when the library screen goes away, so we
+    /// don't sit on open TLS sockets the user is finished with.
     public func close() async {
-        cdn.finishTasksAndInvalidate()
         await MgmtConnectionPool.shared.closeAll(
             matching: "\(MgmtTransport.unbracketed(address)):\(port):")
     }
@@ -636,7 +636,7 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
             if url.scheme?.lowercased() == "data" { return try Self.inlineBytes(url) }
             guard let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http"
             else { throw LibraryError.badArtURL }
-            let (bytes, response) = try await cdn.bytes(from: url)
+            let (bytes, response) = try await Self.cdn.bytes(from: url)
             guard let http = response as? HTTPURLResponse else { throw LibraryError.badArtURL }
             guard (200..<300).contains(http.statusCode) else {
                 throw LibraryError.http(http.statusCode)
