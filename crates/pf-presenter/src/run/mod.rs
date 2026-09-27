@@ -38,6 +38,7 @@ use punktfunk_core::quic::HdrMeta;
 use punktfunk_core::video_fit::{self, VideoFit};
 use sdl3::event::{DisplayEvent, Event, WindowEvent};
 use sdl3::keyboard::Mod;
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -426,6 +427,11 @@ struct StreamState {
     params: SessionParams,
 }
 
+/// The live stream's capture, once connected.
+fn capture_mut(stream: &mut Option<StreamState>) -> Option<&mut Capture> {
+    stream.as_mut().and_then(|s| s.capture.as_mut())
+}
+
 fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>> {
     let mut sh = Shell::open(opts, matches!(mode, ModeCtl::Browse(_)))?;
     let mut stream: Option<StreamState> = match &mut mode {
@@ -477,444 +483,13 @@ fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>> {
             sh.overlay.as_deref(),
         );
         for event in queued {
-            // Console UI sees input first: a consumed event never reaches capture/forwarding.
-            if let Some(o) = sh.overlay.as_mut() {
-                if o.handle_event(&event) {
-                    sh.scroll_routing.consumed(&event);
-                    continue;
-                }
-                // Mouse/touch: console hit-tests in its own pixel space. Consumed while
-                // the console is up; ignored while streaming (those belong to `Capture`).
-                if let Some(input) = overlay_pointer(&event, &sh.window) {
-                    if o.handle_pointer(input) {
-                        sh.scroll_routing.consumed(&event);
-                        continue;
-                    }
-                }
-            }
-            match event {
-                Event::Quit { .. } => {
-                    if let Some(st) = &mut stream {
-                        st.request_quit();
-                    }
-                    break 'main Some(Outcome::Ended(None));
-                }
-                Event::Window { win_event, .. } => match win_event {
-                    WindowEvent::FocusLost => {
-                        sh.scroll_routing.focus_lost();
-                        if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
-                            if cap.release(false) {
-                                sh.capture_off();
-                                tracing::info!("focus lost — input released");
-                            }
-                        }
-                        // Controllers go with keyboard and mouse. SDL already stops
-                        // delivering presses here, but nothing zeroed what the host still
-                        // believes is held — masking flushes it neutral.
-                        sh.focus_lost = true;
-                    }
-                    WindowEvent::FocusGained => {
-                        // Unlike capture, the controller mask has no "the user meant it"
-                        // variant — it only mirrors who owns the pad — so regaining focus
-                        // always lifts its half.
-                        sh.focus_lost = false;
-                        // An auto-release (Alt-Tab) undoes itself; a chord release stays
-                        // until the user opts in. With the ring up the grab waits for its close.
-                        if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
-                            if cap.should_reengage() && cap.engage() && !sh.ring_was_open {
-                                sh.capture_on(cap);
-                                tracing::info!("focus gained — input recaptured");
-                            }
-                        }
-                    }
-                    WindowEvent::PixelSizeChanged(..) | WindowEvent::Resized(..) => {
-                        // A driver that refuses the new size must not end the session.
-                        // A refused fullscreen swapchain costs the fullscreen, not the
-                        // stream: fall back to the geometry that was already working.
-                        // A windowed failure still propagates — no smaller state to fall back to.
-                        if let Err(e) = sh.presenter.recreate_swapchain(&sh.window) {
-                            if !sh.fullscreen {
-                                return Err(e);
-                            }
-                            tracing::warn!(
-                                error = format!("{e:#}"),
-                                "swapchain recreate failed — leaving fullscreen"
-                            );
-                            sh.fullscreen = false;
-                            if let Err(e) = sh.window.set_fullscreen(false) {
-                                tracing::warn!(error = %e, "fullscreen exit failed");
-                            }
-                            continue;
-                        }
-                        sh.presenter.present(
-                            &sh.window,
-                            FrameInput::Redraw,
-                            sh.overlay_frame.as_ref(),
-                        )?;
-                        // Match-window: restamp the debounce. The request fires once
-                        // ~400 ms pass with no further size events, never per drag-frame.
-                        if sh.opts.match_window.is_some() {
-                            if let Some(st) = stream.as_mut() {
-                                st.resize_pending = Some(Instant::now());
-                            }
-                        }
-                    }
-                    // Dragged to another monitor: latch grid and VRR verdict belong to
-                    // the old panel. A 60 Hz-seeded clock must not keep pacing a 144 Hz panel.
-                    WindowEvent::DisplayChanged(..) => {
-                        if let Some(st) = stream.as_mut() {
-                            st.relearn_grid(&sh.window);
-                        }
-                    }
-                    WindowEvent::Exposed => {
-                        sh.presenter.present(
-                            &sh.window,
-                            FrameInput::Redraw,
-                            sh.overlay_frame.as_ref(),
-                        )?;
-                    }
-                    _ => {}
-                },
-                // The panel's rate changed under the window (60 ↔ 165 Hz in the OS
-                // settings): no window event fires, and the grid describes the old rate.
-                Event::Display {
-                    display_event:
-                        DisplayEvent::CurrentModeChanged | DisplayEvent::DesktopModeChanged,
-                    display,
-                    ..
-                } if sh.window.get_display().is_ok_and(|d| d == display) => {
-                    if let Some(st) = stream.as_mut() {
-                        st.relearn_grid(&sh.window);
-                    }
-                }
-                // Windows never auto-repeats injected input, so a held key needs these.
-                // Chords and toggles below fire on the first press only.
-                Event::KeyDown {
-                    scancode: Some(sc),
-                    repeat: true,
-                    ..
-                } => {
-                    if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
-                        cap.on_key_repeat(sc);
-                    }
-                }
-                Event::KeyDown {
-                    keycode,
-                    scancode: Some(sc),
-                    keymod,
-                    repeat: false,
-                    ..
-                } => {
-                    let chord = keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD)
-                        && keymod.intersects(Mod::LALTMOD | Mod::RALTMOD)
-                        && keymod.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD);
-                    use sdl3::keyboard::{Keycode, Scancode};
-                    // The letter the layout prints on the key (AZERTY's Q sits on Scancode::A),
-                    // or the physical position for a layout that has no such letter.
-                    let key = |k: Keycode, s: Scancode| keycode == Some(k) || sc == s;
-                    if chord && key(Keycode::Q, Scancode::Q) {
-                        if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
-                            if cap.captured() {
-                                cap.release(true);
-                                sh.capture_off();
-                            } else if cap.engage() {
-                                sh.capture_on(cap);
-                            }
-                            tracing::info!(captured = cap.captured(), "chord: release/engage");
-                        }
-                        continue;
-                    }
-                    // Mouse model flip. Applies immediately when engaged; a released
-                    // stream just changes what the next engage does.
-                    if chord && key(Keycode::M, Scancode::M) {
-                        if let Some(st) = stream.as_mut() {
-                            let mut flipped = false;
-                            if let Some(cap) = st.capture.as_mut() {
-                                match cap.toggle_desktop() {
-                                    Some(desktop) => {
-                                        if cap.captured() {
-                                            sh.capture_on(cap);
-                                        }
-                                        flipped = true;
-                                        tracing::info!(desktop, "chord: mouse mode");
-                                    }
-                                    None => tracing::info!(
-                                        "chord: mouse mode — host has no absolute pointer \
-                                         (gamescope), staying captured"
-                                    ),
-                                }
-                            }
-                            // A manual flip outranks the standing hint until the host's
-                            // intent next changes (the hint edge clears this).
-                            if flipped {
-                                st.hint_override = true;
-                            }
-                        }
-                        continue;
-                    }
-                    if chord && key(Keycode::D, Scancode::D) {
-                        if let Some(st) = &mut stream {
-                            tracing::info!("chord: disconnect");
-                            st.request_quit();
-                            sh.capture_off();
-                        }
-                        continue;
-                    }
-                    if chord && key(Keycode::S, Scancode::S) {
-                        bump_stats_tier(&mut sh.stats_verbosity, &mut stream);
-                        tracing::info!(tier = ?sh.stats_verbosity, "chord: stats verbosity");
-                        continue;
-                    }
-                    // Quick-action ring at the window centre (a locked pointer has no
-                    // position worth opening at).
-                    if chord && key(Keycode::O, Scancode::O) {
-                        if let (Some(o), true) = (sh.overlay.as_mut(), stream.is_some()) {
-                            let (pw, ph) = sh.window.size_in_pixels();
-                            o.ring_input(RingInput::Toggle {
-                                x: pw as f32 / 2.0,
-                                y: ph as f32 / 2.0,
-                            });
-                        }
-                        continue;
-                    }
-                    // Mic mute — per session, never persisted. The uplink keeps running;
-                    // only sending stops. A session with no mic says so instead of
-                    // swallowing the chord.
-                    if chord && key(Keycode::V, Scancode::V) {
-                        if let Some(st) = &stream {
-                            match st.handle.mic.toggle() {
-                                Some(muted) => tracing::info!(muted, "chord: microphone mute"),
-                                None => tracing::info!(
-                                    "chord: microphone mute — this session streams no \
-                                     microphone (turn it on in Settings)"
-                                ),
-                            }
-                        }
-                        continue;
-                    }
-                    // F11 or Alt+Enter (some Fn layers send a media key for plain F11).
-                    let alt_enter =
-                        sc == Scancode::Return && keymod.intersects(Mod::LALTMOD | Mod::RALTMOD);
-                    if sc == Scancode::F11 || alt_enter {
-                        sh.fullscreen = !sh.fullscreen;
-                        tracing::debug!(fullscreen = sh.fullscreen, "fullscreen toggle");
-                        if let Err(e) = sh.window.set_fullscreen(sh.fullscreen) {
-                            tracing::warn!(error = %e, fullscreen = sh.fullscreen, "fullscreen toggle failed");
-                        }
-                        continue;
-                    }
-                    if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
-                        cap.on_key_down(sc);
-                    }
-                }
-                Event::KeyUp {
-                    scancode: Some(sc), ..
-                } => {
-                    if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
-                        cap.on_key_up(sc);
-                    }
-                }
-                Event::MouseMotion {
-                    x, y, xrel, yrel, ..
-                } => {
-                    if let Some(st) = stream.as_mut() {
-                        let video = st.last_video;
-                        // The echo of our own follow-warp is not the user moving.
-                        if Instant::now() >= st.warp_echo_until {
-                            st.last_user_motion = Instant::now();
-                        }
-                        if let Some(cap) = st.capture.as_mut() {
-                            if cap.desktop() {
-                                // Desktop model: window position through the placement.
-                                // Before the first decoded frame there is nothing to map
-                                // onto — dropped, like touch.
-                                if let Some(video) = video {
-                                    let (lw, lh) = sh.window.size();
-                                    let nx = x / lw.max(1) as f32;
-                                    let ny = y / lh.max(1) as f32;
-                                    cap.on_motion_abs(finger_to_frame(
-                                        sh.opts.video_fit,
-                                        sh.window.size_in_pixels(),
-                                        video,
-                                        nx,
-                                        ny,
-                                    ));
-                                }
-                            } else if st.touch_mouse.leaks(xrel, yrel) {
-                                // Gaming Mode touch-as-mouse: a leaked position, not a
-                                // delta — dropped, and said once.
-                                if st.touch_mouse.take_notice() {
-                                    tracing::warn!(
-                                        xrel,
-                                        yrel,
-                                        "Steam Input is replaying the touchscreen as a mouse — \
-                                         dropping the leaked positions"
-                                    );
-                                    st.session_notice = Some((
-                                        "Steam Input is sending the touchscreen as a mouse — \
-                                         pick the Punktfunk controller layout for touch"
-                                            .into(),
-                                        Instant::now(),
-                                    ));
-                                }
-                            } else {
-                                cap.on_motion(xrel, yrel);
-                            }
-                        }
-                    }
-                }
-                Event::MouseButtonDown { mouse_btn, .. } => {
-                    if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
-                        if !cap.captured() {
-                            // The engaging click is not forwarded. `engage` refuses when
-                            // access covers neither pointer nor keyboard — the click then
-                            // does nothing.
-                            if cap.engage() {
-                                sh.capture_on(cap);
-                            }
-                        } else {
-                            cap.on_button_down(mouse_btn);
-                        }
-                    }
-                }
-                Event::MouseButtonUp { mouse_btn, .. } => {
-                    if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
-                        cap.on_button_up(mouse_btn);
-                    }
-                }
-                Event::MouseWheel { x, y, .. } => {
-                    // The overlay consumes SDL wheels before native/fallback routing.
-                    sh.scroll_routing
-                        .wheel(stream.as_mut().and_then(|s| s.capture.as_mut()), x, y);
-                }
-                // Touchscreen fingers → the session's touch model. `x`/`y` are
-                // window-normalized; only DIRECT devices (an INDIRECT trackpad drives
-                // the mouse). A three-finger tap returns `cycle` → bump the stats tier.
-                Event::FingerDown {
-                    touch_id,
-                    finger_id,
-                    x,
-                    y,
-                    timestamp,
-                    ..
-                } => {
-                    if is_direct_touch(touch_id) {
-                        if let Some(st) = stream.as_mut() {
-                            if !st.touch_mouse.fingers_seen {
-                                tracing::info!(
-                                    touch_id,
-                                    "first touchscreen finger: direct touch reaches the client"
-                                );
-                            }
-                            st.touch_mouse.fingers_seen = true;
-                        }
-                        if ring_finger(&mut sh.overlay, &sh.window, FingerPhase::Down, x, y) {
-                            continue;
-                        }
-                        for act in dispatch_finger(
-                            FingerPhase::Down,
-                            &sh.window,
-                            &mut stream,
-                            finger_id,
-                            x,
-                            y,
-                            timestamp,
-                            sh.opts.video_fit,
-                        ) {
-                            on_touch_act(
-                                act,
-                                &mut sh.stats_verbosity,
-                                &mut stream,
-                                &mut sh.overlay,
-                            );
-                        }
-                    } else if let Some(st) = stream.as_mut() {
-                        // A finger from a device SDL does not call a touchscreen: ignored,
-                        // and said once — otherwise "touch arrived and was thrown away"
-                        // is indistinguishable from "no touch arrived".
-                        if !st.touch_mouse.indirect_seen {
-                            st.touch_mouse.indirect_seen = true;
-                            tracing::info!(
-                                touch_id,
-                                "finger from a non-direct touch device — ignored (a trackpad \
-                                 drives the mouse)"
-                            );
-                        }
-                    }
-                }
-                Event::FingerMotion {
-                    touch_id,
-                    finger_id,
-                    x,
-                    y,
-                    timestamp,
-                    ..
-                } => {
-                    if is_direct_touch(touch_id) {
-                        if ring_finger(&mut sh.overlay, &sh.window, FingerPhase::Move, x, y) {
-                            continue;
-                        }
-                        for act in dispatch_finger(
-                            FingerPhase::Move,
-                            &sh.window,
-                            &mut stream,
-                            finger_id,
-                            x,
-                            y,
-                            timestamp,
-                            sh.opts.video_fit,
-                        ) {
-                            on_touch_act(
-                                act,
-                                &mut sh.stats_verbosity,
-                                &mut stream,
-                                &mut sh.overlay,
-                            );
-                        }
-                    }
-                }
-                Event::FingerUp {
-                    touch_id,
-                    finger_id,
-                    x,
-                    y,
-                    timestamp,
-                    ..
-                } => {
-                    if is_direct_touch(touch_id) {
-                        // The lift also reaches the engine, so it never keeps a finger
-                        // that is gone.
-                        ring_finger(&mut sh.overlay, &sh.window, FingerPhase::Up, x, y);
-                        for act in dispatch_finger(
-                            FingerPhase::Up,
-                            &sh.window,
-                            &mut stream,
-                            finger_id,
-                            x,
-                            y,
-                            timestamp,
-                            sh.opts.video_fit,
-                        ) {
-                            on_touch_act(
-                                act,
-                                &mut sh.stats_verbosity,
-                                &mut stream,
-                                &mut sh.overlay,
-                            );
-                        }
-                    }
-                }
-                // FrameWake (and any other user event): pure wake-up — the frame drain
-                // runs this iteration either way.
-                Event::User { .. } => {}
-                other => sh.pump.handle_event(other),
+            if let ControlFlow::Break(outcome) = sh.on_event(&mut stream, event)? {
+                break 'main Some(outcome);
             }
         }
         // Native events forward only when capture owns the entire SDL batch.
-        sh.scroll_routing.finish(
-            stream.as_mut().and_then(|s| s.capture.as_mut()),
-            sh.overlay.as_deref(),
-        );
+        sh.scroll_routing
+            .finish(capture_mut(&mut stream), sh.overlay.as_deref());
         // Who owns the pad: capture, window focus, and Gaming Mode's overlay signal.
         // Edge-triggered so an open QAM does not re-flush the pads every iteration.
         #[cfg(target_os = "linux")]
@@ -932,7 +507,7 @@ fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>> {
         sh.pump.tick();
         // One coalesced MouseMove per iteration — pure motion must reach the host
         // without waiting for a click/key to flush it.
-        if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
+        if let Some(cap) = capture_mut(&mut stream) {
             cap.flush_motion();
         }
         // Drain forwarded cursor shape/state and drive the local OS cursor — only
@@ -1099,7 +674,7 @@ fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>> {
             // on the host without a flush. It also needs a pointer to aim with: under a lock
             // the cursor is hidden and every event carries the position the lock froze, so
             // capture hands the local one back while it is up and takes the window on close.
-            if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
+            if let Some(cap) = capture_mut(&mut stream) {
                 if ring_open {
                     cap.flush_held();
                 }
@@ -1133,7 +708,7 @@ fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>> {
             if in_gamescope() {
                 continue;
             }
-            if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
+            if let Some(cap) = capture_mut(&mut stream) {
                 if cap.release(true) {
                     sh.capture_off();
                 }
@@ -1500,7 +1075,7 @@ fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>> {
         }
         // Touch long-press: a still finger raises no SDL event, so the gesture engine
         // needs the clock — SDL ticks, the millisecond base the finger timestamps use.
-        if let Some(cap) = stream.as_mut().and_then(|st| st.capture.as_mut()) {
+        if let Some(cap) = capture_mut(&mut stream) {
             cap.tick(sdl3::timer::ticks() as f64);
         }
         let mut ring_cmds = Vec::new();

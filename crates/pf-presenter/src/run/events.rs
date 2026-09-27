@@ -1,6 +1,492 @@
 //! Input: SDL events into capture, touch into the gesture engine, and the pad mask.
 
 use super::*;
+use sdl3::keyboard::{Keycode, Scancode};
+
+impl Shell {
+    /// One SDL event: the console sees it first, then capture, touch, the chords and the
+    /// window. `Break` is the window closing.
+    pub(super) fn on_event(
+        &mut self,
+        stream: &mut Option<StreamState>,
+        event: Event,
+    ) -> Result<ControlFlow<Outcome>> {
+        // Console UI sees input first: a consumed event never reaches capture/forwarding.
+        if let Some(o) = self.overlay.as_mut() {
+            if o.handle_event(&event) {
+                self.scroll_routing.consumed(&event);
+                return Ok(ControlFlow::Continue(()));
+            }
+            // Mouse/touch: console hit-tests in its own pixel space. Consumed while
+            // the console is up; ignored while streaming (those belong to `Capture`).
+            if let Some(input) = overlay_pointer(&event, &self.window) {
+                if o.handle_pointer(input) {
+                    self.scroll_routing.consumed(&event);
+                    return Ok(ControlFlow::Continue(()));
+                }
+            }
+        }
+        match event {
+            Event::Quit { .. } => {
+                if let Some(st) = stream {
+                    st.request_quit();
+                }
+                return Ok(ControlFlow::Break(Outcome::Ended(None)));
+            }
+            Event::Window { win_event, .. } => self.on_window_event(stream, win_event)?,
+            // The panel's rate changed under the window (60 ↔ 165 Hz in the OS
+            // settings): no window event fires, and the grid describes the old rate.
+            Event::Display {
+                display_event: DisplayEvent::CurrentModeChanged | DisplayEvent::DesktopModeChanged,
+                display,
+                ..
+            } if self.window.get_display().is_ok_and(|d| d == display) => {
+                if let Some(st) = stream.as_mut() {
+                    st.relearn_grid(&self.window);
+                }
+            }
+            // Windows never auto-repeats injected input, so a held key needs these.
+            // Chords and toggles fire on the first press only.
+            Event::KeyDown {
+                scancode: Some(sc),
+                repeat: true,
+                ..
+            } => {
+                if let Some(cap) = capture_mut(stream) {
+                    cap.on_key_repeat(sc);
+                }
+            }
+            Event::KeyDown {
+                keycode,
+                scancode: Some(sc),
+                keymod,
+                repeat: false,
+                ..
+            } => self.on_key_down(stream, keycode, sc, keymod),
+            Event::KeyUp {
+                scancode: Some(sc), ..
+            } => {
+                if let Some(cap) = capture_mut(stream) {
+                    cap.on_key_up(sc);
+                }
+            }
+            Event::MouseMotion {
+                x, y, xrel, yrel, ..
+            } => self.on_mouse_motion(stream, x, y, xrel, yrel),
+            Event::MouseButtonDown { mouse_btn, .. } => {
+                if let Some(cap) = capture_mut(stream) {
+                    if !cap.captured() {
+                        // The engaging click is not forwarded. `engage` refuses when
+                        // access covers neither pointer nor keyboard — the click then
+                        // does nothing.
+                        if cap.engage() {
+                            self.capture_on(cap);
+                        }
+                    } else {
+                        cap.on_button_down(mouse_btn);
+                    }
+                }
+            }
+            Event::MouseButtonUp { mouse_btn, .. } => {
+                if let Some(cap) = capture_mut(stream) {
+                    cap.on_button_up(mouse_btn);
+                }
+            }
+            Event::MouseWheel { x, y, .. } => {
+                // The overlay consumes SDL wheels before native/fallback routing.
+                self.scroll_routing.wheel(capture_mut(stream), x, y);
+            }
+            Event::FingerDown {
+                touch_id,
+                finger_id,
+                x,
+                y,
+                timestamp,
+                ..
+            } => self.on_finger(
+                stream,
+                FingerPhase::Down,
+                touch_id,
+                finger_id,
+                x,
+                y,
+                timestamp,
+            ),
+            Event::FingerMotion {
+                touch_id,
+                finger_id,
+                x,
+                y,
+                timestamp,
+                ..
+            } => self.on_finger(
+                stream,
+                FingerPhase::Move,
+                touch_id,
+                finger_id,
+                x,
+                y,
+                timestamp,
+            ),
+            Event::FingerUp {
+                touch_id,
+                finger_id,
+                x,
+                y,
+                timestamp,
+                ..
+            } => self.on_finger(
+                stream,
+                FingerPhase::Up,
+                touch_id,
+                finger_id,
+                x,
+                y,
+                timestamp,
+            ),
+            // FrameWake (and any other user event): pure wake-up — the frame drain
+            // runs this iteration either way.
+            Event::User { .. } => {}
+            other => self.pump.handle_event(other),
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    fn on_window_event(
+        &mut self,
+        stream: &mut Option<StreamState>,
+        win_event: WindowEvent,
+    ) -> Result<()> {
+        match win_event {
+            WindowEvent::FocusLost => {
+                self.scroll_routing.focus_lost();
+                if let Some(cap) = capture_mut(stream) {
+                    if cap.release(false) {
+                        self.capture_off();
+                        tracing::info!("focus lost — input released");
+                    }
+                }
+                // Controllers go with keyboard and mouse. SDL already stops
+                // delivering presses here, but nothing zeroed what the host still
+                // believes is held — masking flushes it neutral.
+                self.focus_lost = true;
+            }
+            WindowEvent::FocusGained => {
+                // Unlike capture, the controller mask has no "the user meant it"
+                // variant — it only mirrors who owns the pad — so regaining focus
+                // always lifts its half.
+                self.focus_lost = false;
+                // An auto-release (Alt-Tab) undoes itself; a chord release stays
+                // until the user opts in. With the ring up the grab waits for its close.
+                if let Some(cap) = capture_mut(stream) {
+                    if cap.should_reengage() && cap.engage() && !self.ring_was_open {
+                        self.capture_on(cap);
+                        tracing::info!("focus gained — input recaptured");
+                    }
+                }
+            }
+            WindowEvent::PixelSizeChanged(..) | WindowEvent::Resized(..) => {
+                // A driver that refuses the new size must not end the session.
+                // A refused fullscreen swapchain costs the fullscreen, not the
+                // stream: fall back to the geometry that was already working.
+                // A windowed failure still propagates — no smaller state to fall back to.
+                if let Err(e) = self.presenter.recreate_swapchain(&self.window) {
+                    if !self.fullscreen {
+                        return Err(e);
+                    }
+                    tracing::warn!(
+                        error = format!("{e:#}"),
+                        "swapchain recreate failed — leaving fullscreen"
+                    );
+                    self.fullscreen = false;
+                    if let Err(e) = self.window.set_fullscreen(false) {
+                        tracing::warn!(error = %e, "fullscreen exit failed");
+                    }
+                    return Ok(());
+                }
+                self.presenter.present(
+                    &self.window,
+                    FrameInput::Redraw,
+                    self.overlay_frame.as_ref(),
+                )?;
+                // Match-window: restamp the debounce. The request fires once
+                // ~400 ms pass with no further size events, never per drag-frame.
+                if self.opts.match_window.is_some() {
+                    if let Some(st) = stream.as_mut() {
+                        st.resize_pending = Some(Instant::now());
+                    }
+                }
+            }
+            // Dragged to another monitor: latch grid and VRR verdict belong to
+            // the old panel. A 60 Hz-seeded clock must not keep pacing a 144 Hz panel.
+            WindowEvent::DisplayChanged(..) => {
+                if let Some(st) = stream.as_mut() {
+                    st.relearn_grid(&self.window);
+                }
+            }
+            WindowEvent::Exposed => {
+                self.presenter.present(
+                    &self.window,
+                    FrameInput::Redraw,
+                    self.overlay_frame.as_ref(),
+                )?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// A first press: one of the loop's own chords, else a key for the host.
+    fn on_key_down(
+        &mut self,
+        stream: &mut Option<StreamState>,
+        keycode: Option<Keycode>,
+        sc: Scancode,
+        keymod: Mod,
+    ) {
+        let Some(chord) = chord_of(keycode, sc, keymod) else {
+            if let Some(cap) = capture_mut(stream) {
+                cap.on_key_down(sc);
+            }
+            return;
+        };
+        match chord {
+            Chord::Capture => {
+                if let Some(cap) = capture_mut(stream) {
+                    if cap.captured() {
+                        cap.release(true);
+                        self.capture_off();
+                    } else if cap.engage() {
+                        self.capture_on(cap);
+                    }
+                    tracing::info!(captured = cap.captured(), "chord: release/engage");
+                }
+            }
+            // Mouse model flip. Applies immediately when engaged; a released
+            // stream just changes what the next engage does.
+            Chord::MouseModel => {
+                if let Some(st) = stream.as_mut() {
+                    let mut flipped = false;
+                    if let Some(cap) = st.capture.as_mut() {
+                        match cap.toggle_desktop() {
+                            Some(desktop) => {
+                                if cap.captured() {
+                                    self.capture_on(cap);
+                                }
+                                flipped = true;
+                                tracing::info!(desktop, "chord: mouse mode");
+                            }
+                            None => tracing::info!(
+                                "chord: mouse mode — host has no absolute pointer \
+                                 (gamescope), staying captured"
+                            ),
+                        }
+                    }
+                    // A manual flip outranks the standing hint until the host's
+                    // intent next changes (the hint edge clears this).
+                    if flipped {
+                        st.hint_override = true;
+                    }
+                }
+            }
+            Chord::Disconnect => {
+                if let Some(st) = stream {
+                    tracing::info!("chord: disconnect");
+                    st.request_quit();
+                    self.capture_off();
+                }
+            }
+            Chord::Stats => {
+                bump_stats_tier(&mut self.stats_verbosity, stream);
+                tracing::info!(tier = ?self.stats_verbosity, "chord: stats verbosity");
+            }
+            // Quick-action ring at the window centre (a locked pointer has no
+            // position worth opening at).
+            Chord::Ring => {
+                if let (Some(o), true) = (self.overlay.as_mut(), stream.is_some()) {
+                    let (pw, ph) = self.window.size_in_pixels();
+                    o.ring_input(RingInput::Toggle {
+                        x: pw as f32 / 2.0,
+                        y: ph as f32 / 2.0,
+                    });
+                }
+            }
+            // Mic mute — per session, never persisted. The uplink keeps running;
+            // only sending stops. A session with no mic says so instead of
+            // swallowing the chord.
+            Chord::Mic => {
+                if let Some(st) = stream {
+                    match st.handle.mic.toggle() {
+                        Some(muted) => tracing::info!(muted, "chord: microphone mute"),
+                        None => tracing::info!(
+                            "chord: microphone mute — this session streams no \
+                             microphone (turn it on in Settings)"
+                        ),
+                    }
+                }
+            }
+            Chord::Fullscreen => {
+                self.fullscreen = !self.fullscreen;
+                tracing::debug!(fullscreen = self.fullscreen, "fullscreen toggle");
+                if let Err(e) = self.window.set_fullscreen(self.fullscreen) {
+                    tracing::warn!(error = %e, fullscreen = self.fullscreen, "fullscreen toggle failed");
+                }
+            }
+        }
+    }
+
+    fn on_mouse_motion(
+        &mut self,
+        stream: &mut Option<StreamState>,
+        x: f32,
+        y: f32,
+        xrel: f32,
+        yrel: f32,
+    ) {
+        let Some(st) = stream.as_mut() else {
+            return;
+        };
+        let video = st.last_video;
+        // The echo of our own follow-warp is not the user moving.
+        if Instant::now() >= st.warp_echo_until {
+            st.last_user_motion = Instant::now();
+        }
+        let Some(cap) = st.capture.as_mut() else {
+            return;
+        };
+        if cap.desktop() {
+            // Desktop model: window position through the placement. Before the first
+            // decoded frame there is nothing to map onto — dropped, like touch.
+            if let Some(video) = video {
+                let (lw, lh) = self.window.size();
+                let nx = x / lw.max(1) as f32;
+                let ny = y / lh.max(1) as f32;
+                cap.on_motion_abs(finger_to_frame(
+                    self.opts.video_fit,
+                    self.window.size_in_pixels(),
+                    video,
+                    nx,
+                    ny,
+                ));
+            }
+        } else if st.touch_mouse.leaks(xrel, yrel) {
+            // Gaming Mode touch-as-mouse: a leaked position, not a delta — dropped,
+            // and said once.
+            if st.touch_mouse.take_notice() {
+                tracing::warn!(
+                    xrel,
+                    yrel,
+                    "Steam Input is replaying the touchscreen as a mouse — \
+                     dropping the leaked positions"
+                );
+                st.session_notice = Some((
+                    "Steam Input is sending the touchscreen as a mouse — \
+                     pick the Punktfunk controller layout for touch"
+                        .into(),
+                    Instant::now(),
+                ));
+            }
+        } else {
+            cap.on_motion(xrel, yrel);
+        }
+    }
+
+    /// Touchscreen fingers → the session's touch model. `x`/`y` are window-normalized;
+    /// only DIRECT devices (an INDIRECT trackpad drives the mouse). A three-finger tap
+    /// bumps the stats tier.
+    #[allow(clippy::too_many_arguments)]
+    fn on_finger(
+        &mut self,
+        stream: &mut Option<StreamState>,
+        phase: FingerPhase,
+        touch_id: u64,
+        finger_id: u64,
+        x: f32,
+        y: f32,
+        timestamp: u64,
+    ) {
+        if !is_direct_touch(touch_id) {
+            // A finger from a device SDL does not call a touchscreen: ignored, and said
+            // once — otherwise "touch arrived and was thrown away" is indistinguishable
+            // from "no touch arrived".
+            if let (FingerPhase::Down, Some(st)) = (phase, stream.as_mut()) {
+                if !st.touch_mouse.indirect_seen {
+                    st.touch_mouse.indirect_seen = true;
+                    tracing::info!(
+                        touch_id,
+                        "finger from a non-direct touch device — ignored (a trackpad \
+                         drives the mouse)"
+                    );
+                }
+            }
+            return;
+        }
+        if let (FingerPhase::Down, Some(st)) = (phase, stream.as_mut()) {
+            if !st.touch_mouse.fingers_seen {
+                tracing::info!(
+                    touch_id,
+                    "first touchscreen finger: direct touch reaches the client"
+                );
+            }
+            st.touch_mouse.fingers_seen = true;
+        }
+        // The lift also reaches the engine, so it never keeps a finger that is gone.
+        if ring_finger(&mut self.overlay, &self.window, phase, x, y) && phase != FingerPhase::Up {
+            return;
+        }
+        for act in dispatch_finger(
+            phase,
+            &self.window,
+            stream,
+            finger_id,
+            x,
+            y,
+            timestamp,
+            self.opts.video_fit,
+        ) {
+            on_touch_act(act, &mut self.stats_verbosity, stream, &mut self.overlay);
+        }
+    }
+}
+
+/// A key the loop answers itself instead of forwarding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Chord {
+    Capture,
+    MouseModel,
+    Disconnect,
+    Stats,
+    Ring,
+    Mic,
+    Fullscreen,
+}
+
+/// Ctrl+Alt+Shift with Q, M, D, S, O or V, and F11 or Alt+Enter for fullscreen (some Fn
+/// layers send a media key for plain F11). A letter matches the key the layout prints it
+/// on (AZERTY's Q sits on Scancode::A), or its position on a layout without that letter.
+pub(super) fn chord_of(keycode: Option<Keycode>, sc: Scancode, keymod: Mod) -> Option<Chord> {
+    let alt = keymod.intersects(Mod::LALTMOD | Mod::RALTMOD);
+    if alt
+        && keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD)
+        && keymod.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD)
+    {
+        let table = [
+            (Keycode::Q, Scancode::Q, Chord::Capture),
+            (Keycode::M, Scancode::M, Chord::MouseModel),
+            (Keycode::D, Scancode::D, Chord::Disconnect),
+            (Keycode::S, Scancode::S, Chord::Stats),
+            (Keycode::O, Scancode::O, Chord::Ring),
+            (Keycode::V, Scancode::V, Chord::Mic),
+        ];
+        if let Some(&(.., chord)) = table
+            .iter()
+            .find(|(k, s, _)| keycode == Some(*k) || sc == *s)
+        {
+            return Some(chord);
+        }
+    }
+    (sc == Scancode::F11 || (sc == Scancode::Return && alt)).then_some(Chord::Fullscreen)
+}
 
 pub(super) fn ui_wants_pad_mask(
     focus_lost: bool,
@@ -338,6 +824,44 @@ pub(super) const FOLLOW_SLACK_PX: i32 = 2;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Chords need all three modifiers and match by printed letter or by position; the
+    /// fullscreen keys need none.
+    #[test]
+    fn chords_match_by_letter_or_position_under_all_three_modifiers() {
+        let all = Mod::LCTRLMOD | Mod::RALTMOD | Mod::LSHIFTMOD;
+        assert_eq!(
+            chord_of(Some(Keycode::Q), Scancode::Q, all),
+            Some(Chord::Capture)
+        );
+        // AZERTY prints Q where QWERTY has A.
+        assert_eq!(
+            chord_of(Some(Keycode::Q), Scancode::A, all),
+            Some(Chord::Capture)
+        );
+        assert_eq!(chord_of(None, Scancode::M, all), Some(Chord::MouseModel));
+        for (k, s, c) in [
+            (Keycode::D, Scancode::D, Chord::Disconnect),
+            (Keycode::S, Scancode::S, Chord::Stats),
+            (Keycode::O, Scancode::O, Chord::Ring),
+            (Keycode::V, Scancode::V, Chord::Mic),
+        ] {
+            assert_eq!(chord_of(Some(k), s, all), Some(c));
+        }
+        assert_eq!(chord_of(Some(Keycode::A), Scancode::A, all), None);
+        let two = Mod::LCTRLMOD | Mod::LALTMOD;
+        assert_eq!(chord_of(Some(Keycode::Q), Scancode::Q, two), None);
+        assert_eq!(
+            chord_of(Some(Keycode::F11), Scancode::F11, Mod::NOMOD),
+            Some(Chord::Fullscreen)
+        );
+        let alt_enter = chord_of(Some(Keycode::Return), Scancode::Return, Mod::RALTMOD);
+        assert_eq!(alt_enter, Some(Chord::Fullscreen));
+        assert_eq!(
+            chord_of(Some(Keycode::Return), Scancode::Return, Mod::NOMOD),
+            None
+        );
+    }
 
     #[test]
     fn released_capture_masks_pads_until_capture_returns() {
