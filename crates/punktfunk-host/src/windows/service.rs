@@ -13,6 +13,7 @@
 //! Subcommands: `run` (SCM binPath), `install`/`uninstall`, `start`/`stop`/`restart`/`status`.
 //! Config: `%ProgramData%\punktfunk\host.env`. Logs: `%ProgramData%\punktfunk\logs\`.
 
+use crate::install::run_quiet;
 use anyhow::{bail, Context, Result};
 use std::ffi::{c_void, OsString};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -1788,17 +1789,6 @@ fn sc(args: &[&str]) -> Result<()> {
         bail!("sc {} failed ({status})", args.join(" "));
     }
     Ok(())
-}
-
-/// System32 path for a bare tool: `service install` runs elevated.
-fn run_quiet(cmd: &str, args: &[&str]) -> bool {
-    std::process::Command::new(crate::install::resolve_tool(cmd))
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 /// Boot-loop rollback after a host update. A fresh intent plus a crash-looping child that *is*
