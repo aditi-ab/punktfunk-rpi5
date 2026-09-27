@@ -878,6 +878,7 @@ object SkiaConsole {
                     c.optJSONObject("SendLogs")?.let(::sendLogs)
                     c.optJSONObject("SpeedTest")?.let(::speedTest)
                     c.optJSONObject("HostAction")?.let(::hostAction)
+                    c.optJSONObject("EndGame")?.let(::endGame)
                     c.optJSONObject("SaveHost")?.let(::saveHost)
                     c.optJSONObject("UpdateHost")?.let(::updateHost)
                     c.optJSONObject("ForgetHost")?.let(::forgetHost)
@@ -1080,6 +1081,24 @@ object SkiaConsole {
         ioPool.execute {
             val message = HostActions.invoke(id, addr, mgmt, fp, hostName, actionId, label)
             main.post { notice(message) }
+        }
+    }
+
+    /** End a title this device launched, say how it went, then re-read what the host runs. */
+    private fun endGame(c: JSONObject) {
+        val addr = c.optString("addr"); val mgmt = c.optInt("mgmt"); val fp = c.optString("fp_hex")
+        val appId = c.optString("app_id"); val title = c.optString("title")
+        val id = identity
+        if (id == null) {
+            notice(identityBlocked())
+            return
+        }
+        ioPool.execute {
+            val outcome = LibraryClient.endGame(addr, mgmt, id.certPem, id.privateKeyPem, fp, appId)
+            main.post {
+                notice(outcome.notice(title))
+                fetchLibrary(c, refreshOnly = true)
+            }
         }
     }
 

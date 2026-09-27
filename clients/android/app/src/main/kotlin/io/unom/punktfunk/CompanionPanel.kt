@@ -201,8 +201,10 @@ private fun StatsPage(lines: List<HudLine>, tier: StatsVerbosity, onTier: (Stats
 private fun ActionsPage(cfg: OverlayConfig, actions: RingActions, haptics: ConsoleHaptics) {
     val state = remember { RingState() }
     ExpireRingHint(state)
+    // End game only while this device's launch is on the stream: a dimmed tile says nothing.
+    val endGame = listOfNotNull(SlotId.EndGame.takeIf { actions.streamedGame() != null })
     val slots = ACTION_SLOTS + actions.hostActions().map { SlotId.Host(it.id) } +
-        cfg.shortcuts.map { SlotId.Shortcut(it.id) } + EXIT_SLOTS
+        cfg.shortcuts.map { SlotId.Shortcut(it.id) } + endGame + EXIT_SLOTS
     Box(Modifier.fillMaxSize()) {
         LazyVerticalGrid(
             GridCells.Adaptive(104.dp),

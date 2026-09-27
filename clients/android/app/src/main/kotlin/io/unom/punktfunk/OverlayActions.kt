@@ -18,6 +18,9 @@ import org.json.JSONObject
  *  [OverlayConfig.shortcuts] by id. */
 sealed class SlotId {
     object EndStream : SlotId()
+
+    /** End the game this device launched, then the stream. */
+    object EndGame : SlotId()
     object DisconnectLinger : SlotId()
     object TouchMode : SlotId()
     object Keyboard : SlotId()
@@ -44,6 +47,7 @@ sealed class SlotId {
     val id: String
         get() = when (this) {
             EndStream -> "end_stream"
+            EndGame -> "end_game"
             DisconnectLinger -> "disconnect_linger"
             TouchMode -> "touch_mode"
             Keyboard -> "keyboard"
@@ -63,6 +67,7 @@ sealed class SlotId {
         /** An id from the blob; `null` for one this build does not know (an empty slot). */
         fun parse(s: String): SlotId? = when (s) {
             "end_stream" -> EndStream
+            "end_game" -> EndGame
             "disconnect_linger" -> DisconnectLinger
             "touch_mode" -> TouchMode
             "keyboard" -> Keyboard
