@@ -234,7 +234,7 @@ final class ConsoleModel: ObservableObject, ConsoleViewDelegate {
         entry: StoredHost?, pin: StreamPreset?, presets: [StreamPreset], hosts: [StoredHost]
     ) -> String {
         var options: [String: Any] = [
-            "device_name": deviceName,
+            "device_name": DeviceName.current,
             "gpu_cache_bytes": gpuCacheBytes,
             // Every Apple platform keeps an interface to fall back to, so the console's own
             // off switch always has somewhere to land.
@@ -265,14 +265,6 @@ final class ConsoleModel: ObservableObject, ConsoleViewDelegate {
         return true
         #else
         return false
-        #endif
-    }
-
-    private static var deviceName: String {
-        #if canImport(UIKit)
-        return UIDevice.current.name
-        #else
-        return Host.current().localizedName ?? "Mac"
         #endif
     }
 
