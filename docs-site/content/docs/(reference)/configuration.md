@@ -307,6 +307,6 @@ clients wait until a slot frees. The limit isn't configurable.
 - **Which GPU** on a multi-GPU box: **Host → GPUs**. A pick there outranks `PUNKTFUNK_RENDER_NODE`
   and `PUNKTFUNK_RENDER_ADAPTER`.
 - **Event hooks and webhooks** — `hooks.json`: [Events & hooks](/docs/automation).
-- **Browser streaming** ports: [The browser client](/docs/running-as-a-service#the-browser-client-preview).
+- **Browser streaming** ports: [Browser Client](/docs/browser-client).
 - **Encoder prerequisites** — drivers and firmware: [Requirements](/docs/requirements).
 - **Client settings** — resolution, bitrate, codec, HDR: [Client settings](/docs/client-settings).
