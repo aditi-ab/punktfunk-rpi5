@@ -59,13 +59,7 @@ impl Shell {
             )? {
                 presented = true;
                 self.overlay_damage.video_presented(Instant::now());
-                let (import_us, submit_us) = self.presenter.last_timings();
-                st.win_import_us.push(import_us);
-                st.win_submit_us.push(submit_us);
-                let (fence_us, acquire_us, present_us) = self.presenter.last_waits();
-                st.win_fence_us.push(fence_us);
-                st.win_acquire_us.push(acquire_us);
-                st.win_present_us.push(present_us);
+                st.win.push(&self.presenter);
                 if self.opts.json_status && !st.ready_announced {
                     st.ready_announced = true;
                     emit(SessionLine::Ready);
@@ -75,14 +69,14 @@ impl Shell {
                     // samples arrive via `take_presented_samples` with a true on-glass stamp.
                     self.presenter.note_presented(pts_ns, decoded_ns);
                     st.gate.note_present(now_ns);
-                    st.win_out_max = st.win_out_max.max(self.presenter.presents_outstanding());
+                    st.win.out_max = st.win.out_max.max(self.presenter.presents_outstanding());
                 } else {
                     st.note_submitted(pts_ns, decoded_ns);
                 }
             }
         }
         // Close the overlay window once per second.
-        if st.win_start.elapsed() >= Duration::from_secs(1) {
+        if st.win.start.elapsed() >= Duration::from_secs(1) {
             self.close_present_window(st);
         }
         Ok(presented)
@@ -90,11 +84,7 @@ impl Shell {
 
     /// The 1 Hz close: the HUD window, the adaptive slot margin, and the presenter line.
     fn close_present_window(&self, st: &mut StreamState) {
-        let import = punktfunk_core::hud::Summary::of(&mut st.win_import_us);
-        let submit = punktfunk_core::hud::Summary::of(&mut st.win_submit_us);
-        let fence = punktfunk_core::hud::Summary::of(&mut st.win_fence_us);
-        let acquire = punktfunk_core::hud::Summary::of(&mut st.win_acquire_us);
-        let queue_present = punktfunk_core::hud::Summary::of(&mut st.win_present_us);
+        let [import, submit, fence, acquire, queue_present] = st.win.take_timings();
         // Drained once per window and shared by the HUD and the log line — a
         // second `take_counters` would read zeros.
         let (replaced, q_drop, q_dry) = st.store.take_counters();
@@ -109,11 +99,6 @@ impl Shell {
             gated,
             forced,
         };
-        st.win_import_us.clear();
-        st.win_submit_us.clear();
-        st.win_fence_us.clear();
-        st.win_acquire_us.clear();
-        st.win_present_us.clear();
         let (pace_ms, latch_ms) = close_window(
             st,
             &self.presenter,
@@ -121,15 +106,15 @@ impl Shell {
             replaced,
             self.stats_verbosity,
         );
-        st.win_start = Instant::now();
+        st.win.start = Instant::now();
         // Adaptive slot margin: start at 0 — a fixed lead is display tax — and
         // widen one step per window whose measured latch misses demand it.
         // One-way per stream.
-        if st.store.is_smoothing() && st.win_misses > 2 && st.margin_ns < MARGIN_MAX_NS {
+        if st.store.is_smoothing() && st.win.misses > 2 && st.margin_ns < MARGIN_MAX_NS {
             st.margin_ns = (st.margin_ns + MARGIN_STEP_NS).min(MARGIN_MAX_NS);
             tracing::info!(
                 margin_us = st.margin_ns / 1000,
-                misses = st.win_misses,
+                misses = st.win.misses,
                 "smoothness slot margin widened (measured latch misses)"
             );
         }
@@ -137,8 +122,8 @@ impl Shell {
         // frame went after decode and how evenly the glass stepped.
         if self.pacing_active {
             let cadence_health = st.pacer.health();
-            let shown: u32 = st.win_steps.iter().sum();
-            let mode_count = st.win_steps.iter().copied().max().unwrap_or(0);
+            let shown: u32 = st.win.steps.iter().sum();
+            let mode_count = st.win.steps.iter().copied().max().unwrap_or(0);
             // Spacings off the most common step, per mille of the window's presents.
             let judder = if shown > 0 {
                 u64::from(shown - mode_count) * 1000 / u64::from(shown)
@@ -154,10 +139,10 @@ impl Shell {
                 q_dry,
                 gated,
                 forced,
-                misses = st.win_misses,
-                out_max = st.win_out_max,
-                steps = ?st.win_steps,
-                busy = ?st.win_busy,
+                misses = st.win.misses,
+                out_max = st.win.out_max,
+                steps = ?st.win.steps,
+                busy = ?st.win.busy,
                 judder,
                 pace_ms,
                 latch_ms,
@@ -180,10 +165,7 @@ impl Shell {
                 "presenter window"
             );
         }
-        st.win_misses = 0;
-        st.win_out_max = 0;
-        st.win_steps = [0; 6];
-        st.win_busy = [0; 2];
+        st.win.reset_counts();
     }
 }
 
@@ -212,12 +194,12 @@ impl StreamState {
             if self.store.is_smoothing()
                 && s.displayed_ns.saturating_sub(s.submitted_ns) > period + self.margin_ns
             {
-                self.win_misses += 1;
+                self.win.misses += 1;
             }
             if self.last_displayed_ns != 0 && period > 0 {
                 let steps =
                     (s.displayed_ns.saturating_sub(self.last_displayed_ns) + period / 2) / period;
-                self.win_steps[(steps as usize).min(5)] += 1;
+                self.win.steps[(steps as usize).min(5)] += 1;
             }
             self.last_displayed_ns = s.displayed_ns;
             stamps.push(s.displayed_ns);
@@ -465,6 +447,80 @@ impl StreamState {
     }
 }
 
+/// One second of presents, closed into the HUD and the presenter line once a second.
+pub(super) struct PresentWindow {
+    /// Per present: D3D11 import lookup (0 off that lane) and `vkQueueSubmit` wall time,
+    /// for the presenter window line.
+    import_us: Vec<u32>,
+    submit_us: Vec<u32>,
+    /// Per present: the in-flight fence wait, `vkAcquireNextImageKHR`, `vkQueuePresentKHR`.
+    fence_us: Vec<u32>,
+    acquire_us: Vec<u32>,
+    present_us: Vec<u32>,
+    /// The overlay window (`NativeClient::hud`) closes here once a second.
+    start: Instant,
+    /// This window's latch misses (glass later than one panel period past submit plus
+    /// the applied lead). Adaptive margin's error signal.
+    misses: u32,
+    out_max: usize,
+    /// Consecutive on-glass spacings this window, in whole panel periods: `[0, 1, 2, 3, 4, 5+]`.
+    /// The mode is the expected step; everything else is judder.
+    steps: [u32; 6],
+    /// Non-blocking presents that came back busy this window: [fence, acquire].
+    busy: [u32; 2],
+}
+
+impl PresentWindow {
+    pub(super) fn new() -> PresentWindow {
+        PresentWindow {
+            import_us: Vec::with_capacity(256),
+            submit_us: Vec::with_capacity(256),
+            fence_us: Vec::with_capacity(256),
+            acquire_us: Vec::with_capacity(256),
+            present_us: Vec::with_capacity(256),
+            start: Instant::now(),
+            misses: 0,
+            out_max: 0,
+            steps: [0; 6],
+            busy: [0; 2],
+        }
+    }
+
+    /// The last present's wall times, from the presenter.
+    fn push(&mut self, presenter: &Presenter) {
+        let (import_us, submit_us) = presenter.last_timings();
+        self.import_us.push(import_us);
+        self.submit_us.push(submit_us);
+        let (fence_us, acquire_us, present_us) = presenter.last_waits();
+        self.fence_us.push(fence_us);
+        self.acquire_us.push(acquire_us);
+        self.present_us.push(present_us);
+    }
+
+    /// `[import, submit, fence, acquire, present]` over the window, cleared for the next.
+    fn take_timings(&mut self) -> [hud::Summary; 5] {
+        [
+            &mut self.import_us,
+            &mut self.submit_us,
+            &mut self.fence_us,
+            &mut self.acquire_us,
+            &mut self.present_us,
+        ]
+        .map(|v| {
+            let s = hud::Summary::of(v);
+            v.clear();
+            s
+        })
+    }
+
+    fn reset_counts(&mut self) {
+        self.misses = 0;
+        self.out_max = 0;
+        self.steps = [0; 6];
+        self.busy = [0; 2];
+    }
+}
+
 /// Display time against the frame's host capture stamp, in the host clock. `None` for a
 /// non-positive or implausible (10 s or more) figure, which the audio plane must not chase.
 fn e2e_ns(clock_offset_ns: i64, displayed_ns: u64, pts_ns: u64) -> Option<u64> {
@@ -586,7 +642,7 @@ impl StreamState {
                 due_ns,
             });
         }
-        self.win_busy[on as usize] += 1;
+        self.win.busy[on as usize] += 1;
         self.busy_on = on;
         self.busy_retry = true;
     }
@@ -645,7 +701,7 @@ impl StreamState {
         self.pacer.reset();
         // The slot margin was sized by the old panel's misses.
         self.margin_ns = 0;
-        self.win_misses = 0;
+        self.win.misses = 0;
         tracing::info!(
             refresh_hz = hz,
             "display changed — relearning the latch grid"

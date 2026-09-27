@@ -296,16 +296,8 @@ struct StreamState {
     /// OSD `HDR→SDR (raw)`: this lane showed PQ with no tone-map. Nothing sets it
     /// today — every lane goes through planar CSC. Kept so a future bypass can say so.
     hdr_untonemapped: bool,
-    /// Per present: D3D11 import lookup (0 off that lane) and `vkQueueSubmit` wall time,
-    /// for the presenter window line.
-    win_import_us: Vec<u32>,
-    win_submit_us: Vec<u32>,
-    /// Per present: the in-flight fence wait, `vkAcquireNextImageKHR`, `vkQueuePresentKHR`.
-    win_fence_us: Vec<u32>,
-    win_acquire_us: Vec<u32>,
-    win_present_us: Vec<u32>,
-    /// The overlay window (`NativeClient::hud`) closes here once a second.
-    win_start: Instant,
+    /// This second of presents: timings, latch misses, glass steps, busy retries.
+    win: PresentWindow,
     /// Last closed window, so a tier cycle re-renders at once rather than up to 1 s later.
     last_snap: Option<StatsSnapshot>,
     /// Latest decoder facts from the pump, and the integrity counters as of the last window.
@@ -337,15 +329,6 @@ struct StreamState {
     /// Smoothness slot-pick margin: starts 0 (a fixed lead is display tax), widens
     /// +500 µs per >2-miss window toward 2.5 ms.
     margin_ns: u64,
-    /// This window's latch misses (glass later than one panel period past submit plus
-    /// the applied lead). Adaptive margin's error signal.
-    win_misses: u32,
-    win_out_max: usize,
-    /// Consecutive on-glass spacings this window, in whole panel periods: `[0, 1, 2, 3, 4, 5+]`.
-    /// The mode is the expected step; everything else is judder.
-    win_steps: [u32; 6],
-    /// Non-blocking presents that came back busy this window: [fence, acquire].
-    win_busy: [u32; 2],
     /// What the held frame waits on. The fence paces the loop itself (the presenter waits
     /// it for a millisecond per pass), so the pass turns straight around and drains the
     /// channel first: a newer frame replaces the held one instead of queuing behind it.
