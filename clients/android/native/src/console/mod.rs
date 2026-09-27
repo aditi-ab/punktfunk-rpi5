@@ -12,19 +12,17 @@ mod egl;
 mod gpu;
 mod host;
 
-use host::{Cmd, ConsoleHost, Phase};
+use host::{Cmd, ConsoleHost};
 use jni::errors::LogErrorAndDefault;
 use jni::objects::{JByteArray, JObject, JString};
 use jni::sys::{jboolean, jfloat, jint, jlong};
 use jni::EnvUnowned;
 
 use crate::session::jni_guard;
-use pf_client_core::console::{PointerButton, PointerInput};
-use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuSample};
-use pf_console_ui::bridge::{CreateOptions, EntryJson, PadsJson, PresetJson};
+use pf_client_core::menu_nav::MenuSample;
+use pf_console_ui::bridge::{self, CreateOptions, EntryJson, MenuCode, PadsJson, PresetJson};
 use pf_console_ui::{
-    HostRow, Insets, Key, LibraryGame, LibraryPhase, PairPhase, Platform, SpeedPhase, Stale,
-    WakeStatus,
+    HostRow, Insets, LibraryGame, LibraryPhase, PairPhase, Platform, SpeedPhase, Stale, WakeStatus,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -61,6 +59,11 @@ fn host(handle: jlong) -> Option<Arc<ConsoleHost>> {
     crate::session::lock_recover(console_hosts())
         .get(&handle)
         .cloned()
+}
+
+/// A Kotlin `Int` code as the `u8` the bridge decoders read; out of range is unknown.
+fn code(v: jint) -> Option<u8> {
+    u8::try_from(v).ok()
 }
 
 fn remove_host(handle: jlong) -> Option<Arc<ConsoleHost>> {
@@ -283,28 +286,13 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleMenu
     event: jint,
 ) {
     jni_guard((), || {
-        let ev = match event {
-            0 => MenuEvent::Move(MenuDir::Up),
-            1 => MenuEvent::Move(MenuDir::Down),
-            2 => MenuEvent::Move(MenuDir::Left),
-            3 => MenuEvent::Move(MenuDir::Right),
-            4 => MenuEvent::Confirm,
-            5 => MenuEvent::Back,
-            6 => MenuEvent::Secondary,
-            7 => MenuEvent::Tertiary,
-            8 => MenuEvent::JumpBack,
-            9 => MenuEvent::JumpForward,
-            10 | 11 => {
-                if let Some(h) = host(handle) {
-                    h.shared.send(Cmd::Ok(event == 10));
-                }
-                return;
-            }
-            _ => return,
+        let (Some(h), Some(code)) = (host(handle), code(event).and_then(bridge::menu_code)) else {
+            return;
         };
-        if let Some(h) = host(handle) {
-            h.shared.send(Cmd::Menu(ev));
-        }
+        h.shared.send(match code {
+            MenuCode::Ok(down) => Cmd::Ok(down),
+            MenuCode::Menu(ev) => Cmd::Menu(ev),
+        });
     })
 }
 
@@ -323,36 +311,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsolePoin
     dy: jfloat,
 ) {
     jni_guard((), || {
-        let input = match kind {
-            0 => PointerInput::Move { x, y },
-            1 => PointerInput::Down {
-                x,
-                y,
-                button: PointerButton::Primary,
-                touch: false,
-            },
-            2 => PointerInput::Up {
-                x,
-                y,
-                button: PointerButton::Primary,
-            },
-            3 => PointerInput::Down {
-                x,
-                y,
-                button: PointerButton::Secondary,
-                touch: false,
-            },
-            4 => PointerInput::Wheel { x, y, dy },
-            5 => PointerInput::Cancel,
-            6 => PointerInput::Down {
-                x,
-                y,
-                button: PointerButton::Primary,
-                touch: true,
-            },
-            _ => return,
-        };
-        if let Some(h) = host(handle) {
+        let input = code(kind).and_then(|kind| bridge::pointer_code(kind, x, y, dy));
+        if let (Some(h), Some(input)) = (host(handle), input) {
             h.shared.send(Cmd::Pointer(input));
         }
     })
@@ -371,23 +331,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleKey(
     repeat: jboolean,
 ) {
     jni_guard((), || {
-        let key = match key {
-            0 => Key::Left,
-            1 => Key::Right,
-            2 => Key::Up,
-            3 => Key::Down,
-            4 => Key::Return,
-            5 => Key::Space,
-            6 => Key::Escape,
-            7 => Key::Backspace,
-            8 => Key::PageUp,
-            9 => Key::PageDown,
-            10 => Key::Tab,
-            11 => Key::Y,
-            12 => Key::X,
-            _ => return,
-        };
-        if let Some(h) = host(handle) {
+        if let (Some(h), Some(key)) = (host(handle), code(key).and_then(bridge::key_code)) {
             h.shared.send(Cmd::Key { key, shift, repeat });
         }
     })
@@ -426,16 +370,11 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleSess
         let Some(h) = host(handle) else {
             return Ok(());
         };
+        // Decoded on the render thread: `SessionPhase` borrows the message.
         let msg = message.try_to_string(env).unwrap_or_default();
-        let ph = match phase {
-            0 => Phase::Connecting,
-            1 => Phase::Streaming,
-            2 => Phase::Failed(msg),
-            3 => Phase::Ended((!msg.is_empty()).then_some(msg)),
-            4 => Phase::Reconnecting(msg),
-            _ => return Ok(()),
-        };
-        h.shared.send(Cmd::Phase(ph));
+        if let Some(phase) = code(phase) {
+            h.shared.send(Cmd::Phase(phase, msg));
+        }
         Ok(())
     })
     .resolve::<LogErrorAndDefault>()
@@ -674,11 +613,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleLibr
 ) {
     jni_guard((), || {
         if let Some(h) = host(handle) {
-            h.handles.library.set_stale(match stale {
-                1 => Stale::Waking,
-                2 => Stale::Offline,
-                _ => Stale::No,
-            });
+            h.handles
+                .library
+                .set_stale(code(stale).map_or(Stale::No, bridge::stale_code));
         }
     })
 }
