@@ -303,7 +303,13 @@ impl Screen {
             Screen::PresetMenu(s) => s.list.dip(),
             Screen::PresetName(s) => s.list.dip(),
             Screen::PresetEdit(s) => s.list.dip(),
-            _ => {}
+            Screen::ShortcutEditor(s) => {
+                if let Some(l) = s.pan_list() {
+                    l.dip()
+                }
+            }
+            Screen::RingEditor(s) => s.pan_list().dip(),
+            Screen::Players(_) | Screen::Licenses(_) | Screen::InputTest(_) => {}
         }
     }
 
