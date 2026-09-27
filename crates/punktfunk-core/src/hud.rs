@@ -93,24 +93,29 @@ pub struct Summary {
     pub p99_us: u32,
 }
 
+/// Percentile `pct` of an ascending, non-empty slice: rank `len * pct / 100`, clamped to the
+/// last sample. The rule every client stat uses.
+pub fn rank<T: Copy>(sorted: &[T], pct: usize) -> T {
+    sorted[(sorted.len() * pct / 100).min(sorted.len() - 1)]
+}
+
 impl Summary {
-    /// Sorts `samples` in place. Rank `len * p / 100`, the rule every client already used.
+    /// Sorts `samples` in place and ranks them with [`rank`].
     pub fn of(samples: &mut [u32]) -> Summary {
         let n = samples.len();
         if n == 0 {
             return Summary::default();
         }
         samples.sort_unstable();
-        let at = |p: usize| samples[(n * p / 100).min(n - 1)];
         let sum: u64 = samples.iter().map(|&s| u64::from(s)).sum();
         Summary {
             n: n.min(u32::MAX as usize) as u32,
             mean_us: (sum / n as u64) as u32,
             min_us: samples[0],
             max_us: samples[n - 1],
-            p50_us: samples[n / 2],
-            p95_us: at(95),
-            p99_us: at(99),
+            p50_us: rank(samples, 50),
+            p95_us: rank(samples, 95),
+            p99_us: rank(samples, 99),
         }
     }
 
@@ -1322,6 +1327,15 @@ fn standard_lines(s: &StatsSnapshot, tier: StatsVerbosity) -> Vec<HudLine> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rank_is_len_times_pct_clamped() {
+        let hundred: Vec<u32> = (0..100).collect();
+        assert_eq!(rank(&hundred, 50), 50);
+        assert_eq!(rank(&hundred, 99), 99);
+        assert_eq!(rank(&hundred, 100), 99);
+        assert_eq!(rank(&[7u32], 95), 7);
+    }
 
     fn sum(n: u32, p50_us: u32, p95_us: u32) -> Summary {
         Summary {
