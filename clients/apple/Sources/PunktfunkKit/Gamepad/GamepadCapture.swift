@@ -347,11 +347,20 @@ public final class GamepadCapture {
 
     /// Bring `slots` in line with the forwarded set: close any slot no longer wanted (flushing its
     /// held wire state and sending GamepadRemove first) and open any newly-forwarded controller into
-    /// its assigned wire index. A controller that stays forwarded keeps its slot untouched, so a
-    /// second pad connecting never disturbs the first. Mirrors pf-client-core's `reconcile_slots`.
+    /// its assigned wire index. A controller that stays forwarded on its index keeps its slot
+    /// untouched, so a second pad connecting never disturbs the first. Mirrors pf-client-core's
+    /// `reconcile_slots`.
+    ///
+    /// A slot whose index moved is closed and opened on the new one. Another window's session
+    /// start renumbers the pads, and the host's rumble and HID output are routed by index.
     private func reconcile(_ forwarded: [GamepadManager.DiscoveredController]) {
-        let wantIDs = Set(forwarded.map { ObjectIdentifier($0.controller) })
-        for slot in slots where !wantIDs.contains(ObjectIdentifier(slot.controller)) {
+        var wanted: [ObjectIdentifier: UInt32] = [:]
+        for dc in forwarded {
+            if let pad = manager.padIndex(for: dc) {
+                wanted[ObjectIdentifier(dc.controller)] = UInt32(pad)
+            }
+        }
+        for slot in slots where wanted[ObjectIdentifier(slot.controller)] != slot.pad {
             closeSlot(slot)
         }
         for dc in forwarded where !slots.contains(where: { $0.controller === dc.controller }) {
