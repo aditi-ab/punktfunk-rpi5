@@ -10,13 +10,6 @@ import VideoToolbox
 import XCTest
 @testable import PunktfunkKit
 
-/// Sendable holder for the values the (background-thread) decode callback writes.
-private final class FrameBox: @unchecked Sendable {
-    let lock = NSLock()
-    var frame: ReadyFrame?
-    var error: OSStatus?
-}
-
 final class VideoToolboxRoundTripTests: XCTestCase {
     private let width = 320
     private let height = 240
@@ -136,28 +129,7 @@ final class VideoToolboxRoundTripTests: XCTestCase {
         let au = AccessUnit(
             data: annexB, ptsNs: 42_000_000, frameIndex: 0, flags: 0, receivedNs: 41_000_000)
 
-        let box = FrameBox()
-        let done = DispatchSemaphore(value: 0)
-        let decoder = VideoDecoder(
-            onDecoded: { frame in
-                box.lock.lock(); box.frame = frame; box.lock.unlock()
-                done.signal()
-            },
-            onDecodeError: { status in
-                box.lock.lock(); box.error = status; box.lock.unlock()
-                done.signal()
-            })
-
-        XCTAssertTrue(decoder.decode(au: au, format: format), "frame submit should succeed")
-        XCTAssertEqual(done.wait(timeout: .now() + 10), .success, "the decode callback must fire")
-        decoder.reset()
-
-        box.lock.lock()
-        let frame = box.frame
-        let error = box.error
-        box.lock.unlock()
-        XCTAssertNil(error.map { "decode error \($0)" })
-        let ready = try XCTUnwrap(frame, "the async output callback must deliver a ReadyFrame")
+        let ready = try decodeOnce(au, format: format)
         let buffer = try XCTUnwrap(ready.pixelBuffer, "a VT decode delivers a .video frame")
         XCTAssertEqual(CVPixelBufferGetWidth(buffer), width)
         XCTAssertEqual(CVPixelBufferGetHeight(buffer), height)

@@ -1637,6 +1637,8 @@ impl NativeClient {
         }
     }
 
+    /// Queue one event. The input task drops a class the live grants refuse; the host
+    /// enforces the same mask.
     pub fn send_input(&self, ev: &InputEvent) -> Result<()> {
         self.input_tx.send(*ev).map_err(|_| PunktfunkError::Closed)
     }

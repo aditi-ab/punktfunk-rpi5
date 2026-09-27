@@ -15,6 +15,7 @@ use std::rc::Rc;
 
 use cros_codecs::codec::av1::parser::FrameHeaderObu;
 use cros_codecs::codec::av1::parser::ObuAction;
+use cros_codecs::codec::av1::parser::ObuType;
 use cros_codecs::codec::av1::parser::ParsedObu;
 use cros_codecs::codec::av1::parser::Parser;
 use cros_codecs::codec::av1::parser::SequenceHeaderObu;
@@ -632,6 +633,72 @@ impl Av1Planner {
     }
 }
 
+/// What an ISOBMFF `av1C` record and a colour description take from a sequence header.
+/// Colour codes are ITU-T H.273; 2 (unspecified) when the header codes none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SequenceInfo {
+    pub profile: u8,
+    /// Operating point 0's `seq_level_idx`.
+    pub level_idx0: u8,
+    /// Operating point 0's `seq_tier`.
+    pub tier0: u8,
+    pub high_bitdepth: bool,
+    pub twelve_bit: bool,
+    pub mono_chrome: bool,
+    pub subsampling_x: bool,
+    pub subsampling_y: bool,
+    pub chroma_sample_position: u8,
+    pub color_primaries: u8,
+    pub transfer_characteristics: u8,
+    pub matrix_coefficients: u8,
+    pub full_range: bool,
+    pub max_width: u32,
+    pub max_height: u32,
+}
+
+/// The first sequence header in `obus`, a low-overhead temporal unit or any run of sized
+/// OBUs. None when it carries none, or the walk hits a malformed OBU first.
+pub fn sequence_info(obus: &[u8]) -> Option<SequenceInfo> {
+    let mut parser = Parser::default();
+    let mut consumed = 0usize;
+    while consumed < obus.len() {
+        let obu = match parser.read_obu(&obus[consumed..]).ok()? {
+            ObuAction::Process(obu) => obu,
+            ObuAction::Drop(n) => {
+                consumed += n as usize;
+                continue;
+            }
+        };
+        consumed += obu.bytes_used;
+        if obu.header.obu_type != ObuType::SequenceHeader {
+            continue;
+        }
+        let ParsedObu::SequenceHeader(seq) = parser.parse_obu(obu).ok()? else {
+            return None;
+        };
+        let color = &seq.color_config;
+        let op0 = &seq.operating_points[0];
+        return Some(SequenceInfo {
+            profile: seq.seq_profile as u8,
+            level_idx0: op0.seq_level_idx,
+            tier0: op0.seq_tier,
+            high_bitdepth: color.high_bitdepth,
+            twelve_bit: color.twelve_bit,
+            mono_chrome: color.mono_chrome,
+            subsampling_x: color.subsampling_x,
+            subsampling_y: color.subsampling_y,
+            chroma_sample_position: color.chroma_sample_position as u8,
+            color_primaries: color.color_primaries as u8,
+            transfer_characteristics: color.transfer_characteristics as u8,
+            matrix_coefficients: color.matrix_coefficients as u8,
+            full_range: color.color_range,
+            max_width: u32::from(seq.max_frame_width_minus_1) + 1,
+            max_height: u32::from(seq.max_frame_height_minus_1) + 1,
+        });
+    }
+    None
+}
+
 fn picture_plan(
     header: &FrameHeaderObu,
     sequence: &SequenceHeaderObu,
@@ -719,6 +786,47 @@ mod tests {
                 Err(e) => println!("{i}: {e}"),
             }
         }
+    }
+
+    /// An SVT-AV1 320x180 keyframe's temporal delimiter and sequence-header OBU: Main, level 0,
+    /// 8-bit 4:2:0, no colour description, studio range. The Apple client's AV1Tests uses it too.
+    const SVT_KEY_HEAD: [u8; 15] = [
+        0x12, 0x00, 0x0a, 0x0b, 0x00, 0x00, 0x00, 0x04, 0x3c, 0xfe, 0xcc, 0x4a, 0xf9, 0x00, 0x40,
+    ];
+
+    #[test]
+    fn sequence_info_reads_what_av1c_needs() {
+        let want = SequenceInfo {
+            profile: 0,
+            level_idx0: 0,
+            tier0: 0,
+            high_bitdepth: false,
+            twelve_bit: false,
+            mono_chrome: false,
+            subsampling_x: true,
+            subsampling_y: true,
+            chroma_sample_position: 0,
+            color_primaries: 2,
+            transfer_characteristics: 2,
+            matrix_coefficients: 2,
+            full_range: false,
+            max_width: 320,
+            max_height: 180,
+        };
+        assert_eq!(sequence_info(&SVT_KEY_HEAD), Some(want), "a temporal unit");
+        assert_eq!(
+            sequence_info(&SVT_KEY_HEAD[2..]),
+            Some(want),
+            "the bare OBU"
+        );
+        for cut in 2..SVT_KEY_HEAD.len() {
+            assert_eq!(sequence_info(&SVT_KEY_HEAD[..cut]), None, "cut at {cut}");
+        }
+        let first = IvfIterator::new(AV1_25FPS).next().expect("a temporal unit");
+        assert!(
+            sequence_info(first).is_some(),
+            "the vendored vector's first unit"
+        );
     }
 
     /// Vendored 25 fps conformance vector. Driven through the planner; the

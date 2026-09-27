@@ -1,7 +1,6 @@
-// The Apple half of the shared de-jitter policy (`punktfunk_core::audio::JitterPolicy`, whose
-// constants `AudioRing` mirrors). These pin the two behaviours a listener actually notices, in the
-// one client where the policy is hand-written in a second language rather than shared as code — so
-// a divergence from the Rust side shows up here rather than as a field report.
+// `AudioRing` driving the Swift twin of `punktfunk_core::audio::JitterPolicy` (which
+// `JitterVectorTests` holds to core). These pin what a listener notices through the ring itself:
+// the samples it plays, its seams and its depth over time.
 //
 // The defect being pinned: the ring primed *up* to a target and clamped at a ceiling, with nothing
 // walking the depth back *down*. Host-vs-DAC clock skew of a few dozen ppm therefore added latency
@@ -117,7 +116,7 @@ final class AudioRingDriftTests: XCTestCase {
     ///
     /// Mirrors `deprime_fuse_is_a_duration_not_a_callback_count` in `punktfunk_core::audio`.
     func testDeprimeFuseIsADurationNotACallbackCount() {
-        let deprimeMS = 60 // AudioRing.deprimeMS / JitterTuning::COREAUDIO.deprime_ms
+        let deprimeMS = 60 // JitterPolicy.deprimeMS / JitterTuning::COREAUDIO.deprime_ms
         let quanta = [5, 8, 10, 16, 21]
         var deprimedAt: [Int: Int] = [:]
         for quantumMS in quanta {
@@ -464,7 +463,7 @@ final class AudioRingDriftTests: XCTestCase {
 
     // MARK: - …and what the ring does with the proposal
 
-    /// Drive one read so the ring knows the device quantum (`renderQuantum` seeds the floor).
+    /// Drive one read so the ring knows the device quantum (the callback size lifts the floor).
     private func primeQuantum(_ ring: AudioRing, quantumMS: Int) {
         var scratch = [Float](repeating: 0, count: quantumMS * perMS)
         scratch.withUnsafeMutableBufferPointer { ring.read(into: $0.baseAddress!, count: $0.count) }
@@ -935,14 +934,14 @@ final class AudioRingDriftTests: XCTestCase {
     ///
     /// Mirrors `a_drought_is_concealed_only_while_the_ring_is_running_out`.
     func testADroughtIsConcealedOnlyWhileTheRingIsRunningOut() {
-        var c = DroughtConceal(maxMS: AudioRing.plcMaxMS)
-        let stalledMS = 3 * AudioRing.frameMS
+        var c = DroughtConceal(maxMS: JitterPolicy.plcMaxMS)
+        let stalledMS = 3 * JitterPolicy.frameMS
         XCTAssertFalse(
             c.conceal(sinceLastPacketMS: stalledMS, depthMS: 40),
             "a 40 ms ring covers this drought by itself")
         XCTAssertTrue(
             c.conceal(sinceLastPacketMS: stalledMS, depthMS: 0), "an empty ring does not")
-        XCTAssertEqual(c.totalMS, AudioRing.frameMS)
+        XCTAssertEqual(c.totalMS, JitterPolicy.frameMS)
     }
 
     /// Ordinary arrival jitter is not a drought — this policy must be invisible until the wire has
@@ -950,9 +949,9 @@ final class AudioRingDriftTests: XCTestCase {
     ///
     /// Mirrors `ordinary_jitter_is_not_a_drought`.
     func testOrdinaryJitterIsNotADrought() {
-        var c = DroughtConceal(maxMS: AudioRing.plcMaxMS)
+        var c = DroughtConceal(maxMS: JitterPolicy.plcMaxMS)
         for _ in 0..<1_000 {
-            XCTAssertFalse(c.conceal(sinceLastPacketMS: AudioRing.frameMS, depthMS: 0))
+            XCTAssertFalse(c.conceal(sinceLastPacketMS: JitterPolicy.frameMS, depthMS: 0))
         }
         XCTAssertEqual(c.totalMS, 0)
     }
@@ -963,15 +962,15 @@ final class AudioRingDriftTests: XCTestCase {
     ///
     /// Mirrors `drought_concealment_is_bounded_at_twice_the_deprime_fuse`.
     func testDroughtConcealmentIsBoundedAtTwiceTheDeprimeFuse() {
-        let deprimeMS = 60 // AudioRing.deprimeMS / JitterTuning::COREAUDIO.deprime_ms
-        XCTAssertEqual(AudioRing.plcMaxMS, 2 * deprimeMS)
-        var c = DroughtConceal(maxMS: AudioRing.plcMaxMS)
+        let deprimeMS = 60 // JitterPolicy.deprimeMS / JitterTuning::COREAUDIO.deprime_ms
+        XCTAssertEqual(JitterPolicy.plcMaxMS, 2 * deprimeMS)
+        var c = DroughtConceal(maxMS: JitterPolicy.plcMaxMS)
         var ms = 0
-        for _ in 0..<1_000 where c.conceal(sinceLastPacketMS: 2 * AudioRing.frameMS, depthMS: 0) {
-            ms += AudioRing.frameMS
+        for _ in 0..<1_000 where c.conceal(sinceLastPacketMS: 2 * JitterPolicy.frameMS, depthMS: 0) {
+            ms += JitterPolicy.frameMS
         }
-        XCTAssertEqual(ms, AudioRing.plcMaxMS, "must use exactly the budget, and stop there")
-        XCTAssertEqual(c.totalMS, AudioRing.plcMaxMS, "and report every millisecond of it")
+        XCTAssertEqual(ms, JitterPolicy.plcMaxMS, "must use exactly the budget, and stop there")
+        XCTAssertEqual(c.totalMS, JitterPolicy.plcMaxMS, "and report every millisecond of it")
     }
 
     /// A packet ends the drought and hands back a full budget for the next one — a link that
@@ -983,16 +982,16 @@ final class AudioRingDriftTests: XCTestCase {
     /// and so does the subtraction (`drought_concealment_is_not_charged_again_by_the_loss_path` in
     /// `punktfunk_core::abi`).
     func testAPacketEndsTheDroughtAndRefreshesTheBudget() {
-        var c = DroughtConceal(maxMS: AudioRing.plcMaxMS)
-        for _ in 0..<1_000 where c.conceal(sinceLastPacketMS: 2 * AudioRing.frameMS, depthMS: 0) {}
-        XCTAssertEqual(c.totalMS, AudioRing.plcMaxMS, "budget spent")
-        XCTAssertFalse(c.conceal(sinceLastPacketMS: 2 * AudioRing.frameMS, depthMS: 0))
+        var c = DroughtConceal(maxMS: JitterPolicy.plcMaxMS)
+        for _ in 0..<1_000 where c.conceal(sinceLastPacketMS: 2 * JitterPolicy.frameMS, depthMS: 0) {}
+        XCTAssertEqual(c.totalMS, JitterPolicy.plcMaxMS, "budget spent")
+        XCTAssertFalse(c.conceal(sinceLastPacketMS: 2 * JitterPolicy.frameMS, depthMS: 0))
         c.packet()
         XCTAssertTrue(
-            c.conceal(sinceLastPacketMS: 2 * AudioRing.frameMS, depthMS: 0),
+            c.conceal(sinceLastPacketMS: 2 * JitterPolicy.frameMS, depthMS: 0),
             "the next drought must start from a full budget")
         XCTAssertEqual(
-            c.totalMS, AudioRing.plcMaxMS + AudioRing.frameMS,
+            c.totalMS, JitterPolicy.plcMaxMS + JitterPolicy.frameMS,
             "the SESSION total keeps counting — it is what the log line reports")
     }
 
@@ -1011,29 +1010,29 @@ final class AudioRingDriftTests: XCTestCase {
             var scratch = [Float](repeating: 0, count: want)
             let feed = [Float](repeating: 0.5, count: 25 * perMS)
             feed.withUnsafeBufferPointer { ring.write($0.baseAddress!, count: 25 * perMS) }
-            var drought = DroughtConceal(maxMS: AudioRing.plcMaxMS)
-            for tick in 0..<(ms / AudioRing.frameMS) {
+            var drought = DroughtConceal(maxMS: JitterPolicy.plcMaxMS)
+            for tick in 0..<(ms / JitterPolicy.frameMS) {
                 if concealing,
                    drought.conceal(
-                    sinceLastPacketMS: tick * AudioRing.frameMS, depthMS: ring.bufferedMS) {
+                    sinceLastPacketMS: tick * JitterPolicy.frameMS, depthMS: ring.bufferedMS) {
                     feed.withUnsafeBufferPointer {
-                        ring.write($0.baseAddress!, count: AudioRing.frameMS * perMS)
+                        ring.write($0.baseAddress!, count: JitterPolicy.frameMS * perMS)
                     }
                 }
                 scratch.withUnsafeMutableBufferPointer {
                     ring.read(into: $0.baseAddress!, count: want)
                 }
-                if scratch.allSatisfy({ $0 == 0 }) { return tick * AudioRing.frameMS }
+                if scratch.allSatisfy({ $0 == 0 }) { return tick * JitterPolicy.frameMS }
             }
             return nil
         }
         // The defect: 25 ms of ring, a 60 ms fuse — the stall is silent well inside the budget.
-        guard let deprimedAt = stall(ms: AudioRing.plcMaxMS, concealing: false) else {
+        guard let deprimedAt = stall(ms: JitterPolicy.plcMaxMS, concealing: false) else {
             return XCTFail("the unconcealed stall must still de-prime — the ring changed under us")
         }
-        XCTAssertLessThan(deprimedAt, AudioRing.plcMaxMS)
+        XCTAssertLessThan(deprimedAt, JitterPolicy.plcMaxMS)
         XCTAssertNil(
-            stall(ms: AudioRing.plcMaxMS, concealing: true),
+            stall(ms: JitterPolicy.plcMaxMS, concealing: true),
             "a stall inside the budget must not reach the listener at all (unconcealed: silent "
                 + "after \(deprimedAt) ms)")
     }
@@ -1054,7 +1053,7 @@ final class AudioRingDriftTests: XCTestCase {
         /// Spend the whole budget on a dead wire, returning the frames it bought and what the
         /// session total reads.
         func spend(frameUs: Int) -> (frames: Int, totalMS: Int) {
-            var c = DroughtConceal(maxMS: AudioRing.plcMaxMS, frameUs: frameUs)
+            var c = DroughtConceal(maxMS: JitterPolicy.plcMaxMS, frameUs: frameUs)
             var frames = 0
             // A second of silence and an empty ring: both thresholds are wide open, so the only
             // thing that can stop this loop is the budget.
@@ -1064,7 +1063,7 @@ final class AudioRingDriftTests: XCTestCase {
         // The Opus plane, unchanged: 120 ms of 5 ms frames is 24 of them. Every figure here is
         // exactly what shipped, which is the bit-identity gate.
         XCTAssertEqual(spend(frameUs: 5_000).frames, 24, "120 ms of 5 ms frames")
-        XCTAssertEqual(spend(frameUs: 5_000).totalMS, AudioRing.plcMaxMS)
+        XCTAssertEqual(spend(frameUs: 5_000).totalMS, JitterPolicy.plcMaxMS)
 
         // …and the same budget at every shorter frame must buy the same WALL CLOCK, which means
         // MORE frames — not the 24 a 5 ms charge would have allowed.
@@ -1083,25 +1082,25 @@ final class AudioRingDriftTests: XCTestCase {
                 frames * frameUs / 1_000, totalMS,
                 "\(frameUs) µs: plc_ms must be the concealment that really happened")
             XCTAssertEqual(
-                totalMS, AudioRing.plcMaxMS,
+                totalMS, JitterPolicy.plcMaxMS,
                 "\(frameUs) µs: and the budget is the same wall clock at every frame length")
         }
 
         // A packet ends the run and hands back a full budget — at the negotiated frame too, so a
         // link that stalls once a minute is covered every time and not only the first.
-        var c = DroughtConceal(maxMS: AudioRing.plcMaxMS, frameUs: 2_000)
+        var c = DroughtConceal(maxMS: JitterPolicy.plcMaxMS, frameUs: 2_000)
         while c.conceal(sinceLastPacketMS: 1_000, depthMS: 0) {}
         XCTAssertFalse(c.conceal(sinceLastPacketMS: 1_000, depthMS: 0), "budget spent")
         c.packet()
         XCTAssertTrue(c.conceal(sinceLastPacketMS: 1_000, depthMS: 0), "a full budget again")
         XCTAssertEqual(
-            c.totalMS, AudioRing.plcMaxMS + 2,
+            c.totalMS, JitterPolicy.plcMaxMS + 2,
             "the SESSION total keeps counting, in the frame the wire really carried")
 
         // The convenience initializer IS the default frame — the property that keeps every Opus
         // session and the four drought tests above bit-identical.
-        var byDefault = DroughtConceal(maxMS: AudioRing.plcMaxMS)
-        var explicit = DroughtConceal(maxMS: AudioRing.plcMaxMS, frameUs: AudioRing.frameMS * 1_000)
+        var byDefault = DroughtConceal(maxMS: JitterPolicy.plcMaxMS)
+        var explicit = DroughtConceal(maxMS: JitterPolicy.plcMaxMS, frameUs: JitterPolicy.frameMS * 1_000)
         for quiet in [0, 5, 9, 10, 50] {
             for depth in [0, 4, 10, 11, 40] {
                 XCTAssertEqual(
@@ -1123,11 +1122,11 @@ final class AudioRingDriftTests: XCTestCase {
     func testTheDroughtThresholdsFollowTheNegotiatedFrame() {
         /// Fresh each time: `conceal` mutates on success, and these probe the thresholds, not a run.
         func concealsAfter(_ quietMS: Int, frameUs: Int) -> Bool {
-            var c = DroughtConceal(maxMS: AudioRing.plcMaxMS, frameUs: frameUs)
+            var c = DroughtConceal(maxMS: JitterPolicy.plcMaxMS, frameUs: frameUs)
             return c.conceal(sinceLastPacketMS: quietMS, depthMS: 0)
         }
         func concealsAtDepth(_ depthMS: Int, frameUs: Int) -> Bool {
-            var c = DroughtConceal(maxMS: AudioRing.plcMaxMS, frameUs: frameUs)
+            var c = DroughtConceal(maxMS: JitterPolicy.plcMaxMS, frameUs: frameUs)
             return c.conceal(sinceLastPacketMS: 1_000, depthMS: depthMS)
         }
         // The Opus plane: two 5 ms frames, exactly the 10 ms that shipped.
@@ -1222,7 +1221,7 @@ final class AudioRingDriftTests: XCTestCase {
         // Default: one 5 ms frame, a 2 ms fade — exactly the pre-hi-res numbers, which is what
         // keeps every Opus session (and the twenty-nine tests above) bit-identical.
         let base = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
-        XCTAssertEqual(base.frameGeometry.frame, AudioRing.frameMS * perMS)
+        XCTAssertEqual(base.frameGeometry.frame, JitterPolicy.frameMS * perMS)
         XCTAssertEqual(base.frameGeometry.crossfade, 2 * perMS)
 
         // A 2 ms lossless frame sheds 2 ms, and the fade is capped at HALF of it rather than
@@ -1262,8 +1261,7 @@ final class AudioRingDriftTests: XCTestCase {
         func floorMS(frameUs: Int?) -> Int {
             let ring = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
             if let frameUs { ring.setFrameUs(frameUs) }
-            // One oversized callback is all it takes: `renderQuantum` is a high-water mark, and
-            // 30 ms exceeds the 20 ms base target so the lift is what decides the floor.
+            // A 30 ms callback exceeds the 20 ms base target, so the lift decides the floor.
             var scratch = [Float](repeating: 0, count: 30 * perMS)
             scratch.withUnsafeMutableBufferPointer {
                 ring.read(into: $0.baseAddress!, count: $0.count)
@@ -1386,9 +1384,12 @@ final class AudioRingDriftTests: XCTestCase {
                     "\(rateHz) Hz / \(channels)ch: the target is denominated in ms, not samples")
 
                 // …and the SAMPLES behind it must be the honest ones. One second at this layout
-                // over-fills the ring and the hard cap trims it to its own 180 ms.
+                // over-fills the ring; the next callback trims it to its own 180 ms, and a
+                // zero-sample one reads nothing after the trim.
                 let flood = [Float](repeating: 0.5, count: rateHz * channels)
                 flood.withUnsafeBufferPointer { ring.write($0.baseAddress!, count: flood.count) }
+                var none = [Float](repeating: 0, count: 1)
+                none.withUnsafeMutableBufferPointer { ring.read(into: $0.baseAddress!, count: 0) }
                 XCTAssertEqual(
                     ring.bufferedSamples,
                     honest(180, rateHz, channels),
@@ -1552,6 +1553,8 @@ final class AudioRingDriftTests: XCTestCase {
         var scratch = [Float](repeating: 0, count: 441 * channels) // 5 ms
         scratch.withUnsafeMutableBufferPointer { ring.read(into: $0.baseAddress!, count: $0.count) }
         feed.withUnsafeBufferPointer { ring.write($0.baseAddress!, count: 441 * channels) }
+        // The trim is the next callback's, judged on the average the priming read seeded.
+        scratch.withUnsafeMutableBufferPointer { ring.read(into: $0.baseAddress!, count: $0.count) }
         XCTAssertLessThan(ring.stats.bufferedMS, 80, "the backlog must have been trimmed")
         XCTAssertEqual(ring.bufferedSamples % channels, 0, "the trim split a frame")
     }

@@ -679,9 +679,7 @@ private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
         // host aims frames at the latch point, not the refresh. One clock read per update; the
         // reporter itself flushes ~1 Hz.
         if let phase {
-            var ts = timespec()
-            clock_gettime(CLOCK_REALTIME, &ts)
-            let nowNs = Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
+            let nowNs = realtimeNowNs()
             phase.noteGrid(
                 targetRealNs: nowNs + Int64(leadS * 1_000_000_000),
                 latchLeadNs: Int64(floorS * 1_000_000_000))
@@ -978,14 +976,7 @@ public final class Stage2Pipeline {
         } else {
             thread = Thread {
             defer { pumpStopped.signal() } // let stop() join the pump (bounded) before decoder.reset()
-            // Format, decoded size, straggler filter and the keyframe WANT — the same rules the
-            // stage-1 pump follows, in one tested place. Loss itself goes through the gate, where
-            // an RFI anchor heals it without an IDR.
-            var pump = AUPumpState()
-            // VideoToolbox reads the RPS itself, so a lost reference must be concealed in the
-            // bitstream before submit (see HevcConcealer). Thread-confined; one per session.
-            let concealer: HevcConcealer? = connection.videoCodec == .hevc ? HevcConcealer() : nil
-            var wasUnrecoverable = false
+            var intake = AUIntake(connection: connection, gate: reanchorGate, recovery: recovery)
             // 4:4:4 backstop: a run of decode/create failures in a 4:4:4 session means this device can't
             // decode 4:4:4 at the negotiated resolution (the HW probe clears the common case but not a
             // resolution-ceiling miss). End cleanly instead of looping on a black screen.
@@ -997,86 +988,24 @@ public final class Stage2Pipeline {
             while alive, !token.isStopped {
                 alive = autoreleasepool { () -> Bool in
                 do {
-                    // Background keep-alive: drain one AU (flow control + host pacing) and discard it
-                    // BEFORE any VideoToolbox decode or Metal render — no GPU work off-screen. The
-                    // decoder session is left intact; exitBackground requests a fresh IDR and the
-                    // re-anchor gate arms on the resumed frame-index gap so concealed frames are
-                    // withheld until it lands.
-                    if connection.isVideoDropped {
-                        _ = try connection.nextAU(timeoutMs: 100)
-                        return true
-                    }
-                    if pump.awaitingIDR { recovery.request() }
-                    // Loss recovery through the shared gate: a drop-count climb beyond the gap's
-                    // credit arms the freeze and asks (the decoder conceals reference-missing
-                    // deltas without an error), and an overdue freeze re-asks for the re-anchor.
-                    if reanchorGate.poll(framesDropped: connection.framesDropped()) {
-                        recovery.request()
-                    }
-                    // Drain HDR mastering metadata (0xCE) and hand it to the PRESENTER (→ CAEDRMetadata).
-                    // Polled UNCONDITIONALLY (not gated on connection.isHDR, the fixed Welcome flag): the
-                    // host sends 0xCE only for HDR, INCLUDING a mid-session SDR→HDR transition (a game
-                    // entering HDR — the host re-inits its encoder) the Welcome flag would never reflect.
-                    // Non-blocking; nil for an SDR stream.
-                    if let meta = try? connection.nextHdrMeta(timeoutMs: 0) {
-                        presenter.setHdrMeta(meta)
-                    }
-                    guard let received = try connection.nextAU(timeoutMs: 100) else { return true }
-                    var au = received // the concealer may swap its bytes below
-                    // A forward frame-index gap fires a throttled RFI (a clean P-frame, no IDR)
-                    // and arms the freeze, credited with the gap width so the reassembler's
-                    // ~120 ms-later framesDropped climb for the same loss cannot re-freeze a
-                    // stream the anchor already healed. A lost anchor lapses into the gate's
-                    // overdue re-ask above.
-                    let gapWidth = connection.noteFrameIndexGapWidth(au.frameIndex)
-                    if gapWidth > 0 { reanchorGate.arm(expectingDrops: UInt64(gapWidth)) }
-                    onFrame?(au)
-                    if pump.isStraggler(frameIndex: au.frameIndex) { return true }
-                    var concealed = AUPumpState.Concealment.none
-                    if let concealer {
-                        switch concealer.conceal(au.data) {
-                        case .intact:
-                            concealed = .decodable
-                        case .rewritten(let data):
-                            concealed = .decodable
-                            au = au.replacing(data: data)
-                            pumpLog.notice(
-                                "video: frame \(au.frameIndex, privacy: .public) names a lost reference — moved to a present picture until the re-anchor"
-                            )
-                        case .unrecoverable:
-                            concealed = .unrecoverable
-                        }
-                        if concealed == .unrecoverable, !wasUnrecoverable {
-                            pumpLog.warning(
-                                "video: frame \(au.frameIndex, privacy: .public) names a lost reference with nothing to stand in — withholding until an IDR"
-                            )
-                        }
-                        wasUnrecoverable = concealed == .unrecoverable
-                    }
-                    let step = pump.note(
-                        frameIndex: au.frameIndex,
-                        idrFormat: connection.videoCodec.formatDescription(fromKeyframe: au.data),
-                        lossAhead: gapWidth > 0, flags: au.flags, concealed: concealed)
-                    if step.straggler { return true }
-                    if let size = step.newSize { onDecodedSize?(size.width, size.height) }
-                    if step.startedFormatWait {
-                        pumpLog.warning(
-                            "video: received AUs but no decodable format (missing/unparsed parameter sets) — requesting an IDR until one seeds it"
-                        )
-                    }
-                    if step.askKeyframe { recovery.request() }
+                    // HDR mastering metadata (0xCE) goes to the presenter (→ CAEDRMetadata).
+                    guard let ready = try intake.next(
+                        onFrame: onFrame, onDecodedSize: onDecodedSize,
+                        onHdrMeta: { presenter.setHdrMeta($0) })
+                    else { return true }
+                    let au = ready.au
                     // A delta between a loss and its re-anchor references the lost picture. Fed to
                     // VideoToolbox it poisons the session — every later non-IDR AU, the anchor too,
                     // comes back kVTVideoDecoderBadDataErr. Withheld, the anchor decodes and lifts.
-                    if step.withhold { return true }
-                    guard let f = pump.format, !token.isStopped else { return true }
+                    if ready.step.withhold { return true }
+                    guard let f = intake.pump.format, !token.isStopped else { return true }
                     if decoder.decode(au: au, format: f) {
                         decodeFailRun = 0
                     } else {
                         // Submit/decoder error: drop the session and re-gate on the next IDR's in-band
                         // parameter sets (a delta frame can't recover) and keep asking for that IDR.
                         decoder.reset()
-                        pump.requireIDR()
+                        intake.requireIDR()
                         decodeFailRun += 1
                         // ~3 s of solid failure in a 4:4:4 session (and only there — a 4:2:0 loss
                         // recovers within a GOP) ⇒ 4:4:4 isn't decodable here; end the session.
@@ -1726,10 +1655,7 @@ public final class Stage2Pipeline {
                             // Metal completed-handler thread — stamp + enqueue, don't block
                             // (the exact contract of the VT output callback).
                             guard let planes else { return }
-                            var ts = timespec()
-                            clock_gettime(CLOCK_REALTIME, &ts)
-                            let decodedNs =
-                                Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
+                            let decodedNs = realtimeNowNs()
                             hud.decoded(
                                 ptsNs: ptsNs, receivedNs: receivedNs, decodedNs: decodedNs)
                             stats.decoded(
@@ -1785,9 +1711,7 @@ public final class Stage2Pipeline {
     /// present time (when the frame is actually on glass), not the moment we drew.
     public static func realtimeNs(forDisplayLinkTimestamp t: CFTimeInterval) -> Int64 {
         let caNow = CACurrentMediaTime()
-        var ts = timespec()
-        clock_gettime(CLOCK_REALTIME, &ts)
-        let realtimeNow = Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
+        let realtimeNow = realtimeNowNs()
         return realtimeNow + Int64((t - caNow) * 1_000_000_000)
     }
 
@@ -1806,9 +1730,7 @@ public final class Stage2Pipeline {
     /// rather than once per session.)
     static func mediaTimeNs(forRealtimeNs t: Int64) -> Int64 {
         let caNow = CACurrentMediaTime()
-        var ts = timespec()
-        clock_gettime(CLOCK_REALTIME, &ts)
-        let realtimeNow = Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
+        let realtimeNow = realtimeNowNs()
         return Int64(caNow * 1_000_000_000) + (t - realtimeNow)
     }
 

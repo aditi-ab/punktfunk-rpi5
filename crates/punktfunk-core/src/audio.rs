@@ -18,6 +18,8 @@ pub mod pad_mix;
 pub mod pcm;
 /// cbindgen:ignore
 pub mod plane;
+#[cfg(test)]
+mod vectors;
 
 use std::time::Duration;
 

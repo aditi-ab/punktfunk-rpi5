@@ -90,6 +90,20 @@ int main(void) {
         punktfunk_au_admission_free(admit);
     }
 
+    {
+        /* A 320x180 Main-profile sequence-header OBU parses; a cut one does not. */
+        static const uint8_t seq[] = {0x0a, 0x0b, 0x00, 0x00, 0x00, 0x04, 0x3c,
+                                      0xfe, 0xcc, 0x4a, 0xf9, 0x00, 0x40};
+        PunktfunkAv1SequenceInfo info;
+        PunktfunkStatus s1 = punktfunk_av1_sequence_info(seq, sizeof seq, &info);
+        PunktfunkStatus s2 = punktfunk_av1_sequence_info(seq, sizeof seq - 1, &info);
+        if (s1 != PUNKTFUNK_STATUS_OK || info.max_width != 320 || info.max_height != 180
+            || s2 != PUNKTFUNK_STATUS_INVALID_ARG) {
+            fprintf(stderr, "FAIL: av1 sequence info (st=%d/%d)\n", (int)s1, (int)s2);
+            return 1;
+        }
+    }
+
     const uint32_t DROP_PERIOD = 8;   /* drop 1 of every 8 packets */
     PunktfunkConfig host_cfg = make_config(0, DROP_PERIOD);
     PunktfunkConfig client_cfg = make_config(1, DROP_PERIOD);

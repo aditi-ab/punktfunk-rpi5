@@ -15,10 +15,8 @@
 // is rejected for ALL chroma formats, including 4:2:0) HEVC Range-Extensions keyframes generated
 // offline with libx265; see scripts notes. Results are cached (device-static) in lazy statics.
 
-import CoreMedia
 import CoreVideo
 import Foundation
-import VideoToolbox
 
 public enum Stage444Probe {
     /// True iff this device hardware-decodes 8-bit 4:4:4 HEVC (the host's current 4:4:4 path —
@@ -35,51 +33,16 @@ public enum Stage444Probe {
         want: kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange,
         fullRangeSibling: kCVPixelFormatType_444YpCbCr10BiPlanarFullRange)
 
-    /// Create a hardware-REQUIRED `VTDecompressionSession` for the synthetic 4:4:4 keyframe and
-    /// decode it, returning true only when the decoder produces the expected (video- or full-range)
-    /// biplanar 4:4:4 pixel format. Any failure (no hardware path, wrong output format, decode error)
-    /// → false → we keep 4:2:0.
+    /// Decode the synthetic 4:4:4 keyframe on a hardware-REQUIRED session: true only when it
+    /// produces the expected (video- or full-range) biplanar 4:4:4 format. Any failure keeps
+    /// 4:2:0. A software decode would pass and then run every real frame on the CPU.
     private static func probeHardware444(
-        au auBytes: [UInt8], want: OSType, fullRangeSibling: OSType
+        au: [UInt8], want: OSType, fullRangeSibling: OSType
     ) -> Bool {
-        let data = Data(auBytes)
-        guard let format = AnnexB.formatDescription(fromIDR: data, codec: .hevc) else { return false }
-        // Require a hardware decoder — a software false-positive would make us advertise 4:4:4 and
-        // then decode every real frame on the CPU, blowing the latency budget.
-        let spec: [CFString: Any] = [
-            kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: true,
-        ]
-        let attrs: [CFString: Any] = [
-            kCVPixelBufferPixelFormatTypeKey: want,
-            kCVPixelBufferMetalCompatibilityKey: true,
-        ]
-        var session: VTDecompressionSession?
-        let created = VTDecompressionSessionCreate(
-            allocator: kCFAllocatorDefault, formatDescription: format,
-            decoderSpecification: spec as CFDictionary, imageBufferAttributes: attrs as CFDictionary,
-            outputCallback: nil, decompressionSessionOut: &session)
-        guard created == noErr, let session else { return false }
-        defer { VTDecompressionSessionInvalidate(session) }
-
-        let au = AccessUnit(data: data, ptsNs: 0, frameIndex: 0, flags: 0, receivedNs: 0)
-        guard let sample = AnnexB.sampleBuffer(au: au, format: format, codec: .hevc) else { return false }
-
-        var produced: OSType = 0
-        // SYNCHRONOUS decode — no `._EnableAsynchronousDecompression`, so the output callback
-        // runs on THIS thread before DecodeFrame returns. The async flag + semaphore wait it
-        // replaced tripped the Thread Performance Checker on every first connect: VideoToolbox's
-        // callback thread carries no QoS class, and the userInteractive connect Task blocked on
-        // it through the semaphore (a priority inversion). A one-shot 256×256 probe gains
-        // nothing from decode parallelism; the lazy statics still cache the result.
-        let status = VTDecompressionSessionDecodeFrame(
-            session, sampleBuffer: sample,
-            flags: [], infoFlagsOut: nil
-        ) { status, _, imageBuffer, _, _ in
-            if status == noErr, let imageBuffer {
-                produced = CVPixelBufferGetPixelFormatType(imageBuffer)
-            }
-        }
-        guard status == noErr else { return false }
+        guard let buffer = VTOneShot.decode(
+            annexB: Data(au), codec: .hevc, pixelFormat: want, requireHardware: true)
+        else { return false }
+        let produced = CVPixelBufferGetPixelFormatType(buffer)
         return produced == want || produced == fullRangeSibling
     }
 }
