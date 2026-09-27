@@ -281,7 +281,7 @@ impl StatusVerdicts {
 /// so treating it as concealment hitches every renegotiation. Only integrity drops.
 ///
 /// AV1 has no reorder envelope and no MMCO; every warning is damage.
-/// [`pf_vkdecode::is_integrity_warning_av1`] is exhaustive so a new warning cannot
+/// [`pf_vkdecode::Av1PlanWarning::is_integrity`] is exhaustive so a new warning cannot
 /// default to clean. The spec-legal branch is the landing site for a future one.
 enum PlanWarnings {
     H264(Vec<pf_vkdecode::PlanWarning>),
@@ -300,28 +300,19 @@ impl PlanWarnings {
 
     /// Integrity (concealment) subset. Allocates only off the clean path.
     ///
-    /// Predicate lives in pf-vkdecode so the fault-injection harness asserts against
-    /// the same list production conceals on.
+    /// Predicate lives on pf-bitstream's warning enums so the fault-injection
+    /// harness asserts against the same list production conceals on.
     fn integrity(&self) -> PlanWarnings {
         match self {
-            PlanWarnings::H264(w) => PlanWarnings::H264(
-                w.iter()
-                    .filter(|x| pf_vkdecode::is_integrity_warning(x))
-                    .cloned()
-                    .collect(),
-            ),
-            PlanWarnings::H265(w) => PlanWarnings::H265(
-                w.iter()
-                    .filter(|x| pf_vkdecode::is_integrity_warning_h265(x))
-                    .cloned()
-                    .collect(),
-            ),
-            PlanWarnings::Av1(w) => PlanWarnings::Av1(
-                w.iter()
-                    .filter(|x| pf_vkdecode::is_integrity_warning_av1(x))
-                    .cloned()
-                    .collect(),
-            ),
+            PlanWarnings::H264(w) => {
+                PlanWarnings::H264(w.iter().filter(|x| x.is_integrity()).cloned().collect())
+            }
+            PlanWarnings::H265(w) => {
+                PlanWarnings::H265(w.iter().filter(|x| x.is_integrity()).cloned().collect())
+            }
+            PlanWarnings::Av1(w) => {
+                PlanWarnings::Av1(w.iter().filter(|x| x.is_integrity()).cloned().collect())
+            }
         }
     }
 

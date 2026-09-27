@@ -631,7 +631,10 @@ impl NativeVaapiDecoder {
             plan.picture.chroma_format_idc,
             8 + plan.picture.bit_depth_luma_minus8,
         )?;
-        let damaged = plan.warnings.iter().any(pf_vaapi::is_integrity_warning);
+        let damaged = plan
+            .warnings
+            .iter()
+            .any(pf_vaapi::PlanWarning::is_integrity);
         if !plan.warnings.is_empty() {
             tracing::debug!(warnings = ?plan.warnings, damaged, "native VAAPI plan warnings");
         }
@@ -709,7 +712,7 @@ impl NativeVaapiDecoder {
         let damaged = plan
             .warnings
             .iter()
-            .any(pf_vaapi::is_integrity_warning_h265);
+            .any(pf_vaapi::PlanWarningH265::is_integrity);
         if !plan.warnings.is_empty() {
             tracing::debug!(warnings = ?plan.warnings, damaged, "native VAAPI plan warnings");
         }
@@ -778,7 +781,10 @@ impl NativeVaapiDecoder {
         let mut shown: Vec<DmabufFrame> = Vec::new();
         let mut damaged_unit = false;
         for plan in &plans {
-            let damaged = plan.warnings.iter().any(pf_vaapi::is_integrity_warning_av1);
+            let damaged = plan
+                .warnings
+                .iter()
+                .any(pf_vaapi::PlanWarningAv1::is_integrity);
             damaged_unit |= damaged;
             if !plan.warnings.is_empty() {
                 tracing::debug!(warnings = ?plan.warnings, damaged, "native VAAPI AV1 plan warnings");
@@ -1454,6 +1460,10 @@ fn export_handle(
 
 #[cfg(test)]
 mod tests {
+    use pf_bitstream::testing::split_h264_aus;
+    use pf_bitstream::testing::split_h265_aus;
+    use pf_bitstream::testing::split_ivf;
+
     use super::*;
 
     /// Bookkeeping only; libva handles are never used. Small so exhaustion is reachable.
@@ -2139,29 +2149,7 @@ mod tests {
     }
 
     /// 250 temporal units, 274 coded, 24 hidden, 250 shown. Same file the other rungs walk.
-    pub(super) const AV1_25FPS: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1"
-    );
-
-    /// `[u32 size][u64 pts][size bytes]` after the `DKIF` header. No vendored parser dep.
-    pub(super) fn split_ivf(stream: &[u8]) -> Vec<&[u8]> {
-        assert_eq!(&stream[0..4], b"DKIF", "the AV1 vector must be an IVF file");
-        let header = usize::from(u16::from_le_bytes([stream[6], stream[7]]));
-        let mut out = Vec::new();
-        let mut at = header;
-        while at + 12 <= stream.len() {
-            let size =
-                u32::from_le_bytes(stream[at..at + 4].try_into().expect("four bytes")) as usize;
-            at += 12;
-            assert!(
-                at + size <= stream.len(),
-                "an IVF frame header claims {size} bytes past the end of the file"
-            );
-            out.push(&stream[at..at + size]);
-            at += size;
-        }
-        out
-    }
+    pub(super) const AV1_25FPS: &[u8] = pf_bitstream::testing::AV1_25FPS;
 
     /// Decode measurement, not pixels. Pixels are the `parity` module. `#[ignore]`
     /// so a missing entry point fails loudly rather than skips.
@@ -2302,14 +2290,10 @@ mod tests {
     }
 
     /// 250 AUs, two slices per picture. Same file the other rungs decode.
-    pub(super) const H264_25FPS: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264"
-    );
+    pub(super) const H264_25FPS: &[u8] = pf_bitstream::testing::H264_25FPS;
 
     /// 250 AUs, one slice per picture.
-    pub(super) const H265_25FPS: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265"
-    );
+    pub(super) const H265_25FPS: &[u8] = pf_bitstream::testing::H265_25FPS;
 
     /// 50 AUs, Main 10: different profile, RT format, and P010. Catches NV12 for 10-bit.
     pub(super) const MAIN10_H265: &[u8] =
@@ -2328,62 +2312,6 @@ mod tests {
     const H264_LAST_ONLY: usize = 225;
     const H265_LAST_ONLY: usize = 204;
     const MAIN10_LAST_ONLY: usize = 45;
-
-    /// Start-code scan. Emulation prevention means `00 00 01` is never payload.
-    fn nal_headers(stream: &[u8]) -> Vec<usize> {
-        let mut out = Vec::new();
-        let mut i = 0usize;
-        while i + 3 <= stream.len() {
-            if stream[i..i + 3] == [0x00, 0x00, 0x01] {
-                out.push(i + 3);
-                i += 3;
-            } else {
-                i += 1;
-            }
-        }
-        out
-    }
-
-    /// New AU at a non-VCL after slices, or a first-of-picture slice while the AU already has slices.
-    fn split_aus(stream: &[u8], classify: impl Fn(&[u8], usize) -> (bool, bool)) -> Vec<&[u8]> {
-        let mut aus = Vec::new();
-        let mut au_start = 0usize;
-        let mut au_has_slice = false;
-        for header in nal_headers(stream) {
-            let (is_slice, first_in_picture) = classify(stream, header);
-            // Three-byte start code, plus the optional leading zero of the four-byte form.
-            let mut start = header - 3;
-            if start > 0 && stream[start - 1] == 0x00 {
-                start -= 1;
-            }
-            if au_has_slice && (!is_slice || first_in_picture) {
-                aus.push(&stream[au_start..start]);
-                au_start = start;
-                au_has_slice = false;
-            }
-            au_has_slice |= is_slice;
-        }
-        aus.push(&stream[au_start..]);
-        aus
-    }
-
-    /// `first_mb_in_slice == 0` is load-bearing: this vector codes two slices per picture.
-    pub(super) fn split_h264_aus(stream: &[u8]) -> Vec<&[u8]> {
-        split_aus(stream, |s, h| {
-            let is_slice = matches!(s[h] & 0x1f, 1 | 5);
-            let first = is_slice && s.get(h + 1).is_some_and(|b| b & 0x80 != 0);
-            (is_slice, first)
-        })
-    }
-
-    /// Two-byte NAL header; first-slice flag is at `+2`, not H.264's `+1`.
-    pub(super) fn split_h265_aus(stream: &[u8]) -> Vec<&[u8]> {
-        split_aus(stream, |s, h| {
-            let is_slice = (s[h] >> 1) & 0x3f < 32;
-            let first = is_slice && s.get(h + 2).is_some_and(|b| b & 0x80 != 0);
-            (is_slice, first)
-        })
-    }
 
     /// Not ignored: a regenerated 8-bit "Main 10" vector would pass the ten-bit leg.
     #[test]
@@ -2873,9 +2801,9 @@ mod parity {
 
     use sha2::Digest;
 
-    use super::tests::split_h264_aus;
-    use super::tests::split_h265_aus;
-    use super::tests::split_ivf;
+    use pf_bitstream::testing::split_h264_aus;
+    use pf_bitstream::testing::split_h265_aus;
+    use pf_bitstream::testing::split_ivf;
     // Test-only `ImageApi` re-dlopens libva and names these; the lib itself does not.
     use pf_libva::VaDisplay;
     use pf_libva::VaStatus;

@@ -228,17 +228,17 @@ impl VkDecoder<H264> {
             let op = dec.prepare_op(&vk_plan.refs, vk_plan.setup_slot, vk_plan.setup_ref)?;
             // Bitstream is slice NALUs only. A real AU opens with AUD/SEI
             // (and SPS/PPS at IDRs); feeding those to VCN inside the decode
-            // range hangs it. `pack_slices` rebases offsets and normalises each
-            // Annex-B prefix to three bytes (`crate::ring::three_byte_prefix`).
+            // range hangs it. `pack_slices` rebases offsets and puts each NAL
+            // behind a three-byte start code.
             let plan_segments: Vec<std::ops::Range<usize>> =
-                plan.slices.iter().map(|s| s.data.clone()).collect();
-            let Some(packed) = pack_slices(au, &plan_segments) else {
+                plan.slices.iter().map(|s| s.nal.clone()).collect();
+            let Some(packed) = pack_slices(&plan_segments) else {
                 return Err(VkDecodeError::Unsupported(
                     "packed slice data exceeds the u32 offsets Vulkan submits".into(),
                 ));
             };
-            // SAFETY: the segments are the plan's own in-bounds slice ranges
-            // (narrowed by the prefix normalisation, so still in bounds); the
+            // SAFETY: each segment is a slice NAL plus the three start-code bytes
+            // before it, inside the plan's own in-bounds slice range; the
             // recorded offsets come from the same `pack_slices` call.
             let upload = unsafe { dec.upload(au, &packed.segments)? };
             let scope = dec.scope(&op, &vk_plan.refs)?;

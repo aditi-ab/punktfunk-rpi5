@@ -13,7 +13,7 @@
 #   ffmpeg -f obu -i lowdelay-3840x2160.av1 -c copy -f ivf lowdelay-3840x2160.ivf.av1
 #
 # The spike writes the low-overhead OBU stream; the IVF wrapper is added so this file
-# is framed exactly like the vendored vector and `common::split_av1_aus` — the
+# is framed exactly like the vendored vector and `pf_bitstream::testing::split_ivf` — the
 # vendored parser's own `IvfIterator` — splits it with no second implementation that
 # could disagree. `-c copy` re-frames, it does not re-encode.
 #

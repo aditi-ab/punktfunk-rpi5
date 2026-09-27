@@ -3218,7 +3218,6 @@ version = "0.40.0"
 dependencies = [
  "cros-codecs",
  "pf-bitstream",
- "pf-vkdecode",
  "tracing",
 ]
 
@@ -3404,7 +3403,6 @@ version = "0.40.0"
 dependencies = [
  "cros-codecs",
  "pf-bitstream",
- "pf-vkdecode",
 ]
 
 [[package]]

@@ -24,94 +24,24 @@ use std::io::Cursor;
 
 use ash::vk;
 use ash::vk::Handle;
+pub use pf_bitstream::testing::split_h264_aus;
+pub use pf_bitstream::testing::split_h265_aus;
+pub use pf_bitstream::testing::split_ivf;
 use pf_vkdecode::DeviceHandles;
 
 /// Vendored H.264 vector: two slice NALUs per picture, so the splitter's
 /// `first_mb_in_slice == 0` branch is load-bearing, and the slice-control
 /// buffer is two records wide where the HEVC vector's is one.
-pub const TEST_25FPS_H264: &[u8] = include_bytes!(
-    "../../../pf-bitstream/vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264"
-);
+pub const TEST_25FPS_H264: &[u8] = pf_bitstream::testing::H264_25FPS;
 
 /// Vendored H.265 twin: one IDR_N_LP then 249 TRAIL pictures.
-pub const TEST_25FPS_H265: &[u8] = include_bytes!(
-    "../../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265"
-);
+pub const TEST_25FPS_H265: &[u8] = pf_bitstream::testing::H265_25FPS;
 
 /// Vendored AV1 twin: 250 temporal units, 274 coded frames. 24 units carry a
 /// hidden second frame (decoded, referenced, never shown); the vector has no
 /// `show_existing_frame`. The directory also has byte-identical
 /// `test-25fps.av1.ivf`; this name is the one with `.md5`/`.crc` beside it.
-pub const TEST_25FPS_AV1: &[u8] = include_bytes!(
-    "../../../pf-bitstream/vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1"
-);
-
-/// One IVF packet per temporal unit. AV1 has no start codes, so an AU is the
-/// container's framing, not a scan of the elementary stream. `IvfIterator` is
-/// the vendored parser; there is no prefix-width rewrite because OBUs are
-/// length-delimited.
-pub fn split_av1_aus(stream: &[u8]) -> Vec<&[u8]> {
-    cros_codecs::bitstream_utils::IvfIterator::new(stream).collect()
-}
-
-/// New AU at a non-VCL NALU after slices, or a slice with `first_mb_in_slice`
-/// 0 (top bit of the byte after the 1-byte NAL header) once the AU has slices.
-/// Mirrors pf-bitstream's `#[cfg(test)]` splitter.
-pub fn split_h264_aus(stream: &[u8]) -> Vec<&[u8]> {
-    use cros_codecs::codec::h264::parser::Nalu;
-    use cros_codecs::codec::h264::parser::NaluType;
-
-    let mut aus = Vec::new();
-    let mut cursor = Cursor::new(stream);
-    let mut au_start = 0usize;
-    let mut au_has_slice = false;
-
-    while let Ok(nalu) = Nalu::next(&mut cursor) {
-        let nalu_offset = cursor.position() as usize;
-        let start = nalu_offset - nalu.offset;
-        let is_slice = matches!(nalu.header.type_, NaluType::Slice | NaluType::SliceIdr);
-        let first_mb_zero = is_slice && stream.get(nalu_offset + 1).is_some_and(|b| b & 0x80 != 0);
-
-        if au_has_slice && (!is_slice || first_mb_zero) {
-            aus.push(&stream[au_start..start]);
-            au_start = start;
-            au_has_slice = false;
-        }
-        au_has_slice |= is_slice;
-    }
-    aus.push(&stream[au_start..]);
-    aus
-}
-
-/// HEVC NAL header is two bytes, so `first_slice_segment_in_pic_flag` is the
-/// top bit of `stream[header_start + 2]` (H.264 reads `+ 1`), and a slice is
-/// `nal_unit_type < 32` rather than an enum pair. Copied from pf-bitstream's
-/// `#[cfg(test)]` splitter rather than re-derived.
-pub fn split_h265_aus(stream: &[u8]) -> Vec<&[u8]> {
-    use cros_codecs::codec::h265::parser::Nalu;
-
-    let mut aus = Vec::new();
-    let mut cursor = Cursor::new(stream);
-    let mut au_start = 0usize;
-    let mut au_has_slice = false;
-
-    while let Ok(nalu) = Nalu::next(&mut cursor) {
-        let header_start = cursor.position() as usize;
-        let start = header_start - nalu.offset;
-        let is_slice = (nalu.header.type_ as u32) < 32;
-        let first_slice_flag =
-            is_slice && stream.get(header_start + 2).is_some_and(|b| b & 0x80 != 0);
-
-        if au_has_slice && (!is_slice || first_slice_flag) {
-            aus.push(&stream[au_start..start]);
-            au_start = start;
-            au_has_slice = false;
-        }
-        au_has_slice |= is_slice;
-    }
-    aus.push(&stream[au_start..]);
-    aus
-}
+pub const TEST_25FPS_AV1: &[u8] = pf_bitstream::testing::AV1_25FPS;
 
 /// Rewrite every Annex-B start code to four-byte (`00 00 00 01`).
 /// Vendored vectors are three-byte; the host emits four-byte. A fixed `+3 + 2`

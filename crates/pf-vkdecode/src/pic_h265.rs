@@ -19,8 +19,12 @@ use ash::vk::native as hh;
 use pf_bitstream::h265::AuPlan;
 use pf_bitstream::h265::PicId;
 use pf_bitstream::h265::RefPic;
+use pf_bitstream::h265::RefRpsIdxError;
+use pf_bitstream::h265::RpsError;
+use pf_bitstream::h265::RPS_UNUSED;
 use tracing::trace;
 
+use crate::slots::Removals;
 use crate::slots::SlotError;
 use crate::slots::SlotMap;
 
@@ -185,6 +189,15 @@ impl From<SlotError> for PlanToVkH265Error {
     }
 }
 
+impl From<RpsError> for PlanToVkH265Error {
+    fn from(err: RpsError) -> Self {
+        match err {
+            RpsError::SetOverflow { set, len } => PlanToVkH265Error::RpsSetOverflow { set, len },
+            RpsError::OutsideRps(id) => PlanToVkH265Error::ReferenceOutsideRps(id),
+        }
+    }
+}
+
 impl From<RefRpsIdxError> for PlanToVkH265Error {
     fn from(err: RefRpsIdxError) -> Self {
         PlanToVkH265Error::RefRpsIdx(err)
@@ -201,81 +214,6 @@ fn ref_info(rp: &RefPic) -> hh::StdVideoDecodeH265ReferenceInfo {
     // marked, current or *Foll*.
     std.PicOrderCntVal = rp.pic_order_cnt;
     std
-}
-
-/// `NumDeltaPocsOfRefRpsIdx` derivation failures. Both backends convert this
-/// into their own conversion error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RefRpsIdxError {
-    /// The first slice's inline `st_ref_pic_set()` predicts from a missing SPS
-    /// candidate — the count cannot be derived, and hardware would misparse the
-    /// slice header.
-    Invalid {
-        curr_rps_idx: u8,
-        delta_idx_minus1: u8,
-    },
-    /// Predicted-from candidate `NumDeltaPocs` exceeds `u8`. Impossible off a
-    /// real parse (≤ 32); an error rather than a clamp, because a clamped count
-    /// makes hardware misparse the slice header.
-    NumDeltaPocsOverflow(u32),
-}
-
-impl std::fmt::Display for RefRpsIdxError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RefRpsIdxError::Invalid {
-                curr_rps_idx,
-                delta_idx_minus1,
-            } => {
-                write!(
-                    f,
-                    "inline st_ref_pic_set predicts from a nonexistent candidate \
-                     (CurrRpsIdx {curr_rps_idx}, delta_idx_minus1 {delta_idx_minus1})"
-                )
-            }
-            RefRpsIdxError::NumDeltaPocsOverflow(count) => {
-                write!(f, "candidate NumDeltaPocs {count} exceeds u8")
-            }
-        }
-    }
-}
-
-impl std::error::Error for RefRpsIdxError {}
-
-/// `NumDeltaPocsOfRefRpsIdx`: when the first slice's inline `st_ref_pic_set()`
-/// uses inter-RPS prediction, hardware re-parses those slice bits and needs
-/// `NumDeltaPocs[RefRpsIdx]` of the source candidate to size the
-/// `used_by_curr_pic_flag`/`use_delta_flag` loop (7.4.8); otherwise 0.
-///
-/// `pf_dxvadec` derives `ucNumDeltaPocsOfRefRpsIdx` from this same call, so the
-/// inter-RPS test in this module covers both backends.
-pub fn num_delta_pocs_of_ref_rps_idx(plan: &AuPlan) -> Result<u8, RefRpsIdxError> {
-    let hdr = &plan
-        .slices
-        .first()
-        .expect("caller validated the plan holds slices")
-        .header;
-    // Inline means CurrRpsIdx == num_short_term_ref_pic_sets (8.3.2 NOTE 2); an
-    // SPS-indexed RPS re-parses nothing in the slice header.
-    let inline = !hdr.short_term_ref_pic_set_sps_flag
-        && hdr.curr_rps_idx == plan.sps.num_short_term_ref_pic_sets;
-    if !inline || !hdr.short_term_ref_pic_set.inter_ref_pic_set_prediction_flag {
-        return Ok(0);
-    }
-    // RefRpsIdx = stRpsIdx - (delta_idx_minus1 + 1), stRpsIdx = CurrRpsIdx here
-    // (equation 7-59). u16 so a hostile delta cannot wrap.
-    let delta = hdr.short_term_ref_pic_set.delta_idx_minus1;
-    let source = u16::from(hdr.curr_rps_idx)
-        .checked_sub(u16::from(delta) + 1)
-        .and_then(|idx| plan.sps.short_term_ref_pic_set.get(usize::from(idx)))
-        .ok_or(RefRpsIdxError::Invalid {
-            curr_rps_idx: hdr.curr_rps_idx,
-            delta_idx_minus1: delta,
-        })?;
-    // Real parses have NumDeltaPocs ≤ 32 (u8). A clamp would misparse the slice
-    // header on hardware, so a constructed plan that exceeds it is an error.
-    u8::try_from(source.num_delta_pocs)
-        .map_err(|_| RefRpsIdxError::NumDeltaPocsOverflow(source.num_delta_pocs))
 }
 
 /// Convert one planned AU, driving `slots` through the AU's slot lifecycle.
@@ -304,64 +242,37 @@ pub fn plan_to_vk_h265(
         });
     }
 
-    // Union of the three current RPS sets, first appearance first. A picture
-    // appears once even if concealment resolved two entries to the same id.
-    let mut refs: Vec<VkRefH265> = Vec::new();
-    let mut index_arrays = [[UNUSED_RPS_ENTRY; H265_RPS_LIST_SIZE]; 3];
-    let sets: [(&'static str, &[RefPic]); 3] = [
-        ("RefPicSetStCurrBefore", &plan.rps.st_curr_before),
-        ("RefPicSetStCurrAfter", &plan.rps.st_curr_after),
-        ("RefPicSetLtCurr", &plan.rps.lt_curr),
-    ];
-    for (array, (name, set)) in index_arrays.iter_mut().zip(sets) {
-        if set.len() > H265_RPS_LIST_SIZE {
-            return Err(PlanToVkH265Error::RpsSetOverflow {
-                set: name,
-                len: set.len(),
-            });
-        }
-        for (position, rp) in set.iter().enumerate() {
-            let entry = match refs.iter().position(|existing| existing.id == rp.id) {
-                Some(index) => {
-                    // Duplicate across sets: bind once. If any occurrence is
-                    // long-term, mark it so — hardware treats LT refs differently
-                    // (no MV scaling, POC-LSB matching).
-                    if rp.is_long_term {
-                        refs[index].std.flags.set_used_for_long_term_reference(1);
-                    }
-                    refs[index].slot
-                }
-                None => {
-                    let slot = slots
-                        .slot_of(rp.id)
-                        .ok_or(PlanToVkH265Error::UnresolvedReference(rp.id))?;
-                    refs.push(VkRefH265 {
-                        slot,
-                        std: ref_info(rp),
-                        id: rp.id,
-                    });
-                    slot
-                }
-            };
-            // DPB slot index, not a `refs` position. Slots ≤ 17, so never 0xFF.
-            debug_assert_ne!(entry, UNUSED_RPS_ENTRY, "a real DPB slot is never 0xFF");
-            array[position] = entry;
-        }
+    // The current sets bind once per picture. If any occurrence is long-term,
+    // mark it so: hardware treats LT refs differently (no MV scaling, POC-LSB
+    // matching).
+    let current = plan.current_rps_refs()?;
+    let mut refs: Vec<VkRefH265> = Vec::with_capacity(current.refs.len());
+    for (rp, long_term) in &current.refs {
+        let slot = slots
+            .slot_of(rp.id)
+            .ok_or(PlanToVkH265Error::UnresolvedReference(rp.id))?;
+        let mut std = ref_info(rp);
+        std.flags
+            .set_used_for_long_term_reference(u32::from(*long_term));
+        refs.push(VkRefH265 {
+            slot,
+            std,
+            id: rp.id,
+        });
     }
-
-    for slice in &plan.slices {
-        for rp in slice.ref_list0.iter().chain(&slice.ref_list1) {
-            if !refs.iter().any(|existing| existing.id == rp.id) {
-                return Err(PlanToVkH265Error::ReferenceOutsideRps(rp.id));
-            }
-        }
-    }
+    // DPB slot indices, not `refs` positions. Slots ≤ 17, so never 0xFF.
+    let index_arrays = current.index.map(|set| {
+        set.map(|position| match position {
+            RPS_UNUSED => UNUSED_RPS_ENTRY,
+            position => refs[usize::from(position)].slot,
+        })
+    });
 
     // The *Foll* pictures bind after the current sets, as FFmpeg's Vulkan hwaccel
     // binds them. A picture this AU retires is no reference: skipping it keeps the
     // setup slot, assigned below from freed slots, out of the list.
-    for rp in &plan.dpb_refs {
-        if plan.dpb.removed.contains(&rp.id) || refs.iter().any(|r| r.id == rp.id) {
+    for rp in &current.foll {
+        if plan.dpb.removed.contains(&rp.id) {
             continue;
         }
         match slots.slot_of(rp.id) {
@@ -389,7 +300,7 @@ pub fn plan_to_vk_h265(
     std_pic.sps_video_parameter_set_id = plan.sps.video_parameter_set_id;
     std_pic.pps_seq_parameter_set_id = plan.pps.seq_parameter_set_id;
     std_pic.pps_pic_parameter_set_id = plan.pps.pic_parameter_set_id;
-    std_pic.NumDeltaPocsOfRefRpsIdx = num_delta_pocs_of_ref_rps_idx(plan)?;
+    std_pic.NumDeltaPocsOfRefRpsIdx = plan.num_delta_pocs_of_ref_rps_idx()?;
     std_pic.PicOrderCntVal = pic.pic_order_cnt;
     // 0 when the RPS came from the SPS by index — Vulkan's convention for this field.
     std_pic.NumBitsForSTRefPicSetInSlice = u16::try_from(pic.short_term_ref_pic_set_size_bits)
@@ -412,23 +323,8 @@ pub fn plan_to_vk_h265(
         );
     }
 
-    // Mutations last. Removals first (they were real regardless of this AU),
-    // then setup; release immediately if this plan already evicted the stored
-    // picture — the slot must still exist for the decode itself.
-    let setup_evicted = plan.dpb.removed.contains(&setup_id);
-    for &id in &plan.dpb.removed {
-        if id == setup_id {
-            continue;
-        }
-        if !slots.release(id) {
-            // Reachable only when the caller skipped an AU's plan through this map.
-            trace!(id, "DpbUpdate removed an id this SlotMap never assigned");
-        }
-    }
-    let setup_slot = slots.assign(setup_id)?;
-    if setup_evicted {
-        slots.release(setup_id);
-    }
+    // Mutations last. Removals first: they were real regardless of this AU.
+    let (setup_slot, _) = slots.commit_setup(setup_id, &plan.dpb.removed, Removals::ReleaseNow)?;
 
     Ok(DecodePlanVkH265 {
         std_pic,
@@ -444,10 +340,8 @@ pub fn plan_to_vk_h265(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::io::Cursor;
     use std::rc::Rc;
 
-    use cros_codecs::codec::h265::parser::Nalu;
     use cros_codecs::codec::h265::parser::Pps;
     use cros_codecs::codec::h265::parser::ShortTermRefPicSet;
     use cros_codecs::codec::h265::parser::Sps;
@@ -461,44 +355,13 @@ mod tests {
     use pf_bitstream::h265::RpsPlan;
     use pf_bitstream::h265::SliceHeader;
     use pf_bitstream::h265::SlicePlan;
+    use pf_bitstream::testing::split_h265_aus;
 
     use super::*;
 
-    // Same vendored vectors pf-bitstream's h265 tests plan, from the same path.
-    const TEST_25FPS: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265"
-    );
-    const TEST_64X64_I_P_B_P: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/64x64-I-P-B-P.h265"
-    );
-
-    /// Test-only AU splitter, mirroring pf-bitstream's private helper: a new AU
-    /// starts at a non-VCL NALU following slices, or at a slice segment with
-    /// `first_slice_segment_in_pic_flag == 1` (first bit of the byte after the
-    /// 2-byte NAL header) when the current AU already has slices.
-    fn split_into_aus(stream: &[u8]) -> Vec<&[u8]> {
-        let mut aus = Vec::new();
-        let mut cursor = Cursor::new(stream);
-        let mut au_start = 0usize;
-        let mut au_has_slice = false;
-
-        while let Ok(nalu) = Nalu::next(&mut cursor) {
-            let header_start = cursor.position() as usize;
-            let start = header_start - nalu.offset;
-            let is_slice = (nalu.header.type_ as u32) < 32;
-            let first_slice_flag =
-                is_slice && stream.get(header_start + 2).is_some_and(|b| b & 0x80 != 0);
-
-            if au_has_slice && (!is_slice || first_slice_flag) {
-                aus.push(&stream[au_start..start]);
-                au_start = start;
-                au_has_slice = false;
-            }
-            au_has_slice |= is_slice;
-        }
-        aus.push(&stream[au_start..]);
-        aus
-    }
+    // Same vendored vectors pf-bitstream's h265 tests plan.
+    const TEST_25FPS: &[u8] = pf_bitstream::testing::H265_25FPS;
+    const TEST_64X64_I_P_B_P: &[u8] = pf_bitstream::testing::H265_64X64_I_P_B_P;
 
     /// Host low-delay HEVC: 120 pictures, five-picture DPB, reorder 0 — 115 of
     /// 120 AUs retire a picture. The stream the GPU legs decode against.
@@ -512,7 +375,7 @@ mod tests {
     /// setup slot is assigned from freed slots, so the two would alias.
     #[test]
     fn every_marked_picture_binds_and_none_aliases_the_setup_slot() {
-        let aus = split_into_aus(LOWDELAY_640X480_H265);
+        let aus = split_h265_aus(LOWDELAY_640X480_H265);
         let mut planner = H265Planner::new();
         let mut slots: Option<SlotMap> = None;
         let mut prev: Option<AuPlan> = None;
@@ -633,7 +496,7 @@ mod tests {
 
     #[test]
     fn the_full_25fps_vector_converts_with_stable_slots_and_start_code_offsets() {
-        let aus = split_into_aus(TEST_25FPS);
+        let aus = split_h265_aus(TEST_25FPS);
         let mut planner = H265Planner::new();
         let mut slots: Option<SlotMap> = None;
         // PicId → slot assigned when that picture was decoded; drop on `removed`.
@@ -754,7 +617,7 @@ mod tests {
 
     #[test]
     fn the_b_frame_vector_populates_both_current_index_arrays_around_the_picture() {
-        let aus = split_into_aus(TEST_64X64_I_P_B_P);
+        let aus = split_h265_aus(TEST_64X64_I_P_B_P);
         let mut planner = H265Planner::new();
         let mut slots: Option<SlotMap> = None;
         let mut b_pictures_seen = 0usize;
@@ -894,6 +757,7 @@ mod tests {
     fn mini_slice(refs0: &[RefPic], refs1: &[RefPic]) -> SlicePlan {
         SlicePlan {
             data: 0..32,
+            nal: 3..32,
             header: SliceHeader::default(),
             ref_list0: refs0.to_vec(),
             ref_list1: refs1.to_vec(),
@@ -1182,6 +1046,7 @@ mod tests {
             },
             slices: vec![SlicePlan {
                 data: 0..32,
+                nal: 3..32,
                 header,
                 ref_list0: vec![st_ref(1, 0)],
                 ref_list1: Vec::new(),

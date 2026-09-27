@@ -26,7 +26,6 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::io::Cursor;
-use std::mem;
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -58,6 +57,13 @@ use crate::sei;
 pub use crate::sei::RecoveryPointHevc;
 
 pub mod conceal;
+mod refs;
+
+pub use refs::CurrentRefs;
+pub use refs::RefRpsIdxError;
+pub use refs::RpsError;
+pub use refs::RPS_SET_LEN;
+pub use refs::RPS_UNUSED;
 
 /// Everything a backend needs to submit one access unit.
 #[derive(Debug, Clone)]
@@ -166,6 +172,9 @@ pub struct SlicePlan {
     /// Byte range of the slice NALU in the input AU, start code included.
     /// Hardware takes the raw bitstream, so the plan points instead of copying.
     pub data: Range<usize>,
+    /// [`Self::data`] from the NAL header on, start code dropped. The three
+    /// bytes before it are always `00 00 01`.
+    pub nal: Range<usize>,
     /// Parsed slice-segment header. For a dependent segment this is COMPLETED
     /// (7.4.7.1 inherited fields already copied); backends never see a partial.
     pub header: SliceHeader,
@@ -194,7 +203,7 @@ pub enum PlanWarning {
 
 impl PlanWarning {
     /// Whether the PICTURE is damaged. Twin of [`crate::h264::PlanWarning::is_integrity`];
-    /// `pf_vkdecode::is_integrity_warning_h265` delegates here.
+    /// every backend conceals on this.
     ///
     /// `NonZeroReorder` is not damage: it fires on the AU that activates an SPS
     /// (opening IRAP, ABR resolution change). Treating it as concealment would
@@ -412,19 +421,11 @@ pub struct H265Planner {
     /// (7.4.7.1).
     last_independent_header: Option<SliceHeader>,
     next_pic_id: PicId,
-    /// Display-ready pictures queued while planning. Not cleared on a failed AU:
-    /// the next [`DpbUpdate`] carries them, so an error cannot swallow a frame.
-    pending_outputs: Vec<PicId>,
-    /// Ids the last [`DpbUpdate`] left alive: baseline for `removed`. Kept
-    /// across failed AUs so interim evictions are reported, never dropped.
-    reported_live: BTreeSet<PicId>,
-    /// The picture the last plan stored: the one a wave's close mark names.
-    last_stored: Option<PicId>,
     /// Set by [`Self::flush`]: planning resumes only at an IRAP.
     awaiting_idr: bool,
-    /// Resident pictures that came off a broken chain — the fact behind
-    /// [`PicturePlan::references_clean`]. See [`crate::clean::CleanLedger`].
-    clean: crate::clean::CleanLedger,
+    /// Outputs, `removed` baseline and the unclean marks behind
+    /// [`PicturePlan::references_clean`].
+    report: crate::report::AuReporter,
 }
 
 impl Default for H265Planner {
@@ -441,11 +442,8 @@ impl Default for H265Planner {
             first_picture_after_eos: true,
             last_independent_header: None,
             next_pic_id: 0,
-            pending_outputs: Vec::new(),
-            reported_live: BTreeSet::new(),
-            last_stored: None,
             awaiting_idr: false,
-            clean: Default::default(),
+            report: Default::default(),
         }
     }
 }
@@ -645,16 +643,17 @@ impl H265Planner {
         let cur = current
             .ok_or_else(|| PlanError::Parse("access unit contains no coded picture".into()))?;
 
-        // Ask over the slice lists, not the RPS/DPB snapshot: 8.3.2 retains
-        // pictures this AU does not use (`used_by_curr_pic` clear). An IRAP's
-        // lists are empty, so this is vacuously true (`CleanLedger`); a
-        // concealed picture's own warnings keep it unclean.
-        let references_clean = self.clean.references_clean(
+        // 8.3.2 retains pictures this AU does not use (`used_by_curr_pic`
+        // clear), so the slice lists decide. An IRAP's lists are empty, so this
+        // is vacuously true; a concealed picture's own warnings keep it unclean.
+        let concealed = warnings.iter().any(PlanWarning::is_integrity);
+        let references_clean = self.report.references_clean(
             slices
                 .iter()
                 .flat_map(|s: &SlicePlan| s.ref_list0.iter().chain(&s.ref_list1))
                 .map(|r| r.id),
-        ) && !warnings.iter().any(PlanWarning::is_integrity);
+            concealed,
+        );
         let picture = Self::picture_plan(&cur, recovery_point, references_clean);
         let rps = cur.rps_plan.clone();
         let dpb_refs = cur.dpb_refs.clone();
@@ -662,36 +661,15 @@ impl H265Planner {
         let pps = Rc::clone(&cur.first_slice_pps);
         let sps = Rc::clone(&pps.sps);
         let stored = self.finish_picture(cur)?;
-
-        // `removed` is vs what the backend last saw alive, not this call's
-        // start: a failed AU in between may have evicted pictures.
-        let live_after = self.live_ids();
-        let mut previously_live = mem::take(&mut self.reported_live);
-        previously_live.insert(stored);
-        let removed = previously_live.difference(&live_after).copied().collect();
-        self.reported_live = live_after;
-        self.last_stored = Some(stored);
-
-        // After `finish_picture` so `stored` is the real id and `live_after`
-        // reflects C.3.4/8.3.2 marking. A pre-marking write could survive an
-        // eviction. `is_integrity` is the one classification, so the ledger
-        // and the consumer cannot disagree.
-        self.clean.note_stored(
-            stored,
-            references_clean,
-            warnings.iter().any(PlanWarning::is_integrity),
-        );
-        self.clean.retain_live(self.reported_live.iter().copied());
+        let dpb = self
+            .report
+            .close(stored, self.live_ids(), references_clean, concealed);
 
         Ok(AuPlan {
             picture,
             rps,
             slices,
-            dpb: DpbUpdate {
-                stored: Some(stored),
-                outputs: mem::take(&mut self.pending_outputs),
-                removed,
-            },
+            dpb,
             dpb_refs,
             warnings,
             sps,
@@ -706,9 +684,7 @@ impl H265Planner {
     /// asks for the IDR. Every P this decoder meets names one active reference, the
     /// picture before it, so a healthy stream reads clean from the close on.
     pub fn forgive_unclean(&mut self) {
-        if let Some(id) = self.last_stored {
-            self.clean.forgive(id);
-        }
+        self.report.forgive_last();
     }
 
     /// Drain the DPB: every still-buffered picture becomes display-ready and
@@ -717,8 +693,7 @@ impl H265Planner {
     /// 8.3 decoding state is discarded; planning resumes only at an IRAP
     /// ([`PlanError::AwaitingIdr`]). Parameter sets survive (7.4.2.4).
     pub fn flush(&mut self) -> DpbUpdate {
-        let mut removed = mem::take(&mut self.reported_live);
-        removed.extend(self.live_ids());
+        let live = self.live_ids();
         self.drain_dpb();
 
         self.rps = Default::default();
@@ -730,14 +705,7 @@ impl H265Planner {
         // (8.1.3), which is what makes non-IDR re-entry sound.
         self.first_picture_after_eos = true;
         self.awaiting_idr = true;
-        // DPB is empty; resume is an IRAP, clean by construction.
-        self.clean.clear();
-
-        DpbUpdate {
-            stored: None,
-            outputs: mem::take(&mut self.pending_outputs),
-            removed: removed.into_iter().collect(),
-        }
+        self.report.flush(live)
     }
 
     /// Envelope: no interlaced video, separate-colour-plane, SCC self-reference,
@@ -825,7 +793,7 @@ impl H265Planner {
                 break;
             }
             match self.dpb.bump(false) {
-                Some(entry) => self.pending_outputs.push(entry.1),
+                Some(entry) => self.report.pending_outputs.push(entry.1),
                 None => break,
             }
         }
@@ -833,7 +801,9 @@ impl H265Planner {
 
     fn drain_dpb(&mut self) {
         let pics = self.dpb.drain();
-        self.pending_outputs.extend(pics.into_iter().map(|e| e.1));
+        self.report
+            .pending_outputs
+            .extend(pics.into_iter().map(|e| e.1));
         self.dpb.clear();
     }
 
@@ -1224,6 +1194,7 @@ impl H265Planner {
         }
 
         Ok(SlicePlan {
+            nal: data.start + slice.nalu.offset..data.end,
             data,
             header: slice.header,
             ref_list0,
@@ -1454,55 +1425,17 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::testing::split_h265_aus;
 
-    const TEST_25FPS: &[u8] =
-        include_bytes!("../vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265");
-    const TEST_BEAR: &[u8] =
-        include_bytes!("../vendor/cros-codecs/src/codec/h265/test_data/bear.h265");
-    const TEST_BBB: &[u8] =
-        include_bytes!("../vendor/cros-codecs/src/codec/h265/test_data/bbb.h265");
-    const TEST_64X64_I_P_B_P: &[u8] =
-        include_bytes!("../vendor/cros-codecs/src/codec/h265/test_data/64x64-I-P-B-P.h265");
-
-    /// Split a raw Annex-B vector into the pre-split AUs `plan_au` takes. A new
-    /// AU starts at a non-VCL NALU after slices, or at a slice with
-    /// `first_slice_segment_in_pic_flag == 1` (first payload bit after the 2-byte
-    /// NAL header) once the current AU already has slices.
-    pub(super) fn split_into_aus(stream: &[u8]) -> Vec<&[u8]> {
-        let mut aus = Vec::new();
-        let mut cursor = Cursor::new(stream);
-        let mut au_start = 0usize;
-        let mut au_has_slice = false;
-
-        while let Ok(nalu) = Nalu::next(&mut cursor) {
-            let header_start = cursor.position() as usize;
-            let start = header_start - nalu.offset;
-            let is_slice = (nalu.header.type_ as u32) < 32;
-            let first_slice_flag =
-                is_slice && stream.get(header_start + 2).is_some_and(|b| b & 0x80 != 0);
-
-            if au_has_slice && (!is_slice || first_slice_flag) {
-                aus.push(&stream[au_start..start]);
-                au_start = start;
-                au_has_slice = false;
-            }
-            au_has_slice |= is_slice;
-        }
-        aus.push(&stream[au_start..]);
-        aus
-    }
-
-    /// Integrity warnings a clean stream must not produce. Delegates rather than
-    /// restating: a `matches!` here would treat a future variant as clean.
-    /// [`PlanWarning::is_integrity`] is exhaustive, so a new variant fails there.
-    fn is_integrity_warning(w: &PlanWarning) -> bool {
-        w.is_integrity()
-    }
+    const TEST_25FPS: &[u8] = crate::testing::H265_25FPS;
+    const TEST_BEAR: &[u8] = crate::testing::H265_BEAR;
+    const TEST_BBB: &[u8] = crate::testing::H265_BBB;
+    const TEST_64X64_I_P_B_P: &[u8] = crate::testing::H265_64X64_I_P_B_P;
 
     /// Plan a vendored clip: every AU plans, no integrity warnings, every stored
     /// id reaches output once, outputs ascend POC within each IRAP period.
     fn plan_whole_clip(stream: &[u8]) -> (H265Planner, Vec<AuPlan>) {
-        let aus = split_into_aus(stream);
+        let aus = split_h265_aus(stream);
         let mut planner = H265Planner::new();
         let mut plans = Vec::new();
         for au in &aus {
@@ -1515,7 +1448,7 @@ mod tests {
 
         for plan in &plans {
             assert!(
-                !plan.warnings.iter().any(is_integrity_warning),
+                !plan.warnings.iter().any(PlanWarning::is_integrity),
                 "clean vector produced an integrity warning: {:?}",
                 plan.warnings
             );
@@ -1570,7 +1503,7 @@ mod tests {
 
     #[test]
     fn the_full_25fps_vector_plans_every_picture_and_every_pic_id_reaches_output() {
-        let aus = split_into_aus(TEST_25FPS);
+        let aus = split_h265_aus(TEST_25FPS);
         assert_eq!(aus.len(), 250, "the vendored golden: 250 pictures");
         let (_, plans) = plan_whole_clip(TEST_25FPS);
         assert_eq!(plans.len(), 250);
@@ -1605,7 +1538,7 @@ mod tests {
         let path = std::env::var("PF_H265_DUMP").expect("PF_H265_DUMP=<capture>");
         let bytes = std::fs::read(&path).expect("read the capture");
         let mut planner = H265Planner::new();
-        for (i, au) in split_into_aus(&bytes).iter().enumerate() {
+        for (i, au) in split_h265_aus(&bytes).iter().enumerate() {
             let plan = planner.plan_au(au).expect("plan");
             let refs: Vec<i32> = plan
                 .slices
@@ -1646,7 +1579,7 @@ mod tests {
 
     #[test]
     fn b_slices_get_a_future_led_list1_distinct_from_list0() {
-        let aus = split_into_aus(TEST_64X64_I_P_B_P);
+        let aus = split_h265_aus(TEST_64X64_I_P_B_P);
         let mut planner = H265Planner::new();
         let mut b_slices_seen = 0usize;
 
@@ -2904,7 +2837,7 @@ mod tests {
 
     #[test]
     fn a_dropped_reference_au_degrades_to_warnings_and_planning_continues() {
-        let aus = split_into_aus(TEST_25FPS);
+        let aus = split_h265_aus(TEST_25FPS);
 
         // Droppable AU: non-IRAP reference not followed by an IRAP (that would
         // reset state and hide the loss).
@@ -3139,7 +3072,7 @@ mod tests {
              plus the current one. A-2 would have said 16 here, because 1920x1088 = \
              2088960 luma samples fall under MaxLumaPs(L5.1) >> 2 = 2228224."
         );
-        // One slot per DPB picture plus one in flight (`pf_vkdecode::slots`).
+        // One slot per DPB picture plus one in flight (`crate::slots`).
         let slots_for = |plan: &AuPlan| plan.picture.max_dpb_frames + 1;
         assert!(
             slots_for(&at_1080p) <= VULKAN_MAX_DPB_SLOTS,

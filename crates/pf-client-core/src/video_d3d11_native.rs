@@ -385,7 +385,7 @@ impl NativeD3d11Decoder {
             let damaged = plan
                 .warnings
                 .iter()
-                .any(pf_dxvadec::is_integrity_warning_av1);
+                .any(pf_dxvadec::PlanWarningAv1::is_integrity);
             concealed |= damaged;
             match self.frame_av1(au, plan, damaged) {
                 Ok(Some(frame)) => shown = Some(frame),
@@ -596,7 +596,10 @@ impl NativeD3d11Decoder {
                     }
                     Err(e) => bail!("plan: {e}"),
                 };
-                let concealed = plan.warnings.iter().any(pf_dxvadec::is_integrity_warning);
+                let concealed = plan
+                    .warnings
+                    .iter()
+                    .any(pf_dxvadec::PlanWarning::is_integrity);
                 let session = ensure_session(
                     &mut self.session,
                     &self.device,
@@ -656,7 +659,7 @@ impl NativeD3d11Decoder {
                 let concealed = plan
                     .warnings
                     .iter()
-                    .any(pf_dxvadec::is_integrity_warning_h265);
+                    .any(pf_dxvadec::PlanWarningH265::is_integrity);
                 let session = ensure_session(
                     &mut self.session,
                     &self.device,
@@ -1434,6 +1437,9 @@ mod parity {
 
     use std::collections::HashMap;
 
+    use pf_bitstream::testing::split_h264_aus;
+    use pf_bitstream::testing::split_h265_aus;
+    use pf_bitstream::testing::split_ivf;
     use pf_dxvadec::H264Planner;
     use pf_dxvadec::H265Planner;
     use sha2::Digest;
@@ -1448,13 +1454,9 @@ mod parity {
 
     use super::*;
 
-    const TEST_25FPS_H264: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264"
-    );
+    const TEST_25FPS_H264: &[u8] = pf_bitstream::testing::H264_25FPS;
 
-    const TEST_25FPS_H265: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265"
-    );
+    const TEST_25FPS_H265: &[u8] = pf_bitstream::testing::H265_25FPS;
 
     /// libavcodec NV12 hashes. Same files as the Vulkan rung, not a copy.
     const GOLDENS_H264: &str = include_str!("../../pf-vkdecode/tests/data/test-25fps.nv12.sha256");
@@ -1491,9 +1493,7 @@ mod parity {
     const MAIN10_FRAME_COUNT: usize = 50;
 
     /// Vendored AV1 vector — IVF, not an elementary stream. Same file as `pf-vkdecode`.
-    const TEST_25FPS_AV1: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1"
-    );
+    const TEST_25FPS_AV1: &[u8] = pf_bitstream::testing::AV1_25FPS;
 
     /// libavcodec per-delivered-frame NV12 hashes for the AV1 vector (320x240).
     const GOLDENS_AV1: &str =
@@ -1537,97 +1537,6 @@ mod parity {
                 let _ = write!(out, "{byte:02x}");
                 out
             })
-    }
-
-    /// Byte offsets of every Annex-B NAL header. Emulation prevention means
-    /// `00 00 01` cannot appear inside a payload. Hand-rolled: `pf-client-core`
-    /// does not depend on the vendored parser; AU-count asserts keep it honest.
-    fn nal_headers(stream: &[u8]) -> Vec<usize> {
-        let mut out = Vec::new();
-        let mut i = 0usize;
-        while i + 3 <= stream.len() {
-            if stream[i..i + 3] == [0x00, 0x00, 0x01] {
-                out.push(i + 3);
-                i += 3;
-            } else {
-                i += 1;
-            }
-        }
-        out
-    }
-
-    /// Split into access units given `(is_slice, starts_a_picture)`. A new AU
-    /// begins at a non-VCL after slices, or at a first-of-picture slice when the
-    /// current AU already has slices — pf-bitstream's rule, once for both codecs.
-    fn split_aus(stream: &[u8], classify: impl Fn(&[u8], usize) -> (bool, bool)) -> Vec<&[u8]> {
-        let mut aus = Vec::new();
-        let mut au_start = 0usize;
-        let mut au_has_slice = false;
-        for header in nal_headers(stream) {
-            let (is_slice, first_in_picture) = classify(stream, header);
-            // Start code owning this header: three bytes, plus the optional
-            // leading zero of the four-byte form.
-            let mut start = header - 3;
-            if start > 0 && stream[start - 1] == 0x00 {
-                start -= 1;
-            }
-            if au_has_slice && (!is_slice || first_in_picture) {
-                aus.push(&stream[au_start..start]);
-                au_start = start;
-                au_has_slice = false;
-            }
-            au_has_slice |= is_slice;
-        }
-        aus.push(&stream[au_start..]);
-        aus
-    }
-
-    /// One-byte NAL header; `nal_unit_type` in the low 5 bits (1 = non-IDR, 5 = IDR).
-    /// `first_mb_in_slice == 0` is the top bit of the next byte.
-    fn split_h264_aus(stream: &[u8]) -> Vec<&[u8]> {
-        split_aus(stream, |s, h| {
-            let is_slice = matches!(s[h] & 0x1f, 1 | 5);
-            let first = is_slice && s.get(h + 1).is_some_and(|b| b & 0x80 != 0);
-            (is_slice, first)
-        })
-    }
-
-    /// Two-byte NAL header; `nal_unit_type` in bits 1..7 of the first byte.
-    /// Slice if type `< 32`; `first_slice_segment_in_pic_flag` is the top bit at `+2`.
-    fn split_h265_aus(stream: &[u8]) -> Vec<&[u8]> {
-        split_aus(stream, |s, h| {
-            let is_slice = (s[h] >> 1) & 0x3f < 32;
-            let first = is_slice && s.get(h + 2).is_some_and(|b| b & 0x80 != 0);
-            (is_slice, first)
-        })
-    }
-
-    /// IVF frames in file order: 32-byte `DKIF` header, then `[u32 size][u64 pts][size]`.
-    /// Hand-rolled for the same reason as `nal_headers`; unit-count asserts keep it honest.
-    fn split_ivf(stream: &[u8]) -> Vec<&[u8]> {
-        assert_eq!(
-            &stream[0..4],
-            b"DKIF",
-            "the vendored AV1 vector must be an IVF file"
-        );
-        let header = usize::from(u16::from_le_bytes([stream[6], stream[7]]));
-        let mut out = Vec::new();
-        let mut at = header;
-        while at + 12 <= stream.len() {
-            let size = u32::from_le_bytes(
-                stream[at..at + 4]
-                    .try_into()
-                    .expect("four bytes make a u32"),
-            ) as usize;
-            at += 12;
-            assert!(
-                at + size <= stream.len(),
-                "an IVF frame header claims {size} bytes past the end of the file"
-            );
-            out.push(&stream[at..at + size]);
-            at += size;
-        }
-        out
     }
 
     /// Decode order and display order as `PicId`s, from a planner run alongside the

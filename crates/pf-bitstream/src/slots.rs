@@ -1,13 +1,20 @@
-//! Maps planner [`PicId`]s to the DPB slot indices a Vulkan Video session binds
-//! images by.
+//! Maps planner [`PicId`]s to the DPB slot indices a decode backend binds
+//! pictures by: a Vulkan Video slot, a DXVA `Index7Bits`, a VAAPI surface index.
 //!
-//! pf-bitstream owns which pictures live; this ledger only translates those
+//! The planners own which pictures live; this ledger only translates those
 //! verdicts. It never evicts: [`SlotError::Full`] means a `removed` entry was
 //! missed. A silent eviction would hide that behind corrupted output.
 
-use pf_bitstream::h264::DpbUpdate;
-use pf_bitstream::h264::PicId;
 use tracing::trace;
+
+use crate::h264::DpbUpdate;
+use crate::h264::PicId;
+
+/// Extra pictures the consumer may hold (delivered, unreleased) on top of
+/// the stream's DPB depth. Pool size is `required_slots + HOLD_HEADROOM`.
+/// 8 covers ~4–7 in-flight frames with one frame of slack; holding more
+/// is `NoFreeSlot`.
+pub const HOLD_HEADROOM: u32 = 8;
 
 /// The H.264 slot ceiling: 16 reference frames plus the picture being decoded.
 const MAX_SLOTS: usize = 17;
@@ -41,21 +48,33 @@ impl std::fmt::Display for SlotError {
 
 impl std::error::Error for SlotError {}
 
+/// When [`SlotMap::commit_setup`] ends the residency of an AU's `removed` ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Removals {
+    /// Return them for release after the decode is issued: an H.264 AU may
+    /// name a picture its own marking evicts.
+    Defer,
+    /// Release them before the setup slot is assigned: the H.265 RPS drops
+    /// pictures before decode, and VAAPI takes its target surface up front.
+    ReleaseNow,
+}
+
 /// Per-session PicId → slot index. Feed every [`DpbUpdate`] in decode order.
 ///
-/// [`Self::apply`] releases `removed` immediately. `plan_to_vk` and
-/// `plan_to_vk_av1` assign the stored picture and return removals as
+/// [`Self::apply`] releases `removed` immediately. The Vulkan and DXVA H.264
+/// and AV1 converters assign the stored picture and return removals as
 /// `release_after_decode` — apply that list only after the decode is issued.
 /// Releasing first lets [`Self::assign`] recycle a slot this AU still names.
 /// Dropping the list leaks one slot per AU.
 ///
-/// `plan_to_vk_h265` applies removals internally: `H265Planner` snapshots
+/// The H.265 converters apply removals internally: `H265Planner` snapshots
 /// `dpb_refs` after `decode_rps`, so a dropped picture is never in this AU's
-/// reference lists.
+/// reference lists. The VAAPI converters do too: VAAPI binds surfaces, not
+/// slots, and takes its target surface up front.
 ///
-/// Slots are planner bookkeeping. The picture pool binds a fresh image on
-/// re-activation, so a delivered image is never a decode target while a
-/// consumer reads it.
+/// Slots are planner bookkeeping. The backend's picture pool binds a fresh
+/// image on re-activation, so a delivered image is never a decode target
+/// while a consumer reads it.
 #[derive(Debug, Clone)]
 pub struct SlotMap {
     slots: Vec<Option<PicId>>,
@@ -120,8 +139,9 @@ impl SlotMap {
 
     /// End DPB residency for `id`. A picture holds its slot while the planner
     /// holds it as a reference or as a decoded picture awaiting output; only a
-    /// [`DpbUpdate::removed`] entry ends that. `plan_to_vk` / `plan_to_vk_av1`
-    /// defer this via `release_after_decode` until the decode is issued.
+    /// [`DpbUpdate::removed`] entry ends that. The Vulkan and DXVA H.264 and
+    /// AV1 converters defer this via `release_after_decode` until the decode
+    /// is issued.
     ///
     /// The slot becomes assignable immediately. Keeping the IMAGE out of reuse
     /// until in-flight decodes complete is the backend's job, not this ledger's.
@@ -133,6 +153,40 @@ impl SlotMap {
             }
             None => false,
         }
+    }
+
+    /// A converter's last step: end `removed` per `removals`, then give `setup`
+    /// its slot. Returns that slot and the ids left for release after decode
+    /// (empty for [`Removals::ReleaseNow`]).
+    ///
+    /// `setup` itself can be in `removed`: a non-reference picture with no free
+    /// frame buffer is stored and evicted in one plan. It still gets a slot for
+    /// the decode and is released at once, so it is never handed back as a
+    /// deferred id.
+    pub fn commit_setup(
+        &mut self,
+        setup: PicId,
+        removed: &[PicId],
+        removals: Removals,
+    ) -> Result<(u8, Vec<PicId>), SlotError> {
+        let others = removed.iter().copied().filter(|&id| id != setup);
+        let release_after_decode = match removals {
+            Removals::Defer => others.collect(),
+            Removals::ReleaseNow => {
+                for id in others {
+                    if !self.release(id) {
+                        // Reachable only if the caller skipped an AU's plan.
+                        trace!(id, "DpbUpdate removed an id this SlotMap never assigned");
+                    }
+                }
+                Vec::new()
+            }
+        };
+        let slot = self.assign(setup)?;
+        if removed.contains(&setup) {
+            self.release(setup);
+        }
+        Ok((slot, release_after_decode))
     }
 
     /// Release every `removed` id. `outputs` is display order, not residency:
@@ -227,6 +281,30 @@ mod tests {
         });
         assert_eq!(slots.slot_of(1), Some(0));
         assert_eq!(slots.slot_of(2), None);
+    }
+
+    #[test]
+    fn commit_setup_defers_or_releases_removals_and_never_defers_the_setup() {
+        let mut slots = SlotMap::new(3);
+        slots.assign(1).unwrap();
+        slots.assign(2).unwrap();
+        let (slot, deferred) = slots.commit_setup(3, &[1, 3], Removals::Defer).unwrap();
+        assert_eq!(slot, 2);
+        assert_eq!(
+            deferred,
+            vec![1],
+            "a stored-and-evicted setup is not deferred"
+        );
+        assert_eq!(slots.slot_of(1), Some(0), "deferred ids keep their slot");
+        assert_eq!(slots.slot_of(3), None, "the evicted setup leaves at once");
+
+        let (slot, deferred) = slots.commit_setup(4, &[1], Removals::ReleaseNow).unwrap();
+        assert!(deferred.is_empty());
+        assert_eq!(
+            slot, 0,
+            "ReleaseNow frees the removed slot before assigning"
+        );
+        assert_eq!(slots.slot_of(1), None);
     }
 
     #[test]

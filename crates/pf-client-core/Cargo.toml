@@ -250,6 +250,8 @@ sha2 = "0.11"
 # deliberately doesn't need.
 log = "0.4"
 tracing-subscriber = { version = "0.3" }
+# `pf_bitstream::testing`: the vendored vectors and access-unit splitters.
+pf-bitstream = { path = "../pf-bitstream", features = ["test-vectors"] }
 
 # PyroWave decode (the opt-in wired-LAN wavelet codec, design/pyrowave-codec-plan.md
 # §4.5) — pure Vulkan compute on the device the frame is presented from, so it builds
@@ -290,7 +292,6 @@ desktop = [
 ]
 # DXVA device and native rung. `desktop` includes it. The `windows` header list
 # stays the full set, because clipboard.rs needs `winuser` and `winbase`.
-# `pf-dxvadec` also links `pf-vkdecode` for `SlotMap` — bindings, loaded at runtime.
 d3d11va = ["dep:pf-dxvadec", "dep:windows"]
 # `discovery` is the mDNS browse (`mdns-sd`, `async-channel`) without the rest of `desktop`.
 # `desktop` includes it, so every desktop consumer is unchanged, and still names

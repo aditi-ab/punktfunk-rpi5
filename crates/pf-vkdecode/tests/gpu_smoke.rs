@@ -256,7 +256,7 @@ fn av1_decodes_48_aus_holding_four_frames_like_the_real_client() {
         );
         smoke(
             &mut decoder,
-            &common::split_av1_aus(common::TEST_25FPS_AV1),
+            &common::split_ivf(common::TEST_25FPS_AV1),
             &Geometry {
                 display: (320, 240),
                 // AV1 decode extent is the post-superres width and granularity is
@@ -314,7 +314,7 @@ fn the_delivery_floor_is_under_what_the_planners_emit_from_the_first_48_aus() {
         let mut planner = pf_bitstream::av1::Av1Planner::new();
         let mut outputs = 0usize;
         let mut frames = 0usize;
-        for (index, au) in common::split_av1_aus(common::TEST_25FPS_AV1)
+        for (index, au) in common::split_ivf(common::TEST_25FPS_AV1)
             .iter()
             .take(AUS)
             .enumerate()

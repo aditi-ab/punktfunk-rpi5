@@ -16,7 +16,11 @@ pub mod av1;
 pub mod clean;
 pub mod h264;
 pub mod h265;
+mod report;
 pub mod sei;
+pub mod slots;
+#[cfg(any(test, feature = "test-vectors"))]
+pub mod testing;
 
 #[cfg(test)]
 mod plan_error_tests {
@@ -37,6 +41,68 @@ mod plan_error_tests {
     }
 }
 
+#[cfg(test)]
+mod integrity_tests {
+    use crate::{av1, h264, h265};
+
+    #[test]
+    fn damage_is_a_lost_reference_or_a_short_au_and_nothing_else() {
+        for w in [
+            h264::PlanWarning::FrameNumGap {
+                expected: 4,
+                got: 7,
+            },
+            h264::PlanWarning::MissingReference {
+                context: "list0",
+                detail: "poc 12".into(),
+            },
+            h264::PlanWarning::TruncatedAu { offset: 900 },
+        ] {
+            assert!(w.is_integrity(), "{w:?} is damage");
+        }
+        assert!(
+            !h264::PlanWarning::Mmco5Rebase.is_integrity(),
+            "an MMCO 5 was planned in FULL — dropping its frame would hitch a \
+             correct stream"
+        );
+
+        for w in [
+            h265::PlanWarning::MissingReference {
+                context: "StCurrBefore",
+                detail: "poc 12".into(),
+            },
+            h265::PlanWarning::TruncatedAu { offset: 900 },
+        ] {
+            assert!(w.is_integrity(), "{w:?} is damage");
+        }
+        assert!(
+            !h265::PlanWarning::NonZeroReorder {
+                max_num_reorder_pics: 1
+            }
+            .is_integrity(),
+            "SPS activation is not damage — it fires on the opening IDR and on \
+             every ABR renegotiation's IDR"
+        );
+    }
+
+    /// Guards reclassification of an AV1 warning as clean. A new variant is
+    /// caught by the exhaustive match, not this hand list.
+    /// `MissingShowExisting` is damage: the screen keeps the previous picture.
+    #[test]
+    fn every_av1_warning_is_damage_because_av1_has_no_envelope_signal() {
+        for w in [
+            av1::PlanWarning::MissingReference {
+                slot: 3,
+                ref_index: 1,
+            },
+            av1::PlanWarning::MissingShowExisting { slot: 5 },
+            av1::PlanWarning::TruncatedAu { offset: 900 },
+        ] {
+            assert!(w.is_integrity(), "{w:?} is damage");
+        }
+    }
+}
+
 // Golden counts from the vendored snapshot's own vectors. A cros-codecs re-sync that
 // shifts parser behaviour must trip here, not in a decode session.
 #[cfg(test)]
@@ -51,14 +117,10 @@ mod vendor_smoke {
     use cros_codecs::codec::h265::parser::Nalu as H265Nalu;
     use cros_codecs::codec::h265::parser::Parser as H265Parser;
 
-    const H264_25FPS: &[u8] =
-        include_bytes!("../vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264");
-    const H265_25FPS: &[u8] =
-        include_bytes!("../vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265");
-    const AV1_25FPS: &[u8] =
-        include_bytes!("../vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1");
-    const VP9_25FPS: &[u8] =
-        include_bytes!("../vendor/cros-codecs/src/codec/vp9/test_data/test-25fps.vp9");
+    use crate::testing::AV1_25FPS;
+    use crate::testing::H264_25FPS;
+    use crate::testing::H265_25FPS;
+    use crate::testing::VP9_25FPS;
 
     #[test]
     fn h264_parses_the_vendored_vector_to_its_goldens() {

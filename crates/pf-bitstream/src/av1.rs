@@ -22,6 +22,8 @@ use cros_codecs::codec::av1::parser::SequenceHeaderObu;
 
 use crate::h264::ColourDescription;
 
+pub mod tiles;
+
 /// Parsed types a backend conversion names. Re-exported so backends do not reach
 /// into the vendored crate — the same courtesy [`crate::h264`] does for `Sps`/`Pps`.
 pub use cros_codecs::codec::av1::parser::FrameHeaderObu as ParsedFrameHeader;
@@ -245,7 +247,7 @@ pub enum PlanWarning {
 
 impl PlanWarning {
     /// Does this warning mean the picture is damaged? Same contract as
-    /// [`crate::h264::PlanWarning::is_integrity`]; `pf_vkdecode` delegates here.
+    /// [`crate::h264::PlanWarning::is_integrity`]; every backend conceals on this.
     ///
     /// Every AV1 variant is damage: the codec has no reorder envelope and no MMCO
     /// to report, so the only warnings are missing or wrong pictures and a walk
@@ -750,6 +752,7 @@ fn picture_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::AV1_25FPS;
     use cros_codecs::bitstream_utils::IvfIterator;
 
     /// `PF_AV1_DUMP=<capture>` with its `.idx`: print each frame's type, entropy source and
@@ -828,11 +831,6 @@ mod tests {
             "the vendored vector's first unit"
         );
     }
-
-    /// Vendored 25 fps conformance vector. Driven through the planner; the
-    /// crate's vendor-pin smoke test walks the same file through the parser.
-    const AV1_25FPS: &[u8] =
-        include_bytes!("../vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1");
 
     /// Walk the whole vector and check the plan is self-consistent at every frame.
     ///
