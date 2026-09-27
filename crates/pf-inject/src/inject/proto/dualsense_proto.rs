@@ -349,8 +349,8 @@ pub fn serialize_state(r: &mut [u8; DS_INPUT_REPORT_LEN], st: &DsState, seq: u8,
         r[22 + i * 2..24 + i * 2].copy_from_slice(&v.to_le_bytes()); // accel at struct off 21
     }
     r[28..32].copy_from_slice(&ts.to_le_bytes()); // sensor_timestamp (struct off 27)
-    pack_touch(&mut r[33..37], &st.touch[0]); // touch point 1 (struct off 32)
-    pack_touch(&mut r[37..41], &st.touch[1]); // touch point 2
+    pack_touch(&mut r[33..37], &st.touch[0], DS_TOUCH_W, DS_TOUCH_H); // point 1, struct off 32
+    pack_touch(&mut r[37..41], &st.touch[1], DS_TOUCH_W, DS_TOUCH_H);
 
     // IMU temperature: a real pad reads 0x0b–0x14 indoors.
     r[32] = 0x14;
@@ -468,11 +468,12 @@ impl TriggerFb {
     }
 }
 
-fn pack_touch(dst: &mut [u8], t: &Touch) {
-    // byte0: bit7 = NOT active (1 = no contact), bits0-6 = contact id.
+/// One contact as the Sony 4-byte touch point, shared by DualSense and DualShock 4: byte0
+/// bit7 = NOT active, bits0-6 = id; then 12-bit X and Y. `w`/`h` are the pad's extents.
+pub(crate) fn pack_touch(dst: &mut [u8], t: &Touch, w: u16, h: u16) {
     dst[0] = (t.id & 0x7F) | if t.active { 0 } else { 0x80 };
     // The kernel advertises ABS_MT ranges 0..=W-1 / 0..=H-1 — never emit the size itself.
-    let (x, y) = (t.x.min(DS_TOUCH_W - 1), t.y.min(DS_TOUCH_H - 1));
+    let (x, y) = (t.x.min(w - 1), t.y.min(h - 1));
     dst[1] = (x & 0xFF) as u8;
     dst[2] = (((x >> 8) & 0x0F) as u8) | (((y & 0x0F) as u8) << 4);
     dst[3] = ((y >> 4) & 0xFF) as u8;

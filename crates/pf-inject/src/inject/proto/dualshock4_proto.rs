@@ -6,7 +6,7 @@
 //! output report (`0x05`) differ. Offsets match kernel `struct dualshock4_input_report_usb` /
 //! `_output_report_common`. Pin via `tests` here and `crates/pf-inject/tests/motion_contract.rs`.
 
-use super::dualsense_proto::{DsState, Touch};
+use super::dualsense_proto::{pack_touch, DsState};
 
 pub const DS4_VENDOR: u16 = 0x054C;
 pub const DS4_PRODUCT: u16 = 0x09CC;
@@ -24,16 +24,6 @@ pub const DS4_FEATURE_PAIRING: &[u8] = &pf_driver_proto::dualshock4::FEATURE_PAI
 pub const DS4_FEATURE_CALIBRATION: &[u8] = &pf_driver_proto::dualshock4::FEATURE_CALIBRATION;
 pub const DS4_FEATURE_FIRMWARE: &[u8] = &pf_driver_proto::dualshock4::FEATURE_FIRMWARE;
 pub use pf_driver_proto::dualshock4::pairing_reply as ds4_pairing_reply;
-
-/// One contact as the DS4 4-byte point: byte0 bit7 = NOT-active, bits0-6 = id; 12-bit X then Y.
-fn pack_touch(dst: &mut [u8], t: &Touch) {
-    dst[0] = (t.id & 0x7F) | if t.active { 0 } else { 0x80 };
-    // Never emit the extent itself — the kernel advertises 0..=W-1 / 0..=H-1.
-    let (x, y) = (t.x.min(DS4_TOUCH_W - 1), t.y.min(DS4_TOUCH_H - 1));
-    dst[1] = (x & 0xFF) as u8;
-    dst[2] = (((x >> 8) & 0x0F) as u8) | (((y & 0x0F) as u8) << 4);
-    dst[3] = ((y >> 4) & 0xFF) as u8;
-}
 
 /// Pack input report `0x01`. Offsets match kernel `struct dualshock4_input_report_usb`;
 /// a `common` field at struct offset N sits at report byte N+1 (byte 0 is the report id).
@@ -61,8 +51,8 @@ pub fn serialize_state(r: &mut [u8; DS4_INPUT_REPORT_LEN], st: &DsState, counter
     r[30] = 0x10 | 0x0B;
     r[33] = 1; // one touch frame; a real DS4 always sends one
     r[34] = ts as u8;
-    pack_touch(&mut r[35..39], &st.touch[0]);
-    pack_touch(&mut r[39..43], &st.touch[1]);
+    pack_touch(&mut r[35..39], &st.touch[0], DS4_TOUCH_W, DS4_TOUCH_H);
+    pack_touch(&mut r[39..43], &st.touch[1], DS4_TOUCH_W, DS4_TOUCH_H);
 }
 
 /// One HID-output pass: rumble on the 0xCA plane, lightbar as a `Led` on 0xCD.
@@ -101,6 +91,24 @@ pub fn parse_ds4_output(data: &[u8], fb: &mut Ds4Feedback) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dualsense_proto::Touch;
+
+    /// A contact past the pad clamps to the DS4 extent (1919 × 941), not the DualSense one.
+    #[test]
+    fn touch_clamps_to_the_ds4_extent() {
+        let mut st = DsState::neutral();
+        st.touch[0] = Touch {
+            active: true,
+            id: 0,
+            x: u16::MAX,
+            y: u16::MAX,
+        };
+        let mut r = [0u8; DS4_INPUT_REPORT_LEN];
+        serialize_state(&mut r, &st, 0, 0);
+        let x = u16::from(r[36]) | (u16::from(r[37] & 0x0F) << 8);
+        let y = u16::from(r[37] >> 4) | (u16::from(r[38]) << 4);
+        assert_eq!((x, y), (DS4_TOUCH_W - 1, DS4_TOUCH_H - 1));
+    }
 
     /// L2 analog is byte 8, not DualSense's 5. Offsets otherwise match kernel DS4 USB.
     #[test]
