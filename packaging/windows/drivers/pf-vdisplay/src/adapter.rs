@@ -47,7 +47,10 @@ pub fn retry_init() -> bool {
         return false;
     }
     dbglog!("[pf-vd] adapter: no adapter at ADD — re-issuing the init");
-    init_adapter(device as WDFDEVICE) >= 0
+    // SAFETY: `DEVICE` is the WDFDEVICE the last D0 entry ran on. An ADD arrives on that
+    // device's own queue, so the device is live; this WUDFHost hosts no other
+    // (`ProcessSharingDisabled`).
+    unsafe { init_adapter(device as WDFDEVICE) >= 0 }
 }
 
 /// Set once this device takes the remote-session role. The OS starts that adapter itself and then
@@ -60,8 +63,12 @@ pub fn is_seat_role() -> bool {
 }
 
 /// Build the adapter caps (FP16/HDR-capable) and kick off the async adapter creation. Called from
-/// `EvtDeviceD0Entry`; idempotent across re-entrant D0 transitions.
-pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
+/// `EvtDeviceD0Entry`, and from an ADD that found no adapter; idempotent across re-entrant D0
+/// transitions.
+///
+/// # Safety
+/// `device` must be a live `WDFDEVICE`.
+pub unsafe fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     // A D0 entry that lands while the first async init is in flight must not issue a second
     // adapter; last-write-wins on `set_adapter` would leak the first.
     if adapter().is_some() || INIT_PENDING.load(Ordering::Acquire) {
@@ -113,7 +120,7 @@ pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     // IddCx roles are exclusive, so the role is per DEVICE and the hardware id decides it. The
     // shipped console devnode is `Root\pf_vdisplay` and structurally cannot take the seat branch
     // below (`design/windows-seat-display-tier.md`).
-    // SAFETY: `device` is the live WDFDEVICE this D0 entry is initialising, which is the contract
+    // SAFETY: `device` is a live WDFDEVICE per this function's contract, which is the contract
     // `query_hardware_ids` requires.
     let hardware_ids = unsafe { pf_umdf_util::wdf::query_hardware_ids(device) };
     caps.MaxMonitorsSupported = 16;
@@ -179,8 +186,9 @@ pub fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     };
     let mut out = iddcx::IDARG_OUT_ADAPTER_INIT::default();
     INIT_PENDING.store(true, Ordering::Release);
-    // SAFETY: `init`/`out` are valid local storage; IddCxAdapterInitAsync reads the caps synchronously
-    // (the adapter object itself is delivered later via adapter_init_finished). Called once per device.
+    // SAFETY: `device` is live per this function's contract; `init`/`out` are valid local storage
+    // IddCxAdapterInitAsync reads synchronously (the adapter object itself is delivered later via
+    // adapter_init_finished). `INIT_PENDING` keeps a second init from racing this one.
     let st = unsafe { wdk_iddcx::IddCxAdapterInitAsync(&init, &mut out) };
     dbglog!("[pf-vd] IddCxAdapterInitAsync -> {st:#x}");
     if st < 0 {

@@ -51,7 +51,8 @@ pub unsafe extern "C" fn device_d0_entry(
         crate::monitor::cleanup_for_device_removal();
         crate::adapter::clear_adapter();
     }
-    crate::adapter::init_adapter(device)
+    // SAFETY: `device` is the framework's live WDFDEVICE for this D0 entry.
+    unsafe { crate::adapter::init_adapter(device) }
 }
 
 /// Async completion of `IddCxAdapterInitAsync`: stash the adapter for later DDIs — IFF the init
