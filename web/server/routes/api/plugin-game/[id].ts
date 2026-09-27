@@ -14,19 +14,13 @@ import {
 	callPlugin,
 	PLUGIN_ID_RE,
 	pluginJson,
+	validEntryId,
 } from "../../../util/pluginProxy";
-
-/** A library id: `<store>:<external id>`, the external part the provider's own. */
-const validEntry = (v: unknown): v is string =>
-	typeof v === "string" &&
-	v.length <= 256 &&
-	v.includes(":") &&
-	![...v].some((c) => c.charCodeAt(0) < 0x20 || c.charCodeAt(0) === 0x7f);
 
 export default defineEventHandler(async (event) => {
 	const id = getRouterParam(event, "id");
 	const { entry } = getQuery(event);
-	if (!id || !PLUGIN_ID_RE.test(id) || !validEntry(entry)) {
+	if (!id || !PLUGIN_ID_RE.test(id) || !validEntryId(entry)) {
 		setResponseStatus(event, 400);
 		return { error: "not a valid plugin or library id" };
 	}

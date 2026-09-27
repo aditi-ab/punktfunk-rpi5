@@ -64,7 +64,8 @@ classify() {
                     ;;
             esac
             case "$path" in
-                web/*|api/openapi.json|scripts/ci/retry.sh|crates/punktfunk-host/src/library/custom.rs)
+                web/*|api/openapi.json|scripts/ci/retry.sh|clients/shared/library-id-vectors.json|\
+                crates/punktfunk-host/src/library/custom.rs)
                     web=true
                     ;;
             esac
@@ -74,7 +75,8 @@ classify() {
                     ;;
             esac
             case "$path" in
-                sdk/*|plugin-kit/*|api/openapi.json|scripts/ci/retry.sh)
+                sdk/*|plugin-kit/*|api/openapi.json|scripts/ci/retry.sh|\
+                clients/shared/library-id-vectors.json)
                     sdk_plugin_kit=true
                     ;;
             esac
@@ -135,6 +137,8 @@ self_test() {
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     check client-shared 'clients/shared/deeplink-vectors.json' \
         'rust=true rust_arm64=true web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    check library-id-vectors 'clients/shared/library-id-vectors.json' \
+        'rust=true rust_arm64=true web=true docs_site=false sdk_plugin_kit=true decky_typecheck=false'
     # The host's unprivileged launch kinds and the console's copy: each side's test reads the other.
     check launch-kinds-console 'web/src/lib/command-execution.ts' \
         'rust=true rust_arm64=false web=true docs_site=false sdk_plugin_kit=false decky_typecheck=false'

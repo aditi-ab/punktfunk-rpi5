@@ -135,12 +135,18 @@ export const isFresh = (
 	v.identity === identity &&
 	now - v.at < (v.found ? HIT_TTL_MS : MISS_TTL_MS);
 
-/** An `http(s)` URL the host will store. */
+/**
+ * An `http(s)` URL the host will store: at most 2048 UTF-8 bytes, no whitespace or control
+ * characters. clients/shared/library-id-vectors.json pins it.
+ */
 export const isHttpUrl = (u: unknown): u is string =>
 	typeof u === "string" &&
-	/^https?:\/\//.test(u) &&
-	u.length <= 2048 &&
-	!/\s/.test(u);
+	/^https?:\/\/./.test(u) &&
+	new TextEncoder().encode(u).length <= 2048 &&
+	![...u].some((c) => {
+		const n = c.charCodeAt(0);
+		return n < 0x20 || (n >= 0x7f && n <= 0x9f) || /\s/.test(c);
+	});
 
 /** What `found` puts in a push: offered slots and fields only, art only as `http(s)`. */
 export const toRow = (

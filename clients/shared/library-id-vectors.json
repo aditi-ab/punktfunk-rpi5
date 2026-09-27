@@ -1,0 +1,121 @@
+{
+  "$comment": "Library entry ids and art URLs the host accepts (crates/punktfunk-host/src/library/metadata.rs `valid_entry_id`, `valid_remote_url`). The console BFF, the console and the plugin kit reject early with the same rule; each suite runs every case. `value` is the string, or its prefix when `fill` is repeated `count` times after it. Lengths are UTF-8 bytes. Read by: metadata.rs tests, web/server/util/pluginProxy.test.ts, web/src/api/metadata.test.ts, plugin-kit/test/library-ids.test.ts.",
+  "entry_ids": [
+    {
+      "value": "steam:570",
+      "valid": true
+    },
+    {
+      "value": "custom:3f9a0c1b2d4e",
+      "valid": true
+    },
+    {
+      "value": "libretro:snes/Super Metroid (USA)",
+      "valid": true
+    },
+    {
+      "value": "a:b:c",
+      "valid": true
+    },
+    {
+      "value": "steam",
+      "valid": false
+    },
+    {
+      "value": ":570",
+      "valid": false
+    },
+    {
+      "value": "steam:",
+      "valid": false
+    },
+    {
+      "value": "",
+      "valid": false
+    },
+    {
+      "value": "romm:",
+      "fill": "a",
+      "count": 300,
+      "valid": true
+    },
+    {
+      "value": "romm:",
+      "fill": "a",
+      "count": 1019,
+      "valid": true
+    },
+    {
+      "value": "romm:",
+      "fill": "a",
+      "count": 1020,
+      "valid": false
+    },
+    {
+      "value": "romm:",
+      "fill": "é",
+      "count": 600,
+      "valid": false
+    }
+  ],
+  "urls": [
+    {
+      "value": "https://cdn.example/p.png",
+      "valid": true
+    },
+    {
+      "value": "http://cdn.example/p.png?w=600",
+      "valid": true
+    },
+    {
+      "value": "ftp://cdn.example/p.png",
+      "valid": false
+    },
+    {
+      "value": "/home/me/p.png",
+      "valid": false
+    },
+    {
+      "value": "data:image/png;base64,AAAA",
+      "valid": false
+    },
+    {
+      "value": "https://cdn.example/a b.png",
+      "valid": false
+    },
+    {
+      "value": "https://cdn.example/a\tb.png",
+      "valid": false
+    },
+    {
+      "value": "https://cdn.example/a\u0001b.png",
+      "valid": false
+    },
+    {
+      "value": "https://cdn.example/a\u0085b.png",
+      "valid": false
+    },
+    {
+      "value": "https://cdn.example/a\u00a0b.png",
+      "valid": false
+    },
+    {
+      "value": "https://x/",
+      "fill": "a",
+      "count": 2038,
+      "valid": true
+    },
+    {
+      "value": "https://x/",
+      "fill": "a",
+      "count": 2039,
+      "valid": false
+    },
+    {
+      "value": "https://x/",
+      "fill": "é",
+      "count": 1100,
+      "valid": false
+    }
+  ]
+}
