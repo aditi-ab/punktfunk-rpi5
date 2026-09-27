@@ -52,8 +52,8 @@ mod tests {
     }
 
     #[test]
-    fn hints_name_the_host_package() {
-        assert!(channel_hint(InstallKind::Apt).contains("punktfunk-host"));
+    fn hints_upgrade_every_punktfunk_package() {
+        assert!(channel_hint(InstallKind::Apt).contains("'punktfunk*'"));
         assert!(channel_hint(InstallKind::Sysext).contains("punktfunk-sysext update"));
     }
 }
