@@ -1099,6 +1099,15 @@ pub fn probe_reachable_many(
         .collect()
 }
 
+/// [`probe_reachable_many`] for one host: whether it answers at `addr:port` as `fp_hex`.
+#[cfg(not(target_family = "wasm"))]
+pub fn probe_one(addr: &str, port: u16, fp_hex: &str, timeout: std::time::Duration) -> bool {
+    probe_reachable_many(vec![(addr.to_string(), port, fp_hex.to_string())], timeout)
+        .first()
+        .copied()
+        .unwrap_or(false)
+}
+
 /// Whether a probe's answer is the host that was asked for. `answered` is the fingerprint
 /// that replied, or `None` when nothing did; `want` is the record's pin, empty for one saved
 /// by address alone — that has nothing to compare, so any answer is the host it names.

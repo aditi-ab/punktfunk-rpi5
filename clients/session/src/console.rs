@@ -16,6 +16,7 @@ use crate::session_main::{
     arg_flag, arg_value, fullscreen_mode, parse_host_port, session_params, stats_tier, window_pos,
 };
 use pf_client_core::gamepad::is_steam_deck;
+use pf_client_core::orchestrate::{self, WakeOutcome, WAKE_RESEND_SECS, WAKE_TIMEOUT_SECS};
 use pf_client_core::{discovery, library, start, trust, wol};
 use pf_console_ui::{
     ConsoleCmd, ConsoleEntry, ConsoleHandles, ConsoleOptions, ConsoleShared, HostRow, LibraryGame,
@@ -752,7 +753,7 @@ impl ServiceState {
                     tracing::warn!(%key, "forget for an unknown host — ignoring");
                     return;
                 };
-                match pf_client_core::orchestrate::forget_host(&mut known, i) {
+                match orchestrate::forget_host(&mut known, i) {
                     Ok(gone) => {
                         tracing::info!(name = %gone.name, addr = %gone.addr, "host forgotten")
                     }
@@ -1185,9 +1186,9 @@ impl ServiceState {
     }
 }
 
-/// The wake-and-wait loop (one per wake): re-send the magic packet every 6 s, probe the
-/// host once a second, 90 s timeout — the Apple `HostWaker`'s cadence. The thread owns
-/// the model's wake status; the shell reads `online`/`timed_out` and acts.
+/// The wake-and-wait loop (one per wake): [`orchestrate::wake_by_probe`], the cadence every
+/// shell shares. The thread owns the model's wake status; the shell reads
+/// `online`/`timed_out` and acts.
 fn spawn_wake(
     console: ConsoleShared,
     row: HostRow,
@@ -1198,62 +1199,31 @@ fn spawn_wake(
     std::thread::Builder::new()
         .name("punktfunk-wake".into())
         .spawn(move || {
-            let last_ip = row.addr.parse::<Ipv4Addr>().ok();
-            let started = Instant::now();
-            let mut last_packet: Option<Instant> = None;
-            loop {
+            orchestrate::wake_by_probe(&row.addr, row.port, &row.fp_hex, &macs, |tick| {
                 // A cancelled thread writes NOTHING: the card it would clear may already have
                 // been replaced by the next host's, and `CancelWake` cleared the slot itself.
                 if cancel.load(Ordering::SeqCst) {
-                    return;
+                    return false;
                 }
-                let elapsed = started.elapsed();
-                let timed_out = elapsed >= Duration::from_secs(90);
-                if !timed_out && last_packet.is_none_or(|t| t.elapsed() >= Duration::from_secs(6)) {
-                    wol::wake(&macs, last_ip);
-                    last_packet = Some(Instant::now());
-                }
-                let online = trust::probe_reachable_many(
-                    vec![(row.addr.clone(), row.port, row.fp_hex.clone())],
-                    Duration::from_millis(900),
-                )
-                .first()
-                .copied()
-                .unwrap_or(false);
-                // Re-checked after the probe: it blocks for ~900 ms, which is long enough for
-                // the user to go back and start waking a different host.
-                if cancel.load(Ordering::SeqCst) {
-                    return;
-                }
+                // Awake → the shell connects and cancels; timed out → the card waits for Try
+                // Again / Cancel. Either ends this thread; a retry spawns a fresh one.
                 console.set_wake(Some(WakeStatus {
                     key: row.key.clone(),
                     name: row.name.clone(),
-                    seconds: elapsed.as_secs() as u32,
-                    timed_out,
-                    online,
+                    seconds: tick.seconds as u32,
+                    timed_out: tick.outcome == Some(WakeOutcome::TimedOut),
+                    online: tick.outcome == Some(WakeOutcome::Online),
                     then_connect,
                 }));
-                if online || timed_out {
-                    // Awake → the shell connects and cancels; timed out → the card
-                    // waits for Try Again / Cancel. Either way this thread is done —
-                    // a retry spawns a fresh one.
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(1000));
-            }
+                true
+            });
         })
         .ok();
 }
 
-/// How long to keep asking a host we have just sent a magic packet to. A cold box takes
-/// 20–60 s to POST and start serving, so one attempt would almost always land on a machine
-/// that is still booting — the same 90-second budget `spawn_wake` allows.
-const WAKE_ATTEMPTS: u32 = 12;
+/// How often to ask a host we have just sent a magic packet to, across the whole
+/// [`WAKE_TIMEOUT_SECS`] a cold box may take to POST and start serving.
 const WAKE_RETRY_EVERY: Duration = Duration::from_secs(5);
-/// Re-send the magic packet this often while retrying. A single packet can be missed, and some
-/// NICs only wake on a fresh one after dropping into a deeper sleep state — `spawn_wake`'s rule,
-/// expressed in this loop's units (every other attempt ≈ every 10 s).
-const WAKE_RESEND_EVERY: u32 = 2;
 
 /// Fetch the library off the service thread, then stream poster art into the shared
 /// model as results land (the renderer drains `push_art` per frame).
@@ -1286,7 +1256,7 @@ fn spawn_fetch(
     std::thread::Builder::new()
         .name("punktfunk-library".into())
         .spawn(move || {
-            // This worker retries for up to a minute and cannot be cancelled, so the player can
+            // This worker retries for up to 90 s and cannot be cancelled, so the player can
             // be two hosts further on by the time it answers. Every write below asks first
             // whether this fetch still owns the model.
             let mine = || shared.fetch_epoch() == epoch;
@@ -1315,10 +1285,11 @@ fn spawn_fetch(
                 }
             }
 
-            let attempts = if waking { WAKE_ATTEMPTS } else { 1 };
+            let started = Instant::now();
+            let mut last_packet = started;
             let mut last_err = None;
             let mut fetched = None;
-            for attempt in 0..attempts {
+            loop {
                 match library::fetch_games(&addr, mgmt, &identity, pin) {
                     Ok(games) => {
                         fetched = Some(games);
@@ -1327,15 +1298,17 @@ fn spawn_fetch(
                     Err(e) => {
                         // Anything other than "can't reach it" is settled — a rejected
                         // certificate does not become acceptable by waiting, and retrying an
-                        // unpaired host twelve times only delays telling the user what is
+                        // unpaired host for 90 s only delays telling the user what is
                         // actually wrong.
                         let retryable = matches!(e, library::LibraryError::Unreachable(_));
                         last_err = Some(e);
-                        if !retryable || attempt + 1 >= attempts {
+                        let budget = Duration::from_secs(WAKE_TIMEOUT_SECS);
+                        if !waking || !retryable || started.elapsed() >= budget {
                             break;
                         }
-                        if attempt % WAKE_RESEND_EVERY == WAKE_RESEND_EVERY - 1 {
+                        if last_packet.elapsed() >= Duration::from_secs(WAKE_RESEND_SECS) {
                             wol::wake(&macs, last_ip);
+                            last_packet = Instant::now();
                         }
                         std::thread::sleep(WAKE_RETRY_EVERY);
                     }
