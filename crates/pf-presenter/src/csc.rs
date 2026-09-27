@@ -250,6 +250,64 @@ impl CscPass {
 /// Bufferless fullscreen triangle (`fullscreen.vert` + `frag_spv`), dynamic
 /// viewport/scissor. `blend` is premultiplied-alpha over the destination
 /// (overlay); `false` is opaque write (CSC).
+/// CSC straight into a swapchain image, taken when the whole picture lands on the surface at
+/// an exact scale. Skips the video image and its blit: at 4K that is two writes and a read of
+/// 33 MB per frame, most of an iGPU's present cost. Pipelines reuse the two CSC layouts, so
+/// their descriptor sets and push constants bind unchanged; the passes fit the overlay's
+/// per-image framebuffers. `clear` paints the letterbox first, `keep` skips that fill.
+pub struct DirectPass {
+    pub clear: vk::RenderPass,
+    pub keep: vk::RenderPass,
+    pub nv12: vk::Pipeline,
+    pub planar: vk::Pipeline,
+}
+
+impl DirectPass {
+    /// `format` is the swapchain's. Rebuilt with the overlay pipe when that changes.
+    pub fn new(
+        device: &ash::Device,
+        format: vk::Format,
+        nv12_layout: vk::PipelineLayout,
+        planar_layout: vk::PipelineLayout,
+    ) -> Result<DirectPass> {
+        let out = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+        let clear = crate::scale::render_pass(device, format, vk::AttachmentLoadOp::CLEAR, out)?;
+        let mut pass = DirectPass {
+            clear,
+            keep: vk::RenderPass::null(),
+            nv12: vk::Pipeline::null(),
+            planar: vk::Pipeline::null(),
+        };
+        let built = (|| {
+            pass.keep =
+                crate::scale::render_pass(device, format, vk::AttachmentLoadOp::DONT_CARE, out)?;
+            let frag = pf_client_core::video_csc_spv::NV12_CSC_FRAG;
+            pass.nv12 = build_fullscreen_pipeline(device, pass.keep, nv12_layout, frag, false)?;
+            let frag = pf_client_core::video_csc_spv::PLANAR_CSC_FRAG;
+            pass.planar = build_fullscreen_pipeline(device, pass.keep, planar_layout, frag, false)?;
+            Ok::<(), anyhow::Error>(())
+        })();
+        match built {
+            Ok(()) => Ok(pass),
+            Err(e) => {
+                pass.destroy(device);
+                Err(e).context("direct CSC pass")
+            }
+        }
+    }
+
+    /// GPU idle on the last submit that used these.
+    pub fn destroy(&self, device: &ash::Device) {
+        // SAFETY: DESTROY per the crate contract; null handles are skipped by Vulkan.
+        unsafe {
+            device.destroy_pipeline(self.planar, None);
+            device.destroy_pipeline(self.nv12, None);
+            device.destroy_render_pass(self.keep, None);
+            device.destroy_render_pass(self.clear, None);
+        }
+    }
+}
+
 pub(crate) fn build_fullscreen_pipeline(
     device: &ash::Device,
     render_pass: vk::RenderPass,

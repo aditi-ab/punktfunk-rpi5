@@ -276,6 +276,12 @@ struct StreamState {
     /// Consecutive on-glass spacings this window, in whole panel periods: `[0, 1, 2, 3, 4, 5+]`.
     /// The mode is the expected step; everything else is judder.
     win_steps: [u32; 6],
+    /// Non-blocking presents that came back busy this window: [fence, acquire].
+    win_busy: [u32; 2],
+    /// What the held frame waits on. The fence paces the loop itself (the presenter waits
+    /// it for a millisecond per pass), so the pass turns straight around and drains the
+    /// channel first: a newer frame replaces the held one instead of queuing behind it.
+    busy_on: crate::vk::BusyOn,
     last_displayed_ns: u64,
     /// Smoothing: the latch slot the last vended frame was aimed at. One present per
     /// slot; a second frame due before the same slot waits for the next.
@@ -430,6 +436,8 @@ impl StreamState {
             win_misses: 0,
             win_out_max: 0,
             win_steps: [0; 6],
+            win_busy: [0; 2],
+            busy_on: crate::vk::BusyOn::Fence,
             last_displayed_ns: 0,
             last_slot_ns: 0,
             busy_retry: false,
@@ -461,12 +469,11 @@ impl StreamState {
         }
     }
 
-    /// User exit: release capture, close with QUIT_CLOSE_CODE so the host tears down
-    /// instead of lingering, stop the pump. The pump then emits `Ended(None)`.
-    /// The presenter had no swapchain image for `image`: keep it for the next pass and
-    /// wake soon. Newest-wins drops it if a fresher frame has landed meanwhile.
+    /// The presenter found `on` busy for `image`: keep it for the next pass and wake
+    /// soon. Newest-wins drops it if a fresher frame has landed meanwhile.
     fn hold_busy(
         &mut self,
+        on: crate::vk::BusyOn,
         image: Option<DecodedImage>,
         pts_ns: u64,
         decoded_ns: u64,
@@ -482,9 +489,13 @@ impl StreamState {
                 due_ns,
             });
         }
+        self.win_busy[on as usize] += 1;
+        self.busy_on = on;
         self.busy_retry = true;
     }
 
+    /// User exit: release capture, close with QUIT_CLOSE_CODE so the host tears down
+    /// instead of lingering, stop the pump. The pump then emits `Ended(None)`.
     fn request_quit(&mut self) {
         if let Some(cap) = &mut self.capture {
             cap.release(true);
@@ -501,8 +512,12 @@ impl StreamState {
     fn wake_timeout(&self) -> Duration {
         const TICK: Duration = Duration::from_millis(15);
         if self.busy_retry {
-            // A frame is waiting on a swapchain image; a refresh frees one.
-            return Duration::from_millis(1);
+            // The fence wait inside the presenter is the pace; only a full swapchain
+            // needs a refresh to pass.
+            return match self.busy_on {
+                crate::vk::BusyOn::Fence => Duration::ZERO,
+                crate::vk::BusyOn::Acquire => Duration::from_millis(1),
+            };
         }
         if !self.store.is_smoothing() {
             return TICK;
@@ -2218,8 +2233,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                                 true
                             }
                             Ok(Presented::Stale) => false,
-                            Ok(Presented::Busy(input)) => {
-                                st.hold_busy(input.into_image(), pts_ns, decoded_ns, due_ns);
+                            Ok(Presented::Busy(input, on)) => {
+                                st.hold_busy(on, input.into_image(), pts_ns, decoded_ns, due_ns);
                                 false
                             }
                             Err(e) => {
@@ -2248,17 +2263,18 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         let outcome = presenter
                             .present(&window, FrameInput::Cpu(&c), overlay_frame.as_ref())
                             .map(|p| match p {
-                                Presented::Shown => Some(true),
-                                Presented::Stale => Some(false),
-                                Presented::Busy(_) => None,
+                                Presented::Shown => Ok(true),
+                                Presented::Stale => Ok(false),
+                                Presented::Busy(_, on) => Err(on),
                             });
                         match outcome {
-                            Ok(Some(shown)) => {
+                            Ok(Ok(shown)) => {
                                 st.cpu_present_warned = false;
                                 shown
                             }
-                            Ok(None) => {
+                            Ok(Err(on)) => {
                                 st.hold_busy(
+                                    on,
                                     Some(DecodedImage::Cpu(c)),
                                     pts_ns,
                                     decoded_ns,
@@ -2299,8 +2315,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                                 true
                             }
                             Ok(Presented::Stale) => false,
-                            Ok(Presented::Busy(input)) => {
-                                st.hold_busy(input.into_image(), pts_ns, decoded_ns, due_ns);
+                            Ok(Presented::Busy(input, on)) => {
+                                st.hold_busy(on, input.into_image(), pts_ns, decoded_ns, due_ns);
                                 false
                             }
                             // Import/CSC failure is survivable — a streak means this box
@@ -2352,8 +2368,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                                 true
                             }
                             Ok(Presented::Stale) => false,
-                            Ok(Presented::Busy(input)) => {
-                                st.hold_busy(input.into_image(), pts_ns, decoded_ns, due_ns);
+                            Ok(Presented::Busy(input, on)) => {
+                                st.hold_busy(on, input.into_image(), pts_ns, decoded_ns, due_ns);
                                 false
                             }
                             Err(e) => {
@@ -2403,8 +2419,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                                 true
                             }
                             Ok(Presented::Stale) => false,
-                            Ok(Presented::Busy(input)) => {
-                                st.hold_busy(input.into_image(), pts_ns, decoded_ns, due_ns);
+                            Ok(Presented::Busy(input, on)) => {
+                                st.hold_busy(on, input.into_image(), pts_ns, decoded_ns, due_ns);
                                 false
                             }
                             Err(e) => {
@@ -2537,6 +2553,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         misses = st.win_misses,
                         out_max = st.win_out_max,
                         steps = ?st.win_steps,
+                        busy = ?st.win_busy,
                         judder,
                         pace_ms,
                         latch_ms,
@@ -2562,6 +2579,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 st.win_misses = 0;
                 st.win_out_max = 0;
                 st.win_steps = [0; 6];
+                st.win_busy = [0; 2];
             }
         }
 

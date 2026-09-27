@@ -218,7 +218,12 @@ impl SessionParams {
             audio_format: settings.audio_format.clone(),
             preferred_codec: settings.preferred_codec(),
             exclude_codecs: 0,
-            video_caps: crate::video::video_caps_for(advertise_hdr, settings.ten_bit_sdr, caps_444),
+            video_caps: crate::video::video_caps_for(
+                advertise_hdr,
+                settings.ten_bit_sdr,
+                caps_444,
+                crate::video::multi_slice_decodable(probes.vulkan.as_ref().map(|v| v.vendor_id)),
+            ),
             want_444: settings.enable_444,
             display_hdr,
             mic_enabled: settings.mic_enabled,

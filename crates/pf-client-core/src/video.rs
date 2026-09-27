@@ -906,12 +906,29 @@ pub fn amd_vulkan_hdr_driver_notice(
     ))
 }
 
+/// Can this machine's decoders take an access unit of several slices? Intel's Windows
+/// Vulkan Video driver (32.0.101.8993) over-writes a heap table while recording the
+/// decode of any multi-slice HEVC AU; FFmpeg faults at the same instruction. An Intel
+/// GPU on Windows asks the host for one slice per frame instead.
+pub fn multi_slice_decodable(vendor_id: Option<u32>) -> bool {
+    !(cfg!(windows) && vendor_id == Some(VENDOR_INTEL))
+}
+
 /// Desktop `video_caps` from the user switches, testable without a GPU.
-/// Callers AND `want_444` with [`hevc_444_hardware_decodable`] and `hdr_enabled`
-/// with [`hdr_presentable`]. `MULTI_SLICE` is unconditional here; Amlogic
-/// MediaCodec wedges on multi-slice AUs. `ten_bit_sdr` asks for Main10 under SDR.
-pub fn video_caps_for(hdr_enabled: bool, ten_bit_sdr: bool, want_444: bool) -> u8 {
-    let mut caps = punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE;
+/// Callers AND `want_444` with [`hevc_444_hardware_decodable`], `hdr_enabled`
+/// with [`hdr_presentable`] and pass [`multi_slice_decodable`] as `multi_slice`
+/// (Amlogic MediaCodec wedges on multi-slice AUs too). `ten_bit_sdr` asks for
+/// Main10 under SDR.
+pub fn video_caps_for(
+    hdr_enabled: bool,
+    ten_bit_sdr: bool,
+    want_444: bool,
+    multi_slice: bool,
+) -> u8 {
+    let mut caps = 0;
+    if multi_slice {
+        caps |= punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE;
+    }
     if hdr_enabled {
         caps |= punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR;
     }
@@ -1774,27 +1791,44 @@ mod tests {
     fn the_444_bit_needs_the_setting_and_a_device_that_can_decode_it() {
         const V444: u8 = punktfunk_core::quic::VIDEO_CAP_444;
         assert_eq!(
-            video_caps_for(true, false, false) & V444,
+            video_caps_for(true, false, false, true) & V444,
             0,
             "a 4:4:4 promise this device cannot keep costs HEVC entirely"
         );
-        assert_ne!(video_caps_for(true, false, true) & V444, 0);
-        assert_eq!(video_caps_for(true, false, false) & V444, 0);
-        assert_eq!(video_caps_for(false, false, false) & V444, 0);
+        assert_ne!(video_caps_for(true, false, true, true) & V444, 0);
+        assert_eq!(video_caps_for(true, false, false, true) & V444, 0);
+        assert_eq!(video_caps_for(false, false, false, true) & V444, 0);
 
         // 4:4:4 must not disturb 10-bit/HDR (those are not probe-gated).
         const HDR_BITS: u8 =
             punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR;
         for want_444 in [false, true] {
-            assert_eq!(video_caps_for(true, false, want_444) & HDR_BITS, HDR_BITS);
-            assert_eq!(video_caps_for(false, false, want_444) & HDR_BITS, 0);
+            assert_eq!(
+                video_caps_for(true, false, want_444, true) & HDR_BITS,
+                HDR_BITS
+            );
+            assert_eq!(video_caps_for(false, false, want_444, true) & HDR_BITS, 0);
             assert_ne!(
-                video_caps_for(false, false, want_444)
+                video_caps_for(false, false, want_444, true)
+                    & punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE,
+                0
+            );
+            assert_eq!(
+                video_caps_for(false, false, want_444, false)
                     & punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE,
                 0,
-                "MULTI_SLICE is unconditional for this embedder"
+                "a decoder that wedges on slices keeps the bit off"
             );
         }
+    }
+
+    /// Intel on Windows is the one desktop decoder that asks for single-slice AUs.
+    #[test]
+    fn multi_slice_is_refused_only_for_intel_on_windows() {
+        assert!(multi_slice_decodable(None));
+        assert!(multi_slice_decodable(Some(0x10DE)));
+        assert!(multi_slice_decodable(Some(0x1002)));
+        assert_eq!(multi_slice_decodable(Some(VENDOR_INTEL)), !cfg!(windows));
     }
 
     /// 10-bit SDR advertises the depth bit alone — never HDR — and is subsumed by HDR.
@@ -1802,15 +1836,18 @@ mod tests {
     fn ten_bit_sdr_advertises_depth_without_hdr() {
         const TEN: u8 = punktfunk_core::quic::VIDEO_CAP_10BIT;
         const HDR: u8 = punktfunk_core::quic::VIDEO_CAP_HDR;
-        assert_eq!(video_caps_for(false, true, false) & (TEN | HDR), TEN);
-        assert_eq!(video_caps_for(false, false, false) & (TEN | HDR), 0);
-        assert_eq!(video_caps_for(true, true, false) & (TEN | HDR), TEN | HDR);
+        assert_eq!(video_caps_for(false, true, false, true) & (TEN | HDR), TEN);
+        assert_eq!(video_caps_for(false, false, false, true) & (TEN | HDR), 0);
         assert_eq!(
-            video_caps_for(false, true, false) & punktfunk_core::quic::VIDEO_CAP_444,
+            video_caps_for(true, true, false, true) & (TEN | HDR),
+            TEN | HDR
+        );
+        assert_eq!(
+            video_caps_for(false, true, false, true) & punktfunk_core::quic::VIDEO_CAP_444,
             0
         );
         assert_ne!(
-            video_caps_for(false, true, false) & punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE,
+            video_caps_for(false, true, false, true) & punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE,
             0
         );
     }

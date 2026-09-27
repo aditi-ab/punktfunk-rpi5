@@ -175,6 +175,8 @@ pub struct OwnedStdH265Vps {
     std: Box<hh::StdVideoH265VideoParameterSet>,
     _ptl_backing: Box<hh::StdVideoH265ProfileTierLevel>,
     _dpb_backing: Box<hh::StdVideoH265DecPicBufMgr>,
+    _hrd_backing: Box<hh::StdVideoH265HrdParameters>,
+    _hrd_sub_backing: Box<[hh::StdVideoH265SubLayerHrdParameters]>,
 }
 
 impl OwnedStdH265Vps {
@@ -197,20 +199,45 @@ impl OwnedStdH265Vps {
 }
 
 /// Converted SPS plus the heap allocations its embedded pointers target.
-/// Same ownership as [`crate::OwnedStdSps`]. PTL and DPB-manager blocks are
-/// always present; scaling lists / short-term RPS / long-term SPS candidates
-/// only when the stream carries them. `pSequenceParameterSetVui` and
-/// `pPredictorPaletteEntries` stay null (palette data is rejected).
+/// Same ownership as [`crate::OwnedStdSps`]. Every pointer targets a block:
+/// filled when the stream carries the data, zeroed with its flag clear when
+/// not. A driver that reads through a pointer whatever the flag says (Intel,
+/// Windows, session-parameters create) then finds a struct instead of null.
 #[derive(Debug)]
 pub struct OwnedStdH265Sps {
     /// Boxed so `pStdSPSs` is this field's address across wrapper moves.
     std: Box<hh::StdVideoH265SequenceParameterSet>,
     _ptl_backing: Box<hh::StdVideoH265ProfileTierLevel>,
     _dpb_backing: Box<hh::StdVideoH265DecPicBufMgr>,
-    _scaling_backing: Option<Box<hh::StdVideoH265ScalingLists>>,
-    /// `pShortTermRefPicSet`'s target: `num_short_term_ref_pic_sets` entries.
-    _st_rps_backing: Option<Box<[hh::StdVideoH265ShortTermRefPicSet]>>,
-    _lt_backing: Option<Box<hh::StdVideoH265LongTermRefPicsSps>>,
+    _scaling_backing: Box<hh::StdVideoH265ScalingLists>,
+    /// `pShortTermRefPicSet`'s target: `num_short_term_ref_pic_sets` entries,
+    /// one zeroed entry when the SPS carries none.
+    _st_rps_backing: Box<[hh::StdVideoH265ShortTermRefPicSet]>,
+    _lt_backing: Box<hh::StdVideoH265LongTermRefPicsSps>,
+    _vui_backing: Box<hh::StdVideoH265SequenceParameterSetVui>,
+    _vui_hrd_backing: Box<hh::StdVideoH265HrdParameters>,
+    _vui_hrd_sub_backing: Box<[hh::StdVideoH265SubLayerHrdParameters]>,
+    _palette_backing: Box<hh::StdVideoH265PredictorPaletteEntries>,
+}
+
+/// A zeroed video-header Std struct: the all-clear baseline every block starts from.
+fn zeroed_std<T: Copy>() -> T {
+    // SAFETY: the callers pass the `hh` Std structs, plain C data of integers, arrays
+    // and raw pointers, for which the all-zero bit pattern is a valid value.
+    unsafe { std::mem::zeroed() }
+}
+
+/// A zeroed HRD block with one zeroed sub-layer entry for each of its two
+/// arrays, so every pointer under it is a struct too.
+fn zeroed_hrd() -> (
+    Box<hh::StdVideoH265HrdParameters>,
+    Box<[hh::StdVideoH265SubLayerHrdParameters]>,
+) {
+    let sub: Box<[hh::StdVideoH265SubLayerHrdParameters]> = Box::new([zeroed_std()]);
+    let mut hrd: hh::StdVideoH265HrdParameters = zeroed_std();
+    hrd.pSubLayerHrdParametersNal = sub.as_ptr();
+    hrd.pSubLayerHrdParametersVcl = sub.as_ptr();
+    (Box::new(hrd), sub)
 }
 
 impl OwnedStdH265Sps {
@@ -227,13 +254,14 @@ impl OwnedStdH265Sps {
     }
 }
 
-/// Converted PPS plus the scaling-list allocation `pScalingLists` targets.
-/// Same ownership as [`crate::OwnedStdSps`].
+/// Converted PPS plus the blocks its pointers target: scaling lists (filled or
+/// zeroed) and a zeroed palette. Same ownership as [`crate::OwnedStdSps`].
 #[derive(Debug)]
 pub struct OwnedStdH265Pps {
     /// Boxed so `pStdPPSs` is this field's address across wrapper moves.
     std: Box<hh::StdVideoH265PictureParameterSet>,
-    _scaling_backing: Option<Box<hh::StdVideoH265ScalingLists>>,
+    _scaling_backing: Box<hh::StdVideoH265ScalingLists>,
+    _palette_backing: Box<hh::StdVideoH265PredictorPaletteEntries>,
 }
 
 impl OwnedStdH265Pps {
@@ -455,11 +483,18 @@ pub fn vps_to_std_h265(vps: &Vps) -> Result<OwnedStdH265Vps, H265ParamsError> {
     std.vps_max_sub_layers_minus1 = vps.max_sub_layers_minus1;
     std.pDecPicBufMgr = &*dpb_backing;
     std.pProfileTierLevel = &*ptl_backing;
+    // Zeroed HRD with its sub-layer arrays: the flags say absent, but a driver
+    // that reads through these pointers regardless (Intel, Windows) must find a
+    // struct, not null. Same shape the FFmpeg decoder hands every driver.
+    let (hrd_backing, hrd_sub_backing) = zeroed_hrd();
+    std.pHrdParameters = &*hrd_backing;
 
     Ok(OwnedStdH265Vps {
         std: Box::new(std),
         _ptl_backing: ptl_backing,
         _dpb_backing: dpb_backing,
+        _hrd_backing: hrd_backing,
+        _hrd_sub_backing: hrd_sub_backing,
     })
 }
 
@@ -486,10 +521,16 @@ pub fn fallback_vps_from_sps(sps: &Sps) -> Result<OwnedStdH265Vps, H265ParamsErr
     std.pDecPicBufMgr = &*dpb_backing;
     std.pProfileTierLevel = &*ptl_backing;
 
+    // Zeroed HRD with its sub-layer arrays, as in the parsed-VPS path above.
+    let (hrd_backing, hrd_sub_backing) = zeroed_hrd();
+    std.pHrdParameters = &*hrd_backing;
+
     Ok(OwnedStdH265Vps {
         std: Box::new(std),
         _ptl_backing: ptl_backing,
         _dpb_backing: dpb_backing,
+        _hrd_backing: hrd_backing,
+        _hrd_sub_backing: hrd_sub_backing,
     })
 }
 
@@ -686,16 +727,21 @@ pub fn sps_to_std_h265(sps: &Sps) -> Result<OwnedStdH265Sps, H265ParamsError> {
 
     std.pProfileTierLevel = &*ptl_backing;
     std.pDecPicBufMgr = &*dpb_backing;
-    if let Some(backing) = &scaling_backing {
-        std.pScalingLists = &**backing;
-    }
-    if let Some(backing) = &st_rps_backing {
-        std.pShortTermRefPicSet = backing.as_ptr();
-    }
-    if let Some(backing) = &lt_backing {
-        std.pLongTermRefPicsSps = &**backing;
-    }
-    // `pSequenceParameterSetVui` and `pPredictorPaletteEntries` stay null.
+    // Absent data keeps its flag clear and gets a zeroed block: see the struct docs.
+    let scaling_backing = scaling_backing.unwrap_or_else(|| Box::new(zeroed_std()));
+    let st_rps_backing: Box<[hh::StdVideoH265ShortTermRefPicSet]> =
+        st_rps_backing.unwrap_or_else(|| Box::new([zeroed_std()]));
+    let lt_backing = lt_backing.unwrap_or_else(|| Box::new(zeroed_std()));
+    let (vui_hrd_backing, vui_hrd_sub_backing) = zeroed_hrd();
+    let mut vui: hh::StdVideoH265SequenceParameterSetVui = zeroed_std();
+    vui.pHrdParameters = &*vui_hrd_backing;
+    let vui_backing = Box::new(vui);
+    let palette_backing: Box<hh::StdVideoH265PredictorPaletteEntries> = Box::new(zeroed_std());
+    std.pScalingLists = &*scaling_backing;
+    std.pShortTermRefPicSet = st_rps_backing.as_ptr();
+    std.pLongTermRefPicsSps = &*lt_backing;
+    std.pSequenceParameterSetVui = &*vui_backing;
+    std.pPredictorPaletteEntries = &*palette_backing;
 
     Ok(OwnedStdH265Sps {
         std: Box::new(std),
@@ -704,6 +750,10 @@ pub fn sps_to_std_h265(sps: &Sps) -> Result<OwnedStdH265Sps, H265ParamsError> {
         _scaling_backing: scaling_backing,
         _st_rps_backing: st_rps_backing,
         _lt_backing: lt_backing,
+        _vui_backing: vui_backing,
+        _vui_hrd_backing: vui_hrd_backing,
+        _vui_hrd_sub_backing: vui_hrd_sub_backing,
+        _palette_backing: palette_backing,
     })
 }
 
@@ -865,14 +915,16 @@ pub fn pps_to_std_h265(pps: &Pps) -> Result<OwnedStdH265Pps, H265ParamsError> {
         std.row_height_minus1[i] = narrow("row_height_minus1", pps.row_height_minus1[i])?;
     }
 
-    if let Some(backing) = &scaling_backing {
-        std.pScalingLists = &**backing;
-    }
-    // `pPredictorPaletteEntries` stays null (rejected above).
+    // Absent data keeps its flag clear and gets a zeroed block (struct docs).
+    let scaling_backing = scaling_backing.unwrap_or_else(|| Box::new(zeroed_std()));
+    let palette_backing: Box<hh::StdVideoH265PredictorPaletteEntries> = Box::new(zeroed_std());
+    std.pScalingLists = &*scaling_backing;
+    std.pPredictorPaletteEntries = &*palette_backing;
 
     Ok(OwnedStdH265Pps {
         std: Box::new(std),
         _scaling_backing: scaling_backing,
+        _palette_backing: palette_backing,
     })
 }
 
@@ -1130,14 +1182,16 @@ mod tests {
         assert_eq!(&dpb.max_num_reorder_pics[..2], &[1, 2]);
         assert_eq!(&dpb.max_latency_increase_plus1[..2], &[7, 8]);
 
-        assert!(
-            std.pScalingLists.is_null(),
-            "enabled but data-absent: driver defaults"
-        );
-        assert!(std.pShortTermRefPicSet.is_null());
-        assert!(std.pLongTermRefPicsSps.is_null());
-        assert!(std.pSequenceParameterSetVui.is_null());
-        assert!(std.pPredictorPaletteEntries.is_null());
+        // Data-absent blocks are attached zeroed with their flags clear.
+        assert!(!std.pScalingLists.is_null());
+        assert!(!std.pShortTermRefPicSet.is_null());
+        assert!(!std.pLongTermRefPicsSps.is_null());
+        assert!(!std.pSequenceParameterSetVui.is_null());
+        assert!(!std.pPredictorPaletteEntries.is_null());
+        // SAFETY: the pointers target `owned`'s boxed backings, alive here.
+        let vui = unsafe { &*std.pSequenceParameterSetVui };
+        assert!(!vui.pHrdParameters.is_null());
+        assert_eq!(std.num_long_term_ref_pics_sps, 0);
     }
 
     #[test]
@@ -1750,8 +1804,8 @@ mod tests {
         assert_eq!(std.num_tile_rows_minus1, 2);
         assert_eq!(&std.column_width_minus1[..2], &[17, 12]);
         assert_eq!(&std.row_height_minus1[..3], &[9, 8, 16]);
-        assert!(std.pScalingLists.is_null());
-        assert!(std.pPredictorPaletteEntries.is_null());
+        assert!(!std.pScalingLists.is_null());
+        assert!(!std.pPredictorPaletteEntries.is_null());
     }
 
     #[test]
@@ -1816,7 +1870,7 @@ mod tests {
         );
         assert_eq!(std.vps_num_units_in_tick, 0);
         assert_eq!(std.vps_time_scale, 0);
-        assert!(std.pHrdParameters.is_null());
+        assert!(!std.pHrdParameters.is_null());
         // SAFETY: both pointers target `owned`'s boxed backings, alive here.
         let (ptl, dpb) = unsafe { (&*std.pProfileTierLevel, &*std.pDecPicBufMgr) };
         assert_eq!(

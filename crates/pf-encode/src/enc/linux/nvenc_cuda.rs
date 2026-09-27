@@ -1421,10 +1421,20 @@ impl NvencCudaEncoder {
             // [`resolve_split_mode`]: env / 10-bit / pixel-rate precedence; a measured verdict
             // wins over the static rule ([`open_split_mode`]).
             let pixel_rate = self.width as u64 * self.height as u64 * self.fps.max(1) as u64;
-            let split_mode = open_split_mode(
-                resolve_split_mode(self.codec, self.bit_depth, pixel_rate, self.encoder_engines),
-                &self.split_key(),
+            let static_mode = resolve_split_mode(
+                self.codec,
+                self.bit_depth,
+                pixel_rate,
+                self.encoder_engines,
+                self.max_slices,
             );
+            // A single-slice client keeps split off: a verdict cached for a sliced session
+            // must not turn it back on.
+            let split_mode = if self.max_slices <= 1 {
+                static_mode
+            } else {
+                open_split_mode(static_mode, &self.split_key())
+            };
             // Split × sub-frame *before* the ladder, ceiling key, and chunked-poll latch —
             // a drop inside `build_init_params` would leave `poll_chunk` busy-polling.
             let (split_mode, subframe_on) = resolve_split_subframe(

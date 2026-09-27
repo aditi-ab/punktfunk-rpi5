@@ -599,6 +599,12 @@ impl Presenter {
         );
         let overlay_pipe = OverlayPipe::new(&device, format.format, false)?;
         let scale = crate::scale::ScalePass::new(&device, format.format)?;
+        let direct = crate::csc::DirectPass::new(
+            &device,
+            format.format,
+            csc.pipeline_layout,
+            csc_planar.pipeline_layout,
+        )?;
 
         // SAFETY: CREATE — CreateInfo is a local; the pool is owned by the Presenter being built.
         let cmd_pool = unsafe {
@@ -650,6 +656,8 @@ impl Presenter {
             video_export,
             overlay_pipe,
             scale,
+            direct,
+            direct_last: None,
             retired_hw: None,
             #[cfg(windows)]
             retained_slot: None,
