@@ -21,6 +21,11 @@ import {
 	useStoreSources,
 } from "@/api/store";
 import { useDialogs } from "@/components/dialogs";
+import {
+	PasswordConfirmField,
+	type PasswordFailure,
+	usePasswordFailure,
+} from "@/components/password-confirm";
 import { QueryState } from "@/components/query-state";
 import { ROW, ROW_GAP, Stagger } from "@/components/stagger";
 import { Badge } from "@/components/ui/badge";
@@ -62,7 +67,7 @@ export const SourcesTab: FC = () => {
 	// The draft waiting on the trust dialog, and a key that re-mounts (and so clears) the form.
 	const [draft, setDraft] = useState<SourceDraft | null>(null);
 	const [formKey, setFormKey] = useState(0);
-	const [wrongPassword, setWrongPassword] = useState(false);
+	const refusal = usePasswordFailure();
 
 	const onRefresh = () =>
 		refresh.mutate(undefined, {
@@ -71,18 +76,15 @@ export const SourcesTab: FC = () => {
 
 	const onConfirmAdd = async (password: string) => {
 		if (!draft) return;
-		setWrongPassword(false);
+		refusal.reset();
 		try {
 			await save.mutateAsync({ ...draft, password });
 			setDraft(null);
 			setFormKey((k) => k + 1);
 		} catch (e) {
-			// A rejected password keeps the dialog open so the operator can retry without refilling
+			// A refused password keeps the dialog open so the operator can retry without refilling
 			// the form; anything else is a genuine failure to write the source.
-			if (e instanceof ApiError && e.status === 401) {
-				setWrongPassword(true);
-				return;
-			}
+			if (refusal.classify(e)) return;
 			toast.error(m.store_add_source_failed());
 		}
 	};
@@ -126,10 +128,10 @@ export const SourcesTab: FC = () => {
 			<TrustSourceDialog
 				draft={draft}
 				isSaving={save.isPending}
-				wrongPassword={wrongPassword}
+				failure={refusal.failure}
 				onCancel={() => {
 					setDraft(null);
-					setWrongPassword(false);
+					refusal.reset();
 				}}
 				onConfirm={onConfirmAdd}
 			/>
@@ -343,9 +345,9 @@ export const TrustSourceDialog: FC<{
 	isSaving: boolean;
 	onCancel: () => void;
 	onConfirm: (password: string) => void;
-	/** Set when the BFF rejected the password (401) — say so and keep the dialog open. */
-	wrongPassword?: boolean;
-}> = ({ draft, isSaving, onCancel, onConfirm, wrongPassword }) => {
+	/** Why the BFF refused the password — say so and keep the dialog open. */
+	failure?: PasswordFailure;
+}> = ({ draft, isSaving, onCancel, onConfirm, failure = null }) => {
 	const [password, setPassword] = useState("");
 	// The dialog stays mounted between drafts; clear the password whenever it closes.
 	useEffect(() => {
@@ -378,23 +380,12 @@ export const TrustSourceDialog: FC<{
 					{/* Adding a source is a trust-root change: every future install rides on it, so the
 				    console password is re-entered here and verified at the BFF, exactly as for a
 				    host update. */}
-					<div className="space-y-2">
-						<Label htmlFor="store-source-password">
-							{m.store_source_password()}
-						</Label>
-						<Input
-							id="store-source-password"
-							type="password"
-							autoComplete="current-password"
-							value={password}
-							onChange={(e) => setPassword(e.target.value)}
-						/>
-						{wrongPassword && (
-							<p role="alert" className="text-xs text-destructive">
-								{m.update_apply_wrong_password()}
-							</p>
-						)}
-					</div>
+					<PasswordConfirmField
+						id="store-source-password"
+						value={password}
+						onChange={setPassword}
+						failure={failure}
+					/>
 
 					<DialogFooter>
 						<Button variant="outline" onClick={onCancel} disabled={isSaving}>

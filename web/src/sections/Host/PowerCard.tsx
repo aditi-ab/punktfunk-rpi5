@@ -1,7 +1,12 @@
 import { Power } from "lucide-react";
 import { type FC, useState } from "react";
+import { ApiError, apiFetch } from "@/api/fetcher";
 import { useListActions } from "@/api/gen/actions/actions";
 import type { ActionInfo } from "@/api/gen/model";
+import {
+	PasswordConfirmField,
+	usePasswordFailure,
+} from "@/components/password-confirm";
 import { QueryState } from "@/components/query-state";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -13,8 +18,7 @@ import {
 	DialogHeader,
 	DialogTitle,
 } from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
+import { apiErrorMessage } from "@/lib/errors";
 import { m } from "@/paraglide/messages";
 
 /** Localized titles for the KNOWN action ids; unknown ids fall back to the server's title —
@@ -101,42 +105,33 @@ export const PowerSection: FC = () => {
 	);
 };
 
-/** The password-confirm dialog keeps its 401 handling local: this route uses 401 for a wrong
- * password, while apiFetch redirects only the auth middleware's `unauthorized` body. */
+/** Runs a host action once the console password is re-entered; the BFF verifies it. */
 export const ConfirmDialog: FC<{
 	action: ActionInfo;
 	onClose: () => void;
 	onAccepted: (action: ActionInfo) => void;
 }> = ({ action, onClose, onAccepted }) => {
 	const [password, setPassword] = useState("");
+	const refusal = usePasswordFailure();
 	const [error, setError] = useState<string | null>(null);
 	const [busy, setBusy] = useState(false);
 
 	const submit = async () => {
 		setBusy(true);
 		setError(null);
+		refusal.reset();
 		try {
-			const res = await fetch(
-				`/api/v1/actions/${encodeURIComponent(action.id)}`,
-				{
-					method: "POST",
-					headers: { "content-type": "application/json" },
-					credentials: "same-origin",
-					body: JSON.stringify({ password }),
-				},
+			await apiFetch(`/api/v1/actions/${encodeURIComponent(action.id)}`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ password }),
+			});
+			onAccepted(action);
+		} catch (e) {
+			if (refusal.classify(e)) return;
+			setError(
+				(e instanceof ApiError && apiErrorMessage(e)) || m.common_error(),
 			);
-			if (res.status === 202) {
-				onAccepted(action);
-				return;
-			}
-			const body = (await res.json().catch(() => null)) as {
-				error?: string;
-			} | null;
-			if (res.status === 401) setError(m.update_apply_wrong_password());
-			else if (res.status === 429) setError(m.update_apply_throttled());
-			else setError(body?.error ?? `HTTP ${res.status}`);
-		} catch {
-			setError(m.common_error());
 		} finally {
 			setBusy(false);
 		}
@@ -158,19 +153,13 @@ export const ConfirmDialog: FC<{
 						void submit();
 					}}
 				>
-					<div className="space-y-1.5">
-						<Label htmlFor="host-power-password">
-							{m.update_apply_password_label()}
-						</Label>
-						<Input
-							id="host-power-password"
-							type="password"
-							autoFocus
-							value={password}
-							onChange={(e) => setPassword(e.target.value)}
-							autoComplete="current-password"
-						/>
-					</div>
+					<PasswordConfirmField
+						id="host-power-password"
+						value={password}
+						onChange={setPassword}
+						failure={refusal.failure}
+						autoFocus
+					/>
 					{error && <p className="text-sm text-destructive">{error}</p>}
 					<DialogFooter>
 						<Button

@@ -1,7 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { Info, KeyRound } from "lucide-react";
 import { type FC, useEffect, useRef, useState } from "react";
-import { ApiError } from "@/api/fetcher";
 import { getListPairedClientsQueryKey } from "@/api/gen/clients/clients";
 import type { PairingStatus } from "@/api/gen/model/pairingStatus";
 import {
@@ -9,6 +8,11 @@ import {
 	useGetPairingStatus,
 } from "@/api/gen/pairing/pairing";
 import { useSubmitPairingPin } from "@/api/pairing";
+import {
+	PasswordConfirmField,
+	type PasswordFailure,
+	usePasswordFailure,
+} from "@/components/password-confirm";
 import { QueryState } from "@/components/query-state";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -46,7 +50,7 @@ export const MoonlightPairingSection: FC = () => {
 	const [pin, setPin] = useState("");
 	const [label, setLabel] = useState("");
 	const [password, setPassword] = useState("");
-	const [wrongPassword, setWrongPassword] = useState(false);
+	const refusal = usePasswordFailure();
 	// Key of the ceremony the PIN is addressed to; "" = the sole one.
 	const [target, setTarget] = useState("");
 	const pairing = useGetPairingStatus({ query: { refetchInterval: 2_000 } });
@@ -67,14 +71,14 @@ export const MoonlightPairingSection: FC = () => {
 			setPin("");
 			setLabel("");
 			setPassword("");
-			setWrongPassword(false);
+			refusal.reset();
 			setTarget("");
 		}
 		wasPending.current = pending;
-	}, [pending, submit.reset]);
+	}, [pending, submit.reset, refusal.reset]);
 
 	const onSubmit = () => {
-		setWrongPassword(false);
+		refusal.reset();
 		// Address the PIN to the ceremony the operator saw: the one they picked, or the sole one.
 		// A second knock never inherits a default — the list order is client-chosen fields.
 		const chosen = addressedCeremony(pairing.data?.pending ?? [], target);
@@ -98,9 +102,7 @@ export const MoonlightPairingSection: FC = () => {
 					// both planes, since this card's count spans them.
 					qc.invalidateQueries({ queryKey: getListPairedClientsQueryKey() });
 				},
-				onError: (e) => {
-					if (e instanceof ApiError && e.status === 401) setWrongPassword(true);
-				},
+				onError: refusal.classify,
 			},
 		);
 	};
@@ -114,7 +116,7 @@ export const MoonlightPairingSection: FC = () => {
 			onLabelChange={setLabel}
 			password={password}
 			onPasswordChange={setPassword}
-			wrongPassword={wrongPassword}
+			failure={refusal.failure}
 			target={target}
 			onTargetChange={setTarget}
 			onSubmit={onSubmit}
@@ -136,7 +138,7 @@ export const MoonlightPairing: FC<{
 	/** The console password, re-confirmed because delivering the PIN completes a pairing. */
 	password: string;
 	onPasswordChange: (v: string) => void;
-	wrongPassword: boolean;
+	failure: PasswordFailure;
 	/** Key of the ceremony the PIN is addressed to; "" = the sole one. */
 	target: string;
 	onTargetChange: (v: string) => void;
@@ -152,7 +154,7 @@ export const MoonlightPairing: FC<{
 	onLabelChange,
 	password,
 	onPasswordChange,
-	wrongPassword,
+	failure,
 	target,
 	onTargetChange,
 	onSubmit,
@@ -258,24 +260,13 @@ export const MoonlightPairing: FC<{
 							    same trust decision as approving a native knock — so the same password gate
 							    (util/confirm.ts). Anyone can point their OWN Moonlight at this host and read
 							    the PIN off their own screen; the password is what they don't have. */}
-							<div className="space-y-2">
-								<Label htmlFor="pair-password">{m.store_spec_password()}</Label>
-								<Input
-									id="pair-password"
-									type="password"
-									autoComplete="current-password"
-									value={password}
-									onChange={(e) => onPasswordChange(e.target.value)}
-								/>
-								<p className="text-xs text-muted-foreground">
-									{m.pairing_password_help()}
-								</p>
-								{wrongPassword && (
-									<p role="alert" className="text-xs text-destructive">
-										{m.update_apply_wrong_password()}
-									</p>
-								)}
-							</div>
+							<PasswordConfirmField
+								id="pair-password"
+								value={password}
+								onChange={onPasswordChange}
+								failure={failure}
+								help={m.pairing_password_help()}
+							/>
 							<Button
 								type="submit"
 								disabled={

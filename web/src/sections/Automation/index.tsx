@@ -2,13 +2,16 @@ import Section from "@unom/ui/section";
 import { toast } from "@unom/ui/toast";
 import { Pencil, Plus, Terminal, Trash2, Webhook, Zap } from "lucide-react";
 import { type FC, useEffect, useMemo, useState } from "react";
-import { ApiError } from "@/api/fetcher";
 import { useListPairedClients } from "@/api/gen/clients/clients";
 import { useGetHooks } from "@/api/gen/hooks/hooks";
 import type { HookEntry } from "@/api/gen/model/hookEntry";
 import { useListNativeClients } from "@/api/gen/native/native";
 import { hookAction, hookFilterSummary, useSaveHooks } from "@/api/hooks";
 import { useDialogs } from "@/components/dialogs";
+import {
+	PasswordConfirmField,
+	usePasswordFailure,
+} from "@/components/password-confirm";
 import { QueryState } from "@/components/query-state";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -21,8 +24,6 @@ import {
 	DialogHeader,
 	DialogTitle,
 } from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { useLocale } from "@/lib/i18n";
 import { m } from "@/paraglide/messages";
 import { HookForm } from "./HookForm";
@@ -67,7 +68,7 @@ export const SectionAutomation: FC = () => {
 	} | null>(null);
 	const [confirming, setConfirming] = useState(false);
 	const [password, setPassword] = useState("");
-	const [wrongPassword, setWrongPassword] = useState(false);
+	const refusal = usePasswordFailure();
 
 	// Seed once. Unlike the display card there is no re-seed-when-clean dance: nothing else in the
 	// console writes hooks, so the server value cannot move underneath an edit.
@@ -102,17 +103,14 @@ export const SectionAutomation: FC = () => {
 	};
 
 	const commit = async () => {
-		setWrongPassword(false);
+		refusal.reset();
 		try {
 			await save.mutateAsync({ hooks: list, password });
 			setConfirming(false);
 			setPassword("");
 			toast.success(m.automation_saved());
 		} catch (e) {
-			if (e instanceof ApiError && e.status === 401) {
-				setWrongPassword(true);
-				return;
-			}
+			if (refusal.classify(e)) return;
 			toast.error(m.automation_save_failed());
 		}
 	};
@@ -249,7 +247,7 @@ export const SectionAutomation: FC = () => {
 				onOpenChange={(o) => {
 					if (!o) {
 						setConfirming(false);
-						setWrongPassword(false);
+						refusal.reset();
 					}
 				}}
 			>
@@ -258,29 +256,18 @@ export const SectionAutomation: FC = () => {
 						<DialogTitle>{m.automation_confirm_title()}</DialogTitle>
 						<DialogDescription>{m.automation_confirm_body()}</DialogDescription>
 					</DialogHeader>
-					<div className="space-y-2">
-						<Label htmlFor="automation-password">
-							{m.store_spec_password()}
-						</Label>
-						<Input
-							id="automation-password"
-							type="password"
-							autoComplete="current-password"
-							value={password}
-							onChange={(e) => setPassword(e.target.value)}
-						/>
-						{wrongPassword && (
-							<p role="alert" className="text-xs text-destructive">
-								{m.update_apply_wrong_password()}
-							</p>
-						)}
-					</div>
+					<PasswordConfirmField
+						id="automation-password"
+						value={password}
+						onChange={setPassword}
+						failure={refusal.failure}
+					/>
 					<DialogFooter>
 						<Button
 							variant="outline"
 							onClick={() => {
 								setConfirming(false);
-								setWrongPassword(false);
+								refusal.reset();
 							}}
 						>
 							{m.common_cancel()}

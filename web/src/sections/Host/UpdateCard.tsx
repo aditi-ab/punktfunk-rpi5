@@ -2,13 +2,17 @@ import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "@unom/ui/toast";
 import { ArrowUpCircle } from "lucide-react";
 import { type FC, type ReactNode, useState } from "react";
-import { ApiError } from "@/api/fetcher";
+import { ApiError, apiFetch } from "@/api/fetcher";
 import type { UpdateStatus } from "@/api/gen/model";
 import {
 	getGetUpdateStatusQueryKey,
 	useForceUpdateCheck,
 	useGetUpdateStatus,
 } from "@/api/gen/update/update";
+import {
+	PasswordConfirmField,
+	usePasswordFailure,
+} from "@/components/password-confirm";
 import { QueryState } from "@/components/query-state";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -21,8 +25,6 @@ import {
 	DialogHeader,
 	DialogTitle,
 } from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { Spinner } from "@/components/ui/spinner";
 import { apiErrorMessage } from "@/lib/errors";
 import { fmtDateTimeSecs } from "@/lib/format";
@@ -272,6 +274,7 @@ const ApplyPanel: FC<{
 }> = ({ status, onApplied }) => {
 	const [open, setOpen] = useState(false);
 	const [password, setPassword] = useState("");
+	const refusal = usePasswordFailure();
 	const [error, setError] = useState<string | null>(null);
 	const [needsForce, setNeedsForce] = useState(false);
 	const [busy, setBusy] = useState(false);
@@ -280,37 +283,30 @@ const ApplyPanel: FC<{
 	const submit = async (force: boolean) => {
 		setBusy(true);
 		setError(null);
+		refusal.reset();
 		try {
-			// Keep confirmation handling local. apiFetch now redirects only the auth middleware's
-			// `{ error: "unauthorized" }` 401, while this 401 means the password was wrong.
-			const res = await fetch("/api/v1/update/apply", {
+			await apiFetch("/api/v1/update/apply", {
 				method: "POST",
-				headers: { "content-type": "application/json" },
-				credentials: "same-origin",
+				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify({ password, force }),
 			});
-			if (res.status === 202) {
-				setOpen(false);
-				setPassword("");
-				onApplied(target);
-				return;
-			}
-			const body = (await res.json().catch(() => null)) as {
-				error?: string;
-			} | null;
-			if (res.status === 401) {
-				setError(m.update_apply_wrong_password());
-			} else if (res.status === 429) {
-				setError(m.update_apply_throttled());
-			} else if (res.status === 409 && body?.error?.includes("force")) {
+			setOpen(false);
+			setPassword("");
+			onApplied(target);
+		} catch (e) {
+			if (refusal.classify(e)) return;
+			const message = e instanceof ApiError ? apiErrorMessage(e) : undefined;
+			if (
+				e instanceof ApiError &&
+				e.status === 409 &&
+				message?.includes("force")
+			) {
 				// The host refused because a stream is live — escalate to the explicit
 				// "drop the stream" confirmation instead of showing a raw error.
 				setNeedsForce(true);
 			} else {
-				setError(body?.error ?? `HTTP ${res.status}`);
+				setError(message || m.common_error());
 			}
-		} catch {
-			setError(m.common_error());
 		} finally {
 			setBusy(false);
 		}
@@ -332,6 +328,7 @@ const ApplyPanel: FC<{
 					if (!o) {
 						setPassword("");
 						setError(null);
+						refusal.reset();
 						setNeedsForce(false);
 					}
 				}}
@@ -354,19 +351,13 @@ const ApplyPanel: FC<{
 							void submit(needsForce);
 						}}
 					>
-						<div className="space-y-1.5">
-							<Label htmlFor="update-apply-password">
-								{m.update_apply_password_label()}
-							</Label>
-							<Input
-								id="update-apply-password"
-								type="password"
-								autoFocus
-								value={password}
-								onChange={(e) => setPassword(e.target.value)}
-								autoComplete="current-password"
-							/>
-						</div>
+						<PasswordConfirmField
+							id="update-apply-password"
+							value={password}
+							onChange={setPassword}
+							failure={refusal.failure}
+							autoFocus
+						/>
 						{error && <p className="text-sm text-destructive">{error}</p>}
 						<DialogFooter>
 							<Button
