@@ -214,10 +214,9 @@ impl CardMenu {
         }
     }
 
-    /// Pinned-card keys append the preset id past a NUL. Commands address the host half.
+    /// Commands address the host, not a pinned card's composite key.
     fn host_key(&self) -> &str {
-        let key = self.host().key.as_str();
-        key.split('\0').next().unwrap_or(key)
+        self.host().host_key()
     }
 
     /// The presets this host pins as cards, by id.

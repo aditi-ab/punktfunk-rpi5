@@ -81,6 +81,21 @@ pub struct HostRow {
     pub game_presets: BTreeMap<String, String>,
 }
 
+impl HostRow {
+    /// The host half of [`Self::key`]: commands, bindings and the store address the host,
+    /// never a pinned card's composite key.
+    pub fn host_key(&self) -> &str {
+        self.key.split('\0').next().unwrap_or(&self.key)
+    }
+}
+
+/// A pinned card's row key: the host's key, then the preset id past a NUL, which no
+/// fingerprint or `addr:port` holds. Apple and Android build the same string, pinned by
+/// `pinned_key` in `clients/shared/console-vectors.json`.
+pub fn pinned_key(host: &str, preset: &str) -> String {
+    format!("{host}\0{preset}")
+}
+
 /// One host-offered action, resolved from `GET /api/v1/actions`
 /// (`design/host-actions.md`). `label` is already chosen: this client's wording for a
 /// known id, else the host's title, so a new host action renders without a console
@@ -511,10 +526,8 @@ impl ConsoleBus {
 mod tests {
     use super::*;
 
-    #[test]
-    fn hosts_generation_bumps_only_on_change() {
-        let shared = ConsoleShared::default();
-        let row = HostRow {
+    fn tower() -> HostRow {
+        HostRow {
             key: "aa".into(),
             id: None,
             name: "Tower".into(),
@@ -534,7 +547,33 @@ mod tests {
             bound_preset: None,
             running: String::new(),
             game_presets: Default::default(),
-        };
+        }
+    }
+
+    #[test]
+    fn pinned_keys_match_the_shared_vectors() {
+        let raw = include_str!("../../../clients/shared/console-vectors.json");
+        let file: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let cases = file["pinned_key"].as_array().expect("pinned_key cases");
+        assert!(!cases.is_empty());
+        for c in cases {
+            let s = |k: &str| c[k].as_str().unwrap_or_else(|| panic!("{k} missing"));
+            let key = pinned_key(s("host"), s("preset"));
+            assert_eq!(key, s("key"));
+            let card = HostRow { key, ..tower() };
+            assert_eq!(card.host_key(), s("host"));
+        }
+        assert_eq!(
+            tower().host_key(),
+            "aa",
+            "a primary row's key is its host key"
+        );
+    }
+
+    #[test]
+    fn hosts_generation_bumps_only_on_change() {
+        let shared = ConsoleShared::default();
+        let row = tower();
         shared.set_hosts(vec![row.clone()]);
         let g1 = shared.hosts_gen();
         shared.set_hosts(vec![row.clone()]);

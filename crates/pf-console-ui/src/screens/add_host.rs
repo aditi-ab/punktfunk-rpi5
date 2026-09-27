@@ -50,8 +50,7 @@ impl AddHostScreen {
             name: host.name.clone(),
             address: host.addr.clone(),
             port: host.port.to_string(),
-            // Pinned-card keys are `host\0preset`; only the host side is edited.
-            edits: Some(host.key.split('\0').next().unwrap_or(&host.key).to_string()),
+            edits: Some(host.host_key().to_string()),
             ..AddHostScreen::new()
         }
     }

@@ -891,7 +891,7 @@ object SkiaConsole {
     }
 
     private fun hostForKey(key: String): KnownHost? {
-        val primary = key.substringBefore('\u0000')
+        val primary = ConsoleJson.hostKey(key)
         return knownHostStore.all().firstOrNull { ConsoleJson.rowKey(it.fpHex, it.address, it.port) == primary }
     }
 

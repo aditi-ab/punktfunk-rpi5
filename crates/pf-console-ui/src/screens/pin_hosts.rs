@@ -46,16 +46,12 @@ impl PinHostsScreen {
     /// Read from the model — the pinned card's row is the state, so the toggle cannot
     /// disagree with the carousel.
     fn pinned(&self, ctx: &Ctx, host_idx: usize) -> bool {
-        let host = &ctx.hosts[host_idx];
-        // The host half of the key (a pinned card appends its preset id past a NUL), not the
-        // address: two OS installs of a dual-boot box are two hosts at one address.
-        fn host_key(k: &str) -> &str {
-            k.split('\0').next().unwrap_or(k)
-        }
-        let key = host_key(&host.key);
-        ctx.hosts.iter().any(|r| {
-            host_key(&r.key) == key && r.pin.as_ref().is_some_and(|p| p.id == self.preset_id)
-        })
+        // The host key, not the address: two OS installs of a dual-boot box are two hosts
+        // at one address.
+        let key = ctx.hosts[host_idx].host_key();
+        ctx.hosts
+            .iter()
+            .any(|r| r.host_key() == key && r.pin.as_ref().is_some_and(|p| p.id == self.preset_id))
     }
 
     pub(crate) fn menu(

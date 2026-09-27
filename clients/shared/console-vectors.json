@@ -1,6 +1,6 @@
 {
   "$comment": "CONSOLE-UI vectors, pinned by pf-console-ui's Rust tests: the Skia console draws these on every platform. Sibling of deeplink-vectors.json, same rules: this file is the contract, and a value absent here is a value no client may assume.",
-  "version": 5,
+  "version": 6,
   "shell_tabs": [
     {
       "id": "hosts",
@@ -39,5 +39,10 @@
     "tab": { "slide_fraction": 0.25 },
     "entrance": { "stagger_s": 0.04, "scale": 0.96, "rise_dp": 12.0 }
   },
-  "$motion_springs": "Version 3: the redesign's motion table (design section 3). Springs are integrator-dependent, so this pins parameters, not sampled positions. nav carries the push/pop geometry too: Back mid-push retargets the same spring (interruptible). The Skia shell animates every screen, so its Rust twin pins it."
+  "$motion_springs": "Version 3: the redesign's motion table (design section 3). Springs are integrator-dependent, so this pins parameters, not sampled positions. nav carries the push/pop geometry too: Back mid-push retargets the same spring (interruptible). The Skia shell animates every screen, so its Rust twin pins it.",
+  "pinned_key": [
+    { "host": "9ee34e95aa", "preset": "p-1", "key": "9ee34e95aa\u0000p-1" },
+    { "host": "10.0.0.2:9777", "preset": "work", "key": "10.0.0.2:9777\u0000work" }
+  ],
+  "$pinned_key": "Version 6: a pinned card's row key (HostRow.key) is the host's key, a NUL, then the preset id. The session, Apple and Android producers build it; the console splits it back to the host key."
 }

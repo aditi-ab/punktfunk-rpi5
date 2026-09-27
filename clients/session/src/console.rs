@@ -1146,14 +1146,13 @@ impl ServiceState {
                     // compares, and a deleted preset falls back at resolve, not here.
                     game_presets: h.game_presets.clone(),
                 };
-                // A pinned card shares the primary tile's live state; its key rides the
-                // preset id behind a NUL (impossible in a fingerprint or `addr:port`),
-                // so cursor-follow and the wake path address the card itself.
+                // A pinned card shares the primary tile's live state; its own key lets
+                // cursor-follow and the wake path address the card itself.
                 let pins = h
                     .resolved_pins(&catalog)
                     .into_iter()
                     .map(|p| HostRow {
-                        key: format!("{key}\0{}", p.id),
+                        key: pf_console_ui::model::pinned_key(&key, &p.id),
                         pin: Some(chip(p)),
                         bound_preset: None,
                         ..row.clone()

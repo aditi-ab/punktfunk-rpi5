@@ -144,7 +144,7 @@ impl LibraryScreen {
 
     /// `h` is this shelf's host; a pinned card's shelf counts its primary row.
     fn own(&self, h: &HostRow) -> bool {
-        Some(h.key.as_str()) == self.host.key.split('\0').next()
+        h.key == self.host.host_key()
     }
 
     pub(super) fn shows(&self, s: Section) -> bool {
