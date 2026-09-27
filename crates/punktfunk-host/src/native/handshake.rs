@@ -868,9 +868,11 @@ async fn negotiate_compositor(
             let dedicated =
                 crate::vdisplay::wants_dedicated_game_session(has_resolvable_launch, client);
             Some(
-                tokio::task::spawn_blocking(move || resolve_compositor(pref, dedicated))
-                    .await
-                    .context("resolve compositor task")??,
+                tokio::task::spawn_blocking(move || {
+                    resolve_compositor(pref, dedicated, true, true)
+                })
+                .await
+                .context("resolve compositor task")??,
             )
         }
         Punktfunk1Source::Synthetic

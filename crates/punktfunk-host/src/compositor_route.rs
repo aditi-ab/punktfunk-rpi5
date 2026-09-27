@@ -1,4 +1,4 @@
-//! Map a client's [`CompositorPref`] to a live `crate::vdisplay::Compositor`.
+//! Map a [`CompositorPref`] to a live `crate::vdisplay::Compositor`, for both planes.
 //!
 //! [`pick_compositor`] is pure. [`resolve_compositor`] runs the blocking
 //! session probes — call it off the async reactor (`spawn_blocking`). An
@@ -12,7 +12,8 @@
 //! Evidence: `design/gamemode-and-dedicated-sessions.md`,
 //! `design/gamescope-multiuser.md`.
 
-use super::*;
+use anyhow::Result;
+use punktfunk_core::config::CompositorPref;
 
 /// `None` only when nothing is available *and* nothing was detected — the
 /// caller turns that into a handshake error.
@@ -49,13 +50,13 @@ fn pinned_at_a_dead_session(
     overridden && chosen.needs_live_session() && live == crate::vdisplay::ActiveKind::None
 }
 
-/// Fires the operator recovery hook (debounced) when configured, so a retry
-/// a few seconds later can land in a recovered desktop. `pinned` is the
-/// `PUNKTFUNK_COMPOSITOR` value when the pin is what got us here, so the
+/// With `recover`, fires the operator recovery hook (debounced) when configured,
+/// so a retry a few seconds later can land in a recovered desktop. `pinned` is
+/// the `PUNKTFUNK_COMPOSITOR` value when the pin is what got us here, so the
 /// message names the knob to change.
 #[cfg(not(target_os = "windows"))]
-fn no_live_session(pinned: Option<&str>) -> anyhow::Error {
-    if crate::vdisplay::try_recover_session() {
+fn no_live_session(pinned: Option<&str>, recover: bool) -> anyhow::Error {
+    if recover && crate::vdisplay::try_recover_session() {
         return anyhow::anyhow!(
             "no live graphical session for this uid — host session recovery launched \
              (PUNKTFUNK_RECOVER_SESSION_CMD); retry in a few seconds"
@@ -82,7 +83,7 @@ fn no_live_session(pinned: Option<&str>) -> anyhow::Error {
 /// turns it off. The resolve paths and `serve_session`'s plane setup must
 /// never disagree about this predicate.
 #[cfg(not(target_os = "windows"))]
-pub(super) fn session_is_isolated(
+pub(crate) fn session_is_isolated(
     compositor: crate::vdisplay::Compositor,
     route: Option<&crate::vdisplay::GamescopeRoute>,
 ) -> bool {
@@ -92,10 +93,16 @@ pub(super) fn session_is_isolated(
 }
 
 /// Blocking session probes around [`pick_compositor`]. Call off the async
-/// reactor (`spawn_blocking`).
-pub(super) fn resolve_compositor(
+/// reactor (`spawn_blocking`). `isolation_capable` is false for a plane with
+/// no per-session injector (GameStream): it always publishes the shared input
+/// backend, even for a spawn [`session_is_isolated`] would isolate. `revive` is
+/// false on a capture-loss rebuild: it follows a live session and never stands
+/// one up, so no managed takeover and no recovery hook mid-switch.
+pub(crate) fn resolve_compositor(
     pref: CompositorPref,
     dedicated_launch: bool,
+    isolation_capable: bool,
+    revive: bool,
 ) -> Result<(
     crate::vdisplay::Compositor,
     Option<crate::vdisplay::GamescopeRoute>,
@@ -105,7 +112,7 @@ pub(super) fn resolve_compositor(
     // session-detection state machine.
     #[cfg(target_os = "windows")]
     {
-        let _ = (pref, dedicated_launch);
+        let _ = (pref, dedicated_launch, isolation_capable, revive);
         Ok((Compositor::Windows, None))
     }
     #[cfg(not(target_os = "windows"))]
@@ -116,6 +123,9 @@ pub(super) fn resolve_compositor(
         crate::vdisplay::cancel_pending_tv_restore();
         // Operator pin: assumed to come with a hand-set env — do not retarget.
         let overridden = pf_host_config::config().compositor.is_some();
+        let isolated = |c: Compositor, route: Option<&crate::vdisplay::GamescopeRoute>| {
+            isolation_capable && session_is_isolated(c, route)
+        };
         // Liveness on both paths. Auto retargets env at the live session; a pin
         // names a backend, not a running session, and skips the
         // `XDG_CURRENT_DESKTOP` scrub, so [`pick_compositor`] cannot return
@@ -161,7 +171,7 @@ pub(super) fn resolve_compositor(
                 // Isolated input goes to its own pinned injector. Do not
                 // retarget the shared last-write-wins slot — that steals
                 // input from a concurrent shared-desktop viewer.
-                if !session_is_isolated(Compositor::Gamescope, route.as_ref()) {
+                if !isolated(Compositor::Gamescope, route.as_ref()) {
                     crate::inject::set_backend_id(crate::vdisplay::input_backend_id(
                         Compositor::Gamescope,
                     ));
@@ -180,18 +190,19 @@ pub(super) fn resolve_compositor(
             // No live session, but managed gamescope infra exists: its path
             // stands the session up from nothing. Skip under an operator pin —
             // `PUNKTFUNK_COMPOSITOR` keeps its exact meaning.
-            None if !overridden && crate::vdisplay::managed_session_available() => {
+            None if revive && !overridden && crate::vdisplay::managed_session_available() => {
                 tracing::info!(
                     "no live graphical session — managed gamescope infra present; routing to \
                      the managed takeover to revive the session"
                 );
                 Compositor::Gamescope
             }
-            None => return Err(no_live_session(None)),
+            None => return Err(no_live_session(None, revive)),
         };
         if pinned_at_a_dead_session(overridden, chosen, active.kind) {
             return Err(no_live_session(
                 pf_host_config::config().compositor.as_deref(),
+                revive,
             ));
         }
         // Resolve the gamescope route on both paths, before input publish: a
@@ -200,7 +211,7 @@ pub(super) fn resolve_compositor(
         let route = crate::vdisplay::resolve_gamescope_route(chosen, false);
         // Publish input as a value, not `PUNKTFUNK_INPUT_BACKEND`. Skip on a
         // pin (operator knob stays in charge) and on isolated (own injector).
-        if !overridden && !session_is_isolated(chosen, route.as_ref()) {
+        if !overridden && !isolated(chosen, route.as_ref()) {
             crate::inject::set_backend_id(crate::vdisplay::input_backend_id(chosen));
         }
         let avail_ids: Vec<&str> = available.iter().map(|c| c.id()).collect();

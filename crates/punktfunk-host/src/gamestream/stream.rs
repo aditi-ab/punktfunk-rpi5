@@ -345,7 +345,7 @@ fn run(
         }
         // Re-runnable: the encode loop calls it again on a mid-stream capture loss.
         let (mut capturer, compositor, gamescope_route) =
-            open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit)?;
+            open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit, true)?;
         // Only Linux `launch_is_nested` reads it; gamescope does not exist on Windows.
         #[cfg(not(target_os = "linux"))]
         let _ = &gamescope_route;
@@ -543,7 +543,7 @@ fn run(
         // Re-detect the live compositor so a Desktop↔Game switch is followed in place, with its
         // own cursor blend. WxH is locked at ANNOUNCE — a resolution change cannot follow.
         let rebuild = || {
-            open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit)
+            open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit, false)
                 .map(|(c, comp, route)| (c, gs_cursor_blend(comp, route.as_ref(), &cfg)))
         };
         return stream_body(
@@ -683,15 +683,13 @@ fn open_gs_mirror_source(
     metadata_cursor: bool,
 ) -> Result<Box<dyn Capturer>> {
     // Enumerate against the compositor that is up now — Desktop↔Game may have switched.
-    let active = crate::vdisplay::detect_active_session();
-    crate::vdisplay::observe_session_instance(&active);
-    crate::vdisplay::apply_session_env(&active);
-    let compositor = crate::vdisplay::compositor_for_kind(active.kind)
-        .map(Ok)
-        .unwrap_or_else(crate::vdisplay::detect)
-        .context("detect compositor")?;
-    // Mirror streams an existing head: no gamescope sub-mode, no route.
-    crate::inject::set_backend_id(crate::vdisplay::input_backend_id(compositor));
+    // Mirror streams an existing head: no gamescope sub-mode, and no session to stand up.
+    let (compositor, _) = crate::compositor_route::resolve_compositor(
+        punktfunk_core::config::CompositorPref::Auto,
+        false,
+        false,
+        false,
+    )?;
     let mut vd = crate::vdisplay::open_mirror(compositor, connector)?;
     vd.set_hw_cursor(metadata_cursor);
     // Panel runs at the owner's mode; the client scales. Pass the client's anyway.
@@ -814,7 +812,9 @@ fn blend_capable_metadata_cursor(cfg: &StreamConfig) -> bool {
     }
 }
 
-/// Virtual-display source at the client's mode. Re-run on mid-stream capture loss to follow a
+/// Virtual-display source at the client's mode. The app's own `compositor` wins; otherwise the
+/// native plane's [`crate::compositor_route::resolve_compositor`] picks, pin included. Only a
+/// connect (`revive`) may revive a session. Re-run on mid-stream capture loss to follow a
 /// Desktop↔Game switch. Does not launch the app — a rebuild must not re-spawn it. The capturer
 /// owns the output keepalive; the factory is dropped here.
 fn open_gs_virtual_source(
@@ -823,6 +823,7 @@ fn open_gs_virtual_source(
     // Resolved once by the caller so a rebuild cannot re-resolve to something different.
     launch: Option<&GsApp>,
     quit: &Arc<AtomicBool>,
+    revive: bool,
 ) -> Result<(
     Box<dyn Capturer>,
     crate::vdisplay::Compositor,
@@ -833,34 +834,16 @@ fn open_gs_virtual_source(
         let r = crate::vdisplay::resolve_gamescope_route(c, false);
         (c, r)
     } else {
-        // Windows has one backend; skip Linux `detect()`, which bails there.
-        #[cfg(target_os = "windows")]
-        {
-            (crate::vdisplay::Compositor::Windows, None)
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            crate::vdisplay::cancel_pending_tv_restore();
-            let active = crate::vdisplay::detect_active_session();
-            // Fold an idle-time Game↔Desktop instance change into the epoch before acquire.
-            crate::vdisplay::observe_session_instance(&active);
-            crate::vdisplay::apply_session_env(&active);
-            // Gate on a resolved command so an unresolvable entry falls back to auto routing.
-            // Host policy only: a Moonlight cert is not a console device, same as admission.
-            let has_launch = launch.and_then(|t| t.command.as_deref()).is_some();
-            if crate::vdisplay::wants_dedicated_game_session(has_launch, None) {
-                let c = crate::vdisplay::Compositor::Gamescope;
-                crate::inject::set_backend_id(crate::vdisplay::input_backend_id(c));
-                (c, crate::vdisplay::resolve_gamescope_route(c, true))
-            } else {
-                let c = crate::vdisplay::compositor_for_kind(active.kind)
-                    .map(Ok)
-                    .unwrap_or_else(crate::vdisplay::detect)
-                    .context("detect compositor")?;
-                crate::inject::set_backend_id(crate::vdisplay::input_backend_id(c));
-                (c, crate::vdisplay::resolve_gamescope_route(c, false))
-            }
-        }
+        // Gate on a resolved command so an unresolvable entry falls back to auto routing.
+        // Host policy only: a Moonlight cert is not a console device, same as admission.
+        let has_launch = launch.and_then(|t| t.command.as_deref()).is_some();
+        // No per-session injector on this plane: input always takes the shared backend.
+        crate::compositor_route::resolve_compositor(
+            punktfunk_core::config::CompositorPref::Auto,
+            crate::vdisplay::wants_dedicated_game_session(has_launch, None),
+            false,
+            revive,
+        )?
     };
     let mut vd = crate::vdisplay::open(compositor).context("open virtual display")?;
     vd.set_hw_cursor(host_composites_metadata_cursor(compositor, &cfg));

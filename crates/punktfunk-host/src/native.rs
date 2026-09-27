@@ -35,13 +35,12 @@ use std::sync::Arc;
 /// Shared with GameStream.
 pub(crate) use pf_frame::thread_qos::boost_thread_priority;
 
-mod compositor;
 // The session's control connection, whichever transport carries it (quinn or WebTransport).
 pub(crate) mod link;
 /// A seat's Steam, up before its client asks (`design/steam-seats-warm-launch-implementation-plan.md`).
 #[cfg(target_os = "linux")]
 pub(crate) mod prewarm;
-use compositor::resolve_compositor;
+use crate::compositor_route::resolve_compositor;
 
 /// GameStream presents the same virtual pad and must pick `windows_xbox_hid` from this definition.
 pub(crate) mod gamepad;
@@ -1862,7 +1861,7 @@ pub(crate) async fn run_admitted(
 
     // Isolated gamescope: per-session input/audio/mic. Identity is the device-fingerprint prefix
     // so keep-alive hands a kept spawn back to the same client. Minted after handshake, before
-    // the input/audio threads (`compositor::session_is_isolated`).
+    // the input/audio threads (`compositor_route::session_is_isolated`).
     #[cfg(target_os = "linux")]
     let isolation: Option<crate::vdisplay::SessionIsolation> = match joined.as_ref().map(|(d, _)| d)
     {
@@ -1876,7 +1875,7 @@ pub(crate) async fn run_admitted(
                 ..i
             }),
         None => compositor
-            .filter(|c| compositor::session_is_isolated(*c, gamescope_route.as_ref()))
+            .filter(|c| crate::compositor_route::session_is_isolated(*c, gamescope_route.as_ref()))
             .map(|_| {
                 // `--open` has no fingerprint; a per-accept sequence isolates at the cost of keep-alive.
                 static ANON_SEQ: AtomicU64 = AtomicU64::new(0);
