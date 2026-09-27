@@ -24,20 +24,10 @@ fn kmsdrm_swapchain_hint() -> String {
 }
 
 impl Presenter {
+    /// Replace the swapchain at the window's current size. A zero-size (minimized) window
+    /// keeps the old swapchain and any image already acquired from it.
     pub fn recreate_swapchain(&mut self, window: &sdl3::video::Window) -> Result<()> {
         self.quiesce_own()?;
-        // An image acquired ahead of a present belongs to the swapchain that goes now.
-        self.acquired = None;
-        // Presentation-engine semaphore waits finish here. A fence wait proves
-        // only OUR submit (VUID-vkDestroySemaphore-05149 /
-        // VUID-vkDestroySwapchainKHR-01282). Decode submits share `queue_lock`.
-        {
-            let _q = self.queue_lock.guard();
-            // SAFETY: `queue` is owned here; `queue_lock` is held so no concurrent submit.
-            unsafe { self.device.queue_wait_idle(self.queue) }
-                .context("vkQueueWaitIdle (swapchain recreate)")?;
-        }
-
         // SAFETY: `pdev` and `surface` are live handles owned by this presenter.
         let caps = unsafe {
             self.surface_i
@@ -56,6 +46,22 @@ impl Presenter {
             // Minimized: keep the old swapchain. Presents return OUT_OF_DATE
             // and land back here once the window has a size.
             return Ok(());
+        }
+        // Presentation-engine semaphore waits finish here. A fence wait proves
+        // only OUR submit (VUID-vkDestroySemaphore-05149 /
+        // VUID-vkDestroySwapchainKHR-01282). Decode submits share `queue_lock`.
+        {
+            let _q = self.queue_lock.guard();
+            // An image acquired ahead of a present belongs to the swapchain that goes now.
+            if self.acquired.is_some() {
+                // SAFETY: `queue_lock` is held above.
+                unsafe { self.retire_acquire_sem() }
+                    .context("vkQueueSubmit (discard the acquired image)")?;
+                self.acquired = None;
+            }
+            // SAFETY: `queue` is owned here; `queue_lock` is held so no concurrent submit.
+            unsafe { self.device.queue_wait_idle(self.queue) }
+                .context("vkQueueWaitIdle (swapchain recreate)")?;
         }
         let mut min_images = caps.min_image_count + 1;
         if caps.max_image_count > 0 {

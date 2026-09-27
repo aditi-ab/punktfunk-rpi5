@@ -19,6 +19,27 @@ impl Presenter {
         }
         Ok(())
     }
+
+    /// An empty batch that waits `acquire_sem`. A discarded image leaves the semaphore
+    /// signalled, and the next acquire needs it unsignalled with no wait pending: that holds
+    /// once the queue drains after this.
+    ///
+    /// # Safety
+    /// The caller holds `queue_lock`.
+    pub(super) unsafe fn retire_acquire_sem(&self) -> ash::prelude::VkResult<()> {
+        let sems = [self.acquire_sem];
+        let stages = [vk::PipelineStageFlags::ALL_COMMANDS];
+        let batch = vk::SubmitInfo::default()
+            .wait_semaphores(&sems)
+            .wait_dst_stage_mask(&stages);
+        // SAFETY: `queue` external sync is the caller's `queue_lock`. `acquire_sem` carries
+        // an acquire's signal that no batch waits yet; `batch` and its arrays are locals.
+        unsafe {
+            self.device
+                .queue_submit(self.queue, &[batch], vk::Fence::null())
+        }
+    }
+
     pub(super) fn allocate(
         &self,
         reqs: vk::MemoryRequirements,
