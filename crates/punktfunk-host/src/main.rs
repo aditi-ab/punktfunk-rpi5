@@ -124,8 +124,12 @@ mod encode_recovery;
 // Who else holds an NVENC session (NVML); names the neighbour when a stream falls behind.
 mod encoder_sessions;
 mod events;
-// Session⇄game lifetime — design/session-game-lifetime.md.
-mod gamelease;
+// Launch, lease and liveness of a session's game; the flat names keep `crate::gamelease::*`.
+mod game;
+use game::{
+    gamelease, holds, launchreg, procscan, runstate, session_launch, session_settings,
+    stream_marker,
+};
 mod gamestream;
 #[cfg(target_os = "linux")]
 #[path = "linux/gpuclocks.rs"]
@@ -133,8 +137,6 @@ mod gpuclocks;
 mod hooks;
 // What every plane shares: host facts, session state, `serve`.
 mod host;
-// Launch holds: plugins and hooks that act before a game starts.
-mod holds;
 // Network-facing; same `forbid` as `mod mgmt`. Tests mutate process env (`set_var` is unsafe in 2024).
 #[cfg_attr(not(test), forbid(unsafe_code))]
 mod identity;
@@ -148,8 +150,6 @@ mod pen_sink;
 mod clock;
 // Compositor + gamescope route for a connect, shared by the native and GameStream planes.
 mod compositor_route;
-// Re-`Hello::launch` must not start a second copy — design/session-game-lifetime.md.
-mod launchreg;
 mod library;
 #[forbid(unsafe_code)]
 mod link_health;
@@ -173,15 +173,8 @@ mod osinfo;
 mod pad_feed;
 mod plugins;
 mod power;
-// Process-table half of session⇄game binding — design/session-game-lifetime.md. Empty on macOS.
-mod procscan;
-// Plugin-reported liveness; `procscan` only sees the process table.
-mod runstate;
 mod send_pacing;
-mod session_launch;
 mod session_plan;
-// Operator policy for session⇄game binding (`session-settings.json`).
-mod session_settings;
 mod session_status;
 mod sleep_inhibit;
 mod slug;
@@ -189,7 +182,6 @@ mod spike;
 mod stats_recorder;
 // Signed catalogs and install jobs via the `plugins` runner — design/plugin-store.md.
 mod store;
-mod stream_marker;
 #[cfg(test)]
 mod test_support {
     /// A fresh directory that lives until the calling test's thread ends, for a helper that
