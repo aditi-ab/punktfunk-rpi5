@@ -318,16 +318,7 @@ pub fn hex(fp: &[u8; 32]) -> String {
     fp.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-pub fn parse_hex32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
-    }
-    Some(out)
-}
+pub use punktfunk_core::fp::parse_hex32;
 
 /// One trusted host: pinned cert fingerprint, how trust was granted, last-reached address.
 #[derive(Clone, Debug, Serialize, Deserialize)]
