@@ -121,6 +121,7 @@ HDR over the virtual display.
 | `crates/pf-zerocopy` | CUDA, EGL and Vulkan dmabuf import and fence sync (Linux) |
 | `crates/pf-inject` | Keyboard, mouse, pen and virtual-gamepad injection |
 | `crates/pf-clipboard` | Shared clipboard backends and the clipboard plane |
+| `crates/pf-audio` | Desktop audio capture, the virtual microphone, pad audio and the Windows wiring plan |
 | `crates/pf-frame`, `pf-gpu`, `pf-win-display` | Frame vocabulary; GPU selection; Windows display topology |
 | `crates/pf-host-config` | The settings registry, its store and the env knobs |
 | `crates/pf-paths`, `pf-paths-win` | Config directory and owner-private files; Windows DACL checks |

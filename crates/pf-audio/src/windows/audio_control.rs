@@ -29,7 +29,7 @@ use wasapi::Direction;
 /// silently downmix a voice-carrier (mono / 24 kHz). One `IAudioClient`
 /// activation per endpoint, only during a wiring pass. Every failure maps to
 /// `None`: the plan treats unknown as non-narrowing, matching pre-format boxes.
-pub(crate) fn mix_format_of(ep: &Endpoint) -> Option<MixFormat> {
+pub fn mix_format_of(ep: &Endpoint) -> Option<MixFormat> {
     let fmt = open_endpoint(ep)
         .ok()?
         .get_iaudioclient()
@@ -63,7 +63,7 @@ pub(crate) fn mix_format_of(ep: &Endpoint) -> Option<MixFormat> {
 ///
 /// Must run on a COM-initialized thread; initializes MTA because the caller is
 /// a tokio blocking-pool thread. A repeat init returns `S_FALSE` (success).
-pub(crate) fn probe_capture_rate() -> super::CaptureRate {
+pub fn probe_capture_rate() -> super::CaptureRate {
     if let Err(e) = wasapi::initialize_mta().ok() {
         tracing::debug!(error = %e, "hi-res capture-rate probe: CoInitializeEx (MTA) failed");
         return super::CaptureRate::Unknown;
@@ -114,7 +114,7 @@ fn list_endpoints(dir: Direction) -> Vec<Endpoint> {
 /// True when the loopback plan must prefer real hardware over the silent sink. With voice
 /// chat kept on the host, `host_and_client` keeps the silent sink and the host renders the
 /// mix to the operator's output instead ([`playthrough_requested`]).
-pub(crate) fn host_audio_requested() -> bool {
+pub fn host_audio_requested() -> bool {
     let cfg = pf_host_config::config();
     cfg.audio_output_mode.prefers_host_hardware()
         && cfg.audio_voice_chat != pf_host_config::VoiceChatRoute::Host
@@ -122,7 +122,7 @@ pub(crate) fn host_audio_requested() -> bool {
 
 /// `host_and_client` with voice chat on the host: capture stays on the silent sink and a
 /// render stream on the parked output lets the operator hear the mix.
-pub(crate) fn playthrough_requested() -> bool {
+pub fn playthrough_requested() -> bool {
     let cfg = pf_host_config::config();
     cfg.audio_output_mode.prefers_host_hardware()
         && cfg.audio_voice_chat == pf_host_config::VoiceChatRoute::Host
@@ -130,7 +130,7 @@ pub(crate) fn playthrough_requested() -> bool {
 
 /// The output the operator heard before this capture parked the default on the plan's
 /// sink; `None` while nothing is parked. The voice-chat pin and playthrough target.
-pub(crate) fn parked_previous_render() -> Option<String> {
+pub fn parked_previous_render() -> Option<String> {
     PLAYBACK
         .parked
         .lock()
@@ -146,16 +146,16 @@ pub(crate) fn parked_previous_render() -> Option<String> {
 /// on the box, so parking them would hand every seat's playback to whichever
 /// seat streamed last. A seat's own endpoints carry its marker and the wiring
 /// plan finds them by id.
-pub(crate) fn keep_default_devices() -> bool {
+pub fn keep_default_devices() -> bool {
     pf_host_config::config().audio_output_mode.keeps_default()
-        || crate::audio::capture_policy::session_keeps_default()
-        || crate::seat::is_seat_host()
+        || crate::capture_policy::session_keeps_default()
+        || pf_paths::seat::is_seat_host()
 }
 
 /// One wiring pass: assignment, fingerprint of the same enumeration the plan consumed
 /// (a device arriving mid-pass must not key the waiter to a set the plan never saw),
 /// and the render inventory for the no-loopback diagnosis.
-pub(crate) struct WiredPlan {
+pub struct WiredPlan {
     pub wiring: Wiring,
     pub fingerprint: u64,
     pub renders: Vec<Endpoint>,
@@ -164,14 +164,14 @@ pub(crate) struct WiredPlan {
 /// Endpoint-set hash with no plan, no default writes, no logs. Cheap poll while a
 /// capture waits out a failure; [`wire_now`] runs again only once this moves.
 /// Must run on a COM-initialized thread.
-pub(crate) fn endpoint_fingerprint() -> u64 {
+pub fn endpoint_fingerprint() -> u64 {
     wiring_plan::fingerprint(
         &list_endpoints(Direction::Render),
         &list_endpoints(Direction::Capture),
     )
 }
 
-pub(crate) fn wire_now(park_defaults: bool) -> Wiring {
+pub fn wire_now(park_defaults: bool) -> Wiring {
     wire_now_full(park_defaults).wiring
 }
 
@@ -179,7 +179,7 @@ pub(crate) fn wire_now(park_defaults: bool) -> Wiring {
 static LAST_WIRING: Mutex<Option<Wiring>> = Mutex::new(None);
 
 /// Snapshot of [`LAST_WIRING`]. A status poll must not run COM or IPolicyConfig writes.
-pub(crate) fn last_wiring() -> Option<Wiring> {
+pub fn last_wiring() -> Option<Wiring> {
     LAST_WIRING.lock().unwrap().clone()
 }
 
@@ -295,7 +295,7 @@ impl PlanInputs {
 }
 
 /// COM-initialized thread. Logged only when the assignment changes.
-pub(crate) fn wire_now_full(park_defaults: bool) -> WiredPlan {
+pub fn wire_now_full(park_defaults: bool) -> WiredPlan {
     recover_orphaned_default();
     // Mint BEFORE enumerating, and wait for what was minted to become enumerable. A freshly
     // minted endpoint is not in MMDevice's list for a few tens of milliseconds, and a plan built
@@ -360,7 +360,7 @@ pub(crate) fn wire_now_full(park_defaults: bool) -> WiredPlan {
         if changed {
             tracing::info!(
                 mode = %pf_host_config::config().audio_output_mode.as_str(),
-                session_asked = crate::audio::capture_policy::session_keeps_default(),
+                session_asked = crate::capture_policy::session_keeps_default(),
                 "leaving the audio default devices untouched (follow_default mode, or a \
                  session's keep-host-audio ask)"
             );
@@ -515,7 +515,7 @@ impl DefaultSlot {
 
 /// Current default render endpoint id. Pad-endpoint provisioning uses this so a
 /// freshly minted pad speaker never stays the default playback device.
-pub(crate) fn default_render_id() -> Option<String> {
+pub fn default_render_id() -> Option<String> {
     wasapi::DeviceEnumerator::new()
         .ok()?
         .get_default_device(&Direction::Render)
@@ -526,7 +526,7 @@ pub(crate) fn default_render_id() -> Option<String> {
 
 /// Current default capture endpoint id. Read before asserting so an already-correct
 /// default costs zero IPolicyConfig writes.
-pub(crate) fn default_capture_id() -> Option<String> {
+pub fn default_capture_id() -> Option<String> {
     wasapi::DeviceEnumerator::new()
         .ok()?
         .get_default_device(&Direction::Capture)
@@ -565,7 +565,7 @@ fn recover_orphaned_default() {
 /// otherwise re-pick by its own ranking, not the operator's pre-park device.
 ///
 /// Returns whether a device was actually put back.
-pub(crate) fn unpark_default_for_uninstall() -> bool {
+pub fn unpark_default_for_uninstall() -> bool {
     let mut restored = false;
     for slot in [&PLAYBACK, &RECORDING] {
         if let Some(prev) = slot.take_marker() {
@@ -617,7 +617,7 @@ fn park_default_recording(name: &str, id: &str, changed: bool) {
 /// wiring pass. One `IPolicyConfig` write: the capture is bound explicitly, so a
 /// hijacked default only moves where apps render. Does not touch [`PLAYBACK`] — the
 /// operator's original default is still owed back at stream end.
-pub(crate) fn reassert_default_playback(id: &str) -> bool {
+pub fn reassert_default_playback(id: &str) -> bool {
     match set_default_endpoint(id) {
         Ok(()) => true,
         Err(e) => {
@@ -628,12 +628,12 @@ pub(crate) fn reassert_default_playback(id: &str) -> bool {
 }
 
 /// Inverse of [`park_default_playback`]: see [`DefaultSlot::restore`].
-pub(crate) fn restore_default_playback() {
+pub fn restore_default_playback() {
     PLAYBACK.restore();
 }
 
 /// Inverse of [`park_default_recording`]: see [`DefaultSlot::restore`].
-pub(crate) fn restore_default_recording() {
+pub fn restore_default_recording() {
     RECORDING.restore();
 }
 
@@ -643,7 +643,7 @@ pub(crate) fn restore_default_recording() {
 static RESHAPED: Mutex<Vec<(String, u16, u32)>> = Mutex::new(Vec::new());
 
 /// Give a render endpoint `channels` until [`restore_endpoint_channels`]. `from` is its count now.
-pub(crate) fn reshape_endpoint(id: &str, from: u16, channels: u16, rate_hz: u32) -> Result<()> {
+pub fn reshape_endpoint(id: &str, from: u16, channels: u16, rate_hz: u32) -> Result<()> {
     set_endpoint_channels(id, channels, rate_hz)?;
     let mut reshaped = RESHAPED.lock().unwrap();
     if !reshaped.iter().any(|(r, ..)| r == id) {
@@ -653,7 +653,7 @@ pub(crate) fn reshape_endpoint(id: &str, from: u16, channels: u16, rate_hz: u32)
 }
 
 /// Inverse of [`reshape_endpoint`] for every endpoint reshaped. Capture exit path.
-pub(crate) fn restore_endpoint_channels() {
+pub fn restore_endpoint_channels() {
     let reshaped = std::mem::take(&mut *RESHAPED.lock().unwrap());
     for (id, channels, rate_hz) in reshaped {
         match set_endpoint_channels(&id, channels, rate_hz) {
@@ -669,7 +669,7 @@ pub(crate) fn restore_endpoint_channels() {
 
 /// Open by endpoint id. Goes through [`super::pad_endpoint::open_wasapi_device`]
 /// so every caller shares one resolution path (see that helper).
-pub(crate) fn open_endpoint(ep: &Endpoint) -> Result<wasapi::Device> {
+pub fn open_endpoint(ep: &Endpoint) -> Result<wasapi::Device> {
     super::pad_endpoint::open_wasapi_device(&ep.1)
         .map_err(|e| anyhow!("open endpoint {:?}: {e:#}", ep.0))
 }
@@ -767,7 +767,7 @@ fn with_policy_config<R>(
 
 /// Set `device_id` as default for eConsole/eMultimedia/eCommunications via
 /// `IPolicyConfig::SetDefaultEndpoint`. Errs if any role fails.
-pub(crate) fn set_default_endpoint(device_id: &str) -> Result<()> {
+pub fn set_default_endpoint(device_id: &str) -> Result<()> {
     use windows::core::Interface;
     with_policy_config(device_id, |pc, id| {
         let mut result = Ok(());
@@ -789,7 +789,7 @@ pub(crate) fn set_default_endpoint(device_id: &str) -> Result<()> {
 /// but the devnode, driver, and stamped identity stay — showing it again is not
 /// a PnP reinstall. Pad-endpoint provider hides the idle DualSense speaker so
 /// libScePad titles do not take the haptics path against an unserviced endpoint.
-pub(crate) fn set_endpoint_visibility(device_id: &str, visible: bool) -> Result<()> {
+pub fn set_endpoint_visibility(device_id: &str, visible: bool) -> Result<()> {
     use windows::core::Interface;
     with_policy_config(device_id, |pc, id| {
         // SAFETY: live IPolicyConfig from `with_policy_config`; INT bool.
@@ -824,7 +824,7 @@ fn set_endpoint_channels(device_id: &str, channels: u16, rate_hz: u32) -> Result
 /// `IPolicyConfig::SetDeviceFormat` with the first of `samples` (store bits, valid bits,
 /// type) the driver takes, per mask. The write replaces the endpoint's whole stored format
 /// set, and the driver validates it, so `Err` means it has no `channels`-channel mode at all.
-pub(crate) fn set_endpoint_format(
+pub fn set_endpoint_format(
     device_id: &str,
     channels: u16,
     rate_hz: u32,

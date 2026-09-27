@@ -35,12 +35,12 @@ use windows::Win32::System::Variant::{VT_BLOB, VT_CLSID, VT_LPWSTR};
 
 /// An owned NUL-terminated UTF-16 buffer, for a property value that borrows or copies the
 /// bytes. A read-only `PCWSTR` argument takes an `HSTRING` instead.
-pub(crate) fn wide(s: &str) -> Vec<u16> {
+pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// `VT_LPWSTR` borrowing `w`, which must outlive it and stay NUL-terminated.
-pub(crate) fn pv_lpwstr(w: &[u16]) -> ManuallyDrop<PROPVARIANT> {
+pub fn pv_lpwstr(w: &[u16]) -> ManuallyDrop<PROPVARIANT> {
     ManuallyDrop::new(PROPVARIANT {
         Anonymous: PROPVARIANT_0 {
             Anonymous: ManuallyDrop::new(PROPVARIANT_0_0 {
@@ -57,7 +57,7 @@ pub(crate) fn pv_lpwstr(w: &[u16]) -> ManuallyDrop<PROPVARIANT> {
 }
 
 /// `VT_CLSID` borrowing `g`, which must outlive it.
-pub(crate) fn pv_clsid(g: &GUID) -> ManuallyDrop<PROPVARIANT> {
+pub fn pv_clsid(g: &GUID) -> ManuallyDrop<PROPVARIANT> {
     ManuallyDrop::new(PROPVARIANT {
         Anonymous: PROPVARIANT_0 {
             Anonymous: ManuallyDrop::new(PROPVARIANT_0_0 {
@@ -74,7 +74,7 @@ pub(crate) fn pv_clsid(g: &GUID) -> ManuallyDrop<PROPVARIANT> {
 }
 
 /// `VT_BLOB` borrowing `b`, which must outlive it.
-pub(crate) fn pv_blob(b: &[u8]) -> ManuallyDrop<PROPVARIANT> {
+pub fn pv_blob(b: &[u8]) -> ManuallyDrop<PROPVARIANT> {
     ManuallyDrop::new(PROPVARIANT {
         Anonymous: PROPVARIANT_0 {
             Anonymous: ManuallyDrop::new(PROPVARIANT_0_0 {
@@ -93,7 +93,7 @@ pub(crate) fn pv_blob(b: &[u8]) -> ManuallyDrop<PROPVARIANT> {
     })
 }
 
-pub(crate) fn pv_string(pv: &PROPVARIANT) -> Option<String> {
+pub fn pv_string(pv: &PROPVARIANT) -> Option<String> {
     // SAFETY: the variant is initialized (built by us or returned by GetValue); pwszVal is only
     // read when vt says VT_LPWSTR, in which case it points at the variant's NUL-terminated
     // string (or is null, which we check).
@@ -110,7 +110,7 @@ pub(crate) fn pv_string(pv: &PROPVARIANT) -> Option<String> {
     }
 }
 
-pub(crate) fn pv_guid(pv: &PROPVARIANT) -> Option<GUID> {
+pub fn pv_guid(pv: &PROPVARIANT) -> Option<GUID> {
     // SAFETY: puuid is only dereferenced when vt == VT_CLSID and non-null.
     unsafe {
         let inner = &pv.Anonymous.Anonymous;
@@ -125,7 +125,7 @@ pub(crate) fn pv_guid(pv: &PROPVARIANT) -> Option<GUID> {
     }
 }
 
-pub(crate) fn pv_bytes(pv: &PROPVARIANT) -> Option<Vec<u8>> {
+pub fn pv_bytes(pv: &PROPVARIANT) -> Option<Vec<u8>> {
     // SAFETY: the blob pointer/length pair is only read when vt == VT_BLOB and
     // the pointer is non-null; the variant owns cbSize bytes there.
     unsafe {
@@ -142,7 +142,7 @@ pub(crate) fn pv_bytes(pv: &PROPVARIANT) -> Option<Vec<u8>> {
 }
 
 /// A device-information set, destroyed on drop.
-pub(crate) struct DevInfoSet(Owned<HDEVINFO>);
+pub struct DevInfoSet(Owned<HDEVINFO>);
 
 impl DevInfoSet {
     /// Adopts a set from `SetupDiGetClassDevsW` / `SetupDiCreateDeviceInfoList`.
@@ -152,7 +152,7 @@ impl DevInfoSet {
     }
 
     /// Every element, in SetupAPI order, until the first `ERROR_NO_MORE_ITEMS`.
-    pub(crate) fn iter(&self) -> impl Iterator<Item = SP_DEVINFO_DATA> + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = SP_DEVINFO_DATA> + '_ {
         (0..).map_while(move |i| {
             let mut did = devinfo_data();
             // SAFETY: live set; `did` is a live out-param with cbSize set.
@@ -163,7 +163,7 @@ impl DevInfoSet {
     }
 }
 
-pub(crate) fn media_class_devs() -> Result<DevInfoSet> {
+pub fn media_class_devs() -> Result<DevInfoSet> {
     // SAFETY: the class GUID is a static const; flags 0 (not DIGCF_PRESENT) so a created-but-
     // never-installed phantom from a previous run is still found and reused, not duplicated.
     let set = unsafe {
@@ -185,7 +185,7 @@ fn devinfo_data() -> SP_DEVINFO_DATA {
     }
 }
 
-pub(crate) fn instance_id(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<String> {
+pub fn instance_id(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<String> {
     let mut buf = [0u16; 200];
     // SAFETY: live devinfo set + element; the buffer length travels with the slice.
     unsafe { SetupDiGetDeviceInstanceIdW(*set.0, did, Some(&mut buf), None) }.ok()?;
@@ -193,7 +193,7 @@ pub(crate) fn instance_id(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<Str
     Some(String::from_utf16_lossy(&buf[..len]))
 }
 
-pub(crate) fn devnode_multi_sz_prop(
+pub fn devnode_multi_sz_prop(
     set: &DevInfoSet,
     did: &SP_DEVINFO_DATA,
     prop: windows::Win32::Devices::DeviceAndDriverInstallation::SETUP_DI_REGISTRY_PROPERTY,
@@ -220,7 +220,7 @@ pub(crate) fn devnode_multi_sz_prop(
 }
 
 /// Installed-driver INF (`DEVPKEY_Device_DriverInfPath`). Absent if the driver never installed.
-pub(crate) fn devnode_inf_path(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<String> {
+pub fn devnode_inf_path(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<String> {
     let mut ty = DEVPROPTYPE(0);
     let mut buf = vec![0u8; 1024];
     let mut req = 0u32;
@@ -250,7 +250,7 @@ pub(crate) fn devnode_inf_path(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Optio
 }
 
 /// REG_DWORD from `Device Parameters`. `None` = no key, no value, or wrong type — foreign.
-pub(crate) fn read_devparam_dword(
+pub fn read_devparam_dword(
     set: &DevInfoSet,
     did: &SP_DEVINFO_DATA,
     value_name: &str,
@@ -290,7 +290,7 @@ pub(crate) fn read_devparam_dword(
 }
 
 /// Write side of [`read_devparam_dword`]; creates the key on a fresh devnode.
-pub(crate) fn write_devparam_dword(
+pub fn write_devparam_dword(
     set: &DevInfoSet,
     did: &mut SP_DEVINFO_DATA,
     value_name: &str,
@@ -344,7 +344,7 @@ pub(crate) fn write_devparam_dword(
 /// Create + register a MEDIA-class root devnode carrying `hwid`, then `mark`
 /// writes the durable owner marker. DeviceDesc only survives until the INF
 /// installs. Shared by the pad provisioner and the `audio-probe` devtest.
-pub(crate) fn create_media_devnode(
+pub fn create_media_devnode(
     desc: &str,
     hwid: &str,
     mark: impl FnOnce(&DevInfoSet, &mut SP_DEVINFO_DATA) -> Result<()>,
@@ -387,7 +387,7 @@ pub(crate) fn create_media_devnode(
 
 /// Bind `inf` to every unbound devnode carrying `hwid`. Idempotent: nothing
 /// needed an update is success. Shared with the `audio-probe` devtest.
-pub(crate) fn bind_driver(hwid: &str, inf: &str) -> Result<()> {
+pub fn bind_driver(hwid: &str, inf: &str) -> Result<()> {
     let inf_w = HSTRING::from(inf);
     let hwid_w = HSTRING::from(hwid);
     // SAFETY: both strings are NUL-terminated and outlive the call; a null parent HWND and no

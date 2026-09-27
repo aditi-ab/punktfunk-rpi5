@@ -10,7 +10,7 @@
 //!
 //! Decode lives in the USB handler. This type only owns the published channel.
 
-use crate::audio::AudioCapturer;
+use crate::AudioCapturer;
 use anyhow::{anyhow, Result};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
@@ -20,7 +20,7 @@ use std::time::Duration;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Interleaved `f32` quad frames lifted straight off the pad's isochronous OUT endpoint.
-pub(crate) struct PadUsbCapturer {
+pub struct PadUsbCapturer {
     rx: Receiver<Vec<f32>>,
     pad: u8,
 }
@@ -41,7 +41,7 @@ impl PadUsbCapturer {
     ///
     /// Fails until usbip publishes one (normal between thread start and attach).
     /// The streamer's open-with-backoff retries, so this is a late start, not silence.
-    pub(crate) fn open(pad: u8) -> Result<PadUsbCapturer> {
+    pub fn open(pad: u8) -> Result<PadUsbCapturer> {
         let rx = pf_inject::dualsense_usbip::take_audio_rx(pad)
             .ok_or_else(|| anyhow!("no usbip pad audio published for pad {pad} (not attached?)"))?;
         tracing::info!(pad, "pad audio capturing from the USB isochronous endpoint");

@@ -41,26 +41,26 @@ static MARKER: Mutex<()> = Mutex::new(());
 
 /// What the pin borrows from the host binary: its process scan, its console-user spawn and
 /// its SYSTEM check.
-pub(crate) struct HostHooks {
+pub struct HostHooks {
     /// `(pid, parent pid, image base name)` of every process, one Toolhelp snapshot.
-    pub(crate) processes: fn() -> Vec<(u32, u32, String)>,
+    pub processes: fn() -> Vec<(u32, u32, String)>,
     /// Run a command line as the console user, windowless; its exit code.
-    pub(crate) run_hidden_as_user: fn(&str, Duration) -> Result<u32>,
+    pub run_hidden_as_user: fn(&str, Duration) -> Result<u32>,
     /// Whether this process runs as LocalSystem.
-    pub(crate) running_as_system: fn() -> bool,
+    pub running_as_system: fn() -> bool,
 }
 
 /// Set once at host startup. Unset, no voice app is found, so no helper runs.
-pub(crate) static HOST_HOOKS: OnceLock<HostHooks> = OnceLock::new();
+pub static HOST_HOOKS: OnceLock<HostHooks> = OnceLock::new();
 
-pub(crate) fn wanted() -> bool {
+pub fn wanted() -> bool {
     pf_host_config::config().audio_voice_chat == pf_host_config::VoiceChatRoute::Host
 }
 
 /// The capture thread's pins: which output, which apps point at it, and the worker
 /// that writes them.
 #[derive(Default)]
-pub(crate) struct VoiceRoute {
+pub struct VoiceRoute {
     target: Option<String>,
     /// Lowercase exe names pinned to `target`.
     pinned: BTreeSet<String>,
@@ -82,7 +82,7 @@ struct ScanReport {
 impl VoiceRoute {
     /// Point voice apps at `device_id` for this capture. Never blocks: a new target
     /// simply re-pins every app on the next [`tick`](Self::tick).
-    pub(crate) fn arm(&mut self, device_id: &str) {
+    pub fn arm(&mut self, device_id: &str) {
         if !wanted() || self.target.as_deref() == Some(device_id) {
             return;
         }
@@ -98,7 +98,7 @@ impl VoiceRoute {
 
     /// Collect the last worker's pins and start the next scan when one is due. Nothing
     /// here touches a process or a snapshot: this runs on the capture thread.
-    pub(crate) fn tick(&mut self) {
+    pub fn tick(&mut self) {
         if let Some(rx) = &self.inflight {
             match rx.try_recv() {
                 Ok(report) => {
@@ -173,7 +173,7 @@ impl VoiceRoute {
 
     /// Put every pinned app back where the operator had it: session end. Blocking — the
     /// capture is stopping. An app that already exited stays owed.
-    pub(crate) fn clear(&mut self) {
+    pub fn clear(&mut self) {
         // A worker still pinning would land its pin after this clear.
         if let Some(rx) = self.inflight.take() {
             let _ = rx.recv_timeout(WORKER_JOIN);
@@ -190,7 +190,7 @@ impl VoiceRoute {
 /// start and session end; a crash or an app that exited before the clear leaves the
 /// marker for the next chance. One helper per app, so one refusal keeps only its own
 /// entry.
-pub(crate) fn recover_orphaned() {
+pub fn recover_orphaned() {
     let _marker = MARKER.lock().unwrap_or_else(|e| e.into_inner());
     let mut owed = read_owed();
     if owed.is_empty() {
@@ -373,7 +373,7 @@ fn run_helper(args: &[&str]) -> bool {
 /// `set` saves the app's current pins in the user's profile the first time, then pins it.
 /// `clear` puts a saved pin back on each role still pinned to `device-id`, and leaves a role
 /// the operator moved since. `-` (an older marker) clears every role to "default".
-pub(crate) fn cli(args: &[String]) -> Result<()> {
+pub fn cli(args: &[String]) -> Result<()> {
     const USAGE: &str = "usage: punktfunk-host voice-route probe|set <device-id> <pid> <exe> | \
                          clear <device-id|-> <pid> <exe>";
     let arg = |i: usize| args.get(i).map(String::as_str).context(USAGE);

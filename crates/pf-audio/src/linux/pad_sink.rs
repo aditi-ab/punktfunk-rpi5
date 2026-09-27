@@ -3,7 +3,7 @@
 //! haptics or pad-speaker audio finds "the controller's audio device" and
 //! plays into us. We own the nodes: `process()` is the capture, mixed into
 //! one 4-ch F32 48 kHz quad (ch0/1 speaker/headphone, ch2/3 voice coils) that
-//! feeds the 0xD1 lanes (`native/pad_audio.rs`).
+//! feeds the 0xD1 lanes (the host's `native/pad_audio.rs`).
 //!
 //! Three nodes match the UCM split. The public 4-ch surface is positioned
 //! FL/FR/RL/RR (`SpeakerHaptic__sink`); a positioned writer on an AUX node is
@@ -33,7 +33,7 @@ const PAD_CHANNELS: u32 = 4;
 
 /// How many pads get a sink (`PUNKTFUNK_PAD_AUDIO_SLOTS`). Default 4: a PipeWire
 /// stream node is cheap; the Windows mint defaults to 1.
-pub(crate) fn pad_audio_slots() -> u8 {
+pub fn pad_audio_slots() -> u8 {
     std::env::var("PUNKTFUNK_PAD_AUDIO_SLOTS")
         .ok()
         .and_then(|s| s.parse::<u8>().ok())
@@ -44,7 +44,7 @@ pub(crate) fn pad_audio_slots() -> u8 {
 /// Whether a PipeWire daemon is plausibly reachable. Stat, not connect: the
 /// handshake runs per-Hello and must not block. `PIPEWIRE_REMOTE` names a
 /// non-default socket; a wrong value fails at spawn, pad kept.
-pub(crate) fn pipewire_reachable() -> bool {
+pub fn pipewire_reachable() -> bool {
     if std::env::var_os("PIPEWIRE_REMOTE").is_some() {
         return true;
     }
@@ -60,9 +60,7 @@ pub(crate) fn pipewire_reachable() -> bool {
 ///
 /// [`ds_pairing_reply`]: pf_inject::dualsense_proto::ds_pairing_reply
 fn pad_mac(pad: u8, edge: bool) -> String {
-    use crate::inject::dualsense_proto::{
-        ds_pairing_reply, DEVTYPE_DUALSENSE, DEVTYPE_DUALSENSE_EDGE,
-    };
+    use pf_inject::dualsense_proto::{ds_pairing_reply, DEVTYPE_DUALSENSE, DEVTYPE_DUALSENSE_EDGE};
     let device_type = if edge {
         DEVTYPE_DUALSENSE_EDGE
     } else {
@@ -375,7 +373,7 @@ impl Drop for PadSinkCapturer {
     }
 }
 
-impl crate::audio::AudioCapturer for PadSinkCapturer {
+impl crate::AudioCapturer for PadSinkCapturer {
     fn next_chunk(&mut self) -> Result<Vec<f32>> {
         match self.chunks.recv_timeout(Duration::from_secs(5)) {
             Ok(c) => Ok(c),
@@ -422,7 +420,7 @@ fn format_pod(channels: u32, positions: [u32; 64]) -> Result<Vec<u8>> {
     use pw::spa::param::audio::{AudioFormat, AudioInfoRaw};
     let mut info = AudioInfoRaw::new();
     info.set_format(AudioFormat::F32LE);
-    info.set_rate(crate::audio::SAMPLE_RATE);
+    info.set_rate(crate::SAMPLE_RATE);
     info.set_channels(channels);
     info.set_position(positions);
     let obj = pw::spa::pod::Object {

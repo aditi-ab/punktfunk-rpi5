@@ -25,9 +25,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 /// Durable ownership marker. The uninstall sweep matches every minted role on it.
-pub(crate) const ROLE_MARKER: &str = "PunktfunkAudioRole";
+pub const ROLE_MARKER: &str = "PunktfunkAudioRole";
 /// Secondary marker that partitions minted roles between validated seat hosts.
-pub(crate) const SEAT_MARKER: &str = "PunktfunkAudioSeat";
+pub const SEAT_MARKER: &str = "PunktfunkAudioSeat";
 const SEAT_MARKER_DOMAIN: &[u8] = b"punktfunk/audio-seat/v1\0";
 /// Audiosrv can take this long to register a freshly minted endpoint.
 const ENDPOINT_WAIT: Duration = Duration::from_secs(15);
@@ -94,7 +94,7 @@ struct AudioIdentity {
 impl AudioIdentity {
     fn from_seat_id(raw: Option<&str>) -> std::result::Result<Self, &'static str> {
         let seat = raw
-            .map(crate::seat::validate_seat_id)
+            .map(pf_paths::seat::validate_seat_id)
             .transpose()?
             .map(|id| SeatIdentity {
                 marker: derive_seat_marker(id),
@@ -158,7 +158,7 @@ fn markers_match(
 fn process_identity() -> Result<&'static AudioIdentity> {
     static IDENTITY: OnceLock<std::result::Result<AudioIdentity, &'static str>> = OnceLock::new();
     let parsed = IDENTITY.get_or_init(|| {
-        crate::seat::seat_id().and_then(|id| AudioIdentity::from_seat_id(id.as_deref()))
+        pf_paths::seat::seat_id().and_then(|id| AudioIdentity::from_seat_id(id.as_deref()))
     });
     match parsed {
         Ok(identity) => Ok(identity),
@@ -168,7 +168,7 @@ fn process_identity() -> Result<&'static AudioIdentity> {
 
 /// Partial is usable: one driver leg failing must not cost the other role.
 #[derive(Debug, Default, Clone)]
-pub(crate) struct MintedAudio {
+pub struct MintedAudio {
     pub speakers_devnode: Option<String>,
     pub speakers_render: Option<String>,
     pub mic_devnode: Option<String>,
@@ -209,7 +209,7 @@ fn gave_up() -> bool {
 }
 
 /// Wiring-plan tier-0: minted endpoint ids, or all-empty while nothing is provisioned.
-pub(crate) fn minted_ids() -> wiring_plan::MintedIds {
+pub fn minted_ids() -> wiring_plan::MintedIds {
     match PROVISIONED.get() {
         Some(m) => wiring_plan::MintedIds {
             speakers_render: m.speakers_render.clone(),
@@ -221,12 +221,12 @@ pub(crate) fn minted_ids() -> wiring_plan::MintedIds {
 }
 
 /// The full record including devnode instance ids. [`minted_ids`] is the wiring-plan subset.
-pub(crate) fn provisioned() -> Option<Arc<MintedAudio>> {
+pub fn provisioned() -> Option<Arc<MintedAudio>> {
     PROVISIONED.get().cloned()
 }
 
 /// Starts one process-identity provisioning worker. Idempotent and non-blocking.
-pub(crate) fn provision_at_startup() {
+pub fn provision_at_startup() {
     if std::env::var_os("PUNKTFUNK_NO_AUDIO_MINT").is_some() || gave_up() {
         return;
     }
@@ -284,7 +284,7 @@ pub(crate) fn provision_at_startup() {
 }
 
 /// Wiring-pass retry. Cheap once latched; while unlatched, at most every [`RETRY_COOLDOWN`] so a late Steam install still mints.
-pub(crate) fn ensure_provisioned() {
+pub fn ensure_provisioned() {
     if PROVISIONED.get().is_some() || gave_up() {
         return;
     }
@@ -327,7 +327,7 @@ fn ensure_all(identity: &'static AudioIdentity) -> Result<MintedAudio> {
 /// driver hands render bytes to the capture pin raw, so a pin at another depth or width turns
 /// the mic into noise. A property stamp is only served after an audio-service restart;
 /// `SetDeviceFormat` is served at once. Runs before the virtual mic opens its stream.
-pub(crate) fn repair_mic_formats() {
+pub fn repair_mic_formats() {
     let Some(m) = provisioned() else {
         return;
     };
@@ -674,7 +674,7 @@ fn adopt_console_orphan_devnode(role: Role, hwid: &str) -> Result<Option<String>
 }
 
 /// Hardware id + INF for one Steam streaming driver: prefer an installed `oemNN.inf` Windows already trusts, else Steam's driver directory.
-pub(crate) fn discover_driver(needle: &str, inf_name: &str) -> Result<(String, String)> {
+pub fn discover_driver(needle: &str, inf_name: &str) -> Result<(String, String)> {
     use windows::Win32::Devices::DeviceAndDriverInstallation::SPDRP_HARDWAREID;
     let steam_dir_inf = || -> Option<String> {
         let w = super::wasapi_mic::steam_driver_inf_path(inf_name)?;
@@ -717,7 +717,7 @@ pub(crate) fn discover_driver(needle: &str, inf_name: &str) -> Result<(String, S
 ///
 /// A latched result or `PUNKTFUNK_NO_AUDIO_MINT` returns immediately. Otherwise an in-flight
 /// pass wins, failed passes respect [`RETRY_COOLDOWN`], and the process attempt cap still applies.
-pub(crate) fn ensure_blocking() {
+pub fn ensure_blocking() {
     if std::env::var_os("PUNKTFUNK_NO_AUDIO_MINT").is_some()
         || PROVISIONED.get().is_some()
         || gave_up()
@@ -758,7 +758,7 @@ pub(crate) fn ensure_blocking() {
     PROVISIONING.store(false, Ordering::SeqCst);
 }
 
-pub(crate) fn devtest_mint() -> Result<()> {
+pub fn devtest_mint() -> Result<()> {
     let identity = process_identity()?;
     let m = ensure_all(identity)?;
     println!("audio-mint: seat={}", identity.label());

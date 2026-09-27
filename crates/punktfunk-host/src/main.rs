@@ -14,7 +14,10 @@
 // Keep `unsafe fn` only where a caller can violate a contract (raw pointer / borrowed HANDLE).
 // Workspace lints already require `// SAFETY:` on every `unsafe` block.
 
-mod audio;
+// Shim: audio backends live in `pf-audio`; keep `crate::audio::*` for this crate's callers.
+mod audio {
+    pub(crate) use pf_audio::*;
+}
 mod bringup;
 mod capture;
 mod detect;

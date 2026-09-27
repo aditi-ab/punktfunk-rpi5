@@ -37,6 +37,7 @@ on:
       - 'crates/pf-gpu/**'
       - 'crates/pf-host-config/**'
       - 'crates/pf-inject/**'
+      - 'crates/pf-audio/**'
       - 'crates/pf-libva/**'
       - 'crates/pf-paths/**'
       - 'crates/pf-paths-win/**'

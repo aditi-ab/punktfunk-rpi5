@@ -22,14 +22,14 @@ use wasapi::{Direction, SampleType, StreamMode, WaveFormat};
 /// `Device Parameters` stamp. `cleanup` and
 /// [`devnode_cleanup`](super::devnode_cleanup) match this so a probe node cannot
 /// outlive the product.
-pub(crate) const PROBE_MARKER: &str = "PunktfunkAudioProbe";
+pub const PROBE_MARKER: &str = "PunktfunkAudioProbe";
 /// Device Manager name until the INF install overwrites it.
 const PROBE_DESC: &str = "Punktfunk Audio Probe";
 const ENDPOINT_WAIT: Duration = Duration::from_secs(15);
 /// Tone renders at 0.5; autoconvert may attenuate. Above this is signal.
 const SIGNAL_FLOOR: f32 = 0.05;
 
-pub(crate) fn run(args: &[String]) -> Result<()> {
+pub fn run(args: &[String]) -> Result<()> {
     wasapi::initialize_mta()
         .ok()
         .context("CoInitializeEx (MTA)")?;

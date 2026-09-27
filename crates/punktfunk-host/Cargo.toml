@@ -48,6 +48,9 @@ pf-capture = { path = "../pf-capture" }
 # subsystem crate (plan §W6). Consumes core::input; the heavy input deps (wayland/reis/xkbcommon/
 # usbip) moved with it.
 pf-inject = { path = "../pf-inject" }
+# Host audio (PipeWire/WASAPI capture, the virtual mic, pad audio, the Windows wiring plan),
+# extracted to a subsystem crate (plan §W6). The PipeWire binding moved with it.
+pf-audio = { path = "../pf-audio" }
 # Virtual-display orchestration (per-compositor Linux backends + the Windows IddCx driver backend),
 # extracted to a subsystem crate (plan §W6). The DDC panel control + KWin zkde protocol moved with it.
 pf-vdisplay = { path = "../pf-vdisplay" }
@@ -222,11 +225,10 @@ h2 = "0.4"
 # Disposable directory fixtures for the Steam local-librarycache scan tests (library.rs).
 tempfile = "3"
 
-# Opus encode for the host->client audio plane — stereo (`opus::Encoder`) AND 5.1/7.1 surround
-# (`opus::MSEncoder`, the safe multistream API the crate exposes; no `audiopus_sys` needed). The
-# crate vendors libopus (cmake-built from source — no system lib, no vcpkg), so it builds on Windows
-# MSVC too (needs CMake + NASM, both on the box) and on macOS, where `punktfunk-core` already
-# vendors it for the client. The mic pump that decodes with it carries no platform code of its own.
+# Opus for the pad-audio encoder (`native::pad_audio`) and `opus::Error` on the audio planes; the
+# desktop encoder and the mic pump live in pf-audio. The crate vendors libopus (cmake-built from
+# source — no system lib, no vcpkg), so it builds on Windows MSVC too (needs CMake + NASM, both on
+# the box) and on macOS, where `punktfunk-core` already vendors it for the client.
 [target.'cfg(any(unix, windows))'.dependencies]
 opus = "0.3"
 
@@ -240,14 +242,11 @@ libc = "0.2"
 # `screencast` gates the ScreenCast portal module; `remote_desktop` adds the RemoteDesktop
 # portal we use for libei input on KWin/GNOME; `tokio` is the default runtime.
 # `open_pipe_wire_remote` is unconditional, so ashpd's own `pipewire` feature is not
-# needed — we drive PipeWire with the `pipewire` crate below.
+# needed — pf-capture and pf-audio drive PipeWire with the `pipewire` crate.
 # `settings` adds the org.freedesktop.portal.Settings proxy the console's theme route reads
 # (design/web-console-overhaul.md §7) — the only cross-desktop source for the desktop's own
 # mode and accent.
 ashpd = { version = "0.13", features = ["screencast", "remote_desktop", "settings"] }
-# Must match the pipewire crate ashpd 0.13 links (libspa/pipewire-sys `links` key is
-# unique per build), i.e. 0.9 — NOT the 0.10 the setup doc mentions.
-pipewire = "0.9"
 # (ashpd 0.13 drives the one-time portal handshake on tokio; the unconditional `tokio = "full"`
 # in [dependencies] already covers that — this block used to re-declare a strict subset of it.)
 # NOTE: the Wayland stack (wayland-client / -protocols{,-wlr,-misc} / -scanner / -backend),
@@ -312,27 +311,19 @@ windows = { version = "0.62", features = [
     # Windows service supervisor (src/windows/service/runtime.rs): a kill-on-close job object so a
     # service crash never orphans the SYSTEM host it launched into the active console session.
     "Win32_System_JobObjects",
-    # CoCreateInstance(PolicyConfigClient) — set the default audio playback/recording endpoints via the
-    # undocumented IPolicyConfig (audio/windows/audio_control.rs) so mic + desktop audio auto-wire.
+    # A packaged game's window property store (src/windows/game_term.rs): COM, IPropertyStore, and
+    # the PROPVARIANT it returns (StructuredStorage, gated on Variant). The audio endpoint work
+    # declares its own in pf-audio.
     "Win32_System_Com",
-    # Pad-audio endpoint provisioning (audio/windows/pad_endpoint.rs): IMMDevice + IPropertyStore
-    # to stamp the DualSense identity onto the minted endpoints (PROPVARIANT lives in
-    # StructuredStorage and is gated on the Variant feature), DEVPKEY_Device_DriverInfPath to
-    # resolve the installed Steam Streaming Speakers INF, and raw Reg* calls behind the MMDevices
-    # ACL repair + the devnode's pad-index marker value.
-    "Win32_Media_Audio",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
-    "Win32_Devices_Properties",
+    # The console user's theme values (src/windows/theme.rs).
     "Win32_System_Registry",
     # SetUnhandledExceptionFilter + EXCEPTION_POINTERS — the last-resort native-crash logger
     # (src/windows/crash.rs); Kernel gates the CONTEXT type EXCEPTION_POINTERS embeds.
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",
-    # RoGetActivationFactory(AudioPolicyConfig) — the per-app output pin that keeps voice-chat
-    # apps on the operator's speakers (audio/windows/voice_route.rs).
-    "Win32_System_WinRT",
     # CreateToolhelp32Snapshot/Process32*W — the conflicting-streaming-host process scan
     # (src/detect/windows.rs): is Sunshine/Apollo/... running alongside us?
     "Win32_System_Diagnostics_ToolHelp",
@@ -355,10 +346,10 @@ windows-service = "0.8"
 # Registry reads the host does on Windows — ergonomic + correct-by-construction vs. hand-rolled
 # Reg* FFI for subkey enumeration. Survived the removal of the built-in store scanners (which is
 # what first pulled it in): `library/launch.rs` resolves launcher install paths for the typed launch
-# kinds a plugin publishes, `procscan/windows.rs` maps processes, and the two `audio/windows/`
-# modules read and clean up device nodes.
+# kinds a plugin publishes and `procscan/windows.rs` maps processes.
 winreg = "0.56"
-# WASAPI loopback audio capture (default render endpoint -> 48 kHz stereo f32 for the Opus path).
+# The pad-audio capture thread's COM init and the `pad-endpoint reshape` devtest's sample types;
+# capture itself lives in pf-audio.
 wasapi = "0.24"
 # Shared host<->driver wire contract for the pf-vdisplay IddCx virtual-display backend: the
 # control-plane IOCTL codes + `#[repr(C)] Pod` request/reply structs, defined ONCE so host<->driver
