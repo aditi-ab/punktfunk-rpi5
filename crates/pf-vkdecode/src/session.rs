@@ -406,7 +406,7 @@ impl StoredParams {
 /// `VkVideoSessionKHR`, its bound memory, and the one-shot RESET arm. Each codec
 /// session owns one ahead of its parameters, so the session is destroyed before
 /// the Std backings drop.
-pub(crate) struct RawVideoSession {
+pub struct RawVideoSession {
     device: ash::Device,
     video_queue: ash::khr::video_queue::Device,
     session: vk::VideoSessionKHR,
@@ -558,6 +558,14 @@ impl Drop for RawVideoSession {
     }
 }
 
+/// What the shared decoder reads off a codec session.
+pub trait CodecSession {
+    fn raw_mut(&mut self) -> &mut RawVideoSession;
+    fn parameters(&self) -> vk::VideoSessionParametersKHR;
+    /// `maxActiveReferencePictures` the session was created with.
+    fn max_active_references(&self) -> u32;
+}
+
 /// A codec's stored parameters: the object handle, NULL until one exists.
 pub(crate) trait ParametersObject {
     fn object(&self) -> vk::VideoSessionParametersKHR;
@@ -569,8 +577,9 @@ impl ParametersObject for StoredParams {
     }
 }
 
-pub(crate) struct VideoSession {
-    pub(crate) raw: RawVideoSession,
+/// H.264 session: [`RawVideoSession`] plus the SPS/PPS parameters object.
+pub struct VideoSession {
+    raw: RawVideoSession,
     parameters: StoredParams,
     ledger: ParamsLedger,
     pub(crate) config: SessionConfig,
@@ -751,9 +760,19 @@ impl VideoSession {
             }
         }
     }
+}
 
-    pub(crate) fn parameters(&self) -> vk::VideoSessionParametersKHR {
+impl CodecSession for VideoSession {
+    fn raw_mut(&mut self) -> &mut RawVideoSession {
+        &mut self.raw
+    }
+
+    fn parameters(&self) -> vk::VideoSessionParametersKHR {
         self.parameters.object
+    }
+
+    fn max_active_references(&self) -> u32 {
+        self.config.max_active_references
     }
 }
 

@@ -71,6 +71,8 @@ pub use caps::YUV444_8;
 pub use caps_av1::Av1ProfileKey;
 pub use caps_h265::output_format_for;
 pub use caps_h265::H265ProfileKey;
+pub use decoder::core::VkCodec;
+pub use decoder::core::VkDecoder;
 pub use decoder::DecodeStatus;
 pub use decoder::DecodedVkFrame;
 pub use decoder::VkDecodeError;

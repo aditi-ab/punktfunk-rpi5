@@ -30,6 +30,7 @@ use crate::caps_av1::Av1ProfileKey;
 use crate::device::DecodeDevice;
 use crate::params_av1::sequence_to_std;
 use crate::params_av1::OwnedStdAv1SequenceHeader;
+use crate::session::CodecSession;
 use crate::session::ParametersObject;
 use crate::session::RawVideoSession;
 use crate::session::SessionError;
@@ -102,8 +103,9 @@ impl ParametersObject for Option<StoredParamsAv1> {
     }
 }
 
-pub(crate) struct VideoSessionAv1 {
-    pub(crate) raw: RawVideoSession,
+/// AV1 session: [`RawVideoSession`] plus the sequence-header parameters object.
+pub struct VideoSessionAv1 {
+    raw: RawVideoSession,
     /// `None` until the first [`Self::ensure_parameters`]: no empty form (module docs).
     parameters: Option<StoredParamsAv1>,
     ledger: ParamsLedgerAv1,
@@ -216,9 +218,19 @@ impl VideoSessionAv1 {
             }
         }
     }
+}
 
-    pub(crate) fn parameters(&self) -> vk::VideoSessionParametersKHR {
+impl CodecSession for VideoSessionAv1 {
+    fn raw_mut(&mut self) -> &mut RawVideoSession {
+        &mut self.raw
+    }
+
+    fn parameters(&self) -> vk::VideoSessionParametersKHR {
         self.parameters.object()
+    }
+
+    fn max_active_references(&self) -> u32 {
+        self.config.max_active_references
     }
 }
 
@@ -227,7 +239,7 @@ impl Drop for VideoSessionAv1 {
         // SAFETY: this session's own parameters object (NULL before the first
         // activation); the decoder drains GPU work first. `raw` drops next and
         // destroys the session; the sequence-header backing drops after that.
-        unsafe { self.raw.destroy_parameters(self.parameters()) };
+        unsafe { self.raw.destroy_parameters(self.parameters.object()) };
     }
 }
 

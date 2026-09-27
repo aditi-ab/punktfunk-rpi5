@@ -4,13 +4,13 @@
 //! tile-payload ring upload → record (barriers, `vkCmdBeginVideoCodingKHR`
 //! with every bound DPB slot, one-shot session RESET, a caps-gated
 //! `RESULT_STATUS_ONLY` query around `vkCmdDecodeVideoKHR`) → submit on the
-//! decode queue under the caller's [`QueueLock`] with a per-image timeline
+//! decode queue under the caller's [`crate::QueueLock`] with a per-image timeline
 //! signal. `show_existing_frame` settles DPB and output with no GPU submit.
 //!
 //! `referenceNameSlotIndices` are DPB slot indices, not `pReferenceSlots`
 //! positions; inconsistent bindings fail closed. AV1 §7.20: a slot this frame
 //! reads cannot become its target until the decode is recorded —
-//! [`DecodePlanVkAv1::release_after_decode`] delays that recycle. A named
+//! [`crate::DecodePlanVkAv1::release_after_decode`] delays that recycle. A named
 //! reference with no image is fatal: latch recovery and wait for the next key
 //! frame; never submit [`REFERENCE_NAME_UNUSED`].
 //!
@@ -19,8 +19,6 @@
 //! zero-tailed arrays (the driver reads the full arrays); `tileCount` is the
 //! real count. Result-status queries only when the queue family advertises them.
 
-use std::collections::BTreeMap;
-use std::collections::VecDeque;
 use std::ops::Range;
 
 use ash::vk;
@@ -28,7 +26,6 @@ use ash::vk::native as hh;
 use cros_codecs::codec::av1::parser::FrameHeaderObu;
 use pf_bitstream::av1::AuPlan;
 use pf_bitstream::av1::Av1Planner;
-use pf_bitstream::av1::PicId;
 use pf_bitstream::av1::PlanWarning;
 use pf_bitstream::av1::NUM_REF_SLOTS;
 use pf_bitstream::h264::DisplayCrop;
@@ -41,42 +38,26 @@ use crate::caps::query_caps;
 use crate::caps::DecodeCaps;
 use crate::caps::DecodeProfile;
 use crate::caps_av1::Av1ProfileKey;
-use crate::decoder::core::build_frame;
-use crate::decoder::core::build_scope;
-use crate::decoder::core::reset_slot_bindings;
-use crate::decoder::core::settle_dpb_ids;
-use crate::decoder::core::sync_slot_bindings;
-use crate::decoder::core::wait_timeline;
-use crate::decoder::core::OpRing;
+use crate::decoder::core::session_extent;
 use crate::decoder::core::PendingPic;
-use crate::decoder::core::RecoveryLatch;
-use crate::decoder::core::RetiredPool;
 use crate::decoder::core::ScopeRef;
-use crate::decoder::DecodeStatus;
+use crate::decoder::core::SessionState;
+use crate::decoder::core::VkCodec;
+use crate::decoder::core::VkDecoder;
 use crate::decoder::DecodedVkFrame;
 use crate::decoder::VkDecodeError;
 use crate::device::DecodeDevice;
 use crate::device::DeviceHandles;
 use crate::device::QueueLock;
-use crate::device::QueueSubmitGuard;
-use crate::images::plan_pools;
-use crate::images::DpbPool;
-use crate::images::PicturePool;
 use crate::pic_av1::plan_to_vk_av1;
-use crate::pic_av1::DecodePlanVkAv1;
 use crate::pic_av1::VkRefAv1;
 use crate::pic_av1::REFERENCE_NAME_UNUSED;
+use crate::recovery::RecoveryMark;
 use crate::ring::pack_av1_tiles;
-use crate::ring::BitstreamRing;
 use crate::ring::PackedAv1Tiles;
-use crate::ring::RingLayout;
-use crate::ring::UploadedAu;
-use crate::ring::INITIAL_SLOT_SIZE;
-use crate::ring::RING_SLOTS;
 use crate::session_av1::ParamsActionAv1;
 use crate::session_av1::SessionConfigAv1;
 use crate::session_av1::VideoSessionAv1;
-use crate::slots::SlotMap;
 
 /// Eight `NUM_REF_FRAMES` plus the picture being decoded. Codec constant, not
 /// an SPS field: an AV1 session never renegotiates DPB depth.
@@ -418,57 +399,13 @@ enum FrameOutcome {
     SkippedAwaitingKey,
 }
 
-/// One session generation. Extent or profile change (bit-depth, sampling,
-/// film-grain) retires it.
-struct SessionStateAv1 {
-    session: VideoSessionAv1,
-    slots: SlotMap,
-    /// Distinct-mode DPB backing. `None` in coincide (the picture pool is the DPB).
-    dpb: Option<DpbPool>,
-    pool: PicturePool,
-    ring: BitstreamRing,
-    ops: OpRing,
-    /// Std ref info per DPB slot. Begin-coding wants it for every bound slot,
-    /// including ones this frame does not reference.
-    slot_refs: Vec<Option<hh::StdVideoDecodeAV1ReferenceInfo>>,
-    /// Coincide: pool picture bound to each DPB slot. Rebound on activation.
-    slot_image: Vec<Option<usize>>,
-    /// Per command-buffer completion tokens (reuse gate).
-    cmd_marks: Vec<Option<(vk::Semaphore, u64)>>,
-    /// Per query-slot submission ordinals (staleness).
-    query_marks: Vec<u64>,
-    submitted: u64,
-    last_submit: Option<(vk::Semaphore, u64)>,
-    /// Stream coded extent (renegotiation comparison).
-    coded_extent: vk::Extent2D,
-    /// Granularity-aligned allocation extent (picture resources and frames).
-    image_extent: vk::Extent2D,
-}
-
-/// Native Vulkan Video AV1 decoder. Public surface matches [`crate::VkH265Decoder`].
-pub struct VkAv1Decoder {
-    dev: DecodeDevice,
-    lock: Box<dyn QueueLock>,
+/// AV1 planner, caps, and stream state of a [`VkAv1Decoder`].
+pub struct Av1 {
     planner: Av1Planner,
     /// Caps per profile key. Bit-depth or film-grain change is a new key.
     caps: Option<(Av1ProfileKey, DecodeCaps)>,
-    state: Option<SessionStateAv1>,
-    /// Hidden frames waiting on a later `show_existing_frame`. A `show_frame`
-    /// picture is settled into `ready` by the plan that decoded it.
-    pending: BTreeMap<PicId, PendingPic>,
-    /// Display-ready frames not yet handed out. A temporal unit can fill several.
-    ready: VecDeque<DecodedVkFrame>,
-    /// Retired generations' pools with consumer-held images (die on last token).
-    graveyard: Vec<RetiredPool>,
-    last_warnings: Vec<PlanWarning>,
-    /// Decode-order ordinal stamped onto frames. Survives rebuilds: it describes
-    /// the stream, not the Vulkan objects.
-    decoded: u64,
-    generation: u64,
-    device_lost: bool,
-    recovery: RecoveryLatch,
-    /// Skip until the next decoded key. The planner has no `flush`, so after
-    /// [`Self::recover_dpb`] its store still names the emptied slots.
+    /// Skip until the next decoded key. The planner has no `flush`, so after a
+    /// recovery its store still names the emptied slots.
     /// Per-frame skip, per-AU error: [`VkDecodeError::AwaitingKeyAv1`].
     /// `Ok(None)` would reset the demotion streak.
     awaiting_key: bool,
@@ -476,7 +413,57 @@ pub struct VkAv1Decoder {
     level_advisory_warned: bool,
 }
 
-impl VkAv1Decoder {
+/// Native Vulkan Video AV1 decoder. A decoded AU is a temporal unit.
+pub type VkAv1Decoder = VkDecoder<Av1>;
+
+impl VkCodec for Av1 {
+    type Session = VideoSessionAv1;
+    type StdRef = hh::StdVideoDecodeAV1ReferenceInfo;
+    type Warning = PlanWarning;
+    type DpbSlotInfo<'a> = vk::VideoDecodeAV1DpbSlotInfoKHR<'a>;
+    const LABEL: &'static str = "av1";
+
+    fn dpb_slot_info(std: &Self::StdRef) -> Self::DpbSlotInfo<'_> {
+        vk::VideoDecodeAV1DpbSlotInfoKHR::default().std_reference_info(std)
+    }
+
+    fn decode_au(
+        dec: &mut VkDecoder<Self>,
+        au: &[u8],
+    ) -> Result<Option<DecodedVkFrame>, VkDecodeError> {
+        dec.decode_inner(au)
+    }
+
+    /// Discard pending pictures (teardown / discontinuity). AV1 has no reorder
+    /// buffer: pending entries are hidden frames. Arms the key-frame wait — the
+    /// planner has no `flush` and still names the emptied slots.
+    fn flush(dec: &mut VkDecoder<Self>) {
+        match &mut dec.state {
+            Some(state) => {
+                for (_, entry) in std::mem::take(&mut dec.pending) {
+                    state.pool.pictures[entry.image].pending = false;
+                }
+            }
+            None => dec.pending.clear(),
+        }
+        dec.reset_slot_ledgers();
+        dec.codec.awaiting_key = true;
+    }
+
+    fn forgive_unclean(&mut self) {
+        self.planner.forgive_unclean();
+    }
+
+    fn snapshot_flags(&self) -> &'static str {
+        if self.awaiting_key {
+            " awaiting=key"
+        } else {
+            ""
+        }
+    }
+}
+
+impl VkDecoder<Av1> {
     /// Wrap the borrowed device. Sessions/pools are built lazily from the first
     /// sequence header (their shape is the stream's, not the device's).
     ///
@@ -494,23 +481,13 @@ impl VkAv1Decoder {
         // SAFETY: forwarded caller contract.
         let dev = unsafe { DecodeDevice::wrap(handles)? };
         dev.require_codec_op(vk::VideoCodecOperationFlagsKHR::DECODE_AV1, "AV1 decode")?;
-        Ok(Self {
-            dev,
-            lock,
+        let codec = Av1 {
             planner: Av1Planner::new(),
             caps: None,
-            state: None,
-            pending: BTreeMap::new(),
-            ready: VecDeque::new(),
-            graveyard: Vec::new(),
-            last_warnings: Vec::new(),
-            decoded: 0,
-            generation: 0,
-            device_lost: false,
-            recovery: RecoveryLatch::default(),
             awaiting_key: false,
             level_advisory_warned: false,
-        })
+        };
+        Ok(Self::with_codec(dev, lock, codec))
     }
 
     /// Caps check before any AU. `film_grain` is part of the AV1 decode profile;
@@ -536,32 +513,11 @@ impl VkAv1Decoder {
         Ok(())
     }
 
-    /// Decode one temporal unit (may carry several frames). Returns the next
-    /// display-ready frame; drain the rest with [`Self::take_ready`].
-    ///
-    /// Every frame skipped while [`Self::awaiting_key`] is [`VkDecodeError::AwaitingKeyAv1`].
+    /// One temporal unit: plan every frame, then decode, settle, or skip each.
     /// A `show_existing_frame` naming an empty slot is a warning and displays
-    /// nothing. `DeviceLost` latches until the owner rebuilds on fresh handles.
-    pub fn decode(&mut self, au: &[u8]) -> Result<Option<DecodedVkFrame>, VkDecodeError> {
-        if self.device_lost {
-            return Err(VkDecodeError::DeviceLost);
-        }
-        let result = self.decode_inner(au);
-        if matches!(result, Err(VkDecodeError::DeviceLost)) {
-            self.device_lost = true;
-        }
-        result
-    }
-
+    /// nothing.
     fn decode_inner(&mut self, au: &[u8]) -> Result<Option<DecodedVkFrame>, VkDecodeError> {
-        // Recover before planning: a stranded DPB picture would fail every later
-        // reference ([`RecoveryLatch`]).
-        if self.recovery.take() {
-            self.recover_dpb();
-        }
-        // Clear before planning so a plan failure cannot re-report the previous AU.
-        self.last_warnings.clear();
-        let plans = match self.planner.plan_au(au) {
+        let plans = match self.codec.planner.plan_au(au) {
             Ok(plans) => plans,
             Err(e) => return Err(VkDecodeError::PlanAv1(e)),
         };
@@ -587,7 +543,7 @@ impl VkAv1Decoder {
             }
         }
         // Count skips; do not return at the first. A key may sit behind a skipped
-        // frame in the same unit. Not a latch: `recover_dpb` already ran.
+        // frame in the same unit. Not a latch: recovery already ran.
         if whole_unit_skipped(plans.len(), skipped) {
             return Err(VkDecodeError::AwaitingKeyAv1);
         }
@@ -598,11 +554,11 @@ impl VkAv1Decoder {
         // Only a decoded key clears the wait. `show_existing_frame` of a key
         // resets the planner store (7.20) but decodes nothing — empty ledger vs
         // full store, then the next inter fails and re-arms the wait.
-        if self.awaiting_key && clears_awaiting_key(plan) {
+        if self.codec.awaiting_key && clears_awaiting_key(plan) {
             debug!("AV1 key frame reached — decoding resumes");
-            self.awaiting_key = false;
+            self.codec.awaiting_key = false;
         }
-        if self.awaiting_key {
+        if self.codec.awaiting_key {
             trace!(
                 show_existing = plan.dpb.stored.is_none(),
                 "frame skipped while awaiting the next AV1 key frame"
@@ -652,163 +608,58 @@ impl VkAv1Decoder {
 
         let vk_plan = plan_to_vk_av1(plan, &mut state.slots).map_err(VkDecodeError::ConvertAv1)?;
 
-        // Binding more than maxActiveReferencePictures is a silent VUID miss.
-        let max_active = state.session.config.max_active_references as usize;
-        if vk_plan.refs.len() > max_active {
-            return Err(VkDecodeError::Unsupported(format!(
-                "frame references {} pictures, session allows {max_active} active references",
-                vk_plan.refs.len()
-            )));
-        }
-
-        // Coincide: unbind released slots; drop the setup slot's previous image.
-        let setup = usize::from(vk_plan.setup_slot);
-        if state.dpb.is_none() {
-            let unbound =
-                sync_slot_bindings(&state.slots, &mut state.slot_image, vk_plan.setup_slot);
-            for picture in unbound {
-                state.pool.pictures[picture].bound = false;
-            }
-        }
-
-        // Free pool picture, never one a consumer holds.
-        let Some(dst) = state.pool.free_index() else {
-            debug!(
-                held = state.pool.held_total(),
-                "picture pool exhausted — release_frame owed"
-            );
-            return Err(VkDecodeError::NoFreeSlot);
-        };
-
-        // Dst's last timeline (presenter write-back), plus coincide refs so
-        // reads follow any reported layout restore.
-        let mut waits: Vec<(vk::Semaphore, u64)> = Vec::new();
-        {
-            let dst_pic = &state.pool.pictures[dst];
-            if dst_pic.value > 0 {
-                waits.push((dst_pic.semaphore, dst_pic.value));
-            }
-        }
-        if state.dpb.is_none() {
-            for r in &vk_plan.refs {
-                if let Some(picture) = state.slot_image[usize::from(r.slot)] {
-                    let pic = &state.pool.pictures[picture];
-                    if pic.value > 0 && !waits.iter().any(|(sem, _)| *sem == pic.semaphore) {
-                        waits.push((pic.semaphore, pic.value));
-                    }
-                }
-            }
-        }
-        let signal_value = state.pool.pictures[dst].value + 1;
-
-        let submission = state.submitted;
-        let cmd_index = (submission % state.ops.cmds.len() as u64) as usize;
-        if let Some((sem, value)) = state.cmd_marks[cmd_index] {
-            // SAFETY: live device; token is a pool picture's semaphore.
-            unsafe { wait_timeline(self.dev.ash(), sem, value, "command buffer reuse")? };
-        }
-        let query_index = (submission % u64::from(state.ops.query_count)) as u32;
-
-        // Tile payloads only; AV1 has no start codes to strip.
-        let Some(packed) = pack_av1_tiles(&bitstream.tiles) else {
-            return Err(VkDecodeError::Unsupported(
-                "packed tile data exceeds the u32 offsets Vulkan submits".into(),
-            ));
-        };
-        let tiles = submitted_tiles(&packed).map_err(VkDecodeError::TilesAv1)?;
-
-        let device = self.dev.ash().clone();
-        let mut poll = |token: &(vk::Semaphore, u64)| -> Result<bool, VkDecodeError> {
-            // SAFETY: live device; token semaphore is a pool semaphore.
-            let current = unsafe { device.get_semaphore_counter_value(token.0) }
-                .map_err(VkDecodeError::from)?;
-            Ok(current >= token.1)
-        };
-        let device2 = self.dev.ash().clone();
-        let mut wait = |token: &(vk::Semaphore, u64)| -> Result<(), VkDecodeError> {
-            // SAFETY: live device; token semaphore is a pool semaphore.
-            unsafe { wait_timeline(&device2, token.0, token.1, "bitstream slot drain") }
-        };
-        // SAFETY: live device; segments are in-bounds plan ranges; pending tokens
-        // are the completion signals of the submissions that consumed the slots.
-        let upload = unsafe {
-            state
-                .ring
-                .upload(&self.dev, au, &packed.segments, &mut poll, &mut wait)?
-        };
-
-        // SAFETY: live device; recorded handles belong to this generation; packed
-        // tiles sit in the ring slot.
-        unsafe {
-            record_and_submit_av1(
-                &self.dev,
-                &*self.lock,
-                state,
-                &vk_plan,
+        // Slots this frame still reads are held through convert/submit so setup
+        // assignment cannot recycle them; the release runs either way.
+        self.submit_then_release(&vk_plan.release_after_decode, |dec| {
+            let op = dec.prepare_op(&vk_plan.refs, vk_plan.setup_slot, vk_plan.setup_ref)?;
+            // Tile payloads only; AV1 has no start codes to strip.
+            let Some(packed) = pack_av1_tiles(&bitstream.tiles) else {
+                return Err(VkDecodeError::Unsupported(
+                    "packed tile data exceeds the u32 offsets Vulkan submits".into(),
+                ));
+            };
+            let tiles = submitted_tiles(&packed).map_err(VkDecodeError::TilesAv1)?;
+            // SAFETY: the segments are in-bounds plan tile ranges; the recorded
+            // tile offsets come from the same `pack_av1_tiles` call.
+            let upload = unsafe { dec.upload(au, &packed.segments)? };
+            let scope = dec.scope(&op, &vk_plan.refs)?;
+            check_reference_names(&vk_plan.refs, &vk_plan.reference_name_slot_indices)?;
+            let mut picture_info = av1_picture_info(
+                vk_plan.pic.std(),
+                vk_plan.reference_name_slot_indices,
                 &tiles,
-                &upload,
-                dst,
-                cmd_index,
-                query_index,
-                &waits,
-                signal_value,
-            )?;
-        }
-
-        let dst_sem = state.pool.pictures[dst].semaphore;
-        state.pool.pictures[dst].value = signal_value;
-        state.pool.pictures[dst].pending = true;
-        if state.dpb.is_none() {
-            state.pool.pictures[dst].bound = true;
-            state.slot_image[setup] = Some(dst);
-        }
-        state.cmd_marks[cmd_index] = Some((dst_sem, signal_value));
-        state.query_marks[query_index as usize] = submission;
-        state.submitted += 1;
-        state.last_submit = Some((dst_sem, signal_value));
-        state
-            .ring
-            .pending
-            .set_pending(upload.slot, (dst_sem, signal_value));
-
-        state.slot_refs[setup] = Some(vk_plan.setup_ref);
-        for r in &vk_plan.refs {
-            state.slot_refs[usize::from(r.slot)] = Some(r.std);
-        }
-
-        // Slots this frame still read; held through convert/submit so setup
-        // assignment cannot recycle them. Free now that the decode is recorded.
-        for &id in &vk_plan.release_after_decode {
-            if !state.slots.release(id) {
-                trace!(id, "deferred release of an id the slot map no longer holds");
-            }
-        }
-
-        self.pending.insert(
-            vk_plan.setup_id,
-            PendingPic {
-                image: dst,
-                submission,
-                query_slot: query_index,
-                timeline_value: signal_value,
-                crop: DisplayCrop {
-                    x: 0,
-                    y: 0,
-                    // Render size is a display hint (5.9.6 has no upper bound),
-                    // not a window. Unclamped it would crop past the decoded image.
-                    width: plan.picture.render_width.min(plan.picture.upscaled_width),
-                    height: plan.picture.render_height.min(plan.picture.frame_height),
+            );
+            // SAFETY: `op`, `scope` and `upload` were just taken for this plan
+            // on the current generation.
+            unsafe { dec.record_and_submit(&op, &scope, &mut picture_info, &upload)? };
+            dec.commit_op(&op, &upload, &vk_plan.refs);
+            dec.pending.insert(
+                vk_plan.setup_id,
+                PendingPic {
+                    image: op.dst,
+                    submission: op.submission,
+                    query_slot: op.query_index,
+                    timeline_value: op.signal_value,
+                    crop: DisplayCrop {
+                        x: 0,
+                        y: 0,
+                        // Render size is a display hint (5.9.6 has no upper bound),
+                        // not a window. Unclamped it would crop past the decoded image.
+                        width: plan.picture.render_width.min(plan.picture.upscaled_width),
+                        height: plan.picture.render_height.min(plan.picture.frame_height),
+                    },
+                    colour: plan.picture.colour,
+                    // No POC. OrderHint wraps; it is not a monotone counter.
+                    poc: plan.picture.order_hint as i32,
+                    // Key is the only re-anchor (no IDR, no recovery-point SEI).
+                    is_idr: plan.picture.is_key,
+                    recovery: RecoveryMark::NONE,
+                    decode_order,
+                    references_clean: plan.picture.references_clean,
                 },
-                colour: plan.picture.colour,
-                // No POC. OrderHint wraps; it is not a monotone counter.
-                poc: plan.picture.order_hint as i32,
-                // Key is the only re-anchor (no IDR, no recovery-point SEI).
-                is_idr: plan.picture.is_key,
-                recovery: crate::recovery::RecoveryMark::NONE,
-                decode_order,
-                references_clean: plan.picture.references_clean,
-            },
-        );
+            );
+            Ok(())
+        })?;
 
         self.settle(&plan.dpb.outputs, &plan.dpb.removed);
 
@@ -830,329 +681,33 @@ impl VkAv1Decoder {
         Ok(FrameOutcome::Decoded)
     }
 
-    /// Outputs become ready (pending → held); removed-never-shown free their images.
-    fn settle(&mut self, outputs: &[PicId], removed: &[PicId]) {
-        let (ready, dropped) = settle_dpb_ids(&mut self.pending, outputs, removed);
-        let Some(state) = self.state.as_mut() else {
-            return;
-        };
-        for entry in ready {
-            let frame = build_frame(
-                &mut state.pool,
-                state.dpb.is_none(),
-                state.image_extent,
-                &entry,
-                self.generation,
-            );
-            self.ready.push_back(frame);
-        }
-        for entry in dropped {
-            debug!(
-                order_hint = entry.poc,
-                "picture displaced from every slot without being shown — freeing its image"
-            );
-            state.pool.pictures[entry.image].pending = false;
-        }
-    }
-
-    /// Return a delivered frame. `presenter_signaled` means the consumer sampled
-    /// and signaled `value + 1` ([`DecodedVkFrame`]); wait that write-back before
-    /// reuse. Every `decode`/`take_ready` frame comes back once, including stale
-    /// generations (retired pool dies on its last token).
-    pub fn release_frame(
-        &mut self,
-        frame: &DecodedVkFrame,
-        presenter_signaled: bool,
-    ) -> Result<(), VkDecodeError> {
-        let pool = if frame.generation == self.generation {
-            match &mut self.state {
-                Some(state) => &mut state.pool,
-                None => {
-                    return Err(VkDecodeError::StaleFrame {
-                        frame_generation: frame.generation,
-                        current_generation: self.generation,
-                    })
-                }
-            }
-        } else {
-            match self
-                .graveyard
-                .iter_mut()
-                .find(|r| r.generation == frame.generation)
-            {
-                Some(retired) => &mut retired.pool,
-                None => {
-                    return Err(VkDecodeError::StaleFrame {
-                        frame_generation: frame.generation,
-                        current_generation: self.generation,
-                    })
-                }
-            }
-        };
-        let index = frame.picture as usize;
-        if index >= pool.pictures.len() {
-            return Err(VkDecodeError::StaleFrame {
-                frame_generation: frame.generation,
-                current_generation: self.generation,
-            });
-        }
-        let picture = &mut pool.pictures[index];
-        match picture.held.checked_sub(1) {
-            Some(remaining) => picture.held = remaining,
-            None => {
-                debug!(index, "frame released more often than delivered");
-                return Ok(());
-            }
-        }
-        if presenter_signaled {
-            picture.value = picture.value.max(frame.value + 1);
-        }
-        // Retired pool dies on last token (presenter waited; decode drained).
-        if frame.generation != self.generation {
-            self.graveyard
-                .retain(|r| r.generation != frame.generation || r.pool.held_total() > 0);
-        }
-        Ok(())
-    }
-
-    /// Next display-ready frame after the one `decode` returned. Drain after every
-    /// decode; leftover frames occupy pool pictures. A temporal unit can fill several.
-    pub fn take_ready(&mut self) -> Option<DecodedVkFrame> {
-        self.ready.pop_front()
-    }
-
-    /// Last planned AU's warnings, decode order. Cleared by the next `decode`.
-    pub fn take_warnings(&mut self) -> Vec<PlanWarning> {
-        std::mem::take(&mut self.last_warnings)
-    }
-
-    /// Forget the planner's unclean marks after a freeze lift on intra refresh marks
-    /// ([`pf_bitstream::clean::CleanLedger::clear`]).
-    pub fn forgive_unclean(&mut self) {
-        self.planner.forgive_unclean();
-    }
-
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    /// Decode-order watermark. 0 before the first decode; `show_existing_frame`
-    /// does not advance it.
-    pub fn decode_order(&self) -> u64 {
-        self.decoded
-    }
-
-    /// One-line state snapshot (not a stable format).
-    pub fn debug_snapshot(&self) -> String {
-        let recovery = if self.recovery.is_latched() {
-            " recovery=owed"
-        } else {
-            ""
-        };
-        let awaiting = if self.awaiting_key {
-            " awaiting=key"
-        } else {
-            ""
-        };
-        match &self.state {
-            None => format!("gen={}{recovery}{awaiting} <no session>", self.generation),
-            Some(state) => {
-                let occupancy: Vec<String> = state
-                    .pool
-                    .pictures
-                    .iter()
-                    .enumerate()
-                    .map(|(i, p)| {
-                        format!(
-                            "{i}:{}{}h{}",
-                            if p.bound { "B" } else { "-" },
-                            if p.pending { "P" } else { "-" },
-                            p.held
-                        )
-                    })
-                    .collect();
-                format!(
-                    "av1 gen={}{recovery}{awaiting} mode={} slots_held={}/{} pool=[{}] \
-                     pending={} ready={} graveyard={}",
-                    self.generation,
-                    if state.dpb.is_none() {
-                        "coincide"
-                    } else {
-                        "distinct"
-                    },
-                    state.slots.active(),
-                    state.slots.capacity(),
-                    occupancy.join(" "),
-                    self.pending.len(),
-                    self.ready.len(),
-                    self.graveyard.len(),
-                )
-            }
-        }
-    }
-
-    /// Decode status without waiting. [`DecodeStatus::Failed`] is a driver error
-    /// or a query slot re-armed before it was read. Without
-    /// `queryResultStatusSupport` (RADV), `Ok` means the timeline completed.
-    pub fn poll_status(&mut self, frame: &DecodedVkFrame) -> DecodeStatus {
-        self.read_status(frame, false)
-    }
-
-    pub fn status_queries(&self) -> bool {
-        self.dev.result_status_queries()
-    }
-
-    pub fn wait_status(&mut self, frame: &DecodedVkFrame) -> DecodeStatus {
-        self.read_status(frame, true)
-    }
-
-    fn read_status(&mut self, frame: &DecodedVkFrame, block: bool) -> DecodeStatus {
-        if frame.generation != self.generation {
-            trace!(
-                frame_generation = frame.generation,
-                current = self.generation,
-                "status asked for a stale-generation frame — Failed, without \
-                 touching the new pools"
-            );
-            return DecodeStatus::Failed;
-        }
-        let Some(state) = &self.state else {
-            return DecodeStatus::Failed;
-        };
-        let Some(query_pool) = state.ops.query_pool else {
-            // No queries: degrade to timeline completion.
-            if block {
-                // SAFETY: live device; pool-owned semaphore.
-                return match unsafe {
-                    wait_timeline(self.dev.ash(), frame.semaphore, frame.value, "status wait")
-                } {
-                    Ok(()) => DecodeStatus::Ok,
-                    Err(VkDecodeError::DeviceLost) => {
-                        self.device_lost = true;
-                        DecodeStatus::Failed
-                    }
-                    Err(_) => DecodeStatus::Failed,
-                };
-            }
-            // SAFETY: live device; pool-owned semaphore.
-            return match unsafe { self.dev.ash().get_semaphore_counter_value(frame.semaphore) } {
-                Ok(current) if current >= frame.value => DecodeStatus::Ok,
-                Ok(_) => DecodeStatus::Pending,
-                Err(vk::Result::ERROR_DEVICE_LOST) => {
-                    self.device_lost = true;
-                    DecodeStatus::Failed
-                }
-                Err(_) => DecodeStatus::Failed,
-            };
-        };
-        let slot = frame.query_slot as usize;
-        if slot >= state.query_marks.len() || state.query_marks[slot] != frame.submission {
-            trace!(
-                slot,
-                "status query slot re-armed before it was read — unprovable, reported Failed"
-            );
-            return DecodeStatus::Failed;
-        }
-        let flags = if block {
-            vk::QueryResultFlags::WAIT | vk::QueryResultFlags::WITH_STATUS_KHR
-        } else {
-            vk::QueryResultFlags::WITH_STATUS_KHR
-        };
-        let mut status = [0i32; 1];
-        // SAFETY: live device; query pool is this generation's; `query_slot` is
-        // in range (checked against the marks array it is sized to).
-        let result = unsafe {
-            self.dev
-                .ash()
-                .get_query_pool_results(query_pool, frame.query_slot, &mut status, flags)
-        };
-        match result {
-            // VkQueryResultStatusKHR: >0 complete, 0 not ready, <0 error.
-            Ok(()) if status[0] > 0 => DecodeStatus::Ok,
-            Ok(()) if status[0] == 0 => DecodeStatus::Pending,
-            Ok(()) => DecodeStatus::Failed,
-            Err(vk::Result::NOT_READY) => DecodeStatus::Pending,
-            Err(vk::Result::ERROR_DEVICE_LOST) => {
-                self.device_lost = true;
-                DecodeStatus::Failed
-            }
-            Err(r) => {
-                debug!(?r, "status query read failed");
-                DecodeStatus::Failed
-            }
-        }
-    }
-
-    /// Bounded wait for a delivered frame's decode-complete signal. Touches no
-    /// decoder state. `frame` must be unreleased (pins the pool semaphore).
-    pub fn wait_decoded(&self, frame: &DecodedVkFrame, timeout_ns: u64) -> bool {
-        if frame.generation != self.generation {
-            return false;
-        }
-        let semaphores = [frame.semaphore];
-        let values = [frame.value];
-        let info = vk::SemaphoreWaitInfo::default()
-            .semaphores(&semaphores)
-            .values(&values);
-        // SAFETY: live device; unreleased frame pins the pool semaphore; info
-        // arrays are locals that outlive the call.
-        unsafe { self.dev.ash().wait_semaphores(&info, timeout_ns) }.is_ok()
-    }
-
-    /// Discard pending pictures (teardown / discontinuity). AV1 has no reorder
-    /// buffer: pending entries are hidden frames. Leaves [`Self::awaiting_key`]
-    /// — the planner has no `flush` and still names the emptied slots.
-    pub fn flush(&mut self) {
-        if let Some(state) = &mut self.state {
-            for (_, entry) in std::mem::take(&mut self.pending) {
-                state.pool.pictures[entry.image].pending = false;
-            }
-            let unbound = reset_slot_bindings(
-                &mut state.slots,
-                &mut state.slot_image,
-                &mut state.slot_refs,
-            );
-            for picture in unbound {
-                state.pool.pictures[picture].bound = false;
-            }
-        } else {
-            self.pending.clear();
-        }
-        self.awaiting_key = true;
-    }
-
-    /// Align the three DPB ledgers after a post-planning failure: planner store,
-    /// [`SlotMap`], slot→picture. [`Self::flush`] empties the last two and arms
-    /// [`Self::awaiting_key`]. Not a session rebuild — pools stay valid.
-    fn recover_dpb(&mut self) {
-        debug!(
-            snapshot = %self.debug_snapshot(),
-            "recovering from a failed AV1 frame — skipping to the next key frame"
-        );
-        self.flush();
-    }
-
     /// Session/caps match this plan's extent and profile. A declared level above
     /// the device ceiling warns once and proceeds (`seq_level_idx` 31 is not a
     /// level).
     fn ensure_state(&mut self, plan: &AuPlan) -> Result<(), VkDecodeError> {
         let key = profile_key_for(plan)?;
-        if self.caps.as_ref().map(|(k, _)| *k) != Some(key) {
+        if self.codec.caps.as_ref().map(|(k, _)| *k) != Some(key) {
             let wanted = key
                 .output_format()
                 .expect("from_stream gated the sampling/depth combination");
             // SAFETY: live device (constructor contract).
             let raw = unsafe { query_caps(&self.dev, DecodeProfile::Av1(key)) }
                 .map_err(|r| caps_query_error(r, key))?;
-            self.caps = Some((key, derive_caps(&raw, wanted)?));
+            self.codec.caps = Some((key, derive_caps(&raw, wanted)?));
         }
         // Declared level above maxLevel is not a refusal: extent and DPB depth
         // are the physical facts. `seq_level_idx` 31 is Annex A's "maximum
         // parameters", not a level; sequence headers carry none to the driver.
-        let caps_max_level = self.caps.as_ref().expect("queried above").1.max_level_idc;
+        let caps_max_level = self
+            .codec
+            .caps
+            .as_ref()
+            .expect("queried above")
+            .1
+            .max_level_idc;
         let stream_level = u32::from(stream_level_idx(plan));
-        if stream_level > caps_max_level.code_point() && !self.level_advisory_warned {
-            self.level_advisory_warned = true;
+        if stream_level > caps_max_level.code_point() && !self.codec.level_advisory_warned {
+            self.codec.level_advisory_warned = true;
             warn!(
                 stream_level,
                 ceiling = %caps_max_level,
@@ -1171,39 +726,11 @@ impl VkAv1Decoder {
         }
     }
 
-    /// Drain the current generation, graveyard any consumer-held images, and build
-    /// a fresh session. Bumps [`Self::generation`] so old frames route there.
+    /// Retire the current generation ([`VkDecoder::retire_state`]) and build a
+    /// fresh session. AV1 never renegotiates DPB depth: [`REQUIRED_SLOTS`].
     fn rebuild_state(&mut self, plan: &AuPlan) -> Result<(), VkDecodeError> {
-        self.drain_gpu()?;
-        if let Some(state) = self.state.take() {
-            debug!("rebuilding AV1 decode session (stream renegotiation)");
-            let SessionStateAv1 { mut pool, .. } = state;
-            for frame in self.ready.drain(..) {
-                let picture = &mut pool.pictures[frame.picture as usize];
-                picture.held = picture.held.saturating_sub(1);
-            }
-            for (_, entry) in std::mem::take(&mut self.pending) {
-                pool.pictures[entry.image].pending = false;
-            }
-            for picture in &mut pool.pictures {
-                picture.bound = false;
-            }
-            let held = pool.held_total();
-            if held > 0 {
-                debug!(
-                    held,
-                    generation = self.generation,
-                    "consumer still holds images of the retired generation — graveyarding"
-                );
-                self.graveyard.push(RetiredPool {
-                    generation: self.generation,
-                    pool,
-                });
-            }
-        }
-        self.generation += 1;
-
-        let (key, caps) = self.caps.as_ref().expect("ensure_state queried caps");
+        self.retire_state()?;
+        let (key, caps) = self.codec.caps.as_ref().expect("ensure_state queried caps");
         let key = *key;
         if REQUIRED_SLOTS > caps.max_dpb_slots {
             return Err(VkDecodeError::Unsupported(format!(
@@ -1212,119 +739,29 @@ impl VkAv1Decoder {
             )));
         }
         let coded = coded_extent(plan);
-        // Bounds at the allocation extent: that is what images are created at.
-        let image_extent = caps.aligned_extent(coded);
-        if coded.width < caps.min_coded_extent.width
-            || coded.height < caps.min_coded_extent.height
-            || image_extent.width > caps.max_coded_extent.width
-            || image_extent.height > caps.max_coded_extent.height
-        {
-            return Err(VkDecodeError::Unsupported(format!(
-                "coded extent {}x{} (allocated {}x{}) outside device range {}x{}..{}x{}",
-                coded.width,
-                coded.height,
-                image_extent.width,
-                image_extent.height,
-                caps.min_coded_extent.width,
-                caps.min_coded_extent.height,
-                caps.max_coded_extent.width,
-                caps.max_coded_extent.height
-            )));
-        }
-
+        let image_extent = session_extent(caps, coded)?;
         let config = SessionConfigAv1 {
             max_coded_extent: image_extent,
             max_dpb_slots: REQUIRED_SLOTS,
             max_active_references: (REQUIRED_SLOTS - 1).min(caps.max_active_references),
             profile: key,
         };
-        let mut pool_plan = plan_pools(caps, REQUIRED_SLOTS);
-        // Test-only: `vkCmdCopyImageToBuffer` needs TRANSFER_SRC; production pools
-        // do not carry it.
-        if std::env::var("PF_VKD_TEST_READBACK").is_ok_and(|v| v == "1") {
-            pool_plan.picture_usage |= vk::ImageUsageFlags::TRANSFER_SRC;
-        }
-        let decode_profile = DecodeProfile::Av1(key);
-        // SAFETY: live device; each created half is owned by a Drop type at birth,
-        // so a mid-build failure unwinds cleanly.
+        // SAFETY: live device per the constructor contract; the session is
+        // owned by a Drop type the moment it exists.
         let state = unsafe {
             let session = VideoSessionAv1::create(&self.dev, caps, config)?;
-            let dpb = if caps.coincide {
-                None
-            } else {
-                Some(
-                    DpbPool::create(&self.dev, caps, &pool_plan, image_extent, decode_profile)
-                        .map_err(VkDecodeError::from)?,
-                )
-            };
-            let pool =
-                PicturePool::create(&self.dev, caps, &pool_plan, image_extent, decode_profile)
-                    .map_err(VkDecodeError::from)?;
-            let ring = BitstreamRing::create(
+            SessionState::create(
                 &self.dev,
-                RingLayout::new(
-                    INITIAL_SLOT_SIZE,
-                    RING_SLOTS,
-                    caps.min_bitstream_offset_alignment,
-                    caps.min_bitstream_size_alignment,
-                ),
-                decode_profile,
-            )
-            .map_err(VkDecodeError::from)?;
-            let ops = OpRing::create(
-                &self.dev,
-                decode_profile,
-                pool_plan.picture_count,
-                RING_SLOTS,
-            )
-            .map_err(VkDecodeError::from)?;
-            SessionStateAv1 {
+                caps,
                 session,
-                slots: SlotMap::new(NUM_REF_SLOTS),
-                slot_refs: vec![None; REQUIRED_SLOTS as usize],
-                slot_image: vec![None; REQUIRED_SLOTS as usize],
-                cmd_marks: vec![None; RING_SLOTS as usize],
-                query_marks: vec![u64::MAX; pool_plan.picture_count as usize],
-                submitted: 0,
-                last_submit: None,
-                coded_extent: coded,
+                DecodeProfile::Av1(key),
+                REQUIRED_SLOTS,
+                coded,
                 image_extent,
-                dpb,
-                pool,
-                ring,
-                ops,
-            }
+            )?
         };
         self.state = Some(state);
         Ok(())
-    }
-
-    fn drain_gpu(&mut self) -> Result<(), VkDecodeError> {
-        let Some(state) = &self.state else {
-            return Ok(());
-        };
-        if let Some((sem, value)) = state.last_submit {
-            // SAFETY: live device; token is a pool picture's semaphore.
-            unsafe { wait_timeline(self.dev.ash(), sem, value, "session drain")? };
-        }
-        Ok(())
-    }
-}
-
-impl Drop for VkAv1Decoder {
-    fn drop(&mut self) {
-        // Best-effort drain so pool Drop does not destroy in-flight work. Presenter
-        // sampling of held/graveyarded images is the caller's teardown contract.
-        if let Err(e) = self.drain_gpu() {
-            debug!(error = %e, "drain on drop failed; tearing down anyway");
-        }
-        if !self.graveyard.is_empty() {
-            debug!(
-                pools = self.graveyard.len(),
-                "graveyard not fully token-drained at decoder drop — destroying anyway \
-                 (upstream teardown forfeited its bounded wait)"
-            );
-        }
     }
 }
 
@@ -1374,18 +811,11 @@ fn stream_level_idx(plan: &AuPlan) -> u8 {
 /// Decode output extent: superres upscales after reconstruction, so pool images
 /// hold `upscaled_width` × `frame_height`. One extent per session generation;
 /// `ensure_state` rebuilds on change. Mid-sequence size override with scaled
-/// refs is outside the envelope: rebuild + [`VkAv1Decoder::awaiting_key`].
+/// refs is outside the envelope: rebuild + the key-frame wait (`Av1::awaiting_key`).
 fn coded_extent(plan: &AuPlan) -> vk::Extent2D {
     vk::Extent2D {
         width: plan.picture.upscaled_width,
         height: plan.picture.frame_height,
-    }
-}
-
-fn slot_view(state: &SessionStateAv1, slot: u8) -> Option<vk::ImageView> {
-    match &state.dpb {
-        Some(dpb) => Some(dpb.dpb_view(slot)),
-        None => state.slot_image[usize::from(slot)].map(|p| state.pool.pictures[p].view),
     }
 }
 
@@ -1401,8 +831,8 @@ impl ScopeRef for VkRefAv1 {
 
 /// Every non-negative `referenceNameSlotIndices` entry must equal some
 /// `pReferenceSlots` `slotIndex`, i.e. one of `refs`, or the driver reads a
-/// slot this op never bound. Runs after [`build_scope`], whose refs pass fails
-/// first on an unbound reference.
+/// slot this op never bound. Runs after [`crate::decoder::core::build_scope`],
+/// whose refs pass fails first on an unbound reference.
 fn check_reference_names(refs: &[VkRefAv1], names: &[i32]) -> Result<(), VkDecodeError> {
     for name in names {
         if *name == REFERENCE_NAME_UNUSED {
@@ -1420,273 +850,22 @@ fn check_reference_names(refs: &[VkRefAv1], names: &[i32]) -> Result<(), VkDecod
     Ok(())
 }
 
-/// Record one AV1 decode op and submit under the queue lock. Image waits per the
-/// pool contract; dst timeline signals `signal_value`.
-///
-/// # Safety
-///
-/// Live device; `vk_plan` derived against this generation's `SlotMap`; `dst` a
-/// free pool picture; tiles resident in `upload`'s ring slot; the command buffer's
-/// previous submission completed (caller waited its mark).
-#[allow(clippy::too_many_arguments)]
-unsafe fn record_and_submit_av1(
-    dev: &DecodeDevice,
-    lock: &dyn QueueLock,
-    state: &mut SessionStateAv1,
-    vk_plan: &DecodePlanVkAv1,
-    tiles: &SubmittedTiles,
-    upload: &UploadedAu,
-    dst: usize,
-    cmd_index: usize,
-    query_index: u32,
-    waits: &[(vk::Semaphore, u64)],
-    signal_value: u64,
-) -> Result<(), VkDecodeError> {
-    let device = dev.ash();
-    let cmd = state.ops.cmds[cmd_index];
-    let coded_extent = state.coded_extent;
-    let coincide = state.dpb.is_none();
-
-    let setup_view = if coincide {
-        state.pool.pictures[dst].view
-    } else {
-        state
-            .dpb
-            .as_ref()
-            .expect("distinct mode")
-            .dpb_view(vk_plan.setup_slot)
-    };
-    let held_slots: Vec<u8> = state.slots.held().map(|(slot, _id)| slot).collect();
-    let (scope, reference_count) = build_scope(
-        &vk_plan.refs,
-        held_slots.into_iter(),
-        vk_plan.setup_slot,
-        setup_view,
-        vk_plan.setup_ref,
-        &state.slot_refs,
-        |slot| slot_view(state, slot),
-    )?;
-    check_reference_names(&vk_plan.refs, &vk_plan.reference_name_slot_indices)?;
-
-    let begin_info =
-        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-    // SAFETY: previous submission completed; pool allows per-buffer reset.
-    unsafe {
-        device
-            .begin_command_buffer(cmd, &begin_info)
-            .map_err(VkDecodeError::from)?
-    };
-
-    let memory_barriers = [vk::MemoryBarrier2::default()
-        .src_stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR)
-        .src_access_mask(vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR)
-        .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR)
-        .dst_access_mask(
-            vk::AccessFlags2::VIDEO_DECODE_READ_KHR | vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR,
-        )];
-    // Fully overwritten: UNDEFINED discard plus a dep on earlier ops.
-    let decode_layer_barrier = |image: vk::Image, layer: u32, new_layout: vk::ImageLayout| {
-        vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR)
-            .src_access_mask(
-                vk::AccessFlags2::VIDEO_DECODE_READ_KHR | vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR,
-            )
-            .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR)
-            .dst_access_mask(
-                vk::AccessFlags2::VIDEO_DECODE_READ_KHR | vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR,
-            )
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(new_layout)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(image)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: layer,
-                layer_count: 1,
-            })
-    };
-    let dst_picture = &state.pool.pictures[dst];
-    let dst_image = dst_picture.image;
-    let mut image_barriers = Vec::new();
-    if coincide {
-        image_barriers.push(decode_layer_barrier(
-            dst_image,
-            dst_picture.layer,
-            vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
-        ));
-    } else {
-        let dpb = state.dpb.as_ref().expect("distinct mode");
-        let (setup_image, setup_layer) = dpb.dpb_target(vk_plan.setup_slot);
-        image_barriers.push(decode_layer_barrier(
-            setup_image,
-            setup_layer,
-            vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
-        ));
-        image_barriers.push(decode_layer_barrier(
-            dst_image,
-            dst_picture.layer,
-            vk::ImageLayout::VIDEO_DECODE_DST_KHR,
-        ));
-    }
-    let dependency = vk::DependencyInfo::default()
-        .memory_barriers(&memory_barriers)
-        .image_memory_barriers(&image_barriers);
-    // SAFETY: recording into the begun buffer; synchronization2 is enabled.
-    unsafe { device.cmd_pipeline_barrier2(cmd, &dependency) };
-
-    // Reset before the coding scope. Skip when the family has no status queries
-    // (RADV: recording a query hangs VCN).
-    if let Some(query_pool) = state.ops.query_pool {
-        // SAFETY: recording; `query_index` is within the pool's count.
-        unsafe { device.cmd_reset_query_pool(cmd, query_pool, query_index, 1) };
-    }
-
-    // Stage resources → std infos → dpb infos → slot infos. Each vector is
-    // complete before the next borrows it, so nothing reallocates under a pointer.
-    let resources: Vec<vk::VideoPictureResourceInfoKHR<'_>> = scope
-        .iter()
-        .map(|entry| {
-            vk::VideoPictureResourceInfoKHR::default()
-                .coded_extent(coded_extent)
-                .base_array_layer(0)
-                .image_view_binding(entry.view)
-        })
-        .collect();
-    let std_refs: Vec<hh::StdVideoDecodeAV1ReferenceInfo> =
-        scope.iter().map(|entry| entry.std).collect();
-    let mut dpb_infos: Vec<vk::VideoDecodeAV1DpbSlotInfoKHR<'_>> = std_refs
-        .iter()
-        .map(|std| vk::VideoDecodeAV1DpbSlotInfoKHR::default().std_reference_info(std))
-        .collect();
-    let mut begin_slots: Vec<vk::VideoReferenceSlotInfoKHR<'_>> = Vec::with_capacity(scope.len());
-    for (index, entry) in scope.iter().enumerate() {
-        begin_slots.push(
-            vk::VideoReferenceSlotInfoKHR::default()
-                .slot_index(entry.slot_index)
-                .picture_resource(&resources[index]),
-        );
-    }
-    for (slot_info, dpb_info) in begin_slots.iter_mut().zip(dpb_infos.iter_mut()) {
-        *slot_info = (*slot_info).push_next(dpb_info);
-    }
-    // Decode-op prefix: this frame's refs in plan order. Names are DPB slots,
-    // not list indices; every named slot is in this prefix (`check_reference_names`).
-    let decode_refs: Vec<vk::VideoReferenceSlotInfoKHR<'_>> =
-        begin_slots[..reference_count].to_vec();
-
-    // Setup uses its real slot index; the begin list's twin entry carries -1.
-    let setup_std = vk_plan.setup_ref;
-    let mut setup_dpb = vk::VideoDecodeAV1DpbSlotInfoKHR::default().std_reference_info(&setup_std);
-    let setup_resource = resources[scope.len() - 1];
-    let setup_slot_info = vk::VideoReferenceSlotInfoKHR::default()
-        .slot_index(i32::from(vk_plan.setup_slot))
-        .picture_resource(&setup_resource)
-        .push_next(&mut setup_dpb);
-
-    let dst_resource = if coincide {
-        setup_resource
-    } else {
-        vk::VideoPictureResourceInfoKHR::default()
-            .coded_extent(coded_extent)
-            .base_array_layer(0)
-            .image_view_binding(state.pool.pictures[dst].view)
-    };
-
-    let mut av1_pic = av1_picture_info(
-        vk_plan.pic.std(),
-        vk_plan.reference_name_slot_indices,
-        tiles,
-    );
-    let mut decode_info = vk::VideoDecodeInfoKHR::default()
-        .src_buffer(state.ring.buffer())
-        .src_buffer_offset(upload.offset)
-        .src_buffer_range(upload.range)
-        .dst_picture_resource(dst_resource)
-        .setup_reference_slot(&setup_slot_info)
-        .push_next(&mut av1_pic);
-    if reference_count > 0 {
-        decode_info = decode_info.reference_slots(&decode_refs);
-    }
-
-    let begin_coding = vk::VideoBeginCodingInfoKHR::default()
-        .video_session(state.session.raw.session())
-        .video_session_parameters(state.session.parameters())
-        .reference_slots(&begin_slots);
-    // Consume RESET here; re-arm if this command buffer never reaches the queue.
-    let did_reset = state.session.raw.take_needs_reset();
-    // SAFETY: recording through end_command_buffer; pointed-to structs outlive
-    // the calls; session/parameters handles are this generation's.
-    let recorded: Result<(), vk::Result> = unsafe {
-        (dev.video_queue().fp().cmd_begin_video_coding_khr)(cmd, &begin_coding);
-        if did_reset {
-            let control = vk::VideoCodingControlInfoKHR::default()
-                .flags(vk::VideoCodingControlFlagsKHR::RESET);
-            (dev.video_queue().fp().cmd_control_video_coding_khr)(cmd, &control);
-        }
-        if let Some(query_pool) = state.ops.query_pool {
-            device.cmd_begin_query(cmd, query_pool, query_index, vk::QueryControlFlags::empty());
-        }
-        (dev.video_decode_queue().fp().cmd_decode_video_khr)(cmd, &decode_info);
-        if let Some(query_pool) = state.ops.query_pool {
-            device.cmd_end_query(cmd, query_pool, query_index);
-        }
-        (dev.video_queue().fp().cmd_end_video_coding_khr)(
-            cmd,
-            &vk::VideoEndCodingInfoKHR::default(),
-        );
-        device.end_command_buffer(cmd)
-    };
-    if let Err(e) = recorded {
-        if did_reset {
-            state.session.raw.re_arm_reset();
-        }
-        return Err(VkDecodeError::from(e));
-    }
-
-    let cmd_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
-    let wait_infos: Vec<vk::SemaphoreSubmitInfo<'_>> = waits
-        .iter()
-        .map(|&(semaphore, value)| {
-            vk::SemaphoreSubmitInfo::default()
-                .semaphore(semaphore)
-                .value(value)
-                .stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR)
-        })
-        .collect();
-    let signals = [vk::SemaphoreSubmitInfo::default()
-        .semaphore(state.pool.pictures[dst].semaphore)
-        .value(signal_value)
-        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
-    let submits = [vk::SubmitInfo2::default()
-        .command_buffer_infos(&cmd_infos)
-        .wait_semaphore_infos(&wait_infos)
-        .signal_semaphore_infos(&signals)];
-    let guard = QueueSubmitGuard::acquire(lock);
-    // SAFETY: decode queue is the device's; the guard externally synchronizes it.
-    let result = unsafe { device.queue_submit2(dev.decode_queue(), &submits, vk::Fence::null()) };
-    drop(guard);
-    if let Err(e) = result {
-        // Recorded RESET never executed; the next recording must redo it.
-        if did_reset {
-            state.session.raw.re_arm_reset();
-        }
-        return Err(VkDecodeError::from(e));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use ash::vk::Handle as _;
     use cros_codecs::bitstream_utils::IvfIterator;
     use cros_codecs::codec::av1::parser::ObuAction;
     use cros_codecs::codec::av1::parser::ParsedObu;
     use cros_codecs::codec::av1::parser::Parser;
+    use pf_bitstream::av1::PicId;
 
     use super::*;
+    use crate::decoder::core::build_scope;
+    use crate::decoder::core::settle_dpb_ids;
+    use crate::decoder::core::sync_slot_bindings;
+    use crate::slots::SlotMap;
 
     const AV1_25FPS: &[u8] = include_bytes!(
         "../../pf-bitstream/vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1"

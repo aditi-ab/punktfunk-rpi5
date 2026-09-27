@@ -40,6 +40,7 @@ use crate::params_h265::OwnedStdH265Vps;
 use crate::params_h265::Pps;
 use crate::params_h265::Sps;
 use crate::params_h265::Vps;
+use crate::session::CodecSession;
 use crate::session::ParametersObject;
 use crate::session::RawVideoSession;
 use crate::session::SessionError;
@@ -278,8 +279,9 @@ impl ParametersObject for StoredParamsH265 {
     }
 }
 
-pub(crate) struct VideoSessionH265 {
-    pub(crate) raw: RawVideoSession,
+/// H.265 session: [`RawVideoSession`] plus the VPS/SPS/PPS parameters object.
+pub struct VideoSessionH265 {
+    raw: RawVideoSession,
     parameters: StoredParamsH265,
     ledger: ParamsLedgerH265,
     pub(crate) config: SessionConfigH265,
@@ -494,9 +496,19 @@ impl VideoSessionH265 {
             }
         }
     }
+}
 
-    pub(crate) fn parameters(&self) -> vk::VideoSessionParametersKHR {
+impl CodecSession for VideoSessionH265 {
+    fn raw_mut(&mut self) -> &mut RawVideoSession {
+        &mut self.raw
+    }
+
+    fn parameters(&self) -> vk::VideoSessionParametersKHR {
         self.parameters.object
+    }
+
+    fn max_active_references(&self) -> u32 {
+        self.config.max_active_references
     }
 }
 

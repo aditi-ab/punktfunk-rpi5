@@ -24,10 +24,7 @@ use std::io::Cursor;
 
 use ash::vk;
 use ash::vk::Handle;
-use pf_vkdecode::DecodeStatus;
-use pf_vkdecode::DecodedVkFrame;
 use pf_vkdecode::DeviceHandles;
-use pf_vkdecode::VkDecodeError;
 
 /// Vendored H.264 vector: two slice NALUs per picture, so the splitter's
 /// `first_mb_in_slice == 0` branch is load-bearing, and the slice-control
@@ -145,60 +142,6 @@ pub fn h264_four_byte_start_codes(stream: &[u8]) -> Vec<u8> {
 pub fn h265_four_byte_start_codes(stream: &[u8]) -> Vec<u8> {
     four_byte_start_codes::<cros_codecs::codec::h265::parser::NaluHeader>(stream)
 }
-
-/// Decode surface the GPU legs drive. The three decoders share no crate trait
-/// (dispatch is client wiring); binding it here lets each leg run one body
-/// against all three codecs.
-pub trait TestDecoder {
-    fn decode(&mut self, au: &[u8]) -> Result<Option<DecodedVkFrame>, VkDecodeError>;
-    fn take_ready(&mut self) -> Option<DecodedVkFrame>;
-    fn wait_status(&mut self, frame: &DecodedVkFrame) -> DecodeStatus;
-    fn release_frame(
-        &mut self,
-        frame: &DecodedVkFrame,
-        presenter_signaled: bool,
-    ) -> Result<(), VkDecodeError>;
-    fn flush(&mut self);
-    fn status_queries(&self) -> bool;
-    fn debug_snapshot(&self) -> String;
-}
-
-/// One forwarding impl so the three decoders cannot be driven differently.
-macro_rules! impl_test_decoder {
-    ($ty:ty) => {
-        impl TestDecoder for $ty {
-            fn decode(&mut self, au: &[u8]) -> Result<Option<DecodedVkFrame>, VkDecodeError> {
-                <$ty>::decode(self, au)
-            }
-            fn take_ready(&mut self) -> Option<DecodedVkFrame> {
-                <$ty>::take_ready(self)
-            }
-            fn wait_status(&mut self, frame: &DecodedVkFrame) -> DecodeStatus {
-                <$ty>::wait_status(self, frame)
-            }
-            fn release_frame(
-                &mut self,
-                frame: &DecodedVkFrame,
-                presenter_signaled: bool,
-            ) -> Result<(), VkDecodeError> {
-                <$ty>::release_frame(self, frame, presenter_signaled)
-            }
-            fn flush(&mut self) {
-                <$ty>::flush(self);
-            }
-            fn status_queries(&self) -> bool {
-                <$ty>::status_queries(self)
-            }
-            fn debug_snapshot(&self) -> String {
-                <$ty>::debug_snapshot(self)
-            }
-        }
-    };
-}
-
-impl_test_decoder!(pf_vkdecode::VkH264Decoder);
-impl_test_decoder!(pf_vkdecode::VkH265Decoder);
-impl_test_decoder!(pf_vkdecode::VkAv1Decoder);
 
 /// Serializes GPU legs in one test binary. Hold it for the whole leg.
 /// Cargo parallelizes tests: two decoders would share a decode queue, and
