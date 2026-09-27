@@ -148,18 +148,14 @@ pub(crate) fn write_cache(dir: &Path, source: &str, index: &Index, meta: &CacheM
         tracing::warn!("store cache dir not created: {e}");
         return;
     }
-    let write = |path: PathBuf, bytes: Vec<u8>| {
-        let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, bytes).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
-    };
     match serde_json::to_vec_pretty(index) {
-        Ok(b) => write(body_path(dir, source), b),
+        Ok(b) => {
+            let _ = pf_paths::replace_file(&body_path(dir, source), &b);
+        }
         Err(e) => tracing::warn!("catalog cache not serialized: {e}"),
     }
     if let Ok(b) = serde_json::to_vec_pretty(meta) {
-        write(meta_path(dir, source), b);
+        let _ = pf_paths::replace_file(&meta_path(dir, source), &b);
     }
 }
 

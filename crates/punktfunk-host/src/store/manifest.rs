@@ -113,16 +113,11 @@ pub(crate) fn forget(plugins_dir: &std::path::Path, pkg: &str) -> Result<()> {
 }
 
 fn write(plugins_dir: &std::path::Path, plugins: BTreeMap<String, Record>) -> Result<()> {
-    std::fs::create_dir_all(plugins_dir)
-        .with_context(|| format!("create {}", plugins_dir.display()))?;
     let json = serde_json::to_string_pretty(&ManifestFile { schema: 1, plugins })
         .context("serialize install-manifest.json")?;
     let path = manifest_path(plugins_dir);
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, format!("{json}\n"))
-        .with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("replace {}", path.display()))?;
-    Ok(())
+    pf_paths::replace_file(&path, format!("{json}\n").as_bytes())
+        .with_context(|| format!("replace {}", path.display()))
 }
 
 /// RFC-3339 UTC stamp for [`Record::installed_at`].

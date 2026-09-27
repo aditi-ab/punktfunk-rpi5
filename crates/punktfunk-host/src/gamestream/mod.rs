@@ -832,29 +832,15 @@ fn load_paired() -> Vec<Vec<u8>> {
     }
 }
 
-/// Persist the paired-client allow-list after each successful pairing. Atomic temp-file
-/// + rename so a crash mid-write cannot truncate `paired.json` and lock out every client.
+/// Persist the paired-client allow-list after each successful pairing, through
+/// [`pf_paths::replace_secret_file`]: a torn `paired.json` would lock out every client.
 pub(crate) fn save_paired(paired: &[Vec<u8>]) {
     let Some(path) = paired_path() else { return };
-    if let Some(dir) = path.parent() {
-        let _ = pf_paths::create_private_dir(dir);
-    }
-    let bytes = match serde_json::to_vec(paired) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(error = %e, "serializing pairings failed");
-            return;
-        }
-    };
-    // Sibling temp file (owner-only), then rename over the target. Never write `path` in place.
-    let tmp = path.with_extension("json.tmp");
-    if let Err(e) = pf_paths::write_secret_file(&tmp, &bytes) {
-        tracing::warn!(error = %e, "persisting pairings failed (temp write)");
-        return;
-    }
-    if let Err(e) = std::fs::rename(&tmp, &path) {
-        tracing::warn!(error = %e, "persisting pairings failed (rename)");
-        let _ = std::fs::remove_file(&tmp);
+    let written = serde_json::to_vec(paired)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| pf_paths::replace_secret_file(&path, &bytes));
+    if let Err(e) = written {
+        tracing::warn!(error = %e, "pairings not persisted");
     }
 }
 
@@ -928,27 +914,14 @@ pub(crate) fn retain_client_labels(still_paired: &[Vec<u8>]) {
     }
 }
 
-/// Persist the label map with the same atomic temp-file + rename as [`save_paired`].
+/// Persist the label map the way [`save_paired`] persists the allow-list.
 fn save_client_labels(labels: &std::collections::BTreeMap<String, String>) {
     let Some(path) = labels_path() else { return };
-    if let Some(dir) = path.parent() {
-        let _ = pf_paths::create_private_dir(dir);
-    }
-    let bytes = match serde_json::to_vec(labels) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(error = %e, "serializing client labels failed");
-            return;
-        }
-    };
-    let tmp = path.with_extension("json.tmp");
-    if let Err(e) = pf_paths::write_secret_file(&tmp, &bytes) {
-        tracing::warn!(error = %e, "persisting client labels failed (temp write)");
-        return;
-    }
-    if let Err(e) = std::fs::rename(&tmp, &path) {
-        tracing::warn!(error = %e, "persisting client labels failed (rename)");
-        let _ = std::fs::remove_file(&tmp);
+    let written = serde_json::to_vec(labels)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| pf_paths::replace_secret_file(&path, &bytes));
+    if let Err(e) = written {
+        tracing::warn!(error = %e, "client labels not persisted");
     }
 }
 

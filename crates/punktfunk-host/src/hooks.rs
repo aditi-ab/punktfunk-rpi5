@@ -270,12 +270,7 @@ impl HooksStore {
 
     /// Persist then adopt (caller validates first). Memory updates only if the write succeeds.
     pub fn set(&self, cfg: HooksConfig) -> Result<()> {
-        if let Some(dir) = self.path.parent() {
-            pf_paths::create_private_dir(dir)?;
-        }
-        let tmp = self.path.with_extension("json.tmp");
-        pf_paths::write_secret_file(&tmp, &serde_json::to_vec_pretty(&cfg)?)?;
-        std::fs::rename(&tmp, &self.path)?;
+        pf_paths::replace_secret_file(&self.path, &serde_json::to_vec_pretty(&cfg)?)?;
         let mut st = self.cur.lock().unwrap();
         st.file_id = Self::file_identity(&self.path);
         st.cfg = Some(cfg);
