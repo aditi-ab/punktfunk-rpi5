@@ -1478,22 +1478,20 @@ pub unsafe extern "C" fn punktfunk_connect(
     client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
-    // SAFETY: pointers forwarded unchanged; this shim dereferences nothing.
-    unsafe {
-        punktfunk_connect_ex(
-            host,
-            port,
-            width,
-            height,
-            refresh_hz,
-            PUNKTFUNK_COMPOSITOR_AUTO,
-            pin_sha256,
-            observed_sha256_out,
-            client_cert_pem,
-            client_key_pem,
-            timeout_ms,
-        )
-    }
+    let o = PunktfunkConnectOpts {
+        host,
+        port,
+        width,
+        height,
+        refresh_hz,
+        pin_sha256,
+        client_cert_pem,
+        client_key_pem,
+        timeout_ms,
+        ..legacy_opts()
+    };
+    // SAFETY: the caller's pointers, moved unchanged into `o`; this shim dereferences nothing.
+    unsafe { connect_ex_impl(&o, observed_sha256_out, std::ptr::null_mut()) }
 }
 
 /// [`punktfunk_connect`] plus a `compositor` (`PUNKTFUNK_COMPOSITOR_*`). `AUTO`
@@ -1517,23 +1515,21 @@ pub unsafe extern "C" fn punktfunk_connect_ex(
     client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
-    // SAFETY: pointers forwarded unchanged; this shim dereferences nothing.
-    unsafe {
-        punktfunk_connect_ex2(
-            host,
-            port,
-            width,
-            height,
-            refresh_hz,
-            compositor,
-            PUNKTFUNK_GAMEPAD_AUTO,
-            pin_sha256,
-            observed_sha256_out,
-            client_cert_pem,
-            client_key_pem,
-            timeout_ms,
-        )
-    }
+    let o = PunktfunkConnectOpts {
+        host,
+        port,
+        width,
+        height,
+        refresh_hz,
+        compositor,
+        pin_sha256,
+        client_cert_pem,
+        client_key_pem,
+        timeout_ms,
+        ..legacy_opts()
+    };
+    // SAFETY: the caller's pointers, moved unchanged into `o`; this shim dereferences nothing.
+    unsafe { connect_ex_impl(&o, observed_sha256_out, std::ptr::null_mut()) }
 }
 
 /// [`punktfunk_connect_ex`] plus a virtual `gamepad` (`PUNKTFUNK_GAMEPAD_*`).
@@ -1559,24 +1555,22 @@ pub unsafe extern "C" fn punktfunk_connect_ex2(
     client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
-    // SAFETY: pointers forwarded unchanged; this shim dereferences nothing.
-    unsafe {
-        punktfunk_connect_ex3(
-            host,
-            port,
-            width,
-            height,
-            refresh_hz,
-            compositor,
-            gamepad,
-            0, // bitrate_kbps = 0: host default
-            pin_sha256,
-            observed_sha256_out,
-            client_cert_pem,
-            client_key_pem,
-            timeout_ms,
-        )
-    }
+    let o = PunktfunkConnectOpts {
+        host,
+        port,
+        width,
+        height,
+        refresh_hz,
+        compositor,
+        gamepad,
+        pin_sha256,
+        client_cert_pem,
+        client_key_pem,
+        timeout_ms,
+        ..legacy_opts()
+    };
+    // SAFETY: the caller's pointers, moved unchanged into `o`; this shim dereferences nothing.
+    unsafe { connect_ex_impl(&o, observed_sha256_out, std::ptr::null_mut()) }
 }
 
 /// [`punktfunk_connect_ex2`] plus encoder `bitrate_kbps`. `0` = host default;
@@ -1601,26 +1595,23 @@ pub unsafe extern "C" fn punktfunk_connect_ex3(
     client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
-    // No game requested: the host's default session.
-    // SAFETY: pointers forwarded unchanged; this shim dereferences nothing.
-    unsafe {
-        punktfunk_connect_ex4(
-            host,
-            port,
-            width,
-            height,
-            refresh_hz,
-            compositor,
-            gamepad,
-            bitrate_kbps,
-            std::ptr::null(),
-            pin_sha256,
-            observed_sha256_out,
-            client_cert_pem,
-            client_key_pem,
-            timeout_ms,
-        )
-    }
+    let o = PunktfunkConnectOpts {
+        host,
+        port,
+        width,
+        height,
+        refresh_hz,
+        compositor,
+        gamepad,
+        bitrate_kbps,
+        pin_sha256,
+        client_cert_pem,
+        client_key_pem,
+        timeout_ms,
+        ..legacy_opts()
+    };
+    // SAFETY: the caller's pointers, moved unchanged into `o`; this shim dereferences nothing.
+    unsafe { connect_ex_impl(&o, observed_sha256_out, std::ptr::null_mut()) }
 }
 
 /// [`punktfunk_connect_ex3`] plus a library title. `launch_id` is a store-qualified
@@ -1647,27 +1638,24 @@ pub unsafe extern "C" fn punktfunk_connect_ex4(
     client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
-    // No video caps: 8-bit BT.709 SDR. HDR embedders pass bits via `ex5`.
-    // SAFETY: pointers forwarded unchanged; this shim dereferences nothing.
-    unsafe {
-        punktfunk_connect_ex5(
-            host,
-            port,
-            width,
-            height,
-            refresh_hz,
-            compositor,
-            gamepad,
-            bitrate_kbps,
-            0,
-            launch_id,
-            pin_sha256,
-            observed_sha256_out,
-            client_cert_pem,
-            client_key_pem,
-            timeout_ms,
-        )
-    }
+    let o = PunktfunkConnectOpts {
+        host,
+        port,
+        width,
+        height,
+        refresh_hz,
+        compositor,
+        gamepad,
+        bitrate_kbps,
+        launch_id,
+        pin_sha256,
+        client_cert_pem,
+        client_key_pem,
+        timeout_ms,
+        ..legacy_opts()
+    };
+    // SAFETY: the caller's pointers, moved unchanged into `o`; this shim dereferences nothing.
+    unsafe { connect_ex_impl(&o, observed_sha256_out, std::ptr::null_mut()) }
 }
 
 /// [`punktfunk_connect_ex4`] plus `video_caps` (`PUNKTFUNK_VIDEO_CAP_*`).
@@ -1696,28 +1684,25 @@ pub unsafe extern "C" fn punktfunk_connect_ex5(
     client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
-    // Stereo (2 channels). Surround embedders pass 6/8 via `ex6`.
-    // SAFETY: pointers forwarded unchanged; this shim dereferences nothing.
-    unsafe {
-        punktfunk_connect_ex6(
-            host,
-            port,
-            width,
-            height,
-            refresh_hz,
-            compositor,
-            gamepad,
-            bitrate_kbps,
-            video_caps,
-            2, // audio_channels = stereo
-            launch_id,
-            pin_sha256,
-            observed_sha256_out,
-            client_cert_pem,
-            client_key_pem,
-            timeout_ms,
-        )
-    }
+    let o = PunktfunkConnectOpts {
+        host,
+        port,
+        width,
+        height,
+        refresh_hz,
+        compositor,
+        gamepad,
+        bitrate_kbps,
+        video_caps,
+        launch_id,
+        pin_sha256,
+        client_cert_pem,
+        client_key_pem,
+        timeout_ms,
+        ..legacy_opts()
+    };
+    // SAFETY: the caller's pointers, moved unchanged into `o`; this shim dereferences nothing.
+    unsafe { connect_ex_impl(&o, observed_sha256_out, std::ptr::null_mut()) }
 }
 
 /// [`punktfunk_connect_ex5`] plus audio channel count: `2` (stereo), `6` (5.1) or
@@ -1748,29 +1733,26 @@ pub unsafe extern "C" fn punktfunk_connect_ex6(
     client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
-    // SAFETY: pointers forwarded unchanged; this shim dereferences nothing.
-    unsafe {
-        punktfunk_connect_ex7(
-            host,
-            port,
-            width,
-            height,
-            refresh_hz,
-            compositor,
-            gamepad,
-            bitrate_kbps,
-            video_caps,
-            audio_channels,
-            PUNKTFUNK_CODEC_HEVC, // HEVC-only, no preference
-            0,
-            launch_id,
-            pin_sha256,
-            observed_sha256_out,
-            client_cert_pem,
-            client_key_pem,
-            timeout_ms,
-        )
-    }
+    let o = PunktfunkConnectOpts {
+        host,
+        port,
+        width,
+        height,
+        refresh_hz,
+        compositor,
+        gamepad,
+        bitrate_kbps,
+        video_caps,
+        audio_channels,
+        launch_id,
+        pin_sha256,
+        client_cert_pem,
+        client_key_pem,
+        timeout_ms,
+        ..legacy_opts()
+    };
+    // SAFETY: the caller's pointers, moved unchanged into `o`; this shim dereferences nothing.
+    unsafe { connect_ex_impl(&o, observed_sha256_out, std::ptr::null_mut()) }
 }
 
 /// [`punktfunk_connect_ex6`] plus `video_codecs` (`PUNKTFUNK_CODEC_*` bits) and a
@@ -1802,36 +1784,28 @@ pub unsafe extern "C" fn punktfunk_connect_ex7(
     client_key_pem: *const std::os::raw::c_char,
     timeout_ms: u32,
 ) -> *mut PunktfunkConnection {
-    // SAFETY: pointers forwarded unchanged; this shim dereferences nothing.
-    unsafe {
-        connect_ex_impl(
-            host,
-            port,
-            0, // no client caps
-            width,
-            height,
-            refresh_hz,
-            compositor,
-            gamepad,
-            bitrate_kbps,
-            video_caps,
-            audio_channels,
-            video_codecs,
-            preferred_codec,
-            launch_id,
-            pin_sha256,
-            observed_sha256_out,
-            client_cert_pem,
-            client_key_pem,
-            std::ptr::null(), // no device name: OS default
-            // 0/0 = unspecified (Opus). Any non-zero rate/bits is a lossless ask.
-            0,
-            0,
-            0,
-            timeout_ms,
-            std::ptr::null_mut(),
-        )
-    }
+    let o = PunktfunkConnectOpts {
+        host,
+        port,
+        width,
+        height,
+        refresh_hz,
+        compositor,
+        gamepad,
+        bitrate_kbps,
+        video_caps,
+        audio_channels,
+        video_codecs,
+        preferred_codec,
+        launch_id,
+        pin_sha256,
+        client_cert_pem,
+        client_key_pem,
+        timeout_ms,
+        ..Default::default()
+    };
+    // SAFETY: the caller's pointers, moved unchanged into `o`; this shim dereferences nothing.
+    unsafe { connect_ex_impl(&o, observed_sha256_out, std::ptr::null_mut()) }
 }
 
 /// [`punktfunk_connect_ex7`] plus `status_out` (nullable): the mapped
@@ -1863,36 +1837,28 @@ pub unsafe extern "C" fn punktfunk_connect_ex8(
     timeout_ms: u32,
     status_out: *mut i32,
 ) -> *mut PunktfunkConnection {
-    // SAFETY: pointers forwarded unchanged; this shim dereferences nothing.
-    unsafe {
-        connect_ex_impl(
-            host,
-            port,
-            0, // no client caps
-            width,
-            height,
-            refresh_hz,
-            compositor,
-            gamepad,
-            bitrate_kbps,
-            video_caps,
-            audio_channels,
-            video_codecs,
-            preferred_codec,
-            launch_id,
-            pin_sha256,
-            observed_sha256_out,
-            client_cert_pem,
-            client_key_pem,
-            std::ptr::null(), // no device name: OS default
-            // 0/0 = unspecified (Opus). Any non-zero rate/bits is a lossless ask.
-            0,
-            0,
-            0,
-            timeout_ms,
-            status_out,
-        )
-    }
+    let o = PunktfunkConnectOpts {
+        host,
+        port,
+        width,
+        height,
+        refresh_hz,
+        compositor,
+        gamepad,
+        bitrate_kbps,
+        video_caps,
+        audio_channels,
+        video_codecs,
+        preferred_codec,
+        launch_id,
+        pin_sha256,
+        client_cert_pem,
+        client_key_pem,
+        timeout_ms,
+        ..Default::default()
+    };
+    // SAFETY: the caller's pointers, moved unchanged into `o`; this shim dereferences nothing.
+    unsafe { connect_ex_impl(&o, observed_sha256_out, status_out) }
 }
 
 /// [`punktfunk_connect_ex8`] plus `client_caps`. Cursor bit: host stops compositing;
@@ -1925,36 +1891,29 @@ pub unsafe extern "C" fn punktfunk_connect_ex9(
     timeout_ms: u32,
     status_out: *mut i32,
 ) -> *mut PunktfunkConnection {
-    // SAFETY: pointers forwarded unchanged; this shim dereferences nothing.
-    unsafe {
-        connect_ex_impl(
-            host,
-            port,
-            client_caps,
-            width,
-            height,
-            refresh_hz,
-            compositor,
-            gamepad,
-            bitrate_kbps,
-            video_caps,
-            audio_channels,
-            video_codecs,
-            preferred_codec,
-            launch_id,
-            pin_sha256,
-            observed_sha256_out,
-            client_cert_pem,
-            client_key_pem,
-            std::ptr::null(), // no device name: OS default
-            // 0/0 = unspecified (Opus). Any non-zero rate/bits is a lossless ask.
-            0,
-            0,
-            0,
-            timeout_ms,
-            status_out,
-        )
-    }
+    let o = PunktfunkConnectOpts {
+        host,
+        port,
+        width,
+        height,
+        refresh_hz,
+        compositor,
+        gamepad,
+        bitrate_kbps,
+        video_caps,
+        audio_channels,
+        video_codecs,
+        preferred_codec,
+        client_caps,
+        launch_id,
+        pin_sha256,
+        client_cert_pem,
+        client_key_pem,
+        timeout_ms,
+        ..Default::default()
+    };
+    // SAFETY: the caller's pointers, moved unchanged into `o`; this shim dereferences nothing.
+    unsafe { connect_ex_impl(&o, observed_sha256_out, status_out) }
 }
 
 /// [`punktfunk_connect_ex9`] plus `device_name` — the label this device knocks
@@ -1989,36 +1948,30 @@ pub unsafe extern "C" fn punktfunk_connect_ex10(
     timeout_ms: u32,
     status_out: *mut i32,
 ) -> *mut PunktfunkConnection {
-    // SAFETY: pointers forwarded unchanged; this shim dereferences nothing.
-    unsafe {
-        connect_ex_impl(
-            host,
-            port,
-            client_caps,
-            width,
-            height,
-            refresh_hz,
-            compositor,
-            gamepad,
-            bitrate_kbps,
-            video_caps,
-            audio_channels,
-            video_codecs,
-            preferred_codec,
-            launch_id,
-            pin_sha256,
-            observed_sha256_out,
-            client_cert_pem,
-            client_key_pem,
-            device_name,
-            // 0/0 = unspecified (Opus). Any non-zero rate/bits is a lossless ask.
-            0,
-            0,
-            0,
-            timeout_ms,
-            status_out,
-        )
-    }
+    let o = PunktfunkConnectOpts {
+        host,
+        port,
+        width,
+        height,
+        refresh_hz,
+        compositor,
+        gamepad,
+        bitrate_kbps,
+        video_caps,
+        audio_channels,
+        video_codecs,
+        preferred_codec,
+        client_caps,
+        launch_id,
+        pin_sha256,
+        client_cert_pem,
+        client_key_pem,
+        device_name,
+        timeout_ms,
+        ..Default::default()
+    };
+    // SAFETY: the caller's pointers, moved unchanged into `o`; this shim dereferences nothing.
+    unsafe { connect_ex_impl(&o, observed_sha256_out, status_out) }
 }
 
 /// [`punktfunk_connect_ex10`] plus an audio-format ask (`audio_rate_hz` /
@@ -2061,40 +2014,40 @@ pub unsafe extern "C" fn punktfunk_connect_ex11(
     timeout_ms: u32,
     status_out: *mut i32,
 ) -> *mut PunktfunkConnection {
-    // SAFETY: pointers forwarded unchanged; this shim dereferences nothing.
-    unsafe {
-        connect_ex_impl(
-            host,
-            port,
-            client_caps,
-            width,
-            height,
-            refresh_hz,
-            compositor,
-            gamepad,
-            bitrate_kbps,
-            video_caps,
-            audio_channels,
-            video_codecs,
-            preferred_codec,
-            launch_id,
-            pin_sha256,
-            observed_sha256_out,
-            client_cert_pem,
-            client_key_pem,
-            device_name,
-            audio_rate_hz,
-            audio_bits,
-            0,
-            timeout_ms,
-            status_out,
-        )
-    }
+    let o = PunktfunkConnectOpts {
+        host,
+        port,
+        width,
+        height,
+        refresh_hz,
+        compositor,
+        gamepad,
+        bitrate_kbps,
+        video_caps,
+        audio_channels,
+        audio_rate_hz,
+        audio_bits,
+        video_codecs,
+        preferred_codec,
+        client_caps,
+        launch_id,
+        pin_sha256,
+        client_cert_pem,
+        client_key_pem,
+        device_name,
+        timeout_ms,
+        ..Default::default()
+    };
+    // SAFETY: the caller's pointers, moved unchanged into `o`; this shim dereferences nothing.
+    unsafe { connect_ex_impl(&o, observed_sha256_out, status_out) }
 }
 
 /// [`punktfunk_connect_ex11`] plus `video_fit`: how this client fills its view when the frame's
 /// shape differs (`PUNKTFUNK_VIDEO_FIT_*`; unknown = fit). A host that frames the picture for
 /// another device reframes to it. Every other argument is [`punktfunk_connect_ex11`]'s.
+///
+/// Frozen, like the rest of the `connect_ex*` family: new options land only in
+/// [`PunktfunkConnectOpts`]. Prefer [`punktfunk_connect_opts`].
 ///
 /// # Safety
 /// Same as [`punktfunk_connect_ex10`].
@@ -2127,42 +2080,40 @@ pub unsafe extern "C" fn punktfunk_connect_ex12(
     timeout_ms: u32,
     status_out: *mut i32,
 ) -> *mut PunktfunkConnection {
-    // SAFETY: pointers forwarded unchanged; this shim dereferences nothing.
-    unsafe {
-        connect_ex_impl(
-            host,
-            port,
-            client_caps,
-            width,
-            height,
-            refresh_hz,
-            compositor,
-            gamepad,
-            bitrate_kbps,
-            video_caps,
-            audio_channels,
-            video_codecs,
-            preferred_codec,
-            launch_id,
-            pin_sha256,
-            observed_sha256_out,
-            client_cert_pem,
-            client_key_pem,
-            device_name,
-            audio_rate_hz,
-            audio_bits,
-            video_fit,
-            timeout_ms,
-            status_out,
-        )
-    }
+    let o = PunktfunkConnectOpts {
+        host,
+        port,
+        width,
+        height,
+        refresh_hz,
+        compositor,
+        gamepad,
+        bitrate_kbps,
+        video_caps,
+        audio_channels,
+        audio_rate_hz,
+        audio_bits,
+        video_codecs,
+        preferred_codec,
+        client_caps,
+        video_fit,
+        launch_id,
+        pin_sha256,
+        client_cert_pem,
+        client_key_pem,
+        device_name,
+        timeout_ms,
+        ..Default::default()
+    };
+    // SAFETY: the caller's pointers, moved unchanged into `o`; this shim dereferences nothing.
+    unsafe { connect_ex_impl(&o, observed_sha256_out, status_out) }
 }
 
-/// [`punktfunk_connect_ex12`] `video_fit`: whole picture, bars.
+/// [`PunktfunkConnectOpts::video_fit`]: whole picture, bars.
 pub const PUNKTFUNK_VIDEO_FIT_FIT: u8 = 0;
-/// [`punktfunk_connect_ex12`] `video_fit`: fill the view, cut the overflow.
+/// [`PunktfunkConnectOpts::video_fit`]: fill the view, cut the overflow.
 pub const PUNKTFUNK_VIDEO_FIT_CROP: u8 = 1;
-/// [`punktfunk_connect_ex12`] `video_fit`: fill the view, scale each axis alone.
+/// [`PunktfunkConnectOpts::video_fit`]: fill the view, scale each axis alone.
 pub const PUNKTFUNK_VIDEO_FIT_STRETCH: u8 = 2;
 
 /// [`punktfunk_connect_ex9`] `client_caps` bit: render the host cursor locally
@@ -2205,7 +2156,7 @@ fn clamp_device_name(s: &str) -> String {
 /// Growable connect options for [`punktfunk_connect_opts`]. Zero-init, set
 /// `struct_size = sizeof(PunktfunkConnectOpts)`, then the fields you mean.
 /// Zero = auto/unspecified (`audio_rate_hz = 0` is Opus; a non-zero pair is
-/// lossless). Append only; no tail padding (96/68-byte asserts); bump ABI.
+/// lossless). Append only; no tail padding (sizes asserted in `abi.rs`); bump ABI.
 #[cfg(feature = "quic")]
 #[repr(C)]
 pub struct PunktfunkConnectOpts {
@@ -2261,23 +2212,86 @@ pub struct PunktfunkConnectOpts {
     pub client_caps: u8,
     /// Always `0`, ignored. Held so the struct keeps its v35 size.
     pub reserved1: u32,
-    /// Always `0`. Fills what would otherwise be tail padding: C leaves padding
-    /// unspecified even under `= {0}`, so the next appended field would read a
-    /// caller's garbage. Spend this before growing the struct again.
-    pub reserved0: u32,
+    /// `PUNKTFUNK_VIDEO_FIT_*`: how this client fills its view when the frame's shape
+    /// differs; unknown = fit. A host that frames the picture for another device reframes
+    /// to it. v35–v40 callers zeroed this byte as `reserved0`, so they ask for fit.
+    pub video_fit: u8,
+    /// Always `0`. Fills what would otherwise be padding: C leaves padding unspecified
+    /// even under `= {0}`, so a later field there would read a caller's garbage.
+    pub reserved0: [u8; 3],
+    /// The settings preset this dial names: its stable id, or null. The host shows it and
+    /// hands it to hooks; the stream is unchanged. Null falls back to
+    /// [`punktfunk_set_session_preset`].
+    pub preset_id: *const std::os::raw::c_char,
+    /// The preset's display name, or null. Read only beside a non-null `preset_id`.
+    pub preset_name: *const std::os::raw::c_char,
 }
 
 // No tail padding (append contract). On grow: freeze `CONNECT_OPTS_MIN_SIZE`, update these sizes.
+// `video_fit` sits in the byte v35–v40 callers zeroed as `reserved0`.
 #[cfg(feature = "quic")]
 const _: () = {
+    use core::mem::{offset_of, size_of};
     #[cfg(target_pointer_width = "64")]
-    assert!(core::mem::size_of::<PunktfunkConnectOpts>() == 104);
+    assert!(
+        size_of::<PunktfunkConnectOpts>() == 120
+            && offset_of!(PunktfunkConnectOpts, video_fit) == 100
+    );
     #[cfg(target_pointer_width = "32")]
-    assert!(core::mem::size_of::<PunktfunkConnectOpts>() == 76);
+    assert!(
+        size_of::<PunktfunkConnectOpts>() == 84
+            && offset_of!(PunktfunkConnectOpts, video_fit) == 72
+    );
 };
 
-/// What [`punktfunk_set_session_preset`] last named. Process-wide, so a connect reads it once,
-/// at entry, into that dial's own parameters.
+/// All zero, as C's `= {0}` leaves it, with this build's `struct_size`.
+#[cfg(feature = "quic")]
+impl Default for PunktfunkConnectOpts {
+    fn default() -> Self {
+        PunktfunkConnectOpts {
+            struct_size: std::mem::size_of::<Self>() as u32,
+            host: ptr::null(),
+            launch_id: ptr::null(),
+            pin_sha256: ptr::null(),
+            client_cert_pem: ptr::null(),
+            client_key_pem: ptr::null(),
+            device_name: ptr::null(),
+            width: 0,
+            height: 0,
+            refresh_hz: 0,
+            compositor: 0,
+            gamepad: 0,
+            bitrate_kbps: 0,
+            audio_rate_hz: 0,
+            timeout_ms: 0,
+            port: 0,
+            video_caps: 0,
+            audio_channels: 0,
+            audio_bits: 0,
+            video_codecs: 0,
+            preferred_codec: 0,
+            client_caps: 0,
+            reserved1: 0,
+            video_fit: 0,
+            reserved0: [0; 3],
+            preset_id: ptr::null(),
+            preset_name: ptr::null(),
+        }
+    }
+}
+
+/// What the entry points before [`punktfunk_connect_ex7`] imply: stereo, HEVC only.
+#[cfg(feature = "quic")]
+fn legacy_opts() -> PunktfunkConnectOpts {
+    PunktfunkConnectOpts {
+        audio_channels: 2,
+        video_codecs: PUNKTFUNK_CODEC_HEVC,
+        ..Default::default()
+    }
+}
+
+/// What [`punktfunk_set_session_preset`] last named. Process-wide, so a connect whose opts name
+/// no preset reads it once, at entry, into that dial's own parameters.
 #[cfg(feature = "quic")]
 static SESSION_PRESET: std::sync::Mutex<Option<crate::quic::SessionPreset>> =
     std::sync::Mutex::new(None);
@@ -2285,6 +2299,9 @@ static SESSION_PRESET: std::sync::Mutex<Option<crate::quic::SessionPreset>> =
 /// Name the settings preset the next connect sends: its stable id and display name. The host
 /// shows it and hands it to hooks; the stream is unchanged. A null `id` names none. The value
 /// outlives the call, so set it before every connect. ABI v38.
+///
+/// Process-wide: two overlapping dials share it. [`PunktfunkConnectOpts::preset_id`] names a
+/// preset for one dial and wins over this.
 ///
 /// # Safety
 /// `id` and `name` are null or NUL-terminated C strings, read during this call only.
@@ -2312,9 +2329,9 @@ const CONNECT_OPTS_MIN_SIZE: usize = 96;
 #[cfg(all(feature = "quic", target_pointer_width = "32"))]
 const CONNECT_OPTS_MIN_SIZE: usize = 68;
 
-/// Connect with every option in one growable [`PunktfunkConnectOpts`]. Semantics
-/// match [`punktfunk_connect_ex11`] field for field. The `ex` chain stays
-/// byte-identical; new options land only in this struct.
+/// Connect with every option in one growable [`PunktfunkConnectOpts`]: the `connect_ex*`
+/// family's arguments, `video_fit` and the session preset. New options land only in this
+/// struct; the `connect_ex*` entry points stay frozen.
 ///
 /// `status_out` (nullable) is written on every path; `observed_sha256_out`
 /// (null or 32 bytes) receives the host fingerprint on success.
@@ -2346,10 +2363,10 @@ pub unsafe extern "C" fn punktfunk_connect_opts(
         return std::ptr::null_mut();
     }
     // Copy the known prefix over zeros so a shorter caller's missing tail stays unspecified.
-    // SAFETY: all-zero is a valid `PunktfunkConnectOpts` — null pointers and zero scalars.
-    let mut o: PunktfunkConnectOpts = unsafe { std::mem::zeroed() };
+    let mut o = PunktfunkConnectOpts::default();
     let take = declared.min(std::mem::size_of::<PunktfunkConnectOpts>());
     // SAFETY: `opts` is readable for `declared >= take`; `o` is a local and cannot overlap.
+    // Every field is an integer or a raw pointer, so any bytes are a valid value.
     unsafe {
         std::ptr::copy_nonoverlapping(
             opts.cast::<u8>(),
@@ -2358,64 +2375,19 @@ pub unsafe extern "C" fn punktfunk_connect_opts(
         );
     }
     // SAFETY: pointer fields forwarded unchanged; the copy did not deref what they point at.
-    unsafe {
-        connect_ex_impl(
-            o.host,
-            o.port,
-            o.client_caps,
-            o.width,
-            o.height,
-            o.refresh_hz,
-            o.compositor,
-            o.gamepad,
-            o.bitrate_kbps,
-            o.video_caps,
-            o.audio_channels,
-            o.video_codecs,
-            o.preferred_codec,
-            o.launch_id,
-            o.pin_sha256,
-            observed_sha256_out,
-            o.client_cert_pem,
-            o.client_key_pem,
-            o.device_name,
-            o.audio_rate_hz,
-            o.audio_bits,
-            0,
-            o.timeout_ms,
-            status_out,
-        )
-    }
+    unsafe { connect_ex_impl(&o, observed_sha256_out, status_out) }
 }
 
-/// Shared body of the connect family. `status_out` is written on every path.
-/// Null `device_name` = OS default. `audio_rate_hz`/`audio_bits` 0/0 is unspecified.
+/// Shared body of the connect family: [`connect_params`], then the dial. `status_out` is
+/// written on every path.
+///
+/// # Safety
+/// `o`'s pointer fields follow [`punktfunk_connect_opts`]; `observed_sha256_out` is null or
+/// valid for 32 bytes; `status_out` is null or writable for one `i32`.
 #[cfg(feature = "quic")]
-#[allow(clippy::too_many_arguments)]
 unsafe fn connect_ex_impl(
-    host: *const std::os::raw::c_char,
-    port: u16,
-    client_caps: u8,
-    width: u32,
-    height: u32,
-    refresh_hz: u32,
-    compositor: u32,
-    gamepad: u32,
-    bitrate_kbps: u32,
-    video_caps: u8,
-    audio_channels: u8,
-    video_codecs: u8,
-    preferred_codec: u8,
-    launch_id: *const std::os::raw::c_char,
-    pin_sha256: *const u8,
+    o: &PunktfunkConnectOpts,
     observed_sha256_out: *mut u8,
-    client_cert_pem: *const std::os::raw::c_char,
-    client_key_pem: *const std::os::raw::c_char,
-    device_name: *const std::os::raw::c_char,
-    audio_rate_hz: u32,
-    audio_bits: u8,
-    video_fit: u8,
-    timeout_ms: u32,
     status_out: *mut i32,
 ) -> *mut PunktfunkConnection {
     let set_status = |s: crate::error::PunktfunkStatus| {
@@ -2423,85 +2395,13 @@ unsafe fn connect_ex_impl(
         unsafe { put(status_out, s as i32) };
     };
     let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        // Null and invalid UTF-8 are both `InvalidArg`.
-        // SAFETY: caller C string, NUL-terminated or null; borrowed for this call only.
-        let Ok(Some(host)) = (unsafe { opt_cstr(host) }) else {
-            set_status(crate::error::PunktfunkStatus::InvalidArg);
-            return std::ptr::null_mut();
-        };
-        // Bad-UTF-8 launch id is non-fatal: treat it as "no game" rather than failing connect.
-        // SAFETY: pointers are caller-supplied and null-checked on this path.
-        let launch = match unsafe { opt_cstr(launch_id) } {
-            Ok(Some(s)) if !s.is_empty() => Some(s.to_string()),
-            _ => None,
-        };
-        // Bad/empty name is non-fatal (OS default). Truncate on a character boundary.
-        // SAFETY: caller C string, NUL-terminated or null; borrowed for this call only.
-        let name = match unsafe { opt_cstr(device_name) } {
-            Ok(Some(s)) if !s.trim().is_empty() => clamp_device_name(s.trim()),
-            _ => crate::client::device_name(),
-        };
-        let mode = crate::config::Mode {
-            width,
-            height,
-            refresh_hz,
-        };
-        // Unrecognized = Auto must hold for the full u32 domain: `as u8` would wrap
-        // 0x101 into a concrete choice before `from_u8`'s fallback could apply.
-        let pref = u8::try_from(compositor)
-            .map(crate::config::CompositorPref::from_u8)
-            .unwrap_or_default();
-        let gamepad = u8::try_from(gamepad)
-            .map(crate::config::GamepadPref::from_u8)
-            .unwrap_or_default();
-        let pin = if pin_sha256.is_null() {
-            None
-        } else {
-            let mut p = [0u8; 32];
-            // SAFETY: caller pointer/length; borrowed for this call only.
-            p.copy_from_slice(unsafe { std::slice::from_raw_parts(pin_sha256, 32) });
-            Some(p)
-        };
-        // SAFETY: pointers are caller-supplied and null-checked on this path.
-        let identity = match (unsafe { opt_cstr(client_cert_pem) }, unsafe {
-            opt_cstr(client_key_pem)
-        }) {
-            (Ok(Some(c)), Ok(Some(k))) => Some((c.to_string(), k.to_string())),
-            (Ok(None), Ok(None)) => None,
-            _ => {
-                // Half an identity / bad UTF-8: fail closed.
-                set_status(crate::error::PunktfunkStatus::InvalidArg);
+        // SAFETY: `o`'s pointer fields are the caller's, under this fn's contract.
+        let params = match unsafe { connect_params(o) } {
+            Ok(p) => p,
+            Err(s) => {
+                set_status(s);
                 return std::ptr::null_mut();
             }
-        };
-        let params = crate::client::ConnectParams {
-            compositor: pref,
-            gamepad,
-            bitrate_kbps,
-            video_caps,
-            audio_channels: crate::audio::normalize_channels(audio_channels),
-            // Unvalidated on purpose: a bad rate is the host's to decline, not a failed connect.
-            audio_rate_hz,
-            audio_bits,
-            video_fit: crate::video_fit::VideoFit::from_wire(video_fit),
-            video_codecs,
-            preferred_codec,
-            // CLIENT_CAP_CURSOR: host stops compositing; only if the embedder draws the cursor.
-            client_caps,
-            launch,
-            // Knock label: embedder `device_name`, else OS default.
-            name: Some(name),
-            pin,
-            identity,
-            preset: lock_recover(&SESSION_PRESET).clone(),
-            // The rest stays default: Legacy coupling (embedders decode what the host answers),
-            // no display volume, whole AUs (`PunktfunkFrame` cannot tell a part), no abort.
-            ..crate::client::ConnectParams::new(
-                host,
-                port,
-                mode,
-                std::time::Duration::from_millis(timeout_ms as u64),
-            )
         };
         match crate::client::NativeClient::connect(params) {
             Ok(c) => {
@@ -2527,6 +2427,98 @@ unsafe fn connect_ex_impl(
     r.unwrap_or_else(|_| {
         set_status(crate::error::PunktfunkStatus::Panic);
         std::ptr::null_mut()
+    })
+}
+
+/// The dial `o` asks for. A null or non-UTF-8 `host` and half an identity are `InvalidArg`;
+/// a bad launch id, device name or preset degrades to none (the OS name for the device).
+///
+/// # Safety
+/// Each pointer field of `o` is null or valid as [`punktfunk_connect_opts`] documents.
+#[cfg(feature = "quic")]
+unsafe fn connect_params(
+    o: &PunktfunkConnectOpts,
+) -> Result<crate::client::ConnectParams, PunktfunkStatus> {
+    // SAFETY: caller C string, NUL-terminated or null; borrowed for this call only.
+    let Ok(Some(host)) = (unsafe { opt_cstr(o.host) }) else {
+        return Err(PunktfunkStatus::InvalidArg);
+    };
+    // SAFETY: as above.
+    let launch = match unsafe { opt_cstr(o.launch_id) } {
+        Ok(Some(s)) if !s.is_empty() => Some(s.to_string()),
+        _ => None,
+    };
+    // Truncate on a character boundary; empty is the OS default.
+    // SAFETY: as above.
+    let name = match unsafe { opt_cstr(o.device_name) } {
+        Ok(Some(s)) if !s.trim().is_empty() => clamp_device_name(s.trim()),
+        _ => crate::client::device_name(),
+    };
+    // Unrecognized = Auto must hold for the full u32 domain: `as u8` would wrap
+    // 0x101 into a concrete choice before `from_u8`'s fallback could apply.
+    let compositor = u8::try_from(o.compositor)
+        .map(crate::config::CompositorPref::from_u8)
+        .unwrap_or_default();
+    let gamepad = u8::try_from(o.gamepad)
+        .map(crate::config::GamepadPref::from_u8)
+        .unwrap_or_default();
+    let pin = if o.pin_sha256.is_null() {
+        None
+    } else {
+        let mut p = [0u8; 32];
+        // SAFETY: a non-null pin is valid for 32 bytes (caller contract); copied out here.
+        p.copy_from_slice(unsafe { std::slice::from_raw_parts(o.pin_sha256, 32) });
+        Some(p)
+    };
+    // SAFETY: as above.
+    let identity = match unsafe { (opt_cstr(o.client_cert_pem), opt_cstr(o.client_key_pem)) } {
+        (Ok(Some(c)), Ok(Some(k))) => Some((c.to_string(), k.to_string())),
+        (Ok(None), Ok(None)) => None,
+        // Half an identity or bad UTF-8: fail closed.
+        _ => return Err(PunktfunkStatus::InvalidArg),
+    };
+    // SAFETY: as above.
+    let preset = match unsafe { opt_cstr(o.preset_id) } {
+        Ok(None) => lock_recover(&SESSION_PRESET).clone(),
+        Ok(Some(id)) => {
+            // SAFETY: as above.
+            let name = unsafe { opt_cstr(o.preset_name) }.ok().flatten();
+            crate::quic::SessionPreset::new(id, name.unwrap_or(""))
+        }
+        Err(()) => None,
+    };
+    let mode = crate::config::Mode {
+        width: o.width,
+        height: o.height,
+        refresh_hz: o.refresh_hz,
+    };
+    Ok(crate::client::ConnectParams {
+        compositor,
+        gamepad,
+        bitrate_kbps: o.bitrate_kbps,
+        video_caps: o.video_caps,
+        audio_channels: crate::audio::normalize_channels(o.audio_channels),
+        // Unvalidated on purpose: a bad rate is the host's to decline, not a failed connect.
+        audio_rate_hz: o.audio_rate_hz,
+        audio_bits: o.audio_bits,
+        video_fit: crate::video_fit::VideoFit::from_wire(o.video_fit),
+        video_codecs: o.video_codecs,
+        preferred_codec: o.preferred_codec,
+        // CLIENT_CAP_CURSOR: host stops compositing; only if the embedder draws the cursor.
+        client_caps: o.client_caps,
+        launch,
+        name: Some(name),
+        pin,
+        identity,
+        preset,
+        // The rest stays default: Legacy coupling (embedders decode what the host answers),
+        // no display volume, whole AUs (`PunktfunkFrame` cannot tell a part), no abort.
+        ..crate::client::ConnectParams::new(
+            host,
+            o.port,
+            mode,
+            std::time::Duration::from_millis(u64::from(o.timeout_ms)),
+        )
     })
 }
 
@@ -5995,8 +5987,8 @@ mod abi_version_tests {
     #[test]
     fn abi_version_is_pinned() {
         // Current ABI. A bump must update this pin.
-        assert_eq!(crate::ABI_VERSION, 40);
-        assert_eq!(super::punktfunk_abi_version(), 40);
+        assert_eq!(crate::ABI_VERSION, 41);
+        assert_eq!(super::punktfunk_abi_version(), 41);
     }
 
     #[test]
@@ -6169,6 +6161,35 @@ mod tests {
             ]
         };
         assert!(statuses.iter().all(|s| *s == PunktfunkStatus::NullPointer));
+    }
+
+    /// `video_fit` and the preset reach the dial. A null `preset_id` takes what
+    /// `punktfunk_set_session_preset` named; a named one wins over it.
+    #[test]
+    fn connect_opts_carry_fit_and_preset() {
+        let mut o = PunktfunkConnectOpts {
+            host: c"127.0.0.1".as_ptr(),
+            video_fit: PUNKTFUNK_VIDEO_FIT_CROP,
+            preset_id: c"dock-1".as_ptr(),
+            preset_name: c"Docked".as_ptr(),
+            ..Default::default()
+        };
+        // SAFETY: C-string literals outlive the call; `name` null names none.
+        unsafe { punktfunk_set_session_preset(c"old".as_ptr(), std::ptr::null()) };
+        // SAFETY: every pointer field is null or a live C-string literal.
+        let p = unsafe { connect_params(&o) }.unwrap();
+        assert_eq!(p.video_fit, crate::video_fit::VideoFit::Crop);
+        assert_eq!(
+            p.preset,
+            crate::quic::SessionPreset::new("dock-1", "Docked")
+        );
+
+        o.preset_id = std::ptr::null();
+        // SAFETY: as above.
+        let p = unsafe { connect_params(&o) }.unwrap();
+        assert_eq!(p.preset, crate::quic::SessionPreset::new("old", ""));
+        // SAFETY: null `id` clears the fallback.
+        unsafe { punktfunk_set_session_preset(std::ptr::null(), std::ptr::null()) };
     }
 
     /// Size-prefix guard: null/undersized is a status, not a read.

@@ -109,12 +109,14 @@ you set the bit. `video_codecs = 0` means HEVC only.
 | `gamepad`, `compositor` | `PUNKTFUNK_GAMEPAD_*` / `PUNKTFUNK_COMPOSITOR_*`; 0 lets the host pick. |
 | `bitrate_kbps` | 0 = host default. |
 | `client_caps` | `PUNKTFUNK_CLIENT_CAP_CURSOR` only if you draw the cursor yourself. |
+| `video_fit` | `PUNKTFUNK_VIDEO_FIT_*`: how your view fills when the frame's shape differs. |
+| `preset_id`, `preset_name` | The settings preset this dial names; the host shows it and hands it to hooks. |
 | `pin_sha256`, `client_cert_pem`, `client_key_pem`, `device_name` | Trust and identity (above). |
 | `launch_id` | `steam:<appid>` or `custom:<id>` to start a library title. |
 | `timeout_ms` | Bounds the whole connect, including a wait for approval. |
 
-The positional `punktfunk_connect` to `punktfunk_connect_ex12` stay for existing callers; new
-options land only in the struct. `video_fit` is the one option only `punktfunk_connect_ex12` takes.
+The positional `punktfunk_connect` to `punktfunk_connect_ex12` stay for existing callers and are
+frozen; new options land only in the struct.
 
 After connect, build your decoder and presenter from what the host chose, never from your request:
 `punktfunk_connection_codec`, `_color_info` (CICP; transfer 16 or 18 is HDR), `_chroma_format`,

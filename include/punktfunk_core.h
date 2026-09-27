@@ -25,7 +25,7 @@
 // Not [`WIRE_VERSION`]. The C surface can grow without a wire byte changing.
 // Pin the integer in `abi.rs` (`abi_version_is_pinned`). Per-bump notes live
 // in `CHANGELOG.md`.
-#define PUNKTFUNK_ABI_VERSION 40
+#define PUNKTFUNK_ABI_VERSION 41
 
 // punktfunk/1 wire version. `Hello`/`Welcome` carry it; hosts equality-check it.
 //
@@ -260,13 +260,13 @@
 // [`punktfunk_connection_set_pad_audio_caps`] bit: the pad renders the SPEAKER stream.
 #define PUNKTFUNK_PAD_AUDIO_CAP_SPEAKER 2
 
-// [`punktfunk_connect_ex12`] `video_fit`: whole picture, bars.
+// [`PunktfunkConnectOpts::video_fit`]: whole picture, bars.
 #define PUNKTFUNK_VIDEO_FIT_FIT 0
 
-// [`punktfunk_connect_ex12`] `video_fit`: fill the view, cut the overflow.
+// [`PunktfunkConnectOpts::video_fit`]: fill the view, cut the overflow.
 #define PUNKTFUNK_VIDEO_FIT_CROP 1
 
-// [`punktfunk_connect_ex12`] `video_fit`: fill the view, scale each axis alone.
+// [`PunktfunkConnectOpts::video_fit`]: fill the view, scale each axis alone.
 #define PUNKTFUNK_VIDEO_FIT_STRETCH 2
 
 // [`punktfunk_connect_ex9`] `client_caps` bit: render the host cursor locally
@@ -1602,7 +1602,7 @@ typedef struct {
 // Growable connect options for [`punktfunk_connect_opts`]. Zero-init, set
 // `struct_size = sizeof(PunktfunkConnectOpts)`, then the fields you mean.
 // Zero = auto/unspecified (`audio_rate_hz = 0` is Opus; a non-zero pair is
-// lossless). Append only; no tail padding (96/68-byte asserts); bump ABI.
+// lossless). Append only; no tail padding (sizes asserted in `abi.rs`); bump ABI.
 typedef struct {
     // `sizeof(PunktfunkConnectOpts)` as this caller was compiled. Smaller than
     // the frozen minimum is rejected; a shorter prefix defaults the tail.
@@ -1656,10 +1656,19 @@ typedef struct {
     uint8_t client_caps;
     // Always `0`, ignored. Held so the struct keeps its v35 size.
     uint32_t reserved1;
-    // Always `0`. Fills what would otherwise be tail padding: C leaves padding
-    // unspecified even under `= {0}`, so the next appended field would read a
-    // caller's garbage. Spend this before growing the struct again.
-    uint32_t reserved0;
+    // `PUNKTFUNK_VIDEO_FIT_*`: how this client fills its view when the frame's shape
+    // differs; unknown = fit. A host that frames the picture for another device reframes
+    // to it. v35–v40 callers zeroed this byte as `reserved0`, so they ask for fit.
+    uint8_t video_fit;
+    // Always `0`. Fills what would otherwise be padding: C leaves padding unspecified
+    // even under `= {0}`, so a later field there would read a caller's garbage.
+    uint8_t reserved0[3];
+    // The settings preset this dial names: its stable id, or null. The host shows it and
+    // hands it to hooks; the stream is unchanged. Null falls back to
+    // [`punktfunk_set_session_preset`].
+    const char *preset_id;
+    // The preset's display name, or null. Read only beside a non-null `preset_id`.
+    const char *preset_name;
 } PunktfunkConnectOpts;
 #endif
 
@@ -2455,6 +2464,9 @@ PunktfunkConnection *punktfunk_connect_ex11(const char *host,
 // shape differs (`PUNKTFUNK_VIDEO_FIT_*`; unknown = fit). A host that frames the picture for
 // another device reframes to it. Every other argument is [`punktfunk_connect_ex11`]'s.
 //
+// Frozen, like the rest of the `connect_ex*` family: new options land only in
+// [`PunktfunkConnectOpts`]. Prefer [`punktfunk_connect_opts`].
+//
 // # Safety
 // Same as [`punktfunk_connect_ex10`].
 PunktfunkConnection *punktfunk_connect_ex12(const char *host,
@@ -2488,15 +2500,18 @@ PunktfunkConnection *punktfunk_connect_ex12(const char *host,
 // shows it and hands it to hooks; the stream is unchanged. A null `id` names none. The value
 // outlives the call, so set it before every connect. ABI v38.
 //
+// Process-wide: two overlapping dials share it. [`PunktfunkConnectOpts::preset_id`] names a
+// preset for one dial and wins over this.
+//
 // # Safety
 // `id` and `name` are null or NUL-terminated C strings, read during this call only.
 void punktfunk_set_session_preset(const char *id, const char *name);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Connect with every option in one growable [`PunktfunkConnectOpts`]. Semantics
-// match [`punktfunk_connect_ex11`] field for field. The `ex` chain stays
-// byte-identical; new options land only in this struct.
+// Connect with every option in one growable [`PunktfunkConnectOpts`]: the `connect_ex*`
+// family's arguments, `video_fit` and the session preset. New options land only in this
+// struct; the `connect_ex*` entry points stay frozen.
 //
 // `status_out` (nullable) is written on every path; `observed_sha256_out`
 // (null or 32 bytes) receives the host fingerprint on success.
