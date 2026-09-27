@@ -89,6 +89,7 @@ on:
       - 'crates/pf-clipboard/**'
       - 'crates/pf-update-check/**'
       - 'crates/pyrowave-sys/**'
+      - 'tools/display-disturb/**'
       - 'packaging/windows/**'
       - 'scripts/windows/**'
       - 'web/**'
@@ -122,6 +123,7 @@ on:
       - 'crates/pf-clipboard/**'
       - 'crates/pf-update-check/**'
       - 'crates/pyrowave-sys/**'
+      - 'tools/display-disturb/**'
       - 'packaging/windows/**'
       - 'scripts/windows/**'
       - 'web/**'
@@ -205,14 +207,14 @@ jobs:
       - name: Clippy (Windows host subsystem)
         # --release and --locked for the same reasons as the package job: reuse C:\t\release
         # instead of spawning a second dep tree, and resolve the graph that is committed.
-        # pf-encode-win, pf-inject and pf-win-display are here because they appear in no other
-        # workflow's -p list at all — their Windows `#[test]`s reached no compiler anywhere.
+        # pf-encode-win, pf-inject, pf-win-display and display-disturb are here because they appear
+        # in no other workflow's -p list at all — their Windows code reached no compiler anywhere.
         # pf-encode-win takes nvenc,qsv and not pyrowave: this lane never builds the PyroWave
         # C++ tree, and the drivers lane already compiles that backend. Two runs, not eight:
         # every extra feature set re-checks the crates the runs share.
         run: |
           cargo clippy --release --locked -p punktfunk-host -p punktfunk-tray --features nvenc,qsv --target x86_64-pc-windows-msvc -- -D warnings; if ($LASTEXITCODE) { throw "host clippy" }
-          cargo clippy --release --locked -p pf-encode -p pf-encode-win -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject --all-targets --features nvenc,qsv --target x86_64-pc-windows-msvc -- -D warnings; if ($LASTEXITCODE) { throw "subsystem clippy" }
+          cargo clippy --release --locked -p pf-encode -p pf-encode-win -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p display-disturb --all-targets --features nvenc,qsv --target x86_64-pc-windows-msvc -- -D warnings; if ($LASTEXITCODE) { throw "subsystem clippy" }
 
       - name: Format check
         # Cheap, needs no compile, and the Linux lane cannot see these crates' Windows modules.
@@ -369,7 +371,7 @@ jobs:
         run: |
           $t = '${{ matrix.target }}'
           cargo clippy --release --locked -p punktfunk-host -p punktfunk-tray ${{ matrix.host_flags }} --target $t -- -D warnings; if ($LASTEXITCODE) { throw "host clippy" }
-          cargo clippy --release --locked -p pf-encode -p pf-encode-win -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject --all-targets ${{ matrix.encode_flags }} --target $t -- -D warnings; if ($LASTEXITCODE) { throw "subsystem clippy" }
+          cargo clippy --release --locked -p pf-encode -p pf-encode-win -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p display-disturb --all-targets ${{ matrix.encode_flags }} --target $t -- -D warnings; if ($LASTEXITCODE) { throw "subsystem clippy" }
 
       - name: Test (pf-capture, Windows)
         if: matrix.arch == 'x64'
