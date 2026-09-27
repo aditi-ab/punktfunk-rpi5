@@ -42,8 +42,8 @@ pub fn rename_aside(path: &Path) -> Result<PathBuf> {
 /// Reads the security descriptor; `icacls` output uses localized account names.
 pub fn ensure_admin_only_source(dir: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::core::{Owned, PCWSTR};
+    use windows::Win32::Foundation::HLOCAL;
     use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
     use windows::Win32::Security::{
         EqualSid, GetAce, IsValidSid, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
@@ -76,8 +76,7 @@ pub fn ensure_admin_only_source(dir: &Path) -> Result<()> {
     let mut owner = PSID::default();
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut sd = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: `wide` is NUL-terminated and outlives the call; the out-params are live locals; the
-    // returned descriptor is the single allocation, LocalFree'd below (owner/dacl point into it).
+    // SAFETY: `wide` is NUL-terminated and outlives the call; the out-params are live locals.
     let rc = unsafe {
         GetNamedSecurityInfoW(
             PCWSTR(wide.as_ptr()),
@@ -90,75 +89,69 @@ pub fn ensure_admin_only_source(dir: &Path) -> Result<()> {
             &mut sd,
         )
     };
-
-    let verdict = (|| -> Result<()> {
-        rc.ok()
-            .map_err(|e| other(format!("GetNamedSecurityInfoW(owner + DACL): {e}")))?;
-        let privileged = privileged_sids()?;
-        let is_privileged = |sid: PSID| -> bool {
-            // SAFETY: every `sid` handed in points into the descriptor returned above (or at an
-            // ACE inside it) and is valid for this scope; IsValidSid is itself the probe.
-            if sid.is_invalid() || !unsafe { IsValidSid(sid) }.as_bool() {
-                return false;
-            }
-            privileged
-                .iter()
-                // SAFETY: `sid` passed IsValidSid above; `p` is an owned, length-exact SID copy.
-                .any(|p| unsafe { EqualSid(sid, PSID(p.as_ptr().cast_mut().cast())) }.is_ok())
-        };
-
-        if !is_privileged(owner) {
-            return Err(other(
-                "the directory is owned by a non-administrative account, which retains WRITE_DAC \
-                 and can restore its own access at any time"
-                    .into(),
-            ));
+    // SAFETY: `sd` is null or the single LocalAlloc'd descriptor just returned, which `owner` and
+    // `dacl` point into; `Owned` frees it once, after their last use.
+    let _sd = unsafe { Owned::new(HLOCAL(sd.0)) };
+    rc.ok()
+        .map_err(|e| other(format!("GetNamedSecurityInfoW(owner + DACL): {e}")))?;
+    let privileged = privileged_sids()?;
+    let is_privileged = |sid: PSID| -> bool {
+        // SAFETY: every `sid` handed in points into the descriptor returned above (or at an
+        // ACE inside it) and is valid for this scope; IsValidSid is itself the probe.
+        if sid.is_invalid() || !unsafe { IsValidSid(sid) }.as_bool() {
+            return false;
         }
-        // A NULL DACL grants everyone everything; an absent one is not "no access".
-        if dacl.is_null() {
-            return Err(other(
-                "the directory has a NULL DACL (everyone has full control)".into(),
-            ));
-        }
-        // SAFETY: `dacl` is a valid ACL inside the descriptor; AceCount bounds the GetAce index.
-        let count = unsafe { (*dacl).AceCount };
-        for i in 0..count as u32 {
-            let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
-            // SAFETY: i < AceCount, and `ace` is a live out-param.
-            unsafe { GetAce(dacl, i, &mut ace) }.map_err(|e| other(format!("GetAce: {e}")))?;
-            // SAFETY: every ACE starts with an ACE_HEADER.
-            let header = unsafe { *(ace as *const ACE_HEADER) };
-            if header.AceType != ACCESS_ALLOWED_ACE_TYPE {
-                continue; // deny ACEs only ever subtract; audit ACEs grant nothing
-            }
-            // SAFETY: an allow ACE is an ACCESS_ALLOWED_ACE, whose SidStart begins the trustee SID.
-            let allowed = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
-            if allowed.Mask & WRITE_MASK == 0 {
-                continue; // no write-shaped right
-            }
-            let sid = PSID(std::ptr::addr_of!(allowed.SidStart) as *mut core::ffi::c_void);
-            if !is_privileged(sid) {
-                return Err(other(format!(
-                    "a non-administrative trustee has write access (ACE {i}, mask {:#010x}) — \
-                     anything staged here can be replaced before it is trusted or executed",
-                    allowed.Mask
-                )));
-            }
-        }
-        Ok(())
-    })();
+        privileged
+            .iter()
+            // SAFETY: `sid` passed IsValidSid above; `p` is an owned, length-exact SID copy.
+            .any(|p| unsafe { EqualSid(sid, PSID(p.as_ptr().cast_mut().cast())) }.is_ok())
+    };
 
-    // SAFETY: `sd` is the single LocalAlloc'd descriptor GetNamedSecurityInfoW returned.
-    unsafe {
-        let _ = LocalFree(Some(HLOCAL(sd.0)));
+    if !is_privileged(owner) {
+        return Err(other(
+            "the directory is owned by a non-administrative account, which retains WRITE_DAC \
+             and can restore its own access at any time"
+                .into(),
+        ));
     }
-    verdict
+    // A NULL DACL grants everyone everything; an absent one is not "no access".
+    if dacl.is_null() {
+        return Err(other(
+            "the directory has a NULL DACL (everyone has full control)".into(),
+        ));
+    }
+    // SAFETY: `dacl` is a valid ACL inside the descriptor; AceCount bounds the GetAce index.
+    let count = unsafe { (*dacl).AceCount };
+    for i in 0..count as u32 {
+        let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: i < AceCount, and `ace` is a live out-param.
+        unsafe { GetAce(dacl, i, &mut ace) }.map_err(|e| other(format!("GetAce: {e}")))?;
+        // SAFETY: every ACE starts with an ACE_HEADER.
+        let header = unsafe { *(ace as *const ACE_HEADER) };
+        if header.AceType != ACCESS_ALLOWED_ACE_TYPE {
+            continue; // deny ACEs only ever subtract; audit ACEs grant nothing
+        }
+        // SAFETY: an allow ACE is an ACCESS_ALLOWED_ACE, whose SidStart begins the trustee SID.
+        let allowed = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
+        if allowed.Mask & WRITE_MASK == 0 {
+            continue; // no write-shaped right
+        }
+        let sid = PSID(std::ptr::addr_of!(allowed.SidStart) as *mut core::ffi::c_void);
+        if !is_privileged(sid) {
+            return Err(other(format!(
+                "a non-administrative trustee has write access (ACE {i}, mask {:#010x}) — \
+                 anything staged here can be replaced before it is trusted or executed",
+                allowed.Mask
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// SYSTEM, `BUILTIN\Administrators`, and TrustedInstaller (owns `%ProgramFiles%`).
 fn privileged_sids() -> Result<Vec<Vec<u8>>> {
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::core::{Owned, PCWSTR};
+    use windows::Win32::Foundation::HLOCAL;
     use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
     use windows::Win32::Security::{GetLengthSid, PSID};
 
@@ -174,15 +167,12 @@ fn privileged_sids() -> Result<Vec<Vec<u8>>> {
         // SAFETY: `wide` is NUL-terminated and outlives the call; psid is a live out-param.
         unsafe { ConvertStringSidToSidW(PCWSTR(wide.as_ptr()), &mut psid) }
             .map_err(|e| other(format!("ConvertStringSidToSidW({s}): {e}")))?;
+        // SAFETY: ConvertStringSidToSidW allocates with LocalAlloc; `Owned` frees it once.
+        let _psid = unsafe { Owned::new(HLOCAL(psid.0)) };
         // SAFETY: psid is a valid SID; copy it out so the caller owns plain bytes.
         let len = unsafe { GetLengthSid(psid) } as usize;
         // SAFETY: GetLengthSid just measured exactly `len` readable bytes at `psid`.
-        let bytes = unsafe { std::slice::from_raw_parts(psid.0 as *const u8, len) }.to_vec();
-        // SAFETY: ConvertStringSidToSidW allocates with LocalAlloc.
-        unsafe {
-            let _ = LocalFree(Some(HLOCAL(psid.0)));
-        }
-        Ok(bytes)
+        Ok(unsafe { std::slice::from_raw_parts(psid.0 as *const u8, len) }.to_vec())
     })
     .collect()
 }
@@ -192,8 +182,8 @@ fn privileged_sids() -> Result<Vec<Vec<u8>>> {
 /// the signal. Distrusts a `host.env` / `web-password` a non-admin planted under `%ProgramData%`.
 pub fn is_admin_owned(path: &Path) -> Option<bool> {
     use std::os::windows::ffi::OsStrExt;
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::core::{Owned, PCWSTR};
+    use windows::Win32::Foundation::HLOCAL;
     use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
     use windows::Win32::Security::{
         EqualSid, IsValidSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
@@ -206,8 +196,7 @@ pub fn is_admin_owned(path: &Path) -> Option<bool> {
         .collect();
     let mut owner = PSID::default();
     let mut sd = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: `wide` is NUL-terminated and outlives the call; the out-params are live locals; the
-    // returned descriptor is the single allocation, LocalFree'd below (owner points into it).
+    // SAFETY: `wide` is NUL-terminated and outlives the call; the out-params are live locals.
     let rc = unsafe {
         GetNamedSecurityInfoW(
             PCWSTR(wide.as_ptr()),
@@ -220,24 +209,20 @@ pub fn is_admin_owned(path: &Path) -> Option<bool> {
             &mut sd,
         )
     };
-    let verdict = (|| -> Option<bool> {
-        rc.ok().ok()?;
-        let privileged = privileged_sids().ok()?;
-        // SAFETY: `owner` points into the descriptor returned above; IsValidSid is the probe.
-        if owner.is_invalid() || !unsafe { IsValidSid(owner) }.as_bool() {
-            return None;
-        }
-        let admin = privileged.iter().any(|p| {
-            // SAFETY: `owner` passed IsValidSid; `p` is an owned, length-exact SID copy.
-            unsafe { EqualSid(owner, PSID(p.as_ptr().cast_mut().cast())) }.is_ok()
-        });
-        Some(admin)
-    })();
-    // SAFETY: `sd` is the single LocalAlloc'd descriptor GetNamedSecurityInfoW returned.
-    unsafe {
-        let _ = LocalFree(Some(HLOCAL(sd.0)));
+    // SAFETY: `sd` is null or the single LocalAlloc'd descriptor just returned, which `owner`
+    // points into; `Owned` frees it once, after the last use of `owner`.
+    let _sd = unsafe { Owned::new(HLOCAL(sd.0)) };
+    rc.ok().ok()?;
+    let privileged = privileged_sids().ok()?;
+    // SAFETY: `owner` points into the descriptor returned above; IsValidSid is the probe.
+    if owner.is_invalid() || !unsafe { IsValidSid(owner) }.as_bool() {
+        return None;
     }
-    verdict
+    let admin = privileged.iter().any(|p| {
+        // SAFETY: `owner` passed IsValidSid; `p` is an owned, length-exact SID copy.
+        unsafe { EqualSid(owner, PSID(p.as_ptr().cast_mut().cast())) }.is_ok()
+    });
+    Some(admin)
 }
 
 /// SID of the account this process runs as, as plain bytes.
@@ -245,7 +230,8 @@ pub fn is_admin_owned(path: &Path) -> Option<bool> {
 /// A per-user install (`PUNKTFUNK_CONFIG_DIR` into a profile) legitimately owns its own
 /// secrets; only a *foreign* unprivileged owner is a plant.
 fn current_user_sid() -> Option<Vec<u8>> {
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::core::Owned;
+    use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Security::{
         GetLengthSid, GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER,
     };
@@ -253,54 +239,49 @@ fn current_user_sid() -> Option<Vec<u8>> {
 
     let mut token = HANDLE::default();
     // SAFETY: GetCurrentProcess returns a pseudo-handle needing no close; `token` is a live
-    // out-param, closed below on every path.
+    // out-param.
     unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.ok()?;
-    let sid = (|| {
-        let mut len = 0u32;
-        // Sizing call: fails with ERROR_INSUFFICIENT_BUFFER and sets `len`.
-        // SAFETY: the null buffer with len 0 is the documented sizing form.
-        unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut len) }.ok();
-        if len == 0 {
-            return None;
-        }
-        let mut buf = vec![0u8; len as usize];
-        // SAFETY: `buf` holds exactly the `len` bytes the sizing call asked for.
-        unsafe {
-            GetTokenInformation(
-                token,
-                TokenUser,
-                Some(buf.as_mut_ptr().cast()),
-                len,
-                &mut len,
-            )
-        }
-        .ok()?;
-        // SAFETY: on success `buf` starts with a TOKEN_USER whose Sid points inside it. A
-        // `Vec<u8>` is only byte-aligned, so the struct is read unaligned.
-        let sid = unsafe { buf.as_ptr().cast::<TOKEN_USER>().read_unaligned() }
-            .User
-            .Sid;
-        if sid.is_invalid() {
-            return None;
-        }
-        // SAFETY: `sid` is valid; GetLengthSid measures exactly the readable bytes, which
-        // live until `buf` drops at the end of this closure.
-        let n = unsafe { GetLengthSid(sid) } as usize;
-        // SAFETY: `n` bytes at `sid` are readable and copied out before `buf` drops.
-        Some(unsafe { std::slice::from_raw_parts(sid.0 as *const u8, n) }.to_vec())
-    })();
-    // SAFETY: `token` came from OpenProcessToken and is not used after this.
-    unsafe {
-        let _ = CloseHandle(token);
+    // SAFETY: the open succeeded, so `token` is a handle this frame alone owns.
+    let token = unsafe { Owned::new(token) };
+    let mut len = 0u32;
+    // Sizing call: fails with ERROR_INSUFFICIENT_BUFFER and sets `len`.
+    // SAFETY: the null buffer with len 0 is the documented sizing form.
+    unsafe { GetTokenInformation(*token, TokenUser, None, 0, &mut len) }.ok();
+    if len == 0 {
+        return None;
     }
-    sid
+    let mut buf = vec![0u8; len as usize];
+    // SAFETY: `buf` holds exactly the `len` bytes the sizing call asked for.
+    unsafe {
+        GetTokenInformation(
+            *token,
+            TokenUser,
+            Some(buf.as_mut_ptr().cast()),
+            len,
+            &mut len,
+        )
+    }
+    .ok()?;
+    // SAFETY: on success `buf` starts with a TOKEN_USER whose Sid points inside it. A
+    // `Vec<u8>` is only byte-aligned, so the struct is read unaligned.
+    let sid = unsafe { buf.as_ptr().cast::<TOKEN_USER>().read_unaligned() }
+        .User
+        .Sid;
+    if sid.is_invalid() {
+        return None;
+    }
+    // SAFETY: `sid` is valid; GetLengthSid measures exactly the readable bytes, which live
+    // until `buf` drops.
+    let n = unsafe { GetLengthSid(sid) } as usize;
+    // SAFETY: `n` bytes at `sid` are readable and copied out before `buf` drops.
+    Some(unsafe { std::slice::from_raw_parts(sid.0 as *const u8, n) }.to_vec())
 }
 
 /// True when `path`'s owner is the account this process runs as.
 pub fn owned_by_current_user(path: &Path) -> bool {
     use std::os::windows::ffi::OsStrExt;
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::core::{Owned, PCWSTR};
+    use windows::Win32::Foundation::HLOCAL;
     use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
     use windows::Win32::Security::{
         EqualSid, IsValidSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
@@ -316,8 +297,7 @@ pub fn owned_by_current_user(path: &Path) -> bool {
         .collect();
     let mut owner = PSID::default();
     let mut sd = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: `wide` is NUL-terminated and outlives the call; the out-params are live locals;
-    // the returned descriptor is the single allocation, LocalFree'd below.
+    // SAFETY: `wide` is NUL-terminated and outlives the call; the out-params are live locals.
     let rc = unsafe {
         GetNamedSecurityInfoW(
             PCWSTR(wide.as_ptr()),
@@ -330,17 +310,15 @@ pub fn owned_by_current_user(path: &Path) -> bool {
             &mut sd,
         )
     };
-    let same = rc.is_ok()
+    // SAFETY: `sd` is null or the single LocalAlloc'd descriptor just returned, which `owner`
+    // points into; `Owned` frees it once, after the last use of `owner`.
+    let _sd = unsafe { Owned::new(HLOCAL(sd.0)) };
+    rc.is_ok()
         && !owner.is_invalid()
         // SAFETY: `owner` points into the descriptor returned above; IsValidSid is the probe.
         && unsafe { IsValidSid(owner) }.as_bool()
         // SAFETY: both SIDs passed IsValidSid / GetLengthSid; `me` is an owned copy.
-        && unsafe { EqualSid(owner, PSID(me.as_ptr().cast_mut().cast())) }.is_ok();
-    // SAFETY: `sd` is the single LocalAlloc'd descriptor GetNamedSecurityInfoW returned.
-    unsafe {
-        let _ = LocalFree(Some(HLOCAL(sd.0)));
-    }
-    same
+        && unsafe { EqualSid(owner, PSID(me.as_ptr().cast_mut().cast())) }.is_ok()
 }
 
 /// True when `path` holds a secret an unprivileged account owns, and renames it aside.
