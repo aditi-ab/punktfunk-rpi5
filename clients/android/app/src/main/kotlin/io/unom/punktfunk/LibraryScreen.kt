@@ -78,7 +78,6 @@ import androidx.compose.ui.unit.sp
 import coil.ImageLoader
 import io.unom.punktfunk.components.launcherIcon
 import io.unom.punktfunk.kit.link.DeepLinks
-import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.library.GameEntry
 import io.unom.punktfunk.kit.library.LibraryClient
 import io.unom.punktfunk.kit.library.LibraryResult
@@ -95,7 +94,7 @@ import kotlin.math.absoluteValue
 import kotlin.math.cos
 import kotlin.math.sign
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 
 // The host game-library browser — the Android mirror of the Apple client's LibraryView: ONE screen
@@ -107,16 +106,14 @@ import kotlinx.coroutines.withContext
 // launch — is shared: only the arrangement differs, because only the input device does.
 
 /**
- * Whether the shelf on screen is an observation or a memory — and, if a memory, whether anything is
- * still being done about it.
- *
- * Three states rather than a flag because the two cached ones want different words. "Waking the
- * host…" says a shelf is about to become current; "last known library" says it isn't going to.
- * Telling a player the first thing while nothing is happening is the kind of lie a progress
- * indicator tells, and it is worth one extra state to never tell it.
+ * Whether the shelf on screen is an observation or a memory — and, if a memory, what is being done
+ * about it. The cached states want different words: "waking" only while a magic packet is out,
+ * "checking" while the host is merely asked, and "last known library" once it isn't going to
+ * become current. The same copy as `pf_console_ui::Stale`.
  */
 private enum class Stale(val note: String?) {
     No(null),
+    Checking("Last known library — checking the host…"),
     Waking("Last known library — waking the host…"),
     Offline("Last known library — the host didn't answer"),
 }
@@ -172,21 +169,6 @@ private sealed class LibState {
     data class Message(val text: String) : LibState() // unauthorized / empty / error
 }
 
-/**
- * How long to keep asking a host we have just sent a magic packet to. A cold box takes 20–60 s to
- * POST and start serving, so one attempt would almost always land on a machine that is still
- * booting — the same 90-second budget [WakeController] allows.
- */
-private const val WAKE_ATTEMPTS = 12
-private const val WAKE_RETRY_MS = 5_000L
-
-/**
- * Re-send the magic packet every other attempt (≈ every 10 s). A single packet can be missed, and
- * some NICs only wake on a fresh one after dropping into a deeper sleep state — [WakeController]'s
- * rule, expressed in this loop's units.
- */
-private const val WAKE_RESEND_EVERY = 2
-
 @Composable
 fun LibraryScreen(
     host: KnownHost,
@@ -229,22 +211,8 @@ fun LibraryScreen(
 
     // Keyed on the mgmt port too: a discovery tick can learn it after this screen is composed, and
     // the fetch must redo itself against the real port rather than stay on a stale 47990 failure.
-    //
-    // Four things happen here and the ORDER is the point:
-    //   1. the CACHED catalog goes up immediately, marked stale — a library is the screen a player
-    //      uses to decide what to play, and an empty one while a sleeping box boots is the opposite
-    //      of useful;
-    //   2. a magic packet goes out, so the box warms while they are still choosing — waking used to
-    //      be bound to CONNECTING, which is far too late to help;
-    //   3. the live fetch runs, retrying across the boot window, and replaces the cached shelf;
-    //   4. `/status` says which titles are already up, AFTER the catalog so a slow answer can never
-    //      hold the titles back.
-    //
-    // A cached catalog also outranks a failure: if the host never answers, the titles on screen are
-    // still the right ones to choose from, and replacing them with an error because a box is asleep
-    // is precisely what the cache exists to prevent.
     LaunchedEffect(host.address, host.port, host.fpHex, host.effectiveMgmtPort, reloadKey) {
-        loadLibrary(context, host) { state = it }
+        loadLibrary(context, host, settings.autoWakeEnabled) { state = it }
     }
 
     // A pinned card's shelf says so, in the card's own `host · preset` shape: what a launch here
@@ -360,34 +328,57 @@ fun LibraryScreen(
  *   1. the CACHED catalog goes up immediately, marked stale — a library is the screen a player
  *      uses to decide what to play, and an empty one while a sleeping box boots is the opposite
  *      of useful;
- *   2. a magic packet goes out, so the box warms while they are still choosing;
+ *   2. with [autoWake] on, a magic packet goes out so the box warms while they are still choosing,
+ *      and only then does the shelf say "waking";
  *   3. the live fetch runs, retrying across the boot window, and replaces the cached shelf;
  *   4. `/status` says which titles are already up, AFTER the catalog so a slow answer can never
  *      hold the titles back.
  * A cached catalog also outranks a failure: if the host never answers, the titles on screen are
  * still the right ones to choose from.
  */
-private suspend fun loadLibrary(context: Context, host: KnownHost, set: (LibState) -> Unit) {
+private suspend fun loadLibrary(
+    context: Context,
+    host: KnownHost,
+    autoWake: Boolean,
+    set: (LibState) -> Unit,
+) {
     set(LibState.Loading)
     val cache = LibraryCache.standard(context.cacheDir)
+    val key = LibraryCache.keyFor(host, host.fpHex)
     val (identity, loader) = prepareLoader(context, host) ?: run {
         set(LibState.Message("Identity unavailable — re-pair may be required"))
         return
     }
-    // Keyed on the host RECORD id, not its address: a box that came back on a new DHCP lease is
-    // the same host with the same library, and keying on where it lives would lose the cache
-    // exactly when a cold-booted machine needs it most.
-    val cached = withContext(Dispatchers.IO) { cache.load(host.id)?.games }?.takeIf { it.isNotEmpty() }
+    val cached = withContext(Dispatchers.IO) { cache.load(key)?.games }?.takeIf { it.isNotEmpty() }
     if (cached != null) {
-        set(LibState.Ready(cached, loader, identity, stale = Stale.Waking))
+        set(LibState.Ready(cached, loader, identity, stale = Stale.Checking))
     }
-    when (val res = fetchAcrossWake(host, identity)) {
+    val res = withContext(Dispatchers.IO) {
+        LibraryClient.fetchAcrossWake(
+            address = host.address,
+            mgmtPort = host.effectiveMgmtPort,
+            certPem = identity.certPem,
+            keyPem = identity.privateKeyPem,
+            fpHex = host.fpHex,
+            macs = host.mac,
+            autoWake = autoWake,
+            isCancelled = { !isActive },
+            onWaking = {
+                if (cached != null) {
+                    launch(Dispatchers.Main) {
+                        set(LibState.Ready(cached, loader, identity, stale = Stale.Waking))
+                    }
+                }
+            },
+        )
+    }
+    when (res) {
         is LibraryResult.Ok -> if (res.games.isEmpty()) {
             set(LibState.Message("No games found on this host."))
         } else {
             set(LibState.Ready(res.games, loader, identity))
             // Remembered AFTER it is on screen: the disk write is not on the path to a shelf.
-            withContext(Dispatchers.IO) { cache.store(host.id, res.games) }
+            withContext(Dispatchers.IO) { cache.store(key, res.games) }
             val running = withContext(Dispatchers.IO) {
                 LibraryClient.fetchRunning(
                     address = host.address,
@@ -435,40 +426,6 @@ private suspend fun prepareLoader(context: Context, host: KnownHost): Pair<Clien
             ?: return@withContext null
         id to loader
     }
-
-/**
- * The catalog fetch, with a magic packet ahead of it and resends across the boot window. The
- * packet is deliberately unconditional rather than only when the host looks offline: it is one
- * datagram an already-awake machine ignores, so finding out whether it is needed costs more than
- * sending it. Anything other than "can't reach it" is settled — see `LibraryResult.isTransient`.
- */
-private suspend fun fetchAcrossWake(host: KnownHost, identity: ClientIdentity): LibraryResult? {
-    val macs = host.mac.joinToString(",")
-    val waking = host.mac.isNotEmpty()
-    if (waking) {
-        withContext(Dispatchers.IO) { NativeBridge.nativeWakeOnLan(macs, host.address) }
-    }
-    val attempts = if (waking) WAKE_ATTEMPTS else 1
-    var last: LibraryResult? = null
-    for (attempt in 0 until attempts) {
-        val res = withContext(Dispatchers.IO) {
-            LibraryClient.fetch(
-                address = host.address,
-                mgmtPort = host.effectiveMgmtPort,
-                certPem = identity.certPem,
-                keyPem = identity.privateKeyPem,
-                fpHex = host.fpHex,
-            )
-        }
-        last = res
-        if (res is LibraryResult.Ok || !res.isTransient || attempt + 1 >= attempts) break
-        if (attempt % WAKE_RESEND_EVERY == WAKE_RESEND_EVERY - 1) {
-            withContext(Dispatchers.IO) { NativeBridge.nativeWakeOnLan(macs, host.address) }
-        }
-        delay(WAKE_RETRY_MS)
-    }
-    return last
-}
 
 /**
  * The touch shelf: a Material poster grid under a back/reload header — the same page the Apple,

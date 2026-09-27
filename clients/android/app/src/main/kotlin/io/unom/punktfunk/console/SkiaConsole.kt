@@ -35,6 +35,7 @@ import io.unom.punktfunk.kit.discovery.DiscoveredHost
 import io.unom.punktfunk.kit.discovery.HostDiscovery
 import io.unom.punktfunk.kit.discovery.Presence
 import io.unom.punktfunk.kit.discovery.PresenceTracker
+import io.unom.punktfunk.kit.discovery.WakeLoop
 import io.unom.punktfunk.kit.library.LibraryCache
 import io.unom.punktfunk.kit.link.StartScreen
 import io.unom.punktfunk.kit.link.host
@@ -758,7 +759,7 @@ object SkiaConsole {
         // launcher tile go straight through, so the session is handed over at once. Mirrors
         // `Shell::launch_hold`, and reads the same cached catalog the shelf was drawn from.
         holdsLaunch = launchId != null &&
-            LibraryCache.standard(app.cacheDir).load(kh?.id ?: fp)?.games
+            LibraryCache.standard(app.cacheDir).load(LibraryCache.keyFor(kh, fp))?.games
                 ?.firstOrNull { it.id == launchId }?.isLauncher == false
         val preset: StreamPreset? = presetStore.resolveFor(kh, presetId, launchId)
         val effective = settings.effectiveFor(preset)
@@ -1102,9 +1103,9 @@ object SkiaConsole {
     }
 
     /**
-     * The wake-and-wait loop (the desktop's `spawn_wake`): resend the magic packet every 6 s,
-     * probe once a second, 90 s timeout; the console reads `online`/`timed_out` off the status
-     * and acts (a `then_connect` wake dials from the shell's side once online).
+     * The wake-and-wait loop ([WakeLoop], the desktop's `spawn_wake`); the console reads
+     * `online`/`timed_out` off the status and acts (a `then_connect` wake dials from the shell's
+     * side once online). Online is a probe of the host, at its live advert's address if it has one.
      */
     private fun wake(c: JSONObject) {
         val key = c.optString("key"); val thenConnect = c.optBoolean("then_connect")
@@ -1113,32 +1114,27 @@ object SkiaConsole {
         val gen = wakeGen.incrementAndGet()
         val name = kh.name.ifBlank { kh.address }
         ioPool.execute {
-            val started = System.currentTimeMillis()
-            var lastPacket = 0L
-            while (wakeGen.get() == gen && handle != 0L) {
-                val elapsed = ((System.currentTimeMillis() - started) / 1000).toInt()
-                val timedOut = elapsed >= 90
-                if (!timedOut && System.currentTimeMillis() - lastPacket >= 6_000) {
-                    NativeBridge.nativeWakeOnLan(kh.mac.joinToString(","), kh.address)
-                    lastPacket = System.currentTimeMillis()
-                }
-                val online = Presence.isSelf(kh, NativeBridge.nativeProbe(kh.address, kh.port, 900)) ||
-                    discovered.any { kh.matches(it) }
-                if (wakeGen.get() != gen) return@execute
+            WakeLoop.run(
+                kh.mac, kh.address,
+                isOnline = {
+                    Presence.probeSelf(kh, discovered.firstOrNull { kh.matches(it) }) { addr, port ->
+                        NativeBridge.nativeProbe(addr, port, 900)
+                    }
+                },
+                cancelled = { wakeGen.get() != gen || handle == 0L },
+            ) { seconds, timedOut, online ->
                 NativeBridge.nativeConsoleSetWake(
                     handle,
-                    ConsoleJson.wakeStatus(key, name, elapsed, timedOut, online, thenConnect),
+                    ConsoleJson.wakeStatus(key, name, seconds, timedOut, online, thenConnect),
                 )
-                if (online || timedOut) return@execute
-                Thread.sleep(1000)
             }
         }
     }
 
     /**
-     * The library pipeline (the desktop's `spawn_fetch`): cached shelf first, wake + retry
-     * across the boot window when the host has a MAC, then the catalog, the running set and
-     * the posters — each poster fetched over the same mTLS client and pushed as bytes.
+     * The library pipeline (the desktop's `spawn_fetch`): cached shelf first, then
+     * [LibraryClient.fetchAcrossWake], then the running set and the posters — each poster
+     * fetched over the same mTLS client and pushed as bytes.
      */
     private fun fetchLibrary(c: JSONObject, refreshOnly: Boolean) {
         val app = appContext ?: return
@@ -1168,25 +1164,17 @@ object SkiaConsole {
             return
         }
         val cache = LibraryCache.standard(app.cacheDir)
-        val cacheKey = kh?.id ?: fp.ifEmpty { "$addr:$mgmt" }
+        val cacheKey = LibraryCache.keyFor(kh, fp)
         ioPool.execute {
             val cached = cache.load(cacheKey)?.games?.takeIf { it.isNotEmpty() }
             if (cached != null) main.post { if (gen == fetchGen.get()) NativeBridge.nativeConsoleLibraryGames(handle, ConsoleJson.libraryGames(cached), true) }
-            val macs = kh?.mac.orEmpty()
-            val waking = macs.isNotEmpty() && settings.autoWakeEnabled
-            if (waking) NativeBridge.nativeWakeOnLan(macs.joinToString(","), addr)
-            val attempts = if (waking) 12 else 1
-            var result: LibraryResult? = null
-            for (attempt in 0 until attempts) {
-                if (gen != fetchGen.get()) return@execute
-                val r = LibraryClient.fetch(addr, mgmt, id.certPem, id.privateKeyPem, fp)
-                result = r
-                if (r is LibraryResult.Ok || r is LibraryResult.Unauthorized) break
-                if (attempt + 1 >= attempts) break
-                if (attempt % 2 == 1) NativeBridge.nativeWakeOnLan(macs.joinToString(","), addr)
-                main.post { if (gen == fetchGen.get()) NativeBridge.nativeConsoleLibraryStale(handle, 1) }
-                Thread.sleep(5_000)
-            }
+            val result = LibraryClient.fetchAcrossWake(
+                addr, mgmt, id.certPem, id.privateKeyPem, fp,
+                macs = kh?.mac.orEmpty(),
+                autoWake = settings.autoWakeEnabled,
+                isCancelled = { gen != fetchGen.get() },
+                onWaking = { main.post { if (gen == fetchGen.get()) NativeBridge.nativeConsoleLibraryStale(handle, 1) } },
+            )
             if (gen != fetchGen.get()) return@execute
             when (val r = result) {
                 is LibraryResult.Ok -> {

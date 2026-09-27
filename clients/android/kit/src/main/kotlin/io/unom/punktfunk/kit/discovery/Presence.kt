@@ -54,6 +54,13 @@ object Presence {
     fun isSelf(saved: KnownHost, answered: String?): Boolean = isSelf(saved.fpHex, answered)
 
     /**
+     * Is [saved] up? Asked at [live]'s address when there is an advert (a cold boot can move the
+     * lease), else at the saved one. The advert alone never counts. Blocking.
+     */
+    fun probeSelf(saved: KnownHost, live: DiscoveredHost?, probe: (String, Int) -> String?): Boolean =
+        isSelf(saved, probe(live?.host ?: saved.address, live?.port ?: saved.port))
+
+    /**
      * Probe every host in [saved] and return the address each one answered AT AND AS ITSELF,
      * keyed by record id. Hosts run in parallel, and a host's fallbacks are asked together once
      * its saved address is silent, so a sweep costs at most two probe budgets, not one per
