@@ -483,22 +483,15 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// time minus `ptsNs`) is valid across machines. `0` = no correction (an older host that
     /// didn't answer, synchronized clocks, or a closed connection).
     ///
-    /// ⚠ LIVE means DO NOT CACHE. Until 2026-08-13 this was a connect-time snapshot, and the
-    /// core's own doc names the failure: "after an NTP step or slow drift the connect-time value
-    /// silently corrupts every capture-clock comparison." The field evidence was stark — two
-    /// sessions minutes apart against the same wired host read hostnet 17–21 ms, then a
-    /// physically impossible 4.4 ms (the host is a VM; VM wall clocks step), and LatencyMeter's
-    /// impossible-sample guard silently trimmed the shifted-negative half, so the HUD showed a
-    /// plausible small number instead of an alarm. Read this property at each use — it is an
-    /// atomic load behind the FFI — and never park it in a `let` or a closure capture list.
-    /// Cross-thread reads follow the `framesDropped()` precedent.
+    /// Read it at each use, never park it in a `let` or a closure capture: an NTP step or a VM
+    /// clock step moves it, and a stale value silently skews every capture-clock comparison. It
+    /// is an atomic load behind the FFI.
     public var clockOffsetNs: Int64 {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return 0 }
-        var offset: Int64 = 0
-        _ = punktfunk_connection_clock_offset_now_ns(h, &offset)
-        return offset
+        return withLiveHandle(or: 0) { h in
+            var offset: Int64 = 0
+            _ = punktfunk_connection_clock_offset_now_ns(h, &offset)
+            return offset
+        }
     }
 
     /// The video encoder bitrate (kbps) the host actually configured — the requested
@@ -698,12 +691,11 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// capture what can't land — a keyboard that silently does nothing is the failure mode
     /// this exists to prevent.
     public var accessGrants: UInt32 {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return Self.grantAll }
-        var grants: UInt32 = Self.grantAll
-        _ = punktfunk_connection_grants(h, &grants)
-        return grants
+        return withLiveHandle(or: Self.grantAll) { h in
+            var grants: UInt32 = Self.grantAll
+            _ = punktfunk_connection_grants(h, &grants)
+            return grants
+        }
     }
 
     /// Seconds until this session's access expires, LIVE (the core counts it down from the
@@ -711,12 +703,11 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// it). `0` = permanent — show no countdown then; while a deadline exists it clamps to
     /// ≥ 1, so `0` stays unambiguous. Poll ~1 Hz for the "ends in 1 h 58 m" chip.
     public var accessExpiresInSeconds: UInt32 {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return 0 }
-        var secs: UInt32 = 0
-        _ = punktfunk_connection_access_expires_in(h, &secs)
-        return secs
+        return withLiveHandle(or: 0) { h in
+            var secs: UInt32 = 0
+            _ = punktfunk_connection_access_expires_in(h, &secs)
+            return secs
+        }
     }
 
     /// The session's grants allow controller input (pads, rich DualSense input).
@@ -735,22 +726,20 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// Wire pads in controller mouse, a bit per pad: their buttons and sticks drive the host
     /// pointer while the host pad sits neutral. A removed pad or a lost pointer grant clears its bit.
     public var padMouse: UInt16 {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return 0 }
-        var mask: UInt16 = 0
-        _ = punktfunk_connection_pad_mouse(h, &mask)
-        return mask
+        return withLiveHandle(or: 0) { h in
+            var mask: UInt16 = 0
+            _ = punktfunk_connection_pad_mouse(h, &mask)
+            return mask
+        }
     }
 
     /// Switch the pads in `mask` to controller mouse; `0` returns every pad to passthrough.
     /// False when the session is gone or the host did not grant pointer input.
     @discardableResult
     public func setPadMouse(_ mask: UInt16) -> Bool {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return false }
-        return punktfunk_connection_set_pad_mouse(h, mask) == statusOK
+        return withLiveHandle(or: false) { h in
+            return punktfunk_connection_set_pad_mouse(h, mask) == statusOK
+        }
     }
 
     /// Live scroll inversion at the connection's one outbound seam — seeded from
@@ -758,20 +747,18 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// per-event reseed. False when the session is gone.
     @discardableResult
     public func setInvertScroll(_ invert: Bool) -> Bool {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return false }
-        return punktfunk_connection_set_invert_scroll(h, invert) == statusOK
+        return withLiveHandle(or: false) { h in
+            return punktfunk_connection_set_invert_scroll(h, invert) == statusOK
+        }
     }
 
     /// Wire pads the host holds now, a bit per pad: declared or driven, not yet removed.
     public var livePads: UInt16 {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return 0 }
-        var mask: UInt16 = 0
-        _ = punktfunk_connection_live_pads(h, &mask)
-        return mask
+        return withLiveHandle(or: 0) { h in
+            var mask: UInt16 = 0
+            _ = punktfunk_connection_live_pads(h, &mask)
+            return mask
+        }
     }
     /// Anything about this session's access differs from the everyday full-and-permanent —
     /// the chip's visibility gate: full + permanent must look exactly like today. Compared
@@ -816,48 +803,30 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// `clientCaps` cursor bit against a `hostSupportsCursor` host receives any. Drain shape
     /// AND state from ONE dedicated cursor thread (they share a lock).
     public func nextCursorShape(timeoutMs: UInt32 = 0) throws -> CursorShapeEvent? {
-        cursorLock.lock()
-        defer { cursorLock.unlock() }
-        guard let h = liveHandle() else { throw PunktfunkClientError.closed }
         var out = PunktfunkCursorShape()
-        let rc = punktfunk_connection_next_cursor_shape(h, &out, timeoutMs)
-        switch rc {
-        case statusOK:
+        return try poll(cursorLock) { h in
+            punktfunk_connection_next_cursor_shape(h, &out, timeoutMs)
+        } decode: {
             // Copy out of the ABI borrow (valid until the next shape call) immediately.
             let bytes = out.rgba.map { Data(bytes: $0, count: Int(out.len)) } ?? Data()
             return CursorShapeEvent(
                 serial: out.serial, width: Int(out.w), height: Int(out.h),
                 hotX: Int(out.hot_x), hotY: Int(out.hot_y), rgba: bytes)
-        case statusNoFrame:
-            return nil
-        case statusClosed:
-            throw PunktfunkClientError.closed
-        default:
-            throw PunktfunkClientError.status(rc)
         }
     }
 
     /// Pull the next cursor STATE (nil = timeout). Latest-wins — drain the queue and apply
     /// only the newest. Same thread + gate as [`nextCursorShape`].
     public func nextCursorState(timeoutMs: UInt32 = 0) throws -> CursorStateEvent? {
-        cursorLock.lock()
-        defer { cursorLock.unlock() }
-        guard let h = liveHandle() else { throw PunktfunkClientError.closed }
         var out = PunktfunkCursorState()
-        let rc = punktfunk_connection_next_cursor_state(h, &out, timeoutMs)
-        switch rc {
-        case statusOK:
+        return try poll(cursorLock) { h in
+            punktfunk_connection_next_cursor_state(h, &out, timeoutMs)
+        } decode: {
             return CursorStateEvent(
                 serial: out.serial,
                 visible: out.flags & 0x01 != 0,
                 relativeHint: out.flags & 0x02 != 0,
                 x: out.x, y: out.y)
-        case statusNoFrame:
-            return nil
-        case statusClosed:
-            throw PunktfunkClientError.closed
-        default:
-            throw PunktfunkClientError.status(rc)
         }
     }
 
@@ -870,10 +839,9 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// enqueue under `abiLock`: the main thread calls it, and the cursor pull thread holds
     /// `cursorLock` through a 100 ms poll.
     public func setCursorRender(clientDraws: Bool) {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return }
-        _ = punktfunk_connection_set_cursor_render(h, clientDraws)
+        withLiveHandle(or: ()) { h in
+            _ = punktfunk_connection_set_cursor_render(h, clientDraws)
+        }
     }
 
     /// The resolved codec as a `VideoCodec` (H.264 / HEVC / AV1) — drives the bitstream framing
@@ -1099,26 +1067,24 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// briefly pausing video. Non-blocking — poll `probeResult()` until `done`. Starting
     /// a probe resets any prior measurement. Silently dropped after close.
     public func startSpeedTest(targetKbps: UInt32, durationMs: UInt32) {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return }
-        _ = punktfunk_connection_speed_test(h, targetKbps, durationMs)
+        withLiveHandle(or: ()) { h in
+            _ = punktfunk_connection_speed_test(h, targetKbps, durationMs)
+        }
     }
 
     /// The current speed-test measurement (zeros before any probe; partial until `done`).
     /// Safe to poll from any thread; nil after close.
     public func probeResult() -> ProbeResult? {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return nil }
-        var out = PunktfunkProbeResult()
-        guard punktfunk_connection_probe_result(h, &out) == statusOK else { return nil }
-        return ProbeResult(
-            done: out.done != 0,
-            recvBytes: out.recv_bytes, recvPackets: out.recv_packets,
-            hostBytes: out.host_bytes, hostPackets: out.host_packets,
-            elapsedMs: out.elapsed_ms, throughputKbps: out.throughput_kbps,
-            lossPct: out.loss_pct)
+        return withLiveHandle(or: nil) { h in
+            var out = PunktfunkProbeResult()
+            guard punktfunk_connection_probe_result(h, &out) == statusOK else { return nil }
+            return ProbeResult(
+                done: out.done != 0,
+                recvBytes: out.recv_bytes, recvPackets: out.recv_packets,
+                hostBytes: out.host_bytes, hostPackets: out.host_packets,
+                elapsedMs: out.elapsed_ms, throughputKbps: out.throughput_kbps,
+                lossPct: out.loss_pct)
+        }
     }
 
     /// Ask the host to switch the live session to a new mode (window resized) — no
@@ -1126,10 +1092,9 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// first new-mode AU is an IDR with fresh parameter sets — `AnnexB.formatDescription`
     /// refresh-on-IDR already handles it) and `currentMode()` reflects the switch.
     public func requestMode(width: UInt32, height: UInt32, refreshHz: UInt32) {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return }
-        _ = punktfunk_connection_request_mode(h, width, height, refreshHz)
+        withLiveHandle(or: ()) { h in
+            _ = punktfunk_connection_request_mode(h, width, height, refreshHz)
+        }
     }
 
     /// Ask the host's encoder to emit a fresh IDR keyframe now — recovery when the local
@@ -1141,10 +1106,9 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// several frames until the IDR lands, so requesting every frame would flood the control
     /// stream. Silently dropped after close.
     public func requestKeyframe() {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return }
-        _ = punktfunk_connection_request_keyframe(h)
+        withLiveHandle(or: ()) { h in
+            _ = punktfunk_connection_request_keyframe(h)
+        }
     }
 
     /// Background-keep-alive video drop (opt-in). While true, both video pumps keep DRAINING
@@ -1172,12 +1136,11 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// `framesDropped` climb for the SAME loss cannot re-freeze a stream an anchor already healed.
     /// Call it for every received AU. Returns 0 after close.
     public func noteFrameIndexGapWidth(_ frameIndex: UInt32) -> UInt32 {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return 0 }
-        var width: UInt32 = 0
-        _ = punktfunk_connection_note_frame_index_ex(h, frameIndex, &width)
-        return width
+        return withLiveHandle(or: 0) { h in
+            var width: UInt32 = 0
+            _ = punktfunk_connection_note_frame_index_ex(h, frameIndex, &width)
+            return width
+        }
     }
 
     /// Cumulative access units the host→client reassembler dropped as unrecoverable (FEC couldn't
@@ -1187,12 +1150,11 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// no decode error and no `.failed` layer), so a decode-error trigger rarely fires. Monotonic
     /// for the session; 0 after close. Cheap (an atomic load) — safe to poll every pump iteration.
     public func framesDropped() -> UInt64 {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return 0 }
-        var out: UInt64 = 0
-        _ = punktfunk_connection_frames_dropped(h, &out)
-        return out
+        return withLiveHandle(or: 0) { h in
+            var out: UInt64 = 0
+            _ = punktfunk_connection_frames_dropped(h, &out)
+            return out
+        }
     }
 
     /// Report one decoded frame's decode-stage latency, in microseconds (the AU leaving `nextAU`
@@ -1201,10 +1163,9 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// decode limit instead of climbing to the network link ceiling and choking the decoder. Cheap;
     /// silently dropped after close. Only worth calling when `wantsDecodeLatency()` is true.
     public func reportDecodeUs(_ us: UInt32) {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return }
-        _ = punktfunk_connection_report_decode_us(h, us)
+        withLiveHandle(or: ()) { h in
+            _ = punktfunk_connection_report_decode_us(h, us)
+        }
     }
 
     // MARK: - Stats overlay
@@ -1244,66 +1205,62 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// One frame left the decoder (`receivedNs` = the AU's reassembly stamp; both client
     /// `CLOCK_REALTIME`). Cheap; dropped after close.
     public func hudDecoded(ptsNs: UInt64, receivedNs: Int64, decodedNs: Int64) {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return }
-        _ = punktfunk_connection_hud_decoded(
-            h, ptsNs, UInt64(max(0, receivedNs)), UInt64(max(0, decodedNs)))
+        withLiveHandle(or: ()) { h in
+            _ = punktfunk_connection_hud_decoded(
+                h, ptsNs, UInt64(max(0, receivedNs)), UInt64(max(0, decodedNs)))
+        }
     }
 
     /// One frame reached the screen at `displayedNs` (client `CLOCK_REALTIME`).
     public func hudDisplayed(ptsNs: UInt64, decodedNs: Int64, displayedNs: Int64) {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return }
-        _ = punktfunk_connection_hud_displayed(
-            h, ptsNs, UInt64(max(0, decodedNs)), UInt64(max(0, displayedNs)))
+        withLiveHandle(or: ()) { h in
+            _ = punktfunk_connection_hud_displayed(
+                h, ptsNs, UInt64(max(0, decodedNs)), UInt64(max(0, displayedNs)))
+        }
     }
 
     /// One sample of the OS present pipeline's depth (the display link's vend lead), ns.
     public func hudOsFloor(ns: Int64) {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested, ns > 0 else { return }
-        _ = punktfunk_connection_hud_os_floor(h, UInt64(ns))
+        guard ns > 0 else { return }
+        withLiveHandle(or: ()) { h in
+            _ = punktfunk_connection_hud_os_floor(h, UInt64(ns))
+        }
     }
 
     /// Close the overlay's window, once a second; `hudLines` formats what it kept.
     public func hudDrain() {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return }
-        _ = punktfunk_connection_hud_drain(h)
+        withLiveHandle(or: ()) { h in
+            _ = punktfunk_connection_hud_drain(h)
+        }
     }
 
     /// The last drained window as overlay lines at `tier`, in the Advanced vocabulary when
     /// `advanced`. Empty after close.
     public func hudLines(tier: StatsVerbosity, advanced: Bool, facts: HudFacts) -> [HudLine] {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return [] }
-        let index = UInt32(StatsVerbosity.allCases.firstIndex(of: tier) ?? 2)
-        let extras = facts.extras.map { "\($0.role.rawValue)\t\($0.text)\n" }.joined()
-        return (facts.preset ?? "").withCString { preset in
-            extras.withCString { extrasPtr in
-                var f = PunktfunkHudFacts()
-                f.struct_size = UInt32(MemoryLayout<PunktfunkHudFacts>.size)
-                f.on_glass = facts.onGlass
-                f.shave_os_floor = facts.shaveOsFloor
-                f.audio_buffer_ms = facts.audioBufferMs
-                f.av_offset_ms = facts.avOffsetMs
-                f.preset = facts.preset == nil ? nil : preset
-                f.extras = extrasPtr
-                var cap = 4096
-                while true {
-                    var buf = [CChar](repeating: 0, count: cap)
-                    var needed: UInt = 0
-                    let rc = punktfunk_connection_hud_text(
-                        h, index, advanced, &f, &buf, UInt(buf.count), &needed)
-                    if rc == statusOK { return HudLine.decode(String(cString: buf)) }
-                    // A line longer than the buffer: grow once to the size the core asked for.
-                    guard Int(needed) > cap else { return [] }
-                    cap = Int(needed)
+        return withLiveHandle(or: []) { h in
+            let index = UInt32(StatsVerbosity.allCases.firstIndex(of: tier) ?? 2)
+            let extras = facts.extras.map { "\($0.role.rawValue)\t\($0.text)\n" }.joined()
+            return (facts.preset ?? "").withCString { preset in
+                extras.withCString { extrasPtr in
+                    var f = PunktfunkHudFacts()
+                    f.struct_size = UInt32(MemoryLayout<PunktfunkHudFacts>.size)
+                    f.on_glass = facts.onGlass
+                    f.shave_os_floor = facts.shaveOsFloor
+                    f.audio_buffer_ms = facts.audioBufferMs
+                    f.av_offset_ms = facts.avOffsetMs
+                    f.preset = facts.preset == nil ? nil : preset
+                    f.extras = extrasPtr
+                    var cap = 4096
+                    while true {
+                        var buf = [CChar](repeating: 0, count: cap)
+                        var needed: UInt = 0
+                        let rc = punktfunk_connection_hud_text(
+                            h, index, advanced, &f, &buf, UInt(buf.count), &needed)
+                        if rc == statusOK { return HudLine.decode(String(cString: buf)) }
+                        // A line longer than the buffer: grow once to the size the core asked for.
+                        guard Int(needed) > cap else { return [] }
+                        cap = Int(needed)
+                    }
                 }
             }
         }
@@ -1313,12 +1270,11 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// controller is armed (Automatic bitrate, non-PyroWave). Query once — constant for the session
     /// — and skip the per-frame decode measurement entirely when it's false. False after close.
     public func wantsDecodeLatency() -> Bool {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return false }
-        var out = false
-        _ = punktfunk_connection_wants_decode_latency(h, &out)
-        return out
+        return withLiveHandle(or: false) { h in
+            var out = false
+            _ = punktfunk_connection_wants_decode_latency(h, &out)
+            return out
+        }
     }
 
     /// Report the display-latch grid + circular arrival-phase statistic so the host can
@@ -1329,35 +1285,28 @@ public final class PunktfunkConnection: @unchecked Sendable {
         nextLatchHostNs: UInt64, latchPeriodNs: UInt32, uncertaintyNs: UInt32,
         arrivalLeadNs: UInt32, coherenceMilli: UInt16
     ) {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return }
-        _ = punktfunk_connection_report_phase(
-            h, nextLatchHostNs, latchPeriodNs, uncertaintyNs, arrivalLeadNs, coherenceMilli)
+        withLiveHandle(or: ()) { h in
+            _ = punktfunk_connection_report_phase(
+                h, nextLatchHostNs, latchPeriodNs, uncertaintyNs, arrivalLeadNs, coherenceMilli)
+        }
     }
 
     /// The currently active session mode (updated by accepted `requestMode` switches).
     public func currentMode() -> (width: UInt32, height: UInt32, refreshHz: UInt32) {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        var w: UInt32 = 0, h: UInt32 = 0, hz: UInt32 = 0
-        if let hd = handle, !closeRequested {
+        withLiveHandle(or: (0, 0, 0)) { hd in
+            var w: UInt32 = 0, h: UInt32 = 0, hz: UInt32 = 0
             _ = punktfunk_connection_mode(hd, &w, &h, &hz)
+            return (w, h, hz)
         }
-        return (w, h, hz)
     }
 
     /// Pull the next access unit; nil on timeout, throws `.closed` once the session ended.
     /// Call from a single pump thread.
     public func nextAU(timeoutMs: UInt32 = 100) throws -> AccessUnit? {
-        pumpLock.lock()
-        defer { pumpLock.unlock() }
-        guard let h = liveHandle() else { throw PunktfunkClientError.closed }
-
         var frame = PunktfunkFrame()
-        let rc = punktfunk_connection_next_au(h, &frame, timeoutMs)
-        switch rc {
-        case statusOK:
+        return try poll(pumpLock) { h in
+            punktfunk_connection_next_au(h, &frame, timeoutMs)
+        } decode: {
             guard let base = frame.data, frame.len > 0 else { return nil }
             let data = Data(bytes: base, count: Int(frame.len)) // copy: ptr valid only until next call
             let pulledNs = realtimeNowNs()
@@ -1370,12 +1319,6 @@ public final class PunktfunkConnection: @unchecked Sendable {
                 data: data, ptsNs: frame.pts_ns,
                 frameIndex: frame.frame_index, flags: frame.flags,
                 receivedNs: receivedNs, pulledNs: pulledNs)
-        case statusNoFrame:
-            return nil
-        case statusClosed:
-            throw PunktfunkClientError.closed
-        default:
-            throw PunktfunkClientError.status(rc)
         }
     }
 
@@ -1383,23 +1326,13 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// ended. Drain from a dedicated audio thread — packets arrive every 5 ms (the core
     /// buffers 320 ms and drops the newest when the puller lags).
     public func nextAudio(timeoutMs: UInt32 = 100) throws -> AudioPacket? {
-        audioLock.lock()
-        defer { audioLock.unlock() }
-        guard let h = liveHandle() else { throw PunktfunkClientError.closed }
-
         var pkt = PunktfunkAudioPacket()
-        let rc = punktfunk_connection_next_audio(h, &pkt, timeoutMs)
-        switch rc {
-        case statusOK:
+        return try poll(audioLock) { h in
+            punktfunk_connection_next_audio(h, &pkt, timeoutMs)
+        } decode: {
             guard let base = pkt.data, pkt.len > 0 else { return nil }
             let data = Data(bytes: base, count: Int(pkt.len)) // copy: ptr valid only until next call
             return AudioPacket(data: data, ptsNs: pkt.pts_ns, seq: pkt.seq)
-        case statusNoFrame:
-            return nil
-        case statusClosed:
-            throw PunktfunkClientError.closed
-        default:
-            throw PunktfunkClientError.status(rc)
         }
     }
 
@@ -1423,29 +1356,23 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// the session ended. Drain from a dedicated audio thread (do NOT also call `nextAudio` — they
     /// share the underlying queue). The returned `samples` are copied out, so the buffer is owned.
     public func nextAudioPcm(timeoutMs: UInt32 = 100) throws -> AudioPCM? {
-        audioLock.lock()
-        defer { audioLock.unlock() }
-        guard let h = liveHandle() else { throw PunktfunkClientError.closed }
-
         var out = PunktfunkAudioPcm()
-        let rc = punktfunk_connection_next_audio_pcm(h, &out, timeoutMs)
-        switch rc {
-        case statusOK:
-            let channels = Int(out.channels)
-            let total = Int(out.frame_count) * channels
-            guard let base = out.samples, total > 0 else { return nil }
-            // Copy: the pointer borrows connection memory only until the next PCM call.
-            let samples = Array(UnsafeBufferPointer(start: base, count: total))
-            return AudioPCM(
-                samples: samples, frameCount: Int(out.frame_count),
-                channels: channels, ptsNs: out.pts_ns, seq: out.seq)
-        case statusNoFrame:
-            return nil
-        case statusClosed:
-            throw PunktfunkClientError.closed
-        default:
-            throw PunktfunkClientError.status(rc)
+        return try poll(audioLock) { h in
+            punktfunk_connection_next_audio_pcm(h, &out, timeoutMs)
+        } decode: {
+            Self.decodePcm(out)
         }
+    }
+
+    /// Copy one in-core PCM frame out of its slot, which the next PCM call overwrites.
+    private static func decodePcm(_ out: PunktfunkAudioPcm) -> AudioPCM? {
+        let channels = Int(out.channels)
+        let total = Int(out.frame_count) * channels
+        guard let base = out.samples, total > 0 else { return nil }
+        let samples = Array(UnsafeBufferPointer(start: base, count: total))
+        return AudioPCM(
+            samples: samples, frameCount: Int(out.frame_count),
+            channels: channels, ptsNs: out.pts_ns, seq: out.seq)
     }
 
     /// Synthesize one frame of concealment from the in-core decoder's own state — no packet
@@ -1463,28 +1390,11 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// share the slot). The returned `samples` are copied out. `ptsNs`/`seq` read 0: this frame was
     /// never on the wire, so it has no capture instant and must not reach an `AvSync` observation.
     public func audioPlc() throws -> AudioPCM? {
-        audioLock.lock()
-        defer { audioLock.unlock() }
-        guard let h = liveHandle() else { throw PunktfunkClientError.closed }
-
         var out = PunktfunkAudioPcm()
-        let rc = punktfunk_connection_audio_plc(h, &out)
-        switch rc {
-        case statusOK:
-            let channels = Int(out.channels)
-            let total = Int(out.frame_count) * channels
-            guard let base = out.samples, total > 0 else { return nil }
-            // Copy: the pointer borrows connection memory only until the next PCM call.
-            let samples = Array(UnsafeBufferPointer(start: base, count: total))
-            return AudioPCM(
-                samples: samples, frameCount: Int(out.frame_count),
-                channels: channels, ptsNs: out.pts_ns, seq: out.seq)
-        case statusNoFrame:
-            return nil
-        case statusClosed:
-            throw PunktfunkClientError.closed
-        default:
-            throw PunktfunkClientError.status(rc)
+        return try poll(audioLock) { h in
+            punktfunk_connection_audio_plc(h, &out)
+        } decode: {
+            Self.decodePcm(out)
         }
     }
 
@@ -1497,21 +1407,11 @@ public final class PunktfunkConnection: @unchecked Sendable {
     public func nextRumble2(timeoutMs: UInt32 = 0) throws
         -> (pad: UInt16, low: UInt16, high: UInt16, ttlMs: UInt32)?
     {
-        feedbackLock.lock()
-        defer { feedbackLock.unlock() }
-        guard let h = liveHandle() else { throw PunktfunkClientError.closed }
-
         var pad: UInt16 = 0, low: UInt16 = 0, high: UInt16 = 0, ttl: UInt32 = .max
-        let rc = punktfunk_connection_next_rumble2(h, &pad, &low, &high, &ttl, timeoutMs)
-        switch rc {
-        case statusOK:
+        return try poll(feedbackLock) { h in
+            punktfunk_connection_next_rumble2(h, &pad, &low, &high, &ttl, timeoutMs)
+        } decode: {
             return (pad, low, high, ttl)
-        case statusNoFrame:
-            return nil
-        case statusClosed:
-            throw PunktfunkClientError.closed
-        default:
-            throw PunktfunkClientError.status(rc)
         }
     }
 
@@ -1535,23 +1435,13 @@ public final class PunktfunkConnection: @unchecked Sendable {
             backstopMs: UInt32
         )?
     {
-        feedbackLock.lock()
-        defer { feedbackLock.unlock() }
-        guard let h = liveHandle() else { throw PunktfunkClientError.closed }
-
         var pad: UInt16 = 0, low: UInt16 = 0, high: UInt16 = 0, backstop: UInt32 = 0
         var lt: UInt16 = 0, rt: UInt16 = 0
-        let rc = punktfunk_connection_next_rumble_cmd2(
-            h, &pad, &low, &high, &lt, &rt, &backstop, timeoutMs)
-        switch rc {
-        case statusOK:
+        return try poll(feedbackLock) { h in
+            punktfunk_connection_next_rumble_cmd2(
+                h, &pad, &low, &high, &lt, &rt, &backstop, timeoutMs)
+        } decode: {
             return (pad, low, high, lt, rt, backstop)
-        case statusNoFrame:
-            return nil
-        case statusClosed:
-            throw PunktfunkClientError.closed
-        default:
-            throw PunktfunkClientError.status(rc)
         }
     }
 
@@ -1586,14 +1476,10 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// DualShock 4 (lightbar only), or an as-is Steam Controller 2 (`.hidRaw`) — poll with a
     /// short timeout, never spin.
     public func nextHidOutput(timeoutMs: UInt32 = 0) throws -> HidOutputEvent? {
-        feedbackLock.lock()
-        defer { feedbackLock.unlock() }
-        guard let h = liveHandle() else { throw PunktfunkClientError.closed }
-
         var out = PunktfunkHidOutput()
-        let rc = punktfunk_connection_next_hidout(h, &out, timeoutMs)
-        switch rc {
-        case statusOK:
+        return try poll(feedbackLock) { h in
+            punktfunk_connection_next_hidout(h, &out, timeoutMs)
+        } decode: {
             switch Int32(out.kind) {
             case PUNKTFUNK_HIDOUT_LED:
                 return .led(pad: out.pad, r: out.r, g: out.g, b: out.b)
@@ -1614,12 +1500,6 @@ public final class PunktfunkConnection: @unchecked Sendable {
             default:
                 return nil // unknown kind from a newer host — skip (forward-compatible)
             }
-        case statusNoFrame:
-            return nil
-        case statusClosed:
-            throw PunktfunkClientError.closed
-        default:
-            throw PunktfunkClientError.status(rc)
         }
     }
 
@@ -1730,14 +1610,10 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// ended. Drain from the feedback thread alongside `nextRumble`/`nextHidOutput`. Nothing arrives
     /// unless `isHDR` — poll with a short timeout, never spin.
     public func nextHdrMeta(timeoutMs: UInt32 = 0) throws -> HdrMeta? {
-        feedbackLock.lock()
-        defer { feedbackLock.unlock() }
-        guard let h = liveHandle() else { throw PunktfunkClientError.closed }
-
         var out = PunktfunkHdrMeta()
-        let rc = punktfunk_connection_next_hdr_meta(h, &out, timeoutMs)
-        switch rc {
-        case statusOK:
+        return try poll(feedbackLock) { h in
+            punktfunk_connection_next_hdr_meta(h, &out, timeoutMs)
+        } decode: {
             // The fixed C `uint16_t[3]` arrays import as tuples — copy them out.
             let px = withUnsafeBytes(of: out.display_primaries_x) {
                 Array($0.bindMemory(to: UInt16.self))
@@ -1751,12 +1627,6 @@ public final class PunktfunkConnection: @unchecked Sendable {
                 maxMasteringLuminance: out.max_display_mastering_luminance,
                 minMasteringLuminance: out.min_display_mastering_luminance,
                 maxCLL: out.max_cll, maxFALL: out.max_fall)
-        case statusNoFrame:
-            return nil
-        case statusClosed:
-            throw PunktfunkClientError.closed
-        default:
-            throw PunktfunkClientError.status(rc)
         }
     }
 
@@ -1776,21 +1646,11 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// `host+network` stage then. Drain non-blockingly (`timeoutMs: 0`) from ONE stats
     /// consumer (its own core plane, safe alongside the other pullers).
     public func nextHostTiming(timeoutMs: UInt32 = 0) throws -> HostTiming? {
-        statsLock.lock()
-        defer { statsLock.unlock() }
-        guard let h = liveHandle() else { throw PunktfunkClientError.closed }
-
         var out = PunktfunkHostTiming()
-        let rc = punktfunk_connection_next_host_timing(h, &out, timeoutMs)
-        switch rc {
-        case statusOK:
+        return try poll(statsLock) { h in
+            punktfunk_connection_next_host_timing(h, &out, timeoutMs)
+        } decode: {
             return HostTiming(ptsNs: out.pts_ns, hostUs: out.host_us)
-        case statusNoFrame:
-            return nil
-        case statusClosed:
-            throw PunktfunkClientError.closed
-        default:
-            throw PunktfunkClientError.status(rc)
         }
     }
 
@@ -1799,10 +1659,9 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// refuse, so no caller re-checks after a mid-session grant edit.
     public func send(_ event: PunktfunkInputEvent) {
         var ev = event
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return }
-        _ = punktfunk_connection_send_input(h, &ev)
+        withLiveHandle(or: ()) { h in
+            _ = punktfunk_connection_send_input(h, &ev)
+        }
     }
 
     /// Send one stylus sample batch (≤ `PUNKTFUNK_PEN_BATCH_MAX`, oldest first) on the pen
@@ -1810,13 +1669,12 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// Thread-safe; silently dropped after close (input is lossy by design).
     public func sendPen(_ samples: [PunktfunkPenSample]) {
         guard !samples.isEmpty else { return }
-        abiLock.lock()
-        defer { abiLock.unlock() }
         // The pen plane is pointing input — same courtesy grant gate as `send(_:)`.
-        guard let h = handle, !closeRequested, granted(Self.grantPointer, handle: h)
-        else { return }
-        samples.withUnsafeBufferPointer { buf in
-            _ = punktfunk_connection_send_pen(h, buf.baseAddress, UInt32(buf.count))
+        withLiveHandle(or: ()) { h in
+            guard granted(Self.grantPointer, handle: h) else { return }
+            samples.withUnsafeBufferPointer { buf in
+                _ = punktfunk_connection_send_pen(h, buf.baseAddress, UInt32(buf.count))
+            }
         }
     }
 
@@ -1825,10 +1683,9 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// keep-alive linger for a reconnect. Call only from an explicit "Disconnect" action — NOT from a
     /// network drop / host-ended / app-background (those keep the linger). Idempotent, safe pre-close.
     public func disconnectQuit() {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return }
-        punktfunk_connection_disconnect_quit(h)
+        withLiveHandle(or: ()) { h in
+            punktfunk_connection_disconnect_quit(h)
+        }
     }
 
     /// Close the connection and free the handle. Safe from any thread, idempotent; waits
@@ -1864,15 +1721,14 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// caller's own counters (host uses them only for diagnostics); empty `opus` is a
     /// DTX silence frame.
     public func sendMic(_ opus: Data, seq: UInt32, ptsNs: UInt64) {
-        abiLock.lock()
-        defer { abiLock.unlock() }
         // Mic injection needs its grant — same courtesy gate as `send(_:)` (the host drops
         // the plane regardless; the UI additionally hides the mic controls via `canUseMic`).
-        guard let h = handle, !closeRequested, granted(Self.grantMic, handle: h)
-        else { return }
-        opus.withUnsafeBytes { p in
-            _ = punktfunk_connection_send_mic(
-                h, p.bindMemory(to: UInt8.self).baseAddress, UInt(opus.count), seq, ptsNs)
+        withLiveHandle(or: ()) { h in
+            guard granted(Self.grantMic, handle: h) else { return }
+            opus.withUnsafeBytes { p in
+                _ = punktfunk_connection_send_mic(
+                    h, p.bindMemory(to: UInt8.self).baseAddress, UInt(opus.count), seq, ptsNs)
+            }
         }
     }
 
@@ -1881,19 +1737,18 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// Non-blocking enqueue (same discipline as `send`); pointless on non-DualSense
     /// sessions — the host ignores it there.
     public func sendTouchpad(pad: UInt8 = 0, finger: UInt8, active: Bool, x: UInt16, y: UInt16) {
-        abiLock.lock()
-        defer { abiLock.unlock() }
         // Rich pad input rides the GAMEPAD grant (it IS controller input) — same gate as `send`.
-        guard let h = handle, !closeRequested, granted(Self.grantGamepad, handle: h)
-        else { return }
-        var rich = PunktfunkRichInput()
-        rich.kind = UInt8(PUNKTFUNK_RICH_TOUCHPAD)
-        rich.pad = pad
-        rich.finger = finger
-        rich.active = active ? 1 : 0
-        rich.x = x
-        rich.y = y
-        _ = punktfunk_connection_send_rich_input(h, &rich)
+        withLiveHandle(or: ()) { h in
+            guard granted(Self.grantGamepad, handle: h) else { return }
+            var rich = PunktfunkRichInput()
+            rich.kind = UInt8(PUNKTFUNK_RICH_TOUCHPAD)
+            rich.pad = pad
+            rich.finger = finger
+            rich.active = active ? 1 : 0
+            rich.x = x
+            rich.y = y
+            _ = punktfunk_connection_send_rich_input(h, &rich)
+        }
     }
 
     /// Send one DualSense motion sample to the host's virtual pad (rich-input plane). The
@@ -1904,17 +1759,16 @@ public final class PunktfunkConnection: @unchecked Sendable {
         pad: UInt8 = 0,
         gyro: (Int16, Int16, Int16), accel: (Int16, Int16, Int16)
     ) {
-        abiLock.lock()
-        defer { abiLock.unlock() }
         // Motion is controller input too — same GAMEPAD gate as `sendTouchpad`.
-        guard let h = handle, !closeRequested, granted(Self.grantGamepad, handle: h)
-        else { return }
-        var rich = PunktfunkRichInput()
-        rich.kind = UInt8(PUNKTFUNK_RICH_MOTION)
-        rich.pad = pad
-        rich.gyro = gyro
-        rich.accel = accel
-        _ = punktfunk_connection_send_rich_input(h, &rich)
+        withLiveHandle(or: ()) { h in
+            guard granted(Self.grantGamepad, handle: h) else { return }
+            var rich = PunktfunkRichInput()
+            rich.kind = UInt8(PUNKTFUNK_RICH_MOTION)
+            rich.pad = pad
+            rich.gyro = gyro
+            rich.accel = accel
+            _ = punktfunk_connection_send_rich_input(h, &rich)
+        }
     }
 
     /// Send one raw HID input report from a client-captured controller — the as-is Steam
@@ -1928,13 +1782,12 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// after close, and gated on the GAMEPAD grant like every other controller send.
     public func sendHidReport(pad: UInt8, _ data: UnsafeRawBufferPointer) {
         guard let base = data.baseAddress, !data.isEmpty else { return }
-        abiLock.lock()
-        defer { abiLock.unlock() }
         // Raw pad input rides the GAMEPAD grant (it IS controller input) — same gate as `send`.
-        guard let h = handle, !closeRequested, granted(Self.grantGamepad, handle: h)
-        else { return }
-        _ = punktfunk_connection_send_hid_report(
-            h, pad, base.assumingMemoryBound(to: UInt8.self), UInt(data.count))
+        withLiveHandle(or: ()) { h in
+            guard granted(Self.grantGamepad, handle: h) else { return }
+            _ = punktfunk_connection_send_hid_report(
+                h, pad, base.assumingMemoryBound(to: UInt8.self), UInt(data.count))
+        }
     }
 
     // MARK: - Shared clipboard (design/clipboard-and-file-transfer.md §5)
@@ -2044,20 +1897,11 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// ended. Drain from a single dedicated thread (`ClipboardSync`) — the event's borrowed
     /// payload is copied into the returned `ClipEvent` before the next poll can overwrite it.
     public func nextClipboard(timeoutMs: UInt32) throws -> ClipEvent? {
-        clipboardLock.lock()
-        defer { clipboardLock.unlock() }
-        guard let h = liveHandle() else { throw PunktfunkClientError.closed }
         var ev = PunktfunkClipEvent()
-        let rc = punktfunk_connection_next_clipboard(h, &ev, timeoutMs)
-        switch rc {
-        case statusOK:
+        return try poll(clipboardLock) { h in
+            punktfunk_connection_next_clipboard(h, &ev, timeoutMs)
+        } decode: {
             return Self.decodeClipEvent(ev)
-        case statusNoFrame:
-            return nil
-        case statusClosed:
-            throw PunktfunkClientError.closed
-        default:
-            throw PunktfunkClientError.status(rc)
         }
     }
 
@@ -2131,12 +1975,11 @@ public final class PunktfunkConnection: @unchecked Sendable {
         // Held ACROSS the call, not just for the snapshot: these two read from the main actor
         // with no plane lock of their own, so a `liveHandle()` snapshot could be freed by a
         // concurrent close between the check and the call.
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return .none }
-        var out: UInt8 = 0
-        guard punktfunk_connection_end_reason(h, &out) == statusOK else { return .none }
-        return SessionEndReason(rawValue: out) ?? .none
+        return withLiveHandle(or: .none) { h in
+            var out: UInt8 = 0
+            guard punktfunk_connection_end_reason(h, &out) == statusOK else { return .none }
+            return SessionEndReason(rawValue: out) ?? .none
+        }
     }
 
     /// Shorthand for the single most actionable reason: the host's launched game exited.
@@ -2149,13 +1992,12 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// teardown); nil for every ordinary end and for connect-time rejections (those surface
     /// from the connect itself as `.rejected`).
     public var endRejection: HostRejection? {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return nil }
-        var status: Int32 = 0
-        guard punktfunk_connection_end_reject(h, &status) == statusOK, status != 0
-        else { return nil }
-        return HostRejection(status: status)
+        return withLiveHandle(or: nil) { h in
+            var status: Int32 = 0
+            guard punktfunk_connection_end_reject(h, &status) == statusOK, status != 0
+            else { return nil }
+            return HostRejection(status: status)
+        }
     }
 
     /// What the host itself said about that close, when it sent a sentence — it knows
@@ -2164,30 +2006,28 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// about: show `HostRejection.userMessage` then. Same read discipline as
     /// `endRejection` (ask after the end, before teardown).
     public var endRejectionMessage: String? {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return nil }
-        // The wire caps the sentence at 256 bytes; this is that plus room for the NUL.
-        var buf = [CChar](repeating: 0, count: 512)
-        guard punktfunk_connection_end_reject_said(h, &buf, UInt(buf.count)) == statusOK
-        else { return nil }
-        let said = String(cString: buf)
-        return said.isEmpty ? nil : said
+        return withLiveHandle(or: nil) { h in
+            // The wire caps the sentence at 256 bytes; this is that plus room for the NUL.
+            var buf = [CChar](repeating: 0, count: 512)
+            guard punktfunk_connection_end_reject_said(h, &buf, UInt(buf.count)) == statusOK
+            else { return nil }
+            let said = String(cString: buf)
+            return said.isEmpty ? nil : said
+        }
     }
 
     /// The host's sentence when this session's launch did not give the player their game:
     /// refused, died on the spot, or picked up without the host seeing it. `nil` otherwise,
     /// and on a host too old to say. The latest verdict wins, so poll it.
     public var launchNotice: String? {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return nil }
-        // The wire caps the sentence at 200 bytes; this is that plus room for the NUL.
-        var buf = [CChar](repeating: 0, count: 256)
-        guard punktfunk_connection_launch_notice(h, &buf, UInt(buf.count)) == statusOK
-        else { return nil }
-        let notice = String(cString: buf)
-        return notice.isEmpty ? nil : notice
+        return withLiveHandle(or: nil) { h in
+            // The wire caps the sentence at 200 bytes; this is that plus room for the NUL.
+            var buf = [CChar](repeating: 0, count: 256)
+            guard punktfunk_connection_launch_notice(h, &buf, UInt(buf.count)) == statusOK
+            else { return nil }
+            let notice = String(cString: buf)
+            return notice.isEmpty ? nil : notice
+        }
     }
 
     deinit { close() }
@@ -2197,5 +2037,35 @@ public final class PunktfunkConnection: @unchecked Sendable {
         abiLock.lock()
         defer { abiLock.unlock() }
         return closeRequested ? nil : handle
+    }
+
+    /// Run `body` on the live handle with `abiLock` held across it, so close() can't free the
+    /// handle mid-call. `fallback` once close is pending.
+    private func withLiveHandle<T>(or fallback: T, _ body: (OpaquePointer) -> T) -> T {
+        abiLock.lock()
+        defer { abiLock.unlock() }
+        guard let h = handle, !closeRequested else { return fallback }
+        return body(h)
+    }
+
+    /// One plane poll with its plane `lock` held across the C call: OK decodes the out-param,
+    /// no frame is nil, and a closed session throws.
+    private func poll<T>(
+        _ lock: NSLock, _ call: (OpaquePointer) -> Int32, decode: () -> T?
+    ) throws -> T? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let h = liveHandle() else { throw PunktfunkClientError.closed }
+        let rc = call(h)
+        switch rc {
+        case statusOK:
+            return decode()
+        case statusNoFrame:
+            return nil
+        case statusClosed:
+            throw PunktfunkClientError.closed
+        default:
+            throw PunktfunkClientError.status(rc)
+        }
     }
 }
