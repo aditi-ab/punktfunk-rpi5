@@ -12,8 +12,8 @@
 //! takes `&self`, so every portal thread can park on it concurrently. A portal
 //! session made here outlives the thread that made it: close it explicitly.
 //!
-//! Every handshake also shares the cursor-mode negotiation
-//! ([`negotiate_cursor_mode`]).
+//! Every ScreenCast handshake also shares [`HANDSHAKE_BUDGET`] and the
+//! cursor-mode negotiation ([`negotiate_cursor_mode`]).
 
 use ashpd::desktop::screencast::{CursorMode, Screencast};
 use ashpd::enumflags2::BitFlags;
@@ -21,6 +21,11 @@ use pf_frame::cursor_mode::{parse_pin, pick, Mode, Pin};
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::runtime::Runtime;
+
+/// Ceiling on one ScreenCast handshake, connect through `open_pipe_wire_remote`.
+/// Under the callers' 20 s setup wait, so the thread that owns a stuck portal
+/// reports it and exits. A hung request poisons every later one from this process.
+pub const HANDSHAKE_BUDGET: Duration = Duration::from_secs(15);
 
 /// `Result` so a failed build fails the handshake with a reason instead of aborting the process.
 static PORTAL_RT: OnceLock<std::io::Result<Runtime>> = OnceLock::new();

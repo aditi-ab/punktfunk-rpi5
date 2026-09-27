@@ -19,6 +19,7 @@
 
 use super::{DisplayOwnership, Mode, SessionCastParts, VirtualDisplay, VirtualOutput};
 use anyhow::{anyhow, bail, Context, Result};
+use pf_capture::portal_rt::HANDSHAKE_BUDGET;
 use std::collections::HashMap;
 use std::io::BufRead;
 use std::os::fd::OwnedFd;
@@ -1388,12 +1389,6 @@ impl Drop for OutputGuard {
         }
     }
 }
-
-/// Ceiling on the ScreenCast handshake (`create_session` → `select_sources` →
-/// `start` → `open_pipe_wire_remote`). Under [`select_and_cast`]'s 20 s wait so
-/// a stuck portal is reported by the thread that owns it — and so that thread
-/// exits.
-const HANDSHAKE_BUDGET: Duration = Duration::from_secs(15);
 
 /// Budget for one `hyprctl` call ([`crate::proc`]). `hyprctl` waits on the
 /// instance socket, so against a wedged compositor it never returns. These

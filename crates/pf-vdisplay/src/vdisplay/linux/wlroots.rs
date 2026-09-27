@@ -19,6 +19,7 @@
 
 use super::{DisplayOwnership, Mode, VirtualDisplay, VirtualOutput};
 use anyhow::{anyhow, bail, Context, Result};
+use pf_capture::portal_rt::HANDSHAKE_BUDGET;
 use std::os::fd::OwnedFd;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -318,9 +319,6 @@ struct Keepalive {
 
 /// 3 s to wait for portal Close before unplugging under a live session.
 const CAST_CLOSE_BUDGET: Duration = Duration::from_secs(3);
-
-/// Whole ScreenCast handshake; sits under the caller's 20 s wait.
-const HANDSHAKE_BUDGET: Duration = Duration::from_secs(15);
 
 /// Signals the portal thread, then waits until it has closed the ScreenCast session
 /// so the caller may unplug the output.

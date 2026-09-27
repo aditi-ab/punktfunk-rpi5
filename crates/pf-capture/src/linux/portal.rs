@@ -1,5 +1,5 @@
-//! xdg ScreenCast / RemoteDesktop control plane: ashpd handshake on the shared
-//! portal runtime, and GNOME's BT.2100 colour-mode probe.
+//! xdg ScreenCast / RemoteDesktop control plane: bounded ashpd handshake on the
+//! shared portal runtime, and GNOME's BT.2100 colour-mode probe.
 //!
 //! Nothing here is per-frame. The handshake runs once; the thread then parks until
 //! `PortalSession`'s `Drop` (parent module) fires `quit_rx`, closes the portal
@@ -12,6 +12,7 @@
 //! is one session-bus round-trip; call from control-plane threads only.
 
 use anyhow::{anyhow, Context, Result};
+use std::future::Future;
 use std::os::fd::OwnedFd;
 
 /// Mutter advertises 10-bit PQ only while the mirrored head is BT.2100.
@@ -121,9 +122,7 @@ const CAST_CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3)
 
 /// Close a portal session within [`CAST_CLOSE_BUDGET`]. A failure is logged, not
 /// fatal: the capturer is already going away.
-async fn close_session(
-    close: impl std::future::Future<Output = std::result::Result<(), ashpd::Error>>,
-) {
+async fn close_session(close: impl Future<Output = std::result::Result<(), ashpd::Error>>) {
     match tokio::time::timeout(CAST_CLOSE_BUDGET, close).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => tracing::warn!(
@@ -137,8 +136,51 @@ async fn close_session(
     }
 }
 
-/// Handshake, park on `quit_rx`, then `Session.Close`. ashpd `Session` has no
-/// `Drop` and the connection is process-global, so nothing else ends the cast.
+/// One handshake step under the shared deadline
+/// ([`crate::portal_rt::HANDSHAKE_BUDGET`]). An await the portal never answers
+/// would park this thread on the process-global connection for good.
+async fn within<T, E>(
+    deadline: tokio::time::Instant,
+    step: impl Future<Output = std::result::Result<T, E>>,
+) -> Result<T>
+where
+    anyhow::Error: From<E>,
+{
+    match tokio::time::timeout_at(deadline, step).await {
+        Ok(result) => Ok(result?),
+        Err(_) => Err(no_answer()),
+    }
+}
+
+fn no_answer() -> anyhow::Error {
+    anyhow!(
+        "the portal did not answer within {}s",
+        crate::portal_rt::HANDSHAKE_BUDGET.as_secs()
+    )
+}
+
+/// The steps after `create_session`, under the deadline. On timeout the
+/// half-built session is closed: nothing else ends it.
+async fn finish_or_close<T, C>(
+    deadline: tokio::time::Instant,
+    steps: impl Future<Output = Result<T>>,
+    close: impl FnOnce() -> C,
+) -> Result<T>
+where
+    C: Future<Output = std::result::Result<(), ashpd::Error>>,
+{
+    match tokio::time::timeout_at(deadline, steps).await {
+        Ok(result) => result,
+        Err(_) => {
+            close_session(close()).await;
+            Err(no_answer())
+        }
+    }
+}
+
+/// Handshake under [`crate::portal_rt::HANDSHAKE_BUDGET`], park on `quit_rx`,
+/// then `Session.Close`. ashpd `Session` has no `Drop` and the connection is
+/// process-global, so nothing else ends the cast.
 pub(super) fn portal_thread(
     setup_tx: std::sync::mpsc::Sender<Result<(OwnedFd, u32), String>>,
     quit_rx: tokio::sync::oneshot::Receiver<()>,
@@ -162,47 +204,53 @@ pub(super) fn portal_thread(
 
     rt.block_on(async move {
         let result: Result<()> = async {
-            let proxy = Screencast::new()
+            let deadline = tokio::time::Instant::now() + crate::portal_rt::HANDSHAKE_BUDGET;
+            let proxy = within(deadline, Screencast::new())
                 .await
                 .context("connect ScreenCast portal")?;
-            let session = proxy
-                .create_session(Default::default())
+            let session = within(deadline, proxy.create_session(Default::default()))
                 .await
                 .context("create_session")?;
-            let cursor_mode =
-                crate::portal_rt::negotiate_cursor_mode(&proxy, want_metadata_cursor, "screencast")
-                    .await;
-            proxy
-                .select_sources(
-                    &session,
-                    SelectSourcesOptions::default()
-                        .set_cursor_mode(crate::portal_rt::to_ashpd(cursor_mode))
-                        // wlroots advertises MONITOR only (`AvailableSourceTypes=1`).
-                        // Asking for an unsupported type invalidates the session.
-                        .set_sources(BitFlags::from_flag(SourceType::Monitor))
-                        .set_multiple(false)
-                        .set_persist_mode(PersistMode::DoNot),
+            let steps = async {
+                let cursor_mode = crate::portal_rt::negotiate_cursor_mode(
+                    &proxy,
+                    want_metadata_cursor,
+                    "screencast",
                 )
-                .await
-                .context("select_sources")?
-                .response()
-                .context("select_sources rejected (unsupported source type / cursor mode?)")?;
-            let streams = proxy
-                .start(&session, None, Default::default())
-                .await
-                .context("start cast")?
-                .response()
-                .context("start response (chooser cancelled? portal misconfigured?)")?;
-            let stream = streams
-                .streams()
-                .first()
-                .context("portal returned no streams")?
-                .clone();
-            let node_id = stream.pipe_wire_node_id();
-            let fd = proxy
-                .open_pipe_wire_remote(&session, Default::default())
-                .await
-                .context("open_pipe_wire_remote")?;
+                .await;
+                proxy
+                    .select_sources(
+                        &session,
+                        SelectSourcesOptions::default()
+                            .set_cursor_mode(crate::portal_rt::to_ashpd(cursor_mode))
+                            // wlroots advertises MONITOR only (`AvailableSourceTypes=1`).
+                            // Asking for an unsupported type invalidates the session.
+                            .set_sources(BitFlags::from_flag(SourceType::Monitor))
+                            .set_multiple(false)
+                            .set_persist_mode(PersistMode::DoNot),
+                    )
+                    .await
+                    .context("select_sources")?
+                    .response()
+                    .context("select_sources rejected (unsupported source type / cursor mode?)")?;
+                let streams = proxy
+                    .start(&session, None, Default::default())
+                    .await
+                    .context("start cast")?
+                    .response()
+                    .context("start response (chooser cancelled? portal misconfigured?)")?;
+                let stream = streams
+                    .streams()
+                    .first()
+                    .context("portal returned no streams")?
+                    .clone();
+                let fd = proxy
+                    .open_pipe_wire_remote(&session, Default::default())
+                    .await
+                    .context("open_pipe_wire_remote")?;
+                Ok::<_, anyhow::Error>((fd, stream.pipe_wire_node_id()))
+            };
+            let (fd, node_id) = finish_or_close(deadline, steps, || session.close()).await?;
 
             setup_tx
                 .send(Ok((fd, node_id)))
@@ -226,7 +274,7 @@ pub(super) fn portal_thread(
 /// RemoteDesktop+ScreenCast on one session (KWin/GNOME). Sources are selected on
 /// a RemoteDesktop session so a single `start` grant — the `kde-authorized`
 /// headless bypass, same as libei — covers capture. ScreenCast has no such
-/// bypass; a standalone path would show a dialog. Same fd + node id, same
+/// bypass; a standalone path would show a dialog. Same budget, fd + node id,
 /// `quit_rx` park and Close as [`portal_thread`].
 pub(super) fn portal_thread_remote_desktop(
     setup_tx: std::sync::mpsc::Sender<Result<(OwnedFd, u32), String>>,
@@ -250,65 +298,68 @@ pub(super) fn portal_thread_remote_desktop(
 
     rt.block_on(async move {
         let result: Result<()> = async {
-            let remote = RemoteDesktop::new()
+            let deadline = tokio::time::Instant::now() + crate::portal_rt::HANDSHAKE_BUDGET;
+            let remote = within(deadline, RemoteDesktop::new())
                 .await
                 .context("connect RemoteDesktop portal")?;
-            let screencast = Screencast::new()
+            let screencast = within(deadline, Screencast::new())
                 .await
                 .context("connect ScreenCast portal")?;
-            let session = remote
-                .create_session(Default::default())
+            let session = within(deadline, remote.create_session(Default::default()))
                 .await
                 .context("create RemoteDesktop session")?;
-            // Device selection is required even though this session never
-            // `connect_to_eis` (inject has its own). Without it, `start` is not
-            // the RemoteDesktop grant `kde-authorized` covers.
-            remote
-                .select_devices(
-                    &session,
-                    SelectDevicesOptions::default()
-                        .set_devices(DeviceType::Keyboard | DeviceType::Pointer)
-                        .set_persist_mode(PersistMode::DoNot),
+            let steps = async {
+                // Device selection is required even though this session never
+                // `connect_to_eis` (inject has its own). Without it, `start` is not
+                // the RemoteDesktop grant `kde-authorized` covers.
+                remote
+                    .select_devices(
+                        &session,
+                        SelectDevicesOptions::default()
+                            .set_devices(DeviceType::Keyboard | DeviceType::Pointer)
+                            .set_persist_mode(PersistMode::DoNot),
+                    )
+                    .await
+                    .context("select_devices")?
+                    .response()
+                    .context("select_devices rejected")?;
+                let cursor_mode = crate::portal_rt::negotiate_cursor_mode(
+                    &screencast,
+                    want_metadata_cursor,
+                    "remote-desktop",
                 )
-                .await
-                .context("select_devices")?
-                .response()
-                .context("select_devices rejected")?;
-            let cursor_mode = crate::portal_rt::negotiate_cursor_mode(
-                &screencast,
-                want_metadata_cursor,
-                "remote-desktop",
-            )
-            .await;
-            screencast
-                .select_sources(
-                    &session,
-                    SelectSourcesOptions::default()
-                        .set_cursor_mode(crate::portal_rt::to_ashpd(cursor_mode))
-                        .set_sources(BitFlags::from_flag(SourceType::Monitor))
-                        .set_multiple(false)
-                        .set_persist_mode(PersistMode::DoNot),
-                )
-                .await
-                .context("select_sources")?
-                .response()
-                .context("select_sources rejected (unsupported source type?)")?;
-            let streams = remote
-                .start(&session, None, Default::default())
-                .await
-                .context("start RemoteDesktop+ScreenCast")?
-                .response()
-                .context("start response (grant not pre-authorized / headless dialog?)")?;
-            let stream = streams
-                .streams()
-                .first()
-                .context("portal returned no screencast streams")?
-                .clone();
-            let node_id = stream.pipe_wire_node_id();
-            let fd = screencast
-                .open_pipe_wire_remote(&session, Default::default())
-                .await
-                .context("open_pipe_wire_remote")?;
+                .await;
+                screencast
+                    .select_sources(
+                        &session,
+                        SelectSourcesOptions::default()
+                            .set_cursor_mode(crate::portal_rt::to_ashpd(cursor_mode))
+                            .set_sources(BitFlags::from_flag(SourceType::Monitor))
+                            .set_multiple(false)
+                            .set_persist_mode(PersistMode::DoNot),
+                    )
+                    .await
+                    .context("select_sources")?
+                    .response()
+                    .context("select_sources rejected (unsupported source type?)")?;
+                let streams = remote
+                    .start(&session, None, Default::default())
+                    .await
+                    .context("start RemoteDesktop+ScreenCast")?
+                    .response()
+                    .context("start response (grant not pre-authorized / headless dialog?)")?;
+                let stream = streams
+                    .streams()
+                    .first()
+                    .context("portal returned no screencast streams")?
+                    .clone();
+                let fd = screencast
+                    .open_pipe_wire_remote(&session, Default::default())
+                    .await
+                    .context("open_pipe_wire_remote")?;
+                Ok::<_, anyhow::Error>((fd, stream.pipe_wire_node_id()))
+            };
+            let (fd, node_id) = finish_or_close(deadline, steps, || session.close()).await?;
 
             setup_tx
                 .send(Ok((fd, node_id)))
@@ -353,5 +404,52 @@ mod hdr_offer_tests {
     #[test]
     fn a_pin_naming_no_live_head_reports_sdr() {
         assert!(!hdr_offer_for(&[("DP-1", true)], Some("DP-9")));
+    }
+}
+
+#[cfg(test)]
+mod handshake_bound_tests {
+    use super::finish_or_close;
+    use std::future::Future;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    fn run<F: Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("build test runtime")
+            .block_on(f)
+    }
+
+    /// A portal that never answers: the setup fails and the half-built session is closed.
+    #[test]
+    fn a_hung_step_closes_the_half_built_session() {
+        let closed = AtomicBool::new(false);
+        let result = run(finish_or_close(
+            tokio::time::Instant::now(),
+            std::future::pending::<anyhow::Result<()>>(),
+            || async {
+                closed.store(true, Ordering::Relaxed);
+                Ok::<(), ashpd::Error>(())
+            },
+        ));
+        assert!(result.is_err());
+        assert!(closed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_finished_handshake_keeps_its_session() {
+        let closed = AtomicBool::new(false);
+        let result = run(finish_or_close(
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            async { Ok(7) },
+            || async {
+                closed.store(true, Ordering::Relaxed);
+                Ok::<(), ashpd::Error>(())
+            },
+        ));
+        assert_eq!(result.unwrap(), 7);
+        assert!(!closed.load(Ordering::Relaxed));
     }
 }
