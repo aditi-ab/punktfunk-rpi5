@@ -139,9 +139,9 @@ public enum DefaultsKey {
     public static let smoothBuffer = "punktfunk.smoothBuffer"
     /// macOS: V-Sync the stream's presents — each decoded frame flips on the next display vsync
     /// (evenly paced, no tearing under direct scanout) instead of as soon as the GPU finishes
-    /// (lowest latency — the default, OFF). Adaptive-refresh Macs present sparse input immediately
-    /// and dense input once per link target. PUNKTFUNK_PRESENT_MODE=immediate|vsync|slot overrides
-    /// that path for A/B. Resolved once per session; see Stage2Pipeline's header.
+    /// (lowest latency — the default, OFF, on fixed and ProMotion panels alike).
+    /// PUNKTFUNK_PRESENT_MODE=immediate|vsync|slot overrides that path for A/B. Resolved once per
+    /// session; see Stage2Pipeline's header.
     public static let vsync = "punktfunk.vsync"
     /// macOS: present WINDOWED sessions in lockstep with the system compositor (the DCP
     /// "mismatched swapID's" kernel-panic mitigation — see SessionPresenter.windowedPresentMode
@@ -271,6 +271,10 @@ public enum DefaultsKey {
     public static let libraryShelf = "punktfunk.libraryShelf"
     /// macOS: take the window fullscreen while streaming and restore it on the host list. On by default.
     public static let fullscreenWhileStreaming = "punktfunk.fullscreenWhileStreaming"
+    /// macOS: open the window fullscreen and keep it there on the host list — the cross-client
+    /// `fullscreen_always`. Outranks `fullscreenWhileStreaming`. A device preference, never part
+    /// of a stream preset.
+    public static let fullscreenAlways = "punktfunk.fullscreenAlways"
     /// LEGACY (pre-tiered overlay): the old boolean stats-overlay toggle. Kept ONLY as the
     /// migration fallback `StatsVerbosity.current` reads when `statsVerbosity` was never
     /// written (absent-or-true → .normal, explicit false → .off). Never written anymore.

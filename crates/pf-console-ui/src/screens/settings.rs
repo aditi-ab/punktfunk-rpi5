@@ -80,6 +80,9 @@ pub enum RowId {
     /// `trust::Settings::advanced_stats`: which vocabulary the overlay speaks. Device-wide.
     AdvancedStats,
     Fullscreen,
+    /// The Mac's three-way picker over `fullscreen_on_stream` and [`FULLSCREEN_ALWAYS_KEY`]. The
+    /// tab shows it in place of [`RowId::Fullscreen`]; a preset still edits that toggle.
+    FullscreenMode,
     AutoWake,
     /// `trust::Settings::follow_os_theme`. Shown only while the embedder publishes
     /// a theme; [`RowId::Palette`] hides while it is on.
@@ -169,6 +172,20 @@ const GAMEPAD_UI_MODE_KEY: &str = "gamepad_ui_mode";
 /// Stored [`GAMEPAD_UI_MODE_KEY`] values (`GamepadUi.kt`).
 const GAMEPAD_UI_MODES: [(&str, &str); 2] =
     [("connected", "With a controller"), ("always", "Always")];
+
+/// Apple's `fullscreenAlways`: the Mac window opens fullscreen and stays so between streams.
+/// Device-only, so no preset carries it.
+const FULLSCREEN_ALWAYS_KEY: &str = "fullscreen_always";
+const FULLSCREEN_MODES: [&str; 3] = ["Off", "While streaming", "Always"];
+
+/// Index into [`FULLSCREEN_MODES`].
+fn fullscreen_mode(s: &pf_client_core::trust::Settings) -> usize {
+    if extra_bool(s, FULLSCREEN_ALWAYS_KEY, false) {
+        2
+    } else {
+        usize::from(s.fullscreen_on_stream)
+    }
+}
 
 /// The background-session pair, the names Android's and Apple's stores share.
 const BACKGROUND_KEEP_ALIVE_KEY: &str = "background_keep_alive";
@@ -431,6 +448,7 @@ const TABS: [(&str, &[RowId]); 8] = [
             RowId::StatsPosition,
             RowId::AdvancedStats,
             RowId::ReduceMotion,
+            RowId::FullscreenMode,
             RowId::Fullscreen,
             RowId::AutoWake,
         ],
@@ -734,6 +752,8 @@ impl SettingsScreen {
                 .iter()
                 .copied()
                 .filter(|id| row_on(*id, ctx.device.platform) && row_applies(*id, ctx))
+                // The Mac's picker stands in for the toggle, which presets keep.
+                .filter(|id| !(*id == RowId::Fullscreen && is_mac(ctx)))
                 .collect();
         }
         if self.presets.is_empty() {
@@ -1270,6 +1290,7 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
         RowId::Pad => &[Desktop],
         // That client's own audio plane and its remote's missing second button.
         RowId::AudioRoute | RowId::CursorGestures => &[WebOS],
+        RowId::FullscreenMode => &[Apple],
         // Main10 at BT.709 asks nothing of the panel, and MediaCodec and NDL both decode it from
         // the SPS.
         RowId::TenBitSdr => &[Desktop, Android, WebOS, Apple],
@@ -1310,10 +1331,11 @@ pub fn row_applies(id: RowId, ctx: &Ctx) -> bool {
             ctx.device.screen.is_some()
         }
         // A Mac window has no background session; Android and the other Apple devices do.
-        RowId::BackgroundKeepAlive => backgroundable(ctx),
+        RowId::BackgroundKeepAlive => !is_mac(ctx),
         RowId::BackgroundTimeout => {
-            backgroundable(ctx) && RowId::BackgroundKeepAlive.extra_on(ctx.settings)
+            !is_mac(ctx) && RowId::BackgroundKeepAlive.extra_on(ctx.settings)
         }
+        RowId::FullscreenMode => is_mac(ctx),
         RowId::StatsPosition => {
             ctx.settings.stats_verbosity() != pf_client_core::trust::StatsVerbosity::Off
         }
@@ -1327,10 +1349,11 @@ pub fn row_applies(id: RowId, ctx: &Ctx) -> bool {
     }
 }
 
-fn backgroundable(ctx: &Ctx) -> bool {
-    ctx.device.platform != crate::platform::Platform::Apple
-        || ctx.device.screen.is_some()
-        || ctx.device.tv
+/// Apple with no handheld screen and no TV.
+fn is_mac(ctx: &Ctx) -> bool {
+    ctx.device.platform == crate::platform::Platform::Apple
+        && ctx.device.screen.is_none()
+        && !ctx.device.tv
 }
 
 /// Where a launch will actually land, named. Not the stored value: with no default host
@@ -1379,7 +1402,9 @@ pub fn row_spec(
 /// The row's Lucide mark.
 fn row_icon(id: RowId) -> &'static str {
     match id {
-        RowId::Aspect | RowId::RenderScale | RowId::Fullscreen => "maximize",
+        RowId::Aspect | RowId::RenderScale | RowId::Fullscreen | RowId::FullscreenMode => {
+            "maximize"
+        }
         RowId::Resolution | RowId::ReduceUiResolution => "monitor",
         RowId::Refresh | RowId::Vsync | RowId::AllowVrr => "refresh-cw",
         RowId::Bitrate | RowId::PadHaptics | RowId::PhoneRumble => "activity",
@@ -1818,6 +1843,11 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
             "Start streams fullscreen",
             on_off(s.fullscreen_on_stream).into(),
         ),
+        RowId::FullscreenMode => (
+            None,
+            "Fullscreen",
+            FULLSCREEN_MODES[fullscreen_mode(s)].into(),
+        ),
         RowId::AutoWake => (None, "Wake hosts automatically", on_off(s.auto_wake).into()),
         RowId::LowLatency => (Some("Decoding"), "Low-latency mode", extra()),
         RowId::PhoneRumble => (Some("This device"), "Rumble on this phone", extra()),
@@ -2073,6 +2103,11 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
              p50/p95 and every stage between. Every number: docs.punktfunk.unom.io/docs/stats"
         }
         RowId::Fullscreen => "Streams open fullscreen instead of windowed.",
+        RowId::FullscreenMode => match fullscreen_mode(ctx.settings) {
+            0 => "Streams stay in a window.",
+            1 => "Streams go fullscreen. The host list returns to a window.",
+            _ => "Punktfunk opens fullscreen and stays fullscreen between streams.",
+        },
         RowId::StatsPosition => "Which corner the statistics overlay sits in.",
         RowId::HostSort => {
             "The order of the host row: as you added them, by name, or most \
@@ -2391,6 +2426,12 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             step_option(at, all.len(), delta, wrap).map(|i| s.start_in = all[i].as_str().into())
         }
         RowId::Fullscreen => toggle(&mut s.fullscreen_on_stream, delta, wrap),
+        RowId::FullscreenMode => step_option(Some(fullscreen_mode(s)), 3, delta, wrap).map(|i| {
+            set_extra_bool(s, FULLSCREEN_ALWAYS_KEY, i == 2);
+            if i < 2 {
+                s.fullscreen_on_stream = i == 1;
+            }
+        }),
         RowId::AutoWake => toggle(&mut s.auto_wake, delta, wrap),
         RowId::LowLatency
         | RowId::PhoneRumble

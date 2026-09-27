@@ -311,40 +311,19 @@ final class PresentPacingTests: XCTestCase {
             PresenterChoice.explicit(setting: nil, env: "stage3", allowStage1: true), .stage3)
     }
 
-    // MARK: - Session pacing (the macOS PyroWave swapID-panic mitigation)
+    // MARK: - Session pacing
 
-    /// macOS PyroWave sessions under the DEFAULT stage-2 choice must get glass pacing (the
-    /// one-in-flight gate is the "mismatched swapID's" kernel-panic mitigation); an EXPLICIT
-    /// stage-2 pick must stay a faithful arrival-pacing A/B. Elsewhere the default is unchanged.
-    func testPacingDefaultsPyroWaveToGlassOnMacOS() {
-        #if os(macOS)
-        XCTAssertEqual(
-            SessionPresenter.pacing(for: .stage2, explicit: nil, codec: .pyrowave), .glass,
-            "defaulted macOS PyroWave must serialize presents (swapID-panic mitigation)")
-        XCTAssertEqual(
-            SessionPresenter.pacing(for: .stage2, explicit: .stage2, codec: .pyrowave), .arrival,
-            "an explicit stage-2 pick must keep arrival pacing (honest A/B)")
-        #else
-        XCTAssertEqual(
-            SessionPresenter.pacing(for: .stage2, explicit: nil, codec: .pyrowave), .arrival)
-        #endif
-        // Non-PyroWave defaults keep arrival pacing under stage-2 everywhere.
-        XCTAssertEqual(
-            SessionPresenter.pacing(for: .stage2, explicit: nil, codec: .hevc), .arrival)
-        // Stage-3 means glass regardless of codec or how it was chosen.
-        XCTAssertEqual(
-            SessionPresenter.pacing(for: .stage3, explicit: .stage3, codec: .hevc), .glass)
-        XCTAssertEqual(
-            SessionPresenter.pacing(for: .stage3, explicit: nil, codec: .pyrowave), .glass)
-        // Stage-4 means deadline regardless of codec or how it was chosen.
-        XCTAssertEqual(
-            SessionPresenter.pacing(for: .stage4, explicit: nil, codec: .hevc), .deadline)
-        XCTAssertEqual(
-            SessionPresenter.pacing(for: .stage4, explicit: .stage4, codec: .pyrowave), .deadline)
-        XCTAssertEqual(
-            SessionPresenter.pacing(for: .decoded, explicit: .decoded, codec: .hevc), .decoded)
-        XCTAssertEqual(
-            SessionPresenter.pacing(for: .decoded, explicit: .decoded, codec: .pyrowave), .deadline)
+    /// Stage-2 is arrival pacing for every codec, PyroWave included: the glass gate cost about a
+    /// refresh per frame and never prevented the DCP panic. Explicit stages keep their pacing.
+    func testPacingMapsStagesTheSameForEveryCodec() {
+        XCTAssertEqual(SessionPresenter.pacing(for: .stage2, codec: .pyrowave), .arrival)
+        XCTAssertEqual(SessionPresenter.pacing(for: .stage2, codec: .hevc), .arrival)
+        XCTAssertEqual(SessionPresenter.pacing(for: .stage3, codec: .hevc), .glass)
+        XCTAssertEqual(SessionPresenter.pacing(for: .stage3, codec: .pyrowave), .glass)
+        XCTAssertEqual(SessionPresenter.pacing(for: .stage4, codec: .hevc), .deadline)
+        XCTAssertEqual(SessionPresenter.pacing(for: .stage4, codec: .pyrowave), .deadline)
+        XCTAssertEqual(SessionPresenter.pacing(for: .decoded, codec: .hevc), .decoded)
+        XCTAssertEqual(SessionPresenter.pacing(for: .decoded, codec: .pyrowave), .deadline)
     }
 
     func testDecodedPacingRequiresAVideoLayer() {
@@ -401,84 +380,40 @@ final class PresentPacingTests: XCTestCase {
 
     // MARK: - Present policy
 
-    /// V-Sync schedules on the grid, adaptive slots need the latency path with V-Sync off, the
-    /// smoothness store takes one frame per slot, and the env knob overrides each for A/B.
+    /// Latency presents on arrival, V-Sync schedules on the grid, the smoothness store takes one
+    /// frame per slot, and the env knob overrides each for A/B.
     func testPresentPolicyResolution() {
-        func policy(
-            _ env: String?, vsync: Bool = false, vsyncPaced: Bool = false,
-            adaptive: Bool = false
-        ) -> PresentPolicy {
-            PresentPolicy.resolve(
-                env: env, vsync: vsync, vsyncPaced: vsyncPaced, adaptiveSlotPaced: adaptive)
+        func policy(_ env: String?, vsync: Bool = false, vsyncPaced: Bool = false) -> PresentPolicy {
+            PresentPolicy.resolve(env: env, vsync: vsync, vsyncPaced: vsyncPaced)
         }
-        let adaptive = policy(nil, adaptive: true)
-        XCTAssertEqual(adaptive, PresentPolicy(adaptiveSlot: true, fixedSlot: false, fixedVsync: false))
-        XCTAssertEqual(adaptive.label(.arrival), "adaptive")
-        XCTAssertEqual(policy("garbage", adaptive: true), adaptive, "an unknown mode is no mode")
+        let arrival = policy(nil)
+        XCTAssertEqual(arrival, PresentPolicy(fixedSlot: false, fixedVsync: false))
+        XCTAssertEqual(arrival.label(.arrival), "immediate")
+        XCTAssertEqual(policy("garbage"), arrival, "an unknown mode is no mode")
 
-        let vsync = policy(nil, vsync: true, adaptive: true)
-        XCTAssertEqual(vsync, PresentPolicy(adaptiveSlot: false, fixedSlot: false, fixedVsync: true))
-        XCTAssertEqual(vsync.label(.glass), "vsync")
+        let vsync = policy(nil, vsync: true)
+        XCTAssertEqual(vsync, PresentPolicy(fixedSlot: false, fixedVsync: true))
+        XCTAssertEqual(vsync.label(.arrival), "vsync")
 
         let smooth = policy(nil, vsyncPaced: true)
-        XCTAssertEqual(smooth, PresentPolicy(adaptiveSlot: false, fixedSlot: true, fixedVsync: false))
+        XCTAssertEqual(smooth, PresentPolicy(fixedSlot: true, fixedVsync: false))
         XCTAssertEqual(smooth.label(.arrival), "slot")
 
-        XCTAssertEqual(
-            policy("slot", adaptive: true),
-            PresentPolicy(adaptiveSlot: false, fixedSlot: true, fixedVsync: false))
-        let immediate = policy("immediate", vsync: true, adaptive: true)
-        XCTAssertEqual(
-            immediate, PresentPolicy(adaptiveSlot: false, fixedSlot: false, fixedVsync: false))
+        XCTAssertEqual(policy("slot"), PresentPolicy(fixedSlot: true, fixedVsync: false))
+        let immediate = policy("immediate", vsync: true)
+        XCTAssertEqual(immediate, PresentPolicy(fixedSlot: false, fixedVsync: false))
         XCTAssertEqual(immediate.label(.arrival), "immediate")
-        XCTAssertEqual(
-            policy("vsync", adaptive: true),
-            PresentPolicy(adaptiveSlot: false, fixedSlot: false, fixedVsync: true))
+        XCTAssertEqual(policy("vsync"), PresentPolicy(fixedSlot: false, fixedVsync: true))
 
-        // The other two pacings name themselves; the display-link policy doesn't apply there.
-        XCTAssertEqual(adaptive.label(.deadline), "deadline")
-        XCTAssertEqual(adaptive.label(.decoded), "decoded")
-    }
-
-    // MARK: - macOS adaptive display
-
-    #if os(macOS)
-    func testAdaptiveSlotPacingResolution() {
-        XCTAssertTrue(SessionPresenter.adaptiveSlotPaced(
-            adaptiveSync: true, priority: .latency, pacing: .arrival))
-        XCTAssertFalse(SessionPresenter.adaptiveSlotPaced(
-            adaptiveSync: false, priority: .latency, pacing: .arrival))
-        XCTAssertFalse(SessionPresenter.adaptiveSlotPaced(
-            adaptiveSync: true, priority: .smooth(buffer: 2), pacing: .arrival))
-        XCTAssertFalse(SessionPresenter.adaptiveSlotPaced(
-            adaptiveSync: true, priority: .latency, pacing: .glass))
-    }
-
-    func testAdaptiveSlotRegimeUsesSparseImmediateAndDenseSlots() {
-        var sparse = AdaptiveSlotRegime()
-        XCTAssertTrue(sparse.update(ptsNs: 1_000_000_000))
-        XCTAssertFalse(sparse.update(ptsNs: 1_028_571_429))
-        XCTAssertFalse(sparse.update(ptsNs: 1_028_571_429), "a put-back is not a new sample")
-
-        var dense = AdaptiveSlotRegime()
-        XCTAssertTrue(dense.update(ptsNs: 1_000_000_000))
-        XCTAssertTrue(dense.update(ptsNs: 1_016_666_667))
-
-        var hitched = AdaptiveSlotRegime()
-        XCTAssertTrue(hitched.update(ptsNs: 1_000_000_000))
-        XCTAssertTrue(hitched.update(ptsNs: 1_008_333_333))
-        XCTAssertTrue(hitched.update(ptsNs: 1_058_333_333), "one capped hitch keeps slots")
-
-        var recoveryPts: UInt64 = 1_028_571_429
-        for _ in 0..<4 {
-            recoveryPts += 16_666_667
-            _ = sparse.update(ptsNs: recoveryPts)
-        }
-        XCTAssertTrue(sparse.isSlotted, "sustained 60 fps returns to slots")
+        // The other pacings name themselves; the display-link policy doesn't apply there.
+        XCTAssertEqual(vsync.label(.glass), "glass")
+        XCTAssertEqual(arrival.label(.deadline), "deadline")
+        XCTAssertEqual(arrival.label(.decoded), "decoded")
     }
 
     // MARK: - pf-present glass metrics
 
+    #if os(macOS)
     /// Fixed 240 Hz: intervals are multiples of the refresh. Adaptive 24–120 Hz with an 8.33 ms
     /// step: 1 = the fastest refresh, 3 = 25 ms, 4 = 33 ms — the 35 fps alternation.
     func testPanelGridUnits() {

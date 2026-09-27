@@ -23,6 +23,7 @@ struct ContentView: View {
     @AppStorage(DefaultsKey.streamHeight) private var height = 1080
     @AppStorage(DefaultsKey.streamHz) private var hz = 60
     @AppStorage(DefaultsKey.fullscreenWhileStreaming) private var fullscreenWhileStreaming = true
+    @AppStorage(DefaultsKey.fullscreenAlways) private var fullscreenAlways = false
     // The raw string is what @AppStorage observes (so cycles from any surface re-render this
     // view); the absent-key default runs the legacy-hudEnabled migration once per init.
     @AppStorage(DefaultsKey.statsVerbosity) private var statsVerbosityRaw
@@ -513,13 +514,11 @@ struct ContentView: View {
         }
         #endif
         #if os(macOS)
-        // Fullscreen only while a session is up (incl. the trust prompt over the blurred stream),
-        // windowed on the host list — so the picker isn't forced fullscreen. Opt-out in Settings.
-        // The controller also reports the window's ACTUAL fullscreen state back into
-        // `isFullscreen` (the user can toggle it manually), which drives the session view's
-        // safe-area handling below.
+        // Fullscreen from launch under Always, else only while a session is up (incl. the trust
+        // prompt over the blurred stream). The controller also mirrors the window's ACTUAL state
+        // into `isFullscreen`, which drives the session view's safe-area handling below.
         .background(FullscreenController(
-            active: fullscreenForSession && model.connection != nil,
+            active: fullscreenAlways || (fullscreenForSession && model.connection != nil),
             isFullscreen: $isFullscreen, appDriven: $appDrivenFullscreen, edge: fullscreenEdge))
         #endif
         // A game launched from the library just exited, so the session ended on purpose: put the

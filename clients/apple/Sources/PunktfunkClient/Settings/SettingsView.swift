@@ -62,6 +62,7 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.startIn) var startInRaw = StartIn.hosts.stored
     @AppStorage(DefaultsKey.defaultHost) var defaultHostID = ""
     @AppStorage(DefaultsKey.fullscreenWhileStreaming) var fullscreenWhileStreaming = true
+    @AppStorage(DefaultsKey.fullscreenAlways) var fullscreenAlways = false
     @AppStorage(DefaultsKey.micEnabled) var micEnabled = true
     @AppStorage(DefaultsKey.echoCancel) var echoCancel = true
     @AppStorage(DefaultsKey.keepHostAudio) var keepHostAudio = false

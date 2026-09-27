@@ -1024,6 +1024,7 @@ fn platform_row_split_hides_only_the_other_platforms_concepts() {
             RowId::GamepadUi,
             RowId::GamepadUiMode,
             RowId::StatsPosition,
+            RowId::FullscreenMode,
         ]
     );
     let off_android: Vec<RowId> = all
@@ -1046,6 +1047,7 @@ fn platform_row_split_hides_only_the_other_platforms_concepts() {
             RowId::Shortcuts,
             RowId::CursorGestures,
             RowId::StatsPosition,
+            RowId::FullscreenMode,
             RowId::Fullscreen,
         ]
     );
@@ -1110,6 +1112,49 @@ fn android_rows_live_in_extra() {
         after.extra = before.extra.clone();
         assert_eq!(after, before);
     }
+}
+
+/// A Mac's tab offers the picker instead of the toggle; its preset editor keeps the toggle,
+/// since "Always" is this Mac's alone.
+#[test]
+fn mac_fullscreen_picker_steps_through_both_keys() {
+    let mut settings = Settings::default();
+    let library = crate::library::LibraryShared::default();
+    let mac = crate::screens::Device {
+        platform: crate::platform::Platform::Apple,
+        ..crate::screens::Device::test()
+    };
+    let tv = crate::screens::Device {
+        tv: true,
+        ..mac.clone()
+    };
+    let ctx = &mut Ctx {
+        device: &mac,
+        ..Ctx::test(&mut settings, &library)
+    };
+    let interface = TABS.iter().position(|(t, _)| *t == "Interface").unwrap();
+    let mut s = SettingsScreen::with_presets(Vec::new());
+    s.tab = interface;
+    let tab = s.row_ids(ctx);
+    assert!(tab.contains(&RowId::FullscreenMode) && !tab.contains(&RowId::Fullscreen));
+    let presets: Vec<RowId> = preset_rows(ctx).into_iter().map(|(_, id)| id).collect();
+    assert!(presets.contains(&RowId::Fullscreen));
+    assert!(!presets.contains(&RowId::FullscreenMode));
+
+    assert!(ctx.settings.fullscreen_on_stream);
+    assert_eq!(fullscreen_mode(ctx.settings), 1);
+    assert!(adjust(RowId::FullscreenMode, 1, false, ctx));
+    assert!(extra_bool(ctx.settings, FULLSCREEN_ALWAYS_KEY, false));
+    assert!(
+        !adjust(RowId::FullscreenMode, 1, false, ctx),
+        "Always is the end"
+    );
+    assert!(adjust(RowId::FullscreenMode, -2, false, ctx));
+    assert!(!extra_bool(ctx.settings, FULLSCREEN_ALWAYS_KEY, true));
+    assert!(!ctx.settings.fullscreen_on_stream);
+
+    ctx.device = &tv;
+    assert!(!row_applies(RowId::FullscreenMode, ctx));
 }
 
 #[test]
@@ -1205,7 +1250,7 @@ fn every_row_has_exactly_one_tab() {
             seen.push(*id);
         }
     }
-    assert_eq!(seen.len(), 61, "{seen:?}");
+    assert_eq!(seen.len(), 62, "{seen:?}");
     assert!(seen.contains(&RowId::StartIn));
     assert!(seen.contains(&RowId::AdvancedStats));
     assert!(seen.contains(&RowId::FollowOsTheme));
