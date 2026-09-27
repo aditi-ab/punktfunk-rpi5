@@ -230,8 +230,9 @@ impl SteamDeckGadget {
     /// Bind a Deck on `dummy_udc.0`. `index` only changes the serial.
     /// Needs `dummy_hcd` + `raw_gadget` and write access to `/dev/raw-gadget`.
     pub fn open(index: u8) -> Result<SteamDeckGadget> {
-        // SAFETY: opening a constant NUL-terminated device path with O_RDWR; returns a fd or -1.
-        let fd = unsafe { libc::open(c"/dev/raw-gadget".as_ptr(), libc::O_RDWR) };
+        // CLOEXEC: a spawned game must not inherit the gadget and keep it bound past our drop.
+        // SAFETY: opening a constant NUL-terminated device path; returns a fd or -1.
+        let fd = unsafe { libc::open(c"/dev/raw-gadget".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         if fd < 0 {
             bail!(
                 "open /dev/raw-gadget ({}) — is raw_gadget+dummy_hcd loaded and are we root?",
