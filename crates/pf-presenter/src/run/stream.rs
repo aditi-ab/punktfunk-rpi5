@@ -97,10 +97,12 @@ impl StreamState {
     }
 
     /// Stop the pump and join its thread before any device-wide idle: the pump submits
-    /// decode work to the shared device. It notices `stop` within its 20 ms receive
-    /// timeout; on a normal end it is already returning.
-    pub(super) fn shutdown(mut self) {
+    /// decode work to the shared device. The presenter lets go of the decoder's frame
+    /// first, so the decoder's teardown gets it back instead of freeing it under a redraw.
+    /// The pump notices `stop` within its 20 ms receive timeout.
+    pub(super) fn shutdown(mut self, presenter: &mut Presenter) {
         self.handle.stop.store(true, Ordering::SeqCst);
+        presenter.drop_video();
         if let Some(t) = self.handle.thread.take() {
             let _ = t.join();
         }
@@ -634,7 +636,7 @@ impl Shell {
     /// Stop the stream's pump and show the console `phase`.
     fn end_stream(&mut self, stream: &mut Option<StreamState>, phase: SessionPhase<'_>) {
         if let Some(st) = stream.take() {
-            st.shutdown();
+            st.shutdown(&mut self.presenter);
         }
         if let Some(o) = self.overlay.as_mut() {
             o.session_phase(phase);
@@ -706,7 +708,7 @@ impl Shell {
                                     "launch while a session was still attached — \
                                      stopping it first"
                                 );
-                                prev.shutdown();
+                                prev.shutdown(&mut self.presenter);
                             }
                             *stream = Some(self.start_stream(*params, force_software));
                             if let Some(o) = self.overlay.as_mut() {
