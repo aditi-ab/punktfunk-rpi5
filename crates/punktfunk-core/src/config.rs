@@ -181,6 +181,12 @@ pub enum GamepadPref {
     /// Joy-Con pair: two Bluetooth halves (`057E:2006` + `2007`) that SDL and Steam combine. SL/SR
     /// carry the paddles, each half its own gyro and motor. Linux UHID, Windows UMDF.
     JoyConPair,
+    /// Switch 2 Pro Controller (`057E:2069`): GL/GR back buttons, gyro. SDL and Steam read it only
+    /// through libusb, so Linux hosts attach it over usbip; Windows hosts fold it to the Switch Pro.
+    Switch2Pro,
+    /// Switch 2 GameCube controller (`057E:2073`): analog L/R with a click, Z, ZL, no gyro. As
+    /// [`GamepadPref::Switch2Pro`].
+    Switch2GameCube,
 }
 
 impl GamepadPref {
@@ -199,6 +205,7 @@ impl GamepadPref {
             GamepadPref::Auto => true,
             // No Xbox pad has a gyro in its HID contract — Elite Series 2 included.
             GamepadPref::Xbox360 | GamepadPref::XboxOne | GamepadPref::XboxElite => false,
+            GamepadPref::Switch2GameCube => false,
             GamepadPref::DualSense
             | GamepadPref::DualShock4
             | GamepadPref::DualSenseEdge
@@ -211,7 +218,8 @@ impl GamepadPref {
             | GamepadPref::EightBitDoPro2
             | GamepadPref::EightBitDoPro3
             | GamepadPref::HoripadSteam
-            | GamepadPref::JoyConPair => true,
+            | GamepadPref::JoyConPair
+            | GamepadPref::Switch2Pro => true,
         }
     }
 
@@ -234,6 +242,8 @@ impl GamepadPref {
             GamepadPref::EightBitDoPro3 => 14,
             GamepadPref::HoripadSteam => 15,
             GamepadPref::JoyConPair => 16,
+            GamepadPref::Switch2Pro => 17,
+            GamepadPref::Switch2GameCube => 18,
         }
     }
 
@@ -256,6 +266,8 @@ impl GamepadPref {
             14 => GamepadPref::EightBitDoPro3,
             15 => GamepadPref::HoripadSteam,
             16 => GamepadPref::JoyConPair,
+            17 => GamepadPref::Switch2Pro,
+            18 => GamepadPref::Switch2GameCube,
             _ => GamepadPref::Auto,
         }
     }
@@ -293,6 +305,8 @@ impl GamepadPref {
             "8bitdopro3" | "8bitdo-pro-3" | "pro3" => GamepadPref::EightBitDoPro3,
             "horipadsteam" | "horipad-steam" | "hori" => GamepadPref::HoripadSteam,
             "joyconpair" | "joycon-pair" | "joycons" => GamepadPref::JoyConPair,
+            "switch2pro" | "switch2-pro" | "procontroller2" => GamepadPref::Switch2Pro,
+            "switch2gamecube" | "switch2-gamecube" | "gamecube" => GamepadPref::Switch2GameCube,
             _ => return None,
         })
     }
@@ -316,6 +330,8 @@ impl GamepadPref {
             GamepadPref::EightBitDoPro3 => "8bitdopro3",
             GamepadPref::HoripadSteam => "horipadsteam",
             GamepadPref::JoyConPair => "joyconpair",
+            GamepadPref::Switch2Pro => "switch2pro",
+            GamepadPref::Switch2GameCube => "switch2gamecube",
         }
     }
 }
@@ -821,11 +837,12 @@ mod tests {
 
     /// False negative kills working gyro; false positive streams ~250 Hz into a void.
     #[test]
-    fn only_the_xbox_classes_lack_a_motion_plane() {
+    fn pads_without_a_gyro_lack_a_motion_plane() {
         for p in [
             GamepadPref::Xbox360,
             GamepadPref::XboxOne,
             GamepadPref::XboxElite,
+            GamepadPref::Switch2GameCube,
         ] {
             assert!(
                 !p.has_motion(),
@@ -847,6 +864,7 @@ mod tests {
             GamepadPref::EightBitDoPro3,
             GamepadPref::HoripadSteam,
             GamepadPref::JoyConPair,
+            GamepadPref::Switch2Pro,
         ] {
             assert!(p.has_motion(), "{} should carry motion", p.as_str());
         }
@@ -903,11 +921,13 @@ mod tests {
             GamepadPref::EightBitDoPro3,
             GamepadPref::HoripadSteam,
             GamepadPref::JoyConPair,
+            GamepadPref::Switch2Pro,
+            GamepadPref::Switch2GameCube,
         ] {
             assert_eq!(GamepadPref::from_u8(p.to_u8()), p);
             assert_eq!(GamepadPref::from_name(p.as_str()), Some(p));
         }
-        // Bytes 0..=16 are assigned and pinned; older peers may know only a prefix.
+        // Bytes 0..=18 are assigned and pinned; older peers may know only a prefix.
         for (v, p) in [
             (0, GamepadPref::Auto),
             (1, GamepadPref::Xbox360),
@@ -926,12 +946,14 @@ mod tests {
             (14, GamepadPref::EightBitDoPro3),
             (15, GamepadPref::HoripadSteam),
             (16, GamepadPref::JoyConPair),
+            (17, GamepadPref::Switch2Pro),
+            (18, GamepadPref::Switch2GameCube),
         ] {
             assert_eq!(p.to_u8(), v);
             assert_eq!(GamepadPref::from_u8(v), p);
         }
         // Next unassigned byte degrades to Auto; assigning it later must update this.
-        assert_eq!(GamepadPref::from_u8(17), GamepadPref::Auto);
+        assert_eq!(GamepadPref::from_u8(19), GamepadPref::Auto);
         assert_eq!(GamepadPref::from_name("PS5"), Some(GamepadPref::DualSense));
         assert_eq!(GamepadPref::from_name("x360"), Some(GamepadPref::Xbox360));
         assert_eq!(GamepadPref::from_name("ps4"), Some(GamepadPref::DualShock4));

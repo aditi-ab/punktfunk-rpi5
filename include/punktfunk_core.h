@@ -172,6 +172,12 @@
 // Joy-Con pair (`057E:2006` + `2007`): SL/SR as paddles, gyro.
 #define PUNKTFUNK_GAMEPAD_JOYCON_PAIR 16
 
+// Switch 2 Pro Controller (`057E:2069`): GL/GR, gyro. Linux hosts only (usbip).
+#define PUNKTFUNK_GAMEPAD_SWITCH2_PRO 17
+
+// Switch 2 GameCube controller (`057E:2073`): analog triggers. Linux hosts only (usbip).
+#define PUNKTFUNK_GAMEPAD_SWITCH2_GAMECUBE 18
+
 // Extended `InputEvent` gamepad button bits: four back grips (Steam L4/L5/R4/R5 ≙
 // Xbox-Elite P1–P4) + misc/capture, in Moonlight's `buttonFlags2 << 16` namespace.
 // Mirror `input::gamepad::BTN_PADDLE1..4` / `BTN_MISC1`.

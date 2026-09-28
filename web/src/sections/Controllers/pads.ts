@@ -189,6 +189,7 @@ export function familyOf(device: string): PadFamily {
 	if (
 		device === "switchpro" ||
 		device === "joyconpair" ||
+		device.startsWith("switch2") ||
 		device.startsWith("8bitdopro")
 	)
 		return "switch";

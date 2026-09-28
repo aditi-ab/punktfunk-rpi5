@@ -123,6 +123,8 @@ fn pref_for_ids(vid: u16, pid: u16) -> Option<GamepadPref> {
         (0x2DC8, 0x6003 | 0x6006) => Some(GamepadPref::EightBitDoPro2),
         (0x2DC8, 0x6009) => Some(GamepadPref::EightBitDoPro3),
         (0x0F0D, 0x01AB | 0x0196) => Some(GamepadPref::HoripadSteam),
+        (0x057E, 0x2069) => Some(GamepadPref::Switch2Pro),
+        (0x057E, 0x2073) => Some(GamepadPref::Switch2GameCube),
         _ => crate::sc2_capture::pref_for(vid, pid),
     }
 }
@@ -2339,6 +2341,8 @@ mod pref_for_ids_tests {
         assert_eq!(pref_for_ids(0x2DC8, 0x6006), Some(P::EightBitDoPro2));
         assert_eq!(pref_for_ids(0x2DC8, 0x6009), Some(P::EightBitDoPro3));
         assert_eq!(pref_for_ids(0x0F0D, 0x0196), Some(P::HoripadSteam));
+        assert_eq!(pref_for_ids(0x057E, 0x2069), Some(P::Switch2Pro));
+        assert_eq!(pref_for_ids(0x057E, 0x2073), Some(P::Switch2GameCube));
         // A plain Series pad keeps SDL's type.
         assert_eq!(pref_for_ids(0x045E, 0x0B12), None);
         // X-input mode is an Xbox 360 pad.

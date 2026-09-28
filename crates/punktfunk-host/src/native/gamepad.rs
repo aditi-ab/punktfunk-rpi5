@@ -89,14 +89,31 @@ fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool, windows: bool
         GamepadPref::EightBitDoPro3 if linux || windows => GamepadPref::EightBitDoPro3,
         GamepadPref::HoripadSteam if linux || windows => GamepadPref::HoripadSteam,
         GamepadPref::JoyConPair if linux || windows => GamepadPref::JoyConPair,
+        // usbip on Linux: SDL and Steam read these through libusb, which a UMDF HID devnode lacks.
+        GamepadPref::Switch2Pro if linux => GamepadPref::Switch2Pro,
+        GamepadPref::Switch2GameCube if linux => GamepadPref::Switch2GameCube,
+        GamepadPref::Switch2Pro | GamepadPref::Switch2GameCube if windows => GamepadPref::SwitchPro,
         _ => GamepadPref::Xbox360,
     }
 }
 
-/// If `/dev/uhid` is not writable *now*, fold UHID backends to the uinput Xbox 360 pad.
-/// Opens and drops the char device — no `UHID_CREATE2`, so nothing is created. No-op off Linux.
+/// Fold a pad whose transport is missing *now*: a Switch 2 pad without `vhci_hcd` to the Switch
+/// Pro, then UHID backends without a writable `/dev/uhid` to the uinput Xbox 360 pad. Opens and
+/// drops the char device — no `UHID_CREATE2`, so nothing is created. No-op off Linux.
 #[cfg(target_os = "linux")]
 fn degrade_if_no_uhid(chosen: GamepadPref) -> GamepadPref {
+    let chosen = match chosen {
+        GamepadPref::Switch2Pro | GamepadPref::Switch2GameCube
+            if !crate::inject::switch2_usbip::available() =>
+        {
+            tracing::warn!(
+                wanted = chosen.as_str(),
+                "vhci_hcd not loaded — falling back to the Switch Pro pad"
+            );
+            GamepadPref::SwitchPro
+        }
+        other => other,
+    };
     let needs_uhid = matches!(
         chosen,
         GamepadPref::DualSense
@@ -502,6 +519,12 @@ mod tests {
             pick_gamepad(Auto, Some("ultimate2"), true, false),
             EightBitDoUltimate2
         );
+        // Switch 2 pads are usbip devices: Linux only, the Switch Pro on Windows.
+        for p in [Switch2Pro, Switch2GameCube] {
+            assert_eq!(pick_gamepad(p, None, true, false), p);
+            assert_eq!(pick_gamepad(p, None, false, true), SwitchPro);
+            assert_eq!(pick_gamepad(p, None, false, false), Xbox360);
+        }
         // Linux uinput 045E:0B00; Windows UMDF.
         assert_eq!(pick_gamepad(XboxElite, None, false, true), XboxElite);
         assert_eq!(pick_gamepad(Auto, Some("elite"), false, true), XboxElite);

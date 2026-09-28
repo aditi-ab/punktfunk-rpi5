@@ -140,6 +140,8 @@ describe("shapes", () => {
 			"8bitdopro3",
 			"horipadsteam",
 			"joyconpair",
+			"switch2pro",
+			"switch2gamecube",
 			"auto",
 		];
 		for (const k of kinds) expect(SHAPES[familyOf(k)]).toBeDefined();
@@ -149,6 +151,7 @@ describe("shapes", () => {
 		expect(familyOf("xboxelite")).toBe("xbox");
 		expect(familyOf("8bitdopro2")).toBe("switch");
 		expect(familyOf("joyconpair")).toBe("switch");
+		expect(familyOf("switch2pro")).toBe("switch");
 		expect(familyOf("8bitdoultimate2")).toBe("xbox");
 	});
 
