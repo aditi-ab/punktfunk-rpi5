@@ -24,8 +24,7 @@ it overrides shows either way.
 The advanced rows are **Advanced statistics**, **Statistics position**, **Statistics size**, **Exit
 hint**, **Reduce interface resolution**, **Smoothness buffer**, **Render scale**, **Video codec**,
 **Full chroma (4:4:4)**, **10-bit SDR**, **V-Sync**, **Follow variable refresh**, **Host
-compositor**, **Video decoder**, **GPU**, **Low-latency mode**, **Safe windowed presentation**,
-**Audio quality**, **Keep host audio playing**, **Echo cancellation**, **Forward controllers**,
+compositor**, **Video decoder**, **GPU**, **Low-latency mode**, **Audio quality**, **Keep host audio playing**, **Echo cancellation**, **Forward controllers**,
 **Use controller**, **Guide button**, **Hold Select for guide**, **Controller haptics**,
 **Controller speaker**, **Steam Controller 2 passthrough** and **DualSense over USB**.
 
@@ -127,7 +126,6 @@ shortcuts. It's on every app and in the console (which edits your defaults only)
 | **Auto-wake on connect** | On | Wakes a sleeping saved host with [Wake-on-LAN](/docs/wake-on-lan) and waits. Turn it off for hosts over a VPN. | All |
 | **Start streams fullscreen** | On | F11 or Alt+Enter leaves fullscreen. On a Mac, **Always** also opens the app fullscreen. | Linux, Windows, Mac (**Fullscreen**: **Off**, **While streaming**, **Always**) |
 | **Keep streaming in background** | Off | Audio and the connection stay live while you switch apps, for 10 minutes unless you pick another limit. | iPhone, iPad, Apple TV, Android phones (**Keep streaming in the background**) |
-| **Safe windowed presentation** | On | Avoids a macOS display-driver crash in windowed streams, at a little latency. | Mac |
 
 ## Interface
 

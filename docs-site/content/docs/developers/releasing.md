@@ -60,7 +60,8 @@ reports; the Windows packer stamps it into the finished binary.
    the one it posts, with `tag` and `authenticode_sha256`. Copy the hash from the Windows host tag
    run, step **Report stable Authenticode identity** (`AUTHENTICODE LEAF SHA-256 FOR ANNOUNCE`).
    `announce` publishes the signed stable update manifest, which is when hosts learn about the
-   release, then posts the notes to Discord.
+   release. It then moves the `stable` branch that Steam Deck builds follow to the tag, and posts
+   the notes to Discord.
 6. **Promote the stores.** Android reaches Play production by itself. To ramp, halt or roll back,
    use the Play Console or `android-promote.yml` (a dry run unless you turn `dry_run` off). Apple:
    submit the TestFlight build for review in App Store Connect.

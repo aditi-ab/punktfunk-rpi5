@@ -48,10 +48,10 @@
 	<key>NSSupportsLiveActivities</key>
 	<true/>
 	<!-- Notched Macs: claim the WHOLE panel. Without this key the system shrinks the display's
-	     active area for us the moment a window sits behind the camera housing, so a full-screen
-	     stream stops below the notch and NSScreen.safeAreaInsets reads zero — the settings'
+	     active area for us the moment a window sits behind the camera housing, so the panel
+	     fullscreen stops below the notch and NSScreen.safeAreaInsets reads zero — the settings'
 	     below-the-notch mode would never appear either. We route around the housing ourselves
-	     (SafeDisplay.videoBox), which is the audit this key asserts. -->
+	     (SafeDisplay.coversHousing), which is the audit this key asserts. -->
 	<key>NSPrefersDisplaySafeAreaCompatibilityMode</key>
 	<false/>
 	<!-- Deep links: punktfunk://connect/<host-uuid>[?launch=<GameEntry.id>]. Emitted by the

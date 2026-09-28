@@ -180,7 +180,7 @@
       "docs": "/docs/steamos-host",
       "floor": "SteamOS 3",
       "install": [
-        "git clone https://git.unom.io/unom/punktfunk ~/punktfunk",
+        "git clone --branch stable https://git.unom.io/unom/punktfunk ~/punktfunk",
         "bash ~/punktfunk/scripts/steamdeck/install.sh"
       ]
     },

@@ -430,7 +430,7 @@ extension SettingsView {
 
     private static let displayAdvancedFields = [
         "smooth_buffer", "render_scale", "codec", "enable_444", "ten_bit_sdr", "vsync",
-        "allow_vrr", "windowed_safe_present", "compositor",
+        "allow_vrr", "compositor",
     ]
 
     /// Advanced display rows away from their defaults, for the collapsed section's count.
@@ -442,7 +442,7 @@ extension SettingsView {
             e.tenBitSdr != d.tenBitSdr, e.compositor != d.compositor,
         ]
         #if os(macOS)
-        changed += [e.vsync != d.vsync, e.windowedSafePresent != d.windowedSafePresent]
+        changed.append(e.vsync != d.vsync)
         #endif
         #if !os(tvOS)
         changed.append(e.allowVRR != d.allowVRR)
@@ -597,17 +597,6 @@ extension SettingsView {
         described("A ProMotion or adaptive-sync display follows the stream's rate — "
             + "smoother motion.", field: "allow_vrr") {
             Toggle("Follow variable refresh", isOn: scoped(SettingsFields.allowVRR))
-        }
-        #endif
-        // The DCP swapID-panic mitigation (DefaultsKey.windowedSafePresent). Off re-arms a
-        // whole-machine kernel panic on affected setups, so the caption says so plainly.
-        #if os(macOS)
-        described(effective.windowedSafePresent
-            ? "Windowed streams present in step with the compositor — avoids a macOS "
-                + "display-driver crash, at a small latency cost."
-            : "Windowed streams use the fastest path. On some high-refresh Macs this can "
-                + "kernel-panic the machine.", field: "windowed_safe_present") {
-            Toggle("Safe windowed presentation", isOn: scoped(SettingsFields.windowedSafePresent))
         }
         #endif
     }

@@ -6,7 +6,7 @@
   Start at boot with nobody logged in: yes  (the SteamOS installer always enables it)
   Web console reachable from: this local network
 ==> Installing: host web-console plugin-runner (built on this device)
-  + [ -d ~/punktfunk/.git ] || git clone --branch stable https://git.unom.io/unom/punktfunk ~/punktfunk
+  + [ -d ~/punktfunk/.git ] || git clone --branch main https://git.unom.io/unom/punktfunk ~/punktfunk
   !! the build runs on this device — it asks for your sudo password first, then takes about 20 minutes on a first run (about a minute on a re-run) and prints nothing until it finishes
   + bash ~/punktfunk/scripts/steamdeck/install.sh
   ok would set clipboard="files" in /box/config/punktfunk/host-settings.json

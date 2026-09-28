@@ -140,7 +140,6 @@ public struct SettingsOverlay: Codable, Equatable, Sendable {
     public var smoothBuffer: Int?
     public var vsync: Bool?
     public var allowVRR: Bool?
-    public var windowedSafePresent: Bool?
     public var modifierLayout: String?
     /// Overlay keys a newer build wrote and this one doesn't model — carried through a
     /// load→save round-trip untouched.
@@ -187,7 +186,6 @@ public struct SettingsOverlay: Codable, Equatable, Sendable {
         case smoothBuffer = "smooth_buffer"
         case vsync
         case allowVRR = "allow_vrr"
-        case windowedSafePresent = "windowed_safe_present"
         case modifierLayout = "modifier_layout"
     }
 
@@ -229,7 +227,6 @@ public struct SettingsOverlay: Codable, Equatable, Sendable {
         smoothBuffer = int(.smoothBuffer)
         vsync = bool(.vsync)
         allowVRR = bool(.allowVRR)
-        windowedSafePresent = bool(.windowedSafePresent)
         modifierLayout = str(.modifierLayout)
         let known = Set(Key.allCases.map(\.rawValue))
         for key in c.allKeys where !known.contains(key.stringValue) {
@@ -275,8 +272,6 @@ public struct SettingsOverlay: Codable, Equatable, Sendable {
         try c.encodeIfPresent(smoothBuffer, forKey: AnyKey(Key.smoothBuffer.rawValue))
         try c.encodeIfPresent(vsync, forKey: AnyKey(Key.vsync.rawValue))
         try c.encodeIfPresent(allowVRR, forKey: AnyKey(Key.allowVRR.rawValue))
-        try c.encodeIfPresent(
-            windowedSafePresent, forKey: AnyKey(Key.windowedSafePresent.rawValue))
         try c.encodeIfPresent(modifierLayout, forKey: AnyKey(Key.modifierLayout.rawValue))
         let known = Set(Key.allCases.map(\.rawValue))
         for (key, value) in extra where !known.contains(key) {
@@ -335,7 +330,6 @@ public enum OverlayField {
         case "smooth_buffer": overlay.smoothBuffer = nil
         case "vsync": overlay.vsync = nil
         case "allow_vrr": overlay.allowVRR = nil
-        case "windowed_safe_present": overlay.windowedSafePresent = nil
         case "modifier_layout": overlay.modifierLayout = nil
         default: return false
         }
@@ -379,7 +373,6 @@ public enum OverlayField {
         case "smooth_buffer": return o.smoothBuffer != nil
         case "vsync": return o.vsync != nil
         case "allow_vrr": return o.allowVRR != nil
-        case "windowed_safe_present": return o.windowedSafePresent != nil
         case "modifier_layout": return o.modifierLayout != nil
         default: return false
         }

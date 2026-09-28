@@ -5,6 +5,9 @@
 #   bash scripts/steamdeck/update.sh           # rebuild host (+web if installed) and restart
 #   bash scripts/steamdeck/update.sh --pull    # `git pull` first (if the source is a git checkout)
 #
+# The branch the checkout follows is its channel: `stable` moves at each release, `main` is canary.
+# Switch with the guided installer's --channel, or `git switch <branch>` then --pull.
+#
 set -euo pipefail
 log()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m  ok\033[0m %s\n' "$*"; }
@@ -33,6 +36,10 @@ WEB=0; [ -f "$HOME/.config/systemd/user/punktfunk-web.service" ] && WEB=1
 
 if [ "${1:-}" = "--pull" ]; then
     [ -d "$SRC/.git" ] || die "$SRC is not a git checkout — rsync new source then run without --pull"
+    git -C "$SRC" symbolic-ref -q HEAD >/dev/null \
+        || die "$SRC isn't on a branch, so there is nothing to pull. Pick a channel, then re-run:
+  git -C $SRC fetch && git -C $SRC switch stable   # releases
+  git -C $SRC fetch && git -C $SRC switch main     # canary"
     # A build regenerates these committed files (bun2nix). When main carries a stale copy, the
     # rebuild dirties it and the next pull that touches it aborts. Restoring derived paths is
     # lossless. Not `reset --hard`: this is the operator's own checkout.
@@ -43,15 +50,12 @@ if [ "${1:-}" = "--pull" ]; then
   has local changes: review them with 'git -C $SRC status', then commit or stash them (or discard
   one with 'git -C $SRC checkout -- <file>') and re-run. Nothing was rebuilt or restarted."
     ok "pulled"
+    # Bash keeps running the text it read before the pull. Build with the pulled tree's recipe.
+    PUNKTFUNK_SRC="$SRC" PUNKTFUNK_BOX="$BOX" exec bash "$SRC/scripts/steamdeck/update.sh"
 fi
 
-# The console tells one build from the next by its version string alone. Without the commit
-# every rebuild reports the same X.Y.Z, and a finished update reads as "nothing newer".
-# An empty value is ignored by the build script, which falls back to the Cargo version.
-PF_BASE="$(sed -n 's/^version = "\(.*\)"/\1/p' "$SRC/Cargo.toml" | head -1)"
-PF_SHA="$(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || true)"
-PF_BUILD_VERSION=""
-[ -z "$PF_BASE" ] || [ -z "$PF_SHA" ] || PF_BUILD_VERSION="$PF_BASE+g$PF_SHA"
+# The version the console shows, in the same scheme as this channel's feed (build-version.sh).
+PF_BUILD_VERSION="$(bash "$SRC/scripts/steamdeck/build-version.sh" "$SRC")"
 
 log "Rebuilding host (release)"
 # nvenc,vulkan-encode matches the packaged builds (deb/arch) — see install.sh.

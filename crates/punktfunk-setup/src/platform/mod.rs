@@ -469,44 +469,33 @@ impl PkgBackend for Steamos {
             .expect("steamos entry has an install line");
         // `git clone` into an existing ~/punktfunk fails, and a re-run is documented as safe.
         // Whatever tree is there is the one to build; `update.sh --pull` is what moves it.
+        let branch = format!("--branch {}", steamos_branch(choices.channel));
         let mut steps: Vec<Step> = clone
             .iter()
-            .map(|line| Step::run(format!("[ -d ~/punktfunk/.git ] || {line}")))
+            .map(|line| {
+                let line = line.replace("--branch stable", &branch);
+                Step::run(format!("[ -d ~/punktfunk/.git ] || {line}"))
+            })
             .collect();
-        // The progress view captures the step's output, so without this line the build looks
-        // frozen for its whole run.
-        steps.push(Step::note(
-            Level::Warn,
-            "the build runs on this device — it asks for your sudo password first, then takes about 20 minutes on a first run (about a minute on a re-run) and prints nothing until it finishes",
-        ));
-        steps.push(Step::run(if choices.gamestream {
-            format!("{build} --gamestream")
-        } else {
-            build.clone()
-        }));
-        // After the build, never before: that script writes host.env defaults only when the
-        // file is absent, and one of them (RADV_PERFTEST=video_encode) turns Vulkan encode on
-        // for Van Gogh. The port move below still lands in host.env.
-        if choices.clipboard {
-            steps.push(Step::set_setting("clipboard", "files"));
-        }
-        // This step ends the run, so the conflict phase never gets to move the port.
-        if choices.move_mgmt_port {
-            steps.push(Step::set_env(
-                "PUNKTFUNK_MGMT_BIND",
-                format!("0.0.0.0:{}", choices.mgmt_port),
-            ));
-        }
-        if let Some(last) = steps.last_mut() {
-            last.ends_run = true;
-        }
+        steps.extend(steamos_build(build, choices));
         steps
     }
 
-    /// One tree, built from `main`. Unreachable in practice: a switch needs a current channel,
-    /// and this family never reports one.
-    fn switch(&self, facts: &Facts, choices: &Choices) -> Vec<Step> {
-        self.install(facts, choices)
+    /// Move the checkout to the channel's branch, then rebuild through the same hand-off.
+    /// `checkout` creates the local branch from `origin/` the first time.
+    fn switch(&self, _facts: &Facts, choices: &Choices) -> Vec<Step> {
+        let lines = install_lines("steamos");
+        let build = lines.last().expect("steamos entry has an install line");
+        let branch = steamos_branch(choices.channel);
+        let mut steps = vec![
+            Step::run("git -C ~/punktfunk fetch origin"),
+            Step::run(format!("git -C ~/punktfunk checkout {branch}")),
+            Step::run(format!(
+                "git -C ~/punktfunk merge --ff-only origin/{branch}"
+            )),
+        ];
+        steps.extend(steamos_build(build, choices));
+        steps
     }
 
     /// Nothing here is a package — the build is spread across the user session and a handful of
@@ -523,13 +512,61 @@ impl PkgBackend for Steamos {
         ]
     }
 
-    fn current_channel(&self, _paths: &BasePaths, _run: &dyn CommandRunner) -> Option<Channel> {
-        None
+    /// The branch `~/punktfunk` follows. `stable` is releases; any other tree pulls `main` or
+    /// nothing, so it is canary. No checkout, no channel.
+    fn current_channel(&self, paths: &BasePaths, _run: &dyn CommandRunner) -> Option<Channel> {
+        let head = paths.read(&paths.home.join("punktfunk/.git/HEAD"))?;
+        Some(if head.trim() == "ref: refs/heads/stable" {
+            Channel::Stable
+        } else {
+            Channel::Canary
+        })
     }
 
     fn installed_pf(&self, _run: &dyn CommandRunner) -> Vec<String> {
         vec![]
     }
+}
+
+/// The branch a Deck checkout follows per channel. The host reads it back from `.git/HEAD`
+/// (`pf_update_check::detect::source_channel`), and `announce.yml` moves `stable`.
+fn steamos_branch(channel: Channel) -> &'static str {
+    match channel {
+        Channel::Stable => "stable",
+        Channel::Canary => "main",
+    }
+}
+
+/// The on-device build and what must follow it. The last step ends the run.
+fn steamos_build(build: &str, choices: &Choices) -> Vec<Step> {
+    // The progress view captures the step's output, so without this line the build looks
+    // frozen for its whole run.
+    let mut steps = vec![Step::note(
+        Level::Warn,
+        "the build runs on this device — it asks for your sudo password first, then takes about 20 minutes on a first run (about a minute on a re-run) and prints nothing until it finishes",
+    )];
+    steps.push(Step::run(if choices.gamestream {
+        format!("{build} --gamestream")
+    } else {
+        build.to_string()
+    }));
+    // After the build, never before: that script writes host.env defaults only when the
+    // file is absent, and one of them (RADV_PERFTEST=video_encode) turns Vulkan encode on
+    // for Van Gogh. The port move below still lands in host.env.
+    if choices.clipboard {
+        steps.push(Step::set_setting("clipboard", "files"));
+    }
+    // This step ends the run, so the conflict phase never gets to move the port.
+    if choices.move_mgmt_port {
+        steps.push(Step::set_env(
+            "PUNKTFUNK_MGMT_BIND",
+            format!("0.0.0.0:{}", choices.mgmt_port),
+        ));
+    }
+    if let Some(last) = steps.last_mut() {
+        last.ends_run = true;
+    }
+    steps
 }
 
 /// User-scope client for families with no native package. An unsupported distro is not
@@ -645,9 +682,43 @@ mod tests {
         assert_eq!(lines.len(), 2, "clone the source, run the on-device build");
         assert!(lines[0].starts_with("git clone"), "{:?}", lines[0]);
         assert!(
+            lines[0].contains("--branch stable"),
+            "canary swaps this for main: {:?}",
+            lines[0]
+        );
+        assert!(
             lines[1].ends_with("scripts/steamdeck/install.sh"),
             "the gamestream flag is appended to this line: {:?}",
             lines[1]
         );
+    }
+
+    #[test]
+    fn a_deck_checkout_reports_the_branch_it_follows() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = BasePaths::rooted(root.path());
+        let run = crate::seam::FakeRunner::new();
+        assert_eq!(
+            Steamos.current_channel(&paths, &run),
+            None,
+            "no checkout yet"
+        );
+        let git = paths.home.join("punktfunk/.git");
+        std::fs::create_dir_all(&git).unwrap();
+        for (head, channel) in [
+            ("ref: refs/heads/stable\n", Channel::Stable),
+            ("ref: refs/heads/main\n", Channel::Canary),
+            (
+                "169730fe73000f4e71411af65e24c82324af8ccb\n",
+                Channel::Canary,
+            ),
+        ] {
+            std::fs::write(git.join("HEAD"), head).unwrap();
+            assert_eq!(
+                Steamos.current_channel(&paths, &run),
+                Some(channel),
+                "{head}"
+            );
+        }
     }
 }

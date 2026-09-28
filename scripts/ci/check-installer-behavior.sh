@@ -59,6 +59,9 @@ installer_case nixos    'ID=nixos\n'                                   'docs/nix
 # ~/punktfunk that the first one cloned.
 installer_case steamos  'ID=steamos\nID_LIKE=arch\n'                    'bash ~/punktfunk/scripts/steamdeck/install.sh'
 installer_case steamos2 'ID=steamos\nID_LIKE=arch\n'                    '[ -d ~/punktfunk/.git ] || git clone'
+# A Deck's channel is its checkout's branch: `stable` (moved at each release) unless asked.
+installer_case steamos3 'ID=steamos\nID_LIKE=arch\n'                    'git clone --branch stable'
+installer_case steamos-canary 'ID=steamos\nID_LIKE=arch\n'              'git clone --branch main' --channel canary
 installer_case holoiso  'ID=holoiso\nID_LIKE="steamos arch"\n'          'scripts/steamdeck/install.sh'
 installer_case gentoo   'ID=gentoo\n'                                  'build-from-source'
 # A distro with no host repo is a dead end for the HOST only: --client takes the flatpak line

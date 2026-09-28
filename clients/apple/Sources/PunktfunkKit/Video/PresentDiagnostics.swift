@@ -374,8 +374,7 @@ final class PresentDebugStats: @unchecked Sendable {
     /// 120 Hz panel saturates this at ~maximumDrawableCount; stage-3 pegs it at the gate depth).
     private var inFlight = 0
     private var maxInFlight = 0
-    /// The session's pace name for the line's `pace=` field — a closure because the macOS
-    /// "(composited)" suffix tracks the windowed present routing live.
+    /// The session's pace name for the line's `pace=` field, read per line.
     private let pace: () -> String
     /// The ordinary link's last reported period in seconds, for `linkMs` — 0 before the first
     /// tick and under deadline pacing (no ordinary link).

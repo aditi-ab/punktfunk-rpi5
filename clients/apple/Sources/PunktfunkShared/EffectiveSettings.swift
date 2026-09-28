@@ -61,7 +61,6 @@ public struct EffectiveSettings: Equatable, Sendable {
     public var smoothBuffer = 0
     public var vsync = false
     public var allowVRR = true
-    public var windowedSafePresent = true
     public var modifierLayout = "mac"
     // Tier G — this device's endpoints and hardware. Session-consumed, so they ride along, but
     // never presetable: a preset is about how a host is streamed, not about which speaker this
@@ -130,7 +129,6 @@ public struct EffectiveSettings: Equatable, Sendable {
         smoothBuffer = int(DefaultsKey.smoothBuffer, smoothBuffer)
         vsync = bool(DefaultsKey.vsync, vsync)
         allowVRR = bool(DefaultsKey.allowVRR, allowVRR)
-        windowedSafePresent = bool(DefaultsKey.windowedSafePresent, windowedSafePresent)
         modifierLayout = str(DefaultsKey.modifierLayout, modifierLayout)
         speakerUID = str(DefaultsKey.speakerUID, speakerUID)
         micUID = str(DefaultsKey.micUID, micUID)
@@ -216,7 +214,6 @@ public struct EffectiveSettings: Equatable, Sendable {
         if let v = overlay.smoothBuffer { s.smoothBuffer = v }
         if let v = overlay.vsync { s.vsync = v }
         if let v = overlay.allowVRR { s.allowVRR = v }
-        if let v = overlay.windowedSafePresent { s.windowedSafePresent = v }
         if let v = overlay.modifierLayout { s.modifierLayout = v }
         return s
     }

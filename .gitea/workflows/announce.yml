@@ -149,6 +149,39 @@ jobs:
             NOTES_URL="https://git.unom.io/unom/punktfunk/releases/tag/${TAG}" \
             bash scripts/ci/publish-update-manifest.sh
 
+      # SteamOS installs build the `stable` branch on the device. It moves with the manifest
+      # above, so a Deck's update offer and the feed's version change together. No force: Gitea
+      # answers a non-fast-forward with 422 and the branch stays.
+      - name: Move the stable branch to the release
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG="$INPUT_TAG"
+          case "$TAG" in
+            v[0-9]*) ;;
+            *) echo "refusing to move stable to a tag that is not vX.Y.Z: $TAG" >&2; exit 1 ;;
+          esac
+          case "$TAG" in
+            *-*) echo "pre-release tag $TAG — stable stays where it is"; exit 0 ;;
+          esac
+          # An annotated tag lists its commit on the `^{}` line, which sorts last.
+          SHA="$(git ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}" | tail -n1 | cut -f1)"
+          [ -n "$SHA" ] || { echo "origin has no tag $TAG" >&2; exit 1; }
+          API="$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/branches"
+          AUTH="Authorization: token $REGISTRY_TOKEN"
+          code="$(curl -sS --retry 3 -o branch.out -w '%{http_code}' -X PUT "$API/stable" \
+            -H "$AUTH" -H 'Content-Type: application/json' -d "{\"new_commit_id\":\"$SHA\"}")"
+          case "$code" in
+            204) ;;
+            404) curl -fsS --retry 3 -X POST "$API" -H "$AUTH" -H 'Content-Type: application/json' \
+                   -d "{\"new_branch_name\":\"stable\",\"old_ref_name\":\"$SHA\"}" > /dev/null ;;
+            422) echo "::warning::stable is already past $TAG; left in place"; exit 0 ;;
+            *) echo "::error::moving stable returned $code: $(cat branch.out)"; exit 1 ;;
+          esac
+          echo "stable → $TAG ($SHA)"
+
       - name: Post release announcement to Discord
         env:
           GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
