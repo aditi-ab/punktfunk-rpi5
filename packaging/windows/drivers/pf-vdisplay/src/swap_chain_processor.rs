@@ -8,8 +8,9 @@
 //! one fused GPU pass into a free pool slot — or drops at the pool. Nothing else: telemetry is
 //! stamped after `FinishedProcessingFrame`, because the window is what DWM waits on for this head.
 //!
-//! Spike S6 (`pool-bypass`) widens that window on purpose: the encoder reads the acquired surface
-//! and the window stays open until the access unit is out. That is the cadence risk being measured.
+//! Spike S6 (`pool-bypass`) issues no pass: the encoder reads the acquired surface, which stays
+//! the driver's until the next acquire returns a frame. So the worker holds that acquire until
+//! the access unit is out, and `FinishedProcessingFrame` still goes out at once.
 //!
 //! The `wdk_iddcx` DDI wrappers return a RAW `NTSTATUS` (`i32`) that is HRESULT-shaped for the
 //! swap-chain DDIs, so we classify it by hand (`hr >= 0` = success; `0x8000_000A` = E_PENDING;
@@ -365,6 +366,7 @@ impl SwapChainProcessor {
                 // leaks the swap-chain's whole surface set per assign/unassign cycle: adopt it
                 // unconditionally and release it before `FinishedProcessingFrame`. The queued
                 // GPU pass survives that (D3D defers destruction).
+                let mut held = false;
                 {
                     let raw = buffer.MetaData.pSurface as *mut core::ffi::c_void;
                     if !raw.is_null() {
@@ -373,15 +375,11 @@ impl SwapChainProcessor {
                         let res = unsafe { IDXGIResource::from_raw(raw) };
                         if let Ok(tex) = res.cast::<ID3D11Texture2D>() {
                             // The one fused pass into a free pool slot, or a drop at the pool.
-                            // Under S6 there is no pass and the surface is the encoder's, so
-                            // the window stays open until the pool hands it back (bounded).
-                            let held = attached.offer(device, &tex, display_qpc);
+                            // Under S6 there is no pass and the surface is the encoder's.
+                            held = attached.offer(device, &tex, display_qpc);
                             // Spike S5: one `CopyResource` into the probe's ring, or nothing.
                             #[cfg(feature = "encode-probe")]
                             crate::encode_probe::offer(device, &tex, display_qpc, target_id);
-                            if held {
-                                attached.wait_release();
-                            }
                         }
                         // `res` drops here: the acquire's surface reference is released,
                         // pre-Finished.
@@ -396,6 +394,12 @@ impl SwapChainProcessor {
                 // Stamped only now: nothing may sit between acquire and Finished. The present
                 // stamp feeds the compose-cadence histogram both modes are compared on.
                 attached.note_frame(display_qpc);
+                // S6: the surface is the driver's until the next acquire returns a frame, so
+                // an encoder still reading it holds that acquire (bounded). Never Finished:
+                // DWM composes this head's next frame on it.
+                if held {
+                    attached.wait_release();
+                }
             } else {
                 // The swap-chain was likely abandoned (e.g. DXGI_ERROR_ACCESS_LOST) — exit the loop.
                 break;

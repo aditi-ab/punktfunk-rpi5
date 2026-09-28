@@ -10,7 +10,7 @@
 //! carries [`Cadence`], the compose-cadence histogram both modes stamp after `Finished`.
 //!
 //! [`bypass_enabled`] is spike S6 (design §3): no fused pass at all — the encoder reads the
-//! acquired surface and the drain worker holds `FinishedProcessingFrame` until the AU is out.
+//! acquired surface and the drain worker holds its next acquire until the AU is out.
 
 use std::collections::VecDeque;
 use std::mem::offset_of;
@@ -38,13 +38,13 @@ use crate::worker::OwnedHandle;
 /// Three slots: the encoder holds up to two in flight while the drain worker fills one.
 pub const SLOTS: usize = 3;
 
-/// How long the bypass drain worker holds `FinishedProcessingFrame` for the encoder. A wedged
-/// encoder must cost the stream, never the head: 100 ms is twelve frame periods at 120 Hz,
-/// past any real access unit, and the timeout drops the frame rather than freezing DWM.
+/// How long the bypass drain worker holds its next acquire for the encoder. A wedged encoder
+/// must cost the stream, never the head: 100 ms is twelve frame periods at 120 Hz, past any
+/// real access unit, and the timeout drops the frame rather than starving the swap-chain.
 const BYPASS_HOLD_MS: u32 = 100;
 
-/// Spike S6 (design §3): encode straight off the acquired surface, `Finished` on the encoder's
-/// completion, no fused pass. The cargo feature keeps the arm out of a shipping build, and
+/// Spike S6 (design §3): encode straight off the acquired surface, the next acquire on the
+/// encoder's completion, no fused pass. The cargo feature keeps the arm out of a shipping build, and
 /// inside a spike build `PFVD_POOL_BYPASS` (any value; machine environment plus a device
 /// restart) still has to be set. Only [`InputKind::Bgra`] can take it — every other kind
 /// needs its converter — so [`Pool::build`] decides per session.
@@ -418,7 +418,7 @@ impl Pool {
     }
 
     /// The drain worker's hold, bypass only: block until the encoder gave the acquired surface
-    /// back, so `FinishedProcessingFrame` never returns a surface still being read. Bounded by
+    /// back, so the next acquire never hands DWM a surface still being read. Bounded by
     /// [`BYPASS_HOLD_MS`]; a timeout takes the surface back, counts a drop and lets the head
     /// run on — the encoder then finds nothing to wrap and skips that frame.
     pub fn wait_release(&self) {
@@ -509,7 +509,7 @@ impl Attached {
     /// The hook, per acquired surface (see [`Pool::offer`]). A pool on another device epoch
     /// marks the session stale — logged once — and the frame goes nowhere. `true` means a
     /// bypass pool took the surface itself, so the caller owes [`Self::wait_release`] before
-    /// `FinishedProcessingFrame`.
+    /// its next acquire.
     pub fn offer(&self, device: &Direct3DDevice, tex: &ID3D11Texture2D, display_qpc: u64) -> bool {
         let Some(pool) = &self.pool else {
             // No pool attached: every acquired surface goes nowhere, with nothing else logging it.
@@ -574,7 +574,7 @@ impl Attached {
     }
 
     /// Wait out the bypass hold ([`Pool::wait_release`]); a pool on the fused pass returns at
-    /// once. Called between the offer and `FinishedProcessingFrame`, nowhere else.
+    /// once. Called after `FinishedProcessingFrame` and before the next acquire, nowhere else.
     pub fn wait_release(&self) {
         if let Some(pool) = &self.pool {
             pool.wait_release();
