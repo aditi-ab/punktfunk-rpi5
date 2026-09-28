@@ -74,6 +74,10 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.statsVerbosity) var statsVerbosityRaw = StatsVerbosity.current.rawValue
     @AppStorage(DefaultsKey.hudPlacement) var hudPlacement = HUDPlacement.topTrailing.rawValue
     @AppStorage(DefaultsKey.advancedStats) var advancedStats = false
+    @AppStorage(DefaultsKey.statsScalePct) var statsScalePct = 100
+    @AppStorage(DefaultsKey.exitHint) var exitHint = true
+    /// Lists each category's advanced rows (`advancedSection`). Device-wide, never a preset's.
+    @AppStorage(DefaultsKey.showAdvanced) var showAdvanced = false
     @ObservedObject var gamepads = GamepadManager.shared
     @AppStorage(DefaultsKey.gamepadUIEnabled) var gamepadUIEnabled = true
     /// When the switch above takes over — read (and shown) only while it is on.
@@ -232,6 +236,8 @@ struct SettingsView: View {
                 sessionSection
                 overlaySection
                 librarySection
+                showAdvancedSection
+                generalAdvancedSection
             }
             .formStyle(.grouped)
             .tabItem { Label("General", systemImage: "gearshape") }
@@ -239,9 +245,8 @@ struct SettingsView: View {
 
             Form {
                 resolutionSection
-                qualitySection
-                presentationSection
-                hostOutputSection
+                pictureSection
+                displayAdvancedSection
             }
             .formStyle(.grouped)
             .tabItem { Label("Display", systemImage: "display") }
@@ -378,6 +383,8 @@ struct SettingsView: View {
                 sessionSection
                 overlaySection
                 librarySection
+                showAdvancedSection
+                generalAdvancedSection
             }
             .formStyle(.grouped)
             .navigationTitle("General")
@@ -385,9 +392,8 @@ struct SettingsView: View {
         case .display:
             Form {
                 resolutionSection
-                qualitySection
-                presentationSection
-                hostOutputSection
+                pictureSection
+                displayAdvancedSection
             }
             .formStyle(.grouped)
             .navigationTitle("Display")
@@ -514,13 +520,14 @@ struct SettingsView: View {
                 sessionSection
                 overlaySection
                 librarySection
+                showAdvancedSection
+                generalAdvancedSection
             }
         case .category(.display):
             Form {
                 resolutionSection
-                qualitySection
-                presentationSection
-                hostOutputSection
+                pictureSection
+                displayAdvancedSection
             }
         case .category(.audio):
             Form { audioSection }

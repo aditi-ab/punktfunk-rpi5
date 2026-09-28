@@ -65,7 +65,7 @@ sudo systemctl mask --now setroubleshootd     # any host; nothing depends on it
 
 On a layered or bootc host, install the drop-in yourself:
 `sudo semodule -i /usr/share/punktfunk/selinux/punktfunk-ds-inhibit.cil`. Setting the client's
-**Gamepad type** to **Xbox 360** avoids it too, without adaptive triggers, lightbar and touchpad.
+**Controller type** to **Xbox 360** avoids it too, without adaptive triggers, lightbar and touchpad.
 
 ### A Steam Controller 2 is captured, but Steam's controller list stays empty
 

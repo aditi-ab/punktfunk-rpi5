@@ -7,7 +7,7 @@
 //! A change is recorded as an override ([`SettingsOverlay::absorb`]); X clears one, so the
 //! row follows the global value again.
 
-use super::settings::{adjust, overrides_row, preset_field, preset_rows, row_spec};
+use super::settings::{adjust, advanced, overrides_row, preset_field, preset_rows, row_spec};
 use crate::glyphs::{Hint, HintKey};
 use crate::model::ConsoleCmd;
 use crate::pointer::Pointer;
@@ -459,8 +459,16 @@ impl PresetEdit {
         out
     }
 
+    /// The preset's rows. An advanced one shows under Show advanced, or while this preset
+    /// overrides it, so no override is ever out of sight.
     fn rows(&self, ctx: &mut Ctx) -> Vec<(&'static str, super::settings::RowId)> {
-        self.in_preset(ctx, |ctx| preset_rows(ctx))
+        let overlay = &self.overlay;
+        self.in_preset(ctx, |ctx| {
+            let all = ctx.settings.show_advanced;
+            (preset_rows(ctx).into_iter())
+                .filter(|(_, id)| all || !advanced(*id) || overrides_row(*id, overlay))
+                .collect()
+        })
     }
 
     pub(crate) fn menu(
@@ -555,9 +563,10 @@ impl PresetEdit {
             k,
         );
         let overlay = self.overlay.clone();
+        let listed = self.rows(ctx);
         let rows: Vec<RowSpec> = self.in_preset(ctx, |ctx| {
             let mut last = "";
-            (preset_rows(ctx).into_iter())
+            (listed.into_iter())
                 .map(|(tab, id)| {
                     let mut spec = row_spec(id, ctx, &[], &Default::default());
                     spec.header = (tab != last).then_some(tab);

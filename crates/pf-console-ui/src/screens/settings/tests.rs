@@ -111,6 +111,110 @@ fn sections_match_the_shared_vectors() {
     assert_eq!(got, want, "the sections' names and order");
 }
 
+/// The shared setting a row edits, by its `settings-catalog.json` key. `None` for a row that
+/// only arranges others (Aspect ratio), navigates, or is one platform's variant (the Mac's
+/// three-way Fullscreen).
+fn catalog_key(id: RowId) -> Option<&'static str> {
+    Some(match id {
+        RowId::StartIn => "start_in",
+        RowId::AutoWake => "auto_wake",
+        RowId::Fullscreen => "fullscreen_on_stream",
+        RowId::BackgroundKeepAlive => "background_keep_alive",
+        RowId::BackgroundTimeout => "background_timeout_minutes",
+        RowId::Stats => "stats_verbosity",
+        RowId::GamepadUi => "gamepad_ui_enabled",
+        RowId::GamepadUiMode => "gamepad_ui_mode",
+        RowId::FollowOsTheme => "follow_os_theme",
+        RowId::Palette => "ui_palette",
+        RowId::ReduceMotion => "reduce_motion",
+        RowId::LibraryView => "library_view",
+        RowId::LibrarySections => "library_sections",
+        RowId::HostSort => "host_sort",
+        RowId::HostGrouping => "host_grouping",
+        RowId::ShowAdvanced => "show_advanced",
+        RowId::AdvancedStats => "advanced_stats",
+        RowId::StatsPosition => "hud_placement",
+        RowId::StatsSize => "stats_scale_pct",
+        RowId::ExitHint => "exit_hint",
+        RowId::ReduceUiResolution => "reduce_ui_resolution",
+        RowId::Resolution => "resolution",
+        RowId::Refresh => "refresh_hz",
+        RowId::Bitrate => "bitrate_kbps",
+        RowId::VideoFit => "video_fit",
+        RowId::Hdr => "hdr_enabled",
+        RowId::PresentPriority => "present_priority",
+        RowId::SmoothBuffer => "smooth_buffer",
+        RowId::RenderScale => "render_scale",
+        RowId::Codec => "codec",
+        RowId::Chroma444 => "enable_444",
+        RowId::TenBitSdr => "ten_bit_sdr",
+        RowId::Vsync => "vsync",
+        RowId::AllowVrr => "allow_vrr",
+        RowId::Compositor => "compositor",
+        RowId::Decoder => "decoder",
+        RowId::LowLatency => "low_latency",
+        RowId::Audio => "audio_channels",
+        RowId::Mic => "mic_enabled",
+        RowId::AudioFormat => "audio_format",
+        RowId::KeepHostAudio => "keep_host_audio",
+        RowId::EchoCancel => "echo_cancel",
+        RowId::AudioRoute => "audio_route",
+        RowId::Touch => "touch_mode",
+        RowId::Mouse => "mouse_mode",
+        RowId::InvertScroll => "invert_scroll",
+        RowId::Shortcuts => "inhibit_shortcuts",
+        RowId::QuickActions => "overlay_actions",
+        RowId::CursorGestures => "cursor_gestures",
+        RowId::PadType => "gamepad",
+        RowId::PhoneRumble => "rumble_on_phone",
+        RowId::PhoneGyro => "gyro_on_phone",
+        RowId::PadForward => "gamepad_forwarding",
+        RowId::Pad => "forward_pad",
+        RowId::SystemButtons => "system_buttons",
+        RowId::GuideGesture => "guide_gesture",
+        RowId::PadHaptics => "pad_haptics",
+        RowId::PadSpeaker => "pad_speaker",
+        RowId::Sc2Passthrough => "sc2_capture",
+        RowId::DsCapture => "ds_capture",
+        _ => return None,
+    })
+}
+
+/// Each row that edits a shared setting carries the catalogue's label, category and tier, and
+/// every catalogue entry has a row here: the console is the surface every platform shares.
+#[test]
+fn rows_match_the_settings_catalog() {
+    let raw = include_str!("../../../../../clients/shared/settings-catalog.json");
+    let file: serde_json::Value = serde_json::from_str(raw).expect("settings-catalog.json parses");
+    let entries = file["settings"].as_array().expect("settings");
+    let library = crate::library::LibraryShared::default();
+    let mut settings = Settings::default();
+    let ctx = Ctx::test(&mut settings, &library);
+    let mut seen = Vec::new();
+    for (tab, rows) in &TABS {
+        for id in rows.iter().copied() {
+            let Some(key) = catalog_key(id) else { continue };
+            let entry = entries
+                .iter()
+                .find(|e| e["key"] == key)
+                .unwrap_or_else(|| panic!("{key} ({id:?}) is not in the catalogue"));
+            let spec = row_spec(id, &ctx, &[], &Default::default());
+            assert_eq!(spec.label, entry["label"].as_str().unwrap(), "{key}");
+            assert_eq!(
+                tab.to_lowercase(),
+                entry["category"].as_str().unwrap(),
+                "{key}"
+            );
+            assert_eq!(advanced(id), entry["advanced"].as_bool().unwrap(), "{key}");
+            seen.push(key);
+        }
+    }
+    for e in entries {
+        let key = e["key"].as_str().unwrap();
+        assert!(seen.contains(&key), "{key} has no console row");
+    }
+}
+
 /// Every row's mark is one this build ships.
 #[test]
 fn every_row_icon_ships() {
@@ -186,6 +290,13 @@ fn rendered_w(screen: &mut SettingsScreen, w: i32) -> f64 {
     screen.render(surface.canvas(), rect, k, dt, &fonts, &mut ctx);
     screen.render_pinned(surface.canvas(), rect, k, dt, &fonts, &ctx);
     k
+}
+
+/// The tab that lists `id`.
+fn tab_of(id: RowId) -> usize {
+    TABS.iter()
+        .position(|(_, rows)| rows.contains(&id))
+        .expect("every row has a tab")
 }
 
 fn press(r: Rect) -> Pointer {
@@ -322,6 +433,7 @@ fn a_pressed_tab_restores_that_tabs_cursor() {
 fn a_press_on_a_row_focuses_and_cycles_it() {
     fake_home();
     let mut s = SettingsScreen::with_presets(Vec::new());
+    s.tab = tab_of(RowId::Aspect);
     rendered(&mut s);
     let first = s.list.row_rect(0).expect("the list drew its rows");
     let mut settings = Settings::default();
@@ -711,14 +823,17 @@ fn bitrate_dims_under_pyrowave() {
 
 #[test]
 fn smoothness_buffer_is_offered_only_under_smoothness() {
-    let mut settings = Settings::default();
+    let mut settings = Settings {
+        show_advanced: true,
+        ..Settings::default()
+    };
     assert_eq!(settings.present_priority, "latency", "the shipped default");
     let library = crate::library::LibraryShared::default();
     let mut ctx = Ctx::test(&mut settings, &library);
     let mut s = SettingsScreen::with_presets(Vec::new());
     s.tab = TABS
         .iter()
-        .position(|(name, _)| *name == "Picture")
+        .position(|(name, _)| *name == "Display")
         .expect("the Picture section");
 
     let video = s.row_ids(&ctx);
@@ -769,6 +884,7 @@ fn a_shrinking_list_pulls_the_cursor_back() {
     fake_home();
     let mut settings = Settings {
         present_priority: "latency".into(),
+        show_advanced: true,
         ..Settings::default()
     };
     crate::store::file_store().save(&settings);
@@ -778,7 +894,7 @@ fn a_shrinking_list_pulls_the_cursor_back() {
     let mut s = SettingsScreen::with_presets(Vec::new());
     s.tab = TABS
         .iter()
-        .position(|(name, _)| *name == "Picture")
+        .position(|(name, _)| *name == "Display")
         .expect("the Picture section");
     s.list.cursor = s.row_ids(&ctx).len() - 1;
     let parked = s.list.cursor;
@@ -860,6 +976,7 @@ fn a_typed_bitrate_is_stored_and_clamped() {
         ..Ctx::test(&mut settings, &library)
     };
     let mut s = SettingsScreen::with_presets(Vec::new());
+    s.tab = tab_of(RowId::Bitrate);
     let mut fx = Outbox::default();
     let ids = s.row_ids(&ctx);
     s.list.cursor = ids
@@ -906,6 +1023,7 @@ fn a_typed_size_is_stored_through_the_shared_rule() {
         ..Ctx::test(&mut settings, &library)
     };
     let mut s = SettingsScreen::with_presets(Vec::new());
+    s.tab = tab_of(RowId::Resolution);
     let mut fx = Outbox::default();
     let ids = s.row_ids(&ctx);
     s.list.cursor = ids
@@ -949,6 +1067,63 @@ fn a_typed_size_is_stored_through_the_shared_rule() {
         (5120, 2880),
         "the largest listed size, not Native"
     );
+}
+
+/// Advanced rows stay out of a tab until Show advanced. A changed one surfaces as a count at
+/// the tab's end, which shows them and lands on it; the first advanced row carries the heading.
+#[test]
+fn advanced_rows_hide_until_shown_and_a_changed_one_is_counted() {
+    let mut settings = Settings::default();
+    let library = crate::library::LibraryShared::default();
+    let store = crate::store::SnapshotStore::new(settings.clone(), Vec::new());
+    let mut ctx = Ctx {
+        store: &store,
+        ..Ctx::test(&mut settings, &library)
+    };
+    let mut s = SettingsScreen::with_presets(Vec::new());
+    s.tab = tab_of(RowId::Codec);
+    let ids = s.row_ids(&ctx);
+    assert!(ids.iter().all(|id| !advanced(*id)), "{ids:?}");
+    assert!(
+        !ids.contains(&RowId::AdvancedChanged),
+        "nothing changed yet"
+    );
+
+    ctx.settings.codec = "av1".into();
+    let ids = s.row_ids(&ctx);
+    assert_eq!(ids.last(), Some(&RowId::AdvancedChanged));
+    assert_eq!(
+        s.spec(RowId::AdvancedChanged, &ids, &ctx).label,
+        "1 advanced setting changed"
+    );
+
+    s.list.jump_to(ids.len() - 1);
+    let mut fx = Outbox::default();
+    s.menu(MenuEvent::Confirm, &mut ctx, &mut fx);
+    assert!(ctx.settings.show_advanced);
+    let ids = s.row_ids(&ctx);
+    assert_eq!(ids.get(s.list.cursor), Some(&RowId::Codec), "lands on it");
+    let first = ids.iter().copied().find(|id| advanced(*id)).unwrap();
+    assert_eq!(s.spec(first, &ids, &ctx).header, Some("Advanced"));
+}
+
+/// A platform's own fresh value is not a change: Android starts the pad speaker off.
+#[test]
+fn a_platform_default_is_not_counted_as_changed() {
+    let mut settings = Settings {
+        pad_speaker: "off".into(),
+        ..Settings::default()
+    };
+    let library = crate::library::LibraryShared::default();
+    let android = crate::screens::Device {
+        platform: crate::platform::Platform::Android,
+        ..crate::screens::Device::test()
+    };
+    let ctx = Ctx {
+        device: &android,
+        ..Ctx::test(&mut settings, &library)
+    };
+    assert!(changed_advanced(tab_of(RowId::PadSpeaker), &ctx).is_empty());
 }
 
 #[test]
@@ -1073,20 +1248,20 @@ fn platform_row_split_hides_only_the_other_platforms_concepts() {
     assert_eq!(
         off_desktop,
         vec![
+            RowId::FullscreenMode,
             RowId::BackgroundKeepAlive,
             RowId::BackgroundTimeout,
+            RowId::GamepadUi,
+            RowId::GamepadUiMode,
+            RowId::ReduceUiResolution,
             RowId::LowLatency,
             RowId::AudioRoute,
+            RowId::CursorGestures,
             RowId::Controllers,
             RowId::PhoneRumble,
             RowId::PhoneGyro,
             RowId::Sc2Passthrough,
             RowId::DsCapture,
-            RowId::CursorGestures,
-            RowId::ReduceUiResolution,
-            RowId::GamepadUi,
-            RowId::GamepadUiMode,
-            RowId::FullscreenMode,
         ]
     );
     let off_android: Vec<RowId> = all
@@ -1097,19 +1272,19 @@ fn platform_row_split_hides_only_the_other_platforms_concepts() {
     assert_eq!(
         off_android,
         vec![
-            RowId::Decoder,
+            RowId::FullscreenMode,
+            RowId::Fullscreen,
             RowId::Chroma444,
             // TenBitSdr is NOT here: MediaCodec decodes Main10 from the SPS and the depth
             // asks nothing of the panel, so Android obeys it.
             RowId::Vsync,
             RowId::AllowVrr,
+            RowId::Decoder,
             RowId::AudioRoute,
-            // Every controller already gets its own wire slot, so player 1 is not a choice.
-            RowId::Pad,
             RowId::Shortcuts,
             RowId::CursorGestures,
-            RowId::FullscreenMode,
-            RowId::Fullscreen,
+            // Every controller already gets its own wire slot, so player 1 is not a choice.
+            RowId::Pad,
         ]
     );
     // Every row reaches at least one platform: a row listed in a tab and offered nowhere
@@ -1193,7 +1368,7 @@ fn mac_fullscreen_picker_steps_through_both_keys() {
         device: &mac,
         ..Ctx::test(&mut settings, &library)
     };
-    let interface = TABS.iter().position(|(t, _)| *t == "Interface").unwrap();
+    let interface = TABS.iter().position(|(t, _)| *t == "General").unwrap();
     let mut s = SettingsScreen::with_presets(Vec::new());
     s.tab = interface;
     let tab = s.row_ids(ctx);
@@ -1311,7 +1486,11 @@ fn every_row_has_exactly_one_tab() {
             seen.push(*id);
         }
     }
-    assert_eq!(seen.len(), 62, "{seen:?}");
+    assert_eq!(seen.len(), 65, "{seen:?}");
+    assert!(
+        !seen.contains(&RowId::AdvancedChanged),
+        "built per tab, never listed"
+    );
     assert!(seen.contains(&RowId::StartIn));
     assert!(seen.contains(&RowId::AdvancedStats));
     assert!(seen.contains(&RowId::FollowOsTheme));
@@ -1425,19 +1604,18 @@ fn audio_format_ships_off_and_follows_the_channel_count() {
     let library = crate::library::LibraryShared::default();
     let mut ctx = Ctx::test(&mut settings, &library);
     let mut s = SettingsScreen::with_presets(Vec::new());
-    s.tab = TABS
-        .iter()
-        .position(|(name, _)| *name == "Sound")
-        .expect("the Sound section");
+    s.tab = tab_of(RowId::AudioFormat);
+    assert!(
+        !s.row_ids(&ctx).contains(&RowId::AudioFormat),
+        "an advanced row: hidden by default"
+    );
+    ctx.settings.show_advanced = true;
     let audio = s.row_ids(&ctx);
-    let channels = audio
-        .iter()
-        .position(|id| *id == RowId::Audio)
-        .expect("the channels row");
+    let first_advanced = audio.iter().position(|id| advanced(*id));
     assert_eq!(
-        audio.get(channels + 1),
-        Some(&RowId::AudioFormat),
-        "the row sits directly under the one that dims it, like every other pair here"
+        first_advanced.map(|i| audio[i]),
+        Some(RowId::AudioFormat),
+        "it leads the tab's advanced rows, the nearest it can sit to the row that dims it"
     );
 
     assert!(
@@ -1510,7 +1688,7 @@ fn palette_row_names_the_pick_and_opens_the_cards() {
     let mut s = SettingsScreen::with_presets(Vec::new());
     s.tab = TABS
         .iter()
-        .position(|(name, _)| *name == "Interface")
+        .position(|(name, _)| *name == "General")
         .expect("the Interface section");
     let ids = s.row_ids(&ctx);
     s.list.cursor = ids

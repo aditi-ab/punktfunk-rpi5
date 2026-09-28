@@ -990,6 +990,17 @@ val COMPOSITOR_OPTIONS = listOf(
 /** (verbosity, label) for the stats-overlay detail picker. Order = the live 3-finger-tap cycle. */
 val STATS_VERBOSITY_OPTIONS = StatsVerbosity.entries.map { it to it.label }
 
+/** (cross-client `hud_placement` name, label) — core's `HudCorner`. */
+val HUD_PLACEMENT_OPTIONS = listOf(
+    "topLeading" to "Top left",
+    "topTrailing" to "Top right",
+    "bottomLeading" to "Bottom left",
+    "bottomTrailing" to "Bottom right",
+)
+
+/** The overlay's size in percent — core's `STATS_SCALE_PCTS`. */
+val STATS_SCALE_OPTIONS = listOf(75, 100, 125, 150, 175, 200).map { it to "$it %" }
+
 /** [Settings.presentPriority] as the wire int `nativeStartVideo` takes (0 = latency, 1 = smooth).
  * Unrecognized values resolve to latency — same rule as the Apple client. */
 fun Settings.presentPriorityWire(): Int = if (presentPriority == "smooth") 1 else 0

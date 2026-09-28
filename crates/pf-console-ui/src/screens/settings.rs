@@ -134,6 +134,50 @@ pub enum RowId {
     LibrarySections,
     /// This build's version. Nothing to change.
     Version,
+    /// `trust::Settings::show_advanced`: whether the tabs list their [`advanced`] rows.
+    ShowAdvanced,
+    /// `trust::Settings::stats_scale_pct`: the statistics panel's size.
+    StatsSize,
+    /// `trust::Settings::exit_hint`: the one-line exit hint at stream start.
+    ExitHint,
+    /// Action row, last on a tab while its advanced rows are hidden and some differ from a fresh
+    /// install: says how many, and shows them.
+    AdvancedChanged,
+}
+
+/// Rows the tabs list only under Show advanced: their default is right for nearly everyone,
+/// picking a value takes knowing how streaming works, and no first stream needs them.
+pub(crate) fn advanced(id: RowId) -> bool {
+    matches!(
+        id,
+        RowId::SmoothBuffer
+            | RowId::RenderScale
+            | RowId::Codec
+            | RowId::Chroma444
+            | RowId::TenBitSdr
+            | RowId::Vsync
+            | RowId::AllowVrr
+            | RowId::Compositor
+            | RowId::Decoder
+            | RowId::LowLatency
+            | RowId::AudioFormat
+            | RowId::KeepHostAudio
+            | RowId::EchoCancel
+            | RowId::AudioRoute
+            | RowId::PadForward
+            | RowId::Pad
+            | RowId::SystemButtons
+            | RowId::GuideGesture
+            | RowId::PadHaptics
+            | RowId::PadSpeaker
+            | RowId::Sc2Passthrough
+            | RowId::DsCapture
+            | RowId::AdvancedStats
+            | RowId::StatsPosition
+            | RowId::StatsSize
+            | RowId::ExitHint
+            | RowId::ReduceUiResolution
+    )
 }
 
 /// `Settings::extra` keys for the rows about the device in your hand, not the host. The
@@ -357,64 +401,68 @@ pub(crate) fn reduce_ui_res(
 /// The explainer band under the rows, design units.
 const DETAIL_H: f64 = crate::widgets::FOOT_DETAIL_H;
 
-// The sections, the rows a player touches most first. A child row sits right under the
-// switch it dims or drops with. Presets is empty here: its rows come from the catalog.
-const TABS: [(&str, &[RowId]); 8] = [
+// The sections, the rows a player touches most first and the [`advanced`] ones last. A child
+// row sits right under the switch it dims or drops with. Presets is empty here: its rows come
+// from the catalog.
+const TABS: [(&str, &[RowId]); 7] = [
     (
-        "Stream",
+        "General",
+        &[
+            RowId::StartIn,
+            RowId::AutoWake,
+            RowId::FullscreenMode,
+            RowId::Fullscreen,
+            RowId::BackgroundKeepAlive,
+            RowId::BackgroundTimeout,
+            RowId::Stats,
+            RowId::GamepadUi,
+            RowId::GamepadUiMode,
+            RowId::FollowOsTheme,
+            RowId::Palette,
+            RowId::ReduceMotion,
+            RowId::LibraryView,
+            RowId::LibrarySections,
+            RowId::HostSort,
+            RowId::HostGrouping,
+            RowId::ShowAdvanced,
+            RowId::AdvancedStats,
+            RowId::StatsPosition,
+            RowId::StatsSize,
+            RowId::ExitHint,
+            RowId::ReduceUiResolution,
+        ],
+    ),
+    (
+        "Display",
         &[
             RowId::Aspect,
             RowId::Resolution,
             RowId::Refresh,
             RowId::Bitrate,
             RowId::VideoFit,
-            RowId::RenderScale,
-            RowId::Compositor,
-            RowId::BackgroundKeepAlive,
-            RowId::BackgroundTimeout,
-        ],
-    ),
-    (
-        "Picture",
-        &[
-            RowId::Codec,
             RowId::Hdr,
             RowId::PresentPriority,
             RowId::SmoothBuffer,
-            RowId::Decoder,
+            RowId::RenderScale,
+            RowId::Codec,
             RowId::Chroma444,
             RowId::TenBitSdr,
-            RowId::LowLatency,
             RowId::Vsync,
             RowId::AllowVrr,
+            RowId::Compositor,
+            RowId::Decoder,
+            RowId::LowLatency,
         ],
     ),
     (
-        "Sound",
+        "Audio",
         &[
             RowId::Audio,
-            RowId::AudioFormat,
             RowId::Mic,
-            RowId::EchoCancel,
+            RowId::AudioFormat,
             RowId::KeepHostAudio,
+            RowId::EchoCancel,
             RowId::AudioRoute,
-        ],
-    ),
-    (
-        "Controllers",
-        &[
-            RowId::PadForward,
-            RowId::Pad,
-            RowId::PadType,
-            RowId::Controllers,
-            RowId::SystemButtons,
-            RowId::GuideGesture,
-            RowId::PadHaptics,
-            RowId::PadSpeaker,
-            RowId::PhoneRumble,
-            RowId::PhoneGyro,
-            RowId::Sc2Passthrough,
-            RowId::DsCapture,
         ],
     ),
     (
@@ -422,32 +470,27 @@ const TABS: [(&str, &[RowId]); 8] = [
         &[
             RowId::Touch,
             RowId::Mouse,
-            RowId::QuickActions,
             RowId::InvertScroll,
             RowId::Shortcuts,
+            RowId::QuickActions,
             RowId::CursorGestures,
         ],
     ),
     (
-        "Interface",
+        "Controllers",
         &[
-            RowId::FollowOsTheme,
-            RowId::Palette,
-            RowId::LibrarySections,
-            RowId::LibraryView,
-            RowId::StartIn,
-            RowId::HostSort,
-            RowId::HostGrouping,
-            RowId::ReduceUiResolution,
-            RowId::GamepadUi,
-            RowId::GamepadUiMode,
-            RowId::Stats,
-            RowId::StatsPosition,
-            RowId::AdvancedStats,
-            RowId::ReduceMotion,
-            RowId::FullscreenMode,
-            RowId::Fullscreen,
-            RowId::AutoWake,
+            RowId::Controllers,
+            RowId::PadType,
+            RowId::PhoneRumble,
+            RowId::PhoneGyro,
+            RowId::PadForward,
+            RowId::Pad,
+            RowId::SystemButtons,
+            RowId::GuideGesture,
+            RowId::PadHaptics,
+            RowId::PadSpeaker,
+            RowId::Sc2Passthrough,
+            RowId::DsCapture,
         ],
     ),
     ("Presets", &[]),
@@ -455,7 +498,7 @@ const TABS: [(&str, &[RowId]); 8] = [
 ];
 
 /// The Presets section — catalog-built, not [`TABS`] rows.
-const PRESETS_TAB: usize = 6;
+const PRESETS_TAB: usize = 5;
 
 /// Strip length for the shell's raster walk. `cfg(test)`: a shipping build
 /// would warn it dead, and this crate treats warnings as errors.
@@ -795,17 +838,25 @@ impl SettingsScreen {
         }
     }
 
-    /// Filtered by [`row_on`] / [`row_applies`]. Presets comes from the catalog.
+    /// Filtered by [`row_on`] / [`row_applies`], and [`advanced`] rows by Show advanced: a tab
+    /// hiding changed ones ends on [`RowId::AdvancedChanged`]. Presets comes from the catalog.
     fn row_ids(&self, ctx: &Ctx) -> Vec<RowId> {
         if self.tab != PRESETS_TAB {
-            return TABS[self.tab]
+            let offered = TABS[self.tab]
                 .1
                 .iter()
                 .copied()
                 .filter(|id| row_on(*id, ctx.device.platform) && row_applies(*id, ctx))
                 // The Mac's picker stands in for the toggle, which presets keep.
-                .filter(|id| !(*id == RowId::Fullscreen && is_mac(ctx)))
-                .collect();
+                .filter(|id| !(*id == RowId::Fullscreen && is_mac(ctx)));
+            if ctx.settings.show_advanced {
+                return offered.collect();
+            }
+            let mut rows: Vec<RowId> = offered.filter(|id| !advanced(*id)).collect();
+            if !changed_advanced(self.tab, ctx).is_empty() {
+                rows.push(RowId::AdvancedChanged);
+            }
+            return rows;
         }
         if self.presets.is_empty() {
             vec![RowId::NewPreset]
@@ -815,6 +866,21 @@ impl SettingsScreen {
                 .chain([RowId::NewPreset])
                 .collect()
         }
+    }
+
+    /// [`row_spec`], with the facts a row cannot know alone: how many hidden rows changed, and
+    /// the Advanced heading over the first advanced row the tab shows.
+    fn spec(&self, id: RowId, ids: &[RowId], ctx: &Ctx) -> RowSpec {
+        let mut spec = row_spec(id, ctx, &self.presets, &self.overrides);
+        if id == RowId::AdvancedChanged {
+            spec.label = match changed_advanced(self.tab, ctx).len() {
+                1 => "1 advanced setting changed".into(),
+                n => format!("{n} advanced settings changed"),
+            };
+        } else if advanced(id) && ids.iter().find(|r| advanced(**r)) == Some(&id) {
+            spec.header = Some("Advanced");
+        }
+        spec
     }
 
     /// Pull the cursor back. The smoothness buffer (and other writers) can shrink the list
@@ -1085,6 +1151,25 @@ impl SettingsScreen {
                     ListMsg::None => pulse,
                 };
             }
+            // Shows the advanced rows and lands on the first changed one.
+            RowId::AdvancedChanged => {
+                return match msg {
+                    ListMsg::Activate => {
+                        let first = changed_advanced(self.tab, ctx).first().copied();
+                        ctx.write(|c| {
+                            c.settings.show_advanced = true;
+                            true
+                        });
+                        let ids = self.row_ids(ctx);
+                        if let Some(i) = first.and_then(|id| ids.iter().position(|r| *r == id)) {
+                            self.list.jump_to(i);
+                        }
+                        pulse
+                    }
+                    ListMsg::Adjust(_) => Some(MenuPulse::Boundary),
+                    ListMsg::None => pulse,
+                };
+            }
             // The console draws the licences with the host's sections. webOS still opens
             // its own screen: that host sends no sections yet.
             RowId::Licenses => {
@@ -1131,12 +1216,8 @@ impl SettingsScreen {
         if self.strip_focus {
             return Some(format!("{} section", TABS[self.tab].0));
         }
-        let row = row_spec(
-            *self.row_ids(ctx).get(self.list.cursor)?,
-            ctx,
-            &self.presets,
-            &self.overrides,
-        );
+        let ids = self.row_ids(ctx);
+        let row = self.spec(*ids.get(self.list.cursor)?, &ids, ctx);
         Some(match row.value {
             Some(value) => format!("{}, {}", row.label, value),
             None => row.label,
@@ -1175,7 +1256,11 @@ impl SettingsScreen {
                 vec![Hint::new(HintKey::Back, "Done")]
             }
             Some(
-                RowId::Controllers | RowId::Licenses | RowId::LibrarySections | RowId::Palette,
+                RowId::Controllers
+                | RowId::Licenses
+                | RowId::LibrarySections
+                | RowId::Palette
+                | RowId::AdvancedChanged,
             ) => vec![
                 Hint::new(HintKey::Confirm, "Open"),
                 Hint::new(HintKey::Back, "Done"),
@@ -1219,10 +1304,7 @@ impl SettingsScreen {
         let list_rect = self.list_rect(rect, k);
         let ids = self.row_ids(ctx);
         self.clamp_cursor(ids.len());
-        let mut rows: Vec<RowSpec> = ids
-            .iter()
-            .map(|id| row_spec(*id, ctx, &self.presets, &self.overrides))
-            .collect();
+        let mut rows: Vec<RowSpec> = ids.iter().map(|id| self.spec(*id, &ids, ctx)).collect();
         // Field-open: the row being typed shows the digits so far and the caret.
         if let Some((typing, text)) = self.typing.as_ref() {
             let (row, value) = match typing {
@@ -1339,8 +1421,9 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
         RowId::Controllers => &[Android, WebOS, Apple],
         // Apps a phone or TV can put in the background; `row_applies` drops the Mac.
         RowId::BackgroundKeepAlive | RowId::BackgroundTimeout => &[Android, Apple],
-        // The clients whose overlays place the statistics by `hud_placement`.
-        RowId::StatsPosition => &[Desktop, Android, Apple],
+        // The clients whose overlays place and size the statistics by these keys, and draw the
+        // exit hint.
+        RowId::StatsPosition | RowId::StatsSize | RowId::ExitHint => &[Desktop, Android, Apple],
         // The webOS session never reads these; its TV builds its own session from a few keys.
         RowId::Compositor
         | RowId::RenderScale
@@ -1434,6 +1517,55 @@ pub fn row_applies(id: RowId, ctx: &Ctx) -> bool {
         RowId::Palette => !(ctx.settings.follow_os_theme && crate::os_theme::available()),
         _ => true,
     }
+}
+
+/// The settings a fresh install starts with on this platform: the shared defaults, and the
+/// few this platform's own app starts elsewhere.
+fn fresh_settings(device: &crate::screens::Device) -> pf_client_core::trust::Settings {
+    use crate::platform::Platform;
+    let mut s = pf_client_core::trust::Settings::default();
+    match device.platform {
+        Platform::Android => {
+            s.pad_speaker = "off".into();
+            s.mouse_mode = "desktop".into();
+        }
+        Platform::Apple => {
+            s.vsync = false;
+            set_extra_bool(&mut s, device_keys::SC2, false);
+        }
+        Platform::Desktop | Platform::WebOS | Platform::Web => {}
+    }
+    s
+}
+
+/// The rows of `ids` that show something other than a fresh install would: what
+/// [`RowId::AdvancedChanged`] counts. Compared by the value drawn, so every row kind works alike.
+fn changed(ids: &[RowId], ctx: &Ctx) -> Vec<RowId> {
+    let mut fresh = fresh_settings(ctx.device);
+    let under = Ctx {
+        hosts: ctx.hosts,
+        library: ctx.library,
+        settings: &mut fresh,
+        store: ctx.store,
+        pads: ctx.pads,
+        device: ctx.device,
+        t: ctx.t,
+    };
+    ids.iter()
+        .copied()
+        .filter(|id| row_spec_base(*id, &under, &[]).value != row_spec_base(*id, ctx, &[]).value)
+        .collect()
+}
+
+/// This tab's advanced rows, offered here and now, that hold a changed value.
+fn changed_advanced(tab: usize, ctx: &Ctx) -> Vec<RowId> {
+    let offered: Vec<RowId> = TABS[tab]
+        .1
+        .iter()
+        .copied()
+        .filter(|id| advanced(*id) && row_on(*id, ctx.device.platform) && row_applies(*id, ctx))
+        .collect();
+    changed(&offered, ctx)
 }
 
 /// Apple with no handheld screen and no TV.
@@ -1533,6 +1665,9 @@ fn row_icon(id: RowId) -> &'static str {
         RowId::ReduceMotion => "eye",
         RowId::AutoWake => "power",
         RowId::Version | RowId::Licenses => "info",
+        RowId::ShowAdvanced | RowId::AdvancedChanged => "wrench",
+        RowId::StatsSize => "chart-column",
+        RowId::ExitHint => "log-out",
         RowId::Preset(_) | RowId::NewPreset => "settings",
     }
 }
@@ -1672,6 +1807,8 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
             return RowSpec::action("New preset\u{2026}", true);
         }
         RowId::Controllers => return RowSpec::action("Controllers", true),
+        // The count is the tab's; `SettingsScreen::spec` writes it in.
+        RowId::AdvancedChanged => return RowSpec::action("Advanced settings changed", true),
         RowId::Licenses => return RowSpec::action("Open-source licences", true),
         RowId::QuickActions => return RowSpec::action("Quick actions", true),
         // Opens the cards: the value names the pick, no ‹ › to step it.
@@ -1773,7 +1910,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         ),
         RowId::Compositor => (
             None,
-            "Compositor",
+            "Host compositor",
             label_for(&COMPOSITORS, &s.compositor).into(),
         ),
         RowId::Codec => (
@@ -1790,7 +1927,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         // Migrate before lookup or a legacy store (`vulkan`/`vaapi`) shows "—".
         RowId::Decoder => (
             None,
-            "Decoder",
+            "Video decoder",
             label_for(
                 &DECODERS,
                 &pf_client_core::decoder_pref::migrate_decoder_pref(&s.decoder),
@@ -1801,7 +1938,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         RowId::Chroma444 => (None, "Full chroma (4:4:4)", on_off(s.enable_444).into()),
         RowId::TenBitSdr => (None, "10-bit SDR", on_off(s.ten_bit_sdr).into()),
         RowId::PresentPriority => (
-            Some("Presentation"),
+            None,
             "Prioritize",
             label_for(&PRESENT_PRIORITIES, &s.present_priority).into(),
         ),
@@ -1835,7 +1972,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
             "Keep host audio playing",
             on_off(s.keep_host_audio).into(),
         ),
-        RowId::Mic => (None, "Microphone", on_off(s.mic_enabled).into()),
+        RowId::Mic => (None, "Stream microphone", on_off(s.mic_enabled).into()),
         RowId::EchoCancel => (None, "Echo cancellation", on_off(s.echo_cancel).into()),
         RowId::PadForward => (
             None,
@@ -1861,7 +1998,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         ),
         RowId::SystemButtons => (
             None,
-            "Steam / guide button",
+            "Guide button",
             label_for(&SYSTEM_BUTTONS, &s.system_buttons).into(),
         ),
         RowId::GuideGesture => (
@@ -1875,9 +2012,13 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
             "Controller speaker",
             on_off(pad_speaker_on(&s.pad_speaker)).into(),
         ),
-        RowId::Touch => (None, "Touch mode", s.touch_mode().label().into()),
-        RowId::Mouse => (None, "Mouse mode", s.mouse_mode().label().into()),
-        RowId::InvertScroll => (None, "Invert scroll", on_off(s.invert_scroll).into()),
+        RowId::Touch => (None, "Touch input", s.touch_mode().label().into()),
+        RowId::Mouse => (None, "Mouse input", s.mouse_mode().label().into()),
+        RowId::InvertScroll => (
+            None,
+            "Invert scroll direction",
+            on_off(s.invert_scroll).into(),
+        ),
         RowId::Shortcuts => (
             None,
             "Capture system shortcuts",
@@ -1914,6 +2055,16 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
             s.stats_verbosity().label().into(),
         ),
         RowId::AdvancedStats => (None, "Advanced statistics", on_off(s.advanced_stats).into()),
+        RowId::ShowAdvanced => (None, "Show advanced", on_off(s.show_advanced).into()),
+        RowId::StatsSize => (
+            None,
+            "Statistics size",
+            format!(
+                "{} %",
+                (punktfunk_core::hud::stats_scale(s.stats_scale_pct) * 100.0).round()
+            ),
+        ),
+        RowId::ExitHint => (None, "Exit hint", on_off(s.exit_hint).into()),
         RowId::HostSort => (None, "Host order", extra()),
         RowId::HostGrouping => (
             None,
@@ -1922,7 +2073,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         ),
         RowId::StatsPosition => (
             None,
-            "Stats position",
+            "Statistics position",
             s.hud_corner(own_stats_corner(ctx.device.platform))
                 .label()
                 .into(),
@@ -1943,11 +2094,11 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
             "Fullscreen",
             FULLSCREEN_MODES[fullscreen_mode(s)].into(),
         ),
-        RowId::AutoWake => (None, "Wake hosts automatically", on_off(s.auto_wake).into()),
-        RowId::LowLatency => (Some("Decoding"), "Low-latency mode", extra()),
+        RowId::AutoWake => (None, "Auto-wake on connect", on_off(s.auto_wake).into()),
+        RowId::LowLatency => (None, "Low-latency mode", extra()),
         RowId::PhoneRumble => (Some("This device"), "Rumble on this phone", extra()),
         RowId::PhoneGyro => (None, "Gyro from this phone", extra()),
-        RowId::Sc2Passthrough => (Some("Passthrough"), "Steam Controller 2", extra()),
+        RowId::Sc2Passthrough => (None, "Steam Controller 2 passthrough", extra()),
         RowId::DsCapture => (None, "DualSense over USB", extra()),
         RowId::AudioRoute => (None, "Audio processing", extra()),
         RowId::CursorGestures => (None, "Long press to right-click", extra()),
@@ -1961,6 +2112,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         RowId::Preset(_)
         | RowId::NewPreset
         | RowId::Controllers
+        | RowId::AdvancedChanged
         | RowId::Licenses
         | RowId::QuickActions
         | RowId::LibrarySections
@@ -2204,6 +2356,10 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
             _ => "Punktfunk opens fullscreen and stays fullscreen between streams.",
         },
         RowId::StatsPosition => "Which corner the statistics overlay sits in.",
+        RowId::StatsSize => "The size of the statistics overlay, on top of your display's scaling.",
+        RowId::ExitHint => "Shows how to leave for a few seconds when a stream starts.",
+        RowId::ShowAdvanced => "Adds the settings most players never need to change.",
+        RowId::AdvancedChanged => "Some hidden settings differ from a fresh install. A shows them.",
         RowId::HostSort => {
             "The order of the host row: as you added them, by name, or most \
              recently connected first."
@@ -2550,6 +2706,16 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             step_option(at, HudCorner::ALL.len(), delta, wrap)
                 .map(|i| s.hud_placement = HudCorner::ALL[i].as_name().into())
         }
+        RowId::StatsSize => {
+            use punktfunk_core::hud::{stats_scale, STATS_SCALE_PCTS};
+            // Stepped from the size in effect, so an off-list stored value moves to its neighbour.
+            let pct = (stats_scale(s.stats_scale_pct) * 100.0).round() as u16;
+            let at = STATS_SCALE_PCTS.iter().position(|p| *p == pct);
+            step_option(at, STATS_SCALE_PCTS.len(), delta, wrap)
+                .map(|i| s.stats_scale_pct = STATS_SCALE_PCTS[i])
+        }
+        RowId::ExitHint => toggle(&mut s.exit_hint, delta, wrap),
+        RowId::ShowAdvanced => toggle(&mut s.show_advanced, delta, wrap),
         RowId::BackgroundTimeout => {
             let mut v = background_timeout(s).to_string();
             step_str(&BACKGROUND_TIMEOUTS, &mut v, delta, wrap).map(|()| {
@@ -2571,6 +2737,7 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         RowId::Preset(_)
         | RowId::NewPreset
         | RowId::Controllers
+        | RowId::AdvancedChanged
         | RowId::Licenses
         | RowId::QuickActions
         | RowId::LibrarySections

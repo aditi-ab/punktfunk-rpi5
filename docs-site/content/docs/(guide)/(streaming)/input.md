@@ -21,6 +21,9 @@ cursor disappears and keys go to the host.
 | Apple TV | — | Hold the remote's **Back** about a second, then let go |
 | Any client, with a controller | Press **L1 + R1 + Start + Select** (Linux, Windows) | Hold it ([details](#leaving-with-a-controller)) |
 
+A stream opens with a one-line hint naming the way to leave, for a few seconds. **Exit hint**, an
+advanced setting, turns it off.
+
 Press the release shortcut again, or click the stream, to capture again. Switching to another app
 releases input and takes it back when you return. Keys and buttons you were holding are let go on
 the host, so nothing sticks. On Linux and Windows, controllers stop reaching the host too until
@@ -108,8 +111,7 @@ third of a second instead: the host sees its guide button held for as long as yo
 long hold opens a SteamOS host's **Quick Access Menu**. A quick tap of Select still reaches the
 game, a beat late.
 
-Two settings control this: **Steam / guide button** (**Guide button** on Apple and Android) and
-**Hold Select for guide**. **Automatic** does this:
+Two advanced settings control this: **Guide button** and **Hold Select for guide**. **Automatic** does this:
 
 | Client | Guide button | Hold Select |
 |---|---|---|

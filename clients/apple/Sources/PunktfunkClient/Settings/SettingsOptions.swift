@@ -85,6 +85,10 @@ enum SettingsOptions {
     static let hudPlacements: [(label: String, tag: String)] =
         HUDPlacement.allCases.map { ($0.label, $0.rawValue) }
 
+    /// The overlay's size on top of the system's text size — core's `STATS_SCALE_PCTS`.
+    static let statsScales: [(label: String, tag: Int)] =
+        [75, 100, 125, 150, 175, 200].map { ("\($0) %", $0) }
+
     /// The macOS Fullscreen picker. "always" is `fullscreenAlways`; the other two are the
     /// presetable `fullscreenWhileStreaming`.
     static let fullscreenModes: [(label: String, tag: String)] = [

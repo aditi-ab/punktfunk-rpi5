@@ -920,11 +920,15 @@ fn every_settings_tab_rasters() {
 }
 
 /// One rendered frame so the rows have real rects to press.
+/// Settings open on Display, whose first rows are Aspect ratio, Resolution, Refresh rate and
+/// Bitrate.
 fn rendered_settings() -> (Shell, skia_safe::Rect) {
     let fonts = crate::theme::build_fonts().unwrap();
     let mut surface = skia_safe::surfaces::raster_n32_premul((1280, 800)).unwrap();
     let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
     s.handle_menu(MenuEvent::Tertiary); // X → Settings
+    finish_motion(&mut s);
+    next_section(&mut s);
     finish_motion(&mut s);
     s.render(surface.canvas(), 1280, 800, &fonts, None, None, &[]);
     let row = match s.stack.last() {
@@ -1005,7 +1009,8 @@ fn a_touch_swipe_scrolls_settings_without_changing_a_value() {
 fn a_finger_pans_and_flings_the_settings_list() {
     use pf_client_core::console::{PointerButton, PointerInput};
     let (mut s, _) = rendered_settings();
-    for _ in 0..5 {
+    // Display → Audio → Input → Controllers → Presets → About → General.
+    for _ in 0..6 {
         next_section(&mut s);
     }
     // A short window, so the nine rows overflow the list by a few rows.
@@ -1023,7 +1028,7 @@ fn a_finger_pans_and_flings_the_settings_list() {
     let before = (top(&s), s.settings.clone());
     let (x, y) = match s.stack.last() {
         Some(Screen::Settings(scr)) => {
-            assert_eq!(scr.tab_for_test(), 5, "Interface, the longest tab");
+            assert_eq!(scr.tab_for_test(), 0, "General, the longest tab");
             let r = scr.row_rect_for_test(2).expect("row 2 drew");
             (r.center_x(), r.center_y())
         }
@@ -2173,14 +2178,14 @@ fn the_announcement_carries_a_settings_value() {
     s.handle_menu(MenuEvent::Tertiary);
     finish_motion(&mut s);
     let row = s.focus_announcement().expect("a settings row names itself");
-    assert!(row.starts_with("Aspect ratio, "), "{row}");
+    assert!(row.starts_with("Start in, "), "{row}");
     s.handle_menu(MenuEvent::Move(MenuDir::Down));
     let below = s.focus_announcement().expect("…and so does the row below");
-    assert!(below.starts_with("Resolution, "), "{below}");
+    assert!(below.starts_with("Auto-wake on connect, "), "{below}");
     assert_ne!(row, below);
     s.handle_menu(MenuEvent::Move(MenuDir::Up));
     s.handle_menu(MenuEvent::Move(MenuDir::Up));
-    assert_eq!(s.focus_announcement().as_deref(), Some("Stream section"));
+    assert_eq!(s.focus_announcement().as_deref(), Some("General section"));
 }
 
 /// Silence, not the wrong row: a screen this driver does not describe, and a takeover that
