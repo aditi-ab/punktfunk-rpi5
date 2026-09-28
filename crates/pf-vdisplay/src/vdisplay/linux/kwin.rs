@@ -122,9 +122,10 @@ impl KwinDisplay {
     /// KWin may apply a stored setup for the new monitor set that already has physicals
     /// disabled — so a post-create enumerate can miss them. The snapshot is the only
     /// unpolluted read: `Exclusive` unions it into restore; other topologies
-    /// [`reenable_stranded`].
+    /// [`reenable_stranded`]. `mgmt` is this create's [`crate::kwin_output_mgmt::watch`].
     fn apply_topology(
         &mut self,
+        mut mgmt: Option<&mut crate::kwin_output_mgmt::Session>,
         name: &str,
         our_prefix: &str,
         dims: (u32, u32),
@@ -143,6 +144,7 @@ impl KwinDisplay {
                 // onto our stable name, so the apply still has to clear a mirror source
                 // and keep our origin off a live screen.
                 let outcome = crate::kwin_output_mgmt::apply_topology(
+                    mgmt.as_deref_mut(),
                     our_prefix,
                     dims.0,
                     dims.1,
@@ -151,7 +153,9 @@ impl KwinDisplay {
                 if outcome.handled {
                     self.our_uuid = outcome.our_uuid;
                 } else {
-                    crate::kwin_output_mgmt::clear_replication_source(our_prefix, dims.0, dims.1);
+                    crate::kwin_output_mgmt::clear_replication_source(
+                        mgmt, our_prefix, dims.0, dims.1,
+                    );
                 }
                 // These topologies promise physicals stay lit; undo KWin switching them off
                 // in reaction to our output appearing.
@@ -160,7 +164,8 @@ impl KwinDisplay {
             }
         };
         // In-process Wayland; immune to a wedged kscreen-doctor.
-        let outcome = crate::kwin_output_mgmt::apply_topology(our_prefix, dims.0, dims.1, kind);
+        let outcome =
+            crate::kwin_output_mgmt::apply_topology(mgmt, our_prefix, dims.0, dims.1, kind);
         if outcome.handled {
             self.our_uuid = outcome.our_uuid;
             if kind == TopologyKind::Primary {
@@ -333,6 +338,9 @@ impl VirtualDisplay for KwinDisplay {
         // Snapshot enabled physicals before our output exists: create changes the
         // monitor set and KWin may disable them. Later reads can already be polluted.
         let pre_enabled = enabled_physicals();
+        // Bound before our output exists: a mode switch's predecessor shares our name,
+        // UUID and restored mode, and only this connection tells the two apart.
+        let mut mgmt = crate::kwin_output_mgmt::watch();
         let (mut node_id, mut stop) = spawn_vout(width, birth_h)?;
         // `requested_*`: `spawn_vout` returns a node id, not a size. `width`/`height`
         // here would look like a KWin readback; the real size is below.
@@ -350,7 +358,7 @@ impl VirtualDisplay for KwinDisplay {
         let (final_dims, expect_exact_dims, achieved_hz) = if want_high {
             // Both resolvers address the output by the size it is at, and KWin's stored
             // setup can move it off its birth size before we ever look. Ask where it is.
-            let at = crate::kwin_output_mgmt::actual_dims(&our_prefix)
+            let at = crate::kwin_output_mgmt::actual_dims(mgmt.as_mut(), &our_prefix)
                 .map(|(w, h, _, _)| (w, h))
                 .unwrap_or((width, birth_h));
             if at != (width, birth_h) {
@@ -366,6 +374,7 @@ impl VirtualDisplay for KwinDisplay {
             // Install+select the high-refresh custom mode. In-process first; kscreen-doctor
             // if KWin has no `set_custom_modes` or misses its budget.
             let active = crate::kwin_output_mgmt::set_custom_mode(
+                mgmt.as_mut(),
                 &our_prefix,
                 at.0,
                 at.1,
@@ -411,16 +420,18 @@ impl VirtualDisplay for KwinDisplay {
                     );
                     // The recreate takes the same stored slot as a ≤60 Hz create. Unverified,
                     // the session streams whatever `kwinoutputconfig.json` restored.
-                    let (dims, exact) = verify_or_reassert(&our_prefix, width, height);
+                    let (dims, exact) =
+                        verify_or_reassert(mgmt.as_mut(), &our_prefix, width, height);
                     (dims, exact, 60)
                 }
             }
         } else {
             // ≤60 Hz installs no mode, so nothing here learned what KWin built.
-            let (dims, exact) = verify_or_reassert(&our_prefix, width, height);
+            let (dims, exact) = verify_or_reassert(mgmt.as_mut(), &our_prefix, width, height);
             (dims, exact, mode.refresh_hz)
         };
-        let disabled = self.apply_topology(&name, &our_prefix, final_dims, &pre_enabled);
+        let disabled =
+            self.apply_topology(mgmt.as_mut(), &name, &our_prefix, final_dims, &pre_enabled);
         // Stash restore on the group, not this session's keepalive: a per-session
         // keepalive would re-enable physicals when the FIRST exclusive member drops
         // under a still-live sibling. Empty ⇒ nothing to restore.
@@ -816,9 +827,14 @@ fn mode_satisfies(active: (u32, u32), want_w: u32, want_h: u32) -> bool {
 /// 1080p comes back 1080p on a 4K request. Unverified, capture and encoder open at KWin's size
 /// while the client decodes the size it negotiated. A size we cannot correct is returned as it
 /// is: everything dims-keyed runs off it, and a monitor mirror legitimately streams a size the
-/// client never asked for.
-fn verify_or_reassert(our_prefix: &str, width: u32, height: u32) -> ((u32, u32), bool) {
-    match crate::kwin_output_mgmt::actual_dims(our_prefix) {
+/// client never asked for. `mgmt` is this create's [`crate::kwin_output_mgmt::watch`].
+fn verify_or_reassert(
+    mut mgmt: Option<&mut crate::kwin_output_mgmt::Session>,
+    our_prefix: &str,
+    width: u32,
+    height: u32,
+) -> ((u32, u32), bool) {
+    match crate::kwin_output_mgmt::actual_dims(mgmt.as_deref_mut(), our_prefix) {
         // Honoured. Do not force scale 1.0: the stable name exists so KDE reapplies this
         // client's scale. Screencast is PIXEL size, so scale should not move captured dims.
         Some((aw, ah, _, scale)) if (aw, ah) == (width, height) => {
@@ -847,7 +863,9 @@ fn verify_or_reassert(our_prefix: &str, width: u32, height: u32) -> ((u32, u32),
             );
             // 60 Hz, not the client's rate: only the size is wrong here, and a 30 fps client
             // would install 30 Hz and throttle the compositor.
-            match crate::kwin_output_mgmt::set_custom_mode(our_prefix, aw, ah, width, height, 60) {
+            match crate::kwin_output_mgmt::set_custom_mode(
+                mgmt, our_prefix, aw, ah, width, height, 60,
+            ) {
                 Some((cw, ch, _)) if mode_satisfies((cw, ch), width, height) => {
                     tracing::info!(
                         active_w = cw,
@@ -2117,5 +2135,48 @@ mod tests {
             .filter(|n| !n.starts_with(MANAGED_PREFIX))
             .collect();
         assert_eq!(to_disable, vec!["eDP-1"]);
+    }
+
+    /// Live mid-stream mode switches: each create runs while its predecessor still holds
+    /// the name and KWin's stored mode, as the registry's create-before-drop does. The
+    /// 60 Hz steps take the `verify_or_reassert` path. Needs
+    /// `KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 kwin_wayland --virtual` (6.5.6+) and PipeWire.
+    #[test]
+    #[ignore = "needs a live KWin and PipeWire; run with --ignored"]
+    fn live_kwin_mode_switch_lands_on_the_new_output() {
+        use super::{KwinDisplay, Mode, VirtualDisplay};
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("pf_vdisplay=info"));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_test_writer()
+            .try_init();
+        let modes = [
+            (1920, 1080, 120),
+            (1280, 720, 120),
+            (1920, 1080, 60),
+            (1280, 720, 60),
+        ];
+        let mode = |(width, height, refresh_hz)| Mode {
+            width,
+            height,
+            refresh_hz,
+        };
+        let name = format!("Virtual-{}", super::VOUT_NAME);
+        let mut vd = KwinDisplay::new().unwrap();
+        let mut live = vd.create(mode(modes[0])).expect("first create");
+        for i in 1..=8 {
+            let want = modes[i % modes.len()];
+            let next = vd.create(mode(want)).expect("mode-switch create");
+            drop(std::mem::replace(&mut live, next));
+            // KWin re-applies its stored setup once the predecessor is gone.
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let got = crate::kwin_output_mgmt::actual_dims(
+                crate::kwin_output_mgmt::watch().as_mut(),
+                &name,
+            )
+            .map(|(w, h, mhz, _)| (w, h, (mhz + 500) / 1000));
+            assert_eq!(got, Some(want), "switch {i}");
+        }
     }
 }
