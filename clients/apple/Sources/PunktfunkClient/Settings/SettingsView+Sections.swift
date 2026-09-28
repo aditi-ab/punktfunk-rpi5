@@ -70,26 +70,10 @@ extension SettingsView {
             iosRefreshRows
             Button("Use this display's mode") { fillFromMainScreen() }
             #elseif os(macOS)
-            HStack {
-                TextField(
-                    "Resolution", value: scoped(SettingsFields.width),
-                    format: .number.grouping(.never))
-                Text("×")
-                TextField("", value: scoped(SettingsFields.height), format: .number.grouping(.never))
-                    .labelsHidden()
-            }
-            overrideMarker(OverlayField.resolution)
-            described("The host drives a real output at exactly this size — no scaling.",
-                field: "refresh_hz") {
-                TextField(
-                    "Refresh rate (Hz)", value: scoped(SettingsFields.refreshHz),
-                    format: .number.grouping(.never))
-            }
-            LabeledContent("") {
-                displayModeControl
-            }
+            macResolutionRows
             #elseif os(tvOS)
             tvStreamModeRow
+            tvCustomSizeRow
             #endif
         }
     }
@@ -139,11 +123,11 @@ extension SettingsView {
         if isCustomResolution {
             // Arbitrary entry: type the exact width × height (and refresh) the host should drive.
             HStack {
-                TextField("Width", value: scoped(SettingsFields.width),
+                TextField("Width", value: customSide(width: true),
                           format: .number.grouping(.never))
                     .keyboardType(.numberPad)
                 Text("×")
-                TextField("Height", value: scoped(SettingsFields.height),
+                TextField("Height", value: customSide(width: false),
                           format: .number.grouping(.never))
                     .labelsHidden()
                     .keyboardType(.numberPad)
@@ -164,7 +148,7 @@ extension SettingsView {
                     .foregroundStyle(.secondary)
                 Picker("Refresh rate", selection: scoped(SettingsFields.refreshHz)) {
                     ForEach(refreshChoices, id: \.self) { rate in
-                        Text("\(rate) Hz").tag(rate)
+                        Text(SettingsOptions.refreshLabel(rate)).tag(rate)
                     }
                 }
                 .labelsHidden()
@@ -174,9 +158,65 @@ extension SettingsView {
         } else {
             // A device with a single supported rate (e.g. 60 Hz) has nothing to pick.
             LabeledContent("Refresh rate") {
-                Text("\(effective.refreshHz) Hz").foregroundStyle(.secondary)
+                Text(SettingsOptions.refreshLabel(effective.refreshHz))
+                    .foregroundStyle(.secondary)
             }
         }
+    }
+    #endif
+
+    #if os(macOS)
+    /// The desktop layout, as on Linux and Windows: the aspect switch over Native, this display's
+    /// notch-safe mode, the family's sizes and Custom…, which shows the typed width and height.
+    @ViewBuilder private var macResolutionRows: some View {
+        Picker("Aspect ratio", selection: aspectSelection) {
+            ForEach(Array(SettingsOptions.families().enumerated()), id: \.offset) { i, family in
+                Text(family.label).tag(i)
+            }
+        }
+        described("The host drives a real output at exactly this size — no scaling.",
+            field: OverlayField.resolution) {
+            Picker("Resolution", selection: resolutionSelection) {
+                ForEach(resolutionChoices, id: \.tag) { choice in
+                    Text(choice.label).tag(choice.tag)
+                }
+            }
+        }
+        if isCustomResolution {
+            HStack {
+                TextField("Width", value: customSide(width: true),
+                          format: .number.grouping(.never))
+                Text("×")
+                TextField("Height", value: customSide(width: false),
+                          format: .number.grouping(.never))
+                    .labelsHidden()
+            }
+        }
+        described("Native follows the display this window is on.", field: "refresh_hz") {
+            Picker("Refresh rate", selection: scoped(SettingsFields.refreshHz)) {
+                ForEach(refreshChoices, id: \.self) { rate in
+                    Text(SettingsOptions.refreshLabel(rate)).tag(rate)
+                }
+            }
+        }
+        LabeledContent("") {
+            displayModeControl
+        }
+    }
+    #endif
+
+    #if os(iOS) || os(macOS)
+    /// A typed side through the shared rule, applied when the field commits (Return or focus
+    /// loss), so a half-typed number is never clamped under the thumb.
+    private func customSide(width: Bool) -> Binding<Int> {
+        Binding(
+            get: { width ? effective.width : effective.height },
+            set: { typed in
+                let s = effective
+                let size = Resolutions.custom(
+                    width ? typed : s.width, width ? s.height : typed, codec: s.codec)
+                setResolution(width: size.w, height: size.h)
+            })
     }
 
     /// Sentinel wheel tag for the "Custom…" row. Real tags are "WxH" (digits + "x"), so this can't
@@ -201,13 +241,15 @@ extension SettingsView {
             })
     }
 
-    /// Wheel rows: the resolution modes (device native first — see `SettingsOptions`), then a
-    /// "Custom…" row that reveals the numeric fields.
+    /// The list: Native (`0x0`, which follows the display), this device's other native mode, the
+    /// family's sizes (see `SettingsOptions.resolutionModes`), then "Custom…", which reveals the
+    /// numeric fields.
     private var resolutionChoices: [(label: String, tag: String)] {
         SettingsOptions.resolutionModes(family: family)
             .map {
-                (label: $0.name.isEmpty ? "\($0.w) × \($0.h)" : "\($0.name)  ·  \($0.w) × \($0.h)",
-                 tag: "\($0.w)x\($0.h)")
+                let size = "\($0.w) × \($0.h)"
+                let label = $0.w == 0 ? $0.name : $0.name.isEmpty ? size : "\($0.name)  ·  \(size)"
+                return (label: label, tag: "\($0.w)x\($0.h)")
             }
             + [(label: "Custom…", tag: Self.customResolutionTag)]
     }
@@ -223,8 +265,8 @@ extension SettingsView {
         customMode || !presetResolutionTags.contains("\(effective.width)x\(effective.height)")
     }
 
-    /// The wheel works in "WxH" tags so one selection drives both width and height; the custom
-    /// sentinel toggles `customMode` instead of writing a size.
+    /// The list works in "WxH" tags so one selection drives both width and height; the custom
+    /// sentinel toggles `customMode`, starting the fields from 1080p when the size was Native.
     private var resolutionSelection: Binding<String> {
         Binding(
             get: {
@@ -235,6 +277,9 @@ extension SettingsView {
             set: { tag in
                 if tag == Self.customResolutionTag {
                     customMode = true
+                    if effective.width == 0 {
+                        setResolution(width: 1920, height: 1080)
+                    }
                     return
                 }
                 customMode = false
@@ -253,8 +298,8 @@ extension SettingsView {
     #if os(tvOS)
     // MARK: - Display: Stream mode (tvOS)
 
-    /// A TV picks size and rate together, as its own settings do: this TV's mode, the common
-    /// ones, and whatever is stored today.
+    /// A TV picks size and rate together, as its own settings do: Native, the common modes, and
+    /// whatever is stored today.
     private var tvStreamModeRow: some View {
         described("The host drives a real output at exactly this mode — no scaling.",
                   field: OverlayField.resolution) {
@@ -262,7 +307,32 @@ extension SettingsView {
         }
     }
 
+    /// Any size, typed on the system keyboard as "width × height", at the stored rate.
+    private var tvCustomSizeRow: some View {
+        described("Any size, typed as width × height.", field: OverlayField.resolution) {
+            TVFieldRow(
+                label: "Custom size",
+                value: Self.tvModes.contains { $0.tag == tvModeTag.wrappedValue }
+                    ? "" : "\(effective.width) × \(effective.height)",
+                placeholder: "Type a size"
+            ) { typingSize = true }
+            .fullScreenCover(isPresented: $typingSize) {
+                TVTextEntry(
+                    title: "Size, as width × height", text: "",
+                    keyboardType: .numbersAndPunctuation
+                ) {
+                    if let size = SettingsOptions.typedSize($0, codec: effective.codec) {
+                        setResolution(width: size.w, height: size.h)
+                    }
+                    typingSize = false
+                }
+            }
+        }
+    }
+
+    /// `0x0x0` is Native: this TV's own mode, resolved at connect.
     private static let tvModes: [(label: String, tag: String)] = [
+        ("Native", "0x0x0"),
         ("720p @ 60", "1280x720x60"),
         ("1080p @ 60", "1920x1080x60"),
         ("4K @ 60", "3840x2160x60"),
@@ -271,15 +341,11 @@ extension SettingsView {
     private var tvModeOptions: [(label: String, tag: String)] {
         let s = effective
         let current = "\(s.width)x\(s.height)x\(s.refreshHz)"
-        let bounds = UIScreen.main.nativeBounds
-        let native = "\(Int(max(bounds.width, bounds.height)))x"
-            + "\(Int(min(bounds.width, bounds.height)))x\(UIScreen.main.maximumFramesPerSecond)"
         var options = Self.tvModes
-        if !options.contains(where: { $0.tag == native }) {
-            options.insert(("This TV (native)", native), at: 0)
-        }
         if !options.contains(where: { $0.tag == current }) {
-            options.insert(("Custom (\(s.width)×\(s.height) @ \(s.refreshHz))", current), at: 0)
+            let size = s.width == 0 ? "Native" : "\(s.width)×\(s.height)"
+            let rate = SettingsOptions.refreshLabel(s.refreshHz)
+            options.insert(("Custom (\(size) @ \(rate))", current), at: 0)
         }
         return options
     }
@@ -357,10 +423,8 @@ extension SettingsView {
         var text = "Above native is sharper, below is lighter on the host and link."
         let settings = effective
         if settings.renderScale != 1.0, !settings.matchWindow {
-            let mode = RenderScale.apply(
-                baseWidth: settings.width, baseHeight: settings.height,
-                scale: settings.renderScale,
-                maxDimension: RenderScale.maxDimension(codec: settings.codec))
+            // Native resolves against this display, as the connect does.
+            let mode = settings.streamMode(native: NativeDisplay.mode)
             text += " Host renders \(Int(mode.width))×\(Int(mode.height))."
         }
         return text
@@ -466,7 +530,8 @@ extension SettingsView {
                     field: "smooth_buffer") {
                     settingPicker(
                         "Buffer",
-                        options: SettingsOptions.smoothBuffers(refreshHz: effective.refreshHz),
+                        options: SettingsOptions.smoothBuffers(
+                            refreshHz: Int(effective.streamMode(native: NativeDisplay.mode).hz)),
                         selection: scoped(SettingsFields.smoothBuffer))
                 }
             }

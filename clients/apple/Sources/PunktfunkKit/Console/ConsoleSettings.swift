@@ -106,9 +106,9 @@ public enum ConsoleSettings {
     /// must read as what the touch UI shows, or the first console frame would offer to change
     /// a setting the player never set.
     private static let fields: [Field] = [
-        .int("width", DefaultsKey.streamWidth, 1920),
-        .int("height", DefaultsKey.streamHeight, 1080),
-        .int("refresh_hz", DefaultsKey.streamHz, 60),
+        .int("width", DefaultsKey.streamWidth, 0),
+        .int("height", DefaultsKey.streamHeight, 0),
+        .int("refresh_hz", DefaultsKey.streamHz, 0),
         .bool("match_window", DefaultsKey.matchWindow, false),
         .int("bitrate_kbps", DefaultsKey.bitrateKbps, 0),
         .double("render_scale", DefaultsKey.renderScale, 1.0),
@@ -119,7 +119,7 @@ public enum ConsoleSettings {
         .bool("ten_bit_sdr", DefaultsKey.tenBitSdr, false),
         .int("audio_channels", DefaultsKey.audioChannels, 2),
         .string("audio_format", DefaultsKey.audioFormat, "opus"),
-        .bool("mic_enabled", DefaultsKey.micEnabled, true),
+        .bool("mic_enabled", DefaultsKey.micEnabled, false),
         .bool("echo_cancel", DefaultsKey.echoCancel, true),
         .bool("keep_host_audio", DefaultsKey.keepHostAudio, false),
         .string("speaker_device", DefaultsKey.speakerUID, ""),
@@ -152,6 +152,9 @@ public enum ConsoleSettings {
         .bool("background_keep_alive", DefaultsKey.backgroundKeepAlive, false),
         .int("background_timeout_minutes", DefaultsKey.backgroundTimeoutMinutes, 10),
         .string("hud_placement", DefaultsKey.hudPlacement, "topTrailing"),
+        .int("stats_scale_pct", DefaultsKey.statsScalePct, 100),
+        .bool("exit_hint", DefaultsKey.exitHint, true),
+        .bool("show_advanced", DefaultsKey.showAdvanced, false),
         .string("host_sort", DefaultsKey.hostSort, "added"),
         .string("host_grouping", DefaultsKey.hostGrouping, "none"),
         .string("gamepad_ui_mode", DefaultsKey.gamepadUIMode, GamepadUIEnvironment.modeWhenConnected),
@@ -170,7 +173,7 @@ public enum ConsoleSettings {
     ]
     private static let padTypes: [(Int, String)] = [
         (0, "auto"), (1, "xbox360"), (3, "xboxone"), (2, "dualsense"), (4, "dualshock4"),
-        (6, "steamdeck"),
+        (6, "steamdeck"), (9, "steamcontroller2"),
     ]
 
     static func compositorName(_ tag: Int) -> String {

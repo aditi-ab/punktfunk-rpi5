@@ -14,6 +14,10 @@ struct StreamHUDView: View {
     let connection: PunktfunkConnection
     var placement: HUDPlacement = .topTrailing
     let verbosity: StatsVerbosity
+    /// The player's Statistics size on top of the system text size; 1 is the stock look.
+    var scale: Double = 1
+    /// Read so a text-size change redraws the scaled styles below.
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
         // .off is gated upstream (ContentView only mounts the HUD when the tier is on) —
@@ -50,7 +54,7 @@ struct StreamHUDView: View {
             VStack(alignment: .leading, spacing: 2) {
                 ForEach(Array(model.hudLines.enumerated()), id: \.offset) { _, line in
                     Text(line.text)
-                        .font(.system(.caption, design: .monospaced))
+                        .font(hudFont(.caption))
                         .foregroundStyle(style(line.role))
                 }
             }
@@ -67,7 +71,7 @@ struct StreamHUDView: View {
                         .fill(Color.accentColor)
                         .frame(width: 7, height: 7)
                     Text(first.text)
-                        .font(.system(.caption, design: .monospaced))
+                        .font(hudFont(.caption))
                 }
             }
             #if os(tvOS)
@@ -81,13 +85,13 @@ struct StreamHUDView: View {
                     ? "access \(model.accessLevel.label.lowercased())"
                     : "access \(model.accessLevel.label.lowercased()) · ends in "
                         + SessionModel.accessCountdown(model.accessRemainingSecs))
-                    .font(.system(.caption2, design: .monospaced))
+                    .font(hudFont(.caption2))
                     .foregroundStyle(.secondary)
             }
             #endif
             ForEach(Array(model.hudLines.dropFirst().enumerated()), id: \.offset) { _, line in
                 Text(line.text)
-                    .font(.system(.caption2, design: .monospaced))
+                    .font(hudFont(.caption2))
                     .foregroundStyle(style(line.role))
             }
             // Capture hint, shown only until input is captured — how to grab it. The RELEASE
@@ -138,6 +142,18 @@ struct StreamHUDView: View {
                 .font(.geist(12, relativeTo: .caption))
             #endif
         }
+    }
+
+    /// A monospaced HUD text style at the player's Statistics size. At 1 it is the stock style;
+    /// otherwise the style's current point size, so Dynamic Type still applies underneath.
+    private func hudFont(_ style: Font.TextStyle) -> Font {
+        guard scale != 1 else { return .system(style, design: .monospaced) }
+        #if os(macOS)
+        let base = NSFont.preferredFont(forTextStyle: style == .caption ? .caption1 : .caption2)
+        #else
+        let base = UIFont.preferredFont(forTextStyle: style == .caption ? .caption1 : .caption2)
+        #endif
+        return .system(size: base.pointSize * scale, design: .monospaced)
     }
 
     /// The HUD's quiet palette: breakdowns recede, and only a warning is allowed to shout.
@@ -239,6 +255,10 @@ struct StreamBadgeStack: View {
 
     var body: some View {
         VStack(spacing: 8) {
+            // How to leave, for a few seconds at stream start.
+            if captureEnabled, model.exitHintShown {
+                ExitHintBadge(text: model.exitHintText).transition(Self.pop)
+            }
             // A forwarded pad has a gyro this session's virtual controller cannot carry. Shown
             // briefly at every stats tier, on every platform: the gyro otherwise just does
             // nothing, and the fix is a setting, so the hint has to name it.
@@ -288,6 +308,22 @@ struct StreamBadgeStack: View {
         .animation(.easeOut(duration: 0.2), value: statsVerbosity)
         .animation(.easeOut(duration: 0.2), value: model.motionUnreachableKind)
         .animation(.easeOut(duration: 0.2), value: model.sc2CapturedHint)
+        .animation(.easeOut(duration: 0.6), value: model.exitHintShown)
+    }
+}
+
+/// The exit hint: one line on how to leave, in the badges' glass language.
+struct ExitHintBadge: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.geist(12, .medium, relativeTo: .caption))
+            .foregroundStyle(.white.opacity(0.9))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .glassBackground(Capsule())
+            .environment(\.colorScheme, .dark) // reads over any frame, like the resize overlay
     }
 }
 

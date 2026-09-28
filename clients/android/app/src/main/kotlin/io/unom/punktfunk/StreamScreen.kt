@@ -658,9 +658,11 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             // Live stats HUD (FPS / throughput / capture→client latency), drawn over the video but
             // BEFORE the transparent gesture layer below, so it shows through and never eats touches.
             // A companion panel carries it instead.
-            if (!companionUp && statsOn && statsLines.isNotEmpty()) {
-                val placement = Modifier.align(Alignment.TopStart).padding(12.dp)
-                OsdScaled { StatsOverlay(statsLines, placement) }
+            val statsShown = !companionUp && statsOn && statsLines.isNotEmpty()
+            val statsCorner = hudAlignment(initialSettings.hudPlacement)
+            if (statsShown) {
+                val placement = Modifier.align(statsCorner).padding(12.dp)
+                OsdScaled { StatsOverlay(statsLines, placement, initialSettings.statsScalePct / 100f) }
             }
             // The Access chip — what this session is allowed to do, said in the preset vocabulary
             // ("Controller only · 1 h 58 m left"), shown while the stats HUD is on. It rides the
@@ -679,13 +681,15 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                 else -> SessionAccess.label(ui.accessGrants)
             }
             // Same corner, stacked: the mute sentence stands whatever the stats tier, because a
-            // player who cannot hear is owed the reason even with chrome off.
+            // player who cannot hear is owed the reason even with chrome off. Top left while the
+            // stats panel holds the top right.
             if (accessChip != null || ui.audioMuteLabel != null) {
+                val left = statsShown && statsCorner == Alignment.TopEnd
                 OsdScaled {
                     Column(
-                        Modifier.align(Alignment.TopEnd).padding(12.dp),
+                        Modifier.align(if (left) Alignment.TopStart else Alignment.TopEnd).padding(12.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp),
-                        horizontalAlignment = Alignment.End,
+                        horizontalAlignment = if (left) Alignment.Start else Alignment.End,
                     ) {
                         ui.audioMuteLabel?.let { AccessChip(it) }
                         accessChip?.let { AccessChip(it) }
@@ -702,48 +706,21 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             if (ui.remotePointerOn) {
                 OsdScaled { RemotePointerHint(Modifier.align(Alignment.TopCenter).padding(top = 16.dp)) }
             }
-            // The start banner (desktop parity), naming ONLY the shortcuts this session actually has:
-            // pad chords when a controller is here, the Back gesture and the three-finger tap when it
-            // is not. Recomputed rather than captured, because both inputs change under it — a pad can
-            // wake mid-banner, and `ui.micRunning` only settles once the capture has actually opened.
-            // Above the video and below the gesture layer: it teaches touches, it must never eat one.
+            // The exit hint (desktop parity): one line on how to leave with the input in hand, the
+            // pad chord when a controller is here. Without one, leaving is a slot in the quick-action
+            // dial, so the line names what opens it. Recomputed rather than captured: a pad can wake
+            // mid-hint. Above the video and below the gesture layer, so it never eats a touch.
             //
-            // Bottom-centre is the desktop's placement and the only edge left — TopStart is the HUD,
-            // TopEnd the Access chip, TopCentre the three transient cues — but MotionUnreachableHint
-            // already owns it, and both of these can be up at t≈0. The banner YIELDS rather than
-            // stacking or sliding off-centre: the notice reports something broken about THIS session
-            // and names the setting that fixes it, while the banner repeats shortcuts that will be
-            // there next stream too. Two pills sharing an edge for six seconds would cost the reader
-            // both.
-            if (banner.up && !ui.motionHint && !touchHint) OsdScaled {
+            // Bottom-centre, which MotionUnreachableHint also owns at t≈0. The hint YIELDS: the
+            // notice reports something broken about THIS session, the hint repeats every stream.
+            if (initialSettings.exitHint && banner.up && !ui.motionHint && !touchHint) OsdScaled {
                 StreamStartBanner(
-                    text = buildList {
-                        if (ui.padPresent) {
-                            // The dial leads: it is the one chord that reaches every other action.
-                            add("Select + A quick actions")
-                            add("Hold Select + Start + L1 + R1 to leave")
-                            // Only while a capture is actually running: the chord itself no-ops
-                            // without one, and offering a mute for a mic nobody has is the lie the
-                            // whole control exists to avoid.
-                            if (ui.micRunning) add("Select + Y mic")
-                            add("Select + X stats")
-                        } else {
-                            // No pad: Back opens the dial (the gesture, or a TV remote's button; a
-                            // mouse's Back goes to the host) unless Settings turned it off.
-                            // Leaving is a slot inside it, not this.
-                            add(
-                                when {
-                                    backOpensRing && gestures -> "Back or a two-finger twist opens quick actions"
-                                    backOpensRing -> "Back opens quick actions"
-                                    gestures -> "A two-finger twist opens quick actions"
-                                    else -> "Ctrl+Alt+Shift+O opens quick actions"
-                                }
-                            )
-                            if (gestures) add("three-finger tap for stats")
-                            // Android keeps Alt+Tab; the alias is only learnable from here.
-                            if (keyboard && !KeyCaptureService.running) add("Alt+` for Alt+Tab")
-                        }
-                    }.joinToString(" · "),
+                    text = when {
+                        ui.padPresent -> "Hold L1 + R1 + Start + Select to leave"
+                        backOpensRing -> "Back opens quick actions"
+                        gestures -> "A two-finger twist opens quick actions"
+                        else -> "Ctrl+Alt+Shift+O opens quick actions"
+                    },
                     alpha = banner.alpha,
                     modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 24.dp),
                 )

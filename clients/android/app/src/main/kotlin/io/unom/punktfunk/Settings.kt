@@ -133,6 +133,14 @@ data class Settings(
      * carries it.
      */
     val advancedStats: Boolean = false,
+    /** The stats overlay's corner, a cross-client `hud_placement` name; "" = top left. */
+    val hudPlacement: String = "",
+    /** The stats overlay's size in percent, on top of the display density. The overlay only. */
+    val statsScalePct: Int = 100,
+    /** Show how to leave for a few seconds when a stream starts. */
+    val exitHint: Boolean = true,
+    /** Settings show their advanced rows. Hiding a row keeps its value. */
+    val showAdvanced: Boolean = false,
     /**
      * Touch input model — how touchscreen fingers drive the host. [TouchMode.TRACKPAD] (default):
      * the cursor stays put on touch-down and moves by the finger's relative delta (swipe to nudge,
@@ -650,6 +658,18 @@ object Resolutions {
         if (w <= 0 || h <= 0) return null
         val shape = w.toDouble() / h
         return ASPECTS.indexOfFirst { kotlin.math.abs(shape / it.shape - 1) < TOLERANCE }.takeIf { it >= 0 }
+    }
+
+    /** Smallest stream mode the host accepts, per side. */
+    const val MIN_WIDTH = 320
+    const val MIN_HEIGHT = 200
+
+    /** A typed `w`×`h` as a mode the host takes: each side at least [MIN_WIDTH]×[MIN_HEIGHT], at
+     * most the codec's per-side ceiling, then floored even. Twin of
+     * `punktfunk_core::resolutions::custom`. */
+    fun custom(w: Int, h: Int, codec: String): Pair<Int, Int> {
+        val cap = RenderScale.maxDimension(codec)
+        return w.coerceIn(MIN_WIDTH, cap) / 2 * 2 to h.coerceIn(MIN_HEIGHT, cap) / 2 * 2
     }
 
     /** The size in family [aspect] nearest in height to [h]; native (`0` or a sentinel) looks for

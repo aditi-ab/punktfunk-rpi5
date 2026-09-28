@@ -23,7 +23,7 @@ use pf_client_core::audio_format::{AUDIO_FORMATS, AUDIO_FORMAT_OPUS};
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
 use pf_client_core::presets::SettingsOverlay;
 use pf_client_core::start;
-use pf_client_core::trust::{MouseMode, StatsVerbosity, TouchMode};
+use pf_client_core::trust::{HudCorner, MouseMode, StatsVerbosity, TouchMode};
 use skia_safe::{Canvas, Rect};
 
 /// Dispatch key for adjust/activate. The pad list under "Use controller" can
@@ -199,14 +199,14 @@ const BACKGROUND_TIMEOUTS: [(&str, &str); 4] = [
 ];
 const BACKGROUND_TIMEOUT_DEFAULT: u64 = 10;
 
-/// Apple's `HUDPlacement` raw values.
-const STATS_POSITION_KEY: &str = "hud_placement";
-const STATS_POSITIONS: [(&str, &str); 4] = [
-    ("topLeading", "Top left"),
-    ("topTrailing", "Top right"),
-    ("bottomLeading", "Bottom left"),
-    ("bottomTrailing", "Bottom right"),
-];
+/// The corner each platform's stats overlay sits in until the player picks one.
+pub(crate) fn own_stats_corner(platform: crate::platform::Platform) -> HudCorner {
+    use crate::platform::Platform;
+    match platform {
+        Platform::Desktop | Platform::Android => HudCorner::TopLeft,
+        Platform::Apple | Platform::WebOS | Platform::Web => HudCorner::TopRight,
+    }
+}
 
 /// `"pad"` is the only live value; `"mix"` renders as off. Local copy because
 /// `pad_audio` is `cfg(linux|windows)` and Android still sends the setting.
@@ -309,9 +309,6 @@ impl RowId {
                 Extra::Choice(webos_keys::AUDIO_ROUTE, "software", &WEBOS_AUDIO_ROUTES)
             }
             RowId::HostSort => Extra::Choice(home::HOST_SORT_KEY, "added", &home::HOST_SORTS),
-            RowId::StatsPosition => {
-                Extra::Choice(STATS_POSITION_KEY, "topTrailing", &STATS_POSITIONS)
-            }
             RowId::GamepadUiMode => {
                 Extra::Choice(GAMEPAD_UI_MODE_KEY, "connected", &GAMEPAD_UI_MODES)
             }
@@ -494,6 +491,30 @@ fn family(
     family_of(fams, s.width, s.height).unwrap_or(0)
 }
 
+/// A window the stream can follow (Match window): the desktops, the browser, and every Apple
+/// device but the TV.
+fn has_window(device: &crate::screens::Device) -> bool {
+    use crate::platform::Platform;
+    match device.platform {
+        Platform::Desktop | Platform::Web => true,
+        Platform::Apple => !device.tv,
+        Platform::Android | Platform::WebOS => false,
+    }
+}
+
+/// A stored size the Resolution row's list does not hold: typed here or on another client.
+fn custom_size(
+    s: &pf_client_core::trust::Settings,
+    fams: &[Family],
+    platform: crate::platform::Platform,
+) -> bool {
+    s.width != 0
+        && !s.match_window
+        && !fams[family(s, fams, platform)]
+            .sizes
+            .contains(&(s.width, s.height))
+}
+
 /// Android's Native (safe area) resolution. The flag only counts on a native size.
 fn safe_area(s: &pf_client_core::trust::Settings, platform: crate::platform::Platform) -> bool {
     platform == crate::platform::Platform::Android
@@ -620,6 +641,16 @@ const SYSTEM_BUTTONS: [(&str, &str); 3] = [
 ];
 const GUIDE_GESTURE: [(&str, &str); 3] = [("auto", "Automatic"), ("on", "On"), ("off", "Off")];
 
+/// What the open typed field sets. Y opens it on Bitrate, or on Resolution for a width and then
+/// a height.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Typing {
+    Bitrate,
+    Width,
+    /// The width typed a step earlier.
+    Height(u32),
+}
+
 pub(crate) struct SettingsScreen {
     pub(super) list: MenuList,
     strip: TabStrip,
@@ -635,8 +666,8 @@ pub(crate) struct SettingsScreen {
     overrides: std::collections::HashMap<String, SettingsOverlay>,
     /// D-pad focus on the section strip. TV remotes have no shoulders and no Tab key.
     strip_focus: bool,
-    /// Typed Mbps while Y has the bitrate field open. Y, not A, so A still cycles.
-    custom_bitrate: Option<String>,
+    /// The typed field Y opened, and its digits. Y, not A, so A still cycles.
+    typing: Option<(Typing, String)>,
     /// Tray keyboard. Unused on Deck: Steam's keyboard types (same as add-host).
     keyboard: Keyboard,
     /// How far the keyboard tray is up, 0..1, as the last frame left it.
@@ -660,7 +691,7 @@ impl SettingsScreen {
             presets_at: 0.0,
             overrides: Default::default(),
             strip_focus: false,
-            custom_bitrate: None,
+            typing: None,
             keyboard: Keyboard::new(),
             seat: 0.0,
         }
@@ -668,64 +699,84 @@ impl SettingsScreen {
 
     /// True while the typed field is open; the run loop keeps SDL text input started.
     pub(crate) fn editing(&self) -> bool {
-        self.custom_bitrate.is_some()
+        self.typing.is_some()
     }
 
     pub(crate) fn edit_field(&self) -> Option<crate::screens::EditField> {
-        crate::screens::EditField::new("Bitrate in Mbps", self.custom_bitrate.as_deref()?, true)
+        let (typing, text) = self.typing.as_ref()?;
+        let label = match typing {
+            Typing::Bitrate => "Bitrate in Mbps",
+            Typing::Width => "Width in pixels",
+            Typing::Height(_) => "Height in pixels",
+        };
+        crate::screens::EditField::new(label, text, true)
     }
 
-    /// Digits only; four is 2000 Mbps, the ceiling.
+    /// Digits only; four is 2000 Mbps and 8192 px, the ceilings.
     fn admits(text: &str, ch: char) -> bool {
         permits(Charset::Digits, ch) && text.chars().count() < 4
     }
 
-    /// SDL text into the bitrate field.
+    /// SDL text into the open field.
     pub(crate) fn text_input(&mut self, typed: &str) {
-        if let Some(text) = self.custom_bitrate.as_mut() {
+        if let Some((_, text)) = self.typing.as_mut() {
             type_text(text, typed, Self::admits);
         }
     }
 
     /// Every way out of the field commits it: the typed number is the setting.
     pub(crate) fn edit_key(&mut self, key: crate::input::Key, ctx: &mut Ctx) -> bool {
-        let Some(text) = self.custom_bitrate.as_mut() else {
+        let Some((_, text)) = self.typing.as_mut() else {
             return false;
         };
         let Some(entry) = field_key(key, text) else {
             return false;
         };
         if entry != Entry::Stay {
-            self.commit_custom(ctx);
+            self.commit_field(ctx);
         }
         true
     }
 
-    /// Close the field. Empty or `0` is an abandoned edit, not Automatic (the first rung).
-    fn commit_custom(&mut self, ctx: &mut Ctx) {
-        let Some(text) = self.custom_bitrate.take() else {
+    /// Close the field, or move from the width to the height. Empty or `0` abandons the edit:
+    /// it is not Automatic or Native, the rows' first entries.
+    fn commit_field(&mut self, ctx: &mut Ctx) {
+        let Some((typing, text)) = self.typing.take() else {
             return;
         };
-        let Ok(mbps) = text.parse::<u32>() else {
+        let Some(n) = text.parse::<u32>().ok().filter(|n| *n > 0) else {
             return;
         };
-        if mbps == 0 {
-            return;
+        match typing {
+            Typing::Bitrate => {
+                ctx.write(|c| {
+                    let ceiling_mbps = bitrate_ceiling_kbps(c.device.platform) / 1_000;
+                    c.settings.bitrate_kbps = n.min(ceiling_mbps) * 1000;
+                    true
+                });
+            }
+            Typing::Width => self.typing = Some((Typing::Height(n), String::new())),
+            Typing::Height(w) => {
+                ctx.write(|c| {
+                    let s = &mut *c.settings;
+                    (s.width, s.height) = punktfunk_core::resolutions::custom(w, n, &s.codec);
+                    s.match_window = false;
+                    if c.device.platform == crate::platform::Platform::Android {
+                        set_extra_bool(s, device_keys::SAFE_AREA_MODE, false);
+                    }
+                    true
+                });
+            }
         }
-        ctx.write(|c| {
-            let ceiling_mbps = bitrate_ceiling_kbps(c.device.platform) / 1_000;
-            c.settings.bitrate_kbps = mbps.min(ceiling_mbps) * 1000;
-            true
-        });
     }
 
-    fn custom_menu(&mut self, ev: MenuEvent, ctx: &mut Ctx) -> Option<MenuPulse> {
-        let text = self.custom_bitrate.as_mut()?;
+    fn field_menu(&mut self, ev: MenuEvent, ctx: &mut Ctx) -> Option<MenuPulse> {
+        let (_, text) = self.typing.as_mut()?;
         let (entry, pulse) = self
             .keyboard
             .edit_menu(ev, ctx.device.deck, text, Self::admits);
         if entry != Entry::Stay {
-            self.commit_custom(ctx);
+            self.commit_field(ctx);
         }
         pulse
     }
@@ -814,7 +865,7 @@ impl SettingsScreen {
     pub(crate) fn press(&mut self) {
         if self.strip_focus {
             self.strip.press();
-        } else if self.custom_bitrate.is_none() {
+        } else if self.typing.is_none() {
             self.list.dip();
         }
     }
@@ -851,12 +902,12 @@ impl SettingsScreen {
 
     /// Strip first: pills sit above the list, so a press there is never a row.
     pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
-        if let Some(text) = self.custom_bitrate.as_mut().filter(|_| !ctx.device.deck) {
+        if let Some((_, text)) = self.typing.as_mut().filter(|_| !ctx.device.deck) {
             let Some(entry) = self.keyboard.edit_pointer(p, text, Self::admits) else {
                 return false;
             };
             if entry != Entry::Stay {
-                self.commit_custom(ctx);
+                self.commit_field(ctx);
             }
             return true;
         }
@@ -886,8 +937,8 @@ impl SettingsScreen {
         ctx: &mut Ctx,
         fx: &mut Outbox,
     ) -> Option<MenuPulse> {
-        if self.custom_bitrate.is_some() {
-            return self.custom_menu(ev, ctx);
+        if self.typing.is_some() {
+            return self.field_menu(ev, ctx);
         }
         if self.strip_focus {
             return self.sections_menu(ev, ctx, fx);
@@ -908,16 +959,15 @@ impl SettingsScreen {
         }
         let ids = self.row_ids(ctx);
         self.clamp_cursor(ids.len());
-        // Y opens the typed bitrate. Skip under PyroWave: the row is inert (`row_spec`).
+        // Y opens the typed bitrate or size. Not the bitrate under PyroWave: the row is inert.
         if ev == MenuEvent::Secondary {
-            return if ids.get(self.list.cursor) == Some(&RowId::Bitrate)
-                && ctx.settings.codec != "pyrowave"
-            {
-                self.custom_bitrate = Some(String::new());
-                Some(MenuPulse::Confirm)
-            } else {
-                None
+            let typing = match ids.get(self.list.cursor) {
+                Some(RowId::Bitrate) if ctx.settings.codec != "pyrowave" => Typing::Bitrate,
+                Some(RowId::Resolution) => Typing::Width,
+                _ => return None,
             };
+            self.typing = Some((typing, String::new()));
+            return Some(MenuPulse::Confirm);
         }
         let (msg, pulse) = self.list.menu(ev, ids.len());
         self.apply_row(msg, pulse, &ids, ctx, fx)
@@ -1094,8 +1144,13 @@ impl SettingsScreen {
     }
 
     pub(crate) fn hints(&self, ctx: &Ctx) -> Vec<Hint> {
-        if self.custom_bitrate.is_some() {
-            return entry_hints(ctx.device.deck, "Done");
+        if let Some((typing, _)) = &self.typing {
+            let done = if *typing == Typing::Width {
+                "Next"
+            } else {
+                "Done"
+            };
+            return entry_hints(ctx.device.deck, done);
         }
         // Strip-focused: hints describe the D-pad, not the rows.
         if self.strip_focus {
@@ -1134,6 +1189,11 @@ impl SettingsScreen {
                 Hint::new(HintKey::Secondary, "Type a rate"),
                 Hint::new(HintKey::Back, "Done"),
             ],
+            Some(RowId::Resolution) => vec![
+                Hint::new(HintKey::Adjust, "Adjust"),
+                Hint::new(HintKey::Secondary, "Type a size"),
+                Hint::new(HintKey::Back, "Done"),
+            ],
             Some(_) => vec![
                 Hint::new(HintKey::Adjust, "Adjust"),
                 Hint::new(HintKey::Confirm, "Change"),
@@ -1154,7 +1214,7 @@ impl SettingsScreen {
     ) {
         self.seat = self
             .keyboard
-            .seat(self.custom_bitrate.is_some() && !ctx.device.deck, dt);
+            .seat(self.typing.is_some() && !ctx.device.deck, dt);
         self.sync_presets(ctx);
         let list_rect = self.list_rect(rect, k);
         let ids = self.row_ids(ctx);
@@ -1163,18 +1223,23 @@ impl SettingsScreen {
             .iter()
             .map(|id| row_spec(*id, ctx, &self.presets, &self.overrides))
             .collect();
-        // Field-open: the Bitrate row shows the typed digits and the caret.
-        if let (Some(text), Some(i)) = (
-            self.custom_bitrate.as_ref(),
-            ids.iter().position(|id| *id == RowId::Bitrate),
-        ) {
-            rows[i].value = Some(if text.is_empty() {
-                "Mbps".into()
-            } else {
-                format!("{text} Mbps")
-            });
-            rows[i].value_dim = text.is_empty();
-            rows[i].caret = true;
+        // Field-open: the row being typed shows the digits so far and the caret.
+        if let Some((typing, text)) = self.typing.as_ref() {
+            let (row, value) = match typing {
+                Typing::Bitrate if text.is_empty() => (RowId::Bitrate, "Mbps".into()),
+                Typing::Bitrate => (RowId::Bitrate, format!("{text} Mbps")),
+                Typing::Width if text.is_empty() => (RowId::Resolution, "Width".into()),
+                Typing::Width => (RowId::Resolution, format!("{text} × \u{2026}")),
+                Typing::Height(w) if text.is_empty() => {
+                    (RowId::Resolution, format!("{w} × height"))
+                }
+                Typing::Height(w) => (RowId::Resolution, format!("{w} × {text}")),
+            };
+            if let Some(i) = ids.iter().position(|id| *id == row) {
+                rows[i].value = Some(value);
+                rows[i].value_dim = text.is_empty();
+                rows[i].caret = true;
+            }
         }
         // Rows run on under the section strip and the explainer, on the shell's trays;
         // with the keyboard up they stay in their band, or a tray would slab the keys.
@@ -1187,7 +1252,7 @@ impl SettingsScreen {
             k,
             dt,
             // No row focus ring while the tray or the strip holds it.
-            self.custom_bitrate.is_none() && !self.strip_focus,
+            self.typing.is_none() && !self.strip_focus,
         );
         if self.seat > 0.0 {
             self.keyboard.render(
@@ -1274,8 +1339,21 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
         RowId::Controllers => &[Android, WebOS, Apple],
         // Apps a phone or TV can put in the background; `row_applies` drops the Mac.
         RowId::BackgroundKeepAlive | RowId::BackgroundTimeout => &[Android, Apple],
-        // Apple draws the statistics overlay itself, in a corner the player picks.
-        RowId::StatsPosition => &[Apple],
+        // The clients whose overlays place the statistics by `hud_placement`.
+        RowId::StatsPosition => &[Desktop, Android, Apple],
+        // The webOS session never reads these; its TV builds its own session from a few keys.
+        RowId::Compositor
+        | RowId::RenderScale
+        | RowId::AudioFormat
+        | RowId::KeepHostAudio
+        | RowId::Mic
+        | RowId::EchoCancel
+        | RowId::PadForward
+        | RowId::SystemButtons
+        | RowId::GuideGesture
+        | RowId::Touch => &[Desktop, Android, Apple, Platform::Web],
+        // DualSense voice coils and speaker: no Apple or browser client plays them.
+        RowId::PadHaptics | RowId::PadSpeaker => &[Desktop, Android, WebOS],
         // Every client ships third-party code. The browser build has no bundle to list.
         RowId::Licenses => &[Desktop, Android, WebOS, Apple],
         // DualSense capture — the pad reaches webOS over Bluetooth HID, not hidraw, so the
@@ -1316,7 +1394,16 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
 /// latency the quantity does not exist, so the row is dropped. It sits directly
 /// below the intent row so the cursor is never on a row that vanishes.
 pub fn row_applies(id: RowId, ctx: &Ctx) -> bool {
+    let apple = ctx.device.platform == crate::platform::Platform::Apple;
     match id {
+        // The Apple app reads these on the Mac alone, as its own settings offer them.
+        RowId::Vsync | RowId::Shortcuts | RowId::Mouse if apple => is_mac(ctx),
+        // An Apple TV has no touchscreen, microphone, scroll wheel or variable refresh.
+        RowId::Touch | RowId::Mic | RowId::EchoCancel | RowId::InvertScroll | RowId::AllowVrr
+            if apple =>
+        {
+            !ctx.device.tv
+        }
         RowId::SmoothBuffer => ctx.settings.present_priority == "smooth",
         // Needs `fallback_ui`; otherwise off strands the user with no UI.
         RowId::GamepadUi => ctx.device.fallback_ui,
@@ -1630,12 +1717,14 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         RowId::Resolution => (
             None,
             "Resolution",
-            if s.match_window {
+            if s.match_window && has_window(ctx.device) {
                 "Match window".into()
             } else if safe_area(s, ctx.device.platform) {
                 "Native (safe area)".into()
             } else if s.width == 0 {
                 "Native".into()
+            } else if custom_size(s, &families(ctx.device.screen), ctx.device.platform) {
+                format!("Custom ({} × {})", s.width, s.height)
             } else {
                 format!("{} × {}", s.width, s.height)
             },
@@ -1831,7 +1920,13 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
             "Group hosts by",
             label_for(&home::HOST_GROUPINGS, host_grouping(s)).into(),
         ),
-        RowId::StatsPosition => (None, "Stats position", extra()),
+        RowId::StatsPosition => (
+            None,
+            "Stats position",
+            s.hud_corner(own_stats_corner(ctx.device.platform))
+                .label()
+                .into(),
+        ),
         RowId::BackgroundKeepAlive => (None, "Keep streaming in background", extra()),
         RowId::BackgroundTimeout => (
             None,
@@ -1914,7 +2009,7 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
     match id {
         RowId::Resolution => {
             "The host creates a virtual display at exactly this size — no scaling. \
-             Match window follows this window, including mid-stream resizes."
+             Y types any size."
         }
         RowId::Aspect => {
             "Which shapes the Resolution row offers. Picking one moves to its size \
@@ -2248,36 +2343,40 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
     }
     let platform = ctx.device.platform;
     let fams = families(ctx.device.screen);
+    let window = has_window(ctx.device);
     let s = &mut *ctx.settings;
     match id {
         RowId::Resolution => {
-            // Native, Native (safe area) on Android, Match window, then the current
-            // family's sizes. The policies before the sizes all clear w/h.
+            // Native, Native (safe area) on Android, Match window where there is a window, the
+            // current family's sizes, then a typed size while one is stored. The policies before
+            // the sizes all clear w/h; stepping onto the typed size is a no-op, so it only reads.
             let sizes = &fams[family(s, &fams, platform)].sizes;
             let android = platform == crate::platform::Platform::Android;
-            let matching = if android { 2 } else { 1 };
-            let cur = if s.match_window {
-                Some(matching)
+            let match_i = 1 + usize::from(android);
+            let first = match_i + usize::from(window);
+            let custom = custom_size(s, &fams, platform);
+            let len = sizes.len() + first + usize::from(custom);
+            let cur = if s.match_window && window {
+                Some(match_i)
             } else if safe_area(s, platform) {
                 Some(1)
             } else if s.width == 0 {
                 Some(0)
+            } else if custom {
+                Some(len - 1)
             } else {
                 sizes
                     .iter()
                     .position(|&wh| wh == (s.width, s.height))
-                    .map(|i| i + matching + 1)
+                    .map(|i| i + first)
             };
-            step_option(cur, sizes.len() + matching + 1, delta, wrap).map(|i| {
-                s.match_window = i == matching;
+            let stepped = step_option(cur, len, delta, wrap).filter(|i| !(custom && *i == len - 1));
+            stepped.map(|i| {
+                s.match_window = window && i == match_i;
                 if android {
                     set_extra_bool(s, device_keys::SAFE_AREA_MODE, i == 1);
                 }
-                (s.width, s.height) = if i <= matching {
-                    (0, 0)
-                } else {
-                    sizes[i - matching - 1]
-                };
+                (s.width, s.height) = if i < first { (0, 0) } else { sizes[i - first] };
             })
         }
         RowId::Aspect => {
@@ -2443,8 +2542,14 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         | RowId::GamepadUi
         | RowId::BackgroundKeepAlive
         | RowId::HostSort
-        | RowId::StatsPosition
         | RowId::GamepadUiMode => id.extra().and_then(|e| e.step(s, delta, wrap)),
+        RowId::StatsPosition => {
+            let at = HudCorner::ALL
+                .iter()
+                .position(|c| *c == s.hud_corner(own_stats_corner(platform)));
+            step_option(at, HudCorner::ALL.len(), delta, wrap)
+                .map(|i| s.hud_placement = HudCorner::ALL[i].as_name().into())
+        }
         RowId::BackgroundTimeout => {
             let mut v = background_timeout(s).to_string();
             step_str(&BACKGROUND_TIMEOUTS, &mut v, delta, wrap).map(|()| {

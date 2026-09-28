@@ -76,6 +76,66 @@ impl StatsVerbosity {
     }
 }
 
+/// Corner the stats overlay sits in. Stored by Apple's `HUDPlacement` names, which devices
+/// already hold; an empty or unknown name is the client's own corner.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HudCorner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl HudCorner {
+    pub const ALL: [HudCorner; 4] = [
+        HudCorner::TopLeft,
+        HudCorner::TopRight,
+        HudCorner::BottomLeft,
+        HudCorner::BottomRight,
+    ];
+
+    pub fn from_name(s: &str) -> Option<HudCorner> {
+        HudCorner::ALL.into_iter().find(|c| c.as_name() == s)
+    }
+
+    pub fn as_name(self) -> &'static str {
+        match self {
+            HudCorner::TopLeft => "topLeading",
+            HudCorner::TopRight => "topTrailing",
+            HudCorner::BottomLeft => "bottomLeading",
+            HudCorner::BottomRight => "bottomTrailing",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            HudCorner::TopLeft => "Top left",
+            HudCorner::TopRight => "Top right",
+            HudCorner::BottomLeft => "Bottom left",
+            HudCorner::BottomRight => "Bottom right",
+        }
+    }
+
+    pub fn right(self) -> bool {
+        matches!(self, HudCorner::TopRight | HudCorner::BottomRight)
+    }
+
+    pub fn bottom(self) -> bool {
+        matches!(self, HudCorner::BottomLeft | HudCorner::BottomRight)
+    }
+}
+
+/// Stats overlay sizes offered, in percent of the display scale.
+pub const STATS_SCALE_PCTS: [u16; 6] = [75, 100, 125, 150, 175, 200];
+
+/// A stored stats size as a multiplier: clamped to [`STATS_SCALE_PCTS`]' range, `0` = 100 %.
+pub fn stats_scale(pct: u16) -> f32 {
+    if pct == 0 {
+        return 1.0;
+    }
+    f32::from(pct.clamp(STATS_SCALE_PCTS[0], STATS_SCALE_PCTS[5])) / 100.0
+}
+
 /// One stage over a window, µs. `n == 0` means unmeasured, never zero latency.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[cfg_attr(
@@ -1370,6 +1430,31 @@ fn standard_lines(s: &StatsSnapshot, tier: StatsVerbosity) -> Vec<HudLine> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Apple devices already store these names; they must round-trip unchanged.
+    #[test]
+    fn hud_corner_reads_apples_names() {
+        for c in HudCorner::ALL {
+            assert_eq!(HudCorner::from_name(c.as_name()), Some(c));
+        }
+        assert_eq!(
+            HudCorner::from_name("topTrailing"),
+            Some(HudCorner::TopRight)
+        );
+        assert_eq!(HudCorner::from_name(""), None);
+        assert_eq!(HudCorner::from_name("middle"), None);
+        assert!(HudCorner::BottomRight.right() && HudCorner::BottomRight.bottom());
+        assert!(!HudCorner::TopLeft.right() && !HudCorner::TopLeft.bottom());
+    }
+
+    #[test]
+    fn stats_scale_clamps_and_reads_zero_as_default() {
+        assert_eq!(stats_scale(100), 1.0);
+        assert_eq!(stats_scale(150), 1.5);
+        assert_eq!(stats_scale(0), 1.0);
+        assert_eq!(stats_scale(10), 0.75);
+        assert_eq!(stats_scale(900), 2.0);
+    }
 
     #[test]
     fn rank_is_len_times_pct_clamped() {

@@ -287,6 +287,15 @@ public enum DefaultsKey {
     /// Which corner the statistics overlay sits in — a `HUDPlacement` raw value
     /// ("topLeading"/"topTrailing"/"bottomLeading"/"bottomTrailing"). Default top-trailing.
     public static let hudPlacement = "punktfunk.hudPlacement"
+    /// The statistics overlay's size in percent, on top of the system text size (cross-client
+    /// `stats_scale_pct`). Default 100.
+    public static let statsScalePct = "punktfunk.statsScalePct"
+    /// Show how to leave for a few seconds when a stream starts (cross-client `exit_hint`).
+    /// Default on.
+    public static let exitHint = "punktfunk.exitHint"
+    /// Settings show their advanced rows (cross-client `show_advanced`). Default off; hiding a
+    /// row keeps its value.
+    public static let showAdvanced = "punktfunk.showAdvanced"
     /// The stats overlay's vocabulary: false (default) shows the figures Moonlight's overlay also
     /// shows, true the Advanced capture-to-glass view. Device-wide; a preset never carries it.
     public static let advancedStats = "punktfunk.advancedStats"

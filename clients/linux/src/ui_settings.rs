@@ -94,15 +94,25 @@ mod index {
     }
 
     pub fn resolution(s: &Settings) -> u32 {
-        // Index 1 is the virtual "Match window" entry; 0 = Native, 2.. = the family's sizes.
+        // 0 = Native, 1 = the virtual "Match window" entry, 2.. = the family's sizes, and
+        // Custom last for a size no family lists.
         if s.match_window {
             return 1;
         }
-        ASPECTS[aspect(s) as usize]
+        if s.width == 0 {
+            return 0;
+        }
+        let family = aspect(s) as usize;
+        ASPECTS[family]
             .sizes
             .iter()
             .position(|&(w, h)| w == s.width && h == s.height)
-            .map_or(0, |i| i as u32 + 2)
+            .map_or(custom(family), |i| i as u32 + 2)
+    }
+
+    /// The Resolution row's Custom entry for a family: after Native, Match window and its sizes.
+    pub fn custom(family: usize) -> u32 {
+        ASPECTS[family].sizes.len() as u32 + 2
     }
 
     pub fn refresh(s: &Settings) -> u32 {
@@ -1225,7 +1235,7 @@ fn resolution_caption(i: u32) -> &'static str {
 }
 
 /// The Resolution row's entries for one family: the D1 tri-state's Native and Match window,
-/// then that family's sizes.
+/// that family's sizes, then Custom, which shows the Width and Height rows.
 fn resolution_names(family: usize) -> Vec<String> {
     ["Native display".to_string(), "Match window".to_string()]
         .into_iter()
@@ -1235,7 +1245,33 @@ fn resolution_names(family: usize) -> Vec<String> {
                 .iter()
                 .map(|&(w, h)| format!("{w} × {h}")),
         )
+        .chain(["Custom\u{2026}".to_string()])
         .collect()
+}
+
+/// A Width or Height row for a typed size, hidden until Resolution is on Custom.
+fn size_row(title: &str, min: u32) -> adw::SpinRow {
+    let row = adw::SpinRow::with_range(f64::from(min), 8192.0, 2.0);
+    row.set_title(title);
+    row.set_visible(false);
+    row
+}
+
+const BITRATE_CAPTION: &str =
+    "Mbit/s · 0 = host default · a host card's menu has a network speed test";
+
+/// Under PyroWave the host sets the rate from the stream mode: the Bitrate row greys out and
+/// says so. The stored rate stays for the other codecs.
+fn lock_bitrate(row: &adw::SpinRow, pyrowave: bool) {
+    row.set_sensitive(!pyrowave);
+    set_row_subtitle(
+        row.upcast_ref(),
+        if pyrowave {
+            "PyroWave sets its own rate from the stream mode"
+        } else {
+            BITRATE_CAPTION
+        },
+    );
 }
 
 /// The SELECTED codec explained: the PyroWave entry is the one that needs its trade-off
@@ -1411,6 +1447,9 @@ struct Rows {
 
 struct DisplayRows {
     res_row: ChoiceRow,
+    /// The typed size, shown while [`Self::res_row`] is on Custom.
+    width_row: adw::SpinRow,
+    height_row: adw::SpinRow,
     aspect_row: ChoiceRow,
     shown_family: Rc<Cell<usize>>,
     hz_row: ChoiceRow,
@@ -1481,6 +1520,8 @@ impl Rows {
             display:
                 DisplayRows {
                     res_row,
+                    width_row,
+                    height_row,
                     aspect_row,
                     hz_row,
                     scale_row,
@@ -1538,10 +1579,22 @@ impl Rows {
                 },
             ..
         } = self;
-        aspect_row.set_selected(index::aspect(s)); // re-lists `res_row` for the family
+        // The typed size starts from the stored one, or from 1080p for Native and Match window.
+        let (w, h) = if s.width == 0 {
+            (1920, 1080)
+        } else {
+            (s.width, s.height)
+        };
+        width_row.set_value(f64::from(w));
+        height_row.set_value(f64::from(h));
+        let family = index::aspect(s);
+        aspect_row.set_selected(family); // re-lists `res_row` for the family
         let res_i = index::resolution(s);
         res_row.set_selected(res_i);
         set_row_subtitle(res_row.widget(), resolution_caption(res_i));
+        let custom = res_i == index::custom(family as usize);
+        width_row.set_visible(custom);
+        height_row.set_visible(custom);
         hz_row.set_selected(index::refresh(s));
         scale_row.set_selected(index::render_scale(s));
         bitrate_row.set_value(f64::from(s.bitrate_kbps) / 1000.0);
@@ -1596,6 +1649,7 @@ impl Rows {
         let codec_i = index::codec(s);
         codec_row.set_selected(codec_i);
         set_row_subtitle(codec_row.widget(), codec_caption(codec_i));
+        lock_bitrate(bitrate_row, s.codec == "pyrowave");
         let fit_i = index::video_fit(s);
         fit_row.set_selected(fit_i);
         set_row_subtitle(fit_row.widget(), VIDEO_FIT_CAPTIONS[fit_i as usize]);
@@ -1629,6 +1683,8 @@ impl Rows {
             display:
                 DisplayRows {
                     res_row,
+                    width_row,
+                    height_row,
                     aspect_row,
                     hz_row,
                     scale_row,
@@ -1813,7 +1869,8 @@ impl Rows {
         }
 
         // `choice!` for the Resolution row, whose revert first puts the Aspect row back so
-        // the family is re-listed before the size is re-seated.
+        // the family is re-listed before the size is re-seated. The typed size is the same
+        // override, so its two rows mark it too.
         {
             let overridden = o.width.is_some() || o.height.is_some() || o.match_window.is_some();
             let revert = {
@@ -1823,24 +1880,37 @@ impl Rows {
                     globals.clone(),
                     touched.clone(),
                 );
+                let (width, height) = (width_row.clone(), height_row.clone());
                 Box::new(move || {
                     touched.set_suspended(true);
+                    if globals.width != 0 {
+                        width.set_value(f64::from(globals.width));
+                        height.set_value(f64::from(globals.height));
+                    }
                     aspect.set_selected(index::aspect(&globals));
                     res.set_selected(index::resolution(&globals));
                     touched.set_suspended(false);
                 }) as Box<dyn Fn()>
             };
             let show = mark(res_row.widget(), "resolution", overridden, revert);
-            let t = touched.clone();
-            res_row.connect_changed(move |_| {
-                if t.suspended() {
-                    return;
-                }
-                t.mark("resolution");
-                if let Some(show) = &show {
-                    show();
-                }
-            });
+            let touch = {
+                let t = touched.clone();
+                Rc::new(move || {
+                    if t.suspended() {
+                        return;
+                    }
+                    t.mark("resolution");
+                    if let Some(show) = &show {
+                        show();
+                    }
+                })
+            };
+            let f = touch.clone();
+            res_row.connect_changed(move |_| f());
+            for row in [width_row, height_row] {
+                let f = touch.clone();
+                row.connect_value_notify(move |_| f());
+            }
         }
         choice!(hz_row, "refresh_hz", o.refresh_hz.is_some(), index::refresh);
         choice!(
@@ -2022,6 +2092,8 @@ impl Rows {
             display:
                 DisplayRows {
                     res_row,
+                    width_row,
+                    height_row,
                     shown_family,
                     hz_row,
                     scale_row,
@@ -2087,28 +2159,25 @@ impl Rows {
             quick,
             ..
         } = self;
-        // A value these tables cannot list (a size typed into another client's custom
-        // fields, a refresh rate off the ladder) displays as the fallback rung, so writing
-        // it back erases it just by opening and closing. Write only what a table lists, or
-        // what moved — the rule the gamepad and pad-speaker rows below already follow.
-        let listed_res = s.match_window
-            || (s.width, s.height) == (0, 0)
-            || ASPECTS
-                .iter()
-                .any(|a| a.sizes.contains(&(s.width, s.height)));
-        let (seed_res, seed_hz, seed_scale) = (
-            index::resolution(s),
-            index::refresh(s),
-            index::render_scale(s),
-        );
-        // Index 1 is the virtual "Match window" option; 0 = Native, 2.. = the listed
-        // family's sizes.
+        // A value these tables cannot list (a refresh rate off the ladder) displays as the
+        // fallback rung, so writing it back erases it just by opening and closing. Write only
+        // what a table lists, or what moved — the rule the gamepad and pad-speaker rows below
+        // already follow. Any size is listable: a size no family has is Custom.
+        let (seed_hz, seed_scale) = (index::refresh(s), index::render_scale(s));
+        // 0 = Native, 1 = Match window, 2.. = the shown family's sizes, Custom last.
         let sizes = ASPECTS[shown_family.get()].sizes;
-        let res_i = (res_row.selected() as usize).min(sizes.len() + 1);
-        if listed_res || res_i as u32 != seed_res {
-            s.match_window = res_i == 1;
-            (s.width, s.height) = if res_i <= 1 { (0, 0) } else { sizes[res_i - 2] };
-        }
+        let custom_i = sizes.len() + 2;
+        let res_i = (res_row.selected() as usize).min(custom_i);
+        s.match_window = res_i == 1;
+        (s.width, s.height) = match res_i {
+            0 | 1 => (0, 0),
+            i if i == custom_i => punktfunk_core::resolutions::custom(
+                width_row.value() as u32,
+                height_row.value() as u32,
+                CODECS[(codec_row.selected() as usize).min(CODECS.len() - 1)],
+            ),
+            i => sizes[i - 2],
+        };
         let hz_i = (hz_row.selected() as usize).min(REFRESH.len() - 1);
         if REFRESH.contains(&s.refresh_hz) || hz_i as u32 != seed_hz {
             s.refresh_hz = REFRESH[hz_i];
@@ -2244,10 +2313,8 @@ fn display_rows(
         resolution_caption(0),
         &res_names.iter().map(String::as_str).collect::<Vec<_>>(),
     );
-    {
-        let w = res_row.widget().clone();
-        res_row.connect_changed(move |i| set_row_subtitle(&w, resolution_caption(i)));
-    }
+    let width_row = size_row("Width", punktfunk_core::resolutions::MIN_WIDTH);
+    let height_row = size_row("Height", punktfunk_core::resolutions::MIN_HEIGHT);
     let aspect_row = ChoiceRow::new(
         dialog,
         inline,
@@ -2258,15 +2325,31 @@ fn display_rows(
     // The family the Resolution row lists right now; only the handler below moves it.
     let shown_family = Rc::new(Cell::new(0usize));
     {
-        let (res, shown) = (res_row.clone(), shown_family.clone());
+        let (w, shown) = (res_row.widget().clone(), shown_family.clone());
+        let (width, height) = (width_row.clone(), height_row.clone());
+        res_row.connect_changed(move |i| {
+            set_row_subtitle(&w, resolution_caption(i));
+            let custom = i == index::custom(shown.get());
+            width.set_visible(custom);
+            height.set_visible(custom);
+        });
+    }
+    {
+        let (res, shown, height) = (res_row.clone(), shown_family.clone(), height_row.clone());
         aspect_row.connect_changed(move |g| {
             // Re-list the family and land on its size nearest the one shown, so the two
-            // rows never disagree. Native and Match window count as 1080 (`nearest`).
+            // rows never disagree. Native and Match window count as 1080 (`nearest`); a typed
+            // size counts as its height.
             let g = g as usize;
-            let h = (res.selected() as usize)
-                .checked_sub(2)
-                .and_then(|i| ASPECTS[shown.get()].sizes.get(i))
-                .map_or(0, |&(_, h)| h);
+            let at = res.selected();
+            let h = if at == index::custom(shown.get()) {
+                height.value() as u32
+            } else {
+                (at as usize)
+                    .checked_sub(2)
+                    .and_then(|i| ASPECTS[shown.get()].sizes.get(i))
+                    .map_or(0, |&(_, h)| h)
+            };
             shown.set(g);
             res.set_options(&resolution_names(g));
             let target = nearest(g, h);
@@ -2308,8 +2391,7 @@ fn display_rows(
     // could not name any of them, and typing was the only way to reach one.
     let bitrate_row = adw::SpinRow::with_range(0.0, 3000.0, 1.0);
     bitrate_row.set_title("Bitrate");
-    bitrate_row
-        .set_subtitle("Mbit/s · 0 = host default · a host card's menu has a network speed test");
+    bitrate_row.set_subtitle(BITRATE_CAPTION);
     let codec_row = ChoiceRow::new(
         dialog,
         inline,
@@ -2318,8 +2400,11 @@ fn display_rows(
         CODEC_LABELS,
     );
     {
-        let w = codec_row.widget().clone();
-        codec_row.connect_changed(move |i| set_row_subtitle(&w, codec_caption(i)));
+        let (w, b) = (codec_row.widget().clone(), bitrate_row.clone());
+        codec_row.connect_changed(move |i| {
+            set_row_subtitle(&w, codec_caption(i));
+            lock_bitrate(&b, CODECS.get(i as usize) == Some(&"pyrowave"));
+        });
     }
     let hdr_row = adw::SwitchRow::builder()
         .title("10-bit HDR")
@@ -2456,6 +2541,8 @@ fn display_rows(
     );
     DisplayRows {
         res_row,
+        width_row,
+        height_row,
         aspect_row,
         shown_family,
         hz_row,
@@ -2895,6 +2982,8 @@ fn add_pages(
         display:
             DisplayRows {
                 res_row,
+                width_row,
+                height_row,
                 aspect_row,
                 hz_row,
                 scale_row,
@@ -3003,6 +3092,8 @@ fn add_pages(
     let resolution_group = group("Resolution", "");
     resolution_group.add(aspect_row.widget());
     resolution_group.add(res_row.widget());
+    resolution_group.add(width_row);
+    resolution_group.add(height_row);
     resolution_group.add(hz_row.widget());
     let quality_group = group("Quality", "");
     quality_group.add(scale_row.widget());
@@ -3142,24 +3233,39 @@ mod tests {
     /// The premise the write guard rests on: a stored value this dialog's table does not
     /// list seeds the row at a FALLBACK rung, indistinguishable from the user having chosen
     /// that rung. `apply_rows` therefore leaves such a row alone unless it moved — otherwise
-    /// opening and closing Settings rewrites a value another client set.
+    /// opening and closing Settings rewrites a value another client set. A size is the
+    /// exception: one no family lists seeds Custom, which shows it.
     ///
     /// No display needed: these are the pure index helpers the rows are seeded from.
     #[test]
     fn off_ladder_values_seed_a_fallback_rung() {
-        // A size typed into another client's custom fields: 3:2 by shape, listed by no family.
+        // A size typed on another client: 3:2 by shape, listed by no family.
         let custom = Settings {
             width: 1500,
             height: 1000,
             ..Default::default()
         };
         assert_eq!(index::aspect(&custom), 4, "lists the 3:2 family");
-        assert_eq!(index::resolution(&custom), 0, "seeds Native, not 1500x1000");
+        assert_eq!(
+            index::resolution(&custom),
+            index::custom(4),
+            "seeds Custom, which holds 1500x1000"
+        );
+        assert_eq!(
+            resolution_names(4).last().map(String::as_str),
+            Some("Custom\u{2026}")
+        );
         assert!(
             !ASPECTS
                 .iter()
                 .any(|a| a.sizes.contains(&(custom.width, custom.height))),
             "the premise: no family can show it"
+        );
+        let native = Settings::default();
+        assert_eq!(
+            index::resolution(&native),
+            0,
+            "Native stays the first entry"
         );
         // The Steam Deck's panel is the first 16:10 size: family 1, row 2 (after Native and
         // Match window), so it round-trips.

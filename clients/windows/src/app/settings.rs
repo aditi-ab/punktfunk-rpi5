@@ -799,6 +799,9 @@ struct Cx<'a> {
     s: Settings,
     over: OverrideFlags,
     preset_mode: bool,
+    /// Resolution sits on Custom… though the stored size is a listed one.
+    custom_res: bool,
+    set_custom_res: &'a AsyncSetState<bool>,
 }
 
 /// General: session, statistics.
@@ -811,6 +814,7 @@ fn general_section(cx: &Cx) -> Vec<Element> {
         ref s,
         ref over,
         preset_mode,
+        ..
     } = *cx;
     let auto_wake_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.auto_wake, |s, on| {
         s.auto_wake = on
@@ -917,6 +921,7 @@ fn display_section(cx: &Cx) -> Vec<Element> {
         ref s,
         ref over,
         preset_mode,
+        ..
     } = *cx;
     // The Aspect combo picks a family and lands on its size nearest the current height. The
     // Resolution combo is the D1 tri-state — Native, Match window (a virtual index 1, stored
@@ -933,14 +938,22 @@ fn display_section(cx: &Cx) -> Vec<Element> {
             (s.width, s.height) = nearest(i, s.height);
         },
     );
+    // Native, Match window, the family's sizes, then Custom…, which shows Width and Height.
+    // A size no family lists is Custom whatever the flag says.
     let sizes = ASPECTS[family].sizes;
+    let custom_i = sizes.len() + 2;
+    let custom =
+        !s.match_window && s.width != 0 && (cx.custom_res || !sizes.contains(&(s.width, s.height)));
     let (res_names, res_i) = {
         let names: Vec<String> = ["Native display".to_string(), "Match window".to_string()]
             .into_iter()
             .chain(sizes.iter().map(|&(w, h)| format!("{w} \u{00D7} {h}")))
+            .chain(["Custom\u{2026}".to_string()])
             .collect();
         let i = if s.match_window {
             1
+        } else if custom {
+            custom_i
         } else {
             sizes
                 .iter()
@@ -949,10 +962,57 @@ fn display_section(cx: &Cx) -> Vec<Element> {
         };
         (names, i)
     };
-    let res_combo = setting_combo(ctx, scope, (rev, set_rev), res_names, res_i, move |s, i| {
-        s.match_window = i == 1;
-        (s.width, s.height) = if i <= 1 { (0, 0) } else { sizes[i - 2] };
-    });
+    let res_combo = {
+        let set_custom = cx.set_custom_res.clone();
+        setting_combo(ctx, scope, (rev, set_rev), res_names, res_i, move |s, i| {
+            set_custom.call(i == custom_i);
+            s.match_window = i == 1;
+            (s.width, s.height) = match i {
+                0 | 1 => (0, 0),
+                // Custom starts from the size shown, or 1080p from Native.
+                i if i == custom_i && s.width == 0 => (1920, 1080),
+                i if i == custom_i => (s.width, s.height),
+                i => sizes[i - 2],
+            };
+        })
+    };
+    // Each box writes its side through the shared rule, keeping the other side as stored.
+    let size_box = |value: u32, min: u32, width: bool| {
+        let (ctx, scope, set_rev) = (ctx.clone(), scope.to_string(), set_rev.clone());
+        NumberBox::new(f64::from(value))
+            .range(f64::from(min), 8192.0)
+            .on_value_changed(move |v: f64| {
+                commit(&ctx, &scope, (rev, &set_rev), |s| {
+                    let typed = v.clamp(0.0, 8192.0) as u32;
+                    let (w, h) = if width {
+                        (typed, s.height)
+                    } else {
+                        (s.width, typed)
+                    };
+                    (s.width, s.height) = punktfunk_core::resolutions::custom(w, h, &s.codec);
+                    s.match_window = false;
+                });
+            })
+    };
+    let res_control: Element = if custom {
+        vstack((
+            Element::from(res_combo),
+            hstack((
+                size_box(s.width, punktfunk_core::resolutions::MIN_WIDTH, true)
+                    .header("Width")
+                    .width(120.0),
+                text_block("\u{00D7}").vertical_alignment(VerticalAlignment::Bottom),
+                size_box(s.height, punktfunk_core::resolutions::MIN_HEIGHT, false)
+                    .header("Height")
+                    .width(120.0),
+            ))
+            .spacing(8.0),
+        ))
+        .spacing(8.0)
+        .into()
+    } else {
+        res_combo.into()
+    };
     let (hz_names, hz_i) = {
         let names: Vec<String> = REFRESH
             .iter()
@@ -1027,6 +1087,8 @@ fn display_section(cx: &Cx) -> Vec<Element> {
         let (ctx, scope, set_rev) = (ctx.clone(), scope.to_string(), set_rev.clone());
         NumberBox::new(f64::from(s.bitrate_kbps) / 1000.0)
             .range(0.0, 3000.0)
+            // PyroWave sets its own rate; the stored one stays for the other codecs.
+            .enabled(s.codec != "pyrowave")
             .on_value_changed(move |v: f64| {
                 commit(&ctx, &scope, (rev, &set_rev), |s| {
                     s.bitrate_kbps = (v.clamp(0.0, 3000.0) * 1000.0) as u32;
@@ -1088,7 +1150,7 @@ fn display_section(cx: &Cx) -> Vec<Element> {
                 "resolution",
                 "Resolution",
                 over.resolution,
-                res_combo,
+                res_control,
                 "The host drives a real virtual output at exactly this size \u{2014} true \
                  pixels, no scaling. \u{201C}Native display\u{201D} follows the monitor this \
                  window is on; \u{201C}Match window\u{201D} keeps the picture pixel-exact \
@@ -1127,8 +1189,12 @@ fn display_section(cx: &Cx) -> Vec<Element> {
                 "Bitrate (Mb/s, 0 = automatic)",
                 over.bitrate_kbps,
                 bitrate_box,
-                "0 lets the host decide (its default, clamped to what it supports). A \
-                 host card\u{2019}s context menu has a network speed test.",
+                if s.codec == "pyrowave" {
+                    "PyroWave sets its own rate from the stream mode."
+                } else {
+                    "0 lets the host decide (its default, clamped to what it supports). A \
+                     host card\u{2019}s context menu has a network speed test."
+                },
             ),
             described_overridable(
                 (rev, set_rev),
@@ -1414,6 +1480,7 @@ fn controllers_section(cx: &Cx) -> Vec<Element> {
         ref s,
         ref over,
         preset_mode,
+        ..
     } = *cx;
     // Controller forwarding: Automatic forwards EVERY real controller, each as its own pad;
     // pinning one restricts the session to that single controller (single-player). Persisted
@@ -1654,6 +1721,7 @@ fn audio_section(cx: &Cx) -> Vec<Element> {
         ref s,
         ref over,
         preset_mode,
+        ..
     } = *cx;
     let (ac_names, ac_i) = presets(AUDIO_CHANNELS, |v| *v == s.audio_channels);
     let channels_combo = setting_combo(ctx, scope, (rev, set_rev), ac_names, ac_i, |s, i| {
@@ -1867,6 +1935,8 @@ pub(crate) fn settings_page(
     set_delete: &AsyncSetState<Option<String>>,
     edit_open: bool,
     set_edit: &AsyncSetState<bool>,
+    custom_res: bool,
+    set_custom_res: &AsyncSetState<bool>,
     rev: u64,
     set_rev: &AsyncSetState<u64>,
     progress: f64,
@@ -1900,6 +1970,8 @@ pub(crate) fn settings_page(
         s,
         over,
         preset_mode,
+        custom_res,
+        set_custom_res,
     };
     // The selected section's content, grouped exactly like the Apple client's categories
     // (SettingsCategory + SettingsView+Sections.swift). Each section builds only its own rows.

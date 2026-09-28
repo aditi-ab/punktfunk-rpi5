@@ -14,10 +14,10 @@
 import Foundation
 
 public struct EffectiveSettings: Equatable, Sendable {
-    // Tier P — presetable (design §3).
-    public var width = 1920
-    public var height = 1080
-    public var refreshHz = 60
+    // Tier P — presetable (design §3). A size or rate of 0 is Native, resolved by `streamMode`.
+    public var width = 0
+    public var height = 0
+    public var refreshHz = 0
     public var matchWindow = false
     public var bitrateKbps = 0
     public var renderScale = 1.0
@@ -30,7 +30,7 @@ public struct EffectiveSettings: Equatable, Sendable {
     /// An `AudioFormatChoice` raw value. `"opus"` — the default — is byte-for-byte the session
     /// every build before the lossless plane ran.
     public var audioFormat = AudioFormatChoice.opus.rawValue
-    public var micEnabled = true
+    public var micEnabled = false
     public var echoCancel = true
     public var keepHostAudio = false
     public var touchMode = "trackpad"

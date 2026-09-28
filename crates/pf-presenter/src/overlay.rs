@@ -48,6 +48,11 @@ pub struct FrameCtx<'a> {
     pub scale: f32,
     /// Stats overlay lines, painted by role. `None` = overlay off.
     pub stats: Option<&'a [HudLine]>,
+    /// The stats panel's corner, and its size on top of [`Self::scale`].
+    pub stats_corner: punktfunk_core::hud::HudCorner,
+    pub stats_scale: f32,
+    /// Show the exit hint when a stream starts; the overlay owns its timing.
+    pub exit_hint: bool,
     pub hint: Option<&'a str>,
     /// Access chip. `None` for a full-control permanent session.
     pub access: Option<&'a str>,

@@ -797,10 +797,12 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
         if (showCustom) {
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 ResolutionField(label = "Width", value = s.width, modifier = Modifier.weight(1f)) { w ->
-                    update(s.copy(width = w))
+                    val (cw, ch) = Resolutions.custom(w, s.height, s.codec)
+                    update(s.copy(width = cw, height = ch))
                 }
                 ResolutionField(label = "Height", value = s.height, modifier = Modifier.weight(1f)) { h ->
-                    update(s.copy(height = h))
+                    val (cw, ch) = Resolutions.custom(s.width, h, s.codec)
+                    update(s.copy(width = cw, height = ch))
                 }
             }
         }
@@ -835,16 +837,30 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
                 "distorts it.",
         ) { fit -> update(s.copy(videoFit = fit)) }
 
+        // The GPU probe, not a MediaCodec one — PyroWave decodes as Vulkan compute.
+        val pyrowaveCapable = remember { VideoDecoders.pyrowaveCapable() }
+        // PyroWave takes its rate from the host, so the row reads Automatic and locks; the stored
+        // rate is kept for the other codecs.
+        val pyrowaveOn = s.codec == "pyrowave" && pyrowaveCapable
         // Custom is read from the stored rate, like the resolution above; the flag only keeps the
         // field open between picking "Custom…" and typing a number.
-        val showCustomBitrate = customBitratePicked || s.isCustomBitrate()
+        val showCustomBitrate = !pyrowaveOn && (customBitratePicked || s.isCustomBitrate())
         SettingDropdown(
             label = "Bitrate",
             options = BITRATE_OPTIONS + (CUSTOM_BITRATE to
                 if (s.isCustomBitrate()) "Custom (${bitrateLabel(s.bitrateKbps)})" else "Custom…"),
-            selected = if (showCustomBitrate) CUSTOM_BITRATE else s.bitrateKbps,
+            selected = when {
+                pyrowaveOn -> 0
+                showCustomBitrate -> CUSTOM_BITRATE
+                else -> s.bitrateKbps
+            },
             field = "bitrate_kbps",
-            caption = "Automatic lets the host decide.",
+            caption = if (pyrowaveOn) {
+                "PyroWave sets its own rate from the stream mode."
+            } else {
+                "Automatic lets the host decide."
+            },
+            enabled = !pyrowaveOn,
         ) { kbps ->
             customBitratePicked = kbps == CUSTOM_BITRATE
             if (kbps != CUSTOM_BITRATE) update(s.copy(bitrateKbps = kbps))
@@ -856,8 +872,6 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
         // Only codecs this device can actually decode are offered — a preference the client never
         // advertises would be a dead setting (see [codecOptionsFor]).
         val av1Capable = remember { VideoDecoders.pickDecoder("video/av01") != null }
-        // The GPU probe, not a MediaCodec one — PyroWave decodes as Vulkan compute.
-        val pyrowaveCapable = remember { VideoDecoders.pyrowaveCapable() }
         // Mirror the Automatic AV1 rule in HostConnect (hardware AV1 AND no partial-frame
         // support) so the picker says what "Automatic" actually does on THIS device.
         val autoPrefersAv1 = remember {
@@ -977,13 +991,16 @@ private fun InputSettings(s: Settings, update: (Settings) -> Unit, onOpenQuickAc
                 onClick = onOpenQuickActions,
             )
         }
-        ToggleRow(
-            title = "Back opens quick actions",
-            subtitle = "Off, Back does nothing mid-stream. It still opens them when no twist, " +
-                "keyboard or pad can",
-            checked = s.backOpensRing,
-            onCheckedChange = { on -> update(s.copy(backOpensRing = on)) },
-        )
+        // A device setting: a preset carries no value for it.
+        DeviceScopeOnly {
+            ToggleRow(
+                title = "Back opens quick actions",
+                subtitle = "Off, Back does nothing mid-stream. It still opens them when no twist, " +
+                    "keyboard or pad can",
+                checked = s.backOpensRing,
+                onCheckedChange = { on -> update(s.copy(backOpensRing = on)) },
+            )
+        }
     }
     SettingsGroup("Keyboard & mouse") {
         SettingDropdown(
@@ -1399,11 +1416,10 @@ internal fun <T> SettingDropdown(
     }
 }
 
-/** One side of a custom resolution. Digits only; every usable keystroke commits — coerced even
- * (encoders reject odd dimensions) and capped at 8192, the HEVC/AV1 per-side ceiling (the host
- * clamps H.264's tighter 4096 itself) — while the field keeps the raw text so intermediate states
- * ("15" on the way to "1512") aren't rewritten mid-typing; it snaps to the committed value when
- * focus leaves. */
+/** One side of a custom resolution. Digits only; every non-zero keystroke commits the raw number,
+ * which the caller passes through [Resolutions.custom]. The field keeps the raw text so
+ * intermediate states ("15" on the way to "1512") aren't rewritten mid-typing; it snaps to the
+ * committed value when focus leaves. */
 @Composable
 private fun ResolutionField(
     label: String,
@@ -1416,7 +1432,7 @@ private fun ResolutionField(
         value = text,
         onValueChange = { raw ->
             text = raw.filter { it.isDigit() }.take(4)
-            val v = (text.toIntOrNull() ?: 0).let { it - it % 2 }.coerceAtMost(8192)
+            val v = text.toIntOrNull() ?: 0
             if (v > 0) onCommit(v)
         },
         label = { Text(label) },

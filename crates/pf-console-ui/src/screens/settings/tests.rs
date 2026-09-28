@@ -405,7 +405,8 @@ fn adjust_clamps_and_activate_wraps() {
 }
 
 /// Android's safe-area mode is its own slot after Native: shown by name, and a nudge
-/// moves off it by one step instead of snapping to Native.
+/// moves off it by one step instead of snapping to Native. A phone has no window, so no
+/// Match window entry sits between it and the sizes.
 #[test]
 fn android_resolution_row_carries_the_safe_area_mode() {
     let mut settings = Settings::default();
@@ -426,7 +427,8 @@ fn android_resolution_row_carries_the_safe_area_mode() {
     let safe = |ctx: &Ctx| extra_bool(ctx.settings, device_keys::SAFE_AREA_MODE, false);
     assert_eq!(value(&ctx).as_deref(), Some("Native (safe area)"));
     assert!(adjust(RowId::Resolution, 1, false, &mut ctx));
-    assert!(ctx.settings.match_window, "safe area → Match window");
+    assert!(!ctx.settings.match_window, "no window to match");
+    assert_eq!((ctx.settings.width, ctx.settings.height), (1280, 720));
     assert!(!safe(&ctx));
     assert!(adjust(RowId::Resolution, -1, false, &mut ctx));
     assert!(
@@ -888,6 +890,67 @@ fn a_typed_bitrate_is_stored_and_clamped() {
     assert!(!s.editing());
 }
 
+/// Y on Resolution takes a width, then a height, through the shared rule. The size then reads
+/// Custom, and a step leaves it for its list neighbour, never for Native.
+#[test]
+fn a_typed_size_is_stored_through_the_shared_rule() {
+    let mut settings = Settings {
+        codec: "h264".into(),
+        match_window: true,
+        ..Settings::default()
+    };
+    let library = crate::library::LibraryShared::default();
+    let store = crate::store::SnapshotStore::new(settings.clone(), Vec::new());
+    let mut ctx = Ctx {
+        store: &store,
+        ..Ctx::test(&mut settings, &library)
+    };
+    let mut s = SettingsScreen::with_presets(Vec::new());
+    let mut fx = Outbox::default();
+    let ids = s.row_ids(&ctx);
+    s.list.cursor = ids
+        .iter()
+        .position(|id| *id == RowId::Resolution)
+        .expect("the resolution row");
+
+    s.menu(MenuEvent::Secondary, &mut ctx, &mut fx);
+    assert!(s.edit_key(crate::input::Key::Return, &mut ctx));
+    assert!(!s.editing(), "an empty width abandons the edit");
+    assert!(ctx.settings.match_window, "and changes nothing");
+
+    s.menu(MenuEvent::Secondary, &mut ctx, &mut fx);
+    assert_eq!(s.edit_field().expect("open").label, "Width in pixels");
+    s.text_input("5121");
+    assert!(s.edit_key(crate::input::Key::Return, &mut ctx));
+    assert_eq!(
+        s.edit_field().expect("still open").label,
+        "Height in pixels",
+        "the width moves on to the height"
+    );
+    s.text_input("1601");
+    assert!(s.edit_key(crate::input::Key::Return, &mut ctx));
+    assert!(!s.editing());
+    assert_eq!(
+        (ctx.settings.width, ctx.settings.height),
+        (4096, 1600),
+        "even, and within H.264's 4096 a side"
+    );
+    assert!(!ctx.settings.match_window);
+    let spec = row_spec(RowId::Resolution, &ctx, &[], &Default::default());
+    assert_eq!(spec.value.as_deref(), Some("Custom (4096 × 1600)"));
+
+    assert!(
+        !adjust(RowId::Resolution, 1, false, &mut ctx),
+        "the typed size is the last entry"
+    );
+    assert!(adjust(RowId::Resolution, -1, false, &mut ctx));
+    assert_eq!(
+        (ctx.settings.width, ctx.settings.height),
+        (5120, 2880),
+        "the largest listed size, not Native"
+    );
+}
+
 #[test]
 fn rates_read_in_the_biggest_round_unit() {
     assert_eq!(bitrate_label(20_000), "20 Mbps");
@@ -1023,7 +1086,6 @@ fn platform_row_split_hides_only_the_other_platforms_concepts() {
             RowId::ReduceUiResolution,
             RowId::GamepadUi,
             RowId::GamepadUiMode,
-            RowId::StatsPosition,
             RowId::FullscreenMode,
         ]
     );
@@ -1046,7 +1108,6 @@ fn platform_row_split_hides_only_the_other_platforms_concepts() {
             RowId::Pad,
             RowId::Shortcuts,
             RowId::CursorGestures,
-            RowId::StatsPosition,
             RowId::FullscreenMode,
             RowId::Fullscreen,
         ]

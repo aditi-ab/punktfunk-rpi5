@@ -25,9 +25,9 @@ struct SettingsView: View {
     #if os(macOS)
     @State private var macTab: MacTab = .general
     #endif
-    @AppStorage(DefaultsKey.streamWidth) var width = 1920
-    @AppStorage(DefaultsKey.streamHeight) var height = 1080
-    @AppStorage(DefaultsKey.streamHz) var hz = 60
+    @AppStorage(DefaultsKey.streamWidth) var width = 0
+    @AppStorage(DefaultsKey.streamHeight) var height = 0
+    @AppStorage(DefaultsKey.streamHz) var hz = 0
     // Opt-in (default OFF): the explicit mode below is used and never auto-resized. When ON, a
     // windowed session instead streams at the window's native pixels (1:1, no scaling) so it stays
     // pixel-exact rather than the presenter resampling a fixed-mode frame into the window.
@@ -63,7 +63,7 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.defaultHost) var defaultHostID = ""
     @AppStorage(DefaultsKey.fullscreenWhileStreaming) var fullscreenWhileStreaming = true
     @AppStorage(DefaultsKey.fullscreenAlways) var fullscreenAlways = false
-    @AppStorage(DefaultsKey.micEnabled) var micEnabled = true
+    @AppStorage(DefaultsKey.micEnabled) var micEnabled = false
     @AppStorage(DefaultsKey.echoCancel) var echoCancel = true
     @AppStorage(DefaultsKey.keepHostAudio) var keepHostAudio = false
     @AppStorage(DefaultsKey.audioChannels) var audioChannels = 2
@@ -117,9 +117,11 @@ struct SettingsView: View {
     // — not just on iPhone, but on any iPad layout that collapses the sidebar to an overlay. Starts
     // .doubleColumn so iPad reliably opens with the sidebar (and its Done) visible.
     @State private var columnVisibility: NavigationSplitViewVisibility = .doubleColumn
-    // Sticky once the wheel lands on "Custom…", so editing a width/height that briefly equals a
-    // preset doesn't snap the wheel back off Custom. A stored non-preset value reads as custom even
-    // when this is false (see `isCustomResolution`), so it survives relaunches without persisting.
+    #endif
+    #if os(iOS) || os(macOS)
+    // Sticky once the list lands on "Custom…", so editing a width/height that briefly equals a
+    // preset doesn't snap it back off Custom. A stored non-preset value reads as custom even when
+    // this is false (see `isCustomResolution`), so it survives relaunches without persisting.
     @State var customMode = false
     #endif
     #if os(tvOS)
@@ -131,6 +133,8 @@ struct SettingsView: View {
 
     /// The system keyboard is up for the Custom bitrate row.
     @State var typingBitrate = false
+    /// The system keyboard is up for the Custom size row.
+    @State var typingSize = false
     /// Focus on a sidebar row picks what the pane shows, as on a tab bar.
     @State private var tvPane: TVPane = .category(.general)
     @FocusState private var tvFocusedPane: TVPane?

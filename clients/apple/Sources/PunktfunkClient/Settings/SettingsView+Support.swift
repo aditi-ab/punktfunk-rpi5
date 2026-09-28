@@ -220,6 +220,7 @@ extension SettingsView {
         #if os(macOS)
         guard let panel = SettingsOptions.macDisplayModes().first else { return }
         applyDisplayMode(panel)
+        customMode = false
         #else
         // nativeBounds is portrait-oriented pixels — streams are landscape.
         let bounds = UIScreen.main.nativeBounds
@@ -238,6 +239,7 @@ extension SettingsView {
     /// Write one of `SettingsOptions.macDisplayModes()` into the mode fields, at the screen's top
     /// rate.
     func applyDisplayMode(_ mode: (name: String, w: Int, h: Int)) {
+        customMode = false
         setResolution(width: mode.w, height: mode.h)
         scoped(SettingsFields.refreshHz).wrappedValue = NSScreen.main?.maximumFramesPerSecond ?? 60
     }

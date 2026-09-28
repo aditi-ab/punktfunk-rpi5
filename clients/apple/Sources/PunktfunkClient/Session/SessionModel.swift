@@ -5,6 +5,7 @@
 // and, on tvOS, AVPlayer.eligibleForHDRPlayback (the TV-capability HDR gate).
 import AVFoundation
 import Foundation
+import GameController
 import os
 import PunktfunkKit
 import SwiftUI
@@ -225,6 +226,11 @@ final class SessionModel: ObservableObject {
     /// the capture's ONLY UI surface: the raw BLE device never enters GameController, so the
     /// Controllers page cannot list it.
     @Published private(set) var sc2CapturedHint = false
+    /// True while the exit hint shows: from stream start for `motionHintSeconds`, unless the
+    /// player turned it off (`DefaultsKey.exitHint`).
+    @Published private(set) var exitHintShown = false
+    /// Drops `exitHintShown` — cancelled on teardown, like `motionHintTimer`.
+    private var exitHintTimer: Task<Void, Never>?
     /// Drops `sc2CapturedHint` — same contract as `motionHintTimer` (restart on a new claim,
     /// cancel on teardown rather than firing into a torn-down model). Only `noteSc2Phase` and
     /// the disconnect teardown touch it.
@@ -676,6 +682,37 @@ final class SessionModel: ObservableObject {
         #endif
     }
 
+    /// Show the exit hint for `motionHintSeconds` at stream start, unless it is turned off.
+    private func noteStreamStart() {
+        exitHintTimer?.cancel()
+        guard UserDefaults.standard.object(forKey: DefaultsKey.exitHint) as? Bool ?? true else {
+            exitHintShown = false
+            return
+        }
+        exitHintShown = true
+        exitHintTimer = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.motionHintSeconds))
+            guard !Task.isCancelled else { return }
+            self?.exitHintShown = false
+        }
+    }
+
+    /// How to leave, in one line, for the input in hand: the pad chord when a controller is
+    /// forwarded, else this device's own way out.
+    var exitHintText: String {
+        if connection?.settings.gamepadForwarding ?? true, !GCController.controllers().isEmpty {
+            return "Hold L1 + R1 + Start + Select to leave"
+        }
+        #if os(tvOS)
+        return "Hold Back to leave"
+        #elseif os(macOS)
+        return "⌃⌥⇧D to leave"
+        #else
+        return GCKeyboard.coalesced != nil
+            ? "⌃⌥⇧D to leave" : "Two-finger twist opens quick actions"
+        #endif
+    }
+
     private func noteMotionUnreachable(_ kind: PunktfunkConnection.GamepadType) {
         motionUnreachableKind = kind
         motionHintTimer?.cancel()
@@ -852,6 +889,9 @@ final class SessionModel: ObservableObject {
         motionHintTimer?.cancel()
         motionHintTimer = nil
         motionUnreachableKind = nil
+        exitHintTimer?.cancel()
+        exitHintTimer = nil
+        exitHintShown = false
         touchHintTimer?.cancel()
         touchHintTimer = nil
         touchFallbackNotice = false
@@ -1134,6 +1174,7 @@ final class SessionModel: ObservableObject {
         watchLaunch()
         refreshStreamedGame()
         displaySleepGuard.acquire()
+        noteStreamStart()
         // Audio starts with streaming, not during the trust prompt — no host sound (or
         // mic uplink!) before the user trusted the host. Devices and the mic switch come from the
         // session's resolved settings ("" = system default), so a preset that turns the mic on

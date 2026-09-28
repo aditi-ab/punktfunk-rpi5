@@ -13,6 +13,7 @@ use anyhow::{anyhow, Context as _, Result};
 use ash::vk as avk;
 use ash::vk::Handle as _;
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
+use pf_client_core::trust::HudCorner;
 use pf_presenter::overlay::{
     FrameCtx, HudLine, Overlay, OverlayAction, OverlayFrame, PointerInput, RingCommand, RingInput,
     Role, SessionPhase, SharedDevice,
@@ -25,7 +26,7 @@ use std::time::{Duration, Instant};
 /// An idle console redraws at most this often. 30 Hz keeps the aurora moving.
 const IDLE_FRAME: Duration = Duration::from_nanos(1_000_000_000 / 30);
 
-/// Long enough to read the leave/stats chords; the last `BANNER_FADE_S` fade out.
+/// Long enough to read the exit hint; the last `BANNER_FADE_S` fade out.
 const BANNER_S: f64 = 6.0;
 const BANNER_FADE_S: f64 = 0.6;
 
@@ -58,6 +59,9 @@ struct Drawn {
     width: u32,
     height: u32,
     stats: Option<Vec<HudLine>>,
+    /// The stats panel's corner (`HudCorner::ALL` index) and size in percent.
+    stats_corner: u8,
+    stats_pct: u16,
     hint: Option<String>,
     /// Chip text. Countdown ticks once a minute, so a still chip is free per frame.
     access: Option<String>,
@@ -384,14 +388,16 @@ impl Overlay for SkiaOverlay {
     }
 
     fn session_phase(&mut self, phase: SessionPhase) {
-        let Some(shell) = &mut self.shell else { return };
-        // Banner clock is the overlay's; everything else is the shell's.
+        // The exit hint's clock is the overlay's, in a plain `--connect` session too; the
+        // phase itself is the console shell's.
         match &phase {
             SessionPhase::Streaming => self.streaming_since = Some(Instant::now()),
             SessionPhase::Ended(_) | SessionPhase::Reconnecting(_) => self.streaming_since = None,
             SessionPhase::Connecting | SessionPhase::Failed(_) => {}
         }
-        shell.session_phase(phase);
+        if let Some(shell) = &mut self.shell {
+            shell.session_phase(phase);
+        }
     }
 
     fn frame(&mut self, ctx: &FrameCtx) -> Result<Option<OverlayFrame>> {
@@ -499,6 +505,11 @@ impl Overlay for SkiaOverlay {
             width: ctx.width,
             height: ctx.height,
             stats: ctx.stats.map(<[HudLine]>::to_vec),
+            stats_corner: HudCorner::ALL
+                .iter()
+                .position(|c| *c == ctx.stats_corner)
+                .unwrap_or(0) as u8,
+            stats_pct: (ctx.stats_scale * 100.0).round() as u16,
             hint: ctx.hint.map(str::to_owned),
             access: ctx.access.map(str::to_owned),
             notice: ctx.notice.map(str::to_owned),
@@ -529,32 +540,29 @@ impl Overlay for SkiaOverlay {
             draw_resize_scrim(canvas, font, ctx.width, ctx.height, phase, scale);
         }
         if let Some(stats) = &want.stats {
-            draw_osd_panel(canvas, font, stats, ctx.width, scale);
+            let osd_scale = scale * ctx.stats_scale.clamp(0.5, 4.0);
+            let size = (ctx.width, ctx.height);
+            draw_osd_panel(canvas, font, stats, size, osd_scale, ctx.stats_corner);
         }
-        // Top-right, stacked in a fixed order: never collides with the stats panel or the
-        // bottom pill, even at stats Off. The mute badges persist, because what they report
-        // does not go away on its own.
+        // Top-right, stacked in a fixed order, and top-left while the stats panel holds the
+        // top right: never under the panel or the bottom pill, even at stats Off. The mute
+        // badges persist, because what they report does not go away on its own.
+        let left = want.stats.is_some() && ctx.stats_corner == HudCorner::TopRight;
         let mut row = 0;
         if want.mic_muted {
-            corner_pill(
-                canvas,
-                font,
-                "Microphone muted",
-                true,
-                ctx.width,
-                row,
-                scale,
-            );
+            let at = (ctx.width, row, left);
+            corner_pill(canvas, font, "Microphone muted", true, at, scale);
             row += 1;
         }
         if !want.audio_mute.is_empty() {
-            corner_pill(canvas, font, &want.audio_mute, true, ctx.width, row, scale);
+            let at = (ctx.width, row, left);
+            corner_pill(canvas, font, &want.audio_mute, true, at, scale);
             row += 1;
         }
         // The access chip (preset label + countdown) stacks under them. A full-control
         // permanent session has none.
         if let Some(access) = &want.access {
-            corner_pill(canvas, font, access, false, ctx.width, row, scale);
+            corner_pill(canvas, font, access, false, (ctx.width, row, left), scale);
         }
         // Access toast outranks the capture hint for its few seconds.
         if let Some(notice) = &want.notice {
@@ -562,7 +570,7 @@ impl Overlay for SkiaOverlay {
         } else if let Some(hint) = &want.hint {
             draw_hint_pill(canvas, font, hint, ctx.width, ctx.height, 1.0, scale);
         } else if banner_step > 0 {
-            // Leave/stats shortcuts, fading so they are discoverable without the OSD.
+            // The exit hint, fading out.
             if let Some(text) = &self.banner_text {
                 draw_hint_pill(
                     canvas,
@@ -620,10 +628,10 @@ fn ring_dt(drawn_at: &mut Option<Instant>) -> f64 {
 }
 
 impl SkiaOverlay {
-    /// Banner alpha 1→0 across the fade tail. Refresh the words while visible
-    /// so a pad hot-plug updates the leave hint.
+    /// Exit-hint alpha 1→0 across the fade tail; 0 when the player turned the hint off.
+    /// The words refresh while visible so a pad hot-plug swaps them.
     fn banner_alpha(&mut self, ctx: &FrameCtx) -> f64 {
-        let Some(since) = self.streaming_since else {
+        let Some(since) = self.streaming_since.filter(|_| ctx.exit_hint) else {
             self.banner_text = None;
             return 0.0;
         };
@@ -633,17 +641,7 @@ impl SkiaOverlay {
             self.banner_text = None;
             return 0.0;
         }
-        // The dial's opener leads: it is the one shortcut that reaches every other action, so a
-        // reader who remembers only this line still has stats, mic and disconnect.
-        self.banner_text = Some(if ctx.pad.is_some() {
-            "Select + A quick actions · Hold L1 + R1 + Start + Select to leave · \
-             Ctrl+Alt+Shift+S stats"
-                .to_string()
-        } else {
-            "Ctrl+Alt+Shift+O quick actions · Ctrl+Alt+Shift+Q releases input · \
-             Ctrl+Alt+Shift+D disconnects · Ctrl+Alt+Shift+S stats"
-                .to_string()
-        });
+        self.banner_text = Some(exit_hint(ctx.pad.is_some()).to_string());
         ((BANNER_S - age) / BANNER_FADE_S).min(1.0)
     }
 
@@ -781,8 +779,24 @@ fn fit_scale(scale: f32, width_at_scale: f32, budget: f32) -> f32 {
     }
 }
 
-/// Stats OSD: translucent rounded panel, top-left, one line each, painted by role.
-fn draw_osd_panel(canvas: &Canvas, base_font: &Font, lines: &[HudLine], width: u32, scale: f32) {
+/// How to leave a stream, in one line: the pad chord when a pad is forwarded, else the key.
+pub(crate) fn exit_hint(pad: bool) -> &'static str {
+    if pad {
+        "Hold L1 + R1 + Start + Select to leave"
+    } else {
+        "Ctrl+Alt+Shift+D to leave"
+    }
+}
+
+/// Stats OSD: translucent rounded panel in `corner`, one line each, painted by role.
+fn draw_osd_panel(
+    canvas: &Canvas,
+    base_font: &Font,
+    lines: &[HudLine],
+    (width, height): (u32, u32),
+    scale: f32,
+    corner: HudCorner,
+) {
     // Width is linear in scale; measure once, then fit so Detailed-tier lines stay in-window.
     let width_at = |s: f32| {
         let font = chrome_font(base_font, s);
@@ -802,13 +816,22 @@ fn draw_osd_panel(canvas: &Canvas, base_font: &Font, lines: &[HudLine], width: u
         .map(|l| font.measure_str(&l.text, None).0)
         .fold(0.0f32, f32::max);
     let (pad_x, pad_y) = (base::OSD_PAD_X * scale, base::OSD_PAD_Y * scale);
-    let (x, y) = (base::OSD_MARGIN * scale, base::OSD_MARGIN * scale);
-    let panel = Rect::from_xywh(
-        x,
-        y,
+    let (w, h) = (
         widest + 2.0 * pad_x,
         line_h * lines.len() as f32 + 2.0 * pad_y,
     );
+    let margin = base::OSD_MARGIN * scale;
+    let x = if corner.right() {
+        width as f32 - w - margin
+    } else {
+        margin
+    };
+    let y = if corner.bottom() {
+        height as f32 - h - margin
+    } else {
+        margin
+    };
+    let panel = Rect::from_xywh(x, y, w, h);
     let radius = base::OSD_RADIUS * scale;
     canvas.draw_rrect(
         RRect::new_rect_xy(panel, radius, radius),
@@ -834,17 +857,16 @@ fn role_color(role: Role) -> Color4f {
     }
 }
 
-/// A standing pill in the top-right corner, `row` pills down: words, led by an error-colour
-/// dot when `dot`. Drawn from state, not from the stats text, so it survives stats Off.
-/// Words: the runtime monospace may not ship a mute glyph. Every pill is one line tall, so
-/// rows stack on one pitch.
+/// A standing pill in a top corner, `row` pills down: words, led by an error-colour dot when
+/// `dot`. `at` is the window width, the row and whether it sits top-left. Drawn from state,
+/// not from the stats text, so it survives stats Off. Words: the runtime monospace may not
+/// ship a mute glyph. Every pill is one line tall, so rows stack on one pitch.
 fn corner_pill(
     canvas: &Canvas,
     base_font: &Font,
     text: &str,
     dot: bool,
-    width: u32,
-    row: usize,
+    (width, row, left): (u32, usize, bool),
     scale: f32,
 ) {
     // Short; it fits any stream window, so take the display scale as-is.
@@ -857,7 +879,11 @@ fn corner_pill(
     let w = font.measure_str(text, None).0 + lead + 2.0 * pad_x;
     let h = line_h + 2.0 * pad_y;
     let margin = base::OSD_MARGIN * scale;
-    let x = width as f32 - w - margin;
+    let x = if left {
+        margin
+    } else {
+        width as f32 - w - margin
+    };
     let y = margin + row as f32 * (h + 8.0 * scale);
     canvas.draw_rrect(
         RRect::new_rect_xy(Rect::from_xywh(x, y, w, h), h / 2.0, h / 2.0),
