@@ -78,8 +78,34 @@ const SHELF_AIR: f64 = 44.0;
 const STATE_H: f64 = 190.0;
 /// Air a scroll keeps round the focused item, design units.
 const REVEAL_AIR: f64 = 20.0;
-/// ~nine grid rows. At [`ART_CACHE_W`] each raster is ~0.7 MB, so this is also RAM.
-const ART_BUDGET: usize = 160;
+/// Covers a screen keeps decoded, and how many places past the first drawn one it decodes.
+/// At [`ART_CACHE_W`] each raster is ~0.7 MB of RAM, plus ~1.3 MB uploaded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ArtBudget {
+    held: usize,
+    ahead: usize,
+}
+
+impl ArtBudget {
+    /// ~nine grid rows.
+    const DESKTOP: Self = Self {
+        held: 160,
+        ahead: 48,
+    };
+    /// A TV shares 1–2 GB between the app, the GPU and the stream's decoder.
+    const TV: Self = Self {
+        held: 64,
+        ahead: 24,
+    };
+
+    fn of(device: &crate::screens::Device) -> Self {
+        if device.tv {
+            Self::TV
+        } else {
+            Self::DESKTOP
+        }
+    }
+}
 /// Twice the grid cell: mip levels both arrangements sample. Smaller magnifies the shelf.
 const ART_CACHE_W: f64 = GRID_W * 2.0;
 const ART_CACHE_H: f64 = GRID_H * 2.0;
@@ -118,7 +144,8 @@ thread_local! {
     static SHARED_ART: RefCell<SharedArt> = RefCell::new(SharedArt::default());
 }
 
-/// [`SHARED_ART`]: at most [`ART_BUDGET`] covers, the oldest shared first out, all at one scale.
+/// [`SHARED_ART`]: at most [`ArtBudget::held`] covers, the oldest shared first out, all at one
+/// scale.
 #[derive(Default)]
 struct SharedArt {
     k: f64,
@@ -136,8 +163,8 @@ pub(super) fn shared_cover(fp: &str, id: &str, k: f64) -> Option<Image> {
     })
 }
 
-/// Offer a cover to every screen. A new scale starts the cache over.
-pub(super) fn share_cover(fp: &str, id: &str, k: f64, img: &Image) {
+/// Offer a cover to every screen, keeping at most `held`. A new scale starts the cache over.
+fn share_cover(fp: &str, id: &str, k: f64, img: &Image, held: usize) {
     SHARED_ART.with(|a| {
         let mut a = a.borrow_mut();
         if a.k != k {
@@ -150,7 +177,7 @@ pub(super) fn share_cover(fp: &str, id: &str, k: f64, img: &Image) {
         if a.covers.insert(key.clone(), img.clone()).is_none() {
             a.order.push_back(key);
         }
-        while a.order.len() > ART_BUDGET {
+        while a.order.len() > held {
             if let Some(old) = a.order.pop_front() {
                 a.covers.remove(&old);
             }
@@ -288,9 +315,9 @@ fn decode_near_cache_size(data: &Data, k: f64) -> Option<Image> {
     codec.get_image(info, None).ok()
 }
 
-/// Coldest stamps first, past [`ART_BUDGET`]. Split out so the policy tests without Skia.
-fn art_to_evict(live: &[String], seen: &HashMap<String, u64>) -> Vec<String> {
-    if live.len() <= ART_BUDGET {
+/// Coldest stamps first, past `held`. Split out so the policy tests without Skia.
+fn art_to_evict(live: &[String], seen: &HashMap<String, u64>, held: usize) -> Vec<String> {
+    if live.len() <= held {
         return Vec::new();
     }
     let mut by_age: Vec<(u64, &String)> = live
@@ -302,7 +329,7 @@ fn art_to_evict(live: &[String], seen: &HashMap<String, u64>) -> Vec<String> {
     by_age.sort_unstable();
     by_age
         .into_iter()
-        .take(live.len() - ART_BUDGET)
+        .take(live.len() - held)
         .map(|(_, id)| id.clone())
         .collect()
 }
@@ -491,6 +518,8 @@ pub(crate) struct LibraryScreen {
     arriving: std::collections::VecDeque<(String, Image)>,
     /// Decode scale. This screen does not republish `k`; a grow cannot re-decode.
     art_k: f64,
+    /// This device's, from the last render.
+    art_budget: ArtBudget,
     /// Last-draw frame per id. Grid pages the whole library; unstamped covers stay forever.
     art_seen: HashMap<String, u64>,
     frame: u64,
@@ -552,6 +581,7 @@ impl LibraryScreen {
             arriving: std::collections::VecDeque::new(),
             // Design scale. Decode runs at this `k` for the life of the screen.
             art_k: 1.0,
+            art_budget: ArtBudget::DESKTOP,
             art_seen: HashMap::new(),
             frame: 0,
             entrance: None,
@@ -914,7 +944,13 @@ impl LibraryScreen {
             let Some((id, img)) = self.arriving.pop_front() else {
                 break;
             };
-            share_cover(&self.host.fp_hex, &id, self.art_k, &img);
+            share_cover(
+                &self.host.fp_hex,
+                &id,
+                self.art_k,
+                &img,
+                self.art_budget.held,
+            );
             self.art.entry(id).or_insert(img);
         }
     }
@@ -931,11 +967,10 @@ impl LibraryScreen {
     }
 
     /// Titles to decode next: on screen last frame first, rows included, then the next
-    /// `AHEAD` places of the view from its first drawn title, so a scroll decodes ahead.
-    /// A window of places, well under [`ART_BUDGET`]: counting only the covers still missing
-    /// walks the whole library as they land, and eviction then chases the decoder round it.
+    /// [`ArtBudget::ahead`] places of the view from its first drawn title, so a scroll decodes
+    /// ahead. A window of places, well under [`ArtBudget::held`]: counting only the covers still
+    /// missing walks the whole library as they land, and eviction then chases the decoder.
     fn art_wanted(&self) -> Vec<String> {
-        const AHEAD: usize = 48;
         let recent = self.frame.saturating_sub(2);
         let seen = |id: &String| self.art_seen.get(id).is_some_and(|&f| f >= recent);
         let lacking = |id: &String| {
@@ -948,7 +983,10 @@ impl LibraryScreen {
             .cloned()
             .collect();
         let first_seen = (self.view.iter()).position(|&g| seen(&self.games[g].id));
-        for &g in self.view.iter().skip(first_seen.unwrap_or(0)).take(AHEAD) {
+        for &g in (self.view.iter())
+            .skip(first_seen.unwrap_or(0))
+            .take(self.art_budget.ahead)
+        {
             let id = &self.games[g].id;
             if lacking(id) && !out.contains(id) {
                 out.push(id.clone());
@@ -1296,6 +1334,7 @@ impl LibraryScreen {
         // Published before the sync that reads it: the poster cache is sized against the
         // scale its covers will be drawn at, and a decode is not something this can redo.
         self.art_k = k;
+        self.art_budget = ArtBudget::of(ctx.device);
         self.sync(ctx.library);
         self.adopt_settings(ctx);
         self.frame = self.frame.wrapping_add(1);
@@ -1332,7 +1371,7 @@ impl LibraryScreen {
     /// After draw: coldest = longest off screen, not longest since decode.
     fn evict_art(&mut self) {
         let live: Vec<String> = self.art.keys().cloned().collect();
-        for id in art_to_evict(&live, &self.art_seen) {
+        for id in art_to_evict(&live, &self.art_seen, self.art_budget.held) {
             self.art.remove(&id);
             self.art_seen.remove(&id);
         }
@@ -2797,7 +2836,9 @@ mod tests {
     /// Stamp after draw. Arrival-order LRU drops the neighbourhood the cursor is in.
     #[test]
     fn eviction_drops_the_coldest_and_keeps_the_focused_neighbourhood() {
-        let live: Vec<String> = (0..ART_BUDGET + 40).map(|i| format!("g{i}")).collect();
+        let live: Vec<String> = (0..ArtBudget::DESKTOP.held + 40)
+            .map(|i| format!("g{i}"))
+            .collect();
         let mut seen = HashMap::new();
         for id in &live {
             seen.insert(id.clone(), 10u64);
@@ -2806,7 +2847,7 @@ mod tests {
         for id in &hot {
             seen.insert(id.clone(), 9_000);
         }
-        let dropped = art_to_evict(&live, &seen);
+        let dropped = art_to_evict(&live, &seen, ArtBudget::DESKTOP.held);
         assert_eq!(dropped.len(), 40, "trimmed back to exactly the budget");
         for id in &hot {
             assert!(!dropped.contains(id), "{id} was on screen and got evicted");
@@ -2815,8 +2856,10 @@ mod tests {
 
     #[test]
     fn eviction_does_nothing_under_the_budget() {
-        let live: Vec<String> = (0..ART_BUDGET).map(|i| format!("g{i}")).collect();
-        assert!(art_to_evict(&live, &HashMap::new()).is_empty());
+        let live: Vec<String> = (0..ArtBudget::DESKTOP.held)
+            .map(|i| format!("g{i}"))
+            .collect();
+        assert!(art_to_evict(&live, &HashMap::new(), ArtBudget::DESKTOP.held).is_empty());
     }
 
     /// Cache ≥ focused shelf card, ≤ source, source aspect. Smaller magnifies; larger wastes GPU.
@@ -2900,11 +2943,13 @@ mod tests {
 
     #[test]
     fn never_drawn_posters_are_evicted_before_merely_old_ones() {
-        let live: Vec<String> = (0..ART_BUDGET + 2).map(|i| format!("g{i}")).collect();
+        let live: Vec<String> = (0..ArtBudget::DESKTOP.held + 2)
+            .map(|i| format!("g{i}"))
+            .collect();
         let mut seen: HashMap<String, u64> = live.iter().map(|id| (id.clone(), 5)).collect();
         seen.remove("g7");
         seen.remove("g9");
-        let dropped = art_to_evict(&live, &seen);
+        let dropped = art_to_evict(&live, &seen, ArtBudget::DESKTOP.held);
         assert_eq!(dropped.len(), 2);
         assert!(dropped.contains(&"g7".to_string()));
         assert!(dropped.contains(&"g9".to_string()));
