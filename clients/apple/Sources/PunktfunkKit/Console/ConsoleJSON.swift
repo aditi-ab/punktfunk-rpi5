@@ -348,7 +348,10 @@ public enum ConsoleJSON {
         string(
             games.compactMap { g -> [String: Any]? in
                 guard let id = g.appID else { return nil }
-                return ["app_id": id, "state": g.state, "awaiting_window": g.awaitingWindow ?? false]
+                return [
+                    "app_id": id, "state": g.state, "awaiting_window": g.awaitingWindow ?? false,
+                    "endable": g.endable ?? false,
+                ]
             })
     }
 }

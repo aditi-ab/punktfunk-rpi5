@@ -13,9 +13,11 @@
 //! `GET /session/last` is the other side of the same registry: what a session came
 //! to, once nothing is streaming any more.
 
+use super::auth::{AuthLane, PairedDevice};
 use super::shared::*;
 use crate::pad_feed::PadFrame;
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::Extension;
 use std::sync::atomic::Ordering;
 
 /// Stop the session
@@ -406,12 +408,59 @@ fn not_on_this_plane() -> Response {
     )
 }
 
-/// End waiting games
+/// Who may end which launched game. The operator and the plugin runner reach every
+/// launch; a paired device reaches only its own, and nothing once its access expired.
+pub(crate) struct GameEnder {
+    /// `None` = every device's launches.
+    owner: Option<String>,
+    /// A paired device whose access expired, or a lane that ends nothing.
+    refused: bool,
+}
+
+impl GameEnder {
+    pub(crate) fn of(st: &MgmtState, lane: AuthLane, fp: Option<&str>) -> Self {
+        match lane {
+            AuthLane::Admin | AuthLane::Plugin => Self {
+                owner: None,
+                refused: false,
+            },
+            AuthLane::Cert => {
+                let live = fp.is_some_and(|fp| {
+                    st.native
+                        .as_ref()
+                        .is_some_and(|n| n.effective(fp, crate::clock::unix_secs()).is_some())
+                });
+                Self {
+                    owner: fp.map(str::to_string),
+                    refused: !live,
+                }
+            }
+            AuthLane::Public => Self {
+                owner: None,
+                refused: true,
+            },
+        }
+    }
+
+    fn scope(&self) -> Option<&str> {
+        self.owner.as_deref()
+    }
+
+    /// A row the caller could end now: in reach, and a game the host can still end.
+    pub(crate) fn may_end(&self, state: &str, launched_by: Option<&str>) -> bool {
+        !self.refused
+            && !matches!(state, "exited" | "untracked")
+            && crate::gamelease::launched_by(launched_by, self.scope())
+    }
+}
+
+/// End a launched game
 ///
-/// Ends games waiting out the reconnect window. With `streaming` and an
-/// `app_id`, also ends that title where it is still on a live session — the
-/// move a player has after a launch that never produced a game. The session
-/// itself stays up (`DELETE /session` plus `game_on_session_end`).
+/// Ends games nobody is streaming: those waiting out the reconnect window and
+/// launches left running after their session ended (`detached` in `GET /status`).
+/// With `streaming`, also ends games still on a live session; the session itself
+/// stays up (`DELETE /session` plus `game_on_session_end`). `app_id` narrows it to
+/// one title. A paired device ends only games it launched.
 #[utoipa::path(
     post,
     path = "/game/end",
@@ -419,18 +468,37 @@ fn not_on_this_plane() -> Response {
     operation_id = "endGame",
     request_body = EndGameRequest,
     responses(
-        (status = OK, description = "How many waiting games were ended", body = EndGameResult),
-        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
-        (status = CONFLICT, description = "No game is waiting to be ended", body = ApiError),
+        (status = OK, description = "How many games were ended", body = EndGameResult),
+        (status = UNAUTHORIZED, description = "Missing or invalid credentials", body = ApiError),
+        (status = FORBIDDEN, description = "This device's access has expired", body = ApiError),
+        (status = CONFLICT, description = "No game in reach to end", body = ApiError),
     )
 )]
-pub(crate) async fn end_game(ApiJson(req): ApiJson<EndGameRequest>) -> Response {
-    let mut ended = crate::gamelease::end_pending(req.app_id.as_deref());
-    // Named title only. The id-less form stays "every waiting game", which is
-    // what the console's one button has always meant.
-    if req.streaming && req.app_id.is_some() {
-        for shared in crate::session_status::live_games(req.app_id.as_deref()) {
-            if !shared.is_trackable() || shared.is_terminating() {
+pub(crate) async fn end_game(
+    State(st): State<Arc<MgmtState>>,
+    Extension(lane): Extension<AuthLane>,
+    device: Option<Extension<PairedDevice>>,
+    ApiJson(req): ApiJson<EndGameRequest>,
+) -> Response {
+    let ender = GameEnder::of(&st, lane, device.as_ref().map(|d| d.0 .0.as_str()));
+    if ender.refused {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "This device's access to the host has expired.",
+        );
+    }
+    let app = req.app_id.as_deref();
+    let mut ended = crate::gamelease::end_pending(ender.scope(), app);
+    for d in crate::launchreg::take_detached(ender.scope(), app) {
+        crate::gamelease::end_detached(d, "ended from the management API");
+        ended += 1;
+    }
+    if req.streaming {
+        for shared in crate::session_status::live_games(app) {
+            if !shared.is_trackable()
+                || shared.is_terminating()
+                || !crate::gamelease::launched_by(shared.fingerprint.as_deref(), ender.scope())
+            {
                 continue;
             }
             crate::gamelease::terminate(shared, "ended from the management API");
@@ -440,17 +508,16 @@ pub(crate) async fn end_game(ApiJson(req): ApiJson<EndGameRequest>) -> Response 
     if ended == 0 {
         return api_error(StatusCode::CONFLICT, "no game is waiting to be ended");
     }
-    tracing::info!(app_id = ?req.app_id, ended, "management API: game ended");
+    tracing::info!(app_id = ?req.app_id, ended, device = ?ender.scope(), "management API: game ended");
     Json(EndGameResult { ended }).into_response()
 }
 
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct EndGameRequest {
-    /// Store-qualified id (`steam:570`); omit to end every waiting game.
+    /// Store-qualified id (`steam:570`); omit to reach every title.
     #[serde(default)]
     pub app_id: Option<String>,
-    /// Also end `app_id` where it is on a live session, not only where it is
-    /// waiting out a reconnect window. Ignored without `app_id`.
+    /// Also end games on a live session, not only games nobody is streaming.
     #[serde(default)]
     #[schema(required = false)]
     pub streaming: bool,
@@ -553,4 +620,51 @@ pub(crate) async fn request_idr(State(st): State<Arc<MgmtState>>) -> Response {
     // Native sessions take IDR from the registry flag, not `app.force_idr`.
     crate::session_status::force_idr_all();
     StatusCode::ACCEPTED.into_response()
+}
+
+#[cfg(test)]
+mod game_ender_tests {
+    use super::GameEnder;
+
+    fn device(fp: &str) -> GameEnder {
+        GameEnder {
+            owner: Some(fp.into()),
+            refused: false,
+        }
+    }
+
+    /// A device ends its own launches, in any hex case, and nobody else's. An
+    /// anonymous launch belongs to no device.
+    #[test]
+    fn a_device_may_end_only_what_it_launched() {
+        let me = device("abcdef");
+        assert!(me.may_end("running", Some("ABCDEF")));
+        assert!(me.may_end("detached", Some("abcdef")));
+        assert!(!me.may_end("running", Some("123456")));
+        assert!(!me.may_end("running", None));
+    }
+
+    #[test]
+    fn the_operator_may_end_any_launch_the_host_can_still_end() {
+        let op = GameEnder {
+            owner: None,
+            refused: false,
+        };
+        assert!(op.may_end("grace", None));
+        assert!(op.may_end("launching", Some("abcdef")));
+        assert!(
+            !op.may_end("untracked", Some("abcdef")),
+            "exit is never seen"
+        );
+        assert!(!op.may_end("exited", Some("abcdef")));
+    }
+
+    #[test]
+    fn an_expired_device_may_end_nothing() {
+        let expired = GameEnder {
+            owner: Some("abcdef".into()),
+            refused: true,
+        };
+        assert!(!expired.may_end("running", Some("abcdef")));
+    }
 }

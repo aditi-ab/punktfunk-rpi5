@@ -193,20 +193,30 @@ public struct RunningGame: Codable, Hashable, Sendable {
     /// Absent for an operator-typed GameStream command, which has no catalog entry behind it.
     public var appID: String?
     public var title: String
-    /// `launching` | `running` | `window` | `exited` | `untracked` | `grace`. A plain String on
-    /// purpose: the host owns the vocabulary and adds to it (`untracked` arrived in 0.30), so an
-    /// unknown value must never fail the decode of the whole list.
+    /// `launching` | `running` | `window` | `exited` | `untracked` | `grace` | `detached`. A plain
+    /// String on purpose: the host owns the vocabulary and adds to it, so an unknown value must
+    /// never fail the decode of the whole list.
     public var state: String
     /// `running`, and the host will report `window` once the game's window is up. Absent from a
     /// host that cannot see windows, or predates them.
     public var awaitingWindow: Bool?
+    /// The live session streaming it; absent for a game nobody streams.
+    public var sessionID: UInt64?
+    /// This device may end it (``LibraryClient/endGame(appID:address:port:certPEM:keyPEM:hostFingerprint:)``):
+    /// a game it launched. Absent from a host that predates the field.
+    public var endable: Bool?
 
     private enum CodingKeys: String, CodingKey {
         case appID = "app_id"
         case title
         case state
         case awaitingWindow = "awaiting_window"
+        case sessionID = "session_id"
+        case endable
     }
+
+    /// A game this device launched that a live session streams: what an in-stream End Game ends.
+    public var streamedHere: Bool { endable == true && sessionID != nil && appID != nil }
 
     /// Is this title *up on the host right now* — i.e. would picking it take the player back into
     /// it rather than start it?
@@ -216,6 +226,43 @@ public struct RunningGame: Codable, Hashable, Sendable {
     /// which is precisely the case where getting back in promptly matters most. Only a confirmed
     /// `exited` does not.
     public var isUp: Bool { state != "exited" }
+}
+
+/// What asking the host to end a game came to (`POST /api/v1/game/end`). The Rust client's
+/// `GameEnd`, words included.
+public enum GameEndOutcome: Equatable, Sendable {
+    case ended
+    /// 409: the host had nothing of this title left to end.
+    case notRunning
+    /// 401/404: a host that predates ending games from a device.
+    case unsupported
+    /// 403: this device's access to the host expired.
+    case expired
+    case failed(String)
+
+    public static func from(status: Int) -> GameEndOutcome {
+        switch status {
+        case 200..<300: return .ended
+        case 409: return .notRunning
+        case 401, 404: return .unsupported
+        case 403: return .expired
+        default: return .failed("the host refused it (\(status))")
+        }
+    }
+
+    /// The game is gone, so a stream that was playing it can end.
+    public var gameGone: Bool { self == .ended || self == .notRunning }
+
+    /// The player-facing line. The Rust, Kotlin and web clients use the same words.
+    public func notice(title: String) -> String {
+        switch self {
+        case .ended: return "Ended \(title)."
+        case .notRunning: return "\(title) isn't running any more."
+        case .unsupported: return "This host needs an update to end games from here."
+        case .expired: return "This device's access to the host has expired."
+        case .failed(let why): return "Couldn't end \(title) \u{2014} \(why)"
+        }
+    }
 }
 
 /// One action a host offers THIS device, from `/api/v1/actions` (`design/host-actions.md` §3.2)
@@ -394,6 +441,31 @@ public enum LibraryClient {
               let list = try? JSONDecoder().decode(HostActionList.self, from: response.body)
         else { return [] }
         return list.actions.filter(\.permitted)
+    }
+
+    /// End one title on the host, live session included (`POST /api/v1/game/end`). The host ends
+    /// it only if this device launched it. Never throws: every outcome is something to tell the
+    /// player.
+    public static func endGame(
+        appID: String,
+        address: String,
+        port: UInt16 = punktfunkDefaultMgmtPort,
+        certPEM: String,
+        keyPEM: String,
+        hostFingerprint: Data
+    ) async -> GameEndOutcome {
+        let body = (try? JSONSerialization.data(
+            withJSONObject: ["app_id": appID, "streaming": true])) ?? Data()
+        do {
+            let identity = try clientIdentity(certPEM: certPEM, keyPEM: keyPEM)
+            let response = try await send(
+                path: "/api/v1/game/end", address: address, port: port,
+                identity: identity, hostFingerprint: hostFingerprint,
+                body: (body, "application/json"))
+            return .from(status: response.status)
+        } catch {
+            return .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+        }
     }
 
     /// Invoke one host action by id (`POST /api/v1/actions/{id}`, empty body).

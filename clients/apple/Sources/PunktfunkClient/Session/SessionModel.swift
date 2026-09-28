@@ -267,6 +267,7 @@ final class SessionModel: ObservableObject {
 
     /// The ring is up: the pad belongs to it (flushed on the host, edges become navigation).
     func setRingOpen(_ open: Bool) {
+        if open { refreshStreamedGame() }
         gamepadCapture?.ringOpen = open
         virtualPad?.masked = open
         // A captured SC2 never enters GamepadCapture, so it hands the ring its pad itself.
@@ -946,6 +947,7 @@ final class SessionModel: ObservableObject {
         if deliberate, phase == .streaming, let shelf = launchedShelf {
             returnToLibrary = shelf
         }
+        streamedGame = nil
         // Read by `sessionEnded` BEFORE it calls us, so clearing here can't rob it of the answer.
         launchedTitleID = nil
         launchedShelf = nil
@@ -1028,6 +1030,44 @@ final class SessionModel: ObservableObject {
         resizing = resizeIndicator.active
     }
 
+    /// The game this device launched that this stream plays (`RunningGame.streamedHere`): the
+    /// ring's End game. Read from `/status` when the stream starts and when the ring opens.
+    @Published private(set) var streamedGame: RunningGame?
+
+    /// Ask the host what this stream plays. Best-effort: a failed read keeps the last answer.
+    func refreshStreamedGame() {
+        guard let host = activeHost, !DemoMode.isDemo(host),
+              let identity = (try? ClientIdentityStore.shared.load())?.identity else { return }
+        let port = connection.map(\.hostMgmtPort).flatMap { $0 > 0 ? $0 : nil } ?? host.effectiveMgmtPort
+        Task { [weak self] in
+            let games = await LibraryClient.running(
+                address: host.address, port: port,
+                certPEM: identity.certPEM, keyPEM: identity.keyPEM,
+                hostFingerprint: host.pinnedSHA256)
+            guard let self, self.activeHost?.id == host.id, self.phase == .streaming else { return }
+            self.streamedGame = games.first(where: \.streamedHere)
+        }
+    }
+
+    /// End the streamed game on the host, then the stream. A refusal keeps the stream and says why.
+    func endStreamedGame() {
+        guard let game = streamedGame, let appID = game.appID, let host = activeHost,
+              let pin = host.pinnedSHA256,
+              let identity = (try? ClientIdentityStore.shared.load())?.identity else { return }
+        let port = connection.map(\.hostMgmtPort).flatMap { $0 > 0 ? $0 : nil } ?? host.effectiveMgmtPort
+        Task { [weak self] in
+            let outcome = await LibraryClient.endGame(
+                appID: appID, address: host.address, port: port,
+                certPEM: identity.certPEM, keyPEM: identity.keyPEM, hostFingerprint: pin)
+            guard let self, self.activeHost?.id == host.id else { return }
+            if outcome.gameGone {
+                self.disconnect()
+            } else {
+                self.showLaunchNotice(outcome.notice(title: game.title))
+            }
+        }
+    }
+
     /// Drop the launch hold and let the stream through.
     func revealStream() {
         launchWatch?.cancel()
@@ -1092,6 +1132,7 @@ final class SessionModel: ObservableObject {
         // flip this phase change causes, released/re-engaged by the user from there).
         phase = .streaming
         watchLaunch()
+        refreshStreamedGame()
         displaySleepGuard.acquire()
         // Audio starts with streaming, not during the trust prompt — no host sound (or
         // mic uplink!) before the user trusted the host. Devices and the mic switch come from the

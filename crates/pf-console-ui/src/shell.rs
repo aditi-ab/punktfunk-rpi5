@@ -2167,6 +2167,7 @@ fn stand_in_games() -> Vec<crate::library::LibraryGame> {
         genres: Vec::new(),
         stats: None,
         running: i == 1,
+        endable: false,
     };
     let stores = ["steam", "lutris", "gog", "epic", "custom", "heroic"];
     let mut out: Vec<_> = (0..12)

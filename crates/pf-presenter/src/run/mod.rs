@@ -394,6 +394,11 @@ struct StreamState {
     /// [`ACCESS_NOTICE_S`](shell::ACCESS_NOTICE_S). An access change outranks "click to
     /// capture" for a few seconds.
     session_notice: Option<(String, Instant)>,
+    /// The ring's End game in flight: the title, and the host's answer once it lands.
+    ending_game: Option<(
+        String,
+        std::sync::mpsc::Receiver<pf_client_core::library::GameEnd>,
+    )>,
     /// Gaming Mode touch-as-mouse: drops leaked Steam Input positions sent as deltas, once.
     touch_mouse: crate::touch::SteamTouchMouse,
     /// Host's pinned fingerprint once connected — the key the pre-fetched host-actions cache uses.

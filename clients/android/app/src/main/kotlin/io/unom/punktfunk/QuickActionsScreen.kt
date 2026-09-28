@@ -334,6 +334,7 @@ private fun slotGroups(cfg: OverlayConfig): List<SlotGroup> {
     val g = mutableListOf(
         SlotGroup("Session", listOf(
             SlotOption("end_stream", "End stream"),
+            SlotOption("end_game", "End game", "Only a game this device launched"),
             SlotOption("disconnect_linger", "Disconnect, keep the game running"),
         )),
         SlotGroup("Input", listOf(

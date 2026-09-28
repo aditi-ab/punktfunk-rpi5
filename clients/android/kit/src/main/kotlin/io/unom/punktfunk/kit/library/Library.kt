@@ -212,14 +212,21 @@ data class RunningGame(
     val appId: String?,
     val title: String,
     /**
-     * `launching` | `running` | `window` | `exited` | `untracked` | `grace`. A plain String on
-     * purpose: the host owns the vocabulary and adds to it (`untracked` arrived in 0.30), so an
-     * unknown value must never fail the decode of the whole list.
+     * `launching` | `running` | `window` | `exited` | `untracked` | `grace` | `detached`. A plain
+     * String on purpose: the host owns the vocabulary and adds to it, so an unknown value must
+     * never fail the decode of the whole list.
      */
     val state: String,
     /** `running`, and the host will report `window` once the game's window is up. */
     val awaitingWindow: Boolean = false,
+    /** The live session streaming it; null for a game nobody streams. */
+    val sessionId: Long? = null,
+    /** This device may end it ([LibraryClient.endGame]): a game it launched. False from an older host. */
+    val endable: Boolean = false,
 ) {
+    /** A game this device launched that a live session streams: what an in-stream End game ends. */
+    val streamedHere: Boolean get() = endable && sessionId != null && appId != null
+
     /**
      * Is this title *up on the host right now* — i.e. would picking it take the player back into
      * it rather than start it?
@@ -230,6 +237,40 @@ data class RunningGame(
      * `exited` does not.
      */
     val isUp: Boolean get() = state != "exited"
+}
+
+/** What asking the host to end a game came to (`POST /api/v1/game/end`). The Rust client's `GameEnd`. */
+sealed class GameEnd {
+    data object Ended : GameEnd()
+    /** 409: the host had nothing of this title left to end. */
+    data object NotRunning : GameEnd()
+    /** 401/404: a host that predates ending games from a device. */
+    data object Unsupported : GameEnd()
+    /** 403: this device's access to the host expired. */
+    data object Expired : GameEnd()
+    data class Failed(val why: String) : GameEnd()
+
+    /** The game is gone, so a stream that was playing it can end. */
+    val gameGone: Boolean get() = this == Ended || this == NotRunning
+
+    /** The player-facing line. The Rust, Swift and web clients use the same words. */
+    fun notice(title: String): String = when (this) {
+        Ended -> "Ended $title."
+        NotRunning -> "$title isn't running any more."
+        Unsupported -> "This host needs an update to end games from here."
+        Expired -> "This device's access to the host has expired."
+        is Failed -> "Couldn't end $title \u2014 $why"
+    }
+
+    companion object {
+        fun fromStatus(code: Int): GameEnd = when (code) {
+            in 200..299 -> Ended
+            409 -> NotRunning
+            401, 404 -> Unsupported
+            403 -> Expired
+            else -> Failed("the host refused it ($code)")
+        }
+    }
 }
 
 object LibraryClient {
@@ -307,12 +348,8 @@ object LibraryClient {
     }
 
     /**
-     * `POST /api/v1/game/end` for one title, live session included (`streaming`).
-     *
-     * The move a player has when a launch never produced a game: the host drops what it thinks is
-     * running for the title, so the next attempt starts it. `true` on 200; `false` on a 409 (the
-     * host had nothing to end) and on any error, which reads the same to the player. BLOCKING;
-     * call from IO.
+     * `POST /api/v1/game/end` for one title, live session included (`streaming`). The host ends it
+     * only if this device launched it. BLOCKING; call from IO.
      */
     fun endGame(
         address: String,
@@ -321,8 +358,8 @@ object LibraryClient {
         keyPem: String,
         fpHex: String,
         appId: String,
-    ): Boolean {
-        if (fpHex.isBlank() || appId.isBlank()) return false
+    ): GameEnd {
+        if (fpHex.isBlank() || appId.isBlank()) return GameEnd.Failed("this host isn't paired")
         return try {
             val body = JSONObject().put("app_id", appId).put("streaming", true)
             val req = Request.Builder()
@@ -330,10 +367,10 @@ object LibraryClient {
                 .post(body.toString().toRequestBody("application/json".toMediaType()))
                 .build()
             mtlsHttpClient(certPem, keyPem, address, fpHex).newCall(req).execute()
-                .use { it.code == 200 }
+                .use { GameEnd.fromStatus(it.code) }
         } catch (e: Exception) {
             Log.w(TAG, "end game failed", e)
-            false
+            GameEnd.Failed(e.message ?: "couldn't reach the host")
         }
     }
 
@@ -406,7 +443,7 @@ object LibraryClient {
     }
 
     /** Just the `games[]` slice of `/status`; everything else on that payload is the console's. */
-    private fun parseRunning(json: String): List<RunningGame> {
+    internal fun parseRunning(json: String): List<RunningGame> {
         val arr = JSONObject(json).optJSONArray("games") ?: return emptyList()
         val out = ArrayList<RunningGame>(arr.length())
         for (i in 0 until arr.length()) {
@@ -417,6 +454,8 @@ object LibraryClient {
                     title = o.optString("title"),
                     state = o.optString("state"),
                     awaitingWindow = o.optBoolean("awaiting_window"),
+                    sessionId = if (o.isNull("session_id")) null else o.optLong("session_id"),
+                    endable = o.optBoolean("endable"),
                 ),
             )
         }

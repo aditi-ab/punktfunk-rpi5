@@ -181,6 +181,7 @@ fn dump_console_screens() {
             genres: Vec::new(),
             stats: None,
             running: false,
+            endable: false,
         })
         .collect(),
     );
@@ -290,6 +291,7 @@ fn dump_console_screens() {
                 genres: Vec::new(),
                 stats: None,
                 running: false,
+                endable: false,
             })
             .collect();
         list[2].stats = played(2 * 3_600_000);
@@ -439,6 +441,7 @@ fn platform_games() -> Vec<crate::library::LibraryGame> {
         genres: Vec::new(),
         stats: None,
         running: false,
+        endable: false,
     })
     .collect()
 }
@@ -731,6 +734,7 @@ fn store_games() -> Vec<crate::library::LibraryGame> {
         genres: Vec::new(),
         stats: None,
         running: false,
+        endable: false,
     };
     let mut games = vec![game("steam:launcher".into(), "Steam", true)];
     games.extend(

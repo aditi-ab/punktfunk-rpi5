@@ -1114,13 +1114,15 @@ pub struct GameSnapshot {
     pub title: String,
     pub store: Option<String>,
     pub plane: crate::events::Plane,
-    /// `launching` / `running` / `window` / `exited` / `untracked`, or `grace`
-    /// on the reconnect window.
+    /// `launching` / `running` / `window` / `exited` / `untracked`, `grace` on
+    /// the reconnect window, or `detached`: still running, no session holds it.
     pub state: &'static str,
     /// `running`, and `window` will follow once the game's window is up.
     pub awaiting_window: bool,
     /// Seconds left before the game is ended. Set only on a `grace` row.
     pub grace_remaining_s: Option<u64>,
+    /// Hex fingerprint of the device that launched it; `None` if anonymous.
+    pub launched_by: Option<String>,
 }
 
 /// Compat plane's launched game, while it has one.
@@ -1151,10 +1153,11 @@ impl Drop for GamestreamGameGuard {
 }
 
 /// Every launched game the host currently knows: live sessions first, then
-/// the compat plane, then games waiting out a reconnect window.
+/// the compat plane, then games waiting out a reconnect window, then launches
+/// still running with no session ([`crate::launchreg::detached`]).
 ///
-/// Sources stay separate — a grace-pending game has no session to hang
-/// off, and omitting it would hide "the host is about to close this game".
+/// Sources stay separate — a grace-pending or detached game has no session
+/// to hang off, and omitting it would hide a game the player can still end.
 pub fn games() -> Vec<GameSnapshot> {
     let mut out: Vec<GameSnapshot> = registry()
         .iter()
@@ -1170,6 +1173,7 @@ pub fn games() -> Vec<GameSnapshot> {
                 state: g.state().as_str(),
                 awaiting_window: g.awaits_window(),
                 grace_remaining_s: None,
+                launched_by: g.fingerprint.clone(),
             })
         })
         .collect();
@@ -1190,6 +1194,7 @@ pub fn games() -> Vec<GameSnapshot> {
                 state: g.state().as_str(),
                 awaiting_window: g.awaits_window(),
                 grace_remaining_s: None,
+                launched_by: g.fingerprint.clone(),
             }),
     );
     out.extend(
@@ -1205,6 +1210,23 @@ pub fn games() -> Vec<GameSnapshot> {
                 state: "grace",
                 awaiting_window: false,
                 grace_remaining_s: Some(remaining),
+                launched_by: g.fingerprint.clone(),
+            }),
+    );
+    out.extend(
+        crate::launchreg::detached()
+            .into_iter()
+            .map(|d| GameSnapshot {
+                session_id: None,
+                client: d.client().to_string(),
+                app_id: d.game.id.clone(),
+                title: d.game.title.clone(),
+                store: d.game.store.clone(),
+                plane: d.plane,
+                state: "detached",
+                awaiting_window: false,
+                grace_remaining_s: None,
+                launched_by: Some(d.fingerprint),
             }),
     );
     out

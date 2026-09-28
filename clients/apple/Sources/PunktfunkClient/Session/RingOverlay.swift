@@ -181,6 +181,11 @@ struct RingActions {
     var requestMode: (UInt32, UInt32, UInt32) -> Void
     var scrollInverted: () -> Bool = { false }
     var toggleScrollInversion: () -> Void = {}
+    /// The game this device launched that this stream plays (`RunningGame.streamedHere`); nil
+    /// offers no End game.
+    var streamedGame: () -> RunningGame? = { nil }
+    /// End that game on the host, then the stream.
+    var endGame: () -> Void = {}
 }
 
 /// The editor's hooks (design §3.3): a tap on a slot picks its action instead of firing it, and
@@ -220,6 +225,10 @@ func spec(_ slot: SlotId, _ cfg: OverlayConfig, _ a: RingActions) -> SlotSpec {
     switch slot {
     case .endStream:
         return SlotSpec(id: "end_stream", label: "End stream", icon: "xmark", armed: true)
+    case .endGame:
+        return SlotSpec(id: "end_game", label: "End game", icon: "xmark.circle",
+                        enabled: a.streamedGame() != nil,
+                        reason: "No game this device launched is running here", armed: true)
     case .disconnectLinger:
         return SlotSpec(id: "disconnect_linger", label: "Disconnect, keep the game running",
                         icon: "rectangle.portrait.and.arrow.right")
@@ -579,6 +588,7 @@ struct RingOverlay: View {
         state.hint = nil
         switch slot {
         case .endStream: state.close(); actions.endStream()
+        case .endGame: state.close(); actions.endGame()
         case .disconnectLinger: state.close(); actions.disconnectLinger()
         case .touchMode: actions.cycleTouchMode()
         case .keyboard: state.close(); actions.keyboard()
@@ -782,6 +792,12 @@ extension RingOverlay {
                                  value: state.armed == "end_stream" ? againHint : "") { [state] in
             if state.armed == "end_stream" { state.close(); a.endStream() } else { state.warnTick &+= 1; state.armed = "end_stream" }
         })
+        if a.streamedGame() != nil {
+            rows.append(SheetRowSpec(label: "End game",
+                                     value: state.armed == "end_game" ? againHint : "") { [state] in
+                if state.armed == "end_game" { state.close(); a.endGame() } else { state.warnTick &+= 1; state.armed = "end_game" }
+            })
+        }
         rows.append(SheetRowSpec(label: "Disconnect, keep the game running") { [state] in state.close(); a.disconnectLinger() })
         rows.append(SheetRowSpec(header: "Resolution", label: "Resolution", value: resLabel, adjust: adjustRes) { adjustRes(1) })
         rows.append(SheetRowSpec(label: "Refresh", value: "\(mode.hz) Hz", adjust: adjustHz) { adjustHz(1) })

@@ -13,7 +13,8 @@ import { m } from "@/paraglide/messages";
  *
  * The `grace` rows are the reason this card exists at all. A game whose session is gone is on a
  * countdown to being closed, which costs unsaved progress; that has to be visible somewhere, with a
- * way to say "yes, do it now" or (by reconnecting) "no". The live rows come almost free alongside.
+ * way to say "yes, do it now" or (by reconnecting) "no". A `detached` row is a game its stream left
+ * running with no countdown; it stays until someone ends it. The live rows come almost free.
  */
 export const RunningGames: FC<{
 	games: ActiveGame[];
@@ -38,7 +39,7 @@ export const RunningGames: FC<{
 						// sessions), so the title alone is not a key. The index is the last resort: every
 						// grace row has a null `session_id`, so two waiting copies of the same title on the
 						// same plane produced identical keys and React collapsed them into one row.
-						key={`${g.plane}:${g.session_id ?? "grace"}:${g.app_id ?? g.title}:${i}`}
+						key={`${g.plane}:${g.session_id ?? g.state}:${g.app_id ?? g.title}:${i}`}
 						game={g}
 						art={coverFor(g, library)}
 						onEnd={() => onEnd(g)}
@@ -62,6 +63,7 @@ const GameRow: FC<{
 	// quit the game and is watching the console wondering why nothing happened deserves the answer
 	// here rather than in the host log.
 	const untracked = game.state === "untracked";
+	const detached = game.state === "detached";
 	return (
 		<div className="flex items-center gap-3">
 			{/* Fixed slot so rows line up whether or not a title has a cover. Plenty won't: an
@@ -94,9 +96,11 @@ const GameRow: FC<{
 							})
 						: untracked
 							? m.games_untracked_note()
-							: [game.client, planeLabel(game.plane)]
-									.filter(Boolean)
-									.join(" · ")}
+							: detached
+								? m.games_detached_note()
+								: [game.client, planeLabel(game.plane)]
+										.filter(Boolean)
+										.join(" · ")}
 				</p>
 			</div>
 			<Button
@@ -135,6 +139,8 @@ function stateLabel(state: string): string {
 			return m.games_state_grace();
 		case "untracked":
 			return m.games_state_untracked();
+		case "detached":
+			return m.games_state_detached();
 		default:
 			return state;
 	}

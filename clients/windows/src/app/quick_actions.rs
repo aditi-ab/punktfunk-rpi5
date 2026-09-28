@@ -132,6 +132,7 @@ fn write(props: &Props, cfg: &OverlayConfig) {
 fn short_label(cfg: &OverlayConfig, slot: &SlotId) -> String {
     match slot {
         SlotId::EndStream => "End".into(),
+        SlotId::EndGame => "Quit".into(),
         SlotId::DisconnectLinger => "Leave".into(),
         SlotId::TouchMode => "Touch".into(),
         SlotId::Keyboard => "Keys".into(),

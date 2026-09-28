@@ -251,8 +251,8 @@ pub fn fetch_games(
 }
 
 /// One title currently launched, from `GET /api/v1/status`. Partial
-/// `ActiveGame`: session/plane/grace stay undecoded so a shelf does not
-/// break when the operator payload grows.
+/// `ActiveGame`: plane and grace stay undecoded so a shelf does not break when
+/// the operator payload grows.
 #[derive(Clone, Debug, Deserialize)]
 pub struct RunningGame {
     /// Store-qualified id (`steam:570`); join key onto [`GameEntry`].
@@ -261,21 +261,97 @@ pub struct RunningGame {
     pub app_id: Option<String>,
     #[serde(default)]
     pub title: String,
-    /// `launching` | `running` | `window` | `exited` | `untracked` | `grace`. A
-    /// String so an unknown host value cannot fail the whole list decode.
+    /// `launching` | `running` | `window` | `exited` | `untracked` | `grace` |
+    /// `detached`. A String so an unknown host value cannot fail the whole list decode.
     #[serde(default)]
     pub state: String,
     /// `running`, and the host will report `window` once the game's window is up.
     /// False from a host that cannot see windows, or predates them.
     #[serde(default)]
     pub awaiting_window: bool,
+    /// The live session streaming it; `None` for a game nobody streams.
+    #[serde(default)]
+    pub session_id: Option<u64>,
+    /// This device may end it ([`end_game`]): a game it launched. False from a
+    /// host that predates the field.
+    #[serde(default)]
+    pub endable: bool,
 }
 
 impl RunningGame {
     /// True unless `state == "exited"`. `untracked` (host cannot follow the
-    /// process) and `grace` (session gone, process still up) both count as up.
+    /// process), `grace` and `detached` (session gone, process still up) count as up.
     pub fn is_up(&self) -> bool {
         self.state != "exited"
+    }
+
+    /// A game this device launched that a live session streams: what an in-stream
+    /// End game ends.
+    pub fn streamed_here(&self) -> bool {
+        self.endable && self.session_id.is_some() && self.app_id.is_some()
+    }
+}
+
+/// What asking the host to end a game came to (`POST /api/v1/game/end`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GameEnd {
+    Ended,
+    /// `409`: the host had nothing of this title left to end.
+    NotRunning,
+    /// `401`/`404`: a host that predates ending games from a device.
+    Unsupported,
+    /// `403`: this device's access to the host expired.
+    Expired,
+    Failed(String),
+}
+
+impl GameEnd {
+    pub fn from_status(code: u16) -> GameEnd {
+        match code {
+            200..=299 => GameEnd::Ended,
+            409 => GameEnd::NotRunning,
+            401 | 404 => GameEnd::Unsupported,
+            403 => GameEnd::Expired,
+            code => GameEnd::Failed(format!("the host refused it ({code})")),
+        }
+    }
+
+    /// The player-facing line. The Swift, Kotlin and web clients use the same words.
+    pub fn notice(&self, title: &str) -> String {
+        match self {
+            GameEnd::Ended => format!("Ended {title}."),
+            GameEnd::NotRunning => format!("{title} isn't running any more."),
+            GameEnd::Unsupported => "This host needs an update to end games from here.".into(),
+            GameEnd::Expired => "This device's access to the host has expired.".into(),
+            GameEnd::Failed(why) => format!("Couldn't end {title} \u{2014} {why}"),
+        }
+    }
+}
+
+/// `POST /api/v1/game/end` for one title, live session included. The host ends
+/// it only if this device launched it. Blocking.
+#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+pub fn end_game(
+    addr: &str,
+    mgmt_port: u16,
+    identity: &(String, String),
+    pin: Option<[u8; 32]>,
+    app_id: &str,
+) -> GameEnd {
+    let agent = match agent(identity, pin) {
+        Ok(a) => a,
+        Err(e) => return GameEnd::Failed(e.to_string()),
+    };
+    let url = format!("{}/api/v1/game/end", base_url(addr, mgmt_port));
+    let body = serde_json::json!({ "app_id": app_id, "streaming": true }).to_string();
+    match agent
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .send(body)
+    {
+        Ok(_) => GameEnd::Ended,
+        Err(ureq::Error::StatusCode(code)) => GameEnd::from_status(code),
+        Err(e) => GameEnd::Failed(classify(e).to_string()),
     }
 }
 
@@ -442,6 +518,12 @@ pub fn refresh_running(addr: &str, mgmt_port: u16, fp_hex: &str) {
     RUNNING.refresh(addr, mgmt_port, fp_hex, fetch_running, RunningGame::is_up);
 }
 
+/// What this host last said it has up, from the [`refresh_running`] cache.
+#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+pub fn running(fp_hex: &str) -> Vec<RunningGame> {
+    RUNNING.get(fp_hex)
+}
+
 /// Drop what this host said — the caller just ended a session on it, so the
 /// answer is about to change and the next tick must ask rather than wait out
 /// [`RUNNING_TTL`].
@@ -570,6 +652,35 @@ pub(crate) fn classify(e: ureq::Error) -> LibraryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(json: &str) -> RunningGame {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// Only a game this device launched and still streams is the in-stream End game's.
+    #[test]
+    fn streamed_here_is_this_devices_live_launch() {
+        let live = r#"{"app_id":"steam:1","state":"running","session_id":3,"endable":true}"#;
+        assert!(row(live).streamed_here());
+        let other = r#"{"app_id":"steam:1","state":"running","session_id":3}"#;
+        assert!(!row(other).streamed_here(), "another device's launch");
+        let left = r#"{"app_id":"steam:1","state":"detached","endable":true}"#;
+        assert!(!row(left).streamed_here(), "nobody streams it");
+        assert!(row(left).is_up());
+    }
+
+    #[test]
+    fn a_game_end_status_maps_to_what_the_player_is_told() {
+        assert_eq!(GameEnd::from_status(200), GameEnd::Ended);
+        assert_eq!(GameEnd::from_status(409), GameEnd::NotRunning);
+        assert_eq!(GameEnd::from_status(401), GameEnd::Unsupported);
+        assert_eq!(GameEnd::from_status(404), GameEnd::Unsupported);
+        assert_eq!(GameEnd::from_status(403), GameEnd::Expired);
+        assert_eq!(
+            GameEnd::NotRunning.notice("Hades"),
+            "Hades isn't running any more."
+        );
+    }
 
     #[test]
     fn initials_take_two_words() {
