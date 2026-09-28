@@ -581,9 +581,19 @@ mod pump_tests {
         join: std::thread::JoinHandle<()>,
     }
 
+    /// The harness's `stale_gap`: short, so a test that waits one out stays fast.
+    const STALE_GAP: Duration = Duration::from_millis(80);
+    /// For a test that needs the gap not to pass: past any stall a loaded runner produces.
+    const LONG_GAP: Duration = Duration::from_secs(1);
+
     /// Real loop vs mocks. `fail_first` = open failures before success. `dead_on_arrival` = every
     /// instance pre-killed. `stable_after = ZERO` treats every death as stable so tests stay fast.
-    fn start_tuned(fail_first: usize, dead_on_arrival: bool, stable_after: Duration) -> Harness {
+    fn start_tuned(
+        fail_first: usize,
+        dead_on_arrival: bool,
+        stable_after: Duration,
+        stale_gap: Duration,
+    ) -> Harness {
         let (tx, rx) = std::sync::mpsc::sync_channel::<MicFrame>(MIC_QUEUE_CAP);
         let opens = Arc::new(AtomicUsize::new(0));
         let alive = Arc::new(Mutex::new(None::<Arc<AtomicBool>>));
@@ -604,7 +614,7 @@ mod pump_tests {
             backoff_start: Duration::from_millis(10),
             backoff_cap: Duration::from_millis(40),
             heartbeat: Duration::from_millis(20),
-            stale_gap: Duration::from_millis(80),
+            stale_gap,
             stable_after,
         };
         let join = std::thread::spawn(move || {
@@ -643,7 +653,7 @@ mod pump_tests {
     }
 
     fn start(fail_first: usize) -> Harness {
-        start_tuned(fail_first, false, Duration::ZERO)
+        start_tuned(fail_first, false, Duration::ZERO, STALE_GAP)
     }
 
     fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
@@ -698,28 +708,29 @@ mod pump_tests {
     /// gone quiet for `stale_gap`, then take over; interleaving the two garbled both.
     #[test]
     fn a_second_session_waits_until_the_first_goes_quiet() {
-        let h = start(0);
+        // A stall past `stale_gap` between the two sessions' frames hands the floor over.
+        let h = start_tuned(0, false, Duration::ZERO, LONG_GAP);
         wait_until("pump polled", || h.polled.load(Ordering::Acquire));
         let frame = 960 * MIC_CHANNELS as usize;
         let other = |seq| MicFrame {
             source: 2,
             ..mic_frame(seq)
         };
-        for seq in 0..5 {
+        for seq in 0..5u32 {
             h.tx.send(mic_frame(seq)).unwrap();
             h.tx.send(other(seq)).unwrap();
-            std::thread::sleep(Duration::from_millis(5));
+            // Paced on the pump: a backlog past `DRAIN_ABOVE` is dropped, not played.
+            wait_until("floor frame pushed", || {
+                h.pushed.load(Ordering::SeqCst) >= (seq as usize + 1) * frame
+            });
         }
-        wait_until("first session pushed", || {
-            h.pushed.load(Ordering::SeqCst) >= 5 * frame
-        });
         std::thread::sleep(Duration::from_millis(40));
         assert_eq!(
             h.pushed.load(Ordering::SeqCst),
             5 * frame,
             "only the floor's frames"
         );
-        std::thread::sleep(Duration::from_millis(120)); // > stale_gap
+        std::thread::sleep(LONG_GAP + Duration::from_millis(40));
         for seq in 5..8 {
             h.tx.send(other(seq)).unwrap();
             std::thread::sleep(Duration::from_millis(5));
@@ -822,7 +833,7 @@ mod pump_tests {
     fn rapid_death_backs_off() {
         // Dead on arrival; high stable_after so each death is a failed open.
         // Unguarded: ~25 opens / 500 ms at 20 ms heartbeat. Backoff 10→20→40: ≈ 7.
-        let h = start_tuned(0, true, Duration::from_secs(10));
+        let h = start_tuned(0, true, Duration::from_secs(10), STALE_GAP);
         std::thread::sleep(Duration::from_millis(500));
         let opens = h.opens.load(Ordering::SeqCst);
         assert!(opens >= 2, "must keep retrying (got {opens})");
@@ -837,7 +848,8 @@ mod pump_tests {
     /// seq 0 then 2 must push ~3 frames (decode, PLC, decode) once the reorder window expires.
     #[test]
     fn seq_gap_is_concealed() {
-        let h = start(0);
+        // A stall past `stale_gap` between the two frames is a pause, which nothing conceals.
+        let h = start_tuned(0, false, Duration::ZERO, LONG_GAP);
         wait_until("pump polled", || h.polled.load(Ordering::Acquire));
         h.tx.send(mic_frame(0)).unwrap();
         h.tx.send(mic_frame(2)).unwrap();
