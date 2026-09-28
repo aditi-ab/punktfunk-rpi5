@@ -8,14 +8,13 @@ import UIKit
 
 @MainActor
 public enum NativeDisplay {
-    /// The main display in landscape pixels, at its top refresh.
+    /// The main display in landscape pixels, at its top refresh. On a Mac that is the panel, not
+    /// the framebuffer a scaled mode renders into (`NSScreen.panelPixelSize`).
     public static var mode: (width: Int, height: Int, hz: Int) {
         #if os(macOS)
         guard let screen = NSScreen.main else { return (1920, 1080, 60) }
-        let scale = screen.backingScaleFactor
-        return (
-            Int(screen.frame.width * scale), Int(screen.frame.height * scale),
-            screen.maximumFramesPerSecond)
+        let panel = screen.panelPixelSize
+        return (panel.width, panel.height, screen.maximumFramesPerSecond)
         #elseif os(visionOS)
         // No screen to read: a window can grow past 4K's detail, and every Vision Pro runs 90 Hz.
         // Fixed until visionOS reports a refresh ceiling; M5 panels reach 120.

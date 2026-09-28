@@ -107,6 +107,11 @@ pub struct SessionParams {
     /// Overlay vocabulary this launch resolved: Standard (`false`) or Advanced. Rides per
     /// launch like the tier, so a browse-mode presenter adopts a change made between streams.
     pub advanced_stats: bool,
+    /// Stats panel corner and size multiplier, per launch like the tier.
+    pub stats_corner: crate::trust::HudCorner,
+    pub stats_scale: f32,
+    /// Show how to leave when this stream starts.
+    pub exit_hint: bool,
     /// Advertise `CLIENT_CAP_PHASE_LOCK` and feed [`latch_grid`](Self::latch_grid). The
     /// desktop leaves it off: the lock moves the wait for the latch into the host's hold
     /// and costs 3–4 ms end to end on an iGPU at 4K. Never set without present timing.
@@ -249,6 +254,10 @@ impl SessionParams {
             preset_id,
             stats_verbosity: probes.stats_verbosity,
             advanced_stats: settings.advanced_stats,
+            // The desktop overlay's own corner is top left.
+            stats_corner: settings.hud_corner(crate::trust::HudCorner::TopLeft),
+            stats_scale: punktfunk_core::hud::stats_scale(settings.stats_scale_pct),
+            exit_hint: settings.exit_hint,
             phase_lock,
             latch_grid: probes.latch_grid,
         }

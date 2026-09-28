@@ -85,6 +85,10 @@ enum SettingsOptions {
     static let hudPlacements: [(label: String, tag: String)] =
         HUDPlacement.allCases.map { ($0.label, $0.rawValue) }
 
+    /// The overlay's size on top of the system's text size — core's `STATS_SCALE_PCTS`.
+    static let statsScales: [(label: String, tag: Int)] =
+        [75, 100, 125, 150, 175, 200].map { ("\($0) %", $0) }
+
     /// The macOS Fullscreen picker. "always" is `fullscreenAlways`; the other two are the
     /// presetable `fullscreenWhileStreaming`.
     static let fullscreenModes: [(label: String, tag: String)] = [
@@ -247,14 +251,28 @@ enum SettingsOptions {
         return Resolutions.familyOf(families, width, height) ?? 0
     }
 
-    /// This device's native modes first, then one entry's sizes from `families()` (unnamed — a
-    /// picker shows them as plain `w × h`), deduped by dimensions (native wins a tie).
+    /// Native (`0 × 0`, the display resolved at connect), this device's other native mode (the
+    /// safe area, below the notch), then one entry's sizes from `families()` (unnamed — a picker
+    /// shows them as plain `w × h`), deduped by dimensions (native wins a tie).
     @MainActor
     static func resolutionModes(family: Int) -> [(name: String, w: Int, h: Int)] {
         let entries = families()
         let sizes = entries[min(family, entries.count - 1)].sizes.map { (name: "", w: $0.w, h: $0.h) }
         var seen = Set<String>()
-        return (nativeModes() + sizes).filter { seen.insert("\($0.w)x\($0.h)").inserted }
+        return ([(name: "Native", w: 0, h: 0)] + nativeModes().dropFirst() + sizes)
+            .filter { seen.insert("\($0.w)x\($0.h)").inserted }
+    }
+
+    /// A refresh rate's label: `0` is Native.
+    static func refreshLabel(_ hz: Int) -> String {
+        hz == 0 ? "Native" : "\(hz) Hz"
+    }
+
+    /// A typed "2560 × 1440" (any separator) through the shared rule; nil without two numbers.
+    static func typedSize(_ text: String, codec: String) -> (w: Int, h: Int)? {
+        let numbers = text.split(whereSeparator: { !$0.isNumber }).compactMap { Int($0) }
+        guard numbers.count >= 2, numbers[0] > 0, numbers[1] > 0 else { return nil }
+        return Resolutions.custom(numbers[0], numbers[1], codec: codec)
     }
 
     /// This device's own modes: the screen, then its safe-area variant where it differs.
@@ -328,23 +346,27 @@ enum SettingsOptions {
     }
     #endif
 
-    /// Refresh rates the device can actually display (no point asking the host to render frames
-    /// the screen can't show), plus any stored custom value so it stays selectable.
+    /// Native (`0`), then the rates the device can actually display (no point asking the host to
+    /// render frames the screen can't show), plus any stored custom value so it stays selectable.
+    /// A Mac lists the desktop clients' rates; a phone or tablet the few its panels run at.
     @MainActor
     static func refreshRates(including current: Int) -> [Int] {
         #if os(visionOS)
         let maxHz = NativeDisplay.mode.hz
+        let ladder = [60, 120, 240]
         #elseif os(iOS) || os(tvOS)
         let maxHz = UIScreen.main.maximumFramesPerSecond
+        let ladder = [60, 120, 240]
         #else
         let maxHz = NSScreen.main?.maximumFramesPerSecond ?? 60
+        let ladder = [30, 60, 90, 120, 144, 165, 240]
         #endif
-        var rates = [60, 120, 240].filter { $0 <= maxHz }
+        var rates = ladder.filter { $0 <= maxHz }
         #if os(visionOS)
         rates.append(maxHz) // 90, which the 60/120/240 ladder skips
         #endif
         if rates.isEmpty { rates = [maxHz] }
-        if !rates.contains(current) { rates.append(current) }
-        return rates.sorted()
+        if current != 0, !rates.contains(current) { rates.append(current) }
+        return [0] + rates.sorted()
     }
 }

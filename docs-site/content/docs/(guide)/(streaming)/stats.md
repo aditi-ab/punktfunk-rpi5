@@ -10,9 +10,9 @@ Every client draws the same stats overlay from the same measurements, in one of 
 - **Advanced** shows how long a frame takes from capture on the host to your screen, as a median
   and a slow-frame figure, and every stage in between.
 
-Both are in the client's Settings under **Statistics**
-([client settings](/docs/client-settings#overlay)): the overlay row picks the level a stream starts
-at, **Advanced statistics** the view.
+Both are in the client's Settings under **General**
+([client settings](/docs/client-settings#overlay)): **Statistics overlay** picks the level a stream
+starts at, **Advanced statistics** the view.
 
 ## Detail levels
 
@@ -33,8 +33,8 @@ With a controller, **Select + X** cycles it on every client. The Linux, Windows,
 apps also have **Statistics** on the [quick-action dial](/docs/input#the-quick-action-dial). A cycle
 lasts for that stream; the next one starts at the level in Settings.
 
-The overlay follows your display's scaling. To resize it on the Linux and Windows clients, see
-`PUNKTFUNK_OSD_SCALE` in [Configuration](/docs/configuration#client-side-native-clients).
+The overlay follows your display's scaling. **Statistics size** makes it larger or smaller on top
+of that, and **Statistics position** moves it to another corner; both are advanced settings.
 
 ## Standard view
 

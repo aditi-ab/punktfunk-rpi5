@@ -21,16 +21,15 @@
   ],
   "$shell_tabs": "Version 3: the console's top-level tabs, in strip order. The Skia shell draws them on every platform, so its Rust twin pins them; Apple and Android hold no copy.",
   "settings_sections": [
-    { "name": "Stream" },
-    { "name": "Picture" },
-    { "name": "Sound" },
-    { "name": "Controllers" },
+    { "name": "General" },
+    { "name": "Display" },
+    { "name": "Audio" },
     { "name": "Input" },
-    { "name": "Interface" },
+    { "name": "Controllers" },
     { "name": "Presets" },
     { "name": "About" }
   ],
-  "$settings_sections": "Version 3: the Settings tab's sections, in tab order. The Skia shell draws them on every platform, so its Rust twin pins them.",
+  "$settings_sections": "Version 4: the Settings tab's sections, in tab order: the categories every client's settings use, plus Presets. The Skia shell draws them on every platform, so its Rust twin pins them.",
   "motion_springs": {
     "focus": { "response": 0.32, "damping": 0.78 },
     "press": { "response": 0.16, "damping": 0.65, "scale": 0.97 },

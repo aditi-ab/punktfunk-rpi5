@@ -341,6 +341,13 @@ impl Shell {
                 // updates this.
                 scale: overlay_scale(self.window.display_scale(), self.osd_scale_pref),
                 stats,
+                stats_corner: stream
+                    .as_ref()
+                    .map_or(punktfunk_core::hud::HudCorner::TopLeft, |st| {
+                        st.params.stats_corner
+                    }),
+                stats_scale: stream.as_ref().map_or(1.0, |st| st.params.stats_scale),
+                exit_hint: stream.as_ref().is_some_and(|st| st.params.exit_hint),
                 hint,
                 access: access_chip.as_deref(),
                 notice: session_notice,

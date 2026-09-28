@@ -65,7 +65,9 @@ mod skia_overlay;
 /// same rows out its own way (the webOS pointer UI's page map). Same kit terms as
 /// [`widgets`]: one consumer, no stability promise.
 pub mod settings_rows {
-    pub use crate::screens::settings::{adjust, detail, row_applies, row_on, row_spec, RowId};
+    pub use crate::screens::settings::{
+        adjust, advanced, changed, detail, row_applies, row_on, row_spec, RowId,
+    };
     pub use crate::screens::{Ctx, Device};
 }
 pub mod store;

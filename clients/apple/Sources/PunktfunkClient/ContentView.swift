@@ -19,9 +19,9 @@ struct ContentView: View {
     // The dev auto-connect hook (DEBUG-only — see `autoConnectIfAsked`) writes these three, so
     // they stay observed here; every OTHER stream setting reaches a session through
     // `EffectiveSettings`, resolved once per connect.
-    @AppStorage(DefaultsKey.streamWidth) private var width = 1920
-    @AppStorage(DefaultsKey.streamHeight) private var height = 1080
-    @AppStorage(DefaultsKey.streamHz) private var hz = 60
+    @AppStorage(DefaultsKey.streamWidth) private var width = 0
+    @AppStorage(DefaultsKey.streamHeight) private var height = 0
+    @AppStorage(DefaultsKey.streamHz) private var hz = 0
     @AppStorage(DefaultsKey.fullscreenWhileStreaming) private var fullscreenWhileStreaming = true
     @AppStorage(DefaultsKey.fullscreenAlways) private var fullscreenAlways = false
     // The raw string is what @AppStorage observes (so cycles from any surface re-render this
@@ -29,6 +29,7 @@ struct ContentView: View {
     @AppStorage(DefaultsKey.statsVerbosity) private var statsVerbosityRaw
         = StatsVerbosity.current.rawValue
     @AppStorage(DefaultsKey.hudPlacement) private var hudPlacement = HUDPlacement.topTrailing.rawValue
+    @AppStorage(DefaultsKey.statsScalePct) private var statsScalePct = 100
     /// The tier the overlay actually shows: the live session's (its preset's, then whatever the
     /// ⌃⌥⇧S/three-finger cycle moved it to) while streaming, the persisted global otherwise.
     private var statsVerbosity: StatsVerbosity {
@@ -313,7 +314,6 @@ struct ContentView: View {
         .animation(.easeInOut(duration: 0.3), value: model.launchHold)
         .onAppear {
             DemoMode.resume(in: store)
-            seedDefaultModeIfNeeded()
             autoConnectIfAsked()
             // An intent that ran before this window subscribed. Ahead of the start screen,
             // which stands down for a link.
@@ -1103,7 +1103,8 @@ struct ContentView: View {
                         if captureEnabled && statsVerbosity != .off {
                             StreamHUDView(
                                 model: model, connection: conn, placement: placement,
-                                verbosity: statsVerbosity)
+                                verbosity: statsVerbosity,
+                                scale: Double(min(max(statsScalePct, 75), 200)) / 100)
                                 .transition(
                                     .scale(scale: 0.8, anchor: placement.unitPoint)
                                         .combined(with: .opacity))
@@ -1329,21 +1330,6 @@ struct ContentView: View {
     }
 
     // MARK: - First-run + dev hooks
-
-    /// First run off the Mac: default the stream mode to this device's native display so the
-    /// video fills it instead of letterboxing 1920×1080 onto a 4:3 iPad. (The compiled-in
-    /// AppStorage defaults only apply until any value is saved; macOS keeps 1080p — a desktop
-    /// window is not the screen.)
-    private func seedDefaultModeIfNeeded() {
-        #if !os(macOS)
-        let defaults = UserDefaults.standard
-        guard defaults.object(forKey: DefaultsKey.streamWidth) == nil else { return }
-        let native = NativeDisplay.mode
-        defaults.set(native.width, forKey: DefaultsKey.streamWidth)
-        defaults.set(native.height, forKey: DefaultsKey.streamHeight)
-        defaults.set(native.hz, forKey: DefaultsKey.streamHz)
-        #endif
-    }
 
     /// PUNKTFUNK_AUTOCONNECT=host[:port] connects immediately (trust-on-first-use,
     /// auto-confirmed — dev only) at the saved or PUNKTFUNK_MODE=WxHxHz mode, without

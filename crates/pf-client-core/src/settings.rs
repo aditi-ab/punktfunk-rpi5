@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-/// Overlay tier. Lives in the core so every client formats with the same enum.
-pub use punktfunk_core::hud::StatsVerbosity;
+/// Overlay tier and corner. Live in the core so every client formats with the same enums.
+pub use punktfunk_core::hud::{HudCorner, StatsVerbosity};
 
 /// How a touchscreen drives the host (Android `TouchMode`, Apple `TouchInputMode`).
 /// Stored stringly in [`Settings::touch_mode`]; parsed with [`TouchMode::from_name`].
@@ -278,6 +278,19 @@ pub struct Settings {
     /// capture→glass view. Device-wide; a preset never carries it.
     #[serde(default)]
     pub advanced_stats: bool,
+    /// Stats overlay corner, a [`HudCorner`] name; `""` = this client's own corner. Device-wide.
+    #[serde(default)]
+    pub hud_placement: String,
+    /// Stats overlay size in percent, on top of the display scale; resolve with
+    /// [`punktfunk_core::hud::stats_scale`]. The stats panel only. Device-wide.
+    #[serde(default = "default_stats_scale_pct")]
+    pub stats_scale_pct: u16,
+    /// Show how to leave for a few seconds when a stream starts. Device-wide.
+    #[serde(default = "default_true")]
+    pub exit_hint: bool,
+    /// Settings screens show their advanced rows. Device-wide; hiding a row keeps its value.
+    #[serde(default)]
+    pub show_advanced: bool,
     /// Enter fullscreen when a stream starts. `--fullscreen` (Gaming Mode) ignores this.
     pub fullscreen_on_stream: bool,
     /// Gamepad-UI backdrop palette (`"violet"` default). Presentation only — never
@@ -399,6 +412,10 @@ fn default_pad_speaker() -> String {
     "pad".into()
 }
 
+fn default_stats_scale_pct() -> u16 {
+    100
+}
+
 impl Settings {
     /// Overlay tier, resolving pre-tier stores: `show_stats = false` → Off, else Normal.
     pub fn stats_verbosity(&self) -> StatsVerbosity {
@@ -413,6 +430,11 @@ impl Settings {
     pub fn set_stats_verbosity(&mut self, v: StatsVerbosity) {
         self.stats_verbosity = Some(v);
         self.show_stats = v != StatsVerbosity::Off;
+    }
+
+    /// The stats corner: the stored one, else `own`, the corner this client draws in by default.
+    pub fn hud_corner(&self, own: HudCorner) -> HudCorner {
+        HudCorner::from_name(&self.hud_placement).unwrap_or(own)
     }
 
     pub fn touch_mode(&self) -> TouchMode {
@@ -498,6 +520,10 @@ impl Default for Settings {
             show_stats: true,
             stats_verbosity: None,
             advanced_stats: false,
+            hud_placement: String::new(),
+            stats_scale_pct: default_stats_scale_pct(),
+            exit_hint: true,
+            show_advanced: false,
             fullscreen_on_stream: true,
             ui_palette: default_ui_palette(),
             follow_os_theme: true,
@@ -750,6 +776,26 @@ mod tests {
         );
         let out = serde_json::to_string(&s).unwrap();
         assert!(out.contains(r#""library_enabled":false"#), "{out}");
+    }
+
+    /// An older store loads the overlay and settings-screen keys at their defaults, and a corner
+    /// the console or Apple already wrote lands in the field, not in `extra`.
+    #[test]
+    fn overlay_keys_default_and_read_the_stored_corner() {
+        let old: Settings = serde_json::from_str(r#"{"width":1920,"height":1080}"#).unwrap();
+        assert_eq!(old.hud_placement, "");
+        assert_eq!(old.hud_corner(HudCorner::TopLeft), HudCorner::TopLeft);
+        assert_eq!(old.stats_scale_pct, 100);
+        assert!(old.exit_hint);
+        assert!(!old.show_advanced);
+
+        let placed: Settings =
+            serde_json::from_str(r#"{"hud_placement":"bottomTrailing"}"#).unwrap();
+        assert_eq!(
+            placed.hud_corner(HudCorner::TopLeft),
+            HudCorner::BottomRight
+        );
+        assert!(placed.extra.is_empty(), "{:?}", placed.extra);
     }
 
     /// Pre-tier store falls back to `show_stats`; setting a tier keeps the legacy bool in sync.

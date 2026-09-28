@@ -182,6 +182,21 @@ pub fn nearest_in(family: &Family, h: u32) -> (u32, u32) {
         .expect("every family lists a size")
 }
 
+/// Smallest stream mode the host accepts, per side.
+pub const MIN_WIDTH: u32 = 320;
+pub const MIN_HEIGHT: u32 = 200;
+
+/// A typed `w`×`h` as a mode the host takes: each side at least [`MIN_WIDTH`]×[`MIN_HEIGHT`],
+/// at most the codec's per-side ceiling, then floored even. Twins in Swift and Kotlin run
+/// `clients/shared/custom-resolution-vectors.json`.
+pub fn custom(w: u32, h: u32, codec: &str) -> (u32, u32) {
+    let max = crate::render_scale::max_dimension(codec);
+    (
+        w.clamp(MIN_WIDTH, max) / 2 * 2,
+        h.clamp(MIN_HEIGHT, max) / 2 * 2,
+    )
+}
+
 /// The size in family `aspect` nearest in height to `h`; a native `0`
 /// looks for 1080. Ties go to the smaller size.
 pub fn nearest(aspect: usize, h: u32) -> (u32, u32) {
@@ -260,6 +275,27 @@ mod tests {
             ASPECTS.len() + 1,
             "safe area equal to the screen"
         );
+    }
+
+    /// The cross-language contract; Swift and Kotlin read the same file.
+    #[test]
+    fn custom_matches_the_shared_vectors() {
+        let raw = include_str!("../../../clients/shared/custom-resolution-vectors.json");
+        let file: serde_json::Value = serde_json::from_str(raw).expect("vector file parses");
+        let cases = file["custom"].as_array().expect("custom");
+        assert!(
+            cases.len() >= 10,
+            "the vector file is the contract; keep it rich"
+        );
+        for case in cases {
+            let pair = |k: &str| {
+                let a = case[k].as_array().unwrap();
+                (a[0].as_u64().unwrap() as u32, a[1].as_u64().unwrap() as u32)
+            };
+            let (w, h) = pair("typed");
+            let got = custom(w, h, case["codec"].as_str().unwrap());
+            assert_eq!(got, pair("want"), "{}", case["name"]);
+        }
     }
 
     #[test]

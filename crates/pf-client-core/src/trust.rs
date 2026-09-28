@@ -24,8 +24,8 @@ mod messages;
 mod probe;
 
 pub use crate::settings::{
-    effective_settings, resolve_preset, MouseMode, PresentPriority, Settings, StatsVerbosity,
-    TouchMode,
+    effective_settings, resolve_preset, HudCorner, MouseMode, PresentPriority, Settings,
+    StatsVerbosity, TouchMode,
 };
 pub use hosts::{
     forget_placeholder, learn_from_advert, learn_mgmt_port_by_fp, persist_host, rekey_addr,

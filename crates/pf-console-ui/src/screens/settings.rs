@@ -23,7 +23,7 @@ use pf_client_core::audio_format::{AUDIO_FORMATS, AUDIO_FORMAT_OPUS};
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
 use pf_client_core::presets::SettingsOverlay;
 use pf_client_core::start;
-use pf_client_core::trust::{MouseMode, StatsVerbosity, TouchMode};
+use pf_client_core::trust::{HudCorner, MouseMode, StatsVerbosity, TouchMode};
 use skia_safe::{Canvas, Rect};
 
 /// Dispatch key for adjust/activate. The pad list under "Use controller" can
@@ -134,6 +134,50 @@ pub enum RowId {
     LibrarySections,
     /// This build's version. Nothing to change.
     Version,
+    /// `trust::Settings::show_advanced`: whether the tabs list their [`advanced`] rows.
+    ShowAdvanced,
+    /// `trust::Settings::stats_scale_pct`: the statistics panel's size.
+    StatsSize,
+    /// `trust::Settings::exit_hint`: the one-line exit hint at stream start.
+    ExitHint,
+    /// Action row, last on a tab while its advanced rows are hidden and some differ from a fresh
+    /// install: says how many, and shows them.
+    AdvancedChanged,
+}
+
+/// Rows the tabs list only under Show advanced: their default is right for nearly everyone,
+/// picking a value takes knowing how streaming works, and no first stream needs them.
+pub fn advanced(id: RowId) -> bool {
+    matches!(
+        id,
+        RowId::SmoothBuffer
+            | RowId::RenderScale
+            | RowId::Codec
+            | RowId::Chroma444
+            | RowId::TenBitSdr
+            | RowId::Vsync
+            | RowId::AllowVrr
+            | RowId::Compositor
+            | RowId::Decoder
+            | RowId::LowLatency
+            | RowId::AudioFormat
+            | RowId::KeepHostAudio
+            | RowId::EchoCancel
+            | RowId::AudioRoute
+            | RowId::PadForward
+            | RowId::Pad
+            | RowId::SystemButtons
+            | RowId::GuideGesture
+            | RowId::PadHaptics
+            | RowId::PadSpeaker
+            | RowId::Sc2Passthrough
+            | RowId::DsCapture
+            | RowId::AdvancedStats
+            | RowId::StatsPosition
+            | RowId::StatsSize
+            | RowId::ExitHint
+            | RowId::ReduceUiResolution
+    )
 }
 
 /// `Settings::extra` keys for the rows about the device in your hand, not the host. The
@@ -199,14 +243,14 @@ const BACKGROUND_TIMEOUTS: [(&str, &str); 4] = [
 ];
 const BACKGROUND_TIMEOUT_DEFAULT: u64 = 10;
 
-/// Apple's `HUDPlacement` raw values.
-const STATS_POSITION_KEY: &str = "hud_placement";
-const STATS_POSITIONS: [(&str, &str); 4] = [
-    ("topLeading", "Top left"),
-    ("topTrailing", "Top right"),
-    ("bottomLeading", "Bottom left"),
-    ("bottomTrailing", "Bottom right"),
-];
+/// The corner each platform's stats overlay sits in until the player picks one.
+pub(crate) fn own_stats_corner(platform: crate::platform::Platform) -> HudCorner {
+    use crate::platform::Platform;
+    match platform {
+        Platform::Desktop | Platform::Android => HudCorner::TopLeft,
+        Platform::Apple | Platform::WebOS | Platform::Web => HudCorner::TopRight,
+    }
+}
 
 /// `"pad"` is the only live value; `"mix"` renders as off. Local copy because
 /// `pad_audio` is `cfg(linux|windows)` and Android still sends the setting.
@@ -309,9 +353,6 @@ impl RowId {
                 Extra::Choice(webos_keys::AUDIO_ROUTE, "software", &WEBOS_AUDIO_ROUTES)
             }
             RowId::HostSort => Extra::Choice(home::HOST_SORT_KEY, "added", &home::HOST_SORTS),
-            RowId::StatsPosition => {
-                Extra::Choice(STATS_POSITION_KEY, "topTrailing", &STATS_POSITIONS)
-            }
             RowId::GamepadUiMode => {
                 Extra::Choice(GAMEPAD_UI_MODE_KEY, "connected", &GAMEPAD_UI_MODES)
             }
@@ -360,64 +401,68 @@ pub(crate) fn reduce_ui_res(
 /// The explainer band under the rows, design units.
 const DETAIL_H: f64 = crate::widgets::FOOT_DETAIL_H;
 
-// The sections, the rows a player touches most first. A child row sits right under the
-// switch it dims or drops with. Presets is empty here: its rows come from the catalog.
-const TABS: [(&str, &[RowId]); 8] = [
+// The sections, the rows a player touches most first and the [`advanced`] ones last. A child
+// row sits right under the switch it dims or drops with. Presets is empty here: its rows come
+// from the catalog.
+const TABS: [(&str, &[RowId]); 7] = [
     (
-        "Stream",
+        "General",
+        &[
+            RowId::StartIn,
+            RowId::AutoWake,
+            RowId::FullscreenMode,
+            RowId::Fullscreen,
+            RowId::BackgroundKeepAlive,
+            RowId::BackgroundTimeout,
+            RowId::Stats,
+            RowId::GamepadUi,
+            RowId::GamepadUiMode,
+            RowId::FollowOsTheme,
+            RowId::Palette,
+            RowId::ReduceMotion,
+            RowId::LibraryView,
+            RowId::LibrarySections,
+            RowId::HostSort,
+            RowId::HostGrouping,
+            RowId::ShowAdvanced,
+            RowId::AdvancedStats,
+            RowId::StatsPosition,
+            RowId::StatsSize,
+            RowId::ExitHint,
+            RowId::ReduceUiResolution,
+        ],
+    ),
+    (
+        "Display",
         &[
             RowId::Aspect,
             RowId::Resolution,
             RowId::Refresh,
             RowId::Bitrate,
             RowId::VideoFit,
-            RowId::RenderScale,
-            RowId::Compositor,
-            RowId::BackgroundKeepAlive,
-            RowId::BackgroundTimeout,
-        ],
-    ),
-    (
-        "Picture",
-        &[
-            RowId::Codec,
             RowId::Hdr,
             RowId::PresentPriority,
             RowId::SmoothBuffer,
-            RowId::Decoder,
+            RowId::RenderScale,
+            RowId::Codec,
             RowId::Chroma444,
             RowId::TenBitSdr,
-            RowId::LowLatency,
             RowId::Vsync,
             RowId::AllowVrr,
+            RowId::Compositor,
+            RowId::Decoder,
+            RowId::LowLatency,
         ],
     ),
     (
-        "Sound",
+        "Audio",
         &[
             RowId::Audio,
-            RowId::AudioFormat,
             RowId::Mic,
-            RowId::EchoCancel,
+            RowId::AudioFormat,
             RowId::KeepHostAudio,
+            RowId::EchoCancel,
             RowId::AudioRoute,
-        ],
-    ),
-    (
-        "Controllers",
-        &[
-            RowId::PadForward,
-            RowId::Pad,
-            RowId::PadType,
-            RowId::Controllers,
-            RowId::SystemButtons,
-            RowId::GuideGesture,
-            RowId::PadHaptics,
-            RowId::PadSpeaker,
-            RowId::PhoneRumble,
-            RowId::PhoneGyro,
-            RowId::Sc2Passthrough,
-            RowId::DsCapture,
         ],
     ),
     (
@@ -425,32 +470,27 @@ const TABS: [(&str, &[RowId]); 8] = [
         &[
             RowId::Touch,
             RowId::Mouse,
-            RowId::QuickActions,
             RowId::InvertScroll,
             RowId::Shortcuts,
+            RowId::QuickActions,
             RowId::CursorGestures,
         ],
     ),
     (
-        "Interface",
+        "Controllers",
         &[
-            RowId::FollowOsTheme,
-            RowId::Palette,
-            RowId::LibrarySections,
-            RowId::LibraryView,
-            RowId::StartIn,
-            RowId::HostSort,
-            RowId::HostGrouping,
-            RowId::ReduceUiResolution,
-            RowId::GamepadUi,
-            RowId::GamepadUiMode,
-            RowId::Stats,
-            RowId::StatsPosition,
-            RowId::AdvancedStats,
-            RowId::ReduceMotion,
-            RowId::FullscreenMode,
-            RowId::Fullscreen,
-            RowId::AutoWake,
+            RowId::Controllers,
+            RowId::PadType,
+            RowId::PhoneRumble,
+            RowId::PhoneGyro,
+            RowId::PadForward,
+            RowId::Pad,
+            RowId::SystemButtons,
+            RowId::GuideGesture,
+            RowId::PadHaptics,
+            RowId::PadSpeaker,
+            RowId::Sc2Passthrough,
+            RowId::DsCapture,
         ],
     ),
     ("Presets", &[]),
@@ -458,7 +498,7 @@ const TABS: [(&str, &[RowId]); 8] = [
 ];
 
 /// The Presets section — catalog-built, not [`TABS`] rows.
-const PRESETS_TAB: usize = 6;
+const PRESETS_TAB: usize = 5;
 
 /// Strip length for the shell's raster walk. `cfg(test)`: a shipping build
 /// would warn it dead, and this crate treats warnings as errors.
@@ -492,6 +532,30 @@ fn family(
         return native.unwrap_or(0);
     }
     family_of(fams, s.width, s.height).unwrap_or(0)
+}
+
+/// A window the stream can follow (Match window): the desktops, the browser, and every Apple
+/// device but the TV.
+fn has_window(device: &crate::screens::Device) -> bool {
+    use crate::platform::Platform;
+    match device.platform {
+        Platform::Desktop | Platform::Web => true,
+        Platform::Apple => !device.tv,
+        Platform::Android | Platform::WebOS => false,
+    }
+}
+
+/// A stored size the Resolution row's list does not hold: typed here or on another client.
+fn custom_size(
+    s: &pf_client_core::trust::Settings,
+    fams: &[Family],
+    platform: crate::platform::Platform,
+) -> bool {
+    s.width != 0
+        && !s.match_window
+        && !fams[family(s, fams, platform)]
+            .sizes
+            .contains(&(s.width, s.height))
 }
 
 /// Android's Native (safe area) resolution. The flag only counts on a native size.
@@ -611,6 +675,18 @@ const PAD_TYPES: [(&str, &str); 7] = [
     ("steamdeck", "Steam Deck"),
     ("steamcontroller2", "Steam Controller 2"),
 ];
+/// The pad types `platform` can ask a host for. The TV client maps Xbox 360, Steam Deck and
+/// Steam Controller 2 to Automatic, so its row does not offer them.
+fn pad_types(platform: crate::platform::Platform) -> Vec<(&'static str, &'static str)> {
+    PAD_TYPES
+        .iter()
+        .copied()
+        .filter(|(v, _)| {
+            platform != crate::platform::Platform::WebOS
+                || !matches!(*v, "xbox360" | "steamdeck" | "steamcontroller2")
+        })
+        .collect()
+}
 /// Shared `system_buttons` key. Auto sends to the host except in Gaming Mode,
 /// where Steam on this device would open a second overlay on the same press.
 const SYSTEM_BUTTONS: [(&str, &str); 3] = [
@@ -619,6 +695,16 @@ const SYSTEM_BUTTONS: [(&str, &str); 3] = [
     ("local", "This device"),
 ];
 const GUIDE_GESTURE: [(&str, &str); 3] = [("auto", "Automatic"), ("on", "On"), ("off", "Off")];
+
+/// What the open typed field sets. Y opens it on Bitrate, or on Resolution for a width and then
+/// a height.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Typing {
+    Bitrate,
+    Width,
+    /// The width typed a step earlier.
+    Height(u32),
+}
 
 pub(crate) struct SettingsScreen {
     pub(super) list: MenuList,
@@ -635,8 +721,8 @@ pub(crate) struct SettingsScreen {
     overrides: std::collections::HashMap<String, SettingsOverlay>,
     /// D-pad focus on the section strip. TV remotes have no shoulders and no Tab key.
     strip_focus: bool,
-    /// Typed Mbps while Y has the bitrate field open. Y, not A, so A still cycles.
-    custom_bitrate: Option<String>,
+    /// The typed field Y opened, and its digits. Y, not A, so A still cycles.
+    typing: Option<(Typing, String)>,
     /// Tray keyboard. Unused on Deck: Steam's keyboard types (same as add-host).
     keyboard: Keyboard,
     /// How far the keyboard tray is up, 0..1, as the last frame left it.
@@ -660,7 +746,7 @@ impl SettingsScreen {
             presets_at: 0.0,
             overrides: Default::default(),
             strip_focus: false,
-            custom_bitrate: None,
+            typing: None,
             keyboard: Keyboard::new(),
             seat: 0.0,
         }
@@ -668,64 +754,84 @@ impl SettingsScreen {
 
     /// True while the typed field is open; the run loop keeps SDL text input started.
     pub(crate) fn editing(&self) -> bool {
-        self.custom_bitrate.is_some()
+        self.typing.is_some()
     }
 
     pub(crate) fn edit_field(&self) -> Option<crate::screens::EditField> {
-        crate::screens::EditField::new("Bitrate in Mbps", self.custom_bitrate.as_deref()?, true)
+        let (typing, text) = self.typing.as_ref()?;
+        let label = match typing {
+            Typing::Bitrate => "Bitrate in Mbps",
+            Typing::Width => "Width in pixels",
+            Typing::Height(_) => "Height in pixels",
+        };
+        crate::screens::EditField::new(label, text, true)
     }
 
-    /// Digits only; four is 2000 Mbps, the ceiling.
+    /// Digits only; four is 2000 Mbps and 8192 px, the ceilings.
     fn admits(text: &str, ch: char) -> bool {
         permits(Charset::Digits, ch) && text.chars().count() < 4
     }
 
-    /// SDL text into the bitrate field.
+    /// SDL text into the open field.
     pub(crate) fn text_input(&mut self, typed: &str) {
-        if let Some(text) = self.custom_bitrate.as_mut() {
+        if let Some((_, text)) = self.typing.as_mut() {
             type_text(text, typed, Self::admits);
         }
     }
 
     /// Every way out of the field commits it: the typed number is the setting.
     pub(crate) fn edit_key(&mut self, key: crate::input::Key, ctx: &mut Ctx) -> bool {
-        let Some(text) = self.custom_bitrate.as_mut() else {
+        let Some((_, text)) = self.typing.as_mut() else {
             return false;
         };
         let Some(entry) = field_key(key, text) else {
             return false;
         };
         if entry != Entry::Stay {
-            self.commit_custom(ctx);
+            self.commit_field(ctx);
         }
         true
     }
 
-    /// Close the field. Empty or `0` is an abandoned edit, not Automatic (the first rung).
-    fn commit_custom(&mut self, ctx: &mut Ctx) {
-        let Some(text) = self.custom_bitrate.take() else {
+    /// Close the field, or move from the width to the height. Empty or `0` abandons the edit:
+    /// it is not Automatic or Native, the rows' first entries.
+    fn commit_field(&mut self, ctx: &mut Ctx) {
+        let Some((typing, text)) = self.typing.take() else {
             return;
         };
-        let Ok(mbps) = text.parse::<u32>() else {
+        let Some(n) = text.parse::<u32>().ok().filter(|n| *n > 0) else {
             return;
         };
-        if mbps == 0 {
-            return;
+        match typing {
+            Typing::Bitrate => {
+                ctx.write(|c| {
+                    let ceiling_mbps = bitrate_ceiling_kbps(c.device.platform) / 1_000;
+                    c.settings.bitrate_kbps = n.min(ceiling_mbps) * 1000;
+                    true
+                });
+            }
+            Typing::Width => self.typing = Some((Typing::Height(n), String::new())),
+            Typing::Height(w) => {
+                ctx.write(|c| {
+                    let s = &mut *c.settings;
+                    (s.width, s.height) = punktfunk_core::resolutions::custom(w, n, &s.codec);
+                    s.match_window = false;
+                    if c.device.platform == crate::platform::Platform::Android {
+                        set_extra_bool(s, device_keys::SAFE_AREA_MODE, false);
+                    }
+                    true
+                });
+            }
         }
-        ctx.write(|c| {
-            let ceiling_mbps = bitrate_ceiling_kbps(c.device.platform) / 1_000;
-            c.settings.bitrate_kbps = mbps.min(ceiling_mbps) * 1000;
-            true
-        });
     }
 
-    fn custom_menu(&mut self, ev: MenuEvent, ctx: &mut Ctx) -> Option<MenuPulse> {
-        let text = self.custom_bitrate.as_mut()?;
+    fn field_menu(&mut self, ev: MenuEvent, ctx: &mut Ctx) -> Option<MenuPulse> {
+        let (_, text) = self.typing.as_mut()?;
         let (entry, pulse) = self
             .keyboard
             .edit_menu(ev, ctx.device.deck, text, Self::admits);
         if entry != Entry::Stay {
-            self.commit_custom(ctx);
+            self.commit_field(ctx);
         }
         pulse
     }
@@ -744,17 +850,25 @@ impl SettingsScreen {
         }
     }
 
-    /// Filtered by [`row_on`] / [`row_applies`]. Presets comes from the catalog.
+    /// Filtered by [`row_on`] / [`row_applies`], and [`advanced`] rows by Show advanced: a tab
+    /// hiding changed ones ends on [`RowId::AdvancedChanged`]. Presets comes from the catalog.
     fn row_ids(&self, ctx: &Ctx) -> Vec<RowId> {
         if self.tab != PRESETS_TAB {
-            return TABS[self.tab]
+            let offered = TABS[self.tab]
                 .1
                 .iter()
                 .copied()
                 .filter(|id| row_on(*id, ctx.device.platform) && row_applies(*id, ctx))
                 // The Mac's picker stands in for the toggle, which presets keep.
-                .filter(|id| !(*id == RowId::Fullscreen && is_mac(ctx)))
-                .collect();
+                .filter(|id| !(*id == RowId::Fullscreen && is_mac(ctx)));
+            if ctx.settings.show_advanced {
+                return offered.collect();
+            }
+            let mut rows: Vec<RowId> = offered.filter(|id| !advanced(*id)).collect();
+            if !changed_advanced(self.tab, ctx).is_empty() {
+                rows.push(RowId::AdvancedChanged);
+            }
+            return rows;
         }
         if self.presets.is_empty() {
             vec![RowId::NewPreset]
@@ -764,6 +878,21 @@ impl SettingsScreen {
                 .chain([RowId::NewPreset])
                 .collect()
         }
+    }
+
+    /// [`row_spec`], with the facts a row cannot know alone: how many hidden rows changed, and
+    /// the Advanced heading over the first advanced row the tab shows.
+    fn spec(&self, id: RowId, ids: &[RowId], ctx: &Ctx) -> RowSpec {
+        let mut spec = row_spec(id, ctx, &self.presets, &self.overrides);
+        if id == RowId::AdvancedChanged {
+            spec.label = match changed_advanced(self.tab, ctx).len() {
+                1 => "1 advanced setting changed".into(),
+                n => format!("{n} advanced settings changed"),
+            };
+        } else if advanced(id) && ids.iter().find(|r| advanced(**r)) == Some(&id) {
+            spec.header = Some("Advanced");
+        }
+        spec
     }
 
     /// Pull the cursor back. The smoothness buffer (and other writers) can shrink the list
@@ -814,7 +943,7 @@ impl SettingsScreen {
     pub(crate) fn press(&mut self) {
         if self.strip_focus {
             self.strip.press();
-        } else if self.custom_bitrate.is_none() {
+        } else if self.typing.is_none() {
             self.list.dip();
         }
     }
@@ -851,12 +980,12 @@ impl SettingsScreen {
 
     /// Strip first: pills sit above the list, so a press there is never a row.
     pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
-        if let Some(text) = self.custom_bitrate.as_mut().filter(|_| !ctx.device.deck) {
+        if let Some((_, text)) = self.typing.as_mut().filter(|_| !ctx.device.deck) {
             let Some(entry) = self.keyboard.edit_pointer(p, text, Self::admits) else {
                 return false;
             };
             if entry != Entry::Stay {
-                self.commit_custom(ctx);
+                self.commit_field(ctx);
             }
             return true;
         }
@@ -886,8 +1015,8 @@ impl SettingsScreen {
         ctx: &mut Ctx,
         fx: &mut Outbox,
     ) -> Option<MenuPulse> {
-        if self.custom_bitrate.is_some() {
-            return self.custom_menu(ev, ctx);
+        if self.typing.is_some() {
+            return self.field_menu(ev, ctx);
         }
         if self.strip_focus {
             return self.sections_menu(ev, ctx, fx);
@@ -908,16 +1037,15 @@ impl SettingsScreen {
         }
         let ids = self.row_ids(ctx);
         self.clamp_cursor(ids.len());
-        // Y opens the typed bitrate. Skip under PyroWave: the row is inert (`row_spec`).
+        // Y opens the typed bitrate or size. Not the bitrate under PyroWave: the row is inert.
         if ev == MenuEvent::Secondary {
-            return if ids.get(self.list.cursor) == Some(&RowId::Bitrate)
-                && ctx.settings.codec != "pyrowave"
-            {
-                self.custom_bitrate = Some(String::new());
-                Some(MenuPulse::Confirm)
-            } else {
-                None
+            let typing = match ids.get(self.list.cursor) {
+                Some(RowId::Bitrate) if ctx.settings.codec != "pyrowave" => Typing::Bitrate,
+                Some(RowId::Resolution) => Typing::Width,
+                _ => return None,
             };
+            self.typing = Some((typing, String::new()));
+            return Some(MenuPulse::Confirm);
         }
         let (msg, pulse) = self.list.menu(ev, ids.len());
         self.apply_row(msg, pulse, &ids, ctx, fx)
@@ -1035,6 +1163,25 @@ impl SettingsScreen {
                     ListMsg::None => pulse,
                 };
             }
+            // Shows the advanced rows and lands on the first changed one.
+            RowId::AdvancedChanged => {
+                return match msg {
+                    ListMsg::Activate => {
+                        let first = changed_advanced(self.tab, ctx).first().copied();
+                        ctx.write(|c| {
+                            c.settings.show_advanced = true;
+                            true
+                        });
+                        let ids = self.row_ids(ctx);
+                        if let Some(i) = first.and_then(|id| ids.iter().position(|r| *r == id)) {
+                            self.list.jump_to(i);
+                        }
+                        pulse
+                    }
+                    ListMsg::Adjust(_) => Some(MenuPulse::Boundary),
+                    ListMsg::None => pulse,
+                };
+            }
             // The console draws the licences with the host's sections. webOS still opens
             // its own screen: that host sends no sections yet.
             RowId::Licenses => {
@@ -1081,12 +1228,8 @@ impl SettingsScreen {
         if self.strip_focus {
             return Some(format!("{} section", TABS[self.tab].0));
         }
-        let row = row_spec(
-            *self.row_ids(ctx).get(self.list.cursor)?,
-            ctx,
-            &self.presets,
-            &self.overrides,
-        );
+        let ids = self.row_ids(ctx);
+        let row = self.spec(*ids.get(self.list.cursor)?, &ids, ctx);
         Some(match row.value {
             Some(value) => format!("{}, {}", row.label, value),
             None => row.label,
@@ -1094,8 +1237,13 @@ impl SettingsScreen {
     }
 
     pub(crate) fn hints(&self, ctx: &Ctx) -> Vec<Hint> {
-        if self.custom_bitrate.is_some() {
-            return entry_hints(ctx.device.deck, "Done");
+        if let Some((typing, _)) = &self.typing {
+            let done = if *typing == Typing::Width {
+                "Next"
+            } else {
+                "Done"
+            };
+            return entry_hints(ctx.device.deck, done);
         }
         // Strip-focused: hints describe the D-pad, not the rows.
         if self.strip_focus {
@@ -1120,7 +1268,11 @@ impl SettingsScreen {
                 vec![Hint::new(HintKey::Back, "Done")]
             }
             Some(
-                RowId::Controllers | RowId::Licenses | RowId::LibrarySections | RowId::Palette,
+                RowId::Controllers
+                | RowId::Licenses
+                | RowId::LibrarySections
+                | RowId::Palette
+                | RowId::AdvancedChanged,
             ) => vec![
                 Hint::new(HintKey::Confirm, "Open"),
                 Hint::new(HintKey::Back, "Done"),
@@ -1132,6 +1284,11 @@ impl SettingsScreen {
             Some(RowId::Bitrate) => vec![
                 Hint::new(HintKey::Adjust, "Adjust"),
                 Hint::new(HintKey::Secondary, "Type a rate"),
+                Hint::new(HintKey::Back, "Done"),
+            ],
+            Some(RowId::Resolution) => vec![
+                Hint::new(HintKey::Adjust, "Adjust"),
+                Hint::new(HintKey::Secondary, "Type a size"),
                 Hint::new(HintKey::Back, "Done"),
             ],
             Some(_) => vec![
@@ -1154,27 +1311,29 @@ impl SettingsScreen {
     ) {
         self.seat = self
             .keyboard
-            .seat(self.custom_bitrate.is_some() && !ctx.device.deck, dt);
+            .seat(self.typing.is_some() && !ctx.device.deck, dt);
         self.sync_presets(ctx);
         let list_rect = self.list_rect(rect, k);
         let ids = self.row_ids(ctx);
         self.clamp_cursor(ids.len());
-        let mut rows: Vec<RowSpec> = ids
-            .iter()
-            .map(|id| row_spec(*id, ctx, &self.presets, &self.overrides))
-            .collect();
-        // Field-open: the Bitrate row shows the typed digits and the caret.
-        if let (Some(text), Some(i)) = (
-            self.custom_bitrate.as_ref(),
-            ids.iter().position(|id| *id == RowId::Bitrate),
-        ) {
-            rows[i].value = Some(if text.is_empty() {
-                "Mbps".into()
-            } else {
-                format!("{text} Mbps")
-            });
-            rows[i].value_dim = text.is_empty();
-            rows[i].caret = true;
+        let mut rows: Vec<RowSpec> = ids.iter().map(|id| self.spec(*id, &ids, ctx)).collect();
+        // Field-open: the row being typed shows the digits so far and the caret.
+        if let Some((typing, text)) = self.typing.as_ref() {
+            let (row, value) = match typing {
+                Typing::Bitrate if text.is_empty() => (RowId::Bitrate, "Mbps".into()),
+                Typing::Bitrate => (RowId::Bitrate, format!("{text} Mbps")),
+                Typing::Width if text.is_empty() => (RowId::Resolution, "Width".into()),
+                Typing::Width => (RowId::Resolution, format!("{text} × \u{2026}")),
+                Typing::Height(w) if text.is_empty() => {
+                    (RowId::Resolution, format!("{w} × height"))
+                }
+                Typing::Height(w) => (RowId::Resolution, format!("{w} × {text}")),
+            };
+            if let Some(i) = ids.iter().position(|id| *id == row) {
+                rows[i].value = Some(value);
+                rows[i].value_dim = text.is_empty();
+                rows[i].caret = true;
+            }
         }
         // Rows run on under the section strip and the explainer, on the shell's trays;
         // with the keyboard up they stay in their band, or a tray would slab the keys.
@@ -1187,7 +1346,7 @@ impl SettingsScreen {
             k,
             dt,
             // No row focus ring while the tray or the strip holds it.
-            self.custom_bitrate.is_none() && !self.strip_focus,
+            self.typing.is_none() && !self.strip_focus,
         );
         if self.seat > 0.0 {
             self.keyboard.render(
@@ -1274,8 +1433,23 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
         RowId::Controllers => &[Android, WebOS, Apple],
         // Apps a phone or TV can put in the background; `row_applies` drops the Mac.
         RowId::BackgroundKeepAlive | RowId::BackgroundTimeout => &[Android, Apple],
-        // Apple draws the statistics overlay itself, in a corner the player picks.
-        RowId::StatsPosition => &[Apple],
+        // The clients whose overlays place and size the statistics by these keys, and draw the
+        // exit hint.
+        RowId::StatsPosition | RowId::StatsSize | RowId::ExitHint => {
+            &[Desktop, Android, Apple, WebOS]
+        }
+        // The webOS session never reads these; its TV builds its own session from a few keys.
+        RowId::RenderScale
+        | RowId::AudioFormat
+        | RowId::KeepHostAudio
+        | RowId::Mic
+        | RowId::EchoCancel
+        | RowId::PadForward
+        | RowId::SystemButtons
+        | RowId::GuideGesture
+        | RowId::Touch => &[Desktop, Android, Apple, Platform::Web],
+        // DualSense voice coils and speaker: no Apple or browser client plays them.
+        RowId::PadHaptics | RowId::PadSpeaker => &[Desktop, Android, WebOS],
         // Every client ships third-party code. The browser build has no bundle to list.
         RowId::Licenses => &[Desktop, Android, WebOS, Apple],
         // DualSense capture — the pad reaches webOS over Bluetooth HID, not hidraw, so the
@@ -1316,7 +1490,16 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
 /// latency the quantity does not exist, so the row is dropped. It sits directly
 /// below the intent row so the cursor is never on a row that vanishes.
 pub fn row_applies(id: RowId, ctx: &Ctx) -> bool {
+    let apple = ctx.device.platform == crate::platform::Platform::Apple;
     match id {
+        // The Apple app reads these on the Mac alone, as its own settings offer them.
+        RowId::Vsync | RowId::Shortcuts | RowId::Mouse if apple => is_mac(ctx),
+        // An Apple TV has no touchscreen, microphone, scroll wheel or variable refresh.
+        RowId::Touch | RowId::Mic | RowId::EchoCancel | RowId::InvertScroll | RowId::AllowVrr
+            if apple =>
+        {
+            !ctx.device.tv
+        }
         RowId::SmoothBuffer => ctx.settings.present_priority == "smooth",
         // Needs `fallback_ui`; otherwise off strands the user with no UI.
         RowId::GamepadUi => ctx.device.fallback_ui,
@@ -1347,6 +1530,55 @@ pub fn row_applies(id: RowId, ctx: &Ctx) -> bool {
         RowId::Palette => !(ctx.settings.follow_os_theme && crate::os_theme::available()),
         _ => true,
     }
+}
+
+/// The settings a fresh install starts with on this platform: the shared defaults, and the
+/// few this platform's own app starts elsewhere.
+fn fresh_settings(device: &crate::screens::Device) -> pf_client_core::trust::Settings {
+    use crate::platform::Platform;
+    let mut s = pf_client_core::trust::Settings::default();
+    match device.platform {
+        Platform::Android => {
+            s.pad_speaker = "off".into();
+            s.mouse_mode = "desktop".into();
+        }
+        Platform::Apple => {
+            s.vsync = false;
+            set_extra_bool(&mut s, device_keys::SC2, false);
+        }
+        Platform::Desktop | Platform::WebOS | Platform::Web => {}
+    }
+    s
+}
+
+/// The rows of `ids` that show something other than a fresh install would: what
+/// [`RowId::AdvancedChanged`] counts. Compared by the value drawn, so every row kind works alike.
+pub fn changed(ids: &[RowId], ctx: &Ctx) -> Vec<RowId> {
+    let mut fresh = fresh_settings(ctx.device);
+    let under = Ctx {
+        hosts: ctx.hosts,
+        library: ctx.library,
+        settings: &mut fresh,
+        store: ctx.store,
+        pads: ctx.pads,
+        device: ctx.device,
+        t: ctx.t,
+    };
+    ids.iter()
+        .copied()
+        .filter(|id| row_spec_base(*id, &under, &[]).value != row_spec_base(*id, ctx, &[]).value)
+        .collect()
+}
+
+/// This tab's advanced rows, offered here and now, that hold a changed value.
+fn changed_advanced(tab: usize, ctx: &Ctx) -> Vec<RowId> {
+    let offered: Vec<RowId> = TABS[tab]
+        .1
+        .iter()
+        .copied()
+        .filter(|id| advanced(*id) && row_on(*id, ctx.device.platform) && row_applies(*id, ctx))
+        .collect();
+    changed(&offered, ctx)
 }
 
 /// Apple with no handheld screen and no TV.
@@ -1446,6 +1678,9 @@ fn row_icon(id: RowId) -> &'static str {
         RowId::ReduceMotion => "eye",
         RowId::AutoWake => "power",
         RowId::Version | RowId::Licenses => "info",
+        RowId::ShowAdvanced | RowId::AdvancedChanged => "wrench",
+        RowId::StatsSize => "chart-column",
+        RowId::ExitHint => "log-out",
         RowId::Preset(_) | RowId::NewPreset => "settings",
     }
 }
@@ -1585,6 +1820,8 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
             return RowSpec::action("New preset\u{2026}", true);
         }
         RowId::Controllers => return RowSpec::action("Controllers", true),
+        // The count is the tab's; `SettingsScreen::spec` writes it in.
+        RowId::AdvancedChanged => return RowSpec::action("Advanced settings changed", true),
         RowId::Licenses => return RowSpec::action("Open-source licences", true),
         RowId::QuickActions => return RowSpec::action("Quick actions", true),
         // Opens the cards: the value names the pick, no ‹ › to step it.
@@ -1630,12 +1867,14 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         RowId::Resolution => (
             None,
             "Resolution",
-            if s.match_window {
+            if s.match_window && has_window(ctx.device) {
                 "Match window".into()
             } else if safe_area(s, ctx.device.platform) {
                 "Native (safe area)".into()
             } else if s.width == 0 {
                 "Native".into()
+            } else if custom_size(s, &families(ctx.device.screen), ctx.device.platform) {
+                format!("Custom ({} × {})", s.width, s.height)
             } else {
                 format!("{} × {}", s.width, s.height)
             },
@@ -1684,7 +1923,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         ),
         RowId::Compositor => (
             None,
-            "Compositor",
+            "Host compositor",
             label_for(&COMPOSITORS, &s.compositor).into(),
         ),
         RowId::Codec => (
@@ -1701,7 +1940,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         // Migrate before lookup or a legacy store (`vulkan`/`vaapi`) shows "—".
         RowId::Decoder => (
             None,
-            "Decoder",
+            "Video decoder",
             label_for(
                 &DECODERS,
                 &pf_client_core::decoder_pref::migrate_decoder_pref(&s.decoder),
@@ -1712,7 +1951,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         RowId::Chroma444 => (None, "Full chroma (4:4:4)", on_off(s.enable_444).into()),
         RowId::TenBitSdr => (None, "10-bit SDR", on_off(s.ten_bit_sdr).into()),
         RowId::PresentPriority => (
-            Some("Presentation"),
+            None,
             "Prioritize",
             label_for(&PRESENT_PRIORITIES, &s.present_priority).into(),
         ),
@@ -1746,7 +1985,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
             "Keep host audio playing",
             on_off(s.keep_host_audio).into(),
         ),
-        RowId::Mic => (None, "Microphone", on_off(s.mic_enabled).into()),
+        RowId::Mic => (None, "Stream microphone", on_off(s.mic_enabled).into()),
         RowId::EchoCancel => (None, "Echo cancellation", on_off(s.echo_cancel).into()),
         RowId::PadForward => (
             None,
@@ -1772,7 +2011,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         ),
         RowId::SystemButtons => (
             None,
-            "Steam / guide button",
+            "Guide button",
             label_for(&SYSTEM_BUTTONS, &s.system_buttons).into(),
         ),
         RowId::GuideGesture => (
@@ -1786,9 +2025,13 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
             "Controller speaker",
             on_off(pad_speaker_on(&s.pad_speaker)).into(),
         ),
-        RowId::Touch => (None, "Touch mode", s.touch_mode().label().into()),
-        RowId::Mouse => (None, "Mouse mode", s.mouse_mode().label().into()),
-        RowId::InvertScroll => (None, "Invert scroll", on_off(s.invert_scroll).into()),
+        RowId::Touch => (None, "Touch input", s.touch_mode().label().into()),
+        RowId::Mouse => (None, "Mouse input", s.mouse_mode().label().into()),
+        RowId::InvertScroll => (
+            None,
+            "Invert scroll direction",
+            on_off(s.invert_scroll).into(),
+        ),
         RowId::Shortcuts => (
             None,
             "Capture system shortcuts",
@@ -1825,13 +2068,29 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
             s.stats_verbosity().label().into(),
         ),
         RowId::AdvancedStats => (None, "Advanced statistics", on_off(s.advanced_stats).into()),
+        RowId::ShowAdvanced => (None, "Show advanced", on_off(s.show_advanced).into()),
+        RowId::StatsSize => (
+            None,
+            "Statistics size",
+            format!(
+                "{} %",
+                (punktfunk_core::hud::stats_scale(s.stats_scale_pct) * 100.0).round()
+            ),
+        ),
+        RowId::ExitHint => (None, "Exit hint", on_off(s.exit_hint).into()),
         RowId::HostSort => (None, "Host order", extra()),
         RowId::HostGrouping => (
             None,
             "Group hosts by",
             label_for(&home::HOST_GROUPINGS, host_grouping(s)).into(),
         ),
-        RowId::StatsPosition => (None, "Stats position", extra()),
+        RowId::StatsPosition => (
+            None,
+            "Statistics position",
+            s.hud_corner(own_stats_corner(ctx.device.platform))
+                .label()
+                .into(),
+        ),
         RowId::BackgroundKeepAlive => (None, "Keep streaming in background", extra()),
         RowId::BackgroundTimeout => (
             None,
@@ -1848,11 +2107,11 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
             "Fullscreen",
             FULLSCREEN_MODES[fullscreen_mode(s)].into(),
         ),
-        RowId::AutoWake => (None, "Wake hosts automatically", on_off(s.auto_wake).into()),
-        RowId::LowLatency => (Some("Decoding"), "Low-latency mode", extra()),
+        RowId::AutoWake => (None, "Auto-wake on connect", on_off(s.auto_wake).into()),
+        RowId::LowLatency => (None, "Low-latency mode", extra()),
         RowId::PhoneRumble => (Some("This device"), "Rumble on this phone", extra()),
         RowId::PhoneGyro => (None, "Gyro from this phone", extra()),
-        RowId::Sc2Passthrough => (Some("Passthrough"), "Steam Controller 2", extra()),
+        RowId::Sc2Passthrough => (None, "Steam Controller 2 passthrough", extra()),
         RowId::DsCapture => (None, "DualSense over USB", extra()),
         RowId::AudioRoute => (None, "Audio processing", extra()),
         RowId::CursorGestures => (None, "Long press to right-click", extra()),
@@ -1866,6 +2125,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         RowId::Preset(_)
         | RowId::NewPreset
         | RowId::Controllers
+        | RowId::AdvancedChanged
         | RowId::Licenses
         | RowId::QuickActions
         | RowId::LibrarySections
@@ -1914,7 +2174,7 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
     match id {
         RowId::Resolution => {
             "The host creates a virtual display at exactly this size — no scaling. \
-             Match window follows this window, including mid-stream resizes."
+             Y types any size."
         }
         RowId::Aspect => {
             "Which shapes the Resolution row offers. Picking one moves to its size \
@@ -2109,6 +2369,10 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
             _ => "Punktfunk opens fullscreen and stays fullscreen between streams.",
         },
         RowId::StatsPosition => "Which corner the statistics overlay sits in.",
+        RowId::StatsSize => "The size of the statistics overlay, on top of your display's scaling.",
+        RowId::ExitHint => "Shows how to leave for a few seconds when a stream starts.",
+        RowId::ShowAdvanced => "Adds the settings most players never need to change.",
+        RowId::AdvancedChanged => "Some hidden settings differ from a fresh install. A shows them.",
         RowId::HostSort => {
             "The order of the host row: as you added them, by name, or most \
              recently connected first."
@@ -2248,36 +2512,40 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
     }
     let platform = ctx.device.platform;
     let fams = families(ctx.device.screen);
+    let window = has_window(ctx.device);
     let s = &mut *ctx.settings;
     match id {
         RowId::Resolution => {
-            // Native, Native (safe area) on Android, Match window, then the current
-            // family's sizes. The policies before the sizes all clear w/h.
+            // Native, Native (safe area) on Android, Match window where there is a window, the
+            // current family's sizes, then a typed size while one is stored. The policies before
+            // the sizes all clear w/h; stepping onto the typed size is a no-op, so it only reads.
             let sizes = &fams[family(s, &fams, platform)].sizes;
             let android = platform == crate::platform::Platform::Android;
-            let matching = if android { 2 } else { 1 };
-            let cur = if s.match_window {
-                Some(matching)
+            let match_i = 1 + usize::from(android);
+            let first = match_i + usize::from(window);
+            let custom = custom_size(s, &fams, platform);
+            let len = sizes.len() + first + usize::from(custom);
+            let cur = if s.match_window && window {
+                Some(match_i)
             } else if safe_area(s, platform) {
                 Some(1)
             } else if s.width == 0 {
                 Some(0)
+            } else if custom {
+                Some(len - 1)
             } else {
                 sizes
                     .iter()
                     .position(|&wh| wh == (s.width, s.height))
-                    .map(|i| i + matching + 1)
+                    .map(|i| i + first)
             };
-            step_option(cur, sizes.len() + matching + 1, delta, wrap).map(|i| {
-                s.match_window = i == matching;
+            let stepped = step_option(cur, len, delta, wrap).filter(|i| !(custom && *i == len - 1));
+            stepped.map(|i| {
+                s.match_window = window && i == match_i;
                 if android {
                     set_extra_bool(s, device_keys::SAFE_AREA_MODE, i == 1);
                 }
-                (s.width, s.height) = if i <= matching {
-                    (0, 0)
-                } else {
-                    sizes[i - matching - 1]
-                };
+                (s.width, s.height) = if i < first { (0, 0) } else { sizes[i - first] };
             })
         }
         RowId::Aspect => {
@@ -2373,7 +2641,7 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             let cur = keys.iter().position(|c| *c == s.forward_pad);
             step_option(cur, keys.len(), delta, wrap).map(|i| s.forward_pad = keys[i].clone())
         }
-        RowId::PadType => step_str(&PAD_TYPES, &mut s.gamepad, delta, wrap),
+        RowId::PadType => step_str(&pad_types(platform), &mut s.gamepad, delta, wrap),
         RowId::SystemButtons => step_str(&SYSTEM_BUTTONS, &mut s.system_buttons, delta, wrap),
         RowId::GuideGesture => step_str(&GUIDE_GESTURE, &mut s.guide_gesture, delta, wrap),
         RowId::PadHaptics => toggle(&mut s.pad_haptics, delta, wrap),
@@ -2443,8 +2711,24 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         | RowId::GamepadUi
         | RowId::BackgroundKeepAlive
         | RowId::HostSort
-        | RowId::StatsPosition
         | RowId::GamepadUiMode => id.extra().and_then(|e| e.step(s, delta, wrap)),
+        RowId::StatsPosition => {
+            let at = HudCorner::ALL
+                .iter()
+                .position(|c| *c == s.hud_corner(own_stats_corner(platform)));
+            step_option(at, HudCorner::ALL.len(), delta, wrap)
+                .map(|i| s.hud_placement = HudCorner::ALL[i].as_name().into())
+        }
+        RowId::StatsSize => {
+            use punktfunk_core::hud::{stats_scale, STATS_SCALE_PCTS};
+            // Stepped from the size in effect, so an off-list stored value moves to its neighbour.
+            let pct = (stats_scale(s.stats_scale_pct) * 100.0).round() as u16;
+            let at = STATS_SCALE_PCTS.iter().position(|p| *p == pct);
+            step_option(at, STATS_SCALE_PCTS.len(), delta, wrap)
+                .map(|i| s.stats_scale_pct = STATS_SCALE_PCTS[i])
+        }
+        RowId::ExitHint => toggle(&mut s.exit_hint, delta, wrap),
+        RowId::ShowAdvanced => toggle(&mut s.show_advanced, delta, wrap),
         RowId::BackgroundTimeout => {
             let mut v = background_timeout(s).to_string();
             step_str(&BACKGROUND_TIMEOUTS, &mut v, delta, wrap).map(|()| {
@@ -2466,6 +2750,7 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         RowId::Preset(_)
         | RowId::NewPreset
         | RowId::Controllers
+        | RowId::AdvancedChanged
         | RowId::Licenses
         | RowId::QuickActions
         | RowId::LibrarySections
