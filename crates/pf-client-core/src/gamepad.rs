@@ -1119,6 +1119,10 @@ impl Worker {
                     Self::set_slot_sensors(&mut slot, true);
                 }
                 slot.audio_caps = self.pad_audio_caps_for(id, &slot.pad);
+                if let Some(path) = slot.pad.path() {
+                    let (vid, pid) = (slot.pad.vendor_id(), slot.pad.product_id());
+                    crate::sc2_capture::log_descriptor(&path, vid.unwrap_or(0), pid.unwrap_or(0));
+                }
                 // Kind before any input so the host builds a matching virtual device. Core
                 // re-sends against datagram loss; an older host ignores it.
                 if let Some(c) = &self.attached {
