@@ -68,14 +68,11 @@ pub struct Screen {
 
 impl Screen {
     pub fn new(facts: Facts, choices: Choices) -> Screen {
-        // SteamOS builds `main` on the device and its script owns the groups, linger and the
-        // unit start. Those rows would be toggles nothing reads, so they are not offered.
+        // SteamOS's build script owns the groups, linger and the unit start. Those rows would be
+        // toggles nothing reads, so they are not offered. Its channel is the checkout's branch.
         let steamos = facts.family == Family::Steamos;
         let mut items = vec![Item::Go];
-        items.push(Item::Row(Field::Components));
-        if !steamos {
-            items.push(Item::Row(Field::Channel));
-        }
+        items.extend([Item::Row(Field::Components), Item::Row(Field::Channel)]);
         // A client listens on nothing fixed, so none of the host wiring rows apply to it.
         if choices.components.host {
             if !steamos {

@@ -201,6 +201,23 @@ pub(crate) fn source_newer(behind: Option<u64>) -> bool {
     behind.is_some_and(|n| n > 0)
 }
 
+/// Does `manifest` offer an update to an install of `kind` running `current`? Status, the
+/// `update.available` event and apply all ask this, so apply never refuses an offer.
+/// A source build answers from its checkout: its version names a commit, not a published build.
+pub(crate) fn offers_update(
+    kind: detect::InstallKind,
+    channel: detect::Channel,
+    current: &str,
+    manifest: &Manifest,
+    source_behind: Option<u64>,
+) -> bool {
+    if kind == detect::InstallKind::SteamosSource {
+        source_newer(source_behind)
+    } else {
+        detect::is_newer(&manifest.version, manifest.ci_run, current, channel)
+    }
+}
+
 /// Blocking feed fetch; call from a blocking thread.
 fn fetch_manifest_blocking(channel: &str) -> Result<Manifest, FeedError> {
     pf_update_check::feed::fetch_manifest_blocking(
@@ -215,9 +232,10 @@ pub(crate) fn refresh_blocking() -> Result<Checked, FeedError> {
     let (kind, channel) = detect::detect();
     // Before the lock: this talks to the network. The manifest still fetches for the
     // "latest published" row, but it cannot decide a source build's answer.
-    let source_build = kind == detect::InstallKind::SteamosSource;
     #[cfg(target_os = "linux")]
-    let behind = source_build.then(linux::source_behind).flatten();
+    let behind = (kind == detect::InstallKind::SteamosSource)
+        .then(linux::source_behind)
+        .flatten();
     #[cfg(not(target_os = "linux"))]
     let behind: Option<u64> = None;
     let result = fetch_manifest_blocking(channel.as_str()).and_then(|m| {
@@ -241,16 +259,13 @@ pub(crate) fn refresh_blocking() -> Result<Checked, FeedError> {
                 manifest: m,
                 fetched_unix: crate::clock::unix_secs_u64(),
             };
-            let newer = if source_build {
-                source_newer(rt.source_behind)
-            } else {
-                detect::is_newer(
-                    &checked.manifest.version,
-                    checked.manifest.ci_run,
-                    crate::version::get(),
-                    channel,
-                )
-            };
+            let newer = offers_update(
+                kind,
+                channel,
+                crate::version::get(),
+                &checked.manifest,
+                rt.source_behind,
+            );
             if newer && rt.announced.as_deref() != Some(checked.manifest.version.as_str()) {
                 rt.announced = Some(checked.manifest.version.clone());
                 crate::events::emit(crate::events::EventKind::UpdateAvailable {
@@ -395,11 +410,12 @@ pub(crate) fn start_apply(force: bool, session_active: bool) -> Result<(), Apply
         let Some(checked) = rt.checked.as_ref() else {
             return Err(ApplyError::NothingToApply);
         };
-        let newer = detect::is_newer(
-            &checked.manifest.version,
-            checked.manifest.ci_run,
-            crate::version::get(),
+        let newer = offers_update(
+            kind,
             channel,
+            crate::version::get(),
+            &checked.manifest,
+            rt.source_behind,
         );
         if !newer {
             return Err(ApplyError::NothingToApply);
@@ -799,5 +815,22 @@ mod tests {
         assert!(source_newer(Some(3)));
         assert!(!source_newer(Some(0)));
         assert!(!source_newer(None));
+    }
+
+    /// A canary Deck stamps the canary base, so the feed's run-number compare cannot answer
+    /// for it. Apply must still accept what status offered.
+    #[test]
+    fn a_deck_build_is_offered_what_its_checkout_is_behind() {
+        use detect::{Channel, InstallKind};
+        let m: Manifest = serde_json::from_value(serde_json::json!({
+            "schema": 1, "channel": "canary", "serial": 1,
+            "version": "0.41.0~ci32773.gdeadbeef", "ci_run": 32773,
+        }))
+        .unwrap();
+        let deck = "0.41.0+g17d166764";
+        let offer = |kind, behind| offers_update(kind, Channel::Canary, deck, &m, behind);
+        assert!(offer(InstallKind::SteamosSource, Some(2)));
+        assert!(!offer(InstallKind::SteamosSource, Some(0)));
+        assert!(!offer(InstallKind::Pacman, Some(2)));
     }
 }

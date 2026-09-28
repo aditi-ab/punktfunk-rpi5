@@ -42,17 +42,18 @@ serving HTTPS (HTTP/1.1 over TLS) with the host's identity cert), so its service
 | Script | What it does |
 |--------|--------------|
 | `install.sh` | Idempotent installer: ensure the `pf2` distrobox + toolchain → build host + web + **plugin runner** → write config → build the **HDR gamescope** below → tune sysctl + udev + `vhci-hcd` + `input` group and **register it on SteamOS's atomic-update keep list** (sudo) → install + start `punktfunk-host` / `punktfunk-web` systemd **user** services with linger, plus the **rebuild check** below. |
-| `update.sh` | Rebuild everything from the current source and restart the services (config + pairings persist). `--pull` does `git pull` first. Also retrofits anything a newer install.sh writes (runner, HDR gamescope, keep-list registration, rebuild check) onto older installs. |
+| `update.sh` | Rebuild everything from the current source and restart the services (config + pairings persist). `--pull` does `git pull` first, on the branch the checkout follows: `stable` (releases, the default) or `main` (canary). Also retrofits anything a newer install.sh writes (runner, HDR gamescope, keep-list registration, rebuild check) onto older installs. |
+| `build-version.sh` | The version a build reports: a release tag's `X.Y.Z`, else the canary base (`scripts/ci/pf-version.sh`) plus the commit, so the console and the channel's feed agree. |
 | `build-gamescope.sh` | Build gamescope + the `pipewire-hdr` patches (`packaging/gamescope`) in the same distrobox and install it as `~/.local/bin/punktfunk-gamescope`, wiring `PUNKTFUNK_GAMESCOPE_BIN` into `host.env` — what lets Game Mode stream **10-bit BT.2020 PQ (HDR)** instead of 8-bit SDR. Best-effort: a failure warns and the host streams SDR. Content-stamped — a no-op unless `packaging/gamescope/` changed or the binary broke. |
 | `rebuild-check.sh` | The post-OS-update self-heal (run by `punktfunk-rebuild-check.service` before the host at session start): `ldd`-probes the host binary **and the HDR gamescope** — milliseconds when healthy, a full `update.sh` rebuild only when a SteamOS update actually broke library links. |
 
 ```sh
-git clone https://git.unom.io/unom/punktfunk ~/punktfunk
+git clone --branch stable https://git.unom.io/unom/punktfunk ~/punktfunk   # --branch main: canary
 bash ~/punktfunk/scripts/steamdeck/install.sh            # PIN pairing required (secure default)
 bash ~/punktfunk/scripts/steamdeck/install.sh --open     # trusted LAN: accept unpaired clients
 bash ~/punktfunk/scripts/steamdeck/install.sh --no-web   # host only, no web console
 bash ~/punktfunk/scripts/steamdeck/install.sh --gamestream     # also serve stock Moonlight (trusted LAN)
-bash ~/punktfunk/scripts/steamdeck/update.sh             # after pulling new source
+bash ~/punktfunk/scripts/steamdeck/update.sh --pull      # pull the followed branch, rebuild
 ```
 
 Note: the Deck install matches a bare `serve` — native-only, PIN pairing required. `--gamestream` and

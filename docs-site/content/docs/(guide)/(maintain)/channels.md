@@ -27,6 +27,7 @@ always one minor version ahead of stable, so going back to stable is a downgrade
 | **Flatpak client** | `https://flatpak.unom.io/io.unom.Punktfunk.Canary.flatpakref` | `…/io.unom.Punktfunk.flatpakref` |
 | **NixOS** | flake input `git+https://git.unom.io/unom/punktfunk?ref=nix-canary`, built nightly | `?ref=nix-stable` |
 | **Decky plugin** | `…/generic/punktfunk-decky/canary/punktfunk.zip` | `…/generic/punktfunk-decky/latest/punktfunk.zip` |
+| **SteamOS on-device build** | `~/punktfunk` on the `main` branch | `~/punktfunk` on the `stable` branch |
 | **Windows host and client** | `canary/` in the download URL, e.g. `…/generic/punktfunk-host-windows/canary/punktfunk-host-setup.exe` | `latest/` in the URL, the releases page, or winget |
 | **Android** | Google Play open testing, or `…/generic/punktfunk-android/canary/punktfunk-android.apk` | [Google Play](https://play.google.com/store/apps/details?id=io.unom.punktfunk), or `latest/` |
 | **Apple** | TestFlight | [App Store](https://apps.apple.com/app/id6779991756) for iPhone, iPad and Apple TV; the `.dmg` on the releases page for the Mac |
@@ -44,7 +45,7 @@ The [releases page](https://git.unom.io/unom/punktfunk/releases) and winget carr
 | **Windows installer** | Run the older `punktfunk-host-setup-<version>.exe` over the current install. |
 | **winget** | `winget install unom.PunktfunkHost --version <x.y.z>` |
 | **Decky plugin** | Install from URL: `…/generic/punktfunk-decky/<version>/punktfunk.zip`. |
-| **SteamOS on-device build** | `git -C ~/punktfunk checkout v<x.y.z>`, then `bash ~/punktfunk/scripts/steamdeck/update.sh` (without `--pull`, which fetches `main` again). |
+| **SteamOS on-device build** | `git -C ~/punktfunk checkout v<x.y.z>`, then `bash ~/punktfunk/scripts/steamdeck/update.sh`. Updates stop until you switch back to a branch. |
 | **NixOS** | `sudo nixos-rebuild switch --rollback`, or pin the flake input to a `v<x.y.z>` tag and rebuild. |
 
 Your config, console password and paired devices carry across in both directions.
@@ -80,6 +81,10 @@ sudo pacman -Sy && sudo pacman -S punktfunk-host punktfunk-web punktfunk-scripti
 # Bazzite sysext
 sudo punktfunk-sysext install --channel canary
 
+# SteamOS on-device build: follow main, then rebuild
+git -C ~/punktfunk fetch && git -C ~/punktfunk switch main
+bash ~/punktfunk/scripts/steamdeck/update.sh --pull
+
 # Flatpak client
 flatpak install --user https://flatpak.unom.io/io.unom.Punktfunk.Canary.flatpakref
 
@@ -89,7 +94,7 @@ nix flake update punktfunk && sudo nixos-rebuild switch
 
 Back to stable is the same edit reversed, plus a step down the package manager allows:
 `sudo apt install --allow-downgrades punktfunk-host=<version>` (versions from `apt-cache madison`),
-`sudo dnf distro-sync punktfunk punktfunk-web punktfunk-scripting`, the same `pacman -S`, or
-`sudo punktfunk-sysext install --channel stable`.
+`sudo dnf distro-sync punktfunk punktfunk-web punktfunk-scripting`, the same `pacman -S`,
+`sudo punktfunk-sysext install --channel stable`, or `switch stable` on a Steam Deck.
 
 Cutting a release is on [Releasing](/docs/developers/releasing).

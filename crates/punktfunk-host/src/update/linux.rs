@@ -89,7 +89,7 @@ fn capture(cmd: &mut Command) -> Option<String> {
 /// The Deck's build tree, or `None` where there is no on-device source build.
 fn source_tree() -> Option<std::path::PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    let dir = Path::new(&home).join("punktfunk");
+    let dir = Path::new(&home).join(pf_update_check::detect::SOURCE_CHECKOUT);
     dir.join(".git").is_dir().then_some(dir)
 }
 

@@ -13,8 +13,8 @@ button or the command that updates this install. The host checks a signed feed o
 while the console is open; **Check now** checks right away. The host also fires `update.available`
 and `update.applied` on the [event stream](/docs/automation).
 
-The channel comes from the repository you installed from, and the card never switches it — see
-[Release Channels](/docs/channels).
+The channel comes from the repository you installed from (on a Steam Deck, the branch
+`~/punktfunk` follows), and the card never switches it — see [Release Channels](/docs/channels).
 
 ## Update now
 

@@ -95,10 +95,10 @@ Press **Update now** on the console's **Updates** card, or run:
 bash ~/punktfunk/scripts/steamdeck/update.sh --pull
 ```
 
-Both rebuild on the device and keep your config and pairings. The build tracks `main`, the
-[canary channel](/docs/channels). After [going back to a release](/docs/channels), run
-`git -C ~/punktfunk checkout main` before the next update, which otherwise stops with *"You are not
-currently on a branch."* More in [Updating](/docs/updating).
+Both rebuild on the device and keep your config and pairings. The checkout follows the `stable`
+branch, which moves to each release when it is announced. To follow `main`, the
+[canary channel](/docs/channels), install or re-run with `--channel canary`. More in
+[Updating](/docs/updating).
 
 ## Good to know
 
