@@ -1,10 +1,7 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "@unom/ui/toast";
 import { type FC, type FormEvent, useState } from "react";
-import {
-	getGetLibraryQueryKey,
-	useListLibraryMetadata,
-} from "@/api/gen/library/library";
+import { useListLibraryMetadata } from "@/api/gen/library/library";
 import {
 	isHttpUrl,
 	type SourceCandidate,
@@ -26,6 +23,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { m } from "@/paraglide/messages";
+import { refreshLibrary } from "../helpers";
 import { useSourceNames } from "../Sources";
 
 export type ArtKind = "portrait" | "hero" | "header" | "logo";
@@ -137,7 +135,7 @@ const SourcePanel: FC<{
 			setSearching(false);
 			setResults(null);
 			await qc.invalidateQueries({ queryKey: sourceKey(id) });
-			await qc.invalidateQueries({ queryKey: getGetLibraryQueryKey() });
+			await refreshLibrary(qc);
 		} catch (e) {
 			failed(e);
 		} finally {

@@ -11,7 +11,6 @@ import {
 import { motion } from "motion/react";
 import { type FC, useState } from "react";
 import {
-	getGetLibraryQueryKey,
 	getListLibraryMetadataQueryKey,
 	useListLibraryMetadata,
 	useSetLibraryMetadata,
@@ -29,6 +28,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { apiErrorMessage } from "@/lib/errors";
 import { m } from "@/paraglide/messages";
+import { refreshLibrary } from "./helpers";
 import { SourceSettingsDialog } from "./SourceSettings";
 import { useSourceNames } from "./Sources";
 
@@ -73,7 +73,7 @@ export const MetadataSourcesSection: FC = () => {
 				})),
 			});
 			qc.setQueryData(getListLibraryMetadataQueryKey(), out);
-			await qc.invalidateQueries({ queryKey: getGetLibraryQueryKey() });
+			await refreshLibrary(qc);
 		} catch (e) {
 			toast.error(apiErrorMessage(e) ?? m.library_metadata_failed());
 		}

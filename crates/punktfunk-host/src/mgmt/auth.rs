@@ -374,6 +374,7 @@ pub(crate) fn plugin_may_access(method: &Method, path: &str) -> bool {
         (&Method::POST, "/api/v1/game/end"),
         // Library reads + provider reconcile. Privileged fields refused via `AuthLane`.
         (&Method::GET, "/api/v1/library"),
+        (&Method::GET, "/api/v1/library/page"),
         (&Method::GET, "/api/v1/library/art/{}/{}"),
         (&Method::GET, "/api/v1/library/scanners"),
         (&Method::PUT, "/api/v1/library/scanners/{}"),
@@ -452,6 +453,7 @@ pub(crate) fn cert_may_access(method: &Method, path: &str) -> bool {
                 // Rosters are not on this lane: they name every other paired device. Library
                 // GET is; POST/PUT/DELETE stay token-only via this exact-path match.
                 | "/api/v1/library"
+                | "/api/v1/library/page"
         ) || path.starts_with("/api/v1/library/art/"))
 }
 

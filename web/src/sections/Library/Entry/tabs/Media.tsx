@@ -2,10 +2,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "@unom/ui/toast";
 import { ImageOff } from "lucide-react";
 import { type FC, useState } from "react";
-import {
-	getGetLibraryQueryKey,
-	useSetLibraryArtPick,
-} from "@/api/gen/library/library";
+import { useSetLibraryArtPick } from "@/api/gen/library/library";
 import { LAUNCHER_ICONS, LauncherIcon } from "@/components/launcher-icon";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
@@ -18,6 +15,7 @@ import {
 } from "@/components/ui/select";
 import { apiErrorMessage } from "@/lib/errors";
 import { m } from "@/paraglide/messages";
+import { refreshLibrary } from "../../helpers";
 import { useSourceNames } from "../../Sources";
 import { type ArtKind, ChooseArtDialog } from "../ChooseArt";
 import { Group, ReadRow, TextField } from "../fields";
@@ -135,7 +133,7 @@ export const MediaTab: FC<TabProps> = ({
 		}
 		try {
 			await pick.mutateAsync({ id: entry.id, data: { kind, url } });
-			await qc.invalidateQueries({ queryKey: getGetLibraryQueryKey() });
+			await refreshLibrary(qc);
 		} catch (e) {
 			toast.error(apiErrorMessage(e) ?? m.library_media_pick_failed());
 		}

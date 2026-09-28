@@ -1,8 +1,11 @@
-import { useQueryClient } from "@tanstack/react-query";
+import { useQueries, useQueryClient } from "@tanstack/react-query";
 import { toast } from "@unom/ui/toast";
 import type { FC } from "react";
 import { getGetStatusQueryKey, useGetStatus } from "@/api/gen/host/host";
-import { useGetLibrary } from "@/api/gen/library/library";
+import {
+	getGetLibraryPageQueryKey,
+	getLibraryPage,
+} from "@/api/gen/library/library";
 import type { ActiveGame } from "@/api/gen/model/activeGame";
 import {
 	useEndGame,
@@ -37,11 +40,22 @@ export const SectionDashboard: FC = () => {
 					: 15_000,
 		},
 	});
-	// The catalog, for the running-game card's box art. Fetched once and held: a library scan touches
-	// every installed store's on-disk metadata, so it must not ride the 2 s status poll.
-	const library = useGetLibrary(undefined, {
-		query: { staleTime: 5 * 60_000 },
+	// The running games' own entries, for their box art. One title each and held: a library can
+	// run to thousands, and nothing here needs the rest of it.
+	const appIds = [
+		...new Set(
+			(status.data?.games ?? []).flatMap((g) => (g.app_id ? [g.app_id] : [])),
+		),
+	].sort();
+	const running = useQueries({
+		queries: appIds.map((id) => ({
+			queryKey: getGetLibraryPageQueryKey({ id, limit: 1 }),
+			queryFn: ({ signal }: { signal: AbortSignal }) =>
+				getLibraryPage({ id, limit: 1 }, { signal }),
+			staleTime: 5 * 60_000,
+		})),
 	});
+	const library = running.flatMap((r) => r.data?.items ?? []);
 	const stop = useStopSession();
 	const idr = useRequestIdr();
 	const endGame = useEndGame();
@@ -126,7 +140,7 @@ export const SectionDashboard: FC = () => {
 	return (
 		<DashboardView
 			status={status}
-			library={library.data}
+			library={library}
 			attention={<AttentionCard />}
 			onStopSession={async () => {
 				if (!(await confirmStopAll())) return;

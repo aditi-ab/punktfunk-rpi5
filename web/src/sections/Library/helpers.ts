@@ -1,3 +1,8 @@
+import type { QueryClient } from "@tanstack/react-query";
+import {
+	getGetLibraryPageQueryKey,
+	getGetLibraryQueryKey,
+} from "@/api/gen/library/library";
 import type { GameEntry } from "@/api/gen/model/gameEntry";
 import { m } from "@/paraglide/messages";
 
@@ -30,4 +35,15 @@ export function storeLabel(
 		default:
 			return nameOf?.(store) ?? store.charAt(0).toUpperCase() + store.slice(1);
 	}
+}
+
+/**
+ * The library changed: every view of it asks again. The whole list and its pages are two
+ * queries with two keys, and a change that refreshed one left the other showing the old title.
+ */
+export function refreshLibrary(qc: QueryClient): Promise<void> {
+	return Promise.all([
+		qc.invalidateQueries({ queryKey: getGetLibraryQueryKey() }),
+		qc.invalidateQueries({ queryKey: getGetLibraryPageQueryKey() }),
+	]).then(() => undefined);
 }

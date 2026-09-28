@@ -403,6 +403,7 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
         ))
         .routes(routes!(session::end_game))
         .routes(routes!(library::get_library))
+        .routes(routes!(library::get_library_page))
         .routes(routes!(library::list_library_scanners))
         .routes(routes!(library::set_library_scanner))
         .routes(routes!(library::set_library_entry_hidden))

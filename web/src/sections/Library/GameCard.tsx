@@ -67,6 +67,7 @@ export const GameCard: FC<GameCardProps> = ({
 							src={src}
 							alt={game.title}
 							loading="lazy"
+							decoding="async"
 							className={`size-full object-cover${hidden ? " opacity-30" : ""}`}
 							onError={() => setFailed((prev) => ({ ...prev, [src]: true }))}
 						/>

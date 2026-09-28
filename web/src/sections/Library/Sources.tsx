@@ -11,7 +11,6 @@ import {
 import { motion } from "motion/react";
 import { type FC, useMemo, useState } from "react";
 import {
-	getGetLibraryQueryKey,
 	getListLibraryScannersQueryKey,
 	useDeleteProviderEntries,
 	useListLibraryScanners,
@@ -32,6 +31,7 @@ import { apiErrorMessage } from "@/lib/errors";
 import { m } from "@/paraglide/messages";
 import { EmulatorsCard } from "@/sections/Library/Emulators";
 import { PendingAccess, usePluginAccess } from "@/sections/PluginAccess";
+import { refreshLibrary } from "./helpers";
 import { SourceSettingsDialog } from "./SourceSettings";
 
 /**
@@ -66,7 +66,7 @@ export const SourcesSection: FC<{
 				data: { enabled: !source.enabled },
 			});
 			qc.setQueryData(getListLibraryScannersQueryKey(), list);
-			await qc.invalidateQueries({ queryKey: getGetLibraryQueryKey() });
+			await refreshLibrary(qc);
 		} catch {
 			toast.error(m.library_sources_failed());
 		}
@@ -87,7 +87,7 @@ export const SourcesSection: FC<{
 		if (!ok) return;
 		try {
 			await purge.mutateAsync({ provider });
-			qc.invalidateQueries({ queryKey: getGetLibraryQueryKey() });
+			refreshLibrary(qc);
 			qc.invalidateQueries({ queryKey: getListLibraryScannersQueryKey() });
 			if (activeFilter === provider) onFilter(null);
 			toast.success(m.library_provider_purged({ provider: source.label }));

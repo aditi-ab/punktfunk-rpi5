@@ -9,6 +9,7 @@
 //! resolves. Tests pin the id scheme, the v1→v2 load, and the privileged-field allowlist.
 
 use super::*;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// One stored row. Same shape the API returns and the console edits.
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
@@ -212,19 +213,48 @@ pub fn load_catalog() -> Catalog {
     }
 }
 
+type CatalogCache = Mutex<Option<((Option<SystemTime>, u64), Arc<Catalog>)>>;
+
+fn catalog_cache() -> &'static CatalogCache {
+    static CACHE: OnceLock<CatalogCache> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// The catalog for readers, parsed once and kept until `library.json`'s mtime or length moves.
+/// Every list, launch and cover request reads it; parsing megabytes for each would dominate a
+/// large library. Writers parse their own copy ([`load_catalog`]) and drop this one on save.
+pub(crate) fn catalog() -> Arc<Catalog> {
+    let Ok(md) = std::fs::metadata(custom_path()) else {
+        return Arc::default();
+    };
+    let stamp = (md.modified().ok(), md.len());
+    if let Some((s, c)) = catalog_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+    {
+        if *s == stamp {
+            return c.clone();
+        }
+    }
+    let parsed = Arc::new(load_catalog());
+    *catalog_cache().lock().unwrap_or_else(|e| e.into_inner()) = Some((stamp, parsed.clone()));
+    parsed
+}
+
 pub fn load_custom() -> Vec<CustomEntry> {
-    load_catalog().entries
+    catalog().entries.clone()
 }
 
 /// One stored row by host id, as written — `detect` and `prep` included, which the
 /// catalog read model leaves out.
 pub fn get_custom(id: &str) -> Option<CustomEntry> {
-    load_catalog().entries.into_iter().find(|e| e.id == id)
+    catalog().entries.iter().find(|e| e.id == id).cloned()
 }
 
 /// Store ids a plugin has claimed, so library scans skip the matching built-in scanner.
 pub fn claimed_stores() -> BTreeMap<String, String> {
-    load_catalog().claims
+    catalog().claims.clone()
 }
 
 /// Surfaced library id. Every `GameEntry` mapping and id→entry lookup goes through here.
@@ -249,10 +279,12 @@ pub(crate) fn source_id_for(e: &CustomEntry) -> Option<&str> {
 /// the console draws a dimmed cover, and this resolver cannot see the caller's lane.
 pub fn entry_for_library_id(library_id: &str) -> Option<CustomEntry> {
     let off = disabled_scanners();
-    load_custom()
-        .into_iter()
+    catalog()
+        .entries
+        .iter()
         .find(|e| library_id_for(e) == library_id)
         .filter(|e| !source_id_for(e).is_some_and(|src| off.contains(src)))
+        .cloned()
 }
 
 /// The entry's art as `GET /library` lists it: its own, merged with picks and metadata sources.
@@ -302,7 +334,10 @@ fn catalog_lock() -> std::sync::MutexGuard<'static, ()> {
 /// Every mutation path goes through here, so the first write upgrades v1. Owner-only, like
 /// hooks.json: a local user must not plant `prep`/`launch`.
 fn save_catalog(catalog: &Catalog) -> Result<()> {
-    save_json(&custom_path(), &serde_json::to_string_pretty(catalog)?)
+    save_json(&custom_path(), &serde_json::to_string_pretty(catalog)?)?;
+    // Two saves inside one mtime tick can leave the same stamp on different bytes.
+    *catalog_cache().lock().unwrap_or_else(|e| e.into_inner()) = None;
+    Ok(())
 }
 
 /// 12 hex chars from title + wall-clock nanos.

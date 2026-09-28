@@ -2819,6 +2819,115 @@
         }
       }
     },
+    "/api/v1/library/page": {
+      "get": {
+        "tags": [
+          "library"
+        ],
+        "summary": "One page of the library.",
+        "description": "Title order, `limit` titles a page (60 when absent, 200 at most). `next_cursor` names the\nlast title sent; pass it back as `cursor` for the next page. It is a place in the order, not\nan offset: a title added or removed between two pages neither repeats nor skips one.\n`q` matches inside the title, any case. `provider`, `platform` and `role` (`game`,\n`launcher`) narrow, and `id` names one title, for a caller that needs only that entry.\nLanes see what `GET /library` shows them.",
+        "operationId": "getLibraryPage",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Titles per page, 1 to 200. 60 when absent",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "`next_cursor` of the page before",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "description": "Only titles containing this text, any case",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "provider",
+            "in": "query",
+            "description": "Only entries owned by this external provider",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "platform",
+            "in": "query",
+            "description": "Only entries on this platform (case-insensitive, e.g. `PS2`)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "role",
+            "in": "query",
+            "description": "`game` or `launcher`",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "query",
+            "description": "Only the entry with this library id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One page, the total and the platform counts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LibraryPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The cursor isn't one this host issued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/library/picks/{id}": {
       "put": {
         "tags": [
@@ -10199,6 +10308,42 @@
           "manual"
         ]
       },
+      "LibraryPage": {
+        "type": "object",
+        "description": "One page of the library in title order.",
+        "required": [
+          "items",
+          "total",
+          "platforms"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OperatorGameEntry"
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Hand back as `cursor` for the page after this one. Absent on the last page."
+          },
+          "platforms": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlatformCount"
+            },
+            "description": "Platforms among the titles matching every filter but `platform`, largest first."
+          },
+          "total": {
+            "type": "integer",
+            "description": "Titles matching the filters, across every page.",
+            "minimum": 0
+          }
+        }
+      },
       "LinkMinute": {
         "type": "object",
         "description": "One minute of link health for one session. Every field is a delta for the window except\nthe bands, which are min..max over it.",
@@ -11155,6 +11300,23 @@
           "gamestream",
           "web"
         ]
+      },
+      "PlatformCount": {
+        "type": "object",
+        "description": "How many titles a platform holds under a page's other filters.",
+        "required": [
+          "platform",
+          "count"
+        ],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "platform": {
+            "type": "string"
+          }
+        }
       },
       "PlayingApps": {
         "type": "object",

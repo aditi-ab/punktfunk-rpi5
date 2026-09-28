@@ -130,23 +130,194 @@ pub(crate) async fn get_library(
     for g in &mut games {
         crate::library::proxy_art(&g.id, &mut g.art);
     }
-    // `cert_may_access` allows GET /library, so paired clients see this body. For a custom
-    // entry `launch.value` is the operator's shell command; clear it. `kind` stays so the
-    // client can still render launchability. Unconditional: the operator arm returned above.
-    // `ids` and `filled` serve metadata sources and the console; a player needs neither.
-    let paired = matches!(lane, AuthLane::Cert);
     for g in &mut games {
-        if let Some(l) = g.launch.as_mut() {
-            if l.kind == "command" {
-                l.value.clear();
-            }
-        }
-        if paired {
-            g.ids.clear();
-            g.filled.clear();
-        }
+        redact_for_lane(g, &lane);
     }
     Json(games).into_response()
+}
+
+/// What a lane other than the operator's may not read. `cert_may_access` allows the library
+/// reads, so paired clients see these bodies: a custom entry's `launch.value` is the operator's
+/// shell command and is cleared, `kind` stays so launchability still renders. `ids` and
+/// `filled` serve metadata sources and the console; a player needs neither.
+fn redact_for_lane(g: &mut crate::library::GameEntry, lane: &AuthLane) {
+    if lane.is_operator() {
+        return;
+    }
+    if let Some(l) = g.launch.as_mut() {
+        if l.kind == "command" {
+            l.value.clear();
+        }
+    }
+    if matches!(lane, AuthLane::Cert) {
+        g.ids.clear();
+        g.filled.clear();
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct LibraryPageQuery {
+    provider: Option<String>,
+    platform: Option<String>,
+    q: Option<String>,
+    role: Option<String>,
+    id: Option<String>,
+    limit: Option<u32>,
+    cursor: Option<String>,
+}
+
+/// How many titles a platform holds under a page's other filters.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct PlatformCount {
+    platform: String,
+    count: usize,
+}
+
+/// One page of the library in title order.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct LibraryPage {
+    items: Vec<crate::library::OperatorGameEntry>,
+    /// Hand back as `cursor` for the page after this one. Absent on the last page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+    /// Titles matching the filters, across every page.
+    total: usize,
+    /// Platforms among the titles matching every filter but `platform`, largest first.
+    platforms: Vec<PlatformCount>,
+}
+
+/// 60 fills a wide grid a few rows deep; 200 bounds one response.
+const PAGE_DEFAULT: u32 = 60;
+const PAGE_MAX: u32 = 200;
+
+/// A title's place in the list: folded title, then id so equal titles keep one order.
+fn sort_key(g: &crate::library::GameEntry) -> (String, String) {
+    (g.title.to_lowercase(), g.id.clone())
+}
+
+fn encode_cursor(key: &(String, String)) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("{}\0{}", key.0, key.1))
+}
+
+fn decode_cursor(cursor: &str) -> Option<(String, String)> {
+    use base64::Engine as _;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .ok()?;
+    let text = String::from_utf8(raw).ok()?;
+    let (title, id) = text.split_once('\0')?;
+    Some((title.to_string(), id.to_string()))
+}
+
+/// One page of the library.
+///
+/// Title order, `limit` titles a page (60 when absent, 200 at most). `next_cursor` names the
+/// last title sent; pass it back as `cursor` for the next page. It is a place in the order, not
+/// an offset: a title added or removed between two pages neither repeats nor skips one.
+/// `q` matches inside the title, any case. `provider`, `platform` and `role` (`game`,
+/// `launcher`) narrow, and `id` names one title, for a caller that needs only that entry.
+/// Lanes see what `GET /library` shows them.
+#[utoipa::path(
+    get,
+    path = "/library/page",
+    tag = "library",
+    operation_id = "getLibraryPage",
+    params(
+        ("limit" = Option<u32>, Query, description = "Titles per page, 1 to 200. 60 when absent"),
+        ("cursor" = Option<String>, Query, description = "`next_cursor` of the page before"),
+        ("q" = Option<String>, Query, description = "Only titles containing this text, any case"),
+        ("provider" = Option<String>, Query, description = "Only entries owned by this external provider"),
+        ("platform" = Option<String>, Query, description = "Only entries on this platform (case-insensitive, e.g. `PS2`)"),
+        ("role" = Option<String>, Query, description = "`game` or `launcher`"),
+        ("id" = Option<String>, Query, description = "Only the entry with this library id"),
+    ),
+    responses(
+        (status = OK, description = "One page, the total and the platform counts", body = LibraryPage),
+        (status = BAD_REQUEST, description = "The cursor isn't one this host issued", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+pub(crate) async fn get_library_page(
+    Extension(lane): Extension<AuthLane>,
+    Query(q): Query<LibraryPageQuery>,
+) -> Response {
+    let after = match q.cursor.as_deref().filter(|c| !c.is_empty()) {
+        None => None,
+        Some(c) => match decode_cursor(c) {
+            Some(key) => Some(key),
+            None => {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "That page marker isn't valid. Load the list again from the start",
+                )
+            }
+        },
+    };
+    let limit = q.limit.unwrap_or(PAGE_DEFAULT).clamp(1, PAGE_MAX) as usize;
+    let mut rows: Vec<crate::library::OperatorGameEntry> = if lane.is_operator() {
+        crate::library::all_games_for_operator()
+    } else {
+        crate::library::all_games()
+            .into_iter()
+            .map(|entry| crate::library::OperatorGameEntry {
+                entry,
+                hidden: false,
+            })
+            .collect()
+    };
+    let needle = q.q.as_deref().map(str::trim).unwrap_or("").to_lowercase();
+    let narrow = LibraryQuery {
+        provider: q.provider.clone(),
+        platform: None,
+    };
+    rows.retain(|r| {
+        matches_query(&r.entry, &narrow)
+            && (needle.is_empty() || r.entry.title.to_lowercase().contains(&needle))
+            && q.id.as_deref().is_none_or(|id| r.entry.id == id)
+            && match q.role.as_deref() {
+                Some("launcher") => r.entry.role == crate::library::GameRole::Launcher,
+                Some("game") => r.entry.role != crate::library::GameRole::Launcher,
+                _ => true,
+            }
+    });
+    let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+    for r in &rows {
+        if let Some(p) = r.entry.meta.platform.as_deref().filter(|p| !p.is_empty()) {
+            *counts.entry(p.to_string()).or_default() += 1;
+        }
+    }
+    let mut platforms: Vec<PlatformCount> = counts
+        .into_iter()
+        .map(|(platform, count)| PlatformCount { platform, count })
+        .collect();
+    platforms.sort_by(|a, b| b.count.cmp(&a.count).then(a.platform.cmp(&b.platform)));
+
+    let by_platform = LibraryQuery {
+        provider: None,
+        platform: q.platform.clone(),
+    };
+    rows.retain(|r| matches_query(&r.entry, &by_platform));
+    let total = rows.len();
+    rows.sort_by_cached_key(|r| sort_key(&r.entry));
+    let start = after.map_or(0, |key| rows.partition_point(|r| sort_key(&r.entry) <= key));
+    let mut items: Vec<_> = rows.into_iter().skip(start).take(limit + 1).collect();
+    let more = items.len() > limit;
+    items.truncate(limit);
+    let next_cursor = more
+        .then(|| items.last().map(|r| encode_cursor(&sort_key(&r.entry))))
+        .flatten();
+    for r in &mut items {
+        crate::library::proxy_art(&r.entry.id, &mut r.entry.art);
+        redact_for_lane(&mut r.entry, &lane);
+    }
+    Json(LibraryPage {
+        items,
+        next_cursor,
+        total,
+        platforms,
+    })
+    .into_response()
 }
 
 /// Shared by both `get_library` arms so the filters cannot drift.

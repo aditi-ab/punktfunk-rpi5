@@ -2137,6 +2137,7 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         // Library writes are plugin-lane (scanner job); privileged fields inside the payload
         // are refused in the handler — see `plugin_lane_cannot_set_command_execution_fields`.
         ("GET", "/api/v1/library", true, true),
+        ("GET", "/api/v1/library/page", true, true),
         ("GET", "/api/v1/library/art/{id}/{kind}", true, true),
         ("GET", "/api/v1/library/scanners", true, false),
         ("PUT", "/api/v1/library/scanners/{id}", true, false),
@@ -3906,6 +3907,99 @@ async fn hide_route_matches_ids_containing_colons() {
 /// Stats ride on the entry: absent until the first launch, then the four numbers as recorded.
 /// The env override must cover the whole body (`paired_clients_list_and_unpair`).
 #[allow(clippy::await_holding_lock)]
+/// Seeds one custom title on a platform.
+fn seed_title(title: &str, platform: &str) {
+    crate::library::add_custom(crate::library::CustomInput {
+        title: title.into(),
+        art: Default::default(),
+        launch: None,
+        prep: None,
+        role: Default::default(),
+        icon: None,
+        detect: None,
+        on_window: None,
+        audio: None,
+        meta: crate::library::GameMeta {
+            platform: Some(platform.into()),
+            ..Default::default()
+        },
+    })
+    .expect("seed a title");
+}
+
+fn titles(page: &serde_json::Value) -> Vec<String> {
+    page["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|g| g["title"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Pages follow title order, the cursor names a place rather than an offset, and the filters
+/// and counts agree with what the pages hold.
+#[tokio::test]
+async fn library_pages_by_cursor_with_search_and_counts() {
+    let _tmp = ConfigDirOverride::new();
+    let app = test_app(test_state(), None);
+    for (t, p) in [
+        ("Delta", "PS2"),
+        ("alpha", "PS2"),
+        ("Charlie", "N64"),
+        ("bravo", "PS2"),
+        ("Echo", "N64"),
+    ] {
+        seed_title(t, p);
+    }
+
+    let (s, first) = send(&app, get_req("/api/v1/library/page?limit=2")).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(titles(&first), ["alpha", "bravo"]);
+    assert_eq!(first["total"], 5);
+    assert_eq!(first["platforms"][0]["platform"], "PS2");
+    assert_eq!(first["platforms"][0]["count"], 3);
+    let cursor = first["next_cursor"]
+        .as_str()
+        .expect("more pages")
+        .to_string();
+
+    // A title that sorts before the cursor arrives between two pages: nothing repeats.
+    seed_title("Able", "PS2");
+    let (_, second) = send(
+        &app,
+        get_req(&format!("/api/v1/library/page?limit=2&cursor={cursor}")),
+    )
+    .await;
+    assert_eq!(titles(&second), ["Charlie", "Delta"]);
+    let cursor = second["next_cursor"]
+        .as_str()
+        .expect("one more")
+        .to_string();
+    let (_, last) = send(
+        &app,
+        get_req(&format!("/api/v1/library/page?limit=2&cursor={cursor}")),
+    )
+    .await;
+    assert_eq!(titles(&last), ["Echo"]);
+    assert!(last.get("next_cursor").is_none(), "{last}");
+
+    let (_, found) = send(&app, get_req("/api/v1/library/page?q=HA")).await;
+    assert_eq!(titles(&found), ["alpha", "Charlie"]);
+    assert_eq!(found["total"], 2);
+
+    // The platform filter narrows the page, not the counts beside it.
+    let (_, n64) = send(&app, get_req("/api/v1/library/page?platform=n64")).await;
+    assert_eq!(titles(&n64), ["Charlie", "Echo"]);
+    assert_eq!(n64["platforms"].as_array().map(Vec::len), Some(2));
+
+    let (s, _) = send(&app, get_req("/api/v1/library/page?cursor=not-a-cursor")).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    let id = first["items"][1]["id"].as_str().expect("an id");
+    let (_, one) = send(&app, get_req(&format!("/api/v1/library/page?id={id}"))).await;
+    assert_eq!(titles(&one), ["bravo"]);
+}
+
 #[tokio::test]
 async fn library_stats_ride_on_the_entry() {
     let _tmp = ConfigDirOverride::new();

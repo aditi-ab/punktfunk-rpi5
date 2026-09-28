@@ -23,42 +23,78 @@ const meta = {
 export default meta;
 type Story = StoryObj;
 
+const LAUNCHER = {
+	id: "steam:bigpicture",
+	store: "steam",
+	title: "Steam Big Picture",
+	art: { portrait: null, hero: null, logo: null, header: null },
+	role: "launcher" as const,
+	launch: { kind: "steam_ui", value: "bigpicture" },
+};
+
+/** What the container hands the view: every handler a no-op, nothing narrowed, covers. */
+const gridArgs = {
+	games: { data: library, ...idle },
+	launchers: [],
+	total: library.length,
+	platforms: [],
+	hasMore: false,
+	loadingMore: false,
+	onMore: noop,
+	query: "",
+	onQuery: noop,
+	platform: null,
+	onPlatform: noop,
+	filtered: false,
+	view: "grid" as const,
+	onView: noop,
+	onDelete: noop,
+	deletingId: null,
+	onToggleHidden: noop,
+	hidingId: null,
+};
+
 export const Populated: Story = {
+	render: () => <LibraryGrid {...gridArgs} />,
+};
+
+/** The same titles as lines: many more fit a screen. */
+export const AsList: Story = {
+	render: () => <LibraryGrid {...gridArgs} view="rows" />,
+};
+
+/** One page of a large library: the count says how much is left, and the list goes on. */
+export const FirstPageOfMany: Story = {
 	render: () => (
 		<LibraryGrid
-			library={{ data: library, ...idle }}
-			onDelete={noop}
-			deletingId={null}
-			onToggleHidden={noop}
-			hidingId={null}
+			{...gridArgs}
+			total={5120}
+			hasMore
+			platforms={[
+				{ platform: "PS2", count: 1840 },
+				{ platform: "SNES", count: 1211 },
+				{ platform: "N64", count: 388 },
+			]}
+		/>
+	),
+};
+
+/** A search that finds nothing is a miss, not a fresh host. */
+export const NoMatches: Story = {
+	render: () => (
+		<LibraryGrid
+			{...gridArgs}
+			games={{ data: [], ...idle }}
+			total={0}
+			query="zzz"
+			filtered
 		/>
 	),
 };
 
 /** Launcher entries (design D4) get their own rail above the grid. */
 export const WithLaunchers: Story = {
-	render: () => (
-		<LibraryGrid
-			library={{
-				data: [
-					{
-						id: "steam:bigpicture",
-						store: "steam",
-						title: "Steam Big Picture",
-						art: { portrait: null, hero: null, logo: null, header: null },
-						role: "launcher",
-						launch: { kind: "steam_ui", value: "bigpicture" },
-					},
-					...library,
-				],
-				...idle,
-			}}
-			onDelete={noop}
-			deletingId={null}
-			onToggleHidden={noop}
-			hidingId={null}
-		/>
-	),
+	render: () => <LibraryGrid {...gridArgs} launchers={[LAUNCHER]} />,
 };
 
 /**
@@ -69,27 +105,18 @@ export const WithLaunchers: Story = {
 export const WithHidden: Story = {
 	render: () => (
 		<LibraryGrid
-			library={{
+			{...gridArgs}
+			games={{
 				data: library.map((g, i) => (i === 1 ? { ...g, hidden: true } : g)),
 				...idle,
 			}}
-			onDelete={noop}
-			deletingId={null}
-			onToggleHidden={noop}
-			hidingId={null}
 		/>
 	),
 };
 
 export const Empty: Story = {
 	render: () => (
-		<LibraryGrid
-			library={{ data: [], ...idle }}
-			onDelete={noop}
-			deletingId={null}
-			onToggleHidden={noop}
-			hidingId={null}
-		/>
+		<LibraryGrid {...gridArgs} games={{ data: [], ...idle }} total={0} />
 	),
 };
 

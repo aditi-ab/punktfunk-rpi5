@@ -10,11 +10,10 @@ import { toast } from "@unom/ui/toast";
 import { type FC, useRef, useState } from "react";
 import {
 	getGetCustomGameQueryKey,
-	getGetLibraryQueryKey,
 	useCreateCustomGame,
 	useDeleteCustomGame,
 	useGetCustomGame,
-	useGetLibrary,
+	useGetLibraryPage,
 	useSetLibraryEntryHidden,
 	useUpdateCustomGame,
 } from "@/api/gen/library/library";
@@ -27,7 +26,12 @@ import { carriesCommandExecution } from "@/lib/command-execution";
 import { apiErrorMessage } from "@/lib/errors";
 import { useLocale } from "@/lib/i18n";
 import { m } from "@/paraglide/messages";
-import { customId, isOperatorOwned, storeLabel } from "../helpers";
+import {
+	customId,
+	isOperatorOwned,
+	refreshLibrary,
+	storeLabel,
+} from "../helpers";
 import { useSourceNames } from "../Sources";
 import {
 	emptyForm,
@@ -47,10 +51,14 @@ export const SectionLibraryEntry: FC = () => {
 	useLocale();
 	const { gameId } = route.useParams();
 	const creating = gameId === "new";
-	const library = useGetLibrary(undefined, { query: { enabled: !creating } });
+	// This one title, not the library it belongs to.
+	const library = useGetLibraryPage(
+		{ id: gameId, limit: 1 },
+		{ query: { enabled: !creating } },
+	);
 	if (creating)
 		return <EntryEditor key="new" entry={null} initial={emptyForm} />;
-	const entry = library.data?.find((e) => e.id === gameId);
+	const entry = library.data?.items[0];
 	return (
 		<QueryState
 			isLoading={library.isLoading}
@@ -143,8 +151,7 @@ const EntryEditor: FC<{
 		enableBeforeUnload: () => dirty && !leaving.current,
 	});
 
-	const refresh = () =>
-		qc.invalidateQueries({ queryKey: getGetLibraryQueryKey() });
+	const refresh = () => refreshLibrary(qc);
 
 	const save = async () => {
 		if (!input.title) return;
