@@ -101,14 +101,33 @@ pub struct Probe {
     pub ostree_booted: bool,
     /// Fed to [`windows_channel_of`].
     pub version: String,
+    /// `.git/HEAD` of the Deck build's checkout ([`SOURCE_CHECKOUT`]). Fed to [`source_channel`].
+    pub source_head: Option<String>,
+}
+
+/// The Deck build's checkout, under `$HOME`.
+pub const SOURCE_CHECKOUT: &str = "punktfunk";
+
+/// A Deck build's channel is the branch its checkout follows: `stable` moves at each announced
+/// release, anything else (`main`, a detached tree) is canary.
+pub fn source_channel(head: Option<&str>) -> Channel {
+    match head.map(str::trim) {
+        Some("ref: refs/heads/stable") => Channel::Stable,
+        _ => Channel::Canary,
+    }
 }
 
 /// Live probe for `product`. Consumers cache [`classify`], not this.
 pub fn gather(product: Product, version: &str) -> Probe {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
     Probe {
         windows: cfg!(target_os = "windows"),
         exe: std::env::current_exe().unwrap_or_default(),
-        home: std::env::var_os("HOME").map(PathBuf::from),
+        source_head: home
+            .as_ref()
+            .filter(|_| product == Product::Host)
+            .and_then(|h| std::fs::read_to_string(h.join(SOURCE_CHECKOUT).join(".git/HEAD")).ok()),
+        home,
         // FLATPAK_ID can be missing after a portal spawn; `/.flatpak-info` still exists.
         flatpak: product == Product::Client
             && (std::env::var_os("FLATPAK_ID").is_some() || Path::new("/.flatpak-info").exists()),
@@ -172,7 +191,10 @@ pub fn classify(p: &Probe, product: Product) -> (InstallKind, Channel) {
             // Only the host has an on-device Deck build (`scripts/steamdeck/update.sh`).
             // A client under $HOME is a private copy — report `source`.
             return match product {
-                Product::Host => (InstallKind::SteamosSource, Channel::Canary),
+                Product::Host => (
+                    InstallKind::SteamosSource,
+                    source_channel(p.source_head.as_deref()),
+                ),
                 Product::Client => (InstallKind::Source, Channel::Stable),
             };
         }
@@ -298,6 +320,29 @@ mod tests {
         let mut p = host_probe();
         p.exe = PathBuf::from("/home/deck/punktfunk/target-steamos/release/punktfunk-host");
         assert_eq!(classify(&p, Product::Host).0, InstallKind::SteamosSource);
+    }
+
+    #[test]
+    fn a_deck_build_follows_the_branch_its_checkout_tracks() {
+        let mut p = host_probe();
+        p.exe = PathBuf::from("/home/deck/punktfunk/target-steamos/release/punktfunk-host");
+        for (head, channel) in [
+            (Some("ref: refs/heads/stable\n"), Channel::Stable),
+            (Some("ref: refs/heads/main\n"), Channel::Canary),
+            // A tree checked out at a tag by hand pulls nothing, so it is not on stable.
+            (
+                Some("169730fe73000f4e71411af65e24c82324af8ccb\n"),
+                Channel::Canary,
+            ),
+            (None, Channel::Canary),
+        ] {
+            p.source_head = head.map(str::to_string);
+            assert_eq!(
+                classify(&p, Product::Host),
+                (InstallKind::SteamosSource, channel),
+                "{head:?}"
+            );
+        }
     }
 
     #[test]

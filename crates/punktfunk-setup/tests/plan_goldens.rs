@@ -191,6 +191,20 @@ fn fresh_installs_on_canary() {
         &fresh("bazzite", Family::Sysext),
         &canary,
     );
+    check(
+        "steamos-fresh-canary",
+        &fresh("steamos", Family::Steamos),
+        &canary,
+    );
+}
+
+/// An installed Deck: its binaries are never on PATH, so it is never "fully installed".
+fn deck_on(channel: Channel) -> Facts {
+    Facts {
+        current_channel: Some(channel),
+        web_unit_present: true,
+        ..fresh("steamos", Family::Steamos)
+    }
 }
 
 /// `rpm_group = "bazzite"` is a sed of the written repo file, not the Bazzite distro.
@@ -231,6 +245,45 @@ fn channel_switches_in_both_directions() {
         &installed("bazzite", Family::Sysext, Channel::Stable),
         &to_canary,
     );
+    check(
+        "steamos-switch-to-stable",
+        &deck_on(Channel::Canary),
+        &to_stable,
+    );
+}
+
+/// A Deck's channel is its checkout's branch. A bare re-run rebuilds whatever it follows; a
+/// switch moves the branch first, fast-forward only, then rebuilds through the same hand-off.
+#[test]
+fn trap_a_deck_switch_moves_the_branch_before_the_build() {
+    let rerun = plan_for(&deck_on(Channel::Canary), &pins()).commands();
+    assert!(
+        !rerun
+            .iter()
+            .any(|c| c.contains("checkout") || c.contains("merge")),
+        "a bare re-run moved a canary Deck: {rerun:?}"
+    );
+    for (from, to, branch) in [
+        (Channel::Canary, Channel::Stable, "stable"),
+        (Channel::Stable, Channel::Canary, "main"),
+    ] {
+        let pins = Pins {
+            channel: Some(to),
+            ..pins()
+        };
+        let cmds = plan_for(&deck_on(from), &pins).commands();
+        let at = |needle: &str| {
+            cmds.iter()
+                .position(|c| c.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} missing: {cmds:?}"))
+        };
+        assert!(at("fetch origin") < at(&format!("checkout {branch}")));
+        assert!(
+            at(&format!("checkout {branch}")) < at(&format!("merge --ff-only origin/{branch}"))
+        );
+        assert!(at("--ff-only") < at("scripts/steamdeck/install.sh"));
+        assert!(!cmds.iter().any(|c| c.contains("git clone")), "{cmds:?}");
+    }
 }
 
 #[test]
