@@ -11,6 +11,7 @@ type Sc2Manager = pf_inject::steam_controller2::Triton2Manager;
 #[derive(Default)]
 pub(super) struct PadBackends {
     xboxone: Option<crate::inject::gamepad::GamepadManager>,
+    xboxelite: Option<crate::inject::gamepad::GamepadManager>,
     dualsense: Option<crate::inject::dualsense::DualSenseManager>,
     dualsense_edge: Option<crate::inject::dualsense::DualSenseEdgeManager>,
     dualshock4: Option<crate::inject::dualshock4::DualShock4Manager>,
@@ -97,6 +98,12 @@ impl PadBackends {
                 )
             })
             .handle(ev),
+            GamepadPref::XboxElite => armed!(self.xboxelite, dev, || {
+                crate::inject::gamepad::GamepadManager::with_identity(
+                    crate::inject::gamepad::PadIdentity::elite2(),
+                )
+            })
+            .handle(ev),
             _ => return false,
         }
         true
@@ -155,10 +162,11 @@ impl PadBackends {
     }
 
     /// Every live UHID manager; [`Self::pump`] and [`Self::heartbeat`] both walk it. A new field
-    /// does not compile until it is listed here. The uinput `xboxone` has no heartbeat.
+    /// does not compile until it is listed here. The uinput Xbox managers have no heartbeat.
     fn uhid(&mut self) -> impl Iterator<Item = &mut dyn UhidTick> {
         let Self {
             xboxone: _,
+            xboxelite: _,
             dualsense,
             dualsense_edge,
             dualshock4,
@@ -187,7 +195,10 @@ impl PadBackends {
         rumble: &mut impl FnMut(u16, u16, u16, u16, u16),
         hidout: &mut impl FnMut(punktfunk_core::quic::HidOutput),
     ) {
-        if let Some(m) = &mut self.xboxone {
+        for m in [&mut self.xboxone, &mut self.xboxelite]
+            .into_iter()
+            .flatten()
+        {
             m.pump_rumble(&mut *rumble);
         }
         for m in self.uhid() {

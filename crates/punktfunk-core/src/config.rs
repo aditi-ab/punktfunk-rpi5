@@ -163,11 +163,10 @@ pub enum GamepadPref {
     /// Puck dongle (`28DE:1304`) carrying a captured SC2. Host presents the
     /// native seven-interface Puck topology, not a relabelled wired `1302`.
     SteamController2Puck,
-    /// Windows-only Elite Series 2 HID (`045E:0B22` Bluetooth, UMDF). Paddles
-    /// still fold or drop: after Windows promotes the pad, `xinputhid` claims
-    /// the HID collection, so extra buttons may reach no consumer
-    /// (`design/xbox-pad-windows-handoff.md`). Off Windows this folds to
-    /// `Xbox360` (`PadIdentity` has 360 and One S only).
+    /// Xbox Elite Series 2. Linux: uinput `045E:0B00`, paddles on
+    /// `BTN_TRIGGER_HAPPY5-8`. Windows: HID `045E:0B22` (Bluetooth, UMDF), whose
+    /// report has no paddles; `xinputhid` may also claim the collection
+    /// (`design/xbox-pad-windows-handoff.md`).
     XboxElite,
 }
 

@@ -66,8 +66,8 @@ fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool, windows: bool
         GamepadPref::DualSense if linux || windows => GamepadPref::DualSense,
         GamepadPref::DualShock4 if linux || windows => GamepadPref::DualShock4,
         GamepadPref::XboxOne if linux || windows => GamepadPref::XboxOne,
-        // No Linux uinput Elite identity (`PadIdentity` stops at One S); `_` → Xbox360.
-        GamepadPref::XboxElite if windows => GamepadPref::XboxElite,
+        // Linux: uinput `045E:0B00`, the one Xbox identity whose paddles SDL maps.
+        GamepadPref::XboxElite if linux || windows => GamepadPref::XboxElite,
         GamepadPref::SteamDeck if linux => GamepadPref::SteamDeck,
         GamepadPref::SteamController if linux => GamepadPref::SteamController,
         GamepadPref::SteamDeck if windows => GamepadPref::SteamDeck,
@@ -263,7 +263,7 @@ fn degrade_steam_on_conflict(chosen: GamepadPref) -> GamepadPref {
 
 /// Fold Xbox One / Elite to 360 when [`windows_xbox_hid`] picks XUSB.
 /// The XUSB companion has one fixed 360 identity; folding here keeps the `Welcome` echo honest.
-/// No-op off Windows (`XboxElite` never survives [`pick_gamepad`] there; `XboxOne` is uinput).
+/// No-op off Windows: `XboxOne` and `XboxElite` are uinput identities there.
 #[cfg(target_os = "windows")]
 fn degrade_xbox_identity(chosen: GamepadPref) -> GamepadPref {
     if matches!(chosen, GamepadPref::XboxOne | GamepadPref::XboxElite) && !windows_xbox_hid() {
@@ -458,10 +458,10 @@ mod tests {
         assert_eq!(pick_gamepad(Auto, Some("series"), true, false), XboxOne);
         assert_eq!(pick_gamepad(XboxOne, None, false, true), XboxOne);
         assert_eq!(pick_gamepad(XboxOne, None, false, false), Xbox360);
-        // Windows-only; no Linux uinput Elite identity.
+        // Linux uinput 045E:0B00; Windows UMDF.
         assert_eq!(pick_gamepad(XboxElite, None, false, true), XboxElite);
         assert_eq!(pick_gamepad(Auto, Some("elite"), false, true), XboxElite);
-        assert_eq!(pick_gamepad(XboxElite, None, true, false), Xbox360);
+        assert_eq!(pick_gamepad(XboxElite, None, true, false), XboxElite);
         assert_eq!(pick_gamepad(XboxElite, None, false, false), Xbox360);
 
         assert_eq!(pick_gamepad(SteamDeck, None, true, false), SteamDeck);

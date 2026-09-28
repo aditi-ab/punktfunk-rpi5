@@ -55,7 +55,7 @@ const BTN_START: u16 = 0x13b;
 const BTN_MODE: u16 = 0x13c;
 const BTN_THUMBL: u16 = 0x13d;
 const BTN_THUMBR: u16 = 0x13e;
-// xpad Elite paddles (SDL/Steam Input). PADDLE1/2/3/4 = R4/L4/R5/L5.
+// xpad Elite paddles: SDL reads HAPPY5/6 as the right pair and HAPPY7/8 as the left pair.
 const BTN_TRIGGER_HAPPY5: u16 = 0x2c4;
 const BTN_TRIGGER_HAPPY6: u16 = 0x2c5;
 const BTN_TRIGGER_HAPPY7: u16 = 0x2c6;
@@ -74,9 +74,10 @@ const BUTTON_MAP: [(u32, u16); 15] = [
     (gamepad::BTN_GUIDE, BTN_MODE),
     (gamepad::BTN_LS_CLICK, BTN_THUMBL),
     (gamepad::BTN_RS_CLICK, BTN_THUMBR),
+    // Wire PADDLE1/2/3/4 = R4/L4/R5/L5.
     (gamepad::BTN_PADDLE1, BTN_TRIGGER_HAPPY5),
-    (gamepad::BTN_PADDLE2, BTN_TRIGGER_HAPPY6),
-    (gamepad::BTN_PADDLE3, BTN_TRIGGER_HAPPY7),
+    (gamepad::BTN_PADDLE2, BTN_TRIGGER_HAPPY7),
+    (gamepad::BTN_PADDLE3, BTN_TRIGGER_HAPPY6),
     (gamepad::BTN_PADDLE4, BTN_TRIGGER_HAPPY8),
 ];
 
@@ -113,6 +114,18 @@ impl PadIdentity {
             version: 0x0408,
             name: b"Microsoft X-Box One S pad",
             log: "X-Box One S pad",
+        }
+    }
+
+    /// Kernel `xpad` table entry `045e:0b00`. SDL's database has no USB row for it, so SDL's
+    /// evdev mapping names `BTN_TRIGGER_HAPPY5-8` as the paddles; the 360 and One S rows do not.
+    pub const fn elite2() -> PadIdentity {
+        PadIdentity {
+            vendor: 0x045e,
+            product: 0x0b00,
+            version: 0x0511,
+            name: b"Microsoft X-Box One Elite 2 pad",
+            log: "X-Box One Elite 2 pad",
         }
     }
 }
