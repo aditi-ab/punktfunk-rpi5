@@ -980,7 +980,7 @@ final class AudioRingDriftTests: XCTestCase {
     /// frames a drought already covered are subtracted from the loss concealment the seq path then
     /// asks for — cannot be tested from here: on this leg the gap tracker lives behind the C ABI,
     /// and so does the subtraction (`drought_concealment_is_not_charged_again_by_the_loss_path` in
-    /// `punktfunk_core::abi`).
+    /// `punktfunk_ffi`).
     func testAPacketEndsTheDroughtAndRefreshesTheBudget() {
         var c = DroughtConceal(maxMS: JitterPolicy.plcMaxMS)
         for _ in 0..<1_000 where c.conceal(sinceLastPacketMS: 2 * JitterPolicy.frameMS, depthMS: 0) {}

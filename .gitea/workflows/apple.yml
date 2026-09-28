@@ -94,12 +94,14 @@ on:
     branches: [main]
     paths:
       - 'crates/punktfunk-core/**'
+      - 'crates/punktfunk-ffi/**'
       - 'crates/pf-console-ui/**'
       - 'crates/pf-client-core/**'
       - 'crates/pf-bitstream/**'
       - 'clients/apple/**'
       - 'clients/shared/**'
       - 'scripts/build-xcframework.sh'
+      - 'tools/gen-headers/**'
       - 'scripts/ci/ensure-sccache.sh'
       - 'scripts/ci/ensure-metal-toolchain.sh'
       - 'scripts/ci/gitea-release.sh'
@@ -115,12 +117,14 @@ on:
   pull_request:
     paths:
       - 'crates/punktfunk-core/**'
+      - 'crates/punktfunk-ffi/**'
       - 'crates/pf-console-ui/**'
       - 'crates/pf-client-core/**'
       - 'crates/pf-bitstream/**'
       - 'clients/apple/**'
       - 'clients/shared/**'
       - 'scripts/build-xcframework.sh'
+      - 'tools/gen-headers/**'
       - 'scripts/ci/ensure-sccache.sh'
       - 'scripts/ci/ensure-metal-toolchain.sh'
       - 'scripts/ci/gitea-release.sh'

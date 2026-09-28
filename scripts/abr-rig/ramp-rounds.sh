@@ -14,9 +14,8 @@ keep() { # <tag> <profile>
   cp "$OUT/$2-1.log" "$OUT/$1-client.log" 2>/dev/null || true
 }
 
-# Build once; every run below measures the same binaries.
-PF_RIG_SKIP_BUILD=0 "$HERE/run.sh" nowall_720p 1 >/dev/null 2>&1 || true
-export PF_RIG_SKIP_BUILD=1
+# Build up front; every later run's cargo build is a no-op.
+"$HERE/run.sh" nowall_720p 1 >/dev/null 2>&1 || true
 
 echo "== no-wall profile, ten runs =="
 for r in $(seq 10); do

@@ -70,9 +70,11 @@ on:
     paths:
       - 'crates/punktfunk-host/**'
       - 'crates/punktfunk-core/**'
+      - 'crates/punktfunk-ffi/**'
       - 'crates/punktfunk-tray/**'
       - 'crates/pf-bitstream/**'
       - 'crates/pf-encode/**'
+      - 'crates/pf-encode-core/**'
       - 'crates/pf-encode-win/**'
       - 'crates/libvpl-sys/**'
       - 'crates/pf-frame/**'
@@ -83,6 +85,7 @@ on:
       - 'crates/pf-win-display/**'
       - 'crates/pf-vdisplay/**'
       - 'crates/pf-inject/**'
+      - 'crates/pf-audio/**'
       - 'crates/pf-paths/**'
       - 'crates/pf-paths-win/**'
       - 'crates/pf-driver-proto/**'
@@ -104,9 +107,11 @@ on:
     paths:
       - 'crates/punktfunk-host/**'
       - 'crates/punktfunk-core/**'
+      - 'crates/punktfunk-ffi/**'
       - 'crates/punktfunk-tray/**'
       - 'crates/pf-bitstream/**'
       - 'crates/pf-encode/**'
+      - 'crates/pf-encode-core/**'
       - 'crates/pf-encode-win/**'
       - 'crates/libvpl-sys/**'
       - 'crates/pf-frame/**'
@@ -117,6 +122,7 @@ on:
       - 'crates/pf-win-display/**'
       - 'crates/pf-vdisplay/**'
       - 'crates/pf-inject/**'
+      - 'crates/pf-audio/**'
       - 'crates/pf-paths/**'
       - 'crates/pf-paths-win/**'
       - 'crates/pf-driver-proto/**'
@@ -207,18 +213,18 @@ jobs:
       - name: Clippy (Windows host subsystem)
         # --release and --locked for the same reasons as the package job: reuse C:\t\release
         # instead of spawning a second dep tree, and resolve the graph that is committed.
-        # pf-encode-win, pf-inject, pf-win-display and display-disturb are here because they appear
-        # in no other workflow's -p list at all — their Windows code reached no compiler anywhere.
-        # pf-encode-win takes nvenc,qsv and not pyrowave: this lane never builds the PyroWave
+        # pf-encode-core, pf-encode-win, pf-inject, pf-audio, pf-win-display and display-disturb are
+        # here because no other workflow's -p list type-checks their Windows code or tests.
+        # The encode crates take nvenc,qsv and not pyrowave: this lane never builds the PyroWave
         # C++ tree, and the drivers lane already compiles that backend. Two runs, not eight:
         # every extra feature set re-checks the crates the runs share.
         run: |
           cargo clippy --release --locked -p punktfunk-host -p punktfunk-tray --features nvenc,qsv --target x86_64-pc-windows-msvc -- -D warnings; if ($LASTEXITCODE) { throw "host clippy" }
-          cargo clippy --release --locked -p pf-encode -p pf-encode-win -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p display-disturb --all-targets --features nvenc,qsv --target x86_64-pc-windows-msvc -- -D warnings; if ($LASTEXITCODE) { throw "subsystem clippy" }
+          cargo clippy --release --locked -p pf-encode -p pf-encode-core -p pf-encode-win -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p pf-audio -p display-disturb --all-targets --features nvenc,qsv --target x86_64-pc-windows-msvc -- -D warnings; if ($LASTEXITCODE) { throw "subsystem clippy" }
 
       - name: Format check
         # Cheap, needs no compile, and the Linux lane cannot see these crates' Windows modules.
-        run: cargo fmt -p punktfunk-host -p pf-encode -p pf-encode-win -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p punktfunk-tray --check
+        run: cargo fmt -p punktfunk-host -p pf-encode -p pf-encode-core -p pf-encode-win -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p pf-audio -p punktfunk-tray --check
 
       - name: Test (pf-capture + pf-vdisplay + pf-win-display, Windows)
         # The crates whose Windows test binaries link against nothing this runner lacks —
@@ -371,7 +377,7 @@ jobs:
         run: |
           $t = '${{ matrix.target }}'
           cargo clippy --release --locked -p punktfunk-host -p punktfunk-tray ${{ matrix.host_flags }} --target $t -- -D warnings; if ($LASTEXITCODE) { throw "host clippy" }
-          cargo clippy --release --locked -p pf-encode -p pf-encode-win -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p display-disturb --all-targets ${{ matrix.encode_flags }} --target $t -- -D warnings; if ($LASTEXITCODE) { throw "subsystem clippy" }
+          cargo clippy --release --locked -p pf-encode -p pf-encode-core -p pf-encode-win -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p pf-audio -p display-disturb --all-targets ${{ matrix.encode_flags }} --target $t -- -D warnings; if ($LASTEXITCODE) { throw "subsystem clippy" }
 
       - name: Test (pf-capture, Windows)
         if: matrix.arch == 'x64'

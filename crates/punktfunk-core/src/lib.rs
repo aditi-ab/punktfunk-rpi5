@@ -1,9 +1,10 @@
-//! Shared protocol, transport, FEC, and C-ABI core for Punktfunk hosts and clients.
+//! Shared protocol, transport, and FEC core for Punktfunk hosts and clients.
 //!
 //! Platform capture, encode, decode, presentation, and input injection live elsewhere.
 //! This crate owns wire framing and reassembly ([`packet`]), erasure coding ([`fec`]),
 //! encryption ([`crypto`]), host/client data-plane state ([`session`]), packet I/O
-//! ([`transport`]), shared configuration and event vocabularies, and the [C ABI](crate::abi).
+//! ([`transport`]), and shared configuration and event vocabularies. The C ABI over it is
+//! the `punktfunk-ffi` crate.
 //! The optional `quic` feature adds the native control plane, pairing, clock sync, adaptive
 //! bitrate, clipboard transport, and the embeddable client worker.
 //!
@@ -11,18 +12,12 @@
 //! the optional control plane.
 
 // `unsafe` is crate-denied. Parsers of network bytes stay safe Rust. Carve-outs are
-// only `abi`/`client` (`extern "C"`) and transport syscall shims that move caller-owned
+// only `client` (`extern "C"`) and transport syscall shims that move caller-owned
 // buffers (`udp/{apple,linux,windows}`, `qos_windows`). A wire parser may not add a
-// carve-out; SAFETY proofs sit next to each `unsafe` (mostly `abi.rs`).
+// carve-out; SAFETY proofs sit next to each `unsafe`.
 #![deny(unsafe_code)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-// For the cdylib/staticlib embedders — Swift, Kotlin, C — and no browser is one. Cargo builds
-// the cdylib on wasm regardless, and these `#[no_mangle]` roots are what make it fail there:
-// wasm-ld exports the mangled symbols they reach, and emcc rejects the first name that is not a
-// JS identifier.
-#[cfg(not(target_family = "wasm"))]
-pub mod abi;
 /// cbindgen:ignore
 pub mod abr;
 pub mod audio;
@@ -39,15 +34,12 @@ pub mod config;
 #[path = "crash_windows.rs"]
 pub mod crash;
 pub mod crypto;
-/// cbindgen:ignore
-#[cfg(feature = "quic")]
-pub mod demo_host;
 pub mod discovery;
 pub mod error;
 pub mod fec;
 /// cbindgen:ignore
 pub mod fp;
-// The stats overlay every client draws: window, snapshot, formatter. The ABI exports it from `abi`.
+// The stats overlay every client draws: window, snapshot, formatter. `punktfunk-ffi` exports it.
 /// cbindgen:ignore
 pub mod hud;
 pub mod input;
@@ -81,18 +73,18 @@ pub use stats::Stats;
 
 /// C-ABI generation. Mirrors `punktfunk_abi_version()`; embedders abort on mismatch.
 ///
-/// Bump on any breaking change to the [C ABI](crate::abi). Additive bumps add
+/// Bump on any breaking change to the C ABI (`punktfunk-ffi`). Additive bumps add
 /// symbols and leave every existing function's signature and behaviour alone.
-/// New connect options append to [`abi::PunktfunkConnectOpts`] behind `struct_size`;
+/// New connect options append to `PunktfunkConnectOpts` behind `struct_size`;
 /// do not mint another `connect_ex*` or grow `PunktfunkAudioPcm` / `PunktfunkStats`
 /// (no size guard, allocated by value). v27 is the exception: `PunktfunkHidOutput`
 /// grew 19 → 85 bytes and the version check is the overrun guard — a second pull
 /// symbol would fork the hidout drain forever.
 ///
 /// Not [`WIRE_VERSION`]. The C surface can grow without a wire byte changing.
-/// Pin the integer in `abi.rs` (`abi_version_is_pinned`). Per-bump notes live
+/// Pin the integer in `punktfunk-ffi` (`abi_version_is_pinned`). Per-bump notes live
 /// in `CHANGELOG.md`.
-pub const ABI_VERSION: u32 = 40;
+pub const ABI_VERSION: u32 = 41;
 
 /// punktfunk/1 wire version. `Hello`/`Welcome` carry it; hosts equality-check it.
 ///

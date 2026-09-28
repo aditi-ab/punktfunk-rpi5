@@ -112,15 +112,20 @@ HDR over the virtual display.
 
 | Path | What |
 |---|---|
-| `crates/punktfunk-core` | Wire format, FEC, crypto, pacing, the QUIC control plane (`quic` feature) and the C ABI |
+| `crates/punktfunk-core` | Wire format, FEC, crypto, pacing and the QUIC control plane (`quic` feature) |
+| `crates/punktfunk-ffi` | The C ABI over the core, and the demo-mode loopback host |
 | `crates/punktfunk-host` | The host: sessions, both protocol planes, management API, game library, CLI |
 | `crates/pf-vdisplay` | Virtual outputs, one backend per compositor plus the Windows driver backend |
 | `crates/pf-capture` | PipeWire portal capture (Linux) and driver push (Windows) behind `Capturer` |
-| `crates/pf-encode`, `pf-encode-win` | Encoder backends on Linux and Windows behind one `Encoder` trait |
+| `crates/pf-encode-core` | The `Encoder` trait and the policy every backend shares |
+| `crates/pf-encode`, `pf-encode-win` | Encoder backends on Linux and Windows |
 | `crates/punktfunk-encode-worker` | Separate binary that runs PyroWave at raised GPU priority |
-| `crates/pf-zerocopy` | CUDA, EGL and Vulkan dmabuf import and fence sync (Linux) |
+| `crates/pf-zerocopy` | CUDA, EGL and Vulkan dmabuf import (Linux) |
+| `crates/pf-dmabuf` | dmabuf fence wait and read-only mapping, shared by host and clients (Linux) |
 | `crates/pf-inject` | Keyboard, mouse, pen and virtual-gamepad injection |
+| `crates/pf-portal` | The one tokio runtime every portal call runs on (Linux) |
 | `crates/pf-clipboard` | Shared clipboard backends and the clipboard plane |
+| `crates/pf-audio` | Desktop audio capture, the virtual microphone, pad audio and the Windows wiring plan |
 | `crates/pf-frame`, `pf-gpu`, `pf-win-display` | Frame vocabulary; GPU selection; Windows display topology |
 | `crates/pf-host-config` | The settings registry, its store and the env knobs |
 | `crates/pf-paths`, `pf-paths-win` | Config directory and owner-private files; Windows DACL checks |
@@ -155,8 +160,8 @@ git dependencies.
 ## Design invariants
 
 - **One core, linked everywhere.** Protocol, FEC and crypto live once in `punktfunk-core`, behind a
-  versioned C ABI. `punktfunk_abi_version()` and `PunktfunkConfig.struct_size` let an embedder
-  detect a mismatch instead of corrupting a struct.
+  versioned C ABI (`punktfunk-ffi`). `punktfunk_abi_version()` and `PunktfunkConfig.struct_size`
+  let an embedder detect a mismatch instead of corrupting a struct.
 - **No async on the hot path.** The per-frame pipeline runs on native threads. `tokio` and `quinn`
   sit behind the off-by-default `quic` feature and serve the control plane only.
 - **The host never scales a virtual display.** Each session gets an output at the client's

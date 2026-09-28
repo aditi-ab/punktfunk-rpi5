@@ -24,7 +24,7 @@
 #                   ci.yml runs on every push against a fleet where 37 of 46 jobs contend for
 #                   ubuntu-24.04. See the `miri:` job below for what it does and does not buy.
 #   * c-abi-asan  → NON-BLOCKING ASAN+LSAN run of the C ABI harness (tests/c/run.sh under
-#                   PF_SAN=address): both sides of the abi.rs boundary instrumented at once, and
+#                   PF_SAN=address): both sides of the C ABI boundary instrumented at once, and
 #                   the only automated check on its Box::into_raw/from_raw leak contract. Same
 #                   here-not-ci.yml reasoning as miri — plus -Zbuild-std defeats sccache, so it
 #                   must not ride the per-push leg.
@@ -408,17 +408,17 @@ jobs:
           [ "$ok" = 1 ] || echo "::warning::miri (punktfunk-core fec::gf8, AVX2/SSSE3) did not pass — non-blocking; see design/rust-safety-programme.md §7"
 
   # ASAN + LSAN over the C ABI harness — §6.1 of design/rust-safety-programme.md, its rank-1
-  # tooling item. crates/punktfunk-core/tests/c/run.sh already proves the staticlib links and
+  # tooling item. crates/punktfunk-ffi/tests/c/run.sh already proves the staticlib links and
   # round-trips 4 frames byte-exact from C on every push (ci.yml); PF_SAN=address rebuilds BOTH
   # sides instrumented — the staticlib on nightly with -Zsanitizer/-Zbuild-std (std itself
   # included), the harness with clang -fsanitize — so ASAN sees the seam a Rust-only tool cannot,
-  # and LSAN (detect_leaks=1, the script's default) becomes the one automated check on abi.rs's
+  # and LSAN (detect_leaks=1, the script's default) becomes the one automated check on the ABI's
   # Box::into_raw/from_raw leak contract.
   # Proven to fail on 192.168.1.25: deleting a single punktfunk_session_free() from harness.c
   # makes LSAN report the ~308 Rust-side allocations behind the handle and run.sh exit 1.
-  # What it does NOT see: the invalid-InputKind-discriminant UB at abi.rs (that needs the
+  # What it does NOT see: the invalid-InputKind-discriminant UB in the ABI (that needs the
   # validator, tracked in §5 of the programme doc), and nothing GPU/Windows — this is the
-  # default-feature (quic-less, opus-less) core only.
+  # default-feature (quic-less, opus-less) ABI only.
   c-abi-asan:
     runs-on: ubuntu-24.04
     container:
@@ -480,6 +480,6 @@ jobs:
           set -o pipefail
           ok=1
           PF_SAN=address PF_SAN_TOOLCHAIN="$SAN_TOOLCHAIN" \
-            bash crates/punktfunk-core/tests/c/run.sh 2>&1 | tee /tmp/asan-harness.log || ok=0
+            bash crates/punktfunk-ffi/tests/c/run.sh 2>&1 | tee /tmp/asan-harness.log || ok=0
           grep -q 'PASS: 4 frames round-tripped byte-exact' /tmp/asan-harness.log || ok=0
-          [ "$ok" = 1 ] || echo "::warning::c-abi-asan did not pass — non-blocking on day one; see design/rust-safety-programme.md §6.1. An LSAN report here means the abi.rs into_raw/from_raw contract broke."
+          [ "$ok" = 1 ] || echo "::warning::c-abi-asan did not pass — non-blocking on day one; see design/rust-safety-programme.md §6.1. An LSAN report here means the C ABI's into_raw/from_raw contract broke."

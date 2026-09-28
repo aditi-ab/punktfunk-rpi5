@@ -73,7 +73,7 @@ These are checked in, and CI fails when the committed copy drifts:
 
 | File | Regenerate |
 |---|---|
-| `include/punktfunk_core.h` | `cargo build -p punktfunk-core` |
+| `include/punktfunk_core.h`, `include/punktfunk_console.h` | `cargo run -p gen-headers` |
 | `api/openapi.json` | `cargo run -p punktfunk-host -- openapi > api/openapi.json` |
 | `docs-site/public/openapi.json` | `cp api/openapi.json docs-site/public/openapi.json` |
 | `sdk/src/gen/punktfunk.ts` | `cd sdk && bun run gen` |

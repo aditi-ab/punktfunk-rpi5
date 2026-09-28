@@ -24,8 +24,8 @@ compositor or a display skip themselves or are `#[ignore]`d.
 
 Two traps:
 
-- `punktfunk-core` alone builds without its `quic` feature, which drops the C ABI tests. Use
-  `cargo test -p punktfunk-core --features quic`.
+- `punktfunk-core` and `punktfunk-ffi` alone build without their `quic` feature, which drops the
+  connection tests. Use `cargo test -p punktfunk-core -p punktfunk-ffi --features quic`.
 - `punktfunk-host` has no library target: pass test filters after `--`, never `--lib`.
 
 ## Per-area checks
@@ -33,7 +33,7 @@ Two traps:
 | Area | Command |
 |---|---|
 | FEC under loss, no network | `cargo run -p loss-harness` |
-| C ABI links from C | `bash crates/punktfunk-core/tests/c/run.sh` |
+| C ABI links from C | `bash crates/punktfunk-ffi/tests/c/run.sh` |
 | Scroll, wire and compatibility | `cargo test -p punktfunk-core --features quic scroll` |
 | Scroll, host mapping (any OS) | `cargo test -p pf-inject --lib scroll` |
 | Touch and scroll in the presenter (macOS too) | `cargo test -p pf-presenter --no-default-features` |

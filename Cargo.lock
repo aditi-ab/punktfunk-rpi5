@@ -1685,6 +1685,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "gen-headers"
+version = "0.40.0"
+dependencies = [
+ "cbindgen",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3132,6 +3139,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "pf-audio"
+version = "0.40.0"
+dependencies = [
+ "anyhow",
+ "opus",
+ "pf-capture",
+ "pf-frame",
+ "pf-host-config",
+ "pf-inject",
+ "pf-paths",
+ "pf-win-display",
+ "pipewire",
+ "punktfunk-core",
+ "sha2 0.11.0",
+ "tracing",
+ "wasapi",
+ "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "windows-service",
+ "winreg 0.56.0",
+]
+
+[[package]]
 name = "pf-bitstream"
 version = "0.40.0"
 dependencies = [
@@ -3147,11 +3176,13 @@ dependencies = [
  "ashpd",
  "bitflags 2.13.1",
  "libc",
+ "pf-dmabuf",
  "pf-driver-proto",
  "pf-encode-win",
  "pf-frame",
  "pf-gpu",
  "pf-host-config",
+ "pf-portal",
  "pf-win-display",
  "pf-zerocopy",
  "pipewire",
@@ -3171,6 +3202,7 @@ dependencies = [
  "anyhow",
  "ash",
  "async-channel",
+ "cfg_aliases 0.2.2",
  "libc",
  "libloading 0.9.0",
  "log",
@@ -3178,12 +3210,12 @@ dependencies = [
  "openh264",
  "opus",
  "pf-bitstream",
+ "pf-dmabuf",
  "pf-dxvadec",
  "pf-libva",
  "pf-update-check",
  "pf-vaapi",
  "pf-vkdecode",
- "pf-zerocopy",
  "pipewire",
  "punktfunk-core",
  "pyrowave-sys",
@@ -3242,6 +3274,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-dmabuf"
+version = "0.40.0"
+dependencies = [
+ "libc",
+ "rustix",
+]
+
+[[package]]
 name = "pf-driver-proto"
 version = "0.0.1"
 dependencies = [
@@ -3270,6 +3310,7 @@ dependencies = [
  "nvidia-video-codec-sdk",
  "openh264",
  "pf-capture",
+ "pf-encode-core",
  "pf-encode-win",
  "pf-frame",
  "pf-gpu",
@@ -3288,6 +3329,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-encode-core"
+version = "0.40.0"
+dependencies = [
+ "anyhow",
+ "nvidia-video-codec-sdk",
+ "pf-driver-proto",
+ "pf-frame",
+ "pyrowave-sys",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "pf-encode-win"
 version = "0.40.0"
 dependencies = [
@@ -3295,10 +3349,9 @@ dependencies = [
  "libvpl-sys",
  "nvidia-video-codec-sdk",
  "pf-bitstream",
- "pf-driver-proto",
+ "pf-encode-core",
  "pf-frame",
  "pyrowave-sys",
- "serde_json",
  "tracing",
  "tracing-subscriber",
  "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -3352,6 +3405,7 @@ dependencies = [
  "pf-driver-proto",
  "pf-host-config",
  "pf-paths",
+ "pf-portal",
  "pf-win-display",
  "punktfunk-core",
  "reis",
@@ -3398,6 +3452,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-portal"
+version = "0.40.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "pf-presenter"
 version = "0.40.0"
 dependencies = [
@@ -3405,8 +3466,8 @@ dependencies = [
  "ash",
  "async-channel",
  "pf-client-core",
+ "pf-dmabuf",
  "pf-vkdecode",
- "pf-zerocopy",
  "punktfunk-core",
  "rustix",
  "sdl3",
@@ -3465,6 +3526,7 @@ dependencies = [
  "pf-gpu",
  "pf-host-config",
  "pf-paths",
+ "pf-portal",
  "pf-win-display",
  "punktfunk-core",
  "serde",
@@ -3513,6 +3575,7 @@ dependencies = [
  "khronos-egl",
  "libc",
  "libloading 0.9.0",
+ "pf-dmabuf",
  "rustix",
  "serde",
  "serde_json",
@@ -3792,10 +3855,9 @@ dependencies = [
 name = "punktfunk-client-apple"
 version = "0.40.0"
 dependencies = [
- "cbindgen",
  "pf-client-core",
  "pf-console-ui",
- "punktfunk-core",
+ "punktfunk-ffi",
  "serde",
  "serde_json",
  "skia-safe",
@@ -3851,14 +3913,12 @@ version = "0.40.0"
 dependencies = [
  "aes-gcm",
  "aws-lc-rs",
- "cbindgen",
  "chacha20poly1305",
  "criterion",
  "fec-rs",
  "hmac 0.13.0",
  "if-addrs",
  "libc",
- "log",
  "opus",
  "pf-bitstream",
  "proptest",
@@ -3876,7 +3936,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ureq",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
  "zerocopy 0.8.56",
  "zeroize",
 ]
@@ -3888,6 +3948,21 @@ dependencies = [
  "pf-encode",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "punktfunk-ffi"
+version = "0.40.0"
+dependencies = [
+ "log",
+ "opus",
+ "pf-bitstream",
+ "punktfunk-core",
+ "quinn",
+ "rand 0.9.5",
+ "rcgen",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3918,6 +3993,7 @@ dependencies = [
  "mac_address",
  "mdns-sd",
  "opus",
+ "pf-audio",
  "pf-capture",
  "pf-clipboard",
  "pf-driver-proto",
@@ -3932,8 +4008,8 @@ dependencies = [
  "pf-vdisplay",
  "pf-win-display",
  "pf-zerocopy",
- "pipewire",
  "punktfunk-core",
+ "punktfunk-ffi",
  "quinn",
  "rand 0.9.5",
  "rcgen",
@@ -6398,15 +6474,6 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
-dependencies = [
- "windows-targets",
-]
-
-[[package]]
-name = "windows-sys"
-version = "0.59.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets",
 ]

@@ -9,11 +9,11 @@
 //! portable. The ureq/rustls fetch path is desktop-gated (`linux` / `windows`).
 
 use serde::{Deserialize, Serialize};
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 use std::collections::VecDeque;
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 use std::sync::{Arc, Mutex};
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 use std::time::{Duration, Instant};
 
 /// Matches host `mgmt::DEFAULT_PORT`. Discovered hosts override via mDNS `mgmt`
@@ -201,7 +201,7 @@ pub fn base_url(addr: &str, mgmt_port: u16) -> String {
 
 /// mTLS agent: client cert from `identity`, server checked by `pin`.
 /// `pin = None` is TOFU (accept any cert), same as the QUIC connect.
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 pub fn agent(
     identity: &(String, String),
     pin: Option<[u8; 32]>,
@@ -231,7 +231,7 @@ pub fn agent(
 
 /// `GET /api/v1/library`. 401/403 → [`LibraryError::NotPaired`]; pin failure →
 /// [`LibraryError::PinMismatch`].
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 pub fn fetch_games(
     addr: &str,
     mgmt_port: u16,
@@ -357,7 +357,7 @@ pub fn end_game(
 
 /// `/status` slice the shelf needs. Other operator fields stay undecoded so a
 /// schema change there cannot break the library screen.
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 #[derive(Deserialize, Default)]
 struct HostStatus {
     #[serde(default)]
@@ -366,7 +366,7 @@ struct HostStatus {
 
 /// `GET {path}` on the host's mgmt API, decoded. Any miss (unreachable, an older host
 /// without the route, an unknown shape) is `T::default()`, never an error.
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 pub(crate) fn get_json<T: serde::de::DeserializeOwned + Default>(
     addr: &str,
     mgmt_port: u16,
@@ -390,7 +390,7 @@ pub(crate) fn get_json<T: serde::de::DeserializeOwned + Default>(
 /// `GET /api/v1/status` `games[]`. Best-effort: older host, unreachable, or
 /// unknown shape → empty list, never an error. A missing Resume badge is
 /// cheaper than failing the library screen.
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 pub fn fetch_running(
     addr: &str,
     mgmt_port: u16,
@@ -403,21 +403,21 @@ pub fn fetch_running(
 /// A process-wide list per host fingerprint, so every tile, shelf and menu reading it
 /// agrees. [`FpCache::refresh`] fetches on a worker at most once a `ttl`, stamping the
 /// entry before the request so a hung host cannot spawn a worker per tick.
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 pub(crate) struct FpCache<T> {
     map: std::sync::OnceLock<Mutex<FpEntries<T>>>,
     ttl: Duration,
     thread: &'static str,
 }
 
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 type FpEntries<T> = std::collections::HashMap<String, (Instant, Vec<T>)>;
 
 /// A best-effort mgmt GET: address, mgmt port, identity, pin.
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 type FpFetch<T> = fn(&str, u16, &(String, String), Option<[u8; 32]>) -> Vec<T>;
 
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 impl<T: Clone + Send + 'static> FpCache<T> {
     pub(crate) const fn new(ttl: Duration, thread: &'static str) -> Self {
         FpCache {
@@ -490,10 +490,10 @@ impl<T: Clone + Send + 'static> FpCache<T> {
 /// 20 s. What a host has up changes minute to minute, unlike the grants
 /// [`crate::host_actions::TTL`] governs — but a home carousel ticks far faster
 /// than that, so this is the rate limit, not the display cadence.
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 pub const RUNNING_TTL: Duration = Duration::from_secs(20);
 
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 static RUNNING: FpCache<RunningGame> = FpCache::new(RUNNING_TTL, "punktfunk-nowplaying");
 
 /// The title to name on a host tile: what this host last said it has up.
@@ -501,7 +501,7 @@ static RUNNING: FpCache<RunningGame> = FpCache::new(RUNNING_TTL, "punktfunk-nowp
 /// Empty until [`refresh_running`] answers, for a host running nothing, and for
 /// one whose entry carries no title — a shell renders the empty string as "no
 /// line", which is also the right answer for a host too old to be asked.
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 pub fn now_playing(fp_hex: &str) -> String {
     RUNNING
         .get(fp_hex)
@@ -513,7 +513,7 @@ pub fn now_playing(fp_hex: &str) -> String {
 
 /// Ask the host what it has up unless [`RUNNING_TTL`] says the last answer still
 /// stands. Idempotent; call it on whatever tick a shell already refreshes host rows on.
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 pub fn refresh_running(addr: &str, mgmt_port: u16, fp_hex: &str) {
     RUNNING.refresh(addr, mgmt_port, fp_hex, fetch_running, RunningGame::is_up);
 }
@@ -527,7 +527,7 @@ pub fn running(fp_hex: &str) -> Vec<RunningGame> {
 /// Drop what this host said — the caller just ended a session on it, so the
 /// answer is about to change and the next tick must ask rather than wait out
 /// [`RUNNING_TTL`].
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 pub fn invalidate_running(fp_hex: &str) {
     RUNNING.invalidate(fp_hex);
 }
@@ -535,13 +535,13 @@ pub fn invalidate_running(fp_hex: &str) {
 /// 16 MiB. Steam heroes are a few MB; larger is not an image for the decoder.
 /// [`crate::art_cache`] holds the same ceiling, so disk never serves what the
 /// network would have refused.
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 pub(crate) const ART_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Host-origin URLs (`base` prefix) use the pinned mTLS agent; the art proxy
 /// requires the paired cert. Any other origin (custom-entry CDN) uses ureq's
 /// default agent: webpki trust, no client cert.
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 pub fn fetch_art(pinned: &ureq::Agent, base: &str, url: &str) -> Result<Vec<u8>, LibraryError> {
     let mut resp = if url.starts_with(base) {
         pinned.get(url).call()
@@ -565,14 +565,14 @@ pub fn fetch_art(pinned: &ureq::Agent, base: &str, url: &str) -> Result<Vec<u8>,
 }
 
 /// Three workers: enough for a LAN art proxy without a connection burst.
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 const ART_WORKERS: usize = 3;
 
 /// Walk each job's candidate URLs until one loads — [`crate::art_cache`] first,
 /// then the network, which writes what it fetched back. Results arrive on the
 /// returned channel; drop the receiver to stop the workers (page popped).
 /// Consumer decodes textures on the main loop, cached bytes included.
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 pub fn spawn_art_fetch(
     base: String,
     identity: (String, String),
@@ -635,7 +635,7 @@ pub fn spawn_art_fetch(
     rx
 }
 
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 pub(crate) fn classify(e: ureq::Error) -> LibraryError {
     match e {
         ureq::Error::StatusCode(401 | 403) => LibraryError::NotPaired,
@@ -730,7 +730,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+    #[cfg(desktop)]
     #[test]
     fn running_games_decode_and_untracked_counts_as_up() {
         // Host `/status` shape: extra operator fields present; typed command omits `app_id`.

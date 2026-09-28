@@ -17,6 +17,7 @@ use super::proto::{
     BufferDesc, ConvertOut, ConvertSrc, CursorRect, ImportKind, Reply, Request, PROTO_VERSION,
 };
 use anyhow::{bail, Context, Result};
+use pf_dmabuf::{ReadMap, Share};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
@@ -359,7 +360,8 @@ impl ImportBackend for EglBackend {
                 message: "SetCursor without a memfd".into(),
             };
         };
-        let r = MappedFd::new(fd.as_fd(), len as usize)
+        let r = ReadMap::new(fd.as_fd(), len as usize, Share::Private)
+            .context("map the cursor memfd")
             .and_then(|m| self.importer.set_cursor(serial, w, h, m.bytes()));
         match r {
             Ok(()) => Reply::Done,
@@ -398,56 +400,6 @@ impl ImportBackend for EglBackend {
                 },
                 None,
             ),
-        }
-    }
-}
-
-/// A read-only mapping of a memfd for the cursor bytes; unmapped on drop.
-struct MappedFd {
-    ptr: *mut libc::c_void,
-    len: usize,
-}
-impl MappedFd {
-    /// Map the first `len` bytes of `fd`. A `len` past the file's end is refused: touching a
-    /// mapped page beyond it is a SIGBUS, not an error.
-    fn new(fd: BorrowedFd<'_>, len: usize) -> Result<MappedFd> {
-        if len == 0 {
-            bail!("empty cursor memfd");
-        }
-        let size = rustix::fs::fstat(fd)
-            .context("fstat(cursor memfd)")?
-            .st_size;
-        if u64::try_from(size).unwrap_or(0) < len as u64 {
-            bail!("cursor memfd holds {size} bytes, message says {len}");
-        }
-        // SAFETY: a fresh read-only private mapping of `len` bytes of `fd`, which holds at least
-        // that many (checked above; the host seals it against shrinking). The pointer is checked
-        // below and unmapped in `Drop`.
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ,
-                libc::MAP_PRIVATE,
-                fd.as_raw_fd(),
-                0,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            bail!("mmap(cursor memfd)");
-        }
-        Ok(MappedFd { ptr, len })
-    }
-    fn bytes(&self) -> &[u8] {
-        // SAFETY: `ptr` maps `len` readable bytes for the mapping's lifetime.
-        unsafe { std::slice::from_raw_parts(self.ptr.cast::<u8>(), self.len) }
-    }
-}
-impl Drop for MappedFd {
-    fn drop(&mut self) {
-        // SAFETY: `ptr`/`len` are the live mapping from `new`.
-        unsafe {
-            libc::munmap(self.ptr, self.len);
         }
     }
 }

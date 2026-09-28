@@ -694,10 +694,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "pf-dmabuf"
+version = "0.40.0"
+dependencies = [
+ "libc",
+ "rustix",
+]
+
+[[package]]
 name = "pf-driver-proto"
 version = "0.0.1"
 dependencies = [
  "bytemuck",
+]
+
+[[package]]
+name = "pf-encode-core"
+version = "0.40.0"
+dependencies = [
+ "anyhow",
+ "nvidia-video-codec-sdk",
+ "pf-driver-proto",
+ "pf-frame",
+ "pyrowave-sys",
+ "tracing",
 ]
 
 [[package]]
@@ -707,7 +727,7 @@ dependencies = [
  "anyhow",
  "libvpl-sys",
  "nvidia-video-codec-sdk",
- "pf-driver-proto",
+ "pf-encode-core",
  "pf-frame",
  "pyrowave-sys",
  "tracing",
@@ -793,6 +813,7 @@ dependencies = [
  "khronos-egl",
  "libc",
  "libloading 0.9.0",
+ "pf-dmabuf",
  "rustix",
  "serde",
  "serde_json",

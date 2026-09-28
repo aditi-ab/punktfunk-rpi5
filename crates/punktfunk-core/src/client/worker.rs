@@ -1,13 +1,14 @@
-//! Constructor bag the connect path hands the tokio worker, plus typed close-code
+//! What the connect path hands the tokio worker, plus typed close-code
 //! classification.
 //!
-//! [`WorkerArgs`] holds Hello fields, event planes, and the live slots the control
-//! task mutates. [`reject_from_close`] maps a QUIC application close onto
+//! [`WorkerArgs`] holds the dial's [`ConnectParams`], the worker's plane
+//! endpoints, and the [`ClientShared`] cells both sides read and write.
+//! [`reject_from_close`] maps a QUIC application close onto
 //! [`crate::reject::RejectReason`]; transport and local closes keep the original error.
 
 use super::*;
 use crate::clipboard::{ClipCommand, ClipEventCore};
-use crate::config::{CompositorPref, GamepadPref, Mode};
+use crate::config::Mode;
 use crate::error::Result;
 use crate::input::InputEvent;
 use crate::quic::{HdrMeta, HidOutput, PadAudioFrame};
@@ -15,40 +16,120 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU32, AtomicU64, 
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 
+/// Cells [`NativeClient`] and the worker's tasks share, one `Arc` per dial.
+///
+/// `clock_offset` and `shutdown` stay `Arc`s: embedders and the data-punch thread hold
+/// those cells on their own.
+pub(crate) struct ClientShared {
+    pub(crate) frames: FrameChannel,
+    pub(crate) shutdown: Arc<AtomicBool>,
+    /// [`PunktfunkEndReason`] as `u8`, latched beside `shutdown`.
+    pub(crate) end_reason: AtomicU8,
+    /// [`NativeClient::disconnect_quit`] → [`crate::quic::QUIT_CLOSE_CODE`] (skip keep-alive
+    /// linger). A plain drop leaves this false → close code 0.
+    pub(crate) quit: AtomicBool,
+    /// Welcome mode, then every accepted switch the control task applies.
+    pub(crate) mode: Mutex<Mode>,
+    pub(crate) probe: Mutex<ProbeState>,
+    /// Unrecoverable AUs. Watch for increases to request a keyframe: infinite GOP conceals
+    /// reference-missing frames, so a decode-error trigger misses them.
+    pub(crate) frames_dropped: AtomicU64,
+    /// Parity-repaired shards. HUD windows by diffing successive reads.
+    pub(crate) fec_recovered: AtomicU64,
+    /// The pinned rate this client could not hold, kbps; `0` until it sheds its backlog
+    /// [`super::frame_channel::PIN_SHEDS_TO_WARN`] times.
+    pub(crate) unsustainable_pin_kbps: AtomicU32,
+    /// The pump counts wire sends and stale-shed drops; the producer counts queue-full drops.
+    pub(crate) mic_stats: MicUplinkCounters,
+    /// Pump tid plus [`NativeClient::register_hot_thread`] ids. Android feeds ADPF.
+    pub(crate) hot_tids: Mutex<Vec<i32>>,
+    /// Live host−client offset (ns). Seeded at connect, refreshed by the control task's
+    /// re-syncs.
+    pub(crate) clock_offset: Arc<AtomicI64>,
+    /// Smoothed QUIC round trip (µs), sampled by the worker. `0` until the first sample.
+    pub(crate) rtt_us: AtomicU32,
+    /// Embedder decode-latency samples. The pump drains a window mean into ABR.
+    pub(crate) decode_lat: Mutex<DecodeLatAcc>,
+    /// Closed ABR windows, newest last ([`NativeClient::take_abr_windows`]).
+    pub(crate) abr_windows: Mutex<std::collections::VecDeque<crate::abr::WindowRecord>>,
+    /// What the bring-up ramp measured, once it stopped.
+    pub(crate) abr_ramp: Mutex<Option<crate::abr::RampRecord>>,
+    /// Live encoder target (kbps): the Welcome seed, then every `BitrateChanged` ack.
+    pub(crate) live_bitrate_kbps: AtomicU32,
+    /// [`crate::hud::RateCut`] code the pump publishes each window; `0` = no standing cut.
+    pub(crate) rate_cut: AtomicU8,
+    /// RFIs the control task sent, aged at each overlay read.
+    pub(crate) recent_rfis: Mutex<RecentRfis>,
+    /// What each frame the pump skipped past still lacked, for the RFI line.
+    pub(crate) short_frames: Mutex<ShortFrames>,
+    /// Per-pad render caps (bit0 haptics, bit1 speaker). OR'd into GamepadArrival flags
+    /// (bits 8/9) toward a `HOST_CAP_PAD_AUDIO` host only.
+    pub(crate) pad_audio_caps: [AtomicU8; crate::input::MAX_PADS],
+    /// Pads the embedder switched to controller mouse.
+    pub(crate) pad_mouse: super::pad_mouse::PadMouseShared,
+    /// Live invert-scroll toggle; the input task applies it once at the outbound seam.
+    pub(crate) scroll_invert: AtomicBool,
+    /// [`AUDIO_MUTE_LOCAL`] | [`AUDIO_MUTE_HOST`]. The embedder owns its bit, the control task
+    /// the host's; clearing one leaves the other standing.
+    pub(crate) audio_mute: AtomicU8,
+    /// OS pad slots this session holds, one bit each ([`crate::quic::PadSlots`]).
+    pub(crate) pad_slots: AtomicU16,
+    /// Latest launch verdict the host sent ([`crate::quic::LaunchOutcome`]).
+    pub(crate) launch_outcome: Mutex<Option<crate::quic::LaunchOutcome>>,
+    /// Live grants: the Welcome seed, then every `AccessUpdate` (latest wins).
+    pub(crate) access_grants: AtomicU32,
+    /// Client-wall unix seconds; `0` = permanent. Re-anchored by every `AccessUpdate`.
+    pub(crate) access_deadline_unix: AtomicU64,
+    /// Mid-session [`crate::reject::RejectReason`] close code; `0` = none.
+    pub(crate) end_reject_code: AtomicU32,
+    /// The host's own sentence for that close. Set once, only with non-empty text.
+    pub(crate) end_reject_said: std::sync::OnceLock<String>,
+}
+
+impl ClientShared {
+    /// Pre-handshake state. `GRANT_ALL` / permanent is a placeholder the pump overwrites from
+    /// Welcome before the embedder can read it.
+    pub(crate) fn new(mode: Mode) -> Self {
+        ClientShared {
+            frames: FrameChannel::new(),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            end_reason: AtomicU8::new(PunktfunkEndReason::None as u8),
+            quit: AtomicBool::new(false),
+            mode: Mutex::new(mode),
+            probe: Mutex::default(),
+            frames_dropped: AtomicU64::new(0),
+            fec_recovered: AtomicU64::new(0),
+            unsustainable_pin_kbps: AtomicU32::new(0),
+            mic_stats: MicUplinkCounters::default(),
+            hot_tids: Mutex::default(),
+            clock_offset: Arc::new(AtomicI64::new(0)),
+            rtt_us: AtomicU32::new(0),
+            decode_lat: Mutex::default(),
+            abr_windows: Mutex::default(),
+            abr_ramp: Mutex::default(),
+            live_bitrate_kbps: AtomicU32::new(0),
+            rate_cut: AtomicU8::new(0),
+            recent_rfis: Mutex::default(),
+            short_frames: Mutex::default(),
+            pad_audio_caps: std::array::from_fn(|_| AtomicU8::new(0)),
+            pad_mouse: Default::default(),
+            scroll_invert: AtomicBool::new(false),
+            audio_mute: AtomicU8::new(0),
+            pad_slots: AtomicU16::new(0),
+            launch_outcome: Mutex::default(),
+            access_grants: AtomicU32::new(crate::quic::GRANT_ALL),
+            access_deadline_unix: AtomicU64::new(0),
+            end_reject_code: AtomicU32::new(0),
+            end_reject_said: std::sync::OnceLock::new(),
+        }
+    }
+}
+
 pub(crate) struct WorkerArgs {
-    pub(crate) host: String,
-    pub(crate) port: u16,
-    pub(crate) mode: Mode,
-    pub(crate) compositor: CompositorPref,
-    pub(crate) gamepad: GamepadPref,
-    pub(crate) bitrate_kbps: u32,
-    pub(crate) video_caps: u8,
-    pub(crate) audio_channels: u8,
-    /// Hello request, never the device format. The host answers in `Welcome`; open
-    /// the device from that. Anything other than 48 kHz/16-bit also sets
-    /// [`crate::quic::CLIENT_CAP_AUDIO_HIRES`].
-    pub(crate) audio_rate_hz: u32,
-    pub(crate) audio_bits: u8,
-    /// Surround coupling asked for; the host answers in `Welcome::audio_layout`.
-    pub(crate) audio_layout: crate::audio::AudioLayout,
-    /// How this client fills its view; the host reframes a shared frame to it.
-    pub(crate) video_fit: crate::video_fit::VideoFit,
-    pub(crate) video_codecs: u8,
-    pub(crate) preferred_codec: u8,
-    pub(crate) display_hdr: Option<HdrMeta>,
-    pub(crate) client_caps: u8,
-    /// Slice-progressive [`crate::session::Frame::part`] opt-in. Ignored on all-intra
-    /// (PyroWave) sessions — newest-wins draining needs whole AUs.
-    pub(crate) frame_parts: bool,
-    pub(crate) launch: Option<String>,
-    /// Display name in `Hello` — the host's approval-list / trust-store label.
-    pub(crate) name: Option<String>,
-    pub(crate) pin: Option<[u8; 32]>,
-    pub(crate) identity: Option<(String, String)>,
-    /// Same budget `connect` bounds `ready_rx` with. The dial loop re-dials inside it
-    /// so a host still coming up from Wake-on-LAN is not a first-attempt failure.
-    pub(crate) connect_timeout: std::time::Duration,
-    pub(crate) frames: Arc<FrameChannel>,
+    /// The dial's ask. `client_caps` already carries the bits core adds
+    /// ([`advertised_client_caps`]); `cancel` stays with the connect call.
+    pub(crate) params: ConnectParams,
+    pub(crate) shared: Arc<ClientShared>,
     pub(crate) audio_tx: SyncSender<AudioPacket>,
     pub(crate) rumble_tx: SyncSender<RumbleUpdate>,
     /// Feed half of the rumble policy engine. Its `Drop` (demux task end) marks the
@@ -57,14 +138,6 @@ pub(crate) struct WorkerArgs {
     pub(crate) hidout_tx: SyncSender<HidOutput>,
     /// Inbound `0xD1` pad-audio frames (voice-coil haptics + speaker).
     pub(crate) pad_audio_tx: SyncSender<PadAudioFrame>,
-    /// Per-pad render caps (bit0 haptics, bit1 speaker). OR'd into GamepadArrival
-    /// flags (bits 8/9) toward a `HOST_CAP_PAD_AUDIO` host only.
-    pub(crate) pad_audio_caps: Arc<[AtomicU8; crate::input::MAX_PADS]>,
-    /// Pads the embedder switched to controller mouse.
-    pub(crate) pad_mouse: Arc<super::pad_mouse::PadMouseShared>,
-    /// Live invert-scroll toggle ([`NativeClient::set_invert_scroll`]); the input
-    /// task applies it once at the outbound seam.
-    pub(crate) scroll_invert: Arc<AtomicBool>,
     pub(crate) hdr_meta_tx: SyncSender<HdrMeta>,
     pub(crate) host_timing_tx: SyncSender<crate::quic::HostTiming>,
     pub(crate) cursor_shape_tx: super::planes::ShapeSender,
@@ -80,64 +153,9 @@ pub(crate) struct WorkerArgs {
     pub(crate) clip_event_tx: SyncSender<ClipEventCore>,
     pub(crate) clip_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<ClipCommand>,
     pub(crate) ready_tx: std::sync::mpsc::Sender<Result<Negotiated>>,
-    pub(crate) shutdown: Arc<AtomicBool>,
-    /// [`crate::client::PunktfunkEndReason`] as `u8`, latched beside `shutdown`.
-    pub(crate) end_reason: Arc<AtomicU8>,
-    /// When set, the worker closes with the deliberate-quit code rather than a generic end.
-    pub(crate) quit: Arc<AtomicBool>,
-    pub(crate) mode_slot: Arc<std::sync::Mutex<Mode>>,
-    pub(crate) probe: Arc<Mutex<ProbeState>>,
-    pub(crate) frames_dropped: Arc<AtomicU64>,
-    pub(crate) fec_recovered: Arc<AtomicU64>,
-    pub(crate) unsustainable_pin_kbps: Arc<AtomicU32>,
-    /// Pump mic task counts wire sends and stale-shed drops; the producer counts
-    /// queue-full drops.
-    pub(crate) mic_stats: Arc<MicUplinkCounters>,
-    pub(crate) hot_tids: Arc<Mutex<Vec<i32>>>,
-    /// Seeded with the connect-time estimate; the control task's mid-stream re-syncs
-    /// update it.
-    pub(crate) clock_offset: Arc<AtomicI64>,
-    /// Smoothed QUIC round trip (µs) for the overlay; a pump task samples it.
-    pub(crate) rtt_us: Arc<AtomicU32>,
-    /// Embedder decode-stage samples. The pump drains a window mean into the ABR
-    /// decode signal.
-    pub(crate) decode_lat: Arc<Mutex<DecodeLatAcc>>,
-    /// Encoder-target mirror. Seeded from Welcome; updated on every `BitrateChanged` ack.
-    pub(crate) live_bitrate: Arc<AtomicU32>,
-    /// Why Automatic last cut the rate ([`crate::hud::RateCut`] code), for the overlay.
-    pub(crate) rate_cut: Arc<AtomicU8>,
-    /// Closed ABR windows, newest last, for an embedder recording a trajectory.
-    pub(crate) abr_windows: Arc<Mutex<std::collections::VecDeque<crate::abr::WindowRecord>>>,
-    /// What the bring-up ramp measured, once it stopped.
-    pub(crate) abr_ramp: Arc<Mutex<Option<crate::abr::RampRecord>>>,
-    /// RFIs sent in the last minute, for the overlay. The control task notes each one.
-    pub(crate) recent_rfis: Arc<Mutex<RecentRfis>>,
-    /// What each frame the pump skipped past still lacked, for the RFI line.
-    pub(crate) short_frames: Arc<Mutex<ShortFrames>>,
-    /// Mute mask the control task ORs [`crate::client::AUDIO_MUTE_HOST`] into on every
-    /// `AudioState`. The embedder's own bit rides the same cell.
-    pub(crate) audio_mute: Arc<AtomicU8>,
-    /// OS pad slots this session holds, one bit each ([`crate::quic::PadSlots`]).
-    /// The player number the overlay names; `0` until the first pad has a device.
-    pub(crate) pad_slots: Arc<AtomicU16>,
-    /// Latest launch verdict the host sent ([`crate::quic::LaunchOutcome`]).
-    pub(crate) launch_outcome: Arc<Mutex<Option<crate::quic::LaunchOutcome>>>,
-    /// Live grants. Seeded from the Welcome advert; every `AccessUpdate` overwrites
-    /// (latest wins).
-    pub(crate) access_grants: Arc<AtomicU32>,
-    /// Client-wall-clock unix seconds; `0` = permanent. Seeded from Welcome
-    /// `expires_in_secs`, re-anchored by every `AccessUpdate`.
-    pub(crate) access_deadline_unix: Arc<AtomicU64>,
-    /// Pushed by the control task only AFTER it has folded the update into the two
-    /// live slots above.
+    /// Pushed by the control task only AFTER it has folded the update into
+    /// `shared.access_grants` / `shared.access_deadline_unix`.
     pub(crate) access_tx: SyncSender<crate::quic::AccessUpdate>,
-    /// Typed mid-session close from [`crate::reject::RejectReason`]; `0` = none.
-    /// Latched beside `end_reason` so an access-expiry close is not rendered as a
-    /// generic host error.
-    pub(crate) end_reject_code: Arc<AtomicU32>,
-    /// The host's own sentence for that close, when it sent one. Set once — a
-    /// connection closes once — and only ever with non-empty text.
-    pub(crate) end_reject_said: Arc<std::sync::OnceLock<String>>,
 }
 
 /// The host's stated rejection and the sentence it sent with it, if the connection

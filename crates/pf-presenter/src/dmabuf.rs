@@ -396,7 +396,7 @@ pub(crate) fn get_or_import(
         None => {
             for fd in &frame.sync_fds {
                 // 100 ms fail-open: a decode this late is a stalled GPU, not a race worth a hang.
-                let _ = pf_zerocopy::dmabuf_fence::wait_sync_file(fd.as_fd(), 100);
+                let _ = pf_dmabuf::fence::wait_sync_file(fd.as_fd(), 100);
             }
         }
     }

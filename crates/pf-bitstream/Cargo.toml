@@ -9,7 +9,7 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-cros-codecs = { path = "vendor/cros-codecs" }
+cros-codecs = { workspace = true }
 tracing = "0.1"
 
 [features]

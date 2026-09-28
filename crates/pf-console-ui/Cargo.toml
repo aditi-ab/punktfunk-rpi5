@@ -78,7 +78,7 @@ pf-client-core = { path = "../pf-client-core", default-features = false }
 # pre-generated bindings.rs under the NEW crate, failing with `no variant, associated function,
 # or constant named 'Default' found for enum SkPathFillType`. That is exactly how #193 shipped.
 skia-safe = { version = "0.99", features = ["textlayout"] }
-ash = { version = "0.38", features = ["loaded"], optional = true }
+ash = { workspace = true, features = ["loaded"], optional = true }
 
 # Android (design/android-skia-console-port.md D1): the same crate over Skia's GL backend on
 # the client's own EGL surface. `gl` not `vulkan` — universal on every Android device this

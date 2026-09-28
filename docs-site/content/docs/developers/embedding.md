@@ -1,24 +1,25 @@
 ---
 title: Embed the core (C ABI)
-description: Build a client for a platform without a Punktfunk app by linking punktfunk-core through its C ABI.
+description: Build a client for a platform without a Punktfunk app by linking the punktfunk-ffi C ABI.
 ---
 
-Link `punktfunk-core` into your own client and it speaks the whole protocol for you: the QUIC
+Link `punktfunk-ffi` into your own client and it speaks the whole protocol for you: the QUIC
 handshake, pairing, the encrypted UDP data plane, FEC and loss recovery, clock sync. You decode
 video, present it, play audio and read input. The contract is
 [`include/punktfunk_core.h`](https://git.unom.io/unom/punktfunk/src/branch/main/include/punktfunk_core.h):
-every symbol carries a doc comment, and this page is the map to it. A Rust client depends on the
-crate with `features = ["quic"]` instead, as the Android client does.
+every symbol carries a doc comment, and this page is the map to it. A Rust client depends on
+`punktfunk-core` with `features = ["quic"]` instead, as the Android client does.
 
 ## Build and link
 
 ```sh
-cargo build -p punktfunk-core --features quic --release
+cargo build -p punktfunk-ffi --features quic --release
 ```
 
-One build writes all three library kinds to `target/release/`: `libpunktfunk_core.a` (static),
-`libpunktfunk_core.so` / `.dylib` / `punktfunk_core.dll` (dynamic). The build also regenerates the
-header from [`abi.rs`](https://git.unom.io/unom/punktfunk/src/branch/main/crates/punktfunk-core/src/abi.rs)
+One build writes both library kinds to `target/release/`: `libpunktfunk_ffi.a` (static),
+`libpunktfunk_ffi.so` / `.dylib` / `punktfunk_ffi.dll` (dynamic). `cargo run -p gen-headers`
+regenerates the header from
+[`punktfunk-ffi`](https://git.unom.io/unom/punktfunk/src/branch/main/crates/punktfunk-ffi/src/lib.rs)
 with cbindgen; the header is checked in, and CI fails when it is stale.
 
 Compile your code with `-DPUNKTFUNK_FEATURE_QUIC`. The whole client API (`punktfunk_connect*`,
@@ -27,16 +28,16 @@ the header declares only the raw transport (`punktfunk_session_*`), which the ho
 
 ```sh
 cc -std=c11 -DPUNKTFUNK_FEATURE_QUIC -I include -c myclient.c
-cc myclient.o -L target/release -lpunktfunk_core -o myclient          # dynamic
-NATIVE=$(cargo rustc -p punktfunk-core --features quic --release --lib --crate-type staticlib \
+cc myclient.o -L target/release -lpunktfunk_ffi -o myclient          # dynamic
+NATIVE=$(cargo rustc -p punktfunk-ffi --features quic --release --lib --crate-type staticlib \
   -- --print native-static-libs 2>&1 | sed -n 's/.*native-static-libs: //p' | tail -1)
-cc myclient.o target/release/libpunktfunk_core.a $NATIVE -o myclient     # static
+cc myclient.o target/release/libpunktfunk_ffi.a $NATIVE -o myclient     # static
 ```
 
 To cross-compile, `rustup target add <triple>`, set `CC_<triple>` and
 `CARGO_TARGET_<TRIPLE>_LINKER` to your SDK's compiler, and add `--target <triple>`. The QUIC build
 compiles aws-lc (TLS) and libopus from C, so the target needs a working C compiler. Apple builds go
-through `scripts/build-xcframework.sh`, which packs the core into `PunktfunkCore.xcframework` with
+through `scripts/build-xcframework.sh`, which packs the C ABI into `PunktfunkCore.xcframework` with
 `PUNKTFUNK_FEATURE_QUIC` already defined. Toolchain setup:
 [Build from source](/docs/developers/build-from-source).
 
@@ -109,12 +110,14 @@ you set the bit. `video_codecs = 0` means HEVC only.
 | `gamepad`, `compositor` | `PUNKTFUNK_GAMEPAD_*` / `PUNKTFUNK_COMPOSITOR_*`; 0 lets the host pick. |
 | `bitrate_kbps` | 0 = host default. |
 | `client_caps` | `PUNKTFUNK_CLIENT_CAP_CURSOR` only if you draw the cursor yourself. |
+| `video_fit` | `PUNKTFUNK_VIDEO_FIT_*`: how your view fills when the frame's shape differs. |
+| `preset_id`, `preset_name` | The settings preset this dial names; the host shows it and hands it to hooks. |
 | `pin_sha256`, `client_cert_pem`, `client_key_pem`, `device_name` | Trust and identity (above). |
 | `launch_id` | `steam:<appid>` or `custom:<id>` to start a library title. |
 | `timeout_ms` | Bounds the whole connect, including a wait for approval. |
 
-The positional `punktfunk_connect` to `punktfunk_connect_ex12` stay for existing callers; new
-options land only in the struct. `video_fit` is the one option only `punktfunk_connect_ex12` takes.
+The positional `punktfunk_connect` to `punktfunk_connect_ex12` stay for existing callers and are
+frozen; new options land only in the struct.
 
 After connect, build your decoder and presenter from what the host chose, never from your request:
 `punktfunk_connection_codec`, `_color_info` (CICP; transfer 16 or 18 is HDR), `_chroma_format`,
@@ -218,4 +221,4 @@ int main(int argc, char **argv) {
 A real client throttles the keyframe request, persists the identity and `host_fp`, and runs audio
 and feedback on their own threads. For a complete client over the same API, read
 [`crates/pf-client-core/src/session.rs`](https://git.unom.io/unom/punktfunk/src/branch/main/crates/pf-client-core/src/session.rs).
-`bash crates/punktfunk-core/tests/c/run.sh` proves the static library links from C on your machine.
+`bash crates/punktfunk-ffi/tests/c/run.sh` proves the static library links from C on your machine.

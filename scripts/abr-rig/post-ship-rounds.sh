@@ -29,11 +29,10 @@ row() { # <tag> <profile> <seconds> <probes> [env assignments…]
   echo "  $tag rc=$rc"
 }
 
-# Build once; every run below measures the same binaries.
+# Build up front; every later run's cargo build is a no-op.
 echo "== build =="
-PF_RIG_SKIP_BUILD=0 "$HERE/run.sh" nowall_720p 1 > "$OUT/ps-build.run" 2>&1
+"$HERE/run.sh" nowall_720p 1 > "$OUT/ps-build.run" 2>&1
 echo "  build rc=$?"
-export PF_RIG_SKIP_BUILD=1
 # The ramp's per-step lines and the drain guard's are debug.
 export RUST_LOG=${RUST_LOG:-info,punktfunk_core::abr=debug}
 

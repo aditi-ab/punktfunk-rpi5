@@ -6,7 +6,7 @@
 //! ordinary [`ClipControl`]/[`ClipOffer`] messages ([`crate::client`] routes those);
 //! only bulk bytes flow here, over [`crate::quic::clipstream`] fetch bi-streams.
 //!
-//! No OS pasteboard. The C ABI ([`crate::abi`]) is the event/command seam: a native
+//! No OS pasteboard. The C ABI (`punktfunk-ffi`) is the event/command seam: a native
 //! client polls offers and fetch-requests and answers with bytes.
 
 use std::collections::HashMap;

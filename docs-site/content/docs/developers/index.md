@@ -32,5 +32,5 @@ it, or rustfmt reformats files you never touched. Then enable the git hooks:
 | [Releasing](/docs/developers/releasing) | Cut a stable release (maintainers) |
 | [Management API](/docs/developers/management-api) | Script the host over its REST API |
 | [Writing plugins](/docs/developers/writing-plugins) | Add a library source or automation to the host |
-| [Embedding](/docs/developers/embedding) | Link `punktfunk-core` into your own client |
+| [Embedding](/docs/developers/embedding) | Link the C ABI (`punktfunk-ffi`) into your own client |
 | [Multi-seat contract](/docs/developers/multi-seat-contract) | Change how the Windows host shares one box between players |

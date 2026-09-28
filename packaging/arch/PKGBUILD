@@ -158,7 +158,7 @@ package_punktfunk-host() {
   pkgdesc="Low-latency desktop/game streaming HOST (Moonlight-compatible + punktfunk/1)"
   # NVENC + GPU EGL/CUDA come from the NVIDIA driver (nvidia-utils) — kept an optdepend, never a
   # hard dep, exactly as the RPM (__requires_exclude libcuda) and deb (shlibdeps filter) do.
-  # The host captures the sink monitor through NATIVE PipeWire (audio/linux.rs) — it never
+  # The host captures the sink monitor through NATIVE PipeWire (pf-audio) — it never
   # opens a Pulse socket itself, so pipewire-pulse is an OPTdepend, not a depend: it exists
   # for the GAMES, which commonly emit through the PulseAudio API. Hard-depending on it made
   # the package uninstallable next to real `pulseaudio`, which serves those games just as well.

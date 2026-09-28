@@ -3174,7 +3174,7 @@ mod tests {
     }
 
     /// Pull and byte-verify `count` synthetic frames through the C ABI connection.
-    unsafe fn pull_verified(conn: *mut punktfunk_core::abi::PunktfunkConnection, count: u32) {
+    unsafe fn pull_verified(conn: *mut punktfunk_ffi::PunktfunkConnection, count: u32) {
         use punktfunk_core::error::PunktfunkStatus;
         let mut got = 0u32;
         // SAFETY: `PunktfunkFrame` is `#[repr(C)]` POD; all-zero is valid (null `data`, `len == 0`).
@@ -3184,9 +3184,7 @@ mod tests {
             // SAFETY: `conn` is the live handle from `punktfunk_connect` (caller asserts non-null,
             // does not close until after return). `&mut frame` outlives this call. This thread is
             // the only video puller.
-            match unsafe {
-                punktfunk_core::abi::punktfunk_connection_next_au(conn, &mut frame, 2000)
-            } {
+            match unsafe { punktfunk_ffi::punktfunk_connection_next_au(conn, &mut frame, 2000) } {
                 PunktfunkStatus::Ok => {
                     // SAFETY: on `Ok`, `frame.data`/`len` is the connection-owned AU, valid until the
                     // next `next_au` on this handle. We read the whole slice before that next call.
@@ -3218,11 +3216,11 @@ mod tests {
     fn c_abi_connection_roundtrip() {
         let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        use punktfunk_core::abi::{
+        use punktfunk_core::error::PunktfunkStatus;
+        use punktfunk_ffi::{
             punktfunk_connect, punktfunk_connection_close, punktfunk_connection_mode,
             punktfunk_connection_send_input,
         };
-        use punktfunk_core::error::PunktfunkStatus;
 
         let host = std::thread::spawn(|| {
             run_ephemeral(Punktfunk1Options {
@@ -3276,9 +3274,7 @@ mod tests {
 
         // Mid-stream renegotiation: request a new mode; `punktfunk_connection_mode` reflects it.
         // SAFETY: `conn` is the live handle; remaining args are by-value. Handle outlives enqueue.
-        let st = unsafe {
-            punktfunk_core::abi::punktfunk_connection_request_mode(conn, 1920, 1080, 144)
-        };
+        let st = unsafe { punktfunk_ffi::punktfunk_connection_request_mode(conn, 1920, 1080, 144) };
         assert_eq!(st, PunktfunkStatus::Ok);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -3382,12 +3378,12 @@ mod tests {
     /// A `synthetic-abr` session publishes a registry row while it streams and retires it
     /// when it ends. The row's id is the one the control task reads off the session's
     /// counters before it asks the governor for a share, so a source that never registers
-    /// leaves a shared path undivided.
+    /// leaves a shared path undivided. The row names the preset this dial carried.
     #[test]
     fn a_synthetic_abr_session_registers_while_it_streams() {
         let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        use punktfunk_core::client::NativeClient;
+        use punktfunk_core::client::{ConnectParams, NativeClient};
 
         let host = std::thread::spawn(|| {
             run_ephemeral(Punktfunk1Options {
@@ -3420,26 +3416,10 @@ mod tests {
             height: 720,
             refresh_hz: 60,
         };
-        let client = NativeClient::connect(
-            "127.0.0.1",
-            19782,
-            mode,
-            CompositorPref::Auto,
-            GamepadPref::Auto,
-            0,
-            0,
-            2,
-            0,
-            0,
-            None,
-            0,
-            false,
-            None,
-            None,
-            None,
-            None,
-            std::time::Duration::from_secs(10),
-        )
+        let client = NativeClient::connect(ConnectParams {
+            preset: punktfunk_core::quic::SessionPreset::new("dock-1", "Docked"),
+            ..ConnectParams::new("127.0.0.1", 19782, mode, std::time::Duration::from_secs(10))
+        })
         .expect("client connects to the synthetic-abr host");
 
         // The registry is process-global and the session_status tests register their own
@@ -3465,6 +3445,7 @@ mod tests {
             "0 is the id the control task skips the governor on"
         );
         assert_eq!(row.plane, crate::events::Plane::Native);
+        assert_eq!(row.preset_name.as_deref(), Some("Docked"));
 
         drop(client);
         host.join().unwrap().unwrap();
@@ -3481,7 +3462,7 @@ mod tests {
     fn clipboard_control_and_fetch_decline_over_session() {
         let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        use punktfunk_core::client::NativeClient;
+        use punktfunk_core::client::{ConnectParams, NativeClient};
         use punktfunk_core::clipboard::ClipEventCore;
         use punktfunk_core::quic::{
             CLIP_FILE_INDEX_NONE, CLIP_FLAG_FILES, CLIP_POLICY_FILES, HOST_CAP_CLIPBOARD,
@@ -3526,26 +3507,12 @@ mod tests {
             height: 720,
             refresh_hz: 60,
         };
-        let client = NativeClient::connect(
+        let client = NativeClient::connect(ConnectParams::new(
             "127.0.0.1",
             19781,
             mode,
-            CompositorPref::Auto,
-            GamepadPref::Auto,
-            0,
-            0,
-            2,
-            0,
-            0,
-            None,
-            0,
-            false,
-            None,
-            None,
-            None,
-            None,
             std::time::Duration::from_secs(10),
-        )
+        ))
         .expect("client connects to synthetic host");
 
         assert_ne!(
@@ -3614,7 +3581,7 @@ mod tests {
     fn delegated_approval_admits_after_knock() {
         let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        use punktfunk_core::client::NativeClient;
+        use punktfunk_core::client::{ConnectParams, NativeClient};
         use punktfunk_core::quic::endpoint;
 
         let store =
@@ -3694,26 +3661,12 @@ mod tests {
         });
 
         // One connect that parks until approved, then streams. Timeout covers park + approver poll.
-        let client = NativeClient::connect(
-            "127.0.0.1",
-            19779,
-            mode,
-            CompositorPref::Auto,
-            GamepadPref::Auto,
-            0,
-            0,
-            2,
-            0,
-            0,
-            None,
-            0,
-            false,
-            None,
-            None, // no Hello name — assert the fingerprint-derived label
-            None, // TOFU; approval, not a PIN, authorizes this client
-            Some((cert, key)),
-            std::time::Duration::from_secs(15),
-        )
+        // No Hello name: assert the fingerprint-derived label. TOFU: approval, not a PIN,
+        // authorizes this client.
+        let client = NativeClient::connect(ConnectParams {
+            identity: Some((cert, key)),
+            ..ConnectParams::new("127.0.0.1", 19779, mode, std::time::Duration::from_secs(15))
+        })
         .expect("approved mid-park → session admitted with no reconnect");
         approver.join().unwrap();
         assert!(
@@ -3756,7 +3709,7 @@ mod tests {
     fn pairing_ceremony_and_gate() {
         let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        use punktfunk_core::client::NativeClient;
+        use punktfunk_core::client::{ConnectParams, NativeClient};
         use punktfunk_core::quic::endpoint;
 
         let host = std::thread::spawn(|| {
@@ -3788,27 +3741,7 @@ mod tests {
 
         // 1: anonymous session on a pairing-required host → rejected.
         assert!(
-            NativeClient::connect(
-                "127.0.0.1",
-                19778,
-                mode,
-                CompositorPref::Auto,
-                GamepadPref::Auto,
-                0,
-                0,
-                2,
-                0,
-                0,
-                None,
-                0,
-                false,
-                None,
-                None,
-                None,
-                None,
-                timeout
-            )
-            .is_err(),
+            NativeClient::connect(ConnectParams::new("127.0.0.1", 19778, mode, timeout)).is_err(),
             "anonymous session must be rejected"
         );
 
@@ -3819,26 +3752,11 @@ mod tests {
         assert!(test_paired_path().exists());
 
         // 3: paired identity gets a session, pinned to the ceremony fingerprint.
-        let client = NativeClient::connect(
-            "127.0.0.1",
-            19778,
-            mode,
-            CompositorPref::Auto,
-            GamepadPref::Auto,
-            0,
-            0,
-            2,
-            0,
-            0,
-            None,
-            0,
-            false,
-            None,
-            None,
-            Some(host_fp),
-            Some((cert.clone(), key.clone())),
-            timeout,
-        )
+        let client = NativeClient::connect(ConnectParams {
+            pin: Some(host_fp),
+            identity: Some((cert.clone(), key.clone())),
+            ..ConnectParams::new("127.0.0.1", 19778, mode, timeout)
+        })
         .expect("paired session");
         assert_eq!(client.host_fingerprint, host_fp);
         // Welcome reports a concrete backend. Do not pin which: `PUNKTFUNK_GAMEPAD` may be set.
@@ -4194,7 +4112,7 @@ mod tests {
     fn launch_refused_without_grant_but_session_admitted() {
         let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        use punktfunk_core::client::NativeClient;
+        use punktfunk_core::client::{ConnectParams, NativeClient};
         use punktfunk_core::quic::endpoint;
 
         let store = access_store_path("launch");
@@ -4223,26 +4141,12 @@ mod tests {
         };
 
         // 1: launch without LAUNCH → typed pre-handshake refusal (`NativeClient` has no Debug).
-        let refused = NativeClient::connect(
-            "127.0.0.1",
-            19784,
-            mode,
-            CompositorPref::Auto,
-            GamepadPref::Auto,
-            0,
-            0,
-            2,
-            0,
-            0,
-            None,
-            0,
-            false,
-            Some("steam:570".into()),
-            Some("Guest Pad".into()),
-            None,
-            Some((cert.clone(), key.clone())),
-            timeout,
-        );
+        let refused = NativeClient::connect(ConnectParams {
+            launch: Some("steam:570".into()),
+            name: Some("Guest Pad".into()),
+            identity: Some((cert.clone(), key.clone())),
+            ..ConnectParams::new("127.0.0.1", 19784, mode, timeout)
+        });
         match refused {
             Ok(_) => panic!("a launch without the grant must be refused"),
             Err(punktfunk_core::PunktfunkError::Rejected(r)) => assert_eq!(
@@ -4254,26 +4158,11 @@ mod tests {
         }
 
         // 2: same device without a launch is admitted.
-        let client = NativeClient::connect(
-            "127.0.0.1",
-            19784,
-            mode,
-            CompositorPref::Auto,
-            GamepadPref::Auto,
-            0,
-            0,
-            2,
-            0,
-            0,
-            None,
-            0,
-            false,
-            None,
-            Some("Guest Pad".into()),
-            None,
-            Some((cert, key)),
-            timeout,
-        )
+        let client = NativeClient::connect(ConnectParams {
+            name: Some("Guest Pad".into()),
+            identity: Some((cert, key)),
+            ..ConnectParams::new("127.0.0.1", 19784, mode, timeout)
+        })
         .expect("controller-only session without a launch must be admitted");
         drop(client);
         let _ = std::fs::remove_file(&store);
@@ -4286,7 +4175,7 @@ mod tests {
     fn unknown_launch_reaches_the_client_as_a_refusal() {
         let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        use punktfunk_core::client::NativeClient;
+        use punktfunk_core::client::{ConnectParams, NativeClient};
         use punktfunk_core::quic::{endpoint, LaunchOutcomeKind};
 
         let store = access_store_path("launch-outcome");
@@ -4297,30 +4186,21 @@ mod tests {
         np.add_with_access("Launcher", &fp_hex, None).unwrap();
         let host = spawn_access_host(19786, 1, np);
         std::thread::sleep(std::time::Duration::from_millis(500));
-        let client = NativeClient::connect(
-            "127.0.0.1",
-            19786,
-            punktfunk_core::Mode {
-                width: 1280,
-                height: 720,
-                refresh_hz: 60,
-            },
-            CompositorPref::Auto,
-            GamepadPref::Auto,
-            0,
-            0,
-            2,
-            0,
-            0,
-            None,
-            0,
-            false,
-            Some("pf-test:no-such-title".into()),
-            Some("Launcher".into()),
-            None,
-            Some((cert, key)),
-            std::time::Duration::from_secs(10),
-        )
+        let client = NativeClient::connect(ConnectParams {
+            launch: Some("pf-test:no-such-title".into()),
+            name: Some("Launcher".into()),
+            identity: Some((cert, key)),
+            ..ConnectParams::new(
+                "127.0.0.1",
+                19786,
+                punktfunk_core::Mode {
+                    width: 1280,
+                    height: 720,
+                    refresh_hz: 60,
+                },
+                std::time::Duration::from_secs(10),
+            )
+        })
         .expect("an unresolvable launch still admits the session");
         // A cold library scan decides the refusal; it can take seconds.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -4345,7 +4225,7 @@ mod tests {
     fn expired_record_knocks_into_pending_and_reapproval_regrants() {
         let _registry = crate::session_status::tests::registry_lock();
         let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        use punktfunk_core::client::NativeClient;
+        use punktfunk_core::client::{ConnectParams, NativeClient};
         use punktfunk_core::quic::endpoint;
 
         let store = access_store_path("regrant");
@@ -4404,30 +4284,20 @@ mod tests {
                 .expect("re-approval");
         });
 
-        let client = NativeClient::connect(
-            "127.0.0.1",
-            19785,
-            punktfunk_core::Mode {
-                width: 1280,
-                height: 720,
-                refresh_hz: 60,
-            },
-            CompositorPref::Auto,
-            GamepadPref::Auto,
-            0,
-            0,
-            2,
-            0,
-            0,
-            None,
-            0,
-            false,
-            None,
-            Some("Yesterday's Guest".into()),
-            None,
-            Some((cert, key)),
-            std::time::Duration::from_secs(15),
-        )
+        let client = NativeClient::connect(ConnectParams {
+            name: Some("Yesterday's Guest".into()),
+            identity: Some((cert, key)),
+            ..ConnectParams::new(
+                "127.0.0.1",
+                19785,
+                punktfunk_core::Mode {
+                    width: 1280,
+                    height: 720,
+                    refresh_hz: 60,
+                },
+                std::time::Duration::from_secs(15),
+            )
+        })
         .expect("re-approved mid-park → session admitted with no reconnect");
         approver.join().unwrap();
         // Re-grant in force: controller-only.

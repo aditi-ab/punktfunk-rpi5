@@ -302,7 +302,7 @@ FENCE_ALLOW = re.compile(r'#!\s*\[\s*allow\s*\(\s*unsafe_op_in_unsafe_fn')
 FORBID = re.compile(r'#!\s*\[\s*forbid\s*\(\s*unsafe_code')
 REPRC = re.compile(r'#\s*\[\s*repr\s*\(\s*C')
 # NOTE: the `const _: () = { ... };` BLOCK form is as common in this tree as the direct
-# `const _: () = assert!(...)` form (18 files use it, incl. abi.rs, gamepad.rs and
+# `const _: () = assert!(...)` form (18 files use it, incl. the C ABI, gamepad.rs and
 # idd_push/probes.rs). An earlier version of this regex matched only the direct form and
 # therefore reported 102 unguarded repr(C) declarations where the true number is 60 —
 # it counted three well-guarded files as defenceless. Keep both alternatives.
@@ -520,10 +520,6 @@ def main():
     tnon = sum(v for k, v in tt.items() if not k.startswith("ffi_call"))
     print(f"  of which in #[cfg(test)]: ffi={tffi} nonFFI={tnon}")
     print(f"  SHIPPED non-FFI ops : {nonffi - tnon}   <-- PRIMARY METRIC (test code excluded)")
-    abi = [r for r in allrecs if r["path"].endswith("punktfunk-core/src/abi.rs")]
-    if abi:
-        a = sum(v for k, v in abi[0]["ops"].items() if not k.startswith("ffi_call"))
-        print(f"  minus abi.rs (client SDK C boundary, host uses it only in tests): {nonffi - tnon - a}")
 
     print()
     print("=" * 100)

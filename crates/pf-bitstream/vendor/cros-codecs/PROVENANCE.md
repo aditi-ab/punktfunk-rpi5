@@ -9,7 +9,7 @@
 - **Why vendored, not a crates.io dependency:** the GitHub repo is a read-only mirror
   and the crates.io release lags it; a pinned, reviewed snapshot is the supply-chain
   posture punktfunk already uses elsewhere (`clients/android/native/vendor/ndk`,
-  `punktfunk-host/vendor/usbip-sim`). Decision of record:
+  `pf-inject/vendor/usbip-sim`). Decision of record:
   punktfunk-planning `design/client-native-decode.md` §8.1.
 
 ## What was taken

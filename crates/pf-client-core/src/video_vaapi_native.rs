@@ -1399,7 +1399,7 @@ fn export(
     }
     let mut sync_fds = Vec::with_capacity(fds.len());
     for fd in &fds {
-        match pf_zerocopy::dmabuf_fence::export_sync_file(fd.as_fd()) {
+        match pf_dmabuf::fence::export_sync_file(fd.as_fd()) {
             Ok(Some(sync)) => sync_fds.push(sync),
             Ok(None) => {}
             Err(e) => {
@@ -2255,7 +2255,7 @@ mod tests {
             // The fence the presenter would wait: how long after the call it signals, and
             // whether the kernel handed one out at all.
             if let Some(f) = &frame {
-                use pf_zerocopy::dmabuf_fence::{wait_sync_file, WaitOutcome};
+                use pf_dmabuf::fence::{wait_sync_file, WaitOutcome};
                 match f.sync_fds.first() {
                     None => fence_outcomes[0] += 1,
                     Some(fd) => {

@@ -53,7 +53,7 @@ pub const ENCODER_ENCODING: u32 = 2;
 /// answers with [`ENCODE_CTL_RESET`](super::ENCODE_CTL_RESET) and `detached` gains one.
 pub const ENCODER_WEDGED: u32 = 3;
 
-/// [`AuSlot::flags`], mirroring `pf_encode_win::AuChunk`: opens an access unit. AU metadata
+/// [`AuSlot::flags`], mirroring `pf_encode_core::AuChunk`: opens an access unit. AU metadata
 /// is authoritative on this slot — the host opens the wire frame from it.
 pub const AU_FIRST: u32 = 1 << 0;
 /// Closes the access unit and releases the encoder's in-flight slot.

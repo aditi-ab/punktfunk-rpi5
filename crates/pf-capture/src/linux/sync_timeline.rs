@@ -13,7 +13,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use pf_zerocopy::dmabuf_fence::WaitOutcome;
+use pf_dmabuf::fence::WaitOutcome;
 use pipewire as pw;
 use pw::spa;
 

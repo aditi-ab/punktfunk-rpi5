@@ -280,8 +280,7 @@ in
         gsettings-desktop-schemas
         adwaita-icon-theme
         libxkbcommon
-        libGL # pf-zerocopy (via pf-client-core) `#[link(name = "GL")]`
-        gbm # pf-zerocopy (via pf-client-core) `#[link(name = "gbm")]`
+        libGL
         vulkan-loader # ash presenter + Vulkan-Video decode (loaded at runtime)
         libva # pf-vaapi decode; dlopen'd, so the postFixup below is what actually finds it
       ];

@@ -1279,30 +1279,24 @@ from the config directory for a true factory reset."
                 return CONNECT_FAILED;
             }
         };
-        let client = match punktfunk_core::client::NativeClient::connect(
-            &host.addr,
-            host.port,
-            punktfunk_core::config::Mode {
-                width: 1280,
-                height: 720,
-                refresh_hz: 60,
-            },
-            punktfunk_core::config::CompositorPref::Auto,
-            punktfunk_core::config::GamepadPref::Auto,
-            0,     // bitrate_kbps: the host's default; this connect never presents
-            0,     // video_caps: nothing decodes here
-            2,     // audio_channels
-            0,     // video_codecs: the probe carries no video
-            0,     // preferred_codec
-            None,  // display_hdr
-            0,     // client_caps: nothing renders a cursor
-            false, // frame_parts: probe/whole-AU consumer
-            None,  // launch
-            Some(punktfunk_core::client::device_name()),
-            Some(pin),
-            Some(identity),
-            Duration::from_secs(15),
-        ) {
+        // Every Hello field at its default: this connect only runs the probe and never presents.
+        let mode = punktfunk_core::config::Mode {
+            width: 1280,
+            height: 720,
+            refresh_hz: 60,
+        };
+        let params = punktfunk_core::client::ConnectParams {
+            name: Some(punktfunk_core::client::device_name()),
+            pin: Some(pin),
+            identity: Some(identity),
+            ..punktfunk_core::client::ConnectParams::new(
+                &host.addr,
+                host.port,
+                mode,
+                Duration::from_secs(15),
+            )
+        };
+        let client = match punktfunk_core::client::NativeClient::connect(params) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("connect: {e:?}");

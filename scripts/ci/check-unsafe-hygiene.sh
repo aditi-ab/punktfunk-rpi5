@@ -17,7 +17,7 @@
 #   B. `unwrap`/`expect`/`panic!` inside an `extern "C"` / `extern "system"` fn body. Panic across
 #      an `extern` boundary is an abort since Rust 1.81 — not a diagnostic, not a sanitizer
 #      finding, not fuzzable (8b98d0b3: an ETW callback's `RING.lock().unwrap()` aborted the host
-#      on a poisoned lock). A body that routes through `catch_unwind` (the abi.rs pattern) is
+#      on a poisoned lock). A body that routes through `catch_unwind` (the C ABI's pattern) is
 #      exempt; otherwise waive a deliberate abort with `// panic-in-extern-ok: <reason>` directly
 #      above the fn.
 #
@@ -154,7 +154,7 @@ END { exit bad ? 1 : 0 }
 ' $(cat "$tmp/files") > "$tmp/gate_b" 2>&1
 if [ -s "$tmp/gate_b" ]; then
     echo "GATE B — panic across an extern boundary aborts the process since Rust 1.81. Route the"
-    echo "         body through catch_unwind (see punktfunk-core abi.rs) or waive a deliberate"
+    echo "         body through catch_unwind (see punktfunk-ffi) or waive a deliberate"
     echo "         abort with '// panic-in-extern-ok: <reason>' on the line above the fn:"
     cat "$tmp/gate_b"
     fail=1
@@ -182,7 +182,7 @@ crates/pf-vkdecode/tests/common/mod.rs:1
 crates/pf-vkdecode/tests/gpu_parity.rs:2
 crates/pf-win-display/src/win_display.rs:2
 crates/punktfunk-core/src/quic/endpoint.rs:2
-crates/punktfunk-host/src/identity.rs:3
+crates/punktfunk-host/src/hostsys/identity.rs:3
 crates/punktfunk-host/src/library/art.rs:2
 crates/punktfunk-host/src/main.rs:1
 crates/punktfunk-host/src/mgmt/tests.rs:3

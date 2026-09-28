@@ -389,6 +389,13 @@ impl MgrInner {
         mons.sort_by_key(|m| m.generation);
         mons.iter().map(|m| m.ccd_key()).collect()
     }
+
+    /// The managed keep-set once `new` joins: every live sibling, then `new`.
+    fn keep_with(&self, new: CcdTargetKey) -> Vec<CcdTargetKey> {
+        let mut keep = self.target_keys();
+        keep.push(new);
+        keep
+    }
 }
 
 /// Device-level watchdog pinger, running while any slot lives (any IOCTL
@@ -1344,68 +1351,16 @@ impl VirtualDisplayManager {
         // Gate on an opened device: the version is 0 until the handshake ran, and the capture
         // layer must not create a section nobody will publish into.
         let hw_cursor = hw_cursor && self.driver_proto.load(Ordering::Relaxed) != 0;
-        // PRE-MUTATION baseline for the standby-sink selector (immunity plan WP3a): the targets
-        // active before this acquire mutates the set. `None` is not an empty baseline — a target
-        // missing from one is a disable candidate, so a failed read would nominate the
-        // operator's own display, and the pass is skipped instead.
-        let baseline_active: Option<Vec<CcdTargetKey>> =
-            if inner.slots.is_empty() && crate::policy::prefs().standby_sink_neutralise() {
-                // A FRESH read through the display actor (it runs the query, off this thread).
-                // A re-stamped last-known-good carries `failures > 0` and is not a baseline.
-                pf_win_display::display_events::refresh_and_wait(Duration::from_millis(500))
-                    .filter(|s| s.is_fresh())
-                    .map(|s| {
-                        s.targets
-                            .iter()
-                            .filter(|t| t.active)
-                            .map(|t| t.key)
-                            .collect()
-                    })
-                    // Actor slow or not running: one direct query on this thread. Its `Err`
-                    // is the case that must not become an empty baseline.
-                    .or_else(|| {
-                        pf_win_display::win_display::target_inventory_checked()
-                            .ok()
-                            .map(|ts| ts.iter().filter(|t| t.active).map(|t| t.key).collect())
-                    })
-            } else {
-                None
-            };
+        let first_member = inner.slots.is_empty();
+        let baseline_active = if first_member && crate::policy::prefs().standby_sink_neutralise() {
+            standby_baseline()
+        } else {
+            None
+        };
         let added =
             self.driver
                 .add_monitor(dev, mode, render_pin, preferred_id, client_hdr, hw_cursor)?;
-        // A taken `preferred_monitor_id` is not refused by the driver: it falls back to the
-        // lowest free connector across the whole device. Losing DPI persistence that way is
-        // survivable, so an unreserved host still takes what it is given, exactly as before.
-        // Landing in someone else's range is not survivable, and nothing else would notice.
-        let missed_seat_slot = slot_plan
-            .seat_slot()
-            .is_some_and(|slot| added.resolved_monitor_id != slot);
-        let crossed_out_of_range = slot_plan
-            .ordinary_max()
-            .is_some_and(|max| added.resolved_monitor_id > max);
-        if missed_seat_slot || crossed_out_of_range {
-            let resolved_id = added.resolved_monitor_id;
-            // `added.key` names the fallback monitor the successful ADD created.
-            let cleanup = self.driver.remove_monitor(dev, &added.key);
-            let reason = match slot_plan.seat_slot() {
-                Some(slot) => format!("this seat's connector {slot}"),
-                None => format!(
-                    "the console connector range 0..={}",
-                    slot_plan.ordinary_max().expect("console plan has a bound")
-                ),
-            };
-            if let Err(error) = cleanup {
-                anyhow::bail!(
-                    "pf-vdisplay assigned connector slot {resolved_id} outside {reason}; refusing \
-                     cross-slot fallback, and cleanup failed: {error:#}"
-                );
-            }
-            anyhow::bail!(
-                "pf-vdisplay assigned connector slot {resolved_id} outside {reason}; removed the \
-                 fallback monitor and refused cross-slot attachment"
-            );
-        }
+        self.refuse_cross_slot(dev, slot_plan, &added)?;
         let added_key =
             CcdTargetKey::from_luid_parts(added.luid.LowPart, added.luid.HighPart, added.target_id);
 
@@ -1427,8 +1382,7 @@ impl VirtualDisplayManager {
                 );
                 // ADD only advertises; force the mode so DXGI captures the requested size. CCD
                 // takes it as data; GDI can only pick from an enumeration that has not refreshed
-                // this soon after arrival. Exclusive: first member captures restore, later ones
-                // re-isolate the grown set. Primary/Extend leave physicals lit.
+                // this soon after arrival.
                 if !pf_win_display::win_display::set_active_mode_ccd(added_key, mode)
                     && !set_active_mode(n, mode)
                 {
@@ -1438,126 +1392,7 @@ impl VirtualDisplayManager {
                         "neither CCD nor GDI wrote the mode — the display stays on the one it runs"
                     );
                 }
-                use crate::policy::Topology;
-                let first_member = inner.slots.is_empty();
-                // Host topology: the CCD isolate is a property of the whole managed GROUP,
-                // not of one member, so a per-device topology has no meaning here — the
-                // first member's answer already governs the group (design §6.1).
-                match topology_action(None) {
-                    Topology::Exclusive => {
-                        // The managed keep-set: every live sibling + the new monitor.
-                        let mut keep = inner.target_keys();
-                        keep.push(added_key);
-                        if first_member {
-                            // DDC off BEFORE isolate: an HMONITOR (and the DDC
-                            // channel) exists only while the display is still
-                            // active. First member only — physicals are already
-                            // dark for a sibling. Evidence: `windows/ddc.rs`.
-                            if crate::policy::prefs().ddc_power_off() {
-                                inner.group.ddc_panels_off = crate::ddc::panel_off_except(n);
-                            }
-                            // Pin AMD connector EDID before isolate so an
-                            // awake sink still answers the live-EDID read.
-                            // Emulation outlives the process. First member
-                            // only. Evidence: `pf_win_display::adl_emul`.
-                            if crate::policy::prefs().edid_lock() {
-                                inner.group.edid_locked =
-                                    pf_win_display::adl_emul::lock_for_stream();
-                            }
-                            // The acquire isolate is a topology TRANSACTION (immunity plan
-                            // WP10/WP11): descriptor-following holds for its deadline, the
-                            // generation moves only on an OBSERVED change, and the PnP leases
-                            // below are stamped with it.
-                            let txn = pf_win_display::topology_churn::begin(
-                                "acquire-isolate",
-                                Duration::from_secs(3),
-                            );
-                            let isolated = isolate_displays_ccd_checked_seam(&keep);
-                            let outcome = isolated.as_ref().map(|(_, o)| *o);
-                            inner.group.ccd_saved = isolated.map(|(saved, _)| saved);
-                            let finished = pf_win_display::topology_churn::finish(
-                                txn,
-                                isolate_txn_outcome(outcome),
-                            );
-                            // After isolate, disable deactivated monitor PnP
-                            // devnodes so standby wake events do not cascade.
-                            // Evidence: `windows/monitor_devnode.rs`.
-                            if crate::policy::prefs().pnp_disable_monitors() {
-                                if let Some(saved) = &inner.group.ccd_saved {
-                                    inner.group.pnp_disabled =
-                                        pf_win_display::monitor_devnode::disable_for_deactivated(
-                                            saved,
-                                            added_key,
-                                            finished.generation,
-                                        );
-                                }
-                            }
-                            // Verified isolate is not durable — see `ensure_exclusive_watch`.
-                            inner.group.ccd_exclusive = inner.group.ccd_saved.is_some();
-                            if inner.group.ccd_exclusive {
-                                self.ensure_exclusive_watch();
-                            }
-                        } else {
-                            // Re-isolate so the fresh member joins the
-                            // composited set. Discard the snapshot unless the
-                            // first member's isolate failed — then adopt this
-                            // one, or teardown cannot restore the physicals.
-                            let snap = isolate_displays_ccd_seam(&keep);
-                            if inner.group.ccd_saved.is_none() {
-                                if let Some(snap) = snap {
-                                    tracing::warn!(
-                                        "display isolate (CCD): the first member captured no restore \
-                                         snapshot (its isolate failed) — adopting this member's, so \
-                                         teardown can still put the physical displays back"
-                                    );
-                                    inner.group.ccd_saved = Some(snap);
-                                    inner.group.ccd_exclusive = true;
-                                    self.ensure_exclusive_watch();
-                                }
-                            }
-                        }
-                    }
-                    Topology::Primary if first_member => {
-                        // force-EXTEND only when the virtual is the SOLE active display (the
-                        // headless auto-activate): on a lit physical the bare EXTEND preset
-                        // re-pulls persistence-DB modes and resets a 120 Hz panel to 60; the
-                        // reposition below re-supplies queried modes verbatim. An UNKNOWN
-                        // answer (query failed) also skips it — never mutate unverified state.
-                        let already_extended = match count_other_active(&[added_key]) {
-                            Some(n) => n > 0,
-                            None => {
-                                tracing::warn!(
-                                    "display topology=primary — CCD query failed; skipping the \
-                                     force-EXTEND (topology state unknown, mutating nothing extra)"
-                                );
-                                true
-                            }
-                        };
-                        if already_extended {
-                            tracing::info!(
-                                "display topology=primary — a physical display is already active; \
-                                 skipping force-EXTEND (preserves its refresh) before making the \
-                                 virtual primary"
-                            );
-                        } else {
-                            force_extend_topology();
-                            thread::sleep(Duration::from_millis(300));
-                        }
-                        inner.group.ccd_saved = set_virtual_primary_ccd(added_key);
-                    }
-                    Topology::Primary => {
-                        // A sibling already holds primary; the new member
-                        // just extends. Group layout arranges it.
-                        tracing::info!(
-                            "display topology=primary — sibling slot holds primary; new member extends"
-                        );
-                    }
-                    Topology::Extend | Topology::Auto => {
-                        tracing::info!(
-                            "display topology=extend — IDD stays extended (no isolate / no primary)"
-                        );
-                    }
-                }
+                self.apply_group_topology_on_add(inner, added_key, n, first_member);
                 // Verified-state wait before capture opens. Ceiling 1500 ms.
                 // A rejected mode burns the ceiling.
                 let settle_start = std::time::Instant::now();
@@ -1578,32 +1413,11 @@ impl VirtualDisplayManager {
                 // re-requesting the rate it actually has would pay a needless resize, while one
                 // re-requesting the phantom rate takes the plain JOIN branch and never tries again.
                 mode = committed_mode_or(added_key, mode);
-
-                // Connected-but-inactive sinks (standby TV) whose wake events
-                // the deactivated-set selector misses. After settle so force-
-                // EXTEND physicals are not still mid-activation. First member
-                // only; Extend leaves active panels untouched by construction.
-                // No baseline ⇒ no pass: see `baseline_active`.
-                if let (true, Some(baseline_active)) = (
-                    first_member && crate::policy::prefs().standby_sink_neutralise(),
-                    baseline_active.as_deref(),
-                ) {
-                    if let Some(rest) =
-                        Duration::from_millis(1500).checked_sub(settle_start.elapsed())
-                    {
-                        thread::sleep(rest);
-                    }
-                    let mut keep = inner.target_keys();
-                    keep.push(added_key);
-                    for id in pf_win_display::monitor_devnode::disable_connected_inactive(
-                        &keep,
-                        baseline_active,
-                        pf_win_display::topology_churn::generation(),
-                    ) {
-                        if !inner.group.pnp_disabled.contains(&id) {
-                            inner.group.pnp_disabled.push(id);
-                        }
-                    }
+                // No baseline ⇒ no pass: see `standby_baseline`.
+                if let Some(baseline) = baseline_active.as_deref()
+                    && crate::policy::prefs().standby_sink_neutralise()
+                {
+                    neutralise_standby_sinks(inner, added_key, baseline, settle_start);
                 }
             }
             None => tracing::warn!(
@@ -1629,6 +1443,168 @@ impl VirtualDisplayManager {
             // `acquire` records the creating device.
             client_fp: None,
         })
+    }
+
+    /// A taken `preferred_monitor_id` is not refused by the driver: it falls back to the
+    /// lowest free connector across the whole device. Losing DPI persistence that way is
+    /// survivable, so an unreserved host takes what it is given. Landing in someone else's
+    /// range is not, and nothing else would notice: remove that monitor and fail the ADD.
+    fn refuse_cross_slot(
+        &self,
+        dev: &ControlDevice,
+        slot_plan: super::identity::WindowsSlotPlan,
+        added: &AddedMonitor,
+    ) -> Result<()> {
+        let missed_seat_slot = slot_plan
+            .seat_slot()
+            .is_some_and(|slot| added.resolved_monitor_id != slot);
+        let crossed_out_of_range = slot_plan
+            .ordinary_max()
+            .is_some_and(|max| added.resolved_monitor_id > max);
+        if !missed_seat_slot && !crossed_out_of_range {
+            return Ok(());
+        }
+        let resolved_id = added.resolved_monitor_id;
+        // `added.key` names the fallback monitor the successful ADD created.
+        let cleanup = self.driver.remove_monitor(dev, &added.key);
+        let reason = match slot_plan.seat_slot() {
+            Some(slot) => format!("this seat's connector {slot}"),
+            None => format!(
+                "the console connector range 0..={}",
+                slot_plan.ordinary_max().expect("console plan has a bound")
+            ),
+        };
+        if let Err(error) = cleanup {
+            anyhow::bail!(
+                "pf-vdisplay assigned connector slot {resolved_id} outside {reason}; refusing \
+                 cross-slot fallback, and cleanup failed: {error:#}"
+            );
+        }
+        anyhow::bail!(
+            "pf-vdisplay assigned connector slot {resolved_id} outside {reason}; removed the \
+             fallback monitor and refused cross-slot attachment"
+        );
+    }
+
+    /// Host topology for a member that just activated as `gdi`. The CCD isolate is a property
+    /// of the whole managed GROUP, not of one member, so a per-device topology has no meaning
+    /// here — the first member's answer already governs the group (design §6.1). Exclusive:
+    /// the first member captures the restore, later ones re-isolate the grown set.
+    /// Primary/Extend leave physicals lit.
+    fn apply_group_topology_on_add(
+        &'static self,
+        inner: &mut MgrInner,
+        added_key: CcdTargetKey,
+        gdi: &str,
+        first_member: bool,
+    ) {
+        use crate::policy::Topology;
+        match topology_action(None) {
+            Topology::Exclusive if first_member => self.isolate_group_first(inner, added_key, gdi),
+            Topology::Exclusive => {
+                // Re-isolate so the fresh member joins the composited set. Discard the
+                // snapshot unless the first member's isolate failed — then adopt this one,
+                // or teardown cannot restore the physicals.
+                let snap = isolate_displays_ccd_seam(&inner.keep_with(added_key));
+                if inner.group.ccd_saved.is_none() {
+                    if let Some(snap) = snap {
+                        tracing::warn!(
+                            "display isolate (CCD): the first member captured no restore \
+                             snapshot (its isolate failed) — adopting this member's, so \
+                             teardown can still put the physical displays back"
+                        );
+                        inner.group.ccd_saved = Some(snap);
+                        inner.group.ccd_exclusive = true;
+                        self.ensure_exclusive_watch();
+                    }
+                }
+            }
+            Topology::Primary if first_member => {
+                // force-EXTEND only when the virtual is the SOLE active display (the
+                // headless auto-activate): on a lit physical the bare EXTEND preset
+                // re-pulls persistence-DB modes and resets a 120 Hz panel to 60; the
+                // reposition below re-supplies queried modes verbatim. An UNKNOWN
+                // answer (query failed) also skips it — never mutate unverified state.
+                let already_extended = match count_other_active(&[added_key]) {
+                    Some(n) => n > 0,
+                    None => {
+                        tracing::warn!(
+                            "display topology=primary — CCD query failed; skipping the \
+                             force-EXTEND (topology state unknown, mutating nothing extra)"
+                        );
+                        true
+                    }
+                };
+                if already_extended {
+                    tracing::info!(
+                        "display topology=primary — a physical display is already active; \
+                         skipping force-EXTEND (preserves its refresh) before making the \
+                         virtual primary"
+                    );
+                } else {
+                    force_extend_topology();
+                    thread::sleep(Duration::from_millis(300));
+                }
+                inner.group.ccd_saved = set_virtual_primary_ccd(added_key);
+            }
+            Topology::Primary => {
+                // A sibling already holds primary; the new member
+                // just extends. Group layout arranges it.
+                tracing::info!(
+                    "display topology=primary — sibling slot holds primary; new member extends"
+                );
+            }
+            Topology::Extend | Topology::Auto => {
+                tracing::info!(
+                    "display topology=extend — IDD stays extended (no isolate / no primary)"
+                );
+            }
+        }
+    }
+
+    /// Exclusive, first member: darken and pin what the isolate is about to deactivate, isolate
+    /// to the keep-set as one topology transaction, then PnP-disable the monitors it
+    /// deactivated and start the watchdog that keeps the isolate in place.
+    fn isolate_group_first(
+        &'static self,
+        inner: &mut MgrInner,
+        added_key: CcdTargetKey,
+        gdi: &str,
+    ) {
+        // DDC off BEFORE isolate: an HMONITOR (and the DDC channel) exists only while the
+        // display is still active. Evidence: `windows/ddc.rs`.
+        if crate::policy::prefs().ddc_power_off() {
+            inner.group.ddc_panels_off = crate::ddc::panel_off_except(gdi);
+        }
+        // Pin AMD connector EDID before isolate so an awake sink still answers the live-EDID
+        // read. Emulation outlives the process. Evidence: `pf_win_display::adl_emul`.
+        if crate::policy::prefs().edid_lock() {
+            inner.group.edid_locked = pf_win_display::adl_emul::lock_for_stream();
+        }
+        // The acquire isolate is a topology TRANSACTION (immunity plan WP10/WP11):
+        // descriptor-following holds for its deadline, the generation moves only on an
+        // OBSERVED change, and the PnP leases below are stamped with it.
+        let txn = pf_win_display::topology_churn::begin("acquire-isolate", Duration::from_secs(3));
+        let isolated = isolate_displays_ccd_checked_seam(&inner.keep_with(added_key));
+        let outcome = isolated.as_ref().map(|(_, o)| *o);
+        inner.group.ccd_saved = isolated.map(|(saved, _)| saved);
+        let finished = pf_win_display::topology_churn::finish(txn, isolate_txn_outcome(outcome));
+        // After isolate, disable deactivated monitor PnP devnodes so standby wake events do
+        // not cascade. Evidence: `windows/monitor_devnode.rs`.
+        if crate::policy::prefs().pnp_disable_monitors() {
+            if let Some(saved) = &inner.group.ccd_saved {
+                inner.group.pnp_disabled = pf_win_display::monitor_devnode::disable_for_deactivated(
+                    saved,
+                    added_key,
+                    finished.generation,
+                );
+            }
+        }
+        // Verified isolate is not durable — see `ensure_exclusive_watch`.
+        inner.group.ccd_exclusive = inner.group.ccd_saved.is_some();
+        if inner.group.ccd_exclusive {
+            self.ensure_exclusive_watch();
+        }
     }
 
     /// Mid-stream resize on the same monitor: refresh the advertised mode list
@@ -1902,9 +1878,7 @@ impl VirtualDisplayManager {
             Topology::Exclusive => {
                 // Grown-set semantics: isolate to the surviving siblings + the new target. The returned
                 // snapshot is DISCARDED — the group keeps the first member's (design §6.1).
-                let mut keep = inner.target_keys();
-                keep.push(new_target);
-                let _ = isolate_displays_ccd_seam(&keep);
+                let _ = isolate_displays_ccd_seam(&inner.keep_with(new_target));
             }
             Topology::Primary => {
                 // Predecessor held primary. The call recaptures a snapshot, so
@@ -2297,6 +2271,55 @@ pub fn slot_id_for(client_fp: Option<[u8; 32]>, mode: (u32, u32)) -> Option<u32>
 fn resolve_render_pin() -> Option<LUID> {
     tracing::info!("IDD push: pinning the render GPU (SET_RENDER_ADAPTER)");
     pf_gpu::resolve_render_adapter_luid()
+}
+
+/// PRE-MUTATION baseline for the standby-sink selector (immunity plan WP3a): the targets
+/// active before this acquire mutates the set. `None` is not an empty baseline — a target
+/// missing from one is a disable candidate, so a failed read would nominate the operator's
+/// own display, and the pass is skipped instead.
+fn standby_baseline() -> Option<Vec<CcdTargetKey>> {
+    // A FRESH read through the display actor (it runs the query, off this thread).
+    // A re-stamped last-known-good carries `failures > 0` and is not a baseline.
+    pf_win_display::display_events::refresh_and_wait(Duration::from_millis(500))
+        .filter(|s| s.is_fresh())
+        .map(|s| {
+            s.targets
+                .iter()
+                .filter(|t| t.active)
+                .map(|t| t.key)
+                .collect()
+        })
+        // Actor slow or not running: one direct query on this thread. Its `Err`
+        // is the case that must not become an empty baseline.
+        .or_else(|| {
+            pf_win_display::win_display::target_inventory_checked()
+                .ok()
+                .map(|ts| ts.iter().filter(|t| t.active).map(|t| t.key).collect())
+        })
+}
+
+/// PnP-disable connected-but-inactive sinks (a standby TV) whose wake events the
+/// deactivated-set selector misses. First member only, and only past the 1500 ms settle
+/// window from `settle_start`, so force-EXTEND physicals are not still mid-activation.
+/// Extend leaves active panels untouched by construction.
+fn neutralise_standby_sinks(
+    inner: &mut MgrInner,
+    added_key: CcdTargetKey,
+    baseline_active: &[CcdTargetKey],
+    settle_start: Instant,
+) {
+    if let Some(rest) = Duration::from_millis(1500).checked_sub(settle_start.elapsed()) {
+        thread::sleep(rest);
+    }
+    for id in pf_win_display::monitor_devnode::disable_connected_inactive(
+        &inner.keep_with(added_key),
+        baseline_active,
+        pf_win_display::topology_churn::generation(),
+    ) {
+        if !inner.group.pnp_disabled.contains(&id) {
+            inner.group.pnp_disabled.push(id);
+        }
+    }
 }
 
 /// A reused monitor keeps the ADD-time render pin. If the current pick has

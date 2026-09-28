@@ -913,31 +913,54 @@ public final class PunktfunkConnection: @unchecked Sendable {
         // Core reads any explicit pair, 48 000/16 included, as a lossless ask and sets
         // `CLIENT_CAP_AUDIO_HIRES`; `AudioFormatChoice.opus.wire` is `(48_000, 16)`.
         let wantsHiRes = audioRateHz != 48_000 || audioBits != 16
-        // The core keeps the preset across dials; nil here clears the last session's.
-        withOptionalCString(settings.presetID) { id in
-            withOptionalCString(settings.presetName) { name in
-                punktfunk_set_session_preset(id, name)
-            }
-        }
+        // Every option by field name; zero is auto/unspecified. The C strings are set below,
+        // inside the scopes that keep them alive for the call.
+        var opts = PunktfunkConnectOpts()
+        opts.struct_size = UInt32(MemoryLayout<PunktfunkConnectOpts>.size)
+        opts.port = port
+        opts.width = width
+        opts.height = height
+        opts.refresh_hz = refreshHz
+        opts.compositor = compositor.rawValue
+        opts.gamepad = gamepad.rawValue
+        opts.bitrate_kbps = bitrateKbps
+        opts.video_caps = videoCaps
+        opts.audio_channels = audioChannels
+        opts.audio_rate_hz = wantsHiRes ? audioRateHz : 0
+        opts.audio_bits = wantsHiRes ? audioBits : 0
+        opts.video_codecs = videoCodecs
+        opts.preferred_codec = preferredCodec
+        opts.client_caps = clientCaps
+        opts.video_fit = videoFit
+        opts.timeout_ms = timeoutMs
         handle = host.withCString { cs in
             withOptionalCString(identity?.certPEM) { cert in
                 withOptionalCString(identity?.keyPEM) { key in
                     withOptionalCString(launchID) { launch in
-                        label.withCString { name in
-                            func dial(_ pin: UnsafePointer<UInt8>?) -> OpaquePointer? {
-                                punktfunk_connect_ex12(
-                                    cs, port, width, height, refreshHz, compositor.rawValue,
-                                    gamepad.rawValue, bitrateKbps, videoCaps, audioChannels,
-                                    wantsHiRes ? audioRateHz : 0, wantsHiRes ? audioBits : 0,
-                                    videoCodecs, preferredCodec, clientCaps, videoFit, launch,
-                                    pin, &observed, cert, key, name, timeoutMs, &connectStatus)
-                            }
-                            if let pin = pinSHA256 {
-                                return pin.withUnsafeBytes { p in
-                                    dial(p.bindMemory(to: UInt8.self).baseAddress)
+                        withOptionalCString(settings.presetID) { presetID in
+                            withOptionalCString(settings.presetName) { presetName in
+                                label.withCString { name in
+                                    opts.host = cs
+                                    opts.client_cert_pem = cert
+                                    opts.client_key_pem = key
+                                    opts.launch_id = launch
+                                    opts.device_name = name
+                                    // This dial's preset; nil names none.
+                                    opts.preset_id = presetID
+                                    opts.preset_name = presetName
+                                    func dial(_ pin: UnsafePointer<UInt8>?) -> OpaquePointer? {
+                                        opts.pin_sha256 = pin
+                                        return punktfunk_connect_opts(
+                                            &opts, &observed, &connectStatus)
+                                    }
+                                    if let pin = pinSHA256 {
+                                        return pin.withUnsafeBytes { p in
+                                            dial(p.bindMemory(to: UInt8.self).baseAddress)
+                                        }
+                                    }
+                                    return dial(nil)
                                 }
                             }
-                            return dial(nil)
                         }
                     }
                 }

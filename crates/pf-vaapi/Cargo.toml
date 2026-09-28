@@ -11,8 +11,8 @@ repository.workspace = true
 [dependencies]
 # Direct dependency on the vendored parser crate, not just pf-bitstream: the conversion
 # consumes the parser's `Sps`/`Pps`/`SliceType` wholesale (pf-bitstream re-exports only a
-# subset), and the same path means the one crate instance the workspace already builds.
-cros-codecs = { path = "../pf-bitstream/vendor/cros-codecs" }
+# subset).
+cros-codecs = { workspace = true }
 pf-bitstream = { path = "../pf-bitstream" }
 
 [dev-dependencies]

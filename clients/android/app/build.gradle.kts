@@ -104,10 +104,6 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = false
-            // punktfunk-core is statically linked into libpunktfunk_android.so (rlib). Its standalone
-            // cdylib (built because the core crate also declares crate-type = cdylib) is never loaded
-            // by Kotlin — drop it from the APK rather than ship ~5–9 MB of dead code.
-            excludes += "**/libpunktfunk_core.so"
         }
     }
 }

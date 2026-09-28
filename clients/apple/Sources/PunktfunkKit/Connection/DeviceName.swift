@@ -15,8 +15,8 @@ import Foundation
 /// The core's own default (`punktfunk_connect_ex9` and earlier) reads `COMPUTERNAME` / `HOSTNAME`
 /// — a Windows variable and a shell variable. Neither exists in a `launchd`-started GUI app, so
 /// every Apple client used to fall through to the literal "This device" and a console with an
-/// iPad, an Apple TV and a Mac pending showed three rows of it. Pass this to
-/// `punktfunk_connect_ex10` instead (`PunktfunkConnection.init` does, by default).
+/// iPad, an Apple TV and a Mac pending showed three rows of it. Pass this as
+/// `PunktfunkConnectOpts.device_name` instead (`PunktfunkConnection.init` does, by default).
 public enum DeviceName {
     /// This device's user-facing name, never empty.
     public static var current: String {

@@ -10,8 +10,8 @@
 //! belongs in the layer the tested host resolves bitrate from
 //! (`design/client-settings-profiles.md` §5.3).
 
-use punktfunk_core::client::{NativeClient, ProbeOutcome};
-use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
+use punktfunk_core::client::{ConnectParams, NativeClient, ProbeOutcome};
+use punktfunk_core::config::Mode;
 use std::time::{Duration, Instant};
 
 /// Ask for far more than any real link can carry, so the link is what limits the answer.
@@ -61,34 +61,24 @@ pub fn run_speed_probe_with(
 ) -> Result<ProbeOutcome, String> {
     // Pin the saved/advertised fingerprint when we have one; a manual host measures over TOFU.
     let pin = fp_hex.and_then(crate::trust::parse_hex32);
-    let c = NativeClient::connect(
-        addr,
-        port,
-        Mode {
-            width: 1280,
-            height: 720,
-            refresh_hz: 60,
-        },
-        CompositorPref::Auto,
-        GamepadPref::Auto,
-        0, // bitrate_kbps: the host's default — this measures the link, not an encoder setting
-        0, // video_caps: probe connect, nothing is decoded
-        2, // audio_channels: stereo baseline
+    let mode = Mode {
+        width: 1280,
+        height: 720,
+        refresh_hz: 60,
+    };
+    // The host's default rate: this measures the link, not an encoder setting. Nothing
+    // presents, so every other Hello field stays default too.
+    let c = NativeClient::connect(ConnectParams {
         // The DEVICE-FREE answer, not `decodable_codecs_for`: this connect creates no
         // presenter and has no `VulkanDecodeDevice` to gate AV1 on, and it decodes nothing.
-        crate::video::decodable_codecs(),
-        0,     // preferred_codec: no preference
-        None,  // display_hdr: probe connect, nothing presents
-        0,     // client_caps: probe connect, nothing renders a cursor
-        false, // frame_parts: probe/whole-AU consumer
-        None,  // launch: no game
+        video_codecs: crate::video::decodable_codecs(),
         // Same label a real session sends — a speed test against a host that doesn't know us
         // yet should knock under this device's name, not a fingerprint placeholder.
-        Some(punktfunk_core::client::device_name()),
+        name: Some(punktfunk_core::client::device_name()),
         pin,
-        Some(identity),
-        Duration::from_secs(15),
-    )
+        identity: Some(identity),
+        ..ConnectParams::new(addr, port, mode, Duration::from_secs(15))
+    })
     .map_err(|e| {
         tracing::warn!(error = ?e, "speed test connect");
         "Couldn't start the speed test".to_string()

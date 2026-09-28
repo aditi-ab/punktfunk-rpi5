@@ -1,18 +1,8 @@
-//! Process-lifetime tokio runtime for every portal handshake.
+//! Bounded ScreenCast handshake steps and the cursor-mode negotiation, shared by
+//! capture and the virtual displays. They run on [`pf_portal::portal_runtime`],
+//! the one runtime ashpd's process-global connection lives on.
 //!
-//! ashpd caches its D-Bus connection in a process-global `OnceLock`. The first
-//! portal proxy creates it, and zbus spawns the connection's reader on
-//! whichever tokio runtime is current at that moment.
-//!
-//! A per-session runtime that is dropped at teardown leaves that cached
-//! connection with no executor. Every later portal call in the process then
-//! waits for a reply nothing is left alive to read.
-//!
-//! Never build a per-session runtime, and never drop this one. `block_on`
-//! takes `&self`, so every portal thread can park on it concurrently. A portal
-//! session made here outlives the thread that made it: close it explicitly.
-//!
-//! Every ScreenCast handshake also shares [`HANDSHAKE_BUDGET`] with its bounded
+//! Every ScreenCast handshake shares [`HANDSHAKE_BUDGET`] with its bounded
 //! steps ([`within`], [`finish_or_close`], [`close_session`]) and the
 //! cursor-mode negotiation ([`negotiate_cursor_mode`]).
 
@@ -20,9 +10,7 @@ use ashpd::desktop::screencast::{CursorMode, Screencast};
 use ashpd::enumflags2::BitFlags;
 use pf_frame::cursor_mode::{parse_pin, pick, Mode, Pin};
 use std::future::Future;
-use std::sync::OnceLock;
 use std::time::Duration;
-use tokio::runtime::Runtime;
 
 /// Ceiling on one ScreenCast handshake, connect through `open_pipe_wire_remote`.
 /// Under the callers' 20 s setup wait, so the thread that owns a stuck portal
@@ -88,25 +76,6 @@ where
             close_session(close()).await;
             Err(no_answer())
         }
-    }
-}
-
-/// `Result` so a failed build fails the handshake with a reason instead of aborting the process.
-static PORTAL_RT: OnceLock<std::io::Result<Runtime>> = OnceLock::new();
-
-/// Multi-thread, 2 workers: the zbus reader must run across `create_session`
-/// → `select_sources` → `start` while a portal thread blocks on `block_on`.
-/// A current-thread runtime cannot pump that.
-pub fn portal_runtime() -> Result<&'static Runtime, String> {
-    match PORTAL_RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("punktfunk-portal-rt")
-            .enable_all()
-            .build()
-    }) {
-        Ok(rt) => Ok(rt),
-        Err(e) => Err(format!("build the shared portal runtime: {e}")),
     }
 }
 

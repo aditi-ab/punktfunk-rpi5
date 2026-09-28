@@ -170,35 +170,6 @@ impl Reporter for ChannelReporter {
     }
 }
 
-/// A render-time collector for the Done page's outro text (single-threaded, no channel).
-#[derive(Default)]
-struct VecReporter(std::cell::RefCell<Vec<String>>);
-
-impl Reporter for VecReporter {
-    fn say(&self, msg: &str) {
-        self.0.borrow_mut().push(msg.to_string());
-    }
-    fn ok(&self, msg: &str) {
-        self.say(msg);
-    }
-    fn warn(&self, msg: &str) {
-        self.say(msg);
-    }
-    fn die(&self, msg: &str) {
-        self.say(msg);
-    }
-    fn plus(&self, cmd: &str) {
-        self.say(cmd);
-    }
-    fn detail(&self, msg: &str) {
-        self.say(msg);
-    }
-    fn line(&self, msg: &str) {
-        self.say(msg);
-    }
-    fn blank(&self) {}
-}
-
 /// Everything a navigation or edit handler needs — one clone per handler.
 #[derive(Clone)]
 struct Ctx {
@@ -559,6 +530,44 @@ impl RealSeams {
     }
 }
 
+/// One run's seams, owned for as long as its executor runs.
+pub enum LiveSeams {
+    Demo(DemoSeams),
+    Real(RealSeams),
+}
+
+impl LiveSeams {
+    pub fn executor<'a>(
+        &'a self,
+        ui: &'a dyn Reporter,
+        dry: bool,
+        silent: bool,
+        web_password: Option<String>,
+    ) -> WinExecutor<'a> {
+        let (run, net, payload, paths, subst): (
+            &dyn CommandRunner,
+            &dyn NetProbe,
+            &dyn PayloadSource,
+            &punktfunk_setup::seam::BasePaths,
+            &Subst,
+        ) = match self {
+            LiveSeams::Demo(d) => (&d.run, &d.net, &d.payload, &d.paths, &d.subst),
+            LiveSeams::Real(r) => (&r.run, &r.net, r.payload.as_ref(), &r.paths, &r.subst),
+        };
+        WinExecutor {
+            run,
+            net,
+            payload,
+            paths,
+            ui,
+            dry,
+            silent,
+            web_password,
+            subst: subst.clone(),
+        }
+    }
+}
+
 fn start_install(ctx: &Ctx) {
     let preset = ctx.preset.clone();
     let screen = ctx.screen.clone();
@@ -572,38 +581,13 @@ fn start_install(ctx: &Ctx) {
         let choices = screen.effective_choices();
         let built = plan::build(&screen.facts, &choices, preset.artifact, uninstall);
         let ui = ChannelReporter::new(set_log);
-        let (demo, real) = match &seams {
-            Seams::Demo { latency_ms } => (Some(DemoSeams::new(&preset, *latency_ms)), None),
-            Seams::Real { root, version } => (None, Some(RealSeams::new(root.as_deref(), version))),
+        let live = match &seams {
+            Seams::Demo { latency_ms } => LiveSeams::Demo(DemoSeams::new(&preset, *latency_ms)),
+            Seams::Real { root, version } => {
+                LiveSeams::Real(RealSeams::new(root.as_deref(), version))
+            }
         };
-        let (run, net, payload, paths, subst): (
-            &dyn CommandRunner,
-            &dyn NetProbe,
-            &dyn PayloadSource,
-            &punktfunk_setup::seam::BasePaths,
-            Subst,
-        ) = match (&demo, &real) {
-            (Some(d), _) => (&d.run, &d.net, &d.payload, &d.paths, d.subst.clone()),
-            (_, Some(r)) => (
-                &r.run,
-                &r.net,
-                r.payload.as_ref(),
-                &r.paths,
-                r.subst.clone(),
-            ),
-            (None, None) => unreachable!("one seam set per run"),
-        };
-        let exec = WinExecutor {
-            run,
-            net,
-            payload,
-            paths,
-            ui: &ui,
-            dry: false,
-            silent: false,
-            web_password: choices.web_password.clone(),
-            subst,
-        };
+        let exec = live.executor(&ui, false, false, choices.web_password.clone());
         match exec.execute(&built) {
             Ok(()) => {
                 set_install.call(InstallPhase::Finished);
@@ -1412,164 +1396,11 @@ fn next_step(title: &str, detail: &str, link: &str, uri: &str) -> Element {
 }
 
 fn done_page(ctx: &Ctx) -> Element {
-    use punktfunk_setup::facts::DOCS;
-    let mut children: Vec<Element> = Vec::new();
-    if ctx.uninstall {
-        children.push(
-            text_block("punktfunk was removed from this PC.")
-                .font_size(18.0)
-                .semibold()
-                .into(),
-        );
-        children.push(
-            text_block(
-                r"Kept on purpose: %ProgramData%\punktfunk (identity, passwords, update cache) — a reinstall picks it up.",
-            )
-            .wrap()
-            .foreground(ThemeRef::SecondaryText)
-            .into(),
-        );
+    let children = if ctx.uninstall {
+        done_uninstalled()
     } else {
-        let fresh = ctx.screen.fresh();
-        children.push(
-            text_block(match (ctx.preset.artifact, fresh) {
-                (Artifact::Host, true) => "The punktfunk host is installed and streaming.",
-                (Artifact::Host, false) => "The punktfunk host is up to date.",
-                (Artifact::Client, true) => "The punktfunk client is installed.",
-                (Artifact::Client, false) => "The punktfunk client is up to date.",
-            })
-            .font_size(18.0)
-            .semibold()
-            .into(),
-        );
-        // Fresh host: the password card, the one thing the user must leave with (D9) — and
-        // the only place a Recommended install shows it.
-        if ctx.preset.artifact == Artifact::Host
-            && fresh
-            && let Some(pw) = &ctx.screen.choices.web_password
-        {
-            // Masked until asked: a finish page can sit on a screen for a while. Copy works
-            // either way. Changing it later is a file edit + service restart (docs:
-            // web-console.md), not a console feature.
-            let reveal = ctx.reveal_done;
-            let toggle = ctx.clone();
-            let copy = ctx.clone();
-            let text = pw.clone();
-            children.push(
-                card(
-                    vstack((
-                        text_block("Your web console password").semibold(),
-                        hstack((
-                            text_block(if reveal { pw.clone() } else { PASSWORD_MASK.into() })
-                                .font_size(22.0)
-                                .font_family(MONO)
-                                .selectable()
-                                .min_width(240.0)
-                                .vertical_alignment(VerticalAlignment::Center),
-                            icon_button(
-                                if reveal {
-                                    Icon::font("\u{ED1A}") // Segoe Fluent "Hide"
-                                } else {
-                                    Symbol::View.into()
-                                },
-                                if reveal { "Hide" } else { "Show" },
-                                move || toggle.set_reveal_done.call(!reveal),
-                            ),
-                            icon_button(
-                                if ctx.copied {
-                                    Symbol::Accept.into()
-                                } else {
-                                    Symbol::Copy.into()
-                                },
-                                if ctx.copied { "Copied" } else { "Copy" },
-                                move || {
-                                    copy_to_clipboard(&text);
-                                    copy.set_copied.call(true);
-                                },
-                            ),
-                        ))
-                        .spacing(6.0)
-                        .vertical_alignment(VerticalAlignment::Center),
-                        text_block(
-                            r"Stored in %ProgramData%\punktfunk\web-password. To change it later, edit that file and run `punktfunk-host service restart` from an elevated PowerShell.",
-                        )
-                        .wrap()
-                        .font_size(12.0)
-                        .foreground(ThemeRef::SecondaryText),
-                    ))
-                    .spacing(6.0),
-                )
-                .into(),
-            );
-        }
-        children.push(
-            text_block("Next")
-                .font_size(12.0)
-                .semibold()
-                .foreground(ThemeRef::SecondaryText)
-                .margin(edges(2.0, 6.0, 0.0, -4.0))
-                .into(),
-        );
-        let (first, second) = match ctx.preset.artifact {
-            Artifact::Host => (
-                next_step(
-                    "Open the web console",
-                    "Approve devices, pick what to stream, change settings. The certificate is the host's own — continue past the browser's warning.",
-                    "https://127.0.0.1:47992",
-                    "https://127.0.0.1:47992/",
-                ),
-                next_step(
-                    "Install a client",
-                    "On the device you play on — Windows, macOS, iOS, Android, Linux, Steam Deck — then connect and press Approve in the console.",
-                    "Client downloads",
-                    &format!("{DOCS}/install-client"),
-                ),
-            ),
-            Artifact::Client => (
-                next_step(
-                    "Open Punktfunk",
-                    "It is in the Start menu. Pick your host from the list, or add one by address.",
-                    "Pairing help",
-                    &format!("{DOCS}/pairing"),
-                ),
-                next_step(
-                    "No host yet?",
-                    "Install the punktfunk host on the PC you stream from.",
-                    "Host install guide",
-                    &format!("{DOCS}/windows-host"),
-                ),
-            ),
-        };
-        children.push(
-            grid((first.grid_column(0), second.grid_column(1)))
-                .columns([GridLength::Star(1.0), GridLength::Star(1.0)])
-                .column_spacing(12.0)
-                .into(),
-        );
-        // The D11/D12 footnotes — the same words as the transcript, as attention cards.
-        let collector = VecReporter::default();
-        win_report::footnotes(
-            &collector,
-            &ctx.screen.facts,
-            &ctx.screen.effective_choices(),
-        );
-        for line in collector.0.into_inner() {
-            children.push(
-                card(
-                    text_block(line.trim())
-                        .wrap()
-                        .foreground(ThemeRef::SystemAttention),
-                )
-                .into(),
-            );
-        }
-        children.push(
-            HyperlinkButton::new("Stuck? Troubleshooting")
-                .navigate_uri(format!("{DOCS}/troubleshooting"))
-                .margin(edges(-10.0, 0.0, 0.0, 0.0))
-                .into(),
-        );
-    }
+        done_installed(ctx)
+    };
     let content = scroll_view(vstack(children).spacing(12.0).max_width(760.0)).into();
     frame(
         ctx,
@@ -1581,6 +1412,166 @@ fn done_page(ctx: &Ctx) -> Element {
             .on_click(|| std::process::exit(0))
             .into()],
     )
+}
+
+fn done_uninstalled() -> Vec<Element> {
+    vec![
+        text_block("punktfunk was removed from this PC.")
+            .font_size(18.0)
+            .semibold()
+            .into(),
+        text_block(
+            r"Kept on purpose: %ProgramData%\punktfunk (identity, passwords, update cache) — a reinstall picks it up.",
+        )
+        .wrap()
+        .foreground(ThemeRef::SecondaryText)
+        .into(),
+    ]
+}
+
+/// The outcome, the password card on a fresh host, the next steps, and the D11/D12
+/// footnotes in the transcript's words as attention cards.
+fn done_installed(ctx: &Ctx) -> Vec<Element> {
+    use punktfunk_setup::facts::DOCS;
+    let fresh = ctx.screen.fresh();
+    let mut children: Vec<Element> = vec![text_block(match (ctx.preset.artifact, fresh) {
+        (Artifact::Host, true) => "The punktfunk host is installed and streaming.",
+        (Artifact::Host, false) => "The punktfunk host is up to date.",
+        (Artifact::Client, true) => "The punktfunk client is installed.",
+        (Artifact::Client, false) => "The punktfunk client is up to date.",
+    })
+    .font_size(18.0)
+    .semibold()
+    .into()];
+    // Fresh host: the password card, the one thing the user must leave with (D9) — and
+    // the only place a Recommended install shows it.
+    if ctx.preset.artifact == Artifact::Host
+        && fresh
+        && let Some(pw) = &ctx.screen.choices.web_password
+    {
+        children.push(password_card(ctx, pw));
+    }
+    children.push(
+        text_block("Next")
+            .font_size(12.0)
+            .semibold()
+            .foreground(ThemeRef::SecondaryText)
+            .margin(edges(2.0, 6.0, 0.0, -4.0))
+            .into(),
+    );
+    let (first, second) = next_steps(ctx.preset.artifact);
+    children.push(
+        grid((first.grid_column(0), second.grid_column(1)))
+            .columns([GridLength::Star(1.0), GridLength::Star(1.0)])
+            .column_spacing(12.0)
+            .into(),
+    );
+    for note in win_report::footnotes(&ctx.screen.facts, &ctx.screen.effective_choices()) {
+        children.push(
+            card(
+                text_block(note)
+                    .wrap()
+                    .foreground(ThemeRef::SystemAttention),
+            )
+            .into(),
+        );
+    }
+    children.push(
+        HyperlinkButton::new("Stuck? Troubleshooting")
+            .navigate_uri(format!("{DOCS}/troubleshooting"))
+            .margin(edges(-10.0, 0.0, 0.0, 0.0))
+            .into(),
+    );
+    children
+}
+
+/// The fresh host's console password, masked until Show: a finish page can sit on a screen
+/// for a while. Copy works either way. Changing it later is a file edit and a service
+/// restart (docs: web-console.md), not a console feature.
+fn password_card(ctx: &Ctx, pw: &str) -> Element {
+    let reveal = ctx.reveal_done;
+    let toggle = ctx.clone();
+    let copy = ctx.clone();
+    let text = pw.to_string();
+    card(
+        vstack((
+            text_block("Your web console password").semibold(),
+            hstack((
+                text_block(if reveal { pw.to_string() } else { PASSWORD_MASK.into() })
+                    .font_size(22.0)
+                    .font_family(MONO)
+                    .selectable()
+                    .min_width(240.0)
+                    .vertical_alignment(VerticalAlignment::Center),
+                icon_button(
+                    if reveal {
+                        Icon::font("\u{ED1A}") // Segoe Fluent "Hide"
+                    } else {
+                        Symbol::View.into()
+                    },
+                    if reveal { "Hide" } else { "Show" },
+                    move || toggle.set_reveal_done.call(!reveal),
+                ),
+                icon_button(
+                    if ctx.copied {
+                        Symbol::Accept.into()
+                    } else {
+                        Symbol::Copy.into()
+                    },
+                    if ctx.copied { "Copied" } else { "Copy" },
+                    move || {
+                        copy_to_clipboard(&text);
+                        copy.set_copied.call(true);
+                    },
+                ),
+            ))
+            .spacing(6.0)
+            .vertical_alignment(VerticalAlignment::Center),
+            text_block(
+                r"Stored in %ProgramData%\punktfunk\web-password. To change it later, edit that file and run `punktfunk-host service restart` from an elevated PowerShell.",
+            )
+            .wrap()
+            .font_size(12.0)
+            .foreground(ThemeRef::SecondaryText),
+        ))
+        .spacing(6.0),
+    )
+    .into()
+}
+
+/// The two follow-up cards for what was installed.
+fn next_steps(artifact: Artifact) -> (Element, Element) {
+    use punktfunk_setup::facts::DOCS;
+    match artifact {
+        Artifact::Host => (
+            next_step(
+                "Open the web console",
+                "Approve devices, pick what to stream, change settings. The certificate is the host's own — continue past the browser's warning.",
+                "https://127.0.0.1:47992",
+                "https://127.0.0.1:47992/",
+            ),
+            next_step(
+                "Install a client",
+                "On the device you play on — Windows, macOS, iOS, Android, Linux, Steam Deck — then connect and press Approve in the console.",
+                "Client downloads",
+                &format!("{DOCS}/install-client"),
+            ),
+        ),
+        Artifact::Client => (
+            next_step(
+                "Open Punktfunk",
+                "It is in the Start menu. Pick your host from the list, or add one by address.",
+                "Pairing help",
+                &format!("{DOCS}/pairing"),
+            ),
+            next_step(
+                "No host yet?",
+                "Install the punktfunk host on the PC you stream from.",
+                "Host install guide",
+                &format!("{DOCS}/windows-host"),
+            ),
+        ),
+    }
 }
 
 const WINDOW_W: f64 = 980.0;

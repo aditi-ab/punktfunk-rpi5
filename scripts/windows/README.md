@@ -72,7 +72,7 @@ gated on the same `attempt=` check CI and the `.deb` builder use), then lays it 
 `<exe-dir>\scripting\runner-cli.js` + `scripting-run.cmd` with the bun runtime at `<exe-dir>\bun\bun.exe`.
 
 **That layout is load-bearing.** `punktfunk-host plugins add/remove/list` forwards package ops to the
-runner, and on Windows it resolves the runner *relative to the running exe* (`crates\punktfunk-host\src\plugins.rs`).
+runner, and on Windows it resolves the runner *relative to the running exe* (`crates\punktfunk-host\src\plugin_host\plugins.rs`).
 Since `deploy-host.ps1` runs the service out of `target\release`, a bundle sitting only in the
 installed `{app}` leaves the freshly built exe reporting *"the plugin runner isn't installed"*. The
 script deploys next to **every** host exe it finds - the built one and whatever the `PunktfunkHost`

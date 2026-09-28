@@ -50,6 +50,9 @@ pf-capture = { path = "../pf-capture" }
 # subsystem crate (plan §W6). Consumes core::input; the heavy input deps (wayland/reis/xkbcommon/
 # usbip) moved with it.
 pf-inject = { path = "../pf-inject" }
+# Host audio (PipeWire/WASAPI capture, the virtual mic, pad audio, the Windows wiring plan),
+# extracted to a subsystem crate (plan §W6). The PipeWire binding moved with it.
+pf-audio = { path = "../pf-audio" }
 # Virtual-display orchestration (per-compositor Linux backends + the Windows IddCx driver backend),
 # extracted to a subsystem crate (plan §W6). The DDC panel control + KWin zkde protocol moved with it.
 pf-vdisplay = { path = "../pf-vdisplay" }
@@ -58,15 +61,7 @@ pf-vdisplay = { path = "../pf-vdisplay" }
 # compiles everywhere; the backends are cfg-gated inside it.
 pf-clipboard = { path = "../pf-clipboard" }
 # M3 native control plane (the `punktfunk/1` QUIC handshake; data plane stays native-thread UDP).
-# Feature list = quinn's own defaults with `rustls-ring` swapped for `rustls-aws-lc-rs`; every
-# crate selecting a rustls backend must agree or feature unification builds both (see core).
-quinn = { version = "0.11", default-features = false, features = [
-    "log",
-    "platform-verifier",
-    "runtime-tokio",
-    "rustls-aws-lc-rs",
-    "bloom",
-] }
+quinn = { workspace = true }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -92,7 +87,7 @@ socket2 = "0.6"
 tokio = { version = "1", features = ["full"] }
 # GameStream-only (behind the `gamestream` feature): the Moonlight RSA-2048 identity generator +
 # pairing signer (cert.rs, pairing.rs) and the legacy-client-cert leniency verifier (tls.rs).
-# The native planes use the P-256 identity (src/identity.rs) and never touch this crate — so a
+# The native planes use the P-256 identity (src/hostsys/identity.rs) and never touch this crate — so a
 # native-only build also sheds the accepted Marvin advisory (RUSTSEC-2023-0071, .cargo/audit.toml).
 #
 # TWO independent `rsa` features, arriving from two different bumps in this wave — both are load-
@@ -137,14 +132,8 @@ base64 = { version = "0.23", default-features = false, features = ["std"] }
 # Blocking HTTP for the library art store: the proxy fetches a cover the first time a client asks
 # for one, on a `spawn_blocking` thread off the async runtime. `ureq` is small + sync (no tokio
 # here) and bundles webpki roots (no system cert dependency).
-# ⚠ `rustls-no-provider`, NEVER the default `rustls` feature — that one pulls `_ring`, which would
-# put the ring backend back into a tree that has deliberately moved to aws-lc-rs.
-ureq = { version = "3", default-features = false, features = [
-    "rustls-no-provider",
-    "rustls-webpki-roots",
-    "gzip",
-] }
-rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+ureq = { workspace = true, features = ["gzip"] }
+rcgen = { workspace = true }
 # ⚠ Do not float this back below 0.18. 0.16 was the LAST crate pulling `thiserror` 1.0 into the
 # host graph (via asn1-rs 0.6 / der-parser 9 / oid-registry 0.7); 0.18 moves that chain to asn1-rs
 # 0.7 + thiserror 2, so the host now links exactly one thiserror major. `cargo tree -p
@@ -153,11 +142,10 @@ x509-parser = "0.18"
 # (axum-server left with the plain-HTTP nvhttp listener: both nvhttp listeners now run the
 # governed tokio-rustls/hyper accept loop in gamestream/tls.rs — connection ceilings + header
 # deadlines, security-review 2026-08-31 M-6 — which axum-server could not express.)
-# aws-lc-rs backend, matching punktfunk-core + the clients (a dissenting crate would pull a
-# second crypto stack in). `prefer-post-quantum` offers X25519MLKEM768 first on the mgmt/native
-# TLS 1.3 listeners; classical curves stay in the list, so a client without ML-KEM still connects.
+# The workspace entry's `prefer-post-quantum` offers X25519MLKEM768 first on the mgmt/native TLS
+# 1.3 listeners; classical curves stay in the list, so a client without ML-KEM still connects.
 # Keep `tls12` for GameStream/Moonlight clients that negotiate TLS 1.2.
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std", "tls12", "logging"] }
+rustls = { workspace = true, features = ["tls12", "logging"] }
 # Manual HTTPS+mTLS serve loop for the mgmt API (axum-server can't surface the peer cert): a
 # tokio-rustls handshake exposes the client cert, then hyper serves the axum Router with the
 # verified fingerprint injected as a request extension. Versions match the workspace lock.
@@ -202,9 +190,7 @@ serde_json = "1"
 # SHA-256 over the downloaded installer and its signing-leaf DER (update/windows.rs) — Windows-only
 # in practice, the plugin-store's ed25519 path re-exports pf-update-check's verifier. Already in the
 # tree via rustls; its API is ring-compatible by design, which is what made the swap mechanical.
-# `prebuilt-nasm`: see pf-update-check's copy — it keeps aws-lc-sys building on Windows x86_64
-# with no NASM on the box, whatever else the build happens to select.
-aws-lc-rs = { version = "1", features = ["prebuilt-nasm"] }
+aws-lc-rs = { workspace = true }
 # Semver comparisons for the plugin store: `minHost` gating and the revocation list's version
 # ranges (`<0.3.2`). Already in the lockfile transitively.
 semver = "1"
@@ -223,12 +209,13 @@ http-body-util = "0.1"
 h2 = "0.4"
 # Disposable directory fixtures for the Steam local-librarycache scan tests (library.rs).
 tempfile = "3"
+# The C ABI, driven from Rust by the native plane's connection round-trip tests (native.rs).
+punktfunk-ffi = { path = "../punktfunk-ffi", features = ["quic"] }
 
-# Opus encode for the host->client audio plane — stereo (`opus::Encoder`) AND 5.1/7.1 surround
-# (`opus::MSEncoder`, the safe multistream API the crate exposes; no `audiopus_sys` needed). The
-# crate vendors libopus (cmake-built from source — no system lib, no vcpkg), so it builds on Windows
-# MSVC too (needs CMake + NASM, both on the box) and on macOS, where `punktfunk-core` already
-# vendors it for the client. The mic pump that decodes with it carries no platform code of its own.
+# Opus for the pad-audio encoder (`native::pad_audio`) and `opus::Error` on the audio planes; the
+# desktop encoder and the mic pump live in pf-audio. The crate vendors libopus (cmake-built from
+# source — no system lib, no vcpkg), so it builds on Windows MSVC too (needs CMake + NASM, both on
+# the box) and on macOS, where `punktfunk-core` already vendors it for the client.
 [target.'cfg(any(unix, windows))'.dependencies]
 opus = "0.3"
 
@@ -242,14 +229,11 @@ libc = "0.2"
 # `screencast` gates the ScreenCast portal module; `remote_desktop` adds the RemoteDesktop
 # portal we use for libei input on KWin/GNOME; `tokio` is the default runtime.
 # `open_pipe_wire_remote` is unconditional, so ashpd's own `pipewire` feature is not
-# needed — we drive PipeWire with the `pipewire` crate below.
+# needed — pf-capture and pf-audio drive PipeWire with the `pipewire` crate.
 # `settings` adds the org.freedesktop.portal.Settings proxy the console's theme route reads
 # (design/web-console-overhaul.md §7) — the only cross-desktop source for the desktop's own
 # mode and accent.
 ashpd = { version = "0.13", features = ["screencast", "remote_desktop", "settings"] }
-# Must match the pipewire crate ashpd 0.13 links (libspa/pipewire-sys `links` key is
-# unique per build), i.e. 0.9 — NOT the 0.10 the setup doc mentions.
-pipewire = "0.9"
 # (ashpd 0.13 drives the one-time portal handshake on tokio; the unconditional `tokio = "full"`
 # in [dependencies] already covers that — this block used to re-declare a strict subset of it.)
 # NOTE: the Wayland stack (wayland-client / -protocols{,-wlr,-misc} / -scanner / -backend),
@@ -314,34 +298,26 @@ windows = { version = "0.62", features = [
     # Windows service supervisor (src/windows/service/runtime.rs): a kill-on-close job object so a
     # service crash never orphans the SYSTEM host it launched into the active console session.
     "Win32_System_JobObjects",
-    # CoCreateInstance(PolicyConfigClient) — set the default audio playback/recording endpoints via the
-    # undocumented IPolicyConfig (audio/windows/audio_control.rs) so mic + desktop audio auto-wire.
+    # A packaged game's window property store (src/windows/game_term.rs): COM, IPropertyStore, and
+    # the PROPVARIANT it returns (StructuredStorage, gated on Variant). The audio endpoint work
+    # declares its own in pf-audio.
     "Win32_System_Com",
-    # Pad-audio endpoint provisioning (audio/windows/pad_endpoint.rs): IMMDevice + IPropertyStore
-    # to stamp the DualSense identity onto the minted endpoints (PROPVARIANT lives in
-    # StructuredStorage and is gated on the Variant feature), DEVPKEY_Device_DriverInfPath to
-    # resolve the installed Steam Streaming Speakers INF, and raw Reg* calls behind the MMDevices
-    # ACL repair + the devnode's pad-index marker value.
-    "Win32_Media_Audio",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
-    "Win32_Devices_Properties",
+    # The console user's theme values (src/windows/theme.rs).
     "Win32_System_Registry",
     # SetUnhandledExceptionFilter + EXCEPTION_POINTERS — the last-resort native-crash logger
     # (src/windows/crash.rs); Kernel gates the CONTEXT type EXCEPTION_POINTERS embeds.
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",
-    # RoGetActivationFactory(AudioPolicyConfig) — the per-app output pin that keeps voice-chat
-    # apps on the operator's speakers (audio/windows/voice_route.rs).
-    "Win32_System_WinRT",
     # CreateToolhelp32Snapshot/Process32*W — the conflicting-streaming-host process scan
     # (src/detect/windows.rs): is Sunshine/Apollo/... running alongside us?
     "Win32_System_Diagnostics_ToolHelp",
     # GetApplicationUserModelId — a packaged (UWP) game's identity, which its frame window carries
     # (src/windows/game_term.rs).
     "Win32_Storage_Packaging_Appx",
-    # The host power actions (src/power.rs, design/host-actions.md): SetSuspendState /
+    # The host power actions (src/hostsys/power.rs, design/host-actions.md): SetSuspendState /
     # IsPwrSuspendAllowed (Power) and InitiateSystemShutdownExW + the SeShutdownPrivilege
     # constants (Shutdown).
     "Win32_System_Power",
@@ -357,10 +333,10 @@ windows-service = "0.8"
 # Registry reads the host does on Windows — ergonomic + correct-by-construction vs. hand-rolled
 # Reg* FFI for subkey enumeration. Survived the removal of the built-in store scanners (which is
 # what first pulled it in): `library/launch.rs` resolves launcher install paths for the typed launch
-# kinds a plugin publishes, `procscan/windows.rs` maps processes, and the two `audio/windows/`
-# modules read and clean up device nodes.
+# kinds a plugin publishes and `procscan/windows.rs` maps processes.
 winreg = "0.56"
-# WASAPI loopback audio capture (default render endpoint -> 48 kHz stereo f32 for the Opus path).
+# The pad-audio capture thread's COM init and the `pad-endpoint reshape` devtest's sample types;
+# capture itself lives in pf-audio.
 wasapi = "0.24"
 # Shared host<->driver wire contract for the pf-vdisplay IddCx virtual-display backend: the
 # control-plane IOCTL codes + `#[repr(C)] Pod` request/reply structs, defined ONCE so host<->driver
