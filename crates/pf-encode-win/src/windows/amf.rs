@@ -610,13 +610,14 @@ impl Component {
         unsafe { ((*(*self.0).vtbl).submit_input)(self.0, surface.0) }
     }
 
-    /// `QueryOutput`: the result plus the output, owned, when there is one.
+    /// `QueryOutput`: the result plus the output, owned, when there is one. The guard is
+    /// built lazily: one around a null pointer would release through it when dropped.
     fn query_output(&self) -> (sys::AmfResult, Option<OwnedData>) {
         let mut data: *mut sys::AmfData = ptr::null_mut();
         // SAFETY: live component; `data` is a local out-param that holds one owned reference
         // whenever AMF fills it.
         let r = unsafe { ((*(*self.0).vtbl).query_output)(self.0, &mut data) };
-        (r, (!data.is_null()).then_some(OwnedData(data)))
+        (r, (!data.is_null()).then(|| OwnedData(data)))
     }
 }
 
