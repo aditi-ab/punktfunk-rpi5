@@ -341,9 +341,11 @@ impl ArtKind {
 /// carry no source and always contribute.
 pub fn all_games() -> Vec<GameEntry> {
     let hidden = hidden_ids();
-    let mut games = collect_games();
-    games.retain(|g| !hidden.contains(&g.id));
-    games
+    sorted_games()
+        .iter()
+        .filter(|g| !hidden.contains(&g.id))
+        .cloned()
+        .collect()
 }
 
 /// The library including hidden titles, each flagged.
@@ -353,16 +355,73 @@ pub fn all_games() -> Vec<GameEntry> {
 /// the GameStream app list, and launch resolution use [`all_games`].
 pub fn all_games_for_operator() -> Vec<OperatorGameEntry> {
     let hidden = hidden_ids();
-    collect_games()
-        .into_iter()
+    sorted_games()
+        .iter()
         .map(|entry| OperatorGameEntry {
             hidden: hidden.contains(&entry.id),
-            entry,
+            entry: entry.clone(),
         })
         .collect()
 }
 
-/// Merge every enabled source and the custom entries, sorted by title, each
+/// A title's place in the list: folded title, then id so equal titles keep one order.
+/// The paged route cuts its pages by this key, so the list has to be sorted by it.
+pub(crate) fn sort_key(g: &GameEntry) -> (String, String) {
+    (g.title.to_lowercase(), g.id.clone())
+}
+
+/// Counts this process's writes to the library files. Two saves inside one mtime tick can
+/// leave the same stamp on different bytes; the count still moves.
+static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What a built list was read from: the config dir, this process's write count, and the
+/// mtime and length of every library file, which is what moves when someone else edits one.
+type Inputs = (
+    PathBuf,
+    u64,
+    Vec<(std::ffi::OsString, Option<SystemTime>, u64)>,
+);
+
+/// Every file the list is built from is named `library*` in the config dir, or sits in
+/// its `library-metadata` folder. A file outside that rule would leave a stale list.
+fn inputs() -> Inputs {
+    let dir = pf_paths::config_dir();
+    let mut stamps = Vec::new();
+    for (folder, prefix) in [(dir.clone(), "library"), (dir.join("library-metadata"), "")] {
+        for e in std::fs::read_dir(folder).into_iter().flatten().flatten() {
+            let name = e.file_name();
+            if !name.to_string_lossy().starts_with(prefix) {
+                continue;
+            }
+            if let Some(md) = e.metadata().ok().filter(|md| md.is_file()) {
+                stamps.push((name, md.modified().ok(), md.len()));
+            }
+        }
+    }
+    stamps.sort();
+    let writes = WRITES.load(std::sync::atomic::Ordering::Acquire);
+    (dir, writes, stamps)
+}
+
+/// The whole library, hidden titles included, sorted by [`sort_key`]. Built once and kept
+/// until an input moves: a page of a large library must not cost the whole of it.
+pub(crate) fn sorted_games() -> std::sync::Arc<Vec<GameEntry>> {
+    type Built = std::sync::Mutex<Option<(Inputs, std::sync::Arc<Vec<GameEntry>>)>>;
+    static BUILT: Built = std::sync::Mutex::new(None);
+    // Read before the build: a write that lands in between leaves this key behind the list,
+    // which costs the next caller a rebuild and never serves an old list.
+    let key = inputs();
+    if let Some((k, games)) = BUILT.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if *k == key {
+            return games.clone();
+        }
+    }
+    let games = std::sync::Arc::new(collect_games());
+    *BUILT.lock().unwrap_or_else(|e| e.into_inner()) = Some((key, games.clone()));
+    games
+}
+
+/// Merge every enabled source and the custom entries, sorted by [`sort_key`], each
 /// carrying its play stats and what Art & Metadata sources fill. Split out so the
 /// two public views differ only in how they apply the hidden set.
 fn collect_games() -> Vec<GameEntry> {
@@ -379,7 +438,7 @@ fn collect_games() -> Vec<GameEntry> {
         g.stats = stats.get(&g.id).copied();
         fills.apply(g);
     }
-    games.sort_by_key(|g| g.title.to_lowercase());
+    games.sort_by_cached_key(sort_key);
     games
 }
 
@@ -397,8 +456,9 @@ fn read_json_or_default<T: serde::de::DeserializeOwned + Default>(path: &Path) -
 /// Owner-only ([`pf_paths::replace_secret_file`]), like hooks.json: `library.json` carries the
 /// `prep`/`launch` commands the host runs.
 fn save_json(path: &Path, json: &str) -> Result<()> {
-    pf_paths::replace_secret_file(path, json.as_bytes())
-        .with_context(|| format!("replace {}", path.display()))
+    let saved = pf_paths::replace_secret_file(path, json.as_bytes());
+    WRITES.fetch_add(1, std::sync::atomic::Ordering::Release);
+    saved.with_context(|| format!("replace {}", path.display()))
 }
 
 #[cfg(test)]

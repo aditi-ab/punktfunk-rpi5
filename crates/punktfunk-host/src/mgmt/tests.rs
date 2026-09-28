@@ -3998,6 +3998,38 @@ async fn library_pages_by_cursor_with_search_and_counts() {
     let id = first["items"][1]["id"].as_str().expect("an id");
     let (_, one) = send(&app, get_req(&format!("/api/v1/library/page?id={id}"))).await;
     assert_eq!(titles(&one), ["bravo"]);
+
+    // A hidden title leaves every page but the operator's, where it is flagged.
+    crate::library::set_entry_hidden(id, true).expect("hide");
+    let (_, all) = send(&app, get_req("/api/v1/library/page")).await;
+    assert_eq!(all["total"], 6);
+    let flagged: Vec<_> = all["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter(|g| g["hidden"] == true)
+        .map(|g| g["title"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(flagged, ["bravo"]);
+}
+
+/// The built list is kept between requests and dropped when a library file moves, whether
+/// this process wrote it or someone else did.
+#[test]
+fn the_built_library_is_kept_until_an_input_moves() {
+    let _tmp = ConfigDirOverride::new();
+    seed_title("alpha", "PS2");
+    let first = crate::library::sorted_games();
+    assert!(Arc::ptr_eq(&first, &crate::library::sorted_games()));
+
+    seed_title("bravo", "PS2");
+    let second = crate::library::sorted_games();
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert_eq!(second.len(), 2);
+
+    let by_hand = pf_paths::config_dir().join("library-stats.json");
+    std::fs::write(by_hand, r#"{"games":{}}"#).expect("write the stats file");
+    assert!(!Arc::ptr_eq(&second, &crate::library::sorted_games()));
 }
 
 #[tokio::test]

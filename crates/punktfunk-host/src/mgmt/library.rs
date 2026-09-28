@@ -13,6 +13,7 @@
 
 use super::auth::{AnyId, AuthLane, OwnedId, ProviderId};
 use super::shared::*;
+use crate::library::sort_key;
 use axum::http::header;
 use axum::Extension;
 use sha2::{Digest, Sha256};
@@ -190,11 +191,6 @@ pub(crate) struct LibraryPage {
 const PAGE_DEFAULT: u32 = 60;
 const PAGE_MAX: u32 = 200;
 
-/// A title's place in the list: folded title, then id so equal titles keep one order.
-fn sort_key(g: &crate::library::GameEntry) -> (String, String) {
-    (g.title.to_lowercase(), g.id.clone())
-}
-
 fn encode_cursor(key: &(String, String)) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("{}\0{}", key.0, key.1))
@@ -255,35 +251,33 @@ pub(crate) async fn get_library_page(
         },
     };
     let limit = q.limit.unwrap_or(PAGE_DEFAULT).clamp(1, PAGE_MAX) as usize;
-    let mut rows: Vec<crate::library::OperatorGameEntry> = if lane.is_operator() {
-        crate::library::all_games_for_operator()
-    } else {
-        crate::library::all_games()
-            .into_iter()
-            .map(|entry| crate::library::OperatorGameEntry {
-                entry,
-                hidden: false,
-            })
-            .collect()
-    };
+    // Rows borrow the kept list: only the titles of this page are copied out of it.
+    let library = crate::library::sorted_games();
+    let hidden = crate::library::hidden_ids();
     let needle = q.q.as_deref().map(str::trim).unwrap_or("").to_lowercase();
     let narrow = LibraryQuery {
         provider: q.provider.clone(),
         platform: None,
     };
-    rows.retain(|r| {
-        matches_query(&r.entry, &narrow)
-            && (needle.is_empty() || r.entry.title.to_lowercase().contains(&needle))
-            && q.id.as_deref().is_none_or(|id| r.entry.id == id)
-            && match q.role.as_deref() {
-                Some("launcher") => r.entry.role == crate::library::GameRole::Launcher,
-                Some("game") => r.entry.role != crate::library::GameRole::Launcher,
-                _ => true,
-            }
-    });
+    let mut rows: Vec<(&crate::library::GameEntry, bool)> = library
+        .iter()
+        .map(|g| (g, hidden.contains(&g.id)))
+        // Only the operator's lane sees a hidden title.
+        .filter(|(_, hidden)| lane.is_operator() || !hidden)
+        .filter(|(g, _)| {
+            matches_query(g, &narrow)
+                && (needle.is_empty() || g.title.to_lowercase().contains(&needle))
+                && q.id.as_deref().is_none_or(|id| g.id == id)
+                && match q.role.as_deref() {
+                    Some("launcher") => g.role == crate::library::GameRole::Launcher,
+                    Some("game") => g.role != crate::library::GameRole::Launcher,
+                    _ => true,
+                }
+        })
+        .collect();
     let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
-    for r in &rows {
-        if let Some(p) = r.entry.meta.platform.as_deref().filter(|p| !p.is_empty()) {
+    for (g, _) in &rows {
+        if let Some(p) = g.meta.platform.as_deref().filter(|p| !p.is_empty()) {
             *counts.entry(p.to_string()).or_default() += 1;
         }
     }
@@ -297,13 +291,20 @@ pub(crate) async fn get_library_page(
         provider: None,
         platform: q.platform.clone(),
     };
-    rows.retain(|r| matches_query(&r.entry, &by_platform));
+    rows.retain(|(g, _)| matches_query(g, &by_platform));
     let total = rows.len();
-    rows.sort_by_cached_key(|r| sort_key(&r.entry));
-    let start = after.map_or(0, |key| rows.partition_point(|r| sort_key(&r.entry) <= key));
-    let mut items: Vec<_> = rows.into_iter().skip(start).take(limit + 1).collect();
-    let more = items.len() > limit;
-    items.truncate(limit);
+    // The library arrives sorted by `sort_key` and the filters keep that order.
+    let start = after.map_or(0, |key| rows.partition_point(|(g, _)| sort_key(g) <= key));
+    let more = rows.len() > start + limit;
+    let mut items: Vec<crate::library::OperatorGameEntry> = rows
+        .into_iter()
+        .skip(start)
+        .take(limit)
+        .map(|(g, hidden)| crate::library::OperatorGameEntry {
+            entry: g.clone(),
+            hidden,
+        })
+        .collect();
     let next_cursor = more
         .then(|| items.last().map(|r| encode_cursor(&sort_key(&r.entry))))
         .flatten();
