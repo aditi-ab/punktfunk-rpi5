@@ -1116,11 +1116,6 @@ public final class StreamLayerView: NSView {
         }
         presenter.layout(in: bounds, contentsScale: window?.backingScaleFactor ?? 1)
         displayLayer.videoGravity = SessionPresenter.gravity(VideoFit(name: connection?.settings.videoFit))
-        // Present routing tracks the window's composited state (fullscreen transitions always
-        // re-layout, so this stays current): a windowed session presents through a Core Animation
-        // transaction — the DCP swapID kernel-panic mitigation (see SessionPresenter.setComposited).
-        // A view not yet in a window counts as composited (the safe default).
-        presenter.setComposited(!(window?.styleMask.contains(.fullScreen) ?? false))
         // Feed the follower only once in a window (backing scale is real then) and with real
         // bounds — a pre-window layout would report point-sized dimensions.
         if window != nil, bounds.width > 0, bounds.height > 0 {

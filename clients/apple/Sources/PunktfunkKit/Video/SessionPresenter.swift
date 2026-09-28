@@ -140,7 +140,7 @@ final class SessionPresenter {
     /// The decoded tvOS path requires a CVPixelBuffer, so PyroWave retains deadline-paced Metal.
     /// Stage-3 and stage-4 map directly to glass and deadline pacing; stage-2 is arrival for every
     /// codec. Glass gating waits for the previous frame's on-glass callback, about a refresh per
-    /// frame, and does not prevent the macOS DCP panic (see `WindowedPresentMode`).
+    /// frame.
     static func pacing(for choice: PresenterChoice, codec: VideoCodec) -> PresentPacing {
         if choice == .decoded { return codec == .pyrowave ? .deadline : .decoded }
         if choice == .stage4 { return .deadline }
@@ -168,19 +168,6 @@ final class SessionPresenter {
     /// build that queue—deadline pacing or tvOS's decoded video plane—not a deeper gate.
     ///
     #if os(macOS)
-    /// Resolve the windowed (composited) present MECHANISM for this session — the DCP
-    /// swapID-panic mitigation picker (see `WindowedPresentMode`). The
-    /// `PUNKTFUNK_WINDOWED_PRESENT=async|transaction|surface` env lever wins (dev A/B);
-    /// otherwise the user's safe-present setting: ON/unset → `.transaction` (the validated
-    /// mitigation), OFF → `.async` (the fast pre-mitigation path — the panic returns on
-    /// affected high-refresh setups; the Settings caption says so). `.surface` is currently
-    /// env-only (prototype — HDR-composite verification owed). Fullscreen always presents
-    /// async regardless (`setComposited`). Internal (not private) for unit tests.
-    static func windowedPresentMode(setting: Bool?, env: String?) -> WindowedPresentMode {
-        if let env, let mode = WindowedPresentMode(rawValue: env) { return mode }
-        return (setting ?? true) ? .transaction : .async
-    }
-
     /// Adaptive-refresh latency sessions choose immediate sparse presents or one dense present per
     /// display-link target: on arrival, a 120 fps stream on a ProMotion panel loses about a tenth
     /// to a fifth of its frames, PyroWave included. Smoothness and the other presenters keep their
@@ -230,18 +217,6 @@ final class SessionPresenter {
         stage2?.setPanel(info)
     }
     private var metalLayer: CAMetalLayer?
-    #if os(macOS)
-    /// The windowed present MECHANISM this session runs while composited (resolved once per
-    /// session in `start` — the user's safe-present setting + the PUNKTFUNK_WINDOWED_PRESENT
-    /// dev override) and the routing last pushed to the pipeline — see `setComposited` (the DCP
-    /// swapID-panic mitigation). Main-thread only, like all of this.
-    private var windowedMode: WindowedPresentMode = .transaction
-    private var windowedPresentApplied: WindowedPresentMode = .async
-    /// The windowed `surface` present target (sibling above `metalLayer`, transparent while
-    /// unused) — installed whenever stage-2 runs so a mechanism flip never has to mutate the
-    /// layer tree mid-session.
-    private var surfaceLayer: CALayer?
-    #endif
     private var connection: PunktfunkConnection?
     /// Re-runs this session's `start` with its own arguments on the given base layer — the
     /// wedged-presenter cure (`rebuildPresentation`) and the move between screens (`move(to:)`).
@@ -358,18 +333,6 @@ final class SessionPresenter {
                 baseLayer.addSublayer(metal)
                 metalLayer = metal
             }
-            #if os(macOS)
-            windowedPresentApplied = .async
-            // Resolve THIS session's windowed mechanism once (setting + dev env lever) —
-            // `setComposited` routes between it and fullscreen-async from every layout.
-            windowedMode = Self.windowedPresentMode(
-                setting: connection.settings.windowedSafePresent,
-                env: ProcessInfo.processInfo.environment["PUNKTFUNK_WINDOWED_PRESENT"])
-            // The surface present target sits ABOVE the metal layer: transparent (nil contents)
-            // unless the surface mechanism actually presents, covering it while it does.
-            baseLayer.addSublayer(pipeline.surfaceLayer)
-            surfaceLayer = pipeline.surfaceLayer
-            #endif
             stage2 = pipeline
             // The ordinary link supplies the vsync grid, retries transient Metal drawable misses,
             // and polls which decoded IOSurface reached glass. Frame arrival remains the render
@@ -516,12 +479,6 @@ final class SessionPresenter {
         CATransaction.setDisableActions(true)
         metalLayer.contentsScale = contentsScale
         metalLayer.frame = snapped
-        #if os(macOS)
-        // The surface present target mirrors the metal layer's geometry exactly — its IOSurfaces
-        // are sized to the same snapped pixel rect, so the contents composite is a 1:1 blit too.
-        surfaceLayer?.contentsScale = contentsScale
-        surfaceLayer?.frame = snapped
-        #endif
         CATransaction.commit()
         // Hand the resulting pixel size to the render thread (it must not read layer geometry
         // cross-thread) — this is what the presenter sizes its drawable to. Uses the SNAPPED size so
@@ -548,35 +505,6 @@ final class SessionPresenter {
         guard size.width > 0, size.height > 0, size != contentSize else { return }
         contentSize = size
     }
-
-    #if os(macOS)
-    /// Route presents for the window's composited state (MAIN thread — the view pushes it on
-    /// every layout, which fullscreen transitions always trigger). A COMPOSITED (windowed)
-    /// session presents through this session's resolved mitigation mechanism (`windowedMode` —
-    /// transactional by default, see `windowedPresentMode`) instead of the async image queue —
-    /// the DCP "mismatched swapID's" kernel-panic mitigation (see `MetalVideoPresenter`; the
-    /// async-swap race survives glass pacing, so pacing alone was not enough). ALL codecs:
-    /// PyroWave hit it 2026-07-18 and windowed HEVC hit the same 240 Hz Mac Studio 2026-07-21 —
-    /// it is the async image queue itself, not any codec or present rate. Fullscreen keeps the
-    /// async path (direct scanout, lowest latency, no panic there). The full HDR/EDR render
-    /// path is preserved in every mechanism.
-    func setComposited(_ composited: Bool) {
-        guard let stage2 else { return }
-        let mode: WindowedPresentMode = composited ? windowedMode : .async
-        guard mode != windowedPresentApplied else { return }
-        let wasSurface = windowedPresentApplied == .surface
-        windowedPresentApplied = mode
-        stage2.setWindowedPresent(mode)
-        if wasSurface {
-            // Uncover the metal layer NOW (its last drawable is still attached, so fullscreen
-            // entry shows the previous frame until the next present — no black flash).
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            surfaceLayer?.contents = nil
-            CATransaction.commit()
-        }
-    }
-    #endif
 
     /// Rebuild the presentation on `layer`, keeping the connection: the picture moving between
     /// the phone and an attached monitor. The fresh display link binds to the screen `layer` is
@@ -632,11 +560,6 @@ final class SessionPresenter {
         stage2 = nil
         metalLayer?.removeFromSuperlayer()
         metalLayer = nil
-        #if os(macOS)
-        surfaceLayer?.removeFromSuperlayer()
-        surfaceLayer = nil
-        windowedPresentApplied = .async
-        #endif
         connection = nil
     }
 

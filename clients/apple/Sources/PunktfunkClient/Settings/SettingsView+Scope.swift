@@ -181,10 +181,6 @@ enum SettingsFields {
         .init(name: "allow_vrr", key: DefaultsKey.allowVRR,
               overlay: \.allowVRR, effective: \.allowVRR)
     }
-    static var windowedSafePresent: SettingsField<Bool> {
-        .init(name: "windowed_safe_present", key: DefaultsKey.windowedSafePresent,
-              overlay: \.windowedSafePresent, effective: \.windowedSafePresent)
-    }
 }
 
 extension SettingsView {
@@ -238,7 +234,6 @@ extension SettingsView {
         base.mouseMode = mouseMode
         base.inhibitShortcuts = inhibitShortcuts
         base.vsync = vsync
-        base.windowedSafePresent = windowedSafePresent
         #endif
         #if os(iOS)
         base.touchMode = touchMode

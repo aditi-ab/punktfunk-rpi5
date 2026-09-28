@@ -143,16 +143,6 @@ public enum DefaultsKey {
     /// and dense input once per link target. PUNKTFUNK_PRESENT_MODE=immediate|vsync|slot overrides
     /// that path for A/B. Resolved once per session; see Stage2Pipeline's header.
     public static let vsync = "punktfunk.vsync"
-    /// macOS: present WINDOWED sessions in lockstep with the system compositor (the DCP
-    /// "mismatched swapID's" kernel-panic mitigation — see SessionPresenter.windowedPresentMode
-    /// and the MetalVideoPresenter saga notes). ON/unset (the default): windowed presents ride
-    /// a Core Animation transaction — validated panic-free on the 240 Hz repro machine, at a
-    /// small display-latency cost vs the raw path. OFF: windowed sessions keep the fast async
-    /// image queue — ON AFFECTED SETUPS (high-refresh displays) THAT PATH KERNEL-PANICS THE
-    /// WHOLE MAC, which is why the default is ON. Fullscreen always presents async (fast path)
-    /// regardless. Resolved once per session; PUNKTFUNK_WINDOWED_PRESENT=async|transaction|
-    /// surface overrides it for dev A/B.
-    public static let windowedSafePresent = "punktfunk.windowedSafePresent"
     /// Allow variable refresh rate: hand the display link a wide frame-rate RANGE (low floor,
     /// preferred = stream rate) so a ProMotion / adaptive-sync display can vary its physical
     /// refresh to match the stream. On by default; a no-op on fixed-refresh displays. On macOS,

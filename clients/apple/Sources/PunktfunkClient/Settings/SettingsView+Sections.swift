@@ -483,16 +483,6 @@ extension SettingsView {
             described("Even pacing, at up to one refresh of added latency.", field: "vsync") {
                 Toggle("V-Sync", isOn: scoped(SettingsFields.vsync))
             }
-            // The DCP swapID-panic mitigation's user handle (see DefaultsKey.windowedSafePresent
-            // for the saga). Default ON: turning it off re-arms a WHOLE-MACHINE kernel panic on
-            // affected setups, so the caption says so in plain words.
-            described(effective.windowedSafePresent
-                ? "Windowed streams present in step with the compositor — avoids a macOS "
-                    + "display-driver crash, at a small latency cost."
-                : "Windowed streams use the fastest path. On some high-refresh Macs this can "
-                    + "kernel-panic the machine.", field: "windowed_safe_present") {
-                Toggle("Safe windowed presentation", isOn: scoped(SettingsFields.windowedSafePresent))
-            }
             #endif
         }
     }

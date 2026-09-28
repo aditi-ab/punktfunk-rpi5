@@ -879,13 +879,7 @@ public final class Stage2Pipeline {
         let cadence = cadence
         let rateHint = frameRateHint
         let vsyncClock = vsyncClock
-        #if os(macOS)
-        // The windowed mechanism can flip mid-session (fullscreen ↔ composited), so the suffix
-        // is read live per line rather than baked into the resolved name.
-        let paceName = { presenter.presentsComposited ? rateHint.pace() + "(composited)" : rateHint.pace() }
-        #else
         let paceName = { rateHint.pace() }
-        #endif
         let debugStats = PresentDebugStats(
             cadence: cadence, pace: paceName,
             linkPeriod: { vsyncClock.lastPeriod() }, panel: { rateHint.panel() })
@@ -1515,18 +1509,6 @@ public final class Stage2Pipeline {
     public func setSourceRect(_ rect: CGRect) {
         presenter.setSourceRect(rect)
     }
-
-    #if os(macOS)
-    /// Forward the windowed present mechanism (MAIN thread — see
-    /// `MetalVideoPresenter.setWindowedPresent`, the DCP swapID-panic mitigation).
-    func setWindowedPresent(_ mode: WindowedPresentMode) {
-        presenter.setWindowedPresent(mode)
-    }
-
-    /// The windowed `surface` present target the hosting SessionPresenter installs as a sibling
-    /// ABOVE `layer` (transparent while unused — see `MetalVideoPresenter.surfaceLayer`).
-    var surfaceLayer: CALayer { presenter.surfaceLayer }
-    #endif
 
     /// Forward the display's current EDR headroom to the presenter (MAIN thread — a `UIScreen`
     /// read). tvOS flips HDR presentation between PQ passthrough and the in-shader tone-map on
