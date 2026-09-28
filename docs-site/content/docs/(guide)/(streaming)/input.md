@@ -23,8 +23,9 @@ cursor disappears and keys go to the host.
 
 Press the release shortcut again, or click the stream, to capture again. Switching to another app
 releases input and takes it back when you return. Keys and buttons you were holding are let go on
-the host, so nothing sticks. On Linux and Windows, controllers stop reaching the host too until
-you capture again.
+the host, so nothing sticks. A key press or release the network drops is sent again, so a bad
+Wi-Fi moment doesn't leave a key held either. On Linux and Windows, controllers stop reaching the
+host too until you capture again.
 
 ### Keyboard shortcuts
 

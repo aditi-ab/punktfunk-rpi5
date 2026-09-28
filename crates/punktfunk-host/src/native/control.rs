@@ -186,6 +186,9 @@ impl PyroWavePin {
 pub(super) struct Task {
     pub(super) ctrl_send: super::link::CtlSend,
     pub(super) ctrl_recv: super::link::CtlRecv,
+    /// The input thread's queue, shared with the datagram loop: a key edge off the
+    /// control stream lands in the same order-preserving line as the pointer.
+    pub(super) input_tx: std::sync::mpsc::SyncSender<super::input::ClientInput>,
     pub(super) initial_mode: punktfunk_core::Mode,
     pub(super) codec: crate::encode::Codec,
     pub(super) live_reconfig_ok: bool,
@@ -247,6 +250,7 @@ pub(super) async fn run(task: Task) {
     let Task {
         mut ctrl_send,
         ctrl_recv,
+        input_tx,
         initial_mode,
         codec,
         live_reconfig_ok,
@@ -359,7 +363,9 @@ pub(super) async fn run(task: Task) {
         tokio::select! {
             msg = ctrl_reader.read_msg() => {
                 let Ok(msg) = msg else { break };
-                if let Ok(req) = Reconfigure::decode(&msg) {
+                if let Ok(edge) = punktfunk_core::quic::InputEdge::decode(&msg) {
+                    offer_edge(edge.0, &session_grants, &input_tx, &counters, &mut denied);
+                } else if let Ok(req) = Reconfigure::decode(&msg) {
                     let now = std::time::Instant::now();
                     // Same bound as the handshake: `> 0` alone acked a mode that cannot land.
                     let valid = crate::encode::validate_refresh(req.mode.refresh_hz).is_ok()
@@ -897,6 +903,34 @@ fn clip_offer_permitted(grants: u32, clip_enabled: bool) -> bool {
     grants & punktfunk_core::quic::GRANT_CLIPBOARD != 0 && clip_enabled
 }
 
+/// A key edge off the control stream joins the datagram plane's queue: the same grant
+/// gate, the same count, and the same drop when the input thread is behind — stale
+/// input is already worthless. The lane keeps its order; the queue keeps it too.
+fn offer_edge(
+    ev: InputEvent,
+    grants: &AtomicU32,
+    input_tx: &std::sync::mpsc::SyncSender<super::input::ClientInput>,
+    counters: &crate::session_status::SessionCounters,
+    denied: &mut crate::session_status::GrantDrops,
+) {
+    let class = punktfunk_core::quic::classify(ev.kind);
+    if grants.load(Ordering::Relaxed) & class.bit() == 0 {
+        denied.note(class);
+        return;
+    }
+    counters.input_events.fetch_add(1, Ordering::Relaxed);
+    let mut ev = ev;
+    // KEY_FLAG_SEMANTIC_VK is in-process (GameStream ingest). Strip it from the wire.
+    if matches!(ev.kind, InputKind::KeyDown | InputKind::KeyUp) {
+        ev.flags &= !crate::inject::KEY_FLAG_SEMANTIC_VK;
+    }
+    if let Err(std::sync::mpsc::TrySendError::Full(_)) =
+        input_tx.try_send(super::input::ClientInput::Event(ev))
+    {
+        counters.input_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1334,5 +1368,45 @@ mod tests {
             800_000,
             "a zero ask is not a measurement"
         );
+    }
+
+    /// A key edge off the control stream takes the datagram path's grant gate, count and
+    /// queue; the in-process flag never survives the wire; a full queue drops and counts.
+    #[test]
+    fn an_edge_off_the_control_stream_joins_the_input_queue() {
+        use punktfunk_core::quic::{GRANT_ALL, GRANT_PRESET_CONTROLLER_ONLY};
+        let (tx, rx) = std::sync::mpsc::sync_channel::<super::super::input::ClientInput>(1);
+        let counters = crate::session_status::SessionCounters::default();
+        let mut denied = crate::session_status::GrantDrops::new(crate::events::Plane::Native);
+        let key = InputEvent {
+            kind: InputKind::KeyDown,
+            _pad: [0; 3],
+            code: 0x41,
+            x: 0,
+            y: 0,
+            flags: crate::inject::KEY_FLAG_SEMANTIC_VK | 4,
+        };
+        offer_edge(
+            key,
+            &AtomicU32::new(GRANT_PRESET_CONTROLLER_ONLY),
+            &tx,
+            &counters,
+            &mut denied,
+        );
+        assert!(rx.try_recv().is_err(), "no keyboard grant, no event");
+        assert_eq!(counters.input_events.load(Ordering::Relaxed), 0);
+
+        let grants = AtomicU32::new(GRANT_ALL);
+        offer_edge(key, &grants, &tx, &counters, &mut denied);
+        match rx.try_recv() {
+            Ok(super::super::input::ClientInput::Event(ev)) => {
+                assert_eq!((ev.kind, ev.code, ev.flags), (InputKind::KeyDown, 0x41, 4))
+            }
+            other => panic!("the edge, unflagged: {}", other.is_ok()),
+        }
+        offer_edge(key, &grants, &tx, &counters, &mut denied);
+        offer_edge(key, &grants, &tx, &counters, &mut denied);
+        assert_eq!(counters.input_events.load(Ordering::Relaxed), 3);
+        assert_eq!(counters.input_dropped.load(Ordering::Relaxed), 1);
     }
 }

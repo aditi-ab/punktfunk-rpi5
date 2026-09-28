@@ -711,6 +711,9 @@ pub(super) async fn negotiate(
         // Idle-keepalive re-encodes are marked `USER_FLAG_REPEAT` so client ABR treats an
         // unflagged AU as new content.
         host_caps2: punktfunk_core::quic::HOST_CAP2_REPEAT_MARK
+            // The control loop feeds key edges into the input queue, so a client sends
+            // them there and a lost release cannot hold a key.
+            | punktfunk_core::quic::HOST_CAP2_INPUT_EDGES
             // Without the bit the client falls back to trackpad instead of sending contacts
             // the injector cannot land (wlroots) or cannot create a device for (Windows < 1809).
             | if crate::inject::touch_supported() {

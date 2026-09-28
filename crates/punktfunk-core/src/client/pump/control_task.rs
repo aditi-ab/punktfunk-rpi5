@@ -116,6 +116,7 @@ impl ControlTask {
                         CtrlRequest::ClipOffer(o) => o.encode(),
                         CtrlRequest::CursorRender(m) => m.encode(),
                         CtrlRequest::Phase(p) => p.encode(),
+                        CtrlRequest::InputEdge(ev) => crate::quic::InputEdge(ev).encode(),
                     };
                     if io::write_msg(&mut ctrl_send, &bytes).await.is_err() {
                         break;

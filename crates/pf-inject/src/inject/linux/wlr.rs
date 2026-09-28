@@ -472,15 +472,25 @@ impl WlrootsInjector {
 }
 
 impl Drop for WlrootsInjector {
+    /// Release what the devices still hold before they go: the compositor keeps a closed
+    /// virtual keyboard's keys pressed (Hyprland's `release_pressed_on_close` is off by
+    /// default), and an open gesture's axis interaction outlives the pointer's destroy.
     fn drop(&mut self) {
-        // A gesture still open ends cancelled, or the compositor keeps the
-        // axis interaction alive past the virtual pointer's destroy.
-        let ops = self.scroll.cancel_all();
-        if !ops.is_empty() {
-            let t = self.now_ms();
-            self.emit_scroll_ops(t, ops);
-            let _ = self.conn.flush();
+        let t = self.now_ms();
+        for evdev in std::mem::take(&mut self.held_keys) {
+            self.keyboard.key(t, evdev as u32, 0);
+            self.xkb_state
+                .update_key(xkb_keycode(evdev), key_direction(false));
         }
+        self.send_modifiers();
+        for btn in std::mem::take(&mut self.pressed) {
+            self.pointer
+                .button(t, btn, wl_pointer::ButtonState::Released);
+        }
+        let ops = self.scroll.cancel_all();
+        self.emit_scroll_ops(t, ops);
+        self.pointer.frame();
+        let _ = self.conn.flush();
     }
 }
 

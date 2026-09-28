@@ -1165,6 +1165,34 @@ impl LaunchOutcome {
     }
 }
 
+/// [`InputEdge`]. 0x5C: 0x58–0x5B are access, audio, launch and pad slots.
+pub const MSG_INPUT_EDGE: u8 = 0x5C;
+
+/// `client → host` ([`MSG_INPUT_EDGE`]): one input event whose loss would stick — a key
+/// press or release — on the control stream instead of the datagram plane, so QUIC resends
+/// it and keeps its order. Sent only toward [`HOST_CAP2_INPUT_EDGES`](super::HOST_CAP2_INPUT_EDGES).
+/// The payload is the datagram encoding unchanged, so the host feeds both paths into one
+/// queue; any kind decodes, and the grants gate it exactly as they gate the datagram.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InputEdge(pub crate::input::InputEvent);
+
+impl InputEdge {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] event[5..23] (`InputEvent::encode`, tag included)
+        Wr::ctl(MSG_INPUT_EDGE, 5 + crate::input::INPUT_WIRE_LEN)
+            .bytes(&self.0.encode())
+            .done()
+    }
+
+    pub fn decode(b: &[u8]) -> Result<InputEdge> {
+        const LEN: usize = 5 + crate::input::INPUT_WIRE_LEN;
+        let r = Rd::ctl(b, MSG_INPUT_EDGE, LEN..=LEN, "bad InputEdge")?;
+        crate::input::InputEvent::decode(r.rest())
+            .map(InputEdge)
+            .ok_or(PunktfunkError::InvalidArg("bad InputEdge"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::config::Mode;
@@ -2109,5 +2137,37 @@ mod tests {
             LaunchOutcome::new(LaunchOutcomeKind::Refused, "  a\u{7}b\n  ").message,
             "ab"
         );
+    }
+
+    /// The payload is the datagram bytes, tag included, so one decoder serves both paths.
+    #[test]
+    fn input_edge_carries_the_datagram_bytes() {
+        use crate::input::{InputEvent, InputKind};
+        let key = |kind, code| InputEvent {
+            kind,
+            _pad: [0; 3],
+            code,
+            x: 0,
+            y: 0,
+            flags: 0,
+        };
+        pin!(
+            InputEdge,
+            InputEdge(key(InputKind::KeyDown, 0x41)),
+            "5cc80041000000000000000000000000000000"
+        );
+        pin!(
+            InputEdge,
+            InputEdge(key(InputKind::KeyUp, 0xA0)),
+            "5cc801a0000000000000000000000000000000"
+        );
+        let good = InputEdge(key(InputKind::KeyDown, 0x41)).encode();
+        assert_eq!(&good[5..], &key(InputKind::KeyDown, 0x41).encode());
+        assert!(InputEdge::decode(&good[..good.len() - 1]).is_err());
+        assert!(InputEdge::decode(&[good.as_slice(), &[0]].concat()).is_err());
+        assert!(PadSlots::decode(&good).is_err());
+        let mut unknown_kind = good.clone();
+        unknown_kind[6] = 0xFF;
+        assert!(InputEdge::decode(&unknown_kind).is_err());
     }
 }
