@@ -368,11 +368,13 @@ pub enum EncodeInput {
 
 impl EncodeInput {
     /// The input for `backend` (the [`SetEncodeRequest::backends`] numbering) under the
-    /// request's HDR, depth and 4:4:4 flags. Only NVENC ingests packed RGB, so only it can
-    /// pair HDR with full chroma; AMF and QSV take P010 and encode 4:2:0. `ten_bit` without
-    /// `hdr` is 10-bit SDR: NVENC still widens from `Bgra`, AMF takes a BT.709 P010
-    /// (`P010Sdr`). Media Foundation takes NV12 whatever was asked for — no vendor's MFT
-    /// accepts P010, so an HDR request that reaches it encodes 8-bit rather than failing.
+    /// request's HDR, depth and 4:4:4 flags. NVENC and AMF ingest 8-bit BGRA and convert it
+    /// themselves, which keeps the conversion off the 3D engine a game renders on. Only
+    /// NVENC ingests packed 10-bit RGB, so only it can pair HDR with full chroma; AMF and QSV
+    /// take P010 and encode 4:2:0. `ten_bit` without `hdr` is 10-bit SDR: NVENC still widens
+    /// from `Bgra`, AMF takes a BT.709 P010 (`P010Sdr`). Media Foundation takes NV12 whatever
+    /// was asked for — no vendor's MFT accepts P010, so an HDR request that reaches it
+    /// encodes 8-bit rather than failing.
     #[must_use]
     pub const fn choose(backend: u32, hdr: bool, ten_bit: bool, chroma444: bool) -> Self {
         match (backend, hdr, chroma444) {
@@ -382,7 +384,18 @@ impl EncodeInput {
             (_, true, _) => Self::P010,
             (backend::NVENC, false, _) => Self::Bgra,
             (backend::AMF, false, _) if ten_bit => Self::P010Sdr,
+            (backend::AMF, false, _) => Self::Bgra,
             _ => Self::Nv12,
+        }
+    }
+
+    /// What `backend` opens with after it refused `self`. Only AMF's BGRA has a second
+    /// choice: a VCN or runtime that declines it still encodes the video engine's NV12.
+    #[must_use]
+    pub const fn fallback(self, backend: u32) -> Option<Self> {
+        match (backend, self) {
+            (backend::AMF, Self::Bgra) => Some(Self::Nv12),
+            _ => None,
         }
     }
 
@@ -763,7 +776,8 @@ mod tests {
             ((1, true, true, true), Rgb10),
             ((2, true, true, true), P010),
             ((2, false, true, false), P010Sdr), // AMF 10-bit SDR: BT.709 P010
-            ((2, false, false, false), Nv12),   // AMF 8-bit SDR
+            ((2, false, false, false), Bgra),   // AMF 8-bit SDR: VCN converts
+            ((3, false, false, false), Nv12),   // QSV 8-bit SDR
             ((3, false, false, true), Nv12),
             ((3, false, true, true), Nv12), // QSV 10-bit SDR not wired: 8-bit NV12
             (
@@ -788,6 +802,21 @@ mod tests {
                     "backend {backend} hdr {hdr} asked 4:4:4 and got a subsampled input"
                 );
             }
+        }
+    }
+
+    /// Only AMF's BGRA has a second input, and it is the one AMF opened with before.
+    #[test]
+    fn only_amf_bgra_falls_back() {
+        use super::EncodeInput::{Bgra, Nv12, P010Sdr, P010};
+        assert_eq!(Bgra.fallback(2), Some(Nv12));
+        assert_eq!(
+            Bgra.fallback(1),
+            None,
+            "NVENC has no NV12 path in the driver"
+        );
+        for kind in [Nv12, P010, P010Sdr] {
+            assert_eq!(kind.fallback(2), None, "{kind:?}");
         }
     }
 
