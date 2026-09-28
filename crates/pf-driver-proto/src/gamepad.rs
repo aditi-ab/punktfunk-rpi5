@@ -54,6 +54,11 @@ pub const DEVTYPE_8BITDO_PRO2: u8 = 10;
 pub const DEVTYPE_8BITDO_PRO3: u8 = 11;
 /// Wireless HORIPAD for Steam, wired (`VID_0F0D&PID_01AB`) ([`crate::hori`]).
 pub const DEVTYPE_HORIPAD_STEAM: u8 = 12;
+/// Left Joy-Con over Bluetooth (`VID_057E&PID_2006`): the Pro Controller's protocol with device
+/// type 1 ([`crate::switch`]). A pair is two devnodes, one per half, that SDL and Steam combine.
+pub const DEVTYPE_JOYCON_LEFT: u8 = 13;
+/// Right Joy-Con over Bluetooth (`VID_057E&PID_2007`), device type 2.
+pub const DEVTYPE_JOYCON_RIGHT: u8 = 14;
 
 /// Written into the section's `driver_proto` on attach. The section starts zeroed, so `0`
 /// means no driver has attached. Bump on a gamepad-layout change.
@@ -68,8 +73,8 @@ pub const GAMEPAD_PROTO_VERSION: u32 = 3;
 /// compares this instead and flags an older driver. Bump it with any driver change a game or
 /// the host depends on. `1`: devnode-index serials, Deck packet numbers, refused unknown ids.
 /// `2`: Share on the Series Xbox pad. `3`: the Switch Pro identity. `4`: the 8BitDo and
-/// HORIPAD identities.
-pub const GAMEPAD_DRIVER_REV: u32 = 4;
+/// HORIPAD identities. `5`: the Joy-Con halves.
+pub const GAMEPAD_DRIVER_REV: u32 = 5;
 
 // Channel proof: who to hand the DATA section to. Do not take the duplication target from
 // the mailbox's `driver_pid` — LocalService can spawn a world-executable WUDFHost and publish
@@ -493,11 +498,12 @@ pub const REPORT_PERIOD_US: u64 = 4_000;
 /// The input-report period the driver serves `device_type` at (the Triton serves changes).
 ///
 /// The Pro Controller pushes `0x30` every 8 ms over Bluetooth and 15 ms over USB, three IMU
-/// samples each. 8 ms sits inside `hid-nintendo`'s 8–17 ms window and SDL measures the sample
-/// spacing from the stream, so the faster real cadence costs no consumer anything.
+/// samples each; a Joy-Con every 15 ms. Both sit inside `hid-nintendo`'s 8–17 ms window, and SDL
+/// measures the sample spacing from the stream.
 pub const fn report_period_us(device_type: u8) -> u64 {
     match device_type {
         DEVTYPE_SWITCH_PRO => 8_000,
+        DEVTYPE_JOYCON_LEFT | DEVTYPE_JOYCON_RIGHT => 15_000,
         // SDL's fixed step for this pad over Bluetooth; it carries no clock to correct it.
         DEVTYPE_8BITDO_ULTIMATE2 => 8_333,
         _ => REPORT_PERIOD_US,
@@ -531,7 +537,8 @@ pub fn serve_due(now_us: u64, due_us: u64, period_us: u64) -> Option<u64> {
 /// at its client's rate and the driver serves at the hardware's, so the driver owns every
 /// clock. A Switch Pro `0x30` or `0x21` carries an 8-bit timer (byte 1). `serial` is this
 /// report's index, `elapsed_us` the time since the first report; every field wraps as hardware
-/// does. Returns `false`, and leaves the report alone, for an identity that has no such fields.
+/// does. The Joy-Con halves carry the Pro's timer. Returns `false`, and leaves the report
+/// alone, for an identity that has no such fields.
 pub fn stamp_report_clock(
     device_type: u8,
     report: &mut [u8; 64],
@@ -563,7 +570,7 @@ pub fn stamp_report_clock(
             true
         }
         // A `0x81` handshake ack has no timer; its byte 1 is the echoed command.
-        DEVTYPE_SWITCH_PRO if report[0] != 0x81 => {
+        DEVTYPE_SWITCH_PRO | DEVTYPE_JOYCON_LEFT | DEVTYPE_JOYCON_RIGHT if report[0] != 0x81 => {
             report[1] = serial as u8;
             true
         }
@@ -595,8 +602,8 @@ pub const fn ps_mac_low(device_type: u8, index: u8) -> u8 {
 
 /// USB serial string of pad `index` presented as `device_type`. SDL and Steam dedup pads by
 /// it, so no two (identity, index) pairs may share one. A PlayStation serial is the pairing
-/// MAC, most significant octet first; each Xbox model has its own base octet. A Switch Pro
-/// serial is its device-info MAC ([`crate::switch::mac`]).
+/// MAC, most significant octet first; each Xbox model has its own base octet. A Switch Pro or
+/// Joy-Con serial is its device-info MAC ([`crate::switch::mac`]).
 pub fn pad_serial(device_type: u8, index: u8) -> String {
     let low = ps_mac_low(device_type, index);
     let xbox = |base: u8| alloc::format!("F4B0FC2A6C{:02X}", base.wrapping_add(index));
@@ -611,10 +618,12 @@ pub fn pad_serial(device_type: u8, index: u8) -> String {
             crate::triton::serial(index, &mut s);
             String::from_utf8_lossy(&s).into_owned()
         }
-        DEVTYPE_SWITCH_PRO => crate::switch::mac(index)
-            .iter()
-            .map(|b| alloc::format!("{b:02X}"))
-            .collect(),
+        DEVTYPE_SWITCH_PRO | DEVTYPE_JOYCON_LEFT | DEVTYPE_JOYCON_RIGHT => {
+            crate::switch::mac(device_type, index)
+                .iter()
+                .map(|b| alloc::format!("{b:02X}"))
+                .collect()
+        }
         DEVTYPE_8BITDO_ULTIMATE2 | DEVTYPE_8BITDO_PRO2 | DEVTYPE_8BITDO_PRO3 => {
             crate::eightbitdo::mac(device_type, index)
                 .iter()
@@ -633,8 +642,10 @@ pub fn pad_serial(device_type: u8, index: u8) -> String {
 /// each names. A token that prefixes another comes after it (`pf_dualsense` after
 /// `pf_dualsenseedge`), so the first match is the right one. Windows Server has no
 /// `xinputhid`, so every Xbox kind binds `pf_xbox_nofilter`; the section fixes the PID.
-pub const HWID_DEVTYPES: [(&str, u8); 14] = [
+pub const HWID_DEVTYPES: [(&str, u8); 16] = [
     ("pf_switchpro", DEVTYPE_SWITCH_PRO),
+    ("pf_joycon_left", DEVTYPE_JOYCON_LEFT),
+    ("pf_joycon_right", DEVTYPE_JOYCON_RIGHT),
     ("pf_8bitdo_ultimate2", DEVTYPE_8BITDO_ULTIMATE2),
     ("pf_8bitdo_pro2", DEVTYPE_8BITDO_PRO2),
     ("pf_8bitdo_pro3", DEVTYPE_8BITDO_PRO3),
@@ -676,6 +687,8 @@ pub const fn identity_vid_pid(device_type: u8) -> Option<(u16, u16)> {
         DEVTYPE_8BITDO_PRO2 => (0x2DC8, 0x6003),
         DEVTYPE_8BITDO_PRO3 => (0x2DC8, 0x6009),
         DEVTYPE_HORIPAD_STEAM => (0x0F0D, 0x01AB),
+        DEVTYPE_JOYCON_LEFT => (0x057E, 0x2006),
+        DEVTYPE_JOYCON_RIGHT => (0x057E, 0x2007),
         _ => return None,
     })
 }
@@ -765,7 +778,7 @@ mod tests {
     #[test]
     fn no_two_pads_share_a_serial() {
         let mut seen = std::collections::HashMap::new();
-        for devtype in DEVTYPE_DUALSENSE..=DEVTYPE_HORIPAD_STEAM {
+        for devtype in DEVTYPE_DUALSENSE..=DEVTYPE_JOYCON_RIGHT {
             for index in 0..16u8 {
                 let serial = pad_serial(devtype, index);
                 if let Some(prev) = seen.insert(serial.clone(), (devtype, index)) {
@@ -813,7 +826,7 @@ mod tests {
         );
         assert_eq!(devtype_from_hwids("usb\\vid_054c&pid_0ce6"), None);
         assert_eq!(devtype_from_hwids(""), None, "a failed property query");
-        assert_eq!(identity_vid_pid(DEVTYPE_HORIPAD_STEAM + 1), None);
+        assert_eq!(identity_vid_pid(DEVTYPE_JOYCON_RIGHT + 1), None);
         assert_eq!(
             identity_vid_pid(DEVTYPE_DUALSENSE_EDGE),
             Some((0x054C, 0x0DF2))

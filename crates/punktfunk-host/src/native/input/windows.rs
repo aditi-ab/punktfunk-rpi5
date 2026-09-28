@@ -30,6 +30,7 @@ pub(super) struct PadBackends {
     eightbitdo_pro2_win: Option<crate::inject::eightbitdo_windows::EightBitDoWindowsManager>,
     eightbitdo_pro3_win: Option<crate::inject::eightbitdo_windows::EightBitDoWindowsManager>,
     horipad_win: Option<crate::inject::hori_windows::HoriWindowsManager>,
+    joycon_win: Option<crate::inject::switch_pro_windows::JoyConWindowsManager>,
 }
 
 impl PadBackends {
@@ -84,6 +85,10 @@ impl PadBackends {
             GamepadPref::HoripadSteam => self
                 .horipad_win
                 .get_or_insert_with(crate::inject::hori_windows::HoriWindowsManager::new)
+                .handle(ev),
+            GamepadPref::JoyConPair => self
+                .joycon_win
+                .get_or_insert_with(crate::inject::switch_pro_windows::JoyConWindowsManager::new)
                 .handle(ev),
             GamepadPref::SwitchPro => self
                 .switchpro_win
@@ -170,6 +175,11 @@ impl PadBackends {
                     m.apply_rich(rich)
                 }
             }
+            GamepadPref::JoyConPair => {
+                if let Some(m) = &mut self.joycon_win {
+                    m.apply_rich(rich)
+                }
+            }
             _ => {}
         }
     }
@@ -196,6 +206,7 @@ impl PadBackends {
             eightbitdo_pro2_win,
             eightbitdo_pro3_win,
             horipad_win,
+            joycon_win,
         } = self;
         [
             steamctrl2.as_mut().map(|m| m as &mut dyn UhidTick),
@@ -213,6 +224,7 @@ impl PadBackends {
             eightbitdo_pro2_win.as_mut().map(|m| m as &mut dyn UhidTick),
             eightbitdo_pro3_win.as_mut().map(|m| m as &mut dyn UhidTick),
             horipad_win.as_mut().map(|m| m as &mut dyn UhidTick),
+            joycon_win.as_mut().map(|m| m as &mut dyn UhidTick),
         ]
         .into_iter()
         .flatten()

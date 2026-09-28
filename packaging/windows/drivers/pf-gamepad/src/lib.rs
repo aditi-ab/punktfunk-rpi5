@@ -22,8 +22,9 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use pf_driver_proto::gamepad::{
     DEVTYPE_8BITDO_PRO2, DEVTYPE_8BITDO_PRO3, DEVTYPE_8BITDO_ULTIMATE2, DEVTYPE_HORIPAD_STEAM,
-    DEVTYPE_STEAMDECK, DEVTYPE_SWITCH_PRO, PadShm, pad_serial,
+    DEVTYPE_JOYCON_LEFT, DEVTYPE_JOYCON_RIGHT, DEVTYPE_STEAMDECK, PadShm, pad_serial,
 };
+use pf_driver_proto::switch::is_switch;
 use pf_driver_proto::{deck, dualsense, dualshock4};
 use pf_driver_proto::{eightbitdo, hori};
 use pf_umdf_util::channel::{ChannelClient, ChannelConfig};
@@ -169,7 +170,7 @@ fn hid_attrs(devtype: u8) -> [u8; 32] {
     let ver = match devtype {
         4..=6 => XBOX_VER,
         7 => TRITON_VER,
-        8 => SWITCH_VER,
+        8 | DEVTYPE_JOYCON_LEFT | DEVTYPE_JOYCON_RIGHT => SWITCH_VER,
         DEVTYPE_8BITDO_ULTIMATE2..=DEVTYPE_HORIPAD_STEAM => 0x0100,
         _ => DS_VER,
     };
@@ -291,7 +292,9 @@ fn neutral_report(devtype: u8) -> [u8; 64] {
         // One S and Elite serve its first 16 bytes; Series adds a zero Share byte.
         4..=6 => XBOX_NEUTRAL_REPORT,
         7 => TRITON_NEUTRAL_REPORT,
-        8 => pf_driver_proto::switch::neutral_report(),
+        dt @ (8 | DEVTYPE_JOYCON_LEFT | DEVTYPE_JOYCON_RIGHT) => {
+            pf_driver_proto::switch::neutral_report(dt)
+        }
         DEVTYPE_8BITDO_ULTIMATE2..=DEVTYPE_8BITDO_PRO3 => eightbitdo::NEUTRAL_REPORT,
         DEVTYPE_HORIPAD_STEAM => hori::NEUTRAL_REPORT,
         _ => NEUTRAL_REPORT, // DualSense and Edge share the report 0x01 shape
@@ -764,7 +767,7 @@ extern "C" fn evt_io_device_control(
             4 => &XBOX_HID_DESC,
             5 | 6 => &XBOX_NO_SHARE_HID_DESC,
             7 => &TRITON_HID_DESC,
-            8 => &SWITCH_HID_DESC,
+            8 | DEVTYPE_JOYCON_LEFT | DEVTYPE_JOYCON_RIGHT => &SWITCH_HID_DESC,
             DEVTYPE_8BITDO_ULTIMATE2 => &EIGHTBITDO_HID_DESC,
             DEVTYPE_8BITDO_PRO2 | DEVTYPE_8BITDO_PRO3 => &EIGHTBITDO_CAPS_HID_DESC,
             DEVTYPE_HORIPAD_STEAM => &HORI_HID_DESC,
@@ -779,7 +782,9 @@ extern "C" fn evt_io_device_control(
             // The Triton's captured 372-byte descriptor lives in the shared proto crate — the
             // host and the pf-inject layout tests read the SAME bytes (drift = test failure).
             7 => &pf_driver_proto::triton::RDESC[..],
-            8 => &pf_driver_proto::switch::RDESC_WITH_PROOF[..],
+            8 | DEVTYPE_JOYCON_LEFT | DEVTYPE_JOYCON_RIGHT => {
+                &pf_driver_proto::switch::RDESC_WITH_PROOF[..]
+            }
             dt @ DEVTYPE_8BITDO_ULTIMATE2..=DEVTYPE_8BITDO_PRO3 => eightbitdo::rdesc(dt, true),
             DEVTYPE_HORIPAD_STEAM => &hori::RDESC_WITH_PROOF[..],
             _ => &dualsense::RDESC[..],
@@ -853,7 +858,7 @@ fn on_output_report(request: &Request, ioctl: ULONG) -> NTSTATUS {
         hex_dump(&bytes, 48)
     );
 
-    if device_type() == DEVTYPE_SWITCH_PRO {
+    if is_switch(device_type()) {
         queue_switch_reply(&bytes);
     }
 
@@ -880,16 +885,17 @@ fn on_output_report(request: &Request, ioctl: ULONG) -> NTSTATUS {
     STATUS_SUCCESS
 }
 
-/// Switch Pro handshake replies waiting for a pended READ_REPORT, oldest first. A reader that
+/// Switch handshake replies waiting for a pended READ_REPORT, oldest first. A reader that
 /// stops reading must not grow it without bound, so the oldest is dropped past eight.
 static SWITCH_REPLIES: std::sync::Mutex<std::collections::VecDeque<[u8; 64]>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
 
-/// Answer a Switch Pro `0x80` command or `0x01` subcommand as the pad would, on the latched
-/// `0x30` header. The host never sees the handshake; it reads the same report for rumble.
+/// Answer a Switch `0x80` command or `0x01` subcommand as the pad would, on the latched `0x30`
+/// header. The host never sees the handshake; it reads the same report for rumble.
 fn queue_switch_reply(output: &[u8]) {
     let latched = INPUT_REPORT.lock().map(|g| *g).unwrap_or(NEUTRAL_REPORT);
-    let Some(reply) = pf_driver_proto::switch::reply(&latched, output, pad_index()) else {
+    let Some(reply) = pf_driver_proto::switch::reply(&latched, output, device_type(), pad_index())
+    else {
         return;
     };
     let mut q = SWITCH_REPLIES.lock().unwrap_or_else(|e| e.into_inner());
@@ -912,7 +918,7 @@ fn serve_switch_reply(queue: WDFQUEUE, now: u64) -> bool {
     };
     let mut report = q.pop_front().unwrap_or(NEUTRAL_REPORT);
     let serial = REPORT_SERIAL.fetch_add(1, Ordering::Relaxed);
-    pf_driver_proto::gamepad::stamp_report_clock(DEVTYPE_SWITCH_PRO, &mut report, serial, now);
+    pf_driver_proto::gamepad::stamp_report_clock(device_type(), &mut report, serial, now);
     let st = request.copy_to_output(&report);
     request.complete(st);
     true
@@ -1148,7 +1154,7 @@ fn on_get_string(request: &Request) -> NTSTATUS {
         0 | 0x000e => match devtype {
             3 | 7 => "Valve Software".into(),
             4..=6 => "Microsoft".into(),
-            8 => "Nintendo Co., Ltd.".into(),
+            8 | DEVTYPE_JOYCON_LEFT | DEVTYPE_JOYCON_RIGHT => "Nintendo Co., Ltd.".into(),
             DEVTYPE_8BITDO_ULTIMATE2..=DEVTYPE_8BITDO_PRO3 => "8BitDo".into(),
             DEVTYPE_HORIPAD_STEAM => "HORI CO.,LTD.".into(),
             _ => "Sony Interactive Entertainment".into(),
@@ -1172,6 +1178,8 @@ fn on_get_string(request: &Request) -> NTSTATUS {
             6 => "Xbox Elite Wireless Controller Series 2".into(),
             7 => "Steam Controller".into(),
             8 => "Pro Controller".into(),
+            DEVTYPE_JOYCON_LEFT => "Joy-Con (L)".into(),
+            DEVTYPE_JOYCON_RIGHT => "Joy-Con (R)".into(),
             DEVTYPE_8BITDO_ULTIMATE2 => "8BitDo Ultimate 2 Wireless".into(),
             DEVTYPE_8BITDO_PRO2 => "8BitDo Pro 2".into(),
             DEVTYPE_8BITDO_PRO3 => "8BitDo Pro 3".into(),
@@ -1263,7 +1271,7 @@ fn tick(queue: WDFQUEUE) {
                     pf_driver_proto::gamepad::DEVTYPE_TRITON => {
                         pf_driver_proto::triton::input_len(buf[0]).is_some()
                     }
-                    DEVTYPE_SWITCH_PRO => buf[0] == 0x30,
+                    dt if is_switch(dt) => buf[0] == 0x30,
                     DEVTYPE_HORIPAD_STEAM => buf[0] == hori::REPORT_ID,
                     _ => buf[0] == 0x01,
                 })
@@ -1311,7 +1319,7 @@ fn tick(queue: WDFQUEUE) {
     // period, held state included (`pf_driver_proto::gamepad::report_period_us`).
     let dt = device_type();
     let now = pad_elapsed_us();
-    if dt == DEVTYPE_SWITCH_PRO && serve_switch_reply(queue, now) {
+    if is_switch(dt) && serve_switch_reply(queue, now) {
         return;
     }
     if dt == pf_driver_proto::gamepad::DEVTYPE_TRITON {

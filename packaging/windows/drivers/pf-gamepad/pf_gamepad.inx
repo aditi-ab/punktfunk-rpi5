@@ -36,7 +36,8 @@ pf_gamepad.dll=1
 ; Hardware ids: `root\pf_dualsense` for a root-enumerated devnode (devgen/devcon tests); `pf_dualsense`
 ; for the host's SwDeviceCreate'd DualSense (the `root\` prefix is reserved for root enumeration, so
 ; SwDeviceCreate rejects it with E_INVALIDARG); `pf_dualshock4` / `pf_dualsenseedge` /
-; `pf_steamdeck` / `pf_triton` / `pf_switchpro` / `pf_8bitdo_*` / `pf_horipad_steam` / `pf_xboxwireless` /
+; `pf_steamdeck` / `pf_triton` / `pf_switchpro` / `pf_joycon_*` / `pf_8bitdo_*` / `pf_horipad_steam` /
+; `pf_xboxwireless` /
 ; `pf_xboxones` / `pf_xboxelite` for the host's
 ; other virtual pads — ONE driver binds all of them and serves the matching HID identity per the
 ; device_type byte the host stamps into shared memory. TWO install sections, though: the
@@ -53,6 +54,8 @@ pf_gamepad.dll=1
 %DeviceDescDeck%=pfGamepad, pf_steamdeck
 %DeviceDescTriton%=pfGamepad, pf_triton
 %DeviceDescSwitchPro%=pfGamepad, pf_switchpro
+%DeviceDescJoyConL%=pfGamepad, pf_joycon_left
+%DeviceDescJoyConR%=pfGamepad, pf_joycon_right
 %DeviceDesc8BitDoU2%=pfGamepad, pf_8bitdo_ultimate2
 %DeviceDesc8BitDoPro2%=pfGamepad, pf_8bitdo_pro2
 %DeviceDesc8BitDoPro3%=pfGamepad, pf_8bitdo_pro3
@@ -201,6 +204,8 @@ DeviceDescEdge     ="Punktfunk Virtual DualSense Edge"
 DeviceDescDeck     ="Punktfunk Virtual Steam Deck Controller"
 DeviceDescTriton   ="Punktfunk Virtual Steam Controller"
 DeviceDescSwitchPro="Punktfunk Virtual Pro Controller"
+DeviceDescJoyConL  ="Punktfunk Virtual Joy-Con (L)"
+DeviceDescJoyConR  ="Punktfunk Virtual Joy-Con (R)"
 DeviceDesc8BitDoU2 ="Punktfunk Virtual 8BitDo Ultimate 2 Wireless"
 DeviceDesc8BitDoPro2="Punktfunk Virtual 8BitDo Pro 2"
 DeviceDesc8BitDoPro3="Punktfunk Virtual 8BitDo Pro 3"

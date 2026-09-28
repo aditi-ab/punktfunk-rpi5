@@ -1,7 +1,8 @@
-//! Nintendo Switch Pro Controller (wired, `057E:2009`) report tables and handshake replies,
-//! pinned to `hid-nintendo.c` and SDL's `SDL_hidapi_switch.c`. The UMDF driver answers the
-//! handshake from [`reply`] with no host round trip; Linux UHID calls the same function, so both
-//! serve identical bytes.
+//! Nintendo Switch Pro Controller (wired, `057E:2009`) and Joy-Con (`2006`/`2007`) report tables
+//! and handshake replies, pinned to `hid-nintendo.c` and SDL's `SDL_hidapi_switch.c`. A Joy-Con
+//! speaks the Pro protocol under its own device type. The UMDF driver answers the handshake from
+//! [`reply`] with no host round trip; Linux UHID calls the same function, so both serve identical
+//! bytes.
 //!
 //! USB: output `0x80 <cmd>` → input `0x81 <cmd>`. Subcommand `0x01` → `0x21`, whose 13-byte
 //! header is the latest `0x30` state report's. SPI `0x10` reads are served by address range.
@@ -76,25 +77,56 @@ pub fn state_report(
     r
 }
 
-/// At rest: sticks centred, nothing held, 1 g on +Z. Zero accel reads as free fall.
-pub fn neutral_report() -> [u8; REPORT_LEN] {
-    state_report(0, 0, [STICK_CENTER; 4], [0, 0, 4096], [0; 3])
+/// At rest: sticks centred, nothing held, 1 g on +Z. Zero accel reads as free fall. A right
+/// Joy-Con's IMU is mounted turned over, so its gravity reads on −Z.
+pub fn neutral_report(device_type: u8) -> [u8; REPORT_LEN] {
+    let z = match device_type {
+        crate::gamepad::DEVTYPE_JOYCON_RIGHT => -4096,
+        _ => 4096,
+    };
+    state_report(0, 0, [STICK_CENTER; 4], [0, 0, z], [0; 3])
 }
 
-/// Nintendo OUI plus the pad index: the MAC `hid-nintendo` keys `uniq` off and SDL reads.
-pub const fn mac(index: u8) -> [u8; 6] {
-    [0x7C, 0xBB, 0x8A, 0xDF, 0x00, index]
+/// Whether `device_type` speaks this protocol: the Pro Controller or a Joy-Con half.
+pub const fn is_switch(device_type: u8) -> bool {
+    use crate::gamepad::{DEVTYPE_JOYCON_LEFT, DEVTYPE_JOYCON_RIGHT, DEVTYPE_SWITCH_PRO};
+    matches!(
+        device_type,
+        DEVTYPE_SWITCH_PRO | DEVTYPE_JOYCON_LEFT | DEVTYPE_JOYCON_RIGHT
+    )
+}
+
+/// The controller type SDL reads from device info: 1 left Joy-Con, 2 right, 3 Pro.
+pub const fn controller_type(device_type: u8) -> u8 {
+    match device_type {
+        crate::gamepad::DEVTYPE_JOYCON_LEFT => 1,
+        crate::gamepad::DEVTYPE_JOYCON_RIGHT => 2,
+        _ => 3,
+    }
+}
+
+/// Nintendo OUI, 0 for a Pro or the Joy-Con's controller type, then the pad index: the MAC
+/// `hid-nintendo` keys `uniq` off and SDL reads. The two halves of a pair never share one.
+pub const fn mac(device_type: u8, index: u8) -> [u8; 6] {
+    let kind = match controller_type(device_type) {
+        3 => 0,
+        t => t,
+    };
+    [0x7C, 0xBB, 0x8A, 0xDF, kind, index]
 }
 
 /// `0x81 <cmd>` handshake ack; `hid-nintendo` matches those two bytes. SDL reads the status
-/// ack (`cmd` 0x01) for the controller type (3, Pro) and the MAC, least significant first.
-pub fn usb_ack(cmd: u8, index: u8) -> [u8; REPORT_LEN] {
+/// ack (`cmd` 0x01) for the controller type and the MAC, least significant first.
+pub fn usb_ack(cmd: u8, device_type: u8, index: u8) -> [u8; REPORT_LEN] {
     let mut r = [0u8; REPORT_LEN];
     r[0] = 0x81;
     r[1] = cmd;
     if cmd == 0x01 {
-        r[3] = 0x03;
-        for (slot, b) in r[4..10].iter_mut().zip(mac(index).iter().rev()) {
+        r[3] = controller_type(device_type);
+        for (slot, b) in r[4..10]
+            .iter_mut()
+            .zip(mac(device_type, index).iter().rev())
+        {
             *slot = *b;
         }
     }
@@ -119,10 +151,11 @@ pub fn subcmd_reply(
     r
 }
 
-/// Subcommand `0x02` payload: firmware 4.33, type `0x03` (Pro), then the MAC.
-pub fn device_info_payload(mac: &[u8; 6]) -> [u8; 12] {
-    let mut p = [0x04, 0x21, 0x03, 0x02, 0, 0, 0, 0, 0, 0, 0x01, 0x01];
-    p[4..10].copy_from_slice(mac);
+/// Subcommand `0x02` payload: firmware 4.33, the controller type, then the MAC.
+pub fn device_info_payload(device_type: u8, index: u8) -> [u8; 12] {
+    let kind = controller_type(device_type);
+    let mut p = [0x04, 0x21, kind, 0x02, 0, 0, 0, 0, 0, 0, 0x01, 0x01];
+    p[4..10].copy_from_slice(&mac(device_type, index));
     p
 }
 
@@ -175,16 +208,21 @@ pub fn spi_flash_read(addr: u32, len: u8) -> Vec<u8> {
     payload
 }
 
-/// The input report a Pro Controller answers `output` with, given its latest `0x30` `state`
-/// and pad `index`: `0x81` for a `0x80` command, `0x21` for a `0x01` subcommand. Device info
-/// and SPI reads carry data; every other subcommand is acked. `None` for rumble-only `0x10`.
-pub fn reply(state: &[u8; REPORT_LEN], output: &[u8], index: u8) -> Option<[u8; REPORT_LEN]> {
+/// The input report pad `index` of `device_type` answers `output` with, given its latest
+/// `0x30` `state`: `0x81` for a `0x80` command, `0x21` for a `0x01` subcommand. Device info and
+/// SPI reads carry data; every other subcommand is acked. `None` for rumble-only `0x10`.
+pub fn reply(
+    state: &[u8; REPORT_LEN],
+    output: &[u8],
+    device_type: u8,
+    index: u8,
+) -> Option<[u8; REPORT_LEN]> {
     match *output.first()? {
-        0x80 => Some(usb_ack(*output.get(1)?, index)),
+        0x80 => Some(usb_ack(*output.get(1)?, device_type, index)),
         0x01 if output.len() >= 11 => {
             let (id, args) = (output[10], &output[11..]);
             Some(match id {
-                0x02 => subcmd_reply(state, 0x82, id, &device_info_payload(&mac(index))),
+                0x02 => subcmd_reply(state, 0x82, id, &device_info_payload(device_type, index)),
                 0x10 => {
                     let addr = args
                         .get(..4)
@@ -220,7 +258,7 @@ mod tests {
         assert_eq!(r[19..21], 0x1122u16.to_le_bytes());
         assert_eq!(r[13..25], r[25..37]);
         assert_eq!(r[13..25], r[37..49]);
-        let n = neutral_report();
+        let n = neutral_report(crate::gamepad::DEVTYPE_SWITCH_PRO);
         assert_eq!(
             n[13 + 4..13 + 6],
             4096i16.to_le_bytes(),
@@ -260,38 +298,58 @@ mod tests {
     /// status ack names a Pro pad and its MAC), subcommands get `0x21` on the latched header.
     #[test]
     fn switch_reply_answers_the_handshake() {
+        use crate::gamepad::DEVTYPE_SWITCH_PRO as PRO;
         let state = state_report(9, 1 << 3, [STICK_CENTER; 4], [0, 0, 4096], [0; 3]);
-        let ack = reply(&state, &[0x80, 0x02], 3).expect("handshake ack");
+        let ack = reply(&state, &[0x80, 0x02], PRO, 3).expect("handshake ack");
         assert_eq!(ack[..2], [0x81, 0x02]);
         assert_eq!(ack[2..], [0u8; 62]);
-        let status = reply(&state, &[0x80, 0x01], 3).expect("status ack");
+        let status = reply(&state, &[0x80, 0x01], PRO, 3).expect("status ack");
         assert_eq!(status[3], 0x03, "controller type Pro");
         let mut mac_back = [0u8; 6];
         mac_back.copy_from_slice(&status[4..10]);
         mac_back.reverse();
-        assert_eq!(mac_back, mac(3), "SDL reverses the status MAC");
+        assert_eq!(mac_back, mac(PRO, 3), "SDL reverses the status MAC");
 
         let subcmd = |id: u8, args: &[u8]| {
             let mut out = alloc::vec![0x01, 0x05, 0, 1, 0x40, 0x40, 0, 1, 0x40, 0x40, id];
             out.extend_from_slice(args);
-            reply(&state, &out, 3).expect("subcommand reply")
+            reply(&state, &out, PRO, 3).expect("subcommand reply")
         };
         let info = subcmd(0x02, &[]);
         assert_eq!(info[..13], [&[0x21][..], &state[1..13]].concat()[..]);
         assert_eq!(info[13..15], [0x82, 0x02]);
-        assert_eq!(info[15..27], device_info_payload(&mac(3)));
+        assert_eq!(info[15..27], device_info_payload(PRO, 3));
         let spi = subcmd(0x10, &[0x3D, 0x60, 0, 0, 9]);
         assert_eq!(spi[13..15], [0x90, 0x10]);
         assert_eq!(spi[15..29], spi_flash_read(0x603D, 9)[..]);
         let mode = subcmd(0x03, &[0x30]);
         assert_eq!(mode[13..16], [0x80, 0x03, 0]);
 
-        assert!(reply(&state, &[0x10, 0x06, 0, 1, 0x40, 0x40, 0, 1, 0x40, 0x40], 3).is_none());
+        let rumble_only = [0x10, 0x06, 0, 1, 0x40, 0x40, 0, 1, 0x40, 0x40];
+        assert!(reply(&state, &rumble_only, PRO, 3).is_none());
         assert!(
-            reply(&state, &[0x01, 0x05], 3).is_none(),
+            reply(&state, &[0x01, 0x05], PRO, 3).is_none(),
             "short subcommand"
         );
-        assert!(reply(&state, &[], 3).is_none());
+        assert!(reply(&state, &[], PRO, 3).is_none());
+    }
+
+    /// Each Joy-Con half names its own type in device info, as SDL reads it over Bluetooth, and
+    /// the two halves of one pad never share a MAC.
+    #[test]
+    fn joycon_halves_name_their_side() {
+        use crate::gamepad::{DEVTYPE_JOYCON_LEFT as L, DEVTYPE_JOYCON_RIGHT as R};
+        let state = neutral_report(L);
+        let info = |dt| {
+            let out = [0x01, 0x05, 0, 1, 0x40, 0x40, 0, 1, 0x40, 0x40, 0x02];
+            reply(&state, &out, dt, 4).expect("device info")
+        };
+        assert_eq!(info(L)[17], 1, "left Joy-Con");
+        assert_eq!(info(R)[17], 2, "right Joy-Con");
+        assert_eq!(info(L)[19..25], mac(L, 4));
+        assert_ne!(mac(L, 4), mac(R, 4));
+        assert_eq!(usb_ack(0x01, R, 4)[3], 2);
+        assert!(is_switch(L) && is_switch(R) && !is_switch(crate::gamepad::DEVTYPE_XBOX));
     }
 
     /// User magics absent; stick min < center < max in per-side byte order; replies echo addr+len.
@@ -345,13 +403,18 @@ mod tests {
     #[test]
     fn switch_timer_advances_per_report() {
         use crate::gamepad::*;
-        let mut r = neutral_report();
+        let mut r = neutral_report(DEVTYPE_SWITCH_PRO);
         assert!(stamp_report_clock(DEVTYPE_SWITCH_PRO, &mut r, 0x1FF, 0));
         assert_eq!(r[1], 0xFF);
-        let mut ack = usb_ack(0x02, 0);
+        let mut ack = usb_ack(0x02, DEVTYPE_SWITCH_PRO, 0);
         assert!(!stamp_report_clock(DEVTYPE_SWITCH_PRO, &mut ack, 5, 0));
         assert_eq!(ack[1], 0x02);
         assert_eq!(pad_serial(DEVTYPE_SWITCH_PRO, 2), "7CBB8ADF0002");
+        assert_eq!(pad_serial(DEVTYPE_JOYCON_RIGHT, 2), "7CBB8ADF0202");
         assert_eq!(identity_vid_pid(DEVTYPE_SWITCH_PRO), Some((0x057E, 0x2009)));
+        assert_eq!(
+            identity_vid_pid(DEVTYPE_JOYCON_LEFT),
+            Some((0x057E, 0x2006))
+        );
     }
 }

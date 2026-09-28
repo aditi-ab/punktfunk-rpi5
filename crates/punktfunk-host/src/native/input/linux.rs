@@ -25,6 +25,7 @@ pub(super) struct PadBackends {
     eightbitdo_pro2: Option<crate::inject::eightbitdo::EightBitDoManager>,
     eightbitdo_pro3: Option<crate::inject::eightbitdo::EightBitDoManager>,
     horipad: Option<crate::inject::hori_steam::HoriManager>,
+    joycon: Option<crate::inject::switch_pro::JoyConPairManager>,
 }
 
 /// Build a backend on first use with the seat's device directory already on it. A pad created
@@ -127,6 +128,12 @@ impl PadBackends {
                 crate::inject::hori_steam::HoriManager::new
             )
             .handle(ev),
+            GamepadPref::JoyConPair => armed!(
+                self.joycon,
+                dev,
+                crate::inject::switch_pro::JoyConPairManager::new
+            )
+            .handle(ev),
             _ => return false,
         }
         true
@@ -195,6 +202,11 @@ impl PadBackends {
                     m.apply_rich(rich)
                 }
             }
+            GamepadPref::JoyConPair => {
+                if let Some(m) = &mut self.joycon {
+                    m.apply_rich(rich)
+                }
+            }
             _ => {}
         }
     }
@@ -222,6 +234,7 @@ impl PadBackends {
             eightbitdo_pro2,
             eightbitdo_pro3,
             horipad,
+            joycon,
         } = self;
         [
             dualsense.as_mut().map(|m| m as &mut dyn UhidTick),
@@ -238,6 +251,7 @@ impl PadBackends {
             eightbitdo_pro2.as_mut().map(|m| m as &mut dyn UhidTick),
             eightbitdo_pro3.as_mut().map(|m| m as &mut dyn UhidTick),
             horipad.as_mut().map(|m| m as &mut dyn UhidTick),
+            joycon.as_mut().map(|m| m as &mut dyn UhidTick),
         ]
         .into_iter()
         .flatten()

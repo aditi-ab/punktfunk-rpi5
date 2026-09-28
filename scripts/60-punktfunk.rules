@@ -43,6 +43,8 @@ KERNEL=="hidraw*", KERNELS=="*054C:0DF2*", GROUP="input", MODE="0660", TAG+="uac
 KERNEL=="hidraw*", KERNELS=="*054C:09CC*", GROUP="input", MODE="0660", TAG+="uaccess"
 # Switch Pro Controller (057E:2009) — SDL's hidapi driver wants hidraw for rumble/LEDs too
 KERNEL=="hidraw*", KERNELS=="*057E:2009*", GROUP="input", MODE="0660", TAG+="uaccess"
+# Joy-Con (L) / (R) (057E:2006 / 2007), the halves of a virtual pair
+KERNEL=="hidraw*", KERNELS=="*057E:200[67]*", GROUP="input", MODE="0660", TAG+="uaccess"
 # 8BitDo Ultimate 2 (2DC8:6012) / Pro 2 (2DC8:6003) / Pro 3 (2DC8:6009) and HORIPAD for Steam
 # (0F0D:01AB): hid-generic binds them, so hidraw is the only way their paddles and gyro reach SDL
 KERNEL=="hidraw*", KERNELS=="*2DC8:6012*", GROUP="input", MODE="0660", TAG+="uaccess"

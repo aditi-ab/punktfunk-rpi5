@@ -282,6 +282,8 @@ mod tests {
             super::super::steam_deck_windows::DECK_HWID,
             super::super::triton_windows::TRITON_HWID,
             super::super::switch_pro_windows::SWITCH_HWID,
+            super::super::switch_pro_windows::JOYCON_LEFT_HWID,
+            super::super::switch_pro_windows::JOYCON_RIGHT_HWID,
             super::super::eightbitdo_windows::ULTIMATE2_HWID,
             super::super::eightbitdo_windows::PRO2_HWID,
             super::super::eightbitdo_windows::PRO3_HWID,
@@ -402,6 +404,14 @@ mod tests {
             (
                 super::super::switch_pro_windows::SWITCH_HWID,
                 pf_driver_proto::gamepad::DEVTYPE_SWITCH_PRO,
+            ),
+            (
+                super::super::switch_pro_windows::JOYCON_LEFT_HWID,
+                pf_driver_proto::gamepad::DEVTYPE_JOYCON_LEFT,
+            ),
+            (
+                super::super::switch_pro_windows::JOYCON_RIGHT_HWID,
+                pf_driver_proto::gamepad::DEVTYPE_JOYCON_RIGHT,
             ),
             (
                 super::super::eightbitdo_windows::ULTIMATE2_HWID,

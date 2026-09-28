@@ -83,11 +83,12 @@ fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool, windows: bool
         // same 28DE:1302 pad a cabled one mints. That descriptor declares 0x79, so the client's
         // forwarded connect edge stays legal on it.
         GamepadPref::SteamController2Puck if windows => GamepadPref::SteamController2,
-        // Linux UHID, read by SDL and Steam through hidraw; Windows UMDF device types 9–12.
+        // Linux UHID, read by SDL and Steam through hidraw; Windows UMDF device types 9–14.
         GamepadPref::EightBitDoUltimate2 if linux || windows => GamepadPref::EightBitDoUltimate2,
         GamepadPref::EightBitDoPro2 if linux || windows => GamepadPref::EightBitDoPro2,
         GamepadPref::EightBitDoPro3 if linux || windows => GamepadPref::EightBitDoPro3,
         GamepadPref::HoripadSteam if linux || windows => GamepadPref::HoripadSteam,
+        GamepadPref::JoyConPair if linux || windows => GamepadPref::JoyConPair,
         _ => GamepadPref::Xbox360,
     }
 }
@@ -110,6 +111,7 @@ fn degrade_if_no_uhid(chosen: GamepadPref) -> GamepadPref {
             | GamepadPref::EightBitDoPro2
             | GamepadPref::EightBitDoPro3
             | GamepadPref::HoripadSteam
+            | GamepadPref::JoyConPair
     );
     if needs_uhid
         && std::fs::OpenOptions::new()
@@ -289,14 +291,16 @@ fn degrade_xbox_identity(chosen: GamepadPref) -> GamepadPref {
     chosen
 }
 
-/// UMDF identities newer than the first driver package, with the INF model token each needs.
+/// UMDF identities newer than the first driver package, with the INF model token each needs. One
+/// package carries both Joy-Con halves, so the left one stands for the pair.
 #[cfg(target_os = "windows")]
-const DRIVER_IDENTITIES: [(GamepadPref, &str); 5] = [
+const DRIVER_IDENTITIES: [(GamepadPref, &str); 6] = [
     (GamepadPref::SwitchPro, "pf_switchpro"),
     (GamepadPref::EightBitDoUltimate2, "pf_8bitdo_ultimate2"),
     (GamepadPref::EightBitDoPro2, "pf_8bitdo_pro2"),
     (GamepadPref::EightBitDoPro3, "pf_8bitdo_pro3"),
     (GamepadPref::HoripadSteam, "pf_horipad_steam"),
+    (GamepadPref::JoyConPair, "pf_joycon_left"),
 ];
 
 /// Fold an identity to the 360 pad when no driver-store package declares its hardware id. An
@@ -488,6 +492,7 @@ mod tests {
             EightBitDoPro2,
             EightBitDoPro3,
             HoripadSteam,
+            JoyConPair,
         ] {
             assert_eq!(pick_gamepad(p, None, true, false), p);
             assert_eq!(pick_gamepad(p, None, false, true), p);
