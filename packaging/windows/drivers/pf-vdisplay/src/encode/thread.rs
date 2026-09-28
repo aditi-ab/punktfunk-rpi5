@@ -198,7 +198,7 @@ impl EncodeThread {
 /// The thread body: open, build or reuse the monitor's pool, report, then drive until stopped.
 /// The pool is reused — retained slot included — when it already fits this session's device,
 /// size and input kind; anything else is a fresh pool installed on the monitor. The open line
-/// names the frame path (`pool` or S6's `bypass`), so a comparison run can prove which it got.
+/// names the frame path (`pool` or `bypass`), so a comparison run can prove which it got.
 fn run(stop: HANDLE, ctx: ThreadCtx, live: Arc<AtomicBool>) {
     let _mmcss = Mmcss::distribution("encode");
     let section = &ctx.session.section;
@@ -223,9 +223,15 @@ fn run(stop: HANDLE, ctx: ThreadCtx, live: Arc<AtomicBool>) {
         }
     };
     let size = (spec.width, spec.height);
+    // `PFVD_POOL_BYPASS` (machine environment, read per open): `0` copies every frame.
+    let bypass = wire::zero_copy(
+        spec.backend,
+        spec.kind == InputKind::Bgra,
+        crate::log::knob("PFVD_POOL_BYPASS").as_deref(),
+    );
     let reused = monitor
         .pool()
-        .filter(|p| p.matches(&ctx.device, spec.kind, size));
+        .filter(|p| p.matches(&ctx.device, spec.kind, size, bypass));
     let pool = match reused {
         Some(p) => p,
         None => match Pool::build(
@@ -234,6 +240,7 @@ fn run(stop: HANDLE, ctx: ThreadCtx, live: Arc<AtomicBool>) {
             size,
             monitor.source_seq.clone(),
             monitor.cursor_cell(),
+            bypass,
         ) {
             Ok(p) => {
                 monitor.set_pool(p.clone());

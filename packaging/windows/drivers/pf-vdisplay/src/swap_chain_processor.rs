@@ -8,9 +8,10 @@
 //! one fused GPU pass into a free pool slot — or drops at the pool. Nothing else: telemetry is
 //! stamped after `FinishedProcessingFrame`, because the window is what DWM waits on for this head.
 //!
-//! Spike S6 (`pool-bypass`) issues no pass: the encoder reads the acquired surface, which stays
-//! the driver's until the next acquire returns a frame. So the worker holds that acquire until
-//! the access unit is out, and `FinishedProcessingFrame` still goes out at once.
+//! A bypass pool issues no pass where it can: the encoder reads the acquired surface, which
+//! stays the driver's until the next acquire returns a frame. So the worker holds that acquire
+//! until the access unit is out, and `FinishedProcessingFrame` still goes out at once. Once the
+//! desktop goes still the worker copies that surface into the pool, the one pass of the run.
 //!
 //! The `wdk_iddcx` DDI wrappers return a RAW `NTSTATUS` (`i32`) that is HRESULT-shaped for the
 //! swap-chain DDIs, so we classify it by hand (`hr >= 0` = success; `0x8000_000A` = E_PENDING;
@@ -264,6 +265,8 @@ impl SwapChainProcessor {
 
         let mut logged_pending = false;
         let mut logged_frame = false;
+        // The surface the encoder last read in place: ours until an acquire returns a frame.
+        let mut last: Option<ID3D11Texture2D> = None;
         loop {
             // Check terminate at the TOP, every iteration. The success branch below does NOT re-check it,
             // so during a CONTINUOUS frame burst (DWM rendering the freshly-activated desktop) a thread the
@@ -340,6 +343,12 @@ impl SwapChainProcessor {
                 // which re-checks terminate, device removal and the encode slots. The wake event
                 // is auto-reset with ONE waiter, so a `SetEvent` raised while this thread is not
                 // waiting stays latched until its next wait — no wakeup is lost.
+                if waited == WAIT_TIMEOUT
+                    && let Some(tex) = last.take()
+                {
+                    // A whole idle wait with nothing composed: the desktop is still.
+                    attached.retain(&tex);
+                }
                 if waited == WAIT_OBJECT_0
                     || waited == WAIT_TIMEOUT
                     || waited.0 == WAIT_OBJECT_0.0 + 1
@@ -356,6 +365,8 @@ impl SwapChainProcessor {
                 // The OS's display time for this frame — the provenance stamp the access unit
                 // this frame becomes carries to the host.
                 let display_qpc = buffer.MetaData.PresentDisplayQPCTime;
+                // DWM composes on the previous surface from here on.
+                last = None;
                 if !logged_frame {
                     dbglog!(
                         "[pf-vd] swap-chain run_core: first frame acquired (target={target_id}) — DWM is compositing the virtual display"
@@ -375,8 +386,9 @@ impl SwapChainProcessor {
                         let res = unsafe { IDXGIResource::from_raw(raw) };
                         if let Ok(tex) = res.cast::<ID3D11Texture2D>() {
                             // The one fused pass into a free pool slot, or a drop at the pool.
-                            // Under S6 there is no pass and the surface is the encoder's.
+                            // A bypass pool may hand the encoder the surface itself instead.
                             held = attached.offer(device, &tex, display_qpc);
+                            last = held.then(|| tex.clone());
                             // Spike S5: one `CopyResource` into the probe's ring, or nothing.
                             #[cfg(feature = "encode-probe")]
                             crate::encode_probe::offer(device, &tex, display_qpc, target_id);
@@ -394,9 +406,9 @@ impl SwapChainProcessor {
                 // Stamped only now: nothing may sit between acquire and Finished. The present
                 // stamp feeds the compose-cadence histogram both modes are compared on.
                 attached.note_frame(display_qpc);
-                // S6: the surface is the driver's until the next acquire returns a frame, so
-                // an encoder still reading it holds that acquire (bounded). Never Finished:
-                // DWM composes this head's next frame on it.
+                // The surface is the driver's until the next acquire returns a frame, so an
+                // encoder still reading it holds that acquire (bounded). Never Finished: DWM
+                // composes this head's next frame on it.
                 if held {
                     attached.wait_release();
                 }

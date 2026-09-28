@@ -554,6 +554,21 @@ pub fn offer_slot(
     }
 }
 
+/// Whether a session's encoder reads the acquired surface itself instead of a copy of it.
+/// Only a BGRA input can: every other kind needs its converter. On by default for AMF
+/// alone, where the copy runs on the 3D engine a game renders on. `knob` is
+/// `PFVD_POOL_BYPASS`: `0` turns it off, any other value turns it on for every backend.
+///
+/// The driver's pool is Windows-only; the rule lives here so it is covered everywhere.
+#[must_use]
+pub fn zero_copy(backend: u32, bgra: bool, knob: Option<&str>) -> bool {
+    bgra && match knob.map(str::trim) {
+        Some("0") => false,
+        Some(_) => true,
+        None => backend == backend::AMF,
+    }
+}
+
 /// [`IOCTL_ENCODE_CTL`] input: one op against one monitor's live encoder. Unused `arg*` /
 /// `payload` bytes are zero. The ops are the `Encoder` trait calls the stream loop already
 /// makes locally on Linux, forwarded by a control proxy — so the wire shape is deliberately
@@ -818,6 +833,16 @@ mod tests {
         for kind in [Nv12, P010, P010Sdr] {
             assert_eq!(kind.fallback(2), None, "{kind:?}");
         }
+    }
+
+    #[test]
+    fn zero_copy_defaults_to_amf_bgra() {
+        use super::backend::{AMF, NVENC};
+        assert!(zero_copy(AMF, true, None));
+        assert!(!zero_copy(NVENC, true, None));
+        assert!(!zero_copy(AMF, true, Some("0")));
+        assert!(zero_copy(NVENC, true, Some("1")));
+        assert!(!zero_copy(AMF, false, Some("1")), "a converter kind");
     }
 
     #[test]
