@@ -4,7 +4,7 @@
 //!   (`capacity 1..=3`). Same contract as the Apple and Android presenters.
 //! * [`LatchClock`] — panel latch grid from `VK_KHR_present_wait` on-glass stamps.
 //!   A reported refresh is a mode claim; VRR makes it unusable. Without present-wait
-//!   the grid is last submit plus the mode period.
+//!   there is no grid: the drain presents at the due time and the panel quantizes.
 //! * [`PresentGate`] — at most one undisplayed FIFO present. MAILBOX cannot queue.
 //! * [`SourcePacer`] — smoothness plays on the source [`CadenceClock`], not arrival.
 //!
@@ -413,8 +413,10 @@ impl SourcePacer {
     /// roughly half a refresh of slack; presenting at the due time carries none, so
     /// the cushions differ. Re-tuning re-anchors (tuning is fixed at construction),
     /// so this keys off the probe's published verdict, not a per-window reading.
-    pub(crate) fn follow(&mut self, verdict: Cadence) {
-        let free = verdict == Cadence::Variable;
+    /// No glass grid (`grid_known` false: no present-wait) runs free as well — a grid
+    /// anchored on submit instants learns the stream's own cadence as the panel.
+    pub(crate) fn follow(&mut self, verdict: Cadence, grid_known: bool) {
+        let free = verdict == Cadence::Variable || !grid_known;
         if free != self.free_running {
             self.free_running = free;
             self.clock = CadenceClock::new(if free {
@@ -425,8 +427,8 @@ impl SourcePacer {
         }
     }
 
-    /// Present at the due time instead of snapping to the latch grid. True only
-    /// where variable refresh is measured live — the panel refreshes when we present.
+    /// Present at the due time instead of snapping to the latch grid: variable refresh
+    /// measured live (the panel refreshes when we present), or no glass grid at all.
     pub(crate) fn free_running(&self) -> bool {
         self.free_running
     }
@@ -900,28 +902,36 @@ mod tests {
         let mut p = SourcePacer::new();
         assert!(!p.free_running(), "snapping until the panel says otherwise");
         fold(&mut p, true, 200);
-        p.follow(Cadence::Fixed);
+        p.follow(Cadence::Fixed, true);
         assert!(!p.free_running());
         assert_eq!(
             p.health().frames,
             200,
             "a verdict that changes nothing must not re-anchor"
         );
-        p.follow(Cadence::Variable);
+        p.follow(Cadence::Variable, true);
         assert!(p.free_running());
         assert_eq!(p.health().frames, 0, "re-tuning is a fresh loop");
-        p.follow(Cadence::Unknown);
+        p.follow(Cadence::Unknown, true);
         assert!(
             !p.free_running(),
             "Unknown is the absence of a measurement, not a measurement of VRR"
         );
+        // No on-glass stamps (no present-wait): nothing to snap to, so the due time
+        // is the target here too, whatever the verdict.
+        p.follow(Cadence::Unknown, false);
+        assert!(p.free_running(), "without a glass grid the drain runs free");
+        p.follow(Cadence::Fixed, false);
+        assert!(p.free_running());
+        p.follow(Cadence::Unknown, true);
+        assert!(!p.free_running());
 
         // With no jitter yet, free-running already holds a frame back more than
         // snapping, which rides the half-refresh the snap-up gives it.
         let mut snap = SourcePacer::new();
         snap.due_ns(true, SRC_PTS0, SRC_READY0, SRC_P);
         let mut free = SourcePacer::new();
-        free.follow(Cadence::Variable);
+        free.follow(Cadence::Variable, true);
         free.due_ns(true, SRC_PTS0, SRC_READY0, SRC_P);
         assert!(
             free.health().cushion_ns > snap.health().cushion_ns,
