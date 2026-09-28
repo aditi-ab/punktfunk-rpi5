@@ -412,6 +412,25 @@ impl Presenter {
         unsafe { self.device.device_wait_idle() }.ok();
     }
 
+    /// Let go of the stream's picture before its pump is joined. The decoder frees its
+    /// pools once the held frame's token is back or its budget runs out, and a `Redraw`
+    /// after that samples freed memory. The console paints opaque over the empty screen.
+    pub(crate) fn drop_video(&mut self) {
+        // A lost device reads nothing more, so a failed wait still lets go.
+        self.quiesce_own().ok();
+        if let Some(f) = self.retired_hw.take() {
+            f.destroy(&self.device);
+        }
+        self.direct_last = None;
+        if let Some(v) = self.video.take() {
+            v.destroy(&self.device);
+        }
+        #[cfg(windows)]
+        {
+            self.retained_slot = None;
+        }
+    }
+
     /// True when `VK_KHR_present_wait` or the native lane's presentation feedback drives
     /// the display stamp. The run loop then defers e2e/display windows to
     /// [`Presenter::take_presented_samples`].

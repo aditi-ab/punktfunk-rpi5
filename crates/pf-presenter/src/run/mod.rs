@@ -504,7 +504,7 @@ fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Outcome> {
     // Join the pump before the device-wide idle: its decode submissions would race
     // vkDeviceWaitIdle otherwise.
     if let Some(st) = stream.take() {
-        st.shutdown();
+        st.shutdown(&mut sh.presenter);
     }
     // Overlay resources live on the presenter's device: quiesce the queue first, drop
     // the overlay, then the presenter tears down.
