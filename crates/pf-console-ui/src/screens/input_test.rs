@@ -207,7 +207,14 @@ fn layout(pref: Option<GamepadPref>) -> Layout {
             icon: icons::PAD_DUALSENSE_EDGE,
             ..dualsense
         },
-        Some(P::SwitchPro | P::EightBitDoPro2 | P::EightBitDoPro3 | P::JoyConPair) => Layout {
+        Some(
+            P::SwitchPro
+            | P::EightBitDoPro2
+            | P::EightBitDoPro3
+            | P::JoyConPair
+            | P::Switch2Pro
+            | P::Switch2GameCube,
+        ) => Layout {
             icon: icons::PAD_SWITCH_PRO,
             ls: (6.3, 8.6),
             rs: (14.7, 12.3),
@@ -422,6 +429,8 @@ mod tests {
             Some(P::EightBitDoPro3),
             Some(P::HoripadSteam),
             Some(P::JoyConPair),
+            Some(P::Switch2Pro),
+            Some(P::Switch2GameCube),
         ] {
             let l = layout(pref);
             let spots = [l.ls, l.rs, l.dpad, l.face, l.back, l.start, l.guide];

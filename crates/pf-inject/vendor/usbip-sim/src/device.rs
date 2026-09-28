@@ -52,12 +52,16 @@ pub struct UsbDevice {
     #[cfg_attr(feature = "serde", serde(skip))]
     pub device_handler: Option<Arc<Mutex<Box<dyn UsbDeviceHandler + Send>>>>,
 
-    /// Per-endpoint isochronous completion deadlines (punktfunk addition) — the absolute-time
-    /// ledger [`handle_iso_urb`](Self::handle_iso_urb) paces against. Keyed by endpoint address.
-    /// Shared across clones because the clones all present the same device: whoever services the
-    /// endpoint advances the one clock.
+    /// Per-endpoint completion deadlines (punktfunk addition) — the absolute-time ledger
+    /// [`next_deadline`](Self::next_deadline) keeps for isochronous URBs and paced interrupt IN.
+    /// Keyed by endpoint address. Shared across clones because the clones all present the same
+    /// device: whoever services the endpoint advances the one clock.
     #[cfg_attr(feature = "serde", serde(skip))]
-    pub(crate) iso_deadlines: Arc<Mutex<HashMap<u8, tokio::time::Instant>>>,
+    pub(crate) pace_deadlines: Arc<Mutex<HashMap<u8, tokio::time::Instant>>>,
+
+    /// Pace interrupt-IN polls on that ledger too (punktfunk addition). Off, a poll sleeps
+    /// `bInterval` from its submission and timer slop stretches the period: 4 ms serves near 5.
+    pub absolute_interrupt_pacing: bool,
 
     pub usb_version: Version,
 
@@ -350,24 +354,29 @@ impl UsbDevice {
             // ISO on ep0 is not a thing; treat it as an unsupported transfer rather than panicking.
             return Err(std::io::Error::other("isochronous transfer to ep0"));
         };
-        // Allow this much catch-up before deciding the stream stalled and re-anchoring. Two USB
-        // frames of slack keeps ordinary scheduling jitter inside the ledger (where it averages
-        // out) without letting a restarted stream burn through a stale deadline backlog.
-        const RESYNC_SLACK: std::time::Duration = std::time::Duration::from_millis(20);
         let step = self.service_interval(ep) * packets.len() as u32;
-        let deadline = {
-            let mut ledger = self.iso_deadlines.lock().unwrap();
-            let now = tokio::time::Instant::now();
-            let due = ledger.entry(ep.address).or_insert(now);
-            if *due + RESYNC_SLACK < now {
-                *due = now;
-            }
-            *due += step;
-            *due
-        };
-        tokio::time::sleep_until(deadline).await;
+        tokio::time::sleep_until(self.next_deadline(ep, step)).await;
         let mut handler = intf.handler.lock().unwrap();
         handler.handle_iso_urb(intf, ep, packets)
+    }
+
+    /// When `ep`'s next transfer of `step` completes: its ledger entry advanced by exactly `step`.
+    /// Overhead eats into the next sleep instead of accumulating. A ledger further behind than
+    /// two frames of slack means a stalled stream, which re-anchors to now rather than bursting.
+    pub(crate) fn next_deadline(
+        &self,
+        ep: UsbEndpoint,
+        step: std::time::Duration,
+    ) -> tokio::time::Instant {
+        const RESYNC_SLACK: std::time::Duration = std::time::Duration::from_millis(20);
+        let mut ledger = self.pace_deadlines.lock().unwrap();
+        let now = tokio::time::Instant::now();
+        let due = ledger.entry(ep.address).or_insert(now);
+        if *due + RESYNC_SLACK < now {
+            *due = now;
+        }
+        *due += step;
+        *due
     }
 
     pub(crate) async fn handle_urb(
@@ -862,6 +871,23 @@ mod pacing_tests {
 
     /// Full speed states `bInterval` in whole milliseconds instead, and 0 must not mean "no wait"
     /// (that would free-run the link).
+    /// A paced interrupt poll shares that ledger: a late wake-up shortens the next sleep instead
+    /// of stretching the period.
+    #[tokio::test(start_paused = true)]
+    async fn interrupt_pacing_holds_the_nominal_period() {
+        let d = dev(UsbSpeed::Full);
+        let ep = UsbEndpoint {
+            address: 0x81,
+            attributes: EndpointAttributes::Interrupt as u8,
+            max_packet_size: 64,
+            interval: 4,
+        };
+        let period = d.service_interval(ep);
+        let first = d.next_deadline(ep, period);
+        tokio::time::sleep_until(first + std::time::Duration::from_millis(1)).await;
+        assert_eq!(d.next_deadline(ep, period) - first, period);
+    }
+
     #[test]
     fn full_speed_interval_is_milliseconds_and_never_zero() {
         assert_eq!(

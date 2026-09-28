@@ -318,13 +318,19 @@ async fn serve<R: AsyncReadExt + Unpin>(
                             ) =>
                     {
                         let period = device.service_interval(ep);
+                        let due = (device.absolute_interrupt_pacing
+                            && matches!(ep.transfer_type(), Some(EndpointAttributes::Interrupt)))
+                        .then(|| device.next_deadline(ep, period));
                         let setup = SetupPacket::parse(&setup);
                         let (intf, tx, in_flight_task) =
                             (intf.clone(), tx.clone(), in_flight.clone());
                         let seqnum = header.seqnum;
                         let mut waiting = in_flight.lock().unwrap();
                         let task = tokio::spawn(async move {
-                            tokio::time::sleep(period).await;
+                            match due {
+                                Some(due) => tokio::time::sleep_until(due).await,
+                                None => tokio::time::sleep(period).await,
+                            }
                             let resp = intf.handler.lock().unwrap().handle_urb(
                                 &intf,
                                 ep,

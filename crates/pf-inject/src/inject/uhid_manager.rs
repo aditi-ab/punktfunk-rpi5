@@ -97,6 +97,18 @@ impl PadState for crate::switch_proto::SwitchState {
     }
 }
 
+impl PadState for crate::switch2_proto::Switch2State {
+    fn neutral() -> Self {
+        Self::neutral()
+    }
+    fn neutralize_gyro(&mut self) -> bool {
+        Self::neutralize_gyro(self)
+    }
+    fn clear_rich(&mut self) {
+        Self::clear_rich(self)
+    }
+}
+
 impl PadState for crate::eightbitdo_proto::EightBitDoState {
     fn neutral() -> Self {
         Self::neutral()

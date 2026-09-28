@@ -473,6 +473,10 @@ pub const PUNKTFUNK_GAMEPAD_8BITDO_PRO3: u32 = 14;
 pub const PUNKTFUNK_GAMEPAD_HORIPAD_STEAM: u32 = 15;
 /// Joy-Con pair (`057E:2006` + `2007`): SL/SR as paddles, gyro.
 pub const PUNKTFUNK_GAMEPAD_JOYCON_PAIR: u32 = 16;
+/// Switch 2 Pro Controller (`057E:2069`): GL/GR, gyro. Linux hosts only (usbip).
+pub const PUNKTFUNK_GAMEPAD_SWITCH2_PRO: u32 = 17;
+/// Switch 2 GameCube controller (`057E:2073`): analog triggers. Linux hosts only (usbip).
+pub const PUNKTFUNK_GAMEPAD_SWITCH2_GAMECUBE: u32 = 18;
 
 /// Extended `InputEvent` gamepad button bits: four back grips (Steam L4/L5/R4/R5 ≙
 /// Xbox-Elite P1–P4) + misc/capture, in Moonlight's `buttonFlags2 << 16` namespace.
@@ -605,6 +609,8 @@ const _: () = {
     assert!(PUNKTFUNK_GAMEPAD_8BITDO_PRO3 == GamepadPref::EightBitDoPro3.to_u8() as u32);
     assert!(PUNKTFUNK_GAMEPAD_HORIPAD_STEAM == GamepadPref::HoripadSteam.to_u8() as u32);
     assert!(PUNKTFUNK_GAMEPAD_JOYCON_PAIR == GamepadPref::JoyConPair.to_u8() as u32);
+    assert!(PUNKTFUNK_GAMEPAD_SWITCH2_PRO == GamepadPref::Switch2Pro.to_u8() as u32);
+    assert!(PUNKTFUNK_GAMEPAD_SWITCH2_GAMECUBE == GamepadPref::Switch2GameCube.to_u8() as u32);
     // Extended button bits mirror the wire `input::gamepad` constants.
     assert!(PUNKTFUNK_GAMEPAD_BTN_PADDLE1 == g::BTN_PADDLE1);
     assert!(PUNKTFUNK_GAMEPAD_BTN_PADDLE2 == g::BTN_PADDLE2);

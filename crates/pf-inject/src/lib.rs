@@ -828,6 +828,13 @@ pub mod steam_remap;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/steam_usbip.rs"]
 pub mod steam_usbip;
+/// Switch 2 Pro / GameCube codec for `switch2_usbip`. Not cfg-gated: pure byte-packing.
+#[path = "inject/proto/switch2_proto.rs"]
+pub mod switch2_proto;
+/// Virtual Switch 2 Pro / GameCube controllers over USB/IP: the libusb-only pads.
+#[cfg(target_os = "linux")]
+#[path = "inject/linux/switch2_usbip.rs"]
+pub mod switch2_usbip;
 /// Virtual Switch Pro via UHID (kernel `hid-nintendo`).
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/switch_pro.rs"]

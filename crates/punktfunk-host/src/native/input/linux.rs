@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::inject::eightbitdo_proto::Model as EightBitDo;
+use crate::inject::switch2_proto::Model as Switch2;
 use crate::inject::uhid_manager::UhidTick;
 
 /// Linux UHID/usbip Triton backend.
@@ -26,6 +27,8 @@ pub(super) struct PadBackends {
     eightbitdo_pro3: Option<crate::inject::eightbitdo::EightBitDoManager>,
     horipad: Option<crate::inject::hori_steam::HoriManager>,
     joycon: Option<crate::inject::switch_pro::JoyConPairManager>,
+    switch2_pro: Option<crate::inject::switch2_usbip::Switch2Manager>,
+    switch2_gamecube: Option<crate::inject::switch2_usbip::Switch2Manager>,
 }
 
 /// Build a backend on first use with the seat's device directory already on it. A pad created
@@ -134,6 +137,14 @@ impl PadBackends {
                 crate::inject::switch_pro::JoyConPairManager::new
             )
             .handle(ev),
+            GamepadPref::Switch2Pro => armed!(self.switch2_pro, dev, || {
+                crate::inject::switch2_usbip::manager(Switch2::Pro)
+            })
+            .handle(ev),
+            GamepadPref::Switch2GameCube => armed!(self.switch2_gamecube, dev, || {
+                crate::inject::switch2_usbip::manager(Switch2::GameCube)
+            })
+            .handle(ev),
             _ => return false,
         }
         true
@@ -207,6 +218,16 @@ impl PadBackends {
                     m.apply_rich(rich)
                 }
             }
+            GamepadPref::Switch2Pro => {
+                if let Some(m) = &mut self.switch2_pro {
+                    m.apply_rich(rich)
+                }
+            }
+            GamepadPref::Switch2GameCube => {
+                if let Some(m) = &mut self.switch2_gamecube {
+                    m.apply_rich(rich)
+                }
+            }
             _ => {}
         }
     }
@@ -235,6 +256,8 @@ impl PadBackends {
             eightbitdo_pro3,
             horipad,
             joycon,
+            switch2_pro,
+            switch2_gamecube,
         } = self;
         [
             dualsense.as_mut().map(|m| m as &mut dyn UhidTick),
@@ -252,6 +275,8 @@ impl PadBackends {
             eightbitdo_pro3.as_mut().map(|m| m as &mut dyn UhidTick),
             horipad.as_mut().map(|m| m as &mut dyn UhidTick),
             joycon.as_mut().map(|m| m as &mut dyn UhidTick),
+            switch2_pro.as_mut().map(|m| m as &mut dyn UhidTick),
+            switch2_gamecube.as_mut().map(|m| m as &mut dyn UhidTick),
         ]
         .into_iter()
         .flatten()
