@@ -174,7 +174,9 @@ fn layout(pref: Option<GamepadPref>) -> Layout {
         ..xbox_one
     };
     match pref {
-        Some(P::XboxOne | P::SteamController2Puck) | None => xbox_one,
+        // 8BitDo and HORI have no outline of their own: the nearest silhouette.
+        Some(P::XboxOne | P::SteamController2Puck | P::EightBitDoUltimate2 | P::HoripadSteam)
+        | None => xbox_one,
         Some(P::Auto | P::Xbox360) => Layout {
             icon: icons::PAD_XBOX_360,
             ls: (6.4, 9.4),
@@ -205,7 +207,7 @@ fn layout(pref: Option<GamepadPref>) -> Layout {
             icon: icons::PAD_DUALSENSE_EDGE,
             ..dualsense
         },
-        Some(P::SwitchPro) => Layout {
+        Some(P::SwitchPro | P::EightBitDoPro2 | P::EightBitDoPro3) => Layout {
             icon: icons::PAD_SWITCH_PRO,
             ls: (6.3, 8.6),
             rs: (14.7, 12.3),
@@ -415,6 +417,10 @@ mod tests {
             Some(P::SteamController2),
             Some(P::SteamController2Puck),
             Some(P::SteamDeck),
+            Some(P::EightBitDoUltimate2),
+            Some(P::EightBitDoPro2),
+            Some(P::EightBitDoPro3),
+            Some(P::HoripadSteam),
         ] {
             let l = layout(pref);
             let spots = [l.ls, l.rs, l.dpad, l.face, l.back, l.start, l.guide];

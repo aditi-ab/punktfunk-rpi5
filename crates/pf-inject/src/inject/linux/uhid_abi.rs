@@ -33,6 +33,7 @@ pub const HID_MAX_DESCRIPTOR_SIZE: usize = 4096;
 pub const UHID_EVENT_SIZE: usize = 4 + 4372;
 /// From `linux/input.h`.
 pub const BUS_USB: u16 = 0x03;
+pub const BUS_BLUETOOTH: u16 = 0x05;
 /// The GET_REPORT reply error for a report this pad does not have.
 const EIO: u16 = 5;
 
@@ -74,6 +75,8 @@ pub fn output_data(ev: &[u8]) -> &[u8] {
 /// `UHID_CREATE2` identity: what the kernel driver binds on. Strings truncate to the kernel's
 /// fields (name 128, phys and uniq 64).
 pub struct Create2<'a> {
+    /// [`BUS_USB`] or [`BUS_BLUETOOTH`]; SDL and Steam read the transport from it.
+    pub bus: u16,
     pub name: &'a str,
     pub phys: &'a str,
     pub uniq: &'a str,
@@ -119,7 +122,7 @@ impl UhidDevice {
         put_cstr(&mut ev, 132, 64, c.phys);
         put_cstr(&mut ev, 196, 64, c.uniq);
         ev[260..262].copy_from_slice(&(c.rdesc.len() as u16).to_ne_bytes());
-        ev[262..264].copy_from_slice(&BUS_USB.to_ne_bytes());
+        ev[262..264].copy_from_slice(&c.bus.to_ne_bytes());
         ev[264..268].copy_from_slice(&c.vendor.to_ne_bytes());
         ev[268..272].copy_from_slice(&c.product.to_ne_bytes());
         ev[272..276].copy_from_slice(&c.version.to_ne_bytes());

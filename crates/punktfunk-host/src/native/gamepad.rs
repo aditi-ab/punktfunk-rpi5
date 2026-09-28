@@ -84,6 +84,11 @@ fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool, windows: bool
         // same 28DE:1302 pad a cabled one mints. That descriptor declares 0x79, so the client's
         // forwarded connect edge stays legal on it.
         GamepadPref::SteamController2Puck if windows => GamepadPref::SteamController2,
+        // Linux UHID, read by SDL and Steam through hidraw.
+        GamepadPref::EightBitDoUltimate2 if linux => GamepadPref::EightBitDoUltimate2,
+        GamepadPref::EightBitDoPro2 if linux => GamepadPref::EightBitDoPro2,
+        GamepadPref::EightBitDoPro3 if linux => GamepadPref::EightBitDoPro3,
+        GamepadPref::HoripadSteam if linux => GamepadPref::HoripadSteam,
         _ => GamepadPref::Xbox360,
     }
 }
@@ -102,6 +107,10 @@ fn degrade_if_no_uhid(chosen: GamepadPref) -> GamepadPref {
             | GamepadPref::SteamController2
             | GamepadPref::SteamController2Puck
             | GamepadPref::SwitchPro
+            | GamepadPref::EightBitDoUltimate2
+            | GamepadPref::EightBitDoPro2
+            | GamepadPref::EightBitDoPro3
+            | GamepadPref::HoripadSteam
     );
     if needs_uhid
         && std::fs::OpenOptions::new()
@@ -458,6 +467,20 @@ mod tests {
         assert_eq!(pick_gamepad(Auto, Some("series"), true, false), XboxOne);
         assert_eq!(pick_gamepad(XboxOne, None, false, true), XboxOne);
         assert_eq!(pick_gamepad(XboxOne, None, false, false), Xbox360);
+        // Linux UHID only; Windows folds to the 360 pad until the driver serves them.
+        for p in [
+            EightBitDoUltimate2,
+            EightBitDoPro2,
+            EightBitDoPro3,
+            HoripadSteam,
+        ] {
+            assert_eq!(pick_gamepad(p, None, true, false), p);
+            assert_eq!(pick_gamepad(p, None, false, true), Xbox360);
+        }
+        assert_eq!(
+            pick_gamepad(Auto, Some("ultimate2"), true, false),
+            EightBitDoUltimate2
+        );
         // Linux uinput 045E:0B00; Windows UMDF.
         assert_eq!(pick_gamepad(XboxElite, None, false, true), XboxElite);
         assert_eq!(pick_gamepad(Auto, Some("elite"), false, true), XboxElite);

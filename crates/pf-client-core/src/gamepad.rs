@@ -108,8 +108,9 @@ fn pref_for_type(t: sdl3::gamepad::GamepadType) -> GamepadPref {
     }
 }
 
-/// Pads whose own identity SDL's type cannot name: no Valve type, the Edge reads as a PS5 and
-/// the Elite as an Xbox One. The host then builds that identity, so the extras land natively.
+/// Pads whose own identity SDL's type cannot name: no Valve, 8BitDo or HORI type, the Edge
+/// reads as a PS5 and the Elite as an Xbox One. The host then builds that identity, so the
+/// extras land natively.
 fn pref_for_ids(vid: u16, pid: u16) -> Option<GamepadPref> {
     match (vid, pid) {
         (0x28DE, 0x1205) => Some(GamepadPref::SteamDeck),
@@ -117,6 +118,11 @@ fn pref_for_ids(vid: u16, pid: u16) -> Option<GamepadPref> {
         (0x054C, 0x0DF2) => Some(GamepadPref::DualSenseEdge),
         // Elite Series 1, Series 2 USB, Bluetooth and BLE.
         (0x045E, 0x02E3 | 0x0B00 | 0x0B05 | 0x0B22) => Some(GamepadPref::XboxElite),
+        // 8BitDo in its own HID mode; X-input mode is `310B` and stays Xbox 360.
+        (0x2DC8, 0x6012) => Some(GamepadPref::EightBitDoUltimate2),
+        (0x2DC8, 0x6003 | 0x6006) => Some(GamepadPref::EightBitDoPro2),
+        (0x2DC8, 0x6009) => Some(GamepadPref::EightBitDoPro3),
+        (0x0F0D, 0x01AB | 0x0196) => Some(GamepadPref::HoripadSteam),
         _ => crate::sc2_capture::pref_for(vid, pid),
     }
 }
@@ -2325,8 +2331,14 @@ mod pref_for_ids_tests {
         for elite in [0x02E3, 0x0B00, 0x0B05, 0x0B22] {
             assert_eq!(pref_for_ids(0x045E, elite), Some(P::XboxElite));
         }
+        assert_eq!(pref_for_ids(0x2DC8, 0x6012), Some(P::EightBitDoUltimate2));
+        assert_eq!(pref_for_ids(0x2DC8, 0x6006), Some(P::EightBitDoPro2));
+        assert_eq!(pref_for_ids(0x2DC8, 0x6009), Some(P::EightBitDoPro3));
+        assert_eq!(pref_for_ids(0x0F0D, 0x0196), Some(P::HoripadSteam));
         // A plain Series pad keeps SDL's type.
         assert_eq!(pref_for_ids(0x045E, 0x0B12), None);
+        // X-input mode is an Xbox 360 pad.
+        assert_eq!(pref_for_ids(0x2DC8, 0x310B), None);
     }
 }
 

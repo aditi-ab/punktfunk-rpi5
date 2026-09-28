@@ -2,6 +2,7 @@
 //! identity. Xbox360 over uinput is the common default and stays in `Pads`.
 
 use super::*;
+use crate::inject::eightbitdo_proto::Model as EightBitDo;
 use crate::inject::uhid_manager::UhidTick;
 
 /// Linux UHID/usbip Triton backend.
@@ -20,6 +21,10 @@ pub(super) struct PadBackends {
     steamctrl: Option<crate::inject::steam_controller::SteamCtrlManager>,
     steamctrl2: Option<Sc2Manager>,
     steamctrl2_puck: Option<crate::inject::steam_controller2::Triton2Manager>,
+    eightbitdo_ultimate2: Option<crate::inject::eightbitdo::EightBitDoManager>,
+    eightbitdo_pro2: Option<crate::inject::eightbitdo::EightBitDoManager>,
+    eightbitdo_pro3: Option<crate::inject::eightbitdo::EightBitDoManager>,
+    horipad: Option<crate::inject::hori_steam::HoriManager>,
 }
 
 /// Build a backend on first use with the seat's device directory already on it. A pad created
@@ -104,6 +109,24 @@ impl PadBackends {
                 )
             })
             .handle(ev),
+            GamepadPref::EightBitDoUltimate2 => armed!(self.eightbitdo_ultimate2, dev, || {
+                crate::inject::eightbitdo::manager(EightBitDo::Ultimate2)
+            })
+            .handle(ev),
+            GamepadPref::EightBitDoPro2 => armed!(self.eightbitdo_pro2, dev, || {
+                crate::inject::eightbitdo::manager(EightBitDo::Pro2)
+            })
+            .handle(ev),
+            GamepadPref::EightBitDoPro3 => armed!(self.eightbitdo_pro3, dev, || {
+                crate::inject::eightbitdo::manager(EightBitDo::Pro3)
+            })
+            .handle(ev),
+            GamepadPref::HoripadSteam => armed!(
+                self.horipad,
+                dev,
+                crate::inject::hori_steam::HoriManager::new
+            )
+            .handle(ev),
             _ => return false,
         }
         true
@@ -152,6 +175,26 @@ impl PadBackends {
                     m.apply_rich(rich)
                 }
             }
+            GamepadPref::EightBitDoUltimate2 => {
+                if let Some(m) = &mut self.eightbitdo_ultimate2 {
+                    m.apply_rich(rich)
+                }
+            }
+            GamepadPref::EightBitDoPro2 => {
+                if let Some(m) = &mut self.eightbitdo_pro2 {
+                    m.apply_rich(rich)
+                }
+            }
+            GamepadPref::EightBitDoPro3 => {
+                if let Some(m) = &mut self.eightbitdo_pro3 {
+                    m.apply_rich(rich)
+                }
+            }
+            GamepadPref::HoripadSteam => {
+                if let Some(m) = &mut self.horipad {
+                    m.apply_rich(rich)
+                }
+            }
             _ => {}
         }
     }
@@ -175,6 +218,10 @@ impl PadBackends {
             steamctrl,
             steamctrl2,
             steamctrl2_puck,
+            eightbitdo_ultimate2,
+            eightbitdo_pro2,
+            eightbitdo_pro3,
+            horipad,
         } = self;
         [
             dualsense.as_mut().map(|m| m as &mut dyn UhidTick),
@@ -185,6 +232,12 @@ impl PadBackends {
             steamctrl.as_mut().map(|m| m as &mut dyn UhidTick),
             steamctrl2.as_mut().map(|m| m as &mut dyn UhidTick),
             steamctrl2_puck.as_mut().map(|m| m as &mut dyn UhidTick),
+            eightbitdo_ultimate2
+                .as_mut()
+                .map(|m| m as &mut dyn UhidTick),
+            eightbitdo_pro2.as_mut().map(|m| m as &mut dyn UhidTick),
+            eightbitdo_pro3.as_mut().map(|m| m as &mut dyn UhidTick),
+            horipad.as_mut().map(|m| m as &mut dyn UhidTick),
         ]
         .into_iter()
         .flatten()

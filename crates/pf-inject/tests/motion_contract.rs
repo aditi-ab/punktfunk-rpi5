@@ -17,6 +17,8 @@ use pf_inject::dualshock4_proto::{
     serialize_state as ds4_serialize, DS4_FEATURE_CALIBRATION, DS4_INPUT_REPORT_LEN, DS4_TOUCH_H,
     DS4_TOUCH_W,
 };
+use pf_inject::eightbitdo_proto::EightBitDoState;
+use pf_inject::hori_proto::HoriState;
 use pf_inject::steam_proto::SteamState;
 use pf_inject::steam_remap::motion_wire_to_deck;
 use pf_inject::switch_proto::SwitchState;
@@ -162,6 +164,34 @@ fn rescaling_backends_convert_the_wire_into_their_native_units() {
     st.apply_motion([wire_gyro; 3], [wire_accel; 3]);
     assert_eq!(st.gyro, [1424; 3], "Switch gyro: 100 °/s at 14.247 LSB/°·s");
     assert_eq!(st.accel, [4096; 3], "Switch accel: 1 g at 4096 LSB/g");
+
+    // SDL 8bitdo: INT16_MAX = 2000 °/s, accel 4096 LSB/g. Signs are the codec tests' job.
+    let mut st = EightBitDoState::neutral();
+    st.apply_motion([wire_gyro; 3], [wire_accel; 3]);
+    assert_eq!(
+        st.gyro.map(i16::abs),
+        [1638; 3],
+        "8BitDo gyro: 100 °/s at 32767/2000"
+    );
+    assert_eq!(
+        st.accel.map(i16::abs),
+        [4096; 3],
+        "8BitDo accel: 1 g at 4096 LSB/g"
+    );
+
+    // SDL steam_hori: the i16 range spans ±2048 °/s, 16 LSB/°·s; accel 4096 LSB/g.
+    let mut st = HoriState::neutral();
+    st.apply_motion([wire_gyro; 3], [wire_accel; 3]);
+    assert_eq!(
+        st.gyro.map(i16::abs),
+        [1600; 3],
+        "HORIPAD gyro: 100 °/s at 16 LSB/°·s"
+    );
+    assert_eq!(
+        st.accel.map(i16::abs),
+        [4096; 3],
+        "HORIPAD accel: 1 g at 4096 LSB/g"
+    );
 }
 
 /// Sony backends pass the wire sample unscaled. Correct only because the blobs above

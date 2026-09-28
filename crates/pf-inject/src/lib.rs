@@ -701,6 +701,13 @@ pub mod dualshock4_proto;
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/dualshock4_windows.rs"]
 pub mod dualshock4_windows;
+/// Virtual 8BitDo pads in their own HID mode via UHID (`hid-generic`; SDL and Steam read hidraw).
+#[cfg(target_os = "linux")]
+#[path = "inject/linux/eightbitdo.rs"]
+pub mod eightbitdo;
+/// 8BitDo HID-mode codec. Not cfg-gated: pure byte-packing, so layout tests run on any host.
+#[path = "inject/proto/eightbitdo_proto.rs"]
+pub mod eightbitdo_proto;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/gamepad.rs"]
 pub mod gamepad;
@@ -713,6 +720,13 @@ pub mod gamepad;
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/gamepad_raii.rs"]
 mod gamepad_raii;
+/// HORIPAD for Steam codec. Not cfg-gated, like [`eightbitdo_proto`].
+#[path = "inject/proto/hori_proto.rs"]
+pub mod hori_proto;
+/// Virtual HORIPAD for Steam via UHID (`hid-generic`; SDL and Steam read hidraw).
+#[cfg(target_os = "linux")]
+#[path = "inject/linux/hori_steam.rs"]
+pub mod hori_steam;
 /// Resident virtual HID mouse via pf-mouse UMDF. Keeps `SM_MOUSEPRESENT` true on headless
 /// hosts so DWM composites a cursor into the IDD frame — `SendInput` alone moves an
 /// invisible pointer with no physical mouse.
@@ -757,6 +771,10 @@ mod pad_shm_ring;
 /// everywhere or nowhere.
 #[path = "inject/pad_slots.rs"]
 pub mod pad_slots;
+/// Report-descriptor walk for the codec tests.
+#[cfg(test)]
+#[path = "inject/proto/rdesc_walk.rs"]
+mod rdesc_walk;
 /// Per-seat device visibility ([`seat_dev::SeatDev`]): the symlinks a sandboxed seat's Steam
 /// resolves its pads through, and the host-wide lock every create takes.
 ///
@@ -764,9 +782,8 @@ pub mod pad_slots;
 /// window arithmetic and the cross-seat rule are what a test pins, everywhere or nowhere.
 #[path = "inject/seat_dev.rs"]
 pub mod seat_dev;
-/// `sensor_timestamp` every virtual Sony pad stamps into its input reports
-/// ([`sensor_clock::SensorClock`]) — elapsed time in DualSense 1/3 µs and DualShock 4
-/// 5.33 µs units, shared by all four backends.
+/// The IMU clock virtual pads stamp into their input reports ([`sensor_clock::SensorClock`]):
+/// elapsed time in DualSense 1/3 µs, DualShock 4 5.33 µs, and µs for 8BitDo and HORIPAD.
 #[path = "inject/sensor_clock.rs"]
 pub mod sensor_clock;
 /// Virtual Steam Deck via UHID — kernel `hid-steam` binds it as a real Deck.

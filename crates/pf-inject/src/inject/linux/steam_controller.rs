@@ -72,6 +72,7 @@ impl SteamDeckPad {
             SteamModel::Controller => ("Steam Controller", "steamctrl", "steamctrl"),
         };
         let dev = UhidDevice::open(&Create2 {
+            bus: crate::uhid_abi::BUS_USB,
             name: &format!("Punktfunk {name} {index}"),
             phys: &format!("punktfunk/{phys}/{index}"),
             uniq: &format!("punktfunk-{uniq}-{index}"),
