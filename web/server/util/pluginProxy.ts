@@ -149,3 +149,14 @@ export async function pluginJson(res: Response, id: string): Promise<unknown> {
 		return { error: text || `plugin ${id} answered ${res.status}` };
 	}
 }
+
+/**
+ * The frame's half of `pf-ui:theme`: asks the console for its palette, then sets each reply as
+ * inline custom properties on `<html>`, which outrank plugin-kit's `:root` and `.dark`. Only the
+ * parent is heard; the plugin origin's `frame-ancestors` makes that the console.
+ */
+const THEME_RECEIVER = `<script>(()=>{if(parent===window)return;const r=document.documentElement;addEventListener("message",e=>{const d=e.data;if(e.source!==parent||d?.type!=="pf-ui:theme")return;r.classList.toggle("dark",!!d.dark);r.style.colorScheme=d.dark?"dark":"light";for(const[k,v]of Object.entries(d.tokens??{}))if(k.startsWith("--")&&typeof v==="string")r.style.setProperty(k,v)});parent.postMessage({type:"pf-ui:theme-request"},"*")})()</script>`;
+
+/** Put {@link THEME_RECEIVER} first in `<head>`, ahead of the stylesheets that would delay it. */
+export const injectThemeReceiver = (html: string): string =>
+	html.replace(/<head\b[^>]*>/i, (tag) => tag + THEME_RECEIVER);

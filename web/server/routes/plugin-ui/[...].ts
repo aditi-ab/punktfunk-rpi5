@@ -2,7 +2,8 @@
 // here the gate (middleware/auth.ts) has confirmed a session — a plugin UI is reachable only by the
 // logged-in operator, on the console's own origin, with no separate password. We look up the
 // plugin's `{port, secret}` server-side, inject the secret as a bearer, strip the browser's cookie,
-// and stream the response through (SSE included). The plugin only ever gets dialed on 127.0.0.1.
+// and stream the response through (SSE included). An HTML page is buffered to carry the theme
+// receiver. The plugin only ever gets dialed on 127.0.0.1.
 //
 // This route runs in the built Bun/Nitro server. In `vite dev` a small middleware in vite.config.ts
 // handles `/plugin-ui` instead (it intercepts before this route, like the /api dev proxy).
@@ -17,6 +18,7 @@ import {
 import {
 	bustCredential,
 	fetchUiCredential,
+	injectThemeReceiver,
 	PLUGIN_ID_RE,
 } from "../../util/pluginProxy";
 
@@ -77,6 +79,10 @@ export default defineEventHandler(async (event) => {
 	if (!resp) {
 		setResponseStatus(event, 502);
 		return { error: `plugin "${id}" is not running` };
+	}
+	// Every plugin page follows the console's theme, published plugins included.
+	if (resp.body && resp.headers.get("content-type")?.includes("text/html")) {
+		resp = new Response(injectThemeReceiver(await resp.text()), resp);
 	}
 	return sendWebResponse(event, sanitize(resp));
 });

@@ -7,7 +7,8 @@
 // to its own loopback REST with the operator's session, because that origin is same-SITE and the
 // `SameSite=Lax` cookie reaches it; what it can no longer do is read or drive the console. It may
 // still keep the address bar in sync by posting `{ type: "pf-ui:navigate", path }` to the parent —
-// now verified against the plugin origin before it is honoured.
+// now verified against the plugin origin before it is honoured. The proxy-injected receiver asks
+// for the console's palette with `pf-ui:theme-request`.
 import { useQuery } from "@tanstack/react-query";
 import { getRouteApi, useNavigate } from "@tanstack/react-router";
 import { ExternalLink, Pin, PinOff, RefreshCw } from "lucide-react";
@@ -23,6 +24,46 @@ import { m } from "@/paraglide/messages";
 import { TierBadge } from "@/sections/Store/TierBadge";
 
 const route = getRouteApi("/plugins/$pluginId/$");
+
+/** The palette names plugin-kit's theme.css declares that the console also themes. */
+const THEME_TOKENS = [
+	"--pf-brand",
+	"--pf-brand-light",
+	"--pf-highlight",
+	"--background",
+	"--foreground",
+	"--card",
+	"--card-foreground",
+	"--popover",
+	"--popover-foreground",
+	"--muted",
+	"--muted-foreground",
+	"--secondary",
+	"--secondary-foreground",
+	"--accent",
+	"--accent-foreground",
+	"--border",
+	"--input",
+	"--ring",
+	"--primary",
+	"--primary-foreground",
+	"--success",
+	"--destructive",
+	"--destructive-foreground",
+];
+
+/** Computed values, so the frame never re-derives the accent and desktop mixes in styles.css. */
+function themeMessage() {
+	const root = document.documentElement;
+	const style = getComputedStyle(root);
+	return {
+		type: "pf-ui:theme",
+		dark: root.classList.contains("dark"),
+		tokens: Object.fromEntries(
+			THEME_TOKENS.map((t) => [t, style.getPropertyValue(t).trim()]),
+		),
+	};
+}
 
 export const SectionPlugin: FC = () => {
 	useLocale();
@@ -128,16 +169,20 @@ export const SectionPlugin: FC = () => {
 		[pluginId, pluginOrigin],
 	);
 
-	// Keep the console address bar in sync with the plugin's internal routing.
+	// Keep the console address bar in sync with the plugin's internal routing, and hand the frame
+	// the console's palette when it asks and whenever the root's theme attributes change.
 	useEffect(() => {
+		// Empty `pluginOrigin` is the vite-dev same-origin arrangement.
+		const expected = pluginOrigin || window.location.origin;
+		const postTheme = () =>
+			iframeRef.current?.contentWindow?.postMessage(themeMessage(), expected);
 		const onMessage = (e: MessageEvent) => {
 			if (e.source !== iframeRef.current?.contentWindow) return;
-			// Now that the frame is cross-origin, `e.origin` is a real check rather than a tautology:
-			// only the plugin origin may drive the console's address bar. (Empty `pluginOrigin` is
-			// the vite-dev same-origin arrangement, where `e.origin` is our own.)
-			const expected = pluginOrigin || window.location.origin;
+			// The frame is cross-origin, so this is a real check: only the plugin origin may drive
+			// the console's address bar.
 			if (e.origin !== expected) return;
 			const data = e.data as { type?: string; path?: string };
+			if (data?.type === "pf-ui:theme-request") postTheme();
 			if (data?.type === "pf-ui:navigate" && typeof data.path === "string") {
 				navigate({
 					to: "/plugins/$pluginId/$",
@@ -147,7 +192,14 @@ export const SectionPlugin: FC = () => {
 			}
 		};
 		window.addEventListener("message", onMessage);
-		return () => window.removeEventListener("message", onMessage);
+		const observer = new MutationObserver(postTheme);
+		observer.observe(document.documentElement, {
+			attributeFilter: ["class", "style", "data-accent", "data-omarchy"],
+		});
+		return () => {
+			window.removeEventListener("message", onMessage);
+			observer.disconnect();
+		};
 	}, [pluginId, navigate, pluginOrigin]);
 
 	return (

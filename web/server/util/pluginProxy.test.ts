@@ -8,7 +8,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { isDialablePort, PLUGIN_ID_RE, validEntryId } from "./pluginProxy";
+import {
+	injectThemeReceiver,
+	isDialablePort,
+	PLUGIN_ID_RE,
+	validEntryId,
+} from "./pluginProxy";
 
 const CONSOLE_PORT = "47992";
 const PLUGIN_PORT = "47993";
@@ -97,5 +102,20 @@ describe("validEntryId", () => {
 	}
 	test("refuses control characters the host would let through", () => {
 		expect(validEntryId("steam:5\u00070")).toBe(false);
+	});
+});
+
+describe("injectThemeReceiver", () => {
+	test("goes first in <head>, never into <header>", () => {
+		const out = injectThemeReceiver(
+			'<html class="dark"><head lang="en"><link rel="stylesheet"></head><body><header></header></body></html>',
+		);
+		expect(out).toContain('<head lang="en"><script>');
+		expect(out).toContain("<header></header>");
+		expect(out.match(/<script>/g)).toHaveLength(1);
+	});
+
+	test("leaves a page without <head> alone", () => {
+		expect(injectThemeReceiver("<p>hi</p>")).toBe("<p>hi</p>");
 	});
 });
