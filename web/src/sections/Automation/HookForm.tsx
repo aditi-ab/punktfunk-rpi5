@@ -1,6 +1,7 @@
+import { keepPreviousData } from "@tanstack/react-query";
 import { type FC, useEffect, useMemo, useState } from "react";
 import { useListPairedClients } from "@/api/gen/clients/clients";
-import { useGetLibrary } from "@/api/gen/library/library";
+import { useGetLibraryPage } from "@/api/gen/library/library";
 import type { HookEntry } from "@/api/gen/model/hookEntry";
 import { useListNativeClients } from "@/api/gen/native/native";
 import { Button } from "@/components/ui/button";
@@ -25,9 +26,13 @@ import {
 	SelectValue,
 } from "@/components/ui/select";
 import { EVENT_KINDS, eventKindLabel } from "@/lib/event-kinds";
+import { useDebounced } from "@/lib/use-debounced";
 import { m } from "@/paraglide/messages";
 
 const EMPTY: HookEntry = { on: "session.started", run: "" };
+
+/** The suggestion list shows this many rows, so the host is asked for no more. */
+const SUGGESTIONS = 50;
 
 // Radix reserves the empty string, so "no device filter" needs a value of its own.
 const ANY_DEVICE = "any";
@@ -60,14 +65,29 @@ export const HookForm: FC<{
 	const set = (patch: Partial<HookEntry>) =>
 		setDraft((d) => ({ ...d, ...patch }));
 
-	// Only while the filter section is open: a hook that does not filter has no reason to pull
-	// a library that can run to five figures.
-	const library = useGetLibrary(undefined, { query: { enabled: filtered } });
+	// The host searches: the field's text goes out once typing pauses and one page of matches
+	// comes back. Only while the filter section is open.
+	const typed = useDebounced((draft.filter?.app ?? "").trim(), 250);
+	const byTitle = useGetLibraryPage(
+		{ q: typed, limit: SUGGESTIONS },
+		{ query: { enabled: filtered, placeholderData: keepPreviousData } },
+	);
+	// A stored filter is an id (`steam:570`), which no title contains: ask for it by id too, so
+	// the field still shows which game it names.
+	const byId = useGetLibraryPage(
+		{ id: typed, limit: 1 },
+		{ query: { enabled: filtered && typed.includes(":") } },
+	);
 	const clients = useListNativeClients({ query: { enabled: filtered } });
 	const moonlight = useListPairedClients({ query: { enabled: filtered } });
 	const appOptions: ComboboxOption[] = useMemo(
 		() =>
-			(library.data ?? []).map((g) => ({
+			[
+				...(byId.data?.items ?? []),
+				...(byTitle.data?.items ?? []).filter(
+					(g) => g.id !== byId.data?.items[0]?.id,
+				),
+			].map((g) => ({
 				value: g.id,
 				label: g.title,
 				// Portrait first, header second — the same step-down the library grid does, so a
@@ -80,7 +100,7 @@ export const HookForm: FC<{
 					</span>
 				),
 			})),
-		[library.data],
+		[byId.data, byTitle.data],
 	);
 	// Both planes' paired devices, keyed by the certificate — a device name is neither unique
 	// nor fixed, so renaming one would otherwise stop its hooks matching. The name is what the
