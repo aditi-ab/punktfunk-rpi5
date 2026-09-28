@@ -22,6 +22,9 @@ impl Shell {
         // warps a synthetic mouse; under relative lock that is a large positive delta that
         // walks the host cursor into the corner.
         sdl3::hint::set("SDL_TOUCH_MOUSE_EVENTS", "0");
+        // The keyboard grab exists only while shortcut capture is on, and then Alt+Tab
+        // belongs to the host. SDL's default minimizes a grabbed fullscreen window on it.
+        sdl3::hint::set("SDL_ALLOW_ALT_TAB_WHILE_GRABBED", "0");
         // Wayland `app_id` (and X11 WM_CLASS) so compositors match io.unom.Punktfunk.desktop.
         // Without it SDL uses a generic identity and the session window gets the default icon.
         sdl3::hint::set("SDL_APP_ID", "io.unom.Punktfunk");
