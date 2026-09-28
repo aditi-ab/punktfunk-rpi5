@@ -208,11 +208,10 @@ impl State {
 
     /// Drop a `kde_output_device_mode_v2` the compositor has destroyed.
     ///
-    /// `removed` is not `type="destructor"`; the compositor destroys the object right
-    /// after sending it, but wayland-rs keeps the proxy. Handing that id back in
-    /// `kde_output_configuration_v2.mode` is a protocol error that kills the connection.
-    /// `set_custom_modes` replaces the custom list, so a previous session's mode is
-    /// destroyed the moment this one installs its own.
+    /// The vendored XML marks `removed` a destructor, so wayland-rs frees the id KWin
+    /// hands its next mode; any proxy kept here names a dead object. `set_custom_modes`
+    /// replaces the custom list, so a previous session's mode is destroyed the moment
+    /// this one installs its own.
     fn forget_mode(&mut self, id: &ObjectId) {
         self.mode_dims.remove(id);
         for dev in self.devices.values_mut() {
@@ -447,7 +446,7 @@ impl crate::wl_pump::SyncDone for State {
     }
 }
 
-struct Session {
+pub(crate) struct Session {
     conn: Connection,
     queue: wayland_client::EventQueue<State>,
     state: State,
@@ -619,10 +618,10 @@ impl Session {
         })
     }
 
-    /// Our just-created virtual output: managed-prefix name AND current size equal to
-    /// the size we created it at. During a supersede the replacement reuses the
-    /// per-slot name while the predecessor is still alive; only the new one sits at
-    /// this size. Newest wins remaining ties: global `name`, else [`DeviceState::seq`].
+    /// Our just-created virtual output: managed-prefix name AND current size `our_w`×`our_h`.
+    /// During a supersede the predecessor keeps the per-slot name and KWin restores its
+    /// stored mode onto the new one, so both can match. Newest wins: global `name`, else
+    /// [`DeviceState::seq`], which is creation order only on a [`watch`] connection.
     fn resolve_ours(&self, our_prefix: &str, our_w: u32, our_h: u32) -> Option<DeviceState> {
         self.state
             .devices
@@ -684,10 +683,31 @@ pub(crate) fn list_monitors() -> anyhow::Result<Vec<crate::monitors::PhysicalMon
     Ok(out)
 }
 
+/// The connection for one create, opened before the output exists. KWin announces
+/// an output made later after every one this connection already holds, so
+/// newest-wins resolves ours while a same-named predecessor shares its name, UUID
+/// and restored mode. A later connection cannot: KWin ≥ 6.7 announces existing
+/// outputs in hash order.
+pub(crate) fn watch() -> Option<Session> {
+    Session::open("watch").ok()
+}
+
+/// `sess` once it has taken in what KWin announced since it last looked: new outputs
+/// on one round, their property bursts on the next. `None` sends the caller to its
+/// fallback.
+fn caught_up(sess: Option<&mut Session>, deadline: Instant) -> Option<&mut Session> {
+    let sess = sess?;
+    let done = sess.sync_barrier(deadline)
+        && (sess.state.devices.values().all(|d| d.seen_done) || sess.sync_barrier(deadline));
+    done.then_some(sess)
+}
+
 /// Place the streamed output (name starts with `our_prefix`, current size
 /// `our_w`×`our_h`) in the desktop: primary unless `Extend`, and for `Exclusive`
-/// every other enabled output goes dark. In-process; a miss leaves `handled = false` for the `kscreen-doctor` path.
+/// every other enabled output goes dark. Runs on `sess` from [`watch`]; a miss
+/// leaves `handled = false` for the `kscreen-doctor` path.
 pub(crate) fn apply_topology(
+    sess: Option<&mut Session>,
     our_prefix: &str,
     our_w: u32,
     our_h: u32,
@@ -698,10 +718,10 @@ pub(crate) fn apply_topology(
         disabled: Vec::new(),
         handled: false,
     };
-    let Ok(mut sess) = Session::open("topology") else {
+    let deadline = Instant::now() + OP_BUDGET;
+    let Some(sess) = caught_up(sess, deadline) else {
         return miss();
     };
-    let deadline = Instant::now() + OP_BUDGET;
 
     let Some(ours) = sess.resolve_ours(our_prefix, our_w, our_h) else {
         tracing::warn!(
@@ -904,12 +924,17 @@ pub(crate) fn apply_topology(
 /// user's screens is what they exist to avoid. A stored `replicationSource`
 /// is not an arrangement; it makes our output show a physical panel. Apply
 /// only when ours is actually mirroring; the ordinary session pays one
-/// bounded enumerate and no apply.
-pub(crate) fn clear_replication_source(our_prefix: &str, our_w: u32, our_h: u32) {
-    let Ok(mut sess) = Session::open("clear_replication_source") else {
+/// bounded roundtrip on `sess` ([`watch`]) and no apply.
+pub(crate) fn clear_replication_source(
+    sess: Option<&mut Session>,
+    our_prefix: &str,
+    our_w: u32,
+    our_h: u32,
+) {
+    let deadline = Instant::now() + OP_BUDGET;
+    let Some(sess) = caught_up(sess, deadline) else {
         return;
     };
-    let deadline = Instant::now() + OP_BUDGET;
     let mgmt_version = sess
         .state
         .mgmt_name_version
@@ -953,15 +978,18 @@ pub(crate) fn clear_replication_source(our_prefix: &str, our_w: u32, our_h: u32)
 /// per-output mode and scale from `kwinoutputconfig.json` by name, and ours is
 /// stable, so a previous session's mode can overlay the one we just requested.
 ///
-/// Resolve by exact name alone ([`newest_named`]): a supersede or a kept display
-/// leaves a predecessor with our name, and KWin gives the new one its stored mode.
-/// `None` while our output is mid-announce.
+/// Resolve by exact name alone ([`newest_named`]) on `sess` from [`watch`]: a
+/// supersede or a kept display leaves a predecessor with our name, and KWin gives
+/// the new one its stored mode. `None` while our output is mid-announce.
 ///
 /// Returns `(width, height, refresh_mHz, scale)`. Scale is for the log:
 /// KWin's screencast streams pixel size, so a restored scale shifts logical
 /// layout without changing capture.
-pub(crate) fn actual_dims(our_name: &str) -> Option<(u32, u32, u32, f64)> {
-    let sess = Session::open("verify_dims").ok()?;
+pub(crate) fn actual_dims(
+    sess: Option<&mut Session>,
+    our_name: &str,
+) -> Option<(u32, u32, u32, f64)> {
+    let sess = caught_up(sess, Instant::now() + OP_BUDGET)?;
     let ours = newest_named(sess.state.devices.values(), our_name)?;
     // Mid-announce has no coherent `current_mode`; reading one anyway is a
     // 0×0 "correction" that stomps a healthy output.
@@ -972,8 +1000,8 @@ pub(crate) fn actual_dims(our_name: &str) -> Option<(u32, u32, u32, f64)> {
     Some((w, h, mhz, ours.scale.filter(|s| *s > 0.0).unwrap_or(1.0)))
 }
 
-/// The newest output named exactly `name`. KWin announces a new output after every
-/// live one, so this is the one just created even when a predecessor shares its name
+/// The newest output named exactly `name`. On a connection opened before the create
+/// ([`watch`]) this is the one just created, even when a predecessor shares its name
 /// and, after KWin restored the stored mode, its size.
 fn newest_named<'a>(
     devices: impl IntoIterator<Item = &'a DeviceState>,
@@ -992,10 +1020,11 @@ fn newest_named<'a>(
 ///
 /// `set_custom_modes` hands KWin a one-entry list; KWin generates CVT timing
 /// (width may align down — [`CVT_H_GRANULARITY`]) and we then select it, which
-/// changes size and renegotiates the screencast (`kwin::create`). Returns the
-/// active mode read back (Hz rounded), or `None` so the caller falls back.
-/// `set_custom_modes` replaces the custom list (`since 18`).
+/// changes size and renegotiates the screencast (`kwin::create`). Runs on `sess`
+/// from [`watch`]. Returns the active mode read back (Hz rounded), or `None` so the
+/// caller falls back. `set_custom_modes` replaces the custom list (`since 18`).
 pub(crate) fn set_custom_mode(
+    sess: Option<&mut Session>,
     our_prefix: &str,
     at_w: u32,
     at_h: u32,
@@ -1003,8 +1032,8 @@ pub(crate) fn set_custom_mode(
     want_h: u32,
     want_hz: u32,
 ) -> Option<(u32, u32, u32)> {
-    let mut sess = Session::open("custom_mode").ok()?;
     let deadline = Instant::now() + OP_BUDGET;
+    let sess = caught_up(sess, deadline)?;
 
     // `set_custom_modes` is `since 18`; calling it on an older bind is a protocol
     // error. Bound version is `min(advertised, MGMT_MAX)`.
