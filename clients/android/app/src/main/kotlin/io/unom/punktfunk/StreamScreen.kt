@@ -86,6 +86,9 @@ import io.unom.punktfunk.kit.SessionEndReason
 import io.unom.punktfunk.kit.VideoDecoders
 import io.unom.punktfunk.kit.VideoFit
 import io.unom.punktfunk.models.ActiveSession
+import io.unom.punktfunk.kit.library.GameEnd
+import io.unom.punktfunk.kit.library.LibraryClient
+import io.unom.punktfunk.kit.library.RunningGame
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -501,6 +504,21 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             delay(300_000)
         }
     }
+    // The game this device launched that this stream plays: the ring's End game. Read when the
+    // stream starts and each time the ring opens; a failed read offers no End game.
+    var streamedGame by remember(handle) { mutableStateOf<RunningGame?>(null) }
+    LaunchedEffect(handle, ring.committed) {
+        val kh = hostRecord ?: return@LaunchedEffect
+        if (kh.fpHex.isEmpty()) return@LaunchedEffect
+        val identity = withContext(Dispatchers.IO) {
+            (IdentityStore(context).load() as? IdentityLoad.Ok)?.identity
+        } ?: return@LaunchedEffect
+        streamedGame = withContext(Dispatchers.IO) {
+            LibraryClient.fetchRunning(
+                kh.address, kh.effectiveMgmtPort, identity.certPem, identity.privateKeyPem, kh.fpHex,
+            )
+        }.firstOrNull { it.streamedHere }
+    }
     val scope = rememberCoroutineScope()
 
     // The background keep-alive (Settings › General). Off — the default, and what every build
@@ -655,6 +673,31 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         toggleStreamMute = { ui.muteStream(!ui.streamMuted) },
         scrollInverted = { ui.invertScroll },
         toggleScrollInversion = { ui.setScrollInverted(!ui.invertScroll) },
+        streamedGame = { streamedGame },
+        endGame = {
+            val game = streamedGame
+            val appId = game?.appId
+            val kh = hostRecord
+            if (game != null && appId != null && kh != null) {
+                scope.launch {
+                    val outcome = withContext(Dispatchers.IO) {
+                        (IdentityStore(context).load() as? IdentityLoad.Ok)?.identity?.let { id ->
+                            LibraryClient.endGame(
+                                kh.address, kh.effectiveMgmtPort, id.certPem, id.privateKeyPem,
+                                kh.fpHex, appId,
+                            )
+                        } ?: GameEnd.Failed("this device has no identity yet")
+                    }
+                    // Gone either way: leave as End stream does. A refusal keeps the stream.
+                    if (outcome.gameGone) {
+                        NativeBridge.nativeDisconnectQuit(handle)
+                        onSessionEnded(SessionEndReason.LOCAL)
+                    } else {
+                        Toast.makeText(context, outcome.notice(game.title), Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+        },
         currentMode = { requestedMode },
         requestMode = { w, h, hz ->
             if (NativeBridge.nativeRequestMode(handle, w, h, hz)) {

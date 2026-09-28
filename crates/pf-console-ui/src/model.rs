@@ -488,6 +488,15 @@ pub enum ConsoleCmd {
         /// the screen already settled.
         label: String,
     },
+    /// End a title this device launched (`POST /api/v1/game/end`). The outcome is a
+    /// notice ([`pf_client_core::library::GameEnd::notice`]), then a running refresh.
+    EndGame {
+        addr: String,
+        mgmt: u16,
+        fp_hex: String,
+        app_id: String,
+        title: String,
+    },
 }
 
 /// Overlay→binary command queue. Same locking as the shared models. Drain cadence

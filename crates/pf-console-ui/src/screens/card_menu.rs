@@ -39,6 +39,8 @@ enum Action {
     PlayWith,
     /// Launch the title, or bring back the one the host has up.
     Play,
+    /// End the title on the host: only one this device launched and the host still runs.
+    EndGame,
     /// Mark or unmark the title on this device.
     Favorite,
     /// The poster's card: cover, facts, and its verbs.
@@ -246,22 +248,27 @@ impl CardMenu {
                     .chain((0..store.presets().len()).map(|i| Action::Preset(Some(i))))
                     .collect();
             }
-            // No Play row: the poster's OK launches it. The Mac's four rows.
-            (Subject::Game { .. }, Mode::Menu) => {
-                return vec![
+            // No Play row: the poster's OK launches it. The Mac's four rows, and End game
+            // while the host runs a launch of this device's.
+            (Subject::Game { game, .. }, Mode::Menu) => {
+                let mut rows = vec![
                     Action::PlayWith,
                     Action::Favorite,
                     Action::TitleDetails,
                     Action::CopyLink,
-                ]
+                ];
+                rows.extend(game.endable.then_some(Action::EndGame));
+                return rows;
             }
-            (Subject::Game { .. }, _) => {
-                return vec![
+            (Subject::Game { game, .. }, _) => {
+                let mut rows = vec![
                     Action::Play,
                     Action::Favorite,
                     Action::BindPreset,
                     Action::CopyLink,
-                ]
+                ];
+                rows.extend(game.endable.then_some(Action::EndGame));
+                return rows;
             }
             (Subject::Host(h), _) => h,
         };
@@ -362,6 +369,7 @@ impl CardMenu {
             },
             Action::SendLogs => "scroll-text",
             Action::Forget => "trash-2",
+            Action::EndGame => "x",
         }
     }
 
@@ -402,6 +410,10 @@ impl CardMenu {
                 Subject::Game { game, .. } if game.running => "Resume".into(),
                 _ => "Play".into(),
             },
+            Action::EndGame if self.armed == Some(Action::EndGame) => {
+                "End game \u{2014} press again".into()
+            }
+            Action::EndGame => "End game".into(),
             Action::Favorite if self.is_favorite(ctx.settings) => "Remove from Favorites".into(),
             Action::Favorite => "Add to Favorites".into(),
             Action::TitleDetails => "Details\u{2026}".into(),
@@ -749,6 +761,24 @@ impl CardMenu {
                 ));
                 fx.pop();
             }
+            // Ending a game can lose unsaved progress: arm, then fire.
+            Action::EndGame if self.armed != Some(Action::EndGame) => {
+                self.armed = Some(Action::EndGame)
+            }
+            Action::EndGame => {
+                let Subject::Game { host, game, .. } = &self.subject else {
+                    return;
+                };
+                fx.cmds.push(ConsoleCmd::EndGame {
+                    addr: host.addr.clone(),
+                    mgmt: host.mgmt_port,
+                    fp_hex: host.fp_hex.clone(),
+                    app_id: game.id.clone(),
+                    title: game.title.clone(),
+                });
+                fx.toast = Some(format!("Ending {}\u{2026}", game.title));
+                fx.pop();
+            }
             Action::Forget if self.armed != Some(Action::Forget) => {
                 self.armed = Some(Action::Forget)
             }
@@ -1085,6 +1115,7 @@ mod tests {
             genres: Vec::new(),
             stats: None,
             running: false,
+            endable: false,
         }
     }
 
@@ -1414,6 +1445,35 @@ mod tests {
         assert_eq!(
             label(&details, Action::BindPreset),
             "Settings preset\u{2026}"
+        );
+    }
+
+    /// End game shows only on a title this device launched and the host still runs, and
+    /// it arms before it asks the host.
+    #[test]
+    fn end_game_is_offered_on_this_devices_running_launch_and_arms_first() {
+        let mut running = game();
+        running.running = true;
+        assert!(!rows(&CardMenu::for_game(&host(), &running, None)).contains(&Action::EndGame));
+        running.endable = true;
+        let mut s = CardMenu::for_game(&host(), &running, None);
+        assert_eq!(rows(&s).last(), Some(&Action::EndGame));
+        let details = CardMenu::on(s.subject.clone(), Mode::Details);
+        assert_eq!(rows(&details).last(), Some(&Action::EndGame));
+        let mut fx = Outbox::default();
+        run_action(&mut s, Action::EndGame, &mut fx);
+        assert!(fx.cmds.is_empty(), "the first press only arms");
+        assert!(label(&s, Action::EndGame).contains("press again"));
+        run_action(&mut s, Action::EndGame, &mut fx);
+        assert_eq!(
+            fx.cmds,
+            vec![ConsoleCmd::EndGame {
+                addr: "10.0.0.5".into(),
+                mgmt: 9778,
+                fp_hex: "aa".into(),
+                app_id: "steam:367520".into(),
+                title: "Hollow Knight".into(),
+            }]
         );
     }
 

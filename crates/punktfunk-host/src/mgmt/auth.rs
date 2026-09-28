@@ -2,10 +2,10 @@
 //! only).
 //!
 //! Three lanes:
-//! - **paired device** — [`cert_may_access`] (status reads plus two writes: log upload and
-//!   host-action invoke). Proven either by a client certificate over mTLS, or — for a browser,
-//!   which has none — by a device token from [`super::device_auth`]. Same authority either way,
-//!   because it is the same pairing.
+//! - **paired device** — [`cert_may_access`] (status reads plus three writes: log upload,
+//!   host-action invoke, ending its own games). Proven either by a client certificate over
+//!   mTLS, or — for a browser, which has none — by a device token from
+//!   [`super::device_auth`]. Same authority either way, because it is the same pairing.
 //! - **plugin token** (bearer, loopback) — [`plugin_may_access`]: admin minus hooks, pairing
 //!   admin, host logs, store, and update.
 //! - **admin token** (bearer, loopback) — everything.
@@ -378,6 +378,10 @@ pub(crate) fn cert_may_access(method: &Method, path: &str) -> bool {
     // Id-only invoke. The handler re-reads `effective(fp, now)` and demands `GRANT_POWER`;
     // the route being reachable grants nothing by itself. `GET /actions` is on the read list.
     if method == Method::POST && path_matches("/api/v1/actions/{}", path) {
+        return true;
+    }
+    // The handler scopes it to games this device launched, and refuses an expired device.
+    if method == Method::POST && path == "/api/v1/game/end" {
         return true;
     }
     method == Method::GET

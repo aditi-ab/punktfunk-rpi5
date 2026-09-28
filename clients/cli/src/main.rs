@@ -57,6 +57,7 @@ punktfunk — the Punktfunk client, headless
   punktfunk default-host [<host-ref>] [--clear]
   punktfunk wake <host-ref> [--wait]
   punktfunk library [<host-ref>] [--json]
+  punktfunk end-game [<host-ref>] --game ID
   punktfunk launch [<host-ref>] [--game ID] [--preset REF] [--request-access]
                                 [--exec] [--fullscreen]
   punktfunk open <punktfunk://…> [--yes]
@@ -169,6 +170,18 @@ this. Needs a paired host (exit 6 otherwise).
 
 With no <host-ref> it asks the default host (`punktfunk default-host`), and
 exits 5 when there is none."
+            }
+            "end-game" => {
+                "\
+punktfunk end-game [<host-ref>] --game ID — end a title this device launched
+
+Asks the host to close the game, live stream included. The host ends only a
+title this device launched; one another device started stays up. Prints the
+outcome on stdout.
+
+Exit 0 when it ended, 5 when the host had nothing of it running, 3 when this
+device's access expired, 2 when the host couldn't be asked or is too old,
+6 when the host isn't paired."
             }
             "launch" => {
                 "\
@@ -420,6 +433,7 @@ from the config directory for a true factory reset."
             "default-host" => default_host_cmd(&rest),
             "wake" => wake(&rest),
             "library" => library_cmd(&rest),
+            "end-game" => end_game_cmd(&rest),
             "launch" => launch(&rest),
             "open" => open(&rest),
             "reachable" => reachable(&rest),
@@ -956,6 +970,48 @@ from the config directory for a true factory reset."
                 eprintln!("library: {e}");
                 CONNECT_FAILED
             }
+        }
+    }
+
+    /// `end-game [<host-ref>] --game ID` — close a title this device launched on the host.
+    fn end_game_cmd(args: &[String]) -> u8 {
+        let usage = "punktfunk end-game [<host-ref>] --game ID";
+        let Some(game) = value(args, "--game") else {
+            eprintln!("usage: {usage}");
+            return UNRESOLVED;
+        };
+        let (known, i) = match resolve_or_default(args, usage) {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+        let host = &known.hosts[i];
+        let Some(pin) = trust::parse_hex32(&host.fp_hex) else {
+            eprintln!(
+                "{} isn't paired yet — punktfunk pair {}",
+                host.name, host.addr
+            );
+            return NEEDS_INTERACTION;
+        };
+        let identity = match trust::load_or_create_identity() {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("client identity: {e:#}");
+                return CONNECT_FAILED;
+            }
+        };
+        let outcome = library::end_game(
+            &host.addr,
+            host.effective_mgmt_port(),
+            &identity,
+            Some(pin),
+            &game,
+        );
+        println!("{}", outcome.notice(&game));
+        match outcome {
+            library::GameEnd::Ended => OK,
+            library::GameEnd::NotRunning => UNRESOLVED,
+            library::GameEnd::Expired => TRUST_REJECTED,
+            library::GameEnd::Unsupported | library::GameEnd::Failed(_) => CONNECT_FAILED,
         }
     }
 

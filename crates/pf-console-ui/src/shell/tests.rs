@@ -495,6 +495,7 @@ fn down_from_a_card_lands_on_its_games_and_launches_there() {
         genres: Vec::new(),
         stats: None,
         running: false,
+        endable: false,
     }]);
     frame(&mut s);
     let below = |s: &Shell| matches!(s.stack.last(), Some(Screen::Home(h)) if h.shelf().is_some());
@@ -559,6 +560,7 @@ fn a_pinned_cards_library_launches_with_its_preset() {
         genres: Vec::new(),
         stats: None,
         running: false,
+        endable: false,
     }]);
     // Down past the Desktops band, which arrives focused and launches nothing.
     s.handle_menu(MenuEvent::Move(MenuDir::Down));
@@ -595,6 +597,7 @@ fn a_primary_tiles_library_leaves_the_preset_to_the_binding() {
         genres: Vec::new(),
         stats: None,
         running: false,
+        endable: false,
     }]);
     s.handle_menu(MenuEvent::Confirm);
     assert!(matches!(
@@ -1332,6 +1335,7 @@ fn mixed_library(library: &LibraryShared) {
             genres: Vec::new(),
             stats: None,
             running: false,
+            endable: false,
         }
     };
     library.set_games(vec![
@@ -1726,6 +1730,7 @@ fn dump_console_screens() {
             genres: Vec::new(),
             stats: None,
             running: false,
+            endable: false,
         })
         .collect(),
     );
@@ -1835,6 +1840,7 @@ fn dump_console_screens() {
                 genres: Vec::new(),
                 stats: None,
                 running: false,
+                endable: false,
             })
             .collect();
         list[2].stats = played(2 * 3_600_000);
@@ -1984,6 +1990,7 @@ fn platform_games() -> Vec<crate::library::LibraryGame> {
         genres: Vec::new(),
         stats: None,
         running: false,
+        endable: false,
     })
     .collect()
 }
@@ -2285,6 +2292,7 @@ fn store_games() -> Vec<crate::library::LibraryGame> {
         genres: Vec::new(),
         stats: None,
         running: false,
+        endable: false,
     };
     let mut games = vec![game("steam:launcher".into(), "Steam", true)];
     games.extend(
@@ -2770,6 +2778,7 @@ mod launch_hold {
             genres: Vec::new(),
             stats: None,
             running: false,
+            endable: false,
         }
     }
 
@@ -2779,6 +2788,8 @@ mod launch_hold {
             title: String::new(),
             state: state.into(),
             awaiting_window: false,
+            session_id: None,
+            endable: false,
         }]
     }
 
@@ -3329,6 +3340,7 @@ fn dump_phone_home() {
             genres: Vec::new(),
             stats: None,
             running: false,
+            endable: false,
         })
         .collect();
     library.set_games(games);

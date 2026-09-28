@@ -343,6 +343,38 @@ fun LibraryScreen(
     // consume it are one-shot on top of that.
     val resumeAt = remember(host.id) { LibraryPosition.last(context, host.id) }
 
+    // End game: the title the confirm asks about, then the host's answer as a toast. Gone either
+    // way drops the Resume badge here; the next load reads the host again.
+    var endAsk by remember { mutableStateOf<GameEntry?>(null) }
+    fun endGame(game: GameEntry) {
+        val ready = state as? LibState.Ready ?: return
+        scope.launch {
+            val outcome = withContext(Dispatchers.IO) {
+                LibraryClient.endGame(
+                    host.address, host.effectiveMgmtPort, ready.identity.certPem,
+                    ready.identity.privateKeyPem, host.fpHex, game.id,
+                )
+            }
+            if (outcome.gameGone) {
+                (state as? LibState.Ready)?.let { state = it.copy(running = it.running - game.id) }
+            }
+            Toast.makeText(context, outcome.notice(game.title), Toast.LENGTH_SHORT).show()
+        }
+    }
+    endAsk?.let { game ->
+        PunktfunkDialog(
+            title = "End ${game.title}?",
+            onDismiss = { endAsk = null },
+            actions = listOf(
+                DialogAction("End game", primary = true) {
+                    endAsk = null
+                    endGame(game)
+                },
+                DialogAction("Cancel") { endAsk = null },
+            ),
+        ) { PromptText("Unsaved progress in the game is lost.") }
+    }
+
     TouchLibrary(
         title = title,
         state = state,
@@ -351,6 +383,7 @@ fun LibraryScreen(
         onReload = { reloadKey++ },
         onLaunch = { identity, game -> launch(identity, game) },
         onCopyLink = { game -> copyLink(game) },
+        onEndGame = { game -> endAsk = game },
         resumeAt = resumeAt,
     )
 }
@@ -399,7 +432,9 @@ private suspend fun loadLibrary(context: Context, host: KnownHost, set: (LibStat
             }
                 .filter { it.isUp }
                 // Two sessions can have the same title up (the host admits concurrent
-                // sessions); for a Resume badge either one is the same answer.
+                // sessions); for a Resume badge either one is the same answer, and the endable
+                // one (sorted last, so it wins) carries End game.
+                .sortedBy { it.endable }
                 .mapNotNull { g -> g.appId?.let { it to g } }
                 .toMap()
             set(LibState.Ready(res.games, loader, identity, running = running))
@@ -487,6 +522,8 @@ private fun TouchLibrary(
     onReload: () -> Unit,
     onLaunch: (ClientIdentity, GameEntry) -> Unit,
     onCopyLink: (GameEntry) -> Unit,
+    /** Ask to end a title this device launched; the caller confirms. */
+    onEndGame: (GameEntry) -> Unit = {},
     /** The title this shelf last launched — where the grid opens. Null on a first visit. */
     resumeAt: String? = null,
 ) {
@@ -555,6 +592,7 @@ private fun TouchLibrary(
                     loader = state.loader,
                     onLaunch = { game -> onLaunch(state.identity, game) },
                     onCopyLink = onCopyLink,
+                    onEndGame = onEndGame,
                     running = state.running,
                     resumeAt = resumeAt,
                     modifier = Modifier.weight(1f),
@@ -592,6 +630,7 @@ internal fun TouchGrid(
     loader: ImageLoader,
     onLaunch: (GameEntry) -> Unit,
     onCopyLink: (GameEntry) -> Unit,
+    onEndGame: (GameEntry) -> Unit = {},
     /**
      * Which titles the host already has up, keyed by library id — so a tile the player can return
      * to says `Resume` rather than looking like every other one. Empty on an older host, an
@@ -636,13 +675,19 @@ internal fun TouchGrid(
         if (launchers.isNotEmpty()) {
             if (both) item(span = { GridItemSpan(maxLineSpan) }) { TouchGroupHeading("Launchers") }
             items(launchers, key = { "launcher-${it.id}" }) {
-                TouchPoster(it, loader, onLaunch, onCopyLink, running[it.id] != null)
+                TouchPoster(
+                    it, loader, onLaunch, onCopyLink, running[it.id] != null,
+                    endable = running[it.id]?.endable == true, onEndGame = onEndGame,
+                )
             }
         }
         if (titles.isNotEmpty()) {
             if (both) item(span = { GridItemSpan(maxLineSpan) }) { TouchGroupHeading("Games") }
             items(titles, key = { "game-${it.id}" }) {
-                TouchPoster(it, loader, onLaunch, onCopyLink, running[it.id] != null)
+                TouchPoster(
+                    it, loader, onLaunch, onCopyLink, running[it.id] != null,
+                    endable = running[it.id]?.endable == true, onEndGame = onEndGame,
+                )
             }
         }
     }
@@ -694,6 +739,9 @@ private fun TouchPoster(
     onCopyLink: (GameEntry) -> Unit,
     /** Already up on the host, so tapping resumes rather than starts. */
     running: Boolean = false,
+    /** Up, and this device launched it: the long press offers End game. */
+    endable: Boolean = false,
+    onEndGame: (GameEntry) -> Unit = {},
 ) {
     var menu by remember { mutableStateOf(false) }
     val shape = MaterialTheme.shapes.medium
@@ -771,6 +819,15 @@ private fun TouchPoster(
                     onCopyLink(game)
                 },
             )
+            if (endable) {
+                DropdownMenuItem(
+                    text = { Text("End game") },
+                    onClick = {
+                        menu = false
+                        onEndGame(game)
+                    },
+                )
+            }
         }
     }
 }

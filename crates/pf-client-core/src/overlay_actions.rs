@@ -21,6 +21,8 @@ pub const RING_SLOTS: usize = 6;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SlotId {
     EndStream,
+    /// End the game this device launched, then the stream.
+    EndGame,
     DisconnectLinger,
     TouchMode,
     Keyboard,
@@ -45,6 +47,7 @@ impl SlotId {
     pub fn id(&self) -> String {
         match self {
             SlotId::EndStream => "end_stream".into(),
+            SlotId::EndGame => "end_game".into(),
             SlotId::DisconnectLinger => "disconnect_linger".into(),
             SlotId::TouchMode => "touch_mode".into(),
             SlotId::Keyboard => "keyboard".into(),
@@ -65,6 +68,7 @@ impl SlotId {
     pub fn parse(s: &str) -> Option<SlotId> {
         Some(match s {
             "end_stream" => SlotId::EndStream,
+            "end_game" => SlotId::EndGame,
             "disconnect_linger" => SlotId::DisconnectLinger,
             "touch_mode" => SlotId::TouchMode,
             "keyboard" => SlotId::Keyboard,
@@ -359,6 +363,7 @@ pub fn catalogue(cfg: &OverlayConfig, platform: RingPlatform) -> Vec<CatalogueGr
             title: "Session",
             entries: vec![
                 e("end_stream", "End stream", ""),
+                e("end_game", "End game", "Only a game this device launched"),
                 e("disconnect_linger", "Disconnect, keep the game running", ""),
             ],
         },
@@ -445,6 +450,7 @@ pub fn catalogue(cfg: &OverlayConfig, platform: RingPlatform) -> Vec<CatalogueGr
 pub fn slot_icon(id: &str, state: &str) -> Option<&'static str> {
     Some(match id {
         "end_stream" => "square",
+        "end_game" => "x",
         "disconnect_linger" => "log-out",
         "touch_mode" => "pointer",
         "keyboard" => "keyboard",
@@ -659,6 +665,7 @@ mod tests {
     fn slot_ids_are_stable_strings() {
         for id in [
             "end_stream",
+            "end_game",
             "disconnect_linger",
             "touch_mode",
             "keyboard",

@@ -65,20 +65,22 @@ export const SectionDashboard: FC = () => {
 	 * "End now" means two different things, and which one is right follows from the row's state: a
 	 * game whose session is still live ends by stopping that session (what then happens to the game
 	 * follows the operator's policy — stopping a session is not licence to close a game), while a
-	 * game already waiting out its reconnect window has no session left to stop and is ended directly.
+	 * game nobody is streaming (`grace` or `detached`) has no session left to stop and is ended directly.
 	 *
 	 * A live native row stops its OWN session by id, so ending one person's game no longer kicks
 	 * everyone else off. Two paths are still wider than the row, and both say so before acting:
 	 *
 	 * - a compat-plane row has no session id, and the host's only stop for it is `DELETE /session`,
 	 *   which tears down every live session on both planes.
-	 * - `POST /game/end` with `app_id: null` means "end EVERY waiting game" to the host, and a grace
-	 *   row for an operator-typed command carries no `app_id` — so that row ended all of them.
+	 * - `POST /game/end` with `app_id: null` means "end EVERY game nobody is streaming" to the host,
+	 *   and a grace row for an operator-typed command carries no `app_id` — so that row ends all of them.
 	 */
 	const onEndGame = async (game: ActiveGame) => {
 		const games = status.data?.games ?? [];
-		if (game.state === "grace") {
-			const waiting = games.filter((g) => g.state === "grace").length;
+		const unstreamed = (g: ActiveGame) =>
+			g.state === "grace" || g.state === "detached";
+		if (unstreamed(game)) {
+			const waiting = games.filter(unstreamed).length;
 			if (!game.app_id && waiting > 1) {
 				const ok = await confirm({
 					title: m.games_end_all_waiting_title({ count: waiting }),

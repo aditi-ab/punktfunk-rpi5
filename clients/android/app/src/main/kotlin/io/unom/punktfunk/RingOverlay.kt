@@ -30,6 +30,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Bedtime
+import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DoNotTouch
 import androidx.compose.material.icons.filled.Home
@@ -82,6 +83,7 @@ import androidx.compose.ui.unit.sp
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.RingNav
+import io.unom.punktfunk.kit.library.RunningGame
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -229,6 +231,11 @@ class RingActions(
     val requestMode: (Int, Int, Int) -> Unit,
     val scrollInverted: () -> Boolean = { false },
     val toggleScrollInversion: () -> Unit = {},
+    /** The game this device launched that this stream plays ([RunningGame.streamedHere]); null
+     *  offers no End game. */
+    val streamedGame: () -> RunningGame? = { null },
+    /** End that game on the host, then the stream. */
+    val endGame: () -> Unit = {},
 )
 
 /**
@@ -254,6 +261,12 @@ internal data class SlotSpec(
 
 internal fun spec(slot: SlotId, cfg: OverlayConfig, a: RingActions): SlotSpec = when (slot) {
     SlotId.EndStream -> SlotSpec("end_stream", "End stream", Icons.Filled.Close, armed = true)
+    SlotId.EndGame -> SlotSpec(
+        "end_game", "End game", Icons.Filled.Cancel,
+        enabled = a.streamedGame() != null,
+        reason = "No game this device launched is running here",
+        armed = true,
+    )
     SlotId.DisconnectLinger ->
         SlotSpec("disconnect_linger", "Disconnect, keep the game running", Icons.Filled.Logout)
     SlotId.TouchMode -> {
@@ -557,6 +570,7 @@ internal fun fireSlot(
     state.hint = null
     when (slot) {
         SlotId.EndStream -> { state.close(); actions.endStream() }
+        SlotId.EndGame -> { state.close(); actions.endGame() }
         SlotId.DisconnectLinger -> { state.close(); actions.disconnectLinger() }
         SlotId.TouchMode -> actions.cycleTouchMode()
         SlotId.Keyboard -> { state.close(); actions.keyboard() }
@@ -836,6 +850,11 @@ private fun sheetRows(
     }
     rows += SheetRowSpec("Session", "End stream", if (state.armed == "end_stream") "tap again" else "") {
         if (state.armed == "end_stream") { state.close(); actions.endStream() } else { haptics.boundary(); state.armed = "end_stream" }
+    }
+    if (actions.streamedGame() != null) {
+        rows += SheetRowSpec(null, "End game", if (state.armed == "end_game") "tap again" else "") {
+            if (state.armed == "end_game") { state.close(); actions.endGame() } else { haptics.boundary(); state.armed = "end_game" }
+        }
     }
     rows += SheetRowSpec(null, "Disconnect, keep the game running") { state.close(); actions.disconnectLinger() }
     rows += SheetRowSpec("Resolution", "Resolution", resLabel, onAdjust = ::adjustRes) { adjustRes(1) }

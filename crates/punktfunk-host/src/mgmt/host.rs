@@ -1,6 +1,7 @@
 //! Host-tagged `/api/v1` routes: identity, liveness, compositor list, live status,
 //! and the loopback tray summary. Split out of the `mgmt` facade.
 
+use super::auth::{AuthLane, PairedDevice};
 use super::shared::*;
 use crate::encode::Codec;
 use crate::gamestream::APP_VERSION;
@@ -9,6 +10,7 @@ use crate::gamestream::CONTROL_PORT;
 use crate::gamestream::GFE_VERSION;
 use crate::gamestream::RTSP_PORT;
 use crate::gamestream::VIDEO_PORT;
+use axum::Extension;
 use std::sync::atomic::Ordering;
 
 #[derive(Serialize, ToSchema)]
@@ -351,7 +353,8 @@ pub(crate) struct ActiveGame {
     /// `native`, `gamestream` or `web`.
     plane: crate::events::Plane,
     /// `launching` | `running` | `window` (its window is on the streamed screen) | `exited` |
-    /// `untracked` (exit will never be seen) | `grace` (reconnect window).
+    /// `untracked` (exit will never be seen) | `grace` (reconnect window) | `detached` (still
+    /// running, no session holds it).
     #[schema(example = "running")]
     state: String,
     /// Present and true while `running` on a host that will report `window` next. A launch hold
@@ -362,6 +365,11 @@ pub(crate) struct ActiveGame {
     /// Seconds until this game is ended — only present on a `grace` row.
     #[serde(skip_serializing_if = "Option::is_none")]
     grace_remaining_s: Option<u64>,
+    /// Present and true when this caller may end it with `POST /game/end`: the operator any
+    /// launched game, a paired device only a game it launched.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[schema(required = false)]
+    endable: bool,
 }
 
 /// One live session as the Dashboard lists it: who, where, since when, and the state
@@ -612,7 +620,12 @@ pub(crate) async fn list_compositors() -> Json<Vec<AvailableCompositor>> {
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
     )
 )]
-pub(crate) async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<RuntimeStatus> {
+pub(crate) async fn get_status(
+    State(st): State<Arc<MgmtState>>,
+    Extension(lane): Extension<AuthLane>,
+    device: Option<Extension<PairedDevice>>,
+) -> Json<RuntimeStatus> {
+    let ender = super::session::GameEnder::of(&st, lane, device.as_ref().map(|d| d.0 .0.as_str()));
     let gs_launch = *st.app.launch.lock().unwrap_or_else(|e| e.into_inner());
     // Stream slot is GameStream-featured only; a native-only build has no compat-plane stream.
     #[cfg(feature = "gamestream")]
@@ -739,6 +752,7 @@ pub(crate) async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<Runtime
                 state: g.state.to_string(),
                 awaiting_window: g.awaiting_window,
                 grace_remaining_s: g.grace_remaining_s,
+                endable: ender.may_end(g.state, g.launched_by.as_deref()),
             })
             .collect(),
         audio: audio_wiring(),

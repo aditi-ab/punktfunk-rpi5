@@ -125,6 +125,24 @@ display policy: see [Dedicated game sessions](/docs/virtual-displays#dedicated-g
 Whether quitting the game ends the session, and the reverse, is under
 [When a game ends](/docs/virtual-displays#when-a-game-ends-and-when-a-session-does).
 
+## Ending a game
+
+**End game** closes a title on the host. A device can end a game it launched, while a stream
+plays it or after the stream has ended. It can't end a game another device started or one you
+started yourself on the host.
+
+| Where | How |
+|---|---|
+| While streaming | **End game** on the [quick-action dial](/docs/input#the-quick-action-dial)'s sheet. The stream ends with it. |
+| A library | Hold or right-click the running title → **End game** |
+| Controller home | The title's options → **End game** |
+| Steam Deck | **End game** under **Host menus** in the Decky panel |
+| Command line | `punktfunk end-game couch-pc --game steam:570` |
+
+The host asks the game to quit like its window's close button and forces it after 10 seconds.
+Unsaved progress is lost, so every client asks first. The web console's **Home** lists games still
+running after their stream ended as **Nobody streaming**, with **End now**.
+
 ## Play stats
 
 Each launch from Punktfunk records the time and adds one to the title's launch count. Play time

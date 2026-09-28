@@ -350,6 +350,11 @@ struct StreamState {
     /// Transient access toast and when it went up — cleared after [`ACCESS_NOTICE_S`].
     /// An access change outranks "click to capture" for a few seconds.
     session_notice: Option<(String, Instant)>,
+    /// The ring's End game in flight: the title, and the host's answer once it lands.
+    ending_game: Option<(
+        String,
+        std::sync::mpsc::Receiver<pf_client_core::library::GameEnd>,
+    )>,
     /// Gaming Mode touch-as-mouse: drops leaked Steam Input positions sent as deltas, once.
     touch_mouse: crate::touch::SteamTouchMouse,
     /// Host's pinned fingerprint once connected — the key the pre-fetched host-actions cache uses.
@@ -402,6 +407,7 @@ impl StreamState {
             cursor_chan: None,
             access: pf_client_core::access::SessionAccess::default(),
             session_notice: None,
+            ending_game: None,
             touch_mouse: crate::touch::SteamTouchMouse::new(in_gamescope()),
             last_hint: None,
             hint_since: std::time::Instant::now(),
@@ -1665,6 +1671,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     // Pre-fetch the ring's host-action slots here, never when it opens.
                     let host_addr = st.params.host.clone();
                     pf_client_core::host_actions::refresh(&host_addr, c.mgmt_port(), &st.fp_hex);
+                    pf_client_core::library::refresh_running(&host_addr, c.mgmt_port(), &st.fp_hex);
                     // The resolved rate — a `0 = native` request becomes a real number
                     // here, last moment before frames start arriving.
                     st.source_interval_ns = frame_interval_ns(m.refresh_hz, native.refresh_hz);
@@ -1970,6 +1977,23 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 .is_some_and(|(_, at)| at.elapsed() >= Duration::from_secs(ACCESS_NOTICE_S))
             {
                 st.session_notice = None;
+            }
+            // The game is gone (or already was): leave as End stream does. Anything else
+            // keeps the stream and says why.
+            let answer = st
+                .ending_game
+                .as_ref()
+                .and_then(|(title, rx)| rx.try_recv().ok().map(|a| (title.clone(), a)));
+            if let Some((title, answer)) = answer {
+                st.ending_game = None;
+                pf_client_core::library::invalidate_running(&st.fp_hex);
+                use pf_client_core::library::GameEnd;
+                if matches!(answer, GameEnd::Ended | GameEnd::NotRunning) {
+                    st.request_quit();
+                    apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts, 0);
+                } else {
+                    st.session_notice = Some((answer.notice(&title), Instant::now()));
+                }
             }
         }
 
@@ -3312,7 +3336,18 @@ fn ring_facts(
         mgmt_port: c.mgmt_port(),
         fp_hex: st.fp_hex.clone(),
         host_name: opts.window_title.clone(),
+        streamed_game: streamed_game(&st.params.host, c.mgmt_port(), &st.fp_hex),
     }
+}
+
+/// The game this device launched that this stream plays, from the running cache. Keeps
+/// the cache fresh too: [`pf_client_core::library::refresh_running`] is TTL-gated.
+fn streamed_game(addr: &str, mgmt_port: u16, fp_hex: &str) -> Option<(String, String)> {
+    pf_client_core::library::refresh_running(addr, mgmt_port, fp_hex);
+    pf_client_core::library::running(fp_hex)
+        .into_iter()
+        .find(|g| g.streamed_here())
+        .and_then(|g| Some((g.app_id?, g.title)))
 }
 
 /// Pads the controller-mouse toggle acts on: the pad that opened the ring, else every live pad.
@@ -3350,6 +3385,30 @@ fn ring_command(
         RingCommand::EndStream => {
             st.request_quit();
             apply_capture(window, mouse, false, false, inhibit_shortcuts, 0);
+        }
+        RingCommand::EndGame { app_id, title } => {
+            // Blocking HTTPS off the render thread; the loop reads the answer.
+            let Some(c) = &st.connector else { return };
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (addr, mgmt, fp) = (st.params.host.clone(), c.mgmt_port(), st.fp_hex.clone());
+            std::thread::Builder::new()
+                .name("punktfunk-endgame".into())
+                .spawn(move || {
+                    let answer = match pf_client_core::trust::load_or_create_identity() {
+                        Ok(id) => pf_client_core::library::end_game(
+                            &addr,
+                            mgmt,
+                            &id,
+                            pf_client_core::trust::parse_hex32(&fp),
+                            &app_id,
+                        ),
+                        Err(e) => pf_client_core::library::GameEnd::Failed(e.to_string()),
+                    };
+                    tracing::info!(app = %app_id, ?answer, "ring: end game");
+                    let _ = tx.send(answer);
+                })
+                .ok();
+            st.ending_game = Some((title, rx));
         }
         RingCommand::DisconnectLinger => {
             // Leave without the quit close code: the host lingers for a reconnect.

@@ -1196,6 +1196,9 @@ pub struct LibraryGame {
     /// claim a title is running because it was last time. `false` on older hosts and while
     /// `/status` is in flight; the badge may appear a frame late rather than hold the catalog.
     pub running: bool,
+    /// Running, and this device launched it: the host lets it end the title. Same source.
+    #[serde(default)]
+    pub endable: bool,
 }
 
 impl LibraryGame {
@@ -1433,11 +1436,14 @@ impl LibraryShared {
             .collect();
         let mut changed = false;
         for g in &mut s.games {
-            let now = games
-                .iter()
-                .any(|r| r.is_up() && r.app_id.as_deref() == Some(g.id.as_str()));
-            if g.running != now {
+            let mine = |r: &&pf_client_core::library::RunningGame| {
+                r.is_up() && r.app_id.as_deref() == Some(g.id.as_str())
+            };
+            let now = games.iter().any(|r| mine(&r));
+            let endable = games.iter().filter(mine).any(|r| r.endable);
+            if g.running != now || g.endable != endable {
                 g.running = now;
+                g.endable = endable;
                 changed = true;
             }
         }
@@ -1551,6 +1557,7 @@ fn desktop_tile() -> LibraryGame {
         genres: Vec::new(),
         stats: None,
         running: false,
+        endable: false,
     }
 }
 
@@ -2069,6 +2076,7 @@ mod tests {
             genres: Vec::new(),
             stats: None,
             running: false,
+            endable: false,
         };
         let shared = LibraryShared::default();
         shared.set_games(vec![
@@ -2107,6 +2115,7 @@ mod tests {
             genres: Vec::new(),
             stats: None,
             running: false,
+            endable: false,
         };
         let shared = LibraryShared::default();
         shared.set_games(vec![
@@ -2157,6 +2166,8 @@ mod tests {
                 title: String::new(),
                 state: state.to_string(),
                 awaiting_window: false,
+                session_id: None,
+                endable: false,
             })
             .collect()
     }
@@ -2179,6 +2190,7 @@ mod tests {
             genres: Vec::new(),
             stats: None,
             running: false,
+            endable: false,
         }]);
         assert_eq!(shared.status_gen(), 0);
         shared.set_running(&running(&["steam:Celeste"], "launching"));
@@ -2224,6 +2236,7 @@ mod tests {
             genres: Vec::new(),
             stats: None,
             running: false,
+            endable: false,
         };
         let shared = LibraryShared::default();
         shared.set_games_cached(vec![g("Celeste"), g("Tunic")]);
@@ -2273,6 +2286,7 @@ mod tests {
                     genres: Vec::new(),
                     stats: None,
                     running: false,
+                    endable: false,
                 })
                 .collect(),
         );
@@ -2310,6 +2324,7 @@ mod tests {
             genres: Vec::new(),
             stats: None,
             running: true,
+            endable: false,
         }]);
         assert_eq!(shared.snapshot().games[0].id, DESKTOP_ID);
     }
@@ -2343,6 +2358,7 @@ mod tests {
                     genres: Vec::new(),
                     stats: None,
                     running: false,
+                    endable: false,
                 })
                 .collect(),
         );
