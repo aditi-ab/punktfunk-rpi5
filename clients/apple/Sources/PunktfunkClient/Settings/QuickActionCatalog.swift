@@ -23,6 +23,7 @@ struct SlotGroup: Identifiable {
 let builtinGroups: [SlotGroup] = [
     .init(id: "Session", options: [
         .init(id: "end_stream", label: "End stream"),
+        .init(id: "end_game", label: "End game", note: "Only a game this device launched"),
         .init(id: "disconnect_linger", label: "Disconnect, keep the game running"),
     ]),
     .init(id: "Input", options: [

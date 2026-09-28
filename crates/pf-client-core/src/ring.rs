@@ -23,6 +23,11 @@ pub enum RingInput {
 #[derive(Clone, Debug, PartialEq)]
 pub enum RingCommand {
     EndStream,
+    /// End [`RingFacts::streamed_game`] on the host, then the stream.
+    EndGame {
+        app_id: String,
+        title: String,
+    },
     DisconnectLinger,
     CycleStats,
     ToggleMic,
@@ -118,4 +123,7 @@ pub struct RingFacts {
     pub mgmt_port: u16,
     pub fp_hex: String,
     pub host_name: String,
+    /// `(app_id, title)` of the game this device launched that this stream plays
+    /// ([`crate::library::RunningGame::streamed_here`]). `None` offers no End game.
+    pub streamed_game: Option<(String, String)>,
 }

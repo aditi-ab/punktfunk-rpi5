@@ -2132,7 +2132,8 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         ("GET", "/api/v1/session/{id}/pads", false, false),
         ("GET", "/api/v1/session/settings", true, false),
         ("PUT", "/api/v1/session/settings", true, false),
-        ("POST", "/api/v1/game/end", true, false),
+        // A device ends only games it launched; the handler scopes it.
+        ("POST", "/api/v1/game/end", true, true),
         // Library writes are plugin-lane (scanner job); privileged fields inside the payload
         // are refused in the handler — see `plugin_lane_cannot_set_command_execution_fields`.
         ("GET", "/api/v1/library", true, true),

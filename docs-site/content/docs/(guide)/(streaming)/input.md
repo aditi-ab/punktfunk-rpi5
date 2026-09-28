@@ -47,7 +47,8 @@ To see the list without a stream: **Keyboard Shortcuts** in the Linux client's m
 Settings. The macOS **Stream** menu lists them too.
 
 **macOS:** while input is captured, every other ⌘ chord goes to the host, ⌘Q included. Turn
-**Capture system shortcuts** off to keep them local. ⌘⎋ and ⌃⌘F always stay with the Mac.
+**Capture system shortcuts** off to keep them local. ⌘⎋ always stays with the Mac; press it,
+then ⌃⌘F, to leave fullscreen.
 ⌘Space, ⌘Tab, Mission Control and other apps' global shortcuts go to the host too, with no
 permission to grant.
 
@@ -224,7 +225,7 @@ What the dial can hold:
 
 | Group | Actions |
 |---|---|
-| Session | **End stream**, **Disconnect, keep the game running** |
+| Session | **End stream**, **End game** (a game this device launched, then the stream), **Disconnect, keep the game running** |
 | Input | **Touch mode**, **Keyboard**, **Virtual controller**, **Send text**, **Guide button**, **Quick access menu**, **Controller mouse** |
 | View · Audio | **Statistics**, **Microphone**, **Mute this stream** (this device only) |
 | Host | **Sleep host**, **Restart host**, **Shut down host** ([Host power](/docs/host-power)) |

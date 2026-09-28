@@ -1094,6 +1094,23 @@ class Plugin:
         """
         return {"running": any(p.is_socket() for p in _ctl_sockets())}
 
+    async def end_game(self, ref: str, game_id: str) -> dict:
+        """End a title this device launched on the host (``punktfunk end-game <ref> --game ID``).
+
+        ``{ok: True, notice}`` once the game is gone — ended now, or not running any more (exit
+        5). Anything else is ``{ok: False, error: <exit code>, notice}``: the CLI's own sentence,
+        which says what to do. Both references are positional or flag values, so one that starts
+        with ``-`` is refused here rather than handed to the CLI as a flag."""
+        ref, game_id = str(ref).strip(), str(game_id).strip()
+        if not ref or ref.startswith("-") or not game_id or game_id.startswith("-"):
+            return {"ok": False, "error": "unresolved", "notice": "Couldn't tell which game to end."}
+        rc, out, err = await _run_cli(["end-game", ref, "--game", game_id], timeout=20.0)
+        lines = (out.strip() or err.strip()).splitlines()
+        notice = lines[-1] if lines else ""
+        if rc in (0, 5):
+            return {"ok": True, "notice": notice}
+        return {"ok": False, "error": str(rc), "notice": notice}
+
     async def host_action(self, action: str) -> dict:
         """Press a HOST system button on the running stream: ``guide`` (the Steam/Xbox/PS
         menu button) or ``qam`` (the quick-access ``…``).

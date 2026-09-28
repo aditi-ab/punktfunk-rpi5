@@ -108,6 +108,9 @@ struct Record {
     /// on the session: a reconnect focuses the game's workspace rather than
     /// claiming a second one. `None` until a placed launch reports it.
     workspace: Option<i64>,
+    /// How [`detached`] names this launch once no session holds it. Set by
+    /// [`Claim::describe`]; the game id stands in until then.
+    about: Option<(crate::gamelease::GameRef, crate::events::Plane)>,
 }
 
 impl Record {
@@ -124,6 +127,7 @@ impl Record {
             claim,
             ending: false,
             workspace: None,
+            about: None,
         }
     }
 }
@@ -291,6 +295,77 @@ pub fn ended(procs: &LiveProcs) {
     recs.retain(|r| !Arc::ptr_eq(&r.procs, procs));
 }
 
+/// A host launch still running with no session holding it — what
+/// `GameOnSessionEnd::Keep` leaves behind after a stream ends.
+pub struct Detached {
+    /// The device that launched it; only it may end it from a paired cert.
+    pub fingerprint: String,
+    pub game: crate::gamelease::GameRef,
+    pub plane: crate::events::Plane,
+    /// The record's slot, for [`ended`] once the game is gone.
+    pub procs: LiveProcs,
+}
+
+impl Detached {
+    /// Same 12-char label a session row carries.
+    pub fn client(&self) -> &str {
+        self.fingerprint.get(..12).unwrap_or(&self.fingerprint)
+    }
+}
+
+/// Launched, unheld, not already ending, and a process we adopted is still
+/// the same live process. `Unknown` never qualifies: it verifies no pid.
+fn is_detached(rec: &Record, live: Liveness) -> bool {
+    rec.launched && !rec.ending && rec.holders == 0 && live == Liveness::Running
+}
+
+/// `owner` = `None` reaches every device's launches; `app` = `None` every title.
+fn in_scope(rec: &Record, owner: Option<&str>, app: Option<&str>) -> bool {
+    owner.is_none_or(|fp| rec.key.fingerprint.eq_ignore_ascii_case(fp))
+        && app.is_none_or(|a| rec.key.game_id == a)
+}
+
+fn detached_view(rec: &Record) -> Detached {
+    let (game, plane) = rec.about.clone().unwrap_or_else(|| {
+        let game = crate::gamelease::GameRef {
+            id: Some(rec.key.game_id.clone()),
+            store: None,
+            title: rec.key.game_id.clone(),
+        };
+        (game, crate::events::Plane::Native)
+    });
+    Detached {
+        fingerprint: rec.key.fingerprint.clone(),
+        game,
+        plane,
+        procs: rec.procs.clone(),
+    }
+}
+
+/// Every launch [`is_detached`], for the status surface.
+pub fn detached() -> Vec<Detached> {
+    let recs = reg().records.lock().unwrap_or_else(|e| e.into_inner());
+    recs.iter()
+        .filter(|r| is_detached(r, liveness(r)))
+        .map(detached_view)
+        .collect()
+}
+
+/// Mark the detached launches in scope as ending and hand them over to be
+/// ended ([`crate::gamelease::end_detached`]). Marked under the lock, so a
+/// claim that races the signal spawns instead of adopting a dying process.
+pub fn take_detached(owner: Option<&str>, app: Option<&str>) -> Vec<Detached> {
+    let mut recs = reg().records.lock().unwrap_or_else(|e| e.into_inner());
+    let mut taken = Vec::new();
+    for r in recs.iter_mut() {
+        if in_scope(r, owner, app) && is_detached(r, liveness(r)) {
+            r.ending = true;
+            taken.push(detached_view(r));
+        }
+    }
+    taken
+}
+
 /// Decide this session's launch plan and claim the record.
 ///
 /// `fresh_stamp` is this session's [`crate::gamelease::launch_clock`],
@@ -444,6 +519,15 @@ impl Claim {
         });
     }
 
+    /// Name the launch for [`detached`]. Same claim check as [`Claim::launched`].
+    pub fn describe(&self, game: &crate::gamelease::GameRef, plane: crate::events::Plane) {
+        self.with_record(|r| {
+            if r.claim == self.id {
+                r.about = Some((game.clone(), plane));
+            }
+        });
+    }
+
     /// Workspace an earlier session gave this launch, for [`Plan::Adopt`] to
     /// focus again. `None` when nothing was placed, or the backend cannot.
     pub fn workspace(&self) -> Option<i64> {
@@ -528,7 +612,44 @@ mod tests {
             claim: 1,
             ending: false,
             workspace: None,
+            about: None,
         }
+    }
+
+    /// Only an unheld, launched, still-live record is left running for the player
+    /// to end. Held means a session streams it; `Unknown` verifies no pid.
+    #[test]
+    fn a_detached_launch_is_unheld_launched_and_verified_live() {
+        assert!(is_detached(&rec(true, 0, None), Liveness::Running));
+        assert!(!is_detached(&rec(true, 1, None), Liveness::Running));
+        assert!(!is_detached(&rec(false, 0, None), Liveness::Running));
+        assert!(!is_detached(&rec(true, 0, None), Liveness::Unknown));
+        assert!(!is_detached(&rec(true, 0, None), Liveness::Gone));
+        let mut ending = rec(true, 0, None);
+        ending.ending = true;
+        assert!(
+            !is_detached(&ending, Liveness::Running),
+            "already on its way out"
+        );
+    }
+
+    /// A device reaches only its own launches; no owner reaches every device's.
+    #[test]
+    fn detached_scope_is_the_launching_device_and_title() {
+        let r = rec(true, 0, None);
+        assert!(in_scope(&r, None, None));
+        assert!(in_scope(&r, Some("FP"), Some("steam:1")));
+        assert!(!in_scope(&r, Some("other-fp"), None));
+        assert!(!in_scope(&r, Some("fp"), Some("steam:2")));
+    }
+
+    /// A record nobody described still names itself: the game id, never an empty title.
+    #[test]
+    fn an_undescribed_launch_is_named_by_its_game_id() {
+        let d = detached_view(&rec(true, 0, None));
+        assert_eq!(d.game.title, "steam:1");
+        assert_eq!(d.game.id.as_deref(), Some("steam:1"));
+        assert_eq!(d.client(), "fp");
     }
 
     /// The four exclusions for `GameOnNewLaunch::End`, asserted one by

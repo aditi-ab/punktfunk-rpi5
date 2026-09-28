@@ -151,7 +151,8 @@ act only on a game the host launched for the session, never one you started your
 | **Reconnect window** | 300 s (10 s to 24 h). Reconnecting cancels it; **Home** shows the countdown and **End now**. |
 
 Closing asks the game to quit like its window's close button, and forces it after 10 seconds.
-Unsaved progress is lost, which is why nothing closes by default.
+Unsaved progress is lost, which is why nothing closes by default. A player can still close one:
+see [Ending a game](/docs/game-library#ending-a-game).
 
 Keep-alive is how long the *screen* outlives a disconnect; the reconnect window is how long the
 *game* does.

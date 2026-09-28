@@ -239,6 +239,23 @@ impl Shell {
             {
                 st.session_notice = None;
             }
+            // The game is gone (or already was): leave as End stream does. Anything else
+            // keeps the stream and says why.
+            let answer = st
+                .ending_game
+                .as_ref()
+                .and_then(|(title, rx)| rx.try_recv().ok().map(|a| (title.clone(), a)));
+            if let Some((title, answer)) = answer {
+                st.ending_game = None;
+                pf_client_core::library::invalidate_running(&st.fp_hex);
+                use pf_client_core::library::GameEnd;
+                if matches!(answer, GameEnd::Ended | GameEnd::NotRunning) {
+                    st.request_quit();
+                    self.capture_off();
+                } else {
+                    st.session_notice = Some((answer.notice(&title), Instant::now()));
+                }
+            }
         }
 
         if let Some(o) = self.overlay.as_mut() {

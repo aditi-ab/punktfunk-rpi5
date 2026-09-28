@@ -51,6 +51,7 @@ import androidx.compose.ui.unit.sp
 import coil.ImageLoader
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
+import io.unom.punktfunk.kit.library.GameEnd
 import io.unom.punktfunk.kit.library.GameEntry
 import io.unom.punktfunk.kit.library.LibraryClient
 import io.unom.punktfunk.kit.security.IdentityHolder
@@ -376,16 +377,20 @@ fun LaunchHoldOverlay(hold: LaunchHold, onRetry: () -> Unit, onShow: () -> Unit)
                             val id = withContext(Dispatchers.IO) {
                                 IdentityHolder.shared(context).await()
                             }
-                            val done = id != null && withContext(Dispatchers.IO) {
-                                LibraryClient.endGame(
-                                    hold.address, hold.mgmtPort, id.certPem, id.privateKeyPem,
-                                    hold.fpHex, hold.game.id,
-                                )
-                            }
-                            ending = if (done) {
-                                "Ended it \u2014 press Retry to start it again."
+                            val outcome = if (id == null) {
+                                GameEnd.Failed("this device has no identity yet")
                             } else {
-                                "The host had nothing running for it."
+                                withContext(Dispatchers.IO) {
+                                    LibraryClient.endGame(
+                                        hold.address, hold.mgmtPort, id.certPem, id.privateKeyPem,
+                                        hold.fpHex, hold.game.id,
+                                    )
+                                }
+                            }
+                            ending = when (outcome) {
+                                GameEnd.Ended -> "Ended it \u2014 press Retry to start it again."
+                                GameEnd.NotRunning -> "The host had nothing running for it."
+                                else -> outcome.notice(hold.game.title)
                             }
                         }
                     },

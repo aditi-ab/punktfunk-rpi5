@@ -22,6 +22,8 @@ import io.unom.punktfunk.kit.GamepadRouter
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.SessionAccess
 import io.unom.punktfunk.kit.SessionEndReason
+import io.unom.punktfunk.kit.library.LibraryClient
+import io.unom.punktfunk.kit.library.RunningGame
 import io.unom.punktfunk.kit.security.IdentityLoad
 import io.unom.punktfunk.kit.security.IdentityStore
 import io.unom.punktfunk.kit.security.KnownHost
@@ -265,6 +267,29 @@ internal fun rememberHostActions(handle: Long, host: KnownHost?): State<List<Hos
         }
     }
     return actions
+}
+
+/**
+ * The game this device launched that this stream plays: the ring's End game. Read when the stream
+ * starts and each time the ring opens ([ringOpen]); a failed read offers no End game.
+ */
+@Composable
+internal fun rememberStreamedGame(handle: Long, host: KnownHost?, ringOpen: Boolean): State<RunningGame?> {
+    val context = LocalContext.current
+    val game = remember(handle) { mutableStateOf<RunningGame?>(null) }
+    LaunchedEffect(handle, ringOpen) {
+        val kh = host ?: return@LaunchedEffect
+        if (kh.fpHex.isEmpty()) return@LaunchedEffect
+        val identity = withContext(Dispatchers.IO) {
+            (IdentityStore(context).load() as? IdentityLoad.Ok)?.identity
+        } ?: return@LaunchedEffect
+        game.value = withContext(Dispatchers.IO) {
+            LibraryClient.fetchRunning(
+                kh.address, kh.effectiveMgmtPort, identity.certPem, identity.privateKeyPem, kh.fpHex,
+            )
+        }.firstOrNull { it.streamedHere }
+    }
+    return game
 }
 
 /**

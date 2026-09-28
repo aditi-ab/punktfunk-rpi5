@@ -300,6 +300,7 @@ mod tests {
             genres: Vec::new(),
             stats: None,
             running: false,
+            endable: false,
         }
     }
 

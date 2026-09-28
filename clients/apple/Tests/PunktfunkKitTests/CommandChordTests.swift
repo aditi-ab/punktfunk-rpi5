@@ -10,8 +10,8 @@ import XCTest
 ///
 ///  * ⌘Q reaching the host at all. That is the whole point — it is the compositor chord on
 ///    Hyprland/KDE/GNOME, and it used to quit the client.
-///  * ⌘⎋ and ⌃⌘F NOT reaching it, under every combination. They are the way out of a captured
-///    stream; forward either and the user is locked in.
+///  * ⌘⎋ NOT reaching it, under every combination. It is the way out of a captured stream;
+///    forward it and the user is locked in.
 ///
 /// The mouse model is deliberately absent from the rule (and from its signature): the chords are
 /// forwarded under the desktop model too, as they are on the SDL clients. Gating it there read as
@@ -40,21 +40,21 @@ final class CommandChordTests: XCTestCase {
         XCTAssertTrue(forwards(m, [.command, .control, .option, .shift]))
     }
 
-    func testTheEscapeHatchesAreNeverForwarded() {
-        // ⌘⎋ releases capture, ⌃⌘F leaves fullscreen. Neither may ever reach the host.
+    func testTheEscapeHatchIsNeverForwarded() {
         XCTAssertFalse(forwards(esc, .command))
-        XCTAssertFalse(forwards(f, [.control, .command]))
-        XCTAssertTrue(InputCapture.isClientReservedChord(keyCode: esc, flags: .command))
-        XCTAssertTrue(
-            InputCapture.isClientReservedChord(keyCode: f, flags: [.control, .command]))
     }
 
-    /// The reservation is exact: it is ⌘⎋ and ⌃⌘F specifically, not "anything with Esc or F in
-    /// it". ⇧⌘⎋ and ⌘F are the host's like any other chord.
+    /// Capturing system shortcuts includes the Mac's own fullscreen chord; the monitor keeps ⌃⌘F
+    /// only with the setting off.
+    func testFullscreenChordGoesToTheHostWithTheSetting() {
+        XCTAssertTrue(forwards(f, [.control, .command]))
+        XCTAssertFalse(forwards(f, [.control, .command], inhibit: false))
+    }
+
+    /// The reservation is exact: ⌘⎋ specifically, not "anything with Esc in it".
     func testNeighbouringChordsAreNotReserved() {
         XCTAssertTrue(forwards(esc, [.command, .shift]))
         XCTAssertTrue(forwards(f, .command))
-        XCTAssertFalse(InputCapture.isClientReservedChord(keyCode: f, flags: .command))
     }
 
     func testNothingWithoutCommandIsClaimedHere() {

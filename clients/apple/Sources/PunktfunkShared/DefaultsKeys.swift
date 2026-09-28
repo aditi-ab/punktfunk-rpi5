@@ -216,9 +216,9 @@ public enum DefaultsKey {
     /// monitor implements it by taking every ⌘ chord off AppKit before a menu key equivalent can
     /// fire and forwarding it instead — which is what makes ⌘Q reach the host's compositor rather
     /// than quitting the client. Off keeps the chords local (the second-screen/work preset).
-    /// The client's own reserved chords (⌘⎋, ⌃⌘F, ⌃⌥⇧…) are never forwarded either way, and — as
-    /// on the SDL clients — the setting has no effect under the `desktop` mouse model, which is
-    /// something you ⌘Tab *away* from. macOS-only today; nothing reads it on iOS/tvOS.
+    /// ⌘⎋ and the ⌃⌥⇧ chords are never forwarded either way; ⌃⌘F is forwarded only with it on.
+    /// It applies under both mouse models, as on the SDL clients. macOS-only today; nothing reads
+    /// it on iOS/tvOS.
     public static let inhibitShortcuts = "punktfunk.inhibitShortcuts"
     /// iPad: capture the mouse/trackpad pointer (pointer lock → relative movement) for games,
     /// rather than forwarding an absolute cursor position. On by default. Only meaningful on iPad
@@ -363,8 +363,8 @@ extension Notification.Name {
     public static let punktfunkToggleQuickActions = Notification.Name("io.unom.punktfunk.toggle-quick-actions")
 
     /// Posted by the app's Stream menu ("Toggle Fullscreen", ⌃⌘F) and by InputCapture's monitor
-    /// when the same combo fires while input is captured (the menu key-equivalent never reaches a
-    /// captured stream view). The key window's `FullscreenController` flips the window's fullscreen
+    /// when the same combo fires while input is captured with `inhibitShortcuts` off (the menu
+    /// key-equivalent never reaches a captured stream view). The key window's `FullscreenController` flips the window's fullscreen
     /// state. macOS only.
     public static let punktfunkToggleFullscreen = Notification.Name("io.unom.punktfunk.toggle-fullscreen")
 

@@ -1547,12 +1547,11 @@ fn windows_term_ladder(shared: &LeaseShared) {
     );
 }
 
-/// End pids an earlier launch adopted
-/// ([`crate::session_settings::GameOnNewLaunch::End`]).
+/// End pids a launch with no lease left adopted: the set it published to
+/// [`crate::launchreg`], and only that set. For
+/// [`crate::session_settings::GameOnNewLaunch::End`] and [`end_detached`].
 ///
-/// Not [`terminate`]: the previous game usually has no lease left, only
-/// the set published to [`crate::launchreg`]. Signals that set only.
-/// Blocking — the caller is about to spawn — and bounded by [`TERM_GRACE`].
+/// Blocking, bounded by [`TERM_GRACE`].
 pub fn end_previous_launch(title: &str, procs: &[crate::procscan::ProcRef], why: &str) -> usize {
     // Re-verify before every signal (rule 2): remembered pids recycle.
     let live = || crate::procscan::alive(procs);
@@ -1565,14 +1564,14 @@ pub fn end_previous_launch(title: &str, procs: &[crate::procscan::ProcRef], why:
         title,
         procs = first.len(),
         reason = why,
-        "ending the previous game before launching the new one"
+        "ending a game this host launched earlier"
     );
     ask_to_close(&first);
     let deadline = Instant::now() + TERM_GRACE;
     while Instant::now() < deadline {
         std::thread::sleep(POLL);
         if live().is_empty() {
-            tracing::info!(title, "the previous game closed when asked");
+            tracing::info!(title, "the game closed when asked");
             return first.len();
         }
     }
@@ -1581,7 +1580,7 @@ pub fn end_previous_launch(title: &str, procs: &[crate::procscan::ProcRef], why:
         title,
         remaining = remaining.len(),
         grace_s = TERM_GRACE.as_secs(),
-        "the previous game did not close when asked — killing it"
+        "the game did not close when asked — killing it"
     );
     force_close(&remaining);
     first.len()
@@ -1730,13 +1729,16 @@ pub fn pending_snapshot() -> Vec<(Arc<LeaseShared>, u64)> {
         .collect()
 }
 
-/// End pending games now. `app` filters; `None` ends all. Returns count.
-pub fn end_pending(app: Option<&str>) -> usize {
+/// End pending games now. `owner` keeps it to one device's launches and
+/// `app` to one title; `None` reaches all. Returns count.
+pub fn end_pending(owner: Option<&str>, app: Option<&str>) -> usize {
     let taken: Vec<Arc<LeaseShared>> = {
         let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
-        let (hit, keep): (Vec<Pending>, Vec<Pending>) = std::mem::take(&mut *reg)
-            .into_iter()
-            .partition(|p| app.is_none() || p.shared.game.id.as_deref() == app);
+        let (hit, keep): (Vec<Pending>, Vec<Pending>) =
+            std::mem::take(&mut *reg).into_iter().partition(|p| {
+                launched_by(p.fingerprint.as_deref(), owner)
+                    && (app.is_none() || p.shared.game.id.as_deref() == app)
+            });
         *reg = keep;
         hit.into_iter().map(|p| p.shared).collect()
     };
@@ -1745,6 +1747,40 @@ pub fn end_pending(app: Option<&str>) -> usize {
         terminate(shared, "ended from the management API");
     }
     n
+}
+
+/// Whether a launch by `launcher` is in `owner`'s reach. `None` owner reaches
+/// every launch; a device owns only launches it made, never an anonymous one.
+pub fn launched_by(launcher: Option<&str>, owner: Option<&str>) -> bool {
+    match owner {
+        None => true,
+        Some(fp) => launcher.is_some_and(|l| l.eq_ignore_ascii_case(fp)),
+    }
+}
+
+/// End a launch no session holds ([`crate::launchreg::take_detached`]) on a
+/// detached thread, then free its record and report the exit as `terminated`.
+pub fn end_detached(d: crate::launchreg::Detached, why: &'static str) {
+    let _ = std::thread::Builder::new()
+        .name("pf1-gameterm".into())
+        .spawn(move || {
+            let procs: Vec<crate::procscan::ProcRef> =
+                d.procs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            end_previous_launch(&d.game.title, &procs, why);
+            crate::launchreg::ended(&d.procs);
+            crate::events::emit(crate::events::EventKind::GameExited {
+                game: crate::events::GameRefPayload {
+                    app: d.game.id.clone(),
+                    title: d.game.title.clone(),
+                    store: d.game.store.clone(),
+                    client: d.client().to_string(),
+                    fingerprint: Some(d.fingerprint.clone()),
+                    plane: d.plane,
+                    preset: None,
+                },
+                reason: crate::events::GameEndReason::Terminated,
+            });
+        });
 }
 
 /// One process-lifetime thread; started on demand; sleeps while empty.
@@ -2320,13 +2356,28 @@ mod tests {
             Some("fp-151".into()),
             Duration::from_secs(3_600),
         );
-        assert_eq!(end_pending(Some(a)), 1);
+        assert_eq!(
+            end_pending(Some("fp-151"), Some(a)),
+            0,
+            "another device's game"
+        );
+        assert_eq!(end_pending(Some("FP-150"), Some(a)), 1);
         assert!(!is_pending(a));
         assert!(is_pending(b));
         assert!(la.shared().is_terminating());
         assert!(!lb.shared().is_terminating());
-        assert_eq!(end_pending(Some("steam:99999")), 0);
+        assert_eq!(end_pending(None, Some("steam:99999")), 0);
         assert_eq!(readopt(Some("fp-151"), Some(b)).len(), 1);
+    }
+
+    /// No owner reaches every launch; a device reaches its own, never an anonymous one.
+    #[test]
+    fn launched_by_is_the_launching_device() {
+        assert!(launched_by(None, None));
+        assert!(launched_by(Some("fp"), None));
+        assert!(launched_by(Some("ab12"), Some("AB12")));
+        assert!(!launched_by(Some("ab12"), Some("cd34")));
+        assert!(!launched_by(None, Some("ab12")));
     }
 
     /// Quick successful child exit is a hand-off, not the game exiting.

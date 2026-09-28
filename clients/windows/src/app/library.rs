@@ -102,6 +102,18 @@ pub(crate) enum LibraryPhase {
 pub(crate) struct LibraryState {
     pub(crate) phase: LibraryPhase,
     pub(crate) art: HashMap<String, String>,
+    /// What the host has up (`/status`), by game id: `true` when this device launched it and
+    /// may end it.
+    pub(crate) running: HashMap<String, bool>,
+}
+
+/// End game's two moments: the title awaiting a yes, and what the host said. Root state, like
+/// `HostsProps::forget`: a flyout click and a worker thread set it.
+#[derive(Clone, PartialEq, Default)]
+pub(crate) struct EndGameUi {
+    /// `(id, title)` the confirmation asks about.
+    pub(crate) ask: Option<(String, String)>,
+    pub(crate) said: Option<String>,
 }
 
 /// Props for the library page: the services plus the fetch/art state driving re-render.
@@ -109,11 +121,13 @@ pub(crate) struct LibraryState {
 pub(crate) struct LibraryProps {
     pub(crate) svc: Svc,
     pub(crate) state: LibraryState,
+    pub(crate) end_game: EndGameUi,
+    pub(crate) set_end_game: AsyncSetState<EndGameUi>,
 }
 
 impl PartialEq for LibraryProps {
     fn eq(&self, other: &Self) -> bool {
-        self.svc == other.svc && self.state == other.state
+        self.svc == other.svc && self.state == other.state && self.end_game == other.end_game
     }
 }
 
@@ -192,6 +206,17 @@ pub(crate) fn start_fetch(ctx: &Arc<AppCtx>, set_library: &AsyncSetState<Library
             );
             publish(&state);
 
+            // After the titles: a slow `/status` must not hold the shelf back.
+            let mgmt = target.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT);
+            for g in library::fetch_running(&target.addr, mgmt, &identity, pin) {
+                if let Some(id) = g.app_id.clone().filter(|_| g.is_up()) {
+                    *state.running.entry(id).or_default() |= g.endable;
+                }
+            }
+            if !state.running.is_empty() {
+                publish(&state);
+            }
+
             if jobs.is_empty() {
                 return;
             }
@@ -243,6 +268,8 @@ fn store_art(dir: &Path, id: &str, bytes: &[u8]) -> Option<String> {
 /// already offer (design/client-deep-links.md §5 names the library game context menu as an
 /// attach point for exactly this).
 const MENU_COPY_LINK: &str = "Copy link";
+/// Only on a title this device launched and the host still runs.
+const MENU_END_GAME: &str = "End game";
 
 /// One title's self-emitted `punktfunk://` link: this page's host with the game's own
 /// `launch=` id attached, so the URL boots straight into that title rather than the desktop.
@@ -310,6 +337,9 @@ fn poster_tile(
     poster_h: f64,
     on_tap: Box<dyn Fn()>,
     on_copy_link: Box<dyn Fn()>,
+    // `Some` while the host runs it; `Some(true)` when this device may end it.
+    up: Option<bool>,
+    on_end_game: Box<dyn Fn()>,
 ) -> Element {
     let poster: Element = match art_uri {
         Some(uri) => Image::new_with_uri(uri)
@@ -364,7 +394,7 @@ fn poster_tile(
             .into(),
         },
     };
-    let framed = border(grid(vec![
+    let mut layers = vec![
         poster,
         // `Pill::Info` rather than a solid accent fill — `style.rs` is explicit that
         // white-on-bright is unreadable here.
@@ -380,14 +410,24 @@ fn poster_tile(
         .vertical_alignment(VerticalAlignment::Top)
         .margin(uniform(6.0))
         .into(),
-    ]))
-    .corner_radius(8.0)
-    .border_brush(if game.launcher {
-        ThemeRef::Accent
-    } else {
-        ThemeRef::CardStroke
-    })
-    .border_thickness(uniform(1.0));
+    ];
+    if up.is_some() {
+        layers.push(
+            pill("Running", Pill::Neutral)
+                .horizontal_alignment(HorizontalAlignment::Left)
+                .vertical_alignment(VerticalAlignment::Bottom)
+                .margin(uniform(6.0))
+                .into(),
+        );
+    }
+    let framed = border(grid(layers))
+        .corner_radius(8.0)
+        .border_brush(if game.launcher {
+            ThemeRef::Accent
+        } else {
+            ThemeRef::CardStroke
+        })
+        .border_thickness(uniform(1.0));
 
     let tappable = border(
         vstack((
@@ -416,11 +456,15 @@ fn poster_tile(
             .subtle()
             .tooltip("More options")
             .automation_name(format!("More options for {}", game.title))
-            .menu_flyout(vec![menu_item(MENU_COPY_LINK)])
-            .on_item_clicked(move |item: String| {
-                if item == MENU_COPY_LINK {
-                    on_copy_link();
-                }
+            .menu_flyout(if up == Some(true) {
+                vec![menu_item(MENU_COPY_LINK), menu_item(MENU_END_GAME)]
+            } else {
+                vec![menu_item(MENU_COPY_LINK)]
+            })
+            .on_item_clicked(move |item: String| match item.as_str() {
+                MENU_COPY_LINK => on_copy_link(),
+                MENU_END_GAME => on_end_game(),
+                _ => {}
             })
             .horizontal_alignment(HorizontalAlignment::Right)
             .vertical_alignment(VerticalAlignment::Top)
@@ -450,8 +494,11 @@ pub(crate) fn library_page(props: &LibraryProps, cx: &mut RenderCx) -> Element {
     let poster_h = tile_w * POSTER_RATIO;
 
     let back_btn = button("Back").icon(lucide::icon("arrow-left")).on_click({
-        let ss = ss.clone();
-        move || ss.call(Screen::Hosts)
+        let (ss, se) = (ss.clone(), props.set_end_game.clone());
+        move || {
+            se.call(EndGameUi::default());
+            ss.call(Screen::Hosts)
+        }
     });
     let title = if target.name.is_empty() {
         "Game library".to_string()
@@ -459,6 +506,14 @@ pub(crate) fn library_page(props: &LibraryProps, cx: &mut RenderCx) -> Element {
         format!("Game library \u{00B7} {}", target.name)
     };
     let mut body: Vec<Element> = vec![page_header(&title, back_btn)];
+    if let Some(said) = &props.end_game.said {
+        body.push(
+            InfoBar::new("End game")
+                .message(said.clone())
+                .is_closable(false)
+                .into(),
+        );
+    }
 
     match &props.state.phase {
         LibraryPhase::Loading => body.push(
@@ -504,6 +559,7 @@ pub(crate) fn library_page(props: &LibraryProps, cx: &mut RenderCx) -> Element {
             let tile = |g: &Game| -> Element {
                 let (ctx2, ss, st) = (ctx.clone(), ss.clone(), st.clone());
                 let (target, id) = (target.clone(), g.id.clone());
+                let (se, ask) = (props.set_end_game.clone(), (g.id.clone(), g.title.clone()));
                 let (link_target, link_id) = (target.clone(), id.clone());
                 // The desktop tile is the host, not one of its titles: it streams with no
                 // launch id, and wakes first because it is often the first dial of the day.
@@ -525,6 +581,13 @@ pub(crate) fn library_page(props: &LibraryProps, cx: &mut RenderCx) -> Element {
                     Box::new(move || match game_link(&link_target, &link_id) {
                         Some(url) => pf_client_core::clipboard::set_text(&url),
                         None => tracing::warn!(id = %link_id, "no saved host to build a link from"),
+                    }),
+                    props.state.running.get(&g.id).copied(),
+                    Box::new(move || {
+                        se.call(EndGameUi {
+                            ask: Some(ask.clone()),
+                            said: None,
+                        })
                     }),
                 )
             };
@@ -573,5 +636,53 @@ pub(crate) fn library_page(props: &LibraryProps, cx: &mut RenderCx) -> Element {
         }
     }
 
-    page_wide(body)
+    // ALWAYS MOUNTED in a stable trailing slot, `is_open` arming it — the hosts page's forget
+    // confirmation, for the same reactor reason.
+    let end_confirm: Element = {
+        let pending = props.end_game.ask.clone();
+        let (se, ctx2, set_library) = (
+            props.set_end_game.clone(),
+            ctx.clone(),
+            props.svc.set_library.clone(),
+        );
+        let content = pending
+            .as_ref()
+            .map(|(_, title)| {
+                format!("End {title} on the host? Unsaved progress in the game is lost.")
+            })
+            .unwrap_or_default();
+        ContentDialog::new("End game?")
+            .content(content)
+            .primary_button_text("End game")
+            .close_button_text("Cancel")
+            .is_open(pending.is_some())
+            .on_closed(move |r: ContentDialogResult| {
+                se.call(EndGameUi::default());
+                let Some((id, title)) = pending
+                    .clone()
+                    .filter(|_| r == ContentDialogResult::Primary)
+                else {
+                    return;
+                };
+                let (se, ctx2, set_library) = (se.clone(), ctx2.clone(), set_library.clone());
+                let _ = std::thread::Builder::new()
+                    .name("punktfunk-endgame".into())
+                    .spawn(move || {
+                        let target = ctx2.shared.target.lock().unwrap().clone();
+                        let pin = target.fp_hex.as_deref().and_then(crate::trust::parse_hex32);
+                        let mgmt = target.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT);
+                        let outcome =
+                            library::end_game(&target.addr, mgmt, &ctx2.identity, pin, &id);
+                        tracing::info!(app = %id, ?outcome, "end game");
+                        se.call(EndGameUi {
+                            ask: None,
+                            said: Some(outcome.notice(&title)),
+                        });
+                        start_fetch(&ctx2, &set_library);
+                    });
+            })
+            .into()
+    };
+
+    grid(vec![page_wide(body), end_confirm]).into()
 }

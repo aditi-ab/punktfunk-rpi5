@@ -77,6 +77,11 @@ extension ConsoleModel {
                 host.clipboardSync = a["on"] as? Bool ?? false
                 store.update(host)
             }
+        case "EndGame":
+            endGame(
+                addr: a["addr"] as? String ?? "", mgmt: port(a["mgmt"]),
+                fp: a["fp_hex"] as? String ?? "", appID: a["app_id"] as? String ?? "",
+                title: a["title"] as? String ?? "")
         case "HostAction":
             hostAction(
                 fp: a["fp_hex"] as? String ?? "", id: a["action_id"] as? String ?? "",
@@ -376,6 +381,20 @@ extension ConsoleModel {
         Task { [weak self] in
             let sent = await SendLogs.toHost(host)
             self?.notice(sent.message)
+        }
+    }
+
+    /// End a title this device launched, say how it went, then re-read what the host runs so
+    /// the poster's badge follows.
+    private func endGame(addr: String, mgmt: UInt16, fp: String, appID: String, title: String) {
+        guard let host = host(fp: fp, addr: addr, port: 0), let pin = host.pinnedSHA256,
+              let identity = (try? ClientIdentityStore.shared.load())?.identity else { return }
+        Task { [weak self] in
+            let outcome = await LibraryClient.endGame(
+                appID: appID, address: addr, port: mgmt,
+                certPEM: identity.certPEM, keyPEM: identity.keyPEM, hostFingerprint: pin)
+            self?.notice(outcome.notice(title: title))
+            self?.fetchLibrary(addr: addr, mgmt: mgmt, fp: fp, refreshOnly: true)
         }
     }
 

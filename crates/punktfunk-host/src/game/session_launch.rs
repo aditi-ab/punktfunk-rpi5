@@ -30,8 +30,9 @@ pub(crate) struct Prepared {
 
 /// Before the display opens, so a nested gamescope that starts the game with it already
 /// knows whether this session spawns: reprieve this client's copy left from a dropped
-/// session, claim the launch record, run the prep steps (HDR toggle, sink switch), then hold
-/// `game.launching` when this session will spawn. Blocking: prep and holds run operator code.
+/// session, claim and name the launch record, run the prep steps (HDR toggle, sink switch),
+/// then hold `game.launching` when this session will spawn. Blocking: prep and holds run
+/// operator code.
 pub(crate) fn prepare(
     target: Option<&LaunchTarget>,
     owner: &LaunchOwner,
@@ -43,7 +44,9 @@ pub(crate) fn prepare(
     let fp = owner.fingerprint.as_deref();
     let claim = target.map(|t| {
         crate::gamelease::readopt(fp, t.game.id.as_deref());
-        crate::launchreg::claim(fp, t.game.id.as_deref(), t.launcher, fresh_stamp)
+        let claim = crate::launchreg::claim(fp, t.game.id.as_deref(), t.launcher, fresh_stamp);
+        claim.describe(&t.game, owner.plane);
+        claim
     });
     let stamp = claim.as_ref().map_or(fresh_stamp, |c| c.stamp());
     let prep = (!prep.is_empty()).then(|| crate::hooks::run_prep(prep, prep_env));

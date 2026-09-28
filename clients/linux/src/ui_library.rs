@@ -58,6 +58,8 @@ struct State {
     /// `recv()` and holds its own handle, so on an all-miss run nothing ever wakes it and the
     /// fetch threads would carry on against a page nobody can see.
     art_rx: RefCell<Option<ArtRx>>,
+    /// What the host has up, by library id (`/status`). An endable row puts End game on the tile.
+    running: RefCell<HashMap<String, library::RunningGame>>,
     /// Bumped by every [`load`]. A fetch whose generation is stale when it lands is dropped:
     /// Reload can be pressed again while one is in flight, and results arrive in whatever
     /// order the two hosts answer, not the order they were asked.
@@ -301,6 +303,7 @@ fn build(
         games: RefCell::new(Vec::new()),
         sort: Cell::new(stored_sort),
         art_rx: RefCell::new(None),
+        running: RefCell::new(HashMap::new()),
         generation: Cell::new(0),
     });
     {
@@ -339,6 +342,20 @@ fn build(
 enum Loaded {
     Cached(Vec<GameEntry>),
     Fetched(Result<Vec<GameEntry>, library::LibraryError>),
+    /// `/status`, after the catalog: a slow answer must not hold the titles back.
+    Running(Vec<library::RunningGame>),
+}
+
+/// Keep what is up, one row per title; the endable row wins, since it carries End game.
+fn set_running(state: &State, games: Vec<library::RunningGame>) {
+    let mut by_id: HashMap<String, library::RunningGame> = HashMap::new();
+    for g in games.into_iter().filter(library::RunningGame::is_up) {
+        let Some(id) = g.app_id.clone() else { continue };
+        if by_id.get(&id).is_none_or(|kept| !kept.endable) {
+            by_id.insert(id, g);
+        }
+    }
+    *state.running.borrow_mut() = by_id;
 }
 
 /// Put one catalog on screen and start its posters. The cards are the same either way —
@@ -369,7 +386,7 @@ fn load(state: &Rc<State>) {
     let identity = state.identity.clone();
     let fp_hex = state.req.fp_hex.clone();
     let pin = fp_hex.as_deref().and_then(trust::parse_hex32);
-    let (tx, rx) = async_channel::bounded(2);
+    let (tx, rx) = async_channel::bounded(3);
     let cache_key = fp_hex.clone();
     std::thread::Builder::new()
         .name("punktfunk-library".into())
@@ -386,7 +403,11 @@ fn load(state: &Rc<State>) {
                 return;
             }
             let fetched = library::fetch_games(&addr, port, &identity, pin);
-            let _ = tx.send_blocking(Loaded::Fetched(fetched));
+            if tx.send_blocking(Loaded::Fetched(fetched)).is_err() {
+                return;
+            }
+            let running = library::fetch_running(&addr, port, &identity, pin);
+            let _ = tx.send_blocking(Loaded::Running(running));
         })
         .expect("spawn library thread");
     let weak = Rc::downgrade(state);
@@ -430,6 +451,12 @@ fn load(state: &Rc<State>) {
                 Loaded::Fetched(Err(e)) => {
                     state.error_page.set_description(Some(&e.to_string()));
                     state.stack.set_visible_child_name("error");
+                }
+                Loaded::Running(games) => {
+                    set_running(&state, games);
+                    if !state.games.borrow().is_empty() {
+                        render(&state);
+                    }
                 }
             }
         }
@@ -572,8 +599,23 @@ fn game_card(state: &Rc<State>, game: &GameEntry) -> gtk::FlowBoxChild {
         });
         actions.add_action(&a);
     }
+    let up = state.running.borrow().get(&game.id).cloned();
+    let endable = up.as_ref().is_some_and(|g| g.endable);
+    if endable {
+        let (weak, id, title) = (Rc::downgrade(state), game.id.clone(), game.title.clone());
+        let a = gio::SimpleAction::new("end-game", None);
+        a.connect_activate(move |_, _| {
+            if let Some(state) = weak.upgrade() {
+                confirm_end_game(&state, &id, &title);
+            }
+        });
+        actions.add_action(&a);
+    }
     let menu = gio::Menu::new();
     menu.append(Some("Copy link"), Some("game.copy-link"));
+    if endable {
+        menu.append(Some("End game"), Some("game.end-game"));
+    }
     let menu_btn = gtk::MenuButton::builder()
         .child(&crate::lucide::row_icon("ellipsis"))
         .menu_model(&menu)
@@ -588,6 +630,16 @@ fn game_card(state: &Rc<State>, game: &GameEntry) -> gtk::FlowBoxChild {
     poster.set_child(Some(&placeholder));
     poster.add_overlay(&pic);
     poster.add_overlay(&badge);
+    if up.is_some() {
+        let pill = gtk::Label::new(Some("Running"));
+        pill.add_css_class("pf-pill");
+        pill.add_css_class("pf-store-badge");
+        pill.set_halign(gtk::Align::Start);
+        pill.set_valign(gtk::Align::End);
+        pill.set_margin_start(6);
+        pill.set_margin_bottom(6);
+        poster.add_overlay(&pill);
+    }
     poster.add_overlay(&menu_btn);
     poster.insert_action_group("game", Some(&actions));
     poster.add_css_class("pf-poster");
@@ -627,6 +679,56 @@ fn game_card(state: &Rc<State>, game: &GameEntry) -> gtk::FlowBoxChild {
     }
     child.connect_activate(move |_| sender.input(AppMsg::Connect(req.clone())));
     child
+}
+
+/// Ending a game can lose unsaved progress, so it asks first.
+fn confirm_end_game(state: &Rc<State>, id: &str, title: &str) {
+    let dialog = adw::AlertDialog::new(
+        Some(&format!("End {title}?")),
+        Some("Unsaved progress in the game is lost."),
+    );
+    dialog.add_responses(&[("cancel", "Cancel"), ("end", "End game")]);
+    dialog.set_response_appearance("end", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let weak = Rc::downgrade(state);
+    let (id, title) = (id.to_string(), title.to_string());
+    dialog.connect_response(Some("end"), move |_, _| {
+        if let Some(state) = weak.upgrade() {
+            end_game(&state, id.clone(), title.clone());
+        }
+    });
+    dialog.present(Some(&state.stack));
+}
+
+/// Ask the host on a worker, toast the answer, then redraw from a fresh `/status`.
+fn end_game(state: &Rc<State>, id: String, title: String) {
+    let (addr, port, identity) = (
+        state.req.addr.clone(),
+        state.mgmt_port,
+        state.identity.clone(),
+    );
+    let pin = state.req.fp_hex.as_deref().and_then(trust::parse_hex32);
+    let (tx, rx) = async_channel::bounded(1);
+    std::thread::Builder::new()
+        .name("punktfunk-endgame".into())
+        .spawn(move || {
+            let outcome = library::end_game(&addr, port, &identity, pin, &id);
+            let running = library::fetch_running(&addr, port, &identity, pin);
+            let _ = tx.send_blocking((outcome, running));
+        })
+        .expect("spawn end-game thread");
+    let (weak, sender) = (Rc::downgrade(state), state.sender.clone());
+    glib::spawn_future_local(async move {
+        let Ok((outcome, running)) = rx.recv().await else {
+            return;
+        };
+        sender.input(AppMsg::Toast(outcome.notice(&title)));
+        if let Some(state) = weak.upgrade() {
+            set_running(&state, running);
+            render(&state);
+        }
+    });
 }
 
 fn is_desktop(game: &GameEntry) -> bool {

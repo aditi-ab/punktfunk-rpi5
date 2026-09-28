@@ -235,6 +235,12 @@ export const streamRunning = callable<[], { running: boolean }>("stream_running"
 export const hostAction = callable<[action: string], { ok: boolean; error?: string }>(
   "host_action",
 );
+// End a title this device launched on the host (`punktfunk end-game`). `ok` when it is gone;
+// `notice` is the CLI's sentence either way.
+export const endGame = callable<
+  [ref: string, gameId: string],
+  { ok: boolean; error?: string; notice?: string }
+>("end_game");
 export const checkUpdate = callable<[force: boolean], UpdateInfo>("check_update");
 // Update the client by whichever route its install supports: `flatpak update --user` for the
 // flatpak, `punktfunk-client --apply-update` (the packaged root helper) for a one-tap-capable

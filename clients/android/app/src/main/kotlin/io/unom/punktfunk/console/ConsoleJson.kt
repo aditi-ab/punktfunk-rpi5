@@ -298,7 +298,7 @@ internal object ConsoleJson {
             val id = g.appId ?: continue
             out.put(
                 JSONObject().put("app_id", id).put("state", g.state)
-                    .put("awaiting_window", g.awaitingWindow),
+                    .put("awaiting_window", g.awaitingWindow).put("endable", g.endable),
             )
         }
         return out.toString()
