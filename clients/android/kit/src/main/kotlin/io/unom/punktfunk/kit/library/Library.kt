@@ -275,11 +275,52 @@ sealed class GameEnd {
 
 object LibraryClient {
     private const val TAG = "LibraryClient"
+
+    /** Titles a request: the host's ceiling for one page. */
+    internal const val PAGE_LIMIT = 200
+
+    /** 500 pages of 200 is 100 000 titles. A host whose cursor never runs out stops here. */
+    internal const val MAX_PAGES = 500
+
+    /** What walking the pages came to: the catalog, or the status that stopped it. */
+    internal sealed class Walk {
+        data class Done(val games: List<GameEntry>) : Walk()
+        data class Refused(val code: Int) : Walk()
+    }
+
+    /** The request path of one page. The cursor is the host's own text, so it is encoded. */
+    internal fun pagePath(cursor: String?): String =
+        "/api/v1/library/page?limit=$PAGE_LIMIT" +
+            (cursor?.let { "&cursor=" + java.net.URLEncoder.encode(it, "UTF-8") } ?: "")
+
     /**
-     * `GET /api/v1/library` at [mgmtBase], authenticated by mTLS. [fpHex] is the pinned host-cert
-     * SHA-256 (64 hex, from the paired [io.unom.punktfunk.kit.security.KnownHost]); a blank value
-     * means the host was never paired, so there's nothing authorized to browse. A refusal maps
-     * through [refused]. BLOCKING — call from a background dispatcher.
+     * The whole catalog, a page at a time, so no answer grows with the library. [get] takes the
+     * cursor of the page before and answers one page's status and body. Any page failing fails
+     * the walk: half a catalog is not one.
+     */
+    internal fun walkPages(base: String, get: (cursor: String?) -> Pair<Int, String>): Walk {
+        val games = ArrayList<GameEntry>()
+        var cursor: String? = null
+        repeat(MAX_PAGES) {
+            val (code, body) = get(cursor)
+            if (code != 200) return Walk.Refused(code)
+            val page = JSONObject(body)
+            games += parseItems(page.getJSONArray("items"), base)
+            val next = str(page, "next_cursor")
+            // A cursor that does not move would ask for the same page forever.
+            if (next == null || next == cursor) return Walk.Done(games)
+            cursor = next
+        }
+        return Walk.Done(games)
+    }
+
+    /**
+     * The host's catalog, walked by `GET /api/v1/library/page` at [mgmtBase] and authenticated
+     * by mTLS. A host older than the paged route refuses it on this lane, so `GET
+     * /api/v1/library` answers whole instead. [fpHex] is the pinned host-cert SHA-256 (64 hex,
+     * from the paired [io.unom.punktfunk.kit.security.KnownHost]); a blank value means the host
+     * was never paired. A refusal maps through [refused]. BLOCKING — call from a background
+     * dispatcher.
      */
     fun fetch(
         address: String,
@@ -300,13 +341,18 @@ object LibraryClient {
             return LibraryResult.Error("couldn't set up a secure connection to the host")
         }
         val base = mgmtBase(address, mgmtPort)
+        val get = { path: String ->
+            client.newCall(Request.Builder().url(base + path).build()).execute()
+                .use { it.code to it.body?.string().orEmpty() }
+        }
         return try {
-            val req = Request.Builder().url("$base/api/v1/library").build()
-            client.newCall(req).execute().use { resp ->
-                if (resp.code == 200) {
-                    LibraryResult.Ok(parse(resp.body?.string().orEmpty(), base))
+            when (val walked = walkPages(base) { cursor -> get(pagePath(cursor)) }) {
+                is Walk.Done -> LibraryResult.Ok(walked.games.launchersFirst())
+                is Walk.Refused -> if (walked.code in setOf(401, 403, 404)) {
+                    val (code, body) = get("/api/v1/library")
+                    if (code == 200) LibraryResult.Ok(parse(body, base)) else refused(code)
                 } else {
-                    refused(resp.code)
+                    refused(walked.code)
                 }
             }
         } catch (e: Exception) {
@@ -462,8 +508,11 @@ object LibraryClient {
         return out
     }
 
-    private fun parse(json: String, base: String): List<GameEntry> {
-        val arr = JSONArray(json)
+    private fun parse(json: String, base: String): List<GameEntry> =
+        parseItems(JSONArray(json), base).launchersFirst()
+
+    /** The titles of one answer, in the host's order. */
+    private fun parseItems(arr: JSONArray, base: String): List<GameEntry> {
         val out = ArrayList<GameEntry>(arr.length())
         for (i in 0 until arr.length()) {
             val o = arr.getJSONObject(i)
@@ -490,7 +539,7 @@ object LibraryClient {
                 ),
             )
         }
-        return out.launchersFirst()
+        return out
     }
 
     /** A present, non-null, non-blank JSON string field, else null. */

@@ -38,6 +38,53 @@ class LibraryClientTest {
         assertEquals("ab".repeat(32), LibraryCache.keyFor(null, "ab".repeat(32)))
     }
 
+    private fun page(ids: List<String>, next: String?): Pair<Int, String> {
+        val items = ids.joinToString(",") { """{"id":"$it","store":"custom","title":"$it","art":{"portrait":"/api/v1/library/art/$it/portrait"}}""" }
+        val cursor = next?.let { ""","next_cursor":"$it"""" } ?: ""
+        return 200 to """{"items":[$items],"total":4,"platforms":[]$cursor}"""
+    }
+
+    @Test
+    fun a_walk_follows_the_cursor_to_the_last_page() {
+        val asked = ArrayList<String?>()
+        val walked = LibraryClient.walkPages("https://h:47990") { cursor ->
+            asked += cursor
+            when (cursor) {
+                null -> page(listOf("a", "b"), "c1")
+                "c1" -> page(listOf("c"), "c2")
+                else -> page(listOf("d"), null)
+            }
+        } as LibraryClient.Walk.Done
+        assertEquals(listOf("a", "b", "c", "d"), walked.games.map { it.id })
+        assertEquals(listOf(null, "c1", "c2"), asked)
+        assertEquals("https://h:47990/api/v1/library/art/a/portrait", walked.games[0].art.portrait)
+    }
+
+    @Test
+    fun a_walk_ends_on_a_cursor_that_does_not_move() {
+        var calls = 0
+        val walked = LibraryClient.walkPages("https://h:47990") {
+            calls++
+            page(listOf("a"), "stuck")
+        } as LibraryClient.Walk.Done
+        assertEquals(2, calls)
+        assertEquals(2, walked.games.size)
+    }
+
+    @Test
+    fun a_refused_page_stops_the_walk_with_its_status() {
+        val walked = LibraryClient.walkPages("https://h:47990") { cursor ->
+            if (cursor == null) page(listOf("a"), "c1") else 403 to ""
+        }
+        assertEquals(LibraryClient.Walk.Refused(403), walked)
+    }
+
+    @Test
+    fun a_cursor_is_encoded_into_the_page_path() {
+        assertEquals("/api/v1/library/page?limit=200", LibraryClient.pagePath(null))
+        assertEquals("/api/v1/library/page?limit=200&cursor=a%2Bb%3D", LibraryClient.pagePath("a+b="))
+    }
+
     private val unreachable = LibraryResult.Error("couldn't reach the host")
 
     private class Run {
