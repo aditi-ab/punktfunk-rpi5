@@ -17,8 +17,9 @@ TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 TARGETS_MAC=(aarch64-apple-darwin)
 BUILD_IOS="${BUILD_IOS:-0}" # BUILD_IOS=1 adds iOS device + simulator slices (rustup targets aarch64-apple-ios{,-sim})
 BUILD_TVOS="${BUILD_TVOS:-0}" # BUILD_TVOS=1 adds tvOS slices — TIER-3 Rust targets, built with $NIGHTLY
+BUILD_VISIONOS="${BUILD_VISIONOS:-0}" # BUILD_VISIONOS=1 adds visionOS slices — TIER-3 too, same $NIGHTLY
 
-# The one place the tvOS toolchain is named — .gitea/workflows/apple.yml reads this line, so keep
+# The one place the tier-3 toolchain is named — .gitea/workflows/apple.yml reads this line, so keep
 # the shape. Pinned: a floating `nightly` swaps the compiler under a TestFlight build with no
 # commit. Install with: rustup toolchain install $NIGHTLY --profile minimal --component rust-src
 NIGHTLY=nightly-2026-08-11
@@ -42,8 +43,8 @@ if [[ -z "${DEVELOPER_DIR:-}" ]]; then
         NONBETA="$(pick_nonbeta_xcode || true)"
         if [[ -n "$NONBETA" ]]; then
             export DEVELOPER_DIR="$NONBETA"
-        elif [[ "$BUILD_IOS" == "1" || "$BUILD_TVOS" == "1" ]]; then
-            echo "ERROR: iOS/tvOS slices need a full NON-BETA Xcode in /Applications" >&2
+        elif [[ "$BUILD_IOS$BUILD_TVOS$BUILD_VISIONOS" == *1* ]]; then
+            echo "ERROR: iOS/tvOS/visionOS slices need a full NON-BETA Xcode in /Applications" >&2
             echo "       (CLT has no iOS SDK; a beta's ld breaks host proc-macro dylibs)." >&2
             exit 1
         elif [[ "$DEFAULT_DIR" != *CommandLineTools* ]]; then
@@ -85,8 +86,8 @@ export CMAKE_POLICY_VERSION_MINIMUM=3.5
 # Skia for the console comes as prebuilt archives keyed by target + features. skia-bindings
 # downloads with no content check and, when no archive matches, builds Skia from source for
 # hours without failing. So it only ever reads files verified here against these digests.
-# The tvOS archives are ours (scripts/skia-tvos/), the rest rust-skia's; re-derive all five
-# on every skia-safe bump. A SKIA_BINARIES_URL from the caller skips the check.
+# The tvOS and visionOS archives are ours (scripts/skia-apple/), the rest rust-skia's; re-derive
+# all seven on every skia-safe bump. A SKIA_BINARIES_URL from the caller skips the check.
 SKIA_TAG=0.99.0
 SKIA_HASH=a25a0fdb7d90429aa2d1
 SKIA_FEATURES=jpegd-jpege-metal-pdf-textlayout
@@ -97,6 +98,8 @@ skia_sha256() {
     aarch64-apple-ios-sim) echo a33fdbebfec3d3e57cd2ba6d4490bec2407199c50328c48f5810bf9a81189f7a ;;
     aarch64-apple-tvos) echo 904aedec99d84fe65c76f7d435642b5cadcee2290284a8ebe3b5a9383e6cfb78 ;;
     aarch64-apple-tvos-sim) echo f664eb840eed925dc55071a07a4a542e63a4fd5f7cba41d667b1c6d4ad593c72 ;;
+    aarch64-apple-visionos) echo 48776b3dafb7e42c7086c72b62fca3781b113592ced3aff9289cfa92729d231f ;;
+    aarch64-apple-visionos-sim) echo fdb1509131de74383e9807c6f2f0b76c1dc56dfe83ba4e4384c6f34cfd50885a ;;
     esac
 }
 SKIA_DIR="$(cd "$TARGET_DIR" && pwd)/skia-binaries"
@@ -110,7 +113,7 @@ skia_fetch() { # target...
         want="$(skia_sha256 "$t")"
         [[ "$(shasum -a 256 "$SKIA_DIR/$f" 2>/dev/null | cut -d' ' -f1)" == "$want" ]] && continue
         case "$t" in
-        *-tvos*) url="https://git.unom.io/unom/skia-binaries/releases/download/$SKIA_TAG/$f" ;;
+        *-tvos* | *-visionos*) url="https://git.unom.io/unom/skia-binaries/releases/download/$SKIA_TAG/$f" ;;
         *) url="https://github.com/rust-skia/skia-binaries/releases/download/$SKIA_TAG/$f" ;;
         esac
         curl -fsSL --retry 3 -o "$SKIA_DIR/$f.part" "$url"
@@ -146,6 +149,13 @@ if [[ "$BUILD_TVOS" == "1" ]]; then
     TVOS_DEPLOYMENT_TARGET=17.0 cargo "+$NIGHTLY" build --release -p punktfunk-client-apple \
         -Z build-std=std,panic_abort --target aarch64-apple-tvos-sim
 fi
+if [[ "$BUILD_VISIONOS" == "1" ]]; then
+    skia_fetch aarch64-apple-visionos aarch64-apple-visionos-sim
+    XROS_DEPLOYMENT_TARGET=26.0 cargo "+$NIGHTLY" build --release -p punktfunk-client-apple \
+        -Z build-std=std,panic_abort --target aarch64-apple-visionos
+    XROS_DEPLOYMENT_TARGET=26.0 cargo "+$NIGHTLY" build --release -p punktfunk-client-apple \
+        -Z build-std=std,panic_abort --target aarch64-apple-visionos-sim
+fi
 
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
@@ -178,6 +188,10 @@ fi
 if [[ "$BUILD_TVOS" == "1" ]]; then
     ARGS+=(-library "$TARGET_DIR"/aarch64-apple-tvos/release/libpunktfunk_apple.a -headers "$STAGE/include")
     ARGS+=(-library "$TARGET_DIR"/aarch64-apple-tvos-sim/release/libpunktfunk_apple.a -headers "$STAGE/include")
+fi
+if [[ "$BUILD_VISIONOS" == "1" ]]; then
+    ARGS+=(-library "$TARGET_DIR"/aarch64-apple-visionos/release/libpunktfunk_apple.a -headers "$STAGE/include")
+    ARGS+=(-library "$TARGET_DIR"/aarch64-apple-visionos-sim/release/libpunktfunk_apple.a -headers "$STAGE/include")
 fi
 
 # Cargo does NOT fingerprint MACOSX_DEPLOYMENT_TARGET — units cached from a build without

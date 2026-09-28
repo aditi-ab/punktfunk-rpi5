@@ -103,7 +103,7 @@ struct SettingsView: View {
     /// The OS keeps the controller's Home press from the stream (`watchHomeButton`).
     @State var homeButtonKept = false
     #endif
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     @AppStorage(DefaultsKey.pointerCapture) var pointerCapture = true
     @AppStorage(DefaultsKey.touchMode) var touchMode = TouchInputMode.trackpad.rawValue
     @AppStorage(DefaultsKey.rumbleOnDevice) var rumbleOnDevice = false
@@ -156,7 +156,7 @@ struct SettingsView: View {
     @State var micChannelCount = 0
     #endif
 
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     /// `initialCategory` is nil in the app (the list opens un-selected on iPhone; iPad lands on
     /// General via `onAppear`). The screenshot harness passes an explicit category so the captured
     /// shot opens on a real settings page (a populated detail) rather than the bare category list.
@@ -288,7 +288,7 @@ struct SettingsView: View {
 
     // MARK: - iOS / iPadOS: adaptive split view
 
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     private var iosBody: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             List(selection: $settingsSelection) {

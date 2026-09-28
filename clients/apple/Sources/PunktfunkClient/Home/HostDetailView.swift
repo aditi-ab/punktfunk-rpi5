@@ -116,7 +116,7 @@ struct HostDetailView: View {
         #if !os(tvOS)
         .navigationTitle(pageTitle(host))
         #endif
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         .navigationBarTitleDisplayMode(.inline)
         #endif
     }
@@ -127,7 +127,7 @@ struct HostDetailView: View {
     /// The host's name, except in the iPad's sheet of sections: its sidebar names the host, so the
     /// pane names its section.
     private func pageTitle(_ host: StoredHost) -> String {
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         if let only { return only.title }
         #endif
         return host.displayName
@@ -397,7 +397,7 @@ private struct HostConnectionFields: View {
                 .labelsHidden()
                 .multilineTextAlignment(.trailing)
                 .autocorrectionDisabled()
-                #if os(iOS)
+                #if os(iOS) || os(visionOS)
                 .textInputAutocapitalization(field == .name ? .words : .never)
                 .keyboardType(field == .port ? .numberPad : .default)
                 #endif

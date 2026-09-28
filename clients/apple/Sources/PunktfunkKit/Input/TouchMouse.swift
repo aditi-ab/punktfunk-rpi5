@@ -43,7 +43,7 @@ public enum TouchInputMode: String, CaseIterable, Sendable {
     public static var sessionOverride: TouchInputMode?
 }
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 import PunktfunkCore
 import UIKit
 
@@ -508,7 +508,11 @@ final class TouchMouse {
             return
         }
         // Ballistics in physical pixels so the curve matches the Android tuning exactly.
+        #if os(visionOS)
+        let scale = view.traitCollection.displayScale
+        #else
         let scale = view.window?.screen.scale ?? view.traitCollection.displayScale
+        #endif
         let dx = (loc.x - prevPoint.x) * scale
         let dy = (loc.y - prevPoint.y) * scale
         let dtMs = max((touch.timestamp - prevTime) * 1000, 1)

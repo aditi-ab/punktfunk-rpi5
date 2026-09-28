@@ -74,7 +74,7 @@ enum ShotScenes {
                 AnyView(ShotHostPage())
             },
         ]
-        #if os(iOS) || os(macOS)
+        #if os(iOS) || os(visionOS) || os(macOS)
         scenes += [
             // The Library tab with its host filter (iOS) and the Mac's Library row. Landscape like
             // the store set's other shelves.
@@ -137,7 +137,7 @@ enum ShotScenes {
             },
         ]
         #endif
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         // The Library tab with every section filled: Desktops, Recently Played, Favorites,
         // Launchers and Games.
         scenes.append(ShotScene(name: "15b-library-sections", orientation: .natural, colorScheme: .dark) {
@@ -407,7 +407,7 @@ private struct ShotHome: View {
                 onPaired: { _, _ in }, onLaunchTitle: { _, _ in }, onConnectShelf: { _ in },
                 wake: { _ in }),
             onLaunch: { _, _ in }, onConnectShelf: { _ in }, onConnectHost: { _ in })
-        #elseif os(iOS)
+        #elseif os(iOS) || os(visionOS)
         ShotTouchTabs(selection: .hosts) { home } library: { Color.clear }
         #else
         home
@@ -428,7 +428,7 @@ private struct ShotHome: View {
     #endif
 }
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 /// Hosts and Library as ContentView's tabs: a tab bar on iPhone, a sidebar-able bar on iPad.
 struct ShotTouchTabs<Hosts: View, Library: View>: View {
     let selection: TouchTab
@@ -619,7 +619,7 @@ private struct ShotLaunchHold: View {
     }
 }
 
-#if os(iOS) || os(macOS)
+#if os(iOS) || os(visionOS) || os(macOS)
 /// The connect overlay (the real `ConnectOverlay`) in each phase — instant "Connecting…"
 /// feedback, the "Waking…" wait, and the wake-timed-out prompt — as the touch UI's Liquid Glass
 /// modal over the host grid.
@@ -743,7 +743,7 @@ private struct ShotSettings: View {
     var body: some View {
         #if os(macOS)
         ShotMacSettingsWindow()
-        #elseif os(iOS)
+        #elseif os(iOS) || os(visionOS)
         // SettingsView owns its NavigationSplitView (sidebar + detail) and Done button, so it is
         // rendered directly — a wrapping NavigationStack would nest a split view in a stack. Open
         // on Display rather than the bare category list: resolution, frame rate, bitrate, HDR and
@@ -812,7 +812,7 @@ private struct ShotPair: View {
     }
 
     var body: some View {
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         // PRESENT it, don't rebuild it. `PairSheet` is a bottom sheet on iOS — it carries its own
         // `.presentationDetents([.medium, .large])` and the system's Liquid Glass background, both
         // of which only exist inside a real `.sheet`. Composed into a ZStack instead (what this
@@ -877,7 +877,7 @@ private struct ShotStreamHero: View {
         }
         .background { ShotDesktopFrame() }
         .background(Color.black.ignoresSafeArea())
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         #endif
@@ -902,6 +902,8 @@ private struct ShotHUD: View {
         }
         #if os(macOS)
         return NSScreen.main?.maximumFramesPerSecond ?? 60
+        #elseif os(visionOS)
+        return NativeDisplay.mode.hz
         #else
         return UIApplication.shared.connectedScenes
             .compactMap { ($0 as? UIWindowScene)?.screen.maximumFramesPerSecond }.first ?? 60

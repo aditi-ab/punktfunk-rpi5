@@ -79,7 +79,7 @@ public final class GamepadFeedback {
     public init(connection: PunktfunkConnection, manager: GamepadManager) {
         self.connection = connection
         self.manager = manager
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         if UserDefaults.standard.bool(forKey: DefaultsKey.rumbleOnDevice),
             CHHapticEngine.capabilitiesForHardware().supportsHaptics {
             deviceRumble = RumbleRenderer(actuator: .device)

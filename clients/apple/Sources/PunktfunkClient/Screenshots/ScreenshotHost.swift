@@ -61,12 +61,12 @@ struct ScreenshotHostView: View {
             // The scene keeps its safe area, so the HUD clears the Dynamic Island; the streamed
             // frame ignores it itself. Black matches the dark iOS window. tvOS and macOS keep the
             // system backdrop and window background the real app sits on.
-            #if os(iOS)
+            #if os(iOS) || os(visionOS)
             .background(Color.black.ignoresSafeArea())
             #endif
             #if os(macOS)
             .background(MacShotWindowConfigurator(scene: scene))
-            #elseif os(iOS)
+            #elseif os(iOS) || os(visionOS)
             .background(IOSOrientationConfigurator(orientation: orientation))
             #endif
             .task {
@@ -80,7 +80,7 @@ struct ScreenshotHostView: View {
             }
     }
 
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     /// PUNKTFUNK_SHOT_ORIENTATION=landscape turns every scene: the iPad set is landscape.
     private var orientation: ShotOrientation {
         ProcessInfo.processInfo.environment["PUNKTFUNK_SHOT_ORIENTATION"] == "landscape"
@@ -90,12 +90,16 @@ struct ScreenshotHostView: View {
 
     private func announceReady() {
         print("PF_SHOT_READY scene=\(scene.name)")
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         // The window in pixels. A landscape iPad app in a portrait simulator is drawn scaled to
         // fit, and the driver crops the screenshot to it.
         if let window = UIApplication.shared.connectedScenes
             .compactMap({ ($0 as? UIWindowScene)?.keyWindow }).first {
+            #if os(visionOS)
+            let scale = window.traitCollection.displayScale
+            #else
             let scale = window.screen.scale
+            #endif
             print("PF_SHOT_WINDOW_PX \(Int(window.bounds.width * scale)) "
                 + "\(Int(window.bounds.height * scale))")
         }
@@ -283,7 +287,7 @@ enum MacSelfCapture {
 }
 #endif
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 /// Orientation lock for the requested scene (landscape for the stream hero, portrait for chrome).
 /// Requires the app to allow those orientations in Info.plist — it does, for both.
 private struct IOSOrientationConfigurator: UIViewControllerRepresentable {
