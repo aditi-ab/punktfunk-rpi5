@@ -61,7 +61,7 @@ const KIND_ZERO_COPY: u32 = 8;
 /// linux-dmabuf tranche flag: this tranche's buffers can go straight to a plane.
 const TRANCHE_SCANOUT: u32 = 1;
 
-/// `PUNKTFUNK_NATIVE_SCANOUT=1` arms the lane. Off until the overlay rides along.
+/// The lane arms on every Wayland session unless `PUNKTFUNK_NATIVE_SCANOUT=0`.
 pub fn enabled() -> bool {
     pf_client_core::video::native_scanout_wanted()
 }
@@ -124,7 +124,16 @@ struct Job {
     pts_ns: u64,
     decoded_ns: u64,
     submitted_ns: u64,
+    /// Committed with no overlay above: the frame counts toward the scanout trial.
+    judged: bool,
 }
+
+/// Picture frames on glass, with no overlay above, before the lane judges the compositor:
+/// two seconds at 60 Hz.
+const TRIAL_FRAMES: u32 = 120;
+/// A frame neither presented nor discarded this long means the compositor is stuck on the
+/// lane's buffers: the picture has frozen.
+const STALL_NS: u64 = 1_000_000_000;
 
 #[derive(Default)]
 struct LaneState {
@@ -146,6 +155,9 @@ struct LaneState {
     samples: Vec<NativeSample>,
     zero_copy: u32,
     presented: u32,
+    /// Judged frames on glass, and how many of those went out zero-copy.
+    trial_presented: u32,
+    trial_zero_copy: u32,
     /// Keys committed with explicit sync: their `wl_buffer.release` is not the release.
     explicit_keys: HashSet<u64>,
     /// `wp_color_manager_v1` advertisements, as raw enum values.
@@ -223,6 +235,10 @@ impl Dispatch<pfb::WpPresentationFeedback, usize> for LaneState {
                 let zero_copy = kind & KIND_ZERO_COPY != 0;
                 state.presented += 1;
                 state.zero_copy += u32::from(zero_copy);
+                if job.judged {
+                    state.trial_presented += 1;
+                    state.trial_zero_copy += u32::from(zero_copy);
+                }
                 state.samples.push(NativeSample {
                     pts_ns: job.pts_ns,
                     decoded_ns: job.decoded_ns,
@@ -574,6 +590,9 @@ pub struct NativeLane {
     hdr_set: bool,
     /// The compositor refused a PQ description: HDR stays on the swapchain path.
     hdr_refused: bool,
+    /// After [`TRIAL_FRAMES`]: whether the compositor scans the picture out. A compositor
+    /// that composites it gains nothing from the lane, and can scan out the swapchain's.
+    verdict: Option<bool>,
     seq: usize,
     dead: bool,
     // SAFETY: field drop order keeps SDL's display alive past every borrowed proxy and queue.
@@ -707,6 +726,7 @@ impl NativeLane {
             hdr_set: false,
             hdr_refused: false,
             seq: 0,
+            verdict: None,
             dead: false,
             _window: window.context(),
         }))
@@ -874,7 +894,9 @@ impl NativeLane {
     }
 
     /// Dispatch what SDL's socket reads brought for this lane. A protocol error retires the
-    /// lane; the connection itself is SDL's to fail on.
+    /// lane; the connection itself is SDL's to fail on, and so does a frame the compositor
+    /// leaves unanswered past [`STALL_NS`]. After [`TRIAL_FRAMES`] judged frames on glass the
+    /// lane stays only if most of them went out zero-copy.
     pub fn pump(&mut self) {
         if self.dead {
             return;
@@ -884,7 +906,39 @@ impl NativeLane {
         {
             tracing::warn!("native scanout: Wayland error — the lane retires, Vulkan presents");
             self.dead = true;
+            return;
         }
+        let now = pf_client_core::session::now_ns();
+        let oldest = self.state.jobs.values().map(|j| j.submitted_ns).min();
+        if oldest.is_some_and(|t| now.saturating_sub(t) > STALL_NS) {
+            tracing::warn!(
+                "native scanout: the compositor answered no frame for a second — the lane \
+                 retires, Vulkan presents"
+            );
+            self.dead = true;
+            return;
+        }
+        let (on_glass, zero_copy) = (self.state.trial_presented, self.state.trial_zero_copy);
+        if self.verdict.is_none() && on_glass >= TRIAL_FRAMES {
+            let scans_out = zero_copy * 2 >= on_glass;
+            self.verdict = Some(scans_out);
+            tracing::info!(
+                on_glass,
+                zero_copy,
+                "native scanout: {}",
+                if scans_out {
+                    "the compositor scans the picture out — the lane keeps the window"
+                } else {
+                    "the compositor composites the picture — the lane retires, Vulkan presents"
+                }
+            );
+            self.dead = !scans_out;
+        }
+    }
+
+    /// The trial showed the compositor scanning the picture out.
+    pub fn scans_out(&self) -> bool {
+        self.verdict == Some(true)
     }
 
     fn flush(&mut self) {
@@ -894,8 +948,9 @@ impl NativeLane {
     }
 
     /// Whether a picture of this size and colour can be the window's buffer: SDR, or PQ
-    /// where the compositor takes a PQ BT.2020 description, and it fills the window
-    /// (through SDL's viewport, or at the window's own size without one).
+    /// where the compositor takes a PQ BT.2020 description and has scanned the lane out,
+    /// and it fills the window (through SDL's viewport, or at the window's own size without
+    /// one).
     pub fn fits(
         &self,
         color: ColorDesc,
@@ -903,7 +958,9 @@ impl NativeLane {
         view: (u32, u32),
         fit: VideoFit,
     ) -> bool {
-        if self.dead || (color.is_pq() && !self.hdr_capable()) {
+        // KWin 6.7 answers no P010 frame carrying a PQ description, so PQ waits for a
+        // compositor that has already scanned SDR frames out.
+        if self.dead || (color.is_pq() && !(self.hdr_capable() && self.scans_out())) {
             return false;
         }
         if self.color_repr.is_some() {
@@ -1127,6 +1184,7 @@ impl NativeLane {
         }
         let seq = self.seq;
         self.seq += 1;
+        let judged = !self.hud.as_ref().is_some_and(|h| h.mapped);
         let Some(Import::Ready(slot)) = self.state.imports.get_mut(&key) else {
             return false;
         };
@@ -1139,6 +1197,7 @@ impl NativeLane {
                 pts_ns,
                 decoded_ns,
                 submitted_ns: pf_client_core::session::now_ns(),
+                judged,
             },
         );
         self.surface.commit();
@@ -1149,7 +1208,8 @@ impl NativeLane {
 
     /// A refused import of a listed pair retires the lane for the session.
     pub fn refused(&mut self, fourcc: u32, modifier: u64) {
-        tracing::warn!(
+        // NVIDIA under Mutter refuses every YUV import: expected, so not a warning.
+        tracing::info!(
             fourcc = format!("{fourcc:#010x}"),
             modifier = format!("{modifier:#x}"),
             "native scanout: the compositor refused a listed dma-buf — the lane retires"

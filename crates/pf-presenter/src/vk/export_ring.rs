@@ -20,7 +20,8 @@ use std::rc::Rc;
 
 pub(crate) const DRM_FORMAT_NV12: u32 = 0x3231_564e;
 pub(crate) const DRM_FORMAT_P010: u32 = 0x3031_3050;
-/// One buffer on screen, one queued in the compositor, one being written.
+/// One buffer on screen, one queued in the compositor, one being written. A fourth only
+/// lets a compositing compositor queue a frame deeper (KWin: +4.5 ms at 60 Hz).
 const SLOTS: usize = 3;
 /// Bit 63 marks a picture ring's key in the lane, never a VAAPI pool key.
 pub(crate) const KEY_PICTURES: u64 = 1 << 63;
