@@ -194,10 +194,6 @@ public final class StreamLayerView: NSView {
     /// bounds change and a resize-END has none, so without this the layer keeps its pre-resize aspect
     /// and the shader stretches the new frame into it (black bars + squish). Main-thread only.
     private var lastDecodedContentSize: CGSize?
-    /// This screen's below-the-notch mode, as of the last screen change — the one input to
-    /// `videoBounds` too expensive to read per mouse event (see `layoutPresenter`).
-    /// Main-thread only.
-    private var safeModePixels: (width: Int, height: Int)?
     /// The screen, its parameters or the backing scale changed since the screen's values were
     /// read. Main-thread only.
     private var screenValuesStale = true
@@ -429,6 +425,10 @@ public final class StreamLayerView: NSView {
 
     /// A click from another app counts (one click into the video captures, not two).
     public override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    /// The video runs under the hidden title bar, where AppKit drags the window for any view that
+    /// allows it and never delivers the click. Captured, that press is the host's.
+    public override var mouseDownCanMoveWindow: Bool { !captured && window?.isMovable == true }
 
     /// The engage click is complete — drop its suppression latch (see InputCapture;
     /// guards against GC delivering both halves of the click before our mouseDown).
@@ -785,29 +785,14 @@ public final class StreamLayerView: NSView {
         return (mode.width, mode.height)
     }
 
-    /// The rect the picture is fit into — `bounds`, except for a full-screen session whose mode is
-    /// exactly this screen's below-the-notch mode, which is trimmed to sit under the camera
-    /// housing (see `SafeDisplay.videoBox`). EVERY measurement against the picture reads this:
-    /// the presenter's fit, the pointer mapping both ways, and the cursor scale.
-    private var videoBounds: CGRect {
-        guard let window, window.styleMask.contains(.fullScreen), let screen = window.screen
-        else { return bounds }
-        let content = hostContentSize()
-        guard content.width > 0, content.height > 0 else { return bounds }
-        return SafeDisplay.videoBox(
-            bounds: bounds, topInsetPoints: Double(screen.safeAreaInsets.top),
-            content: (Int(content.width), Int(content.height)),
-            safeMode: safeModePixels)
-    }
-
-    /// Where the picture sits in `videoBounds`: the presenter's placement in backing pixels, the
+    /// Where the picture sits in `bounds`: the presenter's placement in backing pixels, the
     /// points→pixels scale, and the frame size. Every pointer mapping reads this, so a click lands on
     /// the pixel drawn there.
     private func videoPlacement()
         -> (placement: VideoPlacement, box: CGRect, scale: CGFloat, width: UInt32, height: UInt32)? {
         guard let connection else { return nil }
         let content = hostContentSize()
-        let box = videoBounds
+        let box = bounds
         let scale = window?.backingScaleFactor ?? 1
         guard content.width > 0, content.height > 0, box.width > 0, box.height > 0 else { return nil }
         let p = VideoFit(name: connection.settings.videoFit).place(
@@ -1119,20 +1104,17 @@ public final class StreamLayerView: NSView {
         requestAutoCapture() // entering a session is the deliberate "capture me" moment
     }
 
-    /// Aspect-fit the stage-2 metal sublayer to the video box (`videoBounds`, which is the view
-    /// except under a camera housing); refresh contentsScale on a retina↔non-retina move (see
-    /// SessionPresenter.layout). Also feeds the Match-window follower the WINDOW's physical-pixel
-    /// size (bounds → backing) — it follows the window, not the box — so a resize / retina move
-    /// follows. A screen-change observer re-runs this so the display-link range follows the view.
+    /// Aspect-fit the stage-2 metal sublayer to the view; refresh contentsScale on a
+    /// retina↔non-retina move (see SessionPresenter.layout). Also feeds the Match-window follower
+    /// the view's physical-pixel size (bounds → backing), so a resize / retina move follows. A
+    /// screen-change observer re-runs this so the display-link range follows the view.
     private func layoutPresenter() {
-        // Refreshed BEFORE the fit below reads it, and only when the screen can have changed:
-        // enumerating display modes costs ~150 µs, and a live resize lays out twice per step.
+        // Only when the screen can have changed: a live resize lays out twice per step.
         if screenValuesStale {
             screenValuesStale = window == nil // a view with no window has no screen to keep
-            safeModePixels = window?.screen?.notchSafePixelSize
             presenter.setPanel(Self.panelInfo(window?.screen ?? NSScreen.main))
         }
-        presenter.layout(in: videoBounds, contentsScale: window?.backingScaleFactor ?? 1)
+        presenter.layout(in: bounds, contentsScale: window?.backingScaleFactor ?? 1)
         displayLayer.videoGravity = SessionPresenter.gravity(VideoFit(name: connection?.settings.videoFit))
         // Present routing tracks the window's composited state (fullscreen transitions always
         // re-layout, so this stays current): a windowed session presents through a Core Animation
