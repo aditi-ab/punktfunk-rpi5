@@ -20,7 +20,7 @@ use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use windows::core::{h, w, Interface, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HMODULE, LUID};
@@ -591,6 +591,42 @@ impl Component {
         }
     }
 
+    /// Set the rate property `name` to `ask`, or to the highest rate under it the encoder
+    /// takes: a VCN refuses a rate over its ceiling where other encoders clamp. Bisected on
+    /// the driver's own answer, to 1 Mbit/s, and kept in `ceiling` (0 = not known) so the
+    /// next ask over it is one call. `None` when it takes no rate at all.
+    fn set_rate(&self, name: &HSTRING, ask: i64, ceiling: &AtomicI64) -> Option<i64> {
+        let set = |bps: i64| self.set_property(name, AmfVariant::from_i64(bps));
+        let ask = match ceiling.load(Ordering::Relaxed) {
+            0 => ask,
+            known => ask.min(known),
+        };
+        match set(ask) {
+            sys::AMF_OK => return Some(ask),
+            sys::AMF_OUT_OF_RANGE => {}
+            _ => return None,
+        }
+        let (mut taken, mut refused) = (0, ask);
+        while refused - taken > 1_000_000 {
+            let mid = taken + (refused - taken) / 2;
+            if set(mid) == sys::AMF_OK {
+                taken = mid;
+            } else {
+                refused = mid;
+            }
+        }
+        // The last probe may be a refused one, so the rate returned is set once more.
+        let fit = (taken > 0 && set(taken) == sys::AMF_OK).then_some(taken)?;
+        ceiling.store(fit, Ordering::Relaxed);
+        tracing::info!(
+            property = %name,
+            asked_mbps = ask / 1_000_000,
+            fit_mbps = fit / 1_000_000,
+            "AMF rate fitted under the encoder's ceiling"
+        );
+        Some(fit)
+    }
+
     /// `GetProperty` BOOL. `None` on decline or non-BOOL.
     fn get_prop_bool(&self, name: &HSTRING) -> Option<bool> {
         self.get_property(name)?.as_bool()
@@ -961,6 +997,8 @@ pub struct AmfEncoder {
     height: u32,
     fps: u32,
     bitrate_bps: u64,
+    /// The highest target rate this encoder took after refusing one, 0 until it refuses.
+    rate_ceiling: AtomicI64,
     /// What every submitted texture holds: NV12, P010 or BGRA ([`input_formats`]).
     input: PixelFormat,
     ten_bit: bool,
@@ -1055,6 +1093,7 @@ impl AmfEncoder {
             height,
             fps,
             bitrate_bps,
+            rate_ceiling: AtomicI64::new(0),
             input: format,
             ten_bit,
             hdr,
@@ -1101,13 +1140,18 @@ impl AmfEncoder {
             true,
         )?;
         comp.set_prop(p.rc_method, AmfVariant::from_i64(p.rc_cbr), true)?;
-        let bps = self.bitrate_bps.min(i64::MAX as u64) as i64;
-        comp.set_prop(p.target_bitrate, AmfVariant::from_i64(bps), true)?;
+        let ask = self.bitrate_bps.min(i64::MAX as u64) as i64;
+        let Some(bps) = comp.set_rate(p.target_bitrate, ask, &self.rate_ceiling) else {
+            bail!(
+                "AMF SetProperty({}) took no rate up to {ask}",
+                p.target_bitrate
+            );
+        };
         comp.set_prop(p.peak_bitrate, AmfVariant::from_i64(bps), true)?;
         comp.set_prop(p.framerate, AmfVariant::from_rate(self.fps.max(1), 1), true)?;
         comp.set_prop(
             p.vbv_size,
-            AmfVariant::from_i64(self.vbv_bits(self.bitrate_bps)),
+            AmfVariant::from_i64(self.vbv_bits(bps as u64)),
             false,
         )?;
         comp.set_prop(p.enforce_hrd, AmfVariant::from_bool(true), false)?;
@@ -2095,7 +2139,6 @@ impl Encoder for AmfEncoder {
 
     fn reconfigure_bitrate(&mut self, bps: u64) -> bool {
         let bps_i = bps.min(i64::MAX as u64) as i64;
-        let vbv = self.vbv_bits(bps);
         let Some(inner) = self.inner.as_ref() else {
             // Lazy open applies the new rate via `apply_static_props`.
             self.bitrate_bps = bps;
@@ -2105,26 +2148,28 @@ impl Encoder for AmfEncoder {
         let applied = {
             let p = &self.props;
             let comp = &inner.comp;
-            let ok = comp
-                .set_prop(p.target_bitrate, AmfVariant::from_i64(bps_i), false)
-                .unwrap_or(false)
-                && comp
-                    .set_prop(p.peak_bitrate, AmfVariant::from_i64(bps_i), false)
-                    .unwrap_or(false);
-            if ok {
+            let ceiling = &self.rate_ceiling;
+            let fit = comp
+                .set_rate(p.target_bitrate, bps_i, ceiling)
+                .filter(|&fit| {
+                    comp.set_prop(p.peak_bitrate, AmfVariant::from_i64(fit), false)
+                        .unwrap_or(false)
+                });
+            if let Some(fit) = fit {
                 // Optional VBV rescale; decline keeps the old buffer (HRD absorbs the mismatch).
+                let vbv = self.vbv_bits(fit as u64);
                 let _ = comp.set_prop(p.vbv_size, AmfVariant::from_i64(vbv), false);
             }
-            ok
+            fit
         };
-        if !applied {
+        let Some(bps) = applied.map(|fit| fit as u64) else {
             // Half-applied pair is fine: the rebuild fallback re-authors from scratch.
             tracing::warn!(
                 mbps = bps / 1_000_000,
                 "AMF declined the dynamic bitrate retarget — falling back to a rebuild"
             );
             return false;
-        }
+        };
         self.bitrate_bps = bps; // reset()/re-Init re-apply the new rate
         true
     }
@@ -2885,6 +2930,49 @@ mod tests {
             "post-retarget readback must be the accepted NEW rate"
         );
         eprintln!("live AMF applied-bitrate readback: open {opened:?} -> retarget {retargeted:?}");
+    }
+
+    /// Live: a rate no VCN takes opens at the encoder's ceiling, and so does a retarget.
+    /// Skips without AMD.
+    #[test]
+    fn amf_rate_over_ceiling_live() {
+        if let Err(e) = try_factory() {
+            eprintln!("skipping: AMF runtime unavailable ({e})");
+            return;
+        }
+        let Some(device) = amd_d3d11_device() else {
+            eprintln!("skipping: no AMD adapter on this box");
+            return;
+        };
+        const ASK: u64 = 2_600_000_000;
+        for codec in [Codec::H264, Codec::H265, Codec::Av1] {
+            let opened = AmfEncoder::open(
+                codec,
+                PixelFormat::Nv12,
+                1920,
+                1080,
+                60,
+                ASK,
+                8,
+                ChromaFormat::Yuv420,
+                false,
+                None,
+            );
+            let Ok(mut enc) = opened else {
+                eprintln!("skipping {codec:?}: this GPU declined it");
+                continue;
+            };
+            enc.prepare(&device).expect("open over the ceiling");
+            let ceiling = enc.applied_bitrate_bps().expect("readback");
+            assert!(ceiling < ASK, "{codec:?} took {ASK}");
+            assert!(enc.reconfigure_bitrate(20_000_000), "{codec:?} retarget");
+            assert!(
+                enc.reconfigure_bitrate(ASK),
+                "{codec:?} retarget over the ceiling"
+            );
+            assert_eq!(enc.applied_bitrate_bps(), Some(ceiling), "{codec:?}");
+            eprintln!("live AMF ceiling {codec:?}: {} Mbit/s", ceiling / 1_000_000);
+        }
     }
 
     /// Live probe: AVC and HEVC must be true on any VCN; AV1 is hardware truth (RDNA3+).
