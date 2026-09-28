@@ -3,9 +3,10 @@
 //! live in `pf_driver_proto::switch`, which the Windows driver serves from too. A pair is one
 //! [`SwitchState`] served as two halves ([`serialize_joycon_0x30`]).
 //!
-//! Face buttons are positional (wire south → report B). Wire motion is DualSense units
-//! (20 LSB/°·s, 10000 LSB/g); the report is raw Pro units (14.247 LSB/°·s, 4096 LSB/g)
-//! via the factory-calibration identity. Evidence: this module's tests and hid-nintendo.c.
+//! Face buttons are positional (wire south → report B). Wire motion is SDL's frame in
+//! DualSense units (20 LSB/°·s, 10000 LSB/g); the report is raw Pro axes and units
+//! (14.247 LSB/°·s, 4096 LSB/g) via the factory-calibration identity. Evidence: this module's
+//! tests and hid-nintendo.c.
 
 use pf_driver_proto::switch::{self as wire, STICK_CENTER, STICK_RANGE};
 use punktfunk_core::input::{gamepad as gs, GamepadFrame};
@@ -202,12 +203,17 @@ impl SwitchState {
         self.accel = fresh.accel;
     }
 
-    /// DualSense-convention sample → raw IMU. No axis flip: the Pro path does not negate.
+    /// Wire sample (SDL's frame: pitch, yaw, roll) → the pad's raw axes. SDL reads a Switch
+    /// IMU as `(-y, z, -x)` for both sensors; this is its inverse, and the raw frame
+    /// `hid-nintendo` reads too.
     pub fn apply_motion(&mut self, gyro: [i16; 3], accel: [i16; 3]) {
         let gyro_den = 1000 * gs::MOTION_GYRO_LSB_PER_DEG_S;
-        self.gyro = gyro.map(|v| ((v as i32 * JC_IMU_GYRO_MILLI_RES_PER_DPS) / gyro_den) as i16);
-        self.accel = accel
-            .map(|v| ((v as i32 * JC_IMU_ACCEL_RES_PER_G) / gs::MOTION_ACCEL_LSB_PER_G) as i16);
+        let g = |v: i32| (v * JC_IMU_GYRO_MILLI_RES_PER_DPS / gyro_den) as i16;
+        let a = |v: i32| (v * JC_IMU_ACCEL_RES_PER_G / gs::MOTION_ACCEL_LSB_PER_G) as i16;
+        let [p, y, r] = gyro.map(i32::from);
+        self.gyro = [g(-r), g(-p), g(y)];
+        let [ax, ay, az] = accel.map(i32::from);
+        self.accel = [a(-az), a(-ax), a(ay)];
     }
 }
 
@@ -416,14 +422,17 @@ mod tests {
         assert!(stick_raw(i16::MIN) <= 0xFFF);
     }
 
-    /// Wire 20 LSB/°·s, 10000 LSB/g → raw 14.247 LSB/°·s, 4096 LSB/g.
+    /// Wire 20 LSB/°·s, 10000 LSB/g → raw 14.247 LSB/°·s, 4096 LSB/g, on the axes SDL reads
+    /// back as the wire's: raw `(-roll, -pitch, yaw)`. Gravity at rest (+y) lands on raw +z.
     #[test]
     fn motion_units() {
         let mut st = SwitchState::neutral();
         // 100 °/s = wire 2000 → raw ≈ 1424; 1 g = wire 10000 → raw 4096.
         st.apply_motion([2000, 0, -2000], [10000, -10000, 0]);
-        assert_eq!(st.gyro, [1424, 0, -1424]);
-        assert_eq!(st.accel, [4096, -4096, 0]);
+        assert_eq!(st.gyro, [1424, -1424, 0]);
+        assert_eq!(st.accel, [0, -4096, -4096]);
+        st.apply_motion([0; 3], [0, 10000, 0]);
+        assert_eq!(st.accel, SwitchState::neutral().accel);
     }
 
     /// Neutral → 0; max amp → 65535; left = low/strong, right = high/weak.
@@ -505,7 +514,7 @@ mod tests {
             ..GamepadFrame::default()
         };
         let mut st = SwitchState::merge_joycon_frame(&SwitchState::neutral(), &f);
-        st.apply_motion([2000, 1000, -500], [0, 0, 10000]);
+        st.apply_motion([2000, 1000, -500], [0, 10000, 0]);
         let l = serialize_joycon_0x30(&st, Half::Left, 1);
         let r = serialize_joycon_0x30(&st, Half::Right, 1);
         let bits = |rep: &[u8; 64]| u32::from_le_bytes([rep[3], rep[4], rep[5], 0]);
@@ -523,9 +532,9 @@ mod tests {
         );
         let imu = |rep: &[u8; 64], at: usize| i16::from_le_bytes([rep[at], rep[at + 1]]);
         // accel x/y/z at 13/15/17, gyro at 19/21/23.
-        assert_eq!([imu(&l, 17), imu(&l, 19), imu(&l, 21)], [4096, 1424, 712]);
-        assert_eq!([imu(&r, 17), imu(&r, 19), imu(&r, 21)], [-4096, 1424, -712]);
-        assert_eq!(imu(&r, 23), -imu(&l, 23));
+        let axes = |rep: &[u8; 64]| [17, 19, 21, 23].map(|at| imu(rep, at));
+        assert_eq!(axes(&l), [4096, 356, -1424, 712]);
+        assert_eq!(axes(&r), [-4096, 356, 1424, -712]);
         assert_eq!(serialize_for(Half::Right.device_type(), &st, 1), r);
     }
 
