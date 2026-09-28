@@ -186,7 +186,12 @@ export function familyOf(device: string): PadFamily {
 		return "playstation";
 	if (device.startsWith("steam")) return "steam";
 	// The 8BitDo Pro pads carry Nintendo labels.
-	if (device === "switchpro" || device.startsWith("8bitdopro")) return "switch";
+	if (
+		device === "switchpro" ||
+		device === "joyconpair" ||
+		device.startsWith("8bitdopro")
+	)
+		return "switch";
 	return "xbox";
 }
 

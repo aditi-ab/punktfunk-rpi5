@@ -101,9 +101,9 @@ fn pref_for_type(t: sdl3::gamepad::GamepadType) -> GamepadPref {
         T::PS5 => GamepadPref::DualSense,
         T::PS4 => GamepadPref::DualShock4,
         T::XboxOne => GamepadPref::XboxOne,
-        // A Joy-Con pair exposes the full Pro surface; a single Joy-Con is half a pad
-        // and stays on the Xbox 360 fallback.
-        T::NintendoSwitchPro | T::NintendoSwitchJoyconPair => GamepadPref::SwitchPro,
+        T::NintendoSwitchPro => GamepadPref::SwitchPro,
+        // A single Joy-Con is half a pad and stays on the Xbox 360 fallback.
+        T::NintendoSwitchJoyconPair => GamepadPref::JoyConPair,
         _ => GamepadPref::Xbox360,
     }
 }

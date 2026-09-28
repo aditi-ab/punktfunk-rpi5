@@ -284,6 +284,7 @@ impl PadInfo {
             GamepadPref::EightBitDoPro2 => "8BitDo Pro 2",
             GamepadPref::EightBitDoPro3 => "8BitDo Pro 3",
             GamepadPref::HoripadSteam => "HORIPAD for Steam",
+            GamepadPref::JoyConPair => "Joy-Con pair",
             _ => "",
         }
     }

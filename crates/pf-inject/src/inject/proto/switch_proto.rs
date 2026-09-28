@@ -1,10 +1,12 @@
-//! Nintendo Switch Pro Controller state mapping and feedback parsing for the host backends
-//! (Linux UHID, Windows UMDF). The descriptor, `0x30` layout and handshake replies live in
-//! `pf_driver_proto::switch`, which the Windows driver serves from too.
+//! Nintendo Switch Pro Controller and Joy-Con pair state mapping and feedback parsing for the
+//! host backends (Linux UHID, Windows UMDF). The descriptor, `0x30` layout and handshake replies
+//! live in `pf_driver_proto::switch`, which the Windows driver serves from too. A pair is one
+//! [`SwitchState`] served as two halves ([`serialize_joycon_0x30`]).
 //!
-//! Face buttons are positional (wire south → report B). Wire motion is DualSense units
-//! (20 LSB/°·s, 10000 LSB/g); the report is raw Pro units (14.247 LSB/°·s, 4096 LSB/g)
-//! via the factory-calibration identity. Evidence: this module's tests and hid-nintendo.c.
+//! Face buttons are positional (wire south → report B). Wire motion is SDL's frame in
+//! DualSense units (20 LSB/°·s, 10000 LSB/g); the report is raw Pro axes and units
+//! (14.247 LSB/°·s, 4096 LSB/g) via the factory-calibration identity. Evidence: this module's
+//! tests and hid-nintendo.c.
 
 use pf_driver_proto::switch::{self as wire, STICK_CENTER, STICK_RANGE};
 use punktfunk_core::input::{gamepad as gs, GamepadFrame};
@@ -25,6 +27,9 @@ pub mod btn {
     pub const X: u32 = 1 << 1;
     pub const B: u32 = 1 << 2;
     pub const A: u32 = 1 << 3;
+    /// Right Joy-Con's rail buttons.
+    pub const SR_R: u32 = 1 << 4;
+    pub const SL_R: u32 = 1 << 5;
     pub const R: u32 = 1 << 6;
     pub const ZR: u32 = 1 << 7;
     pub const MINUS: u32 = 1 << 8;
@@ -37,6 +42,9 @@ pub mod btn {
     pub const UP: u32 = 1 << 17;
     pub const RIGHT: u32 = 1 << 18;
     pub const LEFT: u32 = 1 << 19;
+    /// Left Joy-Con's rail buttons.
+    pub const SR_L: u32 = 1 << 20;
+    pub const SL_L: u32 = 1 << 21;
     pub const L: u32 = 1 << 22;
     pub const ZL: u32 = 1 << 23;
 }
@@ -163,6 +171,17 @@ impl SwitchState {
         }
     }
 
+    /// [`SwitchState::merge_frame`] for a Joy-Con pair, whose rail buttons carry the paddles.
+    pub fn merge_joycon_frame(prev: &SwitchState, f: &GamepadFrame) -> SwitchState {
+        let mut st = SwitchState::merge_frame(prev, f, f.buttons);
+        for (wire, bit) in JOYCON_PADDLES {
+            if f.buttons & wire != 0 {
+                st.buttons |= bit;
+            }
+        }
+        st
+    }
+
     /// IMU samples only; a Pro Controller has no touchpad.
     pub fn apply_rich(&mut self, rich: RichInput) {
         if let RichInput::Motion { gyro, accel, .. } = rich {
@@ -184,12 +203,17 @@ impl SwitchState {
         self.accel = fresh.accel;
     }
 
-    /// DualSense-convention sample → raw IMU. No axis flip: the Pro path does not negate.
+    /// Wire sample (SDL's frame: pitch, yaw, roll) → the pad's raw axes. SDL reads a Switch
+    /// IMU as `(-y, z, -x)` for both sensors; this is its inverse, and the raw frame
+    /// `hid-nintendo` reads too.
     pub fn apply_motion(&mut self, gyro: [i16; 3], accel: [i16; 3]) {
         let gyro_den = 1000 * gs::MOTION_GYRO_LSB_PER_DEG_S;
-        self.gyro = gyro.map(|v| ((v as i32 * JC_IMU_GYRO_MILLI_RES_PER_DPS) / gyro_den) as i16);
-        self.accel = accel
-            .map(|v| ((v as i32 * JC_IMU_ACCEL_RES_PER_G) / gs::MOTION_ACCEL_LSB_PER_G) as i16);
+        let g = |v: i32| (v * JC_IMU_GYRO_MILLI_RES_PER_DPS / gyro_den) as i16;
+        let a = |v: i32| (v * JC_IMU_ACCEL_RES_PER_G / gs::MOTION_ACCEL_LSB_PER_G) as i16;
+        let [p, y, r] = gyro.map(i32::from);
+        self.gyro = [g(-r), g(-p), g(y)];
+        let [ax, ay, az] = accel.map(i32::from);
+        self.accel = [a(-az), a(-ax), a(ay)];
     }
 }
 
@@ -209,6 +233,83 @@ pub fn serialize_report_0x30(st: &SwitchState, timer: u8) -> [u8; wire::REPORT_L
         st.accel,
         st.gyro,
     )
+}
+
+/// Wire paddles → rail buttons, in SDL's pair order: PADDLE1/3 are the right half's SR/SL,
+/// PADDLE2/4 the left half's SL/SR.
+const JOYCON_PADDLES: [(u32, u32); 4] = [
+    (gs::BTN_PADDLE1, btn::SR_R),
+    (gs::BTN_PADDLE2, btn::SL_L),
+    (gs::BTN_PADDLE3, btn::SL_R),
+    (gs::BTN_PADDLE4, btn::SR_L),
+];
+
+/// One half of a Joy-Con pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Half {
+    Left,
+    Right,
+}
+
+impl Half {
+    /// The half `device_type` names, `None` for the Pro Controller.
+    pub const fn of(device_type: u8) -> Option<Half> {
+        match device_type {
+            pf_driver_proto::gamepad::DEVTYPE_JOYCON_LEFT => Some(Half::Left),
+            pf_driver_proto::gamepad::DEVTYPE_JOYCON_RIGHT => Some(Half::Right),
+            _ => None,
+        }
+    }
+
+    pub const fn device_type(self) -> u8 {
+        match self {
+            Half::Left => pf_driver_proto::gamepad::DEVTYPE_JOYCON_LEFT,
+            Half::Right => pf_driver_proto::gamepad::DEVTYPE_JOYCON_RIGHT,
+        }
+    }
+
+    pub const fn product(self) -> u32 {
+        match self {
+            Half::Left => 0x2006,
+            Half::Right => 0x2007,
+        }
+    }
+
+    /// This half's rumble level from a decoded `(side 0, side 1)` packet: each half drives the
+    /// side it sits on, as `hid-nintendo` and SDL both write them.
+    pub const fn rumble(self, (left, right): (u16, u16)) -> u16 {
+        match self {
+            Half::Left => left,
+            Half::Right => right,
+        }
+    }
+}
+
+/// Report `0x30` as `half` sends it: its own buttons and stick, the other stick centred. The
+/// right half's IMU is mounted turned over, so its y and z read negated; SDL flips them back.
+pub fn serialize_joycon_0x30(st: &SwitchState, half: Half, timer: u8) -> [u8; wire::REPORT_LEN] {
+    const LEFT: u32 = btn::MINUS | btn::LSTICK | btn::CAPTURE | 0xFF_0000;
+    const RIGHT: u32 = 0xFF | btn::PLUS | btn::RSTICK | btn::HOME;
+    let c = STICK_CENTER;
+    let over = |v: [i16; 3]| [v[0], v[1].saturating_neg(), v[2].saturating_neg()];
+    let (buttons, sticks, accel, gyro) = match half {
+        Half::Left => (st.buttons & LEFT, [st.lx, st.ly, c, c], st.accel, st.gyro),
+        Half::Right => (
+            st.buttons & RIGHT,
+            [c, c, st.rx, st.ry],
+            over(st.accel),
+            over(st.gyro),
+        ),
+    };
+    wire::state_report(timer, buttons, sticks, accel, gyro)
+}
+
+/// The `0x30` report `device_type` serves for `st`: a Joy-Con half's or the Pro's.
+pub fn serialize_for(device_type: u8, st: &SwitchState, timer: u8) -> [u8; wire::REPORT_LEN] {
+    match Half::of(device_type) {
+        Some(half) => serialize_joycon_0x30(st, half, timer),
+        None => serialize_report_0x30(st, timer),
+    }
 }
 
 /// What an output report asks of the host. The pad's own answer is `wire::reply`.
@@ -255,10 +356,13 @@ const RUMBLE_AMPS: [u16; 101] = [
     1003,
 ];
 
-/// Invert one side: even bits of byte 1 are the table index × 2
-/// (`data[1] = freq_high_lo + amp.high`; freq is bit 0 only).
+/// Invert one side, taking the louder band. High band: the even bits of byte 1 are the table
+/// index × 2 (freq is bit 0 only). Low band: byte 3 is `0x40` + index / 2, byte 2's top bit the
+/// odd step. SDL writes a Joy-Con's one motor into a single band, so reading one band loses it.
 fn side_amplitude(side: &[u8]) -> u16 {
-    let idx = ((side[1] & 0xFE) / 2) as usize;
+    let high = (side[1] & 0xFE) / 2;
+    let low = side[3].saturating_sub(0x40).saturating_mul(2) | (side[2] >> 7);
+    let idx = high.max(low) as usize;
     let amp = RUMBLE_AMPS[idx.min(RUMBLE_AMPS.len() - 1)] as u32;
     // Driver: amp = magnitude * 1003 / 65535 — invert, saturating at full scale.
     ((amp * 65535) / 1003).min(65535) as u16
@@ -318,14 +422,17 @@ mod tests {
         assert!(stick_raw(i16::MIN) <= 0xFFF);
     }
 
-    /// Wire 20 LSB/°·s, 10000 LSB/g → raw 14.247 LSB/°·s, 4096 LSB/g.
+    /// Wire 20 LSB/°·s, 10000 LSB/g → raw 14.247 LSB/°·s, 4096 LSB/g, on the axes SDL reads
+    /// back as the wire's: raw `(-roll, -pitch, yaw)`. Gravity at rest (+y) lands on raw +z.
     #[test]
     fn motion_units() {
         let mut st = SwitchState::neutral();
         // 100 °/s = wire 2000 → raw ≈ 1424; 1 g = wire 10000 → raw 4096.
         st.apply_motion([2000, 0, -2000], [10000, -10000, 0]);
-        assert_eq!(st.gyro, [1424, 0, -1424]);
-        assert_eq!(st.accel, [4096, -4096, 0]);
+        assert_eq!(st.gyro, [1424, -1424, 0]);
+        assert_eq!(st.accel, [0, -4096, -4096]);
+        st.apply_motion([0; 3], [0, 10000, 0]);
+        assert_eq!(st.accel, SwitchState::neutral().accel);
     }
 
     /// Neutral → 0; max amp → 65535; left = low/strong, right = high/weak.
@@ -373,6 +480,62 @@ mod tests {
         ));
         assert!(parse_output(&[0x21]).is_none());
         assert!(parse_output(&[]).is_none());
+    }
+
+    /// SDL rumbles a pair's left half on the low band only and its right half on the high band
+    /// only, the same bytes on both sides of each packet.
+    #[test]
+    fn joycon_rumble_reads_either_band() {
+        // Low band at index 100: byte 3 = 0x40 + 50, byte 2 = freq 0x3D with no odd step.
+        let left = [0x74, 0x00, 0x3D, 0x72, 0x74, 0x00, 0x3D, 0x72];
+        assert_eq!(Half::Left.rumble(decode_rumble(&left)), 65535);
+        // Odd low-band step: index 17 → 123.
+        let odd = [0x74, 0x00, 0xBD, 0x48, 0x74, 0x00, 0xBD, 0x48];
+        assert_eq!(decode_rumble(&odd).0, (123u32 * 65535 / 1003) as u16);
+        let right = [0x74, 0xC8, 0x3D, 0x40, 0x74, 0xC8, 0x3D, 0x40];
+        assert_eq!(Half::Right.rumble(decode_rumble(&right)), 65535);
+    }
+
+    /// Each half carries only its own controls. The paddles land on the rail buttons SDL reads as
+    /// the pair's paddles, and the right half's IMU reads turned over.
+    #[test]
+    fn joycon_halves_split_one_state() {
+        let f = GamepadFrame {
+            buttons: gs::BTN_A
+                | gs::BTN_DPAD_UP
+                | gs::BTN_BACK
+                | gs::BTN_START
+                | gs::BTN_PADDLE1
+                | gs::BTN_PADDLE2
+                | gs::BTN_PADDLE3
+                | gs::BTN_PADDLE4,
+            ls_x: 32767,
+            rs_y: -32767,
+            ..GamepadFrame::default()
+        };
+        let mut st = SwitchState::merge_joycon_frame(&SwitchState::neutral(), &f);
+        st.apply_motion([2000, 1000, -500], [0, 10000, 0]);
+        let l = serialize_joycon_0x30(&st, Half::Left, 1);
+        let r = serialize_joycon_0x30(&st, Half::Right, 1);
+        let bits = |rep: &[u8; 64]| u32::from_le_bytes([rep[3], rep[4], rep[5], 0]);
+        assert_eq!(bits(&l), btn::UP | btn::MINUS | btn::SL_L | btn::SR_L);
+        assert_eq!(bits(&r), btn::B | btn::PLUS | btn::SR_R | btn::SL_R);
+        assert_eq!(
+            l[6..9],
+            wire::pack12(STICK_CENTER + STICK_RANGE, STICK_CENTER)
+        );
+        assert_eq!(l[9..12], wire::pack12(STICK_CENTER, STICK_CENTER));
+        assert_eq!(r[6..9], wire::pack12(STICK_CENTER, STICK_CENTER));
+        assert_eq!(
+            r[9..12],
+            wire::pack12(STICK_CENTER, STICK_CENTER - STICK_RANGE)
+        );
+        let imu = |rep: &[u8; 64], at: usize| i16::from_le_bytes([rep[at], rep[at + 1]]);
+        // accel x/y/z at 13/15/17, gyro at 19/21/23.
+        let axes = |rep: &[u8; 64]| [17, 19, 21, 23].map(|at| imu(rep, at));
+        assert_eq!(axes(&l), [4096, 356, -1424, 712]);
+        assert_eq!(axes(&r), [-4096, 356, 1424, -712]);
+        assert_eq!(serialize_for(Half::Right.device_type(), &st, 1), r);
     }
 
     /// Solid and flashing nibbles both count as lit.

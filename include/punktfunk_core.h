@@ -169,6 +169,9 @@
 // Wireless HORIPAD for Steam (`0F0D:01AB`): rear buttons, gyro.
 #define PUNKTFUNK_GAMEPAD_HORIPAD_STEAM 15
 
+// Joy-Con pair (`057E:2006` + `2007`): SL/SR as paddles, gyro.
+#define PUNKTFUNK_GAMEPAD_JOYCON_PAIR 16
+
 // Extended `InputEvent` gamepad button bits: four back grips (Steam L4/L5/R4/R5 ≙
 // Xbox-Elite P1–P4) + misc/capture, in Moonlight's `buttonFlags2 << 16` namespace.
 // Mirror `input::gamepad::BTN_PADDLE1..4` / `BTN_MISC1`.

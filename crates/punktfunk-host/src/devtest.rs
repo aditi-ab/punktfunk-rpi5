@@ -466,12 +466,12 @@ pub fn pad_usbip_test(args: &[String]) -> Result<()> {
 /// positionally swapped.
 #[cfg(target_os = "linux")]
 pub fn switchpro_test(args: &[String]) -> Result<()> {
-    use crate::inject::switch_pro::SwitchProPad;
+    use crate::inject::switch_pro::SwitchPad;
     use crate::inject::switch_proto::SwitchState;
     let secs: u64 = flag_or(args, "--seconds", 20);
     use std::time::{Duration, Instant};
     let mut pad =
-        SwitchProPad::open(0).context("create virtual Switch Pro Controller via /dev/uhid")?;
+        SwitchPad::pro(0).context("create virtual Switch Pro Controller via /dev/uhid")?;
     // 2.5 s: every hid-nintendo probe step blocks until the reply; stream 0x30 like hardware.
     println!("virtual Switch Pro created — servicing the hid-nintendo probe…");
     let init = Instant::now() + Duration::from_millis(2500);

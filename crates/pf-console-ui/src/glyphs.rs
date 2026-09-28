@@ -38,7 +38,10 @@ impl GlyphStyle {
                 GlyphStyle::Shapes
             }
             Some(
-                GamepadPref::SwitchPro | GamepadPref::EightBitDoPro2 | GamepadPref::EightBitDoPro3,
+                GamepadPref::SwitchPro
+                | GamepadPref::EightBitDoPro2
+                | GamepadPref::EightBitDoPro3
+                | GamepadPref::JoyConPair,
             ) => GlyphStyle::Nintendo,
             Some(_) => GlyphStyle::Letters,
             None => GlyphStyle::Keyboard,
@@ -74,9 +77,10 @@ pub fn device_icon(pref: Option<GamepadPref>, platform: Platform) -> Icon {
         GamepadPref::DualShock4 => icons::PAD_DUALSHOCK_4,
         GamepadPref::DualSense => icons::PAD_DUALSENSE,
         GamepadPref::DualSenseEdge => icons::PAD_DUALSENSE_EDGE,
-        GamepadPref::SwitchPro | GamepadPref::EightBitDoPro2 | GamepadPref::EightBitDoPro3 => {
-            icons::PAD_SWITCH_PRO
-        }
+        GamepadPref::SwitchPro
+        | GamepadPref::EightBitDoPro2
+        | GamepadPref::EightBitDoPro3
+        | GamepadPref::JoyConPair => icons::PAD_SWITCH_PRO,
         GamepadPref::SteamController => icons::PAD_STEAM_CONTROLLER,
         GamepadPref::SteamController2 => icons::PAD_STEAM_CONTROLLER_2,
         GamepadPref::SteamController2Puck => icons::PAD_STEAM_PUCK,

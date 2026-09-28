@@ -109,8 +109,11 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
     .find(|(flag, _)| args.iter().any(|a| a == flag))
     .map(|(_, model)| model);
     let horipad = args.iter().any(|a| a == "--horipad");
+    // `--joycons`: a Joy-Con pair, two devnodes; the paddles land on SR (R) and SL (L).
+    let joycons = args.iter().any(|a| a == "--joycons");
     // `--xboxhid` presses Share (the Series pad's Consumer `Record` bit) on the same beats.
-    let extra_buttons: u32 = if edge || deck || triton || eightbitdo.is_some() || horipad {
+    let extra_buttons: u32 = if edge || deck || triton || eightbitdo.is_some() || horipad || joycons
+    {
         punktfunk_core::input::gamepad::BTN_PADDLE1 | punktfunk_core::input::gamepad::BTN_PADDLE2
     } else if xboxhid {
         punktfunk_core::input::gamepad::BTN_MISC1
@@ -300,6 +303,11 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
         drive!(
             crate::inject::hori_windows::HoriWindowsManager::new(),
             "HORIPAD for Steam"
+        );
+    } else if joycons {
+        drive!(
+            crate::inject::switch_pro_windows::JoyConWindowsManager::new(),
+            "Joy-Con pair"
         );
     } else {
         drive!(

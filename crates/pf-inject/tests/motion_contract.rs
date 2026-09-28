@@ -160,10 +160,19 @@ fn rescaling_backends_convert_the_wire_into_their_native_units() {
 
     // hid-nintendo: JC_IMU_GYRO_RES_PER_DPS = 14.247, ACCEL_RES_PER_G = 4096.
     // Identity factory-calibration blob, so report is 1:1. 100 °/s × 14.247 = 1424.7, truncated.
+    // Signs are the codec tests' job: the pad's axes are SDL's permutation of the wire's.
     let mut st = SwitchState::neutral();
     st.apply_motion([wire_gyro; 3], [wire_accel; 3]);
-    assert_eq!(st.gyro, [1424; 3], "Switch gyro: 100 °/s at 14.247 LSB/°·s");
-    assert_eq!(st.accel, [4096; 3], "Switch accel: 1 g at 4096 LSB/g");
+    assert_eq!(
+        st.gyro.map(i16::abs),
+        [1424; 3],
+        "Switch gyro: 100 °/s at 14.247 LSB/°·s"
+    );
+    assert_eq!(
+        st.accel.map(i16::abs),
+        [4096; 3],
+        "Switch accel: 1 g at 4096 LSB/g"
+    );
 
     // SDL 8bitdo: INT16_MAX = 2000 °/s, accel 4096 LSB/g. Signs are the codec tests' job.
     let mut st = EightBitDoState::neutral();
