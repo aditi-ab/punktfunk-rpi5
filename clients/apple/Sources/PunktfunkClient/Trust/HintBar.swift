@@ -2,7 +2,7 @@
 
 import PunktfunkKit
 import SwiftUI
-#if os(iOS) || os(macOS) || os(tvOS)
+#if os(iOS) || os(visionOS) || os(macOS) || os(tvOS)
 import GameController
 
 /// The glyph a button wears in a legend: the ACTIVE controller's own (Xbox "A", DualSense ✕, …)

@@ -174,7 +174,7 @@ public final class InputCapture {
     /// ⌃⌘F is the host's like any ⌘ chord; released, the menu handles it. Main queue.
     public var onToggleFullscreen: (() -> Void)?
 
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     /// Windows VKs of the three modifier classes in the ⌃⌥⇧ chords, both L/R sides:
     /// control (0xA2/0xA3), option (0xA4/0xA5), shift (0xA0/0xA1). Used to sift the HID key stream.
     private static let chordModifierVKs: Set<UInt32> = [0xA2, 0xA3, 0xA4, 0xA5, 0xA0, 0xA1]
@@ -254,7 +254,7 @@ public final class InputCapture {
         ) { [weak self] n in
             if let m = n.object as? GCMouse { self?.attach(mouse: m) }
         })
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         // The mouse can become the *current* one after it connected (and after our start()
         // already ran) — re-attach on that too so a launch-time race doesn't leave the iOS
         // GCMouse path without handlers. attach() is idempotent (dedupes by identity).
@@ -371,6 +371,15 @@ public final class InputCapture {
             return event
         }
         #endif
+    }
+
+    /// Take the global handler slots back from the newer capture that preempted this one, so
+    /// the stream the player turned back to owns the keyboard and mouse again. No-op while this
+    /// capture holds them. `stop` leaves a newer owner's handlers alone.
+    public func reclaim() {
+        guard Self.activeCapture !== self else { return }
+        stop()
+        start()
     }
 
     public func stop() {
@@ -883,7 +892,7 @@ public final class InputCapture {
                     self.cmdKeysDown.remove(vk)
                 }
             }
-            #if os(iOS)
+            #if os(iOS) || os(visionOS)
             // Track Control/Option/Shift for the ⌃⌥⇧ chords below — in both forwarding
             // states (like `cmdKeysDown`) so a modifier held before capture engaged still counts.
             if Self.chordModifierVKs.contains(vk) {
@@ -896,7 +905,7 @@ public final class InputCapture {
                 if !pressed { self.suppressedVK = nil }
                 return
             }
-            #if os(iOS)
+            #if os(iOS) || os(visionOS)
             // No NSEvent monitor here — the toggle combo is detected from the HID
             // stream itself.
             if pressed, vk == 0x1B, !self.cmdKeysDown.isEmpty {
@@ -906,7 +915,7 @@ public final class InputCapture {
             }
             #endif
             guard self.forwarding else { return }
-            #if os(iOS)
+            #if os(iOS) || os(visionOS)
             // ⌃⌥⇧Q releases the captured mouse/keyboard (cross-client parity — the same combo the
             // macOS keyDown monitor handles). Recognized only while forwarding (nothing to release
             // otherwise). The Q is latched (`suppressedVK`) so its keyUp can't type into the host;

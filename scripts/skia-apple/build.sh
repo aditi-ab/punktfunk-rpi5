@@ -1,9 +1,10 @@
 #!/bin/bash
-# Build the two tvOS Skia archives rust-skia does not publish (device, arm64 simulator), for the
-# skia-bindings version pf-console-ui pins. Its build script has no tvOS platform; the patch
-# beside this adds one. Upload both archives to git.unom.io/unom/skia-binaries under the same
-# tag, then update their SHA-256s in crates/pf-console-ui/Cargo.toml.
-# usage: scripts/skia-tvos/build.sh <work-dir>   (about 6 GB; Skia builds in minutes)
+# Build the Apple Skia archives rust-skia does not publish (tvOS and visionOS, device and arm64
+# simulator), for the skia-bindings version pf-console-ui pins. Its build script has neither
+# platform; the patch beside this adds both. Upload the archives to
+# git.unom.io/unom/skia-binaries under the same tag, then pin their SHA-256s in
+# scripts/build-xcframework.sh.
+# usage: scripts/skia-apple/build.sh <work-dir> [target...]   (about 6 GB; Skia builds in minutes)
 set -euo pipefail
 VER=0.99.0
 HASH=a25a0fdb7d90429aa2d1
@@ -11,6 +12,10 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 NIGHTLY=$(sed -n 's/^NIGHTLY=//p' "$HERE/../build-xcframework.sh")
 mkdir -p "$1"
 WORK=$(cd "$1" && pwd)
+shift
+TARGETS=("$@")
+[[ ${#TARGETS[@]} -gt 0 ]] || TARGETS=(aarch64-apple-tvos aarch64-apple-tvos-sim \
+    aarch64-apple-visionos aarch64-apple-visionos-sim)
 SRC=$(ls -d "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/skia-bindings-$VER 2>/dev/null | head -1)
 if [[ -z "$SRC" ]]; then
     echo "skia-bindings $VER is not in the cargo registry: run cargo fetch first" >&2
@@ -25,7 +30,7 @@ patch -d "$WORK/skia-bindings" -p1 < "$HERE/skia-bindings-$VER.patch"
 mkdir -p "$WORK/build/src"
 cat > "$WORK/build/Cargo.toml" <<EOF
 [package]
-name = "skia-tvos-build"
+name = "skia-apple-build"
 version = "0.0.0"
 edition = "2021"
 publish = false
@@ -40,10 +45,10 @@ skia-bindings = { path = "../skia-bindings" }
 EOF
 echo 'pub use skia_safe;' > "$WORK/build/src/lib.rs"
 
-for T in aarch64-apple-tvos aarch64-apple-tvos-sim; do
+for T in "${TARGETS[@]}"; do
     (cd "$WORK/build" && CARGO_TARGET_DIR="$WORK/target" TVOS_DEPLOYMENT_TARGET=17.0 \
-        FORCE_SKIA_BUILD=1 cargo "+$NIGHTLY" build --release -Z build-std=std,panic_abort \
-        --target "$T")
+        XROS_DEPLOYMENT_TARGET=26.0 FORCE_SKIA_BUILD=1 cargo "+$NIGHTLY" build --release \
+        -Z build-std=std,panic_abort --target "$T")
     LIBS=$(find "$WORK/target/$T/release/build" -path '*skia-bindings*' -name libskia.a)
     OUT=$(dirname "$(ls -t $LIBS | head -1)")
     KEY="$HASH-$T-jpegd-jpege-metal-pdf-textlayout"

@@ -71,7 +71,7 @@ enum ShortcutsCatalog {
             keyboard.append(.init(keys: "⌃⌥⇧A", text: "Mute or unmute the microphone"))
         }
         groups.append(.init(title: "Keyboard", items: keyboard))
-        #elseif os(iOS)
+        #elseif os(iOS) || os(visionOS)
         // iPad with a hardware keyboard gets the same cross-client set as the Mac (StreamCommands
         // publishes it either way); a phone simply never sees a keyboard to press it on.
         var keyboard: [ShortcutItem] = [

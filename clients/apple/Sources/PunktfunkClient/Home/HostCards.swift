@@ -18,7 +18,7 @@ struct CardMetrics {
     let radius: CGFloat
 
     static var current: CardMetrics {
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         CardMetrics(tile: 54, monogram: 26, name: 19, meta: 13, status: 11,
                     padding: 16, spacing: 14, radius: 12)
         #elseif os(tvOS)
@@ -368,7 +368,7 @@ struct HostCardView: View {
             }
             #if os(tvOS)
             .buttonStyle(.card)
-            #elseif os(iOS)
+            #elseif os(iOS) || os(visionOS)
             .buttonStyle(HostCardButtonStyle(cornerRadius: m.radius))
             #else
             .buttonStyle(.plain)
@@ -391,7 +391,7 @@ struct HostCardView: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
-                #if os(iOS)
+                #if os(iOS) || os(visionOS)
                 .hoverEffect(.highlight)
                 #endif
                 .padding(.trailing, 4)
@@ -567,7 +567,7 @@ struct DiscoveredCardView: View {
         }
         #if os(tvOS)
         .buttonStyle(.card)
-        #elseif os(iOS)
+        #elseif os(iOS) || os(visionOS)
         .buttonStyle(HostCardButtonStyle(cornerRadius: m.radius))
         #else
         .buttonStyle(.plain)
@@ -576,7 +576,7 @@ struct DiscoveredCardView: View {
     }
 }
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 /// The iOS host-card press/hover treatment, one style for both idioms:
 /// - iPhone: a subtle scale-down on press + a light impact haptic on press-down. (`hoverEffect` is
 ///   inert without a pointer.)

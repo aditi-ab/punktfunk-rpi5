@@ -146,7 +146,7 @@ struct LibraryView: View {
     /// Cover-art loader (the same paired identity + host pinning as the list fetch, reused across
     /// every poster in the grid). Built alongside `games` in `load()`; dropped on disappear.
     @State private var artLoader: (any LibraryArtSource)?
-    #if os(iOS) || os(macOS)
+    #if os(iOS) || os(visionOS) || os(macOS)
     /// The plain grid's hardware-keyboard cursor (a game id), and the grid width the column count
     /// is derived from. nil until the first arrow press, so a touch user never sees a selection
     /// they didn't ask for.
@@ -168,7 +168,7 @@ struct LibraryView: View {
             // In the tab the host filter names the shelf, so the title names the place; a TV's
             // tab bar already does.
             .modifier(LibraryTitle(title: tvTab ? nil : inTab ? "Library" : "\(shelfTitle) — Library"))
-            #if os(iOS)
+            #if os(iOS) || os(visionOS)
             .modifier(LibraryTitleMode(inTab: inTab))
             #endif
             .toolbar {
@@ -183,7 +183,7 @@ struct LibraryView: View {
                     ToolbarItem(placement: .primaryAction) { reloadButton }
                     ToolbarItem(placement: .primaryAction) { sortMenu }
                 }
-                #if os(iOS)
+                #if os(iOS) || os(visionOS)
                 if inTab {
                     ToolbarItem(placement: .primaryAction) { customizeButton }
                 }
@@ -201,7 +201,7 @@ struct LibraryView: View {
                 #endif
             }
             // A TV's `.searchable` is a keyboard band over the shelf; search there wants a tab.
-            #if os(iOS) || os(macOS)
+            #if os(iOS) || os(visionOS) || os(macOS)
             .modifier(TitleSearch(active: inTab, text: $search))
             #endif
             .confirmationDialog(
@@ -352,7 +352,7 @@ struct LibraryView: View {
             restoredScroll = true
             proxy.scrollTo(last, anchor: .center)
         }
-        #if os(iOS) || os(macOS)
+        #if os(iOS) || os(visionOS) || os(macOS)
         // Measured without taking part in layout: it tells the keyboard cursor how many columns
         // `.adaptive` produced.
         .background {
@@ -371,7 +371,7 @@ struct LibraryView: View {
         sections: [(label: String, games: [GameEntry])], proxy: ScrollViewProxy,
         @ViewBuilder content: () -> some View
     ) -> some View {
-        #if os(iOS) || os(macOS)
+        #if os(iOS) || os(visionOS) || os(macOS)
         content()
             .gamepadKeyNavigation(
                 active: onLaunch != nil,
@@ -577,7 +577,7 @@ struct LibraryView: View {
         Button { showCustomize = true } label: {
             Label("Customize", systemImage: "slider.horizontal.3")
         }
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         // A popover on the iPad, as on the Mac; an iPhone shows it as a sheet.
         .popover(isPresented: $showCustomize) {
             LibrarySectionsPanel().frame(minWidth: 320, minHeight: 440)
@@ -608,7 +608,7 @@ struct LibraryView: View {
     }
     #endif
 
-    #if os(iOS) || os(macOS)
+    #if os(iOS) || os(visionOS) || os(macOS)
     /// The keyboard cursor's model over the two grid sections. Rebuilt per press from the live
     /// sections so it can never point into a stale list.
     private func gridNav(sections: [[GameEntry]]) -> LibraryGridNav {
@@ -738,7 +738,7 @@ struct LibraryView: View {
                 endingGame = game
             } : nil,
             host: host)
-            #if os(iOS)
+            #if os(iOS) || os(visionOS)
             .presentationDetents([.medium, .large])
             #elseif os(macOS)
             .frame(minWidth: 440, minHeight: 360)
@@ -778,7 +778,7 @@ struct LibraryView: View {
     /// Whether the keyboard cursor is on this tile (always false where there is no keyboard
     /// navigation to have moved it).
     private func isKeyCursor(_ game: GameEntry) -> Bool {
-        #if os(iOS) || os(macOS)
+        #if os(iOS) || os(visionOS) || os(macOS)
         keyCursor == game.id
         #else
         false
@@ -1312,7 +1312,7 @@ struct TVCardButtonStyle: ButtonStyle {
 }
 #endif
 
-#if os(iOS) || os(macOS)
+#if os(iOS) || os(visionOS) || os(macOS)
 /// The Library tab's and the Mac shelf's title search. The other presentations have none.
 private struct TitleSearch: ViewModifier {
     let active: Bool
@@ -1328,7 +1328,7 @@ private struct TitleSearch: ViewModifier {
 }
 #endif
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 /// The title's mode. On a phone the tab holds its title at the leading edge, scrolled or not,
 /// where the Hosts tab's collapsed title sits: iOS centers a collapsed title, which pressed
 /// "Library" against the toolbar. The iPad and iOS before 26 keep the system title.
@@ -1338,6 +1338,9 @@ private struct LibraryTitleMode: ViewModifier {
 
     func body(content: Content) -> some View {
         let system = content.navigationBarTitleDisplayMode(inTab ? .automatic : .inline)
+        #if os(visionOS)
+        system
+        #else
         if #available(iOS 26, *) {
             if inTab && sizeClass == .compact {
                 content
@@ -1359,6 +1362,7 @@ private struct LibraryTitleMode: ViewModifier {
         } else {
             system
         }
+        #endif
     }
 }
 #endif

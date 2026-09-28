@@ -466,6 +466,8 @@ final class SessionModel: ObservableObject {
                 // see StreamViewIOS), so gate on the TV's mode-independent capability; if the
                 // switch never lands, the presenter's in-shader tone-map keeps PQ safe anyway.
                 return AVPlayer.eligibleForHDRPlayback
+            #elseif os(visionOS)
+                return true // every Vision Pro display presents HDR
             #else
                 return UIScreen.main.potentialEDRHeadroom > 1.0
             #endif
@@ -670,7 +672,7 @@ final class SessionModel: ObservableObject {
     /// Raise `touchFallbackNotice` when the passthrough touch model meets a host without touch
     /// injection — the same fallback `StreamLayerUIView` applies to the fingers themselves.
     private func noteTouchFallback(_ conn: PunktfunkConnection) {
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         guard TouchInputMode.current(conn.settings) == .touch, !conn.hostSupportsTouch else { return }
         touchFallbackNotice = true
         touchHintTimer?.cancel()

@@ -58,7 +58,7 @@ struct ConnectOverlay: View {
             // Dark over its black scrim, whatever the system look.
             .environment(\.colorScheme, .dark)
             .transition(.opacity)
-            #if os(iOS) || os(macOS) || os(tvOS)
+            #if os(iOS) || os(visionOS) || os(macOS) || os(tvOS)
             .background { ConnectControllerInput(waker: waker, onCancelConnect: onCancelConnect) }
             #endif
             #if os(tvOS)
@@ -118,7 +118,7 @@ struct ConnectOverlay: View {
     }
 }
 
-#if os(iOS) || os(macOS) || os(tvOS)
+#if os(iOS) || os(visionOS) || os(macOS) || os(tvOS)
 /// Controller binding for the overlay: B cancels whatever's in flight (a dial or the wake wait); A
 /// retries once a wake has timed out. The closures read the live state on each press, so they stay
 /// correct across the Connecting ↔ Waking handoff without the view re-mounting. A zero-size backing

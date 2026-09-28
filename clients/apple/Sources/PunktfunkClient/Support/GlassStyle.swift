@@ -23,11 +23,15 @@ private struct GlassBackground<S: Shape>: ViewModifier {
     var interactive = false
 
     func body(content: Content) -> some View {
+        #if os(visionOS)
+        content.background(.regularMaterial, in: shape) // visionOS materials are its glass
+        #else
         if #available(iOS 26, macOS 26, tvOS 26, *) {
             content.glassEffect(interactive ? .regular.interactive() : .regular, in: shape)
         } else {
             content.background(.regularMaterial, in: shape)
         }
+        #endif
     }
 }
 
@@ -45,10 +49,10 @@ extension View {
 /// prominent button style on 26+, falling back to `.borderedProminent` (the app's current
 /// primary style) below. Apply directly to a `Button`; role / keyboardShortcut / disabled
 /// chain after it as usual. tvOS stays `.borderedProminent` always — glass chrome fights the
-/// focus engine, and keeping it preserves today's tvOS look exactly.
+/// focus engine, and keeping it preserves today's tvOS look exactly. visionOS has no glass style.
 private struct GlassProminentButton: ViewModifier {
     func body(content: Content) -> some View {
-        #if os(tvOS)
+        #if os(tvOS) || os(visionOS)
         content.buttonStyle(.borderedProminent)
         #else
         if #available(iOS 26, macOS 26, *) {

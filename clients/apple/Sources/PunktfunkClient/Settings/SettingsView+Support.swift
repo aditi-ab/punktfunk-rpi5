@@ -18,7 +18,7 @@ import SwiftUI
 /// width runs its last line straight under that control — which is what the cap alone never
 /// fixed, because an iPhone cell is narrower than the cap in the first place.
 struct CaptionWidth: ViewModifier {
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     /// Reserve the control column. A `UISwitch` is 51pt, and the rest is breathing room — the
     /// caption should stop visibly short of the control, not graze it.
     private static let trailingInset: CGFloat = 76
@@ -148,7 +148,7 @@ extension SettingsView {
         let base = "Compact is a one-line pill; Detailed adds the latency breakdown."
         #if os(macOS)
         return base + " ⌃⌥⇧S cycles it."
-        #elseif os(iOS)
+        #elseif os(iOS) || os(visionOS)
         return base + " ⌃⌥⇧S or a three-finger tap cycles it."
         #else
         return base
@@ -220,6 +220,11 @@ extension SettingsView {
         #if os(macOS)
         guard let panel = SettingsOptions.macDisplayModes().first else { return }
         applyDisplayMode(panel)
+        customMode = false
+        #elseif os(visionOS)
+        let native = NativeDisplay.mode
+        setResolution(width: native.width, height: native.height)
+        scoped(SettingsFields.refreshHz).wrappedValue = native.hz
         customMode = false
         #else
         // nativeBounds is portrait-oriented pixels — streams are landscape.

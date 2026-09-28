@@ -218,7 +218,7 @@ final class PresentPacingTests: XCTestCase {
     /// iOS and tvOS default to the deadline link, macOS to arrival-paced Metal. No selection or an
     /// unknown value falls back to the platform choice.
     func testPresenterChoiceFallsBackToPlatformDefault() {
-        #if os(iOS) || os(tvOS)
+        #if os(iOS) || os(visionOS) || os(tvOS)
         XCTAssertEqual(PresenterChoice.platformDefault, .stage4)
         #else
         XCTAssertEqual(PresenterChoice.platformDefault, .stage2)

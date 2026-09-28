@@ -105,7 +105,7 @@ struct AddHostSheet: View {
                         desktop: "Optional — e.g. Living Room"))
                 TextField("Address", text: $address, prompt: Text("IP or hostname"))
                     .autocorrectionDisabled()
-                    #if os(iOS)
+                    #if os(iOS) || os(visionOS)
                     .textInputAutocapitalization(.never)
                     .keyboardType(.URL)
                     #endif
@@ -116,7 +116,7 @@ struct AddHostSheet: View {
                         touch: "MAC address (for Wake-on-LAN, optional)",
                         desktop: "For Wake-on-LAN, optional"))
                     .autocorrectionDisabled()
-                    #if os(iOS)
+                    #if os(iOS) || os(visionOS)
                     .textInputAutocapitalization(.never)
                     #endif
                 #if !os(tvOS)
@@ -126,7 +126,7 @@ struct AddHostSheet: View {
             #if !os(tvOS)
             .formStyle(.grouped)
             #endif
-            #if os(iOS)
+            #if os(iOS) || os(visionOS)
             // The sheet is sized to its content, so there is nothing to scroll.
             .scrollDisabled(true)
             #endif
@@ -160,7 +160,7 @@ struct AddHostSheet: View {
                 .padding(16)
             #endif
         }
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         // Sized to its content: four fields, the clipboard toggle and the action row.
         .presentationDetents([.height(392 + 44)])
         .presentationDragIndicator(.visible)

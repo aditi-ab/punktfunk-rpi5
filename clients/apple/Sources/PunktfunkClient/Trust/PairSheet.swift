@@ -99,7 +99,7 @@ struct PairSheet: View {
                         "PIN", text: $pin,
                         prompt: Text("Shown in the host's web console"))
                         .font(.geistFixed(16)) // prominent, but on-brand mono (not oversized title3)
-                        #if os(iOS)
+                        #if os(iOS) || os(visionOS)
                         .keyboardType(.numberPad)
                         #endif
                     TextField(
@@ -156,7 +156,7 @@ struct PairSheet: View {
                     #endif
                     .disabled(busy || pin.trimmingCharacters(in: .whitespaces).isEmpty)
             }
-            #if os(iOS)
+            #if os(iOS) || os(visionOS)
             .controlSize(.large)
             #endif
             .padding(16)
@@ -165,7 +165,7 @@ struct PairSheet: View {
         .frame(width: 400)
         .fixedSize(horizontal: false, vertical: true)
         #endif
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         // Bottom sheet instead of a full-screen modal (Liquid Glass background on iOS 26).
         // .medium rests; .large is included so the sheet grows to keep the Pair/Cancel row
         // above the keyboard when the PIN field is focused. Hide the grabber while the ceremony

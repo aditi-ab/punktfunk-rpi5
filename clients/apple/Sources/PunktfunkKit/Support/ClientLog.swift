@@ -88,7 +88,7 @@ public enum ClientLogRing {
         let platform = "macOS"
         #elseif os(tvOS)
         let platform = "tvOS"
-        #elseif os(iOS)
+        #elseif os(iOS) || os(visionOS)
         let platform = "iOS"
         #else
         let platform = "apple"
