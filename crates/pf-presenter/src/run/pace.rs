@@ -24,7 +24,7 @@ impl Shell {
         }
         st.intake();
         let now_ns = session::now_ns();
-        let mut to_present = st.pick(now_ns);
+        let mut to_present = st.pick(now_ns, self.presenter.present_timing_active());
         // FIFO glass budget: one undisplayed present in flight, so the swapchain's
         // own FIFO can never become a standing queue. Only FIFO modes queue and only
         // present timing can count; everywhere else this stays inert.
@@ -295,9 +295,10 @@ impl StreamState {
     }
 
     /// One frame out: latency takes the newest whenever the glass gate allows;
-    /// smoothness serves the frame whose due time has come.
-    pub(super) fn pick(&mut self, now_ns: u64) -> Option<Paced> {
-        self.pacer.follow(self.cadence.verdict());
+    /// smoothness serves the frame whose due time has come. `grid_known`: on-glass
+    /// stamps feed the latch clock; without them the due time itself is the target.
+    pub(super) fn pick(&mut self, now_ns: u64, grid_known: bool) -> Option<Paced> {
+        self.pacer.follow(self.cadence.verdict(), grid_known);
         if self.store.is_smoothing() {
             if self.pacer.free_running() {
                 // Variable refresh, measured: the panel refreshes when we present, so
@@ -477,7 +478,8 @@ impl StreamState {
     }
 
     /// No glass stamps: the submit instant stands in for the display time — for the
-    /// audio plane's e2e, the HUD, and an approximate latch grid.
+    /// audio plane's e2e and the HUD. The latch clock keeps its seed: a submit
+    /// instant is not a latch, and the drain runs free without stamps.
     fn note_submitted(&mut self, pts_ns: u64, decoded_ns: u64) {
         let displayed_ns = session::now_ns();
         // Same hand-off as the glass-stamped branch. Anchored on submit, so it
@@ -486,10 +488,6 @@ impl StreamState {
         if let Some(c) = &self.connector {
             c.hud().note_displayed(pts_ns, decoded_ns, 0, displayed_ns);
         }
-        // The submit instant anchors an approximate grid on the mode's refresh period,
-        // so smoothness still drains one frame per (approximate) slot.
-        self.clock
-            .note_batch(&[displayed_ns], self.store.is_smoothing());
     }
 
     /// Host↔client clock offset, `0` until Connected. Loaded per use so a mid-stream
