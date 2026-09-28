@@ -152,13 +152,8 @@ log "Building punktfunk-host (release) — first build is slow (~15 min)"
 # desktops, where a host without nvenc advertises HEVC and then dies at encoder open. Both entry
 # points are dlopen'd, so an AMD Deck pays nothing to carry them.
 #
-# The console tells one build from the next by its version string alone. Without the commit
-# every rebuild reports the same X.Y.Z, and a finished update reads as "nothing newer".
-# An empty value is ignored by the build script, which falls back to the Cargo version.
-PF_BASE="$(sed -n 's/^version = "\(.*\)"/\1/p' "$SRC/Cargo.toml" | head -1)"
-PF_SHA="$(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || true)"
-PF_BUILD_VERSION=""
-[ -z "$PF_BASE" ] || [ -z "$PF_SHA" ] || PF_BUILD_VERSION="$PF_BASE+g$PF_SHA"
+# The version the console shows, in the same scheme as this channel's feed (build-version.sh).
+PF_BUILD_VERSION="$(bash "$SRC/scripts/steamdeck/build-version.sh" "$SRC")"
 
 # punktfunk-encode-worker is built alongside: the capability-carrying PyroWave encode worker, a
 # SEPARATE binary that lands next to the host in $TARGET_DIR/release (which is how the host finds
@@ -589,7 +584,7 @@ if [ "$OPEN" = 1 ]; then
 else
     echo "  • Pairing required (secure default). From a client, pick this host and enter the PIN the host shows."
 fi
-echo "  • Update later:  bash $SRC/scripts/steamdeck/update.sh"
+echo "  • Update later:  bash $SRC/scripts/steamdeck/update.sh --pull"
 if [ "$NEED_RELOGIN" = 1 ]; then
     echo
     warn "ONE MORE STEP before streaming — reboot the Deck (or fully log out and back in)."
