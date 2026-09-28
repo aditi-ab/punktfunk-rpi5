@@ -2466,6 +2466,94 @@ mod tests {
         );
     }
 
+    /// Live BGRA input per codec: VCN converts, so the encoder takes what the display
+    /// composes. Both submit modes must return an access unit per frame — the ring copy, and
+    /// the caller's own texture in place, which is how the driver's pool submits. Skips
+    /// without AMD.
+    #[test]
+    fn amf_bgra_encode_live_smoke() {
+        use crate::smoke_d3d11::bgra_texture;
+        use crate::smoke_pattern::scroll_pattern;
+        if let Err(e) = try_factory() {
+            eprintln!("skipping: AMF runtime unavailable ({e})");
+            return;
+        }
+        let Some(device) = amd_d3d11_device() else {
+            eprintln!("skipping: no AMD adapter on this box");
+            return;
+        };
+        let (w, h, fps) = (640u32, 480u32, 60u32);
+        // The binds of the driver's BGRA pool slots.
+        let bind = BIND_SR | D3D11_BIND_RENDER_TARGET.0 as u32;
+        let texs: Vec<ID3D11Texture2D> = (0..3)
+            .map(|i| {
+                let px = scroll_pattern(w as usize, h as usize, i);
+                bgra_texture(&device, w, h, Some(&px), bind)
+            })
+            .collect();
+        const FRAMES: usize = 12;
+        for in_place in [false, true] {
+            for codec in [Codec::H265, Codec::H264, Codec::Av1] {
+                if codec == Codec::Av1 && !probe_can_encode_on(&device, codec) {
+                    eprintln!("skipping Av1: this AMD GPU's native probe declined it");
+                    continue;
+                }
+                let mut enc = AmfEncoder::open(
+                    codec,
+                    PixelFormat::Bgra,
+                    w,
+                    h,
+                    fps,
+                    2_000_000,
+                    8,
+                    ChromaFormat::Yuv420,
+                    false,
+                    None,
+                )
+                .expect("open on BGRA");
+                if in_place {
+                    // Three textures in rotation, two in flight: the third is always free.
+                    enc.set_input_ring_depth(2);
+                }
+                let mut aus = Vec::new();
+                for i in 0..FRAMES {
+                    let frame = CapturedFrame {
+                        provenance: Default::default(),
+                        width: w,
+                        height: h,
+                        pts_ns: 1 + i as u64,
+                        format: PixelFormat::Bgra,
+                        payload: FramePayload::D3d11(pf_frame::dxgi::D3d11Frame {
+                            texture: texs[i % texs.len()].clone(),
+                            device: device.clone(),
+                            pyro: None,
+                        }),
+                        cursor: None,
+                    };
+                    enc.submit(&frame).expect("submit");
+                    if let Some(au) = enc.poll().expect("poll") {
+                        aus.push(au);
+                    }
+                }
+                enc.flush().expect("flush");
+                for _ in 0..50 {
+                    match enc.poll().expect("drain poll") {
+                        Some(au) => aus.push(au),
+                        None => break,
+                    }
+                }
+                eprintln!(
+                    "{codec:?} in_place={in_place}: {} AUs of {FRAMES}, {} bytes",
+                    aus.len(),
+                    aus.iter().map(|a| a.data.len()).sum::<usize>()
+                );
+                assert_eq!(aus.len(), FRAMES, "{codec:?} in_place={in_place}");
+                assert!(aus[0].keyframe, "{codec:?}: the stream starts on an IDR");
+                assert_eq!(aus[0].pts_ns, 1, "FIFO pts pairing");
+            }
+        }
+    }
+
     #[test]
     fn amf_encode_live_smoke() {
         if let Err(e) = try_factory() {

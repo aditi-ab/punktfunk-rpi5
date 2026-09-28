@@ -43,6 +43,47 @@ pub fn nv12_texture(
     tex.expect("NV12 texture")
 }
 
+/// A BGRA D3D11 texture on `device` with `bind` flags, holding `bgra` (pitch `w * 4`) or left
+/// undefined: what the display composes, before any conversion.
+pub fn bgra_texture(
+    device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    w: u32,
+    h: u32,
+    bgra: Option<&[u8]>,
+    bind: u32,
+) -> windows::Win32::Graphics::Direct3D11::ID3D11Texture2D {
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: w,
+        Height: h,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: bind,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let init = bgra.map(|b| D3D11_SUBRESOURCE_DATA {
+        pSysMem: b.as_ptr() as *const _,
+        SysMemPitch: w * 4,
+        SysMemSlicePitch: 0,
+    });
+    let mut tex = None;
+    // SAFETY: `init` points at `bgra`, `w * h * 4` bytes alive across the call, read at the
+    // pitch given. The out-param fills only on success.
+    unsafe { device.CreateTexture2D(&desc, init.as_ref().map(|i| i as *const _), Some(&mut tex)) }
+        .expect("BGRA texture");
+    tex.expect("BGRA texture")
+}
+
 /// An NV12 D3D11 frame of the pattern at `frame` frames of motion, as the capturer hands one
 /// to a Windows encoder. `bind` as [`nv12_texture`].
 pub fn nv12_scroll_frame(
