@@ -319,11 +319,52 @@ public struct HostAction: Codable, Hashable, Sendable, Identifiable {
 
 /// Stateless fetcher for a host's library.
 public enum LibraryClient {
-    /// `GET https://<address>:<port>/api/v1/library`, authenticated by **mTLS**: the client
-    /// presents `identity` (its persistent cert/key PEM — the same identity the host paired over
-    /// QUIC), and the host's self-signed cert is pinned by `hostFingerprint` (SHA-256 of its DER,
-    /// the value the client already trusts). No bearer token — a paired client is authorized by
-    /// its certificate. `hostFingerprint == nil` throws `unauthorized`: an unpaired host is never trusted.
+    /// One answer of `GET /api/v1/library/page`. `total` and `platforms` stay undecoded: the
+    /// library screens collate the whole catalog themselves.
+    struct LibraryPage: Decodable {
+        var items: [GameEntry]
+        var nextCursor: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case items
+            case nextCursor = "next_cursor"
+        }
+    }
+
+    /// Titles a request: the host's ceiling for one page.
+    static let pageLimit = 200
+
+    /// 500 pages of 200 is 100 000 titles. A host whose cursor never runs out stops here.
+    static let maxPages = 500
+
+    /// The request path of one page. The cursor is the host's own text, so it is encoded.
+    static func pagePath(cursor: String?) -> String {
+        let plain = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
+        let next = cursor?.addingPercentEncoding(withAllowedCharacters: plain)
+        return "/api/v1/library/page?limit=\(pageLimit)" + (next.map { "&cursor=\($0)" } ?? "")
+    }
+
+    /// The whole catalog, a page at a time, so no answer grows with the library. `get` takes
+    /// the cursor of the page before and answers one page's body. Any page failing fails the
+    /// walk: half a catalog is not one.
+    static func walkPages(_ get: (String?) async throws -> Data) async throws -> [GameEntry] {
+        var games: [GameEntry] = []
+        var cursor: String?
+        for _ in 0..<maxPages {
+            let page = try JSONDecoder().decode(LibraryPage.self, from: try await get(cursor))
+            games += page.items
+            // A cursor that does not move would ask for the same page forever.
+            guard let next = page.nextCursor, !next.isEmpty, next != cursor else { break }
+            cursor = next
+        }
+        return games
+    }
+
+    /// The host's catalog, walked by `GET /api/v1/library/page` and authenticated by **mTLS**:
+    /// the client presents its paired cert/key PEM and the host's self-signed cert is pinned by
+    /// `hostFingerprint` (SHA-256 of its DER). A host older than the paged route refuses it on
+    /// this lane, so `GET /api/v1/library` answers whole instead.
+    /// `hostFingerprint == nil` throws `unauthorized`: an unpaired host is never trusted.
     public static func fetch(
         address: String,
         port: UInt16 = punktfunkDefaultMgmtPort,
@@ -334,27 +375,33 @@ public enum LibraryClient {
         guard let base = URL(string: "\(baseURL(address: address, port: port))/api/v1/library")
         else { throw LibraryError.unreachable("invalid host address") }
         let identity = try clientIdentity(certPEM: certPEM, keyPEM: keyPEM)
-        let response = try await send(
-            path: "/api/v1/library", address: address, port: port,
-            identity: identity, hostFingerprint: hostFingerprint)
-        switch response.status {
-        case 200:
-            var games = try JSONDecoder().decode([GameEntry].self, from: response.body)
-            // Steam art comes back as host-relative proxy paths (`/api/v1/library/art/...`, see
-            // the host's `library::steam_art`) so they work the same regardless of which
-            // interface/port the client reached the host on. Resolve them against THIS host now,
-            // so every other consumer just sees ordinary absolute URLs.
-            for i in games.indices {
-                games[i].art = games[i].art.resolved(against: base)
+        let body: (String) async throws -> Data = { path in
+            let response = try await send(
+                path: path, address: address, port: port,
+                identity: identity, hostFingerprint: hostFingerprint)
+            switch response.status {
+            case 200:
+                return response.body
+            // Both are the host declining this certificate, with the same remedy.
+            case 401, 403:
+                throw LibraryError.unauthorized
+            default:
+                throw LibraryError.http(response.status)
             }
-            return games
-        // 403 joins 401 here: both are the host declining this certificate, and the remedy the
-        // user needs is the same one.
-        case 401, 403:
-            throw LibraryError.unauthorized
-        default:
-            throw LibraryError.http(response.status)
         }
+        var games: [GameEntry]
+        do {
+            games = try await walkPages { cursor in try await body(pagePath(cursor: cursor)) }
+        } catch LibraryError.unauthorized, LibraryError.http(404) {
+            games = try JSONDecoder().decode(
+                [GameEntry].self, from: try await body("/api/v1/library"))
+        }
+        // Art the host serves arrives as host-relative proxy paths (`/api/v1/library/art/...`).
+        // Resolve them against THIS host, so every consumer sees absolute URLs.
+        for i in games.indices {
+            games[i].art = games[i].art.resolved(against: base)
+        }
+        return games
     }
 
     /// What the host currently has running, from `GET /api/v1/status`.
