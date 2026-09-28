@@ -198,7 +198,7 @@ final class ConsoleJSONTests: XCTestCase {
     /// the compositor comes back as its wire number, and an override only this app edits stays.
     func testAConsoleSaveKeepsWhatOnlyThisAppEdits() {
         var base = SettingsOverlay()
-        base.windowedSafePresent = true
+        base.modifierLayout = "pc"
         base.codec = "hevc"
         base.bitrateKbps = 20_000
         let merged = ConsoleJSON.overlay(
@@ -208,7 +208,7 @@ final class ConsoleJSONTests: XCTestCase {
         XCTAssertEqual(merged.compositor, 4)
         XCTAssertEqual(merged.hdrEnabled, false)
         XCTAssertNil(merged.codec, "the console cleared it")
-        XCTAssertEqual(merged.windowedSafePresent, true, "only this app edits it")
+        XCTAssertEqual(merged.modifierLayout, "pc", "only this app edits it")
     }
 }
 

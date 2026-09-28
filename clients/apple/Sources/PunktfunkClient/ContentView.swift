@@ -109,9 +109,7 @@ struct ContentView: View {
     @StateObject private var waker = HostWaker()
     #if os(macOS)
     /// Whether the hosting window is native-fullscreen right now (reported by
-    /// FullscreenController). Drives the session view's safe-area choice: fullscreen goes
-    /// edge-to-edge (behind the notch); windowed respects the top inset so the title bar
-    /// never covers the video.
+    /// FullscreenController). Holds the error alert back while a fullscreen we drove leaves.
     @State private var isFullscreen = false
     /// The fullscreen edge and ownership, outliving the controller views SwiftUI rebuilds.
     @State private var fullscreenEdge = FullscreenController.Edge()
@@ -515,10 +513,12 @@ struct ContentView: View {
         #endif
         #if os(macOS)
         // Fullscreen from launch under Always, else only while a session is up (incl. the trust
-        // prompt over the blurred stream). The controller also mirrors the window's ACTUAL state
-        // into `isFullscreen`, which drives the session view's safe-area handling below.
+        // prompt over the blurred stream). The session's mode picks native or panel fullscreen
+        // and hides the title bar.
         .background(FullscreenController(
             active: fullscreenAlways || (fullscreenForSession && model.connection != nil),
+            stream: model.connection.map { CGSize(width: Int($0.width), height: Int($0.height)) },
+            captured: model.mouseCaptured,
             isFullscreen: $isFullscreen, appDriven: $appDrivenFullscreen, edge: fullscreenEdge))
         #endif
         // A game launched from the library just exited, so the session ended on purpose: put the
@@ -1018,17 +1018,9 @@ struct ContentView: View {
         #if os(macOS)
         .frame(minWidth: 640, minHeight: 360)
         .background(Color.black)
-        // FULLSCREEN fills the whole display, INCLUDING behind the camera housing (notch).
-        // Without this the stream is laid out in the safe area below the notch, so an
-        // aspect-fit video at the display's native mode scales down and leaves black borders.
-        // A fullscreen video behind the notch (a thin top-center strip occluded) is the
-        // expected behavior — same edge-to-edge intent as the iOS/tvOS branches below.
-        // WINDOWED keeps the TOP inset: macOS 26 windows extend content under the (glass)
-        // title bar and report its height as top safe area — ignoring it there put the top of
-        // the video (and the HUD) underneath the title bar. The black `.background` above is a
-        // ShapeStyle background, which always extends under every inset, so the strip behind
-        // the title bar stays black rather than showing the video.
-        .ignoresSafeArea(edges: isFullscreen ? .all : [.horizontal, .bottom])
+        // Edge-to-edge: FullscreenController hides the title bar for a session, and the panel
+        // fullscreen covers the camera housing on purpose (a thin top-centre strip occluded).
+        .ignoresSafeArea()
         #elseif os(iOS) || os(visionOS)
         // Streaming is immersive: edge-to-edge under the status bar and home
         // indicator, both hidden for the session (they return with the hosts grid).

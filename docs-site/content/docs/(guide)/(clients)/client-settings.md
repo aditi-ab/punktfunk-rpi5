@@ -113,7 +113,6 @@ shortcuts. It's on every app and in the console (which edits your defaults only)
 | **Auto-wake on connect** | On | Wakes a sleeping saved host with [Wake-on-LAN](/docs/wake-on-lan) and waits. Turn it off for hosts over a VPN. | All. Console: **Wake hosts automatically**. |
 | **Start streams in fullscreen** | On | F11 or Alt+Enter leaves fullscreen. On a Mac, **Always** also opens the app fullscreen. | Linux, Windows, Mac (**Fullscreen**: **Off**, **While streaming**, **Always**) |
 | **Keep streaming in background** | Off | Audio and the connection stay live while you switch apps, for 10 minutes unless you pick another limit. | iPhone, iPad, Apple TV, Android phones (**Keep streaming in the background**) |
-| **Safe windowed presentation** | On | Avoids a macOS display-driver crash in windowed streams, at a little latency. | Mac |
 
 ## Interface
 
