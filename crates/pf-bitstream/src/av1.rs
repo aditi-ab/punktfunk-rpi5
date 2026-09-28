@@ -373,23 +373,22 @@ impl Av1Planner {
             let obu_start = consumed;
             consumed += used;
 
+            // A new header ends the previous frame; its tile groups are all in.
+            // Plan it before the parse: planning runs the 7.20 update, and the
+            // new header reads the order hints and sizes that update writes.
+            if matches!(obu.header.obu_type, ObuType::Frame | ObuType::FrameHeader) {
+                if let Some((h, t)) = pending.take() {
+                    plans.push(self.plan_one(h, t, std::mem::take(&mut warnings))?);
+                }
+            }
+
             match self.parser.parse_obu(obu) {
                 Ok(ParsedObu::SequenceHeader(seq)) => self.sequence = Some(seq),
-                Ok(ParsedObu::FrameHeader(fh)) => {
-                    // A new header ends the previous frame; its tile groups are
-                    // all in by now.
-                    if let Some((h, t)) = pending.take() {
-                        plans.push(self.plan_one(h, t, std::mem::take(&mut warnings))?);
-                    }
-                    pending = Some((fh, Vec::new()));
-                }
+                Ok(ParsedObu::FrameHeader(fh)) => pending = Some((fh, Vec::new())),
                 Ok(ParsedObu::Frame(frame)) => {
-                    // A Frame OBU is a header plus its first tile group, so it
-                    // ends any previous frame. It stays open like a bare header:
-                    // 5.10 lets further tile-group OBUs follow it.
-                    if let Some((h, t)) = pending.take() {
-                        plans.push(self.plan_one(h, t, std::mem::take(&mut warnings))?);
-                    }
+                    // A Frame OBU is a header plus its first tile group. It stays
+                    // open like a bare header: 5.10 lets further tile-group OBUs
+                    // follow it.
                     let tile = TilePlan {
                         data: obu_start..consumed,
                         tg_start: frame.tile_group.tg_start,
@@ -839,6 +838,29 @@ mod tests {
     /// references; damage would surface later as missing-reference concealment
     /// on frames that were never damaged.
     ///
+    /// A header reads the reference state the frame before it wrote (7.20), also
+    /// when both share a temporal unit. 24 units of this vector carry two frames.
+    #[test]
+    fn order_hints_name_the_pictures_the_planner_resolved() {
+        let mut planner = Av1Planner::new();
+        let mut checked = 0usize;
+        for (unit, packet) in IvfIterator::new(AV1_25FPS).enumerate() {
+            for plan in planner.plan_au(packet).unwrap() {
+                for (name, r) in plan.refs.iter().enumerate() {
+                    let Some(r) = r else { continue };
+                    // `order_hints` is indexed by reference frame; `INTRA_FRAME` is 0.
+                    assert_eq!(
+                        plan.header.order_hints[name + 1],
+                        r.state.order_hint,
+                        "unit {unit}, reference name {name}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0);
+    }
+
     /// This vector has no `show_existing_frame`, so [`Av1Planner::plan_frame`]'s
     /// display-only path (including the key-frame slot reset) is untested here.
     #[test]
