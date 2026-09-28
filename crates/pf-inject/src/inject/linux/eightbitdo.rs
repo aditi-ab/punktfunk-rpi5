@@ -127,3 +127,86 @@ pub type EightBitDoManager = UhidManager<EightBitDoProto>;
 pub fn manager(model: Model) -> EightBitDoManager {
     UhidManager::with_backend(EightBitDoProto::new(model))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use punktfunk_core::input::{gamepad as gs, GamepadEvent};
+
+    /// Holds one of each native pad live for `PF_PAD_HOLD_SECS` (default 3) so an SDL probe can
+    /// read them: paddle beats every 400 ms, a steady 100 °/s pitch, rumble echoed to stdout.
+    #[test]
+    #[ignore = "creates real /dev/uhid devices; needs the input group"]
+    fn native_pads_hold_for_a_probe() {
+        let secs = std::env::var("PF_PAD_HOLD_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+        let mut eightbitdo = [
+            (0u8, manager(Model::Ultimate2)),
+            (1, manager(Model::Pro2)),
+            (2, manager(Model::Pro3)),
+        ];
+        let (hori_idx, mut hori) = (3u8, crate::hori_steam::HoriManager::new());
+        let arrival = |index| GamepadEvent::Arrival {
+            index,
+            kind: 0,
+            capabilities: 0,
+            audio_caps: 0,
+        };
+        let frame = |index: u8, buttons| {
+            GamepadEvent::State(GamepadFrame {
+                index: index as i16,
+                active_mask: 1 << index,
+                buttons,
+                ..Default::default()
+            })
+        };
+        let motion = |pad| RichInput::Motion {
+            pad,
+            gyro: [(100 * gs::MOTION_GYRO_LSB_PER_DEG_S) as i16, 0, 0],
+            accel: [0, gs::MOTION_ACCEL_LSB_PER_G as i16, 0],
+        };
+        for (i, m) in &mut eightbitdo {
+            m.handle(&arrival(*i));
+        }
+        hori.handle(&arrival(hori_idx));
+        let live = eightbitdo.iter().map(|(_, m)| m.live_pads()).sum::<usize>() + hori.live_pads();
+        assert_eq!(live, 4, "every pad must be created");
+        println!("4 native pads up for {secs}s");
+
+        let (start, mut last, mut beat) = (Instant::now(), Instant::now(), 0u32);
+        let mut last_motion = Instant::now();
+        while start.elapsed() < Duration::from_secs(secs) {
+            // 50 Hz: under the manager's 100 ms idle watchdog, which zeroes a stalled gyro.
+            if last_motion.elapsed() >= Duration::from_millis(20) {
+                last_motion = Instant::now();
+                for (i, m) in &mut eightbitdo {
+                    m.apply_rich(motion(*i));
+                }
+                hori.apply_rich(motion(hori_idx));
+            }
+            if last.elapsed() >= Duration::from_millis(400) {
+                last = Instant::now();
+                beat += 1;
+                let buttons = if beat % 2 == 0 {
+                    gs::BTN_A | gs::BTN_PADDLE1 | gs::BTN_PADDLE2
+                } else {
+                    0
+                };
+                for (i, m) in &mut eightbitdo {
+                    m.handle(&frame(*i, buttons));
+                }
+                hori.handle(&frame(hori_idx, buttons));
+            }
+            let echo = |pad, low, high, _, _| println!("rumble pad={pad} low={low} high={high}");
+            for (_, m) in &mut eightbitdo {
+                m.pump(echo, |_| {});
+                m.heartbeat(Duration::from_millis(8));
+            }
+            hori.pump(echo, |_| {});
+            hori.heartbeat(Duration::from_millis(8));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
