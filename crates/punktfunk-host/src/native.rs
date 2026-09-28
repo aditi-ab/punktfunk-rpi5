@@ -1605,9 +1605,16 @@ pub(crate) async fn run_admitted(
         // Written by the input thread below, read by `GET /session/{id}/pads`.
         pads: Arc::new(crate::pad_feed::PadFeed::new()),
     };
+    // One bounded channel for pointer/keyboard and rich input, fed by the datagram loop and
+    // by the control loop's key edges. Unbounded is RSS DoS: the producer outruns the
+    // consumer; pen batches amplify. Drop is correct — stale input is already worthless;
+    // the injector re-syncs from the next event.
+    const INPUT_QUEUE_DEPTH: usize = 1024;
+    let (input_tx, input_rx) = std::sync::mpsc::sync_channel::<ClientInput>(INPUT_QUEUE_DEPTH);
     tokio::spawn(control::run(control::Task {
         ctrl_send,
         ctrl_recv,
+        input_tx: input_tx.clone(),
         initial_mode: hello.mode,
         codec,
         live_reconfig_ok,
@@ -1677,11 +1684,6 @@ pub(crate) async fn run_admitted(
     );
     let input_route = planes.input_route.clone();
 
-    // One bounded channel for pointer/keyboard and rich input. Unbounded is RSS DoS: the
-    // producer outruns the consumer; pen batches amplify. Drop is correct — stale input is
-    // already worthless; the injector re-syncs from the next event.
-    const INPUT_QUEUE_DEPTH: usize = 1024;
-    let (input_tx, input_rx) = std::sync::mpsc::sync_channel::<ClientInput>(INPUT_QUEUE_DEPTH);
     // Stream loop parks the seat pointer through the same path client input takes.
     #[cfg(target_os = "linux")]
     let input_tx_stream = input_tx.clone();

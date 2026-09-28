@@ -23,7 +23,7 @@
 use super::super::pad_mouse::{PadMouse, TICK};
 use super::*;
 use crate::input::scroll::ScrollOutput;
-use crate::input::{GamepadSnapshot, MAX_PADS};
+use crate::input::{GamepadSnapshot, InputKind, MAX_PADS};
 
 /// What the input task reads beside its queue.
 pub(super) struct MouseArgs {
@@ -32,25 +32,49 @@ pub(super) struct MouseArgs {
     pub(super) client: Arc<ClientShared>,
     /// Host advertised `HOST_CAP2_SCROLL`: normalized events go out unchanged.
     pub(super) normalized_scroll: bool,
+    /// The control stream's writer, toward a host that reads key edges there
+    /// (`HOST_CAP2_INPUT_EDGES`). `None` keeps every event on the datagram plane.
+    pub(super) edges: Option<tokio::sync::mpsc::Sender<CtrlRequest>>,
 }
 
 /// The final outbound gate for every ordinary input event — raw embedder sends
-/// and controller-mouse output share it, so validation, the invert toggle and
-/// the old-host `MouseScroll` conversion each happen exactly once.
+/// and controller-mouse output share it, so validation, the invert toggle, the
+/// old-host `MouseScroll` conversion and the key lane each happen exactly once.
 fn send_input(conn: &quinn::Connection, out: &mut ScrollOutput, args: &MouseArgs, ev: InputEvent) {
     let invert = args
         .client
         .scroll_invert
         .load(std::sync::atomic::Ordering::Relaxed);
-    if let Some(ev) = out.prepare(ev, invert) {
-        send_granted(conn, &args.client.access_grants, ev);
+    let Some(ev) = out.prepare(ev, invert) else {
+        return;
+    };
+    if !granted(&args.client.access_grants, ev) {
+        return;
     }
+    // A key edge goes reliable when the host reads it there. A full control queue means
+    // the control task is wedged; the datagram is then the better bet than a stall.
+    if let Some(ctrl) = args.edges.as_ref().filter(|_| is_edge(ev.kind)) {
+        if ctrl.try_send(CtrlRequest::InputEdge(ev)).is_ok() {
+            return;
+        }
+    }
+    let _ = conn.send_datagram(ev.encode().to_vec().into());
 }
 
-/// Send `ev` when the live grants cover its [`crate::quic::classify`] class.
-fn send_granted(conn: &quinn::Connection, grants: &AtomicU32, ev: InputEvent) {
+/// The kinds whose loss sticks: a release the network drops holds the key.
+fn is_edge(kind: InputKind) -> bool {
+    matches!(kind, InputKind::KeyDown | InputKind::KeyUp)
+}
+
+/// Whether the live grants cover `ev`'s [`crate::quic::classify`] class.
+fn granted(grants: &AtomicU32, ev: InputEvent) -> bool {
     let grants = grants.load(std::sync::atomic::Ordering::Relaxed);
-    if grants & crate::quic::classify(ev.kind).bit() != 0 {
+    grants & crate::quic::classify(ev.kind).bit() != 0
+}
+
+/// Send `ev` as a datagram when the live grants cover it.
+fn send_granted(conn: &quinn::Connection, grants: &AtomicU32, ev: InputEvent) {
+    if granted(grants, ev) {
         let _ = conn.send_datagram(ev.encode().to_vec().into());
     }
 }
@@ -139,7 +163,6 @@ pub(super) async fn run(
     pad_audio: bool,
     mouse_args: MouseArgs,
 ) {
-    use crate::input::InputKind;
     use std::sync::atomic::Ordering;
     // bit0 haptics, bit1 speaker. Fed by [`NativeClient::set_pad_audio_caps`] and
     // by arrival events that already carry the bits.
@@ -373,7 +396,62 @@ mod tests {
         MouseArgs {
             client: client.clone(),
             normalized_scroll: true,
+            edges: None,
         }
+    }
+
+    fn key_up(vk: u32) -> InputEvent {
+        InputEvent {
+            kind: InputKind::KeyUp,
+            ..key_down(vk)
+        }
+    }
+
+    /// Toward a host that reads them, key edges leave on the control stream and nothing
+    /// else does; a closed control lane falls back to the datagram.
+    #[tokio::test]
+    async fn key_edges_take_the_control_stream_when_the_host_reads_them() {
+        let (_server, client_conn, host_conn) = loopback().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::channel(4);
+        let client = client(crate::quic::GRANT_ALL);
+        let args = MouseArgs {
+            edges: Some(ctrl_tx),
+            ..mouse_args(&client)
+        };
+        let task = tokio::spawn(run(client_conn, rx, true, false, args));
+
+        tx.send(key_down(0x41)).unwrap();
+        tx.send(key_up(0x41)).unwrap();
+        tx.send(InputEvent {
+            kind: InputKind::MouseMove,
+            _pad: [0; 3],
+            code: 0,
+            x: 3,
+            y: -2,
+            flags: 0,
+        })
+        .unwrap();
+        for want in [key_down(0x41), key_up(0x41)] {
+            match ctrl_rx.recv().await {
+                Some(CtrlRequest::InputEdge(ev)) => assert_eq!(ev, want),
+                _ => panic!("a key edge on the control lane"),
+            }
+        }
+        let motion = next_event(&host_conn, &[]).await;
+        assert_eq!((motion.kind, motion.x), (InputKind::MouseMove, 3));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), host_conn.read_datagram())
+                .await
+                .is_err(),
+            "no key edge as a datagram"
+        );
+
+        drop(ctrl_rx);
+        tx.send(key_down(0x42)).unwrap();
+        let fallback = next_event(&host_conn, &[]).await;
+        assert_eq!((fallback.kind, fallback.code), (InputKind::KeyDown, 0x42));
+        task.abort();
     }
 
     fn key_down(vk: u32) -> InputEvent {

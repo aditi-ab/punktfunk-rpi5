@@ -788,6 +788,13 @@
 // after its first window, and its groups are left alone.
 #define PUNKTFUNK_HOST_CAP2_DELIVERY 32
 
+// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host reads
+// [`InputEdge`](super::control::InputEdge) off the control stream. Toward this bit the
+// client sends every key press and release there, where QUIC resends what the network
+// drops; a lost `KeyUp` on the datagram plane otherwise holds the key until its next edge.
+// Motion, scroll and pads stay datagrams. Without the bit every event is a datagram, as before.
+#define PUNKTFUNK_HOST_CAP2_INPUT_EDGES 64
+
 // [`Hello::video_codecs`]: H.264 / AVC. The software encode path emits H.264, so a client
 // that wants to stream from a GPU-less host must advertise this.
 #define PUNKTFUNK_CODEC_H264 1
@@ -952,6 +959,9 @@
 // Longest [`LaunchOutcome::message`] in UTF-8 bytes. One sentence plus a cause;
 // a host cannot make the client hold more than this.
 #define PUNKTFUNK_LAUNCH_MESSAGE_MAX 200
+
+// [`InputEdge`]. 0x5C: 0x58–0x5B are access, audio, launch and pad slots.
+#define PUNKTFUNK_MSG_INPUT_EDGE 92
 
 #define PUNKTFUNK_AUDIO_MAGIC 201
 
