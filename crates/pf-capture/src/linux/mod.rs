@@ -8,10 +8,11 @@
 //!   drops.
 //! - **pipewire** — owns the `!Send` MainLoop/Stream and pumps frames.
 //!
-//! Frames leave through a one-deep overwriting [`FrameSlot`] plus a wakeup
-//! edge. Payload may be packed RGB, NV12, YUV444, 10-bit PQ, or a dmabuf
-//! that never touches the CPU. Size is the negotiated PipeWire format,
-//! not the portal hint. [`PortalCapturer`]'s `Drop` quits and joins the
+//! Frames leave through a queue that waits out each producer render
+//! ([`pipewire::FrameQueue`]) plus a wakeup edge; the direct capturer's are
+//! rendered on arrival and leave through a one-deep [`FrameSlot`]. Payload may
+//! be packed RGB, NV12, YUV444, 10-bit PQ, or a dmabuf that never touches the
+//! CPU. Size is the negotiated PipeWire format, not the portal hint. [`PortalCapturer`]'s `Drop` quits and joins the
 //! pipewire thread; [`PortalSession`]'s `Drop` fires the portal oneshot
 //! and waits bounded so the zbus drop ends the ScreenCast.
 
@@ -33,7 +34,7 @@ use std::time::Duration;
 /// pins compositor buffers.
 type FrameSlot = Arc<std::sync::Mutex<Option<CapturedFrame>>>;
 
-/// `wait_arrival` for either capturer: returns once `slot` holds a frame,
+/// `wait_arrival` for the direct capturer: returns once `slot` holds a frame,
 /// `deadline` passes, or the producer is broken or gone. Never consumes: the
 /// frame stays for `try_latest`, which also classifies a dead producer.
 fn wait_for_frame(
@@ -194,10 +195,14 @@ impl CaptureSignals {
 /// Portal + PipeWire capturer, reused across streams. [`set_active`] gates
 /// the per-frame de-pad so the screencast stays up between reconnects.
 pub struct PortalCapturer {
-    slot: FrameSlot,
-    /// Wakeup only — the slot holds the frame, so a coalesced edge loses
+    /// Arrivals awaiting their renders. The wait on a render runs on this side, never on
+    /// the PipeWire thread: that one hands the producer's buffers back.
+    queue: pipewire::FrameQueue,
+    /// Wakeup only — the queue holds the frames, so a coalesced edge loses
     /// nothing. Sender dies with the PipeWire thread (`Disconnected`).
     wake: Receiver<()>,
+    /// Arrival to take, per frame (`PUNKTFUNK_PERF`).
+    fence_wait: pipewire::FenceWaitStats,
     signals: CaptureSignals,
     /// `signals.resent` as of the last [`Capturer::take_reference_risk`].
     resent_acked: u64,
@@ -402,7 +407,7 @@ impl PortalCapturer {
 }
 
 struct PwHandles {
-    slot: FrameSlot,
+    queue: pipewire::FrameQueue,
     wake: Receiver<()>,
     signals: CaptureSignals,
     vaapi_dmabuf: bool,
@@ -426,8 +431,9 @@ impl PwHandles {
         hdr_source: super::HdrSource,
     ) -> PortalCapturer {
         PortalCapturer {
-            slot: self.slot,
+            queue: self.queue,
             wake: self.wake,
+            fence_wait: Default::default(),
             signals: self.signals,
             resent_acked: 0,
             stall_since: None,
@@ -466,9 +472,9 @@ fn spawn_pipewire(
         ..
     } = opts;
     // Wakeup edges only; depth 1 is right — a coalesced edge loses nothing
-    // because the slot holds the frame.
-    let slot: FrameSlot = Arc::new(std::sync::Mutex::new(None));
-    let slot_cb = slot.clone();
+    // because the queue holds the frames.
+    let queue = pipewire::FrameQueue::default();
+    let queue_cb = queue.clone();
     let (wake_tx, wake_rx) = sync_channel::<()>(1);
     // Portal-fd vs virtual-output with the same node number are different sources.
     let identity = u64::from(node_id) | (u64::from(fd.is_some()) << 32);
@@ -519,7 +525,7 @@ fn spawn_pipewire(
             if let Err(e) = pipewire::pipewire_thread(
                 fd,
                 node_id,
-                slot_cb,
+                queue_cb,
                 wake_tx,
                 signals_cb,
                 plan,
@@ -534,7 +540,7 @@ fn spawn_pipewire(
         })
         .context("spawn pipewire thread")?;
     Ok(PwHandles {
-        slot,
+        queue,
         wake: wake_rx,
         signals,
         vaapi_dmabuf,
@@ -598,8 +604,11 @@ impl Capturer for PortalCapturer {
 
     fn wait_arrival(&mut self, deadline: std::time::Instant) {
         // A driven producer paints on its own requests (`pipewire::pacer::Pacer`), so
-        // this wait never triggers a paint.
-        wait_for_frame(&self.slot, &self.wake, &self.signals.broken, deadline);
+        // this wait never triggers a paint. It returns on a finished render, not on an
+        // arrival: the producer sends a buffer before it has painted it.
+        if !self.signals.broken.load(Ordering::Relaxed) {
+            let _ = pipewire::wait_ready(&self.queue, &self.wake, deadline);
+        }
     }
 
     /// Only the virtual-output path holds one; the portal thread owns its own session.
@@ -648,8 +657,8 @@ impl Capturer for PortalCapturer {
             // Flush: a reused capturer would hand the next stream the previous
             // session's last frame (`pts_ns` from the old clock). Producer
             // stops publishing while inactive.
-            if let Ok(mut slot) = self.slot.lock() {
-                *slot = None;
+            if let Ok(mut queue) = self.queue.lock() {
+                queue.clear();
             }
             // Else a leftover `Instant` expires the 1500 ms grace on the first
             // `try_latest` of a stream that has been running for microseconds.
@@ -762,7 +771,7 @@ impl PortalCapturer {
                     self.node_id
                 ));
             }
-            // Slot before wakeup: a coalesced edge (or a publish while we
+            // Queue before wakeup: a coalesced edge (or a publish while we
             // were not waiting) is still visible.
             if let Some(f) = self.take_frame() {
                 self.note_negotiation_confirmed();
@@ -775,22 +784,31 @@ impl PortalCapturer {
             }
             let slice = Duration::from_millis(500)
                 .min(deadline.saturating_duration_since(std::time::Instant::now()));
-            match self.wake.recv_timeout(slice) {
-                Ok(()) => continue,
-                Err(RecvTimeoutError::Timeout) if std::time::Instant::now() < deadline => continue,
-                Err(e) => {
-                    // A last frame can sit in the slot even as the producer exits.
-                    if let Some(f) = self.take_frame() {
-                        return Ok(f);
-                    }
-                    return self.next_frame_timed_out(e, budget, verdict);
-                }
+            let until = std::time::Instant::now() + slice;
+            let end = if !pipewire::wait_ready(&self.queue, &self.wake, until) {
+                RecvTimeoutError::Disconnected
+            } else if std::time::Instant::now() >= deadline {
+                RecvTimeoutError::Timeout
+            } else {
+                continue;
+            };
+            // A last frame can sit in the queue even as the producer exits.
+            if let Some(f) = self.take_frame() {
+                return Ok(f);
             }
+            return self.next_frame_timed_out(end, budget, verdict);
         }
     }
 
+    /// The next frame whose render finished; a frame it passes over goes back to the producer.
     fn take_frame(&mut self) -> Option<CapturedFrame> {
-        let frame = self.slot.lock().ok().and_then(|mut s| s.take())?;
+        let taken = self
+            .queue
+            .lock()
+            .ok()?
+            .take_ready(std::time::Instant::now())?;
+        self.fence_wait.took(&taken);
+        let frame = taken.frame;
         if self.vaapi_dmabuf
             || self.raw_for_encoder
             || !matches!(frame.payload, FramePayload::Dmabuf(_))

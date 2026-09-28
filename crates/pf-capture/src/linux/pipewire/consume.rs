@@ -6,6 +6,7 @@ use super::plan::{
     gpu_import, passthrough_fallback_action, ImportOutcome, PassthroughFallback,
     PassthroughFallbackAction,
 };
+use super::queue::{RenderFence, RENDER_GUARD};
 use super::UserData;
 use crate::linux::pw_cursor::composite_cursor;
 use crate::linux::sync_timeline::{plane_count, SyncPoints};
@@ -23,12 +24,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// question is whether the tail is ~0 or milliseconds.
 const FENCE_WAIT_BUCKETS_US: [u64; 6] = [100, 500, 1_000, 2_000, 5_000, 10_000];
 
-/// Producer implicit-fence wait, measured on the PipeWire loop thread.
+/// How long taken frames waited on their renders, arrival to take.
 ///
-/// That thread is the compositor's consumer, so a block here delays recycling for the next
-/// frame. A `NoFence` majority means the wait is structurally free, not merely short.
+/// The producer's buffer is out for that long before encode starts. A `NoFence` majority
+/// means nothing fenced the frames, not that the renders were quick.
 #[derive(Debug, Default, Clone, Copy)]
-pub(super) struct FenceWaitStats {
+pub(in crate::linux) struct FenceWaitStats {
     samples: u64,
     total_us: u64,
     max_us: u64,
@@ -37,7 +38,8 @@ pub(super) struct FenceWaitStats {
     signaled: u64,
     no_fence: u64,
     timed_out: u64,
-    failed: u64,
+    /// Older frames passed over for a newer finished one.
+    passed: u64,
 }
 
 impl FenceWaitStats {
@@ -50,6 +52,42 @@ impl FenceWaitStats {
             .position(|&b| us <= b)
             .unwrap_or(FENCE_WAIT_BUCKETS_US.len());
         self.buckets[idx] += 1;
+    }
+
+    /// One taken frame. Every 300 under `PUNKTFUNK_PERF`, the line: about 5 s at 60 fps.
+    pub(in crate::linux) fn took(&mut self, t: &super::Taken) {
+        use pf_dmabuf::fence::WaitOutcome;
+        self.record(t.waited.as_micros() as u64);
+        self.passed += t.passed as u64;
+        match t.outcome {
+            WaitOutcome::Signaled => self.signaled += 1,
+            WaitOutcome::NoFence => self.no_fence += 1,
+            WaitOutcome::TimedOut => self.timed_out += 1,
+        }
+        if !(pf_host_config::config().perf && self.is_meaningful() && self.samples % 300 == 0) {
+            return;
+        }
+        let q = |p: f64| match self.quantile_bucket_us(p) {
+            Some(Some(us)) => format!("<={us}us"),
+            Some(None) => format!(
+                ">{}us",
+                FENCE_WAIT_BUCKETS_US[FENCE_WAIT_BUCKETS_US.len() - 1]
+            ),
+            None => "n/a".to_string(),
+        };
+        tracing::info!(
+            samples = self.samples,
+            mean_us = self.mean_us(),
+            max_us = self.max_us,
+            p50 = %q(0.50),
+            p99 = %q(0.99),
+            signaled = self.signaled,
+            no_fence = self.no_fence,
+            timed_out = self.timed_out,
+            passed = self.passed,
+            "render fence wait, arrival to take (the producer's buffer is out this long \
+             before encode starts)"
+        );
     }
 
     /// Bucket upper bound for the `q`-quantile, µs; inner `None` is overflow.
@@ -263,28 +301,32 @@ pub(super) fn consume_frame(
     }
 
     let pts_ns = stamp_frame(ud, hdr_pts_ns);
-    if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf {
-        wait_render_fence(ud, sync_points, data_fd(&datas[0]));
-    }
-    let arrival = Arrival {
+    let fence = if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf {
+        render_fence(ud, sync_points, data_fd(&datas[0]))
+    } else {
+        None
+    };
+    let mut arrival = Arrival {
         datas,
         w,
         h,
         pts_ns,
         pw_buf,
         stream,
+        fence,
     };
-    if ud.vaapi_passthrough && try_passthrough(ud, &arrival) {
+    if ud.vaapi_passthrough && try_passthrough(ud, &mut arrival) {
         return;
     }
-    if try_gpu_hold(ud, &arrival) {
+    if try_gpu_hold(ud, &mut arrival) {
         return;
     }
     cpu_depad(ud, arrival);
 }
 
-/// One arrival: its planes, size and wire stamp, and the identity [`UserData::try_defer`]
-/// holds it by.
+/// One arrival: its planes, size and wire stamp, the identity [`UserData::try_defer`]
+/// holds it by, and the fence on its pixels. A lane that publishes the dmabuf passes the
+/// fence on; a lane that reads the pixels here waits it out first.
 struct Arrival<'a> {
     datas: &'a mut [pw::spa::buffer::Data],
     w: usize,
@@ -292,6 +334,14 @@ struct Arrival<'a> {
     pts_ns: u64,
     pw_buf: *mut pw::sys::pw_buffer,
     stream: *mut pw::sys::pw_stream,
+    fence: Option<RenderFence>,
+}
+
+/// Wait the render out on the loop thread: the pixels are read before `.process` returns.
+fn wait_here(fence: Option<RenderFence>) {
+    if let Some(f) = fence {
+        let _ = f.wait(RENDER_GUARD);
+    }
 }
 
 /// The wire stamp for this arrival, taken once before de-pad or import. Sampling at publish
@@ -333,6 +383,9 @@ fn stamp_frame(ud: &mut UserData, hdr_pts_ns: Option<i64>) -> u64 {
                 implausible = r.implausible,
                 hdr_pts_used = ud.hdr_pts_enabled,
                 held_drops = ud.held_drops,
+                undamaged = ud.undamaged,
+                // Buffers the producer sent that never arrived, their release signalled here.
+                undelivered = ud.defer.undelivered.load(Ordering::Relaxed),
                 // Session total of raw-passthrough frames that took the CPU copy instead.
                 cpu_fallbacks = ud.passthrough_fallbacks.frames,
                 // Buffers the producer sent again while held (PipeWire < 1.6); each re-held.
@@ -349,93 +402,56 @@ fn stamp_frame(ud: &mut UserData, hdr_pts_ns: Option<i64>) -> u64 {
     stamp.pts_ns
 }
 
-/// Wait out the producer's render before anything reads the dmabuf `plane`, and tally the wait.
+/// The fence on this buffer's render, for whoever reads the pixels to wait on. `None`:
+/// nothing fences them, and a read may see the frame before.
 ///
-/// The render is fenced at `sync`'s acquire point when the stream negotiated explicit sync, else
-/// by the dmabuf's implicit fence (none on NVIDIA: a stale frame can be read). 100 ms is a
-/// guard: past it the producer is wedged, not slow. A CPU wait on the loop thread; a GPU
-/// semaphore import would free it, and the `PUNKTFUNK_PERF` line says whether that is owed.
-fn wait_render_fence(ud: &mut UserData, sync: Option<SyncPoints>, plane: Option<BorrowedFd<'_>>) {
-    let t0 = std::time::Instant::now();
-    let explicit = ud.sync.as_ref().zip(sync);
-    let waited = match &explicit {
-        Some((dev, p)) => dev.wait(
-            p.acquire_fd,
-            p.acquire_point,
-            std::time::Duration::from_millis(100),
-        ),
-        None => match plane {
-            Some(plane) => pf_dmabuf::fence::wait_read_ready(plane, 100),
-            None => Err(std::io::Error::from_raw_os_error(libc::EBADF)),
-        },
-    };
-    ud.fence_wait.record(t0.elapsed().as_micros() as u64);
-    match waited {
-        Ok(outcome) => {
-            use pf_dmabuf::fence::WaitOutcome;
-            match outcome {
-                WaitOutcome::Signaled => ud.fence_wait.signaled += 1,
-                WaitOutcome::NoFence => ud.fence_wait.no_fence += 1,
-                WaitOutcome::TimedOut => ud.fence_wait.timed_out += 1,
-            }
-            static F0: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-            if explicit.is_some() && F0.swap(false, Ordering::Relaxed) {
+/// The render is fenced at `sync`'s acquire point when the stream negotiated explicit sync,
+/// else by the dmabuf's implicit fence (none on NVIDIA). Not waited here: this is the loop
+/// thread, the only one that hands buffers back.
+fn render_fence(
+    ud: &UserData,
+    sync: Option<SyncPoints>,
+    plane: Option<BorrowedFd<'_>>,
+) -> Option<RenderFence> {
+    static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+    if let Some((dev, p)) = ud.sync.as_ref().zip(sync) {
+        if ONCE.swap(false, Ordering::Relaxed) {
+            tracing::info!(
+                "dmabuf explicit sync active (SyncTimeline): frames wait on the producer's \
+                 acquire point and hand-back signals its release point"
+            );
+        }
+        // SAFETY: the syncobj fd belongs to the buffer this callback holds.
+        let timeline = unsafe { BorrowedFd::borrow_raw(p.acquire_fd) }
+            .try_clone_to_owned()
+            .ok()?;
+        return Some(RenderFence::Acquire {
+            dev: dev.clone(),
+            timeline,
+            point: p.acquire_point,
+        });
+    }
+    match pf_dmabuf::fence::export_sync_file(plane?) {
+        Ok(fence) => {
+            if ONCE.swap(false, Ordering::Relaxed) {
                 tracing::info!(
-                    ?outcome,
-                    "dmabuf explicit sync active (SyncTimeline): the producer's acquire \
-                     point is waited here and its release point signalled on hand-back — \
-                     it no longer finishes the GPU for this stream"
+                    fenced = fence.is_some(),
+                    "dmabuf implicit sync active (fenced: frames wait on the driver's fence; \
+                     not fenced: a read may see the frame before)"
                 );
             }
-            static F1: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-            if explicit.is_none() && F1.swap(false, Ordering::Relaxed) {
-                tracing::info!(
-                    ?outcome,
-                    "dmabuf implicit-fence sync active (Signaled → driver fences the \
-                     render, race closed; NoFence → no implicit fence, zero-copy may \
-                     still show stale frames; TimedOut → fence pending past 100ms, \
-                     proceeded anyway)"
-                );
-            }
+            fence.map(RenderFence::SyncFile)
         }
         Err(e) => {
-            ud.fence_wait.failed += 1;
-            static F2: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-            if F2.swap(false, Ordering::Relaxed) {
+            if ONCE.swap(false, Ordering::Relaxed) {
                 tracing::warn!(
                     error = %e,
-                    "dmabuf EXPORT_SYNC_FILE failed — no implicit-fence sync; NVIDIA \
-                     zero-copy may show stale frames (no producer explicit sync)"
+                    "dmabuf EXPORT_SYNC_FILE failed — nothing fences the producer's render, \
+                     a read may see the frame before"
                 );
             }
+            None
         }
-    }
-    // One line per ~5 s at 60 fps, under PUNKTFUNK_PERF only — same gate as encode submit splits.
-    if pf_host_config::config().perf
-        && ud.fence_wait.is_meaningful()
-        && ud.fence_wait.samples % 300 == 0
-    {
-        let q = |p: f64| match ud.fence_wait.quantile_bucket_us(p) {
-            Some(Some(us)) => format!("<={us}us"),
-            Some(None) => format!(
-                ">{}us",
-                FENCE_WAIT_BUCKETS_US[FENCE_WAIT_BUCKETS_US.len() - 1]
-            ),
-            None => "n/a".to_string(),
-        };
-        tracing::info!(
-            samples = ud.fence_wait.samples,
-            mean_us = ud.fence_wait.mean_us(),
-            max_us = ud.fence_wait.max_us,
-            p50 = %q(0.50),
-            p99 = %q(0.99),
-            signaled = ud.fence_wait.signaled,
-            no_fence = ud.fence_wait.no_fence,
-            timed_out = ud.fence_wait.timed_out,
-            failed = ud.fence_wait.failed,
-            "dmabuf implicit-fence wait on the PipeWire loop thread (PW4: a p99 in the first \
-             bucket means this wait is already free and moving it off-thread buys nothing)"
-        );
     }
 }
 
@@ -443,7 +459,7 @@ fn wait_render_fence(ud: &mut UserData, sync: Option<SyncPoints>, plane: Option<
 /// convert. `true` = the frame ends here, published or dropped; `false` = take the CPU de-pad.
 /// A broken frame names its reason: a silent fall-through CPU-touches every frame on a session
 /// that negotiated zero-copy.
-fn try_passthrough(ud: &mut UserData, a: &Arrival) -> bool {
+fn try_passthrough(ud: &mut UserData, a: &mut Arrival) -> bool {
     let (datas, w, h) = (&*a.datas, a.w, a.h);
     let reason = 'passthrough: {
         let Some(fmt) = ud.format else {
@@ -504,10 +520,10 @@ fn try_passthrough(ud: &mut UserData, a: &Arrival) -> bool {
             break 'passthrough PassthroughFallback::DupFailed;
         };
         let Some(hold) = ud.try_defer(a.pw_buf, a.stream) else {
-            // A shortage, not a broken frame: drop it as the import lane does — the slot
-            // keeps its frame, the next arrival takes the hold that comes back. The CPU
+            // A shortage, not a broken frame: drop it as the import lane does — every hold
+            // is with the encoder, the next arrival takes the one that comes back. The CPU
             // copy on this thread starves the requeues that would end the shortage; a
-            // tiled rebuild asks KWin for a new output each time (#1443 never settled).
+            // tiled rebuild asks KWin for a new output each time.
             // Only a pool that can never hold falls through, or nothing would stream.
             if holds_possible(zerocopy_hold_enabled(), ud.pool.live) {
                 ud.held_drops += 1;
@@ -515,7 +531,7 @@ fn try_passthrough(ud: &mut UserData, a: &Arrival) -> bool {
             }
             break 'passthrough PassthroughFallback::NoHold;
         };
-        ud.publish(CapturedFrame {
+        let frame = CapturedFrame {
             provenance: Default::default(),
             width: w as u32,
             height: h as u32,
@@ -535,7 +551,8 @@ fn try_passthrough(ud: &mut UserData, a: &Arrival) -> bool {
             // RGB→NV12 backends blend cursor-as-metadata. Gamescope burns the pointer in;
             // native NV12/P010 has none.
             cursor: ud.cursor.overlay(),
-        });
+        };
+        ud.publish(frame, a.fence.take());
         // Once per geometry, not once: a resize renegotiates the pool, and a stale
         // stride against a new size is a sheared picture.
         static LAST: std::sync::Mutex<(usize, usize, u32, u32)> =
@@ -570,10 +587,10 @@ fn try_passthrough(ud: &mut UserData, a: &Arrival) -> bool {
 
 /// dmabuf + importer: hand the held buffer to the consumer, which imports at its own tick
 /// (`import_held`), so arrivals above the wire rate cost nothing here. A buffer that cannot be
-/// held is dropped while holds are possible at all (the slot already has a held frame) and
+/// held is dropped while holds are possible at all (every hold is with the encoder) and
 /// imported here only when this pool can never hold. `true` = the frame ends here; `false` =
 /// take the CPU de-pad.
-fn try_gpu_hold(ud: &mut UserData, a: &Arrival) -> bool {
+fn try_gpu_hold(ud: &mut UserData, a: &mut Arrival) -> bool {
     let (datas, w, h) = (&*a.datas, a.w, a.h);
     let mut gpu_import_broken = false;
     if ud.signals.has_importer.load(Ordering::Relaxed) {
@@ -599,7 +616,7 @@ fn try_gpu_hold(ud: &mut UserData, a: &Arrival) -> bool {
                 };
                 if let Some(dup) = dup_data_fd(&datas[0]) {
                     if let Some(hold) = ud.try_defer(a.pw_buf, a.stream) {
-                        ud.publish(CapturedFrame {
+                        let frame = CapturedFrame {
                             provenance: Default::default(),
                             width: w as u32,
                             height: h as u32,
@@ -617,7 +634,8 @@ fn try_gpu_hold(ud: &mut UserData, a: &Arrival) -> bool {
                                 rebuild: ud.signals.broken.clone(),
                             }),
                             cursor: ud.cursor.overlay(),
-                        });
+                        };
+                        ud.publish(frame, a.fence.take());
                         return true;
                     }
                     if holds_possible(zerocopy_hold_enabled(), ud.pool.live) {
@@ -625,6 +643,7 @@ fn try_gpu_hold(ud: &mut UserData, a: &Arrival) -> bool {
                         return true;
                     }
                 }
+                wait_here(a.fence.take());
                 let cell = ud.signals.importer.clone();
                 let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(importer) = guard.as_mut() {
@@ -640,7 +659,7 @@ fn try_gpu_hold(ud: &mut UserData, a: &Arrival) -> bool {
                         ud.modifier,
                     ) {
                         ImportOutcome::Frame(devbuf, out_fmt) => {
-                            ud.publish(CapturedFrame {
+                            let frame = CapturedFrame {
                                 provenance: Default::default(),
                                 width: w as u32,
                                 height: h as u32,
@@ -648,7 +667,8 @@ fn try_gpu_hold(ud: &mut UserData, a: &Arrival) -> bool {
                                 format: out_fmt,
                                 payload: FramePayload::Cuda(devbuf),
                                 cursor: ud.cursor.overlay(),
-                            });
+                            };
+                            ud.publish(frame, None);
                             return true;
                         }
                         ImportOutcome::Dropped => return true,
@@ -667,16 +687,18 @@ fn try_gpu_hold(ud: &mut UserData, a: &Arrival) -> bool {
     false
 }
 
-/// The CPU lane: de-pad one packed plane out of the mapped buffer, blit the pointer unless the
-/// host places it, and publish.
+/// The CPU lane: wait the render out, de-pad one packed plane out of the mapped buffer, blit
+/// the pointer unless the host places it, and publish.
 fn cpu_depad(ud: &mut UserData, a: Arrival) {
     let Arrival {
         datas,
         w,
         h,
         pts_ns,
+        fence,
         ..
     } = a;
+    wait_here(fence);
     let d = &mut datas[0];
     // LINEAR dmabufs also land here (gamescope).
     let data_type = d.type_();
@@ -786,7 +808,7 @@ fn cpu_depad(ud: &mut UserData, a: Arrival) {
         // Already composited into `tight` — nothing for the encoder to blend.
         cursor: None,
     };
-    ud.publish(frame);
+    ud.publish(frame, None);
 }
 
 #[cfg(test)]
