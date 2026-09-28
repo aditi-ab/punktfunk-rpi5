@@ -263,6 +263,8 @@ pub struct KwinFakeInjector {
     last_refresh: Option<Instant>,
     /// Normalized-scroll lowering onto the bare `axis` click channel.
     scroll: ScrollMapper,
+    /// What this device holds, released before it goes ([`Drop`]).
+    held: crate::held::HeldInput,
 }
 
 /// Cap geometry roundtrips at 2 Hz. A roundtrip on every mouse-move would stall the control path.
@@ -301,6 +303,7 @@ impl KwinFakeInjector {
             fake,
             last_refresh: None,
             scroll: ScrollMapper::new(ScrollBackend::Kwin),
+            held: crate::held::HeldInput::default(),
         };
         injector.refresh_geometry();
         tracing::info!(
@@ -365,8 +368,19 @@ impl KwinFakeInjector {
     }
 }
 
+impl Drop for KwinFakeInjector {
+    /// Release what the device still holds before it goes; a key or button KWin keeps
+    /// pressed for a client that vanished is a stuck one.
+    fn drop(&mut self) {
+        for up in self.held.release() {
+            let _ = self.inject(&up);
+        }
+    }
+}
+
 impl InputInjector for KwinFakeInjector {
     fn inject(&mut self, event: &InputEvent) -> Result<()> {
+        self.held.note(event);
         match event.kind {
             InputKind::MouseMove => {
                 self.fake.pointer_motion(event.x as f64, event.y as f64);
