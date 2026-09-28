@@ -147,7 +147,7 @@ pub enum RowId {
 
 /// Rows the tabs list only under Show advanced: their default is right for nearly everyone,
 /// picking a value takes knowing how streaming works, and no first stream needs them.
-pub(crate) fn advanced(id: RowId) -> bool {
+pub fn advanced(id: RowId) -> bool {
     matches!(
         id,
         RowId::SmoothBuffer
@@ -675,6 +675,18 @@ const PAD_TYPES: [(&str, &str); 7] = [
     ("steamdeck", "Steam Deck"),
     ("steamcontroller2", "Steam Controller 2"),
 ];
+/// The pad types `platform` can ask a host for. The TV client maps Xbox 360, Steam Deck and
+/// Steam Controller 2 to Automatic, so its row does not offer them.
+fn pad_types(platform: crate::platform::Platform) -> Vec<(&'static str, &'static str)> {
+    PAD_TYPES
+        .iter()
+        .copied()
+        .filter(|(v, _)| {
+            platform != crate::platform::Platform::WebOS
+                || !matches!(*v, "xbox360" | "steamdeck" | "steamcontroller2")
+        })
+        .collect()
+}
 /// Shared `system_buttons` key. Auto sends to the host except in Gaming Mode,
 /// where Steam on this device would open a second overlay on the same press.
 const SYSTEM_BUTTONS: [(&str, &str); 3] = [
@@ -1423,10 +1435,11 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
         RowId::BackgroundKeepAlive | RowId::BackgroundTimeout => &[Android, Apple],
         // The clients whose overlays place and size the statistics by these keys, and draw the
         // exit hint.
-        RowId::StatsPosition | RowId::StatsSize | RowId::ExitHint => &[Desktop, Android, Apple],
+        RowId::StatsPosition | RowId::StatsSize | RowId::ExitHint => {
+            &[Desktop, Android, Apple, WebOS]
+        }
         // The webOS session never reads these; its TV builds its own session from a few keys.
-        RowId::Compositor
-        | RowId::RenderScale
+        RowId::RenderScale
         | RowId::AudioFormat
         | RowId::KeepHostAudio
         | RowId::Mic
@@ -1540,7 +1553,7 @@ fn fresh_settings(device: &crate::screens::Device) -> pf_client_core::trust::Set
 
 /// The rows of `ids` that show something other than a fresh install would: what
 /// [`RowId::AdvancedChanged`] counts. Compared by the value drawn, so every row kind works alike.
-fn changed(ids: &[RowId], ctx: &Ctx) -> Vec<RowId> {
+pub fn changed(ids: &[RowId], ctx: &Ctx) -> Vec<RowId> {
     let mut fresh = fresh_settings(ctx.device);
     let under = Ctx {
         hosts: ctx.hosts,
@@ -2628,7 +2641,7 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             let cur = keys.iter().position(|c| *c == s.forward_pad);
             step_option(cur, keys.len(), delta, wrap).map(|i| s.forward_pad = keys[i].clone())
         }
-        RowId::PadType => step_str(&PAD_TYPES, &mut s.gamepad, delta, wrap),
+        RowId::PadType => step_str(&pad_types(platform), &mut s.gamepad, delta, wrap),
         RowId::SystemButtons => step_str(&SYSTEM_BUTTONS, &mut s.system_buttons, delta, wrap),
         RowId::GuideGesture => step_str(&GUIDE_GESTURE, &mut s.guide_gesture, delta, wrap),
         RowId::PadHaptics => toggle(&mut s.pad_haptics, delta, wrap),

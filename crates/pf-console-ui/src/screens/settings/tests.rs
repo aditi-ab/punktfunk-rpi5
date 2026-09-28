@@ -1895,3 +1895,29 @@ fn every_extra_row_steps_the_value_it_shows() {
         assert!(ctx.settings.extra.contains_key(key), "{id:?} writes {key}");
     }
 }
+
+/// The TV maps Xbox 360, Steam Deck and Steam Controller 2 to Automatic, so its pad-type row
+/// steps past them.
+#[test]
+fn the_tv_pad_type_row_offers_only_what_it_creates() {
+    let library = crate::library::LibraryShared::default();
+    let tv = crate::screens::Device {
+        platform: crate::platform::Platform::WebOS,
+        tv: true,
+        ..crate::screens::Device::test()
+    };
+    let mut settings = Settings::default();
+    let mut seen = Vec::new();
+    for _ in 0..PAD_TYPES.len() {
+        let mut ctx = Ctx {
+            device: &tv,
+            ..Ctx::test(&mut settings, &library)
+        };
+        adjust(RowId::PadType, 1, true, &mut ctx);
+        seen.push(settings.gamepad.clone());
+    }
+    assert!(seen.iter().any(|v| v == "dualsense"));
+    for gone in ["xbox360", "steamdeck", "steamcontroller2"] {
+        assert!(!seen.iter().any(|v| v == gone), "{gone} offered on the TV");
+    }
+}
