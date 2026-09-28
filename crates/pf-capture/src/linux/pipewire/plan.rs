@@ -501,7 +501,7 @@ pub(in crate::linux) fn gpu_import(
 
 #[cfg(test)]
 mod tests {
-    use super::super::hold::{holds_possible, HOLD_POOL_RESERVE};
+    use super::super::hold::{holds_possible, SHALLOW_POOL};
     use super::{
         consumer_kind, negotiation_plan, passthrough_fallback_action, resolved_capture_arm,
         CaptureArm, ConsumerKind, ImportPolicy, NegotiationInputs, PassthroughFallback,
@@ -583,8 +583,8 @@ mod tests {
             ..nvenc()
         });
         assert!(p.import_policy.yuv444, "4:4:4 must not subsample");
-        assert!(holds_possible(true, HOLD_POOL_RESERVE + 1));
-        assert!(!holds_possible(true, HOLD_POOL_RESERVE));
+        assert!(holds_possible(true, SHALLOW_POOL + 1));
+        assert!(!holds_possible(true, SHALLOW_POOL));
         assert!(!holds_possible(false, 8));
     }
 

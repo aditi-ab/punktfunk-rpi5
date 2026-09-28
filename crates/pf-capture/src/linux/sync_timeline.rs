@@ -78,6 +78,13 @@ const SYNCOBJ_TIMELINE_WAIT: u64 = drm_iowr(0xCA, std::mem::size_of::<SyncobjTim
 const SYNCOBJ_TIMELINE_SIGNAL: u64 = drm_iowr(0xCD, std::mem::size_of::<SyncobjTimelineArray>());
 /// Wait even before the producer attaches a fence at the point; a bare wait is `EINVAL`.
 const WAIT_FOR_SUBMIT: u32 = 1 << 1;
+/// Return once the point has a fence, signalled or not.
+const WAIT_AVAILABLE: u32 = 1 << 2;
+/// A buffer out this long with its release point unsignalled never reached this side. A
+/// delivery takes under a millisecond, but a buffer the producer reclaimed can still be on
+/// its way here, and only the unsignalled point keeps the producer off it: the wait has to
+/// outlast any stall of the loop thread.
+const UNDELIVERED_AFTER: Duration = Duration::from_millis(500);
 /// `spa_meta_sync_timeline.flags`: the producer sets it; clearing it promises the release signal.
 const UNSCHEDULED_RELEASE: u32 = 1 << 0;
 
@@ -100,6 +107,45 @@ pub(super) struct MetaSyncTimeline {
 /// A DRM node whose driver serves the syncobj ioctls. One per stream.
 pub(super) struct SyncDevice {
     node: OwnedFd,
+    ledger: std::sync::Mutex<Ledger>,
+}
+
+/// Per buffer, by its `pw_buffer` address.
+#[derive(Default)]
+struct Ledger {
+    /// The release point last signalled: a point is signalled once.
+    released: std::collections::HashMap<usize, u64>,
+    /// An unsignalled release point on a buffer this side does not hold, and when it was
+    /// first seen there.
+    waiting: std::collections::HashMap<usize, (u64, std::time::Instant)>,
+}
+
+/// What [`release_undelivered`] does with one buffer this side does not hold.
+#[derive(Debug, PartialEq, Eq)]
+enum Undelivered {
+    /// Nothing owed: never sent, already signalled, or the producer reclaims it itself.
+    Settled,
+    /// Owed, and possibly still on its way here.
+    Watch,
+    /// Owed for [`UNDELIVERED_AFTER`]: it was recycled before it arrived.
+    Release,
+}
+
+fn undelivered(
+    (flags, acquire, release): (u32, u64, u64),
+    released: Option<u64>,
+    first_seen: Option<(u64, std::time::Instant)>,
+    now: std::time::Instant,
+) -> Undelivered {
+    if flags & UNSCHEDULED_RELEASE != 0 || release <= acquire || released == Some(release) {
+        return Undelivered::Settled;
+    }
+    match first_seen {
+        Some((point, at)) if point == release && now.duration_since(at) >= UNDELIVERED_AFTER => {
+            Undelivered::Release
+        }
+        _ => Undelivered::Watch,
+    }
 }
 
 impl SyncDevice {
@@ -124,7 +170,10 @@ impl SyncDevice {
             else {
                 continue;
             };
-            let dev = SyncDevice { node: file.into() };
+            let dev = SyncDevice {
+                node: file.into(),
+                ledger: Default::default(),
+            };
             let mut probe = SyncobjCreate {
                 handle: 0,
                 flags: 0,
@@ -177,13 +226,31 @@ impl SyncDevice {
         point: u64,
         timeout: Duration,
     ) -> std::io::Result<WaitOutcome> {
+        self.timeline_wait(fd, point, timeout, WAIT_FOR_SUBMIT)
+    }
+
+    /// Whether the producer has attached its fence at `point`.
+    fn available(&self, fd: RawFd, point: u64) -> bool {
+        matches!(
+            self.timeline_wait(fd, point, Duration::ZERO, WAIT_AVAILABLE),
+            Ok(WaitOutcome::Signaled)
+        )
+    }
+
+    fn timeline_wait(
+        &self,
+        fd: RawFd,
+        point: u64,
+        timeout: Duration,
+        flags: u32,
+    ) -> std::io::Result<WaitOutcome> {
         let handle = self.import(fd)?;
         let mut w = SyncobjTimelineWait {
             handles: std::ptr::from_ref(&handle) as u64,
             points: std::ptr::from_ref(&point) as u64,
             timeout_nsec: monotonic_ns().saturating_add(timeout.as_nanos() as i64),
             count_handles: 1,
-            flags: WAIT_FOR_SUBMIT,
+            flags,
             first_signaled: 0,
             pad: 0,
             deadline_nsec: 0,
@@ -213,6 +280,25 @@ impl SyncDevice {
         let _ = self.destroy(handle);
         res
     }
+
+    /// Signal `buf`'s release point, unless this side already did.
+    fn release(&self, buf: usize, p: &SyncPoints) -> std::io::Result<()> {
+        let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
+        ledger.waiting.remove(&buf);
+        if ledger.released.get(&buf) == Some(&p.release_point) {
+            return Ok(());
+        }
+        self.signal(p.release_fd, p.release_point)?;
+        ledger.released.insert(buf, p.release_point);
+        Ok(())
+    }
+
+    /// `remove_buffer`: the address may name another buffer next.
+    pub(super) fn forget(&self, buf: usize) {
+        let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
+        ledger.released.remove(&buf);
+        ledger.waiting.remove(&buf);
+    }
 }
 
 fn monotonic_ns() -> i64 {
@@ -232,6 +318,7 @@ pub(super) struct SyncPoints {
     pub(super) release_fd: RawFd,
     pub(super) acquire_point: u64,
     pub(super) release_point: u64,
+    flags: u32,
     meta: *mut MetaSyncTimeline,
 }
 
@@ -265,13 +352,14 @@ impl SyncPoints {
             return None;
         }
         // SAFETY: `meta` is non-null and sized above.
-        let (acquire_point, release_point) =
-            unsafe { ((*meta).acquire_point, (*meta).release_point) };
+        let (flags, acquire_point, release_point) =
+            unsafe { ((*meta).flags, (*meta).acquire_point, (*meta).release_point) };
         Some(SyncPoints {
             acquire_fd: acquire.fd as RawFd,
             release_fd: release.fd as RawFd,
             acquire_point,
             release_point,
+            flags,
             meta,
         })
     }
@@ -299,7 +387,7 @@ pub(super) unsafe fn hand_back(
 ) {
     // SAFETY: `buf` is held (caller), so its `spa_buffer` is readable until the queue below.
     if let (Some(dev), Some(p)) = (sync, unsafe { SyncPoints::of((*buf).buffer) }) {
-        match dev.signal(p.release_fd, p.release_point) {
+        match dev.release(buf as usize, &p) {
             // SAFETY: still held.
             Ok(()) => unsafe { p.promise_release() },
             Err(e) => {
@@ -316,6 +404,56 @@ pub(super) unsafe fn hand_back(
     }
     // SAFETY: the caller's contract is `pw_stream_queue_buffer`'s.
     let _ = unsafe { pw::sys::pw_stream_queue_buffer(stream, buf) };
+}
+
+/// Signal the release point of each pool buffer that never reached this side. Returns how
+/// many.
+///
+/// PipeWire recycles a buffer its consumer did not dequeue in time. A producer that leaves
+/// `UNSCHEDULED_RELEASE` clear cannot tell, waits on that release point for good, and its
+/// pool is one buffer short from then on. A point is signalled only behind its acquire
+/// point, so a buffer the producer is painting is left alone.
+///
+/// # Safety
+/// Loop thread; every buffer in `pool` is a live buffer of the stream.
+pub(super) unsafe fn release_undelivered(
+    dev: &SyncDevice,
+    pool: &[usize],
+    held: impl Fn(usize) -> bool,
+) -> usize {
+    let now = std::time::Instant::now();
+    let mut n = 0;
+    for &buf in pool.iter().filter(|&&b| !held(b)) {
+        // SAFETY: `buf` is a live `pw_buffer` (caller). The producer may be writing the
+        // meta; `undelivered` takes a torn pair for settled.
+        let Some(p) = (unsafe { SyncPoints::of((*(buf as *mut pw::sys::pw_buffer)).buffer) })
+        else {
+            continue;
+        };
+        let (released, seen) = {
+            let ledger = dev.ledger.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                ledger.released.get(&buf).copied(),
+                ledger.waiting.get(&buf).copied(),
+            )
+        };
+        let points = (p.flags, p.acquire_point, p.release_point);
+        match undelivered(points, released, seen, now) {
+            Undelivered::Settled => {}
+            Undelivered::Watch => {
+                if seen.is_none_or(|(point, _)| point != p.release_point) {
+                    let mut ledger = dev.ledger.lock().unwrap_or_else(|e| e.into_inner());
+                    ledger.waiting.insert(buf, (p.release_point, now));
+                }
+            }
+            Undelivered::Release => {
+                if dev.available(p.acquire_fd, p.acquire_point) && dev.release(buf, &p).is_ok() {
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
 }
 
 /// The buffer's datas; empty for a null array.
@@ -384,6 +522,42 @@ mod tests {
         assert_eq!(
             offset_of!(MetaSyncTimeline, release_point),
             offset_of!(Spa, release_point)
+        );
+    }
+
+    /// A buffer on its way here looks the same as one that was recycled; only time tells.
+    #[test]
+    fn a_release_point_is_owed_only_after_it_stayed_unsignalled() {
+        let t0 = std::time::Instant::now();
+        let late = t0 + UNDELIVERED_AFTER;
+        assert_eq!(undelivered((0, 0, 0), None, None, t0), Undelivered::Settled);
+        assert_eq!(undelivered((0, 1, 2), None, None, t0), Undelivered::Watch);
+        assert_eq!(
+            undelivered((0, 1, 2), None, Some((2, t0)), t0),
+            Undelivered::Watch
+        );
+        assert_eq!(
+            undelivered((0, 1, 2), None, Some((2, t0)), late),
+            Undelivered::Release
+        );
+        assert_eq!(
+            undelivered((0, 3, 4), Some(2), Some((2, t0)), late),
+            Undelivered::Watch,
+            "a newer point starts its own wait"
+        );
+        assert_eq!(
+            undelivered((0, 1, 2), Some(2), Some((2, t0)), late),
+            Undelivered::Settled
+        );
+        assert_eq!(
+            undelivered((UNSCHEDULED_RELEASE, 1, 2), None, Some((2, t0)), late),
+            Undelivered::Settled,
+            "this producer reclaims the buffer itself"
+        );
+        assert_eq!(
+            undelivered((0, 3, 2), None, Some((2, t0)), late),
+            Undelivered::Settled,
+            "a pair read while the producer wrote it"
         );
     }
 

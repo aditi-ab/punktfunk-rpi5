@@ -1,9 +1,8 @@
 //! Deferred requeue: a published buffer stays out of the producer's pool until encode lets
-//! go of it, within a budget that leaves the producer [`HOLD_POOL_RESERVE`] buffers.
+//! go of it. The whole pool may be out: the producer then has nothing to paint and skips.
 
 use super::UserData;
-use crate::linux::sync_timeline::{hand_back, SyncDevice};
-use crate::{CapturedFrame, DmabufFrame, FramePayload};
+use crate::linux::sync_timeline::{hand_back, release_undelivered, SyncDevice};
 use pipewire as pw;
 use std::sync::atomic::Ordering;
 
@@ -13,7 +12,8 @@ impl UserData {
     /// encode still reads it, so no lane publishes a raw frame under `None`: a transient
     /// shortage drops the arrival, a pool that can never hold (`holds_possible` false) takes
     /// the lane's own fallback.
-    /// Every hold out with an untaken frame in the slot: that frame gives its hold to this one.
+    /// No queued frame is given up for an arrival: the oldest render out is the next to
+    /// finish, and a producer behind a full GPU queue would never see one through.
     /// A buffer the book already lists was re-sent by the producer: no hold, and the capture is
     /// flagged for a rebuild.
     pub(super) fn try_defer(
@@ -43,20 +43,15 @@ impl UserData {
             );
         }
         let pool_live = self.pool.live;
-        let mut generation = self.defer.book.lock().ok()?.try_hold(buf, pool_live);
-        if generation.is_none() && self.release_unconsumed(stream) {
-            generation = self.defer.book.lock().ok()?.try_hold(buf, pool_live);
-        }
-        let Some(generation) = generation else {
+        let Some(generation) = self.defer.book.lock().ok()?.try_hold(buf, pool_live) else {
             if !self.defer.logged_shallow.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
                     pool_depth = pool_live,
-                    reserve = HOLD_POOL_RESERVE,
                     holds_possible = holds_possible(true, pool_live),
-                    "zero-copy: the producer's buffer pool cannot spare a buffer to hold across \
-                     the encode — while holds are possible at all this arrival is dropped and \
-                     the slot keeps its frame (held_drops= on the provenance line); a pool that \
-                     can never hold takes the CPU copy instead"
+                    "zero-copy: the producer's buffer pool cannot lend a buffer across the \
+                     encode — while holds are possible at all this arrival is dropped \
+                     (held_drops= on the provenance line); a pool that can never hold takes \
+                     the CPU copy instead"
                 );
             }
             return None;
@@ -64,7 +59,6 @@ impl UserData {
         if !self.defer.logged_active.swap(true, Ordering::Relaxed) {
             tracing::info!(
                 pool_depth = pool_live,
-                reserve = HOLD_POOL_RESERVE,
                 "zero-copy: withholding each published buffer from the producer until the \
                  encoder releases it (deferred requeue — the producer can no longer rewrite a \
                  frame mid-encode); PUNKTFUNK_ZEROCOPY_HOLD=0 restores the immediate requeue"
@@ -75,42 +69,6 @@ impl UserData {
             buf,
             generation,
         }))
-    }
-
-    /// Requeue the buffer under the slot's untaken held frame now. `publish` would replace that
-    /// frame anyway, but its hold returns only when the loop services the release, too late for
-    /// the arrival that needs it. `true` ⇒ one hold came back.
-    fn release_unconsumed(&self, stream: *mut pw::sys::pw_stream) -> bool {
-        // Out of the slot before the requeue, so the consumer can never take it after.
-        let (stale, buf, generation) = {
-            let Ok(mut slot) = self.slot.lock() else {
-                return false;
-            };
-            let Some(CapturedFrame {
-                payload:
-                    FramePayload::Dmabuf(DmabufFrame {
-                        hold: Some(hold), ..
-                    }),
-                ..
-            }) = &*slot
-            else {
-                return false;
-            };
-            let Some(held) = hold.downcast_ref::<BufferHold>() else {
-                return false;
-            };
-            if std::sync::Arc::strong_count(hold) != 1 {
-                return false;
-            }
-            let (buf, generation) = (held.buf, held.generation);
-            (slot.take(), buf, generation)
-        };
-        // SAFETY: `stream` is the stream whose `.process` is running on this loop thread. The
-        // frame left the slot above and its hold is unique, so nothing reads the buffer after.
-        let requeued = unsafe { self.defer.release(stream, buf, generation) };
-        // Its hold's late release finds the book already completed and no-ops.
-        drop(stale);
-        requeued
     }
 
     /// Requeue a buffer this `.process` publishes nothing from. One the book still lists was
@@ -147,7 +105,7 @@ impl UserData {
 ///
 /// `live` comes from `add_buffer`/`remove_buffer` on the loop thread. There is no "pool
 /// complete" event, so the count is published from `.process` (first dequeue ⇒ allocation
-/// finished). Depth is the budget [`HoldBook::try_hold`] spends; a pool of ≤ [`HOLD_POOL_RESERVE`]
+/// finished). Depth is the budget [`HoldBook::try_hold`] spends; a pool of ≤ [`SHALLOW_POOL`]
 /// cannot defer and the producer may rewrite a buffer mid-encode.
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct PoolCensus {
@@ -177,15 +135,19 @@ impl PoolCensus {
     }
 }
 
-/// Holds exist for this pool: two stay with the producer, the rest may sit in the slot or under
-/// the consumer's import. False means the arrival path imports itself.
+/// Holds exist for this pool: its buffers may wait in the queue or under the consumer's
+/// import. False means the arrival path imports itself.
 pub(super) fn holds_possible(hold_enabled: bool, pool_live: u32) -> bool {
-    hold_enabled && pool_live > HOLD_POOL_RESERVE
+    hold_enabled && pool_live > SHALLOW_POOL
 }
 
-/// Buffers left in the producer's pool: one it is rendering, one in transit. The remaining
-/// pool is the consumer hold budget (host frame, capture slot, and pipelined encoder sources).
-pub(super) const HOLD_POOL_RESERVE: u32 = 2;
+/// A pool this shallow lends nothing: the host's frame and one render out would be all of it,
+/// and the producer could paint only once encode let go.
+///
+/// A deeper pool lends every buffer. One is the host's frame; a producer behind a full GPU
+/// queue has two or three renders out at any frame rate, and a pool of 4 holds no more. With
+/// the whole pool out the producer skips a frame, which costs what dropping one here would.
+pub(super) const SHALLOW_POOL: u32 = 2;
 
 /// Pool the raw lane asks for: four encoder holds, the host frame, the capture slot, and two
 /// buffers reserved for the producer. A producer capped below this spends only the holds it
@@ -227,11 +189,15 @@ pub(super) struct HoldBook {
 }
 
 impl HoldBook {
-    /// Withhold `buf` if the pool can spare it (`pool_live - HOLD_POOL_RESERVE` out at once).
+    /// Withhold `buf` unless the pool is too shallow to lend ([`SHALLOW_POOL`]) or is all out.
     /// A buffer already out was re-sent by the producer: the new generation takes over its
     /// requeue, and the stale hold's [`complete`](Self::complete) no longer matches.
     fn try_hold(&mut self, buf: usize, pool_live: u32) -> Option<u64> {
-        let cap = pool_live.saturating_sub(HOLD_POOL_RESERVE) as usize;
+        let cap = if pool_live > SHALLOW_POOL {
+            pool_live as usize
+        } else {
+            0
+        };
         if !self.out.contains_key(&buf) && self.out.len() >= cap {
             return None;
         }
@@ -268,8 +234,7 @@ pub(super) struct DeferredRequeue {
     /// Releases dropped on any thread, `(buffer, generation)`, until the loop thread requeues
     /// them: the wake callback does, and so does `try_defer` before it gives an arrival up.
     /// The book alone would count a hold the encoder already let go until the loop got round
-    /// to the wake — on a pool of 4 that is the second and last hold, and the arrival that
-    /// finds it still out pays the full-frame CPU copy.
+    /// to the wake, and the arrival that finds it still out is lost.
     pub(super) pending: std::sync::Mutex<Vec<(usize, u64)>>,
     /// Wakes the loop to drain `pending`. Send failure = the loop is gone.
     pub(super) wake: pw::channel::Sender<()>,
@@ -277,39 +242,44 @@ pub(super) struct DeferredRequeue {
     pub(super) logged_shallow: std::sync::atomic::AtomicBool,
     /// Signals a buffer's release point as it rejoins; `None` without explicit sync.
     pub(super) sync: Option<std::sync::Arc<SyncDevice>>,
+    /// Every buffer of the pool, from `add_buffer` to `remove_buffer`.
+    pub(super) pool: std::sync::Mutex<Vec<usize>>,
+    /// Buffers [`release_undelivered`] gave back to the producer.
+    pub(super) undelivered: std::sync::atomic::AtomicU64,
 }
 
 impl DeferredRequeue {
-    /// Return `buf` to the producer iff `generation` still owns it. `true` ⇒ requeued.
-    /// [`HoldBook::complete`] no-ops a renegotiated-away (or reused) address, so a stale hold
-    /// can never queue somebody else's buffer.
+    /// Give the producer back every buffer it sent that never arrived here.
     ///
     /// # Safety
-    /// Loop thread only, and `stream` is the live stream whose buffers this book tracks.
-    unsafe fn release(&self, stream: *mut pw::sys::pw_stream, buf: usize, generation: u64) -> bool {
-        let requeue = self
-            .book
-            .lock()
-            .map(|mut b| b.complete(buf, generation))
-            .unwrap_or(false);
-        if requeue {
-            // SAFETY: `complete` returned true ⇒ this buffer was withheld by exactly this hold
-            // and no `remove_buffer` has freed it since (that purges the book), so the pointer
-            // is a live buffer of `stream` that we own (dequeued, never requeued). The caller
-            // guarantees `stream` is live and that we are on its loop thread.
-            unsafe { hand_back(self.sync.as_deref(), stream, buf as *mut pw::sys::pw_buffer) };
+    /// Loop thread, outside `.process`: every buffer this side dequeued is then in the book
+    /// or handed back.
+    pub(super) unsafe fn recover_undelivered(&self) {
+        let Some(dev) = &self.sync else { return };
+        let (Ok(pool), Ok(book)) = (self.pool.lock(), self.book.lock()) else {
+            return;
+        };
+        // SAFETY: `pool` lists live buffers only (`remove_buffer` takes them out).
+        let n = unsafe { release_undelivered(dev, &pool, |buf| book.contains(buf)) };
+        if n > 0 && self.undelivered.fetch_add(n as u64, Ordering::Relaxed) == 0 {
+            tracing::info!(
+                buffers = n,
+                "explicit sync: the producer sent buffers that never arrived and does not \
+                 reclaim them itself — their release points are signalled here \
+                 (undelivered= on the provenance line)"
+            );
         }
-        requeue
     }
 
     /// Requeue every release parked since the last drain. Returns how many buffers rejoined.
     ///
     /// # Safety
-    /// As [`release`](Self::release).
+    /// Loop thread only, and `stream` is the live stream whose buffers this book tracks.
     pub(super) unsafe fn drain(&self, stream: *mut pw::sys::pw_stream) -> usize {
         self.drain_with(|buf| {
             // SAFETY: `drain_with` hands over only buffers the book still listed under the
-            // dropping hold's generation (see `release`); the caller's contract is `release`'s.
+            // dropping hold's generation, and `remove_buffer` purges the book: `buf` is a
+            // live buffer of `stream` this side dequeued and never requeued.
             unsafe { hand_back(self.sync.as_deref(), stream, buf as *mut pw::sys::pw_buffer) };
         })
     }
@@ -357,15 +327,15 @@ impl Drop for BufferHold {
 
 #[cfg(test)]
 mod tests {
-    use super::{HoldBook, PoolCensus, HOLD_POOL_RESERVE};
+    use super::{HoldBook, PoolCensus, SHALLOW_POOL};
 
     /// A re-sent buffer is re-held: the stale generation no longer requeues, the new one does,
     /// and the pool stays whole.
     #[test]
     fn a_resent_buffer_is_reheld_under_a_new_generation() {
         let mut book = HoldBook::default();
-        let old = book.try_hold(0x10, HOLD_POOL_RESERVE + 2).unwrap();
-        let new = book.try_hold(0x10, HOLD_POOL_RESERVE + 2).unwrap();
+        let old = book.try_hold(0x10, SHALLOW_POOL + 2).unwrap();
+        let new = book.try_hold(0x10, SHALLOW_POOL + 2).unwrap();
         assert!(new > old);
         assert_eq!(book.out.len(), 1);
         assert!(!book.complete(0x10, old));
@@ -418,52 +388,38 @@ mod tests {
         assert_eq!(p.high_water, 0);
     }
 
-    /// The book must always leave [`HOLD_POOL_RESERVE`] buffers with the producer: an 8-pool
-    /// spares 6, and the pools at or below the reserve spare NOTHING — those sessions must fall
-    /// back to the immediate requeue rather than starve the compositor of render targets.
+    /// A pool lends every buffer it has, and a shallow one none: those sessions fall back
+    /// to the immediate requeue.
     #[test]
-    fn hold_book_spends_at_most_pool_minus_reserve() {
+    fn hold_book_lends_the_whole_pool_or_nothing() {
         let mut b = HoldBook::default();
-        for i in 0..6 {
-            assert!(
-                b.try_hold(0x1000 + i, 8).is_some(),
-                "hold {i} within budget"
-            );
+        for i in 0..8 {
+            assert!(b.try_hold(0x1000 + i, 8).is_some(), "hold {i} of 8");
         }
+        assert!(b.try_hold(0x2000, 8).is_none(), "the pool has no ninth");
         assert!(
-            b.try_hold(0x2000, 8).is_none(),
-            "7th of 8 exceeds the budget"
+            HoldBook::default().try_hold(0x1000, SHALLOW_POOL).is_none(),
+            "a shallow pool lends nothing"
         );
-        assert!(
-            HoldBook::default()
-                .try_hold(0x1000, HOLD_POOL_RESERVE)
-                .is_none(),
-            "a pool of exactly the reserve cannot spare a buffer"
-        );
-        assert!(
-            HoldBook::default()
-                .try_hold(0x1000, HOLD_POOL_RESERVE + 1)
-                .is_some(),
-            "one past the reserve spares exactly one"
-        );
+        assert!(HoldBook::default()
+            .try_hold(0x1000, SHALLOW_POOL + 1)
+            .is_some());
     }
 
-    /// KWin's pool of 4 spares two holds: the host's frame and the slot's. The arrival fits only
-    /// once the slot's untaken frame is released in `.process`, and the late release it sends
-    /// afterwards must not requeue the buffer a second time.
+    /// KWin's pool of 4: the host's frame and three renders out. A release gives exactly one
+    /// hold back, and its late duplicate must not requeue the buffer a second time.
     #[test]
-    fn a_released_slot_hold_admits_the_arrival_on_a_kwin_pool() {
+    fn a_kwin_pool_lends_all_four() {
         let pool = crate::KWIN_POOL_MAX as u32;
         let mut b = HoldBook::default();
         assert!(b.try_hold(0x1000, pool).is_some(), "the host's frame");
-        let slot = b.try_hold(0x2000, pool).expect("the slot's frame");
-        assert!(b.try_hold(0x3000, pool).is_none(), "both holds are out");
-        assert!(
-            b.complete(0x2000, slot),
-            "the untaken frame gives its hold back"
-        );
-        assert!(b.try_hold(0x3000, pool).is_some(), "the arrival now holds");
-        assert!(!b.complete(0x2000, slot), "the late release no-ops");
+        let oldest = b.try_hold(0x2000, pool).expect("a render still out");
+        assert!(b.try_hold(0x3000, pool).is_some(), "a second");
+        assert!(b.try_hold(0x4000, pool).is_some(), "a third");
+        assert!(b.try_hold(0x5000, pool).is_none(), "the pool is all out");
+        assert!(b.complete(0x2000, oldest));
+        assert!(b.try_hold(0x5000, pool).is_some());
+        assert!(!b.complete(0x2000, oldest), "the late release no-ops");
     }
 
     /// The raw lane deepens the ask to 6 unless the producer caps lower; KWin fails negotiation
@@ -523,23 +479,19 @@ mod tests {
     #[test]
     fn hold_book_rehold_spends_no_second_slot() {
         let mut b = HoldBook::default();
-        b.try_hold(0x1000, HOLD_POOL_RESERVE + 1).unwrap();
-        assert!(
-            b.try_hold(0x2000, HOLD_POOL_RESERVE + 1).is_none(),
-            "cap is one"
-        );
-        assert!(
-            b.try_hold(0x1000, HOLD_POOL_RESERVE + 1).is_some(),
-            "re-hold within cap"
-        );
-        assert_eq!(b.out.len(), 1);
+        let pool = SHALLOW_POOL + 1;
+        for buf in 0..pool as usize {
+            b.try_hold(0x1000 + buf, pool).unwrap();
+        }
+        assert!(b.try_hold(0x2000, pool).is_none(), "the pool is all out");
+        assert!(b.try_hold(0x1000, pool).is_some(), "re-hold within cap");
+        assert_eq!(b.out.len(), pool as usize);
     }
 
-    /// KWin's pool of 4: the host's frame and the one it just replaced are both out, the
-    /// replaced one's hold already dropped on the encode thread. Before the loop services that
-    /// wake the book still counts it, and the arrival would take the CPU copy. `try_defer`
-    /// drains the parked release first, so the arrival holds — and the wake callback that runs
-    /// later finds nothing left to requeue.
+    /// KWin's pool of 4 with every hold out, one of them already dropped on the encode
+    /// thread. Before the loop services that wake the book still counts it, and the arrival
+    /// would be dropped. `try_defer` drains the parked release first, so the arrival holds —
+    /// and the wake callback that runs later finds nothing left to requeue.
     #[test]
     fn an_arrival_drains_a_release_the_loop_has_not_serviced() {
         use super::{BufferHold, DeferredRequeue};
@@ -552,6 +504,8 @@ mod tests {
             logged_active: std::sync::atomic::AtomicBool::new(false),
             logged_shallow: std::sync::atomic::AtomicBool::new(false),
             sync: None,
+            pool: Default::default(),
+            undelivered: Default::default(),
         });
         let hold = |buf: usize| {
             let generation = defer.book.lock().unwrap().try_hold(buf, pool).unwrap();
@@ -563,6 +517,7 @@ mod tests {
         };
         let replaced = hold(0x1000);
         let _current = hold(0x2000);
+        let _queued = (hold(0x2800), hold(0x2900));
         drop(replaced); // the encode thread let it go; the loop has not run its wake yet
         assert!(
             defer.book.lock().unwrap().try_hold(0x3000, pool).is_none(),

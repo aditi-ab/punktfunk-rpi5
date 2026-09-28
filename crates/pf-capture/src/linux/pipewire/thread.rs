@@ -1,6 +1,6 @@
 //! The PipeWire loop thread: connect, offer, negotiate, then run `.process` until quit.
 
-use super::consume::{consume_frame, realtime_minus_monotonic_ns, FenceWaitStats};
+use super::consume::{consume_frame, realtime_minus_monotonic_ns};
 use super::hold::{pool_ask, DeferredRequeue, HoldBook, PoolCensus};
 use super::offers::{hdr_modifier_offers, offer_pacing, packed_modifier_offers, probe_producer};
 use super::pacer::{wire_interval, Pacer, RawTimer, RequestListener, HEARTBEAT};
@@ -10,10 +10,10 @@ use super::plan::{
 use super::{map_format, UserData};
 use crate::linux::pw_cursor::{update_cursor_meta, CursorState};
 use crate::linux::pw_pods::{
-    build_cursor_meta_param, build_default_format_obj, build_dmabuf_buffers, build_dmabuf_format,
-    build_hdr_dmabuf_format, build_header_meta_param, build_mappable_buffers,
-    build_shm_only_buffers, build_sync_timeline_meta_param, serialize_pod, video_raw, Extent,
-    Pacing, HDR_FORMAT_ORDER,
+    build_cursor_meta_param, build_damage_meta_param, build_default_format_obj,
+    build_dmabuf_buffers, build_dmabuf_format, build_hdr_dmabuf_format, build_header_meta_param,
+    build_mappable_buffers, build_shm_only_buffers, build_sync_timeline_meta_param, serialize_pod,
+    video_raw, Extent, Pacing, HDR_FORMAT_ORDER,
 };
 use crate::linux::sync_timeline::{hand_back, SyncDevice};
 use crate::linux::{CaptureOpts, CaptureSignals};
@@ -28,14 +28,18 @@ use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::SyncSender;
 
+/// How often the loop looks for buffers that never arrived. A lost one costs the producer a
+/// pool slot until then, not a frame.
+const UNDELIVERED_SWEEP: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// The PipeWire loop thread for one capture session: connects, resolves the [`Offer`],
 /// negotiates, and runs `.process` until `quit_rx`, `broken`, or disconnect.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::linux) fn pipewire_thread(
     fd: Option<OwnedFd>,
     node_id: u32,
-    // One-deep mailbox: publish overwrites, so a stalled consumer loses intermediates, never the latest.
-    slot: crate::linux::FrameSlot,
+    // Arrivals awaiting their renders. A consumer that falls behind loses the oldest.
+    queue: super::FrameQueue,
     wake: SyncSender<()>,
     signals: CaptureSignals,
     // Zero-copy decision, resolved once by `spawn_pipewire` — never re-derived here.
@@ -109,6 +113,8 @@ pub(in crate::linux) fn pipewire_thread(
         logged_active: std::sync::atomic::AtomicBool::new(false),
         logged_shallow: std::sync::atomic::AtomicBool::new(false),
         sync: sync.clone(),
+        pool: Default::default(),
+        undelivered: Default::default(),
     });
 
     // The heartbeat timer reads `driving` after `signals` moves into the listener's state.
@@ -132,7 +138,7 @@ pub(in crate::linux) fn pipewire_thread(
         info: VideoInfoRaw::default(),
         format: None,
         modifier: 0,
-        slot,
+        queue,
         wake,
         signals,
         vaapi_passthrough: plan.vaapi_passthrough,
@@ -145,7 +151,6 @@ pub(in crate::linux) fn pipewire_thread(
         pts_reported: std::time::Instant::now(),
         rt_minus_mono_ns: realtime_minus_monotonic_ns(),
         hdr_pts_enabled: pf_host_config::env_on("PUNKTFUNK_CAPTURE_HDR_PTS").unwrap_or(true),
-        fence_wait: FenceWaitStats::default(),
         pool: PoolCensus::default(),
         passthrough_fallbacks: PassthroughFallbacks::default(),
         cursor: CursorState::new(opts.cursor_id0_hides),
@@ -159,6 +164,8 @@ pub(in crate::linux) fn pipewire_thread(
         defer: defer.clone(),
         pacer: pacer.clone(),
         held_drops: 0,
+        damage: DamageGate::new(wire_interval(preferred)),
+        undamaged: 0,
         sync: sync.clone(),
     };
 
@@ -189,9 +196,20 @@ pub(in crate::linux) fn pipewire_thread(
         // Pool census. `remove_buffer` also purges the deferred-requeue book: the buffer is
         // being freed under any hold, so that hold's later release must be a no-op (generation
         // in `HoldBook::complete` also covers the address being reused by a new pool).
-        .add_buffer(|_stream, ud, _buf| ud.pool.add())
+        .add_buffer(|_stream, ud, buf| {
+            ud.pool.add();
+            if let Ok(mut pool) = ud.defer.pool.lock() {
+                pool.push(buf as usize);
+            }
+        })
         .remove_buffer(|_stream, ud, buf| {
             ud.pool.remove();
+            if let Ok(mut pool) = ud.defer.pool.lock() {
+                pool.retain(|&b| b != buf as usize);
+            }
+            if let Some(dev) = &ud.sync {
+                dev.forget(buf as usize);
+            }
             if let Ok(mut book) = ud.defer.book.lock() {
                 book.purge(buf as usize);
             }
@@ -209,6 +227,18 @@ pub(in crate::linux) fn pipewire_thread(
         // (declared after it, dropped before it), and the loop stops dispatching once `run()`
         // returns.
         unsafe { defer_cb.drain(stream_ptr as *mut pw::sys::pw_stream) };
+    });
+    // On a timer, not from `.process`: a producer whose whole pool went undelivered sends
+    // nothing more, and `.process` never runs again.
+    let _undelivered = sync.is_some().then(|| {
+        let defer = defer.clone();
+        // SAFETY: the loop thread dispatches this between callbacks, and the pool lists only
+        // buffers the stream still has.
+        let timer = mainloop
+            .loop_()
+            .add_timer(move |_| unsafe { defer.recover_undelivered() });
+        let _ = timer.update_timer(Some(UNDELIVERED_SWEEP), Some(UNDELIVERED_SWEEP));
+        timer
     });
 
     // `PUNKTFUNK_PW_FIXED_POD="WxH"`: one fixed format, to bisect against a producer's EnumFormat.
@@ -590,9 +620,11 @@ fn build_params(
         params.push(build_sync_timeline_meta_param()?);
     }
     // Any meta listed here narrows the producer's set to the intersection, so the header
-    // rides along with the first one; a producer left unlisted keeps its whole set.
+    // and the damage ride along with the first one; a producer left unlisted keeps its
+    // whole set.
     if cursor_meta || sync {
         params.push(build_header_meta_param()?);
+        params.push(build_damage_meta_param()?);
     }
     Ok(params)
 }
@@ -702,7 +734,7 @@ fn on_process(stream: &pw::stream::Stream, ud: &mut UserData) {
     };
     // Producer's actual pool depth, once per distinct value. `build_dmabuf_buffers`
     // asks for a range; the producer picks. Depth is the deferred-requeue budget:
-    // ≤ HOLD_POOL_RESERVE cannot defer, and a requeued buffer may be rewritten mid-encode.
+    // ≤ SHALLOW_POOL cannot defer, and a requeued buffer may be rewritten mid-encode.
     if let Some(depth) = ud.pool.note_frame() {
         tracing::info!(
             pool_depth = depth,
@@ -754,6 +786,12 @@ fn on_process(stream: &pw::stream::Stream, ud: &mut UserData) {
             return;
         }
 
+        // SAFETY: `spa_buf` is the `spa_buffer` of `newest`, still held.
+        let damage = unsafe { damaged_area(spa_buf) };
+        if !ud.damage.is_new_picture(damage, std::time::Instant::now()) {
+            ud.undamaged += 1;
+            return;
+        }
         if let Some(p) = &ud.pacer {
             p.on_paint();
         }
@@ -784,6 +822,72 @@ fn on_process(stream: &pw::stream::Stream, ud: &mut UserData) {
                 "panic in pipewire process callback — frame dropped"
             );
         }
+    }
+}
+
+/// Which arrivals are pictures, by the damage the producer reports.
+///
+/// KWin records on every repaint it schedules, and one comes ahead of each frame a browser
+/// draws: that record repaints nothing and shows the picture before. Encoded, it is a repeat
+/// in the stream and costs the new picture its slot.
+pub(super) struct DamageGate {
+    /// This producer has reported damage: only then does "none" mean none.
+    reports: bool,
+    last_picture: Option<std::time::Instant>,
+    /// One and a half stream intervals. Past it the host repeats its picture anyway, so an
+    /// arrival is taken whatever its damage says: damage reported wrongly costs a third of
+    /// the rate, not the stream.
+    within: std::time::Duration,
+}
+
+impl DamageGate {
+    pub(super) fn new(interval: std::time::Duration) -> DamageGate {
+        DamageGate {
+            reports: false,
+            last_picture: None,
+            within: interval * 3 / 2,
+        }
+    }
+
+    /// `damage` is [`damaged_area`]'s. `false`: the arrival repeats the picture before.
+    fn is_new_picture(&mut self, damage: Option<u64>, now: std::time::Instant) -> bool {
+        let recent = self
+            .last_picture
+            .is_some_and(|t| now.duration_since(t) < self.within);
+        if damage == Some(0) && self.reports && recent {
+            return false;
+        }
+        self.reports |= damage.is_some_and(|a| a > 0);
+        self.last_picture = Some(now);
+        true
+    }
+}
+
+/// Pixels the producer repainted in this buffer, by its `SPA_META_VideoDamage` regions.
+/// `None`: the buffer carries none, and the producer does not say.
+///
+/// # Safety
+/// `spa_buf` is the `spa_buffer` of a buffer this `.process` still holds.
+unsafe fn damaged_area(spa_buf: *mut spa::sys::spa_buffer) -> Option<u64> {
+    // SAFETY: the caller holds the buffer. `find_meta` yields the region's real size, which
+    // bounds every read below; the producer need not align its regions.
+    unsafe {
+        let meta = spa::sys::spa_buffer_find_meta(spa_buf, spa::sys::SPA_META_VideoDamage);
+        if meta.is_null() || (*meta).data.is_null() {
+            return None;
+        }
+        let regions = (*meta).data as *const spa::sys::spa_meta_region;
+        let count = (*meta).size as usize / std::mem::size_of::<spa::sys::spa_meta_region>();
+        let mut area = 0u64;
+        for i in 0..count {
+            let size = regions.add(i).read_unaligned().region.size;
+            // The list ends at the first region of no size.
+            if size.width == 0 || size.height == 0 {
+                break;
+            }
+            area += u64::from(size.width) * u64::from(size.height);
+        }
+        Some(area)
     }
 }
 
@@ -1006,6 +1110,33 @@ mod tests {
     use pipewire::spa::param::ParamType;
     use pipewire::spa::pod::{deserialize::PodDeserializer, Value};
 
+    /// A producer that fills in no damage loses no frame, and one that reports none for a
+    /// scene that changed still streams, at two pictures in three.
+    #[test]
+    fn only_reported_damage_gates_an_arrival() {
+        use super::DamageGate;
+        let t = std::time::Instant::now();
+        let ms = std::time::Duration::from_millis;
+        let mut gate = DamageGate::new(ms(16));
+        assert!(gate.is_new_picture(Some(0), t), "the first picture");
+        assert!(
+            gate.is_new_picture(Some(0), t + ms(8)),
+            "it may never report any"
+        );
+        assert!(gate.is_new_picture(None, t + ms(16)));
+        assert!(gate.is_new_picture(Some(64), t + ms(24)));
+        assert!(
+            !gate.is_new_picture(Some(0), t + ms(38)),
+            "a record of the unchanged scene, ahead of the next frame"
+        );
+        assert!(gate.is_new_picture(Some(64), t + ms(40)));
+        assert!(!gate.is_new_picture(Some(0), t + ms(56)));
+        assert!(
+            gate.is_new_picture(Some(0), t + ms(64)),
+            "the host would repeat its picture by now"
+        );
+    }
+
     /// Each param's id (EnumFormat, Buffers, Meta), in connect order.
     fn param_ids(params: &[Vec<u8>]) -> Vec<u32> {
         params
@@ -1059,7 +1190,7 @@ mod tests {
     }
 
     /// The format pods lead, the explicit-sync Buffers twin precedes the plain one, and the
-    /// header meta rides behind the metas it joins.
+    /// header and damage metas ride behind the metas they join.
     #[test]
     fn params_go_formats_then_buffers_then_metas() {
         let (format, buffers, meta) = (
@@ -1070,8 +1201,8 @@ mod tests {
         let p = build_params(&dmabuf_offer(), &plan(), &opts(), None, false, true, None).unwrap();
         assert_eq!(
             param_ids(&p),
-            [format, format, buffers, buffers, meta, meta, meta],
-            "BGRx + BGRA, sync twin + plain Buffers, cursor + sync + header metas"
+            [format, format, buffers, buffers, meta, meta, meta, meta],
+            "BGRx + BGRA, sync twin + plain Buffers, cursor + sync + header + damage metas"
         );
         let gamescope = CaptureOpts {
             producer_is_gamescope: true,
@@ -1101,12 +1232,12 @@ mod tests {
             ..opts()
         };
         let p = build_params(&dmabuf_offer(), &plan(), &unpaced, None, false, false, None);
-        assert_eq!(param_ids(&p.unwrap()).len(), 4 + 3);
+        assert_eq!(param_ids(&p.unwrap()).len(), 4 + 4);
         let cpu = Offer {
             want_dmabuf: false,
             ..dmabuf_offer()
         };
         let p = build_params(&cpu, &plan(), &opts(), None, false, false, None).unwrap();
-        assert_eq!(param_ids(&p).len(), 1 + 3);
+        assert_eq!(param_ids(&p).len(), 1 + 4);
     }
 }

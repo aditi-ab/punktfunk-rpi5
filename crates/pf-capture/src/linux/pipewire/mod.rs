@@ -1,27 +1,28 @@
 //! The PipeWire consumer, confined to its own thread (the PW types are `!Send`).
 //!
 //! [`plan`] resolves the zero-copy negotiation, [`offers`] builds the modifier offers,
-//! [`thread`] runs the stream, [`consume`] turns one buffer into a frame, [`hold`] keeps a
-//! published buffer from the producer until encode lets go, and [`pacer`] drives a lazy
-//! producer.
+//! [`thread`] runs the stream, [`consume`] turns one buffer into a frame, [`queue`] keeps the
+//! frames until their renders finish, [`hold`] keeps a published buffer from the producer
+//! until encode lets go, and [`pacer`] drives a lazy producer.
 
 mod consume;
 mod hold;
 mod offers;
 mod pacer;
 mod plan;
+mod queue;
 mod thread;
 
-pub(super) use consume::realtime_minus_monotonic_ns;
+pub(super) use consume::{realtime_minus_monotonic_ns, FenceWaitStats};
 pub(super) use plan::{
     gpu_import, negotiation_plan, ImportOutcome, ImportPolicy, ImportState, NegotiationInputs,
 };
+pub(super) use queue::{wait_ready, FrameQueue, Taken};
 pub(super) use thread::pipewire_thread;
 
 use super::pw_cursor::CursorState;
 use super::sync_timeline::SyncDevice;
 use super::{CapturedFrame, PixelFormat};
-use consume::FenceWaitStats;
 use hold::{DeferredRequeue, PoolCensus};
 use pacer::Pacer;
 use pipewire as pw;
@@ -53,8 +54,8 @@ struct UserData {
     format: Option<PixelFormat>,
     /// DRM modifier for dmabuf import; 0 = LINEAR.
     modifier: u64,
-    /// One-deep mailbox; write only through [`UserData::publish`].
-    slot: super::FrameSlot,
+    /// Arrivals awaiting their renders; write only through [`UserData::publish`].
+    queue: FrameQueue,
     wake: SyncSender<()>,
     signals: super::CaptureSignals,
     /// Raw dmabuf to the encoder instead of a CUDA import (VAAPI).
@@ -74,8 +75,6 @@ struct UserData {
     rt_minus_mono_ns: i64,
     /// `PUNKTFUNK_CAPTURE_HDR_PTS=0` puts the wire back on the delivery stamp unconditionally.
     hdr_pts_enabled: bool,
-    /// Producer-fence wait, measured on this loop thread (a block here delays the next recycle).
-    fence_wait: FenceWaitStats,
     /// Negotiated pool depth from `add_buffer`/`remove_buffer`. Budget for a deeper encode pipeline.
     pool: PoolCensus,
     /// Raw-passthrough frames that fell through to CPU, by reason. Fresh `UserData` per pipeline.
@@ -91,21 +90,24 @@ struct UserData {
     defer: std::sync::Arc<DeferredRequeue>,
     /// Lazy-driver pacing; `None` when the producer keeps the tick.
     pacer: Option<std::rc::Rc<Pacer>>,
-    /// Arrivals dropped because every hold was out (the slot kept an older frame).
+    /// Arrivals dropped because no hold was to be had.
     held_drops: u64,
+    damage: thread::DamageGate,
+    /// Arrivals that repainted nothing and went straight back.
+    undamaged: u64,
     /// Explicit-sync device; `None` when the lane cannot offer it. Whether a buffer carries
     /// sync points is the producer's call at negotiation.
     sync: Option<std::sync::Arc<SyncDevice>>,
 }
 
 impl UserData {
-    /// Latest-wins into [`super::FrameSlot`], then a wakeup edge.
+    /// Queue `frame` behind `fence`, the render its pixels wait on, then a wakeup edge.
     ///
     /// Must not block: this runs inside `.process` and would stall the compositor. A full
-    /// wakeup channel already has a pending edge; the slot is the truth.
-    fn publish(&self, frame: CapturedFrame) {
-        if let Ok(mut slot) = self.slot.lock() {
-            *slot = Some(frame);
+    /// wakeup channel already has a pending edge; the queue is the truth.
+    fn publish(&self, frame: CapturedFrame, fence: Option<queue::RenderFence>) {
+        if let Ok(mut q) = self.queue.lock() {
+            q.push(frame, fence, std::time::Instant::now());
         }
         let _ = self.wake.try_send(());
     }

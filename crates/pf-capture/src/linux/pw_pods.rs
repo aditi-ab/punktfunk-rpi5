@@ -384,6 +384,22 @@ pub(super) fn build_header_meta_param() -> Result<Vec<u8>> {
     )
 }
 
+/// `SPA_META_VideoDamage` on each buffer: the regions the producer repainted, 16 at most.
+pub(super) fn build_damage_meta_param() -> Result<Vec<u8>> {
+    let region = std::mem::size_of::<spa::sys::spa_meta_region>() as i32;
+    meta(
+        spa::sys::SPA_META_VideoDamage,
+        pw::spa::pod::Value::Choice(pw::spa::pod::ChoiceValue::Int(pw::spa::utils::Choice(
+            pw::spa::utils::ChoiceFlags::empty(),
+            pw::spa::utils::ChoiceEnum::Range {
+                default: region * 16,
+                min: region,
+                max: region * 16,
+            },
+        ))),
+    )
+}
+
 /// The producer's `maxFramerate` denominator, off one of its `EnumFormat` pods. KWin 6.8
 /// offers millihertz (`refresh/1000`); 6.7 and older offer whole hertz. `None` without
 /// the property.
