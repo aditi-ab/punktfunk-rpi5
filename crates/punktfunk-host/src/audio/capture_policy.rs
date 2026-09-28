@@ -222,6 +222,45 @@ impl CaptureStats {
         self.paused_us / 1_000
     }
 
+    /// Once [`STATS_EVERY`] has passed since `since`: log the window (with a warning when
+    /// chunks were dropped) and start the next. `device` names the endpoint on a backend
+    /// that picks one; `pauses` stays zero on a backend that never pauses.
+    pub(crate) fn flush_window(&mut self, since: &mut Instant, rate_hz: u32, device: Option<&str>) {
+        if since.elapsed() < STATS_EVERY {
+            return;
+        }
+        let (peak_db, rms_db, delivered_pct) = self.summary(since.elapsed(), rate_hz);
+        let device = device.map(tracing::field::display);
+        if self.dropped_chunks > 0 {
+            tracing::warn!(
+                device,
+                dropped_chunks = self.dropped_chunks,
+                "the audio encode thread could not keep up — captured audio was DROPPED; the \
+                 stream will click and everything after it shifts"
+            );
+        }
+        tracing::info!(
+            device,
+            peak_db = format!("{peak_db:.1}"),
+            rms_db = format!("{rms_db:.1}"),
+            delivered_pct = format!("{delivered_pct:.0}"),
+            // Shape of the `delivered_pct` shortfall: one long hole and three hundred short
+            // ones share a percentage. Buckets under 20/50/100 ms and ≥ 100 ms.
+            gaps = self.gaps,
+            max_gap_ms = self.max_gap_ms(),
+            gap_hist = %self.gap_hist(),
+            missing_ms = self.missing_ms(),
+            // Time the capture was not streaming. `gaps` can't see it.
+            pauses = self.pauses,
+            paused_ms = self.paused_ms(),
+            missed_dequeues = self.missed_dequeues,
+            dropped_chunks = self.dropped_chunks,
+            "desktop audio capture"
+        );
+        *self = CaptureStats::default();
+        *since = Instant::now();
+    }
+
     /// `(peak dBFS, rms dBFS, delivered %)`. Silence is -120 dB, not -inf, so the log stays parseable.
     pub(crate) fn summary(&self, elapsed: Duration, sample_rate: u32) -> (f64, f64, f64) {
         let rms = (self.sumsq / (self.samples as f64).max(1.0)).sqrt();
@@ -456,6 +495,24 @@ impl InfillPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A window logs once it is due, then starts empty.
+    #[test]
+    fn a_capture_window_flushes_once_due() {
+        let mut s = CaptureStats::default();
+        s.observe(&[0.5, -0.5], 2);
+        s.dropped_chunks = 1;
+        let mut since = Instant::now();
+        s.flush_window(&mut since, 48_000, None);
+        assert_eq!((s.frames, s.dropped_chunks), (1, 1), "flushed early");
+        let Some(due) = Instant::now().checked_sub(STATS_EVERY) else {
+            return;
+        };
+        since = due;
+        s.flush_window(&mut since, 48_000, Some("Speakers"));
+        assert_eq!((s.frames, s.dropped_chunks, s.peak), (0, 0, 0.0));
+        assert!(since > due, "the next window starts now");
+    }
 
     /// A dud default change every ~2 s must re-assert a few times, then concede, and warn once each.
     #[test]

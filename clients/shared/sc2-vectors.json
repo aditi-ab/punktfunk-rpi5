@@ -1,0 +1,39 @@
+{
+  "$comment": "Steam Controller 2 byte bookkeeping, hand-written. out_report_len: each output report's wire length with the id byte (pf_driver_proto::triton::out_report_len; the Apple and Android strippedOutputLen is one less), null = undeclared, sent whole. imu_trace: reports fed in order through one fresh IMU gate (pf-client-core, Swift and Kotlin Sc2ImuGate); the report carries ts as a little-endian u32 at byte 30 with non-zero IMU bytes after it, and pass means the IMU bytes leave unchanged, else they are zeroed.",
+  "out_report_len": [
+    {"id": 128, "len": 10},
+    {"id": 129, "len": 8},
+    {"id": 130, "len": 4},
+    {"id": 131, "len": 10},
+    {"id": 132, "len": 9},
+    {"id": 133, "len": 4},
+    {"id": 134, "len": 4},
+    {"id": 135, "len": 64},
+    {"id": 136, "len": 64},
+    {"id": 137, "len": 64},
+    {"id": 138, "len": null},
+    {"id": 139, "len": null},
+    {"id": 140, "len": null},
+    {"id": 141, "len": null},
+    {"id": 142, "len": null},
+    {"id": 143, "len": null}
+  ],
+  "imu_trace": [
+    {"id": 66, "ts": 100, "len": 54, "pass": false},
+    {"id": 66, "ts": 100, "len": 54, "pass": false},
+    {"id": 66, "ts": 200, "len": 54, "pass": true},
+    {"id": 66, "ts": 200, "len": 54, "pass": true},
+    {"id": 66, "ts": 200, "len": 54, "pass": true},
+    {"id": 66, "ts": 200, "len": 54, "pass": true},
+    {"id": 66, "ts": 200, "len": 54, "pass": false},
+    {"id": 69, "ts": 300, "len": 46, "pass": true},
+    {"id": 67, "ts": 300, "len": 54, "pass": true},
+    {"id": 71, "ts": 999, "len": 54, "pass": true},
+    {"id": 69, "ts": 300, "len": 46, "pass": true},
+    {"id": 66, "ts": 300, "len": 40, "pass": true},
+    {"id": 69, "ts": 300, "len": 46, "pass": true},
+    {"id": 69, "ts": 300, "len": 46, "pass": true},
+    {"id": 69, "ts": 300, "len": 46, "pass": false},
+    {"id": 66, "ts": 301, "len": 54, "pass": true}
+  ]
+}

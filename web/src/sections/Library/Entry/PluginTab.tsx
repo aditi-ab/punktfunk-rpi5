@@ -1,7 +1,8 @@
 import { useQueries, useQueryClient } from "@tanstack/react-query";
 import { toast } from "@unom/ui/toast";
 import { type FC, useState } from "react";
-import { gamePlugins, type PluginSummary, usePlugins } from "@/api/plugins";
+import type { PluginSummary } from "@/api/gen/model";
+import { gamePlugins, usePlugins } from "@/api/plugins";
 import {
 	type JsonObject,
 	type JsonSchemaDoc,

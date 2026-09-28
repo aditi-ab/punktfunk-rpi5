@@ -21,11 +21,11 @@ pub mod caps_av1;
 pub mod caps_h265;
 pub mod decoder;
 pub mod decoder_av1;
+pub mod decoder_h264;
 pub mod decoder_h265;
 pub mod device;
 pub mod fault;
 pub mod images;
-pub mod integrity;
 pub mod params;
 pub mod params_av1;
 pub mod params_h265;
@@ -38,12 +38,16 @@ pub mod ring;
 pub mod session;
 pub mod session_av1;
 pub mod session_h265;
-pub mod slots;
+/// The DPB slot ledger, shared with the DXVA and VAAPI backends.
+pub use pf_bitstream::slots;
 
 /// Ash re-export so consumers flatten [`DecodedVkFrame`] handles through this
 /// crate's `ash::vk::Handle`. Their own `ash` is optional; versions must not skew.
 pub use ash;
 // pf-bitstream types a [`DecodedVkFrame`] consumer names, without taking that dep.
+pub use pf_bitstream::av1::tiles::plan_bitstream;
+pub use pf_bitstream::av1::tiles::Av1Bitstream;
+pub use pf_bitstream::av1::tiles::Av1TileError;
 /// [`VkAv1Decoder::take_warnings`] warning type. Distinct from [`PlanWarning`]:
 /// AV1 has `MissingShowExisting`; `MissingReference` has no legal substitute.
 pub use pf_bitstream::av1::PlanWarning as Av1PlanWarning;
@@ -54,34 +58,30 @@ pub use pf_bitstream::h264::PlanWarning;
 /// `NonZeroReorder` (and H.264 `Mmco5Rebase`) are planned in full; dropping
 /// those frames hitches every SPS activation.
 pub use pf_bitstream::h265::PlanWarning as H265PlanWarning;
+pub use pf_bitstream::h265::RefRpsIdxError;
 
 pub use caps::derive_caps;
 pub use caps::plane_formats;
 pub use caps::CapsError;
 pub use caps::DecodeCaps;
 pub use caps::MaxLevelIdc;
-pub use caps::RawH264Caps;
+pub use caps::RawCaps;
 pub use caps::VideoFormat;
 pub use caps::NV12;
 pub use caps::OUTPUT_FORMATS;
 pub use caps::P010;
 pub use caps::YUV444_10;
 pub use caps::YUV444_8;
-pub use caps_av1::derive_caps_av1;
 pub use caps_av1::Av1ProfileKey;
-pub use caps_av1::RawAv1Caps;
-pub use caps_h265::derive_caps_h265;
 pub use caps_h265::output_format_for;
 pub use caps_h265::H265ProfileKey;
-pub use caps_h265::RawH265Caps;
+pub use decoder::core::VkCodec;
+pub use decoder::core::VkDecoder;
 pub use decoder::DecodeStatus;
 pub use decoder::DecodedVkFrame;
 pub use decoder::VkDecodeError;
-pub use decoder::VkH264Decoder;
-pub use decoder_av1::plan_bitstream;
-pub use decoder_av1::Av1Bitstream;
-pub use decoder_av1::Av1TileError;
 pub use decoder_av1::VkAv1Decoder;
+pub use decoder_h264::VkH264Decoder;
 pub use decoder_h265::VkH265Decoder;
 pub use device::DecodeDevice;
 pub use device::DeviceHandles;
@@ -95,9 +95,6 @@ pub use fault::DEFAULT_FAULT_PERIOD;
 pub use images::plan_pools;
 pub use images::PoolPlan;
 pub use images::HOLD_HEADROOM;
-pub use integrity::is_integrity_warning;
-pub use integrity::is_integrity_warning_av1;
-pub use integrity::is_integrity_warning_h265;
 pub use params::pps_to_std;
 pub use params::sps_to_std;
 pub use params::OwnedStdPps;
@@ -124,11 +121,9 @@ pub use pic_av1::OwnedStdAv1PictureInfo;
 pub use pic_av1::PlanToVkAv1Error;
 pub use pic_av1::VkRefAv1;
 pub use pic_av1::REFERENCE_NAME_UNUSED;
-pub use pic_h265::num_delta_pocs_of_ref_rps_idx;
 pub use pic_h265::plan_to_vk_h265;
 pub use pic_h265::DecodePlanVkH265;
 pub use pic_h265::PlanToVkH265Error;
-pub use pic_h265::RefRpsIdxError;
 pub use pic_h265::VkRefH265;
 pub use pic_h265::H265_RPS_LIST_SIZE;
 pub use recovery::RecoveryMark;

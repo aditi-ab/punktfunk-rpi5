@@ -86,12 +86,6 @@ fn capture(cmd: &mut Command) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Shown instead of an Apply button.
-pub(super) fn opt_in_hint() -> String {
-    "sudo usermod -aG punktfunk-update $USER   # enables web-triggered updates for this host"
-        .to_string()
-}
-
 /// The Deck's build tree, or `None` where there is no on-device source build.
 fn source_tree() -> Option<std::path::PathBuf> {
     let home = std::env::var("HOME").ok()?;
@@ -171,7 +165,7 @@ pub(super) fn run_apply_steamos(
             from: crate::version::get().into(),
             to: target_version.into(),
             serial,
-            started_unix: super::now_unix(),
+            started_unix: crate::clock::unix_secs_u64(),
             installer_sha256: String::new(),
             log_path: log.display().to_string(),
             source_build: true,
@@ -243,7 +237,7 @@ pub(super) fn run_apply(
     serial: u64,
     stage: &dyn Fn(&'static str),
 ) -> Result<(), (&'static str, String)> {
-    let started_unix = super::now_unix();
+    let started_unix = crate::clock::unix_secs_u64();
 
     let mut child = Command::new("systemctl")
         .args(["start", "punktfunk-update.service"])
@@ -287,7 +281,7 @@ pub(super) fn run_apply(
                 format!(
                     "not authorized to start the update helper — enable web-triggered \
                      updates first: {}",
-                    opt_in_hint()
+                    super::OPT_IN_HINT
                 )
             } else {
                 format!(
@@ -334,7 +328,7 @@ pub(super) fn run_apply(
                 ok: true,
                 from: current.into(),
                 to: target_version.into(),
-                finished_unix: super::now_unix(),
+                finished_unix: crate::clock::unix_secs_u64(),
                 stage: None,
                 error: None,
                 log_path: None,
@@ -351,7 +345,7 @@ pub(super) fn run_apply(
                 ok: true,
                 from: current.into(),
                 to: current.into(),
-                finished_unix: super::now_unix(),
+                finished_unix: crate::clock::unix_secs_u64(),
                 stage: None,
                 error: None,
                 log_path: None,
@@ -374,7 +368,7 @@ pub(super) fn run_apply(
             from: current.into(),
             to,
             serial,
-            started_unix: super::now_unix(),
+            started_unix: crate::clock::unix_secs_u64(),
             installer_sha256: String::new(),
             log_path: "journalctl -u punktfunk-update.service".into(),
             source_build: false,

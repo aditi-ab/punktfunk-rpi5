@@ -15,7 +15,7 @@ use anyhow::{bail, Result};
 use ndk::native_window::NativeWindow;
 use pf_client_core::console::{PointerInput, SessionPhase};
 use pf_client_core::menu_nav::{MenuEvent, MenuNav, MenuSample, PadInfo};
-use pf_console_ui::bridge::{Event, Published};
+use pf_console_ui::bridge::{phase_code, Event, Published};
 use pf_console_ui::console::FrameCost;
 use pf_console_ui::{
     Console, ConsoleEntry, ConsoleHandles, ConsoleOptions, InputSource, Insets, Key, SnapshotStore,
@@ -25,16 +25,6 @@ use punktfunk_core::config::GamepadPref;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
-
-/// A session edge as Kotlin reports it — `SessionPhase` borrows its strings, so the queue
-/// carries an owned twin.
-pub(super) enum Phase {
-    Connecting,
-    Streaming,
-    Failed(String),
-    Ended(Option<String>),
-    Reconnecting(String),
-}
 
 /// What Kotlin asks the render thread to do.
 pub(super) enum Cmd {
@@ -51,7 +41,9 @@ pub(super) enum Cmd {
         repeat: bool,
     },
     Text(String),
-    Phase(Phase),
+    /// A session edge: its `bridge::phase_code` and message. `SessionPhase` borrows the
+    /// message, so the render thread decodes it.
+    Phase(u8, String),
     Navigate(ConsoleEntry),
     SurfaceCreated(NativeWindow),
     SurfaceChanged,
@@ -250,16 +242,8 @@ impl Drop for ConsoleHost {
 ///
 /// Non-fatal if the platform refuses (the exact floor a foreground app may set is policy).
 fn boost_thread_priority() {
-    // SAFETY: `gettid`/`setpriority` on the calling thread are always-safe syscalls; PRIO_PROCESS
-    // with a TID targets that one task on Linux — the idiom `Process.setThreadPriority` uses.
-    unsafe {
-        let tid = libc::gettid();
-        if libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, -8) != 0 {
-            log::debug!(
-                "console: setpriority(-8) failed (non-fatal): {}",
-                std::io::Error::last_os_error()
-            );
-        }
+    if let Err(e) = crate::sys::set_thread_nice(None, -8) {
+        log::debug!("console: setpriority(-8) failed (non-fatal): {e}");
     }
 }
 
@@ -543,22 +527,15 @@ impl Ui {
             Cmd::Text(t) => {
                 console.text(&t);
             }
-            Cmd::Phase(ph) => {
-                match &ph {
-                    Phase::Connecting => console.session_phase(SessionPhase::Connecting),
-                    Phase::Streaming => console.session_phase(SessionPhase::Streaming),
-                    Phase::Failed(m) => console.session_phase(SessionPhase::Failed(m)),
-                    Phase::Ended(r) => {
-                        console.session_phase(SessionPhase::Ended(r.as_deref()));
+            Cmd::Phase(code, msg) => {
+                if let Some(phase) = phase_code(code, &msg) {
+                    // Coming back from a stream: whatever is held on the pad now (the chord
+                    // that ended it) must be released before it can act here.
+                    let back = matches!(phase, SessionPhase::Ended(_) | SessionPhase::Failed(_));
+                    console.session_phase(phase);
+                    if back {
+                        self.nav.reset();
                     }
-                    Phase::Reconnecting(m) => {
-                        console.session_phase(SessionPhase::Reconnecting(m));
-                    }
-                }
-                // Coming back from a stream: whatever is held on the pad now (the chord
-                // that ended it) must be released before it can act here.
-                if matches!(ph, Phase::Ended(_) | Phase::Failed(_)) {
-                    self.nav.reset();
                 }
             }
             Cmd::Navigate(entry) => console.navigate(entry),

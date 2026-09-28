@@ -13,7 +13,9 @@ description = "punktfunk host video encode: NVENC/VAAPI/AMF/QSV/Vulkan-Video/Pyr
 publish = false
 
 [dependencies]
-punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
+# `quic::{HdrMeta, resolve_codec, Welcome, CODEC_*}` and `video_fit` live outside the `quic`
+# feature, so the encoder crate never builds quinn, rustls or opus.
+punktfunk-core = { path = "../punktfunk-core", default-features = false }
 pf-frame = { path = "../pf-frame" }
 # The Windows backends + the `Encoder` contract; re-exported wholesale from `lib.rs`.
 pf-encode-win = { path = "../pf-encode-win" }
@@ -26,6 +28,8 @@ tracing = "0.1"
 [dev-dependencies]
 # A test writer for the NVENC backend's unit tests (`with_test_writer().try_init()`).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Shared test drivers: the PyroWave window walk and decoder, the trait-forwarding guard.
+pf-encode-win = { path = "../pf-encode-win", features = ["test-support"] }
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]
 # The QSV live e2e drives the REAL HdrP010Converter output (an RTV-written, ring-profile P010

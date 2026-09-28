@@ -12,16 +12,14 @@
 //! Empty, never an error, when there is no DRM session or nothing is plugged in — same contract
 //! as [`crate::monitors::list`]. See `design/per-monitor-portal-capture.md`.
 
+use super::argv::{flag_value, gamescope_argvs, gamescope_output_size};
 use crate::monitors::{describe, PhysicalMonitor};
 use std::path::Path;
 
 /// The DRM-driven head, or empty. Empty is not an error: no gamescope, a nested/headless
 /// backend, or nothing plugged in. Same contract as [`crate::monitors::list`].
 pub(crate) fn list_monitors() -> anyhow::Result<Vec<PhysicalMonitor>> {
-    Ok(heads_under(
-        Path::new("/sys/class/drm"),
-        &super::gamescope_argvs(),
-    ))
+    Ok(heads_under(Path::new("/sys/class/drm"), &gamescope_argvs()))
 }
 
 /// [`list_monitors`] against a sysfs root and argv set.
@@ -34,7 +32,7 @@ fn heads_under(base: &Path, argvs: &[Vec<String>]) -> Vec<PhysicalMonitor> {
     let Some(argv) = argvs.iter().find(|a| drives_drm(a)) else {
         return Vec::new();
     };
-    let output_size = super::gamescope_output_size(argv);
+    let output_size = gamescope_output_size(argv);
     let connected = connected_connectors(base);
     if connected.is_empty() {
         return Vec::new();
@@ -169,21 +167,6 @@ fn backend_flag(argv: &[String]) -> Option<&str> {
 
 fn prefer_output(argv: &[String]) -> Option<&str> {
     flag_value(argv, &["--prefer-output", "-O"])
-}
-
-/// Value of the first matching flag, in `--flag value` and `--flag=value` form.
-fn flag_value<'a>(argv: &'a [String], names: &[&str]) -> Option<&'a str> {
-    argv.iter().enumerate().find_map(|(i, a)| {
-        if let Some((k, v)) = a.split_once('=') {
-            if names.contains(&k) {
-                return Some(v);
-            }
-        }
-        if names.contains(&a.as_str()) {
-            return argv.get(i + 1).map(|s| s.as_str());
-        }
-        None
-    })
 }
 
 /// Sysfs `modes` first line (`WIDTHxHEIGHT`) — last-resort size after `-W`/`-H` and EDID.

@@ -11,6 +11,7 @@
 //! The chain rides the mDNS `os=` TXT record ([`crate::discovery`]) and the
 //! mgmt API's `HostInfo.os`. `PRETTY_NAME` is REST-only — TXT stays small.
 
+use pf_host_config::os_release::OsRelease;
 use std::sync::OnceLock;
 
 /// The host's OS identity, detected once per process (os-release is static for its lifetime).
@@ -47,43 +48,20 @@ const FAMILIES: &[&str] = &[
 ];
 
 fn linux_os_info() -> OsInfo {
-    ["/etc/os-release", "/usr/lib/os-release"]
-        .iter()
-        .find_map(|p| std::fs::read_to_string(p).ok())
-        .map(|s| parse_os_release(&s))
-        .unwrap_or_else(|| OsInfo {
-            chain: "linux".into(),
-            pretty: "Linux".into(),
-        })
+    os_info(pf_host_config::os_release::os_release())
 }
 
-/// Pure os-release parser, compiled on every target so tests run off Linux.
+/// Chain and name from a parsed os-release, pure so tests run off Linux.
 ///
-/// `KEY=value` lines, values optionally quoted. `ID`/`ID_LIKE` are lowercased
-/// and sanitized before they feed a DNS TXT record. `PRETTY_NAME` falls back
-/// `NAME` → capitalized `ID` → `"Linux"`.
-fn parse_os_release(contents: &str) -> OsInfo {
-    let (mut id, mut id_like, mut pretty, mut name) = (None, None, None, None);
-    for line in contents.lines() {
-        let line = line.trim();
-        if let Some(v) = line.strip_prefix("ID=") {
-            id = Some(unquote(v));
-        } else if let Some(v) = line.strip_prefix("ID_LIKE=") {
-            id_like = Some(unquote(v));
-        } else if let Some(v) = line.strip_prefix("PRETTY_NAME=") {
-            pretty = Some(unquote(v));
-        } else if let Some(v) = line.strip_prefix("NAME=") {
-            name = Some(unquote(v));
-        }
-    }
-
-    let id_tok = id.as_deref().and_then(sanitize_token);
+/// `ID`/`ID_LIKE` are lowercased and sanitized before they feed a DNS TXT
+/// record. `PRETTY_NAME` falls back `NAME` → capitalized `ID` → `"Linux"`.
+fn os_info(os: &OsRelease) -> OsInfo {
+    let id_tok = os.id.as_deref().and_then(sanitize_token);
     // First FAMILIES ancestor; skip a token that repeats ID (some distros write ID_LIKE=ID).
-    let like_tok = id_like
-        .as_deref()
-        .unwrap_or("")
-        .split_whitespace()
-        .filter_map(sanitize_token)
+    let like_tok = os
+        .id_like
+        .iter()
+        .filter_map(|t| sanitize_token(t))
         .find(|t| FAMILIES.contains(&t.as_str()) && Some(t) != id_tok.as_ref());
 
     let mut chain = String::from("linux");
@@ -92,7 +70,7 @@ fn parse_os_release(contents: &str) -> OsInfo {
         chain.push_str(tok);
     }
 
-    let pretty = [pretty, name]
+    let pretty = [&os.pretty_name, &os.name]
         .into_iter()
         .flatten()
         .map(|s| s.trim().to_string())
@@ -111,16 +89,6 @@ fn parse_os_release(contents: &str) -> OsInfo {
 /// on every settings upgrade, so a marker file in our package would miss it.
 pub fn is_omarchy() -> bool {
     detect().chain.ends_with("/omarchy")
-}
-
-fn unquote(v: &str) -> String {
-    let v = v.trim();
-    for q in ['"', '\''] {
-        if let Some(inner) = v.strip_prefix(q).and_then(|s| s.strip_suffix(q)) {
-            return inner.to_string();
-        }
-    }
-    v.to_string()
 }
 
 /// TXT-safe `[a-z0-9._-]`, max 32. `None` if nothing survives — garbage must not reach the advert.
@@ -148,7 +116,7 @@ mod tests {
     use super::*;
 
     fn parsed(contents: &str) -> (String, String) {
-        let info = parse_os_release(contents);
+        let info = os_info(&OsRelease::parse(contents));
         (info.chain, info.pretty)
     }
 

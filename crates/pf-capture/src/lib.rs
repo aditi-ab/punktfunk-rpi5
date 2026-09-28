@@ -32,7 +32,7 @@ pub const KWIN_POOL_MAX: i32 = 4;
 /// The ceiling is `KWIN_UNPACED_HEADROOM` times the rate, or none when the rate is unknown.
 /// `PUNKTFUNK_KWIN_PACED=1` asks for the stream rate itself.
 pub fn unpaced_capture() -> bool {
-    !pf_host_config::env_on("PUNKTFUNK_KWIN_PACED").unwrap_or(false)
+    !pf_host_config::row_bool("PUNKTFUNK_KWIN_PACED")
 }
 
 /// Offer PipeWire explicit sync (`SPA_META_SyncTimeline`) on the dmabuf lane.
@@ -54,7 +54,7 @@ pub fn explicit_sync() -> bool {
 /// `PUNKTFUNK_DIRECT_CAPTURE=0` keeps the portal.
 #[cfg(target_os = "linux")]
 pub fn direct_capture() -> bool {
-    pf_host_config::env_on("PUNKTFUNK_DIRECT_CAPTURE").unwrap_or(true)
+    pf_host_config::row_bool("PUNKTFUNK_DIRECT_CAPTURE")
 }
 
 /// Whether a virtual output may be driven as a PipeWire lazy driver.
@@ -66,7 +66,7 @@ pub fn direct_capture() -> bool {
 /// producer-driven stream.
 #[cfg(target_os = "linux")]
 pub fn lazy_capture() -> bool {
-    pf_host_config::env_on("PUNKTFUNK_LAZY_CAPTURE").unwrap_or(true)
+    pf_host_config::row_bool("PUNKTFUNK_LAZY_CAPTURE")
 }
 
 /// A FATAL capture fault: retrying `try_latest` cannot help — the caller must rebuild the
@@ -744,64 +744,77 @@ pub fn open_portal_monitor(
     .map(|c| Box::new(c) as Box<dyn Capturer>)
 }
 
-/// Linux capturer for an existing virtual output's PipeWire node.
-/// `keepalive` owns the output. `want_hdr` holds on a gamescope node only: every other
-/// virtual output is SDR, and a desktop that refuses the offer would latch gamescope's SDR.
-/// `cursor_id0_hides` selects KWin's rewritten cursor-meta contract.
-/// `producer_is_gamescope` selects its no-meta contract and gated tiled modifier offer.
-/// KWin also needs [`KWIN_POOL_MIN`], [`KWIN_POOL_MAX`] as `pool_max`, and [`unpaced_capture`].
-/// `pool_max` is the deepest pool the producer serves; `None` when it serves any depth asked.
+/// The compositor behind a virtual output's PipeWire node. Node ids and remote fds do not
+/// name it, so the host does.
 #[cfg(target_os = "linux")]
-#[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Producer {
+    /// KWin: rewrites `SPA_META_Cursor` every buffer (`id == 0` hides the pointer), serves
+    /// pools of [`KWIN_POOL_MIN`] to [`KWIN_POOL_MAX`], and records unpaced while
+    /// [`unpaced_capture`] holds.
+    Kwin,
+    /// gamescope: no cursor metadata, a gated tiled modifier offer, and the only HDR producer.
+    Gamescope,
+    /// Mutter and every other producer.
+    #[default]
+    Other,
+}
+
+/// What [`open_virtual_output`] negotiates. Named fields: adjacent bools transpose silently
+/// and negotiate the wrong pod family (black screen).
+#[cfg(target_os = "linux")]
+#[derive(Clone, Default)]
+pub struct VirtualOutputOpts {
+    /// `false` forces CPU mmap even when `PUNKTFUNK_ZEROCOPY` is set.
+    pub allow_zerocopy: bool,
+    /// Tiled dmabufs convert to planar YUV444.
+    pub want_444: bool,
+    /// Offer 10-bit PQ/BT.2020. Holds on a [`Producer::Gamescope`] node only: every other
+    /// virtual output is SDR, and a desktop that refuses the offer would latch gamescope's SDR.
+    pub want_hdr: bool,
+    /// 10-bit SDR: keep packed RGB so direct NVENC widens 8→10.
+    pub ten_bit_sdr: bool,
+    /// Skip buffers until the negotiated size matches the preferred mode (KWin's
+    /// sacrificial birth mode).
+    pub expect_exact_dims: bool,
+    pub producer: Producer,
+    pub policy: ZeroCopyPolicy,
+}
+
+/// Linux capturer for an existing virtual output's PipeWire node. `keepalive` owns the output.
+#[cfg(target_os = "linux")]
 pub fn open_virtual_output(
     remote_fd: Option<std::os::fd::OwnedFd>,
     node_id: u32,
     preferred_mode: Option<(u32, u32, u32)>,
     keepalive: Box<dyn Send>,
-    allow_zerocopy: bool,
-    want_444: bool,
-    want_hdr: bool,
-    ten_bit_sdr: bool,
-    policy: ZeroCopyPolicy,
-    expect_exact_dims: bool,
-    cursor_id0_hides: bool,
-    producer_is_gamescope: bool,
-    pool_min: i32,
-    pool_max: Option<i32>,
-    unpaced: bool,
+    opts: VirtualOutputOpts,
 ) -> Result<Box<dyn Capturer>> {
+    let want_hdr = opts.want_hdr
+        && opts.producer == Producer::Gamescope
+        && !hdr_capture_failed(HdrSource::VirtualOutput);
     linux::PortalCapturer::from_virtual_output(
         remote_fd,
         node_id,
         preferred_mode,
         keepalive,
-        allow_zerocopy,
-        want_444,
-        want_hdr && producer_is_gamescope && !hdr_capture_failed(HdrSource::VirtualOutput),
-        ten_bit_sdr,
-        policy,
-        expect_exact_dims,
-        cursor_id0_hides,
-        producer_is_gamescope,
-        pool_min,
-        pool_max,
-        unpaced,
+        VirtualOutputOpts { want_hdr, ..opts },
     )
     .map(|c| Box::new(c) as Box<dyn Capturer>)
 }
 
 /// Direct `ext-image-copy-capture-v1` capturer for a compositor output the host has
-/// already created, named by its `wl_output.name`.
+/// already created, named by its `wl_output.name`. The capturer owns `keepalive`.
 ///
-/// Returns `Err` for every reason the caller should fall back to the portal: the
-/// compositor lacks the protocol, the output is gone, or nothing it offers can be
-/// imported by this session's encoder.
+/// Fails for every reason the caller should fall back to the portal: the compositor
+/// lacks the protocol, the output is gone, or nothing it offers can be imported by this
+/// session's encoder. The failure hands `keepalive` back for that fallback.
 #[cfg(target_os = "linux")]
 pub fn open_direct_output(
     output_name: String,
     keepalive: Box<dyn Send>,
     policy: ZeroCopyPolicy,
-) -> Result<Box<dyn Capturer>> {
+) -> std::result::Result<Box<dyn Capturer>, (anyhow::Error, Box<dyn Send>)> {
     linux::WlCapturer::open(output_name, keepalive, policy)
         .map(|c| Box::new(c) as Box<dyn Capturer>)
 }

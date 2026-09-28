@@ -61,10 +61,7 @@ pub(crate) async fn client_logs_upload(
     // The gate's `is_paired` is expiry-blind (right for roster GETs). This WRITE uses
     // `effective`: a lapsed guest must not keep writing to disk. No grant bit — a view-only
     // guest mid-session is who a debug bundle is wanted from.
-    let now_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let now_unix = crate::clock::unix_secs();
     if st
         .native
         .as_ref()

@@ -6,11 +6,27 @@
 // The credential is cached briefly so a burst of iframe asset requests doesn't hammer the host. On a
 // 401 from the plugin (its secret rotated on restart within the cache window) the proxy busts this
 // cache and re-fetches once — see the route.
-import { loopbackTls, mgmtToken, mgmtUrl } from "./auth";
+import { isError } from "h3";
+import { mgmtFetch } from "./forward";
 import { consoleOriginPort, pluginOriginPort } from "./pluginOrigin";
 
 /** A plugin id — its `definePlugin` name; the same shape the host validates. */
 export const PLUGIN_ID_RE = /^[a-z][a-z0-9-]*$/;
+
+/**
+ * A library id the host accepts: `<store>:<external id>`, both halves non-empty, at most 1024
+ * UTF-8 bytes. Control characters are refused too. clients/shared/library-id-vectors.json pins it.
+ */
+export const validEntryId = (v: unknown): v is string => {
+	if (typeof v !== "string") return false;
+	const colon = v.indexOf(":");
+	return (
+		colon > 0 &&
+		colon < v.length - 1 &&
+		new TextEncoder().encode(v).length <= 1024 &&
+		![...v].some((c) => c.charCodeAt(0) < 0x20 || c.charCodeAt(0) === 0x7f)
+	);
+};
 
 /** The proxy credential for a plugin's loopback UI. */
 export interface UiCredential {
@@ -45,12 +61,11 @@ export function isDialablePort(port: number): boolean {
 }
 
 /**
- * Fetch `{port, secret}` for a plugin's UI from the management API (bearer, loopback). Returns
- * `null` when the plugin isn't registered / has no UI (a 404), or when the port it registered is one
- * we refuse to dial (see {@link isDialablePort}). Results are cached for {@link TTL_MS};
- * pass `bustCache` to force a fresh read (the stale-secret retry). Throws only on a missing mgmt
- * token (a deploy misconfig) — a transient upstream error resolves to `null` (treated as offline)
- * and is not cached.
+ * Fetch `{port, secret}` for a plugin's UI from the management API. Returns `null` when the plugin
+ * isn't registered / has no UI (a 404), or when the port it registered is one we refuse to dial
+ * (see {@link isDialablePort}). Results are cached for {@link TTL_MS}; pass `bustCache` to force a
+ * fresh read (the stale-secret retry). Throws only on a missing mgmt token (a deploy misconfig): an
+ * unreachable host or any other upstream error resolves to `null` (offline) and is not cached.
  */
 export async function fetchUiCredential(
 	id: string,
@@ -62,21 +77,13 @@ export async function fetchUiCredential(
 		if (hit && now - hit.at < TTL_MS) return hit.cred;
 	}
 
-	const base = mgmtUrl();
-	const token = mgmtToken();
-	if (!token) {
-		throw new Error(
-			"management token not configured (PUNKTFUNK_MGMT_TOKEN / ~/.config/punktfunk/mgmt-token)",
-		);
-	}
-	// The host serves the credential over HTTPS with its self-signed loopback cert; relax
-	// verification for that one loopback hop only (the same scoping the /api BFF uses).
-	const fetchOptions = loopbackTls(base) as RequestInit | undefined;
-	const resp = await fetch(`${base}/api/v1/plugins/${id}/ui-credential`, {
-		...fetchOptions,
-		headers: { authorization: `Bearer ${token}` },
-	});
-
+	const resp = await mgmtFetch(`/api/v1/plugins/${id}/ui-credential`).catch(
+		(e: unknown) => {
+			if (isError(e) && e.statusCode === 503) throw e;
+			return null;
+		},
+	);
+	if (!resp) return null;
 	if (resp.ok) {
 		const cred = (await resp.json()) as UiCredential;
 		// A port we refuse to dial is treated exactly like "no UI registered" — the callers already
@@ -94,7 +101,7 @@ export async function fetchUiCredential(
 		cache.set(id, { cred: null, at: now });
 		return null;
 	}
-	// Transient (401/5xx): don't cache, let the next request retry.
+	// Transient (5xx): don't cache, let the next request retry.
 	return null;
 }
 

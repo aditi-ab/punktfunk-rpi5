@@ -423,11 +423,14 @@ fn ensure_role(
     // runs on every exit from here.
     let endpoints = (|| -> Result<(String, Option<String>)> {
         da::bind_driver(&hwid, &inf)?;
-        let render = wait_for(&devnode, false)?;
+        let render = pe::wait_for_endpoint(&devnode, wasapi::Direction::Render, ENDPOINT_WAIT)?;
         let capture = match role {
-            Role::Mic => Some(wait_for(&devnode, true).with_context(|| {
-                format!("the minted mic devnode {devnode} produced no capture endpoint")
-            })?),
+            Role::Mic => Some(
+                pe::wait_for_endpoint(&devnode, wasapi::Direction::Capture, ENDPOINT_WAIT)
+                    .with_context(|| {
+                        format!("the minted mic devnode {devnode} produced no capture endpoint")
+                    })?,
+            ),
             Role::Speakers => None,
         };
         stamp_identity(&render, identity, role, false);
@@ -613,29 +616,6 @@ fn stamp_identity(endpoint_id: &str, identity: &'static AudioIdentity, role: Rol
     tracing::info!(seat = identity.label(), role = role.label(), endpoint = %endpoint_id,
         "minted endpoint name is stored but not yet served — it appears after the next \
          audio-stack restart or reboot");
-}
-
-/// Poll until audiosrv has registered this devnode's render or capture endpoint.
-fn wait_for(devnode: &str, capture: bool) -> Result<String> {
-    let deadline = Instant::now() + ENDPOINT_WAIT;
-    loop {
-        let found = if capture {
-            pe::find_capture_endpoint_for_devnode(devnode)?
-        } else {
-            pe::find_endpoint_for_devnode(devnode)?
-        };
-        if let Some(ep) = found {
-            return Ok(ep);
-        }
-        if Instant::now() >= deadline {
-            bail!(
-                "no {} endpoint appeared for {devnode} within {}s — is Audiosrv running?",
-                if capture { "capture" } else { "render" },
-                ENDPOINT_WAIT.as_secs()
-            );
-        }
-        thread::sleep(Duration::from_millis(250));
-    }
 }
 
 /// Finds the devnode carrying this identity's exact role and optional seat marker pair.

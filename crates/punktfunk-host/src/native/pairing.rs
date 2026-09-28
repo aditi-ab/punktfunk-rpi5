@@ -49,7 +49,7 @@ where
 {
     use punktfunk_core::quic::pake;
     let client_fp = *client_fp;
-    let client_fp_hex = fingerprint_hex(&client_fp);
+    let client_fp_hex = hex::encode(client_fp);
     // Unpaired wire name: scrub once here and log only that value.
     // ANSI/C0 and bidi otherwise reach the operator terminal and the journal.
     let name = sanitize_device_name(&req.name, &client_fp_hex);
@@ -92,7 +92,7 @@ where
     let ok = pake::verify(&confirms.client, &proof.confirm);
 
     if ok {
-        if let Err(e) = np.add_with_access(&req.name, &fingerprint_hex(&client_fp), access) {
+        if let Err(e) = np.add_with_access(&req.name, &hex::encode(client_fp), access) {
             tracing::error!(error = %format!("{e:#}"), "paired clients not saved");
         }
         tracing::info!(name = %name, "pairing complete — client trusted");

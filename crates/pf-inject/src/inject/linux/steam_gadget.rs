@@ -74,7 +74,7 @@ const USB_RAW_EVENT_CONTROL: u32 = 2;
 const USB_SPEED_HIGH: u8 = 3;
 
 use super::steam_proto::{
-    deck_serial, deck_unit_id, feature_reply, neutral_deck_report, RDESC_DECK_CTRL as RDESC_CTRL,
+    deck_serial, feature_reply, neutral_deck_report, RDESC_DECK_CTRL as RDESC_CTRL,
     RDESC_DECK_KBD as RDESC_KBD, RDESC_DECK_MOUSE as RDESC_MOUSE,
 };
 
@@ -217,7 +217,7 @@ pub struct SteamDeckGadget {
     wakers: Vec<Waker>,
     /// Closing `/dev/raw-gadget` tears the gadget down.
     _fd: Arc<File>,
-    seq: u32,
+    enc: super::steam_proto::DeckEncoder,
 }
 
 impl SteamDeckGadget {
@@ -244,7 +244,6 @@ impl SteamDeckGadget {
         uapi::ioctl_value(fd.as_fd(), IOCTL_RUN, 0).context("raw_gadget RUN")?;
 
         let serial = deck_serial(index);
-        let unit_id = deck_unit_id(index);
         let report = Arc::new(Mutex::new(neutral_deck_report()));
         let feedback = Arc::new(Mutex::new(Default::default()));
         let running = Arc::new(AtomicBool::new(true));
@@ -275,7 +274,7 @@ impl SteamDeckGadget {
                 .spawn(move || {
                     // SAFETY: `pthread_self` is always valid on the calling thread.
                     tid.store(unsafe { libc::pthread_self() } as u64, Ordering::SeqCst);
-                    control_loop(fd, running, ctrl_ep, configured, feedback, serial, unit_id);
+                    control_loop(fd, running, ctrl_ep, configured, feedback, serial);
                     done.store(true, Ordering::SeqCst);
                 })
                 .context("spawn gadget control thread")?
@@ -288,7 +287,7 @@ impl SteamDeckGadget {
             threads: vec![control],
             wakers: vec![ctrl_waker],
             _fd: fd,
-            seq: 0,
+            enc: Default::default(),
         };
         let stream = {
             let fd = gadget._fd.clone();
@@ -312,9 +311,7 @@ impl SteamDeckGadget {
     }
 
     pub fn write_state(&mut self, st: &super::steam_proto::SteamState) {
-        self.seq = self.seq.wrapping_add(1);
-        let mut r = [0u8; 64];
-        super::steam_proto::serialize_deck_state(&mut r, st, self.seq);
+        let r = self.enc.encode(st);
         if let Ok(mut g) = self.report.lock() {
             *g = r;
         }
@@ -371,7 +368,6 @@ fn control_loop(
     configured: Arc<AtomicBool>,
     feedback: Arc<Mutex<super::steam_proto::SteamFeedback>>,
     serial: String,
-    unit_id: u32,
 ) {
     let fd = file.as_fd();
     let cfg = build_config();
@@ -403,7 +399,6 @@ fn control_loop(
                     &ctrl,
                     &cfg,
                     &serial,
-                    unit_id,
                     &ctrl_ep,
                     &configured,
                     &mut last_set,
@@ -429,7 +424,6 @@ fn handle_control(
     ctrl: &Setup,
     cfg: &[u8],
     serial: &str,
-    unit_id: u32,
     ctrl_ep: &std::sync::atomic::AtomicI32,
     configured: &AtomicBool,
     last_set: &mut Vec<u8>,
@@ -483,7 +477,7 @@ fn handle_control(
         match ctrl.b_request {
             0x01 => {
                 // GET_REPORT — feature reply for the last SET_REPORT
-                let resp = feature_reply(last_set, serial, unit_id);
+                let resp = feature_reply(last_set, serial);
                 let n = resp.len().min(wl);
                 ep0_write(fd, &resp[..n]);
             }
@@ -580,21 +574,10 @@ pub fn ensure_modules() {
     }
 }
 
-/// Default on for SteamOS (ships the modules and runs Steam Input); off elsewhere.
-/// `PUNKTFUNK_STEAM_GADGET=1`/`0` forces it. A host that *is* a Deck never reaches
+/// Auto is on for SteamOS (ships the modules and runs Steam Input) and off elsewhere;
+/// `PUNKTFUNK_STEAM_GADGET` on/off forces it. A host that *is* a Deck never reaches
 /// here: `resolve_gamepad` degrades `SteamDeck` → DualSense before the manager is built.
 pub fn gadget_preferred() -> bool {
-    if let Some(v) = pf_host_config::knob("PUNKTFUNK_STEAM_GADGET") {
-        return v == "1" || v.eq_ignore_ascii_case("true");
-    }
-    is_steamos()
-}
-
-fn is_steamos() -> bool {
-    std::fs::read_to_string("/etc/os-release")
-        .map(|s| {
-            s.lines()
-                .any(|l| l == "ID=steamos" || (l.starts_with("ID_LIKE=") && l.contains("steamos")))
-        })
-        .unwrap_or(false)
+    pf_host_config::row_tri("PUNKTFUNK_STEAM_GADGET")
+        .unwrap_or_else(|| pf_host_config::os_release::os_release().is("steamos"))
 }

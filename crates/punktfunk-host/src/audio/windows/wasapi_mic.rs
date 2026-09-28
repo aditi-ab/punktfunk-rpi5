@@ -288,7 +288,7 @@ pub(crate) fn install_steam_audio_pair() -> bool {
 /// [`super::pad_endpoint`] (`UpdateDriverForPlugAndPlayDevicesW` when no
 /// installed Speakers devnode exposes `oemNN.inf`). `None` if expansion fails.
 pub(crate) fn steam_driver_inf_path(inf_name: &str) -> Option<Vec<u16>> {
-    use windows::core::PCWSTR;
+    use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
 
     #[cfg(target_arch = "x86_64")]
@@ -297,11 +297,9 @@ pub(crate) fn steam_driver_inf_path(inf_name: &str) -> Option<Vec<u16>> {
     let subdir = "arm64";
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let subdir = "x86";
-    let template: Vec<u16> =
-        format!("%CommonProgramFiles(x86)%\\Steam\\drivers\\Windows10\\{subdir}\\{inf_name}")
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
+    let template = HSTRING::from(format!(
+        "%CommonProgramFiles(x86)%\\Steam\\drivers\\Windows10\\{subdir}\\{inf_name}"
+    ));
     let mut path = vec![0u16; 1024];
     // SAFETY: `template` is a locally built NUL-terminated UTF-16 buffer that outlives the call, and
     // the output slice is a live local whose length the callee is told via the slice itself.

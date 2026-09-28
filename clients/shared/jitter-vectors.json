@@ -1,0 +1,1736 @@
+{
+  "$comment": "Written by punktfunk-core's audio::vectors (see its module doc); the Apple client's JitterVectorTests replays it. jitter: each run is `times` callbacks of step(depth, want) then note_read(short), all in interleaved samples, under JitterTuning::COREAUDIO; expect sums the steps and reads the state after. av_sync: `times` identical observations, then one desired_depth(depth). drought: conceal(since_ms, depth_ms) or packet().",
+  "av_sync": [
+    {
+      "channels": 2,
+      "name": "settles_then_aims_shallower_when_audio_is_late",
+      "rate_hz": 48000,
+      "script": [
+        {
+          "depth": 6000,
+          "expect": {
+            "desired": null,
+            "implausible": false,
+            "observed_ns": null,
+            "offset_ms": 40,
+            "settled": false
+          },
+          "observe": {
+            "buffered": 2400,
+            "clock_offset_ns": -250000,
+            "now_ns": 5000000000,
+            "output_latency_ns": 0,
+            "pts_ns": 1000000000,
+            "times": 99,
+            "video_e2e_ns": 3984750000
+          }
+        },
+        {
+          "depth": 6000,
+          "expect": {
+            "desired": 2160,
+            "implausible": false,
+            "observed_ns": 40000000,
+            "offset_ms": 40,
+            "settled": true
+          },
+          "observe": {
+            "buffered": 2400,
+            "clock_offset_ns": -250000,
+            "now_ns": 5000000000,
+            "output_latency_ns": 0,
+            "pts_ns": 1000000000,
+            "times": 1,
+            "video_e2e_ns": 3984750000
+          }
+        },
+        {
+          "depth": 6000,
+          "expect": {
+            "desired": 2160,
+            "implausible": false,
+            "observed_ns": 40000000,
+            "offset_ms": 40,
+            "settled": true
+          },
+          "observe": {
+            "buffered": 2400,
+            "clock_offset_ns": -250000,
+            "now_ns": 5000000000,
+            "output_latency_ns": 0,
+            "pts_ns": 1000000000,
+            "times": 50,
+            "video_e2e_ns": 3984750000
+          }
+        }
+      ]
+    },
+    {
+      "channels": 2,
+      "name": "aims_deeper_when_audio_is_early",
+      "rate_hz": 48000,
+      "script": [
+        {
+          "depth": 2000,
+          "expect": {
+            "desired": 4880,
+            "implausible": false,
+            "observed_ns": -30000000,
+            "offset_ms": -30,
+            "settled": true
+          },
+          "observe": {
+            "buffered": 2400,
+            "clock_offset_ns": -250000,
+            "now_ns": 5000000000,
+            "output_latency_ns": 0,
+            "pts_ns": 1000000000,
+            "times": 120,
+            "video_e2e_ns": 4054750000
+          }
+        }
+      ]
+    },
+    {
+      "channels": 2,
+      "name": "the_deadband_holds_the_last_request",
+      "rate_hz": 48000,
+      "script": [
+        {
+          "depth": 2000,
+          "expect": {
+            "desired": 0,
+            "implausible": false,
+            "observed_ns": 25000000,
+            "offset_ms": 25,
+            "settled": true
+          },
+          "observe": {
+            "buffered": 2400,
+            "clock_offset_ns": -250000,
+            "now_ns": 5000000000,
+            "output_latency_ns": 0,
+            "pts_ns": 1000000000,
+            "times": 150,
+            "video_e2e_ns": 3999750000
+          }
+        },
+        {
+          "depth": 2000,
+          "expect": {
+            "desired": 876,
+            "implausible": false,
+            "observed_ns": 11715799,
+            "offset_ms": 11,
+            "settled": true
+          },
+          "observe": {
+            "buffered": 2400,
+            "clock_offset_ns": -250000,
+            "now_ns": 5000000000,
+            "output_latency_ns": 0,
+            "pts_ns": 1000000000,
+            "times": 400,
+            "video_e2e_ns": 4020750000
+          }
+        },
+        {
+          "depth": 2000,
+          "expect": {
+            "desired": 876,
+            "implausible": false,
+            "observed_ns": 6419,
+            "offset_ms": 0,
+            "settled": true
+          },
+          "observe": {
+            "buffered": 2400,
+            "clock_offset_ns": -250000,
+            "now_ns": 5000000000,
+            "output_latency_ns": 0,
+            "pts_ns": 1000000000,
+            "times": 3000,
+            "video_e2e_ns": 4024750000
+          }
+        }
+      ]
+    },
+    {
+      "channels": 2,
+      "name": "no_picture_no_opinion",
+      "rate_hz": 48000,
+      "script": [
+        {
+          "depth": 2000,
+          "expect": {
+            "desired": null,
+            "implausible": false,
+            "observed_ns": null,
+            "offset_ms": 0,
+            "settled": false
+          },
+          "observe": {
+            "buffered": 2400,
+            "clock_offset_ns": -250000,
+            "now_ns": 5000000000,
+            "output_latency_ns": 0,
+            "pts_ns": 1000000000,
+            "times": 200,
+            "video_e2e_ns": null
+          }
+        }
+      ]
+    },
+    {
+      "channels": 2,
+      "name": "an_implausible_offset_is_refused",
+      "rate_hz": 48000,
+      "script": [
+        {
+          "depth": 2000,
+          "expect": {
+            "desired": 80,
+            "implausible": false,
+            "observed_ns": 20000000,
+            "offset_ms": 20,
+            "settled": true
+          },
+          "observe": {
+            "buffered": 2400,
+            "clock_offset_ns": -250000,
+            "now_ns": 5000000000,
+            "output_latency_ns": 0,
+            "pts_ns": 1000000000,
+            "times": 150,
+            "video_e2e_ns": 4004750000
+          }
+        },
+        {
+          "depth": 2000,
+          "expect": {
+            "desired": 80,
+            "implausible": true,
+            "observed_ns": null,
+            "offset_ms": 20,
+            "settled": true
+          },
+          "observe": {
+            "buffered": 2400,
+            "clock_offset_ns": -250000,
+            "now_ns": 5000000000,
+            "output_latency_ns": 0,
+            "pts_ns": 1000000000,
+            "times": 3,
+            "video_e2e_ns": 18446744072734301616
+          }
+        },
+        {
+          "depth": 2000,
+          "expect": {
+            "desired": 80,
+            "implausible": false,
+            "observed_ns": 20000000,
+            "offset_ms": 20,
+            "settled": true
+          },
+          "observe": {
+            "buffered": 2400,
+            "clock_offset_ns": -250000,
+            "now_ns": 5000000000,
+            "output_latency_ns": 0,
+            "pts_ns": 1000000000,
+            "times": 1,
+            "video_e2e_ns": 4004750000
+          }
+        }
+      ]
+    },
+    {
+      "channels": 2,
+      "name": "the_device_behind_the_ring_counts",
+      "rate_hz": 48000,
+      "script": [
+        {
+          "depth": 4800,
+          "expect": {
+            "desired": 480,
+            "implausible": false,
+            "observed_ns": 45000000,
+            "offset_ms": 45,
+            "settled": true
+          },
+          "observe": {
+            "buffered": 2400,
+            "clock_offset_ns": -250000,
+            "now_ns": 5000000000,
+            "output_latency_ns": 30000000,
+            "pts_ns": 1000000000,
+            "times": 150,
+            "video_e2e_ns": 4009750000
+          }
+        }
+      ]
+    },
+    {
+      "channels": 2,
+      "name": "the_44k1_rung_steers_in_its_own_samples",
+      "rate_hz": 44100,
+      "script": [
+        {
+          "depth": 3528,
+          "expect": {
+            "desired": 618,
+            "implausible": false,
+            "observed_ns": 33000000,
+            "offset_ms": 33,
+            "settled": true
+          },
+          "observe": {
+            "buffered": 1764,
+            "clock_offset_ns": -250000,
+            "now_ns": 5000000000,
+            "output_latency_ns": 0,
+            "pts_ns": 1000000000,
+            "times": 150,
+            "video_e2e_ns": 3986750000
+          }
+        }
+      ]
+    }
+  ],
+  "drought": [
+    {
+      "frame_us": 5000,
+      "max_ms": 120,
+      "name": "conceals_only_a_real_drought_on_a_draining_ring",
+      "script": [
+        {
+          "depth_ms": 0,
+          "expect": false,
+          "since_ms": 9
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 10
+        },
+        {
+          "depth_ms": 11,
+          "expect": false,
+          "since_ms": 10
+        },
+        {
+          "depth_ms": 10,
+          "expect": true,
+          "since_ms": 10
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 50
+        },
+        {
+          "expect": 3,
+          "packet": true
+        },
+        {
+          "depth_ms": 0,
+          "expect": false,
+          "since_ms": 5
+        }
+      ],
+      "total_ms": 15
+    },
+    {
+      "frame_us": 5000,
+      "max_ms": 120,
+      "name": "the_budget_is_twice_the_fuse",
+      "script": [
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": false,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": false,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": false,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": false,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": false,
+          "since_ms": 20
+        },
+        {
+          "depth_ms": 0,
+          "expect": false,
+          "since_ms": 20
+        },
+        {
+          "expect": 24,
+          "packet": true
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 20
+        }
+      ],
+      "total_ms": 125
+    },
+    {
+      "frame_us": 2000,
+      "max_ms": 120,
+      "name": "a_lossless_frame_moves_both_thresholds",
+      "script": [
+        {
+          "depth_ms": 0,
+          "expect": false,
+          "since_ms": 3
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 4
+        },
+        {
+          "depth_ms": 4,
+          "expect": true,
+          "since_ms": 4
+        },
+        {
+          "depth_ms": 5,
+          "expect": false,
+          "since_ms": 4
+        },
+        {
+          "expect": 2,
+          "packet": true
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 4
+        }
+      ],
+      "total_ms": 6
+    },
+    {
+      "frame_us": 2500,
+      "max_ms": 120,
+      "name": "a_half_millisecond_rung_rounds_the_floor_up",
+      "script": [
+        {
+          "depth_ms": 0,
+          "expect": false,
+          "since_ms": 4
+        },
+        {
+          "depth_ms": 0,
+          "expect": true,
+          "since_ms": 5
+        },
+        {
+          "depth_ms": 5,
+          "expect": true,
+          "since_ms": 5
+        },
+        {
+          "depth_ms": 6,
+          "expect": false,
+          "since_ms": 5
+        }
+      ],
+      "total_ms": 5
+    }
+  ],
+  "jitter": [
+    {
+      "channels": 2,
+      "name": "primes_at_the_target_then_plays",
+      "rate_hz": 48000,
+      "script": [
+        {
+          "expect": {
+            "avg_depth_ms": 0,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": false,
+            "silent": 5,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 0,
+            "short": true,
+            "times": 5,
+            "want": 960
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 0,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": false,
+            "silent": 3,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 1824,
+            "short": false,
+            "times": 3,
+            "want": 960
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 20,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 1920,
+            "short": false,
+            "times": 1,
+            "want": 960
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 24,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 2400,
+            "short": false,
+            "times": 200,
+            "want": 960
+          }
+        }
+      ]
+    },
+    {
+      "channels": 2,
+      "name": "a_large_quantum_lifts_the_priming_floor",
+      "rate_hz": 48000,
+      "script": [
+        {
+          "expect": {
+            "avg_depth_ms": 3,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": false,
+            "silent": 2,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 4224,
+            "short": false,
+            "times": 2,
+            "want": 3840
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 45,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 4320,
+            "short": false,
+            "times": 20,
+            "want": 3840
+          }
+        }
+      ]
+    },
+    {
+      "channels": 2,
+      "name": "one_late_packet_does_not_deprime",
+      "rate_hz": 48000,
+      "script": [
+        {
+          "expect": {
+            "avg_depth_ms": 30,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 2880,
+            "short": false,
+            "times": 20,
+            "want": 480
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 29,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 192,
+            "short": true,
+            "times": 1,
+            "want": 480
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 29,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 2880,
+            "short": false,
+            "times": 10,
+            "want": 480
+          }
+        }
+      ]
+    },
+    {
+      "channels": 2,
+      "name": "starvation_grows_the_target_then_deprimes",
+      "rate_hz": 48000,
+      "script": [
+        {
+          "expect": {
+            "avg_depth_ms": 30,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 2880,
+            "short": false,
+            "times": 20,
+            "want": 480
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 28,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": false,
+            "silent": 4,
+            "target_ms": 40,
+            "trims": 0
+          },
+          "run": {
+            "depth": 0,
+            "short": true,
+            "times": 11,
+            "want": 480
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 28,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": false,
+            "silent": 1,
+            "target_ms": 40,
+            "trims": 0
+          },
+          "run": {
+            "depth": 0,
+            "short": true,
+            "times": 1,
+            "want": 480
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 28,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": false,
+            "silent": 2,
+            "target_ms": 40,
+            "trims": 0
+          },
+          "run": {
+            "depth": 960,
+            "short": false,
+            "times": 2,
+            "want": 480
+          }
+        }
+      ]
+    },
+    {
+      "channels": 2,
+      "name": "the_hard_cap_trims_on_sight",
+      "rate_hz": 48000,
+      "script": [
+        {
+          "expect": {
+            "avg_depth_ms": 30,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 2880,
+            "short": false,
+            "times": 20,
+            "want": 480
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 180,
+            "crossfade": 192,
+            "drop": 1920,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 1
+          },
+          "run": {
+            "depth": 19200,
+            "short": false,
+            "times": 1,
+            "want": 480
+          }
+        }
+      ]
+    },
+    {
+      "channels": 2,
+      "name": "a_clump_is_kept_until_the_average_follows",
+      "rate_hz": 48000,
+      "script": [
+        {
+          "expect": {
+            "avg_depth_ms": 25,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 2400,
+            "short": false,
+            "times": 20,
+            "want": 480
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 50,
+            "crossfade": 9792,
+            "drop": 48960,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 51
+          },
+          "run": {
+            "depth": 5760,
+            "short": false,
+            "times": 300,
+            "want": 480
+          }
+        }
+      ]
+    },
+    {
+      "channels": 2,
+      "name": "a_sustained_excess_sheds_one_frame",
+      "rate_hz": 48000,
+      "script": [
+        {
+          "expect": {
+            "avg_depth_ms": 40,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 3840,
+            "short": false,
+            "times": 399,
+            "want": 480
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 40,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 3840,
+            "short": false,
+            "times": 1,
+            "want": 480
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 39,
+            "crossfade": 192,
+            "drop": 480,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 3840,
+            "short": false,
+            "times": 400,
+            "want": 480
+          }
+        }
+      ]
+    },
+    {
+      "channels": 2,
+      "name": "underruns_grow_the_target_and_quiet_relaxes_it",
+      "rate_hz": 48000,
+      "script": [
+        {
+          "expect": {
+            "avg_depth_ms": 25,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 2400,
+            "short": false,
+            "times": 50,
+            "want": 960
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 24,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 480,
+            "short": true,
+            "times": 1,
+            "want": 960
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 24,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 2400,
+            "short": false,
+            "times": 50,
+            "want": 960
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 24,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 480,
+            "short": true,
+            "times": 1,
+            "want": 960
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 24,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 2400,
+            "short": false,
+            "times": 50,
+            "want": 960
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 24,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 30,
+            "trims": 0
+          },
+          "run": {
+            "depth": 480,
+            "short": true,
+            "times": 1,
+            "want": 960
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 34,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 3360,
+            "short": false,
+            "times": 3000,
+            "want": 960
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 34,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 3360,
+            "short": false,
+            "times": 600,
+            "want": 960
+          }
+        }
+      ]
+    },
+    {
+      "channels": 2,
+      "name": "a_near_miss_grows_once_per_window",
+      "rate_hz": 48000,
+      "script": [
+        {
+          "expect": {
+            "avg_depth_ms": 25,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 2400,
+            "short": false,
+            "times": 20,
+            "want": 960
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 24,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 30,
+            "trims": 0
+          },
+          "run": {
+            "depth": 1152,
+            "short": false,
+            "times": 1,
+            "want": 960
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 24,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 30,
+            "trims": 0
+          },
+          "run": {
+            "depth": 1152,
+            "short": false,
+            "times": 1,
+            "want": 960
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 29,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 30,
+            "trims": 0
+          },
+          "run": {
+            "depth": 2880,
+            "short": false,
+            "times": 500,
+            "want": 960
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 29,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 40,
+            "trims": 0
+          },
+          "run": {
+            "depth": 1152,
+            "short": false,
+            "times": 1,
+            "want": 960
+          }
+        }
+      ]
+    },
+    {
+      "channels": 2,
+      "name": "a_hollow_ring_reprimes_on_its_first_click",
+      "rate_hz": 48000,
+      "script": [
+        {
+          "expect": {
+            "avg_depth_ms": 20,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 1920,
+            "short": false,
+            "times": 5,
+            "want": 480
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 19,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 30,
+            "trims": 0
+          },
+          "run": {
+            "depth": 576,
+            "short": false,
+            "times": 1,
+            "want": 480
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 13,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 30,
+            "trims": 0
+          },
+          "run": {
+            "depth": 1152,
+            "short": false,
+            "times": 400,
+            "want": 480
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 13,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": false,
+            "silent": 0,
+            "target_ms": 30,
+            "trims": 0
+          },
+          "run": {
+            "depth": 288,
+            "short": true,
+            "times": 1,
+            "want": 480
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 13,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": false,
+            "silent": 2,
+            "target_ms": 30,
+            "trims": 0
+          },
+          "run": {
+            "depth": 1152,
+            "short": false,
+            "times": 2,
+            "want": 480
+          }
+        }
+      ]
+    },
+    {
+      "channels": 2,
+      "name": "sync_asks_deeper_and_the_ring_inserts",
+      "rate_hz": 48000,
+      "script": [
+        {
+          "expect": {
+            "avg_depth_ms": 20,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 1920,
+            "short": false,
+            "times": 5,
+            "want": 480
+          }
+        },
+        {
+          "sync": 3840
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 25,
+            "crossfade": 192,
+            "drop": 0,
+            "insert": 480,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 1920,
+            "short": false,
+            "times": 400,
+            "want": 480
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 24,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 1920,
+            "short": false,
+            "times": 10,
+            "want": 480
+          }
+        },
+        {
+          "sync": null
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 24,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 1920,
+            "short": false,
+            "times": 10,
+            "want": 480
+          }
+        }
+      ]
+    },
+    {
+      "channels": 2,
+      "name": "sync_asks_shallower_and_a_failed_probe_restores",
+      "rate_hz": 48000,
+      "script": [
+        {
+          "expect": {
+            "avg_depth_ms": 25,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 2400,
+            "short": false,
+            "times": 5,
+            "want": 480
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 24,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 30,
+            "trims": 0
+          },
+          "run": {
+            "depth": 576,
+            "short": false,
+            "times": 1,
+            "want": 480
+          }
+        },
+        {
+          "sync": 960
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 29,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 2880,
+            "short": false,
+            "times": 1000,
+            "want": 480
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 29,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 30,
+            "trims": 0
+          },
+          "run": {
+            "depth": 288,
+            "short": true,
+            "times": 1,
+            "want": 480
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 29,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 30,
+            "trims": 0
+          },
+          "run": {
+            "depth": 2880,
+            "short": false,
+            "times": 1000,
+            "want": 480
+          }
+        }
+      ]
+    },
+    {
+      "channels": 2,
+      "name": "a_lossless_frame_sheds_its_own_length",
+      "rate_hz": 96000,
+      "script": [
+        {
+          "frame_us": 2000
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 20,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 3840,
+            "short": false,
+            "times": 5,
+            "want": 384
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 38,
+            "crossfade": 192,
+            "drop": 384,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 7680,
+            "short": false,
+            "times": 2000,
+            "want": 384
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 38,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 30,
+            "trims": 0
+          },
+          "run": {
+            "depth": 576,
+            "short": false,
+            "times": 1,
+            "want": 384
+          }
+        }
+      ]
+    },
+    {
+      "channels": 2,
+      "name": "the_44k1_rung_sheds_the_wire_frame",
+      "rate_hz": 44100,
+      "script": [
+        {
+          "expect": {
+            "avg_depth_ms": 20,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 1764,
+            "short": false,
+            "times": 5,
+            "want": 441
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 38,
+            "crossfade": 176,
+            "drop": 440,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 3528,
+            "short": false,
+            "times": 900,
+            "want": 441
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 38,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 1000,
+            "short": true,
+            "times": 1,
+            "want": 441
+          }
+        }
+      ]
+    },
+    {
+      "channels": 6,
+      "name": "surround_trims_whole_frames",
+      "rate_hz": 48000,
+      "script": [
+        {
+          "expect": {
+            "avg_depth_ms": 30,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 8640,
+            "short": false,
+            "times": 5,
+            "want": 1440
+          }
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 180,
+            "crossfade": 576,
+            "drop": 5765,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 1
+          },
+          "run": {
+            "depth": 57605,
+            "short": false,
+            "times": 1,
+            "want": 1440
+          }
+        }
+      ]
+    },
+    {
+      "channels": 2,
+      "name": "a_quantum_past_the_hard_cap_keeps_the_floor",
+      "rate_hz": 48000,
+      "script": [
+        {
+          "sync": 96000
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 210,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 20160,
+            "short": false,
+            "times": 3,
+            "want": 19200
+          }
+        },
+        {
+          "sync": 96
+        },
+        {
+          "expect": {
+            "avg_depth_ms": 210,
+            "crossfade": 0,
+            "drop": 0,
+            "insert": 0,
+            "primed": true,
+            "silent": 0,
+            "target_ms": 20,
+            "trims": 0
+          },
+          "run": {
+            "depth": 20160,
+            "short": false,
+            "times": 3,
+            "want": 19200
+          }
+        }
+      ]
+    }
+  ],
+  "version": 1
+}

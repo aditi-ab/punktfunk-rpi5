@@ -153,6 +153,8 @@ pub mod omarchy_menu;
 // Lucide path data shared by Skia and GTK so a mark cannot differ between them.
 pub mod lucide;
 pub mod overlay_actions;
+// sRGB mixes and WCAG contrast for every client theme, the console's included.
+pub mod rgb;
 pub mod ring;
 // DualSense voice-coil + speaker on the pad's 4-ch device (0xD1 plane): correlation, per-session renderer, tier-A registry the gamepad worker feeds.
 #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
@@ -171,6 +173,15 @@ mod sc2_capture;
 pub mod presets;
 #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
 pub mod session;
+// The `Settings` model and the preset resolver; `trust` re-exports them.
+#[cfg(any(
+    target_os = "linux",
+    windows,
+    target_os = "android",
+    target_vendor = "apple",
+    target_family = "wasm"
+))]
+pub mod settings;
 // One decode-less connect and one host burst — the shared half of every "Test network
 // speed…" row. Desktop-gated with `video`, whose codec advertisement the probe connect
 // sends; Android measures through its own JNI session instead.

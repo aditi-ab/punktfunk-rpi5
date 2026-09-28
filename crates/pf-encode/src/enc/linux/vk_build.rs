@@ -12,7 +12,7 @@
 // `super::*` is the point of the child-module shape. `vk_util` is a crate-root sibling, so
 // `crate::` — not the parent-relative `super::` the parent uses.
 use super::*;
-use crate::vk_util::{ext_advertised, find_mem, make_plain_image, make_view};
+use crate::vk_util::{ext_advertised, find_mem, find_mem_preferring, make_plain_image, make_view};
 use anyhow::{bail, Result};
 use ash::vk;
 use std::ffi::c_void;
@@ -66,7 +66,7 @@ pub(super) unsafe fn probe_rgb_direct(
     }
     // Caps under the rgb-chained profile: colour math must match the compute CSC (`rgb2yuv.comp`
     // 709 / `rgb2yuv10.comp` 2020 / `rgb2yuv10_709.comp` 709 at ten bits). Depth-only profile here.
-    let mut ps = RgbProfileStack::new(codec_op, ten_bit);
+    let mut ps = ProfileStack::new(codec_op, ten_bit, true);
     let profile = *ps.wire(av1);
     let mut rgb_caps = vrgb::VideoEncodeRgbConversionCapabilitiesVALVE {
         s_type: vrgb::stype(vrgb::ST_CAPABILITIES),
@@ -293,6 +293,7 @@ pub(super) unsafe fn make_video_image(
 }
 
 /// [`make_video_image`] with image create flags (`MUTABLE_FORMAT` for plane views).
+/// Memory prefers `DEVICE_LOCAL` and takes any type the driver offers otherwise.
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn make_video_image_flags(
     device: &ash::Device,
@@ -332,27 +333,19 @@ pub(super) unsafe fn make_video_image_flags(
     let img = device.create_image(&ci, None)?;
     let req = device.get_image_memory_requirements(img);
     // Destroy the image if alloc fails: callers only ever see the completed pair.
-    let ti = match find_mem(
-        mp,
-        req.memory_type_bits,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            device.destroy_image(img, None);
-            return Err(e);
-        }
-    };
-    let mem = match device.allocate_memory(
-        &vk::MemoryAllocateInfo::default()
-            .allocation_size(req.size)
-            .memory_type_index(ti),
-        None,
-    ) {
+    let local = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+    let mem = match find_mem_preferring(mp, req.memory_type_bits, local).and_then(|ti| {
+        Ok(device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(ti),
+            None,
+        )?)
+    }) {
         Ok(m) => m,
         Err(e) => {
             device.destroy_image(img, None);
-            return Err(e.into());
+            return Err(e);
         }
     };
     if let Err(e) = device.bind_image_memory(img, mem, 0) {

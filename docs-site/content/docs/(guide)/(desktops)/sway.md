@@ -38,7 +38,7 @@ Don't set `PUNKTFUNK_COMPOSITOR`: a pin turns off detection and session followin
 option is in [Configuration](/docs/configuration).
 
 The host writes its own chooser into `~/.config/xdg-desktop-portal-wlr/config` and restarts xdpw
-when that changes.
+when that changes. When the host stops, it puts your previous chooser back.
 
 ## Start the host
 

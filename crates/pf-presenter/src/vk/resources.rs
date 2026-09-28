@@ -83,17 +83,10 @@ impl Staging {
 }
 
 impl Presenter {
-    /// Touches no queue: a failed rebuild must fail before acquire, same
-    /// rule as the hardware imports.
+    /// Copy `f` into the staging buffer, sizing the plane images and the buffer first.
+    /// Touches no queue: a failed rebuild must fail before acquire, same rule as the
+    /// hardware imports.
     pub(super) fn stage_frame(&mut self, f: &CpuPlanarFrame) -> Result<[usize; 3]> {
-        if self
-            .video
-            .as_ref()
-            .is_none_or(|v| v.width != f.width || v.height != f.height)
-        {
-            self.rebuild_video_image(f.width, f.height)?;
-            tracing::info!(width = f.width, height = f.height, "video image (re)built");
-        }
         if self
             .cpu_planes
             .as_ref()
@@ -174,7 +167,20 @@ impl Presenter {
         Ok(())
     }
 
-    pub(super) fn rebuild_video_image(&mut self, width: u32, height: u32) -> Result<()> {
+    /// Rebuild the video image when the picture size changes. Every lane's CSC target.
+    pub(super) fn ensure_video_image(&mut self, width: u32, height: u32) -> Result<()> {
+        if self
+            .video
+            .as_ref()
+            .is_none_or(|v| v.width != width || v.height != height)
+        {
+            self.rebuild_video_image(width, height)?;
+            tracing::info!(width, height, "video image (re)built");
+        }
+        Ok(())
+    }
+
+    fn rebuild_video_image(&mut self, width: u32, height: u32) -> Result<()> {
         // Old image is only referenced by our command buffers.
         self.quiesce_own()?;
         if let Some(v) = self.video.take() {

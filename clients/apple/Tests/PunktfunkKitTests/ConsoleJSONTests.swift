@@ -50,6 +50,66 @@ final class ConsoleJSONTests: XCTestCase {
         XCTAssertTrue(card["bound_preset"] is NSNull)
     }
 
+    /// `clients/shared/host-row-vectors.json`: the rows the Kotlin and desktop producers send
+    /// too, so a player moving between devices finds one carousel.
+    func testHostRowsMatchTheSharedVectors() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // PunktfunkKitTests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // apple
+            .deletingLastPathComponent() // clients
+            .appendingPathComponent("shared/host-row-vectors.json")
+        let doc = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        for c in try XCTUnwrap(doc["cases"] as? [[String: Any]]) {
+            let name = c["name"] as? String ?? "?"
+            var ids: [String: UUID] = [:]
+            let saved = try XCTUnwrap(c["saved"] as? [[String: Any]], name).map { h in
+                let id = UUID()
+                ids[h["id"] as? String ?? ""] = id
+                let fp = h["fp"] as? String ?? ""
+                return StoredHost(
+                    id: id, name: h["name"] as? String ?? "", address: h["addr"] as? String ?? "",
+                    port: UInt16(h["port"] as? Int ?? 0),
+                    pinnedSHA256: fp.isEmpty ? nil : Data(hex: fp),
+                    lastConnected: (h["last_used"] as? Int).map {
+                        Date(timeIntervalSince1970: TimeInterval($0))
+                    },
+                    mgmtPort: (h["mgmt_port"] as? Int).map { UInt16($0) },
+                    macAddresses: h["mac"] as? [String], pinnedPresetIDs: h["pins"] as? [String],
+                    addedAt: (h["added"] as? Int).map { Date(timeIntervalSince1970: TimeInterval($0)) },
+                    osChain: h["os"] as? String)
+            }
+            let discovered = try XCTUnwrap(c["discovered"] as? [[String: Any]], name).map { d in
+                DiscoveredHost(
+                    id: d["name"] as? String ?? "", name: d["name"] as? String ?? "",
+                    host: d["addr"] as? String ?? "", port: UInt16(d["port"] as? Int ?? 0),
+                    fingerprintHex: (d["fp"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+                    requiresPairing: false, allowsTofu: false, macAddresses: [],
+                    osChain: d["os"] as? String ?? "",
+                    mgmtPort: (d["mgmt_port"] as? Int).map { UInt16($0) })
+            }
+            let online = Set((c["online"] as? [String] ?? []).compactMap { ids[$0] })
+            let presets = (c["presets"] as? [String] ?? []).map { StreamPreset(name: $0, id: $0) }
+            let got = try rows(ConsoleJSON.hostRows(
+                saved: saved, discovered: discovered, online: online, presets: presets))
+            let want = try XCTUnwrap(c["rows"] as? [[String: Any]], name)
+            XCTAssertEqual(got.count, want.count, "\(name) row count")
+            for (i, (w, g)) in zip(want, got).enumerated() {
+                let at = "\(name) row \(i)"
+                XCTAssertEqual(g["key"] as? String, w["key"] as? String, "\(at) key")
+                for k in ["saved", "online", "can_wake"] {
+                    XCTAssertEqual(g[k] as? Bool, w[k] as? Bool, "\(at) \(k)")
+                }
+                XCTAssertEqual(g["mgmt_port"] as? Int, w["mgmt_port"] as? Int, "\(at) mgmt_port")
+                XCTAssertEqual(g["os"] as? String, w["os"] as? String, "\(at) os")
+                XCTAssertEqual(g["last_used"] as? Int, w["last_used"] as? Int, "\(at) last_used")
+                XCTAssertEqual(
+                    (g["pin"] as? [String: Any])?["id"] as? String, w["pin"] as? String, "\(at) pin")
+            }
+        }
+    }
+
     /// An unpaired host that is offline and has a MAC offers Wake, and is keyed by address.
     func testAnOfflineHostOffersWake() throws {
         let saved = host(name: "Attic", paired: false)
@@ -149,5 +209,15 @@ final class ConsoleJSONTests: XCTestCase {
         XCTAssertEqual(merged.hdrEnabled, false)
         XCTAssertNil(merged.codec, "the console cleared it")
         XCTAssertEqual(merged.windowedSafePresent, true, "only this app edits it")
+    }
+}
+
+private extension Data {
+    /// Bytes from lowercase hex; the vectors spell fingerprints that way.
+    init(hex: String) {
+        let chars = Array(hex)
+        self.init(stride(from: 0, to: chars.count, by: 2).compactMap {
+            UInt8(String(chars[$0 ..< Swift.min($0 + 2, chars.count)]), radix: 16)
+        })
     }
 }

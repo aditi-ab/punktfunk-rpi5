@@ -160,22 +160,14 @@ mod tests {
     fn answer(s: &mut PromptScreen, events: &[MenuEvent]) -> Outbox {
         let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
-        let pads = Vec::new();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
+        let device = crate::screens::Device {
             platform: crate::platform::Platform::Apple,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            tv: false,
             fallback_ui: true,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
+            ..crate::screens::Device::test()
+        };
+        let mut ctx = Ctx {
+            device: &device,
+            ..Ctx::test(&mut settings, &library)
         };
         let mut fx = Outbox::default();
         for ev in events {

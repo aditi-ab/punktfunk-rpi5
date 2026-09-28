@@ -11,7 +11,7 @@
 #![allow(non_camel_case_types, non_snake_case)]
 
 use anyhow::{bail, Result};
-use std::os::raw::{c_int, c_uint, c_void};
+use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::sync::OnceLock;
 
 pub type CUresult = c_uint; // CUDA_SUCCESS == 0
@@ -199,6 +199,9 @@ pub(crate) const CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS: c_uint = 0x1;
 pub(crate) struct CudaApi {
     cuInit: unsafe extern "C" fn(c_uint) -> CUresult,
     cuDeviceGet: unsafe extern "C" fn(*mut CUdevice, c_int) -> CUresult,
+    /// `CUuuid` is `struct { char bytes[16]; }`: the device's UUID, as Vulkan reports it.
+    cuDeviceGetUuid: unsafe extern "C" fn(*mut [u8; 16], CUdevice) -> CUresult,
+    cuDeviceGetPCIBusId: unsafe extern "C" fn(*mut c_char, c_int, CUdevice) -> CUresult,
     cuCtxCreate_v2: unsafe extern "C" fn(*mut CUcontext, c_uint, CUdevice) -> CUresult,
     cuCtxDestroy_v2: unsafe extern "C" fn(CUcontext) -> CUresult,
     cuCtxSetCurrent: unsafe extern "C" fn(CUcontext) -> CUresult,
@@ -283,6 +286,8 @@ pub(crate) fn cuda_api() -> Option<&'static CudaApi> {
             let api = CudaApi {
                 cuInit: *lib.get(b"cuInit\0").ok()?,
                 cuDeviceGet: *lib.get(b"cuDeviceGet\0").ok()?,
+                cuDeviceGetUuid: *lib.get(b"cuDeviceGetUuid\0").ok()?,
+                cuDeviceGetPCIBusId: *lib.get(b"cuDeviceGetPCIBusId\0").ok()?,
                 cuCtxCreate_v2: *lib.get(b"cuCtxCreate_v2\0").ok()?,
                 cuCtxDestroy_v2: *lib.get(b"cuCtxDestroy_v2\0").ok()?,
                 cuCtxSetCurrent: *lib.get(b"cuCtxSetCurrent\0").ok()?,
@@ -349,6 +354,8 @@ macro_rules! forward {
 forward! {
     cuInit(flags: c_uint);
     cuDeviceGet(device: *mut CUdevice, ordinal: c_int);
+    cuDeviceGetUuid(uuid: *mut [u8; 16], dev: CUdevice);
+    cuDeviceGetPCIBusId(bus_id: *mut c_char, len: c_int, dev: CUdevice);
     cuCtxCreate_v2(pctx: *mut CUcontext, flags: c_uint, dev: CUdevice);
     cuCtxDestroy_v2(ctx: CUcontext);
     cuCtxSetCurrent(ctx: CUcontext);

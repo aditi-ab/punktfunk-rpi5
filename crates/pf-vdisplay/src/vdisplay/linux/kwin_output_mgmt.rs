@@ -12,7 +12,6 @@
 //! wait for `applied` / `failed`.
 
 use std::collections::HashMap;
-use std::os::fd::{AsFd, AsRawFd};
 use std::time::{Duration, Instant};
 use wayland_client::backend::ObjectId;
 use wayland_client::protocol::wl_callback::{self, WlCallback};
@@ -86,9 +85,6 @@ const REGISTRY_OUTPUT_EVENT_OPCODE: u16 = 1;
 /// Budget for one enumerate-then-apply. A healthy roundtrip is a few ms; this only
 /// exists so a wedged compositor cannot pin the stream thread.
 const OP_BUDGET: Duration = Duration::from_secs(3);
-
-/// Poll slice on the Wayland fd (same cadence as the keepalive loop in `kwin.rs`).
-const POLL_MS: i32 = 100;
 
 // KWin's CVT generator aligns custom-mode width down to this grain, so the generated
 // mode may be a few px narrower than asked. Imported from `kwin.rs` — a second copy
@@ -445,6 +441,12 @@ impl Dispatch<WlCallback, u32> for State {
     }
 }
 
+impl crate::wl_pump::SyncDone for State {
+    fn sync_done(&self) -> u32 {
+        self.sync_done
+    }
+}
+
 struct Session {
     conn: Connection,
     queue: wayland_client::EventQueue<State>,
@@ -546,51 +548,28 @@ impl Session {
     fn sync_barrier(&mut self, deadline: Instant) -> bool {
         self.next_sync += 1;
         let serial = self.next_sync;
-        let qh = self.queue.handle();
-        let _cb = self.conn.display().sync(&qh, serial);
-        self.pump_until(deadline, |st| st.sync_done >= serial)
+        let barrier = crate::wl_pump::sync_barrier(
+            &self.conn,
+            &mut self.queue,
+            &mut self.state,
+            serial,
+            deadline,
+            None,
+        );
+        matches!(barrier, Ok(crate::wl_pump::Pumped::Done))
     }
 
-    /// Bounded event loop: flush, dispatch, poll the fd up to [`POLL_MS`].
-    /// `blocking_dispatch` cannot be interrupted, so we poll instead (same as
-    /// `kwin.rs::run`). Returns `true` once `done(&state)` holds.
+    /// Dispatch until `done` holds or `deadline` passes ([`crate::wl_pump`]).
     fn pump_until(&mut self, deadline: Instant, done: impl Fn(&State) -> bool) -> bool {
-        loop {
-            if done(&self.state) {
-                return true;
-            }
-            if self.queue.dispatch_pending(&mut self.state).is_err() {
-                return false;
-            }
-            if done(&self.state) {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            if self.conn.flush().is_err() {
-                return false;
-            }
-            let Some(guard) = self.conn.prepare_read() else {
-                continue; // events already queued — loop dispatches them
-            };
-            let mut pfd = libc::pollfd {
-                fd: self.conn.as_fd().as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let timeout = (remaining.as_millis() as i32).clamp(0, POLL_MS);
-            // SAFETY: `&mut pfd` points at one live, fully-initialized `libc::pollfd` on the stack and
-            // the count `1` matches that single element, so `poll` reads `fd`/`events` and writes
-            // `revents` strictly within `pfd`. `pfd.fd` is the Wayland connection's fd, valid because
-            // `self.conn` (and the `prepare_read` guard) outlive the call. `poll` blocks up to
-            // `timeout` ms and writes only `revents`; `pfd` is a fresh local that aliases nothing.
-            let r = unsafe { libc::poll(&mut pfd, 1, timeout) };
-            if r > 0 && (pfd.revents & libc::POLLIN) != 0 {
-                let _ = guard.read();
-            } // else: timeout/signal — drop the guard, re-check the deadline
-        }
+        let pumped = crate::wl_pump::pump_until(
+            &self.conn,
+            &mut self.queue,
+            &mut self.state,
+            Some(deadline),
+            None,
+            done,
+        );
+        matches!(pumped, Ok(crate::wl_pump::Pumped::Done))
     }
 
     fn new_config(&self) -> OutputConfig {
@@ -763,26 +742,20 @@ pub(crate) fn apply_topology(
     // Extend adds a screen beside the others and never takes primary.
     let take_primary = kind != TopologyKind::Extend && !sibling_is_primary;
 
-    // Monitors the operator asked to keep lit through an exclusive stream (§5.5). Matched
-    // case-insensitively: a connector reaches us from the console, from a config file and
-    // from KWin itself, and `DP-1` / `dp-1` are the same screen to the person who typed it.
+    // Monitors the operator asked to keep lit through an exclusive stream (§5.5).
     let keep_lit = crate::policy::prefs().get().keep_monitors;
-    let kept = |name: &str| keep_lit.iter().any(|k| k.eq_ignore_ascii_case(name));
 
     let mut to_disable: Vec<(OutputDevice, String, String)> = Vec::new();
     if kind == TopologyKind::Exclusive {
         for d in sess.state.devices.values() {
-            let is_ours = d.proxy.as_ref().map(|p| p.id()) == our_id;
-            let managed = d
-                .name
-                .as_deref()
-                .is_some_and(|n| n.starts_with(MANAGED_PREFIX));
-            let stays_lit = d.name.as_deref().is_some_and(kept);
-            if d.enabled && !is_ours && !managed && !stays_lit {
-                if let (Some(name), Some(proxy)) = (d.name.clone(), d.proxy.clone()) {
-                    let spec = sess.current_dims(d).map(mode_spec).unwrap_or_default();
-                    to_disable.push((proxy, name, spec));
-                }
+            let (Some(name), Some(proxy)) = (d.name.clone(), d.proxy.clone()) else {
+                continue;
+            };
+            let is_ours = Some(proxy.id()) == our_id;
+            let managed = name.starts_with(MANAGED_PREFIX);
+            if crate::monitors::darkens(&name, d.enabled, managed, is_ours, &keep_lit) {
+                let spec = sess.current_dims(d).map(mode_spec).unwrap_or_default();
+                to_disable.push((proxy, name, spec));
             }
         }
     }

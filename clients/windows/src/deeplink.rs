@@ -60,10 +60,7 @@ unsafe fn close_handle(handle: HANDLE) {
 pub(crate) fn positional_url(args: &[String]) -> Option<String> {
     args.iter()
         .skip(1)
-        .find(|a| {
-            let lower = a.to_ascii_lowercase();
-            lower.starts_with("punktfunk://") || lower.starts_with("pf://")
-        })
+        .find(|a| pf_client_core::deeplink::is_link_arg(a))
         .cloned()
 }
 

@@ -86,9 +86,7 @@ windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a74410
 # (see the `gamepad` field in app/); the spawned punktfunk-session does the actual forwarding. SDL3
 # itself (built from source via the bundled CMake on Windows) is pulled transitively by
 # pf-client-core with the same `build-from-source,hidapi` features, so it is not a direct dep here.
-serde_json = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # The reactor's own headless test harness, at the SAME pinned rev: the `test` feature gates
 # `RenderCx::for_test`/`ChannelDispatcher`; `test_reactor` is the upstream repo's

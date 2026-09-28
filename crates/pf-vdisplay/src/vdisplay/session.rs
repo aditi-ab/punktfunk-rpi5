@@ -277,7 +277,6 @@ fn default_bus(env: &EnvProbe, runtime: &str) -> String {
 /// lingering gamescope. Cheap (`/proc` + socket scan).
 #[cfg(target_os = "linux")]
 pub fn detect_active_session() -> ActiveSession {
-    use std::os::unix::fs::MetadataExt;
     let uid = crate::proc::current_uid();
     // One snapshot before any scan — see [`EnvProbe`]. Everything below reads this, never the env.
     let env = EnvProbe::sample();
@@ -292,50 +291,27 @@ pub fn detect_active_session() -> ActiveSession {
     let mut winning_pid: Option<u32> = None;
     // scroll shares sway's backend but not its desktop name, which portal routing reads.
     let mut winning_scroll = false;
-    if let Ok(entries) = std::fs::read_dir("/proc") {
-        for e in entries.flatten() {
-            let name = e.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
-                continue;
-            }
-            let pid_path = e.path();
-            let Ok(md) = std::fs::metadata(&pid_path) else {
-                continue;
-            };
-            if md.uid() != uid {
-                continue;
-            }
-            let Some(comm) = crate::proc::match_name(&pid_path) else {
-                continue;
-            };
-            let (k, prio) = match comm.as_str() {
-                "gamescope" | "gamescope-wl" => (ActiveKind::Gaming, 1),
-                "kwin_wayland" => (ActiveKind::DesktopKde, 4),
-                "gnome-shell" => (ActiveKind::DesktopGnome, 4),
-                // Own backend (hyprctl + xdph), not the sway/river wlroots family.
-                "Hyprland" | "hyprland" => (ActiveKind::DesktopHyprland, 4),
-                // scroll is a sway fork: same IPC, `scrollmsg`, `scroll-ipc.*` socket.
-                "sway" | "river" | "scroll" => (ActiveKind::DesktopWlroots, 4),
-                _ => continue,
-            };
-            let pid = name.parse::<u32>().ok();
-            if prio > best {
-                best = prio;
-                kind = k;
-                winning_pid = pid;
-                winning_scroll = comm == "scroll";
-            } else if prio == best {
-                // Lowest pid among same-priority hits, so `/proc` order cannot flap `winning_pid`
-                // and look like a compositor restart.
-                if let (Some(p), Some(w)) = (pid, winning_pid) {
-                    if p < w {
-                        kind = k;
-                        winning_pid = Some(p);
-                        winning_scroll = comm == "scroll";
-                    }
-                }
-            }
+    for (pid, pid_path) in crate::proc::own_pids() {
+        let Some(comm) = crate::proc::match_name(&pid_path) else {
+            continue;
+        };
+        let (k, prio) = match comm.as_str() {
+            "gamescope" | "gamescope-wl" => (ActiveKind::Gaming, 1),
+            "kwin_wayland" => (ActiveKind::DesktopKde, 4),
+            "gnome-shell" => (ActiveKind::DesktopGnome, 4),
+            // Own backend (hyprctl + xdph), not the sway/river wlroots family.
+            "Hyprland" | "hyprland" => (ActiveKind::DesktopHyprland, 4),
+            // scroll is a sway fork: same IPC, `scrollmsg`, `scroll-ipc.*` socket.
+            "sway" | "river" | "scroll" => (ActiveKind::DesktopWlroots, 4),
+            _ => continue,
+        };
+        // Lowest pid among same-priority hits, so `/proc` order cannot flap `winning_pid`
+        // and look like a compositor restart.
+        if prio > best || (prio == best && winning_pid.is_some_and(|w| pid < w)) {
+            best = prio;
+            kind = k;
+            winning_pid = Some(pid);
+            winning_scroll = comm == "scroll";
         }
     }
 
@@ -381,28 +357,36 @@ pub fn detect_active_session() -> ActiveSession {
 /// owned instance dir under `$XDG_RUNTIME_DIR/hypr/` that still has `.socket.sock`.
 #[cfg(target_os = "linux")]
 fn find_hypr_signature(env: &EnvProbe, runtime: &str, uid: u32) -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
     let hypr = std::path::Path::new(runtime).join("hypr");
     if let Some(sig) = &env.hyprland_signature {
         if hypr.join(sig).join(".socket.sock").exists() {
             return Some(sig.clone());
         }
     }
-    let mut cands: Vec<(std::time::SystemTime, String)> = Vec::new();
-    for e in std::fs::read_dir(&hypr).ok()?.flatten() {
-        let Ok(md) = e.metadata() else { continue };
-        if !md.is_dir() || md.uid() != uid {
-            continue;
-        }
-        if !e.path().join(".socket.sock").exists() {
-            continue;
-        }
-        let name = e.file_name().to_string_lossy().into_owned();
-        let mtime = md.modified().unwrap_or(std::time::UNIX_EPOCH);
-        cands.push((mtime, name));
-    }
-    cands.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
-    cands.into_iter().next().map(|(_, n)| n)
+    newest_owned(&hypr, uid, |name, md, path| {
+        (md.is_dir() && path.join(".socket.sock").exists()).then(|| name.to_string())
+    })
+}
+
+/// What `accept` makes of the newest entry of `dir` owned by `uid` that it takes. `accept` sees
+/// the entry's name, metadata and path. Equal mtimes keep `read_dir` order.
+#[cfg(target_os = "linux")]
+fn newest_owned(
+    dir: &std::path::Path,
+    uid: u32,
+    accept: impl Fn(&str, &std::fs::Metadata, &std::path::Path) -> Option<String>,
+) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let md = e.metadata().ok().filter(|md| md.uid() == uid)?;
+            let answer = accept(&e.file_name().to_string_lossy(), &md, &e.path())?;
+            Some((md.modified().unwrap_or(std::time::UNIX_EPOCH), answer))
+        })
+        .min_by_key(|(mtime, _)| std::cmp::Reverse(*mtime))
+        .map(|(_, answer)| answer)
 }
 
 /// sway and scroll name their IPC socket `<stem>.<uid>.<pid>.sock`.
@@ -415,7 +399,6 @@ const SWAY_IPC_STEMS: [&str; 2] = ["sway-ipc", "scroll-ipc"];
 /// backend talks through `swaymsg`.
 #[cfg(target_os = "linux")]
 fn find_sway_socket(env: &EnvProbe, runtime: &str, uid: u32, pid: Option<u32>) -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
     if let Some(s) = &env.swaysock {
         if std::path::Path::new(s).exists() {
             return Some(s.clone());
@@ -430,21 +413,10 @@ fn find_sway_socket(env: &EnvProbe, runtime: &str, uid: u32, pid: Option<u32>) -
         }
     }
     let prefixes = SWAY_IPC_STEMS.map(|stem| format!("{stem}.{uid}."));
-    let mut cands: Vec<(std::time::SystemTime, String)> = Vec::new();
-    for e in std::fs::read_dir(runtime).ok()?.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if !prefixes.iter().any(|p| name.starts_with(p)) || !name.ends_with(".sock") {
-            continue;
-        }
-        let Ok(md) = e.metadata() else { continue };
-        if md.uid() != uid {
-            continue;
-        }
-        let mtime = md.modified().unwrap_or(std::time::UNIX_EPOCH);
-        cands.push((mtime, e.path().to_string_lossy().into_owned()));
-    }
-    cands.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
-    cands.into_iter().next().map(|(_, p)| p)
+    newest_owned(std::path::Path::new(runtime), uid, |name, _, path| {
+        (prefixes.iter().any(|p| name.starts_with(p)) && name.ends_with(".sock"))
+            .then(|| path.to_string_lossy().into_owned())
+    })
 }
 
 /// `HYPRLAND_INSTANCE_SIGNATURE` for a `hyprctl` child, resolved at spawn.
@@ -479,7 +451,6 @@ pub(crate) fn sway_socket() -> Option<String> {
 /// invisible: what answers is something the session launched (plasmashell, the polkit agent).
 #[cfg(target_os = "linux")]
 pub fn session_x11_env() -> Option<(String, Option<String>)> {
-    use std::os::unix::fs::MetadataExt;
     let (display, xauthority) = crate::with_env_lock(|| {
         let v = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
         (v("DISPLAY"), v("XAUTHORITY"))
@@ -488,21 +459,10 @@ pub fn session_x11_env() -> Option<(String, Option<String>)> {
         return Some((d, xauthority));
     }
     let want_wayland = EnvProbe::sample().wayland_display;
-    let uid = crate::proc::current_uid();
     let mut any = None;
-    for e in std::fs::read_dir("/proc").ok()?.flatten() {
-        let name = e.file_name();
-        if !name.as_encoded_bytes().iter().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        let Ok(md) = e.metadata() else { continue };
-        if md.uid() != uid {
-            continue;
-        }
-        let Ok(raw) = std::fs::read(e.path().join("environ")) else {
-            continue;
-        };
-        let Some((d, xauth, wayland)) = x11_env_from_environ(&raw) else {
+    for (_, path) in crate::proc::own_pids() {
+        let Some((d, xauth, wayland)) = crate::proc::display_env(&path).and_then(desktop_x11)
+        else {
             continue;
         };
         if !x11_socket_live(&d) {
@@ -517,30 +477,15 @@ pub fn session_x11_env() -> Option<(String, Option<String>)> {
     any
 }
 
-/// `(DISPLAY, XAUTHORITY, WAYLAND_DISPLAY)` from one `/proc/<pid>/environ` block. `None` when the
-/// block names no display, or when it belongs to a nested gamescope — that Xwayland dies with the
-/// game, and a desktop launch aimed at it lands nowhere.
+/// `(DISPLAY, XAUTHORITY, WAYLAND_DISPLAY)` of one process. `None` when it names no display, or
+/// when it belongs to a nested gamescope — that Xwayland dies with the game, and a desktop launch
+/// aimed at it lands nowhere.
 #[cfg(target_os = "linux")]
-fn x11_env_from_environ(raw: &[u8]) -> Option<(String, Option<String>, Option<String>)> {
-    let (mut display, mut xauth, mut wayland) = (None, None, None);
-    for kv in raw.split(|&b| b == 0) {
-        let kv = String::from_utf8_lossy(kv);
-        let take = |k: &str| {
-            kv.strip_prefix(k)
-                .filter(|v| !v.is_empty())
-                .map(String::from)
-        };
-        if kv.starts_with("GAMESCOPE_WAYLAND_DISPLAY=") {
-            return None;
-        } else if let Some(v) = take("DISPLAY=") {
-            display = Some(v);
-        } else if let Some(v) = take("XAUTHORITY=") {
-            xauth = Some(v);
-        } else if let Some(v) = take("WAYLAND_DISPLAY=") {
-            wayland = Some(v);
-        }
+fn desktop_x11(env: crate::proc::DisplayEnv) -> Option<(String, Option<String>, Option<String>)> {
+    if env.gamescope_wayland.is_some() {
+        return None;
     }
-    Some((display?, xauth, wayland))
+    Some((env.display?, env.xauthority, env.wayland))
 }
 
 /// Does this `DISPLAY` still have a socket? Guards against a value inherited from an X server that
@@ -563,7 +508,6 @@ pub fn detect_active_session() -> ActiveSession {
 /// else newest-mtime owned socket (skip `.lock`).
 #[cfg(target_os = "linux")]
 fn find_wayland_socket(env: &EnvProbe, runtime: &str, uid: u32) -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
     if let Some(w) = env.wayland_display.clone() {
         {
             let p = if w.starts_with('/') {
@@ -576,21 +520,9 @@ fn find_wayland_socket(env: &EnvProbe, runtime: &str, uid: u32) -> Option<String
             }
         }
     }
-    let mut cands: Vec<(std::time::SystemTime, String)> = Vec::new();
-    for e in std::fs::read_dir(runtime).ok()?.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if !name.starts_with("wayland-") || name.ends_with(".lock") {
-            continue;
-        }
-        let Ok(md) = e.metadata() else { continue };
-        if md.uid() != uid {
-            continue;
-        }
-        let mtime = md.modified().unwrap_or(std::time::UNIX_EPOCH);
-        cands.push((mtime, name));
-    }
-    cands.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
-    cands.into_iter().next().map(|(_, n)| n)
+    newest_owned(std::path::Path::new(runtime), uid, |name, _, _| {
+        (name.starts_with("wayland-") && !name.ends_with(".lock")).then(|| name.to_string())
+    })
 }
 
 /// Write the live session into the process env so backends that can only read
@@ -929,6 +861,10 @@ mod tests {
         vars.join("\0").into_bytes()
     }
 
+    fn x11_env_from_environ(raw: &[u8]) -> Option<(String, Option<String>, Option<String>)> {
+        desktop_x11(crate::proc::DisplayEnv::parse(raw))
+    }
+
     /// The session's own display, with the auth file that goes with it.
     #[test]
     fn a_session_process_yields_its_display_and_auth() {
@@ -954,6 +890,13 @@ mod tests {
     fn a_gamescope_display_is_refused() {
         let raw = environ(&["DISPLAY=:1", "GAMESCOPE_WAYLAND_DISPLAY=gamescope-0"]);
         assert_eq!(x11_env_from_environ(&raw), None);
+    }
+
+    /// An empty `GAMESCOPE_WAYLAND_DISPLAY=` names no gamescope, so the display still answers.
+    #[test]
+    fn an_empty_gamescope_key_is_not_a_nested_session() {
+        let raw = environ(&["DISPLAY=:0", "GAMESCOPE_WAYLAND_DISPLAY="]);
+        assert_eq!(x11_env_from_environ(&raw), Some((":0".into(), None, None)));
     }
 
     /// Every Wayland-only process has an empty or absent `DISPLAY`. Neither is a display.

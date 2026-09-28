@@ -1,7 +1,7 @@
 //! Per-AU H.265 conversion: one [`AuPlan`] into the `DXVA_PicParams_HEVC`,
 //! `DXVA_Qmatrix_HEVC` and slice-control records
 //! `ID3D11VideoContext::SubmitDecoderBuffers` takes — [`crate::pic`] one codec
-//! over, and the DXVA twin of [`pf_vkdecode::pic_h265`].
+//! over, and the DXVA twin of `pf_vkdecode::pic_h265`.
 //!
 //! HEVC decode takes no per-slice reference lists. Hardware re-derives 8.3.4
 //! from the slice bits, keyed by `RefPicSetStCurrBefore`/`StCurrAfter`/`LtCurr`
@@ -25,10 +25,11 @@ use cros_codecs::codec::h265::parser::Sps;
 use pf_bitstream::h265::AuPlan;
 use pf_bitstream::h265::PicId;
 use pf_bitstream::h265::RefPic;
-use pf_vkdecode::num_delta_pocs_of_ref_rps_idx;
-use pf_vkdecode::RefRpsIdxError;
-use pf_vkdecode::SlotError;
-use pf_vkdecode::SlotMap;
+use pf_bitstream::h265::RefRpsIdxError;
+use pf_bitstream::h265::RpsError;
+use pf_bitstream::slots::Removals;
+use pf_bitstream::slots::SlotError;
+use pf_bitstream::slots::SlotMap;
 use tracing::trace;
 
 use crate::dxva::HevcFormatFlags;
@@ -47,6 +48,10 @@ const REF_PIC_LIST_LEN: usize = 15;
 /// Each `RefPicSet*` index array holds eight entries — H.265 allows more;
 /// beyond eight is unexpressible here and refused.
 pub const RPS_LIST_SIZE: usize = 8;
+
+// The index arrays go in as pf-bitstream builds them, so its unused marker
+// must be DXVA's.
+const _: () = assert!(pf_bitstream::h265::RPS_UNUSED == UNUSED_ENTRY);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DxvaRefH265 {
@@ -70,7 +75,7 @@ pub struct DecodePlanDxvaH265 {
     /// matrices, and a driver that honours a buffer it was handed dequantizes
     /// against its contents.
     pub qmatrix: Option<QmatrixHevc>,
-    /// Byte ranges of the AU's slice-segment NALUs, start code included, in plan
+    /// Byte ranges of the AU's slice-segment NALs, start code dropped, in plan
     /// order — what [`crate::pack::pack`] takes.
     pub slice_ranges: Vec<Range<usize>>,
     pub setup_slot: u8,
@@ -188,6 +193,15 @@ impl From<SlotError> for PlanToDxvaH265Error {
     }
 }
 
+impl From<RpsError> for PlanToDxvaH265Error {
+    fn from(err: RpsError) -> Self {
+        match err {
+            RpsError::SetOverflow { set, len } => PlanToDxvaH265Error::RpsSetOverflow { set, len },
+            RpsError::OutsideRps(id) => PlanToDxvaH265Error::ReferenceOutsideRps(id),
+        }
+    }
+}
+
 impl From<RefRpsIdxError> for PlanToDxvaH265Error {
     fn from(err: RefRpsIdxError) -> Self {
         PlanToDxvaH265Error::RefRpsIdx(err)
@@ -283,83 +297,42 @@ pub fn plan_to_dxva_h265(
         });
     }
 
-    let mut refs: Vec<DxvaRefH265> = Vec::new();
-    let mut index_arrays = [[UNUSED_ENTRY; RPS_LIST_SIZE]; 3];
-    let sets: [(&'static str, &[RefPic]); 3] = [
-        ("RefPicSetStCurrBefore", &plan.rps.st_curr_before),
-        ("RefPicSetStCurrAfter", &plan.rps.st_curr_after),
-        ("RefPicSetLtCurr", &plan.rps.lt_curr),
-    ];
-    for (array, (name, set)) in index_arrays.iter_mut().zip(sets) {
-        if set.len() > RPS_LIST_SIZE {
-            return Err(PlanToDxvaH265Error::RpsSetOverflow {
-                set: name,
-                len: set.len(),
-            });
+    // The current sets lead `RefPicList`, so the index arrays' positions into
+    // them are `RefPicList` indices as they stand.
+    let current = plan.current_rps_refs()?;
+    let mut refs: Vec<DxvaRefH265> = Vec::with_capacity(REF_PIC_LIST_LEN);
+    for (rp, _) in &current.refs {
+        let slot = slots
+            .slot_of(rp.id)
+            .ok_or(PlanToDxvaH265Error::UnresolvedReference(rp.id))?;
+        // DPB snapshot is the authority for the marking: an `RefPicSetLtCurr`
+        // index into a short-term-marked entry is an inconsistent DPB. The set's
+        // own copy is the fallback and cannot be reached off a real plan (8.3.2).
+        let marked = plan.dpb_refs.iter().find(|d| d.id == rp.id);
+        if marked.is_none() {
+            trace!(
+                id = rp.id,
+                "an RPS entry names a picture the marked DPB does not hold"
+            );
         }
-        for (position, rp) in set.iter().enumerate() {
-            let index = match refs.iter().position(|existing| existing.id == rp.id) {
-                // A picture that appears in two sets binds once; both index arrays
-                // point at that one entry.
-                Some(index) => index,
-                None => {
-                    let slot = slots
-                        .slot_of(rp.id)
-                        .ok_or(PlanToDxvaH265Error::UnresolvedReference(rp.id))?;
-                    // DPB snapshot is the authority for the marking: an
-                    // `RefPicSetLtCurr` index into a short-term-marked entry is an
-                    // inconsistent DPB. The set's own copy is the fallback and
-                    // cannot be reached off a real plan (8.3.2).
-                    let marked = plan.dpb_refs.iter().find(|d| d.id == rp.id);
-                    if marked.is_none() {
-                        trace!(
-                            id = rp.id,
-                            "an RPS entry names a picture the marked DPB does not hold"
-                        );
-                    }
-                    refs.push(dxva_ref(slot, marked.unwrap_or(rp)));
-                    refs.len() - 1
-                }
-            };
-            // The RPS-set overflow check above bounds this well inside u8 (and
-            // below the 0xFF sentinel).
-            array[position] = index as u8;
-        }
+        refs.push(dxva_ref(slot, marked.unwrap_or(rp)));
     }
     if refs.len() > REF_PIC_LIST_LEN {
         return Err(PlanToDxvaH265Error::TooManyReferences(refs.len()));
     }
-
-    // Cross-check against the current sets alone — what `refs` holds at this
-    // point, and why the check runs before *Foll* pictures are appended. 8.3.4
-    // builds every slice list from the current sets; a picture merely in
-    // `RefPicList` is not reachable by that derivation.
-    let current_set_refs = refs.len();
-    for slice in &plan.slices {
-        for rp in slice.ref_list0.iter().chain(&slice.ref_list1) {
-            if !refs[..current_set_refs]
-                .iter()
-                .any(|existing| existing.id == rp.id)
-            {
-                return Err(PlanToDxvaH265Error::ReferenceOutsideRps(rp.id));
-            }
-        }
-    }
+    let index_arrays = current.index;
 
     // Rest of the marked DPB (*Foll* pictures) in planner DPB order. Overflow
     // past the array is dropped, not refused: nothing here is referenced by this
     // picture, so the decode is unaffected. `RefPicList` holds 15 while the DPB
     // holds up to 16, so this is reachable.
-    for rp in &plan.dpb_refs {
+    for rp in &current.foll {
         if refs.len() == REF_PIC_LIST_LEN {
             trace!(
                 marked = plan.dpb_refs.len(),
                 "the marked DPB exceeds RefPicList; the tail is not expressible"
             );
             break;
-        }
-        if refs.iter().any(|existing| existing.id == rp.id) {
-            continue;
         }
         match slots.slot_of(rp.id) {
             Some(slot) => refs.push(dxva_ref(slot, rp)),
@@ -368,7 +341,7 @@ pub fn plan_to_dxva_h265(
     }
 
     // Everything else fallible, before any mutation.
-    let num_delta_pocs = num_delta_pocs_of_ref_rps_idx(plan)?;
+    let num_delta_pocs = plan.num_delta_pocs_of_ref_rps_idx()?;
     let st_rps_bits = u16::try_from(pic.short_term_ref_pic_set_size_bits).map_err(|_| {
         PlanToDxvaH265Error::StRpsBitsOverflow(pic.short_term_ref_pic_set_size_bits)
     })?;
@@ -515,25 +488,11 @@ pub fn plan_to_dxva_h265(
         .scaling_list_enabled_flag
         .then(|| quantization_matrices(sps, pps));
 
-    let slice_ranges: Vec<Range<usize>> = plan.slices.iter().map(|s| s.data.clone()).collect();
+    let slice_ranges: Vec<Range<usize>> = plan.slices.iter().map(|s| s.nal.clone()).collect();
 
-    // Mutations last, after every fallible step. Removals first — they were real
-    // regardless of this AU's fate — then the setup assignment, released
-    // immediately when this plan already evicted the stored picture (the surface
-    // must still exist for the decode itself).
-    let setup_evicted = plan.dpb.removed.contains(&setup_id);
-    for &id in &plan.dpb.removed {
-        if id == setup_id {
-            continue;
-        }
-        if !slots.release(id) {
-            trace!(id, "DpbUpdate removed an id this SlotMap never assigned");
-        }
-    }
-    let setup_slot = slots.assign(setup_id)?;
-    if setup_evicted {
-        slots.release(setup_id);
-    }
+    // Mutations last, after every fallible step. Removals first: they were real
+    // regardless of this AU's fate.
+    let (setup_slot, _) = slots.commit_setup(setup_id, &plan.dpb.removed, Removals::ReleaseNow)?;
     pp.CurrPic = PicEntry::new(setup_slot, false);
 
     Ok(DecodePlanDxvaH265 {
@@ -562,21 +521,15 @@ pub fn slice_control_h265(records: &[crate::pack::SliceRecord]) -> Vec<SliceHevc
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
 
-    use cros_codecs::codec::h265::parser::Nalu;
     use pf_bitstream::h265::H265Planner;
+    use pf_bitstream::testing::split_h265_aus;
 
     use super::*;
 
-    /// Vendored vectors pf-bitstream's and pf-vkdecode's h265 tests plan, included
-    /// from the same path.
-    const TEST_25FPS: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265"
-    );
-    const TEST_64X64_I_P_B_P: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/64x64-I-P-B-P.h265"
-    );
+    /// Vendored vectors pf-bitstream's and pf-vkdecode's h265 tests plan.
+    const TEST_25FPS: &[u8] = pf_bitstream::testing::H265_25FPS;
+    const TEST_64X64_I_P_B_P: &[u8] = pf_bitstream::testing::H265_64X64_I_P_B_P;
 
     /// Host HEVC: the only stream in this repository that reaches the DPB pressure
     /// HEVC's no-aliasing exemption is claimed against — low-delay IPPP,
@@ -586,37 +539,11 @@ mod tests {
     const LOWDELAY_640X480_H265: &[u8] =
         include_bytes!("../../pf-vkdecode/tests/data/lowdelay-640x480.h265");
 
-    /// Test-only AU splitter, mirroring pf-vkdecode's (which mirrors
-    /// pf-bitstream's `#[cfg(test)]`-private helper).
-    fn split_into_aus(stream: &[u8]) -> Vec<&[u8]> {
-        let mut aus = Vec::new();
-        let mut cursor = Cursor::new(stream);
-        let mut au_start = 0usize;
-        let mut au_has_slice = false;
-
-        while let Ok(nalu) = Nalu::next(&mut cursor) {
-            let header_start = cursor.position() as usize;
-            let start = header_start - nalu.offset;
-            let is_slice = (nalu.header.type_ as u32) < 32;
-            let first_slice_flag =
-                is_slice && stream.get(header_start + 2).is_some_and(|b| b & 0x80 != 0);
-
-            if au_has_slice && (!is_slice || first_slice_flag) {
-                aus.push(&stream[au_start..start]);
-                au_start = start;
-                au_has_slice = false;
-            }
-            au_has_slice |= is_slice;
-        }
-        aus.push(&stream[au_start..]);
-        aus
-    }
-
     fn convert_stream(stream: &[u8]) -> Vec<(AuPlan, DecodePlanDxvaH265)> {
         let mut planner = H265Planner::new();
         let mut slots: Option<SlotMap> = None;
         let mut out = Vec::new();
-        for (i, au) in split_into_aus(stream).into_iter().enumerate() {
+        for (i, au) in split_h265_aus(stream).into_iter().enumerate() {
             let Ok(plan) = planner.plan_au(au) else {
                 continue;
             };
@@ -714,7 +641,7 @@ mod tests {
         // Injected into the snapshot rather than synthesised as a bitstream — the
         // conversion, not the planner, is under test. Vendored vectors never produce
         // this (their RPS names every marked picture they hold).
-        let aus = split_into_aus(TEST_25FPS);
+        let aus = split_h265_aus(TEST_25FPS);
         let mut planner = H265Planner::new();
         let plans: Vec<AuPlan> = aus
             .iter()
@@ -984,7 +911,7 @@ mod tests {
         let mut aliased = 0usize;
         let mut converted = 0usize;
 
-        for (i, au) in split_into_aus(LOWDELAY_640X480_H265)
+        for (i, au) in split_h265_aus(LOWDELAY_640X480_H265)
             .into_iter()
             .enumerate()
         {
@@ -1174,7 +1101,7 @@ mod tests {
         pps_coded: Option<u8>,
     ) -> (AuPlan, DecodePlanDxvaH265) {
         let mut planner = H265Planner::new();
-        let aus = split_into_aus(TEST_25FPS);
+        let aus = split_h265_aus(TEST_25FPS);
         let mut plan = planner.plan_au(aus[0]).expect("plan");
 
         let mut sps = (*plan.sps).clone();
@@ -1298,7 +1225,7 @@ mod tests {
         // matrix for the inter slot.
         let (_, dxva) = {
             let mut planner = H265Planner::new();
-            let aus = split_into_aus(TEST_25FPS);
+            let aus = split_h265_aus(TEST_25FPS);
             let mut plan = planner.plan_au(aus[0]).expect("plan");
             let mut sps = (*plan.sps).clone();
             sps.scaling_list_enabled_flag = true;
@@ -1345,7 +1272,7 @@ mod tests {
 
     #[test]
     fn slice_ranges_ride_through_in_plan_order_on_start_code_boundaries() {
-        let aus = split_into_aus(TEST_25FPS);
+        let aus = split_h265_aus(TEST_25FPS);
         let mut planner = H265Planner::new();
         let mut slots: Option<SlotMap> = None;
         for (i, au) in aus.iter().enumerate() {
@@ -1354,15 +1281,14 @@ mod tests {
             let dxva = plan_to_dxva_h265(&plan, map, i as u32 + 1).expect("convert");
             assert_eq!(dxva.slice_ranges.len(), plan.slices.len());
             for range in &dxva.slice_ranges {
-                let at = &au[range.start..];
-                assert!(at.starts_with(&[0, 0, 1]) || at.starts_with(&[0, 0, 0, 1]));
+                assert_eq!(au[range.start - 3..range.start], [0, 0, 1]);
             }
         }
     }
 
     #[test]
     fn a_capacity_mismatch_is_refused_and_leaves_the_map_untouched() {
-        let aus = split_into_aus(TEST_25FPS);
+        let aus = split_h265_aus(TEST_25FPS);
         let mut planner = H265Planner::new();
         let plan = planner.plan_au(aus[0]).expect("plan");
         let mut slots = SlotMap::new(plan.picture.max_dpb_frames + 1);
@@ -1378,7 +1304,7 @@ mod tests {
 
     #[test]
     fn a_reference_the_map_never_saw_is_refused_and_leaves_the_map_untouched() {
-        let aus = split_into_aus(TEST_25FPS);
+        let aus = split_h265_aus(TEST_25FPS);
         let mut planner = H265Planner::new();
         let first = planner.plan_au(aus[0]).expect("plan 0");
         let second = planner.plan_au(aus[1]).expect("plan 1");
@@ -1423,7 +1349,7 @@ mod tests {
 
     #[test]
     fn a_slot_is_reused_only_after_its_picture_leaves_the_dpb() {
-        let aus = split_into_aus(TEST_25FPS);
+        let aus = split_h265_aus(TEST_25FPS);
         let mut planner = H265Planner::new();
         let mut slots: Option<SlotMap> = None;
         let mut live: Vec<(PicId, u8)> = Vec::new();

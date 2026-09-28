@@ -179,12 +179,7 @@ impl SessionSettingsStore {
     /// so a full disk cannot leave the running host disagreeing with its file.
     pub fn set(&self, settings: SessionSettings) -> Result<()> {
         let settings = settings.sanitized();
-        if let Some(dir) = self.path.parent() {
-            pf_paths::create_private_dir(dir)?;
-        }
-        let tmp = self.path.with_extension("json.tmp");
-        pf_paths::write_secret_file(&tmp, &serde_json::to_vec_pretty(&settings)?)?;
-        std::fs::rename(&tmp, &self.path)?;
+        pf_paths::replace_secret_file(&self.path, &serde_json::to_vec_pretty(&settings)?)?;
         *self.cur.lock().unwrap_or_else(|e| e.into_inner()) = Some(settings);
         Ok(())
     }
@@ -312,6 +307,7 @@ mod tests {
         assert_eq!(got.version, 1, "version is normalized, not echoed");
         let reloaded = SessionSettingsStore::load_from(path.clone());
         assert_eq!(reloaded.get().game_on_session_end, GameOnSessionEnd::Always);
-        assert!(!path.with_extension("json.tmp").exists());
+        let files = std::fs::read_dir(td.path()).unwrap().count();
+        assert_eq!(files, 1, "the temp does not outlive the rename");
     }
 }

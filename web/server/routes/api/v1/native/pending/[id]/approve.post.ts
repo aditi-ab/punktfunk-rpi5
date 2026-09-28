@@ -6,16 +6,9 @@
 // Wins over the `/api/**` catch-all by h3 route specificity. Deny is NOT gated — it only ever
 // narrows what the host trusts.
 import { createError, defineEventHandler, getRouterParam, readBody } from "h3";
+import type { ApprovePending } from "../../../../../../../src/api/gen/model";
 import { confirmPassword } from "../../../../../../util/confirm";
-import { forwardJson } from "../../../../../../util/forward";
-
-interface ApproveBody {
-	name?: string | null;
-	grants?: number;
-	expires_in_secs?: number;
-	until_disconnect?: boolean;
-	password?: string;
-}
+import { type AllFields, forwardJson } from "../../../../../../util/forward";
 
 export default defineEventHandler(async (event) => {
 	// The id goes into the upstream path, so it has to be exactly what the contract says it is —
@@ -24,17 +17,16 @@ export default defineEventHandler(async (event) => {
 	if (!Number.isInteger(id) || id < 0) {
 		throw createError({ statusCode: 404, statusMessage: "no such pending id" });
 	}
-	const body = await readBody<ApproveBody>(event);
+	const body = await readBody<ApprovePending & { password?: string }>(event);
 	await confirmPassword(event, body?.password);
 	// Rebuild from known fields so the password cannot leak upstream. Absent stays absent: the
 	// dialog omits `grants`/`expires_in_secs` to keep a re-knocking device's stored access.
-	const { name, grants, expires_in_secs, until_disconnect } = body ?? {};
-	const upstream: Omit<ApproveBody, "password"> = {};
-	if (typeof name === "string") upstream.name = name;
-	if (grants !== undefined) upstream.grants = grants;
-	if (expires_in_secs !== undefined) upstream.expires_in_secs = expires_in_secs;
-	if (until_disconnect !== undefined)
-		upstream.until_disconnect = until_disconnect;
+	const upstream = {
+		name: typeof body?.name === "string" ? body.name : undefined,
+		grants: body?.grants,
+		expires_in_secs: body?.expires_in_secs,
+		until_disconnect: body?.until_disconnect,
+	} satisfies AllFields<ApprovePending>;
 	return forwardJson(
 		event,
 		`/api/v1/native/pending/${id}/approve`,

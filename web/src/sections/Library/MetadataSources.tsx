@@ -16,14 +16,12 @@ import {
 	useListLibraryMetadata,
 	useSetLibraryMetadata,
 } from "@/api/gen/library/library";
+import type { CatalogEntry } from "@/api/gen/model";
 import type { MetadataSourceInfo } from "@/api/gen/model/metadataSourceInfo";
+import { useGetPluginCatalog } from "@/api/gen/store/store";
 import { useSourceStatus } from "@/api/metadata";
 import { METADATA_CATEGORY, usePlugins } from "@/api/plugins";
-import {
-	type StoreEntry,
-	useInstallPlugin,
-	useStoreCatalog,
-} from "@/api/store";
+import { useInstallPlugin } from "@/api/store";
 import { ROW, ROW_GAP, Stagger } from "@/components/stagger";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -43,7 +41,7 @@ export const MetadataSourcesSection: FC = () => {
 	const list = useListLibraryMetadata();
 	const set = useSetLibraryMetadata();
 	const plugins = usePlugins();
-	const catalog = useStoreCatalog();
+	const catalog = useGetPluginCatalog();
 	const install = useInstallPlugin();
 	const nameOf = useSourceNames();
 	const [settingsFor, setSettingsFor] = useState<string | null>(null);
@@ -90,7 +88,7 @@ export const MetadataSourcesSection: FC = () => {
 	const patch = (i: number, change: Partial<MetadataSourceInfo>) =>
 		apply(sources.map((s, j) => (j === i ? { ...s, ...change } : s)));
 
-	const onInstall = async (entry: StoreEntry) => {
+	const onInstall = async (entry: CatalogEntry) => {
 		try {
 			await install.mutateAsync({ source: entry.source, id: entry.id });
 			toast.success(m.library_source_installing({ title: entry.title }));

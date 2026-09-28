@@ -276,6 +276,21 @@ impl DecodedImage {
             DecodedImage::NativeVk(f) => (f.width, f.height),
         }
     }
+
+    /// The rung that decoded this frame, as the `stats:` decode-path tag. A machine
+    /// interface: additive only, and surviving tags keep their exact spelling.
+    pub fn path_label(&self) -> &'static str {
+        match self {
+            DecodedImage::Cpu(_) => "software",
+            #[cfg(target_os = "linux")]
+            DecodedImage::NativeDmabuf(_) => "native-vaapi",
+            #[cfg(windows)]
+            DecodedImage::D3d11(_) => "native-d3d11va",
+            #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
+            DecodedImage::PyroWave(_) => "pyrowave",
+            DecodedImage::NativeVk(_) => "native-vulkan",
+        }
+    }
 }
 
 /// Software-decoded 8-bit 4:2:0: Y, Cb, Cr packed back-to-back at each plane's width.
@@ -1512,6 +1527,30 @@ impl Decoder {
         self.delivered = false;
     }
 
+    /// Demote from the failing `from` rung onto `built`, the `(decoder, backend)` of the
+    /// rung named `rung`. False when it could not be built: the ladder tries the next one.
+    fn demote_into(
+        &mut self,
+        e: &anyhow::Error,
+        from: &str,
+        rung: &str,
+        built: Result<(&'static str, Backend)>,
+    ) -> bool {
+        match built {
+            Ok((decoder, backend)) => {
+                tracing::warn!(error = %format!("{e:#}"), fails = self.vaapi_fails, from, decoder,
+                    "hardware decode failing repeatedly — demoting to {rung}");
+                self.install(backend);
+                true
+            }
+            Err(why) => {
+                tracing::info!(reason = %format!("{why:#}"),
+                    "{rung} unavailable for demotion — continuing down the ladder");
+                false
+            }
+        }
+    }
+
     /// Running rung is the platform native (VAAPI / D3D11VA). The demotion
     /// that goes sideways into native Vulkan fires only from here.
     fn is_native_platform_rung(&self) -> bool {
@@ -1574,43 +1613,24 @@ impl Decoder {
         user_flags: u32,
         complete: bool,
     ) -> Result<Option<DecodedImage>> {
-        // Concealment: native `Ok(None)` because the picture was damaged, not
-        // buffering. Decides whether the `Ok` below may clear the demotion streak.
-        let mut concealed = false;
-        let result = match &mut self.backend {
-            Backend::NativeVulkan(n) => {
-                debug_assert!(complete, "partial AUs are pyrowave-only");
-                let r = n.decode(au).map(|f| f.map(DecodedImage::NativeVk));
-                // Stream damage is not a decoder fault. Concealment is `Ok(None)`
-                // plus this flag. A driver `RESULT_STATUS` Failed stays an `Err`.
-                if n.take_recovery_request() {
-                    self.want_keyframe = true;
-                    concealed = true;
-                }
-                r
-            }
+        // Native rungs: stream damage is not a decoder fault. Concealment is `Ok(None)`
+        // plus the recovery request, which decides whether the `Ok` below may clear the
+        // demotion streak. A driver `RESULT_STATUS` Failed stays an `Err`.
+        let (result, concealed) = match &mut self.backend {
+            Backend::NativeVulkan(n) => (
+                n.decode(au).map(|f| f.map(DecodedImage::NativeVk)),
+                n.take_recovery_request(),
+            ),
             #[cfg(target_os = "linux")]
-            Backend::NativeVaapi(v) => {
-                debug_assert!(complete, "partial AUs are pyrowave-only");
-                let r = v.decode(au).map(|f| f.map(DecodedImage::NativeDmabuf));
-                // Same concealment split as Vulkan.
-                if v.take_recovery_request() {
-                    self.want_keyframe = true;
-                    concealed = true;
-                }
-                r
-            }
+            Backend::NativeVaapi(v) => (
+                v.decode(au).map(|f| f.map(DecodedImage::NativeDmabuf)),
+                v.take_recovery_request(),
+            ),
             #[cfg(windows)]
-            Backend::NativeD3d11va(d) => {
-                debug_assert!(complete, "partial AUs are pyrowave-only");
-                let r = d.decode(au).map(|f| f.map(DecodedImage::D3d11));
-                // Same concealment split as Vulkan.
-                if d.take_recovery_request() {
-                    self.want_keyframe = true;
-                    concealed = true;
-                }
-                r
-            }
+            Backend::NativeD3d11va(d) => (
+                d.decode(au).map(|f| f.map(DecodedImage::D3d11)),
+                d.take_recovery_request(),
+            ),
             // Nothing else decodes PyroWave: propagate the error; the pump renegotiates the codec.
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             Backend::PyroWave(p) => {
@@ -1621,6 +1641,8 @@ impl Decoder {
             }
             Backend::Software(s) => return Ok(s.decode(au)?.map(DecodedImage::Cpu)),
         };
+        debug_assert!(complete, "partial AUs are pyrowave-only");
+        self.want_keyframe |= concealed;
         match result {
             Ok(f) => {
                 // Only an answer that proves the rung works may clear the streak.
@@ -1664,52 +1686,36 @@ impl Decoder {
                         && vaapi_auto_ok(self.vk.as_ref())
                     {
                         if let Some(codec) = native_vaapi_codec(self.wire_codec) {
-                            match NativeVaapiDecoder::new_for_presenter(
+                            let built = NativeVaapiDecoder::new_for_presenter(
                                 codec,
                                 self.stream,
                                 self.vk.as_ref().map(|v| v.vendor_id),
-                            ) {
-                                Ok(d) => {
-                                    tracing::warn!(error = %format!("{e:#}"), fails = self.vaapi_fails,
-                                        from = which, decoder = d.name(),
-                                        "hardware decode failing repeatedly — demoting to \
-                                         native VAAPI");
-                                    self.install(Backend::NativeVaapi(Box::new(d)));
-                                    return Ok(None);
-                                }
-                                Err(va) => tracing::info!(reason = %format!("{va:#}"),
-                                    "native VAAPI unavailable for demotion — continuing down \
-                                     the ladder"),
+                            )
+                            .map(|d| (d.name(), Backend::NativeVaapi(Box::new(d))));
+                            if self.demote_into(&e, which, "native VAAPI", built) {
+                                return Ok(None);
                             }
                         }
                     }
                     #[cfg(windows)]
                     if self.entered_rungs & RUNG_BIT_NATIVE_PLATFORM == 0 && self.d3d11_import {
                         if let Some(codec) = native_d3d11_codec(self.wire_codec) {
-                            match crate::video_d3d11_native::NativeD3d11Decoder::new(
+                            let (nv12, p010) = self
+                                .vk
+                                .as_ref()
+                                .map_or((false, false), |v| (v.d3d11_nv12, v.d3d11_p010));
+                            let built = crate::video_d3d11_native::NativeD3d11Decoder::new(
                                 codec,
                                 self.stream,
                                 self.adapter_luid,
                                 self.d3d11_hdr10,
                             )
                             .map(|d| {
-                                let (nv12, p010) = self
-                                    .vk
-                                    .as_ref()
-                                    .map_or((false, false), |v| (v.d3d11_nv12, v.d3d11_p010));
-                                d.with_planar(nv12, p010)
-                            }) {
-                                Ok(d) => {
-                                    tracing::warn!(error = %format!("{e:#}"), fails = self.vaapi_fails,
-                                        from = which, decoder = d.name(),
-                                        "hardware decode failing repeatedly — demoting to \
-                                         native D3D11VA");
-                                    self.install(Backend::NativeD3d11va(Box::new(d)));
-                                    return Ok(None);
-                                }
-                                Err(dx) => tracing::info!(reason = %format!("{dx:#}"),
-                                    "native D3D11VA unavailable for demotion — continuing down \
-                                     the ladder"),
+                                let d = d.with_planar(nv12, p010);
+                                (d.name(), Backend::NativeD3d11va(Box::new(d)))
+                            });
+                            if self.demote_into(&e, which, "native D3D11VA", built) {
+                                return Ok(None);
                             }
                         }
                     }
@@ -1727,18 +1733,15 @@ impl Decoder {
                             ) {
                                 let (codec, _) =
                                     native_codec(self.wire_codec).expect("the gate admitted it");
-                                match NativeVulkanDecoder::new(&v, codec, self.stream) {
-                                    Ok(n) => {
-                                        tracing::warn!(error = %format!("{e:#}"), fails = self.vaapi_fails,
-                                            from = which,
-                                            "hardware decode failing repeatedly — demoting to \
-                                             native Vulkan Video");
-                                        self.install(Backend::NativeVulkan(Box::new(n)));
-                                        return Ok(None);
-                                    }
-                                    Err(nv) => tracing::info!(reason = %format!("{nv:#}"),
-                                        "native Vulkan Video unavailable for demotion — \
-                                         software decode"),
+                                let built =
+                                    NativeVulkanDecoder::new(&v, codec, self.stream).map(|n| {
+                                        (
+                                            NativeRung::Vulkan.name(),
+                                            Backend::NativeVulkan(Box::new(n)),
+                                        )
+                                    });
+                                if self.demote_into(&e, which, "native Vulkan Video", built) {
+                                    return Ok(None);
                                 }
                             }
                         }

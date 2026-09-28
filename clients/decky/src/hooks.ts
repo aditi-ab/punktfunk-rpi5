@@ -122,9 +122,15 @@ export function needsPair(v: HostView): boolean {
   return v.fp === "";
 }
 
+/**
+ * Is this advert that saved record? The CLI's own match decides when it names the record; the
+ * rule below, `same_host` in pf-client-core, covers a client too old to say and a record the CLI
+ * read before it had an id. Two known fingerprints decide it alone: the other OS of a dual-boot
+ * box answers at the same lease with the same MAC, so the address would read it as the OS
+ * already saved.
+ */
 function advertMatchesSaved(a: DiscoveredHost, s: SavedHost): boolean {
-  // Two known fingerprints decide it alone: the other OS of a dual-boot box answers at the
-  // same lease with the same MAC, so the address would read it as the OS already saved.
+  if (a.saved_id && s.id) return a.saved_id === s.id;
   if (s.fp_hex && a.fp) return s.fp_hex.toLowerCase() === a.fp.toLowerCase();
   return s.addr === a.addr && s.port === a.port;
 }
@@ -152,8 +158,7 @@ function hostLabel(s: SavedHost, advert?: DiscoveredHost): string {
  * Join the saved store and the live browse into the rows the panel draws.
  *
  * Fingerprint first, address second — a host that moved DHCP lease still matches its record,
- * and a different box that inherited the old address does not inherit its pairing. The CLI's
- * `discover` annotates `saved`/`paired` by exactly this rule too, so the two can't disagree.
+ * and a different box that inherited the old address does not inherit its pairing.
  */
 export function mergeHosts(saved: SavedHost[], discovered: DiscoveredHost[]): HostView[] {
   const views: HostView[] = saved.map((s) => {
@@ -193,7 +198,7 @@ export function mergeHosts(saved: SavedHost[], discovered: DiscoveredHost[]): Ho
       fp: "",
       advertisedFp: a.fp,
       moved: false, // no record, so nothing to be stale
-      paired: a.paired,
+      paired: false, // no record, so no pairing: an older CLI may still say otherwise
       online: true,
       wakeable: false, // no record, so no MAC
       saved: false,

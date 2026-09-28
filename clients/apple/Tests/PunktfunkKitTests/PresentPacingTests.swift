@@ -378,6 +378,48 @@ final class PresentPacingTests: XCTestCase {
     }
     #endif
 
+    // MARK: - Present policy
+
+    /// V-Sync schedules on the grid, adaptive slots need the latency path with V-Sync off, the
+    /// smoothness store takes one frame per slot, and the env knob overrides each for A/B.
+    func testPresentPolicyResolution() {
+        func policy(
+            _ env: String?, vsync: Bool = false, vsyncPaced: Bool = false,
+            adaptive: Bool = false
+        ) -> PresentPolicy {
+            PresentPolicy.resolve(
+                env: env, vsync: vsync, vsyncPaced: vsyncPaced, adaptiveSlotPaced: adaptive)
+        }
+        let adaptive = policy(nil, adaptive: true)
+        XCTAssertEqual(adaptive, PresentPolicy(adaptiveSlot: true, fixedSlot: false, fixedVsync: false))
+        XCTAssertEqual(adaptive.label(.arrival), "adaptive")
+        XCTAssertEqual(policy("garbage", adaptive: true), adaptive, "an unknown mode is no mode")
+
+        let vsync = policy(nil, vsync: true, adaptive: true)
+        XCTAssertEqual(vsync, PresentPolicy(adaptiveSlot: false, fixedSlot: false, fixedVsync: true))
+        XCTAssertEqual(vsync.label(.arrival), "vsync")
+
+        let smooth = policy(nil, vsyncPaced: true)
+        XCTAssertEqual(smooth, PresentPolicy(adaptiveSlot: false, fixedSlot: true, fixedVsync: false))
+        XCTAssertEqual(smooth.label(.arrival), "slot")
+
+        XCTAssertEqual(
+            policy("slot", adaptive: true),
+            PresentPolicy(adaptiveSlot: false, fixedSlot: true, fixedVsync: false))
+        let immediate = policy("immediate", vsync: true, adaptive: true)
+        XCTAssertEqual(
+            immediate, PresentPolicy(adaptiveSlot: false, fixedSlot: false, fixedVsync: false))
+        XCTAssertEqual(immediate.label(.arrival), "immediate")
+        XCTAssertEqual(
+            policy("vsync", adaptive: true),
+            PresentPolicy(adaptiveSlot: false, fixedSlot: false, fixedVsync: true))
+
+        // The other pacings name themselves; the display-link policy doesn't apply there.
+        XCTAssertEqual(adaptive.label(.glass), "glass")
+        XCTAssertEqual(adaptive.label(.deadline), "deadline")
+        XCTAssertEqual(adaptive.label(.decoded), "decoded")
+    }
+
     // MARK: - macOS adaptive display
 
     #if os(macOS)

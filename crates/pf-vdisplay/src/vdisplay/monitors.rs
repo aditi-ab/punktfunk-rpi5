@@ -206,6 +206,41 @@ pub fn resolve<'a>(monitors: &'a [PhysicalMonitor], want: &str) -> Result<&'a Ph
     .into())
 }
 
+/// Does `exclusive` turn this head off? Enabled, not ours, not a managed sibling's
+/// output, and not on the operator's `keep_monitors` list (§5.5). The list matches
+/// case-insensitively: it arrives from the console, a config file and the compositor,
+/// and `DP-1` / `dp-1` are the same screen to the person who typed it.
+pub(crate) fn darkens(
+    name: &str,
+    enabled: bool,
+    managed: bool,
+    ours: bool,
+    keep: &[String],
+) -> bool {
+    enabled && !managed && !ours && !keep.iter().any(|k| k.eq_ignore_ascii_case(name))
+}
+
+/// The connectors [`darkens`] turns off, in list order. `ours` is matched by name.
+pub(crate) fn heads_to_darken(
+    heads: &[PhysicalMonitor],
+    ours: &str,
+    keep: &[String],
+) -> Vec<String> {
+    heads
+        .iter()
+        .filter(|h| {
+            darkens(
+                &h.connector,
+                h.enabled,
+                h.managed,
+                h.connector == ours,
+                keep,
+            )
+        })
+        .map(|h| h.connector.clone())
+        .collect()
+}
+
 /// A [`resolve`] miss, typed so the host can hand the client a sentence naming the
 /// pin rather than the operator chain. `available` empty = the compositor reports
 /// no monitors at all.
@@ -288,6 +323,22 @@ mod tests {
             enabled: true,
             managed: false,
         }
+    }
+
+    /// Kept heads stay lit, matched case-insensitively; ours, managed siblings and
+    /// already-dark heads are never in the list.
+    #[test]
+    fn exclusive_spares_kept_heads_ours_and_managed_siblings() {
+        let mut dark = mon("DP-3");
+        dark.enabled = false;
+        let mut sibling = mon("PF-1-2");
+        sibling.managed = true;
+        let heads = [mon("DP-1"), mon("HDMI-A-1"), mon("PF-1-1"), sibling, dark];
+        assert_eq!(heads_to_darken(&heads, "PF-1-1", &[]), ["DP-1", "HDMI-A-1"]);
+        assert_eq!(
+            heads_to_darken(&heads, "PF-1-1", &["hdmi-a-1".into()]),
+            ["DP-1"]
+        );
     }
 
     #[test]

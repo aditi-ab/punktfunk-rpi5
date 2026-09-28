@@ -25,7 +25,6 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
-use windows::core::PCWSTR;
 use windows::Win32::Devices::Display::GUID_DEVINTERFACE_MONITOR;
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -384,11 +383,10 @@ unsafe extern "system" fn wnd_proc(
 
 /// Message-only windows receive neither `WM_DISPLAYCHANGE` nor broadcast `WM_DEVICECHANGE`.
 fn pump() {
-    let class: Vec<u16> = "pf-display-events\0".encode_utf16().collect();
-    // SAFETY: Win32 window bring-up on this thread. `class` outlives every pointer use (lives to
-    // fn end; the pump loops forever). Handles are the preceding calls' returns; any failure
-    // returns from the thread (degraded, see `spawn_once`). The filter is a fully initialised
-    // local that RegisterDeviceNotificationW reads synchronously.
+    let class = windows::core::w!("pf-display-events");
+    // SAFETY: Win32 window bring-up on this thread. `class` is a static literal. Handles are the
+    // preceding calls' returns; any failure returns from the thread (degraded, see `spawn_once`).
+    // The filter is a fully initialised local that RegisterDeviceNotificationW reads synchronously.
     unsafe {
         let Ok(hinstance) = GetModuleHandleW(None) else {
             tracing::warn!(
@@ -399,7 +397,7 @@ fn pump() {
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wnd_proc),
             hInstance: hinstance.into(),
-            lpszClassName: PCWSTR(class.as_ptr()),
+            lpszClassName: class,
             ..Default::default()
         };
         if RegisterClassW(&wc) == 0 {
@@ -410,8 +408,8 @@ fn pump() {
         }
         let hwnd = match CreateWindowExW(
             WINDOW_EX_STYLE(0),
-            PCWSTR(class.as_ptr()),
-            PCWSTR(class.as_ptr()),
+            class,
+            class,
             WS_OVERLAPPED, // hidden; exists only to receive broadcasts
             0,
             0,

@@ -3,8 +3,8 @@
 
 use std::time::{Duration, Instant};
 
-/// Matches the Vulkan pump: one recovery ask per window so a burst of gaps
-/// cannot storm the control stream. The host coalesces further.
+/// One RFI ask per window so a burst of gaps cannot storm the control stream.
+/// The host coalesces further.
 const RFI_THROTTLE: Duration = Duration::from_millis(100);
 
 /// Gap detector behind [`NativeClient::note_frame_index`]. Wrapping `frame_index`
@@ -13,10 +13,22 @@ const RFI_THROTTLE: Duration = Duration::from_millis(100);
 pub(crate) struct RfiRecovery {
     next_expected: Option<u32>,
     last_req: Option<Instant>,
-    /// Lost range the throttle swallowed, widened by later gaps; sent at the
-    /// first `observe` after the window opens. Otherwise a second gap inside the
+    /// Lost range the throttle swallowed, widened by later gaps; sent by the first
+    /// `observe` or `flush` after the window opens. Otherwise a second gap inside the
     /// window (a lost recovery anchor) asks nothing until the 500 ms backstop.
     pending: Option<(u32, u32)>,
+}
+
+/// Where one AU's `frame_index` falls in receive order, from
+/// [`NativeClient::observe_frame_index`](super::NativeClient::observe_frame_index).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameOrder {
+    /// The first index seen, or the expected next one.
+    InOrder,
+    /// A forward jump over this many lost frames.
+    Gap(u32),
+    /// Behind a frame already seen: a reordered or duplicate AU.
+    Straggler,
 }
 
 /// Recovery request for a forward gap. Keyframe when the span exceeds
@@ -29,41 +41,47 @@ pub(crate) enum RecoveryAsk {
 }
 
 impl RfiRecovery {
-    /// `gap` and `ask` are independent: throttle can yield [`RecoveryAsk::None`]
-    /// with a non-zero gap, and an in-order frame can carry the ask a throttled
-    /// gap deferred. Pass the width to
+    /// `order` and `ask` are independent: throttle can yield [`RecoveryAsk::None`]
+    /// on a [`FrameOrder::Gap`], and an in-order frame can carry the ask a throttled
+    /// gap deferred. Pass the gap width to
     /// [`crate::reanchor::ReanchorGate::arm_expecting_drops`] or the reassembler's
     /// later `frames_dropped` climb is counted as a second loss.
-    pub(crate) fn observe(&mut self, frame_index: u32, now: Instant) -> (u32, RecoveryAsk) {
-        let gap = match self.next_expected {
+    pub(crate) fn observe(&mut self, frame_index: u32, now: Instant) -> (FrameOrder, RecoveryAsk) {
+        let order = match self.next_expected {
             Some(exp) => {
                 // Half-space wrap: wrapping_sub < u32::MAX/2 is a forward gap; top half is a straggler.
                 let ahead = frame_index.wrapping_sub(exp);
                 if ahead == 0 {
                     self.next_expected = Some(frame_index.wrapping_add(1));
-                    0
+                    FrameOrder::InOrder
                 } else if ahead < u32::MAX / 2 {
                     // Advance past this frame so the same gap cannot re-fire. The oldest
                     // unsent loss stays `first`: the host invalidates everything since it.
                     self.next_expected = Some(frame_index.wrapping_add(1));
                     let first = self.pending.map_or(exp, |(first, _)| first);
                     self.pending = Some((first, frame_index.wrapping_sub(1)));
-                    ahead
+                    FrameOrder::Gap(ahead)
                 } else {
                     // Leave next_expected: a rewind would false-gap the next in-order frame.
-                    0
+                    FrameOrder::Straggler
                 }
             }
             None => {
                 self.next_expected = Some(frame_index.wrapping_add(1));
-                0
+                FrameOrder::InOrder
             }
         };
-        (gap, self.flush(now))
+        (order, self.flush(now))
+    }
+
+    /// An IDR was asked for: it repairs every frame the pending range names. The RFI
+    /// throttle keeps its own window; an IDR ask does not hold back the next RFI.
+    pub(crate) fn keyframe_requested(&mut self) {
+        self.pending = None;
     }
 
     /// The pending range as an ask once the throttle window is open, else `None`.
-    fn flush(&mut self, now: Instant) -> RecoveryAsk {
+    pub(crate) fn flush(&mut self, now: Instant) -> RecoveryAsk {
         let throttled = self
             .last_req
             .is_some_and(|t| now.duration_since(t) < RFI_THROTTLE);
@@ -152,8 +170,8 @@ pub(crate) fn first_skipped(last: &mut Option<u32>, idx: u32) -> Option<u32> {
 #[cfg(test)]
 mod rfi_recovery_tests {
     use super::{
-        first_skipped, RecentRfis, RecoveryAsk, RfiRecovery, ShortFrames, RFI_THROTTLE,
-        SHORT_FRAMES,
+        first_skipped, FrameOrder::*, RecentRfis, RecoveryAsk, RfiRecovery, ShortFrames,
+        RFI_THROTTLE, SHORT_FRAMES,
     };
     use std::time::{Duration, Instant};
 
@@ -165,7 +183,7 @@ mod rfi_recovery_tests {
     #[test]
     fn first_frame_arms_without_a_gap() {
         let mut r = RfiRecovery::default();
-        assert_eq!(r.observe(100, base()), (0, RecoveryAsk::None));
+        assert_eq!(r.observe(100, base()), (InOrder, RecoveryAsk::None));
         assert_eq!(r.next_expected, Some(101));
     }
 
@@ -174,9 +192,9 @@ mod rfi_recovery_tests {
         let mut r = RfiRecovery::default();
         let t = base();
         r.observe(100, t);
-        assert_eq!(r.observe(101, t), (0, RecoveryAsk::None));
-        assert_eq!(r.observe(102, t), (0, RecoveryAsk::None));
-        assert_eq!(r.observe(103, t), (0, RecoveryAsk::None));
+        assert_eq!(r.observe(101, t), (InOrder, RecoveryAsk::None));
+        assert_eq!(r.observe(102, t), (InOrder, RecoveryAsk::None));
+        assert_eq!(r.observe(103, t), (InOrder, RecoveryAsk::None));
         assert_eq!(r.next_expected, Some(104));
     }
 
@@ -185,7 +203,7 @@ mod rfi_recovery_tests {
         let mut r = RfiRecovery::default();
         let t = base();
         r.observe(100, t);
-        assert_eq!(r.observe(105, t), (4, RecoveryAsk::Rfi(101, 104)));
+        assert_eq!(r.observe(105, t), (Gap(4), RecoveryAsk::Rfi(101, 104)));
         assert_eq!(r.next_expected, Some(106));
     }
 
@@ -194,7 +212,7 @@ mod rfi_recovery_tests {
         let mut r = RfiRecovery::default();
         let t = base();
         r.observe(100, t);
-        assert_eq!(r.observe(102, t), (1, RecoveryAsk::Rfi(101, 101)));
+        assert_eq!(r.observe(102, t), (Gap(1), RecoveryAsk::Rfi(101, 101)));
     }
 
     #[test]
@@ -202,15 +220,15 @@ mod rfi_recovery_tests {
         let mut r = RfiRecovery::default();
         let t0 = base();
         r.observe(100, t0);
-        assert_eq!(r.observe(105, t0), (4, RecoveryAsk::Rfi(101, 104)));
+        assert_eq!(r.observe(105, t0), (Gap(4), RecoveryAsk::Rfi(101, 104)));
         assert_eq!(
             r.observe(110, t0 + Duration::from_millis(50)),
-            (4, RecoveryAsk::None)
+            (Gap(4), RecoveryAsk::None)
         );
         // The swallowed gap widens the next ask instead of vanishing.
         assert_eq!(
             r.observe(120, t0 + RFI_THROTTLE + Duration::from_millis(1)),
-            (9, RecoveryAsk::Rfi(106, 119))
+            (Gap(9), RecoveryAsk::Rfi(106, 119))
         );
     }
 
@@ -219,21 +237,61 @@ mod rfi_recovery_tests {
         let mut r = RfiRecovery::default();
         let t0 = base();
         r.observe(100, t0);
-        assert_eq!(r.observe(102, t0), (1, RecoveryAsk::Rfi(101, 101)));
+        assert_eq!(r.observe(102, t0), (Gap(1), RecoveryAsk::Rfi(101, 101)));
         // The recovery anchor itself is lost: a second gap inside the window.
         assert_eq!(
             r.observe(104, t0 + Duration::from_millis(30)),
-            (1, RecoveryAsk::None)
+            (Gap(1), RecoveryAsk::None)
         );
         assert_eq!(
             r.observe(105, t0 + Duration::from_millis(60)),
-            (0, RecoveryAsk::None)
+            (InOrder, RecoveryAsk::None)
         );
         assert_eq!(
             r.observe(106, t0 + RFI_THROTTLE),
-            (0, RecoveryAsk::Rfi(103, 103))
+            (InOrder, RecoveryAsk::Rfi(103, 103))
         );
-        assert_eq!(r.observe(107, t0 + RFI_THROTTLE), (0, RecoveryAsk::None));
+        assert_eq!(
+            r.observe(107, t0 + RFI_THROTTLE),
+            (InOrder, RecoveryAsk::None)
+        );
+    }
+
+    #[test]
+    fn a_swallowed_gap_is_sent_by_a_tick_once_the_window_opens() {
+        let mut r = RfiRecovery::default();
+        let t0 = base();
+        r.observe(100, t0);
+        assert_eq!(r.observe(102, t0), (Gap(1), RecoveryAsk::Rfi(101, 101)));
+        assert_eq!(
+            r.observe(104, t0 + Duration::from_millis(30)),
+            (Gap(1), RecoveryAsk::None)
+        );
+        // No frame arrives after the second gap; the pump's tick still sends it.
+        assert_eq!(r.flush(t0 + Duration::from_millis(60)), RecoveryAsk::None);
+        assert_eq!(r.flush(t0 + RFI_THROTTLE), RecoveryAsk::Rfi(103, 103));
+        assert_eq!(r.flush(t0 + RFI_THROTTLE), RecoveryAsk::None);
+    }
+
+    /// An IDR ask drops the pending range but leaves the RFI window alone: a new
+    /// gap right after an IDR ask still asks at once.
+    #[test]
+    fn a_keyframe_ask_clears_the_pending_range_but_not_the_rfi_window() {
+        let mut r = RfiRecovery::default();
+        let t0 = base();
+        r.observe(100, t0);
+        r.keyframe_requested();
+        assert_eq!(r.observe(102, t0), (Gap(1), RecoveryAsk::Rfi(101, 101)));
+        // Swallowed by the RFI window, then repaired by the IDR.
+        assert_eq!(
+            r.observe(104, t0 + Duration::from_millis(30)),
+            (Gap(1), RecoveryAsk::None)
+        );
+        r.keyframe_requested();
+        assert_eq!(
+            r.observe(105, t0 + RFI_THROTTLE),
+            (InOrder, RecoveryAsk::None)
+        );
     }
 
     #[test]
@@ -241,11 +299,11 @@ mod rfi_recovery_tests {
         let mut r = RfiRecovery::default();
         let t = base();
         r.observe(100, t);
-        assert_eq!(r.observe(102, t), (1, RecoveryAsk::Rfi(101, 101)));
+        assert_eq!(r.observe(102, t), (Gap(1), RecoveryAsk::Rfi(101, 101)));
         // The late 101 is a straggler: no gap, expectation untouched.
-        assert_eq!(r.observe(101, t), (0, RecoveryAsk::None));
+        assert_eq!(r.observe(101, t), (Straggler, RecoveryAsk::None));
         assert_eq!(r.next_expected, Some(103));
-        assert_eq!(r.observe(103, t), (0, RecoveryAsk::None));
+        assert_eq!(r.observe(103, t), (InOrder, RecoveryAsk::None));
         assert_eq!(r.next_expected, Some(104));
     }
 
@@ -255,7 +313,7 @@ mod rfi_recovery_tests {
         let t = base();
         r.observe(100, t);
         r.observe(105, t);
-        assert_eq!(r.observe(103, t), (0, RecoveryAsk::None));
+        assert_eq!(r.observe(103, t), (Straggler, RecoveryAsk::None));
         assert_eq!(r.next_expected, Some(106));
     }
 
@@ -264,9 +322,9 @@ mod rfi_recovery_tests {
         let mut r = RfiRecovery::default();
         let t = base();
         r.observe(u32::MAX - 1, t);
-        assert_eq!(r.observe(u32::MAX, t), (0, RecoveryAsk::None));
+        assert_eq!(r.observe(u32::MAX, t), (InOrder, RecoveryAsk::None));
         assert_eq!(r.next_expected, Some(0));
-        assert_eq!(r.observe(0, t), (0, RecoveryAsk::None));
+        assert_eq!(r.observe(0, t), (InOrder, RecoveryAsk::None));
         assert_eq!(r.next_expected, Some(1));
     }
 
@@ -275,7 +333,7 @@ mod rfi_recovery_tests {
         let mut r = RfiRecovery::default();
         let t = base();
         r.observe(u32::MAX - 1, t);
-        assert_eq!(r.observe(1, t), (2, RecoveryAsk::Rfi(u32::MAX, 0)));
+        assert_eq!(r.observe(1, t), (Gap(2), RecoveryAsk::Rfi(u32::MAX, 0)));
         assert_eq!(r.next_expected, Some(2));
     }
 
@@ -285,13 +343,13 @@ mod rfi_recovery_tests {
         let t = base();
         r.observe(100, t);
         let jump = 100 + crate::packet::RFI_MAX_RANGE + 2;
-        assert_eq!(r.observe(jump, t), (jump - 101, RecoveryAsk::Keyframe));
+        assert_eq!(r.observe(jump, t), (Gap(jump - 101), RecoveryAsk::Keyframe));
         assert_eq!(r.next_expected, Some(jump + 1));
-        assert_eq!(r.observe(jump + 1, t), (0, RecoveryAsk::None));
+        assert_eq!(r.observe(jump + 1, t), (InOrder, RecoveryAsk::None));
         // Keyframe stamps last_req too; an immediate follow-up gap stays quiet.
         assert_eq!(
             r.observe(jump + 10, t + Duration::from_millis(1)),
-            (8, RecoveryAsk::None)
+            (Gap(8), RecoveryAsk::None)
         );
     }
 

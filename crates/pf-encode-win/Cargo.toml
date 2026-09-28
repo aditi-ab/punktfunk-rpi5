@@ -21,11 +21,14 @@ tracing = "0.1"
 # backend in pf-encode, so the binding is declared for both targets.
 nvidia-video-codec-sdk = { version = "0.4", features = ["ci-check"], optional = true }
 
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+# PyroWave, only under `pyrowave`: the Windows NV12 zero-copy encoder, and the packetize step
+# both platform backends share (`pyrowave_ffi`). pf-encode links the same crate on Linux.
+pyrowave-sys = { path = "../pyrowave-sys", optional = true }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 # Native Intel QSV (VPL): vendored static MIT dispatcher + bindgen'd C API, only under `qsv`.
 libvpl-sys = { path = "../libvpl-sys", optional = true }
-# PyroWave NV12 zero-copy D3D11→Vulkan encoder, only under `pyrowave`.
-pyrowave-sys = { path = "../pyrowave-sys", optional = true }
 # `#[implement]` for the Media Foundation event sink. The macro's generated code names the
 # `windows_core` crate directly, so the façade's re-export alone does not satisfy it.
 windows-core = "0.62"
@@ -54,6 +57,8 @@ windows = { version = "0.62", features = [
 [dev-dependencies]
 # Reads the SPS colour description back in the live Media Foundation test.
 pf-bitstream = { path = "../pf-bitstream" }
+# Reads `clients/shared/render-scale-vectors.json`.
+serde_json = "1"
 # A test writer for the NVENC backend's unit tests (`with_test_writer().try_init()`).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -67,6 +72,9 @@ qsv = ["dep:libvpl-sys"]
 pyrowave = ["dep:pyrowave-sys"]
 # Linux Vulkan Video in pf-encode shares `rfi` and `vbv_window_ms`; the gate mirrors pf-encode's.
 vulkan-encode = []
+# Helpers for pf-encode's tests: `pyrowave_wire::unwindow`, the `pyrowave_ffi::oracle` decoder,
+# and the `smoke_pattern` drivers. Never in a shipped build.
+test-support = []
 
 [lints]
 workspace = true

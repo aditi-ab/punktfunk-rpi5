@@ -213,46 +213,64 @@ function artKey(appId: number): string {
 }
 
 /**
- * Apply the plugin's grid/hero/logo/icon to a shortcut (idempotent, once per ART_VERSION per
- * appId). Cosmetic and fully best-effort: any failure is swallowed and retried on the next call.
+ * Run `apply` unless `marker` already records `version`, and record it once `apply` reports done.
+ * Cosmetic and best-effort: a shortcut fresh out of AddShortcut may not be registered yet (the
+ * race setShortcutHidden defers around), so a failure retries once 2.5 s later, then waits for
+ * the next call.
  */
-async function applyArtwork(appId: number, isRetry = false): Promise<void> {
+async function artOnce(
+  marker: string,
+  version: number,
+  apply: () => Promise<boolean>,
+  isRetry = false,
+): Promise<void> {
   try {
-    if (localStorage.getItem(artKey(appId)) === `${ART_VERSION}`) {
+    if (localStorage.getItem(marker) === `${version}`) {
       return;
     }
-    const art = await shortcutArt();
-    const assets: [string | undefined, number][] = [
-      [art.grid, 0],
-      [art.hero, 1],
-      [art.logo, 2],
-      [art.gridwide, 3],
-    ];
-    let applied = false;
-    for (const [data, assetType] of assets) {
-      if (data) {
-        await SteamClient.Apps.SetCustomArtworkForApp(appId, data, "png", assetType);
-        applied = true;
-      }
-    }
-    if (art.icon_path) {
-      SteamClient.Apps.SetShortcutIcon(appId, art.icon_path);
-      applied = true;
-    }
-    // Only record "done" when something actually landed — a plugin build whose assets/ is
-    // missing/empty must keep retrying on later mounts instead of poisoning the marker.
-    if (applied) {
-      localStorage.setItem(artKey(appId), `${ART_VERSION}`);
+    if (await apply()) {
+      localStorage.setItem(marker, `${version}`);
     }
   } catch (e) {
-    // A shortcut fresh out of AddShortcut may not be registered yet (the same race
-    // setShortcutHidden defers around) — one deferred second attempt, then leave it to
-    // the next mount.
     if (!isRetry) {
-      setTimeout(() => void applyArtwork(appId, true), 2500);
+      setTimeout(() => void artOnce(marker, version, apply, true), 2500);
     }
     console.warn("punktfunk: shortcut artwork not applied", e);
   }
+}
+
+/** Set each present image into its slot, in order: grid, hero, logo, wide grid. */
+async function setArtSlots(
+  appId: number,
+  images: Array<[data: string | undefined, type: string]>,
+): Promise<boolean> {
+  let applied = false;
+  for (const [slot, [data, type]] of images.entries()) {
+    if (data) {
+      await SteamClient.Apps.SetCustomArtworkForApp(appId, data, type, slot);
+      applied = true;
+    }
+  }
+  return applied;
+}
+
+/** Apply the plugin's grid/hero/logo/icon to a fixed-role shortcut, once per ART_VERSION. */
+function applyArtwork(appId: number): Promise<void> {
+  return artOnce(artKey(appId), ART_VERSION, async () => {
+    const art = await shortcutArt();
+    const applied = await setArtSlots(appId, [
+      [art.grid, "png"],
+      [art.hero, "png"],
+      [art.logo, "png"],
+      [art.gridwide, "png"],
+    ]);
+    if (art.icon_path) {
+      SteamClient.Apps.SetShortcutIcon(appId, art.icon_path);
+      return true;
+    }
+    // Only "done" when something landed: a build whose assets/ is empty keeps retrying.
+    return applied;
+  });
 }
 
 // The shortcut name is user-visible (Steam overlay + library) — brand-case it. BOTH shortcuts
@@ -377,6 +395,9 @@ function remember(key: string, appId: number) {
   } catch {
     /* ignore */
   }
+  if (key.startsWith(GAME_KEY_PREFIX)) {
+    pairCache = null; // rebuilt from storage on the next read
+  }
 }
 function recall(key: string): number | null {
   try {
@@ -387,24 +408,25 @@ function recall(key: string): number | null {
   }
 }
 
-// Install the native-touch controller config once per plugin session (idempotent file writes in
-// the root backend). Keyed by the shared shortcut NAME, so this single call covers both
-// shortcuts. Gated in localStorage so we don't rewrite Steam's config dir on every launch; bump
-// CONFIG_VERSION to force a reinstall after the shipped .vdf changes.
+// The native-touch controller config, installed by the root backend and keyed by shortcut NAME:
+// one entry covers both fixed roles, and each per-game name needs its own. Gated in localStorage
+// so Steam's config dir is not rewritten on every launch; bump CONFIG_VERSION after the shipped
+// .vdf changes.
 const CONFIG_KEY = "punktfunk:controllerConfig";
-// Per-game layouts hang off the same name, one per game title (see ensureGameControllerConfig).
 const GAME_CONFIG_PREFIX = "punktfunk:controllerConfig:";
 const CONFIG_VERSION = 1;
-async function ensureControllerConfig(): Promise<void> {
+
+/** Point shortcut `name` at the touch layout unless `marker` already records CONFIG_VERSION. */
+async function configOnce(marker: string, name: string): Promise<void> {
   try {
-    if (localStorage.getItem(CONFIG_KEY) === `${CONFIG_VERSION}`) {
+    if (localStorage.getItem(marker) === `${CONFIG_VERSION}`) {
       return;
     }
-    const r = await applyControllerConfig(SHORTCUT_NAME);
+    const r = await applyControllerConfig(name);
     // `ok` alone isn't done: with zero account configset dirs (fresh Steam) the backend
     // succeeds without pointing any account at the template — keep retrying until one lands.
     if (r?.ok && (r.applied ?? []).some((a) => a.startsWith("configset:"))) {
-      localStorage.setItem(CONFIG_KEY, `${CONFIG_VERSION}`);
+      localStorage.setItem(marker, `${CONFIG_VERSION}`);
     } else {
       console.warn("punktfunk: controller config not fully applied", r);
     }
@@ -413,109 +435,128 @@ async function ensureControllerConfig(): Promise<void> {
   }
 }
 
+interface Ensured {
+  appId: number;
+  runner: string;
+  clientBin: string;
+}
+
+/** What one shortcut role varies; `ensureShortcut` runs the rest. */
+interface ShortcutRole {
+  /** localStorage key of the role's appId. Also the single-flight key. */
+  key: string;
+  /** Library name. Steam files the controller layout under it too. */
+  name: string;
+  hidden: boolean;
+  /** The other fixed role's key: a same-named shortcut it does not hold is adopted before a new
+   *  one is minted. Absent for a per-game shortcut, whose title could be the user's own entry. */
+  adoptExcept?: string;
+  /** Controller-config marker, or null when this name gets no layout. */
+  configMarker: string | null;
+  /** Launch options set at every ensure; absent for the stream roles, set per launch instead. */
+  launchOptions?: (runner: string, clientBin: string | undefined) => string;
+  /** The art marker a freshly minted appId must not inherit from a deleted shortcut. */
+  artKey: (appId: number) => string;
+  /** Apply the role's artwork, fire-and-forget. */
+  dress: (appId: number) => void;
+}
+
 /**
- * Ensure the STREAM shortcut (hidden, stateful) — the per-session launcher whose launch options
- * are rewritten per stream. Branded, artworked, native-touch config applied, and HIDDEN (it is
- * an implementation detail; the visible entry is the gamepad-UI shortcut). Returns its appId +
- * the current runner path. Reuses/repoints the remembered shortcut (the plugin dir can change
- * across reinstalls, and pre-two-shortcut installs had this one visible).
+ * Ensure a role's shortcut exists and points at the current plugin dir: reuse the remembered
+ * appId only while the shortcut is alive (a stale id must fall through, not be repointed), else
+ * adopt or mint one. Then rewrite exe, start dir and name, visibility and art. Throws when the
+ * launch wrapper is missing.
  */
-async function doEnsureStreamShortcut(): Promise<{ appId: number; runner: string; clientBin: string }> {
+async function ensureShortcutOnce(role: ShortcutRole): Promise<Ensured> {
   const info = await runnerInfo();
   if (!info.exists) {
     throw new Error(`launch wrapper missing at ${info.runner}`);
   }
   const startDir = info.runner.replace(/\/[^/]*$/, ""); // the plugin's bin/ dir
-  void ensureControllerConfig(); // fire-and-forget — never blocks the launch
-
-  // Reuse the remembered shortcut only if it still exists — a stale appId (shortcut deleted, key
-  // outlived it across a reinstall) must fall through, not be silently repointed. On a lost id,
-  // ADOPT an existing same-named shortcut before AddShortcut so a wiped key never duplicates.
-  const remembered = recall(STORAGE_KEY_STREAM);
+  if (role.configMarker) {
+    void configOnce(role.configMarker, role.name); // never blocks the launch
+  }
+  const remembered = recall(role.key);
   let appId =
     remembered != null && (await shortcutStillExists(remembered)) ? remembered : null;
   if (appId == null) {
-    appId =
-      findAdoptableShortcut(recall(STORAGE_KEY_UI)) ??
-      (await SteamClient.Apps.AddShortcut(SHORTCUT_NAME, SHELL, startDir, ""));
-    remember(STORAGE_KEY_STREAM, appId);
+    appId = role.adoptExcept ? findAdoptableShortcut(recall(role.adoptExcept)) : null;
+    if (appId == null) {
+      appId = await SteamClient.Apps.AddShortcut(role.name, SHELL, startDir, "");
+      try {
+        localStorage.removeItem(role.artKey(appId)); // a recycled appId must not skip its art
+      } catch {
+        /* ignore */
+      }
+    }
+    remember(role.key, appId);
   }
   SteamClient.Apps.SetShortcutExe(appId, SHELL);
   SteamClient.Apps.SetShortcutStartDir(appId, startDir);
-  SteamClient.Apps.SetShortcutName(appId, SHORTCUT_NAME);
-  setShortcutHidden(appId, true); // also migrates pre-two-shortcut installs (were visible)
-  void applyArtwork(appId);
+  SteamClient.Apps.SetShortcutName(appId, role.name);
+  if (role.launchOptions) {
+    SteamClient.Apps.SetAppLaunchOptions(appId, role.launchOptions(info.runner, info.client_bin));
+  }
+  setShortcutHidden(appId, role.hidden);
+  role.dress(appId);
   return { appId, runner: info.runner, clientBin: info.client_bin ?? "" };
 }
 
-// Concurrent ensure calls share one run per role — two ensures racing past the liveness check
-// would each AddShortcut, which is exactly the duplicate class this file exists to prevent (and
-// the store-readiness wait makes the window real: mount's fire-and-forget ensure can be mid-wait
-// when a QAM press arrives). Sequential calls still re-run, so per-launch repointing is kept.
-let streamEnsureInFlight: Promise<{ appId: number; runner: string; clientBin: string }> | null =
-  null;
-function ensureStreamShortcut(): Promise<{ appId: number; runner: string; clientBin: string }> {
-  streamEnsureInFlight ??= doEnsureStreamShortcut().finally(() => {
-    streamEnsureInFlight = null;
-  });
-  return streamEnsureInFlight;
+// Concurrent ensures of one role share one run — two racing past the liveness check would each
+// AddShortcut, which is exactly the duplicate class this file exists to prevent (and the
+// store-readiness wait makes the window real). Sequential calls still re-run, so per-launch
+// repointing is kept.
+const ensuring = new Map<string, Promise<Ensured>>();
+function ensureShortcut(role: ShortcutRole): Promise<Ensured> {
+  let p = ensuring.get(role.key);
+  if (!p) {
+    p = ensureShortcutOnce(role).finally(() => ensuring.delete(role.key));
+    ensuring.set(role.key, p);
+  }
+  return p;
 }
 
-/**
- * Ensure the GAMEPAD-UI shortcut (visible, stateless) — the library-facing "Punktfunk" entry
- * that opens the client's console home (bare `--browse`: host picker + pairing + settings).
- * Fixed launch options (no per-session state), branded, artworked, native-touch config applied,
- * kept VISIBLE. Idempotent — call on plugin mount so the library entry always exists and stays
- * repointed to the current plugin dir. Best-effort: returns null on any failure.
- */
-async function doEnsureGamepadUiShortcut(): Promise<number | null> {
-  try {
-    const info = await runnerInfo();
-    if (!info.exists) {
-      return null;
-    }
-    const startDir = info.runner.replace(/\/[^/]*$/, "");
-    void ensureControllerConfig();
-    // PF_BROWSE → the wrapper runs the SESSION's `--browse --fullscreen` (console home), which is
-    // the one branch this rework deliberately left alone. %command% expands to the shortcut exe
-    // (/bin/sh); the wrapper rides behind as an arg. PF_CLIENT_BIN only when the backend resolved
-    // a NATIVE client — else the wrapper's flatpak default stands and this shortcut is exactly
-    // what it always was.
-    const clientBin = safeClientBin(info.client_bin) ? `PF_CLIENT_BIN=${info.client_bin} ` : "";
-    const launchOpts = `${clientBin}PF_BROWSE=1 %command% "${info.runner}"`;
+/** The STREAM shortcut (hidden, stateful): its launch options are rewritten per stream. The
+ *  historical key, so pre-two-shortcut installs migrate into this role, now hidden. */
+const STREAM_ROLE: ShortcutRole = {
+  key: STORAGE_KEY_STREAM,
+  name: SHORTCUT_NAME,
+  hidden: true,
+  adoptExcept: STORAGE_KEY_UI,
+  configMarker: CONFIG_KEY,
+  artKey,
+  dress: (appId) => void applyArtwork(appId),
+};
 
-    // Reuse the remembered entry only if it still exists; a stale appId (deleted shortcut whose
-    // localStorage key survived a plugin reinstall) falls through so the visible library entry
-    // actually comes back instead of repointing a dead id. On a lost id, ADOPT an existing
-    // same-named shortcut (a boot-race duplicate, or the entry whose key was wiped) before
-    // AddShortcut — creation is the last resort, never the response to a mere lookup miss.
-    let appId = recall(STORAGE_KEY_UI);
-    if (appId == null || !(await shortcutStillExists(appId))) {
-      appId =
-        findAdoptableShortcut(recall(STORAGE_KEY_STREAM)) ??
-        (await SteamClient.Apps.AddShortcut(SHORTCUT_NAME, SHELL, startDir, ""));
-      remember(STORAGE_KEY_UI, appId);
-    }
-    SteamClient.Apps.SetShortcutExe(appId, SHELL);
-    SteamClient.Apps.SetShortcutStartDir(appId, startDir);
-    SteamClient.Apps.SetShortcutName(appId, SHORTCUT_NAME);
-    SteamClient.Apps.SetAppLaunchOptions(appId, launchOpts);
-    setShortcutHidden(appId, false); // the visible library entry
-    void applyArtwork(appId);
-    return appId;
+/**
+ * The GAMEPAD-UI shortcut (visible, stateless): the library-facing "Punktfunk" entry that opens
+ * the client's console home. PF_BROWSE → the wrapper runs the session's `--browse --fullscreen`;
+ * %command% expands to the shortcut exe (/bin/sh) with the wrapper behind it as an arg.
+ * PF_CLIENT_BIN only for a resolved NATIVE client, else the wrapper's flatpak default stands.
+ */
+const UI_ROLE: ShortcutRole = {
+  key: STORAGE_KEY_UI,
+  name: SHORTCUT_NAME,
+  hidden: false,
+  adoptExcept: STORAGE_KEY_STREAM,
+  configMarker: CONFIG_KEY,
+  launchOptions: (runner, clientBin) =>
+    `${safeClientBin(clientBin) ? `PF_CLIENT_BIN=${clientBin} ` : ""}PF_BROWSE=1 %command% "${runner}"`,
+  artKey,
+  dress: (appId) => void applyArtwork(appId),
+};
+
+const ensureStreamShortcut = (): Promise<Ensured> => ensureShortcut(STREAM_ROLE);
+
+/** Ensure the visible library entry — call on plugin mount so it always exists and stays
+ *  repointed to the current plugin dir. Best-effort: null on any failure. */
+export async function ensureGamepadUiShortcut(): Promise<number | null> {
+  try {
+    return (await ensureShortcut(UI_ROLE)).appId;
   } catch (e) {
     console.warn("punktfunk: gamepad-UI shortcut not ensured", e);
     return null;
   }
-}
-
-// Same single-flight rule as the stream role (see ensureStreamShortcut).
-let uiEnsureInFlight: Promise<number | null> | null = null;
-export function ensureGamepadUiShortcut(): Promise<number | null> {
-  uiEnsureInFlight ??= doEnsureGamepadUiShortcut().finally(() => {
-    uiEnsureInFlight = null;
-  });
-  return uiEnsureInFlight;
 }
 
 /**
@@ -593,12 +634,6 @@ function gameShortcutPairs(): Array<[number, number]> {
     /* storage unavailable */
   }
   return pairs;
-}
-
-/** Record the shortcut minted for a title; the pair cache is rebuilt on the next read. */
-function rememberGameShortcut(steamAppId: number, appId: number): void {
-  remember(gameKey(steamAppId), appId);
-  pairCache = null;
 }
 
 /** Every key under `prefix`, gone. Collected before removing — removing shifts the indices. */
@@ -684,121 +719,45 @@ function gameArtKey(shortcutAppId: number): string {
   return `punktfunk:gameArt:${shortcutAppId}`;
 }
 
-/** Dress a per-game shortcut in the game's own grid/hero/logo/header and icon. Once per version;
- *  cosmetic and best-effort, with one deferred retry for a shortcut not yet registered. */
-async function applyGameArtwork(
+/** Dress a per-game shortcut in the game's own grid/hero/logo/header and icon, once per version. */
+function applyGameArtwork(
   shortcutAppId: number,
   steamAppId: number,
   iconHash: string,
-  isRetry = false,
 ): Promise<void> {
-  try {
-    if (localStorage.getItem(gameArtKey(shortcutAppId)) === `${GAME_ART_VERSION}`) {
-      return;
-    }
+  return artOnce(gameArtKey(shortcutAppId), GAME_ART_VERSION, async () => {
     const art = await gameArt(steamAppId, iconHash);
     if (!art.ok) {
-      return;
+      return false;
     }
-    const assets: Array<[string | undefined, string | undefined, number]> = [
-      [art.grid, art.grid_type, 0],
-      [art.hero, art.hero_type, 1],
-      [art.logo, art.logo_type, 2],
-      [art.gridwide, art.gridwide_type, 3],
-    ];
-    let applied = false;
-    for (const [data, type, assetType] of assets) {
-      if (data) {
-        await SteamClient.Apps.SetCustomArtworkForApp(shortcutAppId, data, type ?? "jpg", assetType);
-        applied = true;
-      }
-    }
-    const iconLanded = await applyGameIcon(shortcutAppId, steamAppId, art);
+    const applied = await setArtSlots(shortcutAppId, [
+      [art.grid, art.grid_type ?? "jpg"],
+      [art.hero, art.hero_type ?? "jpg"],
+      [art.logo, art.logo_type ?? "jpg"],
+      [art.gridwide, art.gridwide_type ?? "jpg"],
+    ]);
     // Done only when the icon landed too: it is the one piece the overlay shows on every
     // frame, and a gray box there must be retried on the next launch, not recorded as fine.
-    if (applied && iconLanded) {
-      localStorage.setItem(gameArtKey(shortcutAppId), `${GAME_ART_VERSION}`);
-    }
-  } catch (e) {
-    if (!isRetry) {
-      setTimeout(() => void applyGameArtwork(shortcutAppId, steamAppId, iconHash, true), 2500);
-    }
-    console.warn("punktfunk: game artwork not applied", e);
-  }
-}
-
-/** Point a per-game shortcut at the native-touch layout. Steam keys the configset by the
- *  shortcut's lowercase NAME, so each game name needs its own entry; once per name. */
-async function ensureGameControllerConfig(title: string): Promise<void> {
-  // The name is written into a VDF as a quoted key; one carrying a quote would corrupt the
-  // file. Such a game keeps Steam's default layout — a cosmetic loss, not a broken file.
-  if (title.includes('"')) {
-    return;
-  }
-  const key = `${GAME_CONFIG_PREFIX}${title.toLowerCase()}`;
-  try {
-    if (localStorage.getItem(key) === `${CONFIG_VERSION}`) {
-      return;
-    }
-    const r = await applyControllerConfig(title);
-    if (r?.ok && (r.applied ?? []).some((a) => a.startsWith("configset:"))) {
-      localStorage.setItem(key, `${CONFIG_VERSION}`);
-    }
-  } catch (e) {
-    console.warn("punktfunk: game controller config not applied", e);
-  }
+    const iconLanded = await applyGameIcon(shortcutAppId, steamAppId, art);
+    return applied && iconLanded;
+  });
 }
 
 /**
  * Ensure the hidden per-game shortcut for a Steam title: named after the game, dressed in its
  * art, pointed at the touch layout. Reused across launches by appid; recreated if the user
- * removed it. Same liveness rule as the generic roles — a wrong "deleted" mints a duplicate.
+ * removed it. A title carrying a quote gets no layout: the name is written into a VDF as a
+ * quoted key, and Steam's default layout beats a corrupt file.
  */
-async function doEnsureGameShortcut(
-  steamAppId: number,
-  title: string,
-  iconHash: string,
-): Promise<{ appId: number; runner: string; clientBin: string }> {
-  const info = await runnerInfo();
-  if (!info.exists) {
-    throw new Error(`launch wrapper missing at ${info.runner}`);
-  }
-  const startDir = info.runner.replace(/\/[^/]*$/, "");
-  const remembered = gameShortcutFor(steamAppId);
-  let appId =
-    remembered != null && (await shortcutStillExists(remembered)) ? remembered : null;
-  if (appId == null) {
-    appId = await SteamClient.Apps.AddShortcut(title, SHELL, startDir, "");
-    rememberGameShortcut(steamAppId, appId);
-    try {
-      localStorage.removeItem(gameArtKey(appId)); // a recycled appId must not skip its art
-    } catch {
-      /* ignore */
-    }
-  }
-  SteamClient.Apps.SetShortcutExe(appId, SHELL);
-  SteamClient.Apps.SetShortcutStartDir(appId, startDir);
-  SteamClient.Apps.SetShortcutName(appId, title);
-  setShortcutHidden(appId, true);
-  void applyGameArtwork(appId, steamAppId, iconHash);
-  void ensureGameControllerConfig(title);
-  return { appId, runner: info.runner, clientBin: info.client_bin ?? "" };
-}
-
-const gameEnsureInFlight = new Map<number, Promise<{ appId: number; runner: string; clientBin: string }>>();
-function ensureGameShortcut(
-  steamAppId: number,
-  title: string,
-  iconHash: string,
-): Promise<{ appId: number; runner: string; clientBin: string }> {
-  let p = gameEnsureInFlight.get(steamAppId);
-  if (!p) {
-    p = doEnsureGameShortcut(steamAppId, title, iconHash).finally(() => {
-      gameEnsureInFlight.delete(steamAppId);
-    });
-    gameEnsureInFlight.set(steamAppId, p);
-  }
-  return p;
+function ensureGameShortcut(steamAppId: number, title: string, iconHash: string): Promise<Ensured> {
+  return ensureShortcut({
+    key: gameKey(steamAppId),
+    name: title,
+    hidden: true,
+    configMarker: title.includes('"') ? null : `${GAME_CONFIG_PREFIX}${title.toLowerCase()}`,
+    artKey: gameArtKey,
+    dress: (appId) => void applyGameArtwork(appId, steamAppId, iconHash),
+  });
 }
 
 /** Remove every per-game shortcut on record — the cleanup button. Returns how many went. */

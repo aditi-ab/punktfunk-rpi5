@@ -43,26 +43,28 @@ public enum ConsoleJSON {
         }
     }
 
-    /// The home carousel: saved hosts by name, each followed by its pinned preset cards, then
-    /// the discovered-but-unsaved. Mirrors the desktop service's `rows()`.
+    /// The home carousel: saved hosts in store order, which is the order they were added, each
+    /// followed by its pinned preset cards, then the discovered-but-unsaved by name. The console
+    /// applies the player's sort on top. `clients/shared/host-row-vectors.json` holds this, the
+    /// desktop service's `rows()` and the Android producer to the same rows.
     public static func hostRows(
         saved: [StoredHost], discovered: [DiscoveredHost], online: Set<StoredHost.ID>,
         presets: [StreamPreset], actions hostActions: [String: [HostAction]] = [:],
         running: [String: String] = [:]
     ) -> String {
         var out: [[String: Any]] = []
-        for host in saved.sorted(by: { $0.name.lowercased() < $1.name.lowercased() }) {
-            let advert = discovered.first { d in
-                (!fingerprint(host).isEmpty
-                    && d.fingerprintHex?.caseInsensitiveCompare(fingerprint(host)) == .orderedSame)
-                    || (d.host == host.address && d.port == host.port)
-            }
+        let same = { (d: DiscoveredHost, host: StoredHost) in
+            d.matches(pin: fingerprint(host), address: host.address, port: host.port)
+        }
+        for host in saved {
+            let advert = discovered.first { same($0, host) }
             let base = row(host, advert: advert, online: online.contains(host.id),
                            presets: presets, hostActions: hostActions, running: running)
             out.append(base)
             // A pinned card shares the primary tile's live state; its key rides the preset id
             // behind a NUL, which no fingerprint or `addr:port` can hold.
-            for id in host.pinnedPresetIDs ?? [] {
+            var seen = Set<String>()
+            for id in host.pinnedPresetIDs ?? [] where seen.insert(id).inserted {
                 guard let preset = presets.first(where: { $0.id == id }) else { continue }
                 var card = base
                 card["key"] = "\(base["key"] as? String ?? "")\u{0}\(preset.id)"
@@ -71,13 +73,7 @@ public enum ConsoleJSON {
                 out.append(card)
             }
         }
-        let unsaved = discovered.filter { d in
-            !saved.contains { host in
-                (!fingerprint(host).isEmpty
-                    && d.fingerprintHex?.caseInsensitiveCompare(fingerprint(host)) == .orderedSame)
-                    || (host.address == d.host && host.port == d.port)
-            }
-        }
+        let unsaved = discovered.filter { d in !saved.contains { same(d, $0) } }
         for d in unsaved.sorted(by: { $0.name.lowercased() < $1.name.lowercased() }) {
             let fp = d.fingerprintHex ?? ""
             out.append([

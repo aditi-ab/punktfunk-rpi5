@@ -184,68 +184,11 @@ impl RemoteImporter {
         }
     }
 
+    /// One import round trip; see [`super::EglImporter::import`] for `kind`.
     pub fn import(
         &mut self,
-        plane: &DmabufPlane,
-        width: u32,
-        height: u32,
-        fourcc: u32,
-        modifier: Option<u64>,
-    ) -> Result<DeviceBuffer> {
-        self.import_impl(plane, ImportKind::Tiled, width, height, fourcc, modifier)
-    }
-
-    pub fn import_nv12(
-        &mut self,
-        plane: &DmabufPlane,
-        width: u32,
-        height: u32,
-        fourcc: u32,
-        modifier: Option<u64>,
-    ) -> Result<DeviceBuffer> {
-        self.import_impl(
-            plane,
-            ImportKind::TiledNv12,
-            width,
-            height,
-            fourcc,
-            modifier,
-        )
-    }
-
-    pub fn import_yuv444(
-        &mut self,
-        plane: &DmabufPlane,
-        width: u32,
-        height: u32,
-        fourcc: u32,
-        modifier: Option<u64>,
-    ) -> Result<DeviceBuffer> {
-        self.import_impl(plane, ImportKind::Tiled444, width, height, fourcc, modifier)
-    }
-
-    pub fn import_linear(
-        &mut self,
-        plane: &DmabufPlane,
-        width: u32,
-        height: u32,
-    ) -> Result<DeviceBuffer> {
-        self.import_impl(plane, ImportKind::Linear, width, height, 0, None)
-    }
-
-    pub fn import_linear_nv12(
-        &mut self,
-        plane: &DmabufPlane,
-        width: u32,
-        height: u32,
-    ) -> Result<DeviceBuffer> {
-        self.import_impl(plane, ImportKind::LinearNv12, width, height, 0, None)
-    }
-
-    fn import_impl(
-        &mut self,
-        plane: &DmabufPlane,
         kind: ImportKind,
+        plane: &DmabufPlane,
         width: u32,
         height: u32,
         fourcc: u32,
@@ -341,7 +284,7 @@ impl RemoteImporter {
                     }
                 });
                 // Wire has no plane format; layout is the ImportKind we asked for.
-                let yuv444 = kind == ImportKind::Tiled444;
+                let yuv444 = kind.layout() == cuda::PlaneLayout::Yuv444;
                 // SAFETY: `m` is the IPC mapping `open_mapping` opened for this id, with the
                 // worker's layout; the ref taken above keeps it open until `release` drops it.
                 Ok(unsafe {
@@ -527,7 +470,7 @@ impl Drop for RemoteImporter {
 /// kernel gives each dma-buf a unique inode for its lifetime. Worker fd-cache
 /// key, so the fd itself is passed once.
 fn dmabuf_key(fd: BorrowedFd<'_>) -> Result<u64> {
-    Ok(super::fd_identity(fd).context("fstat(dmabuf fd)")?.1)
+    Ok(super::fd_identity(fd).context("fstat dmabuf fd")?.1)
 }
 
 fn open_mapping(desc: &BufferDesc) -> Result<Mapping> {
@@ -727,8 +670,12 @@ mod tests {
         };
         // First sight of the key: fd rides along. Err keeps the key marked sent
         // (worker cached the fd before failing).
-        assert!(imp.import(&plane, 64, 64, 1, Some(2)).is_err());
-        assert!(imp.import(&plane, 64, 64, 1, Some(2)).is_err());
+        assert!(imp
+            .import(ImportKind::Tiled, &plane, 64, 64, 1, Some(2))
+            .is_err());
+        assert!(imp
+            .import(ImportKind::Tiled, &plane, 64, 64, 1, Some(2))
+            .is_err());
         assert!(!imp.dead(), "NeedFd handling must not mark the worker dead");
         // SCM_RIGHTS re-numbers the fd; st_ino of the open file survives.
         let key = dmabuf_key(pr.as_fd()).unwrap();
@@ -762,14 +709,14 @@ mod tests {
             offset: 0,
             stride: 256,
         };
-        let Err(err) = imp.import(&plane, 64, 64, 1, Some(2)) else {
+        let Err(err) = imp.import(ImportKind::Tiled, &plane, 64, 64, 1, Some(2)) else {
             panic!("scripted Err reply must fail the import")
         };
         assert!(format!("{err:#}").contains("EGL_BAD_MATCH"));
         assert!(!imp.dead(), "an Err reply must not mark the worker dead");
 
         // Replies exhausted → server closes → next import dies.
-        let Err(err) = imp.import(&plane, 64, 64, 1, Some(2)) else {
+        let Err(err) = imp.import(ImportKind::Tiled, &plane, 64, 64, 1, Some(2)) else {
             panic!("a closed worker must fail the import")
         };
         assert!(format!("{err:#}").contains("died"), "{err:#}");

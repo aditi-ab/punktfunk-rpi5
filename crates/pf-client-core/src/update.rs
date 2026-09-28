@@ -15,8 +15,8 @@
 #![cfg(target_os = "linux")]
 
 use pf_update_check::detect::{self, InstallKind, Product};
+use pf_update_check::floor;
 use pf_update_check::version::{is_newer, Channel};
-use pf_update_check::PublicKey;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -86,28 +86,25 @@ pub struct Status {
     pub not_published: bool,
 }
 
-/// Keys trusted for manifests. Pinned in [`pf_update_check`] so host and client cannot disagree.
-fn pinned_keys() -> Vec<PublicKey> {
-    pf_update_check::OFFICIAL_UPDATE_KEYS
-        .iter()
-        .filter(|k| !k.is_empty())
-        .filter_map(|k| PublicKey::parse(k).ok())
-        .collect()
-}
-
 /// Operator kill switch for checks. Same env name the host honours.
 pub fn check_disabled() -> bool {
-    matches!(
-        std::env::var("PUNKTFUNK_UPDATE_CHECK").as_deref(),
-        Ok("0") | Ok("false") | Ok("off")
-    )
+    env_off("PUNKTFUNK_UPDATE_CHECK")
 }
 
 /// Operator kill switch for apply. Status still reports what is available and the hand command.
 pub fn apply_disabled() -> bool {
+    env_off("PUNKTFUNK_UPDATE_APPLY")
+}
+
+fn env_off(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| is_off(&v))
+}
+
+/// The host's off grammar for these switches: trimmed, any case, `0`, `false`, `off` or `no`.
+fn is_off(value: &str) -> bool {
     matches!(
-        std::env::var("PUNKTFUNK_UPDATE_APPLY").as_deref(),
-        Ok("0") | Ok("false") | Ok("off")
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "off" | "no"
     )
 }
 
@@ -210,39 +207,13 @@ fn state_path() -> Option<PathBuf> {
         .map(|d| d.join("client-update-state.json"))
 }
 
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-struct FloorFile {
-    #[serde(default)]
-    serial_floor: std::collections::BTreeMap<String, u64>,
-}
-
-fn load_floor(path: &Path, channel: &str) -> u64 {
-    std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<FloorFile>(&b).ok())
-        .and_then(|f| f.serial_floor.get(channel).copied())
-        .unwrap_or(0)
-}
-
-/// Raise (never lower) the floor. Goes through [`crate::trust::write_atomic`] so the
-/// in-place fallback still raises it when rename cannot work.
-fn store_floor(path: &Path, channel: &str, serial: u64) {
-    let mut file: FloorFile = std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
-    let slot = file.serial_floor.entry(channel.to_string()).or_insert(0);
-    if serial <= *slot {
-        return;
-    }
-    *slot = serial;
-    let Ok(bytes) = serde_json::to_vec_pretty(&file) else {
-        return;
-    };
+/// The floor's write: [`crate::trust::write_atomic`], whose in-place fallback still raises it
+/// when rename cannot work.
+fn write_floor(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = crate::trust::write_atomic(path, &bytes);
+    crate::trust::write_atomic(path, bytes)
 }
 
 /// Fetch and verify the channel manifest. Blocking. A failed check sets `error` and
@@ -277,7 +248,7 @@ pub fn check(current: &str) -> Status {
     let manifest = match pf_update_check::feed::fetch_manifest_blocking(
         &pf_update_check::feed::feed_base(),
         channel.as_str(),
-        &pinned_keys(),
+        &pf_update_check::pinned_keys(),
         &format!("punktfunk-client/{current} (update-check)"),
     ) {
         Ok(m) => m,
@@ -290,15 +261,11 @@ pub fn check(current: &str) -> Status {
 
     // Anti-rollback: a validly signed older manifest is an error, not a silent downgrade.
     if let Some(path) = state_path() {
-        let floor = load_floor(&path, channel.as_str());
-        if manifest.serial < floor {
-            status.error = Some(format!(
-                "manifest serial {} is older than the last accepted {} — refusing rollback",
-                manifest.serial, floor
-            ));
+        if let Err(e) = floor::check(&path, channel.as_str(), manifest.serial) {
+            status.error = Some(e);
             return status;
         }
-        store_floor(&path, channel.as_str(), manifest.serial);
+        let _ = floor::raise(&path, channel.as_str(), manifest.serial, write_floor);
     }
 
     status.latest = manifest.version.clone();
@@ -567,6 +534,17 @@ mod tests {
         );
     }
 
+    /// The host reads `PUNKTFUNK_UPDATE_CHECK=no` as off; the client must too.
+    #[test]
+    fn kill_switches_read_the_hosts_off_grammar() {
+        for off in ["0", "false", "off", "no", "OFF", " No ", "0 "] {
+            assert!(is_off(off), "{off:?}");
+        }
+        for on in ["1", "true", "yes", "", "garbage"] {
+            assert!(!is_off(on), "{on:?}");
+        }
+    }
+
     #[test]
     fn opt_in_hint_only_where_it_would_help() {
         let not_opted = Caps {
@@ -584,25 +562,5 @@ mod tests {
             }
         ));
         assert!(!opt_in_would_help(InstallKind::Apt, ready()));
-    }
-
-    #[test]
-    fn serial_floor_never_lowers() {
-        let dir = std::env::temp_dir().join(format!("pf-update-floor-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("state.json");
-        store_floor(&path, "stable", 100);
-        assert_eq!(load_floor(&path, "stable"), 100);
-        store_floor(&path, "stable", 50);
-        assert_eq!(
-            load_floor(&path, "stable"),
-            100,
-            "a replay must not lower it"
-        );
-        store_floor(&path, "stable", 101);
-        assert_eq!(load_floor(&path, "stable"), 101);
-        // Channels are independent floors.
-        assert_eq!(load_floor(&path, "canary"), 0);
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

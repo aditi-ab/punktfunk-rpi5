@@ -21,7 +21,8 @@
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use punktfunk_setup::platform::windows::choices::{NetworkAnswer, LAN_BIND, LOOPBACK_BIND};
+use punktfunk_setup::choices::{LAN_BIND, LOOPBACK_BIND};
+use punktfunk_setup::platform::windows::choices::NetworkAnswer;
 use punktfunk_setup::platform::windows::demo::{sandbox_app_dir, WinDemoRunner, WinPreset};
 use punktfunk_setup::platform::windows::exec::{FakePayload, PayloadSource, Subst, WinExecutor};
 use punktfunk_setup::platform::windows::plan::{self, Artifact};

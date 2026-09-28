@@ -24,7 +24,7 @@ use punktfunk_core::quic::{
     classify, endpoint, io, AccessUpdate, AckReason, BitrateChanged, ClockEcho, ClockProbe,
     ColorInfo, GrantClass, Hello, LinkReport, LossReport, PairRequest, PipelineGap, ProbeRequest,
     ProbeResult, Reconfigure, Reconfigured, RequestKeyframe, RfiRequest, SetBitrate, Start,
-    Welcome, GRANT_ALL, GRANT_CLIPBOARD, GRANT_GAMEPAD, GRANT_LAUNCH, GRANT_MIC, GRANT_POINTER,
+    Welcome, GRANT_ALL, GRANT_CLIPBOARD, GRANT_LAUNCH,
 };
 use punktfunk_core::transport::UdpTransport;
 use punktfunk_core::Session;
@@ -35,13 +35,12 @@ use std::sync::Arc;
 /// Shared with GameStream.
 pub(crate) use pf_frame::thread_qos::boost_thread_priority;
 
-mod compositor;
 // The session's control connection, whichever transport carries it (quinn or WebTransport).
 pub(crate) mod link;
 /// A seat's Steam, up before its client asks (`design/steam-seats-warm-launch-implementation-plan.md`).
 #[cfg(target_os = "linux")]
 pub(crate) mod prewarm;
-use compositor::resolve_compositor;
+use crate::compositor_route::resolve_compositor;
 
 /// GameStream presents the same virtual pad and must pick `windows_xbox_hid` from this definition.
 pub(crate) mod gamepad;
@@ -74,9 +73,11 @@ mod cursor_fwd;
 mod stream;
 use stream::{
     reconfig_allowed, software_stream, synthetic_abr_stream, synthetic_stream, virtual_stream,
-    SessionContext, SynthAbrContext,
+    SessionContext, StreamCommon, SynthAbrContext,
 };
+mod wiring;
 pub use stream::{Content, KeyframeAnswer, SynthAbrShape, DEFAULT_IDR_PCT};
+use wiring::SessionWiring;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Punktfunk1Source {
@@ -196,21 +197,7 @@ pub fn test_frame(idx: u32, len: usize) -> Vec<u8> {
     d
 }
 
-fn now_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
-
-/// Unix seconds. Access deadlines are stored and checked in wall time, not a cached
-/// monotonic offset, so an NTP step moves a deadline with the clock.
-pub(crate) fn wall_unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
+use punktfunk_core::quic::wall_clock_ns as now_ns;
 
 /// Remaining lifetime on the wire: saturating whole seconds, floor 1. `0` means *permanent*,
 /// so a deadline due this second still advertises as expiring.
@@ -257,10 +244,6 @@ fn run_ephemeral(opts: Punktfunk1Options) -> Result<()> {
     let stats = StatsRecorder::new(crate::stats_recorder::default_dir());
     let ident = crate::identity::ephemeral()?;
     rt.block_on(serve(opts, 0, np, stats, ident, None))
-}
-
-fn fingerprint_hex(fp: &[u8; 32]) -> String {
-    fp.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Native host config when unified `serve` runs it in-process.
@@ -342,7 +325,7 @@ pub(crate) async fn serve(
     tracing::info!(
         port = opts.port,
         source = ?opts.source,
-        fingerprint = %fingerprint_hex(&fingerprint),
+        fingerprint = %hex::encode(fingerprint),
         "punktfunk/1 host listening (QUIC) — clients pin this fingerprint"
     );
 
@@ -354,11 +337,11 @@ pub(crate) async fn serve(
         );
         None
     } else {
-        match crate::gamestream::Host::detect() {
+        match crate::host::Host::detect() {
         Ok(h) => crate::discovery::advertise_native(
             &h.hostname,
             opts.port,
-            &fingerprint_hex(&fingerprint),
+            &hex::encode(fingerprint),
             opts.require_pairing,
             &h.uniqueid,
             // 0 = standalone (no mgmt API) → do not advertise an `mgmt` port.
@@ -628,68 +611,6 @@ async fn close_rejected(conn: &link::SessionLink, reason: punktfunk_core::reject
     conn.refuse(reason.close_code(), &reason.to_string()).await;
 }
 
-/// One counter and one `warn!` per grant class per session. Totals at end-of-stream;
-/// per-event logging would be a log DoS.
-struct GrantDrops {
-    // One slot per grant bit (7 with `Power`). Power never drops input; `idx` must still
-    // stay in bounds for every `GrantClass`.
-    counts: [AtomicU64; 7],
-    warned: [AtomicBool; 7],
-}
-
-impl GrantDrops {
-    fn new() -> GrantDrops {
-        GrantDrops {
-            counts: std::array::from_fn(|_| AtomicU64::new(0)),
-            warned: std::array::from_fn(|_| AtomicBool::new(false)),
-        }
-    }
-
-    /// Bit position of the grant, so the table cannot drift from the wire vocabulary.
-    fn idx(class: GrantClass) -> usize {
-        class.bit().trailing_zeros() as usize
-    }
-
-    /// Count one drop; log only the first of each class.
-    fn note(&self, class: GrantClass) {
-        let i = Self::idx(class);
-        self.counts[i].fetch_add(1, Ordering::Relaxed);
-        if !self.warned[i].swap(true, Ordering::Relaxed) {
-            tracing::warn!(
-                class = ?class,
-                "dropping client input this session's access grants don't cover — counted; \
-                 further drops of this class are silent until the session-end totals"
-            );
-        }
-    }
-
-    /// `Class=count` pairs; `"none"` when nothing was dropped.
-    fn summary(&self) -> String {
-        use std::fmt::Write;
-        let mut out = String::new();
-        for class in [
-            GrantClass::Gamepad,
-            GrantClass::Pointer,
-            GrantClass::Keyboard,
-            GrantClass::Clipboard,
-            GrantClass::Mic,
-            GrantClass::Launch,
-        ] {
-            let n = self.counts[Self::idx(class)].load(Ordering::Relaxed);
-            if n != 0 {
-                if !out.is_empty() {
-                    out.push(' ');
-                }
-                let _ = write!(out, "{class:?}={n}");
-            }
-        }
-        if out.is_empty() {
-            out.push_str("none");
-        }
-        out
-    }
-}
-
 /// Seconds before the deadline for best-effort toasts (T−5 m, T−1 m). Older clients miss them.
 const ACCESS_WARN_SECS: [i64; 2] = [300, 60];
 
@@ -737,11 +658,11 @@ async fn access_lifecycle(
     mut deadline: Option<i64>,
     device: crate::events::DeviceRef,
 ) {
-    let mut warned = spent_warnings(deadline, wall_unix_now());
+    let mut warned = spent_warnings(deadline, crate::clock::unix_secs());
     // `power.*` ending every session: typed close so the client does not see a transport error.
     let mut power_rx = crate::power::closing_rx();
     loop {
-        let now = wall_unix_now();
+        let now = crate::clock::unix_secs();
         if let Some(d) = deadline {
             if now >= d {
                 // Wall clock at fire: `d − now` is recomputed each lap, so an NTP step moves it.
@@ -766,7 +687,7 @@ async fn access_lifecycle(
             }
         }
         tokio::select! {
-            () = tokio::time::sleep(access_sleep(deadline, &warned, wall_unix_now())) => {}
+            () = tokio::time::sleep(access_sleep(deadline, &warned, crate::clock::unix_secs())) => {}
             changed = watch_rx.changed() => {
                 if changed.is_err() {
                     return; // registry gone — host shutting down
@@ -794,7 +715,7 @@ async fn access_lifecycle(
                 controls
                     .deadline_unix
                     .store(deadline.unwrap_or(0), Ordering::Relaxed);
-                let now = wall_unix_now();
+                let now = crate::clock::unix_secs();
                 warned = spent_warnings(deadline, now);
                 // Skip an "expire now" (deadline already past) so we do not advertise a phantom second.
                 if deadline.is_none_or(|d| d > now) {
@@ -1283,7 +1204,7 @@ async fn serve_session(
             .await;
             anyhow::bail!("pairing requires the client to present a certificate");
         };
-        let client_fp_hex = fingerprint_hex(&client_fp);
+        let client_fp_hex = hex::encode(client_fp);
         // Charge the cooldown before consulting arming, on every outcome including rejections.
         // Otherwise "is pairing armed?" is a free oracle. A spam of knocks can hold the
         // cooldown against the real device.
@@ -1363,7 +1284,7 @@ async fn serve_session(
         let authorized = fp
             .as_ref()
             .map(|fp| {
-                np.effective(&fingerprint_hex(fp), wall_unix_now())
+                np.effective(&hex::encode(fp), crate::clock::unix_secs())
                     .is_some()
             })
             .unwrap_or(false);
@@ -1380,7 +1301,7 @@ async fn serve_session(
                      client identity and approve it in the console, or run the PIN ceremony)"
                 );
             };
-            let fp_hex = fingerprint_hex(&fp);
+            let fp_hex = hex::encode(fp);
             // Sanitize the wire name before log/console (escapes / bidi). Empty → fingerprint label.
             let label = crate::native_pairing::sanitize_device_name(
                 gate_hello.name.as_deref().unwrap_or(""),
@@ -1474,7 +1395,7 @@ pub(crate) async fn run_admitted(
     data_plane: DataPlane,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<Served> {
-    let session_fp_hex = conn.peer_fingerprint().map(|fp| fingerprint_hex(&fp));
+    let session_fp_hex = conn.peer_fingerprint().map(hex::encode);
     let SessionHost {
         opts,
         audio_cap,
@@ -1490,46 +1411,15 @@ pub(crate) async fn run_admitted(
     // RAII frees the slot on return.
     let _permit = permit;
 
-    // Grants once at admission: effective mask + deadline + watch. Anonymous (`--open`) and
-    // an identity with no record keep full control — nothing on the trust record to enforce.
-    let admit_unix = wall_unix_now();
-    let (initial_grants, deadline_unix, access_watch) = match session_fp_hex.as_deref() {
-        Some(fp_hex) => match np.effective(fp_hex, admit_unix) {
-            Some(mask) => {
-                // Subscribe before reading the deadline so a racing edit lands in this borrow
-                // or as the first change — never in a gap.
-                let rx = np.subscribe(fp_hex);
-                let deadline = rx.borrow().deadline_unix;
-                (mask, deadline, Some(rx))
-            }
-            // Expired between the pairing gate and here: typed expiry, not a setup error.
-            None if opts.require_pairing => {
-                close_rejected(&conn, punktfunk_core::reject::RejectReason::AccessExpired).await;
-                anyhow::bail!("access expired between admission and session setup");
-            }
-            // `--open`: unpaired / expired identities keep full control.
-            None => (GRANT_ALL, None, None),
-        },
-        None => (GRANT_ALL, None, None),
-    };
-    // Count this session while it runs. Held to the end of the function, so an error return or
-    // a cancelled task releases it too — a record granted "this session" is dropped once the
-    // guard falls and nothing reconnects inside the grace.
-    let _session = session_fp_hex
-        .as_deref()
-        .map(|fp_hex| host.np.session_started(fp_hex));
+    let Admission {
+        grants: initial_grants,
+        deadline_unix,
+        watch: access_watch,
+        at_unix: admit_unix,
+        session: _session,
+    } = admit(host, session_fp_hex.as_deref(), &conn, &first).await?;
     // One relaxed load per event; the lifecycle task is the only writer after admission.
     let session_grants = Arc::new(AtomicU32::new(initial_grants));
-    // Launch without LAUNCH: refuse before handshake (typed reason), not a silent bare desktop.
-    if initial_grants & GRANT_LAUNCH == 0 && Hello::decode(&first).is_ok_and(|h| h.launch.is_some())
-    {
-        close_rejected(
-            &conn,
-            punktfunk_core::reject::RejectReason::LaunchNotPermitted,
-        )
-        .await;
-        anyhow::bail!("client requested a library launch without the LAUNCH grant");
-    }
     let expires_in_secs = remaining_secs_wire(deadline_unix, admit_unix);
 
     let source = opts.source;
@@ -1550,40 +1440,22 @@ pub(crate) async fn run_admitted(
     // Session totals for the summary. The input, audio and encode paths all outlive the
     // guard that reads them, so they bump a shared block rather than hand a figure over.
     let counters = Arc::new(crate::session_status::SessionCounters::default());
-    {
-        let stop = stop.clone();
-        let quit = quit.clone();
-        let end_reason = end_reason.clone();
-        let conn = conn.clone();
-        tokio::spawn(async move {
-            let reason = conn.closed().await;
-            if reason.closed_with(QUIT_CODE) {
-                quit.store(true, Ordering::SeqCst);
-                crate::events::SessionEndReason::Local.latch(&end_reason);
-            } else {
-                // The client's own rule: anything that is not our close code is the link
-                // going away. A close this host made reads as `Other` here too, which is
-                // why the paths that make one latch before they call it.
-                crate::events::SessionEndReason::Lost.latch(&end_reason);
-            }
-            stop.store(true, Ordering::SeqCst);
-        });
-    }
+    spawn_end_watch(conn.clone(), stop.clone(), quit.clone(), end_reason.clone());
 
-    let (
+    let handshake::Negotiated {
         hello,
         welcome,
         udp_port,
         data_sock,
         start,
         client_label,
-        session_preset,
+        preset: session_preset,
         abr_features,
         compositor,
         gamescope_route,
         prep,
         joined,
-    ) = tokio::time::timeout(
+    } = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
         handshake::negotiate(
             &conn,
@@ -1648,60 +1520,24 @@ pub(crate) async fn run_admitted(
 
     // Handshake stream stays open: Reconfigure → data plane rebuilds capture/encoder;
     // ProbeRequest → FLAG_PROBE burst. Inbound and outbound multiplexed with `select!`.
-    let (reconfig_tx, reconfig_rx) = std::sync::mpsc::channel::<punktfunk_core::Mode>();
-    let (keyframe_tx, keyframe_rx) = std::sync::mpsc::channel::<()>();
-    // LTR-RFI: encode loop prefers `invalidate_ref_frames` over a full IDR when the encoder can.
-    let (rfi_tx, rfi_rx) = std::sync::mpsc::channel::<(u32, u32)>();
-    let (bitrate_tx, bitrate_rx) = std::sync::mpsc::channel::<u32>();
-    // Encoder truth for `SetBitrate` resolve: applied rate, a ceiling the encoder taught and
-    // re-tests, cadence-degraded (climb refused — more bits are not the fix).
-    let live_bitrate = Arc::new(AtomicU32::new(welcome.bitrate_kbps));
-    let encoder_ceiling = Arc::new(std::sync::Mutex::new(EncoderCeiling::new()));
-    let cadence_degraded = Arc::new(AtomicBool::new(false));
-    // Behind-cadence score for the climb-refusal log (the flag alone has no evidence).
-    let cadence_behind_score = Arc::new(AtomicU32::new(0));
-    // Client-received packet count (`u32::MAX` until the client answers). Distinguishes a
-    // clean link from a dead one (`loss_ppm = 0` means both).
-    let client_packets_received = Arc::new(AtomicU32::new(u32::MAX));
-    let client_packets_received_ctl = client_packets_received.clone();
-    let (probe_tx, probe_rx) = std::sync::mpsc::channel::<ProbeRequest>();
-    // The bring-up ramp's window: probe requests are served on the punched
-    // data plane without the control task's spacing until the send thread
-    // takes it. Open from the handshake, because the client asks as soon as
-    // it has punched — before this host has built anything.
-    let ramp_open = Arc::new(AtomicBool::new(
-        welcome.host_caps2 & punktfunk_core::quic::HOST_CAP2_RAMP != 0,
-    ));
-    let ramp_open_ctl = ramp_open.clone();
-    let (probe_result_tx, probe_result_rx) = tokio::sync::mpsc::unbounded_channel::<ProbeResult>();
-    // Accept ack is written before the rebuild; a failed or differently-honored rebuild must
-    // correct the client's mode slot with a second `Reconfigured { accepted: true, mode }`.
-    let (reconfig_result_tx, reconfig_result_rx) =
-        tokio::sync::mpsc::unbounded_channel::<Reconfigured>();
-    // Rebuild can re-resolve Automatic (1080p client mirroring a 4K panel). Tell the client
-    // (`BitrateChanged`); otherwise ABR's first climb is from a stale lower base.
-    let (retarget_tx, retarget_rx) = tokio::sync::mpsc::unbounded_channel::<(u32, AckReason)>();
-    // Rebuild gap (ms) → `PipelineGap` so the client discards that ABR window as congestion.
-    let (gap_tx, gap_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
-    // Encode loop diffs cursor serial; control task is the sole writer. Wired even if unused.
-    // Depth-1 latest-wins: a shape a stalled peer never drained is stale, not a backlog.
-    let (cursor_shape_tx, cursor_shape_rx) =
-        tokio::sync::watch::channel::<Option<punktfunk_core::quic::CursorShape>>(None);
-    // Channels always wired. Driver only if `Hello::max_shard_payload` and not PyroWave
-    // (PyroWave pins the Welcome value for the session; mid-stream re-key would desync).
-    let (shard_change_tx, shard_change_rx) = tokio::sync::mpsc::unbounded_channel::<u16>();
-    let (shard_ack_tx, shard_ack_rx) = tokio::sync::mpsc::unbounded_channel::<u16>();
-    let (shard_apply_tx, shard_apply_rx) = std::sync::mpsc::channel::<usize>();
-    // Not for a browser either: the driver's targets are UDP-over-IP maths, and a WebTransport
-    // datagram also carries QUIC and HTTP/3 framing, so a grow it computed would not fit.
+    let SessionWiring {
+        control: control_ends,
+        stream: stream_ends,
+        shard,
+        shared,
+    } = SessionWiring::new(&welcome, source);
+    // Shard renegotiation only if `Hello::max_shard_payload` and not PyroWave (PyroWave pins
+    // the Welcome value for the session; a mid-stream re-key would desync). Not for a browser
+    // either: the driver's targets are UDP-over-IP maths, and a WebTransport datagram also
+    // carries QUIC and HTTP/3 framing, so a grow it computed would not fit.
     let shard_reneg = (hello.max_shard_payload > 0
         && codec != crate::encode::Codec::PyroWave
         && matches!(data_plane, DataPlane::Udp))
     .then_some(wire_mtu::ShardReneg {
         client_ceiling: hello.max_shard_payload,
-        change_tx: shard_change_tx,
-        ack_rx: shard_ack_rx,
-        apply_tx: shard_apply_tx,
+        change_tx: shard.change_tx,
+        ack_rx: shard.ack_rx,
+        apply_tx: shard.apply_tx,
     });
     // Path-MTU watch: clamp for the next session, and heal/grow this one if the driver exists.
     wire_mtu::spawn_watch(
@@ -1712,50 +1548,22 @@ pub(crate) async fn run_admitted(
     );
     // Read back from Welcome, not recomputed (would re-probe and could drift).
     let cursor_forward = welcome.host_caps & punktfunk_core::quic::HOST_CAP_CURSOR != 0;
-    // `true` = client draws (exclude + forward), `false` = host composites. Starts true.
-    let cursor_client_draws = Arc::new(AtomicBool::new(true));
-    let cursor_client_draws_dp = cursor_client_draws.clone();
     // Only sources that can keep encoder and packetizer FEC in one wire budget adapt it.
     // Synthetic-abr derives frame bytes from FEC every frame; the virtual path publishes
     // a proposal only after its encoder accepts the matching rate. Fixed synthetic and
     // the standalone software source have no coordinated retarget path.
     let adaptive_fec = adaptive_fec_for(source, fec_static_override().is_some());
-    // A proposal lands on `fec_requested`; the stream loop publishes it to `fec_target`
-    // only after the encoder accepts the matching rate. Synthetic-abr aliases the pair:
-    // it re-derives frame bytes from FEC every frame and has no retarget to coordinate.
-    let fec_target = Arc::new(AtomicU8::new(welcome.fec.fec_percent));
-    let fec_requested = match source {
-        Punktfunk1Source::SyntheticAbr(_) => fec_target.clone(),
-        _ => Arc::new(AtomicU8::new(welcome.fec.fec_percent)),
-    };
-    // The client's proven link rate; the send loop paces a pinned stream against it.
-    let link_kbps = Arc::new(AtomicU32::new(0));
-    // PhaseReports from the control task; encode loop drains. Inert until a vsync-aware client.
-    let phase_ctl = Arc::new(stream::PhaseCtl::new());
-    let phase_ctl_control = phase_ctl.clone();
     // Negotiated rate; PyroWave retarget-refusals ack this pin.
     let session_bitrate_kbps = welcome.bitrate_kbps;
     // Control task flips on `ClipControl`; lifecycle clears it if CLIPBOARD is revoked.
     let clip_enabled = Arc::new(AtomicBool::new(false));
-    // Without CLIPBOARD the coordinator never starts (a watcher that doesn't exist can't leak).
-    // Inert handle (`available: false`) keeps control-task arms uniform: NOT_PERMITTED, and
-    // the decline loop still answers stray fetches.
-    // The clipboard's fetch transfers are quinn streams, so it is on offer only where there are
-    // some — a browser takes the declining arm below until the control plane is carrier-agnostic.
-    let clip_quic = (initial_grants & GRANT_CLIPBOARD != 0)
-        .then(|| conn.as_quic().cloned())
-        .flatten();
-    let clip = if let Some(quic) = clip_quic {
-        pf_clipboard::start(quic, clip_enabled.clone(), compositor.is_some()).await
-    } else {
-        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (_offer_tx, offer_rx) = tokio::sync::mpsc::unbounded_channel();
-        pf_clipboard::ClipCoord {
-            available: false,
-            cmd_tx,
-            offer_rx,
-        }
-    };
+    let clip = start_clipboard(
+        &conn,
+        initial_grants,
+        clip_enabled.clone(),
+        compositor.is_some(),
+    )
+    .await;
     let clip_available = clip.available;
     // Lifecycle and the per-session management routes → control task. Both lanes stay
     // open for the whole session: the console can re-point or mute an anonymous client too.
@@ -1815,29 +1623,8 @@ pub(crate) async fn run_admitted(
             + punktfunk_core::abr::budget::SHARD_WIRE_OVERHEAD,
         audio_kbps: audio_reserved_kbps(&welcome),
         ack_reason: abr_features & punktfunk_core::quic::EXT_ABR_ACK_REASON != 0,
-        live_bitrate: live_bitrate.clone(),
-        encoder_ceiling: encoder_ceiling.clone(),
-        cadence_degraded: cadence_degraded.clone(),
-        cadence_behind_score: cadence_behind_score.clone(),
-        client_packets_received: client_packets_received_ctl,
-        fec_target: fec_target.clone(),
-        fec_requested: fec_requested.clone(),
-        link_kbps: link_kbps.clone(),
-        phase_ctl: phase_ctl_control,
-        reconfig_tx,
-        keyframe_tx,
-        rfi_tx,
-        bitrate_tx,
-        probe_tx,
-        probe_result_rx,
-        ramp_open: ramp_open_ctl,
-        reconfig_result_rx,
-        retarget_rx,
-        gap_rx,
-        shard_change_rx,
-        shard_ack_tx,
-        cursor_shape_rx,
-        cursor_client_draws,
+        ends: control_ends,
+        shared: shared.clone(),
         clip_enabled: clip_enabled.clone(),
         clip,
         session_grants: session_grants.clone(),
@@ -1846,24 +1633,11 @@ pub(crate) async fn run_admitted(
         pad_slots_rx,
         launch_outcome_rx,
         peer: peer.ip(),
+        plane: conn.plane(),
         counters: counters.clone(),
         stats: stats.clone(),
     }));
-    // Trust-store name (a console rename wins), else the sanitized Hello name. `None` if
-    // nameless. Events, hook filters, the stream marker and the tray all show this one.
-    let client_name = session_fp_hex
-        .as_deref()
-        .and_then(|fp| np.list().into_iter().find(|c| c.fingerprint == fp))
-        .map(|c| c.name)
-        .or_else(|| {
-            let raw = hello.name.as_deref().unwrap_or("").trim();
-            (!raw.is_empty()).then(|| {
-                crate::native_pairing::sanitize_device_name(
-                    raw,
-                    session_fp_hex.as_deref().unwrap_or(""),
-                )
-            })
-        });
+    let client_name = client_name(np, session_fp_hex.as_deref(), &hello);
     // Only a fingerprint has a record to watch; with no record there is nothing to expire.
     match (session_fp_hex.clone(), access_watch) {
         (Some(fp_hex), Some(watch_rx)) => {
@@ -1893,73 +1667,21 @@ pub(crate) async fn run_admitted(
         }
     }
 
-    // Isolated gamescope: per-session input/audio/mic. Identity is the device-fingerprint prefix
-    // so keep-alive hands a kept spawn back to the same client. Minted after handshake, before
-    // the input/audio threads (`compositor::session_is_isolated`).
-    #[cfg(target_os = "linux")]
-    let isolation: Option<crate::vdisplay::SessionIsolation> = match joined.as_ref().map(|(d, _)| d)
-    {
-        // A joiner uses the owner's planes: its input relay and sink. A second mic source of the
-        // same name would split the owner's, so this session's mic stays on the shared one.
-        Some(d) => d
-            .isolation
-            .clone()
-            .map(|i| crate::vdisplay::SessionIsolation {
-                mic_source: None,
-                ..i
-            }),
-        None => compositor
-            .filter(|c| compositor::session_is_isolated(*c, gamescope_route.as_ref()))
-            .map(|_| {
-                // `--open` has no fingerprint; a per-accept sequence isolates at the cost of keep-alive.
-                static ANON_SEQ: AtomicU64 = AtomicU64::new(0);
-                let paired = session_fp_hex.as_deref().map(seat_id);
-                let id = paired
-                    .clone()
-                    .unwrap_or_else(|| format!("anon{}", ANON_SEQ.fetch_add(1, Ordering::Relaxed)));
-                let iso = session_isolation(&id, paired.is_some());
-                tracing::info!(%id, sink = iso.sink.as_deref().unwrap_or("-"),
-                "isolated gamescope session — per-session input/audio/mic planes");
-                iso
-            }),
-    };
-    // Where this session's virtual pads are exposed, so its seat's Steam opens those and no
-    // other seat's. `None` on every host without the filter, which is today's box-wide pads.
-    #[cfg(target_os = "linux")]
-    let seat_dev = isolation
-        .as_ref()
-        .and_then(crate::vdisplay::seat_device_dir);
-    #[cfg(not(target_os = "linux"))]
-    let seat_dev: Option<std::path::PathBuf> = None;
-    // Pinned injector + swappable route. Drop at session end closes the EIS connection.
-    #[cfg(target_os = "linux")]
-    let session_injector = isolation
-        .as_ref()
-        .map(|i| crate::inject::InjectorService::start_at(i.ei_relay.clone()));
-    #[cfg(target_os = "linux")]
-    let inj_session_tx = session_injector.as_ref().map(|s| s.sender());
-    #[cfg(target_os = "linux")]
-    let input_route = input::InputRoute::new(match &inj_session_tx {
-        Some(tx) => tx.clone(),
-        None => inj_tx.clone(),
-    });
-    #[cfg(not(target_os = "linux"))]
-    let input_route = input::InputRoute::new(inj_tx.clone());
-    // Isolated mic pump (`punktfunk-mic-{id}`) for this session's 0xCB uplink. Drop tears it down.
-    #[cfg(target_os = "linux")]
-    let session_mic = isolation
-        .as_ref()
-        .and_then(|i| i.mic_source.clone())
-        .map(|name| crate::audio::MicPump::start_named(Some(name)));
-    #[cfg(target_os = "linux")]
-    let mic_tx = session_mic.as_ref().map(|p| p.sender()).unwrap_or(mic_tx);
+    let planes = SessionPlanes::mint(
+        joined.as_ref().map(|(d, _)| d),
+        compositor,
+        gamescope_route.as_ref(),
+        session_fp_hex.as_deref(),
+        &inj_tx,
+        mic_tx,
+    );
+    let input_route = planes.input_route.clone();
 
     // One bounded channel for pointer/keyboard and rich input. Unbounded is RSS DoS: the
     // producer outruns the consumer; pen batches amplify. Drop is correct — stale input is
     // already worthless; the injector re-syncs from the next event.
     const INPUT_QUEUE_DEPTH: usize = 1024;
     let (input_tx, input_rx) = std::sync::mpsc::sync_channel::<ClientInput>(INPUT_QUEUE_DEPTH);
-    let rich_tx = input_tx.clone();
     // Stream loop parks the seat pointer through the same path client input takes.
     #[cfg(target_os = "linux")]
     let input_tx_stream = input_tx.clone();
@@ -1973,6 +1695,7 @@ pub(crate) async fn run_admitted(
         let frame_map = frame_map.clone();
         let pad_feed = controls.pads.clone();
         let counters = counters.clone();
+        let seat_dev = planes.seat_dev.clone();
         std::thread::Builder::new()
             .name("punktfunk1-input".into())
             .spawn({
@@ -1998,122 +1721,24 @@ pub(crate) async fn run_admitted(
             })
             .context("spawn input thread")?
     };
-    // One `read_datagram` loop (two would race): 0xCB mic, 0xCC rich, 0xC8 input. Magics disjoint.
-    let input_conn = conn.clone();
-    let grants_dp = session_grants.clone();
-    let counters_dp = counters.clone();
-    tokio::spawn(async move {
-        // Shared, not local: this task ends with the connection, which closes after the session
-        // summary is built, so a local total would never reach it.
-        let n = &*counters_dp;
-        // Per-class counts; one warn on the first drop; totals at end-of-stream.
-        let denied = GrantDrops::new();
-        let mic_source = crate::audio::mic_source_id();
-        // Full queue: drop, never block (would stall mic + this reader). Disconnected ends the loop.
-        let offer = |tx: &std::sync::mpsc::SyncSender<ClientInput>, item: ClientInput| match tx
-            .try_send(item)
-        {
-            Ok(()) => true,
-            Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                n.input_dropped.fetch_add(1, Ordering::Relaxed);
-                true
-            }
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
-        };
-        while let Ok(d) = input_conn.read_datagram().await {
-            // One relaxed load per datagram; test before offering. Mic/rich/pen by plane tag;
-            // 0xC8 through `classify`.
-            let mask = grants_dp.load(Ordering::Relaxed);
-            if let Some((seq, pts, opus)) = punktfunk_core::quic::decode_mic_datagram(&d) {
-                if mask & GRANT_MIC == 0 {
-                    // Dropping here is the setup gate: forwarding is the only attach this plane has.
-                    denied.note(GrantClass::Mic);
-                    continue;
-                }
-                n.input_mic.fetch_add(1, Ordering::Relaxed);
-                // Bounded `try_send`: never block this loop. seq + pts ride for de-jitter.
-                let _ = mic_tx.try_send(crate::audio::MicFrame {
-                    source: mic_source,
-                    seq,
-                    pts_ns: pts,
-                    opus: opus.to_vec(),
-                });
-            } else if let Some(rich) = punktfunk_core::quic::RichInput::decode(&d) {
-                if mask & GRANT_GAMEPAD == 0 {
-                    denied.note(GrantClass::Gamepad);
-                    continue;
-                }
-                n.input_rich.fetch_add(1, Ordering::Relaxed);
-                if !offer(&rich_tx, ClientInput::Rich(rich)) {
-                    break;
-                }
-            } else if let Some(pen) = punktfunk_core::quic::PenBatch::decode(&d) {
-                // 0xCC kind 0x05 stylus (`RichInput::decode` returns None). Same input thread.
-                if mask & GRANT_POINTER == 0 {
-                    denied.note(GrantClass::Pointer);
-                    continue;
-                }
-                n.input_rich.fetch_add(1, Ordering::Relaxed);
-                if !offer(&rich_tx, ClientInput::Pen(pen)) {
-                    break;
-                }
-            } else if let Some(mut ev) = InputEvent::decode(&d) {
-                let class = classify(ev.kind);
-                if mask & class.bit() == 0 {
-                    denied.note(class);
-                    continue;
-                }
-                n.input_events.fetch_add(1, Ordering::Relaxed);
-                // KEY_FLAG_SEMANTIC_VK is in-process (GameStream ingest). Strip it from the wire.
-                if matches!(
-                    ev.kind,
-                    punktfunk_core::input::InputKind::KeyDown
-                        | punktfunk_core::input::InputKind::KeyUp
-                ) {
-                    ev.flags &= !crate::inject::KEY_FLAG_SEMANTIC_VK;
-                }
-                if !offer(&input_tx, ClientInput::Event(ev)) {
-                    break;
-                }
-            }
-        }
-        tracing::info!(
-            input = n.input_events.load(Ordering::Relaxed),
-            mic = n.input_mic.load(Ordering::Relaxed),
-            rich = n.input_rich.load(Ordering::Relaxed),
-            dropped = n.input_dropped.load(Ordering::Relaxed),
-            denied = %denied.summary(),
-            "client datagram stream ended"
-        );
-    });
+    input::spawn_datagram_reader(
+        conn.clone(),
+        session_grants.clone(),
+        counters.clone(),
+        planes.mic_tx.clone(),
+        input_tx,
+    );
 
     // Handshake complete: CONNECTED. A client rejected earlier never emits either.
-    let event_client = crate::events::ClientRef {
-        name: client_name.clone().unwrap_or_default(),
-        fingerprint: session_fp_hex.clone(),
-        plane: conn.plane(),
-        preset: session_preset.clone(),
-    };
-    crate::events::emit(crate::events::EventKind::ClientConnected {
-        client: event_client.clone(),
-    });
-    {
-        let conn = conn.clone();
-        tokio::spawn(async move {
-            let reason = conn.closed().await;
-            let why = if reason.closed_with(QUIT_CODE) {
-                crate::events::DisconnectReason::Quit
-            } else if matches!(reason, link::LinkClosed::TimedOut) {
-                crate::events::DisconnectReason::Timeout
-            } else {
-                crate::events::DisconnectReason::Error
-            };
-            crate::events::emit(crate::events::EventKind::ClientDisconnected {
-                client: event_client,
-                reason: why,
-            });
-        });
-    }
+    emit_connected(
+        &conn,
+        crate::events::ClientRef {
+            name: client_name.clone().unwrap_or_default(),
+            fingerprint: session_fp_hex.clone(),
+            plane: conn.plane(),
+            preset: session_preset.clone(),
+        },
+    );
 
     // Mode-conflict admission: later clients see this identity + mode + stop (and may `steal`).
     // The audio thread publishes the sink it captures here, for a joiner to tap.
@@ -2121,12 +1746,7 @@ pub(crate) async fn run_admitted(
     let _live_guard = {
         let id = conn.peer_fingerprint();
         let label = id
-            .map(|fp| {
-                fp.iter()
-                    .take(4)
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>()
-            })
+            .map(|fp| hex::encode(&fp[..4]))
             .unwrap_or_else(|| "client".to_string());
         crate::vdisplay::admission::register(
             id,
@@ -2140,10 +1760,7 @@ pub(crate) async fn run_admitted(
             crate::vdisplay::admission::LiveDisplay {
                 compositor,
                 route: gamescope_route.clone(),
-                #[cfg(target_os = "linux")]
-                isolation: isolation.clone(),
-                #[cfg(not(target_os = "linux"))]
-                isolation: None,
+                isolation: planes.isolation.clone(),
                 audio_sink: audio_sink.clone(),
             },
         )
@@ -2177,10 +1794,7 @@ pub(crate) async fn run_admitted(
         );
         // Isolated session captures its own named sink; `None` is the shared path. A joiner
         // taps the owner's sink either way: its isolated one, or the one the owner published.
-        #[cfg(target_os = "linux")]
-        let iso_sink = isolation.as_ref().and_then(|i| i.sink.clone());
-        #[cfg(not(target_os = "linux"))]
-        let iso_sink: Option<String> = None;
+        let iso_sink = planes.isolation.clone().and_then(|i| i.sink);
         let tap_from = joined.as_ref().map(|(d, _)| d.audio_sink.clone());
         let published = audio_sink.clone();
         let muted = controls.muted.clone();
@@ -2209,52 +1823,13 @@ pub(crate) async fn run_admitted(
         None
     };
 
-    // HDR10 baseline at start. The virtual stream then sends the source's real mastering
-    // (GetDesc1) on capture start and keyframes. This covers synthetic + the pre-capture gap.
     if welcome.color.is_hdr() {
-        // Client display volume (Hello::display_hdr) — EDID advertises it. Generic HDR10 for old clients.
-        let meta = crate::encode::hdr_meta_to_wire(hello.display_hdr.map_or_else(
-            pf_frame::hdr::generic_hdr10,
-            crate::encode::hdr_meta_from_wire,
-        ));
-        let _ = conn.send_datagram(punktfunk_core::quic::encode_hdr_meta_datagram(&meta));
-        tracing::info!(
-            client_volume = hello.display_hdr.is_some(),
-            "sent HDR10 static metadata (0xCE baseline)"
-        );
+        send_hdr_baseline(&conn, hello.display_hdr);
     }
-
-    // Synthetic-only test hook: rumble (0xCA) + HID-output (0xCD) for loopback, no real pad.
     if opts.source == Punktfunk1Source::Synthetic
         && std::env::var("PUNKTFUNK_TEST_FEEDBACK").as_deref() == Ok("1")
     {
-        use punktfunk_core::quic::HidOutput;
-        // 400 ms TTL + both trigger motors. Trigger levels differ from each other and the
-        // handles so a wrong-offset decoder cannot hide behind a plausible zero.
-        let d = punktfunk_core::quic::encode_rumble_datagram_v3(
-            0, 0x4000, 0x8000, 0, 400, 0x2000, 0x6000,
-        );
-        let _ = conn.send_datagram(d.to_vec());
-        for h in [
-            HidOutput::Led {
-                pad: 0,
-                r: 10,
-                g: 20,
-                b: 30,
-            },
-            HidOutput::PlayerLeds {
-                pad: 0,
-                bits: 0b00100,
-            },
-            HidOutput::Trigger {
-                pad: 0,
-                which: 1,
-                effect: vec![0x21, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-            },
-        ] {
-            let _ = conn.send_datagram(h.encode());
-        }
-        tracing::info!("PUNKTFUNK_TEST_FEEDBACK: scripted rumble + hidout burst sent");
+        send_test_feedback(&conn);
     }
 
     // Native thread: no async on the hot path.
@@ -2277,40 +1852,7 @@ pub(crate) async fn run_admitted(
     // Linux `PUNKTFUNK_PIN_CLOCKS`: refcounted vendor clock floor while any session streams.
     #[cfg(target_os = "linux")]
     let _clock_pin = crate::gpuclocks::session_pin();
-    // One library lookup: command, title, process identity. Client picks an existing id, never
-    // a command. Blocking: plugin entries ask over loopback from this async context.
-    let launch_target = match hello.launch.as_deref() {
-        None => None,
-        Some(id) => {
-            let owned = id.to_string();
-            match tokio::task::spawn_blocking(move || crate::library::resolve_launch(&owned))
-                .await
-                .context("resolve the session's library launch")?
-            {
-                Some(t) => {
-                    tracing::info!(
-                        launch_id = id,
-                        title = %t.game.title,
-                        command = t.command.as_deref().unwrap_or("-"),
-                        "resolved library launch for this session"
-                    );
-                    Some(t)
-                }
-                None => {
-                    tracing::warn!(
-                        launch_id = id,
-                        "client requested a launch id not in this host's library — ignoring"
-                    );
-                    let _ = launch_outcome_tx.send(punktfunk_core::quic::LaunchOutcome::new(
-                        punktfunk_core::quic::LaunchOutcomeKind::Refused,
-                        "Couldn't start that title — this host doesn't have it in its library \
-                         any more.",
-                    ));
-                    None
-                }
-            }
-        }
-    };
+    let launch_target = resolve_launch(hello.launch.as_deref(), &launch_outcome_tx).await?;
     #[cfg(target_os = "windows")]
     let launch_for_dp = launch_target.as_ref().and(hello.launch.clone());
     #[cfg(not(target_os = "windows"))]
@@ -2318,60 +1860,24 @@ pub(crate) async fn run_admitted(
     // Stats label: device-fingerprint prefix, else peer IP (anonymous, `--open`).
     let client_label = conn
         .peer_fingerprint()
-        .map(|fp| fingerprint_hex(&fp)[..12].to_string())
+        .map(|fp| hex::encode(fp)[..12].to_string())
         .unwrap_or_else(|| conn.remote_address().ip().to_string());
-    // Reconnect inside the game's window: cancel pending termination. Data plane re-adopts via
-    // `launchreg` (carries the original launch instant). Matched on (this client, this title).
-    let fp = conn.peer_fingerprint().map(hex::encode);
-    if let Some(target) = launch_target.as_ref() {
-        // `readopt` already logged leftover processes.
-        let _reprieved = crate::gamelease::readopt(fp.as_deref(), target.game.id.as_deref());
-    }
-    // Stamp and claim before prep: a nested gamescope starts the game with its display, so the
-    // hold below must know already whether this session spawns. A re-dial adopts the original.
-    let fresh_stamp = crate::gamelease::launch_clock();
-    let launch_claim = launch_target.as_ref().map(|t| {
-        let claim =
-            crate::launchreg::claim(fp.as_deref(), t.game.id.as_deref(), t.launcher, fresh_stamp);
-        claim.describe(&t.game, conn.plane());
-        claim
-    });
-    // Custom-title prep before the display opens. Drop undoes in reverse. `block_in_place`:
+    let launch_owner = crate::session_launch::LaunchOwner {
+        client: client_label.clone(),
+        fingerprint: conn.peer_fingerprint().map(hex::encode),
+        plane: conn.plane(),
+        preset: session_preset.clone(),
+    };
+    let (prep_cmds, prep_env) = launch_prep(&hello, &welcome, session_preset.as_ref());
+    // Reprieve, claim, prep and the launch hold, before the display opens. `block_in_place`:
     // operator code is blocking and this is a multi-thread runtime.
-    let _prep = hello.launch.as_deref().and_then(|id| {
-        let cmds = crate::library::prep_for(id);
-        // `PF_APP_ID` + `PF_STREAM_*` so a prep step can set a per-mode FPS cap; `PF_PRESET_*`
-        // so it can tell a docked session from a handheld one.
-        let mut env = vec![("PF_APP_ID".to_string(), id.to_string())];
-        if let Some(p) = &session_preset {
-            env.push(("PF_PRESET_ID".to_string(), p.id.clone()));
-            env.push(("PF_PRESET_NAME".to_string(), p.name.clone()));
-        }
-        env.extend(crate::hooks::prep_mode_env(
-            hello.mode.width,
-            hello.mode.height,
-            hello.mode.refresh_hz,
-            welcome.color.is_hdr(),
-        ));
-        (!cmds.is_empty())
-            .then(|| tokio::task::block_in_place(|| crate::hooks::run_prep(&cmds, &env)))
+    let crate::session_launch::Prepared {
+        claim: launch_claim,
+        stamp: launch_stamp,
+        prep: _prep,
+    } = tokio::task::block_in_place(|| {
+        crate::session_launch::prepare(launch_target.as_ref(), &launch_owner, &prep_cmds, &prep_env)
     });
-    // A spawn waits for whoever holds `game.launching`. An adopted game is already running.
-    if let Some(t) = launch_target
-        .as_ref()
-        .filter(|_| launch_claim.as_ref().is_some_and(|c| c.must_spawn()))
-    {
-        let game = crate::events::GameRefPayload {
-            app: t.game.id.clone(),
-            title: t.game.title.clone(),
-            store: t.game.store.clone(),
-            client: client_label.clone(),
-            fingerprint: fp.clone(),
-            plane: conn.plane(),
-            preset: session_preset.clone(),
-        };
-        tokio::task::block_in_place(|| crate::holds::launching(game));
-    }
     // Welcome/acks/HUD speak wire budget. Encoder opens get the derived video rate (`EncDerive`).
     // PyroWave: budget == encoder rate (bpp pin).
     let bitrate_kbps = welcome.bitrate_kbps;
@@ -2393,9 +1899,6 @@ pub(crate) async fn run_admitted(
     let counters_stream = counters.clone();
     // Client HDR volume for EDID + 0xCE. `None` = older client / no HDR → built-in defaults.
     let client_hdr = hello.display_hdr.map(crate::encode::hdr_meta_from_wire);
-    let fec_target_dp = fec_target.clone();
-    let link_kbps_dp = link_kbps.clone();
-    let fec_requested_dp = fec_requested.clone();
     let conn_stream = conn.clone();
     // 0xCF host-timing only if the client advertised the cap; older clients get no extra datagrams.
     let timing_conn =
@@ -2407,6 +1910,7 @@ pub(crate) async fn run_admitted(
     // Absent ⇒ single-slice. Some TV-SoC decoders wedge on multi-slice AUs.
     let multi_slice = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE != 0;
     let stats_dp = stats;
+    let shared_dp = shared;
     // The title's `audio.sessions`, over every session on this display. Lifted with the session.
     let _audio_policy = hello
         .launch
@@ -2418,13 +1922,13 @@ pub(crate) async fn run_admitted(
     let resize_ms_dp = resize_ms.clone();
     // Stream thread re-points input across compositor switches and hands identity to backends.
     #[cfg(target_os = "linux")]
-    let isolation_dp = isolation.clone();
+    let isolation_dp = planes.isolation.clone();
     #[cfg(target_os = "linux")]
     let input_route_dp = input_route.clone();
     #[cfg(target_os = "linux")]
     let inj_shared_tx_dp = inj_tx.clone();
     #[cfg(target_os = "linux")]
-    let inj_session_tx_dp = inj_session_tx.clone();
+    let inj_session_tx_dp = planes.inj_session_tx.clone();
     // Control-plane local IP for the source-address check (send loop is a blocking thread).
     let control_local_ip = conn.local_ip();
     // Client address: what the registry groups sessions of one NAT or tunnel by.
@@ -2432,216 +1936,98 @@ pub(crate) async fn run_admitted(
     let plane = conn.plane();
     let result: Result<()> = async {
         let stream_thread = tokio::task::spawn_blocking(move || -> Result<()> {
-            let (transport, wire_sock): (Box<dyn punktfunk_core::transport::Transport>, _) = match (data_plane, data_sock) {
-                // A browser's video goes out on the connection it arrived on. Nothing to bind,
-                // nothing to punch, and the source-address check below has no second socket to
-                // compare — the datagrams leave from wherever the QUIC path already is.
-                (DataPlane::Web(plane), _) => {
-                    bringup_dp.mark("punch_done");
-                    (Box::new(plane), None)
-                }
-                (DataPlane::Udp, None) => anyhow::bail!("the native plane negotiated no data socket"),
-                (DataPlane::Udp, Some(data_sock)) => {
-            // Wait for the client's punch and stream to its observed source — the port a NAT or
-            // a port proxy actually answers from. A fixed --data-port is no exception (it fixes
-            // only the host's side), so the client-reported port is the fallback for a punch
-            // that never arrives, never the first choice. IP is the host-observed QUIC remote.
-            let bound = UdpTransport::from_socket_punch(
+            let (transport, wire_sock) = bind_data_plane(
+                data_plane,
                 data_sock,
-                &client_udp.to_string(),
-                client_udp.ip(),
-                std::time::Duration::from_millis(2500),
-            );
-            let (transport, punched) = match bound {
-                Ok(v) => v,
-                Err(e) => {
-                    // Surface here: a teardown stall would otherwise swallow a bind error.
-                    tracing::error!(error = %e, %client_udp, udp_port, "data-plane socket setup failed");
-                    return Err(anyhow::Error::new(e)).context("bind data plane");
-                }
-            };
-            bringup_dp.mark("punch_done");
-            // Post-`connect` `local_addr` is the source stamped on every video datagram.
-            let local = transport.local_addr().ok();
-            tracing::info!(
-                %client_udp,
+                client_udp,
                 udp_port,
-                punched,
-                local = ?local,
-                "data plane bound (punched=true → the client's observed source; false → no \
-                 punch seen, the reported address)"
-            );
-            // Wrong egress: the client's connected socket drops every datagram before userspace.
-            if let (Some(l), Some(c)) = (local.map(|a| a.ip()), control_local_ip) {
-                let c = match c {
-                    std::net::IpAddr::V6(v6) => {
-                        v6.to_ipv4_mapped().map_or(c, std::net::IpAddr::V4)
-                    }
-                    v4 => v4,
-                };
-                if !l.is_unspecified() && l != c {
-                    tracing::warn!(
-                        video_source_ip = %l,
-                        control_local_ip = %c,
-                        "the video data plane egresses from a DIFFERENT host address than the one \
-                         this client connected to — its data socket is connected to the address it \
-                         dialed, so its kernel drops every video datagram before userspace: black \
-                         screen, zero reported loss, healthy control plane. Usual cause is two \
-                         live paths to the client (Ethernet and Wi-Fi both up on the same LAN, or \
-                         a VPN/overlay adapter claiming the route)"
-                    );
-                }
-            }
-            // No punch: inbound UDP to this port looks blocked, fixed or not, and video now goes
-            // to an address the client only claimed.
-            if !punched {
-                tracing::warn!(
-                    %client_udp,
-                    udp_port,
-                    "no hole-punch reached this host's data port — inbound UDP to it looks \
-                     BLOCKED, so video is being sent to the address the client reported without \
-                     any confirmed return path. If the picture stays black while the session is \
-                     otherwise healthy, this line is the reason: allow inbound UDP for the host \
-                     executable (any port), or pin --data-port and open that one"
-                );
-            }
-            let wire_sock = transport.try_clone_socket().ok();
-            (Box::new(transport), wire_sock)
-                }
-            };
-            let mut session = Session::new(cfg, transport)
+                control_local_ip,
+                &bringup_dp,
+            )?;
+            let session = Session::new(cfg, transport)
                 .map_err(|e| anyhow!("host session: {e:?}"))?;
+            let mut common = StreamCommon {
+                session,
+                mode,
+                seconds,
+                stop: stop_stream,
+                quit: quit_stream,
+                end_reason: end_reason_stream,
+                counters: counters_stream,
+                ends: stream_ends,
+                shared: shared_dp,
+                bitrate_kbps,
+                audio_reserved_kbps,
+                shard_payload: welcome.shard_payload,
+                timing_conn,
+                probe_seq,
+                stats: stats_dp,
+                client_label,
+                bringup: bringup_dp,
+                wire_sock,
+                codec,
+                controls,
+                client_name,
+                hdr,
+                bit_depth,
+                chroma,
+            };
             match source {
                 Punktfunk1Source::Software => software_stream(
-                    &mut session,
+                    &mut common.session,
                     codec,
                     mode,
                     bitrate_kbps,
-                    &stop_stream,
-                    &probe_rx,
-                    &probe_result_tx,
-                    &fec_target_dp,
+                    &common.stop,
+                    &common.ends.probe_rx,
+                    &common.ends.probe_result_tx,
+                    &common.shared.fec_target,
                     probe_seq,
                 ),
                 Punktfunk1Source::Synthetic => synthetic_stream(
-                    &mut session,
+                    &mut common.session,
                     frames,
-                    &stop_stream,
-                    &probe_rx,
-                    &probe_result_tx,
-                    &fec_target_dp,
-                    timing_conn.as_ref(),
+                    &common.stop,
+                    &common.ends.probe_rx,
+                    &common.ends.probe_result_tx,
+                    &common.shared.fec_target,
+                    common.timing_conn.as_ref(),
                     probe_seq,
                 ),
-                Punktfunk1Source::SyntheticAbr(shape) => {
-                    synthetic_abr_stream(SynthAbrContext {
-                    session,
-                    mode,
-                    seconds,
+                Punktfunk1Source::SyntheticAbr(shape) => synthetic_abr_stream(SynthAbrContext {
+                    common,
                     content: shape.content,
                     recovery: shape.recovery,
                     answer: shape.answer,
                     idr_pct: shape.idr_pct,
                     bringup_delay: shape.bringup,
-                    ramp_open,
                     fit_pin: hello.bitrate_kbps == 0 && codec == crate::encode::Codec::PyroWave,
-                    stop: stop_stream,
-                    counters: counters_stream,
-                    keyframe: keyframe_rx,
-                    rfi: rfi_rx,
-                    bitrate_rx,
-                    shard_rx: shard_apply_rx,
-                    bitrate_kbps,
-                    audio_reserved_kbps,
-                    shard_payload: welcome.shard_payload,
-                    live_bitrate,
-                    fec_target: fec_target_dp,
-                    probe_rx,
-                    probe_result_tx,
-                    timing_conn,
-                    phase: phase_ctl,
-                    probe_seq,
-                    stats: stats_dp,
-                    client_label,
                     plane,
-                    bringup: bringup_dp,
-                    wire_sock,
-                    codec,
-                    quit: quit_stream,
-                    end_reason: end_reason_stream,
-                    controls,
-                    client_name,
-                    hdr,
-                    bit_depth,
-                    chroma,
                     peer: peer_ip,
-                    })
-                }
+                }),
                 Punktfunk1Source::Virtual => {
                     let compositor = compositor
                         .expect("the Virtual source resolves a compositor during the handshake");
                     let ctx = SessionContext {
-                        session,
-                        mode,
-                        seconds,
-                        stop: stop_stream,
-                        quit: quit_stream,
-                        end_reason: end_reason_stream,
-                        counters: counters_stream,
-                        reconfig: reconfig_rx,
-                        keyframe: keyframe_rx,
-                        rfi: rfi_rx,
-                        bitrate_rx,
-                        shard_rx: shard_apply_rx,
+                        common,
                         compositor,
                         gamescope_route,
-                        bitrate_kbps,
-                        audio_reserved_kbps,
-                        shard_payload: welcome.shard_payload,
-                        live_bitrate,
-                        encoder_ceiling,
-                        cadence_degraded,
-                        cadence_behind_score,
-                        client_packets_received,
                         bitrate_auto,
-                        bit_depth,
-                        hdr,
-                        chroma,
-                        codec,
-                        probe_rx,
-                        probe_result_tx,
-                        ramp_open,
-                        reconfig_result_tx,
-                        retarget_tx,
-                        gap_tx,
-                        fec_target: fec_target_dp,
-                        fec_requested: fec_requested_dp,
-                        link_kbps: link_kbps_dp,
-                        phase: phase_ctl,
-                        conn: conn_stream,
-                        timing_conn,
                         cursor_forward,
-                        cursor_shape_tx,
-                        cursor_client_draws: cursor_client_draws_dp,
-                        probe_seq,
                         streamed_au,
                         multi_slice,
-                        stats: stats_dp,
-                        client_label,
-                        client_name,
+                        conn: conn_stream,
                         launch: launch_for_dp,
                         launch_target,
                         launch_claim,
-                        fresh_stamp,
+                        launch_stamp,
+                        launch_owner,
                         launch_outcome: launch_outcome_dp,
                         client_hdr,
                         join_live,
-                        controls,
                         reframe_to,
                         frame_map,
-                        bringup: bringup_dp,
                         resize_ms: resize_ms_dp,
-                        wire_sock,
                         #[cfg(target_os = "linux")]
                         input_tx: input_tx_stream,
                         #[cfg(target_os = "linux")]
@@ -2694,13 +2080,467 @@ pub(crate) async fn run_admitted(
     }
     .await;
 
-    // Every path: stop audio, close, join side threads. Close ends the datagram task → input.
+    teardown(&stop, &conn, &result, audio_handle, input_handle).await;
+    // Managed gamescope on an autologin box: put the TV's gaming session back once no session
+    // streams gamescope. A `join` session still shows the owner's game after the owner leaves.
+    drop(gamescope_hold);
+    if LIVE_GAMESCOPE.load(Ordering::SeqCst) == 0 {
+        crate::vdisplay::restore_managed_session();
+    }
+    result.map(|()| Served::Session)
+}
+
+/// What admission resolved for this device: its effective grant mask, deadline and the record's
+/// watch. Anonymous (`--open`) and an identity with no record keep full control — nothing on the
+/// trust record to enforce.
+struct Admission {
+    grants: u32,
+    deadline_unix: Option<i64>,
+    watch: Option<tokio::sync::watch::Receiver<crate::native_pairing::AccessState>>,
+    /// When admission ran; Welcome's remaining time counts from here.
+    at_unix: i64,
+    /// Counts this session while it runs. Held to the end of the session, so an error return or
+    /// a cancelled task releases it too — a record granted "this session" is dropped once the
+    /// guard falls and nothing reconnects inside the grace.
+    session: Option<crate::native_pairing::SessionCountGuard>,
+}
+
+/// Grants once at admission, with its two typed refusals: access that expired since the pairing
+/// gate, and a library launch without `GRANT_LAUNCH` — refused before the handshake, not a silent
+/// bare desktop.
+async fn admit(
+    host: &SessionHost,
+    fp_hex: Option<&str>,
+    conn: &link::SessionLink,
+    first: &[u8],
+) -> Result<Admission> {
+    let at_unix = crate::clock::unix_secs();
+    let (grants, deadline_unix, watch) = match fp_hex {
+        Some(fp_hex) => match host.np.effective(fp_hex, at_unix) {
+            Some(mask) => {
+                // Subscribe before reading the deadline so a racing edit lands in this borrow
+                // or as the first change — never in a gap.
+                let rx = host.np.subscribe(fp_hex);
+                let deadline = rx.borrow().deadline_unix;
+                (mask, deadline, Some(rx))
+            }
+            // Expired between the pairing gate and here: typed expiry, not a setup error.
+            None if host.opts.require_pairing => {
+                close_rejected(conn, punktfunk_core::reject::RejectReason::AccessExpired).await;
+                anyhow::bail!("access expired between admission and session setup");
+            }
+            // `--open`: unpaired / expired identities keep full control.
+            None => (GRANT_ALL, None, None),
+        },
+        None => (GRANT_ALL, None, None),
+    };
+    let session = fp_hex.map(|fp_hex| host.np.session_started(fp_hex));
+    if grants & GRANT_LAUNCH == 0 && Hello::decode(first).is_ok_and(|h| h.launch.is_some()) {
+        close_rejected(
+            conn,
+            punktfunk_core::reject::RejectReason::LaunchNotPermitted,
+        )
+        .await;
+        anyhow::bail!("client requested a library launch without the LAUNCH grant");
+    }
+    Ok(Admission {
+        grants,
+        deadline_unix,
+        watch,
+        at_unix,
+        session,
+    })
+}
+
+/// Stop the session when its connection closes, and latch why for the summary. First writer
+/// wins, so the host's own close (game exit, clean finish) beats the `Lost` this would read it
+/// back as.
+fn spawn_end_watch(
+    conn: link::SessionLink,
+    stop: Arc<AtomicBool>,
+    quit: Arc<AtomicBool>,
+    end_reason: Arc<AtomicU8>,
+) {
+    tokio::spawn(async move {
+        let reason = conn.closed().await;
+        if reason.closed_with(QUIT_CODE) {
+            quit.store(true, Ordering::SeqCst);
+            crate::events::SessionEndReason::Local.latch(&end_reason);
+        } else {
+            // The client's own rule: anything that is not our close code is the link
+            // going away. A close this host made reads as `Other` here too, which is
+            // why the paths that make one latch before they call it.
+            crate::events::SessionEndReason::Lost.latch(&end_reason);
+        }
+        stop.store(true, Ordering::SeqCst);
+    });
+}
+
+/// The clipboard coordinator. Without CLIPBOARD it never starts (a watcher that doesn't exist
+/// can't leak): an inert handle (`available: false`) keeps the control task's arms uniform —
+/// NOT_PERMITTED, and the decline loop still answers stray fetches. Fetch transfers are quinn
+/// streams, so a browser takes the inert arm until the control plane is carrier-agnostic.
+async fn start_clipboard(
+    conn: &link::SessionLink,
+    grants: u32,
+    enabled: Arc<AtomicBool>,
+    desktop: bool,
+) -> pf_clipboard::ClipCoord {
+    let quic = (grants & GRANT_CLIPBOARD != 0)
+        .then(|| conn.as_quic().cloned())
+        .flatten();
+    if let Some(quic) = quic {
+        return pf_clipboard::start(quic, enabled, desktop).await;
+    }
+    let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_offer_tx, offer_rx) = tokio::sync::mpsc::unbounded_channel();
+    pf_clipboard::ClipCoord {
+        available: false,
+        cmd_tx,
+        offer_rx,
+    }
+}
+
+/// Trust-store name (a console rename wins), else the sanitized Hello name. `None` if nameless.
+/// Events, hook filters, the stream marker and the tray all show this one.
+fn client_name(np: &NativePairing, fp_hex: Option<&str>, hello: &Hello) -> Option<String> {
+    fp_hex
+        .and_then(|fp| np.list().into_iter().find(|c| c.fingerprint == fp))
+        .map(|c| c.name)
+        .or_else(|| {
+            let raw = hello.name.as_deref().unwrap_or("").trim();
+            (!raw.is_empty())
+                .then(|| crate::native_pairing::sanitize_device_name(raw, fp_hex.unwrap_or("")))
+        })
+}
+
+/// This session's input and mic planes. An isolated gamescope session
+/// (`compositor_route::session_is_isolated`) gets its own; everyone else shares the
+/// host-lifetime ones. Dropping it closes the pinned EIS connection and the isolated mic.
+struct SessionPlanes {
+    /// Linux only. Identity is the device-fingerprint prefix, so keep-alive hands a kept spawn
+    /// back to the same client.
+    isolation: Option<crate::vdisplay::SessionIsolation>,
+    /// Where this session's virtual pads are exposed, so its seat's Steam opens those and no
+    /// other seat's. `None` on every host without the filter, which is today's box-wide pads.
+    seat_dev: Option<std::path::PathBuf>,
+    /// Pointer and keyboard: the pinned injector, else the host-lifetime one. Swappable.
+    input_route: input::InputRoute,
+    #[cfg(target_os = "linux")]
+    inj_session_tx: Option<std::sync::mpsc::Sender<InputEvent>>,
+    /// The 0xCB uplink: this session's `punktfunk-mic-{id}` pump, else the shared one.
+    mic_tx: std::sync::mpsc::SyncSender<crate::audio::MicFrame>,
+    #[cfg(target_os = "linux")]
+    _mic: Option<crate::audio::MicPump>,
+    #[cfg(target_os = "linux")]
+    _injector: Option<crate::inject::InjectorService>,
+}
+
+impl SessionPlanes {
+    /// Minted after the handshake, before the input and audio threads.
+    fn mint(
+        joined: Option<&crate::vdisplay::admission::LiveDisplay>,
+        compositor: Option<crate::vdisplay::Compositor>,
+        route: Option<&crate::vdisplay::GamescopeRoute>,
+        fp_hex: Option<&str>,
+        inj_tx: &std::sync::mpsc::Sender<InputEvent>,
+        mic_tx: std::sync::mpsc::SyncSender<crate::audio::MicFrame>,
+    ) -> SessionPlanes {
+        #[cfg(target_os = "linux")]
+        {
+            let isolation = match joined {
+                // A joiner uses the owner's planes: its input relay and sink. A second mic source
+                // of the same name would split the owner's, so its mic stays on the shared one.
+                Some(d) => d
+                    .isolation
+                    .clone()
+                    .map(|i| crate::vdisplay::SessionIsolation {
+                        mic_source: None,
+                        ..i
+                    }),
+                None => compositor
+                    .filter(|c| crate::compositor_route::session_is_isolated(*c, route))
+                    .map(|_| {
+                        // `--open` has no fingerprint; a per-accept sequence isolates at the cost
+                        // of keep-alive.
+                        static ANON_SEQ: AtomicU64 = AtomicU64::new(0);
+                        let paired = fp_hex.map(seat_id);
+                        let id = paired.clone().unwrap_or_else(|| {
+                            format!("anon{}", ANON_SEQ.fetch_add(1, Ordering::Relaxed))
+                        });
+                        let iso = session_isolation(&id, paired.is_some());
+                        tracing::info!(%id, sink = iso.sink.as_deref().unwrap_or("-"),
+                            "isolated gamescope session — per-session input/audio/mic planes");
+                        iso
+                    }),
+            };
+            let seat_dev = isolation
+                .as_ref()
+                .and_then(crate::vdisplay::seat_device_dir);
+            let injector = isolation
+                .as_ref()
+                .map(|i| crate::inject::InjectorService::start_at(i.ei_relay.clone()));
+            let inj_session_tx = injector.as_ref().map(|s| s.sender());
+            let input_route =
+                input::InputRoute::new(inj_session_tx.clone().unwrap_or_else(|| inj_tx.clone()));
+            let mic = isolation
+                .as_ref()
+                .and_then(|i| i.mic_source.clone())
+                .map(|name| crate::audio::MicPump::start_named(Some(name)));
+            let mic_tx = mic.as_ref().map(|p| p.sender()).unwrap_or(mic_tx);
+            SessionPlanes {
+                isolation,
+                seat_dev,
+                input_route,
+                inj_session_tx,
+                mic_tx,
+                _mic: mic,
+                _injector: injector,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (joined, compositor, route, fp_hex);
+            SessionPlanes {
+                isolation: None,
+                seat_dev: None,
+                input_route: input::InputRoute::new(inj_tx.clone()),
+                mic_tx,
+            }
+        }
+    }
+}
+
+/// `ClientConnected` now, and `ClientDisconnected` with its reason once the connection closes.
+fn emit_connected(conn: &link::SessionLink, client: crate::events::ClientRef) {
+    crate::events::emit(crate::events::EventKind::ClientConnected {
+        client: client.clone(),
+    });
+    let conn = conn.clone();
+    tokio::spawn(async move {
+        let reason = conn.closed().await;
+        let why = if reason.closed_with(QUIT_CODE) {
+            crate::events::DisconnectReason::Quit
+        } else if matches!(reason, link::LinkClosed::TimedOut) {
+            crate::events::DisconnectReason::Timeout
+        } else {
+            crate::events::DisconnectReason::Error
+        };
+        crate::events::emit(crate::events::EventKind::ClientDisconnected {
+            client,
+            reason: why,
+        });
+    });
+}
+
+/// HDR10 baseline at start, from the client's display volume (`Hello::display_hdr`, which
+/// its EDID advertises), else generic HDR10. The virtual stream then sends the source's real
+/// mastering on capture start and keyframes; this covers synthetic and the pre-capture gap.
+fn send_hdr_baseline(conn: &link::SessionLink, display_hdr: Option<punktfunk_core::quic::HdrMeta>) {
+    let meta = crate::encode::hdr_meta_to_wire(display_hdr.map_or_else(
+        pf_frame::hdr::generic_hdr10,
+        crate::encode::hdr_meta_from_wire,
+    ));
+    let _ = conn.send_datagram(punktfunk_core::quic::encode_hdr_meta_datagram(&meta));
+    tracing::info!(
+        client_volume = display_hdr.is_some(),
+        "sent HDR10 static metadata (0xCE baseline)"
+    );
+}
+
+/// `PUNKTFUNK_TEST_FEEDBACK=1` on the synthetic source: rumble (0xCA) and HID output (0xCD)
+/// for a loopback client, with no real pad.
+fn send_test_feedback(conn: &link::SessionLink) {
+    use punktfunk_core::quic::HidOutput;
+    // 400 ms TTL + both trigger motors. Trigger levels differ from each other and the
+    // handles so a wrong-offset decoder cannot hide behind a plausible zero.
+    let d =
+        punktfunk_core::quic::encode_rumble_datagram_v3(0, 0x4000, 0x8000, 0, 400, 0x2000, 0x6000);
+    let _ = conn.send_datagram(d.to_vec());
+    for h in [
+        HidOutput::Led {
+            pad: 0,
+            r: 10,
+            g: 20,
+            b: 30,
+        },
+        HidOutput::PlayerLeds {
+            pad: 0,
+            bits: 0b00100,
+        },
+        HidOutput::Trigger {
+            pad: 0,
+            which: 1,
+            effect: vec![0x21, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        },
+    ] {
+        let _ = conn.send_datagram(h.encode());
+    }
+    tracing::info!("PUNKTFUNK_TEST_FEEDBACK: scripted rumble + hidout burst sent");
+}
+
+/// One library lookup: command, title, process identity. The client picks an existing id,
+/// never a command. An id this host no longer has is refused onto `outcome`. Blocking: plugin
+/// entries ask over loopback from this async context.
+async fn resolve_launch(
+    launch: Option<&str>,
+    outcome: &crate::gamelease::OutcomeTx,
+) -> Result<Option<crate::library::LaunchTarget>> {
+    let Some(id) = launch else {
+        return Ok(None);
+    };
+    let owned = id.to_string();
+    let found = tokio::task::spawn_blocking(move || crate::library::resolve_launch(&owned))
+        .await
+        .context("resolve the session's library launch")?;
+    match &found {
+        Some(t) => tracing::info!(
+            launch_id = id,
+            title = %t.game.title,
+            command = t.command.as_deref().unwrap_or("-"),
+            "resolved library launch for this session"
+        ),
+        None => {
+            tracing::warn!(
+                launch_id = id,
+                "client requested a launch id not in this host's library — ignoring"
+            );
+            let _ = outcome.send(punktfunk_core::quic::LaunchOutcome::new(
+                punktfunk_core::quic::LaunchOutcomeKind::Refused,
+                "Couldn't start that title — this host doesn't have it in its library \
+                 any more.",
+            ));
+        }
+    }
+    Ok(found)
+}
+
+/// The launched title's prep steps and their environment: `PF_APP_ID` and `PF_STREAM_*`, so a
+/// step can set a per-mode FPS cap, and `PF_PRESET_*`, so it can tell a docked session from a
+/// handheld one. Empty without a launch.
+fn launch_prep(
+    hello: &Hello,
+    welcome: &Welcome,
+    preset: Option<&crate::events::PresetRef>,
+) -> (Vec<crate::hooks::PrepCmd>, Vec<(String, String)>) {
+    let Some(id) = hello.launch.as_deref() else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut env = vec![("PF_APP_ID".to_string(), id.to_string())];
+    if let Some(p) = preset {
+        env.push(("PF_PRESET_ID".to_string(), p.id.clone()));
+        env.push(("PF_PRESET_NAME".to_string(), p.name.clone()));
+    }
+    env.extend(crate::hooks::prep_mode_env(
+        hello.mode.width,
+        hello.mode.height,
+        hello.mode.refresh_hz,
+        welcome.color.is_hdr(),
+    ));
+    (crate::library::prep_for(id), env)
+}
+
+/// The video transport, and the data socket's clone for the `wire egress` probe. A browser's
+/// video goes out on the connection it arrived on: nothing to bind or punch, and no second socket
+/// to check the source address of. UDP waits for the client's punch and streams to its observed
+/// source — the port a NAT or a port proxy actually answers from. A fixed `--data-port` is no
+/// exception (it fixes only the host's side), so the client-reported port is the fallback for a
+/// punch that never arrives, never the first choice. The IP is the host-observed QUIC remote.
+fn bind_data_plane(
+    data_plane: DataPlane,
+    data_sock: Option<std::net::UdpSocket>,
+    client_udp: std::net::SocketAddr,
+    udp_port: u16,
+    control_local_ip: Option<std::net::IpAddr>,
+    bringup: &crate::bringup::Trace,
+) -> Result<(
+    Box<dyn punktfunk_core::transport::Transport>,
+    Option<std::net::UdpSocket>,
+)> {
+    let data_sock = match (data_plane, data_sock) {
+        (DataPlane::Web(plane), _) => {
+            bringup.mark("punch_done");
+            return Ok((Box::new(plane), None));
+        }
+        (DataPlane::Udp, None) => anyhow::bail!("the native plane negotiated no data socket"),
+        (DataPlane::Udp, Some(sock)) => sock,
+    };
+    let bound = UdpTransport::from_socket_punch(
+        data_sock,
+        &client_udp.to_string(),
+        client_udp.ip(),
+        std::time::Duration::from_millis(2500),
+    );
+    let (transport, punched) = match bound {
+        Ok(v) => v,
+        Err(e) => {
+            // Surface here: a teardown stall would otherwise swallow a bind error.
+            tracing::error!(error = %e, %client_udp, udp_port, "data-plane socket setup failed");
+            return Err(anyhow::Error::new(e)).context("bind data plane");
+        }
+    };
+    bringup.mark("punch_done");
+    // Post-`connect` `local_addr` is the source stamped on every video datagram.
+    let local = transport.local_addr().ok();
+    tracing::info!(
+        %client_udp,
+        udp_port,
+        punched,
+        local = ?local,
+        "data plane bound (punched=true → the client's observed source; false → no \
+         punch seen, the reported address)"
+    );
+    // Wrong egress: the client's connected socket drops every datagram before userspace.
+    if let (Some(l), Some(c)) = (local.map(|a| a.ip()), control_local_ip) {
+        let c = match c {
+            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(c, std::net::IpAddr::V4),
+            v4 => v4,
+        };
+        if !l.is_unspecified() && l != c {
+            tracing::warn!(
+                video_source_ip = %l,
+                control_local_ip = %c,
+                "the video data plane egresses from a DIFFERENT host address than the one \
+                 this client connected to — its data socket is connected to the address it \
+                 dialed, so its kernel drops every video datagram before userspace: black \
+                 screen, zero reported loss, healthy control plane. Usual cause is two \
+                 live paths to the client (Ethernet and Wi-Fi both up on the same LAN, or \
+                 a VPN/overlay adapter claiming the route)"
+            );
+        }
+    }
+    // No punch: inbound UDP to this port looks blocked, fixed or not, and video now goes
+    // to an address the client only claimed.
+    if !punched {
+        tracing::warn!(
+            %client_udp,
+            udp_port,
+            "no hole-punch reached this host's data port — inbound UDP to it looks \
+             BLOCKED, so video is being sent to the address the client reported without \
+             any confirmed return path. If the picture stays black while the session is \
+             otherwise healthy, this line is the reason: allow inbound UDP for the host \
+             executable (any port), or pin --data-port and open that one"
+        );
+    }
+    let wire_sock = transport.try_clone_socket().ok();
+    Ok((Box::new(transport), wire_sock))
+}
+
+/// Every exit: stop audio, close the connection, join the side threads. The close ends the
+/// datagram task and with it the input thread. The join is bounded: a stuck side thread must not
+/// hold the permit or the admission entry.
+async fn teardown(
+    stop: &AtomicBool,
+    conn: &link::SessionLink,
+    result: &Result<()>,
+    audio_handle: Option<std::thread::JoinHandle<()>>,
+    input_handle: std::thread::JoinHandle<()>,
+) {
     stop.store(true, Ordering::SeqCst);
     conn.close(
         if result.is_ok() { 0u32 } else { 1u32 },
         if result.is_ok() { b"done" } else { b"error" },
     );
-    // Bounded join: a stuck side thread must not hold the permit/admission entry.
     let side_threads = tokio::task::spawn_blocking(move || {
         if let Some(h) = audio_handle {
             let _ = h.join();
@@ -2721,13 +2561,6 @@ pub(crate) async fn run_admitted(
              already-owned until it returns"
         );
     }
-    // Managed gamescope on an autologin box: put the TV's gaming session back once no session
-    // streams gamescope. A `join` session still shows the owner's game after the owner leaves.
-    drop(gamescope_hold);
-    if LIVE_GAMESCOPE.load(Ordering::SeqCst) == 0 {
-        crate::vdisplay::restore_managed_session();
-    }
-    result.map(|()| Served::Session)
 }
 
 /// Live native sessions on a gamescope display, for the managed TV restore above.
@@ -3822,7 +3655,7 @@ mod tests {
         });
         std::thread::sleep(std::time::Duration::from_millis(500));
         let (cert, key) = endpoint::generate_identity().unwrap();
-        let expected_fp = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
+        let expected_fp = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
         let mode = punktfunk_core::Mode {
             width: 1280,
             height: 720,
@@ -4068,7 +3901,7 @@ mod tests {
 
     /// Controller-only passes pads only; View-only passes nothing. Classify is pinned in core.
     #[test]
-    fn input_admission_matrix_and_quiet_drop_accounting() {
+    fn input_admission_matrix() {
         use punktfunk_core::quic::{GRANT_PRESET_CONTROLLER_ONLY, GRANT_PRESET_VIEW_ONLY};
         let admitted = |mask: u32, kind: InputKind| mask & classify(kind).bit() != 0;
 
@@ -4095,14 +3928,6 @@ mod tests {
             assert!(!admitted(GRANT_PRESET_VIEW_ONLY, kind), "{kind:?}");
         }
         assert!(admitted(GRANT_ALL, InputKind::KeyDown));
-
-        // Per-class counters; `"none"` when clean.
-        let drops = GrantDrops::new();
-        assert_eq!(drops.summary(), "none");
-        drops.note(GrantClass::Keyboard);
-        drops.note(GrantClass::Keyboard);
-        drops.note(GrantClass::Mic);
-        assert_eq!(drops.summary(), "Keyboard=2 Mic=1");
     }
 
     /// Pairing-required synthetic host sharing `np` so the test can edit the store live.
@@ -4233,13 +4058,13 @@ mod tests {
         let _ = std::fs::remove_file(&store);
         let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
         let (cert, key) = endpoint::generate_identity().unwrap();
-        let fp_hex = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
+        let fp_hex = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
         np.add_with_access(
             "Evening Guest",
             &fp_hex,
             Some(crate::native_pairing::Access {
                 grants: GRANT_ALL,
-                expires_unix: Some(wall_unix_now() + 2),
+                expires_unix: Some(crate::clock::unix_secs() + 2),
                 until_disconnect: false,
             }),
         )
@@ -4272,7 +4097,7 @@ mod tests {
         });
         // The row survives expiry — only authorization ends.
         assert!(np.is_paired(&fp_hex));
-        assert_eq!(np.effective(&fp_hex, wall_unix_now()), None);
+        assert_eq!(np.effective(&fp_hex, crate::clock::unix_secs()), None);
         let _ = std::fs::remove_file(&store);
         host.join().unwrap().unwrap();
     }
@@ -4288,7 +4113,7 @@ mod tests {
         let _ = std::fs::remove_file(&store);
         let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
         let (cert, key) = endpoint::generate_identity().unwrap();
-        let fp_hex = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
+        let fp_hex = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
         np.add("Edited Device", &fp_hex).unwrap();
         let host = spawn_access_host(19783, 1, np.clone());
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -4304,7 +4129,7 @@ mod tests {
             assert_eq!(welcome.expires_in_secs, 0, "permanent access advertises 0");
 
             // Controller-only, 62 s out (inside T−5 m, outside T−1 m): one warning, ~2 s later.
-            let now = wall_unix_now();
+            let now = crate::clock::unix_secs();
             np.set_access(
                 &fp_hex,
                 crate::native_pairing::Access {
@@ -4349,7 +4174,7 @@ mod tests {
                 &fp_hex,
                 crate::native_pairing::Access {
                     grants: punktfunk_core::quic::GRANT_PRESET_CONTROLLER_ONLY,
-                    expires_unix: Some(wall_unix_now() - 1),
+                    expires_unix: Some(crate::clock::unix_secs() - 1),
                     until_disconnect: false,
                 },
             )
@@ -4376,7 +4201,7 @@ mod tests {
         let _ = std::fs::remove_file(&store);
         let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
         let (cert, key) = endpoint::generate_identity().unwrap();
-        let fp_hex = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
+        let fp_hex = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
         np.add_with_access(
             "Guest Pad",
             &fp_hex,
@@ -4468,7 +4293,7 @@ mod tests {
         let _ = std::fs::remove_file(&store);
         let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
         let (cert, key) = endpoint::generate_identity().unwrap();
-        let fp_hex = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
+        let fp_hex = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
         np.add_with_access("Launcher", &fp_hex, None).unwrap();
         let host = spawn_access_host(19786, 1, np);
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -4527,20 +4352,20 @@ mod tests {
         let _ = std::fs::remove_file(&store);
         let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
         let (cert, key) = endpoint::generate_identity().unwrap();
-        let fp_hex = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
+        let fp_hex = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
         // Still listed, no longer authorized.
         np.add_with_access(
             "Yesterday's Guest",
             &fp_hex,
             Some(crate::native_pairing::Access {
                 grants: GRANT_ALL,
-                expires_unix: Some(wall_unix_now() - 3600),
+                expires_unix: Some(crate::clock::unix_secs() - 3600),
                 until_disconnect: false,
             }),
         )
         .unwrap();
         assert!(np.is_paired(&fp_hex), "expired but still listed");
-        assert_eq!(np.effective(&fp_hex, wall_unix_now()), None);
+        assert_eq!(np.effective(&fp_hex, crate::clock::unix_secs()), None);
 
         let host = spawn_access_host(19785, 1, np.clone());
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -4570,7 +4395,7 @@ mod tests {
                     None,
                     Some(crate::native_pairing::Access {
                         grants: punktfunk_core::quic::GRANT_PRESET_CONTROLLER_ONLY,
-                        expires_unix: Some(wall_unix_now() + 4 * 3600),
+                        expires_unix: Some(crate::clock::unix_secs() + 4 * 3600),
                         until_disconnect: false,
                     }),
                 )
@@ -4607,7 +4432,7 @@ mod tests {
         approver.join().unwrap();
         // Re-grant in force: controller-only.
         assert_eq!(
-            np.effective(&fp_hex, wall_unix_now()),
+            np.effective(&fp_hex, crate::clock::unix_secs()),
             Some(punktfunk_core::quic::GRANT_PRESET_CONTROLLER_ONLY)
         );
         drop(client);

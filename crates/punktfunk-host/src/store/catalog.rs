@@ -9,6 +9,7 @@
 
 use super::index::{Index, MAX_INDEX_BYTES};
 use super::sources::Source;
+use pf_update_check::feed::read_capped;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -57,7 +58,7 @@ pub(crate) fn fetch(source: &Source, etag: Option<&str>) -> Fetched {
         .get("etag")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let body = match read_capped(&mut resp) {
+    let body = match read_capped(&mut resp, MAX_INDEX_BYTES) {
         Ok(b) => b,
         Err(e) => return Fetched::Failed(e),
     };
@@ -66,7 +67,7 @@ pub(crate) fn fetch(source: &Source, etag: Option<&str>) -> Fetched {
     let keys = source.keys();
     if !keys.is_empty() {
         let sig = match agent.get(&source.sig_url()).call() {
-            Ok(mut r) => match read_capped(&mut r) {
+            Ok(mut r) => match read_capped(&mut r, MAX_INDEX_BYTES) {
                 Ok(b) => b,
                 Err(e) => return Fetched::Failed(format!("signature: {e}")),
             },
@@ -92,21 +93,6 @@ pub(crate) fn fetch(source: &Source, etag: Option<&str>) -> Fetched {
         },
         Err(e) => Fetched::Failed(format!("{e:#}")),
     }
-}
-
-fn read_capped(resp: &mut ureq::http::Response<ureq::Body>) -> Result<Vec<u8>, String> {
-    // cap+1 so an oversize-by-one body returns intact and is rejected below with our message;
-    // anything larger trips ureq's own limit. Either way this is Err, not a truncated body.
-    let buf = resp
-        .body_mut()
-        .with_config()
-        .limit((MAX_INDEX_BYTES + 1) as u64)
-        .read_to_vec()
-        .map_err(|e| format!("reading the response body failed: {e}"))?;
-    if buf.len() > MAX_INDEX_BYTES {
-        return Err(format!("response exceeds the {MAX_INDEX_BYTES}-byte cap"));
-    }
-    Ok(buf)
 }
 
 /// `<config_dir>/store-cache`. Last good copy of each source, so a host can boot without a network.
@@ -148,18 +134,14 @@ pub(crate) fn write_cache(dir: &Path, source: &str, index: &Index, meta: &CacheM
         tracing::warn!("store cache dir not created: {e}");
         return;
     }
-    let write = |path: PathBuf, bytes: Vec<u8>| {
-        let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, bytes).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
-    };
     match serde_json::to_vec_pretty(index) {
-        Ok(b) => write(body_path(dir, source), b),
+        Ok(b) => {
+            let _ = pf_paths::replace_file(&body_path(dir, source), &b);
+        }
         Err(e) => tracing::warn!("catalog cache not serialized: {e}"),
     }
     if let Ok(b) = serde_json::to_vec_pretty(meta) {
-        write(meta_path(dir, source), b);
+        let _ = pf_paths::replace_file(&meta_path(dir, source), &b);
     }
 }
 
@@ -167,13 +149,6 @@ pub(crate) fn write_cache(dir: &Path, source: &str, index: &Index, meta: &CacheM
 pub(crate) fn drop_cache(dir: &Path, source: &str) {
     let _ = std::fs::remove_file(body_path(dir, source));
     let _ = std::fs::remove_file(meta_path(dir, source));
-}
-
-pub(crate) fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

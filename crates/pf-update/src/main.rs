@@ -19,11 +19,11 @@
 
 #[cfg(target_os = "linux")]
 mod linux_main {
+    use pf_update_check::detect::{self, Product};
     use serde::Serialize;
     use std::path::Path;
     use std::process::Command;
 
-    const OSTREE_BOOTED: &str = "/run/ostree-booted";
     const PACMAN_OPTIN_CONF: &str = "/etc/punktfunk/update.conf";
 
     /// Which marker to read and which binary the post-install gate runs. Two units, two
@@ -35,17 +35,10 @@ mod linux_main {
     }
 
     impl Mode {
-        fn marker(self) -> &'static str {
+        fn product(self) -> Product {
             match self {
-                Mode::Host => "/usr/share/punktfunk/install-kind",
-                Mode::Client => "/usr/share/punktfunk-client/install-kind",
-            }
-        }
-
-        fn sysext_marker(self) -> &'static str {
-            match self {
-                Mode::Host => "/usr/lib/extension-release.d/extension-release.punktfunk",
-                Mode::Client => "/usr/lib/extension-release.d/extension-release.punktfunk-client",
+                Mode::Host => Product::Host,
+                Mode::Client => Product::Client,
             }
         }
 
@@ -95,7 +88,7 @@ mod linux_main {
 
     /// Kind from root-owned markers and `/run/ostree-booted`, not from argv.
     fn detect_kind(mode: Mode) -> Result<&'static str, String> {
-        if Path::new(mode.sysext_marker()).exists() {
+        if Path::new(mode.product().sysext_marker()).exists() {
             return match mode {
                 Mode::Host => Ok("sysext"),
                 // The signed sysext feed is the host image. Running it here would replace a client-only box.
@@ -106,16 +99,14 @@ mod linux_main {
                 ),
             };
         }
-        let marker_path = mode.marker();
+        let marker_path = mode.product().marker_path();
         let marker = std::fs::read_to_string(marker_path)
             .map_err(|e| format!("no install-kind marker at {marker_path}: {e}"))?;
-        match marker.split_whitespace().next() {
-            Some("apt") => Ok("apt"),
-            Some("dnf") if Path::new(OSTREE_BOOTED).exists() => Ok("rpm-ostree"),
-            Some("dnf") => Ok("dnf"),
-            Some("pacman") => Ok("pacman"),
-            other => Err(format!(
-                "install-kind marker says {other:?} — no root apply leg for it"
+        match detect::parse_marker(&marker, Path::new(detect::OSTREE_BOOTED).exists()) {
+            Some((kind, _)) => Ok(kind.as_str()),
+            None => Err(format!(
+                "install-kind marker says {:?} — no root apply leg for it",
+                marker.split_whitespace().next()
             )),
         }
     }

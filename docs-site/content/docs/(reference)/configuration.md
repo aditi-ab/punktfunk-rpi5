@@ -203,7 +203,7 @@ Env-only additions to the **Game Mode** rows above. See [gamescope](/docs/gamesc
 | `PUNKTFUNK_MONITOR_LINGER_MS` | ms (default `10000`) | Keep a client's virtual display this long after it disconnects. **Keep alive** in [Virtual displays](/docs/virtual-displays) supersedes it. |
 | `PUNKTFUNK_EXCLUSIVE_REASSERT_MS` | ms (default `2000`), `0` off | How often the host checks that exclusive topology held, re-applying it when Windows or a driver turns a physical monitor back on. |
 | `PUNKTFUNK_STANDBY_SINK_KEEP` | any value but `0`/`off` | Keep a connected but inactive external display (a TV on standby, a capture card) powered while streaming; by default the host turns it off, because Windows keeps drawing for it. Also keeps enabled the monitors **Disable monitor devices (PnP)** would disable. |
-| `PUNKTFUNK_NO_ISOLATE` | set | Extend the desktop onto the virtual display instead of making it the only one. **Topology** in [Virtual displays](/docs/virtual-displays) supersedes it. |
+| `PUNKTFUNK_NO_ISOLATE` | `1` | Extend the desktop onto the virtual display instead of making it the only one. **Topology** in [Virtual displays](/docs/virtual-displays) supersedes it. |
 | `PUNKTFUNK_HOST_CMD` | `serve` | The command the service runs; every install writes `serve`. With no line the service runs `serve --gamestream`, which `punktfunk-host service install` rewrites to `serve` with **GameStream** kept on. |
 | `PUNKTFUNK_WEB_CONSOLE` | `off` | Don't run the web console alongside the service. |
 
@@ -245,7 +245,7 @@ standard size. Native protocol only.
 | `PUNKTFUNK_FRAME_DRIVEN` | `1` · `0` | Encode when a frame arrives instead of on a fixed tick, on by default. `0` restores the tick, which adds about half a frame of latency. |
 | `PUNKTFUNK_GSO` | `1` · `0` | UDP segmentation offload: less send CPU, but bursty on constrained links. On by default on Windows (needed past about 1 Gbps), off on Linux. |
 | `PUNKTFUNK_SPLIT_ENCODE` | `0` · `1` · `2` · `3` | NVENC split encode for very high pixel rates. Unset splits on its own from about 4K120; `1` forces a split, `2` and `3` force two or three ways, `0` never splits. |
-| `PUNKTFUNK_NVENC_SUBFRAME` | `0` · `1` | NVENC sub-frame readback for lower latency, on where the GPU supports it. `0` never, `1` always. |
+| `PUNKTFUNK_NVENC_SUBFRAME` | `0` · `1` | NVENC sub-frame readback for lower latency, on where the GPU supports it and the stream has more than one slice. `0` never, `1` on every multi-slice stream. |
 | `PUNKTFUNK_NVENC_SPLIT_ARBITRATE` | `1` | Lets NVENC change its split decision mid-session as the pixel rate moves. |
 | `PUNKTFUNK_PHASE_LOCK` | `0` | Stops timing frame submission to the client's display. Try it if frame pacing keeps cycling. |
 | `PUNKTFUNK_GPU_PRIORITY_CLASS` | `realtime` (default) · `high` · `normal` · `off` | Windows: GPU priority of capture and encode under a heavy game; `realtime` preempts the game at some cost to its frame rate. Try `high` if NVENC freezes with HAGS on and VRAM nearly full. The display driver's own raise turns off with `setx /M PFVD_NO_RT_GPU 1` and a device restart. |

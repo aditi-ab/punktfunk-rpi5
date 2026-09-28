@@ -11,14 +11,21 @@
 //! Entrance waits for neighbourhood art or 400 ms. Pin with the tests in this module.
 
 use crate::anim::{entrances, Entrance, EntranceAt, Spring};
+use crate::anim::{
+    BUMP_C, BUMP_K, BUMP_V, ENTER_RISE, ENTER_SCALE, ENTER_TURN_DEG, SPRING_C, SPRING_K,
+};
+use crate::coverflow::{
+    project, shelf_matrix, POSTER_H, RECEDE_FADE, RECEDE_SCALE, ROTATE_DEG, SHELF_CORNER,
+    SHELF_COVER_MIN, SHELF_EYE, SHELF_SPACING,
+};
 use crate::el::{Axis, El, Id, Tree};
 use crate::glyphs::{Hint, HintKey};
+use crate::grid::{
+    grid_col_hint, grid_step, step_cursor, GridDir, GridShape, StepResult, GRID_GAP, GRID_H,
+    GRID_W, JUMP,
+};
 use crate::library::{
-    grid_col_hint, grid_step, initials, project, shelf_matrix, step_cursor, store_label, GridDir,
-    GridShape, LibraryGame, LibraryPhase, LibraryShared, LibraryView, Stale, StepResult, BUMP_C,
-    BUMP_K, BUMP_V, ENTER_RISE, ENTER_SCALE, ENTER_TURN_DEG, GRID_GAP, GRID_H, GRID_W, JUMP,
-    POSTER_H, RECEDE_FADE, RECEDE_SCALE, ROTATE_DEG, SHELF_CORNER, SHELF_COVER_MIN, SHELF_EYE,
-    SHELF_SPACING, SPRING_C, SPRING_K,
+    initials, store_label, LibraryGame, LibraryPhase, LibraryShared, LibraryView, Stale,
 };
 use crate::model::{ConsoleCmd, HostRow};
 use crate::pointer::{Pointer, PointerKind};
@@ -35,7 +42,7 @@ pub(crate) mod bar;
 mod card;
 mod games;
 pub(crate) use games::CustomizeScreen;
-use games::{Line, Zone};
+use games::{Band, Line, Zone};
 
 /// The screen's scroll node, title `i`'s grid cell, the shelf strip and its cover `i`.
 const GRID: &str = "library-grid";
@@ -410,39 +417,20 @@ pub(crate) fn draw_poster_placeholder(
     );
 }
 
-/// Stream `h` itself, launching nothing — asking a host to launch what it is already
-/// showing is how a second copy starts. The takeover names the running game when there
-/// is one, the host otherwise; a pinned card's preset rides along.
-fn desk_intent(h: &HostRow) -> ConnectIntent {
-    let subject = if h.running.is_empty() {
-        &h.name
-    } else {
-        &h.running
-    };
-    ConnectIntent {
-        addr: h.addr.clone(),
-        port: h.port,
-        fp_hex: h.fp_hex.clone(),
-        launch: None,
-        title: match &h.pin {
-            Some(p) => format!("{subject} \u{b7} {}", p.name),
-            None => subject.clone(),
-        },
-        request_access: false,
-        preset: h.pin.as_ref().map(|p| p.id.clone()),
-    }
-}
-
 /// Write `library_sort` only. Screens re-read it each frame; assigning the field reverts.
 pub(super) fn store_sort(sort: crate::collate::SortKey, ctx: &mut Ctx) {
-    ctx.settings.library_sort = sort.id().to_string();
-    ctx.store.save(ctx.settings);
+    ctx.write(|c| {
+        c.settings.library_sort = sort.id().to_string();
+        true
+    });
 }
 
 /// Write `library_view`. Settings and this bar share the key; last write wins next frame.
 fn store_view(view: LibraryView, ctx: &mut Ctx) {
-    ctx.settings.library_view = view.id().to_string();
-    ctx.store.save(ctx.settings);
+    ctx.write(|c| {
+        c.settings.library_view = view.id().to_string();
+        true
+    });
 }
 
 pub(crate) struct LibraryScreen {
@@ -1060,26 +1048,16 @@ impl LibraryScreen {
         }
     }
 
-    /// This shelf's host itself ([`desk_intent`]).
+    /// This shelf's host itself, launching nothing — asking a host to launch what it is
+    /// already showing is how a second copy starts.
     fn desktop_intent(&self) -> ConnectIntent {
-        desk_intent(&self.host)
+        ConnectIntent::to_host(&self.host, None)
     }
 
     /// Launch `g` on this shelf's host. Pinned card: that preset as a one-off; primary
     /// tile: the host's default.
     fn launch_intent(&self, g: &LibraryGame) -> ConnectIntent {
-        ConnectIntent {
-            addr: self.host.addr.clone(),
-            port: self.host.port,
-            fp_hex: self.host.fp_hex.clone(),
-            launch: Some(g.id.clone()),
-            title: match &self.host.pin {
-                Some(p) => format!("{} \u{b7} {}", g.title, p.name),
-                None => g.title.clone(),
-            },
-            request_access: false,
-            preset: self.host.pin.as_ref().map(|p| p.id.clone()),
-        }
+        ConnectIntent::to_host(&self.host, Some((&g.id, &g.title)))
     }
 
     /// The button the state card offers: Retry after a failure that can retry, the desk
@@ -1412,118 +1390,45 @@ impl LibraryScreen {
         let t = ctx.t;
         let (bands, lines) = self.place_zone(ctx);
         let sectioned = self.sectioned();
-        let shelf = self.view_mode == LibraryView::Shelf && !self.embedded;
-        let avail = f64::from(rect.width()) - 2.0 * edge(k);
         // The lines run on to the screen's foot and blur under the band there.
         let clip = canvas.local_clip_bounds().unwrap_or(rect);
         let foot = clip.bottom.max(rect.bottom);
-        let tray = if self.band_shown() {
-            crate::widgets::FOOT_TITLE_H * k
-        } else {
-            0.0
-        };
-        let band_top = f64::from(rect.bottom) - tray;
-        let usable = band_top - f64::from(rect.top);
-        let view_h = f64::from(foot - rect.top);
-
-        let cols = self.grid_cols(rect, k);
-        // Navigation reads last-drawn columns. A resize is a different grid; re-seat.
-        if self.grid_cols_last != Some(cols) {
-            self.grid_cols_last = Some(cols);
-            self.seat_grid_col();
-        }
-        let shape = GridShape::new(self.len(), cols, self.lead_count());
-        // Two-column clamp can overflow a narrow rect; shrink cells only, never headings.
-        let fit = (avail / ((cols as f64 * (GRID_W + GRID_GAP) - GRID_GAP) * k)).clamp(0.25, 1.0);
-        let (cw, ch) = (GRID_W * k * fit, GRID_H * k * fit);
-        let card_h = ch + card::text_h(self.sort_captions()) * k;
-        let pitch_x = cw + GRID_GAP * k * fit;
-        let gap_y = ROW_GAP * k;
-        let grid_w = cols as f64 * pitch_x - GRID_GAP * k * fit;
-        let split_row = (shape.split > 0).then(|| shape.split_row());
-        let heading_h = if self.embedded {
-            EMBED_AIR
-        } else {
-            GRID_HEADING
-        } * k;
-        // Top inset is always on: it is also the air row 0 needs.
-        let row_top = |row: usize| -> f64 {
-            let section_gap = match split_row {
-                Some(s) if row >= s => heading_h,
-                _ => 0.0,
-            };
-            row as f64 * (card_h + gap_y) + heading_h + section_gap
-        };
-        let geo = shelf.then(|| self.shelf_geo(usable, avail, k));
-        let block_h = |line: Line| -> f64 {
-            match line {
-                Line::Bar => (bar::BAR_H + BAR_AIR) * k,
-                Line::Chips => Self::chips_h(k),
-                Line::Band(b) => Self::band_h(&bands[b], ch, k),
-                Line::Grid => match geo {
-                    Some(g) => g.block,
-                    None => row_top(shape.rows().saturating_sub(1)) + card_h + gap_y,
-                },
-                Line::State if sectioned => STATE_H * k,
-                Line::State => usable,
-            }
-        };
-        let mut tops = Vec::with_capacity(lines.len());
-        let mut content_h = 0.0;
-        for &l in &lines {
-            tops.push(content_h);
-            content_h += block_h(l);
-        }
-        // Matching bottom inset: the last row clears the band.
-        let pad = heading_h + (f64::from(foot) - band_top);
-        content_h += pad;
-        let top_of = |l: Line| lines.iter().position(|&x| x == l).map_or(0.0, |i| tops[i]);
-        let (focus_row, _) = shape.cell_of(self.cursor.max(0) as usize);
-        // The focused item's span: a grid row (its heading too on row 0), or a whole line.
-        let (item_top, item_h) = match (self.zone, geo) {
-            (Zone::Grid, None) if focus_row > 0 => {
-                (top_of(Line::Grid) + row_top(focus_row), card_h)
-            }
-            (Zone::Grid, None) => (top_of(Line::Grid), row_top(0) + card_h),
-            (z, _) => {
-                let line = games::line_of(z);
-                (top_of(line), block_h(line))
-            }
-        };
+        let g = self.field_geom(rect, foot, k, &lines, &bands);
+        let FieldGeom {
+            shape,
+            cw,
+            ch,
+            card_h,
+            pitch_x,
+            gap_y,
+            grid_w,
+            heading_h,
+            split_row,
+            shelf: geo,
+            avail,
+            view_h,
+            ..
+        } = g;
+        let (item_top, item_h) = g.item_span(self.zone, self.cursor, &lines, &bands);
         // Scroll only as far as it takes to show the item and a breath round it, above the
         // band; a line taller than the view shows its top. Never centred: on a phone that
         // walked the first row up over the host's verbs.
         let breath = REVEAL_AIR * k;
         let mut want = self.scroll.pos;
-        if item_top + item_h + breath > want + usable {
-            want = item_top + item_h + breath - usable;
+        if item_top + item_h + breath > want + g.usable {
+            want = item_top + item_h + breath - g.usable;
         }
         if item_top - breath < want {
             want = item_top - breath;
         }
-        let want = want.clamp(0.0, (content_h - view_h).max(0.0));
+        let want = want.clamp(0.0, (g.content_h - view_h).max(0.0));
         let grid = Id::new(GRID, 0);
         let snap = std::mem::take(&mut self.snap_scroll);
         self.follow |= snap;
         self.step_bands(&bands, avail, cw, k, snap);
         let applied = self.applied();
         self.bar.step(fonts, k, avail, true, applied, dt, snap);
-        let tree = self.grid.get_mut();
-        tree.tick(dt as f32);
-        // Follow focus while no finger has the scroll. After a pan the spring starts from
-        // wherever the finger left it, so the next move glides instead of jumping.
-        if self.follow && !tree.moving(grid) {
-            if snap || crate::theme::reduce_motion() {
-                self.scroll = Spring::rest(want);
-            } else {
-                self.scroll
-                    .step_spec(want, crate::anim::springs::FOCUS, 1.0 / 60.0);
-                self.scroll.settle(want, 0.05, 0.5);
-            }
-            tree.set_offset(grid, self.scroll.pos as f32);
-        } else {
-            self.scroll = Spring::rest(f64::from(tree.offset(grid)));
-        }
+        self.follow_scroll(want, snap, dt);
 
         // The recoil moves the drawing on its axis, never the cells a pointer hits.
         let bump = self.bump.pos * k;
@@ -1665,12 +1570,17 @@ impl LibraryScreen {
                         .child(air)
                     }
                 },
-                Line::State => {
-                    root.child(this.state_el(fonts, avail, block_h(Line::State), k, t, hits))
-                }
+                Line::State => root.child(this.state_el(
+                    fonts,
+                    avail,
+                    g.block_h(Line::State, &bands),
+                    k,
+                    t,
+                    hits,
+                )),
             };
         }
-        root = root.child(El::column().size(avail as f32, pad as f32));
+        root = root.child(El::column().size(avail as f32, g.pad as f32));
         let mut tree = this.grid.borrow_mut();
         let frame = tree.layout(root, viewport);
         let field = match geo {
@@ -1678,7 +1588,11 @@ impl LibraryScreen {
             None => grid_cell(this.cursor.max(0) as usize),
         };
         tree.set_focus((!this.quiet).then(|| games::zone_id(this.zone, field)));
-        let cheap = super::settings::reduce_ui_res(ctx.settings, ctx.platform, ctx.fallback_ui);
+        let cheap = super::settings::reduce_ui_res(
+            ctx.settings,
+            ctx.device.platform,
+            ctx.device.fallback_ui,
+        );
         if bleed {
             tree.paint_focus(canvas, frame, k as f32, dt, cheap);
         } else {
@@ -1689,29 +1603,123 @@ impl LibraryScreen {
         }
         drop(tree);
 
-        // Hit rects are the cells as laid out; covers drawn this frame stay warm.
-        let painted = painted.take();
+        self.record_frame(painted.take(), shelf_cards.as_deref(), hits.take(), &bands);
+    }
+
+    /// This frame's field metrics in `rect`, the lines running on to `foot`. Navigation
+    /// reads last-drawn columns, so a resize re-seats the cursor's column.
+    fn field_geom(
+        &mut self,
+        rect: Rect,
+        foot: f32,
+        k: f64,
+        lines: &[Line],
+        bands: &[Band],
+    ) -> FieldGeom {
+        let shelf = self.view_mode == LibraryView::Shelf && !self.embedded;
+        let avail = f64::from(rect.width()) - 2.0 * edge(k);
+        let tray = if self.band_shown() {
+            crate::widgets::FOOT_TITLE_H * k
+        } else {
+            0.0
+        };
+        let band_top = f64::from(rect.bottom) - tray;
+        let usable = band_top - f64::from(rect.top);
+        let cols = self.grid_cols(rect, k);
+        if self.grid_cols_last != Some(cols) {
+            self.grid_cols_last = Some(cols);
+            self.seat_grid_col();
+        }
+        let shape = GridShape::new(self.len(), cols, self.lead_count());
+        // Two-column clamp can overflow a narrow rect; shrink cells only, never headings.
+        let fit = (avail / ((cols as f64 * (GRID_W + GRID_GAP) - GRID_GAP) * k)).clamp(0.25, 1.0);
+        let (cw, ch) = (GRID_W * k * fit, GRID_H * k * fit);
+        let pitch_x = cw + GRID_GAP * k * fit;
+        let heading_h = if self.embedded {
+            EMBED_AIR
+        } else {
+            GRID_HEADING
+        } * k;
+        let mut g = FieldGeom {
+            k,
+            shape,
+            cw,
+            ch,
+            card_h: ch + card::text_h(self.sort_captions()) * k,
+            pitch_x,
+            gap_y: ROW_GAP * k,
+            grid_w: cols as f64 * pitch_x - GRID_GAP * k * fit,
+            heading_h,
+            split_row: (shape.split > 0).then(|| shape.split_row()),
+            shelf: shelf.then(|| self.shelf_geo(usable, avail, k)),
+            sectioned: self.sectioned(),
+            avail,
+            usable,
+            view_h: f64::from(foot - rect.top),
+            tops: Vec::with_capacity(lines.len()),
+            content_h: 0.0,
+            pad: 0.0,
+        };
+        for &l in lines {
+            g.tops.push(g.content_h);
+            let h = g.block_h(l, bands);
+            g.content_h += h;
+        }
+        // Matching bottom inset: the last row clears the band.
+        g.pad = heading_h + (f64::from(foot) - band_top);
+        g.content_h += g.pad;
+        g
+    }
+
+    /// Follow focus to `want` while no finger has the scroll. After a pan the spring starts
+    /// from wherever the finger left it, so the next move glides instead of jumping.
+    fn follow_scroll(&mut self, want: f64, snap: bool, dt: f64) {
+        let grid = Id::new(GRID, 0);
+        let tree = self.grid.get_mut();
+        tree.tick(dt as f32);
+        if self.follow && !tree.moving(grid) {
+            if snap || crate::theme::reduce_motion() {
+                self.scroll = Spring::rest(want);
+            } else {
+                self.scroll
+                    .step_spec(want, crate::anim::springs::FOCUS, 1.0 / 60.0);
+                self.scroll.settle(want, 0.05, 0.5);
+            }
+            tree.set_offset(grid, self.scroll.pos as f32);
+        } else {
+            self.scroll = Spring::rest(f64::from(tree.offset(grid)));
+        }
+    }
+
+    /// Hit rects are the cells as laid out; covers drawn this frame stay warm.
+    fn record_frame(
+        &mut self,
+        painted: Vec<usize>,
+        shelf_cards: Option<&[ShelfCard]>,
+        hits: Vec<(Zone, Rect)>,
+        bands: &[Band],
+    ) {
         self.geom.clear();
         self.geom.resize(self.len(), Rect::new_empty());
         let tree = self.grid.get_mut();
         for &i in &painted {
             self.geom[i] = tree.rect(grid_cell(i)).unwrap_or_else(Rect::new_empty);
         }
-        if let (Some(cards), Some(strip)) = (&shelf_cards, tree.rect(shelf_strip())) {
+        if let (Some(cards), Some(strip)) = (shelf_cards, tree.rect(shelf_strip())) {
             for c in cards {
                 self.geom[c.i] = c.bounds.with_offset((strip.left, strip.top));
             }
         }
         let seen: Vec<usize> = painted
             .into_iter()
-            .chain(shelf_cards.iter().flatten().map(|c| c.i))
+            .chain(shelf_cards.into_iter().flatten().map(|c| c.i))
             .collect();
         for i in seen {
             if let Some(id) = self.game(i).map(|g| g.id.clone()) {
                 self.art_seen.insert(id, self.frame);
             }
         }
-        self.hits = hits.take();
+        self.hits = hits;
         for (z, _) in &self.hits {
             let Zone::Band { band, item } = *z else {
                 continue;
@@ -2073,6 +2081,83 @@ impl LibraryScreen {
     }
 }
 
+/// The field's metrics this frame, px: the grid's cells and rows, the shelf when it shows,
+/// and each line's top in the one scroll.
+struct FieldGeom {
+    k: f64,
+    shape: GridShape,
+    /// A grid cell, and the card under it with its caption.
+    cw: f64,
+    ch: f64,
+    card_h: f64,
+    pitch_x: f64,
+    gap_y: f64,
+    grid_w: f64,
+    heading_h: f64,
+    /// The games section's first row when the launchers hold rows of their own.
+    split_row: Option<usize>,
+    shelf: Option<ShelfGeo>,
+    sectioned: bool,
+    /// Width inside the edges, height above the band, height to the screen's foot.
+    avail: f64,
+    usable: f64,
+    view_h: f64,
+    /// Each line's top in `lines` order; the scroll's height, bottom inset `pad` included.
+    tops: Vec<f64>,
+    content_h: f64,
+    pad: f64,
+}
+
+impl FieldGeom {
+    /// Grid row `row`'s top. The top inset is always on: it is also the air row 0 needs.
+    fn row_top(&self, row: usize) -> f64 {
+        let section_gap = match self.split_row {
+            Some(s) if row >= s => self.heading_h,
+            _ => 0.0,
+        };
+        row as f64 * (self.card_h + self.gap_y) + self.heading_h + section_gap
+    }
+
+    fn block_h(&self, line: Line, bands: &[Band]) -> f64 {
+        let k = self.k;
+        match line {
+            Line::Bar => (bar::BAR_H + BAR_AIR) * k,
+            Line::Chips => LibraryScreen::chips_h(k),
+            Line::Band(b) => LibraryScreen::band_h(&bands[b], self.ch, k),
+            Line::Grid => match self.shelf {
+                Some(g) => g.block,
+                None => {
+                    self.row_top(self.shape.rows().saturating_sub(1)) + self.card_h + self.gap_y
+                }
+            },
+            Line::State if self.sectioned => STATE_H * k,
+            Line::State => self.usable,
+        }
+    }
+
+    /// The focused item's `(top, height)`: a grid row (its heading too on row 0), or a
+    /// whole line.
+    fn item_span(&self, zone: Zone, cursor: i32, lines: &[Line], bands: &[Band]) -> (f64, f64) {
+        let top_of = |l: Line| {
+            lines
+                .iter()
+                .position(|&x| x == l)
+                .map_or(0.0, |i| self.tops[i])
+        };
+        let (focus_row, _) = self.shape.cell_of(cursor.max(0) as usize);
+        match (zone, self.shelf) {
+            (Zone::Grid, None) if focus_row > 0 => {
+                (top_of(Line::Grid) + self.row_top(focus_row), self.card_h)
+            }
+            (Zone::Grid, None) => (top_of(Line::Grid), self.row_top(0) + self.card_h),
+            (z, _) => {
+                let line = games::line_of(z);
+                (top_of(line), self.block_h(line, bands))
+            }
+        }
+    }
+}
+
 /// The shelf's metrics this frame, px: cover size, heading, and the whole block.
 #[derive(Clone, Copy)]
 struct ShelfGeo {
@@ -2096,8 +2181,9 @@ struct ShelfCard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::library::POSTER_W;
+    use crate::coverflow::POSTER_W;
     use crate::screens::Screen;
+    use crate::theme::{contrast, over};
 
     #[test]
     fn a_cover_already_at_cache_size_decodes_here_with_mips() {
@@ -2117,25 +2203,9 @@ mod tests {
 
     fn host() -> HostRow {
         HostRow {
-            key: "aa".into(),
-            id: None,
-            name: "Desk".into(),
             addr: "10.0.0.5".into(),
-            port: 9777,
-            fp_hex: "aa".into(),
-            paired: true,
-            saved: true,
-            online: true,
             mgmt_port: 9778,
-            can_wake: false,
-            clipboard_sync: false,
-            last_used: None,
-            os: String::new(),
-            actions: Vec::new(),
-            pin: None,
-            bound_preset: None,
-            running: String::new(),
-            game_presets: Default::default(),
+            ..HostRow::fixture("aa", "Desk")
         }
     }
 
@@ -2180,28 +2250,6 @@ mod tests {
         (s, library)
     }
 
-    fn ctx<'a>(
-        library: &'a LibraryShared,
-        settings: &'a mut pf_client_core::trust::Settings,
-    ) -> Ctx<'a> {
-        Ctx {
-            hosts: &[],
-            library,
-            settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &[],
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "test",
-            t: 0.0,
-        }
-    }
-
     fn press(
         s: &mut LibraryScreen,
         library: &LibraryShared,
@@ -2209,7 +2257,7 @@ mod tests {
         ev: MenuEvent,
     ) -> (Option<MenuPulse>, Outbox) {
         let mut fx = Outbox::default();
-        let pulse = s.menu(ev, &mut ctx(library, settings), &mut fx);
+        let pulse = s.menu(ev, &mut Ctx::test(settings, library), &mut fx);
         (pulse, fx)
     }
 
@@ -2218,7 +2266,7 @@ mod tests {
         library: &LibraryShared,
         settings: &mut pf_client_core::trust::Settings,
     ) -> Vec<HintKey> {
-        s.hints(&ctx(library, settings))
+        s.hints(&Ctx::test(settings, library))
             .iter()
             .map(|h| h.key)
             .collect()
@@ -2293,7 +2341,7 @@ mod tests {
         );
         press(&mut s, &library, &mut settings, down());
         assert_eq!(s.zone, Zone::Grid);
-        s.adopt_settings(&ctx(&library, &mut settings));
+        s.adopt_settings(&Ctx::test(&mut settings, &library));
         assert_eq!(s.sort, crate::collate::SortKey::Title);
         assert_eq!(
             s.game(1).map(|g| g.title.as_str()),
@@ -2329,7 +2377,7 @@ mod tests {
         assert_eq!(s.zone, Zone::Bar(7));
         press(&mut s, &library, &mut settings, MenuEvent::Confirm);
         assert_eq!(settings.library_view, LibraryView::Grid.id());
-        s.adopt_settings(&ctx(&library, &mut settings));
+        s.adopt_settings(&Ctx::test(&mut settings, &library));
         assert_eq!(s.view_mode, LibraryView::Grid);
         assert!(s.snap_scroll, "a new arrangement seats rather than glides");
         assert_eq!(s.applied(), [0, 7]);
@@ -2343,22 +2391,26 @@ mod tests {
         let mut settings = shelf_settings();
         // The leading tile is the desktop, and it speaks the caption it draws.
         assert_eq!(
-            s.announcement(&ctx(&library, &mut settings)).as_deref(),
+            s.announcement(&Ctx::test(&mut settings, &library))
+                .as_deref(),
             Some("Desktop")
         );
         press(&mut s, &library, &mut settings, right());
         assert_eq!(
-            s.announcement(&ctx(&library, &mut settings)).as_deref(),
+            s.announcement(&Ctx::test(&mut settings, &library))
+                .as_deref(),
             Some("Zeta")
         );
         press(&mut s, &library, &mut settings, up());
         assert_eq!(
-            s.announcement(&ctx(&library, &mut settings)).as_deref(),
+            s.announcement(&Ctx::test(&mut settings, &library))
+                .as_deref(),
             Some("Sort Default, selected")
         );
         press(&mut s, &library, &mut settings, right());
         assert_eq!(
-            s.announcement(&ctx(&library, &mut settings)).as_deref(),
+            s.announcement(&Ctx::test(&mut settings, &library))
+                .as_deref(),
             Some("Sort A–Z")
         );
     }
@@ -2605,8 +2657,8 @@ mod tests {
                 })
                 .collect()
         };
-        s.adopt_settings(&ctx(&library, &mut settings));
-        let (bands, before) = s.bands(&ctx(&library, &mut settings));
+        s.adopt_settings(&Ctx::test(&mut settings, &library));
+        let (bands, before) = s.bands(&Ctx::test(&mut settings, &library));
         let sections: Vec<_> = bands.iter().map(|b| b.section).collect();
         use crate::library::Section;
         assert_eq!(
@@ -2621,8 +2673,8 @@ mod tests {
         assert!(!s.view.iter().any(|&i| s.games[i].launcher));
 
         settings.library_sections = "-launchers,-desktops".into();
-        s.adopt_settings(&ctx(&library, &mut settings));
-        let (bands, _) = s.bands(&ctx(&library, &mut settings));
+        s.adopt_settings(&Ctx::test(&mut settings, &library));
+        let (bands, _) = s.bands(&Ctx::test(&mut settings, &library));
         assert!(bands
             .iter()
             .all(|b| !matches!(b.section, Section::Launchers | Section::Desktops)));
@@ -2729,29 +2781,10 @@ mod tests {
         assert!(s.entrance_armed, "a decoded poster is the whole point");
     }
 
-    fn over(src: Color4f, dst: Color4f) -> Color4f {
-        let m = |s: f32, d: f32| s * src.a + d * (1.0 - src.a);
-        Color4f::new(m(src.r, dst.r), m(src.g, dst.g), m(src.b, dst.b), 1.0)
-    }
-
-    /// WCAG contrast: sRGB → linear, Rec. 709 luminance.
-    fn contrast(a: Color4f, b: Color4f) -> f32 {
-        let lin = |c: f32| {
-            if c <= 0.04045 {
-                c / 12.92
-            } else {
-                ((c + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        let lum = |c: Color4f| 0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b);
-        let (x, y) = (lum(a), lum(b));
-        (x.max(y) + 0.05) / (x.min(y) + 0.05)
-    }
-
     /// Coverless monogram vs face must contrast on every palette. Side cards overlap: alpha leaks.
     #[test]
     fn a_coverless_card_reads_on_every_palette() {
-        for p in &crate::library::PALETTES {
+        for p in &crate::palette::PALETTES {
             crate::theme::set_ink(crate::theme::Ink::of(p));
             for launcher in [false, true] {
                 let face = placeholder_face(launcher);
@@ -2760,7 +2793,7 @@ mod tests {
                 assert!(c > 3.0, "the monogram is unreadable on {}: {c:.2}:1", p.id);
             }
         }
-        crate::theme::set_ink(crate::theme::Ink::of(crate::library::palette("violet")));
+        crate::theme::set_ink(crate::theme::Ink::of(crate::palette::palette("violet")));
     }
 
     /// Stamp after draw. Arrival-order LRU drops the neighbourhood the cursor is in.
@@ -2924,7 +2957,7 @@ mod tests {
                 1.0,
                 1.0 / 60.0,
                 &fonts,
-                &mut ctx(library, settings),
+                &mut Ctx::test(settings, library),
             );
         }
         if let Ok(dir) = std::env::var("PF_GRID_DUMP") {
@@ -3001,7 +3034,7 @@ mod tests {
         let mut fx = Outbox::default();
         s.menu(
             MenuEvent::Move(MenuDir::Down),
-            &mut ctx(&library, &mut settings),
+            &mut Ctx::test(&mut settings, &library),
             &mut fx,
         );
         grid_frames(&mut s, &library, &mut settings, 120, "pan-3");
@@ -3420,7 +3453,7 @@ mod tests {
             scale: Some(2.25),
         };
         let mut s = games_tab(LibraryView::Grid, &full());
-        s.platform = crate::platform::Platform::Apple;
+        s.device.platform = crate::platform::Platform::Apple;
         let phone = |s: &mut Shell, frames: usize, name: &str| {
             let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
             for _ in 0..frames {

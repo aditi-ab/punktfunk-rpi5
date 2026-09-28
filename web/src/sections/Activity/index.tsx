@@ -192,15 +192,19 @@ export const ActivityPage: FC<{
 };
 
 /** The subject of an event, in one line — whatever the payload actually names. */
-function describe(e: ActivityEntry): string {
+export function describe(e: ActivityEntry): string {
 	const d = e.data;
-	const client = pick(d.client, "name") ?? pick(d.session, "client");
+	const client =
+		pick(d.client, "name") ??
+		pick(d.session, "client") ??
+		pick(d.game, "client") ??
+		pick(d.device, "name");
 	const stream = d.stream as Record<string, unknown> | undefined;
 	const parts = [
 		client,
 		typeof stream?.app === "string" ? stream.app : undefined,
+		pick(d.game, "title"),
 		typeof d.reason === "string" ? d.reason : undefined,
-		typeof d.game === "string" ? d.game : undefined,
 	].filter((x): x is string => typeof x === "string" && x.length > 0);
 	// An event whose payload names nothing (host.started, library.changed) is still worth a row —
 	// the kind badge carries the whole meaning, so leave the line blank rather than inventing text.

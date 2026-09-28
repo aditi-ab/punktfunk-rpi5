@@ -29,8 +29,9 @@ object Keymap {
 
     /**
      * Linux evdev keycode (`KeyEvent.scanCode`) → US-positional VK for the layout-**variant**
-     * typing area — the same 48-key table as the Linux client's `evdev_to_vk` and the hosts'
-     * fixed tables. Everything else → 0 (the keycode path is already positional for those).
+     * typing area: the 48 keys of `punktfunk_core::input::evdev_to_vk` that move with the layout,
+     * held to it by `evdev-vk-vectors.json`. Everything else → 0 (the keycode path is already
+     * positional for those).
      */
     fun evdevToVk(scan: Int): Int = when (scan) {
         in 2..10 -> 0x31 + (scan - 2) // KEY_1..KEY_9

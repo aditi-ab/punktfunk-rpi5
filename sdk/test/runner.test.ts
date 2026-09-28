@@ -5,15 +5,14 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { Effect, Fiber } from "effect";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { discoverUnits } from "../src/discover.js";
+import { spawnAgainIfKilled, windowsSddlUnsafeReason } from "../src/file-trust.js";
 import {
 	adoptNestedState,
 	describeFailure,
-	discoverUnits,
 	inProcessConnect,
 	runner,
-	spawnAgainIfKilled,
 	superviseUnit,
-	windowsSddlUnsafeReason,
 	writePluginToken,
 } from "../src/runner.js";
 

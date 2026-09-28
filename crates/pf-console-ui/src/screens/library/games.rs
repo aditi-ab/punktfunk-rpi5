@@ -10,14 +10,15 @@
 use super::super::collections::{paint_tile, TILE_CORNER, TILE_H, TILE_W};
 use super::bar::{pill_id, Pill};
 use super::card::{self, Card, DESK_H, DESK_W};
-use super::{desk_intent, store_sort, store_view, LibraryScreen};
+use super::{store_sort, store_view, LibraryScreen};
 use crate::el::{El, Id};
 use crate::glyphs::{Hint, HintKey};
-use crate::library::{LibraryGame, LibraryPhase, LibraryView, Section, GRID_GAP};
+use crate::grid::GRID_GAP;
+use crate::library::{LibraryGame, LibraryPhase, LibraryView, Section};
 use crate::model::{ConsoleCmd, HostRow};
 use crate::pointer::Pointer;
 use crate::screens::card_menu::CardMenu;
-use crate::screens::{Ctx, Outbox, Screen};
+use crate::screens::{ConnectIntent, Ctx, Outbox, Screen};
 use crate::theme::{fg, Fonts, W};
 use crate::widgets::{button, button_w, text_tab, ListMsg, MenuList, RowSpec};
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
@@ -144,7 +145,7 @@ impl LibraryScreen {
 
     /// `h` is this shelf's host; a pinned card's shelf counts its primary row.
     fn own(&self, h: &HostRow) -> bool {
-        Some(h.key.as_str()) == self.host.key.split('\0').next()
+        h.key == self.host.host_key()
     }
 
     pub(super) fn shows(&self, s: Section) -> bool {
@@ -377,7 +378,7 @@ impl LibraryScreen {
                 Zone::Band { band, item } => {
                     let intent = match &bands[band].items[item] {
                         Item::Desktop(h) if self.own(h) => self.desktop_intent(),
-                        Item::Desktop(h) => desk_intent(h),
+                        Item::Desktop(h) => ConnectIntent::to_host(h, None),
                         Item::Game(i) => self.launch_intent(&self.games[*i]),
                         Item::Collection(c) => {
                             self.open_collection(*c, fx);
@@ -842,8 +843,10 @@ impl CustomizeScreen {
     }
 
     fn save(rows: &[(Section, bool)], ctx: &mut Ctx) {
-        ctx.settings.library_sections = crate::library::stored_sections(rows);
-        ctx.store.save(ctx.settings);
+        ctx.write(|c| {
+            c.settings.library_sections = crate::library::stored_sections(rows);
+            true
+        });
     }
 
     pub(crate) fn menu(
@@ -947,8 +950,8 @@ impl CustomizeScreen {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
-        let note_h = 34.0 * k;
-        let list = Rect::from_ltrb(rect.left, rect.top, rect.right, rect.bottom - note_h as f32);
+        let foot = (crate::widgets::FOOT_DETAIL_H * k) as f32;
+        let list = Rect::from_ltrb(rect.left, rect.top, rect.right, rect.bottom - foot);
         let rows: Vec<RowSpec> = crate::library::sections(&ctx.settings.library_sections)
             .iter()
             .enumerate()
@@ -957,16 +960,10 @@ impl CustomizeScreen {
             })
             .collect();
         self.list.render(canvas, list, &rows, fonts, k, dt, true);
-        fonts.centered(
-            canvas,
-            "The Games tab shows these in this order. An empty section stays hidden.",
-            W::Regular,
-            13.0 * k,
-            fg(0.55),
-            f64::from(rect.center_x()),
-            f64::from(rect.bottom) - note_h + 6.0 * k,
-            f64::from(rect.width()) * 0.8,
-        );
+    }
+
+    pub(crate) fn foot(&self) -> &'static str {
+        "The Games tab shows these in this order. An empty section stays hidden."
     }
 }
 
@@ -981,22 +978,7 @@ mod tests {
         crate::screens::settings::tests::fake_home();
         let library = crate::library::LibraryShared::default();
         let mut settings = pf_client_core::trust::Settings::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &[],
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "test",
-            t: 0.0,
-        };
+        let mut ctx = Ctx::test(&mut settings, &library);
         let mut s = CustomizeScreen::new();
         let mut fx = Outbox::default();
         let mut press = |s: &mut CustomizeScreen, ev| s.menu(ev, &mut ctx, &mut fx);
@@ -1010,5 +992,37 @@ mod tests {
             ctx.settings.library_sections,
             "recent,-desktops,favorites,launchers,collections,games"
         );
+    }
+
+    /// Sort, view, and Customize rebase before they save: a value another writer stored
+    /// after the console's last load survives each of them.
+    #[test]
+    fn library_writes_keep_another_writers_save() {
+        let library = crate::library::LibraryShared::default();
+        let store = crate::store::file_store();
+        let mut settings = pf_client_core::trust::Settings::default();
+        let mut ctx = Ctx {
+            store,
+            ..Ctx::test(&mut settings, &library)
+        };
+        let writes: [fn(&mut Ctx); 3] = [
+            |c| store_sort(crate::collate::SortKey::Title, c),
+            |c| store_view(LibraryView::Shelf, c),
+            |c| {
+                let mut s = CustomizeScreen::new();
+                s.menu(MenuEvent::Move(MenuDir::Left), c, &mut Outbox::default());
+            },
+        ];
+        for (i, write) in writes.into_iter().enumerate() {
+            let mut other = store.load();
+            other.bitrate_kbps = 7_000 + i as u32;
+            store.save(&other);
+            write(&mut ctx);
+            assert_eq!(store.load().bitrate_kbps, 7_000 + i as u32, "write {i}");
+        }
+        let saved = store.load();
+        assert_eq!(saved.library_sort, "title");
+        assert_eq!(saved.library_view, "shelf");
+        assert!(saved.library_sections.contains("-desktops"));
     }
 }

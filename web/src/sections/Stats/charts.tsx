@@ -409,6 +409,76 @@ type Counter = {
 	stroke: string;
 };
 
+/** One line per series against time, the y axis starting at zero and reaching at least `floor`. */
+function SeriesChart({
+	samples,
+	series,
+	y,
+	format,
+	legend = true,
+}: {
+	samples: StatsSample[];
+	series: readonly Counter[];
+	y: {
+		width: number;
+		floor: number;
+		unit?: string;
+		integer?: boolean;
+		tick: (v: number) => string;
+	};
+	format: (v: number) => string;
+	legend?: boolean;
+}) {
+	const rows = useMemo(
+		() =>
+			withSessionBreaks(
+				samples,
+				samples.map((s) => {
+					const row: Record<string, number | null> & { t: number } = {
+						t: tSeconds(s),
+					};
+					for (const c of series) row[c.key] = c.pick(s) ?? null;
+					return row;
+				}),
+			),
+		[samples, series],
+	);
+	return (
+		<ChartFrame>
+			<LineChart data={rows} margin={{ top: 6, right: 8, left: 0, bottom: 0 }}>
+				<CartesianGrid strokeDasharray="3 3" stroke={gridStroke} />
+				<XAxis {...timeAxis} />
+				<YAxis
+					tick={axisTick}
+					stroke={gridStroke}
+					width={y.width}
+					unit={y.unit}
+					allowDecimals={!y.integer}
+					domain={[0, (max: number) => Math.max(max, y.floor)]}
+					tickFormatter={y.tick}
+				/>
+				<Tooltip
+					contentStyle={tooltipStyle}
+					formatter={(v) => format(Number(v))}
+					labelFormatter={secondsLabel}
+				/>
+				{legend && <Legend wrapperStyle={legendStyle} />}
+				{series.map((c) => (
+					<Line
+						key={c.key}
+						type="monotone"
+						dataKey={c.key}
+						name={c.name()}
+						stroke={c.stroke}
+						dot={false}
+						isAnimationActive={false}
+					/>
+				))}
+			</LineChart>
+		</ChartFrame>
+	);
+}
+
 const COUNTERS: Counter[] = [
 	{
 		key: "frames",
@@ -445,56 +515,17 @@ export function HealthChart({ samples }: { samples: StatsSample[] }) {
 		() => COUNTERS.filter((c) => samples.some((s) => c.pick(s) != null)),
 		[samples],
 	);
-	const rows = useMemo(
-		() =>
-			withSessionBreaks(
-				samples,
-				samples.map((s) => {
-					const row: Record<string, number | null> & { t: number } = {
-						t: tSeconds(s),
-					};
-					for (const c of present) row[c.key] = c.pick(s) ?? null;
-					return row;
-				}),
-			),
-		[samples, present],
-	);
 	if (present.length === 0)
 		return (
 			<p className="text-xs text-muted-foreground">{m.stats_health_none()}</p>
 		);
 	return (
-		<ChartFrame>
-			<LineChart data={rows} margin={{ top: 6, right: 8, left: 0, bottom: 0 }}>
-				<CartesianGrid strokeDasharray="3 3" stroke={gridStroke} />
-				<XAxis {...timeAxis} />
-				<YAxis
-					tick={axisTick}
-					stroke={gridStroke}
-					width={40}
-					allowDecimals={false}
-					domain={[0, (max: number) => Math.max(max, 5)]}
-					tickFormatter={(v: number) => fmtNumber(v)}
-				/>
-				<Tooltip
-					contentStyle={tooltipStyle}
-					formatter={(v) => fmtNumber(Number(v))}
-					labelFormatter={secondsLabel}
-				/>
-				<Legend wrapperStyle={legendStyle} />
-				{present.map((c) => (
-					<Line
-						key={c.key}
-						type="monotone"
-						dataKey={c.key}
-						name={c.name()}
-						stroke={c.stroke}
-						dot={false}
-						isAnimationActive={false}
-					/>
-				))}
-			</LineChart>
-		</ChartFrame>
+		<SeriesChart
+			samples={samples}
+			series={present}
+			y={{ width: 40, floor: 5, integer: true, tick: (v) => fmtNumber(v) }}
+			format={(v) => fmtNumber(v)}
+		/>
 	);
 }
 
@@ -503,44 +534,30 @@ export function hasRtt(samples: StatsSample[]): boolean {
 	return samples.some((s) => s.rtt_us != null);
 }
 
+const RTT: readonly Counter[] = [
+	{
+		key: "rtt",
+		pick: (s) => toMs(s.rtt_us),
+		name: m.stats_rtt_title,
+		stroke: "#22a2f2",
+	},
+];
+
 /** The QUIC round trip to the client, in ms — the network's share of the picture. */
 export function RttChart({ samples }: { samples: StatsSample[] }) {
-	const rows = useMemo(
-		() =>
-			withSessionBreaks(
-				samples,
-				samples.map((s) => ({ t: tSeconds(s), rtt: toMs(s.rtt_us) })),
-			),
-		[samples],
-	);
 	return (
-		<ChartFrame>
-			<LineChart data={rows} margin={{ top: 6, right: 8, left: 0, bottom: 0 }}>
-				<CartesianGrid strokeDasharray="3 3" stroke={gridStroke} />
-				<XAxis {...timeAxis} />
-				<YAxis
-					tick={axisTick}
-					stroke={gridStroke}
-					width={56}
-					unit={` ${m.stats_latency_axis()}`}
-					domain={[0, (max: number) => Math.max(max, 1)]}
-					tickFormatter={(v: number) => msTick(v)}
-				/>
-				<Tooltip
-					contentStyle={tooltipStyle}
-					formatter={(v) => dur(Number(v) * 1000)}
-					labelFormatter={secondsLabel}
-				/>
-				<Line
-					type="monotone"
-					dataKey="rtt"
-					name={m.stats_rtt_title()}
-					stroke="#22a2f2"
-					dot={false}
-					isAnimationActive={false}
-				/>
-			</LineChart>
-		</ChartFrame>
+		<SeriesChart
+			samples={samples}
+			series={RTT}
+			y={{
+				width: 56,
+				floor: 1,
+				unit: ` ${m.stats_latency_axis()}`,
+				tick: (v) => msTick(v),
+			}}
+			format={(v) => dur(v * 1000)}
+			legend={false}
+		/>
 	);
 }
 
@@ -551,58 +568,35 @@ export function hasSendSplit(samples: StatsSample[]): boolean {
 	);
 }
 
-const SEND_SPLIT = [
-	{ key: "fec_us", color: "#8b5cf6", label: () => m.stats_send_fec() },
-	{ key: "seal_us", color: "#f59e0b", label: () => m.stats_send_seal() },
-	{ key: "sock_us", color: "#10b981", label: () => m.stats_send_sock() },
-] as const;
+const SEND_SPLIT: readonly Counter[] = [
+	{
+		key: "fec_us",
+		pick: (s) => s.fec_us,
+		name: m.stats_send_fec,
+		stroke: "#8b5cf6",
+	},
+	{
+		key: "seal_us",
+		pick: (s) => s.seal_us,
+		name: m.stats_send_seal,
+		stroke: "#f59e0b",
+	},
+	{
+		key: "sock_us",
+		pick: (s) => s.sock_us,
+		name: m.stats_send_sock,
+		stroke: "#10b981",
+	},
+];
 
 /** What sealing one frame costs, in µs: parity, encryption, the socket. Sub-millisecond by nature. */
 export function SendSplitChart({ samples }: { samples: StatsSample[] }) {
-	const rows = useMemo(
-		() =>
-			withSessionBreaks(
-				samples,
-				samples.map((s) => ({
-					t: tSeconds(s),
-					fec_us: s.fec_us ?? null,
-					seal_us: s.seal_us ?? null,
-					sock_us: s.sock_us ?? null,
-				})),
-			),
-		[samples],
-	);
 	return (
-		<ChartFrame>
-			<LineChart data={rows} margin={{ top: 6, right: 8, left: 0, bottom: 0 }}>
-				<CartesianGrid strokeDasharray="3 3" stroke={gridStroke} />
-				<XAxis {...timeAxis} />
-				<YAxis
-					tick={axisTick}
-					stroke={gridStroke}
-					width={56}
-					unit=" µs"
-					domain={[0, (max: number) => Math.max(max, 10)]}
-					tickFormatter={(v: number) => fmtNumber(v)}
-				/>
-				<Tooltip
-					contentStyle={tooltipStyle}
-					formatter={(v) => dur(Number(v))}
-					labelFormatter={secondsLabel}
-				/>
-				<Legend wrapperStyle={legendStyle} />
-				{SEND_SPLIT.map((s) => (
-					<Line
-						key={s.key}
-						type="monotone"
-						dataKey={s.key}
-						name={s.label()}
-						stroke={s.color}
-						dot={false}
-						isAnimationActive={false}
-					/>
-				))}
-			</LineChart>
-		</ChartFrame>
+		<SeriesChart
+			samples={samples}
+			series={SEND_SPLIT}
+			y={{ width: 56, floor: 10, unit: " µs", tick: (v) => fmtNumber(v) }}
+			format={(v) => dur(v)}
+		/>
 	);
 }

@@ -9,7 +9,7 @@
 //! Two calls: start, then poll. Both are cheap and non-blocking, so Kotlin can drive them from a
 //! coroutine on the main thread the way it polls the stats HUD.
 
-use super::{get_session, jni_guard};
+use super::{jni_guard, SESSIONS};
 use jni::errors::LogErrorAndDefault;
 use jni::objects::{JDoubleArray, JObject};
 use jni::sys::{jboolean, jint, jlong};
@@ -33,7 +33,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSpeedTest(
     duration_ms: jint,
 ) -> jboolean {
     jni_guard(false, || {
-        let Some(h) = get_session(handle) else {
+        let Some(h) = SESSIONS.get(handle) else {
             return false;
         };
         let target = target_kbps.clamp(0, i32::MAX) as u32;
@@ -62,7 +62,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeProbeResult
     // `JDoubleArray::default()` is the null reference the old `JObject::null().into_raw()` returned,
     // so Kotlin still reads `null` on every failure path.
     env.with_env(|env| -> jni::errors::Result<JDoubleArray<'local>> {
-        let Some(h) = get_session(handle) else {
+        let Some(h) = SESSIONS.get(handle) else {
             return Ok(JDoubleArray::default());
         };
         let r = h.client.probe_result();

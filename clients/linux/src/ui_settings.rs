@@ -1331,580 +1331,213 @@ pub fn show_scoped(
     dialog.set_content_width(830);
     let inline = gamescope_session();
 
-    // ---- Display: Resolution ----
-    // The D1 tri-state: Native, Match window (a virtual index 1, stored as the
-    // `match_window` flag), then the sizes of the family the Aspect row picks.
-    let res_names = resolution_names(0);
-    let res_row = ChoiceRow::new(
-        &dialog,
-        inline,
-        "Resolution",
-        resolution_caption(0),
-        &res_names.iter().map(String::as_str).collect::<Vec<_>>(),
-    );
-    {
-        let w = res_row.widget().clone();
-        res_row.connect_changed(move |i| set_row_subtitle(&w, resolution_caption(i)));
-    }
-    let aspect_row = ChoiceRow::new(
-        &dialog,
-        inline,
-        "Aspect ratio",
-        "Which shapes the Resolution row offers",
-        &ASPECTS.iter().map(|a| a.label).collect::<Vec<_>>(),
-    );
-    // The family the Resolution row lists right now; only the handler below moves it.
-    let shown_family = Rc::new(Cell::new(0usize));
-    {
-        let (res, shown) = (res_row.clone(), shown_family.clone());
-        aspect_row.connect_changed(move |g| {
-            // Re-list the family and land on its size nearest the one shown, so the two
-            // rows never disagree. Native and Match window count as 1080 (`nearest`).
-            let g = g as usize;
-            let h = (res.selected() as usize)
-                .checked_sub(2)
-                .and_then(|i| ASPECTS[shown.get()].sizes.get(i))
-                .map_or(0, |&(_, h)| h);
-            shown.set(g);
-            res.set_options(&resolution_names(g));
-            let target = nearest(g, h);
-            let i = ASPECTS[g].sizes.iter().position(|&wh| wh == target);
-            res.set_selected(i.map_or(0, |i| i as u32 + 2));
-        });
-    }
-    let hz_names: Vec<String> = REFRESH
-        .iter()
-        .map(|&r| {
-            if r == 0 {
-                "Native".to_string()
-            } else {
-                format!("{r} Hz")
-            }
-        })
-        .collect();
-    let hz_row = ChoiceRow::new(
-        &dialog,
-        inline,
-        "Refresh rate",
-        "Native follows the monitor the window is on",
-        &hz_names.iter().map(String::as_str).collect::<Vec<_>>(),
-    );
-
-    // ---- Display: Quality ----
-    let scale_names: Vec<String> = RENDER_SCALES
-        .iter()
-        .map(|&s| render_scale_label(s))
-        .collect();
-    let scale_row = ChoiceRow::new(
-        &dialog,
-        inline,
-        "Render scale",
-        "Above 1× supersamples for sharpness; below is lighter on the host",
-        &scale_names.iter().map(String::as_str).collect::<Vec<_>>(),
-    );
-    // 1 Mbit/s per step: the rungs that matter on a thin link are 3, 4, 6 — a 5-wide step
-    // could not name any of them, and typing was the only way to reach one.
-    let bitrate_row = adw::SpinRow::with_range(0.0, 3000.0, 1.0);
-    bitrate_row.set_title("Bitrate");
-    bitrate_row
-        .set_subtitle("Mbit/s · 0 = host default · a host card's menu has a network speed test");
-    let codec_row = ChoiceRow::new(
-        &dialog,
-        inline,
-        "Video codec",
-        codec_caption(0),
-        CODEC_LABELS,
-    );
-    {
-        let w = codec_row.widget().clone();
-        codec_row.connect_changed(move |i| set_row_subtitle(&w, codec_caption(i)));
-    }
-    let hdr_row = adw::SwitchRow::builder()
-        .title("10-bit HDR")
-        .subtitle(
-            "Advertise 10-bit HDR10 so the host upgrades HDR content — shown in HDR where \
-             the display supports it, tone-mapped otherwise",
-        )
-        .build();
-    let chroma_row = adw::SwitchRow::builder()
-        .title("Full chroma (4:4:4)")
-        .subtitle(
-            "Full-colour video: crisp small text and thin lines, at more bandwidth. HEVC \
-             only, and only where the host can encode it.",
-        )
-        .build();
-    let ten_bit_sdr_row = adw::SwitchRow::builder()
-        .title("10-bit SDR")
-        .subtitle(
-            "Smoother gradients without HDR \u{2014} 10-bit encoding precision. Needs an \
-             NVIDIA host; HDR takes over when it engages.",
-        )
-        .build();
-    let decoder_row = ChoiceRow::new(
-        &dialog,
-        inline,
-        "Video decoder",
-        "Automatic picks the best hardware decode, then software",
-        &["Automatic", "Vulkan Video", "VAAPI", "Software"],
-    );
-    // GPU picker (multi-GPU boxes): the adapter name feeds the session's device pick
-    // via `Settings::adapter` → PUNKTFUNK_VK_ADAPTER. Hidden when there's nothing to
-    // pick; a saved adapter that's gone (eGPU unplugged) keeps a revertable entry.
-    let saved_adapter = seed.adapter.clone();
-    let mut gpu_names = vec!["Automatic".to_string()];
-    let mut gpu_keys: Vec<String> = vec![String::new()];
-    for a in &probes.adapters {
-        gpu_names.push(a.clone());
-        gpu_keys.push(a.clone());
-    }
-    if !saved_adapter.is_empty() && !gpu_keys.contains(&saved_adapter) {
-        gpu_names.push(format!("{saved_adapter} (not detected)"));
-        gpu_keys.push(saved_adapter.clone());
-    }
-    let gpu_row = (gpu_keys.len() > 1).then(|| {
-        let row = ChoiceRow::new(
-            &dialog,
-            inline,
-            "GPU",
-            "Decodes and presents the stream",
-            &gpu_names.iter().map(String::as_str).collect::<Vec<_>>(),
-        );
-        let i = gpu_keys
-            .iter()
-            .position(|k| k == &saved_adapter)
-            .unwrap_or(0);
-        row.set_selected(i as u32);
-        row
-    });
-
-    // ---- Display: Presentation ----
-    // The intent pair the Apple and Android clients already carry. The buffer row only
-    // means anything under Smoothness, so it hides itself the rest of the time rather
-    // than sitting there inert.
-    let fit_row = ChoiceRow::new(
-        &dialog,
-        inline,
-        "Picture fit",
-        VIDEO_FIT_CAPTIONS[0],
-        VIDEO_FIT_LABELS,
-    );
-    {
-        let w = fit_row.widget().clone();
-        fit_row.connect_changed(move |i| {
-            set_row_subtitle(
-                &w,
-                VIDEO_FIT_CAPTIONS[(i as usize).min(VIDEO_FITS.len() - 1)],
-            );
-        });
-    }
-    let present_row = ChoiceRow::new(
-        &dialog,
-        inline,
-        "Prioritize",
-        PRESENT_PRIORITY_CAPTIONS[0],
-        PRESENT_PRIORITY_LABELS,
-    );
-    let buffer_row = ChoiceRow::new(
-        &dialog,
-        inline,
-        "Smoothness buffer",
-        "Each frame held absorbs one refresh of hiccup and adds one of delay",
-        SMOOTH_BUFFER_LABELS,
-    );
-    {
-        let w = present_row.widget().clone();
-        let buffer = buffer_row.widget().clone();
-        present_row.connect_changed(move |i| {
-            let i = (i as usize).min(PRESENT_PRIORITY_CAPTIONS.len() - 1);
-            set_row_subtitle(&w, PRESENT_PRIORITY_CAPTIONS[i]);
-            buffer.set_visible(PRESENT_PRIORITIES[i] == "smooth");
-        });
-    }
-    let vsync_row = adw::SwitchRow::builder()
-        .title("V-Sync")
-        .subtitle(
-            "Tear-free. Turning it off removes the wait for the screen's refresh — the \
-             lowest possible delay, at the cost of visible tearing. Not every driver \
-             offers it; the stats overlay names the mode actually in use",
-        )
-        .build();
-    let vrr_row = adw::SwitchRow::builder()
-        .title("Follow variable refresh rate")
-        .subtitle(
-            "On a VRR/FreeSync/G-Sync screen, let the panel refresh in step with the \
-             stream instead of on a fixed cadence. Applies to fullscreen sessions; \
-             harmless on a fixed-refresh screen",
-        )
-        .build();
-
-    // ---- Display: Host output ----
-    let compositor_row = ChoiceRow::new(
-        &dialog,
-        inline,
-        "Host compositor",
-        "Advisory — the host falls back to auto-detect when unavailable",
-        &[
-            "Automatic",
-            "KWin",
-            "Mutter (GNOME)",
-            "Hyprland",
-            "wlroots (Sway/River)",
-            "gamescope",
-        ],
-    );
-
-    // ---- General ----
-    let fullscreen_row = adw::SwitchRow::builder()
-        .title("Start streams in fullscreen")
-        .subtitle("F11, the mouse at the top edge, or L1+R1+Start+Select lead back out")
-        .build();
-    let theme_row = adw::SwitchRow::builder()
-        .title("Follow the Omarchy theme")
-        .subtitle("Colours track omarchy-theme-set live — off keeps Punktfunk's own look")
-        .build();
-    let menu_row = adw::SwitchRow::builder()
-        .title("Hosts in the Omarchy menu")
-        .subtitle(
-            "Super+Space: connect, wake, the console — this writes rows to omarchy-menu.jsonc",
-        )
-        .build();
-    let wake_row = adw::SwitchRow::builder()
-        .title("Auto-wake on connect")
-        .subtitle(
-            "Sends Wake-on-LAN to an offline saved host and waits for it to boot — turn \
-             off if hosts behind a VPN look offline when they aren't",
-        )
-        .build();
-    // Where a bare launch opens. The subtitle names the resolved host, because with no default
-    // host every value lands on the list and the row would otherwise promise a shelf.
-    let start_in_row = ChoiceRow::new(
-        &dialog,
-        inline,
-        "Start in",
-        &start_in_subtitle(),
-        &start::StartIn::ALL.map(start::StartIn::label),
-    );
-    let stats_row = ChoiceRow::new(
-        &dialog,
-        inline,
-        "Statistics overlay",
-        "Compact = fps · latency · bitrate in one line — Ctrl+Alt+Shift+S cycles the tiers live",
-        &["Off", "Compact", "Normal", "Detailed"],
-    );
-    let adv_stats_row = adw::SwitchRow::builder()
-        .title("Advanced statistics")
-        .subtitle(
-            "Off shows the figures Moonlight's overlay also shows. On shows capture to glass \
-             as p50/p95 and every stage between",
-        )
-        .build();
-    let stats_docs_row = adw::ActionRow::builder()
-        .title("What each number means")
-        .subtitle("docs.punktfunk.unom.io/docs/stats")
-        .activatable(true)
-        .build();
-    stats_docs_row.add_suffix(&gtk::Image::from_icon_name("adw-external-link-symbolic"));
-    stats_docs_row.connect_activated(|_| {
-        gtk::UriLauncher::new("https://docs.punktfunk.unom.io/docs/stats").launch(
-            None::<&gtk::Window>,
-            gtk::gio::Cancellable::NONE,
-            |_| {},
-        );
-    });
-
-    // ---- Storage ----
-    let clear_art_row = adw::ActionRow::builder()
-        .title("Clear cached art")
-        .subtitle("Posters are kept on this device so a library opens before the host answers")
-        .activatable(true)
-        .build();
-    clear_art_row.add_suffix(&crate::lucide::row_icon("trash-2"));
-    {
-        let dialog = dialog.downgrade();
-        clear_art_row.connect_activated(move |_| {
-            let toast = match pf_client_core::art_cache::clear() {
-                Ok(()) => "Cached art cleared".to_string(),
-                Err(e) => format!("Couldn't clear the cached art — {e}"),
-            };
-            if let Some(d) = dialog.upgrade() {
-                d.add_toast(adw::Toast::new(&toast));
-            }
-        });
-    }
-
-    // ---- Input ----
-    let touch_row = ChoiceRow::new(
-        &dialog,
-        inline,
-        "Touch input",
-        TOUCH_MODE_CAPTIONS[0],
-        TOUCH_MODE_LABELS,
-    );
-    // Dynamic caption: describe the SELECTED mode, not every mode at once.
-    {
-        let w = touch_row.widget().clone();
-        touch_row.connect_changed(move |i| {
-            let i = (i as usize).min(TOUCH_MODE_CAPTIONS.len() - 1);
-            set_row_subtitle(&w, TOUCH_MODE_CAPTIONS[i]);
-        });
-    }
-    let mouse_row = ChoiceRow::new(
-        &dialog,
-        inline,
-        "Mouse input",
-        MOUSE_MODE_CAPTIONS[0],
-        MOUSE_MODE_LABELS,
-    );
-    {
-        let w = mouse_row.widget().clone();
-        mouse_row.connect_changed(move |i| {
-            let i = (i as usize).min(MOUSE_MODE_CAPTIONS.len() - 1);
-            set_row_subtitle(&w, MOUSE_MODE_CAPTIONS[i]);
-        });
-    }
-    let inhibit_row = adw::SwitchRow::builder()
-        .title("Capture system shortcuts")
-        .subtitle("Forward Alt+Tab, Super, … to the host while input is captured")
-        .build();
-    let invert_row = adw::SwitchRow::builder()
-        .title("Invert scroll direction")
-        .subtitle("Reverses the wheel and trackpad scroll direction sent to the host")
-        .build();
-
-    // ---- Audio ----
-    let surround_row = ChoiceRow::new(
-        &dialog,
-        inline,
-        "Audio channels",
-        "Stereo or surround — the host downmixes if its output has fewer",
-        &["Stereo", "5.1 Surround", "7.1 Surround"],
-    );
-    let audio_format_labels: Vec<&str> = AUDIO_FORMATS.iter().map(|(_, l)| *l).collect();
-    let audio_format_row = ChoiceRow::new(
-        &dialog,
-        inline,
-        "Audio format",
-        "Lossless is uncompressed PCM — 2.3–4.6 Mb/s off the top of the link, and the host has \
-         its own switch",
-        &audio_format_labels,
-    );
-    {
-        // Lossless is stereo-only: a lossless surround frame does not fit one QUIC datagram at
-        // the default MTU and the host declines it (design/hi-res-audio.md §4.2). Greyed, not
-        // hidden, so the reason stays beside the channel row that caused it. Insensitivity also
-        // covers the row's per-preset Reset, so an audio_format override can only be reset
-        // while the channels row says Stereo.
-        let w = audio_format_row.widget().clone();
-        w.set_sensitive(surround_row.selected() == 0);
-        surround_row.connect_changed(move |i| w.set_sensitive(i == 0));
-    }
-    let keep_host_audio_row = adw::SwitchRow::builder()
-        .title("Keep host audio playing")
-        .subtitle("The host's speakers or headphones keep playing while you stream — needs a host on 0.32+")
-        .build();
-    let mic_row = adw::SwitchRow::builder()
-        .title("Stream microphone")
-        .subtitle("Sends your microphone to the host's virtual mic — Ctrl+Alt+Shift+V mutes it mid-stream")
-        .build();
-    let echo_row = adw::SwitchRow::builder()
-        .title("Echo cancellation")
-        .subtitle("Keeps the host's audio, playing from this machine's speakers, out of the uplink")
-        .build();
-    // Endpoint pickers (from the PipeWire probe): visible labels are descriptions, the
-    // stored value is the node name. Hidden when the probe found nothing; a saved
-    // device that's gone keeps a revertable "(not detected)" entry, like the GPU row.
-    let dev_row = |saved: String,
-                   devs: &[pf_client_core::audio::AudioDevice],
-                   title: &str,
-                   subtitle: &str| {
-        let mut names = vec!["System default".to_string()];
-        let mut keys = vec![String::new()];
-        for d in devs {
-            names.push(d.description.clone());
-            keys.push(d.name.clone());
-        }
-        if !saved.is_empty() && !keys.contains(&saved) {
-            names.push(format!("{saved} (not detected)"));
-            keys.push(saved.clone());
-        }
-        let row = (keys.len() > 1).then(|| {
-            let row = ChoiceRow::new(
-                &dialog,
-                inline,
-                title,
-                subtitle,
-                &names.iter().map(String::as_str).collect::<Vec<_>>(),
-            );
-            row.set_selected(keys.iter().position(|k| k == &saved).unwrap_or(0) as u32);
-            row
-        });
-        (row, keys)
+    let rows = Rows {
+        display: display_rows(&dialog, inline, &seed, probes),
+        general: general_rows(&dialog, inline),
+        input: input_rows(&dialog, inline),
+        audio: audio_rows(&dialog, inline, &globals, probes),
+        pads: pad_rows(&dialog, inline, gamepads, &globals, &seed),
+        quick,
     };
-    let (speaker_row, speaker_keys) = dev_row(
-        settings.borrow().speaker_device.clone(),
-        &probes.speakers,
-        "Speaker",
-        "Host audio plays here — System default follows the desktop",
-    );
-    let (micdev_row, micdev_keys) = dev_row(
-        settings.borrow().mic_device.clone(),
-        &probes.mics,
-        "Microphone",
-        "The input that feeds the host's virtual mic",
-    );
-    // The mic device picker and the echo canceller follow the mic switch; the seed's
-    // `set_active` fires the handler only when it changes the switch, so set the initial
-    // state here too. Desensitising the whole row disables the per-row Reset a preset scope
-    // adds, so an echo_cancel override can only be reset while the mic row is on.
-    if let Some(r) = &micdev_row {
-        let w = r.widget().clone();
-        w.set_sensitive(mic_row.is_active());
-        mic_row.connect_active_notify(move |m| w.set_sensitive(m.is_active()));
+    rows.seed(&seed);
+    // Wired after the seed: `set_selected` and `set_active` during setup must not read as a
+    // touch, or opening a preset overrides everything.
+    if let Some(active) = &active {
+        rows.wire_overrides(&dialog, active, &globals, &touched);
     }
-    {
-        let w = echo_row.clone();
-        w.set_sensitive(mic_row.is_active());
-        mic_row.connect_active_notify(move |m| w.set_sensitive(m.is_active()));
-    }
+    // The scope switcher heads the first page — the one row that is always about which layer
+    // you are editing, not about the stream.
+    let switcher = scope_group(
+        &dialog,
+        inline,
+        &scope,
+        &catalog,
+        active.as_ref(),
+        &next_scope,
+        &pending_dup,
+        parent,
+    );
+    add_pages(&dialog, &rows, switcher, preset_mode);
 
-    // ---- Controllers ----
-    // Automatic forwards every real controller as its own pad (Steam's virtual pad skipped);
-    // pinning one forces single-player. The pin persists by stable key (`Settings::forward_pad`),
-    // so an offline pinned pad keeps its entry here. Off sends nothing and never opens the pad,
-    // which frees it for USB passthrough — so the two rows below are desensitised.
-    let pad_forward_row = adw::SwitchRow::builder()
-        .title("Forward controllers")
-        .subtitle(
-            "Send this device's controllers to the host — off if it already has them another way",
-        )
-        .build();
-    let pads = gamepads.pads();
-    let saved_pin = settings.borrow().forward_pad.clone();
-    let mut pad_names = vec!["Automatic (all controllers)".to_string()];
-    let mut pad_keys: Vec<String> = Vec::new();
-    for p in &pads {
-        let kind = p.kind_label();
-        pad_names.push(if kind.is_empty() {
-            p.name.clone()
-        } else {
-            format!("{} · {kind}", p.name)
-        });
-        pad_keys.push(p.key.clone());
-    }
-    if !saved_pin.is_empty() && !pad_keys.contains(&saved_pin) {
-        let name = saved_pin
-            .splitn(3, ':')
-            .nth(2)
-            .unwrap_or("Saved controller");
-        pad_names.push(format!("{name} (not connected)"));
-        pad_keys.push(saved_pin.clone());
-    }
-    let forward_row = ChoiceRow::new(
-        &dialog,
-        inline,
-        "Forwarded controller",
-        if pads.is_empty() {
-            "No controllers detected"
-        } else {
-            "Every pad is its own player — pick one to force single-player"
-        },
-        &pad_names.iter().map(String::as_str).collect::<Vec<_>>(),
-    );
-    let pinned_i = pad_keys
-        .iter()
-        .position(|k| k == &saved_pin)
-        .map_or(0, |i| i + 1);
-    forward_row.set_selected(pinned_i as u32);
-    // The dialog-local choice, written into Settings on close (reading the service back
-    // would race its worker thread applying the Pin message).
-    let chosen_pin: Rc<RefCell<String>> = Rc::new(RefCell::new(saved_pin));
-    {
-        let svc = gamepads.clone();
-        let keys = pad_keys.clone();
-        let chosen = chosen_pin.clone();
-        forward_row.connect_changed(move |sel| {
-            let key = if sel == 0 {
-                None
-            } else {
-                keys.get(sel as usize - 1).cloned()
-            };
-            *chosen.borrow_mut() = key.clone().unwrap_or_default();
-            svc.set_pinned(key);
-        });
-    }
-    let pad_row = ChoiceRow::new(
-        &dialog,
-        inline,
-        "Gamepad type",
-        "The virtual pad on the host — Automatic matches your controller. An X-Box type has no \
-         gyroscope, so pick a DualSense-class one if you want motion.",
-        &[
-            "Automatic",
-            "Xbox 360",
-            "DualSense",
-            "Xbox One",
-            "DualShock 4",
-            "Steam Deck",
-            "Steam Controller 2",
-        ],
-    );
-    // Where the guide (Xbox/PS/Steam) + quick-access presses land, and the hold-Select
-    // gesture that keeps the host's guide reachable when they stay local. Desktop rarely
-    // needs either off Automatic — they exist here because presets are authored on the
-    // desktop and applied everywhere, Gaming Mode included.
-    let sysbtn_row = ChoiceRow::new(
-        &dialog,
-        inline,
-        "Steam / guide button",
-        "Automatic sends it to the host, except where this device reacts to it too",
-        SYSTEM_BUTTON_LABELS,
-    );
-    let gesture_row = ChoiceRow::new(
-        &dialog,
-        inline,
-        "Hold Select for guide",
-        "Hold Select alone for the host's guide button — a tap still goes through",
-        GUIDE_GESTURE_LABELS,
-    );
-    // Controller audio (the 0xD1 plane): a wired DualSense's voice coils and its own speaker,
-    // streamed from the host. Both are negotiated — nothing happens without a capable host AND
-    // a wired DualSense — so the rows say what they are for, not what they will do.
-    // Global scope only, like the forwarded-pad pin: which pad is in your hands is a property
-    // of this device, not of the host a preset is authored against.
-    let haptics_row = adw::SwitchRow::builder()
-        .title("Controller haptics")
-        .subtitle("Play a DualSense's voice-coil haptics on the pad itself — wired pads only")
-        .build();
-    let pad_speaker_row = adw::SwitchRow::builder()
-        .title("Controller speaker")
-        .subtitle("Play the audio a game sends to the pad's own speaker on the pad, not here")
-        .build();
-    // The pad rows only mean something while something is being forwarded (the same
-    // relationship mic → echo cancellation draws just above, initial state included: the
-    // seed's `set_active` fires this only when it CHANGES the switch). Controller audio
-    // belongs in that set too — forwarding off never OPENS the pad, so nothing can detect
-    // that it has an audio device, let alone render on it.
-    {
-        let (f, t) = (forward_row.widget().clone(), pad_row.widget().clone());
-        let (sb, gg) = (sysbtn_row.widget().clone(), gesture_row.widget().clone());
-        let (ha, sp) = (haptics_row.clone(), pad_speaker_row.clone());
-        for w in [&f, &t, &sb, &gg] {
-            w.set_sensitive(seed.gamepad_forwarding);
-        }
-        ha.set_sensitive(seed.gamepad_forwarding);
-        sp.set_sensitive(seed.gamepad_forwarding);
-        pad_forward_row.connect_active_notify(move |r| {
-            for w in [&f, &t, &sb, &gg] {
-                w.set_sensitive(r.is_active());
+    dialog.connect_closed(move |_| {
+        match &active {
+            // Preset scope writes the touched rows into the catalog and leaves the globals
+            // exactly as they were — the point of the whole feature.
+            Some(active) => {
+                let mut values = seed.clone();
+                rows.apply(&mut values);
+                commit_preset(active, &touched, &values);
             }
-            ha.set_sensitive(r.is_active());
-            sp.set_sensitive(r.is_active());
-        });
-    }
+            None => {
+                // Rebase on the file, not the start-of-app snapshot: other whole-file writers
+                // exist (the spawner persists `last_window_w/h`), and saving the stale snapshot
+                // would revert them. The rows carry every value this dialog owns.
+                let mut s = settings.borrow_mut();
+                *s = Settings::load();
+                rows.apply(&mut s);
+                s.save();
+            }
+        }
+        // Deferred Duplicate: the source has just been committed above, so the copy is
+        // taken from what the user was actually looking at.
+        if let Some(src) = pending_dup.borrow_mut().take() {
+            let mut catalog = PresetsFile::load();
+            if let Some(new_id) = catalog.duplicate(&src) {
+                if catalog.save().is_ok() {
+                    *next_scope.borrow_mut() = Some(Scope::Preset(new_id));
+                }
+            }
+        }
+        // A scope switch closed this dialog to commit first; now re-open in the new scope.
+        if let Some(next) = next_scope.borrow_mut().take() {
+            on_scope(next);
+        }
+        on_closed();
+    });
+    dialog.present(Some(parent));
+    dialog
+}
 
-    // ---- Seed from the effective settings for this scope ----
-    {
-        let s = &seed;
+/// Every row the dialog shows, built once per open. GTK widgets are refcounted, so the close
+/// handler owns this and reads the rows back through [`Rows::apply`].
+struct Rows {
+    display: DisplayRows,
+    general: GeneralRows,
+    input: InputRows,
+    audio: AudioRows,
+    pads: PadRows,
+    quick: crate::ui_quick_actions::QuickActions,
+}
+
+struct DisplayRows {
+    res_row: ChoiceRow,
+    aspect_row: ChoiceRow,
+    shown_family: Rc<Cell<usize>>,
+    hz_row: ChoiceRow,
+    scale_row: ChoiceRow,
+    bitrate_row: adw::SpinRow,
+    codec_row: ChoiceRow,
+    hdr_row: adw::SwitchRow,
+    chroma_row: adw::SwitchRow,
+    ten_bit_sdr_row: adw::SwitchRow,
+    decoder_row: ChoiceRow,
+    gpu_row: Option<ChoiceRow>,
+    gpu_keys: Vec<String>,
+    fit_row: ChoiceRow,
+    present_row: ChoiceRow,
+    buffer_row: ChoiceRow,
+    vsync_row: adw::SwitchRow,
+    vrr_row: adw::SwitchRow,
+    compositor_row: ChoiceRow,
+}
+
+struct GeneralRows {
+    fullscreen_row: adw::SwitchRow,
+    theme_row: adw::SwitchRow,
+    menu_row: adw::SwitchRow,
+    wake_row: adw::SwitchRow,
+    start_in_row: ChoiceRow,
+    stats_row: ChoiceRow,
+    adv_stats_row: adw::SwitchRow,
+    stats_docs_row: adw::ActionRow,
+    clear_art_row: adw::ActionRow,
+}
+
+struct InputRows {
+    touch_row: ChoiceRow,
+    mouse_row: ChoiceRow,
+    inhibit_row: adw::SwitchRow,
+    invert_row: adw::SwitchRow,
+}
+
+struct AudioRows {
+    surround_row: ChoiceRow,
+    audio_format_row: ChoiceRow,
+    keep_host_audio_row: adw::SwitchRow,
+    mic_row: adw::SwitchRow,
+    echo_row: adw::SwitchRow,
+    speaker_row: Option<ChoiceRow>,
+    speaker_keys: Vec<String>,
+    micdev_row: Option<ChoiceRow>,
+    micdev_keys: Vec<String>,
+}
+
+struct PadRows {
+    pad_forward_row: adw::SwitchRow,
+    pads: Vec<crate::gamepad::PadInfo>,
+    forward_row: ChoiceRow,
+    chosen_pin: Rc<RefCell<String>>,
+    pad_row: ChoiceRow,
+    sysbtn_row: ChoiceRow,
+    gesture_row: ChoiceRow,
+    haptics_row: adw::SwitchRow,
+    pad_speaker_row: adw::SwitchRow,
+}
+
+impl Rows {
+    /// Seeds every row from the effective settings for this scope.
+    fn seed(&self, s: &Settings) {
+        let Rows {
+            display:
+                DisplayRows {
+                    res_row,
+                    aspect_row,
+                    hz_row,
+                    scale_row,
+                    bitrate_row,
+                    codec_row,
+                    hdr_row,
+                    chroma_row,
+                    ten_bit_sdr_row,
+                    decoder_row,
+                    fit_row,
+                    present_row,
+                    buffer_row,
+                    vsync_row,
+                    vrr_row,
+                    compositor_row,
+                    ..
+                },
+            general:
+                GeneralRows {
+                    fullscreen_row,
+                    theme_row,
+                    menu_row,
+                    wake_row,
+                    start_in_row,
+                    stats_row,
+                    adv_stats_row,
+                    ..
+                },
+            input:
+                InputRows {
+                    touch_row,
+                    mouse_row,
+                    inhibit_row,
+                    invert_row,
+                    ..
+                },
+            audio:
+                AudioRows {
+                    surround_row,
+                    audio_format_row,
+                    keep_host_audio_row,
+                    mic_row,
+                    echo_row,
+                    ..
+                },
+            pads:
+                PadRows {
+                    pad_forward_row,
+                    pad_row,
+                    sysbtn_row,
+                    gesture_row,
+                    haptics_row,
+                    pad_speaker_row,
+                    ..
+                },
+            ..
+        } = self;
         aspect_row.set_selected(index::aspect(s)); // re-lists `res_row` for the family
         let res_i = index::resolution(s);
         res_row.set_selected(res_i);
@@ -1981,12 +1614,71 @@ pub fn show_scoped(
         vrr_row.set_active(s.allow_vrr);
     }
 
-    // ---- Override markers, per-row reset, and the touch that creates an override ----
-    // One pass per row: the marker appears on touch, and reset acts in place — it clears the
-    // field, restores the inherited value and drops the marker, because the model never infers
-    // "not overridden" from a value comparison. Wired after the seed block: `set_selected` and
-    // `set_active` during setup must not read as a touch, or opening a preset overrides everything.
-    if let Some(active) = &active {
+    /// Override markers, per-row reset, and the touch that creates an override. One pass per
+    /// row: the marker appears on touch, and reset acts in place — it clears the field,
+    /// restores the inherited value and drops the marker, because the model never infers
+    /// "not overridden" from a value comparison.
+    fn wire_overrides(
+        &self,
+        dialog: &adw::PreferencesDialog,
+        active: &StreamPreset,
+        globals: &Settings,
+        touched: &Touched,
+    ) {
+        let Rows {
+            display:
+                DisplayRows {
+                    res_row,
+                    aspect_row,
+                    hz_row,
+                    scale_row,
+                    bitrate_row,
+                    codec_row,
+                    hdr_row,
+                    chroma_row,
+                    ten_bit_sdr_row,
+                    fit_row,
+                    present_row,
+                    buffer_row,
+                    vsync_row,
+                    vrr_row,
+                    compositor_row,
+                    ..
+                },
+            general:
+                GeneralRows {
+                    fullscreen_row,
+                    stats_row,
+                    ..
+                },
+            input:
+                InputRows {
+                    touch_row,
+                    mouse_row,
+                    inhibit_row,
+                    invert_row,
+                    ..
+                },
+            audio:
+                AudioRows {
+                    surround_row,
+                    audio_format_row,
+                    keep_host_audio_row,
+                    mic_row,
+                    echo_row,
+                    ..
+                },
+            pads:
+                PadRows {
+                    pad_forward_row,
+                    pad_row,
+                    sysbtn_row,
+                    gesture_row,
+                    ..
+                },
+            quick,
+            ..
+        } = self;
         let o = &active.overrides;
         let preset_id = active.id.clone();
 
@@ -2322,26 +2014,962 @@ pub fn show_scoped(
         }
     }
 
-    // ---- Assemble the category pages (the Apple revamp's map) ----
+    /// One reader for the rows, two destinations: the globals, or a preset's overrides.
+    /// Sharing it is what keeps the two scopes from interpreting the same controls
+    /// differently (the tri-state resolution row is the obvious trap).
+    fn apply(&self, s: &mut Settings) {
+        let Rows {
+            display:
+                DisplayRows {
+                    res_row,
+                    shown_family,
+                    hz_row,
+                    scale_row,
+                    bitrate_row,
+                    codec_row,
+                    hdr_row,
+                    chroma_row,
+                    ten_bit_sdr_row,
+                    decoder_row,
+                    gpu_row,
+                    gpu_keys,
+                    fit_row,
+                    present_row,
+                    buffer_row,
+                    vsync_row,
+                    vrr_row,
+                    compositor_row,
+                    ..
+                },
+            general:
+                GeneralRows {
+                    fullscreen_row,
+                    theme_row,
+                    menu_row,
+                    wake_row,
+                    start_in_row,
+                    stats_row,
+                    adv_stats_row,
+                    ..
+                },
+            input:
+                InputRows {
+                    touch_row,
+                    mouse_row,
+                    inhibit_row,
+                    invert_row,
+                    ..
+                },
+            audio:
+                AudioRows {
+                    surround_row,
+                    audio_format_row,
+                    keep_host_audio_row,
+                    mic_row,
+                    echo_row,
+                    speaker_row,
+                    speaker_keys,
+                    micdev_row,
+                    micdev_keys,
+                    ..
+                },
+            pads:
+                PadRows {
+                    pad_forward_row,
+                    chosen_pin,
+                    pad_row,
+                    sysbtn_row,
+                    gesture_row,
+                    haptics_row,
+                    pad_speaker_row,
+                    ..
+                },
+            quick,
+            ..
+        } = self;
+        // A value these tables cannot list (a size typed into another client's custom
+        // fields, a refresh rate off the ladder) displays as the fallback rung, so writing
+        // it back erases it just by opening and closing. Write only what a table lists, or
+        // what moved — the rule the gamepad and pad-speaker rows below already follow.
+        let listed_res = s.match_window
+            || (s.width, s.height) == (0, 0)
+            || ASPECTS
+                .iter()
+                .any(|a| a.sizes.contains(&(s.width, s.height)));
+        let (seed_res, seed_hz, seed_scale) = (
+            index::resolution(s),
+            index::refresh(s),
+            index::render_scale(s),
+        );
+        // Index 1 is the virtual "Match window" option; 0 = Native, 2.. = the listed
+        // family's sizes.
+        let sizes = ASPECTS[shown_family.get()].sizes;
+        let res_i = (res_row.selected() as usize).min(sizes.len() + 1);
+        if listed_res || res_i as u32 != seed_res {
+            s.match_window = res_i == 1;
+            (s.width, s.height) = if res_i <= 1 { (0, 0) } else { sizes[res_i - 2] };
+        }
+        let hz_i = (hz_row.selected() as usize).min(REFRESH.len() - 1);
+        if REFRESH.contains(&s.refresh_hz) || hz_i as u32 != seed_hz {
+            s.refresh_hz = REFRESH[hz_i];
+        }
+        let scale_i = (scale_row.selected() as usize).min(RENDER_SCALES.len() - 1);
+        let listed_scale = RENDER_SCALES
+            .iter()
+            .any(|&x| (x - s.render_scale).abs() < 1e-6);
+        if listed_scale || scale_i as u32 != seed_scale {
+            s.render_scale = RENDER_SCALES[scale_i];
+        }
+        s.bitrate_kbps = (bitrate_row.value() * 1000.0) as u32;
+        // Keep a stored preference this table doesn't list (e.g. "switchpro" — valid to the
+        // session, hand-edited or written by another client): it displays as "Automatic", and
+        // writing that back would silently erase it just by opening + closing the dialog.
+        // Persist the row only when the user picked a non-Auto entry or the stored value was
+        // a listed one to begin with.
+        let pad_sel = (pad_row.selected() as usize).min(GAMEPADS.len() - 1);
+        if pad_sel != 0 || GAMEPADS.contains(&s.gamepad.as_str()) {
+            s.gamepad = GAMEPADS[pad_sel].to_string();
+        }
+        s.system_buttons = SYSTEM_BUTTONS
+            [(sysbtn_row.selected() as usize).min(SYSTEM_BUTTONS.len() - 1)]
+        .to_string();
+        s.guide_gesture = GUIDE_GESTURES
+            [(gesture_row.selected() as usize).min(GUIDE_GESTURES.len() - 1)]
+        .to_string();
+        s.touch_mode =
+            TOUCH_MODES[(touch_row.selected() as usize).min(TOUCH_MODES.len() - 1)].to_string();
+        s.mouse_mode =
+            MOUSE_MODES[(mouse_row.selected() as usize).min(MOUSE_MODES.len() - 1)].to_string();
+        s.forward_pad = chosen_pin.borrow().clone();
+        s.compositor = COMPOSITORS[(compositor_row.selected() as usize).min(COMPOSITORS.len() - 1)]
+            .to_string();
+        s.decoder = DECODERS[(decoder_row.selected() as usize).min(DECODERS.len() - 1)].to_string();
+        if let Some(r) = &gpu_row {
+            s.adapter = gpu_keys[(r.selected() as usize).min(gpu_keys.len() - 1)].clone();
+        }
+        if let Some(r) = &speaker_row {
+            s.speaker_device =
+                speaker_keys[(r.selected() as usize).min(speaker_keys.len() - 1)].clone();
+        }
+        if let Some(r) = &micdev_row {
+            s.mic_device = micdev_keys[(r.selected() as usize).min(micdev_keys.len() - 1)].clone();
+        }
+        s.set_stats_verbosity(
+            StatsVerbosity::ALL[(stats_row.selected() as usize).min(StatsVerbosity::ALL.len() - 1)],
+        );
+        s.start_in = start::StartIn::ALL
+            [(start_in_row.selected() as usize).min(start::StartIn::ALL.len() - 1)]
+        .as_str()
+        .to_string();
+        s.fullscreen_on_stream = fullscreen_row.is_active();
+        s.advanced_stats = adv_stats_row.is_active();
+        s.follow_os_theme = theme_row.is_active();
+        // Live: the switch must not wait out the shell's 2 s poll to mean something.
+        crate::omarchy::set_enabled(s.follow_os_theme);
+        // The menu switch is not a Settings field: the block's presence in the user's
+        // omarchy-menu.jsonc IS the state, so two installs can't disagree with it.
+        {
+            use pf_client_core::omarchy_menu as menu;
+            let want = menu_row.is_active();
+            let res = match (want, menu::enabled()) {
+                (true, false) => menu::enable(),
+                (false, true) => menu::disable(),
+                _ => Ok(()),
+            };
+            if let Err(e) = res {
+                tracing::warn!("omarchy menu: {e}");
+            }
+        }
+        s.auto_wake = wake_row.is_active();
+        s.inhibit_shortcuts = inhibit_row.is_active();
+        s.invert_scroll = invert_row.is_active();
+        s.gamepad_forwarding = pad_forward_row.is_active();
+        s.pad_haptics = haptics_row.is_active();
+        // `"mix"` is a stored value this switch cannot express (it renders as off today,
+        // pending the mixer leg), so writing the switch back unconditionally would erase
+        // it just by opening and closing the dialog — the same trap the gamepad-type row
+        // guards above. Only write when the user actually moved it.
+        let want_speaker = pad_speaker_row.is_active();
+        if want_speaker != pf_client_core::pad_audio::speaker_active(&s.pad_speaker) {
+            s.pad_speaker = if want_speaker { "pad" } else { "off" }.to_string();
+        }
+        s.keep_host_audio = keep_host_audio_row.is_active();
+        s.mic_enabled = mic_row.is_active();
+        s.echo_cancel = echo_row.is_active();
+        s.hdr_enabled = hdr_row.is_active();
+        s.enable_444 = chroma_row.is_active();
+        s.ten_bit_sdr = ten_bit_sdr_row.is_active();
+        s.audio_channels = match surround_row.selected() {
+            1 => 6,
+            2 => 8,
+            _ => 2,
+        };
+        // Written back whatever the channel row says. The stored choice is a preference, not
+        // a live request — clearing it because the user is on 5.1 today would lose it the
+        // moment they went back to stereo, and the session filters the pair anyway.
+        s.audio_format = AUDIO_FORMATS
+            [(audio_format_row.selected() as usize).min(AUDIO_FORMATS.len() - 1)]
+        .0
+        .to_string();
+        s.codec = CODECS[(codec_row.selected() as usize).min(CODECS.len() - 1)].to_string();
+        let fit_i = (fit_row.selected() as usize).min(VIDEO_FITS.len() - 1);
+        if VIDEO_FITS.contains(&s.video_fit.as_str()) || fit_i as u32 != index::video_fit(s) {
+            s.video_fit = VIDEO_FITS[fit_i].to_string();
+        }
+        s.present_priority = PRESENT_PRIORITIES
+            [(present_row.selected() as usize).min(PRESENT_PRIORITIES.len() - 1)]
+        .to_string();
+        // The index IS the value (0 = Automatic).
+        s.smooth_buffer = (buffer_row.selected() as u8).min(SMOOTH_BUFFER_LABELS.len() as u8 - 1);
+        s.vsync = vsync_row.is_active();
+        s.allow_vrr = vrr_row.is_active();
+        s.overlay_actions = quick.blob().borrow().clone();
+    }
+}
+
+fn display_rows(
+    dialog: &adw::PreferencesDialog,
+    inline: bool,
+    seed: &Settings,
+    probes: &DeviceProbes,
+) -> DisplayRows {
+    // ---- Display: Resolution ----
+    // The D1 tri-state: Native, Match window (a virtual index 1, stored as the
+    // `match_window` flag), then the sizes of the family the Aspect row picks.
+    let res_names = resolution_names(0);
+    let res_row = ChoiceRow::new(
+        dialog,
+        inline,
+        "Resolution",
+        resolution_caption(0),
+        &res_names.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    {
+        let w = res_row.widget().clone();
+        res_row.connect_changed(move |i| set_row_subtitle(&w, resolution_caption(i)));
+    }
+    let aspect_row = ChoiceRow::new(
+        dialog,
+        inline,
+        "Aspect ratio",
+        "Which shapes the Resolution row offers",
+        &ASPECTS.iter().map(|a| a.label).collect::<Vec<_>>(),
+    );
+    // The family the Resolution row lists right now; only the handler below moves it.
+    let shown_family = Rc::new(Cell::new(0usize));
+    {
+        let (res, shown) = (res_row.clone(), shown_family.clone());
+        aspect_row.connect_changed(move |g| {
+            // Re-list the family and land on its size nearest the one shown, so the two
+            // rows never disagree. Native and Match window count as 1080 (`nearest`).
+            let g = g as usize;
+            let h = (res.selected() as usize)
+                .checked_sub(2)
+                .and_then(|i| ASPECTS[shown.get()].sizes.get(i))
+                .map_or(0, |&(_, h)| h);
+            shown.set(g);
+            res.set_options(&resolution_names(g));
+            let target = nearest(g, h);
+            let i = ASPECTS[g].sizes.iter().position(|&wh| wh == target);
+            res.set_selected(i.map_or(0, |i| i as u32 + 2));
+        });
+    }
+    let hz_names: Vec<String> = REFRESH
+        .iter()
+        .map(|&r| {
+            if r == 0 {
+                "Native".to_string()
+            } else {
+                format!("{r} Hz")
+            }
+        })
+        .collect();
+    let hz_row = ChoiceRow::new(
+        dialog,
+        inline,
+        "Refresh rate",
+        "Native follows the monitor the window is on",
+        &hz_names.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+
+    // ---- Display: Quality ----
+    let scale_names: Vec<String> = RENDER_SCALES
+        .iter()
+        .map(|&s| render_scale_label(s))
+        .collect();
+    let scale_row = ChoiceRow::new(
+        dialog,
+        inline,
+        "Render scale",
+        "Above 1× supersamples for sharpness; below is lighter on the host",
+        &scale_names.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    // 1 Mbit/s per step: the rungs that matter on a thin link are 3, 4, 6 — a 5-wide step
+    // could not name any of them, and typing was the only way to reach one.
+    let bitrate_row = adw::SpinRow::with_range(0.0, 3000.0, 1.0);
+    bitrate_row.set_title("Bitrate");
+    bitrate_row
+        .set_subtitle("Mbit/s · 0 = host default · a host card's menu has a network speed test");
+    let codec_row = ChoiceRow::new(
+        dialog,
+        inline,
+        "Video codec",
+        codec_caption(0),
+        CODEC_LABELS,
+    );
+    {
+        let w = codec_row.widget().clone();
+        codec_row.connect_changed(move |i| set_row_subtitle(&w, codec_caption(i)));
+    }
+    let hdr_row = adw::SwitchRow::builder()
+        .title("10-bit HDR")
+        .subtitle(
+            "Advertise 10-bit HDR10 so the host upgrades HDR content — shown in HDR where \
+             the display supports it, tone-mapped otherwise",
+        )
+        .build();
+    let chroma_row = adw::SwitchRow::builder()
+        .title("Full chroma (4:4:4)")
+        .subtitle(
+            "Full-colour video: crisp small text and thin lines, at more bandwidth. HEVC \
+             only, and only where the host can encode it.",
+        )
+        .build();
+    let ten_bit_sdr_row = adw::SwitchRow::builder()
+        .title("10-bit SDR")
+        .subtitle(
+            "Smoother gradients without HDR \u{2014} 10-bit encoding precision. Needs an \
+             NVIDIA host; HDR takes over when it engages.",
+        )
+        .build();
+    let decoder_row = ChoiceRow::new(
+        dialog,
+        inline,
+        "Video decoder",
+        "Automatic picks the best hardware decode, then software",
+        &["Automatic", "Vulkan Video", "VAAPI", "Software"],
+    );
+    // GPU picker (multi-GPU boxes): the adapter name feeds the session's device pick
+    // via `Settings::adapter` → PUNKTFUNK_VK_ADAPTER. Hidden when there's nothing to
+    // pick; a saved adapter that's gone (eGPU unplugged) keeps a revertable entry.
+    let saved_adapter = seed.adapter.clone();
+    let mut gpu_names = vec!["Automatic".to_string()];
+    let mut gpu_keys: Vec<String> = vec![String::new()];
+    for a in &probes.adapters {
+        gpu_names.push(a.clone());
+        gpu_keys.push(a.clone());
+    }
+    if !saved_adapter.is_empty() && !gpu_keys.contains(&saved_adapter) {
+        gpu_names.push(format!("{saved_adapter} (not detected)"));
+        gpu_keys.push(saved_adapter.clone());
+    }
+    let gpu_row = (gpu_keys.len() > 1).then(|| {
+        let row = ChoiceRow::new(
+            dialog,
+            inline,
+            "GPU",
+            "Decodes and presents the stream",
+            &gpu_names.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        let i = gpu_keys
+            .iter()
+            .position(|k| k == &saved_adapter)
+            .unwrap_or(0);
+        row.set_selected(i as u32);
+        row
+    });
+
+    // ---- Display: Presentation ----
+    // The intent pair the Apple and Android clients already carry. The buffer row only
+    // means anything under Smoothness, so it hides itself the rest of the time rather
+    // than sitting there inert.
+    let fit_row = ChoiceRow::new(
+        dialog,
+        inline,
+        "Picture fit",
+        VIDEO_FIT_CAPTIONS[0],
+        VIDEO_FIT_LABELS,
+    );
+    {
+        let w = fit_row.widget().clone();
+        fit_row.connect_changed(move |i| {
+            set_row_subtitle(
+                &w,
+                VIDEO_FIT_CAPTIONS[(i as usize).min(VIDEO_FITS.len() - 1)],
+            );
+        });
+    }
+    let present_row = ChoiceRow::new(
+        dialog,
+        inline,
+        "Prioritize",
+        PRESENT_PRIORITY_CAPTIONS[0],
+        PRESENT_PRIORITY_LABELS,
+    );
+    let buffer_row = ChoiceRow::new(
+        dialog,
+        inline,
+        "Smoothness buffer",
+        "Each frame held absorbs one refresh of hiccup and adds one of delay",
+        SMOOTH_BUFFER_LABELS,
+    );
+    {
+        let w = present_row.widget().clone();
+        let buffer = buffer_row.widget().clone();
+        present_row.connect_changed(move |i| {
+            let i = (i as usize).min(PRESENT_PRIORITY_CAPTIONS.len() - 1);
+            set_row_subtitle(&w, PRESENT_PRIORITY_CAPTIONS[i]);
+            buffer.set_visible(PRESENT_PRIORITIES[i] == "smooth");
+        });
+    }
+    let vsync_row = adw::SwitchRow::builder()
+        .title("V-Sync")
+        .subtitle(
+            "Tear-free. Turning it off removes the wait for the screen's refresh — the \
+             lowest possible delay, at the cost of visible tearing. Not every driver \
+             offers it; the stats overlay names the mode actually in use",
+        )
+        .build();
+    let vrr_row = adw::SwitchRow::builder()
+        .title("Follow variable refresh rate")
+        .subtitle(
+            "On a VRR/FreeSync/G-Sync screen, let the panel refresh in step with the \
+             stream instead of on a fixed cadence. Applies to fullscreen sessions; \
+             harmless on a fixed-refresh screen",
+        )
+        .build();
+
+    // ---- Display: Host output ----
+    let compositor_row = ChoiceRow::new(
+        dialog,
+        inline,
+        "Host compositor",
+        "Advisory — the host falls back to auto-detect when unavailable",
+        &[
+            "Automatic",
+            "KWin",
+            "Mutter (GNOME)",
+            "Hyprland",
+            "wlroots (Sway/River)",
+            "gamescope",
+        ],
+    );
+    DisplayRows {
+        res_row,
+        aspect_row,
+        shown_family,
+        hz_row,
+        scale_row,
+        bitrate_row,
+        codec_row,
+        hdr_row,
+        chroma_row,
+        ten_bit_sdr_row,
+        decoder_row,
+        gpu_row,
+        gpu_keys,
+        fit_row,
+        present_row,
+        buffer_row,
+        vsync_row,
+        vrr_row,
+        compositor_row,
+    }
+}
+
+fn general_rows(dialog: &adw::PreferencesDialog, inline: bool) -> GeneralRows {
+    // ---- General ----
+    let fullscreen_row = adw::SwitchRow::builder()
+        .title("Start streams in fullscreen")
+        .subtitle("F11, the mouse at the top edge, or L1+R1+Start+Select lead back out")
+        .build();
+    let theme_row = adw::SwitchRow::builder()
+        .title("Follow the Omarchy theme")
+        .subtitle("Colours track omarchy-theme-set live — off keeps Punktfunk's own look")
+        .build();
+    let menu_row = adw::SwitchRow::builder()
+        .title("Hosts in the Omarchy menu")
+        .subtitle(
+            "Super+Space: connect, wake, the console — this writes rows to omarchy-menu.jsonc",
+        )
+        .build();
+    let wake_row = adw::SwitchRow::builder()
+        .title("Auto-wake on connect")
+        .subtitle(
+            "Sends Wake-on-LAN to an offline saved host and waits for it to boot — turn \
+             off if hosts behind a VPN look offline when they aren't",
+        )
+        .build();
+    // Where a bare launch opens. The subtitle names the resolved host, because with no default
+    // host every value lands on the list and the row would otherwise promise a shelf.
+    let start_in_row = ChoiceRow::new(
+        dialog,
+        inline,
+        "Start in",
+        &start_in_subtitle(),
+        &start::StartIn::ALL.map(start::StartIn::label),
+    );
+    let stats_row = ChoiceRow::new(
+        dialog,
+        inline,
+        "Statistics overlay",
+        "Compact = fps · latency · bitrate in one line — Ctrl+Alt+Shift+S cycles the tiers live",
+        &["Off", "Compact", "Normal", "Detailed"],
+    );
+    let adv_stats_row = adw::SwitchRow::builder()
+        .title("Advanced statistics")
+        .subtitle(
+            "Off shows the figures Moonlight's overlay also shows. On shows capture to glass \
+             as p50/p95 and every stage between",
+        )
+        .build();
+    let stats_docs_row = adw::ActionRow::builder()
+        .title("What each number means")
+        .subtitle("docs.punktfunk.unom.io/docs/stats")
+        .activatable(true)
+        .build();
+    stats_docs_row.add_suffix(&gtk::Image::from_icon_name("adw-external-link-symbolic"));
+    stats_docs_row.connect_activated(|_| {
+        gtk::UriLauncher::new("https://docs.punktfunk.unom.io/docs/stats").launch(
+            None::<&gtk::Window>,
+            gtk::gio::Cancellable::NONE,
+            |_| {},
+        );
+    });
+
+    // ---- Storage ----
+    let clear_art_row = adw::ActionRow::builder()
+        .title("Clear cached art")
+        .subtitle("Posters are kept on this device so a library opens before the host answers")
+        .activatable(true)
+        .build();
+    clear_art_row.add_suffix(&crate::lucide::row_icon("trash-2"));
+    {
+        let dialog = dialog.downgrade();
+        clear_art_row.connect_activated(move |_| {
+            let toast = match pf_client_core::art_cache::clear() {
+                Ok(()) => "Cached art cleared".to_string(),
+                Err(e) => format!("Couldn't clear the cached art — {e}"),
+            };
+            if let Some(d) = dialog.upgrade() {
+                d.add_toast(adw::Toast::new(&toast));
+            }
+        });
+    }
+    GeneralRows {
+        fullscreen_row,
+        theme_row,
+        menu_row,
+        wake_row,
+        start_in_row,
+        stats_row,
+        adv_stats_row,
+        stats_docs_row,
+        clear_art_row,
+    }
+}
+
+fn input_rows(dialog: &adw::PreferencesDialog, inline: bool) -> InputRows {
+    // ---- Input ----
+    let touch_row = ChoiceRow::new(
+        dialog,
+        inline,
+        "Touch input",
+        TOUCH_MODE_CAPTIONS[0],
+        TOUCH_MODE_LABELS,
+    );
+    // Dynamic caption: describe the SELECTED mode, not every mode at once.
+    {
+        let w = touch_row.widget().clone();
+        touch_row.connect_changed(move |i| {
+            let i = (i as usize).min(TOUCH_MODE_CAPTIONS.len() - 1);
+            set_row_subtitle(&w, TOUCH_MODE_CAPTIONS[i]);
+        });
+    }
+    let mouse_row = ChoiceRow::new(
+        dialog,
+        inline,
+        "Mouse input",
+        MOUSE_MODE_CAPTIONS[0],
+        MOUSE_MODE_LABELS,
+    );
+    {
+        let w = mouse_row.widget().clone();
+        mouse_row.connect_changed(move |i| {
+            let i = (i as usize).min(MOUSE_MODE_CAPTIONS.len() - 1);
+            set_row_subtitle(&w, MOUSE_MODE_CAPTIONS[i]);
+        });
+    }
+    let inhibit_row = adw::SwitchRow::builder()
+        .title("Capture system shortcuts")
+        .subtitle("Forward Alt+Tab, Super, … to the host while input is captured")
+        .build();
+    let invert_row = adw::SwitchRow::builder()
+        .title("Invert scroll direction")
+        .subtitle("Reverses the wheel and trackpad scroll direction sent to the host")
+        .build();
+    InputRows {
+        touch_row,
+        mouse_row,
+        inhibit_row,
+        invert_row,
+    }
+}
+
+fn audio_rows(
+    dialog: &adw::PreferencesDialog,
+    inline: bool,
+    globals: &Settings,
+    probes: &DeviceProbes,
+) -> AudioRows {
+    // ---- Audio ----
+    let surround_row = ChoiceRow::new(
+        dialog,
+        inline,
+        "Audio channels",
+        "Stereo or surround — the host downmixes if its output has fewer",
+        &["Stereo", "5.1 Surround", "7.1 Surround"],
+    );
+    let audio_format_labels: Vec<&str> = AUDIO_FORMATS.iter().map(|(_, l)| *l).collect();
+    let audio_format_row = ChoiceRow::new(
+        dialog,
+        inline,
+        "Audio format",
+        "Lossless is uncompressed PCM — 2.3–4.6 Mb/s off the top of the link, and the host has \
+         its own switch",
+        &audio_format_labels,
+    );
+    {
+        // Lossless is stereo-only: a lossless surround frame does not fit one QUIC datagram at
+        // the default MTU and the host declines it (design/hi-res-audio.md §4.2). Greyed, not
+        // hidden, so the reason stays beside the channel row that caused it. Insensitivity also
+        // covers the row's per-preset Reset, so an audio_format override can only be reset
+        // while the channels row says Stereo.
+        let w = audio_format_row.widget().clone();
+        w.set_sensitive(surround_row.selected() == 0);
+        surround_row.connect_changed(move |i| w.set_sensitive(i == 0));
+    }
+    let keep_host_audio_row = adw::SwitchRow::builder()
+        .title("Keep host audio playing")
+        .subtitle("The host's speakers or headphones keep playing while you stream — needs a host on 0.32+")
+        .build();
+    let mic_row = adw::SwitchRow::builder()
+        .title("Stream microphone")
+        .subtitle("Sends your microphone to the host's virtual mic — Ctrl+Alt+Shift+V mutes it mid-stream")
+        .build();
+    let echo_row = adw::SwitchRow::builder()
+        .title("Echo cancellation")
+        .subtitle("Keeps the host's audio, playing from this machine's speakers, out of the uplink")
+        .build();
+    // Endpoint pickers (from the PipeWire probe): visible labels are descriptions, the
+    // stored value is the node name. Hidden when the probe found nothing; a saved
+    // device that's gone keeps a revertable "(not detected)" entry, like the GPU row.
+    let dev_row = |saved: String,
+                   devs: &[pf_client_core::audio::AudioDevice],
+                   title: &str,
+                   subtitle: &str| {
+        let mut names = vec!["System default".to_string()];
+        let mut keys = vec![String::new()];
+        for d in devs {
+            names.push(d.description.clone());
+            keys.push(d.name.clone());
+        }
+        if !saved.is_empty() && !keys.contains(&saved) {
+            names.push(format!("{saved} (not detected)"));
+            keys.push(saved.clone());
+        }
+        let row = (keys.len() > 1).then(|| {
+            let row = ChoiceRow::new(
+                dialog,
+                inline,
+                title,
+                subtitle,
+                &names.iter().map(String::as_str).collect::<Vec<_>>(),
+            );
+            row.set_selected(keys.iter().position(|k| k == &saved).unwrap_or(0) as u32);
+            row
+        });
+        (row, keys)
+    };
+    let (speaker_row, speaker_keys) = dev_row(
+        globals.speaker_device.clone(),
+        &probes.speakers,
+        "Speaker",
+        "Host audio plays here — System default follows the desktop",
+    );
+    let (micdev_row, micdev_keys) = dev_row(
+        globals.mic_device.clone(),
+        &probes.mics,
+        "Microphone",
+        "The input that feeds the host's virtual mic",
+    );
+    // The mic device picker and the echo canceller follow the mic switch; the seed's
+    // `set_active` fires the handler only when it changes the switch, so set the initial
+    // state here too. Desensitising the whole row disables the per-row Reset a preset scope
+    // adds, so an echo_cancel override can only be reset while the mic row is on.
+    if let Some(r) = &micdev_row {
+        let w = r.widget().clone();
+        w.set_sensitive(mic_row.is_active());
+        mic_row.connect_active_notify(move |m| w.set_sensitive(m.is_active()));
+    }
+    {
+        let w = echo_row.clone();
+        w.set_sensitive(mic_row.is_active());
+        mic_row.connect_active_notify(move |m| w.set_sensitive(m.is_active()));
+    }
+    AudioRows {
+        surround_row,
+        audio_format_row,
+        keep_host_audio_row,
+        mic_row,
+        echo_row,
+        speaker_row,
+        speaker_keys,
+        micdev_row,
+        micdev_keys,
+    }
+}
+
+fn pad_rows(
+    dialog: &adw::PreferencesDialog,
+    inline: bool,
+    gamepads: &crate::gamepad::GamepadService,
+    globals: &Settings,
+    seed: &Settings,
+) -> PadRows {
+    // ---- Controllers ----
+    // Automatic forwards every real controller as its own pad (Steam's virtual pad skipped);
+    // pinning one forces single-player. The pin persists by stable key (`Settings::forward_pad`),
+    // so an offline pinned pad keeps its entry here. Off sends nothing and never opens the pad,
+    // which frees it for USB passthrough — so the two rows below are desensitised.
+    let pad_forward_row = adw::SwitchRow::builder()
+        .title("Forward controllers")
+        .subtitle(
+            "Send this device's controllers to the host — off if it already has them another way",
+        )
+        .build();
+    let pads = gamepads.pads();
+    let saved_pin = globals.forward_pad.clone();
+    let mut pad_names = vec!["Automatic (all controllers)".to_string()];
+    let mut pad_keys: Vec<String> = Vec::new();
+    for p in &pads {
+        let kind = p.kind_label();
+        pad_names.push(if kind.is_empty() {
+            p.name.clone()
+        } else {
+            format!("{} · {kind}", p.name)
+        });
+        pad_keys.push(p.key.clone());
+    }
+    if !saved_pin.is_empty() && !pad_keys.contains(&saved_pin) {
+        let name = saved_pin
+            .splitn(3, ':')
+            .nth(2)
+            .unwrap_or("Saved controller");
+        pad_names.push(format!("{name} (not connected)"));
+        pad_keys.push(saved_pin.clone());
+    }
+    let forward_row = ChoiceRow::new(
+        dialog,
+        inline,
+        "Forwarded controller",
+        if pads.is_empty() {
+            "No controllers detected"
+        } else {
+            "Every pad is its own player — pick one to force single-player"
+        },
+        &pad_names.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    let pinned_i = pad_keys
+        .iter()
+        .position(|k| k == &saved_pin)
+        .map_or(0, |i| i + 1);
+    forward_row.set_selected(pinned_i as u32);
+    // The dialog-local choice, written into Settings on close (reading the service back
+    // would race its worker thread applying the Pin message).
+    let chosen_pin: Rc<RefCell<String>> = Rc::new(RefCell::new(saved_pin));
+    {
+        let svc = gamepads.clone();
+        let keys = pad_keys.clone();
+        let chosen = chosen_pin.clone();
+        forward_row.connect_changed(move |sel| {
+            let key = if sel == 0 {
+                None
+            } else {
+                keys.get(sel as usize - 1).cloned()
+            };
+            *chosen.borrow_mut() = key.clone().unwrap_or_default();
+            svc.set_pinned(key);
+        });
+    }
+    let pad_row = ChoiceRow::new(
+        dialog,
+        inline,
+        "Gamepad type",
+        "The virtual pad on the host — Automatic matches your controller. An X-Box type has no \
+         gyroscope, so pick a DualSense-class one if you want motion.",
+        &[
+            "Automatic",
+            "Xbox 360",
+            "DualSense",
+            "Xbox One",
+            "DualShock 4",
+            "Steam Deck",
+            "Steam Controller 2",
+        ],
+    );
+    // Where the guide (Xbox/PS/Steam) + quick-access presses land, and the hold-Select
+    // gesture that keeps the host's guide reachable when they stay local. Desktop rarely
+    // needs either off Automatic — they exist here because presets are authored on the
+    // desktop and applied everywhere, Gaming Mode included.
+    let sysbtn_row = ChoiceRow::new(
+        dialog,
+        inline,
+        "Steam / guide button",
+        "Automatic sends it to the host, except where this device reacts to it too",
+        SYSTEM_BUTTON_LABELS,
+    );
+    let gesture_row = ChoiceRow::new(
+        dialog,
+        inline,
+        "Hold Select for guide",
+        "Hold Select alone for the host's guide button — a tap still goes through",
+        GUIDE_GESTURE_LABELS,
+    );
+    // Controller audio (the 0xD1 plane): a wired DualSense's voice coils and its own speaker,
+    // streamed from the host. Both are negotiated — nothing happens without a capable host AND
+    // a wired DualSense — so the rows say what they are for, not what they will do.
+    // Global scope only, like the forwarded-pad pin: which pad is in your hands is a property
+    // of this device, not of the host a preset is authored against.
+    let haptics_row = adw::SwitchRow::builder()
+        .title("Controller haptics")
+        .subtitle("Play a DualSense's voice-coil haptics on the pad itself — wired pads only")
+        .build();
+    let pad_speaker_row = adw::SwitchRow::builder()
+        .title("Controller speaker")
+        .subtitle("Play the audio a game sends to the pad's own speaker on the pad, not here")
+        .build();
+    // The pad rows only mean something while something is being forwarded (the same
+    // relationship mic → echo cancellation draws just above, initial state included: the
+    // seed's `set_active` fires this only when it CHANGES the switch). Controller audio
+    // belongs in that set too — forwarding off never OPENS the pad, so nothing can detect
+    // that it has an audio device, let alone render on it.
+    {
+        let (f, t) = (forward_row.widget().clone(), pad_row.widget().clone());
+        let (sb, gg) = (sysbtn_row.widget().clone(), gesture_row.widget().clone());
+        let (ha, sp) = (haptics_row.clone(), pad_speaker_row.clone());
+        for w in [&f, &t, &sb, &gg] {
+            w.set_sensitive(seed.gamepad_forwarding);
+        }
+        ha.set_sensitive(seed.gamepad_forwarding);
+        sp.set_sensitive(seed.gamepad_forwarding);
+        pad_forward_row.connect_active_notify(move |r| {
+            for w in [&f, &t, &sb, &gg] {
+                w.set_sensitive(r.is_active());
+            }
+            ha.set_sensitive(r.is_active());
+            sp.set_sensitive(r.is_active());
+        });
+    }
+    PadRows {
+        pad_forward_row,
+        pads,
+        forward_row,
+        chosen_pin,
+        pad_row,
+        sysbtn_row,
+        gesture_row,
+        haptics_row,
+        pad_speaker_row,
+    }
+}
+
+/// The category pages (the Apple revamp's map), the scope switcher heading the first.
+fn add_pages(
+    dialog: &adw::PreferencesDialog,
+    rows: &Rows,
+    switcher: adw::PreferencesGroup,
+    preset_mode: bool,
+) {
+    let Rows {
+        display:
+            DisplayRows {
+                res_row,
+                aspect_row,
+                hz_row,
+                scale_row,
+                bitrate_row,
+                codec_row,
+                hdr_row,
+                chroma_row,
+                ten_bit_sdr_row,
+                decoder_row,
+                gpu_row,
+                fit_row,
+                present_row,
+                buffer_row,
+                vsync_row,
+                vrr_row,
+                compositor_row,
+                ..
+            },
+        general:
+            GeneralRows {
+                fullscreen_row,
+                theme_row,
+                menu_row,
+                wake_row,
+                start_in_row,
+                stats_row,
+                adv_stats_row,
+                stats_docs_row,
+                clear_art_row,
+                ..
+            },
+        input:
+            InputRows {
+                touch_row,
+                mouse_row,
+                inhibit_row,
+                invert_row,
+                ..
+            },
+        audio:
+            AudioRows {
+                surround_row,
+                audio_format_row,
+                keep_host_audio_row,
+                mic_row,
+                echo_row,
+                speaker_row,
+                micdev_row,
+                ..
+            },
+        pads:
+            PadRows {
+                pad_forward_row,
+                pads,
+                forward_row,
+                pad_row,
+                sysbtn_row,
+                gesture_row,
+                haptics_row,
+                pad_speaker_row,
+                ..
+            },
+        quick,
+        ..
+    } = rows;
     let general = page("General", "preferences-system-symbolic");
     // The scope switcher heads the first page — the one row that is always about which layer
     // you are editing, not about the stream.
-    general.add(&scope_group(
-        &dialog,
-        inline,
-        &scope,
-        &catalog,
-        active.as_ref(),
-        &next_scope,
-        &pending_dup,
-        parent,
-    ));
+    general.add(&switcher);
     let session_group = group("Session", "");
-    session_group.add(&fullscreen_row);
+    session_group.add(fullscreen_row);
     // Auto-wake is a property of the host and this network, not of "Game vs Work" — it stays
     // global in v1 (design §3, tier H/G).
     if !preset_mode {
-        session_group.add(&wake_row);
+        session_group.add(wake_row);
         // A device preference like auto-wake: which host this machine opens on says nothing
         // about how a stream should look, so it is never part of a preset.
         session_group.add(start_in_row.widget());
@@ -2350,24 +2978,24 @@ pub fn show_scoped(
     // the row exists only where the theme does — Omarchy — rather than sitting disabled.
     if !preset_mode && pf_client_core::omarchy::present() {
         let omarchy_group = group("Omarchy", "");
-        omarchy_group.add(&theme_row);
-        omarchy_group.add(&menu_row);
+        omarchy_group.add(theme_row);
+        omarchy_group.add(menu_row);
         general.add(&omarchy_group);
     }
     let stats_group = group("Statistics", "");
     stats_group.add(stats_row.widget());
     // Device-wide: a preset never carries the vocabulary.
     if !preset_mode {
-        stats_group.add(&adv_stats_row);
+        stats_group.add(adv_stats_row);
     }
-    stats_group.add(&stats_docs_row);
+    stats_group.add(stats_docs_row);
     general.add(&session_group);
     general.add(&stats_group);
     // Device-level like auto-wake: what this machine keeps on its own disk is never a
     // property of a preset.
     if !preset_mode {
         let storage_group = group("Storage", "");
-        storage_group.add(&clear_art_row);
+        storage_group.add(clear_art_row);
         general.add(&storage_group);
     }
 
@@ -2378,24 +3006,24 @@ pub fn show_scoped(
     resolution_group.add(hz_row.widget());
     let quality_group = group("Quality", "");
     quality_group.add(scale_row.widget());
-    quality_group.add(&bitrate_row);
+    quality_group.add(bitrate_row);
     quality_group.add(codec_row.widget());
-    quality_group.add(&hdr_row);
-    quality_group.add(&chroma_row);
-    quality_group.add(&ten_bit_sdr_row);
+    quality_group.add(hdr_row);
+    quality_group.add(chroma_row);
+    quality_group.add(ten_bit_sdr_row);
     // Decoder and GPU are facts about THIS device's hardware — never per preset (tier G).
     if !preset_mode {
         quality_group.add(decoder_row.widget());
     }
-    if let (Some(r), false) = (&gpu_row, preset_mode) {
+    if let (Some(r), false) = (gpu_row, preset_mode) {
         quality_group.add(r.widget());
     }
     let presentation_group = group("Presentation", "");
     presentation_group.add(fit_row.widget());
     presentation_group.add(present_row.widget());
     presentation_group.add(buffer_row.widget());
-    presentation_group.add(&vsync_row);
-    presentation_group.add(&vrr_row);
+    presentation_group.add(vsync_row);
+    presentation_group.add(vrr_row);
     // The one form-level note (deliberately not repeated on every row).
     let output_group = group(
         "Host output",
@@ -2413,8 +3041,8 @@ pub fn show_scoped(
     // Group titles are Pango markup — the ampersand must be an entity.
     let kbm_group = group("Keyboard &amp; mouse", "");
     kbm_group.add(mouse_row.widget());
-    kbm_group.add(&inhibit_row);
-    kbm_group.add(&invert_row);
+    kbm_group.add(inhibit_row);
+    kbm_group.add(invert_row);
     input.add(&touch_group);
     input.add(&kbm_group);
     // The quick-action ring: one row that opens its editor — the ring itself (design
@@ -2431,17 +3059,17 @@ pub fn show_scoped(
     let audio_group = group("", "Applies from the next session.");
     audio_group.add(surround_row.widget());
     audio_group.add(audio_format_row.widget());
-    audio_group.add(&keep_host_audio_row);
+    audio_group.add(keep_host_audio_row);
     // The speaker/mic endpoint pickers below are this device's audio routing (tier G) — they
     // render only in the defaults scope; the surround/format + mic-uplink rows above are
     // presetable.
 
-    if let (Some(r), false) = (&speaker_row, preset_mode) {
+    if let (Some(r), false) = (speaker_row, preset_mode) {
         audio_group.add(r.widget());
     }
-    audio_group.add(&mic_row);
-    audio_group.add(&echo_row);
-    if let (Some(r), false) = (&micdev_row, preset_mode) {
+    audio_group.add(mic_row);
+    audio_group.add(echo_row);
+    if let (Some(r), false) = (micdev_row, preset_mode) {
         audio_group.add(r.widget());
     }
     audio.add(&audio_group);
@@ -2461,7 +3089,7 @@ pub fn show_scoped(
             .build();
         controllers_group.add(&none);
     } else {
-        for p in &pads {
+        for p in pads {
             let row = adw::ActionRow::builder()
                 .title(&p.name)
                 .use_markup(false)
@@ -2480,7 +3108,7 @@ pub fn show_scoped(
     // Presetable, so it shows in both scopes — unlike the pin below it, which is about
     // which of THIS device's pads goes first: a "Work" preset can decline to forward
     // controllers to a host that a "Game" preset forwards them to.
-    controllers_group.add(&pad_forward_row);
+    controllers_group.add(pad_forward_row);
     if !preset_mode {
         controllers_group.add(forward_row.widget());
     }
@@ -2490,8 +3118,8 @@ pub fn show_scoped(
     // Global scope only — see the rows' own note. In preset scope they would have no
     // override marker and no way to record a touch, so a toggle would be silently discarded.
     if !preset_mode {
-        controllers_group.add(&haptics_row);
-        controllers_group.add(&pad_speaker_row);
+        controllers_group.add(haptics_row);
+        controllers_group.add(pad_speaker_row);
     }
     controllers.add(&controllers_group);
 
@@ -2505,203 +3133,6 @@ pub fn show_scoped(
     dialog.add(&input);
     dialog.add(&audio);
     dialog.add(&controllers);
-
-    let quick_blob = quick.blob();
-    dialog.connect_closed(move |_| {
-        // One reader for the rows, two destinations: the globals, or a preset's overrides.
-        // Sharing it is what keeps the two scopes from interpreting the same controls
-        // differently (the tri-state resolution row is the obvious trap).
-        let apply_rows = |s: &mut Settings| {
-            // A value these tables cannot list (a size typed into another client's custom
-            // fields, a refresh rate off the ladder) displays as the fallback rung, so writing
-            // it back erases it just by opening and closing. Write only what a table lists, or
-            // what moved — the rule the gamepad and pad-speaker rows below already follow.
-            let listed_res = s.match_window
-                || (s.width, s.height) == (0, 0)
-                || ASPECTS
-                    .iter()
-                    .any(|a| a.sizes.contains(&(s.width, s.height)));
-            let (seed_res, seed_hz, seed_scale) = (
-                index::resolution(s),
-                index::refresh(s),
-                index::render_scale(s),
-            );
-            // Index 1 is the virtual "Match window" option; 0 = Native, 2.. = the listed
-            // family's sizes.
-            let sizes = ASPECTS[shown_family.get()].sizes;
-            let res_i = (res_row.selected() as usize).min(sizes.len() + 1);
-            if listed_res || res_i as u32 != seed_res {
-                s.match_window = res_i == 1;
-                (s.width, s.height) = if res_i <= 1 { (0, 0) } else { sizes[res_i - 2] };
-            }
-            let hz_i = (hz_row.selected() as usize).min(REFRESH.len() - 1);
-            if REFRESH.contains(&s.refresh_hz) || hz_i as u32 != seed_hz {
-                s.refresh_hz = REFRESH[hz_i];
-            }
-            let scale_i = (scale_row.selected() as usize).min(RENDER_SCALES.len() - 1);
-            let listed_scale = RENDER_SCALES
-                .iter()
-                .any(|&x| (x - s.render_scale).abs() < 1e-6);
-            if listed_scale || scale_i as u32 != seed_scale {
-                s.render_scale = RENDER_SCALES[scale_i];
-            }
-            s.bitrate_kbps = (bitrate_row.value() * 1000.0) as u32;
-            // Keep a stored preference this table doesn't list (e.g. "switchpro" — valid to the
-            // session, hand-edited or written by another client): it displays as "Automatic", and
-            // writing that back would silently erase it just by opening + closing the dialog.
-            // Persist the row only when the user picked a non-Auto entry or the stored value was
-            // a listed one to begin with.
-            let pad_sel = (pad_row.selected() as usize).min(GAMEPADS.len() - 1);
-            if pad_sel != 0 || GAMEPADS.contains(&s.gamepad.as_str()) {
-                s.gamepad = GAMEPADS[pad_sel].to_string();
-            }
-            s.system_buttons = SYSTEM_BUTTONS
-                [(sysbtn_row.selected() as usize).min(SYSTEM_BUTTONS.len() - 1)]
-            .to_string();
-            s.guide_gesture = GUIDE_GESTURES
-                [(gesture_row.selected() as usize).min(GUIDE_GESTURES.len() - 1)]
-            .to_string();
-            s.touch_mode =
-                TOUCH_MODES[(touch_row.selected() as usize).min(TOUCH_MODES.len() - 1)].to_string();
-            s.mouse_mode =
-                MOUSE_MODES[(mouse_row.selected() as usize).min(MOUSE_MODES.len() - 1)].to_string();
-            s.forward_pad = chosen_pin.borrow().clone();
-            s.compositor = COMPOSITORS
-                [(compositor_row.selected() as usize).min(COMPOSITORS.len() - 1)]
-            .to_string();
-            s.decoder =
-                DECODERS[(decoder_row.selected() as usize).min(DECODERS.len() - 1)].to_string();
-            if let Some(r) = &gpu_row {
-                s.adapter = gpu_keys[(r.selected() as usize).min(gpu_keys.len() - 1)].clone();
-            }
-            if let Some(r) = &speaker_row {
-                s.speaker_device =
-                    speaker_keys[(r.selected() as usize).min(speaker_keys.len() - 1)].clone();
-            }
-            if let Some(r) = &micdev_row {
-                s.mic_device =
-                    micdev_keys[(r.selected() as usize).min(micdev_keys.len() - 1)].clone();
-            }
-            s.set_stats_verbosity(
-                StatsVerbosity::ALL
-                    [(stats_row.selected() as usize).min(StatsVerbosity::ALL.len() - 1)],
-            );
-            s.start_in = start::StartIn::ALL
-                [(start_in_row.selected() as usize).min(start::StartIn::ALL.len() - 1)]
-            .as_str()
-            .to_string();
-            s.fullscreen_on_stream = fullscreen_row.is_active();
-            s.advanced_stats = adv_stats_row.is_active();
-            s.follow_os_theme = theme_row.is_active();
-            // Live: the switch must not wait out the shell's 2 s poll to mean something.
-            crate::omarchy::set_enabled(s.follow_os_theme);
-            // The menu switch is not a Settings field: the block's presence in the user's
-            // omarchy-menu.jsonc IS the state, so two installs can't disagree with it.
-            {
-                use pf_client_core::omarchy_menu as menu;
-                let want = menu_row.is_active();
-                let res = match (want, menu::enabled()) {
-                    (true, false) => menu::enable(),
-                    (false, true) => menu::disable(),
-                    _ => Ok(()),
-                };
-                if let Err(e) = res {
-                    tracing::warn!("omarchy menu: {e}");
-                }
-            }
-            s.auto_wake = wake_row.is_active();
-            s.inhibit_shortcuts = inhibit_row.is_active();
-            s.invert_scroll = invert_row.is_active();
-            s.gamepad_forwarding = pad_forward_row.is_active();
-            s.pad_haptics = haptics_row.is_active();
-            // `"mix"` is a stored value this switch cannot express (it renders as off today,
-            // pending the mixer leg), so writing the switch back unconditionally would erase
-            // it just by opening and closing the dialog — the same trap the gamepad-type row
-            // guards above. Only write when the user actually moved it.
-            let want_speaker = pad_speaker_row.is_active();
-            if want_speaker != pf_client_core::pad_audio::speaker_active(&s.pad_speaker) {
-                s.pad_speaker = if want_speaker { "pad" } else { "off" }.to_string();
-            }
-            s.keep_host_audio = keep_host_audio_row.is_active();
-            s.mic_enabled = mic_row.is_active();
-            s.echo_cancel = echo_row.is_active();
-            s.hdr_enabled = hdr_row.is_active();
-            s.enable_444 = chroma_row.is_active();
-            s.ten_bit_sdr = ten_bit_sdr_row.is_active();
-            s.audio_channels = match surround_row.selected() {
-                1 => 6,
-                2 => 8,
-                _ => 2,
-            };
-            // Written back whatever the channel row says. The stored choice is a preference, not
-            // a live request — clearing it because the user is on 5.1 today would lose it the
-            // moment they went back to stereo, and the session filters the pair anyway.
-            s.audio_format = AUDIO_FORMATS
-                [(audio_format_row.selected() as usize).min(AUDIO_FORMATS.len() - 1)]
-            .0
-            .to_string();
-            s.codec = CODECS[(codec_row.selected() as usize).min(CODECS.len() - 1)].to_string();
-            let fit_i = (fit_row.selected() as usize).min(VIDEO_FITS.len() - 1);
-            if VIDEO_FITS.contains(&s.video_fit.as_str()) || fit_i as u32 != index::video_fit(s) {
-                s.video_fit = VIDEO_FITS[fit_i].to_string();
-            }
-            s.present_priority = PRESENT_PRIORITIES
-                [(present_row.selected() as usize).min(PRESENT_PRIORITIES.len() - 1)]
-            .to_string();
-            // The index IS the value (0 = Automatic).
-            s.smooth_buffer =
-                (buffer_row.selected() as u8).min(SMOOTH_BUFFER_LABELS.len() as u8 - 1);
-            s.vsync = vsync_row.is_active();
-            s.allow_vrr = vrr_row.is_active();
-            s.overlay_actions = quick_blob.borrow().clone();
-        };
-
-        match &active {
-            // Preset scope writes the touched rows into the catalog and leaves the globals
-            // exactly as they were — the point of the whole feature.
-            Some(active) => {
-                let mut values = seed.clone();
-                apply_rows(&mut values);
-                commit_preset(active, &touched, &values);
-            }
-            None => {
-                // Rebase on the file, not the start-of-app snapshot: other whole-file writers
-                // exist (the spawner persists `last_window_w/h`), and saving the stale snapshot
-                // would revert them. The rows carry every value this dialog owns.
-                let mut s = settings.borrow_mut();
-                *s = Settings::load();
-                apply_rows(&mut s);
-                s.save();
-            }
-        }
-        // Deferred Duplicate: the source has just been committed above, so the copy is
-        // taken from what the user was actually looking at.
-        if let Some(src) = pending_dup.borrow_mut().take() {
-            let mut catalog = PresetsFile::load();
-            if let Some(source) = catalog.find_by_id(&src).cloned() {
-                // "Work 2", "Work 3", … — the first name the catalog doesn't already hold.
-                let copy_name = (2..)
-                    .map(|n| format!("{} {n}", source.name))
-                    .find(|n| !catalog.name_taken(n, None))
-                    .unwrap_or_else(|| source.name.clone());
-                let mut copy = StreamPreset::new(copy_name);
-                copy.overrides = source.overrides.clone();
-                copy.accent = source.accent.clone();
-                let new_id = copy.id.clone();
-                catalog.presets.push(copy);
-                if catalog.save().is_ok() {
-                    *next_scope.borrow_mut() = Some(Scope::Preset(new_id));
-                }
-            }
-        }
-        // A scope switch closed this dialog to commit first; now re-open in the new scope.
-        if let Some(next) = next_scope.borrow_mut().take() {
-            on_scope(next);
-        }
-        on_closed();
-    });
-    dialog.present(Some(parent));
-    dialog
 }
 
 #[cfg(test)]

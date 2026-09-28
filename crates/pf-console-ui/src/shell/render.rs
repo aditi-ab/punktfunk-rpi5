@@ -87,11 +87,11 @@ impl Shell {
         crate::theme::set_reduce_motion(reduce);
         crate::theme::set_reduced_ui(crate::screens::settings::reduce_ui_res(
             &self.settings,
-            self.platform,
-            self.fallback_ui,
+            self.device.platform,
+            self.device.fallback_ui,
         ));
         self.pads = pads.to_vec();
-        self.glyphs = glyph_style(self.input_source, pad_pref, self.platform);
+        self.glyphs = glyph_style(self.input_source, pad_pref, self.device.platform);
         if let Some(Screen::InputTest(test)) = self.stack.last_mut() {
             test.pref = pad_pref;
         }
@@ -187,15 +187,8 @@ impl Shell {
             library: &self.library,
             settings: &mut self.settings,
             store: &*self.store,
-            platform: self.platform,
-            screen: self.screen,
             pads: &self.pads,
-            deck: self.deck,
-            tv: self.tv,
-            fallback_ui: self.fallback_ui,
-            pyrowave_ok: self.pyrowave_ok,
-            av1_ok: self.av1_ok,
-            device_name: &self.device_name,
+            device: &self.device,
             t,
             glyphs: self.glyphs,
             // A modal owns B/A while up — do not also show the screen's legend.
@@ -317,8 +310,10 @@ impl Shell {
             );
             let cy = top + bh / 2.0;
             // The chip names a pad, so it draws that pad's family whatever drove last.
-            let mark =
-                crate::glyphs::device_icon(Some(pad_pref.unwrap_or_default()), self.platform);
+            let mark = crate::glyphs::device_icon(
+                Some(pad_pref.unwrap_or_default()),
+                self.device.platform,
+            );
             crate::glyphs::pad_mark(canvas, mark, bx + pad_x, cy, mark_w, k, fg(0.7));
             fonts.draw(
                 canvas,
@@ -434,15 +429,8 @@ struct LayerEnv<'a> {
     library: &'a LibraryShared,
     settings: &'a mut trust::Settings,
     store: &'a dyn crate::store::SettingsStore,
-    platform: crate::platform::Platform,
-    screen: Option<crate::shell::DeviceScreen>,
     pads: &'a [PadInfo],
-    deck: bool,
-    tv: bool,
-    fallback_ui: bool,
-    pyrowave_ok: bool,
-    av1_ok: bool,
-    device_name: &'a str,
+    device: &'a crate::screens::Device,
     t: f64,
     glyphs: GlyphStyle,
     show_hints: bool,
@@ -515,26 +503,20 @@ impl LayerEnv<'_> {
             library: self.library,
             settings: self.settings,
             store: self.store,
-            platform: self.platform,
-            screen: self.screen,
             pads: self.pads,
-            deck: self.deck,
-            tv: self.tv,
-            fallback_ui: self.fallback_ui,
-            pyrowave_ok: self.pyrowave_ok,
-            av1_ok: self.av1_ok,
-            device_name: self.device_name,
+            device: self.device,
             t: self.t,
         };
         // With focus on the tabs, a root's plate fades out. A root's target count says if
         // focus can enter.
         crate::el::set_dormant(self.strip_focus && band == Band::Strip);
-        let mut pinned_pic = None;
+        let (mut pinned, mut pinned_pic) = ((0.0, 0.0), None);
         let targets = crate::el::census(|| {
             screen.render(canvas, self.content, self.k, self.dt, self.fonts, &mut ctx);
             // Pinned chrome is recorded, not drawn: it goes over the trays, in place, so
             // a slide or a zoom never carries it. Its targets still count here.
-            if screen.pinned(self.k) != (0.0, 0.0) {
+            pinned = screen.pinned(self.k, &ctx);
+            if pinned != (0.0, 0.0) {
                 let mut rec = PictureRecorder::new();
                 let rc = rec.begin_recording(device_edges, false);
                 rc.set_matrix(&base);
@@ -546,8 +528,11 @@ impl LayerEnv<'_> {
         if band == Band::Strip {
             self.root_targets = Some(targets);
         }
-        self.cheap =
-            crate::screens::settings::reduce_ui_res(ctx.settings, ctx.platform, ctx.fallback_ui);
+        self.cheap = crate::screens::settings::reduce_ui_res(
+            ctx.settings,
+            ctx.device.platform,
+            ctx.device.fallback_ui,
+        );
         let title = (band == Band::Title).then(|| screen.title(&ctx));
         let hints = if self.show_hints {
             shortcuts(screen.hints(&ctx), self.glyphs, band == Band::Strip)
@@ -561,7 +546,7 @@ impl LayerEnv<'_> {
             band,
             title,
             hints,
-            pinned: screen.pinned(self.k),
+            pinned,
             pinned_pic,
         }
     }

@@ -617,38 +617,51 @@ mod pool {
         }
     }
 
-    /// Take entries past their linger deadline so the caller drops them after
-    /// releasing the lock — keepalive `Drop` (Mutter D-Bus Stop) can block.
-    /// Each restore is [handed off](hand_off_restore) or returned when the
-    /// group empties (run before the entries drop).
-    pub(super) fn take_expired(
+    /// Entries taken out of the pool, and the topology restores of the groups they emptied.
+    /// The caller runs the restores, then drops the entries, both outside the pool lock.
+    pub(super) struct Drained {
+        pub(super) entries: Vec<Entry>,
+        pub(super) restores: Vec<Restore>,
+    }
+
+    /// Remove every entry `pred` selects. Each removal [hands its restore
+    /// off](hand_off_restore) to a sibling still in the pool, so this stays one in-place pass:
+    /// the heir is picked from what remains at that removal.
+    pub(super) fn drain_where(
         entries: &mut Vec<Entry>,
-        now: Instant,
-        cur_epoch: u64,
-    ) -> (Vec<Entry>, Vec<Restore>) {
-        let mut expired = Vec::new();
-        let mut restores = Vec::new();
-        // Also reap a kept (non-Active) desktop display whose epoch is stale —
-        // the compositor was replaced, so the node id is a corpse. Gamescope is
-        // exempt (`epoch_matches`). Active stays for its session's rebuild.
+        mut pred: impl FnMut(&mut Entry) -> bool,
+    ) -> Drained {
+        let mut out = Drained {
+            entries: Vec::new(),
+            restores: Vec::new(),
+        };
         let mut i = 0;
         while i < entries.len() {
-            let dead_epoch = !epoch_matches(entries[i].backend, entries[i].epoch, cur_epoch)
-                && !matches!(entries[i].life, lifecycle::State::Active { .. });
-            if entries[i].life.poll_expiry(now) || dead_epoch {
+            if pred(&mut entries[i]) {
                 let mut e = entries.remove(i);
                 let (backend, generation) = (e.backend, e.generation);
                 if let Some(r) =
                     hand_off_restore(entries, backend, generation, e.topology_restore.take())
                 {
-                    restores.push(r);
+                    out.restores.push(r);
                 }
-                expired.push(e);
+                out.entries.push(e);
             } else {
                 i += 1;
             }
         }
-        (expired, restores)
+        out
+    }
+
+    /// Take entries past their linger deadline, and kept (non-Active) desktop displays whose
+    /// epoch is stale: the compositor was replaced, so the node id is a corpse. Gamescope is
+    /// exempt (`epoch_matches`); Active stays for its session's rebuild.
+    pub(super) fn take_expired(entries: &mut Vec<Entry>, now: Instant, cur_epoch: u64) -> Drained {
+        drain_where(entries, |e| {
+            let dead_epoch = !epoch_matches(e.backend, e.epoch, cur_epoch)
+                && !matches!(e.life, lifecycle::State::Active { .. });
+            e.life.poll_expiry(now) || dead_epoch
+        })
     }
 
     /// Linger a release applies. A parked seat has no owner yet, so it outlives a `keep_alive`
@@ -658,18 +671,7 @@ mod pool {
         if parked {
             Linger::Forever
         } else {
-            effective_linger(force_immediate, policy)
-        }
-    }
-
-    /// Linger applied on release. A deliberate quit (`force_immediate`) turns a
-    /// linger window into Immediate. `Forever` outranks quit: the screen stays
-    /// until `/display/release`.
-    fn effective_linger(force_immediate: bool, policy: Linger) -> Linger {
-        match (force_immediate, policy) {
-            (true, Linger::Forever) => Linger::Forever,
-            (true, _) => Linger::Immediate,
-            (false, l) => l,
+            lifecycle::effective_linger(force_immediate, policy)
         }
     }
 
@@ -847,22 +849,6 @@ mod pool {
             drop(test_entry("gamescope", 1, None));
             assert!(!hdr_capture_failed(HdrSource::VirtualOutput));
             assert!(hdr_capture_failed(HdrSource::PortalMonitor));
-        }
-
-        #[test]
-        fn deliberate_quit_skips_the_linger_window_but_never_a_pin() {
-            use std::time::Duration;
-            assert_eq!(
-                effective_linger(true, Linger::For(Duration::from_secs(10))),
-                Linger::Immediate
-            );
-            assert_eq!(effective_linger(true, Linger::Immediate), Linger::Immediate);
-            assert_eq!(effective_linger(true, Linger::Forever), Linger::Forever);
-            assert_eq!(
-                effective_linger(false, Linger::For(Duration::from_secs(10))),
-                Linger::For(Duration::from_secs(10))
-            );
-            assert_eq!(effective_linger(false, Linger::Forever), Linger::Forever);
         }
 
         /// A parked seat survives `keep_alive: off`, which is what every other display on that
@@ -1395,9 +1381,9 @@ mod pool {
             e5.epoch = 1;
             es.push(e5);
 
-            let (expired, restores) = take_expired(&mut es, t0, 5);
-            assert!(restores.is_empty());
-            let gone: Vec<u64> = expired.iter().map(|e| e.generation).collect();
+            let drained = take_expired(&mut es, t0, 5);
+            assert!(drained.restores.is_empty());
+            let gone: Vec<u64> = drained.entries.iter().map(|e| e.generation).collect();
             assert_eq!(gone, vec![1, 3]);
             let left: Vec<u64> = es.iter().map(|e| e.generation).collect();
             assert_eq!(left, vec![2, 4, 5]);
@@ -1414,10 +1400,10 @@ mod linux {
     use anyhow::Result;
 
     use super::pool::{
-        assemble_displays, assign_group_ids, budget_count, group_key, hand_off_restore, in_group,
-        join_target, kept_to_evict, kept_to_retire, kept_verdict, park_mode_for, position_for_new,
-        release_linger, reuse_keys_match, slot_key, slot_state, take_expired, Entry, Held, Kept,
-        Restore, Row, Slot,
+        assemble_displays, assign_group_ids, budget_count, drain_where, group_key,
+        hand_off_restore, in_group, join_target, kept_to_evict, kept_to_retire, kept_verdict,
+        park_mode_for, position_for_new, release_linger, reuse_keys_match, slot_key, slot_state,
+        take_expired, Drained, Entry, Held, Kept, Row, Slot,
     };
     use super::DisplayInfo;
     use crate::lifecycle::{self, Release};
@@ -1426,9 +1412,8 @@ mod linux {
 
     enum ReuseOutcome {
         Reused(VirtualOutput),
-        /// Dead kept display, already removed, plus its group restore (run
-        /// before the keepalive drops). Caller creates fresh.
-        Dead(Entry, Option<Restore>),
+        /// Dead kept display, already removed with its group restore. Caller creates fresh.
+        Dead(Drained),
         Miss,
     }
 
@@ -1614,27 +1599,13 @@ mod linux {
         }
         match std::thread::Builder::new()
             .name("vdisplay-linger".into())
-            .spawn(|| {
-                loop {
-                    std::thread::sleep(Duration::from_millis(500));
-                    let (expired, restores) = {
-                        let mut es = reg().entries.lock().unwrap();
-                        take_expired(&mut es, Instant::now(), crate::session_epoch())
-                    };
-                    // Restore physicals (group emptied) before dropping outputs, outside the lock.
-                    for restore in restores {
-                        restore();
-                    }
-                    let reaped = expired.len();
-                    for e in expired {
-                        tracing::info!(
-                            backend = e.backend,
-                            "virtual display: linger expired — torn down"
-                        );
-                        drop(e); // outside the lock
-                    }
-                    emit_released(reaped);
-                }
+            .spawn(|| loop {
+                std::thread::sleep(Duration::from_millis(500));
+                let expired = {
+                    let mut es = reg().entries.lock().unwrap();
+                    take_expired(&mut es, Instant::now(), crate::session_epoch())
+                };
+                expired.finish("linger expired — torn down");
             }) {
             Ok(_) => *started = true,
             Err(e) => tracing::error!(
@@ -1642,6 +1613,24 @@ mod linux {
                 "virtual display: could not start the keep-alive linger reaper — kept displays \
                  will not expire until a later session retries"
             ),
+        }
+    }
+
+    impl Drained {
+        /// Run the restores, then drop the entries: outside the pool lock (a keepalive `Drop`
+        /// can block), restore first so the compositor never sees zero outputs. Returns the
+        /// count torn down.
+        fn finish(self, why: &str) -> usize {
+            for restore in self.restores {
+                restore();
+            }
+            let n = self.entries.len();
+            for e in self.entries {
+                tracing::info!(backend = e.backend, "virtual display: {why}");
+                drop(e);
+            }
+            emit_released(n);
+            n
         }
     }
 
@@ -1700,16 +1689,11 @@ mod linux {
         let cur_epoch = crate::session_epoch();
         let r = reg();
 
-        let (expired, restores) = {
+        let expired = {
             let mut es = r.entries.lock().unwrap();
             take_expired(&mut es, Instant::now(), cur_epoch)
         };
-        for restore in restores {
-            restore();
-        }
-        let reaped = expired.len();
-        drop(expired);
-        emit_released(reaped);
+        expired.finish("linger expired — torn down");
 
         // Before linger reuse: admission named a live session, so share its display.
         if vd.join_live() {
@@ -1848,11 +1832,8 @@ mod linux {
                             ReuseOutcome::Miss
                         }
                         Some(idx) => {
-                            let mut dead = es.remove(idx);
-                            let (b, g) = (dead.backend, dead.generation);
-                            let restore =
-                                hand_off_restore(&mut es, b, g, dead.topology_restore.take());
-                            ReuseOutcome::Dead(dead, restore)
+                            let g = es[idx].generation;
+                            ReuseOutcome::Dead(drain_where(&mut es, |e| e.generation == g))
                         }
                         None => ReuseOutcome::Miss, // adopted/removed by another thread
                     }
@@ -1874,17 +1855,8 @@ mod linux {
                             }
                         }
                     }
-                    ReuseOutcome::Dead(dead, restore) => {
-                        // Outside the lock: restore physicals, then drop keepalive (may block).
-                        if let Some(rst) = restore {
-                            rst();
-                        }
-                        tracing::info!(
-                            backend,
-                            "virtual display: kept display was dead — recreating (validated reuse)"
-                        );
-                        drop(dead);
-                        emit_released(1);
+                    ReuseOutcome::Dead(dead) => {
+                        dead.finish("kept display was dead — recreating (validated reuse)");
                     }
                     ReuseOutcome::Miss => {}
                 }
@@ -2308,38 +2280,13 @@ mod linux {
     /// with keepalive drops outside the lock. Shared by [`force_release`] and [`retire`].
     fn release_kept(slot: Option<u64>, why: &'static str) -> usize {
         let Some(r) = REG.get() else { return 0 };
-        let (released, restores) = {
+        let released = {
             let mut es = r.entries.lock().unwrap();
-            let mut out = Vec::new();
-            let mut restores = Vec::new();
-            let mut i = 0;
-            while i < es.len() {
-                let selected = slot.is_none_or(|s| es[i].generation == s);
-                if selected && es[i].life.force_release() {
-                    let mut e = es.remove(i);
-                    let (backend, g) = (e.backend, e.generation);
-                    let restore = e.topology_restore.take();
-                    if let Some(rst) = hand_off_restore(&mut es, backend, g, restore) {
-                        restores.push(rst);
-                    }
-                    out.push(e);
-                } else {
-                    i += 1;
-                }
-            }
-            (out, restores)
+            drain_where(&mut es, |e| {
+                slot.is_none_or(|s| e.generation == s) && e.life.force_release()
+            })
         };
-        let n = released.len();
-        // Restore physicals (group emptied) before dropping outputs, outside the lock.
-        for restore in restores {
-            restore();
-        }
-        for e in released {
-            tracing::info!(backend = e.backend, "virtual display {why}");
-            drop(e);
-        }
-        emit_released(n);
-        n
+        released.finish(why)
     }
 
     /// Tear down a reused-but-dead pool entry by generation. Drops keepalive
@@ -2376,41 +2323,11 @@ mod linux {
     /// lock (dead sockets fail fast). Selects by backend, not slot/state.
     pub(super) fn invalidate_backend(backend: &str) {
         let Some(r) = REG.get() else { return };
-        let (removed, restores) = {
+        let removed = {
             let mut es = r.entries.lock().unwrap();
-            let mut out = Vec::new();
-            let mut restores = Vec::new();
-            let mut i = 0;
-            while i < es.len() {
-                if es[i].backend == backend {
-                    let mut e = es.remove(i);
-                    let (b, g) = (e.backend, e.generation);
-                    if let Some(rst) = hand_off_restore(&mut es, b, g, e.topology_restore.take()) {
-                        restores.push(rst);
-                    }
-                    out.push(e);
-                } else {
-                    i += 1;
-                }
-            }
-            (out, restores)
+            drain_where(&mut es, |e| e.backend == backend)
         };
-        if removed.is_empty() {
-            return;
-        }
-        for restore in restores {
-            restore();
-        }
-        tracing::info!(
-            backend,
-            count = removed.len(),
-            "virtual displays invalidated — compositor instance gone (A4 session switch)"
-        );
-        let n = removed.len();
-        for e in removed {
-            drop(e); // outside the lock
-        }
-        emit_released(n);
+        removed.finish("invalidated — compositor instance gone (A4 session switch)");
     }
 
     /// Session keepalive. Drop releases the registry hold; a stale lease

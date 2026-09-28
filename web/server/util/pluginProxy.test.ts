@@ -6,7 +6,9 @@
 // dial itself, which on the plugin origin recurses until the process dies; and it is silent, since
 // a self-dial answers 200 like anything else.
 import { afterEach, describe, expect, test } from "bun:test";
-import { isDialablePort, PLUGIN_ID_RE } from "./pluginProxy";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { isDialablePort, PLUGIN_ID_RE, validEntryId } from "./pluginProxy";
 
 const CONSOLE_PORT = "47992";
 const PLUGIN_PORT = "47993";
@@ -70,5 +72,30 @@ describe("PLUGIN_ID_RE", () => {
 		for (const id of hostile) {
 			expect(PLUGIN_ID_RE.test(id)).toBe(false);
 		}
+	});
+});
+
+describe("validEntryId", () => {
+	const vectors = JSON.parse(
+		readFileSync(
+			join(import.meta.dir, "../../../clients/shared/library-id-vectors.json"),
+			"utf8",
+		),
+	) as {
+		entry_ids: {
+			value: string;
+			fill?: string;
+			count?: number;
+			valid: boolean;
+		}[];
+	};
+	for (const c of vectors.entry_ids) {
+		const id = c.value + (c.fill ?? "").repeat(c.count ?? 0);
+		test(`${c.valid ? "accepts" : "refuses"} ${id.slice(0, 40)} (${id.length})`, () => {
+			expect(validEntryId(id)).toBe(c.valid);
+		});
+	}
+	test("refuses control characters the host would let through", () => {
+		expect(validEntryId("steam:5\u00070")).toBe(false);
 	});
 });

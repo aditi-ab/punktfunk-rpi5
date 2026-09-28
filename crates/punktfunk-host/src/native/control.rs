@@ -209,57 +209,11 @@ pub(super) struct Task {
     /// may carry the reason byte. Clear for every shipped client, which rejects
     /// a longer ack, and for every client behind a host without `HOST_CAP2_EXT`.
     pub(super) ack_reason: bool,
-    /// Encoder-applied rate, codec ceiling (`0` = unknown), and cadence-miss
-    /// flag. Read at `SetBitrate` so the ack never exceeds what the encoder
-    /// will actually run.
-    pub(super) live_bitrate: Arc<AtomicU32>,
-    /// See [`Self::live_bitrate`]. The sole place a ceiling decides an ask:
-    /// the data plane learns it, this task spends it.
-    pub(super) encoder_ceiling: Arc<std::sync::Mutex<super::EncoderCeiling>>,
-    /// See [`Self::live_bitrate`].
-    pub(super) cadence_degraded: Arc<AtomicBool>,
-    /// See [`Self::live_bitrate`].
-    pub(super) cadence_behind_score: Arc<AtomicU32>,
-    /// `u32::MAX` is the pre-seed: an old client never sent a `DeliveryReport`.
-    pub(super) client_packets_received: Arc<AtomicU32>,
-    /// FEC in force: what the packetizer runs. Read here; only the stream loop writes.
-    pub(super) fec_target: Arc<AtomicU8>,
-    /// This task's adaptive-FEC proposals. The stream loop publishes them to
-    /// `fec_target` once the encoder accepts the rate the proposal implies.
-    pub(super) fec_requested: Arc<AtomicU8>,
-    /// The rate the client's ramp proved the link carries (kbps); `0` until its
-    /// `LinkReport`. The send loop paces a pinned stream against it.
-    pub(super) link_kbps: Arc<AtomicU32>,
-    /// Encode loop drains at its own cadence (`design/phase-locked-capture.md`).
-    pub(super) phase_ctl: Arc<super::stream::PhaseCtl>,
-    pub(super) reconfig_tx: std::sync::mpsc::Sender<punktfunk_core::Mode>,
-    pub(super) keyframe_tx: std::sync::mpsc::Sender<()>,
-    pub(super) rfi_tx: std::sync::mpsc::Sender<(u32, u32)>,
-    pub(super) bitrate_tx: std::sync::mpsc::Sender<u32>,
-    pub(super) probe_tx: std::sync::mpsc::Sender<ProbeRequest>,
-    /// The client's bring-up ramp may still be running: its steps are served
-    /// on the punched-but-idle data plane, and the spacing below would let
-    /// one step through and refuse the rest. Cleared when the send thread
-    /// takes the session over (`stream::ramp`).
-    pub(super) ramp_open: Arc<AtomicBool>,
-    pub(super) probe_result_rx: tokio::sync::mpsc::UnboundedReceiver<ProbeResult>,
-    pub(super) reconfig_result_rx: tokio::sync::mpsc::UnboundedReceiver<Reconfigured>,
-    /// The rate the encoder settled on, with what settled it. Forwarded as
-    /// `BitrateChanged` so the client's climb base tracks the encoder: a
-    /// rebuild's own re-resolve is `Granted`, a short apply an `EncoderLimit`.
-    pub(super) retarget_rx: tokio::sync::mpsc::UnboundedReceiver<(u32, AckReason)>,
-    /// Rebuild stall duration in ms. Forwarded as `PipelineGap` so the client
-    /// bitrate controller drops the report window that straddled our stall.
-    pub(super) gap_rx: tokio::sync::mpsc::UnboundedReceiver<u32>,
-    /// Wire-MTU watcher → `ShardPayloadChanged` (this task is the sole writer).
-    /// Client `ShardPayloadAck`s return on `shard_ack_tx` and gate a grow.
-    pub(super) shard_change_rx: tokio::sync::mpsc::UnboundedReceiver<u16>,
-    pub(super) shard_ack_tx: tokio::sync::mpsc::UnboundedSender<u16>,
-    /// Depth-1 latest-wins slot: the encode loop overwrites a shape this task
-    /// has not drained, so a stalled peer cannot grow the host.
-    pub(super) cursor_shape_rx:
-        tokio::sync::watch::Receiver<Option<punktfunk_core::quic::CursorShape>>,
-    pub(super) cursor_client_draws: Arc<AtomicBool>,
+    /// The control halves of the session's channels to the stream thread.
+    pub(super) ends: super::wiring::ControlEnds,
+    /// Encoder truth read at `SetBitrate`, so the ack never exceeds what the encoder will run,
+    /// and the FEC, link, ramp and cursor values this task shares with the stream thread.
+    pub(super) shared: super::wiring::SessionShared,
     pub(super) clip_enabled: Arc<AtomicBool>,
     pub(super) clip: pf_clipboard::ClipCoord,
     /// LIVE grant mask, same atomic the datagram filter reads. Deadline/watch
@@ -280,6 +234,8 @@ pub(super) struct Task {
         tokio::sync::mpsc::UnboundedReceiver<punktfunk_core::quic::LaunchOutcome>,
     /// Named on the per-minute `link health` line, so a journal sorts by client.
     pub(super) peer: std::net::IpAddr,
+    /// Which plane carries this session; named on grant-drop warnings.
+    pub(super) plane: crate::events::Plane,
     /// Shared block the encode and send threads bump; this task drains its link half.
     pub(super) counters: Arc<crate::session_status::SessionCounters>,
     /// Armed capture the per-minute line is also written into, so a bug report is one file.
@@ -301,29 +257,35 @@ pub(super) async fn run(task: Task) {
         wire_bytes,
         audio_kbps,
         ack_reason,
-        live_bitrate,
-        encoder_ceiling,
-        cadence_degraded,
-        cadence_behind_score,
-        client_packets_received,
-        fec_target,
-        fec_requested,
-        link_kbps,
-        phase_ctl,
-        reconfig_tx,
-        keyframe_tx,
-        rfi_tx,
-        bitrate_tx,
-        probe_tx,
-        mut probe_result_rx,
-        ramp_open,
-        mut reconfig_result_rx,
-        mut retarget_rx,
-        mut gap_rx,
-        mut shard_change_rx,
-        shard_ack_tx,
-        mut cursor_shape_rx,
-        cursor_client_draws,
+        ends:
+            super::wiring::ControlEnds {
+                reconfig_tx,
+                keyframe_tx,
+                rfi_tx,
+                bitrate_tx,
+                probe_tx,
+                mut probe_result_rx,
+                mut reconfig_result_rx,
+                mut retarget_rx,
+                mut gap_rx,
+                mut shard_change_rx,
+                shard_ack_tx,
+                mut cursor_shape_rx,
+            },
+        shared:
+            super::wiring::SessionShared {
+                live_bitrate,
+                encoder_ceiling,
+                cadence_degraded,
+                cadence_behind_score,
+                client_packets_received,
+                fec_target,
+                fec_requested,
+                link_kbps,
+                phase: phase_ctl,
+                ramp_open,
+                cursor_client_draws,
+            },
         clip_enabled,
         clip,
         session_grants,
@@ -332,6 +294,7 @@ pub(super) async fn run(task: Task) {
         mut pad_slots_rx,
         mut launch_outcome_rx,
         peer,
+        plane,
         counters,
         stats,
     } = task;
@@ -345,7 +308,7 @@ pub(super) async fn run(task: Task) {
     let mut clip_offer_closed = false;
     // First-of-class `warn!` for grant drops. A revoked client spamming the
     // gated messages must not flood the log.
-    let denied = GrantDrops::new();
+    let mut denied = crate::session_status::GrantDrops::new(plane);
     // Same closed-channel discipline as `clip_offer_closed`.
     let mut shard_change_closed = false;
     // `--open` anonymous sessions never spawn deadline/watch; the sender

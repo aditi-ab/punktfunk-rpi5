@@ -10,7 +10,7 @@
 //!
 //! Steam's SET_REPORT features and `0x80..` haptic OUTPUT reports come back
 //! kind-tagged (bit 31 of the slot length,
-//! [`pf_driver_proto::triton::OUT_FEATURE_BIT`], [`OutputDrain::drain_tagged`])
+//! [`pf_driver_proto::triton::OUT_FEATURE_BIT`], [`crate::pad_shm_ring::OutputDrain`])
 //! and go to the client as `HidOutput::HidRaw`. Rumble is also parsed from the
 //! untagged OUTPUT plane onto 0xCA so a phone-mirror path works without raw.
 //!
@@ -18,144 +18,86 @@
 //! [`DEVTYPE_TRITON`]. The real wired Triton is single-interface: no `MI_`
 //! token; SDL matches `28DE:1302` on VID/PID alone, so `usb_mi` is `None`.
 
-use super::dualsense_windows::{
-    create_swdevice, driver_marks, publish_input, stamp_pad, OutputDrain, SwDeviceProfile, SHM_SIZE,
-};
-use super::gamepad_raii::{DriverAttach, PadChannel, ProofTransport, SwDevice};
-use crate::triton_proto::{
-    parse_triton_rumble, serialize_triton_state, triton_serial, TritonState, TRITON_STATE_LEN,
-};
+use super::gamepad_raii::SwDeviceProfile;
+use super::pad_shm::ShmPad;
+use crate::triton_proto::{parse_triton_rumble, triton_serial, TritonState};
 use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::Result;
 use pf_driver_proto::gamepad::DEVTYPE_TRITON;
 use punktfunk_core::quic::{HidOutput, RichInput, HID_RAW_FEATURE, HID_RAW_OUTPUT};
-use std::time::Duration;
 
 /// INF hardware id. A package rename must not touch it.
 pub(super) const TRITON_HWID: &str = "pf_triton";
 
 /// One virtual SC2: `SwDeviceCreate`'d `pf_triton_<index>` plus the sealed
-/// channel. Drop removes the devnode and both sections. `pub` because it is
-/// `PadProto::Pad`.
+/// channel. `pub` because it is `PadProto::Pad`.
 pub struct TritonWinPad {
-    /// Devnode RAII (`SwDeviceClose` on drop).
-    _sw: Option<SwDevice>,
-    channel: PadChannel,
-    attach: DriverAttach,
+    shm: ShmPad,
     /// Synth-mode sequence only. The raw path mirrors the physical pad's
     /// bytes, its own sequence byte included.
     seq: u8,
-    /// v2.3 input-seqlock generation — see `publish_input`.
-    input_gen: u32,
-    /// Kind-tagged FEATURE/OUTPUT split — see [`OutputDrain::drain_tagged`].
-    drain: OutputDrain,
 }
 
 impl TritonWinPad {
-    /// Stamp `device_type` first and magic last, then spawn `pf_triton_<index>`.
     fn open(index: u8) -> Result<TritonWinPad> {
-        let boot_name = pf_driver_proto::gamepad::pad_boot_name(index);
-        let mut channel = PadChannel::create(boot_name.clone(), SHM_SIZE)?;
-        // Ring capability `2` = "this host drains the v2.2 long ring".
-        stamp_pad(
-            channel.data(),
-            DEVTYPE_TRITON,
+        let shm = ShmPad::open(
             index,
-            2,
+            DEVTYPE_TRITON,
             &neutral_triton_report(),
-        );
-        let inst = format!("pf_triton_{index}");
-        let (hsw, instance_id) = create_swdevice(&SwDeviceProfile {
-            instance: &inst,
-            container_tag: 0x5046_4453, // "PFDS"
-            container_index: index,
-            hwid: TRITON_HWID,
-            usb_vid_pid: "VID_28DE&PID_1302",
-            // Single-interface wired Triton — no MI_ token; SDL claims 0x1302 on
-            // VID/PID only. If Steam balks, A/B `Some(0)` (Deck needed `Some(2)`).
-            usb_mi: None,
-            description: "Punktfunk Virtual Steam Controller",
-            enumerator: "punktfunk",
-        })?; // Propagate — swallowing latches the slot to a pad with no devnode.
-        let (hsw, instance_id) = (Some(hsw), instance_id);
-        // Bind the DATA section to THIS devnode, not the pid the LocalService-writable
-        // mailbox names.
-        channel.bind_devnode(
-            index as u32,
-            instance_id.clone(),
-            ProofTransport::HidFeatureReport,
-        );
-        let _sw = hsw.map(SwDevice::new);
-        // The driver must read `device_type = Triton` before hidclass asks for
-        // descriptors, or the pad enumerates as DualSense.
-        channel.deliver_eager(Duration::from_millis(1500));
-        Ok(TritonWinPad {
-            _sw,
-            channel,
-            attach: DriverAttach::new(
-                TRITON_HWID,
-                "pf_gamepad.inf", // one INF serves every identity
-                "C:\\Windows\\ServiceProfiles\\LocalService\\AppData\\Local\\Temp\\pf_gamepad-driver.log",
-                boot_name,
-                instance_id,
-            ),
-            seq: 0,
-            input_gen: 0,
-            drain: OutputDrain::new(),
-        })
+            &SwDeviceProfile {
+                instance: &format!("pf_triton_{index}"),
+                container_tag: 0x5046_4453, // "PFDS"
+                container_index: index,
+                hwid: TRITON_HWID,
+                usb_vid_pid: Some("VID_28DE&PID_1302"),
+                // Single-interface wired Triton — no MI_ token; SDL claims 0x1302 on
+                // VID/PID only. If Steam balks, A/B `Some(0)` (Deck needed `Some(2)`).
+                usb_mi: None,
+                description: "Punktfunk Virtual Steam Controller",
+                enumerator: "punktfunk",
+            },
+        )?;
+        Ok(TritonWinPad { shm, seq: 0 })
     }
 
     fn write_state(&mut self, st: &TritonState) {
-        let mut r = [0u8; 64];
-        if st.raw_len > 0 {
-            let len = (st.raw_len as usize).min(st.raw.len()).min(r.len());
-            r[..len].copy_from_slice(&st.raw[..len]);
-        } else {
-            self.seq = self.seq.wrapping_add(1);
-            let mut s = [0u8; TRITON_STATE_LEN];
-            serialize_triton_state(&mut s, st, self.seq);
-            r[..TRITON_STATE_LEN].copy_from_slice(&s);
-        }
-        publish_input(self.channel.data(), &mut self.input_gen, &r);
+        // The whole 64-byte slot: the driver trims to the report id's declared length.
+        let (r, _) = st.report(&mut self.seq);
+        self.shm.publish(&r);
     }
 
     /// Drain Steam writes: rumble on 0xCA from untagged OUTPUT only (FEATURE
     /// is never rumble); raw kind-tagged for `[0xCD][0x05]`. `resync` is the
     /// ring-overflow flag and must reach `PadFeedback` unchanged.
     fn service(&mut self, idx: u8) -> (Option<(u16, u16)>, Vec<HidOutput>, bool) {
-        self.channel.pump();
-        let (proto, rev) = driver_marks(self.channel.data());
-        self.attach.observe_pad(proto, rev);
         let mut rumble = None;
         let mut hidout = Vec::new();
-        let resync = self
-            .drain
-            .drain_tagged(self.channel.data(), |bytes, feature| {
-                // hidclass pads writes to 64; Linux forwards native length (0x80
-                // rumble is 10). Trim OUTPUT to `out_report_len` so GATT is not
-                // padded. FEATURE stays whole (Steam SETs full reports). Ring
-                // slices are non-empty; salvage/legacy is a fixed 64-byte slice.
-                let bytes = match (feature, bytes.first()) {
-                    (false, Some(&id)) => {
-                        &bytes[..bytes.len().min(pf_driver_proto::triton::out_report_len(id))]
-                    }
-                    _ => bytes,
-                };
-                if !feature {
-                    if let Some(r) = parse_triton_rumble(bytes) {
-                        rumble = Some(r);
-                    }
+        let resync = self.shm.poll(|bytes, feature| {
+            // hidclass pads writes to 64; Linux forwards native length (0x80
+            // rumble is 10). Trim OUTPUT to `out_report_len` so GATT is not
+            // padded. FEATURE stays whole (Steam SETs full reports). Ring
+            // slices are non-empty; salvage/legacy is a fixed 64-byte slice.
+            let bytes = match (feature, bytes.first()) {
+                (false, Some(&id)) => {
+                    &bytes[..bytes.len().min(pf_driver_proto::triton::out_report_len(id))]
                 }
-                hidout.push(HidOutput::HidRaw {
-                    pad: idx,
-                    kind: if feature {
-                        HID_RAW_FEATURE
-                    } else {
-                        HID_RAW_OUTPUT
-                    },
-                    data: bytes.to_vec(),
-                });
+                _ => bytes,
+            };
+            if !feature {
+                if let Some(r) = parse_triton_rumble(bytes) {
+                    rumble = Some(r);
+                }
+            }
+            hidout.push(HidOutput::HidRaw {
+                pad: idx,
+                kind: if feature {
+                    HID_RAW_FEATURE
+                } else {
+                    HID_RAW_OUTPUT
+                },
+                data: bytes.to_vec(),
             });
+        });
         (rumble, hidout, resync)
     }
 }
@@ -194,46 +136,17 @@ impl PadProto for TritonWinProto {
         Ok(p)
     }
 
-    fn neutral(&self) -> TritonState {
-        TritonState::neutral()
-    }
-
     fn merge_frame(
         &self,
         prev: &TritonState,
         f: &punktfunk_core::input::GamepadFrame,
     ) -> TritonState {
-        let mut s = TritonState::from_gamepad(
-            f.buttons,
-            f.ls_x,
-            f.ls_y,
-            f.rs_x,
-            f.rs_y,
-            f.left_trigger,
-            f.right_trigger,
-        );
-        // As-is mode is sticky: a typed frame between two raw reports must not
-        // flap the pad back to synth (the client sends both planes).
-        s.raw = prev.raw;
-        s.raw_len = prev.raw_len;
-        s
+        TritonState::merge_frame(prev, f)
     }
 
     fn apply_rich(&self, st: &mut TritonState, rich: RichInput) {
-        if let RichInput::HidReport { len, data, .. } = rich {
-            let len = (len as usize).min(data.len()).min(st.raw.len());
-            if len == 0 {
-                return;
-            }
-            st.raw[..len].copy_from_slice(&data[..len]);
-            st.raw_len = len as u8;
-        }
-        // Touchpad/Motion/TouchpadEx: nothing to fold — the raw feed carries
-        // pads + IMU, and the synth fallback has no surface for them.
+        st.apply_rich(rich);
     }
-
-    // `neutralize_gyro` / `clear_rich` stay the trait no-ops: this device never
-    // sees `RichInput::Motion`, and motion lives in an opaque passthrough report.
 
     fn write_state(&self, pad: &mut TritonWinPad, st: &TritonState) {
         pad.write_state(st);

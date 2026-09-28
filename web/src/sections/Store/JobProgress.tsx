@@ -1,7 +1,8 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { CheckCircle2, RotateCw, X, XCircle } from "lucide-react";
 import { type FC, useEffect, useRef } from "react";
-import { invalidateStore, type StoreJob, useStoreJob } from "@/api/store";
+import type { Job } from "@/api/gen/model";
+import { invalidateStore, useStoreJob } from "@/api/store";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Spinner } from "@/components/ui/spinner";
@@ -47,7 +48,7 @@ export const JobProgressSection: FC<{
 	 * learns it may start the next install. The host takes one package operation at a time, so the
 	 * run has to be driven by this rather than by a timer.
 	 */
-	onSettled?: (job: StoreJob) => void;
+	onSettled?: (job: Job) => void;
 	step?: BatchStep;
 }> = ({ jobId, onDismiss, onSettled, step }) => {
 	const qc = useQueryClient();
@@ -123,7 +124,7 @@ export const BatchPendingCard: FC<{ step: BatchStep }> = ({ step }) => (
 
 /** The progress card: phase (or outcome), a collapsible log tail, and the failure reason if any. */
 export const JobProgressCard: FC<{
-	job: StoreJob;
+	job: Job;
 	onDismiss: () => void;
 	step?: BatchStep;
 }> = ({ job, onDismiss, step }) => {

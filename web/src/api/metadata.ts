@@ -113,6 +113,14 @@ export const searchSource = (id: string, entry: string, term: string) =>
 export const setSourceMatch = (id: string, entry: string, key: string | null) =>
 	call<SourceMatch>(id, "match", {}, { method: "PUT", body: { entry, key } });
 
-/** An `http(s)` URL the host will store as a pick. */
+/**
+ * An `http(s)` URL the host will store as a pick: at most 2048 UTF-8 bytes, no whitespace or
+ * control characters. clients/shared/library-id-vectors.json pins it.
+ */
 export const isHttpUrl = (v: string): boolean =>
-	/^https?:\/\/\S+$/.test(v) && v.length <= 2048;
+	/^https?:\/\/./.test(v) &&
+	new TextEncoder().encode(v).length <= 2048 &&
+	![...v].some((c) => {
+		const n = c.charCodeAt(0);
+		return n < 0x20 || (n >= 0x7f && n <= 0x9f) || /\s/.test(c);
+	});

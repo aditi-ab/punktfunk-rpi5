@@ -32,39 +32,15 @@ impl PadProto for DsEdgeWinProto {
         Ok(p)
     }
 
-    fn neutral(&self) -> DsState {
-        DsState::neutral()
-    }
-
     /// Paddles OR onto `buttons[2]` each frame — they ride the button plane, not `prev`.
     fn merge_frame(&self, prev: &DsState, f: &punktfunk_core::input::GamepadFrame) -> DsState {
-        let mut s = DsState::from_gamepad(
-            f.buttons,
-            f.ls_x,
-            f.ls_y,
-            f.rs_x,
-            f.rs_y,
-            f.left_trigger,
-            f.right_trigger,
-        );
+        let mut s = DsState::merge_frame(prev, f, f.buttons);
         s.buttons[2] |= edge_paddle_bits(f.buttons);
-        s.touch = prev.touch;
-        s.gyro = prev.gyro;
-        s.accel = prev.accel;
-        s.touch_click = prev.touch_click;
         s
     }
 
     fn apply_rich(&self, st: &mut DsState, rich: RichInput) {
         st.apply_rich(rich, DS_TOUCH_W, DS_TOUCH_H);
-    }
-
-    fn neutralize_gyro(&self, st: &mut DsState) -> bool {
-        st.neutralize_gyro()
-    }
-
-    fn clear_rich(&self, st: &mut DsState) {
-        st.clear_rich();
     }
 
     fn write_state(&self, pad: &mut DsWinPad, st: &DsState) {

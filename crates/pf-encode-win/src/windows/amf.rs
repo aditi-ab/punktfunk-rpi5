@@ -12,14 +12,14 @@
 
 use super::policy::{intra_refresh_period, intra_refresh_requested, ltr_test_force_at};
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
-use crate::retrieve::Ready;
+use crate::retrieve::{AuQueue, FirstAuLog, RetrieveThread};
 use anyhow::{anyhow, bail, Context, Result};
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use windows::core::{h, w, Interface, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HMODULE, LUID};
 use windows::Win32::Graphics::Direct3D11::{
@@ -791,7 +791,7 @@ impl Drop for Buffer {
 const RING: usize = 6;
 
 /// Process-wide count of successful `Init`s. A climbing number with no following first-AU log
-/// ([`Inner::note_first_au`]) is a silent VCN-session wedge.
+/// ([`FirstAuLog`]) is a silent VCN-session wedge.
 static AMF_CONTEXTS_OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// How long the retrieve thread lets `QueryOutput` block before it looks at the stop flag. The
@@ -799,87 +799,35 @@ static AMF_CONTEXTS_OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// on an idle encoder.
 const QUERY_TIMEOUT_MS: i64 = 50;
 
-/// What the retrieve thread and the encode thread share. The component is deliberately not in
-/// here: AMF documents `SubmitInput` and `QueryOutput` as a thread pair, so only the two queues
-/// need a lock, and it is never held across a `QueryOutput`.
-#[derive(Default)]
-struct Out {
-    /// `(pts_ns, forced-IDR, recovery-anchor)` in submit order — `submit` pushes, the retrieve
-    /// thread pops. Its length is the surfaces AMF still holds, which is what back-pressure reads.
-    pending: VecDeque<(u64, bool, bool)>,
-    /// Finished AUs waiting for `poll`.
-    ready: VecDeque<EncodedFrame>,
-    /// First typed `QueryOutput` failure. `poll` surfaces it so the caller resets, exactly as it
-    /// did when the call was on the encode thread.
-    err: Option<String>,
-}
+/// What the retrieve thread and the encode thread share: `(pts_ns, forced-IDR, recovery-anchor)`
+/// per submitted frame. The component is deliberately not in here: AMF documents `SubmitInput` and
+/// `QueryOutput` as a thread pair, so only the queue needs a lock, and it is never held across a
+/// `QueryOutput`.
+type OutQueue = AuQueue<(u64, bool, bool)>;
 
-/// The retrieve thread and its signal. It owns every `QueryOutput` on the component, so the
-/// encode thread never waits on VCN — it takes finished AUs off a queue, and a caller that parks
-/// on handles takes [`Ready`] instead.
+/// The retrieve thread and its queue. The thread owns every `QueryOutput` on the component, so
+/// the encode thread never waits on VCN — it takes finished AUs off the queue, and a caller that
+/// parks on handles takes the queue's signal instead.
 ///
 /// Dropping this stops and joins, and the joined thread has dropped its `Arc` of the component.
 /// [`Inner`] declares it first so the component's last reference, and its Terminate, stay on the
 /// encode thread; [`AmfEncoder::reset`] stops it by hand to get `&mut` for the re-Init.
 struct Retrieve {
-    out: Arc<Mutex<Out>>,
-    have: Arc<Ready>,
-    stop: Arc<AtomicBool>,
-    join: Option<std::thread::JoinHandle<()>>,
+    q: Arc<OutQueue>,
+    thread: RetrieveThread,
 }
 
 impl Retrieve {
     /// Start a thread draining `comp`. `blocking` says `QueryTimeout` took, so the loop parks in
     /// `QueryOutput` instead of sampling.
     fn start(comp: Arc<Component>, props: &CodecProps, blocking: bool) -> Result<Self> {
-        let out: Arc<Mutex<Out>> = Arc::default();
-        let have = Arc::new(Ready::new().ok_or_else(|| anyhow!("AMF: no completion event"))?);
-        let stop = Arc::new(AtomicBool::new(false));
+        let q = Arc::new(OutQueue::new("AMF")?);
         let (odt, okm) = (props.output_data_type, props.output_key_max);
-        let (t_out, t_have, t_stop) = (out.clone(), have.clone(), stop.clone());
-        let join = std::thread::Builder::new()
-            .name("punktfunk-amf-out".into())
-            .spawn(move || retrieve_loop(comp, odt, okm, blocking, t_out, t_have, t_stop))
-            .context("spawn AMF retrieve thread")?;
-        Ok(Self {
-            out,
-            have,
-            stop,
-            join: Some(join),
-        })
-    }
-
-    /// Surfaces AMF still holds — the back-pressure reading.
-    fn in_flight(&self) -> usize {
-        lock(&self.out).pending.len()
-    }
-
-    /// Retire the thread and wait for it to leave `QueryOutput`. Idempotent; the queues survive
-    /// so a caller can inspect them, and [`Self::reset_queues`] is what empties them.
-    fn stop_and_join(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
-    }
-
-    /// Forfeit everything owed — a re-Init voids the reference chain, so the AUs behind it are
-    /// no longer decodable against what the client holds.
-    fn reset_queues(&self) {
-        let mut g = lock(&self.out);
-        g.pending.clear();
-        g.ready.clear();
-        g.err = None;
-        self.have.clear();
-    }
-}
-
-impl Drop for Retrieve {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
+        let t_q = q.clone();
+        let thread = RetrieveThread::spawn("punktfunk-amf-out", move |stop| {
+            retrieve_loop(comp, odt, okm, blocking, &t_q, &stop)
+        })?;
+        Ok(Self { q, thread })
     }
 }
 
@@ -890,34 +838,34 @@ fn retrieve_loop(
     output_data_type: &'static HSTRING,
     output_key_max: i64,
     blocking: bool,
-    out: Arc<Mutex<Out>>,
-    have: Arc<Ready>,
-    stop: Arc<AtomicBool>,
+    q: &OutQueue,
+    stop: &AtomicBool,
 ) {
     pf_frame::thread_qos::boost_thread_priority(false);
     while !stop.load(Ordering::Acquire) {
         match drain_one_output(&comp, output_data_type, output_key_max) {
             Ok(DrainOutcome::Frame { data, key_prop }) => {
-                let mut g = lock(&out);
+                let mut g = q.lock();
                 // An AU with no submit behind it would pair every later AU with the wrong
                 // pts, keyframe flag and anchor; that is a reset, never a renumbering.
                 let Some((pts_ns, forced, recovery_anchor)) = g.pending.pop_front() else {
-                    g.err
-                        .get_or_insert_with(|| "AMF produced an AU with no submit pending".into());
-                    have.set();
+                    q.fail(&mut g, || {
+                        "AMF produced an AU with no submit pending".into()
+                    });
                     return;
                 };
-                g.ready.push_back(EncodedFrame {
-                    data,
-                    pts_ns,
-                    keyframe: key_prop || forced,
-                    recovery_anchor,
-                    recovery_point: false,
-                    recovery_close: false,
-                    chunk_aligned: false,
-                });
-                // Under the lock, so it cannot race the clear `poll` does when it empties.
-                have.set();
+                q.publish(
+                    &mut g,
+                    EncodedFrame {
+                        data,
+                        pts_ns,
+                        keyframe: key_prop || forced,
+                        recovery_anchor,
+                        recovery_point: false,
+                        recovery_close: false,
+                        chunk_aligned: false,
+                    },
+                );
             }
             // `flush` owns the queue across a drain; a clear here could land on a frame queued
             // behind the Drain. EOF repeats on every call while the component sits drained and
@@ -935,9 +883,7 @@ fn retrieve_loop(
                 }
             }
             Err(e) => {
-                let mut g = lock(&out);
-                g.err.get_or_insert_with(|| format!("{e:#}"));
-                have.set();
+                q.fail(&mut q.lock(), || format!("{e:#}"));
                 return;
             }
         }
@@ -972,54 +918,7 @@ struct Inner {
     held: VecDeque<ID3D11Texture2D>,
     /// Last `*InHDRMetadata` pushed to this component — re-push on change or rebuild.
     hdr_pushed: Option<pf_frame::HdrMeta>,
-    /// Gates the one-shot first-AU log. Absence after a context-created line is a VCN wedge.
-    first_au_logged: bool,
-}
-
-impl Inner {
-    /// One-shot first-AU log. Pairs a context-created line with proof VCN actually encodes.
-    fn note_first_au(&mut self, au: &EncodedFrame) {
-        if !self.first_au_logged {
-            self.first_au_logged = true;
-            tracing::info!(
-                bytes = au.data.len(),
-                keyframe = au.keyframe,
-                "AMF produced its first AU on this context"
-            );
-        }
-    }
-
-    /// The oldest finished AU, or the retrieve thread's failure. Clears the signal as the queue
-    /// empties — under the same lock the thread sets it under, so the two cannot cross.
-    fn pop_ready(&mut self) -> Result<Option<EncodedFrame>> {
-        let mut g = lock(&self.retrieve.out);
-        if let Some(e) = g.err.take() {
-            bail!("{e}");
-        }
-        let au = g.ready.pop_front();
-        if g.ready.is_empty() {
-            self.retrieve.have.clear();
-        }
-        Ok(au)
-    }
-
-    /// [`Self::pop_ready`], waiting up to `wait_ms` for the thread to produce one. The bounded
-    /// wait every caller of `poll` already expected, now a handle wait rather than a sample loop.
-    fn take_ready(&mut self, wait_ms: u32) -> Result<Option<EncodedFrame>> {
-        if let Some(au) = self.pop_ready()? {
-            return Ok(Some(au));
-        }
-        if !self.retrieve.have.wait(wait_ms) {
-            return Ok(None);
-        }
-        self.pop_ready()
-    }
-}
-
-/// The queue lock, poison-tolerant: a retrieve thread that panicked leaves the AUs it already
-/// handed over readable, and its error field is what tells `poll` to reset.
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|p| p.into_inner())
+    first_au: FirstAuLog,
 }
 
 pub struct AmfEncoder {
@@ -1466,7 +1365,7 @@ impl AmfEncoder {
             next: 0,
             held: VecDeque::new(),
             hdr_pushed: None,
-            first_au_logged: false,
+            first_au: FirstAuLog::new("AMF produced its first AU on this context"),
         });
         Ok(())
     }
@@ -1509,7 +1408,7 @@ fn push_hdr_metadata(
 /// Can this GPU's AMF runtime `Init` a `codec` encoder on the selected render adapter?
 /// Tears down before return. `false` on any failure, including no runtime.
 pub fn probe_can_encode(codec: Codec, adapter_luid: Option<LUID>) -> bool {
-    let Some(device) = selected_adapter_device(adapter_luid) else {
+    let Some(device) = pf_frame::dxgi::probe_device(adapter_luid, Default::default()) else {
         return false;
     };
     probe_can_encode_on(&device, codec)
@@ -1526,7 +1425,7 @@ pub fn probe_can_encode_10bit(codec: Codec, adapter_luid: Option<LUID>) -> bool 
     if !codec.supports_10bit() {
         return false;
     }
-    let Some(device) = selected_adapter_device(adapter_luid) else {
+    let Some(device) = pf_frame::dxgi::probe_device(adapter_luid, Default::default()) else {
         return false;
     };
     probe_open_on(&device, codec, true)
@@ -1573,53 +1472,6 @@ fn probe_open_on(device: &ID3D11Device, codec: Codec, ten_bit: bool) -> bool {
         sys::AMF_SURFACE_NV12
     };
     comp.init(surface, 640, 480) == sys::AMF_OK
-}
-
-/// D3D11 device on the selected render adapter; OS default hardware adapter if unresolved.
-fn selected_adapter_device(adapter_luid: Option<LUID>) -> Option<ID3D11Device> {
-    use windows::Win32::Foundation::HMODULE;
-    use windows::Win32::Graphics::Direct3D::{
-        D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0,
-    };
-    use windows::Win32::Graphics::Direct3D11::{D3D11CreateDevice, D3D11_SDK_VERSION};
-    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory4};
-    // SAFETY: probe owns every handle. Factory/adapter COM objects or err → default fallback.
-    // `D3D11CreateDevice` fills `device` only on success. Everything drops with its COM wrapper.
-    unsafe {
-        let adapter: Option<IDXGIAdapter1> = adapter_luid.and_then(|luid| {
-            let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
-            factory.EnumAdapterByLuid(luid).ok()
-        });
-        let mut device: Option<ID3D11Device> = None;
-        let created = match &adapter {
-            Some(a) => D3D11CreateDevice(
-                a,
-                D3D_DRIVER_TYPE_UNKNOWN,
-                HMODULE::default(),
-                Default::default(),
-                Some(&[D3D_FEATURE_LEVEL_11_0]),
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                None,
-            ),
-            None => D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                HMODULE::default(),
-                Default::default(),
-                Some(&[D3D_FEATURE_LEVEL_11_0]),
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                None,
-            ),
-        };
-        if created.is_err() {
-            return None;
-        }
-        device
-    }
 }
 
 enum DrainOutcome {
@@ -1735,47 +1587,31 @@ impl AmfEncoder {
             .ltr
             .as_ref()
             .map(|l| (l.mark_ltr_index, l.force_ltr_bitfield));
-        let mut mark_slot: Option<usize> = None;
-        let mut force_slot: Option<usize> = None;
-        let mut recovery_anchor = false;
-        if self.ltr_active {
-            if forced {
-                // IDR resets decoder refs — drop stale LTR slots and any force queued against them.
-                self.ltr_slots = [None; NUM_LTR_SLOTS];
-                self.next_ltr_slot = 0;
-                self.pending_force = None;
-            } else if self.ltr_test_force_at == Some(cur_idx) {
-                // Spike hook: self-trigger the real invalidate path without a live client.
-                let triggered = self.invalidate_ref_frames(cur_idx, cur_idx);
-                tracing::info!(
-                    frame = cur_idx,
-                    triggered,
-                    "AMF LTR test hook fired invalidate_ref_frames"
-                );
-            }
-            // Apply a queued force to this frame. Skip if the taint sweep emptied the slot: the
-            // hardware still holds the tainted mark, so forcing it would re-reference the loss.
-            if let Some(slot) = self.pending_force.take() {
-                if self.ltr_slots[slot].is_some() {
-                    force_slot = Some(slot);
-                    recovery_anchor = true;
-                    // LTR_MODE_RESET_UNUSED, the default: referencing one slot discards the rest.
-                    for (s, marked) in self.ltr_slots.iter_mut().enumerate() {
-                        if s != slot {
-                            *marked = None;
-                        }
-                    }
-                }
-            }
-            // Mark on IDR and every interval, never on the recovery frame (would overwrite the force).
-            if force_slot.is_none() && (forced || cur_idx % self.ltr_mark_interval == 0) {
-                let trusted = self.ltr_slots.map(|m| m.is_some());
-                let slot = super::rfi::mark_slot(&trusted, self.next_ltr_slot);
-                self.ltr_slots[slot] = Some(cur_idx);
-                self.next_ltr_slot = (slot + 1) % NUM_LTR_SLOTS;
-                mark_slot = Some(slot);
-            }
+        if self.ltr_active && !forced && self.ltr_test_force_at == Some(cur_idx) {
+            // Spike hook: self-trigger the real invalidate path without a live client.
+            let triggered = self.invalidate_ref_frames(cur_idx, cur_idx);
+            tracing::info!(
+                frame = cur_idx,
+                triggered,
+                "AMF LTR test hook fired invalidate_ref_frames"
+            );
         }
+        let LtrStep {
+            mark_slot,
+            force_slot,
+        } = if self.ltr_active {
+            ltr_step(
+                &mut self.ltr_slots,
+                &mut self.next_ltr_slot,
+                &mut self.pending_force,
+                forced,
+                cur_idx,
+                self.ltr_mark_interval,
+            )
+        } else {
+            LtrStep::default()
+        };
+        let recovery_anchor = force_slot.is_some();
         #[cfg(test)]
         if self.fail_submit_at == Some(cur_idx) {
             bail!("test hook: frame {cur_idx} refused after the LTR decision");
@@ -1804,25 +1640,10 @@ impl AmfEncoder {
         // a wedge. No progress for the whole budget is a genuine wedge.
         // In place, the caller's declared depth is the bound; copying, it is our own ring.
         let cap = in_place.unwrap_or(RING);
-        if inner.retrieve.in_flight() >= cap {
-            let deadline = std::time::Instant::now() + INPUT_DRAIN_BUDGET;
-            // The retrieve thread is what frees a slot now; this only waits for it, and a whole
-            // budget with no progress is the same wedge it always was.
-            while inner.retrieve.in_flight() >= cap {
-                if let Some(e) = lock(&inner.retrieve.out).err.take() {
-                    bail!("{e}");
-                }
-                if std::time::Instant::now() >= deadline {
-                    bail!(
-                        "AMF produced no output for {} ms with {} frame(s) in flight — \
-                         wedged (escalating to reset)",
-                        INPUT_DRAIN_BUDGET.as_millis(),
-                        inner.retrieve.in_flight()
-                    );
-                }
-                std::thread::sleep(std::time::Duration::from_micros(250));
-            }
-        }
+        inner
+            .retrieve
+            .q
+            .wait_until(INPUT_DRAIN_BUDGET, "AMF output", |o| o.pending.len() < cap)?;
         let slot = inner.next % RING;
         inner.next += 1;
         // The texture the hardware will read: the caller's own when it declared a depth deep
@@ -1918,7 +1739,10 @@ impl AmfEncoder {
         // Queued before the component takes the frame: the retrieve thread can pop for it the
         // moment SubmitInput returns, so a push after that races an empty queue. A refusal
         // below takes the entry back off.
-        lock(&inner.retrieve.out)
+        inner
+            .retrieve
+            .q
+            .lock()
             .pending
             .push_back((captured.pts_ns, forced, recovery_anchor));
         let mut r = inner.comp.submit_input(&surf);
@@ -1937,7 +1761,7 @@ impl AmfEncoder {
         }
         // NEED_MORE_INPUT = accepted; no AU owed for this submit alone.
         if !matches!(r, sys::AMF_OK | sys::AMF_NEED_MORE_INPUT) {
-            lock(&inner.retrieve.out).pending.pop_back();
+            inner.retrieve.q.lock().pending.pop_back();
             if r == sys::AMF_INPUT_FULL {
                 bail!("AMF SubmitInput stayed AMF_INPUT_FULL past the drain budget — wedged");
             }
@@ -1945,6 +1769,54 @@ impl AmfEncoder {
         }
         Ok(())
     }
+}
+
+/// One frame's LTR action, decided before the surface is built.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LtrStep {
+    /// Mark this frame long-term into the slot.
+    mark_slot: Option<usize>,
+    /// Force-reference the slot; the AU is a recovery anchor.
+    force_slot: Option<usize>,
+}
+
+/// This frame's LTR mark and force over the slot mirror. An IDR empties the mirror and drops a
+/// queued force. A queued force needs its slot still marked: the taint sweep empties a slot
+/// whose tainted mark the hardware still holds, and forcing it would re-reference the loss. A
+/// force clears every other slot (`LTR_MODE_RESET_UNUSED`, the default: referencing one slot
+/// discards the rest) and takes the frame's mark, which would overwrite it.
+fn ltr_step(
+    slots: &mut [Option<i64>; NUM_LTR_SLOTS],
+    next_slot: &mut usize,
+    pending_force: &mut Option<usize>,
+    forced: bool,
+    cur_idx: i64,
+    mark_interval: i64,
+) -> LtrStep {
+    let mut step = LtrStep::default();
+    if forced {
+        *slots = [None; NUM_LTR_SLOTS];
+        *next_slot = 0;
+        *pending_force = None;
+    }
+    if let Some(slot) = pending_force.take() {
+        if slots[slot].is_some() {
+            step.force_slot = Some(slot);
+            for (s, marked) in slots.iter_mut().enumerate() {
+                if s != slot {
+                    *marked = None;
+                }
+            }
+        }
+    }
+    if step.force_slot.is_none() && (forced || cur_idx % mark_interval == 0) {
+        let trusted = slots.map(|m| m.is_some());
+        let slot = super::rfi::mark_slot(&trusted, *next_slot);
+        slots[slot] = Some(cur_idx);
+        *next_slot = (slot + 1) % NUM_LTR_SLOTS;
+        step.mark_slot = Some(slot);
+    }
+    step
 }
 
 impl Encoder for AmfEncoder {
@@ -2062,9 +1934,9 @@ impl Encoder for AmfEncoder {
             // The same bound as before, now spent on the retrieve thread's event rather than on
             // a sample loop, so nothing else on this thread waits behind it.
             let budget_ms = (750 / self.fps.max(1)).clamp(1, 12);
-            let au = inner.take_ready(budget_ms)?;
+            let au = inner.retrieve.q.take_ready(budget_ms)?;
             if let Some(au) = &au {
-                inner.note_first_au(au);
+                inner.first_au.note(au);
             }
             au
         };
@@ -2078,7 +1950,7 @@ impl Encoder for AmfEncoder {
     /// The retrieve thread's signal, once a component exists. Before the lazy open there is
     /// nothing to wait on, which a caller reads as "no completion signal" and polls instead.
     fn ready_event(&self) -> Option<isize> {
-        self.inner.as_ref().map(|i| i.retrieve.have.raw())
+        self.inner.as_ref().map(|i| i.retrieve.q.raw())
     }
 
     /// Take the caller's promise about its own texture ring. At 2 or more this skips the
@@ -2122,8 +1994,8 @@ impl Encoder for AmfEncoder {
         }
         // Stop and join before Terminate: the retrieve thread is inside `QueryOutput` on this
         // very component, and a re-Init under it would run against a terminated one.
-        inner.retrieve.stop_and_join();
-        inner.retrieve.reset_queues(); // owed AUs forfeited; rebuilt stream restarts at IDR
+        inner.retrieve.thread.stop_and_join();
+        inner.retrieve.q.reset(); // owed AUs forfeited; rebuilt stream restarts at IDR
         inner.next = 0; // the rebuilt component's first frame is `opening` again
         inner.hdr_pushed = None; // re-Init'd component needs HDR metadata again
         let fmt = if self.ten_bit {
@@ -2250,10 +2122,10 @@ impl Encoder for AmfEncoder {
         // frame submitted after this can be paired with one. Past the budget the component is
         // at end-of-stream, so what is still owed never comes: those entries are stale.
         let deadline = std::time::Instant::now() + INPUT_DRAIN_BUDGET;
-        while inner.retrieve.in_flight() > 0 && std::time::Instant::now() < deadline {
+        while inner.retrieve.q.in_flight() > 0 && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_micros(250));
         }
-        let stale = std::mem::take(&mut lock(&inner.retrieve.out).pending).len();
+        let stale = std::mem::take(&mut inner.retrieve.q.lock().pending).len();
         if stale > 0 {
             tracing::warn!(stale, "AMF drain left frames without an AU");
         }
@@ -2264,6 +2136,55 @@ impl Encoder for AmfEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::smoke_pattern::nv12_texture;
+
+    /// An IDR empties the mirror, drops a queued force and marks slot 0.
+    #[test]
+    fn an_idr_resets_the_ltr_mirror_and_marks_slot_zero() {
+        let (mut slots, mut next, mut pending) = ([Some(3), Some(5)], 1, Some(1));
+        let step = ltr_step(&mut slots, &mut next, &mut pending, true, 9, 8);
+        assert_eq!(
+            step,
+            LtrStep {
+                mark_slot: Some(0),
+                force_slot: None
+            }
+        );
+        assert_eq!((slots, next, pending), ([Some(9), None], 1, None));
+    }
+
+    /// A queued force on a marked slot re-references it, clears the other slot and takes the
+    /// frame's mark. On a slot the taint sweep emptied it ships a plain P.
+    #[test]
+    fn a_queued_force_needs_a_marked_slot() {
+        let (mut slots, mut next, mut pending) = ([Some(0), Some(8)], 0, Some(0));
+        let step = ltr_step(&mut slots, &mut next, &mut pending, false, 16, 8);
+        assert_eq!(
+            step,
+            LtrStep {
+                mark_slot: None,
+                force_slot: Some(0)
+            }
+        );
+        assert_eq!((slots, pending), ([Some(0), None], None));
+        let (mut slots, mut pending) = ([None, Some(8)], Some(0));
+        let step = ltr_step(&mut slots, &mut next, &mut pending, false, 17, 8);
+        assert_eq!(step, LtrStep::default());
+        assert_eq!(pending, None, "a force is consumed either way");
+    }
+
+    /// Marks land on the interval, first on an empty slot, else round robin.
+    #[test]
+    fn a_mark_prefers_an_empty_slot() {
+        let (mut slots, mut next, mut pending) = ([Some(0), None], 0, None);
+        let step = ltr_step(&mut slots, &mut next, &mut pending, false, 15, 8);
+        assert_eq!(step, LtrStep::default(), "off the interval");
+        let step = ltr_step(&mut slots, &mut next, &mut pending, false, 16, 8);
+        assert_eq!(step.mark_slot, Some(1));
+        let step = ltr_step(&mut slots, &mut next, &mut pending, false, 24, 8);
+        assert_eq!(step.mark_slot, Some(0), "both marked: the round robin");
+        assert_eq!(slots, [Some(24), Some(16)]);
+    }
 
     // Layout of the FFI mirrors lives as `const _: ()` in `amf_sys.rs` (every build). This
     // checks little-endian union payload packing, which a size/align assert cannot express.
@@ -2285,6 +2206,9 @@ mod tests {
             max_fall: 400,
         }
     }
+
+    /// The bind flags every AMF test texture takes.
+    const BIND_SR: u32 = windows::Win32::Graphics::Direct3D11::D3D11_BIND_SHADER_RESOURCE.0 as u32;
 
     /// D3D11 device on the AMD adapter. `None` = no AMD GPU — caller skips.
     fn amd_d3d11_device() -> Option<ID3D11Device> {
@@ -2320,30 +2244,6 @@ mod tests {
             }
             None
         }
-    }
-
-    /// DEFAULT-usage NV12 texture (uninit GPU memory; content is irrelevant).
-    fn nv12_texture(device: &ID3D11Device, w: u32, h: u32) -> ID3D11Texture2D {
-        use windows::Win32::Graphics::Direct3D11::D3D11_BIND_SHADER_RESOURCE;
-        let desc = D3D11_TEXTURE2D_DESC {
-            Width: w,
-            Height: h,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: DXGI_FORMAT_NV12,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-            CPUAccessFlags: 0,
-            MiscFlags: 0,
-        };
-        let mut tex: Option<ID3D11Texture2D> = None;
-        // SAFETY: CreateTexture2D fills the out-param only on success; owned COM, this thread.
-        unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex)) }.expect("NV12 texture");
-        tex.expect("NV12 texture")
     }
 
     /// Live [`Encoder`] smoke per codec: submit/poll, native `reset()`, second batch, flush-drain.
@@ -2412,7 +2312,7 @@ mod tests {
             return;
         };
         let (w, h, fps) = (640u32, 480u32, 60u32);
-        let tex = nv12_texture(&device, w, h);
+        let tex = nv12_texture(&device, w, h, None, BIND_SR);
         let mut enc = match AmfEncoder::open(
             Codec::H264,
             PixelFormat::Nv12,
@@ -2474,7 +2374,7 @@ mod tests {
             return;
         };
         let (w, h, fps) = (640u32, 480u32, 60u32);
-        let tex = nv12_texture(&device, w, h);
+        let tex = nv12_texture(&device, w, h, None, BIND_SR);
         let mut enc = match AmfEncoder::open(
             Codec::H264,
             PixelFormat::Nv12,
@@ -2553,7 +2453,7 @@ mod tests {
             return;
         };
         let (w, h, fps) = (640u32, 480u32, 60u32);
-        let tex = nv12_texture(&device, w, h);
+        let tex = nv12_texture(&device, w, h, None, BIND_SR);
 
         for codec in [Codec::H265, Codec::H264, Codec::Av1] {
             // AV1 is RDNA3+: probe THIS device (`open` may pick a different GPU on a hybrid box).
@@ -2673,7 +2573,7 @@ mod tests {
             return;
         };
         let (w, h) = (640u32, 480u32);
-        let tex = nv12_texture(&device, w, h);
+        let tex = nv12_texture(&device, w, h, None, BIND_SR);
         let mut enc = match AmfEncoder::open(
             Codec::H264,
             PixelFormat::Nv12,
@@ -2771,56 +2671,24 @@ mod tests {
         );
     }
 
-    /// LTR anchors on hardware: the wave smokes' moving pattern, a loss every `PF_WAVE_GAP` frames
-    /// (default 40) answered `PF_WAVE_LAG` frames later (default 2) through
-    /// `invalidate_ref_frames`. The full stream and the view without the lost frames land in
-    /// `PUNKTFUNK_SMOKE_DIR` with `.idx` sidecars, for `gpu_parity`'s field hashers. HEVC, or
-    /// `PF_WAVE_CODEC=h264` or `av1` (an `.obu` for `field_av1`); shape `PF_WAVE_SMOKE=WxH:8:fps:mbps`, `PF_WAVE_SOAK` losses.
+    /// LTR anchors on hardware: the wave smokes' moving pattern with losses answered through
+    /// `invalidate_ref_frames`, shaped and dumped by [`crate::smoke_pattern::Soak`].
     ///
     /// `cargo test -p pf-encode-win --lib amf_ltr_anchor_soak -- --ignored --nocapture`
     #[test]
     #[ignore = "requires an AMD GPU with AMF — run manually on an AMD Windows box (.173)"]
     fn amf_ltr_anchor_soak() {
-        use crate::smoke_pattern::{scroll_pattern_nv12, write_capture};
-        use windows::Win32::Graphics::Direct3D11::{
-            D3D11_BIND_SHADER_RESOURCE, D3D11_SUBRESOURCE_DATA,
-        };
+        use crate::smoke_pattern::{nv12_scroll_frame, Soak};
         try_factory().expect("AMF runtime");
         let device = amd_d3d11_device().expect("an AMD adapter");
-        let shape = std::env::var("PF_WAVE_SMOKE").unwrap_or_else(|_| "256x256:8:60:2".into());
-        let mut parts = shape.split(':');
-        let (w, h) = parts
-            .next()
-            .and_then(|s| s.split_once('x'))
-            .map(|(w, h)| (w.parse::<u32>().unwrap(), h.parse::<u32>().unwrap()))
-            .expect("PF_WAVE_SMOKE=WxH[:8[:fps[:mbps]]]");
-        assert_ne!(parts.next(), Some("10"), "the soak feeds NV12");
-        let fps: u32 = parts.next().map_or(60, |f| f.parse().unwrap());
-        let mbps: u64 = parts.next().map_or(2, |m| m.parse().unwrap());
-        let count = |k: &str, d: usize| {
-            std::env::var(k)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(d)
-        };
-        let (losses, gap, lag) = (
-            count("PF_WAVE_SOAK", 12),
-            count("PF_WAVE_GAP", 40),
-            count("PF_WAVE_LAG", 2),
-        );
-        assert!(lag >= 1 && lag < gap, "PF_WAVE_LAG=1..PF_WAVE_GAP");
-        let (codec, ext) = match std::env::var("PF_WAVE_CODEC").as_deref() {
-            Ok("h264") => (Codec::H264, "h264"),
-            Ok("av1") => (Codec::Av1, "obu"),
-            _ => (Codec::H265, "h265"),
-        };
+        let soak = Soak::from_env();
         let mut enc = AmfEncoder::open(
-            codec,
+            soak.codec,
             PixelFormat::Nv12,
-            w,
-            h,
-            fps,
-            mbps * 1_000_000,
+            soak.w,
+            soak.h,
+            soak.fps,
+            soak.mbps * 1_000_000,
             8,
             ChromaFormat::Yuv420,
             false,
@@ -2832,112 +2700,14 @@ mod tests {
             enc.caps().supports_rfi,
             "the driver declined LTR: nothing to soak"
         );
-        let texture = |i: usize| {
-            let (w, h) = (w as usize, h as usize);
-            let nv12 = scroll_pattern_nv12(w, h, i);
-            let desc = D3D11_TEXTURE2D_DESC {
-                Width: w as u32,
-                Height: h as u32,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: DXGI_FORMAT_NV12,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-                CPUAccessFlags: 0,
-                MiscFlags: 0,
-            };
-            let init = D3D11_SUBRESOURCE_DATA {
-                pSysMem: nv12.as_ptr() as *const _,
-                SysMemPitch: w as u32,
-                SysMemSlicePitch: 0,
-            };
-            let mut tex: Option<ID3D11Texture2D> = None;
-            // SAFETY: `init` points at `nv12`, alive across the call; the UV plane follows the Y
-            // plane at the same pitch, the layout D3D11 reads NV12 initial data in.
-            unsafe { device.CreateTexture2D(&desc, Some(&init), Some(&mut tex)) }
-                .expect("NV12 frame texture");
-            tex.expect("NV12 frame texture")
-        };
-        // Loss k is frame 1 + k * gap; its ask comes `lag` frames later, before that frame.
-        let base = lag + 1;
-        let last = base + losses * gap;
-        let (mut lost, mut anchors, mut idrs) = (Vec::new(), Vec::new(), Vec::new());
-        let mut aus: Vec<EncodedFrame> = Vec::new();
-        for i in 0..=last {
-            if i >= base && (i - base) % gap == 0 && (i - base) / gap < losses {
-                let l = (i - lag) as i64;
-                lost.push(i - lag);
-                if enc.invalidate_ref_frames(l, l) {
-                    anchors.push(i);
-                } else {
-                    enc.request_keyframe();
-                    idrs.push(i);
-                }
-            }
-            let frame = CapturedFrame {
-                provenance: Default::default(),
-                width: w,
-                height: h,
-                pts_ns: i as u64,
-                format: PixelFormat::Nv12,
-                payload: FramePayload::D3d11(pf_frame::dxgi::D3d11Frame {
-                    texture: texture(i),
-                    device: device.clone(),
-                    pyro: None,
-                }),
-                cursor: None,
-            };
-            enc.submit_indexed(&frame, i as u32).expect("submit");
-            while let Some(au) = enc.poll().expect("poll") {
-                aus.push(au);
-            }
-        }
-        enc.flush().expect("flush");
-        while let Some(au) = enc.poll().expect("drain") {
-            aus.push(au);
-        }
-        aus.sort_by_key(|a| a.pts_ns);
-        assert_eq!(aus.len(), last + 1, "one AU per frame");
-        for (i, au) in aus.iter().enumerate() {
-            assert_eq!(
-                au.recovery_anchor,
-                anchors.contains(&i),
-                "AU {i}: anchors where answered"
-            );
-            assert!(
-                !idrs.contains(&i) || au.keyframe,
-                "AU {i}: a declined ask is an IDR"
-            );
-        }
-        let csv = |v: &[usize]| {
-            v.iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        };
         println!(
-            "amf_ltr_anchor_soak: {w}x{h} {fps} fps {mbps} Mbps {codec:?} lag={lag} gap={gap} \
-             interval={} lost={} anchors={} idrs={}",
-            enc.ltr_mark_interval,
-            csv(&lost),
-            csv(&anchors),
-            csv(&idrs)
+            "amf_ltr_anchor_soak: LTR mark interval {}",
+            enc.ltr_mark_interval
         );
-        if let Ok(dir) = std::env::var("PUNKTFUNK_SMOKE_DIR") {
-            let full: Vec<&[u8]> = aus.iter().map(|a| a.data.as_slice()).collect();
-            let view: Vec<&[u8]> = aus
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !lost.contains(i))
-                .map(|(_, a)| a.data.as_slice())
-                .collect();
-            write_capture(&format!("{dir}/amf-anchor.{ext}"), &full).expect("write");
-            write_capture(&format!("{dir}/amf-anchor-dropS.{ext}"), &view).expect("write");
-        }
+        let (w, h) = (soak.w, soak.h);
+        soak.run("amf", &mut enc, |i| {
+            nv12_scroll_frame(&device, w, h, i, BIND_SR)
+        });
     }
 
     /// Live `applied_bitrate_bps`: None before lazy open, open rate after submit, new rate after
@@ -2953,7 +2723,7 @@ mod tests {
             return;
         };
         let (w, h, fps) = (640u32, 480u32, 60u32);
-        let tex = nv12_texture(&device, w, h);
+        let tex = nv12_texture(&device, w, h, None, BIND_SR);
         let mut enc = AmfEncoder::open(
             Codec::H265,
             PixelFormat::Nv12,
@@ -3386,7 +3156,7 @@ mod tests {
             return;
         };
         let (w, h, fps) = (640u32, 480u32, 60u32);
-        let tex = nv12_texture(&device, w, h);
+        let tex = nv12_texture(&device, w, h, None, BIND_SR);
         let mut enc = match AmfEncoder::open(
             Codec::H265,
             PixelFormat::Nv12,

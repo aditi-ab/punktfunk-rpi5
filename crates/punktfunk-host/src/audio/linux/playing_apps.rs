@@ -4,24 +4,19 @@
 //! `pf_host_config::voice_app_matches` matches them: process binary first, then
 //! `application.name`, lowercased.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 /// Every audio output stream's app, deduped and sorted. The host's own streams are left out.
 pub(crate) fn playing_apps() -> Result<Vec<String>> {
     use pipewire as pw;
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
     use std::rc::Rc;
 
-    static PW_INIT: std::sync::Once = std::sync::Once::new();
-    PW_INIT.call_once(pw::init);
-
-    let mainloop = pw::main_loop::MainLoopRc::new(None).context("pw MainLoop")?;
-    let context = pw::context::ContextRc::new(&mainloop, None).context("pw Context")?;
-    let core = context.connect_rc(None).context("pw connect")?;
-    let registry = core.get_registry_rc().context("pw registry")?;
-
+    // The console's request thread waits on this; the one-shot's timeout bounds a stalled daemon.
+    let session = super::pw_oneshot::OneShot::connect("playing-apps", super::pw_oneshot::TIMEOUT)?;
     let apps: Rc<RefCell<Vec<String>>> = Rc::default();
-    let _registry_listener = registry
+    let _registry_listener = session
+        .registry
         .add_listener_local()
         .global({
             let apps = apps.clone();
@@ -43,28 +38,8 @@ pub(crate) fn playing_apps() -> Result<Vec<String>> {
             }
         })
         .register();
-
-    // One sync round: the registry replays every global before the `done` for this seq.
-    let awaited: Rc<Cell<Option<pw::spa::utils::result::AsyncSeq>>> = Rc::new(Cell::new(None));
-    let _core_listener = core
-        .add_listener_local()
-        .done({
-            let (mainloop, awaited) = (mainloop.clone(), awaited.clone());
-            move |_, seq| {
-                if awaited.get() == Some(seq) {
-                    mainloop.quit();
-                }
-            }
-        })
-        .register();
-    // A stalled daemon must not hold the console's request thread forever.
-    let timer = mainloop.loop_().add_timer({
-        let mainloop = mainloop.clone();
-        move |_| mainloop.quit()
-    });
-    let _ = timer.update_timer(Some(std::time::Duration::from_secs(2)), None);
-    awaited.set(Some(core.sync(0).context("pw sync")?));
-    mainloop.run();
+    // One round: the registry replays every global before the `done` for this seq.
+    session.round()?;
 
     let mut out = apps.take();
     out.sort();

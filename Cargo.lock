@@ -1419,13 +1419,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fence-ring-spike"
-version = "0.40.0"
-dependencies = [
- "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
-]
-
-[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2479,10 +2472,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "latency-probe"
-version = "0.40.0"
-
-[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3257,6 +3246,7 @@ name = "pf-driver-proto"
 version = "0.0.1"
 dependencies = [
  "bytemuck",
+ "serde_json",
 ]
 
 [[package]]
@@ -3266,7 +3256,6 @@ dependencies = [
  "bytemuck",
  "cros-codecs",
  "pf-bitstream",
- "pf-vkdecode",
  "tracing",
 ]
 
@@ -3309,6 +3298,7 @@ dependencies = [
  "pf-driver-proto",
  "pf-frame",
  "pyrowave-sys",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
  "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -3365,6 +3355,7 @@ dependencies = [
  "pf-win-display",
  "punktfunk-core",
  "reis",
+ "serde_json",
  "tokio",
  "tracing",
  "usbip-sim",
@@ -3419,7 +3410,6 @@ dependencies = [
  "punktfunk-core",
  "rustix",
  "sdl3",
- "serde_json",
  "tracing",
  "wayland-backend",
  "wayland-client",
@@ -3432,6 +3422,7 @@ dependencies = [
 name = "pf-update"
 version = "0.40.0"
 dependencies = [
+ "pf-update-check",
  "serde",
  "serde_json",
 ]
@@ -3445,6 +3436,7 @@ dependencies = [
  "base64 0.23.1",
  "serde",
  "serde_json",
+ "tempfile",
  "ureq",
 ]
 
@@ -3454,7 +3446,6 @@ version = "0.40.0"
 dependencies = [
  "cros-codecs",
  "pf-bitstream",
- "pf-vkdecode",
 ]
 
 [[package]]
@@ -3825,7 +3816,6 @@ dependencies = [
  "relm4",
  "serde_json",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -3838,7 +3828,6 @@ dependencies = [
  "punktfunk-core",
  "serde_json",
  "tracing",
- "tracing-subscriber",
  "winresource",
 ]
 
@@ -3848,10 +3837,8 @@ version = "0.40.0"
 dependencies = [
  "pf-client-core",
  "punktfunk-core",
- "serde_json",
  "test_reactor",
  "tracing",
- "tracing-subscriber",
  "windows 0.62.2 (git+https://github.com/microsoft/windows-rs?rev=acb5a1a7441033d9312b16842af02eb0c2b403dc)",
  "windows-reactor",
  "windows-reactor-setup",
@@ -3999,6 +3986,8 @@ version = "0.40.0"
 dependencies = [
  "console",
  "getrandom 0.3.4",
+ "pf-host-config",
+ "pf-paths",
  "portable-pty",
  "serde",
  "serde_json",

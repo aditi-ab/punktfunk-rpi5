@@ -30,7 +30,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
-use windows::core::{Owned, GUID, PCWSTR, PWSTR};
+use windows::core::{Owned, GUID, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{SPDRP_HARDWAREID, SP_DEVINFO_DATA};
 use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::Media::Audio::{
@@ -400,18 +400,30 @@ fn endpoint_for_devnode_in(
     Ok(None)
 }
 
-/// Poll after driver install; audiosrv registers the endpoint asynchronously.
-fn wait_for_endpoint(instance_id: &str) -> Result<String> {
-    let deadline = Instant::now() + ENDPOINT_WAIT;
+/// Poll until audiosrv has registered `devnode`'s endpoint in `dir`, which it does
+/// asynchronously after a driver install.
+pub(crate) fn wait_for_endpoint(
+    devnode: &str,
+    dir: wasapi::Direction,
+    timeout: Duration,
+) -> Result<String> {
+    let deadline = Instant::now() + timeout;
     loop {
-        if let Some(ep) = find_endpoint_for_devnode(instance_id)? {
+        let found = match dir {
+            wasapi::Direction::Render => find_endpoint_for_devnode(devnode)?,
+            wasapi::Direction::Capture => find_capture_endpoint_for_devnode(devnode)?,
+        };
+        if let Some(ep) = found {
             return Ok(ep);
         }
         if Instant::now() >= deadline {
+            let which = match dir {
+                wasapi::Direction::Render => "render",
+                wasapi::Direction::Capture => "capture",
+            };
             bail!(
-                "no render endpoint appeared for {instance_id} within {}s — is Audiosrv \
-                 running?",
-                ENDPOINT_WAIT.as_secs()
+                "no {which} endpoint appeared for {devnode} within {}s — is Audiosrv running?",
+                timeout.as_secs()
             );
         }
         thread::sleep(Duration::from_millis(250));
@@ -419,7 +431,7 @@ fn wait_for_endpoint(instance_id: &str) -> Result<String> {
 }
 
 fn open_mmdevice(endpoint_id: &str) -> Result<IMMDevice> {
-    let id_w = wide(endpoint_id);
+    let id_w = HSTRING::from(endpoint_id);
     // SAFETY: standard COM activation on a COM-initialized thread; the id buffer is
     // NUL-terminated and outlives the call.
     unsafe {
@@ -578,7 +590,7 @@ fn grant_system_full_control(subkey_path: &str) -> Result<()> {
 
     const READ_CONTROL: u32 = 0x0002_0000;
     const WRITE_DAC: u32 = 0x0004_0000;
-    let path_w = wide(subkey_path);
+    let path_w = HSTRING::from(subkey_path);
     let mut hkey = HKEY::default();
     // SAFETY: the path is NUL-terminated and outlives the call; hkey is a live out-param.
     unsafe {
@@ -747,7 +759,7 @@ pub fn ensure(pad_index: u8) -> Result<PadEndpoint> {
         Some(ep) => ep,
         None => {
             install_sss_driver().context("bind the Steam Streaming Speakers driver")?;
-            wait_for_endpoint(&device_instance)?
+            wait_for_endpoint(&device_instance, wasapi::Direction::Render, ENDPOINT_WAIT)?
         }
     };
     // Stamp until it stays. On a fresh endpoint the write lands, an immediate
@@ -798,19 +810,10 @@ pub fn ensure(pad_index: u8) -> Result<PadEndpoint> {
 /// Best-effort teardown (`pnputil /remove-device`). Tests and the
 /// `pad-endpoint remove` hatch only; endpoints are persistent.
 pub fn remove(pe: &PadEndpoint) {
-    let pnputil = crate::install::sys32("pnputil.exe");
-    match std::process::Command::new(&pnputil)
-        .args(["/remove-device", &pe.device_instance])
-        .output()
-    {
-        Ok(o) if o.status.success() => {
-            tracing::info!(devnode = %pe.device_instance, "pad-audio devnode removed")
-        }
-        Ok(o) => tracing::warn!(devnode = %pe.device_instance, status = ?o.status.code(),
-            stderr = %String::from_utf8_lossy(&o.stderr).trim(),
-            "pnputil could not remove the pad-audio devnode"),
-        Err(e) => tracing::warn!(devnode = %pe.device_instance, error = %e,
-            "pnputil did not run to remove the pad-audio devnode"),
+    match crate::install::remove_device(&pe.device_instance) {
+        Ok(()) => tracing::info!(devnode = %pe.device_instance, "pad-audio devnode removed"),
+        Err(e) => tracing::warn!(devnode = %pe.device_instance, error = %format!("{e:#}"),
+            "pad-audio devnode not removed"),
     }
 }
 
@@ -935,7 +938,7 @@ fn compute_is_pad_endpoint(endpoint_id: &str) -> bool {
 }
 
 fn pad_audio_enabled() -> bool {
-    pf_host_config::knob("PUNKTFUNK_PAD_AUDIO").is_none_or(|v| v != "0")
+    pf_host_config::row_bool("PUNKTFUNK_PAD_AUDIO")
 }
 
 fn pad_audio_slots() -> u8 {

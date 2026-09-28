@@ -49,16 +49,7 @@ final class StreamPump {
         layer.flush() // drop any frames a previous connection left queued
 
         let thread = Thread {
-            // Format, decoded size, straggler filter and the keyframe WANT — shared with the
-            // stage-2 pump, which had the same rules copied. `awaitingIDR` is retried every
-            // iteration so a request the throttle swallowed is re-sent; loss itself goes through
-            // the gate, where an RFI anchor heals it without an IDR.
-            var pump = AUPumpState()
-            // The layer's decoder reads the RPS itself, so a lost reference must be concealed
-            // in the bitstream before enqueue (see HevcConcealer). Thread-confined; one per session.
-            let concealer: HevcConcealer? = connection.videoCodec == .hevc ? HevcConcealer() : nil
-            var wasUnrecoverable = false
-            var awaitingSince = Date.distantPast // when the current recovery began (for the resume log)
+            var intake = AUIntake(connection: connection, gate: gate, recovery: recovery)
             var wasFailed = false
             // Every iteration drains its own autorelease pool: this thread has no runloop, so
             // autoreleased CM/layer temporaries would otherwise accumulate until session end.
@@ -67,71 +58,9 @@ final class StreamPump {
             while alive, !token.isStopped {
                 alive = autoreleasepool { () -> Bool in
                 do {
-                    // Background keep-alive: drain one AU to keep QUIC flow control + host pacing
-                    // healthy, then discard it BEFORE any decode/enqueue — no VideoToolbox/Metal work
-                    // off-screen. Skips all recovery/gate bookkeeping too; exitBackground requests a
-                    // fresh IDR and the re-anchor gate re-arms on the resumed frame-index gap.
-                    if connection.isVideoDropped {
-                        _ = try connection.nextAU(timeoutMs: 100)
-                        return true
-                    }
-                    if pump.awaitingIDR { recovery.request() }
-                    // Loss recovery through the shared gate: a drop-count climb beyond the gap's
-                    // credit arms the freeze and asks (the decoder conceals reference-missing
-                    // deltas without flipping the layer to .failed), and an overdue freeze re-asks
-                    // for the re-anchor. Polled every iteration so a total-loss drought still
-                    // recovers when packets resume.
-                    if gate.poll(framesDropped: connection.framesDropped()) { recovery.request() }
-
-                    guard let received = try connection.nextAU(timeoutMs: 100) else { return true }
-                    var au = received // the concealer may swap its bytes below
-                    // A forward frame-index gap fires a throttled RFI (a clean P-frame, no IDR)
-                    // and arms the freeze, credited with the gap width so the reassembler's
-                    // ~120 ms-later framesDropped climb for the same loss cannot re-freeze a
-                    // stream the anchor already healed. A lost anchor lapses into the gate's
-                    // overdue re-ask above.
-                    let gapWidth = connection.noteFrameIndexGapWidth(au.frameIndex)
-                    if gapWidth > 0 { gate.arm(expectingDrops: UInt64(gapWidth)) }
-                    onFrame?(au)
-                    if pump.isStraggler(frameIndex: au.frameIndex) { return true }
-                    var concealed = AUPumpState.Concealment.none
-                    if let concealer {
-                        switch concealer.conceal(au.data) {
-                        case .intact:
-                            concealed = .decodable
-                        case .rewritten(let data):
-                            concealed = .decodable
-                            au = au.replacing(data: data)
-                            pumpLog.notice(
-                                "video: frame \(au.frameIndex, privacy: .public) names a lost reference — moved to a present picture until the re-anchor"
-                            )
-                        case .unrecoverable:
-                            concealed = .unrecoverable
-                        }
-                        if concealed == .unrecoverable, !wasUnrecoverable {
-                            pumpLog.warning(
-                                "video: frame \(au.frameIndex, privacy: .public) names a lost reference with nothing to stand in — withholding until an IDR"
-                            )
-                        }
-                        wasUnrecoverable = concealed == .unrecoverable
-                    }
-                    let idrFormat = connection.videoCodec.formatDescription(fromKeyframe: au.data)
-                    let step = pump.note(
-                        frameIndex: au.frameIndex, idrFormat: idrFormat, lossAhead: gapWidth > 0,
-                        flags: au.flags, concealed: concealed)
-                    if step.straggler { return true }
-                    if step.askKeyframe { recovery.request() }
-                    if let size = step.newSize { onDecodedSize?(size.width, size.height) }
-                    if step.resumed {
-                        let ms = Int(Date().timeIntervalSince(awaitingSince) * 1000)
-                        pumpLog.notice("video: recovery IDR received — resumed after \(ms, privacy: .public) ms")
-                    }
-                    if step.startedFormatWait {
-                        awaitingSince = Date()
-                        pumpLog.warning(
-                            "video: received AUs but no decodable format (missing/unparsed parameter sets) — requesting an IDR until one seeds it"
-                        )
-                    }
+                    guard let ready = try intake.next(onFrame: onFrame, onDecodedSize: onDecodedSize)
+                    else { return true }
+                    let au = ready.au
                     let failed = layer.status == .failed || layer.requiresFlushToResumeDecoding
                     if failed {
                         // Decode wedged (a lost opening IDR, or an iOS interruption that left the
@@ -140,16 +69,13 @@ final class StreamPump {
                         if !wasFailed { pumpLog.warning("video: display layer wedged — flushing + re-anchoring") }
                         layer.flush()
                         gate.arm() // a wedged decoder is a loss — freeze until the re-anchor
-                        if idrFormat == nil {
-                            pump.requireIDR()
-                            awaitingSince = Date()
-                        }
+                        if !ready.idr { intake.requireIDR() }
                     }
                     wasFailed = failed
                     // A delta between a loss and its re-anchor references the lost picture; one
                     // such AU wedges the layer's decoder until an IDR. Withheld, the anchor lands.
-                    if step.withhold { return true }
-                    guard let f = pump.format,
+                    if ready.step.withhold { return true }
+                    guard let f = intake.pump.format,
                           let sample = connection.videoCodec.sampleBuffer(au: au, format: f),
                           !token.isStopped // don't enqueue a stale frame after a restart
                     else { return true }

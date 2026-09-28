@@ -52,32 +52,11 @@ pub fn note(mut line: String) {
 }
 
 /// `YYYY-MM-DDTHH:MM:SS.mmmZ` from the system clock. Wall time so a bundle
-/// correlates with the host log beside it. No chrono; same civil-date math the
-/// host uses. Shared by every feeder (`ring_layer`, Android logcat tee).
+/// correlates with the host log beside it. Shared by every feeder (`ring_layer`,
+/// Android logcat tee).
 pub fn wallclock() -> String {
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let secs = (ms / 1000) as i64;
-    let days = secs.div_euclid(86_400);
-    let tod = secs.rem_euclid(86_400);
-    // Howard Hinnant's civil_from_days.
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if mo <= 2 { y + 1 } else { y };
-    let (h, mi, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
-    format!(
-        "{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{:03}Z",
-        ms % 1000
-    )
+    let ms = punktfunk_core::quic::wall_clock_ns() / 1_000_000;
+    punktfunk_core::time::utc_rfc3339(ms, true)
 }
 
 /// Oldest-first text bundle. `header` is the shell identity line; an eviction
@@ -136,6 +115,58 @@ pub fn send_to_host(
         }
         Err(e) => Err(crate::library::classify(e)),
     }
+}
+
+/// [`send_to_host`] with the bundle header and outcome every shell uses. `app` names the
+/// binary in the header; the result is the sentence the shell shows the user.
+#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+pub fn send_bundle(
+    app: &str,
+    host_name: &str,
+    addr: &str,
+    mgmt_port: u16,
+    identity: &(String, String),
+    fp_hex: &str,
+) -> String {
+    let header = format!(
+        "{app} {} ({} {}) — client log bundle",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    );
+    let pin = crate::trust::parse_hex32(fp_hex);
+    match send_to_host(addr, mgmt_port, identity, pin, &header) {
+        Ok(id) => {
+            tracing::info!(host = %host_name, id, "client logs uploaded");
+            format!("Logs sent to {host_name} — download them from its web console's Logs page")
+        }
+        Err(e) => {
+            tracing::warn!(host = %host_name, error = %e, "client log upload failed");
+            format!("Couldn't send logs — {e}")
+        }
+    }
+}
+
+/// Install the process subscriber: a fmt layer on `writer` scoped by `RUST_LOG` (default
+/// `info`), beside [`RingLayer`] at DEBUG regardless, since the ring exists for the
+/// diagnostics nobody enabled before the bug happened. `ansi: false` turns colour off for a
+/// log file; `true` keeps the fmt layer's default.
+#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+pub fn init_tracing<W>(writer: W, ansi: bool)
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+    let fmt = tracing_subscriber::fmt::layer().with_writer(writer);
+    let fmt = if ansi { fmt } else { fmt.with_ansi(false) };
+    tracing_subscriber::registry()
+        .with(fmt.with_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        ))
+        .with(RingLayer.with_filter(tracing_subscriber::filter::LevelFilter::DEBUG))
+        .init();
 }
 
 /// `tracing` layer that feeds the ring. Installed beside the visible layer with
@@ -209,22 +240,24 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RingLayer {
     }
 }
 
-/// Line-buffered tee of a spawned session child's stderr into ours and the ring.
-/// Returns immediately; the thread dies with the pipe. WinUI has its own
-/// forwarder (it also tees the client log file); this is for `orchestrate`'s spawn.
+/// Line-buffered tee of a spawned session child's stderr into `out` and the ring.
+/// `out` is our stderr, or the WinUI shell's log-file tee. Returns immediately; the
+/// thread dies with the pipe.
 #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
-pub fn forward_child_stderr(stderr: impl std::io::Read + Send + 'static) {
+pub fn forward_child_stderr(
+    stderr: impl std::io::Read + Send + 'static,
+    mut out: impl std::io::Write + Send + 'static,
+) {
     let _ = std::thread::Builder::new()
         .name("pf-session-log".into())
         .spawn(move || {
-            use std::io::{BufRead as _, Write as _};
+            use std::io::BufRead as _;
             let mut reader = std::io::BufReader::new(stderr);
             let mut buf = Vec::new();
             // Bytes, not `read_line`: that fails the whole read on one non-UTF-8 byte, which
-            // ended the drain — and a stderr pipe nobody empties fills up and blocks the child
-            // mid-stream.
+            // ends the drain — and a stderr pipe nobody empties blocks the child mid-stream.
             while matches!(reader.read_until(b'\n', &mut buf), Ok(n) if n > 0) {
-                let _ = std::io::stderr().write_all(&buf);
+                let _ = out.write_all(&buf);
                 note(String::from_utf8_lossy(&buf).trim_end().to_string());
                 buf.clear();
             }
@@ -256,6 +289,36 @@ mod tests {
         note("x".repeat(10_000));
         let text = render("h");
         assert!(text.contains('…'));
+    }
+
+    /// A non-UTF-8 byte must not end the drain: the child blocks once its pipe fills.
+    #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+    #[test]
+    fn stderr_forward_drains_past_a_non_utf8_line() {
+        #[derive(Clone, Default)]
+        struct Sink(std::sync::Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let _own = RING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let marker = format!("drain-{}", std::process::id());
+        let input = [b"one\n\xff\n".as_slice(), marker.as_bytes(), b"\n"].concat();
+        let sink = Sink::default();
+        forward_child_stderr(std::io::Cursor::new(input.clone()), sink.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let drained = || {
+            *sink.0.lock().unwrap() == input && render("test").contains(&format!("\n{marker}\n"))
+        };
+        while !drained() {
+            assert!(std::time::Instant::now() < deadline, "drain stopped early");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]

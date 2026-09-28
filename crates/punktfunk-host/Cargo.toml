@@ -311,8 +311,8 @@ windows = { version = "0.62", features = [
     # Per-monitor-v2 DPI awareness — IDXGIOutput5::DuplicateOutput1 (the modern capture path Apollo
     # uses; FP16/format-list, robust to overlay/format churn) requires the process to be DPI-aware.
     "Win32_UI_HiDpi",
-    # Windows service supervisor (src/windows/service.rs): a kill-on-close job object so a service
-    # crash never orphans the SYSTEM host it launched into the active console session.
+    # Windows service supervisor (src/windows/service/runtime.rs): a kill-on-close job object so a
+    # service crash never orphans the SYSTEM host it launched into the active console session.
     "Win32_System_JobObjects",
     # CoCreateInstance(PolicyConfigClient) — set the default audio playback/recording endpoints via the
     # undocumented IPolicyConfig (audio/windows/audio_control.rs) so mic + desktop audio auto-wire.

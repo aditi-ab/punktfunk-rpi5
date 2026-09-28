@@ -1,8 +1,7 @@
 //! Translate Moonlight `SS_PEN` / `SS_TOUCH` into punktfunk [`PenSample`]s and wire-touch events.
 //!
 //! Pen: each packet merges over last state into one sample (`BUTTON_ONLY` has no
-//! position by spec), then the same [`PenTracker`] → [`VirtualPen`] chain as the
-//! native plane.
+//! position by spec), then the [`PenSink`](crate::pen_sink::PenSink) both planes share.
 //!
 //! No stroke timeout. Native's 200 ms failsafe exists because datagrams are lossy
 //! and clients heartbeat. Moonlight's ENet control stream is ordered and reliable,
@@ -16,8 +15,8 @@
 use super::input::{SsPen, SsPointer, SsTouch};
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::quic::{
-    PenSample, PenTool, PenTracker, PenTransition, PEN_ANGLE_UNKNOWN, PEN_BARREL1, PEN_BARREL2,
-    PEN_IN_RANGE, PEN_TILT_UNKNOWN, PEN_TOUCHING,
+    PenSample, PenTool, PEN_ANGLE_UNKNOWN, PEN_BARREL1, PEN_BARREL2, PEN_IN_RANGE,
+    PEN_TILT_UNKNOWN, PEN_TOUCHING,
 };
 
 // moonlight-common-c Limelight.h event/tool/button vocabulary.
@@ -42,13 +41,11 @@ const TOUCH_SURFACE: u32 = 65535;
 /// Cap of tracked ids for `CANCEL_ALL` replay. Extra ids still forward down/up; they miss cancel-all.
 const MAX_TOUCH_IDS: usize = 32;
 
-/// Per-session pen and touch translator. Recreated on disconnect; Drop of [`VirtualPen`] releases uinput.
+/// Per-session pen and touch translator. Recreated on disconnect; dropping the pen's
+/// [`crate::inject::pen::VirtualPen`] releases uinput.
 pub struct GsPointer {
-    tracker: PenTracker,
-    dev: Option<crate::inject::pen::VirtualPen>,
-    create_failed: bool,
+    pen: crate::pen_sink::PenSink,
     seq: u16,
-    out: Vec<PenTransition>,
     /// Merge base for packets that omit fields (`BUTTON_ONLY` has no x/y/pressure/tilt/rotation).
     last: PenSample,
     /// This client sent hover, so `UP` is back-to-hover. Without hover, lift must leave range.
@@ -62,11 +59,8 @@ pub struct GsPointer {
 impl GsPointer {
     pub fn new() -> GsPointer {
         GsPointer {
-            tracker: PenTracker::default(),
-            dev: None,
-            create_failed: false,
+            pen: Default::default(),
             seq: 0,
-            out: Vec::new(),
             last: PenSample::default(),
             saw_hover: false,
             touch_ids: Vec::new(),
@@ -86,25 +80,9 @@ impl GsPointer {
             return;
         };
         self.last = sample;
-        if self.dev.is_none() && !self.create_failed {
-            match crate::inject::pen::VirtualPen::create() {
-                Ok(d) => self.dev = Some(d),
-                Err(e) => {
-                    self.create_failed = true;
-                    tracing::warn!(
-                        error = %format!("{e:#}"),
-                        "gamestream pen: virtual tablet creation failed — dropping pen input"
-                    );
-                }
-            }
-        }
-        self.out.clear();
         let batch = punktfunk_core::quic::PenBatch::new(self.seq, &[sample]);
         self.seq = self.seq.wrapping_add(1);
-        self.tracker.apply(&batch, &mut self.out);
-        if let Some(dev) = self.dev.as_mut() {
-            dev.apply_batch(&self.out);
-        }
+        self.pen.apply(&batch);
     }
 
     /// Merge one edge packet over last state. `None` if `BUTTON_ONLY` arrives before any position.
@@ -124,7 +102,7 @@ impl GsPointer {
             _ => PenTool::Unknown,
         };
         if p.event_type == LI_TOUCH_EVENT_BUTTON_ONLY {
-            if !self.tracker.is_active() {
+            if !self.pen.active() {
                 return None;
             }
             let mut s = self.last;

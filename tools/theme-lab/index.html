@@ -273,7 +273,7 @@ textarea#rust {
       </div>
       <div class="checkset">
         <h3>What CI checks today</h3>
-        <p>The palette tests in <span class="mono">library.rs</span> still sample the retired colour mesh, not the field.</p>
+        <p>The palette tests in <span class="mono">palette.rs</span> still sample the retired colour mesh, not the field.</p>
         <div id="gate-checks"></div>
       </div>
     </section>
@@ -310,7 +310,7 @@ textarea#rust {
 
     <section class="panel" aria-label="Export">
       <h2>Rust <small id="edited-count">no changes</small></h2>
-      <p class="note">Replace the entries in <span class="mono">PALETTES</span> (<span class="mono">crates/pf-console-ui/src/library.rs</span>), then refresh this page's data with <span class="mono">cargo test -p pf-console-ui --lib dump_theme_lab -- --ignored</span>.</p>
+      <p class="note">Replace the entries in <span class="mono">PALETTES</span> (<span class="mono">crates/pf-console-ui/src/palette.rs</span>), then refresh this page's data with <span class="mono">cargo test -p pf-console-ui --lib dump_theme_lab -- --ignored</span>.</p>
       <textarea id="rust" readonly spellcheck="false" aria-label="Rust source"></textarea>
       <div class="row2">
         <button type="button" class="btn primary" id="copy-one">Copy this palette</button>
@@ -398,7 +398,7 @@ function inkOf(p) {
 }
 const stopsOf = (p) => p.stops || D.violet_field;
 
-// ---------- the field shader: `library::field_sksl`, rebuilt around edited stops ----------
+// ---------- the field shader: `palette::field_sksl`, rebuilt around edited stops ----------
 function fieldSksl(ground, stops) {
   const n = Math.max(stops.length, 2);
   const s = stops.length < 2 ? [ground, ground] : stops;
@@ -439,7 +439,7 @@ function fieldGlsl() {
     "\nvoid main() { gl_FragColor = field(vec2(gl_FragCoord.x, u_res.y - gl_FragCoord.y)); }\n";
 }
 
-// `library::field_camera`
+// `palette::field_camera`
 function fieldCamera(aspect) {
   const diagonal = Math.sqrt(1 + aspect * aspect);
   const safe = 0.72, cam = 3.0, baseF = 1.73, targetF = baseF * 4.0;
@@ -453,7 +453,7 @@ function fieldCamera(aspect) {
   return [baseF * zoom, scale];
 }
 
-// `library::field_motion`
+// `palette::field_motion`
 function fieldMotion(t) {
   const TAU = Math.PI * 2;
   const norm = (v) => { const l = Math.hypot(v[0], v[1], v[2]); return v.map((x) => x / l); };
@@ -610,7 +610,7 @@ function fieldChecks(pal, t) {
   ];
 }
 
-// `library.rs`'s palette tests, run on the mesh they sample.
+// The palette tests in `palette.rs`, run on the mesh they sample.
 function ramp(stops, t) {
   const n = stops.length;
   if (n === 0) return [0, 0, 0];

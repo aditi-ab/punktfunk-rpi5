@@ -126,17 +126,13 @@ fn resolve_hdr_enabled(
 #[cfg(any(target_os = "linux", windows))]
 mod session_main {
     use pf_client_core::gamepad::GamepadService;
-    use pf_client_core::orchestrate::ResolvedSpec;
+    use pf_client_core::orchestrate::{emit, exit, ResolvedSpec, SessionLine};
     use pf_client_core::session::{Dial, Probes, SessionParams};
     use pf_client_core::trust;
     use punktfunk_core::config::{GamepadPref, Mode};
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use std::time::Duration;
-
-    pub const EXIT_CONNECT_FAILED: u8 = 2;
-    pub const EXIT_TRUST_REJECTED: u8 = 3;
-    pub const EXIT_PRESENTER_FAILED: u8 = 4;
 
     /// The value following `flag` in argv, if present (`--flag value`).
     pub(crate) fn arg_value(flag: &str) -> Option<String> {
@@ -210,7 +206,7 @@ mod session_main {
     fn headless_pair(pin: &str) -> u8 {
         let Some(target) = arg_value("--connect") else {
             eprintln!("--pair requires --connect host[:port]");
-            return EXIT_CONNECT_FAILED;
+            return exit::CONNECT_FAILED;
         };
         let (addr, port) = parse_host_port(&target);
         // The label the HOST files this client under. A headless box has nobody to ask, so
@@ -221,7 +217,7 @@ mod session_main {
             Ok(i) => i,
             Err(e) => {
                 eprintln!("client identity: {e:#}");
-                return EXIT_CONNECT_FAILED;
+                return exit::CONNECT_FAILED;
             }
         };
         match trust::pair_with_host(&addr, port, &identity, pin, &name) {
@@ -233,6 +229,7 @@ mod session_main {
                     port,
                     &fp_hex,
                     true,
+                    &[],
                 ) {
                     eprintln!("couldn't save the host: {e:#}");
                 }
@@ -242,7 +239,7 @@ mod session_main {
             }
             Err(e) => {
                 eprintln!("{}", trust::pair_error_message(&e));
-                EXIT_TRUST_REJECTED
+                exit::TRUST_REJECTED
             }
         }
     }
@@ -432,64 +429,21 @@ mod session_main {
             .then_some((settings.last_window_w, settings.last_window_h))
     }
 
-    /// The Match-window policy hook for the presenter loop
-    /// (design/midstream-resolution-resize.md D1/D2): `Some(persist)` turns the
-    /// debounced resize→`Reconfigure` machinery on; the callback stores each resize-end's
-    /// logical window size (load-modify-save, like the console settings screen) so the
-    /// next launch opens at it.
-    /// The Match-window policy hook (design/midstream-resolution-resize.md D1/D2). The
-    /// callback used to load-modify-save the shared settings file from inside the renderer —
-    /// one of that file's five concurrent writers, for a value only the parent needs. It now
-    /// REPORTS the size on stdout and the spawner persists it
-    /// (design/client-architecture-split.md §5).
-    ///
-    /// `persist_locally` keeps a hand-run session remembering its own window: nobody is
-    /// listening to stdout there, so the event alone would drop the value. A spawned session
-    /// leaves the write to its parent, which is the whole point.
+    /// The Match-window hook (design/midstream-resolution-resize.md D1/D2): each resize-end's
+    /// logical size goes out as a `window` line and the spawner persists it.
+    /// `persist_locally` is for a hand-run session, where nobody reads stdout.
     pub(crate) fn match_window(
         settings: &trust::Settings,
         persist_locally: bool,
     ) -> Option<Box<dyn FnMut(u32, u32)>> {
         settings.match_window.then(|| {
             Box::new(move |w: u32, h: u32| {
-                machine_line(&format!("{{\"window\":{{\"w\":{w},\"h\":{h}}}}}"));
+                emit(SessionLine::Window { w, h });
                 if persist_locally {
                     pf_client_core::orchestrate::persist_window_size(w, h);
                 }
             }) as Box<dyn FnMut(u32, u32)>
         })
-    }
-
-    /// One JSON status line on stdout (the shell parses these; strings hand-escaped via
-    /// the minimal rules a reason string can need). `pub(crate)`: browse mode emits its
-    /// failure through the same contract when spawned with `--json-status`.
-    pub(crate) fn json_line(key: &str, msg: &str, trust_rejected: Option<bool>) {
-        let escaped: String = msg
-            .chars()
-            .flat_map(|c| match c {
-                '"' => vec!['\\', '"'],
-                '\\' => vec!['\\', '\\'],
-                '\n' => vec!['\\', 'n'],
-                c if (c as u32) < 0x20 => vec![' '],
-                c => vec![c],
-            })
-            .collect();
-        match trust_rejected {
-            Some(t) => machine_line(&format!(
-                "{{\"{key}\":\"{escaped}\",\"trust_rejected\":{t}}}"
-            )),
-            None => machine_line(&format!("{{\"{key}\":\"{escaped}\"}}")),
-        }
-    }
-
-    /// Write one line of the shell contract. A dropped write is NOT fatal: `println!` panics
-    /// on EPIPE, so a shell that exited mid-stream used to abort the stream the user is still
-    /// watching. Status nobody is left to read costs nothing to lose.
-    pub(crate) fn machine_line(line: &str) {
-        use std::io::Write as _;
-        let mut out = std::io::stdout().lock();
-        let _ = writeln!(out, "{line}");
-        let _ = out.flush();
     }
 
     /// The PipeWire endpoints the settings pickers offer, as
@@ -509,7 +463,7 @@ mod session_main {
             }
             Err(e) => {
                 eprintln!("list-audio: {e:#}");
-                EXIT_PRESENTER_FAILED
+                exit::RENDERER_FAILED
             }
         }
     }
@@ -553,7 +507,7 @@ mod session_main {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("pad-audio-test: {e:#}");
-                EXIT_PRESENTER_FAILED
+                exit::RENDERER_FAILED
             }
         }
     }
@@ -667,7 +621,7 @@ mod session_main {
             }
             Err(e) => {
                 eprintln!("probe-decode: {e:#}");
-                EXIT_PRESENTER_FAILED
+                exit::RENDERER_FAILED
             }
         }
     }
@@ -770,28 +724,8 @@ mod session_main {
 
     pub fn run() -> u8 {
         // Logs to STDERR — stdout is the machine interface (ready/stats/error lines) — plus
-        // the in-process ring (`pf_client_core::logring`, DEBUG+ regardless of RUST_LOG) that
-        // "Send logs to host" uploads. The env filter scopes the STDERR layer only: the ring
-        // exists precisely for the diagnostics nobody enabled before the bug happened.
-        {
-            use tracing_subscriber::layer::SubscriberExt;
-            use tracing_subscriber::util::SubscriberInitExt;
-            use tracing_subscriber::Layer;
-            tracing_subscriber::registry()
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .with_writer(std::io::stderr)
-                        .with_filter(
-                            tracing_subscriber::EnvFilter::try_from_default_env()
-                                .unwrap_or_else(|_| "info".into()),
-                        ),
-                )
-                .with(
-                    pf_client_core::logring::RingLayer
-                        .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
-                )
-                .init();
-        }
+        // the ring "Send logs to host" uploads.
+        pf_client_core::logring::init_tracing(std::io::stderr, true);
         // SEH last-resort: a driver AV otherwise leaves only an exit code in the shell's log.
         #[cfg(windows)]
         punktfunk_core::crash::install();
@@ -815,7 +749,7 @@ mod session_main {
                 }
                 Err(e) => {
                     eprintln!("list-adapters: {e:#}");
-                    EXIT_PRESENTER_FAILED
+                    exit::RENDERER_FAILED
                 }
             };
         }
@@ -847,12 +781,12 @@ mod session_main {
                 eprintln!(
                     "punktfunk-session pairing accepts only `--pair -`; prefer `punktfunk pair`"
                 );
-                return EXIT_CONNECT_FAILED;
+                return exit::CONNECT_FAILED;
             }
             let mut pin = String::new();
             if std::io::stdin().read_line(&mut pin).is_err() || pin.trim().is_empty() {
                 eprintln!("no pairing PIN on stdin");
-                return EXIT_CONNECT_FAILED;
+                return exit::CONNECT_FAILED;
             }
             return headless_pair(pin.trim());
         }
@@ -919,7 +853,7 @@ mod session_main {
                     "--browse needs the console UI — this is the minimal build \
                      (rebuild without --no-default-features)"
                 );
-                return EXIT_PRESENTER_FAILED;
+                return exit::RENDERER_FAILED;
             }
         }
         let Some(target) = arg_value("--connect") else {
@@ -937,7 +871,7 @@ mod session_main {
                  enrol with --pair (no display needed), in the console, or from the desktop\n\
                  client."
             );
-            return EXIT_CONNECT_FAILED;
+            return exit::CONNECT_FAILED;
         };
         let (addr, port) = parse_host_port(&target);
 
@@ -945,8 +879,11 @@ mod session_main {
             Ok(i) => i,
             Err(e) => {
                 tracing::error!(error = %format!("{e:#}"), "loading the client identity");
-                json_line("error", "this device's client key didn't load", None);
-                return EXIT_CONNECT_FAILED;
+                emit(SessionLine::Error {
+                    msg: "this device's client key didn't load",
+                    trust_rejected: None,
+                });
+                return exit::CONNECT_FAILED;
             }
         };
         // `--resolved-spec <path>`: the spawner already did the resolving, so this process
@@ -965,8 +902,11 @@ mod session_main {
                 }
                 Err(e) => {
                     tracing::error!(error = %e, path = %path.display(), "reading the resolved spec");
-                    json_line("error", "this stream's settings didn't load", None);
-                    return EXIT_CONNECT_FAILED;
+                    emit(SessionLine::Error {
+                        msg: "this stream's settings didn't load",
+                        trust_rejected: None,
+                    });
+                    return exit::CONNECT_FAILED;
                 }
             },
             None => None,
@@ -999,12 +939,13 @@ mod session_main {
             .and_then(trust::parse_hex32)
             .or_else(|| known_host.and_then(|h| trust::parse_hex32(&h.fp_hex)));
         let Some(pin) = pin else {
-            json_line(
-                "error",
-                &format!("{addr}:{port} isn't paired with this device yet. Pair it to continue."),
-                Some(true),
-            );
-            return EXIT_TRUST_REJECTED;
+            emit(SessionLine::Error {
+                msg: &format!(
+                    "{addr}:{port} isn't paired with this device yet. Pair it to continue."
+                ),
+                trust_rejected: Some(true),
+            });
+            return exit::TRUST_REJECTED;
         };
 
         let host_label = known_host.map_or_else(|| addr.clone(), |h| h.name.clone());
@@ -1097,24 +1038,30 @@ mod session_main {
             Ok(pf_presenter::Outcome::Ended(Some(reason))) => {
                 // The host ending the session (game quit, host shutdown) is a normal end
                 // for a one-shot stream binary — report the reason, exit clean.
-                json_line("ended", &reason, None);
+                emit(SessionLine::Ended(&reason));
                 0
             }
             Ok(pf_presenter::Outcome::ConnectFailed {
                 msg,
                 trust_rejected,
             }) => {
-                json_line("error", &msg, Some(trust_rejected));
+                emit(SessionLine::Error {
+                    msg: &msg,
+                    trust_rejected: Some(trust_rejected),
+                });
                 if trust_rejected {
-                    EXIT_TRUST_REJECTED
+                    exit::TRUST_REJECTED
                 } else {
-                    EXIT_CONNECT_FAILED
+                    exit::CONNECT_FAILED
                 }
             }
             Err(e) => {
                 tracing::error!(error = %format!("{e:#}"), "running the presenter");
-                json_line("error", "the stream window didn't start", None);
-                EXIT_PRESENTER_FAILED
+                emit(SessionLine::Error {
+                    msg: "the stream window didn't start",
+                    trust_rejected: None,
+                });
+                exit::RENDERER_FAILED
             }
         }
     }

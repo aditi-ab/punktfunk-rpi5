@@ -296,9 +296,33 @@ fn codec_miss_note(miss: punktfunk_core::quic::CodecMiss, preferred: &str, picke
     }
 }
 
+/// What [`negotiate`] settled, for the session runner.
+pub(super) struct Negotiated {
+    pub(super) hello: Hello,
+    pub(super) welcome: Welcome,
+    /// The data socket's port; `0` for a browser.
+    pub(super) udp_port: u16,
+    pub(super) data_sock: Option<std::net::UdpSocket>,
+    pub(super) start: Start,
+    /// What the client calls itself (`EXT_TAG_CLIENT` on `Start`); `None` from one that sent no
+    /// block. Log only: two dialers from one device are told apart by that line.
+    pub(super) client_label: Option<String>,
+    /// `EXT_TAG_PRESET` on `Start`: the settings preset the client dialled with.
+    pub(super) preset: Option<crate::events::PresetRef>,
+    /// `EXT_TAG_ABR` on `Start` (`0` = absent): the ABR wire features this client reads.
+    pub(super) abr_features: u8,
+    pub(super) compositor: Option<crate::vdisplay::Compositor>,
+    /// Gamescope sub-mode as a value, not process env — a concurrent connect would overwrite env.
+    pub(super) gamescope_route: Option<crate::vdisplay::GamescopeRoute>,
+    pub(super) prep: Option<super::stream::PrepHandle>,
+    /// Admitted by `mode_conflict: join`: the owner's display, which this session shares, and
+    /// the size this client asked for.
+    pub(super) joined: Option<(crate::vdisplay::admission::LiveDisplay, (u32, u32))>,
+}
+
 /// Hello → Welcome → Start. Borrows the control streams; the caller keeps them for mid-stream
 /// renegotiation. `first` is the already-read first control message.
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn negotiate(
     conn: &super::link::SessionLink,
     send: &mut super::link::CtlSend,
@@ -318,27 +342,7 @@ pub(super) async fn negotiate(
     // Effective grant mask and seconds until expiry (`0` = permanent), resolved at admission.
     grants: u32,
     expires_in_secs: u32,
-) -> Result<(
-    Hello,
-    Welcome,
-    u16,
-    Option<std::net::UdpSocket>,
-    Start,
-    // What the client calls itself (`EXT_TAG_CLIENT` on `Start`); `None` from one that sent no
-    // block. Log only: two dialers from one device are told apart by that line.
-    Option<String>,
-    // `EXT_TAG_PRESET` on `Start`: the settings preset the client dialled with.
-    Option<crate::events::PresetRef>,
-    // `EXT_TAG_ABR` on `Start` (`0` = absent): the ABR wire features this client reads.
-    u8,
-    Option<crate::vdisplay::Compositor>,
-    // Gamescope sub-mode as a value, not process env — a concurrent connect would overwrite env.
-    Option<crate::vdisplay::GamescopeRoute>,
-    Option<super::stream::PrepHandle>,
-    // Admitted by `mode_conflict: join`: the owner's display, which this session shares, and
-    // the size this client asked for.
-    Option<(crate::vdisplay::admission::LiveDisplay, (u32, u32))>,
-)> {
+) -> Result<Negotiated> {
     let mut hello = Hello::decode(first).map_err(|e| anyhow!("Hello decode: {e:?}"))?;
     if hello.abi_version != punktfunk_core::WIRE_VERSION {
         close_rejected(
@@ -830,7 +834,7 @@ pub(super) async fn negotiate(
     bringup.mark("start");
     // `wire_mtu::spawn_watch` is started by `serve_session` once the control-task channels
     // exist; it also drives mid-session shard renegotiation (needs the control writer).
-    Ok::<_, anyhow::Error>((
+    Ok(Negotiated {
         hello,
         welcome,
         udp_port,
@@ -843,7 +847,7 @@ pub(super) async fn negotiate(
         gamescope_route,
         prep,
         joined,
-    ))
+    })
 }
 
 /// Compositor for Welcome plus the gamescope route as a value; synthetic has neither.
@@ -870,9 +874,11 @@ async fn negotiate_compositor(
             let dedicated =
                 crate::vdisplay::wants_dedicated_game_session(has_resolvable_launch, client);
             Some(
-                tokio::task::spawn_blocking(move || resolve_compositor(pref, dedicated))
-                    .await
-                    .context("resolve compositor task")??,
+                tokio::task::spawn_blocking(move || {
+                    resolve_compositor(pref, dedicated, true, true)
+                })
+                .await
+                .context("resolve compositor task")??,
             )
         }
         Punktfunk1Source::Synthetic

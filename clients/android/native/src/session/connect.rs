@@ -10,10 +10,7 @@ use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::{
-    get_session, hex32, insert_session, jni_guard, lock_recover, parse_hex32, remove_session,
-    SessionHandle,
-};
+use super::{hex, jni_guard, lock_recover, parse_hex32, SessionHandle, SESSIONS};
 
 /// Machine token of the most recent `nativeConnect`/`nativePair` failure, taken (and cleared)
 /// by `nativeTakeLastError` so Kotlin can render a cause-specific message instead of the old
@@ -89,14 +86,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetLowLaten
 /// Kotlin `FEATURE_PartialFrame` probe said no — the rebuild-free on-glass experiment for a
 /// decoder that may accept `BUFFER_FLAG_PARTIAL_FRAME` without declaring the feature (the NP3's
 /// c2.qti decoders declare nothing). Android-only; everywhere else the probe verdict stands.
-#[cfg(target_os = "android")]
 fn force_parts_sysprop() -> bool {
-    crate::sysprop(c"debug.punktfunk.force_parts").as_deref() == Some("1")
-}
-
-#[cfg(not(target_os = "android"))]
-fn force_parts_sysprop() -> bool {
-    false
+    crate::sys::sysprop(c"debug.punktfunk.force_parts").as_deref() == Some("1")
 }
 
 /// The rates this session may ask for when the one the user chose will not open, best first.
@@ -619,7 +610,7 @@ fn connect(req: ConnectRequest) -> jlong {
                 src_crop: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 decoded_size: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             };
-            insert_session(handle)
+            SESSIONS.insert(handle)
         }
         Err(e) => {
             log::error!("nativeConnect to {host}:{port} failed: {e}");
@@ -641,7 +632,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClose(
     handle: jlong,
 ) {
     jni_guard((), || {
-        let Some(session) = remove_session(handle) else {
+        let Some(session) = SESSIONS.remove(handle) else {
             return;
         };
         #[cfg(target_os = "android")]
@@ -661,7 +652,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDisconnectQ
     handle: jlong,
 ) {
     jni_guard((), || {
-        if let Some(session) = get_session(handle) {
+        if let Some(session) = SESSIONS.get(handle) {
             session.client.disconnect_quit();
         }
     })
@@ -684,7 +675,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeRequestMode
         if width <= 0 || height <= 0 || refresh_hz <= 0 {
             return false;
         }
-        let Some(session) = get_session(handle) else {
+        let Some(session) = SESSIONS.get(handle) else {
             return false;
         };
         session
@@ -706,8 +697,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeHostFingerp
     _this: JObject<'local>,
     handle: jlong,
 ) -> JString<'local> {
-    let out = get_session(handle)
-        .map(|session| hex32(&session.client.host_fingerprint))
+    let out = SESSIONS
+        .get(handle)
+        .map(|session| hex(&session.client.host_fingerprint))
         .unwrap_or_default();
     env.with_env(|env| env.new_string(out))
         .resolve::<LogErrorAndDefault>()
@@ -724,7 +716,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSessionEnde
     handle: jlong,
 ) -> jboolean {
     jni_guard(false, || {
-        get_session(handle).is_some_and(|session| session.client.is_session_ended())
+        SESSIONS
+            .get(handle)
+            .is_some_and(|session| session.client.is_session_ended())
     })
 }
 
@@ -739,7 +733,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeEndReason(
     handle: jlong,
 ) -> jint {
     jni_guard(0, || {
-        get_session(handle)
+        SESSIONS
+            .get(handle)
             .map(|session| session.client.end_reason() as jint)
             .unwrap_or(0)
     })
@@ -783,7 +778,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePair<'local
                 &name,
                 Duration::from_secs(60),
             ) {
-                Ok(host_fp) => hex32(&host_fp),
+                Ok(host_fp) => hex(&host_fp),
                 Err(e) => {
                     // Crypto error == wrong PIN / MITM; anything else == transport/host reject.
                     // The token lets Kotlin say WHICH (`nativeTakeLastError`).

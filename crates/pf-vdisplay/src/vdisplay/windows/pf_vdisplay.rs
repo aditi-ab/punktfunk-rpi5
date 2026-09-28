@@ -103,6 +103,11 @@ fn ioctl(dev: &ControlDevice, code: u32, input: &[u8], output: &mut [u8]) -> Res
     Ok(returned)
 }
 
+/// [`ioctl`] for a control verb that writes no output.
+fn ioctl_send(dev: &ControlDevice, code: u32, input: &[u8]) -> Result<()> {
+    ioctl(dev, code, input, &mut []).map(|_| ())
+}
+
 /// Remove not-present "punktfunk" monitor PDOs that `IddCxMonitorDeparture` leaves behind.
 /// Each ghost pins a VidPN target against IddCx's ~16-slot budget; once full, `IOCTL_ADD`
 /// returns 0x80070490 (`ERROR_NOT_FOUND`). Best-effort: only `Present==false` AND
@@ -119,9 +124,7 @@ fn reap_ghost_monitors() -> u32 {
         $n = 0; foreach ($d in $g) { $LASTEXITCODE = 1; if (Test-Path $pnp) { & $pnp /remove-device $d.InstanceId *> $null }; if ($LASTEXITCODE -eq 0) { $n++ } }; \
         Write-Output ($g.Count.ToString() + ' ' + $n)";
     // Full-path powershell: LocalSystem PATH need not include System32.
-    let ps = std::env::var("SystemRoot")
-        .map(|r| format!(r"{r}\System32\WindowsPowerShell\v1.0\powershell.exe"))
-        .unwrap_or_else(|_| "powershell.exe".to_string());
+    let ps = pf_paths::system32(r"WindowsPowerShell\v1.0\powershell.exe");
     // Bounded: this runs under the manager's `device` mutex (driver open) and under its `state`
     // lock (the ADD slot-exhaustion retry), so a wedged Get-PnpDevice would block every acquire,
     // release and `/display/state`. `output_within` kills the whole tree on the deadline.
@@ -219,9 +222,7 @@ fn reload_vdisplay_adapter() -> AdapterCycle {
             Write-Output ('RELOADED restart ' + (Get-PnpDevice -InstanceId $id).Status) } \
         else { Enable-PnpDevice -InstanceId $id -Confirm:$false; \
             Write-Output ('REFUSED devnodes=' + $all.Count + ' live=' + $live.Count + ' status=' + $ad.Status + ' problem=' + $ad.ConfigManagerErrorCode + ' restart_exit=' + $rx + ' ' + $err) }";
-    let ps = std::env::var("SystemRoot")
-        .map(|r| format!(r"{r}\System32\WindowsPowerShell\v1.0\powershell.exe"))
-        .unwrap_or_else(|_| "powershell.exe".to_string());
+    let ps = pf_paths::system32(r"WindowsPowerShell\v1.0\powershell.exe");
     let pin = LAST_INSTANCE_ID
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -311,14 +312,11 @@ fn set_render_adapter(dev: &ControlDevice, luid: LUID) -> Result<()> {
         luid_low: luid.LowPart,
         luid_high: luid.HighPart,
     };
-    let mut none: [u8; 0] = [];
-    ioctl(
+    ioctl_send(
         dev,
         control::IOCTL_SET_RENDER_ADAPTER,
         bytemuck::bytes_of(&req),
-        &mut none,
     )
-    .map(|_| ())
     .context("pf-vdisplay SET_RENDER_ADAPTER")
 }
 
@@ -329,14 +327,11 @@ pub fn send_cursor_channel(
     dev: &ControlDevice,
     req: &control::SetCursorChannelRequest,
 ) -> Result<()> {
-    let mut none: [u8; 0] = [];
-    ioctl(
+    ioctl_send(
         dev,
         control::IOCTL_SET_CURSOR_CHANNEL,
         bytemuck::bytes_of(req),
-        &mut none,
     )
-    .map(|_| ())
     .context("pf-vdisplay SET_CURSOR_CHANNEL")
 }
 
@@ -346,14 +341,11 @@ pub fn send_cursor_forward(
     dev: &ControlDevice,
     req: &control::SetCursorForwardRequest,
 ) -> Result<()> {
-    let mut none: [u8; 0] = [];
-    ioctl(
+    ioctl_send(
         dev,
         control::IOCTL_SET_CURSOR_FORWARD,
         bytemuck::bytes_of(req),
-        &mut none,
     )
-    .map(|_| ())
     .context("pf-vdisplay SET_CURSOR_FORWARD")
 }
 
@@ -412,15 +404,8 @@ fn drain_driver_log(dev: &ControlDevice) {
 
 /// One-shot control on a monitor's live in-driver encoder (`IOCTL_ENCODE_CTL`, proto v7).
 pub fn send_encode_ctl(dev: &ControlDevice, req: &encode::EncodeCtlRequest) -> Result<()> {
-    let mut none: [u8; 0] = [];
-    ioctl(
-        dev,
-        encode::IOCTL_ENCODE_CTL,
-        bytemuck::bytes_of(req),
-        &mut none,
-    )
-    .map(|_| ())
-    .with_context(|| format!("pf-vdisplay ENCODE_CTL op {}", req.op))
+    ioctl_send(dev, encode::IOCTL_ENCODE_CTL, bytemuck::bytes_of(req))
+        .with_context(|| format!("pf-vdisplay ENCODE_CTL op {}", req.op))
 }
 
 /// RAII SetupAPI device-info list. Every [`open_device`] exit path must destroy it; a driverless
@@ -767,8 +752,7 @@ impl VdisplayDriver for PfVdisplayDriver {
             reap_ghost_monitors();
             return Ok((device, watchdog_s, info.protocol_version));
         }
-        let mut none: [u8; 0] = [];
-        if ioctl(&device, control::IOCTL_CLEAR_ALL, &[], &mut none).is_ok() {
+        if ioctl_send(&device, control::IOCTL_CLEAR_ALL, &[]).is_ok() {
             tracing::info!("cleared orphaned virtual monitors on host startup");
         } else {
             tracing::warn!("pf-vdisplay IOCTL_CLEAR_ALL failed on startup (continuing)");
@@ -865,13 +849,7 @@ impl VdisplayDriver for PfVdisplayDriver {
             // IOCTL succeeded: the driver already created the monitor and took a slot. Bailing
             // without REMOVE leaks it; ~16 leaks wedge later ADDs at 0x80070490.
             let req = control::RemoveRequest { session_id };
-            let mut none: [u8; 0] = [];
-            let undo = ioctl(
-                dev,
-                control::IOCTL_REMOVE,
-                bytemuck::bytes_of(&req),
-                &mut none,
-            );
+            let undo = ioctl_send(dev, control::IOCTL_REMOVE, bytemuck::bytes_of(&req));
             match undo {
                 Ok(_) => tracing::warn!(
                     session_id,
@@ -948,15 +926,7 @@ impl VdisplayDriver for PfVdisplayDriver {
             refresh_hz: mode.refresh_hz,
             _reserved: 0,
         };
-        let mut none: [u8; 0] = [];
-        ioctl(
-            dev,
-            control::IOCTL_UPDATE_MODES,
-            bytemuck::bytes_of(&req),
-            &mut none,
-        )
-        .map(|_| ())
-        .with_context(|| {
+        ioctl_send(dev, control::IOCTL_UPDATE_MODES, bytemuck::bytes_of(&req)).with_context(|| {
             format!(
                 "pf-vdisplay UPDATE_MODES {}x{}@{}",
                 mode.width, mode.height, mode.refresh_hz
@@ -971,19 +941,11 @@ impl VdisplayDriver for PfVdisplayDriver {
         let req = control::RemoveRequest {
             session_id: *session_id,
         };
-        let mut none: [u8; 0] = [];
-        ioctl(
-            dev,
-            control::IOCTL_REMOVE,
-            bytemuck::bytes_of(&req),
-            &mut none,
-        )
-        .map(|_| ())
+        ioctl_send(dev, control::IOCTL_REMOVE, bytemuck::bytes_of(&req))
     }
 
     fn ping(&self, dev: &ControlDevice) -> Result<()> {
-        let mut none: [u8; 0] = [];
-        ioctl(dev, control::IOCTL_PING, &[], &mut none).map(|_| ())
+        ioctl_send(dev, control::IOCTL_PING, &[])
     }
 
     fn drain_log(&self, dev: &ControlDevice) {
@@ -1559,12 +1521,10 @@ mod tests {
         thread::sleep(Duration::from_secs(3));
         let req = control::EncodeProbeRequest { target_id, ..req };
         let dev = open_device().expect("open the pf-vdisplay control device");
-        let mut none: [u8; 0] = [];
-        ioctl(
+        ioctl_send(
             &dev,
             control::IOCTL_ENCODE_PROBE_ARM,
             bytemuck::bytes_of(&req),
-            &mut none,
         )
         .expect("IOCTL_ENCODE_PROBE_ARM — is the driver built with --features encode-probe?");
 

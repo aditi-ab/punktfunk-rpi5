@@ -32,7 +32,7 @@ use super::nvenc_core::{
 use crate::rfi::{Wave, WaveMark};
 // Shared with Linux's direct session. Do not fork this copy.
 use super::nvenc_core::{
-    cached_split_verdict, store_split_verdict, ArbAction, SplitArbiter, SplitKey,
+    cached_split_verdict, open_split_mode, store_split_verdict, ArbAction, SplitArbiter, SplitKey,
 };
 use super::nvenc_status;
 use super::{max_forced_split_mode, resolve_split_mode};
@@ -884,9 +884,11 @@ impl NvencD3d11Encoder {
     }
 
     /// Move the live session to `mode` without an IDR. `nvEncReconfigureEncoder` accepts a
-    /// changed `splitEncodeMode` with `resetEncoder=0` and emits no keyframe.
+    /// changed `splitEncodeMode` with `resetEncoder=0` and emits no keyframe. A refusal
+    /// restores every field, so the encoder's idea of the session stays truthful.
     fn apply_split_mode(&mut self, mode: u32) -> bool {
-        let (prev_mode, prev_sub) = (self.split_mode, self.subframe_on);
+        let (prev_mode, prev_sub, prev_chunks) =
+            (self.split_mode, self.subframe_on, self.subframe_chunks);
         let (mode, subframe) = resolve_split_subframe(
             self.codec,
             mode,
@@ -895,6 +897,9 @@ impl NvencD3d11Encoder {
         );
         self.split_mode = mode;
         self.subframe_on = subframe;
+        // `reconfigure_bitrate` does not recompute this latch; a stale true makes
+        // `poll_chunk` busy-poll while `numSlices` never advances.
+        self.subframe_chunks = self.slices >= 2 && subframe && !self.session_async;
         if self.reconfigure_bitrate(self.bitrate_bps) {
             true
         } else {
@@ -905,6 +910,7 @@ impl NvencD3d11Encoder {
             );
             self.split_mode = prev_mode;
             self.subframe_on = prev_sub;
+            self.subframe_chunks = prev_chunks;
             false
         }
     }
@@ -1078,25 +1084,31 @@ impl NvencD3d11Encoder {
             // Try the request, then binary-search down to the max the level accepts.
             const FLOOR_BPS: u64 = 10_000_000;
             let requested_bps = self.bitrate_bps;
-            // Split-frame encode: one session tops out ~0.8–1 Gpix/s. See [`resolve_split_mode`].
-            // Init-failure fallback below disables it if rejected.
+            // Split-frame encode: one session tops out ~0.8–1 Gpix/s. See [`resolve_split_mode`];
+            // a measured verdict wins ([`open_split_mode`]). Init-failure fallback below
+            // disables it if rejected.
             let pixel_rate = self.width as u64 * self.height as u64 * self.fps.max(1) as u64;
-            let split_mode: u32 = resolve_split_mode(
+            let static_mode = resolve_split_mode(
                 self.codec,
                 self.bit_depth,
                 pixel_rate,
                 self.encoder_engines,
                 self.max_slices,
             );
+            // A single-slice client keeps split off: a verdict cached for a sliced session
+            // must not turn it back on.
+            let split_mode = if self.max_slices <= 1 {
+                static_mode
+            } else {
+                open_split_mode(static_mode, &self.split_key())
+            };
             // Multi-slice default 4, clamped by the client ceiling. `PUNKTFUNK_NVENC_SLICES` overrides.
             self.slices = resolve_slices(self.codec, 4.min(self.max_slices));
-            // Sub-frame defaults ON where the GPU advertises SUBFRAME_READBACK.
-            // `PUNKTFUNK_NVENC_SUBFRAME` is the tri-state override. `subframe_broken`
-            // wins over the operator force so a failed prefix check does not re-arm.
-            // Sub-frame readback needs slices to read ahead of; at one slice it only costs the
-            // second engine on HEVC.
+            // Sub-frame follows the GPU cap and the slice count ([`resolve_subframe`]).
+            // `subframe_broken` wins over the operator force so a failed prefix check does
+            // not re-arm.
             let subframe_req =
-                self.slices >= 2 && resolve_subframe(self.subframe_cap) && !self.subframe_broken;
+                resolve_subframe(self.slices, self.subframe_cap) && !self.subframe_broken;
             let (split_mode, subframe_req) =
                 resolve_split_subframe(self.codec, split_mode, subframe_req, subframe_env_forced());
             // Highest bitrate the codec LEVEL accepts. If a forced split is the only problem,
@@ -2238,59 +2250,18 @@ fn with_probe_session<T>(
     let _gate = DRIVER_SESSION_GATE
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    use windows::Win32::Foundation::HMODULE;
-    use windows::Win32::Graphics::Direct3D::{
-        D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0,
-    };
-    use windows::Win32::Graphics::Direct3D11::{
-        D3D11CreateDevice, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
-    };
-    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory4};
+    use windows::Win32::Graphics::Direct3D11::D3D11_CREATE_DEVICE_BGRA_SUPPORT;
     // No loadable NVENC → nothing to confirm. Also the `api()` gate for every call below and in `f`.
     if try_api().is_err() {
         return None;
     }
-    // SAFETY: this probe owns every handle it creates. `CreateDXGIFactory1` /
-    // `EnumAdapterByLuid` return owned COM or err. `D3D11CreateDevice` fills `device`
-    // or returns Err. `open_encode_session_ex` opens against that device's raw pointer
-    // (valid while `device` is held); a failed open destroys any residue session.
-    // `destroy_encoder` runs once after `f` returns. No handle escapes.
+    // Probe the selected render adapter — the GPU the session will encode on. The OS default
+    // can be the other GPU on a hybrid box.
+    let device = pf_frame::dxgi::probe_device(adapter_luid, D3D11_CREATE_DEVICE_BGRA_SUPPORT)?;
+    // SAFETY: this probe owns every handle it creates. `open_encode_session_ex` opens against
+    // `device`'s raw pointer (valid while `device` is held); a failed open destroys any residue
+    // session. `destroy_encoder` runs once after `f` returns. No handle escapes.
     unsafe {
-        // Probe the selected render adapter — the GPU the session will encode on. The OS default
-        // can be the other GPU on a hybrid box.
-        let adapter: Option<IDXGIAdapter1> = adapter_luid.and_then(|luid| {
-            let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
-            factory.EnumAdapterByLuid(luid).ok()
-        });
-        let mut device: Option<ID3D11Device> = None;
-        let created = match &adapter {
-            Some(a) => D3D11CreateDevice(
-                a,
-                D3D_DRIVER_TYPE_UNKNOWN,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                Some(&[D3D_FEATURE_LEVEL_11_0]),
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                None,
-            ),
-            None => D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                Some(&[D3D_FEATURE_LEVEL_11_0]),
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                None,
-            ),
-        };
-        if created.is_err() {
-            return None;
-        }
-        let device = device?;
         let mut params = nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
             version: nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
             deviceType: nv::NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_DIRECTX,

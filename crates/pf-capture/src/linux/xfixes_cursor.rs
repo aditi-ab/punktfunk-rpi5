@@ -434,6 +434,46 @@ impl XDisplay {
         d
     }
 
+    /// Drain this display's events, re-read the gamescope atoms when one changed (or on
+    /// `resync`), then poll the pointer. `true` when it moved since the last poll; an I/O
+    /// error marks the display dead.
+    fn pump(&mut self, resync: bool) -> bool {
+        // CursorNotify = shape changed. PropertyNotify on either gamescope atom
+        // = a new verdict or focus (the root has many properties).
+        let mut need_feedback = resync;
+        loop {
+            match self.conn.poll_for_event() {
+                Ok(Some(Event::XfixesCursorNotify(_))) => self.need_shape = true,
+                Ok(Some(Event::PropertyNotify(ev))) => {
+                    need_feedback |= ev.atom != 0
+                        && (ev.atom == self.feedback_atom || ev.atom == self.focus_atom);
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {
+                    self.dead = true;
+                    break;
+                }
+            }
+        }
+        if need_feedback && !self.dead {
+            self.resync_gamescope_atoms();
+        }
+        match fetch_pointer(&self.conn, self.root) {
+            Ok(p) if p.same_screen => {
+                let pos = (i32::from(p.root_x), i32::from(p.root_y));
+                let moved = self.last_pos.is_some_and(|lp| lp != pos);
+                self.last_pos = Some(pos);
+                moved
+            }
+            Ok(_) => false, // other screen — keep the last position.
+            Err(_) => {
+                self.dead = true;
+                false
+            }
+        }
+    }
+
     /// Keep a previously-seen value if the read fails: a transient miss
     /// must not look like "no feedback" and re-arm the motion heuristic.
     fn resync_gamescope_atoms(&mut self) {
@@ -492,11 +532,7 @@ fn run(
     let mut last_discover = std::time::Instant::now();
     let mut warned_scale = false;
     let mut active = 0usize;
-    // Overlay serial must bump when the drawn cursor changes — active display
-    // or its shape. Per-display XFixes serials are not comparable, so a switch
-    // could reuse a number and the encoder would keep the old texture.
-    let mut out_serial = 0u64;
-    let mut last_key = (usize::MAX, u64::MAX);
+    let mut serial = OverlaySerial::default();
     let mut warned_image = false;
     let mut last_resync = std::time::Instant::now();
 
@@ -516,45 +552,13 @@ fn run(
         let mut active_moved = false;
         let mut other_moved: Option<usize> = None;
         for (i, d) in displays.iter_mut().enumerate() {
-            if d.dead {
+            if d.dead || !d.pump(resync) {
                 continue;
             }
-            // CursorNotify = shape changed. PropertyNotify on either gamescope atom
-            // = a new verdict or focus (the root has many properties).
-            let mut need_feedback = resync;
-            loop {
-                match d.conn.poll_for_event() {
-                    Ok(Some(Event::XfixesCursorNotify(_))) => d.need_shape = true,
-                    Ok(Some(Event::PropertyNotify(ev))) => {
-                        need_feedback |=
-                            ev.atom != 0 && (ev.atom == d.feedback_atom || ev.atom == d.focus_atom);
-                    }
-                    Ok(Some(_)) => {}
-                    Ok(None) => break,
-                    Err(_) => {
-                        d.dead = true;
-                        break;
-                    }
-                }
-            }
-            if need_feedback && !d.dead {
-                d.resync_gamescope_atoms();
-            }
-            match fetch_pointer(&d.conn, d.root) {
-                Ok(p) if p.same_screen => {
-                    let pos = (i32::from(p.root_x), i32::from(p.root_y));
-                    let moved = d.last_pos.is_some_and(|lp| lp != pos);
-                    d.last_pos = Some(pos);
-                    if moved {
-                        if i == active {
-                            active_moved = true;
-                        } else if other_moved.is_none() {
-                            other_moved = Some(i);
-                        }
-                    }
-                }
-                Ok(_) => {} // other screen — keep the last position.
-                Err(_) => d.dead = true,
+            if i == active {
+                active_moved = true;
+            } else if other_moved.is_none() {
+                other_moved = Some(i);
             }
         }
 
@@ -617,35 +621,75 @@ fn run(
                  cursor bitmap stays at root scale"
             );
         }
-        let overlay = match (d.last_pos, d.shape.rgba.is_empty()) {
-            (Some(pos), false) => {
-                let (px, py) = scale_to_frame(pos, d.root_size, frame);
-                let key = (active, d.shape.serial);
-                if key != last_key {
-                    out_serial += 1;
-                    last_key = key;
-                }
-                Some(CursorOverlay {
-                    // Overlay top-left is pointer − hotspot.
-                    x: px - d.shape.hot_x as i32,
-                    y: py - d.shape.hot_y as i32,
-                    w: d.shape.w,
-                    h: d.shape.h,
-                    rgba: Arc::clone(&d.shape.rgba),
-                    serial: out_serial,
-                    hot_x: d.shape.hot_x,
-                    hot_y: d.shape.hot_y,
-                    visible: drawn,
-                })
-            }
-            _ => None,
-        };
+        let overlay = compose_overlay(
+            active,
+            d.last_pos,
+            d.root_size,
+            &d.shape,
+            frame,
+            drawn,
+            &mut serial,
+        );
         if let Ok(mut s) = slot.lock() {
             *s = overlay;
         }
 
         std::thread::sleep(POLL);
     }
+}
+
+/// The overlay serial. It bumps whenever the drawn cursor changes, the active display or its
+/// shape: per-display XFixes serials are not comparable, so a switch could reuse a number and
+/// the encoder would keep the old texture.
+struct OverlaySerial {
+    out: u64,
+    /// `(active display, its XFixes serial)` the current `out` names.
+    key: (usize, u64),
+}
+
+impl Default for OverlaySerial {
+    fn default() -> Self {
+        Self {
+            out: 0,
+            key: (usize::MAX, u64::MAX),
+        }
+    }
+}
+
+impl OverlaySerial {
+    fn for_key(&mut self, key: (usize, u64)) -> u64 {
+        if key != self.key {
+            self.out += 1;
+            self.key = key;
+        }
+        self.out
+    }
+}
+
+/// Display `active`'s pointer `pos` (root space) and `shape` as a frame-space overlay; `None`
+/// before the first position or bitmap. The overlay's top-left is the pointer less the hotspot.
+fn compose_overlay(
+    active: usize,
+    pos: Option<(i32, i32)>,
+    root: (u16, u16),
+    shape: &Shape,
+    frame: (u32, u32),
+    drawn: bool,
+    serial: &mut OverlaySerial,
+) -> Option<CursorOverlay> {
+    let pos = pos.filter(|_| !shape.rgba.is_empty())?;
+    let (px, py) = scale_to_frame(pos, root, frame);
+    Some(CursorOverlay {
+        x: px - shape.hot_x as i32,
+        y: py - shape.hot_y as i32,
+        w: shape.w,
+        h: shape.h,
+        rgba: Arc::clone(&shape.rgba),
+        serial: serial.for_key((active, shape.serial)),
+        hot_x: shape.hot_x,
+        hot_y: shape.hot_y,
+        visible: drawn,
+    })
 }
 
 /// Live display gamescope draws the cursor from, per `(dead, name, mouse_focus)`.
@@ -743,9 +787,10 @@ fn argb_premul_to_straight_rgba(argb: &[u32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        display_number, focus_index, focus_name, mit_magic_cookie, pick_active, scale_to_frame,
-        MIT_MAGIC_COOKIE_1,
+        compose_overlay, display_number, focus_index, focus_name, mit_magic_cookie, pick_active,
+        scale_to_frame, OverlaySerial, Shape, MIT_MAGIC_COOKIE_1,
     };
+    use std::sync::Arc;
 
     fn entry(family: u16, address: &[u8], number: &[u8], name: &[u8], data: &[u8]) -> Vec<u8> {
         let mut v = family.to_be_bytes().to_vec();
@@ -856,6 +901,59 @@ mod tests {
         // Not negotiated, or a degenerate root: pass through rather than divide by zero.
         assert_eq!(scale_to_frame((7, 9), (1920, 1080), (0, 0)), (7, 9));
         assert_eq!(scale_to_frame((7, 9), (0, 0), (1920, 1080)), (7, 9));
+    }
+
+    fn shape(serial: u64) -> Shape {
+        Shape {
+            rgba: Arc::new(vec![255; 4 * 4 * 4]),
+            w: 4,
+            h: 4,
+            hot_x: 1,
+            hot_y: 2,
+            serial,
+            visible: true,
+        }
+    }
+
+    /// The pointer lands in frame space less the hotspot; no position or bitmap is no overlay.
+    #[test]
+    fn the_overlay_is_the_scaled_pointer_less_the_hotspot() {
+        let mut serial = OverlaySerial::default();
+        let (root, frame) = ((640, 360), (1280, 720));
+        let o = compose_overlay(
+            0,
+            Some((320, 180)),
+            root,
+            &shape(1),
+            frame,
+            true,
+            &mut serial,
+        )
+        .expect("overlay");
+        assert_eq!(
+            (o.x, o.y, o.w, o.h, o.hot_x, o.hot_y),
+            (639, 358, 4, 4, 1, 2)
+        );
+        assert!(o.visible);
+        let hidden = compose_overlay(0, Some((0, 0)), root, &shape(1), frame, false, &mut serial);
+        assert!(
+            !hidden
+                .expect("a hidden pointer is still an overlay")
+                .visible
+        );
+        assert!(compose_overlay(0, None, root, &shape(1), frame, true, &mut serial).is_none());
+        let empty = Shape::default();
+        assert!(compose_overlay(0, Some((1, 1)), root, &empty, frame, true, &mut serial).is_none());
+    }
+
+    /// The serial moves with the drawn cursor: a new shape or another display, never a repeat.
+    #[test]
+    fn the_overlay_serial_follows_the_display_and_its_shape() {
+        let mut s = OverlaySerial::default();
+        assert_eq!(s.for_key((0, 5)), 1);
+        assert_eq!(s.for_key((0, 5)), 1, "the same cursor keeps its serial");
+        assert_eq!(s.for_key((0, 6)), 2, "a new shape");
+        assert_eq!(s.for_key((1, 6)), 3, "another display reusing the number");
     }
 
     /// A 5K frame times a 5K coordinate overflows `i32` — scale in `i64`.

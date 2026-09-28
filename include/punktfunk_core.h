@@ -25,7 +25,7 @@
 // Not [`WIRE_VERSION`]. The C surface can grow without a wire byte changing.
 // Pin the integer in `abi.rs` (`abi_version_is_pinned`). Per-bump notes live
 // in `CHANGELOG.md`.
-#define PUNKTFUNK_ABI_VERSION 39
+#define PUNKTFUNK_ABI_VERSION 40
 
 // punktfunk/1 wire version. `Hello`/`Welcome` carry it; hosts equality-check it.
 //
@@ -533,7 +533,7 @@
 // [`USER_FLAG_RECOVERY_POINT`]: the picture is fully swept on this AU. A client that
 // has seen the bit lifts on the first close after a start seen since its loss instead
 // of counting two marks, so a close whose wave began before the loss never lifts.
-#define USER_FLAG_RECOVERY_CLOSE 512
+#define PUNKTFUNK_USER_FLAG_RECOVERY_CLOSE 512
 
 // `user_flags` bit. Each `shard_payload`-sized window of the frame buffer
 // is a self-delimiting codec packet, zero-padded. Missing shards stay zero
@@ -574,32 +574,32 @@
 #define PUNKTFUNK_MIN_STREAM_BLOCK_SHARDS 16
 
 // DualSense `0xCC`, pad-audio, rumble, and virtual-pad creation (no bit, no uinput node).
-#define PUNKTFUNK_GRANT_GAMEPAD (1 << 0)
+#define PUNKTFUNK_GRANT_GAMEPAD 1
 
 // Mouse, scroll, touch, and the pen plane.
-#define PUNKTFUNK_GRANT_POINTER (1 << 1)
+#define PUNKTFUNK_GRANT_POINTER 2
 
 // Key down/up and IME-committed text.
-#define PUNKTFUNK_GRANT_KEYBOARD (1 << 2)
+#define PUNKTFUNK_GRANT_KEYBOARD 4
 
 // Clipboard coordinator. ANDed with the operator clipboard policy; never overrides it.
-#define PUNKTFUNK_GRANT_CLIPBOARD (1 << 3)
+#define PUNKTFUNK_GRANT_CLIPBOARD 8
 
 // Mic datagram plane and the per-session mic-service attach.
-#define PUNKTFUNK_GRANT_MIC (1 << 4)
+#define PUNKTFUNK_GRANT_MIC 16
 
 // `Hello.launch` resolution.
-#define PUNKTFUNK_GRANT_LAUNCH (1 << 5)
+#define PUNKTFUNK_GRANT_LAUNCH 32
 
 // `power.*` (sleep/reboot/shutdown) on the mgmt cert lane (`design/host-actions.md`).
 // Not a datagram; [`classify`] is untouched. Machine power only — never plugin actions.
-#define PUNKTFUNK_GRANT_POWER (1 << 6)
+#define PUNKTFUNK_GRANT_POWER 64
 
-// An omitted Welcome or registry mask reads as this.
-#define PUNKTFUNK_GRANT_ALL ((((((PUNKTFUNK_GRANT_GAMEPAD | PUNKTFUNK_GRANT_POINTER) | PUNKTFUNK_GRANT_KEYBOARD) | PUNKTFUNK_GRANT_CLIPBOARD) | PUNKTFUNK_GRANT_MIC) | PUNKTFUNK_GRANT_LAUNCH) | PUNKTFUNK_GRANT_POWER)
+// An omitted Welcome or registry mask reads as this: every bit above.
+#define PUNKTFUNK_GRANT_ALL 127
 
 // Stored "Full control" before [`GRANT_POWER`]. [`normalize_legacy_full`] lifts it.
-#define PUNKTFUNK_GRANT_ALL_PRE_POWER (((((PUNKTFUNK_GRANT_GAMEPAD | PUNKTFUNK_GRANT_POINTER) | PUNKTFUNK_GRANT_KEYBOARD) | PUNKTFUNK_GRANT_CLIPBOARD) | PUNKTFUNK_GRANT_MIC) | PUNKTFUNK_GRANT_LAUNCH)
+#define PUNKTFUNK_GRANT_ALL_PRE_POWER 63
 
 // The management API rejects these; it never silently clears unknown bits
 // (that would grant less than the caller asked).
@@ -1967,6 +1967,26 @@ typedef struct {
     uint32_t send_dropped;
 } PunktfunkProbeResult;
 
+// [`punktfunk_av1_sequence_info`]'s answer: what an `av1C` record and a colour description
+// take from an AV1 sequence header. Colour codes are ITU-T H.273, 2 when none is coded.
+typedef struct {
+    uint8_t profile;
+    uint8_t level_idx0;
+    uint8_t tier0;
+    bool high_bitdepth;
+    bool twelve_bit;
+    bool mono_chrome;
+    bool subsampling_x;
+    bool subsampling_y;
+    uint8_t chroma_sample_position;
+    uint8_t color_primaries;
+    uint8_t transfer_characteristics;
+    uint8_t matrix_coefficients;
+    bool full_range;
+    uint32_t max_width;
+    uint32_t max_height;
+} PunktfunkAv1SequenceInfo;
+
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // The demo session to render, from [`punktfunk_demo_host_session`].
 typedef struct {
@@ -1981,14 +2001,6 @@ typedef struct {
 } PunktfunkDemoSession;
 #endif
 
-
-
-
-
-
-
-
-
 // Frame durations the plane may negotiate, longest first.
 //
 // Every rung divides the 48 kHz family into whole samples per channel.
@@ -2000,6 +2012,14 @@ typedef struct {
 // A rung is a wire/ring size, not a duration. Advance `pts_ns` with
 // [`frame_duration_ns`] of the real sample count, never `frame_us`.
 #define PUNKTFUNK_AUDIO_FRAME_US_LADDER { 5000, 4000, 3000, 2500, 2000, 1500, 1000, }
+
+
+
+
+
+
+
+
 
 // Rest pose: 1 g along up (index 1), zeros on the other two. `[0, 0, 0]` is
 // free-fall, not "no sample". Backends that use different units rescale this
@@ -3465,6 +3485,15 @@ PunktfunkStatus punktfunk_h265_concealer_conceal(PunktfunkH265Concealer *c,
 // # Safety
 // `buf`/`len` are exactly what one `conceal` call returned, released once.
 void punktfunk_h265_concealer_release(uint8_t *buf, uintptr_t len);
+
+// Parse the first sequence header in `data`, a low-overhead temporal unit or a run of sized
+// OBUs. `InvalidArg` when it carries none or the header does not parse.
+//
+// # Safety
+// `data` points to `len` readable bytes; `out` is writable.
+PunktfunkStatus punktfunk_av1_sequence_info(const uint8_t *data,
+                                            uintptr_t len,
+                                            PunktfunkAv1SequenceInfo *out);
 
 // Create a re-anchor gate seeded with the session's current `frames_dropped` (so
 // the first [`punktfunk_reanchor_gate_poll`] doesn't read the baseline as a loss).

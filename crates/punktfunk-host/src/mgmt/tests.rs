@@ -5,13 +5,8 @@
 /// change fails here rather than on the platform CI cannot run.
 #[test]
 fn published_endpoint_line_parses_the_way_both_consumers_read_it() {
-    let dir = std::env::temp_dir().join(format!(
-        "pf-mgmt-endpoint-{}-{:p}",
-        std::process::id(),
-        &0u8 as *const u8
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = super::write_endpoint(&dir, 47991).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = super::write_endpoint(dir.path(), 47991).unwrap();
     assert_eq!(path.file_name().unwrap(), super::ENDPOINT_FILE);
 
     let contents = std::fs::read_to_string(&path).unwrap();
@@ -27,8 +22,6 @@ fn published_endpoint_line_parses_the_way_both_consumers_read_it() {
     assert!(!value.contains('='));
     // Loopback whatever the listener binds: a 0.0.0.0 bind must never be echoed as a LAN URL.
     assert!(value.starts_with("https://127.0.0.1:"));
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 use super::*;
@@ -36,11 +29,11 @@ use super::*;
 /// Knocks in these tests come from the LAN unless the test is about a WAN knock. An unknown
 /// source classifies as WAN, which the approve endpoint refuses.
 const LAN_KNOCK: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 44));
-use crate::encode::Codec;
 #[cfg(feature = "gamestream")]
 use crate::gamestream::cert::ServerIdentity;
 use crate::gamestream::tls::{PeerAddr, PeerCertFingerprint};
-use crate::gamestream::{Host, LaunchSession, HTTPS_PORT, HTTP_PORT};
+use crate::gamestream::{LaunchSession, HTTPS_PORT, HTTP_PORT};
+use crate::host::Host;
 use axum::body::Body;
 use axum::http::StatusCode;
 use http_body_util::BodyExt;
@@ -48,31 +41,19 @@ use sha2::{Digest, Sha256};
 use std::sync::atomic::Ordering;
 use tower::ServiceExt;
 
-/// Unique temp dir for the access store; never the host config dir.
+/// The access store's dir, one per call; never the host config dir.
 fn test_access_dir() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "pf-mgmt-access-{}-{:p}",
-        std::process::id(),
-        &0u8 as *const u8
-    ))
+    crate::test_support::scratch()
 }
 
-/// Unique temp dir; never the host config dir.
+/// One dir per call; never the host config dir.
 fn test_client_logs_dir() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "pf-mgmt-clientlogs-{}-{:p}",
-        std::process::id(),
-        &0u8 as *const u8
-    ))
+    crate::test_support::scratch()
 }
 
-/// Unique temp dir; never the host config dir.
+/// One dir per call; never the host config dir.
 fn test_stats() -> Arc<crate::stats_recorder::StatsRecorder> {
-    crate::stats_recorder::StatsRecorder::new(std::env::temp_dir().join(format!(
-        "pf-mgmt-stats-{}-{:p}",
-        std::process::id(),
-        &0u8 as *const u8
-    )))
+    crate::stats_recorder::StatsRecorder::new(crate::test_support::scratch())
 }
 
 fn test_state() -> Arc<AppState> {
@@ -84,15 +65,12 @@ fn test_state() -> Arc<AppState> {
         os_chain: "linux/arch/steamos".into(),
         os_name: "SteamOS".into(),
     };
-    #[cfg(feature = "gamestream")]
-    {
-        let identity = ServerIdentity::ephemeral().expect("ephemeral identity");
-        Arc::new(AppState::new(host, identity, test_stats()))
-    }
-    #[cfg(not(feature = "gamestream"))]
-    {
-        Arc::new(AppState::new(host, test_stats()))
-    }
+    Arc::new(AppState::new(
+        host,
+        test_stats(),
+        #[cfg(feature = "gamestream")]
+        crate::gamestream::GsState::new(ServerIdentity::ephemeral().expect("ephemeral identity")),
+    ))
 }
 
 /// One identified plugin, so the id-scoped routes have something to accept and something to
@@ -545,29 +523,11 @@ fn fake_native_session(
     fps: u32,
 ) -> crate::session_status::LiveSessionGuard {
     let packed = ((width as u64) << 32) | ((height as u64) << 16) | fps as u64;
+    // Desktop stream: no game row.
     crate::session_status::register(crate::session_status::Registration {
         mode: Arc::new(std::sync::atomic::AtomicU64::new(packed)),
-        bitrate_kbps: Arc::new(std::sync::atomic::AtomicU32::new(20_000)),
-        codec: Codec::H265,
-        stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        quit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        force_idr: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        client: "test-client".into(),
-        plane: crate::events::Plane::Native,
         client_name: Some("studio-deck".into()),
-        hdr: false,
-        ttff_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        last_resize_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        // Desktop stream: no game row.
-        game: None,
-        capture_health: Arc::new(std::sync::Mutex::new(None)),
-        join: false,
-        controls: crate::session_status::SessionControls::open(),
-        bit_depth: 8,
-        chroma: crate::encode::ChromaFormat::Yuv420,
-        end_reason: Arc::new(std::sync::atomic::AtomicU8::new(0)),
-        counters: Arc::new(crate::session_status::SessionCounters::default()),
-        peer: None,
+        ..crate::session_status::Registration::fake("test-client")
     })
 }
 
@@ -598,26 +558,11 @@ fn fake_session_with_flags(
         mode: Arc::new(std::sync::atomic::AtomicU64::new(
             (1920u64 << 32) | (1080u64 << 16) | 60,
         )),
-        bitrate_kbps: Arc::new(std::sync::atomic::AtomicU32::new(20_000)),
-        codec: Codec::H265,
         stop: stop.clone(),
         quit: quit.clone(),
         force_idr: idr.clone(),
-        client: client.into(),
-        client_name: None,
-        plane: crate::events::Plane::Native,
-        hdr: false,
-        ttff_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        last_resize_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        game: None,
-        capture_health: Arc::new(std::sync::Mutex::new(None)),
-        join: false,
         controls,
-        bit_depth: 8,
-        chroma: crate::encode::ChromaFormat::Yuv420,
-        end_reason: Arc::new(std::sync::atomic::AtomicU8::new(0)),
-        counters: Arc::new(crate::session_status::SessionCounters::default()),
-        peer: None,
+        ..crate::session_status::Registration::fake(client)
     });
     (guard, stop, quit, idr)
 }
@@ -1723,6 +1668,55 @@ async fn a_plugin_may_reconcile_only_its_own_provider() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// Every plugin-scoped write refuses another plugin's id before it reads the body, and
+/// checks the id's shape only for a caller that may write it.
+#[tokio::test]
+async fn every_plugin_scoped_write_checks_the_owner_first() {
+    let app = test_app(test_state(), None);
+    let req = |method: &str, path: &str, token: &str| {
+        bearer_req(
+            axum::http::Request::builder()
+                .method(method)
+                .uri(format!("/api/v1{path}"))
+                .header("content-type", "application/json")
+                .body(Body::from("{not json"))
+                .unwrap(),
+            token,
+        )
+    };
+    for (method, path) in [
+        ("PUT", "/library/scanners/steam"),
+        ("PUT", "/library/provider/steam"),
+        ("DELETE", "/library/provider/steam"),
+        ("PUT", "/library/provider/steam/running"),
+        ("PUT", "/library/metadata/steam"),
+        ("DELETE", "/library/metadata/steam"),
+        ("PUT", "/plugins/rom-manager"),
+        ("DELETE", "/plugins/rom-manager"),
+    ] {
+        let (status, body) = send(&app, req(method, path, "demo-secret")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {body}");
+        assert_eq!(body["error"], "a plugin may only write its own id");
+    }
+    for (method, path) in [
+        ("PUT", "/library/provider/manual"),
+        ("DELETE", "/library/provider/manual"),
+        ("PUT", "/library/metadata/manual"),
+        ("DELETE", "/library/metadata/manual"),
+        ("PUT", "/plugins/Not_Kebab"),
+    ] {
+        let (status, body) = send(&app, req(method, path, "plugin-secret")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {path}: {body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("id"),
+            "the id is refused, not the body: {body}"
+        );
+    }
+    // Deregistering takes any id: an unknown one is already gone.
+    let (status, _) = send(&app, req("DELETE", "/plugins/Not_Kebab", "plugin-secret")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
 }
 
 /// The runner's shared token keeps the older, unowned behaviour — a loose script has no plugin
@@ -3635,7 +3629,7 @@ async fn events_stream_catch_up_filter_resume_tail_and_dropped() {
     use crate::events::EventKind;
     let _l = EVENTS_TEST_LOCK.lock().await;
     let app = test_app(test_state(), None);
-    let uniq = format!("evt-{}-{:p}", std::process::id(), &0u8 as *const u8);
+    let uniq = format!("evt-{}", std::process::id());
     let m1 = format!("{uniq}-one");
 
     crate::events::emit(EventKind::DisplayReleased { count: 424_242 });
@@ -4276,10 +4270,7 @@ async fn a_paired_device_key_buys_the_cert_lane_and_no_more() {
         Arc::new(crate::native_pairing::NativePairing::load_with(Some(path), None, false).unwrap());
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let spki = key.subject_public_key_info();
-    let fp: String = crate::webtransport::sha256(&spki)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let fp = hex::encode(crate::webtransport::sha256(&spki));
     let app = test_app_native(test_state(), np.clone());
 
     // The exchange, as the page runs it.
@@ -4966,7 +4957,7 @@ async fn plugin_access_refusals_and_reason_sanitizing() {
                         { "path": "relative/dir" },
                         { "path": path },
                     ],
-                    "reason": "games\u{7}\n library"
+                    "reason": "games\u{7}\u{2066}\n library"
                 }),
             ),
             "demo-secret",

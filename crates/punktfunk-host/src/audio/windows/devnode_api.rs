@@ -11,7 +11,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use std::mem::ManuallyDrop;
-use windows::core::{w, Owned, GUID, PCWSTR, PWSTR};
+use windows::core::{w, Owned, GUID, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiCreateDevRegKeyW, SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW,
     SetupDiEnumDeviceInfo, SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW,
@@ -33,16 +33,8 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::System::Variant::{VT_BLOB, VT_CLSID, VT_LPWSTR};
 
-/// REG_MULTI_SZ: each string NUL-terminated, the list NUL-terminated again.
-fn multi_sz_bytes(items: &[&str]) -> Vec<u8> {
-    let mut units: Vec<u16> = items
-        .iter()
-        .flat_map(|s| s.encode_utf16().chain(std::iter::once(0)))
-        .collect();
-    units.push(0);
-    units.iter().flat_map(|u| u.to_le_bytes()).collect()
-}
-
+/// An owned NUL-terminated UTF-16 buffer, for a property value that borrows or copies the
+/// bytes. A read-only `PCWSTR` argument takes an `HSTRING` instead.
 pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -278,7 +270,7 @@ pub(crate) fn read_devparam_dword(
             .ok()?,
         )
     };
-    let name = wide(value_name);
+    let name = HSTRING::from(value_name);
     let mut data = [0u8; 4];
     let mut len = data.len() as u32;
     let mut ty = REG_VALUE_TYPE(0);
@@ -334,7 +326,7 @@ pub(crate) fn write_devparam_dword(
     };
     // SAFETY: the key opened or created above is ours alone; `Owned` closes it once.
     let hkey = unsafe { Owned::new(hkey) };
-    let name = wide(value_name);
+    let name = HSTRING::from(value_name);
     // SAFETY: the value name is NUL-terminated and outlives the call; the DWORD bytes travel
     // with the slice.
     let rc = unsafe {
@@ -362,7 +354,7 @@ pub(crate) fn create_media_devnode(
         .context("SetupDiCreateDeviceInfoList(MEDIA)")?;
     let set = DevInfoSet::adopt(set);
     let mut did = devinfo_data();
-    let desc = wide(desc);
+    let desc = HSTRING::from(desc);
     // SAFETY: name/class/description are live NUL-terminated buffers; DICD_GENERATE_ID makes
     // PnP mint the ROOT\MEDIA\00NN instance id; `did` receives the element.
     unsafe {
@@ -377,7 +369,10 @@ pub(crate) fn create_media_devnode(
         )
     }
     .context("SetupDiCreateDeviceInfo")?;
-    let hwid = multi_sz_bytes(&[hwid]);
+    let hwid: Vec<u8> = pf_win_display::multi_sz(&[hwid])
+        .iter()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
     // SAFETY: live set + element; the multi-sz property bytes travel with the slice.
     unsafe { SetupDiSetDeviceRegistryPropertyW(*set.0, &mut did, SPDRP_HARDWAREID, Some(&hwid)) }
         .context("set SPDRP_HARDWAREID")?;
@@ -393,8 +388,8 @@ pub(crate) fn create_media_devnode(
 /// Bind `inf` to every unbound devnode carrying `hwid`. Idempotent: nothing
 /// needed an update is success. Shared with the `audio-probe` devtest.
 pub(crate) fn bind_driver(hwid: &str, inf: &str) -> Result<()> {
-    let inf_w = wide(inf);
-    let hwid_w = wide(hwid);
+    let inf_w = HSTRING::from(inf);
+    let hwid_w = HSTRING::from(hwid);
     // SAFETY: both strings are NUL-terminated and outlive the call; a null parent HWND and no
     // reboot-required out-param are documented as accepted.
     let r = unsafe {

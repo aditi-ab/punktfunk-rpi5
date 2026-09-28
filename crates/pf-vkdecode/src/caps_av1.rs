@@ -1,7 +1,5 @@
-//! AV1 decode capability query + derivation — [`crate::caps_h265`] one codec over.
-//!
-//! `query_av1_caps` talks to the driver and only COPIES facts into [`RawAv1Caps`].
-//! [`derive_caps_av1`] is pure and shares `derive_arrangement` with H.264/H.265.
+//! AV1 decode profile: the key and chain [`crate::caps`] queries and derives
+//! against.
 //!
 //! Film grain is part of the DECODE PROFILE (`filmGrainSupport` beside
 //! `stdProfile`). Vulkan identity is BY VALUE, so a grain stream is a different
@@ -14,17 +12,7 @@
 use ash::vk;
 use ash::vk::native as hh;
 
-use crate::caps::derive_arrangement;
-use crate::caps::CapsError;
-use crate::caps::DecodeCaps;
-use crate::caps::DecodeProfile;
-use crate::caps::MaxLevelIdc;
-use crate::caps::VideoFormat;
-use crate::caps::COINCIDE_USAGE;
-use crate::caps::DPB_USAGE;
-use crate::caps::OUTPUT_USAGE;
 use crate::caps_h265::output_format_for;
-use crate::device::DecodeDevice;
 use crate::params_av1::ParamsAv1Error;
 use crate::params_av1::STD_PROFILE_HIGH;
 use crate::params_av1::STD_PROFILE_MAIN;
@@ -159,148 +147,19 @@ impl Av1ProfileChain {
     }
 }
 
-/// Hand-buildable driver facts. Field-for-field [`crate::RawH265Caps`], except
-/// `max_level` is an AV1 Std level code point.
-#[derive(Debug, Clone, Default)]
-pub struct RawAv1Caps {
-    pub capability_flags: vk::VideoCapabilityFlagsKHR,
-    /// Coincide/distinct advertisement (`VkVideoDecodeCapabilitiesKHR::flags`).
-    pub decode_flags: vk::VideoDecodeCapabilityFlagsKHR,
-    pub min_bitstream_buffer_offset_alignment: u64,
-    pub min_bitstream_buffer_size_alignment: u64,
-    pub picture_access_granularity: vk::Extent2D,
-    pub min_coded_extent: vk::Extent2D,
-    pub max_coded_extent: vk::Extent2D,
-    pub max_dpb_slots: u32,
-    pub max_active_reference_pictures: u32,
-    /// `VkVideoDecodeAV1CapabilitiesKHR::maxLevel` — Std code points 0…23, the same
-    /// numbering as bitstream `seq_level_idx` over that range.
-    ///
-    /// `seq_level_idx` is 5 bits: 24…30 reserved, 31 is Annex A's "maximum
-    /// parameters" sentinel (not constrained to a level). 31 has no Std code point
-    /// and is not ordered above 7.3. The decoder treats a stream above this ceiling
-    /// as advisory (`VkAv1Decoder::ensure_state`), not as a numeric compare.
-    pub max_level: hh::StdVideoAV1Level,
-    /// `VkVideoCapabilitiesKHR::stdHeaderVersion` — session creation echoes it back.
-    pub std_header_version: vk::ExtensionProperties,
-    /// Distinct-mode DPB images, queried with [`DPB_USAGE`].
-    pub dpb_formats: Vec<VideoFormat>,
-    /// Distinct-mode outputs, queried with [`OUTPUT_USAGE`].
-    pub output_formats: Vec<VideoFormat>,
-    /// Coincide-mode images, queried with [`COINCIDE_USAGE`].
-    pub coincide_formats: Vec<VideoFormat>,
-}
-
-/// Same refusals as H.265: no advertised entry for `wanted` yields
-/// [`CapsError::NoFormat`] with the mode named. Nothing is created — a
-/// pre-session demote, never a silent fallback that would lose bits.
-pub fn derive_caps_av1(raw: &RawAv1Caps, wanted: vk::Format) -> Result<DecodeCaps, CapsError> {
-    let arrangement = derive_arrangement(
-        raw.capability_flags,
-        raw.decode_flags,
-        wanted,
-        &raw.dpb_formats,
-        &raw.output_formats,
-        &raw.coincide_formats,
-    )?;
-    Ok(arrangement.into_caps(
-        raw.min_bitstream_buffer_offset_alignment,
-        raw.min_bitstream_buffer_size_alignment,
-        raw.picture_access_granularity,
-        raw.min_coded_extent,
-        raw.max_coded_extent,
-        raw.max_dpb_slots,
-        raw.max_active_reference_pictures,
-        MaxLevelIdc::Av1(raw.max_level),
-        raw.std_header_version,
-    ))
-}
-
-/// Copies driver facts into [`RawAv1Caps`]. Derivation is [`derive_caps_av1`].
-///
-/// A device that cannot host the profile — grain-enabled, most importantly —
-/// fails the first call with a profile-unsupported result. The caller turns
-/// that into the ladder demote ([`crate::VkAv1Decoder::probe_stream_support`]).
-///
-/// # Safety
-///
-/// `dev` wraps live handles per the [`crate::DeviceHandles`] contract (this
-/// calls instance-level functions against its physical device).
-pub(crate) unsafe fn query_av1_caps(
-    dev: &DecodeDevice,
-    key: Av1ProfileKey,
-) -> Result<RawAv1Caps, vk::Result> {
-    let mut chain = Av1ProfileChain::new(key);
-    let profile = chain.wire();
-
-    let mut av1_caps = vk::VideoDecodeAV1CapabilitiesKHR::default();
-    let mut decode_caps = vk::VideoDecodeCapabilitiesKHR::default();
-    // ORDER IS LOAD-BEARING. `push_next` prepends: codec struct first leaves
-    // VkVideoDecodeCapabilitiesKHR directly after the base. Reverse that and
-    // some drivers fill by position (`query_h265_caps`).
-    let mut caps = vk::VideoCapabilitiesKHR::default()
-        .push_next(&mut av1_caps)
-        .push_next(&mut decode_caps);
-    // SAFETY: physical device is live (DeviceHandles contract); `profile` roots a
-    // fully wired, immovable chain; `caps` chains driver-fillable structs that all
-    // outlive the call.
-    let r = unsafe {
-        (dev.video_queue_instance()
-            .fp()
-            .get_physical_device_video_capabilities_khr)(
-            dev.physical_device(), profile, &mut caps
-        )
-    };
-    if r != vk::Result::SUCCESS {
-        return Err(r);
-    }
-    // Copy out before the chained &mut borrows end.
-    let capability_flags = caps.flags;
-    let min_bitstream_buffer_offset_alignment = caps.min_bitstream_buffer_offset_alignment;
-    let min_bitstream_buffer_size_alignment = caps.min_bitstream_buffer_size_alignment;
-    let picture_access_granularity = caps.picture_access_granularity;
-    let min_coded_extent = caps.min_coded_extent;
-    let max_coded_extent = caps.max_coded_extent;
-    let max_dpb_slots = caps.max_dpb_slots;
-    let max_active_reference_pictures = caps.max_active_reference_pictures;
-    let std_header_version = caps.std_header_version;
-    let decode_flags = decode_caps.flags;
-    let max_level = av1_caps.max_level;
-
-    // Real creation usages (SAMPLED for presenter-facing roles) so the answers
-    // match the images the pools will build.
-    let decode_profile = DecodeProfile::Av1(key);
-    // SAFETY: same liveness as above; the helper wires its own chain (this and
-    // the two calls below).
-    let dpb_formats = unsafe { crate::caps::query_formats(dev, decode_profile, DPB_USAGE)? };
-    // SAFETY: as above.
-    let output_formats = unsafe { crate::caps::query_formats(dev, decode_profile, OUTPUT_USAGE)? };
-    // SAFETY: as above.
-    let coincide_formats =
-        unsafe { crate::caps::query_formats(dev, decode_profile, COINCIDE_USAGE)? };
-
-    Ok(RawAv1Caps {
-        capability_flags,
-        decode_flags,
-        min_bitstream_buffer_offset_alignment,
-        min_bitstream_buffer_size_alignment,
-        picture_access_granularity,
-        min_coded_extent,
-        max_coded_extent,
-        max_dpb_slots,
-        max_active_reference_pictures,
-        max_level,
-        std_header_version,
-        dpb_formats,
-        output_formats,
-        coincide_formats,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::caps::derive_caps;
+    use crate::caps::CapsError;
+    use crate::caps::DecodeProfile;
+    use crate::caps::MaxLevelIdc;
+    use crate::caps::RawCaps;
+    use crate::caps::VideoFormat;
+    use crate::caps::COINCIDE_USAGE;
+    use crate::caps::DPB_USAGE;
     use crate::caps::NV12;
+    use crate::caps::OUTPUT_USAGE;
     use crate::caps::P010;
     use crate::caps::YUV444_10;
     use crate::caps::YUV444_8;
@@ -314,8 +173,8 @@ mod tests {
         }
     }
 
-    fn coincide_device(coincide: Vec<VideoFormat>) -> RawAv1Caps {
-        RawAv1Caps {
+    fn coincide_device(coincide: Vec<VideoFormat>) -> RawCaps {
+        RawCaps {
             capability_flags: vk::VideoCapabilityFlagsKHR::SEPARATE_REFERENCE_IMAGES,
             decode_flags: vk::VideoDecodeCapabilityFlagsKHR::DPB_AND_OUTPUT_COINCIDE,
             min_bitstream_buffer_offset_alignment: 256,
@@ -334,9 +193,11 @@ mod tests {
             },
             max_dpb_slots: 9,
             max_active_reference_pictures: 8,
-            max_level: hh::StdVideoAV1Level_STD_VIDEO_AV1_LEVEL_5_1,
+            max_level: MaxLevelIdc::Av1(hh::StdVideoAV1Level_STD_VIDEO_AV1_LEVEL_5_1),
+            std_header_version: vk::ExtensionProperties::default(),
+            dpb_formats: vec![],
+            output_formats: vec![],
             coincide_formats: coincide,
-            ..Default::default()
         }
     }
 
@@ -506,7 +367,7 @@ mod tests {
     #[test]
     fn a_main_stream_derives_nv12_on_a_coincide_device() {
         let raw = coincide_device(vec![entry(NV12, COINCIDE_USAGE)]);
-        let caps = derive_caps_av1(&raw, NV12).unwrap();
+        let caps = derive_caps(&raw, NV12).unwrap();
         assert!(caps.coincide);
         assert!(!caps.layered_dpb);
         assert_eq!(caps.output_format, NV12);
@@ -520,33 +381,10 @@ mod tests {
     }
 
     #[test]
-    fn the_level_ceiling_derived_here_is_tagged_av1_not_another_codec() {
-        // All three `StdVideo*LevelIdc` types are `c_uint` and the code spaces
-        // disagree (AV1 5.1 is 13, H.265 5.1 is 12, H.264 5.1 is 51). The tag
-        // is what makes the decoder's numeric gate honest.
-        let raw = coincide_device(vec![entry(NV12, COINCIDE_USAGE)]);
-        let caps = derive_caps_av1(&raw, NV12).unwrap();
-        assert_eq!(
-            caps.max_level_idc,
-            MaxLevelIdc::Av1(hh::StdVideoAV1Level_STD_VIDEO_AV1_LEVEL_5_1)
-        );
-        assert_eq!(
-            caps.max_level_idc.code_point(),
-            hh::StdVideoAV1Level_STD_VIDEO_AV1_LEVEL_5_1,
-            "the gate still compares the raw code point"
-        );
-        assert_ne!(
-            caps.max_level_idc,
-            MaxLevelIdc::H265(hh::StdVideoAV1Level_STD_VIDEO_AV1_LEVEL_5_1),
-            "same number, different codec — not the same ceiling"
-        );
-    }
-
-    #[test]
     fn a_ten_bit_stream_on_an_eight_bit_only_device_is_refused_before_any_session() {
         let raw = coincide_device(vec![entry(NV12, COINCIDE_USAGE)]);
         assert_eq!(
-            derive_caps_av1(&raw, P010).unwrap_err(),
+            derive_caps(&raw, P010).unwrap_err(),
             CapsError::NoFormat {
                 mode: "coincide (DPB|DST|SAMPLED)",
                 wanted: P010
@@ -557,7 +395,7 @@ mod tests {
             entry(NV12, COINCIDE_USAGE),
             entry(P010, COINCIDE_USAGE),
         ]);
-        let caps = derive_caps_av1(&raw, P010).unwrap();
+        let caps = derive_caps(&raw, P010).unwrap();
         assert_eq!(caps.output_format, P010);
         assert_eq!(
             caps.plane_view_formats,
@@ -572,7 +410,7 @@ mod tests {
     fn a_distinct_device_missing_the_format_on_one_half_names_that_half() {
         // Distinct only, layered DPB: DPB lists P010, output does not — the
         // refusal must name the missing half.
-        let raw = RawAv1Caps {
+        let raw = RawCaps {
             capability_flags: vk::VideoCapabilityFlagsKHR::empty(),
             decode_flags: vk::VideoDecodeCapabilityFlagsKHR::DPB_AND_OUTPUT_DISTINCT,
             dpb_formats: vec![VideoFormat {
@@ -585,7 +423,7 @@ mod tests {
             ..coincide_device(vec![])
         };
         assert_eq!(
-            derive_caps_av1(&raw, P010).unwrap_err(),
+            derive_caps(&raw, P010).unwrap_err(),
             CapsError::NoFormat {
                 mode: "output (DST|SAMPLED)",
                 wanted: P010
@@ -594,11 +432,11 @@ mod tests {
 
         // Distinct derives when both halves list it. DPB needs neither SAMPLED
         // nor MUTABLE_FORMAT — reference images are never sampled.
-        let raw = RawAv1Caps {
+        let raw = RawCaps {
             output_formats: vec![entry(P010, OUTPUT_USAGE)],
             ..raw
         };
-        let caps = derive_caps_av1(&raw, P010).unwrap();
+        let caps = derive_caps(&raw, P010).unwrap();
         assert!(!caps.coincide);
         assert!(caps.layered_dpb);
         assert_eq!(caps.output_format, P010);
@@ -612,7 +450,7 @@ mod tests {
             vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR,
         )]);
         assert_eq!(
-            derive_caps_av1(&raw, NV12).unwrap_err(),
+            derive_caps(&raw, NV12).unwrap_err(),
             CapsError::UsageUnsupported {
                 mode: "coincide (DPB|DST|SAMPLED)",
                 format: NV12,
@@ -628,7 +466,7 @@ mod tests {
             ..Default::default()
         }]);
         assert_eq!(
-            derive_caps_av1(&raw, NV12).unwrap_err(),
+            derive_caps(&raw, NV12).unwrap_err(),
             CapsError::NoMutableFormat {
                 mode: "coincide (DPB|DST|SAMPLED)",
                 format: NV12,
@@ -641,7 +479,7 @@ mod tests {
         let mut raw = coincide_device(vec![entry(NV12, COINCIDE_USAGE)]);
         raw.decode_flags = vk::VideoDecodeCapabilityFlagsKHR::empty();
         assert_eq!(
-            derive_caps_av1(&raw, NV12).unwrap_err(),
+            derive_caps(&raw, NV12).unwrap_err(),
             CapsError::NoDecodeMode
         );
     }
@@ -650,7 +488,7 @@ mod tests {
     fn an_av1_layered_coincide_device_derives_a_picture_array() {
         let mut raw = coincide_device(vec![entry(NV12, COINCIDE_USAGE)]);
         raw.capability_flags = vk::VideoCapabilityFlagsKHR::empty();
-        let caps = derive_caps_av1(&raw, NV12).unwrap();
+        let caps = derive_caps(&raw, NV12).unwrap();
         assert!(caps.coincide && caps.layered_dpb);
     }
 }

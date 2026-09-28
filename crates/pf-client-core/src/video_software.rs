@@ -938,30 +938,19 @@ mod tests {
     /// rav1d FFI, I420 copy, and colour — none of which the H.264 leg hits.
     #[test]
     fn software_av1_decodes_and_reports_its_sequence_colour() {
-        const IVF: &[u8] = include_bytes!(
-            "../../pf-bitstream/vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1"
-        );
-        // IVF: 32-byte file header, then per-frame [u32 size][u64 pts][payload].
-        let mut off = 32usize;
         let mut dec = SoftwareDecoder::new(punktfunk_core::quic::CODEC_AV1).expect("av1 decoder");
         let mut first = None;
         let (mut units, mut frames) = (0u32, 0u32);
         // Whole vector: send loop + `Dav1dData` drop once per TU, so a leak or
         // wedge fails the run instead of drifting.
-        while off + 12 <= IVF.len() {
-            let sz = u32::from_le_bytes(IVF[off..off + 4].try_into().unwrap()) as usize;
-            off += 12;
-            if off + sz > IVF.len() {
-                break;
-            }
+        for unit in pf_bitstream::testing::split_ivf(pf_bitstream::testing::AV1_25FPS) {
             units += 1;
-            if let Some(f) = dec.decode(&IVF[off..off + sz]).expect("av1 decode") {
+            if let Some(f) = dec.decode(unit).expect("av1 decode") {
                 frames += 1;
                 if first.is_none() {
                     first = Some(f);
                 }
             }
-            off += sz;
         }
         assert!(
             units > 100,

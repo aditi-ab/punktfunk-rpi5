@@ -10,12 +10,12 @@ use crate::events::{emit, EventKind};
 use crate::plugins::access::Decision;
 use axum::Extension;
 
-/// Plugin-authored text: it lands on the console as a caption, so controls go and it is
-/// capped like a catalog string.
+/// Plugin-authored text: it lands on the console as a caption, so controls and bidi marks go,
+/// as in a device name, and it is capped like a catalog string.
 fn sanitize_reason(s: &str) -> Option<String> {
     let out: String = s
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|&c| !c.is_control() && !crate::native_pairing::is_spoofy_char(c))
         .take(120)
         .collect::<String>()
         .trim()

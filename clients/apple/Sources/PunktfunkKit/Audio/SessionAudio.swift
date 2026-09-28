@@ -1033,22 +1033,15 @@ public final class SessionAudio {
         // for the rate — `resolvedAudioRateHz`, never the 96 kHz this client may have asked for.
         let channels = Int(connection.resolvedAudioChannels)
         let rateHz = wireRateHz
-        // One SECOND of interleaved capacity at the session's format. The de-jitter depth itself is
-        // the ring's own business now (`AudioRing.targetMS`, mirroring `JitterTuning::COREAUDIO`)
-        // rather than a prefill passed in here.
+        // One second of capacity at the session's format. The de-jitter depth is the ring's
+        // `JitterPolicy`, not a prefill passed in here.
         stateLock.lock()
         let ring = self.ring ?? AudioRing(seconds: 1, channels: channels, rateHz: rateHz)
         self.ring = ring
         stateLock.unlock()
-        // The session's REAL frame, which the ring cannot know at construction and must not assume:
-        // the shed drops exactly one frame and the target floor is a device quantum plus one, so a
-        // ring left on the 5 ms default sheds two and a half frames at a time on a 96 kHz session
-        // and fades across a whole one. Idempotent, so the rebuild path that reuses this very ring
-        // simply sets it again.
+        // The session's real frame: the shed and the priming lift are one frame. Idempotent, so
+        // a rebuild that reuses this ring sets it again.
         ring.setFrameUs(wireFrameUs)
-        // The device behind this engine may be a different one, or the same one with a different
-        // buffer grant. The largest callback the PREVIOUS engine saw is not a floor for this one.
-        ring.forgetRenderQuantum()
 
         // Engine-native deinterleaved float; the render block deinterleaves the ring's wire order,
         // surround with an explicit channel layout (`wireChannelLayout` is failable — hence

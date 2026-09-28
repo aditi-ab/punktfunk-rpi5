@@ -19,42 +19,14 @@ final class ColorBarDecodeTests: XCTestCase {
         (255, 0, 255), (255, 0, 0), (0, 0, 255), (0, 0, 0),
     ]
 
-    /// Decode one fixture AU to a biplanar 4:2:0 buffer of the given range sibling.
-    private func decode(_ au: [UInt8], pixelFormat: OSType) throws -> CVPixelBuffer {
-        let data = Data(au)
-        guard let format = AnnexB.formatDescription(fromIDR: data, codec: .hevc) else {
-            throw XCTSkip("could not build a format description from the fixture")
-        }
-        let attrs: [CFString: Any] = [kCVPixelBufferPixelFormatTypeKey: pixelFormat]
-        var session: VTDecompressionSession?
-        let created = VTDecompressionSessionCreate(
-            allocator: kCFAllocatorDefault, formatDescription: format,
-            decoderSpecification: nil, imageBufferAttributes: attrs as CFDictionary,
-            outputCallback: nil, decompressionSessionOut: &session)
-        guard created == noErr, let session else {
-            throw XCTSkip("VTDecompressionSessionCreate failed (\(created))")
-        }
-        defer { VTDecompressionSessionInvalidate(session) }
-        let unit = AccessUnit(data: data, ptsNs: 0, frameIndex: 0, flags: 0, receivedNs: 0)
-        guard let sample = AnnexB.sampleBuffer(au: unit, format: format, codec: .hevc) else {
-            throw XCTSkip("could not build a sample buffer")
-        }
-        var produced: CVPixelBuffer?
-        let status = VTDecompressionSessionDecodeFrame(
-            session, sampleBuffer: sample, flags: [], infoFlagsOut: nil
-        ) { status, _, imageBuffer, _, _ in
-            if status == noErr { produced = imageBuffer }
-        }
-        XCTAssertEqual(status, noErr, "decode submit")
-        VTDecompressionSessionWaitForAsynchronousFrames(session)
-        return try XCTUnwrap(produced, "no decoded frame")
-    }
-
     private func assertBars(
         _ name: String, au: [UInt8], pixelFormat: OSType,
         expected: CscRows.Signal
     ) throws {
-        let buffer = try decode(au, pixelFormat: pixelFormat)
+        let buffer = try XCTUnwrap(
+            VTOneShot.decode(
+                annexB: Data(au), codec: .hevc, pixelFormat: pixelFormat, requireHardware: false),
+            "\(name): VideoToolbox must decode the fixture")
         let signal = CscRows.signal(of: buffer)
         XCTAssertEqual(signal, expected, "\(name): VT must propagate the bitstream signaling")
 

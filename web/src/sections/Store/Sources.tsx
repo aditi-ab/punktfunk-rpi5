@@ -12,15 +12,20 @@ import {
 import { motion } from "motion/react";
 import { type FC, type FormEvent, useEffect, useState } from "react";
 import { ApiError } from "@/api/fetcher";
+import type { SourceView } from "@/api/gen/model";
+import { useListPluginSources } from "@/api/gen/store/store";
 import {
 	type SourceBody,
-	type StoreSource,
 	useDeleteSource,
 	useRefreshCatalog,
 	useSetSource,
-	useStoreSources,
 } from "@/api/store";
 import { useDialogs } from "@/components/dialogs";
+import {
+	PasswordConfirmField,
+	type PasswordFailure,
+	usePasswordFailure,
+} from "@/components/password-confirm";
 import { QueryState } from "@/components/query-state";
 import { ROW, ROW_GAP, Stagger } from "@/components/stagger";
 import { Badge } from "@/components/ui/badge";
@@ -45,8 +50,8 @@ type SourceDraft = Omit<SourceBody, "password"> & { name: string };
 
 /** Unix seconds → a locale date-time, or "never" for a source that has never fetched.
  * Locale-aware via lib/format.ts — `toLocaleString` follows the browser, not the console. */
-const fmtFetched = (secs: number): string =>
-	secs > 0 ? fmtDateTimeSecs(secs) : m.store_source_never();
+const fmtFetched = (secs?: number | null): string =>
+	secs ? fmtDateTimeSecs(secs) : m.store_source_never();
 
 /**
  * Container: the catalog sources. Owns the source listing, the refresh-all action, and add/remove.
@@ -55,14 +60,14 @@ const fmtFetched = (secs: number): string =>
  */
 export const SourcesTab: FC = () => {
 	const { confirm } = useDialogs();
-	const sources = useStoreSources();
+	const sources = useListPluginSources();
 	const refresh = useRefreshCatalog();
 	const save = useSetSource();
 	const remove = useDeleteSource();
 	// The draft waiting on the trust dialog, and a key that re-mounts (and so clears) the form.
 	const [draft, setDraft] = useState<SourceDraft | null>(null);
 	const [formKey, setFormKey] = useState(0);
-	const [wrongPassword, setWrongPassword] = useState(false);
+	const refusal = usePasswordFailure();
 
 	const onRefresh = () =>
 		refresh.mutate(undefined, {
@@ -71,23 +76,20 @@ export const SourcesTab: FC = () => {
 
 	const onConfirmAdd = async (password: string) => {
 		if (!draft) return;
-		setWrongPassword(false);
+		refusal.reset();
 		try {
 			await save.mutateAsync({ ...draft, password });
 			setDraft(null);
 			setFormKey((k) => k + 1);
 		} catch (e) {
-			// A rejected password keeps the dialog open so the operator can retry without refilling
+			// A refused password keeps the dialog open so the operator can retry without refilling
 			// the form; anything else is a genuine failure to write the source.
-			if (e instanceof ApiError && e.status === 401) {
-				setWrongPassword(true);
-				return;
-			}
+			if (refusal.classify(e)) return;
 			toast.error(m.store_add_source_failed());
 		}
 	};
 
-	const onRemove = async (source: StoreSource) => {
+	const onRemove = async (source: SourceView) => {
 		const ok = await confirm({
 			title: m.store_source_remove_confirm({ name: source.name }),
 			description: m.store_source_remove_body(),
@@ -96,7 +98,7 @@ export const SourcesTab: FC = () => {
 		});
 		if (!ok) return;
 		try {
-			await remove.mutateAsync(source.name);
+			await remove.mutateAsync({ name: source.name });
 		} catch (e) {
 			// 403 is the host refusing to drop its built-in catalog — say exactly that.
 			toast.error(
@@ -111,7 +113,7 @@ export const SourcesTab: FC = () => {
 		<div className="flex flex-col gap-card">
 			<SourceList
 				sources={sources}
-				busyName={remove.isPending ? (remove.variables ?? null) : null}
+				busyName={remove.isPending ? (remove.variables?.name ?? null) : null}
 				isRefreshing={refresh.isPending}
 				onRefresh={onRefresh}
 				onRemove={onRemove}
@@ -126,10 +128,10 @@ export const SourcesTab: FC = () => {
 			<TrustSourceDialog
 				draft={draft}
 				isSaving={save.isPending}
-				wrongPassword={wrongPassword}
+				failure={refusal.failure}
 				onCancel={() => {
 					setDraft(null);
-					setWrongPassword(false);
+					refusal.reset();
 				}}
 				onConfirm={onConfirmAdd}
 			/>
@@ -140,7 +142,7 @@ export const SourcesTab: FC = () => {
 /** The source table: health per source, with the built-in one locked. */
 export const SourceList: FC<{
 	sources: {
-		data?: StoreSource[];
+		data?: SourceView[];
 		isLoading: boolean;
 		error: unknown;
 		refetch?: () => void;
@@ -149,7 +151,7 @@ export const SourceList: FC<{
 	busyName: string | null;
 	isRefreshing: boolean;
 	onRefresh: () => void;
-	onRemove: (source: StoreSource) => void;
+	onRemove: (source: SourceView) => void;
 }> = ({ sources, busyName, isRefreshing, onRefresh, onRemove }) => {
 	const rows = sources.data ?? [];
 	return (
@@ -343,9 +345,9 @@ export const TrustSourceDialog: FC<{
 	isSaving: boolean;
 	onCancel: () => void;
 	onConfirm: (password: string) => void;
-	/** Set when the BFF rejected the password (401) — say so and keep the dialog open. */
-	wrongPassword?: boolean;
-}> = ({ draft, isSaving, onCancel, onConfirm, wrongPassword }) => {
+	/** Why the BFF refused the password — say so and keep the dialog open. */
+	failure?: PasswordFailure;
+}> = ({ draft, isSaving, onCancel, onConfirm, failure = null }) => {
 	const [password, setPassword] = useState("");
 	// The dialog stays mounted between drafts; clear the password whenever it closes.
 	useEffect(() => {
@@ -378,23 +380,12 @@ export const TrustSourceDialog: FC<{
 					{/* Adding a source is a trust-root change: every future install rides on it, so the
 				    console password is re-entered here and verified at the BFF, exactly as for a
 				    host update. */}
-					<div className="space-y-2">
-						<Label htmlFor="store-source-password">
-							{m.store_source_password()}
-						</Label>
-						<Input
-							id="store-source-password"
-							type="password"
-							autoComplete="current-password"
-							value={password}
-							onChange={(e) => setPassword(e.target.value)}
-						/>
-						{wrongPassword && (
-							<p role="alert" className="text-xs text-destructive">
-								{m.update_apply_wrong_password()}
-							</p>
-						)}
-					</div>
+					<PasswordConfirmField
+						id="store-source-password"
+						value={password}
+						onChange={setPassword}
+						failure={failure}
+					/>
 
 					<DialogFooter>
 						<Button variant="outline" onClick={onCancel} disabled={isSaving}>

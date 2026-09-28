@@ -9,18 +9,11 @@ use super::host::{probe_chunk_bytes, Frame, FrameShape, ProbeDone, SHARD_WIRE_OV
 use super::link::LossDraw;
 use super::Rng;
 use crate::abr::{Driver, DriverConfig, ProbeReport};
-use crate::client::FLUSH_COOLDOWN;
+use crate::client::frame_channel::JumpToLive;
 use crate::stats::Stats;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-/// Jump-to-live's thresholds (`client/frame_channel.rs`, private there):
-/// delay past `FLUSH_LATENCY` held for `FLUSH_AFTER`, or `QUEUE_HIGH` frames
-/// of decode backlog held for `STANDING_TIME`.
-const FLUSH_LATENCY_MS: u64 = 400;
-const FLUSH_AFTER_MS: u64 = 250;
-const QUEUE_HIGH: u32 = 6;
-const STANDING_MS: u64 = 250;
 /// The webOS client's recovery throttle: one ask per 100 ms until a keyframe
 /// lands.
 const KEYFRAME_ASK_MS: u64 = 100;
@@ -211,10 +204,8 @@ pub(super) struct Client {
     pub(super) resent_bytes: u64,
     /// When a frame last lost a shard: what keeps the acked chain engaged.
     loss_seen_ms: Option<u64>,
-    /// Jump-to-live detectors and their shared cooldown.
-    owd_over_since: Option<u64>,
-    queue_over_since: Option<u64>,
-    last_flush_ms: Option<u64>,
+    /// The client's own jump-to-live rule.
+    jump: JumpToLive,
     decode_free_at_ms: u64,
     /// Keyframe throttle: asking until an IDR lands.
     awaiting_idr: bool,
@@ -287,9 +278,7 @@ impl Client {
             lost_frames: 0,
             resent_bytes: 0,
             loss_seen_ms: None,
-            owd_over_since: None,
-            queue_over_since: None,
-            last_flush_ms: None,
+            jump: JumpToLive::new(),
             decode_free_at_ms: 0,
             awaiting_idr: false,
             kf_next_ms: 0,
@@ -505,33 +494,15 @@ impl Client {
         d.base_us + jitter + over * d.us_per_mbps
     }
 
-    /// Jump-to-live, both halves: one-way delay past [`FLUSH_LATENCY_MS`] for
-    /// [`FLUSH_AFTER_MS`], or a decode backlog at [`QUEUE_HIGH`] for
-    /// [`STANDING_MS`]. A flush is ABR's severe `flushed`.
+    /// The client's jump-to-live over this frame's delay and the decode
+    /// backlog, in frames at the refresh rate. A flush is ABR's severe `flushed`.
     fn note_latency(&mut self, owd_ms: i64, now_ms: u64) {
-        if owd_ms > FLUSH_LATENCY_MS as i64 {
-            self.owd_over_since.get_or_insert(now_ms);
-        } else {
-            self.owd_over_since = None;
-        }
         let backlog = (self.decode_free_at_ms.saturating_sub(now_ms)
             * u64::from(self.cfg.refresh_hz.max(1))
-            / 1_000) as u32;
-        if backlog >= QUEUE_HIGH {
-            self.queue_over_since.get_or_insert(now_ms);
-        } else if backlog <= 2 {
-            self.queue_over_since = None;
-        }
-        let over = |since: Option<u64>, ms: u64| since.is_some_and(|t| now_ms - t >= ms);
-        let behind = over(self.owd_over_since, FLUSH_AFTER_MS)
-            || (backlog >= QUEUE_HIGH && over(self.queue_over_since, STANDING_MS));
-        let cooled = self
-            .last_flush_ms
-            .is_none_or(|t| now_ms - t >= FLUSH_COOLDOWN.as_millis() as u64);
-        if behind && cooled {
-            self.owd_over_since = None;
-            self.queue_over_since = None;
-            self.last_flush_ms = Some(now_ms);
+            / 1_000) as usize;
+        let now = self.base + Duration::from_millis(now_ms);
+        let lat_ns = i128::from(owd_ms) * 1_000_000;
+        if self.jump.observe(now, lat_ns, true, backlog).is_some() {
             self.decode_free_at_ms = now_ms;
             self.abr.on_flush();
             self.awaiting_idr = true;

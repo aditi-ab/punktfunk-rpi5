@@ -83,7 +83,7 @@ pub struct OverlayFrame {
 }
 
 // Shared with the Android GL host; lives in `pf_client_core::console`
-// (pf-console-ui sits above this crate). Re-exported so `run.rs` and the
+// (pf-console-ui sits above this crate). Re-exported so the run loop and the
 // console keep the `pf_presenter::overlay::…` path.
 pub use pf_client_core::console::{OverlayAction, PointerButton, PointerInput, SessionPhase};
 pub use pf_client_core::ring::{RingCommand, RingFacts, RingInput};

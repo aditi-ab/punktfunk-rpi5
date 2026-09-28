@@ -15,13 +15,13 @@
 
 use super::channel_proof;
 pub(super) use super::channel_proof::ProofTransport;
+use crate::pad_shm_ring::SectionView;
 use crate::pad_slots::PadCreateFault;
 use anyhow::{anyhow, Context, Result};
 use pf_driver_proto::gamepad::{PadBootstrap, BOOT_MAGIC, GAMEPAD_PROTO_VERSION};
 use std::ffi::c_void;
-use std::marker::PhantomData;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{fence, AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use windows::core::{w, GUID, HRESULT, HSTRING, PCWSTR};
@@ -65,77 +65,6 @@ pub(super) struct Shm {
     view: MEMORY_MAPPED_VIEW_ADDRESS,
     /// Bytes mapped at `view`.
     len: usize,
-}
-
-/// Bounds-checked view of a mapped section, borrowed from the [`Shm`] that keeps it mapped.
-/// Words the driver also writes go through aligned atomics; report bodies are plain copies,
-/// ordered by the sequence word or seqlock around them. Every accessor panics out of range.
-#[derive(Clone, Copy)]
-pub(super) struct SectionView<'a> {
-    base: *mut u8,
-    len: usize,
-    _mapping: PhantomData<&'a [u8]>,
-}
-
-impl<'a> SectionView<'a> {
-    /// A test buffer standing in for a section.
-    #[cfg(test)]
-    pub(super) fn over(buf: &'a mut [u32]) -> SectionView<'a> {
-        SectionView {
-            base: buf.as_mut_ptr().cast(),
-            len: std::mem::size_of_val(buf),
-            _mapping: PhantomData,
-        }
-    }
-
-    /// `len` bytes at `off`, asserted inside the view.
-    fn range(&self, off: usize, len: usize) -> *mut u8 {
-        let end = off.checked_add(len);
-        assert!(
-            end.is_some_and(|e| e <= self.len),
-            "section range {off}+{len} out of bounds"
-        );
-        self.base.wrapping_add(off)
-    }
-
-    /// The atomic word at `off`, asserted in bounds and aligned.
-    fn word<T>(&self, off: usize) -> *const T {
-        let p = self.range(off, size_of::<T>());
-        assert!(
-            p as usize % align_of::<T>() == 0,
-            "section word {off} misaligned"
-        );
-        p.cast()
-    }
-
-    pub(super) fn load_u32(&self, off: usize, order: Ordering) -> u32 {
-        // SAFETY: `word` proved an aligned word inside the live mapping; both sides touch it
-        // only atomically.
-        unsafe { (*self.word::<AtomicU32>(off)).load(order) }
-    }
-
-    pub(super) fn store_u32(&self, off: usize, value: u32, order: Ordering) {
-        // SAFETY: as `load_u32`.
-        unsafe { (*self.word::<AtomicU32>(off)).store(value, order) }
-    }
-
-    pub(super) fn store_u64(&self, off: usize, value: u64, order: Ordering) {
-        // SAFETY: as `load_u32`, for an 8-aligned word.
-        unsafe { (*self.word::<AtomicU64>(off)).store(value, order) }
-    }
-
-    pub(super) fn write_bytes(&self, off: usize, src: &[u8]) {
-        let dst = self.range(off, src.len());
-        // SAFETY: `range` proved `dst` inside the live mapping, which no Rust reference
-        // overlaps; `src` is a separate allocation.
-        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) }
-    }
-
-    pub(super) fn read_bytes(&self, off: usize, dst: &mut [u8]) {
-        let src = self.range(off, dst.len());
-        // SAFETY: as `write_bytes`, copying the other way.
-        unsafe { std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), dst.len()) }
-    }
 }
 
 /// SDDL `SECURITY_ATTRIBUTES` plus the `LocalAlloc`'d descriptor it points at.
@@ -276,11 +205,9 @@ impl Shm {
 
     /// The mapping, stable for this `Shm`'s lifetime (`MapViewOfFile` pins the address).
     pub(super) fn view(&self) -> SectionView<'_> {
-        SectionView {
-            base: self.view.Value.cast(),
-            len: self.len,
-            _mapping: PhantomData,
-        }
+        // SAFETY: `MapViewOfFile` mapped `len` RW bytes at `view`; `Drop` unmaps them only after
+        // this borrow ends. The shared bytes are only reached through the view's raw accessors.
+        unsafe { SectionView::from_raw(self.view.Value.cast(), self.len) }
     }
 
     fn raw_handle(&self) -> HANDLE {
@@ -495,7 +422,7 @@ impl PadChannel {
     }
 
     /// Bind to the `SwDeviceCreate` instance so [`Self::pump`] can ask for a channel proof.
-    /// Call between `create_swdevice` and [`Self::deliver_eager`].
+    /// Call between [`create_swdevice`] and [`Self::deliver_eager`].
     /// `instance_id` is `None` on the `devgen` fallback: no device to ask, no delivery
     /// unless [`TRUST_MAILBOX_ENV`] is set.
     pub(super) fn bind_devnode(
@@ -743,7 +670,7 @@ impl PadChannel {
 }
 
 /// `SwDeviceCreate` completion context: event, HRESULT, and PnP instance id.
-/// [`sw_device_create`] blocks on the event.
+/// [`create_swdevice`] blocks on the event.
 #[repr(C)]
 struct SwCreateCtx {
     event: HANDLE,
@@ -786,51 +713,93 @@ impl SwCreateCtx {
     }
 }
 
-/// What [`sw_device_create`] puts on a software devnode. An empty `compatible_ids` sets none.
-pub(super) struct SwDeviceSpec<'a> {
-    /// `SWD\<enumerator>\<instance>`. No `_` in it, or `E_INVALIDARG`.
-    pub enumerator: &'a str,
+/// A `SwDeviceCreate`'d devnode; drop removes it (`SwDeviceClose`).
+pub(super) struct SwDevice(HSWDEVICE);
+
+/// PnP identity for a virtual devnode, so one [`create_swdevice`] builds every pad, the XUSB
+/// pad and the mouse.
+pub(super) struct SwDeviceProfile<'a> {
+    /// Distinct namespaces per type (`pf_pad_<idx>` vs `pf_ds4_<idx>`) so two types never reuse
+    /// a devnode shell.
     pub instance: &'a str,
-    pub hardware_ids: &'a [&'a str],
-    pub compatible_ids: &'a [&'a str],
+    /// `Data1` of the ContainerId — a per-family tag (`"PFDS"` pads, `"PFMO"` mouse) so two
+    /// families at the same index never share a container (Windows would group them as one
+    /// device).
+    pub container_tag: u32,
+    /// Also stamped into the devnode Location, which the driver reads as its bootstrap-mailbox
+    /// index.
+    pub container_index: u8,
+    /// INF-matched hardware id, listed first so the INF binds.
+    pub hwid: &'static str,
+    /// `VID_…&PID_…` behind the synthesized `USB\` hardware and compatible ids. `None` lists the
+    /// INF id alone: XInput finds the XUSB pad by interface GUID, not VID/PID.
+    pub usb_vid_pid: Option<&'a str>,
+    /// Appended as `&MI_xx` on the USB hardware ids. hidclass mirrors the parent's `USB\VID…`
+    /// tokens into the HID child; hidapi/SDL/Steam parse `MI_` as `bInterfaceNumber` (0 if
+    /// absent). The Steam Deck controller lives on interface 2.
+    pub usb_mi: Option<u8>,
     pub description: &'a str,
-    /// The driver reads its bootstrap-mailbox index from here.
-    pub location: &'a str,
-    pub container: GUID,
+    /// The `SWD\<enumerator>\<instance>` namespace. hidclass names the HID child after it, so a
+    /// pad Steam must recognise carries its VID/PID here (`VID_054C&PID_0CE6&MI_03`,
+    /// `VID_045E&PID_0B13`): Steam merges a pad's views by that token in the path, and under
+    /// `punktfunk` it listed the same pad twice.
+    pub enumerator: &'a str,
 }
 
-/// `SwDeviceCreate` a DriverRequired | SilentInstall | Removable devnode under the root and
-/// wait up to 10 s for PnP's callback. Returns the handle `SwDeviceClose` removes, and the
-/// instance id. A wedged PnP leaks the callback context and event, so a late callback still
-/// writes live memory. The caller must be Administrator.
-pub(super) fn sw_device_create(spec: &SwDeviceSpec) -> Result<(HSWDEVICE, Option<String>)> {
-    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain([0]).collect() };
+/// Spawn a virtual devnode under `p.enumerator` and return it with its PnP instance id.
+///
+/// Game detection (`design/windows-dualsense-game-detection.md`): `HIDD_ATTRIBUTES` VID/PID
+/// satisfies SDL/HIDAPI/RawInput, but a native PS5 path classifies connection type by walking
+/// to the parent and matching `"USB"`/`"BTHENUM"` in `DEVPKEY_Device_CompatibleIds`. Set these
+/// via `SW_DEVICE_CREATE_INFO` only — a later `DEVPROPERTY` write of bus/identity keys is ignored:
+/// - `pszzCompatibleIds` starts with a `USB\` token so the parent walk resolves USB.
+/// - `pszzHardwareIds` lists the INF id first, then `USB\VID_…[&REV_0100]`, so hidclass derives
+///   `HID\VID_…` child ids a genuine USB DualSense exposes.
+/// - a deterministic per-pad `pContainerId` (the null sentinel trips an `xinput1_4` slot skip).
+///
+/// Enumerator names must not contain `_` (`punktfunk`, not `pf_dualsense`) and `pCallback` is
+/// mandatory — either yields `E_INVALIDARG`. The caller must be Administrator (the host runs as
+/// LocalSystem).
+pub(super) fn create_swdevice(p: &SwDeviceProfile) -> Result<(SwDevice, Option<String>)> {
     let multi_sz = |ids: &[&str]| -> Vec<u16> {
         ids.iter()
-            .flat_map(|s| s.encode_utf16().chain([0]))
-            .chain([0])
+            .flat_map(|s| s.encode_utf16().chain(std::iter::once(0)))
+            .chain(std::iter::once(0))
             .collect()
     };
-    let (instance, hwids, compat) = (
-        wide(spec.instance),
-        multi_sz(spec.hardware_ids),
-        multi_sz(spec.compatible_ids),
+    let (hwids, compat) = match p.usb_vid_pid {
+        Some(vid_pid) => {
+            let mi = p.usb_mi.map(|n| format!("&MI_{n:02}")).unwrap_or_default();
+            let usb_rev = format!("USB\\{vid_pid}&REV_0100{mi}");
+            let usb = format!("USB\\{vid_pid}{mi}");
+            let hwids = multi_sz(&[p.hwid, &usb_rev, &usb]);
+            // A `USB\` token first → native bus-type detection resolves USB.
+            let compat = multi_sz(&[&usb, "USB\\Class_03&SubClass_00&Prot_00", "USB\\Class_03"]);
+            (hwids, Some(compat))
+        }
+        None => (multi_sz(&[p.hwid]), None),
+    };
+    let instid = HSTRING::from(p.instance);
+    let desc = HSTRING::from(p.description);
+    // Pad index in Location — the driver polls its bootstrap mailbox by it.
+    let loc = HSTRING::from(p.container_index.to_string());
+    let enumerator = HSTRING::from(p.enumerator);
+    let container = GUID::from_values(
+        p.container_tag,
+        0x0000,
+        0x0000,
+        [0, 0, 0, 0, 0, 0, 0, p.container_index],
     );
-    let (desc, loc, enumerator) = (
-        wide(spec.description),
-        wide(spec.location),
-        wide(spec.enumerator),
-    );
+
+    // The id buffers and `container` outlive SwDeviceCreate (we wait on the event before return).
     let info = SW_DEVICE_CREATE_INFO {
         cbSize: size_of::<SW_DEVICE_CREATE_INFO>() as u32,
-        pszInstanceId: PCWSTR(instance.as_ptr()),
+        pszInstanceId: PCWSTR(instid.as_ptr()),
         pszzHardwareIds: PCWSTR(hwids.as_ptr()),
-        pszzCompatibleIds: if spec.compatible_ids.is_empty() {
-            PCWSTR::null()
-        } else {
-            PCWSTR(compat.as_ptr())
-        },
-        pContainerId: &spec.container,
+        pszzCompatibleIds: compat
+            .as_ref()
+            .map_or(PCWSTR::null(), |c| PCWSTR(c.as_ptr())),
+        pContainerId: &container,
         CapabilityFlags: 0x0000_000B, // DriverRequired | SilentInstall | Removable
         pszDeviceDescription: PCWSTR(desc.as_ptr()),
         pszDeviceLocation: PCWSTR(loc.as_ptr()),
@@ -840,13 +809,17 @@ pub(super) fn sw_device_create(spec: &SwDeviceSpec) -> Result<(HSWDEVICE, Option
     // SAFETY: a manual-reset, initially-unsignaled, unnamed event.
     let event = unsafe { CreateEventW(None, true, false, PCWSTR::null())? };
     // `result` starts as E_FAIL: a timeout must not read a zeroed HRESULT as success.
+    // Heap-allocated: `sw_create_cb` writes through this pointer then `SetEvent`s. The wait is
+    // 10 s; on a wedged-PnP timeout the callback may still be pending, so we leak the box and
+    // leave the event open rather than let a late write hit recycled memory or a reused handle.
     let ctx = Box::into_raw(Box::new(SwCreateCtx {
         event,
         result: E_FAIL,
         instance_id: [0; 128],
     }));
-    // SAFETY: `info`, its buffers and `spec.container` outlive the call and the wait below;
-    // `ctx` is a live heap allocation reclaimed only where the callback provably ran.
+    // SAFETY: info + the buffers outlive the call; `ctx` is a live heap allocation that outlives
+    // every path below (reclaimed only where the callback provably ran). windows-rs returns the
+    // HSWDEVICE (the C out-param) as the Result value.
     let hsw = match unsafe {
         SwDeviceCreate(
             PCWSTR(enumerator.as_ptr()),
@@ -859,47 +832,41 @@ pub(super) fn sw_device_create(spec: &SwDeviceSpec) -> Result<(HSWDEVICE, Option
     } {
         Ok(h) => h,
         Err(e) => {
-            // SAFETY: the call failed, so no callback is pending: `ctx` and `event` are ours.
+            // SAFETY: the call failed, so no callback was registered and `ctx` is ours to reclaim;
+            // `event` is valid and unreferenced.
             unsafe {
                 drop(Box::from_raw(ctx));
                 let _ = CloseHandle(event);
             }
-            return Err(anyhow!("SwDeviceCreate {}: {e}", spec.instance));
+            return Err(anyhow!("SwDeviceCreate({}): {e}", p.instance));
         }
     };
-    // SAFETY: `event` is valid.
-    if unsafe { WaitForSingleObject(event, 10_000) } != WAIT_OBJECT_0 {
-        // SAFETY: `hsw` is the handle SwDeviceCreate returned; `ctx` and `event` leak.
-        unsafe { SwDeviceClose(hsw) };
+    // From here the handle is ours: every early return removes the devnode.
+    let sw = SwDevice(hsw);
+    // SAFETY: event is valid.
+    let wait = unsafe { WaitForSingleObject(event, 10_000) };
+    if wait != WAIT_OBJECT_0 {
+        // Timed out: leak `ctx` and leave `event` open so a late callback writes live memory.
         return Err(anyhow!(
-            "SwDeviceCreate {}: no enumeration callback in 10 s — PnP may be wedged",
-            spec.instance
+            "SwDeviceCreate({}) enumeration callback never fired (10s) — PnP may be wedged",
+            p.instance
         ));
     }
-    // SAFETY: the callback signalled, so nothing else touches `ctx` or `event`; `ctx` came from
-    // `Box::into_raw` above and is reclaimed exactly once.
+    // SAFETY: the callback signalled the event, so nothing else will touch `ctx`/`event`.
+    // `ctx` came from `Box::into_raw` above and is reclaimed exactly once here; `event` is
+    // valid and no longer referenced by a pending callback.
     let ctx = unsafe {
         let _ = CloseHandle(event);
         Box::from_raw(ctx)
     };
     if ctx.result.is_err() {
-        // SAFETY: `hsw` is the handle SwDeviceCreate returned.
-        unsafe { SwDeviceClose(hsw) };
         return Err(anyhow!(
-            "SwDeviceCreate {} enumeration: {:?}",
-            spec.instance,
+            "SwDeviceCreate({}) enumeration: {:?}",
+            p.instance,
             ctx.result
         ));
     }
-    Ok((hsw, ctx.instance_id()))
-}
-
-pub(super) struct SwDevice(HSWDEVICE);
-
-impl SwDevice {
-    pub(super) fn new(hsw: HSWDEVICE) -> Self {
-        SwDevice(hsw)
-    }
+    Ok((sw, ctx.instance_id()))
 }
 
 impl Drop for SwDevice {
@@ -961,7 +928,7 @@ impl DriverAttach {
         self.observe_pad(driver_proto, 0);
     }
 
-    /// `driver_rev` is read after `driver_proto` ([`crate::dualsense_windows::driver_marks`]);
+    /// `driver_rev` is read after `driver_proto` ([`crate::pad_shm_ring::driver_marks`]);
     /// only the attach tick uses it.
     pub(super) fn observe_pad(&mut self, driver_proto: u32, driver_rev: u32) {
         match self.state {
@@ -1099,11 +1066,7 @@ fn driver_store_inventory() -> Option<&'static str> {
     static SPAWN: std::sync::Once = std::sync::Once::new();
     SPAWN.call_once(|| {
         std::thread::spawn(|| {
-            // Resolve via `%SystemRoot%\System32\pnputil.exe`. SYSTEM must not search PATH /
-            // the EXE directory — a planted `pnputil.exe` beside the host would run elevated.
-            let pnputil = std::env::var("SystemRoot")
-                .map(|r| format!(r"{r}\System32\pnputil.exe"))
-                .unwrap_or_else(|_| "pnputil.exe".to_string());
+            let pnputil = pf_paths::system32("pnputil.exe");
             let inv = std::process::Command::new(&pnputil)
                 .arg("/enum-drivers")
                 .output()
@@ -1134,10 +1097,7 @@ fn driver_store_has(inf: &str) -> Option<bool> {
 }
 
 fn devnode_status_line(instance_id: &str, pad: bool) -> String {
-    let wide: Vec<u16> = instance_id
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    let wide = HSTRING::from(instance_id);
     let mut devinst = 0u32;
     // SAFETY: `wide` is a valid NUL-terminated UTF-16 instance id; `devinst` receives the handle.
     let cr = unsafe {

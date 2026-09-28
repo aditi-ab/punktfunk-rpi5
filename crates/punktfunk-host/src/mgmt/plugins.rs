@@ -9,9 +9,9 @@
 //! as launch authority. Per-plugin ownership therefore requires runner process isolation rather
 //! than an additional registry check.
 
+use super::auth::{AnyId, OwnedId, PluginId};
 use super::shared::*;
 use crate::events::{emit, EventKind};
-use axum::Extension;
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
@@ -336,28 +336,18 @@ pub(crate) fn register_ui_for_test(id: &str, port: u16, secret: &str) {
     );
 }
 
-/// Same kebab-case regex the SDK enforces, so the registration id matches the package name.
-fn valid_plugin_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id.as_bytes()[0].is_ascii_lowercase()
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-}
-
-/// A title must not smuggle escapes or newlines into a log line or the nav.
+/// A title must not smuggle escapes, newlines or bidi marks into a log line or the nav.
 fn sanitize(s: &str) -> String {
     s.chars()
-        .filter(|c| !c.is_control())
+        .filter(|&c| !c.is_control() && !crate::native_pairing::is_spoofy_char(c))
         .collect::<String>()
         .trim()
         .to_string()
 }
 
-/// Source is not a [`valid_plugin_id`] — the runner names a unit by `definePlugin` name, package
-/// name, script stem, or `runner`. Sanitize, do not reject: controls go, length is capped, empty
-/// becomes `runner` so a line is never attributed to nothing.
+/// Source is not a [`crate::slug::plugin_id`] — the runner names a unit by `definePlugin` name,
+/// package name, script stem, or `runner`. Sanitize, do not reject: controls go, length is
+/// capped, empty becomes `runner` so a line is never attributed to nothing.
 fn log_target(source: &str) -> String {
     let mut s = sanitize(source);
     if s.is_empty() {
@@ -396,11 +386,7 @@ fn validate(reg: PluginRegistration) -> Result<Valid, String> {
     // so a newer plugin still registers against an older host.
     let category = match reg.category {
         Some(c) => {
-            let ok = (1..=32).contains(&c.len())
-                && c.starts_with(|ch: char| ch.is_ascii_lowercase())
-                && c.bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-            if !ok {
+            if !crate::slug::category(&c) {
                 return Err(
                     "category must be 1–32 chars of [a-z0-9-], starting with a letter".into(),
                 );
@@ -459,11 +445,7 @@ fn validate_ui(u: PluginUi) -> Result<StoredUi, String> {
     }
     let icon = match u.icon {
         Some(icon) => {
-            let ok = (1..=48).contains(&icon.len())
-                && icon
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-            if !ok {
+            if !crate::slug::lucide_icon(&icon) {
                 return Err("ui.icon must be a lucide name ([a-z0-9-], 1–48 chars)".into());
             }
             Some(icon)
@@ -498,19 +480,9 @@ fn validate_ui(u: PluginUi) -> Result<StoredUi, String> {
     )
 )]
 pub(crate) async fn register_plugin(
-    who: Option<Extension<crate::mgmt::auth::PluginIdentity>>,
-    Path(id): Path<String>,
+    OwnedId(id, _): OwnedId<PluginId>,
     ApiJson(reg): ApiJson<PluginRegistration>,
 ) -> Response {
-    if !crate::mgmt::auth::plugin_owns(who.as_ref().map(|e| &e.0), &id) {
-        return api_error(StatusCode::FORBIDDEN, "a plugin may only write its own id");
-    }
-    if !valid_plugin_id(&id) {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid plugin id (expected kebab-case `[a-z][a-z0-9-]*`, ≤64)",
-        );
-    }
     let valid = match validate(reg) {
         Ok(v) => v,
         Err(e) => return api_error(StatusCode::BAD_REQUEST, &e),
@@ -630,13 +602,7 @@ pub(crate) async fn get_ui_credential(Path(id): Path<String>) -> Response {
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
     )
 )]
-pub(crate) async fn delete_plugin(
-    who: Option<Extension<crate::mgmt::auth::PluginIdentity>>,
-    Path(id): Path<String>,
-) -> Response {
-    if !crate::mgmt::auth::plugin_owns(who.as_ref().map(|e| &e.0), &id) {
-        return api_error(StatusCode::FORBIDDEN, "a plugin may only write its own id");
-    }
+pub(crate) async fn delete_plugin(OwnedId(id, _): OwnedId<AnyId>) -> Response {
     if registry().remove(&id) {
         tracing::info!(plugin = %id, "plugin deregistered");
         emit(EventKind::PluginsChanged { id });
@@ -669,23 +635,10 @@ mod tests {
     const SECRET: &str = "abcdefghijklmnop0123";
 
     #[test]
-    fn id_validation() {
-        assert!(valid_plugin_id("rom-manager"));
-        assert!(valid_plugin_id("a"));
-        assert!(valid_plugin_id("x9"));
-        assert!(!valid_plugin_id(""));
-        assert!(!valid_plugin_id("9lives"));
-        assert!(!valid_plugin_id("-lead"));
-        assert!(!valid_plugin_id("Rom"));
-        assert!(!valid_plugin_id("rom_manager"));
-        assert!(!valid_plugin_id(&"a".repeat(65)));
-    }
-
-    #[test]
     fn registration_validation() {
         assert!(validate(reg("ROM Manager", 49321, SECRET)).is_ok());
         let v = validate(PluginRegistration {
-            title: "Ro\u{7}m\n".into(),
+            title: "Ro\u{7}\u{202E}m\n".into(),
             version: None,
             ui: None,
             category: None,

@@ -47,7 +47,7 @@ pub(crate) mod backend;
 pub use backend::SessionCastParts;
 pub use backend::{DisplayOwnership, SessionIsolation, VirtualDisplay, VirtualOutput};
 /// Negotiated ScreenCast cursor mode of a portal-backed output
-/// ([`VirtualDisplay::last_portal_cursor_mode`]). The picker stays private; the verdict is the caller's.
+/// ([`VirtualDisplay::last_portal_cursor_mode`]). The verdict is the caller's.
 pub use portal_cursor::Mode as PortalCursorMode;
 
 /// Time-bounded child-process helpers. Compositor queries shell out; an unbounded wait wedges the session thread.
@@ -749,8 +749,7 @@ pub mod admission;
 mod portal_config;
 
 /// ScreenCast cursor mode to request, negotiated against `AvailableCursorModes`.
-/// A mode the backend does not advertise closes the session. Unconditional
-/// so the ladder's tests run without a compositor, on every CI.
+/// Unconditional: [`PortalCursorMode`] is public on every platform.
 #[path = "vdisplay/linux/portal_cursor.rs"]
 mod portal_cursor;
 
@@ -760,9 +759,20 @@ mod portal_cursor;
 #[path = "vdisplay/linux/portal_picker.rs"]
 mod portal_picker;
 
+/// One ScreenCast of a named output through a portal that reads a picker file
+/// (Hyprland's xdph, wlroots' xdpw).
+#[cfg(target_os = "linux")]
+#[path = "vdisplay/linux/portal_cast.rs"]
+mod portal_cast;
+
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/hyprland.rs"]
 mod hyprland;
+
+/// Bounded dispatch loop shared by the in-process Wayland protocol clients.
+#[cfg(target_os = "linux")]
+#[path = "vdisplay/linux/wl_pump.rs"]
+mod wl_pump;
 
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/kwin.rs"]

@@ -215,7 +215,7 @@ pub(crate) async fn serve(
         let (identity, publish) = mint(port, &plane.sans, &plane.identity)?;
         // Sessions bind to this exact certificate, so a rotation cannot leave one authenticating
         // against a hash the peer never saw.
-        let cert_hash = unhex32(&publish.cert_hash)
+        let cert_hash = <[u8; 32] as hex::FromHex>::from_hex(&publish.cert_hash)
             .context("the minted certificate hash is not 32 hex bytes")?;
         // Windows leaves an IPv6 socket v6-only, so `[::]` alone never hears an IPv4 browser.
         let config = match plane.bind {
@@ -272,19 +272,6 @@ async fn accept_loop(
             }
         });
     }
-}
-
-/// Hex back to the 32 bytes SPAKE2 and the channel binding want. The published form is hex
-/// because that is what `serverCertificateHashes` documentation and our API speak.
-fn unhex32(hex: &str) -> Option<[u8; 32]> {
-    if hex.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
-    }
-    Some(out)
 }
 
 /// Is this page allowed to open a session?

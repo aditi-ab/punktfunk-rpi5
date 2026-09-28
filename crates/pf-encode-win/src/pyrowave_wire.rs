@@ -134,6 +134,59 @@ impl WireBudget {
     }
 }
 
+/// Per-frame rate budget (hard CBR): `bitrate / (8 * fps)`, never below 64 KiB. Both local
+/// encoders size their bitstream from [`Self::bytes`] and hand [`Self::rate_control`] to
+/// pyrowave's rate control.
+pub struct FrameBudget {
+    fps: u32,
+    /// Bytes per frame the link allows.
+    pub bytes: usize,
+    /// Windowing inflation → rate-budget deflation, so the pin holds on the wire.
+    wire: WireBudget,
+}
+
+impl FrameBudget {
+    const FLOOR: usize = 64 * 1024;
+
+    pub fn new(bitrate_bps: u64, fps: u32) -> FrameBudget {
+        FrameBudget {
+            fps,
+            bytes: Self::bytes_for(bitrate_bps, fps),
+            wire: WireBudget::new(),
+        }
+    }
+
+    fn bytes_for(bitrate_bps: u64, fps: u32) -> usize {
+        ((bitrate_bps / (8 * u64::from(fps.max(1)))) as usize).max(Self::FLOOR)
+    }
+
+    /// Retarget in place: free, since every frame is intra and nothing waits on the old rate.
+    pub fn retarget(&mut self, bitrate_bps: u64) {
+        self.bytes = Self::bytes_for(bitrate_bps, self.fps);
+        tracing::debug!(
+            mbps = bitrate_bps / 1_000_000,
+            budget_kib = self.bytes / 1024,
+            "pyrowave: per-frame rate budget retargeted in place"
+        );
+    }
+
+    /// The target for pyrowave's rate control: [`Self::bytes`], deflated by the measured
+    /// windowing inflation when `chunked`, so the pin is the wire rather than the bitstream.
+    pub fn rate_control(&self, chunked: bool) -> usize {
+        if chunked {
+            self.wire.deflate(self.bytes).max(Self::FLOOR)
+        } else {
+            self.bytes
+        }
+    }
+
+    /// Feed one windowed AU's inflation: `packets` became `au_len` wire bytes.
+    pub fn observe(&mut self, packets: &[(usize, usize)], au_len: usize) {
+        let raw: usize = packets.iter().map(|&(_, s)| s).sum();
+        self.wire.observe(raw, au_len);
+    }
+}
+
 /// Where [`build_au`] writes: a growing `Vec`, or a fixed slice for the worker's mapped
 /// return buffer. Each write reports whether it fit.
 trait AuSink {
@@ -241,6 +294,49 @@ pub fn au_bound(packets: &[(usize, usize)], wire_chunk: Option<usize>) -> usize 
         .map(|&(_, s)| s.div_ceil(payload_max).max(1))
         .sum::<usize>()
         * chunk
+}
+
+/// The strict inverse of [`build_au`]'s windowed layout: the codec packet stream, or what makes
+/// `au` something `build_au` never emits. Clients parse leniently instead (a zeroed window is a
+/// lost shard); this is the encoder-side check that every window is well formed.
+#[cfg(any(test, feature = "test-support"))]
+pub fn unwindow(au: &[u8], chunk: usize) -> anyhow::Result<Vec<u8>> {
+    use anyhow::{bail, ensure};
+    ensure!(
+        chunk > WINDOW_PREFIX && au.len() % chunk == 0,
+        "AU of {} B is not whole {chunk}-byte windows",
+        au.len()
+    );
+    let mut out = Vec::new();
+    let mut frag: Option<Vec<u8>> = None;
+    for (i, win) in au.chunks(chunk).enumerate() {
+        let used = u16::from_le_bytes([win[0], win[1]]) as usize;
+        let kind = u16::from_le_bytes([win[2], win[3]]);
+        ensure!(
+            WINDOW_PREFIX + used <= chunk,
+            "window {i} overruns: used {used}"
+        );
+        let body = &win[WINDOW_PREFIX..WINDOW_PREFIX + used];
+        ensure!(
+            win[WINDOW_PREFIX + used..].iter().all(|&b| b == 0),
+            "window {i} has non-zero padding after used"
+        );
+        match (kind, frag.take()) {
+            (WIN_PACKED, None) => out.extend_from_slice(body),
+            (WIN_FRAG_FIRST, None) => frag = Some(body.to_vec()),
+            (WIN_FRAG_CONT, Some(mut f)) => {
+                f.extend_from_slice(body);
+                frag = Some(f);
+            }
+            (WIN_FRAG_LAST, Some(f)) => {
+                out.extend_from_slice(&f);
+                out.extend_from_slice(body);
+            }
+            (k, _) => bail!("window {i}: kind {k} out of place"),
+        }
+    }
+    ensure!(frag.is_none(), "AU ends inside a fragment chain");
+    Ok(out)
 }
 
 /// The windowed layout, for either sink. `false` = the sink ran out.
@@ -447,36 +543,73 @@ impl AuChunker {
     }
 }
 
+/// The datagram-aligned boundary and the streamed-AU cursor over it. Every PyroWave encoder
+/// (Windows, Linux, and the Linux worker proxy) holds one, so the cut cannot drift between them.
+#[derive(Default)]
+pub struct AuStream {
+    /// Datagram-aligned packetize boundary. `None` = one dense packet per AU.
+    pub wire_chunk: Option<usize>,
+    /// AU being handed out in streamed chunks (`Some` between `first` and `last`).
+    chunker: Option<AuChunker>,
+}
+
+impl AuStream {
+    /// Take `shard_payload` as the boundary. Below one block header plus a payload word it
+    /// means nothing: `false`, and nothing changes.
+    pub fn set_chunking(&mut self, shard_payload: usize) -> bool {
+        if shard_payload < 64 {
+            return false;
+        }
+        self.wire_chunk = Some(shard_payload);
+        true
+    }
+
+    /// [`crate::Encoder::supports_chunked_poll`].
+    pub fn supports_chunked_poll(&self) -> bool {
+        stream_chunk_step(self.wire_chunk).is_some()
+    }
+
+    /// Each AU drains through one method: a whole-AU `poll` while a cut is open would emit the
+    /// same bytes twice under one frame index.
+    pub fn check_whole_poll(&self) -> anyhow::Result<()> {
+        if self.chunker.is_some() {
+            anyhow::bail!("pyrowave: poll() on an AU already being drained through poll_chunk");
+        }
+        Ok(())
+    }
+
+    /// Forfeit a half-handed-out AU, so the next `poll_chunk` cannot splice its tail onto a
+    /// fresh one.
+    pub fn reset(&mut self) {
+        self.chunker = None;
+    }
+
+    /// The next piece of the AU already being cut. `None` once it is done: the caller then
+    /// produces the next whole AU for [`Self::cut`]. The host keys begin/finish off
+    /// `first`/`last` and cannot interleave two AUs.
+    pub fn next_open(&mut self) -> Option<crate::AuChunk> {
+        let chunk = self.chunker.as_mut()?.next();
+        if chunk.is_none() {
+            self.chunker = None;
+        }
+        chunk
+    }
+
+    /// Start handing out `f`: window-aligned pieces when streaming is armed, else whole.
+    pub fn cut(&mut self, f: crate::EncodedFrame) -> Option<crate::AuChunk> {
+        match stream_chunk_step(self.wire_chunk) {
+            Some(step) => self.chunker.insert(AuChunker::new(f, step)).next(),
+            None => Some(crate::AuChunk::whole(f)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn walk(au: &[u8], chunk: usize) -> Vec<u8> {
-        assert_eq!(au.len() % chunk, 0, "AU is a whole number of windows");
-        let mut out = Vec::new();
-        let mut frag: Vec<u8> = Vec::new();
-        for win in au.chunks(chunk) {
-            let used = u16::from_le_bytes([win[0], win[1]]) as usize;
-            let kind = u16::from_le_bytes([win[2], win[3]]);
-            assert!(WINDOW_PREFIX + used <= win.len(), "window overrun");
-            assert!(
-                win[WINDOW_PREFIX + used..].iter().all(|&b| b == 0),
-                "non-zero padding after used"
-            );
-            let body = &win[WINDOW_PREFIX..WINDOW_PREFIX + used];
-            match kind {
-                0 => out.extend_from_slice(body),
-                1 => frag = body.to_vec(),
-                2 => frag.extend_from_slice(body),
-                3 => {
-                    frag.extend_from_slice(body);
-                    out.extend_from_slice(&frag);
-                    frag.clear();
-                }
-                k => panic!("unknown window kind {k}"),
-            }
-        }
-        out
+        unwindow(au, chunk).expect("a well-formed windowed AU")
     }
 
     #[test]
@@ -723,5 +856,52 @@ mod tests {
     fn dense_mode_never_streams() {
         assert!(stream_chunk_step(None).is_none());
         assert!(stream_chunk_step(Some(0)).is_none());
+    }
+
+    /// `unwindow` refuses what `build_au` never emits.
+    #[test]
+    fn unwindow_refuses_a_malformed_au() {
+        let bs: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
+        let chunk = 64;
+        let au = build_au(&[(0, 500)], &bs, Some(chunk));
+        assert_eq!(unwindow(&au, chunk).unwrap(), bs[..500]);
+        assert!(
+            unwindow(&au[..au.len() - chunk], chunk).is_err(),
+            "open chain"
+        );
+        assert!(unwindow(&au[chunk..], chunk).is_err(), "CONT without FIRST");
+        assert!(unwindow(&au[..au.len() - 1], chunk).is_err(), "ragged tail");
+        let mut packed = build_au(&[(0, 20)], &bs, Some(chunk));
+        packed[chunk - 1] = 1;
+        assert!(unwindow(&packed, chunk).is_err(), "non-zero padding");
+    }
+
+    /// One floor on both platforms: 64 KiB a frame. A low rate at a low frame rate is honoured,
+    /// not lifted to 1 Mb/s.
+    #[test]
+    fn frame_budget_floors_at_64_kib_a_frame() {
+        assert_eq!(FrameBudget::new(0, 60).bytes, 64 * 1024);
+        assert_eq!(FrameBudget::new(600_000, 1).bytes, 75_000);
+        let mut b = FrameBudget::new(400_000_000, 60);
+        assert_eq!(b.bytes, 833_333);
+        assert_eq!(b.rate_control(false), 833_333);
+        assert_eq!(
+            b.rate_control(true),
+            833_333 * 1024 / 1280,
+            "startup inflation prior"
+        );
+        b.retarget(0);
+        assert_eq!(b.rate_control(true), 64 * 1024);
+    }
+
+    /// A boundary below one block header is ignored, never a switch back to dense.
+    #[test]
+    fn chunking_below_the_floor_keeps_the_boundary() {
+        let mut s = AuStream::default();
+        assert!(!s.set_chunking(63));
+        assert_eq!(s.wire_chunk, None);
+        assert!(s.set_chunking(1408));
+        assert!(!s.set_chunking(0));
+        assert_eq!(s.wire_chunk, Some(1408));
     }
 }

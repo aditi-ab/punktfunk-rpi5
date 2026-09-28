@@ -13,12 +13,16 @@
 use anyhow::{Context, Result};
 use windows::core::Interface;
 use windows::Win32::Foundation::{HMODULE, LUID};
-use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0};
+use windows::Win32::Graphics::Direct3D::{
+    D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0,
+};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION,
 };
-use windows::Win32::Graphics::Dxgi::{IDXGIAdapter1, IDXGIDevice, IDXGIDevice1};
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIDevice, IDXGIDevice1, IDXGIFactory4,
+};
 
 #[derive(Clone)]
 pub struct WinCaptureTarget {
@@ -129,6 +133,53 @@ pub unsafe fn make_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D
     Ok((device, context))
 }
 
+/// The DXGI adapter with `luid`; `None` when the LUID is unset or names no adapter.
+pub fn adapter_by_luid(luid: Option<LUID>) -> Option<IDXGIAdapter1> {
+    let luid = luid?;
+    // SAFETY: both calls return an owned COM reference or an error; nothing is borrowed.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+        factory.EnumAdapterByLuid(luid).ok()
+    }
+}
+
+/// A throwaway D3D11 device for a capability probe: on the adapter with `luid`, else the OS
+/// default hardware adapter. Unlike [`make_device`] it raises no GPU priority.
+pub fn probe_device(luid: Option<LUID>, flags: D3D11_CREATE_DEVICE_FLAG) -> Option<ID3D11Device> {
+    let adapter = adapter_by_luid(luid);
+    let mut device: Option<ID3D11Device> = None;
+    // SAFETY: `adapter` is an owned COM reference live for the call; `device` is a local
+    // out-param the callee fills only on success.
+    let created = unsafe {
+        match &adapter {
+            Some(a) => D3D11CreateDevice(
+                a,
+                D3D_DRIVER_TYPE_UNKNOWN,
+                HMODULE::default(),
+                flags,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                None,
+            ),
+            None => D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                flags,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                None,
+            ),
+        }
+    };
+    created.ok()?;
+    device
+}
+
 /// `PUNKTFUNK_GPU_PRIORITY_CLASS` policy.
 enum PrioMode {
     /// Skip the D3DKMT call; this is not class 0 (IDLE).
@@ -159,62 +210,10 @@ fn configured_gpu_priority_mode() -> PrioMode {
 /// Enable `SE_INC_BASE_PRIORITY` on this process token (best-effort).
 ///
 /// The kernel gates HIGH/REALTIME GPU scheduling on it. SYSTEM/Administrators
-/// hold it; a UAC-filtered token does not, so [`elevate_process_gpu_priority`]
-/// may silently no-op.
+/// hold it; a UAC-filtered token does not, and the warning says so.
 fn enable_inc_base_priority() {
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
-    use windows::Win32::Security::{
-        AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES,
-        SE_INC_BASE_PRIORITY_NAME, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
-        TOKEN_QUERY,
-    };
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    let mut token = HANDLE::default();
-    // SAFETY: `GetCurrentProcess` returns the current-process pseudo-handle, always valid and never
-    // closed; `token` is a local the callee only writes, and it is only used below if this succeeded.
-    let opened = unsafe {
-        OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-            &mut token,
-        )
-    }
-    .is_ok();
-    if opened {
-        let mut luid = LUID::default();
-        // SAFETY: a null system name means "local system"; `SE_INC_BASE_PRIORITY_NAME` is a static
-        // NUL-terminated constant, and `luid` is a local the callee only writes.
-        let found =
-            unsafe { LookupPrivilegeValueW(PCWSTR::null(), SE_INC_BASE_PRIORITY_NAME, &mut luid) }
-                .is_ok();
-        if found {
-            let tp = TOKEN_PRIVILEGES {
-                PrivilegeCount: 1,
-                Privileges: [LUID_AND_ATTRIBUTES {
-                    Luid: luid,
-                    Attributes: SE_PRIVILEGE_ENABLED,
-                }],
-            };
-            // SAFETY: `token` is the live handle opened above; `tp` is a correctly sized local
-            // `TOKEN_PRIVILEGES` whose `PrivilegeCount` matches its one-element array, borrowed only
-            // for the duration of the call.
-            let adjusted = unsafe {
-                AdjustTokenPrivileges(
-                    token,
-                    false,
-                    Some(&tp as *const TOKEN_PRIVILEGES),
-                    0,
-                    None,
-                    None,
-                )
-            };
-            if adjusted.is_err() {
-                tracing::warn!("AdjustTokenPrivileges(SE_INC_BASE_PRIORITY) failed (run as admin/SYSTEM for GPU priority)");
-            }
-        }
-        // SAFETY: `token` was opened above, is owned here, and is closed exactly once on this path.
-        let _ = unsafe { CloseHandle(token) };
+    if let Err(e) = crate::privilege::enable("SeIncreaseBasePriorityPrivilege") {
+        tracing::warn!(error = %e, "SE_INC_BASE_PRIORITY not enabled (run as admin/SYSTEM for GPU priority)");
     }
 }
 

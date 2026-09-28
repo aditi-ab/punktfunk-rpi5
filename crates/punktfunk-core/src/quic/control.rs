@@ -9,7 +9,9 @@
 //! Clipboard: `design/clipboard-and-file-transfer.md`. Shard grow/shrink:
 //! `design/shard-payload-reneg.md`. Phase lock: `design/phase-locked-capture.md`.
 
-use super::*;
+use super::wire::{Rd, Wr};
+#[cfg(doc)]
+use super::{clock_offset_ns, Hello, Start};
 use crate::config::Mode;
 use crate::error::{PunktfunkError, Result};
 
@@ -281,29 +283,29 @@ pub const MSG_CLOCK_PROBE: u8 = 0x30;
 pub const MSG_CLOCK_ECHO: u8 = 0x31;
 pub const MSG_PHASE_REPORT: u8 = 0x32;
 
+/// `width u32 ‖ height u32 ‖ refresh_hz u32`, shared by [`Reconfigure`] and [`Reconfigured`].
+fn put_mode(w: Wr, m: Mode) -> Wr {
+    w.u32(m.width).u32(m.height).u32(m.refresh_hz)
+}
+
+fn read_mode(r: &mut Rd) -> Mode {
+    Mode {
+        width: r.u32(),
+        height: r.u32(),
+        refresh_hz: r.u32(),
+    }
+}
+
 impl Reconfigure {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] w[5..9] h[9..13] hz[13..17]
-        let mut b = Vec::with_capacity(17);
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_RECONFIGURE);
-        b.extend_from_slice(&self.mode.width.to_le_bytes());
-        b.extend_from_slice(&self.mode.height.to_le_bytes());
-        b.extend_from_slice(&self.mode.refresh_hz.to_le_bytes());
-        b
+        put_mode(Wr::ctl(MSG_RECONFIGURE, 17), self.mode).done()
     }
 
     pub fn decode(b: &[u8]) -> Result<Reconfigure> {
-        if b.len() != 17 || &b[0..4] != CTL_MAGIC || b[4] != MSG_RECONFIGURE {
-            return Err(PunktfunkError::InvalidArg("bad Reconfigure"));
-        }
-        let u32at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let mut r = Rd::ctl(b, MSG_RECONFIGURE, 17..=17, "bad Reconfigure")?;
         Ok(Reconfigure {
-            mode: Mode {
-                width: u32at(5),
-                height: u32at(9),
-                refresh_hz: u32at(13),
-            },
+            mode: read_mode(&mut r),
         })
     }
 }
@@ -311,28 +313,15 @@ impl Reconfigure {
 impl Reconfigured {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] accepted[5] w[6..10] h[10..14] hz[14..18]
-        let mut b = Vec::with_capacity(18);
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_RECONFIGURED);
-        b.push(self.accepted as u8);
-        b.extend_from_slice(&self.mode.width.to_le_bytes());
-        b.extend_from_slice(&self.mode.height.to_le_bytes());
-        b.extend_from_slice(&self.mode.refresh_hz.to_le_bytes());
-        b
+        let w = Wr::ctl(MSG_RECONFIGURED, 18).u8(self.accepted as u8);
+        put_mode(w, self.mode).done()
     }
 
     pub fn decode(b: &[u8]) -> Result<Reconfigured> {
-        if b.len() != 18 || &b[0..4] != CTL_MAGIC || b[4] != MSG_RECONFIGURED {
-            return Err(PunktfunkError::InvalidArg("bad Reconfigured"));
-        }
-        let u32at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let mut r = Rd::ctl(b, MSG_RECONFIGURED, 18..=18, "bad Reconfigured")?;
         Ok(Reconfigured {
-            accepted: b[5] != 0,
-            mode: Mode {
-                width: u32at(6),
-                height: u32at(10),
-                refresh_hz: u32at(14),
-            },
+            accepted: r.u8() != 0,
+            mode: read_mode(&mut r),
         })
     }
 }
@@ -340,16 +329,11 @@ impl Reconfigured {
 impl RequestKeyframe {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] — no payload
-        let mut b = Vec::with_capacity(5);
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_REQUEST_KEYFRAME);
-        b
+        Wr::ctl(MSG_REQUEST_KEYFRAME, 5).done()
     }
 
     pub fn decode(b: &[u8]) -> Result<RequestKeyframe> {
-        if b.len() != 5 || &b[0..4] != CTL_MAGIC || b[4] != MSG_REQUEST_KEYFRAME {
-            return Err(PunktfunkError::InvalidArg("bad RequestKeyframe"));
-        }
+        Rd::ctl(b, MSG_REQUEST_KEYFRAME, 5..=5, "bad RequestKeyframe")?;
         Ok(RequestKeyframe)
     }
 }
@@ -357,21 +341,17 @@ impl RequestKeyframe {
 impl RfiRequest {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] first_frame[5..9] last_frame[9..13]
-        let mut b = Vec::with_capacity(13);
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_RFI_REQUEST);
-        b.extend_from_slice(&self.first_frame.to_le_bytes());
-        b.extend_from_slice(&self.last_frame.to_le_bytes());
-        b
+        Wr::ctl(MSG_RFI_REQUEST, 13)
+            .u32(self.first_frame)
+            .u32(self.last_frame)
+            .done()
     }
 
     pub fn decode(b: &[u8]) -> Result<RfiRequest> {
-        if b.len() != 13 || &b[0..4] != CTL_MAGIC || b[4] != MSG_RFI_REQUEST {
-            return Err(PunktfunkError::InvalidArg("bad RfiRequest"));
-        }
+        let mut r = Rd::ctl(b, MSG_RFI_REQUEST, 13..=13, "bad RfiRequest")?;
         Ok(RfiRequest {
-            first_frame: u32::from_le_bytes(b[5..9].try_into().unwrap()),
-            last_frame: u32::from_le_bytes(b[9..13].try_into().unwrap()),
+            first_frame: r.u32(),
+            last_frame: r.u32(),
         })
     }
 }
@@ -379,19 +359,20 @@ impl RfiRequest {
 impl ShardPayloadChanged {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] shard_payload[5..7]
-        let mut b = Vec::with_capacity(7);
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_SHARD_PAYLOAD_CHANGED);
-        b.extend_from_slice(&self.shard_payload.to_le_bytes());
-        b
+        Wr::ctl(MSG_SHARD_PAYLOAD_CHANGED, 7)
+            .u16(self.shard_payload)
+            .done()
     }
 
     pub fn decode(b: &[u8]) -> Result<ShardPayloadChanged> {
-        if b.len() != 7 || &b[0..4] != CTL_MAGIC || b[4] != MSG_SHARD_PAYLOAD_CHANGED {
-            return Err(PunktfunkError::InvalidArg("bad ShardPayloadChanged"));
-        }
+        let mut r = Rd::ctl(
+            b,
+            MSG_SHARD_PAYLOAD_CHANGED,
+            7..=7,
+            "bad ShardPayloadChanged",
+        )?;
         Ok(ShardPayloadChanged {
-            shard_payload: u16::from_le_bytes(b[5..7].try_into().unwrap()),
+            shard_payload: r.u16(),
         })
     }
 }
@@ -399,19 +380,15 @@ impl ShardPayloadChanged {
 impl ShardPayloadAck {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] shard_payload[5..7]
-        let mut b = Vec::with_capacity(7);
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_SHARD_PAYLOAD_ACK);
-        b.extend_from_slice(&self.shard_payload.to_le_bytes());
-        b
+        Wr::ctl(MSG_SHARD_PAYLOAD_ACK, 7)
+            .u16(self.shard_payload)
+            .done()
     }
 
     pub fn decode(b: &[u8]) -> Result<ShardPayloadAck> {
-        if b.len() != 7 || &b[0..4] != CTL_MAGIC || b[4] != MSG_SHARD_PAYLOAD_ACK {
-            return Err(PunktfunkError::InvalidArg("bad ShardPayloadAck"));
-        }
+        let mut r = Rd::ctl(b, MSG_SHARD_PAYLOAD_ACK, 7..=7, "bad ShardPayloadAck")?;
         Ok(ShardPayloadAck {
-            shard_payload: u16::from_le_bytes(b[5..7].try_into().unwrap()),
+            shard_payload: r.u16(),
         })
     }
 }
@@ -419,39 +396,27 @@ impl ShardPayloadAck {
 impl LossReport {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] loss_ppm[5..9]
-        let mut b = Vec::with_capacity(9);
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_LOSS_REPORT);
-        b.extend_from_slice(&self.loss_ppm.to_le_bytes());
-        b
+        Wr::ctl(MSG_LOSS_REPORT, 9).u32(self.loss_ppm).done()
     }
 
     pub fn decode(b: &[u8]) -> Result<LossReport> {
-        if b.len() != 9 || &b[0..4] != CTL_MAGIC || b[4] != MSG_LOSS_REPORT {
-            return Err(PunktfunkError::InvalidArg("bad LossReport"));
-        }
-        Ok(LossReport {
-            loss_ppm: u32::from_le_bytes(b[5..9].try_into().unwrap()),
-        })
+        let mut r = Rd::ctl(b, MSG_LOSS_REPORT, 9..=9, "bad LossReport")?;
+        Ok(LossReport { loss_ppm: r.u32() })
     }
 }
 
 impl DeliveryReport {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] packets_received[5..13]
-        let mut b = Vec::with_capacity(13);
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_DELIVERY_REPORT);
-        b.extend_from_slice(&self.packets_received.to_le_bytes());
-        b
+        Wr::ctl(MSG_DELIVERY_REPORT, 13)
+            .u64(self.packets_received)
+            .done()
     }
 
     pub fn decode(b: &[u8]) -> Result<DeliveryReport> {
-        if b.len() != 13 || &b[0..4] != CTL_MAGIC || b[4] != MSG_DELIVERY_REPORT {
-            return Err(PunktfunkError::InvalidArg("bad DeliveryReport"));
-        }
+        let mut r = Rd::ctl(b, MSG_DELIVERY_REPORT, 13..=13, "bad DeliveryReport")?;
         Ok(DeliveryReport {
-            packets_received: u64::from_le_bytes(b[5..13].try_into().unwrap()),
+            packets_received: r.u64(),
         })
     }
 }
@@ -459,19 +424,13 @@ impl DeliveryReport {
 impl LinkReport {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] proven_kbps[5..9]
-        let mut b = Vec::with_capacity(9);
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_LINK_REPORT);
-        b.extend_from_slice(&self.proven_kbps.to_le_bytes());
-        b
+        Wr::ctl(MSG_LINK_REPORT, 9).u32(self.proven_kbps).done()
     }
 
     pub fn decode(b: &[u8]) -> Result<LinkReport> {
-        if b.len() != 9 || &b[0..4] != CTL_MAGIC || b[4] != MSG_LINK_REPORT {
-            return Err(PunktfunkError::InvalidArg("bad LinkReport"));
-        }
+        let mut r = Rd::ctl(b, MSG_LINK_REPORT, 9..=9, "bad LinkReport")?;
         Ok(LinkReport {
-            proven_kbps: u32::from_le_bytes(b[5..9].try_into().unwrap()),
+            proven_kbps: r.u32(),
         })
     }
 }
@@ -479,19 +438,13 @@ impl LinkReport {
 impl SetBitrate {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] bitrate_kbps[5..9]
-        let mut b = Vec::with_capacity(9);
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_SET_BITRATE);
-        b.extend_from_slice(&self.bitrate_kbps.to_le_bytes());
-        b
+        Wr::ctl(MSG_SET_BITRATE, 9).u32(self.bitrate_kbps).done()
     }
 
     pub fn decode(b: &[u8]) -> Result<SetBitrate> {
-        if b.len() != 9 || &b[0..4] != CTL_MAGIC || b[4] != MSG_SET_BITRATE {
-            return Err(PunktfunkError::InvalidArg("bad SetBitrate"));
-        }
+        let mut r = Rd::ctl(b, MSG_SET_BITRATE, 9..=9, "bad SetBitrate")?;
         Ok(SetBitrate {
-            bitrate_kbps: u32::from_le_bytes(b[5..9].try_into().unwrap()),
+            bitrate_kbps: r.u32(),
         })
     }
 }
@@ -499,23 +452,19 @@ impl SetBitrate {
 impl BitrateChanged {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] bitrate_kbps[5..9] reason[9] (optional)
-        let mut b = Vec::with_capacity(10);
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_BITRATE_CHANGED);
-        b.extend_from_slice(&self.bitrate_kbps.to_le_bytes());
-        if let Some(r) = self.reason {
-            b.push(r.to_wire());
+        let w = Wr::ctl(MSG_BITRATE_CHANGED, 10).u32(self.bitrate_kbps);
+        match self.reason {
+            Some(r) => w.u8(r.to_wire()),
+            None => w,
         }
-        b
+        .done()
     }
 
     pub fn decode(b: &[u8]) -> Result<BitrateChanged> {
-        if !matches!(b.len(), 9 | 10) || &b[0..4] != CTL_MAGIC || b[4] != MSG_BITRATE_CHANGED {
-            return Err(PunktfunkError::InvalidArg("bad BitrateChanged"));
-        }
+        let mut r = Rd::ctl(b, MSG_BITRATE_CHANGED, 9..=10, "bad BitrateChanged")?;
         Ok(BitrateChanged {
-            bitrate_kbps: u32::from_le_bytes(b[5..9].try_into().unwrap()),
-            reason: b.get(9).copied().and_then(AckReason::from_wire),
+            bitrate_kbps: r.u32(),
+            reason: r.opt_u8().and_then(AckReason::from_wire),
         })
     }
 }
@@ -523,20 +472,12 @@ impl BitrateChanged {
 impl PipelineGap {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] gap_ms[5..9]
-        let mut b = Vec::with_capacity(9);
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_PIPELINE_GAP);
-        b.extend_from_slice(&self.gap_ms.to_le_bytes());
-        b
+        Wr::ctl(MSG_PIPELINE_GAP, 9).u32(self.gap_ms).done()
     }
 
     pub fn decode(b: &[u8]) -> Result<PipelineGap> {
-        if b.len() != 9 || &b[0..4] != CTL_MAGIC || b[4] != MSG_PIPELINE_GAP {
-            return Err(PunktfunkError::InvalidArg("bad PipelineGap"));
-        }
-        Ok(PipelineGap {
-            gap_ms: u32::from_le_bytes(b[5..9].try_into().unwrap()),
-        })
+        let mut r = Rd::ctl(b, MSG_PIPELINE_GAP, 9..=9, "bad PipelineGap")?;
+        Ok(PipelineGap { gap_ms: r.u32() })
     }
 }
 
@@ -561,22 +502,17 @@ pub fn window_loss_ppm(recovered: u64, late: u64, received: u64) -> u32 {
 impl ProbeRequest {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] target_kbps[5..9] duration_ms[9..13]
-        let mut b = Vec::with_capacity(13);
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_PROBE_REQUEST);
-        b.extend_from_slice(&self.target_kbps.to_le_bytes());
-        b.extend_from_slice(&self.duration_ms.to_le_bytes());
-        b
+        Wr::ctl(MSG_PROBE_REQUEST, 13)
+            .u32(self.target_kbps)
+            .u32(self.duration_ms)
+            .done()
     }
 
     pub fn decode(b: &[u8]) -> Result<ProbeRequest> {
-        if b.len() != 13 || &b[0..4] != CTL_MAGIC || b[4] != MSG_PROBE_REQUEST {
-            return Err(PunktfunkError::InvalidArg("bad ProbeRequest"));
-        }
-        let u32at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let mut r = Rd::ctl(b, MSG_PROBE_REQUEST, 13..=13, "bad ProbeRequest")?;
         Ok(ProbeRequest {
-            target_kbps: u32at(5),
-            duration_ms: u32at(9),
+            target_kbps: r.u32(),
+            duration_ms: r.u32(),
         })
     }
 }
@@ -585,32 +521,28 @@ impl ProbeResult {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] bytes_sent[5..13] packets_sent[13..17] duration_ms[17..21]
         // wire_packets_sent[21..25] send_dropped[25..29]
-        let mut b = Vec::with_capacity(29);
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_PROBE_RESULT);
-        b.extend_from_slice(&self.bytes_sent.to_le_bytes());
-        b.extend_from_slice(&self.packets_sent.to_le_bytes());
-        b.extend_from_slice(&self.duration_ms.to_le_bytes());
-        b.extend_from_slice(&self.wire_packets_sent.to_le_bytes());
-        b.extend_from_slice(&self.send_dropped.to_le_bytes());
-        b
+        Wr::ctl(MSG_PROBE_RESULT, 29)
+            .u64(self.bytes_sent)
+            .u32(self.packets_sent)
+            .u32(self.duration_ms)
+            .u32(self.wire_packets_sent)
+            .u32(self.send_dropped)
+            .done()
     }
 
     pub fn decode(b: &[u8]) -> Result<ProbeResult> {
         // 21 bytes = pre-wire-stats host (new fields 0); 29 = with wire stats. Reject shorter.
-        if b.len() < 21 || &b[0..4] != CTL_MAGIC || b[4] != MSG_PROBE_RESULT {
-            return Err(PunktfunkError::InvalidArg("bad ProbeResult"));
-        }
-        let u32at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
-        let (wire_packets_sent, send_dropped) = if b.len() >= 29 {
-            (u32at(21), u32at(25))
+        let mut r = Rd::ctl(b, MSG_PROBE_RESULT, 21.., "bad ProbeResult")?;
+        let (bytes_sent, packets_sent, duration_ms) = (r.u64(), r.u32(), r.u32());
+        let (wire_packets_sent, send_dropped) = if r.remaining() >= 8 {
+            (r.u32(), r.u32())
         } else {
             (0, 0)
         };
         Ok(ProbeResult {
-            bytes_sent: u64::from_le_bytes(b[5..13].try_into().unwrap()),
-            packets_sent: u32at(13),
-            duration_ms: u32at(17),
+            bytes_sent,
+            packets_sent,
+            duration_ms,
             wire_packets_sent,
             send_dropped,
         })
@@ -620,43 +552,31 @@ impl ProbeResult {
 impl ClockProbe {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] t1[5..13]
-        let mut b = Vec::with_capacity(13);
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_CLOCK_PROBE);
-        b.extend_from_slice(&self.t1_ns.to_le_bytes());
-        b
+        Wr::ctl(MSG_CLOCK_PROBE, 13).u64(self.t1_ns).done()
     }
 
     pub fn decode(b: &[u8]) -> Result<ClockProbe> {
-        if b.len() != 13 || &b[0..4] != CTL_MAGIC || b[4] != MSG_CLOCK_PROBE {
-            return Err(PunktfunkError::InvalidArg("bad ClockProbe"));
-        }
-        Ok(ClockProbe {
-            t1_ns: u64::from_le_bytes(b[5..13].try_into().unwrap()),
-        })
+        let mut r = Rd::ctl(b, MSG_CLOCK_PROBE, 13..=13, "bad ClockProbe")?;
+        Ok(ClockProbe { t1_ns: r.u64() })
     }
 }
 
 impl ClockEcho {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] t1[5..13] t2[13..21] t3[21..29]
-        let mut b = Vec::with_capacity(29);
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_CLOCK_ECHO);
-        b.extend_from_slice(&self.t1_ns.to_le_bytes());
-        b.extend_from_slice(&self.t2_ns.to_le_bytes());
-        b.extend_from_slice(&self.t3_ns.to_le_bytes());
-        b
+        Wr::ctl(MSG_CLOCK_ECHO, 29)
+            .u64(self.t1_ns)
+            .u64(self.t2_ns)
+            .u64(self.t3_ns)
+            .done()
     }
 
     pub fn decode(b: &[u8]) -> Result<ClockEcho> {
-        if b.len() != 29 || &b[0..4] != CTL_MAGIC || b[4] != MSG_CLOCK_ECHO {
-            return Err(PunktfunkError::InvalidArg("bad ClockEcho"));
-        }
+        let mut r = Rd::ctl(b, MSG_CLOCK_ECHO, 29..=29, "bad ClockEcho")?;
         Ok(ClockEcho {
-            t1_ns: u64::from_le_bytes(b[5..13].try_into().unwrap()),
-            t2_ns: u64::from_le_bytes(b[13..21].try_into().unwrap()),
-            t3_ns: u64::from_le_bytes(b[21..29].try_into().unwrap()),
+            t1_ns: r.u64(),
+            t2_ns: r.u64(),
+            t3_ns: r.u64(),
         })
     }
 }
@@ -665,34 +585,32 @@ impl PhaseReport {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] latch[5..13] period[13..17] uncertainty[17..21] lead[21..25]
         // coherence[25..27] v2 tail. MAX sentinel encodes as the 25-byte v1 form (append-only).
-        let mut b = Vec::with_capacity(27);
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_PHASE_REPORT);
-        b.extend_from_slice(&self.next_latch_host_ns.to_le_bytes());
-        b.extend_from_slice(&self.latch_period_ns.to_le_bytes());
-        b.extend_from_slice(&self.uncertainty_ns.to_le_bytes());
-        b.extend_from_slice(&self.arrival_lead_ns.to_le_bytes());
-        if self.coherence_milli != u16::MAX {
-            b.extend_from_slice(&self.coherence_milli.to_le_bytes());
+        let w = Wr::ctl(MSG_PHASE_REPORT, 27)
+            .u64(self.next_latch_host_ns)
+            .u32(self.latch_period_ns)
+            .u32(self.uncertainty_ns)
+            .u32(self.arrival_lead_ns);
+        match self.coherence_milli {
+            u16::MAX => w,
+            c => w.u16(c),
         }
-        b
+        .done()
     }
 
     pub fn decode(b: &[u8]) -> Result<PhaseReport> {
-        if !(b.len() == 25 || b.len() == 27) || &b[0..4] != CTL_MAGIC || b[4] != MSG_PHASE_REPORT {
-            return Err(PunktfunkError::InvalidArg("bad PhaseReport"));
+        const BAD: &str = "bad PhaseReport";
+        // 25 bytes is v1, 27 is v2; nothing between.
+        if b.len() == 26 {
+            return Err(PunktfunkError::InvalidArg(BAD));
         }
-        let u32at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let mut r = Rd::ctl(b, MSG_PHASE_REPORT, 25..=27, BAD)?;
         Ok(PhaseReport {
-            next_latch_host_ns: u64::from_le_bytes(b[5..13].try_into().unwrap()),
-            latch_period_ns: u32at(13),
-            uncertainty_ns: u32at(17),
-            arrival_lead_ns: u32at(21),
-            coherence_milli: if b.len() == 27 {
-                u16::from_le_bytes(b[25..27].try_into().unwrap())
-            } else {
-                u16::MAX // v1 sender — no coherence signal
-            },
+            next_latch_host_ns: r.u64(),
+            latch_period_ns: r.u32(),
+            uncertainty_ns: r.u32(),
+            arrival_lead_ns: r.u32(),
+            // A v1 sender has no coherence signal.
+            coherence_milli: r.opt_u16().unwrap_or(u16::MAX),
         })
     }
 }
@@ -812,50 +730,43 @@ pub struct ClipFetchHdr {
 }
 
 /// `mime_len u8 || mime bytes || size_hint u64 LE`.
-fn put_clip_kind(b: &mut Vec<u8>, k: &ClipKind) {
+fn put_clip_kind(w: Wr, k: &ClipKind) -> Wr {
     let mime = k.mime.as_bytes();
     let n = mime.len().min(CLIP_MAX_MIME);
-    b.push(n as u8);
-    b.extend_from_slice(&mime[..n]);
-    b.extend_from_slice(&k.size_hint.to_le_bytes());
+    w.u8(n as u8).bytes(&mime[..n]).u64(k.size_hint)
 }
 
-fn get_clip_kind(b: &[u8], off: usize) -> Result<(ClipKind, usize)> {
-    if off >= b.len() {
-        return Err(PunktfunkError::InvalidArg("truncated ClipKind"));
-    }
-    let n = b[off] as usize;
+fn get_clip_kind(r: &mut Rd) -> Result<ClipKind> {
+    let n = r
+        .opt_u8()
+        .ok_or(PunktfunkError::InvalidArg("truncated ClipKind"))? as usize;
     if n > CLIP_MAX_MIME {
         return Err(PunktfunkError::InvalidArg("ClipKind mime too long"));
     }
-    let mime_start = off + 1;
-    let size_start = mime_start + n;
-    if size_start + 8 > b.len() {
+    if r.remaining() < n + 8 {
         return Err(PunktfunkError::InvalidArg("ClipKind overruns message"));
     }
-    let mime = String::from_utf8_lossy(&b[mime_start..size_start]).into_owned();
-    let size_hint = u64::from_le_bytes(b[size_start..size_start + 8].try_into().unwrap());
-    Ok((ClipKind { mime, size_hint }, size_start + 8))
+    let mime = String::from_utf8_lossy(r.bytes(n)).into_owned();
+    Ok(ClipKind {
+        mime,
+        size_hint: r.u64(),
+    })
 }
 
 impl ClipControl {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] enabled[5] flags[6]
-        let mut b = Vec::with_capacity(7);
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_CLIP_CONTROL);
-        b.push(self.enabled as u8);
-        b.push(self.flags);
-        b
+        Wr::ctl(MSG_CLIP_CONTROL, 7)
+            .u8(self.enabled as u8)
+            .u8(self.flags)
+            .done()
     }
 
     pub fn decode(b: &[u8]) -> Result<ClipControl> {
-        if b.len() != 7 || &b[0..4] != CTL_MAGIC || b[4] != MSG_CLIP_CONTROL {
-            return Err(PunktfunkError::InvalidArg("bad ClipControl"));
-        }
+        let mut r = Rd::ctl(b, MSG_CLIP_CONTROL, 7..=7, "bad ClipControl")?;
         Ok(ClipControl {
-            enabled: b[5] != 0,
-            flags: b[6],
+            enabled: r.u8() != 0,
+            flags: r.u8(),
         })
     }
 }
@@ -863,23 +774,19 @@ impl ClipControl {
 impl ClipState {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] enabled[5] policy[6] reason[7]
-        let mut b = Vec::with_capacity(8);
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_CLIP_STATE);
-        b.push(self.enabled as u8);
-        b.push(self.policy);
-        b.push(self.reason);
-        b
+        Wr::ctl(MSG_CLIP_STATE, 8)
+            .u8(self.enabled as u8)
+            .u8(self.policy)
+            .u8(self.reason)
+            .done()
     }
 
     pub fn decode(b: &[u8]) -> Result<ClipState> {
-        if b.len() != 8 || &b[0..4] != CTL_MAGIC || b[4] != MSG_CLIP_STATE {
-            return Err(PunktfunkError::InvalidArg("bad ClipState"));
-        }
+        let mut r = Rd::ctl(b, MSG_CLIP_STATE, 8..=8, "bad ClipState")?;
         Ok(ClipState {
-            enabled: b[5] != 0,
-            policy: b[6],
-            reason: b[7],
+            enabled: r.u8() != 0,
+            policy: r.u8(),
+            reason: r.u8(),
         })
     }
 }
@@ -887,35 +794,28 @@ impl ClipState {
 impl ClipOffer {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] seq[5..9] count[9] then `count` ClipKinds
-        let mut b = Vec::with_capacity(10 + self.kinds.len() * 16);
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_CLIP_OFFER);
-        b.extend_from_slice(&self.seq.to_le_bytes());
         let count = self.kinds.len().min(CLIP_MAX_KINDS);
-        b.push(count as u8);
+        let mut w = Wr::ctl(MSG_CLIP_OFFER, 10 + self.kinds.len() * 16)
+            .u32(self.seq)
+            .u8(count as u8);
         for k in &self.kinds[..count] {
-            put_clip_kind(&mut b, k);
+            w = put_clip_kind(w, k);
         }
-        b
+        w.done()
     }
 
     pub fn decode(b: &[u8]) -> Result<ClipOffer> {
-        if b.len() < 10 || &b[0..4] != CTL_MAGIC || b[4] != MSG_CLIP_OFFER {
-            return Err(PunktfunkError::InvalidArg("bad ClipOffer"));
-        }
-        let seq = u32::from_le_bytes(b[5..9].try_into().unwrap());
-        let count = b[9] as usize;
+        let mut r = Rd::ctl(b, MSG_CLIP_OFFER, 10.., "bad ClipOffer")?;
+        let seq = r.u32();
+        let count = r.u8() as usize;
         if count > CLIP_MAX_KINDS {
             return Err(PunktfunkError::InvalidArg("ClipOffer too many kinds"));
         }
         let mut kinds = Vec::with_capacity(count);
-        let mut off = 10;
         for _ in 0..count {
-            let (k, next) = get_clip_kind(b, off)?;
-            kinds.push(k);
-            off = next;
+            kinds.push(get_clip_kind(&mut r)?);
         }
-        if off != b.len() {
+        if r.remaining() != 0 {
             return Err(PunktfunkError::InvalidArg("trailing bytes"));
         }
         Ok(ClipOffer { seq, kinds })
@@ -927,27 +827,23 @@ impl ClipFetch {
         // magic[0..4] type[4] seq[5..9] file_index[9..13] mime(len u8 || bytes)[13..]
         let mime = self.mime.as_bytes();
         let n = mime.len().min(CLIP_MAX_MIME);
-        let mut b = Vec::with_capacity(14 + n);
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_CLIP_FETCH);
-        b.extend_from_slice(&self.seq.to_le_bytes());
-        b.extend_from_slice(&self.file_index.to_le_bytes());
-        b.push(n as u8);
-        b.extend_from_slice(&mime[..n]);
-        b
+        Wr::ctl(MSG_CLIP_FETCH, 14 + n)
+            .u32(self.seq)
+            .u32(self.file_index)
+            .u8(n as u8)
+            .bytes(&mime[..n])
+            .done()
     }
 
     pub fn decode(b: &[u8]) -> Result<ClipFetch> {
-        if b.len() < 14 || &b[0..4] != CTL_MAGIC || b[4] != MSG_CLIP_FETCH {
-            return Err(PunktfunkError::InvalidArg("bad ClipFetch"));
-        }
-        let seq = u32::from_le_bytes(b[5..9].try_into().unwrap());
-        let file_index = u32::from_le_bytes(b[9..13].try_into().unwrap());
-        let n = b[13] as usize;
-        if n > CLIP_MAX_MIME || b.len() != 14 + n {
+        let mut r = Rd::ctl(b, MSG_CLIP_FETCH, 14.., "bad ClipFetch")?;
+        let seq = r.u32();
+        let file_index = r.u32();
+        let n = r.u8() as usize;
+        if n > CLIP_MAX_MIME || r.remaining() != n {
             return Err(PunktfunkError::InvalidArg("bad ClipFetch mime"));
         }
-        let mime = String::from_utf8_lossy(&b[14..14 + n]).into_owned();
+        let mime = String::from_utf8_lossy(r.rest()).into_owned();
         Ok(ClipFetch {
             seq,
             file_index,
@@ -959,21 +855,17 @@ impl ClipFetch {
 impl ClipFetchHdr {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] status[5] total_size[6..14]
-        let mut b = Vec::with_capacity(14);
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_CLIP_FETCH_HDR);
-        b.push(self.status);
-        b.extend_from_slice(&self.total_size.to_le_bytes());
-        b
+        Wr::ctl(MSG_CLIP_FETCH_HDR, 14)
+            .u8(self.status)
+            .u64(self.total_size)
+            .done()
     }
 
     pub fn decode(b: &[u8]) -> Result<ClipFetchHdr> {
-        if b.len() != 14 || &b[0..4] != CTL_MAGIC || b[4] != MSG_CLIP_FETCH_HDR {
-            return Err(PunktfunkError::InvalidArg("bad ClipFetchHdr"));
-        }
+        let mut r = Rd::ctl(b, MSG_CLIP_FETCH_HDR, 14..=14, "bad ClipFetchHdr")?;
         Ok(ClipFetchHdr {
-            status: b[5],
-            total_size: u64::from_le_bytes(b[6..14].try_into().unwrap()),
+            status: r.u8(),
+            total_size: r.u64(),
         })
     }
 }
@@ -1009,37 +901,32 @@ pub struct CursorShape {
 impl CursorShape {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] serial[5..9] w[9..11] h[11..13] hot_x[13..15] hot_y[15..17] rgba…
-        let mut b = Vec::with_capacity(17 + self.rgba.len());
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_CURSOR_SHAPE);
-        b.extend_from_slice(&self.serial.to_le_bytes());
-        b.extend_from_slice(&self.w.to_le_bytes());
-        b.extend_from_slice(&self.h.to_le_bytes());
-        b.extend_from_slice(&self.hot_x.to_le_bytes());
-        b.extend_from_slice(&self.hot_y.to_le_bytes());
-        b.extend_from_slice(&self.rgba);
-        b
+        Wr::ctl(MSG_CURSOR_SHAPE, 17 + self.rgba.len())
+            .u32(self.serial)
+            .u16(self.w)
+            .u16(self.h)
+            .u16(self.hot_x)
+            .u16(self.hot_y)
+            .bytes(&self.rgba)
+            .done()
     }
 
     pub fn decode(b: &[u8]) -> Result<CursorShape> {
-        if b.len() < 17 || &b[0..4] != CTL_MAGIC || b[4] != MSG_CURSOR_SHAPE {
-            return Err(PunktfunkError::InvalidArg("bad CursorShape"));
-        }
-        let u16at = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
-        let (w, h) = (u16at(9), u16at(11));
+        let mut r = Rd::ctl(b, MSG_CURSOR_SHAPE, 17.., "bad CursorShape")?;
+        let (serial, w, h, hot_x, hot_y) = (r.u32(), r.u16(), r.u16(), r.u16(), r.u16());
         if w == 0 || h == 0 || w > CURSOR_SHAPE_MAX_SIDE || h > CURSOR_SHAPE_MAX_SIDE {
             return Err(PunktfunkError::InvalidArg("bad CursorShape dims"));
         }
-        if b.len() != 17 + (w as usize) * (h as usize) * 4 {
+        if r.remaining() != (w as usize) * (h as usize) * 4 {
             return Err(PunktfunkError::InvalidArg("bad CursorShape len"));
         }
         Ok(CursorShape {
-            serial: u32::from_le_bytes(b[5..9].try_into().unwrap()),
+            serial,
             w,
             h,
-            hot_x: u16at(13),
-            hot_y: u16at(15),
-            rgba: b[17..].to_vec(),
+            hot_x,
+            hot_y,
+            rgba: r.rest().to_vec(),
         })
     }
 }
@@ -1057,19 +944,15 @@ pub struct CursorRenderMode {
 impl CursorRenderMode {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] client_draws[5]
-        let mut b = Vec::with_capacity(6);
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_CURSOR_RENDER);
-        b.push(self.client_draws as u8);
-        b
+        Wr::ctl(MSG_CURSOR_RENDER, 6)
+            .u8(self.client_draws as u8)
+            .done()
     }
 
     pub fn decode(b: &[u8]) -> Result<CursorRenderMode> {
-        if b.len() != 6 || &b[0..4] != CTL_MAGIC || b[4] != MSG_CURSOR_RENDER {
-            return Err(PunktfunkError::InvalidArg("bad CursorRenderMode"));
-        }
+        let mut r = Rd::ctl(b, MSG_CURSOR_RENDER, 6..=6, "bad CursorRenderMode")?;
         Ok(CursorRenderMode {
-            client_draws: b[5] != 0,
+            client_draws: r.u8() != 0,
         })
     }
 }
@@ -1095,21 +978,17 @@ pub struct AccessUpdate {
 impl AccessUpdate {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] grants[5..9] remaining_secs[9..13]
-        let mut b = Vec::with_capacity(13);
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_ACCESS_UPDATE);
-        b.extend_from_slice(&self.grants.to_le_bytes());
-        b.extend_from_slice(&self.remaining_secs.to_le_bytes());
-        b
+        Wr::ctl(MSG_ACCESS_UPDATE, 13)
+            .u32(self.grants)
+            .u32(self.remaining_secs)
+            .done()
     }
 
     pub fn decode(b: &[u8]) -> Result<AccessUpdate> {
-        if b.len() != 13 || &b[0..4] != CTL_MAGIC || b[4] != MSG_ACCESS_UPDATE {
-            return Err(PunktfunkError::InvalidArg("bad AccessUpdate"));
-        }
+        let mut r = Rd::ctl(b, MSG_ACCESS_UPDATE, 13..=13, "bad AccessUpdate")?;
         Ok(AccessUpdate {
-            grants: u32::from_le_bytes(b[5..9].try_into().unwrap()),
-            remaining_secs: u32::from_le_bytes(b[9..13].try_into().unwrap()),
+            grants: r.u32(),
+            remaining_secs: r.u32(),
         })
     }
 }
@@ -1129,18 +1008,12 @@ pub struct AudioState {
 impl AudioState {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] muted[5]
-        let mut b = Vec::with_capacity(6);
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_AUDIO_STATE);
-        b.push(u8::from(self.muted));
-        b
+        Wr::ctl(MSG_AUDIO_STATE, 6).u8(u8::from(self.muted)).done()
     }
 
     pub fn decode(b: &[u8]) -> Result<AudioState> {
-        if b.len() != 6 || &b[0..4] != CTL_MAGIC || b[4] != MSG_AUDIO_STATE {
-            return Err(PunktfunkError::InvalidArg("bad AudioState"));
-        }
-        Ok(AudioState { muted: b[5] != 0 })
+        let mut r = Rd::ctl(b, MSG_AUDIO_STATE, 6..=6, "bad AudioState")?;
+        Ok(AudioState { muted: r.u8() != 0 })
     }
 }
 
@@ -1160,20 +1033,12 @@ pub struct PadSlots {
 impl PadSlots {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] slots[5..7]
-        let mut b = Vec::with_capacity(7);
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_PAD_SLOTS);
-        b.extend_from_slice(&self.slots.to_le_bytes());
-        b
+        Wr::ctl(MSG_PAD_SLOTS, 7).u16(self.slots).done()
     }
 
     pub fn decode(b: &[u8]) -> Result<PadSlots> {
-        if b.len() != 7 || &b[0..4] != CTL_MAGIC || b[4] != MSG_PAD_SLOTS {
-            return Err(PunktfunkError::InvalidArg("bad PadSlots"));
-        }
-        Ok(PadSlots {
-            slots: u16::from_le_bytes(b[5..7].try_into().unwrap()),
-        })
+        let mut r = Rd::ctl(b, MSG_PAD_SLOTS, 7..=7, "bad PadSlots")?;
+        Ok(PadSlots { slots: r.u16() })
     }
 }
 
@@ -1275,27 +1140,27 @@ impl LaunchOutcome {
     pub fn encode(&self) -> Vec<u8> {
         // magic[0..4] type[4] kind[5] len[6] message[7..]
         let msg = self.message.as_bytes();
-        let mut b = Vec::with_capacity(7 + msg.len());
-        b.extend_from_slice(CTL_MAGIC);
-        b.push(MSG_LAUNCH_OUTCOME);
-        b.push(self.kind as u8);
-        b.push(msg.len() as u8);
-        b.extend_from_slice(msg);
-        b
+        Wr::ctl(MSG_LAUNCH_OUTCOME, 7 + msg.len())
+            .u8(self.kind as u8)
+            .u8(msg.len() as u8)
+            .bytes(msg)
+            .done()
     }
 
     pub fn decode(b: &[u8]) -> Result<LaunchOutcome> {
-        let bad = || PunktfunkError::InvalidArg("bad LaunchOutcome");
-        if b.len() < 7 || &b[0..4] != CTL_MAGIC || b[4] != MSG_LAUNCH_OUTCOME {
-            return Err(bad());
-        }
-        let len = b[6] as usize;
-        if len > LAUNCH_MESSAGE_MAX || b.len() != 7 + len {
+        const BAD: &str = "bad LaunchOutcome";
+        let bad = || PunktfunkError::InvalidArg(BAD);
+        let mut r = Rd::ctl(b, MSG_LAUNCH_OUTCOME, 7.., BAD)?;
+        let kind = LaunchOutcomeKind::from_u8(r.u8());
+        let len = r.u8() as usize;
+        if len > LAUNCH_MESSAGE_MAX || r.remaining() != len {
             return Err(bad());
         }
         Ok(LaunchOutcome {
-            kind: LaunchOutcomeKind::from_u8(b[5]),
-            message: std::str::from_utf8(&b[7..]).map_err(|_| bad())?.to_string(),
+            kind,
+            message: std::str::from_utf8(r.rest())
+                .map_err(|_| bad())?
+                .to_string(),
         })
     }
 }
@@ -1304,6 +1169,255 @@ impl LaunchOutcome {
 mod tests {
     use crate::config::Mode;
     use crate::quic::*;
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// One message's wire bytes after `PKFc` (`504b4663`), both ways: the codecs may
+    /// change shape, never the wire.
+    macro_rules! pin {
+        ($ty:ident, $msg:expr, $hex:literal) => {{
+            let m: $ty = $msg;
+            let b = m.encode();
+            assert_eq!(hex(&b), concat!("504b4663", $hex), stringify!($ty));
+            assert_eq!($ty::decode(&b).unwrap(), m, stringify!($ty));
+        }};
+    }
+
+    #[test]
+    fn rate_control_messages_keep_their_wire_bytes() {
+        let mode = Mode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 120,
+        };
+        pin!(
+            Reconfigure,
+            Reconfigure { mode },
+            "01800700003804000078000000"
+        );
+        pin!(
+            Reconfigured,
+            Reconfigured {
+                accepted: true,
+                mode
+            },
+            "0201800700003804000078000000"
+        );
+        pin!(RequestKeyframe, RequestKeyframe, "03");
+        pin!(
+            LossReport,
+            LossReport {
+                loss_ppm: 0x0102_0304
+            },
+            "0404030201"
+        );
+        pin!(
+            SetBitrate,
+            SetBitrate {
+                bitrate_kbps: 50_000
+            },
+            "0550c30000"
+        );
+        pin!(
+            BitrateChanged,
+            BitrateChanged {
+                bitrate_kbps: 50_000,
+                reason: Some(AckReason::Cadence)
+            },
+            "0650c3000002"
+        );
+        pin!(
+            BitrateChanged,
+            BitrateChanged {
+                bitrate_kbps: 50_000,
+                reason: None
+            },
+            "0650c30000"
+        );
+        pin!(
+            RfiRequest,
+            RfiRequest {
+                first_frame: 10,
+                last_frame: 12
+            },
+            "070a0000000c000000"
+        );
+        pin!(
+            ShardPayloadChanged,
+            ShardPayloadChanged {
+                shard_payload: 1200
+            },
+            "08b004"
+        );
+        pin!(
+            ShardPayloadAck,
+            ShardPayloadAck {
+                shard_payload: 1200
+            },
+            "09b004"
+        );
+        pin!(PipelineGap, PipelineGap { gap_ms: 250 }, "0afa000000");
+        pin!(
+            DeliveryReport,
+            DeliveryReport {
+                packets_received: 0x0102_0304_0506_0708
+            },
+            "0b0807060504030201"
+        );
+        pin!(
+            LinkReport,
+            LinkReport {
+                proven_kbps: 0x0a0b_0c0d
+            },
+            "0c0d0c0b0a"
+        );
+    }
+
+    #[test]
+    fn probe_and_clock_messages_keep_their_wire_bytes() {
+        pin!(
+            ProbeRequest,
+            ProbeRequest {
+                target_kbps: 100_000,
+                duration_ms: 500
+            },
+            "20a0860100f4010000"
+        );
+        pin!(
+            ProbeResult,
+            ProbeResult {
+                bytes_sent: 0x1122_3344_5566_7788,
+                packets_sent: 1,
+                duration_ms: 2,
+                wire_packets_sent: 3,
+                send_dropped: 4
+            },
+            "21887766554433221101000000020000000300000004000000"
+        );
+        pin!(
+            ClockProbe,
+            ClockProbe {
+                t1_ns: 0x0102_0304_0506_0708
+            },
+            "300807060504030201"
+        );
+        pin!(
+            ClockEcho,
+            ClockEcho {
+                t1_ns: 1,
+                t2_ns: 2,
+                t3_ns: 3
+            },
+            "31010000000000000002000000000000000300000000000000"
+        );
+        let phase = PhaseReport {
+            next_latch_host_ns: 0x0102_0304_0506_0708,
+            latch_period_ns: 8_333_333,
+            uncertainty_ns: 0x10,
+            arrival_lead_ns: 0x20,
+            coherence_milli: 900,
+        };
+        pin!(
+            PhaseReport,
+            phase,
+            "32080706050403020115287f0010000000200000008403"
+        );
+        pin!(
+            PhaseReport,
+            PhaseReport {
+                coherence_milli: u16::MAX,
+                ..phase
+            },
+            "32080706050403020115287f001000000020000000"
+        );
+    }
+
+    #[test]
+    fn clipboard_messages_keep_their_wire_bytes() {
+        pin!(
+            ClipControl,
+            ClipControl {
+                enabled: true,
+                flags: CLIP_FLAG_FILES
+            },
+            "400101"
+        );
+        pin!(
+            ClipState,
+            ClipState {
+                enabled: true,
+                policy: 3,
+                reason: 4
+            },
+            "41010304"
+        );
+        pin!(
+            ClipOffer,
+            ClipOffer {
+                seq: 7,
+                kinds: vec![ClipKind {
+                    mime: "text/plain".into(),
+                    size_hint: 5
+                }]
+            },
+            "4207000000010a746578742f706c61696e0500000000000000"
+        );
+        pin!(
+            ClipFetch,
+            ClipFetch {
+                seq: 7,
+                file_index: CLIP_FILE_INDEX_NONE,
+                mime: "text/plain".into()
+            },
+            "4307000000ffffffff0a746578742f706c61696e"
+        );
+        pin!(
+            ClipFetchHdr,
+            ClipFetchHdr {
+                status: CLIP_FETCH_OK,
+                total_size: 5
+            },
+            "44000500000000000000"
+        );
+    }
+
+    #[test]
+    fn cursor_and_session_messages_keep_their_wire_bytes() {
+        pin!(
+            CursorShape,
+            CursorShape {
+                serial: 9,
+                w: 1,
+                h: 1,
+                hot_x: 0,
+                hot_y: 0,
+                rgba: vec![1, 2, 3, 4]
+            },
+            "5009000000010001000000000001020304"
+        );
+        pin!(
+            CursorRenderMode,
+            CursorRenderMode { client_draws: true },
+            "5101"
+        );
+        pin!(
+            AccessUpdate,
+            AccessUpdate {
+                grants: 0x1f,
+                remaining_secs: 3600
+            },
+            "581f000000100e0000"
+        );
+        pin!(AudioState, AudioState { muted: true }, "5901");
+        pin!(
+            LaunchOutcome,
+            LaunchOutcome::new(LaunchOutcomeKind::Failed, "gone"),
+            "5a0404676f6e65"
+        );
+        pin!(PadSlots, PadSlots { slots: 5 }, "5b0500");
+    }
 
     #[test]
     fn cursor_render_mode_roundtrip() {

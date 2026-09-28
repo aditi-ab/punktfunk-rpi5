@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Emit the three INLINE launcher-icon registries from the assets/launcher-icons masters.
 
-The OS-icon pipeline prints its path data for a human to paste into each client. That is fine
-for a mark you add once a year; it is not fine here, where three clients each need seven paths
-of up to 3 kB and a single mangled character is a silently wrong logo. So these three files are
-generated outright, with their commentary baked in below:
+Three clients each need seven paths of up to 3 kB, and a single mangled character is a silently
+wrong logo, so these files are generated outright, with their commentary baked in below:
 
     web/src/components/launcher-icon.tsx           web console, inline SVG
     clients/android/.../components/LauncherIcons.kt Android, Compose ImageVector via PathParser
@@ -17,11 +15,8 @@ Usage: python3 scripts/gen_launcher_icon_tables.py     (from anywhere; paths are
 
 from __future__ import annotations
 
-import pathlib
-import re
-import sys
+from svg_marks import ROOT, comment, mark, write
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
 MASTERS = ROOT / "assets" / "launcher-icons"
 
 # Registry order — the order a reader of any of the three files sees. Live tiles first, then the
@@ -35,33 +30,7 @@ BANNER = (
     "Per-mark provenance and licensing: assets/launcher-icons/README.md."
 )
 
-
-def mark(token: str) -> tuple[str, str, float, float]:
-    """(token, path data, viewport width, viewport height) for one master."""
-    svg = (MASTERS / f"{token}.svg").read_text()
-    box = re.search(r'viewBox="([^"]+)"', svg).group(1)
-    paths = re.findall(r'<path[^>]*\sd="([^"]+)"', svg)
-    if len(paths) != 1:
-        sys.exit(f"{token}: expected exactly one <path>, found {len(paths)}")
-    d = paths[0]
-    if any(c in d for c in "\n\t\"\\"):
-        sys.exit(f"{token}: path data must be single-line and free of quotes/backslashes")
-    _, _, w, h = box.split()
-    return token, d, float(w), float(h)
-
-
-MARKS = [mark(t) for t in TOKENS]
-
-
-def comment(prefix: str) -> str:
-    return "\n".join(f"{prefix} {line}".rstrip() for line in BANNER.splitlines())
-
-
-def write(rel: str, body: str) -> None:
-    p = ROOT / rel
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(body)
-    print(f"  {rel} ({len(body):,} bytes)")
+MARKS = [mark(MASTERS, t) for t in TOKENS]
 
 
 # --- web console -----------------------------------------------------------------------------
@@ -72,7 +41,7 @@ rows = "\n".join(
 )
 write(
     "web/src/components/launcher-icon.tsx",
-    f"""{comment("//")}
+    f"""{comment(BANNER, "//")}
 //
 // The mark a `role: "launcher"` tile draws, resolved from the entry's `icon` token. lucide
 // deliberately ships no brand marks, so this is a curated registry — the same shape as
@@ -133,7 +102,7 @@ write(
     "clients/android/app/src/main/kotlin/io/unom/punktfunk/components/LauncherIcons.kt",
     f"""package io.unom.punktfunk.components
 
-{comment("//")}
+{comment(BANNER, "//")}
 
 import androidx.compose.ui.graphics.vector.ImageVector
 
@@ -166,54 +135,21 @@ rows = "\n".join(
 )
 write(
     "crates/pf-console-ui/src/launcher_icons.rs",
-    f"""{comment("//!")}
+    f"""{comment(BANNER, "//!")}
 //!
 //! Brand mark a `role: "launcher"` tile draws, resolved from the entry's
 //! `icon` token.
 
-use skia_safe::{{Matrix, Path, Rect}};
-use std::collections::HashMap;
-use std::sync::{{Mutex, OnceLock}};
+use crate::icons::MarkTable;
+use skia_safe::{{Path, Rect}};
 
-type Glyph = (Path, f32, f32);
-
-/// Token → parsed mark. `None` memoizes a miss so a bad token is not re-parsed
-/// every frame. Named: `clippy::type_complexity` rejects the inline form, and
-/// this file is generated — an inline type would fail `-D warnings` on regen.
-type GlyphCache = HashMap<String, Option<Glyph>>;
-
-const GLYPHS: &[(&str, f32, f32, &str)] = &[
+static TABLE: MarkTable = MarkTable::new(&[
 {rows}
-];
+]);
 
-/// Cached: `Path::from_svg` on a 3 kB string is not free, and the library
-/// shelf re-renders every frame. `None` is a miss or an unparseable path.
-fn glyph(token: &str) -> Option<Glyph> {{
-    static CACHE: OnceLock<Mutex<GlyphCache>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut cache = cache.lock().ok()?;
-    if let Some(hit) = cache.get(token) {{
-        return hit.clone();
-    }}
-    let built = GLYPHS
-        .iter()
-        .find(|(t, ..)| *t == token)
-        .and_then(|(_, w, h, d)| Path::from_svg(d).map(|p| (p, *w, *h)));
-    cache.insert(token.to_string(), built.clone());
-    built
-}}
-
-/// Aspect preserved: the masters' viewports are not all square.
+/// `token`'s mark fitted into `dst`; `None` when this build ships no art for it.
 pub fn launcher_mark(token: &str, dst: Rect) -> Option<Path> {{
-    let (path, vw, vh) = glyph(token)?;
-    let scale = (dst.width() / vw).min(dst.height() / vh);
-    let mut m = Matrix::new_identity();
-    m.set_scale((scale, scale), None);
-    m.post_translate((
-        dst.left + (dst.width() - vw * scale) / 2.0,
-        dst.top + (dst.height() - vh * scale) / 2.0,
-    ));
-    Some(path.with_transform(&m))
+    TABLE.fit(token, dst)
 }}
 
 #[cfg(test)]
@@ -222,31 +158,12 @@ mod tests {{
 
     #[test]
     fn every_glyph_parses() {{
-        for (token, ..) in GLYPHS {{
-            assert!(glyph(token).is_some(), "{{token}} failed to parse");
-        }}
+        assert_eq!(TABLE.unparsed(), Vec::<&str>::new());
     }}
 
     #[test]
     fn unknown_token_draws_nothing() {{
         assert!(launcher_mark("not-a-launcher", Rect::from_wh(64.0, 64.0)).is_none());
-    }}
-
-    /// Letterboxed, never stretched. Steam's viewport is 496×512, not square.
-    #[test]
-    fn mark_is_contained_and_centred() {{
-        let dst = Rect::from_xywh(10.0, 20.0, 80.0, 40.0);
-        let b = launcher_mark("steam", dst).unwrap().compute_tight_bounds();
-        assert!(b.width() <= dst.width() + 0.5 && b.height() <= dst.height() + 0.5);
-        let (cx, cy) = (b.center_x(), b.center_y());
-        assert!(
-            (cx - dst.center_x()).abs() < 1.0,
-            "off-centre horizontally: {{cx}}"
-        );
-        assert!(
-            (cy - dst.center_y()).abs() < 1.0,
-            "off-centre vertically: {{cy}}"
-        );
     }}
 }}
 """,

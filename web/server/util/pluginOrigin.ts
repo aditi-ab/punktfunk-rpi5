@@ -38,7 +38,12 @@ export function isPluginUiPath(pathname: string): boolean {
  * one, so this can never advertise a port nothing is listening on.
  */
 export function pluginOriginPort(): number | null {
-	const raw = process.env.PUNKTFUNK_UI_PLUGIN_PORT_ACTIVE;
+	return activePort("PUNKTFUNK_UI_PLUGIN_PORT_ACTIVE");
+}
+
+/** A port the entry stamped after a successful bind, or `null` when it stamped none. */
+function activePort(name: string): number | null {
+	const raw = process.env[name];
 	const port = raw ? Number(raw) : Number.NaN;
 	return Number.isInteger(port) && port > 0 ? port : null;
 }
@@ -61,9 +66,7 @@ export function isLoopbackBind(bind: string | null): boolean {
 
 /** The console's own port, for the plugin origin's `frame-ancestors`. */
 export function consoleOriginPort(): number | null {
-	const raw = process.env.PUNKTFUNK_UI_CONSOLE_PORT_ACTIVE;
-	const port = raw ? Number(raw) : Number.NaN;
-	return Number.isInteger(port) && port > 0 ? port : null;
+	return activePort("PUNKTFUNK_UI_CONSOLE_PORT_ACTIVE");
 }
 
 /**
@@ -89,16 +92,29 @@ export function consoleOriginScheme(): "http" | "https" | null {
 }
 
 /**
- * The `frame-ancestors` source naming the console, as a pure rule over the three things that can
- * know the scheme — kept separate from the request so it can be tested, because the bug it exists
- * to prevent is invisible in a header (`http://…` looks perfectly well-formed) and only shows up as
- * a plugin panel that never fills in.
+ * The scheme the browser's address bar shows, for `frame-ancestors` and the CSRF origin check.
  *
  * Precedence, and why:
  *  1. `x-forwarded-proto` — something in front terminated TLS, so it, not us, knows what the
  *     browser's address bar says. The only case where the two legitimately differ.
  *  2. the scheme the listener was built with — the normal path, stamped at bind time.
  *  3. the request's own scheme — last resort (nothing stamped: `vite dev`, or a direct import).
+ */
+export function browserScheme(o: {
+	forwardedProto?: string | null;
+	listenerScheme?: "http" | "https" | null;
+	requestScheme: string;
+}): string {
+	const forwarded = o.forwardedProto?.split(",")[0]?.trim().toLowerCase();
+	return forwarded === "https" || forwarded === "http"
+		? forwarded
+		: (o.listenerScheme ?? o.requestScheme.replace(/:$/, ""));
+}
+
+/**
+ * The `frame-ancestors` source naming the console, as a pure rule kept apart from the request so
+ * it can be tested: a wrong scheme is invisible in the header (`http://…` looks well-formed) and
+ * only shows up as a plugin panel that never fills in.
  */
 export function frameAncestorSource(o: {
 	forwardedProto?: string | null;
@@ -107,10 +123,5 @@ export function frameAncestorSource(o: {
 	hostname: string;
 	port: number;
 }): string {
-	const forwarded = o.forwardedProto?.split(",")[0]?.trim().toLowerCase();
-	const scheme =
-		forwarded === "https" || forwarded === "http"
-			? forwarded
-			: (o.listenerScheme ?? o.requestScheme.replace(/:$/, ""));
-	return `${scheme}://${o.hostname}:${o.port}`;
+	return `${browserScheme(o)}://${o.hostname}:${o.port}`;
 }

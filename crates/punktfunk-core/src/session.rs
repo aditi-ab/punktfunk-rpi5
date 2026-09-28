@@ -107,8 +107,23 @@ pub struct Session {
 /// frames return as the last shard lands, so this is reassembly completion. CLOCK_REALTIME
 /// to match `pts_ns` and the skew handshake — not monotonic; the math is cross-machine.
 fn stamp_received(mut f: Frame) -> Frame {
-    f.received_ns = crate::stats::now_realtime_ns();
+    f.received_ns = crate::quic::wall_clock_ns();
     f
+}
+
+/// Write one packet's plaintext at its final wire offset: `seq(8) ‖ header ‖ body ‖
+/// TAG_LEN zeros` for a sealed wire (`seq` is `Some`), `header ‖ body` in the clear.
+/// [`Session::open_from_wire`] reads the sealed layout back.
+fn stage_wire(wire: &mut Vec<u8>, seq: Option<u64>, hdr: &PacketHeader, body: &[u8]) {
+    wire.clear();
+    if let Some(seq) = seq {
+        wire.extend_from_slice(&seq.to_be_bytes());
+    }
+    wire.extend_from_slice(hdr.as_bytes());
+    wire.extend_from_slice(body);
+    if seq.is_some() {
+        wire.resize(wire.len() + crate::crypto::TAG_LEN, 0);
+    }
 }
 
 mod perf;
@@ -430,13 +445,8 @@ impl Session {
             }
             let wire = &mut wires[used];
             used += 1;
-            let seq = *next_seq;
+            stage_wire(wire, Some(*next_seq), hdr, body);
             *next_seq = next_seq.wrapping_add(1);
-            wire.clear();
-            wire.extend_from_slice(&seq.to_be_bytes());
-            wire.extend_from_slice(hdr.as_bytes());
-            wire.extend_from_slice(body);
-            wire.resize(wire.len() + crate::crypto::TAG_LEN, 0);
             bytes += wire.len() as u64;
             if is_data && used - chunk_start >= SEAL_CHUNK_SHARDS {
                 hand_chunk(
@@ -616,9 +626,8 @@ impl Session {
         };
         let mut wires = std::mem::take(wire_pool);
         let mut used = 0usize;
-        // Packetize: plaintext at the final wire offset (`seq(8) ‖ header(40) ‖ shard ‖
-        // tag(16)` with crypto; `header ‖ shard` off). Nonce advances in emission order;
-        // sealing is a later pass so it can split across lanes.
+        // Packetize through `stage_wire`. Nonce advances in emission order; sealing is a
+        // later pass so it can split across lanes.
         let seq_base = *next_seq;
         let encrypting = crypto.is_some();
         let result = {
@@ -630,18 +639,8 @@ impl Session {
                 }
                 let wire = &mut wires[*used];
                 *used += 1;
-                let seq = *next_seq;
+                stage_wire(wire, encrypting.then_some(*next_seq), hdr, body);
                 *next_seq = next_seq.wrapping_add(1);
-                wire.clear();
-                if encrypting {
-                    wire.extend_from_slice(&seq.to_be_bytes());
-                    wire.extend_from_slice(hdr.as_bytes());
-                    wire.extend_from_slice(body);
-                    wire.resize(wire.len() + crate::crypto::TAG_LEN, 0);
-                } else {
-                    wire.extend_from_slice(hdr.as_bytes());
-                    wire.extend_from_slice(body);
-                }
                 Ok(())
             };
             run(packetizer, coder_ref, &mut emit)

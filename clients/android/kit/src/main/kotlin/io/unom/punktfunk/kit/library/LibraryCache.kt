@@ -1,5 +1,6 @@
 package io.unom.punktfunk.kit.library
 
+import io.unom.punktfunk.kit.security.KnownHost
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -152,5 +153,12 @@ class LibraryCache(private val directory: File) {
     companion object {
         /** The app's standard location for this cache, under Android's evictable cache dir. */
         fun standard(cacheDir: File): LibraryCache = LibraryCache(File(cacheDir, "punktfunk-library"))
+
+        /**
+         * The key a host's catalog is filed under, in both shells: the saved record's id, so a
+         * re-addressed host keeps its shelf, else the pin. An unpinned host is never fetched, so
+         * it never needs a key of its own.
+         */
+        fun keyFor(saved: KnownHost?, fpHex: String): String = saved?.id ?: fpHex
     }
 }

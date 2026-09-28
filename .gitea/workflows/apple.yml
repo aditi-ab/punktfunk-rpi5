@@ -23,13 +23,9 @@
 # and the two files' `paths:` filters had already drifted apart, so it was possible for one to fire
 # without the other. Merging is what makes `needs: swift` expressible. Do not split them again.
 #
-# The trigger list is deliberately NARROW on crates/: scripts/build-xcframework.sh builds
-# `clients/apple/native`, whose path deps on Apple are `punktfunk-core`, `pf-console-ui` and
-# `pf-client-core` (default features off: no further path deps). VERIFY THAT BEFORE TRUSTING IT:
-#     grep -n 'path = ' clients/apple/native/Cargo.toml crates/pf-console-ui/Cargo.toml
-# A new path dep on the Apple side means a new line here. Cargo.lock is a partial safety net (it
-# moves when the dep is ADDED) but not a complete one — later edits to that crate would not fire
-# this workflow. This is the same class of gap flatpak.yml documents.
+# The trigger list is deliberately NARROW on crates/: it names the path crates
+# scripts/build-xcframework.sh compiles into `clients/apple/native` for Apple targets.
+# scripts/ci/check-workflow-paths.py fails CI when one is missing.
 #
 # ── Signing / distribution notes (all of these belong to `distribute`) ────────────────────────────
 #
@@ -100,7 +96,9 @@ on:
       - 'crates/punktfunk-core/**'
       - 'crates/pf-console-ui/**'
       - 'crates/pf-client-core/**'
+      - 'crates/pf-bitstream/**'
       - 'clients/apple/**'
+      - 'clients/shared/**'
       - 'scripts/build-xcframework.sh'
       - 'scripts/ci/ensure-sccache.sh'
       - 'scripts/ci/ensure-metal-toolchain.sh'
@@ -119,7 +117,9 @@ on:
       - 'crates/punktfunk-core/**'
       - 'crates/pf-console-ui/**'
       - 'crates/pf-client-core/**'
+      - 'crates/pf-bitstream/**'
       - 'clients/apple/**'
+      - 'clients/shared/**'
       - 'scripts/build-xcframework.sh'
       - 'scripts/ci/ensure-sccache.sh'
       - 'scripts/ci/ensure-metal-toolchain.sh'

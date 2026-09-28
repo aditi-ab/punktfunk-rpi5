@@ -14,12 +14,14 @@
 pub mod client;
 pub mod cuda;
 pub mod egl;
+pub mod gbm;
 // Shared worker rails (SEQPACKET ± `SCM_RIGHTS`, pinned-exe spawn, reaping).
 // Message body is generic; `proto` is this worker's vocabulary only.
 pub mod ipc;
 pub mod proto;
 #[cfg(test)]
 mod tiled_spike;
+pub mod vkdev;
 pub mod vkslot;
 pub mod vulkan;
 pub mod worker;
@@ -28,7 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 pub use cuda::DeviceBuffer;
 pub use egl::{DmabufPlane, EglImporter};
-pub use proto::{ConvertOut, ConvertSrc, CursorRect};
+pub use proto::{ConvertOut, ConvertSrc, CursorRect, ImportKind};
 
 /// `(st_dev, st_ino)` of an open fd. Stable across dups and `SCM_RIGHTS` re-numbering; a
 /// dma-buf keeps its inode for life, so import caches key on it.
@@ -78,14 +80,11 @@ pub fn enabled() -> bool {
     flag_opt("PUNKTFUNK_ZEROCOPY").unwrap_or(true)
 }
 
-/// GPU RGB→NV12 before NVENC. Default ON: NVENC's internal CSC otherwise
-/// runs on the SM the game saturates. `PUNKTFUNK_NV12=0` restores RGB/BGRx.
-/// LINEAR (gamescope/Vulkan-bridge) captures ignore this.
 /// `PUNKTFUNK_NVENC_RAW=0` keeps the NVENC lane on the import path: the capture converts each
 /// frame into a CUDA buffer and the encoder copies it into a slot. Default on: the capture
 /// hands the encoder the held dmabuf and the worker's fused pass writes the slot directly.
 pub fn nvenc_raw_enabled() -> bool {
-    std::env::var("PUNKTFUNK_NVENC_RAW").as_deref() != Ok("0")
+    flag_opt("PUNKTFUNK_NVENC_RAW").unwrap_or(true)
 }
 
 /// Can this box run the fused convert at all? Asks a worker to export the convert timeline,
@@ -114,6 +113,9 @@ pub fn fused_convert_available() -> bool {
     })
 }
 
+/// GPU RGB→NV12 before NVENC. Default ON: NVENC's internal CSC otherwise
+/// runs on the SM the game saturates. `PUNKTFUNK_NV12=0` restores RGB/BGRx.
+/// LINEAR (gamescope/Vulkan-bridge) captures ignore this.
 pub fn nv12_enabled() -> bool {
     flag_opt("PUNKTFUNK_NV12").unwrap_or(true)
 }
@@ -147,8 +149,10 @@ impl Importer {
         }
     }
 
+    /// One dmabuf → CUDA import as `kind`; see [`EglImporter::import`].
     pub fn import(
         &mut self,
+        kind: ImportKind,
         plane: &DmabufPlane,
         width: u32,
         height: u32,
@@ -156,62 +160,8 @@ impl Importer {
         modifier: Option<u64>,
     ) -> anyhow::Result<DeviceBuffer> {
         match self {
-            Importer::Remote(r) => r.import(plane, width, height, fourcc, modifier),
-            Importer::InProc(i) => i.import(plane, width, height, fourcc, modifier),
-        }
-    }
-
-    pub fn import_nv12(
-        &mut self,
-        plane: &DmabufPlane,
-        width: u32,
-        height: u32,
-        fourcc: u32,
-        modifier: Option<u64>,
-    ) -> anyhow::Result<DeviceBuffer> {
-        match self {
-            Importer::Remote(r) => r.import_nv12(plane, width, height, fourcc, modifier),
-            Importer::InProc(i) => i.import_nv12(plane, width, height, fourcc, modifier),
-        }
-    }
-
-    /// Tiled dmabuf → GPU YUV444 → one stacked 3-plane CUDA buffer.
-    pub fn import_yuv444(
-        &mut self,
-        plane: &DmabufPlane,
-        width: u32,
-        height: u32,
-        fourcc: u32,
-        modifier: Option<u64>,
-    ) -> anyhow::Result<DeviceBuffer> {
-        match self {
-            Importer::Remote(r) => r.import_yuv444(plane, width, height, fourcc, modifier),
-            Importer::InProc(i) => i.import_yuv444(plane, width, height, fourcc, modifier),
-        }
-    }
-
-    pub fn import_linear(
-        &mut self,
-        plane: &DmabufPlane,
-        width: u32,
-        height: u32,
-    ) -> anyhow::Result<DeviceBuffer> {
-        match self {
-            Importer::Remote(r) => r.import_linear(plane, width, height),
-            Importer::InProc(i) => i.import_linear(plane, width, height),
-        }
-    }
-
-    /// LINEAR dmabuf → Vulkan-bridge CSC → two-plane NV12 (gamescope analogue of [`import_nv12`](Self::import_nv12)).
-    pub fn import_linear_nv12(
-        &mut self,
-        plane: &DmabufPlane,
-        width: u32,
-        height: u32,
-    ) -> anyhow::Result<DeviceBuffer> {
-        match self {
-            Importer::Remote(r) => r.import_linear_nv12(plane, width, height),
-            Importer::InProc(i) => i.import_linear_nv12(plane, width, height),
+            Importer::Remote(r) => r.import(kind, plane, width, height, fourcc, modifier),
+            Importer::InProc(i) => i.import(kind, plane, width, height, fourcc, modifier),
         }
     }
 
@@ -596,7 +546,7 @@ pub fn nv12_selftest() -> anyhow::Result<()> {
     let mut importer = EglImporter::new()?;
     let nv12 = importer.convert_rgba_for_test(&rgba, W, H)?;
     let (uv_ptr, uv_pitch) = nv12
-        .uv
+        .uv()
         .ok_or_else(|| anyhow::anyhow!("self-test buffer is not NV12"))?;
     let y_host = cuda::read_plane_to_host(nv12.ptr, nv12.pitch, W as usize, H as usize)?;
     let uv_host = cuda::read_plane_to_host(uv_ptr, uv_pitch, (W as usize / 2) * 2, H as usize / 2)?;

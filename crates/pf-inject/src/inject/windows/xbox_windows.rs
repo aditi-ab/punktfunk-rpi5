@@ -16,15 +16,12 @@
 //! contract. `apply_rich` / `clear_rich` / `neutralize_gyro` are no-ops; motion is
 //! decoded and dropped (`GamepadPref::motion_reaches`).
 
-use super::dualsense_windows::{
-    create_swdevice, driver_marks, publish_input, stamp_pad, OutputDrain, SwDeviceProfile, SHM_SIZE,
-};
-use super::gamepad_raii::PadChannel;
+use super::gamepad_raii::SwDeviceProfile;
+use super::pad_shm::ShmPad;
 use super::xbox_proto::{neutral_xbox_report, parse_xbox_output, serialize_xbox_state, XboxState};
 use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::Result;
 use punktfunk_core::quic::RichInput;
-use std::time::Duration;
 
 /// Xbox identity this backend can present. Same transport as `WinDsIdentity`
 /// (`super::dualsense_windows`); only PnP identity and `device_type` differ.
@@ -162,14 +159,7 @@ fn inf_hwid(id: &WinXboxIdentity) -> &'static str {
 /// Virtual Xbox pad: `SwDeviceCreate`'d `pf_xbox_<index>` plus the sealed
 /// channel. Drop removes the devnode and closes both sections.
 pub struct XboxWinPad {
-    /// RAII: `SwDeviceClose` on drop.
-    _sw: Option<super::gamepad_raii::SwDevice>,
-    channel: PadChannel,
-    attach: super::gamepad_raii::DriverAttach,
-    /// v2.3 input-seqlock generation — see `publish_input`.
-    input_gen: u32,
-    /// Ring drain (v2.1+) or legacy latest-slot seq (old driver).
-    drain: OutputDrain,
+    shm: ShmPad,
     /// Rumble `enable` bytes already logged for this pad — see [`XboxWinPad::service`].
     seen_enable: Vec<u8>,
     /// Input bytes the identity's descriptor declares; Share rides past One S / Elite's 16.
@@ -177,91 +167,64 @@ pub struct XboxWinPad {
 }
 
 impl XboxWinPad {
-    /// Stamp `device_type` first, then pad index, then the neutral report, then
-    /// the magic last, and spawn the Bluetooth Xbox identity's devnode.
+    /// Spawn the Bluetooth Xbox identity's devnode.
     fn open(index: u8, id: &WinXboxIdentity) -> Result<XboxWinPad> {
-        let boot_name = pf_driver_proto::gamepad::pad_boot_name(index);
-        let mut channel = PadChannel::create(boot_name.clone(), SHM_SIZE)?;
-        // `2` = host drains the v2.2 long ring (see DualSense open).
-        stamp_pad(channel.data(), id.devtype, index, 2, &neutral_xbox_report());
-        let inst = format!("{}_{index}", id.instance_prefix);
-        let hwid = inf_hwid(id);
-        let (hsw, instance_id) = create_swdevice(&SwDeviceProfile {
-            instance: &inst,
-            // Per-family tag. The three identities share it: only one can hold
-            // a given pad index, so their containers never collide.
-            container_tag: 0x5046_5842, // "PFXB"
-            container_index: index,
-            hwid,
-            usb_vid_pid: id.usb_vid_pid,
-            // Bluetooth pad, not USB composite — no interface number. Deck
-            // Steam promotion needs `&MI_02`; Xbox does not.
-            usb_mi: None,
-            description: id.description,
-            // The HID child becomes `HID\VID_045E&PID_…&IG_00`: Steam merges a pad's views by the
-            // VID/PID in its path, and under `punktfunk` it listed one Xbox pad twice.
-            enumerator: id.usb_vid_pid,
-        })?; // Swallowing latched the slot to a pad with no devnode.
-        channel.bind_devnode(
-            index as u32,
-            instance_id.clone(),
-            super::gamepad_raii::ProofTransport::HidFeatureReport,
-        );
-        let _sw = Some(super::gamepad_raii::SwDevice::new(hsw));
-        // Driver must read `device_type` before hidclass asks for descriptors,
-        // or the pad enumerates as DualSense. 1500 ms bounds that wait.
-        channel.deliver_eager(Duration::from_millis(1500));
+        let shm = ShmPad::open(
+            index,
+            id.devtype,
+            &neutral_xbox_report(),
+            &SwDeviceProfile {
+                instance: &format!("{}_{index}", id.instance_prefix),
+                // Per-family tag. The three identities share it: only one can hold
+                // a given pad index, so their containers never collide.
+                container_tag: 0x5046_5842, // "PFXB"
+                container_index: index,
+                hwid: inf_hwid(id),
+                usb_vid_pid: Some(id.usb_vid_pid),
+                // Bluetooth pad, not USB composite — no interface number. Deck
+                // Steam promotion needs `&MI_02`; Xbox does not.
+                usb_mi: None,
+                description: id.description,
+                // The HID child becomes `HID\VID_045E&PID_…&IG_00`: Steam merges a pad's views by
+                // the VID/PID in its path, and under `punktfunk` it listed one Xbox pad twice.
+                enumerator: id.usb_vid_pid,
+            },
+        )?;
         Ok(XboxWinPad {
-            _sw,
-            channel,
-            attach: super::gamepad_raii::DriverAttach::new(
-                hwid,
-                "pf_gamepad.inf", // one package, every identity
-                "C:\\Windows\\ServiceProfiles\\LocalService\\AppData\\Local\\Temp\\pf_gamepad-driver.log",
-                boot_name,
-                instance_id,
-            ),
-            input_gen: 0,
-            drain: OutputDrain::new(),
+            shm,
             seen_enable: Vec::new(),
             report_len: pf_driver_proto::xbox::input_len(id.devtype),
         })
     }
 
-    /// Publish the identity's slice of `st` under the v2.3 seqlock so a driver read cannot land
-    /// mid-copy.
+    /// Publish the identity's slice of `st`.
     fn write_state(&mut self, st: &XboxState) {
         let r = serialize_xbox_state(st);
-        publish_input(
-            self.channel.data(),
-            &mut self.input_gen,
-            &r[..self.report_len],
-        );
+        self.shm.publish(&r[..self.report_len]);
     }
 
     fn service(&mut self) -> (Option<(u16, u16, u16, u16)>, bool) {
-        self.channel.pump();
-        let (proto, rev) = driver_marks(self.channel.data());
-        self.attach.observe_pad(proto, rev);
         let mut rumble = None;
-        let shm = self.channel.data();
+        let mut first_seen = Vec::new();
         let seen = &mut self.seen_enable;
-        let mailbox = self.channel.boot_name();
-        let resync = self.drain.drain(shm, |bytes| {
+        let resync = self.shm.poll(|bytes, _| {
             if let Some(r) = parse_xbox_output(bytes) {
-                // Which motor bits xinputhid sets is unmeasured; log each new mask once.
                 if !seen.contains(&bytes[1]) {
                     seen.push(bytes[1]);
-                    tracing::debug!(
-                        mailbox,
-                        enable = %format!("{:#04x}", bytes[1]),
-                        raw = ?bytes,
-                        "xbox rumble enable byte"
-                    );
+                    first_seen.push(bytes.to_vec());
                 }
                 rumble = Some(r); // last rumble-carrying report wins
             }
         });
+        // Which motor bits xinputhid sets is unmeasured; log each new mask once.
+        for raw in first_seen {
+            tracing::debug!(
+                mailbox = self.shm.mailbox(),
+                enable = %format!("{:#04x}", raw[1]),
+                raw = ?raw,
+                "xbox rumble enable byte"
+            );
+        }
         (rumble, resync)
     }
 }
@@ -316,32 +279,12 @@ impl PadProto for XboxWinProto {
         Ok(p)
     }
 
-    fn neutral(&self) -> XboxState {
-        XboxState::default()
-    }
-
-    /// Frame fully replaces state — no rich-plane fields to preserve.
     fn merge_frame(&self, _prev: &XboxState, f: &punktfunk_core::input::GamepadFrame) -> XboxState {
-        XboxState::from_gamepad(
-            f.buttons,
-            f.left_trigger,
-            f.right_trigger,
-            f.ls_x,
-            f.ls_y,
-            f.rs_x,
-            f.rs_y,
-        )
+        XboxState::from_frame(f)
     }
 
     /// No rich plane on an Xbox pad.
     fn apply_rich(&self, _st: &mut XboxState, _rich: RichInput) {}
-
-    /// No motion plane, so never stale gyro.
-    fn neutralize_gyro(&self, _st: &mut XboxState) -> bool {
-        false
-    }
-
-    fn clear_rich(&self, _st: &mut XboxState) {}
 
     fn write_state(&self, pad: &mut XboxWinPad, st: &XboxState) {
         pad.write_state(st);

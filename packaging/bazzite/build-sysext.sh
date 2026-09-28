@@ -62,6 +62,7 @@ for tool in rpm2cpio cpio mksquashfs matchpathcon; do
 done
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+. "$HERE/../linux/sysext-lib.sh"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 
@@ -98,22 +99,13 @@ if [ -d "$STAGE/etc" ]; then
 fi
 rm -rf "${STAGE:?}/var"   # rpm ghosts etc. — nothing outside /usr may remain
 
-# The HDR-capable gamescope, when one was built (see --gamescope-stage in the header). Verified by its
-# banner marker rather than trusted by filename: an unpatched gamescope shipped under this name
-# would make the host promise HDR it cannot deliver, and the punktfunk/1 Welcome cannot take that
-# back mid-session.
+# The HDR-capable gamescope, when one was built (see --gamescope-stage in the header), verified by
+# its banner and its WSI layer rather than trusted by filename.
 if [ -n "$GAMESCOPE" ]; then
   GS_BIN="$GAMESCOPE/usr/bin/punktfunk-gamescope"
   GS_LAYER_SO="$GAMESCOPE/usr/lib/punktfunk/libVkLayer_PUNKTFUNK_gamescope_wsi.so"
   GS_LAYER_JSON="$GAMESCOPE/usr/lib/punktfunk/vulkan/implicit_layer.d/punktfunk_gamescope_wsi.json"
-  [ -x "$GS_BIN" ] || { echo "no such executable: $GS_BIN" >&2; exit 1; }
-  "$GS_BIN" --version 2>&1 | grep -q '+pfhdr' || {
-    echo "$GS_BIN has no +pfhdr marker — it is not a punktfunk HDR build" >&2; exit 1; }
-  # Fatal for the same reason the marker check is: an image carrying the compositor without its
-  # layer streams HDR while every game inside it renders SDR, and says nothing about why.
-  for f in "$GS_LAYER_SO" "$GS_LAYER_JSON"; do
-    [ -f "$f" ] || { echo "$f missing — the gamescope stage has no WSI layer" >&2; exit 1; }
-  done
+  pf_verify_gamescope "$GAMESCOPE" "the gamescope stage $GAMESCOPE"
   install -Dm0755 "$GS_BIN" "$STAGE/usr/bin/punktfunk-gamescope"
   install -Dm0755 "$GS_LAYER_SO" \
     "$STAGE/usr/lib/punktfunk/libVkLayer_PUNKTFUNK_gamescope_wsi.so"
@@ -153,107 +145,11 @@ SYSEXT_VERSION_ID=$PF_VR
 EXTENSION_RELOAD_MANAGER=1
 EOF
 
-# CAP_SYS_NICE on the ENCODE WORKER, never on the host — and an assertion of BOTH halves.
-#
-# 0.26.0-1 setcap'd the staged HOST binary here for the GPU-priority lever. mksquashfs records
-# security.capability, so the capability really did ship: verified by mounting the published
-# punktfunk-0.26.0-1-x86-64.raw, where `getcap usr/bin/punktfunk-host` reports `cap_sys_nice=ep`.
-# That broke desktop streaming on every Bazzite KDE box, field-reported as
-# "KWin does not expose zkde_screencast_unstable_v1 to this client".
-#
-# KWin advertises its restricted protocols (zkde_screencast_unstable_v1 for the virtual output,
-# org_kde_kwin_fake_input for input) only to a client it can IDENTIFY, by resolving that client's
-# /proc/<pid>/exe and matching it against an installed .desktop's Exec= — the image ships
-# usr/share/applications/io.unom.Punktfunk.Host.desktop for exactly that. The kernel refuses that
-# readlink to any reader whose effective set is not a superset of the target's PERMITTED set
-# (cap_ptrace_access_check), and KWin holds no capabilities. So a capability on the HOST in this
-# image makes it unidentifiable and every Desktop-mode session dies. Full matrix, including why
-# neither prctl(PR_SET_DUMPABLE, 1) nor systemd AmbientCapabilities= rescues it, in
-# packaging/arch/punktfunk-host.install.
-#
-# usr/bin/punktfunk-encode-worker is the OTHER binary: a separate executable (never a hardlink or a
-# host subcommand — a shared inode shares the capability and re-creates the above), spawned per
-# PyroWave session, speaking one socketpair to its parent and touching neither Wayland nor D-Bus
-# nor the network. Nothing resolves ITS /proc/<pid>/exe, so it can carry the capability the lever
-# needs. This is the ONLY place the sysext can acquire it: a merged sysext's /usr is a read-only
-# squashfs, and it cannot ride in from the RPM either — the spec declares %caps(cap_sys_nice=ep),
-# but rpm keeps capabilities in its own header and `rpm2cpio | cpio` carries only the payload, so
-# the staged file arrives with none. mksquashfs DOES record security.capability (only
-# security.selinux is excluded below), so a setcap on the staging tree is what lands in the image.
-#
-# Needs CAP_SETFCAP, i.e. root (or fakeroot). A plain-user build simply cannot, and that is NOT
-# fatal: an uncapped worker still encodes, at default priority. Warn and carry on rather than fail
-# a release over a pacing lever.
-#
-# `getcap` on a file with no capability exits 0 and prints nothing, so an empty read is unambiguous.
-# The output form differs across libcap versions ("path cap_sys_nice=ep" since ~2.36, "path =
-# cap_sys_nice+ep" before), hence the normalizer.
-_pf_caps_of() {
-  # -> canonical "cap_sys_nice=ep", or "" when the file carries no capability.
-  local raw; raw="$(getcap "$1" 2>/dev/null || true)"
-  [ -n "$raw" ] || { printf ''; return 0; }
-  printf '%s' "${raw#* }" | sed -e 's/^= *//' -e 's/+/=/' -e 's/[[:space:]]*$//'
-}
-
-# BEFORE granting: refuse a capability that arrived from somewhere else. The setcap below would
-# overwrite it and ship a correct-looking image while the surprise — a stray %caps() in the spec, a
-# payload from an unexpected source — went unreported on every other channel. Order matters: assert
-# first, then grant, or the "anything else" arm can never fire.
-if command -v getcap >/dev/null 2>&1 && [ -f "$STAGE/usr/bin/punktfunk-encode-worker" ]; then
-  arrived_caps="$(_pf_caps_of "$STAGE/usr/bin/punktfunk-encode-worker")"
-  case "$arrived_caps" in
-    ''|cap_sys_nice=ep) : ;;
-    *)
-      echo "ERROR: staged usr/bin/punktfunk-encode-worker ARRIVED carrying '$arrived_caps'." >&2
-      echo "       Nothing upstream of this script should grant it anything: rpm keeps capabilities" >&2
-      echo "       in its own header and 'rpm2cpio | cpio' carries only the payload. Find out what" >&2
-      echo "       did — it is granting the same thing on the plain RPM path, unchecked." >&2
-      exit 1 ;;
-  esac
-fi
-
-if [ -f "$STAGE/usr/bin/punktfunk-encode-worker" ]; then
-  if setcap 'cap_sys_nice=ep' "$STAGE/usr/bin/punktfunk-encode-worker" 2>/dev/null; then
-    echo "granted CAP_SYS_NICE to usr/bin/punktfunk-encode-worker (GPU-priority lever active)"
-  else
-    echo "WARNING: could not setcap CAP_SYS_NICE on usr/bin/punktfunk-encode-worker (need" >&2
-    echo "         root/CAP_SETFCAP) — the image ships without it and PyroWave encodes at" >&2
-    echo "         default GPU priority." >&2
-  fi
-fi
-
-# Assert the final matrix rather than trust it. A merged sysext's /usr is a read-only squashfs, so
-# a bad image cannot be repaired on the box — the image is the only place this can be got right.
-#
-#   host   -> MUST be empty. Hard fail. (The RPM payload carries no capabilities today, but the
-#             spec is one `%caps()` away from changing that and this build would bake it in.)
-#   worker -> MUST be exactly cap_sys_nice=ep if it carries anything at all. MISSING IS NOT AN
-#             ERROR (a plain-user build cannot setcap; best-effort by design), but a DIFFERENT or
-#             WIDER capability is — and a read-only image is not the place to discover it.
-if command -v getcap >/dev/null 2>&1; then
-  if [ -f "$STAGE/usr/bin/punktfunk-host" ]; then
-    staged_caps="$(_pf_caps_of "$STAGE/usr/bin/punktfunk-host")"
-    if [ -n "$staged_caps" ]; then
-      echo "ERROR: staged usr/bin/punktfunk-host carries capabilities: $staged_caps" >&2
-      echo "       A capability makes the host unidentifiable to KWin and breaks every Desktop-mode" >&2
-      echo "       session on a merged image, which cannot be repaired on the box (read-only /usr)." >&2
-      echo "       The GPU-priority capability belongs on usr/bin/punktfunk-encode-worker, never here." >&2
-      exit 1
-    fi
-  fi
-  if [ -f "$STAGE/usr/bin/punktfunk-encode-worker" ]; then
-    worker_caps="$(_pf_caps_of "$STAGE/usr/bin/punktfunk-encode-worker")"
-    case "$worker_caps" in
-      '')             echo "note: usr/bin/punktfunk-encode-worker ships uncapped — PyroWave encodes at default GPU priority" ;;
-      cap_sys_nice=ep) : ;;
-      *)
-        echo "ERROR: staged usr/bin/punktfunk-encode-worker carries '$worker_caps'," >&2
-        echo "       expected exactly 'cap_sys_nice=ep' (or nothing at all)." >&2
-        echo "       Refusing to bake an unexpected capability into a read-only image." >&2
-        exit 1 ;;
-    esac
-  fi
-fi
+# CAP_SYS_NICE on the encode worker, never the host, then both halves of the matrix
+# (packaging/linux/sysext-lib.sh). The spec's %caps cannot reach the image: rpm keeps capabilities
+# in its header and `rpm2cpio | cpio` carries only the payload. mksquashfs keeps security.capability
+# (only security.selinux is excluded below). A plain-user build ships the worker uncapped.
+pf_seal_caps "$STAGE" "rpm keeps capabilities in its own header and 'rpm2cpio | cpio' carries only the payload."
 
 # SELinux labels as pseudo-xattrs (see header). matchpathcon resolves each target path against
 # the targeted policy's file_contexts; <<none>> means "no specific entry" — skip those (the

@@ -240,7 +240,8 @@ struct RetiredRing {
     retired_at: Instant,
 }
 
-/// One decode-output plane: STORAGE (decode writes) + SAMPLED (presenter CSC).
+/// One decode-output plane: STORAGE (decode writes) + SAMPLED (presenter CSC), in
+/// device-local memory. No such memory type is an error.
 ///
 /// # Safety
 ///
@@ -283,7 +284,7 @@ unsafe fn make_plane(
                         .property_flags
                         .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
             })
-            .unwrap_or(0);
+            .context("no device-local memory type for a PyroWave plane")?;
         let alloc = vk::MemoryAllocateInfo::default()
             .allocation_size(req.size)
             .memory_type_index(ti);

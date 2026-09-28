@@ -89,8 +89,8 @@ ndk = { version = "0.9", features = ["media", "audio", "nativewindow", "api-leve
 ndk-sys = { version = "0.6", features = ["media"] }
 # setpriority/gettid to raise the decode thread toward URGENT_DISPLAY (see decode::boost_thread_priority).
 libc = "0.2"
-# Opus decode for the host→client audio plane (0xC9: 48 kHz stereo, 5 ms frames). Same crate the
-# host + Linux client use. audiopus_sys vendors libopus (pure C) and builds it static via cmake —
+# Opus decode for pad audio (0xD1); the main audio plane and the mic uplink run in core. Same
+# crate the host + Linux client use. audiopus_sys vendors libopus (pure C) and builds it static via cmake —
 # the cargo-ndk build sets LIBOPUS_STATIC=1/LIBOPUS_NO_PKG=1 so it links the bundled lib, not the host's.
 opus = "0.3"
 # Tier-A pad audio (WP9). Android's audio framework denylists the DualSense's output by VID/PID,

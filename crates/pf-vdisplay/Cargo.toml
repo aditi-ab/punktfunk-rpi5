@@ -15,7 +15,9 @@ description = "punktfunk host virtual-display orchestration: per-compositor Linu
 publish = false
 
 [dependencies]
-punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
+# `Mode`, `CompositorPref` and `quic::REFUSED_REASON_MAX`, all outside the `quic` feature, so the
+# display crate never builds quinn, rustls or opus.
+punktfunk-core = { path = "../punktfunk-core", default-features = false }
 # `HdrMeta` in the `VirtualDisplay` trait (the client's mastering volume) + the DXGI capture
 # identity and the CTA-861.3 luminance fields on Windows. A leaf: no QUIC, no codec.
 pf-frame = { path = "../pf-frame" }

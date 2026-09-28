@@ -2,7 +2,7 @@
 // and the grant that follows a save. Only paths new in that save are granted: the form's old value
 // came from the plugin, and a path the plugin filled in itself is not the operator's word. A save
 // that drops a path lets the form go of it; the host keeps what another form or the operator holds.
-import { loopbackTls, mgmtToken, mgmtUrl } from "./auth";
+import { mgmtFetch } from "./forward";
 import { callPlugin } from "./pluginProxy";
 
 interface Node {
@@ -71,18 +71,12 @@ export function keepAfterDrop(
 	return dropped ? kept : null;
 }
 
-const accessPost = (id: string, route: string, body: unknown) => {
-	const base = mgmtUrl();
-	return fetch(`${base}/api/v1/plugin-access/${id}/${route}`, {
-		...(loopbackTls(base) as RequestInit | undefined),
+const accessPost = (id: string, route: string, body: unknown) =>
+	mgmtFetch(`/api/v1/plugin-access/${id}/${route}`, {
 		method: "POST",
-		headers: {
-			authorization: `Bearer ${mgmtToken()}`,
-			"content-type": "application/json",
-		},
+		headers: { "content-type": "application/json" },
 		body: JSON.stringify(body),
 	});
-};
 
 /** Grant each path to the plugin on the operator's lane, on behalf of `form`. The host refuses
  * what it would refuse a request (`~`, `~/.ssh`, the config dir, …); those come back in

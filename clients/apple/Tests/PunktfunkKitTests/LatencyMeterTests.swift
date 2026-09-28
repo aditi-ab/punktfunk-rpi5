@@ -13,9 +13,7 @@ import XCTest
 
 final class LatencyMeterTests: XCTestCase {
     private func nowRealtimeNs() -> UInt64 {
-        var ts = timespec()
-        clock_gettime(CLOCK_REALTIME, &ts)
-        return UInt64(ts.tv_sec) * 1_000_000_000 + UInt64(ts.tv_nsec)
+        UInt64(realtimeNowNs())
     }
 
     func testEmptyDrainIsNil() {

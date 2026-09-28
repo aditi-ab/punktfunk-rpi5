@@ -11,27 +11,18 @@
 // Returning a WEB `Response` whose body is the upstream's own `ReadableStream` sidesteps the
 // node-response emulation entirely: h3 hands it back as-is and the Bun entry passes it through.
 //
-// Everything else matches the catch-all: session-gated by middleware/auth.ts, mgmt bearer injected
-// server-side, TLS relaxed only for the loopback hop, 401 → 502.
+// Everything else matches the catch-all: session-gated by middleware/auth.ts, and the call itself
+// goes through `mgmtFetch`.
 import { createError, getRequestHeader, getRequestURL, type H3Event } from "h3";
-import { loopbackTls, mgmtToken, mgmtUrl } from "./auth";
+import { mgmtFetch } from "./forward";
 
 /** `path` is the host route below `/api/v1`, e.g. `events` or `session/7/pads`. */
 export async function proxySse(
 	event: H3Event,
 	path: string,
 ): Promise<Response> {
-	const token = mgmtToken();
-	if (!token) {
-		throw createError({
-			statusCode: 503,
-			statusMessage: "management token not configured",
-		});
-	}
-	const base = mgmtUrl();
 	const { search } = getRequestURL(event);
 	const headers: Record<string, string> = {
-		authorization: `Bearer ${token}`,
 		accept: "text/event-stream",
 		// Ask for no compression: a buffering encoder defeats the point of a live stream.
 		"accept-encoding": "identity",
@@ -41,27 +32,11 @@ export async function proxySse(
 	const lastId = getRequestHeader(event, "last-event-id");
 	if (lastId) headers["last-event-id"] = lastId;
 
-	const init: RequestInit = { method: "GET", headers, redirect: "manual" };
-	// Bun.fetch extension — pinned per request, never process-wide (see routes/api/[...].ts).
-	Object.assign(init, loopbackTls(base));
-
-	let upstream: Response;
-	try {
-		upstream = await fetch(`${base}/api/v1/${path}${search}`, init);
-	} catch (cause) {
-		throw createError({
-			statusCode: 502,
-			statusMessage: "management API unreachable",
-			cause,
-		});
-	}
-	if (upstream.status === 401) {
-		throw createError({
-			statusCode: 502,
-			statusMessage:
-				"management API rejected the host token (check PUNKTFUNK_MGMT_TOKEN)",
-		});
-	}
+	const upstream = await mgmtFetch(`/api/v1/${path}${search}`, {
+		method: "GET",
+		headers,
+		redirect: "manual",
+	});
 	if (!upstream.ok || !upstream.body) {
 		throw createError({
 			statusCode: 502,

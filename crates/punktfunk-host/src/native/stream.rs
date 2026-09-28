@@ -1,7 +1,8 @@
 //! Native `punktfunk/1` capture→encode→send data plane.
 //!
 //! Owns the synthetic and software protocol-test sources, speed-test probes, the paced submit,
-//! and [`SessionContext`], the per-session inputs `serve_session` hands to [`virtual_stream`].
+//! and [`SessionContext`], the per-session inputs `serve_session` hands to [`virtual_stream`],
+//! around the [`StreamCommon`] every source takes.
 //! The virtual-display loop itself is [`state::StreamState`]: bring-up in `new`, the tick loop
 //! in `run`, one file per concern under `stream/`.
 //!
@@ -9,6 +10,7 @@
 //! `PUNKTFUNK_STREAMED_AU=0` for the rebuild-free A/B levers. Evidence:
 //! `design/phase-locked-capture.md`, `design/midstream-resolution-resize.md`.
 
+use super::wiring::{SessionShared, StreamEnds};
 use super::*;
 use crate::send_pacing::{frame_driven_enabled, CaptureCredit};
 
@@ -31,7 +33,7 @@ pub(crate) use self::phase_lock::PhaseCtl;
 pub(super) use self::pipeline::{prepare_display, PrepHandle, PreparedDisplay};
 // `control.rs` bounds its spacing exemption by the same step length.
 pub(crate) use self::ramp::RAMP_STEP_MAX_MS;
-use self::send::{send_loop, ChunkMsg, FrameMsg, SendMsg, SendStats};
+use self::send::{send_loop, AuMeta, ChunkMsg, FrameMsg, SendMsg, SendStats};
 // `native.rs` asks before offering a mid-stream reconfig.
 pub(crate) use self::send::reconfig_allowed;
 use self::session_watch::{session_watch_enabled, session_watcher_loop, SessionSwitch};
@@ -544,91 +546,68 @@ fn pace_wires(
     Ok((stat, sock_ns))
 }
 
-/// Owned per-session inputs for [`virtual_stream`]. Receivers move in; the whole context moves
-/// onto the stream thread.
-pub(super) struct SessionContext {
-    pub(super) session: Session,
-    pub(super) mode: punktfunk_core::Mode,
-    pub(super) seconds: u32,
-    pub(super) stop: Arc<AtomicBool>,
+/// What every stream source takes from its session: the punched session, its schedule, the
+/// stream thread's [`StreamEnds`], the [`SessionShared`] values and the session's identity.
+/// [`SessionContext`] and [`SynthAbrContext`] both carry one.
+///
+/// [`StreamEnds`]: super::wiring::StreamEnds
+/// [`SessionShared`]: super::wiring::SessionShared
+pub(crate) struct StreamCommon {
+    pub(crate) session: Session,
+    pub(crate) mode: punktfunk_core::Mode,
+    pub(crate) seconds: u32,
+    pub(crate) stop: Arc<AtomicBool>,
     /// Set on `QUIT_CODE`. Display lease skips keep-alive linger for a user stop.
-    pub(super) quit: Arc<AtomicBool>,
+    pub(crate) quit: Arc<AtomicBool>,
     /// [`crate::events::SessionEndReason`] latch for the session summary; first write wins.
-    pub(super) end_reason: Arc<std::sync::atomic::AtomicU8>,
+    pub(crate) end_reason: Arc<std::sync::atomic::AtomicU8>,
     /// Session totals for the summary; the encode loop notes every bitrate it runs at.
-    pub(super) counters: Arc<crate::session_status::SessionCounters>,
-    pub(super) reconfig: std::sync::mpsc::Receiver<punktfunk_core::Mode>,
-    pub(super) keyframe: std::sync::mpsc::Receiver<()>,
-    /// Lost-frame range `(first, last)`. Prefer `invalidate_ref_frames` over a full IDR.
-    pub(super) rfi: std::sync::mpsc::Receiver<(u32, u32)>,
-    pub(super) bitrate_rx: std::sync::mpsc::Receiver<u32>,
-    /// Validated + ack-gated by the wire-MTU watcher. Applied between AUs only.
-    pub(super) shard_rx: std::sync::mpsc::Receiver<usize>,
+    pub(crate) counters: Arc<crate::session_status::SessionCounters>,
+    pub(crate) ends: super::wiring::StreamEnds,
+    pub(crate) shared: super::wiring::SessionShared,
+    /// Total wire budget (kbps): video + FEC + framing + audio reservation. PyroWave is identity.
+    pub(crate) bitrate_kbps: u32,
+    pub(crate) audio_reserved_kbps: u32,
+    pub(crate) shard_payload: u16,
+    pub(crate) timing_conn: Option<super::link::SessionLink>,
+    /// Without this, a mid-session probe consumes video indexes the gap detector cannot see.
+    pub(crate) probe_seq: bool,
+    pub(crate) stats: Arc<StatsRecorder>,
+    pub(crate) client_label: String,
+    pub(crate) bringup: Arc<crate::bringup::Trace>,
+    /// A clone of the data socket for the sender's kernel-queue probe; `None` on the web plane.
+    pub(crate) wire_sock: Option<std::net::UdpSocket>,
+    pub(crate) codec: crate::encode::Codec,
+    /// Per-session handles the management routes act on; published to the registry.
+    pub(crate) controls: crate::session_status::SessionControls,
+    pub(crate) client_name: Option<String>,
+    /// 10-bit alone does not imply HDR: 10-bit SDR is its own path.
+    pub(crate) hdr: bool,
+    pub(crate) bit_depth: u8,
+    pub(crate) chroma: crate::encode::ChromaFormat,
+}
+
+/// Owned per-session inputs for [`virtual_stream`]: the [`StreamCommon`] plus what a display
+/// needs. The whole context moves onto the stream thread.
+pub(super) struct SessionContext {
+    pub(super) common: StreamCommon,
     pub(super) compositor: crate::vdisplay::Compositor,
     /// Per-instance, not via `PUNKTFUNK_GAMESCOPE_NODE` — two sessions must not overwrite each other.
     pub(super) gamescope_route: Option<crate::vdisplay::GamescopeRoute>,
-    /// Total wire budget (kbps): video + FEC + framing + audio reservation. PyroWave is identity.
-    pub(super) bitrate_kbps: u32,
-    pub(super) audio_reserved_kbps: u32,
-    pub(super) shard_payload: u16,
-    /// ASIC-applied rate, not the request. Shared with pacer, console, mgmt, and climb acks.
-    pub(super) live_bitrate: Arc<AtomicU32>,
-    /// 0 = none discovered. A request already at the ceiling costs nothing to apply.
-    pub(super) encoder_ceiling: Arc<std::sync::Mutex<super::EncoderCeiling>>,
-    /// While set, refuse bitrate climbs — the network is not the bottleneck.
-    pub(super) cadence_degraded: Arc<AtomicBool>,
-    pub(super) cadence_behind_score: Arc<AtomicU32>,
-    /// [`u32::MAX`] = client too old to send a [`DeliveryReport`]. Distinguishes clean-link from
-    /// nothing-arriving: both look like `loss_ppm = 0`.
-    pub(super) client_packets_received: Arc<AtomicU32>,
     /// `Hello::bitrate_kbps == 0`. PyroWave re-resolves on a mid-stream mode switch; an explicit rate stays.
     pub(super) bitrate_auto: bool,
-    /// 8 or 10. Does not imply HDR — `hdr` is separate (10-bit SDR path).
-    pub(super) bit_depth: u8,
-    pub(super) hdr: bool,
-    pub(super) chroma: crate::encode::ChromaFormat,
-    pub(super) codec: crate::encode::Codec,
-    pub(super) probe_rx: std::sync::mpsc::Receiver<ProbeRequest>,
-    pub(super) probe_result_tx: tokio::sync::mpsc::UnboundedSender<ProbeResult>,
-    /// Corrective `Reconfigured` when a rebuild stayed at the old mode or honored a different refresh.
-    pub(super) reconfig_result_tx: tokio::sync::mpsc::UnboundedSender<Reconfigured>,
-    pub(super) retarget_tx: tokio::sync::mpsc::UnboundedSender<(u32, AckReason)>,
-    pub(super) gap_tx: tokio::sync::mpsc::UnboundedSender<u32>,
-    /// The FEC the packetizer runs at. The send loop reads this one only.
-    pub(super) fec_target: Arc<AtomicU8>,
-    /// The control task's adaptive-FEC proposal. `StreamState` publishes it to
-    /// `fec_target` once the encoder accepts the rate the proposal implies.
-    pub(super) fec_requested: Arc<AtomicU8>,
-    /// The client's proven link rate (kbps), `0` until its `LinkReport`; the
-    /// send thread paces a pinned stream against it.
-    pub(super) link_kbps: Arc<AtomicU32>,
     pub(super) conn: super::link::SessionLink,
-    pub(super) timing_conn: Option<super::link::SessionLink>,
-    pub(super) phase: Arc<PhaseCtl>,
     pub(super) cursor_forward: bool,
-    /// `true` = client draws; `false` = host composites. Always `true` (inert) for non-cap sessions.
-    pub(super) cursor_client_draws: Arc<AtomicBool>,
-    /// Depth-1 latest-wins; see [`super::cursor_fwd::CursorForwarder::tick`].
-    pub(super) cursor_shape_tx:
-        tokio::sync::watch::Sender<Option<punktfunk_core::quic::CursorShape>>,
-    /// Without this, a mid-session probe consumes video indexes the gap detector cannot see.
-    pub(super) probe_seq: bool,
-    /// The client's bring-up ramp may be served on the idle data plane
-    /// (`HOST_CAP2_RAMP`). Cleared when the send thread takes the session,
-    /// which is where the control task's probe spacing comes back.
-    pub(super) ramp_open: Arc<AtomicBool>,
     pub(super) streamed_au: bool,
     /// `false` = single-slice. TV-SoC decoders (Amlogic) wedge on multi-slice.
     pub(super) multi_slice: bool,
-    pub(super) stats: Arc<StatsRecorder>,
-    pub(super) client_label: String,
-    pub(super) client_name: Option<String>,
     pub(super) launch: Option<String>,
     pub(super) launch_target: Option<crate::library::LaunchTarget>,
     /// This session's launch record, claimed before prep and the launch hold.
     pub(super) launch_claim: Option<crate::launchreg::Claim>,
-    /// The launch clock, read before prep: a spawn's lease takes processes started after it.
-    pub(super) fresh_stamp: Option<f64>,
+    /// [`crate::session_launch::Prepared::stamp`].
+    pub(super) launch_stamp: Option<f64>,
+    pub(super) launch_owner: crate::session_launch::LaunchOwner,
     /// Where this session's launch outcome goes; the control task writes it to
     /// the client ([`punktfunk_core::quic::LaunchOutcome`]).
     pub(super) launch_outcome: crate::gamelease::OutcomeTx,
@@ -636,16 +615,11 @@ pub(super) struct SessionContext {
     pub(super) client_hdr: Option<pf_frame::HdrMeta>,
     /// Admitted by `mode_conflict: join`: share the live display instead of creating one.
     pub(super) join_live: bool,
-    /// Per-session handles the management routes act on; published to the registry.
-    pub(super) controls: crate::session_status::SessionControls,
     /// A joiner's view and fit ([`SessionPlan::reframe_to`](crate::session_plan::SessionPlan::reframe_to)).
     pub(super) reframe_to: Option<(punktfunk_core::video_fit::VideoFit, (u32, u32))>,
     /// The encoder's framing, published for the input thread.
     pub(super) frame_map: super::input::FrameMap,
-    pub(super) bringup: Arc<crate::bringup::Trace>,
     pub(super) resize_ms: Arc<AtomicU32>,
-    /// A clone of the data socket for the sender's kernel-queue probe; `None` on the web plane.
-    pub(super) wire_sock: Option<std::net::UdpSocket>,
     #[cfg(target_os = "linux")]
     pub(super) input_tx: std::sync::mpsc::SyncSender<super::input::ClientInput>,
     /// Isolated gamescope spawn identity. `None` = shared planes. See `design/gamescope-multiuser.md`.

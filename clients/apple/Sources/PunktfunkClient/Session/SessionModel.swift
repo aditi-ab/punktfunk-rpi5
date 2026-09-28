@@ -438,28 +438,6 @@ final class SessionModel: ObservableObject {
         #else
         let mode = effective.streamMode(native: NativeDisplay.mode)
         #endif
-        let (width, height, hz) = (mode.width, mode.height, mode.hz)
-        let compositor = PunktfunkConnection.Compositor(
-            rawValue: UInt32(clamping: effective.compositor)) ?? .auto
-        var bitrateKbps = UInt32(clamping: effective.bitrateKbps)
-        let audioChannels = UInt8(clamping: effective.audioChannels)
-        // The format this session ASKS for, at every channel count: only the host's gate knows the
-        // datagram size, so a request it cannot fit comes back declined in `Welcome`. The request
-        // is never the answer — SessionAudio and the stats overlay read what the host granted
-        // (`resolvedAudioRateHz`, `resolvedAudioBits`, `isLosslessAudio`).
-        let audioFormat = effective.audioFormatChoice
-        let (audioRateHz, audioBits) = audioFormat.wire
-        let hdrEnabled = effective.hdrEnabled
-        let preferredCodec = PunktfunkConnection.codecByte(effective.codec)
-        // PyroWave is always Automatic bitrate (ABR overhaul RFC §5.2): a fixed kbps is
-        // ill-defined for the all-intra codec (bpp is the operating point) and used to bypass
-        // the host's operator ceiling — send 0 and let the host pin its per-mode rate. Gated
-        // like the advertisement below: a device that failed the Metal probe never offers the
-        // codec, falls back to H.26x, and the user's rate must survive there. The stored
-        // setting is untouched, so switching codecs back restores it.
-        if preferredCodec == PunktfunkConnection.codecPyroWave, MetalWaveletDecoder.supported {
-            bitrateKbps = 0
-        }
         let pin = host.pinnedSHA256
         // Capability gate (main-actor — screen APIs): only advertise HDR when this display can
         // actually present it, so the host sends a proper SDR stream to an SDR display rather than
@@ -486,84 +464,34 @@ final class SessionModel: ObservableObject {
                 return UIScreen.main.potentialEDRHeadroom > 1.0
             #endif
         }()
-        let hdrCapable = hdrEnabled && displayHDR
-        // 4:4:4 opt-IN (default off): full chroma is a per-client choice — a clear win for
-        // desktop/text work, but at a fixed bitrate it spends bits on chroma that game content
-        // doesn't visibly need, and the encode/decode pixel rate rises. The host allows it by
-        // default (PUNKTFUNK_444, default on), so this toggle is the one real switch; the
-        // hardware-decode probe below still gates what can actually be advertised.
-        let want444 = effective.enable444
-        // 10-bit without HDR: an SDR desktop at Main10, which costs a little bandwidth and takes
-        // the banding out of gradients. `hdrCapable` already advertises the depth, so this only
-        // adds the arm where HDR is off or the display cannot show it.
-        let tenBit = hdrCapable || effective.tenBitSdr
-        let connectLine = "connect \(host.displayName) \(host.address):\(host.port) "
-            + "mode=\(width)x\(height)@\(hz) codec=\(effective.codec) bitrate=\(bitrateKbps)kbps "
-            + "hdr=\(hdrCapable) 10bit=\(tenBit) 444=\(want444) "
-            + "audio=\(audioChannels)ch/\(audioRateHz)Hz/\(audioBits)bit "
-            + "pinned=\(pin != nil) tofu=\(allowTofu) launch=\(launchID ?? "-")"
-        sessionLog.info("\(connectLine, privacy: .public)")
         Task.detached(priority: .userInitiated) {
             // PunktfunkConnection.init blocks on the QUIC handshake — keep it off the main
             // actor. The persistent identity is presented on every connect so a paired
             // host recognizes this Mac (nil = anonymous, fine for hosts without
             // --require-pairing; Keychain/generation failure must not block connecting).
             let identity = (try? ClientIdentityStore.shared.load())?.identity
-            // 4:4:4 only when allowed AND decodable in real time. PyroWave's Metal decoder takes
-            // it on any device past its probe. HEVC needs HARDWARE 4:4:4, at BOTH depths when
-            // 10-bit is advertised (the host may still send 8-bit). `chromaFormat` is the answer.
-            let pyroWave =
-                preferredCodec == PunktfunkConnection.codecPyroWave && MetalWaveletDecoder.supported
-            let canDecode444 =
-                pyroWave
-                || (tenBit
-                    ? (Stage444Probe.hwDecode444_8bit && Stage444Probe.hwDecode444_10bit)
-                    : Stage444Probe.hwDecode444_8bit)
-            let videoCaps = PunktfunkConnection.videoCaps(
-                tenBit: tenBit, hdr: hdrCapable, chroma444: want444 && canDecode444)
-            // This client's VideoToolbox path decodes H.264 and HEVC everywhere, and AV1 when
-            // this device has an AV1 hardware decoder (M3-class Macs, A17 Pro-class iPhones —
-            // VideoToolbox has no software AV1 decoder, so advertising it elsewhere would invite
-            // a stream that can't decode; see AV1.swift). The host resolves the emitted codec
-            // from these + the soft `preferredCodec`; `resolvedCodec` reflects what it chose.
-            var videoCodecs = PunktfunkConnection.codecH264 | PunktfunkConnection.codecHEVC
-            if AV1.hardwareDecodeSupported { videoCodecs |= PunktfunkConnection.codecAV1 }
-            // PyroWave (wired LAN) is a pure opt-in: picking it in the codec setting both
-            // advertises the bit and prefers it — the host never auto-selects it, and the
-            // picker only offers it when the Metal decode probe passed (simdgroup floor ≈ A13;
-            // every M-series Mac and the ATV 4K gen 3 pass). The decoder self-configures from
-            // the per-frame sequence header (4:2:0/4:4:4, SDR/PQ — design/pyrowave-444-hdr.md),
-            // so the session keeps the user's HDR/10-bit/4:4:4 caps exactly like HEVC/AV1.
-            if pyroWave { videoCodecs |= PunktfunkConnection.codecPyroWave }
-            // Cursor channel (remote-desktop-sweep M2, macOS): sessions STARTING in the desktop
-            // mouse model advertise local cursor rendering — the host then stops compositing
-            // the pointer and forwards shape/state, which StreamView draws as the real
-            // NSCursor. Capture-mode sessions keep today's composited pointer.
-            #if os(macOS)
-            let presentCaps: UInt8 =
-                (MouseInputMode(rawValue: effective.mouseMode) ?? .capture) == .desktop ? 0x01 : 0
-            #else
-            // iOS/tvOS run the stage-4 deadline presenter, whose link thread feeds
-            // reportPhase — advertise the vsync-aware presenter (0x02, CLIENT_CAP_PHASE_LOCK).
-            // macOS stays without it: the stage-2 arrival presenter has no latch grid.
-            let presentCaps: UInt8 = 0x02
-            #endif
-            // "Keep host audio playing": the host taps its default playback device instead of
-            // parking it on a silent endpoint, so the speakers on the host PC stay live. Pure
-            // REQUEST — no host-cap echo — so an older host simply goes quiet as it always did.
-            let clientCaps =
-                presentCaps
-                | (effective.keepHostAudio ? PunktfunkConnection.clientCapKeepHostAudio : 0)
+            // The decoder probes run here too: each is a one-off decode or shader compile.
+            let offer = ConnectOffer.resolve(
+                effective, mode: mode, displayHDR: displayHDR,
+                pyroWave: MetalWaveletDecoder.supported, av1: AV1.hardwareDecodeSupported,
+                hw444EightBit: Stage444Probe.hwDecode444_8bit,
+                hw444TenBit: Stage444Probe.hwDecode444_10bit)
+            let connectLine = "connect \(host.displayName) \(host.address):\(host.port) "
+                + "mode=\(offer.width)x\(offer.height)@\(offer.hz) codec=\(effective.codec) "
+                + "bitrate=\(offer.bitrateKbps)kbps "
+                + "hdr=\(offer.hdr) 10bit=\(offer.tenBit) 444=\(offer.want444) "
+                + "audio=\(offer.audioChannels)ch/\(offer.audioRateHz)Hz/\(offer.audioBits)bit "
+                + "pinned=\(pin != nil) tofu=\(allowTofu) launch=\(launchID ?? "-")"
+            sessionLog.info("\(connectLine, privacy: .public)")
             let result = Result { try PunktfunkConnection(
                 host: host.address, port: host.port,
-                width: width, height: height, refreshHz: hz,
-                pinSHA256: pin, identity: identity, compositor: compositor,
-                gamepad: gamepad, bitrateKbps: bitrateKbps, videoCaps: videoCaps,
-                audioChannels: audioChannels,
-                audioRateHz: audioRateHz, audioBits: audioBits,
-                videoCodecs: videoCodecs, preferredCodec: preferredCodec,
-                clientCaps: clientCaps,
-                videoFit: VideoFit(name: effective.videoFit).wire,
+                width: offer.width, height: offer.height, refreshHz: offer.hz,
+                pinSHA256: pin, identity: identity, compositor: offer.compositor,
+                gamepad: gamepad, bitrateKbps: offer.bitrateKbps, videoCaps: offer.videoCaps,
+                audioChannels: offer.audioChannels,
+                audioRateHz: offer.audioRateHz, audioBits: offer.audioBits,
+                videoCodecs: offer.videoCodecs, preferredCodec: offer.preferredCodec,
+                clientCaps: offer.clientCaps, videoFit: offer.videoFit,
                 launchID: launchID,
                 // Delegated approval: the host holds this connect open until the operator approves
                 // it (~180 s) — outwait that window so a slow approval still lands here. Normal
@@ -586,38 +514,11 @@ final class SessionModel: ObservableObject {
                 }
                 switch result {
                 case .success(let conn):
-                    let landed = "connected \(host.displayName) "
-                        + "mode=\(conn.width)x\(conn.height)@\(conn.refreshHz) "
-                        + "codec=\(conn.videoCodec) bitrate=\(conn.resolvedBitrateKbps)kbps "
-                        + "depth=\(conn.bitDepth) chroma=\(conn.isChroma444 ? "444" : "420") hdr=\(conn.isHDR) "
-                        + "audio=\(conn.resolvedAudioChannels)ch/\(conn.resolvedAudioRateHz)Hz/\(conn.resolvedAudioBits)bit "
-                        + "shard=\(conn.shardPayload) compositor=\(conn.resolvedCompositor.rawValue) "
-                        + "gamepad=\(conn.resolvedGamepad.rawValue) mgmt=\(conn.hostMgmtPort)"
-                    sessionLog.info("\(landed, privacy: .public)")
-                    if pin != nil || autoTrust || requestAccess {
-                        // requestAccess: the operator approved this device on the host, so the
-                        // session is trusted — stream directly (the caller pins it as paired).
-                        self.connection = conn
-                        self.noteTouchFallback(conn)
-                        self.startStatsTimer()
-                        self.beginStreaming()
-                    } else if allowTofu {
-                        // Host advertised pair=optional — offer the reduced-security TOFU prompt
-                        // over the live (blurred) stream (rule 3a).
-                        self.connection = conn
-                        self.noteTouchFallback(conn)
-                        self.startStatsTimer()
-                        self.phase = .awaitingTrust(fingerprint: conn.hostFingerprint)
-                    } else {
-                        // Unpinned and TOFU not permitted (rule 3b): never let this silently
-                        // become trustable. Drop the connection; the caller routes to pairing.
-                        Task.detached { conn.close() } // joins Rust threads — off-main
-                        self.phase = .idle
-                        self.activeHost = nil
-                        self.revealStream() // no stream is coming; the hold must not outlive the dial
-                        self.errorMessage = "\(host.displayName) is not paired yet. "
-                            + "Pair with its PIN before streaming."
-                    }
+                    // requestAccess: the operator approved this device on the host, so the
+                    // session is trusted (the caller pins it as paired).
+                    self.adopt(
+                        conn, host: host, trusted: pin != nil || autoTrust || requestAccess,
+                        allowTofu: allowTofu)
                 case .failure(let error):
                     sessionLog.warning(
                         "connect \(host.displayName, privacy: .public) failed: \(String(describing: error), privacy: .public)")
@@ -627,32 +528,52 @@ final class SessionModel: ObservableObject {
                     // otherwise nothing here does. It would sit over the home screen until the
                     // next session, and on tvOS it makes the host grid unfocusable behind it.
                     self.revealStream()
-                    if case PunktfunkClientError.rejected(let rejection) = error {
-                        // The host answered and stated its reason (declined / approval timed
-                        // out / busy / versions differ) — show that, and never wake-retry a
-                        // host that is demonstrably awake.
-                        self.errorMessage = "\(host.displayName): \(rejection.userMessage)"
-                    } else if let onUnreachable, !requestAccess {
-                        // The caller owns recovery (wake-and-retry) — no error alert here; its
-                        // own overlay explains what's happening.
-                        onUnreachable()
-                    } else if requestAccess {
-                        // The delegated-approval connect ended without being admitted: the
-                        // operator didn't approve it before the host's park window elapsed (or
-                        // the host was unreachable).
-                        self.errorMessage = "\(host.displayName) didn't let this device in. "
-                            + "Approve it in the host's web console (port 47992 → Pairing), then "
-                            + "request access again — the request expires after a few minutes."
+                    if let message = ConnectOffer.failureMessage(
+                        error, hostName: host.displayName, pinned: pin != nil,
+                        requestAccess: requestAccess, callerRecovers: onUnreachable != nil)
+                    {
+                        self.errorMessage = message
                     } else {
-                        self.errorMessage = pin != nil
-                            ? "Couldn't reach \(host.displayName) — it may be asleep, or its "
-                                + "identity changed since you paired. Pair with it again from "
-                                + "its host card."
-                            : "Couldn't reach \(host.displayName) — it may be asleep, or not "
-                                + "paired yet. Wake it, or pair with it from its host card."
+                        // The caller owns recovery (wake-and-retry); its overlay explains it.
+                        onUnreachable?()
                     }
                 }
             }
+        }
+    }
+
+    /// Route a dial that landed. A trusted host (pinned, auto-trusted or operator-approved)
+    /// streams at once; an unpinned one advertising `pair=optional` gets the TOFU prompt over the
+    /// live, blurred stream (rule 3a); any other is closed and refused (rule 3b), and the caller
+    /// routes it to pairing.
+    private func adopt(
+        _ conn: PunktfunkConnection, host: StoredHost, trusted: Bool, allowTofu: Bool
+    ) {
+        let landed = "connected \(host.displayName) "
+            + "mode=\(conn.width)x\(conn.height)@\(conn.refreshHz) "
+            + "codec=\(conn.videoCodec) bitrate=\(conn.resolvedBitrateKbps)kbps "
+            + "depth=\(conn.bitDepth) chroma=\(conn.isChroma444 ? "444" : "420") hdr=\(conn.isHDR) "
+            + "audio=\(conn.resolvedAudioChannels)ch/\(conn.resolvedAudioRateHz)Hz/\(conn.resolvedAudioBits)bit "
+            + "shard=\(conn.shardPayload) compositor=\(conn.resolvedCompositor.rawValue) "
+            + "gamepad=\(conn.resolvedGamepad.rawValue) mgmt=\(conn.hostMgmtPort)"
+        sessionLog.info("\(landed, privacy: .public)")
+        if trusted {
+            connection = conn
+            noteTouchFallback(conn)
+            startStatsTimer()
+            beginStreaming()
+        } else if allowTofu {
+            connection = conn
+            noteTouchFallback(conn)
+            startStatsTimer()
+            phase = .awaitingTrust(fingerprint: conn.hostFingerprint)
+        } else {
+            Task.detached { conn.close() } // joins Rust threads — off-main
+            phase = .idle
+            activeHost = nil
+            revealStream() // no stream is coming; the hold must not outlive the dial
+            errorMessage = "\(host.displayName) is not paired yet. "
+                + "Pair with its PIN before streaming."
         }
     }
 

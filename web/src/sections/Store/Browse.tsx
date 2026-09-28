@@ -1,7 +1,8 @@
 import { AlertTriangle, Ban, Check, Download, Search } from "lucide-react";
 import { type FC, useMemo, useState } from "react";
+import type { CatalogEntry } from "@/api/gen/model";
+import { useGetPluginCatalog } from "@/api/gen/store/store";
 import { pluginIcon } from "@/api/plugins";
-import { type StoreEntry, useStoreCatalog } from "@/api/store";
 import { QueryState } from "@/components/query-state";
 import { Stagger } from "@/components/stagger";
 import { Badge } from "@/components/ui/badge";
@@ -26,7 +27,7 @@ const GROUP_LABEL: Record<Group, () => string> = {
 };
 
 /** Case-insensitive substring match across the fields an operator would actually search by. */
-function matches(entry: StoreEntry, needle: string): boolean {
+function matches(entry: CatalogEntry, needle: string): boolean {
 	if (!needle) return true;
 	const q = needle.toLowerCase();
 	return [
@@ -44,10 +45,10 @@ function matches(entry: StoreEntry, needle: string): boolean {
  * dialog and the resulting job — so this subsection never installs anything itself.
  */
 export const BrowseTab: FC<{
-	onInstall: (entry: StoreEntry) => void;
+	onInstall: (entry: CatalogEntry) => void;
 	onInstallSpec: () => void;
 }> = ({ onInstall, onInstallSpec }) => {
-	const catalog = useStoreCatalog();
+	const catalog = useGetPluginCatalog();
 	// Sources that could not be fetched — the difference between "this host has no plugins" and
 	// "the console could not find out".
 	const failedSources = (catalog.data?.sources ?? []).filter(
@@ -250,13 +251,13 @@ const PLATFORM_LABELS: Record<string, string> = {
 const HEADERLESS_CARD_PADDING = "p-card pt-card sm:pt-card";
 
 /** One catalog entry. Blocked entries shout; incompatible ones grey out; neither can be installed. */
-export const StoreCard: FC<{ entry: StoreEntry; onInstall: () => void }> = ({
+export const StoreCard: FC<{ entry: CatalogEntry; onInstall: () => void }> = ({
 	entry,
 	onInstall,
 }) => {
 	const Icon = pluginIcon(entry.icon);
-	const blocked = entry.blocked !== undefined;
-	const installed = entry.installed_version !== undefined;
+	const blocked = entry.blocked != null;
+	const installed = entry.installed_version != null;
 	const installable = !blocked && entry.compatible;
 
 	return (

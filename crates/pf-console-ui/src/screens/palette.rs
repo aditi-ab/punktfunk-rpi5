@@ -9,7 +9,7 @@ use crate::anim::approach;
 use crate::el::{Axis, El, Id, Tree};
 use crate::glyphs::{Hint, HintKey};
 use crate::icons::{by_name, draw_icon_weight};
-use crate::library::{Palette, PALETTES, VIOLET_FIELD};
+use crate::palette::{Palette, PALETTES, VIOLET_FIELD};
 use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{Ctx, Outbox};
 use crate::theme::{edge, fill, stroke, Fonts, W};
@@ -45,14 +45,16 @@ impl PaletteScreen {
 
     fn apply(&mut self, ctx: &mut Ctx) -> Option<MenuPulse> {
         let id = PALETTES[self.cursor].id;
-        if ctx.settings.ui_palette == id {
-            return Some(MenuPulse::Boundary);
-        }
-        // Whole-file writer: rebase before mutate or another writer's store is reverted.
-        *ctx.settings = ctx.store.load();
-        ctx.settings.ui_palette = id.to_string();
-        ctx.store.save(ctx.settings);
-        Some(MenuPulse::Confirm)
+        let changed = ctx.write(|c| {
+            let changed = c.settings.ui_palette != id;
+            c.settings.ui_palette = id.to_string();
+            changed
+        });
+        Some(if changed {
+            MenuPulse::Confirm
+        } else {
+            MenuPulse::Boundary
+        })
     }
 
     fn step(&mut self, dir: MenuDir) -> Option<MenuPulse> {
@@ -221,7 +223,11 @@ impl PaletteScreen {
             );
         }
         tree.set_focus(Some(card_id(self.cursor)));
-        let cheap = super::settings::reduce_ui_res(ctx.settings, ctx.platform, ctx.fallback_ui);
+        let cheap = super::settings::reduce_ui_res(
+            ctx.settings,
+            ctx.device.platform,
+            ctx.device.fallback_ui,
+        );
         if view == rect {
             let scrolled = (tree.offset(grid), max);
             crate::widgets::soft_scroll(canvas, rect, rect, scrolled, k, || {
@@ -309,36 +315,12 @@ mod tests {
     use crate::screens::Outbox;
     use pf_client_core::trust::Settings;
 
-    fn ctx<'a>(
-        settings: &'a mut Settings,
-        library: &'a crate::library::LibraryShared,
-        pads: &'a [pf_client_core::menu_nav::PadInfo],
-    ) -> Ctx<'a> {
-        Ctx {
-            hosts: &[],
-            library,
-            settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads,
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
-        }
-    }
-
     /// Opens on the palette in force; a pick lands in the store, the same pick is a thud.
     #[test]
     fn confirm_saves_the_focused_palette_once() {
         let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
-        let pads = Vec::new();
-        let mut ctx = ctx(&mut settings, &library, &pads);
+        let mut ctx = Ctx::test(&mut settings, &library);
         ctx.store.save(ctx.settings);
         let mut s = PaletteScreen::new("graphite");
         assert_eq!(PALETTES[s.cursor].id, "graphite");

@@ -1,7 +1,8 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import { type StoreCatalog, type StoreEntry, storeKeys } from "@/api/store";
+import type { CatalogEntry, CatalogResponse } from "@/api/gen/model";
+import { getGetPluginCatalogQueryKey } from "@/api/gen/store/store";
 import { BrowseTab } from "@/sections/Store/Browse";
 
 // The Browse tab over a fixture catalog: one heading per group, the group chips, and a launcher
@@ -12,8 +13,8 @@ const entry = (
 	id: string,
 	title: string,
 	categories: string[] | undefined,
-	extra: Partial<StoreEntry> = {},
-): StoreEntry => ({
+	extra: Partial<CatalogEntry> = {},
+): CatalogEntry => ({
 	id,
 	pkg: `@punktfunk/plugin-${id}`,
 	title,
@@ -26,11 +27,11 @@ const entry = (
 	platforms: ["linux", "windows"],
 	compatible: true,
 	update_available: false,
-	categories,
+	categories: categories ?? [],
 	...extra,
 });
 
-const CATALOG: StoreCatalog = {
+const CATALOG: CatalogResponse = {
 	host: { version: "0.41.0", platform: "linux" },
 	busy: false,
 	sources: [],
@@ -59,8 +60,10 @@ const meta = {
 		(Story) => {
 			const qc = useQueryClient();
 			useState(() => {
-				qc.setQueryDefaults(storeKeys.catalog, { staleTime: Infinity });
-				qc.setQueryData(storeKeys.catalog, CATALOG);
+				qc.setQueryDefaults(getGetPluginCatalogQueryKey(), {
+					staleTime: Infinity,
+				});
+				qc.setQueryData(getGetPluginCatalogQueryKey(), CATALOG);
 				return null;
 			});
 			return <Story />;

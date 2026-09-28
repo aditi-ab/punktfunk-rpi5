@@ -903,6 +903,18 @@ struct Worker {
     ring_nav: bool,
 }
 
+/// The attached session and the open slot SDL's `which` names. Takes the two fields,
+/// not `&mut Worker`, so a caller still reads the worker's flags while holding the slot.
+fn attached_slot<'a>(
+    attached: &Option<Arc<NativeClient>>,
+    slots: &'a mut [Slot],
+    which: u32,
+) -> Option<(Arc<NativeClient>, &'a mut Slot)> {
+    let c = attached.clone()?;
+    let slot = slots.iter_mut().find(|s| s.id == which)?;
+    Some((c, slot))
+}
+
 impl Worker {
     fn active_id(&self) -> Option<u32> {
         // Pin matches by stable key (most-recent wins if two share one); unmatched falls
@@ -1835,102 +1847,12 @@ impl Worker {
                     self.refresh_active();
                 }
             }
-            Event::ControllerButtonDown { which, button, .. } => {
-                let Some(c) = self.attached.clone() else {
-                    return;
-                };
-                let Some(slot) = self.slots.iter_mut().find(|s| s.id == which) else {
-                    return;
-                };
-                if let Some(surface) = Self::steam_click_surface(slot, button) {
-                    Self::forward_click(&c, slot, surface, true);
-                    return;
-                }
-                if let Some(bit) = button_bit(button) {
-                    if !self.system_forward && matches!(bit, wire::BTN_GUIDE | wire::BTN_MISC1) {
-                        return;
-                    }
-                    // Claimed only where the client can act on it: the ring withholds the press
-                    // it takes, and eating a face button nothing receives is worse than the
-                    // chord not working.
-                    let chord = self
-                        .chords_live
-                        .then(|| select_chord(&slot.held_buttons, bit, slot.gesture.as_guide))
-                        .flatten();
-                    if let Some(chord) = chord {
-                        let _ = self.chord_tx.try_send((slot.index, chord));
-                        // A is the ring's own confirm, so the host must not also see it — a
-                        // pending Select goes with it, and one already on the wire is lifted by
-                        // the ring's mask flush. Stats changes nothing on the host, so that
-                        // press carries on to the game, as it does on the Apple clients.
-                        if chord == SelectChord::Ring {
-                            slot.gesture.swallow_for_ring();
-                            slot.swallow_btn = Some(bit);
-                            slot.held_buttons.push(bit);
-                            return;
-                        }
-                    }
-                    let mut due = Vec::new();
-                    let held_back = if !self.guide_gesture {
-                        false
-                    } else if bit == wire::BTN_BACK {
-                        let alone = slot.held_buttons.is_empty();
-                        slot.gesture.on_select_down(Instant::now(), alone, &mut due)
-                    } else {
-                        slot.gesture.on_other_down(&mut due);
-                        false
-                    };
-                    for (b, down) in due {
-                        send(&c, InputKind::GamepadButton, b, down as i32, slot.index);
-                    }
-                    // Chord bookkeeping sees the physical press even when the gesture holds it back.
-                    slot.held_buttons.push(bit);
-                    if !held_back {
-                        send(&c, InputKind::GamepadButton, bit, 1, slot.index);
-                    }
-                    self.maybe_fire_escape();
-                }
-            }
-            Event::ControllerButtonUp { which, button, .. } => {
-                let Some(c) = self.attached.clone() else {
-                    return;
-                };
-                let Some(slot) = self.slots.iter_mut().find(|s| s.id == which) else {
-                    return;
-                };
-                if let Some(surface) = Self::steam_click_surface(slot, button) {
-                    Self::forward_click(&c, slot, surface, false);
-                    return;
-                }
-                if let Some(bit) = button_bit(button) {
-                    if !self.system_forward && matches!(bit, wire::BTN_GUIDE | wire::BTN_MISC1) {
-                        return;
-                    }
-                    slot.held_buttons.retain(|&b| b != bit);
-                    if slot.swallow_btn == Some(bit) {
-                        slot.swallow_btn = None;
-                        return;
-                    }
-                    let mut due = Vec::new();
-                    let owned = self.guide_gesture
-                        && bit == wire::BTN_BACK
-                        && slot.gesture.on_select_up(Instant::now(), &mut due);
-                    for (b, down) in due {
-                        send(&c, InputKind::GamepadButton, b, down as i32, slot.index);
-                    }
-                    if !owned {
-                        send(&c, InputKind::GamepadButton, bit, 0, slot.index);
-                    }
-                    self.rearm_escape();
-                }
-            }
+            Event::ControllerButtonDown { which, button, .. } => self.on_button_down(which, button),
+            Event::ControllerButtonUp { which, button, .. } => self.on_button_up(which, button),
             Event::ControllerAxisMotion {
                 which, axis, value, ..
             } => {
-                let Some(c) = self.attached.clone() else {
-                    return;
-                };
-                let Some(slot) = self.slots.iter_mut().find(|s| s.id == which) else {
+                let Some((c, slot)) = attached_slot(&self.attached, &mut self.slots, which) else {
                     return;
                 };
                 let (id, v) = axis_value(axis, value);
@@ -1955,13 +1877,9 @@ impl Worker {
                 y,
                 ..
             } => {
-                let Some(c) = self.attached.clone() else {
-                    return;
-                };
-                let Some(slot) = self.slots.iter_mut().find(|s| s.id == which) else {
-                    return;
-                };
-                Self::forward_touch(&c, slot, touchpad as u32, finger as u8, x, y, true);
+                if let Some((c, slot)) = attached_slot(&self.attached, &mut self.slots, which) {
+                    Self::forward_touch(&c, slot, touchpad as u32, finger as u8, x, y, true);
+                }
             }
             Event::ControllerTouchpadUp {
                 which,
@@ -1971,68 +1889,149 @@ impl Worker {
                 y,
                 ..
             } => {
-                let Some(c) = self.attached.clone() else {
-                    return;
-                };
-                let Some(slot) = self.slots.iter_mut().find(|s| s.id == which) else {
-                    return;
-                };
-                Self::forward_touch(&c, slot, touchpad as u32, finger as u8, x, y, false);
+                if let Some((c, slot)) = attached_slot(&self.attached, &mut self.slots, which) {
+                    Self::forward_touch(&c, slot, touchpad as u32, finger as u8, x, y, false);
+                }
             }
             Event::ControllerSensorUpdated {
                 which,
                 sensor,
                 data,
                 ..
-            } => {
-                let Some(c) = self.attached.clone() else {
+            } => self.on_sensor(which, sensor, data),
+            _ => {}
+        }
+    }
+
+    /// Steam pad click, Select chord, guide gesture, then the wire press. The escape
+    /// chord is checked last, once the slot borrow has ended.
+    fn on_button_down(&mut self, which: u32, button: sdl3::gamepad::Button) {
+        let Some((c, slot)) = attached_slot(&self.attached, &mut self.slots, which) else {
+            return;
+        };
+        if let Some(surface) = Self::steam_click_surface(slot, button) {
+            Self::forward_click(&c, slot, surface, true);
+            return;
+        }
+        if let Some(bit) = button_bit(button) {
+            if !self.system_forward && matches!(bit, wire::BTN_GUIDE | wire::BTN_MISC1) {
+                return;
+            }
+            // Claimed only where the client can act on it: the ring withholds the press
+            // it takes, and eating a face button nothing receives is worse than the
+            // chord not working.
+            let chord = self
+                .chords_live
+                .then(|| select_chord(&slot.held_buttons, bit, slot.gesture.as_guide))
+                .flatten();
+            if let Some(chord) = chord {
+                let _ = self.chord_tx.try_send((slot.index, chord));
+                // A is the ring's own confirm, so the host must not also see it — a
+                // pending Select goes with it, and one already on the wire is lifted by
+                // the ring's mask flush. Stats changes nothing on the host, so that
+                // press carries on to the game, as it does on the Apple clients.
+                if chord == SelectChord::Ring {
+                    slot.gesture.swallow_for_ring();
+                    slot.swallow_btn = Some(bit);
+                    slot.held_buttons.push(bit);
                     return;
-                };
-                let Some(slot) = self.slots.iter_mut().find(|s| s.id == which) else {
-                    return;
-                };
-                use sdl3::sensor::SensorType;
-                match sensor {
-                    SensorType::Accelerometer => {
-                        for (i, v) in data.iter().enumerate() {
-                            slot.last_accel[i] =
-                                (v / G * ACCEL_LSB_PER_G).clamp(-32768.0, 32767.0) as i16;
-                        }
-                    }
-                    SensorType::Gyroscope => {
-                        // Per-pad declaration, not the session echo: under Auto the Hello
-                        // carries pad 0's kind while pad 1 may still have a gyro.
-                        if !punktfunk_core::config::pad_motion_reaches(
-                            slot.declared,
-                            c.requested_gamepad,
-                            c.resolved_gamepad,
-                        ) {
-                            if !slot.motion_unreachable_logged {
-                                slot.motion_unreachable_logged = true;
-                                tracing::warn!(
-                                    pad = slot.index,
-                                    declared = ?slot.declared,
-                                    resolved = ?c.resolved_gamepad,
-                                    "this controller has a gyro but the host built it a backend \
-                                     without one — motion will not reach the game; pick a \
-                                     DualSense-class controller type to get it"
-                                );
-                            }
-                            return;
-                        }
-                        let mut gyro = [0i16; 3];
-                        for (i, v) in data.iter().enumerate() {
-                            gyro[i] = (v * GYRO_LSB_PER_RAD_S).clamp(-32768.0, 32767.0) as i16;
-                        }
-                        slot.sent_motion = true;
-                        let _ = c.send_rich_input(RichInput::Motion {
-                            pad: slot.index,
-                            gyro,
-                            accel: slot.last_accel,
-                        });
-                    }
-                    _ => {}
                 }
+            }
+            let mut due = Vec::new();
+            let held_back = if !self.guide_gesture {
+                false
+            } else if bit == wire::BTN_BACK {
+                let alone = slot.held_buttons.is_empty();
+                slot.gesture.on_select_down(Instant::now(), alone, &mut due)
+            } else {
+                slot.gesture.on_other_down(&mut due);
+                false
+            };
+            for (b, down) in due {
+                send(&c, InputKind::GamepadButton, b, down as i32, slot.index);
+            }
+            // Chord bookkeeping sees the physical press even when the gesture holds it back.
+            slot.held_buttons.push(bit);
+            if !held_back {
+                send(&c, InputKind::GamepadButton, bit, 1, slot.index);
+            }
+            self.maybe_fire_escape();
+        }
+    }
+
+    fn on_button_up(&mut self, which: u32, button: sdl3::gamepad::Button) {
+        let Some((c, slot)) = attached_slot(&self.attached, &mut self.slots, which) else {
+            return;
+        };
+        if let Some(surface) = Self::steam_click_surface(slot, button) {
+            Self::forward_click(&c, slot, surface, false);
+            return;
+        }
+        if let Some(bit) = button_bit(button) {
+            if !self.system_forward && matches!(bit, wire::BTN_GUIDE | wire::BTN_MISC1) {
+                return;
+            }
+            slot.held_buttons.retain(|&b| b != bit);
+            if slot.swallow_btn == Some(bit) {
+                slot.swallow_btn = None;
+                return;
+            }
+            let mut due = Vec::new();
+            let owned = self.guide_gesture
+                && bit == wire::BTN_BACK
+                && slot.gesture.on_select_up(Instant::now(), &mut due);
+            for (b, down) in due {
+                send(&c, InputKind::GamepadButton, b, down as i32, slot.index);
+            }
+            if !owned {
+                send(&c, InputKind::GamepadButton, bit, 0, slot.index);
+            }
+            self.rearm_escape();
+        }
+    }
+
+    fn on_sensor(&mut self, which: u32, sensor: sdl3::sensor::SensorType, data: [f32; 3]) {
+        let Some((c, slot)) = attached_slot(&self.attached, &mut self.slots, which) else {
+            return;
+        };
+        use sdl3::sensor::SensorType;
+        match sensor {
+            SensorType::Accelerometer => {
+                for (i, v) in data.iter().enumerate() {
+                    slot.last_accel[i] = (v / G * ACCEL_LSB_PER_G).clamp(-32768.0, 32767.0) as i16;
+                }
+            }
+            SensorType::Gyroscope => {
+                // Per-pad declaration, not the session echo: under Auto the Hello
+                // carries pad 0's kind while pad 1 may still have a gyro.
+                if !punktfunk_core::config::pad_motion_reaches(
+                    slot.declared,
+                    c.requested_gamepad,
+                    c.resolved_gamepad,
+                ) {
+                    if !slot.motion_unreachable_logged {
+                        slot.motion_unreachable_logged = true;
+                        tracing::warn!(
+                            pad = slot.index,
+                            declared = ?slot.declared,
+                            resolved = ?c.resolved_gamepad,
+                            "this controller has a gyro but the host built it a backend \
+                             without one — motion will not reach the game; pick a \
+                             DualSense-class controller type to get it"
+                        );
+                    }
+                    return;
+                }
+                let mut gyro = [0i16; 3];
+                for (i, v) in data.iter().enumerate() {
+                    gyro[i] = (v * GYRO_LSB_PER_RAD_S).clamp(-32768.0, 32767.0) as i16;
+                }
+                slot.sent_motion = true;
+                let _ = c.send_rich_input(RichInput::Motion {
+                    pad: slot.index,
+                    gyro,
+                    accel: slot.last_accel,
+                });
             }
             _ => {}
         }

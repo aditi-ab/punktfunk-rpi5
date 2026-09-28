@@ -54,8 +54,7 @@ import coil.request.ImageRequest
 import io.unom.punktfunk.kit.library.GameEnd
 import io.unom.punktfunk.kit.library.GameEntry
 import io.unom.punktfunk.kit.library.LibraryClient
-import io.unom.punktfunk.kit.security.IdentityStore
-import io.unom.punktfunk.kit.security.obtainIdentity
+import io.unom.punktfunk.kit.security.IdentityHolder
 import io.unom.punktfunk.models.LaunchHold
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -148,10 +147,9 @@ fun LaunchHoldOverlay(hold: LaunchHold, onRetry: () -> Unit, onShow: () -> Unit)
     }
     LaunchedEffect(hold) {
         val (id, art) = withContext(Dispatchers.IO) {
-            runCatching {
-                val me = obtainIdentity(IdentityStore(context))
-                me to posterLoader(context, me, hold.address, hold.fpHex)
-            }.getOrNull()
+            IdentityHolder.shared(context).await()?.let { me ->
+                runCatching { me to posterLoader(context, me, hold.address, hold.fpHex) }.getOrNull()
+            }
         } ?: run {
             onShow()
             return@LaunchedEffect
@@ -377,7 +375,7 @@ fun LaunchHoldOverlay(hold: LaunchHold, onRetry: () -> Unit, onShow: () -> Unit)
                         ending = "Ending it\u2026"
                         scope.launch {
                             val id = withContext(Dispatchers.IO) {
-                                runCatching { obtainIdentity(IdentityStore(context)) }.getOrNull()
+                                IdentityHolder.shared(context).await()
                             }
                             val outcome = if (id == null) {
                                 GameEnd.Failed("this device has no identity yet")

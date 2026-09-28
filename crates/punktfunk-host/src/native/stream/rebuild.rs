@@ -10,8 +10,9 @@ use super::pipeline::{
     build_pipeline, build_pipeline_with_retry, is_permanent_build_error, open_session_encoder,
     Pipeline,
 };
-use super::state::{announce_pipeline_gap, StreamState, MAX_CAPTURE_REBUILDS, MAX_ENCODER_RESETS};
+use super::state::{announce_pipeline_gap, StreamState};
 use super::*;
+use crate::encode_recovery::{RebuildBudget, MAX_CAPTURE_REBUILDS, MAX_ENCODER_RESETS};
 
 /// Isolated gamescope keeps its pinned injector and must not steal the shared backend
 /// (last-write-wins). Everyone else gets the shared sender plus `set_backend_id`.
@@ -23,7 +24,7 @@ fn repoint_session_input(
     compositor: crate::vdisplay::Compositor,
     route: Option<&crate::vdisplay::GamescopeRoute>,
 ) {
-    match session.filter(|_| super::compositor::session_is_isolated(compositor, route)) {
+    match session.filter(|_| crate::compositor_route::session_is_isolated(compositor, route)) {
         Some(tx) => input_route.set(tx.clone()),
         None => {
             input_route.set(shared.clone());
@@ -221,8 +222,7 @@ impl StreamState {
         self.enc_src = (self.frame.format, self.frame.width, self.frame.height);
         self.publish_delivered_mode(new_mode);
         self.inflight.clear();
-        self.last_au_at = std::time::Instant::now();
-        self.encoder_resets = 0;
+        self.watchdog.on_au();
         self.last_forced_idr = Some(std::time::Instant::now());
         resize_trace.finish("pipeline_rebuilt");
         // Reconfigured clears baselines, not the straddling window or slow start.
@@ -297,8 +297,7 @@ impl StreamState {
         }
         self.enc_src = (self.frame.format, self.frame.width, self.frame.height);
         self.inflight.clear();
-        self.last_au_at = std::time::Instant::now();
-        self.encoder_resets = 0;
+        self.watchdog.on_au();
         self.last_forced_idr = Some(std::time::Instant::now());
         trace.finish("pipeline_rebuilt");
         announce_pipeline_gap(&self.gap_tx, trace.total_slot().load(Ordering::Relaxed));
@@ -333,21 +332,10 @@ impl StreamState {
         }
         tracing::warn!(error = %format!("{e:#}"), rebuild = self.capture_rebuilds,
             "capture lost — rebuilding pipeline in place");
-        // A Bazzite/SteamOS Gaming↔Desktop switch tears the old compositor down and can take
-        // 15 s+ to bring the new one up. Keep retrying within a budget while the QUIC keepalive
-        // holds the connection, RE-DETECTING the live compositor each attempt. The client stays
-        // connected, frozen on the last frame, and resumes — no reconnect.
-        const REBUILD_BUDGET: std::time::Duration = std::time::Duration::from_secs(40);
-        // A managed/attach gamescope (re)launch takes up to 45 s (the Steam Big Picture cold
-        // start): room for two full launches, checked per iteration because `compositor`
-        // retargets as re-detection follows.
-        const GAMESCOPE_REBUILD_BUDGET: std::time::Duration = std::time::Duration::from_secs(100);
-        // Right after a capture loss the session detection can be STALE, and a rebuild acting on
-        // a stale "Gaming" answer restarts gamescope-session.target — on SteamOS that steals the
-        // seat back from the session the user just switched to. Until it lapses, builds attach
-        // to live outputs only: never stop/relaunch/take over sessions.
-        const PROBE_HOLDOFF: std::time::Duration = std::time::Duration::from_secs(4);
-        let loss_at = std::time::Instant::now();
+        // Retry within the budget while the QUIC keepalive holds the connection, re-detecting
+        // the live compositor each attempt. The client stays connected, frozen on the last
+        // frame, and resumes — no reconnect.
+        let budget = RebuildBudget::start();
         if pf_host_config::config().compositor.is_some() {
             let active = crate::vdisplay::detect_active_session();
             if crate::vdisplay::compositor_for_kind(active.kind) != Some(self.compositor) {
@@ -400,8 +388,7 @@ impl StreamState {
                 if pf_host_config::config().compositor.is_none() {
                     self.retarget_to_live_session();
                 }
-                let _probe =
-                    (loss_at.elapsed() < PROBE_HOLDOFF).then(crate::vdisplay::rebuild_probe_scope);
+                let _probe = budget.probe_scope();
                 let enc_of = self.enc_now();
                 match build_pipeline_with_retry(
                     &mut self.vd,
@@ -421,13 +408,7 @@ impl StreamState {
                 ) {
                     Ok(p) => break 'built p,
                     Err(e2) => {
-                        let budget = if self.compositor == crate::vdisplay::Compositor::Gamescope {
-                            GAMESCOPE_REBUILD_BUDGET
-                        } else {
-                            REBUILD_BUDGET
-                        };
-                        if self.stop.load(Ordering::SeqCst)
-                            || std::time::Instant::now() >= loss_at + budget
+                        if self.stop.load(Ordering::SeqCst) || budget.expired(Some(self.compositor))
                         {
                             return Err(e2).context(
                                 "capture lost — no compositor came up within the rebuild budget",
@@ -555,15 +536,10 @@ impl StreamState {
                 e
             }
             Err(e) => {
-                self.encoder_resets += 1;
-                if self.encoder_resets > MAX_ENCODER_RESETS {
+                let Some(backoff) = self.watchdog.spend(self.interval) else {
                     return Err(e).context("encoder reopen at the source's new mode");
-                }
-                let backoff = std::cmp::max(
-                    self.interval,
-                    std::time::Duration::from_millis(100u64 << (self.encoder_resets - 1).min(4)),
-                );
-                tracing::warn!(error = %format!("{e:#}"), reset = self.encoder_resets,
+                };
+                tracing::warn!(error = %format!("{e:#}"), reset = self.watchdog.resets(),
                     max = MAX_ENCODER_RESETS,
                     "reopening the encoder at the source's new mode failed — retrying");
                 self.next = std::time::Instant::now() + backoff;
@@ -584,8 +560,7 @@ impl StreamState {
         self.cur_mode = actual;
         self.adopt_built_bitrate(src_kbps);
         self.inflight.clear();
-        self.last_au_at = std::time::Instant::now();
-        self.encoder_resets = 0;
+        self.watchdog.on_au();
         self.last_forced_idr = Some(std::time::Instant::now());
         self.live_mode.store(
             pack_mode(actual.width, actual.height, actual.refresh_hz),

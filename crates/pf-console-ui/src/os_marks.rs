@@ -8,17 +8,10 @@
 //! brand aliases included). This module only maps those tokens to path art and
 //! letterboxes them. `None` means no art — the tile keeps its monogram.
 
-use skia_safe::{Matrix, Path, Rect};
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use crate::icons::MarkTable;
+use skia_safe::{Path, Rect};
 
-type Glyph = (Path, f32, f32);
-
-/// Token → parsed mark. `None` caches a miss so a bad token is not reparsed every frame.
-/// Named: `clippy::type_complexity` rejects the inline form, and this file is generated.
-type GlyphCache = HashMap<String, Option<Glyph>>;
-
-const GLYPHS: &[(&str, f32, f32, &str)] = &[
+static TABLE: MarkTable = MarkTable::new(&[
     ("apple", 384.0, 512.0, "M318.7 268.7c-.2-36.7 16.4-64.4 50-84.8-18.8-26.9-47.2-41.7-84.7-44.6-35.5-2.8-74.3 20.7-88.5 20.7-15 0-49.4-19.7-76.4-19.7C63.3 141.2 4 184.8 4 273.5q0 39.3 14.4 81.2c12.8 36.7 59 126.7 107.2 125.2 25.2-.6 43-17.9 75.8-17.9 31.8 0 48.3 17.9 76.4 17.9 48.6-.7 90.4-82.5 102.6-119.3-65.2-30.7-61.7-90-61.7-91.9zm-56.6-164.2c27.3-32.4 24.8-61.9 24-72.5-24.1 1.4-52 16.4-67.9 34.9-17.5 19.8-27.8 44.3-25.6 71.9 26.1 2 49.9-11.4 69.5-34.3z"),
     ("arch", 24.0, 24.0, "M11.39.605C10.376 3.092 9.764 4.72 8.635 7.132c.693.734 1.543 1.589 2.923 2.554-1.484-.61-2.496-1.224-3.252-1.86C6.86 10.842 4.596 15.138 0 23.395c3.612-2.085 6.412-3.37 9.021-3.862a6.61 6.61 0 01-.171-1.547l.003-.115c.058-2.315 1.261-4.095 2.687-3.973 1.426.12 2.534 2.096 2.478 4.409a6.52 6.52 0 01-.146 1.243c2.58.505 5.352 1.787 8.914 3.844-.702-1.293-1.33-2.459-1.929-3.57-.943-.73-1.926-1.682-3.933-2.713 1.38.359 2.367.772 3.137 1.234-6.09-11.334-6.582-12.84-8.67-17.74zM22.898 21.36v-.623h-.234v-.084h.562v.084h-.234v.623h.331v-.707h.142l.167.5.034.107a2.26 2.26 0 01.038-.114l.17-.493H24v.707h-.091v-.593l-.206.593h-.084l-.205-.602v.602h-.091"),
     ("bazzite", 24.0, 24.0, "M7.178 0h3.589v7.178h7.524c3.153 0 5.709 2.556 5.709 5.709 0 6.138-4.976 11.113-11.113 11.113-3.153 0-5.709-2.556-5.709-5.709V10.766H0v-3.589h7.178zm3.589 10.766v7.524c0 1.171.949 2.12 2.12 2.12 4.156 0 7.524-3.369 7.524-7.524 0-1.171-.949-2.12-2.12-2.12z"),
@@ -33,40 +26,15 @@ const GLYPHS: &[(&str, f32, f32, &str)] = &[
     ("steam", 496.0, 512.0, "M496 256c0 137-111.2 248-248.4 248-113.8 0-209.6-76.3-239-180.4l95.2 39.3c6.4 32.1 34.9 56.4 68.9 56.4 39.2 0 71.9-32.4 70.2-73.5l84.5-60.2c52.1 1.3 95.8-40.9 95.8-93.5 0-51.6-42-93.5-93.7-93.5s-93.7 42-93.7 93.5v1.2L176.6 279c-15.5-.9-30.7 3.4-43.5 12.1L0 236.1C10.2 108.4 117.1 8 247.6 8 384.8 8 496 119 496 256zM155.7 384.3l-30.5-12.6a52.79 52.79 0 0 0 27.2 25.8c26.9 11.2 57.8-1.6 69-28.4 5.4-13 5.5-27.3.1-40.3-5.4-13-15.5-23.2-28.5-28.6-12.9-5.4-26.7-5.2-38.9-.6l31.5 13c19.8 8.2 29.2 30.9 20.9 50.7-8.3 19.9-31 29.2-50.8 21zm173.8-129.9c-34.4 0-62.4-28-62.4-62.3s28-62.3 62.4-62.3 62.4 28 62.4 62.3-27.9 62.3-62.4 62.3zm.1-15.6c25.9 0 46.9-21 46.9-46.8 0-25.9-21-46.8-46.9-46.8s-46.9 21-46.9 46.8c.1 25.8 21.1 46.8 46.9 46.8z"),
     ("ubuntu", 496.0, 512.0, "M248 8C111 8 0 119 0 256s111 248 248 248 248-111 248-248S385 8 248 8zm52.7 93c8.8-15.2 28.3-20.5 43.5-11.7 15.3 8.8 20.5 28.3 11.7 43.6-8.8 15.2-28.3 20.5-43.5 11.7-15.3-8.9-20.5-28.4-11.7-43.6zM87.4 287.9c-17.6 0-31.9-14.3-31.9-31.9 0-17.6 14.3-31.9 31.9-31.9 17.6 0 31.9 14.3 31.9 31.9 0 17.6-14.3 31.9-31.9 31.9zm28.1 3.1c22.3-17.9 22.4-51.9 0-69.9 8.6-32.8 29.1-60.7 56.5-79.1l23.7 39.6c-51.5 36.3-51.5 112.5 0 148.8L172 370c-27.4-18.3-47.8-46.3-56.5-79zm228.7 131.7c-15.3 8.8-34.7 3.6-43.5-11.7-8.8-15.3-3.6-34.8 11.7-43.6 15.2-8.8 34.7-3.6 43.5 11.7 8.8 15.3 3.6 34.8-11.7 43.6zm.3-69.5c-26.7-10.3-56.1 6.6-60.5 35-5.2 1.4-48.9 14.3-96.7-9.4l22.5-40.3c57 26.5 123.4-11.7 128.9-74.4l46.1.7c-2.3 34.5-17.3 65.5-40.3 88.4zm-5.9-105.3c-5.4-62-71.3-101.2-128.9-74.4l-22.5-40.3c47.9-23.7 91.5-10.8 96.7-9.4 4.4 28.3 33.8 45.3 60.5 35 23.1 22.9 38 53.9 40.2 88.5l-46 .6z"),
     ("windows", 24.0, 24.0, "M0 0h11.377v11.377H0zm12.623 0H24v11.377H12.623zM0 12.623h11.377V24H0zm12.623 0H24V24H12.623z"),
-];
+]);
 
-/// Parse once per token. `Path::from_svg` on a 3 kB string is not free, and the
-/// home carousel redraws every frame.
-fn glyph(token: &str) -> Option<Glyph> {
-    static CACHE: OnceLock<Mutex<GlyphCache>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut cache = cache.lock().ok()?;
-    if let Some(hit) = cache.get(token) {
-        return hit.clone();
-    }
-    let built = GLYPHS
-        .iter()
-        .find(|(t, ..)| *t == token)
-        .and_then(|(_, w, h, d)| Path::from_svg(d).map(|p| (p, *w, *h)));
-    cache.insert(token.to_string(), built.clone());
-    built
-}
-
-/// Fitted mark for an OS-identity `chain`, aspect preserved — masters are not all square.
-/// `None` when no token has art; the tile then draws its monogram. Partial chains still
-/// resolve because the shared resolver walks most-specific-first.
+/// Fitted mark for an OS-identity `chain`, aspect preserved. `None` when no token has art;
+/// the tile then draws its monogram. Partial chains still resolve because the shared
+/// resolver walks most-specific-first.
 pub fn os_mark(chain: &str, dst: Rect) -> Option<Path> {
-    let (path, vw, vh) = pf_client_core::os::os_icon_tokens(chain)
+    pf_client_core::os::os_icon_tokens(chain)
         .into_iter()
-        .find_map(|token| glyph(&token))?;
-    let scale = (dst.width() / vw).min(dst.height() / vh);
-    let mut m = Matrix::new_identity();
-    m.set_scale((scale, scale), None);
-    m.post_translate((
-        dst.left + (dst.width() - vw * scale) / 2.0,
-        dst.top + (dst.height() - vh * scale) / 2.0,
-    ));
-    Some(path.with_transform(&m))
+        .find_map(|token| TABLE.fit(&token, dst))
 }
 
 #[cfg(test)]
@@ -76,9 +44,7 @@ mod tests {
     /// A master that fails to parse is a tile that silently loses its icon.
     #[test]
     fn every_glyph_parses() {
-        for (token, ..) in GLYPHS {
-            assert!(glyph(token).is_some(), "{token} failed to parse");
-        }
+        assert_eq!(TABLE.unparsed(), Vec::<&str>::new());
     }
 
     /// Most-specific-first through the shared resolver; `steamos` → Steam is the alias, not table order.
@@ -107,15 +73,5 @@ mod tests {
         assert!(os_mark("", dst).is_none());
         assert!(os_mark("plan9/glenda", dst).is_none());
         assert!(os_mark("!!!/???", dst).is_none());
-    }
-
-    /// Letterboxed, never stretched. Apple's master is 384×512; Windows is 24×24.
-    #[test]
-    fn mark_is_contained_and_centred() {
-        let dst = Rect::from_xywh(10.0, 20.0, 80.0, 40.0);
-        let b = os_mark("apple", dst).unwrap().compute_tight_bounds();
-        assert!(b.width() <= dst.width() + 0.5 && b.height() <= dst.height() + 0.5);
-        assert!((b.center_x() - dst.center_x()).abs() < 1.0);
-        assert!((b.center_y() - dst.center_y()).abs() < 1.0);
     }
 }

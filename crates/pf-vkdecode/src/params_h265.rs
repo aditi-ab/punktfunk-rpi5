@@ -1917,9 +1917,7 @@ mod tests {
         use cros_codecs::codec::h265::parser::NaluType;
         use cros_codecs::codec::h265::parser::Parser;
 
-        const TEST_25FPS: &[u8] = include_bytes!(
-            "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265"
-        );
+        const TEST_25FPS: &[u8] = pf_bitstream::testing::H265_25FPS;
 
         let mut cursor = Cursor::new(TEST_25FPS);
         let mut parser = Parser::default();

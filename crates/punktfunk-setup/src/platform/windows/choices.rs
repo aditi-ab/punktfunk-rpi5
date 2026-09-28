@@ -9,29 +9,12 @@
 
 use std::path::PathBuf;
 
+use crate::choices::{parse_web_bind, LAN_BIND};
 use crate::seam::Env;
 
 use super::args::{InnoArgs, TaskFlag};
 use super::plan::Artifact;
 use super::{NetCategory, WinFacts};
-
-/// What "this PC only" means to the console's listener.
-pub const LOOPBACK_BIND: &str = "127.0.0.1";
-
-/// The console's default listen address: every interface. The console answers only peers on the
-/// local network or a VPN, never the internet.
-pub const LAN_BIND: &str = "0.0.0.0";
-
-/// `/WEBBIND` and its env twin, in the Linux installer's spelling.
-fn parse_bind(raw: &str) -> Option<String> {
-    match raw.trim() {
-        "" => None,
-        "localhost" | "loopback" => Some(LOOPBACK_BIND.to_string()),
-        "lan" | "any" => Some(LAN_BIND.to_string()),
-        v if v.parse::<std::net::IpAddr>().is_ok() => Some(v.to_string()),
-        _ => None,
-    }
-}
 
 /// D12. `Skip` is the silent default: a profile change needs a consent surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,7 +171,7 @@ impl WinChoices {
         .into_iter()
         .flatten()
         {
-            match parse_bind(raw) {
+            match parse_web_bind(raw) {
                 Some(addr) => self.web_bind = Some(addr),
                 None => warnings.push(format!(
                     "web console bind '{raw}' is not an address — ignored"
@@ -232,42 +215,9 @@ impl WinChoices {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{NetProfile, WinInstall};
+    use super::super::NetProfile;
     use super::*;
-
-    fn fresh_facts() -> WinFacts {
-        WinFacts {
-            os_build: 26200,
-            arch: "x64".into(),
-            installed: None,
-            host_env_present: false,
-            web_password_present: false,
-            mgmt_bind_set: false,
-            competing_hosts: vec![],
-            mgmt_port_in_use: false,
-            networks: vec![],
-            steam_audio_drivers: true,
-            tray_autostart: false,
-            vulkan_layer_registered: false,
-            web_task: super::super::TaskState::Absent,
-            scripting_task: super::super::TaskState::Absent,
-            inno_uninstaller: false,
-            client_installed: None,
-        }
-    }
-
-    fn upgrade_facts() -> WinFacts {
-        WinFacts {
-            installed: Some(WinInstall {
-                version: Some("0.34.0".into()),
-                location: Some(r"C:\Program Files\punktfunk\".into()),
-            }),
-            host_env_present: true,
-            tray_autostart: false,
-            vulkan_layer_registered: true,
-            ..fresh_facts()
-        }
-    }
+    use crate::fixtures::{fresh_win as fresh_facts, upgrade_win as upgrade_facts};
 
     #[test]
     fn fresh_defaults_match_the_iss_task_table() {

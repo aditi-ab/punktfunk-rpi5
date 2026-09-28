@@ -1,8 +1,8 @@
 //! Modal overlays: connecting, waking, toast, full-screen takeover.
 
 use crate::anim::{approach, springs};
+use crate::coverflow::{card_matrix, PERSPECTIVE};
 use crate::glyphs::{hint_bar, Hint, HintKey};
-use crate::library::{card_matrix, PERSPECTIVE};
 use crate::theme::{edge, fg, fill, Fonts, PanelStroke, W};
 use skia_safe::{gradient, Canvas, Color4f, Image, PathBuilder, Point, RRect, Rect, TileMode, M44};
 

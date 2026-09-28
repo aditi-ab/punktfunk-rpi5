@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use punktfunk_setup::choices::{Action, Choices, Pins, LAN_BIND, LOOPBACK_BIND};
+use punktfunk_setup::choices::{parse_web_bind, Action, Choices, Pins};
 use punktfunk_setup::exec::{Executor, Opts};
 use punktfunk_setup::facts::{Facts, Family, Floor, DOCS};
 use punktfunk_setup::plan;
@@ -71,18 +71,15 @@ PUNKTFUNK_INSTALL_OMARCHY_SETUP, PUNKTFUNK_INSTALL_MGMT_PORT, PUNKTFUNK_INSTALL_
 /// 2 is bad usage, matching the sh installer's contract.
 const BAD_USAGE: u8 = 2;
 
-/// `--web-bind` / its env twin. `lan` is the friendly spelling of 0.0.0.0; anything else has to
-/// parse as an address, so a typo cannot quietly leave the console somewhere nobody is listening.
+/// `--web-bind` / its env twin. A value [`parse_web_bind`] refuses fails the run, so a typo
+/// cannot quietly leave the console somewhere nobody is listening.
 fn web_bind(raw: &str) -> Result<String, (u8, String)> {
-    match raw.trim() {
-        "localhost" | "loopback" => Ok(LOOPBACK_BIND.to_string()),
-        "lan" | "any" => Ok(LAN_BIND.to_string()),
-        v if v.parse::<std::net::IpAddr>().is_ok() => Ok(v.to_string()),
-        _ => Err((
+    parse_web_bind(raw).ok_or_else(|| {
+        (
             BAD_USAGE,
             "--web-bind must be an address, or 'localhost' or 'lan'".to_string(),
-        )),
-    }
+        )
+    })
 }
 
 struct Cli {

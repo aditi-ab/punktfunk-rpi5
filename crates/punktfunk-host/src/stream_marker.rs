@@ -83,7 +83,6 @@ impl Drop for Guard {
 #[cfg(unix)]
 mod imp {
     use super::{Guard, StreamInfo};
-    use std::io::Write;
     use std::path::PathBuf;
     use std::sync::Mutex;
 
@@ -170,23 +169,9 @@ mod imp {
             client = sanitize(&primary.client),
         );
 
-        if let Err(e) = write_atomic(path, body.as_bytes()) {
+        if let Err(e) = pf_paths::replace_file(path, body.as_bytes()) {
             tracing::debug!(error = %e, path = %path.display(), "stream marker not written");
         }
-    }
-
-    /// Temp + rename. The registry lock serializes writers, so a fixed temp name is safe.
-    fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = path.with_extension("tmp");
-        {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(bytes)?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, path)
     }
 
     impl Drop for Guard {

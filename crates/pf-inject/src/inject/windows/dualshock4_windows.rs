@@ -8,100 +8,60 @@
 //! `design/gamepad-channel-sealing.md`.
 
 use super::dualsense_proto::DsState;
-use super::dualsense_windows::{
-    create_swdevice, driver_marks, publish_input, stamp_pad, OutputDrain, SwDeviceProfile,
-    DEVTYPE_DUALSHOCK4, SHM_SIZE,
-};
 use super::dualshock4_proto::{
-    parse_ds4_output, serialize_state, Ds4Feedback, DS4_INPUT_REPORT_LEN, DS4_TOUCH_H, DS4_TOUCH_W,
+    parse_ds4_output, serialize_state, Ds4Encoder, Ds4Feedback, DS4_INPUT_REPORT_LEN, DS4_TOUCH_H,
+    DS4_TOUCH_W,
 };
-use super::gamepad_raii::PadChannel;
-use crate::sensor_clock::SensorClock;
+use super::gamepad_raii::SwDeviceProfile;
+use super::pad_shm::ShmPad;
 use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::Result;
 use punktfunk_core::quic::{HidOutput, RichInput};
-use std::time::{Duration, Instant};
 
 /// INF hardware id. A package rename must not change this (`hwid_matches_inf`).
 pub(super) const DS4_HWID: &str = "pf_dualshock4";
 
 /// Drop closes the `pf_ds4_<index>` devnode. `pub` because it is `PadProto::Pad`.
 pub struct Ds4WinPad {
-    _sw: Option<super::gamepad_raii::SwDevice>,
-    channel: PadChannel,
-    attach: super::gamepad_raii::DriverAttach,
-    counter: u8,
-    clock: SensorClock,
-    /// v2.3 input-seqlock generation for `publish_input`.
-    input_gen: u32,
-    drain: OutputDrain,
+    shm: ShmPad,
+    enc: Ds4Encoder,
 }
 
 impl Ds4WinPad {
-    /// Stamp `device_type` and ring ver before the magic, then spawn `pf_ds4_<index>`.
     fn open(index: u8) -> Result<Ds4WinPad> {
-        let boot_name = pf_driver_proto::gamepad::pad_boot_name(index);
-        let mut channel = PadChannel::create(boot_name.clone(), SHM_SIZE)?;
         let mut neutral = [0u8; DS4_INPUT_REPORT_LEN];
         serialize_state(&mut neutral, &DsState::neutral(), 0, 0);
-        // `2` = host drains the v2.2 long ring.
-        stamp_pad(channel.data(), DEVTYPE_DUALSHOCK4, index, 2, &neutral);
-        let inst = format!("pf_ds4_{index}");
-        let (hsw, instance_id) = create_swdevice(&SwDeviceProfile {
-            instance: &inst,
-            container_tag: 0x5046_4453, // "PFDS"
-            container_index: index,
-            hwid: DS4_HWID,
-            usb_vid_pid: "VID_054C&PID_09CC",
-            // Composite USB device (headset audio on 0-2); the HID interface is 3.
-            usb_mi: Some(3),
-            description: "Punktfunk Virtual DualShock 4",
-            enumerator: "VID_054C&PID_09CC&MI_03",
-        })?; // `?`: a swallowed fail latched a pad with no devnode; PadSlots never retried.
-        let (hsw, instance_id) = (Some(hsw), instance_id);
-        channel.bind_devnode(
-            index as u32,
-            instance_id.clone(),
-            super::gamepad_raii::ProofTransport::HidFeatureReport,
-        );
-        let _sw = hsw.map(super::gamepad_raii::SwDevice::new);
-        // 1500 ms: driver must read `device_type = 1` before hidclass asks for
-        // descriptors, or the pad enumerates as DualSense.
-        channel.deliver_eager(Duration::from_millis(1500));
+        let shm = ShmPad::open(
+            index,
+            pf_driver_proto::gamepad::DEVTYPE_DUALSHOCK4,
+            &neutral,
+            &SwDeviceProfile {
+                instance: &format!("pf_ds4_{index}"),
+                container_tag: 0x5046_4453, // "PFDS"
+                container_index: index,
+                hwid: DS4_HWID,
+                usb_vid_pid: Some("VID_054C&PID_09CC"),
+                // Composite USB device (headset audio on 0-2); the HID interface is 3.
+                usb_mi: Some(3),
+                description: "Punktfunk Virtual DualShock 4",
+                enumerator: "VID_054C&PID_09CC&MI_03",
+            },
+        )?;
         Ok(Ds4WinPad {
-            _sw,
-            channel,
-            attach: super::gamepad_raii::DriverAttach::new(
-                "pf_dualshock4",
-                "pf_gamepad.inf", // one package serves both HID identities
-                "C:\\Windows\\ServiceProfiles\\LocalService\\AppData\\Local\\Temp\\pf_gamepad-driver.log",
-                boot_name,
-                instance_id,
-            ),
-            counter: 0,
-            clock: SensorClock::dualshock4(),
-            input_gen: 0,
-            drain: OutputDrain::new(),
+            shm,
+            enc: Ds4Encoder::default(),
         })
     }
 
     fn write_state(&mut self, st: &DsState) {
-        self.counter = self.counter.wrapping_add(1);
-        let ts = self.clock.ds4_ticks(Instant::now());
-        let mut r = [0u8; DS4_INPUT_REPORT_LEN];
-        serialize_state(&mut r, st, self.counter, ts);
-        publish_input(self.channel.data(), &mut self.input_gen, &r);
+        let r = self.enc.encode(st);
+        self.shm.publish(&r);
     }
 
     /// Drain every new `0x05` oldest-first so a stop-then-LED burst keeps both.
     fn service(&mut self) -> Ds4Feedback {
-        self.channel.pump();
         let mut fb = Ds4Feedback::default();
-        let (proto, rev) = driver_marks(self.channel.data());
-        self.attach.observe_pad(proto, rev);
-        fb.resync = self.drain.drain(self.channel.data(), |bytes| {
-            parse_ds4_output(bytes, &mut fb)
-        });
+        fb.resync = self.shm.poll(|bytes, _| parse_ds4_output(bytes, &mut fb));
         fb
     }
 }
@@ -137,40 +97,14 @@ impl PadProto for Ds4WinProto {
         Ok(p)
     }
 
-    fn neutral(&self) -> DsState {
-        DsState::neutral()
-    }
-
-    /// Touch, motion, and pad click ride the rich plane and must survive a button-only frame.
     fn merge_frame(&self, prev: &DsState, f: &punktfunk_core::input::GamepadFrame) -> DsState {
         let buttons = crate::steam_remap::fold_paddles(f.buttons, self.remap.paddles);
-        let mut s = DsState::from_gamepad(
-            buttons,
-            f.ls_x,
-            f.ls_y,
-            f.rs_x,
-            f.rs_y,
-            f.left_trigger,
-            f.right_trigger,
-        );
-        s.touch = prev.touch;
-        s.gyro = prev.gyro;
-        s.accel = prev.accel;
-        s.touch_click = prev.touch_click;
-        s
+        DsState::merge_frame(prev, f, buttons)
     }
 
     /// Steam dual pads split one DS4 touchpad left/right; pad clicks ride `touch_click`.
     fn apply_rich(&self, st: &mut DsState, rich: RichInput) {
         st.apply_rich(rich, DS4_TOUCH_W, DS4_TOUCH_H);
-    }
-
-    fn neutralize_gyro(&self, st: &mut DsState) -> bool {
-        st.neutralize_gyro()
-    }
-
-    fn clear_rich(&self, st: &mut DsState) {
-        st.clear_rich();
     }
 
     fn write_state(&self, pad: &mut Ds4WinPad, st: &DsState) {

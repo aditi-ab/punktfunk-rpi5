@@ -13,7 +13,7 @@
 //! - `UHID_SET_REPORT` must be answered.
 #![allow(dead_code)]
 
-use punktfunk_core::input::gamepad as gs;
+use punktfunk_core::input::{gamepad as gs, GamepadFrame};
 use punktfunk_core::quic::RichInput;
 
 /// `hid-steam` matches VID/PID on `BUS_USB`; no usage-page probe.
@@ -165,7 +165,7 @@ impl SteamState {
     }
 
     /// Zero gyro only (gravity stays). `true` if anything changed —
-    /// `PadProto::neutralize_gyro`.
+    /// `PadState::neutralize_gyro`.
     pub fn neutralize_gyro(&mut self) -> bool {
         let changed = self.gyro != [0; 3];
         self.gyro = [0; 3];
@@ -173,7 +173,7 @@ impl SteamState {
     }
 
     /// Drop trackpad + motion. A pad that took this slot inside the replug
-    /// grace must not inherit the last finger or rotation (`PadProto::clear_rich`).
+    /// grace must not inherit the last finger or rotation (`PadState::clear_rich`).
     pub fn clear_rich(&mut self) {
         let fresh = SteamState::neutral();
         self.lpad_x = fresh.lpad_x;
@@ -218,29 +218,14 @@ impl SteamState {
             rt: trigger_u16(rt),
             ..SteamState::neutral()
         };
-        let mut b = 0u64;
+        let mut b = deck_low_buttons(buttons, lt, rt);
         let set = |b: &mut u64, on: bool, m: u64| {
             if on {
                 *b |= m;
             }
         };
-        set(&mut b, on(gs::BTN_A), btn::A);
-        set(&mut b, on(gs::BTN_B), btn::B);
-        set(&mut b, on(gs::BTN_X), btn::X);
-        set(&mut b, on(gs::BTN_Y), btn::Y);
-        set(&mut b, on(gs::BTN_LB), btn::LB);
-        set(&mut b, on(gs::BTN_RB), btn::RB);
-        set(&mut b, lt > 0, btn::LT_FULL);
-        set(&mut b, rt > 0, btn::RT_FULL);
-        set(&mut b, on(gs::BTN_BACK), btn::VIEW);
-        set(&mut b, on(gs::BTN_START), btn::MENU);
-        set(&mut b, on(gs::BTN_GUIDE), btn::STEAM);
         set(&mut b, on(gs::BTN_LS_CLICK), btn::L3);
         set(&mut b, on(gs::BTN_RS_CLICK), btn::R3);
-        set(&mut b, on(gs::BTN_DPAD_UP), btn::DPAD_UP);
-        set(&mut b, on(gs::BTN_DPAD_DOWN), btn::DPAD_DOWN);
-        set(&mut b, on(gs::BTN_DPAD_LEFT), btn::DPAD_LEFT);
-        set(&mut b, on(gs::BTN_DPAD_RIGHT), btn::DPAD_RIGHT);
         // DualSense touchpad-click → Deck right-pad click (same pad apply_rich uses).
         set(&mut b, on(gs::BTN_TOUCHPAD), btn::RPAD_CLICK);
         // PADDLE1/2/3/4 = R4/L4/R5/L5 (`input::gamepad`); MISC1 = QAM.
@@ -250,6 +235,31 @@ impl SteamState {
         set(&mut b, on(gs::BTN_PADDLE4), btn::L5);
         set(&mut b, on(gs::BTN_MISC1), btn::QAM);
         s.buttons = b;
+        s
+    }
+
+    /// Fold a Deck button/stick frame over `prev`. Trackpads, motion and pad clicks arrive on
+    /// the rich plane and survive it. Clicks are their own fields, not `buttons`: the serializer
+    /// ORs them with the frame's `RPAD_CLICK`, so keeping them cannot strand wire BTN_TOUCHPAD.
+    pub fn merge_frame(prev: &SteamState, f: &GamepadFrame) -> SteamState {
+        let mut s = SteamState::from_gamepad(
+            f.buttons,
+            f.ls_x,
+            f.ls_y,
+            f.rs_x,
+            f.rs_y,
+            f.left_trigger,
+            f.right_trigger,
+        );
+        s.rpad_x = prev.rpad_x;
+        s.rpad_y = prev.rpad_y;
+        s.lpad_x = prev.lpad_x;
+        s.lpad_y = prev.lpad_y;
+        s.gyro = prev.gyro;
+        s.accel = prev.accel;
+        s.buttons |= prev.buttons & (btn::RPAD_TOUCH | btn::LPAD_TOUCH);
+        s.lpad_click = prev.lpad_click;
+        s.rpad_click = prev.rpad_click;
         s
     }
 
@@ -346,6 +356,48 @@ pub fn serialize_deck_state(r: &mut [u8; STEAM_REPORT_LEN], st: &SteamState, seq
     r[58..60].copy_from_slice(&st.rpad_pressure.to_le_bytes());
 }
 
+/// Deck state-frame encoder a transport keeps across writes: the frame sequence number.
+#[derive(Default)]
+pub struct DeckEncoder {
+    seq: u32,
+}
+
+impl DeckEncoder {
+    /// The next `ID_CONTROLLER_DECK_STATE` frame for `st`.
+    pub fn encode(&mut self, st: &SteamState) -> [u8; STEAM_REPORT_LEN] {
+        self.seq = self.seq.wrapping_add(1);
+        let mut r = [0u8; STEAM_REPORT_LEN];
+        serialize_deck_state(&mut r, st, self.seq);
+        r
+    }
+}
+
+/// Wire buttons → the Deck bits the classic Steam Controller shares with it: face, shoulders,
+/// full-pull triggers, View / Menu / Steam and the d-pad. Each model ORs its own tail on top.
+fn deck_low_buttons(buttons: u32, lt: u8, rt: u8) -> u64 {
+    let on = |bit: u32| buttons & bit != 0;
+    [
+        (on(gs::BTN_A), btn::A),
+        (on(gs::BTN_B), btn::B),
+        (on(gs::BTN_X), btn::X),
+        (on(gs::BTN_Y), btn::Y),
+        (on(gs::BTN_LB), btn::LB),
+        (on(gs::BTN_RB), btn::RB),
+        (lt > 0, btn::LT_FULL),
+        (rt > 0, btn::RT_FULL),
+        (on(gs::BTN_BACK), btn::VIEW),
+        (on(gs::BTN_START), btn::MENU),
+        (on(gs::BTN_GUIDE), btn::STEAM),
+        (on(gs::BTN_DPAD_UP), btn::DPAD_UP),
+        (on(gs::BTN_DPAD_DOWN), btn::DPAD_DOWN),
+        (on(gs::BTN_DPAD_LEFT), btn::DPAD_LEFT),
+        (on(gs::BTN_DPAD_RIGHT), btn::DPAD_RIGHT),
+    ]
+    .into_iter()
+    .filter(|&(down, _)| down)
+    .fold(0, |b, (_, m)| b | m)
+}
+
 /// Classic Steam Controller mapping. Low 16 button bits match the Deck;
 /// the SC tail (`steam_do_input_event`):
 /// - `9.7`/`10.0` = the two grips (Deck L5/R5). Wire `BTN_PADDLE2`/`BTN_PADDLE1`
@@ -377,27 +429,12 @@ pub fn sc_from_gamepad(
         rpad_y: ry,
         ..SteamState::neutral()
     };
-    let mut b = 0u64;
+    let mut b = deck_low_buttons(buttons, lt, rt);
     let set = |b: &mut u64, on: bool, m: u64| {
         if on {
             *b |= m;
         }
     };
-    set(&mut b, on(gs::BTN_A), btn::A);
-    set(&mut b, on(gs::BTN_B), btn::B);
-    set(&mut b, on(gs::BTN_X), btn::X);
-    set(&mut b, on(gs::BTN_Y), btn::Y);
-    set(&mut b, on(gs::BTN_LB), btn::LB);
-    set(&mut b, on(gs::BTN_RB), btn::RB);
-    set(&mut b, lt > 0, btn::LT_FULL);
-    set(&mut b, rt > 0, btn::RT_FULL);
-    set(&mut b, on(gs::BTN_BACK), btn::VIEW);
-    set(&mut b, on(gs::BTN_START), btn::MENU);
-    set(&mut b, on(gs::BTN_GUIDE), btn::STEAM);
-    set(&mut b, on(gs::BTN_DPAD_UP), btn::DPAD_UP);
-    set(&mut b, on(gs::BTN_DPAD_DOWN), btn::DPAD_DOWN);
-    set(&mut b, on(gs::BTN_DPAD_LEFT), btn::DPAD_LEFT);
-    set(&mut b, on(gs::BTN_DPAD_RIGHT), btn::DPAD_RIGHT);
     // Grips at Deck L5/R5 (9.7 / 10.0): wire L4/R4 (PADDLE2/PADDLE1).
     set(&mut b, on(gs::BTN_PADDLE2), btn::L5);
     set(&mut b, on(gs::BTN_PADDLE1), btn::R5);
@@ -526,23 +563,12 @@ pub const RDESC_DECK_KBD: &[u8] = &[
     0x75,0x01,0x95,0x08,0x81,0x02,0x81,0x01,0x19,0x00,0x29,0x65,0x15,0x00,0x25,0x65,
     0x75,0x08,0x95,0x06,0x81,0x00,0xc0];
 /// Interface 2, EP 0x83 (Usage Page `0xFFFF`, `bCountryCode 33`). Steam filters on this interface.
-#[rustfmt::skip]
-pub const RDESC_DECK_CTRL: &[u8] = &[
-    0x06,0xff,0xff,0x09,0x01,0xa1,0x01,0x09,0x02,0x09,0x03,0x15,0x00,0x26,0xff,0x00,
-    0x75,0x08,0x95,0x40,0x81,0x02,0x09,0x06,0x09,0x07,0x15,0x00,0x26,0xff,0x00,0x75,
-    0x08,0x95,0x40,0xb1,0x02,0xc0];
+pub const RDESC_DECK_CTRL: &[u8] = &pf_driver_proto::deck::RDESC;
 
-/// Stamped into `0x83` attrs `0x0a`/`0x04`. High word is `"PF"` (`0x5046`)
-/// plus index so two virtual Decks never collide.
-pub fn deck_unit_id(index: u8) -> u32 {
-    0x5046_0000 | index as u32
-}
-
-/// Steam rejects a `"PF"`-leading serial and substitutes a hash. `'F'`-leading
-/// passes, so the marker sits one slot in (`"FVPF"`) — distinct from a real
-/// Deck `"FVZZ"`. Derived from [`deck_unit_id`] so `0xAE` and `0x83` agree.
+/// Unit serial of virtual Deck `index`, the one the Windows driver reports too. `FVPF` marks it
+/// virtual, apart from a real Deck's `FVZZ`; Steam rejects a `PF`-leading serial.
 pub fn deck_serial(index: u8) -> String {
-    format!("FVPF{:08X}", deck_unit_id(index))
+    pf_driver_proto::gamepad::pad_serial(pf_driver_proto::gamepad::DEVTYPE_STEAMDECK, index)
 }
 
 /// Header only (controls released). Real-USB transports stream this until the first [`serialize_deck_state`].
@@ -554,56 +580,10 @@ pub fn neutral_deck_report() -> [u8; STEAM_REPORT_LEN] {
     r
 }
 
-/// HID feature GET_REPORT for the real-USB Deck (gadget + usbip). Serving
-/// the real `0x83` blob stops Steam re-probing (gamepad-evdev churn).
-/// Raw 64-byte EP0 payload (command id first, no report-id prefix) —
-/// unlike [`serial_reply`], which carries the UHID report-id the kernel
-/// strips. `unit_id` stamps [`deck_unit_id`] into the device-id attrs.
-pub fn feature_reply(last_set: &[u8], serial: &str, unit_id: u32) -> [u8; STEAM_REPORT_LEN] {
-    let cmd = last_set.first().copied().unwrap_or(ID_GET_STRING_ATTRIBUTE);
-    let mut r = [0u8; STEAM_REPORT_LEN];
-    match cmd {
-        ID_GET_ATTRIBUTES_VALUES => {
-            // [0x83, 0x2d, then 9 × (attr-id, u32-LE)].
-            r[0] = ID_GET_ATTRIBUTES_VALUES;
-            r[1] = 0x2d;
-            let attrs: [(u8, u32); 9] = [
-                (0x01, 0x1205), // product id
-                (0x02, 0),
-                (0x0a, unit_id), // unit serial number (per-instance)
-                (0x04, unit_id ^ 0x5555_5555),
-                (0x09, 0x2e),
-                (0x0b, 0x0fa0),
-                (0x0d, 0),
-                (0x0c, 0),
-                (0x0e, 0),
-            ];
-            let mut o = 2;
-            for (id, val) in attrs {
-                r[o] = id;
-                r[o + 1..o + 5].copy_from_slice(&val.to_le_bytes());
-                o += 5;
-            }
-        }
-        ID_GET_STRING_ATTRIBUTE => {
-            // [0xAE, len, attr, ascii…]. Serial (attr 0x01) wants
-            // `reply[2]==0x01` and `1<=len<=21`; other attrs echo the id.
-            let attr = last_set.get(2).copied().unwrap_or(ATTRIB_STR_UNIT_SERIAL);
-            let b = serial.as_bytes();
-            let len = b.len().clamp(1, 20);
-            r[0] = ID_GET_STRING_ATTRIBUTE;
-            r[1] = len as u8;
-            r[2] = attr;
-            r[3..3 + len].copy_from_slice(&b[..len]);
-        }
-        _ => {
-            // Unknown cmd (e.g. 0x87 settings): echo last SET_REPORT.
-            let n = last_set.len().min(STEAM_REPORT_LEN);
-            r[..n].copy_from_slice(&last_set[..n]);
-        }
-    }
-    r
-}
+/// HID feature GET_REPORT for the real-USB Deck (gadget + usbip). Serving the real `0x83` blob
+/// stops Steam re-probing (gamepad-evdev churn). Raw 64-byte EP0 payload (command id first, no
+/// report-id prefix), unlike [`serial_reply`], which carries the UHID report-id the kernel strips.
+pub use pf_driver_proto::deck::feature_reply;
 
 #[cfg(test)]
 mod tests {
@@ -824,6 +804,37 @@ mod tests {
         assert_ne!(serialized & btn::LPAD_CLICK, 0);
     }
 
+    /// The SC's low button bits are the Deck's: each shared wire button lands on the same bit
+    /// under both mappers.
+    #[test]
+    fn deck_and_sc_share_the_low_buttons() {
+        for wire in [
+            gs::BTN_A,
+            gs::BTN_B,
+            gs::BTN_X,
+            gs::BTN_Y,
+            gs::BTN_LB,
+            gs::BTN_RB,
+            gs::BTN_BACK,
+            gs::BTN_START,
+            gs::BTN_GUIDE,
+            gs::BTN_DPAD_UP,
+            gs::BTN_DPAD_DOWN,
+            gs::BTN_DPAD_LEFT,
+            gs::BTN_DPAD_RIGHT,
+        ] {
+            let deck = SteamState::from_gamepad(wire, 0, 0, 0, 0, 0, 0).buttons;
+            let sc = sc_from_gamepad(wire, 0, 0, 0, 0, 0, 0).buttons;
+            assert_eq!(deck, sc, "wire {wire:#x}");
+            assert_eq!(deck.count_ones(), 1, "wire {wire:#x}");
+        }
+        let pulled = |b: u64| b & (btn::LT_FULL | btn::RT_FULL);
+        assert_eq!(
+            pulled(SteamState::from_gamepad(0, 0, 0, 0, 0, 1, 255).buttons),
+            pulled(sc_from_gamepad(0, 0, 0, 0, 0, 1, 255).buttons)
+        );
+    }
+
     /// SC frame vs `ID_CONTROLLER_STATE`: 24-bit buttons, u8 triggers,
     /// joystick/left-pad multiplex, SC button tail (9.7/10.0/10.2/10.6).
     #[test]
@@ -907,40 +918,5 @@ mod tests {
         let mut d = vec![0u8; 12];
         d[1] = ID_SET_SETTINGS_VALUES; // a settings write — no rumble
         assert_eq!(parse_steam_output(&d).rumble, None);
-    }
-
-    /// Real-USB `0x83` attrs carry the per-instance unit id; `0xAE` carries
-    /// the Steam-accepted serial. A slip is Steam re-probing.
-    #[test]
-    fn deck_feature_reply_contract() {
-        let serial = deck_serial(0);
-        let unit_id = deck_unit_id(0);
-        assert_eq!(serial, "FVPF50460000"); // 12-char alphanumeric, derived from the unit id
-        assert_eq!(serial.len(), 12);
-
-        // 0x83 GET_ATTRIBUTES_VALUES: header + (0x0a, unit_id) at the 3rd attribute slot.
-        let r = feature_reply(&[ID_GET_ATTRIBUTES_VALUES], &serial, unit_id);
-        assert_eq!(r[0], ID_GET_ATTRIBUTES_VALUES);
-        assert_eq!(r[1], 0x2d);
-        assert_eq!(r[12], 0x0a); // 3rd attr id (slots at 2,7,12,…)
-        assert_eq!(
-            u32::from_le_bytes([r[13], r[14], r[15], r[16]]),
-            unit_id,
-            "unit serial attribute must carry the per-instance unit id"
-        );
-
-        // 0xAE GET_STRING_ATTRIBUTE: [0xAE, len, attr(0x01), ascii serial…].
-        let r = feature_reply(
-            &[ID_GET_STRING_ATTRIBUTE, 0, ATTRIB_STR_UNIT_SERIAL],
-            &serial,
-            unit_id,
-        );
-        assert_eq!(r[0], ID_GET_STRING_ATTRIBUTE);
-        assert_eq!(r[1] as usize, serial.len());
-        assert_eq!(r[2], ATTRIB_STR_UNIT_SERIAL);
-        assert_eq!(&r[3..3 + serial.len()], serial.as_bytes());
-
-        assert_ne!(deck_unit_id(0), deck_unit_id(1));
-        assert_ne!(deck_serial(0), deck_serial(1));
     }
 }

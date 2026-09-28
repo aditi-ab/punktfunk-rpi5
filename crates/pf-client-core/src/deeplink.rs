@@ -123,13 +123,24 @@ impl ParseError {
     }
 }
 
+/// `punktfunk`, or its `pf` input alias, in any case.
+fn our_scheme(scheme: &str) -> bool {
+    scheme.eq_ignore_ascii_case("punktfunk") || scheme.eq_ignore_ascii_case("pf")
+}
+
+/// Whether a command-line argument is a link addressed to us. [`parse`] validates it.
+pub fn is_link_arg(arg: &str) -> bool {
+    arg.split_once("://")
+        .is_some_and(|(scheme, _)| our_scheme(scheme))
+}
+
 /// Hostile input is rejected here once for every front-end; `pf://` is an alias.
 pub fn parse(url: &str) -> Result<DeepLink, ParseError> {
     if url.len() > MAX_URL_LEN {
         return Err(ParseError::TooLong);
     }
     let (scheme, rest) = url.split_once("://").ok_or(ParseError::NotOurScheme)?;
-    if !scheme.eq_ignore_ascii_case("punktfunk") && !scheme.eq_ignore_ascii_case("pf") {
+    if !our_scheme(scheme) {
         return Err(ParseError::NotOurScheme);
     }
     // Fragments are not in the grammar; drop `#…` so it cannot smuggle text past the caps.
@@ -292,6 +303,21 @@ impl DeepLink {
             _ => false,
         }
     }
+}
+
+/// A saved host's link built from the store, which holds the stable id and pin a screen
+/// does not; `launch` makes a game's link. The record is the one
+/// [`KnownHosts::resolve`] names, and `None` means it has left the store.
+pub fn saved_host_link(
+    known: &KnownHosts,
+    fp_hex: Option<&str>,
+    addr: &str,
+    port: u16,
+    preset: Option<&str>,
+    launch: Option<&str>,
+) -> Option<String> {
+    let host = known.resolve(fp_hex, addr, port)?;
+    Some(DeepLink::for_host(host, launch, preset).to_url())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -755,6 +781,22 @@ mod tests {
              &host=192.168.1.50:7777&launch=steam:570&preset=aaaaaaaaaaaa&profile=aaaaaaaaaaaa"
         );
         assert_eq!(parse(&url).unwrap(), link);
+        let known = KnownHosts {
+            hosts: vec![h.clone()],
+        };
+        assert_eq!(
+            saved_host_link(
+                &known,
+                Some(&fp),
+                "10.0.0.9",
+                1,
+                Some("aaaaaaaaaaaa"),
+                Some("steam:570")
+            ),
+            Some(url),
+            "the store's record, wherever the screen last saw it"
+        );
+        assert!(is_link_arg("PF://connect/Desk") && !is_link_arg("--pf://"));
 
         // Pre-migration record with no id still emits a resolvable `addr:port`.
         let mut plain = h.clone();

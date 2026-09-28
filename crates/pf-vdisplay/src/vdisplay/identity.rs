@@ -138,7 +138,7 @@ const LEGACY_FILE: &str = "pf-vdisplay-identity.json";
 
 /// Fingerprint hex; `{hex}@{w}x{h}` when `per_client_mode` so each resolution keeps its scale.
 pub(crate) fn identity_key(fp: [u8; 32], mode: (u32, u32), per_client_mode: bool) -> String {
-    let hex: String = fp.iter().map(|b| format!("{b:02x}")).collect();
+    let hex = hex::encode(fp);
     if per_client_mode {
         format!("{hex}@{}x{}", mode.0, mode.1)
     } else {
@@ -275,7 +275,7 @@ impl DisplayIdentityMap {
         self.resolve_bounded(key, live, MAX_ID)
     }
 
-    /// Temp-file + rename. Best-effort. Parent is `config_dir()` (host key, allow-list,
+    /// Best-effort [`pf_paths::replace_file`]. Parent is `config_dir()` (host key, allow-list,
     /// mgmt token) so use `create_private_dir` (0700), not `create_dir_all`.
     fn persist(&self) {
         let Ok(bytes) = serde_json::to_vec_pretty(&self.store) else {
@@ -284,10 +284,7 @@ impl DisplayIdentityMap {
         if let Some(dir) = self.path.parent() {
             let _ = pf_paths::create_private_dir(dir);
         }
-        let tmp = self.path.with_extension("json.tmp");
-        if std::fs::write(&tmp, &bytes).is_ok() {
-            let _ = std::fs::rename(&tmp, &self.path);
-        }
+        let _ = pf_paths::replace_file(&self.path, &bytes);
     }
 }
 
@@ -349,7 +346,7 @@ pub(crate) fn resolve_slot_bounded(
 static SLOT_OWNER: Mutex<BTreeMap<u32, String>> = Mutex::new(BTreeMap::new());
 
 fn remember_slot_owner(slot: u32, fp: [u8; 32]) {
-    let hex: String = fp.iter().map(|b| format!("{b:02x}")).collect();
+    let hex = hex::encode(fp);
     SLOT_OWNER
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -466,10 +463,7 @@ impl ScaleMap {
             // Parent is `config_dir()` (host key, allow-list, token). 0700, not `create_dir_all`.
             let _ = pf_paths::create_private_dir(dir);
         }
-        let tmp = self.path.with_extension("json.tmp");
-        if std::fs::write(&tmp, &bytes).is_ok() {
-            let _ = std::fs::rename(&tmp, &self.path);
-        }
+        let _ = pf_paths::replace_file(&self.path, &bytes);
     }
 }
 

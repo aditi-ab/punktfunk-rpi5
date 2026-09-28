@@ -629,7 +629,7 @@ pub(crate) async fn get_status(
     let gs_launch = *st.app.launch.lock().unwrap_or_else(|e| e.into_inner());
     // Stream slot is GameStream-featured only; a native-only build has no compat-plane stream.
     #[cfg(feature = "gamestream")]
-    let gs_stream = *st.app.stream.lock().unwrap_or_else(|e| e.into_inner());
+    let gs_stream = *st.app.gs.stream.lock().unwrap_or_else(|e| e.into_inner());
     let gs_video = st.app.streaming.load(Ordering::SeqCst);
     let gs_audio = st.app.audio_streaming.load(Ordering::SeqCst);
     // Native plane, published by the video loop; lives outside `AppState` (see `session_status`).
@@ -843,7 +843,7 @@ pub(crate) async fn get_local_summary(State(st): State<Arc<MgmtState>>) -> Json<
 /// GameStream PIN wait. `false` in a native-only build (pairing does not exist); the field stays so the schema matches across flavors.
 #[cfg(feature = "gamestream")]
 fn gs_pin_pending(st: &Arc<MgmtState>) -> bool {
-    st.app.pairing.pin.awaiting_pin()
+    st.app.gs.pairing.pin.awaiting_pin()
 }
 #[cfg(not(feature = "gamestream"))]
 fn gs_pin_pending(_st: &Arc<MgmtState>) -> bool {

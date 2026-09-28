@@ -25,11 +25,11 @@
 
 use super::nvenc_core::{
     apply_low_latency_config, build_init_params, cached_ceiling, cached_split_verdict, codec_guid,
-    encode_cap, force_frame_mode, plan_range_recovery, prefix_diverged, resolve_slices,
-    resolve_split_subframe, resolve_subframe, seed_config, seed_pic_params, seed_preset_config,
-    session_wave_cycle, slice_offsets_len, store_ceiling, store_split_verdict, subframe_env_forced,
-    ArbAction, BitstreamLock, CeilingKey, CreateInstance, EncodeApi, GetMaxSupportedVersion,
-    LowLatencyConfig, NvStatusExt, RangePlan, SplitArbiter, SplitKey,
+    encode_cap, force_frame_mode, open_split_mode, plan_range_recovery, prefix_diverged,
+    resolve_slices, resolve_split_subframe, resolve_subframe, seed_config, seed_pic_params,
+    seed_preset_config, session_wave_cycle, slice_offsets_len, store_ceiling, store_split_verdict,
+    subframe_env_forced, ArbAction, BitstreamLock, CeilingKey, CreateInstance, EncodeApi,
+    GetMaxSupportedVersion, LowLatencyConfig, NvStatusExt, RangePlan, SplitArbiter, SplitKey,
 };
 use super::nvenc_status;
 use super::{max_forced_split_mode, resolve_split_mode};
@@ -400,7 +400,7 @@ fn retrieve_loop(
 /// packed RGB is 4 bytes/px either way, so depth and channel order come from `fmt`, not `buf`.
 /// Packed RGB lets NVENC do the CSC (BT.2020 NCL when HDR) — no host CSC, no depth loss.
 fn buffer_format(buf: &cuda::DeviceBuffer, fmt: pf_frame::PixelFormat) -> nv::NV_ENC_BUFFER_FORMAT {
-    if buf.yuv444 {
+    if buf.is_yuv444() {
         nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444
     } else if buf.is_nv12() {
         nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12
@@ -1116,11 +1116,12 @@ impl NvencCudaEncoder {
         self.encoder_engines = engines.max(0) as u32;
         // Resolve slices + sub-frame here, before open, so config/init/chunked-poll agree.
         // Clamp to `max_slices`: a client that never asked for multi-slice can wedge on
-        // several slice NALs. Caps gate the sub-frame default. Env knobs still override.
+        // several slice NALs. Caps and the slice count gate sub-frame. Env knobs still override.
         self.slices = resolve_slices(self.codec, 4.min(self.max_slices));
         // `subframe_broken` beats the operator force: this encoder already proved the
         // driver's sub-frame accounting corrupt. Per-encoder; a fresh one retests.
-        self.subframe_on = resolve_subframe(self.subframe_cap) && !self.subframe_broken;
+        self.subframe_on =
+            resolve_subframe(self.slices, self.subframe_cap) && !self.subframe_broken;
         self.subframe_forced = subframe_env_forced();
         tracing::info!(
             rfi = self.rfi_supported,
@@ -1320,30 +1321,23 @@ impl NvencCudaEncoder {
             }
             const FLOOR_BPS: u64 = 10_000_000;
             let requested_bps = self.bitrate_bps;
-            // [`resolve_split_mode`]: env / 10-bit / pixel-rate precedence.
+            // [`resolve_split_mode`]: env / 10-bit / pixel-rate precedence; a measured verdict
+            // wins over the static rule ([`open_split_mode`]).
             let pixel_rate = self.width as u64 * self.height as u64 * self.fps.max(1) as u64;
-            let mut split_mode: u32 = resolve_split_mode(
+            let static_mode = resolve_split_mode(
                 self.codec,
                 self.bit_depth,
                 pixel_rate,
                 self.encoder_engines,
                 self.max_slices,
             );
-            // Cached verdict wins over the static rule. Operator pin still beats both
-            // (`resolve_split_mode`); only consult the cache when the knob is unset.
-            if std::env::var_os("PUNKTFUNK_SPLIT_ENCODE").is_none() {
-                if let Some(known) = cached_split_verdict(&self.split_key()) {
-                    if known != split_mode {
-                        tracing::info!(
-                            from = split_mode,
-                            to = known,
-                            "NVENC: using the split mode a previous arbitration measured as \
-                             fastest for this config"
-                        );
-                    }
-                    split_mode = known;
-                }
-            }
+            // A single-slice client keeps split off: a verdict cached for a sliced session
+            // must not turn it back on.
+            let split_mode = if self.max_slices <= 1 {
+                static_mode
+            } else {
+                open_split_mode(static_mode, &self.split_key())
+            };
             // Split × sub-frame *before* the ladder, ceiling key, and chunked-poll latch —
             // a drop inside `build_init_params` would leave `poll_chunk` busy-polling.
             let (split_mode, subframe_on) = resolve_split_subframe(
@@ -1516,15 +1510,19 @@ impl NvencCudaEncoder {
                         }
                     } else {
                         SlotSurface::Cuda(
-                            match self.buffer_fmt {
-                                nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444 => {
-                                    InputSurface::alloc_yuv444(self.width, self.height)
-                                }
-                                nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12 => {
-                                    InputSurface::alloc_nv12(self.width, self.height)
-                                }
-                                _ => InputSurface::alloc_rgb(self.width, self.height),
-                            }
+                            InputSurface::alloc(
+                                match self.buffer_fmt {
+                                    nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444 => {
+                                        cuda::PlaneLayout::Yuv444
+                                    }
+                                    nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12 => {
+                                        cuda::PlaneLayout::Nv12
+                                    }
+                                    _ => cuda::PlaneLayout::Packed32,
+                                },
+                                self.width,
+                                self.height,
+                            )
                             .context("alloc NVENC input surface")?,
                         )
                     };
@@ -1648,7 +1646,8 @@ impl NvencCudaEncoder {
         }
     }
 
-    /// Arm a live split experiment. Opt-in (`PUNKTFUNK_NVENC_SPLIT_ARBITRATE=1`).
+    /// Arm a live split experiment. Opt-in (`PUNKTFUNK_NVENC_SPLIT_ARBITRATE=1`); both
+    /// knobs come from [`crate::knobs`], as on Windows.
     ///
     /// Operator pin (`PUNKTFUNK_SPLIT_ENCODE`) wins. A cached verdict is not re-run. Sync
     /// depth-1 only: pipelined retrieve would mix queue depth into the cost. Needs ≥ 2
@@ -1656,13 +1655,11 @@ impl NvencCudaEncoder {
     /// encode time only, so it would prefer split and lose send/encode overlap. Arbitrate
     /// where nothing is traded (sub-frame already off, or AV1).
     fn arm_split_arbiter(&mut self) {
-        if !matches!(
-            std::env::var("PUNKTFUNK_NVENC_SPLIT_ARBITRATE").as_deref(),
-            Ok("1")
-        ) {
+        let knobs = crate::knobs::get();
+        if knobs.nvenc_split_arbitrate != 1 {
             return;
         }
-        if std::env::var_os("PUNKTFUNK_SPLIT_ENCODE").is_some()
+        if knobs.split_encode != 0
             || cached_split_verdict(&self.split_key()).is_some()
             || self.async_rt.is_some()
             || self.encoder_engines < 2
@@ -2017,7 +2014,7 @@ impl NvencCudaEncoder {
     ) -> Result<()> {
         match self.buffer_fmt {
             nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444 => {
-                if !buf.yuv444 {
+                if !buf.is_yuv444() {
                     bail!("4:4:4 session but the captured buffer is not planar YUV444");
                 }
                 let planes = [
@@ -2107,14 +2104,14 @@ impl NvencCudaEncoder {
         cuda::make_current().context("cuCtxSetCurrent (CPU upload)")?;
         let nv12 = captured.format == P::Nv12;
         let buf = match self.upload.take() {
-            Some(b) if b.width == w && b.height == h && b.uv.is_some() == nv12 => b,
-            _ if nv12 => cuda::DeviceBuffer::alloc_nv12(w, h)?,
-            _ => cuda::DeviceBuffer::alloc(w, h)?,
+            Some(b) if b.width == w && b.height == h && b.is_nv12() == nv12 => b,
+            _ if nv12 => cuda::DeviceBuffer::alloc(cuda::PlaneLayout::Nv12, w, h)?,
+            _ => cuda::DeviceBuffer::alloc(cuda::PlaneLayout::Packed32, w, h)?,
         };
         let (w, h) = (w as usize, h as usize);
         if nv12 {
             let (uv_ptr, uv_pitch) = buf
-                .uv
+                .uv()
                 .context("NV12 device buffer without a chroma plane")?;
             // SAFETY: `buf` is a live NV12 allocation of `w`×`h` (checked or allocated above), Y
             // at `pitch` and UV at `uv_pitch` with `h/2` rows; the context is current (above).
@@ -2210,7 +2207,7 @@ impl NvencCudaEncoder {
             // FREXT only on genuine YUV444; NV12/RGB cannot reconstruct full chroma.
             self.chroma_444 = self.chroma_444
                 && match src {
-                    Source::Cuda(b) => b.yuv444,
+                    Source::Cuda(b) => b.is_yuv444(),
                     Source::Dmabuf(_) => true,
                 };
             // `init_session` publishes `encoder` before later fallible steps. A failure leaves
@@ -2529,6 +2526,9 @@ impl NvencCudaEncoder {
             if let Err(e) = (api().encode_picture)(self.encoder, &mut pic).nv_ok() {
                 // Nothing owns the mapping yet; left mapped, the slot's next map fails too.
                 let _ = (api().unmap_input_resource)(self.encoder, mp.mappedResource);
+                // The forced IDR and the anchor were spent on a picture that never went out.
+                self.force_kf |= flags != 0;
+                self.pending_anchor |= anchor;
                 return Err(nvenc_status::call_err("encode_picture", e));
             }
             t_pic = tp.elapsed();
@@ -2556,12 +2556,13 @@ impl NvencCudaEncoder {
             );
         }
         // Hand the blocking lock to the retrieve thread. `sync_channel(POOL)` cannot fill
-        // (in-flight is capped < POOL).
+        // (in-flight is capped < POOL). A dead thread would strand this AU, so rebuild.
         if let Some(rt) = &self.async_rt {
-            if let Some(tx) = &rt.work_tx {
-                let _ = tx.send(RetrieveJob {
-                    bs: self.bitstreams[slot] as usize,
-                });
+            let job = RetrieveJob {
+                bs: self.bitstreams[slot] as usize,
+            };
+            if rt.work_tx.as_ref().is_none_or(|tx| tx.send(job).is_err()) {
+                bail!("NVENC retrieve thread gone — rebuilding the session");
             }
         }
         Ok(())
@@ -3031,7 +3032,7 @@ impl Drop for NvencCudaEncoder {
 mod tests {
     use super::*;
     use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
-    use pf_zerocopy::cuda::DeviceBuffer;
+    use pf_zerocopy::cuda::{DeviceBuffer, PlaneLayout};
 
     #[test]
     fn split_fallback_does_not_poison_the_no_split_ceiling() {
@@ -3132,8 +3133,8 @@ mod tests {
     /// quota, so timings measure only pixel-proportional cost. `block=1` is incompressible
     /// (RC overshoots); larger `block` is the only way to reach the low bits/frame end.
     fn noise_nv12_frame(w: u32, h: u32, i: u32, block: usize) -> CapturedFrame {
-        let buf = DeviceBuffer::alloc_nv12(w, h).expect("alloc NV12 device buffer");
-        let (uv_ptr, uv_pitch) = buf.uv.expect("NV12 buffer has a UV plane");
+        let buf = DeviceBuffer::alloc(PlaneLayout::Nv12, w, h).expect("alloc NV12 device buffer");
+        let (uv_ptr, uv_pitch) = buf.uv().expect("NV12 buffer has a UV plane");
         let mut st = 0x2545_F491_4F6C_DD1Du64 ^ ((i as u64 + 1) << 32);
         let mut next = move || {
             st ^= st << 13;
@@ -3187,7 +3188,7 @@ mod tests {
 
     fn nv12_frame(w: u32, h: u32, i: u32) -> CapturedFrame {
         // Uninit VRAM: session/RFI machinery, not picture fidelity.
-        let buf = DeviceBuffer::alloc_nv12(w, h).expect("alloc NV12 device buffer");
+        let buf = DeviceBuffer::alloc(PlaneLayout::Nv12, w, h).expect("alloc NV12 device buffer");
         CapturedFrame {
             provenance: Default::default(),
             width: w,
@@ -3478,7 +3479,8 @@ mod tests {
     /// Packed `X2Rgb10` (NVENC `ARGB10`, no host CSC). Uninit VRAM: session machinery, not
     /// picture fidelity.
     fn rgb10_frame(w: u32, h: u32, i: u32) -> CapturedFrame {
-        let buf = DeviceBuffer::alloc(w, h).expect("alloc packed RGB device buffer");
+        let buf = DeviceBuffer::alloc(PlaneLayout::Packed32, w, h)
+            .expect("alloc packed RGB device buffer");
         CapturedFrame {
             provenance: Default::default(),
             width: w,
@@ -3823,18 +3825,18 @@ mod tests {
         // Regression guard: a planar 8-bit capture (real Linux default is NV12; 4:4:4 is
         // planar YUV444) under a 10-bit-negotiated session must degrade to 8-bit and encode,
         // never fail register_resource and end the video.
-        for (label, fmt, chroma, alloc) in [
+        for (label, fmt, chroma, layout) in [
             (
                 "nv12",
                 PixelFormat::Nv12,
                 ChromaFormat::Yuv420,
-                DeviceBuffer::alloc_nv12 as fn(u32, u32) -> anyhow::Result<DeviceBuffer>,
+                PlaneLayout::Nv12,
             ),
             (
                 "yuv444",
                 PixelFormat::Yuv444,
                 ChromaFormat::Yuv444,
-                DeviceBuffer::alloc_yuv444 as fn(u32, u32) -> anyhow::Result<DeviceBuffer>,
+                PlaneLayout::Yuv444,
             ),
         ] {
             pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
@@ -3860,7 +3862,9 @@ mod tests {
                     height: H,
                     pts_ns: u64::from(i) * 16_666_667,
                     format: fmt,
-                    payload: FramePayload::Cuda(alloc(W, H).expect("alloc planar device buffer")),
+                    payload: FramePayload::Cuda(
+                        DeviceBuffer::alloc(layout, W, H).expect("alloc planar device buffer"),
+                    ),
                     cursor: None,
                 };
                 enc.submit_indexed(&frame, i).unwrap_or_else(|e| {
@@ -3905,7 +3909,8 @@ mod tests {
 
         let mut aus = 0usize;
         for i in 0..6u32 {
-            let buf = DeviceBuffer::alloc_yuv444(W, H).expect("alloc YUV444 device buffer");
+            let buf =
+                DeviceBuffer::alloc(PlaneLayout::Yuv444, W, H).expect("alloc YUV444 device buffer");
             let frame = CapturedFrame {
                 provenance: Default::default(),
                 width: W,

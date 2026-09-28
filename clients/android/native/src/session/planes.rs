@@ -6,7 +6,7 @@ use jni::objects::{JIntArray, JObject, JString};
 use jni::sys::{jboolean, jfloat, jint, jlong};
 use jni::EnvUnowned;
 
-use super::{get_session, jni_guard, lock_recover};
+use super::{jni_guard, lock_recover, SESSIONS};
 
 /// Start the retained session's decoder on a `SurfaceView` window.
 ///
@@ -43,7 +43,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartVideo(
             .try_to_string(env)
             .ok()
             .filter(|s| !s.is_empty());
-        let Some(h) = get_session(handle) else {
+        let Some(h) = SESSIONS.get(handle) else {
             return Ok(());
         };
         let mut guard = lock_recover(&h.video);
@@ -124,7 +124,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoSurfac
         if handle == 0 || packed == 0 {
             return;
         }
-        let Some(h) = get_session(handle) else {
+        let Some(h) = SESSIONS.get(handle) else {
             return;
         };
         h.surface_size
@@ -147,7 +147,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoSource
     bottom: jni::sys::jfloat,
 ) {
     jni_guard((), || {
-        let Some(h) = get_session(handle) else {
+        let Some(h) = SESSIONS.get(handle) else {
             return;
         };
         h.src_crop.store(
@@ -170,7 +170,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoMime<'
 ) -> JString<'local> {
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
         // Never null: Kotlin declares a non-null `String`.
-        let Some(h) = get_session(handle) else {
+        let Some(h) = SESSIONS.get(handle) else {
             return env.new_string("");
         };
         env.new_string(crate::decode::codec_mime(h.client.codec))
@@ -195,7 +195,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoCodecL
         let session = if handle == 0 {
             None
         } else {
-            get_session(handle)
+            SESSIONS.get(handle)
         };
         env.new_string(session.map_or("", |h| crate::decode::codec_label(h.client.codec)))
     })
@@ -229,7 +229,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopVideo(
     handle: jlong,
 ) {
     jni_guard((), || {
-        if let Some(h) = get_session(handle) {
+        if let Some(h) = SESSIONS.get(handle) {
             h.stop_video();
         }
     })
@@ -250,7 +250,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoDrain(
     on: jboolean,
 ) {
     jni_guard((), || {
-        if let Some(h) = get_session(handle) {
+        if let Some(h) = SESSIONS.get(handle) {
             if on {
                 h.start_drain();
             } else {
@@ -279,7 +279,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStatsL
 ) -> JString<'local> {
     use punktfunk_core::hud::{self, Extra, Role, StatsVerbosity};
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
-        let Some(h) = get_session(handle) else {
+        let Some(h) = SESSIONS.get(handle) else {
             return Ok(JString::default());
         };
         if lock_recover(&h.video).is_none() {
@@ -350,7 +350,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoSize<'
         if handle == 0 {
             return Ok(JIntArray::default());
         }
-        let Some(h) = get_session(handle) else {
+        let Some(h) = SESSIONS.get(handle) else {
             return Ok(JIntArray::default());
         };
         let mode = h.client.mode();
@@ -377,7 +377,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoDecode
     handle: jlong,
 ) -> JIntArray<'local> {
     env.with_env(|env| -> jni::errors::Result<JIntArray<'local>> {
-        let size = get_session(handle).and_then(|h| {
+        let size = SESSIONS.get(handle).and_then(|h| {
             super::unpack_surface_size(h.decoded_size.load(std::sync::atomic::Ordering::Relaxed))
         });
         let Some((w, h)) = size else {
@@ -403,7 +403,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetVideoSta
     enabled: jboolean,
 ) {
     jni_guard((), || {
-        if let Some(h) = get_session(handle) {
+        if let Some(h) = SESSIONS.get(handle) {
             // Re-enabling opens a fresh window seeded from the current counters.
             h.client.set_hud_enabled(enabled);
         }
@@ -424,7 +424,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartAudio(
     is_tv: jboolean,
 ) {
     jni_guard((), || {
-        let Some(h) = get_session(handle) else {
+        let Some(h) = SESSIONS.get(handle) else {
             return;
         };
         let mut guard = lock_recover(&h.audio);
@@ -448,7 +448,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopAudio(
     handle: jlong,
 ) {
     jni_guard((), || {
-        if let Some(h) = get_session(handle) {
+        if let Some(h) = SESSIONS.get(handle) {
             h.stop_audio();
         }
     })
@@ -471,7 +471,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartMic(
     echo_cancel: jboolean,
 ) -> jni::sys::jint {
     jni_guard(0, || {
-        let Some(h) = get_session(handle) else {
+        let Some(h) = SESSIONS.get(handle) else {
             return 0;
         };
         let mut guard = lock_recover(&h.mic);
@@ -505,7 +505,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopMic(
     handle: jlong,
 ) {
     jni_guard((), || {
-        if let Some(h) = get_session(handle) {
+        if let Some(h) = SESSIONS.get(handle) {
             h.stop_mic();
         }
     })
@@ -538,7 +538,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartPadAud
         if fd < 0 || !(0..16).contains(&pad) {
             return false;
         }
-        let Some(h) = get_session(handle) else {
+        let Some(h) = SESSIONS.get(handle) else {
             return false;
         };
         // Replace any previous renderer first: dropping it joins the old thread, so two of them
@@ -607,7 +607,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopPadAudi
     pad: jni::sys::jint,
 ) {
     jni_guard((), || {
-        if let Some(h) = get_session(handle) {
+        if let Some(h) = SESSIONS.get(handle) {
             h.stop_pad_audio();
             if (0..16).contains(&pad) {
                 // Withdraw the capability and hand the pad back to wire rumble, in that order:
@@ -645,7 +645,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetMicMuted
     muted: jboolean,
 ) {
     jni_guard((), || {
-        if let Some(h) = get_session(handle) {
+        if let Some(h) = SESSIONS.get(handle) {
             h.mic_muted
                 .store(muted, std::sync::atomic::Ordering::Relaxed);
         }
@@ -665,7 +665,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeMicActive(
     handle: jlong,
 ) -> jboolean {
     jni_guard(false, || {
-        get_session(handle).is_some_and(|h| lock_recover(&h.mic).is_some())
+        SESSIONS
+            .get(handle)
+            .is_some_and(|h| lock_recover(&h.mic).is_some())
     })
 }
 
@@ -683,7 +685,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetStreamMu
     muted: jboolean,
 ) {
     jni_guard((), || {
-        if let Some(h) = get_session(handle) {
+        if let Some(h) = SESSIONS.get(handle) {
             h.client.set_audio_muted(muted);
         }
     })
@@ -700,7 +702,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeAudioMute(
     handle: jlong,
 ) -> jint {
     jni_guard(0, || {
-        get_session(handle).map_or(0, |h| jint::from(h.client.audio_mute()))
+        SESSIONS
+            .get(handle)
+            .map_or(0, |h| jint::from(h.client.audio_mute()))
     })
 }
 

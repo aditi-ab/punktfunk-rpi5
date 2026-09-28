@@ -6,9 +6,11 @@
 //! [`pf_zerocopy::DeviceBuffer`], `FramePayload::D3d11` a [`dxgi::D3d11Frame`].
 //!
 //! Same seam: [`hdr`] (HDR10 static metadata / SEI), [`metronome`] (periodic-stall
-//! detector), [`thread_qos`], [`session_tuning`], and on Windows [`dxgi`] (capture
-//! identity + D3D11 device).
+//! detector), [`thread_qos`], [`session_tuning`], [`cursor_mode`] (ScreenCast cursor
+//! ladder), and on Windows [`dxgi`] (capture identity + D3D11 device) and [`privilege`]
+//! (token privileges).
 
+pub mod cursor_mode;
 pub mod hdr;
 pub use hdr::HdrMeta;
 pub mod health;
@@ -19,6 +21,8 @@ pub mod thread_qos;
 
 #[cfg(target_os = "windows")]
 pub mod dxgi;
+#[cfg(target_os = "windows")]
+pub mod privilege;
 
 /// Capture negotiates this; the encoder maps to an NVENC input (`rgb0`/`bgr0`/`rgba`/`bgra`)
 /// and expands 3→4 bytes when needed. No host-side colour conversion.

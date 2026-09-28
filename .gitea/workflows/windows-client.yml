@@ -100,12 +100,12 @@ concurrency:
 on:
   push:
     branches: [main]
-    # ONE list now, not three. The old windows.yml + windows-msix.yml pair carried this same set
-    # three times (push, pull_request, and the second file), which is exactly how a crate goes
-    # missing from one copy — windows-host.yml documents the "Cargo.lock luck" gap that produced.
+    # The crate lines are the Windows client build closure. scripts/ci/check-workflow-paths.py
+    # fails CI when one is missing, in either leg.
     paths:
       - 'clients/windows/**'
       - 'clients/session/**'
+      - 'clients/cli/**'
       - 'crates/punktfunk-core/**'
       - 'crates/pf-client-core/**'
       - 'crates/pf-presenter/**'
@@ -113,14 +113,19 @@ on:
       - 'crates/pf-bitstream/**'
       - 'crates/pf-vkdecode/**'
       - 'crates/pf-dxvadec/**'
+      - 'crates/pf-update-check/**'
+      - 'crates/pyrowave-sys/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
+      - 'scripts/ci/pf-version.ps1'
+      - 'scripts/ci/pf-version.vectors'
       - '.gitea/workflows/windows-client.yml'
     tags: ['v*']
   pull_request:
     paths:
       - 'clients/windows/**'
       - 'clients/session/**'
+      - 'clients/cli/**'
       - 'crates/punktfunk-core/**'
       - 'crates/pf-client-core/**'
       - 'crates/pf-presenter/**'
@@ -128,8 +133,12 @@ on:
       - 'crates/pf-bitstream/**'
       - 'crates/pf-vkdecode/**'
       - 'crates/pf-dxvadec/**'
+      - 'crates/pf-update-check/**'
+      - 'crates/pyrowave-sys/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
+      - 'scripts/ci/pf-version.ps1'
+      - 'scripts/ci/pf-version.vectors'
       - '.gitea/workflows/windows-client.yml'
   workflow_dispatch:
 
@@ -224,6 +233,11 @@ jobs:
         shell: pwsh
         run: ./scripts/ci/ensure-windows-toolchain.ps1
 
+      # The version rule's pwsh twin must agree with pf-version.sh (ci.yml checks that side).
+      - name: pf-version vectors
+        shell: pwsh
+        run: ./scripts/ci/pf-version.ps1 -SelfTest
+
       - name: Configure + version
         shell: pwsh
         run: |
@@ -291,12 +305,12 @@ jobs:
       - name: Clippy (-D warnings)
         shell: pwsh
         run: |
-          # Every crate in the `paths:` trigger above is named here: `cargo clippy -p X` BUILDS a
-          # dependency but only LINTS the packages it is given, so a decode crate that starts the
-          # run but is missing from this list would be gated by nothing.
-          $pkgs = @('-p','punktfunk-client-windows','-p','punktfunk-client-session','-p','punktfunk-cli','-p','pf-client-core','-p','pf-presenter','-p','pf-bitstream','-p','pf-vkdecode','-p','pf-dxvadec')
+          # Every crate in the `paths:` trigger above but punktfunk-core is named here: `cargo
+          # clippy -p X` BUILDS a dependency but only LINTS the packages it is given. The arm64
+          # build has no Skia console and no PyroWave, so those two are x64 only.
+          $pkgs = @('-p','punktfunk-client-windows','-p','punktfunk-client-session','-p','punktfunk-cli','-p','pf-client-core','-p','pf-presenter','-p','pf-bitstream','-p','pf-vkdecode','-p','pf-dxvadec','-p','pf-update-check')
           $sf = @()
-          if ('${{ matrix.target }}' -eq 'aarch64-pc-windows-msvc') { $sf = @('--no-default-features') } else { $pkgs += @('-p','pf-console-ui') }
+          if ('${{ matrix.target }}' -eq 'aarch64-pc-windows-msvc') { $sf = @('--no-default-features') } else { $pkgs += @('-p','pf-console-ui','-p','pyrowave-sys') }
           cargo clippy --release --locked @pkgs --all-targets @sf --target ${{ matrix.target }} -- -D warnings
           if ($LASTEXITCODE) { throw "clippy" }
 

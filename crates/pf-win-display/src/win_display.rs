@@ -20,21 +20,15 @@
 //
 // UNION READS go through `mode_idxs` (a POD u32; modes.get(idx) is correctness)
 // and `source_mode`/`source_mode_mut`, which check infoType first. Device-info
-// packets go through `device_info_get`/`device_info_set`.
+// packets go through `ccd_info`.
 use std::mem::size_of;
 
-use windows::core::PCWSTR;
+use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Devices::Display::QUERY_DISPLAY_CONFIG_FLAGS;
 use windows::Win32::Devices::Display::{
-    DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes,
-    QueryDisplayConfig, SetDisplayConfig, DISPLAYCONFIG_2DREGION,
-    DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
-    DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
-    DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
-    DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_DEVICE_INFO_TYPE,
-    DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO,
-    DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, DISPLAYCONFIG_MODE_INFO_TYPE_TARGET,
-    DISPLAYCONFIG_OUTPUT_TECHNOLOGY_COMPONENT_VIDEO,
+    GetDisplayConfigBufferSizes, QueryDisplayConfig, SetDisplayConfig, DISPLAYCONFIG_2DREGION,
+    DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
+    DISPLAYCONFIG_MODE_INFO_TYPE_TARGET, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_COMPONENT_VIDEO,
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_COMPOSITE_VIDEO,
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED,
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EXTERNAL, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DVI,
@@ -43,14 +37,12 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SDI, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SDTVDONGLE,
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SVIDEO, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED,
     DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EXTERNAL, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_RATIONAL,
-    DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE, DISPLAYCONFIG_SDR_WHITE_LEVEL,
-    DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
-    DISPLAYCONFIG_SOURCE_MODE, DISPLAYCONFIG_TARGET_DEVICE_NAME,
+    DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE, DISPLAYCONFIG_SOURCE_MODE,
     DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY, QDC_ALL_PATHS, QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES,
     SDC_APPLY, SDC_FORCE_MODE_ENUMERATION, SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND,
     SDC_USE_SUPPLIED_DISPLAY_CONFIG,
 };
-use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, LUID, POINTL};
+use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, POINTL};
 use windows::Win32::Graphics::Gdi::{
     ChangeDisplaySettingsExW, EnumDisplaySettingsW, CDS_RESET, CDS_TEST, CDS_UPDATEREGISTRY,
     DEVMODEW, DISP_CHANGE_FAILED, DISP_CHANGE_SUCCESSFUL, DM_BITSPERPEL, DM_DISPLAYFREQUENCY,
@@ -58,6 +50,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 
 use punktfunk_core::Mode;
+
+use crate::ccd_info;
 
 // The identity + inventory types live in the platform-neutral `snapshot` module (WP8) so the
 // cache rules test everywhere; re-exported here so every existing `win_display::` path still works.
@@ -100,76 +94,6 @@ fn source_mode_mut(m: &mut DISPLAYCONFIG_MODE_INFO) -> Option<&mut DISPLAYCONFIG
     }
     // SAFETY: `infoType == SOURCE`, checked above, makes `sourceMode` the live union arm.
     Some(unsafe { &mut m.Anonymous.sourceMode })
-}
-
-/// A `DisplayConfigGetDeviceInfo` / `DisplayConfigSetDeviceInfo` packet.
-///
-/// # Safety
-/// `Self` is `#[repr(C)]` with its `DISPLAYCONFIG_DEVICE_INFO_HEADER` at offset 0, holds only
-/// integer data (every bit pattern valid), and is the payload the OS uses for `TYPE`.
-pub(crate) unsafe trait DeviceInfoPacket: Default {
-    const TYPE: DISPLAYCONFIG_DEVICE_INFO_TYPE;
-    fn header_mut(&mut self) -> &mut DISPLAYCONFIG_DEVICE_INFO_HEADER;
-}
-
-macro_rules! device_info_packet {
-    ($($packet:ty => $kind:expr),* $(,)?) => {$(
-        const _: () = assert!(std::mem::offset_of!($packet, header) == 0);
-        // SAFETY: the windows crate declares `$packet` `#[repr(C)]` from wingdi.h, header first
-        // (asserted above), then integers and integer unions; `$kind` answers with `$packet`.
-        unsafe impl DeviceInfoPacket for $packet {
-            const TYPE: DISPLAYCONFIG_DEVICE_INFO_TYPE = $kind;
-            fn header_mut(&mut self) -> &mut DISPLAYCONFIG_DEVICE_INFO_HEADER {
-                &mut self.header
-            }
-        }
-    )*};
-}
-
-device_info_packet! {
-    DISPLAYCONFIG_SOURCE_DEVICE_NAME => DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
-    DISPLAYCONFIG_TARGET_DEVICE_NAME => DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
-    DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO => DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
-    DISPLAYCONFIG_SDR_WHITE_LEVEL => DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL,
-    DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE => DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE,
-}
-
-/// Stamp `T`'s request type, its full size and the addressed source or target into `packet`.
-fn stamp_device_info<T: DeviceInfoPacket>(packet: &mut T, adapter: LUID, id: u32) {
-    *packet.header_mut() = DISPLAYCONFIG_DEVICE_INFO_HEADER {
-        r#type: T::TYPE,
-        size: size_of::<T>() as u32,
-        adapterId: adapter,
-        id,
-    };
-}
-
-/// Ask the OS for `T` about source or target `id` on `adapter`. `None` when the call fails.
-pub(crate) fn device_info_get<T: DeviceInfoPacket>(adapter: LUID, id: u32) -> Option<T> {
-    let mut packet = T::default();
-    stamp_device_info(&mut packet, adapter, id);
-    // SAFETY: the pointer is cast from the whole local, so its provenance covers the
-    // `size_of::<T>()` bytes the header announces; the OS writes only there, synchronously, and
-    // any bytes it leaves are a valid `T` (`DeviceInfoPacket`).
-    let rc = unsafe { DisplayConfigGetDeviceInfo((&raw mut packet).cast()) };
-    (rc == 0).then_some(packet)
-}
-
-/// Send `packet`'s payload for source or target `id` on `adapter`; the raw return code.
-fn device_info_set<T: DeviceInfoPacket>(mut packet: T, adapter: LUID, id: u32) -> i32 {
-    stamp_device_info(&mut packet, adapter, id);
-    // SAFETY: the pointer is cast from the whole local, so its provenance covers the
-    // `size_of::<T>()` bytes the header announces; the OS reads them synchronously and keeps
-    // nothing.
-    unsafe { DisplayConfigSetDeviceInfo((&raw const packet).cast()) }
-}
-
-/// Whether HDR is on for target `id` on `adapter` (see [`hdr_active`]). `None` when the query
-/// fails.
-fn hdr_state(adapter: LUID, id: u32) -> Option<bool> {
-    let info = device_info_get::<DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO>(adapter, id)?;
-    // SAFETY: `value` overlays a same-sized POD bitfield; every bit pattern is a valid u32.
-    Some(hdr_active(unsafe { info.Anonymous.value }))
 }
 
 /// How a CCD read failed. A QUERY FAILURE is a distinct answer from an empty topology, and no
@@ -346,19 +270,14 @@ pub fn activate_target_path(key: CcdTargetKey) -> bool {
 /// until the OS activates the target into the desktop topology (needs a real WDDM GPU; on a
 /// GPU-less box this stays `None` even though ADD succeeded).
 pub fn resolve_gdi_name(key: CcdTargetKey) -> Option<String> {
+    let p = active_path(key)?;
+    ccd_info::source_gdi_name(p.sourceInfo.adapterId, p.sourceInfo.id)
+}
+
+/// The active CCD path driving `key`; `None` when the query fails or the target is inactive.
+fn active_path(key: CcdTargetKey) -> Option<DISPLAYCONFIG_PATH_INFO> {
     let (paths, _modes) = query_display_config(QDC_ONLY_ACTIVE_PATHS).ok()?;
-    for p in &paths {
-        if path_target_key(p) == key {
-            if let Some(src) = device_info_get::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>(
-                p.sourceInfo.adapterId,
-                p.sourceInfo.id,
-            ) {
-                let name = String::from_utf16_lossy(&src.viewGdiDeviceName);
-                return Some(name.trim_end_matches('\u{0}').to_string());
-            }
-        }
-    }
-    None
+    paths.into_iter().find(|p| path_target_key(p) == key)
 }
 
 /// The virtual display's CURRENT active resolution `(width, height)` via the GDI/CCD API, or `None` if the
@@ -377,7 +296,7 @@ pub fn active_resolution(key: CcdTargetKey) -> Option<(u32, u32)> {
 /// that RECORD a mode must record this, or they claim a refresh the display is not running.
 pub fn active_mode(key: CcdTargetKey) -> Option<(u32, u32, u32)> {
     let gdi = resolve_gdi_name(key)?;
-    let wname: Vec<u16> = gdi.encode_utf16().chain(std::iter::once(0)).collect();
+    let wname = HSTRING::from(gdi.as_str());
     let mut dm = DEVMODEW {
         dmSize: size_of::<DEVMODEW>() as u16,
         ..Default::default()
@@ -448,7 +367,7 @@ pub fn force_mode_reenumeration() -> bool {
 
 /// Distinct resolutions `gdi_name` advertises (fallback when the request is absent).
 pub fn advertised_resolutions(gdi_name: &str) -> Vec<(u32, u32)> {
-    let wname: Vec<u16> = gdi_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let wname = HSTRING::from(gdi_name);
     let mut set = std::collections::BTreeSet::new();
     let mut i = 0u32;
     loop {
@@ -479,7 +398,7 @@ pub fn advertised_resolutions(gdi_name: &str) -> Vec<(u32, u32)> {
 /// land asynchronously after `IddCxMonitorUpdateModes2`. Refresh is part of
 /// the match — WxH-only would skip a rate-only update.
 pub fn wait_mode_advertised(gdi_name: &str, mode: Mode, ceiling: std::time::Duration) -> bool {
-    let wname: Vec<u16> = gdi_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let wname = HSTRING::from(gdi_name);
     let deadline = std::time::Instant::now() + ceiling;
     loop {
         let mut i = 0u32;
@@ -554,28 +473,21 @@ pub fn wait_target_departed(key: CcdTargetKey, ceiling: std::time::Duration) -> 
 /// (the HDR fullscreen independent-flip otherwise storms `ACCESS_LOST` → black); re-enable on return so
 /// WGC keeps HDR on the normal desktop. Returns true on a successful `DisplayConfigSetDeviceInfo`.
 pub fn set_advanced_color(key: CcdTargetKey, enable: bool) -> bool {
-    let Ok((paths, _modes)) = query_display_config(QDC_ONLY_ACTIVE_PATHS) else {
+    let Some(p) = active_path(key) else {
+        tracing::warn!(
+            target = %key,
+            "virtual-display advanced-color: target not in active paths"
+        );
         return false;
     };
-    for p in &paths {
-        if path_target_key(p) == key {
-            let mut s = DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE::default();
-            s.Anonymous.value = enable as u32; // bit 0 = enableAdvancedColor
-            let rc = device_info_set(s, p.targetInfo.adapterId, p.targetInfo.id);
-            tracing::debug!(
-                target = %key,
-                enable,
-                rc,
-                "virtual-display set advanced-color (HDR) state"
-            );
-            return rc == 0;
-        }
-    }
-    tracing::warn!(
+    let rc = ccd_info::set_advanced_color_state(p.targetInfo.adapterId, p.targetInfo.id, enable);
+    tracing::debug!(
         target = %key,
-        "virtual-display advanced-color: target not in active paths"
+        enable,
+        rc,
+        "virtual-display set advanced-color (HDR) state"
     );
-    false
+    rc == 0
 }
 
 /// `DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO` bits: 1 = advancedColorEnabled, 2 = wideColorEnforced.
@@ -593,20 +505,15 @@ fn hdr_active(bits: u32) -> bool {
 /// the capture loop's poller keeps the last known value, since reading a blip as "HDR off" used to cost
 /// an HDR session TWO spurious ring recreates (false, then true again a poll later).
 pub fn advanced_color_enabled(key: CcdTargetKey) -> Option<bool> {
-    let (paths, _modes) = query_display_config(QDC_ONLY_ACTIVE_PATHS).ok()?;
-    for p in &paths {
-        if path_target_key(p) == key {
-            return hdr_state(p.targetInfo.adapterId, p.targetInfo.id);
-        }
-    }
-    None
+    let p = active_path(key)?;
+    ccd_info::advanced_color_bits(p.targetInfo.adapterId, p.targetInfo.id).map(hdr_active)
 }
 
 /// Re-apply the current mode with `CDS_RESET` — a same-mode write is otherwise
 /// a no-op. Restarts presentation after DWM stops composing to a virtual
 /// display. Same input-desktop retry as [`set_active_mode`].
 pub fn force_mode_reset(gdi_name: &str) -> bool {
-    let wname: Vec<u16> = gdi_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let wname = HSTRING::from(gdi_name);
     let mut dm = DEVMODEW {
         dmSize: size_of::<DEVMODEW>() as u16,
         ..Default::default()
@@ -728,7 +635,7 @@ pub fn set_active_mode_ccd(key: CcdTargetKey, mode: Mode) -> bool {
 /// this as [`set_active_mode_ccd`]'s fallback owe that a log, or a display
 /// left on the wrong mode looks like it was never asked.
 pub fn set_active_mode(gdi_name: &str, mode: Mode) -> bool {
-    let wname: Vec<u16> = gdi_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let wname = HSTRING::from(gdi_name);
 
     // Prefer same WxH: exact Hz, else highest advertised ≤ requested, else
     // highest at that resolution. A clamped pixel-rate must not collapse to
@@ -978,11 +885,6 @@ fn output_tech_class(tech: DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY) -> (bool, &'st
     }
 }
 
-fn utf16z_str(buf: &[u16]) -> String {
-    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    String::from_utf16_lossy(&buf[..len])
-}
-
 /// Connected targets (`QDC_ALL_PATHS`, unique by adapter+id). Read-only CCD;
 /// can serialize on the display-config lock — keep it off the capture thread. Empty on a failed
 /// query; the actor ([`crate::display_events`]) uses [`target_inventory_checked`] to tell that
@@ -1012,12 +914,11 @@ pub fn target_inventory_checked() -> Result<Vec<TargetInventory>, CcdError> {
             continue;
         }
         seen.push(key);
-        let Some(req) = device_info_get::<DISPLAYCONFIG_TARGET_DEVICE_NAME>(t.adapterId, t.id)
-        else {
+        let Some(name) = ccd_info::target_name(t.adapterId, t.id) else {
             continue; // no queryable monitor — nothing to attribute
         };
-        let monitor_device_path = utf16z_str(&req.monitorDevicePath);
-        let (mut external_physical, mut tech) = output_tech_class(req.outputTechnology);
+        let monitor_device_path = name.device_path;
+        let (mut external_physical, mut tech) = output_tech_class(name.tech);
         // Our IddCx monitor claims HDMI; connector class would call it a panel.
         let ours = is_our_virtual_display(&monitor_device_path);
         if ours {
@@ -1036,22 +937,16 @@ pub fn target_inventory_checked() -> Result<Vec<TargetInventory>, CcdError> {
                 p.sourceInfo.adapterId.LowPart,
                 p.sourceInfo.adapterId.HighPart,
             );
-            hdr = hdr_state(t.adapterId, t.id);
-            sdr_white_level = device_info_get::<DISPLAYCONFIG_SDR_WHITE_LEVEL>(t.adapterId, t.id)
-                .map(|w| w.SDRWhiteLevel)
-                .filter(|&level| level > 0);
+            hdr = ccd_info::advanced_color_bits(t.adapterId, t.id).map(hdr_active);
+            sdr_white_level = ccd_info::sdr_white_level(t.adapterId, t.id);
             if let Some(sm) = modes.get(mode_idxs(p).0 as usize).and_then(source_mode) {
                 x = sm.position.x;
                 y = sm.position.y;
                 width = sm.width;
                 height = sm.height;
             }
-            if let Some(src) = device_info_get::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>(
-                p.sourceInfo.adapterId,
-                p.sourceInfo.id,
-            ) {
-                gdi_name = utf16z_str(&src.viewGdiDeviceName);
-            }
+            gdi_name = ccd_info::source_gdi_name(p.sourceInfo.adapterId, p.sourceInfo.id)
+                .unwrap_or_default();
         }
         // mHz keeps 59.94 distinct from 60 without a float.
         let refresh_mhz = match t.refreshRate.Denominator {
@@ -1065,7 +960,7 @@ pub fn target_inventory_checked() -> Result<Vec<TargetInventory>, CcdError> {
             external_physical,
             internal_panel: tech == "internal-panel",
             tech,
-            friendly: utf16z_str(&req.monitorFriendlyDeviceName),
+            friendly: name.friendly,
             monitor_device_path,
             ours,
             gdi_name,
@@ -1608,16 +1503,12 @@ pub fn active_scanline_target() -> Option<(u32, i32, u32, bool)> {
             p.sourceInfo.id,
             false,
         );
-        let Some(req) = device_info_get::<DISPLAYCONFIG_TARGET_DEVICE_NAME>(
-            p.targetInfo.adapterId,
-            p.targetInfo.id,
-        ) else {
-            fallback.get_or_insert(candidate);
-            continue;
-        };
-        if is_our_virtual_display(&utf16z_str(&req.monitorDevicePath)) {
-            fallback.get_or_insert(candidate);
-            continue;
+        match ccd_info::target_name(p.targetInfo.adapterId, p.targetInfo.id) {
+            Some(name) if !is_our_virtual_display(&name.device_path) => {}
+            _ => {
+                fallback.get_or_insert(candidate);
+                continue;
+            }
         }
         return Some((candidate.0, candidate.1, candidate.2, true));
     }

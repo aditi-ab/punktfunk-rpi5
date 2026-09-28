@@ -159,7 +159,7 @@ async fn admit_session(conn: &Connection, serving: &Serving) -> Result<Option<Ad
         let fp_hex = hex::encode(fp);
         // `effective`, not `list`: an expired record knocks like an unpaired device, and
         // re-approval is the re-grant.
-        let now = crate::native::wall_unix_now();
+        let now = crate::clock::unix_secs();
         let knock = match serving.plane.pairing.effective(&fp_hex, now) {
             Some(_) => {
                 tracing::info!(fingerprint = %fp_hex, "browser authenticated");
@@ -258,13 +258,11 @@ async fn pair(
     }
     let client_fp = sha256(&req.device_key);
     let source = crate::native_pairing::classify_source(Some(conn.remote_address().ip()));
-    let pin = match serving.plane.pairing.pin_for_attempt(
-        &client_fp
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>(),
-        source,
-    ) {
+    let pin = match serving
+        .plane
+        .pairing
+        .pin_for_attempt(&hex::encode(client_fp), source)
+    {
         crate::native_pairing::PinAttempt::Pin(pin) => pin,
         crate::native_pairing::PinAttempt::Disarmed => {
             return Err(refused(

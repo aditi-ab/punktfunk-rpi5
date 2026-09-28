@@ -146,8 +146,8 @@ pub(crate) fn color_range(layer: u32) -> vk::ImageSubresourceRange {
     }
 }
 
-/// The first memory type in `bits` carrying every `want` flag. `Err` when none does: an
-/// index outside `bits` is invalid for the allocation it would back.
+/// First memory type in `bits` carrying every flag in `want`. A miss is an error, never
+/// index 0: that type may sit outside `bits` or lack a flag the caller relies on.
 pub(crate) fn find_mem(
     mp: &vk::PhysicalDeviceMemoryProperties,
     bits: u32,
@@ -157,7 +157,18 @@ pub(crate) fn find_mem(
         .find(|&i| {
             bits & (1 << i) != 0 && mp.memory_types[i as usize].property_flags.contains(want)
         })
-        .ok_or_else(|| anyhow::anyhow!("find a {want:?} memory type among {bits:#x}"))
+        .ok_or_else(|| anyhow::anyhow!("no Vulkan memory type with {want:?} in bits {bits:#x}"))
+}
+
+/// [`find_mem`] for `prefer`, else any type in `bits`. For video session and video image
+/// memory, which a driver may legally place off the device-local heap.
+#[cfg_attr(not(feature = "vulkan-encode"), allow(dead_code))]
+pub(crate) fn find_mem_preferring(
+    mp: &vk::PhysicalDeviceMemoryProperties,
+    bits: u32,
+    prefer: vk::MemoryPropertyFlags,
+) -> Result<u32> {
+    find_mem(mp, bits, prefer).or_else(|_| find_mem(mp, bits, vk::MemoryPropertyFlags::empty()))
 }
 
 /// DRM fourcc → VkFormat whose *color* components match; Vulkan does the byte swizzle.
@@ -294,8 +305,9 @@ pub(crate) unsafe fn import_rgb_dmabuf(
     )
 }
 
-/// Also imports one-fd LINEAR NV12: UV layout from plane-1, else shared-stride
-/// contiguous planes.
+/// Import `d` as a `usage` image plus a view; fd ownership and the memory pick are
+/// [`pf_zerocopy::vkdev::import_dmabuf_image`]'s. Also imports one-fd LINEAR NV12: UV layout
+/// from plane-1, else shared-stride contiguous planes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn import_rgb_dmabuf_as(
     device: &ash::Device,
@@ -308,13 +320,9 @@ pub(crate) unsafe fn import_rgb_dmabuf_as(
     profile_list: Option<&mut vk::VideoProfileListInfoKHR>,
 ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
     use anyhow::Context;
-    use std::os::fd::{AsRawFd, IntoRawFd};
+    use std::os::fd::AsFd;
     let fmt = fourcc_to_vk(d.fourcc)
         .with_context(|| format!("unsupported dmabuf fourcc {:#x}", d.fourcc))?;
-    // Dup first, keep owned: Vulkan takes the fd only on successful
-    // `allocate_memory`; `vkFreeMemory` then closes it. Close-after-success
-    // is a double-close of a recycled number.
-    let dup = d.fd.try_clone().context("dup dmabuf fd")?;
     let two_plane = matches!(
         fmt,
         vk::Format::G8_B8R8_2PLANE_420_UNORM
@@ -338,101 +346,28 @@ pub(crate) unsafe fn import_rgb_dmabuf_as(
             .offset(d.offset as u64)
             .row_pitch(d.stride as u64)]
     };
-    let mut drm = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
-        .drm_format_modifier(d.modifier)
-        .plane_layouts(&planes);
-    let mut ext = vk::ExternalMemoryImageCreateInfo::default()
-        .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-    let mut ci = vk::ImageCreateInfo::default()
-        .image_type(vk::ImageType::TYPE_2D)
-        .format(fmt)
-        .extent(vk::Extent3D {
+    let (img, mem) = pf_zerocopy::vkdev::import_dmabuf_image(
+        device,
+        ext_fd,
+        mem_props,
+        &pf_zerocopy::vkdev::DmabufImage {
+            fd: d.fd.as_fd(),
+            format: fmt,
             width: cw,
             height: ch,
-            depth: 1,
-        })
-        .mip_levels(1)
-        .array_layers(1)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-        .usage(usage)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .initial_layout(vk::ImageLayout::UNDEFINED)
-        .push_next(&mut ext)
-        .push_next(&mut drm);
-    if let Some(pl) = profile_list {
-        ci = ci.push_next(pl);
-    }
-    let img = device.create_image(&ci, None)?;
-    // Destroy only what this call created; the caller's `DmabufFrame` fd stays theirs.
-    let fd_props = {
-        let mut p = vk::MemoryFdPropertiesKHR::default();
-        // Borrow-only; error leaves `memory_type_bits = 0` and the fallback uses image reqs.
-        let _ = (ext_fd.fp().get_memory_fd_properties_khr)(
-            device.handle(),
-            vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
-            dup.as_raw_fd(),
-            &mut p,
-        );
-        p.memory_type_bits
-    };
-    let req = device.get_image_memory_requirements(img);
-    let bits = req.memory_type_bits & fd_props;
-    let ti = match find_mem(
-        mem_props,
-        if bits != 0 {
-            bits
-        } else {
-            req.memory_type_bits
+            modifier: d.modifier,
+            planes: &planes,
+            usage,
+            initial_layout: vk::ImageLayout::UNDEFINED,
         },
-        vk::MemoryPropertyFlags::empty(),
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            device.destroy_image(img, None);
-            return Err(e); // `dup` drops: nothing consumed it
-        }
-    };
-    let mut ded = vk::MemoryDedicatedAllocateInfo::default().image(img);
-    let mut import = vk::ImportMemoryFdInfoKHR::default()
-        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-        .fd(dup.as_raw_fd());
-    let mem = match device.allocate_memory(
-        &vk::MemoryAllocateInfo::default()
-            .allocation_size(req.size)
-            .memory_type_index(ti)
-            .push_next(&mut ded)
-            .push_next(&mut import),
-        None,
-    ) {
-        Ok(mem) => {
-            // Success transferred fd ownership to the memory object — release, don't close.
-            let _ = dup.into_raw_fd();
-            mem
-        }
-        Err(e) => {
-            device.destroy_image(img, None);
-            return Err(e.into()); // `dup` drops: the one close of the failed import
-        }
-    };
-    if let Err(e) = device.bind_image_memory(img, mem, 0) {
-        device.destroy_image(img, None);
-        device.free_memory(mem, None); // closes the imported fd
-        return Err(e.into());
-    }
-    let view = match device.create_image_view(
-        &vk::ImageViewCreateInfo::default()
-            .image(img)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(fmt)
-            .subresource_range(color_range(0)),
-        None,
-    ) {
+        profile_list,
+    )?;
+    let view = match make_view(device, img, fmt, 0) {
         Ok(v) => v,
         Err(e) => {
             device.destroy_image(img, None);
             device.free_memory(mem, None);
-            return Err(e.into());
+            return Err(e);
         }
     };
     Ok((img, mem, view))
@@ -450,27 +385,19 @@ pub(crate) unsafe fn make_host_buffer(
         None,
     )?;
     let req = device.get_buffer_memory_requirements(buf);
-    let ti = match find_mem(
-        mp,
-        req.memory_type_bits,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            device.destroy_buffer(buf, None);
-            return Err(e);
-        }
-    };
-    let mem = match device.allocate_memory(
-        &vk::MemoryAllocateInfo::default()
-            .allocation_size(req.size)
-            .memory_type_index(ti),
-        None,
-    ) {
+    let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    let mem = match find_mem(mp, req.memory_type_bits, host).and_then(|ti| {
+        Ok(device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(ti),
+            None,
+        )?)
+    }) {
         Ok(m) => m,
         Err(e) => {
             device.destroy_buffer(buf, None);
-            return Err(e.into());
+            return Err(e);
         }
     };
     if let Err(e) = device.bind_buffer_memory(buf, mem, 0) {
@@ -508,27 +435,19 @@ pub(crate) unsafe fn make_plain_image(
     )?;
     let req = device.get_image_memory_requirements(img);
     // Unwind: callers only ever see the completed triple.
-    let ti = match find_mem(
-        mp,
-        req.memory_type_bits,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            device.destroy_image(img, None);
-            return Err(e);
-        }
-    };
-    let mem = match device.allocate_memory(
-        &vk::MemoryAllocateInfo::default()
-            .allocation_size(req.size)
-            .memory_type_index(ti),
-        None,
-    ) {
+    let local = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+    let mem = match find_mem(mp, req.memory_type_bits, local).and_then(|ti| {
+        Ok(device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(ti),
+            None,
+        )?)
+    }) {
         Ok(m) => m,
         Err(e) => {
             device.destroy_image(img, None);
-            return Err(e.into());
+            return Err(e);
         }
     };
     if let Err(e) = device.bind_image_memory(img, mem, 0) {
@@ -580,6 +499,22 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_memory_type_miss_is_an_error_not_index_0() {
+        let mut mp = vk::PhysicalDeviceMemoryProperties {
+            memory_type_count: 3,
+            ..Default::default()
+        };
+        mp.memory_types[1].property_flags = vk::MemoryPropertyFlags::HOST_VISIBLE;
+        mp.memory_types[2].property_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+        let local = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+        assert_eq!(find_mem(&mp, 0b110, local).unwrap(), 2);
+        assert!(find_mem(&mp, 0b011, local).is_err());
+        assert_eq!(find_mem_preferring(&mp, 0b011, local).unwrap(), 0);
+        assert_eq!(find_mem_preferring(&mp, 0b010, local).unwrap(), 1);
+        assert!(find_mem_preferring(&mp, 0, local).is_err());
+    }
 
     #[test]
     fn normalize_cpu_rgb_expands_24bpp_and_borrows_4bpp() {

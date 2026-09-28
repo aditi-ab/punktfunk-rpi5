@@ -1,6 +1,8 @@
 package io.unom.punktfunk.kit
 
 import android.view.KeyEvent
+import java.io.File
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -42,6 +44,33 @@ class KeymapTest {
         assertEquals(0, Keymap.evdevToVk(1)) // KEY_ESC — layout-invariant, keycode path
         assertEquals(0, Keymap.evdevToVk(59)) // KEY_F1
         assertEquals(0, Keymap.evdevToVk(304)) // BTN_SOUTH — gamepad, never a typing key
+    }
+
+    /**
+     * `crates/punktfunk-core/testdata/evdev-vk-vectors.json`, which core's `evdev_to_vk` writes:
+     * every scancode this table maps agrees with it, and every layout-variant key (digits,
+     * letters, OEM punctuation) core maps is covered here.
+     */
+    @Test
+    fun matchesTheCoreVectors() {
+        val file = File("../../../crates/punktfunk-core/testdata/evdev-vk-vectors.json")
+        assertTrue("the vector file must be reachable at ${file.absolutePath}", file.isFile)
+        val cases = JSONObject(file.readText()).getJSONArray("cases")
+        val oem = (0xBA..0xC0) + (0xDB..0xDE) + 0xE2
+        var typing = 0
+        for (i in 0 until cases.length()) {
+            val case = cases.getJSONObject(i)
+            val scan = case.getInt("evdev")
+            val vk = if (case.isNull("vk")) 0 else case.getInt("vk")
+            val mine = Keymap.evdevToVk(scan)
+            if (vk in 0x30..0x39 || vk in 0x41..0x5A || vk in oem) {
+                typing++
+                assertEquals("evdev $scan", vk, mine)
+            } else if (mine != 0) {
+                assertEquals("evdev $scan", vk, mine)
+            }
+        }
+        assertEquals(48, typing)
     }
 
     /** Korean and JIS IME keys leave as the VKs the hosts map, under Android's odd names. */

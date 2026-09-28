@@ -116,7 +116,7 @@ fn power_permitted(st: &MgmtState, lane: AuthLane, fp: Option<&str>) -> bool {
         AuthLane::Cert => fp.is_some_and(|fp| {
             st.native
                 .as_ref()
-                .and_then(|n| n.effective(fp, unix_now()))
+                .and_then(|n| n.effective(fp, crate::clock::unix_secs()))
                 .is_some_and(|mask| mask & punktfunk_core::quic::GRANT_POWER != 0)
         }),
         AuthLane::Plugin | AuthLane::Public => false,
@@ -197,14 +197,6 @@ fn next_monitor_target() -> Result<(String, String), &'static str> {
         crate::vdisplay::policy::prefs().get().capture_monitor,
         || crate::vdisplay::detect().and_then(crate::vdisplay::monitors::list),
     )
-}
-
-/// Host wall clock, unix seconds — the clock stored access deadlines are expressed in.
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 /// List host actions

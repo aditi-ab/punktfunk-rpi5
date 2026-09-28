@@ -41,9 +41,10 @@ note in `clients/android/.../components/OsIcons.kt`.
 ## Regenerating the per-client derivatives
 
 `bash scripts/gen-os-icons.sh [token ...]` turns a master into the three baked forms (GTK
-symbolic SVG, Windows PNG, Apple template PDF) and prints the path data for the three clients
-that inline it (web console, Decky plugin, Android). Adding a **new** token also means adding it
-to each client's shipped-token list — the script prints that checklist too.
+symbolic SVG, Windows PNG, Apple template PDF) and regenerates the path registries of the four
+clients that inline it (Skia console, web console, Decky plugin, Android). Adding a **new** token
+also means adding it to each baked client's shipped-token list — the script prints that checklist
+too.
 
 ## Licensing
 

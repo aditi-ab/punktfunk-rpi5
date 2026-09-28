@@ -31,9 +31,7 @@ public final class LatencyMeter: @unchecked Sendable {
     /// Record one frame at receipt (now). `ptsNs` is the host capture clock (the AU's pts);
     /// `offsetNs` is the host-client clock offset from the skew handshake (0 = uncorrected).
     public func record(ptsNs: UInt64, offsetNs: Int64) {
-        var ts = timespec()
-        clock_gettime(CLOCK_REALTIME, &ts)
-        let nowNs = Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
+        let nowNs = realtimeNowNs()
         record(ptsNs: ptsNs, atNs: nowNs, offsetNs: offsetNs)
     }
 

@@ -160,8 +160,7 @@ impl StreamState {
                 self.bitrate_kbps = applied_kbps;
                 self.live_bitrate.store(applied_kbps, Ordering::Relaxed);
                 self.inflight.clear();
-                self.last_au_at = std::time::Instant::now();
-                self.encoder_resets = 0;
+                self.watchdog.on_au();
                 self.last_forced_idr = Some(std::time::Instant::now());
                 self.behind_score = 0;
                 self.depth_frames = 0;

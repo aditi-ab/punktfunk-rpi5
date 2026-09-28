@@ -17,14 +17,12 @@ import {
 	useListLibraryScanners,
 	useSetLibraryScanner,
 } from "@/api/gen/library/library";
+import type { CatalogEntry } from "@/api/gen/model";
 import type { PluginAccessSnapshot } from "@/api/gen/model/pluginAccessSnapshot";
 import type { ScannerInfo } from "@/api/gen/model/scannerInfo";
+import { useGetPluginCatalog } from "@/api/gen/store/store";
 import { usePlugins } from "@/api/plugins";
-import {
-	type StoreEntry,
-	useInstallPlugin,
-	useStoreCatalog,
-} from "@/api/store";
+import { useInstallPlugin } from "@/api/store";
 import { useDialogs } from "@/components/dialogs";
 import { ROW, ROW_GAP, Stagger } from "@/components/stagger";
 import { Badge } from "@/components/ui/badge";
@@ -53,7 +51,7 @@ export const SourcesSection: FC<{
 	const toggle = useSetLibraryScanner();
 	const purge = useDeleteProviderEntries();
 	const plugins = usePlugins();
-	const catalog = useStoreCatalog();
+	const catalog = useGetPluginCatalog();
 	const install = useInstallPlugin();
 	const access = usePluginAccess();
 	const [settingsFor, setSettingsFor] = useState<ScannerInfo | null>(null);
@@ -98,7 +96,7 @@ export const SourcesSection: FC<{
 		}
 	};
 
-	const onInstall = async (entry: StoreEntry) => {
+	const onInstall = async (entry: CatalogEntry) => {
 		try {
 			// Install by (source, id) — the catalogued, integrity-pinned path. The raw-spec form is
 			// for unverified installs and must never be reachable from a one-click rail.
@@ -154,7 +152,9 @@ export const SourcesSection: FC<{
 			source: s,
 			entry: available.find((p) => p.id === s.id),
 		}))
-		.filter((r): r is { source: ScannerInfo; entry: StoreEntry } => !!r.entry);
+		.filter(
+			(r): r is { source: ScannerInfo; entry: CatalogEntry } => !!r.entry,
+		);
 
 	return (
 		<>
@@ -202,9 +202,9 @@ export const SourcesSection: FC<{
  * migration is a valid state rather than a mess.
  */
 export const MigrationBanner: FC<{
-	rows: ReadonlyArray<{ source: ScannerInfo; entry: StoreEntry }>;
+	rows: ReadonlyArray<{ source: ScannerInfo; entry: CatalogEntry }>;
 	busy: boolean;
-	onInstall: (entry: StoreEntry) => void;
+	onInstall: (entry: CatalogEntry) => void;
 }> = ({ rows, busy, onInstall }) => (
 	<Card>
 		<CardHeader className="pb-3">
@@ -239,7 +239,7 @@ export const MigrationBanner: FC<{
 export const SourcesCard: FC<{
 	sources: ScannerInfo[];
 	/** Catalog rows offering a library source that isn't installed yet. */
-	available: StoreEntry[];
+	available: CatalogEntry[];
 	/** Ids of every plugin whose lease is currently live, whatever its category. */
 	running: Set<string>;
 	/** Source id whose toggle is in flight, or null — only that row disables. */
@@ -250,7 +250,7 @@ export const SourcesCard: FC<{
 	onFilter: (provider: string | null) => void;
 	onSettings: (source: ScannerInfo) => void;
 	onPurge: (source: ScannerInfo) => void;
-	onInstall: (entry: StoreEntry) => void;
+	onInstall: (entry: CatalogEntry) => void;
 	access?: PluginAccessSnapshot[];
 	accessBusy?: boolean;
 	accessInitiallyOpen?: boolean;

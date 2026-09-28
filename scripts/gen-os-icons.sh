@@ -9,9 +9,8 @@
 #   Windows shell PNG, h=96, white          -> clients/windows/assets/os/
 #   Apple clients vector PDF, black fill    -> clients/apple/.../OsIcons.xcassets/
 #
-# The web console, the Decky plugin and the Android client transcribe the master's path
-# data inline instead — those are hand-kept, and this script prints them at the end so a
-# new token can be pasted straight in.
+# The Skia console, the web console, the Decky plugin and the Android client inline the path
+# data instead; scripts/gen_os_mark_table.py generates those four registries.
 #
 # Idempotent. Usage: bash scripts/gen-os-icons.sh [token ...]   (default: every master)
 set -euo pipefail
@@ -81,32 +80,13 @@ JSON
 done
 
 echo
-# The Skia console parses SVG path data at RUNTIME, so it needs no baked derivative — it
-# needs the path string, and gets it as a generated Rust table rather than a hand-kept
-# inline registry. Thirteen paths of up to 3.5 kB where one mangled character is a silently
-# wrong logo is not transcription work for a human. Always regenerated from EVERY master,
-# whatever tokens this script was invoked with: it is one file, and a partial rewrite would
-# drop the rest.
-log "console Rust table (crates/pf-console-ui/src/os_marks.rs)"
+# Always regenerated from EVERY master, whatever tokens this script was invoked with: each
+# registry is one file, and a partial rewrite would drop the rest.
+log "inline path registries (console, web, Decky, Android)"
 python3 scripts/gen_os_mark_table.py
-
-echo
-log "Inline path data (web/src/components/os-icon.tsx, clients/decky/src/os-icon.tsx,"
-log "  clients/android/.../components/OsIcons.kt — hand-kept, paste from here)"
-for t in "${tokens[@]}"; do
-  python3 - "$MASTERS/$t.svg" "$t" <<'PY'
-import re, sys
-svg = open(sys.argv[1]).read()
-box = re.search(r'viewBox="([^"]+)"', svg).group(1)
-d = re.search(r'<path[^>]* d="([^"]+)"', svg).group(1)
-w, h = box.split()[2:]
-print(f'\n  {sys.argv[2]}: viewBox "{box}" (viewport {w} x {h})\n    {d}')
-PY
-done
 
 echo
 log "Remember: a NEW token also has to be added to each client's shipped-token list —"
 log "  clients/linux/src/ui_hosts.rs, clients/linux/data/resources.gresource.xml,"
-log "  clients/windows/src/app/os_icons.rs, clients/apple/.../PunktfunkKit/OsIcon.swift,"
-log "  plus the three inline registries above. (The console's table is generated above and"
-log "  needs no list — it ships whatever masters exist.)"
+log "  clients/windows/src/app/os_icons.rs, clients/apple/.../PunktfunkKit/OsIcon.swift."
+log "  (The generated registries need no list — they ship whatever masters exist.)"

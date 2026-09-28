@@ -1,5 +1,5 @@
 //! Shared streaming-stats recorder (`design/stats-capture-plan.md`). One
-//! [`StatsRecorder`] is created in `gamestream::serve` and shared with
+//! [`StatsRecorder`] is created in `host::serve` and shared with
 //! [`crate::mgmt`] and the native / GameStream encode loops.
 //!
 //! Captures persist as JSON under the captures dir and survive a host restart.
@@ -29,6 +29,104 @@ pub struct StageTiming {
     pub name: String,
     pub p50_us: f32,
     pub p99_us: f32,
+}
+
+/// One stage's p50/p99 over a window's samples.
+pub(crate) fn stage(name: &str, v: &mut [u32]) -> StageTiming {
+    StageTiming {
+        name: name.into(),
+        p50_us: crate::send_pacing::percentile(v, 0.50) as f32,
+        p99_us: crate::send_pacing::percentile(v, 0.99) as f32,
+    }
+}
+
+/// One Windows-driver AU's stages, from the driver encoder's telemetry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DriverSample {
+    /// The driver stamped its slot: pool wait (`None` = unmeasured), its encode, the hand-off.
+    Split {
+        pool: Option<u32>,
+        encode: u32,
+        ipc: u32,
+    },
+    /// Present → arrival in one lump, from a driver that does not stamp. `None` = unmeasured.
+    Lump(Option<u32>),
+}
+
+impl DriverSample {
+    pub(crate) fn from_telemetry(t: Option<&pf_frame::health::EncoderTelemetry>) -> DriverSample {
+        let us = |d: std::time::Duration| d.as_micros().min(u128::from(u32::MAX)) as u32;
+        match t.and_then(|t| t.driver_split) {
+            Some(s) => DriverSample::Split {
+                pool: s.pool.map(us),
+                encode: us(s.encode),
+                ipc: us(s.ipc),
+            },
+            None => DriverSample::Lump(t.and_then(|t| t.present_to_arrival).map(us)),
+        }
+    }
+
+    /// `(queue, encode)` µs for the per-AU host-timing stages; unmeasured reads 0.
+    pub(crate) fn queue_encode_us(self) -> (u32, u32) {
+        match self {
+            DriverSample::Split { pool, encode, .. } => (pool.unwrap_or(0), encode),
+            DriverSample::Lump(lump) => (0, lump.unwrap_or(0)),
+        }
+    }
+}
+
+/// A stats window's driver stages. An unmeasured value adds nothing, never a zero.
+#[derive(Default)]
+pub(crate) struct DriverStages {
+    /// Some AU this window came from the driver.
+    path: bool,
+    /// The driver stamped its split on some AU this window.
+    split: bool,
+    pool: Vec<u32>,
+    encode: Vec<u32>,
+    ipc: Vec<u32>,
+    lump: Vec<u32>,
+}
+
+impl DriverStages {
+    pub(crate) fn note(&mut self, sample: DriverSample) {
+        self.path = true;
+        match sample {
+            DriverSample::Split { pool, encode, ipc } => {
+                self.split = true;
+                self.pool.extend(pool);
+                self.encode.push(encode);
+                self.ipc.push(ipc);
+            }
+            DriverSample::Lump(lump) => self.lump.extend(lump),
+        }
+    }
+
+    /// Some AU this window came from the driver.
+    pub(crate) fn active(&self) -> bool {
+        self.path
+    }
+
+    /// The window's leading stages: `pool encode ipc`, or `driver` from a driver that does
+    /// not stamp. `None` off the driver path, where the plane's host stages apply.
+    pub(crate) fn stages(&mut self) -> Option<Vec<StageTiming>> {
+        if self.split {
+            Some(vec![
+                stage("pool", &mut self.pool),
+                stage("encode", &mut self.encode),
+                stage("ipc", &mut self.ipc),
+            ])
+        } else if self.path {
+            Some(vec![stage("driver", &mut self.lump)])
+        } else {
+            None
+        }
+    }
+
+    /// Start the next window.
+    pub(crate) fn reset(&mut self) {
+        *self = DriverStages::default();
+    }
 }
 
 /// One aggregated sample (~2 s native, ~1 s GameStream).
@@ -201,37 +299,11 @@ fn valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-fn unix_ms_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// Filesystem-safe id from start time + resolution, e.g.
 /// `2026-06-26T20-14-03Z_5120x1440`. Dashes, not colons, so Windows accepts it.
 fn capture_id(unix_ms: u64, width: u32, height: u32) -> String {
-    let secs = (unix_ms / 1000) as i64;
-    let days = secs.div_euclid(86_400);
-    let tod = secs.rem_euclid(86_400);
-    let (y, mo, d) = civil_from_days(days);
-    let (h, mi, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}-{mi:02}-{s:02}Z_{width}x{height}")
-}
-
-/// Civil (Y, M, D) from a count of days since the Unix epoch (Howard Hinnant's `civil_from_days`).
-/// `pub(crate)`: `client_logs::bundle_id` builds its timestamp stem the same way.
-pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    (if m <= 2 { y + 1 } else { y }, m as u32, d)
+    let stamp = punktfunk_core::time::utc_rfc3339(unix_ms, false).replace(':', "-");
+    format!("{stamp}_{width}x{height}")
 }
 
 impl StatsRecorder {
@@ -255,6 +327,24 @@ impl StatsRecorder {
         self.generation.load(Ordering::Relaxed)
     }
 
+    /// This loop's session id in the live capture. `cached` holds `(generation, id)`;
+    /// `register` runs again whenever a new capture has started, since the header is per capture.
+    pub fn session_id(
+        &self,
+        cached: &mut Option<(u64, u32)>,
+        register: impl FnOnce() -> u32,
+    ) -> u32 {
+        let generation = self.generation();
+        match *cached {
+            Some((g, id)) if g == generation => id,
+            _ => {
+                let id = register();
+                *cached = Some((generation, id));
+                id
+            }
+        }
+    }
+
     /// Per-frame `Relaxed` load: whether this frame should measure.
     pub fn is_armed(&self) -> bool {
         self.armed.load(Ordering::Relaxed)
@@ -266,7 +356,7 @@ impl StatsRecorder {
         if guard.is_none() {
             *guard = Some(Live {
                 started: Instant::now(),
-                started_unix_ms: unix_ms_now(),
+                started_unix_ms: crate::clock::unix_ms(),
                 meta: None,
                 samples: Vec::new(),
                 link: Vec::new(),
@@ -358,12 +448,8 @@ impl StatsRecorder {
             link: live.link,
         };
         let bytes = serde_json::to_vec(&capture).map_err(std::io::Error::other)?;
-        // Sibling temp then rename: a crash mid-write cannot leave a half file.
         // `id` is generated (`valid_id`), so this names a child of `dir`.
-        let path = self.dir.join(format!("{}.json", meta.id));
-        let tmp = self.dir.join(format!("{}.json.tmp", meta.id));
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &path)?;
+        pf_paths::replace_file(&self.dir.join(format!("{}.json", meta.id)), &bytes)?;
         Ok(Some(meta))
     }
 
@@ -490,6 +576,59 @@ fn meta_of(live: &Live) -> CaptureMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unmeasured lump or pool adds no sample; a measured 0 µs pool counts. Both planes
+    /// feed these, so a missing present stamp cannot drag the `driver` p50 to zero.
+    #[test]
+    fn driver_stages_count_what_was_measured_and_nothing_else() {
+        assert_eq!(DriverSample::from_telemetry(None), DriverSample::Lump(None));
+        let mut d = DriverStages::default();
+        assert!(d.stages().is_none());
+        for lump in [None, None, Some(500)] {
+            d.note(DriverSample::Lump(lump));
+        }
+        let lump = d.stages().expect("driver path");
+        assert_eq!(lump.len(), 1);
+        assert_eq!((lump[0].name.as_str(), lump[0].p50_us), ("driver", 500.0));
+
+        d.reset();
+        assert!(!d.active());
+        for pool in [Some(0), Some(0), Some(900), None] {
+            d.note(DriverSample::Split {
+                pool,
+                encode: 2_000,
+                ipc: 40,
+            });
+        }
+        let split = d.stages().expect("split path");
+        let names: Vec<_> = split.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["pool", "encode", "ipc"]);
+        assert_eq!(split[0].p50_us, 0.0);
+        assert_eq!(
+            DriverSample::Split {
+                pool: None,
+                encode: 2_000,
+                ipc: 40
+            }
+            .queue_encode_us(),
+            (0, 2_000)
+        );
+    }
+
+    /// A loop keeps its session id for one capture and registers again for the next.
+    #[test]
+    fn session_id_registers_once_per_capture() {
+        let dir = temp_dir();
+        let rec = StatsRecorder::new(dir.clone());
+        let mut sid = None;
+        rec.start();
+        assert_eq!(rec.session_id(&mut sid, || 7), 7);
+        assert_eq!(rec.session_id(&mut sid, || unreachable!()), 7);
+        let _ = rec.stop();
+        rec.start();
+        assert_eq!(rec.session_id(&mut sid, || 9), 9);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn temp_dir() -> PathBuf {
         // Process-wide counter, not a timestamp: parallel tests in the same

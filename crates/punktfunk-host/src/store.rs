@@ -245,7 +245,7 @@ pub(crate) fn plugin_id_for_pkg(pkg: &str) -> Option<String> {
     let id = last
         .strip_prefix("punktfunk-plugin-")
         .or_else(|| last.strip_prefix("plugin-"))?;
-    index::valid_plugin_id(id).then(|| id.to_string())
+    crate::slug::plugin_id(id).then(|| id.to_string())
 }
 
 #[derive(Clone)]
@@ -277,7 +277,7 @@ impl SourceState {
         self.index.is_some()
             && self
                 .fetched_at
-                .is_some_and(|t| catalog::unix_now().saturating_sub(t) < CATALOG_TTL_SECS)
+                .is_some_and(|t| crate::clock::unix_secs_u64().saturating_sub(t) < CATALOG_TTL_SECS)
     }
 }
 
@@ -337,7 +337,7 @@ pub(crate) fn catalogs(force: bool) -> Vec<SourceState> {
                 .and_then(|s| s.etag.clone())
         };
         let outcome = catalog::fetch(&source, etag.as_deref());
-        let now = catalog::unix_now();
+        let now = crate::clock::unix_secs_u64();
         let mut st = state().write().unwrap_or_else(|e| e.into_inner());
         let Some(slot) = st.iter_mut().find(|s| s.source.name == source.name) else {
             continue; // source removed during the fetch

@@ -28,9 +28,6 @@ const SAMPLE_RATE: usize = 48_000;
 /// Capture stereo: WASAPI autoconvert matrixes any endpoint layout into the requested format.
 /// Downmix to mono in code before encode — voice is mono, half the samples, half the wire.
 const CAPT_CHANNELS: usize = 2;
-/// 10 ms at 48 kHz (480 mono samples). Host accepts any size ≤ 120 ms; 10 ms is the fill share
-/// of mouth-to-ear latency.
-const MIC_FRAME: usize = 480;
 
 /// Named once so the decode thread and the render loop share the same de-prime fuse.
 pub(crate) const TUNING: punktfunk_core::audio::JitterTuning =
@@ -649,17 +646,9 @@ fn mic_thread(
         .context("CoInitializeEx (MTA)")?;
     crate::audio_rt::boost_and_log("wasapi-mic");
 
-    let mut encoder = opus::Encoder::new(
-        SAMPLE_RATE as u32,
-        opus::Channels::Mono,
-        opus::Application::Voip,
-    )
-    .map_err(|e| anyhow!("opus encoder: {e}"))?;
-    // 48 kbps mono is transparent for speech. In-band FEC + 10 % assumed loss: 0xCB is
-    // fire-and-forget, so this is the only redundancy.
-    let _ = encoder.set_bitrate(opus::Bitrate::Bits(48_000));
-    let _ = encoder.set_inband_fec(true);
-    let _ = encoder.set_packet_loss_perc(10);
+    // Each event drains the bounded endpoint buffer, so no backlog builds to self-heal.
+    let mut mic = punktfunk_core::audio::mic::MicEncoder::new(false)
+        .map_err(|e| anyhow!("opus encoder: {e}"))?;
 
     let enumerator = DeviceEnumerator::new().context("DeviceEnumerator")?;
     let device = pick_device(&enumerator, &Direction::Capture, "PUNKTFUNK_AUDIO_SOURCE")
@@ -694,9 +683,6 @@ fn mic_thread(
         .context("start capture stream")?;
 
     let mut bytes: VecDeque<u8> = VecDeque::new();
-    let mut ring: VecDeque<f32> = VecDeque::new();
-    let mut out = vec![0u8; 4000];
-    let mut seq = 0u32;
 
     while !stop.load(Ordering::Relaxed) {
         if h_event.wait_for_event(100).is_err() {
@@ -716,36 +702,16 @@ fn mic_thread(
         // Autoconvert already matrixed the endpoint layout to stereo; average L/R to mono.
         let stereo_frame = 4 * CAPT_CHANNELS;
         let whole = (bytes.len() / stereo_frame) * stereo_frame;
-        for c in bytes
-            .drain(..whole)
-            .collect::<Vec<u8>>()
-            .chunks_exact(stereo_frame)
-        {
+        let stereo: Vec<u8> = bytes.drain(..whole).collect();
+        mic.push(stereo.chunks_exact(stereo_frame).map(|c| {
             let l = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
             let r = f32::from_le_bytes([c[4], c[5], c[6], c[7]]);
-            ring.push_back((l + r) * 0.5);
-        }
-        // Keep the client started. Discard whole frames so the ring cannot grow. Do not
-        // advance `seq` — the host would conceal a mute-sized gap frame by frame.
-        if muted.load(Ordering::Relaxed) {
-            let drop_n = (ring.len() / MIC_FRAME) * MIC_FRAME;
-            ring.drain(..drop_n);
-            continue;
-        }
-        while ring.len() >= MIC_FRAME {
-            let pcm: Vec<f32> = ring.drain(..MIC_FRAME).collect();
-            match encoder.encode_float(&pcm, &mut out) {
-                Ok(len) => {
-                    let pts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as u64)
-                        .unwrap_or(0);
-                    let _ = connector.send_mic(seq, pts, out[..len].to_vec());
-                    seq = seq.wrapping_add(1);
-                }
-                Err(e) => tracing::debug!(error = %e, "opus mic encode"),
-            }
-        }
+            (l + r) * 0.5
+        }));
+        // Muted, the client stays started and frames drop unencoded.
+        mic.drain(muted.load(Ordering::Relaxed), |seq, pts, packet| {
+            let _ = connector.send_mic(seq, pts, packet.to_vec());
+        });
     }
     audio_client.stop_stream().ok();
     Ok(())

@@ -74,31 +74,17 @@ fn sanitize_name(name: &str) -> String {
     }
 }
 
-fn unix_ms_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// `{ISO-date}T{h-m-s}Z_{fp16}_{name}` — timestamp first so a directory sort is
 /// newest-last; dashes (not colons) so the stem is a valid Windows filename.
 /// Underscores separate the three fields; name/fp stay `[A-Za-z0-9.-]`.
 fn bundle_id(unix_ms: u64, fp_hex: &str, name: &str) -> String {
-    let secs = (unix_ms / 1000) as i64;
-    let days = secs.div_euclid(86_400);
-    let tod = secs.rem_euclid(86_400);
-    let (y, mo, d) = crate::stats_recorder::civil_from_days(days);
-    let (h, mi, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+    let stamp = punktfunk_core::time::utc_rfc3339(unix_ms, false).replace(':', "-");
     let fp16: String = fp_hex
         .chars()
         .filter(char::is_ascii_alphanumeric)
         .take(16)
         .collect();
-    format!(
-        "{y:04}-{mo:02}-{d:02}T{h:02}-{mi:02}-{s:02}Z_{fp16}_{}",
-        sanitize_name(name)
-    )
+    format!("{stamp}_{fp16}_{}", sanitize_name(name))
 }
 
 impl ClientLogStore {
@@ -113,7 +99,7 @@ impl ClientLogStore {
 
     /// Prunes that device past [`KEEP_PER_DEVICE`].
     pub fn save(&self, fp_hex: &str, device_name: &str, body: &[u8]) -> std::io::Result<String> {
-        let id = bundle_id(unix_ms_now(), fp_hex, device_name);
+        let id = bundle_id(crate::clock::unix_ms(), fp_hex, device_name);
         // Body may contain addresses and host names; owner-only, like host secrets.
         // The dir ACL is not the only gate.
         pf_paths::write_secret_file(&self.dir.join(format!("{id}.log")), body)?;

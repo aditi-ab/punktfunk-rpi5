@@ -428,7 +428,7 @@ impl GameEnder {
                 let live = fp.is_some_and(|fp| {
                     st.native
                         .as_ref()
-                        .is_some_and(|n| n.effective(fp, super::auth::unix_now()).is_some())
+                        .is_some_and(|n| n.effective(fp, crate::clock::unix_secs()).is_some())
                 });
                 Self {
                     owner: fp.map(str::to_string),

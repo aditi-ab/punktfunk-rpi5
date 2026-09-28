@@ -24,7 +24,6 @@ mod vsync;
 
 use async_loop::run_async;
 pub(crate) use setup::{codec_label, codec_mime};
-pub(crate) use vsync::now_monotonic_ns;
 // Shared with the PyroWave lane, which exists only where the codec is built (see `crate::pyro`).
 #[cfg(target_pointer_width = "64")]
 pub(crate) use latency::now_realtime_ns;

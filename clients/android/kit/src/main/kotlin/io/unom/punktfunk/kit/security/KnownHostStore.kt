@@ -82,6 +82,12 @@ data class KnownHost(
      * Mirrors the Rust `KnownHost.prev_addrs` and the Apple client's `StoredHost.previousAddresses`.
      */
     val prevAddresses: List<String> = emptyList(),
+    /** When this record was saved (Unix seconds); the console's "Date added" order. `null` on a
+     *  record saved before the field existed, which sorts ahead of every dated one. */
+    val addedAt: Long? = null,
+    /** Unix seconds of the last session that connected; `null` until one has. Mirrors the Rust
+     *  `KnownHost.last_used` and the Apple client's `StoredHost.lastConnected`. */
+    val lastUsed: Long? = null,
 ) {
     /** This record re-pointed at [to]:[toPort], remembering the address it leaves. */
     fun movedTo(to: String, toPort: Int): KnownHost = copy(
@@ -196,9 +202,15 @@ class KnownHostStore(context: Context) {
             name = if (existing.fpHex.isEmpty()) name else existing.name,
             fpHex = fpHex,
             paired = paired,
-        ) ?: KnownHost(address, port, name, fpHex, paired)
+        ) ?: KnownHost(address, port, name, fpHex, paired, addedAt = nowSecs())
         save(host)
         return host
+    }
+
+    /** Stamp now as [host]'s last connect. No-op when the record is gone. */
+    fun touchLastUsed(host: KnownHost) {
+        val h = byId(host.id) ?: return
+        save(h.copy(lastUsed = nowSecs()))
     }
 
     /**
@@ -388,6 +400,8 @@ class KnownHostStore(context: Context) {
             .put("profile", host.presetId ?: "")
             .put("game_profiles", JSONObject(host.gamePresets))
             .put("prev_addrs", JSONArray(host.prevAddresses))
+            .put("added", host.addedAt ?: 0)
+            .put("last_used", host.lastUsed ?: 0)
             .toString()
 
         /** One stored record, or null when it does not parse. */
@@ -416,6 +430,9 @@ class KnownHostStore(context: Context) {
                     j.optJSONObject(newOrOld(j, "game_presets", "game_profiles")),
                 ),
                 prevAddresses = stringList(j.optJSONArray("prev_addrs")),
+                // 0 (or absent) = never stamped, the same sentinel as `mgmt`.
+                addedAt = j.optLong("added", 0).takeIf { it > 0 },
+                lastUsed = j.optLong("last_used", 0).takeIf { it > 0 },
             )
         }.getOrNull()
 
@@ -443,3 +460,6 @@ class KnownHostStore(context: Context) {
  * everywhere.
  */
 fun newRecordId(): String = UUID.randomUUID().toString()
+
+/** Unix seconds, the unit [KnownHost.addedAt] and [KnownHost.lastUsed] are stored in. */
+fun nowSecs(): Long = System.currentTimeMillis() / 1000

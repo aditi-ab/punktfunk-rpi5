@@ -9,26 +9,17 @@
 //! [`PenTracker`](punktfunk_core::quic::PenTracker) feeds [`PenTransition`]s.
 //! This file maps them to evdev and groups SYN frames so proximity-enter
 //! carries its position in the same frame — libinput otherwise reports a stale
-//! point. ioctl numbers and layouts are [`crate::uapi`]'s.
+//! point. The uinput ABI and device live in [`crate::uinput_abi`].
 //!
 //! Evidence: `design/pen-tablet-input.md`.
 
-use crate::uapi::{
-    self, AbsInfo, InputId, UinputAbsSetup, UinputSetup, UI_ABS_SETUP, UI_DEV_CREATE,
-    UI_DEV_DESTROY, UI_DEV_SETUP, UI_SET_EVBIT, UI_SET_KEYBIT,
+use crate::uinput_abi::{
+    AbsInfo, InputId, UinputDevice, EV_ABS, EV_KEY, EV_SYN, SYN_REPORT, UI_SET_EVBIT,
+    UI_SET_KEYBIT, UI_SET_PROPBIT,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use punktfunk_core::quic::{PenSample, PenTool, PenTransition, PEN_BARREL1, PEN_BARREL2};
-use std::fs::File;
-use std::io::Write;
-use std::os::fd::AsFd;
 
-const UI_SET_PROPBIT: libc::c_ulong = 0x4004_556e;
-
-const EV_SYN: u16 = 0x00;
-const EV_KEY: u16 = 0x01;
-const EV_ABS: u16 = 0x03;
-const SYN_REPORT: u16 = 0;
 const ABS_X: u16 = 0x00;
 const ABS_Y: u16 = 0x01;
 /// Barrel roll on ABS_Z (Wacom Art-Pen). libinput maps min..max onto 0..360°.
@@ -63,7 +54,7 @@ fn tool_key(tool: PenTool) -> u16 {
 
 /// Per-session uinput tablet.
 pub struct VirtualPen {
-    fd: File,
+    dev: UinputDevice,
     /// In-proximity `BTN_TOOL_*`; the `ProximityOut` release target.
     tool: u16,
     /// Current SYN frame already has a Motion; a second Motion starts a new frame.
@@ -73,22 +64,20 @@ pub struct VirtualPen {
 
 impl VirtualPen {
     pub fn create() -> Result<VirtualPen> {
-        let fd = uapi::open_uinput()?;
-        let set = |req, value: u16, what: &'static str| {
-            uapi::ioctl_value(fd.as_fd(), req, value.into()).context(what)
-        };
-        set(UI_SET_EVBIT, EV_KEY, "UI_SET_EVBIT(EV_KEY)")?;
-        set(UI_SET_EVBIT, EV_ABS, "UI_SET_EVBIT(EV_ABS)")?;
-        for key in [
-            BTN_TOOL_PEN,
-            BTN_TOOL_RUBBER,
-            BTN_TOUCH,
-            BTN_STYLUS,
-            BTN_STYLUS2,
-        ] {
-            set(UI_SET_KEYBIT, key, "UI_SET_KEYBIT")?;
-        }
-        set(UI_SET_PROPBIT, INPUT_PROP_DIRECT, "UI_SET_PROPBIT(DIRECT)")?;
+        let dev = UinputDevice::open()?;
+        dev.set_bits(UI_SET_EVBIT, "UI_SET_EVBIT", &[EV_KEY, EV_ABS])?;
+        dev.set_bits(
+            UI_SET_KEYBIT,
+            "UI_SET_KEYBIT",
+            &[
+                BTN_TOOL_PEN,
+                BTN_TOOL_RUBBER,
+                BTN_TOUCH,
+                BTN_STYLUS,
+                BTN_STYLUS2,
+            ],
+        )?;
+        dev.set_bits(UI_SET_PROPBIT, "UI_SET_PROPBIT", &[INPUT_PROP_DIRECT])?;
 
         // 0..65535, resolution 100 units/mm (~655 mm). Zero resolution trips libinput's
         // missing-resolution fixup; the mm figure is unused for pen mapping.
@@ -136,58 +125,43 @@ impl VirtualPen {
                 },
             ),
         ] {
-            let mut a = UinputAbsSetup {
-                code,
-                _pad: 0,
-                absinfo: info,
-            };
-            uapi::ioctl_with(fd.as_fd(), UI_ABS_SETUP, &mut a).context("UI_ABS_SETUP")?;
+            dev.abs(code, info)?;
         }
 
         // pid.codes VID + "PF" PID so compositor tablet-mapping can target this device.
-        let mut setup = UinputSetup {
-            id: InputId {
-                bustype: 0x0006, // BUS_VIRTUAL
-                vendor: 0x1209,
-                product: 0x5046, // "PF"
-                version: 1,
-            },
-            name: [0; 80],
-            ff_effects_max: 0,
+        let id = InputId {
+            bustype: 0x0006, // BUS_VIRTUAL
+            vendor: 0x1209,
+            product: 0x5046, // "PF"
+            version: 1,
         };
-        let name = b"Punktfunk Pen";
-        setup.name[..name.len()].copy_from_slice(name);
-        uapi::ioctl_with(fd.as_fd(), UI_DEV_SETUP, &mut setup).context("UI_DEV_SETUP")?;
-        set(UI_DEV_CREATE, 0, "UI_DEV_CREATE")?;
+        dev.create(id, b"Punktfunk Pen", 0)?;
         tracing::info!("virtual tablet created (Punktfunk Pen, uinput)");
 
         Ok(VirtualPen {
-            fd,
+            dev,
             tool: BTN_TOOL_PEN,
             frame_has_motion: false,
             frame_dirty: false,
         })
     }
 
-    fn emit(&self, type_: u16, code: u16, value: i32) {
-        // Best-effort: a full kernel queue drops the event; the next sample re-syncs axes.
-        let _ = (&self.fd).write(&uapi::input_event(type_, code, value));
-    }
-
     fn flush(&mut self) {
         if self.frame_dirty {
-            self.emit(EV_SYN, SYN_REPORT, 0);
+            self.dev.emit(EV_SYN, SYN_REPORT, 0);
             self.frame_dirty = false;
             self.frame_has_motion = false;
         }
     }
 
     fn motion(&mut self, s: &PenSample) {
-        self.emit(EV_ABS, ABS_X, (s.x * ABS_RANGE) as i32);
-        self.emit(EV_ABS, ABS_Y, (s.y * ABS_RANGE) as i32);
-        self.emit(EV_ABS, ABS_PRESSURE, (s.pressure >> PRESSURE_SHIFT) as i32);
+        self.dev.emit(EV_ABS, ABS_X, (s.x * ABS_RANGE) as i32);
+        self.dev.emit(EV_ABS, ABS_Y, (s.y * ABS_RANGE) as i32);
+        self.dev
+            .emit(EV_ABS, ABS_PRESSURE, (s.pressure >> PRESSURE_SHIFT) as i32);
         if s.distance != punktfunk_core::quic::PEN_DISTANCE_UNKNOWN {
-            self.emit(EV_ABS, ABS_DISTANCE, (s.distance >> DISTANCE_SHIFT) as i32);
+            self.dev
+                .emit(EV_ABS, ABS_DISTANCE, (s.distance >> DISTANCE_SHIFT) as i32);
         }
         // Polar → tiltX/tiltY. Azimuth clockwise from north: east (90°) is +X, south (180°) is +Y.
         if s.tilt_deg != punktfunk_core::quic::PEN_TILT_UNKNOWN
@@ -195,11 +169,13 @@ impl VirtualPen {
         {
             let az = (s.azimuth_deg as f32).to_radians();
             let tilt = s.tilt_deg as f32;
-            self.emit(EV_ABS, ABS_TILT_X, (tilt * az.sin()).round() as i32);
-            self.emit(EV_ABS, ABS_TILT_Y, (-tilt * az.cos()).round() as i32);
+            self.dev
+                .emit(EV_ABS, ABS_TILT_X, (tilt * az.sin()).round() as i32);
+            self.dev
+                .emit(EV_ABS, ABS_TILT_Y, (-tilt * az.cos()).round() as i32);
         }
         if s.roll_deg != punktfunk_core::quic::PEN_ANGLE_UNKNOWN {
-            self.emit(EV_ABS, ABS_Z, (s.roll_deg % 360) as i32);
+            self.dev.emit(EV_ABS, ABS_Z, (s.roll_deg % 360) as i32);
         }
         self.frame_dirty = true;
         self.frame_has_motion = true;
@@ -215,7 +191,7 @@ impl VirtualPen {
                 PenTransition::ProximityIn { tool } => {
                     self.flush();
                     self.tool = tool_key(*tool);
-                    self.emit(EV_KEY, self.tool, 1);
+                    self.dev.emit(EV_KEY, self.tool, 1);
                     self.frame_dirty = true;
                 }
                 PenTransition::Motion { sample } => {
@@ -225,39 +201,32 @@ impl VirtualPen {
                     self.motion(sample);
                 }
                 PenTransition::TipDown => {
-                    self.emit(EV_KEY, BTN_TOUCH, 1);
+                    self.dev.emit(EV_KEY, BTN_TOUCH, 1);
                     self.frame_dirty = true;
                 }
                 PenTransition::ButtonsChanged { pressed, released } => {
                     for (bit, key) in [(PEN_BARREL1, BTN_STYLUS), (PEN_BARREL2, BTN_STYLUS2)] {
                         if pressed & bit != 0 {
-                            self.emit(EV_KEY, key, 1);
+                            self.dev.emit(EV_KEY, key, 1);
                             self.frame_dirty = true;
                         }
                         if released & bit != 0 {
-                            self.emit(EV_KEY, key, 0);
+                            self.dev.emit(EV_KEY, key, 0);
                             self.frame_dirty = true;
                         }
                     }
                 }
                 PenTransition::TipUp => {
-                    self.emit(EV_KEY, BTN_TOUCH, 0);
-                    self.emit(EV_ABS, ABS_PRESSURE, 0);
+                    self.dev.emit(EV_KEY, BTN_TOUCH, 0);
+                    self.dev.emit(EV_ABS, ABS_PRESSURE, 0);
                     self.frame_dirty = true;
                 }
                 PenTransition::ProximityOut => {
-                    self.emit(EV_KEY, self.tool, 0);
+                    self.dev.emit(EV_KEY, self.tool, 0);
                     self.frame_dirty = true;
                 }
             }
         }
         self.flush();
-    }
-}
-
-impl Drop for VirtualPen {
-    fn drop(&mut self) {
-        // Errors are moot on teardown.
-        let _ = uapi::ioctl_value(self.fd.as_fd(), UI_DEV_DESTROY, 0);
     }
 }

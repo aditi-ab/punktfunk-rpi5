@@ -1,5 +1,5 @@
-//! Pre-decode FIFO from the data-plane pump to the embedder, plus jump-to-live
-//! constants and the decode/encode latency accumulators for ABR.
+//! Pre-decode FIFO from the data-plane pump to the embedder, plus the
+//! jump-to-live detectors and the decode/encode latency accumulators for ABR.
 //!
 //! Video AUs are reference-chained under an infinite GOP, so this queue never
 //! drops a middle frame. A standing backlog is a jump-to-live (`clear` +
@@ -17,7 +17,7 @@ use crate::session::Frame;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Clock-free standing-queue trip: depth at/above this is "not draining".
 /// 6 ≈ 100 ms at 60 fps — above a jitter buffer, so only a genuine backlog trips.
@@ -219,6 +219,149 @@ impl StandingLatency {
         self.window_min_ns = None;
         self.run = 0;
         self.resync_tried = false;
+    }
+}
+
+/// Which jump-to-live detector tripped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Trip {
+    /// Every AU sat over [`FLUSH_LATENCY`] for [`FLUSH_AFTER`].
+    pub(crate) clock: bool,
+    /// The queue sat at [`QUEUE_HIGH`] for [`STANDING_TIME`] and still does.
+    pub(crate) queue: bool,
+}
+
+/// What a jump-to-live's flush found.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Shed {
+    /// A clock-only trip found no local backlog. `disarmed`: this one turned
+    /// the clock detector off.
+    Noop { disarmed: bool },
+    /// A real backlog, the `sheds`-th this session.
+    Real { sheds: u32 },
+}
+
+/// Jump-to-live. In-order consume never catches up and an infinite GOP can't
+/// drop a frame, so a backlog that stops draining is flushed. Two detectors
+/// share [`FLUSH_COOLDOWN`]: the clock run ([`FLUSH_LATENCY`] for
+/// [`FLUSH_AFTER`], needs a skew handshake) and the queue run ([`QUEUE_HIGH`]
+/// for [`STANDING_TIME`]). Wall-clock, not frame counts: fps must not scale it.
+/// The caller passes `now`, so the pump and the ABR simulator run one rule.
+pub(crate) struct JumpToLive {
+    stale_since: Option<Instant>,
+    standing_since: Option<Instant>,
+    last_flush: Option<Instant>,
+    /// Consecutive clock-only flushes that found no local backlog.
+    noop_clock_flushes: u32,
+    clock_armed: bool,
+    /// Flushes that found a real backlog. Under a pinned rate nothing else
+    /// lowers the load, so this is the "can't keep up" count.
+    real_sheds: u32,
+    /// A held opening GOP drains until the depth first falls to [`QUEUE_LOW`].
+    preroll_draining: bool,
+    resync_wanted: bool,
+}
+
+impl JumpToLive {
+    pub(crate) fn new() -> Self {
+        JumpToLive {
+            stale_since: None,
+            standing_since: None,
+            last_flush: None,
+            noop_clock_flushes: 0,
+            clock_armed: true,
+            real_sheds: 0,
+            preroll_draining: true,
+            resync_wanted: false,
+        }
+    }
+
+    /// An applied clock re-sync voids the clock run and re-arms its detector.
+    /// `true` = the detector had been disarmed.
+    pub(crate) fn rebase(&mut self) -> bool {
+        self.stale_since = None;
+        self.noop_clock_flushes = 0;
+        !std::mem::replace(&mut self.clock_armed, true)
+    }
+
+    /// A frame neither detector may judge (probe burst, no decoder yet).
+    pub(crate) fn idle(&mut self) {
+        self.stale_since = None;
+        self.standing_since = None;
+    }
+
+    /// One polled frame. `lat_ns` is its skew-corrected delay, `0` without an
+    /// offset or for a prefix part; `depth` is the channel's. `Some` = flush
+    /// now: the runs are reset and the cooldown is already stamped.
+    pub(crate) fn observe(
+        &mut self,
+        now: Instant,
+        lat_ns: i128,
+        is_au: bool,
+        depth: usize,
+    ) -> Option<Trip> {
+        if self.clock_armed && lat_ns > FLUSH_LATENCY.as_nanos() as i128 {
+            self.stale_since.get_or_insert(now);
+        } else if is_au {
+            self.stale_since = None;
+        }
+        self.preroll_draining &= depth > QUEUE_LOW;
+        if depth >= QUEUE_HIGH && !self.preroll_draining {
+            self.standing_since.get_or_insert(now);
+        } else if depth <= QUEUE_LOW {
+            self.standing_since = None;
+        }
+        let ran = |since: Option<Instant>, d| {
+            since.is_some_and(|t| now.saturating_duration_since(t) >= d)
+        };
+        // Still high NOW: a run in the hysteresis band (a clump mid-drain)
+        // must not fire on elapsed time alone.
+        let trip = Trip {
+            clock: ran(self.stale_since, FLUSH_AFTER),
+            queue: depth >= QUEUE_HIGH && ran(self.standing_since, STANDING_TIME),
+        };
+        if !(trip.clock || trip.queue) || !self.claim_flush(now) {
+            return None;
+        }
+        self.idle();
+        Some(trip)
+    }
+
+    /// Stamp the shared cooldown unless the last flush is under
+    /// [`FLUSH_COOLDOWN`] old. `false` = too soon, nothing stamped.
+    pub(crate) fn claim_flush(&mut self, now: Instant) -> bool {
+        if self
+            .last_flush
+            .is_some_and(|t| now.saturating_duration_since(t) < FLUSH_COOLDOWN)
+        {
+            return false;
+        }
+        self.last_flush = Some(now);
+        true
+    }
+
+    /// What `trip`'s flush discarded. A clock-only flush under
+    /// [`NOOP_FLUSH_DATAGRAMS`] with no queued AU is a false behind (clock step,
+    /// upstream queue): the first asks for a re-sync, the
+    /// [`NOOP_CLOCK_FLUSHES_TO_DISARM`]-th disarms the clock detector.
+    pub(crate) fn after_flush(&mut self, trip: Trip, flushed: u64, dropped: usize) -> Shed {
+        if trip.clock && !trip.queue && flushed < NOOP_FLUSH_DATAGRAMS && dropped == 0 {
+            self.noop_clock_flushes += 1;
+            self.resync_wanted |= self.noop_clock_flushes == 1;
+            let disarm = self.noop_clock_flushes >= NOOP_CLOCK_FLUSHES_TO_DISARM;
+            self.clock_armed &= !disarm;
+            return Shed::Noop { disarmed: disarm };
+        }
+        self.noop_clock_flushes = 0;
+        self.real_sheds += 1;
+        Shed::Real {
+            sheds: self.real_sheds,
+        }
+    }
+
+    /// The re-sync the first no-op clock flush asked for, once.
+    pub(crate) fn take_resync(&mut self) -> bool {
+        std::mem::take(&mut self.resync_wanted)
     }
 }
 
@@ -681,5 +824,131 @@ mod standing_latency_tests {
             d.on_window(true),
             StandingLatAction::Resync { .. }
         ));
+    }
+}
+
+#[cfg(test)]
+mod jump_to_live_tests {
+    use super::*;
+
+    const BEHIND: i128 = FLUSH_LATENCY.as_nanos() as i128 + 1;
+    const MS: Duration = Duration::from_millis(1);
+
+    /// A primed decoder: the opening GOP has drained.
+    fn live() -> JumpToLive {
+        let mut j = JumpToLive::new();
+        assert_eq!(j.observe(Instant::now(), 0, true, 0), None);
+        j
+    }
+
+    #[test]
+    fn the_clock_run_trips_after_flush_after_then_cools_down() {
+        let t0 = Instant::now();
+        let mut j = live();
+        assert_eq!(j.observe(t0, BEHIND, true, 0), None);
+        assert_eq!(j.observe(t0 + FLUSH_AFTER - MS, BEHIND, true, 0), None);
+        let trip = j.observe(t0 + FLUSH_AFTER, BEHIND, true, 0);
+        assert_eq!(
+            trip,
+            Some(Trip {
+                clock: true,
+                queue: false
+            })
+        );
+        // The run restarts; a second trip waits out the shared cooldown.
+        let t1 = t0 + FLUSH_AFTER;
+        assert_eq!(j.observe(t1 + FLUSH_AFTER, BEHIND, true, 0), None);
+        assert_eq!(j.observe(t1 + FLUSH_AFTER * 2, BEHIND, true, 0), None);
+        assert!(j.observe(t1 + FLUSH_COOLDOWN, BEHIND, true, 0).is_some());
+    }
+
+    #[test]
+    fn an_on_time_au_resets_the_clock_run_and_a_prefix_part_does_not() {
+        let t0 = Instant::now();
+        let mut j = live();
+        j.observe(t0, BEHIND, true, 0);
+        j.observe(t0 + MS, 0, false, 0);
+        assert!(j.observe(t0 + FLUSH_AFTER, BEHIND, true, 0).is_some());
+        let t1 = t0 + FLUSH_AFTER + FLUSH_COOLDOWN;
+        j.observe(t1, BEHIND, true, 0);
+        j.observe(t1 + MS, 0, true, 0);
+        assert_eq!(j.observe(t1 + FLUSH_AFTER, BEHIND, true, 0), None);
+    }
+
+    #[test]
+    fn the_queue_run_trips_only_while_still_high() {
+        let t0 = Instant::now();
+        let mut j = live();
+        j.observe(t0, 0, true, QUEUE_HIGH);
+        // Mid-drain the run survives the hysteresis band but can't fire.
+        assert_eq!(j.observe(t0 + STANDING_TIME, 0, true, QUEUE_HIGH - 1), None);
+        let trip = j.observe(t0 + STANDING_TIME + MS, 0, true, QUEUE_HIGH);
+        assert_eq!(
+            trip,
+            Some(Trip {
+                clock: false,
+                queue: true
+            })
+        );
+        // Back at QUEUE_LOW the run is gone.
+        let t1 = t0 + FLUSH_COOLDOWN * 2;
+        j.observe(t1, 0, true, QUEUE_HIGH);
+        j.observe(t1 + MS, 0, true, QUEUE_LOW);
+        assert_eq!(j.observe(t1 + STANDING_TIME, 0, true, QUEUE_HIGH), None);
+    }
+
+    #[test]
+    fn a_held_opening_gop_starts_no_queue_run_until_it_drains() {
+        let t0 = Instant::now();
+        let mut j = JumpToLive::new();
+        j.observe(t0, 0, true, PREROLL_AUS);
+        assert_eq!(j.observe(t0 + STANDING_TIME, 0, true, QUEUE_HIGH), None);
+        j.observe(t0 + STANDING_TIME + MS, 0, true, QUEUE_LOW);
+        let t1 = t0 + STANDING_TIME * 2;
+        j.observe(t1, 0, true, QUEUE_HIGH);
+        assert!(j.observe(t1 + STANDING_TIME, 0, true, QUEUE_HIGH).is_some());
+    }
+
+    #[test]
+    fn no_op_clock_flushes_resync_once_then_disarm_until_a_rebase() {
+        let clock = Trip {
+            clock: true,
+            queue: false,
+        };
+        let mut j = live();
+        assert_eq!(j.after_flush(clock, 0, 0), Shed::Noop { disarmed: false });
+        assert!(j.take_resync());
+        assert!(!j.take_resync(), "one re-sync per no-op run");
+        assert_eq!(j.after_flush(clock, 0, 0), Shed::Noop { disarmed: true });
+        assert!(!j.take_resync());
+        let t0 = Instant::now();
+        j.observe(t0, BEHIND, true, 0);
+        assert_eq!(j.observe(t0 + FLUSH_AFTER, BEHIND, true, 0), None);
+        assert!(j.rebase(), "a re-sync re-arms a disarmed detector");
+        assert!(!j.rebase());
+        j.observe(t0, BEHIND, true, 0);
+        assert!(j.observe(t0 + FLUSH_AFTER, BEHIND, true, 0).is_some());
+    }
+
+    #[test]
+    fn a_flush_that_found_a_backlog_counts_as_a_real_shed() {
+        let clock = Trip {
+            clock: true,
+            queue: false,
+        };
+        let mut j = live();
+        assert_eq!(j.after_flush(clock, 0, 0), Shed::Noop { disarmed: false });
+        assert_eq!(
+            j.after_flush(clock, NOOP_FLUSH_DATAGRAMS, 0),
+            Shed::Real { sheds: 1 }
+        );
+        assert_eq!(j.after_flush(clock, 0, 1), Shed::Real { sheds: 2 });
+        let both = Trip {
+            clock: true,
+            queue: true,
+        };
+        assert_eq!(j.after_flush(both, 0, 0), Shed::Real { sheds: 3 });
+        // The real shed broke the no-op run: the next no-op is a first again.
+        assert_eq!(j.after_flush(clock, 0, 0), Shed::Noop { disarmed: false });
     }
 }

@@ -1,11 +1,11 @@
 //! Per-AU H.264 conversion: one [`AuPlan`] into the `DXVA_PicParams_H264`,
 //! `DXVA_Qmatrix_H264` and slice-control records
 //! `ID3D11VideoContext::SubmitDecoderBuffers` is built from —
-//! [`pf_vkdecode::pic`]'s job, one hardware API over.
+//! `pf_vkdecode::pic`'s job, one hardware API over.
 //!
 //! Surfaces are slots. A `DXVA_PicEntry_H264` carries the uncompressed surface
 //! index, so DPB slot and decode-texture `ArraySlice` are the same number and
-//! this module drives the Vulkan rung's [`SlotMap`] unchanged.
+//! this module drives the shared [`SlotMap`] unchanged.
 //!
 //! `RefFrameList` is the marked DPB ([`AuPlan::dpb_refs`]), not the AU's
 //! reference set — DXVA asks for every picture currently used for reference;
@@ -24,8 +24,9 @@ use std::ops::Range;
 use pf_bitstream::h264::AuPlan;
 use pf_bitstream::h264::PicId;
 use pf_bitstream::h264::RefPic;
-use pf_vkdecode::SlotError;
-use pf_vkdecode::SlotMap;
+use pf_bitstream::slots::Removals;
+use pf_bitstream::slots::SlotError;
+use pf_bitstream::slots::SlotMap;
 use tracing::trace;
 
 use crate::dxva::H264BitFields;
@@ -72,7 +73,7 @@ impl DxvaRef {
 pub struct DecodePlanDxva {
     pub pic_params: PicParamsH264,
     pub qmatrix: QmatrixH264,
-    /// Slice NALU byte ranges, start code included — what [`crate::pack::pack`] takes.
+    /// Slice NAL byte ranges, start code dropped — what [`crate::pack::pack`] takes.
     pub slice_ranges: Vec<Range<usize>>,
     /// Decode target surface (`CreateVideoDecoderOutputView` / `DecoderBeginFrame`).
     pub setup_slot: u8,
@@ -204,7 +205,7 @@ impl From<SlotError> for PlanToDxvaError {
 /// `status_id` becomes `StatusReportFeedbackNumber`. libavcodec starts at 1;
 /// 0 is the value a driver reads out of a buffer nobody wrote.
 ///
-/// Atomicity matches [`pf_vkdecode::plan_to_vk`]: every fallible step runs
+/// Atomicity matches `pf_vkdecode::plan_to_vk`: every fallible step runs
 /// before any mutation of `slots`. Envelope and capacity first (read-only);
 /// references resolve against the pre-removal state (this AU's marking can
 /// evict a picture its slices still name); setup is assigned last, and
@@ -383,24 +384,11 @@ pub fn plan_to_dxva(
     qm.bScalingLists8x8[0] = pps.scaling_lists_8x8[0];
     qm.bScalingLists8x8[1] = pps.scaling_lists_8x8[1];
 
-    let slice_ranges: Vec<Range<usize>> = plan.slices.iter().map(|s| s.data.clone()).collect();
+    let slice_ranges: Vec<Range<usize>> = plan.slices.iter().map(|s| s.nal.clone()).collect();
 
-    // Mutations last (fn docs). Removals are not applied here.
-    // The AU's own picture can appear in `removed`: a non-reference with no
-    // free frame buffer is stored-and-evicted in one plan. Assign it, then
-    // release immediately — deferring would hand the caller the decode target.
-    let setup_evicted = plan.dpb.removed.contains(&setup_id);
-    let release_after_decode: Vec<PicId> = plan
-        .dpb
-        .removed
-        .iter()
-        .copied()
-        .filter(|id| *id != setup_id)
-        .collect();
-    let setup_slot = slots.assign(setup_id)?;
-    if setup_evicted {
-        slots.release(setup_id);
-    }
+    // Mutations last (fn docs). Removals are deferred, not applied here.
+    let (setup_slot, release_after_decode) =
+        slots.commit_setup(setup_id, &plan.dpb.removed, Removals::Defer)?;
     // AssociatedFlag is the bottom-field flag; 0 under the progressive envelope.
     pp.CurrPic = PicEntry::new(setup_slot, false);
 
@@ -441,60 +429,24 @@ pub fn slice_control(records: &[crate::pack::SliceRecord]) -> Vec<SliceH264Short
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-    use std::rc::Rc;
-
-    use cros_codecs::codec::h264::nalu_writer::NaluWriter;
-    use cros_codecs::codec::h264::parser::Nalu;
-    use cros_codecs::codec::h264::parser::NaluType;
     use cros_codecs::codec::h264::parser::Pps;
-    use cros_codecs::codec::h264::parser::PpsBuilder;
-    use cros_codecs::codec::h264::parser::Profile;
     use cros_codecs::codec::h264::parser::Sps;
-    use cros_codecs::codec::h264::parser::SpsBuilder;
     use cros_codecs::codec::h264::synthesizer::Synthesizer;
     use pf_bitstream::h264::H264Planner;
-    use pf_bitstream::h264::Level;
+    use pf_bitstream::testing::h264::authored_sps_pps;
+    use pf_bitstream::testing::h264::write_idr_slice;
+    use pf_bitstream::testing::h264::write_p_slice;
+    use pf_bitstream::testing::split_h264_aus;
 
     use super::*;
 
-    /// Shared vendored vector (same path as pf-bitstream / pf-vkdecode goldens).
-    const TEST_25FPS: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264"
-    );
+    const TEST_25FPS: &[u8] = pf_bitstream::testing::H264_25FPS;
 
     /// Host-emitted low-delay IPPP: `max_num_reorder_frames = 0` and a DPB
     /// as deep as its reference count — the shape `release_after_decode`
     /// exists for. Shared with `pf-vkdecode` and `pf-client-core` GPU legs.
     const LOWDELAY_640X480: &[u8] =
         include_bytes!("../../pf-vkdecode/tests/data/lowdelay-640x480.h264");
-
-    /// Test-only AU splitter. A new AU starts at a non-slice NALU following
-    /// a slice, or at a slice whose `first_mb_in_slice` is 0 following a slice.
-    fn split_into_aus(stream: &[u8]) -> Vec<&[u8]> {
-        use cros_codecs::codec::h264::parser::NaluType;
-        let mut aus = Vec::new();
-        let mut cursor = Cursor::new(stream);
-        let mut au_start = 0usize;
-        let mut au_has_slice = false;
-
-        while let Ok(nalu) = Nalu::next(&mut cursor) {
-            let nalu_offset = cursor.position() as usize;
-            let start = nalu_offset - nalu.offset;
-            let is_slice = matches!(nalu.header.type_, NaluType::Slice | NaluType::SliceIdr);
-            let first_mb_zero =
-                is_slice && stream.get(nalu_offset + 1).is_some_and(|b| b & 0x80 != 0);
-
-            if au_has_slice && (!is_slice || first_mb_zero) {
-                aus.push(&stream[au_start..start]);
-                au_start = start;
-                au_has_slice = false;
-            }
-            au_has_slice |= is_slice;
-        }
-        aus.push(&stream[au_start..]);
-        aus
-    }
 
     fn convert_stream() -> Vec<(AuPlan, DecodePlanDxva)> {
         convert(TEST_25FPS)
@@ -510,7 +462,7 @@ mod tests {
         let mut planner = H264Planner::new();
         let mut slots: Option<SlotMap> = None;
         let mut out = Vec::new();
-        for (i, au) in split_into_aus(stream).into_iter().enumerate() {
+        for (i, au) in split_h264_aus(stream).into_iter().enumerate() {
             let Ok(plan) = planner.plan_au(au) else {
                 continue;
             };
@@ -525,95 +477,6 @@ mod tests {
             out.push((plan, dxva));
         }
         out
-    }
-
-    /// Authored 64x64 Main SPS/PPS for long-term marking (no vendored vector
-    /// carries MMCO). Slice headers are written by hand: no synthesizer exists.
-    fn authored_sps_pps() -> (Rc<Sps>, Rc<Pps>) {
-        let sps = SpsBuilder::new()
-            .seq_parameter_set_id(0)
-            .profile_idc(Profile::Main)
-            .level_idc(Level::L4)
-            .frame_mbs_only_flag(true)
-            .direct_8x8_inference_flag(true)
-            .max_num_ref_frames(4)
-            .log2_max_frame_num_minus4(0)
-            .pic_order_cnt_type(0)
-            .log2_max_pic_order_cnt_lsb_minus4(0)
-            .resolution(64, 64)
-            .build();
-        let pps = PpsBuilder::new(Rc::clone(&sps))
-            .pic_parameter_set_id(0)
-            .pic_init_qp(26)
-            .build();
-        (sps, pps)
-    }
-
-    /// One IDR slice NALU. The planner reads headers only, so no slice data
-    /// follows the rbsp stop bit.
-    fn write_idr_slice() -> Vec<u8> {
-        let mut buf = Vec::new();
-        {
-            let mut w = NaluWriter::new(&mut buf, true);
-            w.write_header(3, NaluType::SliceIdr as u8).unwrap();
-            w.write_ue(0u32).unwrap(); // first_mb_in_slice
-            w.write_ue(2u32).unwrap(); // slice_type: I
-            w.write_ue(0u32).unwrap(); // pic_parameter_set_id
-            w.write_f(4, 0u32).unwrap(); // frame_num, u(4)
-            w.write_ue(0u32).unwrap(); // idr_pic_id
-            w.write_f(4, 0u32).unwrap(); // pic_order_cnt_lsb, u(4)
-            w.write_f(1, 0u32).unwrap(); // no_output_of_prior_pics_flag
-            w.write_f(1, 0u32).unwrap(); // long_term_reference_flag
-            w.write_se(0i32).unwrap(); // slice_qp_delta
-            w.write_f(1, 1u32).unwrap(); // rbsp stop bit
-            while !w.aligned() {
-                w.write_f(1, 0u32).unwrap();
-            }
-        }
-        buf
-    }
-
-    /// One P slice NALU. `mmco_ops = None` is sliding-window; `Some` is
-    /// adaptive `(operation, arg)` pairs. The writer appends terminating op 0.
-    fn write_p_slice(
-        frame_num: u32,
-        poc_lsb: u32,
-        ref_idc: u8,
-        num_ref_idx_l0_active: u32,
-        mmco_ops: Option<&[(u32, u32)]>,
-    ) -> Vec<u8> {
-        let mut buf = Vec::new();
-        {
-            let mut w = NaluWriter::new(&mut buf, true);
-            w.write_header(ref_idc, NaluType::Slice as u8).unwrap();
-            w.write_ue(0u32).unwrap(); // first_mb_in_slice
-            w.write_ue(0u32).unwrap(); // slice_type: P
-            w.write_ue(0u32).unwrap(); // pic_parameter_set_id
-            w.write_f(4, frame_num).unwrap(); // frame_num, u(4)
-            w.write_f(4, poc_lsb).unwrap(); // pic_order_cnt_lsb, u(4)
-            w.write_f(1, 1u32).unwrap(); // num_ref_idx_active_override_flag
-            w.write_ue(num_ref_idx_l0_active - 1).unwrap();
-            w.write_f(1, 0u32).unwrap(); // ref_pic_list_modification_flag_l0
-            if ref_idc != 0 {
-                match mmco_ops {
-                    None => w.write_f(1, 0u32).map(|_| ()).unwrap(),
-                    Some(ops) => {
-                        w.write_f(1, 1u32).unwrap(); // adaptive_ref_pic_marking_mode_flag
-                        for (op, arg) in ops {
-                            w.write_ue(*op).unwrap();
-                            w.write_ue(*arg).unwrap();
-                        }
-                        w.write_ue(0u32).unwrap(); // end of the MMCO list
-                    }
-                }
-            }
-            w.write_se(0i32).unwrap(); // slice_qp_delta
-            w.write_f(1, 1u32).unwrap(); // rbsp stop bit
-            while !w.aligned() {
-                w.write_f(1, 0u32).unwrap();
-            }
-        }
-        buf
     }
 
     /// Unique pictures the AU's own slice lists name, in first-appearance order.
@@ -714,7 +577,7 @@ mod tests {
         // Vendored vectors have equal top/bottom counts, so a swapped pair is
         // invisible. Drive one AU with distinct counts.
         let mut planner = H264Planner::new();
-        let aus = split_into_aus(TEST_25FPS);
+        let aus = split_h264_aus(TEST_25FPS);
         let first = planner.plan_au(aus[0]).expect("plan 0");
         let mut second = planner.plan_au(aus[1]).expect("plan 1");
         let ref_id = first.dpb.stored.unwrap();
@@ -788,7 +651,7 @@ mod tests {
         fn intersections(stream: &[u8]) -> (usize, usize, usize) {
             let mut planner = H264Planner::new();
             let (mut both, mut with_removals, mut planned) = (0usize, 0usize, 0usize);
-            for au in split_into_aus(stream) {
+            for au in split_h264_aus(stream) {
                 let Ok(plan) = planner.plan_au(au) else {
                     continue;
                 };
@@ -868,7 +731,7 @@ mod tests {
         let mut slots: Option<SlotMap> = None;
         let mut peak = 0usize;
         let mut capacity = 0usize;
-        for (i, au) in split_into_aus(LOWDELAY_640X480).into_iter().enumerate() {
+        for (i, au) in split_h264_aus(LOWDELAY_640X480).into_iter().enumerate() {
             let Ok(plan) = planner.plan_au(au) else {
                 continue;
             };
@@ -1020,7 +883,7 @@ mod tests {
         for (plan, dxva) in convert_stream() {
             assert_eq!(dxva.slice_ranges.len(), plan.slices.len());
             for (range, slice) in dxva.slice_ranges.iter().zip(&plan.slices) {
-                assert_eq!(*range, slice.data);
+                assert_eq!(*range, slice.nal);
             }
         }
     }
@@ -1041,7 +904,7 @@ mod tests {
     #[test]
     fn a_capacity_mismatch_is_refused_and_leaves_the_map_untouched() {
         let mut planner = H264Planner::new();
-        let au = split_into_aus(TEST_25FPS).into_iter().next().unwrap();
+        let au = split_h264_aus(TEST_25FPS).into_iter().next().unwrap();
         let plan = planner.plan_au(au).expect("plan");
         // Map sized for a different DPB depth (SPS renegotiation).
         let mut slots = SlotMap::new(plan.picture.max_dpb_frames + 1);
@@ -1059,7 +922,7 @@ mod tests {
     #[test]
     fn a_reference_the_map_never_saw_is_refused_and_leaves_the_map_untouched() {
         // Plan two AUs; feed only the second through the map so its ref is missing.
-        let aus = split_into_aus(TEST_25FPS);
+        let aus = split_h264_aus(TEST_25FPS);
         let mut planner = H264Planner::new();
         let first = planner.plan_au(aus[0]).expect("plan 0");
         let second = planner.plan_au(aus[1]).expect("plan 1");
@@ -1115,7 +978,7 @@ mod tests {
             let mut planner = H264Planner::new();
             let mut slots: Option<SlotMap> = None;
             let mut live: Vec<(PicId, u8)> = Vec::new();
-            for (i, au) in split_into_aus(stream).into_iter().enumerate() {
+            for (i, au) in split_h264_aus(stream).into_iter().enumerate() {
                 let Ok(plan) = planner.plan_au(au) else {
                     continue;
                 };

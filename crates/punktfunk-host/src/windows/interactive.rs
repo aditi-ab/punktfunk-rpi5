@@ -12,7 +12,7 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use windows::core::{Owned, PCWSTR, PWSTR};
+use windows::core::{Owned, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Security::{
     DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ALL_ACCESS,
@@ -161,13 +161,7 @@ fn launch(
 
     let mut cmd: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
     let workdir = workdir.map(Path::to_path_buf).or_else(|| exe_dir(cmdline));
-    let workdir_w: Option<Vec<u16>> = workdir.map(|d| {
-        d.as_os_str()
-            .to_string_lossy()
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect()
-    });
+    let workdir_w: Option<HSTRING> = workdir.map(|d| HSTRING::from(d.as_os_str()));
     let cwd = match &workdir_w {
         Some(w) => PCWSTR(w.as_ptr()),
         None => PCWSTR::null(),

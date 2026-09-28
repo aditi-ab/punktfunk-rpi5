@@ -200,38 +200,23 @@ pub(super) fn send_gso(t: &UdpTransport, packets: &[&[u8]]) -> std::io::Result<u
     if gso::refused() || !(t.gso_wanted() || gso::env_on()) {
         return send_batch(t, packets);
     }
-    // GSO: every segment but the last must be exactly `seg` bytes. Guard and
-    // fall back if the batch is not uniform (last may be shorter, never longer).
-    let seg = packets[0].len();
-    let last = packets.len() - 1;
-    if seg == 0 || packets[..last].iter().any(|p| p.len() != seg) || packets[last].len() > seg {
+    let Some(seg) = super::uniform_segment(packets) else {
         return send_batch(t, packets);
-    }
+    };
     let fd = t.socket.as_raw_fd();
     // 64-segment kernel cap, and 65535 - 40 - 8 (IPv6+UDP; tighter than IPv4
     // 65507). Oversize is EMSGSIZE, which `gso_unsupported` latches GSO off
     // process-wide.
     const GSO_MAX_PAYLOAD: usize = 65535 - 40 - 8;
     let max_seg = (GSO_MAX_PAYLOAD / seg).clamp(1, 64);
-    let mut scratch: Vec<u8> = Vec::with_capacity(seg * max_seg);
-    let mut sent = 0usize;
-    for chunk in packets.chunks(max_seg) {
-        scratch.clear();
-        for p in chunk {
-            scratch.extend_from_slice(p);
-        }
-        match send_one_gso(fd, &scratch, seg as u16) {
-            Ok(()) => sent += chunk.len(),
-            // Send buffer full or stale ICMP: drop the rest, never block.
-            Err(e) if is_transient_io(&e) => break,
-            Err(e) if gso_unsupported(&e) => {
-                gso::disable();
-                return Ok(sent + send_batch(t, &packets[sent..])?);
-            }
-            Err(e) => return Err(e),
+    let send_one = |buf: &[u8], seg| send_one_gso(fd, buf, seg);
+    match super::send_segmented(packets, seg, max_seg, send_one, gso_unsupported)? {
+        super::Segmented::Sent(n) => Ok(n),
+        super::Segmented::Unsupported(n) => {
+            gso::disable();
+            Ok(n + send_batch(t, &packets[n..])?)
         }
     }
-    Ok(sent)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

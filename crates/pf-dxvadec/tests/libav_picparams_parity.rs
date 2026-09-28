@@ -18,11 +18,13 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
-use std::io::Cursor;
 use std::mem::offset_of;
 use std::mem::size_of;
 use std::ops::Range;
 
+use pf_bitstream::testing::split_h264_aus;
+use pf_bitstream::testing::split_h265_aus;
+use pf_bitstream::testing::split_ivf;
 use pf_dxvadec::descriptors::BUFFER_BITSTREAM;
 use pf_dxvadec::descriptors::BUFFER_INVERSE_QUANTIZATION_MATRIX;
 use pf_dxvadec::descriptors::BUFFER_PICTURE_PARAMETERS;
@@ -48,77 +50,16 @@ use pf_dxvadec::SlotMap;
 use pf_dxvadec::TileAv1;
 use pf_dxvadec::NUM_REF_SLOTS;
 
-const TEST_25FPS_H264: &[u8] = include_bytes!(
-    "../../pf-bitstream/vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264"
-);
-const TEST_25FPS_H265: &[u8] = include_bytes!(
-    "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265"
-);
+const TEST_25FPS_H264: &[u8] = pf_bitstream::testing::H264_25FPS;
+const TEST_25FPS_H265: &[u8] = pf_bitstream::testing::H265_25FPS;
 /// IVF packet, not AU: one packet may decode several frames, of which at most one shows.
-const TEST_25FPS_AV1: &[u8] = include_bytes!(
-    "../../pf-bitstream/vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1"
-);
+const TEST_25FPS_AV1: &[u8] = pf_bitstream::testing::AV1_25FPS;
 
 /// 250 AUs: pf-bitstream golden and a valid capture's `PFPP` count.
 const VENDORED_AUS: usize = 250;
 
 /// 1 MiB stand-in. 320×240 vectors never hit pack's tail-padding clamp.
 const MAPPING_BYTES: usize = 1 << 20;
-
-fn split_into_aus(stream: &[u8]) -> Vec<&[u8]> {
-    use cros_codecs::codec::h264::parser::Nalu;
-    use cros_codecs::codec::h264::parser::NaluType;
-
-    let mut aus = Vec::new();
-    let mut cursor = Cursor::new(stream);
-    let mut au_start = 0usize;
-    let mut au_has_slice = false;
-
-    while let Ok(nalu) = Nalu::next(&mut cursor) {
-        let nalu_offset = cursor.position() as usize;
-        let start = nalu_offset - nalu.offset;
-        let is_slice = matches!(nalu.header.type_, NaluType::Slice | NaluType::SliceIdr);
-        let first_mb_zero = is_slice && stream.get(nalu_offset + 1).is_some_and(|b| b & 0x80 != 0);
-
-        if au_has_slice && (!is_slice || first_mb_zero) {
-            aus.push(&stream[au_start..start]);
-            au_start = start;
-            au_has_slice = false;
-        }
-        au_has_slice |= is_slice;
-    }
-    aus.push(&stream[au_start..]);
-    aus
-}
-
-/// HEVC AU split: `first_slice_segment_in_pic_flag` is the first bit after the two-byte NAL
-/// header; types below 32 are slices. Copied from `pf-bitstream` `h265.rs` — a different
-/// split would pair every capture AU with the wrong picture.
-fn split_into_aus_h265(stream: &[u8]) -> Vec<&[u8]> {
-    use cros_codecs::codec::h265::parser::Nalu;
-
-    let mut aus = Vec::new();
-    let mut cursor = Cursor::new(stream);
-    let mut au_start = 0usize;
-    let mut au_has_slice = false;
-
-    while let Ok(nalu) = Nalu::next(&mut cursor) {
-        let header_start = cursor.position() as usize;
-        let start = header_start - nalu.offset;
-        let is_slice = (nalu.header.type_ as u32) < 32;
-        let first_slice_flag =
-            is_slice && stream.get(header_start + 2).is_some_and(|b| b & 0x80 != 0);
-
-        if au_has_slice && (!is_slice || first_slice_flag) {
-            aus.push(&stream[au_start..start]);
-            au_start = start;
-            au_has_slice = false;
-        }
-        au_has_slice |= is_slice;
-    }
-    aus.push(&stream[au_start..]);
-    aus
-}
 
 struct OurSubmission {
     pic_params: Vec<u8>,
@@ -141,7 +82,7 @@ fn our_h264_submissions() -> Vec<OurSubmission> {
     let mut slots: Option<SlotMap> = None;
     let mut mapping = vec![0u8; MAPPING_BYTES];
     let mut out = Vec::new();
-    for (i, au) in split_into_aus(TEST_25FPS_H264).into_iter().enumerate() {
+    for (i, au) in split_h264_aus(TEST_25FPS_H264).into_iter().enumerate() {
         let plan: AuPlan = planner
             .plan_au(au)
             .unwrap_or_else(|e| panic!("AU {i} of the vendored H.264 vector must plan: {e}"));
@@ -183,7 +124,7 @@ fn our_hevc_submissions() -> Vec<OurSubmission> {
     let mut slots: Option<SlotMap> = None;
     let mut mapping = vec![0u8; MAPPING_BYTES];
     let mut out = Vec::new();
-    for (i, au) in split_into_aus_h265(TEST_25FPS_H265).into_iter().enumerate() {
+    for (i, au) in split_h265_aus(TEST_25FPS_H265).into_iter().enumerate() {
         let plan = planner
             .plan_au(au)
             .unwrap_or_else(|e| panic!("AU {i} of the vendored HEVC vector must plan: {e}"));
@@ -257,23 +198,6 @@ fn our_av1_submissions() -> Vec<OurSubmission> {
         }
     }
     assert_eq!(out.len(), VENDORED_AV1_FRAMES);
-    out
-}
-
-/// IVF: 32-byte file header, then 12-byte size header per packet.
-fn split_ivf(stream: &[u8]) -> Vec<&[u8]> {
-    let mut out = Vec::new();
-    let mut at = 32usize;
-    while at + 12 <= stream.len() {
-        let size = u32::from_le_bytes([stream[at], stream[at + 1], stream[at + 2], stream[at + 3]])
-            as usize;
-        at += 12;
-        if at + size > stream.len() {
-            break;
-        }
-        out.push(&stream[at..at + size]);
-        at += size;
-    }
     out
 }
 
@@ -2158,7 +2082,7 @@ fn the_picture_parameter_buffer_is_the_whole_hand_declared_struct_for_both_codec
 fn hevc_case(enabled: bool, sps_coded: Option<u8>, pps_coded: Option<u8>) -> OurSubmission {
     use std::rc::Rc;
 
-    let aus = split_into_aus_h265(TEST_25FPS_H265);
+    let aus = split_h265_aus(TEST_25FPS_H265);
     let mut planner = H265Planner::new();
     let mut plan = planner.plan_au(aus[0]).expect("plan");
 

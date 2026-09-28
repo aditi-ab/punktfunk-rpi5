@@ -11,7 +11,9 @@
 //! inside them are drawn here.
 
 use crate::theme::stroke;
-use skia_safe::{utils::parse_path, Canvas, Color4f, PaintCap, PaintJoin};
+use skia_safe::{utils::parse_path, Canvas, Color4f, Matrix, PaintCap, PaintJoin, Path, Rect};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 /// One icon's 24×24 path data.
 #[derive(Clone, Copy)]
@@ -130,9 +132,82 @@ pub fn draw_icon_weight(
     canvas.restore();
 }
 
+/// A generated table of SVG path marks ([`crate::launcher_icons`], [`crate::os_marks`]):
+/// token, viewport width and height, path data. Each token parses once.
+pub(crate) struct MarkTable {
+    glyphs: &'static [(&'static str, f32, f32, &'static str)],
+    /// Token → parsed mark and its viewport. `None` caches a miss so a bad token is not
+    /// reparsed every frame.
+    cache: OnceLock<Mutex<GlyphCache>>,
+}
+
+type GlyphCache = HashMap<String, Option<(Path, f32, f32)>>;
+
+impl MarkTable {
+    pub(crate) const fn new(glyphs: &'static [(&'static str, f32, f32, &'static str)]) -> Self {
+        MarkTable {
+            glyphs,
+            cache: OnceLock::new(),
+        }
+    }
+
+    /// `Path::from_svg` on a 3 kB string is not free, and the carousel and the shelf
+    /// redraw every frame.
+    fn glyph(&self, token: &str) -> Option<(Path, f32, f32)> {
+        let mut cache = self.cache.get_or_init(Default::default).lock().ok()?;
+        if let Some(hit) = cache.get(token) {
+            return hit.clone();
+        }
+        let built = (self.glyphs.iter())
+            .find(|(t, ..)| *t == token)
+            .and_then(|(_, w, h, d)| Path::from_svg(d).map(|p| (p, *w, *h)));
+        cache.insert(token.to_string(), built.clone());
+        built
+    }
+
+    /// `token`'s mark letterboxed into `dst`: aspect preserved, since the masters'
+    /// viewports are not all square. `None` when the table has no art for it.
+    pub(crate) fn fit(&self, token: &str, dst: Rect) -> Option<Path> {
+        let (path, vw, vh) = self.glyph(token)?;
+        let scale = (dst.width() / vw).min(dst.height() / vh);
+        let mut m = Matrix::new_identity();
+        m.set_scale((scale, scale), None);
+        m.post_translate((
+            dst.left + (dst.width() - vw * scale) / 2.0,
+            dst.top + (dst.height() - vh * scale) / 2.0,
+        ));
+        Some(path.with_transform(&m))
+    }
+
+    /// Tokens whose path data does not parse: a tile that silently loses its mark.
+    #[cfg(test)]
+    pub(crate) fn unparsed(&self) -> Vec<&'static str> {
+        (self.glyphs.iter())
+            .map(|(t, ..)| *t)
+            .filter(|t| self.glyph(t).is_none())
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Letterboxed, never stretched: a 2:1 master in a 2:1 box fills it, centred.
+    #[test]
+    fn a_mark_is_contained_and_centred() {
+        static WIDE: MarkTable = MarkTable::new(&[("wide", 20.0, 10.0, "M0 0h20v10H0z")]);
+        let dst = Rect::from_xywh(10.0, 20.0, 80.0, 80.0);
+        let b = WIDE.fit("wide", dst).unwrap().compute_tight_bounds();
+        assert!(b.width() <= dst.width() + 0.5 && b.height() <= dst.height() + 0.5);
+        assert!(
+            (b.width() - 2.0 * b.height()).abs() < 0.5,
+            "stretched: {b:?}"
+        );
+        assert!((b.center_x() - dst.center_x()).abs() < 1.0);
+        assert!((b.center_y() - dst.center_y()).abs() < 1.0);
+        assert!(WIDE.fit("tall", dst).is_none());
+    }
 
     /// Tight bounds, not `bounds()`: an arc's conic control points sit outside
     /// the curve they draw, so the loose box flags a correct circle. Walk the

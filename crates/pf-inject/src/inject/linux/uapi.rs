@@ -1,10 +1,8 @@
-//! Device-node plumbing shared by the uinput pads, the uinput pen, and the raw_gadget Deck:
-//! `open` through std (CLOEXEC, errno kept), `ioctl` over typed references, and the
-//! `<linux/uinput.h>` structs both uinput backends fill.
+//! Device-node plumbing shared by [`crate::uinput_abi`] and the raw_gadget Deck: `open`
+//! through std (CLOEXEC, errno kept) and `ioctl` over typed references.
 //!
 //! Request numbers and layouts are the 64-bit kernel ABI (x86_64 and aarch64 agree).
 
-use anyhow::{anyhow, Result};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::mem::size_of;
@@ -22,7 +20,7 @@ pub(crate) unsafe trait Pod {}
 unsafe impl<const N: usize> Pod for [u8; N] {}
 
 /// The argument size an `_IOC` request number encodes.
-const fn arg_size(req: libc::c_ulong) -> usize {
+pub(crate) const fn arg_size(req: libc::c_ulong) -> usize {
     ((req >> 16) & 0x3fff) as usize
 }
 
@@ -74,105 +72,4 @@ pub(crate) fn open_nonblock(path: &str) -> io::Result<File> {
         .write(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)
-}
-
-/// Open `/dev/uinput` for one virtual device, naming the remedy on failure.
-pub(crate) fn open_uinput() -> Result<File> {
-    open_nonblock("/dev/uinput").map_err(|e| {
-        anyhow!(
-            "open /dev/uinput: {e} (install the udev rule granting the 'input' group access \
-             — see scripts/60-punktfunk.rules — and add the user to the 'input' group)"
-        )
-    })
-}
-
-pub(crate) const UI_DEV_CREATE: libc::c_ulong = 0x5501;
-pub(crate) const UI_DEV_DESTROY: libc::c_ulong = 0x5502;
-pub(crate) const UI_DEV_SETUP: libc::c_ulong = 0x405c_5503;
-pub(crate) const UI_ABS_SETUP: libc::c_ulong = 0x401c_5504;
-pub(crate) const UI_SET_EVBIT: libc::c_ulong = 0x4004_5564;
-pub(crate) const UI_SET_KEYBIT: libc::c_ulong = 0x4004_5565;
-
-#[repr(C)]
-pub(crate) struct InputId {
-    pub bustype: u16,
-    pub vendor: u16,
-    pub product: u16,
-    pub version: u16,
-}
-
-#[repr(C)]
-pub(crate) struct UinputSetup {
-    pub id: InputId,
-    pub name: [u8; 80],
-    pub ff_effects_max: u32,
-}
-
-#[repr(C)]
-#[derive(Default, Clone, Copy)]
-pub(crate) struct AbsInfo {
-    pub value: i32,
-    pub minimum: i32,
-    pub maximum: i32,
-    pub fuzz: i32,
-    pub flat: i32,
-    pub resolution: i32,
-}
-
-#[repr(C)]
-pub(crate) struct UinputAbsSetup {
-    pub code: u16,
-    pub _pad: u16,
-    pub absinfo: AbsInfo,
-}
-
-const _: () = {
-    assert!(size_of::<UinputSetup>() == 92);
-    assert!(size_of::<UinputAbsSetup>() == 28);
-    assert!(size_of::<libc::input_event>() == INPUT_EVENT_LEN);
-};
-
-// SAFETY: `#[repr(C)]` integers and a byte array; the sizes above are the field sums, so
-// neither struct has padding.
-unsafe impl Pod for UinputSetup {}
-// SAFETY: as `UinputSetup`.
-unsafe impl Pod for UinputAbsSetup {}
-
-/// `struct input_event`: a 16-byte `timeval` the kernel stamps, then type, code, value.
-pub(crate) const INPUT_EVENT_LEN: usize = 24;
-
-pub(crate) fn input_event(type_: u16, code: u16, value: i32) -> [u8; INPUT_EVENT_LEN] {
-    let mut ev = [0u8; INPUT_EVENT_LEN];
-    ev[16..18].copy_from_slice(&type_.to_ne_bytes());
-    ev[18..20].copy_from_slice(&code.to_ne_bytes());
-    ev[20..24].copy_from_slice(&value.to_ne_bytes());
-    ev
-}
-
-/// `(type, code, value)` of an event read back from the node.
-pub(crate) fn parse_input_event(ev: &[u8; INPUT_EVENT_LEN]) -> (u16, u16, i32) {
-    (
-        u16::from_ne_bytes([ev[16], ev[17]]),
-        u16::from_ne_bytes([ev[18], ev[19]]),
-        i32::from_ne_bytes([ev[20], ev[21], ev[22], ev[23]]),
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn input_event_round_trips() {
-        assert_eq!(
-            parse_input_event(&input_event(0x15, 0x50, -7)),
-            (0x15, 0x50, -7)
-        );
-    }
-
-    #[test]
-    fn request_sizes_match_their_structs() {
-        assert_eq!(arg_size(UI_DEV_SETUP), size_of::<UinputSetup>());
-        assert_eq!(arg_size(UI_ABS_SETUP), size_of::<UinputAbsSetup>());
-    }
 }

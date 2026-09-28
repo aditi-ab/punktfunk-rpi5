@@ -35,27 +35,11 @@ RUN dnf -y install \
       # rpm.yml's HDR gamescope leg needs them and pulls them with `dnf builddep gamescope`.
   && dnf clean all
 
-# bun — both the BUILD tool and the RUNTIME for the punktfunk-web console (`bun run build` -> the
-# Nitro `bun`-preset .output, served by `Bun.serve` with TLS — HTTP/1.1 over TLS). The
-# RPM vendors THIS bun binary. Not in Fedora repos; install the official standalone binary to a
-# system PATH dir so the rpmbuild `%build`/`%install` (run as any uid) find it.
-#
-# A PINNED release asset, checked by SHA-256 — never `curl https://bun.sh/install | bash`. The spec
-# VENDORS this very binary into punktfunk-web, so the installer would be upstream code choosing
-# bytes rpm.yml then signs with RPM_GPG_PRIVATE_KEY. ONE bun across the repo: same version, asset
-# and sum as rpm.yml, deb.yml and rust-ci.Dockerfile — bump BUN_VERSION and BUN_SHA together (the
-# sums are in the release's SHASUMS256.txt). `-baseline` on purpose: it needs no AVX2, so the bun
-# we ship starts on every x86-64 box — something the auto-detecting installer never promised, since
-# it reads the BUILDER's CPU, not the user's.
-ARG BUN_VERSION=1.4.2
-ARG BUN_SHA=c678040f14fe0440eb839d37cbd0ce4c051a32da72806ac97de6a6aab6bf728f
-RUN curl -fsSL -o /tmp/bun.zip \
-      "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64-baseline.zip" \
-    && echo "${BUN_SHA}  /tmp/bun.zip" | sha256sum -c - \
-    && unzip -q -o -j /tmp/bun.zip '*/bun' -d /tmp \
-    && install -m0755 /tmp/bun /usr/local/bin/bun \
-    && rm -f /tmp/bun.zip /tmp/bun \
-    && bun --version
+# bun — both the BUILD tool and the RUNTIME for the punktfunk-web console, which the RPM vendors.
+# Not in Fedora repos; it goes to a system PATH dir so rpmbuild (run as any uid) finds it. The pin
+# lives in ci/bun.env.
+COPY bun.env install-bun.sh /tmp/
+RUN sh /tmp/install-bun.sh && rm /tmp/bun.env /tmp/install-bun.sh
 
 # libcuda link stub — the zerocopy path links a fixed set of cuXxx driver symbols, but CI has
 # no GPU and never RUNS CUDA. Rather than drag in the NVIDIA userspace stack, synthesize a stub

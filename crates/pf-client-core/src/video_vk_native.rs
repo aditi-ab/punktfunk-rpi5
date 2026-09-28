@@ -20,6 +20,7 @@ use crate::video::{
     ColorDesc, DecodeHealth, NativeReleaseGuard, NativeReleaseToken, NativeVkFrame, NativeVkLayout,
     VulkanDecodeDevice,
 };
+use crate::video_types::trim_deliverable;
 use anyhow::{anyhow, bail, Result};
 use pf_vkdecode::ash::vk;
 use pf_vkdecode::ash::vk::Handle as _;
@@ -291,7 +292,7 @@ impl StatusVerdicts {
 /// so treating it as concealment hitches every renegotiation. Only integrity drops.
 ///
 /// AV1 has no reorder envelope and no MMCO; every warning is damage.
-/// [`pf_vkdecode::is_integrity_warning_av1`] is exhaustive so a new warning cannot
+/// [`pf_vkdecode::Av1PlanWarning::is_integrity`] is exhaustive so a new warning cannot
 /// default to clean. The spec-legal branch is the landing site for a future one.
 enum PlanWarnings {
     H264(Vec<pf_vkdecode::PlanWarning>),
@@ -310,28 +311,19 @@ impl PlanWarnings {
 
     /// Integrity (concealment) subset. Allocates only off the clean path.
     ///
-    /// Predicate lives in pf-vkdecode so the fault-injection harness asserts against
-    /// the same list production conceals on.
+    /// Predicate lives on pf-bitstream's warning enums so the fault-injection
+    /// harness asserts against the same list production conceals on.
     fn integrity(&self) -> PlanWarnings {
         match self {
-            PlanWarnings::H264(w) => PlanWarnings::H264(
-                w.iter()
-                    .filter(|x| pf_vkdecode::is_integrity_warning(x))
-                    .cloned()
-                    .collect(),
-            ),
-            PlanWarnings::H265(w) => PlanWarnings::H265(
-                w.iter()
-                    .filter(|x| pf_vkdecode::is_integrity_warning_h265(x))
-                    .cloned()
-                    .collect(),
-            ),
-            PlanWarnings::Av1(w) => PlanWarnings::Av1(
-                w.iter()
-                    .filter(|x| pf_vkdecode::is_integrity_warning_av1(x))
-                    .cloned()
-                    .collect(),
-            ),
+            PlanWarnings::H264(w) => {
+                PlanWarnings::H264(w.iter().filter(|x| x.is_integrity()).cloned().collect())
+            }
+            PlanWarnings::H265(w) => {
+                PlanWarnings::H265(w.iter().filter(|x| x.is_integrity()).cloned().collect())
+            }
+            PlanWarnings::Av1(w) => {
+                PlanWarnings::Av1(w.iter().filter(|x| x.is_integrity()).cloned().collect())
+            }
         }
     }
 
@@ -535,31 +527,6 @@ const _: () = assert!(
     MAX_DELIVERABLE >= 1,
     "the deliverable queue must be able to carry at least one frame between AUs"
 );
-
-/// One `warn` per this many dropped deliverable frames after the first (~5 s at 60 fps).
-/// The shape that drops at all drops every AU; a warn per frame buries the log.
-const DROP_WARN_EVERY: u64 = 300;
-
-/// Trim `queue` to `cap` by dropping from the front; caller releases the returned frames.
-///
-/// Oldest-first: the front is several AUs stale and the next stage is newest-wins.
-/// Call after this AU's own frame is taken off the front so `cap` bounds carry-over.
-/// Trimming before the take would drop the first of a two-output AU and ship the second.
-fn trim_deliverable(
-    queue: &mut std::collections::VecDeque<DecodedVkFrame>,
-    cap: usize,
-) -> Vec<DecodedVkFrame> {
-    let mut dropped = Vec::new();
-    while queue.len() > cap {
-        match queue.pop_front() {
-            Some(frame) => dropped.push(frame),
-            // `len() > cap` means non-empty. `break` not `expect`: a 0-cap empty
-            // queue must not panic on the decode path.
-            None => break,
-        }
-    }
-    dropped
-}
 
 pub(crate) struct NativeVulkanDecoder {
     dec: Codec,
@@ -906,10 +873,9 @@ impl NativeVulkanDecoder {
         // One frame per AU to the caller; anything that cannot drain holds a pool image.
         let queued = self.deliverable.len();
         for frame in trim_deliverable(&mut self.deliverable, MAX_DELIVERABLE) {
-            self.health.note_dropped();
-            // First drop diagnoses; later ones heartbeat. `queued` is pre-trim depth
-            // — after trim it would be the constant `MAX_DELIVERABLE` every time.
-            if self.health.dropped == 1 || self.health.dropped % DROP_WARN_EVERY == 0 {
+            // `queued` is pre-trim depth: after the trim it would be the constant
+            // `MAX_DELIVERABLE` every time.
+            if self.health.note_dropped() {
                 tracing::warn!(
                     queued,
                     dropped_total = self.health.dropped,

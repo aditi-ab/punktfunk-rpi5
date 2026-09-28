@@ -36,6 +36,7 @@ use std::time::Instant;
 use super::display::DisplayTracker;
 use super::latency::{now_realtime_ns, p50_max_ms};
 use super::vsync::VsyncShared;
+use crate::sys::sysprop;
 
 /// Submit-margin ahead of a timeline's EXPECTED PRESENT — SurfaceFlinger's own latch lead: the
 /// released buffer must be in the BufferQueue by SF's wakeup for that vsync (a few ms before
@@ -54,7 +55,7 @@ const LATCH_MARGIN_NS: i64 = 2_500_000;
 /// `debug.punktfunk.latch_margin_us` (0..=8000 µs): PIN the submit margin for a sweep —
 /// setprop + stream restart, no rebuild. Unset/invalid = `None` = the adaptive default.
 fn latch_margin_ns() -> Option<i64> {
-    let us = crate::sysprop(c"debug.punktfunk.latch_margin_us")?
+    let us = sysprop(c"debug.punktfunk.latch_margin_us")?
         .parse::<i64>()
         .ok()?;
     (0..=8_000).contains(&us).then_some(us * 1_000)
@@ -772,7 +773,7 @@ fn release_unrendered(codec: &MediaCodec, index: usize) {
 /// `debug.punktfunk.presenter` sysprop: `arrival` = the legacy release-immediately path,
 /// anything else / unset = the timeline presenter. The rebuild-free on-device A/B lever.
 pub(super) fn presenter_disabled_by_sysprop() -> bool {
-    crate::sysprop(c"debug.punktfunk.presenter").as_deref() == Some("arrival")
+    sysprop(c"debug.punktfunk.presenter").as_deref() == Some("arrival")
 }
 
 #[cfg(test)]

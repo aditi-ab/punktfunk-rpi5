@@ -18,7 +18,6 @@
 //! Memory safety does not rest on the fences: SurfaceFlinger holds its own buffer reference from
 //! `setBuffer`, so an early delete at worst tears. The fences are the correctness of timing.
 
-use crate::sysprop;
 use ndk::hardware_buffer::HardwareBuffer;
 use ndk::media::image_reader::{AcquireResult, Image, ImageFormat, ImageReader};
 use ndk::media::media_codec::MediaCodec;
@@ -31,10 +30,10 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use super::async_loop::DecodeEvent;
-use super::latency::{now_realtime_ns, p50_max_ms};
+use super::latency::{now_realtime_ns, p50_max_ms, take_by_pts};
 use super::presenter::{cadence_suffix, PresentPriority};
 use super::surface_control::{fence_signal_ns, Layer, PresentComplete};
-use super::vsync::now_monotonic_ns;
+use crate::sys::{now_monotonic_ns, sysprop};
 
 /// Reader pool depth. Must cover the codec's own in-flight outputs + the presenter's held candidate
 /// / FIFO + the buffers still latched on SurfaceFlinger awaiting their release fence. Eight is
@@ -202,8 +201,8 @@ pub(super) struct AscBackend {
     // -- bookkeeping --
     next_seq: u64,
     /// Decode stamps parked at `on_output`, keyed by the pts the codec echoes onto the buffer:
-    /// `(pts_us, decoded_real_ns, decoded_mono_ns)`.
-    stamps: VecDeque<(u64, i128, i64)>,
+    /// `(pts_us, (decoded_real_ns, decoded_mono_ns))`.
+    stamps: VecDeque<(u64, (i128, i64))>,
 
     // -- 1 Hz pf.present window --
     released: u64,
@@ -395,7 +394,8 @@ impl AscBackend {
         present: bool,
     ) {
         if present {
-            self.stamps.push_back((pts_us, decoded_real, decoded_mono));
+            self.stamps
+                .push_back((pts_us, (decoded_real, decoded_mono)));
             if self.stamps.len() > 128 {
                 self.stamps.pop_front();
             }
@@ -403,20 +403,6 @@ impl AscBackend {
         if let Err(e) = codec.release_output_buffer_by_index(index, present) {
             log::warn!("asc: release_output_buffer_by_index({index}, {present}): {e}");
         }
-    }
-
-    /// Pop the decode stamps for `pts_us`, evicting older entries (decode order == input order).
-    fn take_stamp(&mut self, pts_us: u64) -> Option<(i128, i64)> {
-        while let Some(&(p, real, mono)) = self.stamps.front() {
-            if p > pts_us {
-                break;
-            }
-            self.stamps.pop_front();
-            if p == pts_us {
-                return Some((real, mono));
-            }
-        }
-        None
     }
 
     /// Slot scheduling is live: pacing wanted and the clock has a real present behind it.
@@ -619,8 +605,7 @@ impl AscBackend {
         // The buffer timestamp is the pts the codec echoed (ns); pair the parked decode stamps.
         let pts_ns = image.timestamp().unwrap_or(0).max(0);
         let pts_us = (pts_ns / 1000) as u64;
-        let (decoded_real, decoded_mono) = self
-            .take_stamp(pts_us)
+        let (decoded_real, decoded_mono) = take_by_pts(&mut self.stamps, pts_us)
             .unwrap_or((now_realtime_ns(), now_monotonic_ns()));
         let due_ns = self.cadence.as_mut().map(|c| {
             c.due_ns(

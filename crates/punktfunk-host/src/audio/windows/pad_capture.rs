@@ -135,49 +135,70 @@ pub(crate) fn render_test_tone(
     // By id, never a default-device resolve: the question is whether THIS endpoint is heard.
     let device = open_wasapi_device(endpoint_id)
         .with_context(|| format!("pad endpoint {endpoint_id} not found"))?;
-    let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;
     // Same mask as the endpoint and loopback. `None` lets wasapi derive
     // `(1 << 4) - 1` = 0x0F (FL FR FC LFE) instead of 0x33 (FL FR BL BR).
+    play_tone(
+        &device,
+        PAD_CHANNELS as usize,
+        Some(PAD_CHANNEL_MASK),
+        |c| pair.carries(c),
+        seconds,
+        hz,
+        &AtomicBool::new(false),
+    )
+}
+
+/// Tone amplitude. `audio-probe` measures against the same level, so peaks compare.
+const TONE_AMP: f32 = 0.5;
+
+/// Play a `hz` sine into `device` for `seconds` (1–60) or until `stop`: shared-mode 48 kHz
+/// f32 with autoconvert, the open the virtual mic uses. Channels `carries` rejects are silent.
+pub(crate) fn play_tone(
+    device: &wasapi::Device,
+    channels: usize,
+    mask: Option<u32>,
+    carries: impl Fn(usize) -> bool,
+    seconds: u32,
+    hz: f32,
+    stop: &AtomicBool,
+) -> Result<()> {
+    let mut client = device.get_iaudioclient().context("IAudioClient")?;
     let desired = WaveFormat::new(
         32,
         32,
         &SampleType::Float,
         SAMPLE_RATE as usize,
-        PAD_CHANNELS as usize,
-        Some(PAD_CHANNEL_MASK),
+        channels,
+        mask,
     );
-    let (default_period, _min) = audio_client.get_device_period().context("device period")?;
-    audio_client
+    let (period, _) = client.get_device_period().context("device period")?;
+    client
         .initialize_client(
             &desired,
             &Direction::Render,
             &StreamMode::EventsShared {
                 autoconvert: true,
-                buffer_duration_hns: default_period,
+                buffer_duration_hns: period,
             },
         )
-        .context("initialize render client")?;
-    let h_event = audio_client.set_get_eventhandle().context("event handle")?;
-    let render = audio_client
-        .get_audiorenderclient()
-        .context("IAudioRenderClient")?;
-    let buf_frames = audio_client.get_buffer_size().context("buffer size")? as usize;
-    let block = PAD_CHANNELS as usize * std::mem::size_of::<f32>();
+        .context("initialize tone render")?;
+    let h_event = client.set_get_eventhandle().context("event handle")?;
+    let render = client.get_audiorenderclient().context("render client")?;
+    let buf_frames = client.get_buffer_size().context("buffer size")? as usize;
+    let block = channels * std::mem::size_of::<f32>();
     // Start on silence so the stream opens without a glitch, as the mic pump does.
     let _ = render.write_to_device(buf_frames, &vec![0u8; buf_frames * block], None);
-    audio_client.start_stream().context("start render stream")?;
+    client.start_stream().context("start tone stream")?;
 
     let total = u64::from(SAMPLE_RATE) * u64::from(seconds.clamp(1, 60));
     let step = std::f32::consts::TAU * hz / SAMPLE_RATE as f32;
-    let mut phase = 0.0f32;
-    let mut written = 0u64;
+    let (mut phase, mut written) = (0.0f32, 0u64);
     let mut bytes = vec![0u8; buf_frames * block];
-
-    while written < total {
+    while written < total && !stop.load(Ordering::Relaxed) {
         if h_event.wait_for_event(1000).is_err() {
-            anyhow::bail!("render event timed out after {written} frames");
+            anyhow::bail!("tone render event timed out after {written} frames");
         }
-        let free = audio_client
+        let free = client
             .get_available_space_in_frames()
             .context("available space")? as usize;
         let n = free.min((total - written) as usize);
@@ -185,14 +206,14 @@ pub(crate) fn render_test_tone(
             continue;
         }
         for f in 0..n {
-            let s = phase.sin() * 0.5;
+            let s = phase.sin() * TONE_AMP;
             phase += step;
             if phase >= std::f32::consts::TAU {
                 phase -= std::f32::consts::TAU;
             }
-            for c in 0..PAD_CHANNELS as usize {
-                let v: f32 = if pair.carries(c) { s } else { 0.0 };
-                let at = (f * PAD_CHANNELS as usize + c) * 4;
+            for c in 0..channels {
+                let v = if carries(c) { s } else { 0.0 };
+                let at = (f * channels + c) * 4;
                 bytes[at..at + 4].copy_from_slice(&v.to_le_bytes());
             }
         }
@@ -202,8 +223,8 @@ pub(crate) fn render_test_tone(
         written += n as u64;
     }
     // Let the tail drain before tearing the stream down.
-    std::thread::sleep(Duration::from_millis(200));
-    let _ = audio_client.stop_stream();
+    thread::sleep(Duration::from_millis(200));
+    let _ = client.stop_stream();
     Ok(())
 }
 

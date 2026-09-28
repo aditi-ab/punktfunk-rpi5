@@ -16,21 +16,9 @@
 // Auth: `/api/**` is always session-gated (`isPublicPath`), so reaching here means a logged-in
 // operator, and it answers 401 as JSON rather than redirecting — which is what a `fetch` needs. The
 // plugin's per-boot secret stays server-side, exactly as in the `/plugin-ui` proxy.
-import {
-	defineEventHandler,
-	getRouterParam,
-	readRawBody,
-	setResponseStatus,
-} from "h3";
-import { putAndGrant } from "../../../util/handedPaths";
-import {
-	callPlugin,
-	PLUGIN_ID_RE,
-	pluginJson,
-} from "../../../util/pluginProxy";
-
-/** `GET` reads schema + current value; `PUT` validates and saves. Nothing else is forwarded. */
-const ALLOWED = new Set(["GET", "PUT"]);
+import { defineEventHandler, getRouterParam, setResponseStatus } from "h3";
+import { PLUGIN_ID_RE } from "../../../util/pluginProxy";
+import { pluginSurface } from "../../../util/pluginSurface";
 
 export default defineEventHandler(async (event) => {
 	const id = getRouterParam(event, "id");
@@ -42,35 +30,12 @@ export default defineEventHandler(async (event) => {
 		setResponseStatus(event, 400);
 		return { error: "not a valid plugin id" };
 	}
-	const method = event.method;
-	if (!ALLOWED.has(method)) {
-		setResponseStatus(event, 405);
-		return { error: "method not allowed" };
-	}
-	// Read once: `readRawBody` drains the stream, and an empty PUT would save `{}`.
-	const body =
-		method === "PUT"
-			? ((await readRawBody(event, false)) as Uint8Array | undefined)
-			: undefined;
-	const { res, access } =
-		method === "PUT"
-			? await putAndGrant(id, "/__config", body, "config")
-			: { res: await callPlugin(id, "/__config", "GET"), access: undefined };
-	if (!res) {
-		setResponseStatus(event, 502);
-		return { error: `plugin ${id} is not reachable` };
-	}
-
-	// A 404 here is the plugin declining to have a `__config` at all (`config` is optional on the
-	// kit's `serveUi`), which the console renders as "settings live on this plugin's own page".
-	// Marked in the body rather than left as a bare status: under `bun run dev` these routes do not
-	// run and `/api` proxies to the management API, whose 404 for an unknown path would otherwise
-	// read as that same claim about every source.
-	if (res.status === 404) {
-		setResponseStatus(event, 404);
-		return { error: "plugin serves no config surface", noConfig: true };
-	}
-	setResponseStatus(event, res.status);
-	const json = await pluginJson(res, id);
-	return access ? { ...(json as object), access } : json;
+	// `GET` reads schema + current value; `PUT` validates and saves. A 404 is the plugin declining
+	// to have a `__config` at all (`config` is optional on the kit's `serveUi`), which the console
+	// renders as "settings live on this plugin's own page".
+	return pluginSurface(event, id, "/__config", {
+		methods: ["GET", "PUT"],
+		grantForm: "config",
+		notFound: { error: "plugin serves no config surface", noConfig: true },
+	});
 });

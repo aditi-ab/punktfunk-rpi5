@@ -10,6 +10,7 @@ use crate::trust::{self, Settings};
 use crate::ui_hosts::{self, ConnectRequest, HostsMsg, HostsOutput, HostsPage};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
+use pf_client_core::orchestrate::{trust_route, ConnectOutcome, TrustRoute};
 use pf_client_core::start;
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::config::{CompositorPref, GamepadPref};
@@ -142,7 +143,7 @@ pub enum AppMsg {
     /// A `punktfunk://` URL arrived (scheme handler, a shortcut, or a second invocation
     /// forwarded to this instance by GApplication) — design/client-deep-links.md §4.1.
     DeepLink(String),
-    /// The trust gate in front of every connect (rules 1–3, see `update`).
+    /// The trust gate in front of every connect (see `AppModel::connect`).
     Connect(ConnectRequest),
     /// Connect to a saved host that isn't advertising but has a known MAC: fire a wake
     /// packet and DIAL IMMEDIATELY (mDNS absence ≠ unreachable — routed/Tailscale hosts
@@ -437,67 +438,7 @@ impl SimpleComponent for AppModel {
     fn update(&mut self, msg: AppMsg, sender: ComponentSender<Self>) {
         match msg {
             AppMsg::DeepLink(url) => self.open_deep_link(&url, &sender),
-            // Trust gate, in order: a stored fingerprint connects silently; a known address
-            // under a new fingerprint is the impostor case and forces the PIN ceremony; an
-            // unknown host is offered TOFU alongside PIN only when it advertises
-            // `pair=optional`, else delegated approval or PIN.
-            AppMsg::Connect(req) => {
-                if self.busy {
-                    return;
-                }
-                let known = trust::KnownHosts::load();
-                match &req.fp_hex {
-                    Some(fp_hex) => {
-                        if known.find_by_fp(fp_hex).is_some() {
-                            let fp_hex = fp_hex.clone();
-                            sender.input(AppMsg::StartSession {
-                                req,
-                                fp_hex,
-                                tofu: false,
-                                opts: SpawnOpts::default(),
-                            });
-                        } else if known.find_by_addr(&req.addr, req.port).is_some() {
-                            self.toast("Host fingerprint changed — re-pair with a PIN to continue");
-                            crate::ui_trust::pin_dialog(
-                                &self.window,
-                                &sender,
-                                self.identity.clone(),
-                                req,
-                            );
-                        } else if req.pair_optional {
-                            crate::ui_trust::tofu_dialog(&self.window, &sender, req);
-                        } else {
-                            crate::ui_trust::approval_dialog(
-                                &self.window,
-                                &sender,
-                                self.waiting.clone(),
-                                req,
-                            );
-                        }
-                    }
-                    None => {
-                        // Manual entry: a known address connects on its stored pin;
-                        // an unknown one must pair — never silent TOFU.
-                        match known
-                            .find_by_addr(&req.addr, req.port)
-                            .map(|k| k.fp_hex.clone())
-                        {
-                            Some(fp_hex) => sender.input(AppMsg::StartSession {
-                                req,
-                                fp_hex,
-                                tofu: false,
-                                opts: SpawnOpts::default(),
-                            }),
-                            None => crate::ui_trust::approval_dialog(
-                                &self.window,
-                                &sender,
-                                self.waiting.clone(),
-                                req,
-                            ),
-                        }
-                    }
-                }
-            }
+            AppMsg::Connect(req) => self.connect(req, &sender),
             AppMsg::WakeConnect(req) => {
                 if !self.busy {
                     // Never gate the dial on mDNS presence: a routed host (Tailscale/VPN) never
@@ -518,114 +459,14 @@ impl SimpleComponent for AppModel {
                 }
             }
             AppMsg::SpeedTest(req) => self.speed_test(req, &sender),
-            AppMsg::SendLogs(req, mgmt_port) => {
-                // Blocking network (the library agent's 5 s connect / 10 s global budgets) —
-                // a worker thread, with the outcome routed back as a Toast. Wording is the
-                // console's verbatim, so a quoted message means the same thing everywhere.
-                let identity = self.identity.clone();
-                let pin = req.fp_hex.as_deref().and_then(trust::parse_hex32);
-                let mgmt = mgmt_port.unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT);
-                self.toast(&format!("Sending logs to {}…", req.name));
-                let out = sender.input_sender().clone();
-                std::thread::Builder::new()
-                    .name("punktfunk-sendlogs".into())
-                    .spawn(move || {
-                        let header = format!(
-                            "punktfunk-client {} ({} {}) — client log bundle",
-                            env!("CARGO_PKG_VERSION"),
-                            std::env::consts::OS,
-                            std::env::consts::ARCH,
-                        );
-                        let msg = match pf_client_core::logring::send_to_host(
-                            &req.addr, mgmt, &identity, pin, &header,
-                        ) {
-                            Ok(id) => {
-                                tracing::info!(host = %req.name, id, "client logs uploaded");
-                                format!(
-                                    "Logs sent to {} — download them from its web console's \
-                                     Logs page",
-                                    req.name
-                                )
-                            }
-                            Err(e) => {
-                                tracing::warn!(host = %req.name, error = %e, "client log upload failed");
-                                format!("Couldn't send logs — {e}")
-                            }
-                        };
-                        let _ = out.send(AppMsg::Toast(msg));
-                    })
-                    .ok();
-            }
+            AppMsg::SendLogs(req, mgmt_port) => self.send_logs(req, mgmt_port, &sender),
             AppMsg::HostAction {
                 req,
                 mgmt,
                 action_id,
                 label,
                 danger,
-            } => {
-                let mgmt = mgmt.unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT);
-                // Restart and shut down lose whatever is running on that machine, so they ask
-                // first — the same treatment Forget gets. Sleep is reversible from the same
-                // menu ("Wake host"), so it goes straight through.
-                if danger {
-                    let dialog = adw::AlertDialog::new(
-                        Some(&format!("{label}?")),
-                        Some(&format!(
-                            "This ends every stream from {} and anything running on it. \
-                             You'll need to wake or start it again.",
-                            req.name
-                        )),
-                    );
-                    dialog.add_responses(&[("cancel", "Cancel"), ("go", &label)]);
-                    dialog.set_response_appearance("go", adw::ResponseAppearance::Destructive);
-                    dialog.set_default_response(Some("cancel"));
-                    dialog.set_close_response("cancel");
-                    let out = sender.input_sender().clone();
-                    let (req, action_id, label) = (req.clone(), action_id.clone(), label.clone());
-                    dialog.connect_response(Some("go"), move |_, _| {
-                        out.send(AppMsg::HostAction {
-                            req: req.clone(),
-                            mgmt: Some(mgmt),
-                            action_id: action_id.clone(),
-                            label: label.clone(),
-                            // Asked and answered.
-                            danger: false,
-                        })
-                        .ok();
-                    });
-                    dialog.present(Some(&self.window));
-                    return;
-                }
-                // Blocking network on a worker, outcome as a toast — the SendLogs recipe. A
-                // 202 is the last word: the host ends every session and acts a second later,
-                // so there is nothing to poll and nothing to undo.
-                let identity = self.identity.clone();
-                let pin = req.fp_hex.as_deref().and_then(trust::parse_hex32);
-                if let Some(fp) = req.fp_hex.as_deref() {
-                    // Whatever the host said about itself is about to be wrong.
-                    pf_client_core::host_actions::invalidate(fp);
-                }
-                self.toast(&format!("{label} — asking {}…", req.name));
-                let out = sender.input_sender().clone();
-                std::thread::Builder::new()
-                    .name("punktfunk-hostaction".into())
-                    .spawn(move || {
-                        let msg = match pf_client_core::host_actions::invoke(
-                            &req.addr, mgmt, &identity, pin, &action_id,
-                        ) {
-                            Ok(()) => {
-                                tracing::info!(host = %req.name, action = %action_id, "host action accepted");
-                                format!("{}: {label} — on its way", req.name)
-                            }
-                            Err(e) => {
-                                tracing::warn!(host = %req.name, action = %action_id, error = %e, "host action refused");
-                                format!("{label} failed — {e}")
-                            }
-                        };
-                        let _ = out.send(AppMsg::Toast(msg));
-                    })
-                    .ok();
-            }
+            } => self.host_action(req, mgmt, action_id, label, danger, &sender),
             AppMsg::SpeedTestDone => self.busy = false,
             AppMsg::OpenLibrary(req, mgmt_port) => {
                 crate::ui_library::open(self, &sender, req, mgmt_port);
@@ -635,152 +476,22 @@ impl SimpleComponent for AppModel {
                 fp_hex,
                 tofu,
                 opts,
-            } => {
-                if std::mem::replace(&mut self.busy, true) {
-                    return;
-                }
-                self.hosts.emit(HostsMsg::ClearError);
-                self.hosts
-                    .emit(HostsMsg::SetConnecting(Some(req.card_key())));
-                // No settings ride along: the spawner resolves this host's effective ones
-                // (globals + its preset) for both the argv and the child's spec.
-                if let Err(e) =
-                    spawn::spawn_session(sender.input_sender().clone(), req, fp_hex, tofu, opts)
-                {
-                    self.busy = false;
-                    self.hosts.emit(HostsMsg::SetConnecting(None));
-                    self.hosts.emit(HostsMsg::ShowError(e));
-                }
-            }
+            } => self.start_session(req, fp_hex, tofu, opts, &sender),
             AppMsg::SessionReady {
                 req,
                 fp_hex,
                 tofu,
                 persist_paired,
                 cancel,
-            } => {
-                if ready_was_cancelled(cancel.as_ref()) {
-                    return;
-                }
-                self.close_waiting();
-                self.hosts.emit(HostsMsg::SetConnecting(None));
-                // A child that reported ready proves the host answered — the exact condition
-                // the dial-first wake fallback exists to rule out. Left armed, it turns a
-                // later ordinary failure into a spurious "waking…".
-                self.wake_fallback = None;
-                if persist_paired {
-                    // Request-access: the operator approved this device — a trusted
-                    // PAIRED host from now on, like after a PIN ceremony.
-                    match trust::persist_host(&req.name, &req.addr, req.port, &fp_hex, true) {
-                        Ok(()) => self.toast("Approved — connected"),
-                        // The stream is up (the pin was carried in memory), but nothing was
-                        // written — say so, or the host is simply gone at the next launch.
-                        Err(e) => self.toast(&format!("Connected, but couldn't save — {e:#}")),
-                    }
-                } else if tofu {
-                    // The advertised fingerprint proved itself on a real connect.
-                    match trust::persist_host(&req.name, &req.addr, req.port, &fp_hex, false) {
-                        Ok(()) => self.toast(&format!(
-                            "Trusted on first use — fingerprint {}…",
-                            &fp_hex[..16.min(fp_hex.len())]
-                        )),
-                        Err(e) => self.toast(&format!("Connected, but couldn't save — {e:#}")),
-                    }
-                }
-                self.hosts.emit(HostsMsg::Refresh);
-            }
+            } => self.session_ready(req, fp_hex, tofu, persist_paired, cancel),
             AppMsg::SessionExited {
                 req,
                 code,
                 error,
                 ended,
                 tofu,
-            } => {
-                self.close_waiting();
-                self.busy = false;
-                self.hosts.emit(HostsMsg::SetConnecting(None));
-                // The dial-first wake fallback (armed by `WakeConnect`, consumed on every exit):
-                // a failed dial to the non-advertising host it was armed for falls into the
-                // visible wake-and-wait instead of an error alert. Matched by fingerprint (else
-                // address) so a stale armed request can never redirect another host's failure.
-                let cancelled = std::mem::take(&mut self.session_cancelled);
-                let wake_fb =
-                    self.wake_fallback
-                        .take()
-                        .filter(|fb| match (&fb.fp_hex, &req.fp_hex) {
-                            (Some(a), Some(b)) => a == b,
-                            _ => fb.addr == req.addr && fb.port == req.port,
-                        });
-                match (code, error, ended) {
-                    (0, _, None) => {} // clean end — back on the hosts page, no noise
-                    (0, _, Some(reason)) => self.hosts.emit(HostsMsg::ShowError(reason)),
-                    (_, Some((_, true)), _) if !tofu => {
-                        // The stored pin no longer matches (rotated cert or impostor). The host
-                        // ANSWERED — never the wake fallback.
-                        self.toast("Host fingerprint changed — re-pair with a PIN to continue");
-                        crate::ui_trust::pin_dialog(
-                            &self.window,
-                            &sender,
-                            self.identity.clone(),
-                            req,
-                        );
-                    }
-                    // A fingerprint mismatch means the host ANSWERED — reachable, so the plain
-                    // error arms below handle it; only a genuine connect failure wakes.
-                    (_, Some((_, false)), _) if wake_fb.is_some() => {
-                        crate::ui_trust::wake_and_connect(&self.window, &sender, req)
-                    }
-                    (_, Some((msg, _)), _) => self
-                        .hosts
-                        .emit(HostsMsg::ShowError(format!("Couldn't connect — {msg}"))),
-                    // Killed by us (request-access cancel) — the toast already said so.
-                    (-1, None, _) if cancelled => {}
-                    (-1, None, _) => self.hosts.emit(HostsMsg::ShowError(
-                        "Stream session was killed — out of memory, or stopped by the system"
-                            .into(),
-                    )),
-                    (_, None, _) if wake_fb.is_some() => {
-                        crate::ui_trust::wake_and_connect(&self.window, &sender, req)
-                    }
-                    (code, None, _) => self.hosts.emit(HostsMsg::ShowError(format!(
-                        "The session didn't start (exit {code}). Check the client log."
-                    ))),
-                }
-            }
-            AppMsg::OpenConsole => {
-                if std::mem::replace(&mut self.busy, true) {
-                    return;
-                }
-                // The console owns the screen and the pads while it runs, so it takes `busy`
-                // like a stream does. `wait_check_async` lands the exit on this main loop —
-                // no thread, no channel — and turns a non-zero exit into the error the
-                // banner shows, which is also how a session built without `ui` surfaces.
-                let mut argv = vec![
-                    std::ffi::OsString::from(crate::spawn::session_binary()),
-                    "--browse".into(),
-                ];
-                // Same knob a stream uses — the session also fullscreens itself on the Deck
-                // and under gamescope regardless.
-                if self.settings.borrow().fullscreen_on_stream {
-                    argv.push("--fullscreen".into());
-                }
-                let argv: Vec<&std::ffi::OsStr> =
-                    argv.iter().map(std::ffi::OsString::as_os_str).collect();
-                match gio::Subprocess::newv(&argv, gio::SubprocessFlags::NONE) {
-                    Ok(child) => {
-                        let sender = sender.clone();
-                        child.wait_check_async(gio::Cancellable::NONE, move |res| {
-                            sender.input(AppMsg::ConsoleExited(res.err().map(|e| e.to_string())));
-                        });
-                    }
-                    Err(e) => {
-                        self.busy = false;
-                        self.hosts.emit(HostsMsg::ShowError(format!(
-                            "Couldn't start the console UI — {e}"
-                        )));
-                    }
-                }
-            }
+            } => self.session_exited(req, code, error, ended, tofu, &sender),
+            AppMsg::OpenConsole => self.open_console(&sender),
             AppMsg::ConsoleExited(err) => {
                 self.busy = false;
                 // Quitting the console (B at its root) exits 0 and returns here silently.
@@ -801,26 +512,7 @@ impl SimpleComponent for AppModel {
             AppMsg::ShowPreferences => sender.input(AppMsg::ShowPreferencesScoped(
                 crate::ui_settings::Scope::Defaults,
             )),
-            AppMsg::ShowPreferencesScoped(scope) => {
-                let hosts = self.hosts.sender().clone();
-                let reopen = sender.clone();
-                crate::ui_settings::show_scoped(
-                    &self.window,
-                    self.settings.clone(),
-                    &self.gamepad,
-                    &self.probes.borrow(),
-                    scope,
-                    // The switcher closes the dialog to commit the layer it was editing, then
-                    // asks for it back in the new scope — so the app owns the re-open and the
-                    // dialog stays a pure view.
-                    move |next| reopen.input(AppMsg::ShowPreferencesScoped(next)),
-                    move || {
-                        // The library toggle changes the saved cards' menu, and a preset edit
-                        // changes the chips — re-render either way.
-                        let _ = hosts.send(HostsMsg::Refresh);
-                    },
-                );
-            }
+            AppMsg::ShowPreferencesScoped(scope) => self.show_preferences(scope, &sender),
             AppMsg::ShowShortcuts => shortcuts_window(&self.window).present(),
             AppMsg::ShowAbout => crate::ui_settings::show_about(&self.window),
             AppMsg::ShowAddHost => self.hosts.emit(HostsMsg::ShowAddHost),
@@ -832,6 +524,294 @@ impl SimpleComponent for AppModel {
 impl AppModel {
     pub fn toast(&self, msg: &str) {
         self.toasts.add_toast(adw::Toast::new(msg));
+    }
+
+    /// Opens the surface [`trust_route`] picks: the stored pin dials, a changed fingerprint
+    /// gets the PIN dialog, a new `pair=optional` host gets the TOFU offer, and anything
+    /// else gets delegated approval or PIN.
+    fn connect(&mut self, req: ConnectRequest, sender: &ComponentSender<Self>) {
+        if self.busy {
+            return;
+        }
+        let known = trust::KnownHosts::load();
+        let fp = req.fp_hex.as_deref();
+        match trust_route(&known, fp, &req.addr, req.port, req.pair_optional) {
+            TrustRoute::Pinned(fp_hex) => sender.input(AppMsg::StartSession {
+                req,
+                fp_hex,
+                tofu: false,
+                opts: SpawnOpts::default(),
+            }),
+            TrustRoute::FingerprintChanged => {
+                self.toast("Host fingerprint changed — re-pair with a PIN to continue");
+                crate::ui_trust::pin_dialog(&self.window, sender, self.identity.clone(), req);
+            }
+            TrustRoute::OfferTofu(_) => crate::ui_trust::tofu_dialog(&self.window, sender, req),
+            TrustRoute::NeedsPairing => {
+                crate::ui_trust::approval_dialog(&self.window, sender, self.waiting.clone(), req);
+            }
+        }
+    }
+
+    fn send_logs(
+        &self,
+        req: ConnectRequest,
+        mgmt_port: Option<u16>,
+        sender: &ComponentSender<Self>,
+    ) {
+        // Blocking network (the library agent's 5 s connect / 10 s global budgets) —
+        // a worker thread, with the outcome routed back as a Toast.
+        let identity = self.identity.clone();
+        let mgmt = mgmt_port.unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT);
+        self.toast(&format!("Sending logs to {}…", req.name));
+        let out = sender.input_sender().clone();
+        std::thread::Builder::new()
+            .name("punktfunk-sendlogs".into())
+            .spawn(move || {
+                let msg = pf_client_core::logring::send_bundle(
+                    "punktfunk-client",
+                    &req.name,
+                    &req.addr,
+                    mgmt,
+                    &identity,
+                    req.fp_hex.as_deref().unwrap_or_default(),
+                );
+                let _ = out.send(AppMsg::Toast(msg));
+            })
+            .ok();
+    }
+
+    fn host_action(
+        &self,
+        req: ConnectRequest,
+        mgmt: Option<u16>,
+        action_id: String,
+        label: String,
+        danger: bool,
+        sender: &ComponentSender<Self>,
+    ) {
+        let mgmt = mgmt.unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT);
+        // Restart and shut down lose whatever is running on that machine, so they ask
+        // first — the same treatment Forget gets. Sleep is reversible from the same
+        // menu ("Wake host"), so it goes straight through.
+        if danger {
+            let dialog = adw::AlertDialog::new(
+                Some(&format!("{label}?")),
+                Some(&format!(
+                    "This ends every stream from {} and anything running on it. \
+                     You'll need to wake or start it again.",
+                    req.name
+                )),
+            );
+            dialog.add_responses(&[("cancel", "Cancel"), ("go", &label)]);
+            dialog.set_response_appearance("go", adw::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
+            let out = sender.input_sender().clone();
+            let (req, action_id, label) = (req.clone(), action_id.clone(), label.clone());
+            dialog.connect_response(Some("go"), move |_, _| {
+                out.send(AppMsg::HostAction {
+                    req: req.clone(),
+                    mgmt: Some(mgmt),
+                    action_id: action_id.clone(),
+                    label: label.clone(),
+                    // Asked and answered.
+                    danger: false,
+                })
+                .ok();
+            });
+            dialog.present(Some(&self.window));
+            return;
+        }
+        // Blocking network on a worker, outcome as a toast — the SendLogs recipe.
+        let identity = self.identity.clone();
+        self.toast(&format!("{label} — asking {}…", req.name));
+        let out = sender.input_sender().clone();
+        std::thread::Builder::new()
+            .name("punktfunk-hostaction".into())
+            .spawn(move || {
+                let msg = pf_client_core::host_actions::run(
+                    &req.name,
+                    &req.addr,
+                    mgmt,
+                    &identity,
+                    req.fp_hex.as_deref().unwrap_or_default(),
+                    &action_id,
+                    &label,
+                );
+                let _ = out.send(AppMsg::Toast(msg));
+            })
+            .ok();
+    }
+
+    fn start_session(
+        &mut self,
+        req: ConnectRequest,
+        fp_hex: String,
+        tofu: bool,
+        opts: SpawnOpts,
+        sender: &ComponentSender<Self>,
+    ) {
+        if std::mem::replace(&mut self.busy, true) {
+            return;
+        }
+        self.hosts.emit(HostsMsg::ClearError);
+        self.hosts
+            .emit(HostsMsg::SetConnecting(Some(req.card_key())));
+        // No settings ride along: the spawner resolves this host's effective ones
+        // (globals + its preset) for both the argv and the child's spec.
+        if let Err(e) = spawn::spawn_session(sender.input_sender().clone(), req, fp_hex, tofu, opts)
+        {
+            self.busy = false;
+            self.hosts.emit(HostsMsg::SetConnecting(None));
+            self.hosts.emit(HostsMsg::ShowError(e));
+        }
+    }
+
+    fn session_ready(
+        &mut self,
+        req: ConnectRequest,
+        fp_hex: String,
+        tofu: bool,
+        persist_paired: bool,
+        cancel: Option<CancelHandle>,
+    ) {
+        if ready_was_cancelled(cancel.as_ref()) {
+            return;
+        }
+        self.close_waiting();
+        self.hosts.emit(HostsMsg::SetConnecting(None));
+        // A child that reported ready proves the host answered — the exact condition
+        // the dial-first wake fallback exists to rule out. Left armed, it turns a
+        // later ordinary failure into a spurious "waking…".
+        self.wake_fallback = None;
+        if persist_paired {
+            // Request-access: the operator approved this device — a trusted
+            // PAIRED host from now on, like after a PIN ceremony.
+            match trust::persist_host(&req.name, &req.addr, req.port, &fp_hex, true, &[]) {
+                Ok(()) => self.toast("Approved — connected"),
+                // The stream is up (the pin was carried in memory), but nothing was
+                // written — say so, or the host is simply gone at the next launch.
+                Err(e) => self.toast(&format!("Connected, but couldn't save — {e:#}")),
+            }
+        } else if tofu {
+            // The advertised fingerprint proved itself on a real connect.
+            match trust::persist_host(&req.name, &req.addr, req.port, &fp_hex, false, &[]) {
+                Ok(()) => self.toast(&format!(
+                    "Trusted on first use — fingerprint {}…",
+                    &fp_hex[..16.min(fp_hex.len())]
+                )),
+                Err(e) => self.toast(&format!("Connected, but couldn't save — {e:#}")),
+            }
+        }
+        self.hosts.emit(HostsMsg::Refresh);
+    }
+
+    fn session_exited(
+        &mut self,
+        req: ConnectRequest,
+        code: i32,
+        error: Option<(String, bool)>,
+        ended: Option<String>,
+        tofu: bool,
+        sender: &ComponentSender<Self>,
+    ) {
+        self.close_waiting();
+        self.busy = false;
+        self.hosts.emit(HostsMsg::SetConnecting(None));
+        // The dial-first wake fallback (armed by `WakeConnect`, consumed on every exit):
+        // a failed dial to the non-advertising host it was armed for falls into the
+        // visible wake-and-wait instead of an error alert. Matched by fingerprint (else
+        // address) so a stale armed request can never redirect another host's failure.
+        let cancelled = std::mem::take(&mut self.session_cancelled);
+        let wake_fb = self
+            .wake_fallback
+            .take()
+            .filter(|fb| match (&fb.fp_hex, &req.fp_hex) {
+                (Some(a), Some(b)) => a == b,
+                _ => fb.addr == req.addr && fb.port == req.port,
+            });
+        match ConnectOutcome::from_exit(code, error, ended, cancelled) {
+            // A clean end, or our own kill (request-access cancel) — the toast
+            // already said so.
+            ConnectOutcome::Ended(None) | ConnectOutcome::Cancelled => {}
+            ConnectOutcome::Ended(Some(reason)) => self.hosts.emit(HostsMsg::ShowError(reason)),
+            o if wake_fb.is_some() && o.warrants_wake() => {
+                crate::ui_trust::wake_and_connect(&self.window, sender, req)
+            }
+            ConnectOutcome::TrustRejected(_) if !tofu => {
+                // The stored pin no longer matches (rotated cert or impostor).
+                self.toast("Host fingerprint changed — re-pair with a PIN to continue");
+                crate::ui_trust::pin_dialog(&self.window, sender, self.identity.clone(), req);
+            }
+            ConnectOutcome::TrustRejected(msg) | ConnectOutcome::ConnectFailed(msg) => self
+                .hosts
+                .emit(HostsMsg::ShowError(format!("Couldn't connect — {msg}"))),
+            ConnectOutcome::RendererFailed { code: -1 } => self.hosts.emit(HostsMsg::ShowError(
+                "Stream session was killed — out of memory, or stopped by the system".into(),
+            )),
+            ConnectOutcome::RendererFailed { code } => {
+                let how = ConnectOutcome::exit_phrase(code);
+                self.hosts.emit(HostsMsg::ShowError(format!(
+                    "The session didn't start ({how}). Check the client log."
+                )))
+            }
+        }
+    }
+
+    fn open_console(&mut self, sender: &ComponentSender<Self>) {
+        if std::mem::replace(&mut self.busy, true) {
+            return;
+        }
+        // The console owns the screen and the pads while it runs, so it takes `busy`
+        // like a stream does. `wait_check_async` lands the exit on this main loop —
+        // no thread, no channel — and turns a non-zero exit into the error the
+        // banner shows, which is also how a session built without `ui` surfaces.
+        let mut argv = vec![
+            std::ffi::OsString::from(crate::spawn::session_binary()),
+            "--browse".into(),
+        ];
+        // Same knob a stream uses — the session also fullscreens itself on the Deck
+        // and under gamescope regardless.
+        if self.settings.borrow().fullscreen_on_stream {
+            argv.push("--fullscreen".into());
+        }
+        let argv: Vec<&std::ffi::OsStr> = argv.iter().map(std::ffi::OsString::as_os_str).collect();
+        match gio::Subprocess::newv(&argv, gio::SubprocessFlags::NONE) {
+            Ok(child) => {
+                let sender = sender.clone();
+                child.wait_check_async(gio::Cancellable::NONE, move |res| {
+                    sender.input(AppMsg::ConsoleExited(res.err().map(|e| e.to_string())));
+                });
+            }
+            Err(e) => {
+                self.busy = false;
+                self.hosts.emit(HostsMsg::ShowError(format!(
+                    "Couldn't start the console UI — {e}"
+                )));
+            }
+        }
+    }
+
+    fn show_preferences(&self, scope: crate::ui_settings::Scope, sender: &ComponentSender<Self>) {
+        let hosts = self.hosts.sender().clone();
+        let reopen = sender.clone();
+        crate::ui_settings::show_scoped(
+            &self.window,
+            self.settings.clone(),
+            &self.gamepad,
+            &self.probes.borrow(),
+            scope,
+            // The switcher closes the dialog to commit the layer it was editing, then
+            // asks for it back in the new scope — so the app owns the re-open and the
+            // dialog stays a pure view.
+            move |next| reopen.input(AppMsg::ShowPreferencesScoped(next)),
+            move || {
+                // The library toggle changes the saved cards' menu, and a preset edit
+                // changes the chips — re-render either way.
+                let _ = hosts.send(HostsMsg::Refresh);
+            },
+        );
     }
 
     /// Route a `punktfunk://` URL (design/client-deep-links.md §4.1). Parsing, host/preset
@@ -1219,27 +1199,9 @@ fn clear_steam_sdl_device_filter() {
 }
 
 pub fn run() -> glib::ExitCode {
-    // The env filter scopes the fmt layer only; the ring (`pf_client_core::logring`) keeps
-    // DEBUG+ regardless of RUST_LOG, because "Send logs to host" uploads it. The spawned
-    // session's stderr joins the ring too, so a bundle carries the stream's trail.
-    {
-        use tracing_subscriber::layer::SubscriberExt;
-        use tracing_subscriber::util::SubscriberInitExt;
-        use tracing_subscriber::Layer;
-        tracing_subscriber::registry()
-            .with(
-                // The default (stdout) writer, exactly as `fmt().init()` had it.
-                tracing_subscriber::fmt::layer().with_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| "info".into()),
-                ),
-            )
-            .with(
-                pf_client_core::logring::RingLayer
-                    .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
-            )
-            .init();
-    }
+    // Logs to stdout and the ring "Send logs to host" uploads. The spawned session's stderr
+    // joins the ring too, so a bundle carries the stream's trail.
+    pf_client_core::logring::init_tracing(std::io::stdout, true);
     // Steam launches its shortcuts with SDL_GAMECONTROLLER_IGNORE_DEVICES naming every
     // physical pad Steam Input has virtualized; the Settings controller list needs the
     // real devices (same rationale as the session binary).

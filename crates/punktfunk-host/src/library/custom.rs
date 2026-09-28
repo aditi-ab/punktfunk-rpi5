@@ -292,26 +292,17 @@ pub(crate) fn art_slot(art: &mut Artwork, kind: ArtKind) -> &mut Option<String> 
     }
 }
 
-/// Held across load-modify-save: two providers syncing at once share one `library.json.tmp`,
-/// and the later save would drop the earlier one's rows.
+/// Held across load-modify-save: two providers syncing at once would each write back what
+/// they loaded, and the later save would drop the earlier one's rows.
 fn catalog_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Every mutation path goes through here, so the first write upgrades v1.
+/// Every mutation path goes through here, so the first write upgrades v1. Owner-only, like
+/// hooks.json: a local user must not plant `prep`/`launch`.
 fn save_catalog(catalog: &Catalog) -> Result<()> {
-    let dir = pf_paths::config_dir();
-    // 0700 / SYSTEM+Admins, matching hooks.json: a local user must not plant `prep`/`launch`.
-    pf_paths::create_private_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let json = serde_json::to_string_pretty(catalog)?;
-    // Crash mid-write must not truncate. `write_secret_file` applies 0600 / SYSTEM+Admins before
-    // the rename carries them to the final path.
-    let tmp = custom_path().with_extension("json.tmp");
-    pf_paths::write_secret_file(&tmp, json.as_bytes())
-        .with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, custom_path()).context("rename library.json")?;
-    Ok(())
+    save_json(&custom_path(), &serde_json::to_string_pretty(catalog)?)
 }
 
 /// 12 hex chars from title + wall-clock nanos.
@@ -1240,7 +1231,7 @@ mod tests {
     }
 
     /// Unlisted kinds are operator-privileged. The listed set is pinned so widening it is an
-    /// edit to this test.
+    /// edit to this test and to the console's password gate, which keeps the same list.
     #[test]
     fn an_unlisted_launch_kind_is_operator_privileged() {
         let kind = |k: &str| {
@@ -1282,6 +1273,19 @@ mod tests {
         assert_eq!(kind(""), Some("launch.kind"));
         // Resolvers match the exact string; `GOG` is not `gog`.
         assert_eq!(kind("GOG"), Some("launch.kind"));
+
+        let web = include_str!("../../../../web/src/lib/command-execution.ts");
+        let list = web
+            .split_once("UNPRIVILEGED_LAUNCH_KINDS")
+            .and_then(|(_, rest)| rest.split_once("= ["))
+            .and_then(|(_, rest)| rest.split_once("];"))
+            .map(|(list, _)| list)
+            .expect("console list");
+        let console: Vec<&str> = list.split('"').skip(1).step_by(2).collect();
+        assert_eq!(
+            console, UNPRIVILEGED_LAUNCH_KINDS,
+            "a kind the console lists and the host does not skips the console password"
+        );
     }
 
     #[test]

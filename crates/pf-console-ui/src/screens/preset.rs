@@ -13,7 +13,9 @@ use crate::model::ConsoleCmd;
 use crate::pointer::Pointer;
 use crate::screens::{Ctx, EditField, Outbox, Screen};
 use crate::theme::Fonts;
-use crate::widgets::{blurb, KeyMsg, Keyboard, ListMsg, MenuList, RowSpec};
+use crate::widgets::{
+    blurb, entry_hints, field_key, type_text, Entry, Keyboard, ListMsg, MenuList, RowSpec,
+};
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use pf_client_core::presets::SettingsOverlay;
 use skia_safe::{Canvas, Rect};
@@ -79,16 +81,7 @@ impl PresetMenu {
             return None;
         }
         let (msg, pulse) = self.list.menu(ev, ITEMS.len());
-        if matches!(msg, ListMsg::Adjust(_)) {
-            return Some(MenuPulse::Boundary);
-        }
-        if !matches!(msg, ListMsg::Activate) {
-            if pulse.is_some() {
-                self.armed = false;
-            }
-            return pulse;
-        }
-        self.run(ITEMS[self.list.cursor], ctx, fx)
+        self.dispatch(msg, pulse, ctx, fx)
     }
 
     pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
@@ -96,10 +89,27 @@ impl PresetMenu {
         if matches!(msg, ListMsg::None) && pulse.is_none() {
             return false;
         }
-        if matches!(msg, ListMsg::Activate) {
-            self.run(ITEMS[self.list.cursor], ctx, fx);
-        }
+        self.dispatch(msg, pulse, ctx, fx);
         true
+    }
+
+    /// Shared by pad and pointer. Arming is per row: focus on any other row disarms Delete.
+    fn dispatch(
+        &mut self,
+        msg: ListMsg,
+        pulse: Option<MenuPulse>,
+        ctx: &mut Ctx,
+        fx: &mut Outbox,
+    ) -> Option<MenuPulse> {
+        let item = ITEMS[self.list.cursor];
+        if item != Item::Delete {
+            self.armed = false;
+        }
+        match msg {
+            ListMsg::Adjust(_) => Some(MenuPulse::Boundary),
+            ListMsg::None => pulse,
+            ListMsg::Activate => self.run(item, ctx, fx),
+        }
     }
 
     fn run(&mut self, item: Item, ctx: &mut Ctx, fx: &mut Outbox) -> Option<MenuPulse> {
@@ -240,43 +250,39 @@ impl PresetName {
         self.editing.then_some(field)
     }
 
-    fn type_char(&mut self, ch: char) -> bool {
-        if !self.editing || ch.is_control() || self.name.chars().count() >= 40 {
-            return false;
+    /// A name is up to 40 printable characters.
+    fn admits(text: &str, ch: char) -> bool {
+        !ch.is_control() && text.chars().count() < 40
+    }
+
+    /// Typing clears a taken-name error; deleting leaves it up.
+    fn typed(&mut self, before: usize) {
+        if self.name.len() > before {
+            self.error = None;
         }
-        self.name.push(ch);
-        self.error = None;
-        true
     }
 
-    fn backspace(&mut self) -> bool {
-        self.editing && self.name.pop().is_some()
-    }
-
-    pub(crate) fn text_input(&mut self, text: &str) {
-        for ch in text.chars() {
-            self.type_char(ch);
+    pub(crate) fn text_input(&mut self, typed: &str) {
+        if self.editing {
+            let before = self.name.len();
+            type_text(&mut self.name, typed, Self::admits);
+            self.typed(before);
         }
     }
 
     /// Return closes the keyboard onto Save; the next Return saves.
     pub(crate) fn edit_key(&mut self, key: crate::input::Key) -> bool {
-        use crate::input::Key as K;
         if !self.editing {
             return false;
         }
-        match key {
-            K::Backspace => {
-                self.backspace();
-                true
-            }
-            K::Return | K::Escape => {
-                self.editing = false;
-                self.list.cursor = 1;
-                true
-            }
-            _ => false,
+        let Some(entry) = field_key(key, &mut self.name) else {
+            return false;
+        };
+        if entry != Entry::Stay {
+            self.editing = false;
+            self.list.cursor = 1;
         }
+        true
     }
 
     pub(crate) fn menu(
@@ -286,29 +292,17 @@ impl PresetName {
         fx: &mut Outbox,
     ) -> Option<MenuPulse> {
         if self.editing {
-            if ev == MenuEvent::Back {
-                self.editing = false;
-                return Some(MenuPulse::Confirm);
-            }
-            if ctx.deck {
-                return match ev {
-                    MenuEvent::Confirm => self.save(ctx, fx),
-                    _ => None,
-                };
-            }
-            let (msg, pulse) = self.keyboard.menu(ev);
-            let moved = |ok: bool| {
-                Some(if ok {
-                    MenuPulse::Move
-                } else {
-                    MenuPulse::Boundary
-                })
-            };
-            return match msg {
-                KeyMsg::Type(c) => moved(self.type_char(c)),
-                KeyMsg::Backspace => moved(self.backspace()),
-                KeyMsg::Done => self.save(ctx, fx),
-                KeyMsg::None => pulse,
+            let before = self.name.len();
+            let (entry, pulse) =
+                (self.keyboard).edit_menu(ev, ctx.device.deck, &mut self.name, Self::admits);
+            self.typed(before);
+            return match entry {
+                Entry::Stay => pulse,
+                Entry::Close => {
+                    self.editing = false;
+                    pulse
+                }
+                Entry::Done => self.save(ctx, fx),
             };
         }
         if ev == MenuEvent::Back {
@@ -327,25 +321,17 @@ impl PresetName {
     }
 
     pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
-        if self.editing && !ctx.deck {
-            if !self.keyboard.covers(p) {
-                if p.press() {
-                    self.editing = false;
-                    return true;
-                }
-                return false;
-            }
-            match self.keyboard.pointer(p).0 {
-                KeyMsg::Type(c) => {
-                    self.type_char(c);
-                }
-                KeyMsg::Backspace => {
-                    self.backspace();
-                }
-                KeyMsg::Done => {
+        if self.editing && !ctx.device.deck {
+            let before = self.name.len();
+            let entry = (self.keyboard).edit_pointer(p, &mut self.name, Self::admits);
+            self.typed(before);
+            match entry {
+                None => return false,
+                Some(Entry::Stay) => {}
+                Some(Entry::Close) => self.editing = false,
+                Some(Entry::Done) => {
                     self.save(ctx, fx);
                 }
-                KeyMsg::None => {}
             }
             return true;
         }
@@ -393,22 +379,13 @@ impl PresetName {
     }
 
     pub(crate) fn hints(&self, ctx: &Ctx) -> Vec<Hint> {
-        match (self.editing, ctx.deck) {
-            (true, true) => vec![
-                Hint::new(HintKey::Key("STEAM + X"), "Keyboard"),
-                Hint::new(HintKey::Confirm, "Save"),
-                Hint::new(HintKey::Back, "Done"),
-            ],
-            (true, false) => vec![
-                Hint::new(HintKey::Confirm, "Type"),
-                Hint::new(HintKey::Tertiary, "Delete"),
-                Hint::new(HintKey::Back, "Done"),
-            ],
-            (false, _) => vec![
-                Hint::new(HintKey::Confirm, "Select"),
-                Hint::new(HintKey::Back, "Cancel"),
-            ],
+        if self.editing {
+            return entry_hints(ctx.device.deck, "Save");
         }
+        vec![
+            Hint::new(HintKey::Confirm, "Select"),
+            Hint::new(HintKey::Back, "Cancel"),
+        ]
     }
 
     pub(crate) fn render(
@@ -425,7 +402,7 @@ impl PresetName {
              cards it is pinned to.",
         );
         let below = blurb(canvas, fonts, text, rect, k);
-        let seat = self.keyboard.seat(self.editing && !ctx.deck, dt);
+        let seat = self.keyboard.seat(self.editing && !ctx.device.deck, dt);
         let tray_h = if seat > 0.0 {
             (Keyboard::tray_height() + 12.0) * k * seat
         } else {
@@ -608,22 +585,7 @@ mod tests {
     fn with_ctx<R>(f: impl FnOnce(&mut Ctx) -> R) -> R {
         let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
-        let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &[],
-            deck: false,
-            tv: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
-        };
+        let mut ctx = Ctx::test(&mut settings, &library);
         f(&mut ctx)
     }
 
@@ -691,5 +653,36 @@ mod tests {
         with_ctx(|ctx| s.menu(MenuEvent::Confirm, ctx, &mut fx));
         assert_eq!(fx.cmds, vec![ConsoleCmd::DeletePreset { id: "p1".into() }]);
         assert!(matches!(fx.nav, Some(Nav::Pop)));
+    }
+
+    /// A pointer press on another row disarms Delete, as a pad move off it does.
+    #[test]
+    fn a_press_on_another_row_disarms_delete() {
+        use crate::pointer::{Pointer, PointerKind};
+        let mut s = PresetMenu::new("p1".into(), "Couch".into());
+        let fonts = crate::theme::build_fonts().unwrap();
+        let mut surface = skia_safe::surfaces::raster_n32_premul((1280, 800)).unwrap();
+        let rect = Rect::from_xywh(0.0, 0.0, 1280.0, 800.0);
+        with_ctx(|ctx| s.render(surface.canvas(), rect, 1.0, 1.0 / 60.0, &fonts, ctx));
+        let mut fx = Outbox::default();
+        let mut tap = |s: &mut PresetMenu, row: usize| {
+            let r = s.list.row_rect(row).expect("the menu drew");
+            let p = Pointer {
+                x: f64::from(r.center_x()),
+                y: f64::from(r.center_y()),
+                kind: PointerKind::Press,
+            };
+            with_ctx(|ctx| s.pointer(p, ctx, &mut fx));
+        };
+        tap(&mut s, 3);
+        tap(&mut s, 0);
+        tap(&mut s, 3);
+        assert!(
+            !fx.cmds
+                .iter()
+                .any(|c| matches!(c, ConsoleCmd::DeletePreset { .. })),
+            "Edit in between: this Delete only arms"
+        );
+        assert!(s.armed);
     }
 }

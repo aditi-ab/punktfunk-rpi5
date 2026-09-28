@@ -39,8 +39,8 @@ says so in the card and writes `update-rollback-from-<version>.log`.
 | How you installed | Command |
 |---|---|
 | Windows installer | Run the newer `punktfunk-host-setup-<version>.exe` from the [releases page](https://git.unom.io/unom/punktfunk/releases), or `winget upgrade unom.PunktfunkHost` ([winget source](/docs/windows-host#winget), stable only) |
-| Ubuntu (apt) | `sudo apt update && sudo apt install --only-upgrade punktfunk-host` |
-| Fedora (dnf) | `sudo dnf upgrade punktfunk` |
+| Ubuntu (apt) | `sudo apt update && sudo apt install --only-upgrade $(dpkg-query -W -f='${Package}\n' 'punktfunk*')` |
+| Fedora (dnf) | `sudo dnf upgrade 'punktfunk*'` |
 | Bazzite sysext | `sudo punktfunk-sysext update` |
 | Bazzite / Fedora Atomic, layered RPMs | `sudo /usr/share/punktfunk/update-punktfunk.sh`, then reboot |
 | Arch / CachyOS (pacman) | `sudo pacman -Syu` |

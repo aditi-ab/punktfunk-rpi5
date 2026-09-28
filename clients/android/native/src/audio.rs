@@ -1,7 +1,7 @@
 //! Android audio playback: decode the negotiated Opus (`0xC9`) or lossless PCM (`0xD3`)
 //! plane to interleaved f32 and feed AAudio through a jitter ring.
 //!
-//! [`SessionAudio`] fixes rate, depth, frame size, and the host-resolved stereo/5.1/7.1
+//! [`PlaneFormat`] fixes rate, depth, frame size, and the host-resolved stereo/5.1/7.1
 //! layout for the session. [`open_ladder`] tries viable AAudio modes at that exact rate,
 //! [`arm`] verifies that callbacks start, and [`supervise`] reopens disconnected devices.
 //! Unsupported rates are rejected before `Hello` by [`output_rate_is_openable`]; playback
@@ -12,12 +12,12 @@
 //! the video reference for A/V sync. See `design/hi-res-audio.md` and
 //! `design/audio-latency-overhaul.md` for the full policy.
 
-use crate::audio_format::SessionAudio;
-use crate::sysprop;
+use crate::sys::sysprop;
 use ndk::audio::{
     AudioCallbackResult, AudioContentType, AudioDirection, AudioFormat, AudioPerformanceMode,
     AudioSharingMode, AudioStream, AudioStreamBuilder, AudioUsage,
 };
+use punktfunk_core::audio::plane::{PlaneDecoder, PlaneFormat};
 use punktfunk_core::client::{AudioPacket, NativeClient};
 use punktfunk_core::error::PunktfunkError;
 use std::collections::VecDeque;
@@ -66,8 +66,8 @@ enum DecodeExit {
     Disconnected,
     /// The connector closed: no more audio is coming, so there is nothing to reopen FOR.
     SessionClosed,
-    /// The plane cannot run at all (the decoder would not build — libopus refusing the negotiated
-    /// rate is the only way this happens today, since the PCM arm cannot fail). Reopening the
+    /// The plane cannot run at all: the Opus decoder would not build, because libopus refuses the
+    /// negotiated rate or the host named a coupling this build does not know. Reopening the
     /// DEVICE would not change that, so it is not a reason to walk the ladder again.
     Fatal,
 }
@@ -111,167 +111,6 @@ const DEAD_STREAM_WARN_MS: u64 = 1_000;
 // stayed there — the "audio latency is too high" report.
 /// Throttle the AAudio XRun-driven HW-buffer grow check (cheap, but no need to poll every quantum).
 const XRUN_CHECK_EVERY: u32 = 128;
-
-/// Why one arriving frame could not be turned into samples. Small on purpose — the decode loop
-/// only logs it and moves on to the next packet.
-#[derive(Debug)]
-enum DecodeErr {
-    Opus(opus::Error),
-    /// A `0xD3` payload that is not a whole number of samples at the negotiated depth — a
-    /// truncated or hostile datagram. There is no partial-frame reading of it that is not a
-    /// permanent desync of every sample after it, so it is dropped whole.
-    Ragged,
-}
-
-impl std::fmt::Display for DecodeErr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DecodeErr::Opus(e) => write!(f, "opus: {e}"),
-            DecodeErr::Ragged => write!(f, "PCM payload is not a whole number of samples"),
-        }
-    }
-}
-
-/// Decoder for the audio plane: a plain Opus stereo decoder (the validated path), an Opus
-/// multistream decoder for 5.1/7.1, or — on the lossless `0xD3` plane — no decoder at all, since
-/// interleaved little-endian samples are a stride unpack. All three sit behind one `decode_float`
-/// / `conceal` pair so the loop below never branches on the plane. Built from the host-RESOLVED
-/// format; mirrors the Linux client's `AudioDec` and core's own `AudioPcmState`.
-enum AudioDec {
-    Stereo(opus::Decoder),
-    Surround(opus::MSDecoder),
-    /// The `0xD3` plane. `conceal` rides here rather than next to the Opus arms because it is the
-    /// thing a lossless format cannot borrow: `AudioGapTracker` feeds libopus PLC on `0xC9`, and
-    /// there is nothing in a raw frame from which to synthesize its successor (§4.5). `scratch`
-    /// exists because `pcm::to_f32` clears and reserves its output — it cannot write into the
-    /// fixed slice the loop hands out — so the samples are staged and then COPIED in, clamped.
-    Pcm {
-        bits: u8,
-        scratch: Vec<f32>,
-        conceal: punktfunk_core::audio::pcm::PcmConceal,
-    },
-}
-
-impl AudioDec {
-    fn new(fmt: SessionAudio) -> Result<AudioDec, opus::Error> {
-        let channels = fmt.channels as u8;
-        if fmt.is_pcm() {
-            return Ok(AudioDec::Pcm {
-                bits: fmt.bits,
-                scratch: Vec::with_capacity(fmt.frame_samples()),
-                conceal: punktfunk_core::audio::pcm::PcmConceal::new(),
-            });
-        }
-        // The negotiated rate, not a constant — even though on this plane it is always 48 000.
-        // libopus accepts only 8/12/16/24/48 kHz and rejects 96 000 outright, which is the entire
-        // reason `0xD3` exists, so passing it through costs nothing and makes libopus itself the
-        // validator: a host that claimed Opus at a rate it cannot open fails loudly HERE (one
-        // "audio disabled" line naming the codec) instead of decoding at the wrong rate.
-        if channels == 2 {
-            Ok(AudioDec::Stereo(opus::Decoder::new(
-                fmt.rate_hz,
-                opus::Channels::Stereo,
-            )?))
-        } else {
-            // This client asks for the legacy coupling, so a conforming host answers `0`; any
-            // other id is a host defect, named once rather than played as silence.
-            let layout =
-                punktfunk_core::audio::AudioLayout::from_wire(fmt.layout).unwrap_or_else(|| {
-                    tracing::warn!(
-                        layout = fmt.layout,
-                        "unknown audio layout from the host — decoding as legacy"
-                    );
-                    punktfunk_core::audio::AudioLayout::Legacy
-                });
-            let l = punktfunk_core::audio::layout_for(channels, layout);
-            Ok(AudioDec::Surround(opus::MSDecoder::new(
-                fmt.rate_hz,
-                l.streams,
-                l.coupled,
-                l.mapping,
-            )?))
-        }
-    }
-
-    /// Turn one arriving frame into interleaved f32 in `out`, returning **per-channel** samples
-    /// (the unit both planes' callers count in, and the unit concealment is sized from).
-    ///
-    /// `out` is a fixed slice and is never grown: on the PCM arm the staged samples are copied in
-    /// clamped to what fits, which is what makes an oversized or malformed datagram a truncated
-    /// frame rather than an overrun on the decode thread.
-    fn decode_float(
-        &mut self,
-        input: &[u8],
-        out: &mut [f32],
-        channels: usize,
-    ) -> Result<usize, DecodeErr> {
-        match self {
-            AudioDec::Stereo(d) => d.decode_float(input, out, false).map_err(DecodeErr::Opus),
-            AudioDec::Surround(d) => d.decode_float(input, out, false).map_err(DecodeErr::Opus),
-            AudioDec::Pcm {
-                bits,
-                scratch,
-                conceal,
-            } => {
-                // No host emits an empty `0xD3` payload — PCM has no DTX — but a torn datagram
-                // can present as one, and it must NOT reach `PcmConceal::accept`: accepting an
-                // empty frame would clear the last good frame and leave the next loss with
-                // nothing to conceal from.
-                if input.is_empty() {
-                    return Ok(0);
-                }
-                let n = punktfunk_core::audio::pcm::to_f32(input, *bits, scratch)
-                    .ok_or(DecodeErr::Ragged)?;
-                let n = n.min(out.len());
-                out[..n].copy_from_slice(&scratch[..n]);
-                // The next loss is concealed from what the ring actually RECEIVED — the staged
-                // prefix, not the decoded frame. They differ only for an oversized datagram no
-                // conforming host sends, and taking the staged length keeps the concealment
-                // source bounded by the same fixed buffer as everything else.
-                conceal.accept(&out[..n]);
-                Ok(n / channels.max(1))
-            }
-        }
-    }
-
-    /// Synthesize ONE concealed frame into `out` for a packet that never arrived, returning
-    /// per-channel samples (0 = nothing to build from yet, so the caller should let the ring
-    /// carry the gap rather than emit an uninitialized buffer).
-    ///
-    /// Opus interpolates from the decoder's own state (empty input = libopus PLC). `0xD3` has no
-    /// such state, so [`punktfunk_core::audio::pcm::PcmConceal`] repeats-and-fades the last good
-    /// frame and decays a sustained gap to silence — a clean dropout beats a warble.
-    fn conceal(
-        &mut self,
-        out: &mut [f32],
-        frame_samples: usize,
-        channels: usize,
-    ) -> Result<usize, DecodeErr> {
-        // libopus synthesizes into a slice sized by the LAST decoded frame; asking for more than
-        // that is asking it to invent audio the stream never had, and asking with 0 is asking
-        // before anything has decoded.
-        let plc = (frame_samples * channels).min(out.len());
-        match self {
-            AudioDec::Stereo(d) if plc > 0 => d
-                .decode_float(&[], &mut out[..plc], false)
-                .map_err(DecodeErr::Opus),
-            AudioDec::Surround(d) if plc > 0 => d
-                .decode_float(&[], &mut out[..plc], false)
-                .map_err(DecodeErr::Opus),
-            AudioDec::Stereo(_) | AudioDec::Surround(_) => Ok(0),
-            AudioDec::Pcm {
-                scratch, conceal, ..
-            } => {
-                if !conceal.conceal(scratch) {
-                    return Ok(0); // nothing has arrived yet — nothing to repeat
-                }
-                let n = scratch.len().min(out.len());
-                out[..n].copy_from_slice(&scratch[..n]);
-                Ok(n / channels.max(1))
-            }
-        }
-    }
-}
 
 /// Diagnostics — written by the decode thread + the realtime callback, logged periodically. The
 /// audio analogue of the video `fed`/`rendered` counters (we can't "screenshot" sound).
@@ -358,7 +197,7 @@ impl AudioPlayback {
         // Everything about the format comes from what the host RESOLVED, never from what this
         // device asked for: the channel count (2 = stereo / 6 = 5.1 / 8 = 7.1, canonical wire
         // order FL FR FC LFE RL RR SL SR), the plane, the rate, the depth and the frame duration.
-        let fmt = SessionAudio::of(&client);
+        let fmt = PlaneFormat::of(&client);
         let shutdown = Arc::new(AtomicBool::new(false));
         let sd = shutdown.clone();
         let join = std::thread::Builder::new()
@@ -436,7 +275,7 @@ impl Drop for AudioPlayback {
 ///
 /// `debug.punktfunk.audio_sharing` and `debug.punktfunk.audio_perf` can pin mode choices for
 /// field diagnosis. Rate cannot be overridden because it must match the wire format.
-fn open_ladder(is_tv: bool, fmt: SessionAudio) -> Vec<OpenRung> {
+fn open_ladder(is_tv: bool, fmt: PlaneFormat) -> Vec<OpenRung> {
     use AudioPerformanceMode::{LowLatency, None as PerfNone};
     use AudioSharingMode::{Exclusive, Shared};
     let mut modes: Vec<(AudioSharingMode, AudioPerformanceMode)> =
@@ -476,7 +315,7 @@ fn open_ladder(is_tv: bool, fmt: SessionAudio) -> Vec<OpenRung> {
 struct OpenCtx<'a> {
     /// The session's resolved format — what the ring is sized in and what [`arm`] holds an
     /// unspecified-rate rung to.
-    fmt: SessionAudio,
+    fmt: PlaneFormat,
     tuning: punktfunk_core::audio::JitterTuning,
     hard_cap_max: usize,
     game_audio: bool,
@@ -598,21 +437,20 @@ fn open_any(ladder: &[OpenRung], ctx: &OpenCtx) -> Option<LiveStream> {
 /// Bring one opened stream up and prove the device is really pulling from it. Three failures
 /// after a successful `open_stream` each end in silence behind a healthy-looking log:
 ///
-/// 1. **The grant differs from the request.** The data callback writes `num_frames * channels`
-///    `f32`s, so another layout or format is an out-of-bounds write on a realtime thread. The NDK
-///    promises the explicit value or a failed open; a buffer length is not taken on trust.
-/// 2. **`request_start` fails.** The rung is out, and [`open_any`] tries the next.
-/// 3. **The stream starts and never calls back.** Decoding would carry on into a device that
-///    never plays it.
+/// 1. **The grant differs from the request.** The callback writes `num_frames * channels` f32
+///    into AAudio's buffer, so another layout or format is an out-of-bounds write on a realtime
+///    thread. The NDK honours an explicit request or fails the open; this check does not trust
+///    the HAL with a buffer length.
+/// 2. **`request_start` fails.** The caller tries the next rung.
+/// 3. **The stream starts and never calls back.** `prove_pulling` catches it, giving up once
+///    that flag is set (a closing session); the last-resort reopen in [`open_any`] passes
+///    `None`, since an unproven stream beats no stream.
 ///
-/// The rate is held to the RUNG's request, or to the session's for an unspecified rung: any other
-/// rate is a resample, which the hi-res rule (§9) forbids — rejecting the rung is how it says so.
-///
-/// `prove_pulling` runs (3) and gives up once that flag is set (a closing session); the
-/// last-resort reopen in [`open_any`] passes `None`, an unproven stream beating none.
+/// The rate is held to the rung, or to the session's rate on an unspecified rung: a device that
+/// grants another rate is rejected, never resampled quietly.
 fn arm(
     live: &LiveStream,
-    fmt: SessionAudio,
+    fmt: PlaneFormat,
     counters: &Counters,
     prove_pulling: Option<&AtomicBool>,
 ) -> Result<(), ArmError> {
@@ -673,7 +511,7 @@ fn supervise(
     client: Arc<NativeClient>,
     game_audio: bool,
     is_tv: bool,
-    fmt: SessionAudio,
+    fmt: PlaneFormat,
     shutdown: &AtomicBool,
 ) {
     // Fold this decode→AAudio thread into the client's hot-thread set so the ADPF session the
@@ -793,7 +631,7 @@ fn supervise(
 /// renamed to something neutral so that the `opus=` an existing field report or triage note greps
 /// for still means exactly what it always meant — and a lossless session is visibly a different
 /// line rather than the same one with a surprising rate.
-fn plane_counter_key(fmt: SessionAudio) -> &'static str {
+fn plane_counter_key(fmt: PlaneFormat) -> &'static str {
     if fmt.is_pcm() {
         "pcm"
     } else {
@@ -807,12 +645,8 @@ pub(crate) const AUDIO_NICE: i32 = -16;
 
 /// Raise the calling audio or mic thread to [`AUDIO_NICE`], every session.
 pub(crate) fn boost_audio_thread(who: &str) {
-    // SAFETY: `setpriority` on the calling thread; no pointers, no shared state.
-    if unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, AUDIO_NICE) } != 0 {
-        log::debug!(
-            "{who}: setpriority({AUDIO_NICE}) refused (non-fatal): {}",
-            std::io::Error::last_os_error()
-        );
+    if let Err(e) = crate::sys::set_thread_nice(None, AUDIO_NICE) {
+        log::debug!("{who}: setpriority({AUDIO_NICE}) refused (non-fatal): {e}");
     }
 }
 
@@ -856,7 +690,7 @@ impl Render {
             hard_cap_max,
             ..
         } = *ctx;
-        let channels = fmt.channels;
+        let channels = usize::from(fmt.channels);
         // Pre-reserve the ring so `extend` never reallocates on the realtime thread. Worst
         // transient before a trim = the hard cap plus one full channel of the plane's OWN frame,
         // sized from the resolved format — rate, depth AND channel count — so a surround
@@ -868,7 +702,7 @@ impl Render {
         // exact), and the target floor plus the smooth shed are denominated in FRAMES, so a 2 ms
         // lossless frame is shed and crossfaded as one frame. Microseconds: sub-ms rungs exist.
         let mut policy =
-            punktfunk_core::audio::JitterPolicy::new_at_rate(tuning, channels as u8, fmt.rate_hz);
+            punktfunk_core::audio::JitterPolicy::new_at_rate(tuning, fmt.channels, fmt.rate_hz);
         policy.set_frame_us(fmt.frame_us);
         Render {
             counters: ctx.counters.clone(),
@@ -985,7 +819,7 @@ impl Render {
 /// cure is a setting rather than a rebuild. Near-unreachable — `connect` proves the rate is
 /// openable BEFORE the `Hello` — so getting here on a hi-res session means the device changed
 /// underneath one that did open.
-fn log_no_configuration(fmt: SessionAudio) {
+fn log_no_configuration(fmt: PlaneFormat) {
     log::error!(
         "audio: no AAudio configuration on the ladder could be opened and started at {} Hz / {} ch — audio disabled for this session (video unaffected){}",
         fmt.rate_hz,
@@ -1088,7 +922,7 @@ fn decode_loop(
     shutdown: &AtomicBool,
     disconnected: &AtomicBool,
     counters: &Counters,
-    fmt: SessionAudio,
+    fmt: PlaneFormat,
     sync: &punktfunk_core::audio::AudioSyncCell,
 ) -> DecodeExit {
     let mut plane = match Plane::new(client, live, counters, fmt, sync) {
@@ -1124,9 +958,9 @@ struct Plane<'a> {
     client: &'a NativeClient,
     live: &'a LiveStream,
     counters: &'a Counters,
-    fmt: SessionAudio,
+    fmt: PlaneFormat,
     sync: &'a punktfunk_core::audio::AudioSyncCell,
-    dec: AudioDec,
+    dec: PlaneDecoder,
     pcm: Vec<f32>,
     channels: usize,
     /// Per-channel samples of the last decoded frame — the PLC unit. 0 until something has
@@ -1151,24 +985,13 @@ impl<'a> Plane<'a> {
         client: &'a NativeClient,
         live: &'a LiveStream,
         counters: &'a Counters,
-        fmt: SessionAudio,
+        fmt: PlaneFormat,
         sync: &'a punktfunk_core::audio::AudioSyncCell,
     ) -> Result<Plane<'a>, DecodeExit> {
-        let channels = fmt.channels;
-        // Decode scratch, sized for the LARGEST frame THIS plane can hand us: libopus's legal
-        // maximum is 120 ms (5760 samples/ch at 48 kHz); `0xD3`'s is the longest rung of
-        // `pcm::FRAME_US_LADDER` at the negotiated rate. The two differ by more than an order
-        // of magnitude. Copies into it are clamped, so a non-conforming host truncates a frame.
-        let scratch_samples = if fmt.is_pcm() {
-            punktfunk_core::audio::pcm::samples_per_frame(
-                fmt.rate_hz,
-                punktfunk_core::audio::pcm::FRAME_US_LADDER[0],
-                channels as u8,
-            )
-        } else {
-            5760 * channels
-        };
-        let dec = AudioDec::new(fmt).map_err(|e| {
+        let channels = usize::from(fmt.channels);
+        // An unknown Opus coupling is refused like any other init failure: a guessed pairing
+        // plays the wrong speakers.
+        let dec = PlaneDecoder::new(&fmt).map_err(|e| {
             log::error!(
                 "audio: decoder init for codec={} rate={} ch={}: {e} — audio disabled",
                 fmt.codec,
@@ -1203,7 +1026,8 @@ impl<'a> Plane<'a> {
             fmt,
             sync,
             dec,
-            pcm: vec![0f32; scratch_samples],
+            // The largest frame this plane can carry; the decoder clamps into it.
+            pcm: vec![0f32; fmt.max_frame_samples()],
             channels,
             frame_samples: 0,
             window_peak: 0.0,
@@ -1211,7 +1035,7 @@ impl<'a> Plane<'a> {
             drought,
             last_packet: std::time::Instant::now(),
             av_sync_enabled,
-            av: punktfunk_core::audio::AvSync::new_at_rate(channels as u8, fmt.rate_hz),
+            av: punktfunk_core::audio::AvSync::new_at_rate(fmt.channels, fmt.rate_hz),
             video_e2e: client.video_e2e_shared(),
             av_offset_out: client.audio_av_offset_shared(),
             buffer_ms_out: client.audio_buffer_ms_shared(),
@@ -1250,17 +1074,12 @@ impl<'a> Plane<'a> {
         if self.frame_samples == 0 {
             return Ok(false);
         }
-        match self
-            .dec
-            .conceal(&mut self.pcm, self.frame_samples, self.channels)
-        {
+        match self.dec.conceal(self.frame_samples, &mut self.pcm) {
             Ok(samples @ 1..) => self.push(samples * self.channels).map(|()| true),
             _ => Ok(false),
         }
     }
 
-    /// Place the packet against the picture, conceal any seq gap in front of it, decode it into
-    /// the ring, and keep the 1 Hz line.
     /// Device output latency past the ring, ns: when AAudio will play the newest frame it was
     /// handed, less now. `0` until the stream reports a timestamp (it has just started).
     fn output_latency_ns(&self) -> u64 {
@@ -1271,9 +1090,11 @@ impl<'a> Plane<'a> {
         let ahead = stream.frames_written() - ts.frame_position;
         let heard_at =
             ts.time_nanoseconds + ahead * 1_000_000_000 / i64::from(self.fmt.rate_hz.max(1));
-        (heard_at - crate::decode::now_monotonic_ns()).max(0) as u64
+        (heard_at - crate::sys::now_monotonic_ns()).max(0) as u64
     }
 
+    /// Place the packet against the picture, conceal any seq gap in front of it, decode it into
+    /// the ring, and keep the 1 Hz line. An empty payload decodes nothing.
     fn on_packet(&mut self, pkt: &AudioPacket) -> Result<(), DecodeExit> {
         // BEFORE it is queued: `buffered_ahead` is everything that must still play first, so
         // the depth read here is exactly what delays it. Published unconditionally — the ring's
@@ -1308,10 +1129,9 @@ impl<'a> Plane<'a> {
                 break;
             }
         }
-        let samples = match self
-            .dec
-            .decode_float(&pkt.data, &mut self.pcm, self.channels)
-        {
+        let samples = match self.dec.decode(&pkt.data, &mut self.pcm) {
+            // Empty payload: the last frame stays the concealment unit.
+            Ok(0) => return Ok(()),
             Ok(s) => s,
             Err(e) => {
                 log::debug!("audio: decode: {e}");

@@ -102,8 +102,8 @@ pub fn spawn_session(
             trust_rejected,
         } => error = Some((msg, trust_rejected)),
         SessionEvent::Ended(msg) => ended = Some(msg),
-        // The brain persists the window size; the shell has nothing to do with it.
-        SessionEvent::Window { .. } => {}
+        // The brain persists the window size; this shell shows no live stats.
+        SessionEvent::Window { .. } | SessionEvent::Stats(_) => {}
         SessionEvent::Exited(code) => {
             let _ = sender.send(AppMsg::SessionExited {
                 req: req.clone(),

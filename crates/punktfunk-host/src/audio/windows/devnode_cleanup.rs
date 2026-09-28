@@ -180,26 +180,15 @@ fn is_removable_instance(instance_id: &str) -> bool {
     instance_id.to_ascii_uppercase().starts_with("ROOT\\")
 }
 
-/// `pnputil /remove-device` by absolute path: an uninstaller must not depend on `%PATH%`.
+/// [`crate::install::remove_device`], reported on the uninstaller's console.
 fn remove_devnode(instance_id: &str) -> bool {
-    match std::process::Command::new(crate::install::sys32("pnputil.exe"))
-        .args(["/remove-device", instance_id])
-        .output()
-    {
-        Ok(o) if o.status.success() => {
+    match crate::install::remove_device(instance_id) {
+        Ok(()) => {
             println!("removed audio devnode {instance_id}");
             true
         }
-        Ok(o) => {
-            eprintln!(
-                "warning: pnputil could not remove {instance_id} (status {:?}): {}",
-                o.status.code(),
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-            false
-        }
         Err(e) => {
-            eprintln!("warning: pnputil did not run for {instance_id}: {e}");
+            eprintln!("warning: couldn't remove {instance_id}: {e:#}");
             false
         }
     }

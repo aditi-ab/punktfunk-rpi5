@@ -18,8 +18,15 @@ repository.workspace = true
 description = "Signed update-manifest fetch + verification, install-kind detection and version comparison, shared by the punktfunk host and client."
 publish = false
 
+[features]
+# The signed-manifest half: fetch, signature and manifest checks. Without it the crate is the
+# install-kind ladder, the version compare and the serial floor, which the root helper reads
+# without an HTTP client or TLS in its tree.
+default = ["verify"]
+verify = ["dep:anyhow", "dep:aws-lc-rs", "dep:base64", "dep:ureq"]
+
 [dependencies]
-anyhow = "1"
+anyhow = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Ed25519 over the exact manifest bytes — the same primitive the plugin-store index uses, on the
@@ -32,19 +39,22 @@ serde_json = "1"
 # rustls comes from ureq's ring-flavoured dependency — would get no enabler and fail on the CI
 # runner. Naming it here makes the crate build standalone instead of relying on who else is in
 # the selection.
-aws-lc-rs = { version = "1", features = ["prebuilt-nasm"] }
+aws-lc-rs = { version = "1", features = ["prebuilt-nasm"], optional = true }
 # Feature selection matched to ureq's (and punktfunk-host's) on purpose — 0.23's default-on
 # `simd-unsafe` engine stays off, so a currency bump doesn't quietly add unsafe SIMD to the tree.
-base64 = { version = "0.23", default-features = false, features = ["std"] }
+base64 = { version = "0.23", default-features = false, features = ["std"], optional = true }
 # Small, sync, bundles webpki roots — no system cert store dependency, which matters on the
 # Deck (Decky's embedded Python has no usable roots either; see clients/decky/main.py).
 # ⚠ `rustls-no-provider`, NEVER the default `rustls` feature — that one pulls `_ring`, which would
 # put the ring backend back into a tree that has deliberately moved to aws-lc-rs.
-ureq = { version = "3", default-features = false, features = [
+ureq = { version = "3", default-features = false, optional = true, features = [
     "rustls-no-provider",
     "rustls-webpki-roots",
     "gzip",
 ] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

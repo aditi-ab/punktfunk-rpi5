@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
 use std::sync::{Arc, Mutex};
 #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Matches host `mgmt::DEFAULT_PORT`. Discovered hosts override via mDNS `mgmt`
 /// TXT (`DiscoveredHost::mgmt_port`); a saved host that is not advertising falls
@@ -117,6 +117,17 @@ pub const DESKTOP_ID: &str = "\0desktop";
 /// [`crate::lucide`], the nearest system symbol on Apple and Android.
 pub const DESKTOP_ICON: &str = "monitor";
 
+/// Monogram for a poster without art: the first letters of the first two words. Every
+/// Rust shell draws its placeholder tiles with it.
+pub fn initials(title: &str) -> String {
+    title
+        .split_whitespace()
+        .take(2)
+        .filter_map(|w| w.chars().next())
+        .flat_map(char::to_uppercase)
+        .collect()
+}
+
 /// Store id → display label. One table: the console, the GTK dialog and the WinUI dialog all
 /// drew this from a copy of their own, and a store added to one never reached the others.
 pub fn store_label(store: &str) -> &'static str {
@@ -198,14 +209,8 @@ pub fn agent(
     use rustls::pki_types::pem::PemObject;
     let bad =
         |what: &str, e: &dyn std::fmt::Display| LibraryError::Unreachable(format!("{what}: {e}"));
-    // Same aws-lc-rs provider the QUIC endpoints install — mixing rustls
-    // providers panics.
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let builder = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| bad("tls config", &e))?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(punktfunk_core::tls::PinVerify::new(pin)));
+    let builder = punktfunk_core::tls::pinned_builder(punktfunk_core::tls::PinVerify::new(pin))
+        .map_err(|e| bad("tls config", &e))?;
     let cert = rustls::pki_types::CertificateDer::from_pem_slice(identity.0.as_bytes())
         .map_err(|e| bad("client cert pem", &e))?;
     let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(identity.1.as_bytes())
@@ -353,10 +358,33 @@ pub fn end_game(
 /// `/status` slice the shelf needs. Other operator fields stay undecoded so a
 /// schema change there cannot break the library screen.
 #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct HostStatus {
     #[serde(default)]
     games: Vec<RunningGame>,
+}
+
+/// `GET {path}` on the host's mgmt API, decoded. Any miss (unreachable, an older host
+/// without the route, an unknown shape) is `T::default()`, never an error.
+#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+pub(crate) fn get_json<T: serde::de::DeserializeOwned + Default>(
+    addr: &str,
+    mgmt_port: u16,
+    identity: &(String, String),
+    pin: Option<[u8; 32]>,
+    path: &str,
+) -> T {
+    let Ok(agent) = agent(identity, pin) else {
+        return T::default();
+    };
+    let url = format!("{}{path}", base_url(addr, mgmt_port));
+    let Ok(mut resp) = agent.get(&url).call() else {
+        return T::default();
+    };
+    let Ok(body) = resp.body_mut().read_to_string() else {
+        return T::default();
+    };
+    serde_json::from_str(&body).unwrap_or_default()
 }
 
 /// `GET /api/v1/status` `games[]`. Best-effort: older host, unreachable, or
@@ -369,39 +397,104 @@ pub fn fetch_running(
     identity: &(String, String),
     pin: Option<[u8; 32]>,
 ) -> Vec<RunningGame> {
-    let Ok(agent) = agent(identity, pin) else {
-        return Vec::new();
-    };
-    let url = format!("{}/api/v1/status", base_url(addr, mgmt_port));
-    let Ok(mut resp) = agent.get(&url).call() else {
-        return Vec::new();
-    };
-    let Ok(body) = resp.body_mut().read_to_string() else {
-        return Vec::new();
-    };
-    serde_json::from_str::<HostStatus>(&body)
-        .map(|s| s.games)
-        .unwrap_or_default()
+    get_json::<HostStatus>(addr, mgmt_port, identity, pin, "/api/v1/status").games
+}
+
+/// A process-wide list per host fingerprint, so every tile, shelf and menu reading it
+/// agrees. [`FpCache::refresh`] fetches on a worker at most once a `ttl`, stamping the
+/// entry before the request so a hung host cannot spawn a worker per tick.
+#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+pub(crate) struct FpCache<T> {
+    map: std::sync::OnceLock<Mutex<FpEntries<T>>>,
+    ttl: Duration,
+    thread: &'static str,
+}
+
+#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+type FpEntries<T> = std::collections::HashMap<String, (Instant, Vec<T>)>;
+
+/// A best-effort mgmt GET: address, mgmt port, identity, pin.
+#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+type FpFetch<T> = fn(&str, u16, &(String, String), Option<[u8; 32]>) -> Vec<T>;
+
+#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+impl<T: Clone + Send + 'static> FpCache<T> {
+    pub(crate) const fn new(ttl: Duration, thread: &'static str) -> Self {
+        FpCache {
+            map: std::sync::OnceLock::new(),
+            ttl,
+            thread,
+        }
+    }
+
+    fn map(&self) -> std::sync::MutexGuard<'_, FpEntries<T>> {
+        self.map
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// What this host last answered. Empty until [`FpCache::refresh`] lands.
+    pub(crate) fn get(&self, fp_hex: &str) -> Vec<T> {
+        self.map()
+            .get(fp_hex)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    }
+
+    /// Spawn `fetch` unless the entry is still inside the TTL, keeping the rows `keep`
+    /// passes. The identity is loaded on the worker so callers need not thread it through.
+    pub(crate) fn refresh(
+        &'static self,
+        addr: &str,
+        mgmt_port: u16,
+        fp_hex: &str,
+        fetch: FpFetch<T>,
+        keep: fn(&T) -> bool,
+    ) {
+        if fp_hex.is_empty() {
+            return; // empty fingerprint cannot authenticate or key the cache
+        }
+        {
+            let mut c = self.map();
+            match c.get_mut(fp_hex) {
+                Some(entry) if entry.0.elapsed() < self.ttl => return,
+                Some(entry) => entry.0 = Instant::now(),
+                None => {
+                    c.insert(fp_hex.to_string(), (Instant::now(), Vec::new()));
+                }
+            }
+        }
+        let (addr, fp_hex) = (addr.to_string(), fp_hex.to_string());
+        std::thread::Builder::new()
+            .name(self.thread.into())
+            .spawn(move || {
+                let Ok(identity) = crate::trust::load_or_create_identity() else {
+                    return;
+                };
+                let pin = crate::trust::parse_hex32(&fp_hex);
+                let found: Vec<T> = fetch(&addr, mgmt_port, &identity, pin)
+                    .into_iter()
+                    .filter(keep)
+                    .collect();
+                self.map().insert(fp_hex, (Instant::now(), found));
+            })
+            .ok();
+    }
+
+    pub(crate) fn invalidate(&self, fp_hex: &str) {
+        self.map().remove(fp_hex);
+    }
 }
 
 /// 20 s. What a host has up changes minute to minute, unlike the grants
 /// [`crate::host_actions::TTL`] governs — but a home carousel ticks far faster
 /// than that, so this is the rate limit, not the display cadence.
 #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
-pub const RUNNING_TTL: std::time::Duration = std::time::Duration::from_secs(20);
-
-/// Process-wide, keyed by host fingerprint — the [`crate::host_actions`] cache
-/// with a shorter fuse. One cache so a host tile, its shelf and the menu on it
-/// cannot each answer "what is up" differently.
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
-type RunningCache =
-    std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Vec<RunningGame>)>>;
+pub const RUNNING_TTL: Duration = Duration::from_secs(20);
 
 #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
-fn running_cache() -> &'static RunningCache {
-    static C: std::sync::OnceLock<RunningCache> = std::sync::OnceLock::new();
-    C.get_or_init(Default::default)
-}
+static RUNNING: FpCache<RunningGame> = FpCache::new(RUNNING_TTL, "punktfunk-nowplaying");
 
 /// The title to name on a host tile: what this host last said it has up.
 ///
@@ -410,64 +503,25 @@ fn running_cache() -> &'static RunningCache {
 /// line", which is also the right answer for a host too old to be asked.
 #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
 pub fn now_playing(fp_hex: &str) -> String {
-    running_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    RUNNING
         .get(fp_hex)
-        .and_then(|(_, games)| games.iter().find(|g| !g.title.is_empty()))
-        .map(|g| g.title.clone())
+        .into_iter()
+        .find(|g| !g.title.is_empty())
+        .map(|g| g.title)
         .unwrap_or_default()
 }
 
-/// Spawn a worker unless the cache is still inside [`RUNNING_TTL`]. Idempotent;
-/// call it on whatever tick a shell already refreshes host rows on.
-///
-/// Stamped before the request, so a hung host cannot spawn a worker per tick —
-/// [`crate::host_actions::refresh`]'s rule, and for the same reason.
+/// Ask the host what it has up unless [`RUNNING_TTL`] says the last answer still
+/// stands. Idempotent; call it on whatever tick a shell already refreshes host rows on.
 #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
 pub fn refresh_running(addr: &str, mgmt_port: u16, fp_hex: &str) {
-    if fp_hex.is_empty() {
-        return; // empty fingerprint cannot authenticate or key the cache
-    }
-    {
-        let mut c = running_cache().lock().unwrap_or_else(|e| e.into_inner());
-        match c.get_mut(fp_hex) {
-            Some(entry) if entry.0.elapsed() < RUNNING_TTL => return,
-            Some(entry) => entry.0 = std::time::Instant::now(),
-            None => {
-                c.insert(fp_hex.to_string(), (std::time::Instant::now(), Vec::new()));
-            }
-        }
-    }
-    let (addr, fp_hex) = (addr.to_string(), fp_hex.to_string());
-    std::thread::Builder::new()
-        .name("punktfunk-nowplaying".into())
-        .spawn(move || {
-            let Ok(identity) = crate::trust::load_or_create_identity() else {
-                return;
-            };
-            let pin = crate::trust::parse_hex32(&fp_hex);
-            let up: Vec<RunningGame> = fetch_running(&addr, mgmt_port, &identity, pin)
-                .into_iter()
-                .filter(RunningGame::is_up)
-                .collect();
-            running_cache()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(fp_hex, (std::time::Instant::now(), up));
-        })
-        .ok();
+    RUNNING.refresh(addr, mgmt_port, fp_hex, fetch_running, RunningGame::is_up);
 }
 
 /// What this host last said it has up, from the [`refresh_running`] cache.
 #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
 pub fn running(fp_hex: &str) -> Vec<RunningGame> {
-    running_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(fp_hex)
-        .map(|(_, games)| games.clone())
-        .unwrap_or_default()
+    RUNNING.get(fp_hex)
 }
 
 /// Drop what this host said — the caller just ended a session on it, so the
@@ -475,10 +529,7 @@ pub fn running(fp_hex: &str) -> Vec<RunningGame> {
 /// [`RUNNING_TTL`].
 #[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
 pub fn invalidate_running(fp_hex: &str) {
-    running_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(fp_hex);
+    RUNNING.invalidate(fp_hex);
 }
 
 /// 16 MiB. Steam heroes are a few MB; larger is not an image for the decoder.
@@ -629,6 +680,14 @@ mod tests {
             GameEnd::NotRunning.notice("Hades"),
             "Hades isn't running any more."
         );
+    }
+
+    #[test]
+    fn initials_take_two_words() {
+        assert_eq!(initials("Dota 2"), "D2");
+        assert_eq!(initials("half-life"), "H");
+        assert_eq!(initials("The Witness III"), "TW");
+        assert_eq!(initials(""), "");
     }
 
     #[test]

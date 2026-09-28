@@ -37,11 +37,7 @@ mod console;
 // "Send logs to host": the log-ring upload (`pf-client-core` is Android-target-only here).
 #[cfg(target_os = "android")]
 mod logs;
-// The RESOLVED audio format + its ms ⇄ sample arithmetic, split out of `audio` and — unlike it —
-// ungated, because that arithmetic is what a rate the ladder does not divide gets wrong (44 100 Hz
-// used to come out 2.3 % off in every direction at once) and it must be provable without a phone.
-// Nothing in it touches AAudio. `test`-gated for the host build on top of the Android one so the
-// off-device leg still compiles and runs the proof; `audio` is its only non-test user.
+// AAudio callback arithmetic, `test`-gated on top of Android so its proof runs off-device.
 #[cfg(any(target_os = "android", test))]
 mod audio_format;
 #[cfg(target_os = "android")]
@@ -63,6 +59,7 @@ mod pad_audio;
 mod pyro;
 mod session;
 mod stats;
+mod sys;
 // Ungated like `discovery`: pure `jni` + `punktfunk_core::wol` (no Android framework), so it links
 // into the host workspace build too. Kotlin only ever calls it on device.
 mod wol;
@@ -160,17 +157,6 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleAvai
     _this: JObject,
 ) -> jni::sys::jboolean {
     cfg!(target_os = "android")
-}
-
-/// An Android system property, trimmed; `None` when unset or blank.
-#[cfg(target_os = "android")]
-pub(crate) fn sysprop(name: &std::ffi::CStr) -> Option<String> {
-    let mut buf = [0u8; libc::PROP_VALUE_MAX as usize];
-    // SAFETY: `name` is NUL-terminated and `buf` holds PROP_VALUE_MAX bytes, the most it writes.
-    let n = unsafe { libc::__system_property_get(name.as_ptr(), buf.as_mut_ptr().cast()) };
-    let len = usize::try_from(n).unwrap_or(0).min(buf.len());
-    let value = String::from_utf8_lossy(&buf[..len]).trim().to_owned();
-    (!value.is_empty()).then_some(value)
 }
 
 /// The symbol `name` in the `dlopen` handle `lib`, as the fn-pointer type `F`; `None` when absent.

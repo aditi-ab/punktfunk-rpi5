@@ -13,11 +13,13 @@
 use super::shared::*;
 use crate::gamestream::tls::PeerAddr;
 use crate::gamestream::tls::PeerCertFingerprint;
-use axum::extract::Request;
+use axum::extract::{FromRequestParts, Request};
 use axum::http::header;
+use axum::http::request::Parts;
 use axum::http::Method;
 use axum::middleware::Next;
 use sha2::{Digest, Sha256};
+use std::marker::PhantomData;
 
 /// Which credential authorized this request. [`require_auth`] stamps it on every forwarded
 /// request; handlers extract `Extension<AuthLane>`. A missing extension is a 500, not a
@@ -44,12 +46,68 @@ pub(crate) struct PairedDevice(pub String);
 #[derive(Clone, Debug)]
 pub(crate) struct PluginIdentity(pub String);
 
-/// May a request carrying `identity` write the registration or provider named `id`?
+/// The `{id}` path segment of a plugin-owned resource, once the caller may write it.
 ///
-/// One rule, in one place, for `PUT/DELETE /plugins/{id}` and the provider routes: a plugin that
-/// proved which plugin it is may write only its own id.
-pub(crate) fn plugin_owns(identity: Option<&PluginIdentity>, id: &str) -> bool {
-    identity.is_none_or(|who| who.0 == id)
+/// One rule for every plugin-scoped write (`/plugins/{id}`, the library provider, scanner and
+/// metadata routes): a plugin that proved which plugin it is may write only its own id (403).
+/// The operator and the shared runner token may write any. `R` then checks the id's shape
+/// (400). Both run before the body is read.
+pub(crate) struct OwnedId<R>(pub String, pub PhantomData<R>);
+
+/// The shape an [`OwnedId`] must have. `Err` is the 400's message.
+pub(crate) trait IdRule {
+    fn check(id: &str) -> Result<(), String>;
+}
+
+/// A library provider or metadata source ([`crate::library::validate_provider_name`]).
+pub(crate) struct ProviderId;
+
+impl IdRule for ProviderId {
+    fn check(id: &str) -> Result<(), String> {
+        crate::library::validate_provider_name(id)
+    }
+}
+
+/// A plugin registration ([`crate::slug::plugin_id`]).
+pub(crate) struct PluginId;
+
+impl IdRule for PluginId {
+    fn check(id: &str) -> Result<(), String> {
+        crate::slug::plugin_id(id)
+            .then_some(())
+            .ok_or_else(|| "invalid plugin id (expected kebab-case `[a-z][a-z0-9-]*`, ≤64)".into())
+    }
+}
+
+/// Any id: the route answers an unknown one itself.
+pub(crate) struct AnyId;
+
+impl IdRule for AnyId {
+    fn check(_: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+impl<S: Send + Sync, R: IdRule> FromRequestParts<S> for OwnedId<R> {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Response> {
+        let Path(id) = Path::<String>::from_request_parts(parts, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        if parts
+            .extensions
+            .get::<PluginIdentity>()
+            .is_some_and(|who| who.0 != id)
+        {
+            return Err(api_error(
+                StatusCode::FORBIDDEN,
+                "a plugin may only write its own id",
+            ));
+        }
+        R::check(&id).map_err(|e| api_error(StatusCode::BAD_REQUEST, &e))?;
+        Ok(OwnedId(id, PhantomData))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,7 +226,7 @@ pub(crate) async fn require_auth(
             && st
                 .native
                 .as_ref()
-                .is_some_and(|n| n.effective(fp, unix_now()).is_some())
+                .is_some_and(|n| n.effective(fp, crate::clock::unix_secs()).is_some())
         {
             let fp = fp.clone();
             return forward_device(req, next, fp).await;
@@ -184,7 +242,7 @@ pub(crate) async fn require_auth(
                 && st
                     .native
                     .as_ref()
-                    .is_some_and(|n| n.effective(&fp, unix_now()).is_some())
+                    .is_some_and(|n| n.effective(&fp, crate::clock::unix_secs()).is_some())
             {
                 return forward_device(req, next, fp).await;
             }
@@ -401,15 +459,6 @@ pub(crate) fn cert_may_access(method: &Method, path: &str) -> bool {
 /// dependency.
 pub(crate) fn token_eq(presented: &str, expected: &str) -> bool {
     Sha256::digest(presented.as_bytes()) == Sha256::digest(expected.as_bytes())
-}
-
-/// Host wall clock, unix seconds — the clock every stored access deadline is expressed in.
-/// Sampled at each check, same as `mgmt::native`'s copy.
-pub(crate) fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

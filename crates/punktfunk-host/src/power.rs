@@ -195,53 +195,24 @@ pub fn probe(verb: PowerVerb) -> Availability {
     }
 }
 
-/// `SeShutdownPrivilege` is present but disabled on an interactive token.
-/// The reason string is what the system event log records.
+/// `SeShutdownPrivilege` is present but disabled on an interactive token; a token
+/// without it fails here, before the OS call. The reason string is what the system
+/// event log records.
 #[cfg(target_os = "windows")]
 pub fn act(verb: PowerVerb) -> Result<(), String> {
-    use windows::core::Owned;
-    use windows::Win32::Foundation::{HANDLE, LUID};
-    use windows::Win32::Security::{
-        AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
-        SE_SHUTDOWN_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
-    };
     use windows::Win32::System::Power::SetSuspendState;
     use windows::Win32::System::Shutdown::{
         InitiateSystemShutdownExW, SHTDN_REASON_FLAG_PLANNED, SHTDN_REASON_MAJOR_OTHER,
         SHTDN_REASON_MINOR_OTHER,
     };
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     if verb == PowerVerb::Restart {
         // The service supervisor relaunches on this code without a crash backoff.
         std::process::exit(RESTART_EXIT_CODE as i32);
     }
 
-    // SAFETY: privilege-enable on our own process token, adopted by `Owned` once the open
-    // succeeds so it closes on every path.
-    unsafe {
-        let mut token = HANDLE::default();
-        OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-            &mut token,
-        )
-        .map_err(|e| format!("OpenProcessToken: {e}"))?;
-        let token = Owned::new(token);
-        let mut luid = LUID::default();
-        LookupPrivilegeValueW(None, SE_SHUTDOWN_NAME, &mut luid)
-            .and_then(|()| {
-                let privs = TOKEN_PRIVILEGES {
-                    PrivilegeCount: 1,
-                    Privileges: [LUID_AND_ATTRIBUTES {
-                        Luid: luid,
-                        Attributes: SE_PRIVILEGE_ENABLED,
-                    }],
-                };
-                AdjustTokenPrivileges(*token, false, Some(&raw const privs), 0, None, None)
-            })
-            .map_err(|e| format!("enabling SeShutdownPrivilege: {e}"))?;
-    }
+    pf_frame::privilege::enable("SeShutdownPrivilege")
+        .map_err(|e| format!("enabling SeShutdownPrivilege: {e}"))?;
 
     match verb {
         PowerVerb::Sleep => {

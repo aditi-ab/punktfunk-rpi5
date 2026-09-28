@@ -1,8 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { PadFrame } from "@/api/gen/model/padFrame";
 import {
 	appendLog,
 	BIT,
+	BUTTON_NAMES,
 	familyOf,
 	LOG_MAX,
 	logText,
@@ -23,6 +26,29 @@ const frame = (over: Partial<PadFrame> = {}): PadFrame => ({
 	rs_x: 0,
 	rs_y: 0,
 	...over,
+});
+
+// Hand-written beside core's gamepad consts; core and pf-inject test the same rows.
+const vectors = JSON.parse(
+	readFileSync(
+		join(
+			import.meta.dir,
+			"../../../../crates/punktfunk-core/testdata/gamepad-button-vectors.json",
+		),
+		"utf8",
+	),
+) as { buttons: { name: string; bit: number; evdev: string }[] };
+
+describe("the wire buttons", () => {
+	test("bits match core", () => {
+		expect(BIT).toEqual(
+			Object.fromEntries(vectors.buttons.map((b) => [b.name, b.bit])),
+		);
+	});
+
+	test("names match the virtual pad, in log order", () => {
+		expect(BUTTON_NAMES).toEqual(vectors.buttons.map((b) => [b.bit, b.evdev]));
+	});
 });
 
 describe("padEvents", () => {

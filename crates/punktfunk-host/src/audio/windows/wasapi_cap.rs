@@ -16,7 +16,7 @@
 //!
 //! Pin: `design/hi-res-audio.md`, [`super::wiring_plan`], [`super::audio_control`].
 
-use super::capture_policy::{CaptureStats, FightDamper, FIGHT_BACKOFF, STATS_EVERY};
+use super::capture_policy::{CaptureStats, FightDamper, FIGHT_BACKOFF};
 use super::{audio_control, voice_route, wiring_plan, AudioCapturer, SAMPLE_RATE};
 use anyhow::{anyhow, Context, Result};
 use std::collections::VecDeque;
@@ -434,6 +434,183 @@ fn default_render(en: &DeviceEnumerator) -> Option<(Device, String)> {
     Some((d, id))
 }
 
+/// The endpoint to loopback-capture, as `(device, name, id)`: the plan's when `bind_plan`,
+/// else the default render. Echo guard: the plan reserves `mic_render` for the virtual mic,
+/// and capturing it streams the client's voice back to them, so a default that is the mic
+/// falls back to the plan's loopback, or refuses.
+fn choose_endpoint(
+    plan: &audio_control::WiredPlan,
+    bind_plan: bool,
+    en: &DeviceEnumerator,
+) -> Result<(Device, String, String)> {
+    let wiring = &plan.wiring;
+    if bind_plan {
+        let Some(ep) = wiring.loopback_render.clone() else {
+            // Typed: the plan is a pure function of the set, so wait on the fingerprint.
+            return Err(PlanUnsatisfiable::from_plan(plan).into());
+        };
+        let d = audio_control::open_endpoint(&ep)?;
+        return Ok((d, ep.0, ep.1));
+    }
+    let (default, id) =
+        default_render(en).context("default render endpoint (loopback needs a render device)")?;
+    let default_is_mic = wiring
+        .mic_render
+        .as_ref()
+        .is_some_and(|(_, mic_id)| *mic_id == id);
+    if !default_is_mic {
+        let name = default.get_friendlyname().unwrap_or_default();
+        return Ok((default, name, id));
+    }
+    let Some(lb) = wiring.loopback_render.clone() else {
+        // Not [`PlanUnsatisfiable`]: Follow's inputs include the default, which the
+        // operator can change without a topology change (esp. `PUNKTFUNK_KEEP_DEFAULT`).
+        anyhow::bail!(
+            "the default render endpoint is reserved for the virtual mic (capturing it \
+             would echo the client's voice back) — {}",
+            wiring_plan::describe_no_loopback(&plan.renders, wiring)
+        );
+    };
+    tracing::warn!(mic = %wiring.mic_render.as_ref().unwrap().0, loopback = %lb.0,
+        "default render endpoint is the virtual-mic target — loopback-capturing the plan's \
+         endpoint instead");
+    let d = audio_control::open_endpoint(&lb)?;
+    Ok((d, lb.0, lb.1))
+}
+
+/// The rate to open at. The shared-mode mix format is authoritative: `AUTOCONVERTPCM`
+/// succeeds on an upward request and returns interpolated samples, so never pad above the
+/// engine. The floor is [`SAMPLE_RATE`], not the engine: libopus takes 8/12/16/24/48 kHz
+/// only, so a 44.1 kHz endpoint still opens at 48 kHz. An unreadable mix format declines
+/// hi-res, which can't cost a working 48 kHz session.
+fn settle_open_rate(engine_hz: Option<u32>, requested: u32) -> u32 {
+    match engine_hz {
+        Some(hz) if hz > 0 && requested > hz.max(SAMPLE_RATE) => hz.max(SAMPLE_RATE),
+        None => SAMPLE_RATE,
+        _ => requested,
+    }
+}
+
+/// Gap accounting for a polling loopback tap, in the device clock. The tap stops while the
+/// endpoint idles, so "time since last data" would score every quiet as a hole; instead
+/// `DATA_DISCONTINUITY` plus `index` (where the next packet starts if nothing was lost) sizes
+/// the missing audio. Time is passed in.
+struct LoopbackGaps {
+    last_packet: Option<Instant>,
+    /// The next packet's `index` if nothing is lost, in engine frames.
+    next_index: u64,
+    /// The engine rate `index` counts in; a packet's frames are at `open_hz`.
+    index_hz: u64,
+    open_hz: u64,
+}
+
+impl LoopbackGaps {
+    fn new(engine_hz: Option<u32>, open_hz: u32) -> LoopbackGaps {
+        LoopbackGaps {
+            last_packet: None,
+            next_index: 0,
+            index_hz: u64::from(engine_hz.filter(|&hz| hz > 0).unwrap_or(open_hz).max(1)),
+            open_hz: u64::from(open_hz.max(1)),
+        }
+    }
+
+    /// A packet of `frames` (non-zero) starting at `index`. `Some` is the audio a discontinuity
+    /// lost. A flag on the first packet after a quiet stretch is idle-resume, not a hole in
+    /// anything that was playing; a SILENT packet's lost stretch was silence (an idling
+    /// loopback delivers them on the 100 ms timeout, each flagged).
+    fn packet(
+        &mut self,
+        now: Instant,
+        index: u64,
+        frames: u64,
+        discontinuity: bool,
+        silent: bool,
+    ) -> Option<Duration> {
+        let flowing = self
+            .last_packet
+            .is_some_and(|t| now.duration_since(t) < LOOPBACK_IDLE_AFTER);
+        let lost = (discontinuity && flowing && !silent).then(|| {
+            let lost = index.saturating_sub(self.next_index);
+            Duration::from_micros(lost.saturating_mul(1_000_000) / self.index_hz)
+        });
+        self.next_index = index.saturating_add(frames * self.index_hz / self.open_hz);
+        self.last_packet = Some(now);
+        lost
+    }
+}
+
+/// The default-render watchdog: an operator who picks another output mid-stream is followed.
+/// Only a CHANGE of the default id reacts, so a permanently-denied default can't reopen-loop.
+struct DefaultWatch {
+    seen: Option<String>,
+    fight: FightDamper,
+    last_check: Instant,
+}
+
+impl DefaultWatch {
+    /// Once per [`DEFAULT_CHECK_EVERY`]. `Some` = stop the stream and reopen.
+    fn tick(
+        &mut self,
+        en: &DeviceEnumerator,
+        wiring: &wiring_plan::Wiring,
+        (dev_name, dev_id): (&str, &str),
+        keep_default: bool,
+        assert_plan: bool,
+    ) -> Option<Next> {
+        if self.last_check.elapsed() < DEFAULT_CHECK_EVERY {
+            return None;
+        }
+        self.last_check = Instant::now();
+        let (_, nid) = default_render(en)?;
+        if self.seen.as_deref() == Some(nid.as_str()) {
+            return None;
+        }
+        self.seen = Some(nid.clone());
+        if nid == dev_id {
+            return None;
+        }
+        if keep_default {
+            tracing::info!("default render device changed (PUNKTFUNK_KEEP_DEFAULT) — following it");
+            return Some(Next::Reopen(TargetMode::Follow));
+        }
+        match judge_default(wiring, &nid) {
+            DefaultKind::Capturable(name) => {
+                tracing::info!(device = %name,
+                    "operator changed the output device mid-stream — following it (audio now \
+                     also plays on the host)");
+                Some(Next::Reopen(TargetMode::Follow))
+            }
+            // Follow/KEEP_DEFAULT capture IS the default — reopen on Assert.
+            DefaultKind::Dud(_) if !assert_plan => Some(Next::Reopen(TargetMode::Assert)),
+            // Assert binds capture to the plan's endpoint, not the default. Only where apps
+            // render has moved — put the default back, keep the stream. A full reopen is a
+            // dropout on every dud-default fight.
+            DefaultKind::Dud(name) => {
+                self.fight.observed_at(Instant::now());
+                if self.fight.should_reassert() {
+                    audio_control::reassert_default_playback(dev_id);
+                    // Next watchdog tick sees our endpoint and stays quiet.
+                    self.seen = Some(dev_id.to_string());
+                    if self.fight.warn_now() {
+                        tracing::warn!(device = %name, planned = %dev_name,
+                            "something keeps moving the default playback to an endpoint whose \
+                             loopback cannot work — putting it back (the capture is unaffected)");
+                    }
+                } else if self.fight.warn_giving_up() {
+                    tracing::warn!(device = %name, planned = %dev_name,
+                        backoff_s = FIGHT_BACKOFF.as_secs(),
+                        "another program is repeatedly taking the default \
+                         playback device — backing off rather than fighting it. \
+                         Desktop audio keeps streaming from the planned endpoint, \
+                         but apps rendering to the other device will not be heard");
+                }
+                None
+            }
+            DefaultKind::Unknown => Some(Next::Reopen(TargetMode::Assert)),
+        }
+    }
+}
+
 /// One endpoint open + capture loop. First open: [`FIRST_OPEN_ATTEMPTS`] then fatal via `ready`.
 /// Later: capped backoff, or an endpoint-set wait for [`PlanUnsatisfiable`].
 #[allow(clippy::too_many_arguments)]
@@ -498,42 +675,7 @@ fn capture_once(
     let plan_fp = plan.fingerprint;
 
     let en = DeviceEnumerator::new().context("DeviceEnumerator")?;
-    // Echo guard: the plan reserves `mic_render` for the virtual mic. Capturing it streams
-    // the client's voice back to them — fall back to the plan's loopback, or refuse.
-    let (device, dev_name, dev_id) = if bind_plan {
-        let Some(ep) = wiring.loopback_render.clone() else {
-            // Typed: the plan is a pure function of the set, so wait on the fingerprint.
-            return Err(PlanUnsatisfiable::from_plan(&plan).into());
-        };
-        let d = audio_control::open_endpoint(&ep)?;
-        (d, ep.0, ep.1)
-    } else {
-        let (default, id) = default_render(&en)
-            .context("default render endpoint (loopback needs a render device)")?;
-        let default_is_mic = wiring
-            .mic_render
-            .as_ref()
-            .is_some_and(|(_, mic_id)| *mic_id == id);
-        if default_is_mic {
-            let Some(lb) = wiring.loopback_render.clone() else {
-                // Not [`PlanUnsatisfiable`]: Follow's inputs include the default, which the
-                // operator can change without a topology change (esp. `PUNKTFUNK_KEEP_DEFAULT`).
-                anyhow::bail!(
-                    "the default render endpoint is reserved for the virtual mic (capturing it \
-                     would echo the client's voice back) — {}",
-                    wiring_plan::describe_no_loopback(&plan.renders, wiring)
-                );
-            };
-            tracing::warn!(mic = %wiring.mic_render.as_ref().unwrap().0, loopback = %lb.0,
-                "default render endpoint is the virtual-mic target — loopback-capturing the plan's \
-                 endpoint instead");
-            let d = audio_control::open_endpoint(&lb)?;
-            (d, lb.0, lb.1)
-        } else {
-            let name = default.get_friendlyname().unwrap_or_default();
-            (default, name, id)
-        }
-    };
+    let (device, dev_name, dev_id) = choose_endpoint(&plan, bind_plan, &en)?;
 
     let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;
     let mut engine = audio_client.get_mixformat().ok();
@@ -570,36 +712,25 @@ fn capture_once(
                  count; set its speaker configuration in Windows' sound settings for surround");
         }
     }
-    // Mix format is authoritative in shared mode. `AUTOCONVERTPCM` succeeds on an upward
-    // request and returns interpolated samples — never pad; open at the engine rate.
-    // Floor is [`SAMPLE_RATE`], not the engine: libopus takes 8/12/16/24/48 kHz only, so a
-    // 44.1 kHz endpoint still opens at 48 kHz. `rate_hz > hz.max(SAMPLE_RATE)` is both rules.
     let engine_hz = engine.as_ref().map(|f| f.get_samplespersec());
-    let open_hz = match engine_hz {
-        Some(hz) if hz > 0 && rate_hz > hz.max(SAMPLE_RATE) => {
-            let settled = hz.max(SAMPLE_RATE);
-            tracing::info!(
-                device = %dev_name,
-                engine_hz = hz,
-                requested = rate_hz,
-                opening_at = settled,
-                "engine rate is below the requested capture rate — hi-res declined; opening at \
-                 the engine rate rather than letting WASAPI autoconvert upsample it (set this \
-                 endpoint's rate in Windows' device properties to raise it)"
-            );
-            settled
-        }
-        // Unreadable mix format: declining hi-res cannot cost a working 48 kHz session.
-        None if rate_hz != SAMPLE_RATE => {
-            tracing::info!(
-                device = %dev_name,
-                requested = rate_hz,
-                "endpoint mix format unreadable — hi-res declined; opening at the legacy rate"
-            );
-            SAMPLE_RATE
-        }
-        _ => rate_hz,
-    };
+    let open_hz = settle_open_rate(engine_hz, rate_hz);
+    match engine_hz {
+        _ if open_hz == rate_hz => {}
+        Some(hz) => tracing::info!(
+            device = %dev_name,
+            engine_hz = hz,
+            requested = rate_hz,
+            opening_at = open_hz,
+            "engine rate is below the requested capture rate — hi-res declined; opening at \
+             the engine rate rather than letting WASAPI autoconvert upsample it (set this \
+             endpoint's rate in Windows' device properties to raise it)"
+        ),
+        None => tracing::info!(
+            device = %dev_name,
+            requested = rate_hz,
+            "endpoint mix format unreadable — hi-res declined; opening at the legacy rate"
+        ),
+    }
     // Before Initialize can fail — `sample_rate()` already has a decided answer.
     opened_rate.store(open_hz, Ordering::Relaxed);
     // Autoconvert matches the engine mix to this layout. `dwChannelMask` pins wire order
@@ -690,7 +821,7 @@ fn capture_once(
     // Seed is the default right after open. If Assert's park did not stick, converge: follow a
     // capturable default, warn once on a dud. Only a later CHANGE of that id reacts, so a
     // permanently-denied default set cannot reopen-loop.
-    let mut seen_default = default_render(&en).map(|(_, id)| id);
+    let seen_default = default_render(&en).map(|(_, id)| id);
     if assert_plan {
         if let Some(d) = seen_default.as_deref() {
             if d != dev_id {
@@ -711,7 +842,6 @@ fn capture_once(
     }
 
     let mut bytes: VecDeque<u8> = VecDeque::new();
-    let mut last_check = Instant::now();
     let mut last_fp_check = Instant::now();
     // 30 s with zero packets: a broken loopback looks like a quiet desktop. Info, not warn —
     // idle hosts are silent — except last-resort, where the plan already knew the tap is silent.
@@ -722,13 +852,12 @@ fn capture_once(
     // concatenates across the hole (click + permanent A/V offset).
     let mut stats = CaptureStats::default();
     let mut last_stats = Instant::now();
-    // Gap source: this polling tap stops while the endpoint idles, so "time since last data"
-    // would score every quiet as a hole. `DATA_DISCONTINUITY` plus `index` (next packet start
-    // if nothing was lost) sizes missing audio in the device clock.
-    let mut last_packet: Option<Instant> = None;
-    let mut next_index: u64 = 0;
-    let index_hz = u64::from(engine_hz.filter(|&hz| hz > 0).unwrap_or(open_hz).max(1));
-    let mut fight = FightDamper::new(Instant::now());
+    let mut gaps = LoopbackGaps::new(engine_hz, open_hz);
+    let mut watch = DefaultWatch {
+        seen: seen_default,
+        fight: FightDamper::new(Instant::now()),
+        last_check: Instant::now(),
+    };
     loop {
         if stop.load(Ordering::Relaxed) {
             audio_client.stop_stream().ok();
@@ -750,29 +879,18 @@ fn capture_once(
                     if info.flags.silent {
                         bytes.range_mut(before..).for_each(|b| *b = 0);
                     }
-                    let now = Instant::now();
-                    // Before the stamp moves: discontinuity on the first packet after a quiet
-                    // stretch is idle-resume, not a hole in anything that was playing.
-                    let flowing =
-                        last_packet.is_some_and(|t| now.duration_since(t) < LOOPBACK_IDLE_AFTER);
                     let frames = ((bytes.len() - before) / block_align) as u64;
                     if frames == 0 {
                         // Packet-ready then zero frames: a spinning tap looks like a quiet desktop.
                         stats.missed_dequeues += 1;
-                    } else {
-                        // A SILENT packet's lost stretch was silence: an idling loopback delivers
-                        // them on the 100 ms timeout, each flagged discontinuous.
-                        if info.flags.data_discontinuity && flowing && !info.flags.silent {
-                            let lost = info.index.saturating_sub(next_index);
-                            stats.observe_gap(Duration::from_micros(
-                                lost.saturating_mul(1_000_000) / index_hz,
-                            ));
-                        }
-                        // `index` counts engine frames, `frames` counts frames at `open_hz`.
-                        next_index = info
-                            .index
-                            .saturating_add(frames * index_hz / u64::from(open_hz.max(1)));
-                        last_packet = Some(now);
+                    } else if let Some(lost) = gaps.packet(
+                        Instant::now(),
+                        info.index,
+                        frames,
+                        info.flags.data_discontinuity,
+                        info.flags.silent,
+                    ) {
+                        stats.observe_gap(lost);
                     }
                 }
                 Err(e) => return Err(anyhow!("get_next_packet_size: {e}")),
@@ -811,98 +929,22 @@ fn capture_once(
                 stats.dropped_chunks += 1;
             }
         }
-        if last_stats.elapsed() >= STATS_EVERY {
-            let (peak_db, rms_db, delivered_pct) = stats.summary(last_stats.elapsed(), open_hz);
-            if stats.dropped_chunks > 0 {
-                tracing::warn!(
-                    device = %dev_name,
-                    dropped_chunks = stats.dropped_chunks,
-                    "the audio encode thread could not keep up — captured audio was DROPPED; the \
-                     stream will click and everything after it shifts"
-                );
-            }
-            tracing::info!(
-                device = %dev_name,
-                peak_db = format!("{peak_db:.1}"),
-                rms_db = format!("{rms_db:.1}"),
-                delivered_pct = format!("{delivered_pct:.0}"),
-                // Shape of whatever `delivered_pct` is short by. From WASAPI discontinuity, not
-                // callback cadence — an idle-then-resume endpoint is not a gap. See [`LOOPBACK_IDLE_AFTER`].
-                gaps = stats.gaps,
-                max_gap_ms = stats.max_gap_ms(),
-                // Bucket counts (<20/50/100 ms, ≥100 ms) and total cost; same fields as Linux.
-                gap_hist = %stats.gap_hist(),
-                missing_ms = stats.missing_ms(),
-                missed_dequeues = stats.missed_dequeues,
-                dropped_chunks = stats.dropped_chunks,
-                "desktop audio capture"
-            );
-            last_stats = Instant::now();
-            stats = CaptureStats::default();
-        }
+        // Gaps here come from WASAPI discontinuity, not callback cadence: an idle-then-resume
+        // endpoint is not a gap ([`LOOPBACK_IDLE_AFTER`]).
+        stats.flush_window(&mut last_stats, open_hz, Some(dev_name.as_str()));
 
-        // Default render id changed — operator picked a different output mid-stream. A seat has
-        // no operator default: the box's is somebody else's, and following it streams their audio.
-        if !seat && last_check.elapsed() >= DEFAULT_CHECK_EVERY {
-            last_check = Instant::now();
-            if let Some((_, nid)) = default_render(&en) {
-                if seen_default.as_deref() != Some(nid.as_str()) {
-                    seen_default = Some(nid.clone());
-                    if nid != dev_id {
-                        // Stop per-branch, not here: the Dud path keeps capturing, and a
-                        // stop-first would make that keep-alive a no-op.
-                        if keep_default {
-                            audio_client.stop_stream().ok();
-                            tracing::info!(
-                                "default render device changed (PUNKTFUNK_KEEP_DEFAULT) — \
-                                 following it"
-                            );
-                            return Ok(Next::Reopen(TargetMode::Follow));
-                        }
-                        match judge_default(wiring, &nid) {
-                            DefaultKind::Capturable(name) => {
-                                audio_client.stop_stream().ok();
-                                tracing::info!(device = %name,
-                                    "operator changed the output device mid-stream — following \
-                                     it (audio now also plays on the host)");
-                                return Ok(Next::Reopen(TargetMode::Follow));
-                            }
-                            // Assert binds capture to the plan's endpoint, not the default.
-                            // Only where apps render has moved — put the default back, keep the
-                            // stream. A full reopen is a dropout on every dud-default fight.
-                            DefaultKind::Dud(name) => {
-                                if !assert_plan {
-                                    // Follow/KEEP_DEFAULT capture IS the default — reopen on Assert.
-                                    audio_client.stop_stream().ok();
-                                    return Ok(Next::Reopen(TargetMode::Assert));
-                                }
-                                fight.observed_at(Instant::now());
-                                if fight.should_reassert() {
-                                    audio_control::reassert_default_playback(&dev_id);
-                                    // Next watchdog tick sees our endpoint and stays quiet.
-                                    seen_default = Some(dev_id.clone());
-                                    if fight.warn_now() {
-                                        tracing::warn!(device = %name, planned = %dev_name,
-                                            "something keeps moving the default playback to an \
-                                             endpoint whose loopback cannot work — putting it \
-                                             back (the capture is unaffected)");
-                                    }
-                                } else if fight.warn_giving_up() {
-                                    tracing::warn!(device = %name, planned = %dev_name,
-                                        backoff_s = FIGHT_BACKOFF.as_secs(),
-                                        "another program is repeatedly taking the default \
-                                         playback device — backing off rather than fighting it. \
-                                         Desktop audio keeps streaming from the planned endpoint, \
-                                         but apps rendering to the other device will not be heard");
-                                }
-                            }
-                            DefaultKind::Unknown => {
-                                audio_client.stop_stream().ok();
-                                return Ok(Next::Reopen(TargetMode::Assert));
-                            }
-                        }
-                    }
-                }
+        // A seat has no operator default: the box's is somebody else's, and following it
+        // streams their audio.
+        if !seat {
+            if let Some(next) = watch.tick(
+                &en,
+                wiring,
+                (dev_name.as_str(), dev_id.as_str()),
+                keep_default,
+                assert_plan,
+            ) {
+                audio_client.stop_stream().ok();
+                return Ok(next);
             }
         }
 
@@ -1068,6 +1110,48 @@ mod tests {
         }
         // A seat is `keep_default` by construction (`audio_control::keep_default_devices`).
         assert_eq!(binding(TargetMode::Assert, true, true), (true, false));
+    }
+
+    /// Never above the engine, never below what libopus takes, and legacy when unreadable.
+    #[test]
+    fn the_open_rate_never_upsamples_past_the_engine() {
+        assert_eq!(settle_open_rate(Some(48_000), 96_000), 48_000);
+        assert_eq!(settle_open_rate(Some(44_100), 96_000), SAMPLE_RATE);
+        assert_eq!(settle_open_rate(Some(192_000), 96_000), 96_000);
+        assert_eq!(settle_open_rate(Some(44_100), 44_100), 44_100);
+        assert_eq!(settle_open_rate(Some(0), 96_000), 96_000);
+        assert_eq!(settle_open_rate(None, 96_000), SAMPLE_RATE);
+        assert_eq!(settle_open_rate(None, SAMPLE_RATE), SAMPLE_RATE);
+    }
+
+    /// A discontinuity mid-flow is sized in the device clock; one after an idle stretch, or on
+    /// a silent packet, is not a hole.
+    #[test]
+    fn loopback_gaps_are_sized_from_the_device_index() {
+        let t = Instant::now();
+        let ms = Duration::from_millis;
+        let mut g = LoopbackGaps::new(Some(48_000), 48_000);
+        assert_eq!(
+            g.packet(t, 0, 480, true, false),
+            None,
+            "nothing was flowing"
+        );
+        // The next packet should start at 480 and starts at 960: 480 frames, 10 ms, lost.
+        assert_eq!(g.packet(t + ms(20), 960, 480, true, false), Some(ms(10)));
+        assert_eq!(
+            g.packet(t + ms(30), 2_400, 480, true, true),
+            None,
+            "a silent packet"
+        );
+        assert_eq!(
+            g.packet(t + ms(2_000), 9_000, 480, true, false),
+            None,
+            "idle resume"
+        );
+        // A 44.1 kHz engine under a 48 kHz open: the index advances in engine frames.
+        let mut g = LoopbackGaps::new(Some(44_100), 48_000);
+        assert_eq!(g.packet(t, 0, 480, false, false), None);
+        assert_eq!(g.next_index, 441);
     }
 
     /// Live loopback round trip. Skipped unless `PUNKTFUNK_WASAPI_LIVE=1` and a render endpoint exists.

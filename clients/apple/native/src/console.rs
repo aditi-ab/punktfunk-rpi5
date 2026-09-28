@@ -6,16 +6,15 @@
 //! `phase` and `free` run there (the main thread). `push`, `art`, `next_event` and `drain_cmds`
 //! are safe from any thread. The JSON is `pf_console_ui::bridge`'s, which Android speaks too.
 
-use pf_client_core::console::{OverlayAction, PointerButton, PointerInput, SessionPhase};
-use pf_client_core::menu_nav::{MenuDir, MenuEvent};
+use pf_client_core::console::OverlayAction;
 use pf_console_ui::bridge::{
-    CreateOptions, EntryJson, Event, Pads, PadsJson, PresetJson, Published,
+    self, CreateOptions, EntryJson, Event, MenuCode, Pads, PadsJson, PresetJson, Published,
 };
 use pf_console_ui::console::FrameCost;
 use pf_console_ui::{
-    Console, ConsoleEntry, ConsoleHandles, HostRow, InputSource, Insets, Key, LibraryGame,
-    LibraryPhase, LicenseSection, PadTestState, PairPhase, Platform, Prompt, SnapshotStore,
-    SpeedPhase, Stale, Viewport, WakeStatus,
+    Console, ConsoleEntry, ConsoleHandles, HostRow, InputSource, Insets, LibraryGame, LibraryPhase,
+    LicenseSection, PadTestState, PairPhase, Platform, Prompt, SnapshotStore, SpeedPhase, Viewport,
+    WakeStatus,
 };
 use skia_safe::gpu::{self, mtl, DirectContext, SurfaceOrigin};
 use skia_safe::ColorType;
@@ -370,19 +369,8 @@ pub unsafe extern "C" fn punktfunk_console_menu(
     source: u8,
 ) -> bool {
     guard(true, || {
-        let ev = match event {
-            0 => MenuEvent::Move(MenuDir::Up),
-            1 => MenuEvent::Move(MenuDir::Down),
-            2 => MenuEvent::Move(MenuDir::Left),
-            3 => MenuEvent::Move(MenuDir::Right),
-            4 => MenuEvent::Confirm,
-            5 => MenuEvent::Back,
-            6 => MenuEvent::Secondary,
-            7 => MenuEvent::Tertiary,
-            8 => MenuEvent::JumpBack,
-            9 => MenuEvent::JumpForward,
-            10 | 11 => MenuEvent::Confirm,
-            _ => return true,
+        let Some(code) = bridge::menu_code(event) else {
+            return true;
         };
         let source = if source == 1 {
             InputSource::Pad
@@ -396,9 +384,9 @@ pub unsafe extern "C" fn punktfunk_console_menu(
         let Some(mut shell) = c.shell() else {
             return true;
         };
-        let pulse = match event {
-            10 | 11 => shell.console.ok(event == 10, source),
-            _ => shell.console.menu(ev, source),
+        let pulse = match code {
+            MenuCode::Ok(down) => shell.console.ok(down, source),
+            MenuCode::Menu(ev) => shell.console.menu(ev, source),
         };
         if let Some(p) = pulse {
             lock(&c.events).push_back(Event::Pulse(p));
@@ -454,25 +442,8 @@ pub unsafe extern "C" fn punktfunk_console_pointer(
     dy: f32,
 ) -> bool {
     guard(false, || {
-        let down = |button, touch| PointerInput::Down {
-            x,
-            y,
-            button,
-            touch,
-        };
-        let input = match kind {
-            0 => PointerInput::Move { x, y },
-            1 => down(PointerButton::Primary, false),
-            2 => PointerInput::Up {
-                x,
-                y,
-                button: PointerButton::Primary,
-            },
-            3 => down(PointerButton::Secondary, false),
-            4 => PointerInput::Wheel { x, y, dy },
-            5 => PointerInput::Cancel,
-            6 => down(PointerButton::Primary, true),
-            _ => return false,
+        let Some(input) = bridge::pointer_code(kind, x, y, dy) else {
+            return false;
         };
         // SAFETY: live per the contract.
         let Some(c) = (unsafe { c.as_ref() }) else {
@@ -500,21 +471,8 @@ pub unsafe extern "C" fn punktfunk_console_key(
     repeat: bool,
 ) -> bool {
     guard(false, || {
-        let key = match key {
-            0 => Key::Left,
-            1 => Key::Right,
-            2 => Key::Up,
-            3 => Key::Down,
-            4 => Key::Return,
-            5 => Key::Space,
-            6 => Key::Escape,
-            7 => Key::Backspace,
-            8 => Key::PageUp,
-            9 => Key::PageDown,
-            10 => Key::Tab,
-            11 => Key::Y,
-            12 => Key::X,
-            _ => return false,
+        let Some(key) = bridge::key_code(key) else {
+            return false;
         };
         // SAFETY: live per the contract.
         let Some(c) = (unsafe { c.as_ref() }) else {
@@ -564,14 +522,8 @@ pub unsafe extern "C" fn punktfunk_console_phase(
         let (Some(c), msg) = (unsafe { c.as_ref() }, unsafe { str_arg(message) }) else {
             return;
         };
-        let msg = msg.unwrap_or("");
-        let phase = match phase {
-            0 => SessionPhase::Connecting,
-            1 => SessionPhase::Streaming,
-            2 => SessionPhase::Failed(msg),
-            3 => SessionPhase::Ended((!msg.is_empty()).then_some(msg)),
-            4 => SessionPhase::Reconnecting(msg),
-            _ => return,
+        let Some(phase) = bridge::phase_code(phase, msg.unwrap_or("")) else {
+            return;
         };
         let Some(mut shell) = c.shell() else {
             return;
@@ -633,13 +585,9 @@ pub unsafe extern "C" fn punktfunk_console_push(
                 json::<Vec<pf_client_core::library::RunningGame>>(text)
                     .map(|v| library.set_running(&v))
             }
-            PUNKTFUNK_CONSOLE_PUSH_LIBRARY_STALE => json::<u8>(text).map(|v| {
-                library.set_stale(match v {
-                    1 => Stale::Waking,
-                    2 => Stale::Offline,
-                    _ => Stale::No,
-                })
-            }),
+            PUNKTFUNK_CONSOLE_PUSH_LIBRARY_STALE => {
+                json::<u8>(text).map(|v| library.set_stale(bridge::stale_code(v)))
+            }
             PUNKTFUNK_CONSOLE_PUSH_SETTINGS => json(text).map(|v| c.store.set(v)),
             PUNKTFUNK_CONSOLE_PUSH_PRESETS => json::<Vec<PresetJson>>(text)
                 .map(|v| c.store.set_presets(v.into_iter().map(Into::into).collect())),
@@ -733,7 +681,7 @@ pub unsafe extern "C" fn punktfunk_console_drain_cmds(c: *const PunktfunkConsole
 #[unsafe(no_mangle)]
 pub extern "C" fn punktfunk_console_palettes() -> *mut c_char {
     guard(std::ptr::null_mut(), || {
-        let list: Vec<_> = (pf_console_ui::library::PALETTES.iter())
+        let list: Vec<_> = (pf_console_ui::palette::PALETTES.iter())
             .map(|p| serde_json::json!({ "id": p.id, "name": p.name }))
             .collect();
         out_string(serde_json::Value::from(list).to_string())

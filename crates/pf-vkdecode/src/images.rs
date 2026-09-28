@@ -27,11 +27,7 @@ use crate::device::AllocError;
 use crate::device::DecodeDevice;
 use crate::device::Unwind;
 
-/// Extra pictures the consumer may hold (delivered, unreleased) on top of
-/// the stream's DPB depth. Pool size is `required_slots + HOLD_HEADROOM`.
-/// 8 covers ~4–7 in-flight frames with one frame of slack; holding more
-/// is `NoFreeSlot`.
-pub const HOLD_HEADROOM: u32 = 8;
+pub use pf_bitstream::slots::HOLD_HEADROOM;
 
 /// Pool layout for one `(caps, required_slots)` pair. No GPU allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -500,7 +496,8 @@ unsafe fn create_view(
 mod tests {
     use super::*;
     use crate::caps::derive_caps;
-    use crate::caps::RawH264Caps;
+    use crate::caps::MaxLevelIdc;
+    use crate::caps::RawCaps;
     use crate::caps::VideoFormat;
     use crate::caps::NV12;
 
@@ -513,7 +510,7 @@ mod tests {
             image_create_flags: vk::ImageCreateFlags::MUTABLE_FORMAT,
             ..Default::default()
         };
-        let raw = RawH264Caps {
+        let raw = RawCaps {
             capability_flags: if layered {
                 vk::VideoCapabilityFlagsKHR::empty()
             } else {
@@ -524,12 +521,20 @@ mod tests {
             } else {
                 vk::VideoDecodeCapabilityFlagsKHR::DPB_AND_OUTPUT_DISTINCT
             },
+            min_bitstream_buffer_offset_alignment: 0,
+            min_bitstream_buffer_size_alignment: 0,
+            picture_access_granularity: vk::Extent2D::default(),
+            min_coded_extent: vk::Extent2D::default(),
+            max_coded_extent: vk::Extent2D::default(),
+            max_dpb_slots: 0,
+            max_active_reference_pictures: 0,
+            max_level: MaxLevelIdc::H264(0),
+            std_header_version: vk::ExtensionProperties::default(),
             dpb_formats: vec![entry(DPB_USAGE)],
             output_formats: vec![entry(OUTPUT_USAGE)],
             coincide_formats: vec![entry(COINCIDE_USAGE)],
-            ..Default::default()
         };
-        derive_caps(&raw).unwrap()
+        derive_caps(&raw, NV12).unwrap()
     }
 
     #[test]

@@ -75,6 +75,7 @@ import {
 	type H3Event,
 	type SessionConfig,
 } from "h3";
+import { browserScheme } from "./pluginOrigin";
 
 export const SESSION_NAME = "pf_session";
 
@@ -508,8 +509,7 @@ export function safeNextPath(next: string | undefined): string {
  *
  * `getRequestURL().origin` is the wrong source: Nitro's localFetch builds a
  * synthetic request with no TLS socket, so it reports `http:` on an HTTPS
- * listener. Same trap as `frame-ancestors`. Scheme precedence matches that
- * helper: forwarded proto, then the stamped listener scheme, then the request.
+ * listener. The scheme comes from `browserScheme`, the rule `frame-ancestors` uses.
  */
 export function csrfRequestOrigin(o: {
 	forwardedProto?: string | null;
@@ -517,11 +517,7 @@ export function csrfRequestOrigin(o: {
 	requestScheme: string;
 	host: string;
 }): string {
-	const forwarded = o.forwardedProto?.split(",")[0]?.trim().toLowerCase();
-	const scheme =
-		forwarded === "https" || forwarded === "http"
-			? forwarded
-			: (o.listenerScheme ?? o.requestScheme.replace(/:$/, ""));
+	const scheme = browserScheme(o);
 	try {
 		return new URL(`${scheme}://${o.host}`).origin;
 	} catch {

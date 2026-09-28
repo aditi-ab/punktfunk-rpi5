@@ -25,20 +25,7 @@ fn flag_val(args: &[String], name: &str) -> Option<String> {
 fn flag_present(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
-/// `%SystemRoot%\System32\<rel>` — the one place the System32 rule lives.
-///
-/// `CreateProcess` searches the calling process's directory and the working directory before
-/// `%PATH%`, and everything routed through here runs elevated or as SYSTEM: a `certutil.exe`
-/// planted beside the installer would otherwise win. `SystemRoot`, then `WINDIR`, then the
-/// literal default — never a bare name, which is the PATH search this exists to avoid.
-///
-/// `rel` may carry a subdirectory, as PowerShell does.
-pub(crate) fn sys32(rel: &str) -> String {
-    let root = std::env::var("SystemRoot")
-        .or_else(|_| std::env::var("WINDIR"))
-        .unwrap_or_else(|_| r"C:\Windows".to_string());
-    format!(r"{root}\System32\{rel}")
-}
+pub(crate) use pf_paths::system32 as sys32;
 
 /// [`sys32`] for a bare tool name. A name that already carries a separator (the staged
 /// `nefconc.exe`) is its own path and passes through.
@@ -48,8 +35,32 @@ pub(crate) fn resolve_tool(cmd: &str) -> String {
     }
     sys32(&format!("{cmd}.exe"))
 }
-fn run_quiet(cmd: &str, args: &[&str]) -> bool {
+/// Whether the tool ran and exited 0, output discarded. Resolved through [`resolve_tool`], so a
+/// bare name is System32's: `service install` and `driver` run elevated.
+pub(crate) fn run_quiet(cmd: &str, args: &[&str]) -> bool {
     run_code(cmd, args) == Some(0)
+}
+/// `pnputil /remove-device` by absolute path: an uninstaller must not depend on `%PATH%`.
+/// `Err` carries pnputil's exit status and message, or why it did not run.
+pub(crate) fn remove_device(instance_id: &str) -> Result<()> {
+    let o = Command::new(sys32("pnputil.exe"))
+        .args(["/remove-device", instance_id])
+        .output()
+        .context("run pnputil")?;
+    if !o.status.success() {
+        // Whichever stream pnputil wrote its reason to.
+        let msg = if o.stderr.is_empty() {
+            &o.stdout
+        } else {
+            &o.stderr
+        };
+        bail!(
+            "pnputil /remove-device {}: {}",
+            o.status,
+            String::from_utf8_lossy(msg).trim()
+        );
+    }
+    Ok(())
 }
 /// Exit code, output discarded. `None` when the tool did not launch.
 fn run_code(cmd: &str, args: &[&str]) -> Option<i32> {
@@ -381,10 +392,9 @@ fn pad_install_problems(
 
 fn remove_pad_devnodes() {
     for id in pad_instance_ids() {
-        if run_quiet("pnputil", &["/remove-device", &id]) {
-            println!("removed stale pad devnode {id}");
-        } else {
-            eprintln!("warning: pnputil /remove-device {id} failed");
+        match remove_device(&id) {
+            Ok(()) => println!("removed stale pad devnode {id}"),
+            Err(e) => eprintln!("warning: couldn't remove pad devnode {id}: {e:#}"),
         }
     }
 }
@@ -440,10 +450,9 @@ fn uninstall_audio_devices() -> Result<()> {
 fn uninstall_pf_vdisplay() -> Result<()> {
     // ROOT nodes first; leaving them is a ghost "punktfunk virtual display" in Device Manager.
     for id in pf_vdisplay_instance_ids() {
-        if run_quiet("pnputil", &["/remove-device", &id]) {
-            println!("removed device node {id}");
-        } else {
-            eprintln!("warning: pnputil /remove-device {id} failed");
+        match remove_device(&id) {
+            Ok(()) => println!("removed device node {id}"),
+            Err(e) => eprintln!("warning: couldn't remove device node {id}: {e:#}"),
         }
     }
     delete_store_drivers(&["pf_vdisplay"]);

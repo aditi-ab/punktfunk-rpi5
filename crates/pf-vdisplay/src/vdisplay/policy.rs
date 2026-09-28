@@ -431,7 +431,7 @@ pub struct EffectivePolicy {
 /// Hex form of a peer fingerprint — the key `clients` is stored under, and what
 /// the pairing store and the device list already use.
 pub fn fp_hex(fp: Option<[u8; 32]>) -> Option<String> {
-    fp.map(|fp| fp.iter().map(|b| format!("{b:02x}")).collect())
+    fp.map(hex::encode)
 }
 
 impl DisplayPolicy {
@@ -880,56 +880,9 @@ impl DisplayPolicyStore {
     pub fn set(&self, policy: DisplayPolicy) -> Result<()> {
         let policy = policy.sanitized();
         let _tx = self.write.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(dir) = self.path.parent() {
-            pf_paths::create_private_dir(dir)?;
-        }
-        let bytes = serde_json::to_vec_pretty(&policy)?;
-        // Arm before the write: `write_secret_file` creates+truncates first,
-        // so ENOSPC/EIO can leave the unique temp on disk. Nothing reaps
-        // `*.tmp` — a second host process may be using its own in-flight name.
-        let tmp = TmpFile::arm(unique_tmp_path(&self.path));
-        pf_paths::write_secret_file(tmp.path(), &bytes)?;
-        std::fs::rename(tmp.path(), &self.path)?;
-        tmp.published();
+        pf_paths::replace_secret_file(&self.path, &serde_json::to_vec_pretty(&policy)?)?;
         *self.cur.lock().unwrap() = Some(policy);
         Ok(())
-    }
-}
-
-/// Temp path no other writer shares: `<name>.<pid>.<n>.tmp`. A fixed
-/// `.json.tmp` interleaves two host processes into one rename.
-fn unique_tmp_path(path: &std::path::Path) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".{}.{n}.tmp", std::process::id()));
-    path.with_file_name(name)
-}
-
-/// Owns a [`unique_tmp_path`] until rename; deletes on every early exit.
-/// Unique names have no self-heal (a fixed `.json.tmp` was overwritten).
-/// Crash between write and rename needs a reaper the caller cannot own.
-struct TmpFile(Option<PathBuf>);
-
-impl TmpFile {
-    fn arm(path: PathBuf) -> Self {
-        TmpFile(Some(path))
-    }
-    fn path(&self) -> &std::path::Path {
-        self.0.as_deref().expect("disarmed only by consuming self")
-    }
-    /// Rename succeeded: the path is the real file now; do not remove it.
-    fn published(mut self) {
-        self.0 = None;
-    }
-}
-
-impl Drop for TmpFile {
-    fn drop(&mut self) {
-        if let Some(p) = &self.0 {
-            let _ = std::fs::remove_file(p);
-        }
     }
 }
 
@@ -1133,20 +1086,10 @@ fn quarantine_catalog() {
 /// delete each write back what they loaded and one edit vanishes.
 static CATALOG_LOCK: Mutex<()> = Mutex::new(());
 
-/// Persist the catalog (private dir, temp-write + atomic rename). Callers
-/// hold [`CATALOG_LOCK`].
+/// Persist the catalog ([`pf_paths::replace_secret_file`]). Callers hold [`CATALOG_LOCK`].
 fn save_custom_presets(presets: &[CustomPreset]) -> Result<()> {
-    let path = custom_presets_path();
-    if let Some(dir) = path.parent() {
-        pf_paths::create_private_dir(dir)?;
-    }
     let bytes = serde_json::to_vec_pretty(presets)?;
-    // Same guard as `DisplayPolicyStore::set`: a failed write leaves the
-    // unique temp on disk.
-    let tmp = TmpFile::arm(unique_tmp_path(&path));
-    pf_paths::write_secret_file(tmp.path(), &bytes)?;
-    std::fs::rename(tmp.path(), &path)?;
-    tmp.published();
+    pf_paths::replace_secret_file(&custom_presets_path(), &bytes)?;
     Ok(())
 }
 
@@ -1675,25 +1618,6 @@ mod tests {
     }
 
     #[test]
-    fn unique_tmp_paths_never_repeat_and_stay_in_the_same_dir() {
-        let path = PathBuf::from("/tmp/pf/display-settings.json");
-        let a = unique_tmp_path(&path);
-        let b = unique_tmp_path(&path);
-        assert_ne!(a, b, "a fixed temp name is what two writers collide on");
-        assert_eq!(
-            a.parent(),
-            path.parent(),
-            "rename must stay intra-filesystem"
-        );
-        assert!(a.to_string_lossy().ends_with(".tmp"));
-        assert!(a
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with("display-settings.json."));
-    }
-
-    #[test]
     fn one_bad_catalog_entry_costs_only_itself() {
         // One bad entry must not empty the catalog (the next create would then overwrite it).
         let doc = br#"[
@@ -1825,23 +1749,6 @@ mod tests {
         assert!(!standby_sink_neutralise(Some("keep")));
     }
 
-    #[test]
-    fn a_temp_file_is_removed_unless_the_rename_published_it() {
-        let dir = std::env::temp_dir().join(format!("pf-disp-tmp-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        // Failed write/rename must take the unique temp with it; nothing reaps `*.tmp`.
-        let leaked = unique_tmp_path(&dir.join("display-settings.json"));
-        std::fs::write(&leaked, b"partial").unwrap();
-        drop(TmpFile::arm(leaked.clone()));
-        assert!(!leaked.exists(), "a failed write must not leave {leaked:?}");
-        // After publish the file is the real one; removing it would delete the write.
-        let kept = unique_tmp_path(&dir.join("display-settings.json"));
-        std::fs::write(&kept, b"published").unwrap();
-        TmpFile::arm(kept.clone()).published();
-        assert!(kept.exists());
-        let _ = std::fs::remove_file(&kept);
-        let _ = std::fs::remove_dir(&dir);
-    }
     /// Overlay resolution, as a table (`design/web-console-overhaul.md` §6.1).
     ///
     /// The shape this pins: an ABSENT field follows the host, so a host-side

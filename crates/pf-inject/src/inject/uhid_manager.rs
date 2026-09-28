@@ -1,11 +1,11 @@
-//! Stateful virtual-pad manager ([`UhidManager`]) shared by the five backends that keep a full
-//! per-pad report (Linux UHID DualSense / DualShock 4 / Steam Deck, Windows UMDF DualSense /
-//! DualShock 4). Event routing, frame merge, rich-input, silence heartbeat, and the rumble +
-//! hidout-dedup feedback pump live here; a backend supplies only its per-controller pieces via
-//! [`PadProto`].
+//! Virtual-pad manager ([`UhidManager`]) shared by the Linux UHID/usbip pads and every Windows
+//! UMDF pad, XUSB included. Event routing, frame merge, rich-input, silence heartbeat, and the
+//! rumble + hidout-dedup feedback pump live here; a backend supplies only its per-controller
+//! pieces via [`PadProto`].
 //!
-//! Stateless backends (Linux uinput, Windows XUSB) write frames through [`PadSlots`] with no
-//! state vec, heartbeat, or rich plane. Rumble plane: `design/trigger-rumble-plane.md`.
+//! The Linux uinput pad writes frames through [`PadSlots`] itself: evdev holds the last state,
+//! so it needs no state vec, heartbeat, or rich plane. Rumble plane:
+//! `design/trigger-rumble-plane.md`.
 
 use crate::hidout_dedup::HidoutDedup;
 use crate::pad_slots::PadSlots;
@@ -37,15 +37,86 @@ pub struct PadFeedback {
     pub resync: bool,
 }
 
-/// Per-controller half of a stateful virtual-pad backend: transport open, report-state model,
-/// GameStream/rich-input mappers, state write, and feedback poll. `&mut self` lets a backend
-/// carry configuration (Steam-paddle remap, pad identity); most implementations are otherwise
-/// stateless.
+/// Per-pad report state (`DsState`, `SteamState`). `Copy` so the manager can snapshot into
+/// [`PadProto::write_state`] without holding the pad borrow. The state's own model, shared by
+/// every transport and OS that presents it.
+pub trait PadState: Copy {
+    /// A fresh pad: centred, nothing pressed, at rest.
+    fn neutral() -> Self;
+
+    /// Zero this state's angular velocity; keep acceleration (gravity is persistent). Returns
+    /// whether anything changed, so a pad already at rest costs no write.
+    ///
+    /// Motion is level-triggered: [`PadProto::merge_frame`] preserves the last sample and the
+    /// heartbeat re-emits it, so a client that stops sending Motion leaves a constant rotation.
+    /// Idle watchdog, driven from [`MOTION_IDLE_TIMEOUT`]. A state with no motion plane leaves
+    /// this a no-op.
+    fn neutralize_gyro(&mut self) -> bool {
+        false
+    }
+
+    /// Reset rich-plane fields (touch + motion) to a fresh pad, leaving buttons, sticks, and
+    /// feedback cursors. Used on [`Sweep::reclaimed`](crate::pad_slots::Sweep::reclaimed): a
+    /// different controller inherits a live virtual pad without `reset_pad`.
+    fn clear_rich(&mut self) {}
+}
+
+impl PadState for crate::dualsense_proto::DsState {
+    fn neutral() -> Self {
+        Self::neutral()
+    }
+    fn neutralize_gyro(&mut self) -> bool {
+        Self::neutralize_gyro(self)
+    }
+    fn clear_rich(&mut self) {
+        Self::clear_rich(self)
+    }
+}
+
+impl PadState for crate::steam_proto::SteamState {
+    fn neutral() -> Self {
+        Self::neutral()
+    }
+    fn neutralize_gyro(&mut self) -> bool {
+        Self::neutralize_gyro(self)
+    }
+    fn clear_rich(&mut self) {
+        Self::clear_rich(self)
+    }
+}
+
+impl PadState for crate::switch_proto::SwitchState {
+    fn neutral() -> Self {
+        Self::neutral()
+    }
+    fn neutralize_gyro(&mut self) -> bool {
+        Self::neutralize_gyro(self)
+    }
+    fn clear_rich(&mut self) {
+        Self::clear_rich(self)
+    }
+}
+
+/// Motion lives inside the opaque raw report, so there is nothing to neutralize or clear.
+impl PadState for crate::triton_proto::TritonState {
+    fn neutral() -> Self {
+        Self::neutral()
+    }
+}
+
+/// No rich plane on an Xbox pad.
+impl PadState for crate::xbox_proto::XboxState {
+    fn neutral() -> Self {
+        Self::default()
+    }
+}
+
+/// Per-controller half of a stateful virtual-pad backend: transport open, GameStream/rich-input
+/// mappers, state write, and feedback poll. `&mut self` lets a backend carry configuration
+/// (Steam-paddle remap, pad identity); most implementations are otherwise stateless.
 pub trait PadProto {
     type Pad;
-    /// Full report state (`DsState`, `SteamState`). `Copy` so the manager can snapshot into
-    /// [`write_state`](Self::write_state) without holding the pad borrow.
-    type State: Copy;
+    type State: PadState;
 
     const LABEL: &'static str;
     const DEVICE: &'static str;
@@ -54,7 +125,6 @@ pub trait PadProto {
 
     /// Backend logs success; the manager logs create-gate failures.
     fn open(&mut self, idx: u8) -> Result<Self::Pad>;
-    fn neutral(&self) -> Self::State;
     /// Fold one button/stick frame into a new state, preserving from `prev` every field that
     /// arrives on the rich plane (touch / motion). Paddle remap applies here too.
     fn merge_frame(&self, prev: &Self::State, f: &GamepadFrame) -> Self::State;
@@ -68,22 +138,6 @@ pub trait PadProto {
     fn force_heartbeat(&self, _pad: &Self::Pad) -> bool {
         false
     }
-
-    /// Zero this state's angular velocity; keep acceleration (gravity is persistent). Returns
-    /// whether anything changed, so a pad already at rest costs no write.
-    ///
-    /// Motion is level-triggered: [`merge_frame`](Self::merge_frame) preserves the last sample
-    /// and the heartbeat re-emits it, so a client that stops sending Motion leaves a constant
-    /// rotation. Idle watchdog, driven from [`MOTION_IDLE_TIMEOUT`]. Backends with no motion
-    /// plane leave this a no-op.
-    fn neutralize_gyro(&self, _st: &mut Self::State) -> bool {
-        false
-    }
-
-    /// Reset rich-plane fields (touch + motion) to a fresh pad, leaving buttons, sticks, and
-    /// feedback cursors. Used on [`Sweep::reclaimed`](crate::pad_slots::Sweep::reclaimed): a
-    /// different controller inherits a live virtual pad without `reset_pad`.
-    fn clear_rich(&self, _st: &mut Self::State) {}
 }
 
 /// All virtual pads of one stateful backend. Method surface (`new` / `handle` / `apply_rich` /
@@ -148,7 +202,7 @@ impl OverflowWarn {
 ///
 /// INVARIANT: stay above SDL's ~2 s resend (`SDL_RUMBLE_RESEND_MS`). SDL-class writers re-assert
 /// a held level on that cadence because real firmware decays; that re-assert keeps a
-/// legitimately-held rumble alive here. Shared with the XUSB path via [`rumble_idle_timeout`].
+/// legitimately-held rumble alive here. Shared with the uinput FF mixer via [`rumble_idle_timeout`].
 ///
 /// KNOWN COST: `ff-memless` sends one report at start and one at stop, so a finite effect
 /// longer than this window is cut in half. The uinput path can exempt that because evdev FF
@@ -157,14 +211,14 @@ impl OverflowWarn {
 const RUMBLE_IDLE_TIMEOUT: Duration = Duration::from_millis(2500);
 
 /// How long a pad's motion feed may go quiet before angular velocity is zeroed — see
-/// [`PadProto::neutralize_gyro`]. 100 ms ≈ 25 missed samples of a 250 Hz feed (client capture
+/// [`PadState::neutralize_gyro`]. 100 ms ≈ 25 missed samples of a 250 Hz feed (client capture
 /// floors ~4 ms); a still controller sends a zero sample, it does not stop sending.
 const MOTION_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Abandoned-rumble force-off window. `PUNKTFUNK_RUMBLE_IDLE_MS` overrides
 /// [`RUMBLE_IDLE_TIMEOUT`]; `0` disables. Non-zero values are floored at 2100 ms, just above
-/// SDL's ~2 s resend, so the hatch cannot cut a legitimately-held rumble. Shared by UHID/UMDF,
-/// Windows XUSB, and the Linux uinput FF mixer.
+/// SDL's ~2 s resend, so the hatch cannot cut a legitimately-held rumble. Shared by
+/// [`UhidManager`] and the Linux uinput FF mixer.
 pub(crate) fn rumble_idle_timeout() -> Option<Duration> {
     static VAL: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
     *VAL.get_or_init(|| match std::env::var("PUNKTFUNK_RUMBLE_IDLE_MS") {
@@ -189,9 +243,34 @@ impl<B: PadProto + Default> Default for UhidManager<B> {
     }
 }
 
+/// The per-tick half of [`UhidManager`] as an object, so a host keeps its managers of different
+/// backends in one list that both pump and heartbeat walk.
+pub trait UhidTick {
+    fn pump(
+        &mut self,
+        rumble: &mut dyn FnMut(u16, u16, u16, u16, u16),
+        hidout: &mut dyn FnMut(HidOutput),
+    );
+    fn heartbeat(&mut self, max_gap: Duration);
+}
+
+impl<B: PadProto> UhidTick for UhidManager<B> {
+    fn pump(
+        &mut self,
+        rumble: &mut dyn FnMut(u16, u16, u16, u16, u16),
+        hidout: &mut dyn FnMut(HidOutput),
+    ) {
+        UhidManager::pump(self, rumble, hidout);
+    }
+
+    fn heartbeat(&mut self, max_gap: Duration) {
+        UhidManager::heartbeat(self, max_gap);
+    }
+}
+
 impl<B: PadProto> UhidManager<B> {
     pub fn with_backend(backend: B) -> UhidManager<B> {
-        let state = (0..MAX_PADS).map(|_| backend.neutral()).collect();
+        let state = vec![B::State::neutral(); MAX_PADS];
         UhidManager {
             backend,
             slots: PadSlots::new(B::LABEL, B::DEVICE, B::CREATE_HINT),
@@ -275,7 +354,7 @@ impl<B: PadProto> UhidManager<B> {
             let mut neutralized = false;
             if self.last_motion[i].is_some_and(|t| now.duration_since(t) >= MOTION_IDLE_TIMEOUT) {
                 self.last_motion[i] = None;
-                neutralized = self.backend.neutralize_gyro(&mut self.state[i]);
+                neutralized = self.state[i].neutralize_gyro();
             }
             if neutralized || forced || now.duration_since(self.last_write[i]) >= max_gap {
                 self.write(i);
@@ -392,7 +471,7 @@ impl<B: PadProto> UhidManager<B> {
     fn clear_reclaimed_rich(&mut self, reclaimed: u16) {
         for i in 0..MAX_PADS {
             if reclaimed & (1 << i) != 0 {
-                self.backend.clear_rich(&mut self.state[i]);
+                self.state[i].clear_rich();
                 self.last_motion[i] = None;
             }
         }
@@ -401,7 +480,7 @@ impl<B: PadProto> UhidManager<B> {
     /// Reset one pad's sibling state (create and unplug) so the first frame/feedback after a
     /// (re)connect starts from scratch and is always forwarded.
     fn reset_pad(&mut self, idx: usize) {
-        self.state[idx] = self.backend.neutral();
+        self.state[idx] = B::State::neutral();
         self.last_rumble[idx] = (0, 0, 0, 0);
         self.hidout_dedup[idx].clear();
         self.last_write[idx] = Instant::now();
@@ -445,6 +524,22 @@ mod tests {
         accel: i16,
     }
 
+    impl PadState for MockState {
+        fn neutral() -> MockState {
+            MockState::default()
+        }
+        fn neutralize_gyro(&mut self) -> bool {
+            let changed = self.gyro != 0;
+            self.gyro = 0;
+            changed
+        }
+        fn clear_rich(&mut self) {
+            self.rich_marker = 0;
+            self.gyro = 0;
+            self.accel = 0;
+        }
+    }
+
     #[derive(Default)]
     struct MockPad {
         writes: RefCell<Vec<MockState>>,
@@ -465,9 +560,6 @@ mod tests {
             }
             Ok(MockPad::default())
         }
-        fn neutral(&self) -> MockState {
-            MockState::default()
-        }
         fn merge_frame(&self, prev: &MockState, f: &GamepadFrame) -> MockState {
             MockState {
                 buttons: f.buttons,
@@ -487,16 +579,6 @@ mod tests {
                 }
                 _ => {}
             }
-        }
-        fn neutralize_gyro(&self, st: &mut MockState) -> bool {
-            let changed = st.gyro != 0;
-            st.gyro = 0;
-            changed
-        }
-        fn clear_rich(&self, st: &mut MockState) {
-            st.rich_marker = 0;
-            st.gyro = 0;
-            st.accel = 0;
         }
         fn write_state(&self, pad: &mut MockPad, st: &MockState) {
             pad.writes.borrow_mut().push(*st);

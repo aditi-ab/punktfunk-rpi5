@@ -45,17 +45,9 @@ RUN pacman -Syu --noconfirm --needed \
 
 # bun builds the punktfunk-web console + the punktfunk-scripting runner AND is vendored as their
 # runtime (PF_WITH_WEB=1 / PF_WITH_SCRIPTING=1), so these bytes end up in the package arch.yml
-# signs. A PINNED release asset checked by SHA-256, not [extra]'s rolling bun: ONE bun across the
-# repo, same version, asset and sum as rust-ci.Dockerfile — bump BUN_VERSION and BUN_SHA together.
-ARG BUN_VERSION=1.4.2
-ARG BUN_SHA=c678040f14fe0440eb839d37cbd0ce4c051a32da72806ac97de6a6aab6bf728f
-RUN curl -fsSL -o /tmp/bun.zip \
-      "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64-baseline.zip" \
-    && echo "${BUN_SHA}  /tmp/bun.zip" | sha256sum -c - \
-    && unzip -q -o -j /tmp/bun.zip '*/bun' -d /tmp \
-    && install -m0755 /tmp/bun /usr/local/bin/bun \
-    && rm -f /tmp/bun.zip /tmp/bun \
-    && bun --version
+# signs. The pinned asset from ci/bun.env, not [extra]'s rolling bun.
+COPY bun.env install-bun.sh /tmp/
+RUN sh /tmp/install-bun.sh && rm /tmp/bun.env /tmp/install-bun.sh
 
 # Shared compile cache: jobs set RUSTC_WRAPPER=sccache (backend = RustFS S3 on the LAN,
 # see .gitea/workflows — the env lives there so dev use of this image stays uncached).

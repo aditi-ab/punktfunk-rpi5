@@ -95,14 +95,7 @@ impl ksni::Tray for HostTray {
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::*;
-        let running = matches!(
-            self.status,
-            TrayStatus::Running(_) | TrayStatus::Starting | TrayStatus::Degraded
-        );
-        let startable = matches!(
-            self.status,
-            TrayStatus::Stopped | TrayStatus::Error(_) | TrayStatus::NotInstalled
-        );
+        let release = self.status.release_label();
         vec![
             StandardItem {
                 label: self.status.headline(),
@@ -111,13 +104,8 @@ impl ksni::Tray for HostTray {
             }
             .into(),
             MenuItem::Separator,
-            // Always shown; a dead console changes the label, never hides the row.
             StandardItem {
-                label: if self.web_console {
-                    "Open web console".to_string()
-                } else {
-                    "Open web console (not responding)".to_string()
-                },
+                label: status::console_label(self.web_console).into(),
                 activate: Box::new(|t: &mut Self| t.open_console("")),
                 ..Default::default()
             }
@@ -130,11 +118,8 @@ impl ksni::Tray for HostTray {
             }
             .into(),
             StandardItem {
-                label: match self.status.kept_displays() {
-                    1 => "Release kept display…".to_string(),
-                    n => format!("Release {n} kept displays…"),
-                },
-                visible: self.status.kept_displays() > 0,
+                visible: release.is_some(),
+                label: release.unwrap_or_default(),
                 activate: Box::new(|t: &mut Self| t.open_console("displays")),
                 ..Default::default()
             }
@@ -142,23 +127,21 @@ impl ksni::Tray for HostTray {
             MenuItem::Separator,
             StandardItem {
                 label: "Start host".into(),
-                visible: startable && !matches!(self.status, TrayStatus::NotInstalled),
+                visible: self.status.can_start(),
                 activate: Box::new(|t: &mut Self| t.systemctl("start")),
                 ..Default::default()
             }
             .into(),
             StandardItem {
                 label: "Stop host".into(),
-                visible: running,
+                visible: self.status.is_running(),
                 activate: Box::new(|t: &mut Self| t.systemctl("stop")),
                 ..Default::default()
             }
             .into(),
             StandardItem {
-                // Service restart. Clients' host-power "Restart host" reboots the MACHINE
-                // (`design/host-actions.md`); one phrase must not mean both.
-                label: "Restart Punktfunk".into(),
-                visible: running || matches!(self.status, TrayStatus::Error(_)),
+                label: status::RESTART_LABEL.into(),
+                visible: self.status.can_restart(),
                 activate: Box::new(|t: &mut Self| t.systemctl("restart")),
                 ..Default::default()
             }

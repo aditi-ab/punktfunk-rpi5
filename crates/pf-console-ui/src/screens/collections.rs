@@ -285,6 +285,7 @@ fn draw_monogram(canvas: &Canvas, fonts: &Fonts, label: &str, front: Rect, rr: R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::{contrast, over};
 
     fn game(id: &str, launcher: bool, platform: Option<&str>) -> LibraryGame {
         LibraryGame {
@@ -416,32 +417,13 @@ mod tests {
         }
     }
 
-    fn over(src: Color4f, dst: Color4f) -> Color4f {
-        let m = |s: f32, d: f32| s * src.a + d * (1.0 - src.a);
-        Color4f::new(m(src.r, dst.r), m(src.g, dst.g), m(src.b, dst.b), 1.0)
-    }
-
-    /// WCAG contrast: sRGB to linear, then Rec. 709 relative luminance.
-    fn contrast(a: Color4f, b: Color4f) -> f32 {
-        let lin = |c: f32| {
-            if c <= 0.04045 {
-                c / 12.92
-            } else {
-                ((c + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        let lum = |c: Color4f| 0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b);
-        let (x, y) = (lum(a), lum(b));
-        (x.max(y) + 0.05) / (x.min(y) + 0.05)
-    }
-
     /// Initials of a group with no art must read on every palette, not just the dark one.
     ///
     /// A hardcoded near-black face under `fg()` vanishes on pale palettes, where
     /// `fg()` is itself near-black.
     #[test]
     fn the_monogram_reads_on_every_palette() {
-        for p in &crate::library::PALETTES {
+        for p in &crate::palette::PALETTES {
             crate::theme::set_ink(crate::theme::Ink::of(p));
             let ground = Color4f::new(p.ground.0 as f32, p.ground.1 as f32, p.ground.2 as f32, 1.0);
             // Tile accent over the field, then the badge face, then the glyph. Glass
@@ -453,6 +435,6 @@ mod tests {
             let c = contrast(glyph, face);
             assert!(c > 3.0, "the monogram is unreadable on {}: {c:.2}:1", p.id);
         }
-        crate::theme::set_ink(crate::theme::Ink::of(crate::library::palette("violet")));
+        crate::theme::set_ink(crate::theme::Ink::of(crate::palette::palette("violet")));
     }
 }

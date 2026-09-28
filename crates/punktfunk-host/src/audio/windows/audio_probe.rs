@@ -26,8 +26,6 @@ pub(crate) const PROBE_MARKER: &str = "PunktfunkAudioProbe";
 /// Device Manager name until the INF install overwrites it.
 const PROBE_DESC: &str = "Punktfunk Audio Probe";
 const ENDPOINT_WAIT: Duration = Duration::from_secs(15);
-/// Matches `pad-endpoint tone` so peaks compare across probes.
-const TONE_AMP: f32 = 0.5;
 /// Tone renders at 0.5; autoconvert may attenuate. Above this is signal.
 const SIGNAL_FLOOR: f32 = 0.05;
 
@@ -165,8 +163,8 @@ fn probe_ssm(keep: bool) -> Result<()> {
     println!("audio-probe ssm: created devnode {inst}");
     da::bind_driver(&hwid, &inf)?;
 
-    let render_ep = wait_endpoint(&inst, Dir::Render)?;
-    let capture_ep = match wait_endpoint(&inst, Dir::Capture) {
+    let render_ep = pe::wait_for_endpoint(&inst, Direction::Render, ENDPOINT_WAIT)?;
+    let capture_ep = match pe::wait_for_endpoint(&inst, Direction::Capture, ENDPOINT_WAIT) {
         Ok(ep) => ep,
         Err(e) => {
             println!("audio-probe ssm: render endpoint {render_ep} appeared, but:");
@@ -223,7 +221,7 @@ fn probe_sink(keep: bool) -> Result<()> {
     let inst = da::create_media_devnode(PROBE_DESC, &hwid, write_probe_marker)?;
     println!("audio-probe sink: created devnode {inst}");
     da::bind_driver(&hwid, &inf)?;
-    let ep = wait_endpoint(&inst, Dir::Render)?;
+    let ep = pe::wait_for_endpoint(&inst, Direction::Render, ENDPOINT_WAIT)?;
     println!("audio-probe sink: endpoint={ep}");
     report_mix_format("sink", &ep);
 
@@ -352,48 +350,11 @@ fn cleanup() -> Result<()> {
     Ok(())
 }
 
-/// `pnputil /remove-device` — same teardown as `pad-endpoint remove`.
+/// Same teardown as `pad-endpoint remove`.
 fn remove_devnode(inst: &str) {
-    match std::process::Command::new(crate::install::sys32("pnputil.exe"))
-        .args(["/remove-device", inst])
-        .output()
-    {
-        Ok(o) if o.status.success() => println!("audio-probe: removed devnode {inst}"),
-        Ok(o) => println!(
-            "audio-probe: pnputil could not remove {inst} (status {:?}): {}",
-            o.status.code(),
-            String::from_utf8_lossy(&o.stderr).trim()
-        ),
-        Err(e) => println!("audio-probe: pnputil did not run for {inst}: {e}"),
-    }
-}
-
-enum Dir {
-    Render,
-    Capture,
-}
-
-fn wait_endpoint(inst: &str, dir: Dir) -> Result<String> {
-    let deadline = Instant::now() + ENDPOINT_WAIT;
-    loop {
-        let found = match dir {
-            Dir::Render => pe::find_endpoint_for_devnode(inst)?,
-            Dir::Capture => pe::find_capture_endpoint_for_devnode(inst)?,
-        };
-        if let Some(ep) = found {
-            return Ok(ep);
-        }
-        if Instant::now() >= deadline {
-            let which = match dir {
-                Dir::Render => "render",
-                Dir::Capture => "capture",
-            };
-            bail!(
-                "no {which} endpoint appeared for {inst} within {}s",
-                ENDPOINT_WAIT.as_secs()
-            );
-        }
-        thread::sleep(Duration::from_millis(250));
+    match crate::install::remove_device(inst) {
+        Ok(()) => println!("audio-probe: removed devnode {inst}"),
+        Err(e) => println!("audio-probe: couldn't remove {inst}: {e:#}"),
     }
 }
 
@@ -435,7 +396,7 @@ fn tone_while<T>(
     }
 }
 
-/// Shared-mode stereo 48 kHz + autoconvert — same open the virtual mic uses.
+/// Stereo on `target`, or the default render device.
 fn render_tone(target: Option<&str>, seconds: u32, hz: f32, stop: &AtomicBool) -> Result<()> {
     wasapi::initialize_mta()
         .ok()
@@ -447,57 +408,7 @@ fn render_tone(target: Option<&str>, seconds: u32, hz: f32, stop: &AtomicBool) -
             .get_default_device(&Direction::Render)
             .map_err(|e| anyhow!("default render device: {e}"))?,
     };
-    let mut client = device.get_iaudioclient().context("IAudioClient")?;
-    let desired = WaveFormat::new(32, 32, &SampleType::Float, SAMPLE_RATE as usize, 2, None);
-    let (period, _) = client.get_device_period().context("device period")?;
-    client
-        .initialize_client(
-            &desired,
-            &Direction::Render,
-            &StreamMode::EventsShared {
-                autoconvert: true,
-                buffer_duration_hns: period,
-            },
-        )
-        .context("initialize tone render")?;
-    let h_event = client.set_get_eventhandle().context("event handle")?;
-    let render = client.get_audiorenderclient().context("render client")?;
-    let buf_frames = client.get_buffer_size().context("buffer size")? as usize;
-    let _ = render.write_to_device(buf_frames, &vec![0u8; buf_frames * 8], None);
-    client.start_stream().context("start tone stream")?;
-
-    let total = u64::from(SAMPLE_RATE) * u64::from(seconds.clamp(1, 60));
-    let step = std::f32::consts::TAU * hz / SAMPLE_RATE as f32;
-    let (mut phase, mut written) = (0.0f32, 0u64);
-    let mut bytes = vec![0u8; buf_frames * 8];
-    while written < total && !stop.load(Ordering::Relaxed) {
-        if h_event.wait_for_event(1000).is_err() {
-            bail!("tone render event timed out after {written} frames");
-        }
-        let free = client.get_available_space_in_frames().context("space")? as usize;
-        let n = free.min((total - written) as usize);
-        if n == 0 {
-            continue;
-        }
-        for f in 0..n {
-            let s = phase.sin() * TONE_AMP;
-            phase += step;
-            if phase >= std::f32::consts::TAU {
-                phase -= std::f32::consts::TAU;
-            }
-            for c in 0..2 {
-                let at = (f * 2 + c) * 4;
-                bytes[at..at + 4].copy_from_slice(&s.to_le_bytes());
-            }
-        }
-        render
-            .write_to_device(n, &bytes[..n * 8], None)
-            .context("write tone")?;
-        written += n as u64;
-    }
-    thread::sleep(Duration::from_millis(200));
-    let _ = client.stop_stream();
-    Ok(())
+    super::pad_capture::play_tone(&device, 2, None, |_| true, seconds, hz, stop)
 }
 
 /// Peak |sample| and zero-crossing Hz from capture or loopback. Peaks miss an

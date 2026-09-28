@@ -14,7 +14,9 @@ description = "punktfunk host input injection: per-OS keyboard/mouse injectors +
 publish = false
 
 [dependencies]
-punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
+# The input wire types (`input`, `quic::{RichInput, HidOutput, Pen*}`) live outside the `quic`
+# feature, so the input crate never builds quinn, rustls or opus.
+punktfunk-core = { path = "../punktfunk-core", default-features = false }
 pf-driver-proto = { path = "../pf-driver-proto" }
 pf-host-config = { path = "../pf-host-config" }
 pf-paths = { path = "../pf-paths" }
@@ -83,6 +85,10 @@ windows = { version = "0.62", features = [
     "Win32_UI_Input_Pointer",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[dev-dependencies]
+# Reads `crates/punktfunk-core/testdata/gamepad-button-vectors.json`.
+serde_json = "1"
 
 [lints]
 workspace = true

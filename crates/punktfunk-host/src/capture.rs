@@ -148,6 +148,57 @@ pub(crate) struct VirtualCaptureRequest {
     pub gamescope: bool,
 }
 
+/// A live output's metadata without its keepalive: what [`capture_virtual_output`] needs to
+/// attach a second time, once the old capturer hands the keepalive back.
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+pub(crate) struct OutputLease {
+    node_id: u32,
+    preferred_mode: Option<(u32, u32, u32)>,
+    ownership: pf_vdisplay::DisplayOwnership,
+    pool_gen: Option<u64>,
+    output_name: Option<String>,
+    input_output: Option<String>,
+    seat: Option<String>,
+    pid: Option<u32>,
+}
+
+#[cfg(target_os = "linux")]
+impl OutputLease {
+    /// `None` on the portal path: its remote fd cannot be re-derived from the metadata.
+    pub(crate) fn of(vout: &crate::vdisplay::VirtualOutput) -> Option<OutputLease> {
+        vout.remote_fd.is_none().then(|| OutputLease {
+            node_id: vout.node_id,
+            preferred_mode: vout.preferred_mode,
+            ownership: vout.ownership,
+            pool_gen: vout.pool_gen,
+            output_name: vout.output_name.clone(),
+            input_output: vout.input_output.clone(),
+            seat: vout.seat.clone(),
+            pid: vout.pid,
+        })
+    }
+
+    /// The output as a fresh capture sees it. Never a birth-size gate: the output already
+    /// sits at its mode.
+    pub(crate) fn into_output(self, keepalive: Box<dyn Send>) -> crate::vdisplay::VirtualOutput {
+        crate::vdisplay::VirtualOutput {
+            node_id: self.node_id,
+            remote_fd: None,
+            preferred_mode: self.preferred_mode,
+            keepalive,
+            ownership: self.ownership,
+            reused_gen: None,
+            pool_gen: self.pool_gen,
+            expect_exact_dims: false,
+            output_name: self.output_name,
+            input_output: self.input_output,
+            seat: self.seat,
+            pid: self.pid,
+        }
+    }
+}
+
 /// Capturer from an already-created [`crate::vdisplay::VirtualOutput`].
 /// The capturer owns the output keepalive. Direct capture probes its consumer;
 /// PipeWire probes only level-21 gamescope and non-gamescope PyroWave. Ordinary
@@ -194,121 +245,62 @@ pub fn capture_virtual_output(
     // Direct capture first where the compositor has it: the portal's re-request timer
     // halves the rate above ~140 Hz. GPU consumers only — this delivers dmabufs, and a
     // software encoder wants the portal's CPU pixels. Any failure falls through.
+    let mut keepalive = vout.keepalive;
     if let (Some(name), true) = (
         vout.output_name.clone(),
         want.gpu && pf_capture::direct_capture(),
     ) {
-        // `keepalive` must move exactly once: rebuild it for the portal on failure.
         match pf_capture::open_direct_output(
             name.clone(),
-            Box::new(()),
+            keepalive,
             zero_copy_policy(want.pyrowave, want.nv12_native, codec, bit_depth, want.hdr),
         ) {
             Ok(c) => {
                 tracing::info!(output = %name, "capturing the compositor output directly");
-                // The keepalive still has to outlive the capturer; hand it over now that
-                // the session is known good.
-                return Ok(Box::new(KeptAlive {
-                    inner: c,
-                    keepalive: Some(vout.keepalive),
-                }));
+                return Ok(c);
             }
-            Err(e) => tracing::info!(
-                output = %name,
-                reason = %format!("{e:#}"),
-                "no direct capture on this compositor — using the ScreenCast portal"
-            ),
+            Err((e, handed_back)) => {
+                keepalive = handed_back;
+                tracing::info!(
+                    output = %name,
+                    reason = %format!("{e:#}"),
+                    "no direct capture on this compositor — using the ScreenCast portal"
+                )
+            }
         }
     }
+    let producer = if kwin {
+        pf_capture::Producer::Kwin
+    } else if gamescope {
+        pf_capture::Producer::Gamescope
+    } else {
+        pf_capture::Producer::Other
+    };
     pf_capture::open_virtual_output(
         vout.remote_fd,
         vout.node_id,
         vout.preferred_mode,
-        vout.keepalive,
-        want.gpu,
-        want.chroma_444,
-        want.hdr,
-        want.ten_bit_sdr,
-        pf_capture::ZeroCopyPolicy {
-            // No route here. A wrong "foreign" only keeps the LINEAR offer.
-            gamescope_tiled,
-            ..zero_copy_policy(
-                want.pyrowave,
-                want.nv12_native,
-                modifier_codec,
-                bit_depth,
-                want.hdr,
-            )
+        keepalive,
+        pf_capture::VirtualOutputOpts {
+            allow_zerocopy: want.gpu,
+            want_444: want.chroma_444,
+            want_hdr: want.hdr,
+            ten_bit_sdr: want.ten_bit_sdr,
+            expect_exact_dims: vout.expect_exact_dims,
+            producer,
+            policy: pf_capture::ZeroCopyPolicy {
+                // No route here. A wrong "foreign" only keeps the LINEAR offer.
+                gamescope_tiled,
+                ..zero_copy_policy(
+                    want.pyrowave,
+                    want.nv12_native,
+                    modifier_codec,
+                    bit_depth,
+                    want.hdr,
+                )
+            },
         },
-        vout.expect_exact_dims,
-        kwin,
-        gamescope,
-        if kwin {
-            pf_capture::KWIN_POOL_MIN
-        } else {
-            pf_capture::POOL_MIN
-        },
-        kwin.then_some(pf_capture::KWIN_POOL_MAX),
-        kwin && pf_capture::unpaced_capture(),
     )
-}
-
-/// Keeps the compositor's output alive for a capturer that did not take it.
-///
-/// `pf-capture` owns the keepalive on the portal path; the direct path is opened before
-/// the keepalive can be committed, so it rides here instead. Every trait call forwards.
-#[cfg(target_os = "linux")]
-struct KeptAlive {
-    inner: Box<dyn Capturer>,
-    /// Dropped after `inner`, releasing the output only once capture has stopped — unless a
-    /// capture-only rebuild took it back first.
-    keepalive: Option<Box<dyn Send>>,
-}
-
-#[cfg(target_os = "linux")]
-impl Capturer for KeptAlive {
-    fn next_frame(&mut self) -> Result<CapturedFrame> {
-        self.inner.next_frame()
-    }
-    fn take_keepalive(&mut self) -> Option<Box<dyn Send>> {
-        self.keepalive.take()
-    }
-    fn next_frame_within(&mut self, b: std::time::Duration) -> Result<CapturedFrame> {
-        self.inner.next_frame_within(b)
-    }
-    fn next_frame_within_provisional(&mut self, b: std::time::Duration) -> Result<CapturedFrame> {
-        self.inner.next_frame_within_provisional(b)
-    }
-    fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
-        self.inner.try_latest()
-    }
-    fn supports_arrival_wait(&self) -> bool {
-        self.inner.supports_arrival_wait()
-    }
-    fn wait_arrival(&mut self, deadline: std::time::Instant) {
-        self.inner.wait_arrival(deadline)
-    }
-    fn set_active(&mut self, active: bool) {
-        self.inner.set_active(active)
-    }
-    fn is_alive(&self) -> bool {
-        self.inner.is_alive()
-    }
-    fn cursor(&mut self) -> Option<pf_frame::CursorOverlay> {
-        self.inner.cursor()
-    }
-    fn set_cursor_forward(&mut self, on: bool) {
-        self.inner.set_cursor_forward(on)
-    }
-    fn attach_gamescope_cursor(&mut self, t: pf_capture::GamescopeCursorTargets) {
-        self.inner.attach_gamescope_cursor(t)
-    }
-    fn hdr_meta(&self) -> Option<pf_frame::HdrMeta> {
-        self.inner.hdr_meta()
-    }
-    fn pipeline_depth(&self) -> usize {
-        self.inner.pipeline_depth()
-    }
 }
 
 /// Can the native-plane source this session will drive deliver 10-bit PQ/BT.2020?
@@ -629,44 +621,6 @@ mod live_tests {
         drop(vd);
     }
 
-    /// `SeDebugPrivilege` on our token: attaching to a service process (WUDFHost runs as
-    /// LocalService) needs it even from an elevated console session.
-    fn enable_debug_privilege() -> bool {
-        use windows::core::PCWSTR;
-        use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
-        use windows::Win32::Security::{
-            AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_DEBUG_NAME,
-            SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
-        };
-        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-        // SAFETY: plain token FFI on our own process; the handle is closed here.
-        unsafe {
-            let mut tok = HANDLE::default();
-            if OpenProcessToken(
-                GetCurrentProcess(),
-                TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-                &mut tok,
-            )
-            .is_err()
-            {
-                return false;
-            }
-            let mut luid = LUID::default();
-            let ok = LookupPrivilegeValueW(PCWSTR::null(), SE_DEBUG_NAME, &mut luid).is_ok() && {
-                let tp = TOKEN_PRIVILEGES {
-                    PrivilegeCount: 1,
-                    Privileges: [LUID_AND_ATTRIBUTES {
-                        Luid: luid,
-                        Attributes: SE_PRIVILEGE_ENABLED,
-                    }],
-                };
-                AdjustTokenPrivileges(tok, false, Some(&tp), 0, None, None).is_ok()
-            };
-            let _ = CloseHandle(tok);
-            ok
-        }
-    }
-
     /// Freeze `pid` for `hold` by debugger attach (every thread stops at the attach event and
     /// stays stopped until the SAME thread detaches), on a helper thread. `attached` flips once
     /// the freeze took; kill-on-exit is off so a test panic never takes the debuggee down.
@@ -771,10 +725,8 @@ mod live_tests {
             }
         }
         assert!(warm >= 10, "no steady source before the fault (got {warm})");
-        assert!(
-            enable_debug_privilege(),
-            "SeDebugPrivilege could not be enabled"
-        );
+        // Attaching to WUDFHost (LocalService) needs it even from an elevated console.
+        pf_frame::privilege::enable("SeDebugPrivilege").expect("enable SeDebugPrivilege");
         let attached = Arc::new(AtomicBool::new(false));
         let freezer = freeze_for(pid, hold, attached.clone());
         let t_freeze = Instant::now();
