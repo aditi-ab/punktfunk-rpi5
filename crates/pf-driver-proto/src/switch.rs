@@ -27,32 +27,9 @@ pub static RDESC: [u8; 203] = [
     0x85, 0x82, 0x09, 0x06, 0x75, 0x08, 0x95, 0x3F, 0x91, 0x83, 0xC0,
 ];
 
-/// Vendor Feature report `0x85`, 63 bytes: the sealed channel's proof transport. Every
-/// global it uses is restated, so it cannot shift a report above it.
-#[rustfmt::skip]
-const PROOF_ITEMS: [u8; 18] = [
-    0x06, 0x00, 0xFF, 0x85, 0x85, 0x09, 0x2D, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95,
-    0x3F, 0xB1, 0x02,
-];
-
-/// What the Windows driver serves: [`RDESC`] with [`PROOF_ITEMS`] before its closing
-/// `End Collection`. Without the feature report hidclass refuses the host's channel proof and
-/// the pad serves neutral forever. The Linux UHID pad has no channel and serves [`RDESC`].
-pub static RDESC_WITH_PROOF: [u8; 221] = {
-    let mut out = [0u8; 221];
-    let mut i = 0;
-    while i < out.len() {
-        out[i] = if i < 202 {
-            RDESC[i]
-        } else if i < 220 {
-            PROOF_ITEMS[i - 202]
-        } else {
-            RDESC[202]
-        };
-        i += 1;
-    }
-    out
-};
+/// What the Windows driver serves: [`RDESC`] with the channel-proof feature
+/// ([`crate::gamepad::with_proof`]). The Linux UHID pad has no channel and serves [`RDESC`].
+pub static RDESC_WITH_PROOF: [u8; 221] = crate::gamepad::with_proof(&RDESC);
 
 /// Every USB input report, id included. `hid-nintendo` rejects a `0x21` under 49 bytes.
 pub const REPORT_LEN: usize = 64;

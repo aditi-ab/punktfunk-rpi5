@@ -463,13 +463,13 @@ pub const PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2: u32 = 9;
 pub const PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2_PUCK: u32 = 10;
 /// Xbox Elite identity. Linux hosts carry the paddles; Windows hosts drop them.
 pub const PUNKTFUNK_GAMEPAD_XBOXELITE: u32 = 11;
-/// 8BitDo Ultimate 2 Wireless (`2DC8:6012`): L4/R4, back paddles, gyro. Linux hosts.
+/// 8BitDo Ultimate 2 Wireless (`2DC8:6012`): L4/R4, back paddles, gyro.
 pub const PUNKTFUNK_GAMEPAD_8BITDO_ULTIMATE2: u32 = 12;
-/// 8BitDo Pro 2 (`2DC8:6003`): back paddles, gyro. Linux hosts.
+/// 8BitDo Pro 2 (`2DC8:6003`): back paddles, gyro.
 pub const PUNKTFUNK_GAMEPAD_8BITDO_PRO2: u32 = 13;
-/// 8BitDo Pro 3 (`2DC8:6009`): L4/R4, back paddles, gyro. Linux hosts.
+/// 8BitDo Pro 3 (`2DC8:6009`): L4/R4, back paddles, gyro.
 pub const PUNKTFUNK_GAMEPAD_8BITDO_PRO3: u32 = 14;
-/// Wireless HORIPAD for Steam (`0F0D:01AB`): rear buttons, gyro. Linux hosts.
+/// Wireless HORIPAD for Steam (`0F0D:01AB`): rear buttons, gyro.
 pub const PUNKTFUNK_GAMEPAD_HORIPAD_STEAM: u32 = 15;
 
 /// Extended `InputEvent` gamepad button bits: four back grips (Steam L4/L5/R4/R5 ≙

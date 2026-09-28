@@ -53,6 +53,7 @@ impl TritonWinPad {
                 // Single-interface wired Triton — no MI_ token; SDL claims 0x1302 on
                 // VID/PID only. If Steam balks, A/B `Some(0)` (Deck needed `Some(2)`).
                 usb_mi: None,
+                bluetooth: false,
                 description: "Punktfunk Virtual Steam Controller",
                 enumerator: "punktfunk",
             },

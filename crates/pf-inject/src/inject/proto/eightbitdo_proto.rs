@@ -1,24 +1,23 @@
 //! 8BitDo pads in their own HID mode (VID `2DC8`): the input report SDL's and Steam's `8bitdo`
-//! driver parse, its rumble output, and the feature they read at init. Shared by Linux UHID
-//! and Windows UMDF.
+//! driver parse and its rumble output. Identities, descriptors and the capability feature are
+//! [`pf_driver_proto::eightbitdo`]'s. Shared by Linux UHID and Windows UMDF.
 //!
 //! Report `0x01`, [`REPORT_LEN`] bytes: hat (`0x0F` = centre), four sticks and two triggers as
 //! `u8` (sticks centre `0x7F`), three button bytes, battery, accel then gyro as LE `i16`
 //! (4096 LSB/g, ±2000 °/s full scale), and a µs IMU clock on the models that declare one.
 //! Offsets follow `SDL_hidapi_8bitdo.c`; `tests/motion_contract.rs` pins the units.
 
+use pf_driver_proto::eightbitdo as wire;
+pub use pf_driver_proto::eightbitdo::{
+    caps_reply, FEATURE_CAPS, REPORT_ID, REPORT_LEN, RUMBLE_ID, VENDOR,
+};
+use pf_driver_proto::gamepad::{
+    identity_vid_pid, report_period_us, DEVTYPE_8BITDO_PRO2, DEVTYPE_8BITDO_PRO3,
+    DEVTYPE_8BITDO_ULTIMATE2,
+};
 use punktfunk_core::input::{gamepad as gs, GamepadFrame};
 use punktfunk_core::quic::RichInput;
 use std::time::Duration;
-
-pub const VENDOR: u16 = 0x2DC8;
-pub const REPORT_ID: u8 = 0x01;
-pub const REPORT_LEN: usize = 34;
-/// Output `[0x05, low, high, left trigger, right trigger]`, motors as `u8`.
-pub const RUMBLE_ID: u8 = 0x05;
-/// Read by SDL from the Pro 2 and Pro 3 at init. Any reply turns on gyro, rumble and battery;
-/// byte 13 = `0xAA` declares the IMU clock at bytes 27–30.
-pub const FEATURE_CAPS: u8 = 0x06;
 
 const ACCEL_LSB_PER_G: i32 = 4096;
 /// `INT16_MAX` is 2000 °/s.
@@ -60,11 +59,19 @@ pub enum Model {
 }
 
 impl Model {
-    pub const fn product(self) -> u16 {
+    /// The driver's identity for this model; product id, descriptor and clock follow from it.
+    pub const fn devtype(self) -> u8 {
         match self {
-            Model::Ultimate2 => 0x6012,
-            Model::Pro2 => 0x6003,
-            Model::Pro3 => 0x6009,
+            Model::Ultimate2 => DEVTYPE_8BITDO_ULTIMATE2,
+            Model::Pro2 => DEVTYPE_8BITDO_PRO2,
+            Model::Pro3 => DEVTYPE_8BITDO_PRO3,
+        }
+    }
+
+    pub const fn product(self) -> u16 {
+        match identity_vid_pid(self.devtype()) {
+            Some((_, pid)) => pid,
+            None => 0,
         }
     }
 
@@ -84,15 +91,16 @@ impl Model {
 
     /// Pro 2 and Pro 3 answer [`FEATURE_CAPS`] and carry the IMU clock.
     pub const fn timestamps(self) -> bool {
-        !matches!(self, Model::Ultimate2)
+        wire::has_caps(self.devtype())
     }
 
-    /// Fixed report rate for a model without the IMU clock: SDL stamps each sample
-    /// 1/120 s apart over Bluetooth, whatever the arrival rate.
+    /// Fixed report rate for a model without the IMU clock: SDL stamps each sample one step
+    /// apart whatever the arrival rate, so it gets the driver's period.
     pub const fn report_period(self) -> Option<Duration> {
-        match self {
-            Model::Ultimate2 => Some(Duration::from_micros(8_333)),
-            Model::Pro2 | Model::Pro3 => None,
+        if self.timestamps() {
+            None
+        } else {
+            Some(Duration::from_micros(report_period_us(self.devtype())))
         }
     }
 
@@ -116,58 +124,11 @@ impl Model {
         }
     }
 
-    /// Descriptor: Game Pad collection, report `0x01` in, `0x05` out, and `0x06` feature on the
-    /// models that answer one. Report sizes are what SDL and hidclass hold the reports to.
+    /// The UHID descriptor; the Windows driver serves the same with its channel feature.
     pub fn rdesc(self) -> &'static [u8] {
-        if self.timestamps() {
-            RDESC_WITH_CAPS
-        } else {
-            RDESC
-        }
+        wire::rdesc(self.devtype(), false)
     }
 }
-
-macro_rules! rdesc_body {
-    ($($tail:expr),*) => {
-        [
-            0x05, 0x01, // Usage Page (Generic Desktop)
-            0x09, 0x05, // Usage (Game Pad)
-            0xA1, 0x01, // Collection (Application)
-            0x85, 0x01, //   Report ID (1)
-            0x09, 0x39, //   Usage (Hat switch)
-            0x15, 0x00, //   Logical Minimum (0)
-            0x25, 0x07, //   Logical Maximum (7)
-            0x35, 0x00, //   Physical Minimum (0)
-            0x46, 0x3B, 0x01, // Physical Maximum (315)
-            0x65, 0x14, //   Unit (degrees)
-            0x75, 0x04, //   Report Size (4)
-            0x95, 0x01, //   Report Count (1)
-            0x81, 0x42, //   Input (Data,Var,Abs,Null)
-            0x65, 0x00, //   Unit (None)
-            0x81, 0x03, //   Input (Const) — hat byte's high nibble
-            0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35, // X, Y, Z, Rz
-            0x15, 0x00, 0x26, 0xFF, 0x00, // Logical 0..255
-            0x35, 0x00, 0x46, 0xFF, 0x00, // Physical 0..255
-            0x75, 0x08, 0x95, 0x04, 0x81, 0x02, // 4 × u8
-            0x05, 0x02, // Usage Page (Simulation Controls)
-            0x09, 0xC4, 0x09, 0xC5, // Accelerator (RT), Brake (LT)
-            0x95, 0x02, 0x81, 0x02, // 2 × u8
-            0x05, 0x09, // Usage Page (Button)
-            0x19, 0x01, 0x29, 0x18, // Buttons 1..24
-            0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x18, 0x81, 0x02,
-            0x06, 0x00, 0xFF, // Usage Page (Vendor 0xFF00)
-            0x09, 0x20, 0x15, 0x00, 0x26, 0xFF, 0x00,
-            0x75, 0x08, 0x95, 0x17, 0x81, 0x02, // battery, IMU, clock: 23 bytes
-            0x85, 0x05, 0x09, 0x21, 0x95, 0x04, 0x91, 0x02, // Output 0x05: 4 bytes
-            $($tail,)*
-            0xC0,
-        ]
-    };
-}
-
-static RDESC: &[u8] = &rdesc_body!();
-/// Feature `0x06`: 13 bytes after the id, as SDL reads them.
-static RDESC_WITH_CAPS: &[u8] = &rdesc_body!(0x85, 0x06, 0x09, 0x22, 0x95, 0x0D, 0xB1, 0x02);
 
 /// One pad's report state. Motion is raw driver units, driver axis order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -348,16 +309,6 @@ pub fn parse_rumble(data: &[u8]) -> Option<(u16, u16)> {
     }
 }
 
-/// [`FEATURE_CAPS`] reply. SDL takes bytes 5–10 as the serial (printed high byte first), so
-/// the pad index makes each one distinct; `0xAA` at 13 declares the IMU clock.
-pub fn caps_reply(pad: u8) -> [u8; 14] {
-    let mut r = [0u8; 14];
-    r[0] = FEATURE_CAPS;
-    r[5..11].copy_from_slice(&[pad, 0x00, 0x42, 0x38, 0x46, 0x50]);
-    r[13] = 0xAA;
-    r
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,7 +417,7 @@ mod tests {
             Some((0xFFFF, 0x8080))
         );
         assert_eq!(parse_rumble(&[0x04, 1, 2]), None);
-        let c = caps_reply(3);
+        let c = caps_reply(Model::Pro2.devtype(), 3);
         assert_eq!((c[0], c[10], c[13]), (FEATURE_CAPS, 0x50, 0xAA));
     }
 
@@ -494,7 +445,7 @@ mod tests {
             assert_eq!(payload_len(d, OUTPUT, RUMBLE_ID), 4);
         }
         let caps = payload_len(Model::Pro2.rdesc(), FEATURE, FEATURE_CAPS);
-        assert_eq!(caps + 1, caps_reply(0).len());
+        assert_eq!(caps + 1, caps_reply(Model::Pro2.devtype(), 0).len());
         assert_eq!(
             payload_len(Model::Ultimate2.rdesc(), FEATURE, FEATURE_CAPS),
             0

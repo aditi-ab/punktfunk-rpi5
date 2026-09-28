@@ -39,6 +39,7 @@ impl SwitchWinPad {
                 usb_vid_pid: Some("VID_057E&PID_2009"),
                 // A wired Pro Controller is a single-interface HID device.
                 usb_mi: None,
+                bluetooth: false,
                 description: "Punktfunk Virtual Pro Controller",
                 enumerator: "VID_057E&PID_2009",
             },

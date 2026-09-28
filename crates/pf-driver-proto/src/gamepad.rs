@@ -45,6 +45,15 @@ pub const DEVTYPE_TRITON: u8 = 7;
 /// A driver package without the `pf_switchpro` model line never binds the devnode, so the
 /// type needs no protocol bump.
 pub const DEVTYPE_SWITCH_PRO: u8 = 8;
+/// 8BitDo Ultimate 2 Wireless in its own HID mode (`VID_2DC8&PID_6012`), a Bluetooth identity:
+/// no IMU clock, so SDL spaces its samples 1/120 s apart ([`report_period_us`]).
+pub const DEVTYPE_8BITDO_ULTIMATE2: u8 = 9;
+/// 8BitDo Pro 2 (`VID_2DC8&PID_6003`): feature `0x06` and a µs IMU clock ([`crate::eightbitdo`]).
+pub const DEVTYPE_8BITDO_PRO2: u8 = 10;
+/// 8BitDo Pro 3 (`VID_2DC8&PID_6009`), as the Pro 2.
+pub const DEVTYPE_8BITDO_PRO3: u8 = 11;
+/// Wireless HORIPAD for Steam, wired (`VID_0F0D&PID_01AB`) ([`crate::hori`]).
+pub const DEVTYPE_HORIPAD_STEAM: u8 = 12;
 
 /// Written into the section's `driver_proto` on attach. The section starts zeroed, so `0`
 /// means no driver has attached. Bump on a gamepad-layout change.
@@ -58,8 +67,9 @@ pub const GAMEPAD_PROTO_VERSION: u32 = 3;
 /// only moves when the layout breaks, so a driver with old behaviour still attaches; the host
 /// compares this instead and flags an older driver. Bump it with any driver change a game or
 /// the host depends on. `1`: devnode-index serials, Deck packet numbers, refused unknown ids.
-/// `2`: Share on the Series Xbox pad. `3`: the Switch Pro identity.
-pub const GAMEPAD_DRIVER_REV: u32 = 3;
+/// `2`: Share on the Series Xbox pad. `3`: the Switch Pro identity. `4`: the 8BitDo and
+/// HORIPAD identities.
+pub const GAMEPAD_DRIVER_REV: u32 = 4;
 
 // Channel proof: who to hand the DATA section to. Do not take the duplication target from
 // the mailbox's `driver_pid` — LocalService can spawn a world-executable WUDFHost and publish
@@ -442,6 +452,36 @@ const _: () = {
     assert!(offset_of!(PadBootstrap, handle_seq) == 28);
 };
 
+/// Vendor Feature report `0x85`, 63 bytes: the sealed channel's proof transport. Every global it
+/// uses is restated, so it cannot shift a report above it.
+#[rustfmt::skip]
+pub const PROOF_ITEMS: [u8; 18] = [
+    0x06, 0x00, 0xFF, 0x85, 0x85, 0x09, 0x2D, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95,
+    0x3F, 0xB1, 0x02,
+];
+
+/// `rdesc` with [`PROOF_ITEMS`] before its closing `End Collection`: what the Windows driver
+/// serves for an identity whose own descriptor has no feature `0x85`. Without it hidclass
+/// refuses the host's channel proof and the pad serves neutral forever. `N` is `rdesc.len() + 18`.
+pub const fn with_proof<const N: usize>(rdesc: &[u8]) -> [u8; N] {
+    assert!(N == rdesc.len() + PROOF_ITEMS.len());
+    let body = rdesc.len() - 1;
+    assert!(rdesc[body] == 0xC0);
+    let mut out = [0u8; N];
+    let mut i = 0;
+    while i < N {
+        out[i] = if i < body {
+            rdesc[i]
+        } else if i < body + PROOF_ITEMS.len() {
+            PROOF_ITEMS[i - body]
+        } else {
+            0xC0
+        };
+        i += 1;
+    }
+    out
+}
+
 /// How often a real pad on USB sends an input report: `DualSense`, DualShock 4 and the Deck
 /// (its 4 ms connection interval) alike.
 ///
@@ -458,6 +498,8 @@ pub const REPORT_PERIOD_US: u64 = 4_000;
 pub const fn report_period_us(device_type: u8) -> u64 {
     match device_type {
         DEVTYPE_SWITCH_PRO => 8_000,
+        // SDL's fixed step for this pad over Bluetooth; it carries no clock to correct it.
+        DEVTYPE_8BITDO_ULTIMATE2 => 8_333,
         _ => REPORT_PERIOD_US,
     }
 }
@@ -525,6 +567,16 @@ pub fn stamp_report_clock(
             report[1] = serial as u8;
             true
         }
+        // The µs IMU clock the Pro models declare in feature `0x06`.
+        DEVTYPE_8BITDO_PRO2 | DEVTYPE_8BITDO_PRO3 => {
+            report[27..31].copy_from_slice(&(elapsed_us as u32).to_le_bytes());
+            true
+        }
+        // A u16 µs clock SDL reads and then replaces with its own fixed step.
+        DEVTYPE_HORIPAD_STEAM => {
+            report[10..12].copy_from_slice(&(elapsed_us as u16).to_le_bytes());
+            true
+        }
         _ => false,
     }
 }
@@ -563,6 +615,16 @@ pub fn pad_serial(device_type: u8, index: u8) -> String {
             .iter()
             .map(|b| alloc::format!("{b:02X}"))
             .collect(),
+        DEVTYPE_8BITDO_ULTIMATE2 | DEVTYPE_8BITDO_PRO2 | DEVTYPE_8BITDO_PRO3 => {
+            crate::eightbitdo::mac(device_type, index)
+                .iter()
+                .map(|b| alloc::format!("{b:02X}"))
+                .collect()
+        }
+        DEVTYPE_HORIPAD_STEAM => crate::hori::serial(index)
+            .iter()
+            .map(|b| alloc::format!("{b:02X}"))
+            .collect(),
         _ => alloc::format!("35533AD6E7{low:02X}"),
     }
 }
@@ -571,8 +633,12 @@ pub fn pad_serial(device_type: u8, index: u8) -> String {
 /// each names. A token that prefixes another comes after it (`pf_dualsense` after
 /// `pf_dualsenseedge`), so the first match is the right one. Windows Server has no
 /// `xinputhid`, so every Xbox kind binds `pf_xbox_nofilter`; the section fixes the PID.
-pub const HWID_DEVTYPES: [(&str, u8); 10] = [
+pub const HWID_DEVTYPES: [(&str, u8); 14] = [
     ("pf_switchpro", DEVTYPE_SWITCH_PRO),
+    ("pf_8bitdo_ultimate2", DEVTYPE_8BITDO_ULTIMATE2),
+    ("pf_8bitdo_pro2", DEVTYPE_8BITDO_PRO2),
+    ("pf_8bitdo_pro3", DEVTYPE_8BITDO_PRO3),
+    ("pf_horipad_steam", DEVTYPE_HORIPAD_STEAM),
     ("pf_xbox_nofilter", DEVTYPE_XBOX),
     ("pf_xboxwireless", DEVTYPE_XBOX),
     ("pf_xboxones", DEVTYPE_XBOX_ONE_S),
@@ -606,6 +672,10 @@ pub const fn identity_vid_pid(device_type: u8) -> Option<(u16, u16)> {
         DEVTYPE_XBOX_ELITE => (0x045E, 0x0B22),
         DEVTYPE_TRITON => (0x28DE, 0x1302),
         DEVTYPE_SWITCH_PRO => (0x057E, 0x2009),
+        DEVTYPE_8BITDO_ULTIMATE2 => (0x2DC8, 0x6012),
+        DEVTYPE_8BITDO_PRO2 => (0x2DC8, 0x6003),
+        DEVTYPE_8BITDO_PRO3 => (0x2DC8, 0x6009),
+        DEVTYPE_HORIPAD_STEAM => (0x0F0D, 0x01AB),
         _ => return None,
     })
 }
@@ -695,7 +765,7 @@ mod tests {
     #[test]
     fn no_two_pads_share_a_serial() {
         let mut seen = std::collections::HashMap::new();
-        for devtype in DEVTYPE_DUALSENSE..=DEVTYPE_SWITCH_PRO {
+        for devtype in DEVTYPE_DUALSENSE..=DEVTYPE_HORIPAD_STEAM {
             for index in 0..16u8 {
                 let serial = pad_serial(devtype, index);
                 if let Some(prev) = seen.insert(serial.clone(), (devtype, index)) {
@@ -743,7 +813,7 @@ mod tests {
         );
         assert_eq!(devtype_from_hwids("usb\\vid_054c&pid_0ce6"), None);
         assert_eq!(devtype_from_hwids(""), None, "a failed property query");
-        assert_eq!(identity_vid_pid(DEVTYPE_SWITCH_PRO + 1), None);
+        assert_eq!(identity_vid_pid(DEVTYPE_HORIPAD_STEAM + 1), None);
         assert_eq!(
             identity_vid_pid(DEVTYPE_DUALSENSE_EDGE),
             Some((0x054C, 0x0DF2))
@@ -780,6 +850,29 @@ mod tests {
             "a Switch slot waits 8 ms"
         );
         assert_eq!(report_period_us(DEVTYPE_DUALSENSE), p);
+        assert_eq!(
+            report_period_us(DEVTYPE_8BITDO_ULTIMATE2),
+            8_333,
+            "SDL's Bluetooth step"
+        );
+    }
+
+    /// The Pro models' µs clock and the HORIPAD's u16 one advance with real time.
+    #[test]
+    fn eightbitdo_and_hori_clocks() {
+        let mut r = [0u8; 64];
+        assert!(stamp_report_clock(DEVTYPE_8BITDO_PRO2, &mut r, 0, 70_000));
+        assert_eq!(u32::from_le_bytes(r[27..31].try_into().unwrap()), 70_000);
+        let mut u2 = [0u8; 64];
+        assert!(!stamp_report_clock(
+            DEVTYPE_8BITDO_ULTIMATE2,
+            &mut u2,
+            0,
+            70_000
+        ));
+        let mut h = [0u8; 64];
+        assert!(stamp_report_clock(DEVTYPE_HORIPAD_STEAM, &mut h, 0, 70_000));
+        assert_eq!(u16::from_le_bytes([h[10], h[11]]), 70_000u32 as u16);
     }
 
     #[test]

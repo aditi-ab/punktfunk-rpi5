@@ -1,6 +1,6 @@
 //! Wireless HORIPAD for Steam (`0F0D:01AB`, wired identity): the report SDL's and Steam's
-//! `steam_hori` driver parse. No output reports: the pad has no rumble. Shared by Linux UHID
-//! and Windows UMDF.
+//! `steam_hori` driver parse. No output reports: the pad has no rumble. Identity, descriptor
+//! and serial are [`pf_driver_proto::hori`]'s. Shared by Linux UHID and Windows UMDF.
 //!
 //! Report `0x07`, [`REPORT_LEN`] bytes: four sticks (`0x80` = centre), the hat in the low nibble
 //! of byte 5 with face buttons above it, two more button bytes, triggers, a u16 clock SDL does
@@ -11,13 +11,11 @@ use punktfunk_core::input::{gamepad as gs, GamepadFrame};
 use punktfunk_core::quic::RichInput;
 use std::time::Duration;
 
-pub const VENDOR: u16 = 0x0F0D;
-pub const PRODUCT: u16 = 0x01AB;
-pub const NAME: &str = "Wireless HORIPAD For Steam";
-pub const REPORT_ID: u8 = 0x07;
-pub const REPORT_LEN: usize = 64;
-/// SDL stamps a wired pad's samples 4 ms apart whatever the clock bytes say.
-pub const REPORT_PERIOD: Duration = Duration::from_millis(4);
+pub use pf_driver_proto::hori::{serial, NAME, PRODUCT, RDESC, REPORT_ID, REPORT_LEN, VENDOR};
+/// SDL stamps a wired pad's samples 4 ms apart whatever the clock bytes say: the driver's period.
+pub const REPORT_PERIOD: Duration = Duration::from_micros(
+    pf_driver_proto::gamepad::report_period_us(pf_driver_proto::gamepad::DEVTYPE_HORIPAD_STEAM),
+);
 
 /// 16 LSB per °/s: `INT16_MAX` is 2048 °/s.
 const GYRO_LSB_PER_DEG_S: i32 = 16;
@@ -43,32 +41,6 @@ const BUTTONS: [(u32, usize, u8); 16] = [
     (gs::BTN_PADDLE3, 7, 0x08), // M2
     (gs::BTN_PADDLE2, 7, 0x40), // FR
     (gs::BTN_PADDLE1, 7, 0x80), // FL
-];
-
-/// Game Pad collection, input `0x07` of [`REPORT_LEN`] − 1 bytes.
-pub static RDESC: &[u8] = &[
-    0x05, 0x01, // Usage Page (Generic Desktop)
-    0x09, 0x05, // Usage (Game Pad)
-    0xA1, 0x01, // Collection (Application)
-    0x85, 0x07, //   Report ID (7)
-    0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35, // X, Y, Z, Rz
-    0x15, 0x00, 0x26, 0xFF, 0x00, // Logical 0..255
-    0x75, 0x08, 0x95, 0x04, 0x81, 0x02, // 4 × u8
-    0x09, 0x39, // Usage (Hat switch)
-    0x15, 0x00, 0x25, 0x07, // Logical 0..7
-    0x35, 0x00, 0x46, 0x3B, 0x01, // Physical 0..315
-    0x65, 0x14, // Unit (degrees)
-    0x75, 0x04, 0x95, 0x01, 0x81, 0x42, // Input (Data,Var,Abs,Null)
-    0x65, 0x00, // Unit (None)
-    0x05, 0x09, // Usage Page (Button)
-    0x19, 0x01, 0x29, 0x14, // Buttons 1..20
-    0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x14, 0x81, 0x02, 0x05,
-    0x02, // Usage Page (Simulation Controls)
-    0x09, 0xC4, 0x09, 0xC5, // Accelerator (RT), Brake (LT)
-    0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x02, 0x81, 0x02, 0x06, 0x00,
-    0xFF, // Usage Page (Vendor 0xFF00)
-    0x09, 0x20, 0x95, 0x36, 0x81, 0x02, // clock, IMU, battery, serial: 54 bytes
-    0xC0,
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,11 +158,6 @@ fn stick(v: i32) -> u8 {
     ((v.clamp(-32768, 32767) + 32768) * 255 + 32767).div_euclid(65535) as u8
 }
 
-/// Per-pad serial, printed by SDL in byte order.
-pub fn serial(pad: u8) -> [u8; 6] {
-    [0x50, 0x46, 0x48, 0x52, 0x00, pad]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,7 +228,7 @@ mod tests {
     #[test]
     fn descriptor_declares_the_report() {
         use crate::rdesc_walk::{payload_len, INPUT, OUTPUT};
-        assert_eq!(payload_len(RDESC, INPUT, REPORT_ID) + 1, REPORT_LEN);
-        assert_eq!(payload_len(RDESC, OUTPUT, REPORT_ID), 0);
+        assert_eq!(payload_len(&RDESC, INPUT, REPORT_ID) + 1, REPORT_LEN);
+        assert_eq!(payload_len(&RDESC, OUTPUT, REPORT_ID), 0);
     }
 }

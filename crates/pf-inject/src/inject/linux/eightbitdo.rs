@@ -91,7 +91,8 @@ impl PadProto for EightBitDoProto {
 
     /// Rumble on 0xCA; the Pro models' capability feature answered from [`caps_reply`].
     fn service(&self, pad: &mut EightBitDoPad, idx: u8) -> PadFeedback {
-        let answers_caps = self.model.timestamps();
+        let model = self.model;
+        let answers_caps = model.timestamps();
         let mut rumble = None;
         pad.dev.poll(|dev, ev| match ev {
             UhidEvent::Output(data) => {
@@ -100,7 +101,7 @@ impl PadProto for EightBitDoProto {
                 }
             }
             UhidEvent::GetReport { id, rnum } => {
-                let caps = caps_reply(idx);
+                let caps = caps_reply(model.devtype(), idx);
                 let data = (answers_caps && rnum == FEATURE_CAPS).then_some(&caps[..]);
                 let _ = dev.reply_get_report(id, data);
             }

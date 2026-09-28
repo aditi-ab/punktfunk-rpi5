@@ -708,6 +708,10 @@ pub mod eightbitdo;
 /// 8BitDo HID-mode codec. Not cfg-gated: pure byte-packing, so layout tests run on any host.
 #[path = "inject/proto/eightbitdo_proto.rs"]
 pub mod eightbitdo_proto;
+/// Virtual 8BitDo pads via UMDF + shm (device types 9–11).
+#[cfg(target_os = "windows")]
+#[path = "inject/windows/eightbitdo_windows.rs"]
+pub mod eightbitdo_windows;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/gamepad.rs"]
 pub mod gamepad;
@@ -727,6 +731,10 @@ pub mod hori_proto;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/hori_steam.rs"]
 pub mod hori_steam;
+/// Virtual HORIPAD for Steam via UMDF + shm (device type 12).
+#[cfg(target_os = "windows")]
+#[path = "inject/windows/hori_windows.rs"]
+pub mod hori_windows;
 /// Resident virtual HID mouse via pf-mouse UMDF. Keeps `SM_MOUSEPRESENT` true on headless
 /// hosts so DWM composites a cursor into the IDD frame — `SendInput` alone moves an
 /// invisible pointer with no physical mouse.

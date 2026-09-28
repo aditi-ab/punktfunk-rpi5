@@ -26,7 +26,7 @@ impl HoriPad {
             name: NAME,
             phys: &format!("punktfunk/horipad/{index}"),
             uniq: &format!("punktfunk-horipad-{index}"),
-            rdesc: RDESC,
+            rdesc: &RDESC,
             vendor: VENDOR as u32,
             product: PRODUCT as u32,
             version: 0x0100,

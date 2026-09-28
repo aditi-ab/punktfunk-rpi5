@@ -738,12 +738,26 @@ pub(super) struct SwDeviceProfile<'a> {
     /// tokens into the HID child; hidapi/SDL/Steam parse `MI_` as `bInterfaceNumber` (0 if
     /// absent). The Steam Deck controller lives on interface 2.
     pub usb_mi: Option<u8>,
+    /// Present as a classic-Bluetooth HID pad: `BTHENUM\` hardware and compatible ids built from
+    /// `usb_vid_pid` instead of `USB\` ones. SDL and Steam read the bus from the compatible ids.
+    pub bluetooth: bool,
     pub description: &'a str,
     /// The `SWD\<enumerator>\<instance>` namespace. hidclass names the HID child after it, so a
     /// pad Steam must recognise carries its VID/PID here (`VID_054C&PID_0CE6&MI_03`,
     /// `VID_045E&PID_0B13`): Steam merges a pad's views by that token in the path, and under
     /// `punktfunk` it listed the same pad twice.
     pub enumerator: &'a str,
+}
+
+/// The Bluetooth HID service every classic-Bluetooth pad enumerates under.
+const BTH_HID_SERVICE: &str = "BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}";
+
+/// `VID_2DC8&PID_6012` → the hardware id Windows gives that pad over Bluetooth,
+/// `BTHENUM\{00001124-…}_VID&00022DC8_PID&6012` (`0002`: a USB-IF vendor id).
+fn bthenum_id(vid_pid: &str) -> String {
+    let vid = vid_pid.get(4..8).unwrap_or("0000");
+    let pid = vid_pid.get(13..17).unwrap_or("0000");
+    format!("{BTH_HID_SERVICE}_VID&0002{vid}_PID&{pid}")
 }
 
 /// Spawn a virtual devnode under `p.enumerator` and return it with its PnP instance id.
@@ -768,6 +782,12 @@ pub(super) fn create_swdevice(p: &SwDeviceProfile) -> Result<(SwDevice, Option<S
             .collect()
     };
     let (hwids, compat) = match p.usb_vid_pid {
+        Some(vid_pid) if p.bluetooth => {
+            let bth = bthenum_id(vid_pid);
+            // A `BTHENUM\` token and no `USB` one → native bus-type detection resolves Bluetooth.
+            let compat = multi_sz(&[&bth, BTH_HID_SERVICE]);
+            (multi_sz(&[p.hwid, &bth]), Some(compat))
+        }
         Some(vid_pid) => {
             let mi = p.usb_mi.map(|n| format!("&MI_{n:02}")).unwrap_or_default();
             let usb_rev = format!("USB\\{vid_pid}&REV_0100{mi}");
@@ -1184,6 +1204,22 @@ fn cm_problem_hint(problem: u32) -> &'static str {
         43 => "reported failure after start — check the driver log",
         52 => "driver signature rejected — certificate not in Root/TrustedPublisher, or blocked by Memory Integrity",
         _ => "see Device Manager for this code",
+    }
+}
+
+#[cfg(test)]
+mod bthenum_tests {
+    use super::*;
+
+    /// hidapi reports Bluetooth for a `BTHENUM` compatible id, and USB for any id that says `USB`.
+    #[test]
+    fn bluetooth_ids_name_the_pad_and_never_usb() {
+        let id = bthenum_id("VID_2DC8&PID_6012");
+        assert_eq!(
+            id,
+            "BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}_VID&00022DC8_PID&6012"
+        );
+        assert!(!id.to_ascii_uppercase().contains("USB"));
     }
 }
 

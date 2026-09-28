@@ -169,7 +169,8 @@ pub enum GamepadPref {
     /// (`design/xbox-pad-windows-handoff.md`).
     XboxElite,
     /// 8BitDo Ultimate 2 Wireless in its own mode (`2DC8:6012`, Bluetooth identity): L4/R4 and
-    /// both back paddles, gyro. SDL's and Steam's `8bitdo` driver read it; Linux UHID.
+    /// both back paddles, gyro, read by SDL's and Steam's `8bitdo` driver. Linux UHID, Windows
+    /// UMDF, as the three kinds below.
     EightBitDoUltimate2,
     /// 8BitDo Pro 2 in D-input (`2DC8:6003`): two back paddles, gyro.
     EightBitDoPro2,
