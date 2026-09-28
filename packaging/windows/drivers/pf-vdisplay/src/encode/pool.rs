@@ -68,6 +68,8 @@ pub enum Offer {
     Taken(u64, Option<u64>),
     /// Counted; the new drop total.
     Dropped(u64),
+    /// Bypass with no encode thread reading: nothing kept, nothing counted, nothing to hold for.
+    Unread,
     /// Not this pool's surface — nothing counted. Carries what arrived against what the pool
     /// was built for, because the three reasons are indistinguishable from the outside and a
     /// stuck session shows only this line.
@@ -214,6 +216,11 @@ impl Pool {
         let mut st = lock(&self.state);
         let mut recycled = None;
         let i = if self.bypass {
+            // Between sessions nobody gives a surface back, and the worker would wait out
+            // the whole hold on every frame the desktop composes.
+            if !st.live {
+                return Offer::Unread;
+            }
             // A surface still held means the previous access unit is not out; this frame is
             // dropped rather than queued behind it, so the hold below is never nested.
             if st.held.is_some() {
@@ -535,6 +542,7 @@ impl Attached {
                     );
                 }
             }
+            Offer::Unread => {}
             Offer::Taken(seq, recycled) => {
                 held = pool.bypass();
                 if let Some(s) = session {
