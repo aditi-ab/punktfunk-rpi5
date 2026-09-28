@@ -595,9 +595,14 @@ impl Presenter {
     /// a swapchain on it.
     #[cfg(target_os = "linux")]
     fn resume_swapchain(&mut self, window: &sdl3::video::Window) -> anyhow::Result<()> {
-        // The lane's surface objects go first: the swapchain makes its own.
+        // The lane's surface objects go first: the swapchain makes its own. A retired lane
+        // never takes the window again, so its exported images go back too.
         if let Some(lane) = self.native.as_mut() {
             lane.release_window();
+            if lane.is_dead() {
+                self.export_ring = None;
+                self.overlay_ring = None;
+            }
         }
         // SAFETY: CREATE — `instance` is live; SDL returns a surface we own and destroy.
         let surface = unsafe { window.vulkan_create_surface(self.instance.handle()) }
@@ -873,6 +878,8 @@ impl Presenter {
         };
         if (0..ring.len()).any(|i| lane.slot_state(ring.key(i)) == SlotState::Failed) {
             lane.refused(fourcc, ring.modifier);
+            // The lane is retired for the session: its exported images go back.
+            self.export_ring = None;
             return RingSlot::Decline;
         }
         let Some(slot) = ring.free_slot(|k| lane.slot_state(k) == SlotState::Free) else {
@@ -956,8 +963,12 @@ impl Presenter {
         };
         let fourcc = export_ring::overlay_fourcc(o.format);
         let shape = (o.format, o.width, o.height, lane.feedback_generation());
-        self.overlay_blocks_native =
-            !lane.overlay_supported() || fourcc.is_none() || self.overlay_refused == Some(shape);
+        // Until the lane has shown the compositor scans it out, an overlay goes through the
+        // swapchain: drawn into its buffer, the frame can still be scanned out.
+        self.overlay_blocks_native = !lane.scans_out()
+            || !lane.overlay_supported()
+            || fourcc.is_none()
+            || self.overlay_refused == Some(shape);
         if self.overlay_blocks_native || !self.native_last {
             lane.overlay_hide();
             self.overlay_shown = None;

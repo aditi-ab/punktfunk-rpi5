@@ -924,7 +924,8 @@ pub fn amd_vulkan_hdr_driver_notice(
 }
 
 /// `PUNKTFUNK_NATIVE_SCANOUT=1`: the Wayland presenter hands pictures to the compositor as
-/// the window's buffer, so the Vulkan decoder keeps its pictures copyable.
+/// the window's buffer, so the Vulkan decoder keeps its pictures copyable. Opt-in: KWin
+/// composites the buffer, where the swapchain's own can be scanned out.
 pub fn native_scanout_wanted() -> bool {
     cfg!(target_os = "linux")
         && matches!(
