@@ -269,6 +269,9 @@ object NativeBridge {
         lowLatencyMode: Boolean,
         lowLatencyFeature: Boolean,
         isTv: Boolean,
+        /** ChromeOS (`org.chromium.arc`): present through [surface] itself, never an
+         *  ASurfaceControl child layer, which ARC accepts but Chrome can leave undrawn. */
+        chromeOs: Boolean,
         presentPriority: Int,
         smoothBuffer: Int,
         /** The display mode's own refresh rate (0 = unknown) — the latch grid the presenter

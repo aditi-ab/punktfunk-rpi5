@@ -6,7 +6,8 @@
 //! `AImageReader` and each frame is composited onto an `ASurfaceControl` layer via a transaction
 //! carrying a desired present time, scheduling against the panel's real present clock. The
 //! **SurfaceView** presenter — `releaseOutputBufferAtTime` straight to the SurfaceView's window — is
-//! the fallback for API < 29, an ASC init failure, or the `present_backend=surfaceview` sysprop.
+//! the fallback for API < 29, ChromeOS, an ASC init failure, or the `present_backend=surfaceview`
+//! sysprop.
 //!
 //! One-in/one-out: the host opens every stream with an IDR carrying VPS/SPS/PPS **in-band**, so the
 //! decoder needs no out-of-band codec-specific data — we configure with mime + the negotiated
@@ -166,6 +167,9 @@ pub(crate) struct DecodeOptions {
     /// TV form factor (Kotlin's `UiModeManager`): actively drive the HDMI output into the stream's
     /// refresh mode, vs. the softer seamless hint on a phone/tablet.
     pub is_tv: bool,
+    /// ChromeOS (ARC): present through the SurfaceView, never ASurfaceControl — see
+    /// [`asc_presenter::asc_backend_selected`].
+    pub chromeos: bool,
     /// The user's presentation intent (`present_priority` setting): 0 = lowest latency
     /// (newest-wins), 1 = smoothness (a small FIFO). Resolved by
     /// [`presenter::PresentPriority::resolve`]; anything else = latency.

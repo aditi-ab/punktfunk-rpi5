@@ -550,9 +550,16 @@ fn bring_up(
     // Fetched ONCE, ahead of the ladder, so a retry rung never pays the wait again.
     let hdr_static = hdr_static(client);
     let priority = PresentPriority::resolve(opts.present_priority, opts.smooth_buffer);
-    let asc_wanted = asc_backend_selected();
+    let asc_wanted = asc_backend_selected(opts.chromeos);
     if !asc_wanted {
-        log::info!("decode: present backend = SurfaceView (present_backend sysprop)");
+        log::info!(
+            "decode: present backend = SurfaceView ({})",
+            if opts.chromeos {
+                "ChromeOS"
+            } else {
+                "present_backend sysprop"
+            }
+        );
     }
     let rungs = bring_up_rungs(asc_wanted, opts.low_latency_mode);
     for (rung, &(backend, keys)) in rungs.iter().enumerate() {
@@ -587,9 +594,9 @@ fn bring_up(
         let format = low_latency_format(mime, &mode, &codec_name, keys, hdr_static.as_ref());
         // The present backend. ASurfaceControl (default) drives its own `AImageReader` output
         // surface + compositor layer, scheduling against the panel's real present clock; the
-        // SurfaceView presenter is the fallback for API < 29, an ASC init failure, the
-        // `present_backend=surfaceview` sysprop, or a rung that dropped it. A non-null `asc` means
-        // the codec renders into the reader, not the SurfaceView window.
+        // SurfaceView presenter covers API < 29, ChromeOS, an ASC init failure, the sysprop, or a
+        // rung that dropped it. A non-null `asc` means the codec renders into the reader, not the
+        // SurfaceView window.
         let asc = backend.and_then(|overlay| {
             // The negotiated colour is authoritative (PQ vs HLG, range) — not a guess the codec's
             // output format later corrects; many decoders never echo `color-transfer` at all.

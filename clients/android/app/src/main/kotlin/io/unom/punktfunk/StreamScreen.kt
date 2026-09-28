@@ -183,6 +183,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     // TV form factor (leanback): the decoder actively switches the HDMI output mode to the stream
     // refresh; a phone/tablet gets the softer seamless frame-rate hint instead.
     val isTv = remember { context.packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK) }
+    val isChromeOs = remember { context.packageManager.hasSystemFeature("org.chromium.arc") }
     // Focus anchor the soft keyboard is summoned onto AND the pointer-capture grab target (a grab
     // needs a focusable view; captured-pointer events land on it). Declared before the effect
     // below so the capture callbacks can reach the view once it exists.
@@ -547,6 +548,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                                     lowLatencyMode,
                                     choice?.lowLatencyFeature ?: false,
                                     isTv,
+                                    isChromeOs,
                                     initialSettings.presentPriorityWire(),
                                     initialSettings.smoothBuffer,
                                     // The panel's own refresh — from the mode TABLE (streamPanelFps),
