@@ -88,7 +88,7 @@ struct PresetEditorSheet: View {
         NavigationStack {
             form
                 .navigationTitle(draft.title)
-                #if os(iOS)
+                #if os(iOS) || os(visionOS)
                 .navigationBarTitleDisplayMode(.inline)
                 #endif
                 .toolbar {
@@ -119,7 +119,7 @@ struct PresetEditorSheet: View {
             }
             Section {
                 TextField("Name", text: $name, prompt: Text("Name — e.g. Game, Work, Travel"))
-                    #if os(iOS)
+                    #if os(iOS) || os(visionOS)
                     .textInputAutocapitalization(.words)
                     #endif
             } footer: {

@@ -52,6 +52,55 @@ final class LibraryClientTests: XCTestCase {
         XCTAssertNil(steam.platform)
     }
 
+    private func page(_ ids: [String], next: String?) -> Data {
+        let items = ids.map { #"{"id":"\#($0)","store":"custom","title":"\#($0)","art":{},"hidden":false}"# }
+        let cursor = next.map { #","next_cursor":"\#($0)""# } ?? ""
+        return Data(#"{"items":[\#(items.joined(separator: ","))],"total":4,"platforms":[]\#(cursor)}"#.utf8)
+    }
+
+    func testWalkFollowsTheCursorToTheLastPage() async throws {
+        var asked: [String?] = []
+        let games = try await LibraryClient.walkPages { cursor in
+            asked.append(cursor)
+            switch cursor {
+            case nil: return self.page(["a", "b"], next: "c1")
+            case "c1": return self.page(["c"], next: "c2")
+            default: return self.page(["d"], next: nil)
+            }
+        }
+        XCTAssertEqual(games.map(\.id), ["a", "b", "c", "d"])
+        XCTAssertEqual(asked, [nil, "c1", "c2"])
+    }
+
+    func testWalkEndsOnACursorThatDoesNotMove() async throws {
+        var calls = 0
+        let games = try await LibraryClient.walkPages { _ in
+            calls += 1
+            return self.page(["a"], next: "stuck")
+        }
+        XCTAssertEqual(calls, 2)
+        XCTAssertEqual(games.count, 2)
+    }
+
+    func testAFailedPageFailsTheWalk() async {
+        do {
+            _ = try await LibraryClient.walkPages { cursor in
+                if cursor != nil { throw LibraryError.http(500) }
+                return self.page(["a"], next: "c1")
+            }
+            XCTFail("the second page failed")
+        } catch LibraryError.http(500) {
+        } catch {
+            XCTFail("unexpected \(error)")
+        }
+    }
+
+    func testACursorIsEncodedIntoThePagePath() {
+        XCTAssertEqual(LibraryClient.pagePath(cursor: nil), "/api/v1/library/page?limit=200")
+        XCTAssertEqual(
+            LibraryClient.pagePath(cursor: "a+b="), "/api/v1/library/page?limit=200&cursor=a%2Bb%3D")
+    }
+
     func testPosterCandidatesPreferPortraitThenHeader() {
         let full = Artwork(
             portrait: "https://x/p.jpg", hero: "https://x/hero.jpg",

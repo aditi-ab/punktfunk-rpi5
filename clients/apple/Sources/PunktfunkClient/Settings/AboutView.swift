@@ -320,7 +320,7 @@ struct AppIconView: View {
     private static var bundleIcon: (image: Image, needsMask: Bool)? {
         #if os(macOS)
         return (Image(nsImage: NSApplication.shared.applicationIconImage), false)
-        #elseif os(iOS)
+        #elseif os(iOS) || os(visionOS)
         // The last entry is the largest — `CFBundleIconFiles` is ordered small to large.
         guard let icons = Bundle.main.infoDictionary?["CFBundleIcons"] as? [String: Any],
               let primary = icons["CFBundlePrimaryIcon"] as? [String: Any],

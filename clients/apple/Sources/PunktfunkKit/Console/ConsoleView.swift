@@ -48,7 +48,7 @@ public final class ConsoleMetalView: ConsolePlatformView {
         self.queue = queue
         self.delegate = delegate
         super.init(frame: .zero)
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         // The console takes one finger; a second would only fight the first for the cursor.
         isMultipleTouchEnabled = false
         #elseif canImport(AppKit)
@@ -110,11 +110,21 @@ public final class ConsoleMetalView: ConsolePlatformView {
         delegate?.consoleDidDrawFrame()
     }
 
+    #if canImport(UIKit)
+    private var pixelScale: CGFloat {
+        #if os(visionOS)
+        return traitCollection.displayScale > 0 ? traitCollection.displayScale : 2
+        #else
+        return window?.screen.scale ?? 2
+        #endif
+    }
+    #endif
+
     /// The drawable follows the view, in pixels.
     private func resize() {
         let layer = metalLayer
         #if canImport(UIKit)
-        let scale = window?.screen.scale ?? 2
+        let scale = pixelScale
         #else
         let scale = window?.backingScaleFactor ?? 2
         #endif
@@ -126,7 +136,7 @@ public final class ConsoleMetalView: ConsolePlatformView {
     /// Safe-area insets in drawable pixels: the chrome stays inside, the backdrop does not.
     private var pixelInsets: PunktfunkInsets {
         #if canImport(UIKit)
-        let scale = window?.screen.scale ?? 2
+        let scale = pixelScale
         let insets = safeAreaInsets
         return PunktfunkInsets(
             left: Float(insets.left * scale), top: Float(insets.top * scale),
@@ -143,7 +153,7 @@ public final class ConsoleMetalView: ConsolePlatformView {
         return 0
         #else
         #if canImport(UIKit)
-        let scale = window?.screen.scale ?? 2
+        let scale = pixelScale
         #else
         let scale = window?.backingScaleFactor ?? 2
         #endif
@@ -158,7 +168,7 @@ public final class ConsoleMetalView: ConsolePlatformView {
     #if canImport(UIKit)
     // On iOS touches are a finger on the glass. A Siri Remote's clickpad sends indirect touches
     // that start at the screen's centre, so on tvOS they are only a swipe's travel.
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     public override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard tracked == nil, let touch = touches.first else { return }
         tracked = ObjectIdentifier(touch)
@@ -183,7 +193,7 @@ public final class ConsoleMetalView: ConsolePlatformView {
     }
 
     private func send(_ kind: ConsoleBridge.Pointer, _ touch: UITouch) {
-        let scale = window?.screen.scale ?? 2
+        let scale = pixelScale
         let p = touch.location(in: self)
         bridge.pointer(kind, x: Float(p.x * scale), y: Float(p.y * scale))
     }

@@ -18,7 +18,7 @@
 // Category map (SettingsCategory): General = session/app behavior, Display = everything about
 // the picture (resolution lives HERE), Input = touch/keyboard/mouse, Audio, Controllers, About.
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 import CoreHaptics
 #endif
 import GameController
@@ -51,7 +51,7 @@ extension SettingsView {
     // failed exactly one slice: the iOS archive (macOS/tvOS never compile that branch).
     @ViewBuilder var resolutionSection: some View {
         Section("Resolution") {
-            #if os(iOS) || os(macOS)
+            #if os(iOS) || os(visionOS) || os(macOS)
             // Match-window (design/midstream-resolution-resize.md D1): follow the session
             // window/scene, renegotiating the host mode on a resize. Off → the explicit mode below.
             // NO marker here even though this toggle writes one: match-window, width and
@@ -64,7 +64,7 @@ extension SettingsView {
                 Toggle("Match window", isOn: scoped(SettingsFields.matchWindow))
             }
             #endif
-            #if os(iOS)
+            #if os(iOS) || os(visionOS)
             iosResolutionWheel
             overrideMarker(OverlayField.resolution)
             iosRefreshRows
@@ -94,7 +94,7 @@ extension SettingsView {
         }
     }
 
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     // MARK: - Display: Resolution (iOS wheel)
 
     /// Touch-first: an aspect switch over a rotating wheel of that family's common sizes (this
@@ -546,7 +546,7 @@ extension SettingsView {
                         Toggle("Auto-wake on connect", isOn: $autoWakeEnabled)
                     }
                 }
-                #if os(iOS) || os(tvOS)
+                #if os(iOS) || os(visionOS) || os(tvOS)
                 if !inPresetScope {
                     described("Audio and the connection stay live when you switch away; video "
                         + "pauses.") {
@@ -670,7 +670,7 @@ extension SettingsView {
 
     // MARK: - Input
 
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     /// Touch-input model (iPhone + iPad) plus the iPad-only pointer-capture toggle: lock the
     /// mouse/trackpad for relative movement (games) vs forward an absolute cursor position.
     @ViewBuilder var pointerSection: some View {
@@ -714,7 +714,7 @@ extension SettingsView {
     }
     #endif
 
-    #if os(iOS) || os(macOS)
+    #if os(iOS) || os(visionOS) || os(macOS)
     /// The in-stream quick-action ring's editor, opened as a sheet. Every platform with a ring
     /// the user can change: iOS from Touch & pointer, macOS from Keyboard & mouse (the Mac opens
     /// the ring with ⌃⌥⇧O or the Stream menu, so that is where a reader looks for it).
@@ -1030,7 +1030,7 @@ extension SettingsView {
             }
             #if !os(tvOS)
             if homeButtonKept, !inPresetScope, effective.gamepadForwarding,
-               effective.systemButtonsForward, #available(macOS 27.0, iOS 27.0, *) {
+               effective.systemButtonsForward, #available(macOS 27.0, iOS 27.0, visionOS 27.0, *) {
                 described("The system keeps the Home button, so the host never sees it. Add "
                     + "Punktfunk to Home Button Overrides.") {
                     Button("Home Button Settings…") {
@@ -1114,7 +1114,7 @@ extension SettingsView {
     /// Home Button Overrides reads `.defer`, and `GamepadCapture.attach`'s gesture claim then
     /// hands the press to the stream. The setting reads only while a controller is connected.
     func watchHomeButton() async {
-        guard #available(macOS 27.0, iOS 27.0, *), !gamepads.controllers.isEmpty else {
+        guard #available(macOS 27.0, iOS 27.0, visionOS 27.0, *), !gamepads.controllers.isEmpty else {
             homeButtonKept = false
             return
         }

@@ -34,6 +34,7 @@ import {
 	getGetStatusQueryKey,
 } from "@/api/gen/host/host";
 import {
+	getGetLibraryPageQueryKey,
 	getGetLibraryQueryKey,
 	getListLibraryScannersQueryKey,
 } from "@/api/gen/library/library";
@@ -107,10 +108,11 @@ const INVALIDATES = {
 	// The live list, and the policy card's "in effect" values derived from the same state.
 	"display.created": [...STATUS, getGetDisplayStateQueryKey()],
 	"display.released": [...STATUS, getGetDisplayStateQueryKey()],
-	// The bare library key prefixes every parameterised library query, so this catches them all.
+	// Each bare key prefixes its parameterised queries; the pages have a key of their own.
 	// The source list counts entries per provider, so it moves with the library.
 	"library.changed": [
 		getGetLibraryQueryKey(),
+		getGetLibraryPageQueryKey(),
 		getListLibraryScannersQueryKey(),
 	],
 	"emulators.changed": [getGetEmulatorsQueryKey()],

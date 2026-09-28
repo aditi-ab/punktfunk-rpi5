@@ -1,7 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import { getGetLibraryQueryKey } from "@/api/gen/library/library";
+import { getGetLibraryPageQueryKey } from "@/api/gen/library/library";
 import type { GameEntry } from "@/api/gen/model/gameEntry";
 import type { NativeClient } from "@/api/gen/model/nativeClient";
 import { getListNativeClientsQueryKey } from "@/api/gen/native/native";
@@ -11,15 +11,9 @@ import { nativeClients } from "./lib/fixtures";
 /**
  * Adding an automation (`HookForm`).
  *
- * The two filter fields used to be bare text inputs: the operator had to already know a device's
- * exact label and a game's store-qualified id (`steam:570`) and type them from memory. They offer
- * what the host knows now — and stay free text, because a hook may name a game that is not
- * installed yet.
- *
- * `HugeLibrary` is the one that earns its keep. Ten thousand titles is a real Steam account, and
- * the field has to stay instant: the matches are filtered and capped before they reach the DOM,
- * so the option count stays bounded no matter how big the library is. An `<option>` per title
- * would put 10,000 nodes on the page for a field most people never open.
+ * The two filter fields offer what the host knows and stay free text, because a hook may name
+ * a game that is not installed yet. The game field asks the host for one page of matches, so
+ * the story seeds the page an empty field asks for; typing needs a host.
  */
 /** A stand-in cover, so the artwork path is visible without a host to serve real ones.
  *  Every fourth title ships none, which is what exercises the monogram fallback. */
@@ -46,20 +40,30 @@ const TITLES = [
 	"Terraria",
 ];
 
-const HUGE: GameEntry[] = Array.from({ length: 10_000 }, (_, i) => game(i));
-const SMALL: GameEntry[] = HUGE.slice(0, 12);
+/** What the form asks for: `HookForm`'s `SUGGESTIONS`. */
+const PAGE = 50;
 
 /** Seed the cache the form reads, so the story needs no host. */
 function Seeded({
-	library,
+	total,
 	children,
 }: {
-	library: GameEntry[];
+	total: number;
 	children: React.ReactNode;
 }) {
 	const qc = useQueryClient();
 	useState(() => {
-		qc.setQueryData(getGetLibraryQueryKey(), library);
+		const key = getGetLibraryPageQueryKey({ q: "", limit: PAGE });
+		qc.setQueryDefaults(key, { staleTime: Infinity });
+		qc.setQueryData(key, {
+			items: Array.from({ length: Math.min(total, PAGE) }, (_, i) => ({
+				...game(i),
+				hidden: false,
+			})),
+			total,
+			platforms: [],
+			...(total > PAGE ? { next_cursor: "next" } : {}),
+		});
 		qc.setQueryData(
 			getListNativeClientsQueryKey(),
 			nativeClients as NativeClient[],
@@ -69,14 +73,14 @@ function Seeded({
 	return <>{children}</>;
 }
 
-function Harness({ library }: { library: GameEntry[] }) {
+function Harness({ total }: { total: number }) {
 	const [value, setValue] = useState<{
 		on: string;
 		run?: string | null;
 		filter?: { client?: string | null; app?: string | null };
 	} | null>({ on: "stream.started", run: "", filter: { app: "" } });
 	return (
-		<Seeded library={library}>
+		<Seeded total={total}>
 			<HookForm
 				value={value}
 				onCancel={() => setValue(null)}
@@ -95,7 +99,7 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 /** A handful of games, the ordinary case. */
-export const AddHook: Story = { render: () => <Harness library={SMALL} /> };
+export const AddHook: Story = { render: () => <Harness total={12} /> };
 
-/** Ten thousand of them. The suggestion list must stay bounded. */
-export const HugeLibrary: Story = { render: () => <Harness library={HUGE} /> };
+/** Ten thousand of them: the form still holds one page. */
+export const HugeLibrary: Story = { render: () => <Harness total={10_000} /> };

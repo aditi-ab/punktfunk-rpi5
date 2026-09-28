@@ -266,7 +266,10 @@ enum SettingsOptions {
     @MainActor
     static func nativeModes() -> [(name: String, w: Int, h: Int)] {
         var native: [(name: String, w: Int, h: Int)] = []
-        #if os(iOS) || os(tvOS)
+        #if os(visionOS)
+        let mode = NativeDisplay.mode
+        native = [("This device", mode.width, mode.height)]
+        #elseif os(iOS) || os(tvOS)
         let bounds = UIScreen.main.nativeBounds // portrait-oriented pixels (tvOS: the TV mode)
         let nativeW = Int(max(bounds.width, bounds.height))
         let nativeH = Int(min(bounds.width, bounds.height))
@@ -329,12 +332,17 @@ enum SettingsOptions {
     /// the screen can't show), plus any stored custom value so it stays selectable.
     @MainActor
     static func refreshRates(including current: Int) -> [Int] {
-        #if os(iOS) || os(tvOS)
+        #if os(visionOS)
+        let maxHz = NativeDisplay.mode.hz
+        #elseif os(iOS) || os(tvOS)
         let maxHz = UIScreen.main.maximumFramesPerSecond
         #else
         let maxHz = NSScreen.main?.maximumFramesPerSecond ?? 60
         #endif
         var rates = [60, 120, 240].filter { $0 <= maxHz }
+        #if os(visionOS)
+        rates.append(maxHz) // 90, which the 60/120/240 ladder skips
+        #endif
         if rates.isEmpty { rates = [maxHz] }
         if !rates.contains(current) { rates.append(current) }
         return rates.sorted()

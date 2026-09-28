@@ -64,7 +64,7 @@ struct TitleDetailSheet: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(20)
             }
-            #if os(iOS)
+            #if os(iOS) || os(visionOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
             .toolbar {

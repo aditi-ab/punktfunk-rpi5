@@ -3,7 +3,7 @@
 
 #if os(macOS)
 import AppKit
-#elseif os(iOS)
+#elseif os(iOS) || os(visionOS)
 import UIKit
 #endif
 import PunktfunkKit
@@ -24,7 +24,7 @@ struct PunktfunkClientApp: App {
         // Before anything touches the core, so its first lines (identity load, the first connect's
         // transport setup) land in the log ring "Send logs to host" uploads.
         CoreLog.install()
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         // Put Geist on the navigation titles before any bar is built.
         BrandTheme.apply()
         #endif
@@ -106,6 +106,12 @@ struct PunktfunkClientApp: App {
             SettingsView()
                 .tint(.brand)
         }
+        #endif
+        #if os(visionOS)
+        ImmersiveSpace(id: TheaterStage.spaceID) {
+            TheaterView()
+        }
+        .immersionStyle(selection: .constant(TheaterStage.style), in: TheaterStage.style)
         #endif
     }
 }

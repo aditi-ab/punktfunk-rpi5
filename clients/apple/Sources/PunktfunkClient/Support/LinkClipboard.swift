@@ -8,7 +8,7 @@
 
 #if os(macOS)
 import AppKit
-#elseif os(iOS)
+#elseif os(iOS) || os(visionOS)
 import UIKit
 #endif
 
@@ -16,7 +16,7 @@ enum LinkClipboard {
     /// True where a link can actually be copied — the card menus hide the item elsewhere rather
     /// than offering an action that silently does nothing.
     static var isAvailable: Bool {
-        #if os(macOS) || os(iOS)
+        #if os(macOS) || os(iOS) || os(visionOS)
         return true
         #else
         return false
@@ -27,7 +27,7 @@ enum LinkClipboard {
         #if os(macOS)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
-        #elseif os(iOS)
+        #elseif os(iOS) || os(visionOS)
         UIPasteboard.general.string = text
         #endif
     }

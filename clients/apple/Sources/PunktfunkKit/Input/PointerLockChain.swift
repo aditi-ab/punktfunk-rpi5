@@ -22,7 +22,7 @@
 // across sessions. Only the PUBLIC `childViewControllerForPointerLock` selector is touched
 // (App-Store-safe; no private API).
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 import ObjectiveC
 import UIKit
 

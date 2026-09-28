@@ -89,7 +89,7 @@ struct ContentView: View {
     @State private var awaitingApproval: ApprovalRequest?
     @State private var speedTestTarget: StoredHost?
     @State private var libraryTarget: LibraryTarget?
-    #if os(iOS) || os(tvOS)
+    #if os(iOS) || os(visionOS) || os(tvOS)
     /// The touch and TV UIs' tab. A written `libraryTarget` lands on the Library tab.
     @State private var touchTab: TouchTab = .hosts
     #endif
@@ -114,7 +114,7 @@ struct ContentView: View {
     /// The fullscreen edge and ownership, outliving the controller views SwiftUI rebuilds.
     @State private var fullscreenEdge = FullscreenController.Edge()
     #endif
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     /// The stats-OFF tier's touch-exit disc window (see the overlay in `stream(captureEnabled:)`
     /// — the disc must LEAVE the hierarchy so nothing composites over the metal layer).
     @State private var showTouchExit = false
@@ -338,7 +338,7 @@ struct ContentView: View {
             else { return }
             model.cycleStats()
         }
-        #if os(iOS) || os(tvOS)
+        #if os(iOS) || os(visionOS) || os(tvOS)
         // Coming back to the app re-arms the LAN browse. The home's `onAppear`/`onDisappear` do
         // NOT fire across background/foreground, and a browse the system suspended while we were
         // away does not resume on its own — so the host grid came back empty and stayed empty
@@ -352,7 +352,7 @@ struct ContentView: View {
             if phase == .active { discovery.refreshIfRunning() }
         }
         #endif
-        #if os(iOS) || os(tvOS)
+        #if os(iOS) || os(visionOS) || os(tvOS)
         // Backgrounding driver. Only .background/.active matter; .inactive (a transient peek) is
         // ignored so neither branch fires for a Control-Center pull.
         //
@@ -432,7 +432,7 @@ struct ContentView: View {
         .onChange(of: model.phase) { _, phase in
             switch phase {
             case .streaming:
-                #if os(iOS)
+                #if os(iOS) || os(visionOS)
                 showTouchExit = true // the off-tier exit disc's 8 s window, per session start
                 #endif
                 ring.close()
@@ -579,7 +579,7 @@ struct ContentView: View {
             set: { if !$0 { deepLinkConfirm = nil } })
     }
 
-    #if os(iOS) || os(tvOS)
+    #if os(iOS) || os(visionOS) || os(tvOS)
     /// In the touch and TV UIs a shelf is a tab, not a presentation: a written `libraryTarget`
     /// becomes the Library tab's shelf and clears, so the gamepad shell never inherits it as an
     /// open layer.
@@ -679,7 +679,7 @@ struct ContentView: View {
             set: { if !$0 { model.errorMessage = nil } })
     }
 
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     /// The Live Activity mode line, e.g. "2560×1440 @120 · HEVC · HDR", from the live connection.
     private func currentModeLine() -> String {
         guard let c = model.connection else { return "" }
@@ -709,7 +709,7 @@ struct ContentView: View {
     /// live session (same host → focus, different host → say so; NEVER tear one down on a
     /// background tap), and carries only references — a preset it can't honor refuses with a
     /// notice rather than streaming with the wrong settings.
-    #if os(iOS) || os(tvOS)
+    #if os(iOS) || os(visionOS) || os(tvOS)
     /// Hold a streaming session under the opt-in keep-alive, or end it.
     private func applyBackgroundPolicy() {
         guard model.phase == .streaming else { return }
@@ -912,8 +912,8 @@ struct ContentView: View {
     }
     #endif
 
-    #if os(iOS) || os(tvOS)
-    #if os(iOS)
+    #if os(iOS) || os(visionOS) || os(tvOS)
+    #if os(iOS) || os(visionOS)
     /// Hosts and Library. On iPadOS 18 the tab bar turns into a sidebar at a tap, as iPad apps do;
     /// iOS 17 keeps the plain tab bar.
     @ViewBuilder private var touchTabs: some View {
@@ -1021,7 +1021,7 @@ struct ContentView: View {
         // Edge-to-edge: FullscreenController hides the title bar for a session, and the panel
         // fullscreen covers the camera housing on purpose (a thin top-centre strip occluded).
         .ignoresSafeArea()
-        #elseif os(iOS)
+        #elseif os(iOS) || os(visionOS)
         // Streaming is immersive: edge-to-edge under the status bar and home
         // indicator, both hidden for the session (they return with the hosts grid).
         .background(Color.black)
@@ -1051,6 +1051,10 @@ struct ContentView: View {
                     captureEnabled: captureEnabled,
                     onCaptureChange: { [weak model] captured in
                         model?.mouseCaptured = captured
+                        #if os(visionOS)
+                        // The window that takes the keyboard takes the controllers too.
+                        if captured { model?.claimControllers() }
+                        #endif
                     },
                     onDisconnectRequest: { [weak model] in
                         model?.disconnect() // the captured-state ⌃⌥⇧D combo
@@ -1079,6 +1083,15 @@ struct ContentView: View {
                     },
                     endToEndMeter: model.endToEnd
                 )
+                #if os(visionOS)
+                .theater(TheaterStage.shared.renderers(for: conn))
+                .overlay {
+                    if TheaterStage.shared.renderers(for: conn) != nil { InTheaterPlaceholder() }
+                }
+                .ornament(attachmentAnchor: .scene(.bottom), contentAlignment: .top) {
+                    StreamOrnament(connection: conn, quickActions: { ring.toggleCentred() })
+                }
+                #endif
                 .overlay(alignment: placement.alignment) {
                     // The stats overlay MORPHS between tiers and SCALES UP on enter. With no `.id`, a
                     // verbosity change keeps the same StreamHUDView identity, so its one shared glass
@@ -1102,7 +1115,7 @@ struct ContentView: View {
                     StreamBadgeStack(
                         model: model, captureEnabled: captureEnabled, statsVerbosity: statsVerbosity)
                 }
-                #if os(iOS)
+                #if os(iOS) || os(visionOS)
                 // Touch has no menu or ⌘D: while the HUD shows no Disconnect (compact, off) a
                 // corner disc opens the ring. Off drops it after 8 s, since any overlay above the
                 // stream costs ~a refresh of latency; compact composites a pill anyway. The
@@ -1151,10 +1164,9 @@ struct ContentView: View {
                     }
                 }
                 #endif
-                #if os(iOS) || os(tvOS) || os(macOS)
                 // The quick-action ring, over the virtual controller: opened by the iOS twist or
-                // disc, the pad's ring button, the remote's Back or the Mac's chord. Mounted only
-                // while open — a closed overlay costs nothing.
+                // disc, the pad's ring button, the remote's Back, the Mac's chord or the Vision
+                // Pro's ornament. Mounted only while open — a closed overlay costs nothing.
                 .overlay {
                     if captureEnabled, ring.visible {
                         RingOverlay(state: ring, cfg: ringConfig, actions: ringActions(conn))
@@ -1170,7 +1182,6 @@ struct ContentView: View {
                         name: .punktfunkRingOpen, object: NSNumber(value: open))
                     #endif
                 }
-                #endif
                 #if os(macOS)
                 // ⌃⌥⇧O while input is captured (InputCapture's monitor sees the chord first). It
                 // names its session; the Stream menu's item goes through `sessionFocus` instead.
@@ -1186,12 +1197,12 @@ struct ContentView: View {
         }
     }
 
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     /// The two-finger twist → the ring. Nil on the platforms without a twist.
     private var dialSink: ((DialEvent) -> Void)? { { [ring] event in ring.handle(event) } }
     #endif
 
-    #if os(iOS) || os(tvOS) || os(macOS)
+    #if os(iOS) || os(visionOS) || os(tvOS) || os(macOS)
     /// The session's live state and commands behind each ring slot.
     private func ringActions(_ conn: PunktfunkConnection) -> RingActions {
         RingActions(
@@ -1247,18 +1258,18 @@ struct ContentView: View {
             endGame: { [weak model] in model?.endStreamedGame() })
     }
     #endif
-    #if os(iOS) || os(tvOS) || os(macOS)
+    #if os(iOS) || os(visionOS) || os(tvOS) || os(macOS)
     /// The wire pads the controller-mouse toggle acts on: the ring's opener, else every live pad.
     private static func padMouseTarget(_ ring: RingState, _ conn: PunktfunkConnection) -> UInt16 {
         guard let pad = ring.opener else { return conn.livePads }
         return pad < 16 ? 1 << pad : 0
     }
     #endif
-    #if !os(iOS)
+    #if !os(iOS) && !os(visionOS)
     private var dialSink: ((DialEvent) -> Void)? { nil }
     #endif
 
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     /// One touch-control disc: an SF Symbol on a floating glass disc over the frame (26+,
     /// material fallback), sized as a comfortable tap target. `interactive`: the disc IS the tap
     /// target, so the glass reacts to press, and the hit region is matched to the visible disc so
@@ -1319,18 +1330,18 @@ struct ContentView: View {
 
     // MARK: - First-run + dev hooks
 
-    /// First run on iOS: default the stream mode to this device's native screen so the
-    /// video fills the display instead of letterboxing 1920×1080 onto a 4:3 iPad. (The
-    /// compiled-in AppStorage defaults only apply until any value is saved; macOS keeps
-    /// 1080p — a desktop window is not the screen.)
+    /// First run off the Mac: default the stream mode to this device's native display so the
+    /// video fills it instead of letterboxing 1920×1080 onto a 4:3 iPad. (The compiled-in
+    /// AppStorage defaults only apply until any value is saved; macOS keeps 1080p — a desktop
+    /// window is not the screen.)
     private func seedDefaultModeIfNeeded() {
         #if !os(macOS)
         let defaults = UserDefaults.standard
         guard defaults.object(forKey: DefaultsKey.streamWidth) == nil else { return }
-        let bounds = UIScreen.main.nativeBounds // portrait-oriented pixels
-        defaults.set(Int(max(bounds.width, bounds.height)), forKey: DefaultsKey.streamWidth)
-        defaults.set(Int(min(bounds.width, bounds.height)), forKey: DefaultsKey.streamHeight)
-        defaults.set(UIScreen.main.maximumFramesPerSecond, forKey: DefaultsKey.streamHz)
+        let native = NativeDisplay.mode
+        defaults.set(native.width, forKey: DefaultsKey.streamWidth)
+        defaults.set(native.height, forKey: DefaultsKey.streamHeight)
+        defaults.set(native.hz, forKey: DefaultsKey.streamHz)
         #endif
     }
 

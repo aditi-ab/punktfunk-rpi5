@@ -1,5 +1,6 @@
 //! Game-library client for the host management REST API:
-//! `GET https://<host>:<mgmt>/api/v1/library` plus the per-title art proxy.
+//! `GET https://<host>:<mgmt>/api/v1/library/page`, walked to the end, plus the
+//! per-title art proxy.
 //!
 //! Auth is mTLS: the client presents the persistent identity paired over QUIC;
 //! paired certs may read the library routes (no bearer token). The host cert is
@@ -229,8 +230,60 @@ pub fn agent(
     ))
 }
 
-/// `GET /api/v1/library`. 401/403 → [`LibraryError::NotPaired`]; pin failure →
-/// [`LibraryError::PinMismatch`].
+/// One answer of `GET /api/v1/library/page`. `total` and `platforms` stay undecoded:
+/// every shell collates the whole catalog itself.
+#[derive(Deserialize)]
+struct LibraryPage {
+    items: Vec<GameEntry>,
+    #[serde(default)]
+    next_cursor: Option<String>,
+}
+
+/// Titles a request: the host's ceiling for one page.
+pub const PAGE_LIMIT: u32 = 200;
+
+/// 500 pages of 200 is 100 000 titles. A host whose cursor never runs out stops here.
+const MAX_PAGES: usize = 500;
+
+/// The whole catalog, a page at a time, so no answer grows with the library. `get` takes
+/// the cursor of the page before and answers one page's body; `bad_reply` words a body
+/// that does not decode. Any page failing fails the walk: half a catalog is not one.
+pub fn walk_pages<E>(
+    mut get: impl FnMut(Option<&str>) -> Result<String, E>,
+    bad_reply: impl Fn(String) -> E,
+) -> Result<Vec<GameEntry>, E> {
+    let mut games = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        let body = get(cursor.as_deref())?;
+        let page: LibraryPage =
+            serde_json::from_str(&body).map_err(|e| bad_reply(format!("bad JSON: {e}")))?;
+        games.extend(page.items);
+        match page.next_cursor {
+            // A cursor that does not move would ask for the same page forever.
+            Some(next) if !next.is_empty() && cursor.as_deref() != Some(next.as_str()) => {
+                cursor = Some(next);
+            }
+            _ => break,
+        }
+    }
+    Ok(games)
+}
+
+#[cfg(desktop)]
+fn body_of(
+    answer: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+) -> Result<String, LibraryError> {
+    answer
+        .map_err(classify)?
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| LibraryError::Unreachable(format!("read body: {e}")))
+}
+
+/// The host's catalog, walked by `GET /api/v1/library/page`. A host older than that route
+/// refuses it on this lane, so `GET /api/v1/library` answers whole instead. 401/403 from
+/// both → [`LibraryError::NotPaired`]; pin failure → [`LibraryError::PinMismatch`].
 #[cfg(desktop)]
 pub fn fetch_games(
     addr: &str,
@@ -239,15 +292,27 @@ pub fn fetch_games(
     pin: Option<[u8; 32]>,
 ) -> Result<Vec<GameEntry>, LibraryError> {
     let agent = agent(identity, pin)?;
-    let url = format!("{}/api/v1/library", base_url(addr, mgmt_port));
-    let body = match agent.get(&url).call() {
-        Ok(mut resp) => resp
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| LibraryError::Unreachable(format!("read body: {e}")))?,
-        Err(e) => return Err(classify(e)),
-    };
-    serde_json::from_str(&body).map_err(|e| LibraryError::Unreachable(format!("bad JSON: {e}")))
+    let base = base_url(addr, mgmt_port);
+    let bad_reply = LibraryError::Unreachable;
+    let paged = walk_pages(
+        |cursor| {
+            let page = agent
+                .get(format!("{base}/api/v1/library/page"))
+                .query("limit", PAGE_LIMIT.to_string());
+            body_of(match cursor {
+                Some(c) => page.query("cursor", c).call(),
+                None => page.call(),
+            })
+        },
+        bad_reply,
+    );
+    match paged {
+        Err(LibraryError::NotPaired | LibraryError::Http(404)) => {
+            let body = body_of(agent.get(format!("{base}/api/v1/library")).call())?;
+            serde_json::from_str(&body).map_err(|e| bad_reply(format!("bad JSON: {e}")))
+        }
+        walked => walked,
+    }
 }
 
 /// One title currently launched, from `GET /api/v1/status`. Partial
@@ -785,6 +850,72 @@ mod tests {
             vec!["https://h:47990/api/v1/library/art/steam:570/portrait"]
         );
         assert!(back[1].platform.is_none() && back[1].role.is_none());
+    }
+
+    fn page(ids: &[&str], next: Option<&str>) -> String {
+        let items: Vec<_> = ids
+            .iter()
+            .map(
+                |id| serde_json::json!({"id": id, "store": "custom", "title": id, "hidden": false}),
+            )
+            .collect();
+        serde_json::json!({"items": items, "next_cursor": next, "total": 4, "platforms": []})
+            .to_string()
+    }
+
+    fn ids(games: &[GameEntry]) -> Vec<&str> {
+        games.iter().map(|g| g.id.as_str()).collect()
+    }
+
+    #[test]
+    fn a_walk_follows_the_cursor_to_the_last_page() {
+        let mut asked = Vec::new();
+        let games = walk_pages(
+            |cursor| {
+                asked.push(cursor.map(str::to_string));
+                Ok::<_, String>(match cursor {
+                    None => page(&["a", "b"], Some("c1")),
+                    Some("c1") => page(&["c"], Some("c2")),
+                    _ => page(&["d"], None),
+                })
+            },
+            |why| why,
+        )
+        .unwrap();
+        assert_eq!(ids(&games), ["a", "b", "c", "d"]);
+        assert_eq!(asked, [None, Some("c1".into()), Some("c2".into())]);
+    }
+
+    #[test]
+    fn a_walk_ends_on_a_cursor_that_does_not_move() {
+        let mut calls = 0;
+        let games = walk_pages(
+            |_| {
+                calls += 1;
+                Ok::<_, String>(page(&["a"], Some("stuck")))
+            },
+            |why| why,
+        )
+        .unwrap();
+        assert_eq!(
+            calls, 2,
+            "the second answer repeats the cursor it was asked with"
+        );
+        assert_eq!(games.len(), 2);
+    }
+
+    #[test]
+    fn a_failed_page_fails_the_walk() {
+        let walked = walk_pages(
+            |cursor| match cursor {
+                None => Ok(page(&["a"], Some("c1"))),
+                Some(_) => Err("the host went away".to_string()),
+            },
+            |why| why,
+        );
+        assert_eq!(walked.unwrap_err(), "the host went away");
+        let undecodable = walk_pages(|_| Ok::<_, String>("[]".into()), |why| why);
+        assert!(undecodable.unwrap_err().starts_with("bad JSON"));
     }
 
     #[test]

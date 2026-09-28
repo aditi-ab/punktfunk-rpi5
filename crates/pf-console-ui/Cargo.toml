@@ -105,9 +105,10 @@ pf-client-core = { path = "../pf-client-core", default-features = false }
 # Apple: the Mac runs the tests on CPU raster; an Apple host draws through `metal`. With this
 # crate's default features the darwin key is `jpegd-jpege-pdf-textlayout-vulkan`, and with
 # `default-features = false, features = ["metal"]` it is `jpegd-jpege-metal-pdf-textlayout`.
-# rust-skia publishes both for darwin and iOS at 0.99.0. tvOS has no rust-skia archive: its two
-# are ours, built by `scripts/skia-tvos/build.sh` (a patched skia-bindings), fetched through
-# `SKIA_BINARIES_URL` from git.unom.io/unom/skia-binaries/releases/download/0.99.0/, and
+# rust-skia publishes both for darwin and iOS at 0.99.0. tvOS and visionOS have no rust-skia
+# archive: their four are ours, built by `scripts/skia-apple/build.sh` (a patched
+# skia-bindings), fetched through `SKIA_BINARIES_URL` from
+# git.unom.io/unom/skia-binaries/releases/download/0.99.0/, and
 # `build.rs` names the system libraries skia-bindings does not link there. Their SHA-256s
 # are pinned in scripts/build-xcframework.sh, which fetches and verifies every Apple slice's.
 [target.'cfg(target_vendor = "apple")'.dependencies]

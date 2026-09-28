@@ -125,7 +125,7 @@ struct HostSectionsView: View {
                 SpeedTestView(host: host, startsOnAppear: false)
                     #if os(macOS)
                     .navigationTitle(host.displayName)
-                    #elseif os(iOS)
+                    #elseif os(iOS) || os(visionOS)
                     .navigationTitle(HostSection.speedTest.title)
                     #endif
             } else {
