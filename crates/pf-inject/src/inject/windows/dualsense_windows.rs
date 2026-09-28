@@ -86,6 +86,7 @@ impl DsWinPad {
                 usb_vid_pid: Some(id.usb_vid_pid),
                 // Composite USB devices: audio on interfaces 0-2, HID on 3. hidapi reads it back.
                 usb_mi: Some(3),
+                bluetooth: false,
                 description: id.description,
                 enumerator: id.enumerator,
             },
@@ -195,6 +196,7 @@ pub fn deck_spike_hold(index: u8, secs: u64) -> Result<()> {
         usb_vid_pid: Some("VID_28DE&PID_1205"),
         // hidapi parses MI_ from the child hwids; absent = interface 0, Steam wants 2.
         usb_mi: Some(2),
+        bluetooth: false,
         description: "Punktfunk Virtual Steam Deck (spike)",
         enumerator: "punktfunk",
     })?;
@@ -280,6 +282,10 @@ mod tests {
             super::super::steam_deck_windows::DECK_HWID,
             super::super::triton_windows::TRITON_HWID,
             super::super::switch_pro_windows::SWITCH_HWID,
+            super::super::eightbitdo_windows::ULTIMATE2_HWID,
+            super::super::eightbitdo_windows::PRO2_HWID,
+            super::super::eightbitdo_windows::PRO3_HWID,
+            super::super::hori_windows::HORI_HWID,
         ]
         .into_iter()
         // Every Xbox identity, not just the first — a new one without its INF model line never starts.
@@ -396,6 +402,22 @@ mod tests {
             (
                 super::super::switch_pro_windows::SWITCH_HWID,
                 pf_driver_proto::gamepad::DEVTYPE_SWITCH_PRO,
+            ),
+            (
+                super::super::eightbitdo_windows::ULTIMATE2_HWID,
+                pf_driver_proto::gamepad::DEVTYPE_8BITDO_ULTIMATE2,
+            ),
+            (
+                super::super::eightbitdo_windows::PRO2_HWID,
+                pf_driver_proto::gamepad::DEVTYPE_8BITDO_PRO2,
+            ),
+            (
+                super::super::eightbitdo_windows::PRO3_HWID,
+                pf_driver_proto::gamepad::DEVTYPE_8BITDO_PRO3,
+            ),
+            (
+                super::super::hori_windows::HORI_HWID,
+                pf_driver_proto::gamepad::DEVTYPE_HORIPAD_STEAM,
             ),
             // Server's unfiltered Xbox line: any Xbox type, so the pad never enumerates as a
             // DualSense while hidclass asks; the section sets the real one on attach.

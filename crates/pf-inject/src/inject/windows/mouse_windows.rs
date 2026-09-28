@@ -78,6 +78,7 @@ impl VirtualMouse {
             // Virtual identity (PF:MO). USB tokens are inert for a mouse; shared profile = one path.
             usb_vid_pid: Some("VID_5046&PID_4D4F"),
             usb_mi: None,
+            bluetooth: false,
             description: "Punktfunk Virtual Mouse",
             enumerator: "punktfunk",
         }) {
@@ -359,6 +360,7 @@ pub fn channel_proof_probe() -> Result<()> {
         hwid: "pf_mouse",
         usb_vid_pid: Some("VID_5046&PID_4D4F"),
         usb_mi: None,
+        bluetooth: false,
         description: "Punktfunk Virtual Mouse (channel-proof probe)",
         enumerator: "punktfunk",
     })?;

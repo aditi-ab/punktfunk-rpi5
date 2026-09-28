@@ -37,7 +37,9 @@ impl GlyphStyle {
             Some(GamepadPref::DualSense | GamepadPref::DualSenseEdge | GamepadPref::DualShock4) => {
                 GlyphStyle::Shapes
             }
-            Some(GamepadPref::SwitchPro) => GlyphStyle::Nintendo,
+            Some(
+                GamepadPref::SwitchPro | GamepadPref::EightBitDoPro2 | GamepadPref::EightBitDoPro3,
+            ) => GlyphStyle::Nintendo,
             Some(_) => GlyphStyle::Letters,
             None => GlyphStyle::Keyboard,
         }
@@ -64,12 +66,17 @@ pub fn device_icon(pref: Option<GamepadPref>, platform: Platform) -> Icon {
     };
     match pref {
         GamepadPref::Auto | GamepadPref::Xbox360 => icons::PAD_XBOX_360,
-        GamepadPref::XboxOne => icons::PAD_XBOX_ONE,
+        // No mark of their own: the nearest silhouette.
+        GamepadPref::XboxOne | GamepadPref::EightBitDoUltimate2 | GamepadPref::HoripadSteam => {
+            icons::PAD_XBOX_ONE
+        }
         GamepadPref::XboxElite => icons::PAD_XBOX_ELITE,
         GamepadPref::DualShock4 => icons::PAD_DUALSHOCK_4,
         GamepadPref::DualSense => icons::PAD_DUALSENSE,
         GamepadPref::DualSenseEdge => icons::PAD_DUALSENSE_EDGE,
-        GamepadPref::SwitchPro => icons::PAD_SWITCH_PRO,
+        GamepadPref::SwitchPro | GamepadPref::EightBitDoPro2 | GamepadPref::EightBitDoPro3 => {
+            icons::PAD_SWITCH_PRO
+        }
         GamepadPref::SteamController => icons::PAD_STEAM_CONTROLLER,
         GamepadPref::SteamController2 => icons::PAD_STEAM_CONTROLLER_2,
         GamepadPref::SteamController2Puck => icons::PAD_STEAM_PUCK,

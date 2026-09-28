@@ -67,6 +67,7 @@ impl DualSensePad {
     /// `hid-playstation` replaces it with the pairing-report MAC ([`ds_pairing_reply`]).
     pub fn open(index: u8, id: &DsUhidIdentity) -> Result<DualSensePad> {
         let dev = UhidDevice::open(&Create2 {
+            bus: crate::uhid_abi::BUS_USB,
             name: &format!("Punktfunk {} {index}", id.name),
             phys: &format!("punktfunk/{}/{index}", id.phys),
             uniq: &format!("punktfunk-{}-{index}", id.slug),

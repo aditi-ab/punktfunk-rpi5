@@ -108,6 +108,25 @@ fn pref_for_type(t: sdl3::gamepad::GamepadType) -> GamepadPref {
     }
 }
 
+/// Pads whose own identity SDL's type cannot name: no Valve, 8BitDo or HORI type, the Edge
+/// reads as a PS5 and the Elite as an Xbox One. The host then builds that identity, so the
+/// extras land natively.
+fn pref_for_ids(vid: u16, pid: u16) -> Option<GamepadPref> {
+    match (vid, pid) {
+        (0x28DE, 0x1205) => Some(GamepadPref::SteamDeck),
+        (0x28DE, 0x1102 | 0x1142) => Some(GamepadPref::SteamController),
+        (0x054C, 0x0DF2) => Some(GamepadPref::DualSenseEdge),
+        // Elite Series 1, Series 2 USB, Bluetooth and BLE.
+        (0x045E, 0x02E3 | 0x0B00 | 0x0B05 | 0x0B22) => Some(GamepadPref::XboxElite),
+        // 8BitDo in its own HID mode; X-input mode is `310B` and stays Xbox 360.
+        (0x2DC8, 0x6012) => Some(GamepadPref::EightBitDoUltimate2),
+        (0x2DC8, 0x6003 | 0x6006) => Some(GamepadPref::EightBitDoPro2),
+        (0x2DC8, 0x6009) => Some(GamepadPref::EightBitDoPro3),
+        (0x0F0D, 0x01AB | 0x0196) => Some(GamepadPref::HoripadSteam),
+        _ => crate::sc2_capture::pref_for(vid, pid),
+    }
+}
+
 /// Kind declared in [`InputKind::GamepadArrival`]: an explicit setting emulates that
 /// pad on every slot; `Auto` keeps per-pad detection. Applied per pad, not only in
 /// Hello — the host builds each virtual device from arrival. Local feedback still
@@ -950,19 +969,8 @@ impl Worker {
             self.subsystem.vendor_for_id(jid).unwrap_or(0),
             self.subsystem.product_for_id(jid).unwrap_or(0),
         );
-        // SDL has no Valve pad types; VID/PID picks the matching Deck / Steam Controller kind.
-        if vid == 0x28DE && pid == 0x1205 {
-            pref = GamepadPref::SteamDeck;
-        }
-        if vid == 0x28DE && matches!(pid, 0x1102 | 0x1142) {
-            pref = GamepadPref::SteamController;
-        }
-        if let Some(sc2) = crate::sc2_capture::pref_for(vid, pid) {
-            pref = sc2;
-        }
-        // Edge reports as PS5; VID/PID so paddles land on native slots, not the fold/drop policy.
-        if vid == 0x054C && pid == 0x0DF2 {
-            pref = GamepadPref::DualSenseEdge;
+        if let Some(own) = pref_for_ids(vid, pid) {
+            pref = own;
         }
         let name = self
             .subsystem
@@ -1111,6 +1119,10 @@ impl Worker {
                     Self::set_slot_sensors(&mut slot, true);
                 }
                 slot.audio_caps = self.pad_audio_caps_for(id, &slot.pad);
+                if let Some(path) = slot.pad.path() {
+                    let (vid, pid) = (slot.pad.vendor_id(), slot.pad.product_id());
+                    crate::sc2_capture::log_descriptor(&path, vid.unwrap_or(0), pid.unwrap_or(0));
+                }
                 // Kind before any input so the host builds a matching virtual device. Core
                 // re-sends against datagram loss; an older host ignores it.
                 if let Some(c) = &self.attached {
@@ -2306,6 +2318,31 @@ fn run(
         w.menu_poll();
         w.battery_poll();
         w.render_feedback();
+    }
+}
+
+#[cfg(test)]
+mod pref_for_ids_tests {
+    use super::*;
+
+    #[test]
+    fn named_pads_declare_their_own_kind() {
+        use GamepadPref as P;
+        assert_eq!(pref_for_ids(0x28DE, 0x1205), Some(P::SteamDeck));
+        assert_eq!(pref_for_ids(0x28DE, 0x1142), Some(P::SteamController));
+        assert_eq!(pref_for_ids(0x28DE, 0x1302), Some(P::SteamController2));
+        assert_eq!(pref_for_ids(0x054C, 0x0DF2), Some(P::DualSenseEdge));
+        for elite in [0x02E3, 0x0B00, 0x0B05, 0x0B22] {
+            assert_eq!(pref_for_ids(0x045E, elite), Some(P::XboxElite));
+        }
+        assert_eq!(pref_for_ids(0x2DC8, 0x6012), Some(P::EightBitDoUltimate2));
+        assert_eq!(pref_for_ids(0x2DC8, 0x6006), Some(P::EightBitDoPro2));
+        assert_eq!(pref_for_ids(0x2DC8, 0x6009), Some(P::EightBitDoPro3));
+        assert_eq!(pref_for_ids(0x0F0D, 0x0196), Some(P::HoripadSteam));
+        // A plain Series pad keeps SDL's type.
+        assert_eq!(pref_for_ids(0x045E, 0x0B12), None);
+        // X-input mode is an Xbox 360 pad.
+        assert_eq!(pref_for_ids(0x2DC8, 0x310B), None);
     }
 }
 

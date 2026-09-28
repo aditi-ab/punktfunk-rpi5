@@ -154,8 +154,20 @@
 // For capture clients that own the physical Puck; wired/BLE SC2 stays `STEAMCONTROLLER2`.
 #define PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2_PUCK 10
 
-// Xbox Elite identity (Windows UMDF). Identity only — paddles still fold. Else X-Box 360.
+// Xbox Elite identity. Linux hosts carry the paddles; Windows hosts drop them.
 #define PUNKTFUNK_GAMEPAD_XBOXELITE 11
+
+// 8BitDo Ultimate 2 Wireless (`2DC8:6012`): L4/R4, back paddles, gyro.
+#define PUNKTFUNK_GAMEPAD_8BITDO_ULTIMATE2 12
+
+// 8BitDo Pro 2 (`2DC8:6003`): back paddles, gyro.
+#define PUNKTFUNK_GAMEPAD_8BITDO_PRO2 13
+
+// 8BitDo Pro 3 (`2DC8:6009`): L4/R4, back paddles, gyro.
+#define PUNKTFUNK_GAMEPAD_8BITDO_PRO3 14
+
+// Wireless HORIPAD for Steam (`0F0D:01AB`): rear buttons, gyro.
+#define PUNKTFUNK_GAMEPAD_HORIPAD_STEAM 15
 
 // Extended `InputEvent` gamepad button bits: four back grips (Steam L4/L5/R4/R5 ≙
 // Xbox-Elite P1–P4) + misc/capture, in Moonlight's `buttonFlags2 << 16` namespace.

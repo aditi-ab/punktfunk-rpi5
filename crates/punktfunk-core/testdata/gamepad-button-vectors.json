@@ -17,8 +17,8 @@
     {"name": "DPAD_LEFT", "bit": 4, "evdev": "BTN_DPAD_LEFT", "code": null},
     {"name": "DPAD_RIGHT", "bit": 8, "evdev": "BTN_DPAD_RIGHT", "code": null},
     {"name": "PADDLE1", "bit": 65536, "evdev": "BTN_TRIGGER_HAPPY5", "code": 708},
-    {"name": "PADDLE2", "bit": 131072, "evdev": "BTN_TRIGGER_HAPPY6", "code": 709},
-    {"name": "PADDLE3", "bit": 262144, "evdev": "BTN_TRIGGER_HAPPY7", "code": 710},
+    {"name": "PADDLE2", "bit": 131072, "evdev": "BTN_TRIGGER_HAPPY7", "code": 710},
+    {"name": "PADDLE3", "bit": 262144, "evdev": "BTN_TRIGGER_HAPPY6", "code": 709},
     {"name": "PADDLE4", "bit": 524288, "evdev": "BTN_TRIGGER_HAPPY8", "code": 711},
     {"name": "TOUCHPAD", "bit": 1048576, "evdev": "BTN_TOUCHPAD", "code": null},
     {"name": "MISC1", "bit": 2097152, "evdev": "BTN_MISC1", "code": null}

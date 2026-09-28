@@ -47,6 +47,7 @@ impl DeckWinPad {
                 // Wired Deck controller interface. Without this the HID child has no MI_
                 // token, hidapi reports interface 0, and Steam never claims the pad.
                 usb_mi: Some(2),
+                bluetooth: false,
                 description: "Punktfunk Virtual Steam Deck",
                 enumerator: "punktfunk",
             },

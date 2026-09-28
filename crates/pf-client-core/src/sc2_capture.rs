@@ -124,6 +124,26 @@ impl Drop for Sc2Capture {
     }
 }
 
+/// Log a HIDAPI pad's report descriptor, once per slot open, so a "Send logs" bundle carries the
+/// capture a native host identity is built from. Silent where the node will not open.
+pub(crate) fn log_descriptor(path: &str, vid: u16, pid: u16) {
+    let Ok(c_path) = std::ffi::CString::new(path) else {
+        return;
+    };
+    // SAFETY: `c_path` is a valid NUL-terminated string that outlives the call.
+    let dev = Dev(unsafe { hid::SDL_hid_open_path(c_path.as_ptr()) });
+    if dev.0.is_null() {
+        return;
+    }
+    let mut buf = [0u8; 4096];
+    // SAFETY: `dev.0` is open and `buf` is writable for its whole length.
+    let n = unsafe { hid::SDL_hid_get_report_descriptor(dev.0, buf.as_mut_ptr(), buf.len()) };
+    if n > 0 {
+        let rdesc = crate::presets::hex_lower(&buf[..n as usize]);
+        tracing::info!(vid, pid, len = n, rdesc, "controller HID descriptor");
+    }
+}
+
 struct Dev(*mut hid::SDL_hid_device);
 
 // SAFETY: the handle moves into the reader thread once and is used and closed only there.

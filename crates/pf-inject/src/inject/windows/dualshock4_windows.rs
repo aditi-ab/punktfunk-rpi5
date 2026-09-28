@@ -43,6 +43,7 @@ impl Ds4WinPad {
                 usb_vid_pid: Some("VID_054C&PID_09CC"),
                 // Composite USB device (headset audio on 0-2); the HID interface is 3.
                 usb_mi: Some(3),
+                bluetooth: false,
                 description: "Punktfunk Virtual DualShock 4",
                 enumerator: "VID_054C&PID_09CC&MI_03",
             },

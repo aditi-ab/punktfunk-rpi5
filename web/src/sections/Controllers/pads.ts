@@ -51,8 +51,8 @@ export const BUTTON_NAMES: readonly (readonly [number, string])[] = [
 	[BIT.DPAD_LEFT, "BTN_DPAD_LEFT"],
 	[BIT.DPAD_RIGHT, "BTN_DPAD_RIGHT"],
 	[BIT.PADDLE1, "BTN_TRIGGER_HAPPY5"],
-	[BIT.PADDLE2, "BTN_TRIGGER_HAPPY6"],
-	[BIT.PADDLE3, "BTN_TRIGGER_HAPPY7"],
+	[BIT.PADDLE2, "BTN_TRIGGER_HAPPY7"],
+	[BIT.PADDLE3, "BTN_TRIGGER_HAPPY6"],
 	[BIT.PADDLE4, "BTN_TRIGGER_HAPPY8"],
 	[BIT.TOUCHPAD, "BTN_TOUCHPAD"],
 	[BIT.MISC1, "BTN_MISC1"],
@@ -185,7 +185,8 @@ export function familyOf(device: string): PadFamily {
 	if (device.startsWith("dualsense") || device.startsWith("dualshock"))
 		return "playstation";
 	if (device.startsWith("steam")) return "steam";
-	if (device === "switchpro") return "switch";
+	// The 8BitDo Pro pads carry Nintendo labels.
+	if (device === "switchpro" || device.startsWith("8bitdopro")) return "switch";
 	return "xbox";
 }
 

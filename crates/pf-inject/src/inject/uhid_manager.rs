@@ -97,6 +97,30 @@ impl PadState for crate::switch_proto::SwitchState {
     }
 }
 
+impl PadState for crate::eightbitdo_proto::EightBitDoState {
+    fn neutral() -> Self {
+        Self::neutral()
+    }
+    fn neutralize_gyro(&mut self) -> bool {
+        Self::neutralize_gyro(self)
+    }
+    fn clear_rich(&mut self) {
+        Self::clear_rich(self)
+    }
+}
+
+impl PadState for crate::hori_proto::HoriState {
+    fn neutral() -> Self {
+        Self::neutral()
+    }
+    fn neutralize_gyro(&mut self) -> bool {
+        Self::neutralize_gyro(self)
+    }
+    fn clear_rich(&mut self) {
+        Self::clear_rich(self)
+    }
+}
+
 /// Motion lives inside the opaque raw report, so there is nothing to neutralize or clear.
 impl PadState for crate::triton_proto::TritonState {
     fn neutral() -> Self {
@@ -122,6 +146,12 @@ pub trait PadProto {
     const DEVICE: &'static str;
     /// Suffix for the create-failure line — empty on Linux, the driver-install hint on Windows.
     const CREATE_HINT: &'static str;
+    /// Fixed report rate for a pad whose consumers assume one: with no IMU clock in the report,
+    /// SDL stamps each sample one period apart. `Some`: input only updates state and
+    /// [`UhidManager::heartbeat`] writes on deadlines. `None`: every frame writes.
+    fn report_period(&self) -> Option<Duration> {
+        None
+    }
 
     /// Backend logs success; the manager logs create-gate failures.
     fn open(&mut self, idx: u8) -> Result<Self::Pad>;
@@ -159,6 +189,10 @@ pub struct UhidManager<B: PadProto> {
     /// Last `RichInput::Motion` per pad. `None` before the first sample and after neutralize, so
     /// a pad with no motion feed costs nothing per tick.
     last_motion: Vec<Option<Instant>>,
+    /// Next write of a [`PadProto::report_period`] pad, µs after `epoch`; `None` until its first
+    /// heartbeat.
+    next_due: Vec<Option<u64>>,
+    epoch: Instant,
     overflow_warn: Vec<OverflowWarn>,
 }
 
@@ -280,6 +314,8 @@ impl<B: PadProto> UhidManager<B> {
             last_write: vec![Instant::now(); MAX_PADS],
             last_active: vec![Instant::now(); MAX_PADS],
             last_motion: vec![None; MAX_PADS],
+            next_due: vec![None; MAX_PADS],
+            epoch: Instant::now(),
             overflow_warn: vec![OverflowWarn::default(); MAX_PADS],
         }
     }
@@ -319,7 +355,7 @@ impl<B: PadProto> UhidManager<B> {
                 }
                 self.ensure(idx);
                 self.state[idx] = self.backend.merge_frame(&self.state[idx], f);
-                self.write(idx);
+                self.write_unpaced(idx);
             }
         }
     }
@@ -335,12 +371,13 @@ impl<B: PadProto> UhidManager<B> {
             self.last_motion[idx] = Some(Instant::now());
         }
         self.backend.apply_rich(&mut self.state[idx], rich);
-        self.write(idx);
+        self.write_unpaced(idx);
     }
 
     /// Re-emit each live pad's current report if silent for `max_gap` (or the backend forces a
     /// write). UHID/UMDF treat a multi-second input silence as unplug; a held stick produces no
     /// wire events. Re-sending is idempotent: a stale-but-correct frame, never a phantom input.
+    /// A [`PadProto::report_period`] pad writes here only, on its deadlines.
     pub fn heartbeat(&mut self, max_gap: Duration) {
         let now = Instant::now();
         for i in 0..MAX_PADS {
@@ -356,7 +393,16 @@ impl<B: PadProto> UhidManager<B> {
                 self.last_motion[i] = None;
                 neutralized = self.state[i].neutralize_gyro();
             }
-            if neutralized || forced || now.duration_since(self.last_write[i]) >= max_gap {
+            if let Some(period) = self.backend.report_period() {
+                // The driver's schedule: deadlines, restarted rather than burst when a tick is late.
+                let now_us = now.duration_since(self.epoch).as_micros() as u64;
+                let due = *self.next_due[i].get_or_insert(now_us);
+                let period_us = period.as_micros() as u64;
+                if let Some(next) = pf_driver_proto::gamepad::serve_due(now_us, due, period_us) {
+                    self.write(i);
+                    self.next_due[i] = Some(next);
+                }
+            } else if neutralized || forced || now.duration_since(self.last_write[i]) >= max_gap {
                 self.write(i);
             }
         }
@@ -437,6 +483,13 @@ impl<B: PadProto> UhidManager<B> {
         }
     }
 
+    /// Input-driven write. A paced pad's next deadline carries the new state instead.
+    fn write_unpaced(&mut self, idx: usize) {
+        if self.backend.report_period().is_none() {
+            self.write(idx);
+        }
+    }
+
     /// Resets the heartbeat clock on every write so an actively-used pad emits no extra reports.
     fn write(&mut self, idx: usize) {
         let st = self.state[idx];
@@ -486,6 +539,7 @@ impl<B: PadProto> UhidManager<B> {
         self.last_write[idx] = Instant::now();
         self.last_active[idx] = Instant::now();
         self.last_motion[idx] = None;
+        self.next_due[idx] = None;
     }
 
     /// Backdate every pad's motion clock past [`MOTION_IDLE_TIMEOUT`] so the next
@@ -625,6 +679,56 @@ mod tests {
 
     fn mgr() -> UhidManager<MockProto> {
         UhidManager::new()
+    }
+
+    /// [`MockProto`] with a fixed report period; an hour so only the first deadline is due.
+    #[derive(Default)]
+    struct PacedProto(MockProto);
+
+    impl PadProto for PacedProto {
+        type Pad = MockPad;
+        type State = MockState;
+        const LABEL: &'static str = "Paced";
+        const DEVICE: &'static str = "paced pad";
+        const CREATE_HINT: &'static str = "";
+
+        fn open(&mut self, idx: u8) -> Result<MockPad> {
+            self.0.open(idx)
+        }
+        fn merge_frame(&self, prev: &MockState, f: &GamepadFrame) -> MockState {
+            self.0.merge_frame(prev, f)
+        }
+        fn apply_rich(&self, st: &mut MockState, rich: RichInput) {
+            self.0.apply_rich(st, rich)
+        }
+        fn write_state(&self, pad: &mut MockPad, st: &MockState) {
+            self.0.write_state(pad, st)
+        }
+        fn service(&self, pad: &mut MockPad, idx: u8) -> PadFeedback {
+            self.0.service(pad, idx)
+        }
+        fn report_period(&self) -> Option<Duration> {
+            Some(Duration::from_secs(3600))
+        }
+    }
+
+    /// Input only moves a paced pad's state; the heartbeat writes it on a deadline, and a
+    /// `max_gap` of zero does not bypass the period.
+    #[test]
+    fn a_paced_pad_writes_on_its_deadlines_only() {
+        let mut m = UhidManager::<PacedProto>::new();
+        m.handle(&frame(0, 0b1, 0x10));
+        m.apply_rich(motion(0, 900, 10_000));
+        let writes = |m: &UhidManager<PacedProto>| m.slots.get(0).unwrap().writes.borrow().clone();
+        assert!(writes(&m).is_empty(), "input wrote around the pacing");
+
+        m.heartbeat(Duration::ZERO);
+        let w = writes(&m);
+        assert_eq!(w.len(), 1, "the first heartbeat is the first deadline");
+        assert_eq!((w[0].buttons, w[0].gyro), (0x10, 900));
+
+        m.heartbeat(Duration::ZERO);
+        assert_eq!(writes(&m).len(), 1, "a write landed before its deadline");
     }
 
     /// A motion feed that stops must not leave the pad rotating: past [`MOTION_IDLE_TIMEOUT`]

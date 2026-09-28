@@ -163,12 +163,21 @@ pub enum GamepadPref {
     /// Puck dongle (`28DE:1304`) carrying a captured SC2. Host presents the
     /// native seven-interface Puck topology, not a relabelled wired `1302`.
     SteamController2Puck,
-    /// Windows-only Elite Series 2 HID (`045E:0B22` Bluetooth, UMDF). Paddles
-    /// still fold or drop: after Windows promotes the pad, `xinputhid` claims
-    /// the HID collection, so extra buttons may reach no consumer
-    /// (`design/xbox-pad-windows-handoff.md`). Off Windows this folds to
-    /// `Xbox360` (`PadIdentity` has 360 and One S only).
+    /// Xbox Elite Series 2. Linux: uinput `045E:0B00`, paddles on
+    /// `BTN_TRIGGER_HAPPY5-8`. Windows: HID `045E:0B22` (Bluetooth, UMDF), whose
+    /// report has no paddles; `xinputhid` may also claim the collection
+    /// (`design/xbox-pad-windows-handoff.md`).
     XboxElite,
+    /// 8BitDo Ultimate 2 Wireless in its own mode (`2DC8:6012`, Bluetooth identity): L4/R4 and
+    /// both back paddles, gyro, read by SDL's and Steam's `8bitdo` driver. Linux UHID, Windows
+    /// UMDF, as the three kinds below.
+    EightBitDoUltimate2,
+    /// 8BitDo Pro 2 in D-input (`2DC8:6003`): two back paddles, gyro.
+    EightBitDoPro2,
+    /// 8BitDo Pro 3 in D-input (`2DC8:6009`): L4/R4 and two back paddles, gyro.
+    EightBitDoPro3,
+    /// Wireless HORIPAD for Steam (`0F0D:01AB`): four rear buttons, QAM, gyro. No rumble.
+    HoripadSteam,
 }
 
 impl GamepadPref {
@@ -194,7 +203,11 @@ impl GamepadPref {
             | GamepadPref::SteamController
             | GamepadPref::SteamDeck
             | GamepadPref::SteamController2
-            | GamepadPref::SteamController2Puck => true,
+            | GamepadPref::SteamController2Puck
+            | GamepadPref::EightBitDoUltimate2
+            | GamepadPref::EightBitDoPro2
+            | GamepadPref::EightBitDoPro3
+            | GamepadPref::HoripadSteam => true,
         }
     }
 
@@ -212,6 +225,10 @@ impl GamepadPref {
             GamepadPref::SteamController2 => 9,
             GamepadPref::SteamController2Puck => 10,
             GamepadPref::XboxElite => 11,
+            GamepadPref::EightBitDoUltimate2 => 12,
+            GamepadPref::EightBitDoPro2 => 13,
+            GamepadPref::EightBitDoPro3 => 14,
+            GamepadPref::HoripadSteam => 15,
         }
     }
 
@@ -229,6 +246,10 @@ impl GamepadPref {
             9 => GamepadPref::SteamController2,
             10 => GamepadPref::SteamController2Puck,
             11 => GamepadPref::XboxElite,
+            12 => GamepadPref::EightBitDoUltimate2,
+            13 => GamepadPref::EightBitDoPro2,
+            14 => GamepadPref::EightBitDoPro3,
+            15 => GamepadPref::HoripadSteam,
             _ => GamepadPref::Auto,
         }
     }
@@ -259,6 +280,12 @@ impl GamepadPref {
             "steamcontroller2puck" | "steam-controller-2-puck" | "sc2puck" | "ibexpuck" => {
                 GamepadPref::SteamController2Puck
             }
+            "8bitdoultimate2" | "8bitdo-ultimate-2" | "ultimate2" => {
+                GamepadPref::EightBitDoUltimate2
+            }
+            "8bitdopro2" | "8bitdo-pro-2" | "pro2" => GamepadPref::EightBitDoPro2,
+            "8bitdopro3" | "8bitdo-pro-3" | "pro3" => GamepadPref::EightBitDoPro3,
+            "horipadsteam" | "horipad-steam" | "hori" => GamepadPref::HoripadSteam,
             _ => return None,
         })
     }
@@ -277,6 +304,10 @@ impl GamepadPref {
             GamepadPref::SteamController2 => "steamcontroller2",
             GamepadPref::SteamController2Puck => "steamcontroller2puck",
             GamepadPref::XboxElite => "xboxelite",
+            GamepadPref::EightBitDoUltimate2 => "8bitdoultimate2",
+            GamepadPref::EightBitDoPro2 => "8bitdopro2",
+            GamepadPref::EightBitDoPro3 => "8bitdopro3",
+            GamepadPref::HoripadSteam => "horipadsteam",
         }
     }
 }
@@ -803,6 +834,10 @@ mod tests {
             GamepadPref::SteamDeck,
             GamepadPref::SteamController2,
             GamepadPref::SteamController2Puck,
+            GamepadPref::EightBitDoUltimate2,
+            GamepadPref::EightBitDoPro2,
+            GamepadPref::EightBitDoPro3,
+            GamepadPref::HoripadSteam,
         ] {
             assert!(p.has_motion(), "{} should carry motion", p.as_str());
         }
@@ -854,11 +889,15 @@ mod tests {
             GamepadPref::SteamController2,
             GamepadPref::SteamController2Puck,
             GamepadPref::XboxElite,
+            GamepadPref::EightBitDoUltimate2,
+            GamepadPref::EightBitDoPro2,
+            GamepadPref::EightBitDoPro3,
+            GamepadPref::HoripadSteam,
         ] {
             assert_eq!(GamepadPref::from_u8(p.to_u8()), p);
             assert_eq!(GamepadPref::from_name(p.as_str()), Some(p));
         }
-        // Bytes 0..=11 are assigned and pinned; older peers may know only a prefix.
+        // Bytes 0..=15 are assigned and pinned; older peers may know only a prefix.
         for (v, p) in [
             (0, GamepadPref::Auto),
             (1, GamepadPref::Xbox360),
@@ -872,12 +911,16 @@ mod tests {
             (9, GamepadPref::SteamController2),
             (10, GamepadPref::SteamController2Puck),
             (11, GamepadPref::XboxElite),
+            (12, GamepadPref::EightBitDoUltimate2),
+            (13, GamepadPref::EightBitDoPro2),
+            (14, GamepadPref::EightBitDoPro3),
+            (15, GamepadPref::HoripadSteam),
         ] {
             assert_eq!(p.to_u8(), v);
             assert_eq!(GamepadPref::from_u8(v), p);
         }
         // Next unassigned byte degrades to Auto; assigning it later must update this.
-        assert_eq!(GamepadPref::from_u8(12), GamepadPref::Auto);
+        assert_eq!(GamepadPref::from_u8(16), GamepadPref::Auto);
         assert_eq!(GamepadPref::from_name("PS5"), Some(GamepadPref::DualSense));
         assert_eq!(GamepadPref::from_name("x360"), Some(GamepadPref::Xbox360));
         assert_eq!(GamepadPref::from_name("ps4"), Some(GamepadPref::DualShock4));

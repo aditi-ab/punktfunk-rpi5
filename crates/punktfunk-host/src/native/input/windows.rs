@@ -2,6 +2,7 @@
 //! identity. Xbox360 over XUSB is the common default and stays in `Pads`.
 
 use super::*;
+use crate::inject::eightbitdo_proto::Model as EightBitDo;
 use crate::inject::uhid_manager::UhidTick;
 
 /// Windows UMDF Triton backend.
@@ -25,6 +26,10 @@ pub(super) struct PadBackends {
     dualshock4_win: Option<crate::inject::dualshock4_windows::DualShock4WindowsManager>,
     steamdeck_win: Option<crate::inject::steam_deck_windows::SteamDeckWindowsManager>,
     switchpro_win: Option<crate::inject::switch_pro_windows::SwitchProWindowsManager>,
+    eightbitdo_ultimate2_win: Option<crate::inject::eightbitdo_windows::EightBitDoWindowsManager>,
+    eightbitdo_pro2_win: Option<crate::inject::eightbitdo_windows::EightBitDoWindowsManager>,
+    eightbitdo_pro3_win: Option<crate::inject::eightbitdo_windows::EightBitDoWindowsManager>,
+    horipad_win: Option<crate::inject::hori_windows::HoriWindowsManager>,
 }
 
 impl PadBackends {
@@ -61,6 +66,24 @@ impl PadBackends {
             GamepadPref::SteamDeck => self
                 .steamdeck_win
                 .get_or_insert_with(crate::inject::steam_deck_windows::SteamDeckWindowsManager::new)
+                .handle(ev),
+            GamepadPref::EightBitDoUltimate2 => self
+                .eightbitdo_ultimate2_win
+                .get_or_insert_with(|| {
+                    crate::inject::eightbitdo_windows::manager(EightBitDo::Ultimate2)
+                })
+                .handle(ev),
+            GamepadPref::EightBitDoPro2 => self
+                .eightbitdo_pro2_win
+                .get_or_insert_with(|| crate::inject::eightbitdo_windows::manager(EightBitDo::Pro2))
+                .handle(ev),
+            GamepadPref::EightBitDoPro3 => self
+                .eightbitdo_pro3_win
+                .get_or_insert_with(|| crate::inject::eightbitdo_windows::manager(EightBitDo::Pro3))
+                .handle(ev),
+            GamepadPref::HoripadSteam => self
+                .horipad_win
+                .get_or_insert_with(crate::inject::hori_windows::HoriWindowsManager::new)
                 .handle(ev),
             GamepadPref::SwitchPro => self
                 .switchpro_win
@@ -127,6 +150,26 @@ impl PadBackends {
                     m.apply_rich(rich)
                 }
             }
+            GamepadPref::EightBitDoUltimate2 => {
+                if let Some(m) = &mut self.eightbitdo_ultimate2_win {
+                    m.apply_rich(rich)
+                }
+            }
+            GamepadPref::EightBitDoPro2 => {
+                if let Some(m) = &mut self.eightbitdo_pro2_win {
+                    m.apply_rich(rich)
+                }
+            }
+            GamepadPref::EightBitDoPro3 => {
+                if let Some(m) = &mut self.eightbitdo_pro3_win {
+                    m.apply_rich(rich)
+                }
+            }
+            GamepadPref::HoripadSteam => {
+                if let Some(m) = &mut self.horipad_win {
+                    m.apply_rich(rich)
+                }
+            }
             _ => {}
         }
     }
@@ -149,6 +192,10 @@ impl PadBackends {
             dualshock4_win,
             steamdeck_win,
             switchpro_win,
+            eightbitdo_ultimate2_win,
+            eightbitdo_pro2_win,
+            eightbitdo_pro3_win,
+            horipad_win,
         } = self;
         [
             steamctrl2.as_mut().map(|m| m as &mut dyn UhidTick),
@@ -160,6 +207,12 @@ impl PadBackends {
             dualshock4_win.as_mut().map(|m| m as &mut dyn UhidTick),
             steamdeck_win.as_mut().map(|m| m as &mut dyn UhidTick),
             switchpro_win.as_mut().map(|m| m as &mut dyn UhidTick),
+            eightbitdo_ultimate2_win
+                .as_mut()
+                .map(|m| m as &mut dyn UhidTick),
+            eightbitdo_pro2_win.as_mut().map(|m| m as &mut dyn UhidTick),
+            eightbitdo_pro3_win.as_mut().map(|m| m as &mut dyn UhidTick),
+            horipad_win.as_mut().map(|m| m as &mut dyn UhidTick),
         ]
         .into_iter()
         .flatten()

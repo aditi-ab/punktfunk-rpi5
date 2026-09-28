@@ -84,6 +84,7 @@ impl XusbWinPad {
             // XInput finds the device by `GUID_DEVINTERFACE_XUSB`, not VID/PID.
             usb_vid_pid: None,
             usb_mi: None,
+            bluetooth: false,
             description: "Punktfunk Virtual Xbox 360 (XUSB)",
             enumerator: "punktfunk",
         })?;

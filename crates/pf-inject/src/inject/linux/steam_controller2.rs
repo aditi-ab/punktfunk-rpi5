@@ -39,6 +39,7 @@ impl TritonPad {
     /// every virtual pad uses.
     pub fn open(index: u8) -> Result<TritonPad> {
         let dev = UhidDevice::open(&Create2 {
+            bus: crate::uhid_abi::BUS_USB,
             name: &format!("Punktfunk Steam Controller 2 {index}"),
             phys: &format!("punktfunk/triton/{index}"),
             uniq: &format!("punktfunk-triton-{index}"),

@@ -306,6 +306,7 @@ const GAMEPADS: &[&str] = &[
     "auto",
     "xbox360",
     "xboxone",
+    "xboxelite",
     "dualsense",
     "dualsenseedge",
     "dualshock4",

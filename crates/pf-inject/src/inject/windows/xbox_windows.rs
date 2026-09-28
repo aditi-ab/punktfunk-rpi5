@@ -184,6 +184,7 @@ impl XboxWinPad {
                 // Bluetooth pad, not USB composite — no interface number. Deck
                 // Steam promotion needs `&MI_02`; Xbox does not.
                 usb_mi: None,
+                bluetooth: false,
                 description: id.description,
                 // The HID child becomes `HID\VID_045E&PID_…&IG_00`: Steam merges a pad's views by
                 // the VID/PID in its path, and under `punktfunk` it listed one Xbox pad twice.

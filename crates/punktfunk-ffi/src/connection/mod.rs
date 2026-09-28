@@ -461,8 +461,16 @@ pub const PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2: u32 = 9;
 /// Steam Controller Puck dongle: native seven-interface topology, four slots.
 /// For capture clients that own the physical Puck; wired/BLE SC2 stays `STEAMCONTROLLER2`.
 pub const PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2_PUCK: u32 = 10;
-/// Xbox Elite identity (Windows UMDF). Identity only — paddles still fold. Else X-Box 360.
+/// Xbox Elite identity. Linux hosts carry the paddles; Windows hosts drop them.
 pub const PUNKTFUNK_GAMEPAD_XBOXELITE: u32 = 11;
+/// 8BitDo Ultimate 2 Wireless (`2DC8:6012`): L4/R4, back paddles, gyro.
+pub const PUNKTFUNK_GAMEPAD_8BITDO_ULTIMATE2: u32 = 12;
+/// 8BitDo Pro 2 (`2DC8:6003`): back paddles, gyro.
+pub const PUNKTFUNK_GAMEPAD_8BITDO_PRO2: u32 = 13;
+/// 8BitDo Pro 3 (`2DC8:6009`): L4/R4, back paddles, gyro.
+pub const PUNKTFUNK_GAMEPAD_8BITDO_PRO3: u32 = 14;
+/// Wireless HORIPAD for Steam (`0F0D:01AB`): rear buttons, gyro.
+pub const PUNKTFUNK_GAMEPAD_HORIPAD_STEAM: u32 = 15;
 
 /// Extended `InputEvent` gamepad button bits: four back grips (Steam L4/L5/R4/R5 ≙
 /// Xbox-Elite P1–P4) + misc/capture, in Moonlight's `buttonFlags2 << 16` namespace.
@@ -590,6 +598,10 @@ const _: () = {
         PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2_PUCK == GamepadPref::SteamController2Puck.to_u8() as u32
     );
     assert!(PUNKTFUNK_GAMEPAD_XBOXELITE == GamepadPref::XboxElite.to_u8() as u32);
+    assert!(PUNKTFUNK_GAMEPAD_8BITDO_ULTIMATE2 == GamepadPref::EightBitDoUltimate2.to_u8() as u32);
+    assert!(PUNKTFUNK_GAMEPAD_8BITDO_PRO2 == GamepadPref::EightBitDoPro2.to_u8() as u32);
+    assert!(PUNKTFUNK_GAMEPAD_8BITDO_PRO3 == GamepadPref::EightBitDoPro3.to_u8() as u32);
+    assert!(PUNKTFUNK_GAMEPAD_HORIPAD_STEAM == GamepadPref::HoripadSteam.to_u8() as u32);
     // Extended button bits mirror the wire `input::gamepad` constants.
     assert!(PUNKTFUNK_GAMEPAD_BTN_PADDLE1 == g::BTN_PADDLE1);
     assert!(PUNKTFUNK_GAMEPAD_BTN_PADDLE2 == g::BTN_PADDLE2);

@@ -20,8 +20,12 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
-use pf_driver_proto::gamepad::{DEVTYPE_STEAMDECK, DEVTYPE_SWITCH_PRO, PadShm, pad_serial};
+use pf_driver_proto::gamepad::{
+    DEVTYPE_8BITDO_PRO2, DEVTYPE_8BITDO_PRO3, DEVTYPE_8BITDO_ULTIMATE2, DEVTYPE_HORIPAD_STEAM,
+    DEVTYPE_STEAMDECK, DEVTYPE_SWITCH_PRO, PadShm, pad_serial,
+};
 use pf_driver_proto::{deck, dualsense, dualshock4};
+use pf_driver_proto::{eightbitdo, hori};
 use pf_umdf_util::channel::{ChannelClient, ChannelConfig};
 use pf_umdf_util::hid::{
     IOCTL_HID_GET_DEVICE_ATTRIBUTES, IOCTL_HID_GET_DEVICE_DESCRIPTOR,
@@ -135,6 +139,15 @@ static XBOX_NO_SHARE_HID_DESC: [u8; 9] = [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x
 static TRITON_HID_DESC: [u8; 9] = [0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22, 0x74, 0x01]; // 372 bytes
 static SWITCH_HID_DESC: [u8; 9] = [0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22, 0xDD, 0x00]; // 221 bytes
 
+/// `HID_DESCRIPTOR` (bcdHID 0x0100, one report descriptor) for a written descriptor, sized from it.
+const fn hid_desc(rdesc_len: usize) -> [u8; 9] {
+    let len = (rdesc_len as u16).to_le_bytes();
+    [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, len[0], len[1]]
+}
+static EIGHTBITDO_HID_DESC: [u8; 9] = hid_desc(eightbitdo::RDESC_WITH_PROOF.len());
+static EIGHTBITDO_CAPS_HID_DESC: [u8; 9] = hid_desc(eightbitdo::RDESC_CAPS_WITH_PROOF.len());
+static HORI_HID_DESC: [u8; 9] = hid_desc(hori::RDESC_WITH_PROOF.len());
+
 // Each `wReportLength` above restates its descriptor's length. hidclass reads that many bytes and
 // parses what it got, so a mismatch silently enumerates a truncated descriptor or nothing. These
 // asserts stop a descriptor edit from building until its length follows.
@@ -157,6 +170,7 @@ fn hid_attrs(devtype: u8) -> [u8; 32] {
         4..=6 => XBOX_VER,
         7 => TRITON_VER,
         8 => SWITCH_VER,
+        DEVTYPE_8BITDO_ULTIMATE2..=DEVTYPE_HORIPAD_STEAM => 0x0100,
         _ => DS_VER,
     };
     let (vid, pid) =
@@ -194,6 +208,7 @@ fn input_report_len(devtype: u8) -> usize {
         4..=6 => pf_driver_proto::xbox::input_len(devtype),
         // = `triton::input_len(0x42)`, the largest input the 372-byte descriptor declares.
         7 => 54,
+        DEVTYPE_8BITDO_ULTIMATE2..=DEVTYPE_8BITDO_PRO3 => eightbitdo::REPORT_LEN,
         _ => 64,
     }
 }
@@ -277,6 +292,8 @@ fn neutral_report(devtype: u8) -> [u8; 64] {
         4..=6 => XBOX_NEUTRAL_REPORT,
         7 => TRITON_NEUTRAL_REPORT,
         8 => pf_driver_proto::switch::neutral_report(),
+        DEVTYPE_8BITDO_ULTIMATE2..=DEVTYPE_8BITDO_PRO3 => eightbitdo::NEUTRAL_REPORT,
+        DEVTYPE_HORIPAD_STEAM => hori::NEUTRAL_REPORT,
         _ => NEUTRAL_REPORT, // DualSense and Edge share the report 0x01 shape
     }
 }
@@ -748,6 +765,9 @@ extern "C" fn evt_io_device_control(
             5 | 6 => &XBOX_NO_SHARE_HID_DESC,
             7 => &TRITON_HID_DESC,
             8 => &SWITCH_HID_DESC,
+            DEVTYPE_8BITDO_ULTIMATE2 => &EIGHTBITDO_HID_DESC,
+            DEVTYPE_8BITDO_PRO2 | DEVTYPE_8BITDO_PRO3 => &EIGHTBITDO_CAPS_HID_DESC,
+            DEVTYPE_HORIPAD_STEAM => &HORI_HID_DESC,
             _ => &HID_DESC,
         }),
         IOCTL_HID_GET_DEVICE_ATTRIBUTES => request.copy_to_output(&hid_attrs(device_type())),
@@ -760,6 +780,8 @@ extern "C" fn evt_io_device_control(
             // host and the pf-inject layout tests read the SAME bytes (drift = test failure).
             7 => &pf_driver_proto::triton::RDESC[..],
             8 => &pf_driver_proto::switch::RDESC_WITH_PROOF[..],
+            dt @ DEVTYPE_8BITDO_ULTIMATE2..=DEVTYPE_8BITDO_PRO3 => eightbitdo::rdesc(dt, true),
+            DEVTYPE_HORIPAD_STEAM => &hori::RDESC_WITH_PROOF[..],
             _ => &dualsense::RDESC[..],
         }),
         IOCTL_HID_WRITE_REPORT | IOCTL_UMDF_HID_SET_OUTPUT_REPORT => {
@@ -1091,6 +1113,7 @@ fn on_get_feature(request: &Request) -> NTSTATUS {
     let devtype = device_type();
     let ds_pairing = dualsense::pairing_reply(devtype, pad_index());
     let ds4_pairing = dualshock4::pairing_reply(pad_index());
+    let caps = eightbitdo::caps_reply(devtype, pad_index());
     let blob: &[u8] = match (devtype, report_id) {
         (0 | 2, 0x05) => &dualsense::FEATURE_CALIBRATION,
         (0 | 2, 0x09) => &ds_pairing,
@@ -1098,6 +1121,7 @@ fn on_get_feature(request: &Request) -> NTSTATUS {
         (1, 0x02) => &dualshock4::FEATURE_CALIBRATION,
         (1, 0x12) => &ds4_pairing,
         (1, 0xA3) => &dualshock4::FEATURE_FIRMWARE,
+        (dt, eightbitdo::FEATURE_CAPS) if eightbitdo::has_caps(dt) => &caps,
         (_, other) => {
             dbglog!("[pf-gamepad] GET_FEATURE unknown report id 0x{other:02x}");
             return STATUS_INVALID_PARAMETER;
@@ -1125,6 +1149,8 @@ fn on_get_string(request: &Request) -> NTSTATUS {
             3 | 7 => "Valve Software".into(),
             4..=6 => "Microsoft".into(),
             8 => "Nintendo Co., Ltd.".into(),
+            DEVTYPE_8BITDO_ULTIMATE2..=DEVTYPE_8BITDO_PRO3 => "8BitDo".into(),
+            DEVTYPE_HORIPAD_STEAM => "HORI CO.,LTD.".into(),
             _ => "Sony Interactive Entertainment".into(),
         },
         // Per-pad serials: SDL reads this via HidD_GetSerialNumberString and Steam dedups pads
@@ -1146,6 +1172,10 @@ fn on_get_string(request: &Request) -> NTSTATUS {
             6 => "Xbox Elite Wireless Controller Series 2".into(),
             7 => "Steam Controller".into(),
             8 => "Pro Controller".into(),
+            DEVTYPE_8BITDO_ULTIMATE2 => "8BitDo Ultimate 2 Wireless".into(),
+            DEVTYPE_8BITDO_PRO2 => "8BitDo Pro 2".into(),
+            DEVTYPE_8BITDO_PRO3 => "8BitDo Pro 3".into(),
+            DEVTYPE_HORIPAD_STEAM => hori::NAME.into(),
             _ => "DualSense Wireless Controller".into(),
         },
     };
@@ -1154,7 +1184,8 @@ fn on_get_string(request: &Request) -> NTSTATUS {
 
 /// The device-type selector: 0 = DualSense, 1 = DualShock 4, 2 = DualSense Edge, 3 = Steam Deck,
 /// 4 = Xbox Wireless Controller, 5 = Xbox One S, 6 = Xbox Elite Wireless Controller Series 2,
-/// 7 = Steam Controller 2 ("Triton"), 8 = Switch Pro. Read fresh on each enumeration query.
+/// 7 = Steam Controller 2 ("Triton"), 8 = Switch Pro, 9–11 = 8BitDo Ultimate 2 / Pro 2 / Pro 3,
+/// 12 = HORIPAD for Steam. Read fresh on each enumeration query.
 ///
 /// ⚠️ **The sealed section cannot answer the enumeration queries.** hidclass asks for
 /// `GET_DEVICE_DESCRIPTOR` / `GET_REPORT_DESCRIPTOR` / `GET_DEVICE_ATTRIBUTES` while it STARTS the
@@ -1233,6 +1264,7 @@ fn tick(queue: WDFQUEUE) {
                         pf_driver_proto::triton::input_len(buf[0]).is_some()
                     }
                     DEVTYPE_SWITCH_PRO => buf[0] == 0x30,
+                    DEVTYPE_HORIPAD_STEAM => buf[0] == hori::REPORT_ID,
                     _ => buf[0] == 0x01,
                 })
                 && let Ok(mut g) = INPUT_REPORT.lock()

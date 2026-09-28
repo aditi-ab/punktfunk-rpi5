@@ -36,6 +36,7 @@ impl SwitchProPad {
     /// `index` is name/uniq and the virtual MAC. BUS_USB selects hid-nintendo's USB probe.
     pub fn open(index: u8) -> Result<SwitchProPad> {
         let dev = UhidDevice::open(&Create2 {
+            bus: crate::uhid_abi::BUS_USB,
             name: &format!("Punktfunk Switch Pro Controller {index}"),
             phys: &format!("punktfunk/switchpro/{index}"),
             uniq: &format!("punktfunk-swpro-{index}"),

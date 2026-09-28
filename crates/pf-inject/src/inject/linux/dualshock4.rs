@@ -30,6 +30,7 @@ impl DualShock4Pad {
     /// `hid-playstation` keys uniqueness off the pairing-report MAC.
     pub fn open(index: u8) -> Result<DualShock4Pad> {
         let dev = UhidDevice::open(&Create2 {
+            bus: crate::uhid_abi::BUS_USB,
             name: &format!("Punktfunk DualShock 4 {index}"),
             phys: &format!("punktfunk/dualshock4/{index}"),
             uniq: &format!("punktfunk-ds4-{index}"),

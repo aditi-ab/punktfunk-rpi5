@@ -135,6 +135,10 @@ describe("shapes", () => {
 			"steamcontroller2",
 			"steamcontroller2puck",
 			"switchpro",
+			"8bitdoultimate2",
+			"8bitdopro2",
+			"8bitdopro3",
+			"horipadsteam",
 			"auto",
 		];
 		for (const k of kinds) expect(SHAPES[familyOf(k)]).toBeDefined();
@@ -142,6 +146,8 @@ describe("shapes", () => {
 		expect(familyOf("steamdeck")).toBe("steam");
 		expect(familyOf("switchpro")).toBe("switch");
 		expect(familyOf("xboxelite")).toBe("xbox");
+		expect(familyOf("8bitdopro2")).toBe("switch");
+		expect(familyOf("8bitdoultimate2")).toBe("xbox");
 	});
 
 	test("each shape places two sticks and a full face cluster", () => {
