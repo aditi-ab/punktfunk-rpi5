@@ -439,11 +439,13 @@ impl<T: Clone> Dpb<T> {
         debug!("Clearing the DPB");
 
         let max_num_pics = self.max_num_pics;
+        let max_num_reorder_frames = self.max_num_reorder_frames;
         let interlaced = self.interlaced;
 
         *self = Default::default();
 
         self.max_num_pics = max_num_pics;
+        self.max_num_reorder_frames = max_num_reorder_frames;
         self.interlaced = interlaced;
     }
 
@@ -502,6 +504,23 @@ impl<T: Clone> Dpb<T> {
     pub fn bump_as_needed(&mut self, current_pic: &PictureData) -> Vec<Option<T>> {
         let mut pics = vec![];
         while self.needs_bumping(current_pic) && self.len() >= self.max_num_reorder_frames {
+            match self.bump() {
+                Some(pic) => pics.push(pic),
+                None => return pics,
+            }
+            self.remove_unused();
+        }
+
+        pics
+    }
+
+    /// Output on the reorder bound, which C.4.5.3 alone never does. E.2.1: at most
+    /// `max_num_reorder_frames` pictures precede a picture in decoding order and
+    /// follow it in output order. Once more than that wait, the lowest POC is next.
+    pub fn bump_past_reorder_bound(&mut self) -> Vec<Option<T>> {
+        let mut pics = vec![];
+        while self.entries.iter().filter(|e| e.is_bumpable()).count() > self.max_num_reorder_frames
+        {
             match self.bump() {
                 Some(pic) => pics.push(pic),
                 None => return pics,
