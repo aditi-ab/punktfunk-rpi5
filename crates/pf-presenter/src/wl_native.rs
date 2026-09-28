@@ -61,7 +61,7 @@ const KIND_ZERO_COPY: u32 = 8;
 /// linux-dmabuf tranche flag: this tranche's buffers can go straight to a plane.
 const TRANCHE_SCANOUT: u32 = 1;
 
-/// The lane arms on every Wayland session unless `PUNKTFUNK_NATIVE_SCANOUT=0`.
+/// `PUNKTFUNK_NATIVE_SCANOUT=1` arms the lane.
 pub fn enabled() -> bool {
     pf_client_core::video::native_scanout_wanted()
 }
