@@ -930,9 +930,10 @@ impl LibraryScreen {
         }
     }
 
-    /// Titles to decode next: on screen last frame first, rows included, then the view from
-    /// its first drawn title on, so a scroll decodes ahead. Capped well under
-    /// [`ART_BUDGET`], or eviction and decode would chase each other round a long library.
+    /// Titles to decode next: on screen last frame first, rows included, then the next
+    /// `AHEAD` places of the view from its first drawn title, so a scroll decodes ahead.
+    /// A window of places, well under [`ART_BUDGET`]: counting only the covers still missing
+    /// walks the whole library as they land, and eviction then chases the decoder round it.
     fn art_wanted(&self) -> Vec<String> {
         const AHEAD: usize = 48;
         let recent = self.frame.saturating_sub(2);
@@ -947,10 +948,7 @@ impl LibraryScreen {
             .cloned()
             .collect();
         let first_seen = (self.view.iter()).position(|&g| seen(&self.games[g].id));
-        for &g in self.view.iter().skip(first_seen.unwrap_or(0)) {
-            if out.len() >= AHEAD {
-                break;
-            }
+        for &g in self.view.iter().skip(first_seen.unwrap_or(0)).take(AHEAD) {
             let id = &self.games[g].id;
             if lacking(id) && !out.contains(id) {
                 out.push(id.clone());
@@ -3060,6 +3058,32 @@ mod tests {
                 endable: false,
             })
             .collect()
+    }
+
+    /// Covers already held do not push the decode-ahead further down the library.
+    #[test]
+    fn decode_ahead_is_a_window_of_places() {
+        crate::screens::settings::tests::fake_home();
+        let library = LibraryShared::default();
+        let titles: Vec<String> = (0..300).map(|i| format!("Title {i:03}")).collect();
+        let spec: Vec<(&str, Option<&str>)> = titles.iter().map(|t| (t.as_str(), None)).collect();
+        library.set_games(games(&spec));
+        let mut s = LibraryScreen::new(&host());
+        s.all_titles();
+        s.sync(&library);
+        let poster = skia_safe::surfaces::raster_n32_premul((4, 6))
+            .expect("a raster surface")
+            .image_snapshot();
+        let held: Vec<String> = s
+            .view
+            .iter()
+            .take(48)
+            .map(|&g| s.games[g].id.clone())
+            .collect();
+        for id in held {
+            s.art.insert(id, poster.clone());
+        }
+        assert_eq!(s.art_wanted(), Vec::<String>::new());
     }
 
     /// First list is always "fresh" on an empty screen; adopted art must survive that, not a later one.
