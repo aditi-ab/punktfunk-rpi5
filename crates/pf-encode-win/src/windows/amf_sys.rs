@@ -69,6 +69,7 @@ pub const AMF_HEADER_VERSION: u64 = (1u64 << 48) | (4u64 << 32) | (36u64 << 16);
 pub const AMF_MIN_VERSION: u64 = (1u64 << 48) | (4u64 << 32) | (30u64 << 16);
 
 pub const AMF_SURFACE_NV12: i32 = 1;
+pub const AMF_SURFACE_BGRA: i32 = 3;
 pub const AMF_SURFACE_P010: i32 = 10;
 
 /// `InitDX11` version argument: header `AMF_DX11_1` is 111, not 11.

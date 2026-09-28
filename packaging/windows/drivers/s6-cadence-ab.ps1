@@ -5,22 +5,21 @@
   on the virtual display's compose cadence under a FurMark load.
 
 .DESCRIPTION
-  READ THIS BEFORE ACTING ON THE NUMBER. S6 measures cadence, but cadence is not what decides the
-  spike. §2.5 row 1 promises that a blocked encoder leaves the drain worker unaffected, and G3
-  requires a hard-blocked encoder to cost one IDR and never a compose hitch. The bypass holds
-  `FinishedProcessingFrame` on the encoder, so a bounded hold on the head breaks both by
-  construction. A cadence PASS here therefore cannot be adopted without reopening the fault model;
-  a FAIL is simply the plan's own fail path (keep the pool, G3 is met at one pass). The run is
-  worth its twenty minutes because the plan asks for the number, not because the number decides.
+  READ THIS BEFORE ACTING ON THE NUMBER. S6 measures cadence, but cadence is not the whole
+  decision. §2.5 row 1 promises that a blocked encoder leaves the drain worker unaffected, and G3
+  requires a hard-blocked encoder to cost one IDR and never a compose hitch. The bypass holds the
+  next acquire on the encoder, bounded at 100 ms, so a blocked encoder does hitch this head. AMF
+  takes the bypass by default because its pass costs the game more than that; for any other
+  backend a cadence PASS here is one input, next to that fault model.
 
-  ONE driver binary, built --features pool-bypass and deployed before this runs. The legs differ
-  only by the machine knob PFVD_POOL_BYPASS, which a fresh WUDFHost reads once - so each leg
-  cycles the adapter (reset-pf-vdisplay.ps1) to mint one. The knob goes in the machine Environment
-  key, which the driver's `knob()` reads live; host.env cannot reach it, because WUDFHost is not
-  the host process.
+  ONE driver binary, deployed before this runs. The legs differ only by the machine knob
+  PFVD_POOL_BYPASS, which the driver reads at every encoder open - each leg still cycles the
+  adapter (reset-pf-vdisplay.ps1), so both start on a fresh WUDFHost. The knob goes in the
+  machine Environment key, which the driver's `knob()` reads live; host.env cannot reach it,
+  because WUDFHost is not the host process.
 
-    leg A  knob cleared  -> the fused pass into a pool slot, Finished at once
-    leg B  knob set      -> the encoder reads the acquired surface, Finished on its completion
+    leg A  knob 0  -> the fused pass into a pool slot
+    leg B  knob 1  -> the encoder reads the acquired surface, the next acquire on its completion
 
   The instrument is the driver's own "[pf-vd] cadence:" line - PresentDisplayQPCTime deltas in
   eighth frame periods, stamped after FinishedProcessingFrame in BOTH modes, and present in a
@@ -32,9 +31,10 @@
   re-parked every 15 s. Without that the streamed desktop composes nothing, DWM presents nothing,
   and both legs measure an idle desktop. -NoLoad skips it and says so.
 
-  Bypass only engages on a BGRA input kind (NVENC, SDR, 8-bit; 4:2:0 or 4:4:4). An HDR or 10-bit
-  session opens P010 and the pass is mandatory - the leg B header then says mode=pool and the run
-  is VOID. The report says so rather than comparing two identical legs.
+  Bypass only engages on a BGRA input kind (NVENC or AMF, SDR, 8-bit). An HDR or 10-bit session
+  opens P010 and the pass is mandatory - the leg B header then says mode=pool and the run is
+  VOID. The report says so rather than comparing two identical legs. A frame the host draws a
+  visible pointer on takes the pass, whatever the header says.
 
   Run ELEVATED, on the box, from a detached console-user task (kick-task.ps1): FurMark and the
   client both need the console session. Arguments carry no commas and no colons.
@@ -146,9 +146,8 @@ function Set-Knob([string]$name, [string]$value) {
 
 function Invoke-Leg([string]$name, [bool]$bypass) {
     Say "--- leg $name (bypass=$bypass) ---"
-    Set-Knob 'PFVD_POOL_BYPASS' $(if ($bypass) { '1' } else { '' })
-    # The adapter cycle is what mints a WUDFHost that reads the knob: bypass_enabled() and
-    # file_log_enabled() both resolve once per process.
+    Set-Knob 'PFVD_POOL_BYPASS' $(if ($bypass) { '1' } else { '0' })
+    # The adapter cycle mints a fresh WUDFHost: file_log_enabled() resolves once per process.
     & pwsh -NoProfile -File $Reset *>&1 | Add-Content $Log
     Start-Service $Service -ErrorAction SilentlyContinue
     Start-Sleep 8
@@ -279,9 +278,8 @@ $ra = Show-Leg $a
 $rb = Show-Leg $b
 Say ''
 if ($rb.Mode -notmatch 'mode=bypass') {
-    Say 'VOID: leg bypass ran on the pool. Either the deployed driver was not built'
-    Say '      --features pool-bypass, or the session opened a kind the bypass cannot take'
-    Say '      (P010 or planar). Re-run SDR 8-bit against a pool-bypass driver.'
+    Say 'VOID: leg bypass ran on the pool. The session opened a kind the bypass cannot'
+    Say '      take (P010 or planar). Re-run SDR 8-bit.'
 }
 elseif ($ra.N -eq 0 -or $rb.N -eq 0) {
     Say 'VOID: a leg produced no cadence samples - check PFVD_DEBUG_LOG and the driver log path'

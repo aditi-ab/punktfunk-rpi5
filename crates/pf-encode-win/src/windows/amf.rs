@@ -6,9 +6,11 @@
 //! per driver, not vtable changes. Loads `amfrt64.dll` at runtime — no build feature. Missing or
 //! old runtime fails [`AmfEncoder::open`] and the session.
 //!
-//! Input is a same-device D3D11 NV12/P010 texture ring: `CopySubresourceRegion` then
-//! `CreateSurfaceFromDX11Native`. No readback: Bgra/Rgb10a2 or CPU frames fail open/submit.
-//! VCN does not encode 4:4:4. Evidence: `design/native-amf-encoder.md`.
+//! Input is a same-device D3D11 texture in NV12, P010 or BGRA: the caller's own when it
+//! declared a ring depth, else a `CopySubresourceRegion` into [`Inner::ring`], then
+//! `CreateSurfaceFromDX11Native`. BGRA is converted by VCN, so no pass of ours runs on the 3D
+//! engine. No readback: Rgb10a2 or CPU frames fail open/submit. VCN does not encode 4:4:4.
+//! Evidence: `design/native-amf-encoder.md`.
 
 use super::policy::{intra_refresh_period, intra_refresh_requested, ltr_test_force_at};
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
@@ -28,7 +30,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Storage::FileSystem::{
     GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO,
@@ -250,6 +252,8 @@ const AV1_LATENCY_LOWEST: i64 = 3;
 // `AMF_VIDEO_CONVERTER_COLOR_PROFILE_ENUM` (components/ColorSpace.h): studio-range 709 / 2020.
 const COLOR_PROFILE_709: i64 = 1;
 const COLOR_PROFILE_2020: i64 = 2;
+/// `AMF_VIDEO_CONVERTER_COLOR_PROFILE_FULL_709`: full-range RGB, as a desktop composes it.
+const COLOR_PROFILE_FULL_709: i64 = 7;
 // `AMF_COLOR_TRANSFER_CHARACTERISTIC_ENUM` / `AMF_COLOR_PRIMARIES_ENUM` (CICP code points).
 const TRANSFER_BT709: i64 = 1;
 const TRANSFER_SMPTE2084: i64 = 16;
@@ -295,6 +299,12 @@ struct CodecProps {
     out_color_profile: &'static HSTRING,
     out_transfer: &'static HSTRING,
     out_primaries: &'static HSTRING,
+    /// Input colour, set for a BGRA input only: VCN converts it, and AMF's defaults for an
+    /// RGB input do not describe a desktop.
+    in_color_profile: &'static HSTRING,
+    in_transfer: &'static HSTRING,
+    in_primaries: &'static HSTRING,
+    in_full_range: &'static HSTRING,
     /// `*InHDRMetadata` (`AMFBuffer` of [`sys::AmfHdrMetadata`]). `None` on AVC — no HDR on the wire.
     hdr_metadata: Option<&'static HSTRING>,
     /// Intra-refresh: (units-per-slot, block edge px). AVC 16-px MBs, HEVC 64-px CTBs. `None` on
@@ -359,6 +369,10 @@ fn codec_props(codec: Codec) -> CodecProps {
             out_color_profile: h!("OutColorProfile"),
             out_transfer: h!("OutColorTransferChar"),
             out_primaries: h!("OutColorPrimaries"),
+            in_color_profile: h!("InColorProfile"),
+            in_transfer: h!("InColorTransferChar"),
+            in_primaries: h!("InColorPrimaries"),
+            in_full_range: h!("InputFullRangeColor"),
             hdr_metadata: None,
             intra_refresh: Some((h!("IntraRefreshMBsNumberPerSlot"), 16)),
             ltr: Some(LtrProps {
@@ -394,6 +408,10 @@ fn codec_props(codec: Codec) -> CodecProps {
             out_color_profile: h!("HevcOutColorProfile"),
             out_transfer: h!("HevcOutColorTransferChar"),
             out_primaries: h!("HevcOutColorPrimaries"),
+            in_color_profile: h!("HevcInColorProfile"),
+            in_transfer: h!("HevcInColorTransferChar"),
+            in_primaries: h!("HevcInColorPrimaries"),
+            in_full_range: h!("HevcInputFullRangeColor"),
             hdr_metadata: Some(h!("HevcInHDRMetadata")),
             intra_refresh: Some((h!("HevcIntraRefreshCTBsNumberPerSlot"), 64)),
             ltr: Some(LtrProps {
@@ -429,6 +447,10 @@ fn codec_props(codec: Codec) -> CodecProps {
             out_color_profile: h!("Av1OutputColorProfile"),
             out_transfer: h!("Av1OutputColorTransferChar"),
             out_primaries: h!("Av1OutputColorPrimaries"),
+            in_color_profile: h!("Av1InputColorProfile"),
+            in_transfer: h!("Av1InputColorTransferChar"),
+            in_primaries: h!("Av1InputColorPrimaries"),
+            in_full_range: h!("Av1InputFullRangeColor"),
             hdr_metadata: Some(h!("Av1InHDRMetadata")),
             intra_refresh: None,
             ltr: Some(LtrProps {
@@ -610,13 +632,14 @@ impl Component {
         unsafe { ((*(*self.0).vtbl).submit_input)(self.0, surface.0) }
     }
 
-    /// `QueryOutput`: the result plus the output, owned, when there is one.
+    /// `QueryOutput`: the result plus the output, owned, when there is one. The guard is
+    /// built lazily: one around a null pointer would release through it when dropped.
     fn query_output(&self) -> (sys::AmfResult, Option<OwnedData>) {
         let mut data: *mut sys::AmfData = ptr::null_mut();
         // SAFETY: live component; `data` is a local out-param that holds one owned reference
         // whenever AMF fills it.
         let r = unsafe { ((*(*self.0).vtbl).query_output)(self.0, &mut data) };
-        (r, (!data.is_null()).then_some(OwnedData(data)))
+        (r, (!data.is_null()).then(|| OwnedData(data)))
     }
 }
 
@@ -785,6 +808,16 @@ impl Drop for Buffer {
     }
 }
 
+/// The AMF surface format and the ring's texture format for an input this encoder takes.
+fn input_formats(input: PixelFormat) -> Option<(i32, DXGI_FORMAT)> {
+    match input {
+        PixelFormat::Nv12 => Some((sys::AMF_SURFACE_NV12, DXGI_FORMAT_NV12)),
+        PixelFormat::P010 => Some((sys::AMF_SURFACE_P010, DXGI_FORMAT_P010)),
+        PixelFormat::Bgra => Some((sys::AMF_SURFACE_BGRA, DXGI_FORMAT_B8G8R8A8_UNORM)),
+        _ => None,
+    }
+}
+
 /// Input texture ring depth. AMF keeps reading a slot until its AU is retrieved, so at most
 /// `RING - 1` frames may be in flight. `submit` drains before reuse. Shallow enough that
 /// back-pressure starts after a few frames, not after AMF's 16-deep input queue.
@@ -928,6 +961,8 @@ pub struct AmfEncoder {
     height: u32,
     fps: u32,
     bitrate_bps: u64,
+    /// What every submitted texture holds: NV12, P010 or BGRA ([`input_formats`]).
+    input: PixelFormat,
     ten_bit: bool,
     /// BT.2020 PQ (HDR) vs BT.709 (SDR). Independent of `ten_bit`: 10-bit SDR is Main10 under
     /// BT.709. P010 is the ring for both, so the colour signalling follows this, not the format.
@@ -972,8 +1007,8 @@ unsafe impl Send for AmfEncoder {}
 
 impl AmfEncoder {
     /// Open the native AMF encoder. Fails the session when the runtime is missing/too old or the
-    /// capture format is not NV12/P010. AV1 is probed up front (RDNA3+; same [`probe_can_encode`]
-    /// as the advertisement).
+    /// capture format is none of [`input_formats`]. AV1 is probed up front (RDNA3+; same
+    /// [`probe_can_encode`] as the advertisement).
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         codec: Codec,
@@ -1002,18 +1037,9 @@ impl AmfEncoder {
         }
         // Depth follows delivered pixels, not negotiated depth ([`crate::ten_bit_input`]).
         let ten_bit = crate::ten_bit_input(format, bit_depth);
-        // Ring is NV12/P010 only. Any other capture format has no native input path.
-        let expected = if ten_bit {
-            PixelFormat::P010
-        } else {
-            PixelFormat::Nv12
-        };
-        if format != expected {
-            bail!(
-                "native AMF needs the video-processor {expected:?} capture path; capturer \
-                 delivered {format:?} (no readback path since Phase 3 — see the AMFVideoConverter \
-                 note in §3.2)"
-            );
+        // Any other capture format has no native input path, and there is no readback.
+        if input_formats(format).is_none() {
+            bail!("native AMF takes NV12, P010 or BGRA textures; capturer delivered {format:?}");
         }
         if ten_bit && codec == Codec::H264 {
             bail!("native AMF: 10-bit is HEVC-only (H.264 High10 is not a VCN mode)");
@@ -1029,6 +1055,7 @@ impl AmfEncoder {
             height,
             fps,
             bitrate_bps,
+            input: format,
             ten_bit,
             hdr,
             inner: None,
@@ -1157,7 +1184,7 @@ impl AmfEncoder {
             Codec::H264 => {
                 // Never B-frames: a full frame of latency each (RDNA3+ defaults > 0).
                 comp.set_prop(h!("BPicturesPattern"), AmfVariant::from_i64(0), false)?;
-                // Limited-range YUV (matches the video processor's NV12).
+                // Limited-range YUV out, whichever input the ring holds.
                 comp.set_prop(h!("FullRangeColor"), AmfVariant::from_bool(false), false)?;
             }
             Codec::H265 => {
@@ -1167,7 +1194,7 @@ impl AmfEncoder {
                     AmfVariant::from_i64(HEVC_HEADER_IDR_ALIGNED),
                     false,
                 )?;
-                // Studio range, matching NV12/P010 video-processor output.
+                // Studio range out, whichever input the ring holds.
                 comp.set_prop(h!("HevcNominalRange"), AmfVariant::from_i64(0), false)?;
                 if self.ten_bit {
                     // Main10 + 10-bit surfaces: required — silent 8-bit HDR is worse than failing open.
@@ -1240,6 +1267,16 @@ impl AmfEncoder {
         comp.set_prop(p.out_color_profile, AmfVariant::from_i64(profile), self.hdr)?;
         comp.set_prop(p.out_transfer, AmfVariant::from_i64(transfer), self.hdr)?;
         comp.set_prop(p.out_primaries, AmfVariant::from_i64(primaries), self.hdr)?;
+        // BGRA in: VCN converts to the studio-range output above. The profile is required —
+        // it carries the range, and a runtime left guessing washes the picture out. A refusal
+        // fails this open and the caller falls back to NV12.
+        if self.input == PixelFormat::Bgra {
+            let full_709 = AmfVariant::from_i64(COLOR_PROFILE_FULL_709);
+            comp.set_prop(p.in_color_profile, full_709, true)?;
+            comp.set_prop(p.in_transfer, AmfVariant::from_i64(TRANSFER_BT709), false)?;
+            comp.set_prop(p.in_primaries, AmfVariant::from_i64(PRIMARIES_BT709), false)?;
+            comp.set_prop(p.in_full_range, AmfVariant::from_bool(true), false)?;
+        }
         Ok((ir_active, ltr_active))
     }
 
@@ -1276,11 +1313,7 @@ impl AmfEncoder {
         amf_ok(r, "AMF InitDX11 (capturer device)")?;
         let mut comp = lib.create_component(&ctx, self.props.component)?;
         let (ir_active, ltr_active) = self.apply_static_props(&comp)?;
-        let fmt = if self.ten_bit {
-            sys::AMF_SURFACE_P010
-        } else {
-            sys::AMF_SURFACE_NV12
-        };
+        let (fmt, ring_format) = input_formats(self.input).context("AMF input format")?;
         amf_ok(
             comp.init(fmt, self.width as i32, self.height as i32),
             "AMF encoder Init",
@@ -1299,11 +1332,7 @@ impl AmfEncoder {
             Height: self.height,
             MipLevels: 1,
             ArraySize: 1,
-            Format: if self.ten_bit {
-                DXGI_FORMAT_P010
-            } else {
-                DXGI_FORMAT_NV12
-            },
+            Format: ring_format,
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
@@ -1330,7 +1359,7 @@ impl AmfEncoder {
             width = self.width,
             height = self.height,
             fps = self.fps,
-            ring = if self.ten_bit { "P010" } else { "NV12" },
+            ring = ?self.input,
             ltr = ltr_active,
             intra_refresh = ir_active,
             runtime = %format_args!(
@@ -1559,17 +1588,12 @@ impl AmfEncoder {
             }
         };
         // Mid-session format fallback: CopySubresourceRegion across format groups is UB. No readback.
-        let expected = if self.ten_bit {
-            PixelFormat::P010
-        } else {
-            PixelFormat::Nv12
-        };
         anyhow::ensure!(
-            captured.format == expected,
+            captured.format == self.input,
             "captured format {:?} != AMF input ring {:?} (capturer video-processor fallback \
              mid-session — native AMF has no readback path)",
             captured.format,
-            expected
+            self.input
         );
         self.ensure_inner(&frame.device)?;
         let cur_idx = self.frame_idx;
@@ -2440,6 +2464,94 @@ mod tests {
             resumed.windows(2).all(|w| w[1] == w[0] + 1),
             "AUs after the flush are paired off by one: {resumed:?}"
         );
+    }
+
+    /// Live BGRA input per codec: VCN converts, so the encoder takes what the display
+    /// composes. Both submit modes must return an access unit per frame — the ring copy, and
+    /// the caller's own texture in place, which is how the driver's pool submits. Skips
+    /// without AMD.
+    #[test]
+    fn amf_bgra_encode_live_smoke() {
+        use crate::smoke_d3d11::bgra_texture;
+        use crate::smoke_pattern::scroll_pattern;
+        if let Err(e) = try_factory() {
+            eprintln!("skipping: AMF runtime unavailable ({e})");
+            return;
+        }
+        let Some(device) = amd_d3d11_device() else {
+            eprintln!("skipping: no AMD adapter on this box");
+            return;
+        };
+        let (w, h, fps) = (640u32, 480u32, 60u32);
+        // The binds of the driver's BGRA pool slots.
+        let bind = BIND_SR | D3D11_BIND_RENDER_TARGET.0 as u32;
+        let texs: Vec<ID3D11Texture2D> = (0..3)
+            .map(|i| {
+                let px = scroll_pattern(w as usize, h as usize, i);
+                bgra_texture(&device, w, h, Some(&px), bind)
+            })
+            .collect();
+        const FRAMES: usize = 12;
+        for in_place in [false, true] {
+            for codec in [Codec::H265, Codec::H264, Codec::Av1] {
+                if codec == Codec::Av1 && !probe_can_encode_on(&device, codec) {
+                    eprintln!("skipping Av1: this AMD GPU's native probe declined it");
+                    continue;
+                }
+                let mut enc = AmfEncoder::open(
+                    codec,
+                    PixelFormat::Bgra,
+                    w,
+                    h,
+                    fps,
+                    2_000_000,
+                    8,
+                    ChromaFormat::Yuv420,
+                    false,
+                    None,
+                )
+                .expect("open on BGRA");
+                if in_place {
+                    // Three textures in rotation, two in flight: the third is always free.
+                    enc.set_input_ring_depth(2);
+                }
+                let mut aus = Vec::new();
+                for i in 0..FRAMES {
+                    let frame = CapturedFrame {
+                        provenance: Default::default(),
+                        width: w,
+                        height: h,
+                        pts_ns: 1 + i as u64,
+                        format: PixelFormat::Bgra,
+                        payload: FramePayload::D3d11(pf_frame::dxgi::D3d11Frame {
+                            texture: texs[i % texs.len()].clone(),
+                            device: device.clone(),
+                            pyro: None,
+                        }),
+                        cursor: None,
+                    };
+                    enc.submit(&frame).expect("submit");
+                    if let Some(au) = enc.poll().expect("poll") {
+                        aus.push(au);
+                    }
+                }
+                enc.flush().expect("flush");
+                for _ in 0..50 {
+                    match enc.poll().expect("drain poll") {
+                        Some(au) => aus.push(au),
+                        None => break,
+                    }
+                }
+                eprintln!(
+                    "{codec:?} in_place={in_place}: {} AUs of {FRAMES}, {} bytes",
+                    aus.len(),
+                    aus.iter().map(|a| a.data.len()).sum::<usize>()
+                );
+                assert_eq!(aus.len(), FRAMES, "{codec:?} in_place={in_place}");
+                assert!(aus[0].keyframe, "{codec:?}: the stream starts on an IDR");
+                assert_eq!(aus[0].pts_ns, 1, "FIFO pts pairing");
+            }
+        }
     }
 
     #[test]
