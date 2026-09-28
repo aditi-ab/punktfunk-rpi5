@@ -118,8 +118,6 @@ fn imported_release_barrier(
         .image(image)
         .subresource_range(color_range(0))
 }
-/// Max resident dmabuf imports. Above any PipeWire pool; imports alias existing buffers.
-const IMPORT_CACHE_CAP: usize = 16;
 // RGB→NV12 BT.709 CSC. Source `rgb2yuv.comp`; regenerate with
 // `glslangValidator -V rgb2yuv.comp -o rgb2yuv.spv`.
 const CSC_SPV: &[u8] = include_bytes!("rgb2yuv.spv");
@@ -758,6 +756,8 @@ struct Frame {
     /// "producer must not rewrite" across the async GPU read; the host's clone dies at the
     /// next capture, which with a ring of 2 is before this slot finishes.
     src_hold: Option<pf_frame::FrameHold>,
+    /// The dmabuf this slot reads while it is in flight, by [`CachedImport`] key.
+    src_key: Option<(u64, u64)>,
 }
 
 /// What a session opens for. [`VulkanVideoEncoder::open`] resolves it once and the session keeps
@@ -2094,6 +2094,12 @@ impl VulkanVideoEncoder {
     /// Import a dmabuf, reusing a cached import when the same underlying buffer recurs. Keyed by
     /// `(st_dev, st_ino)` because each `DmabufFrame` owns a fresh dup (new fd, same inode).
     /// `fresh` is true only on first import (UNDEFINED old-layout preserves modifier-tiled data).
+    ///
+    /// The cache is as deep as the ring and no deeper: one import per frame that can be in
+    /// flight, a repeat's among them. RADV lists every resident import in every submission,
+    /// and amdgpu then orders that submission behind whatever paints any of them: an import
+    /// of a buffer the producer is rendering into makes each encode wait on that render, and
+    /// the render on the encode.
     unsafe fn import_cached(
         &mut self,
         d: &pf_frame::DmabufFrame,
@@ -2103,9 +2109,12 @@ impl VulkanVideoEncoder {
         // fstat failed → uncacheable sentinel; still owned by the cache and freed on evict/Drop.
         let key = pf_zerocopy::fd_identity(d.fd.as_fd()).unwrap_or((u64::MAX, self.enc_count));
         if let Some(pos) = self.import_cache.iter().position(|e| e.key == key) {
-            let e = &self.import_cache[pos];
-            if e.extent == (cw, ch) {
-                return Ok((e.img, e.view, false));
+            if self.import_cache[pos].extent == (cw, ch) {
+                // Most recently used last: eviction takes the front.
+                let e = self.import_cache.remove(pos);
+                let hit = (e.img, e.view, false);
+                self.import_cache.push(e);
+                return Ok(hit);
             }
             // Key hit, wrong extent: inode now names a different allocation. Evict rather than
             // hand out a stale-sized image. In-flight frames may still read the old image, so
@@ -2132,14 +2141,15 @@ impl VulkanVideoEncoder {
                 return Err(e);
             }
         };
-        // FIFO eviction. Up to `ring_depth - 1` submitted frames may still execute against a
-        // cached image, so destroying an evicted import is a GPU-side use-after-free unless we
-        // idle first. Guarded on the length test so the steady-state (no-evict) path pays nothing.
-        if self.import_cache.len() >= IMPORT_CACHE_CAP {
-            let _ = self.device.device_wait_idle();
-        }
-        while self.import_cache.len() >= IMPORT_CACHE_CAP {
+        // Least recently used first. Every frame in flight read its import after the victim
+        // was last used, so none reads the victim; destroying one that is read is a GPU-side
+        // use-after-free, so a victim found in flight idles the device first.
+        while self.import_cache.len() >= self.frames.len().max(1) {
             let e = self.import_cache.remove(0);
+            let read = |&s: &usize| self.frames[s].src_key == Some(e.key);
+            if self.in_flight.iter().any(read) {
+                let _ = self.device.device_wait_idle();
+            }
             self.device.destroy_image_view(e.view, None);
             self.device.destroy_image(e.img, None);
             self.device.free_memory(e.mem, None);
@@ -4025,9 +4035,11 @@ impl VulkanVideoEncoder {
         // Take the deferred-requeue hold before recording: encode reads the dmabuf until this
         // slot's fence retires. Assigned even if `record_submit` fails — over-hold is harmless,
         // released-while-referenced is the race this closes.
-        self.frames[slot].src_hold = match &frame.payload {
-            FramePayload::Dmabuf(d) => d.hold.clone(),
-            _ => None,
+        (self.frames[slot].src_hold, self.frames[slot].src_key) = match &frame.payload {
+            FramePayload::Dmabuf(d) => {
+                (d.hold.clone(), pf_zerocopy::fd_identity(d.fd.as_fd()).ok())
+            }
+            _ => (None, None),
         };
         self.record_submit(slot, frame, wire)?;
         self.in_flight.push_back(slot);

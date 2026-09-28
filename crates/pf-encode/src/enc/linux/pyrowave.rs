@@ -51,8 +51,6 @@ const CSC444_10_709_SPV: &[u8] = include_bytes!("rgb2yuv444_10_709.spv");
 /// Cursor overlay cap (px). The CSC shader bounds sampling by push constant, so one
 /// allocation fits every pointer bitmap.
 const CURSOR_MAX: u32 = 256;
-/// Max resident dmabuf imports. PipeWire cycles a small fixed pool.
-const IMPORT_CACHE_CAP: usize = 16;
 /// Headroom over the per-frame rate budget for block headers + meta; the rate
 /// controller itself never exceeds the budget.
 const BS_SLACK: usize = 256 * 1024;
@@ -434,6 +432,8 @@ struct InFlight {
     cpu_ns: [u64; 4],
     /// Keeps a raw producer buffer stable through the GPU read.
     _src_hold: Option<pf_frame::FrameHold>,
+    /// The dmabuf this frame reads, by `import_cache` key.
+    src_key: Option<(u64, u64)>,
 }
 
 pub struct PyroWaveEncoder {
@@ -1542,6 +1542,11 @@ impl PyroWaveEncoder {
     /// `(st_dev, st_ino)`: each `DmabufFrame` owns a fresh dup of the same inode. A hit is
     /// always the right size, because `submit_frame` refuses a frame off the session mode.
     /// `fresh` is true only on first import.
+    ///
+    /// One import per slot and no more. RADV lists every resident import in every
+    /// submission, and amdgpu then orders that submission behind whatever paints any of
+    /// them: an import of a buffer the producer is rendering into makes each encode wait on
+    /// that render, and the render on the encode.
     unsafe fn import_cached(
         &mut self,
         d: &pf_frame::DmabufFrame,
@@ -1549,8 +1554,11 @@ impl PyroWaveEncoder {
         ch: u32,
     ) -> Result<(vk::Image, vk::ImageView, bool)> {
         let key = pf_zerocopy::fd_identity(d.fd.as_fd()).unwrap_or((u64::MAX, self.frame_count));
-        if let Some(&(_, _, img, _, view)) = self.import_cache.iter().find(|e| (e.0, e.1) == key) {
-            return Ok((img, view, false));
+        if let Some(pos) = self.import_cache.iter().position(|e| (e.0, e.1) == key) {
+            // Most recently used last: eviction takes the front.
+            let e = self.import_cache.remove(pos);
+            self.import_cache.push(e);
+            return Ok((e.2, e.4, false));
         }
         // Deterministic import refusal rebuilds this capture on its safe offer.
         // Transient OOM stays out of the sticky verdict.
@@ -1567,13 +1575,14 @@ impl PyroWaveEncoder {
                     return Err(e);
                 }
             };
-        // FIFO eviction. The other slot may still sample the oldest import, so idle the
-        // device before destroying it. Only the evicting path pays for the wait.
-        if self.import_cache.len() >= IMPORT_CACHE_CAP {
-            let _ = self.device.device_wait_idle();
-        }
-        while self.import_cache.len() >= IMPORT_CACHE_CAP {
-            let (_, _, oi, om, ov) = self.import_cache.remove(0);
+        // Least recently used first. Every frame in flight read its import after the victim
+        // was last used, so none samples the victim; one found in flight idles the device
+        // before it is destroyed.
+        while self.import_cache.len() >= SLOTS {
+            let (dev, ino, oi, om, ov) = self.import_cache.remove(0);
+            if self.inflight.iter().any(|f| f.src_key == Some((dev, ino))) {
+                let _ = self.device.device_wait_idle();
+            }
             self.device.destroy_image_view(ov, None);
             self.device.destroy_image(oi, None);
             self.device.free_memory(om, None);
@@ -1970,6 +1979,10 @@ impl PyroWaveEncoder {
                 FramePayload::Dmabuf(d) => d.hold.clone(),
                 _ => None,
             },
+            src_key: match &frame.payload {
+                FramePayload::Dmabuf(d) => pf_zerocopy::fd_identity(d.fd.as_fd()).ok(),
+                _ => None,
+            },
         });
         Ok(())
     }
@@ -2312,6 +2325,7 @@ mod tests {
             t0: std::time::Instant::now(),
             cpu_ns: [0; 4],
             _src_hold: Some(hold.clone()),
+            src_key: None,
         };
         assert_eq!(std::sync::Arc::strong_count(&hold), 2);
         drop(frame);
