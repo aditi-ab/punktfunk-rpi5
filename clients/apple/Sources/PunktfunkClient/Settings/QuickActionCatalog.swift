@@ -121,6 +121,6 @@ var previewRingActions: RingActions {
         hostActions: { previewHosts }, invokeHost: { _ in },
         sendShortcut: { _ in },
         padAvailable: { true }, padShown: { false }, togglePad: {}, tapPadButton: { _ in },
-        pointerGranted: { true }, padMouseTarget: { 1 }, padMouseOn: { false }, togglePadMouse: {},
+        pointerGranted: { true }, padMouseTarget: { 1 }, padMouseMode: { .off }, cyclePadMouse: {},
         currentMode: { (1920, 1080, 60) }, requestMode: { _, _, _ in })
 }

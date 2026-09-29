@@ -421,6 +421,37 @@ impl InputKind {
 /// accumulators.
 pub const MAX_PADS: usize = 16;
 
+/// What controller mouse does with a pad. `Touchpad` keeps the pad in the game and moves the
+/// pointer with its touchpads; `Full` makes the whole pad a mouse.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PadMouseMode {
+    #[default]
+    Off = 0,
+    Touchpad = 1,
+    Full = 2,
+}
+
+impl PadMouseMode {
+    pub fn from_u8(v: u8) -> Option<PadMouseMode> {
+        match v {
+            0 => Some(PadMouseMode::Off),
+            1 => Some(PadMouseMode::Touchpad),
+            2 => Some(PadMouseMode::Full),
+            _ => None,
+        }
+    }
+
+    /// The dial's next step: off, touchpad, full, off.
+    pub fn next(self) -> PadMouseMode {
+        match self {
+            PadMouseMode::Off => PadMouseMode::Touchpad,
+            PadMouseMode::Touchpad => PadMouseMode::Full,
+            PadMouseMode::Full => PadMouseMode::Off,
+        }
+    }
+}
+
 /// One pad's complete state packed into a single [`InputKind::GamepadState`] event
 /// (the 18-byte layout, nothing appended):
 ///

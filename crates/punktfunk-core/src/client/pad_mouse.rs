@@ -1,16 +1,19 @@
-//! Controller mouse: pads the embedder flags drive the host's pointer, buttons, scroll and a few
-//! keys instead of its virtual pad (`design/controller-mouse-mode.md`).
+//! Controller mouse: pads the embedder flags drive the host's pointer
+//! (`design/controller-mouse-mode.md`). [`PadMouseMode::Touchpad`] keeps a pad in the game and
+//! moves the pointer with its touchpads ([`super::pad_touch`]); [`PadMouseMode::Full`] turns the
+//! whole pad into a mouse and a few keys.
 //!
 //! The translator is pure — pad state in, `InputEvent`s out — so the input task owns every send.
 //! Buttons are levels, not edges: each fold recomputes the outputs a pad wants held and emits only
 //! the difference, so two sources on one output (A and RT on the left button) cannot double-press.
 //! Buttons already held when a pad enters stay ignored until they release, so the B that closed
-//! the dial never lands as Escape. Stick speed scales with the stream height: the same hand-feel
-//! on a 1080p and a 4K desktop.
+//! the dial never lands as Escape. Stick speed and touchpad travel scale with the stream height:
+//! the same hand-feel on a 1080p and a 4K desktop.
 
+use super::pad_touch::{Contact, Touchpads};
 use crate::input::gamepad::*;
 use crate::input::scroll::{ScrollEvent, ScrollPhase, ScrollSource, SCROLL_SCALE};
-use crate::input::{GamepadSnapshot, InputEvent, InputKind, MAX_PADS};
+use crate::input::{GamepadSnapshot, InputEvent, InputKind, PadMouseMode, MAX_PADS};
 use crate::quic::{GRANT_KEYBOARD, GRANT_POINTER};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
@@ -32,9 +35,9 @@ const FALLBACK_HEIGHT: u32 = 1080;
 const TRIGGER_L: u32 = 1 << 30;
 const TRIGGER_R: u32 = 1 << 31;
 
-const MOUSE_LEFT: u32 = 1;
+pub(super) const MOUSE_LEFT: u32 = 1;
 const MOUSE_MIDDLE: u32 = 2;
-const MOUSE_RIGHT: u32 = 3;
+pub(super) const MOUSE_RIGHT: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Out {
@@ -42,7 +45,8 @@ enum Out {
     Key(u8),
 }
 
-/// Source bits → output, one entry per output bit. Back and paddles are left to the client.
+/// Source bits → output, one entry per output bit. Back and paddles are left to the client; the
+/// touchpad click belongs to [`super::pad_touch`].
 const MAP: [(u32, Out); 14] = [
     (BTN_A | TRIGGER_R, Out::Mouse(MOUSE_LEFT)),
     (BTN_X | TRIGGER_L, Out::Mouse(MOUSE_RIGHT)),
@@ -60,10 +64,14 @@ const MAP: [(u32, Out); 14] = [
     (BTN_GUIDE, Out::Key(0x5B)),
 ];
 
-/// The embedder's request, shared between `NativeClient` and the input task.
+/// The embedder's request, shared between `NativeClient` and the input task. A pad sits in at
+/// most one mask.
 #[derive(Default)]
 pub(crate) struct PadMouseShared {
+    /// Pads in [`PadMouseMode::Full`].
     requested: AtomicU16,
+    /// Pads in [`PadMouseMode::Touchpad`].
+    touchpad: AtomicU16,
     /// Pads the host holds: declared or driven, not yet removed. Written by the input task.
     live: AtomicU16,
     pub(crate) changed: tokio::sync::Notify,
@@ -78,16 +86,45 @@ impl PadMouseShared {
         self.live.store(mask, Ordering::Relaxed);
     }
 
+    /// Exactly the pads in `mask` become full mice; the others leave full mode.
     pub(crate) fn request(&self, mask: u16) {
         self.requested.store(mask, Ordering::Relaxed);
+        self.touchpad.fetch_and(!mask, Ordering::Relaxed);
         self.changed.notify_one();
+    }
+
+    /// Put every pad in `target` in `mode`; the other pads keep theirs.
+    pub(crate) fn set_mode(&self, target: u16, mode: PadMouseMode) {
+        let (full, touchpad) = match mode {
+            PadMouseMode::Off => (0, 0),
+            PadMouseMode::Touchpad => (0, target),
+            PadMouseMode::Full => (target, 0),
+        };
+        self.requested.fetch_and(!target, Ordering::Relaxed);
+        self.requested.fetch_or(full, Ordering::Relaxed);
+        self.touchpad.fetch_and(!target, Ordering::Relaxed);
+        self.touchpad.fetch_or(touchpad, Ordering::Relaxed);
+        self.changed.notify_one();
+    }
+
+    /// The mode every pad in `target` shares under `grants`; a mixed set reads as off.
+    pub(crate) fn mode(&self, target: u16, grants: u32) -> PadMouseMode {
+        if target == 0 {
+            PadMouseMode::Off
+        } else if self.active(grants) & target == target {
+            PadMouseMode::Full
+        } else if self.touchpad_active(grants) & target == target {
+            PadMouseMode::Touchpad
+        } else {
+            PadMouseMode::Off
+        }
     }
 
     pub(crate) fn requested(&self) -> u16 {
         self.requested.load(Ordering::Relaxed)
     }
 
-    /// Pads in mouse mode under `grants`: none without the pointer grant.
+    /// Full-mouse pads under `grants`: none without the pointer grant.
     pub(crate) fn active(&self, grants: u32) -> u16 {
         if grants & GRANT_POINTER != 0 {
             self.requested()
@@ -96,18 +133,29 @@ impl PadMouseShared {
         }
     }
 
+    /// Touchpad-mouse pads under `grants`: none without the pointer grant.
+    pub(crate) fn touchpad_active(&self, grants: u32) -> u16 {
+        if grants & GRANT_POINTER != 0 {
+            self.touchpad.load(Ordering::Relaxed)
+        } else {
+            0
+        }
+    }
+
     pub(crate) fn clear(&self, pad: usize) {
         self.requested.fetch_and(!(1 << pad), Ordering::Relaxed);
+        self.touchpad.fetch_and(!(1 << pad), Ordering::Relaxed);
     }
 
     pub(crate) fn clear_all(&self) {
         self.requested.store(0, Ordering::Relaxed);
+        self.touchpad.store(0, Ordering::Relaxed);
     }
 }
 
 #[derive(Clone, Copy, Default)]
 struct Pad {
-    on: bool,
+    mode: PadMouseMode,
     snap: GamepadSnapshot,
     /// Sources held at enter, dropped bit by bit as they release.
     ignore: u32,
@@ -119,6 +167,7 @@ struct Pad {
     rem: [f64; 4],
     /// Scroll axes mid-gesture; a neutral stick owes an End.
     scroll_active: [bool; 2],
+    touchpads: Touchpads,
 }
 
 impl Pad {
@@ -151,7 +200,7 @@ fn curve(x: i16, y: i16) -> (f64, f64) {
     (fx * s, fy * s)
 }
 
-fn event(kind: InputKind, code: u32, x: i32, y: i32, flags: u32) -> InputEvent {
+pub(super) fn event(kind: InputKind, code: u32, x: i32, y: i32, flags: u32) -> InputEvent {
     InputEvent {
         kind,
         _pad: [0; 3],
@@ -162,9 +211,14 @@ fn event(kind: InputKind, code: u32, x: i32, y: i32, flags: u32) -> InputEvent {
     }
 }
 
-fn scroll_event(axis: u32, delta: i32, phase: ScrollPhase) -> InputEvent {
+pub(super) fn scroll_event(
+    source: ScrollSource,
+    axis: u32,
+    delta: i32,
+    phase: ScrollPhase,
+) -> InputEvent {
     ScrollEvent {
-        source: ScrollSource::Controller,
+        source,
         phase,
         axis,
         delta,
@@ -189,11 +243,15 @@ fn granted(out: Out, grants: u32) -> bool {
 }
 
 /// Whole units out of `*rem + v`, the fraction carried.
-fn take(rem: &mut f64, v: f64) -> i32 {
+pub(super) fn take(rem: &mut f64, v: f64) -> i32 {
     *rem += v;
     let whole = rem.trunc();
     *rem -= whole;
     whole as i32
+}
+
+pub(super) fn stream_height(height: u32) -> f64 {
+    f64::from(if height == 0 { FALLBACK_HEIGHT } else { height })
 }
 
 #[derive(Default)]
@@ -202,20 +260,20 @@ pub(crate) struct PadMouse {
 }
 
 impl PadMouse {
+    pub(crate) fn mode(&self, pad: usize) -> PadMouseMode {
+        self.pads.get(pad).map_or(PadMouseMode::Off, |p| p.mode)
+    }
+
+    /// The whole pad is a mouse: its buttons and sticks fold here instead of the host snapshot.
     pub(crate) fn is_on(&self, pad: usize) -> bool {
-        self.pads.get(pad).is_some_and(|p| p.on)
+        self.mode(pad) == PadMouseMode::Full
     }
 
-    pub(crate) fn on_mask(&self) -> u16 {
-        (0..MAX_PADS)
-            .filter(|&i| self.pads[i].on)
-            .fold(0, |m, i| m | 1 << i)
-    }
-
-    /// Start translating `pad` from its current state. Held buttons stay ignored until released.
-    pub(crate) fn enter(&mut self, pad: usize, snap: GamepadSnapshot) {
+    /// Start translating `pad` in `mode` from its current state. Held buttons stay ignored until
+    /// released.
+    pub(crate) fn enter(&mut self, pad: usize, mode: PadMouseMode, snap: GamepadSnapshot) {
         let mut p = Pad {
-            on: true,
+            mode,
             snap,
             ..Pad::default()
         };
@@ -225,23 +283,24 @@ impl PadMouse {
 
     /// Release every output `pad` holds and stop translating it.
     pub(crate) fn leave(&mut self, pad: usize) -> Vec<InputEvent> {
-        let p = std::mem::take(&mut self.pads[pad]);
+        let mut p = std::mem::take(&mut self.pads[pad]);
         let mut evs: Vec<_> = (0..2u32)
             .filter(|&axis| p.scroll_active[axis as usize])
-            .map(|axis| scroll_event(axis, 0, ScrollPhase::Cancel))
+            .map(|axis| scroll_event(ScrollSource::Controller, axis, 0, ScrollPhase::Cancel))
             .collect();
         evs.extend(
             (0..MAP.len())
                 .filter(|i| p.out & 1 << i != 0)
                 .map(|i| press(MAP[i].1, false)),
         );
+        evs.extend(p.touchpads.release());
         evs
     }
 
-    /// Fold one button/axis event and emit the output edges it causes.
+    /// Fold one button/axis event of a full-mouse pad and emit the output edges it causes.
     pub(crate) fn fold(&mut self, pad: usize, ev: &InputEvent, grants: u32) -> Vec<InputEvent> {
         let p = &mut self.pads[pad];
-        if !p.on || !p.snap.fold(ev) {
+        if p.mode != PadMouseMode::Full || !p.snap.fold(ev) {
             return Vec::new();
         }
         let sources = p.sources();
@@ -262,12 +321,36 @@ impl PadMouse {
             .collect()
     }
 
-    /// True while a translated pad has motion or an open scroll gesture.
+    /// A touchpad contact of a pad in either mode.
+    pub(crate) fn contact(&mut self, c: Contact, height: u32, grants: u32) -> Vec<InputEvent> {
+        match self.pads.get_mut(usize::from(c.pad)) {
+            Some(p) if p.mode != PadMouseMode::Off => p.touchpads.contact(c, height, grants),
+            _ => Vec::new(),
+        }
+    }
+
+    /// `BTN_TOUCHPAD` of a pad in either mode: the click never reaches the host pad.
+    pub(crate) fn touchpad_click(
+        &mut self,
+        pad: usize,
+        down: bool,
+        grants: u32,
+    ) -> Vec<InputEvent> {
+        match self.pads.get_mut(pad) {
+            Some(p) if p.mode != PadMouseMode::Off => {
+                p.touchpads.button_click(down, grants).into_iter().collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// True while a full-mouse pad has stick motion or an open scroll gesture.
     pub(crate) fn moving(&self) -> bool {
         self.pads.iter().any(|p| {
-            p.on && (curve(p.snap.ls_x, p.snap.ls_y) != (0.0, 0.0)
-                || curve(p.snap.rs_x, p.snap.rs_y) != (0.0, 0.0)
-                || p.scroll_active.iter().any(|&active| active))
+            p.mode == PadMouseMode::Full
+                && (curve(p.snap.ls_x, p.snap.ls_y) != (0.0, 0.0)
+                    || curve(p.snap.rs_x, p.snap.rs_y) != (0.0, 0.0)
+                    || p.scroll_active.iter().any(|&active| active))
         })
     }
 
@@ -277,11 +360,14 @@ impl PadMouse {
         if grants & GRANT_POINTER == 0 {
             return evs;
         }
-        let h = f64::from(if height == 0 { FALLBACK_HEIGHT } else { height });
         let dt = dt_s.clamp(0.0, MAX_DT);
-        let px = POINTER_HEIGHTS_PER_S * h * dt;
+        let px = POINTER_HEIGHTS_PER_S * stream_height(height) * dt;
         let units = SCROLL_HEIGHTS_PER_S * f64::from(FALLBACK_HEIGHT) * SCROLL_SCALE * dt;
-        for p in self.pads.iter_mut().filter(|p| p.on) {
+        for p in self
+            .pads
+            .iter_mut()
+            .filter(|p| p.mode == PadMouseMode::Full)
+        {
             let (cx, cy) = curve(p.snap.ls_x, p.snap.ls_y);
             let dx = take(&mut p.rem[0], cx * px);
             let dy = take(&mut p.rem[1], -cy * px);
@@ -293,7 +379,12 @@ impl PadMouse {
                 if velocity == 0.0 {
                     p.rem[remainder] = 0.0;
                     if std::mem::take(&mut p.scroll_active[axis]) {
-                        evs.push(scroll_event(axis as u32, 0, ScrollPhase::End));
+                        evs.push(scroll_event(
+                            ScrollSource::Controller,
+                            axis as u32,
+                            0,
+                            ScrollPhase::End,
+                        ));
                     }
                     continue;
                 }
@@ -304,7 +395,12 @@ impl PadMouse {
                     } else {
                         ScrollPhase::Begin
                     };
-                    evs.push(scroll_event(axis as u32, delta, phase));
+                    evs.push(scroll_event(
+                        ScrollSource::Controller,
+                        axis as u32,
+                        delta,
+                        phase,
+                    ));
                 }
             }
         }
@@ -331,7 +427,7 @@ mod tests {
 
     fn entered() -> PadMouse {
         let mut m = PadMouse::default();
-        m.enter(0, GamepadSnapshot::default());
+        m.enter(0, PadMouseMode::Full, GamepadSnapshot::default());
         m
     }
 
@@ -405,6 +501,7 @@ mod tests {
         let mut m = PadMouse::default();
         m.enter(
             0,
+            PadMouseMode::Full,
             GamepadSnapshot {
                 buttons: BTN_B,
                 ..Default::default()
@@ -529,6 +626,43 @@ mod tests {
     }
 
     #[test]
+    fn touch_reaches_only_a_pad_in_a_mouse_mode() {
+        let lead = |x: f64| Contact {
+            pad: 0,
+            surface: 0,
+            finger: 0,
+            touch: true,
+            click: None,
+            x,
+            y: 0.5,
+            raw: false,
+        };
+        let mut m = PadMouse::default();
+        m.contact(lead(0.1), 1080, GRANT_ALL);
+        assert!(m.contact(lead(0.9), 1080, GRANT_ALL).is_empty(), "off");
+        assert!(m.touchpad_click(0, true, GRANT_ALL).is_empty(), "off");
+        m.enter(0, PadMouseMode::Touchpad, GamepadSnapshot::default());
+        m.contact(lead(0.1), 1080, GRANT_ALL);
+        assert_eq!(
+            m.contact(lead(0.2), 1080, GRANT_ALL)[0].kind,
+            InputKind::MouseMove
+        );
+        assert!(
+            m.fold(0, &button(BTN_A, true), GRANT_ALL).is_empty(),
+            "a touchpad-mode pad keeps its buttons in the game"
+        );
+        assert_eq!(
+            kinds(&m.touchpad_click(0, true, GRANT_ALL)),
+            [(InputKind::MouseButtonDown, MOUSE_LEFT)]
+        );
+        assert_eq!(
+            kinds(&m.leave(0)),
+            [(InputKind::MouseButtonUp, MOUSE_LEFT)],
+            "leaving lifts the click"
+        );
+    }
+
+    #[test]
     fn a_long_stall_is_clamped() {
         let mut m = entered();
         m.fold(0, &axis(AXIS_LS_X, 32767), GRANT_ALL);
@@ -544,9 +678,23 @@ mod tests {
         assert_eq!(s.active(GRANT_KEYBOARD), 0);
         s.clear(2);
         assert_eq!(s.requested(), 0b001);
+        assert_eq!(s.mode(0b001, GRANT_ALL), PadMouseMode::Full);
+        assert_eq!(s.mode(0b001, GRANT_KEYBOARD), PadMouseMode::Off);
+
+        s.set_mode(0b011, PadMouseMode::Touchpad);
+        assert_eq!((s.requested(), s.touchpad_active(GRANT_ALL)), (0, 0b011));
+        assert_eq!(s.mode(0b011, GRANT_ALL), PadMouseMode::Touchpad);
+        s.set_mode(0b001, PadMouseMode::Full);
+        assert_eq!(
+            s.mode(0b011, GRANT_ALL),
+            PadMouseMode::Off,
+            "a mixed set reads as off"
+        );
+        s.request(0b010);
+        assert_eq!((s.requested(), s.touchpad_active(GRANT_ALL)), (0b010, 0));
         let mut m = PadMouse::default();
-        m.enter(3, GamepadSnapshot::default());
-        assert_eq!(m.on_mask(), 0b1000);
+        m.enter(3, PadMouseMode::Full, GamepadSnapshot::default());
+        assert!(m.is_on(3) && !m.is_on(2));
     }
 
     /// Every row of [`MAP`], down and up, plus both triggers. Changing any row fails here.

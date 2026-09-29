@@ -397,14 +397,11 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         tapPadButton = { bit -> activity?.gamepadRouter?.tapButton(bit) },
         pointerGranted = { ui.accessGrants and SessionAccess.POINTER != 0 },
         padMouseTarget = { padMouseTarget(ring, activity?.gamepadRouter) },
-        padMouseOn = {
-            val t = padMouseTarget(ring, activity?.gamepadRouter)
-            t != 0 && (NativeBridge.nativePadMouse(handle) and t) == t
+        padMouseMode = {
+            NativeBridge.nativePadMouseMode(handle, padMouseTarget(ring, activity?.gamepadRouter))
         },
-        togglePadMouse = {
-            val t = padMouseTarget(ring, activity?.gamepadRouter)
-            val on = NativeBridge.nativePadMouse(handle)
-            NativeBridge.nativeSetPadMouse(handle, if ((on and t) == t) on and t.inv() else on or t)
+        cyclePadMouse = {
+            NativeBridge.nativeCyclePadMouse(handle, padMouseTarget(ring, activity?.gamepadRouter))
         },
         audioMute = { ui.audioMute },
         audioMuteLabel = { ui.audioMuteLabel },

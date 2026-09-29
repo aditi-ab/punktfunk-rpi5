@@ -16,7 +16,7 @@
 use crate::clipboard::{ClipCommand, ClipEventCore};
 use crate::config::{CompositorPref, GamepadPref, Mode};
 use crate::error::{PunktfunkError, Result};
-use crate::input::InputEvent;
+use crate::input::{InputEvent, PadMouseMode};
 use crate::quic::{
     endpoint, ClipControl, ClipKind, ClipOffer, ColorInfo, HdrMeta, HidOutput, PadAudioFrame,
     ProbeRequest, RfiRequest, RichInput,
@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 mod control;
 pub(crate) mod frame_channel;
 mod pad_mouse;
+mod pad_touch;
 mod pairing;
 mod planes;
 mod probe;
@@ -247,6 +248,8 @@ pub struct NativeClient {
     /// Pre-encoded 0xCC bytes ([`RichInput`] and [`crate::quic::PenBatch`]). Worker forwards;
     /// a new 0xCC kind never touches the pump.
     rich_input_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    /// Touchpad contacts of controller-mouse pads, for the input task's pointer.
+    pad_touch_tx: tokio::sync::mpsc::UnboundedSender<pad_touch::Contact>,
     /// Bounded ([`CTRL_QUEUE`]). Sparse; full means the control task is wedged — treat as closed.
     ctrl_tx: tokio::sync::mpsc::Sender<CtrlRequest>,
     clip: Mutex<Receiver<ClipEventCore>>,
@@ -603,6 +606,8 @@ impl NativeClient {
         let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
         let (mic_tx, mic_rx) = tokio::sync::mpsc::channel::<(u32, u64, Vec<u8>)>(MIC_QUEUE);
         let (rich_input_tx, rich_input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (pad_touch_tx, pad_touch_rx) =
+            tokio::sync::mpsc::unbounded_channel::<pad_touch::Contact>();
         let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel::<CtrlRequest>(CTRL_QUEUE);
         let (clip_event_tx, clip_event_rx) =
             std::sync::mpsc::sync_channel::<ClipEventCore>(CLIP_EVENT_QUEUE);
@@ -655,6 +660,7 @@ impl NativeClient {
                     input_rx,
                     mic_rx,
                     rich_input_rx,
+                    pad_touch_rx,
                     ctrl_rx,
                     ctrl_tx: ctrl_tx_pump,
                     clip_event_tx,
@@ -705,6 +711,7 @@ impl NativeClient {
             input_tx,
             mic_tx,
             rich_input_tx,
+            pad_touch_tx,
             ctrl_tx,
             clip: Mutex::new(clip_event_rx),
             clip_cmd_tx,
@@ -1523,10 +1530,11 @@ impl NativeClient {
         }
     }
 
-    /// Switch the pads in `mask` (bit = wire pad index) to controller mouse: their buttons and
-    /// sticks drive the host pointer and a few keys while the host pad sits neutral. The rest
-    /// forward as usual. Session-scoped; a removed pad drops its bit. Needs
-    /// [`GRANT_POINTER`](crate::quic::GRANT_POINTER), and losing it clears the mask.
+    /// Switch the pads in `mask` (bit = wire pad index) to full controller mouse: their buttons,
+    /// sticks and touchpads drive the host pointer and a few keys while the host pad sits
+    /// neutral. Every other full-mouse pad goes back to passthrough. Session-scoped; a removed
+    /// pad drops its bit. Needs [`GRANT_POINTER`](crate::quic::GRANT_POINTER), and losing it
+    /// clears every mode.
     pub fn set_pad_mouse(&self, mask: u16) -> Result<()> {
         if mask != 0 && self.access_grants() & crate::quic::GRANT_POINTER == 0 {
             return Err(PunktfunkError::Unsupported(
@@ -1546,7 +1554,29 @@ impl NativeClient {
         self.shared.scroll_invert.load(Ordering::Relaxed)
     }
 
-    /// Pads the embedder switched to controller mouse and that are still connected.
+    /// The controller-mouse mode every pad in `target` shares; a mixed set reads as off.
+    pub fn pad_mouse_mode(&self, target: u16) -> PadMouseMode {
+        self.shared.pad_mouse.mode(target, self.access_grants())
+    }
+
+    /// Step the pads in `target` to the next mode (off, touchpad, full) and return it. In
+    /// touchpad mode the pads stay in the game and only their touchpads drive the pointer.
+    /// Needs [`GRANT_POINTER`](crate::quic::GRANT_POINTER).
+    pub fn cycle_pad_mouse(&self, target: u16) -> Result<PadMouseMode> {
+        if self.access_grants() & crate::quic::GRANT_POINTER == 0 {
+            return Err(PunktfunkError::Unsupported(
+                "host did not grant pointer input",
+            ));
+        }
+        if target == 0 {
+            return Ok(PadMouseMode::Off);
+        }
+        let next = self.pad_mouse_mode(target).next();
+        self.shared.pad_mouse.set_mode(target, next);
+        Ok(next)
+    }
+
+    /// Pads in full controller mouse that are still connected.
     pub fn pad_mouse(&self) -> u16 {
         self.shared.pad_mouse.active(self.access_grants())
     }
@@ -1557,10 +1587,22 @@ impl NativeClient {
     }
 
     /// DualSense touchpad/motion (0xCC). Best-effort. No-op unless the host runs DualSense.
-    /// Dropped for a controller-mouse pad, so its gyro cannot aim the neutral host pad.
-    pub fn send_rich_input(&self, rich: RichInput) -> Result<()> {
-        if self.pad_mouse() & 1u16.checked_shl(u32::from(rich.pad())).unwrap_or(0) != 0 {
-            return Ok(());
+    /// Under controller mouse a pad's touchpads move the pointer instead, and a full-mouse pad
+    /// keeps its gyro too, so it cannot aim the neutral host pad.
+    pub fn send_rich_input(&self, mut rich: RichInput) -> Result<()> {
+        let bit = 1u16.checked_shl(u32::from(rich.pad())).unwrap_or(0);
+        let grants = self.access_grants();
+        let full = self.shared.pad_mouse.active(grants) & bit != 0;
+        if full || self.shared.pad_mouse.touchpad_active(grants) & bit != 0 {
+            let (contacts, forward) = pad_touch::route(&mut rich, full);
+            for c in contacts {
+                self.pad_touch_tx
+                    .send(c)
+                    .map_err(|_| PunktfunkError::Closed)?;
+            }
+            if !forward {
+                return Ok(());
+            }
         }
         self.rich_input_tx
             .send(rich.encode())

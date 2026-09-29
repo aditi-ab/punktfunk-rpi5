@@ -60,6 +60,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         input_rx,
         mut mic_rx,
         mut rich_input_rx,
+        pad_touch_rx,
         ctrl_rx,
         ctrl_tx,
         clip_event_tx,
@@ -150,6 +151,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
     tokio::spawn(input_task::run(
         conn.clone(),
         input_rx,
+        pad_touch_rx,
         gamepad_snapshots,
         pad_audio_arrivals,
         input_task::MouseArgs {
