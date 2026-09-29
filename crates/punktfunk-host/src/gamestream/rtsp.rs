@@ -7,8 +7,9 @@
 //! One native thread per connection, not the per-frame hot path. DESCRIBE offers
 //! `SS_ENC_VIDEO` (per-shard AES-128-GCM), `SS_ENC_CONTROL_V2` (per-direction
 //! control nonces and sealed RTSP), and `SS_ENC_AUDIO` (AES-CBC Opus). Shipping
-//! modes never require them. `PUNKTFUNK_GAMESTREAM_ENCRYPT=0` opts out;
-//! `video` offers only video. See [`EncOffer`].
+//! modes never require them. `PUNKTFUNK_GAMESTREAM_ENCRYPT=0` offers none;
+//! `video` offers only video. Audio still follows a client that asks for it
+//! the legacy way. See [`EncOffer`].
 //!
 //! A sealed connection is recognised, not negotiated: [`ENCRYPTED_MESSAGE_TYPE_BIT`].
 
@@ -388,7 +389,8 @@ const SS_ENC_VIDEO: u32 = 0x02;
 /// AES-128-CBC audio payloads; RTP headers stay clear.
 const SS_ENC_AUDIO: u32 = 0x04;
 
-/// Legacy `x-nv-general.featureFlags` audio-encryption bit.
+/// Legacy `x-nv-general.featureFlags` audio-encryption bit. moonlight-common-c sets it
+/// exactly when it will decrypt audio, whatever the host offered.
 const NVFF_AUDIO_ENCRYPTION: u32 = 0x20;
 
 /// Direction byte in the GCM nonce: `[10..12]` = `b"CC"` client→host, `b"HC"`
@@ -797,7 +799,9 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
 /// ANNOUNCE → [`audio::AudioParams`]. moonlight-common-c `SdpGenerator.c`:
 /// `numChannels`/`channelMask` and `packetDuration` always; `AudioQuality`
 /// is 1 only when the client saw our second surround-params line. Unknown
-/// channel counts fall back to stereo.
+/// channel counts fall back to stereo. Audio is sealed whenever the client set
+/// [`NVFF_AUDIO_ENCRYPTION`], since plaintext under it is silence;
+/// `SS_ENC_AUDIO` counts only if we offered it.
 fn audio_params(map: &HashMap<String, String>, offer: EncOffer) -> audio::AudioParams {
     let parse_u = |k: &str| map.get(k).and_then(|s| s.trim().parse::<u32>().ok());
     let requested = parse_u("x-nv-audio.surround.numChannels").unwrap_or(2);
@@ -818,8 +822,8 @@ fn audio_params(map: &HashMap<String, String>, offer: EncOffer) -> audio::AudioP
     let (offered, _) = enc_flags(offer);
     let ss_enabled = parse_u("x-ss-general.encryptionEnabled").unwrap_or(0);
     let legacy_enabled = parse_u("x-nv-general.featureFlags").unwrap_or(0);
-    let encrypt = offered & SS_ENC_AUDIO != 0
-        && (ss_enabled & SS_ENC_AUDIO != 0 || legacy_enabled & NVFF_AUDIO_ENCRYPTION != 0);
+    let encrypt =
+        legacy_enabled & NVFF_AUDIO_ENCRYPTION != 0 || offered & ss_enabled & SS_ENC_AUDIO != 0;
     audio::AudioParams {
         channels,
         high_quality,
@@ -1039,6 +1043,12 @@ mod tests {
 
         assert!(!audio_params(&ss, EncOffer::VideoOnly).encrypt);
         assert!(!audio_params(&announce(&[]), EncOffer::Supported).encrypt);
+
+        // Android Moonlight sends 0xA7 and decrypts under any offer.
+        let android = announce(&[("x-nv-general.featureFlags", "167")]);
+        for offer in [EncOffer::Off, EncOffer::VideoOnly] {
+            assert!(audio_params(&android, offer).encrypt, "{offer:?}");
+        }
     }
 
     /// Offer ladder. Only `require` sets REQUESTED: a client allowed to
