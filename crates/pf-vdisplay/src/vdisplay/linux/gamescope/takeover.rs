@@ -161,6 +161,16 @@ static RESTORE_FLIGHT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Default restore delay: long enough that a controller hiccup reuses the warm session.
 const RESTORE_DEBOUNCE: Duration = Duration::from_secs(5);
 
+/// SteamOS hand-back with no panel connected: how soon to look for one again.
+const NO_PANEL_RECHECK: Duration = Duration::from_secs(30);
+
+/// Bumped by every hand-back, so a launch that began before one can tell.
+static RESTORE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(super) fn restore_generation() -> u64 {
+    RESTORE_GEN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Crash-restore record of [`Takeover`] (`design/gamemode-and-dedicated-sessions.md`).
 /// Process memory dies with the host; this file lets [`restore_takeover_on_startup`] heal the box.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -190,12 +200,26 @@ fn takeover_state_path() -> std::path::PathBuf {
 /// Best-effort crash-restore snapshot. Never call while holding [`takeover()`].
 pub(super) fn persist_takeover() {
     let state = takeover().record();
-    if !takeover_state_is_live(&state) {
+    write_takeover_record(&state);
+}
+
+/// [`persist_takeover`] for a caller that holds [`takeover()`] across the change it records.
+pub(super) fn persist_takeover_held(t: &Takeover) {
+    write_takeover_record(&t.record());
+}
+
+/// Temp file + rename: a crash mid-write must not leave a record that no longer parses.
+fn write_takeover_record(state: &TakeoverState) {
+    if !takeover_state_is_live(state) {
         clear_takeover();
         return;
     }
-    if let Ok(bytes) = serde_json::to_vec(&state) {
-        let _ = std::fs::write(takeover_state_path(), bytes);
+    if let Ok(bytes) = serde_json::to_vec(state) {
+        let path = takeover_state_path();
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 }
 
@@ -217,10 +241,10 @@ fn takeover_state_is_live(state: &TakeoverState) -> bool {
 
 /// Restart autologin units left `active` under a swept idle drop-in. Gated on a dark box
 /// ([`box_session_live`]): bouncing a live game mode or desktop is the bug. Active under the
-/// drop-in means "running the sleep".
-fn hand_back_idled_units_after_crash() {
+/// drop-in means "running the sleep". Returns the units restarted.
+fn hand_back_idled_units_after_crash() -> Vec<String> {
     if box_session_live() {
-        return; // already drawing — the drop-in was inert
+        return Vec::new(); // already drawing — the drop-in was inert
     }
     let units: Vec<String> = listed_autologin_units()
         .into_iter()
@@ -228,7 +252,7 @@ fn hand_back_idled_units_after_crash() {
         .map(|(unit, _)| unit)
         .collect();
     if units.is_empty() {
-        return;
+        return units;
     }
     tracing::warn!(
         ?units,
@@ -241,10 +265,17 @@ fn hand_back_idled_units_after_crash() {
         }
     }
     ensure_box_session_or_escalate(&units);
+    units
+}
+
+/// The persisted crash-restore record, when there is one that parses.
+fn read_takeover_record() -> Option<TakeoverState> {
+    let bytes = std::fs::read(takeover_state_path()).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// Adopt a stranded takeover from a previous host and schedule restore after a reconnect grace.
-/// Call once from `serve` with [`start_restore_worker`]. No-op when no file exists.
+/// Call once from `serve` with [`start_restore_worker`]. Sweeps what a dead host left either way.
 pub fn restore_takeover_on_startup() {
     // The bind drop-in applies to the TEMPLATE. A leftover copy asks Game Mode for a mount
     // namespace whose tmpfs sources are gone, so the box cannot enter Game Mode.
@@ -256,22 +287,40 @@ pub fn restore_takeover_on_startup() {
         );
         systemctl_user(&["daemon-reload"]);
     }
+    let record = read_takeover_record();
+    // A fresh host owns no session unit. One left running holds Steam with nothing to stop it, and
+    // reads as the box's own session to the hand-back check below.
+    if !record.as_ref().is_some_and(|s| s.managed_session) && unit_known_active(SESSION_UNIT) {
+        tracing::warn!(
+            "gamescope: stopping a managed session a previous host instance left running"
+        );
+        stop_session(SESSION_UNIT);
+    }
     // Removing the FILE does not restart the unit still sleeping under it; the takeover file may
     // be absent, so nothing below would. Hand the live idle unit back.
-    if remove_idle_dropin() {
+    let handed_back = if remove_idle_dropin() {
         tracing::warn!(
             "gamescope: removed a leftover idle drop-in from a previous host instance — the box's \
              own Game Mode session would have started and then done nothing"
         );
-        hand_back_idled_units_after_crash();
-    }
-    let Ok(bytes) = std::fs::read(takeover_state_path()) else {
-        return; // no takeover file — clean start
+        hand_back_idled_units_after_crash()
+    } else {
+        Vec::new()
     };
-    let Ok(state) = serde_json::from_slice::<TakeoverState>(&bytes) else {
+    // Only a SteamOS record keeps its drop-in, for restore to remove. Any other copy is stranded;
+    // an older host's `$HOME` one also outlives reboots.
+    if !record.as_ref().is_some_and(|s| s.steamos) && remove_steamos_dropin() {
+        tracing::warn!(
+            "gamescope: removed a leftover SteamOS headless drop-in from a previous host instance"
+        );
+        systemctl_user(&["daemon-reload"]);
+    }
+    let Some(mut state) = record else {
         clear_takeover();
         return;
     };
+    // Already restarted above; a second restart would kill a Steam still booting.
+    state.stopped_autologin.retain(|u| !handed_back.contains(u));
     if !takeover_state_is_live(&state) {
         clear_takeover();
         return;
@@ -809,8 +858,9 @@ fn replay_switch_under_restored_dm(dm: &str) {
     // Absent helper: plain DM restore, no black screen.
     if std::path::Path::new(OS_SESSION_SELECT).exists() {
         // Helper self-pkexecs and rewrites DM config — DM-verb budget, on the stream thread.
+        // `plasma` is what Steam's own switch sends; Bazzite's helper rejects `desktop`.
         match crate::proc::status_within(
-            Command::new(OS_SESSION_SELECT).arg("desktop"),
+            Command::new(OS_SESSION_SELECT).arg("plasma"),
             DM_VERB_BUDGET,
         ) {
             Ok(s) if s.success() => {
@@ -1231,26 +1281,33 @@ fn handback_watch(units: &[String]) {
 }
 
 fn do_restore_tv_session(verify: bool) {
+    RESTORE_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     // Only release for managed Exclusive: SessionManaged never rides `take_topology_restore`.
     // Above every early return. Idempotent.
     managed_darken_release();
-    // SteamOS restore: remove drop-in + restart the target, unless a desktop is already up. The
-    // takeover lock spans it, so a SteamOS launch waits for the restart instead of racing it.
+    // SteamOS restore: shrink the drop-in to its kill signal + restart the target, unless a
+    // desktop is already up. The takeover lock spans it, so a SteamOS launch waits for the restart.
     {
         let mut t = takeover();
         if t.steamos {
-            // No panel: restarting the target crash-loops gamescope. Keep headless. Check at
-            // restore time so plugging a panel in later restores.
+            // No panel: restarting the target crash-loops gamescope. Keep headless and look again
+            // later: a TV in standby reports disconnected until it is switched on.
             if !physical_display_connected() {
-                tracing::info!(
+                tracing::debug!(
+                    secs = NO_PANEL_RECHECK.as_secs(),
                     "gamescope (SteamOS): no physical display connected — keeping the headless \
-                     session (nothing to restore to)"
+                     session and checking again"
                 );
+                *PENDING_RESTORE.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(Instant::now() + NO_PANEL_RECHECK);
                 return;
             }
             t.steamos = false;
             t.managed = None;
-            remove_steamos_dropin();
+            // The restart below stops our headless gamescope; it must go by SIGKILL too.
+            if write_steamos_handback_dropin().is_err() {
+                remove_steamos_dropin();
+            }
             systemctl_user(&["daemon-reload"]);
             use crate::ActiveKind;
             if matches!(
@@ -1260,6 +1317,9 @@ fn do_restore_tv_session(verify: bool) {
                     | ActiveKind::DesktopWlroots
                     | ActiveKind::DesktopHyprland
             ) {
+                if remove_steamos_dropin() {
+                    systemctl_user(&["daemon-reload"]);
+                }
                 tracing::info!(
                     "gamescope (SteamOS): a desktop session is active — removed the headless \
                      override, not restarting the gaming session"
@@ -1271,6 +1331,11 @@ fn do_restore_tv_session(verify: bool) {
             forget_host_short_sessions();
             let restarted = issue_restore_verb(&["restart", STEAMOS_SESSION_TARGET]);
             forget_host_short_sessions();
+            // A restart still running has yet to stop gamescope; its kill-signal drop-in stays
+            // until the next takeover or hand-back, or the runtime dir goes.
+            if matches!(restarted, RestoreVerb::Done) && remove_steamos_dropin() {
+                systemctl_user(&["daemon-reload"]);
+            }
             match restarted {
                 RestoreVerb::Done => tracing::info!(
                     "gamescope (SteamOS): restored the physical gaming session (removed headless \
