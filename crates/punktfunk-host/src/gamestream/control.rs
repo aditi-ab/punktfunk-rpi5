@@ -612,6 +612,16 @@ fn decode_rfi_range(pt: &[u8]) -> Option<(i64, i64)> {
     (first >= 0 && last >= first).then_some((first, last))
 }
 
+/// Data shards parity could not restore, from a per-frame FEC status (0x5502,
+/// `SS_FRAME_FEC_STATUS`: 21 packed BE bytes after `[u16 type][u16 length]`). Loss FEC
+/// recovered counts 0: it is FEC doing its job, not a reason to cut the bitrate.
+fn decode_fec_status_loss(pt: &[u8]) -> Option<u64> {
+    let body = pt.get(4..25)?;
+    let be16 = |at: usize| u64::from(u16::from_be_bytes([body[at], body[at + 1]]));
+    let (total_data, received_data, received_parity) = (be16(10), be16(14), be16(16));
+    Some(total_data.saturating_sub(received_data + received_parity))
+}
+
 /// Decrypt one control packet (lock GCM scheme on the first authenticating one),
 /// classify against the session grant mask, inject what the grants cover.
 fn on_receive(
@@ -697,6 +707,24 @@ fn on_receive(
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if lost > 0 {
                 tracing::debug!(lost, window_ms, last_good, "control: client loss report");
+            }
+            return;
+        }
+        // A client that sees our Sunshine version never sends 0x0201; this per-frame report,
+        // sent only when FEC had work to do, is its loss signal.
+        if inner == 0x5502 {
+            if let Some(lost) = decode_fec_status_loss(&pt) {
+                state
+                    .loss_stats
+                    .lost
+                    .fetch_add(lost, std::sync::atomic::Ordering::Relaxed);
+                state
+                    .loss_stats
+                    .reports
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if lost > 0 {
+                    tracing::debug!(lost, "control: frame lost past FEC");
+                }
             }
             return;
         }
@@ -1052,7 +1080,7 @@ pub(super) fn gcm_open(key: &[u8; 16], nonce: &[u8], ct_tag: &[u8], aad: &[u8]) 
 
 #[cfg(test)]
 mod tests {
-    use super::decode_rfi_range;
+    use super::{decode_fec_status_loss, decode_rfi_range};
 
     /// Build a 0x0301 invalidate-ref-frames plaintext: `[type LE][len LE][firstFrame i64 LE][last i64 LE]`.
     fn rfi_msg(first: i64, last: i64) -> Vec<u8> {
@@ -1096,6 +1124,38 @@ mod tests {
     fn decodes_a_valid_rfi_range() {
         assert_eq!(decode_rfi_range(&rfi_msg(40, 47)), Some((40, 47)));
         assert_eq!(decode_rfi_range(&rfi_msg(5, 5)), Some((5, 5))); // single frame
+    }
+
+    /// moonlight-common-c `reportFinalFrameFecStatus` layout, big-endian.
+    fn fec_status_msg(total_data: u16, received_data: u16, received_parity: u16) -> Vec<u8> {
+        let mut m = vec![0x02, 0x55, 21, 0];
+        m.extend_from_slice(&7u32.to_be_bytes()); // frameIndex
+        m.extend_from_slice(&[0; 6]); // highest, next contiguous, missing
+        m.extend_from_slice(&total_data.to_be_bytes());
+        m.extend_from_slice(&4u16.to_be_bytes()); // totalParityPackets
+        m.extend_from_slice(&received_data.to_be_bytes());
+        m.extend_from_slice(&received_parity.to_be_bytes());
+        m.extend_from_slice(&[20, 0, 1]); // fecPercentage, block index, block count
+        m
+    }
+
+    #[test]
+    fn fec_status_counts_only_loss_parity_could_not_restore() {
+        assert_eq!(
+            decode_fec_status_loss(&fec_status_msg(10, 8, 2)),
+            Some(0),
+            "recovered"
+        );
+        assert_eq!(
+            decode_fec_status_loss(&fec_status_msg(10, 6, 1)),
+            Some(3),
+            "dropped frame"
+        );
+        assert_eq!(
+            decode_fec_status_loss(&fec_status_msg(10, 6, 1)[..24]),
+            None,
+            "short"
+        );
     }
 
     #[test]
