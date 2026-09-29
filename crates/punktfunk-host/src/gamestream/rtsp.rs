@@ -247,6 +247,10 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                 Some("audio") => (AUDIO_PORT, "X-SS-Ping-Payload"),
                 Some("video") => (VIDEO_PORT, "X-SS-Ping-Payload"),
                 Some("control") => (CONTROL_PORT, "X-SS-Connect-Data"),
+                Some("mic") => {
+                    tracing::info!("RTSP SETUP mic — accepted; this host takes no Moonlight mic");
+                    (MIC_PORT, "X-SS-Ping-Payload")
+                }
                 _ => return response_status("404 Not Found", &req.cseq, &[], None),
             };
             let transport = format!("server_port={port}");
@@ -385,6 +389,10 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
 /// moonlight-common-c `LI_FF_PEN_TOUCH_EVENTS`. Set: clients send native
 /// `SS_PEN`/`SS_TOUCH` instead of synthesizing mouse input.
 const SS_FF_PEN_TOUCH_EVENTS: u32 = 0x01;
+
+/// Moonlight V+'s mic port (Foundation Sunshine's base + 12). V+ ends the session unless
+/// `SETUP streamid=mic` answers 200, but a mic that goes nowhere only warns. Nothing listens.
+const MIC_PORT: u16 = 48001;
 
 /// Per-shard AES-128-GCM video (`Limelight-internal.h`).
 const SS_ENC_VIDEO: u32 = 0x02;
@@ -837,12 +845,12 @@ fn audio_params(map: &HashMap<String, String>, offer: EncOffer) -> audio::AudioP
     }
 }
 
-/// SETUP URI `…/streamid=video/0/0` → `"video"` / `"audio"` / `"control"`.
+/// SETUP URI `…/streamid=video/0/0` → `"video"` / `"audio"` / `"control"` / `"mic"`.
 fn stream_type(uri: &str) -> Option<&str> {
     let after = uri.split("streamid=").nth(1)?;
     let token = after.split('/').next()?;
     match token {
-        "audio" | "video" | "control" => Some(token),
+        "audio" | "video" | "control" | "mic" => Some(token),
         _ => None,
     }
 }
@@ -998,6 +1006,19 @@ mod tests {
             let cfg = stream_config(&map).expect("session must still negotiate");
             assert_eq!(cfg.slices, 1, "slicesPerFrame {bad} must degrade to 1");
         }
+    }
+
+    /// Moonlight V+ ends the session on anything but 200 for its mic SETUP.
+    #[test]
+    fn setup_knows_every_stream_moonlight_asks_for() {
+        for kind in ["audio", "video", "control", "mic"] {
+            let uri = format!("rtsp://10.0.0.2:48010/streamid={kind}/0/0");
+            assert_eq!(stream_type(&uri), Some(kind));
+        }
+        assert_eq!(
+            stream_type("rtsp://10.0.0.2:48010/streamid=bogus/0/0"),
+            None
+        );
     }
 
     #[test]
