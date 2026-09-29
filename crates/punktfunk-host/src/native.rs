@@ -1442,6 +1442,8 @@ pub(crate) async fn run_admitted(
     let counters = Arc::new(crate::session_status::SessionCounters::default());
     spawn_end_watch(conn.clone(), stop.clone(), quit.clone(), end_reason.clone());
 
+    // Before the handshake resolves the compositor: a handshake that fails still hands back.
+    let gamescope_hold = GamescopeHold::new();
     let handshake::Negotiated {
         hello,
         welcome,
@@ -1485,8 +1487,6 @@ pub(crate) async fn run_admitted(
     });
     // Filled by the stream thread's encoder open; the input thread reads it.
     let frame_map = input::FrameMap::default();
-    let gamescope_hold =
-        (compositor == Some(crate::vdisplay::Compositor::Gamescope)).then(GamescopeHold::new);
     // Live reconfigure is off for gamescope (resize must not relaunch the title),
     // `identity: per-client-mode` (resize would resolve a different slot), a monitor
     // mirror (physical head ignores the requested mode) and a `join` session (the mode
@@ -2083,12 +2083,8 @@ pub(crate) async fn run_admitted(
     .await;
 
     teardown(&stop, &conn, &result, audio_handle, input_handle).await;
-    // Managed gamescope on an autologin box: put the TV's gaming session back once no session
-    // streams gamescope. A `join` session still shows the owner's game after the owner leaves.
+    // After teardown: the last hold out hands the TV's gaming session back.
     drop(gamescope_hold);
-    if LIVE_GAMESCOPE.load(Ordering::SeqCst) == 0 {
-        crate::vdisplay::restore_managed_session();
-    }
     result.map(|()| Served::Session)
 }
 
@@ -2565,14 +2561,15 @@ async fn teardown(
     }
 }
 
-/// Live native sessions on a gamescope display, for the managed TV restore above.
+/// Live sessions, on either plane, that may stream a gamescope the host took over.
 static LIVE_GAMESCOPE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// One count in [`LIVE_GAMESCOPE`] for the session's lifetime, early returns included.
-struct GamescopeHold;
+/// One count in [`LIVE_GAMESCOPE`], taken before the session resolves its compositor. Resolving
+/// cancels a pending Game Mode hand-back; the last hold dropped, on any path, schedules it again.
+pub(crate) struct GamescopeHold;
 
 impl GamescopeHold {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         LIVE_GAMESCOPE.fetch_add(1, Ordering::SeqCst);
         GamescopeHold
     }
@@ -2580,7 +2577,10 @@ impl GamescopeHold {
 
 impl Drop for GamescopeHold {
     fn drop(&mut self) {
-        LIVE_GAMESCOPE.fetch_sub(1, Ordering::SeqCst);
+        // A `join` session still shows the owner's game after the owner leaves.
+        if LIVE_GAMESCOPE.fetch_sub(1, Ordering::SeqCst) == 1 {
+            crate::vdisplay::restore_managed_session();
+        }
     }
 }
 
