@@ -14,10 +14,22 @@ const MAX_LUMA_PIXELS_HEVC: u64 = 1_869_449_984;
 /// `current_game` is the running app id **as this caller may see it** (0 = none).
 /// Moonlight keys Resume/Quit on `currentgame != 0` and `_SERVER_BUSY` together;
 /// a non-owner shown the live id would hit owner-only `/resume`/`/cancel`.
-pub fn serverinfo_xml(host: &Host, https: bool, paired: bool, current_game: u32) -> String {
-    // Plain HTTP has no per-client identity, so the MAC is zeros. HTTPS is the routed-NIC
+///
+/// `reached` is the host address the request arrived on: `LocalIP` and the MAC come from that
+/// interface, else from the default route's.
+pub fn serverinfo_xml(
+    host: &Host,
+    https: bool,
+    paired: bool,
+    current_game: u32,
+    reached: Option<std::net::IpAddr>,
+) -> String {
+    let reached = reached
+        .map(|ip| ip.to_canonical())
+        .filter(|ip| !ip.is_loopback() && !ip.is_unspecified());
+    // Plain HTTP has no per-client identity, so the MAC is zeros. HTTPS is the reached NIC's
     // MAC: Moonlight persists it for Wake-on-LAN.
-    let real_mac = if https { host_mac() } else { None };
+    let real_mac = if https { host_mac(reached) } else { None };
     let mac = real_mac.as_deref().unwrap_or("00:00:00:00:00:00");
     let pair_status = u8::from(paired);
     let state = if current_game != 0 {
@@ -56,13 +68,17 @@ pub fn serverinfo_xml(host: &Host, https: bool, paired: bool, current_game: u32)
         uniqueid = host.uniqueid,
         https_port = host.https_port,
         http_port = host.http_port,
-        local_ip = host.local_ip(),
+        local_ip = reached.unwrap_or_else(|| host.local_ip()),
     )
 }
 
-/// Routed-NIC wake MAC (`crate::wol::wake_macs`). Cached on first success only:
-/// a latched miss would advertise zeros after a boot with no address yet.
-fn host_mac() -> Option<String> {
+/// Wake MAC of the NIC holding `reached`, else of the routed NIC (`crate::wol::wake_macs`).
+/// The routed one is cached on first success only: a latched miss would advertise zeros after
+/// a boot with no address yet.
+fn host_mac(reached: Option<std::net::IpAddr>) -> Option<String> {
+    if let Some(mac) = reached.and_then(|ip| crate::wol::wake_macs(ip).into_iter().next()) {
+        return Some(mac);
+    }
     static MAC: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
     let mut cached = MAC.lock().unwrap_or_else(|p| p.into_inner());
     if cached.is_none() {
@@ -201,7 +217,7 @@ mod tests {
             os_chain: "linux".into(),
             os_name: "Linux".into(),
         };
-        let xml = serverinfo_xml(&host, false, false, 0);
+        let xml = serverinfo_xml(&host, false, false, 0, None);
         // Pin the XML to `codec_mode_support()`, not a literal: the mask is GPU-probed.
         let mask = codec_mode_support();
         assert!(mask != 0, "must advertise at least one codec");
@@ -220,11 +236,31 @@ mod tests {
             os_chain: "linux".into(),
             os_name: "Linux".into(),
         };
-        let xml = serverinfo_xml(&host, false, false, 0);
+        let xml = serverinfo_xml(&host, false, false, 0, None);
         assert!(
             xml.contains("<hostname>Tom &amp; Jerry &lt;3</hostname>"),
             "{xml}"
         );
+    }
+
+    /// Moonlight stores `LocalIP` (and the MAC beside it) for reconnects and Wake-on-LAN.
+    #[test]
+    fn serverinfo_reports_the_address_the_client_reached() {
+        let host = Host {
+            hostname: "test".into(),
+            uniqueid: "uid".into(),
+            http_port: 47989,
+            https_port: 47984,
+            os_chain: "linux".into(),
+            os_name: "Linux".into(),
+        };
+        for reached in ["10.9.8.7", "::ffff:10.9.8.7"] {
+            let xml = serverinfo_xml(&host, false, false, 0, Some(reached.parse().unwrap()));
+            assert!(
+                xml.contains("<LocalIP>10.9.8.7</LocalIP>"),
+                "{reached}: {xml}"
+            );
+        }
     }
 
     /// Plain HTTP always zeros. HTTPS is the routed-NIC MAC or zeros, never
@@ -239,9 +275,9 @@ mod tests {
             os_chain: "linux".into(),
             os_name: "Linux".into(),
         };
-        let http = serverinfo_xml(&host, false, false, 0);
+        let http = serverinfo_xml(&host, false, false, 0, None);
         assert!(http.contains("<mac>00:00:00:00:00:00</mac>"));
-        let https = serverinfo_xml(&host, true, true, 0);
+        let https = serverinfo_xml(&host, true, true, 0, None);
         assert!(!https.contains("01:02:03:04:05:06"), "the fake MAC is gone");
         assert!(https.contains("<mac>"), "a mac element is always present");
     }
@@ -257,10 +293,10 @@ mod tests {
             os_chain: "linux".into(),
             os_name: "Linux".into(),
         };
-        let free = serverinfo_xml(&host, true, true, 0);
+        let free = serverinfo_xml(&host, true, true, 0, None);
         assert!(free.contains("<currentgame>0</currentgame>"));
         assert!(free.contains("<state>SUNSHINE_SERVER_FREE</state>"));
-        let busy = serverinfo_xml(&host, true, true, 881_448_767);
+        let busy = serverinfo_xml(&host, true, true, 881_448_767, None);
         assert!(busy.contains("<currentgame>881448767</currentgame>"));
         assert!(busy.contains("<state>SUNSHINE_SERVER_BUSY</state>"));
     }

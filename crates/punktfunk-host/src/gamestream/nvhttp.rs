@@ -8,7 +8,7 @@
 //!
 //! Pairing and grants: `design/per-client-access.md`.
 
-use super::tls::{PeerAddr, PeerCertFingerprint};
+use super::tls::{LocalAddr, PeerAddr, PeerCertFingerprint};
 use super::{serverinfo, LaunchSession, HTTPS_PORT, HTTP_PORT, RTSP_PORT};
 use crate::host::AppState;
 use anyhow::{anyhow, Context, Result};
@@ -176,6 +176,7 @@ async fn h_serverinfo(
     State(st): State<Arc<AppState>>,
     Extension(Https(https)): Extension<Https>,
     peer: Option<Extension<PeerCertFingerprint>>,
+    local: Option<Extension<LocalAddr>>,
 ) -> impl IntoResponse {
     let paired = https && peer_is_paired(&peer, &st);
     // Owner-only `currentgame`: Moonlight uses it to show Resume/Quit.
@@ -189,6 +190,7 @@ async fn h_serverinfo(
         https,
         paired,
         current_game,
+        local.map(|Extension(LocalAddr(a))| a.ip()),
     ))
 }
 
