@@ -51,7 +51,8 @@ pub fn serverinfo_xml(host: &Host, https: bool, paired: bool, current_game: u32)
 <state>{state}</state>
 </root>
 "#,
-        hostname = host.hostname,
+        // Free text from the console: a raw `&` or `<` makes Moonlight's parser drop the host.
+        hostname = super::apps::xml_escape(&host.hostname),
         uniqueid = host.uniqueid,
         https_port = host.https_port,
         http_port = host.http_port,
@@ -207,6 +208,23 @@ mod tests {
         assert!(xml.contains(&format!(
             "<ServerCodecModeSupport>{mask}</ServerCodecModeSupport>"
         )));
+    }
+
+    #[test]
+    fn serverinfo_xml_escapes_the_host_name() {
+        let host = Host {
+            hostname: "Tom & Jerry <3".into(),
+            uniqueid: "uid".into(),
+            http_port: 47989,
+            https_port: 47984,
+            os_chain: "linux".into(),
+            os_name: "Linux".into(),
+        };
+        let xml = serverinfo_xml(&host, false, false, 0);
+        assert!(
+            xml.contains("<hostname>Tom &amp; Jerry &lt;3</hostname>"),
+            "{xml}"
+        );
     }
 
     /// Plain HTTP always zeros. HTTPS is the routed-NIC MAC or zeros, never
