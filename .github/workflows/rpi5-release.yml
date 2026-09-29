@@ -45,10 +45,32 @@ jobs:
             libxtst-dev llvm-dev nasm patchelf pkg-config python3 \
             wayland-protocols
 
+      - name: Restore ARM64 build cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+            target/rpi5-release
+          key: rpi5-arm64-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            rpi5-arm64-${{ hashFiles('Cargo.lock') }}-
+            rpi5-arm64-
+
       - name: Build the portable ARM64 bundle
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           bash packaging/rpi5/build-release.sh "$RELEASE_TAG" dist
+
+      - name: Save ARM64 build cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+            target/rpi5-release
+          key: rpi5-arm64-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
 
       - name: Transfer the exact release bundle to the image builder
         uses: actions/upload-artifact@v4

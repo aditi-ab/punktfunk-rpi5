@@ -2,7 +2,7 @@
 set -eu
 
 expected=/run/punktfunk/wayland-0
-echo "STREAMOS_WAYLAND_WAIT expected=${expected}"
+echo "PUNKTFUNK_WAYLAND_WAIT expected=${expected}"
 attempt=0
 while [ "$attempt" -lt 45 ]; do
     for candidate in "${expected}" /run/user/*/wayland-0; do
@@ -11,7 +11,7 @@ while [ "$attempt" -lt 45 ]; do
                 ln -sf "${candidate}" "${expected}"
             fi
             printf 'wayland_socket=%s\n' "${candidate}" >/data/logs/wayland-ready.log
-            echo "STREAMOS_WAYLAND_READY socket=${candidate}"
+            echo "PUNKTFUNK_WAYLAND_READY socket=${candidate}"
             exit 0
         fi
     done
@@ -24,6 +24,6 @@ done
     ls -la /run/punktfunk /run/user 2>&1 || true
     find /run -maxdepth 4 -name 'wayland-*' -ls 2>&1 || true
 } >/data/logs/wayland-timeout.log
-echo 'STREAMOS_WAYLAND_TIMEOUT' >/dev/ttyS0 2>/dev/null || true
-echo 'STREAMOS_WAYLAND_TIMEOUT'
+echo 'PUNKTFUNK_WAYLAND_TIMEOUT' >/dev/ttyS0 2>/dev/null || true
+echo 'PUNKTFUNK_WAYLAND_TIMEOUT'
 exit 1
