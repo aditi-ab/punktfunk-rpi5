@@ -351,6 +351,13 @@ impl Pairing {
         Ok(paired_xml(&inner, true))
     }
 
+    /// Drop `uniqueid`'s unfinished ceremony, only for the address that opened it. Returns
+    /// whether one was dropped.
+    pub fn abandon(&self, uniqueid: &str, peer_ip: std::net::IpAddr) -> bool {
+        let mut map = self.sessions.lock().unwrap();
+        session_of(&mut map, uniqueid, peer_ip).is_ok() && map.remove(uniqueid).is_some()
+    }
+
     pub fn clientpairingsecret(
         &self,
         uniqueid: &str,

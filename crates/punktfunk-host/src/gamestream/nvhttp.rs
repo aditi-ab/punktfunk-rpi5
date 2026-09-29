@@ -108,10 +108,11 @@ enum Gate {
 }
 
 /// The whole nvhttp surface, each route with its gate.
-fn routes() -> [(&'static str, Gate, MethodRouter<Arc<AppState>>); 7] {
+fn routes() -> [(&'static str, Gate, MethodRouter<Arc<AppState>>); 8] {
     [
         ("/serverinfo", Gate::Open, get(h_serverinfo)),
         ("/pair", Gate::Open, get(h_pair)),
+        ("/unpair", Gate::Open, get(h_unpair)),
         ("/applist", Gate::Paired, get(h_applist)),
         ("/appasset", Gate::PairedAsset, get(h_appasset)),
         ("/launch", Gate::Paired, get(h_launch)),
@@ -403,6 +404,28 @@ async fn h_cancel(
     // display skips keep-alive linger and end-game policy treats it as operator intent.
     st.quit_session("client /cancel");
     xml("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<root status_code=\"200\"><cancel>1</cancel></root>\n".to_string())
+}
+
+/// Moonlight sends this over plain HTTP whenever pairing fails, a wrong PIN included, and reads
+/// any non-200 as a host fault. It carries no credential, so it only ends the caller's own
+/// unfinished ceremony; a pinned cert stays pinned.
+async fn h_unpair(
+    State(st): State<Arc<AppState>>,
+    addr: Option<Extension<PeerAddr>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let (Some(uniqueid), Some(Extension(PeerAddr(a)))) = (q.get("uniqueid"), addr) {
+        if st.gs.pairing.abandon(uniqueid, a.ip()) {
+            tracing::info!(
+                uniqueid,
+                "pairing abandoned by the client (wrong PIN or cancelled)"
+            );
+        }
+    }
+    xml(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<root status_code=\"200\"></root>\n"
+            .to_string(),
+    )
 }
 
 /// Wait for `expected` stopped media threads to exit, so their teardown cannot stomp a
