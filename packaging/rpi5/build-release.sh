@@ -87,12 +87,22 @@ git -C "${ffmpeg_source}" checkout --detach "${ffmpeg_ref}"
     export PUNKTFUNK_BUILD_VERSION="${tag#v}"
     export CARGO_PROFILE_RELEASE_LTO=false
     export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=8
-    cargo build --locked --release -p punktfunk-cli --no-default-features
-    cargo build --locked --release \
+    # rust-skia resumes cached downloads even when they are already complete.
+    # Remove only its download archives before each Cargo invocation to avoid
+    # an HTTP 416 response and an unnecessary Skia source rebuild.
+    cargo_release() {
+        if [[ -d "${target_dir}/release/build" ]]; then
+            find "${target_dir}/release/build" -type f \
+                -path '*/skia-bindings-*/out/.cache/skia-binaries-*.tar.gz' -delete
+        fi
+        cargo "$@"
+    }
+    cargo_release build --locked --release -p punktfunk-cli --no-default-features
+    cargo_release build --locked --release \
         -p punktfunk-client-session \
         --no-default-features \
         --features ui,rpi5-v4l2-request
-    cargo test --locked --release -p pf-client-core -p pf-console-ui -p pf-presenter \
+    cargo_release test --locked --release -p pf-client-core -p pf-console-ui -p pf-presenter \
         --no-default-features \
         --features pf-presenter/rpi5-v4l2-request,pf-console-ui/vulkan-overlay --lib
 )
