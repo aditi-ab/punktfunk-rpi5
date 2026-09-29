@@ -445,6 +445,11 @@ fn launch(_st: &AppState, q: &HashMap<String, String>) -> Result<LaunchSession> 
         .and_then(|m| parse_mode(m))
         .unwrap_or((1920, 1080, 60));
     let appid = q.get("appid").and_then(|s| s.parse().ok()).unwrap_or(1);
+    // A stale shortcut or cached tile must not quietly open the desktop instead.
+    anyhow::ensure!(
+        super::apps::by_id(appid).is_some(),
+        "appid {appid} is not in the catalog"
+    );
     Ok(LaunchSession {
         gcm_key,
         rikeyid,
@@ -768,6 +773,14 @@ mod tests {
         assert!(!launch(&st, &q).unwrap().host_audio, "absent means off");
         q.insert("localAudioPlayMode".into(), "1".into());
         assert!(launch(&st, &q).unwrap().host_audio);
+    }
+
+    #[test]
+    fn launch_refuses_an_app_the_catalog_lacks() {
+        let st = test_state();
+        let mut q = HashMap::from([("rikey".to_string(), "11".repeat(16))]);
+        q.insert("appid".into(), "987654321".into());
+        assert!(launch(&st, &q).is_err());
     }
 
     #[tokio::test]
