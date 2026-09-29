@@ -231,7 +231,7 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
         "DESCRIBE" => response(
             &req.cseq,
             &[("Content-Type", "application/sdp")],
-            Some(&describe_sdp()),
+            Some(&describe_sdp(super::serverinfo::codec_mode_support())),
         ),
         "SETUP" => {
             // SETUP hands out the ping payload the media planes verify. Ungated, any
@@ -586,9 +586,10 @@ fn read_sealed_message(
     Ok(Some(req))
 }
 
-/// DESCRIBE SDP: HEVC + AV1, surround configs, and the encryption offer.
-/// Shipping modes advertise encryption as SUPPORTED, never REQUESTED.
-fn describe_sdp() -> String {
+/// DESCRIBE SDP: the HEVC/AV1 lines `codecs` (`ServerCodecModeSupport`) backs, surround
+/// configs, and the encryption offer. moonlight-common-c picks HEVC or AV1 from those two lines
+/// alone. Shipping modes advertise encryption as SUPPORTED, never REQUESTED.
+fn describe_sdp(codecs: u32) -> String {
     // Advertise pen/touch only where we can inject (Linux uinput; same gate
     // as HOST_CAP_PEN). Else 0 so Moonlight keeps client-side mouse emulation.
     // `PUNKTFUNK_PEN=0` is the kill-switch inside `pen_supported`.
@@ -602,9 +603,13 @@ fn describe_sdp() -> String {
         format!("a=x-ss-general.featureFlags:{feature_flags}"),
         format!("a=x-ss-general.encryptionSupported:{supported}"),
         format!("a=x-ss-general.encryptionRequested:{requested}"),
-        "sprop-parameter-sets=AAAAAU".into(), // HEVC capability
-        "a=rtpmap:98 AV1/90000".into(),       // AV1 capability
     ];
+    if codecs & super::SCM_HEVC != 0 {
+        lines.push("sprop-parameter-sets=AAAAAU".into());
+    }
+    if codecs & super::SCM_AV1_MAIN8 != 0 {
+        lines.push("a=rtpmap:98 AV1/90000".into());
+    }
     // Client takes the first `surround-params=<channelCount>` as normal and
     // a second as HQ, so normal must precede HQ. Stereo lines are Sunshine
     // parity; 2-channel clients hardcode 21101. See `audio::surround_params`.
@@ -1230,7 +1235,11 @@ mod tests {
     /// per channel count.
     #[test]
     fn describe_advertises_codecs_and_surround() {
-        let sdp = describe_sdp();
+        let h264_only = describe_sdp(super::super::SCM_H264);
+        assert!(!h264_only.contains("AAAAAU") && !h264_only.contains("AV1/90000"));
+        let sdp = describe_sdp(
+            super::super::SCM_H264 | super::super::SCM_HEVC | super::super::SCM_AV1_MAIN8,
+        );
         // Assert against `enc_flags`, not a literal: `PUNKTFUNK_GS_ENCRYPT`
         // can still steer the offer.
         let (supported, requested) = enc_flags(gs_encryption_offer());

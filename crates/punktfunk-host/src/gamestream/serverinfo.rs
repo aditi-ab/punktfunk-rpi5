@@ -79,7 +79,7 @@ fn host_mac() -> Option<String> {
 /// codec's 10-bit bit the host can actually deliver ([`apply_hdr`] /
 /// [`crate::gamestream::host_hdr_capable`]). Moonlight offers its HDR toggle only
 /// when a 10-bit bit is set.
-fn codec_mode_support() -> u32 {
+pub(super) fn codec_mode_support() -> u32 {
     use crate::encode::Codec;
     let hdr = crate::gamestream::host_hdr_capable();
     apply_hdr(
