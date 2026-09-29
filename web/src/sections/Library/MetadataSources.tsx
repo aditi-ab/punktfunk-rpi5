@@ -35,6 +35,8 @@ import { useSourceNames } from "./Sources";
 /**
  * Art & Metadata: plugins that fill covers and details for games other sources list. The host
  * keeps their order and switches; each row reads its status line from the plugin itself.
+ * The host lists a source only after its first push, so an installed plugin that never pushed
+ * gets a plain row here; without it, a plugin that fails to start hides the whole card.
  */
 export const MetadataSourcesSection: FC = () => {
 	const qc = useQueryClient();
@@ -58,7 +60,16 @@ export const MetadataSourcesSection: FC = () => {
 			p.compatible,
 	);
 	const sources = list.data ?? [];
-	if (!list.data || (sources.length === 0 && available.length === 0)) {
+	const silent = (catalog.data?.plugins ?? []).filter(
+		(p) =>
+			p.categories?.includes(METADATA_CATEGORY) &&
+			installed.has(p.pkg) &&
+			!sources.some((s) => s.id === p.id),
+	);
+	if (
+		!list.data ||
+		(sources.length === 0 && available.length === 0 && silent.length === 0)
+	) {
 		return null;
 	}
 	const running = new Set((plugins.data ?? []).map((p) => p.id));
@@ -124,6 +135,25 @@ export const MetadataSourcesSection: FC = () => {
 								onDown={() => move(i, 1)}
 								onSettings={() => setSettingsFor(source.id)}
 							/>
+						))}
+						{silent.map((entry) => (
+							<motion.div
+								key={entry.pkg}
+								variants={ROW}
+								className="flex flex-wrap items-center gap-3 rounded-lg border p-3"
+							>
+								<span className="text-sm font-medium">{entry.title}</span>
+								<Badge
+									variant={running.has(entry.id) ? "secondary" : "outline"}
+								>
+									{running.has(entry.id)
+										? m.library_source_running()
+										: m.library_source_stopped()}
+								</Badge>
+								<span className="text-sm text-muted-foreground">
+									{m.library_metadata_silent()}
+								</span>
+							</motion.div>
 						))}
 					</Stagger>
 					<p className="max-w-prose text-xs text-muted-foreground">
