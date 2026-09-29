@@ -15,12 +15,13 @@ import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -802,6 +803,7 @@ private fun GeneralSettings(s: Settings, update: (Settings) -> Unit) {
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: android.content.Context) {
     val (nw, nh, nhz) = nativeDisplayMode(context)
@@ -825,10 +827,8 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        Row(
-            modifier = Modifier.horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
+        // Wraps rather than scrolls, so no entry hides past a phone's edge.
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             families.forEachIndexed { i, a ->
                 FilterChip(
                     selected = i == family,

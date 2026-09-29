@@ -81,23 +81,22 @@ extension SettingsView {
     #if os(iOS) || os(visionOS)
     // MARK: - Display: Resolution (iOS wheel)
 
-    /// Touch-first: an aspect switch over a rotating wheel of that family's common sizes (this
-    /// device's own mode first) — the same family as the Clock/Timer pickers. The host renders a
-    /// virtual output at exactly the chosen mode, so these are real pixel sizes. The last wheel
-    /// row, "Custom…", reveals width/height/refresh fields for an arbitrary mode (see
+    /// Touch-first: wrapping aspect chips over a rotating wheel of that family's common sizes
+    /// (this device's own mode first) — the same family as the Clock/Timer pickers. The host
+    /// renders a virtual output at exactly the chosen mode, so these are real pixel sizes. The
+    /// last wheel row, "Custom…", reveals width/height/refresh fields for an arbitrary mode (see
     /// `iosRefreshRows`).
     @ViewBuilder private var iosResolutionWheel: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Aspect ratio")
                 .font(.geist(15, relativeTo: .subheadline))
                 .foregroundStyle(.secondary)
-            Picker("Aspect ratio", selection: aspectSelection) {
+            WrapLayout(spacing: 8) {
                 ForEach(Array(SettingsOptions.families().enumerated()), id: \.offset) { i, family in
-                    Text(family.label).tag(i)
+                    aspectChip(family.label, index: i)
                 }
             }
-            .labelsHidden()
-            .pickerStyle(.segmented)
+            .padding(.vertical, 2)
             Text("Resolution")
                 .font(.geist(15, relativeTo: .subheadline))
                 .foregroundStyle(.secondary)
@@ -116,6 +115,24 @@ extension SettingsView {
                 .fixedSize(horizontal: false, vertical: true)
                 .modifier(CaptionWidth()) // the same reading cap + control column as `described`
         }
+    }
+
+    /// One aspect family as a capsule, in the Library shelf chips' style. Plain style, so a tap in
+    /// the list row hits only this chip.
+    private func aspectChip(_ label: String, index: Int) -> some View {
+        let on = index == family
+        return Button { aspectSelection.wrappedValue = index } label: {
+            Text(label)
+                .font(.geist(13, .semibold, relativeTo: .subheadline))
+                .lineLimit(1)
+                .foregroundStyle(on ? Color.white : Color.primary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(Capsule().fill(on ? AnyShapeStyle(Color.brand) : AnyShapeStyle(.regularMaterial)))
+                .overlay { if !on { Capsule().strokeBorder(.quaternary, lineWidth: 1) } }
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(on ? .isSelected : [])
     }
 
     /// Custom W×H(+Hz) fields, a segmented refresh picker, or a static single-rate row.
@@ -1298,3 +1315,40 @@ extension SettingsView {
     }
     #endif
 }
+
+#if os(iOS) || os(visionOS)
+/// Its children left to right at their own size, starting a new line where the next one would
+/// pass the proposed width.
+private struct WrapLayout: Layout {
+    var spacing: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let frames = frames(subviews, width: proposal.width ?? .infinity)
+        return CGSize(width: frames.map(\.maxX).max() ?? 0, height: frames.map(\.maxY).max() ?? 0)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        for (view, frame) in zip(subviews, frames(subviews, width: bounds.width)) {
+            view.place(at: CGPoint(x: bounds.minX + frame.minX, y: bounds.minY + frame.minY),
+                       proposal: ProposedViewSize(frame.size))
+        }
+    }
+
+    private func frames(_ subviews: Subviews, width: CGFloat) -> [CGRect] {
+        var frames: [CGRect] = []
+        var origin = CGPoint.zero
+        var lineHeight: CGFloat = 0
+        for view in subviews {
+            let size = view.sizeThatFits(.unspecified)
+            if origin.x > 0, origin.x + size.width > width {
+                origin = CGPoint(x: 0, y: origin.y + lineHeight + spacing)
+                lineHeight = 0
+            }
+            frames.append(CGRect(origin: origin, size: size))
+            origin.x += size.width + spacing
+            lineHeight = max(lineHeight, size.height)
+        }
+        return frames
+    }
+}
+#endif
