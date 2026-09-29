@@ -1212,8 +1212,9 @@ fn stream_body(
     // Software paths refuse in-place retarget; raising FEC then overshoots the budget.
     let mut adapt_supported = true;
     // Wire frameIndex owned here. `submit_indexed(au_seq + enc_inflight)` keeps RFI 1:1
-    // with Moonlight across in-place rebuilds (an internal counter would desync).
-    let mut au_seq: u32 = 0;
+    // with Moonlight across in-place rebuilds. Starts at 1: Moonlight rejects frame 0, so
+    // an opening IDR numbered 0 never decodes.
+    let mut au_seq: u32 = 1;
     let mut enc_inflight: u32 = 0;
     let mut plan = gs_session_plan(&cfg, cursor_blend);
     let mut enc = gs_open_encoder(
