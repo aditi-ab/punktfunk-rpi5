@@ -232,7 +232,9 @@ impl StreamState {
 
     /// Publish capture health, then fold every pending recovery ask (a recovered source stall,
     /// keyframe requests, `/status` force-IDR, RFI ranges) into at most one encoder action: an
-    /// RFI when the encoder can anchor, else one IDR per cooldown.
+    /// RFI when the encoder can anchor, else one IDR per cooldown. A client keyframe ask that
+    /// lands in the same tick as an RFI the encoder anchored is the same loss: the anchor
+    /// repairs it, and a re-ask past the anchor's flight forces the IDR.
     pub(super) fn on_recovery_requests(&mut self) {
         let mut want_kf = false;
         // Staged recovery closed on real source frames (WP14): the client held the last image
@@ -264,8 +266,10 @@ impl StreamState {
             );
             want_kf = true;
         }
+        // Kept apart from the host's own reasons: a client ask never pre-empts the RFI.
+        let mut client_kf = false;
         while self.keyframe.try_recv().is_ok() {
-            want_kf = true;
+            client_kf = true;
         }
         if self.force_idr.swap(false, Ordering::Relaxed) {
             want_kf = true;
@@ -277,18 +281,23 @@ impl StreamState {
                 None => (first, last),
             });
         }
-        if self.plan.codec == crate::encode::Codec::PyroWave && (want_kf || rfi_range.is_some()) {
+        if self.plan.codec == crate::encode::Codec::PyroWave
+            && (want_kf || client_kf || rfi_range.is_some())
+        {
             tracing::debug!(
                 want_kf,
+                client_kf,
                 ?rfi_range,
                 "PyroWave session: recovery request ignored (all-intra — next frame is the recovery)"
             );
             want_kf = false;
+            client_kf = false;
             rfi_range = None;
         }
         // An RFI the encoder declined is proof that recovery needs an IDR — the anchor
         // itself was lost, or every surviving reference is tainted. Not an echo.
         let mut rfi_declined = false;
+        let mut anchored = false;
         if !want_kf {
             if let Some((first, last)) = rfi_range {
                 let width = last.wrapping_sub(first);
@@ -299,6 +308,7 @@ impl StreamState {
                     && self.enc.invalidate_ref_frames(first as i64, last as i64)
                 {
                     self.last_rfi = Some(std::time::Instant::now());
+                    anchored = true;
                 } else {
                     want_kf = true;
                     rfi_declined = true;
@@ -306,7 +316,9 @@ impl StreamState {
                 }
             }
         }
-        if want_kf {
+        if client_kf && anchored {
+            tracing::debug!("keyframe request coalesced — rides on the RFI just anchored");
+        } else if want_kf || client_kf {
             self.force_keyframe(rfi_declined);
         }
     }
