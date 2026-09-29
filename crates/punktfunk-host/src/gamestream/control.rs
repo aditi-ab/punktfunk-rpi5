@@ -430,6 +430,7 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                     peer.reset(&inj_tx);
                 }
                 peer.pump_outbound(&mut host, &state);
+                peer.pump_repeat(&inj_tx, access.as_ref().map(|a| a.mask).unwrap_or(GRANT_ALL));
                 // ENet handshake/keepalive/retransmit pacing is the socket's 2 ms read
                 // timeout in the drain above. Do not sleep on top of it.
             }
@@ -486,6 +487,8 @@ struct ControlPeer {
     pointer: super::pen::GsPointer,
     /// The injector outlives the peer: whatever it still holds is released when it goes.
     held: crate::inject::held::HeldInput,
+    /// Windows auto-repeat for the last held key; the tick injects what falls due.
+    repeat: super::input::KeyRepeat,
     drops: GrantDrops,
     /// One host→client seq for every outbound message (rumble, HDR, termination). The GCM
     /// nonce is derived from it; a per-type counter would reuse (key, nonce) pairs.
@@ -505,9 +508,19 @@ impl ControlPeer {
             pads: SessionPads::new(),
             pointer: super::pen::GsPointer::new(),
             held: Default::default(),
+            repeat: super::input::KeyRepeat::for_this_host(),
             drops: GrantDrops::new(Plane::Gamestream),
             host_seq: 0,
             last_key: None,
+        }
+    }
+
+    /// Inject the held key's repeat when it falls due, under the same grant as the key.
+    fn pump_repeat(&mut self, inj_tx: &Sender<InputEvent>, grants: u32) {
+        if let Some(ev) = self.repeat.due(std::time::Instant::now()) {
+            if self.drops.permitted(grants, classify(ev.kind)) {
+                let _ = inj_tx.send(ev);
+            }
         }
     }
 
@@ -526,6 +539,7 @@ impl ControlPeer {
         self.hdr_signalled = None;
         self.pads = SessionPads::new();
         self.pointer = super::pen::GsPointer::new();
+        self.repeat = super::input::KeyRepeat::for_this_host();
         for ev in self.held.release() {
             let _ = inj_tx.send(ev);
         }
@@ -788,6 +802,7 @@ fn on_receive(
         if peer.drops.permitted(grants, classify(ev.kind)) {
             state.counters.input_events.fetch_add(1, Ordering::Relaxed);
             peer.held.note(&ev);
+            peer.repeat.note(&ev, std::time::Instant::now());
             let _ = inj_tx.send(ev);
         }
     }
