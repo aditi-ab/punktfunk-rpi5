@@ -43,7 +43,8 @@ const FEC_MATRIX: [[u8; FEC_DATA_SHARDS]; FEC_PARITY_SHARDS] =
     [[0x77, 0x40, 0x38, 0x0e], [0xc7, 0xa7, 0x0d, 0x6c]];
 
 /// RTSP ANNOUNCE audio: `x-nv-audio.surround.numChannels`,
-/// `x-nv-audio.surround.AudioQuality`, `x-nv-aqos.packetDuration`.
+/// `x-nv-audio.surround.AudioQuality`, `x-nv-aqos.packetDuration`. PLAY adds
+/// `host_audio` from `/launch`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AudioParams {
     /// 2, 6 (5.1), or 8 (7.1).
@@ -55,6 +56,8 @@ pub struct AudioParams {
     pub packet_duration_ms: u8,
     /// Client negotiated `SS_ENC_AUDIO` or its legacy feature flag.
     pub encrypt: bool,
+    /// Capture must leave the host's own output playing (`localAudioPlayMode`).
+    pub host_audio: bool,
 }
 
 impl Default for AudioParams {
@@ -64,6 +67,7 @@ impl Default for AudioParams {
             high_quality: false,
             packet_duration_ms: 5,
             encrypt: false,
+            host_audio: false,
         }
     }
 }
@@ -250,6 +254,10 @@ fn run(
     tracing::debug!(%client, "audio: client endpoint learned");
 
     let want = layout_for(&params).channels as u32;
+    // Before the parked-capturer check: it compares the policy this guard sets. Outlives `cap`.
+    let _keep_host_audio = params
+        .host_audio
+        .then(crate::audio::capture_policy::keep_host_audio_guard);
     // Always 48 kHz: GameStream Opus has no rate field, and libopus tops out here.
     // Hi-res `0xD3` is native-only (`design/hi-res-audio.md`).
     let mut cap = match audio::take_parked_capture(audio_cap, want, SAMPLE_RATE) {

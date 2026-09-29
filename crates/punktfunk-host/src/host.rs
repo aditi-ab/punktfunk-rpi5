@@ -583,6 +583,7 @@ mod session_tests {
             height: 1080,
             fps: 60,
             appid: 1,
+            host_audio: false,
             peer_ip: None,
             owner_fp: None,
         });

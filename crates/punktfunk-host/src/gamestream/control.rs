@@ -1070,6 +1070,7 @@ mod tests {
             height: 1080,
             fps: 60,
             appid: 1,
+            host_audio: false,
             peer_ip,
             owner_fp: None,
         })

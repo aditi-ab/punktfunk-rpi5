@@ -375,6 +375,9 @@ async fn h_resume(
         if let Some(Extension(PeerAddr(a))) = addr {
             session.peer_ip = Some(a.ip());
         }
+        if let Some(on) = host_audio(&q) {
+            session.host_audio = on;
+        }
     }
     // New ping: RTSP is plaintext until `SS_ENC_CONTROL_V2`, so the previous payload may
     // already be on the wire.
@@ -449,9 +452,17 @@ fn launch(_st: &AppState, q: &HashMap<String, String>) -> Result<LaunchSession> 
         height,
         fps,
         appid,
+        host_audio: host_audio(q).unwrap_or(false),
         peer_ip: None,  // `h_launch` fills from the verified HTTPS peer
         owner_fp: None, // `h_launch` fills from the client cert
     })
+}
+
+/// Moonlight's "Play audio on host" (`localAudioPlayMode`), when the request carries it.
+fn host_audio(q: &HashMap<String, String>) -> Option<bool> {
+    q.get("localAudioPlayMode")
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .map(|v| v != 0)
 }
 
 /// GameStream `mode`: `"WxHxFPS"`.
@@ -731,6 +742,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn launch_reads_play_audio_on_host() {
+        let st = test_state();
+        let mut q = HashMap::from([("rikey".to_string(), "11".repeat(16))]);
+        assert!(!launch(&st, &q).unwrap().host_audio, "absent means off");
+        q.insert("localAudioPlayMode".into(), "1".into());
+        assert!(launch(&st, &q).unwrap().host_audio);
+    }
+
     #[tokio::test]
     async fn pairchallenge_answers_only_a_pinned_client() {
         async fn challenge(
@@ -890,6 +910,7 @@ mod tests {
             height: 1080,
             fps: 60,
             appid: 1,
+            host_audio: false,
             peer_ip: None,
             owner_fp: Some(owner_fp),
         };
@@ -985,6 +1006,7 @@ mod tests {
                 height: 1080,
                 fps: 60,
                 appid: 4242,
+                host_audio: false,
                 peer_ip: None,
                 owner_fp,
             })
@@ -1018,6 +1040,7 @@ mod tests {
             height: 1080,
             fps: 60,
             appid: 1,
+            host_audio: false,
             peer_ip: None,
             owner_fp: Some(owner_fp),
         });
@@ -1025,6 +1048,7 @@ mod tests {
         let mut q = HashMap::new();
         q.insert("rikey".to_string(), "22".repeat(16));
         q.insert("rikeyid".to_string(), "-5".to_string());
+        q.insert("localAudioPlayMode".to_string(), "1".to_string());
         let ok = body_of(
             h_resume(State(st.clone()), peer.clone(), None, Query(q))
                 .await
@@ -1037,6 +1061,7 @@ mod tests {
             let s = launch.as_ref().unwrap();
             assert_eq!(s.gcm_key, [0x22; 16]);
             assert_eq!(s.rikeyid, -5);
+            assert!(s.host_audio, "resume carries the host-audio choice");
         }
 
         let mut bad = HashMap::new();
@@ -1071,6 +1096,7 @@ mod tests {
             height: 1440,
             fps: 120,
             appid: 1,
+            host_audio: false,
             peer_ip: None,
             owner_fp: Some(punktfunk_core::quic::endpoint::cert_fingerprint(der)),
         }

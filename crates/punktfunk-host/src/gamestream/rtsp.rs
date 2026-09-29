@@ -342,7 +342,10 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
             // its Opus payload is AES-CBC sealed.
             if !state.audio_streaming.swap(true, Ordering::SeqCst) {
                 tracing::info!("RTSP PLAY — starting audio stream");
-                let params = *state.gs.audio_params.lock().unwrap();
+                let params = audio::AudioParams {
+                    host_audio: ls.host_audio,
+                    ..*state.gs.audio_params.lock().unwrap()
+                };
                 audio::start(
                     state.audio_streaming.clone(),
                     params.encrypt.then_some(ls.gcm_key),
@@ -829,6 +832,8 @@ fn audio_params(map: &HashMap<String, String>, offer: EncOffer) -> audio::AudioP
         high_quality,
         packet_duration_ms,
         encrypt,
+        // `/launch` carries it; PLAY fills it in.
+        host_audio: false,
     }
 }
 
