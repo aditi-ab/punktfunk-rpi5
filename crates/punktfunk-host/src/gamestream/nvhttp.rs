@@ -450,7 +450,8 @@ async fn wait_media_exit(st: &AppState, before: u64, expected: u64) {
     }
 }
 
-/// `rikey` (16-byte AES hex) and signed `rikeyid` (negative values wrap to a BE u32 IV).
+/// `rikey` (16-byte AES hex) and `rikeyid`, the 32-bit IV seed. moonlight-common-c prints
+/// it signed, moonlight-common-rust unsigned; both mean the same low 32 bits.
 fn parse_rikey(q: &HashMap<String, String>) -> Result<([u8; 16], i32)> {
     let rikey = q.get("rikey").ok_or_else(|| anyhow!("missing rikey"))?;
     let key_bytes = hex::decode(rikey).context("rikey hex")?;
@@ -459,8 +460,35 @@ fn parse_rikey(q: &HashMap<String, String>) -> Result<([u8; 16], i32)> {
     }
     let mut gcm_key = [0u8; 16];
     gcm_key.copy_from_slice(&key_bytes[..16]);
-    let rikeyid: i32 = q.get("rikeyid").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let rikeyid = q
+        .get("rikeyid")
+        .and_then(|s| s.parse::<i64>().ok())
+        .map_or(0, |v| v as u32 as i32);
     Ok((gcm_key, rikeyid))
+}
+
+#[cfg(test)]
+mod rikey_tests {
+    use super::*;
+
+    /// A signed `-5` and an unsigned `4294967291` are the same IV seed.
+    #[test]
+    fn rikeyid_accepts_both_signed_and_unsigned_forms() {
+        let q = |id: &str| {
+            HashMap::from([
+                ("rikey".to_string(), "11".repeat(16)),
+                ("rikeyid".to_string(), id.to_string()),
+            ])
+        };
+        assert_eq!(parse_rikey(&q("-5")).unwrap().1, -5);
+        assert_eq!(parse_rikey(&q("4294967291")).unwrap().1, -5);
+        assert_eq!(
+            parse_rikey(&q("3000000000")).unwrap().1,
+            3_000_000_000u32 as i32
+        );
+        assert_eq!(parse_rikey(&q("9")).unwrap().1, 9);
+        assert_eq!(parse_rikey(&q("x")).unwrap().1, 0);
+    }
 }
 
 fn launch(_st: &AppState, q: &HashMap<String, String>) -> Result<LaunchSession> {

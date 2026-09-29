@@ -243,26 +243,30 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                 );
                 return response_status("401 Unauthorized", &req.cseq, &[], None);
             }
-            let (port, extra_key) = match stream_type(&req.uri) {
-                Some("audio") => (AUDIO_PORT, "X-SS-Ping-Payload"),
-                Some("video") => (VIDEO_PORT, "X-SS-Ping-Payload"),
-                Some("control") => (CONTROL_PORT, "X-SS-Connect-Data"),
+            // Session ping payload from `/launch`. The client echoes it as its first
+            // datagram on each media port.
+            let ping = state.av_ping_payload();
+            let ping_hex = hex::encode(ping);
+            // ENet connect data. Sunshine sends a decimal u32 and moonlight-common-rust
+            // parses one; the control plane never reads it back.
+            let connect_data = u32::from_be_bytes([ping[0], ping[1], ping[2], ping[3]]).to_string();
+            let (port, extra) = match stream_type(&req.uri) {
+                Some("audio") => (AUDIO_PORT, ("X-SS-Ping-Payload", ping_hex.as_str())),
+                Some("video") => (VIDEO_PORT, ("X-SS-Ping-Payload", ping_hex.as_str())),
+                Some("control") => (CONTROL_PORT, ("X-SS-Connect-Data", connect_data.as_str())),
                 Some("mic") => {
                     tracing::info!("RTSP SETUP mic — accepted; this host takes no Moonlight mic");
-                    (MIC_PORT, "X-SS-Ping-Payload")
+                    (MIC_PORT, ("X-SS-Ping-Payload", ping_hex.as_str()))
                 }
                 _ => return response_status("404 Not Found", &req.cseq, &[], None),
             };
             let transport = format!("server_port={port}");
-            // Session ping payload from `/launch`. The client echoes it as its first
-            // datagram on each media port.
-            let payload = hex::encode(state.av_ping_payload());
             response(
                 &req.cseq,
                 &[
                     ("Session", "DEADBEEFCAFE;timeout = 90"),
                     ("Transport", &transport),
-                    (extra_key, &payload),
+                    extra,
                 ],
                 None,
             )
@@ -870,8 +874,10 @@ fn audio_passthrough(map: &HashMap<String, String>) -> Result<bool, String> {
 }
 
 /// SETUP URI `…/streamid=video/0/0` → `"video"` / `"audio"` / `"control"` / `"mic"`.
+/// Only the text between `=` and `/` counts, as Sunshine reads it: moonlight-common-rust
+/// sends `stream=control/13/0`.
 fn stream_type(uri: &str) -> Option<&str> {
-    let after = uri.split("streamid=").nth(1)?;
+    let after = uri.split_once('=')?.1;
     let token = after.split('/').next()?;
     match token {
         "audio" | "video" | "control" | "mic" => Some(token),
@@ -1042,6 +1048,72 @@ mod tests {
         assert_eq!(
             stream_type("rtsp://10.0.0.2:48010/streamid=bogus/0/0"),
             None
+        );
+        // moonlight-common-rust: a bare target, and `stream=` on the control SETUP.
+        assert_eq!(stream_type("streamid=audio/0/0"), Some("audio"));
+        assert_eq!(stream_type("stream=control/13/0"), Some("control"));
+        assert_eq!(stream_type("rtsp://10.0.0.2:48010"), None);
+    }
+
+    /// moonlight-common-rust parses `X-SS-Connect-Data` as a decimal u32 (Sunshine's shape);
+    /// the media ports keep the hex ping payload.
+    #[test]
+    fn setup_control_hands_out_decimal_connect_data() {
+        let host = crate::host::Host {
+            hostname: "t".into(),
+            uniqueid: "id".into(),
+            http_port: super::super::HTTP_PORT,
+            https_port: super::super::HTTPS_PORT,
+            os_chain: "linux".into(),
+            os_name: "Linux".into(),
+        };
+        let identity = super::super::cert::ServerIdentity::ephemeral().expect("identity");
+        let stats = crate::stats_recorder::StatsRecorder::new(
+            std::env::temp_dir().join(format!("pf-rtsp-stats-{}", std::process::id())),
+        );
+        let st = Arc::new(AppState::new(
+            host,
+            stats,
+            super::super::GsState::new(identity),
+        ));
+        // SETUP is gated on a live `/launch`.
+        *st.launch.lock().unwrap() = Some(LaunchSession {
+            gcm_key: [0; 16],
+            rikeyid: 0,
+            width: 1280,
+            height: 720,
+            fps: 60,
+            appid: 1,
+            host_audio: false,
+            peer_ip: None,
+            owner_fp: None,
+        });
+        st.mint_av_ping();
+        let ping = st.av_ping_payload();
+        let setup = |target: &str| {
+            handle_request(
+                &Request {
+                    method: "SETUP".into(),
+                    uri: target.into(),
+                    cseq: "3".into(),
+                    head: String::new(),
+                    body: String::new(),
+                },
+                &st,
+                None,
+            )
+        };
+        let control = setup("stream=control/13/0");
+        assert!(control.starts_with("RTSP/1.0 200"), "{control}");
+        let data = header_value(&control, "x-ss-connect-data").expect("connect data");
+        assert_eq!(
+            data.parse::<u32>().unwrap(),
+            u32::from_be_bytes([ping[0], ping[1], ping[2], ping[3]])
+        );
+        let video = setup("rtsp://10.0.0.2:48010/streamid=video/0/0");
+        assert_eq!(
+            header_value(&video, "x-ss-ping-payload"),
+            Some(hex::encode(ping).as_str())
         );
     }
 
