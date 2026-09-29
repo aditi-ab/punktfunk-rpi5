@@ -1102,11 +1102,55 @@ fn spawn_sender(
     Ok(())
 }
 
-/// Ignore further IDR requests after emitting one. Floor is 100 ms: `frame_interval * 2` is
-/// 16.7 ms at 120 fps, while a client under loss re-asks every ~30 ms — every request would
-/// pass and the IDR storm would feed the loss that prompts the next request.
+/// At most one IDR per this window. Floor is 100 ms: `frame_interval * 2` is 16.7 ms at
+/// 120 fps, while a client under loss re-asks every ~30 ms — every request would pass and the
+/// IDR storm would feed the loss that prompts the next request.
 fn keyframe_coalesce_window(frame_interval: Duration) -> Duration {
     (frame_interval * 2).max(Duration::from_millis(100))
+}
+
+/// Keyframe requests, one IDR per [`keyframe_coalesce_window`]. A request inside the window
+/// stays owed and fires once it passes: Moonlight re-asks only after its next loss, so a
+/// dropped re-ask for a lost IDR freezes the picture until the client's 120-frame drop limit.
+struct KeyframeGate {
+    window: Duration,
+    last: Option<Instant>,
+    owed: bool,
+}
+
+impl KeyframeGate {
+    fn new(window: Duration) -> Self {
+        KeyframeGate {
+            window,
+            last: None,
+            owed: false,
+        }
+    }
+
+    /// An IDR is needed but not asked for this tick (a dropped frame).
+    fn owe(&mut self) {
+        self.owed = true;
+    }
+
+    /// Notes `asked`; true when an IDR is due now.
+    fn due(&mut self, asked: bool, now: Instant) -> bool {
+        self.owed |= asked;
+        if !self.owed
+            || self
+                .last
+                .is_some_and(|t| now.duration_since(t) < self.window)
+        {
+            return false;
+        }
+        self.emitted(now);
+        true
+    }
+
+    /// An IDR went out, here or from a rebuild; it settles every request so far.
+    fn emitted(&mut self, now: Instant) {
+        self.last = Some(now);
+        self.owed = false;
+    }
 }
 
 /// Re-opens the virtual source on capture loss: the new capturer and its `cursor_blend`. Takes
@@ -1266,12 +1310,8 @@ fn stream_body(
 
     // Without RFI each request is a full IDR. One IDR resolves pending loss; NVENC
     // invalidate is never rate-limited.
-    let keyframe_coalesce = keyframe_coalesce_window(frame_interval);
-    let mut last_keyframe: Option<Instant> = None;
+    let mut keyframes = KeyframeGate::new(keyframe_coalesce_window(frame_interval));
     let mut published_hdr: Option<pf_frame::HdrMeta> = None;
-    // A pipeline-head drop consumes no frameIndex; the client cannot see the gap. Arm an IDR
-    // through the same coalesce gate so a burst of drops cannot become an IDR storm.
-    let mut recover_after_drop = false;
     // Same 500 ms cadence the native loop publishes on.
     let mut health_published_at = Instant::now();
 
@@ -1358,7 +1398,7 @@ fn stream_body(
                 enc_src = (frame.format, frame.width, frame.height);
                 supports_rfi = enc.caps().supports_rfi;
                 enc.request_keyframe();
-                last_keyframe = Some(Instant::now());
+                keyframes.emitted(Instant::now());
                 next_frame = Instant::now();
                 // Old encoder died with in-flight AUs; numbering restarts at `au_seq`.
                 enc_inflight = 0;
@@ -1405,7 +1445,7 @@ fn stream_body(
                     enc.set_input_ring_depth(capturer.pipeline_depth().max(1));
                     supports_rfi = enc.caps().supports_rfi;
                     enc.request_keyframe();
-                    last_keyframe = Some(Instant::now());
+                    keyframes.emitted(Instant::now());
                     // Old encoder died with in-flight AUs; numbering restarts at `au_seq`.
                     enc_inflight = 0;
                     watchdog.on_au();
@@ -1424,7 +1464,7 @@ fn stream_body(
                 }
             }
         }
-        let mut want_keyframe = recover_after_drop;
+        let mut want_keyframe = false;
         if let Some((first, last)) = rfi_range.lock().unwrap().take() {
             // Wider than RFI_MAX_RANGE is a phantom range — keyframe, never a force-reference.
             let width = (last as u32).wrapping_sub(first as u32);
@@ -1441,21 +1481,10 @@ fn stream_body(
         if capturer.take_reference_risk() {
             want_keyframe = true;
         }
-        if want_keyframe {
-            let now = Instant::now();
-            let emit = match last_keyframe {
-                Some(t) => now.duration_since(t) >= keyframe_coalesce,
-                None => true,
-            };
-            if emit {
-                enc.request_keyframe();
-                last_keyframe = Some(now);
-                // Satisfied only by an emitted IDR. Coalesced away it is never retried and
-                // leaves duplicate wire indices for a later RFI to anchor on.
-                recover_after_drop = false;
-            } else {
-                tracing::debug!("video: keyframe request coalesced (IDR still in flight)");
-            }
+        if keyframes.due(want_keyframe, Instant::now()) {
+            enc.request_keyframe();
+        } else if want_keyframe {
+            tracing::debug!("video: keyframe request held (IDR still in flight)");
         }
         // Stock Moonlight tone-maps from in-band mastering/CLL SEI on keyframes. `None` is a no-op.
         let hdr_meta = capturer
@@ -1488,7 +1517,7 @@ fn stream_body(
             // Owed AUs died with the discarded state. IDR bypasses coalesce: the client must resync.
             enc_inflight = 0;
             enc.request_keyframe();
-            last_keyframe = Some(Instant::now());
+            keyframes.emitted(Instant::now());
             tracing::warn!(error = %format!("{e:#}"), reset = watchdog.resets(),
                 max = MAX_ENCODER_RESETS,
                 "encoder submit failed — encoder rebuilt in place, forcing an IDR");
@@ -1525,7 +1554,7 @@ fn stream_body(
         }
         let t_pkt = tick.elapsed();
 
-        // Never block: a full queue drops this frame (FEC/RFI covers) so encode is never capped.
+        // Never block: a full queue drops this frame and owes an IDR, so encode is never capped.
         if !aus.is_empty() {
             let batch_len = aus.len() as u32;
             match raw_tx.try_send(RawFrame {
@@ -1539,12 +1568,10 @@ fn stream_body(
                 }
                 Err(std::sync::mpsc::TrySendError::Full(_)) => {
                     dropped_batches += 1;
-                    recover_after_drop = true;
-                    // The driver already spent these indexes; skipping them keeps its wire
-                    // domain and Moonlight's frameIndex aligned (the client reads a gap as loss).
-                    if owed.is_some() {
-                        au_seq = au_seq.wrapping_add(batch_len);
-                    }
+                    keyframes.owe();
+                    // Spend the indexes: the encoder numbered these frames, and the gap is how
+                    // Moonlight learns they are lost instead of decoding past a missing reference.
+                    au_seq = au_seq.wrapping_add(batch_len);
                     if dropped_batches.is_power_of_two() {
                         tracing::warn!(
                             dropped_batches,
@@ -1575,7 +1602,7 @@ fn stream_body(
             };
             enc_inflight = 0;
             enc.request_keyframe();
-            last_keyframe = Some(Instant::now());
+            keyframes.emitted(Instant::now());
             tracing::warn!(reset = watchdog.resets(), max = MAX_ENCODER_RESETS, %why,
                 "encode stall detected — encoder rebuilt in place, forcing an IDR");
             next_frame = Instant::now() + backoff;
@@ -1898,6 +1925,32 @@ mod tests {
         assert_eq!(
             keyframe_coalesce_window(Duration::from_millis(200)),
             Duration::from_millis(400)
+        );
+    }
+
+    #[test]
+    fn keyframe_gate_holds_a_request_until_the_window_passes() {
+        let t0 = Instant::now();
+        let w = Duration::from_millis(100);
+        let mut g = KeyframeGate::new(w);
+        assert!(g.due(true, t0), "first request emits");
+        assert!(!g.due(true, t0 + w / 5), "inside the window: held");
+        assert!(!g.due(false, t0 + w / 2));
+        assert!(
+            g.due(false, t0 + w),
+            "the held request fires once the window passes"
+        );
+        assert!(!g.due(false, t0 + w * 3), "settled: nothing owed");
+        g.owe();
+        assert!(
+            g.due(false, t0 + w * 3),
+            "a dropped frame is owed an IDR too"
+        );
+        g.owe();
+        g.emitted(t0 + w * 5);
+        assert!(
+            !g.due(false, t0 + w * 7),
+            "a rebuild's IDR settles what was owed"
         );
     }
 
