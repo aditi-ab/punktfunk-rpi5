@@ -279,6 +279,56 @@ impl Presenter {
             self.device.reset_fences(&[self.fence])?;
         }
         self.last_fence_us = fence_started.elapsed().as_micros() as u32;
+
+        // Acquire before anything below retires the picture on screen. An out-of-date
+        // swapchain drops this frame, and the next `Redraw` must still replay the last one.
+        let acquire_started = std::time::Instant::now();
+        // An image taken by the non-blocking probe above is used as is.
+        let acquired = match self.acquired {
+            Some(index) => Ok((index, false)),
+            None => {
+                // With a present waiter, each call holds the swapchain for one bounded slice.
+                let timeout = match self.present_timer {
+                    Some(_) => SLICE_NS,
+                    None => u64::MAX,
+                };
+                loop {
+                    let _swapchain = self.present_timer.as_ref().map(|t| t.swapchain_guard());
+                    // SAFETY: `swapchain` and `acquire_sem` are owned here; the guard above is
+                    // the swapchain's host sync. No image is held, so every wait on
+                    // `acquire_sem` is complete: a present's by the fence wait above, a
+                    // discarded image's by `recreate_swapchain`'s queue drain.
+                    let r = unsafe {
+                        self.swap_d.acquire_next_image(
+                            self.swapchain,
+                            timeout,
+                            self.acquire_sem,
+                            vk::Fence::null(),
+                        )
+                    };
+                    if r != Err(vk::Result::TIMEOUT) {
+                        break r;
+                    }
+                }
+            }
+        };
+        let (index, _suboptimal) = match acquired {
+            Ok(r) => r,
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                // Acquire failed: GPU never saw the import; destroy it here.
+                #[cfg(target_os = "linux")]
+                if let Lane::Dmabuf(f) = lane {
+                    f.destroy(&self.device);
+                }
+                self.recreate_swapchain(window)?;
+                return Ok(Presented::Stale);
+            }
+            Err(e) => return Err(e).context("vkAcquireNextImageKHR"),
+        };
+        // Held until the submit waits `acquire_sem`: an error before then leaves the image
+        // for the next present, or for `recreate_swapchain` to retire.
+        self.acquired = Some(index);
+        self.last_acquire_us = acquire_started.elapsed().as_micros() as u32;
         // A `Redraw` samples the retired frame again through the direct pass, so it goes
         // with the next real frame, whose fence covers the redraw's reads too.
         if !redraw {
@@ -454,53 +504,6 @@ impl Presenter {
             self.log_placement(w, h, &p, path);
         }
 
-        let acquire_started = std::time::Instant::now();
-        // An image taken by the non-blocking probe above is used as is.
-        let acquired = match self.acquired {
-            Some(index) => Ok((index, false)),
-            None => {
-                // With a present waiter, each call holds the swapchain for one bounded slice.
-                let timeout = match self.present_timer {
-                    Some(_) => SLICE_NS,
-                    None => u64::MAX,
-                };
-                loop {
-                    let _swapchain = self.present_timer.as_ref().map(|t| t.swapchain_guard());
-                    // SAFETY: `swapchain` and `acquire_sem` are owned here; the guard above is
-                    // the swapchain's host sync. No image is held, so every wait on
-                    // `acquire_sem` is complete: a present's by the fence wait above, a
-                    // discarded image's by `recreate_swapchain`'s queue drain.
-                    let r = unsafe {
-                        self.swap_d.acquire_next_image(
-                            self.swapchain,
-                            timeout,
-                            self.acquire_sem,
-                            vk::Fence::null(),
-                        )
-                    };
-                    if r != Err(vk::Result::TIMEOUT) {
-                        break r;
-                    }
-                }
-            }
-        };
-        let (index, _suboptimal) = match acquired {
-            Ok(r) => r,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                // Acquire failed: GPU never saw the import; destroy it here.
-                #[cfg(target_os = "linux")]
-                if let Lane::Dmabuf(f) = lane {
-                    f.destroy(&self.device);
-                }
-                self.recreate_swapchain(window)?;
-                return Ok(Presented::Stale);
-            }
-            Err(e) => return Err(e).context("vkAcquireNextImageKHR"),
-        };
-        // Held until the submit waits `acquire_sem`: an error before then leaves the image
-        // for the next present, or for `recreate_swapchain` to retire.
-        self.acquired = Some(index);
-        self.last_acquire_us = acquire_started.elapsed().as_micros() as u32;
         let swap_image = self.images[index as usize];
         let direct_target = direct.map(|(_, plan)| CscTarget::Direct {
             framebuffer: self.overlay_pipe.framebuffers[index as usize],
