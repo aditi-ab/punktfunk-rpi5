@@ -212,9 +212,78 @@ fn ev(kind: InputKind, code: u32, x: i32, y: i32, flags: u32) -> InputEvent {
     }
 }
 
+const REPEAT_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+const REPEAT_PERIOD: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// Host-side key repeat. Moonlight drops its own auto-repeat and expects the host to repeat a
+/// held key; `SendInput` never does, and Wayland apps repeat on their own. Sunshine's cadence:
+/// the last key pressed repeats after 500 ms, then every 40 ms, until it is released.
+pub struct KeyRepeat {
+    enabled: bool,
+    held: Option<(InputEvent, std::time::Instant)>,
+}
+
+impl KeyRepeat {
+    /// On only where the injector never repeats (Windows).
+    pub fn for_this_host() -> KeyRepeat {
+        KeyRepeat {
+            enabled: cfg!(target_os = "windows"),
+            held: None,
+        }
+    }
+
+    pub fn note(&mut self, ev: &InputEvent, now: std::time::Instant) {
+        // The low byte is the VK, as the injectors read it.
+        let same_key = |h: &(InputEvent, _)| h.0.code as u8 == ev.code as u8;
+        match ev.kind {
+            InputKind::KeyDown if self.enabled => self.held = Some((*ev, now + REPEAT_DELAY)),
+            InputKind::KeyUp if self.held.as_ref().is_some_and(same_key) => self.held = None,
+            _ => {}
+        }
+    }
+
+    /// The key-down to inject again now, if one is due.
+    pub fn due(&mut self, now: std::time::Instant) -> Option<InputEvent> {
+        let (ev, next) = self.held.as_mut()?;
+        if now < *next {
+            return None;
+        }
+        *next = now + REPEAT_PERIOD;
+        Some(*ev)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_held_key_repeats_after_the_delay_until_released() {
+        let t0 = std::time::Instant::now();
+        let key = |kind| ev(kind, 0x41, 0, 0, 0);
+        let mut r = KeyRepeat {
+            enabled: true,
+            held: None,
+        };
+        r.note(&key(InputKind::KeyDown), t0);
+        assert_eq!(r.due(t0 + REPEAT_DELAY / 2), None);
+        assert_eq!(r.due(t0 + REPEAT_DELAY), Some(key(InputKind::KeyDown)));
+        assert_eq!(r.due(t0 + REPEAT_DELAY + REPEAT_PERIOD / 2), None);
+        assert!(r.due(t0 + REPEAT_DELAY + REPEAT_PERIOD).is_some());
+        r.note(&key(InputKind::KeyUp), t0 + REPEAT_DELAY * 2);
+        assert_eq!(r.due(t0 + REPEAT_DELAY * 3), None);
+
+        let mut off = KeyRepeat {
+            enabled: false,
+            held: None,
+        };
+        off.note(&key(InputKind::KeyDown), t0);
+        assert_eq!(
+            off.due(t0 + REPEAT_DELAY * 3),
+            None,
+            "Linux apps repeat on their own"
+        );
+    }
 
     fn wrap(magic: u32, body: &[u8]) -> Vec<u8> {
         let mut inp = Vec::new();

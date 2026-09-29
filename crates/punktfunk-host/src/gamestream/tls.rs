@@ -30,6 +30,11 @@ pub(crate) struct PeerCertFingerprint(pub Option<String>);
 #[derive(Clone, Copy)]
 pub(crate) struct PeerAddr(pub SocketAddr);
 
+/// The host address a request arrived on. `/serverinfo` reports that interface's IP and MAC,
+/// which Moonlight stores for Wake-on-LAN; the default route may be a VPN or another NIC.
+#[derive(Clone, Copy)]
+pub(crate) struct LocalAddr(pub SocketAddr);
+
 /// A listening socket nothing else on the box can bind beside.
 ///
 /// Windows lets a second socket bind a specific address on a port a wildcard socket holds,
@@ -164,6 +169,7 @@ async fn serve_governed(
         };
         let acceptor = acceptor.clone();
         let app = app.clone();
+        let local = tcp.local_addr().ok().map(LocalAddr);
         tokio::spawn(async move {
             let _permit = permit;
             let _ip_guard = ip_guard;
@@ -189,9 +195,18 @@ async fn serve_governed(
                                 c.as_ref(),
                             ))
                         });
-                    serve_conn(tls_stream, app, PeerCertFingerprint(fp), PeerAddr(peer)).await;
+                    serve_conn(
+                        tls_stream,
+                        app,
+                        PeerCertFingerprint(fp),
+                        PeerAddr(peer),
+                        local,
+                    )
+                    .await;
                 }
-                None => serve_conn(tcp, app, PeerCertFingerprint(None), PeerAddr(peer)).await,
+                None => {
+                    serve_conn(tcp, app, PeerCertFingerprint(None), PeerAddr(peer), local).await
+                }
             }
         });
     }
@@ -211,8 +226,13 @@ fn connection_builder() -> hyper_util::server::conn::auto::Builder<hyper_util::r
     builder
 }
 
-async fn serve_conn<S>(stream: S, app: Router, fp: PeerCertFingerprint, addr: PeerAddr)
-where
+async fn serve_conn<S>(
+    stream: S,
+    app: Router,
+    fp: PeerCertFingerprint,
+    addr: PeerAddr,
+    local: Option<LocalAddr>,
+) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     use tower::ServiceExt;
@@ -223,6 +243,9 @@ where
             let mut req = req.map(axum::body::Body::new);
             req.extensions_mut().insert(fp);
             req.extensions_mut().insert(addr);
+            if let Some(local) = local {
+                req.extensions_mut().insert(local);
+            }
             app.oneshot(req).await
         }
     });
@@ -253,7 +276,7 @@ mod governed_tests {
                 .await
                 .unwrap();
             let peer = PeerAddr("127.0.0.1:1".parse().unwrap());
-            serve_conn(tls, app, PeerCertFingerprint(None), peer).await;
+            serve_conn(tls, app, PeerCertFingerprint(None), peer, None).await;
         });
 
         let mut client = rustls::ClientConfig::builder()
@@ -296,6 +319,7 @@ mod governed_tests {
             app,
             PeerCertFingerprint(None),
             PeerAddr("127.0.0.1:1234".parse().unwrap()),
+            None,
         ));
         client
             .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")

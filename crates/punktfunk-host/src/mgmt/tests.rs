@@ -1169,6 +1169,7 @@ async fn status_reflects_runtime_state() {
         height: 1440,
         fps: 120,
         appid: 1,
+        host_audio: false,
         peer_ip: None,
         owner_fp: None,
     });
@@ -1271,6 +1272,7 @@ async fn paired_clients_list_and_unpair() {
             height: 1080,
             fps: 60,
             appid: 1,
+            host_audio: false,
             peer_ip: None,
             owner_fp: Some(owner),
         });
@@ -1333,6 +1335,7 @@ async fn paired_clients_list_and_unpair() {
             height: 1080,
             fps: 60,
             appid: 1,
+            host_audio: false,
             peer_ip: None,
             owner_fp: Some(owner),
         });
@@ -1778,6 +1781,7 @@ async fn stop_session_clears_runtime_state() {
         height: 1080,
         fps: 60,
         appid: 1,
+        host_audio: false,
         peer_ip: None,
         owner_fp: None,
     });

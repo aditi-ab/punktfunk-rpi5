@@ -8,7 +8,7 @@
 //!
 //! Pairing and grants: `design/per-client-access.md`.
 
-use super::tls::{PeerAddr, PeerCertFingerprint};
+use super::tls::{LocalAddr, PeerAddr, PeerCertFingerprint};
 use super::{serverinfo, LaunchSession, HTTPS_PORT, HTTP_PORT, RTSP_PORT};
 use crate::host::AppState;
 use anyhow::{anyhow, Context, Result};
@@ -108,10 +108,11 @@ enum Gate {
 }
 
 /// The whole nvhttp surface, each route with its gate.
-fn routes() -> [(&'static str, Gate, MethodRouter<Arc<AppState>>); 7] {
+fn routes() -> [(&'static str, Gate, MethodRouter<Arc<AppState>>); 8] {
     [
         ("/serverinfo", Gate::Open, get(h_serverinfo)),
         ("/pair", Gate::Open, get(h_pair)),
+        ("/unpair", Gate::Open, get(h_unpair)),
         ("/applist", Gate::Paired, get(h_applist)),
         ("/appasset", Gate::PairedAsset, get(h_appasset)),
         ("/launch", Gate::Paired, get(h_launch)),
@@ -163,7 +164,7 @@ async fn require_paired(State(st): State<Arc<AppState>>, req: Request, next: Nex
     if gate_for(path) == Some(Gate::PairedAsset) {
         StatusCode::FORBIDDEN.into_response()
     } else {
-        xml(error_xml()).into_response()
+        xml(error_xml(NOT_PAIRED)).into_response()
     }
 }
 
@@ -175,6 +176,7 @@ async fn h_serverinfo(
     State(st): State<Arc<AppState>>,
     Extension(Https(https)): Extension<Https>,
     peer: Option<Extension<PeerCertFingerprint>>,
+    local: Option<Extension<LocalAddr>>,
 ) -> impl IntoResponse {
     let paired = https && peer_is_paired(&peer, &st);
     // Owner-only `currentgame`: Moonlight uses it to show Resume/Quit.
@@ -188,6 +190,7 @@ async fn h_serverinfo(
         https,
         paired,
         current_game,
+        local.map(|Extension(LocalAddr(a))| a.ip()),
     ))
 }
 
@@ -239,16 +242,16 @@ async fn launch_under(
     conflict: crate::vdisplay::policy::ModeConflict,
 ) -> Response {
     // GRANT_LAUNCH + unexpired, besides pairing. GameStream has no join of an owner-launched
-    // session, and no reject vocabulary — the client sees the generic error XML.
+    // session and no reject codes; the client shows the refusal's `status_message`.
     match peer_grants(&peer, &st) {
         Some(g) if g & GRANT_LAUNCH != 0 => {}
         Some(_) => {
             tracing::warn!("launch rejected — this client's access grants do not include Launch");
-            return xml(error_xml()).into_response();
+            return xml(error_xml(NO_LAUNCH)).into_response();
         }
         None => {
             tracing::warn!("launch rejected — this client's access has expired");
-            return xml(error_xml()).into_response();
+            return xml(error_xml(EXPIRED)).into_response();
         }
     }
     let req_fp: Option<[u8; 32]> = peer_fp(&peer);
@@ -270,7 +273,7 @@ async fn launch_under(
                     why,
                     "GameStream launch REJECTED — the session belongs to another client"
                 );
-                return (StatusCode::SERVICE_UNAVAILABLE, xml(error_xml())).into_response();
+                return (StatusCode::SERVICE_UNAVAILABLE, xml(error_xml(BUSY))).into_response();
             }
         }
     }
@@ -309,7 +312,7 @@ async fn launch_under(
         }
         Err(e) => {
             tracing::warn!(error = %format!("{e:#}"), "launch failed");
-            xml(error_xml()).into_response()
+            xml(error_xml(LAUNCH_FAILED)).into_response()
         }
     }
 }
@@ -325,16 +328,16 @@ async fn h_resume(
         Some(g) if g & GRANT_LAUNCH != 0 => {}
         Some(_) => {
             tracing::warn!("resume rejected — this client's access grants do not include Launch");
-            return xml(error_xml());
+            return xml(error_xml(NO_LAUNCH));
         }
         None => {
             tracing::warn!("resume rejected — this client's access has expired");
-            return xml(error_xml());
+            return xml(error_xml(EXPIRED));
         }
     }
     if !peer_may_control_session(&peer, &st) {
         tracing::warn!("resume rejected — caller does not own the session");
-        return xml(error_xml());
+        return xml(error_xml(NOT_OWNER));
     }
     // PLAY skips if `streaming` is still true, so clear the flags and wait for exit.
     let before = st.media_exited.load(std::sync::atomic::Ordering::SeqCst);
@@ -353,7 +356,7 @@ async fn h_resume(
     {
         let mut launch = st.launch.lock().unwrap();
         let Some(session) = launch.as_mut() else {
-            return xml(error_xml());
+            return xml(error_xml(NO_SESSION));
         };
         if q.contains_key("rikey") {
             match parse_rikey(&q) {
@@ -367,13 +370,16 @@ async fn h_resume(
                 }
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "resume rejected — malformed rikey");
-                    return xml(error_xml());
+                    return xml(error_xml(RESUME_FAILED));
                 }
             }
         }
         // Re-bind RTSP/media IP filters to the resume source; the client may have changed networks.
         if let Some(Extension(PeerAddr(a))) = addr {
             session.peer_ip = Some(a.ip());
+        }
+        if let Some(on) = host_audio(&q) {
+            session.host_audio = on;
         }
     }
     // New ping: RTSP is plaintext until `SS_ENC_CONTROL_V2`, so the previous payload may
@@ -390,16 +396,38 @@ async fn h_cancel(
     // (`peer_may_control_session`); denying it wedges the session they are ending.
     if peer_grants(&peer, &st).is_none() {
         tracing::warn!("cancel rejected — this client's access has expired");
-        return xml(error_xml());
+        return xml(error_xml(EXPIRED));
     }
     if !peer_may_control_session(&peer, &st) {
         tracing::warn!("cancel rejected — caller does not own the session");
-        return xml(error_xml());
+        return xml(error_xml(NOT_OWNER));
     }
     // `/cancel` is Quit App, not a drop: `quit_session` sets the quit flag so the virtual
     // display skips keep-alive linger and end-game policy treats it as operator intent.
     st.quit_session("client /cancel");
     xml("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<root status_code=\"200\"><cancel>1</cancel></root>\n".to_string())
+}
+
+/// Moonlight sends this over plain HTTP whenever pairing fails, a wrong PIN included, and reads
+/// any non-200 as a host fault. It carries no credential, so it only ends the caller's own
+/// unfinished ceremony; a pinned cert stays pinned.
+async fn h_unpair(
+    State(st): State<Arc<AppState>>,
+    addr: Option<Extension<PeerAddr>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let (Some(uniqueid), Some(Extension(PeerAddr(a)))) = (q.get("uniqueid"), addr) {
+        if st.gs.pairing.abandon(uniqueid, a.ip()) {
+            tracing::info!(
+                uniqueid,
+                "pairing abandoned by the client (wrong PIN or cancelled)"
+            );
+        }
+    }
+    xml(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<root status_code=\"200\"></root>\n"
+            .to_string(),
+    )
 }
 
 /// Wait for `expected` stopped media threads to exit, so their teardown cannot stomp a
@@ -442,6 +470,11 @@ fn launch(_st: &AppState, q: &HashMap<String, String>) -> Result<LaunchSession> 
         .and_then(|m| parse_mode(m))
         .unwrap_or((1920, 1080, 60));
     let appid = q.get("appid").and_then(|s| s.parse().ok()).unwrap_or(1);
+    // A stale shortcut or cached tile must not quietly open the desktop instead.
+    anyhow::ensure!(
+        super::apps::by_id(appid).is_some(),
+        "appid {appid} is not in the catalog"
+    );
     Ok(LaunchSession {
         gcm_key,
         rikeyid,
@@ -449,9 +482,17 @@ fn launch(_st: &AppState, q: &HashMap<String, String>) -> Result<LaunchSession> 
         height,
         fps,
         appid,
+        host_audio: host_audio(q).unwrap_or(false),
         peer_ip: None,  // `h_launch` fills from the verified HTTPS peer
         owner_fp: None, // `h_launch` fills from the client cert
     })
+}
+
+/// Moonlight's "Play audio on host" (`localAudioPlayMode`), when the request carries it.
+fn host_audio(q: &HashMap<String, String>) -> Option<bool> {
+    q.get("localAudioPlayMode")
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .map(|v| v != 0)
 }
 
 /// GameStream `mode`: `"WxHxFPS"`.
@@ -602,9 +643,24 @@ fn pair_error_xml() -> String {
         .to_string()
 }
 
-fn error_xml() -> String {
-    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<root status_code=\"400\"></root>\n".to_string()
+/// Refusal XML. Moonlight puts `status_message` on screen after "Host PC returned error:".
+fn error_xml(message: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<root status_code=\"400\" status_message=\"{}\"></root>\n",
+        super::apps::xml_escape(message)
+    )
 }
+
+const NOT_PAIRED: &str = "This device isn't paired with the host. Pair it again from Moonlight.";
+const NO_LAUNCH: &str = "This device isn't allowed to start games on this host";
+const EXPIRED: &str =
+    "This device's access to the host has expired. Ask the host's owner to renew it.";
+const BUSY: &str = "Another device is streaming from this host. Try again when it finishes.";
+const LAUNCH_FAILED: &str =
+    "The host couldn't start this app. Refresh the app list, then try again.";
+const NOT_OWNER: &str = "This session belongs to another device";
+const NO_SESSION: &str = "There's no session to resume. Start the app again.";
+const RESUME_FAILED: &str = "The host couldn't resume this session. Start the app again.";
 
 #[cfg(test)]
 mod tests {
@@ -685,7 +741,7 @@ mod tests {
                     assert_eq!(status, StatusCode::OK, "{path}: the nvhttp error is a 200");
                     assert_eq!(
                         body,
-                        error_xml(),
+                        error_xml(NOT_PAIRED),
                         "{path} must answer a stranger with the error XML"
                     );
                 }
@@ -699,7 +755,11 @@ mod tests {
         // argument check (400, not the gate's 403).
         let (status, body) = drive(&st, "/applist", Some(pinned.clone())).await;
         assert_eq!(status, StatusCode::OK);
-        assert_ne!(body, error_xml(), "a pinned cert must not be rejected");
+        assert_ne!(
+            body,
+            error_xml(NOT_PAIRED),
+            "a pinned cert must not be rejected"
+        );
         let (status, _) = drive(&st, "/appasset", Some(pinned)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
@@ -729,6 +789,23 @@ mod tests {
             !peer_is_paired(&other, &st),
             "a non-pinned cert stays rejected"
         );
+    }
+
+    #[test]
+    fn launch_reads_play_audio_on_host() {
+        let st = test_state();
+        let mut q = HashMap::from([("rikey".to_string(), "11".repeat(16))]);
+        assert!(!launch(&st, &q).unwrap().host_audio, "absent means off");
+        q.insert("localAudioPlayMode".into(), "1".into());
+        assert!(launch(&st, &q).unwrap().host_audio);
+    }
+
+    #[test]
+    fn launch_refuses_an_app_the_catalog_lacks() {
+        let st = test_state();
+        let mut q = HashMap::from([("rikey".to_string(), "11".repeat(16))]);
+        q.insert("appid".into(), "987654321".into());
+        assert!(launch(&st, &q).is_err());
     }
 
     #[tokio::test]
@@ -890,6 +967,7 @@ mod tests {
             height: 1080,
             fps: 60,
             appid: 1,
+            host_audio: false,
             peer_ip: None,
             owner_fp: Some(owner_fp),
         };
@@ -985,6 +1063,7 @@ mod tests {
                 height: 1080,
                 fps: 60,
                 appid: 4242,
+                host_audio: false,
                 peer_ip: None,
                 owner_fp,
             })
@@ -1018,6 +1097,7 @@ mod tests {
             height: 1080,
             fps: 60,
             appid: 1,
+            host_audio: false,
             peer_ip: None,
             owner_fp: Some(owner_fp),
         });
@@ -1025,6 +1105,7 @@ mod tests {
         let mut q = HashMap::new();
         q.insert("rikey".to_string(), "22".repeat(16));
         q.insert("rikeyid".to_string(), "-5".to_string());
+        q.insert("localAudioPlayMode".to_string(), "1".to_string());
         let ok = body_of(
             h_resume(State(st.clone()), peer.clone(), None, Query(q))
                 .await
@@ -1037,6 +1118,7 @@ mod tests {
             let s = launch.as_ref().unwrap();
             assert_eq!(s.gcm_key, [0x22; 16]);
             assert_eq!(s.rikeyid, -5);
+            assert!(s.host_audio, "resume carries the host-audio choice");
         }
 
         let mut bad = HashMap::new();
@@ -1071,6 +1153,7 @@ mod tests {
             height: 1440,
             fps: 120,
             appid: 1,
+            host_audio: false,
             peer_ip: None,
             owner_fp: Some(punktfunk_core::quic::endpoint::cert_fingerprint(der)),
         }

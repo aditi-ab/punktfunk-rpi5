@@ -7,8 +7,9 @@
 //! One native thread per connection, not the per-frame hot path. DESCRIBE offers
 //! `SS_ENC_VIDEO` (per-shard AES-128-GCM), `SS_ENC_CONTROL_V2` (per-direction
 //! control nonces and sealed RTSP), and `SS_ENC_AUDIO` (AES-CBC Opus). Shipping
-//! modes never require them. `PUNKTFUNK_GAMESTREAM_ENCRYPT=0` opts out;
-//! `video` offers only video. See [`EncOffer`].
+//! modes never require them. `PUNKTFUNK_GAMESTREAM_ENCRYPT=0` offers none;
+//! `video` offers only video. Audio still follows a client that asks for it
+//! the legacy way. See [`EncOffer`].
 //!
 //! A sealed connection is recognised, not negotiated: [`ENCRYPTED_MESSAGE_TYPE_BIT`].
 
@@ -230,7 +231,7 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
         "DESCRIBE" => response(
             &req.cseq,
             &[("Content-Type", "application/sdp")],
-            Some(&describe_sdp()),
+            Some(&describe_sdp(super::serverinfo::codec_mode_support())),
         ),
         "SETUP" => {
             // SETUP hands out the ping payload the media planes verify. Ungated, any
@@ -246,6 +247,10 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                 Some("audio") => (AUDIO_PORT, "X-SS-Ping-Payload"),
                 Some("video") => (VIDEO_PORT, "X-SS-Ping-Payload"),
                 Some("control") => (CONTROL_PORT, "X-SS-Connect-Data"),
+                Some("mic") => {
+                    tracing::info!("RTSP SETUP mic — accepted; this host takes no Moonlight mic");
+                    (MIC_PORT, "X-SS-Ping-Payload")
+                }
                 _ => return response_status("404 Not Found", &req.cseq, &[], None),
             };
             let transport = format!("server_port={port}");
@@ -272,6 +277,13 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                 return response_status("401 Unauthorized", &req.cseq, &[], None);
             }
             let map = parse_announce(&req.body);
+            if let Err(codec) = audio_passthrough(&map) {
+                tracing::warn!(
+                    codec,
+                    "RTSP ANNOUNCE — refused: this host can't encode that audio passthrough codec"
+                );
+                return response_status("415 Unsupported Media Type", &req.cseq, &[], None);
+            }
             match stream_config(&map) {
                 Some(cfg) => {
                     tracing::info!(?cfg, "RTSP ANNOUNCE — negotiated stream config");
@@ -341,7 +353,10 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
             // its Opus payload is AES-CBC sealed.
             if !state.audio_streaming.swap(true, Ordering::SeqCst) {
                 tracing::info!("RTSP PLAY — starting audio stream");
-                let params = *state.gs.audio_params.lock().unwrap();
+                let params = audio::AudioParams {
+                    host_audio: ls.host_audio,
+                    ..*state.gs.audio_params.lock().unwrap()
+                };
                 audio::start(
                     state.audio_streaming.clone(),
                     params.encrypt.then_some(ls.gcm_key),
@@ -382,13 +397,18 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
 /// `SS_PEN`/`SS_TOUCH` instead of synthesizing mouse input.
 const SS_FF_PEN_TOUCH_EVENTS: u32 = 0x01;
 
+/// Moonlight V+'s mic port (Foundation Sunshine's base + 12). V+ ends the session unless
+/// `SETUP streamid=mic` answers 200, but a mic that goes nowhere only warns. Nothing listens.
+const MIC_PORT: u16 = 48001;
+
 /// Per-shard AES-128-GCM video (`Limelight-internal.h`).
 const SS_ENC_VIDEO: u32 = 0x02;
 
 /// AES-128-CBC audio payloads; RTP headers stay clear.
 const SS_ENC_AUDIO: u32 = 0x04;
 
-/// Legacy `x-nv-general.featureFlags` audio-encryption bit.
+/// Legacy `x-nv-general.featureFlags` audio-encryption bit. moonlight-common-c sets it
+/// exactly when it will decrypt audio, whatever the host offered.
 const NVFF_AUDIO_ENCRYPTION: u32 = 0x20;
 
 /// Direction byte in the GCM nonce: `[10..12]` = `b"CC"` client→host, `b"HC"`
@@ -566,9 +586,10 @@ fn read_sealed_message(
     Ok(Some(req))
 }
 
-/// DESCRIBE SDP: HEVC + AV1, surround configs, and the encryption offer.
-/// Shipping modes advertise encryption as SUPPORTED, never REQUESTED.
-fn describe_sdp() -> String {
+/// DESCRIBE SDP: the HEVC/AV1 lines `codecs` (`ServerCodecModeSupport`) backs, surround
+/// configs, and the encryption offer. moonlight-common-c picks HEVC or AV1 from those two lines
+/// alone. Shipping modes advertise encryption as SUPPORTED, never REQUESTED.
+fn describe_sdp(codecs: u32) -> String {
     // Advertise pen/touch only where we can inject (Linux uinput; same gate
     // as HOST_CAP_PEN). Else 0 so Moonlight keeps client-side mouse emulation.
     // `PUNKTFUNK_PEN=0` is the kill-switch inside `pen_supported`.
@@ -582,9 +603,13 @@ fn describe_sdp() -> String {
         format!("a=x-ss-general.featureFlags:{feature_flags}"),
         format!("a=x-ss-general.encryptionSupported:{supported}"),
         format!("a=x-ss-general.encryptionRequested:{requested}"),
-        "sprop-parameter-sets=AAAAAU".into(), // HEVC capability
-        "a=rtpmap:98 AV1/90000".into(),       // AV1 capability
     ];
+    if codecs & super::SCM_HEVC != 0 {
+        lines.push("sprop-parameter-sets=AAAAAU".into());
+    }
+    if codecs & super::SCM_AV1_MAIN8 != 0 {
+        lines.push("a=rtpmap:98 AV1/90000".into());
+    }
     // Client takes the first `surround-params=<channelCount>` as normal and
     // a second as HQ, so normal must precede HQ. Stereo lines are Sunshine
     // parity; 2-channel clients hardcode 21101. See `audio::surround_params`.
@@ -797,12 +822,14 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
 /// ANNOUNCE → [`audio::AudioParams`]. moonlight-common-c `SdpGenerator.c`:
 /// `numChannels`/`channelMask` and `packetDuration` always; `AudioQuality`
 /// is 1 only when the client saw our second surround-params line. Unknown
-/// channel counts fall back to stereo.
+/// channel counts fall back to stereo. Audio is sealed whenever the client set
+/// [`NVFF_AUDIO_ENCRYPTION`], since plaintext under it is silence;
+/// `SS_ENC_AUDIO` counts only if we offered it.
 fn audio_params(map: &HashMap<String, String>, offer: EncOffer) -> audio::AudioParams {
     let parse_u = |k: &str| map.get(k).and_then(|s| s.trim().parse::<u32>().ok());
     let requested = parse_u("x-nv-audio.surround.numChannels").unwrap_or(2);
     let channels = match requested {
-        2 | 6 | 8 => requested as u8,
+        2 | 6 | 8 | 12 => requested as u8,
         other => {
             tracing::warn!(channels = other, "unsupported channel count — using stereo");
             2
@@ -818,22 +845,36 @@ fn audio_params(map: &HashMap<String, String>, offer: EncOffer) -> audio::AudioP
     let (offered, _) = enc_flags(offer);
     let ss_enabled = parse_u("x-ss-general.encryptionEnabled").unwrap_or(0);
     let legacy_enabled = parse_u("x-nv-general.featureFlags").unwrap_or(0);
-    let encrypt = offered & SS_ENC_AUDIO != 0
-        && (ss_enabled & SS_ENC_AUDIO != 0 || legacy_enabled & NVFF_AUDIO_ENCRYPTION != 0);
+    let encrypt =
+        legacy_enabled & NVFF_AUDIO_ENCRYPTION != 0 || offered & ss_enabled & SS_ENC_AUDIO != 0;
     audio::AudioParams {
         channels,
         high_quality,
         packet_duration_ms,
         encrypt,
+        // `/launch` carries it; PLAY fills it in.
+        host_audio: false,
+        pcm: audio_passthrough(map) == Ok(true),
     }
 }
 
-/// SETUP URI `…/streamid=video/0/0` → `"video"` / `"audio"` / `"control"`.
+/// Moonlight V+'s passthrough ask (`x-ml-audio.codec`, absent for Opus): `Ok(true)` for 16-bit
+/// PCM, `Err` for a codec this host can't encode. Opus under another codec's label plays as
+/// noise or silence, so ANNOUNCE refuses those.
+fn audio_passthrough(map: &HashMap<String, String>) -> Result<bool, String> {
+    match map.get("x-ml-audio.codec").map(|s| s.trim()) {
+        None | Some("opus") => Ok(false),
+        Some("pcm" | "pcm_s16" | "s16") => Ok(true),
+        Some(other) => Err(other.to_string()),
+    }
+}
+
+/// SETUP URI `…/streamid=video/0/0` → `"video"` / `"audio"` / `"control"` / `"mic"`.
 fn stream_type(uri: &str) -> Option<&str> {
     let after = uri.split("streamid=").nth(1)?;
     let token = after.split('/').next()?;
     match token {
-        "audio" | "video" | "control" => Some(token),
+        "audio" | "video" | "control" | "mic" => Some(token),
         _ => None,
     }
 }
@@ -991,6 +1032,30 @@ mod tests {
         }
     }
 
+    /// Moonlight V+ ends the session on anything but 200 for its mic SETUP.
+    #[test]
+    fn setup_knows_every_stream_moonlight_asks_for() {
+        for kind in ["audio", "video", "control", "mic"] {
+            let uri = format!("rtsp://10.0.0.2:48010/streamid={kind}/0/0");
+            assert_eq!(stream_type(&uri), Some(kind));
+        }
+        assert_eq!(
+            stream_type("rtsp://10.0.0.2:48010/streamid=bogus/0/0"),
+            None
+        );
+    }
+
+    /// Moonlight V+ passthrough: PCM is served, AC3/E-AC3 refused rather than sent Opus.
+    #[test]
+    fn announce_audio_passthrough() {
+        assert_eq!(audio_passthrough(&announce(&[])), Ok(false));
+        let pcm = announce(&[("x-ml-audio.codec", "pcm")]);
+        assert_eq!(audio_passthrough(&pcm), Ok(true));
+        assert!(audio_params(&pcm, EncOffer::Supported).pcm);
+        let ac3 = announce(&[("x-ml-audio.codec", "ac3")]);
+        assert_eq!(audio_passthrough(&ac3), Err("ac3".to_string()));
+    }
+
     #[test]
     fn announce_audio_params() {
         assert_eq!(
@@ -1039,6 +1104,12 @@ mod tests {
 
         assert!(!audio_params(&ss, EncOffer::VideoOnly).encrypt);
         assert!(!audio_params(&announce(&[]), EncOffer::Supported).encrypt);
+
+        // Android Moonlight sends 0xA7 and decrypts under any offer.
+        let android = announce(&[("x-nv-general.featureFlags", "167")]);
+        for offer in [EncOffer::Off, EncOffer::VideoOnly] {
+            assert!(audio_params(&android, offer).encrypt, "{offer:?}");
+        }
     }
 
     /// Offer ladder. Only `require` sets REQUESTED: a client allowed to
@@ -1164,7 +1235,11 @@ mod tests {
     /// per channel count.
     #[test]
     fn describe_advertises_codecs_and_surround() {
-        let sdp = describe_sdp();
+        let h264_only = describe_sdp(super::super::SCM_H264);
+        assert!(!h264_only.contains("AAAAAU") && !h264_only.contains("AV1/90000"));
+        let sdp = describe_sdp(
+            super::super::SCM_H264 | super::super::SCM_HEVC | super::super::SCM_AV1_MAIN8,
+        );
         // Assert against `enc_flags`, not a literal: `PUNKTFUNK_GS_ENCRYPT`
         // can still steer the offer.
         let (supported, requested) = enc_flags(gs_encryption_offer());
