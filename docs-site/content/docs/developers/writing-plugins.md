@@ -83,7 +83,11 @@ the console settings form and the CLI. Four files:
     "build": "bun build src/index.ts src/cli.ts --target=bun --outdir dist --external effect --external '@punktfunk/*'",
     "test": "bun test"
   },
-  "dependencies": { "@punktfunk/plugin-kit": "^0.5.3", "effect": "4.0.0-beta.99" },
+  "dependencies": {
+    "@punktfunk/host": "^0.3.0",
+    "@punktfunk/plugin-kit": "^0.9.0",
+    "effect": "4.0.0-beta.99"
+  },
   "punktfunk": {
     "schema": 1,
     "id": "hello",
