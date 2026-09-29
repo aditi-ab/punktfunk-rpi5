@@ -829,7 +829,7 @@ fn audio_params(map: &HashMap<String, String>, offer: EncOffer) -> audio::AudioP
     let parse_u = |k: &str| map.get(k).and_then(|s| s.trim().parse::<u32>().ok());
     let requested = parse_u("x-nv-audio.surround.numChannels").unwrap_or(2);
     let channels = match requested {
-        2 | 6 | 8 => requested as u8,
+        2 | 6 | 8 | 12 => requested as u8,
         other => {
             tracing::warn!(channels = other, "unsupported channel count — using stereo");
             2

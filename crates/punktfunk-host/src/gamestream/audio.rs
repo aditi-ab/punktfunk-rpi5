@@ -47,7 +47,7 @@ const FEC_MATRIX: [[u8; FEC_DATA_SHARDS]; FEC_PARITY_SHARDS] =
 /// `host_audio` from `/launch`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AudioParams {
-    /// 2, 6 (5.1), or 8 (7.1).
+    /// 2, 6 (5.1), 8 (7.1), or Moonlight V+'s 12 (7.1.4).
     pub channels: u8,
     /// `AudioQuality == 1`: uncoupled high-bitrate. Offered only when DESCRIBE
     /// advertises a second surround-params line.
@@ -79,9 +79,26 @@ pub use punktfunk_core::audio::{
     OpusLayout, LAYOUT_51, LAYOUT_51_HQ, LAYOUT_71, LAYOUT_71_HQ, LAYOUT_STEREO,
 };
 
-/// Shared [`punktfunk_core::audio::layout_for`]. Unknown channel counts fall back
-/// to stereo — clients may only request 2/6/8 (`AUDIO_CONFIGURATION_*`).
+/// Moonlight V+ 7.1.4: the 8-stream, 4-coupled identity layout its decoder builds when DESCRIBE
+/// carries no 12-channel line, at Foundation Sunshine's bitrate. Capture stops at 7.1, so the
+/// four height channels are silent.
+pub const LAYOUT_714: OpusLayout = OpusLayout {
+    channels: 12,
+    streams: 8,
+    coupled: 4,
+    mapping: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+    bitrate: 600_000,
+};
+
+/// Channels the capture opens: 7.1 at most.
+const MAX_CAPTURE_CHANNELS: u8 = 8;
+
+/// Shared [`punktfunk_core::audio::layout_for`], plus V+'s 12 channels ([`LAYOUT_714`]).
+/// Unknown channel counts fall back to stereo — stock clients request only 2/6/8.
 pub fn layout_for(params: &AudioParams) -> &'static OpusLayout {
+    if params.channels == LAYOUT_714.channels {
+        return &LAYOUT_714;
+    }
     let layout = if params.high_quality {
         punktfunk_core::audio::AudioLayout::Uncoupled
     } else {
@@ -256,7 +273,7 @@ fn run(
     );
     tracing::debug!(%client, "audio: client endpoint learned");
 
-    let want = layout_for(&params).channels as u32;
+    let want = layout_for(&params).channels.min(MAX_CAPTURE_CHANNELS) as u32;
     // Before the parked-capturer check: it compares the policy this guard sets. Outlives `cap`.
     let _keep_host_audio = params
         .host_audio
@@ -283,6 +300,18 @@ fn audio_payload(opus: &[u8], aes_key: Option<&[u8; 16]>, iv_seq: u32) -> Vec<u8
     let mut iv = [0u8; 16];
     iv[0..4].copy_from_slice(&iv_seq.to_be_bytes());
     Aes128CbcEnc::new(key.into(), (&iv).into()).encrypt_padded_vec::<Pkcs7>(opus)
+}
+
+/// Interleaved `from`-channel samples widened to `to` channels with silent extras.
+fn pad_channels(samples: impl Iterator<Item = f32>, from: usize, to: usize) -> Vec<f32> {
+    let samples: Vec<f32> = samples.collect();
+    if from >= to {
+        return samples;
+    }
+    samples
+        .chunks_exact(from)
+        .flat_map(|s| s.iter().copied().chain(std::iter::repeat_n(0.0, to - from)))
+        .collect()
 }
 
 /// Interleaved f32 → clamped little-endian i16, what V+ writes straight into an Android
@@ -331,7 +360,10 @@ fn audio_body(
     } as usize;
     let samples_per_channel = SAMPLE_RATE as usize * frame_ms / 1000;
     let frame_len = samples_per_channel * layout.channels as usize;
-    let mut acc: Vec<f32> = Vec::with_capacity(frame_len * 4);
+    // Fewer capture channels than the layout (7.1.4) are padded with silence per frame.
+    let cap_ch = cap.channels() as usize;
+    let frame_in = samples_per_channel * cap_ch;
+    let mut acc: Vec<f32> = Vec::with_capacity(frame_in * 4);
     let mut out = vec![0u8; (frame_len * 2).max(1400)];
     let mut seq: u16 = 0;
     let mut timestamp: u32 = 0;
@@ -367,8 +399,8 @@ fn audio_body(
             .next_chunk_within(STOP_POLL)
             .context("capture audio chunk")?;
         acc.extend_from_slice(&chunk);
-        while acc.len() >= frame_len {
-            let mut frame: Vec<f32> = acc.drain(..frame_len).collect();
+        while acc.len() >= frame_in {
+            let mut frame = pad_channels(acc.drain(..frame_in), cap_ch, layout.channels.into());
             if gain != 1.0 {
                 punktfunk_core::audio::apply_gain(&mut frame, gain);
             }
@@ -456,6 +488,28 @@ mod tests {
         assert_eq!(&p[4..8], &[0x03, 0x04, 0x05, 0x06]);
         assert_eq!(&p[8..12], &[0, 0, 0, 0]);
         assert_eq!(&p[12..], &[0xaa, 0xbb]);
+    }
+
+    /// V+ 7.1.4: a 7.1 capture widened to 12 channels encodes with the layout V+ decodes.
+    #[test]
+    fn layout_714_pads_heights_and_encodes() {
+        let p = AudioParams {
+            channels: 12,
+            high_quality: true, // no HQ 12-channel line is advertised; the layout stays 8/4
+            ..AudioParams::default()
+        };
+        assert_eq!(layout_for(&p), &LAYOUT_714);
+        let frame = pad_channels([1.0f32; 8 * 240].into_iter(), 8, 12);
+        assert_eq!(frame.len(), 12 * 240);
+        assert_eq!(
+            &frame[..12],
+            &[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+        );
+        let mut enc =
+            audio::OpusEnc::new(&LAYOUT_714, LAYOUT_714.bitrate, audio::RateControl::HardCbr)
+                .unwrap();
+        let mut out = vec![0u8; 1400];
+        assert!(enc.encode_float(&frame, &mut out).unwrap() > 0);
     }
 
     #[test]
