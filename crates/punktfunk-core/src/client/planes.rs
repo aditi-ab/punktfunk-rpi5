@@ -39,10 +39,73 @@ pub(crate) const HOST_TIMING_QUEUE: usize = 512;
 pub(crate) const CLIP_EVENT_QUEUE: usize = 32;
 
 /// Cursor-shape ([`crate::quic::CursorShape`]). Human-paced but bursty.
-/// Overflow drops newest and the host does not re-send — only a serial
-/// change emits again — so embedders must keep the last shape when
-/// `hostCursors[serial]` misses rather than hiding the pointer.
+/// Overflow evicts the OLDEST ([`shape_queue`]): the host sends a shape once
+/// per change and its state names the newest, so losing that one would leave
+/// the embedder on a stale pointer until the next change.
 pub(crate) const CURSOR_SHAPE_QUEUE: usize = 8;
+
+type ShapeSlot = (
+    std::collections::VecDeque<crate::quic::CursorShape>,
+    // The sender is gone: the session ended.
+    bool,
+);
+
+#[derive(Default)]
+struct ShapeShared {
+    slot: std::sync::Mutex<ShapeSlot>,
+    ready: std::sync::Condvar,
+}
+
+/// A [`CURSOR_SHAPE_QUEUE`]-deep queue that evicts the oldest shape when full. Dropping the
+/// sender closes it, as a channel's disconnect does.
+pub(crate) fn shape_queue() -> (ShapeSender, ShapeReceiver) {
+    let shared = std::sync::Arc::new(ShapeShared::default());
+    (ShapeSender(shared.clone()), ShapeReceiver(shared))
+}
+
+pub(crate) struct ShapeSender(std::sync::Arc<ShapeShared>);
+
+impl ShapeSender {
+    pub(crate) fn send(&self, shape: crate::quic::CursorShape) {
+        let mut slot = self.0.slot.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.0.len() == CURSOR_SHAPE_QUEUE {
+            slot.0.pop_front();
+        }
+        slot.0.push_back(shape);
+        drop(slot);
+        self.0.ready.notify_one();
+    }
+}
+
+impl Drop for ShapeSender {
+    fn drop(&mut self) {
+        self.0.slot.lock().unwrap_or_else(|e| e.into_inner()).1 = true;
+        self.0.ready.notify_all();
+    }
+}
+
+pub(crate) struct ShapeReceiver(std::sync::Arc<ShapeShared>);
+
+impl ShapeReceiver {
+    /// The oldest queued shape, waiting up to `timeout`; `Disconnected` once the sender is
+    /// gone and nothing is left.
+    pub(crate) fn recv_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<crate::quic::CursorShape, std::sync::mpsc::RecvTimeoutError> {
+        let slot = self.0.slot.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut slot, _) = self
+            .0
+            .ready
+            .wait_timeout_while(slot, timeout, |s| s.0.is_empty() && !s.1)
+            .unwrap_or_else(|e| e.into_inner());
+        match slot.0.pop_front() {
+            Some(shape) => Ok(shape),
+            None if slot.1 => Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+            None => Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+        }
+    }
+}
 
 /// Cursor-state (`0xD0`, one datagram per captured frame). Latest-wins; a
 /// tiny ring only bridges scheduling jitter. Overflow heals next frame.
@@ -63,4 +126,44 @@ pub struct AudioPacket {
     /// Opus: one decoder frame. PCM: interleaved LE integers for
     /// [`crate::audio::pcm::to_f32`]. Empty is a DTX silence marker (Opus).
     pub data: Vec<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::Duration;
+
+    fn shape(serial: u32) -> crate::quic::CursorShape {
+        crate::quic::CursorShape {
+            serial,
+            w: 1,
+            h: 1,
+            hot_x: 0,
+            hot_y: 0,
+            rgba: vec![0; 4],
+        }
+    }
+
+    #[test]
+    fn a_full_shape_queue_keeps_the_newest() {
+        let (tx, rx) = shape_queue();
+        for serial in 0..CURSOR_SHAPE_QUEUE as u32 + 3 {
+            tx.send(shape(serial));
+        }
+        let got: Vec<u32> = std::iter::from_fn(|| rx.recv_timeout(Duration::ZERO).ok())
+            .map(|s| s.serial)
+            .collect();
+        assert_eq!(got.len(), CURSOR_SHAPE_QUEUE);
+        assert_eq!(got.last(), Some(&(CURSOR_SHAPE_QUEUE as u32 + 2)));
+        assert!(matches!(
+            rx.recv_timeout(Duration::ZERO),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        drop(tx);
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)),
+            Err(RecvTimeoutError::Disconnected)
+        ));
+    }
 }

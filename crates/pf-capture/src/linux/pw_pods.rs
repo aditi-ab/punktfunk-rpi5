@@ -11,6 +11,8 @@ use pipewire as pw;
 use pw::spa;
 use spa::param::video::VideoFormat;
 
+use super::sync_timeline::{MetaSyncTimeline, META_SYNC_TIMELINE, PARAM_BUFFERS_META_TYPE};
+
 pub(super) fn serialize_pod(obj: pw::spa::pod::Object) -> Result<Vec<u8>> {
     Ok(pw::spa::pod::serialize::PodSerializer::serialize(
         std::io::Cursor::new(Vec::new()),
@@ -23,12 +25,12 @@ pub(super) fn serialize_pod(obj: pw::spa::pod::Object) -> Result<Vec<u8>> {
 
 /// What the offer's `maxFramerate` tells the producer.
 ///
-/// `Unpaced` is `0/1`: no ceiling, so KWin delivers on its own damage signal instead
-/// of a timer. KWin derives its screencast timer from the negotiated `maxFramerate`
-/// and rounds the wait up to a whole millisecond, so an 8.333 ms frame is scheduled
-/// at 9 and the cadence jitters; zero makes its `frameInterval()` zero. KWin 6.7+
-/// offers `Range(refresh, 0/1, refresh)`, so this fixates; older KWin floors at 1/1
-/// and rejects the pod, so the caller lists a plain twin behind it.
+/// `Unpaced` is `0/1`: no ceiling, so KWin delivers on its own damage signal. Up to 6.7
+/// the only ceiling KWin takes is its refresh (`Range(refresh, 0/1, refresh)`), and it
+/// throttles that with a whole-millisecond timer stamped after each render: at the
+/// stream rate every record slips a millisecond until one coalesces, ~9.3 ms apart.
+/// KWin 6.8 offers millihertz and paces the cast at the ceiling that fixates, so there
+/// the stream rate goes on as `Cap`.
 ///
 /// `Cap(hz)` is the wire rate, for a producer that paints on every commit (gamescope
 /// with adaptive sync): it pushes at most `hz` frames a second. A producer that never
@@ -53,70 +55,125 @@ fn max_framerate_prop(pacing: Pacing) -> Option<pw::spa::pod::Property> {
     })
 }
 
-/// NV12 also pins BT.709 limited; packed RGB must not — it is not YUV.
-pub(super) fn build_dmabuf_format(
-    format: VideoFormat,
-    modifiers: &[u64],
-    preferred: Option<(u32, u32, u32)>,
+/// The `VideoSize` and `VideoFramerate` an offer names.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Extent {
+    /// Ranges up to 8192² and 240 Hz around the preferred mode (1080p60 without one).
+    Around(Option<(u32, u32, u32)>),
+    /// One fixed size at variable rate: the `PUNKTFUNK_PW_FIXED_POD` bisect offer.
+    Fixed(u32, u32),
+}
+
+/// The raw-video `EnumFormat` every offer builds on: `format` (a scalar id or a choice),
+/// the extent, then the pacing ceiling.
+pub(super) fn video_raw(
+    format: pw::spa::pod::Property,
+    extent: Extent,
     pacing: Pacing,
-) -> Result<Vec<u8>> {
-    let (dw, dh, dhz) = preferred.unwrap_or((1920, 1080, 60));
+) -> pw::spa::pod::Object {
     use pw::spa::param::format::{FormatProperties, MediaSubtype, MediaType};
+    use pw::spa::utils::{Fraction, Rectangle};
+    let (size, rate) = match extent {
+        Extent::Around(preferred) => {
+            let (w, h, hz) = preferred.unwrap_or((1920, 1080, 60));
+            (
+                pw::spa::pod::property!(
+                    FormatProperties::VideoSize,
+                    Choice,
+                    Range,
+                    Rectangle,
+                    Rectangle {
+                        width: w,
+                        height: h
+                    },
+                    Rectangle {
+                        width: 1,
+                        height: 1
+                    },
+                    Rectangle {
+                        width: 8192,
+                        height: 8192
+                    }
+                ),
+                pw::spa::pod::property!(
+                    FormatProperties::VideoFramerate,
+                    Choice,
+                    Range,
+                    Fraction,
+                    Fraction { num: hz, denom: 1 },
+                    Fraction { num: 0, denom: 1 },
+                    Fraction { num: 240, denom: 1 }
+                ),
+            )
+        }
+        Extent::Fixed(w, h) => (
+            pw::spa::pod::property!(
+                FormatProperties::VideoSize,
+                Rectangle,
+                Rectangle {
+                    width: w,
+                    height: h
+                }
+            ),
+            pw::spa::pod::property!(
+                FormatProperties::VideoFramerate,
+                Fraction,
+                Fraction { num: 0, denom: 1 }
+            ),
+        ),
+    };
     let mut obj = pw::spa::pod::object!(
         pw::spa::utils::SpaTypes::ObjectParamFormat,
         pw::spa::param::ParamType::EnumFormat,
         pw::spa::pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
         pw::spa::pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
-        pw::spa::pod::property!(FormatProperties::VideoFormat, Id, format),
-        pw::spa::pod::property!(
-            FormatProperties::VideoSize,
-            Choice,
-            Range,
-            Rectangle,
-            pw::spa::utils::Rectangle {
-                width: dw,
-                height: dh
-            },
-            pw::spa::utils::Rectangle {
-                width: 1,
-                height: 1
-            },
-            pw::spa::utils::Rectangle {
-                width: 8192,
-                height: 8192
-            }
-        ),
-        pw::spa::pod::property!(
-            FormatProperties::VideoFramerate,
-            Choice,
-            Range,
-            Fraction,
-            pw::spa::utils::Fraction { num: dhz, denom: 1 },
-            pw::spa::utils::Fraction { num: 0, denom: 1 },
-            pw::spa::utils::Fraction { num: 240, denom: 1 }
-        ),
+        format,
+        size,
+        rate,
     );
-    if format == VideoFormat::NV12 {
-        obj.properties.push(pw::spa::pod::Property {
-            key: pw::spa::sys::SPA_FORMAT_VIDEO_colorMatrix,
-            flags: pw::spa::pod::PropertyFlags::MANDATORY,
-            value: pw::spa::pod::Value::Id(pw::spa::utils::Id(
-                pw::spa::sys::SPA_VIDEO_COLOR_MATRIX_BT709,
-            )),
-        });
-        obj.properties.push(pw::spa::pod::Property {
-            key: pw::spa::sys::SPA_FORMAT_VIDEO_colorRange,
-            flags: pw::spa::pod::PropertyFlags::MANDATORY,
-            value: pw::spa::pod::Value::Id(pw::spa::utils::Id(
-                pw::spa::sys::SPA_VIDEO_COLOR_RANGE_16_235,
-            )),
-        });
+    obj.properties.extend(max_framerate_prop(pacing));
+    obj
+}
+
+fn mandatory_id(key: u32, id: u32) -> pw::spa::pod::Property {
+    pw::spa::pod::Property {
+        key,
+        flags: pw::spa::pod::PropertyFlags::MANDATORY,
+        value: pw::spa::pod::Value::Id(pw::spa::utils::Id(id)),
     }
-    if let Some(p) = max_framerate_prop(pacing) {
-        obj.properties.push(p);
+}
+
+/// A dmabuf offer: the raw-video base plus a MANDATORY modifier Choice enum. A YUV format
+/// also pins the matrix its bitstream declares, limited range: BT.709 for NV12, BT.2020 for
+/// P010. Packed RGB pins none — it is not YUV.
+fn dmabuf_format(
+    format: VideoFormat,
+    modifiers: &[u64],
+    preferred: Option<(u32, u32, u32)>,
+    pacing: Pacing,
+) -> pw::spa::pod::Object {
+    use pw::spa::param::format::FormatProperties;
+    use pw::spa::sys;
+    let mut obj = video_raw(
+        pw::spa::pod::property!(FormatProperties::VideoFormat, Id, format),
+        Extent::Around(preferred),
+        pacing,
+    );
+    let matrix = match format {
+        VideoFormat::NV12 => Some(sys::SPA_VIDEO_COLOR_MATRIX_BT709),
+        VideoFormat::P010_10LE => Some(sys::SPA_VIDEO_COLOR_MATRIX_BT2020),
+        _ => None,
+    };
+    if let Some(matrix) = matrix {
+        obj.properties
+            .push(mandatory_id(sys::SPA_FORMAT_VIDEO_colorMatrix, matrix));
+        obj.properties.push(mandatory_id(
+            sys::SPA_FORMAT_VIDEO_colorRange,
+            sys::SPA_VIDEO_COLOR_RANGE_16_235,
+        ));
     }
     obj.properties.push(pw::spa::pod::Property {
-        key: pw::spa::sys::SPA_FORMAT_VIDEO_modifier,
+        key: sys::SPA_FORMAT_VIDEO_modifier,
         flags: pw::spa::pod::PropertyFlags::MANDATORY,
         value: pw::spa::pod::Value::Choice(pw::spa::pod::ChoiceValue::Long(
             pw::spa::utils::Choice(
@@ -128,7 +185,17 @@ pub(super) fn build_dmabuf_format(
             ),
         )),
     });
-    serialize_pod(obj)
+    obj
+}
+
+/// SDR dmabuf `EnumFormat`; see [`dmabuf_format`] for the colour pins.
+pub(super) fn build_dmabuf_format(
+    format: VideoFormat,
+    modifiers: &[u64],
+    preferred: Option<(u32, u32, u32)>,
+    pacing: Pacing,
+) -> Result<Vec<u8>> {
+    serialize_pod(dmabuf_format(format, modifiers, preferred, pacing))
 }
 
 /// PQ (`SPA_VIDEO_TRANSFER_SMPTE2084`). 14 is the wire ABI in
@@ -151,8 +218,7 @@ pub(super) const HDR_FORMAT_ORDER: [VideoFormat; 2] =
 
 /// 10-bit PQ `EnumFormat`. `modifiers` is `[0]` unless the raw lane takes this stream: the
 /// EGL de-tile blit renders into `GL_RGBA8` and would crush the depth. The modifier is a
-/// Choice enum (same shape as [`build_dmabuf_format`]): a scalar `Long(0)` does not
-/// intersect gamescope's `{default:0, alt:0}` choice.
+/// Choice enum: a scalar `Long(0)` does not intersect gamescope's `{default:0, alt:0}` choice.
 /// BT.2020 + PQ are **MANDATORY** — Mutter's HDR pods are too.
 pub(super) fn build_hdr_dmabuf_format(
     format: VideoFormat,
@@ -160,87 +226,16 @@ pub(super) fn build_hdr_dmabuf_format(
     preferred: Option<(u32, u32, u32)>,
     pacing: Pacing,
 ) -> Result<Vec<u8>> {
-    let (dw, dh, dhz) = preferred.unwrap_or((1920, 1080, 60));
-    use pw::spa::param::format::{FormatProperties, MediaSubtype, MediaType};
-    let mut obj = pw::spa::pod::object!(
-        pw::spa::utils::SpaTypes::ObjectParamFormat,
-        pw::spa::param::ParamType::EnumFormat,
-        pw::spa::pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
-        pw::spa::pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
-        pw::spa::pod::property!(FormatProperties::VideoFormat, Id, format),
-        pw::spa::pod::property!(
-            FormatProperties::VideoSize,
-            Choice,
-            Range,
-            Rectangle,
-            pw::spa::utils::Rectangle {
-                width: dw,
-                height: dh
-            },
-            pw::spa::utils::Rectangle {
-                width: 1,
-                height: 1
-            },
-            pw::spa::utils::Rectangle {
-                width: 8192,
-                height: 8192
-            }
-        ),
-        pw::spa::pod::property!(
-            FormatProperties::VideoFramerate,
-            Choice,
-            Range,
-            Fraction,
-            pw::spa::utils::Fraction { num: dhz, denom: 1 },
-            pw::spa::utils::Fraction { num: 0, denom: 1 },
-            pw::spa::utils::Fraction { num: 240, denom: 1 }
-        ),
-    );
-    if let Some(p) = max_framerate_prop(pacing) {
-        obj.properties.push(p);
-    }
-    // P010 is YUV: pin the matrix the bitstream declares, as the NV12 offer does.
-    if format == VideoFormat::P010_10LE {
-        obj.properties.push(pw::spa::pod::Property {
-            key: pw::spa::sys::SPA_FORMAT_VIDEO_colorMatrix,
-            flags: pw::spa::pod::PropertyFlags::MANDATORY,
-            value: pw::spa::pod::Value::Id(pw::spa::utils::Id(
-                pw::spa::sys::SPA_VIDEO_COLOR_MATRIX_BT2020,
-            )),
-        });
-        obj.properties.push(pw::spa::pod::Property {
-            key: pw::spa::sys::SPA_FORMAT_VIDEO_colorRange,
-            flags: pw::spa::pod::PropertyFlags::MANDATORY,
-            value: pw::spa::pod::Value::Id(pw::spa::utils::Id(
-                pw::spa::sys::SPA_VIDEO_COLOR_RANGE_16_235,
-            )),
-        });
-    }
-    obj.properties.push(pw::spa::pod::Property {
-        key: pw::spa::sys::SPA_FORMAT_VIDEO_modifier,
-        flags: pw::spa::pod::PropertyFlags::MANDATORY,
-        value: pw::spa::pod::Value::Choice(pw::spa::pod::ChoiceValue::Long(
-            pw::spa::utils::Choice(
-                pw::spa::utils::ChoiceFlags::empty(),
-                pw::spa::utils::ChoiceEnum::Enum {
-                    default: modifiers[0] as i64,
-                    alternatives: modifiers.iter().map(|&m| m as i64).collect(),
-                },
-            ),
-        )),
-    });
-    obj.properties.push(pw::spa::pod::Property {
-        key: pw::spa::sys::SPA_FORMAT_VIDEO_transferFunction,
-        flags: pw::spa::pod::PropertyFlags::MANDATORY,
-        value: pw::spa::pod::Value::Id(pw::spa::utils::Id(SPA_VIDEO_TRANSFER_SMPTE2084)),
-    });
-    obj.properties.push(pw::spa::pod::Property {
-        key: pw::spa::sys::SPA_FORMAT_VIDEO_colorPrimaries,
-        flags: pw::spa::pod::PropertyFlags::MANDATORY,
-        value: pw::spa::pod::Value::Id(pw::spa::utils::Id(
-            pw::spa::sys::SPA_VIDEO_COLOR_PRIMARIES_BT2020,
-        )),
-    });
+    use pw::spa::sys;
+    let mut obj = dmabuf_format(format, modifiers, preferred, pacing);
+    obj.properties.push(mandatory_id(
+        sys::SPA_FORMAT_VIDEO_transferFunction,
+        SPA_VIDEO_TRANSFER_SMPTE2084,
+    ));
+    obj.properties.push(mandatory_id(
+        sys::SPA_FORMAT_VIDEO_colorPrimaries,
+        sys::SPA_VIDEO_COLOR_PRIMARIES_BT2020,
+    ));
     serialize_pod(obj)
 }
 
@@ -249,20 +244,7 @@ pub(super) fn build_default_format_obj(
     preferred: Option<(u32, u32, u32)>,
     pacing: Pacing,
 ) -> pw::spa::pod::Object {
-    let (dw, dh, dhz) = preferred.unwrap_or((1920, 1080, 60));
-    let mut obj = pw::spa::pod::object!(
-        pw::spa::utils::SpaTypes::ObjectParamFormat,
-        pw::spa::param::ParamType::EnumFormat,
-        pw::spa::pod::property!(
-            pw::spa::param::format::FormatProperties::MediaType,
-            Id,
-            pw::spa::param::format::MediaType::Video
-        ),
-        pw::spa::pod::property!(
-            pw::spa::param::format::FormatProperties::MediaSubtype,
-            Id,
-            pw::spa::param::format::MediaSubtype::Raw
-        ),
+    video_raw(
         // Encoder-mappable layouts only. wlroots often fixates packed RGB
         // (3 bpp); others offer 4 bpp. Restricting the enum fails loudly
         // instead of handing us a format we would misinterpret.
@@ -279,38 +261,45 @@ pub(super) fn build_default_format_obj(
             VideoFormat::RGBA,
             VideoFormat::BGRA,
         ),
-        pw::spa::pod::property!(
-            pw::spa::param::format::FormatProperties::VideoSize,
-            Choice,
-            Range,
-            Rectangle,
-            pw::spa::utils::Rectangle {
-                width: dw,
-                height: dh
-            },
-            pw::spa::utils::Rectangle {
-                width: 1,
-                height: 1
-            },
-            pw::spa::utils::Rectangle {
-                width: 8192,
-                height: 8192
-            }
-        ),
-        pw::spa::pod::property!(
-            pw::spa::param::format::FormatProperties::VideoFramerate,
-            Choice,
-            Range,
-            Fraction,
-            pw::spa::utils::Fraction { num: dhz, denom: 1 },
-            pw::spa::utils::Fraction { num: 0, denom: 1 },
-            pw::spa::utils::Fraction { num: 240, denom: 1 }
-        ),
-    );
-    if let Some(p) = max_framerate_prop(pacing) {
-        obj.properties.push(p);
+        Extent::Around(preferred),
+        pacing,
+    )
+}
+
+fn buffers(properties: Vec<pw::spa::pod::Property>) -> Result<Vec<u8>> {
+    serialize_pod(pw::spa::pod::Object {
+        type_: pw::spa::utils::SpaTypes::ObjectParamBuffers.as_raw(),
+        id: pw::spa::param::ParamType::Buffers.as_raw(),
+        properties,
+    })
+}
+
+fn data_types(mask: i32) -> pw::spa::pod::Property {
+    pw::spa::pod::Property {
+        key: pw::spa::sys::SPA_PARAM_BUFFERS_dataType,
+        flags: pw::spa::pod::PropertyFlags::empty(),
+        value: pw::spa::pod::Value::Int(mask),
     }
-    obj
+}
+
+/// A `Meta` param asking for `kind` on each buffer, `size` bytes of it.
+fn meta(kind: u32, size: pw::spa::pod::Value) -> Result<Vec<u8>> {
+    serialize_pod(pw::spa::pod::Object {
+        type_: pw::spa::utils::SpaTypes::ObjectParamMeta.as_raw(),
+        id: pw::spa::param::ParamType::Meta.as_raw(),
+        properties: vec![
+            pw::spa::pod::Property {
+                key: pw::spa::sys::SPA_PARAM_META_type,
+                flags: pw::spa::pod::PropertyFlags::empty(),
+                value: pw::spa::pod::Value::Id(pw::spa::utils::Id(kind)),
+            },
+            pw::spa::pod::Property {
+                key: pw::spa::sys::SPA_PARAM_META_size,
+                flags: pw::spa::pod::PropertyFlags::empty(),
+                value: size,
+            },
+        ],
+    })
 }
 
 /// CPU-path Buffers: MemPtr, MemFd, and DmaBuf. Gamescope's modifier-bearing
@@ -318,19 +307,11 @@ pub(super) fn build_default_format_obj(
 /// intersection is empty and the link stalls in `negotiating`. A LINEAR
 /// dmabuf is mmap-able, so the CPU de-pad copy still works.
 pub(super) fn build_mappable_buffers() -> Result<Vec<u8>> {
-    serialize_pod(pw::spa::pod::Object {
-        type_: pw::spa::utils::SpaTypes::ObjectParamBuffers.as_raw(),
-        id: pw::spa::param::ParamType::Buffers.as_raw(),
-        properties: vec![pw::spa::pod::Property {
-            key: pw::spa::sys::SPA_PARAM_BUFFERS_dataType,
-            flags: pw::spa::pod::PropertyFlags::empty(),
-            value: pw::spa::pod::Value::Int(
-                (1i32 << pw::spa::sys::SPA_DATA_MemPtr)
-                    | (1i32 << pw::spa::sys::SPA_DATA_MemFd)
-                    | (1i32 << pw::spa::sys::SPA_DATA_DmaBuf),
-            ),
-        }],
-    })
+    buffers(vec![data_types(
+        (1i32 << pw::spa::sys::SPA_DATA_MemPtr)
+            | (1i32 << pw::spa::sys::SPA_DATA_MemFd)
+            | (1i32 << pw::spa::sys::SPA_DATA_DmaBuf),
+    )])
 }
 
 /// SHM Buffers: MemPtr + MemFd, no DmaBuf. Mutter on NVIDIA renders into the
@@ -338,17 +319,9 @@ pub(super) fn build_mappable_buffers() -> Result<Vec<u8>> {
 /// read races the render and flashes the previous frame. Excluding DmaBuf
 /// forces `glReadPixels` into mappable memory, which orders against render.
 pub(super) fn build_shm_only_buffers() -> Result<Vec<u8>> {
-    serialize_pod(pw::spa::pod::Object {
-        type_: pw::spa::utils::SpaTypes::ObjectParamBuffers.as_raw(),
-        id: pw::spa::param::ParamType::Buffers.as_raw(),
-        properties: vec![pw::spa::pod::Property {
-            key: pw::spa::sys::SPA_PARAM_BUFFERS_dataType,
-            flags: pw::spa::pod::PropertyFlags::empty(),
-            value: pw::spa::pod::Value::Int(
-                (1i32 << pw::spa::sys::SPA_DATA_MemPtr) | (1i32 << pw::spa::sys::SPA_DATA_MemFd),
-            ),
-        }],
-    })
+    buffers(vec![data_types(
+        (1i32 << pw::spa::sys::SPA_DATA_MemPtr) | (1i32 << pw::spa::sys::SPA_DATA_MemFd),
+    )])
 }
 
 /// Zero-copy pool depth, as a Choice range. A fixed count a producer cannot
@@ -362,32 +335,92 @@ pub(super) fn build_shm_only_buffers() -> Result<Vec<u8>> {
 const POOL_DEFAULT: i32 = 8;
 const POOL_MAX: i32 = 16;
 
-pub(super) fn build_dmabuf_buffers(pool_min: i32) -> Result<Vec<u8>> {
-    serialize_pod(pw::spa::pod::Object {
-        type_: pw::spa::utils::SpaTypes::ObjectParamBuffers.as_raw(),
-        id: pw::spa::param::ParamType::Buffers.as_raw(),
-        properties: vec![
-            pw::spa::pod::Property {
-                key: pw::spa::sys::SPA_PARAM_BUFFERS_dataType,
-                flags: pw::spa::pod::PropertyFlags::empty(),
-                value: pw::spa::pod::Value::Int(1i32 << pw::spa::sys::SPA_DATA_DmaBuf),
+/// `explicit_sync` adds a MANDATORY `metaType` naming `SPA_META_SyncTimeline`: a producer
+/// without the meta fails this pod and takes the plain twin listed behind it, instead of a
+/// pool this side would wait on for fences that never come.
+pub(super) fn build_dmabuf_buffers(pool_min: i32, explicit_sync: bool) -> Result<Vec<u8>> {
+    let mut properties = vec![
+        data_types(1i32 << pw::spa::sys::SPA_DATA_DmaBuf),
+        pw::spa::pod::Property {
+            key: pw::spa::sys::SPA_PARAM_BUFFERS_buffers,
+            flags: pw::spa::pod::PropertyFlags::empty(),
+            value: pw::spa::pod::Value::Choice(pw::spa::pod::ChoiceValue::Int(
+                pw::spa::utils::Choice(
+                    pw::spa::utils::ChoiceFlags::empty(),
+                    pw::spa::utils::ChoiceEnum::Range {
+                        default: POOL_DEFAULT,
+                        min: pool_min,
+                        max: POOL_MAX,
+                    },
+                ),
+            )),
+        },
+    ];
+    if explicit_sync {
+        properties.push(pw::spa::pod::Property {
+            key: PARAM_BUFFERS_META_TYPE,
+            flags: pw::spa::pod::PropertyFlags::MANDATORY,
+            value: pw::spa::pod::Value::Int(1i32 << META_SYNC_TIMELINE),
+        });
+    }
+    buffers(properties)
+}
+
+/// `SPA_META_SyncTimeline` on each buffer. PipeWire adds it, and the two syncobj datas the
+/// Buffers pod's `metaType` names, only when both sides list this meta.
+pub(super) fn build_sync_timeline_meta_param() -> Result<Vec<u8>> {
+    meta(
+        META_SYNC_TIMELINE,
+        pw::spa::pod::Value::Int(std::mem::size_of::<MetaSyncTimeline>() as i32),
+    )
+}
+
+/// `SPA_META_Header` on each buffer: the producer's own stamp per frame (KWin's last
+/// vblank up to 6.7, its paced tick from 6.8), which the wire pts takes over delivery time.
+pub(super) fn build_header_meta_param() -> Result<Vec<u8>> {
+    meta(
+        spa::sys::SPA_META_Header,
+        pw::spa::pod::Value::Int(std::mem::size_of::<spa::sys::spa_meta_header>() as i32),
+    )
+}
+
+/// `SPA_META_VideoDamage` on each buffer: the regions the producer repainted, 16 at most.
+pub(super) fn build_damage_meta_param() -> Result<Vec<u8>> {
+    let region = std::mem::size_of::<spa::sys::spa_meta_region>() as i32;
+    meta(
+        spa::sys::SPA_META_VideoDamage,
+        pw::spa::pod::Value::Choice(pw::spa::pod::ChoiceValue::Int(pw::spa::utils::Choice(
+            pw::spa::utils::ChoiceFlags::empty(),
+            pw::spa::utils::ChoiceEnum::Range {
+                default: region * 16,
+                min: region,
+                max: region * 16,
             },
-            pw::spa::pod::Property {
-                key: pw::spa::sys::SPA_PARAM_BUFFERS_buffers,
-                flags: pw::spa::pod::PropertyFlags::empty(),
-                value: pw::spa::pod::Value::Choice(pw::spa::pod::ChoiceValue::Int(
-                    pw::spa::utils::Choice(
-                        pw::spa::utils::ChoiceFlags::empty(),
-                        pw::spa::utils::ChoiceEnum::Range {
-                            default: POOL_DEFAULT,
-                            min: pool_min,
-                            max: POOL_MAX,
-                        },
-                    ),
-                )),
-            },
-        ],
-    })
+        ))),
+    )
+}
+
+/// The producer's `maxFramerate` denominator, off one of its `EnumFormat` pods. KWin 6.8
+/// offers millihertz (`refresh/1000`); 6.7 and older offer whole hertz. `None` without
+/// the property.
+pub(super) fn offer_framerate_denom(pod: &[u8]) -> Option<u32> {
+    use pw::spa::pod::{deserialize::PodDeserializer, ChoiceValue, Value};
+    use pw::spa::utils::{Choice, ChoiceEnum};
+    let (_, Value::Object(obj)) = PodDeserializer::deserialize_any_from(pod).ok()? else {
+        return None;
+    };
+    let prop = obj
+        .properties
+        .iter()
+        .find(|p| p.key == pw::spa::sys::SPA_FORMAT_VIDEO_maxFramerate)?;
+    match &prop.value {
+        Value::Fraction(f) => Some(f.denom),
+        Value::Choice(ChoiceValue::Fraction(Choice(_, ChoiceEnum::Range { default, .. })))
+        | Value::Choice(ChoiceValue::Fraction(Choice(_, ChoiceEnum::Enum { default, .. }))) => {
+            Some(default.denom)
+        }
+        _ => None,
+    }
 }
 
 /// `SPA_META_Cursor` on each buffer, paired with the portal's
@@ -398,35 +431,21 @@ pub(super) fn build_cursor_meta_param() -> Result<Vec<u8>> {
             + std::mem::size_of::<spa::sys::spa_meta_bitmap>()
             + (w as usize * h as usize * 4)) as i32
     }
-    serialize_pod(pw::spa::pod::Object {
-        type_: pw::spa::utils::SpaTypes::ObjectParamMeta.as_raw(),
-        id: pw::spa::param::ParamType::Meta.as_raw(),
-        properties: vec![
-            pw::spa::pod::Property {
-                key: pw::spa::sys::SPA_PARAM_META_type,
-                flags: pw::spa::pod::PropertyFlags::empty(),
-                value: pw::spa::pod::Value::Id(pw::spa::utils::Id(spa::sys::SPA_META_Cursor)),
+    meta(
+        spa::sys::SPA_META_Cursor,
+        pw::spa::pod::Value::Choice(pw::spa::pod::ChoiceValue::Int(pw::spa::utils::Choice(
+            pw::spa::utils::ChoiceFlags::empty(),
+            // `max` must cover the producer's offer or Meta fails
+            // silently and no buffer carries a cursor region.
+            // Mutter offers a fixed 384²; 1024² is headroom, not
+            // an allocation — the negotiated size is the producer's.
+            pw::spa::utils::ChoiceEnum::Range {
+                default: meta_size(64, 64),
+                min: meta_size(1, 1),
+                max: meta_size(1024, 1024),
             },
-            pw::spa::pod::Property {
-                key: pw::spa::sys::SPA_PARAM_META_size,
-                flags: pw::spa::pod::PropertyFlags::empty(),
-                value: pw::spa::pod::Value::Choice(pw::spa::pod::ChoiceValue::Int(
-                    pw::spa::utils::Choice(
-                        pw::spa::utils::ChoiceFlags::empty(),
-                        // `max` must cover the producer's offer or Meta fails
-                        // silently and no buffer carries a cursor region.
-                        // Mutter offers a fixed 384²; 1024² is headroom, not
-                        // an allocation — the negotiated size is the producer's.
-                        pw::spa::utils::ChoiceEnum::Range {
-                            default: meta_size(64, 64),
-                            min: meta_size(1, 1),
-                            max: meta_size(1024, 1024),
-                        },
-                    ),
-                )),
-            },
-        ],
-    })
+        ))),
+    )
 }
 
 #[cfg(test)]
@@ -472,7 +491,7 @@ mod tests {
             "PUNKTFUNK_FORCE_SHM must exclude DmaBuf"
         );
         assert_eq!(
-            buffers_data_type(&build_dmabuf_buffers(crate::POOL_MIN).unwrap()),
+            buffers_data_type(&build_dmabuf_buffers(crate::POOL_MIN, false).unwrap()),
             DMABUF,
             "the zero-copy/HDR path must exclude SHM"
         );
@@ -486,16 +505,37 @@ mod tests {
             ("shm-only buffers", build_shm_only_buffers().unwrap()),
             (
                 "dmabuf buffers",
-                build_dmabuf_buffers(crate::POOL_MIN).unwrap(),
+                build_dmabuf_buffers(crate::POOL_MIN, false).unwrap(),
             ),
             (
                 "kwin dmabuf buffers",
-                build_dmabuf_buffers(crate::KWIN_POOL_MIN).unwrap(),
+                build_dmabuf_buffers(crate::KWIN_POOL_MIN, false).unwrap(),
+            ),
+            (
+                "explicit-sync dmabuf buffers",
+                build_dmabuf_buffers(crate::KWIN_POOL_MIN, true).unwrap(),
+            ),
+            (
+                "sync timeline meta",
+                build_sync_timeline_meta_param().unwrap(),
             ),
             ("cursor meta", build_cursor_meta_param().unwrap()),
             (
                 "default format",
                 serialize_pod(build_default_format_obj(None, Pacing::Producer)).unwrap(),
+            ),
+            (
+                "fixed bisect format",
+                serialize_pod(video_raw(
+                    spa::pod::property!(
+                        spa::param::format::FormatProperties::VideoFormat,
+                        Id,
+                        VideoFormat::BGRx
+                    ),
+                    Extent::Fixed(1280, 720),
+                    Pacing::Producer,
+                ))
+                .unwrap(),
             ),
             (
                 "dmabuf BGRx",
@@ -541,6 +581,40 @@ mod tests {
                 "{name} did not parse back as a pod"
             );
         }
+    }
+
+    /// KWin 6.8 is told apart from 6.7 by the denominator of the ceiling it offers.
+    #[test]
+    fn the_offer_denominator_tells_kwin_generations_apart() {
+        use spa::pod::{ChoiceValue, Value};
+        use spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Fraction};
+        let offer = |props: Vec<spa::pod::Property>| {
+            serialize_pod(spa::pod::Object {
+                type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+                id: spa::param::ParamType::EnumFormat.as_raw(),
+                properties: props,
+            })
+            .unwrap()
+        };
+        let range = |num: u32, denom: u32| spa::pod::Property {
+            key: spa::sys::SPA_FORMAT_VIDEO_maxFramerate,
+            flags: spa::pod::PropertyFlags::empty(),
+            value: Value::Choice(ChoiceValue::Fraction(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::Range {
+                    default: Fraction { num, denom },
+                    min: Fraction { num: 0, denom: 1 },
+                    max: Fraction { num, denom },
+                },
+            ))),
+        };
+        assert_eq!(offer_framerate_denom(&offer(vec![range(120, 1)])), Some(1));
+        assert_eq!(
+            offer_framerate_denom(&offer(vec![range(120_000, 1_000)])),
+            Some(1_000)
+        );
+        assert_eq!(offer_framerate_denom(&offer(vec![])), None);
+        assert_eq!(offer_framerate_denom(b"not a pod"), None);
     }
 
     #[test]
@@ -701,7 +775,7 @@ mod tests {
     #[test]
     fn the_dmabuf_pool_request_is_a_range_not_a_fixed_count() {
         for pool_min in [crate::POOL_MIN, crate::KWIN_POOL_MIN] {
-            let pod = build_dmabuf_buffers(pool_min).unwrap();
+            let pod = build_dmabuf_buffers(pool_min, false).unwrap();
             let key = spa::sys::SPA_PARAM_BUFFERS_buffers.to_ne_bytes();
             let at = pod
                 .windows(4)
@@ -738,6 +812,28 @@ mod tests {
         const { assert!(crate::POOL_MIN <= 2) };
         // KWin ≥ 6.2 caps its pool at 4; a higher minimum fails negotiation outright.
         const { assert!(crate::KWIN_POOL_MAX == 4 && crate::KWIN_POOL_MIN <= crate::KWIN_POOL_MAX) };
+    }
+
+    /// Without MANDATORY a producer lacking the meta would still match, and this side would
+    /// then wait on sync datas that never arrive.
+    #[test]
+    fn the_explicit_sync_pod_demands_the_sync_meta() {
+        let key = spa::sys::SPA_PARAM_BUFFERS_metaType.to_ne_bytes();
+        let plain = build_dmabuf_buffers(crate::POOL_MIN, false).unwrap();
+        assert!(
+            !plain.windows(4).any(|w| w == key),
+            "the plain twin must leave metaType to the producer"
+        );
+        let pod = build_dmabuf_buffers(crate::POOL_MIN, true).unwrap();
+        let at = pod
+            .windows(4)
+            .position(|w| w == key)
+            .expect("the explicit-sync pod must carry metaType");
+        let word = |off: usize| u32::from_ne_bytes(pod[off..off + 4].try_into().unwrap());
+        // Property = { key, flags, value_pod }; value_pod = { size, type, body }.
+        assert_eq!(word(at + 4), spa::sys::SPA_POD_PROP_FLAG_MANDATORY);
+        assert_eq!(word(at + 12), spa::sys::SPA_TYPE_Int);
+        assert_eq!(word(at + 16), 1 << spa::sys::SPA_META_SyncTimeline);
     }
 
     #[test]

@@ -14,7 +14,7 @@
 # top: the {channel, manifest} pointer the plugin's self-update check polls.
 #
 # SELF-UPDATE (no Decky store): alongside the zip we also publish a tiny per-channel
-# `manifest.json` ({version, artifact=<immutable per-version zip URL>, sha256}). The installed
+# `manifest.json` ({version, artifact=<that channel's alias zip URL>, sha256}). The installed
 # plugin polls it (main.py check_update), and the frontend drives Decky's own install RPC to
 # apply a newer build. See clients/decky/README.md "Updating".
 #
@@ -73,7 +73,7 @@ jobs:
 
       - name: Build frontend
         run: |
-          pnpm install --frozen-lockfile
+          pnpm install --frozen-lockfile --ignore-scripts
           pnpm run build          # rollup -> clients/decky/dist/index.js
 
       - name: Version + channel + stamp
@@ -89,16 +89,21 @@ jobs:
         run: |
           eval "$(bash scripts/ci/pf-version.sh)"   # -> PF_MAJOR/PF_MINOR (base one minor ahead of latest stable)
           case "$GITHUB_REF" in
-            refs/tags/v*) V="${GITHUB_REF_NAME#v}"; ALIAS=latest ;;
+            # A release refreshes canary/ too: it is newer than every canary built before it,
+            # and the next push under clients/decky may be weeks away. That copy is numbered
+            # like every canary, one minor ahead (pf-version.sh's rule).
+            refs/tags/v*) V="${GITHUB_REF_NAME#v}"; ALIAS=latest
+                          CANARY_VERSION="${PF_MAJOR}.$((PF_MINOR + 1)).${GITHUB_RUN_NUMBER}" ;;
             # Canary MUST be a plain monotonic numeric semver (see the note above): <major>.<minor>.<run>,
             # where major.minor track one minor ahead of the latest stable and the run number climbs.
-            *)            V="${PF_MAJOR}.${PF_MINOR}.${GITHUB_RUN_NUMBER}"; ALIAS=canary ;;
+            *)            V="${PF_MAJOR}.${PF_MINOR}.${GITHUB_RUN_NUMBER}"; ALIAS=canary; CANARY_VERSION="" ;;
           esac
           BASE="https://$REGISTRY/api/packages/$OWNER/generic/$PACKAGE"
           echo "VERSION=$V" >> "$GITHUB_ENV"
           echo "ALIAS=$ALIAS" >> "$GITHUB_ENV"
+          echo "CANARY_VERSION=$CANARY_VERSION" >> "$GITHUB_ENV"
           echo "BASE=$BASE" >> "$GITHUB_ENV"
-          echo "decky version $V -> alias '$ALIAS'"
+          echo "decky version $V -> alias '$ALIAS'${CANARY_VERSION:+ (+ canary $CANARY_VERSION)}"
           VERSION="$V" node -e 'const fs=require("fs");for(const f of ["clients/decky/package.json","clients/decky/plugin.json"]){const j=JSON.parse(fs.readFileSync(f,"utf8"));j.version=process.env.VERSION;fs.writeFileSync(f,JSON.stringify(j,null,2)+"\n");}'
 
       - name: Assemble store-layout zip
@@ -112,26 +117,35 @@ jobs:
           # Runs AFTER the version stamp, so the staged package.json carries $VERSION.
           bash clients/decky/scripts/package.sh
           DEST="clients/decky/out/$PLUGIN"
-          # CI-only addition: the self-update channel pointer the backend reads (main.py
-          # check_update). It points at THIS channel's manifest.json (published below); that
-          # manifest in turn points at the immutable per-version zip, so its sha256 stays valid
-          # across future alias re-uploads.
-          printf '{"channel":"%s","manifest":"%s/%s/manifest.json"}\n' "$ALIAS" "$BASE" "$ALIAS" > "$DEST/update.json"
-          ( cd clients/decky/out && zip -r "$RUNNER_TEMP/punktfunk.zip" "$PLUGIN" )
-          ls -lh "$RUNNER_TEMP/punktfunk.zip"
-          unzip -l "$RUNNER_TEMP/punktfunk.zip"
-          # Backstop against packaging drift: the runtime-loaded pieces MUST be in the zip.
-          for f in main.py dist/index.js bin/punktfunkrun.sh assets/grid.png \
-                   controller_config/punktfunk.vdf update.json; do
-            unzip -l "$RUNNER_TEMP/punktfunk.zip" "$PLUGIN/$f" >/dev/null || { echo "MISSING $f" >&2; exit 1; }
-          done
-          # The update manifest the plugin polls: the immutable per-version artifact + its
-          # sha256 (Decky's installer verifies the download against this hash, aborting on
-          # mismatch — so it MUST be the per-version URL, never the mutable alias).
-          SHA=$(sha256sum "$RUNNER_TEMP/punktfunk.zip" | cut -d' ' -f1)
-          printf '{"version":"%s","artifact":"%s/%s/punktfunk.zip","sha256":"%s"}\n' \
-            "$VERSION" "$BASE" "$VERSION" "$SHA" > "$RUNNER_TEMP/manifest.json"
-          cat "$RUNNER_TEMP/manifest.json"
+          # One zip per channel this run feeds. They differ only in the stamped version and in
+          # update.json, the {channel, manifest} pointer the backend polls (main.py
+          # check_update). The manifest names the channel's ALIAS zip, uploaded right beside it:
+          # the registry's cleanup rule prunes canary version numbers after a week, so a
+          # per-version URL 404s as soon as the newest canary build is that old.
+          bundle() {  # <version> <alias>  ->  $RUNNER_TEMP/<alias>/{punktfunk.zip,manifest.json}
+            local v="$1" alias="$2" out="$RUNNER_TEMP/$2" f sha
+            mkdir -p "$out"
+            for f in package.json plugin.json; do
+              VERSION="$v" node -e 'const fs=require("fs"),f=process.argv[1];const j=JSON.parse(fs.readFileSync(f,"utf8"));j.version=process.env.VERSION;fs.writeFileSync(f,JSON.stringify(j,null,2)+"\n");' "$DEST/$f"
+            done
+            printf '{"channel":"%s","manifest":"%s/%s/manifest.json"}\n' "$alias" "$BASE" "$alias" > "$DEST/update.json"
+            rm -f "$out/punktfunk.zip"
+            ( cd clients/decky/out && zip -r "$out/punktfunk.zip" "$PLUGIN" )
+            # Backstop against packaging drift: the runtime-loaded pieces MUST be in the zip.
+            for f in main.py dist/index.js bin/punktfunkrun.sh assets/grid.png \
+                     controller_config/punktfunk.vdf update.json; do
+              unzip -l "$out/punktfunk.zip" "$PLUGIN/$f" >/dev/null || { echo "MISSING $f" >&2; exit 1; }
+            done
+            # Decky verifies the download against this hash and aborts on a mismatch.
+            sha=$(sha256sum "$out/punktfunk.zip" | cut -d' ' -f1)
+            printf '{"version":"%s","artifact":"%s/%s/punktfunk.zip","sha256":"%s"}\n' \
+              "$v" "$BASE" "$alias" "$sha" > "$out/manifest.json"
+            cat "$out/manifest.json"
+          }
+          bundle "$VERSION" "$ALIAS"
+          [ -z "$CANARY_VERSION" ] || bundle "$CANARY_VERSION" canary
+          ls -lh "$RUNNER_TEMP"/*/punktfunk.zip
+          unzip -l "$RUNNER_TEMP/$ALIAS/punktfunk.zip"
 
       - name: Publish to the Gitea generic registry
         working-directory: ${{ gitea.workspace }}
@@ -139,31 +153,24 @@ jobs:
           TOKEN: ${{ secrets.REGISTRY_TOKEN }}
         run: |
           BASE="https://$REGISTRY/api/packages/$OWNER/generic/$PACKAGE"
-          # 1) Versioned URL + its update manifest (the manifest's `artifact` points here, so the
-          #    published sha256 keeps matching what Decky later downloads). A re-tagged release
-          #    re-fires this workflow and the registry 409s on duplicate uploads — delete any
-          #    prior copy of this version first (404 on the first publish is fine).
-          for f in punktfunk.zip manifest.json; do
-            curl -fsS -o /dev/null --user "enricobuehler:$TOKEN" -X DELETE "$BASE/$VERSION/$f" || true
-          done
-          curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$RUNNER_TEMP/punktfunk.zip" \
-            "$BASE/$VERSION/punktfunk.zip"
-          curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$RUNNER_TEMP/manifest.json" \
-            "$BASE/$VERSION/manifest.json"
-          echo "published $BASE/$VERSION/punktfunk.zip"
-          # 2) Channel alias (stable release -> latest/, canary main build -> canary/) — the
-          #    zip is the "install from URL" link; manifest.json is what the installed plugin
-          #    polls for updates. The generic registry rejects re-uploading an existing
-          #    version/file (409), so delete the prior alias copies first (ignore 404 on run #1).
-          for f in punktfunk.zip manifest.json; do
-            curl -fsS -o /dev/null --user "enricobuehler:$TOKEN" -X DELETE "$BASE/$ALIAS/$f" || true
-          done
-          curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$RUNNER_TEMP/punktfunk.zip" \
-            "$BASE/$ALIAS/punktfunk.zip"
-          curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$RUNNER_TEMP/manifest.json" \
-            "$BASE/$ALIAS/manifest.json"
-          echo "install-from-URL link: $BASE/$ALIAS/punktfunk.zip"
-          echo "update manifest:       $BASE/$ALIAS/manifest.json"
+          # Per channel: the versioned copy (a pinnable URL, also the release asset), then the
+          # alias the manifest names and "install from URL" links to. The registry 409s a
+          # re-upload of an existing version/file (a re-tagged release re-fires this workflow),
+          # so delete any prior copy first (404 on the first publish is fine). The zip lands
+          # before the manifest, so a manifest never names a zip that is not there yet.
+          publish() {  # <version> <alias>
+            local dest f
+            for dest in "$1" "$2"; do
+              for f in punktfunk.zip manifest.json; do
+                curl -fsS -o /dev/null --user "enricobuehler:$TOKEN" -X DELETE "$BASE/$dest/$f" || true
+                curl -fsS --user "enricobuehler:$TOKEN" --upload-file "$RUNNER_TEMP/$2/$f" "$BASE/$dest/$f"
+              done
+            done
+            echo "install-from-URL link: $BASE/$2/punktfunk.zip"
+            echo "update manifest:       $BASE/$2/manifest.json"
+          }
+          publish "$VERSION" "$ALIAS"
+          [ -z "$CANARY_VERSION" ] || publish "$CANARY_VERSION" canary
 
       - name: Attach zip to the Gitea release (stable tags only)
         if: startsWith(gitea.ref, 'refs/tags/v')
@@ -173,4 +180,4 @@ jobs:
         run: |
           . scripts/ci/gitea-release.sh
           RID=$(ensure_release "$GITHUB_REF_NAME" "$GITHUB_REF_NAME" auto)
-          upsert_asset "$RID" "$RUNNER_TEMP/punktfunk.zip" "punktfunk-${VERSION}.zip"
+          upsert_asset "$RID" "$RUNNER_TEMP/$ALIAS/punktfunk.zip" "punktfunk-${VERSION}.zip"

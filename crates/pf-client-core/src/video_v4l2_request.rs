@@ -88,7 +88,7 @@ impl V4l2RequestDecoder {
             }
             let mut ctx = ffi::avcodec_alloc_context3(codec);
             if ctx.is_null() {
-                bail!("could not allocate the HEVC decoder context");
+                bail!("allocate HEVC decoder context");
             }
             (*ctx).hw_device_ctx = ffi::av_buffer_ref(hw_device.0);
             (*ctx).get_format = Some(pick_drm_prime);
@@ -111,7 +111,7 @@ impl V4l2RequestDecoder {
                 ffi::av_frame_free(&mut frame);
                 ffi::av_frame_free(&mut planar);
                 ffi::avcodec_free_context(&mut ctx);
-                bail!("could not allocate FFmpeg packet/frame storage");
+                bail!("allocate FFmpeg packet/frame storage");
             }
             (*planar).format = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P as i32;
             Ok(Self {

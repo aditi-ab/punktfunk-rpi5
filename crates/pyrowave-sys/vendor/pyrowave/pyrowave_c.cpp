@@ -818,6 +818,12 @@ struct pyrowave_encoder_opaque
 	// the encode path reuses them across frames instead of allocating four buffers per frame.
 	BufferHandle queued_meta_gpu;
 	BufferHandle queued_bitstream_gpu;
+	// PUNKTFUNK: the plane views, wrapped once and kept while the caller passes the same
+	// images. Otherwise every frame creates three views and defers three destroys.
+	ImageHandle view_images[3];
+	ImageViewHandle views[3];
+	pyrowave_image_view view_key[3] = {};
+	bool views_ready = false;
 	ChromaSubsampling chroma = {};
 	int width = 0;
 	int height = 0;
@@ -904,6 +910,41 @@ bool WrappedViewBuffers::wrap(Device *device, const pyrowave_gpu_buffers *buffer
 		planes[i] = image_views[i].get();
 	}
 
+	return true;
+}
+
+static bool same_plane(const pyrowave_image_view &a, const pyrowave_image_view &b)
+{
+	return a.image == b.image && a.width == b.width && a.height == b.height &&
+	       a.image_format == b.image_format && a.view_format == b.view_format &&
+	       a.mip_level == b.mip_level && a.layer == b.layer && a.aspect == b.aspect &&
+	       a.swizzle == b.swizzle && a.layout == b.layout;
+}
+
+// PUNKTFUNK: the encoder's plane views, wrapped on the first encode of these images and
+// reused until the caller passes different ones. Held on the encoder, so the frame
+// context never recycles a view the next encode still binds.
+static bool cached_plane_views(pyrowave_encoder encoder, const pyrowave_gpu_buffers *buffers,
+                               ViewBuffers &views)
+{
+	bool same = encoder->views_ready;
+	for (int i = 0; same && i < 3; i++)
+		same = same_plane(encoder->view_key[i], buffers->planes[i]);
+	if (!same)
+	{
+		WrappedViewBuffers fresh = {};
+		if (!fresh.wrap(encoder->device, buffers, VK_IMAGE_USAGE_SAMPLED_BIT))
+			return false;
+		for (int i = 0; i < 3; i++)
+		{
+			encoder->view_images[i] = std::move(fresh.wrapped_images[i]);
+			encoder->views[i] = std::move(fresh.image_views[i]);
+			encoder->view_key[i] = buffers->planes[i];
+		}
+		encoder->views_ready = true;
+	}
+	for (int i = 0; i < 3; i++)
+		views.planes[i] = encoder->views[i].get();
 	return true;
 }
 
@@ -1002,8 +1043,8 @@ pyrowave_encoder_encode_gpu_synchronous(pyrowave_encoder encoder,
 
 	Encoder::BitstreamBuffers bitstream_buffers = {};
 
-	WrappedViewBuffers views = {};
-	if (!views.wrap(device, buffers, VK_IMAGE_USAGE_SAMPLED_BIT))
+	ViewBuffers views = {};
+	if (!cached_plane_views(encoder, buffers, views))
 		return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
 
 	bitstream_buffers.meta.buffer = queued_meta_gpu.get();

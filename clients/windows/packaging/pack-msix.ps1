@@ -196,6 +196,11 @@ if (-not (Test-Path $font)) { throw "missing Assets\lucide.ttf in the layout —
 
 # manifest with version + publisher + architecture substituted
 $manifest = (Get-Content -Raw $manifestTemplate).Replace('{VERSION}', $Version).Replace('{PUBLISHER}', $Publisher).Replace('{ARCH}', $Arch)
+# The ARM64 session is built without the console (no Skia for the target): no tile for it.
+if ($Arch -eq 'arm64') {
+    $manifest = [regex]::Replace($manifest, '(?s)\s*<!-- console:begin -->.*?<!-- console:end -->', '')
+    if ($manifest -match 'PunktfunkConsole') { throw 'the console entry survived the arm64 strip' }
+}
 Set-Content -Path (Join-Path $layout 'AppxManifest.xml') -Value $manifest -Encoding UTF8
 
 # --- resource index (resources.pri) ---

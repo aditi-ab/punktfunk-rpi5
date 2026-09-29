@@ -10,7 +10,7 @@ use super::*;
 /// `PUNKTFUNK_PHASE_LOCK=0` disarms the controller. Armed, it still waits for a [`PhaseReport`].
 pub(super) fn phase_lock_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PUNKTFUNK_PHASE_LOCK").as_deref() != Ok("0"))
+    *ON.get_or_init(|| pf_host_config::env_on("PUNKTFUNK_PHASE_LOCK").unwrap_or(true))
 }
 
 /// Control-task → encode-loop bridge: latest-wins [`PhaseReport`], drained ~1 Hz, published as
@@ -68,7 +68,8 @@ pub(super) struct PhaseController {
     /// Grid epoch; `None` = disengaged. Stamped at engage, cleared at disengage — the lock's age.
     pub(super) epoch: Option<std::time::Instant>,
     pub(super) last_adjust: std::time::Instant,
-    /// |step| integrated since engage — the chase detector.
+    /// Signed steps summed since engage — the chase detector. A chase moves one way; corrections
+    /// around a held phase (window jitter wider than the deadband) cancel.
     pub(super) cum_travel_ns: i64,
     /// Consecutive incoherent reports; 3 disengage.
     pub(super) incoherent_streak: u32,
@@ -206,8 +207,8 @@ impl PhaseController {
             step /= 2;
         }
         self.offset_ns = (self.offset_ns + step).rem_euclid(period_ns);
-        self.cum_travel_ns += step.abs();
-        if self.cum_travel_ns > period_ns + period_ns / 4 {
+        self.cum_travel_ns += step;
+        if self.cum_travel_ns.abs() > period_ns + period_ns / 4 {
             tracing::info!("phase lock: travel budget exhausted without convergence — disengaging");
             self.disengage("travel budget", Self::REENGAGE_BACKOFF, r.coherence_milli);
         }
@@ -318,6 +319,31 @@ mod tests {
         );
     }
 
+    /// Encode time that swings with content moves each report's mean ±1.5 ms around a held
+    /// phase. Corrections of both signs cancel; they must not read as a chase.
+    #[test]
+    fn window_jitter_around_a_held_phase_stays_engaged() {
+        let mut c = PhaseController::new();
+        let mut rng = Lcg(23);
+        let mut locked = false;
+        for i in 0..600 {
+            let wobble = rng.next_noise(1_500_000);
+            let r = report_from_lead(grid_lead(7_500_000, &c) + wobble, 300_000, &mut rng);
+            c.adjust(&r, SIM_P);
+            locked |= c.engaged();
+            assert!(
+                !locked || c.engaged(),
+                "report {i}: disengaged under zero-mean window jitter"
+            );
+        }
+        assert!(locked, "a coherent linear plant must engage");
+        let err = grid_lead(7_500_000, &c) - SIM_TARGET;
+        assert!(
+            err.abs() < 2_000_000,
+            "held near the target lead, residual {err} ns"
+        );
+    }
+
     #[test]
     fn grid_plant_antipode_start_converges_without_chatter() {
         let mut c = PhaseController::new();
@@ -333,7 +359,7 @@ mod tests {
             "an antipode start must still converge, residual {err} ns"
         );
         assert!(
-            c.cum_travel_ns <= SIM_P,
+            c.cum_travel_ns.abs() <= SIM_P,
             "damped antipode stepping spent {} ns of travel — it chattered",
             c.cum_travel_ns
         );

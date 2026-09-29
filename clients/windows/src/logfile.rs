@@ -16,7 +16,7 @@
 //! or hand to Explorer.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -143,26 +143,6 @@ impl Write for Tee {
         }
         Ok(())
     }
-}
-
-/// Forward a spawned child's stderr into the [`Tee`], line-buffered so its lines never
-/// interleave mid-line with the shell's own — and into the client log ring, so a "Send logs
-/// to host" bundle from this shell carries the session's whole receive/decode/present trail
-/// (the file half of exactly that rationale is this module's opening doc). Returns
-/// immediately; the thread dies with the pipe (child exit).
-pub(crate) fn forward_child_stderr(stderr: impl io::Read + Send + 'static) {
-    let _ = std::thread::Builder::new()
-        .name("punktfunk-session-log".into())
-        .spawn(move || {
-            let mut reader = io::BufReader::new(stderr);
-            let mut line = String::new();
-            let mut tee = Tee;
-            while matches!(reader.read_line(&mut line), Ok(n) if n > 0) {
-                let _ = tee.write_all(line.as_bytes());
-                pf_client_core::logring::note(line.trim_end().to_string());
-                line.clear();
-            }
-        });
 }
 
 #[cfg(test)]

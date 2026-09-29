@@ -3,7 +3,7 @@
 The canonical OS/distro brand marks every client derives its host-card OS icon from
 (web console inline SVGs, GTK symbolic icons, Windows PNGs, Apple template imagesets,
 Android `ImageVector`s). One file per **icon token** of the host's OS-identity chain
-(see `crates/punktfunk-host/src/osinfo.rs` and `crates/pf-client-core/src/os.rs`):
+(see `crates/punktfunk-host/src/hostsys/osinfo.rs` and `crates/pf-client-core/src/os.rs`):
 
 | token | mark | source |
 |---|---|---|
@@ -41,9 +41,10 @@ note in `clients/android/.../components/OsIcons.kt`.
 ## Regenerating the per-client derivatives
 
 `bash scripts/gen-os-icons.sh [token ...]` turns a master into the three baked forms (GTK
-symbolic SVG, Windows PNG, Apple template PDF) and prints the path data for the three clients
-that inline it (web console, Decky plugin, Android). Adding a **new** token also means adding it
-to each client's shipped-token list — the script prints that checklist too.
+symbolic SVG, Windows PNG, Apple template PDF) and regenerates the path registries of the four
+clients that inline it (Skia console, web console, Decky plugin, Android). Adding a **new** token
+also means adding it to each baked client's shipped-token list — the script prints that checklist
+too.
 
 ## Licensing
 

@@ -12,7 +12,7 @@
 // `super::*` is the point of the child-module shape. `vk_util` is a crate-root sibling, so
 // `crate::` — not the parent-relative `super::` the parent uses.
 use super::*;
-use crate::vk_util::{ext_advertised, find_mem, make_plain_image, make_view};
+use crate::vk_util::{ext_advertised, find_mem, find_mem_preferring, make_plain_image, make_view};
 use anyhow::{bail, Result};
 use ash::vk;
 use std::ffi::c_void;
@@ -66,7 +66,7 @@ pub(super) unsafe fn probe_rgb_direct(
     }
     // Caps under the rgb-chained profile: colour math must match the compute CSC (`rgb2yuv.comp`
     // 709 / `rgb2yuv10.comp` 2020 / `rgb2yuv10_709.comp` 709 at ten bits). Depth-only profile here.
-    let mut ps = RgbProfileStack::new(codec_op, ten_bit);
+    let mut ps = ProfileStack::new(codec_op, ten_bit, true);
     let profile = *ps.wire(av1);
     let mut rgb_caps = vrgb::VideoEncodeRgbConversionCapabilitiesVALVE {
         s_type: vrgb::stype(vrgb::ST_CAPABILITIES),
@@ -93,18 +93,16 @@ pub(super) unsafe fn probe_rgb_direct(
     if r != vk::Result::SUCCESS {
         return Err("no-rgb-profile(caps)");
     }
-    // Model + range must match the shader. Siting is looser: EFC often offers only COSITED_EVEN
-    // (H.26x left-cosited) while the 2x2-average shader is midpoint. Accept either bit per axis;
-    // pick midpoint if offered, else cosited-even. Nothing in the bitstream signals siting.
-    let pick = |offered: u32| -> Option<u32> {
-        if offered & vrgb::CHROMA_OFFSET_MIDPOINT != 0 {
-            Some(vrgb::CHROMA_OFFSET_MIDPOINT)
-        } else if offered & vrgb::CHROMA_OFFSET_COSITED_EVEN != 0 {
-            Some(vrgb::CHROMA_OFFSET_COSITED_EVEN)
-        } else {
-            None
-        }
+    // Model + range must match the shader. Siting should too: the shader and every decoder use
+    // chroma location 0 (x cosited-even, y midpoint), and nothing in the bitstream says
+    // otherwise. Prefer that bit per axis, else accept the other rather than lose EFC.
+    let pick = |offered: u32, first: u32, second: u32| -> Option<u32> {
+        [first, second].into_iter().find(|&bit| offered & bit != 0)
     };
+    let (even, mid) = (
+        vrgb::CHROMA_OFFSET_COSITED_EVEN,
+        vrgb::CHROMA_OFFSET_MIDPOINT,
+    );
     let want_model = rgb_model_for(hdr);
     if rgb_caps.rgb_models & want_model == 0 || rgb_caps.rgb_ranges & vrgb::RANGE_NARROW == 0 {
         return Err(if hdr {
@@ -114,8 +112,8 @@ pub(super) unsafe fn probe_rgb_direct(
         });
     }
     let (Some(x_offset), Some(y_offset)) = (
-        pick(rgb_caps.x_chroma_offsets),
-        pick(rgb_caps.y_chroma_offsets),
+        pick(rgb_caps.x_chroma_offsets, even, mid),
+        pick(rgb_caps.y_chroma_offsets, mid, even),
     ) else {
         return Err("no-chroma-siting");
     };
@@ -295,6 +293,7 @@ pub(super) unsafe fn make_video_image(
 }
 
 /// [`make_video_image`] with image create flags (`MUTABLE_FORMAT` for plane views).
+/// Memory prefers `DEVICE_LOCAL` and takes any type the driver offers otherwise.
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn make_video_image_flags(
     device: &ash::Device,
@@ -334,20 +333,19 @@ pub(super) unsafe fn make_video_image_flags(
     let img = device.create_image(&ci, None)?;
     let req = device.get_image_memory_requirements(img);
     // Destroy the image if alloc fails: callers only ever see the completed pair.
-    let mem = match device.allocate_memory(
-        &vk::MemoryAllocateInfo::default()
-            .allocation_size(req.size)
-            .memory_type_index(find_mem(
-                mp,
-                req.memory_type_bits,
-                vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            )),
-        None,
-    ) {
+    let local = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+    let mem = match find_mem_preferring(mp, req.memory_type_bits, local).and_then(|ti| {
+        Ok(device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(ti),
+            None,
+        )?)
+    }) {
         Ok(m) => m,
         Err(e) => {
             device.destroy_image(img, None);
-            return Err(e.into());
+            return Err(e);
         }
     };
     if let Err(e) = device.bind_image_memory(img, mem, 0) {
@@ -539,7 +537,7 @@ unsafe fn make_frame_csc(
                 mem_props,
                 cs_req.memory_type_bits,
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )),
+            )?),
         None,
     )?;
     device.bind_buffer_memory(f.cursor_stage, f.cursor_stage_mem, 0)?;
@@ -613,7 +611,7 @@ unsafe fn make_frame_common(
                 mem_props,
                 bs_req.memory_type_bits,
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )),
+            )?),
         None,
     )?;
     device.bind_buffer_memory(f.bs_buf, f.bs_mem, 0)?;

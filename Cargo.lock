@@ -151,6 +151,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "arrayvec"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+
+[[package]]
 name = "ash"
 version = "0.38.0+1.3.281"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1091,7 +1097,7 @@ dependencies = [
 
 [[package]]
 name = "cursor-probe"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "anyhow",
  "pf-capture",
@@ -1223,7 +1229,7 @@ dependencies = [
 
 [[package]]
 name = "display-disturb"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "pf-win-display",
  "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -1260,6 +1266,12 @@ name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
+name = "dyn-clone"
+version = "1.0.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "either"
@@ -1407,13 +1419,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fence-ring-spike"
-version = "0.39.0"
-dependencies = [
- "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
-]
-
-[[package]]
 name = "ffmpeg-sys-next"
 version = "9.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1484,6 +1489,7 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -1690,6 +1696,13 @@ dependencies = [
  "pango-sys",
  "pkg-config",
  "system-deps",
+]
+
+[[package]]
+name = "gen-headers"
+version = "0.41.0"
+dependencies = [
+ "cbindgen",
 ]
 
 [[package]]
@@ -2011,6 +2024,21 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "hermir"
+version = "0.1.0"
+source = "git+https://github.com/unom-io/hermir?rev=26f87cb857670517b83f59d7a56d651ebfd403fe#26f87cb857670517b83f59d7a56d651ebfd403fe"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+ "sevenz-rust2",
+ "sha2 0.11.0",
+ "thiserror 2.0.20",
+ "ureq",
+ "zip",
+]
 
 [[package]]
 name = "hermit-abi"
@@ -2465,10 +2493,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "latency-probe"
-version = "0.39.0"
-
-[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2569,7 +2593,7 @@ dependencies = [
 
 [[package]]
 name = "libvpl-sys"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "bindgen",
  "cmake",
@@ -2604,7 +2628,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "loss-harness"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "punktfunk-core",
 ]
@@ -2614,6 +2638,21 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
+
+[[package]]
+name = "lzma-rust2"
+version = "0.16.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca93e534d1142d1d0dcca6d25fe302508a5dfb40b302802904577725ea0b695b"
+dependencies = [
+ "sha2 0.11.0",
+]
+
+[[package]]
+name = "lzma-rust2"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fde178a3caf126c440fa15628147772d8ee590a39477d711353fbe2e58a73a5b"
 
 [[package]]
 name = "lzma-sys"
@@ -3124,8 +3163,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "pf-audio"
+version = "0.41.0"
+dependencies = [
+ "anyhow",
+ "opus",
+ "pf-capture",
+ "pf-frame",
+ "pf-host-config",
+ "pf-inject",
+ "pf-paths",
+ "pf-win-display",
+ "pipewire",
+ "punktfunk-core",
+ "sha2 0.11.0",
+ "tracing",
+ "wasapi",
+ "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "windows-service",
+ "winreg 0.56.0",
+]
+
+[[package]]
 name = "pf-bitstream"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "cros-codecs",
  "tracing",
@@ -3133,17 +3194,19 @@ dependencies = [
 
 [[package]]
 name = "pf-capture"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "anyhow",
  "ashpd",
  "bitflags 2.13.1",
  "libc",
+ "pf-dmabuf",
  "pf-driver-proto",
  "pf-encode-win",
  "pf-frame",
  "pf-gpu",
  "pf-host-config",
+ "pf-portal",
  "pf-win-display",
  "pf-zerocopy",
  "pipewire",
@@ -3158,11 +3221,12 @@ dependencies = [
 
 [[package]]
 name = "pf-client-core"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "anyhow",
  "ash",
  "async-channel",
+ "cfg_aliases 0.2.2",
  "ffmpeg-sys-next",
  "libc",
  "libloading 0.9.0",
@@ -3171,6 +3235,7 @@ dependencies = [
  "openh264",
  "opus",
  "pf-bitstream",
+ "pf-dmabuf",
  "pf-dxvadec",
  "pf-libva",
  "pf-update-check",
@@ -3200,7 +3265,7 @@ dependencies = [
 
 [[package]]
 name = "pf-clipboard"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -3219,7 +3284,7 @@ dependencies = [
 
 [[package]]
 name = "pf-console-ui"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "anyhow",
  "ash",
@@ -3230,7 +3295,16 @@ dependencies = [
  "serde",
  "serde_json",
  "skia-safe",
+ "taffy",
  "tracing",
+]
+
+[[package]]
+name = "pf-dmabuf"
+version = "0.41.0"
+dependencies = [
+ "libc",
+ "rustix",
 ]
 
 [[package]]
@@ -3238,21 +3312,22 @@ name = "pf-driver-proto"
 version = "0.0.1"
 dependencies = [
  "bytemuck",
+ "serde_json",
 ]
 
 [[package]]
 name = "pf-dxvadec"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
+ "bytemuck",
  "cros-codecs",
  "pf-bitstream",
- "pf-vkdecode",
  "tracing",
 ]
 
 [[package]]
 name = "pf-encode"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "anyhow",
  "ash",
@@ -3261,6 +3336,7 @@ dependencies = [
  "nvidia-video-codec-sdk",
  "openh264",
  "pf-capture",
+ "pf-encode-core",
  "pf-encode-win",
  "pf-frame",
  "pf-gpu",
@@ -3270,6 +3346,7 @@ dependencies = [
  "pf-zerocopy",
  "punktfunk-core",
  "pyrowave-sys",
+ "rustix",
  "serde",
  "serde_json",
  "tracing",
@@ -3278,14 +3355,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-encode-core"
+version = "0.41.0"
+dependencies = [
+ "anyhow",
+ "nvidia-video-codec-sdk",
+ "pf-driver-proto",
+ "pf-frame",
+ "pyrowave-sys",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "pf-encode-win"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "anyhow",
  "libvpl-sys",
  "nvidia-video-codec-sdk",
  "pf-bitstream",
- "pf-driver-proto",
+ "pf-encode-core",
  "pf-frame",
  "pyrowave-sys",
  "tracing",
@@ -3296,7 +3386,7 @@ dependencies = [
 
 [[package]]
 name = "pf-frame"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -3308,7 +3398,7 @@ dependencies = [
 
 [[package]]
 name = "pf-gpu"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "anyhow",
  "pf-host-config",
@@ -3322,7 +3412,7 @@ dependencies = [
 
 [[package]]
 name = "pf-host-config"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "pf-paths",
  "serde_json",
@@ -3330,7 +3420,7 @@ dependencies = [
 
 [[package]]
 name = "pf-inject"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -3341,9 +3431,11 @@ dependencies = [
  "pf-driver-proto",
  "pf-host-config",
  "pf-paths",
+ "pf-portal",
  "pf-win-display",
  "punktfunk-core",
  "reis",
+ "serde_json",
  "tokio",
  "tracing",
  "usbip-sim",
@@ -3359,82 +3451,93 @@ dependencies = [
 
 [[package]]
 name = "pf-libva"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "anyhow",
  "cros-codecs",
  "libloading 0.9.0",
  "pf-bitstream",
  "pf-vaapi",
+ "rustix",
  "tracing",
 ]
 
 [[package]]
 name = "pf-paths"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "tracing",
 ]
 
 [[package]]
 name = "pf-paths-win"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "tracing",
  "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
+name = "pf-portal"
+version = "0.41.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "pf-presenter"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "anyhow",
  "ash",
  "async-channel",
  "pf-client-core",
+ "pf-dmabuf",
  "pf-vkdecode",
  "punktfunk-core",
+ "rustix",
  "sdl3",
- "serde_json",
  "tracing",
  "wayland-backend",
  "wayland-client",
+ "wayland-protocols",
  "wayland-sys",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "pf-update"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
+ "pf-update-check",
  "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "pf-update-check"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
  "base64 0.23.1",
  "serde",
  "serde_json",
+ "tempfile",
  "ureq",
 ]
 
 [[package]]
 name = "pf-vaapi"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "cros-codecs",
  "pf-bitstream",
- "pf-vkdecode",
 ]
 
 [[package]]
 name = "pf-vdisplay"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -3449,6 +3552,7 @@ dependencies = [
  "pf-gpu",
  "pf-host-config",
  "pf-paths",
+ "pf-portal",
  "pf-win-display",
  "punktfunk-core",
  "serde",
@@ -3467,7 +3571,7 @@ dependencies = [
 
 [[package]]
 name = "pf-vkdecode"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "ash",
  "cros-codecs",
@@ -3478,7 +3582,7 @@ dependencies = [
 
 [[package]]
 name = "pf-win-display"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "pf-paths",
  "punktfunk-core",
@@ -3489,13 +3593,16 @@ dependencies = [
 
 [[package]]
 name = "pf-zerocopy"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "anyhow",
  "ash",
+ "bytemuck",
  "khronos-egl",
  "libc",
  "libloading 0.9.0",
+ "pf-dmabuf",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
@@ -3674,6 +3781,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
+name = "ppmd-rust"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "196a7c80b9a7652aba7cc070827516c2abe4ccdf53d128e1944003cf5726cff1"
+
+[[package]]
 name = "ppv-lite86"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3731,7 +3844,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-cli"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "pf-client-core",
  "punktfunk-core",
@@ -3741,7 +3854,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-client-android"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "android_logger",
  "anyhow",
@@ -3765,8 +3878,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "punktfunk-client-apple"
+version = "0.41.0"
+dependencies = [
+ "pf-client-core",
+ "pf-console-ui",
+ "punktfunk-ffi",
+ "serde",
+ "serde_json",
+ "skia-safe",
+ "tracing",
+]
+
+[[package]]
 name = "punktfunk-client-linux"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -3778,12 +3904,11 @@ dependencies = [
  "relm4",
  "serde_json",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
 name = "punktfunk-client-session"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "pf-client-core",
  "pf-console-ui",
@@ -3791,20 +3916,17 @@ dependencies = [
  "punktfunk-core",
  "serde_json",
  "tracing",
- "tracing-subscriber",
  "winresource",
 ]
 
 [[package]]
 name = "punktfunk-client-windows"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "pf-client-core",
  "punktfunk-core",
- "serde_json",
  "test_reactor",
  "tracing",
- "tracing-subscriber",
  "windows 0.62.2 (git+https://github.com/microsoft/windows-rs?rev=acb5a1a7441033d9312b16842af02eb0c2b403dc)",
  "windows-reactor",
  "windows-reactor-setup",
@@ -3813,18 +3935,16 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-core"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "aes-gcm",
  "aws-lc-rs",
- "cbindgen",
  "chacha20poly1305",
  "criterion",
  "fec-rs",
  "hmac 0.13.0",
  "if-addrs",
  "libc",
- "log",
  "opus",
  "pf-bitstream",
  "proptest",
@@ -3842,14 +3962,14 @@ dependencies = [
  "tokio",
  "tracing",
  "ureq",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
  "zerocopy 0.8.56",
  "zeroize",
 ]
 
 [[package]]
 name = "punktfunk-encode-worker"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "pf-encode",
  "tracing",
@@ -3857,8 +3977,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "punktfunk-ffi"
+version = "0.41.0"
+dependencies = [
+ "log",
+ "opus",
+ "pf-bitstream",
+ "punktfunk-core",
+ "quinn",
+ "rand 0.9.5",
+ "rcgen",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "punktfunk-host"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -3869,6 +4004,8 @@ dependencies = [
  "base64 0.23.1",
  "cbc",
  "futures-util",
+ "h2",
+ "hermir",
  "hex",
  "hmac 0.13.0",
  "http-body-util",
@@ -3882,6 +4019,7 @@ dependencies = [
  "mac_address",
  "mdns-sd",
  "opus",
+ "pf-audio",
  "pf-capture",
  "pf-clipboard",
  "pf-driver-proto",
@@ -3896,8 +4034,8 @@ dependencies = [
  "pf-vdisplay",
  "pf-win-display",
  "pf-zerocopy",
- "pipewire",
  "punktfunk-core",
+ "punktfunk-ffi",
  "quinn",
  "rand 0.9.5",
  "rcgen",
@@ -3931,11 +4069,12 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-probe"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "anyhow",
  "mdns-sd",
  "opus",
+ "pf-client-core",
  "punktfunk-core",
  "quinn",
  "tokio",
@@ -3945,10 +4084,12 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-setup"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "console",
  "getrandom 0.3.4",
+ "pf-host-config",
+ "pf-paths",
  "portable-pty",
  "serde",
  "serde_json",
@@ -3958,7 +4099,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-setup-win"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "pf-paths",
  "pf-paths-win",
@@ -3978,11 +4119,10 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-tray"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "anyhow",
  "ksni",
- "libc",
  "pf-paths",
  "punktfunk-core",
  "rustls",
@@ -4002,7 +4142,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "pyrowave-sys"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "bindgen",
  "cmake",
@@ -4294,6 +4434,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ref-cast"
+version = "1.0.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e440fb4e4b4147295338efb76001ab9e4efc0e5839df2c47fc5ac2381d365c3"
+dependencies = [
+ "ref-cast-impl",
+]
+
+[[package]]
+name = "ref-cast-impl"
+version = "1.0.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92ecd8964f8453721699a1ed72037b0db49ce2f5a5138486ee89bed6f67cdf3a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
+]
+
+[[package]]
 name = "regex"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4457,6 +4617,7 @@ dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -4585,6 +4746,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "schemars"
+version = "1.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "687274d293b6cdc6e73e0fee520bf2049650090d7164f87672d212a3c530cf4a"
+dependencies = [
+ "dyn-clone",
+ "ref-cast",
+ "schemars_derive",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "schemars_derive"
+version = "1.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d98c67716b46af2f0b8cf752abc930f6f9aecfbf671ecfb531db8a31dbe4e2ba"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde_derive_internals",
+ "syn 3.0.3",
+]
+
+[[package]]
 name = "scoped-tls"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4595,6 +4781,19 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "scroll-probe"
+version = "0.41.0"
+dependencies = [
+ "anyhow",
+ "pf-inject",
+ "punktfunk-core",
+ "rustix",
+ "tracing-subscriber",
+ "wayland-client",
+ "wayland-protocols",
+]
 
 [[package]]
 name = "sdl3"
@@ -4751,6 +4950,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_derive_internals"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f852137cce035d6a4df67ccce505ff6b3e9fd3a10e3e52b24dc71e650bb1a9bd"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
+]
+
+[[package]]
 name = "serde_json"
 version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4815,6 +5025,19 @@ dependencies = [
  "cfg-if",
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "sevenz-rust2"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0a4f883677093690e91fef8ae81fad8bce9e2c3a079b61054f05ce0d3ecf681e"
+dependencies = [
+ "crc32fast",
+ "js-sys",
+ "lzma-rust2 0.21.0",
+ "ppmd-rust",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -4956,6 +5179,15 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "slotmap"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bdd58c3c93c3d278ca835519292445cb4b0d4dc59ccfdf7ceadaab3f8aeb4038"
+dependencies = [
+ "version_check",
+]
 
 [[package]]
 name = "smallvec"
@@ -5105,6 +5337,17 @@ dependencies = [
  "pkg-config",
  "toml 1.1.4+spec-1.1.0",
  "version-compare",
+]
+
+[[package]]
+name = "taffy"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "639627c87f43b9181c811f40a6296409e093a17bc761214cba3c15df74f86b99"
+dependencies = [
+ "arrayvec",
+ "serde",
+ "slotmap",
 ]
 
 [[package]]
@@ -5495,6 +5738,12 @@ dependencies = [
  "tracing-core",
  "tracing-log",
 ]
+
+[[package]]
+name = "typed-path"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
 
 [[package]]
 name = "typenum"
@@ -6257,15 +6506,6 @@ dependencies = [
 
 [[package]]
 name = "windows-sys"
-version = "0.59.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
-dependencies = [
- "windows-targets",
-]
-
-[[package]]
-name = "windows-sys"
 version = "0.61.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
@@ -6420,6 +6660,17 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "wl-scanout-probe"
+version = "0.41.0"
+dependencies = [
+ "anyhow",
+ "ash",
+ "rustix",
+ "wayland-client",
+ "wayland-protocols",
+]
 
 [[package]]
 name = "writeable"
@@ -6740,10 +6991,72 @@ dependencies = [
 ]
 
 [[package]]
+name = "zip"
+version = "8.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
+dependencies = [
+ "crc32fast",
+ "flate2",
+ "indexmap",
+ "lzma-rust2 0.16.5",
+ "memchr",
+ "typed-path",
+ "zopfli",
+ "zstd",
+]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
+
+[[package]]
 name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[package]]
+name = "zopfli"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f05cd8797d63865425ff89b5c4a48804f35ba0ce8d125800027ad6017d2b5249"
+dependencies = [
+ "bumpalo",
+ "crc32fast",
+ "log",
+ "simd-adler32",
+]
+
+[[package]]
+name = "zstd"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "7.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64d80649ab6db9d9f6f9c80a40becd948eda4714a0a5ac8c4d157a32231c7882"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.1.0+zstd.1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ef0a8027ec3ee71300ab3bcbcd0393f434aa72b91ca6d635a39941deae8eea0"
+dependencies = [
+ "cc",
+ "pkg-config",
+]
 
 [[package]]
 name = "zune-core"

@@ -427,6 +427,23 @@ fn restore_carries_the_pre_install_task_states() {
     )));
 }
 
+// The re-created runner task comes back enabled: an operator's off is put back, not started.
+#[test]
+fn an_upgrade_keeps_a_switched_off_runner_off() {
+    let facts = WinFacts {
+        scripting_task: TaskState::Disabled,
+        ..upgrade()
+    };
+    let text = render(
+        &facts,
+        &WinChoices::derive(&facts, Artifact::Host),
+        Artifact::Host,
+        false,
+    );
+    assert!(text.contains("schtasks /Change /TN PunktfunkScripting /DISABLE"));
+    assert!(!text.contains("schtasks /Run /TN PunktfunkScripting"));
+}
+
 // Unchecking a row on upgrade deletes it. Inno's unchecked box is a no-op; do not copy that.
 #[test]
 fn deselecting_tray_on_an_upgrade_deletes_the_run_key() {

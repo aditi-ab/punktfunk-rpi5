@@ -193,6 +193,16 @@ installed_version() {
 }
 merged() { [ -f "$MARKER" ]; }
 
+# True when host.env turns Attach mode on, by the host's own grammar: PUNKTFUNK_GAMESCOPE_ATTACH set
+# to anything but 0/false/off/no, or PUNKTFUNK_GAMESCOPE_NODE set at all. Last line wins.
+host_env_pins_attach() {
+  local attach node
+  attach="$(sed -n 's/^[[:space:]]*PUNKTFUNK_GAMESCOPE_ATTACH=[[:space:]]*//p' "$1" | tail -n1 \
+            | tr -d "\"'" | tr '[:upper:]' '[:lower:]')"
+  node="$(sed -n 's/^[[:space:]]*PUNKTFUNK_GAMESCOPE_NODE=[[:space:]]*//p' "$1" | tail -n1 | tr -d "\"'")"
+  case "$attach" in ''|0|false|off|no) [ -n "$node" ] ;; *) return 0 ;; esac
+}
+
 post_merge() {
   if ! merged; then
     echo "!! image installed but NOT merged — 'systemd-sysext status' / 'journalctl -u systemd-sysext'" >&2
@@ -242,6 +252,15 @@ post_merge() {
     echo "!! $_pf_user is not in the 'punktfunk' group — the managed gamescope takeover cannot stop"
     echo "!! the display manager, and the virtual Steam Deck pad cannot attach. To opt in:"
     echo "!!     sudo usermod -aG punktfunk $_pf_user"
+  fi
+  # A host.env that turns Attach mode on serves every client a mirror of this box's screen at its
+  # own resolution. The file outlives the template it was copied from, so check it on every merge.
+  local _pf_env
+  _pf_env="$(getent passwd "${_pf_user:-}" 2>/dev/null | cut -d: -f6)/.config/punktfunk/host.env"
+  if [ -n "$_pf_user" ] && [ -f "$_pf_env" ] && host_env_pins_attach "$_pf_env"; then
+    echo "!! $_pf_env turns Attach mode on: every client gets a mirror of this box's screen at its"
+    echo "!! own resolution instead of a display of its own. Delete the PUNKTFUNK_GAMESCOPE_ATTACH"
+    echo "!! (or _NODE) line, then: systemctl --user restart punktfunk-host"
   fi
   modprobe vhci-hcd 2>/dev/null || :
   # Re-fire the vhci rule against the (possibly already-present) controller so attach/detach pick up
@@ -332,10 +351,10 @@ cmd_install() {
   cat <<'EOF'
 
 First-run (once):
-  ujust add-user-to-input-group        # virtual gamepads; then log out + back in
-  mkdir -p ~/.config/punktfunk
-  cp /usr/share/punktfunk/host.env.bazzite ~/.config/punktfunk/host.env
-  systemctl --user daemon-reload && systemctl --user enable --now punktfunk-host
+  ujust add-user-to-input-group add    # virtual gamepads; then log out + back in
+  systemctl --user daemon-reload && systemctl --user enable --now punktfunk-host punktfunk-web
+Settings: the console, Host -> Settings. A line in ~/.config/punktfunk/host.env locks that
+          setting there until you delete it (annotated template: /usr/share/punktfunk/host.env.bazzite).
 Updates:  sudo punktfunk-sysext update
 EOF
 }

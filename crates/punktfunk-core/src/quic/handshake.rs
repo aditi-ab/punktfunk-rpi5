@@ -162,22 +162,90 @@ pub const EXT_TAG_ABR: u16 = 3;
 /// Core sets it for every embedder that links the controller reading it, not the embedder.
 pub const EXT_ABR_ACK_REASON: u8 = 0x01;
 
-/// The extension entries a client appends to its `Start`, label before features.
+/// Extension tag `4` on `Start`: the settings preset this session was dialled with, as
+/// [`SessionPreset::encode`] writes it. The id is the client's own and stable across a rename;
+/// the name is for people. The host shows it and hands it to hooks and plugins; it changes
+/// nothing about the stream. Absent when the client streams with its plain settings.
+pub const EXT_TAG_PRESET: u16 = 4;
+
+/// Longest [`SessionPreset::id`], printable ASCII.
+pub const PRESET_ID_MAX: usize = 32;
+/// Longest [`SessionPreset::name`] in UTF-8 bytes.
+pub const PRESET_NAME_MAX: usize = 64;
+
+/// The preset a session was dialled with ([`EXT_TAG_PRESET`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionPreset {
+    pub id: String,
+    pub name: String,
+}
+
+impl SessionPreset {
+    /// Bounded and stripped: id to printable ASCII, name to [`client_label`]'s rules, each
+    /// truncated. `None` when the id is empty after that, since the id is what a host keys on.
+    pub fn new(id: &str, name: &str) -> Option<SessionPreset> {
+        let id: String = id
+            .trim()
+            .chars()
+            .filter(|c| c.is_ascii_graphic())
+            .take(PRESET_ID_MAX)
+            .collect();
+        let mut name: String = name.trim().chars().filter(|c| !c.is_control()).collect();
+        while name.len() > PRESET_NAME_MAX {
+            name.pop();
+        }
+        (!id.is_empty()).then_some(SessionPreset { id, name })
+    }
+
+    /// `id_len u8, id, name_len u8, name`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + self.id.len() + self.name.len());
+        out.push(self.id.len() as u8);
+        out.extend_from_slice(self.id.as_bytes());
+        out.push(self.name.len() as u8);
+        out.extend_from_slice(self.name.as_bytes());
+        out
+    }
+
+    /// The preset in a decoded block, re-bounded as [`new`](Self::new) does. A malformed
+    /// value is no preset, never a failed handshake: the tag informs, it does not gate.
+    pub fn from_ext(entries: &[(u16, &[u8])]) -> Option<SessionPreset> {
+        let (_, v) = entries.iter().find(|(tag, _)| *tag == EXT_TAG_PRESET)?;
+        let (&id_len, rest) = v.split_first()?;
+        let id = rest.get(..id_len as usize)?;
+        let (&name_len, rest) = rest.get(id_len as usize..)?.split_first()?;
+        let name = rest.get(..name_len as usize)?;
+        SessionPreset::new(
+            std::str::from_utf8(id).ok()?,
+            &String::from_utf8_lossy(name),
+        )
+    }
+}
+
+/// The extension entries a client appends to its `Start`: label, features, then the preset.
 ///
 /// Empty toward a host without [`HOST_CAP2_EXT`](super::HOST_CAP2_EXT): that host reads
 /// `Start`'s six frozen bytes and nothing else, so it never learns the ABR features and
 /// never lengthens an ack — today's behaviour, reached by never being told. An empty label
-/// says nothing rather than saying nothing at length.
+/// or preset says nothing rather than saying nothing at length.
 #[cfg(any(feature = "quic", test))]
-pub(crate) fn start_ext<'a>(host_caps2: u8, label: &'a str, abr: &'a [u8]) -> Vec<(u16, &'a [u8])> {
+pub(crate) fn start_ext<'a>(
+    host_caps2: u8,
+    label: &'a str,
+    abr: &'a [u8],
+    preset: &'a [u8],
+) -> Vec<(u16, &'a [u8])> {
     if host_caps2 & super::HOST_CAP2_EXT == 0 {
         return Vec::new();
     }
-    let mut out: Vec<(u16, &[u8])> = Vec::with_capacity(2);
+    let mut out: Vec<(u16, &[u8])> = Vec::with_capacity(3);
     if !label.is_empty() {
         out.push((EXT_TAG_CLIENT, label.as_bytes()));
     }
     out.push((EXT_TAG_ABR, abr));
+    if !preset.is_empty() {
+        out.push((EXT_TAG_PRESET, preset));
+    }
     out
 }
 
@@ -925,6 +993,46 @@ mod tests {
     use crate::config::{CompositorPref, FecConfig, FecScheme, GamepadPref, Mode, Role};
     use crate::quic::*;
 
+    /// A legacy 26-byte Hello at this mode; every optional field at its default.
+    fn hello(width: u32, height: u32, refresh_hz: u32) -> Hello {
+        Hello {
+            abi_version: 2,
+            mode: Mode {
+                width,
+                height,
+                refresh_hz,
+            },
+            compositor: CompositorPref::Auto,
+            gamepad: GamepadPref::Auto,
+            bitrate_kbps: 0,
+            name: None,
+            launch: None,
+            video_caps: 0,
+            audio_channels: 2,
+            video_codecs: 0,
+            preferred_codec: 0,
+            display_hdr: None,
+            client_caps: 0,
+            max_shard_payload: 0,
+            audio_rate_hz: SAMPLE_RATE_HZ,
+            audio_bits: BITS_16,
+            audio_layout: 0,
+            video_fit: 0,
+        }
+    }
+
+    /// An 800-nit display volume (G, B, R primaries, D65) for the HDR tail.
+    fn display_volume() -> HdrMeta {
+        HdrMeta {
+            display_primaries: [[13250, 34500], [7500, 3000], [34000, 16000]],
+            white_point: [15635, 16450],
+            max_display_mastering_luminance: 8_000_000,
+            min_display_mastering_luminance: 500,
+            max_cll: 0,
+            max_fall: 400,
+        }
+    }
+
     #[test]
     fn welcome_roundtrip() {
         let w = Welcome {
@@ -1275,28 +1383,9 @@ mod tests {
 
         // Extra trailing codec bytes are skipped by a build that ignores them.
         let h = Hello {
-            abi_version: 2,
-            mode: Mode {
-                width: 1280,
-                height: 720,
-                refresh_hz: 60,
-            },
-            compositor: CompositorPref::Auto,
-            gamepad: GamepadPref::Auto,
-            bitrate_kbps: 0,
-            name: None,
-            launch: None,
-            video_caps: 0,
-            audio_channels: 2,
             video_codecs: CODEC_H264 | CODEC_HEVC,
             preferred_codec: CODEC_H264,
-            display_hdr: None,
-            client_caps: 0,
-            max_shard_payload: 0,
-            audio_rate_hz: SAMPLE_RATE_HZ,
-            audio_bits: BITS_16,
-            audio_layout: 0,
-            video_fit: 0,
+            ..hello(1280, 720, 60)
         };
         let enc = h.encode();
         let dec = Hello::decode(&enc).unwrap();
@@ -1367,27 +1456,15 @@ mod tests {
     fn hello_start_roundtrip() {
         let h = Hello {
             abi_version: 1,
-            mode: Mode {
-                width: 1280,
-                height: 720,
-                refresh_hz: 120,
-            },
             compositor: CompositorPref::Kwin,
             gamepad: GamepadPref::DualSense,
             bitrate_kbps: 25_000,
             name: Some("Test Device".into()),
             launch: Some("steam:570".into()),
             video_caps: VIDEO_CAP_10BIT,
-            audio_channels: 2,
             video_codecs: CODEC_H264 | CODEC_HEVC,
             preferred_codec: CODEC_HEVC,
-            display_hdr: None,
-            client_caps: 0,
-            max_shard_payload: 0,
-            audio_rate_hz: SAMPLE_RATE_HZ,
-            audio_bits: BITS_16,
-            audio_layout: 0,
-            video_fit: 0,
+            ..hello(1280, 720, 120)
         };
         assert_eq!(Hello::decode(&h.encode()).unwrap(), h);
         let s = Start {
@@ -1400,28 +1477,10 @@ mod tests {
     fn hello_welcome_compositor_back_compat() {
         // Truncation both ways: missing trailing bytes → Auto; extra bytes ignored.
         let h = Hello {
-            abi_version: 2,
-            mode: Mode {
-                width: 1920,
-                height: 1080,
-                refresh_hz: 60,
-            },
             compositor: CompositorPref::Mutter,
             gamepad: GamepadPref::DualSense,
             bitrate_kbps: 80_000,
-            name: None,
-            launch: None,
-            video_caps: 0,
-            audio_channels: 2,
-            video_codecs: 0,
-            preferred_codec: 0,
-            display_hdr: None,
-            client_caps: 0,
-            max_shard_payload: 0,
-            audio_rate_hz: SAMPLE_RATE_HZ,
-            audio_bits: BITS_16,
-            audio_layout: 0,
-            video_fit: 0,
+            ..hello(1920, 1080, 60)
         };
         let enc = h.encode();
         assert_eq!(enc.len(), 26);
@@ -1532,28 +1591,8 @@ mod tests {
     #[test]
     fn hello_name_roundtrip_and_back_compat() {
         let base = Hello {
-            abi_version: 2,
-            mode: Mode {
-                width: 1280,
-                height: 720,
-                refresh_hz: 60,
-            },
-            compositor: CompositorPref::Auto,
-            gamepad: GamepadPref::Auto,
-            bitrate_kbps: 0,
             name: Some("Enrico's MacBook".into()),
-            launch: None,
-            video_caps: 0,
-            audio_channels: 2,
-            video_codecs: 0,
-            preferred_codec: 0,
-            display_hdr: None,
-            client_caps: 0,
-            max_shard_payload: 0,
-            audio_rate_hz: SAMPLE_RATE_HZ,
-            audio_bits: BITS_16,
-            audio_layout: 0,
-            video_fit: 0,
+            ..hello(1280, 720, 60)
         };
         let enc = base.encode();
         assert_eq!(
@@ -1587,30 +1626,7 @@ mod tests {
 
     #[test]
     fn hello_launch_roundtrip_and_back_compat() {
-        let base = Hello {
-            abi_version: 2,
-            mode: Mode {
-                width: 1920,
-                height: 1080,
-                refresh_hz: 60,
-            },
-            compositor: CompositorPref::Auto,
-            gamepad: GamepadPref::Auto,
-            bitrate_kbps: 0,
-            name: None,
-            launch: None,
-            video_caps: 0,
-            audio_channels: 2,
-            video_codecs: 0,
-            preferred_codec: 0,
-            display_hdr: None,
-            client_caps: 0,
-            max_shard_payload: 0,
-            audio_rate_hz: SAMPLE_RATE_HZ,
-            audio_bits: BITS_16,
-            audio_layout: 0,
-            video_fit: 0,
-        };
+        let base = hello(1920, 1080, 60);
         // Launch alone: a zero-length name placeholder keeps the offset deterministic.
         let with_launch = Hello {
             launch: Some("steam:570".into()),
@@ -1652,37 +1668,10 @@ mod tests {
     #[test]
     fn hello_display_hdr_roundtrip_and_back_compat() {
         let base = Hello {
-            abi_version: 2,
-            mode: Mode {
-                width: 3840,
-                height: 2160,
-                refresh_hz: 120,
-            },
-            compositor: CompositorPref::Auto,
-            gamepad: GamepadPref::Auto,
-            bitrate_kbps: 0,
-            name: None,
-            launch: None,
             video_caps: VIDEO_CAP_10BIT | VIDEO_CAP_HDR,
-            audio_channels: 2,
-            video_codecs: 0,
-            preferred_codec: 0,
-            display_hdr: None,
-            client_caps: 0,
-            max_shard_payload: 0,
-            audio_rate_hz: SAMPLE_RATE_HZ,
-            audio_bits: BITS_16,
-            audio_layout: 0,
-            video_fit: 0,
+            ..hello(3840, 2160, 120)
         };
-        let vol = HdrMeta {
-            display_primaries: [[13250, 34500], [7500, 3000], [34000, 16000]], // G, B, R
-            white_point: [15635, 16450],                                       // D65
-            max_display_mastering_luminance: 8_000_000,                        // 800 nits
-            min_display_mastering_luminance: 500,                              // 0.05 nits
-            max_cll: 0,
-            max_fall: 400,
-        };
+        let vol = display_volume();
         let with_hdr = Hello {
             display_hdr: Some(vol),
             ..base.clone()
@@ -1720,27 +1709,7 @@ mod tests {
         for abi in [1u32, 2, 16, 0x10, 0x0113, 0x1410] {
             let h = Hello {
                 abi_version: abi,
-                mode: Mode {
-                    width: 1280,
-                    height: 720,
-                    refresh_hz: 60,
-                },
-                compositor: CompositorPref::Auto,
-                gamepad: GamepadPref::Auto,
-                bitrate_kbps: 0,
-                name: None,
-                launch: None,
-                video_caps: 0,
-                audio_channels: 2,
-                video_codecs: 0,
-                preferred_codec: 0,
-                display_hdr: None,
-                client_caps: 0,
-                max_shard_payload: 0,
-                audio_rate_hz: SAMPLE_RATE_HZ,
-                audio_bits: BITS_16,
-                audio_layout: 0,
-                video_fit: 0,
+                ..hello(1280, 720, 60)
             }
             .encode();
             assert!(PairRequest::decode(&h).is_err(), "abi {abi} parsed as pair");
@@ -1757,38 +1726,8 @@ mod tests {
     }
     #[test]
     fn hello_client_caps_roundtrip_and_back_compat() {
-        let base = Hello {
-            abi_version: 2,
-            mode: Mode {
-                width: 1920,
-                height: 1080,
-                refresh_hz: 60,
-            },
-            compositor: CompositorPref::Auto,
-            gamepad: GamepadPref::Auto,
-            bitrate_kbps: 0,
-            name: None,
-            launch: None,
-            video_caps: 0,
-            audio_channels: 2,
-            video_codecs: 0,
-            preferred_codec: 0,
-            display_hdr: None,
-            client_caps: 0,
-            max_shard_payload: 0,
-            audio_rate_hz: SAMPLE_RATE_HZ,
-            audio_bits: BITS_16,
-            audio_layout: 0,
-            video_fit: 0,
-        };
-        let vol = HdrMeta {
-            display_primaries: [[13250, 34500], [7500, 3000], [34000, 16000]],
-            white_point: [15635, 16450],
-            max_display_mastering_luminance: 8_000_000,
-            min_display_mastering_luminance: 500,
-            max_cll: 0,
-            max_fall: 400,
-        };
+        let base = hello(1920, 1080, 60);
+        let vol = display_volume();
         // Caps without HDR: remaining < HDR_META_BODY_LEN, so not a truncated HdrMeta.
         let caps_only = Hello {
             client_caps: CLIENT_CAP_CURSOR,
@@ -1826,30 +1765,7 @@ mod tests {
     /// `max_shard_payload` forces earlier placeholders, composes with HDR, degrades to 0.
     #[test]
     fn hello_max_shard_payload_roundtrip_and_back_compat() {
-        let base = Hello {
-            abi_version: 2,
-            mode: Mode {
-                width: 1920,
-                height: 1080,
-                refresh_hz: 60,
-            },
-            compositor: CompositorPref::Auto,
-            gamepad: GamepadPref::Auto,
-            bitrate_kbps: 0,
-            name: None,
-            launch: None,
-            video_caps: 0,
-            audio_channels: 2,
-            video_codecs: 0,
-            preferred_codec: 0,
-            display_hdr: None,
-            client_caps: 0,
-            max_shard_payload: 0,
-            audio_rate_hz: SAMPLE_RATE_HZ,
-            audio_bits: BITS_16,
-            audio_layout: 0,
-            video_fit: 0,
-        };
+        let base = hello(1920, 1080, 60);
         // Advertisement alone: earlier trailing fields are placeholders so the 2 LE bytes land.
         let adv = Hello {
             max_shard_payload: crate::config::max_shard_payload() as u16,
@@ -1857,14 +1773,7 @@ mod tests {
         };
         assert_eq!(Hello::decode(&adv.encode()).unwrap(), adv);
         // Remaining-length disambiguation must still find caps and payload after HDR.
-        let vol = HdrMeta {
-            display_primaries: [[13250, 34500], [7500, 3000], [34000, 16000]],
-            white_point: [15635, 16450],
-            max_display_mastering_luminance: 8_000_000,
-            min_display_mastering_luminance: 500,
-            max_cll: 0,
-            max_fall: 400,
-        };
+        let vol = display_volume();
         let full = Hello {
             display_hdr: Some(vol),
             client_caps: CLIENT_CAP_CURSOR,
@@ -2184,30 +2093,7 @@ mod tests {
     /// remaining-length). That caps the post-HDR tail at 27 bytes.
     #[test]
     fn hello_video_fit_roundtrip_and_back_compat() {
-        let base = Hello {
-            abi_version: 2,
-            mode: Mode {
-                width: 3216,
-                height: 1440,
-                refresh_hz: 60,
-            },
-            compositor: CompositorPref::Auto,
-            gamepad: GamepadPref::Auto,
-            bitrate_kbps: 0,
-            name: None,
-            launch: None,
-            video_caps: 0,
-            audio_channels: 2,
-            video_codecs: 0,
-            preferred_codec: 0,
-            display_hdr: None,
-            client_caps: 0,
-            max_shard_payload: 0,
-            audio_rate_hz: SAMPLE_RATE_HZ,
-            audio_bits: BITS_16,
-            audio_layout: 0,
-            video_fit: 0,
-        };
+        let base = hello(3216, 1440, 60);
         // Fit is absence: the legacy 26 bytes.
         assert_eq!(base.encode().len(), 26);
 
@@ -2235,14 +2121,7 @@ mod tests {
         // With the HDR block and every other tail field the post-HDR tail stays under
         // HDR_META_BODY_LEN, so a Hello without HDR is never read as one with.
         let full = Hello {
-            display_hdr: Some(HdrMeta {
-                display_primaries: [[13250, 34500], [7500, 3000], [34000, 16000]],
-                white_point: [15635, 16450],
-                max_display_mastering_luminance: 8_000_000,
-                min_display_mastering_luminance: 500,
-                max_cll: 0,
-                max_fall: 400,
-            }),
+            display_hdr: Some(display_volume()),
             client_caps: CLIENT_CAP_AUDIO_HIRES,
             max_shard_payload: 8908,
             audio_rate_hz: 96_000,
@@ -2260,30 +2139,7 @@ mod tests {
 
     #[test]
     fn hello_hires_audio_request_roundtrip_and_back_compat() {
-        let base = Hello {
-            abi_version: 2,
-            mode: Mode {
-                width: 1920,
-                height: 1080,
-                refresh_hz: 60,
-            },
-            compositor: CompositorPref::Auto,
-            gamepad: GamepadPref::Auto,
-            bitrate_kbps: 0,
-            name: None,
-            launch: None,
-            video_caps: 0,
-            audio_channels: 2,
-            video_codecs: 0,
-            preferred_codec: 0,
-            display_hdr: None,
-            client_caps: 0,
-            max_shard_payload: 0,
-            audio_rate_hz: SAMPLE_RATE_HZ,
-            audio_bits: BITS_16,
-            audio_layout: 0,
-            video_fit: 0,
-        };
+        let base = hello(1920, 1080, 60);
         // Legacy request is still 26 bytes.
         assert_eq!(base.encode().len(), 26);
         assert_eq!(Hello::decode(&base.encode()).unwrap(), base);
@@ -2360,14 +2216,7 @@ mod tests {
 
         // Post-HDR tail must stay under HDR_META_BODY_LEN (8 spent, 19 free) or a
         // Hello without HDR is read as one with.
-        let vol = HdrMeta {
-            display_primaries: [[13250, 34500], [7500, 3000], [34000, 16000]],
-            white_point: [15635, 16450],
-            max_display_mastering_luminance: 8_000_000,
-            min_display_mastering_luminance: 500,
-            max_cll: 0,
-            max_fall: 400,
-        };
+        let vol = display_volume();
         let full = Hello {
             display_hdr: Some(vol),
             client_caps: CLIENT_CAP_AUDIO_HIRES | CLIENT_CAP_CURSOR,
@@ -2566,16 +2415,42 @@ mod tests {
     #[test]
     fn an_old_host_is_told_nothing_and_answers_as_it_always_did() {
         let abr = [EXT_ABR_ACK_REASON];
-        assert!(start_ext(0, "android 0.38.0", &abr).is_empty());
-        assert!(start_ext(HOST_CAP2_REPEAT_MARK | HOST_CAP2_TOUCH, "x", &abr).is_empty());
+        assert!(start_ext(0, "android 0.38.0", &abr, &[]).is_empty());
+        assert!(start_ext(HOST_CAP2_REPEAT_MARK | HOST_CAP2_TOUCH, "x", &abr, &[]).is_empty());
         // A host that does parse it hears both, the log label first.
-        let ext = start_ext(HOST_CAP2_EXT, "android 0.38.0", &abr);
+        let ext = start_ext(HOST_CAP2_EXT, "android 0.38.0", &abr, &[]);
         assert_eq!(ext.len(), 2);
         assert_eq!(ext[0].0, EXT_TAG_CLIENT);
         assert_eq!(ext_abr_features(&ext), EXT_ABR_ACK_REASON);
         // No label is still a tag: the feature byte does not ride on a log line.
-        let ext = start_ext(HOST_CAP2_EXT, "", &abr);
+        let ext = start_ext(HOST_CAP2_EXT, "", &abr, &[]);
         assert_eq!(ext, vec![(EXT_TAG_ABR, &abr[..])]);
+    }
+
+    #[test]
+    fn a_preset_rides_start_and_reads_back_bounded() {
+        let preset = SessionPreset::new("3f9a0c11e2b4", "Docked").unwrap();
+        let bytes = preset.encode();
+        let abr = [EXT_ABR_ACK_REASON];
+        let block = encode_ext_block(&start_ext(HOST_CAP2_EXT, "deck", &abr, &bytes)).unwrap();
+        let got = decode_ext_block(&block).unwrap();
+        assert_eq!(SessionPreset::from_ext(&got), Some(preset));
+        // Nothing set, nothing sent; an old host hears none of it.
+        assert_eq!(
+            SessionPreset::from_ext(&start_ext(HOST_CAP2_EXT, "", &abr, &[])),
+            None
+        );
+        assert!(start_ext(0, "", &abr, &bytes).is_empty());
+        // A hostile value is bounded, never a failed handshake.
+        let long = SessionPreset::new(&"a".repeat(99), &"\u{7}n".repeat(99)).unwrap();
+        assert_eq!(long.id.len(), PRESET_ID_MAX);
+        assert!(long.name.len() <= PRESET_NAME_MAX && !long.name.contains('\u{7}'));
+        assert_eq!(
+            SessionPreset::from_ext(&[(EXT_TAG_PRESET, &[9, b'x'][..])]),
+            None
+        );
+        assert_eq!(SessionPreset::from_ext(&[(EXT_TAG_PRESET, &[][..])]), None);
+        assert_eq!(SessionPreset::new(" ", "Docked"), None);
     }
 
     /// New client → new host: the tag is one byte of features, and a bit this

@@ -280,6 +280,13 @@ impl PadInfo {
             GamepadPref::SteamController2 => "Steam Controller 2",
             GamepadPref::SteamController2Puck => "Steam Controller 2 Puck",
             GamepadPref::SwitchPro => "Switch Pro",
+            GamepadPref::EightBitDoUltimate2 => "8BitDo Ultimate 2",
+            GamepadPref::EightBitDoPro2 => "8BitDo Pro 2",
+            GamepadPref::EightBitDoPro3 => "8BitDo Pro 3",
+            GamepadPref::HoripadSteam => "HORIPAD for Steam",
+            GamepadPref::JoyConPair => "Joy-Con pair",
+            GamepadPref::Switch2Pro => "Switch 2 Pro",
+            GamepadPref::Switch2GameCube => "GameCube (Switch 2)",
             _ => "",
         }
     }

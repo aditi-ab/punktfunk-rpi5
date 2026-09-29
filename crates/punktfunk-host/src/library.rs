@@ -8,6 +8,7 @@
 //! A plugin publishes a validated [`LaunchSpec`]; the host builds the command
 //! (`launch.rs`, design D1). Source toggles live in `scanners.rs`. Artwork rides on
 //! the entries; [`art`] proxies local files so a client never sees an unreachable path.
+//! Art & Metadata sources fill what an entry lacks at read time (`metadata.rs`).
 //!
 //! This module is read-mostly metadata. Launching a chosen title is `launch.rs`.
 
@@ -24,6 +25,7 @@ mod custom;
 mod detect;
 mod hidden;
 mod launch;
+mod metadata;
 mod scanners;
 mod stats;
 
@@ -32,6 +34,7 @@ pub use custom::*;
 pub use detect::*;
 pub use hidden::*;
 pub use launch::*;
+pub use metadata::*;
 pub use scanners::*;
 pub use stats::*;
 
@@ -156,11 +159,7 @@ const ICON_TOKEN_MAX: usize = 32;
 /// The alphabet makes `../`, a URL, a `data:` payload and a NUL unrepresentable:
 /// plugins control the field and clients interpolate it into names and paths.
 pub fn is_icon_token(t: &str) -> bool {
-    !t.is_empty()
-        && t.len() <= ICON_TOKEN_MAX
-        && t.starts_with(|c: char| c.is_ascii_lowercase())
-        && t.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    crate::slug::is_kebab(t, ICON_TOKEN_MAX, true)
 }
 
 /// Reject a malformed [`GameEntry::icon`] token. `Ok(())` when absent.
@@ -268,6 +267,14 @@ pub struct GameEntry {
     /// time from `library-stats.json`, never stored on the entry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stats: Option<GameStats>,
+    /// Catalog ids a metadata source matches on (`steam`, `gog`, `libretro`, `sgdb` → value),
+    /// set by the plugin that lists the entry. Not sent to paired clients.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub ids: BTreeMap<String, String>,
+    /// Where each borrowed value came from: art slot or meta field → source id, or `pick`
+    /// ([`PICK`]). Values the entry carried itself are absent. Not sent to paired clients.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub filled: BTreeMap<String, String>,
     #[serde(flatten)]
     pub meta: GameMeta,
 }
@@ -301,6 +308,18 @@ pub enum ArtKind {
 }
 
 impl ArtKind {
+    pub const ALL: [Self; 4] = [Self::Portrait, Self::Hero, Self::Logo, Self::Header];
+
+    /// The field name, as `parse` reads it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Portrait => "portrait",
+            Self::Hero => "hero",
+            Self::Logo => "logo",
+            Self::Header => "header",
+        }
+    }
+
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "portrait" => Some(Self::Portrait),
@@ -322,9 +341,11 @@ impl ArtKind {
 /// carry no source and always contribute.
 pub fn all_games() -> Vec<GameEntry> {
     let hidden = hidden_ids();
-    let mut games = collect_games();
-    games.retain(|g| !hidden.contains(&g.id));
-    games
+    sorted_games()
+        .iter()
+        .filter(|g| !hidden.contains(&g.id))
+        .cloned()
+        .collect()
 }
 
 /// The library including hidden titles, each flagged.
@@ -334,21 +355,79 @@ pub fn all_games() -> Vec<GameEntry> {
 /// the GameStream app list, and launch resolution use [`all_games`].
 pub fn all_games_for_operator() -> Vec<OperatorGameEntry> {
     let hidden = hidden_ids();
-    collect_games()
-        .into_iter()
+    sorted_games()
+        .iter()
         .map(|entry| OperatorGameEntry {
             hidden: hidden.contains(&entry.id),
-            entry,
+            entry: entry.clone(),
         })
         .collect()
 }
 
-/// Merge every enabled source and the custom entries, sorted by title, each
-/// carrying its play stats. Split out so the two public views differ only in
-/// how they apply the hidden set.
+/// A title's place in the list: folded title, then id so equal titles keep one order.
+/// The paged route cuts its pages by this key, so the list has to be sorted by it.
+pub(crate) fn sort_key(g: &GameEntry) -> (String, String) {
+    (g.title.to_lowercase(), g.id.clone())
+}
+
+/// Counts this process's writes to the library files. Two saves inside one mtime tick can
+/// leave the same stamp on different bytes; the count still moves.
+static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What a built list was read from: the config dir, this process's write count, and the
+/// mtime and length of every library file, which is what moves when someone else edits one.
+type Inputs = (
+    PathBuf,
+    u64,
+    Vec<(std::ffi::OsString, Option<SystemTime>, u64)>,
+);
+
+/// Every file the list is built from is named `library*` in the config dir, or sits in
+/// its `library-metadata` folder. A file outside that rule would leave a stale list.
+fn inputs() -> Inputs {
+    let dir = pf_paths::config_dir();
+    let mut stamps = Vec::new();
+    for (folder, prefix) in [(dir.clone(), "library"), (dir.join("library-metadata"), "")] {
+        for e in std::fs::read_dir(folder).into_iter().flatten().flatten() {
+            let name = e.file_name();
+            if !name.to_string_lossy().starts_with(prefix) {
+                continue;
+            }
+            if let Some(md) = e.metadata().ok().filter(|md| md.is_file()) {
+                stamps.push((name, md.modified().ok(), md.len()));
+            }
+        }
+    }
+    stamps.sort();
+    let writes = WRITES.load(std::sync::atomic::Ordering::Acquire);
+    (dir, writes, stamps)
+}
+
+/// The whole library, hidden titles included, sorted by [`sort_key`]. Built once and kept
+/// until an input moves: a page of a large library must not cost the whole of it.
+pub(crate) fn sorted_games() -> std::sync::Arc<Vec<GameEntry>> {
+    type Built = std::sync::Mutex<Option<(Inputs, std::sync::Arc<Vec<GameEntry>>)>>;
+    static BUILT: Built = std::sync::Mutex::new(None);
+    // Read before the build: a write that lands in between leaves this key behind the list,
+    // which costs the next caller a rebuild and never serves an old list.
+    let key = inputs();
+    if let Some((k, games)) = BUILT.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if *k == key {
+            return games.clone();
+        }
+    }
+    let games = std::sync::Arc::new(collect_games());
+    *BUILT.lock().unwrap_or_else(|e| e.into_inner()) = Some((key, games.clone()));
+    games
+}
+
+/// Merge every enabled source and the custom entries, sorted by [`sort_key`], each
+/// carrying its play stats and what Art & Metadata sources fill. Split out so the
+/// two public views differ only in how they apply the hidden set.
 fn collect_games() -> Vec<GameEntry> {
     let off = disabled_scanners();
     let stats = game_stats();
+    let fills = Fills::load();
     // Manual entries always contribute; a provider's follow the operator's source toggle.
     let mut games: Vec<GameEntry> = load_custom()
         .into_iter()
@@ -357,9 +436,29 @@ fn collect_games() -> Vec<GameEntry> {
         .collect();
     for g in &mut games {
         g.stats = stats.get(&g.id).copied();
+        fills.apply(g);
     }
-    games.sort_by_key(|g| g.title.to_lowercase());
+    games.sort_by_cached_key(sort_key);
     games
+}
+
+/// Absent or malformed → the default. A bad file must cost its own contents, not the library.
+fn read_json_or_default<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
+            tracing::warn!(file = %path.display(), error = %e, "library file malformed — ignored");
+            T::default()
+        }),
+        Err(_) => T::default(),
+    }
+}
+
+/// Owner-only ([`pf_paths::replace_secret_file`]), like hooks.json: `library.json` carries the
+/// `prep`/`launch` commands the host runs.
+fn save_json(path: &Path, json: &str) -> Result<()> {
+    let saved = pf_paths::replace_secret_file(path, json.as_bytes());
+    WRITES.fetch_add(1, std::sync::atomic::Ordering::Release);
+    saved.with_context(|| format!("replace {}", path.display()))
 }
 
 #[cfg(test)]
@@ -390,6 +489,8 @@ mod tests {
             detect: DetectSpec::default(),
             on_window: OnWindow::default(),
             stats: None,
+            ids: BTreeMap::new(),
+            filled: BTreeMap::new(),
             meta: GameMeta::default(),
         }
     }

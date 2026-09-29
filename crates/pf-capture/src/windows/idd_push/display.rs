@@ -124,8 +124,8 @@ impl IddPushCapturer {
                             pyrowave = self.pyrowave,
                             "IDD push: could not pin the display to the NEGOTIATED depth — following what \
                              it actually composes instead (a physical display forcing HDR, or a driver that \
-                             refuses the flip). The stream's depth will not match the negotiation; the \
-                             encoder's caps cross-check reports the truth to the client"
+                             refuses the flip). The stream's depth will not match the negotiation, \
+                             and nothing tells the client"
                         );
                     }
                 } else {
@@ -166,20 +166,6 @@ impl IddPushCapturer {
         self.width = now.width;
         self.height = now.height;
         self.refresh_sdr_white_scale();
-        self.refresh_cursor_origin();
-    }
-
-    /// Re-read where this monitor sits on the desktop, from the display actor's snapshot (no
-    /// CCD call on this thread), and re-stamp the cursor section — a mode change or an HDR
-    /// re-arrival moves it. `None` keeps the last value, as the poller does.
-    pub(super) fn refresh_cursor_origin(&mut self) {
-        let Some((x, y, _, _)) = pf_win_display::display_events::snapshot().source_rect(self.ccd)
-        else {
-            return;
-        };
-        if let Some(cs) = self.cursor_shared.as_mut() {
-            cs.set_origin((x, y));
-        }
     }
 
     /// Where DWM places SDR white on this HDR desktop (2.5× = 200 nits at the Windows default),

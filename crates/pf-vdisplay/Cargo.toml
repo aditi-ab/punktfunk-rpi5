@@ -15,7 +15,9 @@ description = "punktfunk host virtual-display orchestration: per-compositor Linu
 publish = false
 
 [dependencies]
-punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
+# `Mode`, `CompositorPref` and `quic::REFUSED_REASON_MAX`, all outside the `quic` feature, so the
+# display crate never builds quinn, rustls or opus.
+punktfunk-core = { path = "../punktfunk-core", default-features = false }
 # `HdrMeta` in the `VirtualDisplay` trait (the client's mastering volume) + the DXGI capture
 # identity and the CTA-861.3 luminance fields on Windows. A leaf: no QUIC, no codec.
 pf-frame = { path = "../pf-frame" }
@@ -50,8 +52,11 @@ libc = "0.2"
 # runtime; the gamescope restore worker + portal handshakes use tokio too.
 ashpd = { version = "0.13", features = ["screencast", "remote_desktop"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time"] }
-# The shared, never-dropped portal runtime (`pf_capture::portal_rt`).
+# The ScreenCast handshake bounds and cursor negotiation (`pf_capture::portal_rt`), and the
+# gamescope HDR capture latch.
 pf-capture = { path = "../pf-capture" }
+# The shared, never-dropped portal runtime every cast parks on.
+pf-portal = { path = "../pf-portal" }
 futures-util = "0.3"
 # KWin virtual-output creation via the privileged `zkde_screencast_unstable_v1` protocol (vendored in
 # `protocols/`); the generated interface tables reference `wayland-backend`.

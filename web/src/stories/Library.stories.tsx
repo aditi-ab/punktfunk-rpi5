@@ -1,87 +1,100 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import type { PluginAccessSnapshot } from "@/api/gen/model/pluginAccessSnapshot";
-import { GameForm } from "@/sections/Library/GameForm";
 import { LibraryGrid } from "@/sections/Library/LibraryGrid";
 import { MigrationBanner, SourcesCard } from "@/sections/Library/Sources";
 import { library } from "./lib/fixtures";
+import { Routed } from "./lib/routed";
 
 const noop = () => {};
 const idle = { isLoading: false, error: null, refetch: noop };
-const emptyForm = {
-	title: "",
-	portrait: "",
-	hero: "",
-	header: "",
-	logo: "",
-	command: "",
-	// The console-password confirmation the form requires alongside a launch command; empty here
-	// because the story renders the untouched add form, which has no command yet.
-	password: "",
-	isLauncher: false,
-	exe: "",
-	installDir: "",
-	processName: "",
-	hintsLoaded: false,
-	audioSessions: "all" as const,
-	platform: "",
-	description: "",
-	developer: "",
-	publisher: "",
-	releaseYear: "",
-	genres: "",
-	tags: "",
-	region: "",
-	players: "",
-};
-
-// The overview grid and the add/edit form are separate components now, so the stories
-// render each on its own (no combined page view).
+// Cards link to the entry page, so every story renders inside a router.
 const meta = {
 	title: "Pages/Library",
 	parameters: { layout: "padded" },
+	decorators: [
+		(Story) => (
+			<Routed>
+				<Story />
+			</Routed>
+		),
+	],
 } satisfies Meta;
 
 export default meta;
 type Story = StoryObj;
 
+const LAUNCHER = {
+	id: "steam:bigpicture",
+	store: "steam",
+	title: "Steam Big Picture",
+	art: { portrait: null, hero: null, logo: null, header: null },
+	role: "launcher" as const,
+	launch: { kind: "steam_ui", value: "bigpicture" },
+};
+
+/** What the container hands the view: every handler a no-op, nothing narrowed, covers. */
+const gridArgs = {
+	games: { data: library, ...idle },
+	launchers: [],
+	total: library.length,
+	platforms: [],
+	hasMore: false,
+	loadingMore: false,
+	onMore: noop,
+	query: "",
+	onQuery: noop,
+	platform: null,
+	onPlatform: noop,
+	filtered: false,
+	view: "grid" as const,
+	onView: noop,
+	onDelete: noop,
+	deletingId: null,
+	onToggleHidden: noop,
+	hidingId: null,
+};
+
 export const Populated: Story = {
+	render: () => <LibraryGrid {...gridArgs} />,
+};
+
+/** The same titles as lines: many more fit a screen. */
+export const AsList: Story = {
+	render: () => <LibraryGrid {...gridArgs} view="rows" />,
+};
+
+/** One page of a large library: the count says how much is left, and the list goes on. */
+export const FirstPageOfMany: Story = {
 	render: () => (
 		<LibraryGrid
-			library={{ data: library, ...idle }}
-			onEdit={noop}
-			onDelete={noop}
-			deletingId={null}
-			onToggleHidden={noop}
-			hidingId={null}
+			{...gridArgs}
+			total={5120}
+			hasMore
+			platforms={[
+				{ platform: "PS2", count: 1840 },
+				{ platform: "SNES", count: 1211 },
+				{ platform: "N64", count: 388 },
+			]}
+		/>
+	),
+};
+
+/** A search that finds nothing is a miss, not a fresh host. */
+export const NoMatches: Story = {
+	render: () => (
+		<LibraryGrid
+			{...gridArgs}
+			games={{ data: [], ...idle }}
+			total={0}
+			query="zzz"
+			filtered
 		/>
 	),
 };
 
 /** Launcher entries (design D4) get their own rail above the grid. */
 export const WithLaunchers: Story = {
-	render: () => (
-		<LibraryGrid
-			library={{
-				data: [
-					{
-						id: "steam:bigpicture",
-						store: "steam",
-						title: "Steam Big Picture",
-						art: { portrait: null, hero: null, logo: null, header: null },
-						role: "launcher",
-						launch: { kind: "steam_ui", value: "bigpicture" },
-					},
-					...library,
-				],
-				...idle,
-			}}
-			onEdit={noop}
-			onDelete={noop}
-			deletingId={null}
-			onToggleHidden={noop}
-			hidingId={null}
-		/>
-	),
+	render: () => <LibraryGrid {...gridArgs} launchers={[LAUNCHER]} />,
 };
 
 /**
@@ -92,29 +105,18 @@ export const WithLaunchers: Story = {
 export const WithHidden: Story = {
 	render: () => (
 		<LibraryGrid
-			library={{
+			{...gridArgs}
+			games={{
 				data: library.map((g, i) => (i === 1 ? { ...g, hidden: true } : g)),
 				...idle,
 			}}
-			onEdit={noop}
-			onDelete={noop}
-			deletingId={null}
-			onToggleHidden={noop}
-			hidingId={null}
 		/>
 	),
 };
 
 export const Empty: Story = {
 	render: () => (
-		<LibraryGrid
-			library={{ data: [], ...idle }}
-			onEdit={noop}
-			onDelete={noop}
-			deletingId={null}
-			onToggleHidden={noop}
-			hidingId={null}
-		/>
+		<LibraryGrid {...gridArgs} games={{ data: [], ...idle }} total={0} />
 	),
 };
 
@@ -315,18 +317,6 @@ export const Migration: Story = {
 			]}
 			busy={false}
 			onInstall={noop}
-		/>
-	),
-};
-
-export const AddForm: Story = {
-	render: () => (
-		<GameForm
-			initial={emptyForm}
-			mode="add"
-			onSubmit={noop}
-			onCancel={noop}
-			isSaving={false}
 		/>
 	),
 };

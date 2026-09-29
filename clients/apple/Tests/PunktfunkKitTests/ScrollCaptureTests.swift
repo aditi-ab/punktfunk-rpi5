@@ -257,4 +257,56 @@ final class ScrollCaptureTests: XCTestCase {
             [exp(256, axis: 0, PUNKTFUNK_SCROLL_SOURCE_WHEEL,
                  PUNKTFUNK_SCROLL_PHASE_NONE)])
     }
+
+    /// The unphased sequences Rust's `ScrollAccumulator` wrote, read from the repo: five levels
+    /// up from this file is the root. A phased one re-derives its phase here, so it is skipped.
+    func testMatchesTheRustVectors() throws {
+        var url = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 { url.deleteLastPathComponent() }
+        url.appendPathComponent("crates/punktfunk-core/testdata/scroll-vectors.json")
+        let cases = try JSONDecoder().decode(ScrollVectors.self, from: Data(contentsOf: url)).cases
+        var replayed = 0
+        var wrong: [String] = []
+        for c in cases where c.steps.allSatisfy({ $0.phase == 0 && $0.axis <= 1 }) {
+            var cap = ScrollCapture()
+            for (j, s) in c.steps.enumerated() {
+                let got = events(
+                    &cap, dx: s.axis == 1 ? s.delta : 0, dy: s.axis == 0 ? s.delta : 0,
+                    PunktfunkScrollSource(rawValue: UInt32(s.source)),
+                    PunktfunkScrollPhase(rawValue: UInt32(s.phase)))
+                let want = s.wire.map {
+                    [exp($0.delta, axis: $0.axis, PunktfunkScrollSource(rawValue: UInt32($0.source)),
+                         PunktfunkScrollPhase(rawValue: UInt32($0.phase)))]
+                } ?? []
+                if got != want { wrong.append("\(c.name) step \(j): Rust \(want), Swift \(got)") }
+            }
+            replayed += 1
+        }
+        XCTAssertGreaterThan(replayed, 0)
+        XCTAssertTrue(wrong.isEmpty, wrong.joined(separator: "\n"))
+    }
+}
+
+private struct ScrollVectors: Decodable {
+    let cases: [ScrollVectorCase]
+}
+
+private struct ScrollVectorCase: Decodable {
+    let name: String
+    let steps: [ScrollVectorStep]
+}
+
+private struct ScrollVectorStep: Decodable {
+    let source: Int64
+    let phase: Int64
+    let axis: Int64
+    let delta: Double
+    let wire: ScrollVectorWire?
+}
+
+private struct ScrollVectorWire: Decodable {
+    let source: Int64
+    let phase: Int64
+    let axis: Int64
+    let delta: Int64
 }

@@ -14,6 +14,7 @@ use pf_client_core::console::{OverlayAction, PointerInput, SessionPhase};
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse, PadInfo};
 use punktfunk_core::config::GamepadPref;
 use skia_safe::Canvas;
+use std::time::{Duration, Instant};
 
 pub use crate::input::Key;
 
@@ -30,13 +31,16 @@ pub enum InputSource {
 pub enum ConsoleEntry {
     /// Host list (`--browse`; Android Home).
     Home,
-    /// Home with this host's library pushed (`--browse host`). B pops to Home.
+    /// The Games tab on this host's shelf (`--browse host`).
     /// `Box` because `HostRow` is larger than the other variant.
     Library(Box<HostRow>),
     /// [`Self::Library`] plus one connect to the host's desktop, raised before the first
     /// frame (`start_in = stream`). Cancel or a refusal lands on the shelf underneath,
     /// and nothing retries.
     Stream(Box<HostRow>),
+    /// This host's Pair screen over the host list: a pairing the app asked for (the trust
+    /// card's "Pair instead", a Mac host window). Back lands on Home.
+    Pair(Box<HostRow>),
 }
 
 /// Host-side models and the command bus. Built before [`Console`]: handles are `Clone` +
@@ -86,6 +90,54 @@ impl Viewport {
     }
 }
 
+/// No input for this long: the console is being looked at, not used, and a host may
+/// draw it at a reduced rate. Any input restores full rate on its own frame.
+pub(crate) const IDLE_AFTER: Duration = Duration::from_secs(60);
+
+/// What console frames cost, closed once a [`FrameCost::WINDOW`]. Time the draw and its
+/// flush, never the swap: a swap blocks on vsync and always reads as one panel period.
+#[derive(Default)]
+pub struct FrameCost {
+    frames: u32,
+    sum: Duration,
+    peak: Duration,
+    since: Option<Instant>,
+}
+
+/// One closed [`FrameCost`] window.
+#[derive(Debug, PartialEq)]
+pub struct FrameReport {
+    pub frames: u32,
+    pub window: Duration,
+    pub mean_ms: f64,
+    pub peak_ms: f64,
+}
+
+impl FrameCost {
+    /// One line a minute is cheap enough to leave on for everyone.
+    pub const WINDOW: Duration = Duration::from_secs(60);
+
+    /// Adds one frame's cost; returns the window once it has run [`Self::WINDOW`].
+    pub fn add(&mut self, cost: Duration, now: Instant) -> Option<FrameReport> {
+        let since = *self.since.get_or_insert(now);
+        self.frames += 1;
+        self.sum += cost;
+        self.peak = self.peak.max(cost);
+        let window = now.duration_since(since);
+        if window < Self::WINDOW {
+            return None;
+        }
+        let report = FrameReport {
+            frames: self.frames,
+            window,
+            mean_ms: self.sum.as_secs_f64() * 1000.0 / f64::from(self.frames),
+            peak_ms: self.peak.as_secs_f64() * 1000.0,
+        };
+        *self = FrameCost::default();
+        Some(report)
+    }
+}
+
 pub struct Console {
     shell: Shell,
     fonts: Fonts,
@@ -100,7 +152,7 @@ impl Console {
     ) -> Result<Console> {
         let stream = stream_intent(&entry);
         let fetch = entry_fetch(&entry);
-        let stack = entry_stack(entry, &handles.library);
+        let stack = entry_stack(entry, &opts.device_name);
         if let Some(cmd) = fetch {
             handles.bus.send(cmd);
         }
@@ -131,9 +183,23 @@ impl Console {
             .render_in(canvas, viewport, &self.fonts, pad, pad_pref, pads);
     }
 
+    /// Draw every tab once into `canvas` before the first [`Self::frame`], so their GPU
+    /// programs compile behind the host's splash rather than on first visit. A TV's GL driver
+    /// takes 50–170 ms a program; the next frame overwrites what this draws.
+    pub fn warm_up(&mut self, canvas: &Canvas, viewport: &Viewport) {
+        self.shell.warm_up(canvas, viewport, &self.fonts);
+    }
+
     pub fn menu(&mut self, event: MenuEvent, source: InputSource) -> Option<MenuPulse> {
         self.shell.note_input_source(source);
         self.shell.handle_menu(event)
+    }
+
+    /// A remote's OK, down and up. A press acts on release; held half a second it opens the
+    /// focused card's menu. A source that only knows presses sends [`MenuEvent::Confirm`].
+    pub fn ok(&mut self, down: bool, source: InputSource) -> Option<MenuPulse> {
+        self.shell.note_input_source(source);
+        self.shell.ok(down)
     }
 
     /// Pointer in surface pixels; the shell subtracts insets.
@@ -149,10 +215,27 @@ impl Console {
         self.shell.text_input(text);
     }
 
+    /// Nothing to back out of: focus is on a tab. A Back here asks to exit, and a TV hands
+    /// the press to the system, which is why a host asks BEFORE it binds that button.
+    pub fn at_root(&self) -> bool {
+        self.shell.at_root()
+    }
+
+    /// A launch hold is up. A host with a stream view of its own keeps this console over it
+    /// until the hold lets go with [`OverlayAction::ShowStream`].
+    pub fn holds_launch(&self) -> bool {
+        self.shell.holds_stream()
+    }
+
     /// True while a field is being edited: keep IME / SDL text-input started, and
     /// route printable keys as text, not [`Key`]s.
     pub fn editing(&self) -> bool {
         self.shell.editing()
+    }
+
+    /// The field [`Self::editing`] has open: label, text so far, and whether it takes digits.
+    pub fn edit_field(&self) -> Option<crate::screens::EditField> {
+        self.shell.edit_field()
     }
 
     pub fn session_phase(&mut self, phase: SessionPhase) {
@@ -173,6 +256,11 @@ impl Console {
         self.shell.focus_announcement()
     }
 
+    /// No menu, pointer, key or text input for `IDLE_AFTER` (a minute).
+    pub fn idle(&self) -> bool {
+        self.shell.idle()
+    }
+
     /// Console is off screen; the shell keeps its stack for return.
     pub fn in_stream(&self) -> bool {
         self.shell.in_stream
@@ -187,7 +275,7 @@ impl Console {
         }
         let stream = stream_intent(&entry);
         let fetch = entry_fetch(&entry);
-        let stack = entry_stack(entry, self.shell.library());
+        let stack = entry_stack(entry, self.shell.device_name());
         if let Some(cmd) = fetch {
             self.shell.send_cmd(cmd);
         }
@@ -197,6 +285,13 @@ impl Console {
         }
     }
 
+    /// Ask the player something a system alert would put out of a pad's reach. The answer
+    /// arrives as [`ConsoleCmd::PromptAnswer`].
+    pub fn prompt(&mut self, prompt: crate::screens::prompt::Prompt) {
+        let screen = crate::screens::prompt::PromptScreen::new(prompt);
+        self.shell.push_screen(Screen::Prompt(screen));
+    }
+
     /// Skia resource-cache budget for the host `DirectContext`. The shell only carries it.
     pub fn gpu_cache_bytes(&self) -> usize {
         self.shell.gpu_cache_bytes
@@ -204,7 +299,7 @@ impl Console {
 
     /// Shell and fonts for the Vulkan overlay: stream chrome uses the same fonts; the
     /// overlay holds the shell as `Option`.
-    #[cfg(feature = "vulkan-overlay")]
+    #[cfg(all(any(target_os = "linux", windows), feature = "vulkan-overlay"))]
     pub(crate) fn into_parts(self) -> (Shell, Fonts) {
         (self.shell, self.fonts)
     }
@@ -228,8 +323,7 @@ fn stream_intent(entry: &ConsoleEntry) -> Option<crate::screens::ConnectIntent> 
     })
 }
 
-/// The fetch a shelf entry needs. Nothing else loads a pushed shelf, so send it after
-/// [`entry_stack`] snapshots the epoch.
+/// The fetch a shelf entry needs. Nothing else loads a pushed shelf.
 fn entry_fetch(entry: &ConsoleEntry) -> Option<ConsoleCmd> {
     let (ConsoleEntry::Library(host) | ConsoleEntry::Stream(host)) = entry else {
         return None;
@@ -241,18 +335,17 @@ fn entry_fetch(entry: &ConsoleEntry) -> Option<ConsoleCmd> {
     })
 }
 
-fn entry_stack(entry: ConsoleEntry, library: &crate::library::LibraryShared) -> Vec<Screen> {
+fn entry_stack(entry: ConsoleEntry, device_name: &str) -> Vec<Screen> {
     match entry {
         ConsoleEntry::Home => vec![Screen::Home(crate::screens::home::HomeScreen::new())],
-        ConsoleEntry::Library(host) | ConsoleEntry::Stream(host) => vec![
+        ConsoleEntry::Pair(host) => vec![
             Screen::Home(crate::screens::home::HomeScreen::new()),
-            // Snapshot the model's fetch epoch so the host's following `FetchLibrary`
-            // is the first raise; that is how the shelf knows the result is its own.
-            Screen::Library(crate::screens::library::LibraryScreen::new(
-                &host,
-                library.fetch_epoch(),
-            )),
+            Screen::Pair(crate::screens::pair::PairScreen::new(&host, device_name)),
         ],
+        // The Games tab's root.
+        ConsoleEntry::Library(host) | ConsoleEntry::Stream(host) => vec![Screen::Library(
+            crate::screens::library::LibraryScreen::new(&host),
+        )],
     }
 }
 
@@ -269,27 +362,25 @@ fn already_showing(top: Option<&Screen>, entry: &ConsoleEntry) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn frame_cost_closes_once_a_window() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut c = FrameCost::default();
+        assert_eq!(c.add(ms(2), t0), None);
+        assert_eq!(c.add(ms(6), t0 + Duration::from_secs(30)), None);
+        let r = c.add(ms(4), t0 + FrameCost::WINDOW).expect("window closed");
+        assert_eq!((r.frames, r.window), (3, FrameCost::WINDOW));
+        assert!((r.mean_ms - 4.0).abs() < 1e-9 && (r.peak_ms - 6.0).abs() < 1e-9);
+        // The next frame opens a fresh window.
+        assert_eq!(c.add(ms(1), t0 + FrameCost::WINDOW * 2), None);
+    }
+
     fn row() -> HostRow {
         HostRow {
-            key: "aa".into(),
             id: Some("rec-1".into()),
-            name: "Desk".into(),
             addr: "10.0.0.5".into(),
-            port: 9777,
-            fp_hex: "aa".into(),
-            paired: true,
-            saved: true,
-            online: true,
-            mgmt_port: 47990,
-            can_wake: false,
-            clipboard_sync: false,
-            last_used: None,
-            os: String::new(),
-            actions: Vec::new(),
-            pin: None,
-            bound_preset: None,
-            running: String::new(),
-            game_presets: Default::default(),
+            ..HostRow::fixture("aa", "Desk")
         }
     }
 
@@ -327,29 +418,38 @@ mod tests {
         }
     }
 
-    /// Both host entries land on the same two screens, so B leaves a cancelled stream
+    /// Both host entries land on the Games tab's shelf, so B leaves a cancelled stream
     /// on the shelf rather than on the host list.
     #[test]
     fn a_stream_entry_opens_the_same_stack_as_library() {
-        let library = crate::library::LibraryShared::default();
         for entry in [
             ConsoleEntry::Library(Box::new(row())),
             ConsoleEntry::Stream(Box::new(row())),
         ] {
-            let stack = entry_stack(entry, &library);
-            assert!(matches!(
-                stack.as_slice(),
-                [Screen::Home(_), Screen::Library(_)]
-            ));
+            let stack = entry_stack(entry, "d");
+            assert!(matches!(stack.as_slice(), [Screen::Library(_)]));
         }
+    }
+
+    /// A pairing the app asks for opens Pair over Home, so Back lands on the host list. It
+    /// fetches nothing and connects nothing.
+    #[test]
+    fn a_pair_entry_opens_pair_over_home() {
+        let entry = ConsoleEntry::Pair(Box::new(row()));
+        assert!(entry_fetch(&entry).is_none());
+        assert!(stream_intent(&entry).is_none());
+        let stack = entry_stack(entry, "d");
+        assert!(matches!(
+            stack.as_slice(),
+            [Screen::Home(_), Screen::Pair(_)]
+        ));
     }
 
     /// Returning to the shelf on top keeps it (its posters survive the stream); another
     /// host's shelf, a Stream entry, or a Home top re-roots as before.
     #[test]
     fn a_library_entry_for_the_shelf_on_top_is_a_no_op() {
-        let library = crate::library::LibraryShared::default();
-        let stack = entry_stack(ConsoleEntry::Library(Box::new(row())), &library);
+        let stack = entry_stack(ConsoleEntry::Library(Box::new(row())), "d");
         let top = stack.last();
         assert!(already_showing(
             top,
@@ -367,8 +467,9 @@ mod tests {
             top,
             &ConsoleEntry::Library(Box::new(other))
         ));
+        let home = Screen::Home(crate::screens::home::HomeScreen::new());
         assert!(!already_showing(
-            stack.first(),
+            Some(&home),
             &ConsoleEntry::Library(Box::new(row()))
         ));
     }

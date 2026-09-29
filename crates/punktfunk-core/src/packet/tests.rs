@@ -37,44 +37,100 @@ fn base_header() -> PacketHeader {
     }
 }
 
-fn packet(h: PacketHeader) -> Vec<u8> {
-    let mut p = Vec::new();
+/// The receive side of a test: a reassembler with its coder and counters.
+struct Rig {
+    r: Reassembler,
+    coder: Box<dyn crate::fec::ErasureCoder>,
+    stats: StatsCounters,
+}
+
+impl Rig {
+    /// Limits and FEC scheme from `cfg`, as a client session builds them.
+    fn new(cfg: &Config) -> Rig {
+        Rig::with(ReassemblerLimits::from_config(cfg), cfg.fec.scheme)
+    }
+
+    fn with(limits: ReassemblerLimits, scheme: FecScheme) -> Rig {
+        Rig {
+            r: Reassembler::new(limits),
+            coder: coder_for(scheme),
+            stats: StatsCounters::default(),
+        }
+    }
+
+    fn push(&mut self, p: &[u8]) -> Option<crate::session::Frame> {
+        self.r.push(p, self.coder.as_ref(), &self.stats).unwrap()
+    }
+
+    /// The one frame `delivery` completes, if any. Completing twice fails the test.
+    fn push_all(&mut self, delivery: &[Vec<u8>]) -> Option<crate::session::Frame> {
+        let mut got = None;
+        for p in delivery {
+            if let Some(f) = self.push(p) {
+                assert!(got.is_none(), "frame must complete exactly once");
+                got = Some(f);
+            }
+        }
+        got
+    }
+
+    /// Every frame or part `delivery` completes, in order.
+    fn push_collect(&mut self, delivery: &[Vec<u8>]) -> Vec<crate::session::Frame> {
+        delivery.iter().filter_map(|p| self.push(p)).collect()
+    }
+}
+
+fn hdr(p: &[u8]) -> PacketHeader {
+    PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap()
+}
+
+/// `header ‖ body`, as the packetizer's emit callback hands it over.
+fn wire(h: &PacketHeader, body: &[u8]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(HEADER_LEN + body.len());
     p.extend_from_slice(h.as_bytes());
-    p.extend_from_slice(&vec![0xAB; h.shard_bytes as usize]);
+    p.extend_from_slice(body);
     p
+}
+
+/// The packets whose header passes `keep`.
+fn select(pkts: &[Vec<u8>], keep: impl Fn(&PacketHeader) -> bool) -> Vec<Vec<u8>> {
+    pkts.iter().filter(|p| keep(&hdr(p))).cloned().collect()
+}
+
+/// `p` with its header rewritten by `f`.
+fn patch(p: &[u8], f: impl FnOnce(&mut PacketHeader)) -> Vec<u8> {
+    let mut h = hdr(p);
+    f(&mut h);
+    let mut out = p.to_vec();
+    out[..HEADER_LEN].copy_from_slice(h.as_bytes());
+    out
+}
+
+fn packet(h: PacketHeader) -> Vec<u8> {
+    wire(&h, &vec![0xAB; h.shard_bytes as usize])
 }
 
 /// 65535+65535 shards must drop, not allocate.
 #[test]
 fn rejects_oversized_shard_counts() {
-    let mut r = Reassembler::new(limits());
-    let coder = coder_for(FecScheme::Gf8);
-    let stats = StatsCounters::default();
+    let mut rig = Rig::with(limits(), FecScheme::Gf8);
     let mut h = base_header();
     h.data_shards = 65535;
     h.recovery_shards = 65535;
-    assert!(r
-        .push(&packet(h), coder.as_ref(), &stats)
-        .unwrap()
-        .is_none());
-    assert_eq!(stats.snapshot().packets_dropped, 1);
+    assert!(rig.push(&packet(h)).is_none());
+    assert_eq!(rig.stats.snapshot().packets_dropped, 1);
 }
 
 /// A later packet with different geometry must drop, not index past the first packet's shard vec.
 #[test]
 fn rejects_inconsistent_block_geometry_without_panicking() {
-    let mut r = Reassembler::new(limits());
-    let coder = coder_for(FecScheme::Gf8);
-    let stats = StatsCounters::default();
+    let mut rig = Rig::with(limits(), FecScheme::Gf8);
 
     let mut h1 = base_header();
     h1.data_shards = 4;
     h1.recovery_shards = 2;
     h1.frame_bytes = 64;
-    assert!(r
-        .push(&packet(h1), coder.as_ref(), &stats)
-        .unwrap()
-        .is_none());
+    assert!(rig.push(&packet(h1)).is_none());
 
     // shard_index 7 is in-range for this header's 8 slots, past the pinned 6.
     let mut h2 = base_header();
@@ -82,68 +138,48 @@ fn rejects_inconsistent_block_geometry_without_panicking() {
     h2.recovery_shards = 2;
     h2.shard_index = 7;
     h2.frame_bytes = 64;
-    assert!(r
-        .push(&packet(h2), coder.as_ref(), &stats)
-        .unwrap()
-        .is_none());
-    assert_eq!(stats.snapshot().packets_dropped, 1);
+    assert!(rig.push(&packet(h2)).is_none());
+    assert_eq!(rig.stats.snapshot().packets_dropped, 1);
 }
 
 /// Loss window is capture-pts, not frame count: 33 ms late at 120 fps is late, not lost.
 #[test]
 fn incomplete_frames_age_out_by_capture_time_not_frame_count() {
-    let mut r = Reassembler::new(limits());
-    let coder = coder_for(FecScheme::Gf8);
-    let stats = StatsCounters::default();
+    let mut rig = Rig::with(limits(), FecScheme::Gf8);
     const FRAME_NS: u64 = 8_333_333; // 120 fps
 
     let mut h = base_header();
     h.data_shards = 2;
     h.frame_bytes = 32;
-    assert!(r
-        .push(&packet(h), coder.as_ref(), &stats)
-        .unwrap()
-        .is_none());
+    assert!(rig.push(&packet(h)).is_none());
 
     // 8 frames at 120 fps ≈ 67 ms, inside LOSS_WINDOW_NS; frame 0 must still be live.
     for i in 1..=8u32 {
         let mut h = base_header();
         h.frame_index = i;
         h.pts_ns = i as u64 * FRAME_NS;
-        assert!(r
-            .push(&packet(h), coder.as_ref(), &stats)
-            .unwrap()
-            .is_some());
+        assert!(rig.push(&packet(h)).is_some());
     }
-    assert_eq!(stats.snapshot().frames_dropped, 0);
+    assert_eq!(rig.stats.snapshot().frames_dropped, 0);
 
     // ~66 ms late at 120 fps — still inside the window.
     let mut h = base_header();
     h.data_shards = 2;
     h.frame_bytes = 32;
     h.shard_index = 1;
-    assert!(r
-        .push(&packet(h), coder.as_ref(), &stats)
-        .unwrap()
-        .is_some());
+    assert!(rig.push(&packet(h)).is_some());
 
     let mut h = base_header();
     h.frame_index = 20;
     h.pts_ns = 20 * FRAME_NS;
     h.data_shards = 2;
     h.frame_bytes = 32;
-    assert!(r
-        .push(&packet(h), coder.as_ref(), &stats)
-        .unwrap()
-        .is_none());
+    assert!(rig.push(&packet(h)).is_none());
     let mut h = base_header();
     h.frame_index = 21;
     h.pts_ns = 20 * FRAME_NS + LOSS_WINDOW_NS + 1;
-    assert!(r
-        .push(&packet(h), coder.as_ref(), &stats)
-        .unwrap()
-        .is_some());
-    assert_eq!(stats.snapshot().frames_dropped, 1);
+    assert!(rig.push(&packet(h)).is_some());
+    assert_eq!(rig.stats.snapshot().frames_dropped, 1);
 
     let mut h = base_header();
     h.frame_index = 20;
@@ -151,11 +187,8 @@ fn incomplete_frames_age_out_by_capture_time_not_frame_count() {
     h.data_shards = 2;
     h.frame_bytes = 32;
     h.shard_index = 1;
-    assert!(r
-        .push(&packet(h), coder.as_ref(), &stats)
-        .unwrap()
-        .is_none());
-    assert_eq!(stats.snapshot().frames_dropped, 1, "no double-count");
+    assert!(rig.push(&packet(h)).is_none());
+    assert_eq!(rig.stats.snapshot().frames_dropped, 1, "no double-count");
 }
 
 /// Explicit `frame_index` must not bump the packetizer's internal video or probe counters.
@@ -187,7 +220,7 @@ fn explicit_frame_index_is_stamped_and_internal_counter_untouched() {
     .unwrap();
     assert_eq!(seen, vec![4242]);
     let pkts = pk.packetize(&[1u8; 16], 0, 0, coder.as_ref()).unwrap();
-    let hdr = PacketHeader::read_from_bytes(&pkts[0][..HEADER_LEN]).unwrap();
+    let hdr = hdr(&pkts[0]);
     assert_eq!(hdr.frame_index, 0);
     // Probe indexes are a third counter, not the video one.
     assert_eq!(pk.alloc_probe_index(), 0);
@@ -197,24 +230,19 @@ fn explicit_frame_index_is_stamped_and_internal_counter_untouched() {
 /// FLAG_PROBE frames reassemble in their own window; they must not age out against video indexes.
 #[test]
 fn probe_frames_reassemble_in_their_own_window() {
-    let mut r = Reassembler::new(limits());
-    let coder = coder_for(FecScheme::Gf8);
-    let stats = StatsCounters::default();
+    let mut rig = Rig::with(limits(), FecScheme::Gf8);
 
     let mut v = base_header();
     v.frame_index = 100_000;
     v.pts_ns = 1_000_000_000;
-    assert!(r
-        .push(&packet(v), coder.as_ref(), &stats)
-        .unwrap()
-        .is_some());
+    assert!(rig.push(&packet(v)).is_some());
 
     // Probe index 0 is 100k behind the video window and must still complete.
     let mut p = base_header();
     p.frame_index = 0;
     p.pts_ns = 1_000_000_100;
     p.user_flags = FLAG_PROBE as u32;
-    let got = r.push(&packet(p), coder.as_ref(), &stats).unwrap();
+    let got = rig.push(&packet(p));
     assert!(got.is_some(), "probe frame must complete in its own window");
     assert_eq!(got.unwrap().flags & FLAG_PROBE as u32, FLAG_PROBE as u32);
 
@@ -222,39 +250,28 @@ fn probe_frames_reassemble_in_their_own_window() {
     let mut v2 = base_header();
     v2.frame_index = 100_001;
     v2.pts_ns = 1_000_000_200;
-    assert!(r
-        .push(&packet(v2), coder.as_ref(), &stats)
-        .unwrap()
-        .is_some());
-    assert_eq!(stats.snapshot().frames_dropped, 0);
+    assert!(rig.push(&packet(v2)).is_some());
+    assert_eq!(rig.stats.snapshot().frames_dropped, 0);
 }
 
 /// Probe-window age-out must not increment video `frames_dropped` (that fires client recovery).
 #[test]
 fn aged_out_probe_frames_do_not_count_as_dropped() {
-    let mut r = Reassembler::new(limits());
-    let coder = coder_for(FecScheme::Gf8);
-    let stats = StatsCounters::default();
+    let mut rig = Rig::with(limits(), FecScheme::Gf8);
 
     let mut p = base_header();
     p.user_flags = FLAG_PROBE as u32;
     p.data_shards = 2;
     p.frame_bytes = 32;
-    assert!(r
-        .push(&packet(p), coder.as_ref(), &stats)
-        .unwrap()
-        .is_none());
+    assert!(rig.push(&packet(p)).is_none());
 
     let mut p2 = base_header();
     p2.user_flags = FLAG_PROBE as u32;
     p2.frame_index = 1;
     p2.pts_ns = LOSS_WINDOW_NS + 1;
-    assert!(r
-        .push(&packet(p2), coder.as_ref(), &stats)
-        .unwrap()
-        .is_some());
+    assert!(rig.push(&packet(p2)).is_some());
     assert_eq!(
-        stats.snapshot().frames_dropped,
+        rig.stats.snapshot().frames_dropped,
         0,
         "probe-window drops must not fire video loss recovery"
     );
@@ -307,19 +324,13 @@ fn e2e_roundtrip(
         delivery.push(dup);
     }
 
-    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-    let stats = StatsCounters::default();
-    let mut got = None;
-    for p in &delivery {
-        if let Some(f) = r.push(p, coder.as_ref(), &stats).unwrap() {
-            assert!(got.is_none(), "frame must complete exactly once");
-            got = Some(f);
-        }
-    }
-    let f = got.expect("frame must complete within the FEC budget");
+    let mut rig = Rig::new(&cfg);
+    let f = rig
+        .push_all(&delivery)
+        .expect("frame must complete within the FEC budget");
     assert_eq!(f.data, src, "reassembled AU must be byte-identical");
     assert_eq!(f.pts_ns, 12345);
-    let snap = stats.snapshot();
+    let snap = rig.stats.snapshot();
     let (recovered, late) = (snap.fec_recovered_shards, snap.fec_late_shards);
     if reverse {
         assert!(
@@ -356,7 +367,6 @@ fn e2e_multiblock_loss_reorder_dup_gf8() {
 /// All data shards then all parity; SOF on the first packet, EOF on the last.
 #[test]
 fn packetize_emits_all_data_before_any_parity() {
-    use zerocopy::FromBytes;
     let cfg = e2e_config(FecScheme::Gf16, 50);
     let coder = coder_for(FecScheme::Gf16);
     let mut pk = Packetizer::new(&cfg);
@@ -364,10 +374,7 @@ fn packetize_emits_all_data_before_any_parity() {
     let src: Vec<u8> = (0..100).map(|i| (i * 31 + 3) as u8).collect();
     let pkts = pk.packetize(&src, 1, 0, coder.as_ref()).unwrap();
     assert_eq!(pkts.len(), 11);
-    let hdrs: Vec<PacketHeader> = pkts
-        .iter()
-        .map(|p| PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap())
-        .collect();
+    let hdrs: Vec<PacketHeader> = pkts.iter().map(|p| hdr(p)).collect();
     let layout: Vec<(u16, u16)> = hdrs
         .iter()
         .map(|h| (h.block_index, h.shard_index))
@@ -420,7 +427,7 @@ fn packetize_emits_all_data_before_any_parity() {
     let mut pk0 = Packetizer::new(&cfg0);
     let pkts0 = pk0.packetize(&src, 2, 0, coder.as_ref()).unwrap();
     assert_eq!(pkts0.len(), 7, "no parity at 0% FEC");
-    let last = PacketHeader::read_from_bytes(&pkts0.last().unwrap()[..HEADER_LEN]).unwrap();
+    let last = hdr(pkts0.last().unwrap());
     assert_eq!(last.flags & FLAG_EOF, FLAG_EOF, "EOF on last data shard");
     assert!(last.shard_index < last.data_shards, "last packet is data");
 }
@@ -438,12 +445,8 @@ fn e2e_empty_frame() {
     let mut pk = Packetizer::new(&cfg);
     let pkts = pk.packetize(&[], 7, 0, coder.as_ref()).unwrap();
     assert_eq!(pkts.len(), 1);
-    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-    let stats = StatsCounters::default();
-    let f = r
-        .push(&pkts[0], coder.as_ref(), &stats)
-        .unwrap()
-        .expect("empty frame completes");
+    let mut rig = Rig::new(&cfg);
+    let f = rig.push(&pkts[0]).expect("empty frame completes");
     assert!(f.data.is_empty());
 }
 
@@ -455,21 +458,46 @@ fn e2e_unrecoverable_loss_ages_out() {
     let mut pk = Packetizer::new(&cfg);
     let src = vec![0x5Au8; 64]; // 64/16 = 4 data + 50% = 2 recovery
     let pkts = pk.packetize(&src, 1_000, 0, coder.as_ref()).unwrap();
-    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-    let stats = StatsCounters::default();
+    let mut rig = Rig::new(&cfg);
     // 3 of 6 shards, k=4: cannot reconstruct.
     for p in &pkts[..3] {
-        assert!(r.push(p, coder.as_ref(), &stats).unwrap().is_none());
+        assert!(rig.push(p).is_none());
     }
     let next = pk
         .packetize(&src, 1_000 + LOSS_WINDOW_NS + 1, 0, coder.as_ref())
         .unwrap();
     let mut done = false;
     for p in &next {
-        done |= r.push(p, coder.as_ref(), &stats).unwrap().is_some();
+        done |= rig.push(p).is_some();
     }
     assert!(done);
-    assert_eq!(stats.snapshot().frames_dropped, 1);
+    assert_eq!(rig.stats.snapshot().frames_dropped, 1);
+}
+
+/// The count the RFI line carries: what a short frame lacks past its parity.
+#[test]
+fn missing_beyond_parity_counts_what_parity_cannot_rebuild() {
+    let cfg = e2e_config(FecScheme::Gf16, 50);
+    let coder = coder_for(FecScheme::Gf16);
+    let mut pk = Packetizer::new(&cfg);
+    let mut rig = Rig::new(&cfg);
+    // Frame 0: 64 B = 4 data + 2 parity. Three data lost, both parity in: one short.
+    let one = pk.packetize(&[1u8; 64], 1_000, 0, coder.as_ref()).unwrap();
+    for i in [0, 4, 5] {
+        rig.push(&one[i]);
+    }
+    assert_eq!(rig.r.missing_beyond_parity(0), Some((1, 2)));
+    // Frame 1: 100 B = blocks (4+2) and (3+2). Block 1 never arrives: its 3 data count.
+    let two = pk.packetize(&[2u8; 100], 2_000, 0, coder.as_ref()).unwrap();
+    for i in [0, 1, 2, 3, 7, 8] {
+        rig.push(&two[i]);
+    }
+    assert_eq!(rig.r.missing_beyond_parity(1), Some((3, 2)));
+    assert_eq!(
+        rig.r.missing_beyond_parity(2),
+        None,
+        "no shard of it arrived"
+    );
 }
 
 /// In-flight budget is [`IN_FLIGHT_BUF_FACTOR`] × max_frame_bytes, not one max-size buffer per first shard.
@@ -481,35 +509,31 @@ fn in_flight_buffer_budget_bounds_allocation() {
     // One frame: 4×8×16 B buffer + the opened block's state; both are metered.
     let per_frame = 512 + block_state_bytes(8, 0);
     let fits = budget / per_frame;
-    let mut r = Reassembler::new(lim);
-    let coder = coder_for(FecScheme::Gf8);
-    let stats = StatsCounters::default();
+    let mut rig = Rig::with(lim, FecScheme::Gf8);
     for i in 0..=fits as u32 {
         let mut h = base_header();
         h.frame_index = i;
         h.frame_bytes = 512;
         h.block_count = 4;
         h.data_shards = 8;
-        r.push(&packet(h), coder.as_ref(), &stats).unwrap();
+        rig.push(&packet(h));
     }
     assert_eq!(
-        stats.snapshot().packets_dropped,
+        rig.stats.snapshot().packets_dropped,
         1,
         "the frame past the budget is dropped, everything under it accepted"
     );
     assert!(
-        r.in_flight() <= budget,
+        rig.r.in_flight() <= budget,
         "in-flight commitment {} must never exceed the {budget} B budget",
-        r.in_flight(),
+        rig.r.in_flight(),
     );
 }
 
 /// Recovery-shard payloads count toward in-flight and are credited when the frame ages out.
 #[test]
 fn recovery_shard_payloads_are_metered_and_released() {
-    let mut r = Reassembler::new(limits());
-    let coder = coder_for(FecScheme::Gf8);
-    let stats = StatsCounters::default();
+    let mut rig = Rig::with(limits(), FecScheme::Gf8);
 
     // 4+4 block, 3 parity only (k=4): cannot reconstruct; each 16 B payload stays charged.
     let mut h = base_header();
@@ -519,13 +543,10 @@ fn recovery_shard_payloads_are_metered_and_released() {
     for j in 4..7u16 {
         let mut h = h;
         h.shard_index = j;
-        assert!(r
-            .push(&packet(h), coder.as_ref(), &stats)
-            .unwrap()
-            .is_none());
+        assert!(rig.push(&packet(h)).is_none());
     }
     assert_eq!(
-        r.in_flight(),
+        rig.r.in_flight(),
         64 + block_state_bytes(4, 4) + 3 * 16,
         "held parity payloads must be part of the in-flight commitment"
     );
@@ -534,12 +555,9 @@ fn recovery_shard_payloads_are_metered_and_released() {
     let mut h = base_header();
     h.frame_index = 1;
     h.pts_ns = LOSS_WINDOW_NS + 1;
-    assert!(r
-        .push(&packet(h), coder.as_ref(), &stats)
-        .unwrap()
-        .is_some());
+    assert!(rig.push(&packet(h)).is_some());
     assert_eq!(
-        r.in_flight(),
+        rig.r.in_flight(),
         0,
         "released frames must return every charged byte"
     );
@@ -548,42 +566,27 @@ fn recovery_shard_payloads_are_metered_and_released() {
 /// `(data_shards, block_count)` must match geometry derived from `frame_bytes`, or drop.
 #[test]
 fn rejects_geometry_inconsistent_with_frame_bytes() {
-    let mut r = Reassembler::new(limits());
-    let coder = coder_for(FecScheme::Gf8);
-    let stats = StatsCounters::default();
+    let mut rig = Rig::with(limits(), FecScheme::Gf8);
     let mut h = base_header();
     h.frame_bytes = 16; // one shard
     h.data_shards = 2; // claims two
-    assert!(r
-        .push(&packet(h), coder.as_ref(), &stats)
-        .unwrap()
-        .is_none());
-    assert_eq!(stats.snapshot().packets_dropped, 1);
+    assert!(rig.push(&packet(h)).is_none());
+    assert_eq!(rig.stats.snapshot().packets_dropped, 1);
 }
 
 #[test]
 fn rejects_wrong_shard_bytes_and_oversized_frame() {
-    let coder = coder_for(FecScheme::Gf8);
-
-    let mut r = Reassembler::new(limits());
-    let stats = StatsCounters::default();
+    let mut rig = Rig::with(limits(), FecScheme::Gf8);
     let mut h = base_header();
     h.shard_bytes = 8; // != negotiated 16
-    assert!(r
-        .push(&packet(h), coder.as_ref(), &stats)
-        .unwrap()
-        .is_none());
-    assert_eq!(stats.snapshot().packets_dropped, 1);
+    assert!(rig.push(&packet(h)).is_none());
+    assert_eq!(rig.stats.snapshot().packets_dropped, 1);
 
-    let mut r = Reassembler::new(limits());
-    let stats = StatsCounters::default();
+    let mut rig = Rig::with(limits(), FecScheme::Gf8);
     let mut h = base_header();
     h.frame_bytes = 1_000_000; // > max_frame_bytes
-    assert!(r
-        .push(&packet(h), coder.as_ref(), &stats)
-        .unwrap()
-        .is_none());
-    assert_eq!(stats.snapshot().packets_dropped, 1);
+    assert!(rig.push(&packet(h)).is_none());
+    assert_eq!(rig.stats.snapshot().packets_dropped, 1);
 }
 
 /// Receiver `max_total_shards` is frozen at session start. `Packetizer::recovery_for` clamps
@@ -605,7 +608,7 @@ fn adaptive_fec_ramp_keeps_maximal_blocks_within_the_peers_ceiling() {
     let k = cfg.fec.max_data_per_block as usize;
     let mut clamped = false;
     for p in &pkts {
-        let hdr = PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
+        let hdr = hdr(p);
         let total = hdr.data_shards as usize + hdr.recovery_shards as usize;
         assert!(
             total <= lim.max_total_shards,
@@ -624,11 +627,10 @@ fn adaptive_fec_ramp_keeps_maximal_blocks_within_the_peers_ceiling() {
     }
     assert!(clamped, "test must exercise a maximal block");
 
-    let mut r = Reassembler::new(lim);
-    let stats = StatsCounters::default();
+    let mut rig = Rig::with(lim, FecScheme::Gf16);
     let mut got = None;
     for p in &pkts {
-        if let Some(f) = r.push(p, coder.as_ref(), &stats).unwrap() {
+        if let Some(f) = rig.push(p) {
             got = Some(f);
         }
     }
@@ -712,17 +714,10 @@ fn streamed_roundtrip(scheme: FecScheme, kill: &[usize], reverse: bool) {
     }
 
     let cfg = e2e_config(scheme, 50);
-    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-    let coder = coder_for(scheme);
-    let stats = StatsCounters::default();
-    let mut got = None;
-    for p in &delivery {
-        if let Some(f) = r.push(p, coder.as_ref(), &stats).unwrap() {
-            assert!(got.is_none(), "frame must complete exactly once");
-            got = Some(f);
-        }
-    }
-    let f = got.expect("streamed frame must complete within the FEC budget");
+    let mut rig = Rig::new(&cfg);
+    let f = rig
+        .push_all(&delivery)
+        .expect("streamed frame must complete within the FEC budget");
     assert_eq!(
         f.data, src,
         "reassembled streamed AU must be byte-identical"
@@ -754,7 +749,7 @@ fn streamed_headers_sentinel_then_final() {
     let (pkts, src) = streamed_packets(FecScheme::Gf16, 50, &chunk_refs);
     let mut saw_final = false;
     for (i, p) in pkts.iter().enumerate() {
-        let h = PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
+        let h = hdr(p);
         assert_eq!(
             h.flags & FLAG_SOF != 0,
             i == 0,
@@ -786,7 +781,7 @@ fn streamed_headers_sentinel_then_final() {
 fn streamed_small_frame_degenerates_to_legacy() {
     let (pkts, src) = streamed_packets(FecScheme::Gf16, 50, &[&[0x5Au8; 40]]);
     for p in &pkts {
-        let h = PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
+        let h = hdr(p);
         assert_eq!(
             h.block_count, 1,
             "single-block streamed AU must be legacy-shaped"
@@ -798,9 +793,7 @@ fn streamed_small_frame_degenerates_to_legacy() {
 /// Drop a sentinel that is not full-K, claims a non-zero total, or leaves no room for a final block.
 #[test]
 fn streamed_sentinel_firewall_bounds() {
-    let mut r = Reassembler::new(limits());
-    let coder = coder_for(FecScheme::Gf8);
-    let stats = StatsCounters::default();
+    let mut rig = Rig::with(limits(), FecScheme::Gf8);
     let sentinel = |f: fn(&mut PacketHeader)| {
         let mut h = base_header();
         h.block_count = 0;
@@ -811,30 +804,18 @@ fn streamed_sentinel_firewall_bounds() {
         h
     };
     let h = sentinel(|h| h.data_shards = 7);
-    assert!(r
-        .push(&packet(h), coder.as_ref(), &stats)
-        .unwrap()
-        .is_none());
+    assert!(rig.push(&packet(h)).is_none());
     let h = sentinel(|h| h.frame_bytes = 64);
-    assert!(r
-        .push(&packet(h), coder.as_ref(), &stats)
-        .unwrap()
-        .is_none());
+    assert!(rig.push(&packet(h)).is_none());
     // derived max_blocks is 32; no room for a final after index 31
     let h = sentinel(|h| h.block_index = 31);
-    assert!(r
-        .push(&packet(h), coder.as_ref(), &stats)
-        .unwrap()
-        .is_none());
-    assert_eq!(stats.snapshot().packets_dropped, 3);
+    assert!(rig.push(&packet(h)).is_none());
+    assert_eq!(rig.stats.snapshot().packets_dropped, 3);
     // Conformant sentinel accepted — rejections above are not vacuous.
     let h = sentinel(|_| {});
-    assert!(r
-        .push(&packet(h), coder.as_ref(), &stats)
-        .unwrap()
-        .is_none());
+    assert!(rig.push(&packet(h)).is_none());
     assert_eq!(
-        stats.snapshot().packets_dropped,
+        rig.stats.snapshot().packets_dropped,
         3,
         "conformant sentinel accepted"
     );
@@ -843,9 +824,7 @@ fn streamed_sentinel_firewall_bounds() {
 /// Final totals that put a received sentinel out of range kill the whole frame; stragglers cannot resurrect it.
 #[test]
 fn streamed_lying_final_totals_kill_the_frame_wholesale() {
-    let mut r = Reassembler::new(limits());
-    let coder = coder_for(FecScheme::Gf8);
-    let stats = StatsCounters::default();
+    let mut rig = Rig::with(limits(), FecScheme::Gf8);
     for bi in 0..2u16 {
         let mut h = base_header();
         h.block_count = 0;
@@ -853,10 +832,7 @@ fn streamed_lying_final_totals_kill_the_frame_wholesale() {
         h.data_shards = 8;
         h.recovery_shards = 0;
         h.block_index = bi;
-        assert!(r
-            .push(&packet(h), coder.as_ref(), &stats)
-            .unwrap()
-            .is_none());
+        assert!(rig.push(&packet(h)).is_none());
     }
     // Final claiming one 16-byte shard is self-valid (expect_blocks=1, K=1) but disowns both sentinels.
     let mut lying = base_header();
@@ -864,11 +840,8 @@ fn streamed_lying_final_totals_kill_the_frame_wholesale() {
     lying.frame_bytes = 16;
     lying.data_shards = 1;
     lying.recovery_shards = 0;
-    assert!(r
-        .push(&packet(lying), coder.as_ref(), &stats)
-        .unwrap()
-        .is_none());
-    let snap = stats.snapshot();
+    assert!(rig.push(&packet(lying)).is_none());
+    let snap = rig.stats.snapshot();
     assert_eq!(
         snap.frames_dropped, 1,
         "the lying frame must be counted lost"
@@ -878,13 +851,10 @@ fn streamed_lying_final_totals_kill_the_frame_wholesale() {
     h.frame_bytes = 0;
     h.data_shards = 8;
     h.recovery_shards = 0;
-    let before = stats.snapshot().packets_dropped;
-    assert!(r
-        .push(&packet(h), coder.as_ref(), &stats)
-        .unwrap()
-        .is_none());
+    let before = rig.stats.snapshot().packets_dropped;
+    assert!(rig.push(&packet(h)).is_none());
     assert_eq!(
-        stats.snapshot().packets_dropped,
+        rig.stats.snapshot().packets_dropped,
         before + 1,
         "straggler for a killed frame must be dropped, not re-open it"
     );
@@ -934,39 +904,17 @@ fn slice_streamed_packets() -> (Vec<Vec<u8>>, Vec<u8>) {
     for c in slice_chunks() {
         src.extend_from_slice(&c);
         pk.push_streamed(&mut au, &c, true, coder.as_ref(), |h, b| {
-            let mut p = Vec::with_capacity(HEADER_LEN + b.len());
-            p.extend_from_slice(h.as_bytes());
-            p.extend_from_slice(b);
-            pkts.push(p);
+            pkts.push(wire(h, b));
             Ok(())
         })
         .unwrap();
     }
     pk.finish_streamed(au, coder.as_ref(), |h, b| {
-        let mut p = Vec::with_capacity(HEADER_LEN + b.len());
-        p.extend_from_slice(h.as_bytes());
-        p.extend_from_slice(b);
-        pkts.push(p);
+        pkts.push(wire(h, b));
         Ok(())
     })
     .unwrap();
     (pkts, src)
-}
-
-fn push_all(
-    r: &mut Reassembler,
-    coder: &dyn crate::fec::ErasureCoder,
-    stats: &StatsCounters,
-    delivery: &[Vec<u8>],
-) -> Option<crate::session::Frame> {
-    let mut got = None;
-    for p in delivery {
-        if let Some(f) = r.push(p, coder, stats).unwrap() {
-            assert!(got.is_none(), "frame must complete exactly once");
-            got = Some(f);
-        }
-    }
-    got
 }
 
 /// Slice packets carry `USER_FLAG_SLICE_STREAM`; sentinel `frame_bytes` is the shard-aligned block base.
@@ -978,7 +926,7 @@ fn slice_streamed_wire_shape_and_roundtrip() {
     // Block 0 keeps one shard (chunk 0 is an exact multiple) into block 1.
     let expect = [(0u16, 19u16, 0u32), (1, 26, 304), (2, 18, 720)];
     for p in &pkts {
-        let h = PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
+        let h = hdr(p);
         assert_ne!(
             h.user_flags & USER_FLAG_SLICE_STREAM,
             0,
@@ -998,10 +946,9 @@ fn slice_streamed_wire_shape_and_roundtrip() {
     }
 
     let cfg = slice_config();
-    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-    let coder = coder_for(FecScheme::Gf16);
-    let stats = StatsCounters::default();
-    let f = push_all(&mut r, coder.as_ref(), &stats, &pkts)
+    let mut rig = Rig::new(&cfg);
+    let f = rig
+        .push_all(&pkts)
         .expect("slice-streamed frame must complete");
     assert_eq!(f.data, src, "reassembled slice AU must be byte-identical");
     assert_ne!(f.flags & USER_FLAG_SLICE_STREAM, 0);
@@ -1011,26 +958,20 @@ fn slice_streamed_wire_shape_and_roundtrip() {
 #[test]
 fn slice_streamed_survives_loss_and_reorder() {
     let (pkts, src) = slice_streamed_packets();
-    let mut delivery: Vec<Vec<u8>> = pkts
-        .iter()
-        .filter(|p| {
-            let h = PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
-            // Kill data 2/5/17 of block 0 and 3/7 of block 1 — within 50% parity.
-            !(h.block_count == 0
-                && ((h.block_index == 0 && [2, 5, 17].contains(&h.shard_index))
-                    || (h.block_index == 1 && [3, 7].contains(&h.shard_index))))
-        })
-        .cloned()
-        .collect();
+    // Kill data 2/5/17 of block 0 and 3/7 of block 1 — within 50% parity.
+    let mut delivery = select(&pkts, |h| {
+        !(h.block_count == 0
+            && ((h.block_index == 0 && [2, 5, 17].contains(&h.shard_index))
+                || (h.block_index == 1 && [3, 7].contains(&h.shard_index))))
+    });
     delivery.reverse();
     let dup = delivery.first().cloned().unwrap();
     delivery.push(dup);
 
     let cfg = slice_config();
-    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-    let coder = coder_for(FecScheme::Gf16);
-    let stats = StatsCounters::default();
-    let f = push_all(&mut r, coder.as_ref(), &stats, &delivery)
+    let mut rig = Rig::new(&cfg);
+    let f = rig
+        .push_all(&delivery)
         .expect("slice-streamed frame must complete within the FEC budget");
     assert_eq!(f.data, src);
 }
@@ -1039,43 +980,30 @@ fn slice_streamed_survives_loss_and_reorder() {
 #[test]
 fn slice_streamed_post_pin_out_of_range_sentinel_dropped() {
     let (pkts, src) = slice_streamed_packets();
-    let hdr_of = |p: &Vec<u8>| PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
 
     let cfg = slice_config();
-    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-    let coder = coder_for(FecScheme::Gf16);
-    let stats = StatsCounters::default();
+    let mut rig = Rig::new(&cfg);
 
     // Final block first — pins totals (64 data shards, final K = 1).
-    let finals: Vec<Vec<u8>> = pkts
-        .iter()
-        .filter(|p| hdr_of(p).block_count != 0)
-        .cloned()
-        .collect();
-    assert!(push_all(&mut r, coder.as_ref(), &stats, &finals).is_none());
+    let finals: Vec<Vec<u8>> = select(&pkts, |h| h.block_count != 0);
+    assert!(rig.push_all(&finals).is_none());
 
     // Block 0 claiming base shard 60: 60+20 > 63 overlaps the final block. Drop, do not kill the frame.
-    let mut evil = pkts
+    let first = pkts
         .iter()
         .find(|p| {
-            let h = hdr_of(p);
+            let h = hdr(p);
             h.block_count == 0 && h.block_index == 0 && h.shard_index == 0
         })
-        .cloned()
         .unwrap();
-    let mut h = PacketHeader::read_from_bytes(&evil[..HEADER_LEN]).unwrap();
-    h.frame_bytes = 60 * 16;
-    evil[..HEADER_LEN].copy_from_slice(h.as_bytes());
-    let before = stats.snapshot().packets_dropped;
-    assert!(r.push(&evil, coder.as_ref(), &stats).unwrap().is_none());
-    assert_eq!(stats.snapshot().packets_dropped, before + 1);
+    let evil = patch(first, |h| h.frame_bytes = 60 * 16);
+    let before = rig.stats.snapshot().packets_dropped;
+    assert!(rig.push(&evil).is_none());
+    assert_eq!(rig.stats.snapshot().packets_dropped, before + 1);
 
-    let rest: Vec<Vec<u8>> = pkts
-        .iter()
-        .filter(|p| hdr_of(p).block_count == 0)
-        .cloned()
-        .collect();
-    let f = push_all(&mut r, coder.as_ref(), &stats, &rest)
+    let rest: Vec<Vec<u8>> = select(&pkts, |h| h.block_count == 0);
+    let f = rig
+        .push_all(&rest)
         .expect("the honest blocks must still complete the frame");
     assert_eq!(f.data, src);
 }
@@ -1084,46 +1012,32 @@ fn slice_streamed_post_pin_out_of_range_sentinel_dropped() {
 #[test]
 fn slice_streamed_lying_final_kills_frame() {
     let (pkts, _) = slice_streamed_packets();
-    let hdr_of = |p: &Vec<u8>| PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
 
     let cfg = slice_config();
-    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-    let coder = coder_for(FecScheme::Gf16);
-    let stats = StatsCounters::default();
+    let mut rig = Rig::new(&cfg);
 
-    let sentinels: Vec<Vec<u8>> = pkts
-        .iter()
-        .filter(|p| hdr_of(p).block_count == 0)
-        .cloned()
-        .collect();
-    assert!(push_all(&mut r, coder.as_ref(), &stats, &sentinels).is_none());
+    let sentinels: Vec<Vec<u8>> = select(&pkts, |h| h.block_count == 0);
+    assert!(rig.push_all(&sentinels).is_none());
 
     // Final K=30 puts final base at shard 34; block 2 (base 45, K 18) needs base ≥ 63.
-    let mut lying = pkts
+    let final_first = pkts
         .iter()
         .find(|p| {
-            let h = hdr_of(p);
+            let h = hdr(p);
             h.block_count != 0 && h.shard_index == 0
         })
-        .cloned()
         .unwrap();
-    let mut h = PacketHeader::read_from_bytes(&lying[..HEADER_LEN]).unwrap();
-    h.data_shards = 30;
-    lying[..HEADER_LEN].copy_from_slice(h.as_bytes());
-    assert!(r.push(&lying, coder.as_ref(), &stats).unwrap().is_none());
+    let lying = patch(final_first, |h| h.data_shards = 30);
+    assert!(rig.push(&lying).is_none());
     assert_eq!(
-        stats.snapshot().frames_dropped,
+        rig.stats.snapshot().frames_dropped,
         1,
         "the lying frame must be counted lost"
     );
 
-    let finals: Vec<Vec<u8>> = pkts
-        .iter()
-        .filter(|p| hdr_of(p).block_count != 0)
-        .cloned()
-        .collect();
-    assert!(push_all(&mut r, coder.as_ref(), &stats, &finals).is_none());
-    assert_eq!(stats.snapshot().frames_dropped, 1);
+    let finals: Vec<Vec<u8>> = select(&pkts, |h| h.block_count != 0);
+    assert!(rig.push_all(&finals).is_none());
+    assert_eq!(rig.stats.snapshot().frames_dropped, 1);
 }
 
 /// A sentinel base that passes range checks but breaks tiling (gap + overlap) must not
@@ -1131,7 +1045,6 @@ fn slice_streamed_lying_final_kills_frame() {
 #[test]
 fn slice_streamed_lying_base_within_bounds_kills_frame() {
     let (pkts, _) = slice_streamed_packets();
-    let hdr_of = |p: &Vec<u8>| PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
 
     // Shift block 1 base from shard 19 to 20 on every packet (base is pinned by the first).
     // Still aligned, still 20+26=46 ≤ 63, but leaves a one-shard gap at 19 and overwrites
@@ -1139,35 +1052,33 @@ fn slice_streamed_lying_base_within_bounds_kills_frame() {
     let delivery: Vec<Vec<u8>> = pkts
         .iter()
         .map(|p| {
-            let mut h = hdr_of(p);
-            if h.block_count == 0 && h.block_index == 1 {
-                let mut p = p.clone();
-                h.frame_bytes = 320;
-                p[..HEADER_LEN].copy_from_slice(h.as_bytes());
-                p
-            } else {
-                p.clone()
-            }
+            patch(p, |h| {
+                if h.block_count == 0 && h.block_index == 1 {
+                    h.frame_bytes = 320;
+                }
+            })
         })
         .collect();
 
     let cfg = slice_config();
-    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-    let coder = coder_for(FecScheme::Gf16);
-    let stats = StatsCounters::default();
+    let mut rig = Rig::new(&cfg);
     assert!(
-        push_all(&mut r, coder.as_ref(), &stats, &delivery).is_none(),
+        rig.push_all(&delivery).is_none(),
         "a mis-tiled frame must never be delivered"
     );
     assert_eq!(
-        stats.snapshot().frames_dropped,
+        rig.stats.snapshot().frames_dropped,
         1,
         "the mis-tiled frame must be counted lost"
     );
-    assert_eq!(r.in_flight(), 0, "the killed frame must release its budget");
+    assert_eq!(
+        rig.r.in_flight(),
+        0,
+        "the killed frame must release its budget"
+    );
 
-    assert!(push_all(&mut r, coder.as_ref(), &stats, &delivery).is_none());
-    assert_eq!(stats.snapshot().frames_dropped, 1);
+    assert!(rig.push_all(&delivery).is_none());
+    assert_eq!(rig.stats.snapshot().frames_dropped, 1);
 }
 
 /// One slice larger than a FEC block must emit multiple blocks from a single push; the final block must not be oversized.
@@ -1180,23 +1091,17 @@ fn slice_streamed_giant_slice_cuts_multiple_blocks() {
     let src: Vec<u8> = (0..70 * 16).map(|i| (i * 131 + 7) as u8).collect();
     let mut pkts: Vec<Vec<u8>> = Vec::new();
     pk.push_streamed(&mut au, &src, true, coder.as_ref(), |h, b| {
-        let mut p = Vec::with_capacity(HEADER_LEN + b.len());
-        p.extend_from_slice(h.as_bytes());
-        p.extend_from_slice(b);
-        pkts.push(p);
+        pkts.push(wire(h, b));
         Ok(())
     })
     .unwrap();
     pk.finish_streamed(au, coder.as_ref(), |h, b| {
-        let mut p = Vec::with_capacity(HEADER_LEN + b.len());
-        p.extend_from_slice(h.as_bytes());
-        p.extend_from_slice(b);
-        pkts.push(p);
+        pkts.push(wire(h, b));
         Ok(())
     })
     .unwrap();
     for p in &pkts {
-        let h = PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
+        let h = hdr(p);
         if h.block_count == 0 {
             assert_eq!((h.block_index, h.data_shards, h.frame_bytes), (0, 64, 0));
         } else {
@@ -1204,9 +1109,8 @@ fn slice_streamed_giant_slice_cuts_multiple_blocks() {
             assert_eq!(h.frame_bytes as usize, src.len());
         }
     }
-    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-    let stats = StatsCounters::default();
-    let f = push_all(&mut r, coder.as_ref(), &stats, &pkts).expect("must complete");
+    let mut rig = Rig::new(&cfg);
+    let f = rig.push_all(&pkts).expect("must complete");
     assert_eq!(f.data, src);
 }
 
@@ -1225,32 +1129,25 @@ fn slice_streamed_small_kmax_roundtrip() {
             .collect();
         src.extend_from_slice(&chunk);
         pk.push_streamed(&mut au, &chunk, true, coder.as_ref(), |h, b| {
-            let mut p = Vec::with_capacity(HEADER_LEN + b.len());
-            p.extend_from_slice(h.as_bytes());
-            p.extend_from_slice(b);
-            pkts.push(p);
+            pkts.push(wire(h, b));
             Ok(())
         })
         .unwrap();
     }
     pk.finish_streamed(au, coder.as_ref(), |h, b| {
-        let mut p = Vec::with_capacity(HEADER_LEN + b.len());
-        p.extend_from_slice(h.as_bytes());
-        p.extend_from_slice(b);
-        pkts.push(p);
+        pkts.push(wire(h, b));
         Ok(())
     })
     .unwrap();
     for p in &pkts {
-        let h = PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
+        let h = hdr(p);
         if h.block_count == 0 {
             assert_eq!(h.data_shards, 4, "floor clamps to full-K blocks");
             assert_eq!(h.frame_bytes % (4 * 16), 0, "bases advance block-wise");
         }
     }
-    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-    let stats = StatsCounters::default();
-    let f = push_all(&mut r, coder.as_ref(), &stats, &pkts).expect("must complete");
+    let mut rig = Rig::new(&cfg);
+    let f = rig.push_all(&pkts).expect("must complete");
     assert_eq!(f.data, src);
 }
 
@@ -1258,23 +1155,20 @@ fn slice_streamed_small_kmax_roundtrip() {
 #[test]
 fn slice_streamed_mixed_flag_packet_dropped() {
     let (pkts, _) = slice_streamed_packets();
-    let hdr_of = |p: &Vec<u8>| PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
 
     let cfg = slice_config();
-    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-    let coder = coder_for(FecScheme::Gf16);
-    let stats = StatsCounters::default();
+    let mut rig = Rig::new(&cfg);
 
     let first = pkts
         .iter()
-        .find(|p| hdr_of(p).block_count == 0)
+        .find(|p| hdr(p).block_count == 0)
         .cloned()
         .unwrap();
-    assert!(r.push(&first, coder.as_ref(), &stats).unwrap().is_none());
+    assert!(rig.push(&first).is_none());
 
     // Legacy one-shard final that would pass the legacy firewall; only the flag check
     // stops it pinning this slice-opened frame under uniform rules.
-    let mut h = hdr_of(&first);
+    let mut h = hdr(&first);
     h.user_flags &= !USER_FLAG_SLICE_STREAM;
     h.block_index = 0;
     h.block_count = 1;
@@ -1282,44 +1176,29 @@ fn slice_streamed_mixed_flag_packet_dropped() {
     h.data_shards = 1;
     h.recovery_shards = 0;
     h.shard_index = 0;
-    let mut legacy = Vec::with_capacity(HEADER_LEN + 16);
-    legacy.extend_from_slice(h.as_bytes());
-    legacy.extend_from_slice(&[0xEE; 16]);
-    let before = stats.snapshot().packets_dropped;
-    assert!(r.push(&legacy, coder.as_ref(), &stats).unwrap().is_none());
-    assert_eq!(stats.snapshot().packets_dropped, before + 1);
-    assert_eq!(stats.snapshot().frames_dropped, 0, "dropped, not killed");
+    let legacy = wire(&h, &[0xEE; 16]);
+    let before = rig.stats.snapshot().packets_dropped;
+    assert!(rig.push(&legacy).is_none());
+    assert_eq!(rig.stats.snapshot().packets_dropped, before + 1);
+    assert_eq!(
+        rig.stats.snapshot().frames_dropped,
+        0,
+        "dropped, not killed"
+    );
 }
 
 // ---------------------------------------------------------------------------
 // Slice-progressive prefix delivery (Frame::part)
 // ---------------------------------------------------------------------------
 
-fn push_collect(
-    r: &mut Reassembler,
-    coder: &dyn crate::fec::ErasureCoder,
-    stats: &StatsCounters,
-    delivery: &[Vec<u8>],
-) -> Vec<crate::session::Frame> {
-    let mut out = Vec::new();
-    for p in delivery {
-        if let Some(f) = r.push(p, coder, stats).unwrap() {
-            out.push(f);
-        }
-    }
-    out
-}
-
 /// In-order: one part per completed block; last part is the suffix with `last` + `complete`.
 #[test]
 fn parts_stream_in_order() {
     let (pkts, src) = slice_streamed_packets();
     let cfg = slice_config();
-    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-    r.set_deliver_parts(true);
-    let coder = coder_for(FecScheme::Gf16);
-    let stats = StatsCounters::default();
-    let got = push_collect(&mut r, coder.as_ref(), &stats, &pkts);
+    let mut rig = Rig::new(&cfg);
+    rig.r.set_deliver_parts(true);
+    let got = rig.push_collect(&pkts);
     assert_eq!(
         got.len(),
         4,
@@ -1345,7 +1224,7 @@ fn parts_stream_in_order() {
     }
     assert_eq!(rebuilt, src, "concatenated parts must be the byte-exact AU");
     assert_eq!(
-        stats.snapshot().frames_completed,
+        rig.stats.snapshot().frames_completed,
         0,
         "the reassembler leaves the completion count to the session boundary"
     );
@@ -1355,27 +1234,19 @@ fn parts_stream_in_order() {
 #[test]
 fn parts_coalesce_across_reordered_blocks() {
     let (pkts, src) = slice_streamed_packets();
-    let hdr_of = |p: &Vec<u8>| PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
     // Blocks 1 and 2 fully first, then block 0, then the final block.
     let mut delivery: Vec<Vec<u8>> = Vec::new();
     for want in [1u16, 2, 0] {
-        delivery.extend(
-            pkts.iter()
-                .filter(|p| {
-                    let h = hdr_of(p);
-                    h.block_count == 0 && h.block_index == want
-                })
-                .cloned(),
-        );
+        delivery.extend(select(&pkts, |h| {
+            h.block_count == 0 && h.block_index == want
+        }));
     }
-    delivery.extend(pkts.iter().filter(|p| hdr_of(p).block_count != 0).cloned());
+    delivery.extend(select(&pkts, |h| h.block_count != 0));
 
     let cfg = slice_config();
-    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-    r.set_deliver_parts(true);
-    let coder = coder_for(FecScheme::Gf16);
-    let stats = StatsCounters::default();
-    let got = push_collect(&mut r, coder.as_ref(), &stats, &delivery);
+    let mut rig = Rig::new(&cfg);
+    rig.r.set_deliver_parts(true);
+    let got = rig.push_collect(&delivery);
     assert_eq!(got.len(), 2, "one coalesced prefix part + the final suffix");
     let p0 = got[0].part.unwrap();
     assert_eq!((p0.offset, p0.first, p0.last), (0, true, false));
@@ -1391,22 +1262,14 @@ fn parts_coalesce_across_reordered_blocks() {
 #[test]
 fn parts_wait_for_fec_reconstruction() {
     let (pkts, src) = slice_streamed_packets();
-    let hdr_of = |p: &Vec<u8>| PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
     // Kill two data shards of block 0 — within the 50% parity budget.
-    let delivery: Vec<Vec<u8>> = pkts
-        .iter()
-        .filter(|p| {
-            let h = hdr_of(p);
-            !(h.block_count == 0 && h.block_index == 0 && [1, 7].contains(&h.shard_index))
-        })
-        .cloned()
-        .collect();
+    let delivery = select(&pkts, |h| {
+        !(h.block_count == 0 && h.block_index == 0 && [1, 7].contains(&h.shard_index))
+    });
     let cfg = slice_config();
-    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-    r.set_deliver_parts(true);
-    let coder = coder_for(FecScheme::Gf16);
-    let stats = StatsCounters::default();
-    let got = push_collect(&mut r, coder.as_ref(), &stats, &delivery);
+    let mut rig = Rig::new(&cfg);
+    rig.r.set_deliver_parts(true);
+    let got = rig.push_collect(&delivery);
     let mut rebuilt = Vec::new();
     for f in &got {
         rebuilt.extend_from_slice(&f.data);
@@ -1426,10 +1289,9 @@ fn parts_degenerate_whole_frame() {
     let mut pk = Packetizer::new(&cfg);
     let src: Vec<u8> = (0..40).map(|i| i as u8).collect();
     let pkts = pk.packetize(&src, 7, 0, coder.as_ref()).unwrap();
-    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-    r.set_deliver_parts(true);
-    let stats = StatsCounters::default();
-    let got = push_collect(&mut r, coder.as_ref(), &stats, &pkts);
+    let mut rig = Rig::new(&cfg);
+    rig.r.set_deliver_parts(true);
+    let got = rig.push_collect(&pkts);
     assert_eq!(got.len(), 1);
     let f = &got[0];
     assert_eq!(
@@ -1453,11 +1315,9 @@ fn parts_flow_for_legacy_streamed_frames() {
     let chunk_refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
     let (pkts, src) = streamed_packets(FecScheme::Gf16, 50, &chunk_refs);
     let cfg = e2e_config(FecScheme::Gf16, 50);
-    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-    r.set_deliver_parts(true);
-    let coder = coder_for(FecScheme::Gf16);
-    let stats = StatsCounters::default();
-    let got = push_collect(&mut r, coder.as_ref(), &stats, &pkts);
+    let mut rig = Rig::new(&cfg);
+    rig.r.set_deliver_parts(true);
+    let got = rig.push_collect(&pkts);
     assert!(got.len() > 1, "sentinel blocks must deliver early parts");
     let mut rebuilt = Vec::new();
     for f in &got {
@@ -1471,11 +1331,9 @@ fn parts_flow_for_legacy_streamed_frames() {
 /// wire base sits near the frame ceiling is still bounded by the in-flight budget.
 #[test]
 fn streamed_open_commits_its_own_extent_and_stays_bounded() {
-    let coder = coder_for(FecScheme::Gf8);
     // limits(): 16 B shards, max_data_shards 8, max_frame_bytes 4096 → budget 4×4096.
     // Modest legacy sentinels (K=8 → 128 B) must not exhaust it.
-    let mut r = Reassembler::new(limits());
-    let stats = StatsCounters::default();
+    let mut rig = Rig::with(limits(), FecScheme::Gf8);
     for fi in 0..32u32 {
         let mut h = base_header();
         h.block_count = 0;
@@ -1483,13 +1341,10 @@ fn streamed_open_commits_its_own_extent_and_stays_bounded() {
         h.data_shards = 8;
         h.recovery_shards = 0;
         h.frame_index = fi;
-        assert!(r
-            .push(&packet(h), coder.as_ref(), &stats)
-            .unwrap()
-            .is_none());
+        assert!(rig.push(&packet(h)).is_none());
     }
     assert_eq!(
-        stats.snapshot().packets_dropped,
+        rig.stats.snapshot().packets_dropped,
         0,
         "ordinary one-datagram opens must not exhaust the in-flight budget"
     );
@@ -1498,8 +1353,7 @@ fn streamed_open_commits_its_own_extent_and_stays_bounded() {
     let lim = limits();
     let budget = IN_FLIGHT_BUF_FACTOR * lim.max_frame_bytes;
     let fits = budget / (4096 + block_state_bytes(8, 0));
-    let mut r = Reassembler::new(lim);
-    let stats = StatsCounters::default();
+    let mut rig = Rig::with(lim, FecScheme::Gf8);
     for fi in 0..=fits as u32 {
         let mut h = base_header();
         h.user_flags = USER_FLAG_SLICE_STREAM;
@@ -1509,18 +1363,15 @@ fn streamed_open_commits_its_own_extent_and_stays_bounded() {
         h.data_shards = 8;
         h.recovery_shards = 0;
         h.frame_index = fi;
-        assert!(r
-            .push(&packet(h), coder.as_ref(), &stats)
-            .unwrap()
-            .is_none());
+        assert!(rig.push(&packet(h)).is_none());
     }
     assert!(
-        r.in_flight() <= budget,
+        rig.r.in_flight() <= budget,
         "in-flight commitment {} must never exceed the {budget} B budget",
-        r.in_flight(),
+        rig.r.in_flight(),
     );
     assert_eq!(
-        stats.snapshot().packets_dropped,
+        rig.stats.snapshot().packets_dropped,
         1,
         "the first ceiling-claiming open past the budget must be refused"
     );
@@ -1530,9 +1381,7 @@ fn streamed_open_commits_its_own_extent_and_stays_bounded() {
 /// write would land outside the exact-sized buffer) without corrupting the in-flight frame.
 #[test]
 fn streamed_out_of_range_sentinel_after_final_first_is_dropped() {
-    let mut r = Reassembler::new(limits());
-    let coder = coder_for(FecScheme::Gf8);
-    let stats = StatsCounters::default();
+    let mut rig = Rig::with(limits(), FecScheme::Gf8);
     // Final opens: block_count=1, frame_bytes=32 → K=2. One shard so totals pin while still in flight.
     let mut fin = base_header();
     fin.block_count = 1;
@@ -1540,10 +1389,7 @@ fn streamed_out_of_range_sentinel_after_final_first_is_dropped() {
     fin.data_shards = 2;
     fin.recovery_shards = 0;
     fin.shard_index = 0;
-    assert!(r
-        .push(&packet(fin), coder.as_ref(), &stats)
-        .unwrap()
-        .is_none());
+    assert!(rig.push(&packet(fin)).is_none());
     // Sentinels at slot 0 and 1 are non-final under pinned block_count=1; never write the 32-byte buffer.
     for bi in 0..2u16 {
         let mut h = base_header();
@@ -1552,17 +1398,13 @@ fn streamed_out_of_range_sentinel_after_final_first_is_dropped() {
         h.data_shards = 8;
         h.recovery_shards = 0;
         h.block_index = bi;
-        assert!(r
-            .push(&packet(h), coder.as_ref(), &stats)
-            .unwrap()
-            .is_none());
+        assert!(rig.push(&packet(h)).is_none());
     }
-    assert_eq!(stats.snapshot().packets_dropped, 2);
+    assert_eq!(rig.stats.snapshot().packets_dropped, 2);
     let mut fin2 = fin;
     fin2.shard_index = 1;
-    let got = r
-        .push(&packet(fin2), coder.as_ref(), &stats)
-        .unwrap()
+    let got = rig
+        .push(&packet(fin2))
         .expect("frame must still complete after the rejected sentinels");
     assert_eq!(got.data.len(), 32);
     assert!(got.complete);
@@ -1571,9 +1413,7 @@ fn streamed_out_of_range_sentinel_after_final_first_is_dropped() {
 /// A second final with different totals is rejected once pinned; the frame completes under the first totals.
 #[test]
 fn streamed_second_final_with_different_totals_is_rejected() {
-    let mut r = Reassembler::new(limits());
-    let coder = coder_for(FecScheme::Gf8);
-    let stats = StatsCounters::default();
+    let mut rig = Rig::with(limits(), FecScheme::Gf8);
     let sentinel_shard = |shard_index: u16| {
         let mut h = base_header();
         h.block_count = 0;
@@ -1595,33 +1435,21 @@ fn streamed_second_final_with_different_totals_is_rejected() {
         h
     };
     // Sentinel opens block 0, then the real final pins totals: 10 shards = 160 bytes.
-    assert!(r
-        .push(&packet(sentinel_shard(0)), coder.as_ref(), &stats)
-        .unwrap()
-        .is_none());
-    assert!(r
-        .push(&packet(final_shard(160, 2, 0)), coder.as_ref(), &stats)
-        .unwrap()
-        .is_none());
+    assert!(rig.push(&packet(sentinel_shard(0))).is_none());
+    assert!(rig.push(&packet(final_shard(160, 2, 0))).is_none());
     // Second final claiming 144 B (K=1) is self-valid but contradicts the pin.
-    let before = stats.snapshot().packets_dropped;
-    assert!(r
-        .push(&packet(final_shard(144, 1, 0)), coder.as_ref(), &stats)
-        .unwrap()
-        .is_none());
-    assert_eq!(stats.snapshot().packets_dropped, before + 1);
+    let before = rig.stats.snapshot().packets_dropped;
+    assert!(rig.push(&packet(final_shard(144, 1, 0))).is_none());
+    assert_eq!(rig.stats.snapshot().packets_dropped, before + 1);
     // Remaining block-0 shards plus the original final tail complete under the first pin.
     let mut got = None;
     for s in 1..8u16 {
         assert!(got.is_none());
-        got = r
-            .push(&packet(sentinel_shard(s)), coder.as_ref(), &stats)
-            .unwrap();
+        got = rig.push(&packet(sentinel_shard(s)));
     }
     assert!(got.is_none(), "block 1 still owes a shard");
-    let got = r
-        .push(&packet(final_shard(160, 2, 1)), coder.as_ref(), &stats)
-        .unwrap()
+    let got = rig
+        .push(&packet(final_shard(160, 2, 1)))
         .expect("frame completes under the first pinned totals");
     assert_eq!(got.data.len(), 160);
 }
@@ -1686,14 +1514,13 @@ fn streamed_packets_with(
 #[test]
 fn slice_streamed_exact_shard_multiple_completes() {
     let cfg = prod_slice_config();
-    let coder = coder_for(FecScheme::Gf16);
     let payload = cfg.shard_payload;
     for shards in [16usize, 29, 30, 64] {
         let (pkts, src) = streamed_packets_with(&cfg, 1, 1000, true, &[shards * payload]);
         // Final block must carry real bytes, never a lone zero-pad sitting on the previous block.
-        let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-        let stats = StatsCounters::default();
-        let f = push_all(&mut r, coder.as_ref(), &stats, &pkts)
+        let mut rig = Rig::new(&cfg);
+        let f = rig
+            .push_all(&pkts)
             .unwrap_or_else(|| panic!("{shards}-shard AU (exact multiple) must complete"));
         assert_eq!(f.data, src, "{shards}-shard AU must be byte-identical");
     }
@@ -1701,9 +1528,9 @@ fn slice_streamed_exact_shard_multiple_completes() {
     for extra in 0..3usize {
         let n = 30 * payload + extra;
         let (pkts, src) = streamed_packets_with(&cfg, 2, 2000, true, &[n]);
-        let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-        let stats = StatsCounters::default();
-        let f = push_all(&mut r, coder.as_ref(), &stats, &pkts)
+        let mut rig = Rig::new(&cfg);
+        let f = rig
+            .push_all(&pkts)
             .unwrap_or_else(|| panic!("{n}-byte AU must complete"));
         assert_eq!(f.data, src);
     }
@@ -1714,19 +1541,15 @@ fn slice_streamed_exact_shard_multiple_completes() {
 #[test]
 fn slice_streamed_in_flight_budget_matches_legacy() {
     let cfg = prod_slice_config();
-    let coder = coder_for(FecScheme::Gf16);
     // 40 KB AU opened but not completed — several of these sit in flight under reorder.
     for slice in [false, true] {
-        let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-        let stats = StatsCounters::default();
+        let mut rig = Rig::new(&cfg);
         for i in 0..12u32 {
             let (pkts, _) = streamed_packets_with(&cfg, i, 1_000_000 * i as u64, slice, &[40_000]);
-            r.push(&pkts[0], coder.as_ref(), &stats).unwrap();
+            rig.push(&pkts[0]);
         }
         assert_eq!(
-            stats
-                .packets_dropped
-                .load(std::sync::atomic::Ordering::Relaxed),
+            rig.stats.snapshot().packets_dropped,
             0,
             "slice={slice}: 12 ordinary AUs in flight must fit the in-flight budget"
         );
@@ -1761,10 +1584,7 @@ fn legacy_packets_with(
         .collect();
     let mut pkts: Vec<Vec<u8>> = Vec::new();
     pk.packetize_each(&src, pts_ns, 0, Some(frame_index), coder, |h, b| {
-        let mut p = Vec::with_capacity(HEADER_LEN + b.len());
-        p.extend_from_slice(h.as_bytes());
-        p.extend_from_slice(b);
-        pkts.push(p);
+        pkts.push(wire(h, b));
         Ok(())
     })
     .unwrap();
@@ -1775,7 +1595,6 @@ fn legacy_packets_with(
 /// streamed, in-flight budget — each must deliver byte-identical frames.
 #[test]
 fn slice_wire_suite_at_production_shard_sizes() {
-    let coder = coder_for(FecScheme::Gf16);
     for &shard in &PRODUCTION_SHARDS {
         let cfg = geo_config(shard);
 
@@ -1783,16 +1602,16 @@ fn slice_wire_suite_at_production_shard_sizes() {
             for extra in 0..3usize {
                 let n = shards * shard + extra;
                 let (pkts, src) = streamed_packets_with(&cfg, 1, 1000, true, &[n]);
-                let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-                let stats = StatsCounters::default();
-                let f = push_all(&mut r, coder.as_ref(), &stats, &pkts)
+                let mut rig = Rig::new(&cfg);
+                let f = rig
+                    .push_all(&pkts)
                     .unwrap_or_else(|| panic!("shard {shard}: {n}-byte slice AU must complete"));
                 assert_eq!(
                     f.data, src,
                     "shard {shard}: {n}-byte AU must be byte-identical"
                 );
                 assert_eq!(
-                    r.in_flight(),
+                    rig.r.in_flight(),
                     0,
                     "shard {shard}: budget must return to zero"
                 );
@@ -1806,7 +1625,7 @@ fn slice_wire_suite_at_production_shard_sizes() {
             let killed = pkts
                 .iter()
                 .position(|p| {
-                    let h = PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
+                    let h = hdr(p);
                     h.shard_index < h.data_shards && h.recovery_shards >= 1
                 })
                 .expect("suite frame must have a recoverable data shard");
@@ -1819,38 +1638,34 @@ fn slice_wire_suite_at_production_shard_sizes() {
             if reverse {
                 delivery.reverse();
             }
-            let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-            let stats = StatsCounters::default();
-            let f = push_all(&mut r, coder.as_ref(), &stats, &delivery).unwrap_or_else(|| {
+            let mut rig = Rig::new(&cfg);
+            let f = rig.push_all(&delivery).unwrap_or_else(|| {
                 panic!("shard {shard} reverse={reverse}: lossy slice AU must complete")
             });
             assert_eq!(f.data, src, "shard {shard} reverse={reverse}");
-            assert_eq!(r.in_flight(), 0);
+            assert_eq!(rig.r.in_flight(), 0);
         }
 
         // Uniform full-K sentinel: AU spanning a K=200 sentinel plus a final block.
         {
             let (pkts, src) = streamed_packets_with(&cfg, 3, 3000, false, &[230 * shard]);
-            let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-            let stats = StatsCounters::default();
-            let f = push_all(&mut r, coder.as_ref(), &stats, &pkts)
+            let mut rig = Rig::new(&cfg);
+            let f = rig
+                .push_all(&pkts)
                 .unwrap_or_else(|| panic!("shard {shard}: legacy-streamed AU must complete"));
             assert_eq!(f.data, src);
-            assert_eq!(r.in_flight(), 0);
+            assert_eq!(rig.r.in_flight(), 0);
         }
 
         for slice in [false, true] {
-            let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-            let stats = StatsCounters::default();
+            let mut rig = Rig::new(&cfg);
             for i in 0..12u32 {
                 let (pkts, _) =
                     streamed_packets_with(&cfg, i, 1_000_000 * i as u64, slice, &[40_000]);
-                r.push(&pkts[0], coder.as_ref(), &stats).unwrap();
+                rig.push(&pkts[0]);
             }
             assert_eq!(
-                stats
-                    .packets_dropped
-                    .load(std::sync::atomic::Ordering::Relaxed),
+                rig.stats.snapshot().packets_dropped,
                 0,
                 "shard {shard} slice={slice}: 12 AUs in flight must fit the budget"
             );
@@ -1865,8 +1680,7 @@ fn mid_stream_shard_swap_delivers_every_frame() {
     let cfg = geo_config(1408);
     let coder = coder_for(FecScheme::Gf16);
     let mut pk = Packetizer::new(&cfg);
-    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-    let stats = StatsCounters::default();
+    let mut rig = Rig::new(&cfg);
 
     // (shard size, AU length); swap happens between AUs.
     let schedule = [
@@ -1882,13 +1696,14 @@ fn mid_stream_shard_swap_delivers_every_frame() {
         let pts = 1_000_000 * (i as u64 + 1);
         let (pkts, src) = legacy_packets_with(&mut pk, i as u32, pts, len, coder.as_ref());
         for p in &pkts {
-            let h = PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
+            let h = hdr(p);
             assert_eq!(
                 h.shard_bytes as usize, shard,
                 "sender must stamp the live size"
             );
         }
-        let f = push_all(&mut r, coder.as_ref(), &stats, &pkts)
+        let f = rig
+            .push_all(&pkts)
             .unwrap_or_else(|| panic!("frame {i} at shard {shard} must complete"));
         assert_eq!(
             f.data, src,
@@ -1897,11 +1712,11 @@ fn mid_stream_shard_swap_delivers_every_frame() {
         assert!(f.complete);
     }
     assert_eq!(
-        r.in_flight(),
+        rig.r.in_flight(),
         0,
         "budget must be exact across geometry swaps"
     );
-    assert_eq!(stats.snapshot().frames_dropped, 0);
+    assert_eq!(rig.stats.snapshot().frames_dropped, 0);
 }
 
 /// An old-geometry frame still in flight when new-geometry frames arrive completes under
@@ -1911,8 +1726,7 @@ fn old_geometry_frame_completes_after_new_geometry_arrived() {
     let cfg = geo_config(1408);
     let coder = coder_for(FecScheme::Gf16);
     let mut pk = Packetizer::new(&cfg);
-    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-    let stats = StatsCounters::default();
+    let mut rig = Rig::new(&cfg);
 
     // Frame 0 at 1408: 7 data + 2 parity. Withhold three data shards so FEC cannot complete it.
     let (pkts0, src0) = legacy_packets_with(&mut pk, 0, 1_000_000, 6 * 1408 + 50, coder.as_ref());
@@ -1924,7 +1738,7 @@ fn old_geometry_frame_completes_after_new_geometry_arrived() {
     let head: Vec<Vec<u8>> = pkts0[..4].iter().chain(&pkts0[7..]).cloned().collect();
     let straggler = &pkts0[4];
     assert!(
-        push_all(&mut r, coder.as_ref(), &stats, &head).is_none(),
+        rig.push_all(&head).is_none(),
         "frame 0 must still be incomplete"
     );
 
@@ -1932,18 +1746,17 @@ fn old_geometry_frame_completes_after_new_geometry_arrived() {
     for i in 1..=2u32 {
         let pts = 1_000_000 + 1_000_000 * i as u64;
         let (pkts, src) = legacy_packets_with(&mut pk, i, pts, 3 * 512 + 7, coder.as_ref());
-        let f = push_all(&mut r, coder.as_ref(), &stats, &pkts).expect("new-geometry frame");
+        let f = rig.push_all(&pkts).expect("new-geometry frame");
         assert_eq!(f.data, src);
     }
 
-    let f = r
-        .push(straggler, coder.as_ref(), &stats)
-        .unwrap()
+    let f = rig
+        .push(straggler)
         .expect("old-geometry frame must complete under its own pin");
     assert_eq!(f.data, src0);
     assert_eq!(f.frame_index, 0);
-    assert_eq!(r.in_flight(), 0);
-    assert_eq!(stats.snapshot().frames_dropped, 0);
+    assert_eq!(rig.r.in_flight(), 0);
+    assert_eq!(rig.stats.snapshot().frames_dropped, 0);
 }
 
 /// A packet with a different in-bounds shard size for an already-pinned frame is dropped.
@@ -1951,8 +1764,7 @@ fn old_geometry_frame_completes_after_new_geometry_arrived() {
 fn cross_geometry_packet_for_a_pinned_frame_is_dropped() {
     let cfg = geo_config(1408);
     let coder = coder_for(FecScheme::Gf16);
-    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
-    let stats = StatsCounters::default();
+    let mut rig = Rig::new(&cfg);
 
     let mut pk_a = Packetizer::new(&geo_config(1408));
     let mut pk_b = Packetizer::new(&geo_config(1216));
@@ -1960,18 +1772,16 @@ fn cross_geometry_packet_for_a_pinned_frame_is_dropped() {
     // Same frame index at 1216: self-consistent, wrong for this frame's pin.
     let (impostor, _) = legacy_packets_with(&mut pk_b, 0, 1_000_000, 5 * 1216, coder.as_ref());
 
-    assert!(r.push(&pkts[0], coder.as_ref(), &stats).unwrap().is_none());
-    let before = stats.snapshot().packets_dropped;
-    assert!(r
-        .push(&impostor[1], coder.as_ref(), &stats)
-        .unwrap()
-        .is_none());
+    assert!(rig.push(&pkts[0]).is_none());
+    let before = rig.stats.snapshot().packets_dropped;
+    assert!(rig.push(&impostor[1]).is_none());
     assert_eq!(
-        stats.snapshot().packets_dropped,
+        rig.stats.snapshot().packets_dropped,
         before + 1,
         "cross-geometry packet must be dropped by the frame pin"
     );
-    let f = push_all(&mut r, coder.as_ref(), &stats, &pkts[1..])
+    let f = rig
+        .push_all(&pkts[1..])
         .expect("the pinned frame must still complete from its real packets");
     assert_eq!(f.data, src, "no impostor bytes may reach the frame");
 }
@@ -1983,9 +1793,7 @@ fn shard_size_firewall_bounds() {
     let lim = ReassemblerLimits::from_config(&cfg);
     assert_eq!(lim.min_shard_bytes, crate::config::MIN_SHARD_PAYLOAD);
     assert_eq!(lim.max_shard_bytes, crate::config::max_shard_payload());
-    let coder = coder_for(FecScheme::Gf16);
-    let mut r = Reassembler::new(lim);
-    let stats = StatsCounters::default();
+    let mut rig = Rig::with(lim, FecScheme::Gf16);
 
     let single = |shard: usize, frame_index: u32| {
         let mut h = base_header();
@@ -1996,13 +1804,10 @@ fn shard_size_firewall_bounds() {
     };
     // 510 below floor (even), 9154 above ceiling (even), 1409 odd within bounds: all dropped.
     for (i, shard) in [510usize, 9154, 1409].into_iter().enumerate() {
-        let before = stats.snapshot().packets_dropped;
-        assert!(r
-            .push(&packet(single(shard, i as u32)), coder.as_ref(), &stats)
-            .unwrap()
-            .is_none());
+        let before = rig.stats.snapshot().packets_dropped;
+        assert!(rig.push(&packet(single(shard, i as u32))).is_none());
         assert_eq!(
-            stats.snapshot().packets_dropped,
+            rig.stats.snapshot().packets_dropped,
             before + 1,
             "shard {shard} must be firewalled"
         );
@@ -2014,13 +1819,8 @@ fn shard_size_firewall_bounds() {
     .into_iter()
     .enumerate()
     {
-        let f = r
-            .push(
-                &packet(single(shard, 10 + i as u32)),
-                coder.as_ref(),
-                &stats,
-            )
-            .unwrap()
+        let f = rig
+            .push(&packet(single(shard, 10 + i as u32)))
             .unwrap_or_else(|| panic!("boundary shard {shard} must deliver"));
         assert_eq!(f.data.len(), shard);
     }
@@ -2031,31 +1831,23 @@ fn shard_size_firewall_bounds() {
 /// still timed, and probe filler is not timed at all.
 #[test]
 fn a_frame_that_never_completes_is_still_timed() {
-    let mut r = Reassembler::new(limits());
-    let coder = coder_for(FecScheme::Gf8);
-    let stats = StatsCounters::default();
+    let mut rig = Rig::with(limits(), FecScheme::Gf8);
     // Four data shards, no parity: one shard arrives, three never do.
     let mut h = base_header();
     h.frame_bytes = 64;
     h.data_shards = 4;
-    h.pts_ns = crate::stats::now_realtime_ns() - 30_000_000;
-    assert!(r
-        .push(&packet(h), coder.as_ref(), &stats)
-        .unwrap()
-        .is_none());
+    h.pts_ns = crate::quic::wall_clock_ns() - 30_000_000;
+    assert!(rig.push(&packet(h)).is_none());
     // A second shard of the same frame adds nothing: one sample per frame.
     let mut h2 = h;
     h2.shard_index = 1;
-    assert!(r
-        .push(&packet(h2), coder.as_ref(), &stats)
-        .unwrap()
-        .is_none());
+    assert!(rig.push(&packet(h2)).is_none());
     let mut probe = h;
     probe.frame_index = 9;
     probe.user_flags = FLAG_PROBE as u32;
-    let _ = r.push(&packet(probe), coder.as_ref(), &stats);
+    let _ = rig.r.push(&packet(probe), rig.coder.as_ref(), &rig.stats);
 
-    let got: Vec<i64> = r.take_shard_delays().collect();
+    let got: Vec<i64> = rig.r.take_shard_delays().collect();
     assert_eq!(got.len(), 1, "one sample for the one frame that opened");
     assert!(
         (25_000_000..60_000_000).contains(&got[0]),
@@ -2063,7 +1855,7 @@ fn a_frame_that_never_completes_is_still_timed() {
         got[0]
     );
     assert_eq!(
-        r.take_shard_delays().count(),
+        rig.r.take_shard_delays().count(),
         0,
         "a drained sample is not re-presented"
     );
@@ -2096,8 +1888,7 @@ mod geometry_proptests {
             seed in any::<u64>(),
         ) {
             let coder = coder_for(FecScheme::Gf16);
-            let mut r = Reassembler::new(ReassemblerLimits::from_config(&geo_config(1408)));
-            let stats = StatsCounters::default();
+            let mut rig = Rig::new(&geo_config(1408));
 
             let mut all: Vec<(u64, u32, Vec<u8>)> = Vec::new(); // (shuffle key, frame, pkt)
             let mut sources: Vec<(u32, Vec<u8>)> = Vec::new();
@@ -2113,7 +1904,7 @@ mod geometry_proptests {
                 };
                 if kill {
                     if let Some(k) = pkts.iter().position(|p| {
-                        let h = PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
+                        let h = hdr(p);
                         h.shard_index < h.data_shards && h.recovery_shards >= 1
                     }) {
                         pkts.remove(k);
@@ -2134,7 +1925,7 @@ mod geometry_proptests {
             let mut delivered: std::collections::HashMap<u32, Vec<u8>> =
                 std::collections::HashMap::new();
             for (_, _, p) in &all {
-                if let Some(f) = r.push(p, coder.as_ref(), &stats).unwrap() {
+                if let Some(f) = rig.push(p) {
                     prop_assert!(f.complete);
                     prop_assert!(delivered.insert(f.frame_index, f.data).is_none(),
                         "a frame must deliver exactly once");
@@ -2145,8 +1936,8 @@ mod geometry_proptests {
                 prop_assert!(got.is_some(), "frame {i} must be DELIVERED, not merely error-free");
                 prop_assert_eq!(got.unwrap(), src, "frame {} must be byte-identical", i);
             }
-            prop_assert_eq!(r.in_flight(), 0, "budget must be exact after all frames terminate");
-            prop_assert_eq!(stats.snapshot().frames_dropped, 0u64);
+            prop_assert_eq!(rig.r.in_flight(), 0, "budget must be exact after all frames terminate");
+            prop_assert_eq!(rig.stats.snapshot().frames_dropped, 0u64);
         }
     }
 }

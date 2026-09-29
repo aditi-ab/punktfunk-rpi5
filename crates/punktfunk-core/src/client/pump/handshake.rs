@@ -17,19 +17,14 @@ pub(super) struct HandshakeOut {
 }
 
 pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<HandshakeOut> {
-    let (host, port, pin) = (&args.host, args.port, args.pin);
-    let (mode, compositor, gamepad) = (args.mode, args.compositor, args.gamepad);
-    let (bitrate_kbps, video_caps, audio_channels) =
-        (args.bitrate_kbps, args.video_caps, args.audio_channels);
-    let (video_codecs, preferred_codec, display_hdr) =
-        (args.video_codecs, args.preferred_codec, args.display_hdr);
-    let (launch, identity, shutdown) = (&args.launch, &args.identity, &args.shutdown);
-    let remote: std::net::SocketAddr = join_host_port(host, port)
+    let p = &args.params;
+    let (pin, shutdown) = (p.pin, &args.shared.shutdown);
+    let remote: std::net::SocketAddr = join_host_port(&p.host, p.port)
         .parse()
         .map_err(|_| PunktfunkError::InvalidArg("host:port"))?;
     let (ep, observed) = endpoint::client_pinned_with_identity(
         pin,
-        identity.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
+        p.identity.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
     );
     let ep = ep.map_err(|e| PunktfunkError::Io(std::io::Error::other(e.to_string())))?;
     // Retry silence across the connect budget. One quinn dial dies after the ~8 s idle
@@ -39,8 +34,8 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
     // Leave Hello/Welcome/clock-sync room after a late dial, still inside the budget.
     const CONTROL_HEADROOM: std::time::Duration = std::time::Duration::from_secs(2);
     let start = tokio::time::Instant::now();
-    let deadline = start + args.connect_timeout;
-    let redial_until = start + args.connect_timeout.saturating_sub(CONTROL_HEADROOM);
+    let deadline = start + p.timeout;
+    let redial_until = start + p.timeout.saturating_sub(CONTROL_HEADROOM);
     let conn = loop {
         let connecting = ep
             .connect(remote, "punktfunk")
@@ -95,40 +90,40 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
             &mut send,
             &Hello {
                 abi_version: crate::WIRE_VERSION,
-                mode,
-                compositor,
-                gamepad,
-                bitrate_kbps,
+                mode: p.mode,
+                compositor: p.compositor,
+                gamepad: p.gamepad,
+                bitrate_kbps: p.bitrate_kbps,
                 // Host pending-approval / paired-devices label. `None` → fingerprint "device abcd…".
-                name: args.name.clone(),
-                launch: launch.clone(),
+                name: p.name.clone(),
+                launch: p.launch.clone(),
                 // HOST_TIMING / PROBE_SEQ / STREAMED_AU are OR'd in: every NativeClient
                 // demuxes 0xCF, isolates probe seqs, and accepts streamed AUs. MULTI_SLICE
                 // is decoder truth — only the embedder may set it.
-                video_caps: video_caps
+                video_caps: p.video_caps
                     | crate::quic::VIDEO_CAP_HOST_TIMING
                     | crate::quic::VIDEO_CAP_PROBE_SEQ
                     | crate::quic::VIDEO_CAP_STREAMED_AU,
-                audio_channels,
-                video_codecs,
-                preferred_codec,
+                audio_channels: p.audio_channels,
+                video_codecs: p.video_codecs,
+                preferred_codec: p.preferred_codec,
                 // Client panel HDR volume for the host virtual-display EDID. `None` = unknown/SDR.
-                display_hdr,
+                display_hdr: p.display_hdr,
                 // Pass-through. CLIENT_CAP_CURSOR stops host pointer compositing — only
                 // an embedder that draws the cursor locally may set it.
-                client_caps: args.client_caps,
+                client_caps: p.client_caps,
                 // Unconditional: receive buffers are `MAX_DATAGRAM_BYTES`, so every
                 // embedder accepts a mid-session shard grow (design/shard-payload-reneg.md).
                 max_shard_payload: crate::config::max_shard_payload() as u16,
                 // Asked-for format. Legacy 48 kHz / 16-bit omits both fields (Hello stays
                 // pre-hi-res). Non-legacy travels with CLIENT_CAP_AUDIO_HIRES — the bit
                 // is the opt-in, these are its parameters.
-                audio_rate_hz: args.audio_rate_hz,
-                audio_bits: args.audio_bits,
+                audio_rate_hz: p.audio_rate_hz,
+                audio_bits: p.audio_bits,
                 // The coupling asked for; `0` (legacy) keeps the Hello byte-identical.
-                audio_layout: args.audio_layout.wire(),
+                audio_layout: p.audio_layout.wire(),
                 // How this client fills its view; a host framing for another device reframes to it.
-                video_fit: args.video_fit.wire(),
+                video_fit: p.video_fit.wire(),
             }
             .encode(),
         )
@@ -160,7 +155,8 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
         // reason is this crate's, so no client app can leave it clear and make one host
         // answer two ways.
         let abr = [crate::quic::EXT_ABR_ACK_REASON];
-        let ext = crate::quic::start_ext(welcome.host_caps2, &label, &abr);
+        let preset = p.preset.as_ref().map(|s| s.encode()).unwrap_or_default();
+        let ext = crate::quic::start_ext(welcome.host_caps2, &label, &abr, &preset);
         let start_msg = if ext.is_empty() {
             start.encode()
         } else {
@@ -201,7 +197,7 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
         // Embedder opt-in: AU prefixes as `Frame::part` while the tail is still on
         // the wire. Never on PyroWave — newest-wins per queue entry shreds a mid-AU
         // (`FrameChannel::pop`). Unrelated to `VIDEO_CAP_STREAMED_AU` (whole Frame).
-        if args.frame_parts && welcome.codec != crate::quic::CODEC_PYROWAVE {
+        if p.frame_parts && welcome.codec != crate::quic::CODEC_PYROWAVE {
             session.set_deliver_frame_parts(true);
         }
         Ok::<_, PunktfunkError>((

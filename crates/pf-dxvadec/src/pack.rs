@@ -6,8 +6,8 @@
 //!
 //! 1. **Every slice is preceded by a three-byte start code** (`00 00 01`).
 //!    `BSNALunitDataLocation` points at that start code, not the NALU header.
-//!    Annex-B allows a four-byte prefix; the plan's ranges include whichever the
-//!    encoder emitted. Normalising to three is the driver-facing pattern.
+//!    The ranges are the plan's `nal` ranges, start code dropped, so the packer
+//!    writes three bytes whatever prefix the encoder emitted.
 //! 2. **`SliceBytesInBuffer` counts the start code**, so it is `3 + NALU bytes`.
 //! 3. **Pad the buffer to a 128-byte multiple with zeros**, charged to the last
 //!    slice's `SliceBytesInBuffer`. Trailing zeros after `rbsp_trailing_bits`
@@ -47,11 +47,6 @@ pub enum PackError {
         end: usize,
         au: usize,
     },
-    /// Range does not start with an Annex-B start code. The planner only emits
-    /// Annex-B, so the AU was mutated between planning and packing.
-    NoStartCode {
-        start: usize,
-    },
     /// Mapping cannot hold the packed AU. Refuse rather than truncate a picture.
     BufferTooSmall {
         needed: usize,
@@ -62,7 +57,7 @@ pub enum PackError {
     /// AV1 ([`mod@crate::pack_av1`]): frame carried no tile data.
     NoTiles,
     /// AV1: tile payload is in no tile-group region from the same walk.
-    /// Unreachable via [`pf_vkdecode::plan_bitstream`]; the alternative is a
+    /// Unreachable via [`crate::plan_bitstream`]; the alternative is a
     /// record addressing another tile's bytes.
     TileOutsideGroup {
         start: usize,
@@ -85,9 +80,6 @@ impl std::fmt::Display for PackError {
                     "slice range {start}..{end} falls outside the {au}-byte AU"
                 )
             }
-            PackError::NoStartCode { start } => {
-                write!(f, "the slice at byte {start} carries no Annex-B start code")
-            }
             PackError::BufferTooSmall { needed, capacity } => write!(
                 f,
                 "the AU needs {needed} bitstream bytes; the driver's buffer holds {capacity}"
@@ -108,19 +100,7 @@ impl std::fmt::Display for PackError {
 
 impl std::error::Error for PackError {}
 
-/// Bytes after an Annex-B start code (`00 00 01` or `00 00 00 01`).
-///
-/// Not a scan: the plan says this range *is* a NALU. A start code anywhere
-/// but the front means the range is wrong; finding a later one would hide that.
-fn nalu_payload(nalu: &[u8]) -> Option<&[u8]> {
-    match nalu {
-        [0, 0, 1, rest @ ..] => Some(rest),
-        [0, 0, 0, 1, rest @ ..] => Some(rest),
-        _ => None,
-    }
-}
-
-/// Byte count [`pack`] writes before padding: `3 + payload` per slice.
+/// Byte count [`pack`] writes before padding: `3 + NAL` per slice.
 /// Separate so a caller can size a mapping, and so size cannot drift from pack.
 pub fn packed_size(au: &[u8], slices: &[Range<usize>]) -> Result<usize, PackError> {
     if slices.is_empty() {
@@ -128,18 +108,18 @@ pub fn packed_size(au: &[u8], slices: &[Range<usize>]) -> Result<usize, PackErro
     }
     let mut total = 0usize;
     for range in slices {
-        let nalu = au.get(range.clone()).ok_or(PackError::RangeOutsideAu {
+        let nal = au.get(range.clone()).ok_or(PackError::RangeOutsideAu {
             start: range.start,
             end: range.end,
             au: au.len(),
         })?;
-        let payload = nalu_payload(nalu).ok_or(PackError::NoStartCode { start: range.start })?;
-        total = total.saturating_add(3 + payload.len());
+        total = total.saturating_add(3 + nal.len());
     }
     Ok(total)
 }
 
-/// Pack `slices` of `au` into `dst`, returning slice-control locations.
+/// Pack the NAL ranges `slices` of `au` into `dst`, each behind `00 00 01`,
+/// returning slice-control locations.
 ///
 /// `dst` is the whole mapped bitstream buffer, not a sub-slice: padding needs
 /// the real capacity. Short of room for the 128-byte tail, clamp (libavcodec
@@ -156,13 +136,12 @@ pub fn pack(au: &[u8], slices: &[Range<usize>], dst: &mut [u8]) -> Result<Packed
     let mut records = Vec::with_capacity(slices.len());
     let mut cursor = 0usize;
     for range in slices {
-        // `packed_size` already proved both; re-deriving keeps this index in bounds.
-        let nalu = au.get(range.clone()).ok_or(PackError::RangeOutsideAu {
+        // `packed_size` already proved it; re-deriving keeps this index in bounds.
+        let payload = au.get(range.clone()).ok_or(PackError::RangeOutsideAu {
             start: range.start,
             end: range.end,
             au: au.len(),
         })?;
-        let payload = nalu_payload(nalu).ok_or(PackError::NoStartCode { start: range.start })?;
         let location = u32::try_from(cursor).map_err(|_| PackError::Overflow(cursor))?;
         dst[cursor..cursor + 3].copy_from_slice(&[0, 0, 1]);
         dst[cursor + 3..cursor + 3 + payload.len()].copy_from_slice(payload);
@@ -196,16 +175,18 @@ pub fn pack(au: &[u8], slices: &[Range<usize>], dst: &mut [u8]) -> Result<Packed
 mod tests {
     use super::*;
 
+    /// An AU of `count` NALs behind alternating three- and four-byte start
+    /// codes, with the plan's `nal` ranges.
     fn synth_au(count: usize, payload: usize) -> (Vec<u8>, Vec<Range<usize>>) {
         let mut au = Vec::new();
         let mut ranges = Vec::new();
         for i in 0..count {
-            let start = au.len();
             if i % 2 == 0 {
                 au.extend_from_slice(&[0, 0, 1]);
             } else {
                 au.extend_from_slice(&[0, 0, 0, 1]);
             }
+            let start = au.len();
             au.extend(std::iter::repeat_n(0xA0 + i as u8, payload));
             ranges.push(start..au.len());
         }
@@ -288,17 +269,6 @@ mod tests {
             expected += 33;
         }
         assert_eq!(packed.data_size, 4 * 33 + (128 - (4 * 33) % 128));
-    }
-
-    #[test]
-    fn a_slice_without_a_start_code_is_a_typed_error_not_a_mis_packed_buffer() {
-        let au = vec![0x41u8; 32];
-        let mut dst = vec![0u8; 512];
-        let range = 0usize..32;
-        assert_eq!(
-            pack(&au, std::slice::from_ref(&range), &mut dst),
-            Err(PackError::NoStartCode { start: 0 })
-        );
     }
 
     #[test]

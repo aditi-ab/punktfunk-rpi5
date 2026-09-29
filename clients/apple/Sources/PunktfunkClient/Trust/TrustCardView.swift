@@ -19,7 +19,7 @@ struct TrustCardView: View {
     let onTrust: () -> Void
     let onPairInstead: () -> Void
 
-    #if os(iOS) || os(macOS) || os(tvOS)
+    #if os(iOS) || os(visionOS) || os(macOS) || os(tvOS)
     /// Observed so the legend appears the moment a pad wakes up mid-prompt — and so it stays
     /// absent for the mouse/touch users this card is otherwise for.
     @ObservedObject private var gamepads = GamepadManager.shared
@@ -37,7 +37,7 @@ struct TrustCardView: View {
         // Floating trust card over the blurred stream — Liquid Glass on 26+, .regularMaterial
         // fallback below. The inner fingerprint box stays .quaternary (content, not glass).
         .glassBackground(RoundedRectangle(cornerRadius: 18))
-        #if os(iOS) || os(macOS) || os(tvOS)
+        #if os(iOS) || os(visionOS) || os(macOS) || os(tvOS)
         .background {
             TrustControllerInput(onTrust: onTrust, onCancel: onCancel, onPairInstead: onPairInstead)
         }
@@ -84,7 +84,7 @@ struct TrustCardView: View {
                     .keyboardShortcut(.defaultAction)
                     #endif
             }
-            #if os(iOS)
+            #if os(iOS) || os(visionOS)
             .controlSize(.large)
             #endif
             // The verified alternative to eyeballing hex: drop this session (the host
@@ -96,7 +96,7 @@ struct TrustCardView: View {
                 .buttonStyle(.borderless)
                 #endif
                 .font(.geist(16, relativeTo: .callout))
-            #if os(iOS) || os(macOS) || os(tvOS)
+            #if os(iOS) || os(visionOS) || os(macOS) || os(tvOS)
             // Only with a pad attached: controller glyphs in front of a trackpad user would be
             // naming buttons they don't have.
             if gamepads.active != nil {
@@ -129,7 +129,7 @@ struct TrustCardView: View {
     }
 }
 
-#if os(iOS) || os(macOS) || os(tvOS)
+#if os(iOS) || os(visionOS) || os(macOS) || os(tvOS)
 /// Controller binding for the trust prompt: A trusts, B cancels, X runs the PIN ceremony instead.
 /// The same zero-size-backing-view shape as `ConnectOverlay`'s `ConnectControllerInput` — mounted
 /// for exactly as long as the card is up, and `GamepadMenuInput`'s snapshot-on-start swallows

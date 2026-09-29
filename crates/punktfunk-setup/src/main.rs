@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use punktfunk_setup::choices::{Action, Choices, Pins, LAN_BIND, LOOPBACK_BIND};
+use punktfunk_setup::choices::{parse_web_bind, Action, Choices, Pins};
 use punktfunk_setup::exec::{Executor, Opts};
 use punktfunk_setup::facts::{Facts, Family, Floor, DOCS};
 use punktfunk_setup::plan;
@@ -40,7 +40,7 @@ usage: punktfunk-setup [options]
   --host | --client     what to install (default: host; combinable)
   --channel stable|canary   package channel (default stable; canary = latest main build). On a box
                         that already has it this SWITCHES channel, either direction.
-  --gamestream | --no-gamestream   Moonlight/Artemis/third-party clients (default depends on the box)
+  --gamestream | --no-gamestream   Moonlight/Artemis/third-party clients (default off)
   --clipboard | --no-clipboard     shared clipboard (default yes)
   --punktfunk-group | --no-punktfunk-group   full controller / virtual Steam Deck pad (default yes;
                         it joins the punktfunk group, which grants usbip attach)
@@ -71,18 +71,15 @@ PUNKTFUNK_INSTALL_OMARCHY_SETUP, PUNKTFUNK_INSTALL_MGMT_PORT, PUNKTFUNK_INSTALL_
 /// 2 is bad usage, matching the sh installer's contract.
 const BAD_USAGE: u8 = 2;
 
-/// `--web-bind` / its env twin. `lan` is the friendly spelling of 0.0.0.0; anything else has to
-/// parse as an address, so a typo cannot quietly leave the console somewhere nobody is listening.
+/// `--web-bind` / its env twin. A value [`parse_web_bind`] refuses fails the run, so a typo
+/// cannot quietly leave the console somewhere nobody is listening.
 fn web_bind(raw: &str) -> Result<String, (u8, String)> {
-    match raw.trim() {
-        "localhost" | "loopback" => Ok(LOOPBACK_BIND.to_string()),
-        "lan" | "any" => Ok(LAN_BIND.to_string()),
-        v if v.parse::<std::net::IpAddr>().is_ok() => Ok(v.to_string()),
-        _ => Err((
+    parse_web_bind(raw).ok_or_else(|| {
+        (
             BAD_USAGE,
             "--web-bind must be an address, or 'localhost' or 'lan'".to_string(),
-        )),
-    }
+        )
+    })
 }
 
 struct Cli {
@@ -202,19 +199,25 @@ fn parse(args: Vec<String>, env: &Env) -> Result<Cli, (u8, String)> {
 }
 
 fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(code) => code,
+    }
+}
+
+/// The whole run, phase by phase. `Err` ends it at once with that exit code, success
+/// included (`--help`, a cancelled settings screen).
+fn run() -> Result<(), ExitCode> {
     let env = Env::from_env();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let cli = match parse(args, &env) {
-        Ok(cli) => cli,
-        Err((0, text)) => {
+    let cli = parse(args, &env).map_err(|(code, text)| {
+        if code == 0 {
             println!("{text}");
-            return ExitCode::SUCCESS;
-        }
-        Err((code, text)) => {
+        } else {
             eprintln!("{text}");
-            return ExitCode::from(code);
         }
-    };
+        ExitCode::from(code)
+    })?;
 
     let tty = std::fs::OpenOptions::new()
         .read(true)
@@ -238,33 +241,7 @@ fn main() -> ExitCode {
         .unwrap_or_default();
     runner.exports.push(("USER".to_string(), user));
 
-    // A demo box is canned: skip preflight, and nothing may be probed.
-    let facts = if let Some(name) = &demo {
-        match punktfunk_setup::demo::preset(name) {
-            Some(facts) => facts,
-            None => {
-                plain.die(&format!(
-                    "unknown --demo preset '{name}'. Try: {}",
-                    punktfunk_setup::demo::PRESETS.join(", ")
-                ));
-                return ExitCode::FAILURE;
-            }
-        }
-    } else {
-        if let Err(msg) = preflight(&env, &paths, &mut runner) {
-            report::banner(&plain);
-            plain.die(&msg);
-            return ExitCode::FAILURE;
-        }
-        match load_facts(&cli, &paths, &runner, &env) {
-            Ok(facts) => facts,
-            Err(msg) => {
-                report::banner(&plain);
-                plain.die(&msg);
-                return ExitCode::FAILURE;
-            }
-        }
-    };
+    let facts = resolve_facts(&cli, &env, &paths, &mut runner, &plain)?;
 
     // The TUI is the interactive surface only. No terminal or `--yes` stays on the plain
     // output, byte for byte — CI containers and scripts depend on it.
@@ -295,79 +272,21 @@ fn main() -> ExitCode {
         report::banner(ui);
         report::detected(ui, &facts);
     }
-
-    // Floors sit after the uninstall dispatch: a box below them must still be able to clean up.
-    if choices.action != Action::Uninstall
-        && let Some(floor) = &facts.floor
-    {
-        match floor {
-            Floor::Die(msg) => {
-                ui.die(msg);
-                return ExitCode::FAILURE;
-            }
-            Floor::Confirm(msg) => {
-                ui.warn(msg);
-                if !ask(interactive, "Continue anyway?") {
-                    return ExitCode::FAILURE;
-                }
-            }
+    gate_floor(ui, &facts, choices.action, interactive)?;
+    match &tui {
+        Some(tui) => {
+            let drawn = tui.intro(
+                logo::intro_level(&caps, yes),
+                logo::Parts {
+                    host: choices.components.host,
+                    client: choices.components.client,
+                },
+            );
+            choices = interactive_choices(tui, drawn, &facts, choices, &cli.pins)?;
         }
+        None => report::choices_summary(ui, &choices),
     }
-
-    if let Some(tui) = &tui {
-        let parts = logo::Parts {
-            host: choices.components.host,
-            client: choices.components.client,
-        };
-        let drawn = tui.intro(logo::intro_level(&caps, yes), parts);
-        let mut screen = Screen::new(facts.clone(), choices.clone());
-        match tui.settings(&mut screen, drawn) {
-            Step::Cancel => {
-                tui.outro(&["Nothing was changed.".to_string()]);
-                return ExitCode::SUCCESS;
-            }
-            Step::Run(action) => choices.action = action,
-            Step::Idle | Step::Edit(_) => unreachable!("the settings loop only ends on a choice"),
-        }
-        // Edits live on the screen, not in the pins.
-        let action = choices.action;
-        choices = screen.choices;
-        choices.action = action;
-        // After the settings screen, not a row on it: the console password is the one thing
-        // a fresh host install leaves the user needing, and a row is too easy to walk past.
-        // A box that already has one keeps it — this never overwrites a password in use.
-        if action == Action::Install
-            && choices.components.host
-            && !facts.web_password_present
-            && facts.family != Family::Steamos
-        {
-            let ip = facts.ip.clone().unwrap_or_else(|| "this box".to_string());
-            choices.web_password =
-                tui.web_password(&format!("https://{ip}:47992"), report::PASSWORD_READ);
-        }
-        // Right after it, for the same reason: the console is the whole product surface, and who
-        // can reach it is the one thing a host install must not decide behind the user's back.
-        // `--web-bind` pins it, and then there is nothing to ask.
-        if action == Action::Install && choices.components.host && cli.pins.web_bind.is_none() {
-            let ip = facts.ip.clone().unwrap_or_else(|| "this box".to_string());
-            if let Some(bind) = tui.web_bind(&ip, &choices.web_bind) {
-                choices.web_bind = bind;
-            }
-        }
-    } else {
-        report::choices_summary(ui, &choices);
-    }
-
-    // A distro with no punktfunk repo stops a host install only: a client install takes the
-    // flatpak line. Checked after the screen, because switching to client-only is how a
-    // user gets past it.
-    if choices.action != Action::Uninstall
-        && choices.components.host
-        && let Some(msg) = &facts.host_punt
-    {
-        ui.die(msg);
-        return ExitCode::FAILURE;
-    }
+    gate_host_punt(ui, &facts, &choices)?;
 
     let plan = plan::build(&facts, &choices);
     let demo_runner = demo.as_ref().map(|_| {
@@ -393,13 +312,10 @@ fn main() -> ExitCode {
     {
         t.begin_progress(plan.phases.len());
     }
-    let outcome = match exec.execute(&plan, &facts, &choices) {
-        Ok(outcome) => outcome,
-        Err(failed) => {
-            ui.die(&failed.0);
-            return ExitCode::FAILURE;
-        }
-    };
+    let outcome = exec.execute(&plan, &facts, &choices).map_err(|failed| {
+        ui.die(&failed.0);
+        ExitCode::FAILURE
+    })?;
 
     if let Some(t) = &tui {
         t.end_progress();
@@ -407,12 +323,121 @@ fn main() -> ExitCode {
 
     if choices.action == Action::Uninstall {
         report::uninstall_outro(ui);
-        return ExitCode::SUCCESS;
+        return Ok(());
     }
     // A hand-off ends the plan early and its own summary went into the progress view's capture
     // buffer, so this is the only report that says whether the box ended up working.
     report::verify(ui, run, &facts, &choices, &outcome, opts);
-    ExitCode::SUCCESS
+    Ok(())
+}
+
+/// The box to install on: a canned `--demo` preset (no preflight, nothing probed), else
+/// preflight and then the `--facts` file or a probe. Every refusal dies on the plain output.
+fn resolve_facts(
+    cli: &Cli,
+    env: &Env,
+    paths: &BasePaths,
+    runner: &mut SystemRunner,
+    plain: &Plain,
+) -> Result<Facts, ExitCode> {
+    if let Some(name) = &cli.demo {
+        return punktfunk_setup::demo::preset(name).ok_or_else(|| {
+            plain.die(&format!(
+                "unknown --demo preset '{name}'. Try: {}",
+                punktfunk_setup::demo::PRESETS.join(", ")
+            ));
+            ExitCode::FAILURE
+        });
+    }
+    preflight(env, paths, runner)
+        .and_then(|()| load_facts(cli, paths, runner, env))
+        .map_err(|msg| {
+            report::banner(plain);
+            plain.die(&msg);
+            ExitCode::FAILURE
+        })
+}
+
+/// The version floor. It sits after the uninstall dispatch: a box below it must still be
+/// able to clean up. A confirm floor asks, and without a terminal its default no stands.
+fn gate_floor(
+    ui: &dyn Reporter,
+    facts: &Facts,
+    action: Action,
+    interactive: bool,
+) -> Result<(), ExitCode> {
+    if action == Action::Uninstall {
+        return Ok(());
+    }
+    match &facts.floor {
+        None => Ok(()),
+        Some(Floor::Die(msg)) => {
+            ui.die(msg);
+            Err(ExitCode::FAILURE)
+        }
+        Some(Floor::Confirm(msg)) => {
+            ui.warn(msg);
+            if ask(interactive, "Continue anyway?") {
+                Ok(())
+            } else {
+                Err(ExitCode::FAILURE)
+            }
+        }
+    }
+}
+
+/// The settings screen, then the two questions a host install must not answer behind the
+/// user's back: the console password and who can reach the console. Cancel changes nothing.
+fn interactive_choices(
+    tui: &Tui<'_>,
+    drawn: usize,
+    facts: &Facts,
+    mut choices: Choices,
+    pins: &Pins,
+) -> Result<Choices, ExitCode> {
+    let mut screen = Screen::new(facts.clone(), choices.clone());
+    let action = match tui.settings(&mut screen, drawn) {
+        Step::Cancel => {
+            tui.outro(&["Nothing was changed.".to_string()]);
+            return Err(ExitCode::SUCCESS);
+        }
+        Step::Run(action) => action,
+        Step::Idle | Step::Edit(_) => unreachable!("the settings loop only ends on a choice"),
+    };
+    // Edits live on the screen, not in the pins.
+    choices = screen.choices;
+    choices.action = action;
+    let host_install = action == Action::Install && choices.components.host;
+    let ip = facts.ip.clone().unwrap_or_else(|| "this box".to_string());
+    // After the settings screen, not a row on it: the console password is the one thing
+    // a fresh host install leaves the user needing, and a row is too easy to walk past.
+    // A box that already has one keeps it — this never overwrites a password in use.
+    if host_install && !facts.web_password_present && facts.family != Family::Steamos {
+        choices.web_password =
+            tui.web_password(&format!("https://{ip}:47992"), report::PASSWORD_READ);
+    }
+    // Right after it, for the same reason: the console is the whole product surface.
+    // `--web-bind` pins it, and then there is nothing to ask.
+    if host_install
+        && pins.web_bind.is_none()
+        && let Some(bind) = tui.web_bind(&ip, &choices.web_bind)
+    {
+        choices.web_bind = bind;
+    }
+    Ok(choices)
+}
+
+/// A distro with no punktfunk repo stops a host install only: a client install takes the
+/// flatpak line. Checked after the screen, because switching to client-only is how a user
+/// gets past it.
+fn gate_host_punt(ui: &dyn Reporter, facts: &Facts, choices: &Choices) -> Result<(), ExitCode> {
+    match &facts.host_punt {
+        Some(msg) if choices.action != Action::Uninstall && choices.components.host => {
+            ui.die(msg);
+            Err(ExitCode::FAILURE)
+        }
+        _ => Ok(()),
+    }
 }
 
 fn preflight(env: &Env, paths: &BasePaths, runner: &mut SystemRunner) -> Result<(), String> {
@@ -431,10 +456,16 @@ fn preflight(env: &Env, paths: &BasePaths, runner: &mut SystemRunner) -> Result<
         return Err("curl is required (install it with your package manager first)".into());
     }
     // Root without sudo (a minimal Debian container): a shim so the verbatim `sudo …`
-    // lines from platforms.json still work.
+    // lines from platforms.json still work. The dir leads root's PATH, so it is created
+    // fresh at 0700: a dir another user planted under that name fails the create.
     if root && !runner.which("sudo") {
-        let dir = std::env::temp_dir().join(format!("punktfunk-setup-{}", std::process::id()));
-        if std::fs::create_dir_all(&dir).is_ok()
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("punktfunk-setup-{}-{nanos}", std::process::id()));
+        if create_private_dir(&dir).is_ok()
             && std::fs::write(dir.join("sudo"), "#!/bin/sh\nexec \"$@\"\n").is_ok()
         {
             set_executable(&dir.join("sudo"));
@@ -457,6 +488,18 @@ fn set_executable(path: &std::path::Path) {
 
 #[cfg(not(unix))]
 fn set_executable(_path: &std::path::Path) {}
+
+/// Owner-only and never an existing dir: `create` fails on a name already taken.
+#[cfg(unix)]
+fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir(path)
+}
 
 fn load_facts(
     cli: &Cli,
@@ -609,5 +652,59 @@ mod tests {
         );
         let both = parse(args(&["--host", "--client"]), &Env::default()).unwrap();
         assert!(both.pins.host && both.pins.client);
+    }
+
+    fn arch() -> Facts {
+        punktfunk_setup::demo::preset("arch-fresh").unwrap()
+    }
+
+    /// Below the floor nothing installs, but an uninstall still cleans up; without a
+    /// terminal a confirm floor's default no stands.
+    #[test]
+    fn the_floor_stops_an_install_but_never_an_uninstall() {
+        let (ui, buf) = Plain::capture();
+        let mut facts = arch();
+        facts.floor = Some(Floor::Die("glibc too old".into()));
+        assert_eq!(
+            gate_floor(&ui, &facts, Action::Install, false),
+            Err(ExitCode::FAILURE)
+        );
+        assert!(buf.borrow().contains("glibc too old"));
+        assert_eq!(gate_floor(&ui, &facts, Action::Uninstall, false), Ok(()));
+        facts.floor = Some(Floor::Confirm("untested release".into()));
+        assert_eq!(
+            gate_floor(&ui, &facts, Action::Install, false),
+            Err(ExitCode::FAILURE)
+        );
+    }
+
+    /// A distro with no host repo stops only a host install.
+    #[test]
+    fn the_host_punt_leaves_a_client_install_through() {
+        let (ui, _buf) = Plain::capture();
+        let mut facts = arch();
+        facts.host_punt = Some("no host package here".into());
+        let mut choices = Choices::derive(&facts, &Pins::default());
+        choices.components.host = true;
+        assert_eq!(
+            gate_host_punt(&ui, &facts, &choices),
+            Err(ExitCode::FAILURE)
+        );
+        choices.components.host = false;
+        choices.components.client = true;
+        assert_eq!(gate_host_punt(&ui, &facts, &choices), Ok(()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_sudo_shim_dir_is_fresh_and_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("shim");
+        create_private_dir(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        // A name someone else created first is refused, not reused.
+        assert!(create_private_dir(&dir).is_err());
     }
 }

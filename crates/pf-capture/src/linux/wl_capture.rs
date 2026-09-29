@@ -555,7 +555,9 @@ fn run(
     let mut buffers: Vec<wl_buffer::WlBuffer> = Vec::with_capacity(pool.bos.len());
     for bo in &pool.bos {
         let params = linux_dmabuf.create_params(&qh, ());
-        let m = bo.wire_modifier();
+        // An implicit layout (`INVALID`) goes out as-is: the compositor rejects it rather
+        // than this side guessing one.
+        let m = bo.modifier;
         params.add(
             bo.fd.as_fd(),
             0,
@@ -590,7 +592,7 @@ fn run(
         w,
         h,
         fourcc = format_args!("{:#010x}", fourcc),
-        modifier = pool.bos.first().map(|b| b.wire_modifier()).unwrap_or(0),
+        modifier = pool.bos.first().map(|b| b.modifier).unwrap_or(0),
         pool = pool.bos.len(),
         "direct wayland capture: the compositor fills our dmabufs, no portal in the path"
     );
@@ -642,10 +644,10 @@ fn run(
             };
             f.destroy();
             let bo = &pool.bos[idx];
-            let modifier = if bo.modifier_is_invalid() {
+            let modifier = if bo.modifier == pf_zerocopy::gbm::DRM_FORMAT_MOD_INVALID {
                 0
             } else {
-                bo.wire_modifier()
+                bo.modifier
             };
             let payload = if let Some(imp) = importer.as_mut() {
                 // The import reads the buffer synchronously here, so the buffer goes
@@ -655,32 +657,28 @@ fn run(
                     offset: bo.offset,
                     stride: bo.stride,
                 };
-                let imported = if modifier == 0 {
-                    imp.import_linear(&plane, w, h)
-                } else {
-                    imp.import(&plane, w, h, fourcc, Some(modifier))
+                let (kind, modifier) = match modifier {
+                    0 => (pf_zerocopy::ImportKind::Linear, None),
+                    m => (pf_zerocopy::ImportKind::Tiled, Some(m)),
                 };
+                let imported = imp.import(kind, &plane, w, h, fourcc, modifier);
                 free.put(idx);
                 match imported {
                     Ok(buf) => FramePayload::Cuda(buf),
                     Err(e) => bail!("GPU import of the captured dmabuf failed: {e:#}"),
                 }
             } else {
-                // SAFETY: `bo.fd` is the pool's live dmabuf fd; `F_DUPFD_CLOEXEC` reads
-                // only the integer and returns an independent CLOEXEC duplicate (or -1,
-                // checked). The dup is what the frame owns and closes; the pool keeps its own.
-                let dup = unsafe { libc::fcntl(bo.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-                if dup < 0 {
-                    bail!("F_DUPFD_CLOEXEC on the capture dmabuf failed — raise the host's NOFILE");
-                }
+                // The frame owns and closes the dup; the pool keeps its own fd.
+                let fd = bo
+                    .fd
+                    .try_clone()
+                    .context("dup the capture dmabuf (raise the host's NOFILE)")?;
                 let hold: pf_frame::FrameHold = Arc::new(BufHold {
                     list: free.clone(),
                     idx,
                 });
                 FramePayload::Dmabuf(DmabufFrame {
-                    // SAFETY: `dup` is the fresh fd just checked `>= 0`; nothing else owns
-                    // it, so `OwnedFd` closes it exactly once.
-                    fd: unsafe { std::os::fd::FromRawFd::from_raw_fd(dup) },
+                    fd,
                     fourcc,
                     modifier,
                     offset: bo.offset,

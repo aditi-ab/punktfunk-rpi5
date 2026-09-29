@@ -105,6 +105,8 @@ extension InputCapture {
         m[0x29] = 0xBA; m[0x27] = 0xDE; m[0x32] = 0xC0 // ; ' ` (OEM_1 7 3)
         m[0x2B] = 0xBC; m[0x2F] = 0xBE; m[0x2C] = 0xBF // , . / (OEM_COMMA PERIOD 2)
         m[0x0A] = 0xE2 // ISO 102nd key (<> next to left shift; OEM_102)
+        // JIS ¥ ろ keypad-comma かな 英数: the VKs `hidToVK` sends for HID 0x89 0x87 0x85 0x90 0x91.
+        m[0x5D] = 0xE1; m[0x5E] = 0xC1; m[0x5F] = 0xC2; m[0x68] = 0x15; m[0x66] = 0x19
         // Function keys F1..F12 (scattered) → VK 0x70..0x7B. F13+ omitted (no host arm).
         m[0x7A] = 0x70; m[0x78] = 0x71; m[0x63] = 0x72; m[0x76] = 0x73 // F1 F2 F3 F4
         m[0x60] = 0x74; m[0x61] = 0x75; m[0x62] = 0x76; m[0x64] = 0x77 // F5 F6 F7 F8
@@ -145,7 +147,7 @@ extension InputCapture {
     #endif
 }
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 /// US-layout character → Windows VK for the on-screen keyboard (`StreamLayerUIView`'s
 /// UIKeyInput). Unlike every other key source, `insertText` delivers CHARACTERS, not key
 /// positions, so this is the inverse of a US layout: `shift` means "wrap in VK_LSHIFT so the

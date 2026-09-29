@@ -3,6 +3,7 @@
 // register/renew/deregister through Scope. Validated end-to-end by the phase-0 spike:
 // core-only env layers, no platform package, SPA fallthrough preserved.
 import { type PluginUiHandle, servePluginUi } from "@punktfunk/host";
+import { decodeHostEvent, type GameRef } from "@punktfunk/host/core";
 import { Effect, FileSystem, Layer, Path, Schema, type Scope } from "effect";
 import { Etag, HttpPlatform, HttpRouter } from "effect/unstable/http";
 import type { ConfigService } from "./config.js";
@@ -116,6 +117,174 @@ export const makeConfigHandler = <S extends Schema.Top>(
 	};
 };
 
+/**
+ * A path the operator types into the plugin's form. The console grants it to the plugin when the
+ * form saves (read-write with `write`); the plugin never asks for it.
+ */
+export const handedPath = (opts: { readonly write?: boolean } = {}) =>
+	Schema.String.annotate({
+		format: opts.write ? "pf:path:write" : "pf:path",
+	});
+
+/** One line under a plugin's tab on an entry page. */
+export interface StatusLine {
+	readonly level: "info" | "warn";
+	readonly text: string;
+}
+
+/** A plugin's section on each library entry's page. */
+export interface ServeUiGame<S extends Schema.Top> {
+	/** The section's form, derived like `config`'s. */
+	readonly schema: S;
+	/** The section's raw value for one entry, or `undefined` for "no tab on this entry". */
+	readonly load: (entryId: string) => Effect.Effect<unknown>;
+	/** Persist a value that decoded against `schema`. */
+	readonly save: (
+		entryId: string,
+		value: Schema.Schema.Type<S>,
+	) => Effect.Effect<void, unknown>;
+	/** Lines shown in the tab: what the plugin did with this entry last. */
+	readonly status?: (
+		entryId: string,
+	) => Effect.Effect<ReadonlyArray<StatusLine>>;
+}
+
+/**
+ * A library id the host accepts: `<store>:<external id>`, both halves non-empty, at most 1024
+ * UTF-8 bytes. Control characters are refused too. clients/shared/library-id-vectors.json pins it.
+ */
+export const validEntryId = (id: string): boolean => {
+	const colon = id.indexOf(":");
+	return (
+		colon > 0 &&
+		colon < id.length - 1 &&
+		new TextEncoder().encode(id).length <= 1024 &&
+		![...id].some(isControl)
+	);
+};
+
+function isControl(c: string): boolean {
+	const n = c.charCodeAt(0);
+	return n < 0x20 || n === 0x7f;
+}
+
+/** At most eight lines of at most 120 characters, control characters stripped. */
+const cleanStatus = (lines: ReadonlyArray<StatusLine>): StatusLine[] =>
+	lines.slice(0, 8).map((l) => ({
+		level: l.level === "warn" ? "warn" : "info",
+		text: [...String(l.text)]
+			.filter((c) => !isControl(c))
+			.join("")
+			.slice(0, 120),
+	}));
+
+/**
+ * The `/__game?entry=<id>` handler. `GET` answers `{schema, value, status}`, or 404 when `load`
+ * gives `undefined`. `PUT` decodes the body against the schema before `save` sees it.
+ */
+export const makeGameHandler = <S extends Schema.Top>(
+	game: ServeUiGame<S>,
+): ((req: Request) => Promise<Response>) => {
+	const schema = deriveConfigJsonSchema(game.schema);
+	const decode = Schema.decodeUnknownEffect(game.schema as never) as (
+		u: unknown,
+	) => Effect.Effect<Schema.Schema.Type<S>, unknown>;
+	return async (req: Request): Promise<Response> => {
+		const entry = new URL(req.url).searchParams.get("entry") ?? "";
+		if (!validEntryId(entry)) {
+			return Response.json(
+				{ error: "not a library entry id" },
+				{ status: 400 },
+			);
+		}
+		if (req.method === "GET") {
+			const value = await Effect.runPromise(game.load(entry));
+			if (value === undefined) {
+				return Response.json(
+					{ error: "no section for this entry" },
+					{ status: 404 },
+				);
+			}
+			const status = game.status
+				? await Effect.runPromise(game.status(entry)).catch(() => [])
+				: [];
+			return Response.json({ schema, value, status: cleanStatus(status) });
+		}
+		if (req.method === "PUT") {
+			let body: unknown;
+			try {
+				body = await req.json();
+			} catch (cause) {
+				return Response.json(
+					{ error: "body must be JSON", issue: String(cause) },
+					{ status: 400 },
+				);
+			}
+			const decoded = await Effect.runPromise(Effect.result(decode(body)));
+			if (decoded._tag === "Failure") {
+				return Response.json(
+					{ error: "value rejected", issue: String(decoded.failure) },
+					{ status: 400 },
+				);
+			}
+			try {
+				await Effect.runPromise(game.save(entry, decoded.success));
+			} catch (cause) {
+				return Response.json(
+					{ error: "save failed", issue: String(cause) },
+					{ status: 500 },
+				);
+			}
+			return Response.json({ ok: true });
+		}
+		return new Response("method not allowed", { status: 405 });
+	};
+};
+
+/** Stages a plugin holds. The host waits for the handler before it goes on. */
+export interface ServeUiHolds {
+	/** Before the host starts a launched game; not when it picks up one still running. */
+	readonly "game.launching"?: (game: GameRef) => Effect.Effect<void, unknown>;
+}
+
+/**
+ * The `/__hold` handler: decodes the event, runs its stage's handler, answers 204. The request's
+ * signal interrupts the handler when the host stops waiting.
+ */
+export const makeHoldHandler =
+	(holds: ServeUiHolds) =>
+	async (req: Request): Promise<Response> => {
+		if (req.method !== "POST") {
+			return new Response("method not allowed", { status: 405 });
+		}
+		let body: unknown;
+		try {
+			body = await req.json();
+		} catch (cause) {
+			return Response.json(
+				{ error: "body must be JSON", issue: String(cause) },
+				{ status: 400 },
+			);
+		}
+		const ev = decodeHostEvent(body);
+		if (ev._tag === "Failure" || ev.success.kind !== "game.launching") {
+			return Response.json({ error: "not a held stage" }, { status: 400 });
+		}
+		const run = holds["game.launching"];
+		if (!run) {
+			return Response.json({ error: "stage not held" }, { status: 404 });
+		}
+		try {
+			await Effect.runPromise(run(ev.success.game), { signal: req.signal });
+		} catch (cause) {
+			return Response.json(
+				{ error: "hold failed", issue: String(cause) },
+				{ status: 500 },
+			);
+		}
+		return new Response(null, { status: 204 });
+	};
+
 export interface ServeUiOptions {
 	/** Console nav title. */
 	readonly title: string;
@@ -143,6 +312,22 @@ export interface ServeUiOptions {
 	 * `/plugin-ui/<id>/…` proxy, so there is no new host surface and nothing new exposed to the LAN.
 	 */
 	readonly config?: ServeUiConfig<Schema.Top>;
+	/**
+	 * Serve `GET`/`PUT /__game?entry=<id>`: this plugin's tab on each library entry's page. Same
+	 * auth as `config`; the console renders the schema with the same form.
+	 */
+	readonly game?: ServeUiGame<Schema.Top>;
+	/**
+	 * Serve `/__metadata/*`: an Art & Metadata source's status and the console's Choose dialog.
+	 * Built by `defineMetadataPlugin`; same auth as `config`.
+	 */
+	readonly metadata?: (req: Request) => Promise<Response>;
+	/**
+	 * Stages this plugin holds. The host POSTs the event to `/__hold` and waits for the handler,
+	 * up to `holdTimeoutMs` (default 30 000, at most 120 000), then goes on regardless.
+	 */
+	readonly holds?: ServeUiHolds;
+	readonly holdTimeoutMs?: number;
 	/**
 	 * The plugin API: `HttpApiBuilder.layer(api)` + group handler layers + raw routes
 	 * (e.g. `sseRoute`), with plugin services already provided. `httpApiEnv` is provided
@@ -183,6 +368,8 @@ export const serveUi = (
 		const serveConfig = opts.config
 			? makeConfigHandler(opts.config)
 			: undefined;
+		const serveGame = opts.game ? makeGameHandler(opts.game) : undefined;
+		const serveHold = opts.holds ? makeHoldHandler(opts.holds) : undefined;
 
 		const fetch = async (req: Request): Promise<Response | undefined> => {
 			const url = new URL(req.url);
@@ -191,6 +378,17 @@ export const serveUi = (
 			// plugin's own routes can never shadow them.
 			if (url.pathname === "/__config") {
 				return serveConfig?.(req) ?? new Response("not found", { status: 404 });
+			}
+			if (url.pathname === "/__game") {
+				return serveGame?.(req) ?? new Response("not found", { status: 404 });
+			}
+			if (url.pathname.startsWith("/__metadata/")) {
+				return (
+					opts.metadata?.(req) ?? new Response("not found", { status: 404 })
+				);
+			}
+			if (url.pathname === "/__hold") {
+				return serveHold?.(req) ?? new Response("not found", { status: 404 });
 			}
 			if (!url.pathname.startsWith(prefix)) return undefined; // → static SPA
 			return handler(req);
@@ -210,6 +408,21 @@ export const serveUi = (
 							? { staticDir: opts.staticDir }
 							: {}),
 						...(opts.category !== undefined ? { category: opts.category } : {}),
+						surfaces: {
+							page: opts.staticDir !== undefined,
+							config: opts.config !== undefined,
+							game: opts.game !== undefined,
+						},
+						...(opts.holds
+							? {
+									holds: Object.keys(opts.holds).filter(
+										(k) => opts.holds?.[k as keyof ServeUiHolds],
+									),
+								}
+							: {}),
+						...(opts.holdTimeoutMs !== undefined
+							? { holdTimeoutMs: opts.holdTimeoutMs }
+							: {}),
 						fetch,
 					}),
 				catch: (cause) => new UiServeError({ cause }),

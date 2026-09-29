@@ -122,9 +122,15 @@ export function needsPair(v: HostView): boolean {
   return v.fp === "";
 }
 
+/**
+ * Is this advert that saved record? The CLI's own match decides when it names the record; the
+ * rule below, `same_host` in pf-client-core, covers a client too old to say and a record the CLI
+ * read before it had an id. Two known fingerprints decide it alone: the other OS of a dual-boot
+ * box answers at the same lease with the same MAC, so the address would read it as the OS
+ * already saved.
+ */
 function advertMatchesSaved(a: DiscoveredHost, s: SavedHost): boolean {
-  // Two known fingerprints decide it alone: the other OS of a dual-boot box answers at the
-  // same lease with the same MAC, so the address would read it as the OS already saved.
+  if (a.saved_id && s.id) return a.saved_id === s.id;
   if (s.fp_hex && a.fp) return s.fp_hex.toLowerCase() === a.fp.toLowerCase();
   return s.addr === a.addr && s.port === a.port;
 }
@@ -152,8 +158,7 @@ function hostLabel(s: SavedHost, advert?: DiscoveredHost): string {
  * Join the saved store and the live browse into the rows the panel draws.
  *
  * Fingerprint first, address second — a host that moved DHCP lease still matches its record,
- * and a different box that inherited the old address does not inherit its pairing. The CLI's
- * `discover` annotates `saved`/`paired` by exactly this rule too, so the two can't disagree.
+ * and a different box that inherited the old address does not inherit its pairing.
  */
 export function mergeHosts(saved: SavedHost[], discovered: DiscoveredHost[]): HostView[] {
   const views: HostView[] = saved.map((s) => {
@@ -193,7 +198,7 @@ export function mergeHosts(saved: SavedHost[], discovered: DiscoveredHost[]): Ho
       fp: "",
       advertisedFp: a.fp,
       moved: false, // no record, so nothing to be stale
-      paired: a.paired,
+      paired: false, // no record, so no pairing: an older CLI may still say otherwise
       online: true,
       wakeable: false, // no record, so no MAC
       saved: false,
@@ -479,26 +484,30 @@ export async function applyUpdate(
   }
 
   if (info.update_available) {
+    // The manifest names the channel's alias zip, which every publish replaces. Read it again
+    // now, past the backend's 30 min cache, so the hash is the one beside the zip Decky fetches.
+    const fresh = await checkUpdate(true).catch(() => null);
+    const plugin = fresh?.update_available ? fresh : info;
     try {
       const backend = window.DeckyBackend;
       if (backend?.callable) {
         // Fire-and-forget: the loader reinstalls + reloads THIS plugin, tearing the panel down
         // before any result could arrive — so never await it. Decky shows its own confirm prompt.
         void backend.callable("utilities/install_plugin")(
-          info.artifact,
+          plugin.artifact,
           // The name Decky uninstalls before extracting the new zip — it locates the folder by
           // matching plugin.json "name", so this must equal THIS build's plugin.json name (the
           // brand-cased one), not the lowercase on-disk dir.
           "Punktfunk",
-          info.latest,
-          info.hash,
+          plugin.latest,
+          plugin.hash,
           INSTALL_TYPE_UPDATE,
         );
         toaster.toast({
           title: "Punktfunk",
           // Decky's installer also phones the plugin store first, which can hang on some
           // networks before the actual install proceeds — set expectations.
-          body: `Updating the plugin to v${info.latest} — confirm Decky’s prompt. This can take a couple of minutes.`,
+          body: `Updating the plugin to v${plugin.latest} — confirm Decky’s prompt. This can take a couple of minutes.`,
         });
         return;
       }

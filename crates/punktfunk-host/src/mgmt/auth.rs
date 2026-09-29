@@ -2,10 +2,10 @@
 //! only).
 //!
 //! Three lanes:
-//! - **paired device** — [`cert_may_access`] (status reads plus two writes: log upload and
-//!   host-action invoke). Proven either by a client certificate over mTLS, or — for a browser,
-//!   which has none — by a device token from [`super::device_auth`]. Same authority either way,
-//!   because it is the same pairing.
+//! - **paired device** — [`cert_may_access`] (status reads plus three writes: log upload,
+//!   host-action invoke, ending its own games). Proven either by a client certificate over
+//!   mTLS, or — for a browser, which has none — by a device token from
+//!   [`super::device_auth`]. Same authority either way, because it is the same pairing.
 //! - **plugin token** (bearer, loopback) — [`plugin_may_access`]: admin minus hooks, pairing
 //!   admin, host logs, store, and update.
 //! - **admin token** (bearer, loopback) — everything.
@@ -13,11 +13,13 @@
 use super::shared::*;
 use crate::gamestream::tls::PeerAddr;
 use crate::gamestream::tls::PeerCertFingerprint;
-use axum::extract::Request;
+use axum::extract::{FromRequestParts, Request};
 use axum::http::header;
+use axum::http::request::Parts;
 use axum::http::Method;
 use axum::middleware::Next;
 use sha2::{Digest, Sha256};
+use std::marker::PhantomData;
 
 /// Which credential authorized this request. [`require_auth`] stamps it on every forwarded
 /// request; handlers extract `Extension<AuthLane>`. A missing extension is a 500, not a
@@ -44,12 +46,68 @@ pub(crate) struct PairedDevice(pub String);
 #[derive(Clone, Debug)]
 pub(crate) struct PluginIdentity(pub String);
 
-/// May a request carrying `identity` write the registration or provider named `id`?
+/// The `{id}` path segment of a plugin-owned resource, once the caller may write it.
 ///
-/// One rule, in one place, for `PUT/DELETE /plugins/{id}` and the provider routes: a plugin that
-/// proved which plugin it is may write only its own id.
-pub(crate) fn plugin_owns(identity: Option<&PluginIdentity>, id: &str) -> bool {
-    identity.is_none_or(|who| who.0 == id)
+/// One rule for every plugin-scoped write (`/plugins/{id}`, the library provider, scanner and
+/// metadata routes): a plugin that proved which plugin it is may write only its own id (403).
+/// The operator and the shared runner token may write any. `R` then checks the id's shape
+/// (400). Both run before the body is read.
+pub(crate) struct OwnedId<R>(pub String, pub PhantomData<R>);
+
+/// The shape an [`OwnedId`] must have. `Err` is the 400's message.
+pub(crate) trait IdRule {
+    fn check(id: &str) -> Result<(), String>;
+}
+
+/// A library provider or metadata source ([`crate::library::validate_provider_name`]).
+pub(crate) struct ProviderId;
+
+impl IdRule for ProviderId {
+    fn check(id: &str) -> Result<(), String> {
+        crate::library::validate_provider_name(id)
+    }
+}
+
+/// A plugin registration ([`crate::slug::plugin_id`]).
+pub(crate) struct PluginId;
+
+impl IdRule for PluginId {
+    fn check(id: &str) -> Result<(), String> {
+        crate::slug::plugin_id(id)
+            .then_some(())
+            .ok_or_else(|| "invalid plugin id (expected kebab-case `[a-z][a-z0-9-]*`, ≤64)".into())
+    }
+}
+
+/// Any id: the route answers an unknown one itself.
+pub(crate) struct AnyId;
+
+impl IdRule for AnyId {
+    fn check(_: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+impl<S: Send + Sync, R: IdRule> FromRequestParts<S> for OwnedId<R> {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Response> {
+        let Path(id) = Path::<String>::from_request_parts(parts, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        if parts
+            .extensions
+            .get::<PluginIdentity>()
+            .is_some_and(|who| who.0 != id)
+        {
+            return Err(api_error(
+                StatusCode::FORBIDDEN,
+                "a plugin may only write its own id",
+            ));
+        }
+        R::check(&id).map_err(|e| api_error(StatusCode::BAD_REQUEST, &e))?;
+        Ok(OwnedId(id, PhantomData))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,7 +226,7 @@ pub(crate) async fn require_auth(
             && st
                 .native
                 .as_ref()
-                .is_some_and(|n| n.effective(fp, unix_now()).is_some())
+                .is_some_and(|n| n.effective(fp, crate::clock::unix_secs()).is_some())
         {
             let fp = fp.clone();
             return forward_device(req, next, fp).await;
@@ -184,7 +242,7 @@ pub(crate) async fn require_auth(
                 && st
                     .native
                     .as_ref()
-                    .is_some_and(|n| n.effective(&fp, unix_now()).is_some())
+                    .is_some_and(|n| n.effective(&fp, crate::clock::unix_secs()).is_some())
             {
                 return forward_device(req, next, fp).await;
             }
@@ -222,11 +280,20 @@ pub(crate) async fn require_auth(
         }
         // A plugin's OWN token: the same routes, plus the identity that makes them its own.
         Some(token) => {
-            let who = st
-                .plugin_tokens
-                .iter()
-                .find(|(_, pt)| token_eq(token, pt))
-                .map(|(id, _)| id.clone());
+            let find = |tokens: &std::collections::BTreeMap<String, String>| {
+                tokens
+                    .iter()
+                    .find(|(_, pt)| token_eq(token, pt))
+                    .map(|(id, _)| id.clone())
+            };
+            let mut who = find(&st.plugin_tokens.read().unwrap_or_else(|p| p.into_inner()));
+            // `plugins add` mints in its own process: the file has the token before memory does.
+            if who.is_none() {
+                if let Some(fresh) = crate::mgmt_token::read_per_plugin(&st.config_dir) {
+                    who = find(&fresh);
+                    *st.plugin_tokens.write().unwrap_or_else(|p| p.into_inner()) = fresh;
+                }
+            }
             match who {
                 Some(id) => forward_plugin(req, next, Some(PluginIdentity(id))).await,
                 None => api_error(
@@ -252,7 +319,8 @@ fn bearer(req: &Request) -> Option<&str> {
 }
 
 /// Allowlist of routes the plugin token may reach. A later route is denied until classified
-/// (`plugin_lane_classifies_every_route` in `mgmt::tests` fails the build otherwise).
+/// (`every_route_is_classified_for_the_plugin_and_cert_lanes` in `mgmt::tests` fails the
+/// build otherwise).
 ///
 /// Out of the list: hooks (operator commands + webhook secrets), `GET /logs` (those secrets
 /// unredacted), pairing admin, UI-proxy credentials, the plugin store, the update surface,
@@ -306,6 +374,7 @@ pub(crate) fn plugin_may_access(method: &Method, path: &str) -> bool {
         (&Method::POST, "/api/v1/game/end"),
         // Library reads + provider reconcile. Privileged fields refused via `AuthLane`.
         (&Method::GET, "/api/v1/library"),
+        (&Method::GET, "/api/v1/library/page"),
         (&Method::GET, "/api/v1/library/art/{}/{}"),
         (&Method::GET, "/api/v1/library/scanners"),
         (&Method::PUT, "/api/v1/library/scanners/{}"),
@@ -316,6 +385,11 @@ pub(crate) fn plugin_may_access(method: &Method, path: &str) -> bool {
         (&Method::DELETE, "/api/v1/library/provider/{}"),
         // Provider liveness for its own titles — mapped through the catalog, no one else's session.
         (&Method::PUT, "/api/v1/library/provider/{}/running"),
+        // An Art & Metadata source pushes its own result and reads its mode. Ordering, the
+        // switches and picks are the operator's.
+        (&Method::GET, "/api/v1/library/metadata"),
+        (&Method::PUT, "/api/v1/library/metadata/{}"),
+        (&Method::DELETE, "/api/v1/library/metadata/{}"),
         (&Method::POST, "/api/v1/stats/capture/start"),
         (&Method::POST, "/api/v1/stats/capture/stop"),
         (&Method::GET, "/api/v1/stats/capture/status"),
@@ -325,6 +399,8 @@ pub(crate) fn plugin_may_access(method: &Method, path: &str) -> bool {
         (&Method::DELETE, "/api/v1/stats/recordings/{}"),
         (&Method::GET, "/api/v1/plugins"),
         (&Method::POST, "/api/v1/plugins/logs"),
+        // Where a managed emulator's program is, for the plugin that launches it.
+        (&Method::GET, "/api/v1/emulators"),
         // A plugin asks for a folder and reads its own rows; deciding is admin-only, so the
         // overview and `/plugin-access/{}/decide` are deliberately absent here.
         (&Method::GET, "/api/v1/plugin-access/requests"),
@@ -363,6 +439,10 @@ pub(crate) fn cert_may_access(method: &Method, path: &str) -> bool {
     if method == Method::POST && path_matches("/api/v1/actions/{}", path) {
         return true;
     }
+    // The handler scopes it to games this device launched, and refuses an expired device.
+    if method == Method::POST && path == "/api/v1/game/end" {
+        return true;
+    }
     method == Method::GET
         && (matches!(
             path,
@@ -373,6 +453,7 @@ pub(crate) fn cert_may_access(method: &Method, path: &str) -> bool {
                 // Rosters are not on this lane: they name every other paired device. Library
                 // GET is; POST/PUT/DELETE stay token-only via this exact-path match.
                 | "/api/v1/library"
+                | "/api/v1/library/page"
         ) || path.starts_with("/api/v1/library/art/"))
 }
 
@@ -380,15 +461,6 @@ pub(crate) fn cert_may_access(method: &Method, path: &str) -> bool {
 /// dependency.
 pub(crate) fn token_eq(presented: &str, expected: &str) -> bool {
     Sha256::digest(presented.as_bytes()) == Sha256::digest(expected.as_bytes())
-}
-
-/// Host wall clock, unix seconds — the clock every stored access deadline is expressed in.
-/// Sampled at each check, same as `mgmt::native`'s copy.
-pub(crate) fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

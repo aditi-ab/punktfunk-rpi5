@@ -4,6 +4,8 @@ export {
 	type AccessRequestOutcome,
 	type AccessRequestPath,
 	requestAccess,
+	requestCores,
+	requestEmulators,
 	unreachable,
 } from "./access.js";
 export { type CacheStore, makeCacheStore } from "./cache-store.js";
@@ -27,11 +29,18 @@ export {
 	statePath,
 } from "./paths.js";
 export {
+	ART_KINDS,
+	ArtKind,
 	Artwork,
+	AudioPolicy,
 	DEFAULT_RUNNING_TTL_S,
 	DetectHint,
+	EntryIds,
 	GameMeta,
 	LaunchSpec,
+	MetadataEntry,
+	type MetaField,
+	OnWindow,
 	PrepStep,
 	ProviderClient,
 	type ProviderClientService,
@@ -58,9 +67,15 @@ export {
 } from "./sync-engine.js";
 export {
 	deriveConfigJsonSchema,
+	handedPath,
 	httpApiEnv,
 	makeConfigHandler,
+	makeGameHandler,
+	makeHoldHandler,
 	type ServeUiConfig,
+	type ServeUiGame,
+	type ServeUiHolds,
 	type ServeUiOptions,
+	type StatusLine,
 	serveUi,
 } from "./ui-server.js";

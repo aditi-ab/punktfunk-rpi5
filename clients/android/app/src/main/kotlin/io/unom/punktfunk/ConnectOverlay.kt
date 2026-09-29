@@ -41,7 +41,7 @@ import androidx.compose.ui.window.DialogProperties
 
 /**
  * Which phase of the connect flow to draw — the pure view model [ConnectOverlay] resolves from the
- * live dial/wake state, so [ConnectTakeover] / [ConnectModal] can render (and be screenshot-tested)
+ * live dial/wake state, so [ConnectModal] can render (and be screenshot-tested)
  * statelessly.
  */
 internal sealed interface ConnectPhase {
@@ -95,11 +95,7 @@ private fun connectCopy(phase: ConnectPhase): ConnectCopy = when (phase) {
  *  - **Waking** ([WakeController.waking] non-null): the dial failed on a sleeping host, so we're firing
  *    Wake-on-LAN and waiting for it to advertise again, escalating to a retry/cancel prompt on timeout.
  *
- * Presentation is mode-aware (mirrors the Apple client): in the **console / gamepad** UI it's a
- * full-screen aurora [ConnectTakeover] — the same signature backdrop the console home uses, driven by
- * the pad (B cancels, A retries once timed out) with a hint bar. In the **default touch** UI it's a
- * Material [ConnectModal] over the host grid, matching the app's other dialogs — the aurora takeover
- * looked out of place there.
+ * Drawn as a Material [ConnectModal] over the host grid, matching the app's other dialogs.
  *
  * The two phases hand off within a single Compose frame (see ConnectScreen's `doConnectDirect` →
  * `waker.start` → redial), so nothing blinks between them.

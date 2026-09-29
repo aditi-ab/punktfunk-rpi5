@@ -1,11 +1,8 @@
 #!/bin/sh
-# Every config-dir file the plugin runner reads must be bound into its unit's empty home.
+# Every config-dir path the plugin runner reads must be bound into its unit's empty home.
 #
-# `ProtectHome=tmpfs` means a path the unit does not name does not exist for the runner, whatever
-# is on disk. `plugin-tokens.json` shipped unbound and no plugin on Linux could start, with an
-# error blaming the host for a file the host had already written. The names come out of the SDK
-# here rather than from a second hand-kept list; a join whose first argument is not one of the
-# three spellings below is invisible to this gate.
+# `ProtectHome=tmpfs` means an unnamed path does not exist for the runner. Names come from the SDK;
+# for a nested file the first component names the directory bind that keeps renames visible.
 set -eu
 cd "$(dirname "$0")/../.."
 

@@ -309,9 +309,10 @@ fn escape(rbsp: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{opening_idr_au, split_into_aus, trail_p, SpsOpts};
+    use super::super::tests::{opening_idr_au, trail_p, SpsOpts};
     use super::super::H265Planner;
     use super::*;
+    use crate::testing::split_h265_aus;
 
     fn idr() -> Vec<u8> {
         opening_idr_au(&SpsOpts::default())
@@ -391,7 +392,7 @@ mod tests {
     #[test]
     fn the_vulkan_wave_dump_conceals_only_its_first_post_loss_picture() {
         let dropped = include_bytes!("../../tests/vectors/vkenc-wave-smoke-dropped.h265");
-        let aus = split_into_aus(dropped);
+        let aus = split_h265_aus(dropped);
         assert_eq!(aus.len(), 7);
         let mut c = H265Concealer::new();
         assert_eq!(c.conceal(aus[0]), Concealment::Intact);
@@ -417,7 +418,7 @@ mod tests {
         // The full stream never needs it.
         let full = include_bytes!("../../tests/vectors/vkenc-wave-smoke.h265");
         let mut c = H265Concealer::new();
-        for au in split_into_aus(full) {
+        for au in split_h265_aus(full) {
             assert_eq!(c.conceal(au), Concealment::Intact);
         }
         // For the VideoToolbox replay harness.

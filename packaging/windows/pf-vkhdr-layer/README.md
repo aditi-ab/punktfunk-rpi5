@@ -26,10 +26,11 @@ Dark Ages enables HDR over the virtual display with this layer.**
 - Intercepts `vkGetPhysicalDeviceSurfaceFormatsKHR` / `...2KHR`, calls down to the ICD, and appends
   `{A2B10G10R10_UNORM_PACK32, HDR10_ST2084_EXT}` + `{R16G16B16A16_SFLOAT, EXTENDED_SRGB_LINEAR_EXT}`
   (deduped — a no-op on real HDR monitors that already list them).
-- **Self-gates**: it only injects when the surface's monitor actually has Windows advanced-color
-  (HDR) *enabled* right now (checked via `DisplayConfigGetDeviceInfo` / `GET_ADVANCED_COLOR_INFO`).
-  So it does **nothing** on SDR sessions/displays — no washed-out "SDR-in-HDR". It tracks
-  `VkSurfaceKHR → HWND` by intercepting `vkCreateWin32SurfaceKHR`.
+- **Self-gates**: it only injects when the surface's monitor is a punktfunk virtual display (EDID
+  manufacturer `PNK`) with Windows HDR on right now: advanced color enabled, wide color not
+  enforced (checked via `DisplayConfigGetDeviceInfo` / `GET_ADVANCED_COLOR_INFO`). So it does
+  **nothing** on physical displays, on SDR sessions, or under Auto Color Management — no
+  washed-out "SDR-in-HDR". It tracks `VkSurfaceKHR → HWND` by intercepting `vkCreateWin32SurfaceKHR`.
 - Everything else is pass-through dispatch chaining (instance + device).
 
 It is shipped as an **always-on** implicit layer (loads via the registry, so it works regardless of

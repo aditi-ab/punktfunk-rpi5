@@ -13,14 +13,14 @@
 //! picks a head when no name is published.
 //!
 //! Pin: install the host `.desktop` and re-login (KWin caches the grant per-exe).
-//! Same path as `krdpserver`. See `docs-site/content/docs/kde.md`.
+//! Same path as `krdpserver`. See `docs-site/content/docs/(guide)/(desktops)/kde.md`.
 
 #![allow(clippy::all, dead_code, non_camel_case_types, non_snake_case, unused)]
 
 use super::{gs_button_to_evdev, vk_to_evdev, InputEvent, InputInjector};
 use crate::scroll::{ScrollBackend, ScrollMapper, ScrollOp};
 use anyhow::{Context, Result};
-use punktfunk_core::input::{InputKind, PRECISE_PX_PER_DETENT, SCROLL_FLAG_PRECISE};
+use punktfunk_core::input::InputKind;
 use std::time::{Duration, Instant};
 use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
@@ -52,32 +52,6 @@ const MAX_VERSION: u32 = 4;
 
 const AXIS_VERTICAL: u32 = 0;
 const AXIS_HORIZONTAL: u32 = 1;
-/// GameStream `code` for a horizontal wheel (same as `gamestream::input`).
-const SCROLL_HORIZONTAL: u32 = 1;
-
-/// Axis units one wheel click is worth. `fake_input` carries a bare `axis` — no source, no
-/// v120 — and KWin forwards it as such, so every toolkit falls back to the legacy convention
-/// of ten units per click (Qt and Chromium multiply the value by 12 to get 120-space, GTK
-/// divides by 10). The value is therefore a CLICK COUNT, never a distance.
-const UNITS_PER_DETENT: f64 = 10.0;
-
-/// Pixels a client scrolls for one of those clicks: three text lines, the price the Windows
-/// injector puts on a detent too. A precise delta is a distance and clicks are all this
-/// channel has, so it converts through here — without that a 10 px flick buys a whole click
-/// and the page runs an order of magnitude too far. Only a source-carrying backend (libei,
-/// wlroots) scrolls a gesture by its true distance.
-pub(crate) const PRECISE_CLICK_PX: f64 = 60.0;
-
-/// Axis units for one scroll event: `x` is the wire's WHEEL_DELTA(120) delta, `precise` its
-/// [`SCROLL_FLAG_PRECISE`] bit. Vertical is negated by the caller, not here.
-fn axis_value(x: i32, precise: bool) -> f64 {
-    let detents = f64::from(x) / 120.0;
-    if precise {
-        detents * PRECISE_PX_PER_DETENT / PRECISE_CLICK_PX * UNITS_PER_DETENT
-    } else {
-        detents * UNITS_PER_DETENT
-    }
-}
 
 struct OutputTrack {
     /// Registry id; also dispatch user-data so events find this entry.
@@ -289,6 +263,8 @@ pub struct KwinFakeInjector {
     last_refresh: Option<Instant>,
     /// Normalized-scroll lowering onto the bare `axis` click channel.
     scroll: ScrollMapper,
+    /// What this device holds, released before it goes ([`Drop`]).
+    held: crate::held::HeldInput,
 }
 
 /// Cap geometry roundtrips at 2 Hz. A roundtrip on every mouse-move would stall the control path.
@@ -327,6 +303,7 @@ impl KwinFakeInjector {
             fake,
             last_refresh: None,
             scroll: ScrollMapper::new(ScrollBackend::Kwin),
+            held: crate::held::HeldInput::default(),
         };
         injector.refresh_geometry();
         tracing::info!(
@@ -391,8 +368,19 @@ impl KwinFakeInjector {
     }
 }
 
+impl Drop for KwinFakeInjector {
+    /// Release what the device still holds before it goes; a key or button KWin keeps
+    /// pressed for a client that vanished is a stuck one.
+    fn drop(&mut self) {
+        for up in self.held.release() {
+            let _ = self.inject(&up);
+        }
+    }
+}
+
 impl InputInjector for KwinFakeInjector {
     fn inject(&mut self, event: &InputEvent) -> Result<()> {
+        self.held.note(event);
         match event.kind {
             InputKind::MouseMove => {
                 self.fake.pointer_motion(event.x as f64, event.y as f64);
@@ -403,8 +391,8 @@ impl InputInjector for KwinFakeInjector {
                 if w > 0 && h > 0 {
                     self.refresh_geometry();
                     let (lx, ly, lw, lh) = self.logical_target(w, h);
-                    let nx = (event.x as f64 / w as f64).clamp(0.0, 1.0);
-                    let ny = (event.y as f64 / h as f64).clamp(0.0, 1.0);
+                    let nx = (event.x as f64 / w as f64).clamp(0.0, f64::from(crate::ABS_EDGE));
+                    let ny = (event.y as f64 / h as f64).clamp(0.0, f64::from(crate::ABS_EDGE));
                     self.fake
                         .pointer_motion_absolute(lx + nx * lw, ly + ny * lh);
                 }
@@ -415,25 +403,10 @@ impl InputInjector for KwinFakeInjector {
                     self.fake.button(btn, st);
                 }
             }
-            InputKind::MouseScroll => {
-                // Wire is WHEEL_DELTA(120); vertical flips the Wayland axis sign. The app
-                // reads this axis in clicks ([`UNITS_PER_DETENT`]), so a precise delta must be
-                // repriced from the wire's detent to what a click scrolls; it cannot travel as
-                // a distance the way it does on wlroots.
-                let horizontal = event.code == SCROLL_HORIZONTAL;
-                let axis = if horizontal {
-                    AXIS_HORIZONTAL
-                } else {
-                    AXIS_VERTICAL
-                };
-                let sign = if horizontal { 1.0 } else { -1.0 };
-                let precise = event.flags & SCROLL_FLAG_PRECISE != 0;
-                self.fake.axis(axis, sign * axis_value(event.x, precise));
-            }
-            // Normalized scroll lowers through the shared mapper onto the same
-            // bare axis; the plan carries click-priced units and the Wayland
-            // vertical sign already applied.
-            InputKind::Scroll => self.inject_scroll(event),
+            // Legacy and normalized scroll lower through the shared mapper onto
+            // the bare axis; the plan carries click-priced units and the
+            // Wayland vertical sign already applied.
+            InputKind::MouseScroll | InputKind::Scroll => self.inject_scroll(event),
             InputKind::KeyDown | InputKind::KeyUp => {
                 // Evdev code; KWin owns the keymap and modifier state — no modifiers request.
                 if let Some(evdev) = vk_to_evdev(event.code as u8) {
@@ -450,8 +423,8 @@ impl InputInjector for KwinFakeInjector {
                 if w > 0 && h > 0 {
                     self.refresh_geometry();
                     let (lx, ly, lw, lh) = self.logical_target(w, h);
-                    let nx = (event.x as f64 / w as f64).clamp(0.0, 1.0);
-                    let ny = (event.y as f64 / h as f64).clamp(0.0, 1.0);
+                    let nx = (event.x as f64 / w as f64).clamp(0.0, f64::from(crate::ABS_EDGE));
+                    let ny = (event.y as f64 / h as f64).clamp(0.0, f64::from(crate::ABS_EDGE));
                     let x = lx + nx * lw;
                     let y = ly + ny * lh;
                     if event.kind == InputKind::TouchDown {
@@ -525,31 +498,5 @@ mod tests {
         ];
         let got = pick(heads.iter(), Some("Virtual-punktfunk-1"), 1920, 1080);
         assert_eq!(got.map(|g| g.logical_x), Some(1920));
-    }
-
-    /// The app multiplies this axis back by 12 to reach 120-space, so a detent has to leave
-    /// as 10 units — 15 spent one and a half clicks per notch.
-    #[test]
-    fn a_wheel_detent_is_one_click() {
-        assert_eq!(axis_value(120, false), 10.0);
-        assert_eq!(axis_value(-240, false), -20.0);
-    }
-
-    /// A 60 px flick must move 60 px of content: 60 px is one click here, and one click is
-    /// 10 units. Sending the distance itself (the old `PRECISE_PX_PER_DETENT` scale) made it
-    /// six clicks.
-    #[test]
-    fn a_precise_flick_travels_its_own_distance() {
-        let px = 60.0;
-        let wire = (px * 12.0) as i32; // clients put a measured pixel into 120-space at 12
-        assert!((axis_value(wire, true) - UNITS_PER_DETENT).abs() < 1e-9);
-        assert!((axis_value(wire, false) - 60.0).abs() < 1e-9);
-    }
-
-    /// A precise delta never flips its own sign, and zero stays zero.
-    #[test]
-    fn precise_keeps_its_sign() {
-        assert!(axis_value(-120, true) < 0.0);
-        assert_eq!(axis_value(0, true), 0.0);
     }
 }

@@ -38,6 +38,10 @@ desktop = ["pf-client-core/desktop"]
 # armeabi-v7a one is (see the provenance note in clients/android/kit/build.gradle.kts).
 gl = ["skia-safe/gl"]
 
+# Skia's Metal backend for an Apple host (`clients/apple/native`). Take it with
+# `default-features = false`: rust-skia publishes no archive that has both `metal` and `vulkan`.
+metal = ["skia-safe/metal"]
+
 # Same Linux+Windows gating as the rest of the client stack.
 [target.'cfg(any(target_os = "linux", windows))'.dependencies]
 pf-presenter = { path = "../pf-presenter", optional = true, default-features = false }
@@ -58,6 +62,10 @@ pf-client-core = { path = "../pf-client-core", default-features = false }
 # fail when no matching asset exists — it silently falls back to a gn/ninja build of Skia from
 # source, which turns a 2-minute CI leg into a multi-hour one. Verified at 0.99.0, both targets:
 #   skia-binaries-a25a0fdb7d90429aa2d1-<target>-jpegd-jpege-pdf-textlayout-vulkan.tar.gz
+# The same 0.99.0 release also publishes, for x86_64-pc-windows-msvc, a `gl` archive and a
+# `d3d` archive (hash a25a0fdb7d90429aa2d1): `…-gl-jpegd-jpege-pdf-textlayout` and
+# `…-d3d-jpegd-jpege-pdf-textlayout`. This crate still takes `vulkan` on desktop.
+# This dependency does not select either key.
 # ⚠ The asset name CHANGED across this bump — at 0.87 it was `<target>-pdf-textlayout-vulkan`,
 # because `jpeg` was not yet in skia-safe's DEFAULT feature set (0.87: binary-cache, embed-icudtl,
 # pdf; 0.99: + jpeg). We take defaults, so the JPEG codecs came along with the bump. That is a
@@ -70,7 +78,7 @@ pf-client-core = { path = "../pf-client-core", default-features = false }
 # pre-generated bindings.rs under the NEW crate, failing with `no variant, associated function,
 # or constant named 'Default' found for enum SkPathFillType`. That is exactly how #193 shipped.
 skia-safe = { version = "0.99", features = ["textlayout"] }
-ash = { version = "0.38", features = ["loaded"], optional = true }
+ash = { workspace = true, features = ["loaded"], optional = true }
 
 # Android (design/android-skia-console-port.md D1): the same crate over Skia's GL backend on
 # the client's own EGL surface. `gl` not `vulkan` — universal on every Android device this
@@ -94,9 +102,21 @@ pf-client-core = { path = "../pf-client-core", default-features = false }
 skia-safe = { version = "0.99", features = ["gl", "textlayout"] }
 pf-client-core = { path = "../pf-client-core", default-features = false }
 
-# Everything the shell itself needs, on every platform it runs on (macOS stays an empty crate:
-# the Mac client is clients/apple).
-[target.'cfg(any(target_os = "linux", windows, target_os = "android", target_family = "wasm"))'.dependencies]
+# Apple: the Mac runs the tests on CPU raster; an Apple host draws through `metal`. With this
+# crate's default features the darwin key is `jpegd-jpege-pdf-textlayout-vulkan`, and with
+# `default-features = false, features = ["metal"]` it is `jpegd-jpege-metal-pdf-textlayout`.
+# rust-skia publishes both for darwin and iOS at 0.99.0. tvOS and visionOS have no rust-skia
+# archive: their four are ours, built by `scripts/skia-apple/build.sh` (a patched
+# skia-bindings), fetched through `SKIA_BINARIES_URL` from
+# git.unom.io/unom/skia-binaries/releases/download/0.99.0/, and
+# `build.rs` names the system libraries skia-bindings does not link there. Their SHA-256s
+# are pinned in scripts/build-xcframework.sh, which fetches and verifies every Apple slice's.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+skia-safe = { version = "0.99", features = ["textlayout"] }
+pf-client-core = { path = "../pf-client-core", default-features = false }
+
+# Everything the shell itself needs, on every platform it runs on.
+[target.'cfg(any(target_os = "linux", windows, target_os = "android", target_vendor = "apple", target_family = "wasm"))'.dependencies]
 anyhow = "1"
 tracing = "0.1"
 # The host-facing model types (`HostRow`, `ConsoleCmd`, `LibraryGame`, …) derive serde so a host
@@ -108,6 +128,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # `config::GamepadPref` keys the button-glyph style (PlayStation shapes vs ABXY).
 punktfunk-core = { path = "../punktfunk-core" }
+# Flexbox for the element layer (`el/`). Pure Rust; flexbox and the content-size pass only.
+taffy = { version = "0.14", default-features = false, features = ["std", "taffy_tree", "flexbox", "content_size"] }
 
 # Linux links the system SDL3; Windows builds it from source (same choice as the rest
 # of the workspace's Windows SDL consumers).
@@ -117,8 +139,8 @@ sdl3 = { version = "0.18", features = ["hidapi", "ash"], optional = true }
 [target.'cfg(windows)'.dependencies]
 sdl3 = { version = "0.18", features = ["hidapi", "ash", "build-from-source"], optional = true }
 
-# The shared console parity vectors (`clients/shared/console-vectors.json`) are read by three
-# tests here — the palette table, the tab names and the transition motion — and the library
+# The shared console parity vectors (`clients/shared/console-vectors.json`) are read by tests
+# here — the tab names and the transition motion — and the library
 # collation vectors (`clients/shared/library-collate-vectors.json`) by a fourth (`collate.rs`).
 # Dev-only: nothing in the shipping crate parses JSON. `pf-client-core` reads its own deeplink
 # vectors the same way.

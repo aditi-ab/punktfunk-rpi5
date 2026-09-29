@@ -8,22 +8,20 @@
 //! daemon down and joins its fold thread. This makes stop-vs-poll races safe without JVM callbacks
 //! or Rust pointers crossing JNI.
 
-use crate::session::jni_guard;
+use crate::session::{jni_guard, HandleTable};
 use jni::errors::LogErrorAndDefault;
 use jni::objects::{JObject, JString};
 use jni::sys::jlong;
 use jni::EnvUnowned;
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-/// DNS-SD service type punktfunk hosts advertise (host side: `punktfunk_host::discovery`).
+/// DNS-SD service type punktfunk hosts advertise (host side: `punktfunk_host::hostsys::discovery`).
 const SERVICE_TYPE: &str = "_punktfunk._udp.local.";
-/// Wire protocol id in the `proto` TXT record; a host advertising anything else is skipped.
-const PROTO: &str = "punktfunk/1";
 /// Field separator inside one serialized record (ASCII Unit Separator — never in a field value).
 const FIELD_SEP: char = '\u{1f}';
 /// How long the fold thread waits for an event before it looks at the rescan flag.
@@ -202,75 +200,29 @@ impl Drop for Discovery {
     }
 }
 
-static NEXT_DISCOVERY_HANDLE: AtomicU64 = AtomicU64::new(0x3000_0000_0000_0001);
+static DISCOVERIES: HandleTable<Discovery> = HandleTable::new(0x3000_0000_0000_0001);
 
-fn discoveries() -> &'static Mutex<HashMap<jlong, Arc<Discovery>>> {
-    static DISCOVERIES: OnceLock<Mutex<HashMap<jlong, Arc<Discovery>>>> = OnceLock::new();
-    DISCOVERIES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn insert_discovery(discovery: Discovery) -> jlong {
-    let discovery = Arc::new(discovery);
-    let mut discoveries = crate::session::lock_recover(discoveries());
-    loop {
-        let handle = NEXT_DISCOVERY_HANDLE.fetch_add(1, Ordering::Relaxed) as jlong;
-        if handle != 0 && !discoveries.contains_key(&handle) {
-            discoveries.insert(handle, discovery);
-            return handle;
-        }
-    }
-}
-
-fn get_discovery(handle: jlong) -> Option<Arc<Discovery>> {
-    if handle == 0 {
-        return None;
-    }
-    crate::session::lock_recover(discoveries())
-        .get(&handle)
-        .cloned()
-}
-
-fn remove_discovery(handle: jlong) -> Option<Arc<Discovery>> {
-    if handle == 0 {
-        return None;
-    }
-    crate::session::lock_recover(discoveries()).remove(&handle)
-}
-
-/// Build a [`Host`] from a resolved mDNS record, or `None` if it isn't a usable punktfunk host
-/// (incompatible advertised proto, or no IPv4 address). IPv4 only on purpose: the core dials with
-/// `format!("{host}:{port}").parse::<SocketAddr>()`, which can't parse a bare/scoped IPv6 literal
-/// (it needs the `[addr%scope]:port` form), so surfacing a v6-only host would present a card that
-/// fails on every tap. Dropping it shows the honest "not found" instead.
+/// The [`Host`] a resolved mDNS record describes, or `None` if it isn't a usable punktfunk host
+/// (see `punktfunk_core::discovery::advert_from_txt`, the parse every client shares).
 fn resolve(info: &ResolvedService) -> Option<Host> {
-    let val = |k: &str| info.get_property_val_str(k).unwrap_or("").to_string();
-    let proto = val("proto");
-    if !proto.is_empty() && proto != PROTO {
-        return None; // some other DNS-SD service sharing the type — ignore
-    }
-    // Deterministic pick from the union of per-interface answers (the host OS's responder
-    // contributes VPN/overlay addresses; `iter().next()` on the HashSet dialed an arbitrary
-    // one) — same policy as the desktop client, shared in `punktfunk_core::discovery`.
-    let candidates: Vec<std::net::Ipv4Addr> = info.get_addresses_v4().into_iter().collect();
-    let addr = punktfunk_core::discovery::pick_host_addr(&candidates, val("addr").parse().ok())?
-        .to_string();
-    let id = val("id");
-    let fullname = info.get_fullname();
+    let v4: Vec<std::net::Ipv4Addr> = info.get_addresses_v4().into_iter().collect();
+    let h = punktfunk_core::discovery::advert_from_txt(
+        info.get_fullname(),
+        info.get_port(),
+        &v4,
+        |k| info.get_property_val_str(k),
+    )?;
     Some(Host {
-        key: if id.is_empty() {
-            fullname.to_string()
-        } else {
-            id
-        },
-        name: fullname.split('.').next().unwrap_or("?").to_string(),
-        addr,
-        port: info.get_port(),
-        fp: val("fp"),
-        pair: val("pair"),
-        mac: val("mac"),
-        os: val("os"),
+        key: h.key,
+        name: h.name,
+        addr: h.addr,
+        port: h.port,
+        fp: h.fp_hex,
+        pair: h.pair,
+        mac: h.mac.join(","),
+        os: h.os,
         // 0 = the host didn't advertise one (older host); Kotlin then falls back to 47990.
-        mgmt: val("mgmt").parse().unwrap_or(0),
+        mgmt: h.mgmt_port.unwrap_or(0),
     })
 }
 
@@ -282,7 +234,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoverySt
     _this: JObject,
 ) -> jlong {
     jni_guard(0, || match Discovery::start() {
-        Some(discovery) => insert_discovery(discovery),
+        Some(discovery) => DISCOVERIES.insert(discovery),
         None => 0,
     })
 }
@@ -299,7 +251,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryPo
     // `LogErrorAndDefault` logs then yields `JString::default()` — the null reference the old
     // `std::ptr::null_mut()` default returned. Kotlin still sees a null String on failure.
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
-        let out = get_discovery(handle)
+        let out = DISCOVERIES
+            .get(handle)
             .map(|discovery| discovery.snapshot())
             .unwrap_or_default();
         env.new_string(out)
@@ -315,7 +268,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryRe
     handle: jlong,
 ) {
     jni_guard((), || {
-        if let Some(discovery) = get_discovery(handle) {
+        if let Some(discovery) = DISCOVERIES.get(handle) {
             discovery.rescan();
         }
     })
@@ -329,7 +282,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoverySt
     _this: JObject,
     handle: jlong,
 ) {
-    jni_guard((), || drop(remove_discovery(handle)))
+    jni_guard((), || drop(DISCOVERIES.remove(handle)))
 }
 
 #[cfg(test)]

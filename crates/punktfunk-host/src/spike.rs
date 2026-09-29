@@ -135,6 +135,10 @@ pub fn run(opts: Options) -> Result<()> {
     capturer.set_active(true);
 
     let first = capturer.next_frame().context("capture first frame")?;
+    // The gate is what the display composes: the encoder follows an SDR display down to 8-bit.
+    if hdr && capturer.hdr_meta().is_none() {
+        anyhow::bail!("--hdr: the display composes SDR, not HDR");
+    }
     let (w, h) = (first.width, first.height);
     tracing::info!(
         width = w,

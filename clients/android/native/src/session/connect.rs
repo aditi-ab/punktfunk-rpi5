@@ -5,15 +5,12 @@ use jni::errors::LogErrorAndDefault;
 use jni::objects::{JObject, JString};
 use jni::sys::{jboolean, jint, jlong};
 use jni::EnvUnowned;
-use punktfunk_core::client::NativeClient;
+use punktfunk_core::client::{ConnectParams, NativeClient};
 use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::{
-    get_session, hex32, insert_session, jni_guard, lock_recover, parse_hex32, remove_session,
-    SessionHandle,
-};
+use super::{hex, jni_guard, lock_recover, parse_hex32, SessionHandle, SESSIONS};
 
 /// Machine token of the most recent `nativeConnect`/`nativePair` failure, taken (and cleared)
 /// by `nativeTakeLastError` so Kotlin can render a cause-specific message instead of the old
@@ -89,22 +86,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetLowLaten
 /// Kotlin `FEATURE_PartialFrame` probe said no — the rebuild-free on-glass experiment for a
 /// decoder that may accept `BUFFER_FLAG_PARTIAL_FRAME` without declaring the feature (the NP3's
 /// c2.qti decoders declare nothing). Android-only; everywhere else the probe verdict stands.
-#[cfg(target_os = "android")]
 fn force_parts_sysprop() -> bool {
-    let mut buf = [0u8; 92]; // PROP_VALUE_MAX
-                             // SAFETY: __system_property_get with a valid name + PROP_VALUE_MAX buffer is always safe.
-    let n = unsafe {
-        libc::__system_property_get(
-            c"debug.punktfunk.force_parts".as_ptr(),
-            buf.as_mut_ptr().cast(),
-        )
-    };
-    n > 0 && std::str::from_utf8(&buf[..n as usize]).unwrap_or("").trim() == "1"
-}
-
-#[cfg(not(target_os = "android"))]
-fn force_parts_sysprop() -> bool {
-    false
+    crate::sys::sysprop(c"debug.punktfunk.force_parts").as_deref() == Some("1")
 }
 
 /// The rates this session may ask for when the one the user chose will not open, best first.
@@ -210,7 +193,7 @@ fn resolve_requested_audio_format(rate_hz: u32, bits: u8, channels: u8) -> (u32,
         .unwrap_or(HZ48);
     if granted != rate_hz {
         log::warn!(
-            "audio: this device will not open a {rate_hz} Hz output, so the session asks for {granted} Hz / {bits}-bit instead — the wire is only ever offered a format this client has proved it can play"
+            "audio: this device can't play {rate_hz} Hz without resampling, so the session asks for {granted} Hz / {bits}-bit instead — the wire is only ever offered a format this client has proved it can play"
         );
     }
     (granted, bits)
@@ -393,6 +376,12 @@ struct ConnectRequest {
     /// Build plus the shell that dialled; rides `Start`'s extension block as the host's log label.
     #[serde(default)]
     dialer: String,
+    /// The settings preset this session streams with; `None` for the plain settings.
+    #[serde(default)]
+    preset_id: Option<String>,
+    /// That preset's name.
+    #[serde(default)]
+    preset_name: Option<String>,
 }
 
 /// `NativeBridge.nativeConnect(requestJson): Long` — see [`ConnectRequest`]. Returns an opaque
@@ -453,10 +442,15 @@ fn connect(req: ConnectRequest) -> jlong {
         keep_host_audio,
         video_fit,
         dialer,
+        preset_id,
+        preset_name,
     } = req;
     // Which shell asked, for the host's `handshake complete` line. Set before the dial: core reads
     // it once the host says it parses the block.
     punktfunk_core::client::set_client_label(&dialer);
+    let preset = preset_id.as_deref().and_then(|id| {
+        punktfunk_core::quic::SessionPreset::new(id, preset_name.as_deref().unwrap_or(""))
+    });
     let launch = launch.filter(|s| !s.is_empty());
     let device_name = device_name
         .map(|s| s.trim().to_string())
@@ -510,14 +504,11 @@ fn connect(req: ConnectRequest) -> jlong {
     // playback.
     let (audio_rate_hz, audio_bits) =
         resolve_requested_audio_format(audio_rate_hz, audio_bits, audio_channels);
-    match NativeClient::connect_with_audio_format(
-        &host,
-        port,
-        mode,
-        CompositorPref::from_u8(compositor_pref),
-        GamepadPref::from_u8(gamepad_pref),
+    let params = ConnectParams {
+        compositor: CompositorPref::from_u8(compositor_pref),
+        gamepad: GamepadPref::from_u8(gamepad_pref),
         bitrate_kbps, // 0 = host default
-        video_caps(hdr_enabled, ten_bit_sdr, multi_slice_ok),
+        video_caps: video_caps(hdr_enabled, ten_bit_sdr, multi_slice_ok),
         audio_channels,
         // The audio format this session ASKS for (resolved above). A non-default pair is what
         // makes core set `CLIENT_CAP_AUDIO_HIRES` in the `Hello` — capable AND the user turned it
@@ -528,14 +519,14 @@ fn connect(req: ConnectRequest) -> jlong {
         audio_rate_hz,
         audio_bits,
         // Legacy coupling: libopus here decodes either, and nothing on Android needs the other.
-        punktfunk_core::audio::AudioLayout::Legacy,
-        punktfunk_core::video_fit::VideoFit::from_name(&video_fit),
+        audio_layout: punktfunk_core::audio::AudioLayout::Legacy,
+        video_fit: punktfunk_core::video_fit::VideoFit::from_name(&video_fit),
         // Codecs this device decodes (`VideoDecoders.decodableCodecBits`): H.264 + HEVC always,
         // AV1 on a real `video/av01` decoder, PyroWave on a GPU that passes the probe — the one
         // bit here naming no MediaCodec, since it decodes as Vulkan compute in `crate::pyro`.
         // Masked to the known bits, falling back to H.264|HEVC on 0 so a bogus value cannot
         // advertise nothing and kill the handshake. The host echoes its pick in `connector.codec`.
-        {
+        video_codecs: {
             let bits = video_codecs
                 & (punktfunk_core::quic::CODEC_H264
                     | punktfunk_core::quic::CODEC_HEVC
@@ -550,7 +541,7 @@ fn connect(req: ConnectRequest) -> jlong {
         preferred_codec,
         // No display-volume forwarding from Android yet (the panel tone-maps PQ itself via the
         // Surface dataspace + static metadata) — the host keeps its virtual-display EDID defaults.
-        None,
+        display_hdr: None,
         // No CLIENT_CAP_CURSOR: this client does not render the host cursor locally (no
         // shape/state planes in the jni surface) — advertising it would stream cursor-less.
         // CLIENT_CAP_PHASE_LOCK is honest: the async decode loop's presenter feeds
@@ -560,7 +551,7 @@ fn connect(req: ConnectRequest) -> jlong {
         // arrival bits: without it the host never sets HOST_CAP_PAD_AUDIO and never emits 0xD1,
         // so declaring a pad's render caps later would have nothing to gate. Gated on the
         // settings so a user with pad audio off does not make the host provision endpoints.
-        punktfunk_core::quic::CLIENT_CAP_PHASE_LOCK
+        client_caps: punktfunk_core::quic::CLIENT_CAP_PHASE_LOCK
             | if pad_audio_ok {
                 punktfunk_core::quic::CLIENT_CAP_PAD_AUDIO
             } else {
@@ -582,17 +573,17 @@ fn connect(req: ConnectRequest) -> jlong {
         // loop feeds them with BUFFER_FLAG_PARTIAL_FRAME.
         frame_parts,
         launch, // a store-qualified library id to boot into a game, or None for the desktop
-        device_name, // Kotlin's Build.MODEL — the host's approval-list / trust-store label
+        name: device_name, // Kotlin's Build.MODEL — the host's approval-list / trust-store label
         pin,    // Some → Crypto on host-fp mismatch
         identity, // owned (cert, key) PEM, or None (anonymous)
+        preset,
         // Handshake budget from Kotlin: ~10 s for a normal connect, ~185 s for "request access"
         // (the host parks the connection until the operator approves the device — see ConnectScreen).
-        Duration::from_millis(timeout_ms),
-        // The Kotlin side cancels by dropping the result (`Dial.cancelled`), not by aborting
-        // the dial — its connect runs on a pool thread, so a parked one costs a thread, not a
-        // stuck UI. Wire a flag through here if that ever stops being true.
-        None,
-    ) {
+        // No `cancel`: Kotlin drops the result (`Dial.cancelled`) rather than abort the dial — its
+        // connect runs on a pool thread, so a parked one costs a thread, not a stuck UI.
+        ..ConnectParams::new(&host, port, mode, Duration::from_millis(timeout_ms))
+    };
+    match NativeClient::connect(params) {
         Ok(client) => {
             let client = Arc::new(client);
             let handle = SessionHandle {
@@ -615,7 +606,7 @@ fn connect(req: ConnectRequest) -> jlong {
                 src_crop: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 decoded_size: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             };
-            insert_session(handle)
+            SESSIONS.insert(handle)
         }
         Err(e) => {
             log::error!("nativeConnect to {host}:{port} failed: {e}");
@@ -627,15 +618,23 @@ fn connect(req: ConnectRequest) -> jlong {
 
 /// `NativeBridge.nativeClose(handle)` — remove one session key and begin teardown.
 ///
-/// Existing JNI calls retain their `Arc` until they return, then the final drop joins media workers
-/// and closes the connector. Zero, stale, duplicate, and concurrent closes are no-ops.
+/// Pad audio is joined here, since it borrows a USB fd Kotlin may close once this returns. Other
+/// JNI calls keep their `Arc` until they return; the final drop joins the remaining workers and
+/// closes the connector. Zero, stale, duplicate, and concurrent closes are no-ops.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClose(
     _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
 ) {
-    jni_guard((), || drop(remove_session(handle)))
+    jni_guard((), || {
+        let Some(session) = SESSIONS.remove(handle) else {
+            return;
+        };
+        #[cfg(target_os = "android")]
+        session.stop_pad_audio();
+        drop(session);
+    })
 }
 
 /// Mark an explicit user disconnect so the host skips reconnect linger.
@@ -649,7 +648,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDisconnectQ
     handle: jlong,
 ) {
     jni_guard((), || {
-        if let Some(session) = get_session(handle) {
+        if let Some(session) = SESSIONS.get(handle) {
             session.client.disconnect_quit();
         }
     })
@@ -672,7 +671,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeRequestMode
         if width <= 0 || height <= 0 || refresh_hz <= 0 {
             return false;
         }
-        let Some(session) = get_session(handle) else {
+        let Some(session) = SESSIONS.get(handle) else {
             return false;
         };
         session
@@ -694,8 +693,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeHostFingerp
     _this: JObject<'local>,
     handle: jlong,
 ) -> JString<'local> {
-    let out = get_session(handle)
-        .map(|session| hex32(&session.client.host_fingerprint))
+    let out = SESSIONS
+        .get(handle)
+        .map(|session| hex(&session.client.host_fingerprint))
         .unwrap_or_default();
     env.with_env(|env| env.new_string(out))
         .resolve::<LogErrorAndDefault>()
@@ -712,7 +712,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSessionEnde
     handle: jlong,
 ) -> jboolean {
     jni_guard(false, || {
-        get_session(handle).is_some_and(|session| session.client.is_session_ended())
+        SESSIONS
+            .get(handle)
+            .is_some_and(|session| session.client.is_session_ended())
     })
 }
 
@@ -727,7 +729,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeEndReason(
     handle: jlong,
 ) -> jint {
     jni_guard(0, || {
-        get_session(handle)
+        SESSIONS
+            .get(handle)
             .map(|session| session.client.end_reason() as jint)
             .unwrap_or(0)
     })
@@ -771,7 +774,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePair<'local
                 &name,
                 Duration::from_secs(60),
             ) {
-                Ok(host_fp) => hex32(&host_fp),
+                Ok(host_fp) => hex(&host_fp),
                 Err(e) => {
                     // Crypto error == wrong PIN / MITM; anything else == transport/host reject.
                     // The token lets Kotlin say WHICH (`nativeTakeLastError`).

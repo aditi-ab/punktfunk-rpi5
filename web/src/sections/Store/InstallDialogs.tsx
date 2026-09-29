@@ -1,6 +1,11 @@
 import { BadgeCheck, ShieldAlert, ShieldQuestion } from "lucide-react";
 import { type FC, useEffect, useState } from "react";
-import type { PendingUpdate, StoreEntry } from "@/api/store";
+import type { CatalogEntry } from "@/api/gen/model";
+import type { PendingUpdate } from "@/api/store";
+import {
+	PasswordConfirmField,
+	type PasswordFailure,
+} from "@/components/password-confirm";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -28,9 +33,9 @@ import { m } from "@/paraglide/messages";
  */
 export const InstallDialog: FC<{
 	/** The entry being confirmed, or null when the dialog is closed. */
-	entry: StoreEntry | null;
+	entry: CatalogEntry | null;
 	onCancel: () => void;
-	onConfirm: (entry: StoreEntry) => void;
+	onConfirm: (entry: CatalogEntry) => void;
 	isPending: boolean;
 }> = ({ entry, onCancel, onConfirm, isPending }) => {
 	const external = entry?.tier === "external";
@@ -186,9 +191,9 @@ export const SpecInstallDialog: FC<{
 	onCancel: () => void;
 	onConfirm: (spec: string, password: string) => void;
 	isPending: boolean;
-	/** Set when the BFF rejected the password (401), so the dialog can say so and stay open. */
-	wrongPassword?: boolean;
-}> = ({ open, onCancel, onConfirm, isPending, wrongPassword }) => {
+	/** Why the BFF refused the password, so the dialog can say so and stay open. */
+	failure?: PasswordFailure;
+}> = ({ open, onCancel, onConfirm, isPending, failure = null }) => {
 	const [spec, setSpec] = useState("");
 	const [echo, setEcho] = useState("");
 	const [accepted, setAccepted] = useState(false);
@@ -270,24 +275,13 @@ export const SpecInstallDialog: FC<{
 					<span>{m.store_spec_checkbox()}</span>
 				</Label>
 
-				<div className="space-y-2">
-					<Label htmlFor="store-spec-password">{m.store_spec_password()}</Label>
-					<Input
-						id="store-spec-password"
-						type="password"
-						autoComplete="current-password"
-						value={password}
-						onChange={(e) => setPassword(e.target.value)}
-					/>
-					<p className="text-xs text-muted-foreground">
-						{m.store_spec_password_help()}
-					</p>
-					{wrongPassword && (
-						<p role="alert" className="text-xs text-destructive">
-							{m.update_apply_wrong_password()}
-						</p>
-					)}
-				</div>
+				<PasswordConfirmField
+					id="store-spec-password"
+					value={password}
+					onChange={setPassword}
+					failure={failure}
+					help={m.store_spec_password_help()}
+				/>
 
 				<DialogFooter>
 					<Button variant="outline" onClick={onCancel} disabled={isPending}>

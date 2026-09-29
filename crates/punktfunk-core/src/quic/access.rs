@@ -15,34 +15,29 @@
 
 use crate::input::InputKind;
 
+// Literals, not `1 << n` or ORs: cbindgen copies the spelling into the header, and Swift
+// imports a `#define` only when it is a plain value.
 /// DualSense `0xCC`, pad-audio, rumble, and virtual-pad creation (no bit, no uinput node).
-pub const GRANT_GAMEPAD: u32 = 1 << 0;
+pub const GRANT_GAMEPAD: u32 = 0x01;
 /// Mouse, scroll, touch, and the pen plane.
-pub const GRANT_POINTER: u32 = 1 << 1;
+pub const GRANT_POINTER: u32 = 0x02;
 /// Key down/up and IME-committed text.
-pub const GRANT_KEYBOARD: u32 = 1 << 2;
+pub const GRANT_KEYBOARD: u32 = 0x04;
 /// Clipboard coordinator. ANDed with the operator clipboard policy; never overrides it.
-pub const GRANT_CLIPBOARD: u32 = 1 << 3;
+pub const GRANT_CLIPBOARD: u32 = 0x08;
 /// Mic datagram plane and the per-session mic-service attach.
-pub const GRANT_MIC: u32 = 1 << 4;
+pub const GRANT_MIC: u32 = 0x10;
 /// `Hello.launch` resolution.
-pub const GRANT_LAUNCH: u32 = 1 << 5;
+pub const GRANT_LAUNCH: u32 = 0x20;
 /// `power.*` (sleep/reboot/shutdown) on the mgmt cert lane (`design/host-actions.md`).
 /// Not a datagram; [`classify`] is untouched. Machine power only — never plugin actions.
-pub const GRANT_POWER: u32 = 1 << 6;
+pub const GRANT_POWER: u32 = 0x40;
 
-/// An omitted Welcome or registry mask reads as this.
-pub const GRANT_ALL: u32 = GRANT_GAMEPAD
-    | GRANT_POINTER
-    | GRANT_KEYBOARD
-    | GRANT_CLIPBOARD
-    | GRANT_MIC
-    | GRANT_LAUNCH
-    | GRANT_POWER;
+/// An omitted Welcome or registry mask reads as this: every bit above.
+pub const GRANT_ALL: u32 = 0x7F;
 
 /// Stored "Full control" before [`GRANT_POWER`]. [`normalize_legacy_full`] lifts it.
-pub const GRANT_ALL_PRE_POWER: u32 =
-    GRANT_GAMEPAD | GRANT_POINTER | GRANT_KEYBOARD | GRANT_CLIPBOARD | GRANT_MIC | GRANT_LAUNCH;
+pub const GRANT_ALL_PRE_POWER: u32 = 0x3F;
 
 /// Exact [`GRANT_ALL_PRE_POWER`] → [`GRANT_ALL`]. Other masks pass through.
 /// That stored Full already has `KEYBOARD`+`POINTER` (desktop power menu), so
@@ -81,6 +76,19 @@ pub enum GrantClass {
 }
 
 impl GrantClass {
+    /// Every class, in bit order. Tables indexed by [`GrantClass::bit`] size from this.
+    ///
+    /// cbindgen:ignore
+    pub const ALL: [GrantClass; 7] = [
+        Self::Gamepad,
+        Self::Pointer,
+        Self::Keyboard,
+        Self::Clipboard,
+        Self::Mic,
+        Self::Launch,
+        Self::Power,
+    ];
+
     pub fn bit(self) -> u32 {
         match self {
             Self::Gamepad => GRANT_GAMEPAD,
@@ -141,6 +149,18 @@ mod tests {
             acc |= b;
         }
         assert_eq!(acc, GRANT_ALL);
+        let classes = GrantClass::ALL.iter().fold(0, |acc, c| acc | c.bit());
+        assert_eq!(
+            classes, GRANT_ALL,
+            "GrantClass::ALL must name every grant bit"
+        );
+        for (i, c) in GrantClass::ALL.iter().enumerate() {
+            assert_eq!(
+                c.bit().trailing_zeros() as usize,
+                i,
+                "{c:?} out of bit order"
+            );
+        }
         assert_eq!(GRANT_ALL & GRANT_RESERVED, 0);
         assert_eq!(GRANT_ALL | GRANT_RESERVED, u32::MAX);
     }
@@ -156,7 +176,7 @@ mod tests {
 
     #[test]
     fn legacy_full_reads_as_the_current_full() {
-        assert_eq!(GRANT_ALL_PRE_POWER, 0x3F);
+        assert_eq!(GRANT_ALL_PRE_POWER, GRANT_ALL & !GRANT_POWER);
         assert_eq!(normalize_legacy_full(GRANT_ALL_PRE_POWER), GRANT_ALL);
         assert_eq!(normalize_legacy_full(GRANT_ALL), GRANT_ALL);
         assert_eq!(normalize_legacy_full(GRANT_GAMEPAD), GRANT_GAMEPAD);
@@ -189,6 +209,77 @@ mod tests {
         assert_eq!(
             seen, 17,
             "InputKind wire vocabulary grew — classify the new kind"
+        );
+    }
+
+    /// The bit table, the legacy-full read, and the mask → preset level each client derives:
+    /// normalize, drop unknown bits, then match the three presets or fall to `custom`.
+    fn grant_vectors() -> String {
+        let bits = [
+            ("GAMEPAD", GRANT_GAMEPAD),
+            ("POINTER", GRANT_POINTER),
+            ("KEYBOARD", GRANT_KEYBOARD),
+            ("CLIPBOARD", GRANT_CLIPBOARD),
+            ("MIC", GRANT_MIC),
+            ("LAUNCH", GRANT_LAUNCH),
+            ("POWER", GRANT_POWER),
+        ];
+        let masks = [
+            0,
+            GRANT_GAMEPAD,
+            GRANT_ALL,
+            GRANT_ALL_PRE_POWER,
+            GRANT_ALL_PRE_POWER & !GRANT_KEYBOARD,
+            GRANT_ALL & !GRANT_LAUNCH,
+            GRANT_GAMEPAD | GRANT_CLIPBOARD,
+            GRANT_POWER,
+            0x80,
+            0x80 | GRANT_GAMEPAD,
+            0x80 | GRANT_ALL,
+            0x80 | GRANT_ALL_PRE_POWER,
+            0x100 | GRANT_ALL_PRE_POWER,
+        ];
+        let level = |mask: u32| match normalize_legacy_full(mask) & GRANT_ALL {
+            GRANT_PRESET_FULL => "full",
+            GRANT_PRESET_CONTROLLER_ONLY => "controller",
+            GRANT_PRESET_VIEW_ONLY => "view",
+            _ => "custom",
+        };
+        let about = "Generated from punktfunk_core::quic::access by grant_vectors_are_checked_in \
+            (UPDATE_VECTORS=1 rewrites it). pf-client-core, the web console, Kotlin and Swift \
+            replay it.";
+        let mut out = format!("{{\n  \"$comment\": \"{about}\",\n  \"bits\": {{\n");
+        for (i, (name, bit)) in bits.iter().enumerate() {
+            let comma = if i + 1 < bits.len() { "," } else { "" };
+            out += &format!("    \"{name}\": {bit}{comma}\n");
+        }
+        out += &format!(
+            "  }},\n  \"all\": {GRANT_ALL},\n  \"all_pre_power\": {GRANT_ALL_PRE_POWER},\n  \
+             \"masks\": [\n"
+        );
+        for (i, &mask) in masks.iter().enumerate() {
+            let comma = if i + 1 < masks.len() { "," } else { "" };
+            let normalized = normalize_legacy_full(mask);
+            let level = level(mask);
+            out += &format!(
+                "    {{\"mask\": {mask}, \"normalized\": {normalized}, \"level\": \"{level}\"}}\
+                 {comma}\n"
+            );
+        }
+        out + "  ]\n}\n"
+    }
+
+    #[test]
+    fn grant_vectors_are_checked_in() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/grant-vectors.json");
+        let fresh = grant_vectors();
+        if std::env::var_os("UPDATE_VECTORS").is_some() {
+            std::fs::write(path, &fresh).unwrap();
+        }
+        let on_disk = std::fs::read_to_string(path).unwrap_or_default();
+        assert!(
+            on_disk == fresh,
+            "{path} is stale: rerun with UPDATE_VECTORS=1"
         );
     }
 

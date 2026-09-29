@@ -9,7 +9,7 @@ import XCTest
 /// Three hand-written resolvers decide where every client opens — this one,
 /// `crates/pf-client-core/src/start.rs`, and the Android kit's `StartScreen.kt`. A client that
 /// disagreed would open on a different host from the one its own settings row names. Sibling of
-/// `ConsoleVectorsTests` and `SharedFoundationTests.testDeepLinkSharedVectors`, read the same way.
+/// `SharedFoundationTests.testDeepLinkSharedVectors`, read the same way.
 final class StartScreenVectorsTests: XCTestCase {
     /// Read from the repo, not from a bundle resource: a copy would be a second file, and a
     /// second file drifts. Four `deletingLastPathComponent()` calls walk

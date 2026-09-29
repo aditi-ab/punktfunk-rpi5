@@ -1,5 +1,7 @@
 package io.unom.punktfunk.kit
 
+import java.io.File
+import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -289,26 +291,26 @@ class Sc2DeviceTest {
         assertEquals("100f6c34-1735-4313-b402-38567131e5f3", Sc2Device.BLE_FEATURE_CHAR)
     }
 
+    /** `clients/shared/sc2-vectors.json`: the host's id-included lengths, one byte longer. */
     @Test
-    fun `output lengths mirror the host's id-included table`() {
-        // Transcribed from `pf_driver_proto::triton::out_report_len`, which holds the same table
-        // with the id byte counted in. Editing either side alone goes red here.
-        val hostLen = mapOf(
-            0x80 to 10, 0x81 to 8, 0x82 to 4, 0x83 to 10, 0x84 to 9,
-            0x85 to 4, 0x86 to 4, 0x87 to 64, 0x88 to 64, 0x89 to 64,
-        )
-        for ((id, len) in hostLen) {
-            assertEquals("id 0x%02x".format(id), len, Sc2Device.strippedOutputLen(id)!! + 1)
+    fun `output lengths match the shared vectors`() {
+        val file = File("../../shared/sc2-vectors.json")
+        assertTrue("the shared vector file must be reachable at ${file.absolutePath}", file.isFile)
+        val rows = JSONObject(file.readText()).getJSONArray("out_report_len")
+        for (i in 0 until rows.length()) {
+            val row = rows.getJSONObject(i)
+            val id = row.getInt("id")
+            // Undeclared ids stay whole on both sides: the host does not trim, we do not guess.
+            val want = if (row.isNull("len")) null else row.getInt("len") - 1
+            assertEquals("id 0x%02x".format(id), want, Sc2Device.strippedOutputLen(id))
         }
-        // Undeclared ids stay whole on both sides: the host does not trim, we do not guess.
-        assertNull(Sc2Device.strippedOutputLen(0x8A))
         assertNull(Sc2Device.strippedOutputLen(0x00))
     }
 
     @Test
     fun `a rumble stream collapses while a queued pulse survives`() {
         // More rumbles than the queue holds: uncoalesced, the overflow evicts the pulse.
-        val q = OutReportQueue()
+        val q = OutReportQueue<ByteArray>()
         val pulse = byteArrayOf(0x81.toByte(), 1)
         q.offer(pulse, Sc2Device.outputCoalesceKey(pulse))
         repeat(OutReportQueue.CAP + 8) { n ->

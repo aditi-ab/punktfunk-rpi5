@@ -13,8 +13,8 @@
 //  * pointer: the cursor jumps to the finger and follows it (absolute moves through the
 //    aspect-fit letterbox) — direct pointing for desktop-style use.
 //
-// The third `TouchInputMode` (`touch`) never reaches this type: `StreamLayerUIView` forwards
-// those fingers as REAL wire touches (multi-touch passthrough) instead.
+// `touch` never reaches this type: `StreamLayerUIView` forwards those fingers as REAL wire
+// touches (multi-touch passthrough) instead. `off` runs a second instance with no `send`.
 
 import Foundation
 import PunktfunkShared
@@ -29,6 +29,8 @@ public enum TouchInputMode: String, CaseIterable, Sendable {
     case trackpad
     case pointer
     case touch
+    /// Fingers reach the host as nothing; the twist, keyboard swipe and stats tap still run.
+    case off
 
     /// The session's setting, defaulting to trackpad when unknown — unless the ring's Touch mode
     /// slot cycled it for this session (`sessionOverride`, cleared at session end).
@@ -41,7 +43,7 @@ public enum TouchInputMode: String, CaseIterable, Sendable {
     public static var sessionOverride: TouchInputMode?
 }
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 import PunktfunkCore
 import UIKit
 
@@ -506,7 +508,11 @@ final class TouchMouse {
             return
         }
         // Ballistics in physical pixels so the curve matches the Android tuning exactly.
+        #if os(visionOS)
+        let scale = view.traitCollection.displayScale
+        #else
         let scale = view.window?.screen.scale ?? view.traitCollection.displayScale
+        #endif
         let dx = (loc.x - prevPoint.x) * scale
         let dy = (loc.y - prevPoint.y) * scale
         let dtMs = max((touch.timestamp - prevTime) * 1000, 1)

@@ -5,6 +5,7 @@
 // and, on tvOS, AVPlayer.eligibleForHDRPlayback (the TV-capability HDR gate).
 import AVFoundation
 import Foundation
+import GameController
 import os
 import PunktfunkKit
 import SwiftUI
@@ -116,7 +117,30 @@ final class SessionModel: ObservableObject {
     }
 
     @Published private(set) var phase: Phase = .idle
-    @Published private(set) var connection: PunktfunkConnection?
+    @Published private(set) var connection: PunktfunkConnection? {
+        didSet {
+            #if os(macOS)
+            Self.liveConnections[ObjectIdentifier(self)] = connection
+            #endif
+        }
+    }
+    #if os(macOS)
+    /// Every window's live connection: a Cmd+Q runs no window's teardown.
+    private static var liveConnections: [ObjectIdentifier: PunktfunkConnection] = [:]
+    /// Teardowns still running off-main. Closing the last window quits the app under them.
+    private static let closing = DispatchGroup()
+
+    /// App quit: end each live session as a deliberate quit, before the process goes.
+    static func quitAll() {
+        for conn in liveConnections.values {
+            conn.disconnectQuit()
+            conn.close()
+        }
+        liveConnections.removeAll()
+        // A close waits out plane polls of 100–200 ms. 3 s bounds a wedged one.
+        _ = closing.wait(timeout: .now() + 3)
+    }
+    #endif
     /// The launched title whose game is not up yet: its cover flies out of the shelf tile at the
     /// tap and holds the screen — through the dial, and then over the stream — until the host's
     /// `/status` says the game left `launching` (`punktfunk-host::gamelease`), or the player asks
@@ -126,6 +150,9 @@ final class SessionModel: ObservableObject {
     /// the only moment the cover has somewhere to fly FROM, and holding from there means one
     /// unbroken screen from the tap to the game rather than a stream of the launcher in between.
     @Published private(set) var launchHold: LaunchHoldTarget?
+    /// The console's own launch hold is up, as the console reports it: the console stays over
+    /// the stream it dialled, and the stream takes no input, until the console lets go.
+    @Published var consoleHold = false
     /// The launched game is up and the host is waiting for its window.
     @Published private(set) var launchWindowWait = false
     private var launchWatch: Task<Void, Never>?
@@ -199,6 +226,11 @@ final class SessionModel: ObservableObject {
     /// the capture's ONLY UI surface: the raw BLE device never enters GameController, so the
     /// Controllers page cannot list it.
     @Published private(set) var sc2CapturedHint = false
+    /// True while the exit hint shows: from stream start for `motionHintSeconds`, unless the
+    /// player turned it off (`DefaultsKey.exitHint`).
+    @Published private(set) var exitHintShown = false
+    /// Drops `exitHintShown` — cancelled on teardown, like `motionHintTimer`.
+    private var exitHintTimer: Task<Void, Never>?
     /// Drops `sc2CapturedHint` — same contract as `motionHintTimer` (restart on a new claim,
     /// cancel on teardown rather than firing into a torn-down model). Only `noteSc2Phase` and
     /// the disconnect teardown touch it.
@@ -241,6 +273,7 @@ final class SessionModel: ObservableObject {
 
     /// The ring is up: the pad belongs to it (flushed on the host, edges become navigation).
     func setRingOpen(_ open: Bool) {
+        if open { refreshStreamedGame() }
         gamepadCapture?.ringOpen = open
         virtualPad?.masked = open
         // A captured SC2 never enters GamepadCapture, so it hands the ring its pad itself.
@@ -299,7 +332,6 @@ final class SessionModel: ObservableObject {
     @Published private(set) var clipboardEnabled = false
     /// The host's last `ClipState.reason` (`CLIP_REASON_*`) — why an enable was refused
     /// (backend unavailable / policy disabled / …); 0 = OK.
-    @Published private(set) var clipboardReason: UInt8 = 0
 
     // MARK: - Per-client access (design/per-client-access.md §7)
 
@@ -407,32 +439,11 @@ final class SessionModel: ObservableObject {
         statsVerbosity = StatsVerbosity(rawValue: effective.statsVerbosity) ?? .normal
         #if os(iOS)
         // An attached monitor shows the picture (StreamViewController), so its size and rate win.
-        let mode = ExternalDisplay.streamMode(effective) ?? effective.streamMode
+        let mode = ExternalDisplay.streamMode(effective)
+            ?? effective.streamMode(native: NativeDisplay.mode)
         #else
-        let mode = effective.streamMode
+        let mode = effective.streamMode(native: NativeDisplay.mode)
         #endif
-        let (width, height, hz) = (mode.width, mode.height, mode.hz)
-        let compositor = PunktfunkConnection.Compositor(
-            rawValue: UInt32(clamping: effective.compositor)) ?? .auto
-        var bitrateKbps = UInt32(clamping: effective.bitrateKbps)
-        let audioChannels = UInt8(clamping: effective.audioChannels)
-        // The format this session ASKS for, at every channel count: only the host's gate knows the
-        // datagram size, so a request it cannot fit comes back declined in `Welcome`. The request
-        // is never the answer — SessionAudio and the stats overlay read what the host granted
-        // (`resolvedAudioRateHz`, `resolvedAudioBits`, `isLosslessAudio`).
-        let audioFormat = effective.audioFormatChoice
-        let (audioRateHz, audioBits) = audioFormat.wire
-        let hdrEnabled = effective.hdrEnabled
-        let preferredCodec = PunktfunkConnection.codecByte(effective.codec)
-        // PyroWave is always Automatic bitrate (ABR overhaul RFC §5.2): a fixed kbps is
-        // ill-defined for the all-intra codec (bpp is the operating point) and used to bypass
-        // the host's operator ceiling — send 0 and let the host pin its per-mode rate. Gated
-        // like the advertisement below: a device that failed the Metal probe never offers the
-        // codec, falls back to H.26x, and the user's rate must survive there. The stored
-        // setting is untouched, so switching codecs back restores it.
-        if preferredCodec == PunktfunkConnection.codecPyroWave, MetalWaveletDecoder.supported {
-            bitrateKbps = 0
-        }
         let pin = host.pinnedSHA256
         // Capability gate (main-actor — screen APIs): only advertise HDR when this display can
         // actually present it, so the host sends a proper SDR stream to an SDR display rather than
@@ -455,88 +466,40 @@ final class SessionModel: ObservableObject {
                 // see StreamViewIOS), so gate on the TV's mode-independent capability; if the
                 // switch never lands, the presenter's in-shader tone-map keeps PQ safe anyway.
                 return AVPlayer.eligibleForHDRPlayback
+            #elseif os(visionOS)
+                return true // every Vision Pro display presents HDR
             #else
                 return UIScreen.main.potentialEDRHeadroom > 1.0
             #endif
         }()
-        let hdrCapable = hdrEnabled && displayHDR
-        // 4:4:4 opt-IN (default off): full chroma is a per-client choice — a clear win for
-        // desktop/text work, but at a fixed bitrate it spends bits on chroma that game content
-        // doesn't visibly need, and the encode/decode pixel rate rises. The host allows it by
-        // default (PUNKTFUNK_444, default on), so this toggle is the one real switch; the
-        // hardware-decode probe below still gates what can actually be advertised.
-        let want444 = effective.enable444
-        // 10-bit without HDR: an SDR desktop at Main10, which costs a little bandwidth and takes
-        // the banding out of gradients. `hdrCapable` already advertises the depth, so this only
-        // adds the arm where HDR is off or the display cannot show it.
-        let tenBit = hdrCapable || effective.tenBitSdr
-        let connectLine = "connect \(host.displayName) \(host.address):\(host.port) "
-            + "mode=\(width)x\(height)@\(hz) codec=\(effective.codec) bitrate=\(bitrateKbps)kbps "
-            + "hdr=\(hdrCapable) 10bit=\(tenBit) 444=\(want444) "
-            + "audio=\(audioChannels)ch/\(audioRateHz)Hz/\(audioBits)bit "
-            + "pinned=\(pin != nil) tofu=\(allowTofu) launch=\(launchID ?? "-")"
-        sessionLog.info("\(connectLine, privacy: .public)")
         Task.detached(priority: .userInitiated) {
             // PunktfunkConnection.init blocks on the QUIC handshake — keep it off the main
             // actor. The persistent identity is presented on every connect so a paired
             // host recognizes this Mac (nil = anonymous, fine for hosts without
             // --require-pairing; Keychain/generation failure must not block connecting).
             let identity = (try? ClientIdentityStore.shared.load())?.identity
-            // 4:4:4 only when allowed AND decodable in real time. PyroWave's Metal decoder takes
-            // it on any device past its probe. HEVC needs HARDWARE 4:4:4, at BOTH depths when
-            // 10-bit is advertised (the host may still send 8-bit). `chromaFormat` is the answer.
-            let pyroWave =
-                preferredCodec == PunktfunkConnection.codecPyroWave && MetalWaveletDecoder.supported
-            let canDecode444 =
-                pyroWave
-                || (tenBit
-                    ? (Stage444Probe.hwDecode444_8bit && Stage444Probe.hwDecode444_10bit)
-                    : Stage444Probe.hwDecode444_8bit)
-            let videoCaps = PunktfunkConnection.videoCaps(
-                tenBit: tenBit, hdr: hdrCapable, chroma444: want444 && canDecode444)
-            // This client's VideoToolbox path decodes H.264 and HEVC everywhere, and AV1 when
-            // this device has an AV1 hardware decoder (M3-class Macs, A17 Pro-class iPhones —
-            // VideoToolbox has no software AV1 decoder, so advertising it elsewhere would invite
-            // a stream that can't decode; see AV1.swift). The host resolves the emitted codec
-            // from these + the soft `preferredCodec`; `resolvedCodec` reflects what it chose.
-            var videoCodecs = PunktfunkConnection.codecH264 | PunktfunkConnection.codecHEVC
-            if AV1.hardwareDecodeSupported { videoCodecs |= PunktfunkConnection.codecAV1 }
-            // PyroWave (wired LAN) is a pure opt-in: picking it in the codec setting both
-            // advertises the bit and prefers it — the host never auto-selects it, and the
-            // picker only offers it when the Metal decode probe passed (simdgroup floor ≈ A13;
-            // every M-series Mac and the ATV 4K gen 3 pass). The decoder self-configures from
-            // the per-frame sequence header (4:2:0/4:4:4, SDR/PQ — design/pyrowave-444-hdr.md),
-            // so the session keeps the user's HDR/10-bit/4:4:4 caps exactly like HEVC/AV1.
-            if pyroWave { videoCodecs |= PunktfunkConnection.codecPyroWave }
-            // Cursor channel (remote-desktop-sweep M2, macOS): sessions STARTING in the desktop
-            // mouse model advertise local cursor rendering — the host then stops compositing
-            // the pointer and forwards shape/state, which StreamView draws as the real
-            // NSCursor. Capture-mode sessions keep today's composited pointer.
-            #if os(macOS)
-            let presentCaps: UInt8 =
-                (MouseInputMode(rawValue: effective.mouseMode) ?? .capture) == .desktop ? 0x01 : 0
-            #else
-            // iOS/tvOS run the stage-4 deadline presenter, whose link thread feeds
-            // reportPhase — advertise the vsync-aware presenter (0x02, CLIENT_CAP_PHASE_LOCK).
-            // macOS stays without it: the stage-2 arrival presenter has no latch grid.
-            let presentCaps: UInt8 = 0x02
-            #endif
-            // "Keep host audio playing": the host taps its default playback device instead of
-            // parking it on a silent endpoint, so the speakers on the host PC stay live. Pure
-            // REQUEST — no host-cap echo — so an older host simply goes quiet as it always did.
-            let clientCaps =
-                presentCaps
-                | (effective.keepHostAudio ? PunktfunkConnection.clientCapKeepHostAudio : 0)
+            // The decoder probes run here too: each is a one-off decode or shader compile.
+            let offer = ConnectOffer.resolve(
+                effective, mode: mode, displayHDR: displayHDR,
+                pyroWave: MetalWaveletDecoder.supported, av1: AV1.hardwareDecodeSupported,
+                hw444EightBit: Stage444Probe.hwDecode444_8bit,
+                hw444TenBit: Stage444Probe.hwDecode444_10bit)
+            let connectLine = "connect \(host.displayName) \(host.address):\(host.port) "
+                + "mode=\(offer.width)x\(offer.height)@\(offer.hz) codec=\(effective.codec) "
+                + "bitrate=\(offer.bitrateKbps)kbps "
+                + "hdr=\(offer.hdr) 10bit=\(offer.tenBit) 444=\(offer.want444) "
+                + "audio=\(offer.audioChannels)ch/\(offer.audioRateHz)Hz/\(offer.audioBits)bit "
+                + "pinned=\(pin != nil) tofu=\(allowTofu) launch=\(launchID ?? "-")"
+            sessionLog.info("\(connectLine, privacy: .public)")
             let result = Result { try PunktfunkConnection(
                 host: host.address, port: host.port,
-                width: width, height: height, refreshHz: hz,
-                pinSHA256: pin, identity: identity, compositor: compositor,
-                gamepad: gamepad, bitrateKbps: bitrateKbps, videoCaps: videoCaps,
-                audioChannels: audioChannels,
-                audioRateHz: audioRateHz, audioBits: audioBits,
-                videoCodecs: videoCodecs, preferredCodec: preferredCodec,
-                clientCaps: clientCaps,
-                videoFit: VideoFit(name: effective.videoFit).wire,
+                width: offer.width, height: offer.height, refreshHz: offer.hz,
+                pinSHA256: pin, identity: identity, compositor: offer.compositor,
+                gamepad: gamepad, bitrateKbps: offer.bitrateKbps, videoCaps: offer.videoCaps,
+                audioChannels: offer.audioChannels,
+                audioRateHz: offer.audioRateHz, audioBits: offer.audioBits,
+                videoCodecs: offer.videoCodecs, preferredCodec: offer.preferredCodec,
+                clientCaps: offer.clientCaps, videoFit: offer.videoFit,
                 launchID: launchID,
                 // Delegated approval: the host holds this connect open until the operator approves
                 // it (~180 s) — outwait that window so a slow approval still lands here. Normal
@@ -559,38 +522,11 @@ final class SessionModel: ObservableObject {
                 }
                 switch result {
                 case .success(let conn):
-                    let landed = "connected \(host.displayName) "
-                        + "mode=\(conn.width)x\(conn.height)@\(conn.refreshHz) "
-                        + "codec=\(conn.videoCodec) bitrate=\(conn.resolvedBitrateKbps)kbps "
-                        + "depth=\(conn.bitDepth) chroma=\(conn.isChroma444 ? "444" : "420") hdr=\(conn.isHDR) "
-                        + "audio=\(conn.resolvedAudioChannels)ch/\(conn.resolvedAudioRateHz)Hz/\(conn.resolvedAudioBits)bit "
-                        + "shard=\(conn.shardPayload) compositor=\(conn.resolvedCompositor.rawValue) "
-                        + "gamepad=\(conn.resolvedGamepad.rawValue) mgmt=\(conn.hostMgmtPort)"
-                    sessionLog.info("\(landed, privacy: .public)")
-                    if pin != nil || autoTrust || requestAccess {
-                        // requestAccess: the operator approved this device on the host, so the
-                        // session is trusted — stream directly (the caller pins it as paired).
-                        self.connection = conn
-                        self.noteTouchFallback(conn)
-                        self.startStatsTimer()
-                        self.beginStreaming()
-                    } else if allowTofu {
-                        // Host advertised pair=optional — offer the reduced-security TOFU prompt
-                        // over the live (blurred) stream (rule 3a).
-                        self.connection = conn
-                        self.noteTouchFallback(conn)
-                        self.startStatsTimer()
-                        self.phase = .awaitingTrust(fingerprint: conn.hostFingerprint)
-                    } else {
-                        // Unpinned and TOFU not permitted (rule 3b): never let this silently
-                        // become trustable. Drop the connection; the caller routes to pairing.
-                        Task.detached { conn.close() } // joins Rust threads — off-main
-                        self.phase = .idle
-                        self.activeHost = nil
-                        self.revealStream() // no stream is coming; the hold must not outlive the dial
-                        self.errorMessage = "\(host.displayName) is not paired yet. "
-                            + "Pair with its PIN before streaming."
-                    }
+                    // requestAccess: the operator approved this device on the host, so the
+                    // session is trusted (the caller pins it as paired).
+                    self.adopt(
+                        conn, host: host, trusted: pin != nil || autoTrust || requestAccess,
+                        allowTofu: allowTofu)
                 case .failure(let error):
                     sessionLog.warning(
                         "connect \(host.displayName, privacy: .public) failed: \(String(describing: error), privacy: .public)")
@@ -600,32 +536,52 @@ final class SessionModel: ObservableObject {
                     // otherwise nothing here does. It would sit over the home screen until the
                     // next session, and on tvOS it makes the host grid unfocusable behind it.
                     self.revealStream()
-                    if case PunktfunkClientError.rejected(let rejection) = error {
-                        // The host answered and stated its reason (declined / approval timed
-                        // out / busy / versions differ) — show that, and never wake-retry a
-                        // host that is demonstrably awake.
-                        self.errorMessage = "\(host.displayName): \(rejection.userMessage)"
-                    } else if let onUnreachable, !requestAccess {
-                        // The caller owns recovery (wake-and-retry) — no error alert here; its
-                        // own overlay explains what's happening.
-                        onUnreachable()
-                    } else if requestAccess {
-                        // The delegated-approval connect ended without being admitted: the
-                        // operator didn't approve it before the host's park window elapsed (or
-                        // the host was unreachable).
-                        self.errorMessage = "\(host.displayName) didn't let this device in. "
-                            + "Approve it in the host's web console (port 47992 → Pairing), then "
-                            + "request access again — the request expires after a few minutes."
+                    if let message = ConnectOffer.failureMessage(
+                        error, hostName: host.displayName, pinned: pin != nil,
+                        requestAccess: requestAccess, callerRecovers: onUnreachable != nil)
+                    {
+                        self.errorMessage = message
                     } else {
-                        self.errorMessage = pin != nil
-                            ? "Couldn't reach \(host.displayName) — it may be asleep, or its "
-                                + "identity changed since you paired. Pair with it again from "
-                                + "its host card."
-                            : "Couldn't reach \(host.displayName) — it may be asleep, or not "
-                                + "paired yet. Wake it, or pair with it from its host card."
+                        // The caller owns recovery (wake-and-retry); its overlay explains it.
+                        onUnreachable?()
                     }
                 }
             }
+        }
+    }
+
+    /// Route a dial that landed. A trusted host (pinned, auto-trusted or operator-approved)
+    /// streams at once; an unpinned one advertising `pair=optional` gets the TOFU prompt over the
+    /// live, blurred stream (rule 3a); any other is closed and refused (rule 3b), and the caller
+    /// routes it to pairing.
+    private func adopt(
+        _ conn: PunktfunkConnection, host: StoredHost, trusted: Bool, allowTofu: Bool
+    ) {
+        let landed = "connected \(host.displayName) "
+            + "mode=\(conn.width)x\(conn.height)@\(conn.refreshHz) "
+            + "codec=\(conn.videoCodec) bitrate=\(conn.resolvedBitrateKbps)kbps "
+            + "depth=\(conn.bitDepth) chroma=\(conn.isChroma444 ? "444" : "420") hdr=\(conn.isHDR) "
+            + "audio=\(conn.resolvedAudioChannels)ch/\(conn.resolvedAudioRateHz)Hz/\(conn.resolvedAudioBits)bit "
+            + "shard=\(conn.shardPayload) compositor=\(conn.resolvedCompositor.rawValue) "
+            + "gamepad=\(conn.resolvedGamepad.rawValue) mgmt=\(conn.hostMgmtPort)"
+        sessionLog.info("\(landed, privacy: .public)")
+        if trusted {
+            connection = conn
+            noteTouchFallback(conn)
+            startStatsTimer()
+            beginStreaming()
+        } else if allowTofu {
+            connection = conn
+            noteTouchFallback(conn)
+            startStatsTimer()
+            phase = .awaitingTrust(fingerprint: conn.hostFingerprint)
+        } else {
+            Task.detached { conn.close() } // joins Rust threads — off-main
+            phase = .idle
+            activeHost = nil
+            revealStream() // no stream is coming; the hold must not outlive the dial
+            errorMessage = "\(host.displayName) is not paired yet. "
+                + "Pair with its PIN before streaming."
         }
     }
 
@@ -716,7 +672,7 @@ final class SessionModel: ObservableObject {
     /// Raise `touchFallbackNotice` when the passthrough touch model meets a host without touch
     /// injection — the same fallback `StreamLayerUIView` applies to the fingers themselves.
     private func noteTouchFallback(_ conn: PunktfunkConnection) {
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         guard TouchInputMode.current(conn.settings) == .touch, !conn.hostSupportsTouch else { return }
         touchFallbackNotice = true
         touchHintTimer?.cancel()
@@ -725,6 +681,37 @@ final class SessionModel: ObservableObject {
             guard !Task.isCancelled else { return }
             self?.touchFallbackNotice = false
         }
+        #endif
+    }
+
+    /// Show the exit hint for `motionHintSeconds` at stream start, unless it is turned off.
+    private func noteStreamStart() {
+        exitHintTimer?.cancel()
+        guard UserDefaults.standard.object(forKey: DefaultsKey.exitHint) as? Bool ?? true else {
+            exitHintShown = false
+            return
+        }
+        exitHintShown = true
+        exitHintTimer = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.motionHintSeconds))
+            guard !Task.isCancelled else { return }
+            self?.exitHintShown = false
+        }
+    }
+
+    /// How to leave, in one line, for the input in hand: the pad chord when a controller is
+    /// forwarded, else this device's own way out.
+    var exitHintText: String {
+        if connection?.settings.gamepadForwarding ?? true, !GCController.controllers().isEmpty {
+            return "Hold L1 + R1 + Start + Select to leave"
+        }
+        #if os(tvOS)
+        return "Hold Back to leave"
+        #elseif os(macOS)
+        return "⌃⌥⇧D to leave"
+        #else
+        return GCKeyboard.coalesced != nil
+            ? "⌃⌥⇧D to leave" : "Two-finger twist opens quick actions"
         #endif
     }
 
@@ -904,6 +891,9 @@ final class SessionModel: ObservableObject {
         motionHintTimer?.cancel()
         motionHintTimer = nil
         motionUnreachableKind = nil
+        exitHintTimer?.cancel()
+        exitHintTimer = nil
+        exitHintShown = false
         touchHintTimer?.cancel()
         touchHintTimer = nil
         touchFallbackNotice = false
@@ -956,12 +946,18 @@ final class SessionModel: ObservableObject {
         clipboardSync = nil
         #endif
         clipboardEnabled = false
-        clipboardReason = 0
         if let conn = connection {
+            #if os(macOS)
+            let closing = Self.closing
+            closing.enter()
+            #endif
             // Drain-thread teardown waits the pullers out and close() waits out in-flight
             // polls + joins the Rust worker threads — keep all of it off the main actor,
             // in this order (no poll left on any plane when the handle is freed).
             Task.detached {
+                #if os(macOS)
+                defer { closing.leave() }
+                #endif
                 audio?.stop()
                 feedback?.stop()
                 #if !os(tvOS)
@@ -993,6 +989,7 @@ final class SessionModel: ObservableObject {
         if deliberate, phase == .streaming, let shelf = launchedShelf {
             returnToLibrary = shelf
         }
+        streamedGame = nil
         // Read by `sessionEnded` BEFORE it calls us, so clearing here can't rob it of the answer.
         launchedTitleID = nil
         launchedShelf = nil
@@ -1075,6 +1072,44 @@ final class SessionModel: ObservableObject {
         resizing = resizeIndicator.active
     }
 
+    /// The game this device launched that this stream plays (`RunningGame.streamedHere`): the
+    /// ring's End game. Read from `/status` when the stream starts and when the ring opens.
+    @Published private(set) var streamedGame: RunningGame?
+
+    /// Ask the host what this stream plays. Best-effort: a failed read keeps the last answer.
+    func refreshStreamedGame() {
+        guard let host = activeHost, !DemoMode.isDemo(host),
+              let identity = (try? ClientIdentityStore.shared.load())?.identity else { return }
+        let port = connection.map(\.hostMgmtPort).flatMap { $0 > 0 ? $0 : nil } ?? host.effectiveMgmtPort
+        Task { [weak self] in
+            let games = await LibraryClient.running(
+                address: host.address, port: port,
+                certPEM: identity.certPEM, keyPEM: identity.keyPEM,
+                hostFingerprint: host.pinnedSHA256)
+            guard let self, self.activeHost?.id == host.id, self.phase == .streaming else { return }
+            self.streamedGame = games.first(where: \.streamedHere)
+        }
+    }
+
+    /// End the streamed game on the host, then the stream. A refusal keeps the stream and says why.
+    func endStreamedGame() {
+        guard let game = streamedGame, let appID = game.appID, let host = activeHost,
+              let pin = host.pinnedSHA256,
+              let identity = (try? ClientIdentityStore.shared.load())?.identity else { return }
+        let port = connection.map(\.hostMgmtPort).flatMap { $0 > 0 ? $0 : nil } ?? host.effectiveMgmtPort
+        Task { [weak self] in
+            let outcome = await LibraryClient.endGame(
+                appID: appID, address: host.address, port: port,
+                certPEM: identity.certPEM, keyPEM: identity.keyPEM, hostFingerprint: pin)
+            guard let self, self.activeHost?.id == host.id else { return }
+            if outcome.gameGone {
+                self.disconnect()
+            } else {
+                self.showLaunchNotice(outcome.notice(title: game.title))
+            }
+        }
+    }
+
     /// Drop the launch hold and let the stream through.
     func revealStream() {
         launchWatch?.cancel()
@@ -1127,7 +1162,7 @@ final class SessionModel: ObservableObject {
                     self?.revealStream()
                     return
                 }
-                self?.launchWindowWait = windowWait
+                if self?.launchWindowWait != windowWait { self?.launchWindowWait = windowWait }
                 try? await Task.sleep(nanoseconds: NSEC_PER_SEC)
             }
         }
@@ -1139,7 +1174,9 @@ final class SessionModel: ObservableObject {
         // flip this phase change causes, released/re-engaged by the user from there).
         phase = .streaming
         watchLaunch()
+        refreshStreamedGame()
         displaySleepGuard.acquire()
+        noteStreamStart()
         // Audio starts with streaming, not during the trust prompt — no host sound (or
         // mic uplink!) before the user trusted the host. Devices and the mic switch come from the
         // session's resolved settings ("" = system default), so a preset that turns the mic on
@@ -1241,14 +1278,11 @@ final class SessionModel: ObservableObject {
     #if !os(tvOS)
     /// Create + start the session's clipboard bridge and route its host acks into the published
     /// UI state. `ClipboardSync.start()` sends the enable; the host's `.state` answer flips
-    /// `clipboardEnabled` (or leaves it false with a `clipboardReason` the UI can explain).
+    /// `clipboardEnabled`, or leaves it false.
     private func startClipboardSync(_ conn: PunktfunkConnection) {
         let sync = ClipboardSync(connection: conn)
-        sync.onState = { [weak self] enabled, _, reason in
-            Task { @MainActor in
-                self?.clipboardEnabled = enabled
-                self?.clipboardReason = reason
-            }
+        sync.onState = { [weak self] enabled, _, _ in
+            Task { @MainActor in self?.clipboardEnabled = enabled }
         }
         sync.start()
         clipboardSync = sync
@@ -1264,7 +1298,6 @@ final class SessionModel: ObservableObject {
         if let sync = clipboardSync {
             clipboardSync = nil
             clipboardEnabled = false
-            clipboardReason = 0
             Task.detached { sync.stop() }
         } else if conn.hostSupportsClipboard, conn.canUseClipboard {
             startClipboardSync(conn)
@@ -1285,7 +1318,11 @@ final class SessionModel: ObservableObject {
                 // decodes (a rejected/capped switch). The decoded-frame END clears it promptly on
                 // success; this only fires after the timeout.
                 self.resizeIndicator.tick(now: ProcessInfo.processInfo.systemUptime)
-                self.resizing = self.resizeIndicator.active
+                // Published only on change: @Published fires on every assignment, and each one
+                // re-renders the window over the stream.
+                if self.resizing != self.resizeIndicator.active {
+                    self.resizing = self.resizeIndicator.active
+                }
                 // Access chip + expiry warnings: the same tick that drives every other live
                 // readout also walks the countdown and picks up mid-session grant edits.
                 self.updateAccessState()
@@ -1320,11 +1357,12 @@ final class SessionModel: ObservableObject {
     /// change so a cycle never waits for the next tick.
     func renderHud() {
         guard let conn = connection else {
-            hudLines = []
+            if !hudLines.isEmpty { hudLines = [] }
             return
         }
         let advanced = UserDefaults.standard.bool(forKey: DefaultsKey.advancedStats)
-        hudLines = conn.hudLines(tier: statsVerbosity, advanced: advanced, facts: hudFacts())
+        let lines = conn.hudLines(tier: statsVerbosity, advanced: advanced, facts: hudFacts())
+        if lines != hudLines { hudLines = lines } // an unchanged overlay must not re-render
     }
 
     /// What only the app knows: the floor policy (macOS presents straight to the display, so

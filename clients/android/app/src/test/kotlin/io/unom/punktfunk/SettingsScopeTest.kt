@@ -12,6 +12,7 @@ import androidx.compose.ui.test.isToggleable
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -49,7 +50,8 @@ class SettingsScopeTest {
 
     /** "Invert scroll direction" is the row under test: Input is presetable end to end. */
     private fun toggleTheRow() {
-        compose.onNode(isToggleable() and hasAnySibling(hasText("Invert scroll direction"))).performClick()
+        compose.onNode(isToggleable() and hasAnySibling(hasText("Invert scroll direction")))
+            .performScrollTo().performClick()
         compose.waitForIdle()
     }
 

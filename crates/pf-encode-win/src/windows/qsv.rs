@@ -14,14 +14,13 @@
 
 use super::policy::{intra_refresh_requested, ltr_test_force_at};
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
-use crate::retrieve::Ready;
+use crate::retrieve::{AuQueue, FirstAuLog, RetrieveThread};
 use anyhow::{anyhow, bail, Context, Result};
 use libvpl_sys as vpl;
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
-use std::collections::VecDeque;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use windows::core::Interface;
 use windows::Win32::Foundation::LUID;
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
@@ -173,9 +172,11 @@ fn intel_loader() -> Result<(Loader, Vec<VplImpl>)> {
             if cfg.is_null() {
                 bail!("MFXCreateConfig returned null");
             }
-            let mut var: vpl::mfxVariant = std::mem::zeroed();
-            var.Type = vpl::MFX_VARIANT_TYPE_U32;
-            var.Data = vpl::mfxVariant_data { U32: value };
+            let var = vpl::mfxVariant {
+                Type: vpl::MFX_VARIANT_TYPE_U32,
+                Data: vpl::mfxVariant_data { U32: value },
+                ..Default::default()
+            };
             vpl_ok(
                 vpl::MFXSetConfigFilterProperty(cfg, name.as_ptr(), var),
                 "MFXSetConfigFilterProperty",
@@ -250,7 +251,7 @@ fn create_session(target_luid: Option<[u8; 8]>) -> Result<(Loader, Session, (u16
             "MFXCreateSession",
         )?;
         let session = Session(session);
-        let mut ver: vpl::mfxVersion = std::mem::zeroed();
+        let mut ver = vpl::mfxVersion::default();
         let _ = vpl::MFXQueryVersion(session.0, &mut ver);
         let api = (ver.__bindgen_anon_1.Major, ver.__bindgen_anon_1.Minor);
         Ok((loader, session, api))
@@ -317,11 +318,13 @@ fn codec_id(codec: Codec) -> u32 {
 
 /// Low-latency block: `AsyncDepth=1`, no B-frames, CBR, HRD off (no-IDR Reset), infinite GOP.
 fn build_params(cfg: &EncodeConfig) -> ParamSet {
-    // SAFETY: all-zero is the documented initial state for every VPL parameter struct; fields
-    // are then set through the typed accessors.
-    let mut par: vpl::mfxVideoParam = unsafe { std::mem::zeroed() };
-    par.AsyncDepth = 1;
-    par.IOPattern = vpl::MFX_IOPATTERN_IN_VIDEO_MEMORY as u16;
+    // All-zero is VPL's documented initial state for every parameter and ext-buffer struct, and
+    // bindgen's `Default` is all-zero for each one used here (no padding, or a zero-fill impl).
+    let mut par = vpl::mfxVideoParam {
+        AsyncDepth: 1,
+        IOPattern: vpl::MFX_IOPATTERN_IN_VIDEO_MEMORY as u16,
+        ..Default::default()
+    };
     let mfx = mfx_of(&mut par);
     mfx.CodecId = codec_id(cfg.codec);
     mfx.LowPower = vpl::MFX_CODINGOPTION_ON as u16;
@@ -369,8 +372,7 @@ fn build_params(cfg: &EncodeConfig) -> ParamSet {
     }
 
     // HRD off: spec prerequisite for a bitrate Reset that does not emit a keyframe.
-    // SAFETY: all-zero is valid for every ext buffer; the header is then stamped.
-    let mut co: Box<vpl::mfxExtCodingOption> = Box::new(unsafe { std::mem::zeroed() });
+    let mut co = Box::new(vpl::mfxExtCodingOption::default());
     co.Header.BufferId = vpl::MFX_EXTBUFF_CODING_OPTION as u32;
     co.Header.BufferSz = std::mem::size_of::<vpl::mfxExtCodingOption>() as u32;
     co.NalHrdConformance = vpl::MFX_CODINGOPTION_OFF as u16;
@@ -379,7 +381,8 @@ fn build_params(cfg: &EncodeConfig) -> ParamSet {
 
     // Intra-refresh: AVC/HEVC only — AV1 has no IntRefType.
     let co2 = (cfg.intra_refresh && matches!(cfg.codec, Codec::H264 | Codec::H265)).then(|| {
-        // SAFETY: all-zero is valid; header stamped below.
+        // SAFETY: all-zero is a valid `mfxExtCodingOption2`; header stamped below. Not
+        // `Default`: this struct has padding, which the derived impl leaves unwritten.
         let mut b: Box<vpl::mfxExtCodingOption2> = Box::new(unsafe { std::mem::zeroed() });
         b.Header.BufferId = vpl::MFX_EXTBUFF_CODING_OPTION2 as u32;
         b.Header.BufferSz = std::mem::size_of::<vpl::mfxExtCodingOption2>() as u32;
@@ -392,8 +395,7 @@ fn build_params(cfg: &EncodeConfig) -> ParamSet {
     // BT.2020 PQ. An "unspecified" stream lets decoders pick 601 at sub-HD.
     let hdr = cfg.ten_bit && cfg.codec != Codec::H264;
     let vsi = {
-        // SAFETY: all-zero is valid; header stamped below.
-        let mut b: Box<vpl::mfxExtVideoSignalInfo> = Box::new(unsafe { std::mem::zeroed() });
+        let mut b = Box::new(vpl::mfxExtVideoSignalInfo::default());
         b.Header.BufferId = vpl::MFX_EXTBUFF_VIDEO_SIGNAL_INFO as u32;
         b.Header.BufferSz = std::mem::size_of::<vpl::mfxExtVideoSignalInfo>() as u32;
         b.VideoFormat = 5; // unspecified
@@ -411,9 +413,7 @@ fn build_params(cfg: &EncodeConfig) -> ParamSet {
         Some(b)
     };
     let mastering = cfg.hdr_meta.filter(|_| hdr).map(|m| {
-        // SAFETY: all-zero is valid; header stamped below.
-        let mut b: Box<vpl::mfxExtMasteringDisplayColourVolume> =
-            Box::new(unsafe { std::mem::zeroed() });
+        let mut b = Box::new(vpl::mfxExtMasteringDisplayColourVolume::default());
         b.Header.BufferId = vpl::MFX_EXTBUFF_MASTERING_DISPLAY_COLOUR_VOLUME as u32;
         b.Header.BufferSz = std::mem::size_of::<vpl::mfxExtMasteringDisplayColourVolume>() as u32;
         b.InsertPayloadToggle = vpl::MFX_PAYLOAD_IDR as u16;
@@ -445,9 +445,7 @@ fn build_params(cfg: &EncodeConfig) -> ParamSet {
         .filter(|_| hdr)
         .filter(|m| m.max_cll != 0 || m.max_fall != 0)
         .map(|m| {
-            // SAFETY: all-zero is valid; header stamped below.
-            let mut b: Box<vpl::mfxExtContentLightLevelInfo> =
-                Box::new(unsafe { std::mem::zeroed() });
+            let mut b = Box::new(vpl::mfxExtContentLightLevelInfo::default());
             b.Header.BufferId = vpl::MFX_EXTBUFF_CONTENT_LIGHT_LEVEL_INFO as u32;
             b.Header.BufferSz = std::mem::size_of::<vpl::mfxExtContentLightLevelInfo>() as u32;
             b.InsertPayloadToggle = vpl::MFX_PAYLOAD_IDR as u16;
@@ -471,9 +469,7 @@ fn build_params(cfg: &EncodeConfig) -> ParamSet {
 
 /// Idle `mfxExtRefListCtrl`: every `FrameOrder` is `MFX_FRAMEORDER_UNKNOWN`.
 fn empty_reflist() -> vpl::mfxExtRefListCtrl {
-    // SAFETY: all-zero is a valid `mfxExtRefListCtrl`; the header + sentinel FrameOrders are
-    // stamped before use.
-    let mut r: vpl::mfxExtRefListCtrl = unsafe { std::mem::zeroed() };
+    let mut r = vpl::mfxExtRefListCtrl::default();
     r.Header.BufferId = vpl::MFX_EXTBUFF_UNIVERSAL_REFLIST_CTRL as u32;
     r.Header.BufferSz = std::mem::size_of::<vpl::mfxExtRefListCtrl>() as u32;
     let unknown = vpl::MFX_FRAMEORDER_UNKNOWN as u32;
@@ -499,10 +495,9 @@ struct FrameCtrl {
 
 impl FrameCtrl {
     fn new() -> Box<Self> {
-        // SAFETY: all-zero is valid for `mfxEncodeCtrl` (no ext buffers attached, no forced
-        // type); the reflist starts as the sentinel idle state and the pointer array is wired
-        // only when the reflist is actually used.
-        let ctrl: vpl::mfxEncodeCtrl = unsafe { std::mem::zeroed() };
+        // All-zero: no ext buffers attached, no forced type. The pointer array is wired only
+        // when the reflist is actually used.
+        let ctrl = vpl::mfxEncodeCtrl::default();
         let mut b = Box::new(FrameCtrl {
             ctrl,
             reflist: empty_reflist(),
@@ -528,16 +523,27 @@ struct Pending {
     _ctrl: Option<Box<FrameCtrl>>,
 }
 
+// SAFETY: `Pending` carries raw VPL allocations — a sync point, the boxed bitstream the runtime
+// writes into, and the frame-control ext buffers. None is thread-affine (they are process-global
+// runtime memory, like the session itself, which is why `QsvEncoder` is `Send` at all), and the
+// queue mutex gives exactly one thread access at a time: `submit` pushes an entry and never
+// looks at it again, and only the sync thread pops one.
+unsafe impl Send for Pending {}
+
 /// Output bitstream. Boxed so `Data` stays stable while the runtime writes asynchronously.
 struct BsBuf {
     buf: Vec<u8>,
     mfx: vpl::mfxBitstream,
 }
 
+// SAFETY: `mfx.Data` points into the box's own `buf`, plain heap memory with no thread affinity.
+// The runtime writes it only while its `Pending` is in flight; otherwise only the queue lock's
+// holder touches it.
+unsafe impl Send for BsBuf {}
+
 impl BsBuf {
     fn new(capacity: usize) -> Box<Self> {
-        // SAFETY: all-zero is a valid `mfxBitstream`; Data/MaxLength are wired below.
-        let mfx: vpl::mfxBitstream = unsafe { std::mem::zeroed() };
+        let mfx = vpl::mfxBitstream::default();
         let mut b = Box::new(BsBuf {
             buf: vec![0u8; capacity],
             mfx,
@@ -560,87 +566,37 @@ const IN_FLIGHT_MAX: usize = 4;
 /// under the session watchdog's ~2 s floor.
 const BUSY_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// What the retrieve thread and the encode thread share. The session is not in here: only this
-/// thread calls `SyncOperation` on it, and the lock is never held across that call.
+/// Recycled bitstream boxes, under the queue lock beside the in-flight FIFO.
 #[derive(Default)]
-struct Out {
-    /// In-flight FIFO. `GopRefDist=1` so AUs complete in submit order — `submit` pushes the back,
-    /// the retrieve thread pops the front, and nothing else touches either end.
-    pending: VecDeque<Pending>,
-    ready: VecDeque<EncodedFrame>,
-    /// Recycled bitstream boxes. `mfxBitstream` address must stay stable while in flight.
+struct BsPool {
+    /// `mfxBitstream` address must stay stable while in flight, hence the boxes.
     #[allow(clippy::vec_box)]
-    bs_pool: Vec<Box<BsBuf>>,
-    /// First `SyncOperation` failure; `poll` surfaces it so the caller resets.
-    err: Option<String>,
+    boxes: Vec<Box<BsBuf>>,
 }
 
-// SAFETY: `Pending` carries raw VPL allocations — a sync point, the boxed bitstream the runtime
-// writes into, and the frame-control ext buffers. None is thread-affine (they are process-global
-// runtime memory, like the session itself, which is why `QsvEncoder` is `Send` at all), and the
-// mutex is what gives exactly one thread access at a time: `submit` pushes an entry and never
-// looks at it again, and only the sync thread pops one.
-unsafe impl Send for Out {}
+/// What the sync thread and the encode thread share. `GopRefDist=1` so AUs complete in submit
+/// order. The session is not in here: only the sync thread calls `SyncOperation` on it, and the
+/// lock is never held across that call.
+type OutQueue = AuQueue<Pending, BsPool>;
 
-/// The sync thread and its signal. It owns every `MFXVideoCORE_SyncOperation`, so the encode
-/// thread never blocks on the fixed function — it takes finished AUs off a queue, and a caller
-/// that parks on handles takes [`Ready`] instead.
+/// The sync thread and its queue. The thread owns every `MFXVideoCORE_SyncOperation`, so the
+/// encode thread never blocks on the fixed function — it takes finished AUs off the queue, and a
+/// caller that parks on handles takes the queue's signal instead.
 ///
 /// Dropping this stops and joins, which must happen before the session is closed under it:
 /// [`Inner`] declares it first, and [`QsvEncoder::reset`] stops it by hand around the re-Init.
 struct Retrieve {
-    out: Arc<Mutex<Out>>,
-    have: Arc<Ready>,
-    stop: Arc<AtomicBool>,
-    join: Option<std::thread::JoinHandle<()>>,
+    q: Arc<OutQueue>,
+    thread: RetrieveThread,
 }
 
 impl Retrieve {
     fn start(session: vpl::mfxSession) -> Result<Self> {
-        let out: Arc<Mutex<Out>> = Arc::default();
-        let have = Arc::new(Ready::new().ok_or_else(|| anyhow!("QSV: no completion event"))?);
-        let stop = Arc::new(AtomicBool::new(false));
-        let (s, t_out, t_have, t_stop) =
-            (session as usize, out.clone(), have.clone(), stop.clone());
-        let join = std::thread::Builder::new()
-            .name("punktfunk-qsv-out".into())
-            .spawn(move || sync_loop(s, t_out, t_have, t_stop))
-            .context("spawn QSV sync thread")?;
-        Ok(Self {
-            out,
-            have,
-            stop,
-            join: Some(join),
-        })
-    }
-
-    /// Frames the runtime still owes an AU for — the back-pressure reading.
-    fn in_flight(&self) -> usize {
-        lock(&self.out).pending.len()
-    }
-
-    /// Retire the thread and wait for it to leave `SyncOperation`. Idempotent.
-    fn stop_and_join(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
-    }
-
-    /// Forfeit everything owed. Only legal after `Close`, which aborts the writes the runtime
-    /// still has outstanding into these buffers.
-    fn reset_queues(&self) {
-        let mut g = lock(&self.out);
-        g.pending.clear();
-        g.ready.clear();
-        g.err = None;
-        self.have.clear();
-    }
-}
-
-impl Drop for Retrieve {
-    fn drop(&mut self) {
-        self.stop_and_join();
+        let q = Arc::new(OutQueue::new("QSV")?);
+        let (s, t_q) = (session as usize, q.clone());
+        let thread =
+            RetrieveThread::spawn("punktfunk-qsv-out", move |stop| sync_loop(s, &t_q, &stop))?;
+        Ok(Self { q, thread })
     }
 }
 
@@ -649,13 +605,13 @@ const SYNC_WAIT_MS: u32 = 50;
 
 /// Sync finished frames and hand their AUs to the encode thread. The session travels as `usize`;
 /// the thread is joined before anything closes it.
-fn sync_loop(session: usize, out: Arc<Mutex<Out>>, have: Arc<Ready>, stop: Arc<AtomicBool>) {
+fn sync_loop(session: usize, q: &OutQueue, stop: &AtomicBool) {
     pf_frame::thread_qos::boost_thread_priority(false);
     let session = session as vpl::mfxSession;
     while !stop.load(Ordering::Acquire) {
         // The front's sync point, copied out so the lock is not held across the wait. Only this
         // thread pops, so the entry it names is still the front when the lock comes back.
-        let Some(syncp) = lock(&out).pending.front().map(|p| p.syncp) else {
+        let Some(syncp) = q.lock().pending.front().map(|p| p.syncp) else {
             // Nothing owed: wait for `submit` rather than spin on an empty queue.
             std::thread::sleep(std::time::Duration::from_micros(250));
             continue;
@@ -667,15 +623,14 @@ fn sync_loop(session: usize, out: Arc<Mutex<Out>>, have: Arc<Ready>, stop: Arc<A
         if sts == vpl::MFX_WRN_IN_EXECUTION {
             continue;
         }
-        let mut g = lock(&out);
+        let mut g = q.lock();
         if sts < vpl::MFX_ERR_NONE {
-            g.err.get_or_insert_with(|| {
+            q.fail(&mut g, || {
                 format!(
                     "MFXVideoCORE_SyncOperation failed: {} ({sts})",
                     sts_name(sts)
                 )
             });
-            have.set();
             return;
         }
         let done = match g.pending.pop_front() {
@@ -684,14 +639,11 @@ fn sync_loop(session: usize, out: Arc<Mutex<Out>>, have: Arc<Ready>, stop: Arc<A
         };
         match au_from(done) {
             Ok((au, bs)) => {
-                g.bs_pool.push(bs);
-                g.ready.push_back(au);
-                // Under the lock, so it cannot race the clear `poll` does when it empties.
-                have.set();
+                g.extra.boxes.push(bs);
+                q.publish(&mut g, au);
             }
             Err(e) => {
-                g.err.get_or_insert_with(|| format!("{e:#}"));
-                have.set();
+                q.fail(&mut g, || format!("{e:#}"));
                 return;
             }
         }
@@ -726,12 +678,6 @@ fn au_from(done: Pending) -> Result<(EncodedFrame, Box<BsBuf>)> {
     Ok((au, bs_box))
 }
 
-/// The queue lock, poison-tolerant: a sync thread that panicked leaves what it already handed
-/// over readable, and its error field is what tells `poll` to reset.
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|p| p.into_inner())
-}
-
 struct Inner {
     /// Joined before `session` closes under it ([`Inner::drop`]).
     retrieve: Retrieve,
@@ -742,7 +688,7 @@ struct Inner {
     dctx: ID3D11DeviceContext,
     bs_bytes: usize,
     frames_submitted: u64,
-    first_au_logged: bool,
+    first_au: FirstAuLog,
     /// Warn once if the runtime hands out array textures (subresource-0 copy would be wrong).
     array_warned: bool,
 }
@@ -752,7 +698,7 @@ impl Drop for Inner {
     /// may still be writing, and Close is what aborts those writes; field order alone freed
     /// the boxes under the runtime whenever a session ended with a frame in flight.
     fn drop(&mut self) {
-        self.retrieve.stop_and_join();
+        self.retrieve.thread.stop_and_join();
         // SAFETY: the session is live and its sync thread joined; Close on an encoder in any
         // state is legal and its result carries nothing here.
         unsafe {
@@ -762,52 +708,16 @@ impl Drop for Inner {
 }
 
 impl Inner {
-    fn note_first_au(&mut self, au: &EncodedFrame) {
-        if !self.first_au_logged {
-            self.first_au_logged = true;
-            tracing::info!(
-                bytes = au.data.len(),
-                keyframe = au.keyframe,
-                "QSV produced its first AU on this session"
-            );
-        }
-    }
-
     fn take_bs(&mut self) -> Box<BsBuf> {
         // A bitrate retarget can raise worst-case AU size; drop pooled buffers that are now short.
-        let mut g = lock(&self.retrieve.out);
-        while let Some(mut b) = g.bs_pool.pop() {
+        let mut g = self.retrieve.q.lock();
+        while let Some(mut b) = g.extra.boxes.pop() {
             if b.mfx.MaxLength as usize >= self.bs_bytes {
                 b.recycle();
                 return b;
             }
         }
         BsBuf::new(self.bs_bytes)
-    }
-
-    /// The oldest finished AU, or the sync thread's failure. Clears the signal as the queue
-    /// empties — under the same lock the thread sets it under, so the two cannot cross.
-    fn pop_ready(&mut self) -> Result<Option<EncodedFrame>> {
-        let mut g = lock(&self.retrieve.out);
-        if let Some(e) = g.err.take() {
-            bail!("{e}");
-        }
-        let au = g.ready.pop_front();
-        if g.ready.is_empty() {
-            self.retrieve.have.clear();
-        }
-        Ok(au)
-    }
-
-    /// [`Self::pop_ready`], waiting up to `wait_ms` for the thread to produce one.
-    fn take_ready(&mut self, wait_ms: u32) -> Result<Option<EncodedFrame>> {
-        if let Some(au) = self.pop_ready()? {
-            return Ok(Some(au));
-        }
-        if !self.retrieve.have.wait(wait_ms) {
-            return Ok(None);
-        }
-        self.pop_ready()
     }
 }
 
@@ -848,8 +758,10 @@ pub struct QsvEncoder {
     resets_without_output: u32,
 }
 
-// SAFETY: raw VPL and D3D11 handles are not auto-`Send`. The session moves the encoder onto
-// one encode thread and drives it there; the immediate context is never shared.
+// SAFETY: raw VPL handles are not auto-`Send`, and none is thread-affine. Every call on this
+// encoder runs on the one thread that owns it; only the sync thread shares the session (see
+// `Retrieve`). The immediate context the runtime also uses is multithread-protected in
+// `ensure_inner`.
 unsafe impl Send for QsvEncoder {}
 
 impl QsvEncoder {
@@ -982,7 +894,7 @@ impl QsvEncoder {
         let ir_requested = cfg.intra_refresh && set.co2.is_some();
         // SAFETY: `session` is live; `got` and its (empty) ext chain outlive the call.
         let bs_bytes = unsafe {
-            let mut got: vpl::mfxVideoParam = std::mem::zeroed();
+            let mut got = vpl::mfxVideoParam::default();
             vpl_ok(
                 vpl::MFXVideoENCODE_GetVideoParam(session, &mut got),
                 "MFXVideoENCODE_GetVideoParam",
@@ -1001,7 +913,8 @@ impl QsvEncoder {
             // only reference to it) all outlive the synchronous call, and the runtime writes back
             // only into the buffer whose header we stamped.
             let confirmed = unsafe {
-                let mut got: vpl::mfxVideoParam = std::mem::zeroed();
+                let mut got = vpl::mfxVideoParam::default();
+                // Zero-filled, padding included, as at `build_params`.
                 let mut co2_out: vpl::mfxExtCodingOption2 = std::mem::zeroed();
                 co2_out.Header.BufferId = vpl::MFX_EXTBUFF_CODING_OPTION2 as u32;
                 co2_out.Header.BufferSz = std::mem::size_of::<vpl::mfxExtCodingOption2>() as u32;
@@ -1103,7 +1016,7 @@ impl QsvEncoder {
             dctx,
             bs_bytes,
             frames_submitted: 0,
-            first_au_logged: false,
+            first_au: FirstAuLog::new("QSV produced its first AU on this session"),
             array_warned: false,
         });
         Ok(())
@@ -1153,82 +1066,195 @@ impl QsvEncoder {
         let opening = self.inner.as_ref().is_none_or(|i| i.frames_submitted == 0);
         let forced = std::mem::take(&mut self.force_kf) || opening;
         self.frame_idx += 1;
-        let mut mark_slot: Option<usize> = None;
-        let mut force_ltr: Option<(usize, i64)> = None;
-        let mut recovery_anchor = false;
-        if self.ltr_active {
-            if forced {
-                // IDR voids decoder refs — drop stale slots and any queued force.
-                self.ltr_slots = [None; NUM_LTR_SLOTS];
-                self.ltr_tainted = [false; NUM_LTR_SLOTS]; // IDR flushed the DPB
-                self.next_ltr_slot = 0;
-                self.pending_force = None;
-            } else if self.ltr_test_force_at == Some(cur_idx) {
-                let triggered = self.invalidate_ref_frames(cur_idx, cur_idx);
-                tracing::info!(
-                    frame = cur_idx,
-                    triggered,
-                    "QSV LTR test hook fired invalidate_ref_frames"
-                );
-            }
-            if let Some(slot) = self.pending_force.take() {
-                // Resolve now: taint may have landed since the force was queued.
-                // Empty or tainted = ship a plain P, no `recovery_anchor` (that tag
-                // lifts the client's post-loss freeze).
-                if let Some(idx) = self.ltr_slots[slot].filter(|_| !self.ltr_tainted[slot]) {
-                    force_ltr = Some((slot, idx));
-                    recovery_anchor = true;
-                }
-            }
-            if force_ltr.is_none() && (forced || cur_idx % self.ltr_mark_interval == 0) {
-                let trusted: [bool; NUM_LTR_SLOTS] =
-                    std::array::from_fn(|s| self.ltr_slots[s].is_some() && !self.ltr_tainted[s]);
-                let slot = super::rfi::mark_slot(&trusted, self.next_ltr_slot);
-                self.ltr_slots[slot] = Some(cur_idx);
-                // Re-mark replaces LongTermIdx: the tainted frame leaves the DPB.
-                self.ltr_tainted[slot] = false;
-                self.next_ltr_slot = (slot + 1) % NUM_LTR_SLOTS;
-                mark_slot = Some(slot);
-            }
+        if self.ltr_active && !forced && self.ltr_test_force_at == Some(cur_idx) {
+            let triggered = self.invalidate_ref_frames(cur_idx, cur_idx);
+            tracing::info!(
+                frame = cur_idx,
+                triggered,
+                "QSV LTR test hook fired invalidate_ref_frames"
+            );
         }
+        let ltr = self.ltr_step(forced, cur_idx);
         #[cfg(test)]
         if self.fail_submit_at == Some(cur_idx) {
             bail!("test hook: frame {cur_idx} refused after the LTR decision");
         }
-        let ltr_slots = self.ltr_slots;
-        let reject_ok = self.codec != Codec::Av1;
         let inner = self.inner.as_mut().expect("ensure_inner succeeded");
         // Wait for the sync thread to free a slot before submitting: the runtime keeps writing a
         // bitstream until its frame is synced, so the queue must not grow under overload.
-        if inner.retrieve.in_flight() >= IN_FLIGHT_MAX {
-            let deadline = std::time::Instant::now() + BUSY_BUDGET;
-            while inner.retrieve.in_flight() >= IN_FLIGHT_MAX {
-                if let Some(e) = lock(&inner.retrieve.out).err.take() {
-                    bail!("{e}");
-                }
-                if std::time::Instant::now() >= deadline {
-                    bail!(
-                        "QSV produced no output for {} ms with {} frame(s) in flight — \
-                         wedged (escalating to reset)",
-                        BUSY_BUDGET.as_millis(),
-                        inner.retrieve.in_flight()
-                    );
-                }
-                std::thread::sleep(std::time::Duration::from_micros(250));
-            }
+        inner
+            .retrieve
+            .q
+            .wait_until(BUSY_BUDGET, "QSV output", |o| {
+                o.pending.len() < IN_FLIGHT_MAX
+            })?;
+        let surf = inner.load_surface(&frame.texture, cur_idx, captured.pts_ns)?;
+        let mut ctrl = frame_ctrl(
+            forced,
+            ltr,
+            cur_idx,
+            &self.ltr_slots,
+            self.codec != Codec::Av1,
+        );
+        let mut bs = inner.take_bs();
+        let syncp = inner.encode_async(&surf, ctrl.as_deref_mut(), &mut bs)?;
+        inner.retrieve.q.lock().pending.push_back(Pending {
+            syncp,
+            bs,
+            pts_ns: captured.pts_ns,
+            forced,
+            recovery_anchor: ltr.force.is_some(),
+            _ctrl: ctrl,
+        });
+        inner.frames_submitted += 1;
+        // `surf` releases here; the runtime holds its own reference for the in-flight encode.
+        Ok(())
+    }
+
+    /// This frame's LTR mark and force. An IDR empties the mirror and drops a queued force. A
+    /// queued force resolves now: taint may have landed since it was queued, and an empty or
+    /// tainted slot ships a plain P with no recovery anchor (that tag lifts the client's
+    /// post-loss freeze). A force takes the frame's mark, which would overwrite it.
+    fn ltr_step(&mut self, forced: bool, cur_idx: i64) -> LtrStep {
+        let mut step = LtrStep::default();
+        if !self.ltr_active {
+            return step;
         }
-        // SAFETY: the whole block runs on the single encode thread against the live session.
-        // `MFXMemory_GetSurfaceForEncode` returns a runtime-owned surface we must Release
-        // exactly once (every exit path below does). `GetNativeHandle` returns a borrowed
-        // (non-AddRef'd) D3D11 texture the runtime keeps alive at least until the surface's
-        // Release — the `CopySubresourceRegion` happens strictly before that. The manually
+        if forced {
+            self.ltr_slots = [None; NUM_LTR_SLOTS];
+            self.ltr_tainted = [false; NUM_LTR_SLOTS]; // IDR flushed the DPB
+            self.next_ltr_slot = 0;
+            self.pending_force = None;
+        }
+        if let Some(slot) = self.pending_force.take() {
+            step.force = self.ltr_slots[slot]
+                .filter(|_| !self.ltr_tainted[slot])
+                .map(|idx| (slot, idx));
+        }
+        if step.force.is_none() && (forced || cur_idx % self.ltr_mark_interval == 0) {
+            let trusted: [bool; NUM_LTR_SLOTS] =
+                std::array::from_fn(|s| self.ltr_slots[s].is_some() && !self.ltr_tainted[s]);
+            let slot = super::rfi::mark_slot(&trusted, self.next_ltr_slot);
+            self.ltr_slots[slot] = Some(cur_idx);
+            // Re-mark replaces LongTermIdx: the tainted frame leaves the DPB.
+            self.ltr_tainted[slot] = false;
+            self.next_ltr_slot = (slot + 1) % NUM_LTR_SLOTS;
+            step.mark_slot = Some(slot);
+        }
+        step
+    }
+}
+
+/// One frame's LTR action, decided before the surface is built.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LtrStep {
+    /// Mark this frame long-term into the slot.
+    mark_slot: Option<usize>,
+    /// Re-reference `(slot, wire index)`; the AU is a recovery anchor.
+    force: Option<(usize, i64)>,
+}
+
+/// The encode control for an IDR, an LTR mark or an LTR force; `None` for a plain P. A force
+/// rejects the other DPB candidates on AVC/HEVC (`reject_ok`), naming the marks in `ltr_slots`.
+fn frame_ctrl(
+    forced: bool,
+    ltr: LtrStep,
+    cur_idx: i64,
+    ltr_slots: &[Option<i64>; NUM_LTR_SLOTS],
+    reject_ok: bool,
+) -> Option<Box<FrameCtrl>> {
+    if !forced && ltr.mark_slot.is_none() && ltr.force.is_none() {
+        return None;
+    }
+    let mut c = FrameCtrl::new();
+    if forced {
+        c.ctrl.FrameType =
+            (vpl::MFX_FRAMETYPE_IDR | vpl::MFX_FRAMETYPE_I | vpl::MFX_FRAMETYPE_REF) as u16;
+    }
+    let mut use_reflist = false;
+    if let Some(slot) = ltr.mark_slot {
+        c.reflist.LongTermRefList[0].FrameOrder = cur_idx as u32;
+        c.reflist.LongTermRefList[0].PicStruct = vpl::MFX_PICSTRUCT_PROGRESSIVE as u16;
+        c.reflist.LongTermRefList[0].LongTermIdx = slot as u16;
+        c.reflist.ApplyLongTermIdx = 1;
+        use_reflist = true;
+    }
+    if let Some((slot, ltr_frame)) = ltr.force {
+        // LongTermIdx stays 0 in PreferredRefList (AV1 rejects nonzero; AVC/HEVC key on
+        // FrameOrder).
+        c.reflist.PreferredRefList[0].FrameOrder = ltr_frame as u32;
+        c.reflist.PreferredRefList[0].PicStruct = vpl::MFX_PICSTRUCT_PROGRESSIVE as u16;
+        // PreferredRefList is a reorder hint; the encoder may still predict from tainted
+        // short-term refs. Reject the other DPB candidates and cap L0 at 1. AVC/HEVC only — AV1
+        // rejection is unvalidated; an unhonored hint still IDR-escalates.
+        if reject_ok {
+            let mut rej = 0;
+            let mut reject = |idx: i64| {
+                if idx >= 0 && idx != ltr_frame {
+                    c.reflist.RejectedRefList[rej].FrameOrder = idx as u32;
+                    c.reflist.RejectedRefList[rej].PicStruct =
+                        vpl::MFX_PICSTRUCT_PROGRESSIVE as u16;
+                    rej += 1;
+                }
+            };
+            reject(cur_idx - 1);
+            reject(cur_idx - 2);
+            for (s, marked) in ltr_slots.iter().enumerate() {
+                if s != slot {
+                    if let Some(idx) = *marked {
+                        reject(idx);
+                    }
+                }
+            }
+            c.reflist.NumRefIdxL0Active = 1;
+        }
+        use_reflist = true;
+        tracing::info!(
+            slot,
+            ltr_frame,
+            frame = cur_idx,
+            "QSV LTR-RFI: re-referencing known-good LTR (clean recovery, no IDR)"
+        );
+    }
+    if use_reflist {
+        c.attach_reflist();
+    }
+    Some(c)
+}
+
+/// A runtime surface for one encode. Dropping it releases our reference, on every path.
+struct EncodeSurface {
+    surf: *mut vpl::mfxFrameSurface1,
+    release: unsafe extern "C" fn(*mut vpl::mfxFrameSurface1) -> vpl::mfxStatus,
+}
+
+impl Drop for EncodeSurface {
+    fn drop(&mut self) {
+        // SAFETY: `surf` came from `MFXMemory_GetSurfaceForEncode` with this `release`, and this
+        // guard is its one owner, so the reference drops exactly once.
+        unsafe {
+            let _ = (self.release)(self.surf);
+        }
+    }
+}
+
+impl Inner {
+    /// A runtime surface holding a copy of `texture`, stamped with the frame's order and time.
+    fn load_surface(
+        &mut self,
+        texture: &ID3D11Texture2D,
+        frame_order: i64,
+        pts_ns: u64,
+    ) -> Result<EncodeSurface> {
+        // SAFETY: encode thread, live session. The surface `MFXMemory_GetSurfaceForEncode`
+        // returns is released exactly once, by the guard, on every path after it is built.
+        // `GetNativeHandle` returns a borrowed (non-AddRef'd) D3D11 texture the runtime keeps
+        // alive at least until that release, and the copy lands strictly before it; the
         // re-wrapped `ID3D11Texture2D::from_raw_borrowed` reference is never released by us.
-        // `EncodeFrameAsync` copies `ctrl` internally; the attached ext buffers live on in the
-        // `Pending` entry until the sync point completes, per the API contract.
         unsafe {
             let mut surf: *mut vpl::mfxFrameSurface1 = ptr::null_mut();
             vpl_ok(
-                vpl::MFXMemory_GetSurfaceForEncode(inner.session.0, &mut surf),
+                vpl::MFXMemory_GetSurfaceForEncode(self.session.0, &mut surf),
                 "MFXMemory_GetSurfaceForEncode",
             )?;
             if surf.is_null() {
@@ -1239,161 +1265,94 @@ impl QsvEncoder {
                 .then(|| (*iface).Release)
                 .flatten()
                 .ok_or_else(|| anyhow!("QSV surface has no FrameInterface.Release"))?;
-            // Every failure path below must release the surface.
-            let submit_result: Result<vpl::mfxSyncPoint> = (|| {
-                let get_native = (*iface)
-                    .GetNativeHandle
-                    .ok_or_else(|| anyhow!("QSV surface has no GetNativeHandle"))?;
-                let mut res: vpl::mfxHDL = ptr::null_mut();
-                let mut res_type: vpl::mfxResourceType = 0;
-                vpl_ok(
-                    get_native(surf, &mut res, &mut res_type),
-                    "FrameInterface.GetNativeHandle",
-                )?;
-                if res_type != vpl::MFX_RESOURCE_DX11_TEXTURE || res.is_null() {
-                    bail!("QSV surface native handle is not a D3D11 texture (type {res_type})");
-                }
-                let dst = ID3D11Texture2D::from_raw_borrowed(&res)
-                    .ok_or_else(|| anyhow!("QSV native handle is not ID3D11Texture2D"))?;
-                if !inner.array_warned {
-                    let mut desc = D3D11_TEXTURE2D_DESC::default();
-                    dst.GetDesc(&mut desc);
-                    if desc.ArraySize > 1 {
-                        inner.array_warned = true;
-                        tracing::warn!(
-                            array_size = desc.ArraySize,
-                            "QSV runtime handed out an ARRAY texture — subresource-0 copy may \
-                             target the wrong slice (needs the on-glass check, design §3.4)"
-                        );
-                    }
-                }
-                let src: ID3D11Resource = frame.texture.cast().context("texture -> resource")?;
-                let dst_res: ID3D11Resource = dst.cast().context("qsv texture -> resource")?;
-                inner
-                    .dctx
-                    .CopySubresourceRegion(&dst_res, 0, 0, 0, 0, &src, 0, None);
-                // mfxExtRefListCtrl keys on FrameOrder; `submit_indexed` keeps that = wire index.
-                (*surf).Data.FrameOrder = cur_idx as u32;
-                (*surf).Data.TimeStamp = captured.pts_ns.wrapping_mul(9) / 100_000; // 90 kHz
-                let mut ctrl: Option<Box<FrameCtrl>> = None;
-                if forced || mark_slot.is_some() || force_ltr.is_some() {
-                    let mut c = FrameCtrl::new();
-                    if forced {
-                        c.ctrl.FrameType = (vpl::MFX_FRAMETYPE_IDR
-                            | vpl::MFX_FRAMETYPE_I
-                            | vpl::MFX_FRAMETYPE_REF)
-                            as u16;
-                    }
-                    let mut use_reflist = false;
-                    if let Some(slot) = mark_slot {
-                        c.reflist.LongTermRefList[0].FrameOrder = cur_idx as u32;
-                        c.reflist.LongTermRefList[0].PicStruct =
-                            vpl::MFX_PICSTRUCT_PROGRESSIVE as u16;
-                        c.reflist.LongTermRefList[0].LongTermIdx = slot as u16;
-                        c.reflist.ApplyLongTermIdx = 1;
-                        use_reflist = true;
-                    }
-                    if let Some((slot, ltr_frame)) = force_ltr {
-                        // LongTermIdx stays 0 in PreferredRefList (AV1 rejects nonzero;
-                        // AVC/HEVC key on FrameOrder).
-                        c.reflist.PreferredRefList[0].FrameOrder = ltr_frame as u32;
-                        c.reflist.PreferredRefList[0].PicStruct =
-                            vpl::MFX_PICSTRUCT_PROGRESSIVE as u16;
-                        // PreferredRefList is a reorder hint; the encoder may still
-                        // predict from tainted short-term refs. Reject the other DPB
-                        // candidates and cap L0 at 1. AVC/HEVC only — AV1 rejection
-                        // is unvalidated; an unhonored hint still IDR-escalates.
-                        if reject_ok {
-                            let mut rej = 0;
-                            let mut reject = |idx: i64| {
-                                if idx >= 0 && idx != ltr_frame {
-                                    c.reflist.RejectedRefList[rej].FrameOrder = idx as u32;
-                                    c.reflist.RejectedRefList[rej].PicStruct =
-                                        vpl::MFX_PICSTRUCT_PROGRESSIVE as u16;
-                                    rej += 1;
-                                }
-                            };
-                            reject(cur_idx - 1);
-                            reject(cur_idx - 2);
-                            for (s, marked) in ltr_slots.iter().enumerate() {
-                                if s != slot {
-                                    if let Some(idx) = *marked {
-                                        reject(idx);
-                                    }
-                                }
-                            }
-                            c.reflist.NumRefIdxL0Active = 1;
-                        }
-                        use_reflist = true;
-                        tracing::info!(
-                            slot,
-                            ltr_frame,
-                            frame = cur_idx,
-                            "QSV LTR-RFI: re-referencing known-good LTR (clean recovery, \
-                             no IDR)"
-                        );
-                    }
-                    if use_reflist {
-                        c.attach_reflist();
-                    }
-                    ctrl = Some(c);
-                }
-                let mut bs = inner.take_bs();
-                let mut syncp: vpl::mfxSyncPoint = ptr::null_mut();
-                let ctrl_ptr = ctrl
-                    .as_mut()
-                    .map(|c| &mut c.ctrl as *mut vpl::mfxEncodeCtrl)
-                    .unwrap_or(ptr::null_mut());
-                let deadline = std::time::Instant::now() + BUSY_BUDGET;
-                let sts = loop {
-                    let sts = vpl::MFXVideoENCODE_EncodeFrameAsync(
-                        inner.session.0,
-                        ctrl_ptr,
-                        surf,
-                        &mut bs.mfx,
-                        &mut syncp,
+            let surf = EncodeSurface { surf, release };
+            let get_native = (*iface)
+                .GetNativeHandle
+                .ok_or_else(|| anyhow!("QSV surface has no GetNativeHandle"))?;
+            let mut res: vpl::mfxHDL = ptr::null_mut();
+            let mut res_type: vpl::mfxResourceType = 0;
+            vpl_ok(
+                get_native(surf.surf, &mut res, &mut res_type),
+                "FrameInterface.GetNativeHandle",
+            )?;
+            if res_type != vpl::MFX_RESOURCE_DX11_TEXTURE || res.is_null() {
+                bail!("QSV surface native handle is not a D3D11 texture (type {res_type})");
+            }
+            let dst = ID3D11Texture2D::from_raw_borrowed(&res)
+                .ok_or_else(|| anyhow!("QSV native handle is not ID3D11Texture2D"))?;
+            if !self.array_warned {
+                let mut desc = D3D11_TEXTURE2D_DESC::default();
+                dst.GetDesc(&mut desc);
+                if desc.ArraySize > 1 {
+                    self.array_warned = true;
+                    tracing::warn!(
+                        array_size = desc.ArraySize,
+                        "QSV runtime handed out an ARRAY texture — subresource-0 copy may \
+                         target the wrong slice (needs the on-glass check, design §3.4)"
                     );
-                    if sts != vpl::MFX_WRN_DEVICE_BUSY {
-                        break sts;
-                    }
-                    // The sync thread is what frees the runtime; this only re-offers the frame.
-                    if std::time::Instant::now() >= deadline {
-                        break sts;
-                    }
-                    std::thread::sleep(std::time::Duration::from_micros(250));
-                };
-                match sts {
-                    s if s == vpl::MFX_WRN_DEVICE_BUSY => {
-                        bail!("QSV EncodeFrameAsync stayed DEVICE_BUSY past the drain budget");
-                    }
-                    // GopRefDist=1 owes one AU per submit; MORE_DATA would desync the FIFO.
-                    vpl::MFX_ERR_MORE_DATA => {
-                        bail!("QSV EncodeFrameAsync returned MORE_DATA with GopRefDist=1");
-                    }
-                    s if s < vpl::MFX_ERR_NONE => {
-                        bail!("QSV EncodeFrameAsync failed: {} ({s})", sts_name(s));
-                    }
-                    _ => {}
                 }
-                if syncp.is_null() {
-                    bail!("QSV EncodeFrameAsync returned no sync point");
-                }
-                lock(&inner.retrieve.out).pending.push_back(Pending {
-                    syncp,
-                    bs,
-                    pts_ns: captured.pts_ns,
-                    forced,
-                    recovery_anchor,
-                    _ctrl: ctrl,
-                });
-                inner.frames_submitted += 1;
-                Ok(syncp)
-            })();
-            // Runtime holds its own ref for the in-flight encode; ours drops now.
-            let _ = release(surf);
-            submit_result?;
+            }
+            let src: ID3D11Resource = texture.cast().context("texture -> resource")?;
+            let dst_res: ID3D11Resource = dst.cast().context("qsv texture -> resource")?;
+            self.dctx
+                .CopySubresourceRegion(&dst_res, 0, 0, 0, 0, &src, 0, None);
+            // mfxExtRefListCtrl keys on FrameOrder; `submit_indexed` keeps that = wire index.
+            (*surf.surf).Data.FrameOrder = frame_order as u32;
+            (*surf.surf).Data.TimeStamp = pts_ns.wrapping_mul(9) / 100_000; // 90 kHz
+            Ok(surf)
         }
-        Ok(())
+    }
+
+    /// Hand `surf` to the runtime, re-offering it while the device stays busy within
+    /// [`BUSY_BUDGET`]. Returns the sync point the retrieve thread waits on.
+    fn encode_async(
+        &self,
+        surf: &EncodeSurface,
+        ctrl: Option<&mut FrameCtrl>,
+        bs: &mut BsBuf,
+    ) -> Result<vpl::mfxSyncPoint> {
+        let ctrl_ptr = ctrl.map_or(ptr::null_mut(), |c| &mut c.ctrl as *mut vpl::mfxEncodeCtrl);
+        let mut syncp: vpl::mfxSyncPoint = ptr::null_mut();
+        let deadline = std::time::Instant::now() + BUSY_BUDGET;
+        let sts = loop {
+            // SAFETY: encode thread, live session. `EncodeFrameAsync` copies `ctrl`; its ext
+            // buffers and `bs` live on in the `Pending` entry until the sync point completes,
+            // and `surf` stays referenced until its guard drops.
+            let sts = unsafe {
+                vpl::MFXVideoENCODE_EncodeFrameAsync(
+                    self.session.0,
+                    ctrl_ptr,
+                    surf.surf,
+                    &mut bs.mfx,
+                    &mut syncp,
+                )
+            };
+            if sts != vpl::MFX_WRN_DEVICE_BUSY {
+                break sts;
+            }
+            // The sync thread is what frees the runtime; this only re-offers the frame.
+            if std::time::Instant::now() >= deadline {
+                break sts;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(250));
+        };
+        match sts {
+            s if s == vpl::MFX_WRN_DEVICE_BUSY => {
+                bail!("QSV EncodeFrameAsync stayed DEVICE_BUSY past the drain budget");
+            }
+            // GopRefDist=1 owes one AU per submit; MORE_DATA would desync the FIFO.
+            vpl::MFX_ERR_MORE_DATA => {
+                bail!("QSV EncodeFrameAsync returned MORE_DATA with GopRefDist=1");
+            }
+            s if s < vpl::MFX_ERR_NONE => {
+                bail!("QSV EncodeFrameAsync failed: {} ({s})", sts_name(s));
+            }
+            _ => {}
+        }
+        if syncp.is_null() {
+            bail!("QSV EncodeFrameAsync returned no sync point");
+        }
+        Ok(syncp)
     }
 }
 
@@ -1518,9 +1477,9 @@ impl Encoder for QsvEncoder {
             // The same bound as before, now spent on the sync thread's event rather than inside
             // `SyncOperation`, so nothing else on this thread waits behind it.
             let budget_ms = (750 / self.fps.max(1)).clamp(1, 12);
-            let au = inner.take_ready(budget_ms)?;
+            let au = inner.retrieve.q.take_ready(budget_ms)?;
             if let Some(au) = &au {
-                inner.note_first_au(au);
+                inner.first_au.note(au);
             }
             au
         };
@@ -1533,7 +1492,7 @@ impl Encoder for QsvEncoder {
     /// The sync thread's signal, once a session exists. Before the lazy open there is nothing to
     /// wait on, which a caller reads as "no completion signal" and polls instead.
     fn ready_event(&self) -> Option<isize> {
-        self.inner.as_ref().map(|i| i.retrieve.have.raw())
+        self.inner.as_ref().map(|i| i.retrieve.q.raw())
     }
 
     /// Stall recovery: Close+Init in place. A second reset with no AU drops the whole session.
@@ -1559,7 +1518,7 @@ impl Encoder for QsvEncoder {
             let inner = self.inner.as_mut().expect("checked above");
             // Stop and join first: the sync thread is inside `SyncOperation` on this very
             // session, and Close under it would abort the operation it is waiting on.
-            inner.retrieve.stop_and_join();
+            inner.retrieve.thread.stop_and_join();
             // Close before dropping `pending`: each entry owns the BsBuf/FrameCtrl the runtime
             // still writes, and Close is what aborts those writes.
 
@@ -1569,9 +1528,9 @@ impl Encoder for QsvEncoder {
             unsafe {
                 let _ = vpl::MFXVideoENCODE_Close(inner.session.0);
             }
-            inner.retrieve.reset_queues();
+            inner.retrieve.q.reset();
             inner.frames_submitted = 0;
-            inner.first_au_logged = false;
+            inner.first_au.rearm();
             inner.session.0
         };
         match self.init_encode(rebuilt) {
@@ -1587,7 +1546,7 @@ impl Encoder for QsvEncoder {
                         inner.bs_bytes = bs_bytes;
                         // BufferSizeInKB may have changed; a pooled buffer sized for the old rate
                         // would be short.
-                        lock(&inner.retrieve.out).bs_pool.clear();
+                        inner.retrieve.q.lock().extra.boxes.clear();
                         // The session encodes again, so it needs its sync thread back — without
                         // one nothing would ever take an AU off it.
                         match Retrieve::start(inner.session.0) {
@@ -1639,20 +1598,16 @@ impl Encoder for QsvEncoder {
             };
             // Reset needs every sync completed; the sync thread is what completes them, so this
             // waits for the queue to empty rather than draining it here.
-            let deadline = std::time::Instant::now() + BUSY_BUDGET;
-            while inner.retrieve.in_flight() > 0 {
-                if let Some(e) = lock(&inner.retrieve.out).err.take() {
-                    tracing::warn!(error = %e, "QSV retarget drain failed");
-                    return false;
-                }
-                if std::time::Instant::now() >= deadline {
-                    tracing::warn!(
-                        "QSV bitrate retarget: in-flight frames didn't settle — falling back to a \
-                         rebuild"
-                    );
-                    return false;
-                }
-                std::thread::sleep(std::time::Duration::from_micros(250));
+            let settled = inner
+                .retrieve
+                .q
+                .wait_until(BUSY_BUDGET, "QSV retarget drain", |o| o.pending.is_empty());
+            if let Err(e) = settled {
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "QSV bitrate retarget didn't settle — falling back to a rebuild"
+                );
+                return false;
             }
             inner.session.0
         };
@@ -1660,9 +1615,8 @@ impl Encoder for QsvEncoder {
         self.bitrate_bps = bps;
         let cfg = self.encode_config();
         let mut set = build_params(&cfg);
-        // SAFETY: all-zero valid; header stamped below; outlives the synchronous Reset call.
-        let mut reset_opt: Box<vpl::mfxExtEncoderResetOption> =
-            Box::new(unsafe { std::mem::zeroed() });
+        // Header stamped below; outlives the synchronous Reset call.
+        let mut reset_opt = Box::new(vpl::mfxExtEncoderResetOption::default());
         reset_opt.Header.BufferId = vpl::MFX_EXTBUFF_ENCODER_RESET_OPTION as u32;
         reset_opt.Header.BufferSz = std::mem::size_of::<vpl::mfxExtEncoderResetOption>() as u32;
         reset_opt.StartNewSequence = vpl::MFX_CODINGOPTION_OFF as u16;
@@ -1688,7 +1642,7 @@ impl Encoder for QsvEncoder {
         // SAFETY: `session` is live on this thread and drained above; `got` and its (empty) ext
         // chain outlive the synchronous call.
         let refreshed = unsafe {
-            let mut got: vpl::mfxVideoParam = std::mem::zeroed();
+            let mut got = vpl::mfxVideoParam::default();
             let sts = vpl::MFXVideoENCODE_GetVideoParam(session, &mut got);
             (sts >= vpl::MFX_ERR_NONE).then(|| {
                 let m = &mut got.__bindgen_anon_1.mfx;
@@ -1736,7 +1690,7 @@ impl Encoder for QsvEncoder {
                 if sts < vpl::MFX_ERR_NONE || syncp.is_null() {
                     break; // MFX_ERR_MORE_DATA = drained
                 }
-                lock(&inner.retrieve.out).pending.push_back(Pending {
+                inner.retrieve.q.lock().pending.push_back(Pending {
                     syncp,
                     bs,
                     pts_ns: 0,
@@ -1827,6 +1781,112 @@ mod tests {
                 assert!(can, "10-bit implies base codec support");
             }
         }
+    }
+
+    /// LTR on, no session: the LTR decision is pure over the mirror.
+    fn ltr_encoder() -> QsvEncoder {
+        let mut enc = QsvEncoder::open(
+            Codec::H265,
+            PixelFormat::Nv12,
+            640,
+            480,
+            30,
+            2_000_000,
+            8,
+            ChromaFormat::Yuv420,
+            None,
+        )
+        .expect("open");
+        enc.ltr_active = true;
+        enc.ltr_mark_interval = 8;
+        enc.ltr_test_force_at = None;
+        enc
+    }
+
+    /// An IDR empties the mirror, drops a queued force and marks slot 0.
+    #[test]
+    fn an_idr_resets_the_ltr_mirror_and_marks_slot_zero() {
+        let mut enc = ltr_encoder();
+        enc.ltr_slots = [Some(3), Some(5)];
+        enc.ltr_tainted = [true, false];
+        enc.next_ltr_slot = 1;
+        enc.pending_force = Some(1);
+        let step = enc.ltr_step(true, 9);
+        assert_eq!(
+            step,
+            LtrStep {
+                mark_slot: Some(0),
+                force: None
+            }
+        );
+        assert_eq!(enc.ltr_slots, [Some(9), None]);
+        assert_eq!(enc.ltr_tainted, [false, false]);
+        assert_eq!(enc.next_ltr_slot, 1);
+        assert_eq!(enc.pending_force, None);
+    }
+
+    /// A queued force on a clean slot re-references it and takes the frame's mark. On a tainted
+    /// slot it ships a plain P.
+    #[test]
+    fn a_queued_force_needs_a_clean_slot() {
+        let mut enc = ltr_encoder();
+        enc.ltr_slots = [Some(0), Some(8)];
+        enc.pending_force = Some(0);
+        assert_eq!(
+            enc.ltr_step(false, 16),
+            LtrStep {
+                mark_slot: None,
+                force: Some((0, 0))
+            }
+        );
+        assert_eq!(enc.pending_force, None, "a force is consumed");
+        enc.ltr_tainted = [true, false];
+        enc.pending_force = Some(0);
+        assert_eq!(enc.ltr_step(false, 17), LtrStep::default());
+        assert_eq!(enc.pending_force, None);
+    }
+
+    /// Marks land on the interval, first on a slot holding no trusted picture.
+    #[test]
+    fn a_mark_prefers_a_slot_without_a_trusted_picture() {
+        let mut enc = ltr_encoder();
+        enc.ltr_slots = [Some(0), Some(8)];
+        enc.ltr_tainted = [false, true];
+        assert_eq!(
+            enc.ltr_step(false, 15),
+            LtrStep::default(),
+            "off the interval"
+        );
+        assert_eq!(enc.ltr_step(false, 16).mark_slot, Some(1));
+        assert_eq!(enc.ltr_slots, [Some(0), Some(16)]);
+        assert!(!enc.ltr_tainted[1], "a re-mark clears the taint");
+        assert_eq!(enc.next_ltr_slot, 0);
+    }
+
+    /// A force rejects the two previous frames and every other mark and caps L0 at one; AV1
+    /// rejects nothing. A plain P carries no control.
+    #[test]
+    fn a_forced_ltr_rejects_every_other_reference() {
+        let ltr = LtrStep {
+            mark_slot: None,
+            force: Some((0, 4)),
+        };
+        let slots = [Some(4), Some(8)];
+        let c = frame_ctrl(false, ltr, 20, &slots, true).expect("ctrl");
+        let rejected: Vec<u32> = c.reflist.RejectedRefList[..3]
+            .iter()
+            .map(|e| e.FrameOrder)
+            .collect();
+        assert_eq!(rejected, [19, 18, 8]);
+        assert_eq!(c.reflist.PreferredRefList[0].FrameOrder, 4);
+        assert_eq!(c.reflist.NumRefIdxL0Active, 1);
+        assert_eq!(c.ctrl.NumExtParam, 1);
+        let av1 = frame_ctrl(false, ltr, 20, &slots, false).expect("ctrl");
+        assert_eq!(
+            av1.reflist.RejectedRefList[0].FrameOrder,
+            vpl::MFX_FRAMEORDER_UNKNOWN as u32
+        );
+        assert!(frame_ctrl(false, LtrStep::default(), 20, &slots, true).is_none());
     }
 
     fn init_tracing() {
@@ -2014,22 +2074,17 @@ mod tests {
         }
     }
 
-    /// LTR anchors on hardware, as `amf_ltr_anchor_soak`: the moving pattern, a loss every
-    /// `PF_WAVE_GAP` frames (default 40) answered `PF_WAVE_LAG` frames later (default 2) through
-    /// `invalidate_ref_frames`. The full stream and the view without the lost frames land in
-    /// `PUNKTFUNK_SMOKE_DIR` with `.idx` sidecars, for `gpu_parity`'s field hashers. HEVC, or
-    /// H.264 with `PF_WAVE_CODEC=h264`; shape `PF_WAVE_SMOKE=WxH:8:fps:mbps`, `PF_WAVE_SOAK` losses.
+    /// LTR anchors on hardware: the wave smokes' moving pattern with losses answered through
+    /// `invalidate_ref_frames`, shaped and dumped by [`crate::smoke_pattern::Soak`].
     #[test]
     #[ignore = "requires an Intel GPU with QSV — run manually on the Intel VM (9200)"]
     fn qsv_ltr_anchor_soak() {
-        use crate::smoke_pattern::{scroll_pattern_nv12, write_capture};
+        use crate::{smoke_d3d11::nv12_scroll_frame, smoke_pattern::Soak};
         use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
         use windows::Win32::Graphics::Direct3D11::{
-            D3D11CreateDevice, ID3D11Device, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
-            D3D11_BIND_SHADER_RESOURCE, D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA,
-            D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+            D3D11CreateDevice, ID3D11Device, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+            D3D11_SDK_VERSION,
         };
-        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
         use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory4};
         init_tracing();
         let (_loader, impls) = intel_loader().expect("an Intel VPL loader");
@@ -2037,34 +2092,7 @@ mod tests {
             .iter()
             .find(|i| i.luid_valid)
             .expect("an Intel VPL implementation");
-        let shape = std::env::var("PF_WAVE_SMOKE").unwrap_or_else(|_| "256x256:8:60:2".into());
-        let mut parts = shape.split(':');
-        let (w, h) = parts
-            .next()
-            .and_then(|s| s.split_once('x'))
-            .map(|(w, h)| (w.parse::<u32>().unwrap(), h.parse::<u32>().unwrap()))
-            .expect("PF_WAVE_SMOKE=WxH[:8[:fps[:mbps]]]");
-        assert_ne!(parts.next(), Some("10"), "the soak feeds NV12");
-        let fps: u32 = parts.next().map_or(60, |f| f.parse().unwrap());
-        let mbps: u64 = parts.next().map_or(2, |m| m.parse().unwrap());
-        let count = |k: &str, d: usize| {
-            std::env::var(k)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(d)
-        };
-        let (losses, gap, lag) = (
-            count("PF_WAVE_SOAK", 12),
-            count("PF_WAVE_GAP", 40),
-            count("PF_WAVE_LAG", 2),
-        );
-        assert!(lag >= 1 && lag < gap, "PF_WAVE_LAG=1..PF_WAVE_GAP");
-        let h264 = std::env::var("PF_WAVE_CODEC").is_ok_and(|v| v == "h264");
-        let (codec, ext) = if h264 {
-            (Codec::H264, "h264")
-        } else {
-            (Codec::H265, "h265")
-        };
+        let soak = Soak::from_env();
         // SAFETY: test-only COM on one thread. `EnumAdapterByLuid` gets the LUID the runtime
         // reported; `D3D11CreateDevice` fills `device` only on success.
         let device: ID3D11Device = unsafe {
@@ -2090,12 +2118,12 @@ mod tests {
             device.expect("device")
         };
         let mut enc = QsvEncoder::open(
-            codec,
+            soak.codec,
             PixelFormat::Nv12,
-            w,
-            h,
-            fps,
-            mbps * 1_000_000,
+            soak.w,
+            soak.h,
+            soak.fps,
+            soak.mbps * 1_000_000,
             8,
             ChromaFormat::Yuv420,
             None,
@@ -2106,111 +2134,11 @@ mod tests {
             enc.caps().supports_rfi,
             "the driver declined LTR: nothing to soak"
         );
-        let texture = |i: usize| {
-            let (w, h) = (w as usize, h as usize);
-            let nv12 = scroll_pattern_nv12(w, h, i);
-            let desc = D3D11_TEXTURE2D_DESC {
-                Width: w as u32,
-                Height: h as u32,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: DXGI_FORMAT_NV12,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
-                CPUAccessFlags: 0,
-                MiscFlags: 0,
-            };
-            let init = D3D11_SUBRESOURCE_DATA {
-                pSysMem: nv12.as_ptr() as *const _,
-                SysMemPitch: w as u32,
-                SysMemSlicePitch: 0,
-            };
-            let mut tex: Option<ID3D11Texture2D> = None;
-            // SAFETY: `init` points at `nv12`, alive across the call; the UV plane follows the Y
-            // plane at the same pitch, the layout D3D11 reads NV12 initial data in.
-            unsafe { device.CreateTexture2D(&desc, Some(&init), Some(&mut tex)) }
-                .expect("NV12 frame texture");
-            tex.expect("NV12 frame texture")
-        };
-        // Loss k is frame 1 + k * gap; its ask comes `lag` frames later, before that frame.
-        let base = lag + 1;
-        let last = base + losses * gap;
-        let (mut lost, mut anchors, mut idrs) = (Vec::new(), Vec::new(), Vec::new());
-        let mut aus: Vec<EncodedFrame> = Vec::new();
-        for i in 0..=last {
-            if i >= base && (i - base) % gap == 0 && (i - base) / gap < losses {
-                let l = (i - lag) as i64;
-                lost.push(i - lag);
-                if enc.invalidate_ref_frames(l, l) {
-                    anchors.push(i);
-                } else {
-                    enc.request_keyframe();
-                    idrs.push(i);
-                }
-            }
-            let frame = CapturedFrame {
-                provenance: Default::default(),
-                width: w,
-                height: h,
-                pts_ns: i as u64,
-                format: PixelFormat::Nv12,
-                payload: FramePayload::D3d11(pf_frame::dxgi::D3d11Frame {
-                    texture: texture(i),
-                    device: device.clone(),
-                    pyro: None,
-                }),
-                cursor: None,
-            };
-            enc.submit_indexed(&frame, i as u32).expect("submit");
-            while let Some(au) = enc.poll().expect("poll") {
-                aus.push(au);
-            }
-        }
-        enc.flush().expect("flush");
-        while let Some(au) = enc.poll().expect("drain") {
-            aus.push(au);
-        }
-        aus.sort_by_key(|a| a.pts_ns);
-        assert_eq!(aus.len(), last + 1, "one AU per frame");
-        for (i, au) in aus.iter().enumerate() {
-            assert_eq!(
-                au.recovery_anchor,
-                anchors.contains(&i),
-                "AU {i}: anchors where answered"
-            );
-            assert!(
-                !idrs.contains(&i) || au.keyframe,
-                "AU {i}: a declined ask is an IDR"
-            );
-        }
-        let csv = |v: &[usize]| {
-            v.iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-        println!(
-            "qsv_ltr_anchor_soak: {w}x{h} {fps} fps {mbps} Mbps {codec:?} lag={lag} gap={gap} \
-             lost={} anchors={} idrs={}",
-            csv(&lost),
-            csv(&anchors),
-            csv(&idrs)
-        );
-        if let Ok(dir) = std::env::var("PUNKTFUNK_SMOKE_DIR") {
-            let full: Vec<&[u8]> = aus.iter().map(|a| a.data.as_slice()).collect();
-            let view: Vec<&[u8]> = aus
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !lost.contains(i))
-                .map(|(_, a)| a.data.as_slice())
-                .collect();
-            write_capture(&format!("{dir}/qsv-anchor.{ext}"), &full).expect("write");
-            write_capture(&format!("{dir}/qsv-anchor-dropS.{ext}"), &view).expect("write");
-        }
+        let bind = (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32;
+        let (w, h) = (soak.w, soak.h);
+        soak.run("qsv", &mut enc, |i| {
+            nv12_scroll_frame(&device, w, h, i, bind)
+        });
     }
 
     #[test]

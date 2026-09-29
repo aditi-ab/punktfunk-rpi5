@@ -27,13 +27,24 @@ pub enum Content {
     /// A source slower than the session: `fps` new frames a second, each still sized from the
     /// session's per-frame allowance, so the budget goes unspent.
     FrameDriven { fps: u32, fill_pct: u32 },
+    /// A minute of [`Content::Steady`], then a desktop gone still: `fps` new frames a second
+    /// and host-marked repeats between them.
+    MotionThenStill { fps: u32, fill_pct: u32 },
 }
 
+/// How long [`Content::MotionThenStill`] moves before it goes still.
+const STILL_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl Content {
-    /// `steady`, `idle-then-motion` or `frame-driven:35`, at `fill_pct` of the allowance.
+    /// `steady`, `idle-then-motion`, `frame-driven:35` or `motion-then-still:5`, at
+    /// `fill_pct` of the allowance.
     pub fn parse(spec: &str, fill_pct: u32) -> Option<Content> {
         match spec.split_once(':') {
             Some(("frame-driven", fps)) => Some(Content::FrameDriven {
+                fps: fps.parse().ok().filter(|&f| f > 0)?,
+                fill_pct,
+            }),
+            Some(("motion-then-still", fps)) => Some(Content::MotionThenStill {
                 fps: fps.parse().ok().filter(|&f| f > 0)?,
                 fill_pct,
             }),
@@ -50,7 +61,8 @@ impl Content {
         match self {
             Content::Steady { fill_pct }
             | Content::IdleThenMotion { fill_pct }
-            | Content::FrameDriven { fill_pct, .. } => fill_pct,
+            | Content::FrameDriven { fill_pct, .. }
+            | Content::MotionThenStill { fill_pct, .. } => fill_pct,
         }
     }
 
@@ -67,13 +79,22 @@ impl Content {
                 }
             }
             // Integer cadence over the tick count: 35 of every 165 ticks carry content.
-            Content::FrameDriven { fps: src, .. } => {
-                let want = u64::from(src.min(fps));
-                let per = u64::from(fps.max(1));
-                (tick * want / per != (tick + 1) * want / per).then_some(Shot::New)
-            }
+            Content::FrameDriven { fps: src, .. } => cadence(src, fps, tick).then_some(Shot::New),
+            Content::MotionThenStill { .. } if elapsed < STILL_AFTER => Some(Shot::New),
+            Content::MotionThenStill { fps: src, .. } => Some(if cadence(src, fps, tick) {
+                Shot::New
+            } else {
+                Shot::Repeat
+            }),
         }
     }
+}
+
+/// Whether tick `tick` of a session at `fps` carries one of `src` new frames a second.
+fn cadence(src: u32, fps: u32, tick: u64) -> bool {
+    let want = u64::from(src.min(fps));
+    let per = u64::from(fps.max(1));
+    tick * want / per != (tick + 1) * want / per
 }
 
 /// How the source answers a keyframe request.
@@ -186,13 +207,10 @@ fn owe_idr(
     }
 }
 
-/// Per-session inputs for [`synthetic_abr_stream`]. The display-side half of
-/// [`SessionContext`] has no meaning here and is not carried.
+/// Per-session inputs for [`synthetic_abr_stream`]: the [`StreamCommon`] plus the shape it
+/// encodes. The display-side half of [`SessionContext`] has no meaning here and is not carried.
 pub(crate) struct SynthAbrContext {
-    pub(crate) session: Session,
-    pub(crate) mode: punktfunk_core::Mode,
-    /// `0` = until the client leaves.
-    pub(crate) seconds: u32,
+    pub(crate) common: StreamCommon,
     pub(crate) content: Content,
     /// How long after a keyframe ask a decodable frame reaches the wire. `0` = the next one.
     /// A GPU host that answers with a pipeline rebuild takes about a second, and the asks
@@ -205,88 +223,71 @@ pub(crate) struct SynthAbrContext {
     /// pipeline build holds it. The client's bring-up ramp is served on the
     /// idle data plane for exactly this long.
     pub(crate) bringup_delay: std::time::Duration,
-    /// The ramp window's flag, cleared on hand-over.
-    pub(crate) ramp_open: Arc<AtomicBool>,
     /// Automatic PyroWave: the client's ramp closes with one lower pin, so the
     /// window lingers a bounded grace past the fake bring-up for it to cross.
     pub(crate) fit_pin: bool,
-    pub(crate) stop: Arc<AtomicBool>,
-    pub(crate) counters: Arc<crate::session_status::SessionCounters>,
-    pub(crate) keyframe: std::sync::mpsc::Receiver<()>,
-    pub(crate) rfi: std::sync::mpsc::Receiver<(u32, u32)>,
-    pub(crate) bitrate_rx: std::sync::mpsc::Receiver<u32>,
-    pub(crate) shard_rx: std::sync::mpsc::Receiver<usize>,
-    /// Total wire budget (kbps): video + FEC + framing + the audio reservation.
-    pub(crate) bitrate_kbps: u32,
-    pub(crate) audio_reserved_kbps: u32,
-    pub(crate) shard_payload: u16,
-    pub(crate) live_bitrate: Arc<AtomicU32>,
-    pub(crate) fec_target: Arc<AtomicU8>,
-    pub(crate) probe_rx: std::sync::mpsc::Receiver<ProbeRequest>,
-    pub(crate) probe_result_tx: tokio::sync::mpsc::UnboundedSender<ProbeResult>,
-    pub(crate) timing_conn: Option<super::super::link::SessionLink>,
-    pub(crate) phase: Arc<PhaseCtl>,
-    pub(crate) probe_seq: bool,
-    pub(crate) stats: Arc<StatsRecorder>,
-    pub(crate) client_label: String,
-    pub(crate) bringup: Arc<crate::bringup::Trace>,
-    pub(crate) wire_sock: Option<std::net::UdpSocket>,
-    /// What [`crate::session_status::register`] needs and this source cannot derive: the
-    /// session's own handles, what the handshake negotiated, and the client's address, which
-    /// is how the shared-path governor groups sessions.
-    pub(crate) codec: crate::encode::Codec,
-    pub(crate) quit: Arc<AtomicBool>,
-    pub(crate) end_reason: Arc<AtomicU8>,
-    pub(crate) controls: crate::session_status::SessionControls,
-    pub(crate) client_name: Option<String>,
-    pub(crate) hdr: bool,
-    pub(crate) bit_depth: u8,
-    pub(crate) chroma: crate::encode::ChromaFormat,
+    /// What [`crate::session_status::register`] needs and this source can't derive: which
+    /// plane carries it, and the client's address, which is how the shared-path governor
+    /// groups sessions.
+    pub(crate) plane: crate::events::Plane,
     pub(crate) peer: std::net::IpAddr,
 }
 
-/// Stream until the client leaves, `seconds` elapse, or the send thread goes.
+/// Stream until the client leaves, `seconds` (`0` = until the client leaves) elapse, or the
+/// send thread goes.
 pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
     boost_thread_priority(true);
     let SynthAbrContext {
-        session,
-        mode,
-        seconds,
+        common:
+            StreamCommon {
+                session,
+                mode,
+                seconds,
+                stop,
+                quit,
+                end_reason,
+                counters,
+                ends:
+                    StreamEnds {
+                        keyframe,
+                        rfi,
+                        bitrate_rx,
+                        shard_rx,
+                        probe_rx,
+                        probe_result_tx,
+                        ..
+                    },
+                shared:
+                    SessionShared {
+                        live_bitrate,
+                        fec_target,
+                        phase,
+                        ramp_open,
+                        ..
+                    },
+                bitrate_kbps,
+                audio_reserved_kbps,
+                shard_payload,
+                timing_conn,
+                probe_seq,
+                stats,
+                client_label,
+                bringup,
+                wire_sock,
+                codec,
+                controls,
+                client_name,
+                hdr,
+                bit_depth,
+                chroma,
+            },
         content,
         recovery,
         answer,
         idr_pct,
         bringup_delay,
-        ramp_open,
         fit_pin,
-        stop,
-        counters,
-        keyframe,
-        rfi,
-        bitrate_rx,
-        shard_rx,
-        bitrate_kbps,
-        audio_reserved_kbps,
-        shard_payload,
-        live_bitrate,
-        fec_target,
-        probe_rx,
-        probe_result_tx,
-        timing_conn,
-        phase,
-        probe_seq,
-        stats,
-        client_label,
-        bringup,
-        wire_sock,
-        codec,
-        quit,
-        end_reason,
-        controls,
-        client_name,
-        hdr,
-        bit_depth,
-        chroma,
+        plane,
         peer,
     } = ctx;
     let fps = mode.refresh_hz.max(1);
@@ -323,7 +324,11 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
         mode: live_mode.clone(),
         codec: "synthetic-abr",
         client: client_label.clone(),
+        plane,
         bitrate_kbps: live_bitrate.clone(),
+        // No client ramp reaches the synthetic source; the factor paces it.
+        link_kbps: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        link_paced: false,
         bringup: bringup.clone(),
         wire_sock,
         driver_dropped: Arc::new(AtomicU64::new(0)),
@@ -391,7 +396,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
         force_idr: Arc::new(AtomicBool::new(false)),
         client: client_label,
         client_name,
-        plane: crate::events::Plane::Native,
+        plane,
         hdr,
         ttff_ms: bringup.total_slot(),
         // Never written: a source that cannot reconfigure never resizes.
@@ -481,23 +486,23 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
             };
             let msg = FrameMsg {
                 data: test_frame(au_seq, len),
-                capture_ns: now_ns(),
-                flags,
-                frame_index: au_seq,
-                deadline: due + interval,
-                // A plausible encode: half a frame budget, which is what a GPU that is not
-                // the bottleneck reads. The client's encode-stage detector needs a number
-                // in the right decade, not a model.
-                encode_us: (500_000 / fps).max(1),
-                queue_us: 0,
-                cap_us: 0,
-                submit_us: 0,
-                wait_us: 0,
-                repeat: shot == Shot::Repeat,
-                was_measured: true,
-                driver: false,
-                split: false,
-                ipc_us: 0,
+                meta: AuMeta {
+                    capture_ns: now_ns(),
+                    flags,
+                    frame_index: au_seq,
+                    deadline: due + interval,
+                    // A plausible encode: half a frame budget, which is what a GPU that is not
+                    // the bottleneck reads. The client's encode-stage detector needs a number
+                    // in the right decade, not a model.
+                    encode_us: (500_000 / fps).max(1),
+                    queue_us: 0,
+                    cap_us: 0,
+                    submit_us: 0,
+                    wait_us: 0,
+                    repeat: shot == Shot::Repeat,
+                    was_measured: true,
+                    driver: None,
+                },
             };
             if frame_tx.send(SendMsg::Frame(msg)).is_err() {
                 break;
@@ -652,6 +657,17 @@ mod tests {
             idle.frame_at(std::time::Duration::from_secs(11), 60, 0),
             Some(Shot::New)
         );
+
+        // A minute of motion, then 5 new frames a second among repeats.
+        let still = Content::parse("motion-then-still:5", 100).expect("motion-then-still parses");
+        assert!((0..60)
+            .all(|t| still.frame_at(std::time::Duration::from_secs(1), 60, t) == Some(Shot::New)));
+        let late = std::time::Duration::from_secs(61);
+        let new = (0..60)
+            .filter(|&t| still.frame_at(late, 60, t) == Some(Shot::New))
+            .count();
+        assert_eq!(new, 5, "five new frames a second once still");
+        assert_eq!(still.frame_at(late, 60, 1), Some(Shot::Repeat));
 
         assert_eq!(Content::parse("frame-driven:0", 100), None);
         assert_eq!(Content::parse("nonsense", 100), None);

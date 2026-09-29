@@ -46,8 +46,9 @@ public final class GamepadCapture {
 
     /// One forwarded controller: the open device plus the last wire state for its pad index (the
     /// diff base — also what `flush` unwinds). Held per Slot so two controllers never clobber each
-    /// other's held buttons/axes/fingers. Mirrors pf-client-core's `Slot`.
-    private final class Slot {
+    /// other's held buttons/axes/fingers. Mirrors pf-client-core's `Slot`. Main-actor like its
+    /// owner, so the main-run-loop timers that fire on it may hold it.
+    @MainActor private final class Slot {
         let controller: GCController
         /// Wire pad index (GamepadManager's stable lowest-free assignment), threaded onto every
         /// event this controller sends — the low byte of `flags`.
@@ -337,18 +338,29 @@ public final class GamepadCapture {
         let pad = slots.first?.pad ?? 0
         wire.send(.gamepadButton(bit, down: true, pad: pad))
         let timer = Timer(timeInterval: Self.tapPress, repeats: false) { [weak self] _ in
-            Task { @MainActor in self?.wire?.send(.gamepadButton(bit, down: false, pad: pad)) }
+            MainActor.assumeIsolated {
+                self?.wire?.send(.gamepadButton(bit, down: false, pad: pad))
+            }
         }
         RunLoop.main.add(timer, forMode: .common)
     }
 
     /// Bring `slots` in line with the forwarded set: close any slot no longer wanted (flushing its
     /// held wire state and sending GamepadRemove first) and open any newly-forwarded controller into
-    /// its assigned wire index. A controller that stays forwarded keeps its slot untouched, so a
-    /// second pad connecting never disturbs the first. Mirrors pf-client-core's `reconcile_slots`.
+    /// its assigned wire index. A controller that stays forwarded on its index keeps its slot
+    /// untouched, so a second pad connecting never disturbs the first. Mirrors pf-client-core's
+    /// `reconcile_slots`.
+    ///
+    /// A slot whose index moved is closed and opened on the new one. Another window's session
+    /// start renumbers the pads, and the host's rumble and HID output are routed by index.
     private func reconcile(_ forwarded: [GamepadManager.DiscoveredController]) {
-        let wantIDs = Set(forwarded.map { ObjectIdentifier($0.controller) })
-        for slot in slots where !wantIDs.contains(ObjectIdentifier(slot.controller)) {
+        var wanted: [ObjectIdentifier: UInt32] = [:]
+        for dc in forwarded {
+            if let pad = manager.padIndex(for: dc) {
+                wanted[ObjectIdentifier(dc.controller)] = UInt32(pad)
+            }
+        }
+        for slot in slots where wanted[ObjectIdentifier(slot.controller)] != slot.pad {
             closeSlot(slot)
         }
         for dc in forwarded where !slots.contains(where: { $0.controller === dc.controller }) {
@@ -409,18 +421,10 @@ public final class GamepadCapture {
         for element in claimed {
             element.preferredSystemGestureState = .disabled
         }
-        // The Home/PS button (→ guide; the host maps it to the DualSense PS / Xbox guide bit,
-        // BTN_MODE on the virtual xpad — the Steam-overlay button). On iOS 26 the OS opens its
-        // Game Overlay for this press regardless of the gesture claim below (the app is
-        // LSApplicationCategoryType=games, which enrolls it); the sanctioned per-controller
-        // opt-out is the USER's iOS 27+ Home-button setting. TODO(iOS 27 SDK): read
-        // `GCControllerHomeButtonSettingsManager` and surface a one-time
-        // `openControllerHomeButtonSettings(for:)` deep-link so users can hand the button to
-        // the stream — the class is Swift-only and 27.0+, so it needs the Xcode 27 SDK to
-        // even compile. Until then hold-Select is the reliable route. Driven DIRECTLY from this
-        // handler's pressed value (not via buttonMask), because the legacy
-        // `extendedGamepad.buttonHome` is unreliable/often nil even when the physical element
-        // exists. On tvOS the element is absent (reserved) → nil, the whole block no-ops.
+        // Home/PS → the host's guide (the Steam-overlay button). On macOS/iOS 27 the OS honors
+        // the claim above only for apps under Home Button Overrides (or macOS with Home Button
+        // Actions off); Settings links there (`watchHomeButton`). Driven from this handler: the
+        // legacy `extendedGamepad.buttonHome` is often nil when the element exists. tvOS: nil.
         if let home = c.physicalInputProfile.buttons[GCInputButtonHome] {
             home.pressedChangedHandler = { [weak self, weak slot] _, _, pressed in
                 MainActor.assumeIsolated { if let self, let slot { self.sendGuide(slot, down: pressed) } }
@@ -575,7 +579,7 @@ public final class GamepadCapture {
 
     /// A sector, once engaged, keeps the stick until the angle is this far past its 30° edge — a
     /// thumb resting on the boundary between two slots would otherwise flicker between them.
-    static let sectorOverlapDeg = 5.0
+    nonisolated static let sectorOverlapDeg = 5.0
 
     /// The ring slot the left stick points at, given the sector already engaged: past the dead
     /// zone by MAGNITUDE (a diagonal counts) the angle falls into one of six 60° sectors centred
@@ -679,7 +683,7 @@ public final class GamepadCapture {
             if slot.tapReleaseOwed { finishTap(slot) }
             slot.selectPending = true
             let timer = Timer(timeInterval: Self.guideHold, repeats: false) { [weak self, weak slot] _ in
-                Task { @MainActor in
+                MainActor.assumeIsolated {
                     if let self, let slot { self.gestureHoldFired(slot) }
                 }
             }
@@ -715,7 +719,7 @@ public final class GamepadCapture {
         wire?.send(.gamepadButton(GamepadWire.back, down: true, pad: slot.pad))
         slot.tapReleaseOwed = true
         let timer = Timer(timeInterval: Self.tapPress, repeats: false) { [weak self, weak slot] _ in
-            Task { @MainActor in
+            MainActor.assumeIsolated {
                 if let self, let slot { self.finishTap(slot) }
             }
         }
@@ -917,7 +921,7 @@ public final class GamepadCapture {
         let held = slots.contains { $0.buttons & Self.escapeChord == Self.escapeChord }
         if held, chordTimer == nil {
             let timer = Timer(timeInterval: Self.disconnectHold, repeats: false) { [weak self] _ in
-                Task { @MainActor in self?.onDisconnectRequest?() }
+                MainActor.assumeIsolated { self?.onDisconnectRequest?() }
             }
             RunLoop.main.add(timer, forMode: .common)
             chordTimer = timer

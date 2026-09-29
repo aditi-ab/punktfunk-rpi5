@@ -13,12 +13,16 @@
 use anyhow::{Context, Result};
 use windows::core::Interface;
 use windows::Win32::Foundation::{HMODULE, LUID};
-use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0};
+use windows::Win32::Graphics::Direct3D::{
+    D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0,
+};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION,
 };
-use windows::Win32::Graphics::Dxgi::{IDXGIAdapter1, IDXGIDevice, IDXGIDevice1};
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIDevice, IDXGIDevice1, IDXGIFactory4,
+};
 
 #[derive(Clone)]
 pub struct WinCaptureTarget {
@@ -129,6 +133,53 @@ pub unsafe fn make_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D
     Ok((device, context))
 }
 
+/// The DXGI adapter with `luid`; `None` when the LUID is unset or names no adapter.
+pub fn adapter_by_luid(luid: Option<LUID>) -> Option<IDXGIAdapter1> {
+    let luid = luid?;
+    // SAFETY: both calls return an owned COM reference or an error; nothing is borrowed.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+        factory.EnumAdapterByLuid(luid).ok()
+    }
+}
+
+/// A throwaway D3D11 device for a capability probe: on the adapter with `luid`, else the OS
+/// default hardware adapter. Unlike [`make_device`] it raises no GPU priority.
+pub fn probe_device(luid: Option<LUID>, flags: D3D11_CREATE_DEVICE_FLAG) -> Option<ID3D11Device> {
+    let adapter = adapter_by_luid(luid);
+    let mut device: Option<ID3D11Device> = None;
+    // SAFETY: `adapter` is an owned COM reference live for the call; `device` is a local
+    // out-param the callee fills only on success.
+    let created = unsafe {
+        match &adapter {
+            Some(a) => D3D11CreateDevice(
+                a,
+                D3D_DRIVER_TYPE_UNKNOWN,
+                HMODULE::default(),
+                flags,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                None,
+            ),
+            None => D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                flags,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                None,
+            ),
+        }
+    };
+    created.ok()?;
+    device
+}
+
 /// `PUNKTFUNK_GPU_PRIORITY_CLASS` policy.
 enum PrioMode {
     /// Skip the D3DKMT call; this is not class 0 (IDLE).
@@ -159,62 +210,10 @@ fn configured_gpu_priority_mode() -> PrioMode {
 /// Enable `SE_INC_BASE_PRIORITY` on this process token (best-effort).
 ///
 /// The kernel gates HIGH/REALTIME GPU scheduling on it. SYSTEM/Administrators
-/// hold it; a UAC-filtered token does not, so [`elevate_process_gpu_priority`]
-/// may silently no-op.
+/// hold it; a UAC-filtered token does not, and the warning says so.
 fn enable_inc_base_priority() {
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
-    use windows::Win32::Security::{
-        AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES,
-        SE_INC_BASE_PRIORITY_NAME, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
-        TOKEN_QUERY,
-    };
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    let mut token = HANDLE::default();
-    // SAFETY: `GetCurrentProcess` returns the current-process pseudo-handle, always valid and never
-    // closed; `token` is a local the callee only writes, and it is only used below if this succeeded.
-    let opened = unsafe {
-        OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-            &mut token,
-        )
-    }
-    .is_ok();
-    if opened {
-        let mut luid = LUID::default();
-        // SAFETY: a null system name means "local system"; `SE_INC_BASE_PRIORITY_NAME` is a static
-        // NUL-terminated constant, and `luid` is a local the callee only writes.
-        let found =
-            unsafe { LookupPrivilegeValueW(PCWSTR::null(), SE_INC_BASE_PRIORITY_NAME, &mut luid) }
-                .is_ok();
-        if found {
-            let tp = TOKEN_PRIVILEGES {
-                PrivilegeCount: 1,
-                Privileges: [LUID_AND_ATTRIBUTES {
-                    Luid: luid,
-                    Attributes: SE_PRIVILEGE_ENABLED,
-                }],
-            };
-            // SAFETY: `token` is the live handle opened above; `tp` is a correctly sized local
-            // `TOKEN_PRIVILEGES` whose `PrivilegeCount` matches its one-element array, borrowed only
-            // for the duration of the call.
-            let adjusted = unsafe {
-                AdjustTokenPrivileges(
-                    token,
-                    false,
-                    Some(&tp as *const TOKEN_PRIVILEGES),
-                    0,
-                    None,
-                    None,
-                )
-            };
-            if adjusted.is_err() {
-                tracing::warn!("AdjustTokenPrivileges(SE_INC_BASE_PRIORITY) failed (run as admin/SYSTEM for GPU priority)");
-            }
-        }
-        // SAFETY: `token` was opened above, is owned here, and is closed exactly once on this path.
-        let _ = unsafe { CloseHandle(token) };
+    if let Err(e) = crate::privilege::enable("SeIncreaseBasePriorityPrivilege") {
+        tracing::warn!(error = %e, "SE_INC_BASE_PRIORITY not enabled (run as admin/SYSTEM for GPU priority)");
     }
 }
 
@@ -248,36 +247,52 @@ unsafe fn d3dkmt_set_scheduling_priority_class(
 }
 
 /// Raise this process's D3DKMT GPU scheduling class (once, best-effort).
-///
-/// Process class is the cross-process lever; `SetGPUThreadPriority` alone does
-/// not unstarve encode under a GPU-bound game. Default REALTIME; see
-/// [`configured_gpu_priority_mode`]. No-ops under a UAC-filtered token.
 fn elevate_process_gpu_priority() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         use windows::Win32::System::Threading::GetCurrentProcess;
-        let prio = match configured_gpu_priority_mode() {
-            PrioMode::Off => {
-                tracing::info!("GPU process scheduling priority class left at default (off)");
-                return;
-            }
-            PrioMode::Static(p) => p,
-        };
-        enable_inc_base_priority();
-        // SAFETY: `d3dkmt_set_scheduling_priority_class` requires a valid process handle;
-        // `GetCurrentProcess()` returns the current-process pseudo-handle, which is always valid and
-        // needs no close.
-        match unsafe { d3dkmt_set_scheduling_priority_class(GetCurrentProcess(), prio) } {
-            Some(0) => tracing::info!(
-                priority_class = prio,
-                "GPU process scheduling priority class set (2=normal 4=high 5=realtime)"
-            ),
-            Some(st) => tracing::warn!(
-                status = format!("0x{st:08X}"),
-                "D3DKMTSetProcessSchedulingPriorityClass failed (run as admin/SYSTEM for GPU priority)"
-            ),
-            None => tracing::warn!("D3DKMTSetProcessSchedulingPriorityClass export not found"),
-        }
+        // SAFETY: the current-process pseudo-handle is always valid, carries every access
+        // right and needs no close.
+        unsafe { elevate_gpu_priority_of(GetCurrentProcess(), "self") };
     });
+}
+
+/// Raise `process`'s D3DKMT GPU scheduling class (best-effort, logged per call). `what`
+/// names the process in the log.
+///
+/// Process class is the cross-process lever; `SetGPUThreadPriority` alone does not
+/// unstarve encode under a GPU-bound game. It covers every GPU context the process owns,
+/// including ones a driver creates internally (NVENC's RGB→YUV pass). Default REALTIME;
+/// see [`configured_gpu_priority_mode`]. The kernel checks this caller's
+/// `SE_INC_BASE_PRIORITY`, so it no-ops under a UAC-filtered token.
+///
+/// # Safety
+/// `process` must be a live process handle carrying `PROCESS_SET_INFORMATION`.
+pub unsafe fn elevate_gpu_priority_of(process: windows::Win32::Foundation::HANDLE, what: &str) {
+    let prio = match configured_gpu_priority_mode() {
+        PrioMode::Off => {
+            tracing::info!(
+                process = what,
+                "GPU scheduling priority class left at default (off)"
+            );
+            return;
+        }
+        PrioMode::Static(p) => p,
+    };
+    enable_inc_base_priority();
+    // SAFETY: `process` is live and carries the access right, per this fn's contract.
+    match unsafe { d3dkmt_set_scheduling_priority_class(process, prio) } {
+        Some(0) => tracing::info!(
+            process = what,
+            priority_class = prio,
+            "GPU scheduling priority class set (2=normal 4=high 5=realtime)"
+        ),
+        Some(st) => tracing::warn!(
+            process = what,
+            status = format!("0x{st:08X}"),
+            "GPU scheduling priority class not raised (the host needs admin/SYSTEM)"
+        ),
+        None => tracing::warn!("D3DKMTSetProcessSchedulingPriorityClass export not found"),
+    }
 }

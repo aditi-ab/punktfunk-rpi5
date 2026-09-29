@@ -2,12 +2,15 @@ package io.unom.punktfunk
 
 import android.view.InputDevice
 import android.view.MotionEvent
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import java.io.File
 
 /**
  * The Kotlin twin of the core's `ScrollAccumulator` — same Q24.8 wire, same residue and
@@ -109,5 +112,32 @@ class ScrollNormalizerTest {
             ScrollWire.SOURCE_UNKNOWN,
             wireScrollSource(eventWithSource(InputDevice.SOURCE_JOYSTICK).source),
         )
+    }
+
+    /** Every sequence Rust's `ScrollAccumulator` wrote; `../../../` from the module is the root. */
+    @Test
+    fun matchesTheRustVectors() {
+        val file = File("../../../crates/punktfunk-core/testdata/scroll-vectors.json")
+        assertTrue("the vector file must be reachable at ${file.absolutePath}", file.isFile)
+        val cases = JSONObject(file.readText()).getJSONArray("cases")
+        assertTrue("the vector file has cases", cases.length() > 0)
+        val wrong = mutableListOf<String>()
+        for (i in 0 until cases.length()) {
+            val case = cases.getJSONObject(i)
+            val steps = case.getJSONArray("steps")
+            val n = ScrollNormalizer()
+            for (j in 0 until steps.length()) {
+                val s = steps.getJSONObject(j)
+                val got = n.event(s.getInt("source"), s.getInt("phase"), s.getInt("axis"), s.getDouble("delta"))
+                val want = if (s.isNull("wire")) {
+                    null
+                } else {
+                    val w = s.getJSONObject("wire")
+                    NormalizedScroll(w.getInt("axis"), w.getInt("delta"), w.getInt("source"), w.getInt("phase"))
+                }
+                if (got != want) wrong += "${case.getString("name")} step $j: Rust $want, Kotlin $got"
+            }
+        }
+        assertTrue(wrong.joinToString("\n"), wrong.isEmpty())
     }
 }

@@ -1,10 +1,17 @@
 package io.unom.punktfunk
 
 import android.os.Build
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.displayCutout
+import androidx.compose.foundation.layout.systemBars
+import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 
@@ -45,3 +52,14 @@ fun PunktfunkTheme(content: @Composable () -> Unit) {
     // already ship (see Type.kt).
     MaterialTheme(colorScheme = scheme, typography = PunktfunkTypography, content = content)
 }
+
+/** A pill: a badge, a chip. */
+val PillShape = RoundedCornerShape(50)
+
+/**
+ * The area content keeps clear: the system bars UNION the display cutout. `systemBarsPadding()`
+ * leaves out the cutout, which in landscape is a side inset with no bar behind it.
+ */
+@Composable
+fun Modifier.safeArea(): Modifier =
+    windowInsetsPadding(WindowInsets.systemBars.union(WindowInsets.displayCutout))

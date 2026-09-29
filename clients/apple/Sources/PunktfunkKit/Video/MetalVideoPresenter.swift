@@ -14,43 +14,12 @@
 #if canImport(Metal) && canImport(QuartzCore)
 import CoreGraphics
 import CoreVideo
-#if os(macOS)
-import IOSurface
-#endif
 import Metal
 import MetalPerformanceShaders
 import QuartzCore
 import os
 
 private let presenterLog = ClientLog(category: "presenter")
-
-#if os(macOS)
-/// HOW a windowed (composited) macOS session pushes finished frames to glass — the DCP
-/// "mismatched swapID's" kernel-panic saga's mechanism picker. Fullscreen always presents
-/// `async` (direct-scanout promotion, lowest latency, no panic reports there); the windowed
-/// mechanism is resolved per session by SessionPresenter (user setting +
-/// PUNKTFUNK_WINDOWED_PRESENT env override) and routed here via `setWindowedPresent`.
-///
-/// - `async`: the CAMetalLayer image queue (`commandBuffer.present`) — the fastest composited
-///   path and the PANIC TRIGGER on high-refresh displays (the out-of-band swaps race
-///   WindowServer's compositor; it survived glass pacing and every codec).
-/// - `transaction`: `CAMetalLayer.presentsWithTransaction` — the swap commits WITH the layer
-///   tree, in lockstep with the compositor (Apple's documented remedy; validated no-panic on
-///   the 240 Hz repro machine). The present is committed from the RENDER thread inside an
-///   explicit CATransaction + flush — see `encodePresent` for why that beats the original
-///   main-thread hop.
-/// - `surface`: no image queue at all — render into a pooled IOSurface and swap it into a plain
-///   CALayer's `contents` (the f407f418 PyroWave mitigation, resurrected format-aware:
-///   rgba16Float + PQ tagging keeps HDR). WindowServer treats it as ordinary layer damage on
-///   its own composite cadence. PROTOTYPE: whether the compositor honors PQ/EDR for plain-layer
-///   IOSurface contents still needs an on-glass eyeball — the metal layer stays underneath with
-///   `wantsExtendedDynamicRangeContent` as the EDR anchor.
-enum WindowedPresentMode: String, Sendable {
-    case async
-    case transaction
-    case surface
-}
-#endif
 
 /// HDR reference white (BT.2408 "HDR Reference White"): the absolute luminance, in nits, that the
 /// PQ signal's diffuse white sits at. Passed to `CAEDRMetadata.hdr10(opticalOutputScale:)`, it anchors
@@ -87,7 +56,7 @@ private let sdrColorspace: CGColorSpace? = {
 ///
 /// `PUNKTFUNK_SDR10_DRAWABLE=8` keeps the 8-bit drawable — the A/B lever if a panel composites
 /// the wide format wrong.
-private let sdr10Drawable: MTLPixelFormat =
+let sdr10Drawable: MTLPixelFormat =
     ProcessInfo.processInfo.environment["PUNKTFUNK_SDR10_DRAWABLE"] == "8"
     ? .bgra8Unorm : .bgr10a2Unorm
 
@@ -310,119 +279,6 @@ public final class MetalVideoPresenter {
     /// The layer the hosting view installs (as a sublayer) and sizes to its bounds.
     public let layer: CAMetalLayer
 
-    #if os(macOS)
-    /// WINDOWED-mode present coordination — the macOS DCP KERNEL PANIC mitigation.
-    ///
-    /// The panic ("mismatched swapID's" @UnifiedPipeline.cpp, WindowServer dies, machine reboots):
-    /// the CAMetalLayer's ASYNCHRONOUS image queue (`commandBuffer.present(drawable)` — an
-    /// out-of-band flip, mandatory with `displaySyncEnabled=false`) diverges from WindowServer's
-    /// compositor on a high-refresh COMPOSITED (windowed) session — the compositor's notion of the
-    /// current swap and the layer's queued swap disagree, and the DCP asserts. It survived glass
-    /// pacing: a fully serialized one-in-flight present stream still panicked a 240 Hz Mac Studio
-    /// (2026-07-18, PyroWave), and a windowed HEVC session panicked the same machine 2026-07-21 —
-    /// so it is the async image queue itself, at any pacing or codec, not a present rate.
-    ///
-    /// The fix keeps the full render path (rgba16Float / PQ / EDR — real HDR is preserved) and
-    /// only changes HOW the drawable is presented: `CAMetalLayer.presentsWithTransaction`. With it
-    /// set, we don't hand the drawable to the command buffer; we commit, wait until scheduled, then
-    /// call `drawable.present()` INSIDE a CATransaction — the present is enrolled in Core
-    /// Animation's transaction and committed together with the layer tree, so the swap stays in
-    /// lockstep with the compositor instead of racing it (Apple's documented remedy for Metal
-    /// presentation drifting out of sync with CA). Fullscreen keeps the async path (direct-scanout
-    /// promotion, lowest latency, no compositor and no panic reports there).
-    ///
-    /// 2026-07-21 latency rework: the mitigation MECHANISM is now a three-way pick
-    /// (`WindowedPresentMode`) and the transactional present commits from the RENDER thread —
-    /// see `encodePresent`. Staged under `stagingLock` (main pushes it via
-    /// `setComposited`→`setWindowedPresent`); the render thread drains it and toggles the layer
-    /// property + present style. `Active` is the render-thread copy so the layer property flips
-    /// exactly once per mode change.
-    private var windowedPresentStaged: WindowedPresentMode = .async
-    private var windowedPresentActive: WindowedPresentMode = .async
-
-    /// PUNKTFUNK_TXN_PRESENT=main — the ORIGINAL transactional present (commit →
-    /// waitUntilScheduled → hop to the MAIN thread and present inside its CATransaction), kept
-    /// as a field A/B lever. The default is the render-thread commit: the present harness
-    /// (2026-07-21, this saga) measured the main hop landing a runloop turn late on a busy main
-    /// thread, and an ACTIVE implicit transaction there NESTS the explicit one — presents batch
-    /// at runloop-iteration rate (the field's presents=55 @ fps=240, display_p50 18.6 ms).
-    /// Off-main commits measured immune to main-thread churn (~10 ms glass p50 at 240 Hz
-    /// full-size vs 14+ ms under a churned main hop).
-    private let txnPresentOnMain =
-        ProcessInfo.processInfo.environment["PUNKTFUNK_TXN_PRESENT"] == "main"
-
-    /// The WINDOWED-mode `surface` present target: a plain CALayer sized like `layer` (installed
-    /// as a sibling ABOVE it by SessionPresenter), fed IOSurfaces via `contents` inside explicit
-    /// CATransactions. Transparent (nil contents) whenever surface mode is off, so the metal
-    /// layer below shows through. See `WindowedPresentMode.surface`.
-    let surfaceLayer: CALayer = {
-        let l = CALayer()
-        l.contentsGravity = .resize // frame is already aspect-fit + pixel-snapped by layout
-        l.isOpaque = true
-        l.actions = ["contents": NSNull(), "bounds": NSNull(), "position": NSNull()]
-        return l
-    }()
-
-    /// One IOSurface-backed render target of the windowed surface-present pool. All pool state
-    /// is RENDER-THREAD confined; only the immutable surface refs cross threads (contents swap).
-    private struct SurfaceSlot {
-        let surface: IOSurfaceRef
-        let texture: MTLTexture
-        /// Monotonic use stamp — the reuse picker takes the least-recently-rendered free slot.
-        var seq: UInt64 = 0
-    }
-
-    private var surfacePool: [SurfaceSlot] = []
-    private var surfacePoolSize: CGSize = .zero
-    /// What the pool's surfaces and textures were allocated for.
-    private enum SurfaceDepth { case sdr8, sdr10, hdr }
-    private var surfacePoolDepth = SurfaceDepth.sdr8
-    private var surfaceSeq: UInt64 = 0
-    /// Index of the slot most recently handed to the layer — never rewritten next, even if its
-    /// use count already dropped (the compositor may still be scanning out the previous frame).
-    private var lastHandedOff: Int?
-
-    /// Once-per-second decomposition of the ACTIVE windowed present path (the field-diagnosis
-    /// half of the DCP-latency work): scheduled/completed wait + commit/flush cost per present,
-    /// and how many presents/swaps were issued. The pf-present line shows the GLASS side
-    /// (latchMs / dropped); this shows the ISSUE side. Logged via `presenterLog` only while a
-    /// windowed mechanism is active (zero cost fullscreen). Lock-guarded: transaction mode
-    /// records from the render thread, surface mode from Metal completion threads.
-    private final class WindowedPresentDiag: @unchecked Sendable {
-        private let lock = NSLock()
-        private var presents = 0
-        private var schedMs: [Double] = []
-        private var commitMs: [Double] = []
-        private var last = CACurrentMediaTime()
-
-        func record(schedMs sched: Double, commitMs commit: Double, mode: WindowedPresentMode) {
-            lock.lock()
-            presents += 1
-            schedMs.append(sched)
-            commitMs.append(commit)
-            let now = CACurrentMediaTime()
-            guard now - last >= 1 else {
-                lock.unlock()
-                return
-            }
-            last = now
-            let sSched = schedMs.sorted()
-            let sCommit = commitMs.sorted()
-            let line = String(
-                format: "pf-windowed mode=%@ presents=%d schedMs p50=%.2f max=%.2f "
-                    + "commitMs p50=%.2f max=%.2f",
-                mode.rawValue, presents, sSched[sSched.count / 2], sSched.last ?? 0,
-                sCommit[sCommit.count / 2], sCommit.last ?? 0)
-            presents = 0
-            schedMs.removeAll(keepingCapacity: true)
-            commitMs.removeAll(keepingCapacity: true)
-            lock.unlock()
-            presenterLog.info("\(line, privacy: .public)")
-        }
-    }
-
-    private let windowedDiag = WindowedPresentDiag()
-    #endif
 
     private let device: MTLDevice
     private let queue: MTLCommandQueue
@@ -508,12 +364,17 @@ public final class MetalVideoPresenter {
     private var lastSizeSig = ""
     #endif
 
-    /// nil if Metal is unavailable (no GPU / a headless CI) or a shader fails to compile — the caller
-    /// falls back to stage-1.
-    public static func make() -> MetalVideoPresenter? {
-        guard let device = MTLCreateSystemDefaultDevice(),
-              let queue = device.makeCommandQueue()
-        else { return nil }
+    private struct Pipelines {
+        let device: MTLDevice
+        let sdr, sdr10, hdr: MTLRenderPipelineState
+        let hdrToneMap: MTLRenderPipelineState?
+        let planar, planarHDR, planarToneMap: MTLRenderPipelineState
+    }
+
+    /// Compiled once per process: the source and its env lever never change, and every session
+    /// start, wedge rebuild and monitor move would otherwise recompile on the main thread.
+    private static let pipelines: Pipelines? = {
+        guard let device = MTLCreateSystemDefaultDevice() else { return nil }
         let pipelineSDR: MTLRenderPipelineState
         let pipelineSDR10: MTLRenderPipelineState
         let pipelineHDR: MTLRenderPipelineState
@@ -524,7 +385,7 @@ public final class MetalVideoPresenter {
         do {
             // DEBUG A/B lever: PUNKTFUNK_BILINEAR_LUMA=1 compiles the shader with Catmull-Rom OFF
             // (plain bilinear luma) by prepending a #define ahead of the source. Default (unset) is
-            // the normal bicubic path. Read at presenter creation — set it in the environment and
+            // the normal bicubic path. Read once per process — set it in the environment and
             // relaunch to flip; the log line confirms which path built.
             let bilinearLuma = ProcessInfo.processInfo.environment["PUNKTFUNK_BILINEAR_LUMA"] == "1"
             let source = (bilinearLuma ? "#define PF_BILINEAR_LUMA 1\n" : "") + shaderSource
@@ -578,6 +439,17 @@ public final class MetalVideoPresenter {
         } catch {
             return nil
         }
+        return Pipelines(
+            device: device, sdr: pipelineSDR, sdr10: pipelineSDR10, hdr: pipelineHDR,
+            hdrToneMap: pipelineHDRToneMap, planar: pipelinePlanar,
+            planarHDR: pipelinePlanarHDR, planarToneMap: pipelinePlanarToneMap)
+    }()
+
+    /// nil if Metal is unavailable (no GPU / a headless CI) or a shader fails to compile — the caller
+    /// falls back to stage-1.
+    public static func make() -> MetalVideoPresenter? {
+        guard let p = pipelines, let queue = p.device.makeCommandQueue() else { return nil }
+        let device = p.device
         var cache: CVMetalTextureCache?
         CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache)
         guard let textureCache = cache else { return nil }
@@ -618,10 +490,10 @@ public final class MetalVideoPresenter {
         layer.maximumDrawableCount = 3
 
         return MetalVideoPresenter(
-            device: device, queue: queue, pipelineSDR: pipelineSDR, pipelineSDR10: pipelineSDR10,
-            pipelineHDR: pipelineHDR,
-            pipelineHDRToneMap: pipelineHDRToneMap, pipelinePlanar: pipelinePlanar,
-            pipelinePlanarHDR: pipelinePlanarHDR, pipelinePlanarToneMap: pipelinePlanarToneMap,
+            device: device, queue: queue, pipelineSDR: p.sdr, pipelineSDR10: p.sdr10,
+            pipelineHDR: p.hdr,
+            pipelineHDRToneMap: p.hdrToneMap, pipelinePlanar: p.planar,
+            pipelinePlanarHDR: p.planarHDR, pipelinePlanarToneMap: p.planarToneMap,
             textureCache: textureCache, layer: layer)
     }
 
@@ -769,43 +641,6 @@ public final class MetalVideoPresenter {
         stagingLock.unlock()
     }
 
-    #if os(macOS)
-    /// Park the windowed present mechanism (MAIN thread — the hosting view pushes its window
-    /// state on every layout; SessionPresenter resolves the mechanism per session). `.async` =
-    /// FULLSCREEN (or the user opted out of the mitigation): the image queue. `.transaction` /
-    /// `.surface` = COMPOSITED (windowed) mitigation mechanisms — see `WindowedPresentMode`.
-    /// Applied by the render thread on the next frame, like every other staged value here.
-    func setWindowedPresent(_ mode: WindowedPresentMode) {
-        stagingLock.lock()
-        windowedPresentStaged = mode
-        stagingLock.unlock()
-        // Leaving `surface` means somebody is about to clear the layer's contents. A swap already
-        // committed would otherwise land afterwards and put a stale frame back on an opaque layer
-        // that sits ABOVE the metal one, covering the live stream for the rest of the session.
-        if mode != .surface { surfaceEpoch.bump() }
-    }
-
-    /// Whether the staged mechanism is a COMPOSITED (windowed) one — transaction/surface vs the
-    /// fullscreen async image queue — for the pf-present pace line's "(composited)" suffix.
-    /// Lock-safe, same staged read the render thread makes.
-    var presentsComposited: Bool {
-        stagingLock.lock(); defer { stagingLock.unlock() }
-        return windowedPresentStaged != .async
-    }
-
-    /// Generation of the surface-present target, so a completion handler can tell whether the
-    /// layer it is about to write to is still the one it rendered for. Its own object because the
-    /// handler must not retain the presenter.
-    final class SurfaceEpoch: @unchecked Sendable {
-        private let lock = NSLock()
-        private var value: UInt64 = 0
-        func bump() { lock.lock(); value &+= 1; lock.unlock() }
-        func current() -> UInt64 { lock.lock(); defer { lock.unlock() }; return value }
-        func isCurrent(_ v: UInt64) -> Bool { current() == v }
-    }
-    let surfaceEpoch = SurfaceEpoch()
-    #endif
-
     /// Deadline pacing only, RENDER THREAD: reconcile the layer with a decoded frame BEFORE a
     /// drawable exists. The link vends from the layer's CURRENT config, and the layer starts
     /// with `drawableSize` 0 (it never tracks bounds once set explicitly, and the sublayer's
@@ -821,13 +656,14 @@ public final class MetalVideoPresenter {
     /// Drain the staged HDR grade and apply it. RENDER THREAD (or `reconcileLayer`'s caller):
     /// idempotent, so every present path can call it and the first one to run wins. Every path
     /// must — a stream whose path skipped it tone-maps against the bare reference-white anchor
-    /// with no mastering volume for the whole session.
+    /// with no mastering volume for the whole session. The host repeats the grade on every
+    /// keyframe (every PyroWave frame); an unchanged one leaves the layer alone.
     private func applyStagedHdrMeta() {
         stagingLock.lock()
         let newHdrMeta = pendingHdrMeta
         pendingHdrMeta = nil
         stagingLock.unlock()
-        guard let newHdrMeta else { return }
+        guard let newHdrMeta, newHdrMeta != lastHdrMeta else { return }
         lastHdrMeta = newHdrMeta
         // tvOS has no edrMetadata — the cached grade still matters for a later flip's
         // configureColor. macOS/iOS refine the live tone-map now.
@@ -939,9 +775,7 @@ public final class MetalVideoPresenter {
         stagingLock.lock()
         let targetFromLayout = drawableTarget
         stagingLock.unlock()
-        // A PQ (HDR) pyrowave stream drives the same layer/EDR machinery as the biplanar path —
-        // including macOS windowed sessions, which keep real HDR (the DCP mitigation is the
-        // transactional present in `encodePresent`, not a colour downgrade).
+        // A PQ (HDR) pyrowave stream drives the same layer/EDR machinery as the biplanar path.
         configure(hdr: planes.pq)
         applyStagedHdrMeta()
         var csc = planes.csc
@@ -999,36 +833,6 @@ public final class MetalVideoPresenter {
         #if DEBUG
         logSizeIfChanged(decoded: decodedSize, drawable: targetSize)
         #endif
-        #if os(macOS)
-        // Windowed (composited) → the DCP swapID-panic mitigation mechanism (see
-        // `WindowedPresentMode`). Toggle the layer property BEFORE vending a drawable so the
-        // vend matches how it will be presented; drained here on the render thread, flipped
-        // exactly once per mode change.
-        stagingLock.lock()
-        let windowedMode = windowedPresentStaged
-        stagingLock.unlock()
-        if windowedMode != windowedPresentActive {
-            windowedPresentActive = windowedMode
-            layer.presentsWithTransaction = windowedMode == .transaction
-            if windowedMode != .surface, !surfacePool.isEmpty {
-                // Leaving surface mode (fullscreen entry / mechanism A/B): drop the pool — at 5K
-                // it holds >100 MB, and re-entering rebuilds it in one frame. SessionPresenter
-                // clears the surface layer's contents on main.
-                surfacePool.removeAll()
-                surfacePoolSize = .zero
-                lastHandedOff = nil
-            }
-            presenterLog.info(
-                "stage2: windowed present mode \(windowedMode.rawValue, privacy: .public) (DCP swapID-panic mitigation)")
-        }
-        if windowedMode == .surface {
-            // No image queue at all: render into a pooled IOSurface and swap it into the
-            // sibling layer's contents. The drawable/queue tail below never runs.
-            return encodeToSurface(
-                targetSize: targetSize, pipeline: pipeline, onPresented: onPresented,
-                luma: luma, keepAlive: keepAlive, bind: bind)
-        }
-        #endif
         if let providedDrawable,
            providedDrawable.texture.pixelFormat != layer.pixelFormat {
             return false // config outran the vend (HDR flip) — next vend has the new format
@@ -1074,37 +878,6 @@ public final class MetalVideoPresenter {
         }
         // Keep the bound sources alive until the GPU finishes sampling (see the callers).
         commandBuffer.addCompletedHandler { _ in _ = keepAlive }
-        #if os(macOS)
-        if windowedPresentActive == .transaction {
-            // A runloop-less render thread must flush its explicit transaction: layer mutations
-            // otherwise keep the present inside an uncommitted implicit transaction and retain every
-            // drawable. The main-thread A/B commits on its runloop instead. Transactions own pacing.
-            commandBuffer.commit()
-            let schedStart = CACurrentMediaTime()
-            commandBuffer.waitUntilScheduled()
-            let schedMs = (CACurrentMediaTime() - schedStart) * 1000
-            let commitStart = CACurrentMediaTime()
-            if txnPresentOnMain {
-                let presentedDrawable = drawable
-                DispatchQueue.main.async {
-                    CATransaction.begin()
-                    CATransaction.setDisableActions(true)
-                    presentedDrawable.present()
-                    CATransaction.commit()
-                }
-            } else {
-                CATransaction.begin()
-                CATransaction.setDisableActions(true)
-                drawable.present()
-                CATransaction.commit()
-                CATransaction.flush()
-            }
-            windowedDiag.record(
-                schedMs: schedMs, commitMs: (CACurrentMediaTime() - commitStart) * 1000,
-                mode: .transaction)
-            return true
-        }
-        #endif
         // An absolute link target is the fixed-grid path; without one, present when the GPU finishes.
         if let presentAtMediaTime {
             commandBuffer.present(drawable, atTime: presentAtMediaTime)
@@ -1114,173 +887,6 @@ public final class MetalVideoPresenter {
         commandBuffer.commit()
         return true
     }
-
-    #if os(macOS)
-    /// The WINDOWED `surface` present tail (see `WindowedPresentMode.surface`): render with the
-    /// same per-frame pipeline into a pooled IOSurface and hand it to `surfaceLayer.contents`
-    /// from the command buffer's COMPLETION handler, inside an explicit CATransaction + flush
-    /// (the same off-main commit discipline as the transactional present — an ordinary
-    /// damaged-layer update on WindowServer's own composite cadence, no image queue anywhere).
-    /// RENDER THREAD. `onPresented` is stamped right after the contents swap commits — the
-    /// closest observable analogue of "reached glass" here (the composite follows within a
-    /// refresh, so the display-stage meters read slightly OPTIMISTIC in this mode).
-    ///
-    /// The pool tracks the layer's depth: bgra8 or `sdr10Drawable` for SDR, rgba16Float tagged
-    /// BT.2100 PQ for HDR — `configure` already ran, so the caller's `pipeline` attachment
-    /// format always matches.
-    /// HDR OPEN RISK (why this whole mode is a prototype): whether the compositor honors the
-    /// PQ tag + EDR for plain-CALayer IOSurface contents needs an on-glass eyeball; the metal
-    /// layer underneath keeps `wantsExtendedDynamicRangeContent` as the EDR anchor (the harness
-    /// measured the display's EDR headroom engaging with this arrangement).
-    private func encodeToSurface(
-        targetSize: CGSize, pipeline: MTLRenderPipelineState,
-        onPresented: ((Int64?) -> Void)?,
-        luma: MTLTexture, keepAlive: [Any], bind: (MTLRenderCommandEncoder) -> Void
-    ) -> Bool {
-        ensureSurfacePool(
-            size: targetSize, depth: hdrActive ? .hdr : (tenBitSDRActive ? .sdr10 : .sdr8))
-        guard let slotIndex = takeSurfaceSlot(),
-              let commandBuffer = queue.makeCommandBuffer()
-        else { return false }
-        let slot = surfacePool[slotIndex]
-        let (lumaTexture, uvRects) = lumaForTarget(
-            luma, target: slot.texture, commandBuffer: commandBuffer)
-        var rects = uvRects
-
-        let pass = MTLRenderPassDescriptor()
-        pass.colorAttachments[0].texture = slot.texture
-        pass.colorAttachments[0].loadAction = .clear
-        pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
-        pass.colorAttachments[0].storeAction = .store
-        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
-            return false
-        }
-        encoder.setRenderPipelineState(pipeline)
-        encoder.setFragmentTexture(lumaTexture, index: 0)
-        encoder.setVertexBytes(&rects, length: MemoryLayout<UvRects>.stride, index: 0)
-        bind(encoder)
-        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-        encoder.endEncoding()
-        let surface = slot.surface
-        let surfaceLayer = surfaceLayer // captured directly — the handler must not retain self
-        let diag = windowedDiag
-        let epoch = surfaceEpoch
-        let epochAtCommit = epoch.current()
-        let commitStamp = CACurrentMediaTime()
-        commandBuffer.addCompletedHandler { _ in
-            _ = keepAlive // sources pinned until the GPU finished sampling
-            // The present target moved on while this was in flight (fullscreen entry clears the
-            // layer) — writing now would restore a frame nobody is going to replace.
-            guard epoch.isCurrent(epochAtCommit) else { return }
-            let completedAt = CACurrentMediaTime()
-            // Swap on THIS Metal completion thread: explicit transaction + flush, so the commit
-            // reaches the render server now, independent of main (completion handlers for one
-            // queue fire in execution order, so swaps can't reorder).
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            surfaceLayer.contents = surface
-            CATransaction.commit()
-            CATransaction.flush()
-            diag.record(
-                schedMs: (completedAt - commitStamp) * 1000,
-                commitMs: (CACurrentMediaTime() - completedAt) * 1000, mode: .surface)
-            onPresented?(Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: CACurrentMediaTime()))
-        }
-        commandBuffer.commit()
-        lastHandedOff = slotIndex
-        return true
-    }
-
-    /// IOSurface and Metal formats that share one word. Metal `bgr10a2Unorm` is IOSurface `l10r`
-    /// (`ARGB2101010LEPacked`): alpha in the top two bits, then R, G, B down to bit 0.
-    private static func surfaceFormats(_ depth: SurfaceDepth) -> (OSType, MTLPixelFormat) {
-        switch depth {
-        case .hdr: return (kCVPixelFormatType_64RGBAHalf, .rgba16Float)
-        case .sdr8: return (kCVPixelFormatType_32BGRA, .bgra8Unorm)
-        case .sdr10:
-            return sdr10Drawable == .bgra8Unorm
-                ? (kCVPixelFormatType_32BGRA, .bgra8Unorm)
-                : (kCVPixelFormatType_ARGB2101010LEPacked, sdr10Drawable)
-        }
-    }
-
-    /// (Re)build the pool at `size`/`depth` — 4 IOSurface render targets (one on glass, one
-    /// committed in CA, one rendering, one spare). RENDER THREAD. A failed allocation leaves the
-    /// pool empty; the caller returns false and the ring's putBack + display-link retry take
-    /// over.
-    private func ensureSurfacePool(size: CGSize, depth: SurfaceDepth) {
-        guard size != surfacePoolSize || depth != surfacePoolDepth else { return }
-        surfacePool.removeAll()
-        lastHandedOff = nil
-        let w = Int(size.width)
-        let h = Int(size.height)
-        guard w > 0, h > 0 else { return }
-        let hdr = depth == .hdr
-        // rgba16Float (8 B/px) carries the PQ-encoded HDR samples; the SDR formats are 4 B/px.
-        // 256-byte row alignment satisfies both IOSurface and Metal linear-texture rules.
-        let (surfaceFormat, textureFormat) = Self.surfaceFormats(depth)
-        let bytesPerElement = hdr ? 8 : 4
-        let bytesPerRow = ((w * bytesPerElement) + 255) & ~255
-        let props: [String: Any] = [
-            kIOSurfaceWidth as String: w,
-            kIOSurfaceHeight as String: h,
-            kIOSurfaceBytesPerElement as String: bytesPerElement,
-            kIOSurfaceBytesPerRow as String: bytesPerRow,
-            kIOSurfacePixelFormat as String: surfaceFormat,
-        ]
-        let desc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: textureFormat, width: w, height: h, mipmapped: false)
-        desc.usage = [.renderTarget]
-        desc.storageMode = .shared
-        for _ in 0..<4 {
-            guard let surface = IOSurfaceCreate(props as CFDictionary),
-                  let texture = device.makeTexture(descriptor: desc, iosurface: surface, plane: 0)
-            else {
-                // Leave the key UNSET so the next frame retries. Recording it up front latched a
-                // single failed allocation (memory pressure at 5K) as "this size is built", and
-                // every later frame short-circuited on the guard above — the picture froze for the
-                // session while audio and input stayed live.
-                surfacePool.removeAll()
-                return
-            }
-            // Tag the surface like the metal layer (BT.2100 PQ, or `sdrColorspace`), so the
-            // compositor colour-matches the contents instead of drawing them in the panel's space.
-            let space = hdr ? CGColorSpace(name: CGColorSpace.itur_2100_PQ) : sdrColorspace
-            if let name = space?.name {
-                IOSurfaceSetValue(surface, "IOSurfaceColorSpace" as CFString, name)
-            }
-            surfacePool.append(SurfaceSlot(surface: surface, texture: texture))
-        }
-        // Only now is this size actually built.
-        surfacePoolSize = size
-        surfacePoolDepth = depth
-        // The EDR request rides the SURFACE layer too (its contents are what composite); the
-        // metal layer underneath keeps its own from configureColor as the anchor. Layer flags
-        // are committed by the next swap's transaction flush.
-        surfaceLayer.wantsExtendedDynamicRangeContent = hdr
-    }
-
-    /// Pick the slot to render into: never the one just handed to the layer (the compositor may
-    /// still scan it), prefer surfaces the window server isn't holding (`IOSurfaceIsInUse`), and
-    /// among those the least recently rendered. Falls back to the LRU busy slot rather than
-    /// stalling — a visible glitch at worst, never a queue-up. RENDER THREAD.
-    private func takeSurfaceSlot() -> Int? {
-        guard !surfacePool.isEmpty else { return nil }
-        var free: Int?
-        var busy: Int?
-        for i in surfacePool.indices where i != lastHandedOff {
-            if !IOSurfaceIsInUse(surfacePool[i].surface) {
-                if free == nil || surfacePool[i].seq < surfacePool[free!].seq { free = i }
-            } else {
-                if busy == nil || surfacePool[i].seq < surfacePool[busy!].seq { busy = i }
-            }
-        }
-        guard let pick = free ?? busy else { return nil }
-        surfaceSeq += 1
-        surfacePool[pick].seq = surfaceSeq
-        return pick
-    }
-    #endif
 
     /// Luma to bind for a draw into `target`, with the UV rects that sample it. The plane itself
     /// when the visible region is not larger than the target; otherwise that region Lanczos-scaled

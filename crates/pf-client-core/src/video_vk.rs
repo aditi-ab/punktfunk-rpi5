@@ -106,8 +106,8 @@ pub struct VulkanDecodeDevice {
     /// Vulkan Video decode is usable (queue + extensions + features). The bundle
     /// exists without it; gate the Vulkan rung on this, not on `Some`.
     pub video_decode: bool,
-    /// Real present timing (`VK_KHR_present_wait`). Gates `CLIENT_CAP_PHASE_LOCK`:
-    /// without a latch stamp the desktop must not claim the cap.
+    /// Real present timing (`VK_KHR_present_wait`): the presenter has on-glass latch
+    /// stamps. A client may claim `CLIENT_CAP_PHASE_LOCK` only with this set.
     pub present_timing: bool,
     /// PyroWave decode is usable (Vulkan 1.3 + `shaderInt16` / 8-bit storage /
     /// subgroup size control). Gates the `CODEC_PYROWAVE` advertisement.
@@ -127,6 +127,9 @@ pub struct VulkanDecodeDevice {
     pub d3d11_import: bool,
     /// Presenter enabled Linux dma-buf import. Always `false` off Linux.
     pub dmabuf_import: bool,
+    /// The presenter's VAAPI node decodes AV1 where its Vulkan does not
+    /// (`video::vaapi_av1_decodable`). Always `false` off Linux.
+    pub vaapi_av1_decode: bool,
     /// Presenter can import RGB10A2 and offers an HDR10 swapchain, so D3D11VA
     /// emits PQ pass-through instead of tonemapping to sRGB. Always `false` off Windows.
     pub d3d11_hdr10: bool,

@@ -1,9 +1,18 @@
 package io.unom.punktfunk
 
 import android.os.Build
+import android.os.SystemClock
 import android.view.InputDevice
 import android.view.MotionEvent
+import androidx.annotation.RequiresApi
 import io.unom.punktfunk.kit.NativeBridge
+import io.unom.punktfunk.kit.isExternalDevice
+
+/** How long after a mouse Back edge a system Back is that button's own echo. */
+private const val BACK_ECHO_MS = 300L
+
+/** How long after the capture-engaging DOWN its own BUTTON_PRESS may still arrive. */
+private const val ENGAGE_PRESS_MS = 100L
 
 /** True when any connected input device is a pointer (USB/BT mouse, or a touchpad driving one). */
 fun hasPhysicalMouse(): Boolean = InputDevice.getDeviceIds().any { id ->
@@ -17,10 +26,6 @@ fun hasPhysicalKeyboard(): Boolean = InputDevice.getDeviceIds().any { id ->
     } == true
 }
 
-/** Below API 29 there is no `isExternal`; built-in keys and the nav bar carry no vendor id. */
-fun InputDevice.isExternalDevice(): Boolean =
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) isExternal else vendorId != 0
-
 /**
  * Whether a BACK/FORWARD key is a mouse side button, sent to the host as X1/X2, rather than the
  * quick-action ring's Back. Plain facts in, so the rule is tested ([MouseSideKeyTest]).
@@ -32,8 +37,9 @@ fun InputDevice.isExternalDevice(): Boolean =
  *
  * A side button the system maps to Back (One UI 8 does, with no setting) never reaches us as a
  * button: Android injects a Back key from a virtual device of its own, stamped like the nav
- * bar's. The Back gesture takes the newer dispatch path and is no key at all, so with a mouse
- * attached a Back from no external device is the mouse's.
+ * bar's. From Android 16 the Back gesture takes the predictive dispatch path and is no key at
+ * all, so with a mouse attached a Back from no external device is the mouse's. Before that
+ * ([gestureIsKey]) the gesture and the nav bar send that same key, and it stays the ring's.
  */
 fun isMouseSideKey(
     tv: Boolean,
@@ -43,9 +49,10 @@ fun isMouseSideKey(
     mouse: Boolean,
     dpad: Boolean,
     mousePresent: Boolean = false,
+    gestureIsKey: Boolean = false,
 ): Boolean = when {
     fallback || pad -> false
-    !external -> mousePresent && !tv
+    !external -> mousePresent && !tv && !gestureIsKey
     !tv -> true
     else -> mouse && !dpad
 }
@@ -126,6 +133,10 @@ class MouseForwarder(
     /** Chord-released: no auto re-engage (start / click) until the user opts back in. */
     private var userReleased = false
 
+    /** The quick-action ring is up: the mouse is the ring's, uncaptured, and forwards nothing. */
+    private var suspended = false
+    private var regrabAfterSuspend = false
+
     private val heldButtons = mutableSetOf<Int>()
     private val scrollNorm = ScrollNormalizer()
     private var moveAccX = 0f
@@ -133,13 +144,28 @@ class MouseForwarder(
 
     /** Uncaptured mouse events on the TOUCH stream (position while a button is down). */
     fun onTouchEvent(ev: MotionEvent): Boolean {
+        if (suspended) return false // the ring's clickable slots take it
         if (!pointerGranted) return true // inert: consumed over the stream, nothing forwards
+        // An Android 14+ touchpad reports its gestures as a fake finger on this stream: two-finger
+        // scroll carries its distance on the gesture axes, a pinch is not the host's. Neither is
+        // pointer motion, and neither engages capture.
+        if (Build.VERSION.SDK_INT >= 34) {
+            when (ev.classification) {
+                MotionEvent.CLASSIFICATION_TWO_FINGER_SWIPE -> {
+                    gestureScroll(ev)
+                    return true
+                }
+                MotionEvent.CLASSIFICATION_PINCH -> return true
+            }
+        }
         when (ev.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 if (captureWanted && !captured && !userReleased) {
                     // The engaging click: grab the pointer and swallow the click (desktop
-                    // parity — the click that captures never reaches the host). The paired
-                    // BUTTON_RELEASE is dropped by the held-set guard in [button].
+                    // parity — the click that captures never reaches the host). Its
+                    // BUTTON_PRESS follows as its own event and is dropped in [press]; the
+                    // paired BUTTON_RELEASE falls to the held-set guard.
+                    engageClickAt = SystemClock.uptimeMillis()
                     onRequestCapture?.invoke()
                     return true
                 }
@@ -155,6 +181,7 @@ class MouseForwarder(
 
     /** Uncaptured mouse events on the GENERIC stream (hover motion, wheel, button edges). */
     fun onGenericMotion(ev: MotionEvent): Boolean {
+        if (suspended) return false
         if (!pointerGranted) return true // inert: consumed over the stream, nothing forwards
         when (ev.actionMasked) {
             MotionEvent.ACTION_HOVER_MOVE -> sendAbs(ev)
@@ -168,43 +195,54 @@ class MouseForwarder(
     }
 
     /**
-     * Captured-pointer events (the view holds [android.view.View.requestPointerCapture]): x/y ARE
-     * the relative deltas ([InputDevice.SOURCE_MOUSE_RELATIVE]), batched samples included. A
-     * captured touchpad reports absolute finger coordinates instead — not handled (the touch
-     * gesture layer is the touchpad story); returning false leaves those to the framework.
+     * Captured-pointer events (the view holds [android.view.View.requestPointerCapture]). A mouse
+     * reports [InputDevice.SOURCE_MOUSE_RELATIVE], its x/y ARE the deltas, and DOWN/UP carry that
+     * report's motion too. A touchpad reports [InputDevice.SOURCE_TOUCHPAD] with absolute finger
+     * positions; one finger moves by its [MotionEvent.AXIS_RELATIVE_X]/Y, and its clicks are
+     * buttons. Batched samples are included either way.
      */
     fun onCapturedPointer(ev: MotionEvent): Boolean {
-        if (!pointerGranted) return true // a revocation is racing the release of the grab
-        if (ev.actionMasked == MotionEvent.ACTION_SCROLL && ev.isFromSource(InputDevice.SOURCE_TOUCHPAD)) {
-            wheel(ev)
+        // A revocation or the ring is racing the release of the grab.
+        if (!pointerGranted || suspended) return true
+        if (ev.isFromSource(InputDevice.SOURCE_TOUCHPAD)) {
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_SCROLL -> wheel(ev)
+                MotionEvent.ACTION_MOVE -> if (ev.pointerCount == 1) {
+                    moveBy(ev, MotionEvent.AXIS_RELATIVE_X, MotionEvent.AXIS_RELATIVE_Y)
+                }
+                MotionEvent.ACTION_BUTTON_PRESS -> button(ev.actionButton, true)
+                MotionEvent.ACTION_BUTTON_RELEASE -> button(ev.actionButton, false)
+            }
             return true
         }
         if (!ev.isFromSource(InputDevice.SOURCE_MOUSE_RELATIVE)) return false
         when (ev.actionMasked) {
-            MotionEvent.ACTION_MOVE -> {
-                var dx = 0f
-                var dy = 0f
-                for (i in 0 until ev.historySize) {
-                    dx += ev.getHistoricalX(i)
-                    dy += ev.getHistoricalY(i)
-                }
-                dx += ev.x
-                dy += ev.y
-                moveAccX += dx
-                moveAccY += dy
-                val ox = moveAccX.toInt() // truncate toward zero — sub-pixel remainder kept w/ sign
-                val oy = moveAccY.toInt()
-                if (ox != 0 || oy != 0) {
-                    NativeBridge.nativeSendPointerMove(handle, ox, oy)
-                    moveAccX -= ox
-                    moveAccY -= oy
-                }
-            }
+            MotionEvent.ACTION_MOVE, MotionEvent.ACTION_DOWN, MotionEvent.ACTION_UP ->
+                moveBy(ev, MotionEvent.AXIS_X, MotionEvent.AXIS_Y)
             MotionEvent.ACTION_BUTTON_PRESS -> button(ev.actionButton, true)
             MotionEvent.ACTION_BUTTON_RELEASE -> button(ev.actionButton, false)
             MotionEvent.ACTION_SCROLL -> wheel(ev)
         }
         return true
+    }
+
+    /** Relative motion off `ev`'s [axisX]/[axisY], history included, whole pixels only. */
+    private fun moveBy(ev: MotionEvent, axisX: Int, axisY: Int) {
+        var dx = ev.getAxisValue(axisX)
+        var dy = ev.getAxisValue(axisY)
+        for (i in 0 until ev.historySize) {
+            dx += ev.getHistoricalAxisValue(axisX, i)
+            dy += ev.getHistoricalAxisValue(axisY, i)
+        }
+        moveAccX += dx
+        moveAccY += dy
+        val ox = moveAccX.toInt() // truncate toward zero — sub-pixel remainder kept w/ sign
+        val oy = moveAccY.toInt()
+        if (ox != 0 || oy != 0) {
+            NativeBridge.nativeSendPointerMove(handle, ox, oy)
+            moveAccX -= ox
+            moveAccY -= oy
+        }
     }
 
     /** Ctrl+Alt+Shift+Q: release the grab, or (re-)engage it — works even when auto-capture is off. */
@@ -232,6 +270,20 @@ class MouseForwarder(
         if (!has) flushButtons()
     }
 
+    /** The ring opens (`true`) or closes: lift what is held, hand the pointer to it, take it back. */
+    fun setSuspended(on: Boolean) {
+        if (on == suspended) return
+        suspended = on
+        if (on) {
+            flushButtons()
+            regrabAfterSuspend = captured
+            if (captured) onReleaseCapture?.invoke()
+        } else if (regrabAfterSuspend) {
+            regrabAfterSuspend = false
+            if (pointerGranted) onRequestCapture?.invoke()
+        }
+    }
+
     /** Stream teardown: lift anything held and let the grab go. */
     fun release() {
         flushButtons()
@@ -243,6 +295,29 @@ class MouseForwarder(
         // edge is the honest answer for it.
         val (x, y, w, h) = frameAt(ev.x, ev.y) ?: return
         NativeBridge.nativeSendPointerAbs(handle, x, y, w, h)
+    }
+
+    /**
+     * One two-finger swipe sample, batched history included. The gesture axes hold the negated
+     * finger travel in pixels (AOSP `GestureConverter`): fingers up is a positive Y distance,
+     * the content scrolling down, so the wheel's vertical sign flips and its horizontal does not.
+     */
+    @RequiresApi(34)
+    private fun gestureScroll(ev: MotionEvent) {
+        if (ev.actionMasked != MotionEvent.ACTION_MOVE) return
+        val axes = MotionEvent.AXIS_GESTURE_SCROLL_X_DISTANCE to MotionEvent.AXIS_GESTURE_SCROLL_Y_DISTANCE
+        var dx = ev.getAxisValue(axes.first)
+        var dy = ev.getAxisValue(axes.second)
+        for (i in 0 until ev.historySize) {
+            dx += ev.getHistoricalAxisValue(axes.first, i)
+            dy += ev.getHistoricalAxisValue(axes.second, i)
+        }
+        listOfNotNull(
+            scrollNorm.event(ScrollWire.SOURCE_FINGER, ScrollWire.PHASE_NONE, ScrollWire.AXIS_VERTICAL, -dy / density.toDouble()),
+            scrollNorm.event(ScrollWire.SOURCE_FINGER, ScrollWire.PHASE_NONE, ScrollWire.AXIS_HORIZONTAL, dx / density.toDouble()),
+        ).forEach {
+            NativeBridge.nativeSendNormalizedScroll(handle, it.axis, it.delta, it.source, it.phase)
+        }
     }
 
     private fun wheel(ev: MotionEvent) {
@@ -290,7 +365,25 @@ class MouseForwarder(
         press(b, down)
     }
 
+    /** When the last mouse Back edge went to the host ([SystemClock.uptimeMillis]). */
+    @Volatile
+    private var lastBackAt = 0L
+
+    /**
+     * Android 16+ also turns a mouse's Back button into a system Back, which reaches the ring's
+     * BackHandler right after the edge already went to the host as X1: that Back is the mouse's.
+     */
+    fun backIsMouseEcho(): Boolean = SystemClock.uptimeMillis() - lastBackAt < BACK_ECHO_MS
+
+    /** When a primary DOWN engaged capture; its own BUTTON_PRESS follows within [ENGAGE_PRESS_MS]. */
+    private var engageClickAt = 0L
+
     private fun press(b: Int, down: Boolean) {
+        if (b == 1 && down && SystemClock.uptimeMillis() - engageClickAt < ENGAGE_PRESS_MS) {
+            engageClickAt = 0L
+            return
+        }
+        if (b == 4) lastBackAt = SystemClock.uptimeMillis()
         if (down) {
             // add() is false when the button is already held — the second delivery of a button
             // this device reports on two paths at once. Sending the down again would double-press

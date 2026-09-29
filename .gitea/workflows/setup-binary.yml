@@ -18,12 +18,16 @@ on:
     tags: ['v*']
     paths:
       - crates/punktfunk-setup/**
+      - crates/pf-host-config/**
+      - crates/pf-paths/**
       - data/platforms.json
       - Cargo.lock
       - .gitea/workflows/setup-binary.yml
   pull_request:
     paths:
       - crates/punktfunk-setup/**
+      - crates/pf-host-config/**
+      - crates/pf-paths/**
       - data/platforms.json
       - Cargo.lock
       - .gitea/workflows/setup-binary.yml
@@ -84,7 +88,7 @@ jobs:
         if: matrix.arch == 'x86_64'
         run: ./punktfunk-setup_${{ matrix.arch }} --help | grep -q 'PUNKTFUNK_INSTALL_OMARCHY_SETUP'
       # v3: Gitea's API rejects upload-artifact@v4 (see apple.yml). Download is a zip.
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@ff15f0306b3f739f7b6fd43fb5d26cd321bd4de5 # v3
         with:
           name: punktfunk-setup-${{ matrix.arch }}
           path: |

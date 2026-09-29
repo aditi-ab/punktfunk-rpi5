@@ -9,9 +9,13 @@
 //! runs so the shell and session windows group as one taskbar app. Packaged
 //! processes already share MSIX identity; overriding it detaches the Start-menu
 //! pin, so they are left alone.
+//!
+//! [`window_monitor`] names the monitor the window is on, the key the HDR volume
+//! lookup matches DXGI outputs against.
 
 use windows_sys::core::w;
 use windows_sys::Win32::Foundation::{APPMODEL_ERROR_NO_PACKAGE, HWND, LPARAM, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
 use windows_sys::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
@@ -37,20 +41,35 @@ pub(crate) fn set_app_user_model_id() {
     }
 }
 
-/// Resource ordinal 1 onto this HWND. No-op when the exe embeds no icon.
-pub(crate) fn stamp_window_icon(window: &sdl3::video::Window) {
-    // SAFETY: the SDL property lookups return the `HWND` SDL itself owns for this live `window`
-    // borrow; the icon calls only pass that handle and a resource ordinal back to Win32, and every
-    // result is checked before use.
-    unsafe {
-        let hwnd: HWND = sdl3::sys::properties::SDL_GetPointerProperty(
+/// The `HWND` SDL owns for this window; `None` before SDL has created it.
+fn window_hwnd(window: &sdl3::video::Window) -> Option<HWND> {
+    // SAFETY: the SDL property lookups only read the live `window` borrow's property set.
+    let hwnd = unsafe {
+        sdl3::sys::properties::SDL_GetPointerProperty(
             sdl3::sys::video::SDL_GetWindowProperties(window.raw()),
             sdl3::sys::video::SDL_PROP_WINDOW_WIN32_HWND_POINTER,
             std::ptr::null_mut(),
-        ) as HWND;
-        if hwnd.is_null() {
-            return;
-        }
+        )
+    } as HWND;
+    (!hwnd.is_null()).then_some(hwnd)
+}
+
+/// The `HMONITOR` holding most of the window, as an integer for the DXGI output match.
+pub(crate) fn window_monitor(window: &sdl3::video::Window) -> Option<isize> {
+    let hwnd = window_hwnd(window)?;
+    // SAFETY: `hwnd` is SDL's live handle; the call only reads it and returns a monitor handle.
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    (!monitor.is_null()).then_some(monitor as isize)
+}
+
+/// Resource ordinal 1 onto this HWND. No-op when the exe embeds no icon.
+pub(crate) fn stamp_window_icon(window: &sdl3::video::Window) {
+    let Some(hwnd) = window_hwnd(window) else {
+        return;
+    };
+    // SAFETY: `hwnd` is the handle SDL owns for this live `window` borrow; the icon calls only
+    // pass that handle and a resource ordinal back to Win32, and every result is checked before use.
+    unsafe {
         let module = GetModuleHandleW(std::ptr::null());
         for (which, metric) in [(ICON_SMALL, SM_CXSMICON), (ICON_BIG, SM_CXICON)] {
             let px = GetSystemMetrics(metric);

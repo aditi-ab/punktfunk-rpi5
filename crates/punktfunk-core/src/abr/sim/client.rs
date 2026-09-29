@@ -9,18 +9,11 @@ use super::host::{probe_chunk_bytes, Frame, FrameShape, ProbeDone, SHARD_WIRE_OV
 use super::link::LossDraw;
 use super::Rng;
 use crate::abr::{Driver, DriverConfig, ProbeReport};
-use crate::client::FLUSH_COOLDOWN;
+use crate::client::frame_channel::JumpToLive;
 use crate::stats::Stats;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-/// Jump-to-live's thresholds (`client/frame_channel.rs`, private there):
-/// delay past `FLUSH_LATENCY` held for `FLUSH_AFTER`, or `QUEUE_HIGH` frames
-/// of decode backlog held for `STANDING_TIME`.
-const FLUSH_LATENCY_MS: u64 = 400;
-const FLUSH_AFTER_MS: u64 = 250;
-const QUEUE_HIGH: u32 = 6;
-const STANDING_MS: u64 = 250;
 /// The webOS client's recovery throttle: one ask per 100 ms until a keyframe
 /// lands.
 const KEYFRAME_ASK_MS: u64 = 100;
@@ -33,6 +26,28 @@ pub(super) const PROBE_FRAME: u32 = u32::MAX;
 /// Stall the client reports with a host pipeline rebuild. ABR only logs it;
 /// what the rebuild costs is the discarded window and the lost reference.
 const REBUILD_GAP_MS: u32 = 400;
+/// Most shards past parity a NACK asks for (`design/loss-repair-nack-ack.md` D2).
+const NACK_MAX_BEYOND: u32 = 2;
+/// The acked chain stays engaged this long after the last loss (D5).
+const ACK_HOLD_MS: u64 = 10_000;
+/// Frames back an acked reference can reach: Vulkan Video's DPB. Past it the
+/// encoder falls back to the plain chain.
+const ACK_REACH_FRAMES: u64 = 8;
+
+/// What the client does with a frame its parity could not close.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum Repair {
+    /// Today: the frame is lost and the client asks until a recovery frame lands.
+    #[default]
+    Rfi,
+    /// A frame at most [`NACK_MAX_BEYOND`] short, on a round trip inside one
+    /// frame period, gets the shards resent and completes a round trip later.
+    /// Anything else falls to [`Repair::Rfi`].
+    Nack,
+    /// While the link has shown loss the encoder references only acknowledged
+    /// frames, so a lost frame is skipped: still dropped, but nothing is asked.
+    Ack,
+}
 
 /// Decode latency: a floor plus a rise past the rate the decoder is happy at.
 #[derive(Clone, Copy, Debug, Default)]
@@ -76,6 +91,7 @@ pub(super) struct ClientCfg {
     /// bring-up ramp as a fit check on it — a measured wall lowers it once,
     /// every other outcome leaves it, and no controller runs either way.
     pub pin_kbps: Option<u32>,
+    pub repair: Repair,
 }
 
 impl Default for ClientCfg {
@@ -96,6 +112,7 @@ impl Default for ClientCfg {
             rebuild_at_ms: None,
             automatic: true,
             pin_kbps: None,
+            repair: Repair::Rfi,
         }
     }
 }
@@ -183,10 +200,12 @@ pub(super) struct Client {
     /// Unrecoverable frames since the last window closed. The host's adaptive
     /// FEC is told; on the real wire the keyframe ask tells it.
     lost_frames: u64,
-    /// Jump-to-live detectors and their shared cooldown.
-    owd_over_since: Option<u64>,
-    queue_over_since: Option<u64>,
-    last_flush_ms: Option<u64>,
+    /// Bytes NACK resends put on the wire past the budget.
+    pub(super) resent_bytes: u64,
+    /// When a frame last lost a shard: what keeps the acked chain engaged.
+    loss_seen_ms: Option<u64>,
+    /// The client's own jump-to-live rule.
+    jump: JumpToLive,
     decode_free_at_ms: u64,
     /// Keyframe throttle: asking until an IDR lands.
     awaiting_idr: bool,
@@ -257,9 +276,9 @@ impl Client {
             lost_blocks: Vec::new(),
             stats: Stats::default(),
             lost_frames: 0,
-            owd_over_since: None,
-            queue_over_since: None,
-            last_flush_ms: None,
+            resent_bytes: 0,
+            loss_seen_ms: None,
+            jump: JumpToLive::new(),
             decode_free_at_ms: 0,
             awaiting_idr: false,
             kf_next_ms: 0,
@@ -296,6 +315,11 @@ impl Client {
     /// `false` = an explicit bitrate, which the governor never touches.
     pub(super) fn automatic(&self) -> bool {
         self.cfg.automatic
+    }
+
+    /// Frames this session could not decode, over the whole run.
+    pub(super) fn frames_dropped(&self) -> u64 {
+        self.stats.frames_dropped
     }
 
     /// Make the next frame unrecoverable, whatever the link does.
@@ -356,8 +380,12 @@ impl Client {
         tail
     }
 
-    /// Close one frame: repair what parity covers, count the rest.
-    pub(super) fn complete(&mut self, frame: u32, draw: LossDraw, now_ms: u64) {
+    /// Close one frame: repair what parity covers, then what [`Repair`] can,
+    /// and count the rest. `rtt_ms` is the link's round trip right now.
+    ///
+    /// The NACK model resends only what closes the gap, and neither loses the
+    /// resend nor holds the frames behind it: an upper bound on what a NACK buys.
+    pub(super) fn complete(&mut self, frame: u32, draw: LossDraw, now_ms: u64, rtt_ms: u64) {
         let Some(pos) = self.flight.iter().position(|f| f.id == frame) else {
             return;
         };
@@ -390,25 +418,53 @@ impl Client {
             lost += 1;
         }
         let mut repaired = 0u32;
+        let mut beyond = 0u32;
         let mut unrecoverable = f.forced;
         for (b, &lost_b) in self.lost_blocks.iter().enumerate() {
             if lost_b == 0 {
                 continue;
             }
-            if lost_b <= f.shape.parity_of(b as u32) {
+            let parity = f.shape.parity_of(b as u32);
+            if lost_b <= parity {
                 repaired += lost_b;
             } else {
                 unrecoverable = true;
+                beyond += lost_b - parity;
             }
         }
-        let arrived = shards.saturating_sub(lost.min(shards));
+        let mut arrived = shards.saturating_sub(lost.min(shards));
+        let period_ms = 1_000 / u64::from(self.cfg.refresh_hz.max(1));
+        // Loss before this frame is what had the encoder on the acked chain.
+        let engaged = self
+            .loss_seen_ms
+            .is_some_and(|t| now_ms.saturating_sub(t) <= ACK_HOLD_MS);
+        if lost > 0 {
+            self.loss_seen_ms = Some(now_ms);
+        }
+        let mut now_ms = now_ms;
+        let mut skipped = false;
+        if unrecoverable && !f.forced {
+            match self.cfg.repair {
+                Repair::Nack if beyond <= NACK_MAX_BEYOND && rtt_ms <= period_ms => {
+                    unrecoverable = false;
+                    repaired = lost;
+                    arrived += beyond;
+                    self.resent_bytes += u64::from(beyond) * shard_wire;
+                    now_ms += rtt_ms;
+                }
+                Repair::Ack => {
+                    skipped = engaged && rtt_ms <= ACK_REACH_FRAMES * period_ms;
+                }
+                _ => {}
+            }
+        }
         self.stats.packets_received += u64::from(arrived);
         self.stats.bytes_received += u64::from(arrived) * shard_wire;
         self.stats.fec_recovered_shards += u64::from(repaired);
         if unrecoverable {
             self.stats.frames_dropped += 1;
             self.lost_frames += 1;
-            self.awaiting_idr = true;
+            self.awaiting_idr |= !skipped;
             return;
         }
         self.stats.frames_completed += 1;
@@ -438,33 +494,15 @@ impl Client {
         d.base_us + jitter + over * d.us_per_mbps
     }
 
-    /// Jump-to-live, both halves: one-way delay past [`FLUSH_LATENCY_MS`] for
-    /// [`FLUSH_AFTER_MS`], or a decode backlog at [`QUEUE_HIGH`] for
-    /// [`STANDING_MS`]. A flush is ABR's severe `flushed`.
+    /// The client's jump-to-live over this frame's delay and the decode
+    /// backlog, in frames at the refresh rate. A flush is ABR's severe `flushed`.
     fn note_latency(&mut self, owd_ms: i64, now_ms: u64) {
-        if owd_ms > FLUSH_LATENCY_MS as i64 {
-            self.owd_over_since.get_or_insert(now_ms);
-        } else {
-            self.owd_over_since = None;
-        }
         let backlog = (self.decode_free_at_ms.saturating_sub(now_ms)
             * u64::from(self.cfg.refresh_hz.max(1))
-            / 1_000) as u32;
-        if backlog >= QUEUE_HIGH {
-            self.queue_over_since.get_or_insert(now_ms);
-        } else if backlog <= 2 {
-            self.queue_over_since = None;
-        }
-        let over = |since: Option<u64>, ms: u64| since.is_some_and(|t| now_ms - t >= ms);
-        let behind = over(self.owd_over_since, FLUSH_AFTER_MS)
-            || (backlog >= QUEUE_HIGH && over(self.queue_over_since, STANDING_MS));
-        let cooled = self
-            .last_flush_ms
-            .is_none_or(|t| now_ms - t >= FLUSH_COOLDOWN.as_millis() as u64);
-        if behind && cooled {
-            self.owd_over_since = None;
-            self.queue_over_since = None;
-            self.last_flush_ms = Some(now_ms);
+            / 1_000) as usize;
+        let now = self.base + Duration::from_millis(now_ms);
+        let lat_ns = i128::from(owd_ms) * 1_000_000;
+        if self.jump.observe(now, lat_ns, true, backlog).is_some() {
             self.decode_free_at_ms = now_ms;
             self.abr.on_flush();
             self.awaiting_idr = true;
@@ -616,6 +654,8 @@ impl Client {
                 // report tick stays suppressed for the rest of the session.
                 crate::abr::Action::AbandonProbe => self.probing = false,
                 crate::abr::Action::Delivery(packets) => out.push(Action::Delivery(packets)),
+                // The simulated host has no pacer to hand a link rate to.
+                crate::abr::Action::LinkRate(_) => {}
             }
         }
         if self.ramp_done.is_none() {
@@ -687,6 +727,7 @@ mod tests {
                 burst_len: 4,
             },
             10,
+            0,
         );
         assert_eq!(c.stats.frames_dropped, 0, "four shards, four parity");
         assert_eq!(c.stats.fec_recovered_shards, 4);
@@ -702,6 +743,7 @@ mod tests {
                 burst_len: 5,
             },
             10,
+            0,
         );
         assert_eq!(
             c.stats.frames_dropped, 1,
@@ -731,7 +773,7 @@ mod tests {
         ] {
             let mut c = client(Instant::now());
             c.expect(&frame(1, 300_000, 10), 0);
-            c.complete(1, draw, 5);
+            c.complete(1, draw, 5, 0);
             assert_eq!(c.stats.frames_dropped, 0, "22 of 22 parity shards");
             assert_eq!(c.stats.fec_recovered_shards, 22);
         }
@@ -744,11 +786,59 @@ mod tests {
                 ..LossDraw::default()
             },
             5,
+            0,
         );
         assert_eq!(
             c.stats.frames_dropped, 1,
             "one shard past the pool loses the frame"
         );
+    }
+
+    /// NACK closes a frame two short on a round trip inside a frame period and
+    /// leaves the rest to the ask; the acked chain skips a loss once engaged.
+    #[test]
+    fn a_nack_closes_a_short_frame_and_the_acked_chain_skips_a_lost_one() {
+        let short = |beyond: u32| LossDraw {
+            random: 0,
+            burst_at: 10,
+            burst_len: 4 + beyond,
+        };
+        let with = |repair: Repair| {
+            Client::new(
+                ClientCfg {
+                    repair,
+                    ..ClientCfg::default()
+                },
+                11,
+                Instant::now(),
+                Instant::now(),
+            )
+        };
+        // 45 000 bytes at 10 %: 32 data, 4 parity. 60 Hz: a 16 ms period.
+        let mut c = with(Repair::Nack);
+        c.expect(&frame(1, 45_000, 10), 0);
+        c.complete(1, short(2), 10, 16);
+        assert_eq!(c.stats.frames_dropped, 0, "two past parity, resent");
+        assert_eq!(c.resent_bytes, 2 * (1408 + SHARD_WIRE_OVERHEAD));
+        assert!(!c.awaiting_idr);
+        for (beyond, rtt) in [(3, 16), (1, 17)] {
+            let mut c = with(Repair::Nack);
+            c.expect(&frame(1, 45_000, 10), 0);
+            c.complete(1, short(beyond), 10, rtt);
+            assert_eq!(c.stats.frames_dropped, 1, "{beyond} past parity, rtt {rtt}");
+            assert!(c.awaiting_idr, "falls to the ask");
+            assert_eq!(c.resent_bytes, 0);
+        }
+
+        let mut c = with(Repair::Ack);
+        c.expect(&frame(1, 45_000, 10), 0);
+        c.complete(1, short(1), 10, 16);
+        assert!(c.awaiting_idr, "no loss before it: the chain was plain");
+        c.awaiting_idr = false;
+        c.expect(&frame(2, 45_000, 10), 20);
+        c.complete(2, short(1), 30, 16);
+        assert_eq!(c.stats.frames_dropped, 2);
+        assert!(!c.awaiting_idr, "engaged: skipped, nothing asked");
     }
 
     /// The window the ceiling injection lands in is discarded, exactly as the
@@ -800,12 +890,12 @@ mod tests {
                 c.expect(&f, t);
                 let burst = host.burst_of(&f);
                 if c.deliver(f.id, burst, t).is_some() {
-                    c.complete(f.id, LossDraw::default(), t);
+                    c.complete(f.id, LossDraw::default(), t, 0);
                 }
             }
             let (id, bytes) = host.release(t);
             if bytes > 0 && c.deliver(id, bytes, t).is_some() {
-                c.complete(id, LossDraw::default(), t);
+                c.complete(id, LossDraw::default(), t, 0);
             }
             c.tick(t, base, &mut out);
         }

@@ -9,7 +9,7 @@ import PunktfunkKit
 import UniformTypeIdentifiers
 
 /// A canned `LibraryArtSource`: poster bytes by URL, no network. What the screenshot shelf hands
-/// the real coverflow in place of the paired-host loader.
+/// the real library in place of the paired-host loader.
 struct ShotArtSource: LibraryArtSource {
     let fixtures: [String: Data]
 

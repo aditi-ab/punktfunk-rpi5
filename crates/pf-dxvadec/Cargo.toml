@@ -9,16 +9,19 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Byte views of the DXVA buffers. `Pod` rejects padding at compile time; `min_const_generics`
+# covers `[u8; 810]` in the H.264 picture parameters.
+bytemuck = { version = "1.25", features = ["derive", "min_const_generics"] }
 # Direct dependency on the vendored parser crate, not just pf-bitstream: the picture-parameter
 # conversion consumes the parser's `Sps`/`Pps` types wholesale (pf-bitstream re-exports only
-# `Level`/`SliceHeader`), and the same path means the one crate instance the workspace already
-# builds — no duplicate types.
-cros-codecs = { path = "../pf-bitstream/vendor/cros-codecs" }
+# `Level`/`SliceHeader`).
+cros-codecs = { workspace = true }
 pf-bitstream = { path = "../pf-bitstream" }
-# For `SlotMap`/`SlotError` ONLY — see this crate's lib.rs for why the DPB slot ledger is
-# borrowed from the Vulkan crate rather than duplicated or moved.
-pf-vkdecode = { path = "../pf-vkdecode" }
 tracing = "0.1"
+
+[dev-dependencies]
+# `pf_bitstream::testing`: the vendored vectors and access-unit splitters.
+pf-bitstream = { path = "../pf-bitstream", features = ["test-vectors"] }
 
 [lints]
 workspace = true

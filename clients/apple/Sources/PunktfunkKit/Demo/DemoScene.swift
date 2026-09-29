@@ -23,6 +23,7 @@ final class DemoScene {
     private var sticks: [CGFloat] = [0, 0, 0, 0]
     /// LT, RT in 0…1.
     private var triggers: [CGFloat] = [0, 0]
+    private static let flashLabel = ProcessInfo.processInfo.environment["PUNKTFUNK_DEMO_FLASH"]
     private var lastInput = "Nothing yet"
     private var lastInputAt = -10.0
     private var lastRender: Double?
@@ -198,6 +199,18 @@ final class DemoScene {
         let dt = min(now - (lastRender ?? now), 0.1)
         lastRender = now
         move(dx: sticks[0] * 900 * dt, dy: -sticks[1] * 900 * dt)
+
+        // Camera latency test: black, full white for 250 ms after each press, the run's label in
+        // a corner so a slow-motion video shows which presenter it filmed.
+        if let label = Self.flashLabel {
+            let lit = now - lastInputAt < 0.25
+            ctx.setFillColor(CGColor(gray: lit ? 1 : 0, alpha: 1))
+            ctx.fill(CGRect(origin: .zero, size: canvas))
+            text(ctx, label, at: CGPoint(x: 48, y: 96), size: 56, bold: true,
+                 color: CGColor(gray: 0.5, alpha: 1))
+            frame += 1
+            return
+        }
 
         drawBackdrop(ctx, now)
         drawHeader(ctx)

@@ -50,8 +50,10 @@ note() { printf '%s\n' "$*"; }
 #   $2 host_caps      canonical capability string on the host binary, "" = none
 #   $3 worker_caps    canonical capability string on the worker binary, "" = none
 #   $4 worker_present 1 if the artifact ships the worker at all
+#   $5 "uncapped-ok"  optional: an uncapped worker only notes (the sysext builders' best-effort
+#                     grant). Nothing that gates a published artifact passes it.
 assert_matrix() {
-  local label="$1" host_caps="$2" worker_caps="$3" worker_present="$4" rc=0
+  local label="$1" host_caps="$2" worker_caps="$3" worker_present="$4" uncapped_ok="${5:-}" rc=0
   if [ -n "$host_caps" ]; then
     err "$label: $HOST_REL carries '$host_caps' — it must carry NO capability, ever."
     err "$label: a capability makes the host unidentifiable to KWin (it cannot readlink"
@@ -65,6 +67,8 @@ assert_matrix() {
     err "$label: version-check each other over their socket — and the GPU-priority lever is inert"
     err "$label: without the worker."
     rc=1
+  elif [ -z "$worker_caps" ] && [ "$uncapped_ok" = uncapped-ok ]; then
+    note "--  $label: $WORKER_REL ships uncapped — PyroWave encodes at default GPU priority"
   elif [ "$worker_caps" != "$WANT_WORKER_CAPS" ]; then
     err "$label: $WORKER_REL carries '${worker_caps:-<none>}', expected exactly '$WANT_WORKER_CAPS'."
     if [ -z "$worker_caps" ]; then
@@ -74,7 +78,7 @@ assert_matrix() {
     fi
     rc=1
   fi
-  if [ "$rc" = 0 ]; then
+  if [ "$rc" = 0 ] && [ -n "$worker_caps" ]; then
     note "OK  $label: host uncapped, worker $WANT_WORKER_CAPS"
   fi
   return "$rc"
@@ -279,6 +283,10 @@ self_test() {
   _expect fail "worker present but uncapped"           "" "" 1
   _expect fail "worker over-granted"                   "" "cap_sys_admin=ep" 1
   _expect fail "worker granted the wrong flags"        "" "cap_sys_nice=eip" 1
+  _expect pass "build time: worker left uncapped"      "" "" 1 uncapped-ok
+  _expect fail "build time: host capped"               "cap_sys_nice=ep" "" 1 uncapped-ok
+  _expect fail "build time: worker over-granted"       "" "cap_sys_admin=ep" 1 uncapped-ok
+  _expect fail "build time: worker absent"             "" "" 0 uncapped-ok
 
   note "canonicalisation:"
   _norm() {

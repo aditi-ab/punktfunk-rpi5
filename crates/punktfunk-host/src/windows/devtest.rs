@@ -87,8 +87,36 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     let triton = args.iter().any(|a| a == "--triton");
-    let extra_buttons: u32 = if edge || deck || triton {
+    // `--switch`: Pro Controller; the driver answers the handshake, the host streams `0x30`.
+    let switch = args.iter().any(|a| a == "--switch");
+    // `--8bitdo-u2` / `--8bitdo-pro2` / `--8bitdo-pro3` / `--horipad`: the native identities;
+    // the paddles press on the same beats as the Edge's.
+    let eightbitdo = [
+        (
+            "--8bitdo-u2",
+            crate::inject::eightbitdo_proto::Model::Ultimate2,
+        ),
+        (
+            "--8bitdo-pro2",
+            crate::inject::eightbitdo_proto::Model::Pro2,
+        ),
+        (
+            "--8bitdo-pro3",
+            crate::inject::eightbitdo_proto::Model::Pro3,
+        ),
+    ]
+    .into_iter()
+    .find(|(flag, _)| args.iter().any(|a| a == flag))
+    .map(|(_, model)| model);
+    let horipad = args.iter().any(|a| a == "--horipad");
+    // `--joycons`: a Joy-Con pair, two devnodes; the paddles land on SR (R) and SL (L).
+    let joycons = args.iter().any(|a| a == "--joycons");
+    // `--xboxhid` presses Share (the Series pad's Consumer `Record` bit) on the same beats.
+    let extra_buttons: u32 = if edge || deck || triton || eightbitdo.is_some() || horipad || joycons
+    {
         punktfunk_core::input::gamepad::BTN_PADDLE1 | punktfunk_core::input::gamepad::BTN_PADDLE2
+    } else if xboxhid {
+        punktfunk_core::input::gamepad::BTN_MISC1
     } else {
         0
     };
@@ -260,6 +288,26 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
         drive!(
             crate::inject::triton_windows::TritonWindowsManager::new(),
             "Steam Controller 2"
+        );
+    } else if switch {
+        drive!(
+            crate::inject::switch_pro_windows::SwitchProWindowsManager::new(),
+            "Switch Pro Controller"
+        );
+    } else if let Some(model) = eightbitdo {
+        drive!(
+            crate::inject::eightbitdo_windows::manager(model),
+            model.name()
+        );
+    } else if horipad {
+        drive!(
+            crate::inject::hori_windows::HoriWindowsManager::new(),
+            "HORIPAD for Steam"
+        );
+    } else if joycons {
+        drive!(
+            crate::inject::switch_pro_windows::JoyConWindowsManager::new(),
+            "Joy-Con pair"
         );
     } else {
         drive!(

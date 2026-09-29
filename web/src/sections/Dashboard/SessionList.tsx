@@ -19,6 +19,7 @@ import {
 	SelectTrigger,
 	SelectValue,
 } from "@/components/ui/select";
+import { fmtClockDuration } from "@/lib/format";
 import { m } from "@/paraglide/messages";
 import { levelLabel } from "@/sections/Pairing/access";
 
@@ -97,15 +98,18 @@ const Row: FC<{
 	const perSession = row.id != null;
 	// Mute and the player slot ride native-only lanes: the compat plane's audio has no
 	// per-session mute, and its pads are not placed through the host's pad pool.
-	const nativeLanes = row.plane === "native";
+	const nativeLanes = row.plane !== "gamestream";
 	const facts = [
 		row.mode,
 		row.join ? m.sessions_joined() : m.sessions_own_display(),
-		m.sessions_uptime({ time: formatUptime(row.uptime_s) }),
+		m.sessions_uptime({
+			time: fmtClockDuration(row.uptime_s, { hours: true }),
+		}),
 		sharedWith.length > 0
 			? m.sessions_shared_path({ names: sharedWith.join(", ") })
 			: undefined,
 		row.plane === "gamestream" ? "GameStream" : undefined,
+		row.plane === "web" ? m.sessions_plane_web() : undefined,
 	].filter(Boolean);
 	return (
 		<div className="flex flex-col gap-3 border-b pb-4 last:border-0 last:pb-0 sm:flex-row sm:items-center">
@@ -115,6 +119,11 @@ const Row: FC<{
 					<span className="truncate font-medium">
 						{row.client_name || row.client}
 					</span>
+					{row.preset_name && (
+						<span className="truncate text-sm text-muted-foreground">
+							· {row.preset_name}
+						</span>
+					)}
 					{row.muted && <Badge variant="secondary">{m.sessions_muted()}</Badge>}
 					{/* Which controllers the session holds right now — the badge follows the
 					    pads, not the pick, so a slot that has not moved yet reads honestly. */}
@@ -225,12 +234,3 @@ const Row: FC<{
 
 /** No pick: the slot is whichever comes free. Not a slot number, so it cannot collide with one. */
 const AUTO_PLAYER = "auto";
-
-/** `h:mm` past an hour, else `m:ss` — a session's age reads as a duration, not seconds.
- * Shared with `LastSessionCard`, so a finished session reads the same as a live one. */
-export function formatUptime(seconds: number): string {
-	const s = Math.max(0, Math.floor(seconds));
-	const mm = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
-	if (s >= 3600) return `${Math.floor(s / 3600)}:${mm}`;
-	return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
-}

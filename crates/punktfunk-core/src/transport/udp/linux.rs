@@ -52,7 +52,9 @@ fn mmsghdrs(iovs: &mut [libc::iovec]) -> Vec<mmsghdr> {
         .collect()
 }
 
-/// Process-wide UDP GSO latch. Opt-in (`PUNKTFUNK_GSO=1`).
+/// Process-wide UDP GSO gate. Opt-in (`PUNKTFUNK_GSO=1`), or per transport
+/// through [`Transport::set_gso`](super::super::Transport::set_gso) when the
+/// pacer runs at a proven link rate.
 ///
 /// Super-buffer trains cut send CPU but lose delivered rate on constrained hops
 /// (queue drop in the transport path, not the video pacer). Default stays off;
@@ -63,12 +65,13 @@ fn mmsghdrs(iovs: &mut [libc::iovec]) -> Vec<mmsghdr> {
 #[cfg(target_os = "linux")]
 mod gso {
     use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0); // 0 = uninit, 1 = on, 2 = off
+    // 0 = uninit, 1 = env on, 2 = env off, 3 = refused by the path.
+    static STATE: AtomicU8 = AtomicU8::new(0);
 
-    pub fn active() -> bool {
+    pub fn env_on() -> bool {
         match STATE.load(Ordering::Relaxed) {
             1 => true,
-            2 => false,
+            2 | 3 => false,
             _ => {
                 let on = std::env::var("PUNKTFUNK_GSO").is_ok_and(|v| v != "0");
                 STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
@@ -76,10 +79,14 @@ mod gso {
             }
         }
     }
+    /// The path refused GSO once; no ask turns it back on.
+    pub fn refused() -> bool {
+        STATE.load(Ordering::Relaxed) == 3
+    }
     /// Latch GSO off after an unsupported-path syscall error. Warn once so a
     /// mid-session downshift to `sendmmsg` is visible.
     pub fn disable() {
-        if STATE.swap(2, Ordering::Relaxed) != 2 {
+        if STATE.swap(3, Ordering::Relaxed) != 3 {
             tracing::warn!("Linux UDP GSO unsupported on this path — falling back to sendmmsg");
         }
     }
@@ -190,41 +197,26 @@ pub(super) fn send_gso(t: &UdpTransport, packets: &[&[u8]]) -> std::io::Result<u
     if packets.is_empty() {
         return Ok(0);
     }
-    if !gso::active() {
+    if gso::refused() || !(t.gso_wanted() || gso::env_on()) {
         return send_batch(t, packets);
     }
-    // GSO: every segment but the last must be exactly `seg` bytes. Guard and
-    // fall back if the batch is not uniform (last may be shorter, never longer).
-    let seg = packets[0].len();
-    let last = packets.len() - 1;
-    if seg == 0 || packets[..last].iter().any(|p| p.len() != seg) || packets[last].len() > seg {
+    let Some(seg) = super::uniform_segment(packets) else {
         return send_batch(t, packets);
-    }
+    };
     let fd = t.socket.as_raw_fd();
     // 64-segment kernel cap, and 65535 - 40 - 8 (IPv6+UDP; tighter than IPv4
     // 65507). Oversize is EMSGSIZE, which `gso_unsupported` latches GSO off
     // process-wide.
     const GSO_MAX_PAYLOAD: usize = 65535 - 40 - 8;
     let max_seg = (GSO_MAX_PAYLOAD / seg).clamp(1, 64);
-    let mut scratch: Vec<u8> = Vec::with_capacity(seg * max_seg);
-    let mut sent = 0usize;
-    for chunk in packets.chunks(max_seg) {
-        scratch.clear();
-        for p in chunk {
-            scratch.extend_from_slice(p);
-        }
-        match send_one_gso(fd, &scratch, seg as u16) {
-            Ok(()) => sent += chunk.len(),
-            // Send buffer full or stale ICMP: drop the rest, never block.
-            Err(e) if is_transient_io(&e) => break,
-            Err(e) if gso_unsupported(&e) => {
-                gso::disable();
-                return Ok(sent + send_batch(t, &packets[sent..])?);
-            }
-            Err(e) => return Err(e),
+    let send_one = |buf: &[u8], seg| send_one_gso(fd, buf, seg);
+    match super::send_segmented(packets, seg, max_seg, send_one, gso_unsupported)? {
+        super::Segmented::Sent(n) => Ok(n),
+        super::Segmented::Unsupported(n) => {
+            gso::disable();
+            Ok(n + send_batch(t, &packets[n..])?)
         }
     }
-    Ok(sent)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

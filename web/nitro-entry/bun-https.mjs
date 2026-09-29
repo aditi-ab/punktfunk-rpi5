@@ -158,7 +158,7 @@ const listenerOptions = (lane) => ({
 	async fetch(req, server) {
 		// Before the body is buffered or a socket upgraded: an internet peer gets nothing to hold.
 		const peer = server.requestIP(req)?.address;
-		if (!isLocalPeer(peer)) {
+		if (!(await isLocalPeer(peer))) {
 			return new Response(
 				"This console only answers on its own network. Connect from that network or over a VPN.\n",
 				{ status: 403 },

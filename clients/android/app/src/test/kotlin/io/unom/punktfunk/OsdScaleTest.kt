@@ -13,8 +13,9 @@ import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 
 /**
- * The overlay scale is derived, not stored, so what is worth pinning is the derivation: a TV gets
- * [TV_OSD_SCALE] and nothing else does, and [OsdScaled] actually reaches the `dp` inside it.
+ * The overlay scale is derived, not stored, so what is worth pinning is the derivation: a TV draws
+ * at the console's couch scale and nothing else changes, and [OsdScaled] actually reaches the `dp`
+ * inside it.
  *
  * `sdk = [36]` for the same reason as the screenshot tests: Robolectric ships android-all jars only
  * up to API 36 while the app's compileSdk is 37.
@@ -30,38 +31,40 @@ class OsdScaleTest {
         shadowOf(context.packageManager).setSystemFeature(PackageManager.FEATURE_LEANBACK, true)
     }
 
-    /** Ratio of the density inside [OsdScaled] to the one outside it, and the fontScale inside. */
-    private fun measure(): Pair<Float, Float> {
-        var ratio = 0f
+    /** The density inside [OsdScaled], the one outside it, and the fontScale inside. */
+    private fun measure(): Triple<Float, Float, Float> {
+        var inner = 0f
+        var outer = 0f
         var fontScale = 0f
         compose.setContent {
-            val outer = LocalDensity.current
+            outer = LocalDensity.current.density
             OsdScaled {
-                ratio = LocalDensity.current.density / outer.density
+                inner = LocalDensity.current.density
                 fontScale = LocalDensity.current.fontScale
             }
         }
         compose.waitForIdle()
-        return ratio to fontScale
+        return Triple(inner, outer, fontScale)
     }
 
     @Test
     fun anOrdinaryDeviceDrawsAtItsNativeSize() {
-        assertEquals(1f, osdScale(compose.activity), 1e-4f)
-        assertEquals(1f, measure().first, 1e-4f)
+        val (inner, outer, _) = measure()
+        assertEquals(outer, inner, 1e-4f)
     }
 
     @Test
-    fun aTvEnlargesTheChrome() {
+    fun aTvDrawsAtTheConsolesCouchScale() {
         beATv()
-        assertEquals(TV_OSD_SCALE, osdScale(compose.activity), 1e-4f)
-        assertEquals(TV_OSD_SCALE, measure().first, 1e-4f)
+        val m = compose.activity.resources.displayMetrics
+        val (inner, _, _) = measure()
+        assertEquals(minOf(m.widthPixels, m.heightPixels) / COUCH_HEIGHT, inner, 1e-4f)
     }
 
     /** The system text size the user chose still applies on top; the scale must not swallow it. */
     @Test
     fun theSystemFontScaleSurvives() {
         beATv()
-        assertEquals(compose.activity.resources.configuration.fontScale, measure().second, 1e-4f)
+        assertEquals(compose.activity.resources.configuration.fontScale, measure().third, 1e-4f)
     }
 }

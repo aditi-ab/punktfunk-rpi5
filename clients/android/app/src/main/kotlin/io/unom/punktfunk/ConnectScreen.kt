@@ -22,6 +22,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.withStarted
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.discovery.DiscoveredHost
@@ -34,10 +35,9 @@ import io.unom.punktfunk.kit.link.HostResolution
 import io.unom.punktfunk.kit.link.LinkError
 import io.unom.punktfunk.kit.link.LinkRoute
 import io.unom.punktfunk.kit.security.ClientIdentity
-import io.unom.punktfunk.kit.security.IdentityStore
+import io.unom.punktfunk.kit.security.IdentityHolder
 import io.unom.punktfunk.kit.security.KnownHost
 import io.unom.punktfunk.kit.security.KnownHostStore
-import io.unom.punktfunk.kit.security.obtainIdentity
 import io.unom.punktfunk.models.ActiveSession
 import io.unom.punktfunk.models.PendingLinkConnect
 import io.unom.punktfunk.models.PendingTrust
@@ -46,13 +46,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-
-/**
- * Handshake budget for the no-PIN "request access" connect. Must exceed the host's approval-park
- * window (~180 s) so a slow operator approval still lands on this same parked connection rather than
- * timing the client out first. Mirrors the Linux client's 185 s.
- */
-private const val REQUEST_ACCESS_TIMEOUT_MS = 185_000
 
 /**
  * How long a host's advertised actions stay fresh before this screen asks again — the desktop's
@@ -170,7 +163,6 @@ fun ConnectScreen(
         onDispose { discovery.removeListener(subscriber) }
     }
 
-    val identityStore = remember { IdentityStore(context) }
     val knownHostStore = remember { KnownHostStore(context) }
     var savedHosts by remember { mutableStateOf(knownHostStore.all()) }
     // The settings-preset catalog. Read here (not in the settings screen's copy) because this is
@@ -231,12 +223,15 @@ fun ConnectScreen(
         discovery.addNetworkListener(onNetwork)
         onDispose { discovery.removeNetworkListener(onNetwork) }
     }
+    // Probe laps wait while the app is away: a stopped activity does not pause a coroutine.
+    val appLifecycle = (context as? LifecycleOwner)?.lifecycle
     LaunchedEffect(savedHosts, lnpGranted, networkGen) {
         if (!lnpGranted) {
             reachable = emptySet()
             return@LaunchedEffect
         }
         while (true) {
+            appLifecycle?.withStarted {}
             val saved = savedHosts
             val up = withContext(Dispatchers.IO) {
                 Presence.sweep(
@@ -258,14 +253,25 @@ fun ConnectScreen(
             delay(12_000)
         }
     }
-    // Mint-once on genuine first run; an Unrecoverable store (decrypt failure) surfaces here and
-    // refuses to connect — never silently shadow-minting a new identity (which would force re-pair).
-    var identity by remember { mutableStateOf<ClientIdentity?>(null) }
-    LaunchedEffect(Unit) {
-        runCatching { withContext(Dispatchers.IO) { obtainIdentity(identityStore) } }
-            .onSuccess { identity = it }
-            .onFailure { status = "Identity unavailable — re-pair may be required" }
+    // The process-wide identity load ([IdentityHolder]), mirrored into state so the effects keyed
+    // on it rerun when it lands. An Unrecoverable store refuses to connect rather than shadow-mint.
+    val identities = remember { IdentityHolder.shared(context) }
+    var identity by remember { mutableStateOf(identities.current) }
+    fun loadIdentity() {
+        scope.launch {
+            identity = withContext(Dispatchers.IO) { identities.await() }
+            if (identity == null) status = IdentityHolder.UNAVAILABLE
+        }
     }
+    // Every identity-gated action funnels here: ready → the identity, also when another screen's
+    // retry loaded it; else the holder's line, and a failed load is retried by this same tap.
+    fun requireIdentity(): ClientIdentity? {
+        (identity ?: identities.current)?.let { identity = it; return it }
+        status = identities.blockedMessage()
+        if (identities.failed) loadIdentity()
+        return null
+    }
+    LaunchedEffect(Unit) { loadIdentity() }
     // A trust decision awaiting the user (first-connect TOFU / fp changed / PIN pairing / the
     // request-access-or-PIN choice).
     var pendingTrust by remember { mutableStateOf<PendingTrust?>(null) }
@@ -290,6 +296,7 @@ fun ConnectScreen(
     LaunchedEffect(savedHosts, identity) {
         val id = identity ?: return@LaunchedEffect
         while (true) {
+            appLifecycle?.withStarted {}
             val now = android.os.SystemClock.elapsedRealtime()
             for (kh in savedHosts) {
                 if (!kh.paired || kh.fpHex.isEmpty()) continue
@@ -325,35 +332,17 @@ fun ConnectScreen(
         launch: String?,
     ): Long = connectToHost(
         context, settings.effectiveFor(preset), id, targetHost, targetPort, pinHex,
-        launch = launch, dialer = "touch/host-grid", timeoutMs = timeoutMs,
+        launch = launch, dialer = "touch/host-grid", timeoutMs = timeoutMs, preset = preset,
     )
 
-    // What the stream screen is handed: the settings this connect actually used, plus the HOST's
-    // clipboard decision (a property of the record, not a global). A host we never saved — a
-    // connect that failed to pin — gets the secure default: no clipboard until the user enables
-    // it for that host (security-review 2026-08-31 M-8).
-    fun session(handle: Long, record: KnownHost?, preset: StreamPreset?): ActiveSession {
-        // The session's own Welcome carries where this host serves its library. Save it now: this
-        // is the only source that does not need an mDNS advert, so it is what makes a host that
-        // moved off 47990 browsable over a VPN or when it was added by address. 0 = not
-        // advertised, and learnMgmtPort ignores it.
-        if (record != null) {
-            NativeBridge.nativeHostMgmtPort(handle).takeIf { it > 0 }?.let {
-                knownHostStore.learnMgmtPort(record, it)
-            }
-        }
-        return ActiveSession(
-            handle,
-            settings.effectiveFor(preset),
-            clipboardSync = record?.clipboardSync ?: false,
-            presetName = preset?.name,
-            hostId = record?.id,
-        )
-    }
+    // What the stream screen is handed: the settings this connect used, and the host's record.
+    fun session(handle: Long, record: KnownHost?, preset: StreamPreset?): ActiveSession =
+        SessionFactory.afterDial(handle, record, settings.effectiveFor(preset), preset, knownHostStore)
 
-    // The actual dial (identity already ready). A TOFU dial (pinHex null) pins what the host
-    // presented, as an unpaired known host. [onFailure] takes over an unreachable dial (the
-    // wake-wait fallback, discovery already restarted); [onMismatch] takes over a refused pin.
+    // The actual dial (identity already ready). A TOFU dial (no saved record; pinned to the
+    // advertised fingerprint when there is one) saves what the host presented, as an unpaired
+    // known host. [onFailure] takes over an unreachable dial (the wake-wait fallback, discovery
+    // already restarted); [onMismatch] takes over a refused pin.
     fun doConnectDirect(
         targetHost: String,
         targetPort: Int,
@@ -364,10 +353,7 @@ fun ConnectScreen(
         onFailure: (() -> Unit)? = null,
         onMismatch: (() -> Unit)? = null,
     ) {
-        val id = identity ?: run {
-            status = "Identity not ready yet — try again in a moment"
-            return
-        }
+        val id = requireIdentity() ?: return
         val thisAttempt = ConnectAttempt(name)
         attempt = thisAttempt // shows the ConnectOverlay's "Connecting…" phase immediately
         connecting = true
@@ -386,14 +372,10 @@ fun ConnectScreen(
             attempt = null
             connecting = false
             if (handle != 0L) {
-                // By this dial's pin: the address may also name the other OS of a dual-boot box.
-                var record = pinHex?.let { knownHostStore.resolve(it, targetHost, targetPort) }
-                if (pinHex == null) { // TOFU: pin what we observed (unpaired)
-                    val fp = NativeBridge.nativeHostFingerprint(handle)
-                    if (fp.isNotEmpty()) {
-                        record = knownHostStore.trust(targetHost, targetPort, name, fp, paired = false)
-                    }
-                }
+                // By this dial's pin (the address may also name the other OS of a dual-boot box);
+                // with no saved record, a TOFU dial pins what the host presented, unpaired.
+                val record = pinHex?.let { knownHostStore.resolve(it, targetHost, targetPort) }
+                    ?: SessionFactory.pinPresented(handle, targetHost, targetPort, name, paired = false, knownHostStore)
                 onConnected(session(handle, record, preset))
             } else {
                 discovery.addListener(subscriber)
@@ -443,10 +425,7 @@ fun ConnectScreen(
         launch: String? = null,
         onMismatch: (() -> Unit)? = null,
     ) {
-        if (identity == null) {
-            status = "Identity not ready yet — try again in a moment"
-            return
-        }
+        if (requireIdentity() == null) return
         // The record this dial's pin names. A TOFU dial is to a host not saved yet, so only a
         // placeholder can be it — never the other OS of a dual-boot box at the same address.
         val kh = knownHostStore.resolve(pinHex ?: "", targetHost, targetPort)
@@ -474,14 +453,12 @@ fun ConnectScreen(
                     // asks the host itself, at the address it advertises if it moved lease.
                     isOnline = {
                         val live = liveAdvert()
-                        withContext(Dispatchers.IO) {
-                            Presence.isSelf(
-                                pinHex ?: "",
-                                NativeBridge.nativeProbe(
-                                    live?.host ?: targetHost, live?.port ?: targetPort, 3_000,
-                                ),
-                            )
-                        }
+                        Presence.isSelf(
+                            pinHex ?: "",
+                            NativeBridge.nativeProbe(
+                                live?.host ?: targetHost, live?.port ?: targetPort, 3_000,
+                            ),
+                        )
                     },
                     onOnline = {
                         val live = liveAdvert()
@@ -510,11 +487,7 @@ fun ConnectScreen(
     // The connect can't be aborted, so Cancel returns the UI immediately and a late result is torn
     // down silently via the per-attempt flag (mirrors the Linux client's request-access flow).
     fun requestAccess(target: PendingTrust) {
-        val id = identity
-        if (id == null) {
-            status = "Identity not ready yet — try again in a moment"
-            return
-        }
+        val id = requireIdentity() ?: return
         val req = RequestAccessState(target)
         awaiting = req
         connecting = true
@@ -541,12 +514,10 @@ fun ConnectScreen(
             if (handle != 0L) {
                 // Approved — save the host as PAIRED, pinning the fingerprint it presented, so
                 // future connects are silent (exactly like after a PIN ceremony).
-                val fp = NativeBridge.nativeHostFingerprint(handle)
-                var record = knownHostStore.resolve(fp, target.host, target.port)
-                if (fp.isNotEmpty()) {
-                    record = knownHostStore.trust(target.host, target.port, target.name, fp, paired = true)
-                    savedHosts = knownHostStore.all()
-                }
+                val record = SessionFactory.pinPresented(
+                    handle, target.host, target.port, target.name, paired = true, knownHostStore,
+                )?.also { savedHosts = knownHostStore.all() }
+                    ?: knownHostStore.resolve("", target.host, target.port)
                 onConnected(session(handle, record, preset = null))
             } else {
                 // Cause-specific: an operator denial, an approval timeout, and a request that
@@ -632,10 +603,7 @@ fun ConnectScreen(
     var speedTestPhase by remember { mutableStateOf<SpeedTestPhase>(SpeedTestPhase.Connecting) }
 
     fun startSpeedTest(entry: HostCardEntry) {
-        val id = identity ?: run {
-            status = "Identity not ready yet — try again in a moment"
-            return
-        }
+        val id = requireIdentity() ?: return
         // The magic packet isn't the only thing LNP blocks: without the grant this would EPERM its
         // way to a timeout and report a dead link on a perfectly good one.
         if (!lnpGranted) {
@@ -689,10 +657,7 @@ fun ConnectScreen(
     // Host-power grant is offered none; a destructive one still asks first, because losing what
     // is running on that machine is not something a mis-tap should be able to do.
     fun runHostAction(kh: KnownHost, a: HostActions.Action) {
-        val id = identity ?: run {
-            status = "Identity not ready yet — try again in a moment"
-            return
-        }
+        val id = requireIdentity() ?: return
         val name = kh.name.ifBlank { kh.address }
         notice = "${a.label} — asking $name…"
         status = null
@@ -722,10 +687,7 @@ fun ConnectScreen(
     // is a notice either way (success and failure both name the host), because the row's whole job
     // is to tell a reporter whether the bundle actually landed.
     fun sendLogs(kh: KnownHost) {
-        val id = identity ?: run {
-            status = "Identity not ready yet — try again in a moment"
-            return
-        }
+        val id = requireIdentity() ?: return
         notice = "Sending logs to ${kh.name.ifBlank { kh.address }}…"
         status = null
         scope.launch {
@@ -839,17 +801,9 @@ fun ConnectScreen(
             connectsAfter = false,
             macs = kh.mac,
             lastIp = kh.address,
-            // "Back up" is the host answering a probe, at the address its advert claims if a cold
-            // boot moved it — never the advert alone, which a sleeping host keeps publishing.
             isOnline = {
-                val live = discovered.firstOrNull { kh.matches(it) }
-                withContext(Dispatchers.IO) {
-                    Presence.isSelf(
-                        kh,
-                        NativeBridge.nativeProbe(
-                            live?.host ?: kh.address, live?.port ?: kh.port, 3_000,
-                        ),
-                    )
+                Presence.probeSelf(kh, discovered.firstOrNull { kh.matches(it) }) { addr, port ->
+                    NativeBridge.nativeProbe(addr, port, 3_000)
                 }
             },
             onOnline = {},
@@ -955,7 +909,14 @@ fun ConnectScreen(
         onPendingTrustChange = { pendingTrust = it },
         onTrustNew = { pt ->
             pendingTrust = null
-            doConnect(pt.host, pt.port, pt.name, null, pt.preset, pt.launch)
+            // Pinned to the fingerprint the prompt showed, when the advert carried one.
+            doConnect(
+                pt.host, pt.port, pt.name, pt.advertisedFp, pt.preset, pt.launch,
+                onMismatch = {
+                    status = "Couldn't connect: the host didn't present the identity it advertised. " +
+                        "Pair with its PIN instead."
+                },
+            )
         },
         onPaired = { pt, fp ->
             knownHostStore.trust(pt.host, pt.port, pt.name, fp, paired = true)

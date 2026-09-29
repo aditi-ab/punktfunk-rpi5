@@ -191,6 +191,20 @@ fn fresh_installs_on_canary() {
         &fresh("bazzite", Family::Sysext),
         &canary,
     );
+    check(
+        "steamos-fresh-canary",
+        &fresh("steamos", Family::Steamos),
+        &canary,
+    );
+}
+
+/// An installed Deck: its binaries are never on PATH, so it is never "fully installed".
+fn deck_on(channel: Channel) -> Facts {
+    Facts {
+        current_channel: Some(channel),
+        web_unit_present: true,
+        ..fresh("steamos", Family::Steamos)
+    }
 }
 
 /// `rpm_group = "bazzite"` is a sed of the written repo file, not the Bazzite distro.
@@ -231,6 +245,45 @@ fn channel_switches_in_both_directions() {
         &installed("bazzite", Family::Sysext, Channel::Stable),
         &to_canary,
     );
+    check(
+        "steamos-switch-to-stable",
+        &deck_on(Channel::Canary),
+        &to_stable,
+    );
+}
+
+/// A Deck's channel is its checkout's branch. A bare re-run rebuilds whatever it follows; a
+/// switch moves the branch first, fast-forward only, then rebuilds through the same hand-off.
+#[test]
+fn trap_a_deck_switch_moves_the_branch_before_the_build() {
+    let rerun = plan_for(&deck_on(Channel::Canary), &pins()).commands();
+    assert!(
+        !rerun
+            .iter()
+            .any(|c| c.contains("checkout") || c.contains("merge")),
+        "a bare re-run moved a canary Deck: {rerun:?}"
+    );
+    for (from, to, branch) in [
+        (Channel::Canary, Channel::Stable, "stable"),
+        (Channel::Stable, Channel::Canary, "main"),
+    ] {
+        let pins = Pins {
+            channel: Some(to),
+            ..pins()
+        };
+        let cmds = plan_for(&deck_on(from), &pins).commands();
+        let at = |needle: &str| {
+            cmds.iter()
+                .position(|c| c.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} missing: {cmds:?}"))
+        };
+        assert!(at("fetch origin") < at(&format!("checkout {branch}")));
+        assert!(
+            at(&format!("checkout {branch}")) < at(&format!("merge --ff-only origin/{branch}"))
+        );
+        assert!(at("--ff-only") < at("scripts/steamdeck/install.sh"));
+        assert!(!cmds.iter().any(|c| c.contains("git clone")), "{cmds:?}");
+    }
 }
 
 #[test]
@@ -761,8 +814,8 @@ fn trap_the_steamos_build_is_announced_before_it_runs() {
     );
 }
 
-/// The build script takes `--gamestream`; there is no host.env route to the Moonlight planes
-/// before the units it starts already exist.
+/// The build script takes `--gamestream` and stores it before it starts the host; a setting
+/// written after the script would wait for a restart.
 #[test]
 fn trap_steamos_forwards_the_gamestream_choice_to_the_script() {
     let on = Pins {
@@ -1106,5 +1159,61 @@ fn the_password_file_is_written_owner_only() {
         assert_eq!(mode(&file), 0o600, "the password is readable by others");
         assert_eq!(mode(file.parent().expect("dir")), 0o700);
     }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Settings land through the host's own store: validated against the registry, merged with the
+/// keys already there, and owner-only like every write the host makes to that file.
+#[cfg(unix)]
+#[test]
+fn host_settings_go_through_the_hosts_store() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = std::env::temp_dir().join(format!("pf-setup-settings-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let paths = BasePaths::rooted(&root);
+    let file = paths.host_settings();
+    std::fs::create_dir_all(file.parent().expect("dir")).unwrap();
+    std::fs::write(&file, r#"{"version":1,"from_a_newer_host":"kept"}"#).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let facts = fresh("arch", Family::Pacman);
+    let choices = Choices::derive(&facts, &pins());
+    let (ui, buf) = Plain::capture();
+    let run = FakeRunner::new();
+    let exec = Executor {
+        paths: &paths,
+        run: &run,
+        ui: &ui,
+        opts: Opts {
+            dry: false,
+            quiet: false,
+            tty: false,
+        },
+    };
+    let plan = Plan {
+        phases: vec![PlanPhase {
+            kind: Phase::Options,
+            title: "Host settings".into(),
+            steps: vec![
+                Step::set_setting("gamestream", true),
+                Step::set_setting("clipboard", "files"),
+                Step::set_setting("clipboard", "everything"),
+            ],
+        }],
+    };
+    exec.execute(&plan, &facts, &choices).expect("the writes");
+
+    let stored: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(stored["gamestream"], true);
+    assert_eq!(stored["clipboard"], "files", "an invalid value never lands");
+    assert_eq!(stored["from_a_newer_host"], "kept");
+    assert!(
+        buf.borrow().contains("couldn't write"),
+        "the refusal is reported"
+    );
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&file), 0o600);
+    assert_eq!(mode(file.parent().unwrap()), 0o700);
     let _ = std::fs::remove_dir_all(&root);
 }

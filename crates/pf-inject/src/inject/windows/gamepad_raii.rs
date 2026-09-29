@@ -15,24 +15,30 @@
 
 use super::channel_proof;
 pub(super) use super::channel_proof::ProofTransport;
+use crate::pad_shm_ring::SectionView;
 use crate::pad_slots::PadCreateFault;
 use anyhow::{anyhow, Context, Result};
 use pf_driver_proto::gamepad::{PadBootstrap, BOOT_MAGIC, GAMEPAD_PROTO_VERSION};
 use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{fence, AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
-use windows::core::{w, HRESULT, HSTRING, PCWSTR};
+use windows::core::{w, GUID, HRESULT, HSTRING, PCWSTR};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    CM_Get_DevNode_Status, CM_Locate_DevNodeW, CM_DEVNODE_STATUS_FLAGS, CM_LOCATE_DEVNODE_NORMAL,
-    CM_PROB, CR_SUCCESS, DN_DRIVER_LOADED, DN_HAS_PROBLEM, DN_STARTED,
+    CM_Get_DevNode_PropertyW, CM_Get_DevNode_Status, CM_Locate_DevNodeW, CM_DEVNODE_STATUS_FLAGS,
+    CM_LOCATE_DEVNODE_NORMAL, CM_PROB, CR_SUCCESS, DN_DRIVER_LOADED, DN_HAS_PROBLEM, DN_STARTED,
 };
-use windows::Win32::Devices::Enumeration::Pnp::{SwDeviceClose, HSWDEVICE};
+use windows::Win32::Devices::Enumeration::Pnp::{
+    SwDeviceClose, SwDeviceCreate, HSWDEVICE, SW_DEVICE_CREATE_INFO,
+};
+use windows::Win32::Devices::Properties::{
+    DEVPKEY_Device_HardwareIds, DEVPROPTYPE, DEVPROP_TYPE_STRING_LIST,
+};
 use windows::Win32::Foundation::{
     CloseHandle, DuplicateHandle, GetLastError, LocalFree, SetLastError, DUPLICATE_HANDLE_OPTIONS,
-    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
-    WIN32_ERROR,
+    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, E_FAIL, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
+    WAIT_OBJECT_0, WIN32_ERROR,
 };
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -42,7 +48,9 @@ use windows::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_ALL_ACCESS,
     FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
 };
-use windows::Win32::System::Threading::{GetCurrentProcess, SetEvent, WaitForSingleObject};
+use windows::Win32::System::Threading::{
+    CreateEventW, GetCurrentProcess, SetEvent, WaitForSingleObject,
+};
 
 /// `SECTION_MAP_READ | SECTION_MAP_WRITE` — what the pad driver maps. Granted in
 /// [`PadChannel::deliver_to`] instead of `DUPLICATE_SAME_ACCESS`, so the remote handle
@@ -55,6 +63,8 @@ pub(super) struct Shm {
     /// Duplication source for the sealed channel.
     handle: OwnedHandle,
     view: MEMORY_MAPPED_VIEW_ADDRESS,
+    /// Bytes mapped at `view`.
+    len: usize,
 }
 
 /// SDDL `SECURITY_ATTRIBUTES` plus the `LocalAlloc`'d descriptor it points at.
@@ -183,12 +193,21 @@ impl Shm {
             // SAFETY: `view` points at `size` writable bytes (just mapped).
             unsafe { core::ptr::write_bytes(view.Value as *mut u8, 0, size) };
         }
-        Ok((Shm { handle, view }, existed))
+        Ok((
+            Shm {
+                handle,
+                view,
+                len: size,
+            },
+            existed,
+        ))
     }
 
-    /// Mapped base. Stable for this `Shm`'s lifetime — `MapViewOfFile` pins the address.
-    pub(super) fn base(&self) -> *mut u8 {
-        self.view.Value as *mut u8
+    /// The mapping, stable for this `Shm`'s lifetime (`MapViewOfFile` pins the address).
+    pub(super) fn view(&self) -> SectionView<'_> {
+        // SAFETY: `MapViewOfFile` mapped `len` RW bytes at `view`; `Drop` unmaps them only after
+        // this borrow ends. The shared bytes are only reached through the view's raw accessors.
+        unsafe { SectionView::from_raw(self.view.Value.cast(), self.len) }
     }
 
     fn raw_handle(&self) -> HANDLE {
@@ -349,18 +368,19 @@ impl PadChannel {
             &HSTRING::from(boot_name.as_str()),
             core::mem::size_of::<PadBootstrap>(),
         )?;
-        let base = boot.base();
-        // SAFETY: `base` is the live, page-aligned mailbox view (>= size_of::<PadBootstrap>()); the
-        // field offsets are pinned by the proto's asserts and naturally aligned, so the atomic views
-        // are valid. `host_proto` is published BEFORE `magic` (Release) — a driver that observes the
-        // magic (Acquire) sees the version.
-        unsafe {
-            (*(base.add(core::mem::offset_of!(PadBootstrap, host_proto)) as *const AtomicU32))
-                .store(GAMEPAD_PROTO_VERSION, Ordering::Relaxed);
-            fence(Ordering::Release);
-            (*(base.add(core::mem::offset_of!(PadBootstrap, magic)) as *const AtomicU32))
-                .store(BOOT_MAGIC, Ordering::Release);
-        }
+        // `host_proto` before `magic` (Release): a driver that sees the magic sees the version.
+        let mailbox = boot.view();
+        mailbox.store_u32(
+            core::mem::offset_of!(PadBootstrap, host_proto),
+            GAMEPAD_PROTO_VERSION,
+            Ordering::Relaxed,
+        );
+        fence(Ordering::Release);
+        mailbox.store_u32(
+            core::mem::offset_of!(PadBootstrap, magic),
+            BOOT_MAGIC,
+            Ordering::Release,
+        );
         created_names().push(boot_name.clone());
         Ok(PadChannel {
             data,
@@ -388,8 +408,9 @@ impl Drop for PadChannel {
 }
 
 impl PadChannel {
-    pub(super) fn data_base(&self) -> *mut u8 {
-        self.data.base()
+    /// The DATA section this channel delivers.
+    pub(super) fn data(&self) -> SectionView<'_> {
+        self.data.view()
     }
 
     pub(super) fn boot_name(&self) -> &str {
@@ -397,14 +418,11 @@ impl PadChannel {
     }
 
     fn boot_load(&self, off: usize) -> u32 {
-        // SAFETY: the mailbox view is live (owned by `self.boot`), page-aligned, and every
-        // `PadBootstrap` u32 field offset is 4-aligned (proto asserts), so the atomic view is valid;
-        // no reference into the shared region outlives the load.
-        unsafe { (*(self.boot.base().add(off) as *const AtomicU32)).load(Ordering::Acquire) }
+        self.boot.view().load_u32(off, Ordering::Acquire)
     }
 
     /// Bind to the `SwDeviceCreate` instance so [`Self::pump`] can ask for a channel proof.
-    /// Call between `create_swdevice` and [`Self::deliver_eager`].
+    /// Call between [`create_swdevice`] and [`Self::deliver_eager`].
     /// `instance_id` is `None` on the `devgen` fallback: no device to ask, no delivery
     /// unless [`TRUST_MAILBOX_ENV`] is set.
     pub(super) fn bind_devnode(
@@ -424,6 +442,10 @@ impl PadChannel {
         let drv_proto = self.boot_load(core::mem::offset_of!(PadBootstrap, driver_proto));
         if drv_proto != 0 && drv_proto != GAMEPAD_PROTO_VERSION && !self.warned_proto {
             self.warned_proto = true;
+            crate::note_pad_driver(crate::PadDriverVerdict::ProtocolMismatch {
+                driver_proto: drv_proto,
+                host_proto: GAMEPAD_PROTO_VERSION,
+            });
             tracing::warn!(
                 mailbox = %self.boot_name,
                 driver_proto = drv_proto,
@@ -602,20 +624,26 @@ impl PadChannel {
             .context("DuplicateHandle(gamepad DATA section) into the driver's WUDFHost")?;
         }
         let value = remote.0 as usize as u64;
-        let base = self.boot.base();
         let seq = BOOT_SEQ.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: live, page-aligned mailbox view; `data_handle` is 8-aligned and `handle_pid`/
-        // `handle_seq` 4-aligned (proto asserts). The handle value + owning pid are published BEFORE
-        // the seq (Release) — a driver that observes the new seq (Acquire) sees a complete delivery.
-        unsafe {
-            (*(base.add(core::mem::offset_of!(PadBootstrap, data_handle)) as *const AtomicU64))
-                .store(value, Ordering::Relaxed);
-            (*(base.add(core::mem::offset_of!(PadBootstrap, handle_pid)) as *const AtomicU32))
-                .store(pid, Ordering::Relaxed);
-            fence(Ordering::Release);
-            (*(base.add(core::mem::offset_of!(PadBootstrap, handle_seq)) as *const AtomicU32))
-                .store(seq, Ordering::Release);
-        }
+        // Handle value + owning pid before the seq (Release): a driver that sees the new seq
+        // (Acquire) sees a complete delivery.
+        let mailbox = self.boot.view();
+        mailbox.store_u64(
+            core::mem::offset_of!(PadBootstrap, data_handle),
+            value,
+            Ordering::Relaxed,
+        );
+        mailbox.store_u32(
+            core::mem::offset_of!(PadBootstrap, handle_pid),
+            pid,
+            Ordering::Relaxed,
+        );
+        fence(Ordering::Release);
+        mailbox.store_u32(
+            core::mem::offset_of!(PadBootstrap, handle_seq),
+            seq,
+            Ordering::Release,
+        );
         Ok((seq, process))
     }
 
@@ -642,17 +670,17 @@ impl PadChannel {
 }
 
 /// `SwDeviceCreate` completion context: event, HRESULT, and PnP instance id.
-/// Shared by every Windows companion backend; the creator blocks on the event.
+/// [`create_swdevice`] blocks on the event.
 #[repr(C)]
-pub(super) struct SwCreateCtx {
-    pub(super) event: HANDLE,
-    pub(super) result: HRESULT,
-    pub(super) instance_id: [u16; 128],
+struct SwCreateCtx {
+    event: HANDLE,
+    result: HRESULT,
+    instance_id: [u16; 128],
 }
 
 /// `SwDeviceCreate` callback: stash result + instance id and wake the creator.
 /// The creator blocks on the event, so there is no concurrent access to `*ctx`.
-pub(super) unsafe extern "system" fn sw_create_cb(
+unsafe extern "system" fn sw_create_cb(
     _dev: HSWDEVICE,
     result: HRESULT,
     ctx: *const c_void,
@@ -679,18 +707,186 @@ pub(super) unsafe extern "system" fn sw_create_cb(
 }
 
 impl SwCreateCtx {
-    pub(super) fn instance_id(&self) -> Option<String> {
+    fn instance_id(&self) -> Option<String> {
         let len = self.instance_id.iter().position(|&c| c == 0)?;
         (len > 0).then(|| String::from_utf16_lossy(&self.instance_id[..len]))
     }
 }
 
+/// A `SwDeviceCreate`'d devnode; drop removes it (`SwDeviceClose`).
 pub(super) struct SwDevice(HSWDEVICE);
 
-impl SwDevice {
-    pub(super) fn new(hsw: HSWDEVICE) -> Self {
-        SwDevice(hsw)
+/// PnP identity for a virtual devnode, so one [`create_swdevice`] builds every pad, the XUSB
+/// pad and the mouse.
+pub(super) struct SwDeviceProfile<'a> {
+    /// Distinct namespaces per type (`pf_pad_<idx>` vs `pf_ds4_<idx>`) so two types never reuse
+    /// a devnode shell.
+    pub instance: &'a str,
+    /// `Data1` of the ContainerId — a per-family tag (`"PFDS"` pads, `"PFMO"` mouse) so two
+    /// families at the same index never share a container (Windows would group them as one
+    /// device).
+    pub container_tag: u32,
+    /// Also stamped into the devnode Location, which the driver reads as its bootstrap-mailbox
+    /// index.
+    pub container_index: u8,
+    /// INF-matched hardware id, listed first so the INF binds.
+    pub hwid: &'static str,
+    /// `VID_…&PID_…` behind the synthesized `USB\` hardware and compatible ids. `None` lists the
+    /// INF id alone: XInput finds the XUSB pad by interface GUID, not VID/PID.
+    pub usb_vid_pid: Option<&'a str>,
+    /// Appended as `&MI_xx` on the USB hardware ids. hidclass mirrors the parent's `USB\VID…`
+    /// tokens into the HID child; hidapi/SDL/Steam parse `MI_` as `bInterfaceNumber` (0 if
+    /// absent). The Steam Deck controller lives on interface 2.
+    pub usb_mi: Option<u8>,
+    /// Present as a classic-Bluetooth HID pad: `BTHENUM\` hardware and compatible ids built from
+    /// `usb_vid_pid` instead of `USB\` ones. SDL and Steam read the bus from the compatible ids.
+    pub bluetooth: bool,
+    pub description: &'a str,
+    /// The `SWD\<enumerator>\<instance>` namespace. hidclass names the HID child after it, so a
+    /// pad Steam must recognise carries its VID/PID here (`VID_054C&PID_0CE6&MI_03`,
+    /// `VID_045E&PID_0B13`): Steam merges a pad's views by that token in the path, and under
+    /// `punktfunk` it listed the same pad twice.
+    pub enumerator: &'a str,
+}
+
+/// The Bluetooth HID service every classic-Bluetooth pad enumerates under.
+const BTH_HID_SERVICE: &str = "BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}";
+
+/// `VID_2DC8&PID_6012` → the hardware id Windows gives that pad over Bluetooth,
+/// `BTHENUM\{00001124-…}_VID&00022DC8_PID&6012` (`0002`: a USB-IF vendor id).
+fn bthenum_id(vid_pid: &str) -> String {
+    let vid = vid_pid.get(4..8).unwrap_or("0000");
+    let pid = vid_pid.get(13..17).unwrap_or("0000");
+    format!("{BTH_HID_SERVICE}_VID&0002{vid}_PID&{pid}")
+}
+
+/// Spawn a virtual devnode under `p.enumerator` and return it with its PnP instance id.
+///
+/// Game detection (`design/windows-dualsense-game-detection.md`): `HIDD_ATTRIBUTES` VID/PID
+/// satisfies SDL/HIDAPI/RawInput, but a native PS5 path classifies connection type by walking
+/// to the parent and matching `"USB"`/`"BTHENUM"` in `DEVPKEY_Device_CompatibleIds`. Set these
+/// via `SW_DEVICE_CREATE_INFO` only — a later `DEVPROPERTY` write of bus/identity keys is ignored:
+/// - `pszzCompatibleIds` starts with a `USB\` token so the parent walk resolves USB.
+/// - `pszzHardwareIds` lists the INF id first, then `USB\VID_…[&REV_0100]`, so hidclass derives
+///   `HID\VID_…` child ids a genuine USB DualSense exposes.
+/// - a deterministic per-pad `pContainerId` (the null sentinel trips an `xinput1_4` slot skip).
+///
+/// Enumerator names must not contain `_` (`punktfunk`, not `pf_dualsense`) and `pCallback` is
+/// mandatory — either yields `E_INVALIDARG`. The caller must be Administrator (the host runs as
+/// LocalSystem).
+pub(super) fn create_swdevice(p: &SwDeviceProfile) -> Result<(SwDevice, Option<String>)> {
+    let multi_sz = |ids: &[&str]| -> Vec<u16> {
+        ids.iter()
+            .flat_map(|s| s.encode_utf16().chain(std::iter::once(0)))
+            .chain(std::iter::once(0))
+            .collect()
+    };
+    let (hwids, compat) = match p.usb_vid_pid {
+        Some(vid_pid) if p.bluetooth => {
+            let bth = bthenum_id(vid_pid);
+            // A `BTHENUM\` token and no `USB` one → native bus-type detection resolves Bluetooth.
+            let compat = multi_sz(&[&bth, BTH_HID_SERVICE]);
+            (multi_sz(&[p.hwid, &bth]), Some(compat))
+        }
+        Some(vid_pid) => {
+            let mi = p.usb_mi.map(|n| format!("&MI_{n:02}")).unwrap_or_default();
+            let usb_rev = format!("USB\\{vid_pid}&REV_0100{mi}");
+            let usb = format!("USB\\{vid_pid}{mi}");
+            let hwids = multi_sz(&[p.hwid, &usb_rev, &usb]);
+            // A `USB\` token first → native bus-type detection resolves USB.
+            let compat = multi_sz(&[&usb, "USB\\Class_03&SubClass_00&Prot_00", "USB\\Class_03"]);
+            (hwids, Some(compat))
+        }
+        None => (multi_sz(&[p.hwid]), None),
+    };
+    let instid = HSTRING::from(p.instance);
+    let desc = HSTRING::from(p.description);
+    // Pad index in Location — the driver polls its bootstrap mailbox by it.
+    let loc = HSTRING::from(p.container_index.to_string());
+    let enumerator = HSTRING::from(p.enumerator);
+    let container = GUID::from_values(
+        p.container_tag,
+        0x0000,
+        0x0000,
+        [0, 0, 0, 0, 0, 0, 0, p.container_index],
+    );
+
+    // The id buffers and `container` outlive SwDeviceCreate (we wait on the event before return).
+    let info = SW_DEVICE_CREATE_INFO {
+        cbSize: size_of::<SW_DEVICE_CREATE_INFO>() as u32,
+        pszInstanceId: PCWSTR(instid.as_ptr()),
+        pszzHardwareIds: PCWSTR(hwids.as_ptr()),
+        pszzCompatibleIds: compat
+            .as_ref()
+            .map_or(PCWSTR::null(), |c| PCWSTR(c.as_ptr())),
+        pContainerId: &container,
+        CapabilityFlags: 0x0000_000B, // DriverRequired | SilentInstall | Removable
+        pszDeviceDescription: PCWSTR(desc.as_ptr()),
+        pszDeviceLocation: PCWSTR(loc.as_ptr()),
+        ..Default::default()
+    };
+
+    // SAFETY: a manual-reset, initially-unsignaled, unnamed event.
+    let event = unsafe { CreateEventW(None, true, false, PCWSTR::null())? };
+    // `result` starts as E_FAIL: a timeout must not read a zeroed HRESULT as success.
+    // Heap-allocated: `sw_create_cb` writes through this pointer then `SetEvent`s. The wait is
+    // 10 s; on a wedged-PnP timeout the callback may still be pending, so we leak the box and
+    // leave the event open rather than let a late write hit recycled memory or a reused handle.
+    let ctx = Box::into_raw(Box::new(SwCreateCtx {
+        event,
+        result: E_FAIL,
+        instance_id: [0; 128],
+    }));
+    // SAFETY: info + the buffers outlive the call; `ctx` is a live heap allocation that outlives
+    // every path below (reclaimed only where the callback provably ran). windows-rs returns the
+    // HSWDEVICE (the C out-param) as the Result value.
+    let hsw = match unsafe {
+        SwDeviceCreate(
+            PCWSTR(enumerator.as_ptr()),
+            w!("HTREE\\ROOT\\0"),
+            &info,
+            None,
+            Some(sw_create_cb),
+            Some(ctx as *const c_void),
+        )
+    } {
+        Ok(h) => h,
+        Err(e) => {
+            // SAFETY: the call failed, so no callback was registered and `ctx` is ours to reclaim;
+            // `event` is valid and unreferenced.
+            unsafe {
+                drop(Box::from_raw(ctx));
+                let _ = CloseHandle(event);
+            }
+            return Err(anyhow!("SwDeviceCreate({}): {e}", p.instance));
+        }
+    };
+    // From here the handle is ours: every early return removes the devnode.
+    let sw = SwDevice(hsw);
+    // SAFETY: event is valid.
+    let wait = unsafe { WaitForSingleObject(event, 10_000) };
+    if wait != WAIT_OBJECT_0 {
+        // Timed out: leak `ctx` and leave `event` open so a late callback writes live memory.
+        return Err(anyhow!(
+            "SwDeviceCreate({}) enumeration callback never fired (10s) — PnP may be wedged",
+            p.instance
+        ));
     }
+    // SAFETY: the callback signalled the event, so nothing else will touch `ctx`/`event`.
+    // `ctx` came from `Box::into_raw` above and is reclaimed exactly once here; `event` is
+    // valid and no longer referenced by a pending callback.
+    let ctx = unsafe {
+        let _ = CloseHandle(event);
+        Box::from_raw(ctx)
+    };
+    if ctx.result.is_err() {
+        return Err(anyhow!(
+            "SwDeviceCreate({}) enumeration: {:?}",
+            p.instance,
+            ctx.result
+        ));
+    }
+    Ok((sw, ctx.instance_id()))
 }
 
 impl Drop for SwDevice {
@@ -704,8 +900,9 @@ impl Drop for SwDevice {
 const ATTACH_GRACE: Duration = Duration::from_secs(3);
 
 /// Per-pad attach watcher. Feed `driver_proto` every service tick; logs attach,
-/// version mismatch, or — after [`ATTACH_GRACE`] of silence — one diagnosis.
-/// States never repeat a log line, so the pump can call this at full rate.
+/// version mismatch, a pad that enumerated as another controller, or — after
+/// [`ATTACH_GRACE`] of silence — one diagnosis. States never repeat a log line, so the
+/// pump can call this at full rate.
 pub(super) struct DriverAttach {
     driver: &'static str,
     inf: &'static str,
@@ -713,6 +910,8 @@ pub(super) struct DriverAttach {
     shm_name: String,
     /// `None` on the out-of-band fallback path.
     instance_id: Option<String>,
+    /// The `device_type` the pad's hardware id names; `None` for the XUSB pad and the mouse.
+    identity: Option<u8>,
     created: Instant,
     state: AttachState,
 }
@@ -738,12 +937,20 @@ impl DriverAttach {
             driver_log,
             shm_name,
             instance_id,
+            identity: pf_driver_proto::gamepad::devtype_from_hwids(driver),
             created: Instant::now(),
             state: AttachState::Waiting,
         }
     }
 
+    /// For the XUSB pad and the mouse, whose sections carry no driver revision.
     pub(super) fn observe(&mut self, driver_proto: u32) {
+        self.observe_pad(driver_proto, 0);
+    }
+
+    /// `driver_rev` is read after `driver_proto` ([`crate::pad_shm_ring::driver_marks`]);
+    /// only the attach tick uses it.
+    pub(super) fn observe_pad(&mut self, driver_proto: u32, driver_rev: u32) {
         match self.state {
             AttachState::Attached => {}
             AttachState::Waiting | AttachState::Warned if driver_proto != 0 => {
@@ -763,14 +970,54 @@ impl DriverAttach {
                         "gamepad driver/host protocol mismatch — update the drivers: punktfunk-host.exe driver install --gamepad"
                     );
                 }
+                self.check_pad(driver_rev);
                 self.state = AttachState::Attached;
             }
             AttachState::Waiting if self.created.elapsed() >= ATTACH_GRACE => {
+                if self.identity.is_some() {
+                    crate::note_pad_driver(crate::PadDriverVerdict::NotAttached);
+                }
                 self.diagnose();
                 self.state = AttachState::Warned;
             }
             _ => {}
         }
+    }
+
+    /// Judge a freshly attached pad's driver ([`crate::pad_attach_verdict`]) for the diagnostics
+    /// row, and WARN on an old revision or on a pad that reports another controller's VID/PID
+    /// than its hardware id names (an older driver that did not know the id).
+    fn check_pad(&self, driver_rev: u32) {
+        let Some(devtype) = self.identity else {
+            return;
+        };
+        let got = self
+            .instance_id
+            .as_deref()
+            .and_then(channel_proof::hid_vid_pid);
+        let verdict = crate::pad_attach_verdict(devtype, driver_rev, got);
+        let fix = "reinstall the host with its controller drivers";
+        match &verdict {
+            crate::PadDriverVerdict::WrongIdentity { want, got } => tracing::warn!(
+                driver = self.driver,
+                want = %format!("VID_{:04X}&PID_{:04X}", want.0, want.1),
+                got = %format!("VID_{:04X}&PID_{:04X}", got.0, got.1),
+                fix,
+                "virtual pad enumerated as another controller; games see the wrong pad"
+            ),
+            crate::PadDriverVerdict::Stale {
+                driver_rev,
+                host_rev,
+            } => tracing::warn!(
+                driver = self.driver,
+                driver_rev,
+                host_rev,
+                fix,
+                "gamepad driver is older than this host; pads run with its old behaviour"
+            ),
+            _ => {}
+        }
+        crate::note_pad_driver(verdict);
     }
 
     /// One-shot WARN: driver-store presence, devnode PnP problem, where to look next.
@@ -782,9 +1029,10 @@ impl DriverAttach {
         let (driver, inf, driver_log) = (self.driver, self.inf, self.driver_log);
         let shm_name = self.shm_name.clone();
         let instance_id = self.instance_id.clone();
+        let pad = self.identity.is_some();
         std::thread::Builder::new()
             .name("pf-driver-diagnose".into())
-            .spawn(move || diagnose_blocking(driver, inf, driver_log, &shm_name, instance_id))
+            .spawn(move || diagnose_blocking(driver, inf, driver_log, &shm_name, instance_id, pad))
             .ok();
     }
 }
@@ -796,6 +1044,7 @@ fn diagnose_blocking(
     driver_log: &'static str,
     shm_name: &str,
     instance_id: Option<String>,
+    pad: bool,
 ) {
     let store = match driver_store_has(inf) {
         Some(true) => "driver package present in the driver store",
@@ -805,7 +1054,7 @@ fn diagnose_blocking(
         None => "driver store could not be queried (pnputil failed or still enumerating)",
     };
     let devnode = match &instance_id {
-        Some(id) => devnode_status_line(id),
+        Some(id) => devnode_status_line(id, pad),
         None => "no per-session devnode (SwDeviceCreate failed earlier — see the warning above)"
             .to_string(),
     };
@@ -837,11 +1086,7 @@ fn driver_store_inventory() -> Option<&'static str> {
     static SPAWN: std::sync::Once = std::sync::Once::new();
     SPAWN.call_once(|| {
         std::thread::spawn(|| {
-            // Resolve via `%SystemRoot%\System32\pnputil.exe`. SYSTEM must not search PATH /
-            // the EXE directory — a planted `pnputil.exe` beside the host would run elevated.
-            let pnputil = std::env::var("SystemRoot")
-                .map(|r| format!(r"{r}\System32\pnputil.exe"))
-                .unwrap_or_else(|_| "pnputil.exe".to_string());
+            let pnputil = pf_paths::system32("pnputil.exe");
             let inv = std::process::Command::new(&pnputil)
                 .arg("/enum-drivers")
                 .output()
@@ -871,11 +1116,8 @@ fn driver_store_has(inf: &str) -> Option<bool> {
     Some(inv.contains(&inf.to_ascii_lowercase()))
 }
 
-fn devnode_status_line(instance_id: &str) -> String {
-    let wide: Vec<u16> = instance_id
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+fn devnode_status_line(instance_id: &str, pad: bool) -> String {
+    let wide = HSTRING::from(instance_id);
     let mut devinst = 0u32;
     // SAFETY: `wide` is a valid NUL-terminated UTF-16 instance id; `devinst` receives the handle.
     let cr = unsafe {
@@ -899,11 +1141,17 @@ fn devnode_status_line(instance_id: &str) -> String {
         return format!("devnode {instance_id}: status query failed (CR={})", cr.0);
     }
     if status.0 & DN_HAS_PROBLEM.0 != 0 {
+        let refused =
+            pad && hardware_ids(devinst).is_some_and(|ids| crate::pad_refused(problem.0, &ids));
+        let hint = if refused {
+            "the gamepad driver refused it: no pf_* hardware id names this pad; the host and \
+             driver disagree on the controller list — reinstall both"
+        } else {
+            cm_problem_hint(problem.0)
+        };
         return format!(
-            "devnode {instance_id} has PnP problem code {} ({}) [status 0x{:08x}]",
-            problem.0,
-            cm_problem_hint(problem.0),
-            status.0
+            "devnode {instance_id} has PnP problem code {} ({hint}) [status 0x{:08x}]",
+            problem.0, status.0
         );
     }
     format!(
@@ -911,6 +1159,36 @@ fn devnode_status_line(instance_id: &str) -> String {
         status.0,
         status.0 & DN_DRIVER_LOADED.0 != 0,
         status.0 & DN_STARTED.0 != 0,
+    )
+}
+
+/// A devnode's hardware ids, lowercase and `;`-terminated, the form the driver matches on.
+fn hardware_ids(devinst: u32) -> Option<String> {
+    let mut ty = DEVPROPTYPE(0);
+    let mut buf = [0u16; 512];
+    let mut size = std::mem::size_of_val(&buf) as u32;
+    // SAFETY: `devinst` is a located devnode; the key is a static const; `buf` holds `size`
+    // bytes and `ty` / `size` are valid out-params.
+    let cr = unsafe {
+        CM_Get_DevNode_PropertyW(
+            devinst,
+            &DEVPKEY_Device_HardwareIds,
+            &mut ty,
+            Some(buf.as_mut_ptr().cast()),
+            &mut size,
+            0,
+        )
+    };
+    if cr != CR_SUCCESS || ty != DEVPROP_TYPE_STRING_LIST {
+        return None;
+    }
+    let len = (size as usize / 2).min(buf.len());
+    Some(
+        buf[..len]
+            .split(|&c| c == 0)
+            .filter(|id| !id.is_empty())
+            .map(|id| String::from_utf16_lossy(id).to_ascii_lowercase() + ";")
+            .collect(),
     )
 }
 
@@ -926,6 +1204,22 @@ fn cm_problem_hint(problem: u32) -> &'static str {
         43 => "reported failure after start — check the driver log",
         52 => "driver signature rejected — certificate not in Root/TrustedPublisher, or blocked by Memory Integrity",
         _ => "see Device Manager for this code",
+    }
+}
+
+#[cfg(test)]
+mod bthenum_tests {
+    use super::*;
+
+    /// hidapi reports Bluetooth for a `BTHENUM` compatible id, and USB for any id that says `USB`.
+    #[test]
+    fn bluetooth_ids_name_the_pad_and_never_usb() {
+        let id = bthenum_id("VID_2DC8&PID_6012");
+        assert_eq!(
+            id,
+            "BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}_VID&00022DC8_PID&6012"
+        );
+        assert!(!id.to_ascii_uppercase().contains("USB"));
     }
 }
 

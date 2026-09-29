@@ -124,6 +124,26 @@ impl Drop for Sc2Capture {
     }
 }
 
+/// Log a HIDAPI pad's report descriptor, once per slot open, so a "Send logs" bundle carries the
+/// capture a native host identity is built from. Silent where the node will not open.
+pub(crate) fn log_descriptor(path: &str, vid: u16, pid: u16) {
+    let Ok(c_path) = std::ffi::CString::new(path) else {
+        return;
+    };
+    // SAFETY: `c_path` is a valid NUL-terminated string that outlives the call.
+    let dev = Dev(unsafe { hid::SDL_hid_open_path(c_path.as_ptr()) });
+    if dev.0.is_null() {
+        return;
+    }
+    let mut buf = [0u8; 4096];
+    // SAFETY: `dev.0` is open and `buf` is writable for its whole length.
+    let n = unsafe { hid::SDL_hid_get_report_descriptor(dev.0, buf.as_mut_ptr(), buf.len()) };
+    if n > 0 {
+        let rdesc = crate::presets::hex_lower(&buf[..n as usize]);
+        tracing::info!(vid, pid, len = n, rdesc, "controller HID descriptor");
+    }
+}
+
 struct Dev(*mut hid::SDL_hid_device);
 
 // SAFETY: the handle moves into the reader thread once and is used and closed only there.
@@ -269,6 +289,36 @@ mod tests {
         r[30..34].copy_from_slice(&ts.to_le_bytes());
         r[36] = 0x11; // gyro
         r
+    }
+
+    /// `clients/shared/sc2-vectors.json`'s trace through one gate; the Swift and Kotlin gates
+    /// replay the same file.
+    #[test]
+    fn imu_gate_matches_the_shared_trace() {
+        let raw = include_str!("../../../clients/shared/sc2-vectors.json");
+        let file: serde_json::Value = serde_json::from_str(raw).expect("vector file parses");
+        let mut gate = ImuGate::default();
+        for (i, step) in file["imu_trace"]
+            .as_array()
+            .expect("imu_trace")
+            .iter()
+            .enumerate()
+        {
+            let len = step["len"].as_u64().unwrap() as usize;
+            let mut r = vec![0u8; len];
+            r[0] = step["id"].as_u64().unwrap() as u8;
+            let ts = step["ts"].as_u64().unwrap() as u32;
+            let imu = ImuGate::OFFSET..len.min(ImuGate::OFFSET + ImuGate::LEN);
+            r[ImuGate::OFFSET..ImuGate::OFFSET + 4].copy_from_slice(&ts.to_le_bytes());
+            r[ImuGate::OFFSET + 4..imu.end].fill(0x11);
+            let before = r.clone();
+            gate.apply(&mut r);
+            if step["pass"].as_bool().unwrap() {
+                assert_eq!(r, before, "step {i}");
+            } else {
+                assert!(r[imu].iter().all(|&b| b == 0), "step {i}");
+            }
+        }
     }
 
     #[test]

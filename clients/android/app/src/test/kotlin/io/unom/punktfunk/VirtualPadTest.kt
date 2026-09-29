@@ -33,7 +33,7 @@ class VirtualPadTest {
     fun presets_carry_the_controls_the_design_names() {
         fun labels(layout: String) = padControls(layout, 933f, 420f).map { it.label }.toSet()
         val full = labels("full")
-        assertEquals(13, full.size)
+        assertEquals(14, full.size)
         assertTrue(
             full.containsAll(
                 listOf(
@@ -54,7 +54,7 @@ class VirtualPadTest {
     @Test
     fun preset_ids_are_the_schema_ids() {
         assertEquals(
-            setOf("lb", "lt", "rb", "rt", "l3", "r3", "ls", "rs", "dpad", "face", "select", "guide", "start"),
+            setOf("lb", "lt", "rb", "rt", "l3", "r3", "ls", "rs", "dpad", "face", "select", "guide", "start", "ring"),
             padControls("full", 933f, 420f).map { it.id }.toSet(),
         )
     }

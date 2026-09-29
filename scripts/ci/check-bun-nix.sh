@@ -32,6 +32,9 @@
 # the same exact version. Nothing checked that before; a half-moved pin regenerates the file with a
 # generator the flake does not use.
 #
+# It also holds every other bun pin (the oven/bun images, flake.nix's overlay, the Windows portable
+# bun, the winget server) to the release in ci/bun.env, which the Linux builders install.
+#
 # The list of packages to check is read out of packaging/nix/packages.nix (its `bunNix = src + …`
 # lines) rather than hardcoded here, so a third bun package is covered the day it is added — and an
 # empty list is a hard error, because a gate that checks nothing passes exactly like a clean tree.
@@ -102,6 +105,28 @@ while read -r dir; do
         fail=1
     fi
 done < "$TMP/roots"
+
+# --- the bun runtime pin ---------------------------------------------------------------------------
+# ci/bun.env names the one bun release; every image tag and download URL elsewhere must match it,
+# and flake.nix's x86_64 hash must be the same asset's sum. Release notes and the changelog are
+# history and are not checked.
+BUN_PIN=$(sed -n 's/^BUN_VERSION=//p' "$ROOT/ci/bun.env")
+BUN_SHA=$(sed -n 's/^BUN_SHA=//p' "$ROOT/ci/bun.env")
+[ -n "$BUN_PIN" ] && [ -n "$BUN_SHA" ] || { echo "check-bun-nix: no BUN_VERSION/BUN_SHA in ci/bun.env" >&2; exit 1; }
+git -C "$ROOT" grep -n -o -E 'oven/bun:[0-9][0-9.]*[0-9]|bun-v[0-9][0-9.]*[0-9]' -- \
+    ':!CHANGELOG.md' ':!docs/releases' > "$TMP/bunpins" || true
+[ -s "$TMP/bunpins" ] || { echo "check-bun-nix: found no bun pin outside ci/bun.env" >&2; exit 1; }
+while IFS= read -r hit; do
+    case "$hit" in
+        *"oven/bun:$BUN_PIN" | *"bun-v$BUN_PIN") ;;
+        *) echo "check-bun-nix: $hit disagrees with ci/bun.env (bun $BUN_PIN)" >&2; fail=1 ;;
+    esac
+done < "$TMP/bunpins"
+grep -q "version = \"$BUN_PIN\";" "$FLAKE" || {
+    echo "check-bun-nix: flake.nix's bun overlay does not set version = \"$BUN_PIN\"" >&2; fail=1; }
+BUN_SRI=$(bun -e "console.log('sha256-'+Buffer.from(process.argv[1],'hex').toString('base64'))" "$BUN_SHA")
+grep -q "hash = \"$BUN_SRI\";" "$FLAKE" || {
+    echo "check-bun-nix: flake.nix has no x86_64 bun hash $BUN_SRI (BUN_SHA in ci/bun.env)" >&2; fail=1; }
 
 # --- the generator ---------------------------------------------------------------------------------
 # Prefer an already-installed bun2nix at the pinned version (fast, offline — the dev case); otherwise
@@ -176,6 +201,6 @@ done < "$TMP/roots"
 
 [ "$checked" -gt 0 ] || { echo "check-bun-nix: checked nothing — refusing to report success" >&2; exit 1; }
 if [ "$fail" -eq 0 ] && [ "$FIX" -eq 0 ]; then
-    echo "check-bun-nix: $checked bun package(s) in sync, bun2nix pinned at $PINNED everywhere"
+    echo "check-bun-nix: $checked bun package(s) in sync, bun2nix pinned at $PINNED, bun $BUN_PIN everywhere"
 fi
 exit "$fail"

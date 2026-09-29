@@ -9,9 +9,9 @@
 //! as launch authority. Per-plugin ownership therefore requires runner process isolation rather
 //! than an additional registry check.
 
+use super::auth::{AnyId, OwnedId, PluginId};
 use super::shared::*;
 use crate::events::{emit, EventKind};
-use axum::Extension;
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
@@ -32,6 +32,19 @@ pub(crate) struct PluginUi {
     pub secret: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    /// Serves a page the console opens and lists in the nav. Absent means yes, as before the flag.
+    #[serde(default = "yes")]
+    pub page: bool,
+    /// Serves `GET/PUT /__config`, the plugin-wide settings form.
+    #[serde(default)]
+    pub config: bool,
+    /// Serves `GET/PUT /__game?entry=<id>`, a tab on each library entry's page.
+    #[serde(default)]
+    pub game: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -46,6 +59,13 @@ pub(crate) struct PluginRegistration {
     /// Game sources); omit the field to keep a nav page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
+    /// Stages this plugin holds (`game.launching`). The host POSTs the event to `/__hold` on
+    /// `ui.port` and waits for a 2xx. Needs `ui`.
+    #[serde(default)]
+    pub holds: Vec<String>,
+    /// How long a hold may take, 1–120 000 ms. Absent means 30 000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_timeout_ms: Option<u32>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -69,6 +89,12 @@ pub(crate) struct PluginUiPublic {
     pub port: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    /// See [`PluginUi::page`].
+    pub page: bool,
+    /// See [`PluginUi::config`].
+    pub config: bool,
+    /// See [`PluginUi::game`].
+    pub game: bool,
 }
 
 /// Listing row. Never carries the secret — the browser reaches the UI only through the console proxy.
@@ -97,6 +123,9 @@ struct StoredUi {
     port: u16,
     secret: String,
     icon: Option<String>,
+    page: bool,
+    config: bool,
+    game: bool,
 }
 
 /// `expires_at` is monotonic [`Instant`] — a wall-clock jump must not expire a live lease.
@@ -105,6 +134,8 @@ struct Stored {
     version: Option<String>,
     ui: Option<StoredUi>,
     category: Option<String>,
+    holds: Vec<String>,
+    hold_timeout: Duration,
     expires_at: Instant,
 }
 
@@ -127,6 +158,8 @@ struct Valid {
     version: Option<String>,
     ui: Option<StoredUi>,
     category: Option<String>,
+    holds: Vec<String>,
+    hold_timeout: Duration,
 }
 
 impl PluginRegistry {
@@ -153,6 +186,8 @@ impl PluginRegistry {
                 version: v.version,
                 ui: v.ui,
                 category: v.category,
+                holds: v.holds,
+                hold_timeout: v.hold_timeout,
                 expires_at,
             },
         );
@@ -182,6 +217,9 @@ impl PluginRegistry {
                 ui: s.ui.as_ref().map(|u| PluginUiPublic {
                     port: u.port,
                     icon: u.icon.clone(),
+                    page: u.page,
+                    config: u.config,
+                    game: u.game,
                 }),
                 category: s.category.clone(),
             })
@@ -202,6 +240,23 @@ impl PluginRegistry {
             port: ui.port,
             secret: ui.secret.clone(),
         })
+    }
+
+    /// Live plugins holding `stage`, with the credentials to call them. Read-only.
+    fn holders(&self, stage: &str) -> Vec<Holder> {
+        let map = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        map.iter()
+            .filter(|(_, s)| s.is_live() && s.holds.iter().any(|h| h == stage))
+            .filter_map(|(id, s)| {
+                let ui = s.ui.as_ref()?;
+                Some(Holder {
+                    id: id.clone(),
+                    port: ui.port,
+                    secret: ui.secret.clone(),
+                    timeout: s.hold_timeout,
+                })
+            })
+            .collect()
     }
 
     /// Read-only; does not prune or emit.
@@ -238,6 +293,19 @@ pub(crate) fn live_plugin_ids() -> Vec<String> {
     registry().live_ids()
 }
 
+/// A plugin that holds a stage, as [`crate::holds`] calls it. Carries the secret: never serialize.
+pub(crate) struct Holder {
+    pub id: String,
+    pub port: u16,
+    pub secret: String,
+    pub timeout: Duration,
+}
+
+/// Live plugins registered to hold `stage`.
+pub(crate) fn holders(stage: &str) -> Vec<Holder> {
+    registry().holders(stage)
+}
+
 /// In-process `{port, secret}` for [`crate::library::ask_plugin_launch`]. Same lookup as
 /// `GET /plugins/{id}/ui-credential`, without a management-API round trip to a port this process
 /// already holds.
@@ -257,34 +325,29 @@ pub(crate) fn register_ui_for_test(id: &str, port: u16, secret: &str) {
                 port,
                 secret: secret.to_string(),
                 icon: None,
+                page: true,
+                config: false,
+                game: false,
             }),
             category: None,
+            holds: Vec::new(),
+            hold_timeout: Duration::from_secs(30),
         },
     );
 }
 
-/// Same kebab-case regex the SDK enforces, so the registration id matches the package name.
-fn valid_plugin_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id.as_bytes()[0].is_ascii_lowercase()
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-}
-
-/// A title must not smuggle escapes or newlines into a log line or the nav.
+/// A title must not smuggle escapes, newlines or bidi marks into a log line or the nav.
 fn sanitize(s: &str) -> String {
     s.chars()
-        .filter(|c| !c.is_control())
+        .filter(|&c| !c.is_control() && !crate::native_pairing::is_spoofy_char(c))
         .collect::<String>()
         .trim()
         .to_string()
 }
 
-/// Source is not a [`valid_plugin_id`] — the runner names a unit by `definePlugin` name, package
-/// name, script stem, or `runner`. Sanitize, do not reject: controls go, length is capped, empty
-/// becomes `runner` so a line is never attributed to nothing.
+/// Source is not a [`crate::slug::plugin_id`] — the runner names a unit by `definePlugin` name,
+/// package name, script stem, or `runner`. Sanitize, do not reject: controls go, length is
+/// capped, empty becomes `runner` so a line is never attributed to nothing.
 fn log_target(source: &str) -> String {
     let mut s = sanitize(source);
     if s.is_empty() {
@@ -323,11 +386,7 @@ fn validate(reg: PluginRegistration) -> Result<Valid, String> {
     // so a newer plugin still registers against an older host.
     let category = match reg.category {
         Some(c) => {
-            let ok = (1..=32).contains(&c.len())
-                && c.starts_with(|ch: char| ch.is_ascii_lowercase())
-                && c.bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-            if !ok {
+            if !crate::slug::category(&c) {
                 return Err(
                     "category must be 1–32 chars of [a-z0-9-], starting with a letter".into(),
                 );
@@ -336,11 +395,36 @@ fn validate(reg: PluginRegistration) -> Result<Valid, String> {
         }
         None => None,
     };
+    if let Some(bad) = reg
+        .holds
+        .iter()
+        .find(|h| !crate::holds::STAGES.contains(&h.as_str()))
+    {
+        return Err(format!(
+            "holds: unknown stage `{}` — known: {}",
+            sanitize(bad),
+            crate::holds::STAGES.join(", ")
+        ));
+    }
+    if !reg.holds.is_empty() && ui.is_none() {
+        return Err("holds needs ui.port and ui.secret — the host calls /__hold there".into());
+    }
+    let Some(hold_timeout) = crate::holds::deadline(reg.hold_timeout_ms) else {
+        return Err(format!(
+            "hold_timeout_ms must be 1–{}",
+            crate::holds::HOLD_MAX_MS
+        ));
+    };
+    let mut holds = reg.holds;
+    holds.sort();
+    holds.dedup();
     Ok(Valid {
         title,
         version,
         ui,
         category,
+        holds,
+        hold_timeout,
     })
 }
 
@@ -361,11 +445,7 @@ fn validate_ui(u: PluginUi) -> Result<StoredUi, String> {
     }
     let icon = match u.icon {
         Some(icon) => {
-            let ok = (1..=48).contains(&icon.len())
-                && icon
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-            if !ok {
+            if !crate::slug::lucide_icon(&icon) {
                 return Err("ui.icon must be a lucide name ([a-z0-9-], 1–48 chars)".into());
             }
             Some(icon)
@@ -376,6 +456,9 @@ fn validate_ui(u: PluginUi) -> Result<StoredUi, String> {
         port: u.port,
         secret: u.secret,
         icon,
+        page: u.page,
+        config: u.config,
+        game: u.game,
     })
 }
 
@@ -397,19 +480,9 @@ fn validate_ui(u: PluginUi) -> Result<StoredUi, String> {
     )
 )]
 pub(crate) async fn register_plugin(
-    who: Option<Extension<crate::mgmt::auth::PluginIdentity>>,
-    Path(id): Path<String>,
+    OwnedId(id, _): OwnedId<PluginId>,
     ApiJson(reg): ApiJson<PluginRegistration>,
 ) -> Response {
-    if !crate::mgmt::auth::plugin_owns(who.as_ref().map(|e| &e.0), &id) {
-        return api_error(StatusCode::FORBIDDEN, "a plugin may only write its own id");
-    }
-    if !valid_plugin_id(&id) {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "invalid plugin id (expected kebab-case `[a-z][a-z0-9-]*`, ≤64)",
-        );
-    }
     let valid = match validate(reg) {
         Ok(v) => v,
         Err(e) => return api_error(StatusCode::BAD_REQUEST, &e),
@@ -529,13 +602,7 @@ pub(crate) async fn get_ui_credential(Path(id): Path<String>) -> Response {
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
     )
 )]
-pub(crate) async fn delete_plugin(
-    who: Option<Extension<crate::mgmt::auth::PluginIdentity>>,
-    Path(id): Path<String>,
-) -> Response {
-    if !crate::mgmt::auth::plugin_owns(who.as_ref().map(|e| &e.0), &id) {
-        return api_error(StatusCode::FORBIDDEN, "a plugin may only write its own id");
-    }
+pub(crate) async fn delete_plugin(OwnedId(id, _): OwnedId<AnyId>) -> Response {
     if registry().remove(&id) {
         tracing::info!(plugin = %id, "plugin deregistered");
         emit(EventKind::PluginsChanged { id });
@@ -555,34 +622,28 @@ mod tests {
                 port,
                 secret: secret.into(),
                 icon: Some("gamepad-2".into()),
+                page: true,
+                config: false,
+                game: false,
             }),
             category: None,
+            holds: Vec::new(),
+            hold_timeout_ms: None,
         }
     }
 
     const SECRET: &str = "abcdefghijklmnop0123";
 
     #[test]
-    fn id_validation() {
-        assert!(valid_plugin_id("rom-manager"));
-        assert!(valid_plugin_id("a"));
-        assert!(valid_plugin_id("x9"));
-        assert!(!valid_plugin_id(""));
-        assert!(!valid_plugin_id("9lives"));
-        assert!(!valid_plugin_id("-lead"));
-        assert!(!valid_plugin_id("Rom"));
-        assert!(!valid_plugin_id("rom_manager"));
-        assert!(!valid_plugin_id(&"a".repeat(65)));
-    }
-
-    #[test]
     fn registration_validation() {
         assert!(validate(reg("ROM Manager", 49321, SECRET)).is_ok());
         let v = validate(PluginRegistration {
-            title: "Ro\u{7}m\n".into(),
+            title: "Ro\u{7}\u{202E}m\n".into(),
             version: None,
             ui: None,
             category: None,
+            holds: Vec::new(),
+            hold_timeout_ms: None,
         })
         .unwrap();
         assert_eq!(v.title, "Rom");
@@ -591,6 +652,8 @@ mod tests {
             version: None,
             ui: None,
             category: Some(c.into()),
+            holds: Vec::new(),
+            hold_timeout_ms: None,
         };
         assert_eq!(
             validate(lib("library")).unwrap().category.as_deref(),
@@ -606,6 +669,57 @@ mod tests {
         assert!(validate(reg("x", 49321, "tooshort")).is_err());
         assert!(validate(reg("x", 49321, "bad secret with spaces!!")).is_err());
         assert!(validate(reg("   ", 49321, SECRET)).is_err());
+    }
+
+    #[test]
+    fn ui_flags_default_to_a_page_only() {
+        let old: PluginUi =
+            serde_json::from_value(serde_json::json!({"port": 49321, "secret": SECRET})).unwrap();
+        assert!(old.page && !old.config && !old.game);
+        let tab: PluginUi = serde_json::from_value(
+            serde_json::json!({"port": 49321, "secret": SECRET, "page": false, "game": true}),
+        )
+        .unwrap();
+        assert!(!tab.page && !tab.config && tab.game);
+        let r = PluginRegistry::new();
+        r.upsert("p", validate(reg("T", 49321, SECRET)).unwrap());
+        let mut flagged = reg("T", 49321, SECRET);
+        flagged.ui.as_mut().unwrap().game = true;
+        assert!(
+            r.upsert("p", validate(flagged).unwrap()),
+            "a flag change is visible"
+        );
+        let ui = r.snapshot().0.remove(0).ui.unwrap();
+        assert!(ui.page && ui.game && !ui.config);
+    }
+
+    #[test]
+    fn a_hold_needs_a_known_stage_a_ui_and_a_sane_deadline() {
+        let held = |holds: &[&str], ms: Option<u32>| PluginRegistration {
+            holds: holds.iter().map(|h| h.to_string()).collect(),
+            hold_timeout_ms: ms,
+            ..reg("Slots", 49321, SECRET)
+        };
+        let v = validate(held(&["game.launching", "game.launching"], Some(5_000))).unwrap();
+        assert_eq!(v.holds, vec!["game.launching".to_string()]);
+        assert_eq!(v.hold_timeout, Duration::from_secs(5));
+        assert!(validate(held(&["game.exited"], None)).is_err());
+        assert!(validate(held(&["game.launching"], Some(0))).is_err());
+        assert!(validate(held(&["game.launching"], Some(120_001))).is_err());
+        let headless = PluginRegistration {
+            ui: None,
+            ..held(&["game.launching"], None)
+        };
+        assert!(validate(headless).is_err());
+
+        let r = PluginRegistry::new();
+        r.upsert("slots", validate(held(&["game.launching"], None)).unwrap());
+        r.upsert("other", validate(reg("Other", 49322, SECRET)).unwrap());
+        let h = r.holders("game.launching");
+        assert_eq!(h.len(), 1);
+        assert_eq!((h[0].id.as_str(), h[0].port), ("slots", 49321));
+        assert_eq!(h[0].timeout, Duration::from_secs(30));
+        assert!(r.holders("game.exited").is_empty());
     }
 
     #[test]
@@ -648,6 +762,8 @@ mod tests {
                 version: None,
                 ui: None,
                 category: None,
+                holds: Vec::new(),
+                hold_timeout_ms: None,
             })
             .unwrap(),
         );

@@ -81,16 +81,11 @@ pub(crate) fn read_result(path: &Path) -> Option<ResultRecord> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Temp + rename. Intent and result records must never be half-written.
+/// [`pf_paths::replace_file`]. Intent and result records must never be half-written.
 pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &bytes)?;
-    std::fs::rename(&tmp, path)
+    pf_paths::replace_file(path, &bytes)
 }
 
 #[derive(Debug, PartialEq, Eq)]

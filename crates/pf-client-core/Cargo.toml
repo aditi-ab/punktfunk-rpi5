@@ -18,11 +18,12 @@ repository.workspace = true
 # (`pf-console-ui`) now runs inside the Android client too, and everything IT needs from
 # this crate is data — `trust::Settings`, the menu-event vocabulary + synthesizer, the
 # library model, the deep-link grammar, the overlay action/session-phase types. Those
-# modules are gated `any(linux, windows, android, wasm)` in lib.rs; the session pump, decoders,
+# modules are gated `cfg(portable)` in lib.rs (build.rs); the session pump, decoders,
 # audio, SDL gamepad service and the ureq fetches stay desktop-only, so this block carries
 # only what the portable modules touch. `quic` (not `ureq-tls`): `trust` names
 # `NativeClient`/`endpoint` for identity + pairing; nothing here fetches over HTTPS.
-[target.'cfg(target_os = "android")'.dependencies]
+# Apple targets take the same subset: the console crate builds for the Mac, iOS and tvOS.
+[target.'cfg(any(target_os = "android", target_vendor = "apple"))'.dependencies]
 punktfunk-core = { path = "../punktfunk-core", features = ["quic", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -112,7 +113,7 @@ rav1d = { version = "1", default-features = false, features = ["bitdepth_8"], op
 # 123 on Windows, and rav1d re-exports only `Dav1dResult`, so the typed enum that would
 # otherwise name it is out of reach. Already in the tree (rav1d's own dependency).
 libc = { version = "0.2", optional = true }
-# StreamOS Raspberry Pi 5 HEVC V4L2 Request decoder.
+# Raspberry Pi 5 HEVC V4L2 Request decoder.
 ffmpeg-sys-next = { version = "9", optional = true }
 
 # Opus for the audio planes. The VIDEO side has no FFmpeg at all since M10: every decode
@@ -126,19 +127,11 @@ mdns-sd = { version = "0.21", optional = true }
 # Game-library fetch from the host's management API over mTLS + fingerprint pinning.
 # `ureq` is small + sync (the host uses it too) and its rustls unifies with the
 # workspace's (quinn's) 0.23; the pinning verifier mirrors core's private `PinVerify`.
-# ⚠ `rustls-no-provider`, NEVER the default `rustls` feature: that one pulls `_ring`, which would
-# put the ring backend back into a tree that has moved to aws-lc-rs. Same spelling everywhere.
-ureq = { version = "3", default-features = false, optional = true, features = [
-    "rustls-no-provider",
-    "rustls-webpki-roots",
-    "gzip",
-] }
+ureq = { workspace = true, optional = true, features = ["gzip"] }
 # Signed update-manifest fetch/verify + the install-kind ladder, shared with the host so one
 # trust rule serves both (crates/pf-update-check).
 pf-update-check = { path = "../pf-update-check", optional = true }
-# aws-lc-rs backend + PQ hybrid key exchange, matching punktfunk-core (see its Cargo.toml for
-# why every crate that names a rustls backend has to name the same one).
-rustls = { version = "0.23", default-features = false, optional = true, features = ["aws_lc_rs", "prefer-post-quantum", "logging", "std", "tls12"] }
+rustls = { workspace = true, optional = true, features = ["logging", "tls12"] }
 # Art-cache keys (`art_cache`): the SHA-256 of a poster URL. Already in the tree —
 # punktfunk-core's `tls` hashes certificates with the same version.
 sha2 = "0.11"
@@ -146,15 +139,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 tracing = "0.1"
-# `logring::RingLayer` — the ONE tracing layer feeding the ring, shared by the session binary
-# and both desktop shells (it lived in clients/session, which left the GTK and WinUI shells
-# with no ring and so no "Send logs to host"). Minimal features: the layer only needs the
-# `Layer` trait; the bins bring their own full-featured tracing-subscriber, and cargo's
-# feature union means this adds nothing they didn't already compile. `tracing-log` is the
-# bridge-normalization half (see the layer's docs) and rides tracing-subscriber's default
-# `tracing-log` feature in every bin anyway. Android/Apple builds are untouched — this is
+# `logring::RingLayer` — the ONE tracing layer feeding the ring — and `logring::init_tracing`,
+# the subscriber the session binary and both desktop shells install around it. Default
+# features: their `tracing-log` makes `init()` forward `log`-crate records, and `tracing-log`
+# below is the layer's bridge-normalization half. Android/Apple builds are untouched — this is
 # the desktop target block.
-tracing-subscriber = { version = "0.3", default-features = false, optional = true, features = ["std", "registry"] }
+tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter"] }
 tracing-log = { version = "0.2", optional = true }
 # Stable ids for profiles and host records (profiles.rs) — the OS RNG only, same version the
 # workspace already resolves for punktfunk-core. No uuid crate: the v4 layout is four lines.
@@ -185,6 +175,9 @@ tokio = { version = "1", features = ["time"], optional = true }
 # ordinary macOS and container gates, exactly as pf-dxvadec does for Windows.
 pf-vaapi = { path = "../pf-vaapi", optional = true }
 pf-libva = { path = "../pf-libva", optional = true }
+# `fence`: the decode's write fence as a sync_file, so the presenter waits it
+# on the GPU instead of the pump blocking in `vaSyncSurface`.
+pf-dmabuf = { path = "../pf-dmabuf", optional = true }
 # libva itself is dlopen'd, never linked (see `video_vaapi_native`'s module docs): the
 # container can then compile and clippy the whole rung without `libva-dev`, and a machine
 # without a VAAPI runtime gets a clean refusal instead of a packaging dependency.
@@ -210,10 +203,10 @@ pf-dxvadec = { path = "../pf-dxvadec", optional = true }
 winreg = { version = "0.56", optional = true }
 sdl3 = { version = "0.18", features = ["hidapi", "build-from-source"], optional = true }
 # D3D11 decode-device plumbing (video_d3d11.rs): device/adapter selection, DXVA probes, and
-# the shared NT-handle hand-off ring `video_d3d11_native` fills. Same pinned rev as
-# clients/windows so `windows-core` unifies with windows-reactor's. Not the only windows-rs
-# here — `wasapi` pulls the crates.io copy too; clients/windows/Cargo.toml says why it stays.
-windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc", optional = true, features = [
+# the shared NT-handle hand-off ring `video_d3d11_native` fills. The workspace entry's git rev,
+# so `windows-core` unifies with windows-reactor's. `wasapi` pulls the crates.io copy too;
+# clients/windows/Cargo.toml says why it stays.
+windows = { workspace = true, optional = true, features = [
     # Features are header-named since windows-rs generates from the SDK headers directly
     # (#4689) — one feature per header, replacing the old `Win32_*` namespace features.
     "d3d11",
@@ -252,6 +245,8 @@ sha2 = "0.11"
 # deliberately doesn't need.
 log = "0.4"
 tracing-subscriber = { version = "0.3" }
+# `pf_bitstream::testing`: the vendored vectors and access-unit splitters.
+pf-bitstream = { path = "../pf-bitstream", features = ["test-vectors"] }
 
 # PyroWave decode (the opt-in wired-LAN wavelet codec, design/pyrowave-codec-plan.md
 # §4.5) — pure Vulkan compute on the device the frame is presented from, so it builds
@@ -259,11 +254,10 @@ tracing-subscriber = { version = "0.3" }
 # Windows, and the JNI client's own swapchain on Android (pyrowave-sys covers all three;
 # it is an empty stub elsewhere). Its own target table rather than the desktop one above,
 # because Android takes this crate `--no-default-features` — no decode ladder, no session
-# pump, just the wavelet lane. `ash` only wraps the owner's existing raw handles (same
-# pinned version as pf-presenter).
+# pump, just the wavelet lane. `ash` only wraps the owner's existing raw handles.
 [target.'cfg(any(target_os = "linux", windows, target_os = "android"))'.dependencies]
 pyrowave-sys = { path = "../pyrowave-sys", optional = true }
-ash = { version = "0.38", optional = true }
+ash = { workspace = true, optional = true }
 
 [features]
 # `desktop` separates the full Linux/Windows stack — session pump, the native decode ladder,
@@ -284,17 +278,30 @@ default = ["desktop", "pyrowave"]
 desktop = [
     "punktfunk-core/ureq-tls",
     "dep:pf-vkdecode", "dep:pf-bitstream", "dep:async-channel", "dep:openh264", "dep:rav1d",
-    "dep:libc", "dep:opus", "dep:mdns-sd", "dep:ureq", "dep:pf-update-check", "dep:rustls",
+    "dep:libc", "dep:opus", "discovery", "dep:ureq", "dep:pf-update-check", "dep:rustls",
     "dep:tracing-subscriber", "dep:tracing-log",
     "dep:pipewire", "dep:sdl3", "dep:zbus", "dep:tokio", "dep:pf-vaapi", "dep:pf-libva", "dep:libloading", "dep:x11rb",
-    "dep:wasapi", "dep:pf-dxvadec", "dep:winreg", "dep:windows",
+    "dep:pf-dmabuf",
+    "dep:wasapi", "dep:winreg", "d3d11va",
 ]
-# StreamOS Raspberry Pi 5 HEVC decode through the downstream FFmpeg V4L2 Request API.
+# DXVA device and native rung. `desktop` includes it. The `windows` header list
+# stays the full set, because clipboard.rs needs `winuser` and `winbase`.
+d3d11va = ["dep:pf-dxvadec", "dep:windows"]
+# `discovery` is the mDNS browse (`mdns-sd`, `async-channel`) without the rest of `desktop`.
+# `desktop` includes it, so every desktop consumer is unchanged, and still names
+# `async-channel` for the session and gamepad paths. A shell that only looks for hosts says
+# `features = ["discovery"]`. Android and wasm say nothing — the module stays Linux and Windows.
+discovery = ["dep:mdns-sd", "dep:async-channel"]
+# Raspberry Pi 5 HEVC decode through the downstream FFmpeg V4L2 Request API.
 rpi5-v4l2-request = ["desktop", "dep:ffmpeg-sys-next"]
 # PyroWave client decode ships in every default build (flatpak included; pyrowave-sys is a
 # vendored in-repo tree, offline-safe, and an empty stub off Linux/Windows). The codec is
 # still strictly per-session opt-in (Settings codec pick / PUNKTFUNK_PREFER_PYROWAVE=1).
 pyrowave = ["dep:pyrowave-sys", "dep:ash"]
+
+# build.rs names the `portable` and `desktop` module gates.
+[build-dependencies]
+cfg_aliases = "0.2"
 
 [lints]
 workspace = true

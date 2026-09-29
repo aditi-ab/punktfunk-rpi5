@@ -2,7 +2,6 @@
 
 use super::setup::pick_formats;
 use super::{OverlayPipe, Presenter};
-use crate::csc::CscPass;
 use anyhow::{anyhow, Context as _, Result};
 use ash::vk;
 
@@ -25,18 +24,17 @@ fn kmsdrm_swapchain_hint() -> String {
 }
 
 impl Presenter {
+    /// Replace the swapchain at the window's current size. A zero-size (minimized) window
+    /// keeps the old swapchain and any image already acquired from it.
     pub fn recreate_swapchain(&mut self, window: &sdl3::video::Window) -> Result<()> {
-        self.quiesce_own()?;
-        // Presentation-engine semaphore waits finish here. A fence wait proves
-        // only OUR submit (VUID-vkDestroySemaphore-05149 /
-        // VUID-vkDestroySwapchainKHR-01282). Decode submits share `queue_lock`.
-        {
-            let _q = self.queue_lock.guard();
-            // SAFETY: `queue` is owned here; `queue_lock` is held so no concurrent submit.
-            unsafe { self.device.queue_wait_idle(self.queue) }
-                .context("vkQueueWaitIdle (swapchain recreate)")?;
+        // The native lane owns the window: no surface to size. The next frame through the
+        // swapchain path makes both again at the size recorded here.
+        if self.suspended {
+            let (width, height) = window.size_in_pixels();
+            self.extent = vk::Extent2D { width, height };
+            return Ok(());
         }
-
+        self.quiesce_own()?;
         // SAFETY: `pdev` and `surface` are live handles owned by this presenter.
         let caps = unsafe {
             self.surface_i
@@ -55,6 +53,22 @@ impl Presenter {
             // Minimized: keep the old swapchain. Presents return OUT_OF_DATE
             // and land back here once the window has a size.
             return Ok(());
+        }
+        // Presentation-engine semaphore waits finish here. A fence wait proves
+        // only OUR submit (VUID-vkDestroySemaphore-05149 /
+        // VUID-vkDestroySwapchainKHR-01282). Decode submits share `queue_lock`.
+        {
+            let _q = self.queue_lock.guard();
+            // An image acquired ahead of a present belongs to the swapchain that goes now.
+            if self.acquired.is_some() {
+                // SAFETY: `queue_lock` is held above.
+                unsafe { self.retire_acquire_sem() }
+                    .context("vkQueueSubmit (discard the acquired image)")?;
+                self.acquired = None;
+            }
+            // SAFETY: `queue` is owned here; `queue_lock` is held so no concurrent submit.
+            unsafe { self.device.queue_wait_idle(self.queue) }
+                .context("vkQueueWaitIdle (swapchain recreate)")?;
         }
         let requested_images = std::env::var("PUNKTFUNK_SWAPCHAIN_IMAGES")
             .ok()
@@ -114,16 +128,10 @@ impl Presenter {
         // Quiesce covered our cmd bufs, queue drain the presentation-engine
         // semaphore waits, present-timer drain the last waiter — nothing
         // still names these objects.
-        let (overlay_views, overlay_framebuffers) = self.overlay_pipe.take_targets();
+        self.overlay_pipe.destroy_targets(&self.device);
         // SAFETY: quiesce, `queue_wait_idle`, and present-timer drain above;
-        // GPU idle on these views, framebuffers, semaphores, and `old`.
+        // GPU idle on these semaphores and `old`.
         unsafe {
-            for fb in overlay_framebuffers {
-                self.device.destroy_framebuffer(fb, None);
-            }
-            for v in overlay_views {
-                self.device.destroy_image_view(v, None);
-            }
             for s in self.render_sems.drain(..) {
                 self.device.destroy_semaphore(s, None);
             }
@@ -163,10 +171,19 @@ impl Presenter {
         Ok(())
     }
 
-    /// Swapchain is HDR10/PQ, not a PQ stream tone-mapped onto SDR.
-    /// User-facing "HDR" indicators should report this, not stream signalling.
+    /// Swapchain is HDR10/PQ, or the native lane hands PQ to the compositor with a PQ
+    /// description; not a PQ stream tone-mapped onto SDR by us. User-facing "HDR"
+    /// indicators should report this, not stream signalling.
     pub fn hdr_active(&self) -> bool {
-        self.hdr_active
+        self.hdr_active || (self.native_last && self.native_pq)
+    }
+
+    /// The swapchain holds 10 bits a channel (SDR or HDR10): an overlay drawn in 8 would band.
+    pub fn ten_bit(&self) -> bool {
+        matches!(
+            self.format.format,
+            vk::Format::A2B10G10R10_UNORM_PACK32 | vk::Format::A2R10G10B10_UNORM_PACK32
+        )
     }
 
     /// Drop back to the SDR swapchain. No-op unless HDR10 is live.
@@ -209,6 +226,10 @@ impl Presenter {
         let Some(ext) = &self.hdr_metadata_d else {
             return;
         };
+        // Suspended for the native lane: the rebuilt swapchain gets it pushed again.
+        if self.swapchain == vk::SwapchainKHR::null() {
+            return;
+        }
         // Same generic baseline as the Windows presenter: BT.2020 + D65,
         // 1000-nit mastering, MaxCLL 1000 / MaxFALL 400.
         let m = self.hdr_meta.unwrap_or(punktfunk_core::quic::HdrMeta {
@@ -240,7 +261,10 @@ impl Presenter {
         unsafe { ext.set_hdr_metadata(&[self.swapchain], &[md]) };
         tracing::debug!(from_host = self.hdr_meta.is_some(), "HDR metadata pushed");
     }
-    /// SDR↔HDR10 flip. Video intermediate is 10-bit: PQ in 8 bits bands.
+    /// SDR↔HDR10 flip. The video intermediate ([`super::VIDEO_FORMAT`]) keeps its format; only
+    /// its content, mapped for the old mode, is dropped. A driver that refuses the HDR10
+    /// swapchain it advertised loses `hdr10_format` for good: back to SDR, where PQ frames
+    /// tone-map.
     pub(super) fn set_hdr_mode(&mut self, window: &sdl3::video::Window, on: bool) -> Result<()> {
         let target = if on {
             self.hdr10_format.expect("caller checked availability")
@@ -250,24 +274,8 @@ impl Presenter {
         };
         tracing::info!(hdr = on, format = ?target, "switching presentation mode");
         self.quiesce_own()?;
-        self.video_format = if on {
-            vk::Format::A2B10G10R10_UNORM_PACK32
-        } else {
-            vk::Format::R8G8B8A8_UNORM
-        };
-        self.csc.destroy(&self.device); // `quiesce_own` above; only our cmd bufs reference it
-        self.csc = CscPass::new(&self.device, self.video_format)?;
-        // Planar CSC (PyroWave + software) writes the same intermediate; rebuild it too.
-        self.csc_planar.destroy(&self.device);
-        self.csc_planar = CscPass::new_planar(&self.device, self.video_format)?;
         if let Some(v) = self.video.take() {
-            // SAFETY: `quiesce_own` above; GPU idle on this video image.
-            unsafe {
-                self.device.destroy_framebuffer(v.framebuffer, None);
-                self.device.destroy_image_view(v.view, None);
-                self.device.destroy_image(v.image, None);
-                self.device.free_memory(v.memory, None);
-            }
+            v.destroy(&self.device); // `quiesce_own` above: GPU idle on it
         }
         // New overlay pipe for the new format. Old views/framebuffers are
         // only in our cmd bufs — fence quiesce makes destroy safe here;
@@ -276,22 +284,29 @@ impl Presenter {
             &mut self.overlay_pipe,
             OverlayPipe::new(&self.device, target.format, on)?,
         );
-        let (overlay_views, overlay_framebuffers) = old_pipe.take_targets();
-        // SAFETY: fence quiesce above; these views/framebuffers are only in our cmd bufs.
-        unsafe {
-            for fb in overlay_framebuffers {
-                self.device.destroy_framebuffer(fb, None);
-            }
-            for v in overlay_views {
-                self.device.destroy_image_view(v, None);
-            }
-        }
         old_pipe.destroy(&self.device);
-        // The scale pass renders into the swapchain format too; fence quiesce above.
-        self.scale.destroy(&self.device);
-        self.scale = crate::scale::ScalePass::new(&self.device, target.format)?;
+        // The scale and direct passes render into the swapchain format too; fence quiesce above.
+        // Build each new one first: a failed create must not leave destroyed handles for Drop.
+        let new_scale = crate::scale::ScalePass::new(&self.device, target.format)?;
+        std::mem::replace(&mut self.scale, new_scale).destroy(&self.device);
+        let new_direct = crate::csc::DirectPass::new(
+            &self.device,
+            target.format,
+            self.csc.pipeline_layout,
+            self.csc_planar.pipeline_layout,
+        )?;
+        std::mem::replace(&mut self.direct, new_direct).destroy(&self.device);
+        self.direct_last = None;
         self.format = target;
         self.hdr_active = on;
-        self.recreate_swapchain(window)
+        match self.recreate_swapchain(window) {
+            Err(e) if on => {
+                tracing::warn!(error = %format!("{e:#}"),
+                    "HDR10 swapchain refused — staying SDR and tone-mapping PQ");
+                self.hdr10_format = None;
+                self.set_hdr_mode(window, false)
+            }
+            r => r,
+        }
     }
 }

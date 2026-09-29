@@ -10,8 +10,11 @@ use crate::glyphs::{Hint, HintKey};
 use crate::model::{ConsoleCmd, HostRow, PairPhase};
 use crate::pointer::Pointer;
 use crate::screens::{ConnectIntent, Ctx, Outbox};
-use crate::theme::{fg, Fonts, EDGE_INSET, ERROR, W};
-use crate::widgets::{permits, Charset, KeyMsg, Keyboard, ListMsg, MenuList, RowSpec, ROW_MAX_W};
+use crate::theme::{fg, Fonts, ERROR, W};
+use crate::widgets::{
+    blurb, entry_hints, field_key, permits, type_text, Charset, Entry, Keyboard, ListMsg, MenuList,
+    RowSpec,
+};
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Rect};
 
@@ -35,7 +38,7 @@ pub(crate) struct PairScreen {
     port: u16,
     /// Empty = typed host with no advert, so no Request access row.
     fp_hex: String,
-    list: MenuList,
+    pub(super) list: MenuList,
     keyboard: Keyboard,
     pin: String,
     device: String,
@@ -99,15 +102,25 @@ impl PairScreen {
         self.editing.is_some()
     }
 
+    pub(crate) fn edit_field(&self) -> Option<crate::screens::EditField> {
+        match self.editing? {
+            Field::Pin => crate::screens::EditField::new("PIN", &self.pin, true),
+            Field::Device => crate::screens::EditField::new("Device name", &self.device, false),
+        }
+    }
+
     fn can_pair(&self) -> bool {
         !self.pin.trim().is_empty() && !self.busy
     }
 
-    fn field_mut(&mut self, f: Field) -> &mut String {
-        match f {
+    /// The open field, its text, and the keyboard that types into it.
+    fn open(&mut self) -> Option<(Field, &mut Keyboard, &mut String)> {
+        let f = self.editing?;
+        let text = match f {
             Field::Pin => &mut self.pin,
             Field::Device => &mut self.device,
-        }
+        };
+        Some((f, &mut self.keyboard, text))
     }
 
     fn charset(f: Field) -> Charset {
@@ -117,41 +130,29 @@ impl PairScreen {
         }
     }
 
-    fn type_char(&mut self, ch: char) -> bool {
-        let Some(f) = self.editing else { return false };
-        if !permits(Self::charset(f), ch) {
-            return false;
-        }
-        if f == Field::Pin && self.pin.chars().count() >= 8 {
-            return false; // 4-digit PINs today; 8 is headroom, not a passphrase
-        }
-        self.field_mut(f).push(ch);
-        true
+    /// Whether field `f` takes `ch` after `text`. PINs are 4 digits today; 8 is headroom,
+    /// not a passphrase.
+    fn admits(f: Field, text: &str, ch: char) -> bool {
+        permits(Self::charset(f), ch) && !(f == Field::Pin && text.chars().count() >= 8)
     }
 
-    pub(crate) fn text_input(&mut self, text: &str) {
-        for ch in text.chars() {
-            self.type_char(ch);
+    pub(crate) fn text_input(&mut self, typed: &str) {
+        if let Some((f, _, text)) = self.open() {
+            type_text(text, typed, |t, c| Self::admits(f, t, c));
         }
     }
 
     pub(crate) fn edit_key(&mut self, key: crate::input::Key) -> bool {
-        use crate::input::Key as K;
-        if self.editing.is_none() {
+        let Some((_, _, text)) = self.open() else {
             return false;
+        };
+        let Some(entry) = field_key(key, text) else {
+            return false;
+        };
+        if entry != Entry::Stay {
+            self.editing = None;
         }
-        match key {
-            K::Backspace => {
-                let f = self.editing.unwrap();
-                self.field_mut(f).pop();
-                true
-            }
-            K::Return | K::Escape => {
-                self.editing = None;
-                true
-            }
-            _ => false,
-        }
+        true
     }
 
     pub(crate) fn menu(
@@ -160,39 +161,13 @@ impl PairScreen {
         ctx: &mut Ctx,
         fx: &mut Outbox,
     ) -> Option<MenuPulse> {
-        if self.editing.is_some() {
-            if ctx.deck {
-                return match ev {
-                    MenuEvent::Back | MenuEvent::Confirm => {
-                        self.editing = None;
-                        Some(MenuPulse::Confirm)
-                    }
-                    _ => None,
-                };
+        let deck = ctx.device.deck;
+        if let Some((f, keyboard, text)) = self.open() {
+            let (entry, pulse) = keyboard.edit_menu(ev, deck, text, |t, c| Self::admits(f, t, c));
+            if entry != Entry::Stay {
+                self.editing = None;
             }
-            let (msg, pulse) = self.keyboard.menu(ev);
-            return match msg {
-                KeyMsg::Type(c) => {
-                    if self.type_char(c) {
-                        Some(MenuPulse::Move)
-                    } else {
-                        Some(MenuPulse::Boundary)
-                    }
-                }
-                KeyMsg::Backspace => {
-                    let f = self.editing.unwrap();
-                    if self.field_mut(f).pop().is_some() {
-                        Some(MenuPulse::Move)
-                    } else {
-                        Some(MenuPulse::Boundary)
-                    }
-                }
-                KeyMsg::Done => {
-                    self.editing = None;
-                    Some(MenuPulse::Confirm)
-                }
-                KeyMsg::None => pulse,
-            };
+            return pulse;
         }
 
         if ev == MenuEvent::Back {
@@ -208,26 +183,12 @@ impl PairScreen {
     /// Raised keyboard is modal: hits on it stay here; a press outside closes it rather
     /// than reaching the row underneath.
     pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
-        if self.editing.is_some() && !ctx.deck {
-            if !self.keyboard.covers(p) {
-                if p.press() {
-                    self.editing = None;
-                    return true;
-                }
+        if let Some((f, keyboard, text)) = self.open().filter(|_| !ctx.device.deck) {
+            let Some(entry) = keyboard.edit_pointer(p, text, |t, c| Self::admits(f, t, c)) else {
                 return false;
-            }
-            let (msg, _) = self.keyboard.pointer(p);
-            match msg {
-                KeyMsg::Type(c) => {
-                    self.type_char(c);
-                }
-                KeyMsg::Backspace => {
-                    if let Some(f) = self.editing {
-                        self.field_mut(f).pop();
-                    }
-                }
-                KeyMsg::Done => self.editing = None,
-                KeyMsg::None => {}
+            };
+            if entry != Entry::Stay {
+                self.editing = None;
             }
             return true;
         }
@@ -274,7 +235,7 @@ impl PairScreen {
                             port: self.port,
                             pin: self.pin.trim().to_string(),
                             device_name: if self.device.trim().is_empty() {
-                                ctx.device_name.to_string()
+                                ctx.device.name.clone()
                             } else {
                                 self.device.trim().to_string()
                             },
@@ -296,18 +257,7 @@ impl PairScreen {
 
     pub(crate) fn hints(&self, ctx: &Ctx) -> Vec<Hint> {
         if self.editing.is_some() {
-            if ctx.deck {
-                return vec![
-                    Hint::new(HintKey::Key("STEAM + X"), "Keyboard"),
-                    Hint::new(HintKey::Confirm, "Done"),
-                    Hint::new(HintKey::Back, "Done"),
-                ];
-            }
-            return vec![
-                Hint::new(HintKey::Confirm, "Type"),
-                Hint::new(HintKey::Tertiary, "Delete"),
-                Hint::new(HintKey::Back, "Done"),
-            ];
+            return entry_hints(ctx.device.deck, "Done");
         }
         vec![
             Hint::new(HintKey::Confirm, "Select"),
@@ -330,18 +280,11 @@ impl PairScreen {
         } else {
             "Enter the PIN from the host's web console (Pairing page) or its log."
         };
-        fonts.leading(
-            canvas,
-            intro,
-            W::Regular,
-            13.0 * k,
-            fg(0.55),
-            f64::from(rect.left) + EDGE_INSET * k,
-            f64::from(rect.top) + 2.0 * k,
-            ROW_MAX_W * 0.72 * k,
-        );
+        let below = blurb(canvas, fonts, intro, rect, k);
 
-        let seat = self.keyboard.seat(self.editing.is_some() && !ctx.deck, dt);
+        let seat = self
+            .keyboard
+            .seat(self.editing.is_some() && !ctx.device.deck, dt);
         let tray_h = if seat > 0.0 {
             (Keyboard::tray_height() + 12.0) * k * seat
         } else {
@@ -351,7 +294,7 @@ impl PairScreen {
         let status_h = 34.0 * k;
         let list_rect = Rect::from_ltrb(
             rect.left,
-            rect.top + (34.0 * k) as f32,
+            below.top,
             rect.right,
             rect.bottom - tray_h as f32 - status_h as f32,
         );
@@ -455,50 +398,27 @@ mod tests {
 
     fn host() -> HostRow {
         HostRow {
-            key: "10.0.0.7:9777".into(),
-            id: None,
-            name: "Tower".into(),
             addr: "10.0.0.7".into(),
-            port: 9777,
             fp_hex: String::new(),
             paired: false,
-            saved: true,
-            online: true,
-            mgmt_port: 47990,
-            can_wake: false,
-            clipboard_sync: false,
-            last_used: None,
-            os: String::new(),
-            actions: Vec::new(),
-            pin: None,
-            bound_preset: None,
-            running: String::new(),
-            game_presets: Default::default(),
+            ..HostRow::fixture("10.0.0.7:9777", "Tower")
         }
     }
 
     #[test]
     fn pair_submits_with_pin_and_device_fallback() {
         let mut settings = Settings::default();
-        let pads = Vec::new();
         let library = crate::library::LibraryShared::default();
+        let device = crate::screens::Device {
+            name: "living-room-deck".into(),
+            ..crate::screens::Device::test()
+        };
         let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "living-room-deck",
-            t: 0.0,
+            device: &device,
+            ..Ctx::test(&mut settings, &library)
         };
         let mut s = PairScreen::new(&host(), "living-room-deck");
-        s.device.clear(); // empty field falls back to `ctx.device_name`
+        s.device.clear(); // empty field falls back to `&ctx.device.name`
         s.editing = Some(Field::Pin);
         s.text_input("1234");
         s.edit_key(crate::input::Key::Return);
@@ -521,22 +441,14 @@ mod tests {
         let mut host = host();
         host.fp_hex = "abcd".into();
         let mut settings = Settings::default();
-        let pads = Vec::new();
         let library = crate::library::LibraryShared::default();
+        let device = crate::screens::Device {
+            name: "deck".into(),
+            ..crate::screens::Device::test()
+        };
         let mut ctx = Ctx {
-            hosts: &[],
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "deck",
-            t: 0.0,
+            device: &device,
+            ..Ctx::test(&mut settings, &library)
         };
         let mut s = PairScreen::new(&host, "deck");
         assert_eq!(s.roles().len(), 4, "Request Access + PIN + Device + Pair");

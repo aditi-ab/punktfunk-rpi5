@@ -42,6 +42,8 @@ pub(crate) fn serve_startup_recover() {
     // Re-light Exclusive CCD-isolate panels. After the devnode leg so re-enabled
     // monitors exist for the EXTEND preset (the snapshot was process memory).
     isolate_journal::startup_recover();
+    // Turn NVIDIA Instant Replay back on if a prior host paused it and died.
+    super::instant_replay::startup_recover();
     // The display actor (cached CCD snapshot) — up before the first session or management
     // read, so nothing else has to touch the display-config lock for inventory.
     pf_win_display::display_events::spawn_once();

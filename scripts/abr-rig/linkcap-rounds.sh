@@ -13,8 +13,7 @@ keep() { # <tag> <profile>
   cp "$OUT/$2-host.log" "$OUT/$1-host.log" 2>/dev/null || true
 }
 
-PF_RIG_SKIP_BUILD=0 "$HERE/run.sh" nowall_720p 1 >/dev/null 2>&1 || true
-export PF_RIG_SKIP_BUILD=1
+"$HERE/run.sh" nowall_720p 1 >/dev/null 2>&1 || true
 # The drain guard's per-window line is debug; without this the reader can count
 # guard endings but not the windows each one covered.
 export RUST_LOG=${RUST_LOG:-info,punktfunk_core::abr=debug}

@@ -1,0 +1,1790 @@
+{
+  "cell_ramp": [
+    0.1,
+    -0.06,
+    0.04,
+    -0.12,
+    -0.08,
+    0.14,
+    -0.1,
+    0.06,
+    0.06,
+    -0.12,
+    0.16,
+    -0.04,
+    -0.1,
+    0.08,
+    -0.06,
+    0.12
+  ],
+  "check": {
+    "ground": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "sksl": "uniform float2 u_res;\n// x = seconds since the shell started, y = the calm mix (0 launcher, 1 form).\nuniform float2 u_tc;\n// rgb = the palette's ground scaled for the calm lift; a is unused (float4 so\n// the uniform block stays 16-byte aligned under any packing rule).\nuniform float4 u_lift;\n// rgb = what the vignette and scrims tend toward (black under a dark palette, white\n// under a pale one — darkening a pastel field would strand the dark text on it), and\n// a = how hard. A pale field needs far less: mixing toward white at the dark field's\n// strength bleaches the chroma straight out of the gradient.\nuniform float4 u_scrim;\n// x = focal length, y = sphere scale (`field_camera`), z = passes over the sphere\n// (1 = the plain sphere's height, 2 = re-hit at that height: the displaced surface).\nuniform float4 u_cam;\n// The sphere's turn (rows of the world-to-sphere rotation) and its drift at this\n// instant: xyz of each, from `field_motion`, so no pixel pays for time alone.\nuniform float4 u_rot0;\nuniform float4 u_rot1;\nuniform float4 u_rot2;\nuniform float4 u_mot;\nuniform float4 u_wmot;\n\nconst float DETAIL = 3.33;\nconst float INTENSITY = 4.29;\nconst float TWIST = 0.04;\nconst float WARP = 0.26;\n\nfloat3 hash33(float3 p) {\n    float3 q = float3(dot(p, float3(127.1, 311.7, 74.7)),\n                      dot(p, float3(269.5, 183.3, 246.1)),\n                      dot(p, float3(113.5, 271.9, 124.6)));\n    return fract(sin(q) * 43758.5453) * 2.0 - 1.0;\n}\nfloat3 smoother(float3 t) { return t * t * t * (t * (t * 6.0 - 15.0) + 10.0); }\nfloat gradDot(float3 cell, float3 off, float3 local) {\n    return dot(hash33(cell + off), local - off);\n}\nfloat perlin3(float3 p) {\n    float3 cell = floor(p); float3 local = fract(p); float3 w = smoother(local);\n    float n000 = gradDot(cell, float3(0.0, 0.0, 0.0), local);\n    float n100 = gradDot(cell, float3(1.0, 0.0, 0.0), local);\n    float n010 = gradDot(cell, float3(0.0, 1.0, 0.0), local);\n    float n110 = gradDot(cell, float3(1.0, 1.0, 0.0), local);\n    float n001 = gradDot(cell, float3(0.0, 0.0, 1.0), local);\n    float n101 = gradDot(cell, float3(1.0, 0.0, 1.0), local);\n    float n011 = gradDot(cell, float3(0.0, 1.0, 1.0), local);\n    float n111 = gradDot(cell, float3(1.0, 1.0, 1.0), local);\n    float nx00 = mix(n000, n100, w.x); float nx10 = mix(n010, n110, w.x);\n    float nx01 = mix(n001, n101, w.x); float nx11 = mix(n011, n111, w.x);\n    return mix(mix(nx00, nx10, w.y), mix(nx01, nx11, w.y), w.z) * 1.1547;\n}\nfloat3 rotateOctave(float3 p) {\n    return float3(0.80 * p.y + 0.60 * p.z,\n                  -0.80 * p.x + 0.36 * p.y - 0.48 * p.z,\n                  -0.60 * p.x - 0.48 * p.y + 0.64 * p.z);\n}\nfloat fbm(float3 p) {\n    float3 q = p; float total = 0.0; float amp = 1.0; float weight = 0.0;\n    for (int i = 0; i < 3; i++) {\n        total += perlin3(q) * amp; weight += amp;\n        q = rotateOctave(q) * 2.02 + float3(3.7, 1.9, 6.3);\n        amp *= 0.48;\n    }\n    return total / max(weight, 0.0001);\n}\nfloat3 warpVector(float3 p) {\n    return float3(perlin3(p), perlin3(p + float3(5.2, 1.3, 2.8)),\n                  perlin3(p + float3(1.7, 9.2, 4.4)));\n}\nfloat heightField(float3 dir) {\n    float frequency = mix(1.05, 3.4, clamp(DETAIL / 5.0, 0.0, 1.0));\n    float3 p = dir * frequency + float3(1.7, 3.1, 5.3) + u_mot.xyz;\n    float3 warp = warpVector(p * 0.55 + u_wmot.xyz * 0.42 + float3(0.7, -1.1, 0.4)) * WARP;\n    return fbm(p + warp);\n}\nfloat3 rotateAxis(float3 p, float3 axis, float angle) {\n    float c = cos(angle); float s = sin(angle);\n    return p * c + cross(axis, p) * s + axis * dot(axis, p) * (1.0 - c);\n}\nfloat torsion(float3 dir) {\n    float axial = clamp(dot(dir, normalize(float3(-0.68, 0.54, 0.49))), -1.0, 1.0);\n    return axial * (1.5 - 0.5 * axial * axial) * TWIST;\n}\nfloat3 linearToSrgb(float3 c) {\n    float3 v = max(c, float3(0.0));\n    return mix(v * 12.92, 1.055 * pow(v, float3(1.0 / 2.4)) - 0.055, step(float3(0.0031308), v));\n}\nfloat3 oklabToLinear(float3 c) {\n    float lc = c.x + 0.3963377774 * c.y + 0.2158037573 * c.z;\n    float mc = c.x - 0.1055613458 * c.y - 0.0638541728 * c.z;\n    float sc = c.x - 0.0894841775 * c.y - 1.2914855480 * c.z;\n    float l = lc * lc * lc; float m = mc * mc * mc; float s = sc * sc * sc;\n    return float3(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,\n                  -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,\n                  -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s);\n}\n// The gradient's stops, even spaced and already in OKLab, blended with a smoothstep.\nfloat3 gradientAt(float t) {\n    float x = clamp(t, 0.0, 1.0) * 4.0;\n    float3 a; float3 b; float f;\n    if (x < 1.0) { a = float3(0, 0, 0); b = float3(0, 0, 0); f = x - 0.0; }\n    else if (x < 2.0) { a = float3(0, 0, 0); b = float3(0.12884036243921004, -0.0004230519067687233, -0.04703737465158814); f = x - 1.0; }\n    else if (x < 3.0) { a = float3(0.12884036243921004, -0.0004230519067687233, -0.04703737465158814); b = float3(0.14219822524556275, 0.02179907093292764, -0.04967099880852077); f = x - 2.0; }\n    else { a = float3(0.14219822524556275, 0.02179907093292764, -0.04967099880852077); b = float3(0.18213266560913166, 0.05009269037634294, -0.03651782281104443); f = x - 3.0; }\n    f = f * f * (3.0 - 2.0 * f);\n    return linearToSrgb(oklabToLinear(mix(a, b, f)));\n}\nfloat spread(float raw) { return clamp((raw - 0.5) * 3.0 + 0.5, 0.0, 1.0); }\n\nhalf4 main(float2 xy) {\n    float calm = u_tc.y;\n    float aspect = u_res.x / u_res.y;\n    float2 uv = xy / u_res;\n    // The pixel's ray, in the camera's frame: origin, looking down -z at a sphere\n    // three units away. Focal length and scale are the cover-zoom's.\n    float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);\n    float3 rd = normalize(float3(ndc.x * aspect / u_cam.x, ndc.y / u_cam.x, -1.0));\n    float3 sc = float3(0.0, 0.0, -3.0);\n    float scale = u_cam.y;\n    float disp = 0.30 * INTENSITY;\n    float3 twistAxis = normalize(float3(-0.68, 0.54, 0.49));\n    float radius = scale;\n    float h = 0.0; bool seen = false;\n    // Two passes: the plain sphere's hit names a height, the sphere re-sized by it\n    // is hit again — the displaced surface, near enough, without the mesh.\n    for (int i = 0; i < 2; i++) {\n        if (float(i) >= u_cam.z) { break; }\n        float mid = dot(rd, sc);\n        float disc = mid * mid - dot(sc, sc) + radius * radius;\n        if (disc < 0.0) { break; }\n        float3 obj = (rd * (mid - sqrt(disc)) - sc) / scale;\n        float3 base = float3(dot(u_rot0.xyz, obj), dot(u_rot1.xyz, obj), dot(u_rot2.xyz, obj));\n        float3 dir = normalize(base);\n        dir = normalize(rotateAxis(base, twistAxis, -torsion(dir)));\n        h = heightField(dir);\n        seen = true;\n        radius = scale * max(1.0 + h * disp, 0.72);\n    }\n    float3 col;\n    if (seen) {\n        col = gradientAt(spread(h * 0.5 + 0.5));\n    } else {\n        // Past the sphere: the same gradient along a fixed diagonal.\n        float2 axis = normalize(float2(0.62 * aspect, 0.78));\n        float2 centered = float2((uv.x - 0.5) * aspect, uv.y - 0.5);\n        float extent = abs(axis.x) * aspect * 0.5 + abs(axis.y) * 0.5;\n        col = gradientAt(dot(centered, axis) / max(extent * 2.0, 0.0001) + 0.5);\n    }\n\n    // Calm: flatten the field toward its own ground — the pools dim and the\n    // corners lift, so a form screen keeps real colour under its glass rows while\n    // losing the launcher's contrast. Motion is untouched (see the doc comment).\n    col = mix(col, col * 0.60 + u_lift.rgb, calm);\n\n    // Elliptical vignette: clear at r=0.25 → black·0.42 at r=1.15 (aspect-fit ellipse).\n    // Halved under calm: a launcher's cards sit in the pooled centre, but a form\n    // screen's rows run out toward the edges, where crushing to black just eats them.\n    float2 e = (uv - 0.5) * 2.0;\n    float vig = clamp((length(e) - 0.25) / 0.90, 0.0, 1.0)\n              * mix(0.42, 0.21, calm) * u_scrim.a;\n    col = mix(col, u_scrim.rgb, vig);\n\n    // Vertical legibility scrim: black 0.38/0.06/0.08/0.40 at 0/0.32/0.68/1.\n    float v = uv.y;\n    float s = v < 0.32 ? mix(0.38, 0.06, v / 0.32)\n            : v < 0.68 ? mix(0.06, 0.08, (v - 0.32) / 0.36)\n            : mix(0.08, 0.40, (v - 0.68) / 0.32);\n    col = mix(col, u_scrim.rgb, s * u_scrim.a);\n\n    return half4(half3(col), 1.0);\n}\n",
+    "stops": [
+      [
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.01,
+        0.02,
+        0.1
+      ],
+      [
+        0.045,
+        0.016,
+        0.115
+      ],
+      [
+        0.12,
+        0.024,
+        0.13
+      ]
+    ]
+  },
+  "inks": {
+    "dark": {
+      "accent": [
+        0.5249999761581421,
+        0.47099998593330383,
+        0.9610000252723694,
+        1.0
+      ],
+      "face": [
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        [
+          0.5249999761581421,
+          0.47099998593330383,
+          0.9610000252723694,
+          1.0
+        ]
+      ],
+      "fg": [
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "glass": [
+        0.0860000029206276,
+        0.0860000029206276,
+        0.125,
+        0.6200000047683716
+      ],
+      "glass_low": [
+        0.0860000029206276,
+        0.0860000029206276,
+        0.125,
+        0.6200000047683716
+      ],
+      "scrim": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "shadow": 1.0
+    },
+    "pale": {
+      "accent": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "face": [
+        [
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "fg": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "glass": [
+        1.0,
+        1.0,
+        1.0,
+        0.6600000262260437
+      ],
+      "glass_low": [
+        1.0,
+        1.0,
+        1.0,
+        0.6600000262260437
+      ],
+      "scrim": [
+        1.0,
+        1.0,
+        1.0,
+        0.44999998807907104
+      ],
+      "shadow": 0.4000000059604645
+    },
+    "vivid": {
+      "accent": [
+        0.2800000011920929,
+        0.20000000298023224,
+        0.699999988079071,
+        1.0
+      ],
+      "face": [
+        [
+          0.5600000023841858,
+          0.41999998688697815,
+          0.9300000071525574,
+          1.0
+        ],
+        [
+          0.4000000059604645,
+          0.25999999046325684,
+          0.8199999928474426,
+          1.0
+        ]
+      ],
+      "fg": [
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "glass": [
+        0.3199999928474426,
+        0.23999999463558197,
+        0.41999998688697815,
+        0.30000001192092896
+      ],
+      "glass_low": [
+        1.0,
+        1.0,
+        1.0,
+        0.1599999964237213
+      ],
+      "scrim": [
+        0.0,
+        0.0,
+        0.0,
+        0.11999999731779099
+      ],
+      "shadow": 0.550000011920929
+    }
+  },
+  "mesh_colors": [
+    [
+      0.075,
+      0.06,
+      0.16
+    ],
+    [
+      0.34,
+      0.27,
+      0.72
+    ],
+    [
+      0.3,
+      0.26,
+      0.74
+    ],
+    [
+      0.075,
+      0.06,
+      0.16
+    ],
+    [
+      0.42,
+      0.2,
+      0.54
+    ],
+    [
+      0.49,
+      0.39,
+      0.95
+    ],
+    [
+      0.28,
+      0.31,
+      0.84
+    ],
+    [
+      0.16,
+      0.26,
+      0.64
+    ],
+    [
+      0.45,
+      0.23,
+      0.6
+    ],
+    [
+      0.53,
+      0.31,
+      0.75
+    ],
+    [
+      0.35,
+      0.35,
+      0.91
+    ],
+    [
+      0.19,
+      0.28,
+      0.7
+    ],
+    [
+      0.075,
+      0.06,
+      0.16
+    ],
+    [
+      0.22,
+      0.18,
+      0.54
+    ],
+    [
+      0.24,
+      0.2,
+      0.58
+    ],
+    [
+      0.075,
+      0.06,
+      0.16
+    ]
+  ],
+  "palettes": [
+    {
+      "accent": [
+        0.525,
+        0.471,
+        0.961
+      ],
+      "ground": [
+        0.51,
+        0.47,
+        0.96
+      ],
+      "id": "violet",
+      "light": false,
+      "name": "Violet",
+      "stops": null
+    },
+    {
+      "accent": [
+        0.525,
+        0.471,
+        0.961
+      ],
+      "ground": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "id": "oled",
+      "light": false,
+      "name": "Eclipse",
+      "stops": [
+        [
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.01,
+          0.02,
+          0.1
+        ],
+        [
+          0.045,
+          0.016,
+          0.115
+        ],
+        [
+          0.12,
+          0.024,
+          0.13
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.525,
+        0.471,
+        0.961
+      ],
+      "ground": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "id": "void",
+      "light": false,
+      "name": "Void",
+      "stops": [
+        [
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.78,
+        0.8,
+        0.86
+      ],
+      "ground": [
+        0.055,
+        0.055,
+        0.07
+      ],
+      "id": "graphite",
+      "light": false,
+      "name": "Graphite",
+      "stops": [
+        [
+          0.06,
+          0.07,
+          0.11
+        ],
+        [
+          0.15,
+          0.18,
+          0.25
+        ],
+        [
+          0.3,
+          0.31,
+          0.35
+        ],
+        [
+          0.45,
+          0.42,
+          0.38
+        ],
+        [
+          0.6,
+          0.56,
+          0.49
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.6,
+        0.8,
+        1.0
+      ],
+      "ground": [
+        0.06,
+        0.08,
+        0.11
+      ],
+      "id": "slate",
+      "light": false,
+      "name": "Slate",
+      "stops": [
+        [
+          0.06,
+          0.08,
+          0.11
+        ],
+        [
+          0.14,
+          0.18,
+          0.24
+        ],
+        [
+          0.24,
+          0.3,
+          0.38
+        ],
+        [
+          0.4,
+          0.44,
+          0.48
+        ],
+        [
+          0.6,
+          0.58,
+          0.52
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.4,
+        0.72,
+        1.0
+      ],
+      "ground": [
+        0.03,
+        0.05,
+        0.16
+      ],
+      "id": "midnight",
+      "light": false,
+      "name": "Midnight",
+      "stops": [
+        [
+          0.05,
+          0.02,
+          0.16
+        ],
+        [
+          0.05,
+          0.11,
+          0.36
+        ],
+        [
+          0.08,
+          0.24,
+          0.6
+        ],
+        [
+          0.14,
+          0.42,
+          0.8
+        ],
+        [
+          0.36,
+          0.76,
+          0.86
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.45,
+        0.85,
+        1.0
+      ],
+      "ground": [
+        0.02,
+        0.0,
+        0.1
+      ],
+      "id": "electric",
+      "light": false,
+      "name": "Electric",
+      "stops": [
+        [
+          0.02,
+          0.0,
+          0.1
+        ],
+        [
+          0.14,
+          0.02,
+          0.5
+        ],
+        [
+          0.3,
+          0.1,
+          0.95
+        ],
+        [
+          0.1,
+          0.45,
+          1.0
+        ],
+        [
+          0.2,
+          0.9,
+          1.0
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.45,
+        0.95,
+        0.9
+      ],
+      "ground": [
+        0.01,
+        0.05,
+        0.14
+      ],
+      "id": "ocean",
+      "light": false,
+      "name": "Ocean",
+      "stops": [
+        [
+          0.01,
+          0.05,
+          0.14
+        ],
+        [
+          0.02,
+          0.18,
+          0.4
+        ],
+        [
+          0.02,
+          0.4,
+          0.62
+        ],
+        [
+          0.05,
+          0.66,
+          0.72
+        ],
+        [
+          0.55,
+          0.92,
+          0.8
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.36,
+        0.9,
+        0.78
+      ],
+      "ground": [
+        0.02,
+        0.07,
+        0.11
+      ],
+      "id": "aurora",
+      "light": false,
+      "name": "Aurora",
+      "stops": [
+        [
+          0.02,
+          0.07,
+          0.11
+        ],
+        [
+          0.03,
+          0.24,
+          0.28
+        ],
+        [
+          0.05,
+          0.46,
+          0.4
+        ],
+        [
+          0.14,
+          0.6,
+          0.72
+        ],
+        [
+          0.44,
+          0.42,
+          0.86
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.52,
+        0.9,
+        0.62
+      ],
+      "ground": [
+        0.02,
+        0.07,
+        0.1
+      ],
+      "id": "jade",
+      "light": false,
+      "name": "Jade",
+      "stops": [
+        [
+          0.02,
+          0.07,
+          0.1
+        ],
+        [
+          0.03,
+          0.22,
+          0.19
+        ],
+        [
+          0.05,
+          0.4,
+          0.34
+        ],
+        [
+          0.16,
+          0.58,
+          0.46
+        ],
+        [
+          0.6,
+          0.84,
+          0.52
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.55,
+        1.0,
+        0.55
+      ],
+      "ground": [
+        0.01,
+        0.07,
+        0.04
+      ],
+      "id": "emerald",
+      "light": false,
+      "name": "Emerald",
+      "stops": [
+        [
+          0.01,
+          0.07,
+          0.04
+        ],
+        [
+          0.02,
+          0.26,
+          0.12
+        ],
+        [
+          0.04,
+          0.5,
+          0.22
+        ],
+        [
+          0.16,
+          0.74,
+          0.34
+        ],
+        [
+          0.6,
+          0.92,
+          0.4
+        ]
+      ]
+    },
+    {
+      "accent": [
+        1.0,
+        0.42,
+        0.42
+      ],
+      "ground": [
+        0.08,
+        0.02,
+        0.06
+      ],
+      "id": "crimson",
+      "light": false,
+      "name": "Crimson",
+      "stops": [
+        [
+          0.1,
+          0.02,
+          0.1
+        ],
+        [
+          0.34,
+          0.03,
+          0.12
+        ],
+        [
+          0.62,
+          0.06,
+          0.2
+        ],
+        [
+          0.86,
+          0.2,
+          0.28
+        ],
+        [
+          0.98,
+          0.52,
+          0.32
+        ]
+      ]
+    },
+    {
+      "accent": [
+        1.0,
+        0.5,
+        0.62
+      ],
+      "ground": [
+        0.08,
+        0.0,
+        0.06
+      ],
+      "id": "ruby",
+      "light": false,
+      "name": "Ruby",
+      "stops": [
+        [
+          0.06,
+          0.0,
+          0.2
+        ],
+        [
+          0.4,
+          0.02,
+          0.16
+        ],
+        [
+          0.8,
+          0.06,
+          0.3
+        ],
+        [
+          1.0,
+          0.28,
+          0.48
+        ],
+        [
+          1.0,
+          0.62,
+          0.56
+        ]
+      ]
+    },
+    {
+      "accent": [
+        1.0,
+        0.72,
+        0.2
+      ],
+      "ground": [
+        0.06,
+        0.01,
+        0.02
+      ],
+      "id": "lava",
+      "light": false,
+      "name": "Lava",
+      "stops": [
+        [
+          0.06,
+          0.01,
+          0.02
+        ],
+        [
+          0.42,
+          0.02,
+          0.04
+        ],
+        [
+          0.86,
+          0.12,
+          0.02
+        ],
+        [
+          1.0,
+          0.45,
+          0.02
+        ],
+        [
+          1.0,
+          0.85,
+          0.2
+        ]
+      ]
+    },
+    {
+      "accent": [
+        1.0,
+        0.7,
+        0.36
+      ],
+      "ground": [
+        0.07,
+        0.05,
+        0.04
+      ],
+      "id": "copper",
+      "light": false,
+      "name": "Copper",
+      "stops": [
+        [
+          0.08,
+          0.05,
+          0.04
+        ],
+        [
+          0.36,
+          0.15,
+          0.08
+        ],
+        [
+          0.66,
+          0.32,
+          0.14
+        ],
+        [
+          0.85,
+          0.56,
+          0.26
+        ],
+        [
+          0.5,
+          0.78,
+          0.62
+        ]
+      ]
+    },
+    {
+      "accent": [
+        1.0,
+        0.8,
+        0.3
+      ],
+      "ground": [
+        0.1,
+        0.04,
+        0.02
+      ],
+      "id": "amber",
+      "light": false,
+      "name": "Amber",
+      "stops": [
+        [
+          0.1,
+          0.02,
+          0.1
+        ],
+        [
+          0.36,
+          0.16,
+          0.02
+        ],
+        [
+          0.66,
+          0.36,
+          0.04
+        ],
+        [
+          0.88,
+          0.58,
+          0.08
+        ],
+        [
+          0.92,
+          0.86,
+          0.36
+        ]
+      ]
+    },
+    {
+      "accent": [
+        1.0,
+        0.62,
+        0.56
+      ],
+      "ground": [
+        0.07,
+        0.04,
+        0.12
+      ],
+      "id": "dusk",
+      "light": false,
+      "name": "Dusk",
+      "stops": [
+        [
+          0.08,
+          0.04,
+          0.14
+        ],
+        [
+          0.26,
+          0.1,
+          0.34
+        ],
+        [
+          0.5,
+          0.2,
+          0.48
+        ],
+        [
+          0.78,
+          0.38,
+          0.5
+        ],
+        [
+          0.96,
+          0.62,
+          0.48
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.85,
+        0.55,
+        1.0
+      ],
+      "ground": [
+        0.08,
+        0.02,
+        0.16
+      ],
+      "id": "grape",
+      "light": false,
+      "name": "Grape",
+      "stops": [
+        [
+          0.08,
+          0.02,
+          0.16
+        ],
+        [
+          0.28,
+          0.06,
+          0.48
+        ],
+        [
+          0.52,
+          0.14,
+          0.78
+        ],
+        [
+          0.78,
+          0.3,
+          0.92
+        ],
+        [
+          1.0,
+          0.55,
+          0.8
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.4,
+        1.0,
+        0.7
+      ],
+      "ground": [
+        0.05,
+        0.0,
+        0.12
+      ],
+      "id": "neon",
+      "light": false,
+      "name": "Neon",
+      "stops": [
+        [
+          0.05,
+          0.0,
+          0.12
+        ],
+        [
+          0.4,
+          0.0,
+          0.6
+        ],
+        [
+          0.9,
+          0.05,
+          0.55
+        ],
+        [
+          0.15,
+          0.35,
+          0.95
+        ],
+        [
+          0.3,
+          0.95,
+          0.55
+        ]
+      ]
+    },
+    {
+      "accent": [
+        1.0,
+        0.6,
+        0.3
+      ],
+      "ground": [
+        0.02,
+        0.08,
+        0.1
+      ],
+      "id": "tropic",
+      "light": false,
+      "name": "Tropic",
+      "stops": [
+        [
+          0.02,
+          0.1,
+          0.12
+        ],
+        [
+          0.02,
+          0.42,
+          0.42
+        ],
+        [
+          0.95,
+          0.45,
+          0.1
+        ],
+        [
+          0.98,
+          0.2,
+          0.45
+        ],
+        [
+          0.4,
+          0.1,
+          0.55
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.42,
+        0.3,
+        0.28
+      ],
+      "ground": [
+        0.97,
+        0.96,
+        0.94
+      ],
+      "id": "paper",
+      "light": true,
+      "name": "Paper",
+      "stops": [
+        [
+          0.99,
+          0.95,
+          0.88
+        ],
+        [
+          0.91,
+          0.94,
+          0.98
+        ],
+        [
+          0.98,
+          0.91,
+          0.94
+        ],
+        [
+          0.99,
+          0.97,
+          0.89
+        ],
+        [
+          0.9,
+          0.94,
+          0.99
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.12,
+        0.3,
+        0.62
+      ],
+      "ground": [
+        0.92,
+        0.95,
+        1.0
+      ],
+      "id": "sky",
+      "light": true,
+      "name": "Sky",
+      "stops": [
+        [
+          0.76,
+          0.87,
+          1.0
+        ],
+        [
+          0.62,
+          0.78,
+          0.99
+        ],
+        [
+          0.72,
+          0.76,
+          0.99
+        ],
+        [
+          0.84,
+          0.82,
+          1.0
+        ],
+        [
+          0.86,
+          0.98,
+          0.96
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.1,
+        0.2,
+        0.55
+      ],
+      "ground": [
+        0.78,
+        0.88,
+        1.0
+      ],
+      "id": "glacier",
+      "light": true,
+      "name": "Glacier",
+      "stops": [
+        [
+          0.45,
+          0.7,
+          1.0
+        ],
+        [
+          0.6,
+          0.8,
+          1.0
+        ],
+        [
+          0.75,
+          0.85,
+          1.0
+        ],
+        [
+          0.85,
+          0.8,
+          1.0
+        ],
+        [
+          0.95,
+          0.85,
+          1.0
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.44,
+        0.24,
+        0.66
+      ],
+      "ground": [
+        0.95,
+        0.92,
+        0.99
+      ],
+      "id": "lilac",
+      "light": true,
+      "name": "Lilac",
+      "stops": [
+        [
+          0.84,
+          0.76,
+          0.99
+        ],
+        [
+          0.74,
+          0.7,
+          0.99
+        ],
+        [
+          0.88,
+          0.74,
+          0.98
+        ],
+        [
+          0.98,
+          0.82,
+          0.94
+        ],
+        [
+          0.96,
+          0.94,
+          1.0
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.25,
+        0.05,
+        0.55
+      ],
+      "ground": [
+        0.8,
+        0.72,
+        1.0
+      ],
+      "id": "iris",
+      "light": true,
+      "name": "Iris",
+      "stops": [
+        [
+          0.6,
+          0.35,
+          0.95
+        ],
+        [
+          0.55,
+          0.5,
+          1.0
+        ],
+        [
+          0.65,
+          0.65,
+          1.0
+        ],
+        [
+          0.85,
+          0.6,
+          0.98
+        ],
+        [
+          1.0,
+          0.7,
+          0.9
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.55,
+        0.05,
+        0.35
+      ],
+      "ground": [
+        1.0,
+        0.78,
+        0.9
+      ],
+      "id": "bubblegum",
+      "light": true,
+      "name": "Bubblegum",
+      "stops": [
+        [
+          1.0,
+          0.5,
+          0.8
+        ],
+        [
+          1.0,
+          0.62,
+          0.85
+        ],
+        [
+          0.92,
+          0.7,
+          0.95
+        ],
+        [
+          0.7,
+          0.75,
+          1.0
+        ],
+        [
+          0.6,
+          0.85,
+          1.0
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.68,
+        0.14,
+        0.22
+      ],
+      "ground": [
+        1.0,
+        0.9,
+        0.8
+      ],
+      "id": "coral",
+      "light": true,
+      "name": "Coral",
+      "stops": [
+        [
+          1.0,
+          0.58,
+          0.62
+        ],
+        [
+          1.0,
+          0.68,
+          0.56
+        ],
+        [
+          1.0,
+          0.8,
+          0.64
+        ],
+        [
+          0.99,
+          0.88,
+          0.72
+        ],
+        [
+          1.0,
+          0.96,
+          0.8
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.5,
+        0.0,
+        0.2
+      ],
+      "ground": [
+        1.0,
+        0.72,
+        0.66
+      ],
+      "id": "flamingo",
+      "light": true,
+      "name": "Flamingo",
+      "stops": [
+        [
+          1.0,
+          0.3,
+          0.6
+        ],
+        [
+          1.0,
+          0.42,
+          0.55
+        ],
+        [
+          1.0,
+          0.55,
+          0.45
+        ],
+        [
+          1.0,
+          0.7,
+          0.45
+        ],
+        [
+          1.0,
+          0.85,
+          0.6
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.6,
+        0.16,
+        0.1
+      ],
+      "ground": [
+        1.0,
+        0.82,
+        0.66
+      ],
+      "id": "peach",
+      "light": true,
+      "name": "Peach",
+      "stops": [
+        [
+          1.0,
+          0.45,
+          0.6
+        ],
+        [
+          1.0,
+          0.6,
+          0.44
+        ],
+        [
+          1.0,
+          0.72,
+          0.52
+        ],
+        [
+          1.0,
+          0.82,
+          0.58
+        ],
+        [
+          0.98,
+          0.92,
+          0.72
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.55,
+        0.05,
+        0.3
+      ],
+      "ground": [
+        1.0,
+        0.8,
+        0.75
+      ],
+      "id": "candy",
+      "light": true,
+      "name": "Candy",
+      "stops": [
+        [
+          1.0,
+          0.4,
+          0.7
+        ],
+        [
+          1.0,
+          0.55,
+          0.6
+        ],
+        [
+          1.0,
+          0.75,
+          0.4
+        ],
+        [
+          0.8,
+          0.9,
+          0.5
+        ],
+        [
+          0.55,
+          0.85,
+          0.95
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.3,
+        0.36,
+        0.08
+      ],
+      "ground": [
+        1.0,
+        0.98,
+        0.86
+      ],
+      "id": "lemon",
+      "light": true,
+      "name": "Lemon",
+      "stops": [
+        [
+          1.0,
+          0.86,
+          0.44
+        ],
+        [
+          0.98,
+          0.96,
+          0.56
+        ],
+        [
+          0.7,
+          0.94,
+          0.64
+        ],
+        [
+          0.84,
+          0.97,
+          0.78
+        ],
+        [
+          0.98,
+          0.99,
+          0.9
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.4,
+        0.22,
+        0.0
+      ],
+      "ground": [
+        1.0,
+        0.88,
+        0.4
+      ],
+      "id": "sunflower",
+      "light": true,
+      "name": "Sunflower",
+      "stops": [
+        [
+          1.0,
+          0.6,
+          0.1
+        ],
+        [
+          1.0,
+          0.75,
+          0.1
+        ],
+        [
+          1.0,
+          0.88,
+          0.2
+        ],
+        [
+          0.95,
+          0.95,
+          0.4
+        ],
+        [
+          0.75,
+          0.92,
+          0.6
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.45,
+        0.18,
+        0.02
+      ],
+      "ground": [
+        1.0,
+        0.85,
+        0.6
+      ],
+      "id": "sherbet",
+      "light": true,
+      "name": "Sherbet",
+      "stops": [
+        [
+          1.0,
+          0.55,
+          0.25
+        ],
+        [
+          1.0,
+          0.72,
+          0.3
+        ],
+        [
+          1.0,
+          0.9,
+          0.4
+        ],
+        [
+          0.85,
+          0.95,
+          0.5
+        ],
+        [
+          0.6,
+          0.92,
+          0.7
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.18,
+        0.36,
+        0.24
+      ],
+      "ground": [
+        0.94,
+        0.96,
+        0.9
+      ],
+      "id": "sage",
+      "light": true,
+      "name": "Sage",
+      "stops": [
+        [
+          0.72,
+          0.84,
+          0.7
+        ],
+        [
+          0.8,
+          0.9,
+          0.76
+        ],
+        [
+          0.9,
+          0.94,
+          0.8
+        ],
+        [
+          0.96,
+          0.96,
+          0.84
+        ],
+        [
+          0.99,
+          0.97,
+          0.9
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.1,
+        0.35,
+        0.12
+      ],
+      "ground": [
+        0.85,
+        0.95,
+        0.6
+      ],
+      "id": "meadow",
+      "light": true,
+      "name": "Meadow",
+      "stops": [
+        [
+          0.3,
+          0.8,
+          0.4
+        ],
+        [
+          0.55,
+          0.9,
+          0.4
+        ],
+        [
+          0.8,
+          0.95,
+          0.45
+        ],
+        [
+          0.95,
+          0.95,
+          0.55
+        ],
+        [
+          1.0,
+          0.9,
+          0.65
+        ]
+      ]
+    },
+    {
+      "accent": [
+        0.02,
+        0.3,
+        0.35
+      ],
+      "ground": [
+        0.75,
+        0.95,
+        0.9
+      ],
+      "id": "lagoon",
+      "light": true,
+      "name": "Lagoon",
+      "stops": [
+        [
+          0.2,
+          0.75,
+          0.8
+        ],
+        [
+          0.35,
+          0.85,
+          0.85
+        ],
+        [
+          0.55,
+          0.92,
+          0.8
+        ],
+        [
+          0.7,
+          0.95,
+          0.7
+        ],
+        [
+          0.92,
+          0.98,
+          0.75
+        ]
+      ]
+    }
+  ],
+  "sksl": {
+    "head": "uniform float2 u_res;\n// x = seconds since the shell started, y = the calm mix (0 launcher, 1 form).\nuniform float2 u_tc;\n// rgb = the palette's ground scaled for the calm lift; a is unused (float4 so\n// the uniform block stays 16-byte aligned under any packing rule).\nuniform float4 u_lift;\n// rgb = what the vignette and scrims tend toward (black under a dark palette, white\n// under a pale one — darkening a pastel field would strand the dark text on it), and\n// a = how hard. A pale field needs far less: mixing toward white at the dark field's\n// strength bleaches the chroma straight out of the gradient.\nuniform float4 u_scrim;\n// x = focal length, y = sphere scale (`field_camera`), z = passes over the sphere\n// (1 = the plain sphere's height, 2 = re-hit at that height: the displaced surface).\nuniform float4 u_cam;\n// The sphere's turn (rows of the world-to-sphere rotation) and its drift at this\n// instant: xyz of each, from `field_motion`, so no pixel pays for time alone.\nuniform float4 u_rot0;\nuniform float4 u_rot1;\nuniform float4 u_rot2;\nuniform float4 u_mot;\nuniform float4 u_wmot;\n\nconst float DETAIL = 3.33;\nconst float INTENSITY = 4.29;\nconst float TWIST = 0.04;\nconst float WARP = 0.26;\n\nfloat3 hash33(float3 p) {\n    float3 q = float3(dot(p, float3(127.1, 311.7, 74.7)),\n                      dot(p, float3(269.5, 183.3, 246.1)),\n                      dot(p, float3(113.5, 271.9, 124.6)));\n    return fract(sin(q) * 43758.5453) * 2.0 - 1.0;\n}\nfloat3 smoother(float3 t) { return t * t * t * (t * (t * 6.0 - 15.0) + 10.0); }\nfloat gradDot(float3 cell, float3 off, float3 local) {\n    return dot(hash33(cell + off), local - off);\n}\nfloat perlin3(float3 p) {\n    float3 cell = floor(p); float3 local = fract(p); float3 w = smoother(local);\n    float n000 = gradDot(cell, float3(0.0, 0.0, 0.0), local);\n    float n100 = gradDot(cell, float3(1.0, 0.0, 0.0), local);\n    float n010 = gradDot(cell, float3(0.0, 1.0, 0.0), local);\n    float n110 = gradDot(cell, float3(1.0, 1.0, 0.0), local);\n    float n001 = gradDot(cell, float3(0.0, 0.0, 1.0), local);\n    float n101 = gradDot(cell, float3(1.0, 0.0, 1.0), local);\n    float n011 = gradDot(cell, float3(0.0, 1.0, 1.0), local);\n    float n111 = gradDot(cell, float3(1.0, 1.0, 1.0), local);\n    float nx00 = mix(n000, n100, w.x); float nx10 = mix(n010, n110, w.x);\n    float nx01 = mix(n001, n101, w.x); float nx11 = mix(n011, n111, w.x);\n    return mix(mix(nx00, nx10, w.y), mix(nx01, nx11, w.y), w.z) * 1.1547;\n}\nfloat3 rotateOctave(float3 p) {\n    return float3(0.80 * p.y + 0.60 * p.z,\n                  -0.80 * p.x + 0.36 * p.y - 0.48 * p.z,\n                  -0.60 * p.x - 0.48 * p.y + 0.64 * p.z);\n}\nfloat fbm(float3 p) {\n    float3 q = p; float total = 0.0; float amp = 1.0; float weight = 0.0;\n    for (int i = 0; i < 3; i++) {\n        total += perlin3(q) * amp; weight += amp;\n        q = rotateOctave(q) * 2.02 + float3(3.7, 1.9, 6.3);\n        amp *= 0.48;\n    }\n    return total / max(weight, 0.0001);\n}\nfloat3 warpVector(float3 p) {\n    return float3(perlin3(p), perlin3(p + float3(5.2, 1.3, 2.8)),\n                  perlin3(p + float3(1.7, 9.2, 4.4)));\n}\nfloat heightField(float3 dir) {\n    float frequency = mix(1.05, 3.4, clamp(DETAIL / 5.0, 0.0, 1.0));\n    float3 p = dir * frequency + float3(1.7, 3.1, 5.3) + u_mot.xyz;\n    float3 warp = warpVector(p * 0.55 + u_wmot.xyz * 0.42 + float3(0.7, -1.1, 0.4)) * WARP;\n    return fbm(p + warp);\n}\nfloat3 rotateAxis(float3 p, float3 axis, float angle) {\n    float c = cos(angle); float s = sin(angle);\n    return p * c + cross(axis, p) * s + axis * dot(axis, p) * (1.0 - c);\n}\nfloat torsion(float3 dir) {\n    float axial = clamp(dot(dir, normalize(float3(-0.68, 0.54, 0.49))), -1.0, 1.0);\n    return axial * (1.5 - 0.5 * axial * axial) * TWIST;\n}\nfloat3 linearToSrgb(float3 c) {\n    float3 v = max(c, float3(0.0));\n    return mix(v * 12.92, 1.055 * pow(v, float3(1.0 / 2.4)) - 0.055, step(float3(0.0031308), v));\n}\nfloat3 oklabToLinear(float3 c) {\n    float lc = c.x + 0.3963377774 * c.y + 0.2158037573 * c.z;\n    float mc = c.x - 0.1055613458 * c.y - 0.0638541728 * c.z;\n    float sc = c.x - 0.0894841775 * c.y - 1.2914855480 * c.z;\n    float l = lc * lc * lc; float m = mc * mc * mc; float s = sc * sc * sc;\n    return float3(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,\n                  -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,\n                  -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s);\n}\n// The gradient's stops, even spaced and already in OKLab, blended with a smoothstep.\nfloat3 gradientAt(float t) {\n",
+    "tail": "    f = f * f * (3.0 - 2.0 * f);\n    return linearToSrgb(oklabToLinear(mix(a, b, f)));\n}\nfloat spread(float raw) { return clamp((raw - 0.5) * 3.0 + 0.5, 0.0, 1.0); }\n\nhalf4 main(float2 xy) {\n    float calm = u_tc.y;\n    float aspect = u_res.x / u_res.y;\n    float2 uv = xy / u_res;\n    // The pixel's ray, in the camera's frame: origin, looking down -z at a sphere\n    // three units away. Focal length and scale are the cover-zoom's.\n    float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);\n    float3 rd = normalize(float3(ndc.x * aspect / u_cam.x, ndc.y / u_cam.x, -1.0));\n    float3 sc = float3(0.0, 0.0, -3.0);\n    float scale = u_cam.y;\n    float disp = 0.30 * INTENSITY;\n    float3 twistAxis = normalize(float3(-0.68, 0.54, 0.49));\n    float radius = scale;\n    float h = 0.0; bool seen = false;\n    // Two passes: the plain sphere's hit names a height, the sphere re-sized by it\n    // is hit again — the displaced surface, near enough, without the mesh.\n    for (int i = 0; i < 2; i++) {\n        if (float(i) >= u_cam.z) { break; }\n        float mid = dot(rd, sc);\n        float disc = mid * mid - dot(sc, sc) + radius * radius;\n        if (disc < 0.0) { break; }\n        float3 obj = (rd * (mid - sqrt(disc)) - sc) / scale;\n        float3 base = float3(dot(u_rot0.xyz, obj), dot(u_rot1.xyz, obj), dot(u_rot2.xyz, obj));\n        float3 dir = normalize(base);\n        dir = normalize(rotateAxis(base, twistAxis, -torsion(dir)));\n        h = heightField(dir);\n        seen = true;\n        radius = scale * max(1.0 + h * disp, 0.72);\n    }\n    float3 col;\n    if (seen) {\n        col = gradientAt(spread(h * 0.5 + 0.5));\n    } else {\n        // Past the sphere: the same gradient along a fixed diagonal.\n        float2 axis = normalize(float2(0.62 * aspect, 0.78));\n        float2 centered = float2((uv.x - 0.5) * aspect, uv.y - 0.5);\n        float extent = abs(axis.x) * aspect * 0.5 + abs(axis.y) * 0.5;\n        col = gradientAt(dot(centered, axis) / max(extent * 2.0, 0.0001) + 0.5);\n    }\n\n    // Calm: flatten the field toward its own ground — the pools dim and the\n    // corners lift, so a form screen keeps real colour under its glass rows while\n    // losing the launcher's contrast. Motion is untouched (see the doc comment).\n    col = mix(col, col * 0.60 + u_lift.rgb, calm);\n\n    // Elliptical vignette: clear at r=0.25 → black·0.42 at r=1.15 (aspect-fit ellipse).\n    // Halved under calm: a launcher's cards sit in the pooled centre, but a form\n    // screen's rows run out toward the edges, where crushing to black just eats them.\n    float2 e = (uv - 0.5) * 2.0;\n    float vig = clamp((length(e) - 0.25) / 0.90, 0.0, 1.0)\n              * mix(0.42, 0.21, calm) * u_scrim.a;\n    col = mix(col, u_scrim.rgb, vig);\n\n    // Vertical legibility scrim: black 0.38/0.06/0.08/0.40 at 0/0.32/0.68/1.\n    float v = uv.y;\n    float s = v < 0.32 ? mix(0.38, 0.06, v / 0.32)\n            : v < 0.68 ? mix(0.06, 0.08, (v - 0.32) / 0.36)\n            : mix(0.08, 0.40, (v - 0.68) / 0.32);\n    col = mix(col, u_scrim.rgb, s * u_scrim.a);\n\n    return half4(half3(col), 1.0);\n}\n"
+  },
+  "violet_field": [
+    [
+      0.8,
+      0.6,
+      0.98
+    ],
+    [
+      0.47,
+      0.44,
+      1.0
+    ],
+    [
+      0.98,
+      0.12,
+      0.62
+    ]
+  ],
+  "vivid_ground": 0.3
+}

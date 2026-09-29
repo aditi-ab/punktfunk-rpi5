@@ -1,7 +1,7 @@
 // The library-provider wire schemas — a browser-safe module (no node imports) so plugin
 // CONTRACTS can share these types with their UIs. Mirrors the host's `ProviderEntryInput`
-// (crates/punktfunk-host mgmt/library.rs). Identity codecs: plain JSON shapes, so values
-// pass through unencoded; the value is the shared type + authoring validation.
+// (crates/punktfunk-host library/custom.rs); test/wire-contract.test.ts pins the fields. Identity
+// codecs: plain JSON shapes, so values pass through unencoded.
 import { Schema } from "effect";
 
 export const Artwork = Schema.Struct({
@@ -37,6 +37,9 @@ export type Artwork = typeof Artwork.Type;
  * | `uplay` | digits — a Ubisoft Connect game id | windows |
  * | `amazon` | an Amazon Games product id (`amzn1.adg.product.…`) | windows |
  * | `battlenet` | a Battle.net launch code (`WTCG`, `Pro`, `Fen`, …), case kept | windows |
+ * | `ea` | an EA app content id from the game's `installerdata.xml` | windows |
+ * | `rockstar` | a Rockstar Games Launcher title id (`gta5`, `rdr2`); the host finds the folder | windows |
+ * | `gamebar` | an exe's absolute path; the host runs it only if a signed-in user's Game Bar list names it | windows |
  * | `desktop_id` | an installed `.desktop` entry's id; the host reads its `Exec` | linux |
  * | `exec` | the name of an `exec` template in THIS plugin's manifest — see below | both |
  *
@@ -162,6 +165,46 @@ export const GameMeta = Schema.Struct({
 });
 export type GameMeta = typeof GameMeta.Type;
 
+/**
+ * Catalog ids an Art & Metadata source matches on, set by the plugin that lists the entry:
+ * `steam` → appid, `gog` → product id, `epic` → catalog item id, `libretro` →
+ * `<libretro system>/<No-Intro name>`, `sgdb` → SteamGridDB game id. Keys `[a-z0-9_]{1,16}`,
+ * values at most 256 characters, at most eight; the host drops a bad pair.
+ */
+export const EntryIds = Schema.Record(Schema.String, Schema.String);
+export type EntryIds = typeof EntryIds.Type;
+
+/**
+ * Which sessions on the title's display hear it: `all` (the default), `owner` (the session that
+ * owns the display), `joined` (the sessions that joined it) or `launcher` (only the one that
+ * launched the title).
+ */
+export const AudioPolicy = Schema.Struct({
+	sessions: Schema.optionalKey(
+		Schema.Literals(["all", "owner", "joined", "launcher"]),
+	),
+});
+export type AudioPolicy = typeof AudioPolicy.Type;
+
+/**
+ * What the host does with the title's own window once it first reaches the streamed screen. Every
+ * key is optional; an absent one keeps the host's default.
+ */
+export const OnWindow = Schema.Struct({
+	/** `own` opens it on an empty workspace, `current` on the one in view. Default: the host's
+	 * display policy. Only backends that can place a launch honour it. */
+	workspace: Schema.optionalKey(
+		Schema.NullOr(Schema.Literals(["own", "current"])),
+	),
+	/** Raise it. Default on. */
+	focus: Schema.optionalKey(Schema.NullOr(Schema.Boolean)),
+	/** Make it full-screen. Default off: most games set their own mode. */
+	fullscreen: Schema.optionalKey(Schema.NullOr(Schema.Boolean)),
+	/** Move it onto the streamed head if it opened elsewhere. Default on. */
+	move_to_stream_output: Schema.optionalKey(Schema.NullOr(Schema.Boolean)),
+});
+export type OnWindow = typeof OnWindow.Type;
+
 export const ProviderEntry = Schema.Struct({
 	external_id: Schema.String,
 	title: Schema.String,
@@ -192,6 +235,34 @@ export const ProviderEntry = Schema.Struct({
 	 * has real cover art, which beats a brand mark every time.
 	 */
 	icon: Schema.optionalKey(Schema.String),
+	ids: Schema.optionalKey(EntryIds),
+	on_window: Schema.optionalKey(OnWindow),
+	audio: Schema.optionalKey(Schema.NullOr(AudioPolicy)),
 	...GameMeta.fields,
 });
 export type ProviderEntry = typeof ProviderEntry.Type;
+
+/** One of an entry's four art slots. */
+export const ArtKind = Schema.Literals(["portrait", "hero", "logo", "header"]);
+export type ArtKind = typeof ArtKind.Type;
+export const ART_KINDS: ReadonlyArray<ArtKind> = [
+	"portrait",
+	"hero",
+	"logo",
+	"header",
+];
+
+/** A `GameMeta` field a metadata source may fill. */
+export type MetaField = keyof GameMeta;
+
+/**
+ * One row of an Art & Metadata source's push (`PUT /library/metadata/{source}`). Art is
+ * `http(s)` URLs only; the host fetches and keeps them like a provider's CDN art.
+ */
+export const MetadataEntry = Schema.Struct({
+	/** Library id, as `GET /library` lists it. */
+	id: Schema.String,
+	art: Schema.optionalKey(Artwork),
+	meta: Schema.optionalKey(GameMeta),
+});
+export type MetadataEntry = typeof MetadataEntry.Type;

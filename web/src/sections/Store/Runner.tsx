@@ -1,11 +1,9 @@
 import { toast } from "@unom/ui/toast";
 import { Container, Play, Power, PowerOff } from "lucide-react";
 import type { FC } from "react";
-import {
-	type RuntimeStatus,
-	useSetRuntime,
-	useStoreRuntime,
-} from "@/api/store";
+import type { RuntimeView } from "@/api/gen/model";
+import { useGetPluginRuntime } from "@/api/gen/store/store";
+import { useSetRuntime } from "@/api/store";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -19,20 +17,24 @@ import { m } from "@/paraglide/messages";
 function useRunnerToggle() {
 	const set = useSetRuntime();
 	const toggle = (enabled: boolean) => {
-		set.mutate(enabled, {
-			onError: () => toast.error(m.store_runner_failed()),
-		});
+		set.mutate(
+			{ data: { enabled } },
+			{
+				onError: () => toast.error(m.store_runner_failed()),
+			},
+		);
 	};
 	return { toggle, isPending: set.isPending };
 }
 
 /**
  * Browse-tab banner: the runner is installed but not running, so nothing an operator installs
- * here would start. Renders nothing in every other state (including "not installed" — the
- * Installed tab's card explains that case properly).
+ * here would start. A runner the host reports as failing says that instead of "switched off".
+ * Renders nothing in every other state (including "not installed" — the Installed tab's card
+ * explains that case properly).
  */
 export const RunnerBanner: FC = () => {
-	const runtime = useStoreRuntime();
+	const runtime = useGetPluginRuntime();
 	const { toggle, isPending } = useRunnerToggle();
 	const s = runtime.data;
 	if (!s?.installed || s.running) return null;
@@ -40,7 +42,7 @@ export const RunnerBanner: FC = () => {
 	return (
 		<div className="flex flex-col gap-3 rounded-lg border border-amber-600/40 bg-amber-500/10 p-4 text-sm text-amber-600 sm:flex-row sm:items-center dark:border-amber-500/40 dark:text-amber-500">
 			<PowerOff className="size-5 shrink-0" />
-			<p className="flex-1">{m.store_runner_banner()}</p>
+			<p className="flex-1">{s.detail || m.store_runner_banner()}</p>
 			<Button size="sm" disabled={isPending} onClick={() => toggle(true)}>
 				<Play className="size-4" />
 				{m.store_runner_enable()}
@@ -55,7 +57,7 @@ export const RunnerBanner: FC = () => {
  * stacking a second error banner on top of the installed list's own.
  */
 export const RunnerCardSection: FC = () => {
-	const runtime = useStoreRuntime();
+	const runtime = useGetPluginRuntime();
 	const { toggle, isPending } = useRunnerToggle();
 	if (!runtime.data) return null;
 	return (
@@ -69,7 +71,7 @@ export const RunnerCardSection: FC = () => {
  * way back up, and enable is what starts it.
  */
 export const RunnerCard: FC<{
-	status: RuntimeStatus;
+	status: RuntimeView;
 	busy: boolean;
 	onToggle: (enabled: boolean) => void;
 }> = ({ status, busy, onToggle }) => (

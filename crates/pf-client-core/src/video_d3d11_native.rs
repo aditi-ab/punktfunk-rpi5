@@ -5,7 +5,7 @@
 //! RGBA for the presenter, so this path is not zero-copy; see [`crate::video_d3d11`].
 //!
 //! [`NativeD3d11Decoder::new`] rejects unsupported codecs, shapes, profiles, or configs
-//! so [`crate::video`]'s ladder can fall through before an AU is consumed. In-band shape
+//! so a caller can fall through before an AU is consumed. In-band shape
 //! changes rebuild the whole [`Session`]. The pool is one decoder-only `ID3D11Texture2D`
 //! array; [`pf_dxvadec::align_surface`] and [`pf_dxvadec::pool_size`] size it. Slots a
 //! submission names stay live until [`NativeD3d11Decoder::release_deferred`] after the
@@ -35,8 +35,9 @@ use windows::Win32::dxgi::{
     DXGI_SHARED_RESOURCE_WRITE,
 };
 
-use crate::video::{ColorDesc, DecodeHealth, StreamFormat};
+use crate::video_color::ColorDesc;
 use crate::video_d3d11::{create_device, D3d11Frame, HandoffRing, HandoffSource};
+use crate::video_types::{DecodeHealth, StreamFormat};
 
 /// Decode-pool bind flag. The pool takes this flag alone.
 const BIND_DECODER: u32 = 0x200;
@@ -51,7 +52,7 @@ const BEGIN_FRAME_SLEEP: Duration = Duration::from_millis(1);
 const E_PENDING: i32 = 0x8000_000A_u32 as i32;
 
 /// Pin string for this rung.
-pub(crate) const DECODER_PIN: &str = "native-d3d11va";
+pub const DECODER_PIN: &str = "native-d3d11va";
 
 /// Per-codec planner, chosen once at construction. Session, pool, and submission stay
 /// codec-agnostic; forking them per codec would fork the machinery that is hard to get right.
@@ -170,7 +171,7 @@ struct Session {
     profile: DxvaProfile,
 }
 
-pub(crate) struct NativeD3d11Decoder {
+pub struct NativeD3d11Decoder {
     device: ID3D11Device,
     /// Live context for teardown/rebuild; the hand-off holds its own clone for the blit.
     #[allow(dead_code)]
@@ -206,8 +207,8 @@ impl NativeD3d11Decoder {
     ///
     /// The decoder object is not created here: `D3D11_VIDEO_DECODER_DESC` needs the coded
     /// size from the in-band SPS. The negotiated format only proves the adapter can host
-    /// a profile; the session's profile comes from [`StreamShape`].
-    pub(crate) fn new(
+    /// a profile; the session's profile comes from `StreamShape`.
+    pub fn new(
         codec: Codec,
         stream: StreamFormat,
         luid: Option<[u8; 8]>,
@@ -261,29 +262,29 @@ impl NativeD3d11Decoder {
         })
     }
 
-    pub(crate) fn name(&self) -> &'static str {
+    pub fn name(&self) -> &'static str {
         DECODER_PIN
     }
 
     /// Hand NV12 / P010 pictures over as planar copies when the presenter imports them
-    /// ([`HandoffRing::set_planar`]); RGB through the video processor otherwise.
-    pub(crate) fn with_planar(mut self, nv12: bool, p010: bool) -> Self {
+    /// (`HandoffRing::set_planar`); RGB through the video processor otherwise.
+    pub fn with_planar(mut self, nv12: bool, p010: bool) -> Self {
         self.handoff.set_planar(nv12, p010);
         self
     }
 
-    pub(crate) fn health(&self) -> DecodeHealth {
+    pub fn health(&self) -> DecodeHealth {
         self.health
     }
 
     /// Drain the keyframe request raised by concealment.
-    pub(crate) fn take_recovery_request(&mut self) -> bool {
+    pub fn take_recovery_request(&mut self) -> bool {
         std::mem::take(&mut self.want_recovery)
     }
 
     /// The gate lifted on intra refresh marks: the planner's damaged-chain marks are stale
     /// (`CleanLedger::clear`).
-    pub(crate) fn forgive_unclean(&mut self) {
+    pub fn forgive_unclean(&mut self) {
         match &mut self.planner {
             Planner::H264(p) => p.forgive_unclean(),
             Planner::H265(p) => p.forgive_unclean(),
@@ -297,7 +298,7 @@ impl NativeD3d11Decoder {
     /// (drop, request recovery) or an HEVC RASL skip after an open-GOP join. Either as
     /// `Err` would demote on the lossy links this rung exists to handle. `Err` is a
     /// decoder that could not run — streak-eligible, counted as `refused`.
-    pub(crate) fn decode(&mut self, au: &[u8]) -> Result<Option<D3d11Frame>> {
+    pub fn decode(&mut self, au: &[u8]) -> Result<Option<D3d11Frame>> {
         if matches!(self.planner, Planner::Av1(_)) {
             return self.decode_av1(au);
         }
@@ -384,7 +385,7 @@ impl NativeD3d11Decoder {
             let damaged = plan
                 .warnings
                 .iter()
-                .any(pf_dxvadec::is_integrity_warning_av1);
+                .any(pf_dxvadec::PlanWarningAv1::is_integrity);
             concealed |= damaged;
             match self.frame_av1(au, plan, damaged) {
                 Ok(Some(frame)) => shown = Some(frame),
@@ -578,7 +579,7 @@ impl NativeD3d11Decoder {
     }
 
     /// Plan one AU and convert it, rebuilding the session when shape moved.
-    /// `Ok(None)` is the RASL skip and nothing else.
+    /// `Ok(None)` is a RASL skip or the idle wait for an IDR; neither feeds the decoder.
     fn plan(&mut self, au: &[u8]) -> Result<Option<Submission>> {
         self.status_id = self.status_id.wrapping_add(1).max(1);
         let status_id = self.status_id;
@@ -588,17 +589,17 @@ impl NativeD3d11Decoder {
                     Ok(plan) => plan,
                     // Nothing to feed until the IDR and its parameter sets land — a
                     // decoder built mid-GOP sees slices first. Idle, not a refusal.
-                    Err(
-                        e @ (pf_dxvadec::PlanError::AwaitingIdr
-                        | pf_dxvadec::PlanError::NoActiveParamSet { .. }),
-                    ) => {
+                    Err(e) if e.awaits_idr() => {
                         self.want_recovery = true;
                         tracing::debug!(error = %e, "native D3D11VA idle until the next IDR");
                         return Ok(None);
                     }
                     Err(e) => bail!("plan: {e}"),
                 };
-                let concealed = plan.warnings.iter().any(pf_dxvadec::is_integrity_warning);
+                let concealed = plan
+                    .warnings
+                    .iter()
+                    .any(pf_dxvadec::PlanWarning::is_integrity);
                 let session = ensure_session(
                     &mut self.session,
                     &self.device,
@@ -648,10 +649,7 @@ impl NativeD3d11Decoder {
                         return Ok(None);
                     }
                     // Same idle wait as the H.264 arm.
-                    Err(
-                        e @ (pf_dxvadec::PlanErrorH265::AwaitingIdr
-                        | pf_dxvadec::PlanErrorH265::NoActiveParamSet { .. }),
-                    ) => {
+                    Err(e) if e.awaits_idr() => {
                         self.want_recovery = true;
                         tracing::debug!(error = %e, "native D3D11VA idle until the next IDR");
                         return Ok(None);
@@ -661,7 +659,7 @@ impl NativeD3d11Decoder {
                 let concealed = plan
                     .warnings
                     .iter()
-                    .any(pf_dxvadec::is_integrity_warning_h265);
+                    .any(pf_dxvadec::PlanWarningH265::is_integrity);
                 let session = ensure_session(
                     &mut self.session,
                     &self.device,
@@ -698,7 +696,8 @@ impl NativeD3d11Decoder {
                     codec: Codec::H265,
                     facts: PictureFacts {
                         colour: colour_of(plan.picture.colour),
-                        keyframe: plan.picture.is_irap,
+                        // IDR only, as on every rung: a CRA's leading pictures may not decode.
+                        keyframe: plan.picture.is_idr,
                         references_clean: plan.picture.references_clean,
                         width: plan.picture.display_crop.width,
                         height: plan.picture.display_crop.height,
@@ -984,7 +983,7 @@ fn colour_of(colour: pf_dxvadec::ColourDescription) -> ColorDesc {
 
 /// Does this adapter expose any HEVC decode profile? Asked before the codec caps go
 /// on the wire; no decoder is built here.
-pub(crate) fn adapter_decodes_hevc(luid: Option<[u8; 8]>) -> bool {
+pub fn adapter_decodes_hevc(luid: Option<[u8; 8]>) -> bool {
     let Ok((device, _)) = create_device(luid) else {
         return false;
     };
@@ -1438,6 +1437,9 @@ mod parity {
 
     use std::collections::HashMap;
 
+    use pf_bitstream::testing::split_h264_aus;
+    use pf_bitstream::testing::split_h265_aus;
+    use pf_bitstream::testing::split_ivf;
     use pf_dxvadec::H264Planner;
     use pf_dxvadec::H265Planner;
     use sha2::Digest;
@@ -1448,17 +1450,12 @@ mod parity {
     use windows::Win32::d3d11::D3D11_USAGE_STAGING;
     use windows::Win32::dxgi::CreateDXGIFactory1;
     use windows::Win32::dxgi::IDXGIFactory1;
-    use windows::Win32::dxgi::DXGI_ADAPTER_DESC1;
 
     use super::*;
 
-    const TEST_25FPS_H264: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264"
-    );
+    const TEST_25FPS_H264: &[u8] = pf_bitstream::testing::H264_25FPS;
 
-    const TEST_25FPS_H265: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265"
-    );
+    const TEST_25FPS_H265: &[u8] = pf_bitstream::testing::H265_25FPS;
 
     /// libavcodec NV12 hashes. Same files as the Vulkan rung, not a copy.
     const GOLDENS_H264: &str = include_str!("../../pf-vkdecode/tests/data/test-25fps.nv12.sha256");
@@ -1495,9 +1492,7 @@ mod parity {
     const MAIN10_FRAME_COUNT: usize = 50;
 
     /// Vendored AV1 vector — IVF, not an elementary stream. Same file as `pf-vkdecode`.
-    const TEST_25FPS_AV1: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1"
-    );
+    const TEST_25FPS_AV1: &[u8] = pf_bitstream::testing::AV1_25FPS;
 
     /// libavcodec per-delivered-frame NV12 hashes for the AV1 vector (320x240).
     const GOLDENS_AV1: &str =
@@ -1541,97 +1536,6 @@ mod parity {
                 let _ = write!(out, "{byte:02x}");
                 out
             })
-    }
-
-    /// Byte offsets of every Annex-B NAL header. Emulation prevention means
-    /// `00 00 01` cannot appear inside a payload. Hand-rolled: `pf-client-core`
-    /// does not depend on the vendored parser; AU-count asserts keep it honest.
-    fn nal_headers(stream: &[u8]) -> Vec<usize> {
-        let mut out = Vec::new();
-        let mut i = 0usize;
-        while i + 3 <= stream.len() {
-            if stream[i..i + 3] == [0x00, 0x00, 0x01] {
-                out.push(i + 3);
-                i += 3;
-            } else {
-                i += 1;
-            }
-        }
-        out
-    }
-
-    /// Split into access units given `(is_slice, starts_a_picture)`. A new AU
-    /// begins at a non-VCL after slices, or at a first-of-picture slice when the
-    /// current AU already has slices — pf-bitstream's rule, once for both codecs.
-    fn split_aus(stream: &[u8], classify: impl Fn(&[u8], usize) -> (bool, bool)) -> Vec<&[u8]> {
-        let mut aus = Vec::new();
-        let mut au_start = 0usize;
-        let mut au_has_slice = false;
-        for header in nal_headers(stream) {
-            let (is_slice, first_in_picture) = classify(stream, header);
-            // Start code owning this header: three bytes, plus the optional
-            // leading zero of the four-byte form.
-            let mut start = header - 3;
-            if start > 0 && stream[start - 1] == 0x00 {
-                start -= 1;
-            }
-            if au_has_slice && (!is_slice || first_in_picture) {
-                aus.push(&stream[au_start..start]);
-                au_start = start;
-                au_has_slice = false;
-            }
-            au_has_slice |= is_slice;
-        }
-        aus.push(&stream[au_start..]);
-        aus
-    }
-
-    /// One-byte NAL header; `nal_unit_type` in the low 5 bits (1 = non-IDR, 5 = IDR).
-    /// `first_mb_in_slice == 0` is the top bit of the next byte.
-    fn split_h264_aus(stream: &[u8]) -> Vec<&[u8]> {
-        split_aus(stream, |s, h| {
-            let is_slice = matches!(s[h] & 0x1f, 1 | 5);
-            let first = is_slice && s.get(h + 1).is_some_and(|b| b & 0x80 != 0);
-            (is_slice, first)
-        })
-    }
-
-    /// Two-byte NAL header; `nal_unit_type` in bits 1..7 of the first byte.
-    /// Slice if type `< 32`; `first_slice_segment_in_pic_flag` is the top bit at `+2`.
-    fn split_h265_aus(stream: &[u8]) -> Vec<&[u8]> {
-        split_aus(stream, |s, h| {
-            let is_slice = (s[h] >> 1) & 0x3f < 32;
-            let first = is_slice && s.get(h + 2).is_some_and(|b| b & 0x80 != 0);
-            (is_slice, first)
-        })
-    }
-
-    /// IVF frames in file order: 32-byte `DKIF` header, then `[u32 size][u64 pts][size]`.
-    /// Hand-rolled for the same reason as `nal_headers`; unit-count asserts keep it honest.
-    fn split_ivf(stream: &[u8]) -> Vec<&[u8]> {
-        assert_eq!(
-            &stream[0..4],
-            b"DKIF",
-            "the vendored AV1 vector must be an IVF file"
-        );
-        let header = usize::from(u16::from_le_bytes([stream[6], stream[7]]));
-        let mut out = Vec::new();
-        let mut at = header;
-        while at + 12 <= stream.len() {
-            let size = u32::from_le_bytes(
-                stream[at..at + 4]
-                    .try_into()
-                    .expect("four bytes make a u32"),
-            ) as usize;
-            at += 12;
-            assert!(
-                at + size <= stream.len(),
-                "an IVF frame header claims {size} bytes past the end of the file"
-            );
-            out.push(&stream[at..at + size]);
-            at += size;
-        }
-        out
     }
 
     /// Decode order and display order as `PicId`s, from a planner run alongside the
@@ -1752,18 +1656,7 @@ mod parity {
             return None;
         };
         let mut chosen = None;
-        for i in 0.. {
-            // SAFETY: a COM call on the live factory; `Ok` proves an adapter came back.
-            let Ok(adapter) = (unsafe { factory.EnumAdapters1(i) }) else {
-                break;
-            };
-            // SAFETY: `DXGI_ADAPTER_DESC1` is plain-old-data, so all-zeroes is valid.
-            let mut desc: DXGI_ADAPTER_DESC1 = unsafe { std::mem::zeroed() };
-            // SAFETY: a COM call on the adapter just enumerated, filling the zeroed
-            // local through the out-param; checked before the descriptor is read.
-            if unsafe { adapter.GetDesc1(&mut desc) }.is_err() {
-                continue;
-            }
+        for (i, (_, desc)) in crate::video_d3d11::adapters(&factory).enumerate() {
             let end = desc
                 .Description
                 .iter()

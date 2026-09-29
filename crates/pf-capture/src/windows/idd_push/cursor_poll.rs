@@ -133,24 +133,18 @@ fn run(
     // best-effort: already on winsta0\default if this fails
     desktop.reattach();
     let mut last_attach = Instant::now();
-
-    let mut shape: Option<Shape> = None;
-    let mut cached_handle: isize = 0;
-    let mut failed_handle: isize = 0; // don't re-rasterise a failing handle every tick
-    let mut serial: u64 = 0;
-    let mut logged_live = false;
-    let mut last_extent = Instant::now();
+    let mut cache = ShapeCache::new();
 
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(CursorPoller::INTERVAL);
         if last_attach.elapsed() >= CursorPoller::REATTACH {
             last_attach = Instant::now();
             desktop.reattach();
-            // Let a failed handle be tried again. The skip below is cleared only by a
-            // SUCCESSFUL rasterise of a DIFFERENT handle, and the arrow's HCURSOR is stable
-            // for the session — so a transient GDI failure (a null `GetDC` across a desktop
-            // switch) otherwise froze the shape until the session ended.
-            failed_handle = 0;
+            // Let a failed handle be tried again. The skip is cleared only by a SUCCESSFUL
+            // rasterise of a DIFFERENT handle, and the arrow's HCURSOR is stable for the
+            // session, so a transient GDI failure (a null `GetDC` across a desktop switch)
+            // would otherwise freeze the shape until the session ended.
+            cache.failed = 0;
             // …and re-read the target's desktop rect from the display actor's snapshot (no CCD
             // call here): a resize, an HDR recreate or the user moving this display changes BOTH
             // the origin positions are made relative to and the extent `in_rect` tests against,
@@ -185,20 +179,62 @@ fn run(
         }
 
         let flags = ci.flags.0;
-        let showing = flags & CURSOR_SHOWING != 0 && flags & CURSOR_SUPPRESSED == 0;
+        // Touch or pen input: Windows stops drawing the pointer, but no app hid it. Publishing
+        // a hide would read as a grab and flip the client to relative; keep the last snapshot.
+        if flags & CURSOR_SUPPRESSED != 0 {
+            continue;
+        }
+        let showing = flags & CURSOR_SHOWING != 0;
+        cache.refresh(ci.hCursor, showing, ccd);
+        // `SetCursor(NULL)` (game/video hide) leaves `CURSOR_SHOWING` set with a NULL
+        // `hCursor`; flags alone would publish the last shape.
+        let shown = showing && ci.hCursor.0 as isize != 0;
+        let pos = (ci.ptScreenPos.x - rect.0, ci.ptScreenPos.y - rect.1);
+        let overlay = compose_overlay(pos, rect, shown, cache.shape.as_ref());
+        *slot.lock().unwrap_or_else(|p| p.into_inner()) = overlay;
+    }
+}
 
-        // Rasterise on handle change only. Hidden cursors keep the cached shape
-        // (hidden-but-known needs a seen bitmap). Animated cursors publish frame 0.
-        let handle = ci.hCursor.0 as isize;
+/// The rasterised shape and when to redo it.
+struct ShapeCache {
+    shape: Option<Shape>,
+    /// Handle `shape` was rasterised from.
+    cached: isize,
+    /// A handle whose rasterise failed; not retried every tick.
+    failed: isize,
+    serial: u64,
+    logged_live: bool,
+    last_extent: Instant,
+}
 
-        // Handle identity cannot see a re-render. Windows rebuilds system cursors
-        // when the scale under the pointer changes, but the shared handle stays
-        // put for the session (arrow is 0x10003 throughout). Re-read extent
-        // (dimensions only) and drop the cache when it moved.
-        if showing && handle != 0 && handle == cached_handle {
-            if last_extent.elapsed() >= CursorPoller::EXTENT_PROBE {
-                last_extent = Instant::now();
-                if let (Some(now), Some(s)) = (cursor_extent(ci.hCursor), shape.as_ref()) {
+impl ShapeCache {
+    fn new() -> Self {
+        Self {
+            shape: None,
+            cached: 0,
+            failed: 0,
+            serial: 0,
+            logged_live: false,
+            last_extent: Instant::now(),
+        }
+    }
+
+    /// Rasterise `cursor` on a handle change only; a hidden cursor keeps the cached shape, and
+    /// an animated one publishes frame 0. Handle identity cannot see a re-render: Windows
+    /// rebuilds system cursors when the scale under the pointer changes but keeps the shared
+    /// handle for the session (arrow is 0x10003 throughout), so the extent is re-read every
+    /// [`CursorPoller::EXTENT_PROBE`] and a move drops the cache.
+    fn refresh(
+        &mut self,
+        cursor: windows::Win32::UI::WindowsAndMessaging::HCURSOR,
+        showing: bool,
+        ccd: pf_win_display::win_display::CcdTargetKey,
+    ) {
+        let handle = cursor.0 as isize;
+        if showing && handle != 0 && handle == self.cached {
+            if self.last_extent.elapsed() >= CursorPoller::EXTENT_PROBE {
+                self.last_extent = Instant::now();
+                if let (Some(now), Some(s)) = (cursor_extent(cursor), self.shape.as_ref()) {
                     if now != (s.w, s.h) {
                         tracing::info!(
                             target = %ccd,
@@ -209,67 +245,83 @@ fn run(
                             now.0,
                             now.1
                         );
-                        cached_handle = 0; // re-rasterise below, on this same tick
+                        self.cached = 0; // re-rasterise below, on this same tick
                     }
                 }
             }
         } else {
             // A handle change re-rasterises on its own — hold the probe off so it can't fire on
             // the very next tick against a shape that is current by construction.
-            last_extent = Instant::now();
+            self.last_extent = Instant::now();
         }
-
-        if showing && handle != 0 && handle != cached_handle && handle != failed_handle {
-            match rasterize(ci.hCursor) {
-                Some((rgba, w, h, hot_x, hot_y)) => {
-                    serial += 1;
-                    shape = Some(Shape {
-                        rgba: std::sync::Arc::new(rgba),
-                        w,
-                        h,
-                        hot_x,
-                        hot_y,
-                        serial,
-                    });
-                    cached_handle = handle;
-                    failed_handle = 0;
-                    if !logged_live {
-                        logged_live = true;
-                        tracing::info!(
-                            target = %ccd,
-                            "cursor poller live — GDI shape source publishing (serial 1: {w}x{h})"
-                        );
-                    }
-                }
-                None => {
-                    // The owning app may have destroyed the cursor mid-read; keep the previous
-                    // shape and don't hammer this handle again until it changes.
-                    failed_handle = handle;
+        if !showing || handle == 0 || handle == self.cached || handle == self.failed {
+            return;
+        }
+        match rasterize(cursor) {
+            Some((rgba, w, h, hot_x, hot_y)) => {
+                self.serial += 1;
+                self.shape = Some(Shape {
+                    rgba: std::sync::Arc::new(rgba),
+                    w,
+                    h,
+                    hot_x,
+                    hot_y,
+                    serial: self.serial,
+                });
+                self.cached = handle;
+                self.failed = 0;
+                if !self.logged_live {
+                    self.logged_live = true;
+                    tracing::info!(
+                        target = %ccd,
+                        "cursor poller live — GDI shape source publishing (serial 1: {w}x{h})"
+                    );
                 }
             }
+            // The owning app may have destroyed the cursor mid-read; keep the previous
+            // shape and don't hammer this handle again until it changes.
+            None => self.failed = handle,
         }
-
-        let overlay = shape.as_ref().map(|s| {
-            let (px, py) = (ci.ptScreenPos.x - rect.0, ci.ptScreenPos.y - rect.1);
-            let in_rect = px >= 0 && py >= 0 && px < rect.2 && py < rect.3;
-            pf_frame::CursorOverlay {
-                // Overlay x/y = bitmap top-left (reported position − hotspot), frame pixels.
-                x: px - s.hot_x as i32,
-                y: py - s.hot_y as i32,
-                w: s.w,
-                h: s.h,
-                rgba: s.rgba.clone(),
-                serial: s.serial,
-                hot_x: s.hot_x,
-                hot_y: s.hot_y,
-                // `handle != 0` is part of visible, not just of rasterise:
-                // `SetCursor(NULL)` (game/video hide) leaves `CURSOR_SHOWING` set
-                // with a NULL `hCursor`. Flags alone would publish the last shape.
-                visible: showing && in_rect && handle != 0,
-            }
-        });
-        *slot.lock().unwrap_or_else(|p| p.into_inner()) = overlay;
     }
+}
+
+/// One poll's overlay. `pos` is the pointer relative to `rect`'s origin, and outside `rect`
+/// the pointer is `visible: false`; `shown` is a drawn pointer with a cursor handle. A pointer
+/// hidden before any shape was seen (a game that hid it before this session) is still a hide
+/// the client must hear: an empty, invisible overlay.
+fn compose_overlay(
+    pos: (i32, i32),
+    rect: (i32, i32, i32, i32),
+    shown: bool,
+    shape: Option<&Shape>,
+) -> Option<pf_frame::CursorOverlay> {
+    let (px, py) = pos;
+    let Some(s) = shape else {
+        return (!shown).then(|| pf_frame::CursorOverlay {
+            x: px,
+            y: py,
+            w: 0,
+            h: 0,
+            rgba: std::sync::Arc::new(Vec::new()),
+            serial: 0,
+            hot_x: 0,
+            hot_y: 0,
+            visible: false,
+        });
+    };
+    let in_rect = px >= 0 && py >= 0 && px < rect.2 && py < rect.3;
+    Some(pf_frame::CursorOverlay {
+        // Overlay x/y = bitmap top-left (reported position − hotspot), frame pixels.
+        x: px - s.hot_x as i32,
+        y: py - s.hot_y as i32,
+        w: s.w,
+        h: s.h,
+        rgba: s.rgba.clone(),
+        serial: s.serial,
+        hot_x: s.hot_x,
+        hot_y: s.hot_y,
+        visible: shown && in_rect,
+    })
 }
 
 /// Owned input-desktop handle: keep the current binding, swap on demand, close
@@ -635,6 +687,40 @@ fn grow_invert_outline(rgba: &mut [u8], invert: &[bool], w: usize, h: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn arrow() -> Shape {
+        Shape {
+            rgba: std::sync::Arc::new(vec![255; 2 * 2 * 4]),
+            w: 2,
+            h: 2,
+            hot_x: 1,
+            hot_y: 1,
+            serial: 7,
+        }
+    }
+
+    /// The overlay is the pointer less the hotspot, visible only inside the target's rect.
+    #[test]
+    fn the_overlay_is_visible_only_inside_the_rect() {
+        let rect = (1920, 0, 1280, 720);
+        let o = compose_overlay((10, 20), rect, true, Some(&arrow())).expect("overlay");
+        assert_eq!((o.x, o.y, o.w, o.h, o.serial), (9, 19, 2, 2, 7));
+        assert!(o.visible);
+        let out = compose_overlay((1280, 20), rect, true, Some(&arrow())).expect("overlay");
+        assert!(!out.visible, "past the rect's width");
+        let hidden = compose_overlay((10, 20), rect, false, Some(&arrow())).expect("overlay");
+        assert!(!hidden.visible, "a NULL handle or a hidden cursor");
+    }
+
+    /// Before any shape: a hide still reaches the client as an empty overlay; a shown pointer
+    /// publishes nothing until it rasterises.
+    #[test]
+    fn a_hide_before_any_shape_is_an_empty_overlay() {
+        let hidden = compose_overlay((3, 4), (0, 0, 640, 480), false, None).expect("a hide");
+        assert_eq!((hidden.x, hidden.y, hidden.w, hidden.h), (3, 4, 0, 0));
+        assert!(!hidden.visible && hidden.rgba.is_empty());
+        assert!(compose_overlay((3, 4), (0, 0, 640, 480), true, None).is_none());
+    }
 
     /// 1bpp plane → 32bpp as `GetDIBits` does: any non-zero channel means "bit set".
     fn plane(bits: &[u8]) -> Vec<u8> {

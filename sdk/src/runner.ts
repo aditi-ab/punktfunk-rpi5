@@ -22,26 +22,31 @@ import {
 	Fiber,
 	Schedule,
 } from "effect";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Writable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { PunktfunkHost } from "./client.js";
+import { discoverUnits } from "./discover.js";
 import { layer as hostLayer } from "./effect.js";
 import { type ConnectOptions, configDir, hostFetch, publishedMgmtUrl } from "./config.js";
 import { connect, type PluginDef } from "./index.js";
 import {
 	bwrapArgv,
+	expandHome,
 	grantedRoots,
 	netlinkFilter,
 	type PluginManifest,
-	readManifest,
+	refusedRoot,
 	sandboxEnv,
 	sandboxProbe,
 } from "./sandbox.js";
 import { serveHostProxy } from "./host-proxy.js";
+import { forwardUi, type UiForward } from "./ui-forward.js";
+import { defaultLog, type LogSink, type RunnerLogLevel } from "./runner-log.js";
 
 export interface RunnerOptions {
 	/** Where loose scripts live. Default `<config_dir>/scripts`. */
@@ -79,15 +84,6 @@ export interface RunnerOptions {
 	log?: (line: string, level?: RunnerLogLevel) => void;
 }
 
-/**
- * Severity of a runner line. Only three, because that is all the runner distinguishes: it is
- * reporting on units, not producing application logs.
- */
-export type RunnerLogLevel = "info" | "warn" | "error";
-
-/** The sink shape used internally, with the level always supplied by the caller's default. */
-export type LogSink = (line: string, level?: RunnerLogLevel) => void;
-
 export interface Unit {
 	/** Display name: the file stem, or the plugin package name. */
 	name: string;
@@ -100,351 +96,6 @@ export interface Unit {
 	manifest?: PluginManifest;
 }
 
-const defaultLog: LogSink = (line, level = "info") => {
-	const stamped = `${new Date().toISOString()} ${line}`;
-	if (level === "error") console.error(stamped);
-	else if (level === "warn") console.warn(stamped);
-	else console.log(stamped);
-};
-
-// ---- unit-file trust (the sshd rule, both halves) ---------------------------------------------
-
-// SDDL access-mask bits that let a principal change the file's content or its protection:
-// write/append data + EAs, DELETE (delete + recreate), WRITE_DAC / WRITE_OWNER (rewrite the
-// protection itself), and the generic write/all bits. FILE_WRITE_ATTRIBUTES (0x100) is
-// deliberately NOT here: it only toggles timestamps/readonly/hidden — never content — and the
-// runner's own service principal legitimately holds it (bun's module loader opens unit files
-// requesting RX+WA; `plugins enable` grants exactly that on the plugins/scripts dirs — counting
-// WA as tampering would make the runner refuse every unit it is supposed to run).
-const SDDL_WRITE_BITS =
-	0x2 | 0x4 | 0x10 | 0x10000 | 0x40000 | 0x80000 | 0x10000000 | 0x40000000;
-
-// SDDL two-letter rights tokens → access-mask bits (generic, standard, file-specific, and the
-// low object-rights aliases hex masks sometimes render as). Anything unrecognized is treated as
-// write-capable — fail closed.
-const SDDL_RIGHT_TOKENS: Record<string, number> = {
-	GA: 0x10000000,
-	GX: 0x20000000,
-	GW: 0x40000000,
-	GR: 0x80000000,
-	RC: 0x20000,
-	SD: 0x10000,
-	WD: 0x40000,
-	WO: 0x80000,
-	FA: 0x1f01ff,
-	FR: 0x120089,
-	FW: 0x120116,
-	FX: 0x1200a0,
-	CC: 0x1,
-	DC: 0x2,
-	LC: 0x4,
-	SW: 0x8,
-	RP: 0x10,
-	WP: 0x20,
-	DT: 0x40,
-	LO: 0x80,
-	CR: 0x100,
-};
-
-// SDDL two-letter account abbreviations we may meet on a unit file, → full SIDs.
-const SDDL_SID_ABBREV: Record<string, string> = {
-	SY: "S-1-5-18", // NT AUTHORITY\SYSTEM
-	BA: "S-1-5-32-544", // BUILTIN\Administrators
-	OW: "S-1-3-4", // OWNER RIGHTS
-	CO: "S-1-3-0", // CREATOR OWNER
-	LS: "S-1-5-19", // NT AUTHORITY\LOCAL SERVICE
-	NS: "S-1-5-20", // NT AUTHORITY\NETWORK SERVICE
-	BU: "S-1-5-32-545", // BUILTIN\Users
-	AU: "S-1-5-11", // Authenticated Users
-	IU: "S-1-5-4", // INTERACTIVE
-	WD: "S-1-1-0", // Everyone
-};
-
-const TRUSTED_OWNER_SIDS = new Set([
-	"S-1-5-18", // SYSTEM
-	"S-1-5-32-544", // Administrators
-	"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464", // TrustedInstaller
-]);
-
-/** An SDDL rights field as an access mask; -1 when it can't be fully understood (fail closed). */
-const sddlRightsMask = (rights: string): number => {
-	if (rights.startsWith("0x") || rights.startsWith("0X")) {
-		const n = Number.parseInt(rights, 16);
-		return Number.isNaN(n) ? -1 : n;
-	}
-	if (rights.length % 2 !== 0) return -1;
-	let mask = 0;
-	for (let i = 0; i < rights.length; i += 2) {
-		const bits = SDDL_RIGHT_TOKENS[rights.slice(i, i + 2)];
-		if (bits === undefined) return -1;
-		mask = (mask | bits) >>> 0;
-	}
-	return mask;
-};
-
-/**
- * The Windows half of the sshd rule, as a pure function over the file's SDDL (exported for
- * tests). Returns `null` when the descriptor is trustworthy — owner is
- * SYSTEM/Administrators/TrustedInstaller (or `extraTrustedSid`, the account running the runner:
- * the Unix rule's "your own file is fine") and no other principal holds a write-capable allow
- * ACE — else a human-readable refusal reason. Unknown ACE shapes count as write-capable.
- */
-export const windowsSddlUnsafeReason = (
-	sddl: string,
-	extraTrustedSid?: string,
-): string | null => {
-	const trusted = new Set(TRUSTED_OWNER_SIDS);
-	trusted.add("S-1-3-4"); // OWNER RIGHTS — constrained by the owner check below
-	if (extraTrustedSid) trusted.add(extraTrustedSid);
-
-	const owner = /^O:(S-[0-9-]+|[A-Z]{2})/.exec(sddl)?.[1];
-	const ownerSid =
-		owner === undefined
-			? undefined
-			: owner.startsWith("S-")
-				? owner
-				: SDDL_SID_ABBREV[owner];
-	if (ownerSid === undefined || !trusted.has(ownerSid)) {
-		return `owner ${owner ?? "unknown"} is not SYSTEM/Administrators/TrustedInstaller`;
-	}
-
-	const daclAt = sddl.indexOf("D:");
-	if (daclAt < 0) return "no DACL in the security descriptor";
-	// ACE format: (type;flags;rights;objectGuid;inheritGuid;sid[;condition]). SACL ACEs after
-	// "S:" match the regex too but are audit types, filtered by the allow-type check.
-	for (const [, ace] of sddl.slice(daclAt + 2).matchAll(/\(([^)]*)\)/g)) {
-		const [type, flags = "", rights = "", , , sid = ""] = ace.split(";");
-		if (type !== "A" && type !== "XA") continue; // deny/audit ACEs only ever tighten
-		// Inherit-only ACEs are templates for children; they grant nothing on this file. Flags
-		// come in two-letter tokens — compare exactly, not by substring.
-		const flagTokens: string[] = flags.match(/.{2}/g) ?? [];
-		if (flagTokens.includes("IO")) continue;
-		const mask = sddlRightsMask(rights);
-		if (mask !== -1 && (mask & SDDL_WRITE_BITS) === 0) continue; // read-only ACE
-		const resolved = sid.startsWith("S-") ? sid : (SDDL_SID_ABBREV[sid] ?? sid);
-		if (!trusted.has(resolved)) {
-			return `${sid} can write it (only SYSTEM/Administrators may)`;
-		}
-	}
-	return null;
-};
-
-/**
- * Run `spawn`, and once more if the first run was killed rather than exiting.
- *
- * Bun on Windows fires a `spawnSync` timeout within milliseconds when the spawn is the first
- * after an idle event loop. A killed ACL read is an unreadable ACL, which refuses the unit.
- */
-export const spawnAgainIfKilled = <T extends { status: number | null }>(
-	spawn: () => T,
-): T => {
-	const first = spawn();
-	return first.status === null ? spawn() : first;
-};
-
-/** The SID this process runs as, fetched once (`undefined` when it can't be determined). */
-let processSidCache: string | undefined | false;
-const processSid = (): string | undefined => {
-	if (processSidCache === undefined) {
-		const res = spawnAgainIfKilled(() =>
-			spawnSync(
-				windowsPowershell(),
-				[
-					"-NoProfile",
-					"-NonInteractive",
-					"-Command",
-					"[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
-				],
-				{
-					encoding: "utf8",
-					windowsHide: true,
-					timeout: 15_000,
-					env: windowsPowershellEnv(),
-				},
-			),
-		);
-		const sid = res.status === 0 ? (res.stdout ?? "").trim() : "";
-		processSidCache = /^S-[0-9-]+$/.test(sid) ? sid : false;
-	}
-	return processSidCache === false ? undefined : processSidCache;
-};
-
-// Full System32 path, never PATH — a planted powershell.exe must not run with our privileges
-// (mirrors the host CLI's powershell_path, security-review 2026-07-17).
-const windowsPowershell = (): string =>
-	path.join(
-		process.env.SystemRoot ?? "C:\\Windows",
-		"System32",
-		"WindowsPowerShell",
-		"v1.0",
-		"powershell.exe",
-	);
-
-// Spawn env for Windows PowerShell 5.1 with PSModulePath STRIPPED (5.1 rebuilds its default).
-// An inherited PSModulePath that includes a PowerShell 7 module dir (pwsh adds a machine-scope
-// entry) makes 5.1 fail to autoload Microsoft.PowerShell.Security — type-data conflict
-// ("AuditToString is already present") — so Get-Acl dies and every unit is refused. Seen live
-// on the .173 host box; intermittent per spawn, deterministic once stripped.
-const windowsPowershellEnv = (): Record<string, string | undefined> => {
-	const env: Record<string, string | undefined> = { ...process.env };
-	delete env.PSModulePath;
-	return env;
-};
-
-/** Read a file's SDDL and apply [`windowsSddlUnsafeReason`]. Unreadable ACL ⇒ refuse. */
-const windowsFileIsSafe = (file: string, log: LogSink): boolean => {
-	const escaped = file.replace(/'/g, "''");
-	const res = spawnAgainIfKilled(() =>
-		spawnSync(
-			windowsPowershell(),
-			[
-				"-NoProfile",
-				"-NonInteractive",
-				"-Command",
-				`(Get-Acl -LiteralPath '${escaped}').Sddl`,
-			],
-			{
-				encoding: "utf8",
-				windowsHide: true,
-				timeout: 15_000,
-				env: windowsPowershellEnv(),
-			},
-		),
-	);
-	const sddl = res.status === 0 ? (res.stdout ?? "").trim() : "";
-	if (!sddl) {
-		log(`[runner] REFUSING ${file} — its ACL is unreadable`, "error");
-		return false;
-	}
-	const reason = windowsSddlUnsafeReason(sddl, processSid());
-	if (reason !== null) {
-		log(
-			`[runner] REFUSING ${file} — ${reason}. Reinstall the plugin with ` +
-				`\`punktfunk-host plugins add\`, or re-own the file to Administrators and strip ` +
-				`non-admin write ACEs (icacls).`,
-			"error",
-		);
-		return false;
-	}
-	return true;
-};
-
-/**
- * The sshd rule (RFC §9.1/§9.4): refuse a unit file anyone less privileged than the operator
- * could have written — group/world-writable mode on Unix; on Windows, an owner outside
- * SYSTEM/Administrators/TrustedInstaller or a write-capable ACE for a non-admin principal.
- */
-const fileIsSafe = (file: string, log: LogSink): boolean => {
-	if (process.platform === "win32") return windowsFileIsSafe(file, log);
-	try {
-		const mode = fs.statSync(file).mode & 0o022;
-		if (mode !== 0) {
-			log(
-				`[runner] REFUSING ${file} — group/world-writable (chmod go-w it first)`,
-				"error",
-			);
-			return false;
-		}
-	} catch {
-		return false;
-	}
-	return true;
-};
-
-const SCRIPT_EXTENSIONS = new Set([".ts", ".js", ".mjs", ".mts", ".cjs"]);
-
-/** Enumerate the operator's units: loose scripts plus installed plugin packages. */
-export const discoverUnits = (
-	options: RunnerOptions = {},
-	log: LogSink = options.log ?? defaultLog,
-): Unit[] => {
-	const units: Unit[] = [];
-	const scriptsDir = options.scriptsDir ?? path.join(configDir(), "scripts");
-	const pluginsDir = options.pluginsDir ?? path.join(configDir(), "plugins");
-	try {
-		for (const entry of fs.readdirSync(scriptsDir).sort()) {
-			const file = path.join(scriptsDir, entry);
-			if (!SCRIPT_EXTENSIONS.has(path.extname(entry))) continue;
-			if (!fs.statSync(file).isFile()) continue;
-			if (!fileIsSafe(file, log)) continue;
-			units.push({ name: path.basename(entry, path.extname(entry)), file });
-		}
-	} catch {
-		// no scripts dir — fine
-	}
-	const modules = path.join(pluginsDir, "node_modules");
-	// The packages the operator actually installed — `bun add` records them as the plugins dir's
-	// own `dependencies`. This is what separates a plugin from a plugin's LIBRARY:
-	// `@punktfunk/plugin-kit` matches the `plugin-*` naming convention exactly but arrives as a
-	// transitive dependency of every kit-built plugin, and running it as a unit is nonsense.
-	// `undefined` only when there is no readable `package.json` at all — a hand-assembled tree then
-	// falls back to the naming convention rather than discovering nothing. A package.json with no
-	// `dependencies` key yields an EMPTY set, not `undefined`: `bun remove` drops the key when the
-	// last plugin goes, and orphaned transitive packages can outlive it, so falling back there
-	// would start running a plugin's library the moment you uninstall the last real plugin.
-	let topLevel: Set<string> | undefined;
-	try {
-		const root = JSON.parse(
-			fs.readFileSync(path.join(pluginsDir, "package.json"), "utf8"),
-		) as { dependencies?: Record<string, string> };
-		topLevel = new Set(Object.keys(root.dependencies ?? {}));
-	} catch {
-		// no package.json — fall back to the convention
-	}
-	// Read a plugin package's manifest (`module`/`main` entry) and add it as a unit.
-	const addPlugin = (dir: string, name: string): void => {
-		if (topLevel && !topLevel.has(name)) return; // a dependency, not an installed plugin
-		try {
-			const manifest = JSON.parse(
-				fs.readFileSync(path.join(dir, "package.json"), "utf8"),
-			) as { main?: string; module?: string };
-			const rel = manifest.module ?? manifest.main ?? "index.js";
-			const file = path.join(dir, rel);
-			if (!fileIsSafe(file, log)) return;
-			const declared = readManifest(dir);
-			units.push({
-				name,
-				file,
-				packageDir: dir,
-				...(declared ? { manifest: declared } : {}),
-			});
-		} catch (e) {
-			log(`[runner] skipping ${name}: unreadable package.json (${e})`, "warn");
-		}
-	};
-	try {
-		for (const pkg of fs.readdirSync(modules).sort()) {
-			// Unscoped convention: `punktfunk-plugin-*`.
-			if (pkg.startsWith("punktfunk-plugin-")) {
-				addPlugin(path.join(modules, pkg), pkg);
-				continue;
-			}
-			// Scoped convention: `<any scope>/plugin-*`. A scoped name resolves cleanly from a
-			// registry scope-map, so a plugin can depend on `@punktfunk/host` + `effect` as shared
-			// (hoisted) deps rather than bundling its own copy of each.
-			//
-			// ANY scope, not just `@punktfunk`: the plugin store requires catalog entries to be
-			// scoped precisely so the scope can map to that entry's registry, so a third-party
-			// plugin necessarily arrives as `@their-scope/plugin-*`. Limiting discovery to the
-			// first-party scope would let such a plugin install and then never run.
-			if (pkg.startsWith("@")) {
-				try {
-					for (const scoped of fs.readdirSync(path.join(modules, pkg)).sort()) {
-						if (scoped.startsWith("plugin-")) {
-							addPlugin(path.join(modules, pkg, scoped), `${pkg}/${scoped}`);
-						}
-					}
-				} catch {
-					// not a readable scope dir — fine
-				}
-			}
-		}
-	} catch {
-		// no plugins dir — fine
-	}
-	return units;
-};
-
 /**
  * Whether plugins run sandboxed at all. Off is an explicit operator choice, logged where they
  * will see it — never a silent downgrade because a box could not manage a namespace.
@@ -452,20 +103,87 @@ export const discoverUnits = (
 export const sandboxMode = (): "on" | "off" =>
 	/^(0|off|false)$/i.test(process.env.PUNKTFUNK_PLUGIN_SANDBOX ?? "") ? "off" : "on";
 
-/** Write this plugin's own token under its state dir for the sandbox's read-only bind. */
-const writePluginToken = (config: string, stateDir: string, id: string): string | undefined => {
-	const file = path.join(stateDir, ".plugin-token");
+/**
+ * Move `<state>/<id>/` up into `<state>/`: 0.39 bound the state dir one level too high, so a
+ * sandboxed plugin wrote there. On a clash the nested file is the newer one; the older is kept
+ * beside it as `<name>.pre-sandbox`.
+ */
+export const adoptNestedState = (stateDir: string, id: string, log: LogSink): void => {
+	const nested = path.join(stateDir, id);
+	let names: string[];
+	try {
+		if (!fs.lstatSync(nested).isDirectory()) return;
+		names = fs.readdirSync(nested);
+	} catch {
+		return;
+	}
+	for (const name of names) {
+		const to = path.join(stateDir, name);
+		try {
+			if (fs.existsSync(to)) fs.renameSync(to, `${to}.pre-sandbox`);
+			fs.renameSync(path.join(nested, name), to);
+		} catch (e) {
+			log(`[runner] ${id}: state ${name} stayed in ${nested}: ${e}`, "warn");
+			return;
+		}
+	}
+	try {
+		fs.rmdirSync(nested);
+	} catch {}
+	log(`[runner] ${id}: moved its state up from ${nested}`);
+};
+
+/** This plugin's own API token, from the map the host mints for every installed manifest. */
+const pluginToken = (config: string, id: string): string | undefined => {
 	try {
 		const tokens = JSON.parse(
-			fs.readFileSync(path.join(config, "plugin-tokens.json"), "utf8"),
+			fs.readFileSync(path.join(config, "plugin-run", "plugin-tokens.json"), "utf8"),
 		) as Record<string, string>;
-		const token = tokens[id];
-		if (token === undefined) return undefined;
-		fs.mkdirSync(stateDir, { recursive: true });
-		fs.writeFileSync(file, `PUNKTFUNK_PLUGIN_TOKEN=${token}\n`, { mode: 0o600 });
-		return file;
+		return tokens[id];
 	} catch {
 		return undefined;
+	}
+};
+
+/**
+ * The connection an in-process plugin gets: its own token when its manifest has one, so it is
+ * scoped to its own provider and its folder requests reach the host. Anything else keeps the
+ * runner's.
+ */
+export const inProcessConnect = (
+	unit: Unit,
+	options: RunnerOptions,
+): ConnectOptions | undefined => {
+	const id = unit.manifest?.id;
+	const token = id ? pluginToken(options.configDir ?? configDir(), id) : undefined;
+	return token ? { ...options.connect, token } : options.connect;
+};
+
+/**
+ * Write this plugin's own token under its state dir for the sandbox's read-only bind. A missing
+ * token and an unwritable state dir are different faults and say so.
+ *
+ * The plugin writes that dir, so the old file is unlinked and a new one created exclusively: a
+ * link it left there is removed, never followed to another plugin's files.
+ */
+export const writePluginToken = (
+	config: string,
+	stateDir: string,
+	id: string,
+): string | Error => {
+	const token = pluginToken(config, id);
+	if (token === undefined)
+		return new Error(
+			`No API credential exists for ${id} yet. Restart the host if this persists.`,
+		);
+	const file = path.join(stateDir, ".plugin-token");
+	try {
+		fs.mkdirSync(stateDir, { recursive: true });
+		fs.rmSync(file, { force: true });
+		fs.writeFileSync(file, `PUNKTFUNK_PLUGIN_TOKEN=${token}\n`, { mode: 0o600, flag: "wx" });
+		return file;
+	} catch (e) {
+		return new Error(`Couldn't write the credential for ${id} into ${stateDir} — ${e}`);
 	}
 };
 
@@ -487,15 +205,10 @@ const runSandboxed = (
 		const id = manifest.id ?? unit.name;
 		const config = options.configDir ?? configDir();
 		const stateDir = path.join(config, "plugin-state", id);
+		adoptNestedState(stateDir, id, log);
 		const tokenFile = writePluginToken(config, stateDir, id);
-		if (!tokenFile) {
-			resume(
-				Effect.fail(
-					new Error(
-						`no token for ${id} in plugin-tokens.json — the host mints one per installed plugin on its next start, and under the runner's unit that file has to be bound into the home it replaces`,
-					),
-				),
-			);
+		if (tokenFile instanceof Error) {
+			resume(Effect.fail(tokenFile));
 			return;
 		}
 		const filter = netlinkFilter();
@@ -503,8 +216,25 @@ const runSandboxed = (
 			resume(Effect.fail(new Error(`no sandbox syscall filter for ${process.arch}`)));
 			return;
 		}
+		const home = os.homedir();
+		const grants = grantedRoots(config, id);
+		const refused = [
+			...(manifest.reads ?? []),
+			...(manifest.writes ?? []),
+			...grants.map((g) => g.path),
+		]
+			.map((p) => expandHome(p, home))
+			.filter((p) => path.isAbsolute(p) && refusedRoot(p, home));
+		if (refused.length > 0)
+			log(`[runner] ${id}: not sharing ${refused.join(", ")} — no plugin gets those`, "warn");
 		const runtime = process.env.XDG_RUNTIME_DIR ?? "/tmp";
-		const socket = path.join(runtime, "punktfunk", `plugin-${id}.sock`);
+		// One per attempt: a restart's new proxy binds while the old one is still closing, and a
+		// shared name would let the old close delete the new socket.
+		const socket = path.join(
+			runtime,
+			"punktfunk",
+			`plugin-${id}-${randomBytes(4).toString("hex")}.sock`,
+		);
 		const url = options.connect?.url ?? publishedMgmtUrl() ?? "https://127.0.0.1:47990";
 		// The host's cert is self-signed: a bare `fetch` fails TLS and every plugin 502s at connect.
 		const pinned = options.sandboxFetch
@@ -515,6 +245,24 @@ const runSandboxed = (
 			url,
 			fetch: ((input, init) => pinned.then((f) => f(input, init))) as typeof fetch,
 		});
+		// No network: its UI socket goes in a dir of its own, forwarded to the host's loopback.
+		let ui: { dir: string; port: number } | undefined;
+		let forward: UiForward | undefined;
+		if (!manifest.network) {
+			const dir = path.join(runtime, "punktfunk", `ui-${id}-${randomBytes(4).toString("hex")}`);
+			try {
+				fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+				forward = forwardUi(path.join(dir, "ui.sock"));
+				ui = { dir, port: forward.port };
+			} catch (e) {
+				log(`[runner] ${id}: its settings page stays unreachable — ${e}`, "warn");
+			}
+		}
+		const release = (): void => {
+			proxy.close();
+			forward?.close();
+			if (ui) fs.rmSync(ui.dir, { recursive: true, force: true });
+		};
 		const argv = [
 			...bwrapArgv(
 				manifest,
@@ -525,9 +273,10 @@ const runSandboxed = (
 					pluginsDir: options.pluginsDir ?? path.join(config, "plugins"),
 					bun: process.execPath,
 					runner: runnerEntry(),
-					home: os.homedir(),
+					home,
+					...(ui ? { ui } : {}),
 				},
-				grantedRoots(config, id),
+				grants,
 			),
 			process.execPath,
 			runnerEntry(),
@@ -539,29 +288,42 @@ const runSandboxed = (
 		const child = spawn("bwrap", argv, {
 			env: sandboxEnv(os.homedir()),
 			// fd 3 is `--add-seccomp-fd 3`.
-			stdio: ["ignore", "inherit", "inherit", "pipe"],
+			stdio: ["ignore", "inherit", "pipe", "pipe"],
+		});
+		// stderr still reaches the journal; its tail also names why the sandbox exited, since
+		// bwrap's own errors come before the plugin can ship a log line.
+		let stderrTail = "";
+		child.stderr?.on("data", (chunk: Buffer) => {
+			process.stderr.write(chunk);
+			stderrTail = (stderrTail + chunk.toString()).slice(-2000);
 		});
 		// A bwrap that dies before reading surfaces through `exit`, not an EPIPE here.
 		(child.stdio[3] as Writable).on("error", () => {}).end(filter);
 		child.on("error", (e) => {
-			proxy.close();
+			release();
 			resume(Effect.fail(e));
 		});
 		child.on("exit", (code, signal) => {
-			proxy.close();
-			if (code === 0) resume(Effect.succeed("plugin" as const));
-			else
-				resume(
-					Effect.fail(
-						new Error(`sandboxed plugin exited ${signal ? `on ${signal}` : `with ${code}`}`),
-					),
-				);
+			release();
+			if (code === 0) {
+				resume(Effect.succeed("plugin" as const));
+				return;
+			}
+			const last = stderrTail
+				.split("\n")
+				.filter((line) => line.trim() !== "")
+				.slice(-3)
+				.join(" | ");
+			const how = signal ? `on ${signal}` : `with ${code}`;
+			resume(
+				Effect.fail(new Error(`sandboxed plugin exited ${how}${last ? ` — ${last}` : ""}`)),
+			);
 		});
 		return Effect.sync(() => {
 			// Interruption (shutdown): SIGTERM lets the plugin's finalizers run; `--die-with-parent`
 			// is the backstop if this runner is killed outright.
 			child.kill("SIGTERM");
-			proxy.close();
+			release();
 		});
 	});
 
@@ -597,11 +359,12 @@ const attemptUnit = (
 			return "script" as const; // the import WAS the run (top-level await)
 		}
 		const def = mod.default;
+		const own = inProcessConnect(unit, options);
 		if (Effect.isEffect(def.main)) {
 			// The well-behaved shape: interruption reaches it structurally, its scoped
 			// finalizers run on shutdown.
 			yield* (def.main as Effect.Effect<unknown, unknown, PunktfunkHost>).pipe(
-				Effect.provide(hostLayer(options.connect)),
+				Effect.provide(hostLayer(own)),
 			);
 		} else {
 			// The simple shape: a facade client whose close is guaranteed by the scope —
@@ -610,7 +373,7 @@ const attemptUnit = (
 			yield* Effect.scoped(
 				Effect.gen(function* () {
 					const pf = yield* Effect.acquireRelease(
-						Effect.tryPromise(() => connect(options.connect)),
+						Effect.tryPromise(() => connect(own)),
 						(client) => Effect.sync(() => client.close()),
 					);
 					yield* Effect.tryPromise(async () => await main(pf));
@@ -619,6 +382,27 @@ const attemptUnit = (
 		}
 		return "plugin" as const;
 	});
+
+/**
+ * The first lines of what actually failed. `Effect.tryPromise` wraps a rejection in an
+ * `UnknownError` whose own message says nothing, so the wrapper is peeled off.
+ */
+export const describeFailure = (cause: Cause.Cause<unknown>): string => {
+	let err: unknown = Cause.squash(cause);
+	while (
+		typeof err === "object" &&
+		err !== null &&
+		(err as { _tag?: unknown })._tag === "UnknownError" &&
+		"cause" in err
+	)
+		err = (err as { cause: unknown }).cause;
+	const text = err instanceof Error ? err.message || err.name : String(err);
+	return text
+		.split("\n")
+		.filter((line) => line.trim() !== "")
+		.slice(0, 6)
+		.join(" | ");
+};
 
 /**
  * A unit under supervision: plugins restart on failure (capped exponential backoff, jittered);
@@ -654,12 +438,7 @@ export const superviseUnit = (
 			),
 		),
 		Effect.tapCause((cause) =>
-			Effect.sync(() =>
-				log(
-					`[${unit.name}] failed: ${Cause.pretty(cause).split("\n")[0]}`,
-					"error",
-				),
-			),
+			Effect.sync(() => log(`[${unit.name}] failed: ${describeFailure(cause)}`, "error")),
 		),
 		Effect.retry(restart),
 		Effect.catchCause((cause) =>
@@ -694,9 +473,7 @@ export const runOneUnit = (
 			),
 		),
 		Effect.tapCause((cause) =>
-			Effect.sync(() =>
-				log(`[${unit.name}] failed: ${Cause.pretty(cause).split("\n")[0]}`, "error"),
-			),
+			Effect.sync(() => log(`[${unit.name}] failed: ${describeFailure(cause)}`, "error")),
 		),
 		Effect.asVoid,
 	);
@@ -707,7 +484,7 @@ type FileStamp = { mtimeMs: number; size: number } | undefined;
 /** The grants file's rename-safe polling stamp; absence is a stable state too. */
 const grantFileStamp = (config: string): FileStamp => {
 	try {
-		const stat = fs.statSync(path.join(config, "plugin-grants.json"));
+		const stat = fs.statSync(path.join(config, "plugin-run", "plugin-grants.json"));
 		return { mtimeMs: stat.mtimeMs, size: stat.size };
 	} catch {
 		return undefined;

@@ -43,15 +43,12 @@ impl Default for SessionAccess {
 }
 
 impl SessionAccess {
-    /// Grants plus deadline from the connector. Core stores Unix time; this
-    /// converts it onto this process's monotonic clock.
+    /// Grants plus deadline from the connector, moved onto this process's monotonic clock.
     pub fn from_connector(c: &punktfunk_core::client::NativeClient) -> SessionAccess {
-        let deadline = c.access_deadline_unix().map(|deadline_unix| {
-            let now_unix = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs());
-            Instant::now() + Duration::from_secs(deadline_unix.saturating_sub(now_unix))
-        });
+        let deadline = match c.access_expires_in_secs() {
+            0 => None,
+            secs => Some(Instant::now() + Duration::from_secs(secs.into())),
+        };
         SessionAccess {
             grants: c.access_grants(),
             deadline,
@@ -143,6 +140,23 @@ mod tests {
             "Full control"
         );
         assert_eq!(preset_label(GRANT_ALL | (1 << 20)), "Full control");
+    }
+
+    /// The level core writes for each mask; the web console and Kotlin replay the same file.
+    #[test]
+    fn labels_match_the_core_grant_vectors() {
+        let raw = include_str!("../../punktfunk-core/testdata/grant-vectors.json");
+        let file: serde_json::Value = serde_json::from_str(raw).expect("grant-vectors.json parses");
+        for case in file["masks"].as_array().expect("masks array") {
+            let mask = case["mask"].as_u64().expect("mask") as u32;
+            let want = match case["level"].as_str().expect("level") {
+                "full" => "Full control",
+                "controller" => "Controller only",
+                "view" => "View only",
+                _ => "Custom",
+            };
+            assert_eq!(preset_label(mask), want, "mask {mask:#x}");
+        }
     }
 
     #[test]

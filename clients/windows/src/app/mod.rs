@@ -42,6 +42,7 @@
 //!   state, and root can only start a tween off a trigger it owns.
 
 mod connect;
+mod embedded_png;
 mod help;
 mod hosts;
 mod launcher_icons;
@@ -162,8 +163,9 @@ pub(crate) struct Shared {
     /// case Refresh is simply inert rather than a second, competing browse).
     pub(crate) rescan: Mutex<Option<discovery::Rescan>>,
     /// The live session child (spawn mode) — the status page's Disconnect and the
-    /// request-access Cancel kill it. A FRESH handle is installed per spawn.
-    pub(crate) session: Mutex<crate::spawn::SessionChild>,
+    /// request-access Cancel kill it. A FRESH handle is installed per spawn, so a stale
+    /// handle never kills a newer session.
+    pub(crate) session: Mutex<pf_client_core::orchestrate::CancelHandle>,
     /// Latest stats window from the session child (spawn mode); mirrored into the HUD
     /// sample for the session status page.
     pub(crate) stats: Mutex<Option<punktfunk_core::hud::StatsSnapshot>>,
@@ -193,6 +195,8 @@ pub struct AppCtx {
     pub(crate) settings: Mutex<Settings>,
     pub(crate) gamepad: GamepadService,
     pub(crate) shared: Arc<Shared>,
+    /// The settings page's GPU and audio-endpoint lists, re-probed with the snapshot above.
+    pub(crate) probes: Mutex<settings::DeviceProbes>,
 }
 
 pub fn run(identity: (String, String), gamepad: GamepadService) -> windows_reactor::Result<()> {
@@ -206,6 +210,7 @@ pub fn run(identity: (String, String), gamepad: GamepadService) -> windows_react
         settings: Mutex::new(Settings::load()),
         gamepad,
         shared: Arc::new(Shared::default()),
+        probes: Mutex::default(),
     });
     // Re-apply the persisted forwarded-controller pin (stable key; the service matches it
     // whenever such a pad connects) — GTK-shell parity.
@@ -318,6 +323,9 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     // Whether the Edit-preset modal is up. Root state for the reactor-backend-handler reason
     // above; guarded in the page so it only renders while a preset is actually in scope.
     let (settings_edit, set_settings_edit) = cx.use_async_state(false);
+    // Resolution is on Custom… while the size typed there still matches a listed one. Root
+    // state for the same reason.
+    let (settings_custom_res, set_settings_custom_res) = cx.use_async_state(false);
     // Bumped when a settings edit changes what the page should SHOW without changing any state
     // it already reads — ANY edit through `settings::commit` (creating an override must surface
     // its marker as immediately as resetting one clears it), a reset, a preset colour change.
@@ -373,6 +381,7 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     let (probed, set_probed) = cx.use_async_state(HashMap::<String, bool>::new());
     // Library fetch/art state (thread-driven → root; see `library::start_fetch`).
     let (library, set_library) = cx.use_async_state(library::LibraryState::default());
+    let (end_game, set_end_game) = cx.use_async_state(library::EndGameUi::default());
     // Where a bare launch opens (design/default-host.md). Once per process, before the poll
     // below can deliver anything: a link queued at startup is explicit intent and wins, and
     // `pending()` reads the queue WITHOUT draining it so the router still gets it.
@@ -573,7 +582,7 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
                             .collect();
                         let online = crate::trust::probe_known(&hosts, Duration::from_millis(2500));
                         let map: HashMap<String, bool> =
-                            hosts.into_iter().map(|h| h.fp_hex).zip(online).collect();
+                            hosts.iter().map(|h| h.card_key()).zip(online).collect();
                         set_probed.call(map);
                         std::thread::sleep(Duration::from_secs(12));
                     }
@@ -731,6 +740,8 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
             &set_settings_delete,
             settings_edit,
             &set_settings_edit,
+            settings_custom_res,
+            &set_settings_custom_res,
             settings_rev,
             &set_settings_rev,
             nav_progress,
@@ -744,6 +755,8 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
             library::LibraryProps {
                 svc,
                 state: library,
+                end_game,
+                set_end_game,
             },
         ),
         // The stream runs in the punktfunk-session child's own window; this screen is a

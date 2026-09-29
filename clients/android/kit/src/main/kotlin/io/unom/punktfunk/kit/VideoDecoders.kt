@@ -46,19 +46,30 @@ object VideoDecoders {
      */
     /**
      * The `quic::CODEC_*` bitfield of codecs this device can decode, advertised in the Hello so the
-     * host never emits a codec the decode loop can't open: H.264 (1) and HEVC (2) always (universal
-     * on Android hardware), plus AV1 (4) only when [pickDecoder] finds a real (hardware, non-blocked)
-     * `video/av01` decoder, plus PyroWave (8) when the GPU answers
-     * [NativeBridge.nativePyrowaveCapable].
+     * host never emits a codec the decode loop can't open: H.264 (1) always, HEVC (2) and AV1 (4)
+     * only when [pickDecoder] finds a real (non-blocked) decoder for them, plus PyroWave (8) when
+     * the GPU answers [NativeBridge.nativePyrowaveCapable]. ChromeOS (ARC) ships no HEVC decoder,
+     * and the host's automatic pick prefers HEVC.
      *
      * PyroWave is the one bit here that names no `MediaCodec`: it is Vulkan compute, so the probe
      * asks the driver rather than `MediaCodecList`. Enumerates `MediaCodecList` (and, once per
      * process, a Vulkan instance) — call at connect time, not per frame.
      */
     fun decodableCodecBits(): Int =
-        1 or 2 or
+        1 or
+            (if (pickDecoder("video/hevc") != null) 2 else 0) or
             (if (pickDecoder("video/av01") != null) 4 else 0) or
             (if (pyrowaveCapable()) 8 else 0)
+
+    /** The `MediaCodec` MIMEs [decodableCodecBits] advertises. */
+    private fun advertisedMimes(): List<String> {
+        val bits = decodableCodecBits()
+        return buildList {
+            add("video/avc")
+            if (bits and 2 != 0) add("video/hevc")
+            if (bits and 4 != 0) add("video/av01")
+        }
+    }
 
     /**
      * Whether this device's GPU decodes PyroWave ([NativeBridge.nativePyrowaveCapable]) — the
@@ -83,11 +94,7 @@ object VideoDecoders {
      * defaults to >1 slice only toward clients that set the bit.
      */
     fun multiSliceTolerant(): Boolean {
-        val mimes = buildList {
-            add("video/avc")
-            add("video/hevc")
-            if (decodableCodecBits() and 4 != 0) add("video/av01")
-        }
+        val mimes = advertisedMimes()
         return mimes.all { mime ->
             val name = pickDecoder(mime)?.name?.lowercase() ?: return@all false
             !name.startsWith("omx.amlogic") && !name.startsWith("c2.amlogic")
@@ -102,11 +109,7 @@ object VideoDecoders {
      * conservative shape as [multiSliceTolerant] (an unprobeable pick disqualifies).
      */
     fun partialFrameCapable(): Boolean {
-        val mimes = buildList {
-            add("video/avc")
-            add("video/hevc")
-            if (decodableCodecBits() and 4 != 0) add("video/av01")
-        }
+        val mimes = advertisedMimes()
         val infos = runCatching { MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos }
             .getOrNull() ?: return false
         return mimes.all { mime ->
@@ -125,11 +128,7 @@ object VideoDecoders {
      * the P2 slice-pipeline gate that is otherwise invisible until a stream behaves differently.
      */
     fun capsReport(): String {
-        val mimes = buildList {
-            add("video/avc")
-            add("video/hevc")
-            if (decodableCodecBits() and 4 != 0) add("video/av01")
-        }
+        val mimes = advertisedMimes()
         val infos = runCatching { MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos }
             .getOrNull() ?: return "codec list unavailable"
         return mimes.joinToString("  ") { mime ->

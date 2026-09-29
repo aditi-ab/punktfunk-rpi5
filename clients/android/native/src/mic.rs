@@ -12,19 +12,20 @@
 //!
 //! **Mute** is a flag the encode loop reads per 10 ms frame, never a stream teardown: the AAudio
 //! input stream, the input-preset ladder it settled on and its primed buffers all survive a
-//! mute/unmute untouched, so toggling costs an atomic load and nothing else.
+//! mute/unmute untouched, so toggling costs an atomic load and nothing else. A disconnect (a
+//! headset plugged or pulled) reopens the stream on the same encoder; see [`supervise`].
 
 use ndk::audio::{
     AudioCallbackResult, AudioDirection, AudioFormat, AudioInputPreset, AudioPerformanceMode,
     AudioSharingMode, AudioStream, AudioStreamBuilder, SessionId,
 };
+use punktfunk_core::audio::mic::MicEncoder;
 use punktfunk_core::client::NativeClient;
-use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 /// What one capture open attempt yields: the stream, plus both halves of the PCM hand-off — the
 /// receiver the encode worker drains and the sender that returns emptied buffers for reuse. Note
@@ -34,12 +35,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// Named rather than written inline for the same reason as that one — `clippy::type_complexity`,
 /// now that the Android target is actually linted (`:kit:cargoNdkClippy`).
 type OpenedCapture = ndk::audio::Result<(AudioStream, Receiver<Vec<f32>>, SyncSender<Vec<f32>>)>;
+/// A started stream from [`open_started`]: the capture plus the session id AAudio allocated.
+type StartedCapture = (AudioStream, Receiver<Vec<f32>>, SyncSender<Vec<f32>>, i32);
 
 const CHANNELS: usize = 1;
 const SAMPLE_RATE: i32 = 48_000;
-/// 10 ms per channel @ 48 kHz — half the desktop clients' 20 ms frame, trading a little Opus
-/// header overhead for one less buffered interval; the host accepts ≤ 120 ms.
-const FRAME_SAMPLES: usize = 480;
 /// Captured-chunk hand-off depth (each ~ one burst); drops on overflow (best-effort uplink).
 /// Bursts are sized in frames, so the wall-time depth is unchanged by the stereo→mono move.
 const RING_CHUNKS: usize = 64;
@@ -48,30 +48,29 @@ const RING_CHUNKS: usize = 64;
 /// each buffer a one-time grow on the capture thread, after which the steady state is
 /// allocation-free again.
 const CHUNK_CAP_SAMPLES: usize = 960; // 20 ms mono — the same wall-time as the old stereo value
-/// Opus VOIP target bitrate (mono speech; tunable).
-const MIC_BITRATE: i32 = 48_000;
-/// Encode-side self-heal threshold, in queued 10 ms frames (~60 ms): waking to more than this
-/// means the uplink stalled — and because the capture callback drops the NEWEST chunk when the
-/// channel is full, a stall otherwise converts to standing mic delay that never drains (real-time
-/// playback host-side never makes time back up). Skip to the newest few frames instead.
-const BACKLOG_MAX_FRAMES: usize = 6;
-/// What a self-heal keeps: ~20 ms of the freshest audio (one audible blip, live again).
-const BACKLOG_KEEP_FRAMES: usize = 2;
+/// Settling time between a disconnect and the reopen: a headset handing over the route.
+const REOPEN_SETTLE_MS: u64 = 250;
+/// Reopens that may find no input before the mic gives up: ~2 s, past a Bluetooth handover.
+const REOPEN_ATTEMPTS: u32 = 8;
 
-/// Owned by [`crate::session::SessionHandle`]: the live AAudio input stream + the encode thread.
+/// Owned by [`crate::session::SessionHandle`]: the encode thread, which owns the AAudio input
+/// stream (see [`supervise`]). Dropping this stops the thread, and the thread closes the stream.
 pub struct MicCapture {
-    _stream: AudioStream, // dropping it stops + closes the AAudio input stream
     /// The audio-session id AAudio allocated (`> 0`) when echo cancellation asked for one — the
-    /// hook Kotlin hangs the Java `AcousticEchoCanceler`/`NoiseSuppressor` on. `0` = none.
+    /// hook Kotlin hangs the Java `AcousticEchoCanceler`/`NoiseSuppressor` on. `0` = none. The
+    /// first open's; a reopen after a disconnect keeps the HAL preset but not the Java effects.
     session_id: i32,
     shutdown: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
-// SAFETY: Rust accesses the stream only through this unique owner. Drop first stops and joins the
-// encode worker, then AAudio closes the stream and quiesces its own callback; it may run on any
-// non-callback JNI thread. The session mutex prevents concurrent application-side stream access.
-unsafe impl Send for MicCapture {}
+/// Why [`run`] returned.
+#[derive(Debug, PartialEq, Eq)]
+enum Exit {
+    Shutdown,
+    /// AAudio reported the stream disconnected; it is dead by contract, reopen.
+    Disconnected,
+}
 
 /// The open ladder: Exclusive first — MMAP-exclusive is AAudio's lowest-latency path — falling
 /// back to Shared when the device refuses (no MMAP, mic claimed, …); and each sharing mode with
@@ -102,6 +101,7 @@ fn open_capture(
     voice: bool,
     captured: &Arc<AtomicU64>,
     dropped: &Arc<AtomicU64>,
+    disconnected: &Arc<AtomicBool>,
 ) -> OpenedCapture {
     let (tx, rx) = sync_channel::<Vec<f32>>(RING_CHUNKS);
     // Recycle free-list, mirroring the playback path: the realtime capture callback must
@@ -168,13 +168,57 @@ fn open_capture(
             .input_preset(AudioInputPreset::VoiceCommunication)
             .session_id(None);
     }
+    let cb_disconnected = disconnected.clone();
     let stream = builder
         .data_callback(Box::new(callback))
-        .error_callback(Box::new(|_s, e| {
+        .error_callback(Box::new(move |_s, e| {
             log::warn!("mic: AAudio error (device reroute/disconnect?): {e:?}");
+            cb_disconnected.store(true, Ordering::SeqCst);
         }))
         .open_stream()?;
     Ok((stream, rx, free_tx))
+}
+
+/// Walk the ladder and start the first stream that opens: the stream, its hand-off pair, and
+/// the session id AAudio allocated (`0` = none). `None` = every rung refused, or start failed.
+fn open_started(
+    echo_cancel: bool,
+    captured: &Arc<AtomicU64>,
+    dropped: &Arc<AtomicU64>,
+    disconnected: &Arc<AtomicBool>,
+) -> Option<StartedCapture> {
+    let mut opened = None;
+    for &(sharing, voice) in capture_rungs(echo_cancel) {
+        match open_capture(sharing, voice, captured, dropped, disconnected) {
+            Ok(o) => {
+                opened = Some(o);
+                break;
+            }
+            Err(e) => log::info!(
+                "mic: open {sharing:?}{} failed ({e}) — trying the next fallback",
+                if voice { "+VoiceCommunication" } else { "" },
+            ),
+        }
+    }
+    let (stream, rx, free_tx) = opened?;
+    // `> 0` is the handle Kotlin hangs the Java AcousticEchoCanceler/NoiseSuppressor off as the
+    // HAL preset's backstop; only a voice rung asks for one.
+    let session_id = match stream.session_id() {
+        SessionId::Allocated(id) => id.get(),
+        SessionId::None => 0,
+    };
+    if let Err(e) = stream.request_start() {
+        log::error!("mic: request_start: {e}");
+        return None;
+    }
+    log::info!(
+        "mic: AAudio input started rate={} ch={} fmt={:?} share={:?} session={session_id}",
+        stream.sample_rate(),
+        stream.channel_count(),
+        stream.format(),
+        stream.sharing_mode(),
+    );
+    Some((stream, rx, free_tx, session_id))
 }
 
 impl MicCapture {
@@ -189,57 +233,14 @@ impl MicCapture {
         echo_cancel: bool,
         muted: Arc<AtomicBool>,
     ) -> Option<MicCapture> {
-        let captured = Arc::new(AtomicU64::new(0));
-        // Chunks discarded on the capture thread (free-list empty / encoder lagging); logged
-        // throttled from the encode worker.
-        let dropped = Arc::new(AtomicU64::new(0));
-
-        let mut opened = None;
-        for &(sharing, voice) in capture_rungs(echo_cancel) {
-            match open_capture(sharing, voice, &captured, &dropped) {
-                Ok(o) => {
-                    opened = Some(o);
-                    break;
-                }
-                Err(e) => log::info!(
-                    "mic: open {sharing:?}{} failed ({e}) — trying the next fallback",
-                    if voice { "+VoiceCommunication" } else { "" },
-                ),
-            }
-        }
-        let (stream, rx, free_tx) = match opened {
-            Some(o) => o,
-            None => {
-                log::error!("mic: open_stream (RECORD_AUDIO granted?): every mode refused");
-                return None;
-            }
-        };
-
-        // The session id AAudio actually allocated (only a voice rung asks for one): `> 0` is the
-        // handle Kotlin hangs the Java AcousticEchoCanceler/NoiseSuppressor off as the HAL
-        // preset's backstop; `0` = none, nothing to attach.
-        let session_id = match stream.session_id() {
-            SessionId::Allocated(id) => id.get(),
-            SessionId::None => 0,
-        };
-
-        if let Err(e) = stream.request_start() {
-            log::error!("mic: request_start: {e}");
-            return None;
-        }
-        log::info!(
-            "mic: AAudio input started rate={} ch={} fmt={:?} share={:?} session={session_id}",
-            stream.sample_rate(),
-            stream.channel_count(),
-            stream.format(),
-            stream.sharing_mode(),
-        );
-
         let shutdown = Arc::new(AtomicBool::new(false));
         let sd = shutdown.clone();
+        // The worker opens the stream and owns it for life, so it never crosses threads; the
+        // first open's outcome comes back here for the session id.
+        let (ready_tx, ready_rx) = sync_channel::<Option<i32>>(1);
         let join = match std::thread::Builder::new()
             .name("pf-mic".into())
-            .spawn(move || encode_loop(client, rx, free_tx, sd, muted, captured, dropped))
+            .spawn(move || supervise(client, echo_cancel, muted, sd, ready_tx))
         {
             Ok(join) => join,
             Err(e) => {
@@ -247,13 +248,17 @@ impl MicCapture {
                 return None;
             }
         };
-
-        Some(MicCapture {
-            _stream: stream,
-            session_id,
-            shutdown,
-            join: Some(join),
-        })
+        match ready_rx.recv() {
+            Ok(Some(session_id)) => Some(MicCapture {
+                session_id,
+                shutdown,
+                join: Some(join),
+            }),
+            _ => {
+                let _ = join.join();
+                None
+            }
+        }
     }
 
     /// The audio-session id AAudio allocated (`> 0`; see [`MicCapture::start`]), `0` = none.
@@ -266,143 +271,153 @@ impl Drop for MicCapture {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
         if let Some(j) = self.join.take() {
-            let _ = j.join();
+            let _ = j.join(); // the worker stops and closes the AAudio stream on its way out
         }
-        // `_stream` drops here → AAudio request_stop + close.
     }
 }
 
-/// Consumer: drain captured f32 → accumulate → Opus `encode_float` 10 ms mono frames → `send_mic`.
-/// Drained chunk buffers go back to the callback's free-list; the encode scratch is reused across
-/// frames (only the packet Vec handed to `send_mic` is allocated per frame — it's sent away owned).
-///
-/// While `muted` is set a formed frame is dropped instead of encoded (see the frame loop) — the
-/// capture side keeps running exactly as it does unmuted, so nothing about the stream, its ring or
-/// its backlog behaviour changes across a toggle.
-fn encode_loop(
+/// Own the input stream for the session: open it, run the uplink against it, and open it again
+/// when AAudio disconnects it (a headset plugged or pulled, Bluetooth taking the route). The
+/// stream is dead by AAudio's contract then; without a reopen the mic stayed silent while the
+/// session still offered its mute. The encoder and `seq` carry over, so the host sees one stream.
+fn supervise(
     client: Arc<NativeClient>,
-    rx: Receiver<Vec<f32>>,
-    free_tx: SyncSender<Vec<f32>>,
-    shutdown: Arc<AtomicBool>,
+    echo_cancel: bool,
     muted: Arc<AtomicBool>,
-    captured: Arc<AtomicU64>,
-    dropped: Arc<AtomicU64>,
+    shutdown: Arc<AtomicBool>,
+    ready: SyncSender<Option<i32>>,
 ) {
     // Fold this Opus-encode/uplink thread into the client's hot-thread set so the ADPF session the
     // decode thread opens keeps mic encode on a fast core too (the playback side's decode_loop
     // does the same). No-op below API 33.
     client.register_hot_thread();
-    let mut enc = match opus::Encoder::new(
-        SAMPLE_RATE as u32,
-        opus::Channels::Mono,
-        opus::Application::Voip,
-    ) {
-        Ok(e) => e,
+    crate::audio::boost_audio_thread("mic");
+    // Self-heal on: the capture callback drops the NEWEST chunk when the channel is full, so a
+    // stall here would otherwise become standing mic delay the host never makes back up.
+    let mut up = match MicEncoder::new(true) {
+        Ok(up) => up,
         Err(e) => {
             log::error!("mic: opus encoder init: {e} — mic disabled");
+            let _ = ready.send(None);
             return;
         }
     };
-    // Speech tuning: complexity 5 roughly halves encode cost for no audible loss at this rate,
-    // and in-band FEC at an assumed 10% loss lets the host's decoder reconstruct a dropped
-    // datagram from its successor instead of playing a hole (the uplink is fire-and-forget).
-    // A refused setter leaves the encoder on libopus defaults — audible, so say which.
-    for (what, r) in [
-        ("bitrate", enc.set_bitrate(opus::Bitrate::Bits(MIC_BITRATE))),
-        ("complexity", enc.set_complexity(5)),
-        ("inband_fec", enc.set_inband_fec(true)),
-        ("packet_loss_perc", enc.set_packet_loss_perc(10)),
-    ] {
-        if let Err(e) = r {
-            log::warn!("mic: opus {what} not applied: {e}");
-        }
+    // Complexity 5 roughly halves encode cost for no audible loss on speech at this rate.
+    if let Err(e) = up.encoder_mut().set_complexity(5) {
+        log::warn!("mic: opus complexity not applied: {e}");
     }
-
-    let frame = FRAME_SAMPLES * CHANNELS;
-    let mut ring: VecDeque<f32> = VecDeque::with_capacity(frame * 4);
-    let mut pcm = vec![0f32; frame]; // reusable encode scratch (one 10 ms frame)
-    let mut out = vec![0u8; 4000]; // max Opus packet for a 10 ms frame fits easily
-    let mut seq: u32 = 0;
-    let mut sent: u64 = 0;
-    let mut stale: u64 = 0; // frames shed by the backlog self-heal (see BACKLOG_MAX_FRAMES)
-    let mut muted_frames: u64 = 0; // frames dropped unencoded because the user muted
-    let mut peak = 0f32; // loudest |sample| since the last log — tells speech from silence
-
+    let captured = Arc::new(AtomicU64::new(0));
+    // Chunks discarded on the capture thread (free-list empty / encoder lagging); logged
+    // throttled from the encode loop.
+    let dropped = Arc::new(AtomicU64::new(0));
+    let mut ready = Some(ready);
+    let mut attempts: u32 = 0;
     while !shutdown.load(Ordering::Relaxed) {
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let Some((stream, rx, free_tx, session_id)) =
+            open_started(echo_cancel, &captured, &dropped, &disconnected)
+        else {
+            if let Some(r) = ready.take() {
+                log::error!("mic: open_stream (RECORD_AUDIO granted?): every mode refused");
+                let _ = r.send(None);
+                return;
+            }
+            attempts += 1;
+            if attempts > REOPEN_ATTEMPTS {
+                log::warn!("mic: no input device after the disconnect — the mic stays off");
+                break;
+            }
+            crate::audio::nap(&shutdown, REOPEN_SETTLE_MS);
+            continue;
+        };
+        attempts = 0;
+        match ready.take() {
+            Some(r) => {
+                let _ = r.send(Some(session_id));
+            }
+            None => log::info!("mic: reopened after a disconnect (session={session_id})"),
+        }
+        let exit = run(
+            &mut up,
+            &client,
+            &rx,
+            &free_tx,
+            &shutdown,
+            &disconnected,
+            &muted,
+            &captured,
+            &dropped,
+        );
+        let _ = stream.request_stop();
+        drop(stream); // → AAudioStream_close
+        if exit == Exit::Shutdown {
+            break;
+        }
+        log::warn!("mic: input disconnected — reopening in {REOPEN_SETTLE_MS} ms");
+        crate::audio::nap(&shutdown, REOPEN_SETTLE_MS);
+    }
+    log::info!(
+        "mic: stopped (sent={} captured_frames={} dropped_chunks={} stale_frames={} \
+         muted_frames={})",
+        up.sent,
+        captured.load(Ordering::Relaxed),
+        dropped.load(Ordering::Relaxed),
+        up.stale,
+        up.muted_frames,
+    );
+}
+
+/// Consumer for one stream: drain captured f32 into the encoder, which sends 10 ms mono frames
+/// with `send_mic`, until shutdown or a disconnect. Drained chunk buffers go back to the
+/// callback's free-list. A mute drops formed frames; the stream itself runs on untouched.
+#[allow(clippy::too_many_arguments)] // one call site, `supervise`
+fn run(
+    up: &mut MicEncoder,
+    client: &NativeClient,
+    rx: &Receiver<Vec<f32>>,
+    free_tx: &SyncSender<Vec<f32>>,
+    shutdown: &AtomicBool,
+    disconnected: &AtomicBool,
+    muted: &AtomicBool,
+    captured: &AtomicU64,
+    dropped: &AtomicU64,
+) -> Exit {
+    while !shutdown.load(Ordering::Relaxed) {
+        if disconnected.load(Ordering::SeqCst) {
+            return Exit::Disconnected;
+        }
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(mut chunk) => {
-                // `drain(..)` keeps the Vec's capacity; hand the emptied buffer back to the
-                // callback's free-list (dropped only if the pool is momentarily full).
-                ring.extend(chunk.drain(..));
+                up.push(chunk.drain(..));
                 let _ = free_tx.try_send(chunk);
-                // Drain whatever else queued while we were away, so a post-stall backlog lands as
-                // ONE lump the self-heal below can size up — chunk-at-a-time it would be encoded
-                // (and inflicted on the host as standing delay) before it ever looked deep.
+                // Take whatever else queued while we were away, so a post-stall backlog lands as
+                // ONE lump the self-heal can size up.
                 while let Ok(mut chunk) = rx.try_recv() {
-                    ring.extend(chunk.drain(..));
+                    up.push(chunk.drain(..));
                     let _ = free_tx.try_send(chunk);
                 }
             }
-            Err(RecvTimeoutError::Timeout) => continue, // wake to re-check shutdown
-            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => continue, // wake to re-check shutdown/disconnect
+            // The callback dropped its sender: the stream is gone.
+            Err(RecvTimeoutError::Disconnected) => return Exit::Disconnected,
         }
-        // Self-heal the latency ratchet: a stall (scheduler hiccup, a slow send) queues stale
-        // audio, and every ms of it would ride the stream as mic delay for the rest of the
-        // session. Jump to the newest ~20 ms (one audible blip), counting the shed.
-        if ring.len() > BACKLOG_MAX_FRAMES * frame {
-            let excess = ring.len() - BACKLOG_KEEP_FRAMES * frame;
-            ring.drain(..excess);
-            stale += (excess / frame) as u64;
-        }
-        while ring.len() >= frame {
-            // Muted: drop the frame at the last point before it would become an Opus packet —
-            // room audio is never encoded and nothing goes on the wire. `seq` does NOT advance:
-            // it numbers the datagrams the host de-jitters, and that side reads a seq jump as
-            // loss (conceal + a counted gap) where a mute is a pause. Freezing it means the
-            // frame after an unmute continues the chain, which is what the host's own
-            // `reset_stream` doc calls for and what the desktop uplink does. (Encoding silence
-            // instead would keep a pointless uplink and a host-side ring alive for the whole
-            // mute.) `peak` is the loudest sample the UPLINK carried since the last log, so a
-            // dropped frame resets rather than raises it.
-            if muted.load(Ordering::Relaxed) {
-                ring.drain(..frame);
-                muted_frames += 1;
-                peak = 0.0;
-                continue;
-            }
-            for (dst, src) in pcm.iter_mut().zip(ring.drain(..frame)) {
-                *dst = src;
-            }
-            for &s in &pcm {
-                peak = peak.max(s.abs());
-            }
-            match enc.encode_float(&pcm, &mut out) {
-                Ok(len) => {
-                    let pts = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as u64)
-                        .unwrap_or(0);
-                    let _ = client.send_mic(seq, pts, out[..len].to_vec());
-                    seq = seq.wrapping_add(1);
-                    sent += 1;
-                    if sent % 500 == 0 {
-                        log::info!(
-                            "mic: sent={sent} captured_frames={} dropped_chunks={} \
-                             stale_frames={stale} muted_frames={muted_frames} peak={peak:.3}",
-                            captured.load(Ordering::Relaxed),
-                            dropped.load(Ordering::Relaxed),
-                        );
-                        peak = 0.0;
-                    }
-                }
-                Err(e) => log::debug!("mic: opus encode: {e}"),
-            }
+        let before = up.sent;
+        up.drain(muted.load(Ordering::Relaxed), |seq, pts, packet| {
+            let _ = client.send_mic(seq, pts, packet.to_vec());
+        });
+        if up.sent / 500 != before / 500 {
+            log::info!(
+                "mic: sent={} captured_frames={} dropped_chunks={} stale_frames={} \
+                 muted_frames={} peak={:.3}",
+                up.sent,
+                captured.load(Ordering::Relaxed),
+                dropped.load(Ordering::Relaxed),
+                up.stale,
+                up.muted_frames,
+                up.peak,
+            );
+            up.peak = 0.0;
         }
     }
-    log::info!(
-        "mic: stopped (sent={sent} captured_frames={} dropped_chunks={} stale_frames={stale} \
-         muted_frames={muted_frames})",
-        captured.load(Ordering::Relaxed),
-        dropped.load(Ordering::Relaxed),
-    );
+    Exit::Shutdown
 }

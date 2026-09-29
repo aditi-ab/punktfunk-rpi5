@@ -2,6 +2,10 @@ import { Timer } from "lucide-react";
 import { type FC, useEffect, useState } from "react";
 import type { ApprovePending } from "@/api/gen/model/approvePending";
 import type { PendingDevice } from "@/api/gen/model/pendingDevice";
+import {
+	PasswordConfirmField,
+	type PasswordFailure,
+} from "@/components/password-confirm";
 import { Button } from "@/components/ui/button";
 import {
 	Dialog,
@@ -45,9 +49,9 @@ export const ApproveDialog: FC<{
 	 * with no PIN ceremony, so a session cookie on its own must not be able to do it. */
 	onApprove: (id: number, body: ApprovePending, password: string) => void;
 	isPending: boolean;
-	/** The last approve was refused: the password was wrong. */
-	wrongPassword: boolean;
-}> = ({ device, onCancel, onApprove, isPending, wrongPassword }) => {
+	/** Why the BFF refused the last approve's password, if it did. */
+	failure: PasswordFailure;
+}> = ({ device, onCancel, onApprove, isPending, failure }) => {
 	const [name, setName] = useState("");
 	const [password, setPassword] = useState("");
 	const [draft, setDraft] = useState<AccessDraft>(() =>
@@ -161,24 +165,13 @@ export const ApproveDialog: FC<{
 					{/* Approving pairs the device outright — no PIN — so it re-confirms the console
 					    password, which the BFF verifies and strips (util/confirm.ts). Both approve
 					    paths below carry it, the guest fast path included. */}
-					<div className="space-y-2">
-						<Label htmlFor="approve-password">{m.store_spec_password()}</Label>
-						<Input
-							id="approve-password"
-							type="password"
-							autoComplete="current-password"
-							value={password}
-							onChange={(e) => setPassword(e.target.value)}
-						/>
-						<p className="text-xs text-muted-foreground">
-							{m.pairing_password_help()}
-						</p>
-						{wrongPassword && (
-							<p role="alert" className="text-xs text-destructive">
-								{m.update_apply_wrong_password()}
-							</p>
-						)}
-					</div>
+					<PasswordConfirmField
+						id="approve-password"
+						value={password}
+						onChange={setPassword}
+						failure={failure}
+						help={m.pairing_password_help()}
+					/>
 
 					{/* The guest fast path — visually its own thing, deliberately not one of the footer
 					    buttons: one click grants Controller only for 4 hours, no dialog fiddling. */}

@@ -43,37 +43,24 @@ punktfunk-core = { path = "../../crates/punktfunk-core", features = ["quic"] }
 # nothing enables it and the C++ is never compiled.
 pf-client-core = { path = "../../crates/pf-client-core", default-features = false, features = ["desktop"] }
 
-# WinUI 3 UI via windows-reactor (a declarative React-like framework backed by WinUI).
-# Unpublished (version 0.0.0) and fast-moving, so pinned to a verified commit. Pin bumped
-# 2026-07-29 (from the 2026-07-01 rev) for: reconciler keyed-child-order fix (#4728), widget
-# validation (#4727), DPI collision fix (#4751), icon elements (#4736), multi-window (#4730),
-# scroll virtualization (#4710). All three windows-rs deps here MUST share this rev, and it must
-# match pf-client-core's `windows` pin — that is what makes the `IDXGISwapChain1` handed to reactor
-# satisfy reactor's own `windows_core::Interface`.
-# ⚠ This is NOT "the workspace builds ONE windows-rs", which an earlier version of this note
-# claimed. `wasapi` (via pf-client-core) pulls the crates.io `windows 0.62.2` alongside this git
-# copy, so both are in the lock and both compile. That costs build time and binary size, not
-# correctness. ⛔ Do NOT try to collapse it with a blanket `[patch.crates-io] windows`: this rev
-# uses header-named features (`dxgi`, `combaseapi`) while a dozen other manifests still use the
-# old `Win32_*` namespace features, and the patch would break every one of them.
-windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
-# Win32 / DXGI for the GPU picker and the shell's window plumbing. Pulled from the SAME
-# windows-rs commit as windows-reactor so their `windows-core` unifies — the `IDXGISwapChain1`
-# we hand to `SwapChainPanelHandle::set_swap_chain` must satisfy reactor's `windows_core::Interface`.
-# Features are header-named since the in-house-metadata rework (#4689) — one feature per SDK
-# header, replacing the old `Win32_*` namespace features.
-windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc", features = [
+# WinUI 3 UI via windows-reactor (a declarative React-like framework backed by WinUI). The
+# windows-rs rev is the workspace entry's (root Cargo.toml). `wasapi` (via pf-client-core) still
+# pulls crates.io `windows 0.62`, so two windows-rs copies compile: build time, not correctness.
+# ⛔ No blanket `[patch.crates-io] windows`: this rev uses header-named features (`dxgi`) while
+# the crates.io users name `Win32_*` namespaces, and the patch would break every one of them.
+windows-reactor = { workspace = true }
+# Win32 / DXGI for the GPU picker and the shell's window plumbing. Same rev as windows-reactor, so
+# the `IDXGISwapChain1` handed to `SwapChainPanelHandle::set_swap_chain` satisfies reactor's
+# `windows_core::Interface`. Features are header-named: one per SDK header (#4689).
+windows = { workspace = true, features = [
     # GetCurrentPackageFullName — the packaged-run probe guarding the explicit
     # AppUserModelID (main.rs; MSIX identity must win over the dev-run tag).
     "appmodel",
     # CoCreateInstance/CoInitializeEx (+ objbase/objidl/wtypesbase below) for the
     # "Create shortcut" writer (deeplink.rs).
     "combaseapi",
-    # SetWindowSubclass/DefSubclassProc — the deep-link WM_COPYDATA subclass hook.
-    "commctrl",
     "consoleapi",
     "dxgi",
-    "errhandlingapi",
     "libloaderapi",
     "objbase",
     "objidl",
@@ -81,7 +68,7 @@ windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a74410
     "shobjidl_core",
     "synchapi",
     "winerror",
-    # Windowing, messages, icons — and COPYDATASTRUCT, which lives in winuser now too.
+    # Windowing, messages, icons, and the deep-link receiver's message-only window + COPYDATASTRUCT.
     "winuser",
 ] }
 
@@ -89,25 +76,23 @@ windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a74410
 # (see the `gamepad` field in app/); the spawned punktfunk-session does the actual forwarding. SDL3
 # itself (built from source via the bundled CMake on Windows) is pulled transitively by
 # pf-client-core with the same `build-from-source,hidapi` features, so it is not a direct dep here.
-serde_json = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# The reactor's own headless test harness, at the SAME pinned rev: the `test` feature gates
+# The reactor's own headless test harness: the `test` feature gates
 # `RenderCx::for_test`/`ChannelDispatcher`; `test_reactor` is the upstream repo's
 # RecordingBackend crate (cargo resolves a git dep's workspace member by package name).
 # These power tests/reactor_semantics.rs — the characterization suite for the re-render
-# semantics this client's architecture depends on. Re-run it on every future SHA bump.
+# semantics this client's architecture depends on. Re-run it on every windows-rs rev bump.
 [target.'cfg(windows)'.dev-dependencies]
-windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc", features = ["test"] }
-test_reactor = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
+windows-reactor = { workspace = true, features = ["test"] }
+test_reactor = { workspace = true }
 
 # Embeds the app icon as an exe resource (build.rs) — Windows hosts only (rc.exe from the SDK).
 # windows-reactor-setup stages the Windows App SDK runtime bootstrap (framework-dependent) next
-# to the exe — the new-model replacement for the old windows-reactor build.rs; same pinned rev.
+# to the exe — the new-model replacement for the old windows-reactor build.rs.
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
-windows-reactor-setup = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
+windows-reactor-setup = { workspace = true }
 
 [lints]
 workspace = true

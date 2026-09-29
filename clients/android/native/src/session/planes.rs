@@ -6,7 +6,7 @@ use jni::objects::{JIntArray, JObject, JString};
 use jni::sys::{jboolean, jfloat, jint, jlong};
 use jni::EnvUnowned;
 
-use super::{get_session, jni_guard, lock_recover};
+use super::{jni_guard, lock_recover, SESSIONS};
 
 /// Start the retained session's decoder on a `SurfaceView` window.
 ///
@@ -24,6 +24,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartVideo(
     low_latency_mode: jboolean,
     ll_feature: jboolean,
     is_tv: jboolean,
+    chromeos: jboolean,
     present_priority: jni::sys::jint,
     smooth_buffer: jni::sys::jint,
     panel_fps: jni::sys::jint,
@@ -43,23 +44,15 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartVideo(
             .try_to_string(env)
             .ok()
             .filter(|s| !s.is_empty());
-        let Some(h) = get_session(handle) else {
+        let Some(h) = SESSIONS.get(handle) else {
             return Ok(());
         };
         let mut guard = lock_recover(&h.video);
         if guard.is_some() {
             return Ok(()); // already streaming
         }
-        // SAFETY: `env`/`surface` are valid JNI pointers for this call. `as *mut _` bridges any
-        // jni-sys version skew between the `jni` and `ndk` crates (both are raw `*mut _` pointers)
-        // — a real skew here, not a hypothetical one: `jni` is on jni-sys 0.4 while the vendored
-        // `ndk` is still on 0.3.
-        let window = match unsafe {
-            ndk::native_window::NativeWindow::from_surface(
-                env.get_raw() as *mut _,
-                surface.as_raw() as *mut _,
-            )
-        } {
+        // SAFETY: Kotlin declares `surface` a non-null `Surface`.
+        let window = match unsafe { crate::window_from_surface(env, &surface) } {
             Some(w) => w,
             None => {
                 log::error!("nativeStartVideo: no ANativeWindow from Surface");
@@ -82,6 +75,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartVideo(
             ll_feature,
             low_latency_mode,
             is_tv,
+            chromeos,
             present_priority,
             smooth_buffer,
             panel_hz: panel_fps,
@@ -132,7 +126,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoSurfac
         if handle == 0 || packed == 0 {
             return;
         }
-        let Some(h) = get_session(handle) else {
+        let Some(h) = SESSIONS.get(handle) else {
             return;
         };
         h.surface_size
@@ -155,7 +149,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoSource
     bottom: jni::sys::jfloat,
 ) {
     jni_guard((), || {
-        let Some(h) = get_session(handle) else {
+        let Some(h) = SESSIONS.get(handle) else {
             return;
         };
         h.src_crop.store(
@@ -168,7 +162,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoSource
 /// `NativeBridge.nativeVideoMime(handle): String` — the MediaCodec MIME for the codec the host
 /// resolved (`"video/hevc"` / `"video/avc"` / `"video/av01"`), so Kotlin can rank `MediaCodecList`
 /// decoders for it before calling [`Java_io_unom_punktfunk_kit_NativeBridge_nativeStartVideo`].
-/// Empty string on a `0` handle. Cheap; safe on the UI thread.
+/// Empty string on a `0` or closed handle. Cheap; safe on the UI thread.
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoMime<'local>(
@@ -177,11 +171,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoMime<'
     handle: jlong,
 ) -> JString<'local> {
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
-        if handle == 0 {
-            return Ok(JString::default());
-        }
-        let Some(h) = get_session(handle) else {
-            return Ok(JString::default());
+        // Never null: Kotlin declares a non-null `String`.
+        let Some(h) = SESSIONS.get(handle) else {
+            return env.new_string("");
         };
         env.new_string(crate::decode::codec_mime(h.client.codec))
     })
@@ -201,13 +193,13 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoCodecL
     handle: jlong,
 ) -> JString<'local> {
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
-        if handle == 0 {
-            return Ok(JString::default());
-        }
-        let Some(h) = get_session(handle) else {
-            return Ok(JString::default());
+        // `JString::default()` is Java null, which the Kotlin `String` return does not allow.
+        let session = if handle == 0 {
+            None
+        } else {
+            SESSIONS.get(handle)
         };
-        env.new_string(crate::decode::codec_label(h.client.codec))
+        env.new_string(session.map_or("", |h| crate::decode::codec_label(h.client.codec)))
     })
     .resolve::<LogErrorAndDefault>()
 }
@@ -239,7 +231,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopVideo(
     handle: jlong,
 ) {
     jni_guard((), || {
-        if let Some(h) = get_session(handle) {
+        if let Some(h) = SESSIONS.get(handle) {
             h.stop_video();
         }
     })
@@ -260,7 +252,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoDrain(
     on: jboolean,
 ) {
     jni_guard((), || {
-        if let Some(h) = get_session(handle) {
+        if let Some(h) = SESSIONS.get(handle) {
             if on {
                 h.start_drain();
             } else {
@@ -289,7 +281,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStatsL
 ) -> JString<'local> {
     use punktfunk_core::hud::{self, Extra, Role, StatsVerbosity};
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
-        let Some(h) = get_session(handle) else {
+        let Some(h) = SESSIONS.get(handle) else {
             return Ok(JString::default());
         };
         if lock_recover(&h.video).is_none() {
@@ -360,7 +352,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoSize<'
         if handle == 0 {
             return Ok(JIntArray::default());
         }
-        let Some(h) = get_session(handle) else {
+        let Some(h) = SESSIONS.get(handle) else {
             return Ok(JIntArray::default());
         };
         let mode = h.client.mode();
@@ -387,7 +379,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoDecode
     handle: jlong,
 ) -> JIntArray<'local> {
     env.with_env(|env| -> jni::errors::Result<JIntArray<'local>> {
-        let size = get_session(handle).and_then(|h| {
+        let size = SESSIONS.get(handle).and_then(|h| {
             super::unpack_surface_size(h.decoded_size.load(std::sync::atomic::Ordering::Relaxed))
         });
         let Some((w, h)) = size else {
@@ -413,7 +405,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetVideoSta
     enabled: jboolean,
 ) {
     jni_guard((), || {
-        if let Some(h) = get_session(handle) {
+        if let Some(h) = SESSIONS.get(handle) {
             // Re-enabling opens a fresh window seeded from the current counters.
             h.client.set_hud_enabled(enabled);
         }
@@ -434,7 +426,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartAudio(
     is_tv: jboolean,
 ) {
     jni_guard((), || {
-        let Some(h) = get_session(handle) else {
+        let Some(h) = SESSIONS.get(handle) else {
             return;
         };
         let mut guard = lock_recover(&h.audio);
@@ -458,7 +450,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopAudio(
     handle: jlong,
 ) {
     jni_guard((), || {
-        if let Some(h) = get_session(handle) {
+        if let Some(h) = SESSIONS.get(handle) {
             h.stop_audio();
         }
     })
@@ -481,7 +473,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartMic(
     echo_cancel: jboolean,
 ) -> jni::sys::jint {
     jni_guard(0, || {
-        let Some(h) = get_session(handle) else {
+        let Some(h) = SESSIONS.get(handle) else {
             return 0;
         };
         let mut guard = lock_recover(&h.mic);
@@ -515,7 +507,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopMic(
     handle: jlong,
 ) {
     jni_guard((), || {
-        if let Some(h) = get_session(handle) {
+        if let Some(h) = SESSIONS.get(handle) {
             h.stop_mic();
         }
     })
@@ -548,23 +540,28 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartPadAud
         if fd < 0 || !(0..16).contains(&pad) {
             return false;
         }
-        let Some(h) = get_session(handle) else {
+        let Some(h) = SESSIONS.get(handle) else {
             return false;
         };
         // Replace any previous renderer first: dropping it joins the old thread, so two of them
         // can never hold the same descriptor at once.
         h.stop_pad_audio();
+        // SAFETY: Kotlin keeps the connection that owns `fd` open until `nativeStopPadAudio`
+        // returns, and that call (or `nativeClose`) drops, and so joins, this renderer first.
+        let started = unsafe {
+            crate::pad_audio::start(
+                std::sync::Arc::clone(&h.client),
+                pad as u8,
+                fd,
+                haptics,
+                speaker,
+            )
+        };
         // The capability declaration and the rumble suppression are NOT done here: the renderer
         // makes both only once its USB stream actually opens (see `pad_audio::render`). Doing them
         // at spawn time would, on a kernel that refuses the interface claim, take the pad off wire
         // rumble and give it nothing in return — no haptics of any kind.
-        match crate::pad_audio::start(
-            std::sync::Arc::clone(&h.client),
-            pad as u8,
-            fd,
-            haptics,
-            speaker,
-        ) {
+        match started {
             Some(p) => {
                 *lock_recover(&h.pad_audio) = Some(p);
                 true
@@ -612,7 +609,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopPadAudi
     pad: jni::sys::jint,
 ) {
     jni_guard((), || {
-        if let Some(h) = get_session(handle) {
+        if let Some(h) = SESSIONS.get(handle) {
             h.stop_pad_audio();
             if (0..16).contains(&pad) {
                 // Withdraw the capability and hand the pad back to wire rumble, in that order:
@@ -650,7 +647,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetMicMuted
     muted: jboolean,
 ) {
     jni_guard((), || {
-        if let Some(h) = get_session(handle) {
+        if let Some(h) = SESSIONS.get(handle) {
             h.mic_muted
                 .store(muted, std::sync::atomic::Ordering::Relaxed);
         }
@@ -670,7 +667,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeMicActive(
     handle: jlong,
 ) -> jboolean {
     jni_guard(false, || {
-        get_session(handle).is_some_and(|h| lock_recover(&h.mic).is_some())
+        SESSIONS
+            .get(handle)
+            .is_some_and(|h| lock_recover(&h.mic).is_some())
     })
 }
 
@@ -688,7 +687,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetStreamMu
     muted: jboolean,
 ) {
     jni_guard((), || {
-        if let Some(h) = get_session(handle) {
+        if let Some(h) = SESSIONS.get(handle) {
             h.client.set_audio_muted(muted);
         }
     })
@@ -705,7 +704,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeAudioMute(
     handle: jlong,
 ) -> jint {
     jni_guard(0, || {
-        get_session(handle).map_or(0, |h| jint::from(h.client.audio_mute()))
+        SESSIONS
+            .get(handle)
+            .map_or(0, |h| jint::from(h.client.audio_mute()))
     })
 }
 

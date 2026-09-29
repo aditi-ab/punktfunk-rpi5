@@ -14,11 +14,12 @@
 //! unauthenticated (the spec is in-tree). Default bind is all interfaces;
 //! `--mgmt-bind 127.0.0.1:47990` restores loopback-only.
 
-use crate::gamestream::{tls::serve_https, AppState};
+use crate::gamestream::tls::serve_https;
+use crate::host::AppState;
 use anyhow::{Context, Result};
 use axum::{middleware, routing::get, Json, Router};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use utoipa::{Modify, OpenApi};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use utoipa_scalar::{Scalar, Servable};
@@ -31,6 +32,7 @@ mod cors;
 mod device_auth;
 mod diagnostics;
 mod display;
+mod emulators;
 mod events;
 mod gpu;
 mod hooks;
@@ -38,7 +40,7 @@ mod host;
 mod library;
 mod native;
 mod plugin_access;
-mod plugins;
+pub(crate) mod plugins;
 mod session;
 mod settings;
 mod shared;
@@ -109,12 +111,10 @@ pub fn publish_endpoint(bind: SocketAddr) {
 /// The 0700 config dir is the access control.
 fn write_endpoint(dir: &std::path::Path, port: u16) -> std::io::Result<std::path::PathBuf> {
     let path = dir.join(ENDPOINT_FILE);
-    // Write-then-rename: systemd may source this mid-rewrite. A torn read
+    // Replace, not write: systemd may source this mid-rewrite. A torn read
     // yields empty `PUNKTFUNK_MGMT_URL`; a set-but-blank var is not the
-    // built-in default. `rename` is atomic on Unix and replace on Windows.
-    let tmp = dir.join(format!("{ENDPOINT_FILE}.tmp"));
-    std::fs::write(&tmp, endpoint_line(port))?;
-    std::fs::rename(&tmp, &path)?;
+    // built-in default.
+    pf_paths::replace_file(&path, endpoint_line(port).as_bytes())?;
     Ok(path)
 }
 
@@ -164,9 +164,11 @@ pub(crate) struct MgmtState {
     plugin_token: Option<String>,
     /// Per-plugin tokens by id ([`Options::plugin_tokens`]). A match also stamps
     /// [`auth::PluginIdentity`], which is what the id-scoped routes check.
-    pub(crate) plugin_tokens: std::collections::BTreeMap<String, String>,
+    pub(crate) plugin_tokens: PluginTokens,
     /// Folder grants, denials, and pending requests — the `/plugin-access` routes' store.
     access: Arc<crate::plugins::access::AccessStore>,
+    /// Where `plugin-run/` lives: auth re-reads the token file there on a miss.
+    config_dir: std::path::PathBuf,
     /// Bound port, echoed in [`PortMap`].
     port: u16,
     /// Live device challenges and the tokens they became. See [`mgmt::device_auth`].
@@ -176,6 +178,8 @@ pub(crate) struct MgmtState {
     /// which case the device lane refuses rather than binding to nothing.
     identity_fingerprint: Option<[u8; 32]>,
 }
+
+pub(crate) type PluginTokens = Arc<RwLock<std::collections::BTreeMap<String, String>>>;
 
 /// `native` is the shared punktfunk/1 pairing handle when the unified host
 /// runs the native QUIC server.
@@ -231,7 +235,7 @@ pub async fn run(
         state,
         Some(token),
         opts.plugin_token.filter(|t| !t.trim().is_empty()),
-        opts.plugin_tokens,
+        Arc::new(RwLock::new(opts.plugin_tokens)),
         opts.bind.port(),
         native,
         stats,
@@ -250,14 +254,14 @@ fn app(
     state: Arc<AppState>,
     token: Option<String>,
     plugin_token: Option<String>,
-    plugin_tokens: std::collections::BTreeMap<String, String>,
+    plugin_tokens: PluginTokens,
     port: u16,
     native: Option<Arc<crate::native_pairing::NativePairing>>,
     stats: Arc<crate::stats_recorder::StatsRecorder>,
     // Injected so handler tests use a temp dir, not the real config dir.
     client_logs_dir: std::path::PathBuf,
-    // Where `plugin-grants.json` / `plugin-access-pending.json` live; injected for the same reason.
-    access_config_dir: std::path::PathBuf,
+    // Root for `plugin-run/` and `plugin-access-pending.json`; test-injected.
+    config_dir: std::path::PathBuf,
     gamestream_enabled: bool,
     identity_fingerprint: Option<[u8; 32]>,
     // Whether the WebTransport plane is running. State only for `cors::enabled`, so it is not
@@ -276,7 +280,10 @@ fn app(
         port,
         device_auth: device_auth::DeviceAuth::default(),
         identity_fingerprint,
-        access: Arc::new(crate::plugins::access::AccessStore::open(access_config_dir)),
+        access: Arc::new(crate::plugins::access::AccessStore::open(
+            config_dir.clone(),
+        )),
+        config_dir,
     });
     let (api_routes, api) = api_router_parts();
     let routed = api_routes.route_layer(middleware::from_fn_with_state(
@@ -396,6 +403,7 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
         ))
         .routes(routes!(session::end_game))
         .routes(routes!(library::get_library))
+        .routes(routes!(library::get_library_page))
         .routes(routes!(library::list_library_scanners))
         .routes(routes!(library::set_library_scanner))
         .routes(routes!(library::set_library_entry_hidden))
@@ -413,8 +421,17 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
                     library::reconcile_provider_entries,
                     library::delete_provider_entries
                 ))
+                .routes(routes!(
+                    library::put_library_metadata,
+                    library::delete_library_metadata
+                ))
                 .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
+        .routes(routes!(
+            library::list_library_metadata,
+            library::set_library_metadata
+        ))
+        .routes(routes!(library::set_library_art_pick))
         .routes(routes!(library::report_provider_running))
         .routes(routes!(library::get_library_art))
         .routes(routes!(stats::stats_capture_start))
@@ -449,6 +466,10 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
         ))
         .routes(routes!(plugin_access::get_plugin_access))
         .routes(routes!(plugin_access::decide_plugin_access))
+        .routes(routes!(plugin_access::release_plugin_access))
+        .routes(routes!(emulators::get_emulators))
+        .routes(routes!(emulators::install_emulator))
+        .routes(routes!(emulators::remove_emulator))
         .routes(routes!(store::get_catalog))
         .routes(routes!(store::refresh_catalog))
         .routes(routes!(store::list_installed))
@@ -504,6 +525,7 @@ pub fn openapi_json() -> String {
         (name = "hooks", description = "Operator hooks: commands and webhooks fired on lifecycle events (fire-and-forget — hooks observe, never veto)"),
         (name = "plugins", description = "Plugin directory: running `punktfunk-plugin-*` processes register a lease and, optionally, a loopback UI the web console proxies and adds to its nav"),
         (name = "plugin-access", description = "Plugin folder access: a plugin requests a directory (its own token), the operator grants or denies it (admin lane only)"),
+        (name = "emulators", description = "Managed emulators (hermir): the catalog, what is installed or detected, install and remove (admin lane only)"),
         (name = "store", description = "Plugin store: browse signed catalogs (verified first-party entries, attributed third-party sources), install/uninstall as tracked jobs, and switch the plugin runner on"),
         (name = "update", description = "Host update check: install kind + channel, the last verified release manifest, and whether a newer host exists (admin lane only)"),
         (name = "actions", description = "Host actions: discover what this host offers (per-caller availability + permission) and invoke one by id — v1: sleep, restart, shut down the machine, gated per device by the Host power grant"),

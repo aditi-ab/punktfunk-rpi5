@@ -101,7 +101,7 @@ BuildRequires:  pkgconfig(sdl3)
 # --- Runtime -----------------------------------------------------------------
 Requires:       pipewire
 Requires:       wireplumber
-# The host captures the sink monitor through NATIVE PipeWire (audio/linux.rs) and never opens a
+# The host captures the sink monitor through NATIVE PipeWire (pf-audio) and never opens a
 # Pulse socket itself — the shim is for the GAMES, which commonly emit through the PulseAudio
 # API. Weak-dep, because `pipewire-pulseaudio` CONFLICTS with `pulseaudio`: as a hard Requires it
 # made the host uninstallable for anyone running real PulseAudio, which serves those games just
@@ -365,6 +365,7 @@ install -Dm0644 scripts/99-punktfunk-net.conf %{buildroot}%{_prefix}/lib/sysctl.
 install -Dm0755 target/release/pf-update %{buildroot}%{_libexecdir}/punktfunk/pf-update
 install -Dm0644 packaging/linux/punktfunk-update.service %{buildroot}%{_unitdir}/punktfunk-update.service
 install -Dm0644 packaging/linux/49-punktfunk-update.rules %{buildroot}%{_datadir}/polkit-1/rules.d/49-punktfunk-update.rules
+install -Dm0755 packaging/linux/restart-user-units.sh %{buildroot}%{_libexecdir}/punktfunk/restart-user-units
 
 # systemd *user* unit (the host runs in the graphical session, not as root).
 install -Dm0644 scripts/punktfunk-host.service %{buildroot}%{_userunitdir}/punktfunk-host.service
@@ -612,6 +613,7 @@ install -Dm0755 "$(command -v bun)" %{buildroot}%{_libexecdir}/punktfunk-bun/bun
 %dir %{_libexecdir}/punktfunk
 %{_libexecdir}/punktfunk/pf-dm-helper
 %{_libexecdir}/punktfunk/pf-update
+%{_libexecdir}/punktfunk/restart-user-units
 %{_unitdir}/punktfunk-update.service
 %{_datadir}/polkit-1/rules.d/49-punktfunk-update.rules
 %{_datadir}/polkit-1/rules.d/49-punktfunk-power.rules
@@ -737,17 +739,16 @@ echo "virtual Steam Deck pad: sudo usermod -aG punktfunk \$USER   # then log out
 echo "  — it authorizes stopping the display manager for a managed gamescope session, and the"
 echo "    pad's usbip nodes; it can emulate arbitrary USB devices, so join it only on a box you trust."
 echo "then enable the host: systemctl --user enable --now punktfunk-host"
-echo "Config: cp %{_datadir}/%{name}/host.env.bazzite ~/.config/punktfunk/host.env"
+echo "Settings: the console (Host -> Settings). A line in ~/.config/punktfunk/host.env locks that setting there;"
+echo "  annotated templates: %{_datadir}/%{name}/host.env.{bazzite,kde,example}"
 # Fedora/RHEL run firewalld by default — point the way to the installed service definitions.
 if command -v firewall-cmd >/dev/null 2>&1; then
     echo "Firewall (firewalld): sudo firewall-cmd --reload &&"
     echo "    sudo firewall-cmd --permanent --add-service=punktfunk-gamestream && sudo firewall-cmd --reload"
     echo "    (use punktfunk-native for the native-only host)"
 fi
-# A RUNNING firewalld keeps serving the service definition it loaded at its last (re)start, so a
-# port added to the XML by this upgrade — 47993, the separate origin plugin UIs are served from —
-# is not open until a reload, and the console shows every plugin interface as an empty panel with
-# nothing to explain it. `--info-service` asks the daemon, i.e. reads that stale copy.
+# A running firewalld serves the service it last loaded, so a port this upgrade added to the XML is
+# closed until a reload. `--info-service` asks the daemon, i.e. reads that stale copy.
 if command -v firewall-cmd >/dev/null 2>&1 &&
    firewall-cmd --state >/dev/null 2>&1 &&
    firewall-cmd --query-service=punktfunk-web >/dev/null 2>&1 &&
@@ -755,6 +756,14 @@ if command -v firewall-cmd >/dev/null 2>&1 &&
     echo ""
     echo "punktfunk: the punktfunk-web firewalld service now also covers TCP 47993 (plugin UIs)."
     echo "  Plugin interfaces will not load in the console until:  sudo firewall-cmd --reload"
+fi
+if command -v firewall-cmd >/dev/null 2>&1 &&
+   firewall-cmd --state >/dev/null 2>&1 &&
+   firewall-cmd --query-service=punktfunk-native >/dev/null 2>&1 &&
+   ! firewall-cmd --info-service=punktfunk-native 2>/dev/null | grep -q '9778'; then
+    echo ""
+    echo "punktfunk: the punktfunk-native firewalld service now also covers UDP 9778 (browser"
+    echo "  streaming). A browser cannot connect to this host until:  sudo firewall-cmd --reload"
 fi
 # Conflicting Moonlight-compatible host (Sunshine/Apollo/...): reuse the host's own detector so the
 # warning stays in one place. Exit 1 = something found; never fail the install on it.
@@ -764,6 +773,10 @@ if command -v punktfunk-host >/dev/null 2>&1; then
         echo "$conflict"
     fi
 fi
+
+# Any punktfunk server package update restarts the running services, once per transaction.
+%transfiletriggerin -- %{_bindir}/punktfunk-host %{_datadir}/punktfunk-web %{_datadir}/punktfunk-scripting %{_libexecdir}/punktfunk-bun
+%{_libexecdir}/punktfunk/restart-user-units
 %endif
 
 %if %{with web}

@@ -1,0 +1,52 @@
+{
+  "$comment": "Generated from punktfunk_core::input::scroll::ScrollAccumulator by scroll_vectors_are_checked_in (UPDATE_VECTORS=1 rewrites it). The Kotlin ScrollNormalizer test replays every case.",
+  "cases": [
+    {"name": "wheel detents", "steps": [
+      {"source": 1, "phase": 0, "axis": 0, "delta": 120.0, "wire": {"source": 1, "phase": 0, "axis": 0, "delta": 30720}},
+      {"source": 1, "phase": 0, "axis": 0, "delta": -240.0, "wire": {"source": 1, "phase": 0, "axis": 0, "delta": -61440}}
+    ]},
+    {"name": "hi-res wheel quarters", "steps": [
+      {"source": 1, "phase": 0, "axis": 0, "delta": 30.0, "wire": {"source": 1, "phase": 0, "axis": 0, "delta": 7680}},
+      {"source": 1, "phase": 0, "axis": 0, "delta": 30.0, "wire": {"source": 1, "phase": 0, "axis": 0, "delta": 7680}},
+      {"source": 1, "phase": 0, "axis": 0, "delta": 30.0, "wire": {"source": 1, "phase": 0, "axis": 0, "delta": 7680}},
+      {"source": 1, "phase": 0, "axis": 0, "delta": 30.0, "wire": {"source": 1, "phase": 0, "axis": 0, "delta": 7680}}
+    ]},
+    {"name": "unknown carries its fraction", "steps": [
+      {"source": 0, "phase": 0, "axis": 0, "delta": 0.4, "wire": {"source": 0, "phase": 0, "axis": 0, "delta": 102}},
+      {"source": 0, "phase": 0, "axis": 0, "delta": 0.4, "wire": {"source": 0, "phase": 0, "axis": 0, "delta": 102}},
+      {"source": 0, "phase": 0, "axis": 0, "delta": 0.4, "wire": {"source": 0, "phase": 0, "axis": 0, "delta": 103}}
+    ]},
+    {"name": "finger gesture", "steps": [
+      {"source": 2, "phase": 1, "axis": 0, "delta": 1.5, "wire": {"source": 2, "phase": 1, "axis": 0, "delta": 384}},
+      {"source": 2, "phase": 2, "axis": 0, "delta": 0.01, "wire": {"source": 2, "phase": 2, "axis": 0, "delta": 2}},
+      {"source": 2, "phase": 2, "axis": 0, "delta": 0.001, "wire": null},
+      {"source": 2, "phase": 3, "axis": 0, "delta": 0.0, "wire": {"source": 2, "phase": 3, "axis": 0, "delta": 0}}
+    ]},
+    {"name": "momentum tail", "steps": [
+      {"source": 2, "phase": 5, "axis": 0, "delta": 3.3, "wire": {"source": 2, "phase": 5, "axis": 0, "delta": 844}},
+      {"source": 2, "phase": 6, "axis": 0, "delta": 0.2, "wire": {"source": 2, "phase": 6, "axis": 0, "delta": 51}},
+      {"source": 2, "phase": 7, "axis": 0, "delta": 0.0, "wire": {"source": 2, "phase": 7, "axis": 0, "delta": 0}}
+    ]},
+    {"name": "a source switch drops the residue", "steps": [
+      {"source": 3, "phase": 0, "axis": 0, "delta": 0.003, "wire": null},
+      {"source": 3, "phase": 0, "axis": 0, "delta": 0.003, "wire": {"source": 3, "phase": 0, "axis": 0, "delta": 1}},
+      {"source": 4, "phase": 2, "axis": 0, "delta": 0.003, "wire": null}
+    ]},
+    {"name": "a boundary drops the residue", "steps": [
+      {"source": 4, "phase": 2, "axis": 0, "delta": 0.003, "wire": null},
+      {"source": 4, "phase": 1, "axis": 0, "delta": 0.003, "wire": {"source": 4, "phase": 1, "axis": 0, "delta": 0}}
+    ]},
+    {"name": "horizontal", "steps": [
+      {"source": 2, "phase": 2, "axis": 1, "delta": -2.5, "wire": {"source": 2, "phase": 2, "axis": 1, "delta": -640}}
+    ]},
+    {"name": "saturates", "steps": [
+      {"source": 3, "phase": 0, "axis": 0, "delta": 1000000000.0, "wire": {"source": 3, "phase": 0, "axis": 0, "delta": 2147483647}}
+    ]},
+    {"name": "rejects", "steps": [
+      {"source": 2, "phase": 3, "axis": 0, "delta": 1.0, "wire": null},
+      {"source": 1, "phase": 1, "axis": 0, "delta": 120.0, "wire": null},
+      {"source": 5, "phase": 6, "axis": 0, "delta": 1.0, "wire": null},
+      {"source": 2, "phase": 2, "axis": 2, "delta": 1.0, "wire": null}
+    ]}
+  ]
+}

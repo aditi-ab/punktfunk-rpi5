@@ -195,6 +195,15 @@ fn timed_out(cmd: &Command, budget: Duration) -> Error {
     )
 }
 
+/// Sets its flag on drop: the keepalive whose drop stops the worker thread parked on the flag.
+pub(crate) struct StopFlag(pub(crate) std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for StopFlag {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// The calling process's real uid.
 ///
 /// Session/gamescope lookups that derive `/run/user/<uid>` (or filter `/proc` to "our"
@@ -212,14 +221,95 @@ pub(crate) fn current_uid() -> u32 {
 /// entry until reaped, so presence alone reads a crashed one as alive.
 #[cfg(target_os = "linux")]
 pub(crate) fn pid_alive(pid: u32) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
-    // `comm` is parenthesized and may hold `)`: the state letter follows the last one.
-    let state = stat
-        .rsplit_once(')')
-        .and_then(|(_, rest)| rest.trim_start().chars().next());
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| stat_alive(&stat))
+}
+
+/// The parent of `pid`, from `/proc/<pid>/stat`. `None` once it is gone.
+#[cfg(target_os = "linux")]
+pub(crate) fn ppid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat_fields(&stat)?.nth(1)?.parse().ok()
+}
+
+/// The `/proc/<pid>/stat` fields after `comm`, from the state letter on. `comm` is
+/// parenthesized and may hold `)`: the fields follow the last one.
+#[cfg(target_os = "linux")]
+fn stat_fields(stat: &str) -> Option<std::str::SplitWhitespace<'_>> {
+    Some(stat.rsplit_once(')')?.1.split_whitespace())
+}
+
+#[cfg(target_os = "linux")]
+fn stat_alive(stat: &str) -> bool {
+    let state = stat_fields(stat).and_then(|mut f| f.next()?.chars().next());
     state.is_some_and(|s| !matches!(s, 'Z' | 'X' | 'x'))
+}
+
+/// Every `/proc/<pid>` directory, as `(pid, path)`.
+#[cfg(target_os = "linux")]
+pub(crate) fn pids() -> impl Iterator<Item = (u32, std::path::PathBuf)> {
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let name = name.to_str()?;
+            if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            Some((name.parse().ok()?, e.path()))
+        })
+}
+
+/// [`pids`] owned by this process's uid.
+#[cfg(target_os = "linux")]
+pub(crate) fn own_pids() -> impl Iterator<Item = (u32, std::path::PathBuf)> {
+    use std::os::unix::fs::MetadataExt;
+    let uid = current_uid();
+    pids().filter(move |(_, path)| std::fs::metadata(path).is_ok_and(|md| md.uid() == uid))
+}
+
+/// The display keys of one process's environment. An empty value is absent.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct DisplayEnv {
+    pub display: Option<String>,
+    pub xauthority: Option<String>,
+    pub wayland: Option<String>,
+    /// `GAMESCOPE_WAYLAND_DISPLAY`: set only inside a gamescope session.
+    pub gamescope_wayland: Option<String>,
+}
+
+impl DisplayEnv {
+    /// Parse a NUL-separated `/proc/<pid>/environ` block.
+    pub(crate) fn parse(raw: &[u8]) -> DisplayEnv {
+        let mut env = DisplayEnv::default();
+        for kv in raw.split(|&b| b == 0) {
+            let kv = String::from_utf8_lossy(kv);
+            let Some((key, value)) = kv.split_once('=') else {
+                continue;
+            };
+            let slot = match key {
+                "DISPLAY" => &mut env.display,
+                "XAUTHORITY" => &mut env.xauthority,
+                "WAYLAND_DISPLAY" => &mut env.wayland,
+                "GAMESCOPE_WAYLAND_DISPLAY" => &mut env.gamescope_wayland,
+                _ => continue,
+            };
+            if !value.is_empty() {
+                *slot = Some(value.to_string());
+            }
+        }
+        env
+    }
+}
+
+/// [`DisplayEnv`] of the process at `pid_dir` (a `/proc/<pid>` directory). `None` when its
+/// `environ` is unreadable: another uid, or gone.
+#[cfg(target_os = "linux")]
+pub(crate) fn display_env(pid_dir: &std::path::Path) -> Option<DisplayEnv> {
+    std::fs::read(pid_dir.join("environ"))
+        .ok()
+        .map(|raw| DisplayEnv::parse(&raw))
 }
 
 /// The longest `/proc/<pid>/comm` the kernel will report: `TASK_COMM_LEN` is 16 *including* the
@@ -937,5 +1027,57 @@ mod tests_windows {
             !survived.exists(),
             "a grandchild outlived the budget — the shell was killed but not the tree under it"
         );
+    }
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::DisplayEnv;
+
+    fn environ(vars: &[&str]) -> Vec<u8> {
+        vars.join("\0").into_bytes()
+    }
+
+    #[test]
+    fn each_display_key_lands_in_its_own_field() {
+        let env = DisplayEnv::parse(&environ(&[
+            "HOME=/home/u",
+            "WAYLAND_DISPLAY=wayland-kde",
+            "DISPLAY=:0",
+            "XAUTHORITY=/run/user/1000/xauth_ab",
+            "GAMESCOPE_WAYLAND_DISPLAY=gamescope-0",
+        ]));
+        assert_eq!(env.display.as_deref(), Some(":0"));
+        assert_eq!(env.xauthority.as_deref(), Some("/run/user/1000/xauth_ab"));
+        assert_eq!(env.wayland.as_deref(), Some("wayland-kde"));
+        assert_eq!(env.gamescope_wayland.as_deref(), Some("gamescope-0"));
+    }
+
+    /// An empty `GAMESCOPE_WAYLAND_DISPLAY=` names no gamescope session, for every reader.
+    #[test]
+    fn an_empty_value_is_absent() {
+        let env = DisplayEnv::parse(&environ(&["DISPLAY=", "GAMESCOPE_WAYLAND_DISPLAY="]));
+        assert_eq!(env, DisplayEnv::default());
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod stat_tests {
+    use super::{stat_alive, stat_fields};
+
+    #[test]
+    fn the_state_follows_the_last_paren_of_comm() {
+        assert!(!stat_alive("9846 (gamescope-wl) Z 837 9846 9846 0 -1"));
+        assert!(stat_alive("77 (odd) name)) S 1 77 77 0 -1"));
+        assert!(!stat_alive("garbage"));
+        let ppid = stat_fields("77 (odd) name)) S 1 77").and_then(|mut f| f.nth(1));
+        assert_eq!(ppid, Some("1"));
+    }
+
+    /// `X` is a task being torn down: gone for every caller, a Steam wait included.
+    #[test]
+    fn a_dead_task_is_not_alive() {
+        assert!(!stat_alive("12 (steam) X 1 12 12 0 -1"));
+        assert!(!stat_alive("12 (steam) x 1 12 12 0 -1"));
     }
 }

@@ -8,6 +8,7 @@ Classifies by WHAT THE UNSAFE DOES (operations), not by block count.
 Usage:  python3 unsafe_census.py <repo-root> [--json]
 
 Method (and its error bars) are documented in the report; in short:
+  0. Take the crate scope from `cargo metadata` (see host_roots), so a new crate is counted.
   1. Strip line/block comments and string/char literals (a hand-rolled scanner).
   2. Resolve each crate's module tree from lib.rs/main.rs, propagating `#[cfg(..)]`
      from `mod x;` declarations down to files, so cfg attribution is structural
@@ -18,37 +19,33 @@ Method (and its error bars) are documented in the report; in short:
      unsafe OPERATIONS by regex, deduped by source span so nested blocks don't
      double count.
 """
-import os, re, sys, json, collections
+import os, re, sys, json, collections, subprocess
 
 # ---------------------------------------------------------------- scope
 
-HOST_ROOTS = [
-    "crates/punktfunk-host",
-    "crates/punktfunk-encode-worker",
-    "crates/punktfunk-tray",
-    "crates/pf-capture",
-    "crates/pf-encode",
-    "crates/pf-inject",
-    "crates/pf-vdisplay",
-    "crates/pf-win-display",
-    "crates/pf-zerocopy",
-    "crates/pf-frame",
-    "crates/pf-clipboard",
-    "crates/pf-gpu",
-    "crates/punktfunk-core",
-    "crates/pyrowave-sys",
-    "crates/libvpl-sys",
-    "crates/pf-driver-proto",
-    "crates/pf-host-config",
-    "crates/pf-paths",
-    "packaging/windows/drivers",
-]
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ci"))
+from cargo_graph import closure  # noqa: E402
 
-CLIENT_ONLY_ROOTS = [
-    "crates/pf-client-core", "crates/pf-presenter", "crates/pf-vkdecode",
-    "crates/pf-dxvadec", "crates/pf-vaapi", "crates/pf-console-ui",
-    "crates/pf-bitstream", "clients",
-]
+# The host scope is every local crate these binaries link on either OS with every feature on (no
+# dev-dependencies), plus the Windows drivers, which build in their own workspace.
+HOST_BINARIES = ["punktfunk-host", "punktfunk-encode-worker", "punktfunk-tray"]
+HOST_TRIPLES = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+EXTRA_HOST_ROOTS = ["packaging/windows/drivers"]
+
+
+def host_roots():
+    """Crate directories in the host scope, relative to the repo root (the cwd)."""
+    dirs = set()
+    for triple in HOST_TRIPLES:
+        meta = json.loads(subprocess.check_output(
+            ["cargo", "metadata", "--format-version", "1", "--locked", "--all-features",
+             "--filter-platform", triple], text=True))
+        ids = closure(meta, HOST_BINARIES, dev=False)
+        dirs |= {os.path.relpath(os.path.dirname(p["manifest_path"])).replace(os.sep, "/")
+                 for p in meta["packages"] if p["id"] in ids and p["source"] is None}
+    # A crate vendored inside another crate's directory is walked with its parent.
+    nested = {d for d in dirs if any(d.startswith(o + "/") for o in dirs)}
+    return sorted(dirs - nested) + EXTRA_HOST_ROOTS
 
 EXCLUDE_DIR_PARTS = {"target", ".claude", "node_modules", ".git"}
 
@@ -305,7 +302,7 @@ FENCE_ALLOW = re.compile(r'#!\s*\[\s*allow\s*\(\s*unsafe_op_in_unsafe_fn')
 FORBID = re.compile(r'#!\s*\[\s*forbid\s*\(\s*unsafe_code')
 REPRC = re.compile(r'#\s*\[\s*repr\s*\(\s*C')
 # NOTE: the `const _: () = { ... };` BLOCK form is as common in this tree as the direct
-# `const _: () = assert!(...)` form (18 files use it, incl. abi.rs, gamepad.rs and
+# `const _: () = assert!(...)` form (18 files use it, incl. the C ABI, gamepad.rs and
 # idd_push/probes.rs). An earlier version of this regex matched only the direct form and
 # therefore reported 102 unguarded repr(C) declarations where the true number is 60 —
 # it counted three well-guarded files as defenceless. Keep both alternatives.
@@ -451,7 +448,7 @@ def main():
     as_json = "--json" in sys.argv
     os.chdir(repo)
     allrecs = []
-    for root in HOST_ROOTS:
+    for root in host_roots():
         if not os.path.isdir(root): continue
         # crate entry points (a dir may hold several crates, e.g. packaging/windows/drivers)
         entries = []
@@ -523,10 +520,6 @@ def main():
     tnon = sum(v for k, v in tt.items() if not k.startswith("ffi_call"))
     print(f"  of which in #[cfg(test)]: ffi={tffi} nonFFI={tnon}")
     print(f"  SHIPPED non-FFI ops : {nonffi - tnon}   <-- PRIMARY METRIC (test code excluded)")
-    abi = [r for r in allrecs if r["path"].endswith("punktfunk-core/src/abi.rs")]
-    if abi:
-        a = sum(v for k, v in abi[0]["ops"].items() if not k.startswith("ffi_call"))
-        print(f"  minus abi.rs (client SDK C boundary, host uses it only in tests): {nonffi - tnon - a}")
 
     print()
     print("=" * 100)

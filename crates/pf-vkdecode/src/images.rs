@@ -25,12 +25,9 @@ use crate::caps::OUTPUT_USAGE;
 use crate::device::find_memory_type_preferring;
 use crate::device::AllocError;
 use crate::device::DecodeDevice;
+use crate::device::Unwind;
 
-/// Extra pictures the consumer may hold (delivered, unreleased) on top of
-/// the stream's DPB depth. Pool size is `required_slots + HOLD_HEADROOM`.
-/// 8 covers ~4–7 in-flight frames with one frame of slack; holding more
-/// is `NoFreeSlot`.
-pub const HOLD_HEADROOM: u32 = 8;
+pub use pf_bitstream::slots::HOLD_HEADROOM;
 
 /// Pool layout for one `(caps, required_slots)` pair. No GPU allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +80,37 @@ pub fn plan_pools(caps: &DecodeCaps, required_slots: u32) -> PoolPlan {
     }
 }
 
+/// Give the pool's pictures TRANSFER_SRC when the driver answers a query that asks for it
+/// on `format`. Some drivers report exactly the usage they were asked about, so the base
+/// negotiation's answer cannot vouch for a bit it never asked. `false` leaves the plan as is.
+///
+/// # Safety
+///
+/// `dev` wraps live handles ([`crate::DeviceHandles`] contract).
+pub(crate) unsafe fn allow_copy_out(
+    dev: &DecodeDevice,
+    profile: DecodeProfile,
+    plan: &mut PoolPlan,
+    format: vk::Format,
+) -> bool {
+    let usage = plan.picture_usage | vk::ImageUsageFlags::TRANSFER_SRC;
+    // SAFETY: fn contract; a physical-device query.
+    let answered = match unsafe { crate::caps::query_formats(dev, profile, usage) } {
+        Ok(formats) => formats.iter().any(|f| {
+            f.format == format
+                && f.image_usage.contains(usage)
+                && f.image_create_flags.contains(plan.picture_flags)
+                && f.image_tiling == vk::ImageTiling::OPTIMAL
+        }),
+        Err(_) => false,
+    };
+    if answered {
+        plan.picture_usage = usage;
+    }
+    tracing::debug!(?format, answered, "decode pictures copyable (TRANSFER_SRC)");
+    answered
+}
+
 pub(crate) struct Picture {
     /// Shared with the other pictures when a layered coincide pool backs them
     /// all with one array image.
@@ -128,6 +156,8 @@ pub(crate) struct PicturePool {
     /// (session caps are keyed by profile). `build_frame` stamps it onto
     /// each `DecodedVkFrame`.
     pub(crate) format: vk::Format,
+    /// The pictures carry TRANSFER_SRC ([`allow_copy_out`]).
+    pub(crate) copyable: bool,
     pub(crate) pictures: Vec<Picture>,
 }
 
@@ -151,6 +181,9 @@ impl PicturePool {
             images: Vec::new(),
             memory: Vec::new(),
             format: caps.output_format,
+            copyable: plan
+                .picture_usage
+                .contains(vk::ImageUsageFlags::TRANSFER_SRC),
             pictures: Vec::new(),
         };
         let families = dev.sharing_families();
@@ -403,47 +436,29 @@ unsafe fn create_video_image(
     } else {
         ci.sharing_mode(vk::SharingMode::EXCLUSIVE)
     };
+    // SAFETY: only the image and memory created below go in, before any use.
+    let mut unwind = unsafe { Unwind::new(dev.ash()) };
     // SAFETY: live device; `ci` roots a chain of locals outliving the call.
     let image = unsafe { dev.ash().create_image(&ci, None)? };
+    unwind.image = image;
     // SAFETY: `image` was just created on this device.
     let req = unsafe { dev.ash().get_image_memory_requirements(image) };
-    let props = dev.memory_properties();
     // DEVICE_LOCAL preferred; any type in `memoryTypeBits` is accepted (the
     // driver's placement contract, same as session bindings).
-    let type_index = match find_memory_type_preferring(
-        &props,
+    let type_index = find_memory_type_preferring(
+        &dev.memory_properties(),
         req.memory_type_bits,
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    ) {
-        Ok(index) => index,
-        Err(e) => {
-            // SAFETY: destroying the just-created, never-bound image.
-            unsafe { dev.ash().destroy_image(image, None) };
-            return Err(e);
-        }
-    };
+    )?;
     let alloc = vk::MemoryAllocateInfo::default()
         .allocation_size(req.size)
         .memory_type_index(type_index);
-    // SAFETY: live device; unwind destroys the unbound image so the error path
-    // leaks nothing.
-    let memory = match unsafe { dev.ash().allocate_memory(&alloc, None) } {
-        Ok(m) => m,
-        Err(e) => {
-            // SAFETY: destroying the just-created, never-bound image.
-            unsafe { dev.ash().destroy_image(image, None) };
-            return Err(e.into());
-        }
-    };
+    // SAFETY: live device; `alloc` is a local.
+    let memory = unsafe { dev.ash().allocate_memory(&alloc, None)? };
+    unwind.memory = memory;
     // SAFETY: fresh image + fresh memory of the required size.
-    if let Err(e) = unsafe { dev.ash().bind_image_memory(image, memory, 0) } {
-        // SAFETY: unwinding the two objects created above.
-        unsafe {
-            dev.ash().destroy_image(image, None);
-            dev.ash().free_memory(memory, None);
-        }
-        return Err(e.into());
-    }
+    unsafe { dev.ash().bind_image_memory(image, memory, 0)? };
+    unwind.disarm();
     Ok((image, memory))
 }
 
@@ -481,7 +496,8 @@ unsafe fn create_view(
 mod tests {
     use super::*;
     use crate::caps::derive_caps;
-    use crate::caps::RawH264Caps;
+    use crate::caps::MaxLevelIdc;
+    use crate::caps::RawCaps;
     use crate::caps::VideoFormat;
     use crate::caps::NV12;
 
@@ -494,7 +510,7 @@ mod tests {
             image_create_flags: vk::ImageCreateFlags::MUTABLE_FORMAT,
             ..Default::default()
         };
-        let raw = RawH264Caps {
+        let raw = RawCaps {
             capability_flags: if layered {
                 vk::VideoCapabilityFlagsKHR::empty()
             } else {
@@ -505,12 +521,20 @@ mod tests {
             } else {
                 vk::VideoDecodeCapabilityFlagsKHR::DPB_AND_OUTPUT_DISTINCT
             },
+            min_bitstream_buffer_offset_alignment: 0,
+            min_bitstream_buffer_size_alignment: 0,
+            picture_access_granularity: vk::Extent2D::default(),
+            min_coded_extent: vk::Extent2D::default(),
+            max_coded_extent: vk::Extent2D::default(),
+            max_dpb_slots: 0,
+            max_active_reference_pictures: 0,
+            max_level: MaxLevelIdc::H264(0),
+            std_header_version: vk::ExtensionProperties::default(),
             dpb_formats: vec![entry(DPB_USAGE)],
             output_formats: vec![entry(OUTPUT_USAGE)],
             coincide_formats: vec![entry(COINCIDE_USAGE)],
-            ..Default::default()
         };
-        derive_caps(&raw).unwrap()
+        derive_caps(&raw, NV12).unwrap()
     }
 
     #[test]

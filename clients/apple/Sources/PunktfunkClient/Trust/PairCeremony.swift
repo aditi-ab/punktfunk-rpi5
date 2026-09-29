@@ -1,6 +1,6 @@
-// The SPAKE2 PIN ceremony itself, with no opinion about how it's presented. Two screens run it:
-// `PairSheet` (the touch/desktop Form, and tvOS's focus-engine layout) and `GamepadPairView` (the
-// controller-driven console screen). The ceremony is the part that must not diverge between them —
+// The SPAKE2 PIN ceremony itself, with no opinion about how it's presented. Two callers run it:
+// `PairSheet` (the touch/desktop Form, and tvOS's focus-engine layout) and `ConsoleModel` (the
+// console's pair screen). The ceremony is the part that must not diverge between them —
 // it decides what counts as a wrong PIN, what a rejection means, and which failures are worth
 // telling the user apart — so it lives here once rather than being copied into the second caller.
 //

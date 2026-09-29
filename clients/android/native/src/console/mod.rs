@@ -12,157 +12,29 @@ mod egl;
 mod gpu;
 mod host;
 
-use host::{Cmd, ConsoleHost, Phase};
+use host::{Cmd, ConsoleHost};
 use jni::errors::LogErrorAndDefault;
 use jni::objects::{JByteArray, JObject, JString};
 use jni::sys::{jboolean, jfloat, jint, jlong};
 use jni::EnvUnowned;
 
-use crate::session::jni_guard;
-use pf_client_core::console::{PointerButton, PointerInput};
-use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuSample, PadBattery, PadInfo};
+use crate::session::{jni_guard, HandleTable};
+use pf_client_core::menu_nav::MenuSample;
+use pf_console_ui::bridge::{self, CreateOptions, EntryJson, MenuCode, PadsJson, PresetJson};
 use pf_console_ui::{
-    ConsoleEntry, ConsoleOptions, HostRow, Insets, Key, LibraryGame, LibraryPhase, PairPhase,
-    Platform, SnapshotStore, SpeedPhase, Stale, WakeStatus,
+    HostRow, Insets, LibraryGame, LibraryPhase, PairPhase, Platform, SpeedPhase, Stale, WakeStatus,
 };
-use punktfunk_core::config::GamepadPref;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 /// How long `nativeConsoleNextEvent` blocks at most — short enough that Kotlin's poll thread
 /// notices `running = false` promptly on teardown (the rumble poll's cadence).
 const EVENT_TIMEOUT: Duration = Duration::from_millis(100);
 
-/// What Kotlin hands `nativeConsoleCreate`.
-#[derive(serde::Deserialize)]
-struct CreateOptions {
-    device_name: String,
-    /// Skia's resource budget, bytes (Kotlin sizes it from `ActivityManager.memoryClass`).
-    gpu_cache_bytes: usize,
-    /// Whether the touch shell exists as a fallback (phones/tablets; false on a TV) —
-    /// gates the console-off settings row. Default false: absent means don't offer it.
-    #[serde(default)]
-    fallback_ui: bool,
-    /// Whether a real `video/av01` decoder exists (Kotlin's `MediaCodecList` answer, the
-    /// same one that sets the `CODEC_AV1` advertisement bit). Absent means don't claim the
-    /// device lacks it, so the codec row stays unmarked.
-    #[serde(default = "yes")]
-    av1_ok: bool,
-    /// The settings snapshot the shell starts from (`pf_client_core::trust::Settings` JSON).
-    settings: pf_client_core::trust::Settings,
-    /// The preset catalog as `[{id, name, overrides}, …]`.
-    #[serde(default)]
-    presets: Vec<PresetJson>,
-    /// The known-hosts records (`KnownHosts` JSON) — for building `punktfunk://` links.
-    #[serde(default)]
-    known_hosts: pf_client_core::trust::KnownHosts,
-    /// Where to start: `{"home": true}` or `{"library": <HostRow>}`.
-    #[serde(default)]
-    entry: EntryJson,
-    /// This device's screen and its safe area as landscape `[w, h]`, for the Aspect row.
-    /// Absent on a TV and from an older caller.
-    #[serde(default)]
-    screen: Option<(u32, u32)>,
-    #[serde(default)]
-    safe_area: Option<(u32, u32)>,
-}
+static CONSOLES: HandleTable<ConsoleHost> = HandleTable::new(0x2000_0000_0000_0001);
 
-/// `#[serde(default)]` for a bool an older caller may omit and that must read `true`.
-fn yes() -> bool {
-    true
-}
-
-#[derive(serde::Deserialize, Default)]
-struct EntryJson {
-    #[serde(default)]
-    library: Option<HostRow>,
-    /// The same row, plus a connect to its desktop before the first frame. `library`
-    /// wins if a caller sends both — a shelf is the safe half of the pair.
-    #[serde(default)]
-    stream: Option<HostRow>,
-}
-
-impl EntryJson {
-    fn into_entry(self) -> ConsoleEntry {
-        match (self.library, self.stream) {
-            (Some(h), _) => ConsoleEntry::Library(Box::new(h)),
-            (None, Some(h)) => ConsoleEntry::Stream(Box::new(h)),
-            (None, None) => ConsoleEntry::Home,
-        }
-    }
-}
-
-/// One controller as Kotlin describes it — `PadInfo` with the pref as its wire byte.
-#[derive(serde::Deserialize)]
-struct PadJson {
-    name: String,
-    key: String,
-    pref: u8,
-    #[serde(default)]
-    steam_virtual: bool,
-    #[serde(default)]
-    battery: Option<BatteryJson>,
-    /// `VID:PID · gamepad · dpad` — what the controllers screen prints under the name.
-    #[serde(default)]
-    detail: String,
-    #[serde(default)]
-    forwarded: bool,
-    #[serde(default)]
-    rumble: bool,
-}
-
-#[derive(serde::Deserialize)]
-struct BatteryJson {
-    percent: u8,
-    charging: bool,
-}
-
-#[derive(serde::Deserialize)]
-struct PadsJson {
-    #[serde(default)]
-    label: Option<String>,
-    /// The glyph style's pref as its wire byte; absent = keyboard glyphs.
-    #[serde(default)]
-    pref: Option<u8>,
-    #[serde(default)]
-    pads: Vec<PadJson>,
-}
-
-static NEXT_CONSOLE_HANDLE: AtomicU64 = AtomicU64::new(0x2000_0000_0000_0001);
-
-fn console_hosts() -> &'static Mutex<HashMap<jlong, Arc<ConsoleHost>>> {
-    static HOSTS: OnceLock<Mutex<HashMap<jlong, Arc<ConsoleHost>>>> = OnceLock::new();
-    HOSTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn insert_host(host: ConsoleHost) -> jlong {
-    let host = Arc::new(host);
-    let mut hosts = crate::session::lock_recover(console_hosts());
-    loop {
-        let handle = NEXT_CONSOLE_HANDLE.fetch_add(1, Ordering::Relaxed) as jlong;
-        if handle != 0 && !hosts.contains_key(&handle) {
-            hosts.insert(handle, host);
-            return handle;
-        }
-    }
-}
-
-fn host(handle: jlong) -> Option<Arc<ConsoleHost>> {
-    if handle == 0 {
-        return None;
-    }
-    crate::session::lock_recover(console_hosts())
-        .get(&handle)
-        .cloned()
-}
-
-fn remove_host(handle: jlong) -> Option<Arc<ConsoleHost>> {
-    if handle == 0 {
-        return None;
-    }
-    crate::session::lock_recover(console_hosts()).remove(&handle)
+/// A Kotlin `Int` code as the `u8` the bridge decoders read; out of range is unknown.
+fn code(v: jint) -> Option<u8> {
+    u8::try_from(v).ok()
 }
 
 fn json_arg<T: serde::de::DeserializeOwned>(env: &mut jni::Env, s: &JString) -> Option<T> {
@@ -189,7 +61,7 @@ macro_rules! json_pusher {
             json: JString,
         ) {
             env.with_env(|env| -> jni::errors::Result<()> {
-                if let (Some($h), Some($v)) = (host(handle), json_arg::<$ty>(env, &json)) {
+                if let (Some($h), Some($v)) = (CONSOLES.get(handle), json_arg::<$ty>(env, &json)) {
                     $apply;
                 }
                 Ok(())
@@ -210,41 +82,21 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleCrea
     options: JString,
 ) -> jlong {
     env.with_env(|env| -> jni::errors::Result<jlong> {
-        let Some(opts) = json_arg::<CreateOptions>(env, &options) else {
+        let Some(mut opts) = json_arg::<CreateOptions>(env, &options) else {
             return Ok(0);
         };
-        let store = Arc::new(SnapshotStore::new(
-            opts.settings,
-            opts.presets.into_iter().map(Into::into).collect(),
-        ));
-        store.set_known_hosts(opts.known_hosts);
-        let console_opts = ConsoleOptions {
-            device_name: opts.device_name,
-            deck: false,
-            fallback_ui: opts.fallback_ui,
-            // The same probe that gates the `CODEC_PYROWAVE` advertisement, so the codec
-            // row cannot offer a picture this GPU would never decode. Cached per process.
-            pyrowave_ok: crate::pyro::available(),
-            // MediaCodec's answer, from the side that owns the enumeration: the NDK has no
-            // codec list. Marks the codec row's AV1 value on a device the Hello never
-            // advertises AV1 for.
-            av1_ok: opts.av1_ok,
-            store: Some(store.clone()),
-            platform: Platform::Android,
-            gpu_cache_bytes: opts.gpu_cache_bytes.max(16 << 20),
-            screen: opts.screen.map(|full| pf_console_ui::DeviceScreen {
-                full,
-                safe: opts.safe_area.unwrap_or(full),
-            }),
-        };
-        let host = match ConsoleHost::start(console_opts, opts.entry.into_entry(), store) {
+        // The same probe that gates the `CODEC_PYROWAVE` advertisement, so the codec
+        // row cannot offer a picture this GPU would never decode. Cached per process.
+        opts.pyrowave_ok = crate::pyro::available();
+        let (console_opts, entry, store) = opts.into_console(Platform::Android);
+        let host = match ConsoleHost::start(console_opts, entry, store) {
             Ok(host) => host,
             Err(e) => {
                 log::error!("console: render thread spawn failed: {e}");
                 return Ok(0);
             }
         };
-        Ok(insert_host(host))
+        Ok(CONSOLES.insert(host))
     })
     .resolve::<LogErrorAndDefault>()
 }
@@ -258,7 +110,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleDest
     handle: jlong,
 ) {
     jni_guard((), || {
-        drop(remove_host(handle));
+        drop(CONSOLES.remove(handle));
     })
 }
 
@@ -272,18 +124,11 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleSurf
     surface: JObject,
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
-        let Some(h) = host(handle) else {
+        let Some(h) = CONSOLES.get(handle) else {
             return Ok(());
         };
-        // SAFETY: `env`/`surface` are valid JNI pointers for this call; the raw casts bridge the
-        // jni-sys version skew between the `jni` and vendored `ndk` crates (see nativeStartVideo).
-        let window = unsafe {
-            ndk::native_window::NativeWindow::from_surface(
-                env.get_raw() as *mut _,
-                surface.as_raw() as *mut _,
-            )
-        };
-        match window {
+        // SAFETY: Kotlin declares `surface` a non-null `Surface`.
+        match unsafe { crate::window_from_surface(env, &surface) } {
             Some(w) => h.shared.send(Cmd::SurfaceCreated(w)),
             None => log::error!("console: no ANativeWindow from Surface"),
         }
@@ -300,7 +145,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleSurf
     handle: jlong,
 ) {
     jni_guard((), || {
-        if let Some(h) = host(handle) {
+        if let Some(h) = CONSOLES.get(handle) {
             h.shared.send(Cmd::SurfaceChanged);
         }
     })
@@ -316,7 +161,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleSurf
     handle: jlong,
 ) {
     jni_guard((), || {
-        if let Some(h) = host(handle) {
+        if let Some(h) = CONSOLES.get(handle) {
             h.shared.destroy_surface_blocking();
         }
     })
@@ -336,7 +181,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleSetV
     scale: jfloat,
 ) {
     jni_guard((), || {
-        if let Some(h) = host(handle) {
+        if let Some(h) = CONSOLES.get(handle) {
             h.shared.send(Cmd::Viewport {
                 insets: Insets {
                     left: left.max(0.0),
@@ -366,7 +211,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsolePadS
     dpad: jint,
 ) {
     jni_guard((), || {
-        if let Some(h) = host(handle) {
+        if let Some(h) = CONSOLES.get(handle) {
             let bit = |v: jint, i: u32| v & (1 << i) != 0;
             h.shared.send(Cmd::PadSample(MenuSample {
                 buttons: [
@@ -388,7 +233,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsolePadS
 /// `NativeBridge.nativeConsoleMenu(handle, event)` — a discrete menu event, for input that is
 /// already an event on the Kotlin side (a TV remote's D-pad `KeyEvent`s, the touch escape hatch):
 /// 0..3 = move up/down/left/right, 4 confirm, 5 back, 6 secondary (Y), 7 tertiary (X),
-/// 8 jump back (L1), 9 jump forward (R1).
+/// 8 jump back (L1), 9 jump forward (R1), 10/11 a remote's OK down/up (acts on release, held
+/// it is the card's menu).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleMenu(
     _env: EnvUnowned,
@@ -397,22 +243,16 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleMenu
     event: jint,
 ) {
     jni_guard((), || {
-        let ev = match event {
-            0 => MenuEvent::Move(MenuDir::Up),
-            1 => MenuEvent::Move(MenuDir::Down),
-            2 => MenuEvent::Move(MenuDir::Left),
-            3 => MenuEvent::Move(MenuDir::Right),
-            4 => MenuEvent::Confirm,
-            5 => MenuEvent::Back,
-            6 => MenuEvent::Secondary,
-            7 => MenuEvent::Tertiary,
-            8 => MenuEvent::JumpBack,
-            9 => MenuEvent::JumpForward,
-            _ => return,
+        let (Some(h), Some(code)) = (
+            CONSOLES.get(handle),
+            code(event).and_then(bridge::menu_code),
+        ) else {
+            return;
         };
-        if let Some(h) = host(handle) {
-            h.shared.send(Cmd::Menu(ev));
-        }
+        h.shared.send(match code {
+            MenuCode::Ok(down) => Cmd::Ok(down),
+            MenuCode::Menu(ev) => Cmd::Menu(ev),
+        });
     })
 }
 
@@ -431,36 +271,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsolePoin
     dy: jfloat,
 ) {
     jni_guard((), || {
-        let input = match kind {
-            0 => PointerInput::Move { x, y },
-            1 => PointerInput::Down {
-                x,
-                y,
-                button: PointerButton::Primary,
-                touch: false,
-            },
-            2 => PointerInput::Up {
-                x,
-                y,
-                button: PointerButton::Primary,
-            },
-            3 => PointerInput::Down {
-                x,
-                y,
-                button: PointerButton::Secondary,
-                touch: false,
-            },
-            4 => PointerInput::Wheel { x, y, dy },
-            5 => PointerInput::Cancel,
-            6 => PointerInput::Down {
-                x,
-                y,
-                button: PointerButton::Primary,
-                touch: true,
-            },
-            _ => return,
-        };
-        if let Some(h) = host(handle) {
+        let input = code(kind).and_then(|kind| bridge::pointer_code(kind, x, y, dy));
+        if let (Some(h), Some(input)) = (CONSOLES.get(handle), input) {
             h.shared.send(Cmd::Pointer(input));
         }
     })
@@ -479,23 +291,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleKey(
     repeat: jboolean,
 ) {
     jni_guard((), || {
-        let key = match key {
-            0 => Key::Left,
-            1 => Key::Right,
-            2 => Key::Up,
-            3 => Key::Down,
-            4 => Key::Return,
-            5 => Key::Space,
-            6 => Key::Escape,
-            7 => Key::Backspace,
-            8 => Key::PageUp,
-            9 => Key::PageDown,
-            10 => Key::Tab,
-            11 => Key::Y,
-            12 => Key::X,
-            _ => return,
-        };
-        if let Some(h) = host(handle) {
+        if let (Some(h), Some(key)) = (CONSOLES.get(handle), code(key).and_then(bridge::key_code)) {
             h.shared.send(Cmd::Key { key, shift, repeat });
         }
     })
@@ -511,7 +307,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleText
     text: JString,
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
-        if let (Some(h), Ok(t)) = (host(handle), text.try_to_string(env)) {
+        if let (Some(h), Ok(t)) = (CONSOLES.get(handle), text.try_to_string(env)) {
             h.shared.send(Cmd::Text(t));
         }
         Ok(())
@@ -531,19 +327,14 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleSess
     message: JString,
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
-        let Some(h) = host(handle) else {
+        let Some(h) = CONSOLES.get(handle) else {
             return Ok(());
         };
+        // Decoded on the render thread: `SessionPhase` borrows the message.
         let msg = message.try_to_string(env).unwrap_or_default();
-        let ph = match phase {
-            0 => Phase::Connecting,
-            1 => Phase::Streaming,
-            2 => Phase::Failed(msg),
-            3 => Phase::Ended((!msg.is_empty()).then_some(msg)),
-            4 => Phase::Reconnecting(msg),
-            _ => return Ok(()),
-        };
-        h.shared.send(Cmd::Phase(ph));
+        if let Some(phase) = code(phase) {
+            h.shared.send(Cmd::Phase(phase, msg));
+        }
         Ok(())
     })
     .resolve::<LogErrorAndDefault>()
@@ -561,32 +352,14 @@ json_pusher!(
 /// `NativeBridge.nativeConsoleSetPads(handle, padsJson)` — the connected controllers for the
 /// chip, the settings rows and the controllers screen: `{"label": "DualSense", "pref": 1,
 /// "pads": [{name, key, pref, steam_virtual, battery: {percent, charging} | null, detail,
-/// forwarded, rumble}]}`.
+/// forwarded, rumble}], "others": [{name, kind, detail}]}`.
     Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleSetPads,
     PadsJson,
     |h, p| {
-        let pads = p
-            .pads
-            .into_iter()
-            .map(|j| PadInfo {
-                name: j.name,
-                key: j.key,
-                pref: GamepadPref::from_u8(j.pref),
-                steam_virtual: j.steam_virtual,
-                battery: j.battery.map(|b| PadBattery {
-                    percent: b.percent.min(100),
-                    charging: b.charging,
-                }),
-                detail: j.detail,
-                forwarded: j.forwarded,
-                rumble: j.rumble,
-            })
-            .collect();
-        h.shared.send(Cmd::Pads {
-            label: p.label,
-            pref: p.pref.map(GamepadPref::from_u8),
-            pads,
-        })
+        let mut p = p;
+        h.handles.console.set_other_devices(p.take_others());
+        let (label, pref, pads) = p.into_pads();
+        h.shared.send(Cmd::Pads { label, pref, pads })
     }
 );
 
@@ -601,7 +374,10 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleNext
     handle: jlong,
 ) -> JString<'local> {
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
-        let out = match host(handle).and_then(|h| h.shared.next_event(EVENT_TIMEOUT)) {
+        let out = match CONSOLES
+            .get(handle)
+            .and_then(|h| h.shared.next_event(EVENT_TIMEOUT))
+        {
             Some(ev) => ev.to_json(),
             None => String::new(),
         };
@@ -619,7 +395,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleDrai
     handle: jlong,
 ) -> JString<'local> {
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
-        let out = match host(handle) {
+        let out = match CONSOLES.get(handle) {
             Some(h) => {
                 let cmds = h.handles.bus.drain();
                 serde_json::to_string(&cmds).unwrap_or_else(|_| "[]".into())
@@ -669,7 +445,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleAdva
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
         if let (Some(h), Ok(k), Some(p)) = (
-            host(handle),
+            CONSOLES.get(handle),
             key.try_to_string(env),
             json_arg::<SpeedPhase>(env, &json),
         ) {
@@ -689,7 +465,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleNoti
     text: JString,
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
-        if let (Some(h), Ok(t)) = (host(handle), text.try_to_string(env)) {
+        if let (Some(h), Ok(t)) = (CONSOLES.get(handle), text.try_to_string(env)) {
             h.handles.console.set_notice(t);
         }
         Ok(())
@@ -707,11 +483,27 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleLibr
     handle: jlong,
 ) {
     jni_guard((), || {
-        if let Some(h) = host(handle) {
+        if let Some(h) = CONSOLES.get(handle) {
             h.handles.library.begin_fetch();
         }
     })
 }
+
+json_pusher!(
+/// `NativeBridge.nativeConsoleSetPadTest(handle, json)` — `{"held": [..], "axes": [[name, v]]}`,
+/// the pad's reading while `ConsoleCmd::PadTest` is on.
+    Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleSetPadTest,
+    pf_console_ui::PadTestState,
+    |h, v| h.handles.console.set_pad_test(v)
+);
+
+json_pusher!(
+/// `NativeBridge.nativeConsoleSetLicenses(handle, json)` — `[{"heading", "text"}]`, what this app
+/// bundles; the answer to `ConsoleCmd::LoadLicenses`.
+    Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleSetLicenses,
+    Vec<pf_console_ui::LicenseSection>,
+    |h, v| h.handles.console.set_licenses(v)
+);
 
 json_pusher!(
 /// `NativeBridge.nativeConsoleLibraryPhase(handle, json)` — `"Loading"`, `"Empty"`, `"Ready"`,
@@ -732,7 +524,10 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleLibr
     cached: jboolean,
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
-        if let (Some(h), Some(games)) = (host(handle), json_arg::<Vec<LibraryGame>>(env, &json)) {
+        if let (Some(h), Some(games)) = (
+            CONSOLES.get(handle),
+            json_arg::<Vec<LibraryGame>>(env, &json),
+        ) {
             if cached {
                 h.handles.library.set_games_cached(games);
             } else {
@@ -755,7 +550,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleLibr
     bytes: JByteArray,
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
-        let Some(h) = host(handle) else {
+        let Some(h) = CONSOLES.get(handle) else {
             return Ok(());
         };
         let id = id.try_to_string(env)?;
@@ -783,12 +578,10 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleLibr
     stale: jint,
 ) {
     jni_guard((), || {
-        if let Some(h) = host(handle) {
-            h.handles.library.set_stale(match stale {
-                1 => Stale::Waking,
-                2 => Stale::Offline,
-                _ => Stale::No,
-            });
+        if let Some(h) = CONSOLES.get(handle) {
+            h.handles
+                .library
+                .set_stale(code(stale).map_or(Stale::No, bridge::stale_code));
         }
     })
 }
@@ -808,26 +601,6 @@ json_pusher!(
     Vec<PresetJson>,
     |h, p| h.store.set_presets(p.into_iter().map(Into::into).collect())
 );
-
-/// One catalog entry as Kotlin sends it. `overrides` is the console's settings encoding;
-/// an overlay the console cannot read leaves that one preset unmarked, not the catalog empty.
-#[derive(serde::Deserialize)]
-struct PresetJson {
-    id: String,
-    name: String,
-    #[serde(default)]
-    overrides: serde_json::Value,
-}
-
-impl From<PresetJson> for pf_console_ui::store::PresetEntry {
-    fn from(p: PresetJson) -> Self {
-        pf_console_ui::store::PresetEntry {
-            id: p.id,
-            name: p.name,
-            overrides: serde_json::from_value(p.overrides).unwrap_or_default(),
-        }
-    }
-}
 
 json_pusher!(
 /// `NativeBridge.nativeConsoleSetKnownHosts(handle, json)` — the known-hosts records

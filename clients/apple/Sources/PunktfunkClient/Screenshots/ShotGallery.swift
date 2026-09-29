@@ -320,7 +320,7 @@ struct ShotHostPage: View {
     }
 }
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 /// The Library tab on the mock catalog, every section filled, inside the real tab bar. The
 /// layout and favorites are the scene's own, so a capture never writes the device's.
 struct ShotLibrarySections: View {
@@ -369,9 +369,23 @@ struct ShotLibraryTouch: View {
     }
 }
 
-/// The Library with its host filter over the mock hosts, on the mock catalog.
+/// The Library with its host filter over the mock hosts, on the mock catalog, in the app's own
+/// frame: the Mac shell's Library row, the iOS Library tab.
 struct ShotLibraryFilter: View {
     var body: some View {
+        #if os(macOS)
+        MacShellView(
+            store: ShotMock.pageStore, selection: .constant(.library), hosts: EmptyView(),
+            onLaunch: { _, _ in }, onConnectShelf: { _ in }, onConnectHost: { _ in },
+            libraryShotPhase: .catalog(ShotMock.games, running: ["steam:starfall"]))
+        #elseif os(iOS) || os(visionOS)
+        ShotTouchTabs(selection: .library) { Color.clear } library: { library }
+        #else
+        library
+        #endif
+    }
+
+    private var library: some View {
         LibraryTabView(
             store: ShotMock.pageStore, onLaunch: { _, _ in }, onConnectShelf: { _ in },
             onConnectHost: { _ in }, showHosts: {},
@@ -399,7 +413,7 @@ struct ShotLibraryFilter: View {
         .preferredColorScheme(.dark)
 }
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 #Preview("Library tab") {
     ShotLibrarySections()
         .preferredColorScheme(.dark)

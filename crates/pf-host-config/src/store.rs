@@ -118,9 +118,35 @@ pub fn mark_started() {
     let _ = STARTED.set(snapshot());
 }
 
-/// A raw `PUNKTFUNK_*` read that also sees the console. For a registry row: the env value when
-/// env set the row, else the console's value spelled as the env var would be, else `None`, so a
-/// reader keeps its own default and its own grammar. Any other name reads the environment.
+/// A Bool row's value in force, in the registry's one grammar: the value the console shows.
+pub fn row_bool(env: &str) -> bool {
+    row_bool_in(&snapshot().settings, env)
+}
+
+/// A tri-state (`auto`/`on`/`off`) row's value in force; `None` is auto.
+pub fn row_tri(env: &str) -> Option<bool> {
+    row_tri_in(&snapshot().settings, env)
+}
+
+pub(crate) fn row_bool_in(rows: &[Resolved], env: &str) -> bool {
+    rows.iter()
+        .find(|r| r.setting.env == env)
+        .and_then(|r| r.value.as_bool())
+        .unwrap_or_default()
+}
+
+pub(crate) fn row_tri_in(rows: &[Resolved], env: &str) -> Option<bool> {
+    match rows.iter().find(|r| r.setting.env == env)?.value.as_str() {
+        Some("on") => Some(true),
+        Some("off") => Some(false),
+        _ => None,
+    }
+}
+
+/// A raw `PUNKTFUNK_*` read that also sees the console, for numeric, text and enum rows: the
+/// env value when env set the row, else the console's value spelled as the env var would be,
+/// else `None`, so the reader keeps its own default. Any other name reads the environment.
+/// Bool and tri-state rows read through [`row_bool`] and [`row_tri`].
 pub fn knob(name: &str) -> Option<String> {
     knob_in(&snapshot().settings, name)
 }
@@ -177,12 +203,22 @@ fn pending_between(start: &Snapshot, now: &Snapshot) -> Vec<&'static str> {
 /// before writing anything.
 pub fn save(patch: &Map<String, Value>) -> Result<(), SaveError> {
     let _w = WRITE.lock().unwrap_or_else(PoisonError::into_inner);
-    let path = store_path();
-    let mut file = load_file(&path);
-    apply_patch(&mut file, patch)?;
-    write_file(&path, &file).map_err(SaveError::Io)?;
+    merge_into(&store_path(), patch)?;
     reload();
     Ok(())
+}
+
+/// [`save`] into the store at `path`, without reloading this process. The installer writes a
+/// host's store this way before the host runs.
+pub fn save_at(path: &Path, patch: &Map<String, Value>) -> Result<(), SaveError> {
+    let _w = WRITE.lock().unwrap_or_else(PoisonError::into_inner);
+    merge_into(path, patch)
+}
+
+fn merge_into(path: &Path, patch: &Map<String, Value>) -> Result<(), SaveError> {
+    let mut file = load_file(path);
+    apply_patch(&mut file, patch)?;
+    write_file(path, &file).map_err(SaveError::Io)
 }
 
 fn apply_patch(file: &mut Map<String, Value>, patch: &Map<String, Value>) -> Result<(), SaveError> {
@@ -210,13 +246,8 @@ fn apply_patch(file: &mut Map<String, Value>, patch: &Map<String, Value>) -> Res
 }
 
 fn write_file(path: &Path, file: &Map<String, Value>) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        pf_paths::create_private_dir(dir)?;
-    }
     let bytes = serde_json::to_vec_pretty(file).map_err(std::io::Error::other)?;
-    let tmp = path.with_extension("json.tmp");
-    pf_paths::write_secret_file(&tmp, &bytes)?;
-    std::fs::rename(&tmp, path)
+    pf_paths::replace_secret_file(path, &bytes)
 }
 
 /// Every key, unknown ones included, so a save from an older host keeps a newer host's keys.
@@ -499,6 +530,86 @@ mod tests {
             "at its default the reader decides"
         );
         assert_eq!(knob_in(&rows, "PUNKTFUNK_NOT_A_KNOB"), None);
+    }
+
+    #[test]
+    fn typed_rows_read_the_value_the_console_shows() {
+        let file = obj(json!({"instant_replay_pause": "on", "pen": false}));
+        let env = env_of(&[
+            ("PUNKTFUNK_STEAM_GADGET", "auto"),
+            ("PUNKTFUNK_SESSION_WATCH", "TRUE"),
+            ("PUNKTFUNK_PAD_AUDIO", "no"),
+            ("PUNKTFUNK_UPDATE_CHECK", " off "),
+            ("PUNKTFUNK_DUALSENSE_USBIP", "Yes"),
+        ]);
+        let rows = resolve(&env, &file, &[]);
+        let row_tri = |k: &str| row_tri_in(&rows, k);
+        let row_bool = |k: &str| row_bool_in(&rows, k);
+        assert_eq!(row_tri("PUNKTFUNK_INSTANT_REPLAY_PAUSE"), Some(true));
+        assert_eq!(
+            row_tri("PUNKTFUNK_STEAM_GADGET"),
+            None,
+            "auto defers to the host"
+        );
+        assert_eq!(row_tri("PUNKTFUNK_SESSION_WATCH"), Some(true));
+        assert_eq!(row_tri("PUNKTFUNK_GAMESCOPE_BIND"), None);
+        assert!(!row_bool("PUNKTFUNK_PEN") && !row_bool("PUNKTFUNK_PAD_AUDIO"));
+        assert!(!row_bool("PUNKTFUNK_UPDATE_CHECK"));
+        assert!(row_bool("PUNKTFUNK_DUALSENSE_USBIP"));
+        assert!(row_bool("PUNKTFUNK_MDNS"), "a default is the row's own");
+        let cfg = build(
+            &env_of(&[
+                ("PUNKTFUNK_GAMESCOPE_VRR", "false"),
+                ("PUNKTFUNK_AUDIO_REDUNDANCY", "auto"),
+            ]),
+            &Map::new(),
+            &[],
+        )
+        .config;
+        assert!(!cfg.gamescope_vrr);
+        assert_eq!(cfg.audio_redundancy, None);
+    }
+
+    /// A Bool or tri-state row reads through `row_bool`/`row_tri`, never a raw-string reader
+    /// with a grammar of its own that the console does not share.
+    #[test]
+    fn typed_rows_are_read_through_the_typed_readers() {
+        let mut stack = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("..")];
+        let mut typed_calls = 0;
+        while let Some(p) = stack.pop() {
+            if p.is_dir() {
+                stack.extend(std::fs::read_dir(&p).unwrap().map(|e| e.unwrap().path()));
+                continue;
+            }
+            if p.extension().is_none_or(|x| x != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&p).unwrap();
+            for (i, _) in text.match_indices("\"PUNKTFUNK_") {
+                let name = text[i + 1..].split('"').next().unwrap();
+                let call = text[..i].trim_end();
+                let row = SETTINGS.iter().find(|s| s.env == name);
+                let is_bool = row.is_some_and(|s| s.kind == registry::Kind::Bool);
+                let is_tri = row.is_some_and(|s| s.kind == registry::TRI);
+                let at = p.display();
+                if call.ends_with("row_bool(") {
+                    assert!(is_bool, "{at}: {name} is not a Bool row");
+                    typed_calls += 1;
+                } else if call.ends_with("row_tri(") {
+                    assert!(is_tri, "{at}: {name} is not a tri-state row");
+                    typed_calls += 1;
+                } else if ["knob(", "on(", "val(", "flag("]
+                    .iter()
+                    .any(|c| call.ends_with(c))
+                {
+                    assert!(
+                        !is_bool && !is_tri,
+                        "{at}: read {name} with row_bool/row_tri"
+                    );
+                }
+            }
+        }
+        assert!(typed_calls > 10, "the scan found the workspace");
     }
 
     #[test]

@@ -50,9 +50,8 @@ pub fn saved_request(k: &trust::KnownHost) -> ConnectRequest {
         name: k.name.clone(),
         addr: k.addr.clone(),
         port: k.port,
-        // `None`, not `Some("")`, for a record saved by address and never paired: the connect
-        // gate reads `Some` as "we hold a pin" and would skip the trust ceremony, then hand the
-        // child an empty `--fp` it refuses. Same shape the Discovered arm already uses.
+        // `None` for a record saved by address and never paired, so `card_key` keys it by
+        // address. Same shape the Discovered arm already uses.
         fp_hex: (!k.fp_hex.is_empty()).then(|| k.fp_hex.clone()),
         pair_optional: false,
         launch: None,
@@ -794,18 +793,10 @@ fn is_hex_colour(s: &str) -> bool {
     s.len() == 7 && s.starts_with('#') && s[1..].chars().all(|c| c.is_ascii_hexdigit())
 }
 
-fn saved_key(h: &KnownHost) -> String {
-    if h.fp_hex.is_empty() {
-        format!("{}:{}", h.addr, h.port)
-    } else {
-        h.fp_hex.clone()
-    }
-}
-
 pub struct HostsPage {
     adverts: HashMap<String, DiscoveredHost>,
     /// Saved hosts proven reachable by the periodic QUIC probe (mDNS-independent), keyed by
-    /// [`saved_key`]. OR'd with live-advert presence to drive the Online pip.
+    /// [`KnownHost::card_key`]. OR'd with live-advert presence to drive the Online pip.
     probed: HashMap<String, bool>,
     connecting: Option<String>,
     saved: FactoryVecDeque<HostCard>,
@@ -1006,7 +997,9 @@ impl SimpleComponent for HostsPage {
         console_btn.set_tooltip_text(Some("Console UI — the controller-driven couch interface"));
         console_btn.set_action_name(Some("win.console"));
         let menu = gio::Menu::new();
-        menu.append(Some("Console UI"), Some("win.console"));
+        if cfg!(feature = "console") {
+            menu.append(Some("Console UI"), Some("win.console"));
+        }
         menu.append(Some("Preferences"), Some("win.preferences"));
         menu.append(Some("Keyboard Shortcuts"), Some("win.shortcuts"));
         menu.append(Some("About Punktfunk"), Some("win.about"));
@@ -1018,7 +1011,9 @@ impl SimpleComponent for HostsPage {
             .build();
         // Packed after the menu so the hamburger stays rightmost (pack_end fills inward).
         header.pack_end(&menu_btn);
-        header.pack_end(&console_btn);
+        if cfg!(feature = "console") {
+            header.pack_end(&console_btn);
+        }
 
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&header);
@@ -1069,7 +1064,7 @@ impl SimpleComponent for HostsPage {
                             .spawn(move || {
                                 let results = crate::trust::probe_known(&hosts, PROBE_TIMEOUT);
                                 let map: HashMap<String, bool> =
-                                    hosts.iter().map(saved_key).zip(results).collect();
+                                    hosts.iter().map(KnownHost::card_key).zip(results).collect();
                                 let _ = tx.send_blocking(map);
                             })
                             .expect("spawn probe thread");
@@ -1281,7 +1276,7 @@ impl HostsPage {
                 // sends no goodbye for, so counting it kept a sleeping machine's pip green — and
                 // the wake gate reads `!online`, which is how Wake-on-LAN stayed silent for
                 // exactly the host it was meant to wake.
-                let online = self.probed.get(&saved_key(k)).copied().unwrap_or(false);
+                let online = self.probed.get(&k.card_key()).copied().unwrap_or(false);
                 // Learn what this host's live advert teaches: its wake MAC(s), its OS chain (so
                 // the icon survives it going offline), its management port, and an address the
                 // probe sweep asks — the card moves there only once its pin answers.
@@ -1309,10 +1304,9 @@ impl HostsPage {
                     pf_client_core::host_actions::refresh(&k.addr, mgmt, &k.fp_hex);
                 }
                 saved.push_back(HostCard {
-                    // `saved_key`, the same key `ConnectRequest::card_key` mints — a bare
-                    // `fp_hex` is empty for an unpaired record, so it matched every other
-                    // unpaired card and none of them was the one clicked.
-                    connecting: self.connecting.as_deref() == Some(saved_key(k).as_str()),
+                    // The key `ConnectRequest::card_key` mints. A bare `fp_hex` is empty for
+                    // every unpaired record.
+                    connecting: self.connecting.as_deref() == Some(k.card_key().as_str()),
                     kind: CardKind::Saved {
                         host: k.clone(),
                         online,
@@ -1603,22 +1597,10 @@ impl HostsPage {
             let (id, addr, port) = (id.map(str::to_string), addr.to_string(), port);
             dialog.connect_response(Some("remove"), move |_, _| {
                 let mut known = KnownHosts::load();
-                let target = known.index_of_card(id.as_deref(), &addr, port);
-                let gone = target.and_then(|i| known.hosts[i].id.clone());
-                // The cached game catalog is keyed by fingerprint and outlives the record
-                // otherwise: forgetting a host must not leave its title list on disk.
-                if let Some(fp) = target.map(|i| known.hosts[i].fp_hex.clone()) {
-                    pf_client_core::library_cache::forget(&fp);
-                }
-                known.remove_card(id.as_deref(), &addr, port);
-                if let Err(e) = known.save() {
-                    let _ = sender.output(HostsOutput::Toast(format!("Couldn't save — {e:#}")));
-                }
-                // The resolver already ignores a dangling pointer, so this is hygiene: without
-                // it a later re-pair of a different box would inherit somebody's old choice.
-                let mut settings = trust::Settings::load();
-                if start::clear_default(&mut settings, gone.as_deref()) {
-                    settings.save();
+                if let Some(i) = known.index_of_card(id.as_deref(), &addr, port) {
+                    if let Err(e) = pf_client_core::orchestrate::forget_host(&mut known, i) {
+                        let _ = sender.output(HostsOutput::Toast(format!("Couldn't save — {e:#}")));
+                    }
                 }
                 sender.input(HostsMsg::Refresh);
             });

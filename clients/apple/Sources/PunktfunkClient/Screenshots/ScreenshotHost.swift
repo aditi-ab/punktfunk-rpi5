@@ -19,6 +19,7 @@ import SwiftUI
 #if os(macOS)
 import AppKit
 import ImageIO
+import ScreenCaptureKit
 #endif
 
 @MainActor
@@ -45,7 +46,7 @@ struct ScreenshotHostView: View {
 
     init(scene: ShotScene) {
         self.scene = scene
-        // Pin the palette for the capture. The aurora screens read the LIVE `uiPalette` default,
+        // Pin the palette for the capture. The console reads the LIVE `uiPalette` default,
         // and a reused Simulator (or a dev Mac) carries whatever was last picked there — the
         // Apple TV set once shipped out on a sunset palette that a test device had persisted.
         // Idempotent, and only ever runs in shot mode (this view exists behind that gate).
@@ -53,38 +54,20 @@ struct ScreenshotHostView: View {
             ProcessInfo.processInfo.environment["PUNKTFUNK_SHOT_PALETTE"] ?? "violet",
             forKey: DefaultsKey.uiPalette)
     }
-    #if os(iOS)
-    @Environment(\.horizontalSizeClass) private var hSizeClass
-    @Environment(\.verticalSizeClass) private var vSizeClass
-    #endif
-
-    /// The gamepad UI's form-metric tier, published here for the same reason ContentView does it:
-    /// this harness mounts those screens DIRECTLY, with no ContentView in the tree, so without it
-    /// an iPad capture renders every gamepad screen at iPhone scale — a capture that doesn't look
-    /// like the app.
-    private var gamepadMetrics: GamepadFormMetrics {
-        #if os(iOS)
-        .forWindow(h: hSizeClass, v: vSizeClass)
-        #else
-        .platformDefault
-        #endif
-    }
-
     var body: some View {
         scene.make()
             .environment(\.colorScheme, scene.colorScheme)
-            .environment(\.gamepadMetrics, gamepadMetrics)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             // The scene keeps its safe area, so the HUD clears the Dynamic Island; the streamed
             // frame ignores it itself. Black matches the dark iOS window. tvOS and macOS keep the
             // system backdrop and window background the real app sits on.
-            #if os(iOS)
+            #if os(iOS) || os(visionOS)
             .background(Color.black.ignoresSafeArea())
             #endif
             #if os(macOS)
             .background(MacShotWindowConfigurator(scene: scene))
-            #elseif os(iOS)
-            .background(IOSOrientationConfigurator(orientation: scene.orientation))
+            #elseif os(iOS) || os(visionOS)
+            .background(IOSOrientationConfigurator(orientation: orientation))
             #endif
             .task {
                 // Let layout + materials settle, then signal the driver. PUNKTFUNK_SHOT_DELAY
@@ -97,8 +80,30 @@ struct ScreenshotHostView: View {
             }
     }
 
+    #if os(iOS) || os(visionOS)
+    /// PUNKTFUNK_SHOT_ORIENTATION=landscape turns every scene: the iPad set is landscape.
+    private var orientation: ShotOrientation {
+        ProcessInfo.processInfo.environment["PUNKTFUNK_SHOT_ORIENTATION"] == "landscape"
+            ? .landscape : scene.orientation
+    }
+    #endif
+
     private func announceReady() {
         print("PF_SHOT_READY scene=\(scene.name)")
+        #if os(iOS) || os(visionOS)
+        // The window in pixels. A landscape iPad app in a portrait simulator is drawn scaled to
+        // fit, and the driver crops the screenshot to it.
+        if let window = UIApplication.shared.connectedScenes
+            .compactMap({ ($0 as? UIWindowScene)?.keyWindow }).first {
+            #if os(visionOS)
+            let scale = window.traitCollection.displayScale
+            #else
+            let scale = window.screen.scale
+            #endif
+            print("PF_SHOT_WINDOW_PX \(Int(window.bounds.width * scale)) "
+                + "\(Int(window.bounds.height * scale))")
+        }
+        #endif
         fflush(stdout)
         #if os(macOS)
         MacSelfCapture.captureIfRequested(scene: scene)
@@ -165,10 +170,10 @@ private struct MacShotWindowConfigurator: NSViewRepresentable {
 }
 
 /// PUNKTFUNK_SHOT_SELFCAPTURE=<dir>: once the scene is ready the app captures its own windows
-/// through the window server and exits. A process may always read its own windows, so there is
-/// no Screen Recording grant, and materials come out as on screen. Only this process's windows go
-/// in, front to back over the canvas: sheets and the Settings window land in the shot, the menu
-/// bar, the desktop and other apps do not.
+/// through ScreenCaptureKit and exits. A process may capture its own windows without a Screen
+/// Recording grant (macOS 14.4+), and materials come out as on screen. Only this process's
+/// windows go in, front to back over the canvas: sheets and the Settings window land in the
+/// shot, the menu bar, the desktop and other apps do not.
 enum MacSelfCapture {
     /// The canvas in the top-left global space, set by the window configurator.
     static var canvas: CGRect?
@@ -179,26 +184,86 @@ enum MacSelfCapture {
         let outDir = URL(fileURLWithPath: (dir as NSString).expandingTildeInPath, isDirectory: true)
         try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
         let url = outDir.appendingPathComponent("\(ShotDevice.mac.id)-\(scene.name).png")
-        let pid = ProcessInfo.processInfo.processIdentifier
-        let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID)
-            as? [[String: Any]] ?? []
-        let ids = windows.filter { ($0[kCGWindowOwnerPID as String] as? pid_t) == pid }
-            .compactMap { $0[kCGWindowNumber as String] as? CGWindowID }
-        // The list holds raw window numbers in pointer slots; bridged NSNumbers yield no image.
-        var slots = ids.map { UnsafeRawPointer(bitPattern: UInt($0)) }
-        if let list = CFArrayCreate(nil, &slots, slots.count, nil),
-           let shot = CGImage(windowListFromArrayScreenBounds: canvas ?? .null,
-                              windowArray: list, imageOption: [.bestResolution]),
-           let flat = flatten(shot),
-           let dest = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) {
-            CGImageDestinationAddImage(dest, flat, nil)
-            CGImageDestinationFinalize(dest)
-            print("PF_SHOT_SAVED \(url.path) \(flat.width)x\(flat.height)px")
-        } else {
-            print("PF_SHOT_CAPTURE_FAILED scene=\(scene.name) windows=\(ids.count)")
+        Task { @MainActor in
+            // The front sheet takes key, as a click would: an unkeyed sheet draws grey buttons.
+            if let sheet = NSApp.orderedWindows.first(where: { $0.isVisible && $0.sheetParent != nil }) {
+                sheet.makeKey()
+                try? await Task.sleep(nanoseconds: 300_000_000)
+            }
+            let (shot, windows) = await captureOwnWindows()
+            if let shot, let flat = flatten(shot),
+               let dest = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) {
+                CGImageDestinationAddImage(dest, flat, nil)
+                CGImageDestinationFinalize(dest)
+                print("PF_SHOT_SAVED \(url.path) \(flat.width)x\(flat.height)px")
+            } else {
+                print("PF_SHOT_CAPTURE_FAILED scene=\(scene.name) windows=\(windows)")
+            }
+            fflush(stdout)
+            exit(0)
         }
-        fflush(stdout)
-        exit(0)
+    }
+
+    /// This app's visible windows composited back to front over `canvas` (else the front
+    /// window): each window's pixels through ScreenCaptureKit, its place from AppKit — the
+    /// current-process content needs no screen-recording consent but redacts window frames.
+    /// Before macOS 14.4 the whole-system content does, and asks once.
+    @MainActor
+    private static func captureOwnWindows() async -> (CGImage?, Int) {
+        let visible = NSApp.orderedWindows.filter(\.isVisible) // front to back
+        guard let front = visible.first else { return (nil, 0) }
+        // AppKit frames are bottom-left global; the canvas is top-left global.
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+        func topLeft(_ f: NSRect) -> CGRect {
+            CGRect(x: f.minX, y: primaryHeight - f.maxY, width: f.width, height: f.height)
+        }
+        let bounds = canvas ?? topLeft(front.frame)
+        let scale = front.backingScaleFactor
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(
+                  data: nil, width: Int((bounds.width * scale).rounded()),
+                  height: Int((bounds.height * scale).rounded()), bitsPerComponent: 8,
+                  bytesPerRow: 0, space: space,
+                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return (nil, visible.count) }
+        do {
+            let content: SCShareableContent
+            if #available(macOS 14.4, *) {
+                content = try await SCShareableContent.currentProcess
+            } else {
+                content = try await SCShareableContent.current
+            }
+            var drawn = 0
+            for window in visible.reversed() {
+                // macOS 27 draws an attached sheet into its parent's capture, and a capture of the
+                // sheet itself returns the parent shrunk to the sheet's size.
+                if #available(macOS 27, *), window.sheetParent != nil { continue }
+                let frame = topLeft(window.frame)
+                guard frame.intersects(bounds),
+                      let scWindow = content.windows.first(where: {
+                          $0.windowID == CGWindowID(window.windowNumber)
+                      })
+                else { continue }
+                let config = SCStreamConfiguration()
+                config.width = Int((frame.width * scale).rounded())
+                config.height = Int((frame.height * scale).rounded())
+                config.captureResolution = .best
+                config.showsCursor = false
+                let image = try await SCScreenshotManager.captureImage(
+                    contentFilter: SCContentFilter(desktopIndependentWindow: scWindow),
+                    configuration: config)
+                // CG draws bottom-up: flip the window's top-left offset within the canvas.
+                ctx.draw(image, in: CGRect(
+                    x: (frame.minX - bounds.minX) * scale,
+                    y: (bounds.maxY - frame.maxY) * scale,
+                    width: frame.width * scale, height: frame.height * scale))
+                drawn += 1
+            }
+            return (drawn > 0 ? ctx.makeImage() : nil, drawn)
+        } catch {
+            print("PF_SHOT_CAPTURE_ERROR \(error.localizedDescription)")
+            return (nil, 0)
+        }
     }
 
     /// A window's round corners leave transparent pixels; fill them with the window background
@@ -222,7 +287,7 @@ enum MacSelfCapture {
 }
 #endif
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 /// Orientation lock for the requested scene (landscape for the stream hero, portrait for chrome).
 /// Requires the app to allow those orientations in Info.plist — it does, for both.
 private struct IOSOrientationConfigurator: UIViewControllerRepresentable {

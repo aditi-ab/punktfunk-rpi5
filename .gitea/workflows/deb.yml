@@ -52,16 +52,19 @@ on:
       - 'crates/pf-client-core/**'
       - 'crates/pf-clipboard/**'
       - 'crates/pf-console-ui/**'
+      - 'crates/pf-dmabuf/**'
       - 'crates/pf-driver-proto/**'
       - 'crates/pf-encode/**'
-      - 'crates/pf-encode-win/**'
+      - 'crates/pf-encode-core/**'
       - 'crates/pf-frame/**'
       - 'crates/pf-gpu/**'
       - 'crates/pf-host-config/**'
       - 'crates/pf-inject/**'
+      - 'crates/pf-audio/**'
       - 'crates/pf-libva/**'
       - 'crates/pf-paths/**'
       - 'crates/pf-paths-win/**'
+      - 'crates/pf-portal/**'
       - 'crates/pf-presenter/**'
       - 'crates/pf-update/**'
       - 'crates/pf-update-check/**'
@@ -71,6 +74,7 @@ on:
       - 'crates/pf-win-display/**'
       - 'crates/pf-zerocopy/**'
       - 'crates/punktfunk-core/**'
+      - 'crates/punktfunk-ffi/**'
       - 'crates/punktfunk-encode-worker/**'
       - 'crates/punktfunk-host/**'
       - 'crates/punktfunk-tray/**'
@@ -88,6 +92,7 @@ on:
       - 'packaging/linux/*.desktop'
       - 'packaging/linux/*.rules'
       - 'packaging/linux/*.service'
+      - 'packaging/linux/*.sh'
       - 'packaging/linux/*.ufw'
       - 'packaging/linux/*.xml'
       - 'packaging/linux/icons/**'
@@ -126,6 +131,8 @@ on:
       - 'scripts/ci/pf-version.sh'
       - 'scripts/ci/retry.sh'
       - 'ci/skia-binaries.sh'
+      - 'ci/bun.env'
+      - 'ci/install-bun.sh'
       - '.gitea/workflows/deb.yml'
     # Single project version: a `vX.Y.Z` tag is THE release for every platform (see
     # docs-site channels.md). The old version-shadow (a client tag shipping a host package
@@ -175,22 +182,15 @@ jobs:
         run: sh scripts/ci/ensure-sccache.sh
 
       - name: Version + channel
-        # vX.Y.Z tag -> X.Y.Z, published to the `stable` apt distribution (a real release).
-        # A main push -> <next-minor>~ciN.g<sha>, published to the `canary` distribution: the '~' sorts
-        # below the eventual tag, it climbs monotonically by run number, and the canary base is
-        # derived one minor AHEAD of the latest stable tag (scripts/ci/pf-version.sh) so a
-        # stable->canary box re-point still moves forward (see channels.md). Computed BEFORE the build so it's stamped into the binary
+        # vX.Y.Z tag -> X.Y.Z in the `stable` apt distribution; a main push -> <next-minor>~ciN.g<sha>
+        # in `canary`, where the '~' sorts below the eventual tag (scripts/ci/pf-version.sh owns the
+        # rule, see channels.md). Computed BEFORE the build so it's stamped into the binary
         # (PUNKTFUNK_BUILD_VERSION -> build.rs -> --version).
         run: |
-          eval "$(bash scripts/ci/pf-version.sh)"   # -> PF_BASE (one minor ahead of the latest stable tag)
-          SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
-          case "$GITHUB_REF" in
-            refs/tags/v*) V="${GITHUB_REF_NAME#v}"; DIST=stable ;;
-            *)            V="${PF_BASE}~ci${GITHUB_RUN_NUMBER}.g${SHORT}"; DIST=canary ;;
-          esac
-          echo "VERSION=$V" >> "$GITHUB_ENV"
-          echo "DISTRIBUTION=$DIST" >> "$GITHUB_ENV"
-          echo "package version $V -> apt distribution '$DIST'"
+          eval "$(bash scripts/ci/pf-version.sh --format deb)"   # -> PF_VERSION, PF_CHANNEL
+          echo "VERSION=$PF_VERSION" >> "$GITHUB_ENV"
+          echo "DISTRIBUTION=$PF_CHANNEL" >> "$GITHUB_ENV"
+          echo "package version $PF_VERSION -> apt distribution '$PF_CHANNEL'"
 
       # dpkg-shlibdeps (Depends resolution) + dpkg-deb live in dpkg-dev. The client's link
       # deps are also baked into the rust-ci image, but this job runs against the image
@@ -224,16 +224,24 @@ jobs:
           key: cargo-home-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-home-
       - id: target
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
           # `-release-`, never ci.yml's debug key: a job that hits a shared key exactly skips its
           # save, so this release tree would never be stored.
           key: cargo-target-release-v3-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-target-release-v3-${{ env.rustc }}-
-      # The post-step save still runs after a failed restore, once the whole job passes.
+      # A failed restore reads as a miss, so the save at the end of the job replaces the entry.
       - name: Drop a partial target restore
         run: sh scripts/ci/drop-partial-target.sh "${{ steps.target.outputs.cache-hit }}" "cargo-target-release-v3-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}"
+
+      # Cargo judges path crates by mtime, and this checkout is new. Every job that saves this
+      # target cache must run this first: scripts/ci/src-mtimes.rs.
+      - name: Carry source mtimes (unchanged crates stay fresh)
+        continue-on-error: true
+        run: |
+          rustc -O scripts/ci/src-mtimes.rs -o /tmp/src-mtimes
+          /tmp/src-mtimes target
 
       - name: Build release clients
         env:
@@ -280,28 +288,10 @@ jobs:
         # (our Bun.serve TLS entry), so prove the build IS a bun bundle and serves /login.
         # No TLS env here, so the custom entry binds plain HTTP — the smoke curl stays simple.
         run: |
-          # bun builds AND runs the console. Baked into the rust-ci image; bootstrap here too so the
-          # job stays green against the PREVIOUS image (docker.yml bootstrap lag).
-          #
-          # A PINNED release asset, checked by SHA-256 — never `curl https://bun.sh/install | bash`.
-          # build-bun-deb.sh VENDORS this very binary into the punktfunk-bun .deb (BUN_BIN, below),
-          # so an install script piped into root's shell is upstream code choosing bytes we then
-          # publish under REGISTRY_TOKEN. Not in Debian/Ubuntu, so a pin is the only option here.
-          # ONE bun across the repo: same version as rpm.yml and windows-host.yml, and the same
-          # asset + sum as rpm.yml (windows pins bun-windows-x64.zip, so its sum differs) — bump
-          # all three together (the sums are in the release's SHASUMS256.txt). `-baseline` on
-          # purpose: it needs no AVX2, so the bun we ship starts on every x86-64 box — something the
-          # auto-detecting installer never promised, since it reads the BUILDER's CPU, not the user's.
-          command -v bun >/dev/null || {
-            apt-get install -y --no-install-recommends unzip
-            BUN_VER=bun-v1.3.14
-            BUN_SHA=a063908ae08b7852ca10939bbdc6ceed3ddabce8fb9402dce83d65d73b36e6c7
-            curl -fsSL -o /tmp/bun.zip \
-              "https://github.com/oven-sh/bun/releases/download/$BUN_VER/bun-linux-x64-baseline.zip"
-            echo "$BUN_SHA  /tmp/bun.zip" | sha256sum -c -
-            unzip -q -o -j /tmp/bun.zip '*/bun' -d /tmp
-            install -m0755 /tmp/bun /usr/local/bin/bun
-          }
+          # bun builds AND runs the console, and build-bun-deb.sh vendors it into punktfunk-bun
+          # (BUN_BIN, below). Baked into the rust-ci image; the script heals an image that lags the
+          # pin in ci/bun.env (docker.yml bootstrap lag).
+          sh ci/install-bun.sh
           export PATH="$HOME/.bun/bin:$PATH"
           cd web
           # --ignore-scripts, like every other web install in CI (ci.yml, web-screenshots.yml,
@@ -391,11 +381,21 @@ jobs:
             upsert_asset "$RID" "$DEB"
           done
 
+      # Only main writes the target cache, so no branch dispatch feeds a published build. Only on
+      # a miss: the version-stamped binaries rebuild every run, so a save per push costs more
+      # than it saves.
+      - name: Save target
+        if: github.ref == 'refs/heads/main' && steps.target.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: cargo-target-release-v3-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
+
   # ---------------------------------------------------------------------------------------------
   # The HOST .deb — built on Ubuntu 24.04 (noble), so it installs on Ubuntu 24.04 LTS through
   # 26.04 (see the file header + packaging/debian/README.md). Runs in
-  # parallel with build-publish and publishes to the SAME distribution/component; the version step is
-  # byte-identical so host and clients share a version line.
+  # parallel with build-publish and publishes to the SAME distribution/component; both version steps
+  # run `pf-version.sh --format deb`, so host and clients share a version line.
   build-publish-host:
     runs-on: ubuntu-24.04
     container:
@@ -416,15 +416,10 @@ jobs:
       - name: Version + channel
         run: |
           git config --global --add safe.directory "$PWD"
-          eval "$(bash scripts/ci/pf-version.sh)"   # -> PF_BASE (one minor ahead of the latest stable tag)
-          SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
-          case "$GITHUB_REF" in
-            refs/tags/v*) V="${GITHUB_REF_NAME#v}"; DIST=stable ;;
-            *)            V="${PF_BASE}~ci${GITHUB_RUN_NUMBER}.g${SHORT}"; DIST=canary ;;
-          esac
-          echo "VERSION=$V" >> "$GITHUB_ENV"
-          echo "DISTRIBUTION=$DIST" >> "$GITHUB_ENV"
-          echo "host package version $V -> apt distribution '$DIST'"
+          eval "$(bash scripts/ci/pf-version.sh --format deb)"   # -> PF_VERSION, PF_CHANNEL
+          echo "VERSION=$PF_VERSION" >> "$GITHUB_ENV"
+          echo "DISTRIBUTION=$PF_CHANNEL" >> "$GITHUB_ENV"
+          echo "host package version $PF_VERSION -> apt distribution '$PF_CHANNEL'"
 
       # dpkg-shlibdeps/dpkg-deb are baked into rust-ci-noble; python3 is for the release-attach
       # helper. Re-install defensively so the job stays green against the PREVIOUS image on the
@@ -444,7 +439,7 @@ jobs:
           key: cargo-home-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-home-
       - id: target
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
           # Own key: this target dir is built against 24.04's glibc/toolchain and must NOT share
@@ -456,6 +451,14 @@ jobs:
           restore-keys: cargo-target-noble-release-v1-${{ env.rustc }}-
       - name: Drop a partial target restore
         run: sh scripts/ci/drop-partial-target.sh "${{ steps.target.outputs.cache-hit }}" "cargo-target-noble-release-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}"
+
+      # Cargo judges path crates by mtime, and this checkout is new. Every job that saves this
+      # target cache must run this first: scripts/ci/src-mtimes.rs.
+      - name: Carry source mtimes (unchanged crates stay fresh)
+        continue-on-error: true
+        run: |
+          rustc -O scripts/ci/src-mtimes.rs -o /tmp/src-mtimes
+          /tmp/src-mtimes target
 
       - name: Build release host
         env:
@@ -530,6 +533,14 @@ jobs:
             upsert_asset "$RID" "$DEB"
           done
 
+      # Same rule as build-publish's save.
+      - name: Save target
+        if: github.ref == 'refs/heads/main' && steps.target.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: cargo-target-noble-release-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
+
   # ---------------------------------------------------------------------------------------------
   # `punktfunk-gamescope` for apt — the patched build that gives a gamescope session HDR, a cursor,
   # and the client's real refresh rate instead of a hardcoded 60 Hz. Same reasoning as the RPM leg
@@ -558,19 +569,15 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Byte-identical to the other jobs' version step (pf-version.sh is deterministic per commit)
-      # — but only DISTRIBUTION is used here. The package version is the gamescope upstream
-      # version + our patch level, which build-gamescope-deb.sh derives itself; it deliberately
-      # does NOT follow the punktfunk version line, because this package moves on its own cadence.
+      # Only the channel is used here. The package version is the gamescope upstream version + our
+      # patch level, which build-gamescope-deb.sh derives itself; this package moves on its own
+      # cadence, not the punktfunk version line.
       - name: Channel
         run: |
           git config --global --add safe.directory "$PWD"
-          case "$GITHUB_REF" in
-            refs/tags/v*) DIST=stable ;;
-            *)            DIST=canary ;;
-          esac
-          echo "DISTRIBUTION=$DIST" >> "$GITHUB_ENV"
-          echo "gamescope -> apt distribution '$DIST'"
+          eval "$(bash scripts/ci/pf-version.sh)"   # -> PF_CHANNEL
+          echo "DISTRIBUTION=$PF_CHANNEL" >> "$GITHUB_ENV"
+          echo "gamescope -> apt distribution '$PF_CHANNEL'"
 
       # CACHED on packaging/gamescope/** alone — it depends on nothing else in this repo, so a
       # normal push restores a binary instead of spending ~10 minutes on someone else's tree.
@@ -663,19 +670,13 @@ jobs:
       - name: sccache (no-op once the image bakes it)
         run: sh scripts/ci/ensure-sccache.sh
 
-      # Byte-identical to build-publish's version step (pf-version.sh is deterministic per
-      # commit), so the arm64 package always shares the amd64 version line.
+      # pf-version.sh is deterministic per commit, so the arm64 package shares the amd64 version line.
       - name: Version + channel
         run: |
-          eval "$(bash scripts/ci/pf-version.sh)"
-          SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
-          case "$GITHUB_REF" in
-            refs/tags/v*) V="${GITHUB_REF_NAME#v}"; DIST=stable ;;
-            *)            V="${PF_BASE}~ci${GITHUB_RUN_NUMBER}.g${SHORT}"; DIST=canary ;;
-          esac
-          echo "VERSION=$V" >> "$GITHUB_ENV"
-          echo "DISTRIBUTION=$DIST" >> "$GITHUB_ENV"
-          echo "package version $V -> apt distribution '$DIST' (arm64)"
+          eval "$(bash scripts/ci/pf-version.sh --format deb)"   # -> PF_VERSION, PF_CHANNEL
+          echo "VERSION=$PF_VERSION" >> "$GITHUB_ENV"
+          echo "DISTRIBUTION=$PF_CHANNEL" >> "$GITHUB_ENV"
+          echo "package version $PF_VERSION -> apt distribution '$PF_CHANNEL' (arm64)"
 
       # dpkg-shlibdeps + dpkg-deb. The arm64 link deps themselves are the cross image's whole
       # point and are already baked in; python3 is for scripts/ci/gitea-release.sh.
@@ -697,7 +698,7 @@ jobs:
           key: cargo-home-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-home-
       - id: target
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
           # Its OWN key: aarch64 artifacts never share the amd64 target cache, and `-release-`
@@ -707,16 +708,31 @@ jobs:
       - name: Drop a partial target restore
         run: sh scripts/ci/drop-partial-target.sh "${{ steps.target.outputs.cache-hit }}" "cargo-target-arm64-release-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}"
 
+      # Cargo judges path crates by mtime, and this checkout is new. Every job that saves this
+      # target cache must run this first: scripts/ci/src-mtimes.rs.
+      - name: Carry source mtimes (unchanged crates stay fresh)
+        continue-on-error: true
+        run: |
+          rustc -O scripts/ci/src-mtimes.rs -o /tmp/src-mtimes
+          /tmp/src-mtimes target
+
       - name: Build the arm64 client .deb
         env:
           PUNKTFUNK_BUILD_VERSION: ${{ env.VERSION }}   # stamped into the binaries (build.rs)
         run: |
           git config --global --add safe.directory "$PWD"
+          # The restored target holds the binaries the cache was saved with, and the packer
+          # ships any binary it finds. Build first, as build-publish does.
+          cargo build --release --locked --target aarch64-unknown-linux-gnu \
+            -p punktfunk-client-linux -p punktfunk-client-session -p punktfunk-cli -p pf-update
           ARCH=arm64 TARGET=aarch64-unknown-linux-gnu \
             bash packaging/debian/build-client-deb.sh
           # Fail here rather than shipping an amd64 binary under an arm64 package name.
           readelf -h target/aarch64-unknown-linux-gnu/release/punktfunk-session \
             | grep -q AArch64 || { echo "ERROR: session binary is not AArch64"; exit 1; }
+          # The update check compares the version the shell carries; it must be this run's.
+          grep -qaF "$VERSION" target/aarch64-unknown-linux-gnu/release/punktfunk-client \
+            || { echo "ERROR: punktfunk-client does not carry version $VERSION"; exit 1; }
 
       - name: sccache stats (visibility only)
         if: always()
@@ -748,6 +764,14 @@ jobs:
           for DEB in dist/*.deb; do
             upsert_asset "$RID" "$DEB"
           done
+
+      # Same rule as build-publish's save.
+      - name: Save target
+        if: github.ref == 'refs/heads/main' && steps.target.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: cargo-target-arm64-release-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}
 
   # ---------------------------------------------------------------------------------------------
   # Does the thing we just published actually INSTALL? Nothing in this repo asked that before, and
@@ -783,20 +807,15 @@ jobs:
       - name: Channel + expected version
         run: |
           git config --global --add safe.directory "$PWD"
-          eval "$(bash scripts/ci/pf-version.sh)"
-          SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
-          case "$GITHUB_REF" in
-            refs/tags/v*) V="${GITHUB_REF_NAME#v}"; DIST=stable ;;
-            *)            V="${PF_BASE}~ci${GITHUB_RUN_NUMBER}.g${SHORT}"; DIST=canary ;;
-          esac
-          echo "DISTRIBUTION=$DIST" >> "$GITHUB_ENV"
-          echo "EXPECT_VERSION=$V" >> "$GITHUB_ENV"
-          echo "expecting $V in apt distribution '$DIST'"
+          eval "$(bash scripts/ci/pf-version.sh --format deb)"   # -> PF_VERSION, PF_CHANNEL
+          echo "DISTRIBUTION=$PF_CHANNEL" >> "$GITHUB_ENV"
+          echo "EXPECT_VERSION=$PF_VERSION" >> "$GITHUB_ENV"
+          echo "expecting $PF_VERSION in apt distribution '$PF_CHANNEL'"
 
       # The support matrix, asserted rather than asserted-in-prose. Each row names the packages
       # that MUST install on that distro; anything absent from the row is expected not to and is
       # not checked here (the client's glibc 2.43 floor keeps it off 24.04 and Debian 13 —
-      # see docs-site/content/docs/debian.md).
+      # see docs-site/content/docs/(guide)/(install)/debian.mdx).
       - name: Install from the apt registry on every supported distro
         run: bash scripts/ci/deb-install-smoke.sh
         env:

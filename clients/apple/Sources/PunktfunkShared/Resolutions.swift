@@ -53,6 +53,17 @@ public enum Resolutions {
         return aspects.firstIndex { abs(shape / $0.shape - 1) < tolerance }
     }
 
+    /// Smallest stream mode the host accepts, per side.
+    public static let minWidth = 320
+    public static let minHeight = 200
+
+    /// A typed `w`×`h` as a mode the host takes: each side at least `minWidth`×`minHeight`, at most
+    /// the codec's per-side ceiling, then floored even. Twin of `punktfunk_core::resolutions::custom`.
+    public static func custom(_ w: Int, _ h: Int, codec: String) -> (w: Int, h: Int) {
+        let cap = RenderScale.maxDimension(codec: codec)
+        return (min(max(w, minWidth), cap) / 2 * 2, min(max(h, minHeight), cap) / 2 * 2)
+    }
+
     /// The size in family `aspect` nearest in height to `h`; a native `0` looks for 1080. Ties go
     /// to the smaller size.
     public static func nearest(_ aspect: Int, height h: Int) -> (w: Int, h: Int) {

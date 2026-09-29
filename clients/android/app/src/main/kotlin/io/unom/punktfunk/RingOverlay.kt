@@ -30,7 +30,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Bedtime
+import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.DoNotTouch
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Insights
 import androidx.compose.material.icons.filled.Keyboard
@@ -81,6 +83,7 @@ import androidx.compose.ui.unit.sp
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.RingNav
+import io.unom.punktfunk.kit.library.RunningGame
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -228,6 +231,11 @@ class RingActions(
     val requestMode: (Int, Int, Int) -> Unit,
     val scrollInverted: () -> Boolean = { false },
     val toggleScrollInversion: () -> Unit = {},
+    /** The game this device launched that this stream plays ([RunningGame.streamedHere]); null
+     *  offers no End game. */
+    val streamedGame: () -> RunningGame? = { null },
+    /** End that game on the host, then the stream. */
+    val endGame: () -> Unit = {},
 )
 
 /**
@@ -237,7 +245,7 @@ class RingActions(
 class RingEditing(val pick: (Int) -> Unit, val swap: (Int, Int) -> Unit)
 
 /** One button as the ring draws it: glyph or keycap chip, its state, and why it is dimmed. */
-private data class SlotSpec(
+internal data class SlotSpec(
     val id: String,
     val label: String,
     val icon: ImageVector? = null,
@@ -251,8 +259,14 @@ private data class SlotSpec(
     val state: String = "",
 )
 
-private fun spec(slot: SlotId, cfg: OverlayConfig, a: RingActions): SlotSpec = when (slot) {
+internal fun spec(slot: SlotId, cfg: OverlayConfig, a: RingActions): SlotSpec = when (slot) {
     SlotId.EndStream -> SlotSpec("end_stream", "End stream", Icons.Filled.Close, armed = true)
+    SlotId.EndGame -> SlotSpec(
+        "end_game", "End game", Icons.Filled.Cancel,
+        enabled = a.streamedGame() != null,
+        reason = "No game this device launched is running here",
+        armed = true,
+    )
     SlotId.DisconnectLinger ->
         SlotSpec("disconnect_linger", "Disconnect, keep the game running", Icons.Filled.Logout)
     SlotId.TouchMode -> {
@@ -263,6 +277,7 @@ private fun spec(slot: SlotId, cfg: OverlayConfig, a: RingActions): SlotSpec = w
                 TouchMode.TRACKPAD -> Icons.Filled.TouchApp
                 TouchMode.POINTER -> Icons.Filled.Mouse
                 TouchMode.TOUCH -> Icons.Filled.PanTool
+                TouchMode.OFF -> Icons.Filled.DoNotTouch
             },
             toggle = true, state = m.name.lowercase().replaceFirstChar { it.uppercase() },
         )
@@ -389,14 +404,7 @@ fun RingOverlay(
             state.close()
         }
     }
-    // An armed slot and a hint both time out.
-    LaunchedEffect(state.armed, state.hint, state.lastTouch) {
-        if (state.armed != null || state.hint != null) {
-            delay(ARM_MS.coerceAtLeast(HINT_MS))
-            state.armed = null
-            state.hint = null
-        }
-    }
+    ExpireRingHint(state)
     var textDialog by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) { if (state.nativeMode == null) state.nativeMode = actions.currentMode() }
     val rows = if (state.sheet) sheetRows(state, cfg, actions, haptics) { textDialog = true } else emptyList()
@@ -519,11 +527,23 @@ fun RingOverlay(
     }
 }
 
+/** An armed slot and a hint both time out. */
+@Composable
+internal fun ExpireRingHint(state: RingState) {
+    LaunchedEffect(state.armed, state.hint, state.lastTouch) {
+        if (state.armed != null || state.hint != null) {
+            delay(ARM_MS.coerceAtLeast(HINT_MS))
+            state.armed = null
+            state.hint = null
+        }
+    }
+}
+
 /**
  * The haptic vocabulary: a tap per press, a firm "no" on a dimmed button, a warning when a
  * destructive slot arms, and the confirm on the commit (StreamScreen fires that one).
  */
-private fun fireSlot(
+internal fun fireSlot(
     s: SlotSpec,
     slot: SlotId,
     state: RingState,
@@ -550,6 +570,7 @@ private fun fireSlot(
     state.hint = null
     when (slot) {
         SlotId.EndStream -> { state.close(); actions.endStream() }
+        SlotId.EndGame -> { state.close(); actions.endGame() }
         SlotId.DisconnectLinger -> { state.close(); actions.disconnectLinger() }
         SlotId.TouchMode -> actions.cycleTouchMode()
         SlotId.Keyboard -> { state.close(); actions.keyboard() }
@@ -829,6 +850,11 @@ private fun sheetRows(
     }
     rows += SheetRowSpec("Session", "End stream", if (state.armed == "end_stream") "tap again" else "") {
         if (state.armed == "end_stream") { state.close(); actions.endStream() } else { haptics.boundary(); state.armed = "end_stream" }
+    }
+    if (actions.streamedGame() != null) {
+        rows += SheetRowSpec(null, "End game", if (state.armed == "end_game") "tap again" else "") {
+            if (state.armed == "end_game") { state.close(); actions.endGame() } else { haptics.boundary(); state.armed = "end_game" }
+        }
     }
     rows += SheetRowSpec(null, "Disconnect, keep the game running") { state.close(); actions.disconnectLinger() }
     rows += SheetRowSpec("Resolution", "Resolution", resLabel, onAdjust = ::adjustRes) { adjustRes(1) }

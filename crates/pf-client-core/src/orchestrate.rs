@@ -3,12 +3,13 @@
 //!
 //! A [`ConnectPlan`] is built from a card click, a CLI verb, or a URL. Front-ends
 //! render; they do not decide when to prompt, how long to wait for a sleeping host,
-//! or what counts as a refusal. [`UiDelegate`] is the presentation surface.
+//! or what counts as a refusal. A session exit reaches them as a [`ConnectOutcome`].
 //!
 //! Wake cadence lives on [`WAKE_TIMEOUT_SECS`] / [`WAKE_RESEND_SECS`].
 
 use crate::deeplink::{DeepLink, HostResolution, Route};
 use crate::presets::{PresetsFile, Resolution, StreamPreset};
+use crate::session::{Dial, Probes, SessionParams};
 use crate::trust::{KnownHost, KnownHosts, Settings};
 use serde::{Deserialize, Serialize};
 use std::process::{Child, Command, Stdio};
@@ -16,6 +17,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
+use std::time::Duration;
 
 /// Dial target as values. A plan-holder has no [`KnownHost`] in hand.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -47,6 +49,49 @@ impl From<&KnownHost> for HostTarget {
     }
 }
 
+/// Where a connect goes before it dials. Each front-end opens its own surface per arm.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrustRoute {
+    /// A stored pin: dial silently.
+    Pinned(String),
+    /// A new fingerprint where another is pinned: PIN only, even under `pair=optional`.
+    /// It may be an impostor; the other OS of a dual-boot box pairs once with a PIN.
+    FingerprintChanged,
+    /// A new host advertising `pair=optional`: this fingerprint may be trusted on first use.
+    OfferTofu(String),
+    /// PIN or delegated approval.
+    NeedsPairing,
+}
+
+/// The connect trust gate. `advertised_fp` follows [`KnownHosts::resolve_index`]: `None`
+/// is a typed address and takes the record pinned there; `Some("")` is a card saved
+/// without a pin and has none. A placeholder is no pin, so a fingerprint arriving at one
+/// is a new host, not a changed one.
+pub fn trust_route(
+    known: &KnownHosts,
+    advertised_fp: Option<&str>,
+    addr: &str,
+    port: u16,
+    pair_optional: bool,
+) -> TrustRoute {
+    // `find_by_addr` prefers a pinned record, so this misses only when none is pinned here.
+    let pinned_here = || {
+        known
+            .find_by_addr(addr, port)
+            .filter(|h| !h.fp_hex.is_empty())
+    };
+    match advertised_fp {
+        None => pinned_here().map_or(TrustRoute::NeedsPairing, |h| {
+            TrustRoute::Pinned(h.fp_hex.clone())
+        }),
+        Some("") => TrustRoute::NeedsPairing,
+        Some(fp) if known.find_by_fp(fp).is_some() => TrustRoute::Pinned(fp.to_string()),
+        Some(_) if pinned_here().is_some() => TrustRoute::FingerprintChanged,
+        Some(fp) if pair_optional => TrustRoute::OfferTofu(fp.to_string()),
+        Some(_) => TrustRoute::NeedsPairing,
+    }
+}
+
 /// One session, every policy question already answered. Front-ends do not re-decide.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConnectPlan {
@@ -71,6 +116,9 @@ pub struct ConnectPlan {
     /// does not look it up again.
     pub clipboard: bool,
 }
+
+/// Handshake budget when the plan and `--connect-timeout` both omit one.
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 15;
 
 impl ConnectPlan {
     /// Card-click plan. `one_off_preset`: `Some("")` forces the global defaults on a
@@ -162,6 +210,7 @@ impl ConnectPlan {
             settings: self.settings.clone(),
             clipboard,
             preset: self.preset.as_ref().map(|p| p.name.clone()),
+            preset_id: self.preset.as_ref().map(|p| p.id.clone()),
         }
     }
 
@@ -195,6 +244,27 @@ impl ConnectPlan {
         // No `--window-pos`: Wayland compositors own placement, so the flag is a silent
         // no-op from GTK/CLI. Windows appends its own. An X11-only special case is drift.
         args
+    }
+
+    /// Pump parameters for this plan. Device probes stay off it: the plan is
+    /// what a shell serialises, and it must not carry a device handle.
+    ///
+    /// The pin is the parsed form of [`HostTarget::fp_hex`]. An unset
+    /// [`Self::connect_timeout_secs`] is [`DEFAULT_CONNECT_TIMEOUT_SECS`].
+    pub fn session_params(&self, pin: [u8; 32], probes: Probes) -> SessionParams {
+        self.spec(self.clipboard).session_params(
+            Dial {
+                host: self.host.addr.clone(),
+                port: self.host.port,
+                pin,
+                launch: self.launch.clone(),
+                connect_timeout: Duration::from_secs(
+                    self.connect_timeout_secs
+                        .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
+                ),
+            },
+            probes,
+        )
     }
 }
 
@@ -427,13 +497,35 @@ impl WakeWait {
     }
 }
 
-/// Front-end presentation. Nothing here decides policy.
-pub trait UiDelegate {
-    /// Unknown or never-pinned host. Return true to enter the trust flow. A
-    /// non-interactive front-end returns false — refusing is always safe.
-    fn confirm_unknown_host(&mut self, host: &UnknownHost) -> bool;
-    fn wake_progress(&mut self, host: &HostTarget, tick: WakeTick);
-    fn report(&mut self, outcome: &ConnectOutcome);
+/// Wake-and-wait on this thread, with a reachability probe as the presence reading. Ticks
+/// are paced to wall-clock seconds, so the probe's own wait does not stretch the budget.
+/// `each` sees every tick before its packet goes out and returns `false` to stop; the
+/// result is the last tick, `None` when `each` stopped it.
+pub fn wake_by_probe(
+    addr: &str,
+    port: u16,
+    fp_hex: &str,
+    mac: &[String],
+    mut each: impl FnMut(&WakeTick) -> bool,
+) -> Option<WakeTick> {
+    let last_ip = addr.parse().ok();
+    let started = std::time::Instant::now();
+    let mut wait = WakeWait::new();
+    loop {
+        let online = crate::trust::probe_one(addr, port, fp_hex, Duration::from_millis(900));
+        let tick = wait.tick(online);
+        if !each(&tick) {
+            return None;
+        }
+        if tick.send_packet {
+            crate::wol::wake(mac, last_ip);
+        }
+        if tick.outcome.is_some() {
+            return Some(tick);
+        }
+        let next = Duration::from_secs(wait.seconds());
+        std::thread::sleep(next.saturating_sub(started.elapsed()));
+    }
 }
 
 /// How a connect finished. Front-ends map this onto their own surface.
@@ -444,8 +536,52 @@ pub enum ConnectOutcome {
     ConnectFailed(String),
     /// No pin, or the pin no longer matches. Never retried silently.
     TrustRejected(String),
-    RendererFailed(String),
+    /// The session died without a contract line. `-1` = no exit code (a Unix signal).
+    RendererFailed {
+        code: i32,
+    },
+    /// Our own kill: Disconnect or a cancelled request.
     Cancelled,
+}
+
+impl ConnectOutcome {
+    /// Classify a session exit: its code, the `error`/`ended` lines it spoke, and whether
+    /// we killed it. A contract line says more than a code. `cancelled` covers whatever
+    /// code our kill leaves: `-1` from a Unix signal, `1` from Windows' TerminateProcess.
+    pub fn from_exit(
+        code: i32,
+        error: Option<(String, bool)>,
+        ended: Option<String>,
+        cancelled: bool,
+    ) -> ConnectOutcome {
+        match (code, error) {
+            (_, Some((msg, true))) => ConnectOutcome::TrustRejected(msg),
+            (_, Some((msg, false))) => ConnectOutcome::ConnectFailed(msg),
+            (0, None) => ConnectOutcome::Ended(ended),
+            _ if cancelled => ConnectOutcome::Cancelled,
+            (code, None) => ConnectOutcome::RendererFailed { code },
+        }
+    }
+
+    /// Whether the dial-first wake fallback runs: the dial failed, or the session died
+    /// without a word. A trust rejection means the host answered; `-1` is a system kill.
+    pub fn warrants_wake(&self) -> bool {
+        match self {
+            ConnectOutcome::ConnectFailed(_) => true,
+            ConnectOutcome::RendererFailed { code } => *code != -1,
+            _ => false,
+        }
+    }
+
+    /// How a session that died silently went, for a banner. An NTSTATUS crash reads in
+    /// hex, the form the Event Log and the crash filter use.
+    pub fn exit_phrase(code: i32) -> String {
+        match code as u32 {
+            0xC000_0005 => "crashed with an access violation (0xC0000005)".to_string(),
+            c if code < 0 => format!("died with exception 0x{c:08X}"),
+            _ => format!("exited with code {code}"),
+        }
+    }
 }
 
 /// Everything a session needs, resolved by the caller — what `--resolved-spec`
@@ -462,6 +598,9 @@ pub struct ResolvedSpec {
     /// Preset name for the stats overlay. `None` = the global defaults.
     #[serde(default, alias = "profile", skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
+    /// The preset's stable id, which the dial names to the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset_id: Option<String>,
 }
 
 impl ResolvedSpec {
@@ -503,15 +642,31 @@ impl ResolvedSpec {
         serde_json::from_str(&text)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
+
+    /// Pump parameters for a direct connect. Same fill as
+    /// [`ConnectPlan::session_params`]. Host, pin, launch, and timeout come from
+    /// the command line; this spec already holds settings, clipboard, and preset.
+    pub fn session_params(&self, dial: Dial, probes: Probes) -> SessionParams {
+        SessionParams::from_plan(
+            &self.settings,
+            self.clipboard,
+            self.preset.clone(),
+            self.preset_id.clone(),
+            dial,
+            probes,
+        )
+    }
 }
 
-/// One event from the session child's stdout contract (`{"ready":true}`,
+/// One event from the session child's stdout contract (`{"ready":true}`, `stats-json:`,
 /// `{"error":…}`, `{"ended":…}`, then EOF and an exit code). Parsed once so
 /// shells cannot disagree about what "ready" or "trust rejected" means.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SessionEvent {
     /// First frame presented — the stream is up.
     Ready,
+    /// One `stats-json:` window, once a second.
+    Stats(Box<punktfunk_core::hud::StatsSnapshot>),
     Error {
         msg: String,
         trust_rejected: bool,
@@ -528,8 +683,14 @@ pub enum SessionEvent {
     Exited(i32),
 }
 
-/// Parse one stdout line of the session contract. `None` for `stats:` and stray output.
+/// Parse one stdout line of the session contract. `None` for the text `stats:` line, which
+/// is for a person reading a log, and for stray output.
 pub fn parse_session_line(line: &str) -> Option<SessionEvent> {
+    if let Some(json) = line.strip_prefix("stats-json: ") {
+        return serde_json::from_str(json)
+            .ok()
+            .map(|s| SessionEvent::Stats(Box::new(s)));
+    }
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     if v.get("ready").and_then(|r| r.as_bool()) == Some(true) {
         return Some(SessionEvent::Ready);
@@ -552,6 +713,68 @@ pub fn parse_session_line(line: &str) -> Option<SessionEvent> {
     None
 }
 
+/// The session's exit codes, beside its stdout lines. 0 is a clean end.
+pub mod exit {
+    pub const CONNECT_FAILED: u8 = 2;
+    /// No pin, the pin no longer matches, or pairing is required.
+    pub const TRUST_REJECTED: u8 = 3;
+    /// The stream window or the console did not start.
+    pub const RENDERER_FAILED: u8 = 4;
+}
+
+/// One line the session writes on stdout; [`parse_session_line`] reads each back.
+pub enum SessionLine<'a> {
+    Ready,
+    /// `trust_rejected: None` leaves the field out, which readers take as `false`.
+    Error {
+        msg: &'a str,
+        trust_rejected: Option<bool>,
+    },
+    Ended(&'a str),
+    Window {
+        w: u32,
+        h: u32,
+    },
+    /// `stats:` for a person reading a log, then `stats-json:` for a program.
+    Stats {
+        text: &'a str,
+        snap: &'a punktfunk_core::hud::StatsSnapshot,
+    },
+}
+
+impl SessionLine<'_> {
+    fn render(&self) -> String {
+        use serde_json::json;
+        match self {
+            SessionLine::Ready => json!({ "ready": true }).to_string(),
+            SessionLine::Error {
+                msg,
+                trust_rejected: None,
+            } => json!({ "error": msg }).to_string(),
+            SessionLine::Error {
+                msg,
+                trust_rejected: Some(t),
+            } => json!({ "error": msg, "trust_rejected": t }).to_string(),
+            SessionLine::Ended(msg) => json!({ "ended": msg }).to_string(),
+            // Not `json!`: its map sorts keys, and this line has always been `w` first.
+            SessionLine::Window { w, h } => format!(r#"{{"window":{{"w":{w},"h":{h}}}}}"#),
+            SessionLine::Stats { text, snap } => format!(
+                "stats: {text}\nstats-json: {}",
+                serde_json::to_string(snap).unwrap_or_default()
+            ),
+        }
+    }
+}
+
+/// Write one contract line to stdout. Not `println!`: it panics on EPIPE, and the shell
+/// can exit mid-stream. Status nobody is left to read costs nothing to lose.
+pub fn emit(line: SessionLine) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{}", line.render());
+    let _ = out.flush();
+}
+
 /// Persist a window size the session reported. The spawner's job, not the
 /// renderer's — and only on a real change, so a session that never resizes
 /// never touches the file.
@@ -562,6 +785,21 @@ pub fn persist_window_size(w: u32, h: u32) {
         s.last_window_h = h;
         s.save();
     }
+}
+
+/// Forget `known.hosts[i]` and save. Once saved, what is keyed on the record goes too: its
+/// cached game catalog and action rows, and a default-host pointer that a later re-pair of
+/// another box would otherwise inherit.
+pub fn forget_host(known: &mut KnownHosts, i: usize) -> anyhow::Result<KnownHost> {
+    let gone = known.hosts.remove(i);
+    known.save()?;
+    crate::library_cache::forget(&gone.fp_hex);
+    crate::host_actions::invalidate(&gone.fp_hex);
+    let mut settings = Settings::load();
+    if crate::start::clear_default(&mut settings, gone.id.as_deref()) {
+        settings.save();
+    }
+    Ok(gone)
 }
 
 /// Session binary: installed next to this executable, else `$PATH` (a dev run
@@ -600,21 +838,19 @@ impl CancelHandle {
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
+
+    /// Whether a child is spawned and not yet reaped.
+    pub fn is_running(&self) -> bool {
+        self.child.lock().unwrap().is_some()
+    }
 }
 
-/// Spawns the session and supervises stdout on a reader thread. `cancel` accepts
-/// cancellation before or after the child is armed. [`SessionEvent::Exited`] always
-/// arrives, and `None` creates a fresh handle.
-pub fn spawn_session(
-    plan: &ConnectPlan,
-    cancel: Option<CancelHandle>,
-    on_event: impl FnMut(SessionEvent) + Send + 'static,
-) -> Result<CancelHandle, String> {
+/// The session command for `plan`, and the `--resolved-spec` temp it names. Spec mode: the
+/// child reads no stores and cannot disagree about a file either of us might write. A failed
+/// write is not fatal — the child's compat path resolves the same values through the same helper.
+pub fn session_command(plan: &ConnectPlan) -> (Command, Option<std::path::PathBuf>) {
     let mut cmd = Command::new(session_binary());
     let mut args = plan.session_args();
-    // Spec mode: the child reads no stores and cannot disagree about a file either
-    // of us might write. A failed write is not fatal — the child's compat path
-    // resolves the same values through the same helper.
     let spec_path = match plan.spec(plan.clipboard).write_temp() {
         Ok(path) => {
             args.push("--resolved-spec".into());
@@ -626,14 +862,42 @@ pub fn spawn_session(
             None
         }
     };
-    cmd.args(args)
-        .stdin(Stdio::null())
+    cmd.args(args);
+    (cmd, spec_path)
+}
+
+/// Spawns the session for `plan` and supervises it. See [`spawn_child`].
+pub fn spawn_session(
+    plan: &ConnectPlan,
+    cancel: Option<CancelHandle>,
+    on_event: impl FnMut(SessionEvent) + Send + 'static,
+) -> Result<CancelHandle, String> {
+    let (cmd, spec_path) = session_command(plan);
+    let slot = spawn_child(cmd, spec_path, cancel, std::io::stderr(), on_event)?;
+    tracing::info!(
+        host = %plan.host.addr, port = plan.host.port,
+        preset = plan.preset.as_ref().map(|p| p.name.as_str()).unwrap_or("-"),
+        "session binary spawned"
+    );
+    Ok(slot)
+}
+
+/// Spawns a session command and supervises its stdout contract on a reader thread.
+/// Stderr goes to `stderr_sink` and the log ring. `spec_path` is deleted once the child
+/// exits, or at once if it never starts. `cancel` accepts cancellation before or after the
+/// child is armed; `None` creates a fresh handle. [`SessionEvent::Exited`] always arrives.
+pub fn spawn_child(
+    mut cmd: Command,
+    spec_path: Option<std::path::PathBuf>,
+    cancel: Option<CancelHandle>,
+    stderr_sink: impl std::io::Write + Send + 'static,
+    on_event: impl FnMut(SessionEvent) + Send + 'static,
+) -> Result<CancelHandle, String> {
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         // Piped through the ring forwarder, not inherited: a GUI-only log export
         // otherwise holds everything except the stream it was exported about.
         .stderr(Stdio::piped());
-    // The reader thread below deletes the spec once the child is done with it; a spawn that
-    // never gets there has to clean up after itself, or the temp is left for good.
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -644,13 +908,8 @@ pub fn spawn_session(
         }
     };
     if let Some(stderr) = child.stderr.take() {
-        crate::logring::forward_child_stderr(stderr);
+        crate::logring::forward_child_stderr(stderr, stderr_sink);
     }
-    tracing::info!(
-        host = %plan.host.addr, port = plan.host.port,
-        preset = plan.preset.as_ref().map(|p| p.name.as_str()).unwrap_or("-"),
-        "session binary spawned"
-    );
     let stdout = child.stdout.take().expect("piped stdout");
     let slot = cancel.unwrap_or_default();
     *slot.child.lock().unwrap() = Some(child);
@@ -724,6 +983,9 @@ pub fn exec_session(plan: &ConnectPlan) -> std::io::Error {
 mod tests {
     use super::*;
     use crate::deeplink;
+    use crate::trust::StatsVerbosity;
+    use punktfunk_core::config::{GamepadPref, Mode};
+    use punktfunk_core::quic::HdrMeta;
 
     fn host(name: &str, addr: &str, id: &str, fp: &str) -> KnownHost {
         KnownHost {
@@ -735,6 +997,41 @@ mod tests {
             mac: vec!["aa:bb:cc:dd:ee:ff".into()],
             id: Some(id.into()),
             ..Default::default()
+        }
+    }
+
+    /// A stored pin dials; a new fingerprint where another is pinned asks for a PIN even
+    /// under `pair=optional`; a placeholder holds no pin to change.
+    #[test]
+    fn trust_route_sends_a_changed_fingerprint_to_the_pin() {
+        use TrustRoute::*;
+        let (desk, other, fresh) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+        let (desk, other, fresh) = (desk.as_str(), other.as_str(), fresh.as_str());
+        let known = KnownHosts {
+            hosts: vec![
+                host("Desk", "10.0.0.2", "1", desk),
+                host("Typed", "10.0.0.3", "2", ""),
+            ],
+        };
+        for (fp, addr, optional, want) in [
+            (Some(desk), "10.0.0.2", false, Pinned(desk.into())),
+            (Some(desk), "10.0.0.9", false, Pinned(desk.into())), // a moved lease
+            (Some(other), "10.0.0.2", true, FingerprintChanged),
+            (Some(other), "10.0.0.2", false, FingerprintChanged),
+            (Some(fresh), "10.0.0.9", true, OfferTofu(fresh.into())),
+            (Some(fresh), "10.0.0.9", false, NeedsPairing),
+            (Some(fresh), "10.0.0.3", true, OfferTofu(fresh.into())),
+            (Some(fresh), "10.0.0.3", false, NeedsPairing),
+            // A card saved without a pin never borrows the one pinned at its address.
+            (Some(""), "10.0.0.2", false, NeedsPairing),
+            (Some(""), "10.0.0.3", true, NeedsPairing),
+            // A typed address takes whatever is pinned there.
+            (None, "10.0.0.2", false, Pinned(desk.into())),
+            (None, "10.0.0.3", false, NeedsPairing),
+            (None, "10.0.0.9", true, NeedsPairing),
+        ] {
+            let got = trust_route(&known, fp, addr, 9777, optional);
+            assert_eq!(got, want, "{fp:?} at {addr}, optional {optional}");
         }
     }
 
@@ -955,6 +1252,7 @@ mod tests {
             },
             clipboard: true,
             preset: Some("Work".into()),
+            preset_id: Some("3f9a0c11e2b4".into()),
         };
         let json = serde_json::to_string(&spec).unwrap();
         assert_eq!(serde_json::from_str::<ResolvedSpec>(&json).unwrap(), spec);
@@ -962,6 +1260,7 @@ mod tests {
         // No preset: the key is absent, not null.
         let plain = ResolvedSpec {
             preset: None,
+            preset_id: None,
             ..spec.clone()
         };
         let json = serde_json::to_string(&plain).unwrap();
@@ -1001,6 +1300,43 @@ mod tests {
     }
 
     #[test]
+    fn session_exits_classify_once() {
+        use ConnectOutcome as O;
+        // A contract line says more than a code.
+        let trust = O::from_exit(3, Some(("pin".into(), true)), None, false);
+        assert_eq!(trust, O::TrustRejected("pin".into()));
+        assert!(!trust.warrants_wake(), "the host answered");
+        let failed = O::from_exit(2, Some(("no route".into(), false)), None, false);
+        assert_eq!(failed, O::ConnectFailed("no route".into()));
+        assert!(failed.warrants_wake());
+        assert_eq!(O::from_exit(0, None, None, false), O::Ended(None));
+        assert_eq!(
+            O::from_exit(0, None, Some("Host ended".into()), false),
+            O::Ended(Some("Host ended".into()))
+        );
+        // Our own kill is silent whatever code it leaves: a Unix signal, or TerminateProcess's 1.
+        assert_eq!(O::from_exit(-1, None, None, true), O::Cancelled);
+        assert_eq!(O::from_exit(1, None, None, true), O::Cancelled);
+        // Anything else that died silently is a failure, never a blank return.
+        let crashed = O::from_exit(1, None, None, false);
+        assert_eq!(crashed, O::RendererFailed { code: 1 });
+        assert!(crashed.warrants_wake());
+        assert!(
+            !O::RendererFailed { code: -1 }.warrants_wake(),
+            "a system kill"
+        );
+    }
+
+    #[test]
+    fn exit_phrase_names_an_ntstatus_in_hex() {
+        assert_eq!(ConnectOutcome::exit_phrase(2), "exited with code 2");
+        let av = ConnectOutcome::exit_phrase(-1073741819);
+        assert!(av.contains("access violation (0xC0000005)"), "{av}");
+        let other = ConnectOutcome::exit_phrase(0xC000_0409u32 as i32);
+        assert!(other.contains("0xC0000409"), "{other}");
+    }
+
+    #[test]
     fn session_contract_lines() {
         assert_eq!(
             parse_session_line(r#"{"ready":true}"#),
@@ -1032,8 +1368,175 @@ mod tests {
         // ignoring it.
         assert_eq!(parse_session_line(r#"{"window":{"w":1600}}"#), None);
         assert_eq!(parse_session_line("stats: 1280×800@60 · 60 fps"), None);
-        assert_eq!(parse_session_line(r#"stats-json: {"received":60}"#), None);
+        // The snapshot is an event; the text line is for a person reading a log.
+        match parse_session_line(r#"stats-json: {"width":1280,"received":60}"#) {
+            Some(SessionEvent::Stats(s)) => assert_eq!((s.width, s.received), (1280, 60)),
+            other => panic!("stats line parsed as {other:?}"),
+        }
         assert_eq!(parse_session_line(""), None);
         assert_eq!(parse_session_line(r#"{"other":1}"#), None);
+    }
+
+    /// Every line the session writes parses back to the event it meant, byte for byte
+    /// where the wire form is pinned above.
+    #[test]
+    fn emitted_lines_parse_back() {
+        let parse = |l: SessionLine| parse_session_line(&l.render());
+        assert_eq!(SessionLine::Ready.render(), r#"{"ready":true}"#);
+        assert_eq!(parse(SessionLine::Ready), Some(SessionEvent::Ready));
+        let pin = SessionLine::Error {
+            msg: "pin \"x\"\n\tno",
+            trust_rejected: Some(true),
+        };
+        assert_eq!(
+            parse(pin),
+            Some(SessionEvent::Error {
+                msg: "pin \"x\"\n\tno".into(),
+                trust_rejected: true
+            })
+        );
+        let bare = SessionLine::Error {
+            msg: "no window",
+            trust_rejected: None,
+        };
+        assert_eq!(bare.render(), r#"{"error":"no window"}"#);
+        assert_eq!(
+            parse(bare),
+            Some(SessionEvent::Error {
+                msg: "no window".into(),
+                trust_rejected: false
+            })
+        );
+        assert_eq!(
+            parse(SessionLine::Ended("Host ended")),
+            Some(SessionEvent::Ended("Host ended".into()))
+        );
+        let win = SessionLine::Window { w: 1600, h: 900 };
+        assert_eq!(win.render(), r#"{"window":{"w":1600,"h":900}}"#);
+        assert_eq!(parse(win), Some(SessionEvent::Window { w: 1600, h: 900 }));
+        let snap = punktfunk_core::hud::StatsSnapshot {
+            width: 1280,
+            received: 60,
+            ..Default::default()
+        };
+        let stats = SessionLine::Stats {
+            text: "1280×800@60",
+            snap: &snap,
+        }
+        .render();
+        let mut lines = stats.lines();
+        assert_eq!(lines.next(), Some("stats: 1280×800@60"));
+        match lines.next().and_then(parse_session_line) {
+            Some(SessionEvent::Stats(s)) => assert_eq!((s.width, s.received), (1280, 60)),
+            other => panic!("stats-json parsed as {other:?}"),
+        }
+    }
+
+    /// No GPU and no store. Host, launch, clipboard, timeout, bitrate, and codec
+    /// come from the plan. Caps are the wire bits, not whatever the helper returns.
+    #[test]
+    fn session_params_carry_the_plan_without_a_gpu() {
+        let h = host(
+            "Desk",
+            "192.168.1.50",
+            "11111111-2222-4333-8444-555555555555",
+            &"ab".repeat(32),
+        );
+        let plan = ConnectPlan {
+            host: HostTarget::from(&h),
+            launch: Some("steam:570".into()),
+            preset: None,
+            preset_override: None,
+            settings: Settings {
+                bitrate_kbps: 42_000,
+                codec: "av1".into(),
+                enable_444: true,
+                ..Default::default()
+            },
+            wake: false,
+            connect_timeout_secs: Some(45),
+            tofu: false,
+            clipboard: true,
+        };
+        let force_software = Arc::new(AtomicBool::new(false));
+        let latch_grid = Arc::new(crate::session::LatchGrid::default());
+        let probes = |hdr_enabled: bool, hevc_444_hardware: bool| Probes {
+            mode: Mode {
+                width: 2560,
+                height: 1440,
+                refresh_hz: 10,
+            },
+            identity: ("client".into(), "desk".into()),
+            vulkan: None,
+            force_software: Arc::clone(&force_software),
+            gamepad: GamepadPref::Xbox360,
+            hdr_enabled,
+            display_hdr: Some(HdrMeta::default()),
+            hevc_444_hardware,
+            stats_verbosity: StatsVerbosity::Detailed,
+            latch_grid: Arc::clone(&latch_grid),
+        };
+        let params = plan.session_params([9; 32], probes(false, false));
+        assert_eq!(params.host, plan.host.addr);
+        assert_eq!(params.port, plan.host.port);
+        assert_eq!(params.launch, plan.launch);
+        assert_eq!(params.clipboard, plan.clipboard);
+        assert_eq!(
+            params.connect_timeout,
+            Duration::from_secs(plan.connect_timeout_secs.unwrap())
+        );
+        assert_eq!(params.bitrate_kbps, plan.settings.bitrate_kbps);
+        assert_ne!(plan.settings.bitrate_kbps, Settings::default().bitrate_kbps);
+        assert_eq!(params.preferred_codec, punktfunk_core::quic::CODEC_AV1);
+        assert_ne!(plan.settings.codec, Settings::default().codec);
+        assert_eq!(params.exclude_codecs, 0);
+        assert_eq!(params.want_444, plan.settings.enable_444);
+        assert!(params.vulkan.is_none());
+        assert!(params.display_hdr.is_none());
+        assert!(!params.phase_lock);
+        assert_eq!(
+            params.video_caps,
+            punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE
+        );
+        assert_eq!(
+            params.mode,
+            Mode {
+                width: 2560,
+                height: 1440,
+                refresh_hz: 30,
+            }
+        );
+        assert_eq!(params.pin, Some([9; 32]));
+        assert_eq!(params.identity, ("client".into(), "desk".into()));
+        assert_eq!(params.gamepad, GamepadPref::Xbox360);
+        assert_eq!(params.stats_verbosity, StatsVerbosity::Detailed);
+        assert!(Arc::ptr_eq(&params.force_software, &force_software));
+        assert!(Arc::ptr_eq(&params.latch_grid, &latch_grid));
+
+        let hdr = plan.session_params([9; 32], probes(true, false));
+        assert_eq!(
+            hdr.video_caps,
+            punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE
+                | punktfunk_core::quic::VIDEO_CAP_10BIT
+                | punktfunk_core::quic::VIDEO_CAP_HDR
+        );
+        assert!(hdr.display_hdr.is_some());
+
+        let chroma = plan.session_params([9; 32], probes(false, true));
+        assert_eq!(
+            chroma.video_caps,
+            punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE | punktfunk_core::quic::VIDEO_CAP_444
+        );
+        assert!(chroma.want_444);
+        assert!(chroma.display_hdr.is_none());
+
+        let mut declined = plan.clone();
+        declined.settings.hdr_enabled = false;
+        let off = declined.session_params([9; 32], probes(true, false));
+        assert_eq!(off.video_caps, punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE);
+        assert!(
+            off.display_hdr.is_none(),
+            "the volume stays off with HDR off"
+        );
     }
 }

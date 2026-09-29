@@ -1,5 +1,5 @@
-// Hardware-keyboard navigation for the gamepad UI (iOS/iPadOS/macOS): arrows move, Return/Space
-// activate, Esc backs out.
+// Hardware-keyboard navigation for the library grid (iOS/iPadOS/macOS): arrows move,
+// Return/Space activate, Esc backs out.
 //
 // Asked for by a field user on an iPad ("select games with keyboard arrows, enter to launch"). An
 // iPad on a Magic Keyboard and a couch Mac are the same situation the console layout was built
@@ -11,12 +11,11 @@
 // there, and these screens hand it navigation authority on purpose.
 //
 // The view must be FOCUSED to receive key presses, so this takes focus on appear. That is safe on
-// exactly these screens because the gamepad UI has no system text fields to steal it from —
-// GamepadKeyboard is a custom grid of keycaps, not a `TextField`.
+// exactly these screens because they have no system text fields to steal it from.
 
 import PunktfunkKit
 import SwiftUI
-#if os(iOS) || os(macOS)
+#if os(iOS) || os(visionOS) || os(macOS)
 
 extension View {
     /// Route arrows / Return / Esc into the same handlers the controller poll drives.
@@ -69,7 +68,7 @@ private struct GamepadKeyNav: ViewModifier {
 
     /// Run a handler only while this screen owns input, and report back whether the press was
     /// consumed. `.ignored` matters: an unhandled Esc still has to reach the `.cancelAction`
-    /// shortcut that closes a macOS sheet (see GamepadAddHostView's hidden Cancel button).
+    /// shortcut that closes a macOS sheet.
     private func handle(_ action: () -> Void) -> KeyPress.Result {
         guard active else { return .ignored }
         action()

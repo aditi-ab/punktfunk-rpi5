@@ -15,7 +15,9 @@
 # the table. `PROVEN_BUCKET_WINDOWS` is in it and expected green: see
 # `KNOWN_GREEN`. `PROBE_AFTERMATH_WINDOWS` is mutated to 0 rather than to
 # another count: its budget binds only for a client that never gets its
-# picture back, and no scenario models one.
+# picture back, and no scenario models one. `SHARD_WIRE_OVERHEAD` is the
+# packet header's size and `NO_SHARE_KBPS` a wire value, not decisions, so
+# neither is in the table.
 set -u
 cd "$(dirname "$0")/.." || exit 2
 
@@ -105,6 +107,17 @@ LOSS_HORIZON_WINDOWS|const LOSS_HORIZON_WINDOWS: u32 = 32;|const LOSS_HORIZON_WI
 LOSS_BUDGET_SECS|const LOSS_BUDGET_SECS: u64 = 600;|const LOSS_BUDGET_SECS: u64 = 60;
 LOSS_RELEASE_PCT|const LOSS_RELEASE_PCT: u32 = 125;|const LOSS_RELEASE_PCT: u32 = 100;
 LOSS_PCT_MAX|const LOSS_PCT_MAX: u8 = 25;|const LOSS_PCT_MAX: u8 = 50;
+MIN_BITRATE_KBPS|const MIN_BITRATE_KBPS: u32 = 500;|const MIN_BITRATE_KBPS: u32 = 5_000;
+FEC_MIN|const FEC_MIN: u8 = 5;|const FEC_MIN: u8 = 20;
+FEC_MAX|const FEC_MAX: u8 = 50;|const FEC_MAX: u8 = 15;
+FEC_ADAPTIVE_START|const FEC_ADAPTIVE_START: u8 = 10;|const FEC_ADAPTIVE_START: u8 = 40;
+FEC_STEP|const FEC_STEP: u8 = 3;|const FEC_STEP: u8 = 20;
+FEC_STEP_WINDOWS|const FEC_STEP_WINDOWS: u32 = 4;|const FEC_STEP_WINDOWS: u32 = 40;
+PROBE_MS|const PROBE_MS: u32 = 800;|const PROBE_MS: u32 = 100;
+PROBE_DELAY|const PROBE_DELAY: Duration = Duration::from_secs(2);|const PROBE_DELAY: Duration = Duration::from_secs(30);
+PROBE_TIMEOUT|const PROBE_TIMEOUT: Duration = Duration::from_secs(15);|const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+STILL_FRAMES_DIV|const STILL_FRAMES_DIV: u64 = 4;|const STILL_FRAMES_DIV: u64 = 40;
+ACK_GIVE_UP|const ACK_GIVE_UP: Duration = Duration::from_secs(10);|const ACK_GIVE_UP: Duration = Duration::from_secs(300);
 EOF
 )
 

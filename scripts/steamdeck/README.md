@@ -3,7 +3,7 @@
 Run a punktfunk **host** on a Steam Deck — stream its Game Mode (or KDE desktop) *to* other devices.
 (Streaming *to* a Deck is the client; use the Flatpak + [Decky plugin](../../clients/decky/) instead.)
 
-User-facing guide: **docs-site → "SteamOS (Host)"** (`docs-site/content/docs/steamos-host.md`).
+User-facing guide: **docs-site → "SteamOS (Host)"** (`docs-site/content/docs/(guide)/(install)/steamos-host.mdx`).
 This README is the deep reference for what the scripts do and how to operate them by hand.
 
 ## Why build on-device (not a package or prebuilt binary)
@@ -42,21 +42,22 @@ serving HTTPS (HTTP/1.1 over TLS) with the host's identity cert), so its service
 | Script | What it does |
 |--------|--------------|
 | `install.sh` | Idempotent installer: ensure the `pf2` distrobox + toolchain → build host + web + **plugin runner** → write config → build the **HDR gamescope** below → tune sysctl + udev + `vhci-hcd` + `input` group and **register it on SteamOS's atomic-update keep list** (sudo) → install + start `punktfunk-host` / `punktfunk-web` systemd **user** services with linger, plus the **rebuild check** below. |
-| `update.sh` | Rebuild everything from the current source and restart the services (config + pairings persist). `--pull` does `git pull` first. Also retrofits anything a newer install.sh writes (runner, HDR gamescope, keep-list registration, rebuild check) onto older installs. |
+| `update.sh` | Rebuild everything from the current source and restart the services (config + pairings persist). `--pull` does `git pull` first, on the branch the checkout follows: `stable` (releases, the default) or `main` (canary). Also retrofits anything a newer install.sh writes (runner, HDR gamescope, keep-list registration, rebuild check) onto older installs. |
+| `build-version.sh` | The version a build reports: a release tag's `X.Y.Z`, else the canary base (`scripts/ci/pf-version.sh`) plus the commit, so the console and the channel's feed agree. |
 | `build-gamescope.sh` | Build gamescope + the `pipewire-hdr` patches (`packaging/gamescope`) in the same distrobox and install it as `~/.local/bin/punktfunk-gamescope`, wiring `PUNKTFUNK_GAMESCOPE_BIN` into `host.env` — what lets Game Mode stream **10-bit BT.2020 PQ (HDR)** instead of 8-bit SDR. Best-effort: a failure warns and the host streams SDR. Content-stamped — a no-op unless `packaging/gamescope/` changed or the binary broke. |
 | `rebuild-check.sh` | The post-OS-update self-heal (run by `punktfunk-rebuild-check.service` before the host at session start): `ldd`-probes the host binary **and the HDR gamescope** — milliseconds when healthy, a full `update.sh` rebuild only when a SteamOS update actually broke library links. |
 
 ```sh
-git clone https://git.unom.io/unom/punktfunk ~/punktfunk
+git clone --branch stable https://git.unom.io/unom/punktfunk ~/punktfunk   # --branch main: canary
 bash ~/punktfunk/scripts/steamdeck/install.sh            # PIN pairing required (secure default)
 bash ~/punktfunk/scripts/steamdeck/install.sh --open     # trusted LAN: accept unpaired clients
 bash ~/punktfunk/scripts/steamdeck/install.sh --no-web   # host only, no web console
 bash ~/punktfunk/scripts/steamdeck/install.sh --gamestream     # also serve stock Moonlight (trusted LAN)
-bash ~/punktfunk/scripts/steamdeck/update.sh             # after pulling new source
+bash ~/punktfunk/scripts/steamdeck/update.sh --pull      # pull the followed branch, rebuild
 ```
 
-Note: the Deck install matches a bare `serve` — native-only, PIN pairing required. Pass `--gamestream`
-to also serve stock Moonlight clients; `--no-gamestream` is kept for old command lines / re-runs.
+Note: the Deck install matches a bare `serve` — native-only, PIN pairing required. `--gamestream` and
+`--no-gamestream` set the console's **GameStream** setting; change it later under Host → Settings.
 
 Env overrides: `PUNKTFUNK_SRC` (source dir, default `~/punktfunk`), `PUNKTFUNK_BOX` (container name,
 default `pf2`), `PUNKTFUNK_MGMT_PORT` (47990), `PUNKTFUNK_WEB_PORT` (47992).
@@ -68,8 +69,8 @@ default `pf2`), `PUNKTFUNK_MGMT_PORT` (47990), `PUNKTFUNK_WEB_PORT` (47992).
   password + session secret). Trust material (`cert.pem`, `mgmt-token`, `punktfunk1-paired.json`) lives
   here too and persists across updates.
 - **Services:** `~/.config/systemd/user/punktfunk-host.service` (runs `serve --mgmt-bind
-  0.0.0.0:47990`, `+ --gamestream` / `+ --open` if chosen — the native `punktfunk/1` plane is always
-  on; `--gamestream` adds the Moonlight-compat planes so Game Mode also streams to stock Moonlight),
+  0.0.0.0:47990`, `+ --open` if chosen — the native `punktfunk/1` plane is always on; GameStream
+  follows the console's setting, and `update.sh` moves an older unit's `--gamestream` into it),
   `punktfunk-web.service`, `punktfunk-rebuild-check.service` (post-OS-update self-heal, enabled), and
   `punktfunk-scripting.service` (plugin runner, **opt-in** — enable it once you use plugins/scripts).
   Linger is enabled so they run without a login session.

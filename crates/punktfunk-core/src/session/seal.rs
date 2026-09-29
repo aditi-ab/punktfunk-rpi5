@@ -52,6 +52,63 @@ impl SealLane {
     }
 }
 
+/// Data shards per pipeline step: ~180 KB of wire, 0.15 ms at 10 GbE and ~0.12 ms of
+/// AES-GCM, so the lane and the wire stay busy and the hand-off stays small beside them.
+pub(super) const SEAL_CHUNK_SHARDS: usize = 128;
+
+/// The session's counted send: how many of the packets the kernel took.
+pub type SendFn<'a> = dyn FnMut(&[&[u8]]) -> Result<usize> + 'a;
+
+/// Where [`Session::seal_frame_chunks_at`](super::Session::seal_frame_chunks_at) hands each
+/// sealed chunk, with the send it must use.
+pub type SealSink<'a> = dyn FnMut(&[Vec<u8>], &mut SendFn<'_>) -> Result<()> + 'a;
+
+/// One step of the chunk pipeline: `wires[chunk_start..used]` goes to the lane, and
+/// the chunk before it comes back sealed for `sink`. The new job goes out first so
+/// the lane works while `sink` sends. `in_flight` tracks the job left at the lane;
+/// the caller collects it when the frame ends.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn hand_chunk(
+    lane: &SealLane,
+    wires: &mut Vec<Vec<u8>>,
+    used: &mut usize,
+    chunk_start: usize,
+    seq_base: u64,
+    timed: bool,
+    scratch: &mut Vec<Vec<u8>>,
+    in_flight: &mut bool,
+    done: &mut Vec<Vec<u8>>,
+    seal_ns: &mut u64,
+    sink: &mut SealSink<'_>,
+    send: &mut SendFn<'_>,
+) -> Result<()> {
+    let mut bufs = std::mem::take(scratch);
+    bufs.extend(wires.drain(chunk_start..*used));
+    *used = chunk_start;
+    let job = SealJob {
+        bufs,
+        seq_base,
+        timed,
+        ns: 0,
+        result: Ok(()),
+    };
+    if lane.to_worker.send(job).is_err() {
+        return Err(crate::error::PunktfunkError::Unsupported("seal lane died"));
+    }
+    if std::mem::replace(in_flight, true) {
+        let mut prev = lane
+            .from_worker
+            .recv()
+            .map_err(|_| crate::error::PunktfunkError::Unsupported("seal lane died"))?;
+        *seal_ns += prev.ns;
+        let r = prev.result.and_then(|()| sink(&prev.bufs, send));
+        done.append(&mut prev.bufs);
+        *scratch = prev.bufs;
+        r?;
+    }
+    Ok(())
+}
+
 /// Buffer `i` is `seq(8) ‖ plaintext ‖ tag scratch`; seals `[8..]` under nonce
 /// `seq_base + i`. Same layout and nonce order as the fused single-lane path.
 pub(super) fn seal_wire_slice(

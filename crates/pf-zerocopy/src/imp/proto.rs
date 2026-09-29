@@ -30,6 +30,26 @@ pub enum ImportKind {
     LinearNv12,
 }
 
+impl ImportKind {
+    /// The CUDA planes this import delivers.
+    pub fn layout(self) -> super::cuda::PlaneLayout {
+        use super::cuda::PlaneLayout;
+        match self {
+            ImportKind::Tiled | ImportKind::Linear => PlaneLayout::Packed32,
+            ImportKind::TiledNv12 | ImportKind::LinearNv12 => PlaneLayout::Nv12,
+            ImportKind::Tiled444 => PlaneLayout::Yuv444,
+        }
+    }
+
+    /// Tiled imports de-tile through EGL/GL; LINEAR ones go through the Vulkan bridge.
+    pub fn is_tiled(self) -> bool {
+        matches!(
+            self,
+            ImportKind::Tiled | ImportKind::TiledNv12 | ImportKind::Tiled444
+        )
+    }
+}
+
 /// host → worker.
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub enum Request {

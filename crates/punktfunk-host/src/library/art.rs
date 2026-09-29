@@ -526,13 +526,6 @@ fn art_refused_path(dir: &Path, key: &str) -> PathBuf {
     dir.join(format!("{key}.refused"))
 }
 
-fn now_s() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// True once a fetch refused this URL. [`proxy_art`] then leaves it in the catalog verbatim, so
 /// the client fetches it itself exactly as it did before the store existed.
 fn remote_art_refused(url: &str) -> bool {
@@ -543,7 +536,8 @@ fn remote_art_refused(url: &str) -> bool {
 /// blob is its own URL, so it never goes stale.
 fn art_is_fresh(meta: &ArtMeta) -> bool {
     meta.url.starts_with("data:")
-        || now_s().saturating_sub(meta.fetched_at_s) < meta.max_age_s.max(ART_REVALIDATE_S)
+        || crate::clock::unix_secs_u64().saturating_sub(meta.fetched_at_s)
+            < meta.max_age_s.max(ART_REVALIDATE_S)
 }
 
 fn read_art_meta(dir: &Path, key: &str) -> Option<ArtMeta> {
@@ -668,7 +662,7 @@ fn stored_remote_art(url: &str) -> Option<(Vec<u8>, String)> {
                 ctype: ctype.to_string(),
                 etag,
                 max_age_s,
-                fetched_at_s: now_s(),
+                fetched_at_s: crate::clock::unix_secs_u64(),
             };
             write_art(&dir, &key, &bytes, &meta);
             Some((bytes, meta.ctype))
@@ -681,7 +675,7 @@ fn stored_remote_art(url: &str) -> Option<(Vec<u8>, String)> {
                     &dir,
                     &key,
                     &ArtMeta {
-                        fetched_at_s: now_s(),
+                        fetched_at_s: crate::clock::unix_secs_u64(),
                         ..meta
                     },
                 );
@@ -740,7 +734,7 @@ pub fn proxy_art(id: &str, art: &mut Artwork) {
 /// Best box-art for a library id, for GameStream `/appasset` (Moonlight fetches covers from the
 /// host, not the CDN). Blocking — call off the async runtime.
 pub fn fetch_box_art(id: &str) -> Option<(Vec<u8>, String)> {
-    let entry = entry_for_library_id(id)?;
+    let art = merged_art(id)?;
     [
         ArtKind::Portrait,
         ArtKind::Header,
@@ -748,7 +742,7 @@ pub fn fetch_box_art(id: &str) -> Option<(Vec<u8>, String)> {
         ArtKind::Logo,
     ]
     .into_iter()
-    .filter_map(|kind| art_field(&entry.art, kind))
+    .filter_map(|kind| art_field(&art, kind))
     .find_map(|v| resolve_art_bytes(&v))
 }
 

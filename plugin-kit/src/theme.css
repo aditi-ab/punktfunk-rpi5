@@ -1,8 +1,9 @@
 /* punktfunk plugin-UI theme — the console's violet identity, packaged so plugin UIs
  * render indistinguishably from the console they're embedded in.
  *
- * Extracted from the console's web/src/styles.css + timing-functions.css (keep in sync —
- * console/theme unification is a tracked follow-up). Consume as the FIRST import of the
+ * Extracted from the console's web/src/styles.css + timing-functions.css. Inside the console's
+ * frame these are the fallback: the console sets its live palette and `.dark` inline over them
+ * (`pf-ui:theme`, injected by the proxy). Consume as the FIRST import of the
  * plugin UI's Tailwind entry, then add the app-specific lines yourself:
  *
  *   @import "tailwindcss";
@@ -11,7 +12,7 @@
  *   @custom-variant dark (&:is(.dark *));
  *   @source "../node_modules/@unom/ui/dist/**\/*.{js,mjs}";
  *
- * Pin `<html class="dark">` (the console does) — removing the class yields light.
+ * Pin `<html class="dark">` for the standalone tab — removing the class yields light.
  */
 
 /* ── Penner easing tokens — @unom/ui's accordion/collapsible/material resolve these. ── */

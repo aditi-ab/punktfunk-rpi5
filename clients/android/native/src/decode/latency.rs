@@ -5,15 +5,7 @@ use punktfunk_core::session::Frame;
 use std::collections::VecDeque;
 use std::time::Duration;
 
-/// Wall-clock now in nanoseconds (CLOCK_REALTIME basis), to compare against the host-stamped
-/// capture `pts_ns` after the skew offset is applied.
-pub(crate) fn now_realtime_ns() -> i128 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i128)
-        .unwrap_or(0)
-}
+pub(crate) use punktfunk_core::client::now_realtime_ns;
 
 /// HUD `decoded` point for one dequeued output frame, keyed by the echoed `presentationTimeUs`:
 /// hand the frame and its `decode` span (received→decoded, single-clock local, ≥ 0) to
@@ -31,18 +23,7 @@ pub(super) fn note_decoded_pts(
     pts_us: u64,
     decoded_ns: i128,
 ) -> Option<i128> {
-    // Pair the echoed pts back to its receipt stamp, evicting stale (older) entries as we go.
-    let mut received_ns = None;
-    while let Some(&(p, r)) = in_flight.front() {
-        if p > pts_us {
-            break; // future frame — leave it for its own output buffer
-        }
-        in_flight.pop_front();
-        if p == pts_us {
-            received_ns = Some(r);
-            break;
-        }
-    }
+    let received_ns = take_by_pts(in_flight, pts_us);
     let decode_us = received_ns.map(|r| ((decoded_ns - r).max(0) / 1000) as u64);
     // Adaptive bitrate: the `decode` stage (received→decoded, single-clock local) IS the decoder-
     // backlog signal — the only bottleneck the host-side network signals can't see (a fast LAN
@@ -61,18 +42,17 @@ pub(super) fn note_decoded_pts(
     received_ns
 }
 
-/// The queued-instant stamp for a decoded output, keyed by the echoed `presentationTimeUs` — the
-/// same monotonic evict-as-you-go pairing as [`take_flags`], over an `(pts_us, realtime_ns)` map
-/// (the feed side stamps each AU as its last piece enters the codec). A miss returns `None` —
-/// the split is simply not recorded for that frame.
-pub(super) fn take_stamp(map: &mut VecDeque<(u64, i128)>, pts_us: u64) -> Option<i128> {
-    while let Some(&(p, t)) = map.front() {
+/// The value parked for `pts_us` in a pts-ordered queue, popping it and every older entry.
+/// Decode order == input order (low-latency, no B-frames), so an older entry was dropped inside
+/// the codec or parked before a flush; a newer one stays for its own output. `None` on a miss.
+pub(super) fn take_by_pts<V: Copy>(q: &mut VecDeque<(u64, V)>, pts_us: u64) -> Option<V> {
+    while let Some(&(p, v)) = q.front() {
         if p > pts_us {
-            break; // future frame — leave it for its own output buffer
+            return None;
         }
-        map.pop_front();
+        q.pop_front();
         if p == pts_us {
-            return Some(t);
+            return Some(v);
         }
     }
     None
@@ -81,20 +61,10 @@ pub(super) fn take_stamp(map: &mut VecDeque<(u64, i128)>, pts_us: u64) -> Option
 /// The AU `user_flags` for a decoded output, keyed by the echoed `presentationTimeUs`. Recovery
 /// signalling (FLAG_SOF IDR marker / RECOVERY_ANCHOR / RECOVERY_POINT) rides the AU's flags, which are
 /// only in scope at feed time — so the feed side parks `(pts_us, flags)` here and the present side
-/// looks them up to fold [`ReanchorGate::on_decoded`]. Decode order == input order (low-latency, no
-/// B-frames), so this evicts entries older than `pts_us` as it goes; a miss (probe filler, or an entry
-/// aged past the cap) reads `0` — no recovery flags, decoded normally.
+/// looks them up to fold [`ReanchorGate::on_decoded`]. A miss (probe filler, or an entry aged past
+/// the cap) reads `0` — no recovery flags, decoded normally.
 pub(super) fn take_flags(map: &mut VecDeque<(u64, u32)>, pts_us: u64) -> u32 {
-    while let Some(&(p, f)) = map.front() {
-        if p > pts_us {
-            break; // future frame — leave it for its own output buffer
-        }
-        map.pop_front();
-        if p == pts_us {
-            return f;
-        }
-    }
-    0
+    take_by_pts(map, pts_us).unwrap_or(0)
 }
 
 /// p50/max of an unsorted µs sample vec, in ms — the HUD's per-stage summary, shared by both
@@ -137,4 +107,25 @@ pub(super) fn note_received_frame(
         }
     }
     received_ns
+}
+
+#[cfg(test)]
+mod tests {
+    use super::take_by_pts;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn take_by_pts_evicts_older_pops_the_match_and_holds_newer() {
+        let mut q: VecDeque<(u64, i128)> = [(10, 1), (20, 2), (30, 3), (40, 4)].into();
+        assert_eq!(take_by_pts(&mut q, 30), Some(3));
+        assert_eq!(q, VecDeque::from([(40, 4)]));
+        assert_eq!(
+            take_by_pts(&mut q, 35),
+            None,
+            "a miss keeps the newer entry"
+        );
+        assert_eq!(q, VecDeque::from([(40, 4)]));
+        assert_eq!(take_by_pts(&mut q, 50), None);
+        assert!(q.is_empty());
+    }
 }

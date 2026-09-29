@@ -5,13 +5,8 @@
 /// change fails here rather than on the platform CI cannot run.
 #[test]
 fn published_endpoint_line_parses_the_way_both_consumers_read_it() {
-    let dir = std::env::temp_dir().join(format!(
-        "pf-mgmt-endpoint-{}-{:p}",
-        std::process::id(),
-        &0u8 as *const u8
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = super::write_endpoint(&dir, 47991).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = super::write_endpoint(dir.path(), 47991).unwrap();
     assert_eq!(path.file_name().unwrap(), super::ENDPOINT_FILE);
 
     let contents = std::fs::read_to_string(&path).unwrap();
@@ -27,8 +22,6 @@ fn published_endpoint_line_parses_the_way_both_consumers_read_it() {
     assert!(!value.contains('='));
     // Loopback whatever the listener binds: a 0.0.0.0 bind must never be echoed as a LAN URL.
     assert!(value.starts_with("https://127.0.0.1:"));
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 use super::*;
@@ -36,11 +29,11 @@ use super::*;
 /// Knocks in these tests come from the LAN unless the test is about a WAN knock. An unknown
 /// source classifies as WAN, which the approve endpoint refuses.
 const LAN_KNOCK: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 44));
-use crate::encode::Codec;
 #[cfg(feature = "gamestream")]
 use crate::gamestream::cert::ServerIdentity;
 use crate::gamestream::tls::{PeerAddr, PeerCertFingerprint};
-use crate::gamestream::{Host, LaunchSession, HTTPS_PORT, HTTP_PORT};
+use crate::gamestream::{LaunchSession, HTTPS_PORT, HTTP_PORT};
+use crate::host::Host;
 use axum::body::Body;
 use axum::http::StatusCode;
 use http_body_util::BodyExt;
@@ -48,31 +41,19 @@ use sha2::{Digest, Sha256};
 use std::sync::atomic::Ordering;
 use tower::ServiceExt;
 
-/// Unique temp dir for the access store; never the host config dir.
+/// The access store's dir, one per call; never the host config dir.
 fn test_access_dir() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "pf-mgmt-access-{}-{:p}",
-        std::process::id(),
-        &0u8 as *const u8
-    ))
+    crate::test_support::scratch()
 }
 
-/// Unique temp dir; never the host config dir.
+/// One dir per call; never the host config dir.
 fn test_client_logs_dir() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "pf-mgmt-clientlogs-{}-{:p}",
-        std::process::id(),
-        &0u8 as *const u8
-    ))
+    crate::test_support::scratch()
 }
 
-/// Unique temp dir; never the host config dir.
+/// One dir per call; never the host config dir.
 fn test_stats() -> Arc<crate::stats_recorder::StatsRecorder> {
-    crate::stats_recorder::StatsRecorder::new(std::env::temp_dir().join(format!(
-        "pf-mgmt-stats-{}-{:p}",
-        std::process::id(),
-        &0u8 as *const u8
-    )))
+    crate::stats_recorder::StatsRecorder::new(crate::test_support::scratch())
 }
 
 fn test_state() -> Arc<AppState> {
@@ -84,15 +65,12 @@ fn test_state() -> Arc<AppState> {
         os_chain: "linux/arch/steamos".into(),
         os_name: "SteamOS".into(),
     };
-    #[cfg(feature = "gamestream")]
-    {
-        let identity = ServerIdentity::ephemeral().expect("ephemeral identity");
-        Arc::new(AppState::new(host, identity, test_stats()))
-    }
-    #[cfg(not(feature = "gamestream"))]
-    {
-        Arc::new(AppState::new(host, test_stats()))
-    }
+    Arc::new(AppState::new(
+        host,
+        test_stats(),
+        #[cfg(feature = "gamestream")]
+        crate::gamestream::GsState::new(ServerIdentity::ephemeral().expect("ephemeral identity")),
+    ))
 }
 
 /// One identified plugin, so the id-scoped routes have something to accept and something to
@@ -100,6 +78,10 @@ fn test_state() -> Arc<AppState> {
 /// unidentified lane beside it.
 fn test_plugin_tokens() -> std::collections::BTreeMap<String, String> {
     std::collections::BTreeMap::from([("demo".to_string(), "demo-secret".to_string())])
+}
+
+fn shared_plugin_tokens(tokens: std::collections::BTreeMap<String, String>) -> super::PluginTokens {
+    Arc::new(std::sync::RwLock::new(tokens))
 }
 
 // `None` installs "test-secret" (`send` attaches the matching bearer). An explicit token
@@ -110,7 +92,7 @@ fn test_app(state: Arc<AppState>, token: Option<&str>) -> Router {
         state,
         Some(token.unwrap_or("test-secret").to_string()),
         Some("plugin-secret".to_string()),
-        test_plugin_tokens(),
+        shared_plugin_tokens(test_plugin_tokens()),
         DEFAULT_PORT,
         None,
         stats,
@@ -131,7 +113,7 @@ fn test_app_browser(state: Arc<AppState>) -> Router {
         state,
         Some("test-secret".to_string()),
         Some("plugin-secret".to_string()),
-        test_plugin_tokens(),
+        shared_plugin_tokens(test_plugin_tokens()),
         DEFAULT_PORT,
         None,
         stats,
@@ -150,7 +132,7 @@ fn test_app_native(state: Arc<AppState>, np: Arc<crate::native_pairing::NativePa
         state,
         Some("test-secret".to_string()),
         Some("plugin-secret".to_string()),
-        test_plugin_tokens(),
+        shared_plugin_tokens(test_plugin_tokens()),
         DEFAULT_PORT,
         Some(np),
         stats,
@@ -245,7 +227,7 @@ async fn host_actions_follow_the_power_grant() {
     let (status, body) = send(&app, discover(guest_fp)).await;
     assert_eq!(status, StatusCode::OK);
     let rows = body["actions"].as_array().unwrap();
-    assert_eq!(rows.len(), 4, "{body}");
+    assert_eq!(rows.len(), 5, "{body}");
     assert!(
         rows.iter().all(|a| a["permitted"] == false),
         "a controller-only guest must not be offered power: {body}"
@@ -257,6 +239,7 @@ async fn host_actions_follow_the_power_grant() {
                 .as_array()
                 .unwrap()
                 .iter()
+                .filter(|a| a["group"] != "display")
                 .all(|a| a["permitted"] == true),
             "full control (current or legacy-stored) carries Power: {body}"
         );
@@ -279,6 +262,84 @@ async fn host_actions_follow_the_power_grant() {
     // Unknown id 404s before grant or platform checks.
     let (status, _) = send(&app, post("/api/v1/actions/no.such")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// `display.next` follows the caller's own live session, never the Host power grant, and a
+/// refusal ends nothing. Never invoked with a pass: `policy::prefs()` is the developer's own
+/// `display-settings.json`, so a pinned two-head box would really switch.
+#[tokio::test]
+async fn display_next_follows_the_live_session_not_the_power_grant() {
+    use punktfunk_core::quic::GRANT_GAMEPAD;
+    let _serial = crate::session_status::tests::REGISTRY.lock().await;
+    let np = Arc::new(
+        crate::native_pairing::NativePairing::load_with(
+            Some(
+                std::env::temp_dir()
+                    .join(format!("pf-mgmt-display-next-{}.json", std::process::id())),
+            ),
+            None,
+            false,
+        )
+        .unwrap(),
+    );
+    let streaming_fp = "aaaa00000011"; // controller-only, streaming
+    let idle_fp = "bbbb00000012"; // full control, nothing live
+    np.add_with_access(
+        "streaming",
+        streaming_fp,
+        Some(crate::native_pairing::Access {
+            grants: GRANT_GAMEPAD,
+            expires_unix: None,
+            until_disconnect: false,
+        }),
+    )
+    .unwrap();
+    np.add("idle", idle_fp).unwrap();
+    let app = test_app_native(test_state(), np);
+    let (_live, stop, quit, _) = fake_session_with_flags(streaming_fp);
+
+    let display_next = |body: &serde_json::Value| {
+        body["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == "display.next")
+            .cloned()
+            .unwrap_or_else(|| panic!("display.next is always listed: {body}"))
+    };
+    let discover = |fp: Option<&str>| {
+        let mut req = get_req("/api/v1/actions");
+        if let Some(fp) = fp {
+            req.extensions_mut()
+                .insert(PeerCertFingerprint(Some(fp.to_string())));
+        }
+        req
+    };
+    let row = display_next(&send(&app, discover(Some(streaming_fp))).await.1);
+    assert_eq!(
+        row["permitted"], true,
+        "its own session, no grant bit: {row}"
+    );
+    assert_eq!(row["group"], "display");
+    assert_eq!(row["danger"], false);
+    let row = display_next(&send(&app, discover(Some(idle_fp))).await.1);
+    assert_eq!(
+        row["permitted"], false,
+        "Host power is not a session: {row}"
+    );
+    let row = display_next(&send(&app, discover(None)).await.1);
+    assert_eq!(row["permitted"], true, "the console may always: {row}");
+
+    // Down the power path this device has the grant and would meet the other live device's
+    // 409 instead.
+    let post = axum::http::Request::post("/api/v1/actions/display.next")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(send_cert(&app, post, idle_fp).await, StatusCode::FORBIDDEN);
+    assert!(
+        !stop.load(Ordering::SeqCst) && !quit.load(Ordering::SeqCst),
+        "a display action ends no session"
+    );
 }
 
 /// A paired streaming cert reaches only the read-only allowlist; PIN and mutating routes need the operator bearer.
@@ -462,29 +523,11 @@ fn fake_native_session(
     fps: u32,
 ) -> crate::session_status::LiveSessionGuard {
     let packed = ((width as u64) << 32) | ((height as u64) << 16) | fps as u64;
+    // Desktop stream: no game row.
     crate::session_status::register(crate::session_status::Registration {
         mode: Arc::new(std::sync::atomic::AtomicU64::new(packed)),
-        bitrate_kbps: Arc::new(std::sync::atomic::AtomicU32::new(20_000)),
-        codec: Codec::H265,
-        stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        quit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        force_idr: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        client: "test-client".into(),
-        plane: crate::events::Plane::Native,
         client_name: Some("studio-deck".into()),
-        hdr: false,
-        ttff_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        last_resize_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        // Desktop stream: no game row.
-        game: None,
-        capture_health: Arc::new(std::sync::Mutex::new(None)),
-        join: false,
-        controls: crate::session_status::SessionControls::open(),
-        bit_depth: 8,
-        chroma: crate::encode::ChromaFormat::Yuv420,
-        end_reason: Arc::new(std::sync::atomic::AtomicU8::new(0)),
-        counters: Arc::new(crate::session_status::SessionCounters::default()),
-        peer: None,
+        ..crate::session_status::Registration::fake("test-client")
     })
 }
 
@@ -515,26 +558,11 @@ fn fake_session_with_flags(
         mode: Arc::new(std::sync::atomic::AtomicU64::new(
             (1920u64 << 32) | (1080u64 << 16) | 60,
         )),
-        bitrate_kbps: Arc::new(std::sync::atomic::AtomicU32::new(20_000)),
-        codec: Codec::H265,
         stop: stop.clone(),
         quit: quit.clone(),
         force_idr: idr.clone(),
-        client: client.into(),
-        client_name: None,
-        plane: crate::events::Plane::Native,
-        hdr: false,
-        ttff_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        last_resize_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        game: None,
-        capture_health: Arc::new(std::sync::Mutex::new(None)),
-        join: false,
         controls,
-        bit_depth: 8,
-        chroma: crate::encode::ChromaFormat::Yuv420,
-        end_reason: Arc::new(std::sync::atomic::AtomicU8::new(0)),
-        counters: Arc::new(crate::session_status::SessionCounters::default()),
-        peer: None,
+        ..crate::session_status::Registration::fake(client)
     });
     (guard, stop, quit, idr)
 }
@@ -1081,7 +1109,7 @@ async fn host_info_publishes_the_hosts_own_fingerprint() {
         state,
         Some("test-secret".to_string()),
         Some("plugin-secret".to_string()),
-        test_plugin_tokens(),
+        shared_plugin_tokens(test_plugin_tokens()),
         DEFAULT_PORT,
         None,
         stats,
@@ -1544,6 +1572,75 @@ async fn a_plugin_may_write_only_its_own_id() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+/// Authentication reads the shared map on every request, so a store job can publish a token
+/// before restarting the runner without rebuilding the management router.
+#[tokio::test]
+async fn a_refreshed_plugin_token_takes_effect_live() {
+    let state = test_state();
+    let stats = state.stats.clone();
+    let tokens = shared_plugin_tokens(std::collections::BTreeMap::from([(
+        "demo".to_string(),
+        "old-secret".to_string(),
+    )]));
+    let app = app(
+        state,
+        Some("test-secret".to_string()),
+        Some("plugin-secret".to_string()),
+        tokens.clone(),
+        DEFAULT_PORT,
+        None,
+        stats,
+        test_client_logs_dir(),
+        test_access_dir(),
+        false,
+        None,
+        false,
+    );
+    *tokens
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        std::collections::BTreeMap::from([("demo".to_string(), "new-secret".to_string())]);
+    let put = |token: &str| {
+        axum::http::Request::builder()
+            .method("PUT")
+            .uri("/api/v1/plugins/demo")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(r#"{"title":"Demo"}"#))
+            .unwrap()
+    };
+    assert_eq!(
+        send(&app, put("old-secret")).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        send(&app, put("new-secret")).await.0,
+        StatusCode::NO_CONTENT
+    );
+}
+
+/// `plugins add` mints in another process: a token only the file knows authenticates, as that
+/// plugin, on its first request.
+#[tokio::test]
+async fn a_token_minted_by_another_process_authenticates() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = dir.path().join(crate::plugins::RUNNER_DATA_DIR);
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::write(run.join("plugin-tokens.json"), r#"{"fresh":"cli-secret"}"#).unwrap();
+    let app = test_app_access(test_state(), dir.path());
+    let put = |id: &str| {
+        axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/api/v1/plugins/{id}"))
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer cli-secret")
+            .body(Body::from(r#"{"title":"Fresh"}"#))
+            .unwrap()
+    };
+    assert_eq!(send(&app, put("fresh")).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(send(&app, put("demo")).await.0, StatusCode::FORBIDDEN);
+}
+
 /// Same rule on the library side: a provider's entries belong to the plugin that owns the id.
 #[tokio::test]
 async fn a_plugin_may_reconcile_only_its_own_provider() {
@@ -1571,6 +1668,55 @@ async fn a_plugin_may_reconcile_only_its_own_provider() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// Every plugin-scoped write refuses another plugin's id before it reads the body, and
+/// checks the id's shape only for a caller that may write it.
+#[tokio::test]
+async fn every_plugin_scoped_write_checks_the_owner_first() {
+    let app = test_app(test_state(), None);
+    let req = |method: &str, path: &str, token: &str| {
+        bearer_req(
+            axum::http::Request::builder()
+                .method(method)
+                .uri(format!("/api/v1{path}"))
+                .header("content-type", "application/json")
+                .body(Body::from("{not json"))
+                .unwrap(),
+            token,
+        )
+    };
+    for (method, path) in [
+        ("PUT", "/library/scanners/steam"),
+        ("PUT", "/library/provider/steam"),
+        ("DELETE", "/library/provider/steam"),
+        ("PUT", "/library/provider/steam/running"),
+        ("PUT", "/library/metadata/steam"),
+        ("DELETE", "/library/metadata/steam"),
+        ("PUT", "/plugins/rom-manager"),
+        ("DELETE", "/plugins/rom-manager"),
+    ] {
+        let (status, body) = send(&app, req(method, path, "demo-secret")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {body}");
+        assert_eq!(body["error"], "a plugin may only write its own id");
+    }
+    for (method, path) in [
+        ("PUT", "/library/provider/manual"),
+        ("DELETE", "/library/provider/manual"),
+        ("PUT", "/library/metadata/manual"),
+        ("DELETE", "/library/metadata/manual"),
+        ("PUT", "/plugins/Not_Kebab"),
+    ] {
+        let (status, body) = send(&app, req(method, path, "plugin-secret")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {path}: {body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("id"),
+            "the id is refused, not the body: {body}"
+        );
+    }
+    // Deregistering takes any id: an unknown one is already gone.
+    let (status, _) = send(&app, req("DELETE", "/plugins/Not_Kebab", "plugin-secret")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
 }
 
 /// The runner's shared token keeps the older, unowned behaviour — a loose script has no plugin
@@ -1986,10 +2132,12 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         ("GET", "/api/v1/session/{id}/pads", false, false),
         ("GET", "/api/v1/session/settings", true, false),
         ("PUT", "/api/v1/session/settings", true, false),
-        ("POST", "/api/v1/game/end", true, false),
+        // A device ends only games it launched; the handler scopes it.
+        ("POST", "/api/v1/game/end", true, true),
         // Library writes are plugin-lane (scanner job); privileged fields inside the payload
         // are refused in the handler — see `plugin_lane_cannot_set_command_execution_fields`.
         ("GET", "/api/v1/library", true, true),
+        ("GET", "/api/v1/library/page", true, true),
         ("GET", "/api/v1/library/art/{id}/{kind}", true, true),
         ("GET", "/api/v1/library/scanners", true, false),
         ("PUT", "/api/v1/library/scanners/{id}", true, false),
@@ -2002,6 +2150,13 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         ("DELETE", "/api/v1/library/custom/{id}", true, false),
         ("PUT", "/api/v1/library/provider/{provider}", true, false),
         ("DELETE", "/api/v1/library/provider/{provider}", true, false),
+        // A source writes its own result and reads its mode; order, switches and picks are
+        // curation, operator-only.
+        ("GET", "/api/v1/library/metadata", true, false),
+        ("PUT", "/api/v1/library/metadata", false, false),
+        ("PUT", "/api/v1/library/metadata/{source}", true, false),
+        ("DELETE", "/api/v1/library/metadata/{source}", true, false),
+        ("PUT", "/api/v1/library/picks/{id}", false, false),
         // Provider liveness is plugin-lane like reconcile; the host maps through the catalog.
         // Never the cert lane — a streaming client has no titles of its own.
         (
@@ -2030,9 +2185,20 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         ("POST", "/api/v1/plugin-access/requests", true, false),
         ("GET", "/api/v1/plugin-access/requests", true, false),
         ("GET", "/api/v1/plugin-access", false, false),
+        // A managed emulator's program is what a plugin's launch template points at; installing is
+        // the operator's, like every install.
+        ("GET", "/api/v1/emulators", true, false),
+        ("POST", "/api/v1/emulators/{id}/install", false, false),
+        ("POST", "/api/v1/emulators/{id}/remove", false, false),
         (
             "POST",
             "/api/v1/plugin-access/{plugin}/decide",
+            false,
+            false,
+        ),
+        (
+            "POST",
+            "/api/v1/plugin-access/{plugin}/release",
             false,
             false,
         ),
@@ -3464,7 +3630,7 @@ async fn events_stream_catch_up_filter_resume_tail_and_dropped() {
     use crate::events::EventKind;
     let _l = EVENTS_TEST_LOCK.lock().await;
     let app = test_app(test_state(), None);
-    let uniq = format!("evt-{}-{:p}", std::process::id(), &0u8 as *const u8);
+    let uniq = format!("evt-{}", std::process::id());
     let m1 = format!("{uniq}-one");
 
     crate::events::emit(EventKind::DisplayReleased { count: 424_242 });
@@ -3741,6 +3907,131 @@ async fn hide_route_matches_ids_containing_colons() {
 /// Stats ride on the entry: absent until the first launch, then the four numbers as recorded.
 /// The env override must cover the whole body (`paired_clients_list_and_unpair`).
 #[allow(clippy::await_holding_lock)]
+/// Seeds one custom title on a platform.
+fn seed_title(title: &str, platform: &str) {
+    crate::library::add_custom(crate::library::CustomInput {
+        title: title.into(),
+        art: Default::default(),
+        launch: None,
+        prep: None,
+        role: Default::default(),
+        icon: None,
+        detect: None,
+        on_window: None,
+        audio: None,
+        meta: crate::library::GameMeta {
+            platform: Some(platform.into()),
+            ..Default::default()
+        },
+    })
+    .expect("seed a title");
+}
+
+fn titles(page: &serde_json::Value) -> Vec<String> {
+    page["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|g| g["title"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Pages follow title order, the cursor names a place rather than an offset, and the filters
+/// and counts agree with what the pages hold.
+#[tokio::test]
+async fn library_pages_by_cursor_with_search_and_counts() {
+    let _tmp = ConfigDirOverride::new();
+    let app = test_app(test_state(), None);
+    for (t, p) in [
+        ("Delta", "PS2"),
+        ("alpha", "PS2"),
+        ("Charlie", "N64"),
+        ("bravo", "PS2"),
+        ("Echo", "N64"),
+    ] {
+        seed_title(t, p);
+    }
+
+    let (s, first) = send(&app, get_req("/api/v1/library/page?limit=2")).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(titles(&first), ["alpha", "bravo"]);
+    assert_eq!(first["total"], 5);
+    assert_eq!(first["platforms"][0]["platform"], "PS2");
+    assert_eq!(first["platforms"][0]["count"], 3);
+    let cursor = first["next_cursor"]
+        .as_str()
+        .expect("more pages")
+        .to_string();
+
+    // A title that sorts before the cursor arrives between two pages: nothing repeats.
+    seed_title("Able", "PS2");
+    let (_, second) = send(
+        &app,
+        get_req(&format!("/api/v1/library/page?limit=2&cursor={cursor}")),
+    )
+    .await;
+    assert_eq!(titles(&second), ["Charlie", "Delta"]);
+    let cursor = second["next_cursor"]
+        .as_str()
+        .expect("one more")
+        .to_string();
+    let (_, last) = send(
+        &app,
+        get_req(&format!("/api/v1/library/page?limit=2&cursor={cursor}")),
+    )
+    .await;
+    assert_eq!(titles(&last), ["Echo"]);
+    assert!(last.get("next_cursor").is_none(), "{last}");
+
+    let (_, found) = send(&app, get_req("/api/v1/library/page?q=HA")).await;
+    assert_eq!(titles(&found), ["alpha", "Charlie"]);
+    assert_eq!(found["total"], 2);
+
+    // The platform filter narrows the page, not the counts beside it.
+    let (_, n64) = send(&app, get_req("/api/v1/library/page?platform=n64")).await;
+    assert_eq!(titles(&n64), ["Charlie", "Echo"]);
+    assert_eq!(n64["platforms"].as_array().map(Vec::len), Some(2));
+
+    let (s, _) = send(&app, get_req("/api/v1/library/page?cursor=not-a-cursor")).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    let id = first["items"][1]["id"].as_str().expect("an id");
+    let (_, one) = send(&app, get_req(&format!("/api/v1/library/page?id={id}"))).await;
+    assert_eq!(titles(&one), ["bravo"]);
+
+    // A hidden title leaves every page but the operator's, where it is flagged.
+    crate::library::set_entry_hidden(id, true).expect("hide");
+    let (_, all) = send(&app, get_req("/api/v1/library/page")).await;
+    assert_eq!(all["total"], 6);
+    let flagged: Vec<_> = all["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter(|g| g["hidden"] == true)
+        .map(|g| g["title"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(flagged, ["bravo"]);
+}
+
+/// The built list is kept between requests and dropped when a library file moves, whether
+/// this process wrote it or someone else did.
+#[test]
+fn the_built_library_is_kept_until_an_input_moves() {
+    let _tmp = ConfigDirOverride::new();
+    seed_title("alpha", "PS2");
+    let first = crate::library::sorted_games();
+    assert!(Arc::ptr_eq(&first, &crate::library::sorted_games()));
+
+    seed_title("bravo", "PS2");
+    let second = crate::library::sorted_games();
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert_eq!(second.len(), 2);
+
+    let by_hand = pf_paths::config_dir().join("library-stats.json");
+    std::fs::write(by_hand, r#"{"games":{}}"#).expect("write the stats file");
+    assert!(!Arc::ptr_eq(&second, &crate::library::sorted_games()));
+}
+
 #[tokio::test]
 async fn library_stats_ride_on_the_entry() {
     let _tmp = ConfigDirOverride::new();
@@ -3812,6 +4103,7 @@ fn a_recorded_launch_credits_its_run_to_the_library_stats() {
             },
             client: "test".into(),
             fingerprint: None,
+            preset: None,
             plane: crate::events::Plane::Native,
             spec: crate::library::DetectSpec::dir(tmp.path()),
             nested: false,
@@ -3848,6 +4140,130 @@ fn a_recorded_launch_credits_its_run_to_the_library_stats() {
     assert_eq!(s.last_run_ms, s.play_time_ms, "one run: {s:?}");
     assert_eq!(s.launch_count, 0, "the lease never counts launches: {s:?}");
     assert_eq!(s.last_played_unix_ms, 0);
+}
+
+/// A metadata source fills a gap, a pick beats it, the replace switch beats own art, and
+/// DELETE forgets the source. The env override must cover the whole body.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn metadata_sources_fill_pick_replace_and_forget() {
+    let _tmp = ConfigDirOverride::new();
+    let app = test_app(test_state(), None);
+    let json_req = |method: &str, uri: &str, body: serde_json::Value| {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let added = crate::library::add_custom(crate::library::CustomInput {
+        title: "Hades".into(),
+        art: crate::library::Artwork {
+            portrait: Some("https://own/p.png".into()),
+            ..Default::default()
+        },
+        launch: None,
+        prep: None,
+        role: Default::default(),
+        icon: None,
+        detect: None,
+        on_window: None,
+        audio: None,
+        meta: Default::default(),
+    })
+    .expect("seed one custom title");
+    let id = crate::library::library_id_for(&added);
+
+    let (s, json) = send(
+        &app,
+        json_req(
+            "PUT",
+            "/api/v1/library/metadata/sgdb",
+            serde_json::json!({
+                "matching": "search",
+                "entries": [
+                    {"id": id, "art": {"portrait": "https://sgdb/p.png", "logo": "https://sgdb/l.png",
+                     "hero": "file:///etc/passwd"}, "meta": {"developer": "Supergiant"}},
+                    {"id": "not-an-id", "art": {"logo": "https://sgdb/x.png"}}
+                ]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{json}");
+    assert_eq!(
+        (json["entries"].as_u64(), json["dropped"].as_u64()),
+        (Some(1), Some(2))
+    );
+
+    let (_, json) = send(&app, get_req("/api/v1/library")).await;
+    let g = &json[0];
+    assert_eq!(g["filled"]["logo"], "sgdb", "{json}");
+    assert_eq!(g["developer"], "Supergiant");
+    assert!(
+        g["filled"].get("portrait").is_none(),
+        "own art stays: {json}"
+    );
+    assert!(g["art"]["logo"]
+        .as_str()
+        .unwrap()
+        .starts_with("/api/v1/library/art/"));
+
+    let pick = format!("/api/v1/library/picks/{id}");
+    let (s, _) = send(
+        &app,
+        json_req(
+            "PUT",
+            &pick,
+            serde_json::json!({"kind": "logo", "url": "file:///x"}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "a pick is http(s) only");
+    let (s, _) = send(
+        &app,
+        json_req(
+            "PUT",
+            &pick,
+            serde_json::json!({"kind": "logo", "url": "https://pick/l.png"}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (_, json) = send(&app, get_req("/api/v1/library")).await;
+    assert_eq!(json[0]["filled"]["logo"], "pick");
+
+    let (s, json) = send(
+        &app,
+        json_req(
+            "PUT",
+            "/api/v1/library/metadata",
+            serde_json::json!([{"id": "sgdb", "enabled": true, "replace": true}]),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(json[0]["replace"], true, "{json}");
+    let (_, json) = send(&app, get_req("/api/v1/library")).await;
+    assert_eq!(
+        json[0]["filled"]["portrait"], "sgdb",
+        "replace beats own art: {json}"
+    );
+
+    let del = axum::http::Request::delete("/api/v1/library/metadata/sgdb")
+        .body(Body::empty())
+        .unwrap();
+    let (s, json) = send(&app, del).await;
+    assert_eq!((s, json["removed"].as_bool()), (StatusCode::OK, Some(true)));
+    let (_, json) = send(&app, get_req("/api/v1/library/metadata")).await;
+    assert_eq!(json.as_array().map(Vec::len), Some(0), "{json}");
+    let (_, json) = send(&app, get_req("/api/v1/library")).await;
+    assert_eq!(
+        json[0]["filled"]["logo"], "pick",
+        "the pick outlives the source: {json}"
+    );
+    assert!(json[0].get("developer").is_none());
 }
 
 // ------------------------------------------------------------------ library providers
@@ -3980,10 +4396,7 @@ async fn a_paired_device_key_buys_the_cert_lane_and_no_more() {
         Arc::new(crate::native_pairing::NativePairing::load_with(Some(path), None, false).unwrap());
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let spki = key.subject_public_key_info();
-    let fp: String = crate::webtransport::sha256(&spki)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let fp = hex::encode(crate::webtransport::sha256(&spki));
     let app = test_app_native(test_state(), np.clone());
 
     // The exchange, as the page runs it.
@@ -4100,6 +4513,32 @@ async fn a_paired_device_key_buys_the_cert_lane_and_no_more() {
         StatusCode::OK,
         "a device token must not reach the admin lane"
     );
+
+    // The lane's writes are the device's too, whichever way it proved itself: its log upload,
+    // and the power actions its grants allow.
+    let upload = axum::http::Request::post("/api/v1/client-logs")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from("the page's own log"))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(upload).await.unwrap().status(),
+        StatusCode::CREATED,
+        "a browser files its log under its device"
+    );
+    let list = axum::http::Request::get("/api/v1/actions")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(list).await.unwrap();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let actions: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let sleep = actions["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == "power.sleep")
+        .unwrap();
+    assert_eq!(sleep["permitted"], true, "full access includes host power");
 
     // Unpairing revokes at once, rather than when the token lapses.
     np.remove(&fp).unwrap();
@@ -4312,10 +4751,10 @@ fn test_app_access(state: Arc<AppState>, access_dir: &std::path::Path) -> Router
         state,
         Some("test-secret".to_string()),
         Some("plugin-secret".to_string()),
-        std::collections::BTreeMap::from([
+        shared_plugin_tokens(std::collections::BTreeMap::from([
             ("demo".to_string(), "demo-secret".to_string()),
             ("other".to_string(), "other-secret".to_string()),
-        ]),
+        ])),
         DEFAULT_PORT,
         None,
         stats,
@@ -4574,6 +5013,52 @@ async fn plugin_access_decisions_land_and_stick() {
     assert_eq!(s, StatusCode::NOT_FOUND);
 }
 
+/// A file a form hands over grants its folder, and the grant goes when the form lets go.
+#[tokio::test]
+async fn plugin_access_form_grants_go_with_the_form() {
+    let dir = tempfile::tempdir().unwrap();
+    let saves = tempfile::tempdir().unwrap();
+    let app = test_app_access(test_state(), dir.path());
+    let folder = saves.path().canonicalize().unwrap();
+    let ini = folder.join("game.ini");
+    std::fs::write(&ini, "x").unwrap();
+    let ini = ini.to_string_lossy().into_owned();
+
+    let (s, json) = send(
+        &app,
+        post_json(
+            "/api/v1/plugin-access/demo/decide",
+            serde_json::json!({
+                "path": ini, "decision": "allow", "write": true, "form": "game:steam:1",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{json}");
+    assert_eq!(json["grants"][0]["path"], folder.to_string_lossy().as_ref());
+    assert_eq!(
+        json["grants"][0]["forms"],
+        serde_json::json!(["game:steam:1"])
+    );
+
+    let release = |form: &str, keep: &[&str]| {
+        post_json(
+            "/api/v1/plugin-access/demo/release",
+            serde_json::json!({ "form": form, "keep": keep }),
+        )
+    };
+    let (s, json) = send(&app, release("game:steam:1", &[&ini])).await;
+    assert_eq!(s, StatusCode::OK, "{json}");
+    assert_eq!(json["grants"].as_array().unwrap().len(), 1, "{json}");
+    let (s, json) = send(&app, release("game:steam:1", &[])).await;
+    assert_eq!(s, StatusCode::OK, "{json}");
+    assert_eq!(json["grants"], serde_json::json!([]));
+    assert_eq!(
+        send(&app, release("", &[])).await.0,
+        StatusCode::BAD_REQUEST
+    );
+}
+
 /// A refused path is an answer, not a row; a plugin-authored reason loses its control bytes.
 #[tokio::test]
 async fn plugin_access_refusals_and_reason_sanitizing() {
@@ -4598,7 +5083,7 @@ async fn plugin_access_refusals_and_reason_sanitizing() {
                         { "path": "relative/dir" },
                         { "path": path },
                     ],
-                    "reason": "games\u{7}\n library"
+                    "reason": "games\u{7}\u{2066}\n library"
                 }),
             ),
             "demo-secret",

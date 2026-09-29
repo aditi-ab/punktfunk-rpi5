@@ -23,32 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// `CLOCK_MONOTONIC` now in nanoseconds — the clock AChoreographer stamps its timelines on and
-/// the one `AMediaCodec_releaseOutputBufferAtTime` compares against (`System.nanoTime` basis).
-/// Distinct from the stats path's `CLOCK_REALTIME`: presenter scheduling stays monotonic.
-pub(super) fn now_monotonic_ns() -> i64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `clock_gettime` with a valid out-pointer is an always-safe syscall.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    // Explicit widening: `timespec`'s fields are 32-bit on armv7 (`time_t`/`c_long`) and 64-bit on
-    // arm64, so these casts are REQUIRED on one shipping ABI and redundant on the other.
-    //
-    // `:kit:cargoNdkClippy` lints both widths, so it sees the redundant half and flags it; taking
-    // its advice would break the 32-bit build, which is the ABI for the many 32-bit Google TV /
-    // Android TV boxes this client targets. `i64::from`/`.into()` do not escape it either — they
-    // just trade `unnecessary_cast` for `useless_conversion` on the 64-bit side. So the cast stays
-    // and the lint is answered here rather than in whichever build breaks first.
-    #[allow(
-        clippy::unnecessary_cast,
-        reason = "required on 32-bit ABIs; redundant only on 64-bit"
-    )]
-    {
-        ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
-    }
-}
+use crate::sys::now_monotonic_ns;
 
 /// One upcoming frame timeline (API 33+ payload): when SurfaceFlinger expects to present the
 /// frame, and the last instant it can be submitted to make that present. Monotonic ns.
@@ -187,60 +162,41 @@ struct ChoreoApi {
 impl ChoreoApi {
     /// Resolve from `libandroid.so`. `None` when even the baseline symbols are missing.
     fn resolve() -> Option<ChoreoApi> {
-        // SAFETY: dlopen of the always-mapped libandroid.so (refcount bump, never closed); each
-        // dlsym is null-checked before the transmute to its fn-pointer type.
+        // SAFETY: dlopen of the always-mapped libandroid.so (refcount bump, never closed; null is
+        // checked). Each `sym` type is the NDK header's signature for that name.
         unsafe {
             let lib = libc::dlopen(c"libandroid.so".as_ptr(), libc::RTLD_NOW);
             if lib.is_null() {
                 return None;
             }
-            let sym = |name: &std::ffi::CStr| {
-                let p = libc::dlsym(lib, name.as_ptr());
-                (!p.is_null()).then_some(p)
-            };
-            let get_instance = sym(c"AChoreographer_getInstance")?;
-            let post_vsync = sym(c"AChoreographer_postVsyncCallback");
-            let post_frame64 = sym(c"AChoreographer_postFrameCallback64");
-            post_vsync.or(post_frame64)?; // neither post entry point — no clock on this device
+            use crate::sym;
+            let post_vsync = sym(lib, c"AChoreographer_postVsyncCallback");
+            let post_frame64 = sym(lib, c"AChoreographer_postFrameCallback64");
+            // Neither post entry point — no clock on this device.
+            if post_vsync.is_none() && post_frame64.is_none() {
+                return None;
+            }
             Some(ChoreoApi {
-                get_instance: std::mem::transmute::<
-                    *mut c_void,
-                    unsafe extern "C" fn() -> *mut c_void,
-                >(get_instance),
-                post_vsync: post_vsync.map(|p| std::mem::transmute::<*mut c_void, PostVsyncCallback>(p)),
-                post_frame64: post_frame64
-                    .map(|p| std::mem::transmute::<*mut c_void, PostFrameCallback64>(p)),
-                fcd_frame_time: sym(c"AChoreographerFrameCallbackData_getFrameTimeNanos").map(|p| {
-                    std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*const c_void) -> i64>(p)
-                }),
-                fcd_timelines_len: sym(c"AChoreographerFrameCallbackData_getFrameTimelinesLength")
-                    .map(|p| {
-                        std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*const c_void) -> usize>(
-                            p,
-                        )
-                    }),
+                get_instance: sym(lib, c"AChoreographer_getInstance")?,
+                post_vsync,
+                post_frame64,
+                fcd_frame_time: sym(lib, c"AChoreographerFrameCallbackData_getFrameTimeNanos"),
+                fcd_timelines_len: sym(
+                    lib,
+                    c"AChoreographerFrameCallbackData_getFrameTimelinesLength",
+                ),
                 fcd_preferred_index: sym(
+                    lib,
                     c"AChoreographerFrameCallbackData_getPreferredFrameTimelineIndex",
-                )
-                .map(|p| {
-                    std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*const c_void) -> usize>(p)
-                }),
+                ),
                 fcd_expected_present: sym(
+                    lib,
                     c"AChoreographerFrameCallbackData_getFrameTimelineExpectedPresentationTimeNanos",
-                )
-                .map(|p| {
-                    std::mem::transmute::<
-                        *mut c_void,
-                        unsafe extern "C" fn(*const c_void, usize) -> i64,
-                    >(p)
-                }),
-                fcd_deadline: sym(c"AChoreographerFrameCallbackData_getFrameTimelineDeadlineNanos")
-                    .map(|p| {
-                        std::mem::transmute::<
-                            *mut c_void,
-                            unsafe extern "C" fn(*const c_void, usize) -> i64,
-                        >(p)
-                    }),
+                ),
+                fcd_deadline: sym(
+                    lib,
+                    c"AChoreographerFrameCallbackData_getFrameTimelineDeadlineNanos",
+                ),
             })
         }
     }

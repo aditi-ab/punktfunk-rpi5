@@ -193,20 +193,30 @@ public struct RunningGame: Codable, Hashable, Sendable {
     /// Absent for an operator-typed GameStream command, which has no catalog entry behind it.
     public var appID: String?
     public var title: String
-    /// `launching` | `running` | `window` | `exited` | `untracked` | `grace`. A plain String on
-    /// purpose: the host owns the vocabulary and adds to it (`untracked` arrived in 0.30), so an
-    /// unknown value must never fail the decode of the whole list.
+    /// `launching` | `running` | `window` | `exited` | `untracked` | `grace` | `detached`. A plain
+    /// String on purpose: the host owns the vocabulary and adds to it, so an unknown value must
+    /// never fail the decode of the whole list.
     public var state: String
     /// `running`, and the host will report `window` once the game's window is up. Absent from a
     /// host that cannot see windows, or predates them.
     public var awaitingWindow: Bool?
+    /// The live session streaming it; absent for a game nobody streams.
+    public var sessionID: UInt64?
+    /// This device may end it (``LibraryClient/endGame(appID:address:port:certPEM:keyPEM:hostFingerprint:)``):
+    /// a game it launched. Absent from a host that predates the field.
+    public var endable: Bool?
 
     private enum CodingKeys: String, CodingKey {
         case appID = "app_id"
         case title
         case state
         case awaitingWindow = "awaiting_window"
+        case sessionID = "session_id"
+        case endable
     }
+
+    /// A game this device launched that a live session streams: what an in-stream End Game ends.
+    public var streamedHere: Bool { endable == true && sessionID != nil && appID != nil }
 
     /// Is this title *up on the host right now* — i.e. would picking it take the player back into
     /// it rather than start it?
@@ -216,6 +226,43 @@ public struct RunningGame: Codable, Hashable, Sendable {
     /// which is precisely the case where getting back in promptly matters most. Only a confirmed
     /// `exited` does not.
     public var isUp: Bool { state != "exited" }
+}
+
+/// What asking the host to end a game came to (`POST /api/v1/game/end`). The Rust client's
+/// `GameEnd`, words included.
+public enum GameEndOutcome: Equatable, Sendable {
+    case ended
+    /// 409: the host had nothing of this title left to end.
+    case notRunning
+    /// 401/404: a host that predates ending games from a device.
+    case unsupported
+    /// 403: this device's access to the host expired.
+    case expired
+    case failed(String)
+
+    public static func from(status: Int) -> GameEndOutcome {
+        switch status {
+        case 200..<300: return .ended
+        case 409: return .notRunning
+        case 401, 404: return .unsupported
+        case 403: return .expired
+        default: return .failed("the host refused it (\(status))")
+        }
+    }
+
+    /// The game is gone, so a stream that was playing it can end.
+    public var gameGone: Bool { self == .ended || self == .notRunning }
+
+    /// The player-facing line. The Rust, Kotlin and web clients use the same words.
+    public func notice(title: String) -> String {
+        switch self {
+        case .ended: return "Ended \(title)."
+        case .notRunning: return "\(title) isn't running any more."
+        case .unsupported: return "This host needs an update to end games from here."
+        case .expired: return "This device's access to the host has expired."
+        case .failed(let why): return "Couldn't end \(title) \u{2014} \(why)"
+        }
+    }
 }
 
 /// One action a host offers THIS device, from `/api/v1/actions` (`design/host-actions.md` §3.2)
@@ -272,11 +319,52 @@ public struct HostAction: Codable, Hashable, Sendable, Identifiable {
 
 /// Stateless fetcher for a host's library.
 public enum LibraryClient {
-    /// `GET https://<address>:<port>/api/v1/library`, authenticated by **mTLS**: the client
-    /// presents `identity` (its persistent cert/key PEM — the same identity the host paired over
-    /// QUIC), and the host's self-signed cert is pinned by `hostFingerprint` (SHA-256 of its DER,
-    /// the value the client already trusts). No bearer token — a paired client is authorized by
-    /// its certificate. `hostFingerprint == nil` ⇒ TOFU (accept the presented host cert).
+    /// One answer of `GET /api/v1/library/page`. `total` and `platforms` stay undecoded: the
+    /// library screens collate the whole catalog themselves.
+    struct LibraryPage: Decodable {
+        var items: [GameEntry]
+        var nextCursor: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case items
+            case nextCursor = "next_cursor"
+        }
+    }
+
+    /// Titles a request: the host's ceiling for one page.
+    static let pageLimit = 200
+
+    /// 500 pages of 200 is 100 000 titles. A host whose cursor never runs out stops here.
+    static let maxPages = 500
+
+    /// The request path of one page. The cursor is the host's own text, so it is encoded.
+    static func pagePath(cursor: String?) -> String {
+        let plain = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
+        let next = cursor?.addingPercentEncoding(withAllowedCharacters: plain)
+        return "/api/v1/library/page?limit=\(pageLimit)" + (next.map { "&cursor=\($0)" } ?? "")
+    }
+
+    /// The whole catalog, a page at a time, so no answer grows with the library. `get` takes
+    /// the cursor of the page before and answers one page's body. Any page failing fails the
+    /// walk: half a catalog is not one.
+    static func walkPages(_ get: (String?) async throws -> Data) async throws -> [GameEntry] {
+        var games: [GameEntry] = []
+        var cursor: String?
+        for _ in 0..<maxPages {
+            let page = try JSONDecoder().decode(LibraryPage.self, from: try await get(cursor))
+            games += page.items
+            // A cursor that does not move would ask for the same page forever.
+            guard let next = page.nextCursor, !next.isEmpty, next != cursor else { break }
+            cursor = next
+        }
+        return games
+    }
+
+    /// The host's catalog, walked by `GET /api/v1/library/page` and authenticated by **mTLS**:
+    /// the client presents its paired cert/key PEM and the host's self-signed cert is pinned by
+    /// `hostFingerprint` (SHA-256 of its DER). A host older than the paged route refuses it on
+    /// this lane, so `GET /api/v1/library` answers whole instead.
+    /// `hostFingerprint == nil` throws `unauthorized`: an unpaired host is never trusted.
     public static func fetch(
         address: String,
         port: UInt16 = punktfunkDefaultMgmtPort,
@@ -287,27 +375,33 @@ public enum LibraryClient {
         guard let base = URL(string: "\(baseURL(address: address, port: port))/api/v1/library")
         else { throw LibraryError.unreachable("invalid host address") }
         let identity = try clientIdentity(certPEM: certPEM, keyPEM: keyPEM)
-        let response = try await send(
-            path: "/api/v1/library", address: address, port: port,
-            identity: identity, hostFingerprint: hostFingerprint)
-        switch response.status {
-        case 200:
-            var games = try JSONDecoder().decode([GameEntry].self, from: response.body)
-            // Steam art comes back as host-relative proxy paths (`/api/v1/library/art/...`, see
-            // the host's `library::steam_art`) so they work the same regardless of which
-            // interface/port the client reached the host on. Resolve them against THIS host now,
-            // so every other consumer just sees ordinary absolute URLs.
-            for i in games.indices {
-                games[i].art = games[i].art.resolved(against: base)
+        let body: (String) async throws -> Data = { path in
+            let response = try await send(
+                path: path, address: address, port: port,
+                identity: identity, hostFingerprint: hostFingerprint)
+            switch response.status {
+            case 200:
+                return response.body
+            // Both are the host declining this certificate, with the same remedy.
+            case 401, 403:
+                throw LibraryError.unauthorized
+            default:
+                throw LibraryError.http(response.status)
             }
-            return games
-        // 403 joins 401 here: both are the host declining this certificate, and the remedy the
-        // user needs is the same one.
-        case 401, 403:
-            throw LibraryError.unauthorized
-        default:
-            throw LibraryError.http(response.status)
         }
+        var games: [GameEntry]
+        do {
+            games = try await walkPages { cursor in try await body(pagePath(cursor: cursor)) }
+        } catch LibraryError.unauthorized, LibraryError.http(404) {
+            games = try JSONDecoder().decode(
+                [GameEntry].self, from: try await body("/api/v1/library"))
+        }
+        // Art the host serves arrives as host-relative proxy paths (`/api/v1/library/art/...`).
+        // Resolve them against THIS host, so every consumer sees absolute URLs.
+        for i in games.indices {
+            games[i].art = games[i].art.resolved(against: base)
+        }
+        return games
     }
 
     /// What the host currently has running, from `GET /api/v1/status`.
@@ -396,6 +490,31 @@ public enum LibraryClient {
         return list.actions.filter(\.permitted)
     }
 
+    /// End one title on the host, live session included (`POST /api/v1/game/end`). The host ends
+    /// it only if this device launched it. Never throws: every outcome is something to tell the
+    /// player.
+    public static func endGame(
+        appID: String,
+        address: String,
+        port: UInt16 = punktfunkDefaultMgmtPort,
+        certPEM: String,
+        keyPEM: String,
+        hostFingerprint: Data
+    ) async -> GameEndOutcome {
+        let body = (try? JSONSerialization.data(
+            withJSONObject: ["app_id": appID, "streaming": true])) ?? Data()
+        do {
+            let identity = try clientIdentity(certPEM: certPEM, keyPEM: keyPEM)
+            let response = try await send(
+                path: "/api/v1/game/end", address: address, port: port,
+                identity: identity, hostFingerprint: hostFingerprint,
+                body: (body, "application/json"))
+            return .from(status: response.status)
+        } catch {
+            return .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+        }
+    }
+
     /// Invoke one host action by id (`POST /api/v1/actions/{id}`, empty body).
     ///
     /// Returning normally means the host ACCEPTED it (202) — it now ends every session and acts
@@ -461,6 +580,12 @@ public enum LibraryClient {
         }
     }
 
+    /// Build and cache the TLS identity ahead of the first request. Blocking Keychain work:
+    /// call off the main actor, so the callers on it find the pair built.
+    public static func warmIdentity(_ identity: ClientIdentity) {
+        _ = try? ClientTLS.makeIdentity(certPEM: identity.certPEM, keyPEM: identity.keyPEM)
+    }
+
     /// One request against the host — a GET, or a POST when `body` is given — with transport
     /// failures mapped onto `LibraryError`.
     static func send(
@@ -480,6 +605,8 @@ public enum LibraryClient {
                 identity: identity, pinnedHostFingerprint: hostFingerprint)
         } catch MgmtTransportError.pinMismatch {
             throw LibraryError.pinMismatch
+        } catch MgmtTransportError.unpinned {
+            throw LibraryError.unauthorized
         } catch MgmtTransportError.timedOut {
             throw LibraryError.unreachable("timed out")
         } catch let error as MgmtTransportError {
@@ -519,6 +646,48 @@ public protocol LibraryArtSource: Sendable {
     func close() async
 }
 
+/// One fetch per key, shared by everyone who asks while it flies, and cancelled once the last
+/// of them is. A tile scrolled past gives up its fetch; a tile still on screen keeps it.
+final class ArtFlights: @unchecked Sendable {
+    private struct Flight {
+        let task: Task<Data, Error>
+        var waiters: Int
+    }
+
+    private let lock = NSLock()
+    private var flights: [String: Flight] = [:]
+
+    func value(
+        for key: String, fetch: @escaping @Sendable () async throws -> Data
+    ) async throws -> Data {
+        let task: Task<Data, Error> = lock.withLock {
+            if var flying = flights[key] {
+                flying.waiters += 1
+                flights[key] = flying
+                return flying.task
+            }
+            let task = Task.detached(operation: fetch)
+            flights[key] = Flight(task: task, waiters: 1)
+            return task
+        }
+        defer { lock.withLock { if flights[key]?.task == task { flights[key] = nil } } }
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            lock.withLock {
+                guard var flying = flights[key], flying.task == task else { return }
+                flying.waiters -= 1
+                if flying.waiters > 0 {
+                    flights[key] = flying
+                } else {
+                    flights[key] = nil
+                    task.cancel()
+                }
+            }
+        }
+    }
+}
+
 /// Loads cover art for the library UI, routing each URL to the transport that suits its origin.
 ///
 /// A `GameEntry`'s art candidates mix two very different things: the host's own art proxy
@@ -538,16 +707,19 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
     private let port: UInt16
     private let identity: SecIdentity
     private let hostFingerprint: Data?
-    /// Third-party origins only. No delegate: these are ordinary public HTTPS URLs and get the
-    /// system's normal certificate validation. No URLCache either — `ArtCache` owns the disk
-    /// persistence, so a second unmanaged copy underneath it would be pure waste.
-    private let cdn: URLSession
+    /// Third-party origins only, with the system's normal certificate validation and no URLCache
+    /// (`ArtCache` owns persistence). Process-wide and never invalidated: a fetch that outlives
+    /// `close()` would otherwise create a task on a dead session, which raises.
+    private static let cdn: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.urlCache = nil
+        return URLSession(configuration: config)
+    }()
     /// nil when the caches directory is unavailable — then we simply always fetch.
-    private let cache = ArtCache.standard()
+    private var cache: ArtCache? { ArtCache.shared }
     /// One fetch per cache key at a time — the same entry shown in two sections must not fetch
     /// its art twice on a cold cache. Failures are deliberately not remembered.
-    private let inflightLock = NSLock()
-    private var inflight: [String: Task<Data, Error>] = [:]
+    private let flights = ArtFlights()
 
     public init(
         address: String,
@@ -560,9 +732,6 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
         self.port = port
         self.identity = try LibraryClient.clientIdentity(certPEM: certPEM, keyPEM: keyPEM)
         self.hostFingerprint = hostFingerprint
-        let config = URLSessionConfiguration.default
-        config.urlCache = nil
-        self.cdn = URLSession(configuration: config)
     }
 
     /// Image bytes for one art URL, cached on disk after the first fetch. A miss propagates the
@@ -573,14 +742,7 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
         if url.scheme?.lowercased() == "data" { return try Self.inlineBytes(url) }
         let key = Self.cacheKey(for: url, hostAddress: address, hostPort: port, pin: hostFingerprint)
         if let cache, let cached = await cache.data(forKey: key) { return cached }
-        let task: Task<Data, Error> = inflightLock.withLock {
-            if let flying = inflight[key] { return flying }
-            let flying = Task.detached { try await self.fetch(url) }
-            inflight[key] = flying
-            return flying
-        }
-        defer { inflightLock.withLock { inflight[key] = nil } }
-        let fetched = try await task.value
+        let fetched = try await flights.value(for: key) { try await self.fetch(url) }
         if let cache { await cache.store(fetched, forKey: key) }
         return fetched
     }
@@ -596,10 +758,9 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
         return data
     }
 
-    /// Release this host's pooled connections and the CDN session — call when the library screen
-    /// goes away, so we don't sit on open TLS sockets the user is finished with.
+    /// Release this host's pooled connections — call when the library screen goes away, so we
+    /// don't sit on open TLS sockets the user is finished with.
     public func close() async {
-        cdn.finishTasksAndInvalidate()
         await MgmtConnectionPool.shared.closeAll(
             matching: "\(MgmtTransport.unbracketed(address)):\(port):")
     }
@@ -636,20 +797,29 @@ public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
             if url.scheme?.lowercased() == "data" { return try Self.inlineBytes(url) }
             guard let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http"
             else { throw LibraryError.badArtURL }
-            let (bytes, response) = try await cdn.bytes(from: url)
+            let (bytes, response) = try await Self.cdn.bytes(from: url)
             guard let http = response as? HTTPURLResponse else { throw LibraryError.badArtURL }
             guard (200..<300).contains(http.statusCode) else {
                 throw LibraryError.http(http.statusCode)
             }
-            // Bound the body WHILE it streams — the ceiling is decorative if every byte is in
-            // memory already when it's checked.
-            var data = Data()
-            for try await byte in bytes {
-                data.append(byte)
-                if data.count > MgmtTransport.maxResponseBytes {
-                    throw MgmtTransportError.tooLarge
-                }
+            // Bound the body WHILE it streams: the ceiling is decorative if every byte is in
+            // memory already when it's checked. A declared length past it is refused unread.
+            let ceiling = MgmtTransport.maxResponseBytes
+            guard http.expectedContentLength <= Int64(ceiling) else {
+                throw MgmtTransportError.tooLarge
             }
+            var data = Data()
+            var block: [UInt8] = []
+            block.reserveCapacity(65_536)
+            for try await byte in bytes {
+                block.append(byte)
+                guard block.count == 65_536 else { continue }
+                data.append(contentsOf: block)
+                block.removeAll(keepingCapacity: true)
+                if data.count > ceiling { throw MgmtTransportError.tooLarge }
+            }
+            data.append(contentsOf: block)
+            if data.count > ceiling { throw MgmtTransportError.tooLarge }
             return data
         }
         let response = try await LibraryClient.send(

@@ -1,5 +1,5 @@
-// Reusable library widgets, shared by the touch grid (LibraryView's `GameCard`) and the gamepad
-// coverflow (LibraryCoverflowView's cover cell).
+// Reusable library widgets for the touch grid (LibraryView's `GameCard`), the Library tab and the
+// launch hold.
 
 import ImageIO
 import PunktfunkKit
@@ -10,34 +10,22 @@ import UIKit
 import AppKit
 #endif
 
-/// The store-provenance badge (Steam vs. a user-curated custom entry) overlaid on a poster —
-/// shared by the touch grid's `GameCard` and the gamepad coverflow's cover cell.
+/// The store-provenance badge (Steam vs. a user-curated custom entry) overlaid on a poster.
 struct StoreBadge: View {
     /// Which store surfaced the entry, already resolved to a display name (`GameEntry.storeLabel`).
     let label: String
     /// A launcher entry (design D4) gets the brand fill, so "opens Steam" is legible at poster size
     /// without reading the title.
     var isLauncher: Bool = false
-    /// Fill the chip with a flat wash instead of a frosted material.
-    ///
-    /// The coverflow MUST pass true. Its cards ride a `.scrollTransition` that composites them
-    /// with `opacity < 1` and a 3D rotation, and a material cannot sample a backdrop through an
-    /// offscreen composite — so the frost stayed blank on every card and only appeared on the one
-    /// card sitting at exactly full opacity in the centre, reading as a flash on focus. A flat
-    /// wash has no backdrop to sample: it is simply always there. (Deliberately black, not
-    /// palette ink: the chip sits on cover art, whose colours the palette has no business
-    /// fighting.)
-    var solid: Bool = false
 
     private var fill: AnyShapeStyle {
-        if isLauncher { return AnyShapeStyle(Color.brand) }
-        return solid ? AnyShapeStyle(Color.black.opacity(0.58)) : AnyShapeStyle(.ultraThinMaterial)
+        isLauncher ? AnyShapeStyle(Color.brand) : AnyShapeStyle(.ultraThinMaterial)
     }
 
     var body: some View {
         Text(label)
             .font(.geist(11, .semibold, relativeTo: .caption2))
-            .foregroundStyle(isLauncher || solid ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
+            .foregroundStyle(isLauncher ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
             .padding(.horizontal, 6)
             .padding(.vertical, 3)
             .background(fill, in: Capsule())
@@ -48,26 +36,11 @@ struct StoreBadge: View {
 /// "This one is already running on the host" — the Resume affordance, overlaid on a poster.
 ///
 /// A badge rather than a changed button title because the grid's tiles have no titles to change:
-/// the poster *is* the control. It says `Resume` rather than `Running` on purpose — the player
-/// does not need a status report, they need to know what tapping it will do.
-///
-/// Flat-filled for the same reason `StoreBadge(solid:)` exists: the coverflow composites its cards
-/// offscreen, where a material has no backdrop to sample.
+/// the poster *is* the control. A glyph, not a word: the grid's tiles go down to ~130 pt wide and
+/// already carry the store chip in the opposite corner.
 struct RunningBadge: View {
-    var solid: Bool = false
-    /// Glyph only, no word. The grid's tiles go down to ~130 pt wide and already carry the store
-    /// chip in the opposite corner; at that size "Resume" plus an icon leaves the two badges
-    /// touching in the middle. The coverflow's cards are several times wider and take the word.
-    var compact: Bool = false
-
     var body: some View {
-        Group {
-            if compact {
-                Image(systemName: "play.fill")
-            } else {
-                Label("Resume", systemImage: "play.fill").labelStyle(.titleAndIcon)
-            }
-        }
+        Image(systemName: "play.fill")
             .font(.geist(11, .semibold, relativeTo: .caption2))
             .foregroundStyle(.white)
             // Semantic green rather than the brand violet: this is a state the host reports, not a
@@ -75,7 +48,7 @@ struct RunningBadge: View {
             // already owns the brand fill one corner away.
             .padding(.horizontal, 6)
             .padding(.vertical, 3)
-            .background(Color.green.opacity(solid ? 0.92 : 0.85), in: Capsule())
+            .background(Color.green.opacity(0.85), in: Capsule())
             .padding(6)
             .accessibilityLabel("Running on the host — resume")
     }
@@ -100,22 +73,24 @@ private extension Image {
 /// Decode cover art at the size it will be DRAWN, not the size the CDN shipped.
 ///
 /// A Steam capsule is 600×900 (some custom art 1000×1500); decoded, that is 2–6 MB per poster
-/// and stays resident for as long as its tile does. A coverflow holds a dozen; a grid on an iPad
-/// Pro or an Apple TV holds forty, and Apple TV's memory ceiling is the lowest of the three.
+/// and stays resident for as long as its tile does. A grid on an iPad Pro or an Apple TV holds
+/// forty, and Apple TV's memory ceiling is the lowest of the three.
 /// This is the desktop console's own lesson (its grid was a slideshow until posters were decoded
 /// at twice their cell size): `CGImageSourceCreateThumbnailAtIndex` decodes straight to a
 /// bounded bitmap and never materialises the full-size one. `maxPixels` is the longer edge, in
 /// PIXELS (the caller multiplies its point size by the screen scale, ×2 for headroom under the
 /// focus pop). nil ⇒ decode as shipped — still capped by DECLARED pixels, since the wire bound
-/// caps bytes, not those.
+/// caps bytes, not those. Either way the bitmap is decoded HERE, off the main actor: a plain
+/// `UIImage(data:)` would defer the decode to its first draw.
 private func decodePoster(_ data: Data, maxPixels: Int?) -> PlatformImage? {
-    guard let maxPixels, maxPixels > 0 else { return imageWithinPixelCap(data) }
-    guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+    guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+          let edge = maxPixels.flatMap({ $0 > 0 ? $0 : nil }) ?? declaredEdge(source)
+    else { return nil }
     let options: [CFString: Any] = [
         kCGImageSourceCreateThumbnailFromImageAlways: true,
         kCGImageSourceCreateThumbnailWithTransform: true,
         kCGImageSourceShouldCacheImmediately: true,
-        kCGImageSourceThumbnailMaxPixelSize: maxPixels,
+        kCGImageSourceThumbnailMaxPixelSize: edge,
     ]
     guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
         // A format ImageIO can't thumbnail (rare) still gets the decode — with the same pixel
@@ -136,12 +111,19 @@ private let maxFullDecodePixels = 16_777_216 // 4096×4096
 
 private func imageWithinPixelCap(_ data: Data) -> PlatformImage? {
     guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-          let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+          declaredEdge(source) != nil
+    else { return nil }
+    return PlatformImage(data: data)
+}
+
+/// The image's longer edge as declared, or nil when it's unreadable or past the pixel cap.
+private func declaredEdge(_ source: CGImageSource) -> Int? {
+    guard let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
           let width = props[kCGImagePropertyPixelWidth] as? Int,
           let height = props[kCGImagePropertyPixelHeight] as? Int,
           width > 0, height > 0, width * height <= maxFullDecodePixels
     else { return nil }
-    return PlatformImage(data: data)
+    return max(width, height)
 }
 
 /// Where each library poster last drew, in global (window) coordinates, by entry id.
@@ -183,8 +165,7 @@ private struct TileFramePreference: PreferenceKey {
 /// regardless of its own aspect ratio: a portrait capsule fills it as intended, and a fallback
 /// banner (wide hero/header art, used when a title has no portrait capsule) is cropped to the same
 /// tile rather than allowed to size it — see the `Color.clear` in `body` for why that takes more
-/// than a `.frame(maxWidth:)` and a `.clipped()`. Not `private` —
-/// the gamepad coverflow (`LibraryCoverflowView`) reuses it directly rather than re-fetching art.
+/// than a `.frame(maxWidth:)` and a `.clipped()`.
 struct PosterImage: View {
     let candidates: [URL]
     let title: String
@@ -195,10 +176,6 @@ struct PosterImage: View {
     /// The size this poster is drawn at, in POINTS — the decode is bounded to twice its longer
     /// edge in pixels (see `decodePoster`). nil decodes the art as shipped.
     var drawnSize: CGSize?
-    /// Fires once this poster has settled — art loaded, or every candidate exhausted and the
-    /// placeholder is what it will be. The gamepad coverflow waits on a few of these before
-    /// playing its entrance, so the cards swing in carrying artwork rather than grey rectangles.
-    var onLoaded: (() -> Void)?
     /// Publish this poster's on-screen rect to `TileFrames` under this id (the entry's). What the
     /// launch hold flies its cover out of; nil for a poster nothing launches from.
     var frameID: String?
@@ -262,11 +239,9 @@ struct PosterImage: View {
     }
 
     private func loadCurrent() async {
-        // Past the end: the placeholder IS the final look, so this poster has settled.
-        guard index < candidates.count else {
-            onLoaded?()
-            return
-        }
+        // Already drawn: a new loader (a tab switch back) must not fetch and decode it again.
+        // Past the end: the placeholder IS the final look.
+        guard image == nil, index < candidates.count else { return }
         // No loader yet is not a failed candidate — the task refires when one arrives.
         guard let loader else { return }
         // Twice the drawn edge: headroom for the focus pop and a Retina-crisp cover, without
@@ -288,7 +263,6 @@ struct PosterImage: View {
             return
         }
         image = loaded
-        onLoaded?()
     }
 
     private var placeholder: some View {

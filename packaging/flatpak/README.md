@@ -175,5 +175,7 @@ re-add the remote (the `GPGKey` changed), so rotate rarely.
   --bundle` to consume; mirrors the deb/rpm curl-upload pattern. No auto-update — this is what the
   **Decky plugin** pulls (stable `latest/punktfunk-client.flatpak`), plus the offline/manual path.
 - **Release attachment:** also done on tags, good for a human-facing download page.
-- **Flathub (deferred):** best discoverability + zero hosting, but a separate submission/review
-  process and less control; revisit once the client is past scaffold quality.
+- **Flathub (blocked):** its [Generative AI policy](https://docs.flathub.org/docs/for-app-authors/requirements)
+  bans AI-assisted manifests and AI-opened submissions, so a person writes both, not a copy of this
+  manifest. Flathub also builds Skia from source (Neovide's manifest shows how), wants the newest
+  GNOME runtime, and flags `/tmp/.X11-unix` (`finish-args-host-tmp-access`) until granted an exception.

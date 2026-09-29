@@ -25,10 +25,14 @@ pub(super) async fn run(
     // `0xD2` rebuild: recover here and re-insert in order so every embedder sees a
     // complete stream without knowing the plane exists.
     let mut audio_red = crate::audio::AudioRedRecovery::new();
+    // One seq space for every audio plane: a late or duplicate packet never reaches a decoder.
+    let mut audio_seq = crate::audio::AudioSeqGate::new();
     while let Ok(d) = conn.read_datagram().await {
         match d.first() {
             Some(&crate::quic::AUDIO_MAGIC) => {
-                if let Some((seq, pts_ns, opus)) = crate::quic::decode_audio_datagram(&d) {
+                if let Some((seq, pts_ns, opus)) =
+                    crate::quic::decode_audio_datagram(&d).filter(|&(seq, ..)| audio_seq.fresh(seq))
+                {
                     let _ = audio_tx.try_send(AudioPacket {
                         seq,
                         pts_ns,
@@ -38,6 +42,7 @@ pub(super) async fn run(
             }
             Some(&crate::quic::AUDIO_RED_MAGIC) => {
                 if let Some((seq, pts_ns, opus, prev)) = crate::quic::decode_audio_red_datagram(&d)
+                    .filter(|&(seq, ..)| audio_seq.fresh(seq))
                 {
                     if audio_red.recover_before(seq, prev.is_some()) {
                         // Copy is the previous protocol frame: seq-1, pts minus one FRAME_MS.
@@ -107,7 +112,9 @@ pub(super) async fn run(
             // payload format. A session runs one plane for life. No `0xD2` on PCM —
             // conceal at decode (`pcm::PcmConceal`), do not reconstruct here.
             Some(&crate::quic::AUDIO_PCM_MAGIC) => {
-                if let Some((seq, pts_ns, pcm)) = crate::quic::decode_audio_pcm_datagram(&d) {
+                if let Some((seq, pts_ns, pcm)) = crate::quic::decode_audio_pcm_datagram(&d)
+                    .filter(|&(seq, ..)| audio_seq.fresh(seq))
+                {
                     let _ = audio_tx.try_send(AudioPacket {
                         seq,
                         pts_ns,

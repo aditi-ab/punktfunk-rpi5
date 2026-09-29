@@ -14,7 +14,8 @@ class MouseSideKeyTest {
         mouse: Boolean = true,
         dpad: Boolean = false,
         mousePresent: Boolean = false,
-    ) = isMouseSideKey(tv, external, pad, fallback, mouse, dpad, mousePresent)
+        gestureIsKey: Boolean = false,
+    ) = isMouseSideKey(tv, external, pad, fallback, mouse, dpad, mousePresent, gestureIsKey)
 
     @Test
     fun offTvEveryExternalBackIsTheHosts() {
@@ -39,6 +40,11 @@ class MouseSideKeyTest {
         assertTrue("mouse attached", virtual(true, false))
         assertFalse("no mouse: the nav bar's Back", virtual(false, false))
         assertFalse("a TV keeps its Back", virtual(true, true))
+        // Before Android 16 the gesture is this same key, and it opens the ring.
+        assertFalse(
+            "gesture as a key",
+            claim(external = false, mouse = false, dpad = true, mousePresent = true, gestureIsKey = true),
+        )
     }
 
     @Test

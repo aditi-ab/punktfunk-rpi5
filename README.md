@@ -5,16 +5,16 @@
 <p align="center"><b>Low-latency desktop and game streaming with first-class Linux and Windows hosts.</b></p>
 
 > [!IMPORTANT]
-> This is the Aditi/StreamOS Raspberry Pi 5 fork of Punktfunk v0.39.0. It adds
-> the Pi 5 V4L2 Request decoder and the StreamOS presentation and audio fixes.
-> See [Raspberry Pi 5 fork notes](docs/streamos-rpi5.md) for the maintained
-> downstream delta, release process, validation record, and update procedure.
-> The [patch rationale](docs/streamos-rpi5-patch-rationale.md) records why each
-> downstream change exists and whether it remains a candidate for upstreaming.
+> This is Aditi's standalone Raspberry Pi 5 fork of Punktfunk, with HEVC hardware
+> decoding, Wayland pacing, efficient overlays, Bluetooth settings, and audio fixes.
 >
-> The ARM64 release bundle also runs on a regular 64-bit Raspberry Pi OS system;
-> StreamOS is a consumer, not a runtime dependency. See
-> [Raspberry Pi 5 installation](docs/raspberry-pi-5.md).
+> Download the complete **kiosk image (`.img.xz`)** or **portable ARM64 bundle** from
+> [GitHub Releases](https://github.com/aditi-ab/punktfunk-rpi5/releases/latest).
+> Each release supplies matching artifacts and SHA-256 checksums. The kiosk image
+> boots directly into Punktfunk on Raspberry Pi 5.
+>
+> See [installation](docs/raspberry-pi-5.md), [fork maintenance](docs/rpi5-fork.md),
+> and [patch rationale](docs/rpi5-patch-rationale.md).
 
 Run the host on a Linux or Windows PC and stream your desktop or games to a Mac, PC, phone, tablet
 or TV. Each client gets **its own virtual display at its own native resolution and refresh rate**,
@@ -27,7 +27,7 @@ monitors.
 [Support matrix](https://docs.punktfunk.unom.io/docs/support-matrix) (what works where) ·
 [Roadmap](https://docs.punktfunk.unom.io/docs/roadmap)
 
-💬 [Discord](https://discord.gg/kaPNvzMuGU) · [r/Punktfunk](https://www.reddit.com/r/Punktfunk/)
+💬 [Discord](https://discord.gg/wzEGg9y45z) · [r/Punktfunk](https://www.reddit.com/r/Punktfunk/)
 
 🔒 Vulnerabilities go privately to **security@punktfunk.com**, not to an issue — [SECURITY.md](SECURITY.md).
 
@@ -84,7 +84,7 @@ uninstalling are [/docs/updating](https://docs.punktfunk.unom.io/docs/updating) 
 | Streaming to… | Use |
 |---|---|
 | Mac | The **Apple app** — notarized DMG, or TestFlight |
-| iPhone, iPad, Apple TV | The **Apple app** on TestFlight |
+| iPhone, iPad, Apple TV | The **Apple app** on the [App Store](https://apps.apple.com/app/id6779991756) |
 | Linux desktop / laptop | **`punktfunk-client`** — Flatpak (any distro), or apt / rpm / pacman |
 | Steam Deck | The **Decky plugin** in Gaming Mode; the Flatpak in Desktop Mode |
 | Android phone or TV | The **Android app** on Google Play |
@@ -97,63 +97,15 @@ Every client discovers hosts automatically and does a one-time
 [PIN pairing](https://docs.punktfunk.unom.io/docs/pairing). Per-device steps:
 **[/docs/install-client](https://docs.punktfunk.unom.io/docs/install-client)**.
 
-## Build & test (from source)
+## Develop
 
-```sh
-cargo build --workspace
-cargo test  --workspace          # unit + loopback + proptest + C ABI harness
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all --check
-
-cargo run -p loss-harness                   # FEC loss-resilience sweep (no network needed)
-bash crates/punktfunk-core/tests/c/run.sh   # standalone C-ABI link + round-trip proof
-```
-
-`include/punktfunk_core.h` regenerates from `crates/punktfunk-core/src/abi.rs` on every build
-(cbindgen via `build.rs`). The Apple, Android and Windows clients have their own toolchains — see
-each client's README and [Build from source](https://docs.punktfunk.unom.io/docs/build-from-source).
-
-## Layout
-
-```
-crates/
-  punktfunk-core/   protocol · FEC · pacing · crypto · QUIC control plane — the C ABI
-  punktfunk-host/   the host (Linux + Windows): sessions · input · GameStream · punktfunk/1 · mgmt API
-  pf-capture/       PipeWire (Linux) and IDD-push (Windows) capturers behind one `Capturer`
-  pf-encode(-win)/  hardware encode: NVENC · AMF · QSV · Media Foundation · PyroWave · software
-  pf-vdisplay/      client-sized virtual outputs, one backend per compositor
-  pf-client-core/   shared client plumbing: session pump · decode ladder · audio · gamepads · discovery
-  pf-vkdecode/  pf-dxvadec/  pf-vaadec/  pf-bitstream/   the native decode rungs and their parser
-  pf-presenter/  pf-console-ui/   Vulkan presenter and the gamepad-driven console shell
-  punktfunk-setup/  the guided installer binary served by install.sh
-clients/
-  apple/    macOS · iOS · tvOS (Swift · VideoToolbox · Metal · GameController)
-  linux/    GTK4 launcher shell that spawns the session client
-  session/  punktfunk-session, the Vulkan streaming session — also standalone (gamescope, Decky)
-  windows/  Windows desktop app (Rust · WinUI 3 · D3D11 · WASAPI · SDL3)
-  android/  Android phone + TV (Kotlin · Rust JNI core · AMediaCodec · AAudio)
-  cli/  probe/  decky/  shared/    headless CLI · measurement client · Deck plugin · test vectors
-web/                web console (TanStack) over the management API
-api/openapi.json    management-API spec (regenerated via `punktfunk-host openapi`, checked in)
-sdk/  plugin-kit/   `@punktfunk/host` TypeScript client · `@punktfunk/plugin-kit` authoring kit
-packaging/          apt · rpm · Arch · Flatpak · Bazzite · bootc · Windows installer + drivers · winget · Nix
-docs-site/          the public docs (Fumadocs) — https://docs.punktfunk.unom.io
-tools/  ci/         measurement harnesses · CI container images
-```
-
-The browser client and the LG webOS client live in their own repositories and take these crates as
-pinned git dependencies.
-
-## Design invariants
-
-- **One core, linked everywhere.** Protocol, FEC and crypto live in `punktfunk-core` once, behind a
-  versioned C ABI (`punktfunk_abi_version()`; `PunktfunkConfig` carries its own `struct_size`).
-- **No async on the hot path.** The per-frame pipeline is native threads only; `tokio`/`quinn` are
-  gated behind the off-by-default `quic` feature — control plane only.
-- **Native client resolution, no scaling.** Each session gets an output at exactly the client's
-  `WxH@Hz`; every compositor keeps its own backend behind a shared `VirtualDisplay` trait.
-- **FEC is the wall-breaker.** GF(2⁸) (≤255 shards/block) for Moonlight compatibility; GF(2¹⁶)
-  (≤65535 shards, SIMD, O(n log n)) for `punktfunk/1`.
+Building, testing and contributing are in the
+**[developer docs](https://docs.punktfunk.unom.io/docs/developers)**:
+[Architecture](https://docs.punktfunk.unom.io/docs/developers/architecture) (crate map and design
+invariants) ·
+[Build from source](https://docs.punktfunk.unom.io/docs/developers/build-from-source) ·
+[Testing](https://docs.punktfunk.unom.io/docs/developers/testing) ·
+[Contributing](https://docs.punktfunk.unom.io/docs/developers/contributing).
 
 ## License
 
@@ -175,8 +127,9 @@ additional terms or conditions. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Punktfunk's own source is MIT/Apache-2.0. Shipped binaries additionally link third-party components
 under their own (permissive) licenses — see [`THIRD-PARTY-NOTICES.txt`](THIRD-PARTY-NOTICES.txt)
-(regenerate with `scripts/gen-third-party-notices.sh`). Nothing links FFmpeg any more: host encode
-went native in 2026-09, and the clients decode natively.
+(regenerate with `scripts/gen-third-party-notices.sh`). The Raspberry Pi hardware-decoder
+feature additionally links the bundled Raspberry Pi FFmpeg libraries; their license and build
+information accompany the release bundle.
 
 ### Trademarks
 

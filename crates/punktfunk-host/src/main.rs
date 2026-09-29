@@ -14,7 +14,10 @@
 // Keep `unsafe fn` only where a caller can violate a contract (raw pointer / borrowed HANDLE).
 // Workspace lints already require `// SAFETY:` on every `unsafe` block.
 
-mod audio;
+// Shim: audio backends live in `pf-audio`; keep `crate::audio::*` for this crate's callers.
+mod audio {
+    pub(crate) use pf_audio::*;
+}
 mod bringup;
 mod capture;
 mod detect;
@@ -22,11 +25,6 @@ mod devtest;
 /// Structured health verdicts — design/web-console-diagnostics.md.
 #[forbid(unsafe_code)]
 mod diagnostics;
-// Network-facing; same `forbid` as `mod mgmt`.
-#[forbid(unsafe_code)]
-mod discovery;
-#[forbid(unsafe_code)]
-mod wol;
 // `#[path]` keeps `crate::*` names flat while files live under `src/linux/`.
 #[cfg(target_os = "linux")]
 #[path = "linux/drm_sync.rs"]
@@ -36,7 +34,10 @@ mod drm_sync;
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
-use windows::{game_term, install, interactive, seat, service, tray};
+use windows::{game_term, install, interactive, service, tray};
+// What this host reads of the multi-seat contract; unset means the console host.
+#[cfg(target_os = "windows")]
+use pf_paths::seat;
 #[cfg(not(target_os = "windows"))]
 mod windows {
     pub(crate) mod entry {
@@ -114,28 +115,34 @@ mod encode {
         Ok(())
     }
 }
+mod encode_recovery;
 mod events;
-// Session⇄game lifetime — design/session-game-lifetime.md.
-mod gamelease;
+// Launch, lease and liveness of a session's game; the flat names keep `crate::gamelease::*`.
+mod game;
+use game::{
+    gamelease, holds, launchreg, procscan, runstate, session_launch, session_settings,
+    stream_marker,
+};
 mod gamestream;
 #[cfg(target_os = "linux")]
 #[path = "linux/gpuclocks.rs"]
 mod gpuclocks;
 mod hooks;
-// Network-facing; same `forbid` as `mod mgmt`. Tests mutate process env (`set_var` is unsafe in 2024).
-#[cfg_attr(not(test), forbid(unsafe_code))]
-mod identity;
+// What every plane shares: host facts, session state, `serve`.
+mod host;
+// The box itself: identity, adverts, wake, power, sleep; the flat names keep `crate::power::*`.
+mod hostsys;
+use hostsys::{discovery, identity, osinfo, power, sleep_inhibit, wol};
 // Shim: inject backends live in `pf-inject`; keep `crate::inject::*` for this crate's callers.
 mod inject {
     pub(crate) use pf_inject::*;
 }
-mod client_logs;
-// Re-`Hello::launch` must not start a second copy — design/session-game-lifetime.md.
-mod launchreg;
+mod pen_sink;
+// Unix wall clock every stored deadline and event stamp reads.
+mod clock;
+// Compositor + gamescope route for a connect, shared by the native and GameStream planes.
+mod compositor_route;
 mod library;
-#[forbid(unsafe_code)]
-mod link_health;
-mod log_capture;
 // Network-facing secure-default surface. `not(test)` because tests mutate process env
 // (`set_var` is unsafe in 2024) and `native` has in-process C-ABI roundtrips.
 #[cfg_attr(not(test), forbid(unsafe_code))]
@@ -149,28 +156,38 @@ mod ctl;
 mod native;
 #[forbid(unsafe_code)]
 mod native_pairing;
-mod net_health;
-mod osinfo;
 // Live per-session pad tap the console's Controllers page streams.
+mod emulators;
 mod pad_feed;
-mod plugins;
-mod power;
-// Process-table half of session⇄game binding — design/session-game-lifetime.md. Empty on macOS.
-mod procscan;
-// Plugin-reported liveness; `procscan` only sees the process table.
-mod runstate;
+// Plugin runner, access and store; the flat names keep `crate::plugins::*`.
+mod plugin_host;
+use plugin_host::{plugins, store};
 mod send_pacing;
 mod session_plan;
-// Operator policy for session⇄game binding (`session-settings.json`).
-mod session_settings;
-mod session_status;
-mod sleep_inhibit;
+mod slug;
 mod spike;
-mod stats_recorder;
-// Signed catalogs and install jobs via the `plugins` runner — design/plugin-store.md.
-mod store;
-mod stream_marker;
+// Session status, stats and log capture; the flat names keep `crate::session_status::*`.
+mod telemetry;
+use telemetry::{
+    client_logs, encoder_sessions, link_health, log_capture, net_health, session_status,
+    stats_recorder,
+};
+#[cfg(test)]
+mod test_support {
+    /// A fresh directory that lives until the calling test's thread ends, for a helper that
+    /// returns a path rather than a guard. The test harness runs each test on its own thread.
+    pub(crate) fn scratch() -> std::path::PathBuf {
+        thread_local!(static DIRS: std::cell::RefCell<Vec<tempfile::TempDir>> = const {
+            std::cell::RefCell::new(Vec::new())
+        });
+        let dir = tempfile::tempdir().expect("create a scratch dir");
+        let path = dir.path().to_path_buf();
+        DIRS.with_borrow_mut(|dirs| dirs.push(dir));
+        path
+    }
+}
 mod update;
+mod version;
 // The browser plane (design/web-client-implementation-plan.md Phase 1). Runtime opt-in.
 mod webtransport;
 // Shim: virtual-display lives in `pf-vdisplay`; keep `crate::vdisplay::*` for this crate's callers.
@@ -194,6 +211,12 @@ use std::path::PathBuf;
 /// portal flow reads a property off those two transient objects. It is the module's
 /// only `warn!`, so `error` there costs nothing else. The ring keeps them regardless.
 const DEFAULT_LOG_FILTER: &str = "info,zbus::proxy=error";
+
+// POSIX `geteuid`: no arguments, no memory, cannot fail — so `safe` for every caller.
+#[cfg(unix)]
+unsafe extern "C" {
+    safe fn geteuid() -> u32;
+}
 
 fn main() {
     // Before any `ureq` agent (cover-art, webhooks, catalog, updates).
@@ -244,10 +267,7 @@ fn main() {
             .unwrap_or("<unnamed>")
             .to_string();
         let backtrace = std::backtrace::Backtrace::force_capture();
-        let ts_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let ts_ms = clock::unix_ms();
         log_capture::ring().push_remote(
             "ERROR",
             "punktfunk_host::panic",
@@ -354,6 +374,7 @@ fn is_management_cli(args: &[String]) -> bool {
         | Some("tray")
         // Loopback API client; `watch` is long-lived — do not take GPU clocks or the DXGI hook.
         | Some("ctl")
+        | Some("settings")
         | Some("openapi")
         | Some("library")
         | Some("detect-conflicts")
@@ -370,24 +391,16 @@ fn is_management_cli(args: &[String]) -> bool {
     }
 }
 
-fn real_main() -> Result<()> {
-    take_env_credentials();
-    let args: Vec<String> = std::env::args().skip(1).collect();
-
-    if matches!(
-        args.first().map(String::as_str),
-        Some("--version") | Some("-V") | Some("version")
-    ) {
-        println!("punktfunk-host {}", env!("PUNKTFUNK_VERSION"));
-        return Ok(());
-    }
-
-    let management_cli = is_management_cli(&args);
+/// Once per process, before the subcommand: the banner, the capture anchor, the display
+/// event sink, the voice-pin hooks, platform preflight and the GPU driver profile. A
+/// management CLI skips the host parts.
+fn startup(args: &[String]) {
+    let management_cli = is_management_cli(args);
 
     if !management_cli {
         tracing::info!(
             "punktfunk-host {} (punktfunk_core ABI v{})",
-            env!("PUNKTFUNK_VERSION"),
+            crate::version::get(),
             punktfunk_core::ABI_VERSION
         );
     }
@@ -413,6 +426,14 @@ fn real_main() -> Result<()> {
         }
     }));
 
+    // Once: the voice-chat pin reaches processes and the console user through the host.
+    #[cfg(target_os = "windows")]
+    let _ = audio::voice_route::HOST_HOOKS.set(audio::voice_route::HostHooks {
+        processes: procscan::processes,
+        run_hidden_as_user: interactive::run_hidden_as_current_session_user,
+        running_as_system: hooks::running_as_system,
+    });
+
     windows::entry::preflight(management_cli);
 
     // P2-cap driver profile only. Clock pin is per live client (`gpuclocks::session_pin`), not
@@ -424,6 +445,21 @@ fn real_main() -> Result<()> {
     ) {
         gpuclocks::on_host_start();
     }
+}
+
+fn real_main() -> Result<()> {
+    take_env_credentials();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if matches!(
+        args.first().map(String::as_str),
+        Some("--version") | Some("-V") | Some("version")
+    ) {
+        println!("punktfunk-host {}", crate::version::get());
+        return Ok(());
+    }
+
+    startup(&args);
 
     match args.first().map(String::as_str) {
         Some("serve") => {
@@ -434,7 +470,7 @@ fn real_main() -> Result<()> {
             pf_host_config::mark_started();
             // Must run before any new session touches the topology.
             windows::entry::serve_startup_recover();
-            gamestream::serve(mgmt_opts, native, gamestream)
+            host::serve(mgmt_opts, native, gamestream)
         }
         Some("detect-conflicts") => {
             let found = detect::scan();
@@ -451,6 +487,7 @@ fn real_main() -> Result<()> {
             Ok(())
         }
         Some("ctl") => ctl::main(&args[1..]),
+        Some("settings") => settings_cli(&args[1..]),
         Some("plugins") => plugins::main(&args[1..]),
         Some("openapi") => {
             print!("{}", mgmt::openapi_json());
@@ -485,35 +522,7 @@ fn real_main() -> Result<()> {
         #[cfg(target_os = "linux")]
         Some("nv12-selftest") => zerocopy::nv12_selftest(),
         #[cfg(target_os = "linux")]
-        Some("hdr-probe") => {
-            let monitor_hdr = pf_capture::gnome_hdr_monitor_active();
-            let hevc10 = encode::can_encode_10bit(encode::Codec::H265);
-            let av110 = encode::can_encode_10bit(encode::Codec::Av1);
-            let gs_binary_hdr = pf_vdisplay::gamescope_hdr_available(None);
-            let gs_knob = pf_host_config::config().gamescope_hdr;
-            let compositor = vdisplay::detect().ok();
-            println!("monitor in BT.2100 (HDR) colour mode: {monitor_hdr}");
-            println!("gamescope offers 10-bit PQ capture:   {gs_binary_hdr}");
-            println!("PUNKTFUNK_GAMESCOPE_HDR:              {gs_knob}");
-            // In-node cursor lets the session take the zero-CSC encode source; otherwise a
-            // full-frame blend. Invisible until you compare two streams, so print it here.
-            println!(
-                "gamescope paints the cursor in-node:  {}",
-                pf_vdisplay::gamescope_composites_cursor(None)
-            );
-            println!("encoder Main10 (HEVC): {hevc10}");
-            println!("encoder 10-bit (AV1):  {av110}");
-            println!(
-                "native-plane HDR on the resolved compositor ({}): {}",
-                compositor.map_or("none".to_string(), |c| format!("{c:?}")),
-                crate::capture::capturer_supports_hdr_for(compositor, None)
-            );
-            println!(
-                "GameStream HDR capable (PUNKTFUNK_10BIT + a capable source + encoder): {}",
-                gamestream::host_hdr_capable()
-            );
-            Ok(())
-        }
+        Some("hdr-probe") => devtest::hdr_probe(),
         // Exit 0 iff a virtual output can be created now — bringup scripts poll this instead of `sleep`.
         Some("probe-compositor") => {
             let compositor = vdisplay::detect()?;
@@ -524,53 +533,9 @@ fn real_main() -> Result<()> {
         // `voice-route set|clear …`: the per-app output pin. The capture thread spawns it as the
         // console user, because a SYSTEM caller writes SYSTEM's app preferences, not the user's.
         #[cfg(target_os = "windows")]
-        Some("voice-route") => audio::voice_route_cli(&args[1..]),
-        // Connector names `PUNKTFUNK_CAPTURE_MONITOR` takes — available before the mgmt API is up.
+        Some("voice-route") => audio::voice_route::cli(&args[1..]),
         #[cfg(target_os = "linux")]
-        Some("list-monitors") => {
-            let compositor = vdisplay::detect()?;
-            let monitors = vdisplay::monitors::list(compositor)
-                .with_context(|| format!("enumerate monitors on {compositor:?}"))?;
-            if monitors.is_empty() {
-                println!("{compositor:?}: no monitors");
-                return Ok(());
-            }
-            let pinned = vdisplay::capture_monitor();
-            println!("{compositor:?}:");
-            for m in &monitors {
-                let mut tags = Vec::new();
-                if m.primary {
-                    tags.push("primary");
-                }
-                if !m.enabled {
-                    tags.push("disabled");
-                }
-                if m.managed {
-                    tags.push("punktfunk virtual display");
-                }
-                if pinned
-                    .as_deref()
-                    .is_some_and(|p| p.eq_ignore_ascii_case(&m.connector))
-                {
-                    tags.push("PINNED");
-                }
-                println!(
-                    "  {:<12} {:>13} at +{},+{}  scale {}  {}{}",
-                    m.connector,
-                    m.mode_label(),
-                    m.x,
-                    m.y,
-                    m.scale,
-                    m.description,
-                    if tags.is_empty() {
-                        String::new()
-                    } else {
-                        format!("  [{}]", tags.join(", "))
-                    }
-                );
-            }
-            Ok(())
-        }
+        Some("list-monitors") => devtest::list_monitors(),
         #[cfg(target_os = "linux")]
         Some("mirror-test") => devtest::mirror_test(&args),
         #[cfg(target_os = "linux")]
@@ -584,92 +549,7 @@ fn real_main() -> Result<()> {
         #[cfg(target_os = "linux")]
         Some("switchpro-test") => devtest::switchpro_test(&args),
         Some("spike") => spike::run(parse_spike(&args[1..])?),
-        Some("punktfunk1-host") => {
-            let get = |flag: &str| {
-                args.iter()
-                    .skip_while(|a| *a != flag)
-                    .nth(1)
-                    .map(String::as_str)
-            };
-            let source = match get("--source") {
-                Some("virtual") => native::Punktfunk1Source::Virtual,
-                Some("synthetic-abr") => {
-                    let fill = get("--fill")
-                        .and_then(|s| s.parse().ok())
-                        .filter(|&p: &u32| p > 0 && p <= 100)
-                        .unwrap_or(100);
-                    let spec = get("--content").unwrap_or("steady");
-                    let recovery = std::time::Duration::from_millis(
-                        get("--recovery-ms")
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(0),
-                    );
-                    let answer = match native::KeyframeAnswer::parse(
-                        get("--keyframe-answer").unwrap_or("idr"),
-                    ) {
-                        Some(a) => a,
-                        None => bail!("--keyframe-answer takes idr or wave:<n>"),
-                    };
-                    let bringup = std::time::Duration::from_millis(
-                        get("--bringup-ms")
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(2_500),
-                    );
-                    let idr_pct = get("--idr-pct")
-                        .and_then(|s| s.parse().ok())
-                        .filter(|&p: &u32| p > 0)
-                        .unwrap_or(native::DEFAULT_IDR_PCT);
-                    match native::Content::parse(spec, fill) {
-                        Some(c) => native::Punktfunk1Source::SyntheticAbr(native::SynthAbrShape {
-                            content: c,
-                            recovery,
-                            answer,
-                            idr_pct,
-                            bringup,
-                            serve_ramp: !args.iter().any(|a| a == "--no-ramp"),
-                        }),
-                        None => {
-                            bail!("--content takes steady, idle-then-motion or frame-driven:<fps>")
-                        }
-                    }
-                }
-                _ => native::Punktfunk1Source::Synthetic,
-            };
-            // Empty would arm SPAKE2 with an empty password (same trap as `--mgmt-token`).
-            let pairing_pin = match get("--pairing-pin") {
-                Some(p) if p.trim().is_empty() => bail!("--pairing-pin must not be empty"),
-                p => p.map(str::to_string),
-            };
-            native::run(native::Punktfunk1Options {
-                port: get("--port").and_then(|s| s.parse().ok()).unwrap_or(9777),
-                source,
-                seconds: get("--seconds").and_then(|s| s.parse().ok()).unwrap_or(30),
-                frames: get("--frames").and_then(|s| s.parse().ok()).unwrap_or(300),
-                max_sessions: get("--max-sessions")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0),
-                max_concurrent: get("--max-concurrent")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(native::DEFAULT_MAX_CONCURRENT),
-                // Pairing required unless `--allow-tofu`. `--require-pairing`/`--allow-pairing` are no-ops.
-                require_pairing: !args.iter().any(|a| a == "--allow-tofu"),
-                allow_pairing: true,
-                pairing_pin,
-                paired_store: None,
-                // Fixed port = one number to open or proxy; the client's punch still picks the path.
-                data_port: get("--data-port")
-                    .map(str::to_string)
-                    .or_else(|| std::env::var("PUNKTFUNK_DATA_PORT").ok())
-                    .and_then(|s| s.parse().ok()),
-                // QUIC idle timeout; flag overrides env; absent = core default (8 s).
-                idle_timeout: get("--idle-timeout-ms")
-                    .and_then(|s| s.trim().parse::<u64>().ok())
-                    .filter(|&ms| ms > 0)
-                    .map(std::time::Duration::from_millis)
-                    .or_else(native::idle_timeout_from_env),
-                mdns: !args.iter().any(|a| a == "--no-mdns") && discovery::mdns_enabled(),
-            })
-        }
+        Some("punktfunk1-host") => native::run(parse_punktfunk1(&args[1..])?),
         Some("-h") | Some("--help") | Some("help") | None => {
             print_usage();
             Ok(())
@@ -680,6 +560,23 @@ fn real_main() -> Result<()> {
             None => bail!("unknown command '{other}' (try --help)"),
         },
     }
+}
+
+/// `settings set <id> <value>` writes the console's settings store without a running host, so an
+/// installer's choice stays the console's to change. The value is JSON (`true`, `30`; `null`
+/// clears), else a bare string.
+fn settings_cli(args: &[String]) -> Result<()> {
+    let [verb, id, raw] = args else {
+        bail!("usage: punktfunk-host settings set <id> <value>");
+    };
+    if verb != "set" {
+        bail!("unknown settings verb '{verb}' (try: set)");
+    }
+    let value = serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::from(raw.as_str()));
+    let patch = serde_json::Map::from_iter([(id.clone(), value.clone())]);
+    pf_host_config::save(&patch).context("save host settings")?;
+    println!("{id}={value} → {}", pf_host_config::store_path().display());
+    Ok(())
 }
 
 /// Native plane + management API always run. `--gamestream` is trusted-LAN only.
@@ -766,12 +663,15 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, b
     }
     // Mint only if the runner is installed — otherwise a second admin-adjacent credential sits
     // on disk for a subsystem that is not running. Scope: `plugin_may_access`, not pairing/hooks.
-    if crate::plugins::runtime_status().installed {
+    let runner = crate::plugins::runtime_status();
+    if runner.installed {
         opts.plugin_token = Some(crate::mgmt_token::load_or_generate_plugin()?);
         // One token per installed plugin, so the API can tell them apart: a plugin may write its
         // own registration and its own provider, and no other's.
-        let ids: Vec<String> = crate::plugins::manifest::installed().into_keys().collect();
-        opts.plugin_tokens = crate::mgmt_token::load_or_generate_per_plugin(&ids)?;
+        opts.plugin_tokens = crate::mgmt_token::load_or_generate_per_plugin()?;
+        // An upgrade or a hand-edited grants file may have changed what the runner must see.
+        crate::plugins::converge_runner_roots();
+        crate::plugins::converge_runner_acls(&runner);
     }
     // Default all-interfaces so paired clients browse over mTLS. Admin stays loopback in
     // `require_auth`. Packaged units ship a fixed ExecStart — `host.env` is the upgrade-safe pin;
@@ -863,6 +763,114 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, b
         );
     }
     Ok((opts, native, gamestream))
+}
+
+/// `punktfunk1-host` flags. A bad value is an error, as in [`parse_serve`]: a typo'd port
+/// must not quietly serve 9777.
+fn parse_punktfunk1(args: &[String]) -> Result<native::Punktfunk1Options> {
+    fn value<T: std::str::FromStr>(flag: &str, v: String) -> Result<T> {
+        v.trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("bad {flag} '{v}'"))
+    }
+    let mut opts = native::Punktfunk1Options {
+        port: 9777,
+        source: native::Punktfunk1Source::Synthetic,
+        seconds: 30,
+        frames: 300,
+        max_sessions: 0,
+        max_concurrent: native::DEFAULT_MAX_CONCURRENT,
+        // Pairing required unless `--allow-tofu`. `--require-pairing`/`--allow-pairing` are no-ops.
+        require_pairing: true,
+        allow_pairing: true,
+        pairing_pin: None,
+        paired_store: None,
+        // Fixed port = one number to open or proxy; the client's punch still picks the path.
+        data_port: std::env::var("PUNKTFUNK_DATA_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok()),
+        // QUIC idle timeout; flag overrides env; absent = core default (8 s).
+        idle_timeout: native::idle_timeout_from_env(),
+        mdns: discovery::mdns_enabled(),
+    };
+    let mut source = "synthetic".to_string();
+    // What `--source synthetic-abr` encodes; ignored by the other sources.
+    let (mut content, mut fill, mut idr_pct) =
+        ("steady".to_string(), 100u32, native::DEFAULT_IDR_PCT);
+    let (mut recovery_ms, mut bringup_ms, mut serve_ramp) = (0u64, 2_500u64, true);
+    let mut answer = "idr".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let mut next = || {
+            i += 1;
+            args.get(i)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing value for {arg}"))
+        };
+        match arg {
+            "--port" => opts.port = value(arg, next()?)?,
+            "--source" => source = next()?,
+            "--seconds" => opts.seconds = value(arg, next()?)?,
+            "--frames" => opts.frames = value(arg, next()?)?,
+            "--max-sessions" => opts.max_sessions = value(arg, next()?)?,
+            "--max-concurrent" => opts.max_concurrent = value(arg, next()?)?,
+            "--allow-tofu" => opts.require_pairing = false,
+            "--require-pairing" | "--allow-pairing" => {}
+            // Empty would arm SPAKE2 with an empty password (same trap as `--mgmt-token`).
+            "--pairing-pin" => match next()? {
+                p if p.trim().is_empty() => bail!("--pairing-pin must not be empty"),
+                p => opts.pairing_pin = Some(p),
+            },
+            "--data-port" => opts.data_port = Some(value(arg, next()?)?),
+            "--idle-timeout-ms" => match value::<u64>(arg, next()?)? {
+                0 => bail!("--idle-timeout-ms must be > 0"),
+                ms => opts.idle_timeout = Some(std::time::Duration::from_millis(ms)),
+            },
+            "--no-mdns" => opts.mdns = false,
+            "--content" => content = next()?,
+            "--fill" => fill = value(arg, next()?)?,
+            "--recovery-ms" => recovery_ms = value(arg, next()?)?,
+            "--keyframe-answer" => answer = next()?,
+            "--bringup-ms" => bringup_ms = value(arg, next()?)?,
+            "--idr-pct" => idr_pct = value(arg, next()?)?,
+            "--no-ramp" => serve_ramp = false,
+            "-h" | "--help" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            other => bail!("unknown argument '{other}' (try --help)"),
+        }
+        i += 1;
+    }
+    opts.source = match source.as_str() {
+        "synthetic" => native::Punktfunk1Source::Synthetic,
+        "virtual" => native::Punktfunk1Source::Virtual,
+        "synthetic-abr" => {
+            if !(1..=100).contains(&fill) {
+                bail!("--fill takes 1-100");
+            }
+            if idr_pct == 0 {
+                bail!("--idr-pct must be > 0");
+            }
+            let Some(answer) = native::KeyframeAnswer::parse(&answer) else {
+                bail!("--keyframe-answer takes idr or wave:<n>");
+            };
+            let Some(content) = native::Content::parse(&content, fill) else {
+                bail!("--content takes steady, idle-then-motion, frame-driven:<fps> or motion-then-still:<fps>");
+            };
+            native::Punktfunk1Source::SyntheticAbr(native::SynthAbrShape {
+                content,
+                recovery: std::time::Duration::from_millis(recovery_ms),
+                answer,
+                idr_pct,
+                bringup: std::time::Duration::from_millis(bringup_ms),
+                serve_ramp,
+            })
+        }
+        other => bail!("unknown --source '{other}' (synthetic|synthetic-abr|virtual)"),
+    };
+    Ok(opts)
 }
 
 fn parse_spike(args: &[String]) -> Result<Options> {
@@ -992,6 +1000,8 @@ USAGE:
     punktfunk-host ctl <VERB>                 operator control over the local management API —
                                               pairing, devices, sessions, `watch` (line-JSON for a
                                               shell widget); `ctl --help` for the verb list
+    punktfunk-host settings set <ID> <VALUE>  write one console setting to host-settings.json;
+                                              restart the host to apply it
     punktfunk-host plugins <CMD>              install/run host plugins (add, remove, list, enable,
                                               disable, status) — `plugins --help` for details
     punktfunk-host tray <CMD>                 status-tray lifecycle (start, stop, status) — Windows;
@@ -1017,8 +1027,8 @@ SERVE OPTIONS:
                                  RTSP, ENet control, _nvstream mDNS). OFF by default — they carry
                                  inherent on-path weaknesses (plain-HTTP pairing + legacy GCM nonce
                                  reuse, security-review #5/#9); enable only on a TRUSTED LAN.
-                                 Also PUNKTFUNK_GAMESTREAM=1 in host.env (how a packaged install
-                                 opts in — the shipped units run native-only)
+                                 The flag locks the console's GameStream setting; an install sets
+                                 that setting instead (`settings set gamestream true`)
     --native                     no-op (the native punktfunk/1 plane always runs in `serve` now)
     --native-port <PORT>         native QUIC port (or PUNKTFUNK_NATIVE_PORT in host.env, which
                                  this flag overrides). Default 9777. Clients follow via mDNS, and
@@ -1040,9 +1050,10 @@ PUNKTFUNK1-HOST OPTIONS:
                                  test frames, frames sized from the live Automatic rate, or a
                                  virtual display + NVENC (default: synthetic). synthetic-abr
                                  needs no display and no GPU
-    --content <SCRIPT>           what synthetic-abr encodes: steady, idle-then-motion, or
-                                 frame-driven:<fps> for a source slower than the session
-                                 (default: steady)
+    --content <SCRIPT>           what synthetic-abr encodes: steady, idle-then-motion,
+                                 frame-driven:<fps> for a source slower than the session, or
+                                 motion-then-still:<fps> for a minute of motion, then <fps>
+                                 new frames a second among repeats (default: steady)
     --fill <PCT>                 share of each frame's bit allowance synthetic-abr fills,
                                  1-100 (default: 100)
     --recovery-ms <MS>           how long synthetic-abr takes to answer a keyframe request.
@@ -1113,4 +1124,52 @@ NOTES:
     (_punktfunk._udp) for client auto-discovery — 'punktfunk-probe --discover' lists them."
     );
     windows::entry::print_usage();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A bad value is refused rather than replaced by the default.
+    #[test]
+    fn punktfunk1_host_refuses_a_bad_value() {
+        let o = parse_punktfunk1(&args(&["--port", "9800", "--allow-tofu", "--no-mdns"])).unwrap();
+        assert_eq!((o.port, o.require_pairing, o.mdns), (9800, false, false));
+        assert!(matches!(o.source, native::Punktfunk1Source::Synthetic));
+        for bad in [
+            &["--port", "abc"][..],
+            &["--seconds", "-1"],
+            &["--source", "virtaul"],
+            &["--source", "synthetic-abr", "--fill", "0"],
+            &["--idle-timeout-ms", "0"],
+            &["--pairing-pin", " "],
+            &["--port"],
+            &["--frobnicate"],
+        ] {
+            assert!(
+                parse_punktfunk1(&args(bad)).is_err(),
+                "{bad:?} was accepted"
+            );
+        }
+        let abr = [
+            "--source",
+            "synthetic-abr",
+            "--content",
+            "idle-then-motion",
+            "--fill",
+            "50",
+        ];
+        let o = parse_punktfunk1(&args(&abr)).unwrap();
+        let native::Punktfunk1Source::SyntheticAbr(shape) = o.source else {
+            panic!("synthetic-abr source");
+        };
+        assert_eq!(
+            (shape.idr_pct, shape.serve_ramp),
+            (native::DEFAULT_IDR_PCT, true)
+        );
+    }
 }

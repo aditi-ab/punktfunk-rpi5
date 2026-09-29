@@ -14,6 +14,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import {
+	Cause,
 	Deferred,
 	Duration,
 	Effect,
@@ -32,7 +33,8 @@ export type SyncReason =
 	| "fs-change"
 	| "config-change"
 	| "manual"
-	| "coalesced";
+	| "coalesced"
+	| "library-change";
 
 export interface LastSync {
 	readonly fingerprint: string;
@@ -228,11 +230,14 @@ export const makeSyncEngine = <
 				return { _tag: "Applied", report, count: entries.length } as const;
 			});
 
-		// Errors must never kill a loop — log and carry on (the original's catch).
+		// Nothing may kill a loop: a scan that throws is a defect, not a typed failure, and
+		// `Effect.catch` alone would let it end the fiber without a word.
 		const safeSync = (reason: SyncReason): Effect.Effect<void> =>
 			sync(reason).pipe(
-				Effect.catch((e: SyncError) =>
-					Effect.logWarning(`sync (${reason}) failed: ${e.cause}`),
+				Effect.catchCause((cause) =>
+					Effect.logWarning(
+						`sync (${reason}) failed: ${Cause.pretty(cause).split("\n").slice(0, 8).join("\n")}`,
+					),
 				),
 				Effect.asVoid,
 			);

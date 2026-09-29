@@ -41,6 +41,8 @@ public enum PadControlKind: Equatable, Sendable {
     case stick(axisX: UInt32, axisY: UInt32)
     /// The finger's position down the pill is the pull: the top is 0, the bottom is full.
     case trigger(axis: UInt32)
+    /// A tap opens the quick-action ring; nothing goes on the wire.
+    case ring
 }
 
 /// `id` is the tweak key in the blob (`PadTweak`); `sc` and `hidden` are the applied tweak —
@@ -107,8 +109,9 @@ private func disc(_ id: String, _ label: String, _ glyph: String, _ bit: UInt32,
 /// Positions are fixed per preset (§4.3): sticks in the bottom corners, the D-pad beside the left
 /// stick, the face buttons in the bottom-right corner with the right stick beside them, the
 /// shoulders in the top corners with the stick clicks beside them, Select, Guide and Start along
-/// the bottom edge. A narrow layer lifts the D-pad and the right stick above their neighbours and
-/// puts the middle three along the top edge instead. An unknown preset is `full`.
+/// the bottom edge, and the quick-action ring's button inboard of the left bumper. A narrow layer
+/// lifts the D-pad and the right stick above their neighbours and puts the middle three along the
+/// top edge instead. An unknown preset is `full`.
 public func padControls(layout: String, w: Float, h: Float) -> [PadControl] {
     typealias P = VirtualPad
     let narrow = w < P.narrow
@@ -174,6 +177,10 @@ public func padControls(layout: String, w: Float, h: Float) -> [PadControl] {
     out.append(disc("select", "Select", "⧉", GamepadWire.back, w / 2 - 64, midY, P.smallRadius))
     out.append(disc("guide", "Guide", "◎", GamepadWire.guide, w / 2, midY, P.smallRadius))
     out.append(disc("start", "Start", "☰", GamepadWire.start, w / 2 + 64, midY, P.smallRadius))
+    let ringX = P.margin + 2 * P.bumperRadius + 8
+    out.append(PadControl(id: "ring", label: "Quick actions",
+                          rect: PadRect(ringX, P.margin + P.bumperRadius - P.smallRadius, 2 * P.smallRadius, 2 * P.smallRadius),
+                          kind: .ring))
     return out
 }
 

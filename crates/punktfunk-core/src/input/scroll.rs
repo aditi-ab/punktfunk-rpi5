@@ -844,4 +844,105 @@ mod tests {
         };
         assert_eq!(o.prepare(key, true), Some(key));
     }
+
+    /// `testdata/scroll-vectors.json`: capture sequences and what [`ScrollAccumulator`]
+    /// puts on the wire for each step. Sources and phases are their wire numbers.
+    fn scroll_vectors() -> String {
+        use ScrollPhase::*;
+        use ScrollSource::*;
+        type Step = (ScrollSource, ScrollPhase, u32, f64);
+        let cases: [(&str, &[Step]); 10] = [
+            (
+                "wheel detents",
+                &[(Wheel, None, 0, 120.0), (Wheel, None, 0, -240.0)],
+            ),
+            ("hi-res wheel quarters", &[(Wheel, None, 0, 30.0); 4]),
+            (
+                "unknown carries its fraction",
+                &[(Unknown, None, 0, 0.4); 3],
+            ),
+            (
+                "finger gesture",
+                &[
+                    (Finger, Begin, 0, 1.5),
+                    (Finger, Update, 0, 0.01),
+                    (Finger, Update, 0, 0.001),
+                    (Finger, End, 0, 0.0),
+                ],
+            ),
+            (
+                "momentum tail",
+                &[
+                    (Finger, MomentumBegin, 0, 3.3),
+                    (Finger, Momentum, 0, 0.2),
+                    (Finger, MomentumEnd, 0, 0.0),
+                ],
+            ),
+            (
+                "a source switch drops the residue",
+                &[
+                    (Continuous, None, 0, 0.003),
+                    (Continuous, None, 0, 0.003),
+                    (Touch, Update, 0, 0.003),
+                ],
+            ),
+            (
+                "a boundary drops the residue",
+                &[(Touch, Update, 0, 0.003), (Touch, Begin, 0, 0.003)],
+            ),
+            ("horizontal", &[(Finger, Update, 1, -2.5)]),
+            ("saturates", &[(Continuous, None, 0, 1e9)]),
+            (
+                "rejects",
+                &[
+                    (Finger, End, 0, 1.0),
+                    (Wheel, Begin, 0, 120.0),
+                    (Controller, Momentum, 0, 1.0),
+                    (Finger, Update, 2, 1.0),
+                ],
+            ),
+        ];
+        let about = "Generated from punktfunk_core::input::scroll::ScrollAccumulator by \
+            scroll_vectors_are_checked_in (UPDATE_VECTORS=1 rewrites it). The Kotlin \
+            ScrollNormalizer test replays every case.";
+        let mut out = format!("{{\n  \"$comment\": \"{about}\",\n  \"cases\": [\n");
+        for (i, (name, steps)) in cases.iter().enumerate() {
+            let mut acc = ScrollAccumulator::new();
+            out += &format!("    {{\"name\": \"{name}\", \"steps\": [\n");
+            for (j, &(source, phase, axis, delta)) in steps.iter().enumerate() {
+                let wire = acc
+                    .event(source, phase, axis, delta)
+                    .map_or("null".into(), |e| {
+                        let se = ScrollEvent::from_event(&e).unwrap();
+                        format!(
+                            "{{\"source\": {}, \"phase\": {}, \"axis\": {}, \"delta\": {}}}",
+                            se.source as u8, se.phase as u8, se.axis, se.delta
+                        )
+                    });
+                let comma = if j + 1 < steps.len() { "," } else { "" };
+                out += &format!(
+                    "      {{\"source\": {}, \"phase\": {}, \"axis\": {axis}, \"delta\": {delta:?}, \
+                     \"wire\": {wire}}}{comma}\n",
+                    source as u8, phase as u8
+                );
+            }
+            let comma = if i + 1 < cases.len() { "," } else { "" };
+            out += &format!("    ]}}{comma}\n");
+        }
+        out + "  ]\n}\n"
+    }
+
+    #[test]
+    fn scroll_vectors_are_checked_in() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/scroll-vectors.json");
+        let fresh = scroll_vectors();
+        if std::env::var_os("UPDATE_VECTORS").is_some() {
+            std::fs::write(path, &fresh).unwrap();
+        }
+        let on_disk = std::fs::read_to_string(path).unwrap_or_default();
+        assert!(
+            on_disk == fresh,
+            "{path} is stale: rerun with UPDATE_VECTORS=1"
+        );
+    }
 }

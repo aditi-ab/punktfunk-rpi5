@@ -1,6 +1,7 @@
 //! Host-tagged `/api/v1` routes: identity, liveness, compositor list, live status,
 //! and the loopback tray summary. Split out of the `mgmt` facade.
 
+use super::auth::{AuthLane, PairedDevice};
 use super::shared::*;
 use crate::encode::Codec;
 use crate::gamestream::APP_VERSION;
@@ -9,6 +10,7 @@ use crate::gamestream::CONTROL_PORT;
 use crate::gamestream::GFE_VERSION;
 use crate::gamestream::RTSP_PORT;
 use crate::gamestream::VIDEO_PORT;
+use axum::Extension;
 use std::sync::atomic::Ordering;
 
 #[derive(Serialize, ToSchema)]
@@ -348,10 +350,11 @@ pub(crate) struct ActiveGame {
     /// Which store surfaced it (`steam`, `heroic`, `custom`, …), when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     store: Option<String>,
-    /// `native` or `gamestream`.
+    /// `native`, `gamestream` or `web`.
     plane: crate::events::Plane,
     /// `launching` | `running` | `window` (its window is on the streamed screen) | `exited` |
-    /// `untracked` (exit will never be seen) | `grace` (reconnect window).
+    /// `untracked` (exit will never be seen) | `grace` (reconnect window) | `detached` (still
+    /// running, no session holds it).
     #[schema(example = "running")]
     state: String,
     /// Present and true while `running` on a host that will report `window` next. A launch hold
@@ -362,6 +365,11 @@ pub(crate) struct ActiveGame {
     /// Seconds until this game is ended — only present on a `grace` row.
     #[serde(skip_serializing_if = "Option::is_none")]
     grace_remaining_s: Option<u64>,
+    /// Present and true when this caller may end it with `POST /game/end`: the operator any
+    /// launched game, a paired device only a game it launched.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[schema(required = false)]
+    endable: bool,
 }
 
 /// One live session as the Dashboard lists it: who, where, since when, and the state
@@ -380,6 +388,9 @@ pub(crate) struct SessionRow {
     /// Display name (trust store, else the name the client sent). `null` if nameless.
     #[serde(skip_serializing_if = "Option::is_none")]
     client_name: Option<String>,
+    /// Name of the settings preset the client dialled with. Absent for plain settings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preset_name: Option<String>,
     /// `WxH@Hz`.
     #[schema(example = "3840x2160@120")]
     mode: String,
@@ -492,7 +503,7 @@ pub(crate) struct LocalSummary {
 pub(crate) async fn get_health() -> Json<Health> {
     Json(Health {
         status: "ok".into(),
-        version: env!("PUNKTFUNK_VERSION").into(),
+        version: crate::version::get().into(),
         abi_version: punktfunk_core::ABI_VERSION,
     })
 }
@@ -514,7 +525,7 @@ pub(crate) async fn get_host_info(State(st): State<Arc<MgmtState>>) -> Json<Host
         hostname: h.hostname.clone(),
         uniqueid: h.uniqueid.clone(),
         local_ip: h.local_ip().to_string(),
-        version: env!("PUNKTFUNK_VERSION").into(),
+        version: crate::version::get().into(),
         abi_version: punktfunk_core::ABI_VERSION,
         app_version: APP_VERSION.into(),
         gfe_version: GFE_VERSION.into(),
@@ -609,11 +620,16 @@ pub(crate) async fn list_compositors() -> Json<Vec<AvailableCompositor>> {
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
     )
 )]
-pub(crate) async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<RuntimeStatus> {
+pub(crate) async fn get_status(
+    State(st): State<Arc<MgmtState>>,
+    Extension(lane): Extension<AuthLane>,
+    device: Option<Extension<PairedDevice>>,
+) -> Json<RuntimeStatus> {
+    let ender = super::session::GameEnder::of(&st, lane, device.as_ref().map(|d| d.0 .0.as_str()));
     let gs_launch = *st.app.launch.lock().unwrap_or_else(|e| e.into_inner());
     // Stream slot is GameStream-featured only; a native-only build has no compat-plane stream.
     #[cfg(feature = "gamestream")]
-    let gs_stream = *st.app.stream.lock().unwrap_or_else(|e| e.into_inner());
+    let gs_stream = *st.app.gs.stream.lock().unwrap_or_else(|e| e.into_inner());
     let gs_video = st.app.streaming.load(Ordering::SeqCst);
     let gs_audio = st.app.audio_streaming.load(Ordering::SeqCst);
     // Native plane, published by the video loop; lives outside `AppState` (see `session_status`).
@@ -625,12 +641,13 @@ pub(crate) async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<Runtime
     let sessions: Vec<SessionRow> = native
         .iter()
         .map(|s| {
-            let native_plane = s.plane == crate::events::Plane::Native;
+            let native_plane = s.plane != crate::events::Plane::Gamestream;
             SessionRow {
                 id: Some(s.id),
                 plane: s.plane,
                 client: s.client.clone(),
                 client_name: s.client_name.clone(),
+                preset_name: s.preset_name.clone(),
                 mode: crate::events::mode_str(s.width, s.height, s.fps),
                 hdr: s.hdr,
                 join: s.join,
@@ -735,6 +752,7 @@ pub(crate) async fn get_status(State(st): State<Arc<MgmtState>>) -> Json<Runtime
                 state: g.state.to_string(),
                 awaiting_window: g.awaiting_window,
                 grace_remaining_s: g.grace_remaining_s,
+                endable: ender.may_end(g.state, g.launched_by.as_deref()),
             })
             .collect(),
         audio: audio_wiring(),
@@ -785,7 +803,7 @@ pub(crate) async fn get_local_summary(State(st): State<Arc<MgmtState>>) -> Json<
         .map(|n| (n.status().paired_clients, n.pending().len() as u32))
         .unwrap_or((0, 0));
     Json(LocalSummary {
-        version: env!("PUNKTFUNK_VERSION").into(),
+        version: crate::version::get().into(),
         // Either plane, like `/status`; GameStream flags alone miss a native session.
         video_streaming: st.app.streaming.load(Ordering::SeqCst) || !native.is_empty(),
         audio_streaming: st.app.audio_streaming.load(Ordering::SeqCst) || !native.is_empty(),
@@ -825,7 +843,7 @@ pub(crate) async fn get_local_summary(State(st): State<Arc<MgmtState>>) -> Json<
 /// GameStream PIN wait. `false` in a native-only build (pairing does not exist); the field stays so the schema matches across flavors.
 #[cfg(feature = "gamestream")]
 fn gs_pin_pending(st: &Arc<MgmtState>) -> bool {
-    st.app.pairing.pin.awaiting_pin()
+    st.app.gs.pairing.pin.awaiting_pin()
 }
 #[cfg(not(feature = "gamestream"))]
 fn gs_pin_pending(_st: &Arc<MgmtState>) -> bool {

@@ -51,10 +51,8 @@ object Sc2Device {
      * Declared STRIPPED payload length per output report id (wire length = stripped + 1), or null
      * for an id with no declared length: clamp to what arrived, never guess-trim past it.
      *
-     * The host's `pf_driver_proto::triton::out_report_len` holds the same table id-INCLUDED, and
-     * the two are hand-mirrored. [Sc2DeviceTest] pins `stripped + 1` against a transcription of
-     * those values, so it catches a drift made here but not one made on the Rust side. Editing
-     * either table means editing both.
+     * The host's `pf_driver_proto::triton::out_report_len` holds the same table id-INCLUDED;
+     * `clients/shared/sc2-vectors.json` holds it, the Apple table and this one to the same rows.
      */
     fun strippedOutputLen(id: Int): Int? = when (id) {
         0x80 -> 9 // grip rumble    -> 100F6CB5

@@ -102,16 +102,13 @@ impl Drop for InputDesktopBinding {
 /// returns `ERROR_ACCESS_DENIED`. The synthetic device is not desktop-affine, so
 /// rebinding the thread is enough — recreating the device would drop in-flight
 /// contacts and pen in-range state.
-///
-/// # Safety
-/// `dev` must be a live synthetic-pointer device and `frame` a live slice for the call.
-unsafe fn inject_following_desktop(
-    dev: HSYNTHETICPOINTERDEVICE,
+fn inject_following_desktop(
+    dev: &Device,
     frame: &[POINTER_TYPE_INFO],
 ) -> windows::core::Result<()> {
-    // SAFETY: per this fn's contract — `dev` is live and `frame` outlives the call, which only
-    // reads it. Best-effort, exactly as the direct call was.
-    match unsafe { InjectSyntheticPointerInput(dev, frame) } {
+    // SAFETY: `dev` owns a live synthetic-pointer device for the borrow; the call only reads
+    // `frame`. Best-effort, exactly as the direct call was.
+    match unsafe { InjectSyntheticPointerInput(dev.0, frame) } {
         Ok(()) => Ok(()),
         Err(first) => {
             // Only a desktop switch is worth a rebind; anything else would just fail identically.
@@ -119,7 +116,7 @@ unsafe fn inject_following_desktop(
                 return Err(first);
             };
             // SAFETY: same live `dev`/`frame`, re-issued with this thread on the input desktop.
-            unsafe { InjectSyntheticPointerInput(dev, frame) }
+            unsafe { InjectSyntheticPointerInput(dev.0, frame) }
         }
     }
 }
@@ -401,10 +398,9 @@ fn inject_pen(sh: &mut PenShared, edge: POINTER_FLAGS, is_new: bool) {
             },
         },
     };
-    // SAFETY: `sh.dev.0` is the live device this wrapper owns; the one-element array is a live
-    // stack value the call only reads. Best-effort like every injector write — a transient
-    // failure (desktop switch) is healed by the next refresh tick re-asserting state.
-    if let Err(e) = unsafe { inject_following_desktop(sh.dev.0, &[info]) } {
+    // Best-effort like every injector write — a transient failure (desktop switch) is healed
+    // by the next refresh tick re-asserting state.
+    if let Err(e) = inject_following_desktop(&sh.dev, &[info]) {
         if !sh.fail_warned {
             sh.fail_warned = true;
             tracing::warn!(
@@ -613,9 +609,8 @@ fn inject_touch_frame(sh: &mut TouchShared, edge: Option<(u32, POINTER_FLAGS)>) 
             },
         });
     }
-    // SAFETY: `sh.dev.0` is the live owned device; `frame` is a live Vec the call only reads.
     // Best-effort — a transient failure heals on the next event/refresh re-assertion.
-    if let Err(e) = unsafe { inject_following_desktop(sh.dev.0, &frame) } {
+    if let Err(e) = inject_following_desktop(&sh.dev, &frame) {
         if !sh.fail_warned {
             sh.fail_warned = true;
             tracing::warn!(error = %e, contacts = frame.len(), "touch inject failed");

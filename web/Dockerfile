@@ -12,7 +12,7 @@
 # as the logged-in operator on the console's origin. Publish BOTH (`-p 47992:47992 -p
 # 47993:47993`): the browser loads the frame from the second port directly, so a container that
 # only publishes 47992 serves a console whose every plugin interface is an empty panel.
-FROM oven/bun:1 AS build
+FROM oven/bun:1.4.2 AS build
 WORKDIR /repo/web
 
 # Dependency layer: lockfile only, so source edits don't re-install.
@@ -36,7 +36,7 @@ COPY web/ ./
 # prebuild runs orval (openapi → src/api/gen); the paraglide vite plugin compiles i18n.
 RUN bun run build
 
-FROM oven/bun:1-slim
+FROM oven/bun:1.4.2-slim
 WORKDIR /app
 COPY --from=build /repo/web/.output ./.output
 USER bun

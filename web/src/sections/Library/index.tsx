@@ -1,54 +1,86 @@
+import { Link } from "@tanstack/react-router";
 import Section from "@unom/ui/section";
 import { Plus } from "lucide-react";
 import { type FC, useState } from "react";
+import { useGetPluginAccess } from "@/api/gen/plugin-access/plugin-access";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useLocale } from "@/lib/i18n";
 import { m } from "@/paraglide/messages";
-import { type FormTarget, GameFormSection } from "./GameForm";
 import { LibraryGridSection } from "./LibraryGrid";
-import { SourcesSection } from "./Sources";
+import { MetadataSourcesSection } from "./MetadataSources";
+import { SourcesSection, useSourceNames } from "./Sources";
 
-// Library = an OVERVIEW grid + a SEPARATE add/edit form, deliberately split into their own files
-// (LibraryGrid / GameForm) so the two concerns never share a component. This container owns only the
-// shared "is the form open, and for what" UI state; the grid and form each own their own data.
+type Tab = "games" | "sources";
+
+// Library = the games, and where they come from. Games lead: a library of thousands must not
+// sit under its own settings. Adding or editing an entry happens on its own page
+// (`/library/$gameId`, `/library/new`).
 export const SectionLibrary: FC = () => {
 	useLocale();
-	// null = form hidden; "new" = adding; a GameEntry = editing that custom entry. Keying the form
-	// by the target re-seeds its fields when switching add → edit (or between entries).
-	const [target, setTarget] = useState<FormTarget | null>(null);
-	// Which provider (if any) the grid is filtered to.
+	const [tab, setTab] = useState<Tab>("games");
+	// Which provider (if any) the games are narrowed to.
 	const [providerFilter, setProviderFilter] = useState<string | null>(null);
+	const nameOf = useSourceNames();
+	// Folder and install requests wait under Sources; the tab says so while Games is open.
+	const access = useGetPluginAccess();
+	const waiting = (access.data ?? []).reduce(
+		(n, row) => n + row.pending.length,
+		0,
+	);
 
 	return (
 		<Section maxWidth={false}>
 			<div className="flex flex-col gap-card">
 				<div className="flex items-center justify-between gap-4">
 					<h1 className="text-2xl font-semibold">{m.library_title()}</h1>
-					{target === null && (
-						<Button onClick={() => setTarget("new")}>
+					<Button asChild>
+						<Link to="/library/$gameId" params={{ gameId: "new" }}>
 							<Plus className="size-4" />
 							{m.library_add_button()}
-						</Button>
-					)}
+						</Link>
+					</Button>
 				</div>
 
-				{target !== null && (
-					<GameFormSection
-						key={target === "new" ? "new" : target.id}
-						target={target}
-						onClose={() => setTarget(null)}
-					/>
-				)}
-
-				<SourcesSection
-					activeFilter={providerFilter}
-					onFilter={setProviderFilter}
-				/>
-
-				<LibraryGridSection
-					onEdit={(entry) => setTarget(entry)}
-					providerFilter={providerFilter}
-				/>
+				<Tabs value={tab} onValueChange={(v) => setTab(v as Tab)}>
+					<TabsList>
+						<TabsTrigger value="games">{m.library_tab_games()}</TabsTrigger>
+						<TabsTrigger value="sources">
+							{m.library_tab_sources()}
+							{waiting > 0 && (
+								<Badge variant="secondary" className="ml-2">
+									{waiting}
+								</Badge>
+							)}
+						</TabsTrigger>
+					</TabsList>
+					<TabsContent value="games" className="flex flex-col gap-card">
+						<LibraryGridSection
+							providerFilter={providerFilter}
+							source={
+								providerFilter
+									? {
+											label: nameOf(providerFilter) ?? providerFilter,
+											onClear: () => setProviderFilter(null),
+										}
+									: undefined
+							}
+							onSources={() => setTab("sources")}
+						/>
+					</TabsContent>
+					<TabsContent value="sources" className="flex flex-col gap-card">
+						<SourcesSection
+							activeFilter={providerFilter}
+							onFilter={(provider) => {
+								setProviderFilter(provider);
+								// Narrowing is a question about the games: answer it where they are.
+								if (provider) setTab("games");
+							}}
+						/>
+						<MetadataSourcesSection />
+					</TabsContent>
+				</Tabs>
 			</div>
 		</Section>
 	);

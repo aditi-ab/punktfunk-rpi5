@@ -3,7 +3,7 @@
 
 #if os(macOS)
 import AppKit
-#elseif os(iOS)
+#elseif os(iOS) || os(visionOS)
 import UIKit
 #endif
 import PunktfunkKit
@@ -24,10 +24,23 @@ struct PunktfunkClientApp: App {
         // Before anything touches the core, so its first lines (identity load, the first connect's
         // transport setup) land in the log ring "Send logs to host" uploads.
         CoreLog.install()
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         // Put Geist on the navigation titles before any bar is built.
         BrandTheme.apply()
         #endif
+        Self.warmIdentity()
+    }
+
+    /// The identity's first load is blocking Keychain work, and most of its callers sit on the
+    /// main actor. Loaded here, off it, they find both halves cached.
+    private static func warmIdentity() {
+        #if DEBUG
+        if ScreenshotMode.isActive { return }
+        #endif
+        DispatchQueue.global(qos: .utility).async {
+            guard let identity = (try? ClientIdentityStore.shared.load())?.identity else { return }
+            LibraryClient.warmIdentity(identity)
+        }
     }
 
     var body: some Scene {
@@ -94,6 +107,12 @@ struct PunktfunkClientApp: App {
                 .tint(.brand)
         }
         #endif
+        #if os(visionOS)
+        ImmersiveSpace(id: TheaterStage.spaceID) {
+            TheaterView()
+        }
+        .immersionStyle(selection: .constant(TheaterStage.style), in: TheaterStage.style)
+        #endif
     }
 }
 
@@ -111,6 +130,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    /// Without this a quit reads to the host as a dropped link, and it lingers the display.
+    func applicationWillTerminate(_ notification: Notification) {
+        SessionModel.quitAll()
+        PresetStore.shared.flush()
     }
 }
 #elseif os(iOS)

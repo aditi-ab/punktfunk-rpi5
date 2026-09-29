@@ -310,7 +310,6 @@ class DsCapture(
             Log.w(TAG, "pad audio: second USB connection failed")
             return
         }
-        padAudioConn = conn
         padAudioStarted = true
         // Real-world self test, opt-in: `adb shell setprop debug.punktfunk.pad_audio_selftest 3`
         // drives the voice coils for N seconds through the actual client path before the renderer
@@ -323,14 +322,19 @@ class DsCapture(
                 .invoke(null, "debug.punktfunk.pad_audio_selftest", "0") as String
         }.getOrNull()?.toIntOrNull() ?: 0
         if (secs > 0) {
-            // Diagnostic mode: the self test OWNS this descriptor for the capture, and the renderer
-            // must not also drive it — two engines on one usbfs descriptor reap each other's
-            // completions, which is precisely the fault this test exists to expose.
+            // Diagnostic mode: the self test OWNS this connection and closes it once the native
+            // call returns, so teardown never closes it mid-write. The renderer must not also drive
+            // it — two engines on one usbfs descriptor reap each other's completions.
             Thread({
-                val r = NativeBridge.nativePadAudioSelfTest(fd, secs, 60)
+                val r = try {
+                    NativeBridge.nativePadAudioSelfTest(fd, secs, 60)
+                } finally {
+                    conn?.close()
+                }
                 Log.i(TAG, "pad audio self-test → ${if (r > 0) "PASS ($r frames)" else "FAIL ($r)"}")
             }, "pf-pad-selftest").start()
         } else {
+            padAudioConn = conn
             // B6: hand the coils back before the first haptics frame. Any rumble earlier in this
             // session asserted HAPTICS_SELECT, which firmware-mutes them, and nothing else ever
             // clears it — so without this the stream renders into a muted actuator and looks for
@@ -475,6 +479,12 @@ class DsCapture(
         usb.writeRaw(0, DsDevice.ds5PlayerLedsReport(m, bits))
     }
 
+    override fun micLed(pad: Int, mode: Int) {
+        val m = model ?: return
+        if (m == DsDevice.Model.DUALSHOCK4) return // no mic LED on a DS4
+        usb.writeRaw(0, DsDevice.ds5MicLedReport(m, mode))
+    }
+
     override fun trigger(pad: Int, which: Int, effect: ByteArray) {
         val m = model ?: return
         if (m == DsDevice.Model.DUALSHOCK4) return // no adaptive triggers on a DS4
@@ -497,7 +507,8 @@ class DsCapture(
     )
 
     /**
-     * Hand the pad back neutral: adaptive triggers released, lightbar dark, player LEDs clear.
+     * Hand the pad back neutral: adaptive triggers released, lightbar dark, player and mic LEDs
+     * clear.
      *
      * Rumble stops the moment nothing renews it, but these are LATCHED in the controller's
      * firmware — they outlive the stream, the app, and being unplugged. Ending a session while a
@@ -523,6 +534,7 @@ class DsCapture(
         }
         usb.writeControl(DsDevice.ds5LightbarReport(m, 0, 0, 0))
         usb.writeControl(DsDevice.ds5PlayerLedsReport(m, 0))
+        usb.writeControl(DsDevice.ds5MicLedReport(m, 0))
     }
 
     /** The report that stops the motors. The DS4's is a full-state write, so it zeroes the

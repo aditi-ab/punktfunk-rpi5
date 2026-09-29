@@ -16,16 +16,16 @@ use pf_driver_proto::gamepad::{
     IOCTL_PF_GET_CHANNEL_PROOF,
 };
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use windows::core::{GUID, PCWSTR};
+use windows::core::{GUID, HSTRING, PCWSTR};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_Child, CM_Get_Device_IDW, CM_Get_Device_Interface_ListW,
     CM_Get_Device_Interface_List_SizeW, CM_Get_Sibling, CM_Locate_DevNodeW,
     CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CM_LOCATE_DEVNODE_NORMAL, CR_SUCCESS,
 };
 use windows::Win32::Devices::HumanInterfaceDevice::{
-    HidD_FreePreparsedData, HidD_GetFeature, HidD_GetIndexedString, HidD_GetPreparsedData,
-    HidD_GetProductString, HidD_GetSerialNumberString, HidD_SetFeature, HidP_GetCaps,
-    GUID_DEVINTERFACE_HID, HIDP_CAPS, PHIDP_PREPARSED_DATA,
+    HidD_FreePreparsedData, HidD_GetAttributes, HidD_GetFeature, HidD_GetIndexedString,
+    HidD_GetPreparsedData, HidD_GetProductString, HidD_GetSerialNumberString, HidD_SetFeature,
+    HidP_GetCaps, GUID_DEVINTERFACE_HID, HIDD_ATTRIBUTES, HIDP_CAPS, PHIDP_PREPARSED_DATA,
 };
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
@@ -252,6 +252,28 @@ fn ask_hid_path(path: &str, expect_pad_index: u32) -> Result<u32> {
         .map_err(|why| anyhow!("{why}"))
 }
 
+/// VID/PID the driver reports on `instance_id`'s HID collection (`HidD_GetAttributes`): what SDL,
+/// Steam and Windows read. `None` until hidclass has published the collection.
+pub(super) fn hid_vid_pid(instance_id: &str) -> Option<(u16, u16)> {
+    for child in child_device_ids(instance_id).ok()? {
+        for path in interface_paths(&GUID_DEVINTERFACE_HID, &child).unwrap_or_default() {
+            let Ok(handle) = open_device(&path) else {
+                continue;
+            };
+            let mut attrs = HIDD_ATTRIBUTES {
+                Size: std::mem::size_of::<HIDD_ATTRIBUTES>() as u32,
+                ..Default::default()
+            };
+            // SAFETY: `handle` is the live collection handle just opened; `attrs` is a valid,
+            // size-stamped out-param.
+            if unsafe { HidD_GetAttributes(HANDLE(handle.as_raw_handle()), &mut attrs) } {
+                return Some((attrs.VendorID, attrs.ProductID));
+            }
+        }
+    }
+    None
+}
+
 /// Same call the delivery path makes, for the `channel-proof-probe` subcommand — reports the
 /// production answer rather than a re-implementation of it.
 pub fn probe_pid(
@@ -398,7 +420,7 @@ fn ask_hid_both(h: HANDLE) -> (String, String, String) {
 /// and the only open that works on a HID mouse/keyboard collection — Windows refuses a
 /// user-mode read handle on those.
 fn open_device(path: &str) -> Result<OwnedHandle> {
-    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide = HSTRING::from(path);
     // SAFETY: `wide` is a valid NUL-terminated UTF-16 path for the duration of the call; the returned
     // handle is owned solely by the `OwnedHandle` built from it.
     let h = unsafe {
@@ -471,7 +493,7 @@ fn decode_proof(buf: &[u16]) -> Option<ChannelProof> {
 }
 
 fn interface_paths(class: &GUID, device_id: &str) -> Result<Vec<String>> {
-    let wide: Vec<u16> = device_id.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide = HSTRING::from(device_id);
     let mut len = 0u32;
     // SAFETY: `len` is a valid out-param; `wide` is a NUL-terminated id valid for the call.
     let cr = unsafe {
@@ -509,10 +531,7 @@ fn interface_paths(class: &GUID, device_id: &str) -> Result<Vec<String>> {
 /// Immediate children of `instance_id`. For a HID minidriver those are the collection PDOs
 /// hidclass created under our devnode — the HID interface lives there, not on the parent.
 fn child_device_ids(instance_id: &str) -> Result<Vec<String>> {
-    let wide: Vec<u16> = instance_id
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    let wide = HSTRING::from(instance_id);
     let mut devinst = 0u32;
     // SAFETY: `devinst` is a valid out-param; `wide` is a NUL-terminated id valid for the call.
     let cr = unsafe {

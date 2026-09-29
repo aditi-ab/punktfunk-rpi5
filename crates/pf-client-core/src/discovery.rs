@@ -8,43 +8,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// DNS-SD type hosts advertise. See host crate `punktfunk_host::discovery`.
+/// DNS-SD type hosts advertise. See host crate `punktfunk_host::hostsys::discovery`.
 const SERVICE_TYPE: &str = "_punktfunk._udp.local.";
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct DiscoveredHost {
-    /// Advertised host id, or the mDNS fullname when `id` is absent.
-    pub key: String,
-    /// mDNS service fullname. [`DiscoveryEvent::Removed`] names the advert by this.
-    pub fullname: String,
-    pub name: String,
-    pub addr: String,
-    pub port: u16,
-    /// Certificate fingerprint to pin (lowercase hex). Empty if not advertised.
-    pub fp_hex: String,
-    /// `"required"` or `"optional"`.
-    pub pair: String,
-    /// Management API port from mDNS `mgmt`. `None` if absent; the library
-    /// client then uses the well-known default.
-    pub mgmt_port: Option<u16>,
-    /// Wake-on-LAN MACs from mDNS `mac` (comma-separated `aa:bb:cc:dd:ee:ff`). Empty if absent.
-    pub mac: Vec<String>,
-    /// OS-identity chain from mDNS `os` (`windows` | `macos` | `linux[/<family>][/<id>]`),
-    /// sanitized ([`crate::os::sanitize_os`]). Empty if absent.
-    pub os: String,
-}
-
-impl DiscoveredHost {
-    /// Advertised mDNS TXT `id`, or `""` when absent. [`DiscoveredHost::key`] then
-    /// equals `fullname` — that equality is the no-id signal; use this, do not re-derive.
-    pub fn advertised_id(&self) -> &str {
-        if self.key == self.fullname {
-            ""
-        } else {
-            &self.key
-        }
-    }
-}
+pub use punktfunk_core::discovery::DiscoveredHost;
 
 /// Is this advert that saved host? Two known fingerprints settle it on their own — falling
 /// back to the address there would let whoever inherits a sleeping host's DHCP lease be
@@ -77,6 +44,51 @@ impl Rescan {
     /// Set the flag; the query follows within a tick. Coalesces: many requests, one query.
     pub fn request(&self) {
         self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// A browse watched for one host while it wakes. It owns the one advert match rule the
+/// wake-and-wait loops share, and their rescan cadence.
+pub struct AdvertWatch {
+    rx: async_channel::Receiver<DiscoveryEvent>,
+    rescan: Rescan,
+    polls: u32,
+}
+
+impl AdvertWatch {
+    pub fn start() -> AdvertWatch {
+        let (rx, rescan) = browse();
+        AdvertWatch {
+            rx,
+            rescan,
+            polls: 0,
+        }
+    }
+
+    /// Where the host advertised from since the last poll, if it did. A pinned host
+    /// (`fp` non-empty) is matched by its pin alone, an unpinned one by `addr:port`.
+    ///
+    /// Every fifth poll re-queries: `mdns-sd`'s backoff has doubled past a minute by the
+    /// time a cold box finishes booting.
+    pub fn poll(&mut self, fp: Option<&str>, addr: &str, port: u16) -> Option<(String, u16)> {
+        let mut seen = None;
+        while let Ok(ev) = self.rx.try_recv() {
+            let DiscoveryEvent::Resolved(h) = ev else {
+                continue;
+            };
+            let matched = match fp.filter(|f| !f.is_empty()) {
+                Some(fp) => h.fp_hex == fp,
+                None => h.addr == addr && h.port == port,
+            };
+            if matched {
+                seen = Some((h.addr, h.port));
+            }
+        }
+        self.polls += 1;
+        if self.polls % 5 == 0 {
+            self.rescan.request();
+        }
+        seen
     }
 }
 
@@ -129,46 +141,17 @@ pub fn browse() -> (async_channel::Receiver<DiscoveryEvent>, Rescan) {
                 let update = match event {
                     ServiceEvent::ServiceResolved(info) => {
                         let props = info.get_properties();
-                        let val = |k: &str| props.get_property_val_str(k).unwrap_or("").to_string();
-                        // IPv4 only: the core dials `{host}:{port}` on IPv4-bound
-                        // sockets; a v6 pick from this unordered set fails on click.
-                        // Among v4, `pick_host_addr` — `HashSet::iter().next()` is
-                        // an arbitrary overlay vs LAN address.
-                        let candidates: Vec<std::net::Ipv4Addr> =
+                        let v4: Vec<std::net::Ipv4Addr> =
                             info.get_addresses_v4().into_iter().collect();
-                        let Some(addr) = punktfunk_core::discovery::pick_host_addr(
-                            &candidates,
-                            val("addr").parse().ok(),
-                        )
-                        .map(|a| a.to_string()) else {
+                        let Some(host) = punktfunk_core::discovery::advert_from_txt(
+                            info.get_fullname(),
+                            info.get_port(),
+                            &v4,
+                            |k| props.get_property_val_str(k),
+                        ) else {
                             continue;
                         };
-                        let id = val("id");
-                        DiscoveryEvent::Resolved(DiscoveredHost {
-                            key: if id.is_empty() {
-                                info.get_fullname().to_string()
-                            } else {
-                                id
-                            },
-                            fullname: info.get_fullname().to_string(),
-                            name: info
-                                .get_fullname()
-                                .split('.')
-                                .next()
-                                .unwrap_or("?")
-                                .to_string(),
-                            addr,
-                            port: info.get_port(),
-                            fp_hex: val("fp"),
-                            pair: val("pair"),
-                            mgmt_port: val("mgmt").parse().ok(),
-                            mac: val("mac")
-                                .split(',')
-                                .map(|s| s.trim().to_string())
-                                .filter(|s| !s.is_empty())
-                                .collect(),
-                            os: crate::os::sanitize_os(&val("os")),
-                        })
+                        DiscoveryEvent::Resolved(host)
                     }
                     ServiceEvent::ServiceRemoved(_ty, fullname) => {
                         DiscoveryEvent::Removed { fullname }
@@ -287,6 +270,43 @@ mod tests {
         let mut unpinned = other_os.clone();
         unpinned.fp_hex = String::new();
         assert!(same_host(&placeholder, &unpinned));
+    }
+
+    /// A woken host's advert counts only if it is that host: a pinned target is matched by
+    /// its pin wherever it came back, never by an fp-less advert at its old address.
+    #[test]
+    fn a_pinned_wake_target_is_matched_by_its_pin_alone() {
+        let (tx, rx) = async_channel::unbounded();
+        let mut w = AdvertWatch {
+            rx,
+            rescan: Rescan(Arc::default()),
+            polls: 0,
+        };
+        let mut fp_less = host("id-1", "desk._punktfunk._udp.local.", "192.168.1.9");
+        fp_less.fp_hex = String::new();
+        let mut moved = host("id-2", "desk._punktfunk._udp.local.", "192.168.1.20");
+        moved.fp_hex = "bb".into();
+
+        tx.try_send(DiscoveryEvent::Resolved(fp_less.clone()))
+            .unwrap();
+        assert_eq!(w.poll(Some("bb"), "192.168.1.9", 9777), None);
+        tx.try_send(DiscoveryEvent::Resolved(moved)).unwrap();
+        assert_eq!(
+            w.poll(Some("bb"), "192.168.1.9", 9777),
+            Some(("192.168.1.20".into(), 9777))
+        );
+        // A card saved without a pin has only its address to go on.
+        tx.try_send(DiscoveryEvent::Resolved(fp_less)).unwrap();
+        assert_eq!(
+            w.poll(Some(""), "192.168.1.9", 9777),
+            Some(("192.168.1.9".into(), 9777))
+        );
+        assert!(!w.rescan.0.load(Ordering::Relaxed));
+        (0..2).for_each(|_| drop(w.poll(None, "192.168.1.9", 9777)));
+        assert!(
+            w.rescan.0.load(Ordering::Relaxed),
+            "the fifth poll re-queries"
+        );
     }
 
     #[test]

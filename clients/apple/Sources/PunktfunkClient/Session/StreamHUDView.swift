@@ -14,6 +14,10 @@ struct StreamHUDView: View {
     let connection: PunktfunkConnection
     var placement: HUDPlacement = .topTrailing
     let verbosity: StatsVerbosity
+    /// The player's Statistics size on top of the system text size; 1 is the stock look.
+    var scale: Double = 1
+    /// Read so a text-size change redraws the scaled styles below.
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
         // .off is gated upstream (ContentView only mounts the HUD when the tier is on) —
@@ -50,7 +54,7 @@ struct StreamHUDView: View {
             VStack(alignment: .leading, spacing: 2) {
                 ForEach(Array(model.hudLines.enumerated()), id: \.offset) { _, line in
                     Text(line.text)
-                        .font(.system(.caption, design: .monospaced))
+                        .font(hudFont(.caption))
                         .foregroundStyle(style(line.role))
                 }
             }
@@ -67,7 +71,7 @@ struct StreamHUDView: View {
                         .fill(Color.accentColor)
                         .frame(width: 7, height: 7)
                     Text(first.text)
-                        .font(.system(.caption, design: .monospaced))
+                        .font(hudFont(.caption))
                 }
             }
             #if os(tvOS)
@@ -81,13 +85,13 @@ struct StreamHUDView: View {
                     ? "access \(model.accessLevel.label.lowercased())"
                     : "access \(model.accessLevel.label.lowercased()) · ends in "
                         + SessionModel.accessCountdown(model.accessRemainingSecs))
-                    .font(.system(.caption2, design: .monospaced))
+                    .font(hudFont(.caption2))
                     .foregroundStyle(.secondary)
             }
             #endif
             ForEach(Array(model.hudLines.dropFirst().enumerated()), id: \.offset) { _, line in
                 Text(line.text)
-                    .font(.system(.caption2, design: .monospaced))
+                    .font(hudFont(.caption2))
                     .foregroundStyle(style(line.role))
             }
             // Capture hint, shown only until input is captured — how to grab it. The RELEASE
@@ -104,7 +108,7 @@ struct StreamHUDView: View {
                     .font(.geist(11, relativeTo: .caption2))
                     .foregroundStyle(.secondary)
             }
-            #elseif os(iOS)
+            #elseif os(iOS) || os(visionOS)
             // Touch always plays directly; ⌘⎋ (hardware keyboard) captures kb/mouse.
             if !model.mouseCaptured, connection.canSendPointer || connection.canSendKeyboard {
                 Text("⌘⎋ captures keyboard & mouse")
@@ -133,11 +137,23 @@ struct StreamHUDView: View {
             #if os(macOS)
             Button("Disconnect (⌃⌥⇧D)") { model.disconnect() }
                 .font(.geist(12, relativeTo: .caption))
-            #elseif os(iOS)
+            #elseif os(iOS) || os(visionOS)
             Button("Disconnect") { model.disconnect() }
                 .font(.geist(12, relativeTo: .caption))
             #endif
         }
+    }
+
+    /// A monospaced HUD text style at the player's Statistics size. At 1 it is the stock style;
+    /// otherwise the style's current point size, so Dynamic Type still applies underneath.
+    private func hudFont(_ style: Font.TextStyle) -> Font {
+        guard scale != 1 else { return .system(style, design: .monospaced) }
+        #if os(macOS)
+        let base = NSFont.preferredFont(forTextStyle: style == .caption ? .caption1 : .caption2)
+        #else
+        let base = UIFont.preferredFont(forTextStyle: style == .caption ? .caption1 : .caption2)
+        #endif
+        return .system(size: base.pointSize * scale, design: .monospaced)
     }
 
     /// The HUD's quiet palette: breakdowns recede, and only a warning is allowed to shout.
@@ -177,7 +193,7 @@ struct StreamHUDView: View {
     private var cardPadding: CGFloat {
         #if os(tvOS)
         return 16
-        #elseif os(iOS)
+        #elseif os(iOS) || os(visionOS)
         return max(10, cardCornerRadius * 0.45)
         #else
         return 10
@@ -189,7 +205,7 @@ struct StreamHUDView: View {
     /// radius (below); tvOS floats it well clear of the TV's overscan-ish edge; macOS windows
     /// keep the classic 10.
     private var edgeInset: CGFloat {
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         return 14
         #elseif os(tvOS)
         return 24
@@ -210,7 +226,7 @@ struct StreamHUDView: View {
     /// 28 pt is the most this card's stack can wear (with `cardPadding` scaling alongside), and
     /// devices whose display radius asks for less than that still get a truly concentric corner.
     private var cardCornerRadius: CGFloat {
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         return min(28, max(12, DeviceMetrics.displayCornerRadius - edgeInset))
         #elseif os(tvOS)
         return 16 // scales with the roomier padding
@@ -223,6 +239,91 @@ struct StreamHUDView: View {
     /// Apple's hardware display corners use so the concentric inset actually reads as parallel.
     private var cardShape: RoundedRectangle {
         RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
+    }
+}
+
+/// The bottom-centre badges over the stream: the transient hints, the access chip and the muted
+/// microphone. One stack, so two badges never land on top of each other while they overlap.
+/// Nothing mounts while `captureEnabled` is off (the trust prompt, the console's launch hold).
+struct StreamBadgeStack: View {
+    @ObservedObject var model: SessionModel
+    let captureEnabled: Bool
+    let statsVerbosity: StatsVerbosity
+
+    /// How every badge enters and leaves.
+    private static let pop: AnyTransition = .opacity.combined(with: .scale(scale: 0.9))
+
+    var body: some View {
+        VStack(spacing: 8) {
+            // How to leave, for a few seconds at stream start.
+            if captureEnabled, model.exitHintShown {
+                ExitHintBadge(text: model.exitHintText).transition(Self.pop)
+            }
+            // A forwarded pad has a gyro this session's virtual controller cannot carry. Shown
+            // briefly at every stats tier, on every platform: the gyro otherwise just does
+            // nothing, and the fix is a setting, so the hint has to name it.
+            if captureEnabled, model.motionUnreachableKind != nil {
+                MotionUnreachableBadge().transition(Self.pop)
+            }
+            // The SC2 passthrough's claim edge, the capture's only visible trace.
+            if captureEnabled, model.sc2CapturedHint {
+                Sc2CapturedBadge().transition(Self.pop)
+            }
+            // The Touch (passthrough) model met a host that drops contacts; the fingers run the
+            // trackpad engine instead, and this says so once.
+            if captureEnabled, model.touchFallbackNotice {
+                TouchFallbackBadge().transition(Self.pop)
+            }
+            // The expiry warning (T−5 m / T−1 m, per-client access §7), every platform and tier:
+            // a dead pad must read as ended access while it can still be fixed.
+            if captureEnabled, let warning = model.accessWarning {
+                AccessWarningBadge(text: warning).transition(Self.pop)
+            }
+            // The host's word on a launch that did not give the player their game.
+            if captureEnabled, let notice = model.launchNotice {
+                AccessWarningBadge(text: notice, icon: "exclamationmark.triangle")
+                    .transition(Self.pop)
+            }
+            #if !os(tvOS)
+            // The access chip rides the stats tier for a LIMITED session only; a
+            // full-and-permanent one never mounts it. tvOS states it in the stats overlay.
+            if captureEnabled && statsVerbosity != .off && model.accessLimited {
+                AccessChipBadge(
+                    label: model.accessLevel.label, remainingSecs: model.accessRemainingSecs)
+                    .transition(Self.pop)
+            }
+            // Up for as long as the mic is muted, at every stats tier (see MicMutedBadge).
+            if captureEnabled && model.micMuted {
+                MicMutedBadge { model.setMicMuted(false) }.transition(Self.pop)
+            }
+            #endif
+        }
+        .padding(.bottom, 24)
+        // The badges' visibility drivers, the stats tier included (the access chip rides it). A
+        // badge whose driver is missing here pops in unanimated.
+        .animation(.easeOut(duration: 0.2), value: model.micMuted)
+        .animation(.easeOut(duration: 0.2), value: model.accessWarning)
+        .animation(.easeOut(duration: 0.2), value: model.launchNotice)
+        .animation(.easeOut(duration: 0.2), value: model.accessLimited)
+        .animation(.easeOut(duration: 0.2), value: statsVerbosity)
+        .animation(.easeOut(duration: 0.2), value: model.motionUnreachableKind)
+        .animation(.easeOut(duration: 0.2), value: model.sc2CapturedHint)
+        .animation(.easeOut(duration: 0.6), value: model.exitHintShown)
+    }
+}
+
+/// The exit hint: one line on how to leave, in the badges' glass language.
+struct ExitHintBadge: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.geist(12, .medium, relativeTo: .caption))
+            .foregroundStyle(.white.opacity(0.9))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .glassBackground(Capsule())
+            .environment(\.colorScheme, .dark) // reads over any frame, like the resize overlay
     }
 }
 
@@ -383,7 +484,7 @@ struct MicMutedBadge: View {
 }
 #endif
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 /// Device display geometry the overlay needs but UIKit doesn't expose publicly.
 enum DeviceMetrics {
     /// The physical display's corner radius. There's no public API for it, so read the private
@@ -392,6 +493,9 @@ enum DeviceMetrics {
     /// less-perfect inset, never a crash. The key is assembled from parts so it isn't a plain literal
     /// in the binary; note the App Store private-API consideration regardless.
     static var displayCornerRadius: CGFloat {
+        #if os(visionOS)
+        return 46 // every visionOS window's corner radius
+        #else
         let key = ["_display", "Corner", "Radius"].joined()
         guard
             let screen = UIApplication.shared.connectedScenes
@@ -401,6 +505,7 @@ enum DeviceMetrics {
             radius.doubleValue > 0
         else { return 44 }
         return CGFloat(radius.doubleValue)
+        #endif
     }
 }
 #endif

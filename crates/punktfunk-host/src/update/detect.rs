@@ -15,10 +15,7 @@ use std::sync::OnceLock;
 pub(crate) fn detect() -> (InstallKind, Channel) {
     static DETECTED: OnceLock<(InstallKind, Channel)> = OnceLock::new();
     *DETECTED.get_or_init(|| {
-        classify_shared(
-            &gather(Product::Host, env!("PUNKTFUNK_VERSION")),
-            Product::Host,
-        )
+        classify_shared(&gather(Product::Host, crate::version::get()), Product::Host)
     })
 }
 
@@ -55,8 +52,8 @@ mod tests {
     }
 
     #[test]
-    fn hints_name_the_host_package() {
-        assert!(channel_hint(InstallKind::Apt).contains("punktfunk-host"));
+    fn hints_upgrade_every_punktfunk_package() {
+        assert!(channel_hint(InstallKind::Apt).contains("'punktfunk*'"));
         assert!(channel_hint(InstallKind::Sysext).contains("punktfunk-sysext update"));
     }
 }

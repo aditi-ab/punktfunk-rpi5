@@ -5,7 +5,7 @@
 //! simply record what today's controller does. Every tuned number carries the
 //! reading it came from.
 
-use super::client::{ClientCfg, DecodeCfg};
+use super::client::{ClientCfg, DecodeCfg, Repair};
 use super::host::{ContentPhase, HostCfg};
 use super::link::LinkCfg;
 use super::{run, Scenario, SessionCfg};
@@ -525,6 +525,17 @@ pub(super) fn wan_lone_loss() -> Scenario {
     }
 }
 
+/// A path again, its client repairing short frames another way: NACK first, or
+/// references only to acknowledged frames. Served by the ramp, as the row it
+/// copies is in the table.
+fn repairing(mut sc: Scenario, name: &'static str, repair: Repair) -> Scenario {
+    sc.name = name;
+    for s in &mut sc.sessions {
+        s.client.repair = repair;
+    }
+    with_ramp(sc)
+}
+
 /// The rig's Wi-Fi profile: a 237 Mbps link nothing touches, and a source that
 /// fills 78 % of whatever allowance it is given.
 ///
@@ -790,6 +801,42 @@ pub(super) fn static_then_motion() -> Scenario {
         },
         sessions: vec![s],
         achievable_kbps: 171_294,
+        blip_at_ms: None,
+    }
+}
+
+/// A game, then a near-still desktop, on a link that loses one packet in a
+/// hundred. The busy windows teach the delivery norm; the still ones carry a
+/// few small frames, so one repaired shard is heavy loss there.
+pub(super) fn calm_desktop_lossy() -> Scenario {
+    let s = tv_session(
+        20_000,
+        None,
+        vec![
+            ContentPhase {
+                until_ms: 40_000,
+                ..ContentPhase::default()
+            },
+            ContentPhase {
+                active_pct: 6,
+                fill_pct: 20,
+                ..ContentPhase::default()
+            },
+        ],
+    );
+    Scenario {
+        name: "calm_desktop_lossy",
+        seed: 0x7A_C400,
+        duration_ms: 120_000,
+        link: LinkCfg {
+            capacity: vec![(0, 245_000)],
+            buffer_ms: 60,
+            base_delay_ms: 3,
+            loss_ppm: 10_000,
+            ..LinkCfg::default()
+        },
+        sessions: vec![s],
+        achievable_kbps: 168_000,
         blip_at_ms: None,
     }
 }
@@ -1340,7 +1387,8 @@ pub(super) fn fat_pipe_10min() -> Scenario {
 ///
 /// Every row but `old_host` runs against a host that serves the ramp; the
 /// seven calibrations run a second time against one that does not, because
-/// what they replay are field sessions from before it existed.
+/// what they replay are field sessions from before it existed. The two WAN
+/// paths run again at the tail with each loss repair (`_nack`, `_ack`).
 pub(super) fn all() -> Vec<Scenario> {
     let mut table: Vec<Scenario> = vec![
         lan_10g(),
@@ -1425,6 +1473,16 @@ pub(super) fn all() -> Vec<Scenario> {
     // append-only.
     table.push(pyrowave_pin_fit());
     table.push(pyrowave_pin_holds());
+    table.push(with_ramp(calm_desktop_lossy()));
+    let wan = || wan_wg_12(0x7A_5500, 180_000);
+    for (sc, name, repair) in [
+        (wan_lone_loss(), "wan_lone_loss_nack", Repair::Nack),
+        (wan_lone_loss(), "wan_lone_loss_ack", Repair::Ack),
+        (wan(), "wan_wg_12_nack", Repair::Nack),
+        (wan(), "wan_wg_12_ack", Repair::Ack),
+    ] {
+        table.push(repairing(sc, name, repair));
+    }
     table
 }
 
@@ -2118,6 +2176,32 @@ mod tests {
         assert!(tail < 100_000, "the session ends over the wall at {tail}");
     }
 
+    /// Content going still is not the link falling short. A near-still window
+    /// carries a fraction of what busy ones taught, and on a lossy link one
+    /// repaired shard among its few packets reads as heavy loss: neither may
+    /// land the rate on the still picture's wire rate, or mark a wall there.
+    #[test]
+    fn a_still_picture_on_a_lossy_link_keeps_the_rate() {
+        let r = run(&with_ramp(calm_desktop_lossy()));
+        let busy = r.windows[0]
+            .iter()
+            .filter(|w| w.t_ms <= 40_000)
+            .map(|w| w.rate_kbps)
+            .next_back()
+            .expect("the busy phase ran");
+        let still: Vec<_> = r.windows[0].iter().filter(|w| w.t_ms > 42_000).collect();
+        let low = still.iter().map(|w| w.rate_kbps).min().expect("windows");
+        assert!(
+            low * 2 >= busy,
+            "the still desktop took {busy} kbps down to {low}"
+        );
+        let cap = still.iter().filter_map(|w| w.link_cap).min();
+        assert!(
+            cap.is_none_or(|c| c * 2 >= busy),
+            "a wall was marked at {cap:?} on a {busy} kbps session"
+        );
+    }
+
     /// A cell that gets better: the cap it taught has to get out of the way.
     ///
     /// `lte_variable` steps 8 → 50 Mbps at 75 s with a cap latched at 4 736.
@@ -2232,12 +2316,14 @@ mod tests {
     /// Both halves of the lend are counted over eight cells, because each turns
     /// on one window. The active session is told about the room only when a
     /// share clock lands on a window whose egress runs two bands over its rate,
-    /// which is a session's own noise; the lender then climbs off the floor its
-    /// stillness latched through whatever the active one has left it. Most
-    /// cells climb; a third of them reach half again as much.
+    /// which is a session's own noise. Most cells climb; a third of them reach
+    /// half again as much. Stillness costs the lender nothing, so when it
+    /// moves again it is back near its half of the path within 40 s.
     #[test]
     fn a_still_sibling_lends_the_path_and_a_departing_one_hands_it_over() {
-        let (mut climbed, mut half_again, mut doubled) = (0usize, 0usize, 0usize);
+        const HALF_KBPS: u32 = 18_000 / 2;
+        let (mut climbed, mut half_again) = (0usize, 0usize);
+        let mut lender = Vec::new();
         for seed in (0..8u64).map(|i| 0x7A_5800 + i) {
             let sc = Scenario {
                 seed,
@@ -2253,7 +2339,7 @@ mod tests {
             let (before, during) = (at(44_000, 0), at(100_000, 0));
             climbed += usize::from(during > before);
             half_again += usize::from(during * 2 >= before * 3);
-            doubled += usize::from(at(145_000, 1) >= at(100_000, 1) * 2);
+            lender.push(at(145_000, 1));
         }
         assert!(
             climbed >= 6,
@@ -2264,9 +2350,11 @@ mod tests {
             half_again >= 3,
             "the active session took half again as much on {half_again} of eight cells"
         );
+        let back = lender.iter().filter(|&&k| k * 4 >= HALF_KBPS * 3).count();
         assert!(
-            doubled >= 6,
-            "the lender doubled off its floor on {doubled} of eight cells"
+            back >= 6,
+            "the lender was back at three quarters of its half on {back} of eight \
+             cells: {lender:?}"
         );
 
         let r = run(&with_ramp(shared_leaver()));
@@ -2311,6 +2399,7 @@ mod tests {
             "rebuild" => host_rebuild_stall(),
             "wave" => host_rebuild_wave(),
             "weak" => encoder_weak(),
+            "calm" => calm_desktop_lossy(),
             _ => wifi_tv(),
         };
         // As the table has it. `SIM_LEGACY=1` reads the calibration instead.
@@ -2346,6 +2435,47 @@ mod tests {
             );
         }
         println!("metrics {:?}", r.metrics);
+    }
+
+    /// `cargo test … repair_readout -- --ignored --nocapture`: waves, lost frames
+    /// and kB past the budget per ten minutes, today and with each repair, over 16
+    /// seeds. One seed is one trajectory, and a repaired frame moves every draw
+    /// after it, so a single row reads noise as effect.
+    #[test]
+    #[ignore = "a reading aid, not a check"]
+    fn repair_readout() {
+        const SEEDS: u64 = 16;
+        println!("scenario\twaves_10min\tlost_10min\tabove_budget_kb_10min");
+        for name in [
+            "wan_lone_loss",
+            "wan_lone_loss_nack",
+            "wan_lone_loss_ack",
+            "wan_wg_12",
+            "wan_wg_12_nack",
+            "wan_wg_12_ack",
+        ] {
+            let (mut waves, mut lost, mut bytes, mut ms) = (0, 0, 0, 0);
+            for i in 0..SEEDS {
+                let mut sc = all().into_iter().find(|sc| sc.name == name).unwrap();
+                sc.seed ^= i.wrapping_mul(0x9E37_79B9);
+                let r = run(&sc).repair;
+                waves += u64::from(r.waves);
+                lost += r.lost;
+                bytes += r.above_budget_bytes;
+                ms += sc.duration_ms;
+            }
+            // Tenths, per ten minutes.
+            let per = |n: u64| {
+                let t = n * 6_000_000 / ms;
+                format!("{}.{}", t / 10, t % 10)
+            };
+            println!(
+                "{name}\t{}\t{}\t{}",
+                per(waves),
+                per(lost),
+                per(bytes / 1_000)
+            );
+        }
     }
 
     /// Every scenario in the plan's table runs from its fixed seed, and a run

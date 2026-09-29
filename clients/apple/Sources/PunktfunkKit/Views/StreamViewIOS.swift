@@ -1,37 +1,21 @@
-// iOS/iPadOS presenter: the same AVSampleBufferDisplayLayer + StreamPump as macOS,
-// hosted in a UIViewController so the scene can pointer-lock (the iPadOS equivalent of
-// the Mac's cursor capture — with a hardware mouse/trackpad the system cursor is hidden
-// and GCMouse's raw deltas drive the host cursor alone; the system only honors the lock
-// fullscreen-and-frontmost, so in Stage Manager it degrades to Mac-style "both cursors
-// visible" forwarding).
+// iOS/iPadOS presenter: the macOS AVSampleBufferDisplayLayer + StreamPump in a UIViewController,
+// so the scene can pointer-lock. UITouch.type routes fingers and pointers apart.
 //
-// FINGER touch and INDIRECT POINTER (mouse/trackpad) are routed apart by UITouch.type.
-// Direct fingers (and Pencil) always forward as wire touches — every finger maps to a touch
-// id, coordinates mapped through the aspect-fit letterbox into host-mode pixels (surface ==
-// host mode, so the host's rescale is the identity).
+// Direct fingers and Pencil always forward as wire touches, mapped through the aspect-fit letterbox
+// into host-mode pixels. A mouse or trackpad is a pointer and never forwards as a touch.
 //
-// A hardware mouse/trackpad is a pointer, not a finger. When the scene is pointer-LOCKED
-// (full-screen + frontmost iPad, and the user hasn't disabled pointer capture in Settings —
-// see PointerLockChain, which steers the lock request through SwiftUI's hosting controllers)
-// GCMouse delivers raw relative deltas and the system hides the cursor — the gaming-grade path.
-// InputCapture handles EVERY connected mouse (GCMouse.mice), not just the current one, so a
-// trackpad + a second pointer (e.g. a Universal Control mouse) both drive. When the scene CAN'T
-// lock (Stage Manager, not frontmost, iPhone, capture disabled) the system shows its own cursor
-// and routes the mouse through UIKit's pointer path: hover + indirect-pointer touches, which we
-// forward as ABSOLUTE cursor position (+ buttons) so the host cursor tracks the visible local one.
-// We never forward an indirect pointer as a touch — doing so hid the cursor and made the host see
-// taps instead of a moving mouse. The two paths are mutually exclusive on `gcMouseForwarding`
-// (== locked): GCMouse forwards only WHILE locked, the UIKit indirect path (motion, buttons AND
-// scroll) only while NOT locked — so a pointer that emits both channels under lock can't double-send.
-// Hardware keyboard forwarding shares InputCapture with macOS — auto-engaged when streaming
-// starts, ⌘⎋ toggles and ⌃⌥⇧Q releases (both detected from the HID stream; there is no NSEvent
-// monitor here). ⌃⌥⇧Q is the cross-client Ctrl+Alt+Shift+Q — it un-captures so the Magic Keyboard
-// trackpad drives the local iPad UI again.
+// Locked (full-screen, frontmost, pointer capture allowed; see PointerLockChain): GCMouse drives
+// motion and buttons for every connected mouse and the system hides the cursor. Unlocked (Stage
+// Manager, not frontmost, iPhone): UIKit hover and indirect touches forward an absolute cursor
+// plus buttons. `gcMouseForwarding` (== locked) keeps the two apart, so a pointer reporting on both
+// never double-sends. Scroll always comes from UIKit's pan recognizers, locked or not.
 //
-// The public type is named StreamView like its macOS twin (each is platform-gated), so
-// the SwiftUI app layer is identical on both platforms.
+// Hardware keyboards share InputCapture with macOS: engaged at stream start, ⌘⎋ toggles and
+// ⌃⌥⇧Q releases, both read from the HID stream.
+//
+// The public type is named StreamView like its macOS twin, so the SwiftUI layer is shared.
 
-#if os(iOS) || os(tvOS)
+#if os(iOS) || os(visionOS) || os(tvOS)
 import AVFoundation
 import GameController
 import PunktfunkCore
@@ -60,6 +44,9 @@ public struct StreamView: UIViewControllerRepresentable {
     private let onResizeTarget: ((UInt32, UInt32) -> Void)?
     private let onDecodedSize: (@Sendable (Int, Int) -> Void)?
     private let endToEndMeter: LatencyMeter?
+    #if os(visionOS)
+    private var theaterRenderers: TheaterRenderers?
+    #endif
 
     /// `onDisconnectRequest` exists for call-site parity with the macOS StreamView (the
     /// captured-state ⌃⌥⇧D combo is detected by the macOS NSEvent monitor only); on iOS a
@@ -88,8 +75,20 @@ public struct StreamView: UIViewControllerRepresentable {
         self.endToEndMeter = endToEndMeter
     }
 
+    #if os(visionOS)
+    /// Present into a theater's renderers instead of this view while `renderers` is set.
+    public func theater(_ renderers: TheaterRenderers?) -> StreamView {
+        var view = self
+        view.theaterRenderers = renderers
+        return view
+    }
+    #endif
+
     public func makeUIViewController(context: Context) -> StreamViewController {
         let controller = StreamViewController()
+        #if os(visionOS)
+        controller.setTheater(theaterRenderers)
+        #endif
         controller.onCaptureChange = onCaptureChange
         controller.onDial = onDial
         controller.captureEnabled = captureEnabled
@@ -107,6 +106,9 @@ public struct StreamView: UIViewControllerRepresentable {
         controller.endToEndMeter = endToEndMeter
         controller.onResizeTarget = onResizeTarget
         controller.onDecodedSize = onDecodedSize
+        #if os(visionOS)
+        controller.setTheater(theaterRenderers)
+        #endif
         if controller.connection !== connection {
             controller.start(connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
         }
@@ -150,8 +152,8 @@ public final class StreamViewController: StreamViewControllerBase {
     /// The decoded frames are HDR — what the display-mode request follows.
     private var frameHDR = false
     #endif
-    #if os(iOS)
     private var inputCapture: InputCapture?
+    #if os(iOS) || os(visionOS)
     fileprivate var captured = false
     private var pointerInteraction: UIPointerInteraction?
     /// Capture state at the last resign, restored on the next foreground — otherwise the
@@ -165,78 +167,36 @@ public final class StreamViewController: StreamViewControllerBase {
     private var matchFollower: MatchWindowFollower?
     /// The picture's surface on an attached monitor (see `ExternalDisplay`), and whether the
     /// stream presents there now. Input and the HUD stay on the phone either way.
+    #if os(iOS)
     private lazy var externalVideo: ExternalVideoView = {
         let view = ExternalVideoView()
         view.onLayout = { [weak self] in self?.layoutMetalLayer() }
         return view
     }()
+    #endif
     private var onExternal = false
-    // MARK: Escape-drop re-lock
-    //
-    // iPadOS releases the pointer lock BY ITSELF when the user presses Escape — the platform's
-    // built-in "let me out", mirroring the web Pointer Lock API's default unlock gesture. Nothing
-    // in our code does it: a bare Esc never touches `captured`, so it keeps forwarding to the host
-    // as the game key it is. But the lock going away flips the mouse onto the absolute UIKit path
-    // and un-hides the iPadOS cursor, so hitting Esc for an in-game menu silently costs the capture
-    // until the user clicks to win it back. Esc is a GAME key here, not a request to hand the
-    // pointer back to iPadOS, so an unwanted drop is re-requested below. The DELIBERATE releases
-    // (⌘⎋, ⌃⌥⇧Q, the Stream menu, backgrounding) all clear `captured` first, so `wantsPointerLock`
-    // is already false when their drop is observed and none of them are fought here.
-    //
-    // Recovery is TWO-STAGE, because either stage alone leaves a hole:
-    //   1. the burst below, fired the instant the drop is observed — wins back a lock the system
-    //      is willing to return immediately (a transient drop that wasn't Escape at all);
-    //   2. a CLICK into the video while still captured (`onPointerButton`) — the fallback for the
-    //      Escape case proper, where the platform declines during the moment right after its own
-    //      release gesture and the burst therefore expires having achieved nothing.
-    // Stage 2 is what keeps a lost burst from being permanent: `captured` is still true, so no
-    // other path would ever ask again, and the capture would spend the rest of its life on the
-    // absolute pointer — clicking correctly, aiming not at all.
-    /// Whether this capture ever actually held the lock. Only a lock we HELD is worth winning back
-    /// — never having been granted one means the scene doesn't qualify, not that Esc took it.
-    /// Cleared when capture ends, so each capture starts from a clean slate.
-    private var pointerLockWasEngaged = false
-    /// Attempts spent in the current re-lock burst, and when the burst began.
-    private var pointerRelockAttempt = 0
-    private var pointerRelockBurstStart: CFTimeInterval = 0
-    /// True from an unwanted drop until the lock is back (or the burst gives up). While pending,
-    /// the local cursor stays hidden and absolute pointer MOTION stays muted, so a re-lock that
-    /// lands a frame or two later is invisible instead of flashing the iPadOS cursor and
-    /// teleporting the host's to the pointer's absolute position.
-    private var pointerRelockPending = false
-    /// Forces `prefersPointerLocked` to report false for one resolve pass, so the escalated attempt
-    /// presents the system with a genuine false→true transition instead of re-asserting a value it
-    /// already holds. See `requestPointerRelock()`.
-    private var pointerLockForcedOff = false
-    /// A burst is 3 attempts, and a burst can't restart inside 2 s. A scene the system will never
-    /// lock (Stage Manager, Split View) therefore costs three cheap re-resolves and then falls back
-    /// to today's click-to-recapture, rather than retrying forever.
-    private static let pointerRelockAttemptLimit = 3
-    private static let pointerRelockBurstWindow: CFTimeInterval = 2
-    /// Gap between attempts in a burst — long enough for the system to answer the previous
-    /// re-resolve, short enough that the whole burst fits in ~0.6 s. Must exceed
-    /// `pointerLockForcedOffHold` so an escalated attempt is back to preferring the lock before the
-    /// next attempt evaluates.
-    private static let pointerRelockRetryDelay: TimeInterval = 0.2
-    /// How long an escalated attempt reports `prefersPointerLocked == false` before flipping back,
-    /// so the system observes a real transition instead of coalescing the flip away.
-    private static let pointerLockForcedOffHold: TimeInterval = 0.05
-    /// Attempts spent in the QUIET tail (see `scheduleQuietRelock()`), reset with the burst.
-    private var pointerRelockQuietAttempt = 0
-    /// When the quiet tail re-asks, measured from the drop. The visible burst above spends its whole
-    /// budget inside ~0.6 s — and the pointer-lock cooldown the platform applies right after its own
-    /// Escape gesture is about a second, so every one of those attempts asks while the answer can
-    /// only be no. These land AFTER it. They are "quiet" because unlike the burst they do not hide
-    /// the cursor or mute motion: the pointer behaves exactly as it does today while they run, so
-    /// stretching the recovery costs the user nothing if it also fails.
-    private static let pointerRelockQuietDelays: [TimeInterval] = [1.2, 2.4]
+    // `prefersPointerLocked` mirrors `wantsPointerLock`; SpringBoard grants or drops on its own
+    // terms. `requestPointerLock` re-asks only on an event that can change its answer: a drop
+    // while wanted, a click while unlocked, the scene going active, the window filling the screen
+    // again. Each is one false→true edge — re-asserting a value it already holds is ignored.
+
+    /// True while a re-ask holds `prefersPointerLocked` at false for `pointerLockEdgeHold`.
+    private var pointerLockSuppressed = false
+    /// Long enough for UIKit to push the false pass to the scene before the true one follows.
+    private static let pointerLockEdgeHold: TimeInterval = 0.05
+    /// When the last drop-triggered re-ask was scheduled. A grant SpringBoard revokes at once
+    /// would otherwise re-ask on every revoke; one a second keeps that bounded.
+    private var pointerLockDropRelockAt: CFTimeInterval = -.infinity
+    /// Whether the window filled its screen at the last layout pass (assumed so until a pass says
+    /// otherwise) — the pass that makes it fill again, a re-maximise, is the one that re-asks.
+    private var windowFilledScreen = true
     #endif
 
     /// Reads whether the scene's pointer is actually locked right now; nil = state
     /// unavailable (no scene yet, or pre-availability). Only while this is true does GCMouse
     /// deliver relative deltas — otherwise the touch path carries input.
     private func pointerLockEngaged() -> Bool? {
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         return view.window?.windowScene?.pointerLockState?.isLocked
         #else
         return nil
@@ -262,8 +222,10 @@ public final class StreamViewController: StreamViewControllerBase {
     var captureEnabled = true {
         didSet {
             guard captureEnabled != oldValue else { return }
-            #if os(iOS)
+            #if os(iOS) || os(visionOS)
             setCaptured(captureEnabled)
+            #else
+            inputCapture?.setForwarding(captureEnabled)
             #endif
         }
     }
@@ -288,7 +250,7 @@ public final class StreamViewController: StreamViewControllerBase {
         registerForTraitChanges([UITraitDisplayScale.self]) { (vc: StreamViewController, _) in
             vc.layoutMetalLayer()
         }
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         // Hide the iPadOS cursor while it hovers the video: the host renders its own
         // cursor from our deltas, so the local one only diverges from it. This hides the
         // pointer; true pointer LOCK (below) is what makes GCMouse deliver relative deltas
@@ -299,7 +261,7 @@ public final class StreamViewController: StreamViewControllerBase {
         #endif
     }
 
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     /// Whether the user wants the mouse/trackpad pointer CAPTURED (pointer lock → relative
     /// movement, the gaming default) rather than forwarded as an absolute position (desktop
     /// use). Read from the session's resolved settings so it tracks the Settings toggle (it is
@@ -321,7 +283,7 @@ public final class StreamViewController: StreamViewControllerBase {
             && connection?.canSendPointer == true
     }
 
-    public override var prefersPointerLocked: Bool { wantsPointerLock && !pointerLockForcedOff }
+    public override var prefersPointerLocked: Bool { wantsPointerLock && !pointerLockSuppressed }
     public override var prefersHomeIndicatorAutoHidden: Bool { true }
 
     // NOTE: we deliberately do NOT override `childViewControllerForPointerLock`. The default
@@ -447,7 +409,7 @@ public final class StreamViewController: StreamViewControllerBase {
         stop()
         self.connection = connection
         loadViewIfNeeded()
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         // Fresh session: drop any resign/foreground capture-restore state left over from a
         // prior session (stop() doesn't clear it). Otherwise a stale `true` could later
         // re-engage capture on a foreground that the new session never asked for.
@@ -521,71 +483,35 @@ public final class StreamViewController: StreamViewControllerBase {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: release)
             }
         }
-        // Indirect pointer (mouse/trackpad) WITHOUT a lock → absolute cursor + buttons + scroll.
-        // While the scene is pointer-LOCKED the GCMouse path owns motion AND buttons AND scroll, so
-        // the whole UIKit indirect path is gated off here (`gcMouseForwarding`). The trackpad and a
-        // mouse BOTH report through GCMouse under lock and ALSO emit UIKit indirect-pointer events
-        // (pinned at the locked position) — without this gate a click double-sends (GCMouse + UIKit)
-        // and a second pointer (e.g. a Universal Control mouse) competes with the trackpad. The gate
-        // is the exact mirror of the GCMouse handlers, which fire only while locked.
+        // Indirect pointer WITHOUT a lock → absolute cursor + buttons. Under lock a mouse or trackpad
+        // also emits UIKit indirect events pinned at the lock point while GCMouse owns motion and
+        // buttons, so this path is gated off (`gcMouseForwarding`). Otherwise a click sends twice.
         streamView.onPointerMoveAbs = { [weak self] p in
             guard let self, self.inputCapture?.gcMouseForwarding == false else { return }
-            // A re-lock is in flight after an Esc-drop: the absolute path would teleport the host
-            // cursor to wherever the local pointer sits, undoing the relative aiming we're about to
-            // resume. Motion only — BUTTONS still forward (they carry no position, so a click during
-            // the couple of frames a re-lock takes must not be swallowed mid-firefight).
-            guard !self.pointerRelockPending else { return }
             self.inputCapture?.sendMouseAbs(
                 x: p.x, y: p.y, surfaceWidth: p.w, surfaceHeight: p.h)
         }
         streamView.onPointerButton = { [weak self] button, down in
             guard let self else { return }
-            // Released → a trackpad/mouse click into the video RE-ENGAGES capture (the iPad
-            // analogue of macOS's `mouseDown → engageCapture(fromClick:)`, and the click-mirror of
-            // the ⌘⎋ / ⌃⌥⇧Q keyboard toggles). Only the button-DOWN engages; that click is the local
-            // engage gesture, so it's suppressed toward the host (`fromClick`) and never forwarded —
-            // its release is swallowed by InputCapture's suppress latch, whichever path delivers it.
-            // (Finger taps are untouched: touch always plays directly, so only the indirect pointer
-            // re-captures.) Captured already → the absolute path forwards the button as before.
+            // Released → a primary press into the video re-engages capture, like macOS's
+            // `engageCapture(fromClick:)`. It is the local gesture, never forwarded: InputCapture's
+            // latch swallows its release. Only button 1 has that latch; another button would send
+            // a lone release and eat the next click. Captured → the absolute path forwards it.
             if !self.captured {
-                if down, self.captureEnabled { self.setCaptured(true, fromClick: true) }
+                if down, button == 1, self.captureEnabled { self.setCaptured(true, fromClick: true) }
                 return
             }
             guard self.inputCapture?.gcMouseForwarding == false else { return }
             self.inputCapture?.sendMouseButton(button, pressed: down)
-            // …and if we're captured but NOT locked, this click is also the recovery gesture for an
-            // Escape-drop the burst lost. iPadOS refuses to re-lock in the moment right after its
-            // own "let me out" gesture, so the burst fired at the drop can spend its whole budget
-            // and give up while the capture is still wanted. Nothing else would ever re-ask —
-            // setCaptured is the only other requester and a bare Esc never clears `captured` — so
-            // without this the session stays on the absolute path for the rest of the capture:
-            // clicks still land where you aim (absolute positions keep forwarding) but the game
-            // gets no relative deltas, so camera look is dead. A click is a real user gesture,
-            // which is exactly what the platform wants before it will hand the lock back.
-            //
-            // On the button UP, so the click has fully forwarded on ONE transport first: asking on
-            // the DOWN can flip `gcMouseForwarding` mid-click and strand the release on the GCMouse
-            // path. Gated on `pointerLockWasEngaged` exactly as the drop path is, so a scene that
-            // never qualifies (Stage Manager, Split View) is never bursted at, and on a burst not
-            // already being in flight — a pending burst mutes absolute motion, so re-arming one on
-            // every click of a menu the user is still aiming around would freeze the cursor between
-            // clicks. Only once it has settled does a further click buy a fresh budget (clearing the
-            // attempt counter, so a gesture isn't refused inside the 2 s window the drop's own burst
-            // may have just spent).
-            if !down, self.wantsPointerLock, self.pointerLockWasEngaged,
-                !self.pointerRelockPending, self.pointerLockEngaged() != true {
-                self.pointerRelockAttempt = 0
-                self.pointerRelockQuietAttempt = 0 // a real gesture buys a fresh tail too
-                self.updatePointerLockChain() // a reparent since the drop would break the walk to us
-                self.requestPointerRelock()
-            }
+            // Captured but unlocked: the click is the user gesture SpringBoard wants before it
+            // hands a declined or dropped lock back. On the UP, so the click has fully forwarded
+            // on one transport — a grant mid-click would strand the release on the GCMouse path.
+            if !down { self.requestPointerLock() }
         }
-        // Trackpad gestures always use UIKit, including under pointer lock.
-        // Only discrete pans yield to an attached, forwarding GCMouse wheel.
+        // Every scroll, wheel and trackpad, locked or not: UIKit applies Natural Scrolling, which
+        // GCMouse's raw wheel does not, so the direction never changes with the lock.
         streamView.onScroll = { [weak self] dx, dy, source, phase in
-            guard let self, let capture = self.inputCapture else { return }
-            if source == PUNKTFUNK_SCROLL_SOURCE_CONTINUOUS, capture.forwardsRawWheel { return }
-            capture.sendScroll(dx: dx, dy: dy, source: source, phase: phase)
+            self?.inputCapture?.sendScroll(dx: dx, dy: dy, source: source, phase: phase)
         }
 
         let capture = InputCapture(connection: connection)
@@ -611,14 +537,6 @@ public final class StreamViewController: StreamViewControllerBase {
         }
         capture.start()
         inputCapture = capture
-        #if os(tvOS)
-        // tvOS has no click-to-capture and no pointer lock, so nothing here ever flips these the
-        // way `setCaptured` does on iOS — an attached Bluetooth mouse or keyboard had its motion,
-        // buttons, scroll and every key dropped while the handlers sat installed. A session IS the
-        // capture on this platform, so forwarding runs for as long as one does.
-        capture.setForwarding(true)
-        capture.gcMouseForwarding = true
-        #endif
         // Match-window (C3): when ON, follow the scene's pixel size so a resizable iPad scene
         // streams 1:1 (pixel-exact) instead of the presenter resampling a fixed-mode frame into it.
         // `viewDidLayoutSubviews` feeds it — covers Stage Manager / Split View resizes and rotation.
@@ -632,6 +550,8 @@ public final class StreamViewController: StreamViewControllerBase {
             maxDimension: RenderScale.maxDimension(codec: connection.settings.codec))
         follower.onResizeTarget = onResizeTarget
         matchFollower = follower
+        #endif
+        #if os(iOS)
         // A monitor attached before the session starts shows the picture from the first frame.
         onExternal = ExternalDisplay.shared.screen != nil
         if onExternal { ExternalDisplay.shared.show(externalVideo) }
@@ -660,7 +580,7 @@ public final class StreamViewController: StreamViewControllerBase {
             })
         layoutMetalLayer()
 
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         // GC only delivers while active; everything held is flushed by InputCapture's
         // own resign observer — here we just mirror the capture state for the HUD and
         // the pointer lock.
@@ -679,19 +599,33 @@ public final class StreamViewController: StreamViewControllerBase {
         ) { [weak self] _ in
             // inputCapture != nil: don't try to restore before this session's capture is wired
             // up — setForwarding would silently no-op on the nil handlers and leave input dead.
-            guard let self, self.wasCapturedOnResign, self.captureEnabled,
-                  self.connection != nil, self.inputCapture != nil
+            guard let self, self.captureEnabled, self.connection != nil, self.inputCapture != nil
             else { return }
-            self.setCaptured(true)
+            if self.wasCapturedOnResign {
+                self.setCaptured(true)
+            } else {
+                // Captured before the scene was active (a launch straight into a stream): the
+                // first ask found no frontmost scene, so ask again now there is one.
+                self.requestPointerLock()
+            }
         })
-        // The system can grant or drop the lock without us asking (Slide Over, Stage Manager,
-        // entering/leaving foregroundActive). Re-resolve the mouse routing on every change:
-        // GCMouse (locked) vs the absolute UIKit pointer path (unlocked), and the
-        // hidden-vs-visible local cursor.
+        // The system grants or drops the lock on its own terms (Slide Over, Stage Manager, the
+        // window leaving screen size). Re-resolve the routing on every change; a drop while the
+        // lock is still wanted asks once more, a turn later, so a drop that precedes the app's own
+        // resign finds `captured` already cleared and does nothing.
         observers.append(NotificationCenter.default.addObserver(
             forName: UIPointerLockState.didChangeNotification, object: nil, queue: .main
-        ) { [weak self] _ in
-            self?.syncPointerLock()
+        ) { [weak self] note in
+            guard let self else { return }
+            self.syncPointerLock()
+            guard (note.userInfo?[UIPointerLockState.sceneUserInfoKey] as? UIScene)
+                === self.view.window?.windowScene,
+                self.wantsPointerLock, self.pointerLockEngaged() == false
+            else { return }
+            let now = CACurrentMediaTime()
+            guard now - self.pointerLockDropRelockAt >= 1 else { return }
+            self.pointerLockDropRelockAt = now
+            DispatchQueue.main.async { [weak self] in self?.requestPointerLock() }
         })
         // The Stream menu's "Release Mouse" (⌃⌥⇧Q) posts this — the discoverable menu surface for
         // the RELEASED state. While CAPTURED the combo is recognized from the HID stream in
@@ -706,20 +640,33 @@ public final class StreamViewController: StreamViewControllerBase {
                   self.view.window?.windowScene?.activationState == .foregroundActive else { return }
             self.setCaptured(false)
         })
-        // The ring's Keyboard slot summons the soft keyboard the three-finger swipe does.
+        // The ring's Keyboard slot shows the soft keyboard, and hides it when it is up. iPhone's
+        // keyboard has no dismiss key, and passthrough has no three-finger swipe.
         observers.append(NotificationCenter.default.addObserver(
-            forName: .punktfunkShowSoftKeyboard, object: nil, queue: .main
+            forName: .punktfunkToggleSoftKeyboard, object: nil, queue: .main
         ) { [weak self] _ in
             guard let self,
                   self.view.window?.windowScene?.activationState == .foregroundActive else { return }
-            self.streamView.setSoftKeyboardVisible(true)
+            self.streamView.setSoftKeyboardVisible(!self.streamView.isFirstResponder)
         })
+        #if os(iOS)
         // A monitor plugged in or pulled mid-session takes the picture or hands it back.
         observers.append(NotificationCenter.default.addObserver(
             forName: ExternalDisplay.didChange, object: nil, queue: .main
         ) { [weak self] _ in
             self?.routeVideo()
         })
+        #endif
+        #if os(visionOS)
+        // Several windows can stream at once and none is "in front": input follows the window
+        // the player last pinched into.
+        observers.append(NotificationCenter.default.addObserver(
+            forName: UIWindow.didBecomeKeyNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self, (note.object as? UIWindow) === self.view.window else { return }
+            self.setCaptured(true)
+        })
+        #endif
 
         if captureEnabled {
             setCaptured(true) // entering a session is the deliberate "capture me" moment
@@ -727,6 +674,13 @@ public final class StreamViewController: StreamViewControllerBase {
         #endif
 
         #if os(tvOS)
+        // No click-to-capture and no pointer lock here: a session IS the capture, so an attached
+        // Bluetooth mouse or keyboard forwards for as long as one runs — once it is trusted.
+        let capture = InputCapture(connection: connection)
+        capture.start()
+        capture.gcMouseForwarding = true
+        capture.setForwarding(captureEnabled)
+        inputCapture = capture
         // The TV's mode switch (requested in applyDisplayCriteriaIfNeeded) completes
         // asynchronously, and a dynamic-range-only switch doesn't re-layout by itself —
         // re-layout on the switch/mode notifications so the presenter sees the new EDR
@@ -743,7 +697,7 @@ public final class StreamViewController: StreamViewControllerBase {
     func stop() {
         observers.forEach(NotificationCenter.default.removeObserver(_:))
         observers.removeAll()
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         setCaptured(false)
         inputCapture?.stop()
         inputCapture = nil
@@ -763,12 +717,16 @@ public final class StreamViewController: StreamViewControllerBase {
         streamView.onScroll = nil
         streamView.currentHostMode = nil
         matchFollower = nil
+        #endif
+        #if os(iOS)
         if onExternal {
             ExternalDisplay.shared.hide(externalVideo) // the monitor mirrors the phone again
             onExternal = false
         }
         #endif
         #if os(tvOS)
+        inputCapture?.stop()
+        inputCapture = nil
         // Return the TV to the user's preferred mode — the home screen must not stay in the
         // session's HDR10/refresh mode.
         sessionDisplayManager?.preferredDisplayCriteria = nil
@@ -783,16 +741,13 @@ public final class StreamViewController: StreamViewControllerBase {
     public override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         layoutMetalLayer()
-        #if os(iOS)
-        // Match-window (C3): feed the follower the view's physical-pixel size (points × scale).
-        // Not while a monitor shows the picture: its mode comes from `requestSurfaceMode`.
-        let b = streamView.bounds
-        if b.width > 0, b.height > 0, !onExternal {
-            let scale = renderScale
-            matchFollower?.noteSize(
-                widthPx: Int((b.width * scale).rounded()),
-                heightPx: Int((b.height * scale).rounded()))
-        }
+        #if os(iOS) || os(visionOS)
+        // The theater's panel is not the picture's size, so Match window sits it out.
+        if !onExternal, presenter.theater == nil { noteMatchWindowSize() }
+        // The window back at screen size (a windowed scene re-maximised) can hold the lock again.
+        let fills = windowFillsScreen
+        if fills, !windowFilledScreen { requestPointerLock() }
+        windowFilledScreen = fills
         #endif
         #if os(tvOS)
         applyDisplayCriteriaIfNeeded()
@@ -855,13 +810,22 @@ public final class StreamViewController: StreamViewControllerBase {
     /// main screen scale if the trait is still unspecified.
     private var renderScale: CGFloat {
         let s = traitCollection.displayScale
+        #if os(visionOS)
+        return s > 0 ? s : 2 // visionOS windows render at 2x
+        #else
         return s > 0 ? s : UIScreen.main.scale
+        #endif
     }
 
     /// Aspect-fit the stage-2 metal sublayer to the surface showing the picture — this view, or
     /// an attached monitor — at that surface's render scale (see SessionPresenter.layout).
     private func layoutMetalLayer() {
         videoLayer.videoGravity = SessionPresenter.gravity(VideoFit(name: connection?.settings.videoFit))
+        #if !os(visionOS) // visionOS exposes no display, so its panel stays unknown
+        // UIKit exposes only the ceiling; the range and step stay unknown (min = max).
+        let maxHz = Double((streamView.window?.screen ?? UIScreen.main).maximumFramesPerSecond)
+        presenter.setPanel(PanelInfo(minHz: maxHz, maxHz: maxHz))
+        #endif
         #if os(iOS)
         if onExternal {
             let scale = externalVideo.traitCollection.displayScale
@@ -879,6 +843,30 @@ public final class StreamViewController: StreamViewControllerBase {
         #endif
         return streamView.displayLayer
     }
+
+    #if os(visionOS)
+    /// The window's size before the theater shrank it.
+    private var sizeBeforeTheater: CGSize?
+    /// The window while the picture is on the theater's screen: a panel below its sightline.
+    private static let theaterPanel = CGSize(width: 480, height: 270)
+
+    /// Move the picture into a theater's renderers, or back here with nil. The window shrinks
+    /// to a panel meanwhile, then gets its size back. Main thread.
+    func setTheater(_ renderers: TheaterRenderers?) {
+        guard renderers !== presenter.theater else { return }
+        presenter.setTheater(renderers)
+        if let scene = view.window?.windowScene {
+            if renderers != nil, sizeBeforeTheater == nil {
+                sizeBeforeTheater = view.window?.bounds.size
+                scene.requestGeometryUpdate(.Vision(size: Self.theaterPanel))
+            } else if renderers == nil, let size = sizeBeforeTheater {
+                sizeBeforeTheater = nil
+                scene.requestGeometryUpdate(.Vision(size: size))
+            }
+        }
+        if connection != nil { layoutMetalLayer() }
+    }
+    #endif
 
     /// The decoded frames turned HDR or SDR. tvOS follows them with the display mode. Main thread.
     private func noteFrameHDR(_ hdr: Bool) {
@@ -900,6 +888,7 @@ public final class StreamViewController: StreamViewControllerBase {
         layoutMetalLayer()
     }
 
+    #if os(iOS) || os(visionOS)
     #if os(iOS)
     /// Follow a monitor plugged in or pulled mid-session: move the picture onto it or back to the
     /// phone, then ask the host for the mode that fits. Main thread.
@@ -915,7 +904,22 @@ public final class StreamViewController: StreamViewControllerBase {
         }
         presenter.move(to: videoLayer)
         layoutMetalLayer()
-        requestSurfaceMode()
+        // A monitor takes its mode from `requestSurfaceMode`; back on the phone, Match-window
+        // owns it again, and a size request queued before the plug-in must not fire.
+        let follows = !external && (connection?.settings.matchWindow ?? false)
+        matchFollower?.setEnabled(follows)
+        if follows { noteMatchWindowSize() } else { requestSurfaceMode() }
+    }
+    #endif
+
+    /// Match-window (C3): feed the follower the view's physical-pixel size (points × scale).
+    private func noteMatchWindowSize() {
+        let b = streamView.bounds
+        guard b.width > 0, b.height > 0 else { return }
+        let scale = renderScale
+        matchFollower?.noteSize(
+            widthPx: Int((b.width * scale).rounded()),
+            heightPx: Int((b.height * scale).rounded()))
     }
 
     /// Ask the host for the mode that fits where the picture is: the monitor's pixels at its top
@@ -923,7 +927,12 @@ public final class StreamViewController: StreamViewControllerBase {
     private func requestSurfaceMode() {
         guard let connection else { return }
         let settings = connection.settings
-        let target = (onExternal ? ExternalDisplay.streamMode(settings) : nil) ?? settings.streamMode
+        #if os(iOS)
+        let target = (onExternal ? ExternalDisplay.streamMode(settings) : nil)
+            ?? settings.streamMode(native: NativeDisplay.mode)
+        #else
+        let target = settings.streamMode(native: NativeDisplay.mode)
+        #endif
         let live = connection.currentMode()
         guard live.width != target.width || live.height != target.height
             || live.refreshHz != target.hz
@@ -939,6 +948,7 @@ public final class StreamViewController: StreamViewControllerBase {
         if on {
             // `connection != nil` is the session-active gate (presenter internals are opaque here).
             guard captureEnabled, !captured, connection != nil else { return }
+            inputCapture?.reclaim() // another window's stream may hold the keyboard and mouse
             inputCapture?.setForwarding(true, suppressClick: fromClick)
             captured = true
             // Claim the responder chain for as long as we own the keyboard — `pressesBegan` has to
@@ -971,26 +981,6 @@ public final class StreamViewController: StreamViewControllerBase {
     /// change and capture toggle. Main queue.
     private func syncPointerLock() {
         let locked = pointerLockEngaged() == true
-        // Wanted, previously HELD, and now gone is the Esc-drop signature. The "previously held"
-        // half matters: a lock that was never granted is a scene that doesn't qualify (Stage
-        // Manager, Split View), and burst-requesting there would hide the cursor for the burst's
-        // duration to win a lock that isn't coming. A first grant is already driven by the chain
-        // engage in setCaptured/viewDidAppear.
-        if locked {
-            pointerLockWasEngaged = true
-            pointerRelockPending = false
-            pointerRelockAttempt = 0
-            pointerRelockQuietAttempt = 0 // granted — any scheduled tail finds nothing to do
-        } else if wantsPointerLock, pointerLockWasEngaged {
-            requestPointerRelock()
-        } else {
-            // Capture is gone (or the lock was never ours) — settle, and let the next capture
-            // start from a clean "never held" slate.
-            if !wantsPointerLock { pointerLockWasEngaged = false }
-            pointerRelockPending = false
-            pointerRelockAttempt = 0
-            pointerRelockQuietAttempt = 0
-        }
         let useGCMouse = captured && locked
         // Lock dropped (or capture ended) while the GCMouse path held a button down: once
         // gcMouseForwarding flips false its release handler is gated off, so flush any held
@@ -1005,128 +995,43 @@ public final class StreamViewController: StreamViewControllerBase {
                 """
                 pointer lock isLocked=\(locked, privacy: .public) \
                 captured=\(self.captured, privacy: .public) \
-                relockPending=\(self.pointerRelockPending, privacy: .public) \
-                relockAttempt=\(self.pointerRelockAttempt, privacy: .public)
+                wanted=\(self.wantsPointerLock, privacy: .public) \
+                sceneQualifies=\(self.sceneCanHoldPointerLock, privacy: .public) \
+                chainReachesScene=\(PointerLockChain.reachesScene(from: self), privacy: .public)
                 """)
         }
     }
 
-    /// SpringBoard grants the lock only to a frontmost scene that fills its screen. A windowed
-    /// scene — including the one its title-strip double-click leaves behind — is refused outright.
-    private var sceneCanHoldPointerLock: Bool {
-        guard let window = view.window, let scene = window.windowScene,
-              scene.activationState == .foregroundActive
-        else { return false }
+    /// The window at its screen's size. A windowed scene — including the one the title strip's
+    /// double-click leaves behind — is refused the lock outright.
+    private var windowFillsScreen: Bool {
+        #if os(visionOS)
+        return false // a visionOS window never fills a screen
+        #else
+        guard let window = view.window, let scene = window.windowScene else { return false }
         return window.bounds.size == scene.screen.bounds.size
+        #endif
     }
 
-    /// Ask for the lock back after a drop we didn't want (see the Escape-drop note on the state
-    /// above), only while the scene can hold it. Bounded to a short burst; idempotent within it.
-    /// Main queue.
-    private func requestPointerRelock() {
-        // Anywhere else the drop is SpringBoard saying we don't qualify, not the Esc key. Asking
-        // would hide the cursor and mute motion for a lock that isn't coming; the qualifying
-        // states (foreground, appearance, reparent, full screen again) re-resolve on their own.
-        guard sceneCanHoldPointerLock else {
-            pointerRelockPending = false
-            return
-        }
-        let now = CACurrentMediaTime()
-        // attempt == 0 is a fresh burst (first drop, or one the settle branch cleared); the window
-        // is the backstop for the pathological case where a grant is immediately revoked again and
-        // re-arms us. Even then this stays timer-driven at a few Hz — never a spin.
-        if pointerRelockAttempt == 0 || now - pointerRelockBurstStart > Self.pointerRelockBurstWindow {
-            pointerRelockBurstStart = now
-            pointerRelockAttempt = 0
-        }
-        guard pointerRelockAttempt < Self.pointerRelockAttemptLimit else {
-            // Out of VISIBLE budget: give the cursor straight back (the caller invalidates the
-            // interaction, so it can never stay hidden on a lock the system won't grant) and hand
-            // off to the quiet tail, which keeps asking after the platform's post-Escape cooldown
-            // without costing the user anything while it does.
-            pointerRelockPending = false
-            scheduleQuietRelock()
-            return
-        }
-        pointerRelockAttempt += 1
-        pointerRelockPending = true
-        let escalate = pointerRelockAttempt > 1
-        // Deferred a turn so a ⌘⎋ whose GC keystroke lands after the system's unlock notification
-        // has already cleared `captured` — then the guard below drops this attempt instead of
-        // fighting the user's own release.
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.pointerRelockPending else { return }
-            guard self.wantsPointerLock, self.pointerLockEngaged() != true else {
-                // The grant landed, or the capture went away under us (⌘⎋ / ⌃⌥⇧Q / resign).
-                // Settle through the one decision point rather than returning with `pending` still
-                // set — that flag hides the cursor, so it must never outlive the burst.
-                self.syncPointerLock()
-                return
-            }
-            if escalate {
-                // Re-asserting a value the system already holds didn't take. Present a real
-                // false→true transition instead — the documented way to change your mind about the
-                // lock — and re-anchor the chain in case a reparent broke the downward walk to us.
-                // Held for a beat rather than cleared on the next turn: the system resolves the
-                // property asynchronously, and a same-turn flip back to true can be coalesced into
-                // no transition at all. We are already unlocked, so the false pass costs nothing.
-                self.pointerLockForcedOff = true
-                self.setNeedsUpdateOfPrefersPointerLocked()
-                self.updatePointerLockChain()
-                DispatchQueue.main.asyncAfter(deadline: .now() + Self.pointerLockForcedOffHold) {
-                    [weak self] in
-                    guard let self else { return }
-                    self.pointerLockForcedOff = false
-                    self.setNeedsUpdateOfPrefersPointerLocked()
-                }
-            } else {
-                self.setNeedsUpdateOfPrefersPointerLocked()
-            }
-            // A GRANT arrives as a didChange → syncPointerLock, which settles the burst and makes
-            // this retry a no-op. Routed back through syncPointerLock (not straight into another
-            // requestPointerRelock) so the give-up path re-resolves the cursor through the one
-            // place that does it.
-            DispatchQueue.main.asyncAfter(deadline: .now() + Self.pointerRelockRetryDelay) {
-                [weak self] in
-                guard let self, self.pointerRelockPending else { return }
-                self.syncPointerLock()
-            }
-        }
+    /// SpringBoard grants the lock only to a frontmost scene that fills its screen.
+    private var sceneCanHoldPointerLock: Bool {
+        view.window?.windowScene?.activationState == .foregroundActive && windowFillsScreen
     }
 
-    /// Keep asking for the lock after the visible burst has given up — past the cooldown the
-    /// platform applies to its own Escape gesture, which is the window the burst spends entirely.
-    ///
-    /// Deliberately NOT a longer burst. `pointerRelockPending` hides the cursor and mutes absolute
-    /// motion, which is only tolerable for the couple of frames a fast re-grab takes; holding that
-    /// for seconds would trade a released pointer for a frozen one. These attempts leave the
-    /// pointer fully usable — if they all fail the user sees exactly today's behaviour, and a click
-    /// is still the immediate way back.
-    ///
-    /// Each attempt presents a real false→true transition (the same escalation the burst uses on
-    /// its later tries) because re-asserting a value the system already holds is what didn't take.
-    /// A grant arrives as a `didChange` → `syncPointerLock`, which resets the counters, so a
-    /// successful attempt silently ends the tail.
-    private func scheduleQuietRelock() {
-        guard pointerRelockQuietAttempt < Self.pointerRelockQuietDelays.count else { return }
-        let delay = Self.pointerRelockQuietDelays[pointerRelockQuietAttempt]
-        pointerRelockQuietAttempt += 1
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+    /// Ask again for a lock SpringBoard declined or dropped, while the scene can hold one: one
+    /// false→true edge, with the chain re-anchored in case a reparent broke the walk to us. A call
+    /// during the edge folds into it. No-op when the lock is held or no longer wanted. Main queue.
+    private func requestPointerLock() {
+        guard wantsPointerLock, pointerLockEngaged() != true, sceneCanHoldPointerLock,
+              !pointerLockSuppressed
+        else { return }
+        pointerLockSuppressed = true
+        updatePointerLockChain()
+        setNeedsUpdateOfPrefersPointerLocked()
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.pointerLockEdgeHold) { [weak self] in
             guard let self else { return }
-            // Still wanted, still grantable, and still not held — otherwise the tail is moot.
-            guard self.wantsPointerLock, self.pointerLockWasEngaged,
-                self.pointerLockEngaged() != true, self.sceneCanHoldPointerLock
-            else { return }
-            self.pointerLockForcedOff = true
+            self.pointerLockSuppressed = false
             self.setNeedsUpdateOfPrefersPointerLocked()
-            self.updatePointerLockChain()
-            DispatchQueue.main.asyncAfter(deadline: .now() + Self.pointerLockForcedOffHold) {
-                [weak self] in
-                guard let self else { return }
-                self.pointerLockForcedOff = false
-                self.setNeedsUpdateOfPrefersPointerLocked()
-                self.scheduleQuietRelock() // no-op once the delays are spent, or once granted
-            }
         }
     }
     #endif
@@ -1137,20 +1042,15 @@ public final class StreamViewController: StreamViewControllerBase {
     }
 }
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 extension StreamViewController: UIPointerInteractionDelegate {
     public func pointerInteraction(
         _ interaction: UIPointerInteraction, styleFor region: UIPointerRegion
     ) -> UIPointerStyle? {
-        // Hide the local cursor only when the scene is actually pointer-LOCKED — then the
-        // host renders its own cursor from GCMouse deltas and a visible local one would just
-        // diverge. When the lock isn't held the cursor stays VISIBLE so the user can aim; the
-        // pointer is forwarded as an absolute position, both cursors tracking together.
-        // …except across an Esc-drop we're actively re-locking (`pointerRelockPending`): staying
-        // hidden for those couple of frames is what turns the fix into "Esc did nothing to my
-        // mouse" rather than a cursor that blinks in and out. The burst is bounded and clears
-        // itself on give-up, so the cursor can never stay hidden on a lock that isn't coming.
-        captured && (pointerLockEngaged() == true || pointerRelockPending) ? .hidden() : nil
+        // Hide the local cursor only while the scene is actually pointer-LOCKED — the host draws
+        // its own from GCMouse deltas. Unlocked, it stays visible so the user can aim; the pointer
+        // forwards as an absolute position and both cursors track together.
+        captured && pointerLockEngaged() == true ? .hidden() : nil
     }
 }
 #endif
@@ -1165,7 +1065,7 @@ final class StreamLayerUIView: UIView {
         layer as! AVSampleBufferDisplayLayer
     }
 
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     /// A position already mapped into host-mode pixels, with the surface dims the host
     /// rescales against (== host mode, so its rescale is the identity).
     struct HostPoint { let x: Int32; let y: Int32; let w: UInt32; let h: UInt32 }
@@ -1220,6 +1120,14 @@ final class StreamLayerUIView: UIView {
         mouse.onDial = { [weak self] event in self?.onDial?(event) }
         return mouse
     }()
+    /// The `off` model: the same gestures (twist, keyboard swipe, stats tap) with no `send`,
+    /// so a miss beside the on-screen pad never moves the host cursor.
+    private lazy var mutedMouse: TouchMouse = {
+        let mouse = TouchMouse()
+        mouse.onKeyboardGesture = { [weak self] show in self?.setSoftKeyboardVisible(show) }
+        mouse.onDial = { [weak self] event in self?.onDial?(event) }
+        return mouse
+    }()
     /// The finger route latched at gesture start — a Settings change mid-gesture applies to
     /// the NEXT touch, so one gesture never splits across input models.
     private var fingerRoute: TouchInputMode?
@@ -1238,6 +1146,7 @@ final class StreamLayerUIView: UIView {
     /// Release anything the touch-driven mouse holds and forget gesture state — session stop.
     func resetTouchInput() {
         touchMouse.reset()
+        mutedMouse.reset()
         pencil.reset() // leaves range → the host lifts anything still inked
         fingerRoute = nil
         setSoftKeyboardVisible(false) // a stream that's gone takes its keyboard with it
@@ -1262,7 +1171,7 @@ final class StreamLayerUIView: UIView {
     override init(frame: CGRect) {
         super.init(frame: frame)
         displayLayer.videoGravity = .resizeAspect
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         isMultipleTouchEnabled = true
         // Button-less mouse/trackpad movement (no lock) arrives as hover, not touches —
         // forward it as absolute cursor moves so the host cursor tracks without a click held.
@@ -1282,6 +1191,8 @@ final class StreamLayerUIView: UIView {
             scrollPan.allowedTouchTypes = []
             addGestureRecognizer(scrollPan)
         }
+        #endif
+        #if os(iOS)
         // Pencil squeeze / double-tap → the pen plane's barrel buttons (no-op while
         // `penEnabled` is false — PencilStream ignores interactions out of range).
         let pencilInteraction = UIPencilInteraction()
@@ -1294,7 +1205,7 @@ final class StreamLayerUIView: UIView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("not used") }
 
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         route(touches, event: event, kind: .down)
     }
@@ -1341,7 +1252,7 @@ final class StreamLayerUIView: UIView {
     }
 
     /// Route direct fingers by the touch-input model, latched for the whole gesture:
-    /// passthrough → real wire touches; trackpad/pointer → the TouchMouse gesture engine.
+    /// passthrough → real wire touches; trackpad/pointer/off → a TouchMouse gesture engine.
     private func forwardFingers(_ touches: Set<UITouch>, kind: TouchKind) {
         var mode = fingerRoute ?? TouchInputMode.current(settings)
         if mode == .touch, !touchPassthroughEnabled { mode = .trackpad }
@@ -1355,15 +1266,16 @@ final class StreamLayerUIView: UIView {
             // the dial. Forwarding first is deliberate: a pull that never completes must not
             // have cost the host a contact.
             trackEdgePull(touches, kind: kind)
-        case .trackpad, .pointer:
+        case .trackpad, .pointer, .off:
+            let mouse = mode == .off ? mutedMouse : touchMouse
             switch kind {
-            case .down: touchMouse.began(touches, in: self, trackpad: mode == .trackpad)
-            case .move: touchMouse.moved(touches, in: self)
-            case .up: touchMouse.ended(touches, in: self)
-            case .cancel: touchMouse.cancelled(touches)
+            case .down: mouse.began(touches, in: self, trackpad: mode != .pointer)
+            case .move: mouse.moved(touches, in: self)
+            case .up: mouse.ended(touches, in: self)
+            case .cancel: mouse.cancelled(touches)
             }
         }
-        if touchIDs.isEmpty, touchMouse.isIdle { fingerRoute = nil }
+        if touchIDs.isEmpty, touchMouse.isIdle, mutedMouse.isIdle { fingerRoute = nil }
     }
 
     /// An indirect-pointer touch is a button-held click/drag session: forward its position as
@@ -1522,7 +1434,11 @@ final class StreamLayerUIView: UIView {
     private func hostPoint(from p: CGPoint) -> HostPoint? {
         guard let hostMode = currentHostMode?(), hostMode.width > 0, hostMode.height > 0
         else { return nil }
+        #if os(visionOS)
+        let s = traitCollection.displayScale > 0 ? traitCollection.displayScale : 2
+        #else
         let s = traitCollection.displayScale > 0 ? traitCollection.displayScale : UIScreen.main.scale
+        #endif
         let placement = VideoFit(name: settings.videoFit).place(
             view: (Int((bounds.width * s).rounded()), Int((bounds.height * s).rounded())),
             frame: (Int(hostMode.width), Int(hostMode.height)))
@@ -1558,7 +1474,7 @@ final class StreamLayerUIView: UIView {
     #endif
 }
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 // The soft keyboard's output → wire key events. UIKeyInput is deliberately minimal (no
 // UITextInput): the stream needs keystrokes, not an editing buffer — insertions map through
 // `SoftKeyMap` to US-positional VKs (with a VK_LSHIFT wrap for shifted characters) and

@@ -37,12 +37,8 @@ public enum DefaultsKey {
     public static let gamepadID = "punktfunk.gamepadID"
     /// The `PunktfunkConnection.GamepadType` raw value of the last controller that was actually
     /// attached — written by `GamepadManager` whenever one becomes active, never cleared on
-    /// disconnect. It exists so the gamepad UI's button legends keep speaking the pad the user
-    /// owns: the live controller's own `sfSymbolsName` is authoritative while it's connected, but
-    /// the moment it sleeps or disconnects there is nothing left to ask, and the legends used to
-    /// snap back to generic letter glyphs (i.e. Xbox) under a DualSense user's hands. Also what
-    /// makes the legends right at all under `gamepadUIMode == "always"`, where the console UI is
-    /// up with no pad attached by design. See `GamepadGlyphs`.
+    /// disconnect, so a button legend keeps speaking the pad the user owns once it sleeps or
+    /// disconnects. See `GamepadGlyphs`.
     public static let lastGamepadKind = "punktfunk.lastGamepadKind"
     /// Forward this device's controllers to the host at all (default true). Off is for a
     /// couch whose controller reaches the host another way — USB passthrough such as
@@ -147,16 +143,6 @@ public enum DefaultsKey {
     /// and dense input once per link target. PUNKTFUNK_PRESENT_MODE=immediate|vsync|slot overrides
     /// that path for A/B. Resolved once per session; see Stage2Pipeline's header.
     public static let vsync = "punktfunk.vsync"
-    /// macOS: present WINDOWED sessions in lockstep with the system compositor (the DCP
-    /// "mismatched swapID's" kernel-panic mitigation — see SessionPresenter.windowedPresentMode
-    /// and the MetalVideoPresenter saga notes). ON/unset (the default): windowed presents ride
-    /// a Core Animation transaction — validated panic-free on the 240 Hz repro machine, at a
-    /// small display-latency cost vs the raw path. OFF: windowed sessions keep the fast async
-    /// image queue — ON AFFECTED SETUPS (high-refresh displays) THAT PATH KERNEL-PANICS THE
-    /// WHOLE MAC, which is why the default is ON. Fullscreen always presents async (fast path)
-    /// regardless. Resolved once per session; PUNKTFUNK_WINDOWED_PRESENT=async|transaction|
-    /// surface overrides it for dev A/B.
-    public static let windowedSafePresent = "punktfunk.windowedSafePresent"
     /// Allow variable refresh rate: hand the display link a wide frame-rate RANGE (low floor,
     /// preferred = stream rate) so a ProMotion / adaptive-sync display can vary its physical
     /// refresh to match the stream. On by default; a no-op on fixed-refresh displays. On macOS,
@@ -220,9 +206,9 @@ public enum DefaultsKey {
     /// monitor implements it by taking every ⌘ chord off AppKit before a menu key equivalent can
     /// fire and forwarding it instead — which is what makes ⌘Q reach the host's compositor rather
     /// than quitting the client. Off keeps the chords local (the second-screen/work preset).
-    /// The client's own reserved chords (⌘⎋, ⌃⌘F, ⌃⌥⇧…) are never forwarded either way, and — as
-    /// on the SDL clients — the setting has no effect under the `desktop` mouse model, which is
-    /// something you ⌘Tab *away* from. macOS-only today; nothing reads it on iOS/tvOS.
+    /// ⌘⎋ and the ⌃⌥⇧ chords are never forwarded either way; ⌃⌘F is forwarded only with it on.
+    /// It applies under both mouse models, as on the SDL clients. macOS-only today; nothing reads
+    /// it on iOS/tvOS.
     public static let inhibitShortcuts = "punktfunk.inhibitShortcuts"
     /// iPad: capture the mouse/trackpad pointer (pointer lock → relative movement) for games,
     /// rather than forwarding an absolute cursor position. On by default. Only meaningful on iPad
@@ -232,7 +218,8 @@ public enum DefaultsKey {
     public static let pointerCapture = "punktfunk.pointerCapture"
     /// iPhone/iPad: how touchscreen fingers drive the host — a `TouchInputMode` raw value:
     /// "trackpad" (default: relative cursor with tap-click / two-finger-scroll gestures),
-    /// "pointer" (the cursor jumps to the finger), or "touch" (real multi-touch passthrough).
+    /// "pointer" (the cursor jumps to the finger), "touch" (real multi-touch passthrough), or
+    /// "off" (fingers reach the host as nothing).
     /// Read live per gesture by `StreamLayerUIView`.
     public static let touchMode = "punktfunk.touchMode"
     // RETIRED: `punktfunk.libraryEnabled`, the "Show game library" switch. Pairing is the only
@@ -245,16 +232,11 @@ public enum DefaultsKey {
     /// unknown value reads as host order. Presentation only — a device preference, never part of
     /// a stream preset. Written by the library's sort/view bar and by the Collections screen.
     public static let librarySort = "punktfunk.librarySort"
-    /// Which arrangement the gamepad library opens in — a `LibraryArrangement` stored value
-    /// (`"shelf"` = the coverflow, the default; `"grid"`). The cross-client `library_view` key;
+    /// Which arrangement the console's library opens in — a `LibraryArrangement` stored value
+    /// (`"shelf"`, the default; `"grid"`). The cross-client `library_view` key;
     /// unknown reads as shelf. Presentation only. One key, two surfaces: the library's bar and the
     /// Interface settings row both write it.
     public static let libraryView = "punktfunk.libraryView"
-    /// Open a browsable library straight onto its Collections (group-by-platform tiles) instead of
-    /// the shelf — the cross-client `library_collections` key. Off by default; a library that is
-    /// not worth browsing (one platform, one store) opens on the shelf regardless. Presentation
-    /// only.
-    public static let libraryCollections = "punktfunk.libraryCollections"
     /// Where a bare launch opens — a `StartIn` stored value (`"hosts"` the default, `"library"`,
     /// `"stream"`). The cross-client `start_in` key; unknown reads as hosts, and with no default
     /// host every value degrades to the host list. Resolve through `StartScreen.resolve`, never by
@@ -279,6 +261,10 @@ public enum DefaultsKey {
     public static let libraryShelf = "punktfunk.libraryShelf"
     /// macOS: take the window fullscreen while streaming and restore it on the host list. On by default.
     public static let fullscreenWhileStreaming = "punktfunk.fullscreenWhileStreaming"
+    /// macOS: open the window fullscreen and keep it there on the host list — the cross-client
+    /// `fullscreen_always`. Outranks `fullscreenWhileStreaming`. A device preference, never part
+    /// of a stream preset.
+    public static let fullscreenAlways = "punktfunk.fullscreenAlways"
     /// LEGACY (pre-tiered overlay): the old boolean stats-overlay toggle. Kept ONLY as the
     /// migration fallback `StatsVerbosity.current` reads when `statsVerbosity` was never
     /// written (absent-or-true → .normal, explicit false → .off). Never written anymore.
@@ -291,11 +277,19 @@ public enum DefaultsKey {
     /// Which corner the statistics overlay sits in — a `HUDPlacement` raw value
     /// ("topLeading"/"topTrailing"/"bottomLeading"/"bottomTrailing"). Default top-trailing.
     public static let hudPlacement = "punktfunk.hudPlacement"
+    /// The statistics overlay's size in percent, on top of the system text size (cross-client
+    /// `stats_scale_pct`). Default 100.
+    public static let statsScalePct = "punktfunk.statsScalePct"
+    /// Show how to leave for a few seconds when a stream starts (cross-client `exit_hint`).
+    /// Default on.
+    public static let exitHint = "punktfunk.exitHint"
+    /// Settings show their advanced rows (cross-client `show_advanced`). Default off; hiding a
+    /// row keeps its value.
+    public static let showAdvanced = "punktfunk.showAdvanced"
     /// The stats overlay's vocabulary: false (default) shows the figures Moonlight's overlay also
     /// shows, true the Advanced capture-to-glass view. Device-wide; a preset never carries it.
     public static let advancedStats = "punktfunk.advancedStats"
-    /// iOS/iPadOS/macOS: switch the host list, settings and game library to a controller-friendly
-    /// layout (the console launcher, gamepad-navigable settings, a coverflow-style library).
+    /// iOS/iPadOS/macOS: front the console instead of the touch/desktop layouts.
     /// On by default; WHEN it takes over is `gamepadUIMode`. See `GamepadUIEnvironment.isActive`.
     public static let gamepadUIEnabled = "punktfunk.gamepadUIEnabled"
     /// When `gamepadUIEnabled` actually takes over: `"connected"` (the default — only while a
@@ -305,13 +299,10 @@ public enum DefaultsKey {
     /// settings rows hide it when the switch is off. Anything unrecognized reads as
     /// `"connected"`. A device preference, never part of a stream preset.
     public static let gamepadUIMode = "punktfunk.gamepadUIMode"
-    /// Which colour family the gamepad UI's living backdrop drifts through — a
-    /// `GamepadPalette` id ("violet" = the brand default, then "oled"/"nebula"/"abyss"/"ember"/
-    /// "moss"/"graphite", then the pale ones). The cross-client `ui_palette` key: the desktop
-    /// console and the Android client carry the same table under the same names. Presentation
-    /// only, so it is a device preference and never part of a stream preset. An unknown value
-    /// reads as the default rather than failing — a newer client may have shipped a palette this
-    /// build doesn't know.
+    /// The console's backdrop palette — the cross-client `ui_palette` key, an id from the
+    /// console's own table (`ConsoleBridge.palettes`). A device preference, never part of a
+    /// stream preset. An unknown value reads as the default: a newer client may have shipped a
+    /// palette this build doesn't know.
     public static let uiPalette = "punktfunk.uiPalette"
     /// iPhone: ALSO play the rumble the host addresses to controller 1 (wire pad 0) on this
     /// device's own Taptic Engine — for phone-clip pads that ship without rumble motors, where
@@ -352,8 +343,8 @@ extension Notification.Name {
     /// menus) — it exists so the menu item is honest whenever it CAN fire, and as the shortcut's
     /// discoverable menu-bar surface.
     public static let punktfunkReleaseCapture = Notification.Name("io.unom.punktfunk.release-capture")
-    /// The quick-action ring's Keyboard slot: summon the stream view's soft keyboard (iOS).
-    public static let punktfunkShowSoftKeyboard = Notification.Name("io.unom.punktfunk.show-soft-keyboard")
+    /// The quick-action ring's Keyboard slot: show the stream view's soft keyboard, or hide it (iOS).
+    public static let punktfunkToggleSoftKeyboard = Notification.Name("io.unom.punktfunk.toggle-soft-keyboard")
     /// Asks a session to advance its stats tier; `object` is its connection, nil for every session.
     /// Posted by `StatsVerbosity.requestCycle`. The stored default does not move.
     public static let punktfunkStatsCycled = Notification.Name("io.unom.punktfunk.stats-cycled")
@@ -371,8 +362,8 @@ extension Notification.Name {
     public static let punktfunkToggleQuickActions = Notification.Name("io.unom.punktfunk.toggle-quick-actions")
 
     /// Posted by the app's Stream menu ("Toggle Fullscreen", ⌃⌘F) and by InputCapture's monitor
-    /// when the same combo fires while input is captured (the menu key-equivalent never reaches a
-    /// captured stream view). The key window's `FullscreenController` flips the window's fullscreen
+    /// when the same combo fires while input is captured with `inhibitShortcuts` off (the menu
+    /// key-equivalent never reaches a captured stream view). The key window's `FullscreenController` flips the window's fullscreen
     /// state. macOS only.
     public static let punktfunkToggleFullscreen = Notification.Name("io.unom.punktfunk.toggle-fullscreen")
 

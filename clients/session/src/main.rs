@@ -126,16 +126,13 @@ fn resolve_hdr_enabled(
 #[cfg(any(target_os = "linux", windows))]
 mod session_main {
     use pf_client_core::gamepad::GamepadService;
-    use pf_client_core::session::SessionParams;
+    use pf_client_core::orchestrate::{emit, exit, ResolvedSpec, SessionLine};
+    use pf_client_core::session::{Dial, Probes, SessionParams};
     use pf_client_core::trust;
-    use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
+    use punktfunk_core::config::{GamepadPref, Mode};
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use std::time::Duration;
-
-    pub const EXIT_CONNECT_FAILED: u8 = 2;
-    pub const EXIT_TRUST_REJECTED: u8 = 3;
-    pub const EXIT_PRESENTER_FAILED: u8 = 4;
 
     /// The value following `flag` in argv, if present (`--flag value`).
     pub(crate) fn arg_value(flag: &str) -> Option<String> {
@@ -209,7 +206,7 @@ mod session_main {
     fn headless_pair(pin: &str) -> u8 {
         let Some(target) = arg_value("--connect") else {
             eprintln!("--pair requires --connect host[:port]");
-            return EXIT_CONNECT_FAILED;
+            return exit::CONNECT_FAILED;
         };
         let (addr, port) = parse_host_port(&target);
         // The label the HOST files this client under. A headless box has nobody to ask, so
@@ -220,7 +217,7 @@ mod session_main {
             Ok(i) => i,
             Err(e) => {
                 eprintln!("client identity: {e:#}");
-                return EXIT_CONNECT_FAILED;
+                return exit::CONNECT_FAILED;
             }
         };
         match trust::pair_with_host(&addr, port, &identity, pin, &name) {
@@ -232,6 +229,7 @@ mod session_main {
                     port,
                     &fp_hex,
                     true,
+                    &[],
                 ) {
                     eprintln!("couldn't save the host: {e:#}");
                 }
@@ -241,7 +239,7 @@ mod session_main {
             }
             Err(e) => {
                 eprintln!("{}", trust::pair_error_message(&e));
-                EXIT_TRUST_REJECTED
+                exit::TRUST_REJECTED
             }
         }
     }
@@ -268,30 +266,26 @@ mod session_main {
             .map(|flag| arg_value(flag).unwrap_or_default())
     }
 
-    /// The connect budget: 15 s normally; `--connect-timeout SECS` overrides — the
-    /// shell's request-access flow passes ~185 s because the host PARKS the connection
-    /// until the operator clicks Approve.
+    /// Handshake budget. `--connect-timeout SECS` overrides the default.
+    /// Request-access passes a longer budget: the host parks until Approve.
     pub(crate) fn connect_timeout() -> Duration {
         Duration::from_secs(
             arg_value("--connect-timeout")
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(15),
+                .unwrap_or(pf_client_core::orchestrate::DEFAULT_CONNECT_TIMEOUT_SECS),
         )
     }
 
-    /// Builds one session's pump parameters from effective settings.
+    /// Clipboard decision, then [`params_from_spec`].
     ///
-    /// Both direct and browse launches pass the result of [`trust::effective_settings`],
-    /// including the resolved host preset. Zero-valued mode fields inherit the display
-    /// under the session window. `preset` names that resolution in the stats overlay.
-    ///
-    /// Capability preferences remain requests. Device and selected-output probes narrow
-    /// them before they enter [`SessionParams`], so the handshake only advertises formats
-    /// this session can present.
+    /// `clipboard_override` is the spawner's per-host decision. `None` reads the
+    /// record this pin resolves to. `display_hdr` is the selected output's HDR
+    /// volume on Windows.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn session_params(
         settings: &trust::Settings,
         preset: Option<String>,
+        preset_id: Option<String>,
         clipboard_override: Option<bool>,
         addr: String,
         port: u16,
@@ -300,107 +294,89 @@ mod session_main {
         launch: Option<String>,
         gamepad: &GamepadService,
         native: Mode,
+        display_hdr: Option<punktfunk_core::quic::HdrMeta>,
         force_software: Arc<AtomicBool>,
         vulkan: Option<pf_client_core::video::VulkanDecodeDevice>,
     ) -> SessionParams {
-        // Per-host clipboard opt-in (design/clipboard-and-file-transfer.md §5.3). In spec
-        // mode the spawner already resolved it; otherwise this looks it up itself, which is
-        // the last store read the compat path still owes. `addr` is moved into the struct
-        // below, so read it first.
         let clipboard = clipboard_override.unwrap_or_else(|| {
-            // The record this pin RESOLVES to, not "any record at its address": a retired
-            // duplicate, or the other OS of a dual-boot box, must never be the one that
-            // hands a host the clipboard.
             trust::KnownHosts::load()
                 .resolve(Some(&trust::hex(&pin)), &addr, port)
                 .is_some_and(|h| h.clipboard_sync)
         });
-        // The shell-persisted forwarded-controller pin (stable `vid:pid:name`), applied to
-        // OUR service — the shells' own can't reach this process. Empty = automatic. Set
-        // unconditionally for `set_forwarding`'s reason below: browse mode reuses one
-        // service, so a cleared pin has to clear it there too.
+        let spec = ResolvedSpec {
+            settings: settings.clone(),
+            clipboard,
+            preset,
+            preset_id,
+        };
+        params_from_spec(
+            spec,
+            addr,
+            port,
+            pin,
+            identity,
+            launch,
+            gamepad,
+            native,
+            display_hdr,
+            force_software,
+            vulkan,
+        )
+    }
+
+    /// Gamepad-service writes and display probes, then the shared params fill.
+    ///
+    /// HDR, 4:4:4, and the pad service stay here: the library has no window
+    /// and no device. Mode fallback and video caps live in
+    /// [`ResolvedSpec::session_params`].
+    #[allow(clippy::too_many_arguments)]
+    fn params_from_spec(
+        spec: ResolvedSpec,
+        addr: String,
+        port: u16,
+        pin: [u8; 32],
+        identity: (String, String),
+        launch: Option<String>,
+        gamepad: &GamepadService,
+        native: Mode,
+        display_hdr: Option<punktfunk_core::quic::HdrMeta>,
+        force_software: Arc<AtomicBool>,
+        vulkan: Option<pf_client_core::video::VulkanDecodeDevice>,
+    ) -> SessionParams {
+        let settings = &spec.settings;
+        // Unconditional on every launch. Browse mode reuses one service, so a
+        // cleared pin or a stream with forwarding off must undo the previous
+        // choice before attach.
         gamepad
             .set_pinned((!settings.forward_pad.is_empty()).then(|| settings.forward_pad.clone()));
-        // Whether to forward controllers AT ALL (off = the pad reaches the host by some other
-        // route — VirtualHere and friends). Set unconditionally, not only when off: browse mode
-        // reuses one service across launches, so a stream that follows one with it off must put
-        // it back. It goes on before the attach below, so a non-forwarding session never opens
-        // — never grabs — the device.
         gamepad.set_forwarding(settings.gamepad_forwarding);
-        // System-button routing: whether raw guide/QAM presses ride the wire, and whether
-        // hold-Select arms as the alternate guide route. Auto keys off Gaming Mode — the
-        // local Steam UI reacts to the same physical buttons there no matter what, so
-        // forwarding raw opens BOTH overlays, the local one on top of the stream. Set
-        // unconditionally for the same browse-mode-reuse reason as the line above.
         let game_mode = gaming_mode();
         gamepad.set_system_buttons(
             settings.system_buttons_forward(game_mode),
             settings.guide_gesture_enabled(game_mode),
         );
-        // The control socket (guide/QAM injection — the Decky panel's host buttons).
-        // Spawned at first params-build so it exists for --connect AND console launches.
+        // First build binds it, for --connect and for console launches.
         #[cfg(unix)]
         crate::ctl_socket::spawn(gamepad.clone());
-        // Pad-audio prefs to OUR gamepad service (same reasoning as the pin above): tier-A
-        // slots declare their render caps at open time, which happens on attach — after this.
         gamepad.set_pad_audio_prefs(
             settings.pad_haptics,
             pf_client_core::pad_audio::speaker_active(&settings.pad_speaker),
         );
-        let mode = Mode {
-            width: if settings.width == 0 {
-                native.width
-            } else {
-                settings.width
-            },
-            height: if settings.height == 0 {
-                native.height
-            } else {
-                settings.height
-            },
-            refresh_hz: if settings.refresh_hz == 0 {
-                native.refresh_hz.max(30)
-            } else {
-                settings.refresh_hz
-            },
-        };
-        // Render scale: multiply the resolved mode (even + codec-clamped) so the host renders
-        // larger/smaller and the presenter resamples to the window. 1.0 = Native. Applied after the
-        // Native/explicit resolution so it composes uniformly with both.
-        let (sw, sh) = punktfunk_core::render_scale::apply(
-            mode.width,
-            mode.height,
-            settings.render_scale,
-            punktfunk_core::render_scale::max_dimension(&settings.codec),
-        );
-        let mode = Mode {
-            width: sw,
-            height: sh,
-            ..mode
-        };
-        // Before the struct literal — `vulkan` moves into it below.
-        let phase_lock = vulkan.as_ref().is_some_and(|v| v.present_timing);
-        // …and the 4:4:4 promise, for the same reason: asked while the device bundle is
-        // still borrowable. `&&` short-circuits, so a box that never enabled Full chroma
-        // pays no capability queries for a feature it does not want.
-        let want_444 = settings.enable_444
+        // Short-circuit: Full chroma off must not build an HEVC decoder.
+        // The probe constructs one to ask about 4:4:4 profiles.
+        let hevc_444_hardware = settings.enable_444
             && pf_client_core::video::hevc_444_hardware_decodable(vulkan.as_ref());
-        if settings.enable_444 && !want_444 {
-            // Loud, because the user turned a switch on and HEVC will not carry it. Asking
-            // anyway loses the whole codec: the decode ladder has no 4:4:4 HEVC rung.
+        if settings.enable_444 && !hevc_444_hardware {
             tracing::warn!(
                 "Full chroma (4:4:4) requested but this device has no 4:4:4 HEVC decode — \
                  HEVC sessions ask for 4:2:0 instead. PyroWave still asks for 4:4:4: it \
                  decodes full chroma on any GPU."
             );
         }
-        // Windows offers HDR only when the selected output is actively presenting HDR.
-        // Driver-declared SDR tone-mapping is not enough: unsupported outputs can accept
-        // the conversion and cover the stream with a black or corrupt layer. The peak-nits
-        // environment override remains the explicit headless-test bypass.
+        // Windows: HDR only when the selected output is presenting HDR.
+        // `PUNKTFUNK_CLIENT_PEAK_NITS` is the headless bypass.
         #[cfg(windows)]
-        let display_hdr = punktfunk_core::client::display_hdr_env_override()
-            .or_else(|| pf_client_core::video_d3d11::display_hdr_volume(window_pos()));
+        let display_hdr = punktfunk_core::client::display_hdr_env_override().or(display_hdr);
         #[cfg(windows)]
         let output_hdr = display_hdr.is_some();
         #[cfg(not(windows))]
@@ -414,97 +390,35 @@ mod session_main {
                 "HDR request declined"
             );
         }
-        SessionParams {
-            host: addr,
-            port,
-            mode,
-            compositor: CompositorPref::from_name(&settings.compositor)
-                .unwrap_or(CompositorPref::Auto),
-            gamepad: {
-                // The setting AS CHOSEN goes to the pad service too, not just the Hello: the host
-                // builds each virtual pad from that pad's arrival and only falls back to this
-                // session default for a pad that never declares one, so an explicit choice that
-                // stopped here would be undone the moment a controller connected.
-                let chosen = GamepadPref::from_name(&settings.gamepad).unwrap_or(GamepadPref::Auto);
-                gamepad.set_kind_override(chosen);
-                match chosen {
-                    GamepadPref::Auto => gamepad.auto_pref(),
-                    explicit => explicit,
-                }
+        // The service hears the chosen kind; the Hello hears Auto resolved.
+        // The host builds each pad from its arrival, not only this default.
+        let chosen = GamepadPref::from_name(&settings.gamepad).unwrap_or(GamepadPref::Auto);
+        gamepad.set_kind_override(chosen);
+        let gamepad_pref = match chosen {
+            GamepadPref::Auto => gamepad.auto_pref(),
+            explicit => explicit,
+        };
+        spec.session_params(
+            Dial {
+                host: addr,
+                port,
+                pin,
+                launch,
+                connect_timeout: connect_timeout(),
             },
-            bitrate_kbps: settings.bitrate_kbps,
-            audio_channels: settings.audio_channels,
-            // The lossless-audio opt-in, AS STORED — the pump is what filters it, because only it
-            // knows whether this box's output device will open the rate and what the host
-            // answered. `PUNKTFUNK_AUDIO_HIRES` still overrides it there (a headless box or a
-            // Gaming-Mode kiosk has no settings UI), which is why nothing is resolved here.
-            audio_format: settings.audio_format.clone(),
-            preferred_codec: settings.preferred_codec(),
-            // Nothing excluded on a fresh dial. Only the run loop's codec-fallback retry
-            // sets this, and it does so on a CLONE of these params — a Settings-level
-            // "never use HEVC" would be `preferred_codec`, not this.
-            exclude_codecs: 0,
-            // Desktop decode truth: every stack here (Vulkan Video, D3D11VA, VAAPI,
-            // openh264/rav1d) takes multi-slice AUs, so MULTI_SLICE is unconditional —
-            // mobile/TV embedders advertise per-decoder instead (Amlogic wedges on it).
-            // HDR and 4:4:4 are requests only; the host answers the resolved chroma in the
-            // Welcome, before we build a decoder. Rules and tests: `video::video_caps_for`.
-            video_caps: pf_client_core::video::video_caps_for(
+            Probes {
+                mode: native,
+                identity,
+                vulkan,
+                force_software,
+                gamepad: gamepad_pref,
                 hdr_enabled,
-                settings.ten_bit_sdr,
-                want_444,
-            ),
-            want_444: settings.enable_444,
-            // The panel's HDR volume reaches the host's virtual-display EDID so host apps
-            // tone-map to the real glass. Windows only: DXGI reads the `--window-pos`
-            // monitor (advanced-color outputs), gated on the HDR setting because an
-            // unadvertised 10-bit/HDR makes the volume noise. Linux has no portable query
-            // and keeps the host EDID; `PUNKTFUNK_CLIENT_PEAK_NITS` overrides both.
-            #[cfg(windows)]
-            display_hdr: hdr_enabled.then_some(display_hdr).flatten(),
-            #[cfg(not(windows))]
-            display_hdr: None,
-            // The presenter renders the host cursor locally in desktop mouse mode (M2 cursor
-            // channel); capture-mode sessions keep the composited cursor, so only advertise
-            // when the session STARTS in desktop mode. The host gates further (Linux portal
-            // compositors only).
-            cursor_forward: settings.mouse_mode() == trust::MouseMode::Desktop,
-            mic_enabled: settings.mic_enabled,
-            echo_cancel: settings.echo_cancel,
-            // Pad audio (0xD1): the DualSense haptics/speaker render settings. The gamepad
-            // service learns the same prefs below so tier-A slots declare their render caps
-            // at open; the session pump gates CLIENT_CAP_PAD_AUDIO + the renderer on these.
-            pad_haptics: settings.pad_haptics,
-            pad_speaker: settings.pad_speaker.clone(),
-            clipboard,
-            keep_host_audio: settings.keep_host_audio,
-            video_fit: punktfunk_core::video_fit::VideoFit::from_name(&settings.video_fit),
-            // The Settings preference (auto → VAAPI where it exists; the presenter
-            // demotes to software on boxes whose Vulkan can't import the dmabufs).
-            // PUNKTFUNK_DECODER still overrides inside the decoder for bisects.
-            decoder: settings.decoder.clone(),
-            launch,
-            vulkan,
-            pin: Some(pin),
-            identity,
-            connect_timeout: connect_timeout(),
-            force_software,
-            preset,
-            // Presentation-tier, carried per launch rather than read once by the run loop:
-            // the console streams many sessions through ONE loop, so this is the only way a
-            // tier the user picked between streams (or one a host's preset carries) reaches
-            // the overlay before the app is restarted. Single mode passes the same value its
-            // presenter options already hold, so it changes nothing there.
-            stats_verbosity: stats_tier(settings),
-            advanced_stats: settings.advanced_stats,
-            // Phase-locked capture (design/phase-locked-capture.md, Apple/Android parity):
-            // advertised only when the presenter has real on-glass latch stamps
-            // (VK_KHR_present_wait) — without them there is no latch grid to report. The
-            // grid itself is written by the presenter (run_session clones the Arc out of
-            // these params) and folded into ~1 Hz PhaseReports by the session pump.
-            phase_lock,
-            latch_grid: std::sync::Arc::new(pf_client_core::session::LatchGrid::default()),
-        }
+                display_hdr,
+                hevc_444_hardware,
+                stats_verbosity: stats_tier(settings),
+                latch_grid: std::sync::Arc::new(pf_client_core::session::LatchGrid::default()),
+            },
+        )
     }
 
     /// The window's starting size under Match-window: the persisted last size, so the
@@ -515,64 +429,21 @@ mod session_main {
             .then_some((settings.last_window_w, settings.last_window_h))
     }
 
-    /// The Match-window policy hook for the presenter loop
-    /// (design/midstream-resolution-resize.md D1/D2): `Some(persist)` turns the
-    /// debounced resize→`Reconfigure` machinery on; the callback stores each resize-end's
-    /// logical window size (load-modify-save, like the console settings screen) so the
-    /// next launch opens at it.
-    /// The Match-window policy hook (design/midstream-resolution-resize.md D1/D2). The
-    /// callback used to load-modify-save the shared settings file from inside the renderer —
-    /// one of that file's five concurrent writers, for a value only the parent needs. It now
-    /// REPORTS the size on stdout and the spawner persists it
-    /// (design/client-architecture-split.md §5).
-    ///
-    /// `persist_locally` keeps a hand-run session remembering its own window: nobody is
-    /// listening to stdout there, so the event alone would drop the value. A spawned session
-    /// leaves the write to its parent, which is the whole point.
+    /// The Match-window hook (design/midstream-resolution-resize.md D1/D2): each resize-end's
+    /// logical size goes out as a `window` line and the spawner persists it.
+    /// `persist_locally` is for a hand-run session, where nobody reads stdout.
     pub(crate) fn match_window(
         settings: &trust::Settings,
         persist_locally: bool,
     ) -> Option<Box<dyn FnMut(u32, u32)>> {
         settings.match_window.then(|| {
             Box::new(move |w: u32, h: u32| {
-                machine_line(&format!("{{\"window\":{{\"w\":{w},\"h\":{h}}}}}"));
+                emit(SessionLine::Window { w, h });
                 if persist_locally {
                     pf_client_core::orchestrate::persist_window_size(w, h);
                 }
             }) as Box<dyn FnMut(u32, u32)>
         })
-    }
-
-    /// One JSON status line on stdout (the shell parses these; strings hand-escaped via
-    /// the minimal rules a reason string can need). `pub(crate)`: browse mode emits its
-    /// failure through the same contract when spawned with `--json-status`.
-    pub(crate) fn json_line(key: &str, msg: &str, trust_rejected: Option<bool>) {
-        let escaped: String = msg
-            .chars()
-            .flat_map(|c| match c {
-                '"' => vec!['\\', '"'],
-                '\\' => vec!['\\', '\\'],
-                '\n' => vec!['\\', 'n'],
-                c if (c as u32) < 0x20 => vec![' '],
-                c => vec![c],
-            })
-            .collect();
-        match trust_rejected {
-            Some(t) => machine_line(&format!(
-                "{{\"{key}\":\"{escaped}\",\"trust_rejected\":{t}}}"
-            )),
-            None => machine_line(&format!("{{\"{key}\":\"{escaped}\"}}")),
-        }
-    }
-
-    /// Write one line of the shell contract. A dropped write is NOT fatal: `println!` panics
-    /// on EPIPE, so a shell that exited mid-stream used to abort the stream the user is still
-    /// watching. Status nobody is left to read costs nothing to lose.
-    pub(crate) fn machine_line(line: &str) {
-        use std::io::Write as _;
-        let mut out = std::io::stdout().lock();
-        let _ = writeln!(out, "{line}");
-        let _ = out.flush();
     }
 
     /// The PipeWire endpoints the settings pickers offer, as
@@ -592,7 +463,7 @@ mod session_main {
             }
             Err(e) => {
                 eprintln!("list-audio: {e:#}");
-                EXIT_PRESENTER_FAILED
+                exit::RENDERER_FAILED
             }
         }
     }
@@ -636,7 +507,7 @@ mod session_main {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("pad-audio-test: {e:#}");
-                EXIT_PRESENTER_FAILED
+                exit::RENDERER_FAILED
             }
         }
     }
@@ -750,47 +621,49 @@ mod session_main {
             }
             Err(e) => {
                 eprintln!("probe-decode: {e:#}");
-                EXIT_PRESENTER_FAILED
+                exit::RENDERER_FAILED
             }
         }
     }
 
-    /// Steam Deck / RADV: Mesa gates Vulkan Video decode — the `VK_KHR_video_decode_*`
-    /// extensions AND the decode-capable queue family — behind `RADV_PERFTEST=video_decode`.
-    /// Without it the presenter's device advertises no decode queue, so `Decoder::new`'s
-    /// `auto` path can't build the Vulkan decoder and the session silently falls back to
-    /// VAAPI (whose separate-plane dmabuf import shows chroma fringing — green/yellow specks
-    /// around the cursor — on VanGogh). We want the Vulkan path, so opt in here, before the
-    /// RADV driver loads (the Vulkan instance is created later, inside `run_session`).
-    ///
-    /// RADV-only knob: ANV/NVIDIA/other drivers ignore `RADV_PERFTEST`, and a box where video
-    /// decode is already the default just no-ops. Append rather than clobber so a user's own
-    /// `RADV_PERFTEST` survives; `PUNKTFUNK_DECODER=native-vaapi` still overrides the decoder
-    /// choice (the pre-M10 `vaapi` spelling reaches the same rung — it migrates, loudly).
+    /// Mesa gates Vulkan Video decode — the `VK_KHR_video_decode_*` extensions AND the
+    /// decode-capable queue family — behind one switch per driver: RADV reads
+    /// `RADV_PERFTEST=video_decode`, ANV (Intel) `ANV_DEBUG=video-decode`. Without it the
+    /// presenter's device advertises no decode queue and `auto` falls to VAAPI, which
+    /// chroma-fringes on VanGogh and is unverified on Intel. Every other driver ignores
+    /// both, and a driver that already decodes by default no-ops. Appended, never
+    /// clobbered, so a user's own flags survive; `PUNKTFUNK_DECODER=native-vaapi` still
+    /// pins VAAPI.
     ///
     /// ⚠⚠ Called from the TOP of [`run`], ahead of the `--list-adapters` / `--probe-decode`
-    /// early exits — not merely "before `run_session` creates the instance". Those flags
-    /// create Vulkan instances of their own and RADV latches `RADV_PERFTEST` when its ICD
-    /// initialises, so a call placed after them leaves the triage tool describing a device
-    /// that cannot decode while the streaming path decodes on it.
+    /// early exits. Those create Vulkan instances of their own and Mesa latches these
+    /// variables when its ICD initialises, so a later call leaves the triage tools
+    /// describing a device that cannot decode while the streaming path decodes on it.
     #[cfg(target_os = "linux")]
-    #[allow(unsafe_code)] // the two SAFETY-commented single-threaded-startup env writes below
-    fn enable_radv_video_decode() {
-        const TOKEN: &str = "video_decode";
-        match std::env::var("RADV_PERFTEST") {
-            Ok(v) if v.split(',').any(|t| t == TOKEN) => return,
+    #[allow(unsafe_code)] // the SAFETY-commented single-threaded-startup env write below
+    fn enable_mesa_video_decode() {
+        for (var, token) in [
+            ("RADV_PERFTEST", "video_decode"),
+            ("ANV_DEBUG", "video-decode"),
+        ] {
+            let Some(value) = with_token(std::env::var(var).ok().as_deref(), token) else {
+                continue;
+            };
             // SAFETY: called at the very top of `run()`, before this process creates any
             // thread — the Vulkan loader, SDL, and the session runtime all start later.
-            Ok(v) if !v.is_empty() => unsafe {
-                std::env::set_var("RADV_PERFTEST", format!("{v},{TOKEN}"))
-            },
-            // SAFETY: as above — single-threaded startup.
-            _ => unsafe { std::env::set_var("RADV_PERFTEST", TOKEN) },
+            unsafe { std::env::set_var(var, &value) };
+            tracing::info!(var, value = %value, "opted into Mesa Vulkan Video decode");
         }
-        tracing::info!(
-            radv_perftest = %std::env::var("RADV_PERFTEST").unwrap_or_default(),
-            "opted into RADV Vulkan Video decode (Mesa gates it behind RADV_PERFTEST on the Deck)"
-        );
+    }
+
+    /// `current` with `token` appended to its comma list; `None` when it is already there.
+    #[cfg(target_os = "linux")]
+    fn with_token(current: Option<&str>, token: &str) -> Option<String> {
+        match current {
+            Some(v) if v.split(',').any(|t| t == token) => None,
+            Some(v) if !v.is_empty() => Some(format!("{v},{token}")),
+            _ => Some(token.to_owned()),
+        }
     }
 
     /// The driver's own answers about video images, printed with nothing in front of
@@ -851,38 +724,18 @@ mod session_main {
 
     pub fn run() -> u8 {
         // Logs to STDERR — stdout is the machine interface (ready/stats/error lines) — plus
-        // the in-process ring (`pf_client_core::logring`, DEBUG+ regardless of RUST_LOG) that
-        // "Send logs to host" uploads. The env filter scopes the STDERR layer only: the ring
-        // exists precisely for the diagnostics nobody enabled before the bug happened.
-        {
-            use tracing_subscriber::layer::SubscriberExt;
-            use tracing_subscriber::util::SubscriberInitExt;
-            use tracing_subscriber::Layer;
-            tracing_subscriber::registry()
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .with_writer(std::io::stderr)
-                        .with_filter(
-                            tracing_subscriber::EnvFilter::try_from_default_env()
-                                .unwrap_or_else(|_| "info".into()),
-                        ),
-                )
-                .with(
-                    pf_client_core::logring::RingLayer
-                        .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
-                )
-                .init();
-        }
+        // the ring "Send logs to host" uploads.
+        pf_client_core::logring::init_tracing(std::io::stderr, true);
         // SEH last-resort: a driver AV otherwise leaves only an exit code in the shell's log.
         #[cfg(windows)]
         punktfunk_core::crash::install();
 
         // Runs before ANY Vulkan call, including the probe flags below — hence the top of
         // `run`, ahead of the early exits, so triage answers the same question the streaming
-        // path asks. Makes RADV expose its video-decode queue and extensions so the decoder's
-        // `auto` path prefers Vulkan Video over VAAPI. Windows drivers expose theirs already.
+        // path asks. Makes RADV and ANV expose their video-decode queue and extensions so the
+        // decoder's `auto` path can take Vulkan Video. Windows drivers expose theirs already.
         #[cfg(target_os = "linux")]
-        enable_radv_video_decode();
+        enable_mesa_video_decode();
 
         // `--list-adapters`: print the Vulkan physical devices' marketing names (one per
         // line, discrete first) for the desktop shells' GPU picker, then exit.
@@ -896,7 +749,7 @@ mod session_main {
                 }
                 Err(e) => {
                     eprintln!("list-adapters: {e:#}");
-                    EXIT_PRESENTER_FAILED
+                    exit::RENDERER_FAILED
                 }
             };
         }
@@ -928,12 +781,12 @@ mod session_main {
                 eprintln!(
                     "punktfunk-session pairing accepts only `--pair -`; prefer `punktfunk pair`"
                 );
-                return EXIT_CONNECT_FAILED;
+                return exit::CONNECT_FAILED;
             }
             let mut pin = String::new();
             if std::io::stdin().read_line(&mut pin).is_err() || pin.trim().is_empty() {
                 eprintln!("no pairing PIN on stdin");
-                return EXIT_CONNECT_FAILED;
+                return exit::CONNECT_FAILED;
             }
             return headless_pair(pin.trim());
         }
@@ -1000,7 +853,7 @@ mod session_main {
                     "--browse needs the console UI — this is the minimal build \
                      (rebuild without --no-default-features)"
                 );
-                return EXIT_PRESENTER_FAILED;
+                return exit::RENDERER_FAILED;
             }
         }
         let Some(target) = arg_value("--connect") else {
@@ -1018,7 +871,7 @@ mod session_main {
                  enrol with --pair (no display needed), in the console, or from the desktop\n\
                  client."
             );
-            return EXIT_CONNECT_FAILED;
+            return exit::CONNECT_FAILED;
         };
         let (addr, port) = parse_host_port(&target);
 
@@ -1026,8 +879,11 @@ mod session_main {
             Ok(i) => i,
             Err(e) => {
                 tracing::error!(error = %format!("{e:#}"), "loading the client identity");
-                json_line("error", "this device's client key didn't load", None);
-                return EXIT_CONNECT_FAILED;
+                emit(SessionLine::Error {
+                    msg: "this device's client key didn't load",
+                    trust_rejected: None,
+                });
+                return exit::CONNECT_FAILED;
             }
         };
         // `--resolved-spec <path>`: the spawner already did the resolving, so this process
@@ -1038,18 +894,25 @@ mod session_main {
         let spec = arg_value("--resolved-spec").map(std::path::PathBuf::from);
         // `--fp` names its own record; only a bare address falls back to what it answers with.
         let fp_arg = arg_value("--fp").map(|f| f.to_ascii_lowercase());
-        let (settings, preset_name, clipboard_override) = match &spec {
-            Some(path) => match pf_client_core::orchestrate::ResolvedSpec::read(path) {
+        let resolved = match &spec {
+            Some(path) => match ResolvedSpec::read(path) {
                 Ok(s) => {
                     tracing::info!(path = %path.display(), "running from a resolved spec");
-                    (s.settings, s.preset, Some(s.clipboard))
+                    Some(s)
                 }
                 Err(e) => {
                     tracing::error!(error = %e, path = %path.display(), "reading the resolved spec");
-                    json_line("error", "this stream's settings didn't load", None);
-                    return EXIT_CONNECT_FAILED;
+                    emit(SessionLine::Error {
+                        msg: "this stream's settings didn't load",
+                        trust_rejected: None,
+                    });
+                    return exit::CONNECT_FAILED;
                 }
             },
+            None => None,
+        };
+        let (settings, preset_name, preset_id) = match &resolved {
+            Some(s) => (s.settings.clone(), s.preset.clone(), s.preset_id.clone()),
             None => {
                 let (settings, preset) = trust::effective_settings(
                     fp_arg.as_deref(),
@@ -1058,7 +921,8 @@ mod session_main {
                     preset_arg().as_deref(),
                     arg_value("--launch").as_deref(),
                 );
-                (settings, preset.map(|p| p.name), None)
+                let id = preset.as_ref().map(|p| p.id.clone());
+                (settings, preset.map(|p| p.name), id)
             }
         };
         if let Some(name) = &preset_name {
@@ -1075,12 +939,13 @@ mod session_main {
             .and_then(trust::parse_hex32)
             .or_else(|| known_host.and_then(|h| trust::parse_hex32(&h.fp_hex)));
         let Some(pin) = pin else {
-            json_line(
-                "error",
-                &format!("{addr}:{port} isn't paired with this device yet. Pair it to continue."),
-                Some(true),
-            );
-            return EXIT_TRUST_REJECTED;
+            emit(SessionLine::Error {
+                msg: &format!(
+                    "{addr}:{port} isn't paired with this device yet. Pair it to continue."
+                ),
+                trust_rejected: Some(true),
+            });
+            return exit::TRUST_REJECTED;
         };
 
         let host_label = known_host.map_or_else(|| addr.clone(), |h| h.name.clone());
@@ -1134,21 +999,38 @@ mod session_main {
         };
 
         let outcome =
-            pf_presenter::run_session(opts, move |gamepad, native, force_software, vulkan| {
-                session_params(
-                    &settings,
-                    preset_name,
-                    clipboard_override,
-                    addr,
-                    port,
-                    pin,
-                    identity,
-                    launch,
-                    gamepad,
-                    native,
-                    force_software,
-                    vulkan,
-                )
+            pf_presenter::run_session(opts, move |gamepad, native, hdr, force_software, vulkan| {
+                match resolved {
+                    Some(spec) => params_from_spec(
+                        spec,
+                        addr,
+                        port,
+                        pin,
+                        identity,
+                        launch,
+                        gamepad,
+                        native,
+                        hdr,
+                        force_software,
+                        vulkan,
+                    ),
+                    None => session_params(
+                        &settings,
+                        preset_name,
+                        preset_id,
+                        None,
+                        addr,
+                        port,
+                        pin,
+                        identity,
+                        launch,
+                        gamepad,
+                        native,
+                        hdr,
+                        force_software,
+                        vulkan,
+                    ),
+                }
             });
 
         match outcome {
@@ -1156,24 +1038,30 @@ mod session_main {
             Ok(pf_presenter::Outcome::Ended(Some(reason))) => {
                 // The host ending the session (game quit, host shutdown) is a normal end
                 // for a one-shot stream binary — report the reason, exit clean.
-                json_line("ended", &reason, None);
+                emit(SessionLine::Ended(&reason));
                 0
             }
             Ok(pf_presenter::Outcome::ConnectFailed {
                 msg,
                 trust_rejected,
             }) => {
-                json_line("error", &msg, Some(trust_rejected));
+                emit(SessionLine::Error {
+                    msg: &msg,
+                    trust_rejected: Some(trust_rejected),
+                });
                 if trust_rejected {
-                    EXIT_TRUST_REJECTED
+                    exit::TRUST_REJECTED
                 } else {
-                    EXIT_CONNECT_FAILED
+                    exit::CONNECT_FAILED
                 }
             }
             Err(e) => {
                 tracing::error!(error = %format!("{e:#}"), "running the presenter");
-                json_line("error", "the stream window didn't start", None);
-                EXIT_PRESENTER_FAILED
+                emit(SessionLine::Error {
+                    msg: "the stream window didn't start",
+                    trust_rejected: None,
+                });
+                exit::RENDERER_FAILED
             }
         }
     }
@@ -1194,6 +1082,24 @@ mod session_main {
                 assert_eq!(stats_tier_with(chosen, true), chosen);
                 assert_eq!(stats_tier_with(chosen, false), chosen);
             }
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn a_mesa_switch_is_appended_once_and_keeps_the_users_own() {
+            assert_eq!(
+                with_token(None, "video-decode").as_deref(),
+                Some("video-decode")
+            );
+            assert_eq!(
+                with_token(Some(""), "video-decode").as_deref(),
+                Some("video-decode")
+            );
+            assert_eq!(
+                with_token(Some("sync"), "video-decode").as_deref(),
+                Some("sync,video-decode")
+            );
+            assert_eq!(with_token(Some("sync,video-decode"), "video-decode"), None);
         }
 
         /// The console reads the file ONCE for its window, so a tier changed between streams

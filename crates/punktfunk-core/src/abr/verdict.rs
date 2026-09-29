@@ -141,10 +141,11 @@ impl Baselines {
     /// `draining` says the last link cut is still emptying the queue it
     /// caused, which is the one thing a delay rise can mean that the rate
     /// must not answer again, `link_vouches` is the same vouching the run
-    /// gives, read off this window instead of its history, and `freeze_owd`
-    /// holds the delay baseline still while a lift is being judged — a
-    /// baseline that learns the rise it is supposed to detect detects
-    /// nothing.
+    /// gives, read off this window instead of its history, `freeze_owd`
+    /// hands the window's delay to the lift being judged — the baseline holds
+    /// still and the verdict is the lift's, because a baseline that learns the
+    /// rise it is supposed to detect detects nothing — and `still` says the
+    /// source drew too few frames for its loss to be the rate's doing.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn score(
         &mut self,
@@ -156,6 +157,7 @@ impl Baselines {
         draining: bool,
         link_vouches: bool,
         freeze_owd: bool,
+        still: bool,
     ) -> Verdict {
         let quiet = w.activity.quiet();
         // Keepalive OWD/decode would train the rolling min on the quietest
@@ -197,13 +199,19 @@ impl Baselines {
             encode_rise_us,
             encode_severe_us,
         );
+        // A still source offers the link a sliver of the rate: its loss and
+        // lost frames are the path's, and cutting would not change them. FEC
+        // and RFI answer them. A queue holding its frames is still the rate's.
+        let path_noise = still && !owd_bad;
+        let loss_ppm = if path_noise { 0 } else { w.loss_ppm };
+        let dropped = if path_noise { 0 } else { w.dropped };
         // A lost frame and nothing else: the recovery plane's business (RFI,
         // FEC), not the rate's. A long clean run at this rate says so, and so
         // does a window whose wire and delay show a link with room — which a
         // session still climbing has instead of a run.
-        let blip = w.dropped > 0
+        let blip = dropped > 0
             && (clean_run >= BLIP_CLEAN_WINDOWS || link_vouches)
-            && w.loss_ppm < HEAVY_LOSS_PPM
+            && loss_ppm < HEAVY_LOSS_PPM
             && !w.flushed
             && !owd_bad
             && !decode_bad
@@ -211,15 +219,15 @@ impl Baselines {
             && w.recovery_kf < RECOVERY_KF_BAD;
         // Severe: one window. Ordinary congestion: two consecutive.
         let severe = !blip
-            && (w.dropped > 0
+            && (dropped > 0
                 || w.flushed
-                || w.loss_ppm >= SEVERE_LOSS_PPM
+                || loss_ppm >= SEVERE_LOSS_PPM
                 || decode_severe
                 || encode_severe
                 || w.recovery_kf >= RECOVERY_KF_SEVERE);
         let bad = severe
             || (!blip
-                && (w.loss_ppm >= HEAVY_LOSS_PPM
+                && (loss_ppm >= HEAVY_LOSS_PPM
                     || owd_bad
                     || decode_bad
                     || encode_bad
@@ -240,7 +248,12 @@ impl Baselines {
         v.reason = if blip {
             Reason::Blip
         } else {
-            reason(w, owd_bad, &v)
+            let seen = WindowSample {
+                loss_ppm,
+                dropped,
+                ..*w
+            };
+            reason(&seen, owd_bad, &v)
         };
         v
     }

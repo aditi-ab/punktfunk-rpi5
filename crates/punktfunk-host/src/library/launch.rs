@@ -16,7 +16,7 @@ mod desktop;
 #[cfg(not(windows))]
 pub use desktop::valid_desktop_id;
 mod exec;
-pub use exec::{publishable as exec_spec_is_publishable, ExecRecipe};
+pub use exec::{spec_is_valid as exec_spec_is_valid, ExecRecipe};
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
@@ -145,6 +145,50 @@ pub(crate) fn valid_battlenet_code(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
+/// EA app content id (`1026480`, `Origin.SFT.50.0000123`), interpolated into
+/// `origin2://game/launch/?offerIds=<id>`: alphanumerics, `.`, `_`, `-`.
+pub(crate) fn valid_ea_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Rockstar Games Launcher title id (`gta5`, `rdr2`): the host looks up the launcher and the
+/// title's folder itself, so the plugin supplies only this word.
+pub(crate) fn valid_rockstar_title(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// The title id a Rockstar uninstall entry names: `…\Launcher.exe" -uninstall=gta5` (or
+/// `uninstall.exe`). Anything else is not a Rockstar title.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn rockstar_uninstall_title(uninstall: &str) -> Option<&str> {
+    let lower = uninstall.to_ascii_lowercase();
+    let exe = lower
+        .find("launcher.exe")
+        .or_else(|| lower.find("uninstall.exe"))?;
+    let at = lower[exe..].rfind("uninstall=")? + exe + "uninstall=".len();
+    let title = uninstall[at..].trim().trim_matches('"');
+    valid_rockstar_title(title).then_some(title)
+}
+
+/// `gamebar` exe, spawned as one quoted argv element: drive-rooted, `.exe`, no quote or
+/// control character. The shape only — Windows still runs it only if Game Bar lists it.
+pub(crate) fn valid_gamebar_exe(value: &str) -> bool {
+    let b = value.as_bytes();
+    (8..=1024).contains(&b.len())
+        && b[0].is_ascii_alphabetic()
+        && &b[1..3] == b":\\"
+        && value.to_ascii_lowercase().ends_with(".exe")
+        && !value.chars().any(|c| c == '"' || c.is_control())
+}
+
 /// `launcher_ui` values this OS can open (design D4). One kind; a value names
 /// a UI (`heroic` vs `heroic-console`; Windows `playnite` is Fullscreen).
 ///
@@ -212,6 +256,22 @@ mod tests {
         assert_eq!(id & 0xFFFF_FFFF, 0x0200_0000, "low dword is the marker");
     }
     #[test]
+    fn rockstar_uninstall_entries_name_their_title() {
+        let t = rockstar_uninstall_title;
+        assert_eq!(
+            t(r#""C:\Program Files\Rockstar Games\Launcher\uninstall.exe" -uninstall=gta5"#),
+            Some("gta5")
+        );
+        assert_eq!(
+            t(r#""D:\Rockstar\Launcher\Launcher.exe" -enableFullMode -uninstall=rdr2_gen9"#),
+            Some("rdr2_gen9")
+        );
+        assert_eq!(t(r#""C:\Other\setup.exe" -uninstall=gta5"#), None);
+        assert_eq!(t(r#""C:\R\uninstall.exe" -uninstall=gta5 & calc"#), None);
+        assert_eq!(t(r#""C:\R\Launcher.exe" /S"#), None);
+    }
+
+    #[test]
     fn store_ids_are_charset_guarded() {
         assert!(valid_uplay_id("5595"));
         assert!(!valid_uplay_id(""));
@@ -225,6 +285,20 @@ mod tests {
         assert!(valid_battlenet_code("wow_classic"));
         assert!(!valid_battlenet_code("Pro\" & calc"));
         assert!(!valid_battlenet_code(""));
+        assert!(valid_ea_id("1026480"));
+        assert!(valid_ea_id("Origin.SFT.50.0000123"));
+        assert!(!valid_ea_id("1026480&autoDownload=1"));
+        assert!(!valid_ea_id(""));
+        assert!(valid_rockstar_title("gta5_gen9"));
+        assert!(!valid_rockstar_title("gta5\" -x"));
+        assert!(!valid_rockstar_title(""));
+        assert!(valid_gamebar_exe(r"D:\Games\Jürgen's Game\game.EXE"));
+        assert!(!valid_gamebar_exe(r"\\server\share\game.exe"));
+        assert!(!valid_gamebar_exe(r#"C:\Games\x.exe" --flag"#));
+        assert!(!valid_gamebar_exe(r"C:\Games\x.bat"));
+        assert!(!valid_gamebar_exe("C:\\Games\\a\nb.exe"));
+        assert!(!valid_gamebar_exe(r"C:\.exe"));
+        assert!(!valid_gamebar_exe("game.exe"));
     }
 
     #[test]

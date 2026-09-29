@@ -21,6 +21,12 @@
       "what": "punktfunk/1 QUIC control port",
       "env": "PUNKTFUNK_NATIVE_PORT"
     },
+    "browser": {
+      "port": 9778,
+      "proto": "udp",
+      "what": "browser streaming (preview, off until switched on)",
+      "env": "PUNKTFUNK_WEBTRANSPORT_PORT"
+    },
     "data": {
       "port": null,
       "proto": "udp",
@@ -162,7 +168,7 @@
       "docs": "/docs/nixos",
       "floor": "NixOS with flakes",
       "install": [
-        "# flake input: inputs.punktfunk.url = \"git+https://git.unom.io/unom/punktfunk\";",
+        "# flake input: inputs.punktfunk.url = \"git+https://git.unom.io/unom/punktfunk?ref=nix-stable\";",
         "# then: imports = [ punktfunk.nixosModules.default ]; services.punktfunk.host.enable = true;"
       ]
     },
@@ -174,7 +180,7 @@
       "docs": "/docs/steamos-host",
       "floor": "SteamOS 3",
       "install": [
-        "git clone https://git.unom.io/unom/punktfunk ~/punktfunk",
+        "git clone --branch stable https://git.unom.io/unom/punktfunk ~/punktfunk",
         "bash ~/punktfunk/scripts/steamdeck/install.sh"
       ]
     },
@@ -237,10 +243,11 @@
       "id": "apple-client",
       "name": "iPhone, iPad, Apple TV",
       "installs": "client",
-      "packageManager": "testflight",
+      "packageManager": "appstore",
       "docs": "/docs/install-client#ios-ipados-apple-tv",
       "floor": "iOS, iPadOS and tvOS 17 or newer",
-      "url": "https://testflight.apple.com/join/Qr7uSemk"
+      "url": "https://apps.apple.com/app/id6779991756",
+      "testflight": "https://testflight.apple.com/join/Qr7uSemk"
     },
     {
       "id": "android-client",

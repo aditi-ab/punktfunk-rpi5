@@ -724,10 +724,7 @@ mod tests {
         use cros_codecs::codec::h264::parser::NaluType;
         use cros_codecs::codec::h264::parser::Parser;
 
-        // Shared with pf-bitstream tests; path is relative to this crate.
-        const TEST_25FPS: &[u8] = include_bytes!(
-            "../../pf-bitstream/vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264"
-        );
+        const TEST_25FPS: &[u8] = pf_bitstream::testing::H264_25FPS;
 
         let mut cursor = Cursor::new(TEST_25FPS);
         let mut parser = Parser::default();

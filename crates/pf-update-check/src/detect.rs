@@ -52,6 +52,9 @@ impl Product {
 /// `CHANNEL=stable|canary` for the sysext updater.
 const SYSEXT_CONF: &str = "/etc/punktfunk-sysext.conf";
 
+/// Present on rpm-ostree and bootc boxes.
+pub const OSTREE_BOOTED: &str = "/run/ostree-booted";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallKind {
     WindowsInstaller,
@@ -98,21 +101,40 @@ pub struct Probe {
     pub ostree_booted: bool,
     /// Fed to [`windows_channel_of`].
     pub version: String,
+    /// `.git/HEAD` of the Deck build's checkout ([`SOURCE_CHECKOUT`]). Fed to [`source_channel`].
+    pub source_head: Option<String>,
+}
+
+/// The Deck build's checkout, under `$HOME`.
+pub const SOURCE_CHECKOUT: &str = "punktfunk";
+
+/// A Deck build's channel is the branch its checkout follows: `stable` moves at each announced
+/// release, anything else (`main`, a detached tree) is canary.
+pub fn source_channel(head: Option<&str>) -> Channel {
+    match head.map(str::trim) {
+        Some("ref: refs/heads/stable") => Channel::Stable,
+        _ => Channel::Canary,
+    }
 }
 
 /// Live probe for `product`. Consumers cache [`classify`], not this.
 pub fn gather(product: Product, version: &str) -> Probe {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
     Probe {
         windows: cfg!(target_os = "windows"),
         exe: std::env::current_exe().unwrap_or_default(),
-        home: std::env::var_os("HOME").map(PathBuf::from),
+        source_head: home
+            .as_ref()
+            .filter(|_| product == Product::Host)
+            .and_then(|h| std::fs::read_to_string(h.join(SOURCE_CHECKOUT).join(".git/HEAD")).ok()),
+        home,
         // FLATPAK_ID can be missing after a portal spawn; `/.flatpak-info` still exists.
         flatpak: product == Product::Client
             && (std::env::var_os("FLATPAK_ID").is_some() || Path::new("/.flatpak-info").exists()),
         marker: std::fs::read_to_string(product.marker_path()).ok(),
         sysext: Path::new(product.sysext_marker()).exists(),
         sysext_conf: std::fs::read_to_string(SYSEXT_CONF).ok(),
-        ostree_booted: Path::new("/run/ostree-booted").exists(),
+        ostree_booted: Path::new(OSTREE_BOOTED).exists(),
         version: version.to_string(),
     }
 }
@@ -169,36 +191,44 @@ pub fn classify(p: &Probe, product: Product) -> (InstallKind, Channel) {
             // Only the host has an on-device Deck build (`scripts/steamdeck/update.sh`).
             // A client under $HOME is a private copy — report `source`.
             return match product {
-                Product::Host => (InstallKind::SteamosSource, Channel::Canary),
+                Product::Host => (
+                    InstallKind::SteamosSource,
+                    source_channel(p.source_head.as_deref()),
+                ),
                 Product::Client => (InstallKind::Source, Channel::Stable),
             };
         }
     }
 
-    if let Some(marker) = &p.marker {
-        let mut words = marker.split_whitespace();
-        let kind = words.next().unwrap_or("");
-        let channel = match words.next() {
-            Some("canary") => Channel::Canary,
-            _ => Channel::Stable,
-        };
-        let kind = match kind {
-            "apt" => Some(InstallKind::Apt),
-            // Ostree consumed the RPM by layering; `dnf upgrade` is not the update path.
-            "dnf" if p.ostree_booted => Some(InstallKind::RpmOstree),
-            "dnf" => Some(InstallKind::Dnf),
-            "pacman" => Some(InstallKind::Pacman),
-            _ => None,
-        };
-        if let Some(kind) = kind {
-            return (kind, channel);
-        }
-    }
+    p.marker
+        .as_deref()
+        .and_then(|m| parse_marker(m, p.ostree_booted))
+        .unwrap_or((InstallKind::Source, Channel::Stable))
+}
 
-    (InstallKind::Source, Channel::Stable)
+/// A [`Product::marker_path`] file: kind, then an optional channel. `None` for a kind no
+/// package manager delivers. The root helper reads the kind through this too.
+pub fn parse_marker(text: &str, ostree_booted: bool) -> Option<(InstallKind, Channel)> {
+    let mut words = text.split_whitespace();
+    let kind = match words.next()? {
+        "apt" => InstallKind::Apt,
+        // Ostree consumed the RPM by layering; `dnf upgrade` is not the update path.
+        "dnf" if ostree_booted => InstallKind::RpmOstree,
+        "dnf" => InstallKind::Dnf,
+        "pacman" => InstallKind::Pacman,
+        _ => return None,
+    };
+    let channel = match words.next() {
+        Some("canary") => Channel::Canary,
+        _ => Channel::Stable,
+    };
+    Some((kind, channel))
 }
 
 /// One-line, copy-pastable "how to update" hint. No placeholders.
+///
+/// The apt and dnf hints upgrade every installed `punktfunk*` package, the set pf-update's
+/// one-click apply upgrades, so the console and plugin runner move with the host.
 pub fn update_command(kind: InstallKind, product: Product) -> String {
     let bin = product.binary();
     match (kind, product) {
@@ -220,10 +250,9 @@ pub fn update_command(kind: InstallKind, product: Product) -> String {
             format!("sudo rpm-ostree update --uninstall {bin} --install {bin}   (staged; reboot to finish)")
         }
         (InstallKind::Apt, _) => {
-            format!("sudo apt update && sudo apt install --only-upgrade {bin}")
+            r"sudo apt update && sudo apt install --only-upgrade $(dpkg-query -W -f='${Package}\n' 'punktfunk*')".into()
         }
-        (InstallKind::Dnf, Product::Host) => "sudo dnf upgrade punktfunk".into(),
-        (InstallKind::Dnf, Product::Client) => "sudo dnf upgrade punktfunk-client".into(),
+        (InstallKind::Dnf, _) => "sudo dnf upgrade 'punktfunk*'".into(),
         (InstallKind::Pacman, _) => "sudo pacman -Syu".into(),
         (InstallKind::SteamosSource, _) => {
             "bash ~/punktfunk/scripts/steamdeck/update.sh --pull".into()
@@ -294,6 +323,29 @@ mod tests {
     }
 
     #[test]
+    fn a_deck_build_follows_the_branch_its_checkout_tracks() {
+        let mut p = host_probe();
+        p.exe = PathBuf::from("/home/deck/punktfunk/target-steamos/release/punktfunk-host");
+        for (head, channel) in [
+            (Some("ref: refs/heads/stable\n"), Channel::Stable),
+            (Some("ref: refs/heads/main\n"), Channel::Canary),
+            // A tree checked out at a tag by hand pulls nothing, so it is not on stable.
+            (
+                Some("169730fe73000f4e71411af65e24c82324af8ccb\n"),
+                Channel::Canary,
+            ),
+            (None, Channel::Canary),
+        ] {
+            p.source_head = head.map(str::to_string);
+            assert_eq!(
+                classify(&p, Product::Host),
+                (InstallKind::SteamosSource, channel),
+                "{head:?}"
+            );
+        }
+    }
+
+    #[test]
     fn ladder_user_owned_client_is_plain_source() {
         let mut p = probe("/home/deck/.local/bin/punktfunk-client");
         p.marker = None;
@@ -317,6 +369,14 @@ mod tests {
                 (kind, channel),
                 "marker `{marker}`"
             );
+        }
+    }
+
+    /// The root helper refuses what this returns `None` for.
+    #[test]
+    fn a_marker_without_a_package_manager_parses_as_none() {
+        for marker in ["", "snap stable", "sysext", "nix"] {
+            assert_eq!(parse_marker(marker, false), None, "marker `{marker}`");
         }
     }
 
@@ -356,9 +416,17 @@ mod tests {
     }
 
     #[test]
-    fn hints_are_product_specific() {
-        assert!(update_command(InstallKind::Apt, Product::Client).contains("punktfunk-client"));
-        assert!(update_command(InstallKind::Apt, Product::Host).contains("punktfunk-host"));
+    fn package_hints_upgrade_every_installed_punktfunk_package() {
+        for product in [Product::Host, Product::Client] {
+            assert_eq!(
+                update_command(InstallKind::Apt, product),
+                r"sudo apt update && sudo apt install --only-upgrade $(dpkg-query -W -f='${Package}\n' 'punktfunk*')"
+            );
+            assert_eq!(
+                update_command(InstallKind::Dnf, product),
+                "sudo dnf upgrade 'punktfunk*'"
+            );
+        }
         assert!(update_command(InstallKind::Flatpak, Product::Client).contains("flatpak update"));
     }
 }

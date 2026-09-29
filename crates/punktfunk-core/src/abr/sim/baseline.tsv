@@ -8,7 +8,7 @@ lte_variable	59	3	33	2600	245	0	0	1000	0597f7ec
 shared_two_auto	1	3	0	4	28	0	0	1000	daa667a5
 shared_newcomer	0	1	8	0	40	0	0	895	0ab5e4f6
 shared_fixed_plus_auto	0	1	16	0	84	0	0	998	c5474d1b
-shared_idle_lender	1	3	4	4	31	0	0	956	36e59f08
+shared_idle_lender	1	3	8	4	36	0	0	999	73044534
 shared_leaver	1	3	0	4	28	0	0	971	8146ca5d
 gpu_saturated	0	3	32	0	5	0	0	1000	ef7d422a
 static_then_motion	0	1	0	0	5	0	0	1000	c74cf3dd
@@ -52,5 +52,10 @@ host_rebuild_stall_legacy	0	1	15	0	2	0	0	1000	325d140c
 decoder_knee_legacy	0	99999	12	0	3	0	0	1000	f43012d4
 unknown_refresh_knee_legacy	0	99999	25	0	1	0	0	1000	af8cb644
 idle_then_motion_legacy	0	11	0	6	4	0	0	1000	74053aa3
-pyrowave_pin_fit	0	2	0	0	5	0	0	1000	811c9dc5
+pyrowave_pin_fit	0	1	0	0	5	0	0	1000	811c9dc5
 pyrowave_pin_holds	0	1	0	0	1	0	0	1000	811c9dc5
+calm_desktop_lossy	0	3	0	15	5	0	0	1000	ea6b71af
+wan_lone_loss_nack	0	3	5	17	40	0	0	1000	23629498
+wan_lone_loss_ack	0	3	4	11	38	0	0	1000	b1aeb373
+wan_wg_12_nack	0	3	0	0	31	0	0	1000	6edcf0ca
+wan_wg_12_ack	0	3	0	0	31	0	0	1000	6edcf0ca

@@ -6,7 +6,7 @@ import PackageDescription
 
 let package = Package(
     name: "PunktfunkKit",
-    platforms: [.macOS(.v14), .iOS(.v17), .tvOS(.v17)],
+    platforms: [.macOS(.v14), .iOS(.v17), .tvOS(.v17), .visionOS("26.0")],
     products: [
         .library(name: "PunktfunkKit", targets: ["PunktfunkKit"]),
         // Dependency-free foundation (stored-host model + JSON codec, settings keys, App-Group
@@ -17,12 +17,8 @@ let package = Package(
         .executable(name: "PunktfunkClient", targets: ["PunktfunkClient"]),
     ],
     dependencies: [
-        // Progressive (gradient) backdrop blur for the form screens' trays — a real blur with no
-        // material tint stage (see GamepadTrayBlur). Pinned by REVISION, not `from:`: the
-        // GlurBackdrop product exists only on main — no release carries it (the newest tag,
-        // `1.1`, predates it, and is not three-component semver anyway, so version-based
-        // resolution stops at 1.0.4). The revision is main's head at adoption time; a revision
-        // pin stays reproducible when the branch moves.
+        // Progressive backdrop blur with no material tint; `pf-console-ui`'s `blur.rs` follows it.
+        // Pinned by revision: GlurBackdrop exists only on main, and no tagged release carries it.
         .package(
             url: "https://github.com/joogps/Glur.git",
             revision: "ba4f05d3c9a608ec773b9305f2af6089390de68a"),
@@ -60,6 +56,15 @@ let package = Package(
                 .linkedFramework("Security"),
                 .linkedFramework("SystemConfiguration"),
                 .linkedLibrary("resolv"),
+                // Skia, for the console (clients/apple/native).
+                .linkedLibrary("c++"),
+                .linkedFramework("Metal"),
+                .linkedFramework("CoreText"),
+                .linkedFramework("CoreGraphics"),
+                .linkedFramework("ImageIO"),
+                .linkedFramework("ApplicationServices", .when(platforms: [.macOS])),
+                .linkedFramework("UIKit", .when(platforms: [.iOS, .tvOS, .visionOS])),
+                .linkedFramework("MobileCoreServices", .when(platforms: [.iOS, .tvOS, .visionOS])),
             ]
         ),
         // Development app shell (swift run PunktfunkClient): connect form → stream + input.

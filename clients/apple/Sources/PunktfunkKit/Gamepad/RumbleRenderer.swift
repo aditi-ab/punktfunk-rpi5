@@ -444,12 +444,19 @@ final class RumbleRenderer: @unchecked Sendable {
 
     /// The ticker runs only while something needs tending — any nonzero target (watchdog,
     /// throttle catch-up, HID keepalive, post-reset engine rebuild) or segments still alive.
+    /// A pad with nothing to drive has nothing to tend, whatever the target.
     private func updateTicker() {
-        let needed = target != (0, 0, 0, 0)
+        #if os(macOS)
+        let inert = broken && dualSenseHID == nil
+        #else
+        let inert = broken
+        #endif
+        let audible = target != (0, 0, 0, 0)
             || low?.current != nil || low?.retiring != nil
             || high?.current != nil || high?.retiring != nil
             || leftTrigger?.current != nil || leftTrigger?.retiring != nil
             || rightTrigger?.current != nil || rightTrigger?.retiring != nil
+        let needed = audible && !inert
         if needed, ticker == nil {
             let t = DispatchSource.makeTimerSource(queue: queue)
             t.schedule(
@@ -558,7 +565,7 @@ final class RumbleRenderer: @unchecked Sendable {
     /// iPhone has one — everything else (iPad, Mac, TV) reports no haptic hardware and latches
     /// off (nothing to retry; the settings toggle is hidden there anyway, this is the backstop).
     private func setupDevice() {
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         guard CHHapticEngine.capabilitiesForHardware().supportsHaptics else {
             log.info("rumble: this device has no haptic actuator — device rumble unavailable")
             broken = true
@@ -647,6 +654,13 @@ final class RumbleRenderer: @unchecked Sendable {
     // On macOS the DualSense's motors aren't reachable through CHHapticEngine, so for a DualSense
     // we drive them over raw HID (see `DualSenseHID`); every other pad keeps the CoreHaptics path.
     // Runs on the serial `queue`, like the rest of the renderer state.
+
+    /// Set a DualSense's mic-mute LED over raw HID (macOS); a no-op for any other pad.
+    func setMicLED(_ mode: UInt8) {
+        #if os(macOS)
+        queue.async { self.dualSenseHID?.micLED(mode: mode) }
+        #endif
+    }
 
     private func openHIDIfDualSense(_ c: GCController?) -> Bool {
         #if os(macOS)

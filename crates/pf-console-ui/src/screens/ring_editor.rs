@@ -11,7 +11,7 @@ use crate::glyphs::{Hint, HintKey};
 use crate::pointer::{Pointer, PointerKind};
 use crate::ring::{EditEvent, Ring, LABEL_H};
 use crate::screens::{Ctx, Outbox, Screen};
-use crate::theme::{card_face, fg, fill, focus_halo, stroke, Fonts, EDGE_INSET, W};
+use crate::theme::{card_face, edge, fg, fill, focus_halo, stroke, Fonts};
 use crate::widgets::{ListMsg, MenuList, RowSpec, ROW_MAX_W};
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
 use pf_client_core::overlay_actions::{
@@ -39,7 +39,10 @@ pub(crate) fn ring_platform(platform: crate::platform::Platform) -> RingPlatform
         crate::platform::Platform::Desktop | crate::platform::Platform::Web => {
             RingPlatform::Desktop
         }
-        crate::platform::Platform::Android => RingPlatform::Touch,
+        // Glass either way: a phone or iPad's screen, and the Siri Remote's trackpad.
+        crate::platform::Platform::Android | crate::platform::Platform::Apple => {
+            RingPlatform::Touch
+        }
         // Not `Touch`: the TV's ring is driven by a pad or the remote's D-pad, so it wants the
         // keyboard/pad default blob. The Magic Remote is a pointer, but it never makes the
         // ring a touch surface.
@@ -85,8 +88,8 @@ impl RingEditorScreen {
     pub(crate) fn new(ctx: &Ctx) -> RingEditorScreen {
         let mut s = RingEditorScreen {
             ring: Ring::new(),
-            cfg: OverlayConfig::platform_default(ring_platform(ctx.platform)),
-            platform: ctx.platform,
+            cfg: OverlayConfig::platform_default(ring_platform(ctx.device.platform)),
+            platform: ctx.device.platform,
             blob: String::new(),
             list: MenuList::new(),
             focus: Focus::Ring,
@@ -98,7 +101,7 @@ impl RingEditorScreen {
             swallow_move: false,
         };
         s.ring.edit_at(0.0, 0.0);
-        s.adopt(&ctx.settings.overlay_actions, ctx.platform);
+        s.adopt(&ctx.settings.overlay_actions, ctx.device.platform);
         s
     }
 
@@ -130,13 +133,14 @@ impl RingEditorScreen {
         });
     }
 
-    /// Whole-file writer: rebase on a fresh load so a concurrent save is not reverted.
+    /// Stores `blob` as the ring and adopts it.
     fn write(&mut self, blob: String, ctx: &mut Ctx) {
-        *ctx.settings = ctx.store.load();
-        ctx.settings.overlay_actions = blob;
-        ctx.store.save(ctx.settings);
+        ctx.write(|c| {
+            c.settings.overlay_actions = blob;
+            true
+        });
         let b = ctx.settings.overlay_actions.clone();
-        self.adopt(&b, ctx.platform);
+        self.adopt(&b, ctx.device.platform);
     }
 
     fn pick(&mut self, slot: usize, id: &str, ctx: &mut Ctx) {
@@ -159,6 +163,14 @@ impl RingEditorScreen {
     fn reset(&mut self, ctx: &mut Ctx, fx: &mut Outbox) {
         self.write(String::new(), ctx);
         fx.toast = Some("Quick actions reset".into());
+    }
+
+    /// The picker's list while it is open, else the slot list.
+    pub(super) fn pan_list(&mut self) -> &mut MenuList {
+        match &mut self.picker {
+            Some(pk) => &mut pk.list,
+            None => &mut self.list,
+        }
     }
 
     fn open_picker(&mut self, slot: usize) {
@@ -446,20 +458,17 @@ impl RingEditorScreen {
     ) {
         if ctx.settings.overlay_actions != self.blob {
             let b = ctx.settings.overlay_actions.clone();
-            self.adopt(&b, ctx.platform);
+            self.adopt(&b, ctx.device.platform);
         }
         self.ring.tick();
         let kf = k as f32;
-        fonts.leading(
+        crate::widgets::blurb(
             canvas,
+            fonts,
             "Point the stick at a button; A changes it. Y lifts a button and A drops it on \
              another to swap; with a pointer, click or drag.",
-            W::Regular,
-            13.0 * k,
-            fg(0.55),
-            f64::from(rect.left) + EDGE_INSET * k,
-            f64::from(rect.top) + 2.0 * k,
-            ROW_MAX_W * 0.9 * k,
+            rect,
+            k,
         );
 
         // Side-by-side when stacked fit would shrink the ring below 0.75 and width
@@ -477,7 +486,7 @@ impl RingEditorScreen {
         };
         let rk = kf * fit;
         let stage_x = if side {
-            rect.left + (EDGE_INSET * k) as f32
+            rect.left + (edge(k)) as f32
         } else {
             rect.center_x() - stage_w / 2.0
         };

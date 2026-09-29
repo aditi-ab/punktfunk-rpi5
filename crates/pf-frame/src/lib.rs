@@ -6,9 +6,11 @@
 //! [`pf_zerocopy::DeviceBuffer`], `FramePayload::D3d11` a [`dxgi::D3d11Frame`].
 //!
 //! Same seam: [`hdr`] (HDR10 static metadata / SEI), [`metronome`] (periodic-stall
-//! detector), [`thread_qos`], [`session_tuning`], and on Windows [`dxgi`] (capture
-//! identity + D3D11 device).
+//! detector), [`thread_qos`], [`session_tuning`], [`cursor_mode`] (ScreenCast cursor
+//! ladder), and on Windows [`dxgi`] (capture identity + D3D11 device) and [`privilege`]
+//! (token privileges).
 
+pub mod cursor_mode;
 pub mod hdr;
 pub use hdr::HdrMeta;
 pub mod health;
@@ -19,6 +21,8 @@ pub mod thread_qos;
 
 #[cfg(target_os = "windows")]
 pub mod dxgi;
+#[cfg(target_os = "windows")]
+pub mod privilege;
 
 /// Capture negotiates this; the encoder maps to an NVENC input (`rgb0`/`bgr0`/`rgba`/`bgra`)
 /// and expands 3→4 bytes when needed. No host-side colour conversion.
@@ -72,6 +76,28 @@ impl PixelFormat {
     /// HDR metadata key on this, not on the packed-RGB layout.
     pub fn is_hdr(self) -> bool {
         self.is_hdr_rgb10() || self == PixelFormat::P010
+    }
+}
+
+#[cfg(test)]
+mod cursor_crop_tests {
+    use super::{crop_cursor_rgba, CURSOR_OVERLAY_MAX};
+
+    #[test]
+    fn an_oversized_cursor_keeps_its_top_left_rows_unsheared() {
+        let (w, h) = (CURSOR_OVERLAY_MAX + 32, 3);
+        let rgba: Vec<u8> = (0..w * h).flat_map(|i| i.to_le_bytes()).collect();
+        let (out, cw, ch) = crop_cursor_rgba(rgba, w, h);
+        assert_eq!((cw, ch), (CURSOR_OVERLAY_MAX, 3));
+        assert_eq!(out.len(), (cw * ch * 4) as usize);
+        // Row 1 starts at source pixel `w`, not at the byte after row 0's crop.
+        assert_eq!(out[(cw * 4) as usize..][..4], w.to_le_bytes());
+    }
+
+    #[test]
+    fn a_cursor_within_the_cap_passes_through() {
+        let rgba = vec![7u8; 32 * 32 * 4];
+        assert_eq!(crop_cursor_rgba(rgba.clone(), 32, 32), (rgba, 32, 32));
     }
 }
 
@@ -192,6 +218,27 @@ pub struct CursorOverlay {
     /// Compositor pointer visibility. `false` = host app hid the pointer. The encode loop
     /// strips invisible overlays before any blend, so encoders may treat `Some` as "draw it".
     pub visible: bool,
+}
+
+/// Side of every encoder's cursor texture. The blends upload it as one contiguous block, so a
+/// wider bitmap must be cut down before it becomes an overlay ([`crop_cursor_rgba`]).
+pub const CURSOR_OVERLAY_MAX: u32 = 256;
+
+/// `rgba` (`w`×`h`, 4 bytes a pixel) cut to its top-left [`CURSOR_OVERLAY_MAX`] square. The
+/// top-left and the hotspot stay put; only pixels past the cap are lost.
+pub fn crop_cursor_rgba(rgba: Vec<u8>, w: u32, h: u32) -> (Vec<u8>, u32, u32) {
+    let (cw, ch) = (w.min(CURSOR_OVERLAY_MAX), h.min(CURSOR_OVERLAY_MAX));
+    if (cw, ch) == (w, h) {
+        return (rgba, w, h);
+    }
+    let (row, src_row) = (cw as usize * 4, w as usize * 4);
+    let out = rgba
+        .chunks_exact(src_row)
+        .take(ch as usize)
+        .flat_map(|r| &r[..row])
+        .copied()
+        .collect();
+    (out, cw, ch)
 }
 
 impl CursorOverlay {

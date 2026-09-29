@@ -3,7 +3,8 @@
 //
 // Names come from the host's own `BUTTON_MAP` (pf-inject `linux/gamepad.rs`), so a line here
 // reads the way the same press reads in an evdev dump. A wire bit with no evdev counterpart
-// (the D-pad, which the uinput pad emits as a hat) keeps its wire name.
+// (the D-pad, which the uinput pad emits as a hat) keeps its wire name. Both tables are
+// pinned by `crates/punktfunk-core/testdata/gamepad-button-vectors.json`.
 
 import type { PadFrame } from "@/api/gen/model/padFrame";
 
@@ -50,8 +51,8 @@ export const BUTTON_NAMES: readonly (readonly [number, string])[] = [
 	[BIT.DPAD_LEFT, "BTN_DPAD_LEFT"],
 	[BIT.DPAD_RIGHT, "BTN_DPAD_RIGHT"],
 	[BIT.PADDLE1, "BTN_TRIGGER_HAPPY5"],
-	[BIT.PADDLE2, "BTN_TRIGGER_HAPPY6"],
-	[BIT.PADDLE3, "BTN_TRIGGER_HAPPY7"],
+	[BIT.PADDLE2, "BTN_TRIGGER_HAPPY7"],
+	[BIT.PADDLE3, "BTN_TRIGGER_HAPPY6"],
 	[BIT.PADDLE4, "BTN_TRIGGER_HAPPY8"],
 	[BIT.TOUCHPAD, "BTN_TOUCHPAD"],
 	[BIT.MISC1, "BTN_MISC1"],
@@ -184,7 +185,14 @@ export function familyOf(device: string): PadFamily {
 	if (device.startsWith("dualsense") || device.startsWith("dualshock"))
 		return "playstation";
 	if (device.startsWith("steam")) return "steam";
-	if (device === "switchpro") return "switch";
+	// The 8BitDo Pro pads carry Nintendo labels.
+	if (
+		device === "switchpro" ||
+		device === "joyconpair" ||
+		device.startsWith("switch2") ||
+		device.startsWith("8bitdopro")
+	)
+		return "switch";
 	return "xbox";
 }
 

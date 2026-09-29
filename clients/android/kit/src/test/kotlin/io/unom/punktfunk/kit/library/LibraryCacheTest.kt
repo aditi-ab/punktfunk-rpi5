@@ -19,6 +19,7 @@ class LibraryCacheTest {
             developer = "Nintendo",
             releaseYear = 1992,
             genres = listOf("Racing"),
+            stats = GameStats(lastPlayedUnixMs = 1_757_160_000_000, playTimeMs = 5_400_000, launchCount = 12),
         )
         cache.store("host", listOf(game))
         assertEquals(listOf(game), cache.load("host")?.games)

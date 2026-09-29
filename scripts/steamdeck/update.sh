@@ -5,6 +5,9 @@
 #   bash scripts/steamdeck/update.sh           # rebuild host (+web if installed) and restart
 #   bash scripts/steamdeck/update.sh --pull    # `git pull` first (if the source is a git checkout)
 #
+# The branch the checkout follows is its channel: `stable` moves at each release, `main` is canary.
+# Switch with the guided installer's --channel, or `git switch <branch>` then --pull.
+#
 set -euo pipefail
 log()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m  ok\033[0m %s\n' "$*"; }
@@ -33,20 +36,13 @@ WEB=0; [ -f "$HOME/.config/systemd/user/punktfunk-web.service" ] && WEB=1
 
 if [ "${1:-}" = "--pull" ]; then
     [ -d "$SRC/.git" ] || die "$SRC is not a git checkout — rsync new source then run without --pull"
-    # web/bun.nix and sdk/bun.nix are GENERATED (bun2nix, a pure function of the matching bun.lock —
-    # packaging/nix/README.md) yet COMMITTED, because the Nix build fetches node_modules only from
-    # them. Until the --ignore-scripts fix below, web's `bun install` here ran its `postinstall`
-    # (`bun2nix -o bun.nix`) and rewrote that tracked file on every single update. That is invisible
-    # while the committed file is in sync — but main carried a STALE web/bun.nix from 1db8f763 to
-    # b79d90b4, so any Deck updated in that window had the file rewritten to the *correct* content
-    # and has been sitting dirty ever since. The next `git pull --ff-only` that touches it then dies
-    # with "Your local changes to the following files would be overwritten by merge", and the update
-    # stops before a single service is restarted.
-    #
-    # Restore ONLY these two derived paths. Not a blanket `git reset --hard`: $SRC is the operator's
-    # own checkout (they may have patched a source file, or be carrying a cherry-pick), and silently
-    # deleting that to save an update is a far worse trade than one legible error. Discarding these
-    # two is provably lossless — regenerating them from the lockfiles is exactly what bun2nix does.
+    git -C "$SRC" symbolic-ref -q HEAD >/dev/null \
+        || die "$SRC isn't on a branch, so there is nothing to pull. Pick a channel, then re-run:
+  git -C $SRC fetch && git -C $SRC switch stable   # releases
+  git -C $SRC fetch && git -C $SRC switch main     # canary"
+    # A build regenerates these committed files (bun2nix). When main carries a stale copy, the
+    # rebuild dirties it and the next pull that touches it aborts. Restoring derived paths is
+    # lossless. Not `reset --hard`: this is the operator's own checkout.
     git -C "$SRC" checkout -- web/bun.nix sdk/bun.nix 2>/dev/null || true
     log "git pull"
     git -C "$SRC" pull --ff-only \
@@ -54,15 +50,12 @@ if [ "${1:-}" = "--pull" ]; then
   has local changes: review them with 'git -C $SRC status', then commit or stash them (or discard
   one with 'git -C $SRC checkout -- <file>') and re-run. Nothing was rebuilt or restarted."
     ok "pulled"
+    # Bash keeps running the text it read before the pull. Build with the pulled tree's recipe.
+    PUNKTFUNK_SRC="$SRC" PUNKTFUNK_BOX="$BOX" exec bash "$SRC/scripts/steamdeck/update.sh"
 fi
 
-# The console tells one build from the next by its version string alone. Without the commit
-# every rebuild reports the same X.Y.Z, and a finished update reads as "nothing newer".
-# An empty value is ignored by the build script, which falls back to the Cargo version.
-PF_BASE="$(sed -n 's/^version = "\(.*\)"/\1/p' "$SRC/Cargo.toml" | head -1)"
-PF_SHA="$(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || true)"
-PF_BUILD_VERSION=""
-[ -z "$PF_BASE" ] || [ -z "$PF_SHA" ] || PF_BUILD_VERSION="$PF_BASE+g$PF_SHA"
+# The version the console shows, in the same scheme as this channel's feed (build-version.sh).
+PF_BUILD_VERSION="$(bash "$SRC/scripts/steamdeck/build-version.sh" "$SRC")"
 
 log "Rebuilding host (release)"
 # nvenc,vulkan-encode matches the packaged builds (deb/arch) — see install.sh.
@@ -266,6 +259,19 @@ if [ ! -s "$GRANT_DST" ] && [ -s "$GRANT_SRC" ]; then
     mkdir -p "$(dirname "$GRANT_DST")"
     install -m644 "$GRANT_SRC" "$GRANT_DST"
     ok "seeded KDE RemoteDesktop grant (Desktop-mode input)"
+fi
+
+# GameStream is the console's setting; a unit flag locks its toggle. An older install's
+# --gamestream moves into the store and stays on.
+HOST_UNIT="$HOME/.config/systemd/user/punktfunk-host.service"
+if grep -qs -- '^ExecStart=.* --gamestream' "$HOST_UNIT"; then
+    if "$BIN" settings set gamestream true >/dev/null; then
+        sed -i '/^ExecStart=/s/ --gamestream//' "$HOST_UNIT"
+        systemctl --user daemon-reload
+        ok "GameStream moved to the console's Host settings (still on)"
+    else
+        warn "GameStream stays pinned in $HOST_UNIT, so the console can't change it"
+    fi
 fi
 
 log "Restarting services"

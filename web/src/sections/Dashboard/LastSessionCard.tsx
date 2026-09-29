@@ -4,9 +4,8 @@ import type { SessionSummary } from "@/api/gen/model/sessionSummary";
 import { useGetRecentSessions } from "@/api/gen/session/session";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { fmtNumber } from "@/lib/format";
+import { fmtClockDuration, fmtNumber } from "@/lib/format";
 import { m } from "@/paraglide/messages";
-import { formatUptime } from "./SessionList";
 
 /**
  * What the session that just finished came to — the numbers the host has always written to
@@ -55,7 +54,7 @@ export const LastSession: FC<{ session?: SessionSummary }> = ({ session }) => {
 	// a single number that moved all session is the one thing worth not printing.
 	const span = session.bitrate;
 	const facts = [
-		formatUptime(session.duration_s),
+		fmtClockDuration(session.duration_s, { hours: true }),
 		session.mode,
 		`${session.codec.toUpperCase()} ${session.bit_depth}-bit ${session.chroma}`,
 		span

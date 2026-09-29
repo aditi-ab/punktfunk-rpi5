@@ -1,5 +1,6 @@
 package io.unom.punktfunk.console
 
+import android.os.Vibrator
 import android.view.InputDevice
 import io.unom.punktfunk.HostActions
 import io.unom.punktfunk.Settings
@@ -12,6 +13,8 @@ import io.unom.punktfunk.kit.library.DEFAULT_MGMT_PORT
 import io.unom.punktfunk.kit.library.GameEntry
 import io.unom.punktfunk.kit.library.RunningGame
 import io.unom.punktfunk.kit.security.KnownHost
+import io.unom.punktfunk.deviceDetail
+import io.unom.punktfunk.matches
 import io.unom.punktfunk.padInfoOf
 import org.json.JSONArray
 import org.json.JSONObject
@@ -28,6 +31,15 @@ internal object ConsoleJson {
     /** `HostRow.key` — the pinned fingerprint when there is one, else `addr:port` (Rust parity). */
     fun rowKey(fpHex: String, address: String, port: Int): String =
         if (fpHex.isEmpty()) "$address:$port" else fpHex
+
+    /**
+     * A pinned card's `HostRow.key`: the host's [rowKey], a NUL, then the preset id. Pinned by
+     * `pinned_key` in `clients/shared/console-vectors.json`, which the console splits back.
+     */
+    fun pinnedKey(key: String, presetId: String): String = "$key\u0000$presetId"
+
+    /** The host half of a row key: a pinned card's key without its preset id. */
+    fun hostKey(key: String): String = key.substringBefore('\u0000')
 
     private fun presetChip(p: StreamPreset): JSONObject = JSONObject()
         .put("id", p.id)
@@ -54,10 +66,10 @@ internal object ConsoleJson {
     }
 
     /**
-     * The home carousel: saved hosts (name order — Android records carry no last-used time),
-     * each followed by its pinned preset cards, then discovered-but-unsaved hosts. Mirrors
-     * `clients/session/src/console.rs::rows()` — the desktop service's ordering — so a
-     * player who moves between a Deck and a phone finds the same carousel.
+     * The home carousel: saved hosts in the order they were added, each followed by its pinned
+     * preset cards, then discovered-but-unsaved hosts by name. The console applies the player's
+     * sort on top. The desktop and Apple producers send the same rows;
+     * `clients/shared/host-row-vectors.json` holds all three to it.
      */
     fun hostRows(
         saved: List<KnownHost>,
@@ -73,13 +85,11 @@ internal object ConsoleJson {
         running: Map<String, String> = emptyMap(),
     ): String {
         val out = JSONArray()
-        fun advertFor(h: KnownHost): DiscoveredHost? = discovered.firstOrNull { d ->
-            (h.fpHex.isNotEmpty() && d.fingerprint.equals(h.fpHex, ignoreCase = true)) ||
-                (d.host == h.address && d.port == h.port)
-        }
-        for (h in saved.sortedBy { it.name.lowercase() }) {
+        // The store keeps no insertion order; an undated record predates the stamp, so it
+        // goes first and keeps the order it came in.
+        for (h in saved.sortedWith(compareBy(nullsFirst<Long>()) { it.addedAt })) {
             val key = rowKey(h.fpHex, h.address, h.port)
-            val advert = advertFor(h)
+            val advert = discovered.firstOrNull { h.matches(it) }
             // Presence is the probe alone, by record id. An advert only says where to look: a
             // suspending host sends no mDNS goodbye, so its record lingers for up to 75 minutes —
             // long enough to keep the pip green and, since `can_wake` reads `!online`, the Wake
@@ -98,7 +108,7 @@ internal object ConsoleJson {
                 .put("mgmt_port", advert?.mgmtPort ?: h.mgmtPort ?: DEFAULT_MGMT_PORT)
                 .put("can_wake", !online && h.mac.isNotEmpty())
                 .put("clipboard_sync", h.clipboardSync)
-                .put("last_used", JSONObject.NULL)
+                .put("last_used", h.lastUsed ?: JSONObject.NULL)
                 .put("os", advert?.os?.takeIf { it.isNotEmpty() } ?: h.os)
                 .put("actions", actionRows(hostActions[h.fpHex]))
                 .put("pin", JSONObject.NULL)
@@ -112,24 +122,19 @@ internal object ConsoleJson {
                 // inherit the map — a card is the same host's shelf.
                 .put("game_presets", JSONObject(h.gamePresets))
             out.put(base)
-            // A pinned card shares the primary tile's live state; its key rides the preset id
-            // behind a NUL (impossible in a fingerprint or `addr:port`) — Rust parity.
-            for (pid in h.pinnedPresetIds) {
+            // A pinned card shares the primary tile's live state under its own key.
+            for (pid in h.pinnedPresetIds.distinct()) {
                 val p = presets.firstOrNull { it.id == pid } ?: continue
                 out.put(
                     JSONObject(base.toString())
-                        .put("key", "$key\u0000${p.id}")
+                        .put("key", pinnedKey(key, p.id))
                         .put("pin", presetChip(p))
                         .put("bound_preset", JSONObject.NULL),
                 )
             }
         }
-        val extra = discovered.filter { d ->
-            saved.none { h ->
-                (h.fpHex.isNotEmpty() && h.fpHex.equals(d.fingerprint, ignoreCase = true)) ||
-                    (h.address == d.host && h.port == d.port)
-            }
-        }.sortedBy { it.name.lowercase() }
+        val extra = discovered.filter { d -> saved.none { it.matches(d) } }
+            .sortedBy { it.name.lowercase() }
         for (d in extra) {
             val fp = d.fingerprint.orEmpty()
             out.put(
@@ -160,7 +165,7 @@ internal object ConsoleJson {
     fun hostRow(h: KnownHost, pin: StreamPreset?, presets: List<StreamPreset>): JSONObject {
         val key = rowKey(h.fpHex, h.address, h.port)
         return JSONObject()
-            .put("key", if (pin == null) key else "$key\u0000${pin.id}")
+            .put("key", if (pin == null) key else pinnedKey(key, pin.id))
             .put("id", h.id)
                 .put("name", h.name.ifBlank { h.address })
             .put("addr", h.address)
@@ -172,7 +177,7 @@ internal object ConsoleJson {
             .put("mgmt_port", h.mgmtPort ?: DEFAULT_MGMT_PORT)
             .put("can_wake", false)
             .put("clipboard_sync", h.clipboardSync)
-            .put("last_used", JSONObject.NULL)
+            .put("last_used", h.lastUsed ?: JSONObject.NULL)
             .put("os", h.os)
             .put("pin", pin?.let(::presetChip) ?: JSONObject.NULL)
             .put(
@@ -247,7 +252,10 @@ internal object ConsoleJson {
 
     // ---- library ------------------------------------------------------------------------------
 
-    /** `[LibraryGame]` from the Kotlin catalog — the desktop service's `to_model` mapping. */
+    /**
+     * `[LibraryGame]` from the Kotlin catalog — the desktop service's `to_model` mapping.
+     * Without `stats` the Recent and Most played sorts fall back to host order.
+     */
     fun libraryGames(games: List<GameEntry>): String {
         val out = JSONArray()
         for (g in games) {
@@ -262,6 +270,7 @@ internal object ConsoleJson {
                     .put("developer", g.developer ?: JSONObject.NULL)
                     .put("year", g.releaseYear ?: JSONObject.NULL)
                     .put("genres", JSONArray(g.genres))
+                    .put("stats", g.stats?.toJson() ?: JSONObject.NULL)
                     .put("running", false),
             )
         }
@@ -289,7 +298,7 @@ internal object ConsoleJson {
             val id = g.appId ?: continue
             out.put(
                 JSONObject().put("app_id", id).put("state", g.state)
-                    .put("awaiting_window", g.awaitingWindow),
+                    .put("awaiting_window", g.awaitingWindow).put("endable", g.endable),
             )
         }
         return out.toString()
@@ -315,7 +324,7 @@ internal object ConsoleJson {
      * `{"label", "pref", "pads": [...]}` — the controller chip's text (the driving pad's name),
      * the glyph style's pref byte, and one entry per connected pad for the settings rows and the
      * console's Connected-controllers screen. [extras] are appended, and the first one names the
-     * chip when no `InputDevice` drives it.
+     * chip when no `InputDevice` drives it. [body] is this device's own vibrator.
      *
      * `detail`/`forwarded`/`rumble` come straight from [padInfoOf], the same reader the touch
      * Controllers screen renders from: the support answer a user gets must not depend on which
@@ -325,10 +334,12 @@ internal object ConsoleJson {
         pads: List<InputDevice>,
         driving: InputDevice?,
         extras: List<ExtraPad> = emptyList(),
+        body: Vibrator? = null,
+        others: List<InputDevice> = emptyList(),
     ): String {
         val arr = JSONArray()
         for (d in pads) {
-            val info = padInfoOf(d)
+            val info = padInfoOf(d, body)
             val entry = JSONObject()
                 .put("name", d.name)
                 .put("key", "${d.vendorId}:${d.productId}:${d.name}")
@@ -366,11 +377,32 @@ internal object ConsoleJson {
             )
         }
         val extra = extras.firstOrNull()
+        val otherRows = JSONArray()
+        for (d in others) {
+            otherRows.put(JSONObject().put("name", d.name).put("kind", kindOf(d)).put("detail", deviceDetail(d)))
+        }
         return JSONObject()
             .put("label", driving?.name ?: extra?.name ?: JSONObject.NULL)
             .put("pref", driving?.let { Gamepad.prefFor(it) } ?: extra?.pref ?: JSONObject.NULL)
             .put("pads", arr)
+            .put("others", otherRows)
             .toString()
+    }
+
+    /**
+     * Real, plugged-in input devices that are not controllers — a pad Android misreads lands
+     * here, so it is listed somewhere. Below API 29 there is no `isExternal`; all are listed.
+     */
+    fun otherInputs(): List<InputDevice> = InputDevice.getDeviceIds().toList()
+        .mapNotNull { InputDevice.getDevice(it) }
+        .filter { !it.isVirtual && !Gamepad.looksLikeController(it) }
+        .filter { android.os.Build.VERSION.SDK_INT < 29 || it.isExternal }
+
+    private fun kindOf(d: InputDevice): String = when {
+        d.supportsSource(InputDevice.SOURCE_MOUSE) -> "mouse"
+        d.keyboardType == InputDevice.KEYBOARD_TYPE_ALPHABETIC -> "keyboard"
+        d.supportsSource(InputDevice.SOURCE_DPAD) -> "remote"
+        else -> "other"
     }
 
     // ---- settings (`trust::Settings`) -------------------------------------------------------

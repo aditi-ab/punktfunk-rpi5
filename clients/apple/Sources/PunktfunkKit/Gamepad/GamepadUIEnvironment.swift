@@ -1,6 +1,4 @@
-// Whether the iOS/iPadOS/macOS UI should be in its controller-friendly mode (the console-style
-// host launcher, gamepad settings, and the coverflow library browser instead of the touch/desktop
-// layouts). A pure function, not a singleton: the reactivity comes from callers already observing
+// Whether the app should front the console instead of the touch/desktop layouts. A pure function, not a singleton: the reactivity comes from callers already observing
 // `GamepadManager.shared` and the `DefaultsKey.gamepadUIEnabled` @AppStorage themselves (the same
 // local-read pattern SettingsView already uses for GamepadManager), so this stays the single place
 // the inputs combine without adding a second ObservableObject or an environment key nobody else needs.

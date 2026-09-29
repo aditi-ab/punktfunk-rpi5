@@ -42,5 +42,5 @@ available when the wireless controller is disconnected. A headless smoke probe i
 available as `cargo run -p pf-client-core --example bluetooth_probe
 --no-default-features --features desktop -- --scan` on a BlueZ machine.
 
-The UI and backend require no StreamOS or StreamShell code. Image packaging only
-supplies standard Linux Bluetooth/audio services and the rebuilt Punktfunk bundle.
+Image packaging supplies standard Linux Bluetooth/audio services and the
+Punktfunk bundle. The same UI and backend run in the portable client.

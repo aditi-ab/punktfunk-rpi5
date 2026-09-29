@@ -14,10 +14,10 @@
 import Foundation
 
 public struct EffectiveSettings: Equatable, Sendable {
-    // Tier P — presetable (design §3).
-    public var width = 1920
-    public var height = 1080
-    public var refreshHz = 60
+    // Tier P — presetable (design §3). A size or rate of 0 is Native, resolved by `streamMode`.
+    public var width = 0
+    public var height = 0
+    public var refreshHz = 0
     public var matchWindow = false
     public var bitrateKbps = 0
     public var renderScale = 1.0
@@ -30,7 +30,7 @@ public struct EffectiveSettings: Equatable, Sendable {
     /// An `AudioFormatChoice` raw value. `"opus"` — the default — is byte-for-byte the session
     /// every build before the lossless plane ran.
     public var audioFormat = AudioFormatChoice.opus.rawValue
-    public var micEnabled = true
+    public var micEnabled = false
     public var echoCancel = true
     public var keepHostAudio = false
     public var touchMode = "trackpad"
@@ -61,7 +61,6 @@ public struct EffectiveSettings: Equatable, Sendable {
     public var smoothBuffer = 0
     public var vsync = false
     public var allowVRR = true
-    public var windowedSafePresent = true
     public var modifierLayout = "mac"
     // Tier G — this device's endpoints and hardware. Session-consumed, so they ride along, but
     // never presetable: a preset is about how a host is streamed, not about which speaker this
@@ -130,7 +129,6 @@ public struct EffectiveSettings: Equatable, Sendable {
         smoothBuffer = int(DefaultsKey.smoothBuffer, smoothBuffer)
         vsync = bool(DefaultsKey.vsync, vsync)
         allowVRR = bool(DefaultsKey.allowVRR, allowVRR)
-        windowedSafePresent = bool(DefaultsKey.windowedSafePresent, windowedSafePresent)
         modifierLayout = str(DefaultsKey.modifierLayout, modifierLayout)
         speakerUID = str(DefaultsKey.speakerUID, speakerUID)
         micUID = str(DefaultsKey.micUID, micUID)
@@ -216,7 +214,6 @@ public struct EffectiveSettings: Equatable, Sendable {
         if let v = overlay.smoothBuffer { s.smoothBuffer = v }
         if let v = overlay.vsync { s.vsync = v }
         if let v = overlay.allowVRR { s.allowVRR = v }
-        if let v = overlay.windowedSafePresent { s.windowedSafePresent = v }
         if let v = overlay.modifierLayout { s.modifierLayout = v }
         return s
     }
@@ -371,11 +368,16 @@ public enum PresetSelection: Hashable, Sendable {
 
 extension EffectiveSettings {
     /// The mode a session asks the host for: the configured size at the render scale, capped at
-    /// the codec's per-axis limit, at the configured refresh.
-    public var streamMode: (width: UInt32, height: UInt32, hz: UInt32) {
+    /// the codec's per-axis limit, at the configured refresh. A zero width, height or refresh is
+    /// the console's Native and takes `native`'s; a native refresh counts as at least 30.
+    public func streamMode(
+        native: (width: Int, height: Int, hz: Int)
+    ) -> (width: UInt32, height: UInt32, hz: UInt32) {
         let mode = RenderScale.apply(
-            baseWidth: width, baseHeight: height, scale: renderScale,
+            baseWidth: width == 0 ? native.width : width,
+            baseHeight: height == 0 ? native.height : height, scale: renderScale,
             maxDimension: RenderScale.maxDimension(codec: codec))
-        return (mode.width, mode.height, UInt32(clamping: refreshHz))
+        let hz = refreshHz == 0 ? max(native.hz, 30) : refreshHz
+        return (mode.width, mode.height, UInt32(clamping: hz))
     }
 }

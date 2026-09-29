@@ -2,6 +2,7 @@ package io.unom.punktfunk
 
 import android.content.Context
 import io.unom.punktfunk.kit.NativeBridge
+import io.unom.punktfunk.kit.library.mgmtBase
 import io.unom.punktfunk.kit.security.ClientIdentity
 import io.unom.punktfunk.kit.security.KnownHost
 import okhttp3.MediaType.Companion.toMediaType
@@ -59,7 +60,7 @@ object SendLogs {
                 identity.certPem, identity.privateKeyPem, addr, fpHex,
             )
             val req = Request.Builder()
-                .url("https://$addr:$mgmtPort/api/v1/client-logs")
+                .url("${mgmtBase(addr, mgmtPort)}/api/v1/client-logs")
                 .post(body.toRequestBody("text/plain; charset=utf-8".toMediaType()))
                 .build()
             client.newCall(req).execute().use { resp ->

@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Enrico=20B=C3=BChler?= <enrico.buehler@unom.io>
+Date: Fri, 25 Sep 2026 17:43:24 +0200
+Subject: [PATCH] steamcompmgr: take a game out of iconic when input returns to
+ it
+
+A fullscreen game that loses input to the Steam overlay can minimize
+itself. gamescope fakes the iconic state it asks for and takes a window
+out of it only when the focus window changes. The overlay moves input
+focus, not the focus window, so the game stayed iconic after the overlay
+closed: Wine kept its client window at the minimized 160x31 size, the WSI
+layer refused to bypass Xwayland, and the output showed that window alone.
+
+Take the focus window out of iconic when input focus comes back to it.
+Stamp pfhdr24.
+---
+ src/meson.build      | 3 ++-
+ src/steamcompmgr.cpp | 5 +++++
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src/meson.build b/src/meson.build
+index ccf4bf2..52b9914 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -204,7 +204,8 @@ vcs_tag = run_command(vcs_tag_cmd, check: false).stdout().strip()
+ #   +pfhdr21 — …and a packed RGB capture dmabuf takes a tiled modifier its consumer accepts
+ #   +pfhdr22 — …and a planar capture dmabuf exports its chroma plane where the driver put it
+ #   +pfhdr23 — …and the composited cursor follows a shape change or a hide, and the pointer bound forgets a closed window
+-version_tag = vcs_tag + '+pfhdr23' + ' (' + compiler_name + ' ' + compiler_version + ')'
++#   +pfhdr24 — …and input back from an overlay takes the focused game out of iconic
++version_tag = vcs_tag + '+pfhdr24' + ' (' + compiler_name + ' ' + compiler_version + ')'
+ 
+ gamescope_version_conf = configuration_data()
+ gamescope_version_conf.set('VCS_TAG', version_tag)
+diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+index 2dfadff..682ba20 100644
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -4174,6 +4174,11 @@ void xwayland_ctx_t::DetermineAndApplyFocus( const std::vector< steamcompmgr_win
+ 			// don't care if we change kb focus window due to that happening when
+ 			// going from override -> focus and we don't want to hide then as it's probably a dropdown.
+ 			ctx->cursor->hide();
++
++			// Input back from an overlay reactivates a game that minimized itself when it lost
++			// focus to it. Take it out of iconic, as a focus change does; never put it back.
++			if ( inputFocus == ctx->focus.focusWindow )
++				set_wm_state( ctx, inputFocus->xwayland().id, ICCCM_NORMAL_STATE );
+ 		}
+ 
+ 		ctx->focus.inputFocusWindow = inputFocus;

@@ -2,8 +2,10 @@
 //! the IDD pipeline-depth adaptation, and the pacing sleep. The drain after the loop is here too.
 
 use super::recovery::{reset_stalled_encoder, run_loop_stage};
-use super::state::{Flow, StreamState, Tick, ENCODE_STALL_WINDOW, MAX_ENCODER_RESETS};
+use super::state::{Flow, StreamState, Tick};
 use super::*;
+use crate::encode_recovery::MAX_ENCODER_RESETS;
+use crate::stats_recorder::DriverSample;
 
 // ~20 net behind-frames (≈0.3 s) escalates; warmup skips the first ~1 s of bring-up.
 const DEPTH_ESCALATE: u32 = 20;
@@ -41,7 +43,7 @@ fn mark_recovery_boundary(ir_wave_pos: &mut u32, is_keyframe: bool, period: u32)
 /// `PUNKTFUNK_IDD_ADAPTIVE=0` pins the capturer's full depth. Off when max depth is already 1.
 fn idd_adaptive_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PUNKTFUNK_IDD_ADAPTIVE").as_deref() != Ok("0"))
+    *ON.get_or_init(|| pf_host_config::env_on("PUNKTFUNK_IDD_ADAPTIVE").unwrap_or(true))
 }
 
 /// Escalated sessions flag on any net behind-frame; being escalated alone does not latch a cap.
@@ -137,7 +139,7 @@ impl StreamState {
         if let Some(stage) = self.capturer.take_pending_stage() {
             let outcome = run_loop_stage(stage, &mut self.enc, &mut self.inflight);
             self.capturer.stage_done(stage, outcome);
-            self.last_au_at = std::time::Instant::now();
+            self.watchdog.restart();
         }
         let mut repeat = false;
         match cap_result {
@@ -333,26 +335,19 @@ impl StreamState {
                      session without rebuild attempts (see the error for the remedy)");
                 return Err(e).context("encoder submit");
             }
-            self.encoder_resets += 1;
-            if self.encoder_resets > MAX_ENCODER_RESETS
-                || !reset_stalled_encoder(&mut self.enc, &mut self.inflight)
-            {
+            let Some(backoff) = self.watchdog.recover(self.interval, || {
+                reset_stalled_encoder(&mut self.enc, &mut self.inflight)
+            }) else {
                 tracing::error!(
                     error = %format!("{e:#}"),
-                    resets = self.encoder_resets,
+                    resets = self.watchdog.resets(),
                     "encoder did not recover after repeated in-place rebuilds — ending the video \
                      session (see the error above for the cause)");
                 return Err(e).context("encoder submit");
-            }
-            tracing::warn!(error = %format!("{e:#}"), reset = self.encoder_resets,
+            };
+            tracing::warn!(error = %format!("{e:#}"), reset = self.watchdog.resets(),
                 max = MAX_ENCODER_RESETS,
                 "encoder submit failed — encoder rebuilt in place, forcing an IDR");
-            self.last_au_at = std::time::Instant::now();
-            // 100 ms → 1.6 s. One frame period burns all 5 resets within 40 ms at 120 Hz.
-            let backoff = std::cmp::max(
-                self.interval,
-                std::time::Duration::from_millis(100u64 << (self.encoder_resets - 1).min(4)),
-            );
             self.next = std::time::Instant::now() + backoff;
             std::thread::sleep(backoff);
             return Ok(Flow::Continue);
@@ -436,6 +431,43 @@ impl StreamState {
         );
     }
 
+    /// The AU-level fields for the AU just taken, from its `inflight` stamps
+    /// `(capture, submit, deadline)`. On the driver the host submits nothing: the stages are
+    /// the driver's own, and its per-AU present time (`pts_ns`) beats the tick's clock, which
+    /// would give every AU of a burst the same one.
+    fn au_meta(
+        &self,
+        st: &Stamps,
+        (cap_ns, sub_ns, deadline): (u64, u64, std::time::Instant),
+        pts_ns: u64,
+        flags: u32,
+        wait_us: u32,
+    ) -> AuMeta {
+        let d = if st.owed {
+            driver_stages(&*self.enc)
+        } else {
+            AuStages::host((now_ns().saturating_sub(sub_ns) / 1000) as u32, st.queue_us)
+        };
+        AuMeta {
+            capture_ns: if st.owed && pts_ns > 0 {
+                pts_ns
+            } else {
+                cap_ns
+            },
+            flags,
+            frame_index: self.au_seq,
+            deadline,
+            encode_us: d.encode_us,
+            queue_us: d.queue_us,
+            cap_us: st.cap_us,
+            submit_us: st.submit_us,
+            wait_us,
+            repeat: st.repeat,
+            was_measured: st.measure,
+            driver: d.driver,
+        }
+    }
+
     /// Stream one AU's chunks as they land. `Au` = a whole AU went out (the caller polls again
     /// while owed frames remain); `Nothing` = the encoder has no more output this tick.
     fn poll_chunked(&mut self, st: &Stamps, resend_meta: &mut bool) -> Polled {
@@ -450,8 +482,7 @@ impl StreamState {
                 Ok(None) => return Polled::Nothing,
                 Err(e) => return Polled::Failed(e),
             };
-            self.last_au_at = std::time::Instant::now();
-            self.encoder_resets = 0;
+            self.watchdog.on_au();
             // A FIRST while the previous AU's LAST never came (the driver dropped its
             // tail, or a reset abandoned it): close that frame on the wire first, or
             // this AU is spliced onto a truncated prefix under its own flags.
@@ -479,40 +510,16 @@ impl StreamState {
                 self.bringup.mark("first_au");
             }
             let last = c.last;
-            let (cap_ns, sub_ns, deadline) = *self.inflight.front().expect("inflight non-empty");
+            let inflight = *self.inflight.front().expect("inflight non-empty");
             let wait_total_us = t_wait.elapsed().as_micros() as u32;
-            // On the driver the host submits nothing: the stages are the driver's own stamps,
-            // or its present → arrival lump, and the tick's queue age means nothing.
-            let d = if st.owed {
-                driver_stages(&*self.enc)
-            } else {
-                AuStages::host((now_ns().saturating_sub(sub_ns) / 1000) as u32, st.queue_us)
-            };
-            // The driver stamps each AU with its own present time; the tick's clock
-            // would give every AU of a burst the same one.
-            let capture_ns = if st.owed && c.pts_ns > 0 {
-                c.pts_ns
-            } else {
-                cap_ns
-            };
+            let wait_us = if st.measure { wait_total_us } else { 0 };
+            let meta = self.au_meta(st, inflight, c.pts_ns, flags, wait_us);
+            let encode_us = meta.encode_us;
             let msg = ChunkMsg {
                 data: c.data,
                 first: c.first,
                 last,
-                capture_ns,
-                flags,
-                frame_index: self.au_seq,
-                deadline,
-                encode_us: d.encode_us,
-                queue_us: d.queue_us,
-                ipc_us: d.ipc_us,
-                split: d.split,
-                cap_us: st.cap_us,
-                submit_us: st.submit_us,
-                wait_us: if st.measure { wait_total_us } else { 0 },
-                repeat: st.repeat,
-                was_measured: st.measure,
-                driver: st.owed,
+                meta,
             };
             if self.frame_tx.send(SendMsg::Chunk(msg)).is_err() {
                 return Polled::SendGone;
@@ -526,7 +533,7 @@ impl StreamState {
                     if self.sent % 120 == 0 {
                         tracing::info!(
                             first_slice_us = first_chunk_us,
-                            encode_us = d.encode_us,
+                            encode_us,
                             "streamed AU (sampled): first slice handed to send at \
                              first_slice_us; encode finished at encode_us"
                         );
@@ -556,9 +563,8 @@ impl StreamState {
             Ok(None) => return Polled::Nothing,
             Err(e) => return Polled::Failed(e),
         };
-        self.last_au_at = std::time::Instant::now();
-        self.encoder_resets = 0;
-        let (cap_ns, sub_ns, deadline) = self.inflight.pop_front().expect("inflight non-empty");
+        self.watchdog.on_au();
+        let inflight = self.inflight.pop_front().expect("inflight non-empty");
         let caps = self.enc.caps();
         let flags = au_flags(
             &caps,
@@ -571,34 +577,9 @@ impl StreamState {
             &self.counters.link,
         );
         self.send_hdr_meta(au.keyframe, resend_meta);
-        // As in the chunked arm: the driver's stamps, not a host submit that never happened.
-        let d = if st.owed {
-            driver_stages(&*self.enc)
-        } else {
-            AuStages::host((now_ns().saturating_sub(sub_ns) / 1000) as u32, st.queue_us)
-        };
-        // As in the chunked arm: the driver's per-AU present time over the tick's clock.
-        let capture_ns = if st.owed && au.pts_ns > 0 {
-            au.pts_ns
-        } else {
-            cap_ns
-        };
         let msg = FrameMsg {
+            meta: self.au_meta(st, inflight, au.pts_ns, flags, wait_us),
             data: au.data,
-            capture_ns,
-            flags,
-            frame_index: self.au_seq,
-            deadline,
-            encode_us: d.encode_us,
-            queue_us: d.queue_us,
-            ipc_us: d.ipc_us,
-            split: d.split,
-            cap_us: st.cap_us,
-            submit_us: st.submit_us,
-            wait_us,
-            repeat: st.repeat,
-            was_measured: st.measure,
-            driver: st.owed,
         };
         self.bringup.mark("first_au");
         if self.frame_tx.send(SendMsg::Frame(msg)).is_err() {
@@ -627,32 +608,23 @@ impl StreamState {
     /// A poll failure, or owed frames with no AU for the stall window: rebuild the encoder in
     /// place, up to [`MAX_ENCODER_RESETS`] times.
     fn check_encode_stall(&mut self, depth: usize, poll_err: Option<anyhow::Error>) -> Result<()> {
-        let stall_window = ENCODE_STALL_WINDOW.max(self.interval * 8);
-        let stall_backlog = depth
-            + (stall_window.as_secs_f64() / self.interval.as_secs_f64().max(1e-6)).ceil() as usize;
-        let stalled = !self.inflight.is_empty()
-            && (self.last_au_at.elapsed() >= stall_window || self.inflight.len() > stall_backlog);
-        if poll_err.is_none() && !stalled {
-            return Ok(());
-        }
-        let why = match &poll_err {
-            Some(e) => format!("poll failed: {e:#}"),
-            None => format!(
-                "no AU for {} ms with {} frame(s) in flight",
-                self.last_au_at.elapsed().as_millis(),
-                self.inflight.len()
-            ),
+        let stalled = self
+            .watchdog
+            .stalled(self.inflight.len(), depth, self.interval);
+        let why = match (&poll_err, stalled) {
+            (Some(e), _) => format!("poll failed: {e:#}"),
+            (None, Some(why)) => why,
+            (None, None) => return Ok(()),
         };
-        self.encoder_resets += 1;
-        if self.encoder_resets > MAX_ENCODER_RESETS
-            || !reset_stalled_encoder(&mut self.enc, &mut self.inflight)
-        {
+        let recovered = self.watchdog.recover(self.interval, || {
+            reset_stalled_encoder(&mut self.enc, &mut self.inflight)
+        });
+        if recovered.is_none() {
             return Err(poll_err.unwrap_or_else(|| anyhow!("{why}")))
                 .context("encoder stalled — in-place rebuild unavailable or exhausted");
         }
-        tracing::warn!(reset = self.encoder_resets, max = MAX_ENCODER_RESETS, %why,
+        tracing::warn!(reset = self.watchdog.resets(), max = MAX_ENCODER_RESETS, %why,
             "encode stall detected — encoder rebuilt in place, forcing an IDR");
-        self.last_au_at = std::time::Instant::now();
         Ok(())
     }
 
@@ -699,6 +671,8 @@ impl StreamState {
                         flips_suppressed = self.cadence_flips_suppressed,
                         "encode behind cadence — ABR climbs will be refused until it recovers"
                     );
+                    // Name any other encoder on the engine; Windows pauses Instant Replay there.
+                    crate::encoder_sessions::on_behind_cadence();
                 } else {
                     tracing::info!(
                         behind_score = self.behind_score,
@@ -820,20 +794,20 @@ impl StreamState {
             let encode_us = (now_ns().saturating_sub(sub_ns) / 1000) as u32;
             let msg = FrameMsg {
                 data: au.data,
-                capture_ns: cap_ns,
-                flags,
-                frame_index: self.au_seq,
-                deadline,
-                encode_us,
-                queue_us: 0,
-                ipc_us: 0,
-                split: false,
-                cap_us: 0,
-                submit_us: 0,
-                wait_us: 0,
-                repeat: false,
-                was_measured: false,
-                driver: false,
+                meta: AuMeta {
+                    capture_ns: cap_ns,
+                    flags,
+                    frame_index: self.au_seq,
+                    deadline,
+                    encode_us,
+                    queue_us: 0,
+                    cap_us: 0,
+                    submit_us: 0,
+                    wait_us: 0,
+                    repeat: false,
+                    was_measured: false,
+                    driver: None,
+                },
             };
             if self.frame_tx.send(SendMsg::Frame(msg)).is_err() {
                 break;
@@ -845,13 +819,11 @@ impl StreamState {
 }
 
 /// What one AU's `queue_us`/`encode_us` mean on its message: the host's own stamps, or the
-/// driver's. `split` = the driver stamped its slot, so `queue_us` is its pool wait, `encode_us`
-/// its encode and `ipc_us` the hand-off; otherwise `encode_us` is present → arrival in one lump.
+/// driver's ([`DriverSample::queue_encode_us`]), whose full sample rides along for the stats.
 struct AuStages {
     queue_us: u32,
     encode_us: u32,
-    ipc_us: u32,
-    split: bool,
+    driver: Option<DriverSample>,
 }
 
 impl AuStages {
@@ -859,29 +831,19 @@ impl AuStages {
         AuStages {
             queue_us,
             encode_us,
-            ipc_us: 0,
-            split: false,
+            driver: None,
         }
     }
 }
 
-/// The driver's stages for the AU just taken. All zero before its first AU.
+/// The driver's stages for the AU just taken. Unmeasured before its first AU.
 fn driver_stages(enc: &dyn crate::encode::Encoder) -> AuStages {
-    let us = |d: std::time::Duration| d.as_micros().min(u128::from(u32::MAX)) as u32;
-    let t = enc.telemetry();
-    match t.as_ref().and_then(|t| t.driver_split) {
-        Some(s) => AuStages {
-            queue_us: s.pool.map_or(0, us),
-            encode_us: us(s.encode),
-            ipc_us: us(s.ipc),
-            split: true,
-        },
-        None => AuStages {
-            queue_us: 0,
-            encode_us: t.and_then(|t| t.present_to_arrival).map_or(0, us),
-            ipc_us: 0,
-            split: false,
-        },
+    let sample = DriverSample::from_telemetry(enc.telemetry().as_ref());
+    let (queue_us, encode_us) = sample.queue_encode_us();
+    AuStages {
+        queue_us,
+        encode_us,
+        driver: Some(sample),
     }
 }
 

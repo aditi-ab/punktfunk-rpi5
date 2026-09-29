@@ -9,11 +9,15 @@
 
 import * as fs from "node:fs";
 import type { PluginDef } from "@punktfunk/host";
+import type { GameRef } from "@punktfunk/host/core";
 import { Duration, Effect, type Schema, Stream } from "effect";
-import { requestAccess, unreachable } from "../access.js";
+import {
+	type AccessRequestOutcome,
+	requestAccess,
+	unreachable,
+} from "../access.js";
 import { type CliCommand, runPluginCli } from "../cli.js";
 import { type ConfigService, makeConfigService } from "../config.js";
-import type { HostRequestError } from "../errors.js";
 import { HostClient, type PluginInfo } from "../host-client.js";
 import { ProviderClient, type ProviderClientService } from "../reconcile.js";
 import { definePluginKit, type PluginKitDef } from "../runtime.js";
@@ -95,6 +99,18 @@ export interface LibraryPluginDef<S extends Schema.Top> {
 	readonly title?: string;
 	/** Extra CLI verbs beyond the standard `detect` / `scan` / `uninstall` set. */
 	readonly commands?: Record<string, CliCommand<never>>;
+	/**
+	 * Work before the host starts one of this plugin's titles, like fetching its files. It fires for
+	 * every launch on the host, so check `game.app`. See `serveUi`'s `holds`.
+	 */
+	readonly holds?: {
+		readonly "game.launching"?: (
+			game: GameRef,
+			cfg: S["Type"],
+		) => Effect.Effect<void, unknown>;
+	};
+	/** How long the host waits for a hold, 1–120 000 ms. Default 30 000. */
+	readonly holdTimeoutMs?: number;
 }
 
 /** `--flag value` from an argv slice, or undefined. */
@@ -114,12 +130,37 @@ export interface LibraryPlugin {
 	readonly cli: (argv?: ReadonlyArray<string>) => Promise<void>;
 }
 
+/** One line per folder the host answered; a launcher that is simply not installed stays quiet. */
+const logOutcomes = (outcomes: ReadonlyArray<AccessRequestOutcome>) =>
+	Effect.forEach(
+		outcomes,
+		({ path, outcome }) => {
+			if (outcome === "pending")
+				return Effect.logInfo(`asked the operator for ${path}`);
+			if (outcome === "denied")
+				return Effect.logInfo(`the operator did not allow ${path}`);
+			if (outcome === "granted")
+				return Effect.logWarning(
+					`${path} is allowed but not visible to this plugin — a folder that appeared after the runner started needs a runner restart`,
+				);
+			if (outcome === "refused:not_directory") return Effect.void;
+			return Effect.logInfo(
+				`the host won't offer ${path} (${outcome.replace(/^refused:/, "")})`,
+			);
+		},
+		{ discard: true },
+	);
+
+/**
+ * Ask for the wanted folders the plugin can't reach, once per distinct set, then scan. A request
+ * the host never answered is asked again on the next scan; it never fails the scan.
+ */
 const accessAwareCompute = <Cfg, A, E, R>(
 	wants: ((cfg: Cfg) => ReadonlyArray<string>) | undefined,
 	title: string,
 	load: Effect.Effect<Cfg, E, R>,
 	compute: (cfg: Cfg) => Effect.Effect<A, E, R>,
-): (() => Effect.Effect<A, E | HostRequestError, R | HostClient>) => {
+): (() => Effect.Effect<A, E, R | HostClient>) => {
 	let lastAsked: string | undefined;
 	return () =>
 		load.pipe(
@@ -133,10 +174,8 @@ const accessAwareCompute = <Cfg, A, E, R>(
 				}
 				return requestAccess(dirs, title).pipe(
 					Effect.tap((outcomes) => {
-						lastAsked = key;
-						return outcomes.length > 0
-							? Effect.logInfo(`asked the operator for ${dirs.length} folders`)
-							: Effect.void;
+						if (outcomes.length === dirs.length) lastAsked = key;
+						return logOutcomes(outcomes);
 					}),
 					Effect.andThen(compute(cfg)),
 				);
@@ -254,13 +293,27 @@ export const defineLibraryPlugin = <S extends Schema.Top>(
 			),
 		});
 
-		// The UI server exists ONLY to serve `__config` (and the SDK's `__health`): no `staticDir`,
-		// no API. That is the whole "settings without an SPA" story (design D7, closing G8), and the
-		// `library` category is what keeps six installed scanners out of the console's sidebar.
+		// The UI server serves `__config` (and the SDK's `__health`), plus `__hold` when the scanner
+		// holds a stage: no `staticDir`, no API. The `library` category keeps installed scanners out
+		// of the console's sidebar.
+		const launching = def.holds?.["game.launching"];
 		yield* serveUi({
 			title: def.title ?? def.name,
 			category: "library",
 			config: { schema: def.configSchema, service: cfgService },
+			...(launching
+				? {
+						holds: {
+							"game.launching": (game: GameRef) =>
+								cfgService.load.pipe(
+									Effect.flatMap((cfg) => launching(game, cfg)),
+								),
+						},
+					}
+				: {}),
+			...(def.holdTimeoutMs !== undefined
+				? { holdTimeoutMs: def.holdTimeoutMs }
+				: {}),
 		});
 
 		yield* engine.start;

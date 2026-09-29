@@ -1,0 +1,18 @@
+{
+  "$comment": "A typed resolution → the mode a client asks for, pinned by punktfunk-core resolutions::custom, the Swift Resolutions.custom and the Kotlin Resolutions.custom tests. Each side: at least 320 × 200, at most max_dimension(codec) from render-scale-vectors.json, then floored even.",
+  "custom": [
+    {"name": "a listed size passes", "typed": [1920, 1080], "codec": "hevc", "want": [1920, 1080]},
+    {"name": "odd sides floor even", "typed": [1921, 1081], "codec": "hevc", "want": [1920, 1080]},
+    {"name": "a handheld", "typed": [1280, 800], "codec": "auto", "want": [1280, 800]},
+    {"name": "portrait", "typed": [1080, 2400], "codec": "av1", "want": [1080, 2400]},
+    {"name": "an unlisted shape", "typed": [1500, 1000], "codec": "hevc", "want": [1500, 1000]},
+    {"name": "below the floor", "typed": [100, 100], "codec": "hevc", "want": [320, 200]},
+    {"name": "zero", "typed": [0, 0], "codec": "auto", "want": [320, 200]},
+    {"name": "odd at the floor", "typed": [321, 201], "codec": "hevc", "want": [320, 200]},
+    {"name": "H.264 ceiling", "typed": [5120, 2880], "codec": "h264", "want": [4096, 2880]},
+    {"name": "H.264 ceiling, both sides", "typed": [8191, 4097], "codec": "h264", "want": [4096, 4096]},
+    {"name": "HEVC ceiling", "typed": [9999, 9999], "codec": "hevc", "want": [8192, 8192]},
+    {"name": "Automatic takes the wider ceiling", "typed": [7680, 4320], "codec": "auto", "want": [7680, 4320]},
+    {"name": "PyroWave ceiling", "typed": [10000, 1440], "codec": "pyrowave", "want": [8192, 1440]}
+  ]
+}

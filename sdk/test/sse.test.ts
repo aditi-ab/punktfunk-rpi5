@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { SseAuthError, SseParser, sseFrames } from "../src/sse.js";
+import { classifyFrame, SseAuthError, SseParser, sseFrames } from "../src/sse.js";
 import type { ResolvedConfig } from "../src/config.js";
 import { staticBearer } from "../src/credential.js";
 
@@ -83,5 +83,24 @@ describe("sseFrames", () => {
 		} finally {
 			server.stop(true);
 		}
+	});
+});
+
+describe("classifyFrame", () => {
+	const frame = (event: string, data: string) => ({ event, data });
+	test("sorts every frame the host sends into one of five classes", () => {
+		expect(classifyFrame(frame("dropped", "")).tag).toBe("dropped");
+		expect(classifyFrame(frame("live", "")).tag).toBe("live");
+		expect(classifyFrame(frame("x", "{not json")).tag).toBe("garbled");
+		expect(
+			classifyFrame(frame("later.kind", '{"seq":1,"ts_ms":1,"schema":1,"kind":"later.kind"}')),
+		).toEqual({
+			tag: "unknown",
+			json: { seq: 1, ts_ms: 1, schema: 1, kind: "later.kind" },
+		});
+		const ev = classifyFrame(
+			frame("host.stopping", '{"seq":2,"ts_ms":1,"schema":1,"kind":"host.stopping"}'),
+		);
+		expect(ev.tag === "event" && ev.event.kind).toBe("host.stopping");
 	});
 });

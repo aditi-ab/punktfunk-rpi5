@@ -10,7 +10,7 @@ use crate::model::ConsoleCmd;
 use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox};
 use crate::theme::{fg, Fonts, W};
-use crate::widgets::{ListMsg, MenuList, RowSpec};
+use crate::widgets::{ListMsg, MenuList, RowSpec, FOOT_DETAIL_H};
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Rect};
 
@@ -30,7 +30,7 @@ pub(crate) struct BindPresetScreen {
     /// Set when the menu was raised on a title rather than the host tile. Same catalog
     /// and same radio behaviour either way — only the binding it writes differs.
     game: Option<GameSubject>,
-    list: MenuList,
+    pub(super) list: MenuList,
 }
 
 impl BindPresetScreen {
@@ -185,13 +185,11 @@ impl BindPresetScreen {
             );
             return;
         }
-        // 34 px band under the list for the explainer, matching settings detail text.
-        let detail_h = 34.0 * k;
         let list_rect = Rect::from_ltrb(
             rect.left,
             rect.top,
             rect.right,
-            rect.bottom - detail_h as f32,
+            rect.bottom - (FOOT_DETAIL_H * k) as f32,
         );
         let bound = self.bound(ctx);
         let rows: Vec<RowSpec> = (0..self.len())
@@ -233,21 +231,17 @@ impl BindPresetScreen {
             .collect();
         self.list
             .render(canvas, list_rect, &rows, fonts, k, dt, true);
-        let detail = if self.game.is_some() {
-            "What this title streams with, overriding the host's default. A pinned card still keeps its own."
+    }
+
+    /// The explainer under the list, once there is a list.
+    pub(crate) fn foot(&self) -> Option<&'static str> {
+        if self.presets.is_empty() {
+            None
+        } else if self.game.is_some() {
+            Some("What this title streams with, overriding the host's default. A pinned card still keeps its own.")
         } else {
-            "What a plain press on this host's tile connects with. Pinned cards keep their own."
-        };
-        fonts.centered(
-            canvas,
-            detail,
-            W::Regular,
-            13.0 * k,
-            fg(0.55),
-            cx,
-            f64::from(rect.bottom) - detail_h + 6.0 * k,
-            f64::from(rect.width()) * 0.8,
-        );
+            Some("What a plain press on this host's tile connects with. Pinned cards keep their own.")
+        }
     }
 }
 
@@ -260,30 +254,13 @@ mod tests {
 
     fn host(bound: Option<&str>) -> HostRow {
         HostRow {
-            key: "aa".into(),
-            id: None,
-            name: "Desk".into(),
-            addr: "10.0.0.9".into(),
-            port: 9777,
-            fp_hex: "aa".into(),
-            paired: true,
-            saved: true,
-            online: true,
-            mgmt_port: 47990,
-            can_wake: false,
-            clipboard_sync: false,
-            last_used: None,
-            os: String::new(),
-            actions: Vec::new(),
-            pin: None,
             bound_preset: bound.map(|id| PresetChip {
                 id: id.into(),
                 name: "Work".into(),
                 accent: None,
                 bitrate_kbps: None,
             }),
-            running: String::new(),
-            game_presets: Default::default(),
+            ..HostRow::fixture("aa", "Desk")
         }
     }
 
@@ -298,23 +275,11 @@ mod tests {
     #[test]
     fn choosing_a_preset_binds_and_no_default_clears() {
         let mut settings = Settings::default();
-        let pads = Vec::new();
         let library = crate::library::LibraryShared::default();
         let hosts = [host(Some("p1"))];
         let mut ctx = Ctx {
             hosts: &hosts,
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
+            ..Ctx::test(&mut settings, &library)
         };
         let mut s = screen();
         let mut fx = Outbox::default();
@@ -348,23 +313,11 @@ mod tests {
     #[test]
     fn re_choosing_the_current_binding_is_a_boundary_not_a_command() {
         let mut settings = Settings::default();
-        let pads = Vec::new();
         let library = crate::library::LibraryShared::default();
         let hosts = [host(Some("p1"))];
         let mut ctx = Ctx {
             hosts: &hosts,
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
+            ..Ctx::test(&mut settings, &library)
         };
         let mut s = screen();
         let mut fx = Outbox::default();
@@ -377,18 +330,7 @@ mod tests {
         let mut settings = Settings::default();
         let mut ctx = Ctx {
             hosts: &hosts,
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
+            ..Ctx::test(&mut settings, &library)
         };
         let mut s = screen();
         let mut fx = Outbox::default();
@@ -402,7 +344,6 @@ mod tests {
     #[test]
     fn a_title_binds_its_own_preset_and_reads_its_own_checkmark() {
         let mut settings = Settings::default();
-        let pads = Vec::new();
         let library = crate::library::LibraryShared::default();
         // Host bound to p1, title already bound to p2 — the two must not be confused.
         let mut row = host(Some("p1"));
@@ -411,18 +352,7 @@ mod tests {
         let hosts = [row];
         let mut ctx = Ctx {
             hosts: &hosts,
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
+            ..Ctx::test(&mut settings, &library)
         };
         let mut s = BindPresetScreen::for_game(
             "aa".into(),

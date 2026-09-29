@@ -4,9 +4,9 @@
 //! (IddCx hardware cursor — DWM then excludes the pointer from consumed frames), and
 //! seqlock-reads the driver's publishes at encode-tick pace into the same
 //! [`pf_frame::CursorOverlay`] the Linux portal path produces. Downstream (forwarder,
-//! wire, client renderer) is shared. The header also carries the two facts the driver's
-//! own blend needs and cannot query in session 0: the monitor's desktop origin and the
-//! HDR desktop's SDR-white scale.
+//! wire, client renderer) is shared. IddCx positions are already relative to the monitor.
+//! The header also carries the one fact the driver's own blend needs and cannot query in
+//! session 0: the HDR desktop's SDR-white scale.
 
 use super::*;
 use pf_driver_proto::cursor::{
@@ -19,10 +19,6 @@ use std::sync::atomic::AtomicU32;
 /// life.
 pub(super) struct CursorShared {
     section: MappedSection,
-    /// Monitor desktop origin. IddCx reports desktop coordinates; the overlay wants
-    /// frame-relative. Placement is stable for the session; a topology change recreates
-    /// the pipeline.
-    origin: (i32, i32),
     /// Last `shape_id` whose pixels were converted. Position-only updates (the common
     /// case) reuse it — a refcount bump, no pixel work.
     cached_id: u32,
@@ -50,13 +46,11 @@ impl From<ShapeRgba> for ConvertedShape {
 }
 
 impl CursorShared {
-    /// Create + initialize the section (origin stamped, magic last, seq even/zero). The
-    /// returned handle is the section itself (owned by `self`); the caller duplicates it into
-    /// the WUDFHost.
-    pub(super) fn create(ccd: pf_win_display::win_display::CcdTargetKey) -> Result<CursorShared> {
-        // Desktop origin of this monitor's source — for the desktop→frame coordinate shift.
-        let rect = pf_win_display::win_display::source_desktop_rect(ccd);
-        let origin = rect.map(|(x, y, _w, _h)| (x, y)).unwrap_or((0, 0));
+    /// Create + initialize the section (zeroed, magic last, seq even/zero). The origin stays
+    /// 0: IddCx positions are monitor-relative, and a driver that still subtracts it must
+    /// subtract nothing. The returned handle is the section itself (owned by `self`); the
+    /// caller duplicates it into the WUDFHost.
+    pub(super) fn create() -> Result<CursorShared> {
         // SAFETY: plain FFI. Unnamed pagefile-backed section, host-lifetime owned; the view is
         // mapped once here and unmapped exactly once by `MappedSection::drop` (which unmaps before
         // closing the mapping handle). No borrow into the view outlives the `MappedSection`: every
@@ -84,8 +78,6 @@ impl CursorShared {
             }
             let shm = view.Value.cast::<CursorShm>();
             std::ptr::write_bytes(view.Value.cast::<u8>(), 0, CURSOR_SHM_SIZE);
-            (*shm).origin_x = origin.0;
-            (*shm).origin_y = origin.1;
             // Magic last: the driver validates it at adopt. Seq 0 is even = consistent.
             std::sync::atomic::fence(Ordering::Release);
             (*shm).magic = CURSOR_MAGIC;
@@ -93,30 +85,13 @@ impl CursorShared {
         };
         Ok(CursorShared {
             section,
-            origin,
             cached_id: 0,
             cached: None,
         })
     }
 
-    pub(super) fn section_handle(&self) -> HANDLE {
-        HANDLE(self.section.handle.as_raw_handle())
-    }
-
-    /// Re-stamp the monitor's desktop origin: a resize or an HDR re-arrival moves it, and both
-    /// the driver's blend and the fallback read here place the pointer relative to it.
-    pub(super) fn set_origin(&mut self, origin: (i32, i32)) {
-        if origin == self.origin {
-            return;
-        }
-        self.origin = origin;
-        let shm = self.section.ptr::<CursorShm>();
-        // SAFETY: the view spans `CURSOR_SHM_SIZE` for `self`'s lifetime; both fields are
-        // 4-aligned i32s in the fixed layout, written whole.
-        unsafe {
-            std::ptr::addr_of_mut!((*shm).origin_x).write_volatile(origin.0);
-            std::ptr::addr_of_mut!((*shm).origin_y).write_volatile(origin.1);
-        }
+    pub(super) fn section_handle(&self) -> BorrowedHandle<'_> {
+        self.section.handle.as_handle()
     }
 
     /// Tell the driver where this HDR desktop puts SDR white (1.0 = 80 nits) for its blend
@@ -180,10 +155,9 @@ impl CursorShared {
                 }
             }
             let shape = self.cached.as_ref()?;
-            // Driver-written i32s: saturate rather than trust them to stay in range.
             return Some(pf_frame::CursorOverlay {
-                x: hdr.x.saturating_sub(self.origin.0),
-                y: hdr.y.saturating_sub(self.origin.1),
+                x: hdr.x,
+                y: hdr.y,
                 w: shape.w,
                 h: shape.h,
                 rgba: shape.rgba.clone(),

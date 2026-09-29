@@ -1,5 +1,4 @@
-// Controller-side haptic feedback for the gamepad menu UI (the host launcher + the library
-// coverflow). The couch case is the whole point: the user is holding a game controller, not the
+// Controller-side haptic feedback for the console's menus. The couch case is the whole point: the user is holding a game controller, not the
 // iPhone/iPad, so a device-only `.sensoryFeedback` tick never reaches their hands — this plays a
 // short CoreHaptics transient on the ACTIVE controller instead, so a dpad move / launch / end-stop
 // is felt on the pad. (The views pair this with `.sensoryFeedback` so a touch/handheld user still

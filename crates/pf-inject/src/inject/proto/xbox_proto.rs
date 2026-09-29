@@ -4,22 +4,21 @@
 //! `pf-xusb` registers only `GUID_DEVINTERFACE_XUSB` and has no HID collection, so Steam hidapi,
 //! DirectInput, `joy.cpl`, and WGI/GameInput never see it — only classic `XInputGetState` does.
 //!
-//! The report is `XBOX_RDESC` in order: two 16-bit stick pairs (`X`/`Y`, `Rx`/`Ry`, 0..65535),
-//! two 16-bit Simulation-page triggers (`Brake`/`Accelerator`, 0..1023), a 4-bit null-state hat
-//! plus 4 pad bits, then 15 buttons plus 1 pad bit. [`serialize_xbox_state`] writes that layout;
-//! [`tests`] pin every field.
+//! The report is `pf_driver_proto::xbox::SERIES_RDESC` in order: two 16-bit stick pairs
+//! (`X`/`Y`, `Z`/`Rz`, 0..65535), two 16-bit Simulation-page triggers (`Brake`/`Accelerator`,
+//! 0..1023), a 4-bit null-state hat plus 4 pad bits, 15 buttons plus 1 pad bit, then Share plus 7
+//! pad bits. [`serialize_xbox_state`] writes that layout; [`tests`] pin every field.
 //!
 //! Button numbers are the real Xbox-Bluetooth layout, gaps included. We enumerate as Microsoft
 //! `045E:0B13`; SDL / Steam / Windows stock mappings key off that VID/PID. Renumbering silently
 //! lands every control on the wrong action. Reserved slots 3, 6, 9, 10 are Microsoft's — leave
 //! them empty.
 
-use punktfunk_core::input::gamepad as gs;
+use punktfunk_core::input::{gamepad as gs, GamepadFrame};
 
-/// Report id included. Must equal the driver's `XBOX_INPUT_REPORT_LEN`: hidclass sizes
-/// READ_REPORT from the descriptor, and `copy_to_output` refuses a longer source rather than
-/// truncating.
-pub const XBOX_REPORT_LEN: usize = 16;
+/// The Series report, id included. One S and Elite publish only its first
+/// [`pf_driver_proto::xbox::input_len`] bytes, which stop before Share.
+pub const XBOX_REPORT_LEN: usize = pf_driver_proto::xbox::SERIES_INPUT_LEN;
 
 const REPORT_ID: u8 = 0x01;
 
@@ -76,6 +75,19 @@ impl XboxState {
             rs_x,
             rs_y,
         }
+    }
+
+    /// A frame fully replaces the state: an Xbox pad has no rich-plane fields to keep.
+    pub fn from_frame(f: &GamepadFrame) -> XboxState {
+        XboxState::from_gamepad(
+            f.buttons,
+            f.left_trigger,
+            f.right_trigger,
+            f.ls_x,
+            f.ls_y,
+            f.rs_x,
+            f.rs_y,
+        )
     }
 }
 
@@ -160,6 +172,7 @@ pub fn serialize_xbox_state(s: &XboxState) -> [u8; XBOX_REPORT_LEN] {
     let (lo, hi) = button_bits(s.buttons);
     r[14] = lo;
     r[15] = hi;
+    r[16] = u8::from(s.buttons & gs::BTN_MISC1 != 0); // Share: Consumer `Record`
     r
 }
 
@@ -168,9 +181,111 @@ pub fn neutral_xbox_report() -> [u8; XBOX_REPORT_LEN] {
     serialize_xbox_state(&XboxState::default())
 }
 
+/// Xbox Bluetooth rumble report → `(low, high, left_trigger, right_trigger)` on 0..65535.
+///
+/// Report `0x03`: `[id, enable, left_trigger, right_trigger, strong, weak, duration, delay,
+/// loop]`. Magnitudes are 0..100, not 0..255; reading them as 0..255 costs 60 % of the range.
+/// `enable` bit 0 = weak (right handle, `high`), bit 1 = strong (left handle, `low`), bit 2 =
+/// right trigger, bit 3 = left trigger, as Linux `hid-microsoft` and xpadneo write them. A clear
+/// bit reads as a stopped motor. `None` for anything but a rumble report.
+pub fn parse_xbox_output(bytes: &[u8]) -> Option<(u16, u16, u16, u16)> {
+    // The driver republishes output reports report-id-prefixed, like the PS backends.
+    if bytes.len() < 6 || bytes[0] != 0x03 {
+        return None;
+    }
+    let enable = bytes[1];
+    let scale = |v: u8| -> u16 { (v.min(100) as u32 * 65535 / 100) as u16 };
+    let gated = |bit: u8, v: u8| if enable & bit != 0 { scale(v) } else { 0 };
+    Some((
+        gated(0x02, bytes[4]),
+        gated(0x01, bytes[5]),
+        gated(0x08, bytes[2]),
+        gated(0x04, bytes[3]),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rumble_scales_off_the_zero_to_hundred_protocol_range() {
+        let full = [0x03, 0x0F, 0, 0, 100, 100, 0, 0, 1];
+        assert_eq!(parse_xbox_output(&full), Some((65535, 65535, 0, 0)));
+        let half = [0x03, 0x03, 0, 0, 50, 100, 0, 0, 1];
+        assert_eq!(parse_xbox_output(&half), Some((32767, 65535, 0, 0)));
+    }
+
+    /// Trigger magnitudes share the handles' 0..100 range. A full-scale `100`
+    /// is `65535`, not `25700` (the 0..255 misread).
+    #[test]
+    fn trigger_magnitudes_are_not_a_zero_to_255_range() {
+        let full = [0x03, 0xFF, 100, 100, 0, 0, 0, 0, 1];
+        assert_eq!(parse_xbox_output(&full), Some((0, 0, 65535, 65535)));
+        let half = [0x03, 0xFF, 50, 25, 0, 0, 0, 0, 1];
+        assert_eq!(parse_xbox_output(&half), Some((0, 0, 32767, 16383)));
+    }
+
+    /// Values above 0..100 clamp, not wrap — all four actuators share the
+    /// scale closure.
+    #[test]
+    fn out_of_range_magnitudes_clamp() {
+        let over = [0x03, 0xFF, 255, 255, 255, 255, 0, 0, 1];
+        assert_eq!(parse_xbox_output(&over), Some((65535, 65535, 65535, 65535)));
+    }
+
+    /// One bit per actuator, as `hid-microsoft` (`ENABLE_WEAK` = bit 0, `ENABLE_STRONG` =
+    /// bit 1) and xpadneo (`XBOX_RUMBLE_RIGHT` = bit 2, `XBOX_RUMBLE_LEFT` = bit 3) define them.
+    /// Every actuator carries a distinct magnitude, so a swapped bit names the wrong motor.
+    #[test]
+    fn each_enable_bit_drives_its_own_actuator() {
+        let report = |enable: u8| [0x03, enable, 10, 20, 30, 40, 0, 0, 1];
+        let s = |v: u32| (v * 65535 / 100) as u16;
+        assert_eq!(
+            parse_xbox_output(&report(0x01)),
+            Some((0, s(40), 0, 0)),
+            "weak"
+        );
+        assert_eq!(
+            parse_xbox_output(&report(0x02)),
+            Some((s(30), 0, 0, 0)),
+            "strong"
+        );
+        assert_eq!(
+            parse_xbox_output(&report(0x04)),
+            Some((0, 0, 0, s(20))),
+            "right trigger"
+        );
+        assert_eq!(
+            parse_xbox_output(&report(0x08)),
+            Some((0, 0, s(10), 0)),
+            "left trigger"
+        );
+        assert_eq!(parse_xbox_output(&report(0x00)), Some((0, 0, 0, 0)), "none");
+    }
+
+    /// `hid-microsoft`'s `ms_ff_worker` sends `enable = 0x03` with only the handle magnitudes.
+    /// That is a handle-only rumble, never a trigger one.
+    #[test]
+    fn the_kernel_handle_report_leaves_the_triggers_silent() {
+        let kernel = [0x03, 0x03, 0, 0, 80, 20, 0xFF, 0, 0xFF];
+        assert_eq!(
+            parse_xbox_output(&kernel),
+            Some((
+                (80u32 * 65535 / 100) as u16,
+                (20u32 * 65535 / 100) as u16,
+                0,
+                0
+            ))
+        );
+    }
+
+    #[test]
+    fn non_rumble_reports_are_ignored() {
+        assert_eq!(parse_xbox_output(&[0x01, 0x0F, 0, 0, 100, 100]), None);
+        assert_eq!(parse_xbox_output(&[0x03, 0x0F, 0]), None);
+        assert_eq!(parse_xbox_output(&[]), None);
+    }
 
     fn le(b: &[u8]) -> u16 {
         u16::from_le_bytes([b[0], b[1]])
@@ -181,7 +296,7 @@ mod tests {
     fn the_report_matches_the_descriptor_layout() {
         let s = XboxState::from_gamepad(0, 0, 0, 0, 0, 0, 0);
         let r = serialize_xbox_state(&s);
-        assert_eq!(r.len(), XBOX_REPORT_LEN, "16 bytes: id + 8 + 4 + 1 + 2");
+        assert_eq!(r.len(), XBOX_REPORT_LEN, "17 bytes: id + 8 + 4 + 1 + 2 + 1");
         assert_eq!(r[0], 0x01, "report id");
     }
 
@@ -316,14 +431,25 @@ mod tests {
         }
     }
 
-    /// Touchpad / capture / paddles have no Xbox HID slot — drop them, do not collide with a real button.
+    /// Touchpad and paddles have no Xbox HID slot — drop them, do not collide with a real button.
     #[test]
     fn unmappable_wire_buttons_are_dropped() {
-        let extra = gs::BTN_TOUCHPAD | gs::BTN_MISC1 | gs::BTN_PADDLE1;
+        let extra = gs::BTN_TOUCHPAD | gs::BTN_PADDLE1;
         let r = serialize_xbox_state(&XboxState::from_gamepad(extra, 0, 0, 0, 0, 0, 0));
-        assert_eq!(r[14], 0);
-        assert_eq!(r[15], 0);
-        assert_eq!(r[13] & 0x0F, 0);
+        assert_eq!(r[13..], [0, 0, 0, 0]);
+    }
+
+    /// Share is bit 0 of byte 16, where the Series pad and SDL's Bluetooth parser put it. It
+    /// sits past the 16 bytes One S and Elite serve, so they never report it.
+    #[test]
+    fn share_is_bit_zero_of_the_byte_one_s_and_elite_do_not_serve() {
+        let r = serialize_xbox_state(&XboxState::from_gamepad(gs::BTN_MISC1, 0, 0, 0, 0, 0, 0));
+        assert_eq!(r[16], 0x01);
+        assert_eq!(r[13..16], [0, 0, 0], "Share set a button or the hat");
+        use pf_driver_proto::gamepad::{DEVTYPE_XBOX_ELITE, DEVTYPE_XBOX_ONE_S};
+        for dt in [DEVTYPE_XBOX_ONE_S, DEVTYPE_XBOX_ELITE] {
+            assert_eq!(pf_driver_proto::xbox::input_len(dt), 16);
+        }
     }
 
     #[test]
@@ -334,8 +460,7 @@ mod tests {
         );
         let r = neutral_xbox_report();
         assert_eq!(r[13], 0, "hat NULL");
-        assert_eq!(r[14], 0);
-        assert_eq!(r[15], 0);
+        assert_eq!(r[14..], [0, 0, 0], "no buttons, no Share");
         // Must match the driver's `XBOX_NEUTRAL_REPORT`; a drift is a different at-rest pose before the first frame.
         assert_eq!(r[0], 0x01);
         assert_eq!([r[1], r[2]], [0x00, 0x80], "LX = 0x8000");

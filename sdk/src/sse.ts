@@ -1,9 +1,11 @@
-// The SSE half of the SDK: a spec-shaped parser plus one shared reconnecting frame source both
-// surfaces consume — the Effect `Stream` wraps it, the Promise facade iterates it directly, so
-// there is exactly one implementation of connect/parse/resume (RFC §7: "two surfaces, one
-// core"). Reconnects carry `Last-Event-ID` (the host replays from its ring); backoff is
-// exponential + jittered, capped, and resets after a healthy connection.
+// The SSE half of the SDK: a spec-shaped parser, one shared reconnecting frame source and one
+// frame classifier both surfaces consume — the Effect `Stream` wraps them, the Promise facade
+// iterates them directly, so there is exactly one implementation of connect/parse/resume/decode
+// (RFC §7: "two surfaces, one core"). Reconnects carry `Last-Event-ID` (the host replays from its
+// ring); backoff is exponential + jittered, capped, and resets after a healthy connection.
+import { Result } from "effect";
 import type { Connection } from "./connection.js";
+import { decodeHostEvent, type HostEvent } from "./wire.js";
 
 /** One parsed SSE frame. */
 export interface SseFrame {
@@ -13,6 +15,31 @@ export interface SseFrame {
 	data: string;
 	/** The `id:` field (the host sets it to the event's `seq`). */
 	id?: string;
+}
+
+/**
+ * What one frame is. `dropped` is the fell-off-the-ring marker, `live` the end of the host's
+ * catch-up, `garbled` a payload that is not JSON, `unknown` a kind this SDK cannot decode (a newer
+ * host). The surfaces differ only in how they react.
+ */
+export type ClassifiedFrame =
+	| { tag: "event"; event: HostEvent }
+	| { tag: "unknown"; json: unknown }
+	| { tag: "dropped" | "live" | "garbled" };
+
+export function classifyFrame(frame: SseFrame): ClassifiedFrame {
+	if (frame.event === "dropped") return { tag: "dropped" };
+	if (frame.event === "live") return { tag: "live" };
+	let json: unknown;
+	try {
+		json = JSON.parse(frame.data);
+	} catch {
+		return { tag: "garbled" };
+	}
+	const decoded = decodeHostEvent(json);
+	return Result.isFailure(decoded)
+		? { tag: "unknown", json }
+		: { tag: "event", event: decoded.success };
 }
 
 /** Incremental SSE parser (the WHATWG dispatch rules the host's frames need). */

@@ -8,6 +8,8 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.InputDevice
+import android.view.KeyEvent
+import android.view.MotionEvent
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -15,6 +17,8 @@ import io.unom.punktfunk.CONNECT_TIMEOUT_MS
 import io.unom.punktfunk.ConnectErrors
 import io.unom.punktfunk.HostActions
 import io.unom.punktfunk.PresetStore
+import io.unom.punktfunk.REQUEST_ACCESS_TIMEOUT_MS
+import io.unom.punktfunk.SessionFactory
 import io.unom.punktfunk.Settings
 import io.unom.punktfunk.SettingsStore
 import io.unom.punktfunk.SpeedTestPhase
@@ -28,10 +32,12 @@ import io.unom.punktfunk.runSpeedTest
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.VideoDecoders
+import io.unom.punktfunk.kit.deviceBodyVibrator
 import io.unom.punktfunk.kit.discovery.DiscoveredHost
 import io.unom.punktfunk.kit.discovery.HostDiscovery
 import io.unom.punktfunk.kit.discovery.Presence
 import io.unom.punktfunk.kit.discovery.PresenceTracker
+import io.unom.punktfunk.kit.discovery.WakeLoop
 import io.unom.punktfunk.kit.library.LibraryCache
 import io.unom.punktfunk.kit.link.StartScreen
 import io.unom.punktfunk.kit.link.host
@@ -40,10 +46,10 @@ import io.unom.punktfunk.kit.library.LibraryClient
 import io.unom.punktfunk.kit.library.LibraryResult
 import io.unom.punktfunk.kit.library.RunningGame
 import io.unom.punktfunk.kit.security.ClientIdentity
-import io.unom.punktfunk.kit.security.IdentityStore
+import io.unom.punktfunk.kit.security.IdentityHolder
 import io.unom.punktfunk.kit.security.KnownHost
 import io.unom.punktfunk.kit.security.KnownHostStore
-import io.unom.punktfunk.kit.security.obtainIdentity
+import io.unom.punktfunk.kit.security.nowSecs
 import io.unom.punktfunk.models.ActiveSession
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -104,9 +110,10 @@ object SkiaConsole {
     private lateinit var knownHostStore: KnownHostStore
     private lateinit var presetStore: PresetStore
     private lateinit var settingsStore: SettingsStore
-    private var identity: ClientIdentity? = null
-    /** The identity load has ended, with or without one. Main-thread only. */
-    private var identityLoaded = false
+    private lateinit var identities: IdentityHolder
+    private val identity: ClientIdentity? get() = identities.current
+    /** A link that arrived before the first identity load ended; replayed once it has. Main-thread only. */
+    private var parkedLink: String? = null
     private var discovery: HostDiscovery? = null
     private var discovered: List<DiscoveredHost> = emptyList()
 
@@ -141,7 +148,6 @@ object SkiaConsole {
     private var holdsLaunch = false
     private var onSettingsChange: ((Settings) -> Unit)? = null
     private var onQuit: (() -> Unit)? = null
-    private var onPlatformScreen: ((String) -> Unit)? = null
     private var onPadAction: ((String, String) -> Unit)? = null
     private var onPulse: ((String) -> Unit)? = null
 
@@ -214,6 +220,7 @@ object SkiaConsole {
         val app = context.applicationContext
         appContext = app
         knownHostStore = KnownHostStore(app)
+        identities = IdentityHolder.shared(app)
         presetStore = PresetStore(app)
         settingsStore = SettingsStore(app)
         settings = initial
@@ -226,6 +233,8 @@ object SkiaConsole {
             // The touch shell exists as a fallback on phones/tablets but not on a TV —
             // gates the console's own "Controller-optimized UI" off switch.
             .put("fallback_ui", !io.unom.punktfunk.isTvDevice(app))
+            // No clipboard worth copying a link to on a TV.
+            .put("tv", io.unom.punktfunk.isTvDevice(app))
             // The same MediaCodec answer the Hello advertises by: without a real AV1
             // decoder the codec row marks AV1 unsupported instead of offering a dead pick.
             .put("av1_ok", VideoDecoders.decodableCodecBits() and 4 != 0)
@@ -327,16 +336,16 @@ object SkiaConsole {
      * with a 75-minute TTL that a suspending host sends no goodbye for, so trusting it left a
      * sleeping machine reading Online and, since Wake is gated on `!online`, unwakeable.
      *
-     * Only while the console is ON SCREEN (attached): parked behind the touch UI or a stream
-     * there is nobody to show the pips to — and mid-stream the radio belongs to the session. The
-     * timer keeps ticking so probes resume within a cadence of re-attach.
+     * Only while the console is ON SCREEN (attached, the app in front): parked behind the touch
+     * UI, a stream or Home there is nobody to show the pips to — and mid-stream the radio belongs
+     * to the session. The timer keeps ticking so probes resume within a cadence of coming back.
      */
     private val sweep = object : Runnable {
         override fun run() {
             if (handle == 0L) return
             main.removeCallbacks(this)
             main.postDelayed(this, SWEEP_MS)
-            if (onConnected == null) return
+            if (onConnected == null || discovery?.appVisible == false) return
             val saved = knownHostStore.all()
             val live = discovered
             ioPool.execute {
@@ -367,20 +376,19 @@ object SkiaConsole {
     }
 
     private fun startServices(app: Context) {
-        ioPool.execute {
-            val id = runCatching { obtainIdentity(IdentityStore(app)) }
-                .onFailure { Log.w(TAG, "identity unavailable: ${it.message}") }
-                .getOrNull()
-            main.post { identity = id; identityLoaded = true }
-        }
+        identities.ensure()
         discovery = HostDiscovery.shared(app).also { it.addNetworkListener(onNetworkChanged) }
         resumeDiscovery()
         // Commands from the console, drained on a short cadence once the identity load ends:
-        // a start entry queues its shelf fetch or desktop dial before that.
+        // a start entry queues its shelf fetch or desktop dial before that, and a cold-start
+        // link waits in `parkedLink`.
         main.post(object : Runnable {
             override fun run() {
                 if (handle == 0L) return
-                if (identityLoaded) drainCommands()
+                if (identities.settled) {
+                    parkedLink?.let { parkedLink = null; handleDeepLink(it) }
+                    drainCommands()
+                }
                 main.postDelayed(this, 100)
             }
         })
@@ -405,7 +413,6 @@ object SkiaConsole {
         onConnected: (ActiveSession) -> Unit,
         onSettingsChange: (Settings) -> Unit,
         onQuit: () -> Unit,
-        onPlatformScreen: (String) -> Unit,
         onPadAction: (String, String) -> Unit,
         onPulse: (String) -> Unit,
         onAnnounce: (String) -> Unit,
@@ -413,7 +420,6 @@ object SkiaConsole {
         this.onConnected = onConnected
         this.onSettingsChange = onSettingsChange
         this.onQuit = onQuit
-        this.onPlatformScreen = onPlatformScreen
         this.onPadAction = onPadAction
         this.onPulse = onPulse
         this.onAnnounce = onAnnounce
@@ -431,7 +437,6 @@ object SkiaConsole {
         onConnected = null
         onSettingsChange = null
         onQuit = null
-        onPlatformScreen = null
         onPadAction = null
         onPulse = null
         onAnnounce = null
@@ -483,9 +488,14 @@ object SkiaConsole {
      * decision — or that named the host by a guessable label or address — is a notice here. A link
      * may never establish trust, the console's Pair screen is reached from the host's tile rather
      * than from a URL, and the console draws no prompt this shell could ask a question through.
+     * A cold start delivers the link before the identity load ends; it waits for that.
      */
     fun handleDeepLink(url: String) {
         if (handle == 0L) return
+        if (!identities.settled) {
+            parkedLink = url
+            return
+        }
         val parsed = io.unom.punktfunk.kit.link.DeepLinks.parse(url)
         if (parsed is io.unom.punktfunk.kit.link.DeepLinkResult.Refused) {
             if (parsed.error != io.unom.punktfunk.kit.link.LinkError.NOT_OUR_SCHEME) notice(parsed.message())
@@ -541,8 +551,26 @@ object SkiaConsole {
         if (handle == 0L) return
         NativeBridge.nativeConsoleSetPads(
             handle,
-            ConsoleJson.pads(Gamepad.pads(), driving ?: Gamepad.firstPad(), extras),
+            ConsoleJson.pads(
+                Gamepad.pads(),
+                driving ?: Gamepad.firstPad(),
+                extras,
+                appContext?.let(::deviceBodyVibrator),
+                ConsoleJson.otherInputs(),
+            ),
         )
+    }
+
+    /**
+     * The driving pad's reading while the console's input test is on (`ConsoleCmd::PadTest`),
+     * null otherwise. While set, the shell's probes feed it instead of the menu. Main-thread only.
+     */
+    internal var padTest: PadTestReading? = null
+        private set
+
+    internal fun pushPadTest() {
+        val t = padTest ?: return
+        if (handle != 0L) NativeBridge.nativeConsoleSetPadTest(handle, t.json())
     }
 
     // ---- model pushers -----------------------------------------------------------------------
@@ -697,14 +725,14 @@ object SkiaConsole {
         val requestAccess = a.optBoolean("request_access", false)
         val id = identity
         if (id == null) {
-            NativeBridge.nativeConsoleSessionPhase(handle, 2, "Identity not ready yet — try again in a moment")
+            NativeBridge.nativeConsoleSessionPhase(handle, 2, identities.blockedMessage())
             return
         }
         // The shell raises its hold for a GAME launch off a shelf; a desktop connect and a
         // launcher tile go straight through, so the session is handed over at once. Mirrors
         // `Shell::launch_hold`, and reads the same cached catalog the shelf was drawn from.
         holdsLaunch = launchId != null &&
-            LibraryCache.standard(app.cacheDir).load(kh?.id ?: fp)?.games
+            LibraryCache.standard(app.cacheDir).load(LibraryCache.keyFor(kh, fp))?.games
                 ?.firstOrNull { it.id == launchId }?.isLauncher == false
         val preset: StreamPreset? = presetStore.resolveFor(kh, presetId, launchId)
         val effective = settings.effectiveFor(preset)
@@ -719,6 +747,7 @@ object SkiaConsole {
                     app, effective, id, addr, port, fp, launchId,
                     dialer = if (launchId != null) "console/library" else "console/desktop",
                     timeoutMs = timeout,
+                    preset = preset,
                 )
             }
             main.post {
@@ -732,29 +761,17 @@ object SkiaConsole {
                     // A request-access approval, or a first TOFU-less connect: save the host as
                     // PAIRED, pinning what it presented, so the next connect is silent.
                     if (record == null || (requestAccess && !record.paired)) {
-                        val seen = NativeBridge.nativeHostFingerprint(h)
-                        if (seen.isNotEmpty()) {
-                            val name = record?.name
-                                ?: discovered.firstOrNull { it.host == addr && it.port == port }?.name
-                                ?: addr
-                            record = knownHostStore.trust(addr, port, name, seen, paired = requestAccess || record?.paired == true)
+                        val name = record?.name
+                            ?: discovered.firstOrNull { it.host == addr && it.port == port }?.name
+                            ?: addr
+                        val paired = requestAccess || record?.paired == true
+                        SessionFactory.pinPresented(h, addr, port, name, paired, knownHostStore)?.let {
+                            record = it
                             pushHosts(); pushKnownHosts()
                         }
                     }
-                    if (record != null) {
-                        NativeBridge.nativeHostMgmtPort(h).takeIf { it > 0 }?.let {
-                            knownHostStore.learnMgmtPort(record, it)
-                        }
-                    }
-                    val session = ActiveSession(
-                        h,
-                        effective,
-                        clipboardSync = record?.clipboardSync ?: false,
-                        presetName = preset?.name,
-                        hostId = record?.id,
-                        launchedFromLibrary = launchId != null,
-                        libraryPresetId = presetId,
-                    )
+                    val session = SessionFactory.afterDial(h, record, effective, preset, knownHostStore)
+                        .copy(launchedFromLibrary = launchId != null, libraryPresetId = presetId)
                     // The console learns the dial landed and keeps the screen: its launch hold
                     // is still waiting on the game. Handing the session over here instead would
                     // swap the console for the stream view mid-wait, which is the seam this
@@ -782,6 +799,20 @@ object SkiaConsole {
 
     // ---- commands from the console -----------------------------------------------------
 
+    /** `ConsoleCmd::LoadLicenses`: the notices this APK bundles, for the console's Licences screen. */
+    private fun loadLicenses() {
+        val app = appContext ?: return
+        ioPool.execute {
+            val notices = runCatching {
+                app.assets.open("THIRD-PARTY-NOTICES.txt").bufferedReader().use { it.readText() }
+            }.getOrDefault("Third-party notices unavailable.")
+            val json = JSONArray()
+                .put(JSONObject().put("heading", "Third-party software").put("text", notices))
+                .toString()
+            main.post { if (handle != 0L) NativeBridge.nativeConsoleSetLicenses(handle, json) }
+        }
+    }
+
     private fun drainCommands() {
         val arr = runCatching { JSONArray(NativeBridge.nativeConsoleDrainCmds(handle)) }.getOrNull() ?: return
         for (i in 0 until arr.length()) {
@@ -789,6 +820,7 @@ object SkiaConsole {
                 is String -> when (c) {
                     "CancelWake" -> { wakeGen.incrementAndGet(); NativeBridge.nativeConsoleSetWake(handle, "null") }
                     "Probe" -> { resumeDiscovery(); pushHosts() }
+                    "LoadLicenses" -> loadLicenses()
                 }
                 is JSONObject -> {
                     c.optJSONObject("FetchLibrary")?.let { fetchLibrary(it, refreshOnly = false) }
@@ -797,24 +829,31 @@ object SkiaConsole {
                     c.optJSONObject("SendLogs")?.let(::sendLogs)
                     c.optJSONObject("SpeedTest")?.let(::speedTest)
                     c.optJSONObject("HostAction")?.let(::hostAction)
+                    c.optJSONObject("EndGame")?.let(::endGame)
                     c.optJSONObject("SaveHost")?.let(::saveHost)
                     c.optJSONObject("UpdateHost")?.let(::updateHost)
                     c.optJSONObject("ForgetHost")?.let(::forgetHost)
+                    c.optJSONObject("UnpairHost")?.let(::unpairHost)
+                    c.optJSONObject("SavePreset")?.let(::savePreset)
+                    c.optJSONObject("DeletePreset")?.let {
+                        presetStore.delete(it.optString("id"))
+                        pushPresets()
+                    }
                     c.optJSONObject("Wake")?.let(::wake)
                     c.optJSONObject("SetPin")?.let(::setPin)
                     c.optJSONObject("BindPreset")?.let(::bindPreset)
                     c.optJSONObject("SetClipboard")?.let(::setClipboard)
-                    c.optJSONObject("OpenPlatformScreen")?.let { onPlatformScreen?.invoke(it.optString("id")) }
+                    c.optJSONObject("PadTest")?.let {
+                        padTest = if (it.optBoolean("on")) PadTestReading() else null
+                    }
                     c.optJSONObject("PadAction")?.let { onPadAction?.invoke(it.optString("action"), it.optString("pad_key")) }
-                    c.optString("OpenPlatformScreen").takeIf { c.has("OpenPlatformScreen") && c.opt("OpenPlatformScreen") is String }
-                        ?.let { onPlatformScreen?.invoke(it) }
                 }
             }
         }
     }
 
     private fun hostForKey(key: String): KnownHost? {
-        val primary = key.substringBefore('\u0000')
+        val primary = ConsoleJson.hostKey(key)
         return knownHostStore.all().firstOrNull { ConsoleJson.rowKey(it.fpHex, it.address, it.port) == primary }
     }
 
@@ -828,7 +867,12 @@ object SkiaConsole {
         if (existing != null) {
             if (name.isNotEmpty()) knownHostStore.save(existing.copy(name = name))
         } else {
-            knownHostStore.save(KnownHost(address = addr, port = port, name = name.ifEmpty { addr }, fpHex = "", paired = false))
+            knownHostStore.save(
+                KnownHost(
+                    address = addr, port = port, name = name.ifEmpty { addr }, fpHex = "", paired = false,
+                    addedAt = nowSecs(),
+                ),
+            )
         }
         pushHosts(); pushKnownHosts()
     }
@@ -845,6 +889,28 @@ object SkiaConsole {
         val kh = hostForKey(c.optString("key")) ?: return
         knownHostStore.remove(kh)
         appContext?.let { LibraryCache.standard(it.cacheDir).forget(kh.id) }
+        pushHosts(); pushKnownHosts()
+    }
+
+    /** `ConsoleCmd::SavePreset`: the console saved one preset whole, merged onto the stored one. */
+    private fun savePreset(c: JSONObject) {
+        val id = c.optString("id").takeIf { it.isNotEmpty() } ?: return
+        val stored = presetStore.byId(id) ?: StreamPreset(id = id, name = "")
+        val overrides = io.unom.punktfunk.SettingsOverlay.fromConsoleJson(
+            c.optJSONObject("overrides") ?: JSONObject(), stored.overrides,
+        )
+        presetStore.save(stored.copy(name = c.optString("name"), overrides = overrides))
+        pushPresets()
+    }
+
+    private fun pushPresets() {
+        if (handle != 0L) NativeBridge.nativeConsoleSetPresets(handle, ConsoleJson.presets(presetStore.all()))
+    }
+
+    /** `ConsoleCmd::UnpairHost`: keep the record, drop its pin, so the next connect pairs again. */
+    private fun unpairHost(c: JSONObject) {
+        val kh = hostForKey(c.optString("key")) ?: return
+        knownHostStore.save(kh.copy(fpHex = "", paired = false))
         pushHosts(); pushKnownHosts()
     }
 
@@ -895,7 +961,7 @@ object SkiaConsole {
         val hostName = c.optString("host_name").ifEmpty { addr }
         val id = identity
         if (id == null) {
-            notice("Identity not ready yet — try again in a moment")
+            notice(identities.blockedMessage())
             return
         }
         val app = appContext ?: return
@@ -915,7 +981,7 @@ object SkiaConsole {
         val addr = c.optString("addr"); val port = c.optInt("port"); val fp = c.optString("fp_hex")
         val id = identity
         if (id == null) {
-            advanceSpeed(key, SpeedTestPhase.Failed("Identity not ready yet — try again in a moment"))
+            advanceSpeed(key, SpeedTestPhase.Failed(identities.blockedMessage()))
             return
         }
         val app = appContext ?: return
@@ -923,7 +989,10 @@ object SkiaConsole {
         // console keeps drawing.
         ioPool.execute {
             kotlinx.coroutines.runBlocking {
-                runSpeedTest(app, id, addr, port, fp) { p -> main.post { advanceSpeed(key, p) } }
+                runSpeedTest(
+                    app, id, addr, port, fp,
+                    onProgress = { kbps -> main.post { advanceSpeedProgress(key, kbps) } },
+                ) { p -> main.post { advanceSpeed(key, p) } }
             }
         }
     }
@@ -945,6 +1014,12 @@ object SkiaConsole {
         NativeBridge.nativeConsoleAdvanceSpeed(handle, key, json)
     }
 
+    /** A mid-burst figure for the console's graph, as `SpeedPhase::Progress`. */
+    private fun advanceSpeedProgress(key: String, kbps: Int) {
+        val json = JSONObject().put("Progress", JSONObject().put("kbps", kbps)).toString()
+        NativeBridge.nativeConsoleAdvanceSpeed(handle, key, json)
+    }
+
     /**
      * Sleep / restart / shut the host down (`design/host-actions.md` §7) — the console already
      * confirmed a destructive one twice before raising this, and the host re-checks this
@@ -956,7 +1031,7 @@ object SkiaConsole {
         val actionId = c.optString("action_id"); val label = c.optString("label")
         val id = identity
         if (id == null) {
-            notice("Identity not ready yet — try again in a moment")
+            notice(identities.blockedMessage())
             return
         }
         ioPool.execute {
@@ -965,12 +1040,30 @@ object SkiaConsole {
         }
     }
 
+    /** End a title this device launched, say how it went, then re-read what the host runs. */
+    private fun endGame(c: JSONObject) {
+        val addr = c.optString("addr"); val mgmt = c.optInt("mgmt"); val fp = c.optString("fp_hex")
+        val appId = c.optString("app_id"); val title = c.optString("title")
+        val id = identity
+        if (id == null) {
+            notice(identities.blockedMessage())
+            return
+        }
+        ioPool.execute {
+            val outcome = LibraryClient.endGame(addr, mgmt, id.certPem, id.privateKeyPem, fp, appId)
+            main.post {
+                notice(outcome.notice(title))
+                fetchLibrary(c, refreshOnly = true)
+            }
+        }
+    }
+
     private fun pair(c: JSONObject) {
         val addr = c.optString("addr"); val port = c.optInt("port")
         val pin = c.optString("pin"); val name = c.optString("device_name")
         val id = identity
         if (id == null) {
-            NativeBridge.nativeConsoleSetPair(handle, ConsoleJson.pairFailed("Identity not ready yet — try again in a moment"))
+            NativeBridge.nativeConsoleSetPair(handle, ConsoleJson.pairFailed(identities.blockedMessage()))
             return
         }
         NativeBridge.nativeConsoleSetPair(handle, ConsoleJson.pairBusy())
@@ -995,9 +1088,9 @@ object SkiaConsole {
     }
 
     /**
-     * The wake-and-wait loop (the desktop's `spawn_wake`): resend the magic packet every 6 s,
-     * probe once a second, 90 s timeout; the console reads `online`/`timed_out` off the status
-     * and acts (a `then_connect` wake dials from the shell's side once online).
+     * The wake-and-wait loop ([WakeLoop], the desktop's `spawn_wake`); the console reads
+     * `online`/`timed_out` off the status and acts (a `then_connect` wake dials from the shell's
+     * side once online). Online is a probe of the host, at its live advert's address if it has one.
      */
     private fun wake(c: JSONObject) {
         val key = c.optString("key"); val thenConnect = c.optBoolean("then_connect")
@@ -1006,32 +1099,27 @@ object SkiaConsole {
         val gen = wakeGen.incrementAndGet()
         val name = kh.name.ifBlank { kh.address }
         ioPool.execute {
-            val started = System.currentTimeMillis()
-            var lastPacket = 0L
-            while (wakeGen.get() == gen && handle != 0L) {
-                val elapsed = ((System.currentTimeMillis() - started) / 1000).toInt()
-                val timedOut = elapsed >= 90
-                if (!timedOut && System.currentTimeMillis() - lastPacket >= 6_000) {
-                    NativeBridge.nativeWakeOnLan(kh.mac.joinToString(","), kh.address)
-                    lastPacket = System.currentTimeMillis()
-                }
-                val online = Presence.isSelf(kh, NativeBridge.nativeProbe(kh.address, kh.port, 900)) ||
-                    discovered.any { kh.matches(it) }
-                if (wakeGen.get() != gen) return@execute
+            WakeLoop.run(
+                kh.mac, kh.address,
+                isOnline = {
+                    Presence.probeSelf(kh, discovered.firstOrNull { kh.matches(it) }) { addr, port ->
+                        NativeBridge.nativeProbe(addr, port, 900)
+                    }
+                },
+                cancelled = { wakeGen.get() != gen || handle == 0L },
+            ) { seconds, timedOut, online ->
                 NativeBridge.nativeConsoleSetWake(
                     handle,
-                    ConsoleJson.wakeStatus(key, name, elapsed, timedOut, online, thenConnect),
+                    ConsoleJson.wakeStatus(key, name, seconds, timedOut, online, thenConnect),
                 )
-                if (online || timedOut) return@execute
-                Thread.sleep(1000)
             }
         }
     }
 
     /**
-     * The library pipeline (the desktop's `spawn_fetch`): cached shelf first, wake + retry
-     * across the boot window when the host has a MAC, then the catalog, the running set and
-     * the posters — each poster fetched over the same mTLS client and pushed as bytes.
+     * The library pipeline (the desktop's `spawn_fetch`): cached shelf first, then
+     * [LibraryClient.fetchAcrossWake], then the running set and the posters — each poster
+     * fetched over the same mTLS client and pushed as bytes.
      */
     private fun fetchLibrary(c: JSONObject, refreshOnly: Boolean) {
         val app = appContext ?: return
@@ -1039,7 +1127,8 @@ object SkiaConsole {
         val id = identity
         val kh = knownHostStore.getByFp(fp)
         if (refreshOnly) {
-            if (id == null) return
+            // Silent path — no notice, but the failed load still gets its retry.
+            if (id == null) { identities.blockedMessage(); return }
             ioPool.execute {
                 val games = LibraryClient.fetchRunning(addr, mgmt, id.certPem, id.privateKeyPem, fp)
                 main.post {
@@ -1056,29 +1145,21 @@ object SkiaConsole {
         val gen = fetchGen.incrementAndGet()
         NativeBridge.nativeConsoleLibraryBegin(handle)
         if (id == null) {
-            NativeBridge.nativeConsoleLibraryPhase(handle, ConsoleJson.libraryError("Couldn't load the library", "Identity not ready yet — try again in a moment", true))
+            NativeBridge.nativeConsoleLibraryPhase(handle, ConsoleJson.libraryError("Couldn't load the library", identities.blockedMessage(), true))
             return
         }
         val cache = LibraryCache.standard(app.cacheDir)
-        val cacheKey = kh?.id ?: fp.ifEmpty { "$addr:$mgmt" }
+        val cacheKey = LibraryCache.keyFor(kh, fp)
         ioPool.execute {
             val cached = cache.load(cacheKey)?.games?.takeIf { it.isNotEmpty() }
             if (cached != null) main.post { if (gen == fetchGen.get()) NativeBridge.nativeConsoleLibraryGames(handle, ConsoleJson.libraryGames(cached), true) }
-            val macs = kh?.mac.orEmpty()
-            val waking = macs.isNotEmpty() && settings.autoWakeEnabled
-            if (waking) NativeBridge.nativeWakeOnLan(macs.joinToString(","), addr)
-            val attempts = if (waking) 12 else 1
-            var result: LibraryResult? = null
-            for (attempt in 0 until attempts) {
-                if (gen != fetchGen.get()) return@execute
-                val r = LibraryClient.fetch(addr, mgmt, id.certPem, id.privateKeyPem, fp)
-                result = r
-                if (r is LibraryResult.Ok || r is LibraryResult.Unauthorized) break
-                if (attempt + 1 >= attempts) break
-                if (attempt % 2 == 1) NativeBridge.nativeWakeOnLan(macs.joinToString(","), addr)
-                main.post { if (gen == fetchGen.get()) NativeBridge.nativeConsoleLibraryStale(handle, 1) }
-                Thread.sleep(5_000)
-            }
+            val result = LibraryClient.fetchAcrossWake(
+                addr, mgmt, id.certPem, id.privateKeyPem, fp,
+                macs = kh?.mac.orEmpty(),
+                autoWake = settings.autoWakeEnabled,
+                isCancelled = { gen != fetchGen.get() },
+                onWaking = { main.post { if (gen == fetchGen.get()) NativeBridge.nativeConsoleLibraryStale(handle, 1) } },
+            )
             if (gen != fetchGen.get()) return@execute
             when (val r = result) {
                 is LibraryResult.Ok -> {
@@ -1143,9 +1224,6 @@ object SkiaConsole {
         }
     }
 
-    /** The no-PIN request-access park (≥ the host's approval window) — ConnectScreen's figure. */
-    private const val REQUEST_ACCESS_TIMEOUT_MS = 185_000
-
     /** How long a host's advertised actions stay fresh before we ask again — the desktop's
      *  `pf_client_core::host_actions::TTL`. Long on purpose: what it governs changes when an
      *  operator edits access, not minute to minute, and each refresh is a TLS handshake. */
@@ -1178,4 +1256,60 @@ internal fun fetchArt(candidates: List<String>, client: OkHttpClient, offline: B
         if (bytes != null) return bytes
     }
     return null
+}
+
+/** One pad's held buttons and axes, by the names the console's `PadTestState` reads. */
+internal class PadTestReading {
+    private val keys = linkedSetOf<String>()
+    /** The d-pad as a HAT, which many pads report instead of keys. */
+    private val hat = linkedSetOf<String>()
+    private var axes: Map<String, Float> = emptyMap()
+
+    /** A key by its CORRECTED code ([Gamepad.padKeyCode]), as the stream reads it. */
+    fun key(code: Int, down: Boolean) {
+        val name = TEST_NAMES[code] ?: return
+        if (down) keys += name else keys -= name
+    }
+
+    fun motion(ev: MotionEvent) {
+        axes = io.unom.punktfunk.padAxes(ev)
+        val (hx, hy) = (axes["HX"] ?: 0f) to (axes["HY"] ?: 0f)
+        hat.clear()
+        if (hx < -0.5f) hat += "Left"
+        if (hx > 0.5f) hat += "Right"
+        if (hy < -0.5f) hat += "Up"
+        if (hy > 0.5f) hat += "Down"
+    }
+
+    fun json(): String {
+        val held = JSONArray()
+        (keys + hat).forEach { held.put(it) }
+        val ax = JSONArray()
+        for (n in listOf("LX", "LY", "RX", "RY", "LT", "RT")) {
+            ax.put(JSONArray().put(n).put((axes[n] ?: 0f).toDouble()))
+        }
+        return JSONObject().put("held", held).put("axes", ax).toString()
+    }
+
+    private companion object {
+        val TEST_NAMES = mapOf(
+            KeyEvent.KEYCODE_BUTTON_A to "A",
+            KeyEvent.KEYCODE_BUTTON_B to "B",
+            KeyEvent.KEYCODE_BUTTON_X to "X",
+            KeyEvent.KEYCODE_BUTTON_Y to "Y",
+            KeyEvent.KEYCODE_BUTTON_L1 to "LB",
+            KeyEvent.KEYCODE_BUTTON_R1 to "RB",
+            KeyEvent.KEYCODE_BUTTON_L2 to "LT",
+            KeyEvent.KEYCODE_BUTTON_R2 to "RT",
+            KeyEvent.KEYCODE_BUTTON_SELECT to "Back",
+            KeyEvent.KEYCODE_BUTTON_START to "Start",
+            KeyEvent.KEYCODE_BUTTON_MODE to "Guide",
+            KeyEvent.KEYCODE_BUTTON_THUMBL to "LS",
+            KeyEvent.KEYCODE_BUTTON_THUMBR to "RS",
+            KeyEvent.KEYCODE_DPAD_UP to "Up",
+            KeyEvent.KEYCODE_DPAD_DOWN to "Down",
+            KeyEvent.KEYCODE_DPAD_LEFT to "Left",
+            KeyEvent.KEYCODE_DPAD_RIGHT to "Right",
+        )
+    }
 }

@@ -143,20 +143,24 @@ float main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 ";
 
 /// P010 chroma: half-res interleaved (Cb,Cr) on plane 1 (`R16G16_UNORM`).
-/// Left-cosited (H.273 chroma_loc type 0, the unsignaled default). Average the
-/// even luma column's two rows in scRGB-linear, then PQ + Cb/Cr. A 2×2 box is
-/// centre-sited and shifts chroma by half a luma pixel against the decoder.
-/// `inv_src` = (1/srcW, 1/srcH).
+/// Left-cosited (H.273 chroma_loc type 0, the unsignaled default): a [1 2 1] filter
+/// centred on the even luma column, over both rows, in scRGB-linear, then PQ + Cb/Cr.
+/// Without the side taps the odd column never reaches chroma and 1-px colour aliases;
+/// a 2×2 box is centre-sited and shifts chroma half a luma pixel. The PyroWave pass
+/// uses the same taps. `inv_src` = (1/srcW, 1/srcH).
 const HDR_P010_UV_PS: &str = r"
 #include_common
 cbuffer C : register(b0) { float2 inv_src; float2 pad; };
+float3 left_taps(float2 c, float hx) {
+    return tx.Sample(sm, c - float2(2.0 * hx, 0.0)).rgb + 2.0 * tx.Sample(sm, c).rgb
+         + tx.Sample(sm, c + float2(2.0 * hx, 0.0)).rgb;
+}
 float2 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
-    // `uv` is the chroma texel centre (middle of the 2×2 luma block). Left-cosite
-    // is the LEFT column: the two centres sit at uv + (-h.x, ±h.y).
+    // `uv` is the chroma texel centre (middle of the 2×2 luma block). The even (left)
+    // column's two centres sit at uv + (-h.x, ±h.y); point sampling clamps at the edge.
     float2 h = inv_src * 0.5;
-    float3 a = tx.Sample(sm, uv + float2(-h.x, -h.y)).rgb;
-    float3 b = tx.Sample(sm, uv + float2(-h.x,  h.y)).rgb;
-    float3 scrgb = (a + b) * 0.5;
+    float3 scrgb = (left_taps(uv + float2(-h.x, -h.y), h.x)
+                  + left_taps(uv + float2(-h.x,  h.y), h.x)) * 0.125;
     float3 nits = scrgb * 80.0;
     float3 lin2020 = mul(BT709_TO_BT2020, nits);
     float3 pq = pq_oetf(lin2020 / 10000.0);

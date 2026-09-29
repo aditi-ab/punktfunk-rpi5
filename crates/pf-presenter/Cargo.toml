@@ -22,8 +22,6 @@ punktfunk-core = { path = "../punktfunk-core", default-features = false }
 # C++ in — fatal on Windows ARM64, where Granite has no SIMD path.
 pf-client-core = { path = "../pf-client-core", default-features = false, features = ["desktop"] }
 punktfunk-core = { path = "../punktfunk-core", features = ["quic", "serde"] }
-# The `stats-json:` stdout line (the overlay snapshot).
-serde_json = "1"
 # `--probe-decode` reports the driver's own video-format answers through pf-vkdecode's
 # query rather than a second copy of it — a probe that keeps its own copy is a probe
 # that eventually disagrees with the code it exists to explain (VIDEO_BASE's doc says
@@ -35,7 +33,7 @@ pf-vkdecode = { path = "../pf-vkdecode" }
 # start and fail into a clean error; on Windows vulkan-1.dll is a GPU-driver component).
 # `ash` on sdl3 types SDL_Vulkan_CreateSurface with ash 0.38 handles so the surface
 # hands over without transmutes.
-ash = { version = "0.38", features = ["loaded"] }
+ash = { workspace = true, features = ["loaded"] }
 
 async-channel = "2"
 anyhow = "1"
@@ -45,20 +43,29 @@ tracing = "0.1"
 # of the workspace's Windows SDL consumers).
 [target.'cfg(target_os = "linux")'.dependencies]
 sdl3 = { version = "0.18", features = ["hidapi", "ash"] }
+# `fence::wait_sync_file`: the CPU fallback when the device cannot import a
+# sync_file as a semaphore.
+pf-dmabuf = { path = "../pf-dmabuf" }
 # `wayland_scroll` wraps SDL's foreign wl_display: `system` is the backend that
 # can, `dlopen` keeps the libwayland-client link lazy. Versions match the
 # workspace's locked wayland-* set (pf-inject uses the same 0.31/0.3 line).
 wayland-client = { version = "0.31", features = ["system", "dlopen"] }
 wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
 wayland-sys = { version = "0.31", default-features = false, features = ["client"] }
+# `wl_native`: linux-dmabuf, presentation-time and colour-representation on that same
+# connection; `rustix` reads CLOCK_MONOTONIC to move presentation stamps onto the session clock.
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+rustix = { version = "1", features = ["time"] }
 
 [target.'cfg(windows)'.dependencies]
 sdl3 = { version = "0.18", features = ["hidapi", "ash", "build-from-source"] }
 # Window branding only (win32.rs): the exe-embedded icon onto the SDL window's title
 # bar/taskbar (WM_SETICON) and the shared AppUserModelID for unpackaged runs, so the
-# shell and the session window group as ONE taskbar app across the visibility handoff.
-windows-sys = { version = "0.61", features = [
+# shell and the session window group as ONE taskbar app across the visibility handoff. Gdi: the
+# window's monitor, the key for the HDR volume lookup.
+windows-sys = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_Storage_Packaging_Appx",
     "Win32_System_LibraryLoader",
     "Win32_UI_Shell",

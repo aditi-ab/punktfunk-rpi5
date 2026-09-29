@@ -11,9 +11,9 @@
 
 use crate::audio;
 use crate::video::{DecodedFrame, DecodedImage, Decoder};
-use punktfunk_core::client::NativeClient;
+use punktfunk_core::client::{ConnectParams, FrameOrder, NativeClient};
 use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
-use punktfunk_core::reanchor::{index_gap, GateVerdict, ReanchorGate};
+use punktfunk_core::reanchor::{GateVerdict, ReanchorGate};
 use punktfunk_core::PunktfunkError;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -97,6 +97,9 @@ pub struct SessionParams {
     /// only — values are already baked in; it rides so the overlay can name the preset
     /// without re-reading a store.
     pub preset: Option<String>,
+    /// That preset's stable id: the dial names it to the host, which shows it and hands it to
+    /// hooks and plugins. `None` with `preset` from an older spec just names nothing.
+    pub preset_id: Option<String>,
     /// Overlay tier this launch resolved to. Presentation-only: the controller never
     /// reads it. It rides so a browse-mode presenter (one window, many sessions) can
     /// adopt a per-launch choice; the in-stream cycle chord still wins for that stream.
@@ -104,17 +107,23 @@ pub struct SessionParams {
     /// Overlay vocabulary this launch resolved: Standard (`false`) or Advanced. Rides per
     /// launch like the tier, so a browse-mode presenter adopts a change made between streams.
     pub advanced_stats: bool,
-    /// Advertise `CLIENT_CAP_PHASE_LOCK`: the presenter has real on-glass latch stamps
-    /// (`VK_KHR_present_wait`) and will feed [`latch_grid`](Self::latch_grid). Never
-    /// set without present timing — the host arms on report receipt.
+    /// Stats panel corner and size multiplier, per launch like the tier.
+    pub stats_corner: crate::trust::HudCorner,
+    pub stats_scale: f32,
+    /// Show how to leave when this stream starts.
+    pub exit_hint: bool,
+    /// Advertise `CLIENT_CAP_PHASE_LOCK` and feed [`latch_grid`](Self::latch_grid). The
+    /// desktop leaves it off: the lock moves the wait for the latch into the host's hold
+    /// and costs 3–4 ms end to end on an iGPU at 4K. Never set without present timing.
     pub phase_lock: bool,
     pub latch_grid: Arc<LatchGrid>,
 }
 
 /// Presenter → pump latch grid (the `force_software` pattern the other way). The
-/// presenter's 1 Hz fold writes an on-glass latch plus panel period; the pump folds
-/// AU arrivals against them into the ~1 Hz `PhaseReport`. All zeros until the first
-/// fold — and forever without present timing — so the pump stays quiet then.
+/// presenter writes an on-glass latch, the panel period and what a frame needs before
+/// its latch; the pump folds AU arrivals against them into the ~1 Hz `PhaseReport`.
+/// All zeros until the first fold — and forever without present timing — so the pump
+/// stays quiet then.
 #[derive(Default)]
 pub struct LatchGrid {
     /// Recent on-glass latch (client `CLOCK_REALTIME` ns — same domain as AU arrivals).
@@ -122,6 +131,137 @@ pub struct LatchGrid {
     pub anchor_ns: std::sync::atomic::AtomicU64,
     /// Panel latch period (ns). `0` = no grid yet.
     pub period_ns: std::sync::atomic::AtomicU64,
+    /// Hand-over to latch, as the presenter learned it (ns). `0` = the host's lead covers it.
+    pub need_ns: std::sync::atomic::AtomicU64,
+}
+
+/// Host, pin, launch, and budget for one dial.
+///
+/// The pin is the parsed form of the plan's `host.fp_hex`. Device handles stay
+/// on [`Probes`]: a plan is serialised across the shell.
+pub struct Dial {
+    pub host: String,
+    pub port: u16,
+    pub pin: [u8; 32],
+    pub launch: Option<String>,
+    pub connect_timeout: Duration,
+}
+
+/// Device facts the plan does not own. The gamepad value is the Hello pref
+/// the caller already resolved; opening the pad service stays in the session binary.
+pub struct Probes {
+    pub mode: Mode,
+    pub vulkan: Option<crate::video::VulkanDecodeDevice>,
+    pub display_hdr: Option<punktfunk_core::quic::HdrMeta>,
+    /// This display can present HDR. Caps and the panel volume also require the
+    /// HDR setting. A panel volume may still be absent.
+    pub hdr_enabled: bool,
+    pub identity: (String, String),
+    pub gamepad: GamepadPref,
+    pub force_software: Arc<AtomicBool>,
+    pub latch_grid: Arc<LatchGrid>,
+    pub stats_verbosity: crate::trust::StatsVerbosity,
+    /// This device decodes HEVC 4:4:4. Caps AND this with the Full chroma switch.
+    pub hevc_444_hardware: bool,
+}
+
+impl SessionParams {
+    /// One fill for a resolved spec and a [`Dial`]. Probes stay off the plan.
+    ///
+    /// A zero width, height, or refresh inherits `mode`. Refresh 0 becomes
+    /// `mode.refresh_hz.max(30)`. `exclude_codecs` stays 0. `want_444` is the
+    /// switch; caps carry 4:4:4 only when `hevc_444_hardware` is set too.
+    /// HDR caps need the setting and [`Probes::hdr_enabled`]. The panel volume
+    /// follows the probe alone. The caller builds [`Probes::latch_grid`].
+    pub fn from_plan(
+        settings: &crate::trust::Settings,
+        clipboard: bool,
+        preset: Option<String>,
+        preset_id: Option<String>,
+        dial: Dial,
+        probes: Probes,
+    ) -> Self {
+        let mode = Mode {
+            width: if settings.width == 0 {
+                probes.mode.width
+            } else {
+                settings.width
+            },
+            height: if settings.height == 0 {
+                probes.mode.height
+            } else {
+                settings.height
+            },
+            refresh_hz: if settings.refresh_hz == 0 {
+                probes.mode.refresh_hz.max(30)
+            } else {
+                settings.refresh_hz
+            },
+        };
+        let (width, height) = punktfunk_core::render_scale::apply(
+            mode.width,
+            mode.height,
+            settings.render_scale,
+            punktfunk_core::render_scale::max_dimension(&settings.codec),
+        );
+        let mode = Mode {
+            width,
+            height,
+            ..mode
+        };
+        // Off on the desktop (see the field). The report path stays for a client that asks.
+        let phase_lock = false;
+        let caps_444 = settings.enable_444 && probes.hevc_444_hardware;
+        let advertise_hdr = settings.hdr_enabled && probes.hdr_enabled;
+        // The host writes the volume into its display's EDID, so it rides only with HDR on.
+        let display_hdr = advertise_hdr.then_some(probes.display_hdr).flatten();
+        Self {
+            host: dial.host,
+            port: dial.port,
+            mode,
+            compositor: CompositorPref::from_name(&settings.compositor)
+                .unwrap_or(CompositorPref::Auto),
+            gamepad: probes.gamepad,
+            bitrate_kbps: settings.bitrate_kbps,
+            audio_channels: settings.audio_channels,
+            audio_format: settings.audio_format.clone(),
+            preferred_codec: settings.preferred_codec(),
+            exclude_codecs: 0,
+            video_caps: crate::video::video_caps_for(
+                advertise_hdr,
+                settings.ten_bit_sdr,
+                caps_444,
+                crate::video::multi_slice_decodable(probes.vulkan.as_ref().map(|v| v.vendor_id)),
+            ),
+            want_444: settings.enable_444,
+            display_hdr,
+            mic_enabled: settings.mic_enabled,
+            echo_cancel: settings.echo_cancel,
+            pad_haptics: settings.pad_haptics,
+            pad_speaker: settings.pad_speaker.clone(),
+            clipboard,
+            keep_host_audio: settings.keep_host_audio,
+            video_fit: punktfunk_core::video_fit::VideoFit::from_name(&settings.video_fit),
+            cursor_forward: settings.mouse_mode() == crate::trust::MouseMode::Desktop,
+            decoder: settings.decoder.clone(),
+            launch: dial.launch,
+            vulkan: probes.vulkan,
+            pin: Some(dial.pin),
+            identity: probes.identity,
+            connect_timeout: dial.connect_timeout,
+            force_software: probes.force_software,
+            preset,
+            preset_id,
+            stats_verbosity: probes.stats_verbosity,
+            advanced_stats: settings.advanced_stats,
+            // The desktop overlay's own corner is top left.
+            stats_corner: settings.hud_corner(crate::trust::HudCorner::TopLeft),
+            stats_scale: punktfunk_core::hud::stats_scale(settings.stats_scale_pct),
+            exit_hint: settings.exit_hint,
+            phase_lock,
+            latch_grid: probes.latch_grid,
+        }
+    }
 }
 
 /// Decode-side facts the overlay window cannot read off the connector, about once a
@@ -239,6 +379,7 @@ pub struct SessionHandle {
 }
 
 pub fn start(params: SessionParams) -> SessionHandle {
+    punktfunk_core::client::set_thread_boost(crate::audio_rt::boost_core_thread);
     let (ev_tx, ev_rx) = async_channel::unbounded();
     // Tiny frame queue, newest wins: force_send displaces the oldest when the UI lags.
     let (frame_tx, frame_rx) = async_channel::bounded(2);
@@ -259,126 +400,8 @@ pub fn start(params: SessionParams) -> SessionHandle {
     }
 }
 
-pub fn now_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
-
-/// Session audio decoder: `0xC9` Opus or `0xD3` PCM, behind one pair of methods so
-/// the pull loop is plane-agnostic. The plane is chosen once from
-/// `Welcome::audio_codec` and never changes (output device is open at a fixed
-/// format). Both planes share a header, so this type is the only thing that knows.
-/// Both arms return interleaved sample counts so the loop sizes pushes, concealment
-/// and ring reporting from one number.
-struct AudioDec {
-    /// Host-resolved channel count, to turn libopus per-channel counts into interleaved.
-    channels: usize,
-    kind: DecKind,
-}
-
-enum DecKind {
-    Stereo(opus::Decoder),
-    Surround(opus::MSDecoder),
-    /// Lossless plane: no codec state, only the negotiated depth. A lossless format has
-    /// no PLC; `PcmConceal` repeats and fades instead.
-    Pcm {
-        bits: u8,
-        conceal: punktfunk_core::audio::pcm::PcmConceal,
-    },
-}
-
-impl AudioDec {
-    /// Build for the plane the host resolved — `codec`/`rate_hz`/`bits` off Welcome,
-    /// never off what this client asked for.
-    fn new(
-        codec: u8,
-        channels: u8,
-        rate_hz: u32,
-        bits: u8,
-        layout: punktfunk_core::audio::AudioLayout,
-    ) -> Result<AudioDec, opus::Error> {
-        let ch = channels.max(1) as usize;
-        // A lossless session never reaches libopus. libopus accepts only
-        // 8/12/16/24/48 kHz, which is why the hi-res ladder is a second plane.
-        if codec == punktfunk_core::quic::AUDIO_CODEC_PCM {
-            // Depth is the unpack stride: core reads anything that is not 16 as 24, and
-            // a mismatch desyncs every sample after the first. Warn rather than refuse
-            // (silence); negotiation should never produce this.
-            if !punktfunk_core::audio::pcm::depth_is_supported(bits) {
-                tracing::warn!(
-                    bits,
-                    "the host resolved a lossless depth this plane does not define — unpacking \
-                     as 24-bit, which will be wrong if it meant anything else"
-                );
-            }
-            return Ok(AudioDec {
-                channels: ch,
-                kind: DecKind::Pcm {
-                    bits,
-                    conceal: punktfunk_core::audio::pcm::PcmConceal::new(),
-                },
-            });
-        }
-        // Opus is 48 kHz by construction. Taking the rate from Welcome (not a second
-        // literal) keeps the decoder, ring, and A/V-sync loop on the same millisecond.
-        let kind = if channels == 2 {
-            DecKind::Stereo(opus::Decoder::new(rate_hz, opus::Channels::Stereo)?)
-        } else {
-            let l = punktfunk_core::audio::layout_for(channels, layout);
-            DecKind::Surround(opus::MSDecoder::new(
-                rate_hz, l.streams, l.coupled, l.mapping,
-            )?)
-        };
-        Ok(AudioDec { channels: ch, kind })
-    }
-
-    /// Decode one arrived frame into `out`; returns interleaved sample count.
-    /// `out` is caller scratch. Opus decodes into a fixed slice, so it must already
-    /// hold the biggest frame the plane can carry. PCM hands the Vec to `pcm::to_f32`,
-    /// which grows it — a malformed oversized datagram cannot overrun there.
-    fn decode(&mut self, input: &[u8], out: &mut Vec<f32>) -> Option<usize> {
-        let channels = self.channels;
-        match &mut self.kind {
-            DecKind::Stereo(d) => d.decode_float(input, out, false).ok().map(|n| n * channels),
-            DecKind::Surround(d) => d.decode_float(input, out, false).ok().map(|n| n * channels),
-            DecKind::Pcm { bits, conceal } => {
-                // `None` is a truncated datagram — a partial sample would desync every
-                // sample after it. The caller treats it as a lost frame.
-                let n = punktfunk_core::audio::pcm::to_f32(input, *bits, out)?;
-                conceal.accept(&out[..n]);
-                Some(n)
-            }
-        }
-    }
-
-    /// Synthesise one missing-datagram frame into `out`. `None` = nothing decoded yet;
-    /// the caller should let the ring re-prime. `interleaved` is the last good frame's
-    /// length — libopus PLC synthesises exactly the slice it is handed; PCM ignores it.
-    fn conceal(&mut self, interleaved: usize, out: &mut Vec<f32>) -> Option<usize> {
-        let channels = self.channels;
-        match &mut self.kind {
-            // Length read here is this frame's, not the previous call's — `PcmConceal`
-            // already holds the frame it repeats, and reports `false` before anything arrives.
-            DecKind::Pcm { conceal, .. } => conceal.conceal(out).then_some(out.len()),
-            libopus => {
-                // libopus PLC synthesises exactly the slice it is handed; before anything
-                // has decoded there is no frame length to ask it for.
-                let plc = interleaved.min(out.len());
-                if plc == 0 {
-                    return None;
-                }
-                let per_ch = match libopus {
-                    DecKind::Stereo(d) => d.decode_float(&[], &mut out[..plc], false).ok()?,
-                    DecKind::Surround(d) => d.decode_float(&[], &mut out[..plc], false).ok()?,
-                    DecKind::Pcm { .. } => unreachable!("the PCM arm matched above"),
-                };
-                Some(per_ch * channels)
-            }
-        }
-    }
-}
+/// The client's present and latency clock: the same wall-clock basis the host stamps `pts_ns` in.
+pub use punktfunk_core::quic::wall_clock_ns as now_ns;
 
 // Audio-format vocabulary lives in `audio_format` so the Skia console can read it on
 // Android, where nothing else in this file compiles. Re-exported so desktop callers'
@@ -553,6 +576,113 @@ fn connect_plan(params: &SessionParams) -> ConnectPlan {
     }
 }
 
+/// Hello's client-capability bits. `CLIENT_CAP_AUDIO_HIRES` is not here: core derives
+/// it from the audio format pair being specified, the one rule that keeps 48 kHz/16-bit
+/// lossless askable.
+fn client_caps(params: &SessionParams, pad_audio_on: bool) -> u8 {
+    use punktfunk_core::quic::{
+        CLIENT_CAP_CURSOR, CLIENT_CAP_KEEP_HOST_AUDIO, CLIENT_CAP_PAD_AUDIO, CLIENT_CAP_PHASE_LOCK,
+    };
+    let bit = |on: bool, cap: u8| if on { cap } else { 0 };
+    bit(params.cursor_forward, CLIENT_CAP_CURSOR)
+        | bit(params.phase_lock, CLIENT_CAP_PHASE_LOCK)
+        | bit(pad_audio_on, CLIENT_CAP_PAD_AUDIO)
+        | bit(params.keep_host_audio, CLIENT_CAP_KEEP_HOST_AUDIO)
+}
+
+/// Dial the host. `Err` is the terminal event the pump sends instead of `Connected`.
+fn dial(
+    params: &SessionParams,
+    stop: &Arc<AtomicBool>,
+    plan: &ConnectPlan,
+) -> Result<Arc<NativeClient>, SessionEvent> {
+    // Lossless opt-in, filtered by what this box can play. `CLIENT_CAP_AUDIO_HIRES`
+    // means capable *and* the user turned it on — advertising without being able to
+    // render spends 1.5–4.6 Mbps ABR cannot reclaim. `Some` past this block is
+    // "ask", and asking is what sets the bit (`AUDIO_FORMAT_UNSPECIFIED`).
+    let hires = requested_audio_format(&params.audio_format).filter(|&(rate, _)| {
+        if params.audio_channels != 2 {
+            // A hi-res surround frame does not fit one datagram at the default MTU
+            // and this plane is never fragmented. The two settings are independent
+            // overlay keys, and the env override answers to no UI, so this is the
+            // one place both are known.
+            tracing::warn!(
+                channels = params.audio_channels,
+                "lossless audio is stereo-only — a surround frame does not fit one QUIC \
+                 datagram; asking for the default Opus plane instead"
+            );
+            return false;
+        }
+        audio::can_render_at(rate)
+    });
+    if let Some((rate, bits)) = hires {
+        tracing::info!(rate, bits, "asking the host for the lossless audio plane");
+    }
+    // This pair is the request: core derives the cap from it being specified, so
+    // `None` must reach the wire as unspecified, not as an explicit 48 000/16.
+    let (audio_rate_hz, audio_bits) = hires.unwrap_or(AUDIO_FORMAT_UNSPECIFIED);
+    NativeClient::connect(ConnectParams {
+        compositor: params.compositor,
+        gamepad: params.gamepad,
+        bitrate_kbps: plan.bitrate_kbps,
+        video_caps: plan.video_caps,
+        audio_channels: params.audio_channels,
+        audio_rate_hz,
+        audio_bits,
+        // Legacy coupling: this client decodes either, and only NDL-class sinks need the other.
+        audio_layout: punktfunk_core::audio::AudioLayout::Legacy,
+        video_fit: params.video_fit,
+        video_codecs: plan.advertised_codecs,
+        preferred_codec: plan.preferred,
+        // Env hatch wins so an A/B run can pin an exact peak (`PUNKTFUNK_CLIENT_PEAK_NITS`).
+        display_hdr: punktfunk_core::client::display_hdr_env_override().or(params.display_hdr),
+        client_caps: client_caps(params, plan.pad_audio_on),
+        // Slice-progressive delivery: off — every rung here is fed whole AUs.
+        frame_parts: false,
+        launch: params.launch.clone(),
+        // Host's trust-store label. Without it every no-PIN "request access" knock
+        // showed as the fingerprint placeholder "device abcd1234".
+        name: Some(crate::trust::device_name()),
+        pin: params.pin,
+        identity: Some(params.identity.clone()),
+        preset: params.preset_id.as_deref().and_then(|id| {
+            punktfunk_core::quic::SessionPreset::new(id, params.preset.as_deref().unwrap_or(""))
+        }),
+        // Session stop flag, so cancel reaches a dial that has not landed. Without
+        // it this parks the pump for the whole budget (185 s on a request-access
+        // connect the host holds pending) and cancel cannot be answered until return.
+        cancel: Some(stop.clone()),
+        ..ConnectParams::new(
+            &params.host,
+            params.port,
+            params.mode,
+            params.connect_timeout,
+        )
+    })
+    .map(Arc::new)
+    .map_err(|e| {
+        let trust_rejected = matches!(e, PunktfunkError::Crypto);
+        let msg = match e {
+            PunktfunkError::Crypto => {
+                "Host identity rejected — wrong fingerprint, or the host requires pairing"
+                    .to_string()
+            }
+            PunktfunkError::Timeout => "Connection timed out".to_string(),
+            // Host said why it turned us away — show that verbatim: "denied on the
+            // host" and "timed out" call for different next steps.
+            PunktfunkError::Rejected(reason) => crate::trust::connect_reject_message(reason),
+            other => {
+                tracing::warn!(error = %other, "connect failed");
+                "The host didn't answer".to_string()
+            }
+        };
+        SessionEvent::Failed {
+            msg,
+            trust_rejected,
+        }
+    })
+}
+
 fn open_decoder(
     decoder: &str,
     vulkan: Option<&crate::video::VulkanDecodeDevice>,
@@ -641,27 +771,6 @@ struct PlaneSettings {
     echo_cancel: bool,
 }
 
-/// Send the remembered lost range once the shared 100 ms ask throttle is open.
-/// A span wider than `RFI_MAX_RANGE` is beyond any encoder's history: keyframe.
-fn flush_pending_rfi(
-    pending: &mut Option<(u32, u32)>,
-    last_req: &mut Option<Instant>,
-    now: Instant,
-    connector: &NativeClient,
-) {
-    let throttled = last_req.is_some_and(|t| now.duration_since(t) < Duration::from_millis(100));
-    let Some((first, last)) = pending.filter(|_| !throttled) else {
-        return;
-    };
-    *pending = None;
-    *last_req = Some(now);
-    if last.wrapping_sub(first).wrapping_add(1) > punktfunk_core::packet::RFI_MAX_RANGE {
-        let _ = connector.request_keyframe();
-    } else {
-        let _ = connector.request_rfi(first, last);
-    }
-}
-
 fn spawn_plane_threads(
     connector: &Arc<NativeClient>,
     stop: &Arc<AtomicBool>,
@@ -717,6 +826,48 @@ fn spawn_plane_threads(
     }
 }
 
+/// How the pump waits a hardware decode to completion before it hands the frame on.
+enum HwDone {
+    /// Vulkan Video: the picture's timeline semaphore reaches `value`.
+    Timeline(u64, u64),
+    /// VAAPI: the surface's write fence, exported as a sync_file.
+    #[cfg(target_os = "linux")]
+    SyncFile(std::os::fd::OwnedFd),
+    /// The decoder returned with the pixels done.
+    Cpu,
+}
+
+/// One keyframe ask per 100 ms, shared by every recovery site in the pump.
+#[derive(Default)]
+struct KeyframeAsk {
+    last: Option<Instant>,
+}
+
+impl KeyframeAsk {
+    const EVERY: Duration = Duration::from_millis(100);
+
+    /// Take the ask window at `now`. False while an ask from the last 100 ms holds it.
+    fn claim(&mut self, now: Instant) -> bool {
+        if self
+            .last
+            .is_some_and(|t| now.duration_since(t) < Self::EVERY)
+        {
+            return false;
+        }
+        self.last = Some(now);
+        true
+    }
+
+    /// [`Self::claim`], then ask the host for a keyframe when the window was open.
+    fn ask(&mut self, now: Instant, connector: &NativeClient) -> bool {
+        let open = self.claim(now);
+        if open {
+            let _ = connector.request_keyframe();
+        }
+        open
+    }
+}
+
 fn pump(
     params: SessionParams,
     ev_tx: async_channel::Sender<SessionEvent>,
@@ -724,113 +875,18 @@ fn pump(
     stop: Arc<AtomicBool>,
     mic: MicControl,
 ) {
+    crate::audio_rt::boost_and_log("decode");
+    let plan = connect_plan(&params);
     let ConnectPlan {
-        preferred,
         pad_speaker_on,
         pad_audio_on,
         advertised_codecs,
-        bitrate_kbps,
-        video_caps,
-    } = connect_plan(&params);
-    // Lossless opt-in, filtered by what this box can play. `CLIENT_CAP_AUDIO_HIRES`
-    // means capable *and* the user turned it on — advertising without being able to
-    // render spends 1.5–4.6 Mbps ABR cannot reclaim. `Some` past this block is
-    // "ask", and asking is what sets the bit (`AUDIO_FORMAT_UNSPECIFIED`).
-    let hires = requested_audio_format(&params.audio_format).filter(|&(rate, _)| {
-        if params.audio_channels != 2 {
-            // A hi-res surround frame does not fit one datagram at the default MTU
-            // and this plane is never fragmented. The two settings are independent
-            // overlay keys, and the env override answers to no UI, so this is the
-            // one place both are known.
-            tracing::warn!(
-                channels = params.audio_channels,
-                "lossless audio is stereo-only — a surround frame does not fit one QUIC \
-                 datagram; asking for the default Opus plane instead"
-            );
-            return false;
-        }
-        audio::can_render_at(rate)
-    });
-    if let Some((rate, bits)) = hires {
-        tracing::info!(rate, bits, "asking the host for the lossless audio plane");
-    }
-    // This pair is the request: core derives the cap from it being specified, so
-    // `None` must reach the wire as unspecified, not as an explicit 48 000/16.
-    let (audio_rate_hz, audio_bits) = hires.unwrap_or(AUDIO_FORMAT_UNSPECIFIED);
-    let connector = match NativeClient::connect_with_audio_format(
-        &params.host,
-        params.port,
-        params.mode,
-        params.compositor,
-        params.gamepad,
-        bitrate_kbps,
-        video_caps,
-        params.audio_channels,
-        audio_rate_hz,
-        audio_bits,
-        // Legacy coupling: this client decodes either, and only NDL-class sinks need the other.
-        punktfunk_core::audio::AudioLayout::Legacy,
-        params.video_fit,
-        advertised_codecs,
-        preferred,
-        // Env hatch wins so an A/B run can pin an exact peak (`PUNKTFUNK_CLIENT_PEAK_NITS`).
-        punktfunk_core::client::display_hdr_env_override().or(params.display_hdr),
-        (if params.cursor_forward {
-            punktfunk_core::quic::CLIENT_CAP_CURSOR
-        } else {
-            0
-        }) | (if params.phase_lock {
-            punktfunk_core::quic::CLIENT_CAP_PHASE_LOCK
-        } else {
-            0
-            // AUDIO_HIRES is not set here: core derives it from the format pair being
-            // specified, which is the one rule that keeps 48 kHz/16-bit lossless
-            // askable. Setting it without a format would advertise a request the host
-            // can only decline.
-        }) | (if pad_audio_on {
-            punktfunk_core::quic::CLIENT_CAP_PAD_AUDIO
-        } else {
-            0
-        }) | (if params.keep_host_audio {
-            punktfunk_core::quic::CLIENT_CAP_KEEP_HOST_AUDIO
-        } else {
-            0
-        }),
-        // Slice-progressive delivery: off — every rung here is fed whole AUs.
-        false,
-        params.launch.clone(),
-        // Host's trust-store label. Without it every no-PIN "request access" knock
-        // showed as the fingerprint placeholder "device abcd1234".
-        Some(crate::trust::device_name()),
-        params.pin,
-        Some(params.identity),
-        params.connect_timeout,
-        // Session stop flag, so cancel reaches a dial that has not landed. Without
-        // it this parks the pump for the whole budget (185 s on a request-access
-        // connect the host holds pending) and cancel cannot be answered until return.
-        Some(stop.clone()),
-    ) {
-        Ok(c) => Arc::new(c),
-        Err(e) => {
-            let trust_rejected = matches!(e, PunktfunkError::Crypto);
-            let msg = match e {
-                PunktfunkError::Crypto => {
-                    "Host identity rejected — wrong fingerprint, or the host requires pairing"
-                        .to_string()
-                }
-                PunktfunkError::Timeout => "Connection timed out".to_string(),
-                // Host said why it turned us away — show that verbatim: "denied on the
-                // host" and "timed out" call for different next steps.
-                PunktfunkError::Rejected(reason) => crate::trust::connect_reject_message(reason),
-                other => {
-                    tracing::warn!(error = %other, "connect failed");
-                    "The host didn't answer".to_string()
-                }
-            };
-            let _ = ev_tx.send_blocking(SessionEvent::Failed {
-                msg,
-                trust_rejected,
-            });
+        ..
+    } = plan;
+    let connector = match dial(&params, &stop, &plan) {
+        Ok(c) => c,
+        Err(failed) => {
+            let _ = ev_tx.send_blocking(failed);
             return;
         }
     };
@@ -901,10 +957,11 @@ fn pump(
     // Live host↔client clock offset, loaded per frame so mid-stream re-syncs keep
     // capture-clock latency honest — never cached at session start.
     let clock_offset_live = connector.clock_offset_shared();
-    // Every received AU's arrival stamp, folded per stats window against the latch
-    // grid into the ~1 Hz PhaseReport. 256 ≈ 2 s at 120 Hz.
+    // Every received AU's arrival stamp and decode time, folded per stats window against
+    // the latch grid into the ~1 Hz PhaseReport. 256 ≈ 2 s at 120 Hz.
     let latch_grid = params.latch_grid.clone();
     let mut phase_arrivals: Vec<u64> = Vec::new();
+    let mut phase_decodes: Vec<u64> = Vec::new();
     let mut last_applied_phase: Option<i32> = None;
     // `PUNKTFUNK_DEBUG_RECONFIGURE=WxH@HZ:SECS` — request one mid-stream mode
     // switch N seconds in, so a headless session can exercise the resize path.
@@ -926,29 +983,17 @@ fn pump(
     let mut pin_noticed = false;
     // The last launch verdict turned into a notice: each verdict is said once.
     let mut launch_told: Option<punktfunk_core::quic::LaunchOutcome> = None;
-    // One fence-waited decode sample per window on the async rung: a per-frame wait
-    // would serialize decode to 1/latency.
-    let mut fence_sampled = false;
     // Report decode stage to ABR only when armed. Constant for the session.
     let wants_decode = connector.wants_decode_latency();
     // What actually decoded the last frame — VAAPI can demote mid-session.
     let mut dec_path: &'static str = "";
-    let mut last_kf_req: Option<Instant> = None;
-    // Lost range the ask throttle swallowed, `(first, last)`, widened by later gaps
-    // and sent by `flush_pending_rfi` once the throttle opens. Without it a second
-    // gap inside the window (a lost recovery anchor) asks nothing until the 500 ms
-    // backstop, and then for an IDR.
-    let mut pending_rfi: Option<(u32, u32)> = None;
+    let mut kf = KeyframeAsk::default();
     // PyroWave AUs decode independently, so a late one is still worth showing.
     let all_intra = connector.codec == punktfunk_core::quic::CODEC_PYROWAVE;
     // Freeze-until-reanchor. Armed on any loss signal, withholds concealed frames
     // until a clean re-anchor. Owns the no-output streak and overdue-freeze
     // backstop. Seeded with the current drop count so the first `poll` is not a loss.
     let mut gate = ReanchorGate::new(connector.frames_dropped());
-    // Frame index we expect next. A jump is the earliest loss signal — ~120 ms
-    // ahead of `frames_dropped` (the reassembler only declares a straggler lost
-    // once it ages out of the loss window).
-    let mut next_expected_index: Option<u32> = None;
     // Fixture capture of every AU as it reaches `decode_frame` (`au_dump.rs`).
     // This is what the host sent. `PUNKTFUNK_AU_FAULT` injects one level down, so
     // a faulted run's fixture is the clean bitstream and will not replay the damage.
@@ -1028,45 +1073,32 @@ fn pump(
                 // Host numbers frames consecutively, so a jump means a frame is missing
                 // and this AU references a picture we never decoded. Arm the freeze at
                 // the first such frame — ~120 ms before `frames_dropped` — so concealment
-                // never reaches the screen.
-                match next_expected_index {
-                    Some(exp) if frame.frame_index == exp => {
-                        next_expected_index = Some(exp.wrapping_add(1));
+                // never reaches the screen. The connector asks for the RFI.
+                match connector.observe_frame_index(frame.frame_index) {
+                    // Credited arm: the reassembler books these lost frames into
+                    // `frames_dropped` up to ~120 ms from now; the credit keeps that
+                    // climb from re-freezing a stream the RFI anchor healed. A gap that finds
+                    // the ask window open spends it on the RFI; later gaps do not hold it shut.
+                    FrameOrder::Gap(gap) => {
+                        let now = Instant::now();
+                        gate.arm_expecting_drops(now, u64::from(gap));
+                        kf.claim(now);
+                        tracing::trace!(
+                            gap,
+                            "frame gap — RFI recovery, holding last frame until re-anchor"
+                        );
                     }
-                    // Forward gap: hold the last good frame, but do not ask for a
-                    // keyframe here. Hiding concealment is free; an IDR at 4K120 is not
-                    // and can re-trigger the burst. A straggler (`index_gap` → None)
-                    // leaves the expectation so the real gap still trips.
-                    Some(exp) => {
-                        if let Some(gap) = index_gap(exp, frame.frame_index) {
-                            let now = Instant::now();
-                            // Credited arm: the reassembler books these lost frames into
-                            // `frames_dropped` up to ~120 ms from now; the credit keeps
-                            // that climb from re-freezing a stream the RFI anchor healed.
-                            gate.arm_expecting_drops(now, u64::from(gap));
-                            next_expected_index = Some(frame.frame_index.wrapping_add(1));
-                            // The oldest unsent loss stays `first`: the host invalidates
-                            // everything since it anyway, so one ask covers a burst.
-                            let first = pending_rfi.map_or(exp, |(first, _)| first);
-                            pending_rfi = Some((first, frame.frame_index.wrapping_sub(1)));
-                            flush_pending_rfi(&mut pending_rfi, &mut last_kf_req, now, &connector);
-                            tracing::trace!(
-                                gap,
-                                "frame gap — RFI recovery, holding last frame until re-anchor"
-                            );
-                        } else if !all_intra {
-                            // A whole AU behind one already decoded: decoding it now
-                            // rewinds the DPB (H.264 reads it as a frame_num wrap, HEVC's
-                            // RPS unmarks the newer picture) and phantoms an RFI. Skip.
-                            tracing::trace!(
-                                index = frame.frame_index,
-                                expected = exp,
-                                "skipping a straggler AU that arrived behind a decoded one"
-                            );
-                            continue;
-                        }
+                    // A whole AU behind one already decoded: decoding it now rewinds the
+                    // DPB (H.264 reads it as a frame_num wrap, HEVC's RPS unmarks the
+                    // newer picture). PyroWave AUs decode independently, so it keeps them.
+                    FrameOrder::Straggler if !all_intra => {
+                        tracing::trace!(
+                            index = frame.frame_index,
+                            "skipping a straggler AU that arrived behind a decoded one"
+                        );
+                        continue;
                     }
-                    None => next_expected_index = Some(frame.frame_index.wrapping_add(1)),
+                    FrameOrder::InOrder | FrameOrder::Straggler => {}
                 }
                 // A partial that lost the race (a newer frame already decoded) is time
                 // travel — skip it. Completes keep the normal path.
@@ -1152,64 +1184,52 @@ fn pump(
                                 "damaged reference chain reached an unfrozen gate — holding, \
                                  requesting keyframe"
                             );
-                            if last_kf_req
-                                .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
-                            {
-                                last_kf_req = Some(now);
-                                let _ = connector.request_keyframe();
-                            }
+                            kf.ask(now, &connector);
                         }
                         total_frames += 1;
-                        // `stats:` decode-path tag is a machine interface — additive
-                        // only. Surviving tags keep their exact spelling.
-                        dec_path = match &image {
-                            DecodedImage::Cpu(_) => "software",
-                            #[cfg(target_os = "linux")]
-                            DecodedImage::NativeDmabuf(_) => "native-vaapi",
-                            #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
-                            DecodedImage::V4l2Planar(_) => "v4l2-request",
-                            #[cfg(windows)]
-                            DecodedImage::D3d11(_) => "native-d3d11va",
-                            #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
-                            DecodedImage::PyroWave(_) => "pyrowave",
-                            DecodedImage::NativeVk(_) => "native-vulkan",
-                        };
+                        dec_path = image.path_label();
                         if total_frames == 1 {
-                            let (w, h, path) = match &image {
-                                DecodedImage::Cpu(c) => (c.width, c.height, "software"),
-                                #[cfg(target_os = "linux")]
-                                DecodedImage::NativeDmabuf(d) => {
-                                    (d.width, d.height, "native-vaapi-dmabuf")
-                                }
-                                #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
-                                DecodedImage::V4l2Planar(d) => {
-                                    (d.width, d.height, "v4l2-request-planar")
-                                }
-                                #[cfg(windows)]
-                                DecodedImage::D3d11(d) => (d.width, d.height, "native-d3d11va"),
-                                #[cfg(all(
-                                    any(target_os = "linux", windows),
-                                    feature = "pyrowave"
-                                ))]
-                                DecodedImage::PyroWave(f) => (f.width, f.height, "pyrowave"),
-                                DecodedImage::NativeVk(f) => (f.width, f.height, "native-vulkan"),
-                            };
-                            tracing::info!(width = w, height = h, path, "first frame decoded");
+                            let (width, height) = image.dimensions();
+                            tracing::info!(width, height, path = dec_path, "first frame decoded");
+                        }
+                        // Hardware rungs return at submission. Wait the decode's own fence
+                        // here, on the pump: i915 raises the media engine's clock only for
+                        // a thread that waits (a 4K decode on a Meteor Lake Arc takes 6.8 ms
+                        // unboosted, 2.7 boosted), and `decoded_ns` then means complete.
+                        // 50 ms bounds a wedged pipeline; the presenter waits the GPU too.
+                        let hw_fence = match &image {
+                            // Native rung: decode signals `semaphore_value` when pixels
+                            // are ready (presenter write-back is `+ 1`).
+                            DecodedImage::NativeVk(f) => {
+                                HwDone::Timeline(f.semaphore, f.semaphore_value)
+                            }
+                            // VAAPI ships the decode's write fence as a sync_file; a dup
+                            // outlives the frame's move to the presenter.
+                            #[cfg(target_os = "linux")]
+                            DecodedImage::NativeDmabuf(d) => d
+                                .sync_fds
+                                .first()
+                                .and_then(|fd| fd.try_clone().ok())
+                                .map_or(HwDone::Cpu, HwDone::SyncFile),
+                            _ => HwDone::Cpu,
+                        };
+                        match hw_fence {
+                            HwDone::Timeline(sem, value) => {
+                                decoder.wait_hw_decoded(sem, value, 50_000_000);
+                            }
+                            #[cfg(target_os = "linux")]
+                            HwDone::SyncFile(fd) => {
+                                use std::os::fd::AsFd as _;
+                                let _ = pf_dmabuf::fence::wait_sync_file(fd.as_fd(), 50);
+                            }
+                            HwDone::Cpu => {}
                         }
                         // Travels with the frame so the presenter can measure `display`.
                         let decoded_ns = now_ns();
                         connector.hud().note_decoded(frame.pts_ns, decoded_ns);
-                        // Ship first, then the decode stat. Vulkan returns at submission;
-                        // a per-frame fence wait serializes to 1/decode_latency. One
-                        // honest sample per window. Polling would quantize by a whole
-                        // frame interval (8.3 ms at 120 Hz vs ~0.1–2 ms decodes).
-                        let hw_fence = match &image {
-                            // Native rung: decode signals `semaphore_value` when pixels
-                            // are ready (presenter write-back is `+ 1`). Wait measures
-                            // received→decode-complete.
-                            DecodedImage::NativeVk(f) => Some((f.semaphore, f.semaphore_value)),
-                            _ => None,
-                        };
+                        if params.phase_lock && phase_decodes.len() < 256 {
+                            phase_decodes.push(decoded_ns.saturating_sub(received_ns));
+                        }
                         if present {
                             // A displaced frame decoded and was never shown: newest wins.
                             if let Ok(Some(_)) = frame_tx.force_send(DecodedFrame {
@@ -1221,30 +1241,13 @@ fn pump(
                             }
                         } else {
                             // Withhold this frame so the presenter redraws the last good
-                            // picture. `hw_fence` still samples (handle stays valid).
+                            // picture.
                             tracing::trace!("holding last frame — awaiting post-loss re-anchor");
                         }
-                        match hw_fence {
-                            // `decoded_ns` is a submission stamp here, so GPU decode sits
-                            // inside `display` and this sample re-counts it.
-                            Some((sem, value)) => {
-                                if !fence_sampled && decoder.wait_hw_decoded(sem, value, 50_000_000)
-                                {
-                                    fence_sampled = true;
-                                    let us = now_ns().saturating_sub(received_ns) / 1000;
-                                    connector.hud().note_decode_us(us, true);
-                                }
-                            }
-                            None => {
-                                let us = decoded_ns.saturating_sub(received_ns) / 1000;
-                                connector.hud().note_decode_us(us, false);
-                            }
-                        }
-                        // ABR: decoder-backlog every frame, using the CPU-side stamp.
-                        // Exact for sync paths; received→submit for async Vulkan — the
-                        // backpressure the controller needs, without the fence wait.
+                        // Received → pixels done, every frame; the ABR's decoder-backlog too.
+                        let us = decoded_ns.saturating_sub(received_ns) / 1000;
+                        connector.hud().note_decode_us(us, false);
                         if wants_decode {
-                            let us = decoded_ns.saturating_sub(received_ns) / 1000;
                             connector.report_decode_us(us.min(u32::MAX as u64) as u32);
                         }
                     }
@@ -1253,12 +1256,7 @@ fn pump(
                     // and, once it trips, arms the freeze and asks for an IDR.
                     Ok(None) => {
                         let now = Instant::now();
-                        if gate.on_no_output(now)
-                            && last_kf_req
-                                .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
-                        {
-                            last_kf_req = Some(now);
-                            let _ = connector.request_keyframe();
+                        if gate.on_no_output(now) && kf.ask(now, &connector) {
                             tracing::debug!("requested keyframe (decoder produced no output)");
                         }
                     }
@@ -1281,12 +1279,7 @@ fn pump(
                     Err(e) => {
                         tracing::debug!(error = %e, "decode error (recovering)");
                         let now = Instant::now();
-                        if gate.on_no_output(now)
-                            && last_kf_req
-                                .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
-                        {
-                            last_kf_req = Some(now);
-                            let _ = connector.request_keyframe();
+                        if gate.on_no_output(now) && kf.ask(now, &connector) {
                             tracing::debug!("requested keyframe (decode error recovery)");
                         }
                     }
@@ -1308,11 +1301,7 @@ fn pump(
                     if !gate.is_holding() {
                         gate.arm(now);
                     }
-                    if last_kf_req
-                        .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
-                    {
-                        last_kf_req = Some(now);
-                        let _ = connector.request_keyframe();
+                    if kf.ask(now, &connector) {
                         tracing::debug!("requested keyframe (decoder recovery)");
                     }
                 }
@@ -1368,19 +1357,13 @@ fn pump(
         // means the only recovery keyframe is one we request.
         let dropped = connector.frames_dropped();
         let now = Instant::now();
-        if gate.poll(dropped, now)
-            && last_kf_req.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100))
-        {
-            last_kf_req = Some(now);
-            // The IDR repairs everything a pending RFI would have named.
-            pending_rfi = None;
-            let _ = connector.request_keyframe();
+        if gate.poll(dropped, now) && kf.ask(now, &connector) {
             tracing::debug!(
                 dropped,
                 "requested keyframe (loss recovery / overdue re-anchor)"
             );
         }
-        flush_pending_rfi(&mut pending_rfi, &mut last_kf_req, now, &connector);
+        connector.flush_frame_recovery();
 
         if window_start.elapsed() >= Duration::from_secs(1) {
             let pin_kbps = connector.unsustainable_pin_kbps();
@@ -1407,18 +1390,25 @@ fn pump(
                 let period = latch_grid.period_ns.load(Ordering::Relaxed);
                 let anchor = latch_grid.anchor_ns.load(Ordering::Relaxed);
                 if period > 0 && anchor > 0 {
+                    // The instant an arrival must beat: the latch less the window's p75
+                    // decode and what the presenter needs. The host aims its lead at it.
+                    phase_decodes.sort_unstable();
+                    let decode = phase_decodes
+                        .get(phase_decodes.len() * 3 / 4)
+                        .copied()
+                        .unwrap_or(0);
+                    let need = latch_grid.need_ns.load(Ordering::Relaxed);
+                    let ready_by = anchor as i128 - phase_shift_ns(need, decode, period) as i128;
                     let leads_us: Vec<u64> = phase_arrivals
                         .iter()
-                        .map(|a| {
-                            ((anchor as i128 - *a as i128).rem_euclid(period as i128) / 1000) as u64
-                        })
+                        .map(|a| ((ready_by - *a as i128).rem_euclid(period as i128) / 1000) as u64)
                         .collect();
                     if let Some((lead_ns, coherence)) =
                         punktfunk_core::phase::circular_latch(&leads_us, period as i64)
                     {
-                        // Extrapolate the (possibly ~1 s old) anchor to the next latch
+                        // Extrapolate the (possibly ~1 s old) instant to the next one
                         // at or after now, then express it on the host clock.
-                        let (now, p, a) = (now_ns() as i128, period as i128, anchor as i128);
+                        let (now, p, a) = (now_ns() as i128, period as i128, ready_by);
                         let k = ((now - a).max(0) + p - 1) / p;
                         let offset = clock_offset_live.load(Ordering::Relaxed) as i128;
                         connector.report_phase(
@@ -1431,13 +1421,13 @@ fn pump(
                     }
                 }
                 phase_arrivals.clear();
+                phase_decodes.clear();
             }
             let _ = ev_tx.try_send(SessionEvent::DecodeFacts(DecodeFacts {
                 decoder: dec_path,
                 health: decoder.decode_health(),
             }));
             window_start = Instant::now();
-            fence_sampled = false;
         }
     };
 
@@ -1527,49 +1517,38 @@ fn spawn_audio(
 ) -> Option<std::thread::JoinHandle<()>> {
     // Decoder + playback from the host-resolved format, never the request. Opening
     // the device from the request is the failure a clamping host would trigger.
-    let channels = connector.audio_channels;
+    let fmt = punktfunk_core::audio::plane::PlaneFormat::of(&connector);
     // A codec this client does not speak is refused out loud. `Welcome::decode`
     // takes `audio_codec` verbatim — folding an unknown id onto Opus would
     // Opus-decode a `0xD3` payload (noise) or wait forever for `0xC9` (silence).
     if !matches!(
-        connector.audio_codec,
+        fmt.codec,
         punktfunk_core::quic::AUDIO_CODEC_OPUS | punktfunk_core::quic::AUDIO_CODEC_PCM
     ) {
         tracing::warn!(
-            codec = connector.audio_codec,
+            codec = fmt.codec,
             "the host resolved an audio plane this client cannot decode — streaming video-only"
         );
         return None;
     }
-    let lossless = connector.audio_codec == punktfunk_core::quic::AUDIO_CODEC_PCM;
-    // Same refusal for the coupling: a wrong pairing plays, and plays the wrong speakers.
-    let Some(layout) = punktfunk_core::audio::AudioLayout::from_wire(connector.audio_layout) else {
+    // Depth is the unpack stride and anything but 16 unpacks as 24. Warn rather than refuse.
+    if fmt.is_pcm() && !punktfunk_core::audio::pcm::depth_is_supported(fmt.bits) {
         tracing::warn!(
-            layout = connector.audio_layout,
-            "the host resolved an audio layout this client cannot decode — streaming video-only"
+            bits = fmt.bits,
+            "the host resolved a lossless depth this plane does not define — unpacking \
+             as 24-bit, which will be wrong if it meant anything else"
         );
-        return None;
-    };
-    // Zero is inexpressible off the wire, but everything below divides by it and
-    // libopus refuses it. This is the one value that must not depend on a peer.
-    let rate_hz = match connector.audio_sample_rate_hz {
-        0 => punktfunk_core::audio::SAMPLE_RATE_HZ,
-        hz => hz,
-    };
-    // One protocol frame. Opus is the fixed 5 ms; lossless negotiates from path
-    // MTU, so it must be read, never assumed.
-    let frame_us = if lossless {
-        // Floor at the ladder's shortest rung. `0` could only come from a host that
-        // did not state a duration; sizing a quantum from zero is worse than 1 ms.
-        (connector.audio_frame_us as u32).max(1_000)
-    } else {
-        punktfunk_core::audio::FRAME_MS * 1000
-    };
+    }
+    // An unknown Opus coupling is refused too: a wrong pairing plays the wrong speakers.
+    let mut dec = punktfunk_core::audio::plane::PlaneDecoder::new(&fmt)
+        .map_err(|e| tracing::warn!(error = %e, "audio decoder unavailable — streaming video-only"))
+        .ok()?;
+    let (channels, rate_hz, frame_us) = (fmt.channels, fmt.rate_hz, fmt.frame_us);
     tracing::info!(
-        codec = if lossless { "pcm" } else { "opus" },
+        codec = if fmt.is_pcm() { "pcm" } else { "opus" },
         channels,
         rate_hz,
-        bits = connector.audio_bits,
+        bits = fmt.bits,
         frame_us,
         "negotiated audio format"
     );
@@ -1579,15 +1558,6 @@ fn spawn_audio(
         frame_us,
     })
     .map_err(|e| tracing::warn!(error = %e, "audio disabled"))
-    .ok()?;
-    let mut dec = AudioDec::new(
-        connector.audio_codec,
-        channels,
-        rate_hz,
-        connector.audio_bits,
-        layout,
-    )
-    .map_err(|e| tracing::warn!(error = %e, "opus decoder failed — audio disabled"))
     .ok()?;
     // A/V sync. This thread holds the packet's host capture `pts_ns`, the ring
     // depth, and the video e2e figure. `PUNKTFUNK_NO_AV_SYNC` is the escape hatch.
@@ -1602,19 +1572,9 @@ fn spawn_audio(
     let video_e2e = connector.video_e2e_shared();
     let av_offset_out = connector.audio_av_offset_shared();
     let buffer_ms_out = connector.audio_buffer_ms_shared();
-    // Interleaved samples per ms, in the resolved rate: 48×ch at protocol default,
-    // 96×ch on a 96 kHz lossless session. The old 48 kHz constant would have halved
-    // every `buffer_ms` this thread publishes, in the direction that looks healthy.
-    let per_ms = (rate_hz / 1000).max(1) as usize * channels.max(1) as usize;
-    // Decode scratch. Opus: up to 120 ms (hard bound — libopus decodes into a
-    // fixed slice), derived from the rate so it cannot silently become 60 ms.
-    // PCM: one negotiated frame; `pcm::to_f32` grows the Vec, so oversized
-    // datagrams reallocate rather than overrun.
-    let scratch = if lossless {
-        punktfunk_core::audio::pcm::samples_per_frame(rate_hz, frame_us, channels)
-    } else {
-        120 * per_ms
-    };
+    // Decode scratch: the largest frame the plane can carry. The decoder never grows it.
+    let scratch = fmt.max_frame_samples();
+    let ch = channels as usize;
     // Pull-loop tick, one protocol frame. Rounded up so a sub-millisecond rung can
     // never round to a zero-length timeout and spin.
     let frame_ms = (frame_us as u64).div_ceil(1000).max(1);
@@ -1639,6 +1599,7 @@ fn spawn_audio(
                 player.push(buf);
             };
             let mut gaps = punktfunk_core::audio::AudioGapTracker::new_at_frame_us(frame_us);
+            // Last decoded frame per channel: the PLC unit, 0 until something decodes.
             let mut frame_samples = 0usize;
             let mut av = punktfunk_core::audio::AvSync::new_at_rate(channels, rate_hz);
             if !av_sync_enabled {
@@ -1720,9 +1681,8 @@ fn spawn_audio(
                         let depth = sync_cell.depth();
                         // Published even with sync off — ring depth is what makes a
                         // "too much latency" report triageable.
-                        buffer_ms_out.store((depth / per_ms) as u32, Ordering::Relaxed);
-                        // A delayed packet whose timeline position was already concealed is
-                        // not going to play, so it is not an A/V-sync observation either.
+                        buffer_ms_out.store(fmt.samples_ms(depth), Ordering::Relaxed);
+                        // Concealed timeline positions do not contribute A/V-sync observations.
                         if av_sync_enabled && !discard_packet {
                             let ve2e = video_e2e.load(Ordering::Relaxed);
                             let o = punktfunk_core::audio::AvSyncObservation {
@@ -1730,6 +1690,7 @@ fn spawn_audio(
                                 now_local_ns: punktfunk_core::client::now_realtime_ns(),
                                 clock_offset_ns: connector.clock_offset_now_ns(),
                                 buffered_ahead: depth,
+                                output_latency_ns: sync_cell.output_latency_ns(),
                                 // 0 = nothing on the glass yet; no reference, no correction.
                                 video_e2e_ns: (ve2e > 0).then_some(ve2e),
                             };
@@ -1742,34 +1703,38 @@ fn spawn_audio(
                         // from decoder state; PCM repeats-and-fades — lossless has nothing
                         // to interpolate from. Gap arithmetic is codec-independent.
                         for _ in 0..missing_to_conceal {
-                            if frame_samples == 0 {
-                                break;
-                            }
-                            if let Some(n) = dec.conceal(frame_samples, &mut pcm) {
-                                queue(&player, &pcm[..n]);
+                            match dec.conceal(frame_samples, &mut pcm) {
+                                Ok(n) if n > 0 => queue(&player, &pcm[..n * ch]),
+                                _ => break,
                             }
                         }
                         if discard_packet {
                             continue;
                         }
                         match dec.decode(&pkt.data, &mut pcm) {
-                            Some(n) => {
+                            // Empty payload: the last frame stays the concealment unit.
+                            Ok(0) => {}
+                            Ok(n) => {
                                 frame_samples = n;
-                                queue(&player, &pcm[..n]);
+                                queue(&player, &pcm[..n * ch]);
                             }
                             // Opus: corrupt packet. PCM: not a whole number of samples
                             // at the negotiated depth. Either way the frame is lost.
-                            None => tracing::debug!(bytes = pkt.data.len(), "audio decode failed"),
+                            Err(e) => tracing::debug!(
+                                error = %e,
+                                bytes = pkt.data.len(),
+                                "audio decode failed"
+                            ),
                         }
                     }
                     Err(PunktfunkError::NoFrame) => {
                         // Nothing on the wire. If the ring is draining, conceal at one
                         // frame per tick — this arm fires every frame time, the rate
                         // the callback drains at. `frame_samples` is 0 until first decode.
-                        let depth_ms = (sync_cell.depth() / per_ms) as u32;
+                        let depth_ms = fmt.samples_ms(sync_cell.depth());
                         if frame_samples > 0 && drought.conceal(last_packet.elapsed(), depth_ms) {
-                            if let Some(n) = dec.conceal(frame_samples, &mut pcm) {
-                                queue(&player, &pcm[..n]);
+                            if let Ok(n @ 1..) = dec.conceal(frame_samples, &mut pcm) {
+                                queue(&player, &pcm[..n * ch]);
                             }
                             sync_cell.publish_plc_ms(drought.total_ms());
                         }
@@ -1794,6 +1759,14 @@ fn parse_debug_reconfigure(s: &str) -> Option<(Mode, Duration)> {
         refresh_hz: hz.trim().parse().ok()?,
     };
     Some((mode, Duration::from_secs(secs_s.trim().parse().ok()?)))
+}
+
+/// How far before its latch an arrival has to land: decode plus what the presenter needs.
+/// Held 3 ms under a period, the room the host's own lead takes.
+fn phase_shift_ns(need_ns: u64, decode_ns: u64, period_ns: u64) -> u64 {
+    need_ns
+        .saturating_add(decode_ns)
+        .min(period_ns.saturating_sub(3_000_000))
 }
 
 #[cfg(test)]
@@ -1826,6 +1799,14 @@ mod tests {
         assert_eq!(covered, 0);
         // A gap larger than the concealed span still asks the decoder for the remainder.
         assert_eq!(reconcile_drought(&mut covered, 2, 5), (3, false));
+    }
+
+    #[test]
+    fn the_phase_shift_adds_decode_to_the_need_below_a_period() {
+        assert_eq!(phase_shift_ns(0, 0, 16_666_666), 0);
+        assert_eq!(phase_shift_ns(6_000_000, 500_000, 16_666_666), 6_500_000);
+        assert_eq!(phase_shift_ns(6_000_000, 9_000_000, 8_333_333), 5_333_333);
+        assert_eq!(phase_shift_ns(1_000_000, 0, 2_000_000), 0);
     }
 
     /// Every spelling the env-var doc promises has to land on the right side of
@@ -1966,72 +1947,18 @@ mod tests {
         assert_eq!(resolve_audio_format(Some("44100"), AUDIO_FORMAT_OPUS), None);
     }
 
-    /// Lossless arm: interleaved counts, concealment says no before it has anything
-    /// to repeat, truncated datagram refused. A per-channel mix-up would halve every
-    /// ring push — audible as a starving ring, not an obvious failure.
+    /// Every recovery site shares one window: a claim inside 100 ms of the last is refused.
     #[test]
-    fn the_lossless_plane_decodes_and_conceals_in_interleaved_samples() {
-        use punktfunk_core::audio::pcm;
-        let mut dec = AudioDec::new(
-            punktfunk_core::quic::AUDIO_CODEC_PCM,
-            2,
-            96_000,
-            pcm::BITS_24,
-            punktfunk_core::audio::AudioLayout::Legacy,
-        )
-        .expect("the PCM arm builds no codec and cannot fail");
-        let mut out = Vec::new();
-        // Saying so makes the caller emit silence and let the ring re-prime, instead
-        // of playing an uninitialised buffer.
-        assert_eq!(dec.conceal(384, &mut out), None);
-
-        // 2 ms frame at 96 kHz/24-bit stereo — the rung the default MTU ceiling lands on.
-        let frame = pcm::samples_per_frame(96_000, 2_000, 2);
-        assert_eq!(frame, 384, "192 samples per channel, interleaved");
-        let mut wire = Vec::new();
-        pcm::from_f32(&vec![0.5f32; frame], pcm::BITS_24, &mut wire);
-        assert_eq!(
-            dec.decode(&wire, &mut out),
-            Some(frame),
-            "interleaved count"
+    fn keyframe_asks_share_one_hundred_millisecond_window() {
+        let t0 = Instant::now();
+        let mut kf = KeyframeAsk::default();
+        assert!(kf.claim(t0), "the first ask goes out");
+        assert!(!kf.claim(t0 + Duration::from_millis(99)));
+        assert!(kf.claim(t0 + Duration::from_millis(100)));
+        assert!(
+            !kf.claim(t0 + Duration::from_millis(150)),
+            "the window restarts at the last granted ask"
         );
-        assert!(out[..frame].iter().all(|s| (s - 0.5).abs() < 1e-3));
-
-        // `PcmConceal` holds the frame it repeats, at the frame's own length.
-        assert_eq!(dec.conceal(0, &mut out), Some(frame));
-
-        // Not a whole number of samples at the negotiated depth: refuse rather than
-        // decode a shifted frame.
-        assert_eq!(dec.decode(&wire[..wire.len() - 1], &mut out), None);
-    }
-
-    /// Opus arm through the same methods: they return interleaved counts where
-    /// libopus counts per channel — the one place this could have halved a working plane.
-    #[test]
-    fn the_opus_plane_reports_interleaved_samples_too() {
-        let mut enc = opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Audio)
-            .expect("opus encoder");
-        let mut packet = [0u8; 4_000];
-        let silence = [0.0f32; 240 * 2];
-        let n = enc
-            .encode_float(&silence, &mut packet)
-            .expect("encode one 5 ms stereo frame");
-        let mut dec = AudioDec::new(
-            punktfunk_core::quic::AUDIO_CODEC_OPUS,
-            2,
-            48_000,
-            16,
-            punktfunk_core::audio::AudioLayout::Legacy,
-        )
-        .expect("opus decoder");
-        // Pump scratch: 120 ms — the biggest frame the Opus plane can carry.
-        let mut out = vec![0f32; 120 * 48 * 2];
-        assert_eq!(dec.decode(&packet[..n], &mut out), Some(240 * 2));
-        // PLC is asked for, and answered, in the same unit.
-        assert_eq!(dec.conceal(240 * 2, &mut out), Some(240 * 2));
-        // Nothing to size PLC from is a `None`, not a panic on an empty slice.
-        let mut empty = Vec::new();
-        assert_eq!(dec.conceal(0, &mut empty), None);
     }
 
     #[test]

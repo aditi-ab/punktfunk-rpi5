@@ -185,28 +185,6 @@ object Gamepad {
         }
     }
 
-    /**
-     * The glyph family a controller's physical buttons belong to, for the console UI's hint bar —
-     * so a DualSense user sees ✕/○/□/△ shapes and a Switch pad its monochrome lettering instead of
-     * Xbox's coloured letters. PURELY visual: the wire mapping ([buttonBit]) is unaffected.
-     */
-    enum class PadStyle { GENERIC, XBOX, PLAYSTATION, NINTENDO }
-
-    /**
-     * Resolve the [PadStyle] for a connected controller by USB vendor id. Vendor alone is enough —
-     * every pad a vendor ships wears its family's glyphs (any Sony pad has the shapes, any Nintendo
-     * pad the −/+ system buttons), so unlike [prefFor] no PID table is needed. Valve renders as
-     * [PadStyle.XBOX]: Steam pads carry A/B/X/Y in Xbox positions. Unknown vendors (8BitDo & co.,
-     * which near-universally clone the Xbox layout) fall back to [PadStyle.GENERIC], drawn with the
-     * Xbox convention.
-     */
-    fun styleFor(dev: InputDevice?): PadStyle = when (dev?.vendorId) {
-        VID_SONY -> PadStyle.PLAYSTATION
-        VID_MICROSOFT, VID_VALVE -> PadStyle.XBOX
-        VID_NINTENDO -> PadStyle.NINTENDO
-        else -> PadStyle.GENERIC
-    }
-
     /** True when [dev]'s source classes include gamepad or joystick. */
     fun isPad(dev: InputDevice?): Boolean {
         val s = dev?.sources ?: return false

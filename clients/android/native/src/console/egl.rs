@@ -109,6 +109,8 @@ pub(super) struct EglContext {
     pub(super) stencil_bits: i32,
     /// The config's MSAA sample count (0 = none) — likewise.
     pub(super) samples: i32,
+    /// The config is 10/10/10/2: the default framebuffer is `GL_RGB10_A2`.
+    pub(super) ten_bit: bool,
 }
 
 // SAFETY: EGL handles are process-wide tokens; the render thread is the only thread that
@@ -117,8 +119,9 @@ unsafe impl Send for EglContext {}
 
 impl EglContext {
     /// Initialise the default display and create an ES 3 context, falling back to ES 2 on
-    /// the boxes that have nothing newer. RGBA8888 with an 8-bit stencil (Skia's path
-    /// rendering wants one), no depth, no MSAA (the shell anti-aliases in Skia).
+    /// the boxes that have nothing newer. 10/10/10/2 first under ES 3 (the backdrop's
+    /// gradients band in 8), else RGBA8888; an 8-bit stencil (Skia's path rendering wants
+    /// one), no depth, no MSAA (the shell anti-aliases in Skia).
     pub(super) fn new() -> Result<EglContext> {
         // SAFETY: plain EGL calls with valid arguments; every handle is checked before use.
         unsafe {
@@ -130,9 +133,10 @@ impl EglContext {
             if eglInitialize(display, &mut major, &mut minor) != EGL_TRUE {
                 bail!("eglInitialize: 0x{:x}", eglGetError());
             }
-            for (version, renderable) in [
-                (GlesVersion::Es3, EGL_OPENGL_ES3_BIT),
-                (GlesVersion::Es2, EGL_OPENGL_ES2_BIT),
+            for (version, renderable, (rgb, alpha)) in [
+                (GlesVersion::Es3, EGL_OPENGL_ES3_BIT, (10, 2)),
+                (GlesVersion::Es3, EGL_OPENGL_ES3_BIT, (8, 8)),
+                (GlesVersion::Es2, EGL_OPENGL_ES2_BIT, (8, 8)),
             ] {
                 let attribs = [
                     EGL_SURFACE_TYPE,
@@ -140,13 +144,13 @@ impl EglContext {
                     EGL_RENDERABLE_TYPE,
                     renderable,
                     EGL_RED_SIZE,
-                    8,
+                    rgb,
                     EGL_GREEN_SIZE,
-                    8,
+                    rgb,
                     EGL_BLUE_SIZE,
-                    8,
+                    rgb,
                     EGL_ALPHA_SIZE,
-                    8,
+                    alpha,
                     EGL_STENCIL_SIZE,
                     8,
                     EGL_DEPTH_SIZE,
@@ -180,8 +184,11 @@ impl EglContext {
                 };
                 let stencil_bits = attr(EGL_STENCIL_SIZE);
                 let samples = attr(EGL_SAMPLES);
+                // What EGL picked, not what was asked: a match is "at least" these sizes.
+                let ten_bit = attr(EGL_RED_SIZE) == 10;
                 log::info!(
-                    "console: EGL {major}.{minor}, GLES {client_version} context, stencil {stencil_bits}, samples {samples}"
+                    "console: EGL {major}.{minor}, GLES {client_version} context, {} bit, stencil {stencil_bits}, samples {samples}",
+                    if ten_bit { 10 } else { 8 }
                 );
                 return Ok(EglContext {
                     display,
@@ -190,6 +197,7 @@ impl EglContext {
                     version,
                     stencil_bits,
                     samples,
+                    ten_bit,
                 });
             }
             bail!(
@@ -199,14 +207,21 @@ impl EglContext {
         }
     }
 
-    /// A window surface over `window` (an `ANativeWindow*`), made current on the calling
-    /// thread with a vsync-locked swap interval. Returns the surface and its pixel size.
-    pub(super) fn window_surface(&self, window: *mut c_void) -> Result<EglSurface> {
-        // SAFETY: `window` is a live ANativeWindow the caller holds a reference to for the
-        // surface's lifetime; the display/config/context are this object's own.
+    /// A window surface over `window`, made current on the calling thread with a vsync-locked
+    /// swap interval. Returns the surface and its pixel size.
+    pub(super) fn window_surface(
+        &self,
+        window: &ndk::native_window::NativeWindow,
+    ) -> Result<EglSurface> {
+        // SAFETY: `window` is live for the call and EGL takes its own reference for the surface's
+        // lifetime; the display/config/context are this object's own.
         unsafe {
-            let surface =
-                eglCreateWindowSurface(self.display, self.config, window, std::ptr::null());
+            let surface = eglCreateWindowSurface(
+                self.display,
+                self.config,
+                window.ptr().as_ptr().cast(),
+                std::ptr::null(),
+            );
             if surface == EGL_NO_SURFACE {
                 bail!("eglCreateWindowSurface: 0x{:x}", eglGetError());
             }

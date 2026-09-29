@@ -569,7 +569,7 @@ pub(crate) fn stream_existing_output(
         .context("spawn Mutter monitor-mirror thread")?;
     // Built before the wait so a timeout still signals the thread,
     // rather than leaving a RecordMonitor cast on a real head.
-    let guard = MirrorStop(stop);
+    let guard = crate::proc::StopFlag(stop);
     let node_id = match setup_rx.recv_timeout(Duration::from_secs(20)) {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => bail!("Mutter monitor mirror failed: {e}"),
@@ -584,14 +584,6 @@ pub(crate) fn stream_existing_output(
         cursor_mode: None,
         keepalive: Box::new(guard),
     })
-}
-
-struct MirrorStop(Arc<AtomicBool>);
-
-impl Drop for MirrorStop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
-    }
 }
 
 /// D-Bus connection behind a mirrored-monitor cast. Drop of the opener's

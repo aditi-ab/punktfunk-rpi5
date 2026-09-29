@@ -22,7 +22,7 @@
 // across sessions. Only the PUBLIC `childViewControllerForPointerLock` selector is touched
 // (App-Store-safe; no private API).
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 import ObjectiveC
 import UIKit
 
@@ -79,6 +79,14 @@ enum PointerLockChain {
             child = parent
         }
         anchor.setNeedsUpdateOfPrefersPointerLocked()
+    }
+
+    /// Whether the system's downward walk can reach `anchor` at all: the containment chain must
+    /// end at the window's root or at a presented controller. A diagnostic, not a gate.
+    static func reachesScene(from anchor: UIViewController) -> Bool {
+        var top = anchor
+        while let parent = top.parent { top = parent }
+        return top === anchor.view.window?.rootViewController || top.presentingViewController != nil
     }
 
     /// Clear the forced forwarding on every stamped ancestor (so the SwiftUI parents stop retaining

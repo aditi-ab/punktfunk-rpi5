@@ -9,7 +9,7 @@
 //                                            runs an unreviewed package
 //   - PUT  /api/v1/store/sources/{name}    — adds a catalog SOURCE, i.e. a new trust root
 //   - PUT  /api/v1/hooks                   — a hook is a shell command the host runs on its events
-//   - the library writes that carry `prep`/`launch.kind == "command"` — same primitive, gated
+//   - the library writes that carry `prep` or a privileged launch kind — same primitive, gated
 //     conditionally in util/libraryConfirm.ts
 //   - POST /api/v1/actions/{id}           — the host power actions (sleep/reboot/shutdown,
 //                                            design/host-actions.md §7): ending the machine from

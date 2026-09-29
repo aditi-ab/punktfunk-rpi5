@@ -24,14 +24,14 @@ use punktfunk_core::clipboard::ClipEventCore;
 use punktfunk_core::error::PunktfunkError;
 use punktfunk_core::quic::{ClipKind, CLIP_FILE_INDEX_NONE, HOST_CAP_CLIPBOARD};
 
-use super::{get_session, jni_guard, SessionHandle};
+use super::{jni_guard, SessionHandle, SESSIONS};
 
 /// The portable wire MIME both ends map to their platform text type.
 const TEXT_MIME: &str = "text/plain;charset=utf-8";
 
 /// Retain one keyed session for the duration of a clipboard JNI call.
 fn client(handle: jlong) -> Option<Arc<SessionHandle>> {
-    get_session(handle)
+    SESSIONS.get(handle)
 }
 
 /// `NativeBridge.nativeClipSupported(handle)` — the host advertised `HOST_CAP_CLIPBOARD`.
@@ -180,7 +180,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeNextClip<'l
     // "null on timeout" contract in the doc comment above is unchanged.
     env.with_env(|env| -> jni::errors::Result<JString<'local>> {
         let Some(h) = client(handle) else {
-            return Ok(JString::default());
+            return env.new_string("closed");
         };
         let msg = match h.client.next_clip(Duration::from_millis(250)) {
             Ok(ClipEventCore::State { enabled, .. }) => format!("state:{}", u8::from(enabled)),

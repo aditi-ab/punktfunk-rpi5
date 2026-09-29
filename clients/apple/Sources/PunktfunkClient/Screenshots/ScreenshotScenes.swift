@@ -39,27 +39,6 @@ enum ShotScenes {
             ShotScene(name: "05-settings", orientation: .natural, colorScheme: .dark) {
                 AnyView(ShotSettings())
             },
-            // 06–10 are the iOS/macOS console-shell block below; the library is cross-platform
-            // (tvOS renders the same coverflow), hence the number above that range.
-            ShotScene(name: "11-library", orientation: .landscape, colorScheme: .dark) {
-                AnyView(ShotLibrary())
-            },
-            // The grid arrangement, and the view/sort bar FOCUSED — the desktop shipped a
-            // mis-sized bar wash precisely because no shot ever showed the bar with focus.
-            ShotScene(name: "11b-library-grid", orientation: .landscape, colorScheme: .dark) {
-                AnyView(ShotLibrary(arrangement: .grid))
-            },
-            ShotScene(name: "11c-library-bar", orientation: .landscape, colorScheme: .dark) {
-                AnyView(ShotLibrary(arrangement: .shelf, barFocused: true))
-            },
-            // The Collections tiles (group by platform), as "start in collections" opens them.
-            ShotScene(name: "11d-collections", orientation: .landscape, colorScheme: .dark) {
-                AnyView(ShotLibrary(collections: true))
-            },
-            // A title's Options menu (X) over the shelf.
-            ShotScene(name: "11e-library-options", orientation: .landscape, colorScheme: .dark) {
-                AnyView(ShotLibrary(options: true))
-            },
             // The launch hold, settled: what the player looks at from the tap until the game is
             // actually running.
             ShotScene(name: "13-launch-hold", orientation: .landscape, colorScheme: .dark) {
@@ -95,15 +74,11 @@ enum ShotScenes {
                 AnyView(ShotHostPage())
             },
         ]
-        #if os(iOS) || os(macOS)
-        // The gamepad-mode console screens (no tvOS — native focus engine there). Dev-only shots
-        // for eyeballing the Liquid Glass host tiles + settings rows.
+        #if os(iOS) || os(visionOS) || os(macOS)
         scenes += [
-            ShotScene(name: "06-gamepad-home", orientation: .natural, colorScheme: .dark) {
-                AnyView(ShotGamepadHome())
-            },
-            // The Library tab with its host filter (iOS) and the Mac's Library row.
-            ShotScene(name: "15f-library-filter", orientation: .natural, colorScheme: .dark) {
+            // The Library tab with its host filter (iOS) and the Mac's Library row. Landscape like
+            // the store set's other shelves.
+            ShotScene(name: "15f-library-filter", orientation: .landscape, colorScheme: .dark) {
                 AnyView(ShotLibraryFilter())
             },
             // The host page as sections beside a sidebar: the iPad's sheet, the Mac's window.
@@ -111,35 +86,15 @@ enum ShotScenes {
                 AnyView(HostSectionsView(
                     hostID: ShotMock.battlestationID, store: ShotMock.pageStore, handOff: { _ in }))
             },
-            ShotScene(name: "07-gamepad-settings", orientation: .natural, colorScheme: .dark) {
-                AnyView(ShotGamepadSettings())
-            },
-            ShotScene(name: "08-gamepad-addhost", orientation: .natural, colorScheme: .dark) {
-                AnyView(ShotGamepadAddHost())
-            },
-            // The keyboard tray up, with the edited row seated above the keys (set
-            // PUNKTFUNK_SHOT_EDITING=address to type into a field other than the name).
-            ShotScene(name: "08b-gamepad-addhost-typing", orientation: .landscape, colorScheme: .dark) {
-                AnyView(ShotGamepadAddHost())
-            },
-            ShotScene(name: "09-connecting", orientation: .natural, colorScheme: .dark) {
+            // The connect overlay's Liquid Glass modal over the touch grid, in each phase.
+            ShotScene(name: "09d-connecting-modal", orientation: .natural, colorScheme: .dark) {
                 AnyView(ShotConnect(kind: .connecting))
             },
-            ShotScene(name: "09b-waking", orientation: .natural, colorScheme: .dark) {
+            ShotScene(name: "09e-waking-modal", orientation: .natural, colorScheme: .dark) {
                 AnyView(ShotConnect(kind: .waking))
             },
-            ShotScene(name: "09c-wake-timed-out", orientation: .natural, colorScheme: .dark) {
-                AnyView(ShotConnect(kind: .timedOut))
-            },
-            // The default-UI presentation (Liquid Glass modal over the touch grid) of the same phases.
-            ShotScene(name: "09d-connecting-modal", orientation: .natural, colorScheme: .dark) {
-                AnyView(ShotConnect(kind: .connecting, gamepadUI: false))
-            },
-            ShotScene(name: "09e-waking-modal", orientation: .natural, colorScheme: .dark) {
-                AnyView(ShotConnect(kind: .waking, gamepadUI: false))
-            },
             ShotScene(name: "09f-wake-timed-out-modal", orientation: .natural, colorScheme: .dark) {
-                AnyView(ShotConnect(kind: .timedOut, gamepadUI: false))
+                AnyView(ShotConnect(kind: .timedOut))
             },
             // FEEL THE GAME — the controller test panel with injected pads. Gated with the
             // console block because ControllerTestView doesn't build on tvOS, not because it
@@ -147,6 +102,10 @@ enum ShotScenes {
             // for horizontal use, so the two pads sit as side-by-side columns (see the scene).
             ShotScene(name: "12-controllers", orientation: .landscape, colorScheme: .dark) {
                 AnyView(ShotControllers())
+            },
+            // The gamepad UI: the console the app swaps in when a controller is connected.
+            ShotScene(name: "06-console", orientation: .landscape, colorScheme: .dark) {
+                AnyView(ShotConsole())
             },
         ]
         #endif
@@ -178,7 +137,7 @@ enum ShotScenes {
             },
         ]
         #endif
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         // The Library tab with every section filled: Desktops, Recently Played, Favorites,
         // Launchers and Games.
         scenes.append(ShotScene(name: "15b-library-sections", orientation: .natural, colorScheme: .dark) {
@@ -408,7 +367,7 @@ enum ShotMock {
         #endif
     }
 
-    /// A believable shelf for the library coverflow: the demo host's titles (`DemoMode.games`)
+    /// A believable shelf for the library: the demo host's titles (`DemoMode.games`)
     /// plus the Steam launcher, which stays artless by design and renders its brand mark.
     static let games: [GameEntry] = DemoMode.games + {
         let json = """
@@ -437,14 +396,26 @@ private struct ShotHome: View {
 
     var body: some View {
         #if os(macOS)
-        HomeView(
-            store: store, model: model, discovery: discovery,
-            showAddHost: .constant(false), pairingTarget: .constant(nil),
-            speedTestTarget: .constant(nil), libraryTarget: .constant(nil),
-            connect: { _, _ in }, connectDiscovered: { _ in },
-            onPaired: { _, _ in }, onLaunchTitle: { _, _ in }, onConnectShelf: { _ in },
-            wake: { _ in })
+        // The window as ContentView builds it: the sidebar shell around the host grid.
+        MacShellView(
+            store: store, selection: .constant(.hosts),
+            hosts: HomeView(
+                store: store, model: model, discovery: discovery,
+                showAddHost: .constant(false), pairingTarget: .constant(nil),
+                speedTestTarget: .constant(nil), libraryTarget: .constant(nil),
+                connect: { _, _ in }, connectDiscovered: { _ in },
+                onPaired: { _, _ in }, onLaunchTitle: { _, _ in }, onConnectShelf: { _ in },
+                wake: { _ in }),
+            onLaunch: { _, _ in }, onConnectShelf: { _ in }, onConnectHost: { _ in })
+        #elseif os(iOS) || os(visionOS)
+        ShotTouchTabs(selection: .hosts) { home } library: { Color.clear }
         #else
+        home
+        #endif
+    }
+
+    #if !os(macOS)
+    private var home: some View {
         HomeView(
             store: store, model: model, discovery: discovery,
             showAddHost: .constant(false), pairingTarget: .constant(nil),
@@ -453,9 +424,37 @@ private struct ShotHome: View {
             connect: { _, _ in }, connectDiscovered: { _ in },
             onPaired: { _, _ in }, onLaunchTitle: { _, _ in }, onConnectShelf: { _ in },
             wake: { _ in })
-        #endif
+    }
+    #endif
+}
+
+#if os(iOS) || os(visionOS)
+/// Hosts and Library as ContentView's tabs: a tab bar on iPhone, a sidebar-able bar on iPad.
+struct ShotTouchTabs<Hosts: View, Library: View>: View {
+    let selection: TouchTab
+    @ViewBuilder let hosts: Hosts
+    @ViewBuilder let library: Library
+
+    var body: some View {
+        if #available(iOS 18, *) {
+            TabView(selection: .constant(selection)) {
+                Tab("Hosts", systemImage: "desktopcomputer", value: TouchTab.hosts) { hosts }
+                Tab("Library", systemImage: "square.grid.2x2", value: TouchTab.library) { library }
+            }
+            .tabViewStyle(.sidebarAdaptable)
+        } else {
+            TabView(selection: .constant(selection)) {
+                hosts
+                    .tabItem { Label("Hosts", systemImage: "desktopcomputer") }
+                    .tag(TouchTab.hosts)
+                library
+                    .tabItem { Label("Library", systemImage: "square.grid.2x2") }
+                    .tag(TouchTab.library)
+            }
+        }
     }
 }
+#endif
 
 #if os(tvOS)
 /// The TV's tab bar as the app draws it, over the mock hosts and catalog.
@@ -567,58 +566,14 @@ private struct ShotTVCustomizeMoved: View {
 
 // MARK: - Library
 
-/// The library with the mock shelf — the store listing's PICK & PLAY frame. The real
-/// `LibraryConsoleView` (coverflow or grid), no network: `ShotPosterArt` answers the mock entries' art immediately,
-/// so the cards swing in already carrying posters (the entrance waits on art settling).
-private struct ShotLibrary: View {
-    var arrangement: LibraryArrangement?
-    var barFocused = false
-    var collections = false
-    var options = false
-
-    /// Dev knobs for driving the console library on a Mac from the shot harness: with
-    /// `PUNKTFUNK_FAKE_LIBRARY` set the scene shows that catalog (a real multi-row grid, the
-    /// shared collate vectors file works) instead of the five-title mock; with
-    /// `PUNKTFUNK_SHOT_INTERACTIVE=1` the screen owns the controller/keyboard, so arrow keys walk
-    /// the grid exactly as the pad would.
-    private var games: [GameEntry] {
-        let env = ProcessInfo.processInfo.environment
-        guard let path = env["PUNKTFUNK_FAKE_LIBRARY"], !path.isEmpty,
-              let data = FileManager.default.contents(atPath: path)
-        else { return ShotMock.games }
-        struct Wrapped: Decodable { let library: [GameEntry] }
-        let decoder = JSONDecoder()
-        if let list = try? decoder.decode([GameEntry].self, from: data) { return list.launchersFirst }
-        if let wrapped = try? decoder.decode(Wrapped.self, from: data) { return wrapped.library.launchersFirst }
-        return ShotMock.games
-    }
-
-    private var interactive: Bool {
-        ProcessInfo.processInfo.environment["PUNKTFUNK_SHOT_INTERACTIVE"] == "1"
-    }
-
-    var body: some View {
-        LibraryConsoleView(
-            games: games, artLoader: ShotPosterArt.source,
-            onLaunch: { _ in }, onDismiss: {},
-            // The mock has a clipboard action, and a game up, so the Options menu shows both
-            // of the rows a real shelf offers.
-            onCopyLink: { _ in }, hostName: "Battlestation",
-            nowPlaying: "Hollow Knight", onConnect: {},
-            controllerActive: interactive,
-            arrangementOverride: arrangement, barFocusedInitially: barFocused,
-            startInCollectionsOverride: collections, optionsInitially: options)
-    }
-}
-
 // MARK: - Launch hold
 
 /// The launch hold over the real shelf.
 ///
-/// The shelf underneath is the actual `LibraryConsoleView`, not a backdrop image, which is what
-/// makes the flight real: its posters publish their rects to `TileFrames` exactly as they do in
-/// the app, so the cover here leaves the tile it is drawn in rather than a rect this scene made
-/// up. `flight` replays the arrival every few seconds — the still frame cannot show it.
+/// The shelf underneath is the touch grid, not a backdrop image, which is what makes the flight
+/// real: its posters publish their rects to `TileFrames` exactly as they do in the app, so the
+/// cover here leaves the tile it is drawn in rather than a rect this scene made up. `flight`
+/// replays the arrival every few seconds — the still frame cannot show it.
 private struct ShotLaunchHold: View {
     var flight = false
     /// Which mock title launches. Its tile has to be on screen for a rect to exist.
@@ -631,10 +586,7 @@ private struct ShotLaunchHold: View {
 
     var body: some View {
         ZStack {
-            // The GRID for the flight: the coverflow's centred card already sits where the hold
-            // puts it, so a cover leaving it barely travels. A grid tile is small and off to one
-            // side, which is the move the animation is actually for.
-            ShotLibrary(arrangement: flight ? .grid : nil)
+            ShotLibraryTouch()
             if showing {
                 LaunchHoldView(
                     entry: launched, host: nil, connecting: true,
@@ -667,56 +619,23 @@ private struct ShotLaunchHold: View {
     }
 }
 
-// MARK: - Gamepad-mode console screens (dev-only glass preview)
-
-#if os(iOS) || os(macOS)
-private struct ShotGamepadHome: View {
-    @StateObject private var store = ShotMock.hostStore()
-    @StateObject private var model = SessionModel()
-    @StateObject private var discovery = ShotMock.discovery()
-    @StateObject private var waker = HostWaker()
-
-    var body: some View {
-        GamepadHomeView(
-            store: store, model: model, discovery: discovery,
-            libraryTarget: .constant(nil), pairingTarget: .constant(nil),
-            onPaired: { _, _ in }, waker: waker,
-            connect: { _, _ in }, connectDiscovered: { _ in }, launchTitle: { _, _ in },
-            connectShelf: { _ in }, wakeOnly: { _ in })
-    }
-}
-
-private struct ShotGamepadSettings: View {
-    @StateObject private var store = ShotMock.hostStore()
-
-    var body: some View { GamepadSettingsView(store: store) }
-}
-
-private struct ShotGamepadAddHost: View {
-    var body: some View { GamepadAddHostView(onAdd: { _ in }) }
-}
-
-/// The unified connect overlay (the real `ConnectOverlay`) in each phase — instant "Connecting…"
-/// feedback, the "Waking…" wait, and the wake-timed-out prompt. `gamepadUI` picks the presentation:
-/// the console's full-screen aurora takeover over the gamepad home, or the default UI's Liquid Glass
-/// modal over the touch host grid.
+#if os(iOS) || os(visionOS) || os(macOS)
+/// The connect overlay (the real `ConnectOverlay`) in each phase — instant "Connecting…"
+/// feedback, the "Waking…" wait, and the wake-timed-out prompt — as the touch UI's Liquid Glass
+/// modal over the host grid.
 private struct ShotConnect: View {
     enum Kind { case connecting, waking, timedOut }
     let kind: Kind
-    var gamepadUI = true
 
     @StateObject private var store = ShotMock.hostStore()
-    @StateObject private var model = SessionModel()
-    @StateObject private var discovery = ShotMock.discovery()
     @StateObject private var waker = HostWaker()
 
     var body: some View {
-        backdrop
+        ShotHome()
             .overlay {
                 ConnectOverlay(
                     connectingHostName: kind == .connecting ? "Battlestation" : nil,
                     waker: waker,
-                    gamepadUI: gamepadUI,
                     onCancelConnect: {})
             }
             .onAppear {
@@ -735,16 +654,35 @@ private struct ShotConnect: View {
             }
     }
 
-    @ViewBuilder private var backdrop: some View {
-        if gamepadUI {
-            GamepadHomeView(
-                store: store, model: model, discovery: discovery,
-                libraryTarget: .constant(nil), pairingTarget: .constant(nil),
-            onPaired: { _, _ in }, waker: waker,
-                connect: { _, _ in }, connectDiscovered: { _ in }, launchTitle: { _, _ in },
-            connectShelf: { _ in }, wakeOnly: { _ in })
-        } else {
-            ShotHome()
+}
+
+// MARK: - Console
+
+/// The console over the mock hosts, as ContentView mounts it for a connected controller.
+private struct ShotConsole: View {
+    @StateObject private var store = ShotMock.hostStore()
+    @StateObject private var model = SessionModel()
+    @StateObject private var discovery = ShotMock.discovery()
+    @StateObject private var waker = HostWaker()
+    /// Mounted once the scene has turned: a console built before the rotation kept its
+    /// portrait width.
+    @State private var mounted = false
+
+    var body: some View {
+        ZStack {
+            if mounted {
+                ConsoleHomeView(
+                    store: store, model: model, discovery: discovery, waker: waker,
+                    entry: .constant(nil), notice: .constant(nil), pairing: .constant(nil),
+                    linkConfirm: .constant(nil), runLink: { _ in }, onFailed: {},
+                    onPaired: { _, _ in }, connect: { _, _ in }, connectDiscovered: { _ in },
+                    requestAccess: { _ in }, requestAccessDiscovered: { _ in },
+                    launchTitle: { _, _ in }, connectShelf: { _ in }, wakeOnly: { _ in })
+            }
+        }
+        .task {
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            mounted = true
         }
     }
 }
@@ -805,7 +743,7 @@ private struct ShotSettings: View {
     var body: some View {
         #if os(macOS)
         ShotMacSettingsWindow()
-        #elseif os(iOS)
+        #elseif os(iOS) || os(visionOS)
         // SettingsView owns its NavigationSplitView (sidebar + detail) and Done button, so it is
         // rendered directly — a wrapping NavigationStack would nest a split view in a stack. Open
         // on Display rather than the bare category list: resolution, frame rate, bitrate, HDR and
@@ -874,7 +812,7 @@ private struct ShotPair: View {
     }
 
     var body: some View {
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         // PRESENT it, don't rebuild it. `PairSheet` is a bottom sheet on iOS — it carries its own
         // `.presentationDetents([.medium, .large])` and the system's Liquid Glass background, both
         // of which only exist inside a real `.sheet`. Composed into a ZStack instead (what this
@@ -921,7 +859,12 @@ private struct ShotTrust: View {
 /// The frame fills the display; the HUD stays inside the safe area. The status bar and home
 /// indicator hide, as they do for a live session.
 private struct ShotStreamHero: View {
+    #if os(macOS)
+    /// The App Store canvas's scale: a 1× monitor still shoots the 2× Mac.
+    private let scale = ShotDevice.mac.scale
+    #else
     @Environment(\.displayScale) private var scale
+    #endif
 
     var body: some View {
         GeometryReader { geo in
@@ -934,7 +877,7 @@ private struct ShotStreamHero: View {
         }
         .background { ShotDesktopFrame() }
         .background(Color.black.ignoresSafeArea())
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         #endif
@@ -959,6 +902,8 @@ private struct ShotHUD: View {
         }
         #if os(macOS)
         return NSScreen.main?.maximumFramesPerSecond ?? 60
+        #elseif os(visionOS)
+        return NativeDisplay.mode.hz
         #else
         return UIApplication.shared.connectedScenes
             .compactMap { ($0 as? UIWindowScene)?.screen.maximumFramesPerSecond }.first ?? 60

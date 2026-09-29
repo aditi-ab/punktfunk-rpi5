@@ -46,11 +46,15 @@ pub fn fail_reply(status: u32, (error, name): Fail) -> SetEncodeReply {
     reply
 }
 
-/// `pf_frame::HdrMeta` from its 28 `repr(C)` bytes.
-pub fn hdr_meta(bytes: &[u8; 28]) -> HdrMeta {
+/// `pf_frame::HdrMeta` from its 28 `repr(C)` bytes. All zero is the host's `None`: no mastering
+/// volume, never a 0-nit one.
+pub fn hdr_meta(bytes: &[u8; 28]) -> Option<HdrMeta> {
+    if bytes.iter().all(|&b| b == 0) {
+        return None;
+    }
     // SAFETY: `HdrMeta` is `repr(C)`, 28 bytes of plain integers with no invalid bit pattern;
     // `read_unaligned` copies them out of the request's byte array.
-    unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<HdrMeta>()) }
+    Some(unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<HdrMeta>()) })
 }
 
 /// The request's `open` spec for backend `backend` of its list. The input comes from
@@ -60,7 +64,13 @@ pub fn spec_for(req: &SetEncodeRequest, backend: u32) -> Result<OpenSpec, Fail> 
     let (hdr, chroma444) = (req.hdr == 1, req.chroma == 1);
     // 10-bit SDR (depth 10, HDR off) picks a BT.709 P010 input on AMF; `choose` ignores it elsewhere.
     let ten_bit = req.bit_depth >= 10;
-    let kind = InputKind::choose(backend, hdr, ten_bit, chroma444);
+    let chosen = InputKind::choose(backend, hdr, ten_bit, chroma444);
+    // `PFVD_AMF_NV12` (machine environment, read per open) opens AMF on the video engine's
+    // NV12 at once: the A/B for a VCN whose own colour conversion looks or runs worse.
+    let kind = match chosen.fallback(backend) {
+        Some(second) if crate::log::knob("PFVD_AMF_NV12").is_some() => second,
+        _ => chosen,
+    };
     Ok(OpenSpec {
         backend,
         codec: codec_from_wire(req.codec).ok_or((-4, "codec"))?,
@@ -89,9 +99,10 @@ fn caps_wire(c: EncoderCaps) -> EncoderCapsWire {
     }
 }
 
-/// Walk the request's backend list in order; the first that opens wins. `Err` is the last
-/// failure as the wire reply — no silent fallback past the list. `open_backend` returns a
-/// backend whose session already exists, so `reply.caps` describes the live encoder rather
+/// Walk the request's backend list in order; the first that opens wins. A backend that
+/// refuses its input is tried on [`InputKind::fallback`] before the next one. `Err` is the
+/// last failure as the wire reply — no silent fallback past the list. `open_backend` returns
+/// a backend whose session already exists, so `reply.caps` describes the live encoder rather
 /// than its defaults — the host reads those caps once and never asks again.
 fn open_listed(
     req: &SetEncodeRequest,
@@ -100,32 +111,38 @@ fn open_listed(
 ) -> Result<(Box<dyn Encoder>, OpenSpec, SetEncodeReply), SetEncodeReply> {
     let mut last: Fail = (-1, "nobackend");
     for &backend in req.backends.iter().take_while(|&&b| b != 0) {
-        let spec = match spec_for(req, backend) {
+        let first = match spec_for(req, backend) {
             Ok(s) => s,
             Err(f) => {
                 last = f;
                 continue;
             }
         };
-        match open_backend(&spec, adapter, device) {
-            Ok(mut enc) => {
-                if req.wire_chunk_bytes != 0 {
-                    enc.set_wire_chunking(req.wire_chunk_bytes as usize);
+        let second = first
+            .kind
+            .fallback(backend)
+            .map(|kind| OpenSpec { kind, ..first });
+        for spec in std::iter::once(first).chain(second) {
+            match open_backend(&spec, adapter, device) {
+                Ok(mut enc) => {
+                    if req.wire_chunk_bytes != 0 {
+                        enc.set_wire_chunking(req.wire_chunk_bytes as usize);
+                    }
+                    if req.hdr == 1 {
+                        enc.set_hdr_meta(hdr_meta(&req.hdr_meta));
+                    }
+                    let applied = enc.applied_bitrate_bps().unwrap_or(spec.bitrate_bps);
+                    let mut reply = fail_reply(
+                        wire::SET_ENCODE_OK,
+                        (0, BACKEND_NAMES[backend as usize - 1]),
+                    );
+                    reply.backend_opened = backend;
+                    reply.caps = caps_wire(enc.caps());
+                    reply.applied_bitrate_kbps = (applied / 1000) as u32;
+                    return Ok((enc, spec, reply));
                 }
-                if req.hdr == 1 {
-                    enc.set_hdr_meta(Some(hdr_meta(&req.hdr_meta)));
-                }
-                let applied = enc.applied_bitrate_bps().unwrap_or(spec.bitrate_bps);
-                let mut reply = fail_reply(
-                    wire::SET_ENCODE_OK,
-                    (0, BACKEND_NAMES[backend as usize - 1]),
-                );
-                reply.backend_opened = backend;
-                reply.caps = caps_wire(enc.caps());
-                reply.applied_bitrate_kbps = (applied / 1000) as u32;
-                return Ok((enc, spec, reply));
+                Err(f) => last = f,
             }
-            Err(f) => last = f,
         }
     }
     Err(fail_reply(wire::SET_ENCODE_NO_BACKEND, last))
@@ -181,7 +198,7 @@ impl EncodeThread {
 /// The thread body: open, build or reuse the monitor's pool, report, then drive until stopped.
 /// The pool is reused — retained slot included — when it already fits this session's device,
 /// size and input kind; anything else is a fresh pool installed on the monitor. The open line
-/// names the frame path (`pool` or S6's `bypass`), so a comparison run can prove which it got.
+/// names the frame path (`pool` or `bypass`), so a comparison run can prove which it got.
 fn run(stop: HANDLE, ctx: ThreadCtx, live: Arc<AtomicBool>) {
     let _mmcss = Mmcss::distribution("encode");
     let section = &ctx.session.section;
@@ -206,9 +223,15 @@ fn run(stop: HANDLE, ctx: ThreadCtx, live: Arc<AtomicBool>) {
         }
     };
     let size = (spec.width, spec.height);
+    // `PFVD_POOL_BYPASS` (machine environment, read per open): `0` copies every frame.
+    let bypass = wire::zero_copy(
+        spec.backend,
+        spec.kind == InputKind::Bgra,
+        crate::log::knob("PFVD_POOL_BYPASS").as_deref(),
+    );
     let reused = monitor
         .pool()
-        .filter(|p| p.matches(&ctx.device, spec.kind, size));
+        .filter(|p| p.matches(&ctx.device, spec.kind, size, bypass));
     let pool = match reused {
         Some(p) => p,
         None => match Pool::build(
@@ -217,6 +240,7 @@ fn run(stop: HANDLE, ctx: ThreadCtx, live: Arc<AtomicBool>) {
             size,
             monitor.source_seq.clone(),
             monitor.cursor_cell(),
+            bypass,
         ) {
             Ok(p) => {
                 monitor.set_pool(p.clone());
@@ -289,14 +313,15 @@ pub fn codec_from_wire(codec: u32) -> Option<Codec> {
 /// private instance wants none of them. The loader-wide knob needs a 1.3.234+ loader; each
 /// manifest's own `disable_environment` works on any.
 ///
-/// Call from `driver_entry` only. Mutating the environment is unsound once other threads run,
-/// and the encode thread is exactly the wrong place for it; at load there is no other thread.
+/// Call from `driver_entry`, before the first encoder opens: the loader reads these when it
+/// creates an instance. WUDFHost is our own process (`ProcessSharingDisabled`), so the variables
+/// reach nobody else.
 pub fn disable_implicit_vulkan_layers() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        // SAFETY: called from `driver_entry`, before this driver has started a thread, so no
-        // reader can race the write. WUDFHost is our own process (`ProcessSharingDisabled`), so
-        // the variables reach nobody else.
+        // SAFETY: std documents `set_var` as always safe on Windows: the process environment
+        // sits behind the OS's own lock, so the framework threads WUDFHost already runs cannot
+        // race the write.
         unsafe {
             for (k, v) in [
                 ("VK_LOADER_LAYERS_DISABLE", "~implicit~"),

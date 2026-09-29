@@ -23,6 +23,9 @@ pub use crate::video_color::{csc_rows, ColorDesc};
 /// The module stays private, like every other backend.
 pub use crate::video_software::NoSoftwareRung;
 use crate::video_software::SoftwareDecoder;
+/// Defined in [`crate::video_types`] so `d3d11va` can name them without this
+/// module. Call sites keep the `video::` paths.
+pub use crate::video_types::{umd_version_parts, DecodeHealth, StreamFormat};
 #[cfg(target_os = "linux")]
 use crate::video_vaapi_native::NativeVaapiDecoder;
 /// The Vulkan handoff types live in [`crate::video_vk`] so Android can reach them without
@@ -70,66 +73,6 @@ pub enum DecodedImage {
     /// the timeline, samples, restores [`NativeVkFrame::layout`], and drops the
     /// frame to release the slot.
     NativeVk(NativeVkFrame),
-}
-
-/// Session-cumulative decode integrity. Only native rungs fill it
-/// ([`Decoder::decode_health`] is `None` elsewhere). Counters are monotonic;
-/// the stats window diffs them like `frames_dropped`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DecodeHealth {
-    /// AUs whose plan needed concealment (missing DPB ref, `frame_num` gap,
-    /// truncated NALU walk). Output was released unshown.
-    pub damaged: u64,
-    /// Frames the driver reported corrupt (`RESULT_STATUS_ONLY`). Distinct from
-    /// [`Self::damaged`]: damaged is an incomplete bitstream; failed is hardware
-    /// that could not decode what arrived. Structurally 0 where
-    /// [`Self::status_queries`] is false — [`Self::note`] still extends [`Self::run`].
-    pub failed: u64,
-    /// AUs the decoder refused (plan error or session failure). No picture.
-    /// Distinct from [`Self::damaged`]: concealment coped; refusal could not run.
-    pub refused: u64,
-    /// Consecutive AUs with no showable picture; 0 on the next clean AU.
-    /// Separates a recovering lossy link (`run 0`) from a stream that went down.
-    pub run: u32,
-    /// Longest [`Self::run`] of the session. A 1 Hz sample of `run` misses the peak.
-    pub worst_run: u32,
-    /// Correctly decoded frames discarded because the deliverable queue overflowed.
-    /// Not damaged/refused/failed: the stream was fine and a picture showed, so
-    /// this must not extend [`Self::run`]. Structurally 0 without a deliverable queue.
-    pub dropped: u64,
-    /// Per-op decode-status queries (`queryResultStatusSupport`). False on RADV
-    /// (a query hangs the VCN ring); [`Self::failed`] then stays 0. Distinguishes
-    /// clean from unmeasured.
-    pub status_queries: bool,
-}
-
-impl DecodeHealth {
-    /// Fold one AU's verdict. Damaged, refused, and driver-failed all extend the
-    /// run. Where [`Self::status_queries`] is false, a `Failed` read still extends
-    /// the run but does not count as [`Self::failed`].
-    pub(crate) fn note(&mut self, damaged: bool, refused: bool, failed: u32) {
-        if self.status_queries {
-            self.failed = self.failed.saturating_add(u64::from(failed));
-        }
-        if damaged {
-            self.damaged = self.damaged.saturating_add(1);
-        }
-        if refused {
-            self.refused = self.refused.saturating_add(1);
-        }
-        if damaged || refused || failed > 0 {
-            self.run = self.run.saturating_add(1);
-            self.worst_run = self.worst_run.max(self.run);
-        } else {
-            self.run = 0;
-        }
-    }
-
-    /// One correctly-decoded frame discarded unshown. Separate from [`Self::note`]:
-    /// several frames can drop inside one AU that still shipped a picture. Never touches [`Self::run`].
-    pub(crate) fn note_dropped(&mut self) {
-        self.dropped = self.dropped.saturating_add(1);
-    }
 }
 
 /// Raw `VkFormat` code point, carried across the ash-free boundary.
@@ -259,6 +202,8 @@ pub struct NativeVkFrame {
     /// H.265 flushes its DPB and may deliver pictures decoded before the loss.
     /// The pump stamps this at arm and ignores older [`Self::recovery`].
     pub decode_order: u64,
+    /// The picture carries TRANSFER_SRC: a consumer may copy it out (native scanout).
+    pub copyable: bool,
     /// Sends the release token on drop — see [`NativeReleaseGuard`].
     pub guard: NativeReleaseGuard,
 }
@@ -336,6 +281,23 @@ impl DecodedImage {
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             DecodedImage::PyroWave(f) => (f.width, f.height),
             DecodedImage::NativeVk(f) => (f.width, f.height),
+        }
+    }
+
+    /// The rung that decoded this frame, as the `stats:` decode-path tag. A machine
+    /// interface: additive only, and surviving tags keep their exact spelling.
+    pub fn path_label(&self) -> &'static str {
+        match self {
+            DecodedImage::Cpu(_) => "software",
+            #[cfg(target_os = "linux")]
+            DecodedImage::NativeDmabuf(_) => "native-vaapi",
+            #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
+            DecodedImage::V4l2Planar(_) => "v4l2-request",
+            #[cfg(windows)]
+            DecodedImage::D3d11(_) => "native-d3d11va",
+            #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
+            DecodedImage::PyroWave(_) => "pyrowave",
+            DecodedImage::NativeVk(_) => "native-vulkan",
         }
     }
 }
@@ -462,6 +424,14 @@ pub struct DmabufFrame {
     /// Whole prediction chain was fully available. Corroborates a host
     /// `USER_FLAG_RECOVERY_ANCHOR`: see [`DecodedImage::anchor_evidence`].
     pub references_clean: bool,
+    /// The decode's write fences as sync_files, one per exported object. Empty means
+    /// the decoder already waited on the CPU; otherwise the importer waits them on
+    /// the GPU (or polls) before it samples.
+    pub sync_fds: Vec<std::os::fd::OwnedFd>,
+    /// Identity of the surface behind the fds across the pool's lifetime: the
+    /// importer keeps one `VkImage` per key instead of re-importing every frame.
+    /// The high 32 bits change when the pool is rebuilt.
+    pub pool_key: u64,
     pub guard: DrmFrameGuard,
 }
 
@@ -506,33 +476,6 @@ enum Backend {
     /// CPU rung (openh264 / rav1d). Last in every ladder, so it never demotes.
     /// The only rung that can fail to exist for a codec: see [`last_rung_verdict`].
     Software(SoftwareDecoder),
-}
-
-/// Picture shape the host resolved in Welcome, before any AU arrives.
-///
-/// The in-band SPS stays authoritative. Available at construction so a
-/// device-dependent shape refuses before the rung is chosen, instead of
-/// demoting past it on the first decode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StreamFormat {
-    /// [`punktfunk_core::quic::CHROMA_IDC_420`] (1) or
-    /// [`punktfunk_core::quic::CHROMA_IDC_444`] (3). A host that omits it reads as 4:2:0, never 0.
-    pub chroma_format_idc: u8,
-    /// Bits per component: 8, or 10 for Main10/HDR. A host that omits it reads 8.
-    pub bit_depth: u8,
-}
-
-impl StreamFormat {
-    /// 8-bit 4:2:0 — every H.264 session, and what an omitted Welcome shape decodes to.
-    pub const SDR_420_8: StreamFormat = StreamFormat {
-        chroma_format_idc: punktfunk_core::quic::CHROMA_IDC_420,
-        bit_depth: 8,
-    };
-
-    /// `bit_depth` as H.265 `bit_depth_luma_minus8`. `None` outside 8/10 is a refusal, not a skipped probe.
-    pub(crate) fn bit_depth_minus8(self) -> Option<u8> {
-        self.bit_depth.checked_sub(8)
-    }
 }
 
 pub struct Decoder {
@@ -732,11 +675,11 @@ pub fn native_evidence(rung: NativeRung, wire: u8) -> RungEvidence {
         // Keep `verified` false: flipping it would move `auto` off Vulkan Video on every Linux AMD/Intel client.
         (NativeRung::Vaapi, _) => (
             false,
-            "7 legs bit-identical to libavcodec on RDNA3 (Mesa 26.0.3, 2026-08-08) - H.264, \
-             H.265, HEVC Main 10 and AV1, on both the conformance vectors and our own host's \
-             low-delay streams - but has NEVER run on a second vendor and has never been \
-             soaked, and `verified` here would move `auto` off Vulkan Video on every Linux \
-             AMD/Intel client (M6/M7)",
+            "7 legs bit-identical to libavcodec on RDNA3 (Mesa 26.0.3, 2026-08-08) and Intel \
+             Xe-LP (iHD 26.1.2, 2026-09-24) - H.264, H.265, HEVC Main 10 and AV1, on both the \
+             conformance vectors and our own host's low-delay streams - but never soaked, and \
+             `verified` here would move `auto` off Vulkan Video on every Linux AMD/Intel \
+             client (M6/M7)",
         ),
         // rav1d uses two frame contexts so a damaged reference returns an error instead of aborting.
         (NativeRung::Software, CODEC_H264 | CODEC_AV1) => (
@@ -881,22 +824,43 @@ pub fn decodable_codecs() -> u8 {
         | software_decodable_codecs()
 }
 
+/// PCI vendor of Intel GPUs.
+pub(crate) const VENDOR_INTEL: u32 = 0x8086;
+
+/// The decode ops the native Vulkan rung may use, from what the device advertises.
+/// Intel's Mesa driver decodes H.264 and HEVC bit-exact with libavcodec but not AV1,
+/// so Linux Intel keeps AV1 off Vulkan; its AV1 goes through the VAAPI rung.
+pub fn usable_decode_ops(vendor_id: u32, advertised: u32) -> u32 {
+    if cfg!(target_os = "linux") && vendor_id == VENDOR_INTEL {
+        advertised & !VIDEO_CODEC_OP_DECODE_AV1
+    } else {
+        advertised
+    }
+}
+
+/// Does the presenter's VAAPI node decode AV1, where its Vulkan does not? The presenter
+/// asks once at setup. NVIDIA is never asked: the ladder never enters its VAAPI.
+#[cfg(target_os = "linux")]
+pub fn vaapi_av1_decodable(vendor_id: u32, vulkan_av1: bool) -> bool {
+    !vulkan_av1
+        && vendor_id != crate::video_vk::VENDOR_NVIDIA
+        && crate::video_vaapi_native::av1_decodable(vendor_id)
+}
+
 /// Can this machine decode AV1 in hardware? Device facts only, never a decoder existing:
-/// Vulkan `DECODE_AV1` on the decode family, or (Windows) D3D11 import so DXVA
-/// can run Profile 0. The CPU AV1 rung still exists; the wire promise is made once.
-///
-/// VAAPI is not consulted: opening a display is too early and too often; the
-/// Vulkan bit covers the Mesa devices where VAAPI AV1 exists.
+/// Vulkan `DECODE_AV1` on the decode family; (Windows) D3D11 import so DXVA can run
+/// Profile 0; (Linux) the presenter's VAAPI AV1 entry point, on a presenter the VAAPI
+/// rung may feed. The CPU AV1 rung still exists; the wire promise is made once.
 pub fn av1_hardware_decodable(vk: Option<&VulkanDecodeDevice>) -> bool {
     if vk.is_some_and(|v| v.video_decode && v.decode_video_caps & VIDEO_CODEC_OP_DECODE_AV1 != 0) {
         return true;
     }
     // Per-platform second answer, bound to a name: a cfg'd `return` is `needless_return` on Windows (`-D warnings`).
     #[cfg(windows)]
-    let d3d11 = vk.is_some_and(|v| v.d3d11_import);
-    #[cfg(not(windows))]
-    let d3d11 = false;
-    d3d11
+    let platform = vk.is_some_and(|v| v.d3d11_import);
+    #[cfg(target_os = "linux")]
+    let platform = vk.is_some_and(|v| v.vaapi_av1_decode && vaapi_auto_ok(Some(v)));
+    platform
 }
 
 /// Can this client decode 4:4:4 HEVC — the promise `VIDEO_CAP_444` makes.
@@ -951,18 +915,6 @@ pub fn hdr_presentable(vk: Option<&VulkanDecodeDevice>) -> bool {
 /// D3D11VA on the same driver is unaffected. Fields as [`umd_version_parts`] splits them.
 pub const AMD_VULKAN_HDR_DRIVER_FLOOR: [u16; 4] = [32, 0, 21025, 0];
 
-/// DXGI's packed user-mode driver version (`CheckInterfaceSupport`) as the four
-/// Device Manager fields: `32.0.21025.10016` becomes `[32, 0, 21025, 10016]`.
-pub fn umd_version_parts(raw: i64) -> [u16; 4] {
-    let v = raw as u64;
-    [
-        (v >> 48) as u16,
-        (v >> 32) as u16,
-        (v >> 16) as u16,
-        v as u16,
-    ]
-}
-
 /// Toast for an HDR session on the Vulkan rung whose AMD driver predates
 /// [`AMD_VULKAN_HDR_DRIVER_FLOOR`]; `None` otherwise, including an unknown driver.
 /// A warning only: D3D11VA costs frames, and a driver update fixes the Vulkan path.
@@ -982,12 +934,40 @@ pub fn amd_vulkan_hdr_driver_notice(
     ))
 }
 
+/// `PUNKTFUNK_NATIVE_SCANOUT=1`: the Wayland presenter hands pictures to the compositor as
+/// the window's buffer, so the Vulkan decoder keeps its pictures copyable. Opt-in: KWin
+/// composites the buffer, where the swapchain's own can be scanned out.
+pub fn native_scanout_wanted() -> bool {
+    cfg!(target_os = "linux")
+        && matches!(
+            std::env::var("PUNKTFUNK_NATIVE_SCANOUT").as_deref(),
+            Ok("1" | "flip")
+        )
+}
+
+/// Can this machine's decoders take an access unit of several slices? Intel's Windows
+/// Vulkan Video driver (32.0.101.8993) over-writes a heap table while recording the
+/// decode of any multi-slice HEVC AU; FFmpeg faults at the same instruction. An Intel
+/// GPU on Windows asks the host for one slice per frame instead.
+pub fn multi_slice_decodable(vendor_id: Option<u32>) -> bool {
+    !(cfg!(windows) && vendor_id == Some(VENDOR_INTEL))
+}
+
 /// Desktop `video_caps` from the user switches, testable without a GPU.
-/// Callers AND `want_444` with [`hevc_444_hardware_decodable`] and `hdr_enabled`
-/// with [`hdr_presentable`]. `MULTI_SLICE` is unconditional here; Amlogic
-/// MediaCodec wedges on multi-slice AUs. `ten_bit_sdr` asks for Main10 under SDR.
-pub fn video_caps_for(hdr_enabled: bool, ten_bit_sdr: bool, want_444: bool) -> u8 {
-    let mut caps = punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE;
+/// Callers AND `want_444` with [`hevc_444_hardware_decodable`], `hdr_enabled`
+/// with [`hdr_presentable`] and pass [`multi_slice_decodable`] as `multi_slice`
+/// (Amlogic MediaCodec wedges on multi-slice AUs too). `ten_bit_sdr` asks for
+/// Main10 under SDR.
+pub fn video_caps_for(
+    hdr_enabled: bool,
+    ten_bit_sdr: bool,
+    want_444: bool,
+    multi_slice: bool,
+) -> u8 {
+    let mut caps = 0;
+    if multi_slice {
+        caps |= punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE;
+    }
     if hdr_enabled {
         caps |= punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR;
     }
@@ -1484,8 +1464,8 @@ impl Decoder {
 
     /// Wait for a Vulkan-Video GPU decode (timeline). `false` declines the
     /// sample: not this backend, timeout, missing ledger pair, or stale generation.
-    pub fn wait_hw_decoded(&self, timeline_sem: u64, value: u64, timeout_ns: u64) -> bool {
-        match &self.backend {
+    pub fn wait_hw_decoded(&mut self, timeline_sem: u64, value: u64, timeout_ns: u64) -> bool {
+        match &mut self.backend {
             Backend::NativeVulkan(d) => d.wait_timeline(timeline_sem, value, timeout_ns),
             _ => false,
         }
@@ -1574,6 +1554,30 @@ impl Decoder {
         self.delivered = false;
     }
 
+    /// Demote from the failing `from` rung onto `built`, the `(decoder, backend)` of the
+    /// rung named `rung`. False when it could not be built: the ladder tries the next one.
+    fn demote_into(
+        &mut self,
+        e: &anyhow::Error,
+        from: &str,
+        rung: &str,
+        built: Result<(&'static str, Backend)>,
+    ) -> bool {
+        match built {
+            Ok((decoder, backend)) => {
+                tracing::warn!(error = %format!("{e:#}"), fails = self.vaapi_fails, from, decoder,
+                    "hardware decode failing repeatedly — demoting to {rung}");
+                self.install(backend);
+                true
+            }
+            Err(why) => {
+                tracing::info!(reason = %format!("{why:#}"),
+                    "{rung} unavailable for demotion — continuing down the ladder");
+                false
+            }
+        }
+    }
+
     /// Running rung is the platform native (VAAPI / D3D11VA). The demotion
     /// that goes sideways into native Vulkan fires only from here.
     fn is_native_platform_rung(&self) -> bool {
@@ -1636,48 +1640,28 @@ impl Decoder {
         user_flags: u32,
         complete: bool,
     ) -> Result<Option<DecodedImage>> {
-        // Concealment: native `Ok(None)` because the picture was damaged, not
-        // buffering. Decides whether the `Ok` below may clear the demotion streak.
-        let mut concealed = false;
-        let result = match &mut self.backend {
-            Backend::NativeVulkan(n) => {
-                debug_assert!(complete, "partial AUs are pyrowave-only");
-                let r = n.decode(au).map(|f| f.map(DecodedImage::NativeVk));
-                // Stream damage is not a decoder fault. Concealment is `Ok(None)`
-                // plus this flag. A driver `RESULT_STATUS` Failed stays an `Err`.
-                if n.take_recovery_request() {
-                    self.want_keyframe = true;
-                    concealed = true;
-                }
-                r
-            }
+        // Native rungs: stream damage is not a decoder fault. Concealment is `Ok(None)`
+        // plus the recovery request, which decides whether the `Ok` below may clear the
+        // demotion streak. A driver `RESULT_STATUS` Failed stays an `Err`.
+        let (result, concealed) = match &mut self.backend {
+            Backend::NativeVulkan(n) => (
+                n.decode(au).map(|f| f.map(DecodedImage::NativeVk)),
+                n.take_recovery_request(),
+            ),
             #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
             Backend::V4l2Request(v) => {
-                debug_assert!(complete, "partial AUs are pyrowave-only");
-                v.decode(au).map(|f| f.map(DecodedImage::V4l2Planar))
+                (v.decode(au).map(|f| f.map(DecodedImage::V4l2Planar)), false)
             }
             #[cfg(target_os = "linux")]
-            Backend::NativeVaapi(v) => {
-                debug_assert!(complete, "partial AUs are pyrowave-only");
-                let r = v.decode(au).map(|f| f.map(DecodedImage::NativeDmabuf));
-                // Same concealment split as Vulkan.
-                if v.take_recovery_request() {
-                    self.want_keyframe = true;
-                    concealed = true;
-                }
-                r
-            }
+            Backend::NativeVaapi(v) => (
+                v.decode(au).map(|f| f.map(DecodedImage::NativeDmabuf)),
+                v.take_recovery_request(),
+            ),
             #[cfg(windows)]
-            Backend::NativeD3d11va(d) => {
-                debug_assert!(complete, "partial AUs are pyrowave-only");
-                let r = d.decode(au).map(|f| f.map(DecodedImage::D3d11));
-                // Same concealment split as Vulkan.
-                if d.take_recovery_request() {
-                    self.want_keyframe = true;
-                    concealed = true;
-                }
-                r
-            }
+            Backend::NativeD3d11va(d) => (
+                d.decode(au).map(|f| f.map(DecodedImage::D3d11)),
+                d.take_recovery_request(),
+            ),
             // Nothing else decodes PyroWave: propagate the error; the pump renegotiates the codec.
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             Backend::PyroWave(p) => {
@@ -1688,6 +1672,8 @@ impl Decoder {
             }
             Backend::Software(s) => return Ok(s.decode(au)?.map(DecodedImage::Cpu)),
         };
+        debug_assert!(complete, "partial AUs are pyrowave-only");
+        self.want_keyframe |= concealed;
         match result {
             Ok(f) => {
                 // Only an answer that proves the rung works may clear the streak.
@@ -1733,52 +1719,36 @@ impl Decoder {
                         && vaapi_auto_ok(self.vk.as_ref())
                     {
                         if let Some(codec) = native_vaapi_codec(self.wire_codec) {
-                            match NativeVaapiDecoder::new_for_presenter(
+                            let built = NativeVaapiDecoder::new_for_presenter(
                                 codec,
                                 self.stream,
                                 self.vk.as_ref().map(|v| v.vendor_id),
-                            ) {
-                                Ok(d) => {
-                                    tracing::warn!(error = %format!("{e:#}"), fails = self.vaapi_fails,
-                                        from = which, decoder = d.name(),
-                                        "hardware decode failing repeatedly — demoting to \
-                                         native VAAPI");
-                                    self.install(Backend::NativeVaapi(Box::new(d)));
-                                    return Ok(None);
-                                }
-                                Err(va) => tracing::info!(reason = %format!("{va:#}"),
-                                    "native VAAPI unavailable for demotion — continuing down \
-                                     the ladder"),
+                            )
+                            .map(|d| (d.name(), Backend::NativeVaapi(Box::new(d))));
+                            if self.demote_into(&e, which, "native VAAPI", built) {
+                                return Ok(None);
                             }
                         }
                     }
                     #[cfg(windows)]
                     if self.entered_rungs & RUNG_BIT_NATIVE_PLATFORM == 0 && self.d3d11_import {
                         if let Some(codec) = native_d3d11_codec(self.wire_codec) {
-                            match crate::video_d3d11_native::NativeD3d11Decoder::new(
+                            let (nv12, p010) = self
+                                .vk
+                                .as_ref()
+                                .map_or((false, false), |v| (v.d3d11_nv12, v.d3d11_p010));
+                            let built = crate::video_d3d11_native::NativeD3d11Decoder::new(
                                 codec,
                                 self.stream,
                                 self.adapter_luid,
                                 self.d3d11_hdr10,
                             )
                             .map(|d| {
-                                let (nv12, p010) = self
-                                    .vk
-                                    .as_ref()
-                                    .map_or((false, false), |v| (v.d3d11_nv12, v.d3d11_p010));
-                                d.with_planar(nv12, p010)
-                            }) {
-                                Ok(d) => {
-                                    tracing::warn!(error = %format!("{e:#}"), fails = self.vaapi_fails,
-                                        from = which, decoder = d.name(),
-                                        "hardware decode failing repeatedly — demoting to \
-                                         native D3D11VA");
-                                    self.install(Backend::NativeD3d11va(Box::new(d)));
-                                    return Ok(None);
-                                }
-                                Err(dx) => tracing::info!(reason = %format!("{dx:#}"),
-                                    "native D3D11VA unavailable for demotion — continuing down \
-                                     the ladder"),
+                                let d = d.with_planar(nv12, p010);
+                                (d.name(), Backend::NativeD3d11va(Box::new(d)))
+                            });
+                            if self.demote_into(&e, which, "native D3D11VA", built) {
+                                return Ok(None);
                             }
                         }
                     }
@@ -1796,18 +1766,15 @@ impl Decoder {
                             ) {
                                 let (codec, _) =
                                     native_codec(self.wire_codec).expect("the gate admitted it");
-                                match NativeVulkanDecoder::new(&v, codec, self.stream) {
-                                    Ok(n) => {
-                                        tracing::warn!(error = %format!("{e:#}"), fails = self.vaapi_fails,
-                                            from = which,
-                                            "hardware decode failing repeatedly — demoting to \
-                                             native Vulkan Video");
-                                        self.install(Backend::NativeVulkan(Box::new(n)));
-                                        return Ok(None);
-                                    }
-                                    Err(nv) => tracing::info!(reason = %format!("{nv:#}"),
-                                        "native Vulkan Video unavailable for demotion — \
-                                         software decode"),
+                                let built =
+                                    NativeVulkanDecoder::new(&v, codec, self.stream).map(|n| {
+                                        (
+                                            NativeRung::Vulkan.name(),
+                                            Backend::NativeVulkan(Box::new(n)),
+                                        )
+                                    });
+                                if self.demote_into(&e, which, "native Vulkan Video", built) {
+                                    return Ok(None);
                                 }
                             }
                         }
@@ -1872,27 +1839,44 @@ mod tests {
     fn the_444_bit_needs_the_setting_and_a_device_that_can_decode_it() {
         const V444: u8 = punktfunk_core::quic::VIDEO_CAP_444;
         assert_eq!(
-            video_caps_for(true, false, false) & V444,
+            video_caps_for(true, false, false, true) & V444,
             0,
             "a 4:4:4 promise this device cannot keep costs HEVC entirely"
         );
-        assert_ne!(video_caps_for(true, false, true) & V444, 0);
-        assert_eq!(video_caps_for(true, false, false) & V444, 0);
-        assert_eq!(video_caps_for(false, false, false) & V444, 0);
+        assert_ne!(video_caps_for(true, false, true, true) & V444, 0);
+        assert_eq!(video_caps_for(true, false, false, true) & V444, 0);
+        assert_eq!(video_caps_for(false, false, false, true) & V444, 0);
 
         // 4:4:4 must not disturb 10-bit/HDR (those are not probe-gated).
         const HDR_BITS: u8 =
             punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR;
         for want_444 in [false, true] {
-            assert_eq!(video_caps_for(true, false, want_444) & HDR_BITS, HDR_BITS);
-            assert_eq!(video_caps_for(false, false, want_444) & HDR_BITS, 0);
+            assert_eq!(
+                video_caps_for(true, false, want_444, true) & HDR_BITS,
+                HDR_BITS
+            );
+            assert_eq!(video_caps_for(false, false, want_444, true) & HDR_BITS, 0);
             assert_ne!(
-                video_caps_for(false, false, want_444)
+                video_caps_for(false, false, want_444, true)
+                    & punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE,
+                0
+            );
+            assert_eq!(
+                video_caps_for(false, false, want_444, false)
                     & punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE,
                 0,
-                "MULTI_SLICE is unconditional for this embedder"
+                "a decoder that wedges on slices keeps the bit off"
             );
         }
+    }
+
+    /// Intel on Windows is the one desktop decoder that asks for single-slice AUs.
+    #[test]
+    fn multi_slice_is_refused_only_for_intel_on_windows() {
+        assert!(multi_slice_decodable(None));
+        assert!(multi_slice_decodable(Some(0x10DE)));
+        assert!(multi_slice_decodable(Some(0x1002)));
+        assert_eq!(multi_slice_decodable(Some(VENDOR_INTEL)), !cfg!(windows));
     }
 
     /// 10-bit SDR advertises the depth bit alone — never HDR — and is subsumed by HDR.
@@ -1900,15 +1884,18 @@ mod tests {
     fn ten_bit_sdr_advertises_depth_without_hdr() {
         const TEN: u8 = punktfunk_core::quic::VIDEO_CAP_10BIT;
         const HDR: u8 = punktfunk_core::quic::VIDEO_CAP_HDR;
-        assert_eq!(video_caps_for(false, true, false) & (TEN | HDR), TEN);
-        assert_eq!(video_caps_for(false, false, false) & (TEN | HDR), 0);
-        assert_eq!(video_caps_for(true, true, false) & (TEN | HDR), TEN | HDR);
+        assert_eq!(video_caps_for(false, true, false, true) & (TEN | HDR), TEN);
+        assert_eq!(video_caps_for(false, false, false, true) & (TEN | HDR), 0);
         assert_eq!(
-            video_caps_for(false, true, false) & punktfunk_core::quic::VIDEO_CAP_444,
+            video_caps_for(true, true, false, true) & (TEN | HDR),
+            TEN | HDR
+        );
+        assert_eq!(
+            video_caps_for(false, true, false, true) & punktfunk_core::quic::VIDEO_CAP_444,
             0
         );
         assert_ne!(
-            video_caps_for(false, true, false) & punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE,
+            video_caps_for(false, true, false, true) & punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE,
             0
         );
     }
@@ -2128,6 +2115,7 @@ mod tests {
             present_timing: false,
             d3d11_import: false,
             dmabuf_import: true,
+            vaapi_av1_decode: false,
             d3d11_hdr10: false,
             d3d11_nv12: false,
             d3d11_p010: false,
@@ -2209,6 +2197,47 @@ mod tests {
         // Discrete Arc advertises Vulkan Video and must still land on D3D11VA in auto.
         assert!(!decode_device(0x8086, "Intel(R) Arc(TM) B580 Graphics").prefer_vulkan_first());
         assert!(!decode_device(0x8086, "Intel(R) Arc(TM) Pro Graphics").prefer_vulkan_first());
+    }
+
+    /// Where Vulkan has no AV1, the presenter's VAAPI answer advertises it, but only on a
+    /// presenter the VAAPI rung may feed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_vaapi_av1_is_advertised_where_the_vaapi_rung_runs() {
+        let mut intel = decode_device(0x8086, "Intel(R) Graphics (RKL GT1)");
+        intel.decode_video_caps = usable_decode_ops(
+            0x8086,
+            VIDEO_CODEC_OP_DECODE_H265 | VIDEO_CODEC_OP_DECODE_AV1,
+        );
+        assert!(
+            !av1_hardware_decodable(Some(&intel)),
+            "Vulkan AV1 is masked on Intel"
+        );
+        intel.vaapi_av1_decode = true;
+        assert!(av1_hardware_decodable(Some(&intel)));
+        assert_ne!(decodable_codecs_for(Some(&intel), "auto") & CODEC_AV1, 0);
+        intel.dmabuf_import = false;
+        assert!(
+            !av1_hardware_decodable(Some(&intel)),
+            "VAAPI frames need dmabuf import"
+        );
+
+        let mut nvidia = decode_device(0x10DE, "NVIDIA GeForce RTX 3070 Ti");
+        nvidia.vaapi_av1_decode = true;
+        assert!(!av1_hardware_decodable(Some(&nvidia)));
+    }
+
+    #[test]
+    fn linux_intel_keeps_av1_off_the_vulkan_rung() {
+        let all =
+            VIDEO_CODEC_OP_DECODE_H264 | VIDEO_CODEC_OP_DECODE_H265 | VIDEO_CODEC_OP_DECODE_AV1;
+        let intel = usable_decode_ops(0x8086, all);
+        let h26x = VIDEO_CODEC_OP_DECODE_H264 | VIDEO_CODEC_OP_DECODE_H265;
+        assert_eq!(intel & h26x, h26x);
+        let av1_kept = intel & VIDEO_CODEC_OP_DECODE_AV1 != 0;
+        assert_eq!(av1_kept, !cfg!(target_os = "linux"));
+        assert_eq!(usable_decode_ops(0x1002, all), all);
+        assert_eq!(usable_decode_ops(0x10DE, all), all);
     }
 
     /// `auto` enters the VAAPI rung only on a presenter that imports its
@@ -2526,7 +2555,7 @@ mod tests {
                 rung.name()
             );
             assert!(
-                e.note.contains("second vendor") && e.note.contains("soak"),
+                e.note.contains("never soaked"),
                 "{} / {codec:#x}: the warning note must name the missing priority \
                  coverage, got {:?}",
                 rung.name(),

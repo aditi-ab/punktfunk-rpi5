@@ -136,6 +136,11 @@ data class SettingsOverlay(
         /** The width/height pair, which one control drives — the reset alias, as on every client. */
         const val FIELD_RESOLUTION = SettingsFields.FIELD_RESOLUTION
 
+        /** The console's saved overlay over [base]: each modelled field from [j], set or
+         *  cleared; carried-through keys stay. */
+        internal fun fromConsoleJson(j: JSONObject, base: SettingsOverlay): SettingsOverlay =
+            SettingsFields.PRESET.fold(base) { o, f -> f.overlayFromConsoleJson(o, j) }
+
         internal fun fromJson(j: JSONObject): SettingsOverlay {
             // Keys this build models are read below; everything else is carried through.
             val extra = j.keys().asSequence()
@@ -180,7 +185,8 @@ class PresetStore(context: Context) {
         .mapNotNull { (it as? String)?.let(::parse) }
         .sortedBy { it.name.lowercase() }
 
-    fun byId(id: String): StreamPreset? = prefs.getString(id, null)?.let(::parse)
+    /** `as? String`: the file also holds a Boolean flag, and `id` can come from a link. */
+    fun byId(id: String): StreamPreset? = (prefs.all[id] as? String)?.let(::parse)
 
     fun save(preset: StreamPreset) {
         prefs.edit().putString(preset.id, encode(preset)).apply()

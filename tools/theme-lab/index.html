@@ -1,0 +1,1081 @@
+<meta charset="utf-8">
+<title>Punktfunk Palette Lab</title>
+<meta name="description" content="Edit the console's backdrop palettes on the real field shader, with live legibility checks and Rust export.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
+<style>
+/* One look on purpose: a neutral grading-suite grey, so the chrome tints no judgement. */
+:root {
+  color-scheme: dark;
+  --bg: #141517;
+  --panel: #1b1c1f;
+  --raise: #24262a;
+  --line: #303238;
+  --text: #ebebe8;
+  --muted: #9c9ea3;
+  --faint: #6c6e74;
+  --pass: #33d64a;
+  --warn: #e5a83b;
+  --fail: #f04842;
+  --focus: #ffffff;
+  --sans: "Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  /* The ink the mock console draws with; set per palette from script. */
+  --fg: #ffffff;
+  --accent: #8678f5;
+  --glass: rgba(22, 22, 32, 0.62);
+  --glass-low: rgba(22, 22, 32, 0.62);
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.45 var(--sans);
+  padding-inline: 16px;
+  padding-block: 12px 24px;
+}
+button, input, select, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+header.top {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 16px;
+  padding-bottom: 12px; border-bottom: 1px solid var(--line); margin-bottom: 14px;
+}
+header.top h1 { font-size: 17px; font-weight: 600; margin: 0; letter-spacing: 0.01em; }
+header.top p { margin: 0; color: var(--muted); font-size: 13px; max-width: 70ch; }
+#status { margin-left: auto; font-size: 12px; color: var(--muted); }
+#status.bad { color: var(--fail); }
+
+.app {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr) 340px;
+  gap: 16px;
+  align-items: start;
+}
+@media (max-width: 1180px) {
+  .app { grid-template-columns: 200px minmax(0, 1fr); }
+  .editor { grid-column: 1 / -1; }
+}
+@media (max-width: 760px) {
+  .app { grid-template-columns: minmax(0, 1fr); }
+  .rail { order: 3; }
+  .editor { order: 2; }
+}
+
+.label {
+  font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--faint); margin: 0 0 6px;
+}
+
+/* --- palette rail --- */
+.rail { display: flex; flex-direction: column; gap: 14px; }
+.rail ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.pal {
+  width: 100%; display: grid; grid-template-columns: 26px 1fr auto; align-items: center; gap: 9px;
+  padding: 5px 8px; border: 1px solid transparent; border-radius: 7px; background: none; text-align: left;
+}
+.pal:hover { background: var(--raise); }
+.pal[aria-current="true"] { background: var(--raise); border-color: var(--line); }
+.pal .chip { width: 26px; height: 18px; border-radius: 4px; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.12); }
+.pal .name { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pal .name small { color: var(--faint); font-family: var(--mono); font-size: 11px; margin-left: 4px; }
+.pip { font-size: 11px; font-family: var(--mono); min-width: 18px; text-align: right; }
+.pip.ok { color: var(--pass); }
+.pip.no { color: var(--fail); }
+.pal .edited { color: var(--warn); font-size: 10px; margin-left: 4px; }
+
+/* --- stage --- */
+.stagecol { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.stage {
+  position: relative; aspect-ratio: 16 / 9; width: 100%; max-width: 100%;
+  border-radius: 10px; overflow: hidden; background: #000; container-type: inline-size;
+  box-shadow: 0 0 0 1px var(--line);
+}
+.stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.mock { position: absolute; inset: 0; color: var(--fg); font-family: var(--sans); pointer-events: none; }
+.mock .tabs { position: absolute; top: 4.2cqw; left: 4.5cqw; display: flex; gap: 0.6cqw; font-size: 1.55cqw; font-weight: 600; }
+.mock .tabs span { padding: 0.55cqw 1.4cqw; border-radius: 99px; opacity: 0.62; }
+.mock .tabs span.on { opacity: 1; background: var(--glass); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
+.mock .chip { position: absolute; top: 4.2cqw; right: 4.5cqw; font-size: 1.35cqw; padding: 0.55cqw 1.3cqw; border-radius: 99px;
+  background: var(--glass); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); opacity: 0.95; }
+.mock .cards { position: absolute; left: 0; right: 0; top: 16cqw; display: flex; justify-content: center; align-items: center; gap: 2.4cqw; }
+.mock .card {
+  width: 20cqw; aspect-ratio: 4 / 3; border-radius: 1.6cqw; padding: 1.6cqw;
+  background: linear-gradient(var(--glass), var(--glass-low));
+  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  display: flex; flex-direction: column; justify-content: flex-end; gap: 0.4cqw;
+}
+.mock .card.focus { width: 24cqw; box-shadow: 0 0 0 0.35cqw var(--accent), 0 1.5cqw 4cqw rgba(0,0,0,0.35); }
+.mock .card b { font-size: 1.9cqw; font-weight: 700; }
+.mock .card.focus b { font-size: 2.2cqw; }
+.mock .card i { font-style: normal; font-size: 1.25cqw; opacity: 0.66; display: flex; align-items: center; gap: 0.6cqw; }
+.mock .card i::before { content: ""; width: 0.8cqw; height: 0.8cqw; border-radius: 50%; background: #33d64a; }
+.mock .hint { position: absolute; left: 4.5cqw; bottom: 3.8cqw; font-size: 1.35cqw; padding: 0.7cqw 1.5cqw; border-radius: 99px;
+  background: var(--glass); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); display: flex; gap: 1.8cqw; }
+.mock .hint kbd { font: inherit; font-weight: 700; margin-right: 0.5cqw; }
+.mock .form { position: absolute; left: 4.5cqw; right: 26cqw; top: 11cqw; display: flex; flex-direction: column; gap: 0.8cqw; }
+.mock .form h2 { font-size: 3cqw; margin: 0 0 1cqw; font-weight: 700; }
+.mock .row {
+  display: flex; justify-content: space-between; align-items: center; padding: 1.3cqw 1.8cqw; border-radius: 1.2cqw;
+  background: var(--glass); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); font-size: 1.6cqw; font-weight: 500;
+}
+.mock .row span:last-child { opacity: 0.7; }
+.mock .row.focus { background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 55%, transparent), var(--glass)); }
+.mock .switch { width: 4.4cqw; height: 2.4cqw; border-radius: 99px; background: var(--accent); position: relative; opacity: 1 !important; }
+.mock .switch::after { content: ""; position: absolute; right: 0.3cqw; top: 0.3cqw; width: 1.8cqw; height: 1.8cqw; border-radius: 50%; background: #fff; }
+
+.controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.seg button { border: 0; background: none; padding: 6px 12px; font-size: 13px; color: var(--muted); }
+.seg button[aria-pressed="true"] { background: var(--raise); color: var(--text); }
+.btn { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 6px 12px; font-size: 13px; }
+.btn:hover { background: var(--raise); }
+.btn.primary { background: var(--text); color: var(--bg); border-color: var(--text); font-weight: 600; }
+.time { display: flex; align-items: center; gap: 8px; flex: 1 1 220px; min-width: 0; }
+.time input { flex: 1; min-width: 0; accent-color: var(--text); }
+.time output { font-size: 12px; color: var(--muted); min-width: 64px; }
+
+/* --- checks --- */
+.checks { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+.checkset { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+.checkset h3 { font-size: 13px; margin: 0 0 2px; font-weight: 600; }
+.checkset > p { margin: 0 0 10px; color: var(--muted); font-size: 12px; }
+.check { display: grid; grid-template-columns: 58px 1fr; gap: 10px; padding: 7px 0; border-top: 1px solid var(--line); }
+.check:first-of-type { border-top: 0; }
+.tag { font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; text-align: center;
+  border-radius: 5px; padding: 3px 0; align-self: start; }
+.tag.pass { color: var(--pass); background: rgba(51, 214, 74, 0.12); }
+.tag.fail { color: var(--fail); background: rgba(240, 72, 66, 0.14); }
+.tag.warn { color: var(--warn); background: rgba(229, 168, 59, 0.13); }
+.check b { font-weight: 600; font-size: 13px; display: block; }
+.check span { color: var(--muted); font-size: 12px; }
+.check .mono { color: var(--text); }
+
+/* --- editor --- */
+.editor { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; display: flex; flex-direction: column; gap: 12px; }
+.panel h2 { font-size: 15px; margin: 0; font-weight: 600; display: flex; align-items: baseline; gap: 8px; }
+.panel h2 small { font: 12px var(--mono); color: var(--faint); }
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field > span { font-size: 12px; color: var(--muted); }
+.field input[type="text"] { background: var(--bg); border: 1px solid var(--line); border-radius: 7px; padding: 6px 9px; width: 100%; }
+.note { font-size: 12px; color: var(--muted); margin: 0; }
+.note.warn { color: var(--warn); }
+.swatch { display: grid; grid-template-columns: 34px 1fr auto; align-items: center; gap: 8px; }
+.sw-btn { width: 34px; height: 28px; padding: 0; border: 1px solid var(--line); border-radius: 6px; box-shadow: inset 0 0 0 2px var(--panel); }
+.sw-btn[aria-expanded="true"] { outline: 2px solid var(--focus); outline-offset: 2px; }
+.swatch input[type="text"] { font-family: var(--mono); font-size: 12.5px; padding: 5px 8px; }
+.iconbtns { display: inline-flex; gap: 2px; }
+.iconbtns button { border: 1px solid var(--line); background: var(--bg); border-radius: 6px; width: 26px; height: 26px; font-size: 12px; color: var(--muted); padding: 0; }
+.iconbtns button:hover:not(:disabled) { color: var(--text); }
+.iconbtns button:disabled { opacity: 0.35; cursor: default; }
+.stops { display: flex; flex-direction: column; gap: 6px; }
+.ramp { height: 14px; border-radius: 4px; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.1); }
+.row2 { display: flex; flex-wrap: wrap; gap: 8px; }
+textarea#rust {
+  width: 100%; min-height: 150px; resize: vertical; background: var(--bg); border: 1px solid var(--line);
+  border-radius: 8px; padding: 10px; font: 12px/1.5 var(--mono); white-space: pre; overflow: auto; color: var(--text);
+}
+.copied { font-size: 12px; color: var(--pass); }
+
+/* --- colour picker --- */
+.picker {
+  position: absolute; z-index: 20; width: min(312px, calc(100vw - 32px));
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55); display: flex; flex-direction: column; gap: 10px;
+}
+.pk-plane, .pk-hue { position: relative; touch-action: none; cursor: crosshair; border-radius: 6px; }
+.pk-plane canvas, .pk-hue canvas { display: block; width: 100%; border-radius: 6px; }
+.pk-plane canvas { height: 176px; }
+.pk-hue canvas { height: 18px; }
+.pk-dot { position: absolute; width: 14px; height: 14px; margin: -7px 0 0 -7px; border-radius: 50%;
+  border: 2px solid #fff; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6); pointer-events: none; }
+.pk-bar { position: absolute; top: -3px; bottom: -3px; width: 6px; margin-left: -3px; border-radius: 3px;
+  border: 2px solid #fff; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6); pointer-events: none; }
+.pk-axis { display: flex; justify-content: space-between; font: 10.5px var(--mono); color: var(--faint); margin-top: 3px; }
+.pk-fields { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.pk-fields label { display: flex; flex-direction: column; gap: 3px; font-size: 10.5px; font-weight: 600;
+  letter-spacing: 0.06em; text-transform: uppercase; color: var(--faint); }
+.pk-fields input { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px;
+  font: 12px var(--mono); width: 100%; min-width: 0; }
+.pk-fields .wide { grid-column: span 2; }
+.pk-compare { display: grid; grid-template-columns: 1fr 1fr; height: 30px; border-radius: 6px; overflow: hidden;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.1); }
+.pk-compare button { border: 0; font-size: 11px; font-weight: 600; padding: 0; }
+.pk-read { margin: 0; font: 11.5px var(--mono); color: var(--muted); }
+.pk-quick { display: flex; flex-wrap: wrap; gap: 5px; }
+.pk-quick button { width: 22px; height: 22px; border-radius: 5px; border: 1px solid var(--line); padding: 0; }
+.pk-foot { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.pk-gamut { font-size: 11.5px; color: var(--warn); }
+
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<header class="top">
+  <h1>Punktfunk Palette Lab</h1>
+  <p>The console's backdrop field, drawn by its own shader. Pick a palette, change its ramp and ink, and watch the legibility checks as the field moves.</p>
+  <span id="status" class="mono">Loading the palette table…</span>
+</header>
+
+<div class="app">
+  <nav class="rail" aria-label="Palettes">
+    <div><p class="label">White ink</p><ol id="list-dark"></ol></div>
+    <div><p class="label">Dark ink</p><ol id="list-pale"></ol></div>
+  </nav>
+
+  <main class="stagecol">
+    <div class="stage" id="stage">
+      <canvas id="field" width="512" height="288"></canvas>
+      <div class="mock" id="mock-launcher">
+        <div class="tabs"><span class="on">Hosts</span><span>Library</span><span>Players</span><span>Settings</span></div>
+        <div class="chip">DualSense</div>
+        <div class="cards">
+          <div class="card"><b>Studio</b><i>Online · 1440p 144</i></div>
+          <div class="card focus"><b>Living room PC</b><i>Online · 4K 120</i></div>
+          <div class="card"><b>Deck dock</b><i>Online · 800p 90</i></div>
+        </div>
+        <div class="hint"><span><kbd>A</kbd>Connect</span><span><kbd>Y</kbd>Library</span><span><kbd>X</kbd>Card menu</span></div>
+      </div>
+      <div class="mock" id="mock-form" hidden>
+        <div class="tabs"><span>Hosts</span><span>Library</span><span>Players</span><span class="on">Settings</span></div>
+        <div class="form">
+          <h2>Stream</h2>
+          <div class="row"><span>Resolution</span><span>3840 × 2160</span></div>
+          <div class="row focus"><span>Frame rate</span><span>120 fps</span></div>
+          <div class="row"><span>Bitrate</span><span>Automatic</span></div>
+          <div class="row"><span>HDR</span><span class="switch"></span></div>
+        </div>
+        <div class="hint"><span><kbd>A</kbd>Change</span><span><kbd>B</kbd>Back</span></div>
+      </div>
+    </div>
+
+    <div class="controls">
+      <div class="seg" role="group" aria-label="Screen">
+        <button type="button" id="mode-launcher" aria-pressed="true">Launcher</button>
+        <button type="button" id="mode-form" aria-pressed="false">Settings form</button>
+      </div>
+      <button type="button" class="btn" id="play">Pause</button>
+      <label class="time" for="t">
+        <input type="range" id="t" min="0" max="300" step="0.1" value="40" aria-label="Field clock">
+        <output id="t-out" class="mono">t = 40.0 s</output>
+      </label>
+    </div>
+
+    <section class="checks" aria-label="Checks">
+      <div class="checkset">
+        <h3>On the field</h3>
+        <p>Measured on this frame, in both screens. The worse screen counts.</p>
+        <div id="field-checks"></div>
+      </div>
+      <div class="checkset">
+        <h3>What CI checks today</h3>
+        <p>The palette tests in <span class="mono">palette.rs</span> still sample the retired colour mesh, not the field.</p>
+        <div id="gate-checks"></div>
+      </div>
+    </section>
+  </main>
+
+  <aside class="editor">
+    <section class="panel" aria-label="Edit palette">
+      <h2><span id="ed-title">Violet</span><small id="ed-id">violet</small></h2>
+      <label class="field" for="ed-name"><span>Name</span><input type="text" id="ed-name" autocomplete="off"></label>
+      <div class="field">
+        <span>Ink</span>
+        <div class="seg" role="group" aria-label="Ink">
+          <button type="button" id="ink-white" aria-pressed="true">White ink, dark field</button>
+          <button type="button" id="ink-dark" aria-pressed="false">Dark ink, pale field</button>
+        </div>
+        <p class="note warn" id="vivid-note" hidden>A white-ink field this bright uses the vivid glass, whose accent is fixed. Darken the ground to use this palette's own accent.</p>
+      </div>
+      <div class="field">
+        <span>Field ramp, dark end first</span>
+        <div class="ramp" id="ramp"></div>
+        <div class="stops" id="stops"></div>
+        <div class="row2"><button type="button" class="btn" id="add-stop">Add stop</button></div>
+      </div>
+      <div class="field">
+        <span>Ground: the corners settle onto it, form screens lift toward it</span>
+        <div class="swatch" id="ground"></div>
+      </div>
+      <div class="field">
+        <span>Accent: focus ring, selected row, switch tracks</span>
+        <div class="swatch" id="accent"></div>
+      </div>
+      <div class="row2"><button type="button" class="btn" id="revert">Revert palette</button></div>
+    </section>
+
+    <section class="panel" aria-label="Export">
+      <h2>Rust <small id="edited-count">no changes</small></h2>
+      <p class="note">Replace the entries in <span class="mono">PALETTES</span> (<span class="mono">crates/pf-console-ui/src/palette.rs</span>), then refresh this page's data with <span class="mono">cargo test -p pf-console-ui --lib dump_theme_lab -- --ignored</span>.</p>
+      <textarea id="rust" readonly spellcheck="false" aria-label="Rust source"></textarea>
+      <div class="row2">
+        <button type="button" class="btn primary" id="copy-one">Copy this palette</button>
+        <button type="button" class="btn" id="copy-all">Copy every change</button>
+        <span class="copied" id="copied" hidden>Copied</span>
+      </div>
+    </section>
+  </aside>
+</div>
+
+<div class="picker" id="picker" role="dialog" aria-label="Colour picker" hidden>
+  <div>
+    <div class="pk-plane" id="pk-plane" tabindex="0" role="slider" aria-label="Lightness and chroma">
+      <canvas></canvas><span class="pk-dot" id="pk-dot"></span>
+    </div>
+    <div class="pk-axis"><span>grey</span><span>lightness ↑ · chroma →</span><span>vivid</span></div>
+  </div>
+  <div class="pk-hue" id="pk-hue" tabindex="0" role="slider" aria-label="Hue" aria-valuemin="0" aria-valuemax="360">
+    <canvas></canvas><span class="pk-bar" id="pk-bar"></span>
+  </div>
+  <div class="pk-fields">
+    <label for="pk-l">Light %<input id="pk-l" type="number" min="0" max="100" step="0.5"></label>
+    <label for="pk-c">Chroma<input id="pk-c" type="number" min="0" max="0.37" step="0.002"></label>
+    <label for="pk-h">Hue °<input id="pk-h" type="number" min="0" max="360" step="1"></label>
+    <label for="pk-hex">Hex<input id="pk-hex" type="text" spellcheck="false" autocomplete="off"></label>
+    <label for="pk-rgb" class="wide">Rust tuple<input id="pk-rgb" type="text" spellcheck="false" autocomplete="off"></label>
+  </div>
+  <div class="pk-compare">
+    <button type="button" id="pk-before" title="Go back to this colour">Before</button>
+    <button type="button" id="pk-now" tabindex="-1" aria-hidden="true">Now</button>
+  </div>
+  <p class="pk-read" id="pk-read"></p>
+  <div><p class="label">From this palette</p><div class="pk-quick" id="pk-quick"></div></div>
+  <div class="pk-foot">
+    <span class="pk-gamut" id="pk-gamut" hidden>Held at the sRGB edge</span>
+    <button type="button" class="btn primary" id="pk-done">Done</button>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+const STORE = "pf-palette-lab";
+const CHECK_T = 40; // the frame the palette list's pips sample
+const SAMPLE_W = 160, SAMPLE_H = 90;
+
+let D = null;          // lab-data.json, as dumped by the Rust table
+let table = [];        // the working palettes
+let original = {};     // id -> the table's own palette
+let sel = 0;
+let calm = 0;
+let playing = !matchMedia("(prefers-reduced-motion: reduce)").matches;
+let clock = CHECK_T;
+
+// ---------- colour maths (the Rust gate's, verbatim) ----------
+const lin = (v) => (v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4));
+const lum = (c) => 0.2126 * lin(c[0]) + 0.7152 * lin(c[1]) + 0.0722 * lin(c[2]);
+const contrast = (a, b) => { const x = lum(a), y = lum(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); };
+const luma = (c) => 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+const clamp01 = (v) => Math.min(1, Math.max(0, v));
+const hex = (c) => "#" + c.slice(0, 3).map((v) => Math.round(clamp01(v) * 255).toString(16).padStart(2, "0")).join("");
+const fromHex = (h) => [1, 3, 5].map((i) => Math.round((parseInt(h.slice(i, i + 2), 16) / 255) * 1000) / 1000);
+const rgba = (c) => `rgba(${Math.round(c[0] * 255)}, ${Math.round(c[1] * 255)}, ${Math.round(c[2] * 255)}, ${c[3] ?? 1})`;
+
+function oklab([r, g, b]) {
+  const L = (c) => { const v = Math.max(c, 0); return v < 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+  const [lr, lg, lb] = [L(r), L(g), L(b)];
+  const l = Math.cbrt(Math.max(0.4122214708 * lr + 0.5363325363 * lg + 0.0514459929 * lb, 0));
+  const m = Math.cbrt(Math.max(0.2119034982 * lr + 0.6806995451 * lg + 0.1073969566 * lb, 0));
+  const s = Math.cbrt(Math.max(0.0883024619 * lr + 0.2817188376 * lg + 0.6299787005 * lb, 0));
+  return [
+    0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s,
+    1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s,
+    0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s,
+  ];
+}
+
+// ---------- the ink `theme::Ink::of` picks ----------
+function inkOf(p) {
+  const accent = [...p.accent, 1];
+  if (!p.light && luma(p.ground) > D.vivid_ground) return { ...D.inks.vivid, vivid: true };
+  if (!p.light) return { ...D.inks.dark, accent };
+  const g = p.ground;
+  return { ...D.inks.pale, fg: [g[0] * 0.16, g[1] * 0.14, g[2] * 0.2, 1], accent };
+}
+const stopsOf = (p) => p.stops || D.violet_field;
+
+// ---------- the field shader: `palette::field_sksl`, rebuilt around edited stops ----------
+function fieldSksl(ground, stops) {
+  const n = Math.max(stops.length, 2);
+  const s = stops.length < 2 ? [ground, ground] : stops;
+  const f3 = (c) => { const [l, a, b] = oklab(c); return `float3(${l}, ${a}, ${b})`; };
+  let segs = "";
+  for (let i = 0; i < n - 1; i++) {
+    const seg = `a = ${f3(s[i])}; b = ${f3(s[i + 1])}; f = x - ${i}.0;`;
+    if (n === 2) segs += `    ${seg}\n`;
+    else if (i === 0) segs += `    if (x < 1.0) { ${seg} }\n`;
+    else if (i === n - 2) segs += `    else { ${seg} }\n`;
+    else segs += `    else if (x < ${i + 1}.0) { ${seg} }\n`;
+  }
+  return D.sksl.head + `    float x = clamp(t, 0.0, 1.0) * ${n - 1}.0;\n    float3 a; float3 b; float f;\n` + segs + D.sksl.tail;
+}
+
+// Same text, numbers equal to 1e-9: Rust and JS print a float differently, never its value.
+function sameShader(a, b) {
+  const re = /\d+(\.\d+)?(e-?\d+)?/g;
+  const na = a.match(re) || [], nb = b.match(re) || [];
+  return a.replace(re, "#") === b.replace(re, "#") && na.length === nb.length && na.every((x, i) => Math.abs(+x - +nb[i]) < 1e-9);
+}
+
+// The Rust shader around a gradient that reads its stops from uniforms, so an edit redraws
+// without a recompile. Same segments and blend as `fieldSksl`'s if-chain.
+const GRADIENT = [
+  "    float x = clamp(t, 0.0, 1.0) * (u_n - 1.0);",
+  "    vec3 a = u_stops[0]; vec3 b = u_stops[1]; float f = x;",
+  "    for (int i = 1; i < 7; i++) {",
+  "        if (float(i) < u_n - 1.0 && x >= float(i)) { a = u_stops[i]; b = u_stops[i + 1]; f = x - float(i); }",
+  "    }",
+].join("\n") + "\n";
+function fieldGlsl() {
+  const conv = (src) => src
+    .replace(/\bfloat2\b/g, "vec2").replace(/\bfloat3\b/g, "vec3").replace(/\bfloat4\b/g, "vec4")
+    .replace(/\bhalf4\b/g, "vec4").replace(/\bhalf3\b/g, "vec3").replace(/\bhalf\b/g, "float");
+  const body = (conv(D.sksl.head) + GRADIENT + conv(D.sksl.tail)).replace(/vec4 main\(vec2 xy\)/, "vec4 field(vec2 xy)");
+  return "precision highp float;\nuniform vec3 u_stops[8];\nuniform float u_n;\n" + body +
+    "\nvoid main() { gl_FragColor = field(vec2(gl_FragCoord.x, u_res.y - gl_FragCoord.y)); }\n";
+}
+
+// `palette::field_camera`
+function fieldCamera(aspect) {
+  const diagonal = Math.sqrt(1 + aspect * aspect);
+  const safe = 0.72, cam = 3.0, baseF = 1.73, targetF = baseF * 4.0;
+  const required = (cam * diagonal) / Math.sqrt(targetF * targetF + diagonal * diagonal);
+  const scale = Math.max(required / safe, 0.82);
+  const conservative = Math.min(cam - 0.001, scale * safe);
+  const depth = Math.sqrt(Math.max(cam * cam - conservative * conservative, 0.0001));
+  const minCover = Math.min(Math.max(((diagonal * depth) / (baseF * conservative)) * 1.12, 0.5), 10);
+  const minimum = Math.min(Math.max(minCover * 0.65, 0.5), 10);
+  const zoom = Math.min(Math.max(minimum * Math.pow(10 / minimum, 0.72), minimum), 10);
+  return [baseF * zoom, scale];
+}
+
+// `palette::field_motion`
+function fieldMotion(t) {
+  const TAU = Math.PI * 2;
+  const norm = (v) => { const l = Math.hypot(v[0], v[1], v[2]); return v.map((x) => x / l); };
+  const wrap = (ph) => ph - Math.floor(ph / TAU) * TAU;
+  const rotate = (p, a, angle) => {
+    const c = Math.cos(angle), s = Math.sin(angle), d = a[0] * p[0] + a[1] * p[1] + a[2] * p[2];
+    const x = [a[1] * p[2] - a[2] * p[1], a[2] * p[0] - a[0] * p[2], a[0] * p[1] - a[1] * p[0]];
+    return [0, 1, 2].map((i) => p[i] * c + x[i] * s + a[i] * d * (1 - c));
+  };
+  const rt = t * 0.03;
+  const unorient = (p) => {
+    const c = Math.cos(0.24), s = Math.sin(0.24);
+    let o = [p[0], c * p[1] - s * p[2], s * p[1] + c * p[2]];
+    o = rotate(o, norm([0.58, -0.69, 0.43]), -wrap(rt * 0.1732051));
+    o = rotate(o, norm([-0.71, 0.29, 0.64]), -wrap(rt * 0.2236068));
+    return rotate(o, norm([0.36, 0.81, 0.46]), -wrap(rt * 0.287));
+  };
+  const cols = [unorient([1, 0, 0]), unorient([0, 1, 0]), unorient([0, 0, 1])];
+  const mt = t * 0.9;
+  const curved = (r, ph) => [Math.sin(wrap(mt * r[0] + ph[0])), Math.sin(wrap(mt * r[1] + ph[1])), Math.cos(wrap(mt * r[2] + ph[2]))];
+  const drift = (a, ka, b, kb, c, kc) => { a = norm(a); b = norm(b); return [0, 1, 2].map((i) => a[i] * mt * ka + b[i] * mt * kb + c[i] * kc); };
+  const primary = drift([0.73, -0.41, 0.55], 0.105, [-0.28, 0.91, 0.31], 0.023, curved([0.071, 0.043, 0.029], [0, 1.73, 4.11]), 0.16);
+  const warp = drift([-0.46, 0.38, 0.8], 0.137, [0.84, 0.51, -0.18], 0.031, curved([0.089, 0.053, 0.034], [2.21, 5.07, 0.83]), 0.12);
+  const rows = [0, 1, 2].map((r) => [cols[0][r], cols[1][r], cols[2][r], 0]);
+  return { rows, primary: [...primary, 0], warp: [...warp, 0] };
+}
+
+// ---------- WebGL ----------
+class FieldGL {
+  constructor(canvas) {
+    const gl = canvas.getContext("webgl", { preserveDrawingBuffer: true, antialias: false, premultipliedAlpha: false });
+    if (!gl) throw new Error("This browser has no WebGL, which the field needs.");
+    this.gl = gl;
+    this.canvas = canvas;
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    this.prog = this.program();
+  }
+  program() {
+    const gl = this.gl;
+    const shader = (type, src) => {
+      const s = gl.createShader(type);
+      gl.shaderSource(s, src);
+      gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+      return s;
+    };
+    const p = gl.createProgram();
+    gl.attachShader(p, shader(gl.VERTEX_SHADER, "attribute vec2 pos; void main() { gl_Position = vec4(pos, 0.0, 1.0); }"));
+    gl.attachShader(p, shader(gl.FRAGMENT_SHADER, fieldGlsl()));
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+    const u = {};
+    for (const n of ["u_res", "u_tc", "u_lift", "u_scrim", "u_cam", "u_rot0", "u_rot1", "u_rot2", "u_mot", "u_wmot", "u_stops", "u_n"]) u[n] = gl.getUniformLocation(p, n);
+    return { p, u, pos: gl.getAttribLocation(p, "pos") };
+  }
+  draw(pal, t, calmMix) {
+    const gl = this.gl, w = this.canvas.width, h = this.canvas.height;
+    const prog = this.prog;
+    const st = stopsOf(pal).length < 2 ? [pal.ground, pal.ground] : stopsOf(pal);
+    const lab = new Float32Array(24);
+    for (let i = 0; i < 8; i++) lab.set(oklab(st[Math.min(i, st.length - 1)]), i * 3);
+    const ink = inkOf(pal);
+    const [focal, scale] = fieldCamera(w / h);
+    const m = fieldMotion(t);
+    gl.viewport(0, 0, w, h);
+    gl.useProgram(prog.p);
+    gl.enableVertexAttribArray(prog.pos);
+    gl.vertexAttribPointer(prog.pos, 2, gl.FLOAT, false, 0, 0);
+    const u = prog.u, g = pal.ground;
+    gl.uniform2f(u.u_res, w, h);
+    gl.uniform2f(u.u_tc, t, calmMix);
+    gl.uniform4f(u.u_lift, g[0] * 0.4, g[1] * 0.4, g[2] * 0.4, 0);
+    gl.uniform4fv(u.u_scrim, ink.scrim);
+    gl.uniform4f(u.u_cam, focal, scale, 2, 0);
+    gl.uniform4fv(u.u_rot0, m.rows[0]);
+    gl.uniform4fv(u.u_rot1, m.rows[1]);
+    gl.uniform4fv(u.u_rot2, m.rows[2]);
+    gl.uniform4fv(u.u_mot, m.primary);
+    gl.uniform4fv(u.u_wmot, m.warp);
+    gl.uniform3fv(u.u_stops, lab);
+    gl.uniform1f(u.u_n, st.length);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+  // sRGB pixels, top row first.
+  pixels() {
+    const gl = this.gl, w = this.canvas.width, h = this.canvas.height;
+    const buf = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+    const out = new Array(w * h);
+    for (let y = 0; y < h; y++) {
+      const src = (h - 1 - y) * w * 4;
+      for (let x = 0; x < w; x++) {
+        const i = src + x * 4;
+        out[y * w + x] = [buf[i] / 255, buf[i + 1] / 255, buf[i + 2] / 255];
+      }
+    }
+    return out;
+  }
+}
+
+// ---------- checks ----------
+const pct = (sorted, f) => sorted[Math.floor((sorted.length - 1) * f)];
+
+function hueOf([r, g, b], floor) {
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+  if (d < floor) return null;
+  let h = mx === r ? 60 * (((g - b) / d) % 6) : mx === g ? 60 * ((b - r) / d + 2) : 60 * ((r - g) / d + 4);
+  return (h + 360) % 360;
+}
+
+// The field as the player sees it: text on glass, titles on the bare field, brightness, hues.
+function fieldStats(pal, calmMix, t) {
+  sampler.draw(pal, t, calmMix);
+  const px = sampler.pixels();
+  const ink = inkOf(pal);
+  const gl = ink.glass, a = gl[3];
+  const over = (c) => [c[0] * (1 - a) + gl[0] * a, c[1] * (1 - a) + gl[1] * a, c[2] * (1 - a) + gl[2] * a];
+  const onGlass = px.map((c) => contrast(ink.fg, over(c))).sort((x, y) => x - y);
+  const band = px.slice(0, (SAMPLE_W * SAMPLE_H) / 8).map((c) => contrast(ink.fg, c)).sort((x, y) => x - y);
+  const mean = px.reduce((s, c) => s + luma(c), 0) / px.length;
+  const bins = new Array(360).fill(0);
+  let coloured = 0;
+  for (const c of px) { const h = hueOf(c, 0.06); if (h !== null) { bins[Math.floor(h) % 360]++; coloured++; } }
+  const floor = Math.max(1, Math.floor(coloured / 200));
+  const lit = bins.map((n, i) => (n >= floor ? i : -1)).filter((i) => i >= 0);
+  let arc = 0;
+  if (lit.length > 1) {
+    let gap = 360 - lit[lit.length - 1] + lit[0];
+    for (let i = 1; i < lit.length; i++) gap = Math.max(gap, lit[i] - lit[i - 1]);
+    arc = 360 - gap;
+  }
+  return { glass: pct(onGlass, 0.02), band: pct(band, 0.05), mean, arc };
+}
+
+function fieldChecks(pal, t) {
+  const s = [fieldStats(pal, 0, t), fieldStats(pal, 1, t)];
+  const worst = (k, lo) => (lo ? (s[0][k] <= s[1][k] ? 0 : 1) : (s[0][k] >= s[1][k] ? 0 : 1));
+  const screen = (i) => (i === 0 ? "launcher" : "settings form");
+  const inkWord = pal.light ? "dark" : "white";
+  const g = worst("glass", true), b = worst("band", true);
+  const m = pal.light ? worst("mean", true) : worst("mean", false);
+  const arc = Math.max(s[0].arc, s[1].arc);
+  return [
+    { state: s[g].glass >= 4.5 ? "pass" : "fail", title: "Text on glass",
+      text: `${inkWord[0].toUpperCase() + inkWord.slice(1)} text on a panel reads <span class="mono">${s[g].glass.toFixed(1)}:1</span> where the field is worst (${screen(g)}). Body text needs 4.5:1.` },
+    { state: s[b].band >= 3 ? "pass" : "fail", title: "Titles on the bare field",
+      text: `Tab names and headings in the top band read <span class="mono">${s[b].band.toFixed(1)}:1</span> (${screen(b)}). Large text needs 3:1.` },
+    { state: (pal.light ? s[m].mean >= 0.5 : s[m].mean <= 0.45) ? "pass" : "fail", title: "Brightness fits the ink",
+      text: `The field averages <span class="mono">${s[m].mean.toFixed(2)}</span> lightness (${screen(m)}). ${pal.light ? "Dark ink wants at least 0.50." : "White ink wants at most 0.45."}` },
+    { state: arc >= 45 ? "pass" : "warn", title: "Colours in view",
+      text: `This frame spans <span class="mono">${arc}°</span> of hue. Under 45° the field reads as one colour.` },
+  ];
+}
+
+// The palette tests in `palette.rs`, run on the mesh they sample.
+function ramp(stops, t) {
+  const n = stops.length;
+  if (n === 0) return [0, 0, 0];
+  if (n === 1) return stops[0];
+  const x = clamp01(t) * (n - 1), i = Math.min(Math.floor(x), n - 2), f = x - i;
+  return [0, 1, 2].map((k) => stops[i][k] + (stops[i + 1][k] - stops[i][k]) * f);
+}
+const meshOf = (p) => (p.stops ? Array.from({ length: 16 }, (_, i) => ramp(p.stops, 0.5 * ((i % 4) / 3 + Math.floor(i / 4) / 3) + D.cell_ramp[i])) : D.mesh_colors);
+
+function gateChecks(p) {
+  const mesh = meshOf(p);
+  const mean = mesh.reduce((s, c) => s + luma(c), 0) / 16;
+  const white = (c) => 1.05 / (lum(c) + 0.05);
+  const out = [];
+  const gamut = mesh.every((c) => c.every((v) => v >= 0 && v <= 1));
+  out.push({ state: gamut ? "pass" : "fail", title: "In gamut", text: "Every mesh colour stays inside sRGB." });
+  const honest = p.light ? mean > 0.5 && luma(p.ground) > 0.6 : mean < 0.45 && white(p.ground) >= 3;
+  out.push({ state: honest ? "pass" : "fail", title: "Honest about lightness",
+    text: p.light
+      ? `Mesh mean <span class="mono">${mean.toFixed(2)}</span> over 0.50, ground <span class="mono">${luma(p.ground).toFixed(2)}</span> over 0.60.`
+      : `Mesh mean <span class="mono">${mean.toFixed(2)}</span> under 0.45, white on the ground <span class="mono">${white(p.ground).toFixed(1)}:1</span> at least 3:1.` });
+  const a = luma(p.accent);
+  out.push({ state: (p.light ? a < 0.45 : a > 0.25) ? "pass" : "fail", title: "Accent against glass",
+    text: `Accent lightness <span class="mono">${a.toFixed(2)}</span>; ${p.light ? "under 0.45 on white frost" : "over 0.25 on dark glass"}.` });
+  if (p.id !== "void") {
+    const hues = mesh.map((c) => hueOf(c, 0.04)).filter((h) => h !== null);
+    let spread = 0;
+    for (const x of hues) for (const y of hues) { const d = Math.abs(x - y) % 360; spread = Math.max(spread, Math.min(d, 360 - d)); }
+    const floor = ["graphite", "paper", "slate"].includes(p.id) ? 20 : 45;
+    out.push({ state: hues.length >= 8 && spread >= floor ? "pass" : "fail", title: "Multi-tone",
+      text: `The mesh spans <span class="mono">${Math.round(spread)}°</span> of hue over ${hues.length} coloured cells; needs ${floor}° over 8.` });
+  }
+  return out;
+}
+
+function renderChecks(el, checks) {
+  el.innerHTML = checks.map((c) =>
+    `<div class="check"><span class="tag ${c.state}">${c.state}</span><div><b>${c.title}</b><span>${c.text}</span></div></div>`).join("");
+}
+
+// ---------- state ----------
+const clone = (p) => JSON.parse(JSON.stringify(p));
+const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const edited = (p) => !same(p, original[p.id]);
+
+function save() {
+  try {
+    const drafts = {};
+    for (const p of table) if (edited(p)) drafts[p.id] = p;
+    localStorage.setItem(STORE, JSON.stringify(drafts));
+  } catch (_) { /* a private window keeps edits for this visit only */ }
+}
+function restore() {
+  try {
+    const drafts = JSON.parse(localStorage.getItem(STORE) || "{}");
+    table = table.map((p) => (drafts[p.id] ? { ...p, ...drafts[p.id], id: p.id } : p));
+  } catch (_) { /* nothing saved */ }
+}
+
+// ---------- the palette list ----------
+const pipCache = new Map();
+function failures(p) {
+  const key = JSON.stringify(p);
+  if (pipCache.has(key)) return pipCache.get(key);
+  const n = fieldChecks(p, CHECK_T).filter((c) => c.state === "fail").length;
+  pipCache.set(key, n);
+  return n;
+}
+function listItem(p, i) {
+  const s = stopsOf(p);
+  const grad = `linear-gradient(90deg, ${s.map(hex).join(", ")})`;
+  const n = failures(p);
+  return `<li><button type="button" class="pal" data-i="${i}" aria-current="${i === sel}">
+    <span class="chip" style="background:${grad}"></span>
+    <span class="name">${p.name}${edited(p) ? '<span class="edited">●</span>' : ""}<small>${p.id}</small></span>
+    <span class="pip ${n ? "no" : "ok"}" title="${n ? n + " field checks fail" : "Field checks pass"}">${n ? "✕" + n : "✓"}</span>
+  </button></li>`;
+}
+function renderList() {
+  $("#list-dark").innerHTML = table.map((p, i) => (p.light ? "" : listItem(p, i))).join("");
+  $("#list-pale").innerHTML = table.map((p, i) => (p.light ? listItem(p, i) : "")).join("");
+}
+document.addEventListener("click", (e) => {
+  const b = e.target.closest(".pal");
+  if (!b) return;
+  sel = +b.dataset.i;
+  onPalette();
+});
+
+// ---------- the editor ----------
+function swatch(el, color, onChange, extra = "") {
+  el.innerHTML = `<button type="button" class="sw-btn" aria-label="Pick a colour" aria-haspopup="dialog" aria-expanded="false" style="background:${hex(color)}"></button><input type="text" class="mono" value="${hex(color)}" spellcheck="false" aria-label="Hex">${extra}`;
+  const btn = el.querySelector(".sw-btn"), text = el.querySelector("input");
+  let current = color;
+  const set = (c) => { current = c; onChange(c); };
+  btn.addEventListener("click", () => openPicker(btn, text, current, set));
+  text.addEventListener("change", () => {
+    if (!/^#[0-9a-f]{6}$/i.test(text.value)) { text.value = hex(current); return; }
+    const c = fromHex(text.value);
+    btn.style.background = hex(c);
+    set(c);
+    if (pk.open && pk.anchor === btn) setRgb(c, false);
+  });
+}
+
+function renderEditor() {
+  closePicker(false);
+  const p = table[sel];
+  $("#ed-title").textContent = p.name;
+  $("#ed-id").textContent = p.id;
+  $("#ed-name").value = p.name;
+  $("#ink-white").setAttribute("aria-pressed", String(!p.light));
+  $("#ink-dark").setAttribute("aria-pressed", String(p.light));
+  $("#vivid-note").hidden = !inkOf(p).vivid;
+  const s = stopsOf(p);
+  $("#ramp").style.background = `linear-gradient(90deg, ${s.map(hex).join(", ")})`;
+  const box = $("#stops");
+  box.innerHTML = "";
+  s.forEach((c, i) => {
+    const row = document.createElement("div");
+    row.className = "swatch";
+    box.appendChild(row);
+    swatch(row, c, (v) => { editStops((st) => { st[i] = v; }, true); },
+      `<span class="iconbtns"><button type="button" data-up="${i}" aria-label="Move up" ${i ? "" : "disabled"}>↑</button><button type="button" data-down="${i}" aria-label="Move down" ${i < s.length - 1 ? "" : "disabled"}>↓</button><button type="button" data-rm="${i}" aria-label="Remove stop" ${s.length > 2 ? "" : "disabled"}>✕</button></span>`);
+  });
+  swatch($("#ground"), p.ground, (v) => edit((q) => { q.ground = v; }, true));
+  swatch($("#accent"), p.accent, (v) => edit((q) => { q.accent = v; }, true));
+  $("#add-stop").disabled = s.length >= 8;
+  renderExport();
+}
+
+$("#stops").addEventListener("click", (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  if (b.dataset.rm) editStops((st) => st.splice(+b.dataset.rm, 1));
+  if (b.dataset.up) editStops((st) => { const i = +b.dataset.up; [st[i - 1], st[i]] = [st[i], st[i - 1]]; });
+  if (b.dataset.down) editStops((st) => { const i = +b.dataset.down; [st[i + 1], st[i]] = [st[i], st[i + 1]]; });
+});
+$("#add-stop").addEventListener("click", () => editStops((st) => st.push([...st[st.length - 1]])));
+$("#ed-name").addEventListener("input", (e) => edit((q) => { q.name = e.target.value.trim() || original[q.id].name; }, true));
+$("#ink-white").addEventListener("click", () => edit((q) => { q.light = false; }));
+$("#ink-dark").addEventListener("click", () => edit((q) => { q.light = true; }));
+$("#revert").addEventListener("click", () => { table[sel] = clone(original[table[sel].id]); save(); onPalette(); });
+
+// `quiet` keeps the editor's own inputs (a drag on a colour picker) alive while it runs.
+function edit(fn, quiet = false) {
+  const p = table[sel];
+  fn(p);
+  save();
+  if (quiet) { applyInk(); renderExport(); refreshSoon(); $("#ed-title").textContent = p.name; $("#vivid-note").hidden = !inkOf(p).vivid; }
+  else onPalette();
+}
+function editStops(fn, quiet = false) {
+  edit((p) => {
+    const st = stopsOf(p).map((c) => [...c]);
+    fn(st);
+    p.stops = st;
+    if (p.id === "violet" && original.violet.stops === null && same(st, D.violet_field)) p.stops = null;
+  }, quiet);
+  if (quiet) $("#ramp").style.background = `linear-gradient(90deg, ${stopsOf(table[sel]).map(hex).join(", ")})`;
+}
+
+// The checks render the field four times; a drag waits until it rests.
+let soon = 0;
+function refreshSoon() { clearTimeout(soon); soon = setTimeout(flushRefresh, 160); }
+function flushRefresh() { clearTimeout(soon); renderList(); refreshChecks(); }
+
+// ---------- colour picker: OKLCH, the space the field blends in ----------
+const CMAX = 0.37;
+function oklabToRgb([L, a, b]) {
+  const l = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3;
+  const m = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3;
+  const s = (L - 0.0894841775 * a - 1.291485548 * b) ** 3;
+  const enc = (v) => (v <= 0.0031308 ? 12.92 * v : 1.055 * Math.pow(v, 1 / 2.4) - 0.055);
+  return [
+    enc(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s),
+    enc(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s),
+    enc(-0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s),
+  ];
+}
+const lchToRgb = (L, C, H) => oklabToRgb([L, C * Math.cos((H * Math.PI) / 180), C * Math.sin((H * Math.PI) / 180)]);
+const inGamut = (c) => c.every((v) => v >= -0.0005 && v <= 1.0005);
+function maxChroma(L, H) {
+  let lo = 0, hi = CMAX;
+  for (let i = 0; i < 16; i++) { const m = (lo + hi) / 2; if (inGamut(lchToRgb(L, m, H))) lo = m; else hi = m; }
+  return lo;
+}
+const round3 = (c) => c.map((v) => Math.round(clamp01(v) * 1000) / 1000);
+
+// `want` is the chroma asked for; `C` is what the gamut allows at this lightness and hue.
+const pk = { open: false, anchor: null, text: null, onChange: null, start: null, rgb: [0, 0, 0], L: 0.5, C: 0, H: 280, want: 0 };
+const picker = $("#picker");
+
+function openPicker(anchor, text, color, onChange) {
+  if (pk.open && pk.anchor === anchor) { closePicker(); return; }
+  closePicker(false);
+  Object.assign(pk, { open: true, anchor, text, onChange, start: [...color] });
+  anchor.setAttribute("aria-expanded", "true");
+  picker.hidden = false;
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  for (const cv of picker.querySelectorAll("canvas")) {
+    cv.width = Math.round(cv.clientWidth * dpr);
+    cv.height = Math.round(cv.clientHeight * dpr);
+  }
+  $("#pk-before").style.background = hex(color);
+  $("#pk-before").style.color = luma(color) > 0.55 ? "#000" : "#fff";
+  renderQuick();
+  setRgb(color, false);
+  place();
+  $("#pk-plane").focus();
+}
+function closePicker(refocus = true) {
+  if (!pk.open) return;
+  pk.open = false;
+  picker.hidden = true;
+  pk.anchor.setAttribute("aria-expanded", "false");
+  if (refocus && pk.anchor.isConnected) pk.anchor.focus();
+  flushRefresh();
+}
+function place() {
+  const r = pk.anchor.getBoundingClientRect(), w = picker.offsetWidth, h = picker.offsetHeight;
+  const left = Math.min(Math.max(16, r.left), innerWidth - w - 16);
+  const below = r.bottom + h + 8 <= innerHeight || r.top - h - 8 < 0;
+  picker.style.left = `${left + scrollX}px`;
+  picker.style.top = `${(below ? r.bottom + 8 : r.top - h - 8) + scrollY}px`;
+}
+
+// An exact colour (hex, tuple, a quick pick): lightness, chroma and hue follow from it.
+function setRgb(rgb, emit) {
+  pk.rgb = round3(rgb);
+  const [L, a, b] = oklab(pk.rgb);
+  pk.L = L;
+  pk.C = pk.want = Math.hypot(a, b);
+  if (pk.C > 0.002) pk.H = ((Math.atan2(b, a) * 180) / Math.PI + 360) % 360;
+  show(true, false);
+  if (emit) commit();
+}
+// A move on the plane, the strip or a number: held inside sRGB by lowering chroma.
+function setLch(L, want, H) {
+  const hueMoved = H !== pk.H;
+  pk.L = Math.min(Math.max(L, 0), 1);
+  pk.H = ((H % 360) + 360) % 360;
+  pk.want = Math.min(Math.max(want, 0), CMAX);
+  const max = maxChroma(pk.L, pk.H);
+  pk.C = Math.min(pk.want, max);
+  pk.rgb = round3(lchToRgb(pk.L, pk.C, pk.H));
+  show(hueMoved, pk.want > max + 0.002);
+  commit();
+}
+function commit() {
+  pk.anchor.style.background = hex(pk.rgb);
+  pk.text.value = hex(pk.rgb);
+  pk.onChange(pk.rgb);
+}
+
+function show(planeToo, clamped) {
+  if (planeToo) renderPlane();
+  renderHue();
+  const dot = $("#pk-dot"), bar = $("#pk-bar");
+  dot.style.left = `${(pk.C / CMAX) * 100}%`;
+  dot.style.top = `${(1 - pk.L) * 100}%`;
+  bar.style.left = `${(pk.H / 360) * 100}%`;
+  $("#pk-plane").setAttribute("aria-valuetext", `lightness ${Math.round(pk.L * 100)} %, chroma ${pk.C.toFixed(3)}`);
+  $("#pk-hue").setAttribute("aria-valuenow", String(Math.round(pk.H)));
+  const active = document.activeElement;
+  const put = (id, v) => { if (active !== $(id)) $(id).value = v; };
+  put("#pk-l", (pk.L * 100).toFixed(1));
+  put("#pk-c", pk.C.toFixed(3));
+  put("#pk-h", Math.round(pk.H));
+  put("#pk-hex", hex(pk.rgb));
+  put("#pk-rgb", pk.rgb.map((v) => v.toFixed(3)).join(", "));
+  const now = $("#pk-now");
+  now.style.background = hex(pk.rgb);
+  now.style.color = luma(pk.rgb) > 0.55 ? "#000" : "#fff";
+  $("#pk-read").textContent = `luma ${luma(pk.rgb).toFixed(2)} · on white ${contrast([1, 1, 1], pk.rgb).toFixed(1)}:1 · on black ${contrast([0, 0, 0], pk.rgb).toFixed(1)}:1`;
+  $("#pk-gamut").hidden = !clamped;
+}
+
+function renderPlane() {
+  const cv = $("#pk-plane canvas"), w = cv.width, h = cv.height;
+  const g = cv.getContext("2d"), img = g.createImageData(w, h), d = img.data;
+  for (let y = 0; y < h; y++) {
+    const L = 1 - y / (h - 1), max = maxChroma(L, pk.H);
+    for (let x = 0; x < w; x++) {
+      const C = (x / (w - 1)) * CMAX, i = (y * w + x) * 4;
+      if (C <= max) {
+        const c = lchToRgb(L, C, pk.H);
+        d[i] = clamp01(c[0]) * 255; d[i + 1] = clamp01(c[1]) * 255; d[i + 2] = clamp01(c[2]) * 255;
+      } else {
+        const v = ((x + y) >> 2) % 3 === 0 ? 44 : 27; // hatching past the sRGB edge
+        d[i] = v; d[i + 1] = v + 1; d[i + 2] = v + 4;
+      }
+      d[i + 3] = 255;
+    }
+  }
+  g.putImageData(img, 0, 0);
+}
+function renderHue() {
+  const cv = $("#pk-hue canvas"), w = cv.width, h = cv.height, g = cv.getContext("2d");
+  for (let x = 0; x < w; x++) {
+    const H = (x / (w - 1)) * 360;
+    g.fillStyle = hex(lchToRgb(pk.L, Math.min(Math.max(pk.want, 0.08), maxChroma(pk.L, H)), H));
+    g.fillRect(x, 0, 1, h);
+  }
+}
+function renderQuick() {
+  const p = table[sel];
+  const picks = [...stopsOf(p).map((c, i) => [c, `Stop ${i + 1}`]), [p.ground, "Ground"], [p.accent, "Accent"]];
+  $("#pk-quick").innerHTML = picks.map(([c, name], i) =>
+    `<button type="button" data-q="${i}" title="${name} ${hex(c)}" aria-label="${name} ${hex(c)}" style="background:${hex(c)}"></button>`).join("");
+  $("#pk-quick").onclick = (e) => { const b = e.target.closest("button"); if (b) setRgb(picks[+b.dataset.q][0], true); };
+}
+
+function drag(el, onPoint) {
+  el.addEventListener("pointerdown", (e) => { el.setPointerCapture(e.pointerId); el.focus(); onPoint(e); });
+  el.addEventListener("pointermove", (e) => { if (el.hasPointerCapture(e.pointerId)) onPoint(e); });
+}
+drag($("#pk-plane"), (e) => {
+  const r = $("#pk-plane").getBoundingClientRect();
+  setLch(1 - (e.clientY - r.top) / r.height, ((e.clientX - r.left) / r.width) * CMAX, pk.H);
+});
+drag($("#pk-hue"), (e) => {
+  const r = $("#pk-hue").getBoundingClientRect();
+  setLch(pk.L, pk.want, Math.min(Math.max((e.clientX - r.left) / r.width, 0), 1) * 360);
+});
+$("#pk-plane").addEventListener("keydown", (e) => {
+  const big = e.shiftKey ? 5 : 1;
+  const moves = { ArrowUp: [0.01, 0], ArrowDown: [-0.01, 0], ArrowRight: [0, 0.004], ArrowLeft: [0, -0.004] };
+  const mv = moves[e.key];
+  if (!mv) return;
+  e.preventDefault();
+  setLch(pk.L + mv[0] * big, pk.C + mv[1] * big, pk.H);
+});
+$("#pk-hue").addEventListener("keydown", (e) => {
+  const step = { ArrowRight: 1, ArrowUp: 1, ArrowLeft: -1, ArrowDown: -1 }[e.key];
+  if (!step) return;
+  e.preventDefault();
+  setLch(pk.L, pk.want, pk.H + step * (e.shiftKey ? 10 : 1));
+});
+$("#pk-l").addEventListener("input", (e) => { if (e.target.value !== "") setLch(+e.target.value / 100, pk.want, pk.H); });
+$("#pk-c").addEventListener("input", (e) => { if (e.target.value !== "") setLch(pk.L, +e.target.value, pk.H); });
+$("#pk-h").addEventListener("input", (e) => { if (e.target.value !== "") setLch(pk.L, pk.want, +e.target.value); });
+$("#pk-hex").addEventListener("change", (e) => {
+  const v = e.target.value.trim(), h = v.startsWith("#") ? v : "#" + v;
+  if (/^#[0-9a-f]{6}$/i.test(h)) setRgb(fromHex(h), true); else e.target.value = hex(pk.rgb);
+});
+$("#pk-rgb").addEventListener("change", (e) => {
+  const n = (e.target.value.match(/-?\d*\.?\d+/g) || []).map(Number);
+  if (n.length === 3 && n.every((v) => v >= 0 && v <= 1)) setRgb(n, true);
+  else e.target.value = pk.rgb.map((v) => v.toFixed(3)).join(", ");
+});
+$("#pk-before").addEventListener("click", () => setRgb(pk.start, true));
+$("#pk-done").addEventListener("click", () => closePicker());
+picker.addEventListener("keydown", (e) => { if (e.key === "Escape") { e.stopPropagation(); closePicker(); } });
+document.addEventListener("pointerdown", (e) => {
+  if (pk.open && !picker.contains(e.target) && e.target !== pk.anchor) closePicker(false);
+});
+addEventListener("resize", () => { if (pk.open) place(); });
+
+// ---------- Rust export ----------
+const f3 = (v) => { const s = (Math.round(v * 1000) / 1000 === v ? v.toFixed(3) : String(v)); return s.includes(".") ? s : s + ".0"; };
+const tuple = (c) => `(${c.slice(0, 3).map(f3).join(", ")})`;
+function rustOf(p) {
+  let stops = "stops: None,";
+  if (p.stops) {
+    const lines = [];
+    for (let i = 0; i < p.stops.length; i += 3) lines.push("            " + p.stops.slice(i, i + 3).map(tuple).join(", ") + ",");
+    stops = "\n        stops: Some(&[\n" + lines.join("\n") + "\n        ]),";
+  }
+  const head = p.stops ? `        id: "${p.id}", name: "${p.name}",` : `        id: "${p.id}", name: "${p.name}", ${stops}`;
+  return `    Palette {\n${head}${p.stops ? stops : ""}\n        ground: ${tuple(p.ground)}, accent: ${tuple(p.accent)}, light: ${p.light},\n    },`;
+}
+function renderExport() {
+  const n = table.filter(edited).length;
+  $("#edited-count").textContent = n ? `${n} changed` : "no changes";
+  $("#rust").value = rustOf(table[sel]);
+}
+async function copy(text) {
+  const done = () => { const c = $("#copied"); c.hidden = false; setTimeout(() => (c.hidden = true), 1400); };
+  try { await navigator.clipboard.writeText(text); done(); }
+  catch (_) { const ta = $("#rust"); ta.value = text; ta.focus(); ta.select(); }
+}
+$("#copy-one").addEventListener("click", () => copy(rustOf(table[sel])));
+$("#copy-all").addEventListener("click", () => {
+  const changed = table.filter(edited);
+  copy(changed.length ? changed.map(rustOf).join("\n") : "// No palette changed yet.");
+});
+
+// ---------- stage ----------
+function applyInk() {
+  const ink = inkOf(table[sel]);
+  const r = document.documentElement.style;
+  r.setProperty("--fg", rgba(ink.fg));
+  r.setProperty("--accent", rgba(ink.accent));
+  r.setProperty("--glass", rgba(ink.glass));
+  r.setProperty("--glass-low", rgba(ink.glass_low));
+}
+
+function setMode(form) {
+  calm = form ? 1 : 0;
+  $("#mode-launcher").setAttribute("aria-pressed", String(!form));
+  $("#mode-form").setAttribute("aria-pressed", String(form));
+  $("#mock-launcher").hidden = form;
+  $("#mock-form").hidden = !form;
+}
+$("#mode-launcher").addEventListener("click", () => setMode(false));
+$("#mode-form").addEventListener("click", () => setMode(true));
+$("#play").addEventListener("click", () => { playing = !playing; $("#play").textContent = playing ? "Pause" : "Play"; });
+$("#t").addEventListener("input", (e) => { clock = +e.target.value; refreshChecks(); });
+
+let checksAt = -1;
+function refreshChecks() {
+  const p = table[sel];
+  renderChecks($("#field-checks"), fieldChecks(p, clock));
+  renderChecks($("#gate-checks"), gateChecks(p));
+  checksAt = clock;
+}
+
+function onPalette() {
+  applyInk();
+  renderList();
+  renderEditor();
+  refreshChecks();
+}
+
+let field, sampler, last = performance.now();
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.1);
+  last = now;
+  if (playing) {
+    clock = (clock + dt) % 300;
+    $("#t").value = clock.toFixed(1);
+    if (Math.abs(clock - checksAt) >= 0.5) refreshChecks();
+  }
+  $("#t-out").textContent = `t = ${clock.toFixed(1)} s`;
+  field.draw(table[sel], clock, calm);
+  requestAnimationFrame(frame);
+}
+
+async function boot() {
+  const status = $("#status");
+  try {
+    const res = await fetch("lab-data.json");
+    if (!res.ok) throw new Error(`lab-data.json answered ${res.status}`);
+    D = await res.json();
+    field = new FieldGL($("#field"));
+    const sc = document.createElement("canvas");
+    sc.width = SAMPLE_W; sc.height = SAMPLE_H;
+    sampler = new FieldGL(sc);
+    if (!sameShader(fieldSksl(D.check.ground, D.check.stops), D.check.sksl)) {
+      status.textContent = "The field shader changed shape. Regenerate lab-data.json before trusting this page.";
+      status.classList.add("bad");
+    } else {
+      status.textContent = `${D.palettes.length} palettes · the console's own field shader`;
+    }
+    table = D.palettes.map(clone);
+    for (const p of D.palettes) original[p.id] = clone(p);
+    restore();
+    $("#play").textContent = playing ? "Pause" : "Play";
+    onPalette();
+    requestAnimationFrame(frame);
+  } catch (e) {
+    status.textContent = `The lab couldn't start: ${e.message}. Serve this folder over HTTP so the page can read lab-data.json.`;
+    status.classList.add("bad");
+  }
+}
+boot();
+</script>

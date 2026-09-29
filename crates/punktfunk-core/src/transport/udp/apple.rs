@@ -146,34 +146,19 @@ pub(super) fn recv_batch(
             Err(_) => recvx::disable(),
         }
     }
-    use std::os::fd::AsRawFd;
-    let fd = t.socket.as_raw_fd();
     let n_bufs = out.len().min(lens.len());
     let mut got = 0usize;
+    // The socket is non-blocking, so an empty queue reads as `WouldBlock`.
     while got < n_bufs {
-        let buf = &mut out[got];
-        // SAFETY: `fd` is a live socket owned by `t`; `buf` is a live mutable buffer whose
-        // pointer/len pair is valid for writes for the duration of the call.
-        let r = unsafe {
-            libc::recv(
-                fd,
-                buf.as_mut_ptr() as *mut libc::c_void,
-                buf.len(),
-                libc::MSG_DONTWAIT,
-            )
-        };
-        if r < 0 {
-            let err = std::io::Error::last_os_error();
-            if is_transient_io(&err) {
-                break; // drained or stale ICMP — no data this poll
+        match t.socket.recv(&mut out[got]) {
+            Ok(n) => {
+                lens[got] = n;
+                got += 1;
             }
-            if got > 0 {
-                break; // keep what we have; surface the error on the next empty poll
-            }
-            return Err(err);
+            Err(e) if is_transient_io(&e) => break, // drained or stale ICMP — no data this poll
+            Err(_) if got > 0 => break, // keep what we have; the next empty poll surfaces it
+            Err(e) => return Err(e),
         }
-        lens[got] = r as usize;
-        got += 1;
     }
     Ok(got)
 }

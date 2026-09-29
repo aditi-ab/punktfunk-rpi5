@@ -38,9 +38,6 @@ accepted = [
     "WTFPL",
 ]
 
-# cbindgen is MPL-2.0 but it is a BUILD-ONLY codegen tool that never links into a shipped artifact
-# (its generated header is not a derivative work), so it is excluded from the notices rather than
-# accepted as a linked license.
 ignore-build-dependencies = true
 ignore-dev-dependencies = true
 
@@ -52,8 +49,13 @@ ignore-dev-dependencies = true
 # accepted arm on its own (MIT/Apache-2.0 are globally accepted), so it needs no entry. (It is
 # also UEFI-target-gated out of every shipped build.)
 #
-# There is deliberately NO per-crate entry here any more. `ring` used to need one (its licence is an
+# cbindgen, below, is the one per-crate entry. `ring` used to need one (its licence is an
 # AND that includes the OpenSSL licence, which was accepted for that crate alone), but the crypto
 # backend moved to aws-lc-rs and the ureq 2 → 3 upgrade removed ring from every target we build.
 # aws-lc-sys 0.44's SPDX is an AND of ISC / Apache-2.0 / MIT / BSD-3-Clause / MIT-0 — all globally
 # accepted above — and carries no OpenSSL clause, so `OpenSSL` left the global list with ring.
+
+# cbindgen (MPL-2.0) is the library tools/gen-headers runs to write include/*.h. No shipped
+# artifact links it, and the header it writes is not a derivative work.
+[cbindgen]
+accepted = ["MPL-2.0"]

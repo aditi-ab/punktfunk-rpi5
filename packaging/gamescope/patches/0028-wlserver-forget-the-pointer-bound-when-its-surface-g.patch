@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Enrico=20B=C3=BChler?= <enrico.buehler@unom.io>
+Date: Fri, 25 Sep 2026 02:08:49 +0000
+Subject: [PATCH] wlserver: forget the pointer bound when its surface
+ goes away
+
+The X window extent that bounds the pointer is cached against a raw
+`wlr_surface` pointer and replaced only on the next focus pass that finds
+an Xwayland input window. When that window closes while focus sits on
+another surface, a surface allocated later at the same address inherited
+its bounds and fenced the pointer to the old window's size.
+
+Forget the cached surface when it is destroyed. Stamp pfhdr23.
+---
+ src/meson.build  |  3 ++-
+ src/wlserver.cpp | 11 +++++++++++
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/src/meson.build b/src/meson.build
+index 577c70e4..ccf4bf22 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -203,7 +203,8 @@ vcs_tag = run_command(vcs_tag_cmd, check: false).stdout().strip()
+ #   +pfhdr20 — …and dmabuf capture buffers live in device memory, not system RAM
+ #   +pfhdr21 — …and a packed RGB capture dmabuf takes a tiled modifier its consumer accepts
+ #   +pfhdr22 — …and a planar capture dmabuf exports its chroma plane where the driver put it
+-version_tag = vcs_tag + '+pfhdr22' + ' (' + compiler_name + ' ' + compiler_version + ')'
++#   +pfhdr23 — …and the composited cursor follows a shape change or a hide, and the pointer bound forgets a closed window
++version_tag = vcs_tag + '+pfhdr23' + ' (' + compiler_name + ' ' + compiler_version + ')'
+ 
+ gamescope_version_conf = configuration_data()
+ gamescope_version_conf.set('VCS_TAG', version_tag)
+diff --git a/src/wlserver.cpp b/src/wlserver.cpp
+index aec76688..a048b320 100644
+--- a/src/wlserver.cpp
++++ b/src/wlserver.cpp
+@@ -584,6 +584,8 @@ static void handle_wl_surface_commit( struct wl_listener *l, void *data )
+ 	xwayland_surface_commit(surf->wlr);
+ }
+ 
++static void wlserver_forget_cursor_extent( struct wlr_surface *pSurface );
++
+ static void handle_wl_surface_destroy( struct wl_listener *l, void *data )
+ {
+ 	wlserver_wl_surface_info *surf = wl_container_of( l, surf, destroy );
+@@ -642,6 +644,9 @@ static void handle_wl_surface_destroy( struct wl_listener *l, void *data )
+ 		wl_resource_set_user_data( pSwapchain, nullptr );
+ 	}
+ 
++	// A new surface at this address must not inherit the pointer bounds of this one.
++	wlserver_forget_cursor_extent( surf->wlr );
++
+ 	wl_list_remove( &surf->commit.link );
+ 	wl_list_remove( &surf->destroy.link );
+ 
+@@ -2577,6 +2582,12 @@ void wlserver_set_cursor_extent( struct wlr_surface *pSurface, int nWidth, int n
+ 		wlserver_clampcursor();
+ }
+ 
++static void wlserver_forget_cursor_extent( struct wlr_surface *pSurface )
++{
++	if ( s_pCursorExtentSurface == pSurface )
++		s_pCursorExtentSurface = nullptr;
++}
++
+ void wlserver_mousefocus( struct wlr_surface *wlrsurface, int x /* = 0 */, int y /* = 0 */ )
+ {
+ 	assert( wlserver_is_lock_held() );

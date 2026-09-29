@@ -12,12 +12,13 @@
 /// Keyboard LAYOUT from `localectl`, not a `PUNKTFUNK_*` knob. Shared so the
 /// injector and the gamescope backend do not depend on each other.
 pub mod layout;
+pub mod os_release;
 pub mod registry;
 mod store;
 
 pub use store::{
-    knob, mark_started, pin, reload, restart_pending, save, snapshot, store_path, Resolved,
-    SaveError, Snapshot, Source,
+    knob, mark_started, pin, reload, restart_pending, row_bool, row_tri, save, save_at, snapshot,
+    store_path, Resolved, SaveError, Snapshot, Source,
 };
 
 /// Explicit-off for a `PUNKTFUNK_*` var: trimmed, case-insensitive
@@ -25,9 +26,10 @@ pub use store::{
 /// `None`. Callers must use this — `var(k) != Ok("0")` treats `"0 "` and
 /// `"false"` as ON.
 ///
-/// Not `pf-zerocopy`'s grammar (`1|true|yes|on` on, everything else off).
+/// Not `pf-zerocopy`'s grammar, where blank is off and junk keeps the default.
 ///
-/// Reads through [`knob`], so a registry row's console value counts as set.
+/// For env-only knobs. A registry Bool or tri-state row reads through [`row_bool`] or
+/// [`row_tri`], which also see the console.
 pub fn env_on(name: &str) -> Option<bool> {
     knob(name).map(|s| is_on(&s))
 }
@@ -242,7 +244,7 @@ pub struct HostConfig {
     /// `PUNKTFUNK_AUDIO_HIRES` — host policy gate for lossless `0xD3`
     /// (`design/hi-res-audio.md`). **Default ON**, explicit-off. The host only
     /// *allows* the plane; the client's format pick is the session switch.
-    /// [`env_on`] treats a client-shaped `96000/24` as allow. `0` forces Opus.
+    /// A junk value such as a client-shaped `96000/24` keeps the default. `0` forces Opus.
     pub audio_hires: bool,
     /// `PUNKTFUNK_PERF` — per-stage timing instrumentation.
     pub perf: bool,
@@ -256,8 +258,8 @@ pub struct HostConfig {
     /// `design/per-monitor-portal-capture.md`.
     pub capture_monitor: Option<String>,
     /// `PUNKTFUNK_PORTAL_CURSOR_MODE` — `auto` (default) · `hidden` · `embedded` ·
-    /// `metadata`. Preference, not a command: `portal_cursor::pick` closes the
-    /// session if the backend does not advertise it. `embedded` is the safe pin.
+    /// `metadata`. Preference, not a command: `pf_frame::cursor_mode::pick` never
+    /// requests a mode the backend does not advertise. `embedded` is the safe pin.
     pub portal_cursor_mode: Option<String>,
     /// `PUNKTFUNK_COMPOSITOR` — explicit compositor override (operator/CI/test).
     /// Not the runtime-detected session; `apply_session_env` never writes this.
@@ -306,7 +308,7 @@ pub struct HostConfig {
     pub gamescope_sdr_nits: Option<u32>,
     /// `PUNKTFUNK_GAMESCOPE_BIND` — bind patched gamescope over `/usr/bin/gamescope`
     /// in the session unit's mount namespace. `gamescope-session-plus` hardcodes
-    /// that path (`pf-vdisplay`'s `gamescope.rs`).
+    /// that path (`pf-vdisplay`'s `gamescope/bind.rs`).
     ///
     /// Three-valued. A user-unit mount namespace maps only this uid, so
     /// root-owned `/tmp/.X11-unix` reads as `nobody` and Xwayland refuses to start.
@@ -330,6 +332,8 @@ pub struct HostConfig {
     /// compositor render rate, not the session: a 120 Hz session over a 60 fps cap
     /// still sends 120 frames (60 repeats). gamescope: `--nested-refresh`, 1..=240.
     pub max_fps: Option<u32>,
+    /// Row `pyrowave_bpp` — bits per pixel a PyroWave frame gets at 4:2:0 SDR.
+    pub pyrowave_bpp: f64,
     /// `PUNKTFUNK_VDISPLAY_HZ_MULT` — virtual-display refresh as a multiple of the
     /// session rate; the stream stays at the session rate. Default 1; 2 halves
     /// worst-case age (~16 ms at 60 Hz) without extra wire frames. Clamped 1..=4.
@@ -341,14 +345,16 @@ pub struct HostConfig {
 }
 
 impl HostConfig {
-    /// Fields parsed from their env spelling. Each read goes through the rows, so a field whose
-    /// env name has a registry row also sees the console's value. The typed rows are
-    /// [`Self::apply_settings`].
+    /// Fields read by env name. Each read goes through the rows, so a field whose env name has a
+    /// registry row also sees the console's value; Bool and tri-state rows take the resolved
+    /// value, the rest their env spelling. The id-keyed rows are [`Self::apply_settings`].
     fn from_rows(rows: &[Resolved]) -> Self {
         let val = |k: &str| store::knob_in(rows, k);
         // Presence, not value.
         let flag = |k: &str| val(k).is_some();
         let on = |k: &str| val(k).map(|s| is_on(&s));
+        let row_bool = |k: &str| store::row_bool_in(rows, k);
+        let row_tri = |k: &str| store::row_tri_in(rows, k);
         Self {
             // Blank-is-unset: `PUNKTFUNK_MGMT_BIND=` means default.
             mgmt_bind: val("PUNKTFUNK_MGMT_BIND")
@@ -372,10 +378,10 @@ impl HostConfig {
             encoder_pref: encoder_pref(val("PUNKTFUNK_ENCODER")),
             render_adapter: val("PUNKTFUNK_RENDER_ADAPTER"),
             zerocopy: on("PUNKTFUNK_ZEROCOPY"),
-            chacha20: on("PUNKTFUNK_CHACHA20").unwrap_or(true),
+            chacha20: row_bool("PUNKTFUNK_CHACHA20"),
             audio_quality: val("PUNKTFUNK_AUDIO_QUALITY").map(|s| s.trim().to_lowercase()),
-            audio_redundancy: on("PUNKTFUNK_AUDIO_REDUNDANCY"),
-            audio_hires: on("PUNKTFUNK_AUDIO_HIRES").unwrap_or(true),
+            audio_redundancy: row_tri("PUNKTFUNK_AUDIO_REDUNDANCY"),
+            audio_hires: row_bool("PUNKTFUNK_AUDIO_HIRES"),
             perf: flag("PUNKTFUNK_PERF"),
             // Defaults to `virtual` — the flagship per-client virtual output. It used to be unset,
             // which fell through to the synthetic test pattern: fine for a dev box that always has
@@ -386,38 +392,28 @@ impl HostConfig {
             capture_monitor: val("PUNKTFUNK_CAPTURE_MONITOR")
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
-            // Emptied-to-None. Spellings are parsed at `portal_cursor::want`.
+            // Emptied-to-None. Spellings are parsed by `pf_frame::cursor_mode::parse_pin`.
             portal_cursor_mode: val("PUNKTFUNK_PORTAL_CURSOR_MODE")
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
             compositor: val("PUNKTFUNK_COMPOSITOR"),
             gamepad: val("PUNKTFUNK_GAMEPAD"),
-            gamescope_steam: val("PUNKTFUNK_GAMESCOPE_STEAM").is_some_and(|s| {
-                matches!(
-                    s.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            }),
-            gamescope_grab_cursor: val("PUNKTFUNK_GAMESCOPE_GRAB_CURSOR").is_some_and(|s| {
-                matches!(
-                    s.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            }),
-            gamescope_splash: on("PUNKTFUNK_GAMESCOPE_SPLASH").unwrap_or(true),
-            gamescope_isolate: on("PUNKTFUNK_GAMESCOPE_ISOLATE").unwrap_or(true),
-            steam_seat_home: on("PUNKTFUNK_STEAM_SEAT_HOME").unwrap_or(false),
-            steam_seat_sandbox: on("PUNKTFUNK_STEAM_SEAT_SANDBOX").unwrap_or(false),
+            gamescope_steam: row_bool("PUNKTFUNK_GAMESCOPE_STEAM"),
+            gamescope_grab_cursor: row_bool("PUNKTFUNK_GAMESCOPE_GRAB_CURSOR"),
+            gamescope_splash: row_bool("PUNKTFUNK_GAMESCOPE_SPLASH"),
+            gamescope_isolate: row_bool("PUNKTFUNK_GAMESCOPE_ISOLATE"),
+            steam_seat_home: row_bool("PUNKTFUNK_STEAM_SEAT_HOME"),
+            steam_seat_sandbox: row_bool("PUNKTFUNK_STEAM_SEAT_SANDBOX"),
             steam_prewarm: val("PUNKTFUNK_STEAM_PREWARM")
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 .unwrap_or(1)
                 .min(8),
-            gamescope_hdr: on("PUNKTFUNK_GAMESCOPE_HDR").unwrap_or(true),
+            gamescope_hdr: row_bool("PUNKTFUNK_GAMESCOPE_HDR"),
             gamescope_sdr_nits: val("PUNKTFUNK_GAMESCOPE_SDR_NITS")
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 .filter(|n| (1..=10_000).contains(n)),
-            // Unset is AUTO; `=0` is stock gamescope; `=1` is force.
-            gamescope_bind: on("PUNKTFUNK_GAMESCOPE_BIND"),
+            // Auto by default; `off` is stock gamescope; `on` is force.
+            gamescope_bind: row_tri("PUNKTFUNK_GAMESCOPE_BIND"),
             // Junk entries are dropped; this only widens a menu.
             gamescope_refresh_rates: parse_refresh_rates(
                 val("PUNKTFUNK_GAMESCOPE_REFRESH_RATES").as_deref(),
@@ -430,7 +426,7 @@ impl HostConfig {
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 .unwrap_or(1)
                 .clamp(1, 4),
-            gamescope_vrr: val("PUNKTFUNK_GAMESCOPE_VRR").as_deref().map(str::trim) != Some("0"),
+            gamescope_vrr: row_bool("PUNKTFUNK_GAMESCOPE_VRR"),
             ..Self::default()
         }
     }
@@ -457,6 +453,9 @@ impl HostConfig {
             .as_u64()
             .filter(|&f| f > 0)
             .map(|f| f.min(240) as u32);
+        self.pyrowave_bpp = get("pyrowave_bpp")
+            .as_f64()
+            .unwrap_or(registry::PYROWAVE_BPP);
         self.audio_output_mode =
             AudioOutputMode::parse(&text("audio_output_mode")).unwrap_or_default();
         self.audio_voice_chat =

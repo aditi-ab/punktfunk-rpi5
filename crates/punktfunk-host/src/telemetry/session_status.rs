@@ -1,0 +1,2155 @@
+//! Live native-session status for management `GET /status`.
+//!
+//! GameStream records its session in `AppState.{launch, stream, streaming}`.
+//! The native plane never writes those fields — it is handed only the shared
+//! stats recorder ([`crate::native::serve`]). This registry is the surface
+//! the native video loop ([`crate::native::virtual_stream`]) publishes to,
+//! keyed per session so concurrent sessions (up to `max_sessions`) each get
+//! an entry.
+//!
+//! [`register`] on stream start; [`LiveSessionGuard`] removes the entry on
+//! any scope exit. `/status` reads [`snapshot`]/[`count`]. The id-less Dashboard
+//! stop and IDR reach every native session through [`stop_all_quit`] and
+//! [`force_idr_all`]; the per-session routes take one id through [`stop_quit`],
+//! [`force_idr`] and [`controls`].
+//!
+//! The same drop builds a [`crate::events::SessionSummary`] — the session's own
+//! numbers plus why it ended — onto `session.ended` and into [`recent`], which is
+//! what `GET /api/v1/session/last` serves. [`SessionCounters`] is the shared block
+//! the input, audio and encode paths bump so the summary can read totals from
+//! threads that outlive it.
+
+use std::collections::VecDeque;
+use std::sync::atomic::{
+    AtomicBool, AtomicI64, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering,
+};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+
+use crate::encode::{ChromaFormat, Codec};
+use crate::events::{
+    AudioEgress, BitrateSpan, GyroCadence, InputCounts, Plane, SessionEndReason, SessionSummary,
+};
+use punktfunk_core::quic::GrantClass;
+
+/// One live native session. The Arcs are the video loop's own handles, so a
+/// mid-stream mode/bitrate change shows on `/status` with no second write.
+struct LiveSession {
+    id: u64,
+    /// Packed `w:16|h:16|hz:16` ([`crate::native::pack_mode`]); live on a mode switch.
+    mode: Arc<AtomicU64>,
+    /// Encoder target, kbps. Same Arc the ABR path writes.
+    bitrate_kbps: Arc<AtomicU32>,
+    codec: Codec,
+    /// Teardown flag ([`stop_all`]).
+    stop: Arc<AtomicBool>,
+    /// Deliberate-stop flag ([`stop_all_quit`]). Distinct from `stop`: intended
+    /// teardown skips display keep-alive linger and trips end-game-on-session-end.
+    quit: Arc<AtomicBool>,
+    /// One-shot force-keyframe ([`force_idr_all`]). The encode loop drains it
+    /// alongside a client decode-recovery request.
+    force_idr: Arc<AtomicBool>,
+    /// Client label: 12-hex cert-fingerprint prefix, or peer IP if anonymous.
+    client: String,
+    /// Display name (trust-store, else sanitized Hello). `None` if nameless.
+    client_name: Option<String>,
+    /// Which plane serves it. Both register here, so a stop or a keyframe reaches either.
+    plane: crate::events::Plane,
+    hdr: bool,
+    /// Bring-up total (hello → first packet), ms. 0 until the first packet left.
+    ttff_ms: Arc<AtomicU32>,
+    /// Last mid-stream resize (reconfigure → rebuilt), ms. 0 = none yet.
+    last_resize_ms: Arc<AtomicU32>,
+    /// Launched title's lease, if any — what [`games`] reports for this session.
+    game: Option<Arc<crate::gamelease::LeaseShared>>,
+    /// The capturer's live health, published by the video loop (WP18). `None` until the
+    /// first publish, or on a capturer that does not classify.
+    capture_health: Arc<Mutex<Option<pf_capture::CaptureHealth>>>,
+    /// Sharing another session's display (`mode_conflict: join`) rather than owning one.
+    join: bool,
+    /// What the per-session management routes act on.
+    controls: SessionControls,
+    started: std::time::Instant,
+    /// Host wall clock at registration; [`started`](Self::started) cannot give one.
+    started_unix: i64,
+    /// 8 or 10, and the encoder's chroma. Fixed for the session.
+    bit_depth: u8,
+    chroma: ChromaFormat,
+    /// [`SessionEndReason`] as `u8`, latched by whichever path knows. 0 = the video
+    /// loop never reached its clean tail, which is [`SessionEndReason::HostError`].
+    end_reason: Arc<AtomicU8>,
+    /// What the video loop counted, stored once at its tail ([`record_tally`]).
+    /// `None` on a loop that bailed before it.
+    tally: Option<SessionTally>,
+    /// Totals the input, audio and encode paths bump while the session runs.
+    counters: Arc<SessionCounters>,
+    /// Client address, so sessions from one NAT or tunnel can be told apart.
+    peer: Option<std::net::IpAddr>,
+}
+
+/// The video loop's own totals, handed over as it finishes.
+#[derive(Clone, Copy)]
+pub struct SessionTally {
+    /// Access units the send thread put on the wire.
+    pub frames_sent: u64,
+    /// The capturer's refused frames; `None` where it does not count them.
+    pub frames_dropped: Option<u64>,
+    /// Path MTU the QUIC stack settled on, bytes.
+    pub path_mtu: u16,
+}
+
+/// Live handles the management plane acts on for ONE session. Built in
+/// `native::serve` and carried here by the video loop, so a per-session route
+/// never has to reach across into another session's state.
+#[derive(Clone)]
+pub struct SessionControls {
+    /// LIVE grant mask — the same atomic the input filter reads every event against.
+    pub grants: Arc<AtomicU32>,
+    /// The pairing's own mask. A live change is `requested & ceiling`: the console
+    /// re-points within what this device is paired for, never above it.
+    pub ceiling: Arc<AtomicU32>,
+    /// Audio egress drops this session's frames while set. Capturer and sink stay up.
+    pub muted: Arc<AtomicBool>,
+    /// Access deadline, unix seconds; 0 = permanent. The `remaining_secs` an
+    /// `AccessUpdate` owes the client.
+    pub deadline_unix: Arc<AtomicI64>,
+    /// The control task's access lane — the same one the expiry watch writes, so a
+    /// live re-point clears the clipboard exactly like a pairing edit does.
+    pub access_tx: Option<tokio::sync::mpsc::UnboundedSender<punktfunk_core::quic::AccessUpdate>>,
+    /// The control task's audio lane. `None` on a session with no control task (tests).
+    pub audio_tx: Option<tokio::sync::mpsc::UnboundedSender<punktfunk_core::quic::AudioState>>,
+    /// OS pad slots this session holds, one bit each — the player numbers a local
+    /// co-op game reads. Published by the input thread.
+    pub pad_slots: Arc<AtomicU16>,
+    /// Full cert fingerprint, when this session has one. The stable device key —
+    /// `client` is only its 12-hex prefix, and an address is not an identity.
+    pub fingerprint: Option<String>,
+    /// The settings preset the client dialled with, when it named one.
+    pub preset: Option<crate::events::PresetRef>,
+    /// This device's key in [`crate::inject::pad_pool`]. A reservation and a
+    /// reconnect are keyed by it, so both follow the pairing, never the address.
+    pub pad_owner: u64,
+    /// Player slot the operator picked, 0-based; [`NO_PAD_SLOT`] = lazy claim.
+    pub preferred_pad_slot: Arc<AtomicU8>,
+    /// Live pad tap this session's input thread publishes to. Idle until a console
+    /// opens `GET /session/{id}/pads` ([`crate::pad_feed`]).
+    pub pads: Arc<crate::pad_feed::PadFeed>,
+}
+
+/// `preferred_pad_slot` for a session the operator has not placed. Not a valid
+/// slot: `MAX_PADS` is 16.
+pub const NO_PAD_SLOT: u8 = u8::MAX;
+
+/// The compositor head one session streams — where its launch's window stage
+/// places the game.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamedHead {
+    pub compositor: crate::vdisplay::Compositor,
+    /// `wl_output.name` of the streamed head.
+    pub output: String,
+}
+
+impl SessionControls {
+    /// Full control, permanent, unmuted, nothing to tell the client. The shape an
+    /// anonymous (`--open`) session and the tests start from.
+    pub fn open() -> SessionControls {
+        SessionControls {
+            grants: Arc::new(AtomicU32::new(punktfunk_core::quic::GRANT_ALL)),
+            ceiling: Arc::new(AtomicU32::new(punktfunk_core::quic::GRANT_ALL)),
+            muted: Arc::new(AtomicBool::new(false)),
+            deadline_unix: Arc::new(AtomicI64::new(0)),
+            access_tx: None,
+            audio_tx: None,
+            pad_slots: Arc::new(AtomicU16::new(0)),
+            fingerprint: None,
+            preset: None,
+            pad_owner: crate::inject::pad_pool::owner_key(None),
+            preferred_pad_slot: Arc::new(AtomicU8::new(NO_PAD_SLOT)),
+            pads: Arc::new(crate::pad_feed::PadFeed::new()),
+        }
+    }
+
+    /// The player slot the operator picked for this session, 0-based.
+    pub fn player(&self) -> Option<u8> {
+        match self.preferred_pad_slot.load(Ordering::Relaxed) {
+            NO_PAD_SLOT => None,
+            slot => Some(slot),
+        }
+    }
+
+    /// Place this session's pads on `slot`, or hand it back to the lazy claim with
+    /// `None`. The pool reservation is a hint the next pad to plug reads, so a pad
+    /// already built keeps the slot it was created under until it re-plugs.
+    ///
+    /// `false` = another live session asked for that slot first and keeps it.
+    pub fn set_player(&self, slot: Option<u8>) -> bool {
+        let Some(slot) = slot else {
+            self.preferred_pad_slot
+                .store(NO_PAD_SLOT, Ordering::Relaxed);
+            return true;
+        };
+        if !crate::inject::pad_pool::global().reserve(slot, self.pad_owner) {
+            return false;
+        }
+        self.preferred_pad_slot.store(slot, Ordering::Relaxed);
+        true
+    }
+
+    /// OS pad slots this session holds right now, lowest first.
+    pub fn pads(&self) -> Vec<u8> {
+        let mask = self.pad_slots.load(Ordering::Relaxed);
+        (0..punktfunk_core::input::MAX_PADS as u8)
+            .filter(|n| mask & (1 << n) != 0)
+            .collect()
+    }
+
+    /// Re-point the live mask, clamped to the pairing's ceiling, and tell the client
+    /// its chip changed. Returns the mask that took effect — never more than `ceiling`.
+    pub fn set_grants(&self, requested: u32) -> u32 {
+        let applied = requested & self.ceiling.load(Ordering::Relaxed);
+        self.grants.store(applied, Ordering::Relaxed);
+        let deadline = self.deadline_unix.load(Ordering::Relaxed);
+        if let Some(tx) = &self.access_tx {
+            let now = crate::clock::unix_secs();
+            // Best-effort, like every other `AccessUpdate`: the host enforces either way.
+            let _ = tx.send(punktfunk_core::quic::AccessUpdate {
+                grants: applied,
+                remaining_secs: if deadline == 0 {
+                    0
+                } else {
+                    u32::try_from((deadline - now).max(1)).unwrap_or(u32::MAX)
+                },
+            });
+        }
+        applied
+    }
+
+    /// Set the audio gate and tell the client, so its overlay can name the silence
+    /// instead of leaving the player to wonder what broke.
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::SeqCst);
+        if let Some(tx) = &self.audio_tx {
+            let _ = tx.send(punktfunk_core::quic::AudioState { muted });
+        }
+    }
+}
+
+/// Session totals the loops bump and the summary reads.
+///
+/// One block rather than a dozen `Arc<Atomic…>`: the input task, the audio thread and the
+/// encode loop all outlive [`LiveSessionGuard::drop`], so the summary cannot wait for them
+/// to hand a figure over. Relaxed throughout — diagnostics, not synchronisation.
+#[derive(Default)]
+pub struct SessionCounters {
+    /// Datagrams accepted by class, and offers the input queue refused when full.
+    pub input_events: AtomicU64,
+    pub input_mic: AtomicU64,
+    pub input_rich: AtomicU64,
+    pub input_dropped: AtomicU64,
+    /// `RichInput::Motion` arrivals, and the gaps ≥ 500 ms among them.
+    motion_samples: AtomicU64,
+    motion_stalls: AtomicU64,
+    /// Set when the audio thread starts. Distinguishes a silent plane from no plane.
+    audio_ran: AtomicBool,
+    audio_sent: AtomicU64,
+    audio_infilled: AtomicU64,
+    audio_late: AtomicU64,
+    audio_max_late_us: AtomicU64,
+    audio_reanchors: AtomicU64,
+    /// Every encoder target the session ran at. `notes` counts them; the first is the
+    /// opening rate, so the rest are the moves.
+    bitrate_min_kbps: AtomicU32,
+    bitrate_max_kbps: AtomicU32,
+    bitrate_sum_kbps: AtomicU64,
+    bitrate_notes: AtomicU32,
+    /// Last rate noted, so a rebuild at the same number is not a move.
+    bitrate_last_kbps: AtomicU32,
+    /// Per-minute link health ([`crate::link_health`]). Drained by the control task, not by
+    /// the summary: these are window deltas, the rest of this block is session totals.
+    pub link: crate::link_health::LinkCounters,
+    /// What the shared-path governor reads and writes for this session.
+    pub share: AbrShare,
+}
+
+impl SessionCounters {
+    /// One motion arrival. `stalled` is [`crate::native::motion_cadence`]'s own verdict, so
+    /// what counts as a break in the feed is defined in exactly one place.
+    /// Zero the per-session tallies. For a plane that keeps one counter block across
+    /// sessions (the compat plane's, which its control loop bumps without a session handle).
+    pub fn reset(&self) {
+        for c in [
+            &self.input_events,
+            &self.input_mic,
+            &self.input_rich,
+            &self.input_dropped,
+        ] {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub fn note_motion(&self, stalled: bool) {
+        self.motion_samples.fetch_add(1, Ordering::Relaxed);
+        if stalled {
+            self.motion_stalls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The audio plane is up for this session, however little it goes on to send.
+    pub fn note_audio_started(&self) {
+        self.audio_ran.store(true, Ordering::Relaxed);
+    }
+
+    /// One audio frame on the wire. `late` is the miss against its slot and `was_late` the
+    /// window's own verdict on it — same split as [`note_motion`](Self::note_motion).
+    pub fn note_audio_frame(&self, late: std::time::Duration, infilled: bool, was_late: bool) {
+        self.audio_sent.fetch_add(1, Ordering::Relaxed);
+        if infilled {
+            self.audio_infilled.fetch_add(1, Ordering::Relaxed);
+        }
+        if was_late {
+            self.audio_late.fetch_add(1, Ordering::Relaxed);
+        }
+        self.audio_max_late_us
+            .fetch_max(late.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    pub fn note_audio_reanchor(&self) {
+        self.audio_reanchors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One encoder target the session ran at. Call it wherever the rate actually changed:
+    /// a repeat would read as a move that never happened.
+    pub fn note_bitrate(&self, kbps: u32) {
+        if kbps == 0 {
+            return;
+        }
+        if self.bitrate_last_kbps.swap(kbps, Ordering::Relaxed) != kbps {
+            self.link.note_retarget();
+        }
+        self.bitrate_min_kbps
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |m| {
+                Some(if m == 0 { kbps } else { m.min(kbps) })
+            })
+            .ok();
+        self.bitrate_max_kbps.fetch_max(kbps, Ordering::Relaxed);
+        self.bitrate_sum_kbps
+            .fetch_add(u64::from(kbps), Ordering::Relaxed);
+        self.bitrate_notes.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Input one session dropped because its access grants don't cover it, per grant class.
+/// One `warn!` on a class's first drop (per-event logging is a log DoS; on GameStream it is
+/// the only support signal, as Moonlight has no grants UX), totals at session end.
+pub struct GrantDrops {
+    plane: Plane,
+    counts: [u64; GrantClass::ALL.len()],
+    warned: [bool; GrantClass::ALL.len()],
+}
+
+impl GrantDrops {
+    pub fn new(plane: Plane) -> GrantDrops {
+        GrantDrops {
+            plane,
+            counts: [0; GrantClass::ALL.len()],
+            warned: [false; GrantClass::ALL.len()],
+        }
+    }
+
+    /// `true` when `mask` grants `class`; otherwise counts the drop and returns `false`.
+    pub fn permitted(&mut self, mask: u32, class: GrantClass) -> bool {
+        if mask & class.bit() != 0 {
+            return true;
+        }
+        self.note(class);
+        false
+    }
+
+    /// Count one drop; log only the first of each class.
+    pub fn note(&mut self, class: GrantClass) {
+        let i = class.bit().trailing_zeros() as usize;
+        self.counts[i] += 1;
+        if !std::mem::replace(&mut self.warned[i], true) {
+            tracing::warn!(
+                class = ?class,
+                plane = self.plane.as_str(),
+                "dropping client input this session's access grants don't cover — counted; \
+                 further drops of this class are silent until the session-end totals"
+            );
+        }
+    }
+
+    /// `Class=count` pairs in bit order; `None` when nothing was dropped.
+    pub fn summary(&self) -> Option<String> {
+        let pairs: Vec<String> = GrantClass::ALL
+            .iter()
+            .zip(self.counts)
+            .filter(|(_, n)| *n != 0)
+            .map(|(class, n)| format!("{class:?}={n}"))
+            .collect();
+        (!pairs.is_empty()).then(|| pairs.join(" "))
+    }
+}
+
+/// Which sessions hear a title's audio (`audio.sessions` on a custom entry).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioSessions {
+    #[default]
+    All,
+    /// The session that owns the display; joiners are silent.
+    Owner,
+    /// The sessions that joined the display; the owner is silent.
+    Joined,
+    /// Only the session that launched the title.
+    Launcher,
+}
+
+/// Whether `policy` silences a session. `launcher` is the launching session's
+/// client label, matched the way [`stop_by_fingerprint`] matches.
+fn policy_mutes(policy: AudioSessions, launcher: &str, client: &str, join: bool) -> bool {
+    match policy {
+        AudioSessions::All => false,
+        AudioSessions::Owner => join,
+        AudioSessions::Joined => !join,
+        AudioSessions::Launcher => client != launcher,
+    }
+}
+
+struct AudioPolicy {
+    sessions: AudioSessions,
+    launcher: String,
+    /// Sessions this policy muted, so its end unmutes exactly those.
+    muted: Vec<u64>,
+}
+
+/// The live title policy, applied to sessions that register while it stands.
+/// One at a time: a second lease replaces it, and the first to end lifts both.
+static AUDIO_POLICY: Mutex<Option<AudioPolicy>> = Mutex::new(None);
+
+/// Apply a title's `audio.sessions` through the same mute the operator uses, so
+/// the client is told and the operator can unmute live. Drop unmutes what it muted.
+pub fn apply_audio_policy(sessions: AudioSessions, launcher: &str) -> AudioPolicyGuard {
+    let mut muted = Vec::new();
+    for s in registry().iter() {
+        // Compat sessions have no per-session mute, and marking one muted without muting it
+        // would put a Muted badge on a session the operator can still hear.
+        if s.plane != crate::events::Plane::Gamestream
+            && policy_mutes(sessions, launcher, &s.client, s.join)
+        {
+            s.controls.set_muted(true);
+            muted.push(s.id);
+        }
+    }
+    let mut live = AUDIO_POLICY.lock().unwrap_or_else(PoisonError::into_inner);
+    // Replacing a live policy inherits what it muted: the first lease to end lifts both.
+    if let Some(prev) = live.take() {
+        muted.extend(prev.muted);
+    }
+    *live = Some(AudioPolicy {
+        sessions,
+        launcher: launcher.to_owned(),
+        muted,
+    });
+    drop(live);
+    tracing::info!(policy = ?sessions, launcher, "title audio policy applied");
+    AudioPolicyGuard(())
+}
+
+pub struct AudioPolicyGuard(());
+
+impl Drop for AudioPolicyGuard {
+    fn drop(&mut self) {
+        let Some(policy) = AUDIO_POLICY
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        else {
+            return;
+        };
+        for s in registry().iter() {
+            if policy.muted.contains(&s.id) {
+                s.controls.set_muted(false);
+            }
+        }
+    }
+}
+
+/// Resolved read of one live session for `/status`.
+#[derive(Clone)]
+pub struct SessionSnapshot {
+    /// Same id the per-session routes and `session.started` carry.
+    pub id: u64,
+    /// Client label: 12-hex cert-fingerprint prefix, or peer IP if anonymous.
+    pub client: String,
+    pub hdr: bool,
+    /// Sharing another session's display rather than owning one.
+    pub join: bool,
+    pub muted: bool,
+    /// Live `GRANT_*` mask, after any per-session re-point.
+    pub grants: u32,
+    pub uptime_s: u64,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub bitrate_kbps: u32,
+    pub codec: Codec,
+    /// Display name (trust-store, else sanitized Hello). `None` if nameless.
+    pub client_name: Option<String>,
+    /// Name of the preset the client dialled with, if any.
+    pub preset_name: Option<String>,
+    /// Which plane serves it.
+    pub plane: crate::events::Plane,
+    /// The capturer's live health, if it classifies.
+    pub capture_health: Option<pf_capture::CaptureHealth>,
+    /// Bring-up total (hello → first packet), ms. 0 while still bringing up.
+    pub time_to_first_frame_ms: u32,
+    /// Last mid-stream resize total, ms. 0 = no resize this session.
+    pub last_resize_ms: u32,
+    /// OS pad slots this session holds, lowest first. Slot `n` is player `n + 1`.
+    pub pads: Vec<u8>,
+    /// Player slot the operator picked, 0-based. `None` = lazy claim.
+    pub preferred_pad_slot: Option<u8>,
+    /// Last closed link-health minute ([`crate::link_health`]). `None` in a session's first
+    /// minute, before one has closed.
+    pub link: Option<crate::link_health::LinkMinute>,
+    /// Other live sessions from the same client address.
+    pub shared_path_with: Vec<u64>,
+}
+
+/// The live-session table, locked. A panic under the lock leaves every entry whole,
+/// so poison is recovered here rather than turned into a panic at the next caller.
+fn registry() -> MutexGuard<'static, Vec<LiveSession>> {
+    static REG: OnceLock<Mutex<Vec<LiveSession>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `f` on live session `id`, under the registry lock. `None` = no such session.
+fn with_session<T>(id: u64, f: impl FnOnce(&LiveSession) -> T) -> Option<T> {
+    registry().iter().find(|s| s.id == id).map(f)
+}
+
+fn next_id() -> u64 {
+    static ID: AtomicU64 = AtomicU64::new(1);
+    ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// [`crate::events::SessionRef`] for this session; mode is read live.
+fn session_ref(s: &LiveSession) -> crate::events::SessionRef {
+    let (width, height, fps) = crate::native::unpack_mode(s.mode.load(Ordering::Relaxed));
+    crate::events::SessionRef {
+        id: s.id,
+        client: s.client.clone(),
+        // `controls` already carries the device key this session was admitted by.
+        fingerprint: s.controls.fingerprint.clone(),
+        plane: s.plane,
+        mode: crate::events::mode_str(width, height, fps),
+        hdr: s.hdr,
+        preset: s.controls.preset.clone(),
+    }
+}
+
+/// `None` until a pad sends motion: a keyboard-and-mouse session owes no gyro row.
+fn gyro_cadence(c: &SessionCounters) -> Option<GyroCadence> {
+    let samples = c.motion_samples.load(Ordering::Relaxed);
+    let stalls = c.motion_stalls.load(Ordering::Relaxed);
+    (samples > 0 || stalls > 0).then_some(GyroCadence { samples, stalls })
+}
+
+/// `None` when no audio thread ran. A thread that ran and sent nothing reports zeros —
+/// a silent plane and no plane are different faults.
+fn audio_egress(c: &SessionCounters) -> Option<AudioEgress> {
+    c.audio_ran.load(Ordering::Relaxed).then(|| AudioEgress {
+        sent: c.audio_sent.load(Ordering::Relaxed),
+        infilled: c.audio_infilled.load(Ordering::Relaxed),
+        late: c.audio_late.load(Ordering::Relaxed),
+        max_late_ms: c.audio_max_late_us.load(Ordering::Relaxed) / 1_000,
+        reanchors: c.audio_reanchors.load(Ordering::Relaxed),
+    })
+}
+
+/// `None` until an opening rate is noted. The first note is that rate, so the moves are
+/// the notes after it.
+fn bitrate_span(c: &SessionCounters) -> Option<BitrateSpan> {
+    let notes = c.bitrate_notes.load(Ordering::Relaxed);
+    (notes > 0).then(|| BitrateSpan {
+        min_kbps: c.bitrate_min_kbps.load(Ordering::Relaxed),
+        avg_kbps: (c.bitrate_sum_kbps.load(Ordering::Relaxed) / u64::from(notes)) as u32,
+        max_kbps: c.bitrate_max_kbps.load(Ordering::Relaxed),
+        adaptive_steps: notes - 1,
+    })
+}
+
+/// Everything this session ended up being. Built once, in [`LiveSessionGuard::drop`],
+/// and shared by `session.ended` and `GET /session/last`.
+fn summary(s: &LiveSession) -> SessionSummary {
+    let (width, height, fps) = crate::native::unpack_mode(s.mode.load(Ordering::Relaxed));
+    SessionSummary {
+        id: s.id,
+        client: s.client.clone(),
+        client_name: s.client_name.clone(),
+        started_unix: s.started_unix,
+        duration_s: s.started.elapsed().as_secs(),
+        mode: crate::events::mode_str(width, height, fps),
+        hdr: s.hdr,
+        join: s.join,
+        codec: s.codec.label().to_string(),
+        bit_depth: s.bit_depth,
+        chroma: if s.chroma.is_444() { "4:4:4" } else { "4:2:0" }.to_string(),
+        bitrate_kbps: s.bitrate_kbps.load(Ordering::Relaxed),
+        bitrate: bitrate_span(&s.counters),
+        input: InputCounts {
+            events: s.counters.input_events.load(Ordering::Relaxed),
+            mic: s.counters.input_mic.load(Ordering::Relaxed),
+            rich: s.counters.input_rich.load(Ordering::Relaxed),
+            dropped: s.counters.input_dropped.load(Ordering::Relaxed),
+        },
+        gyro: gyro_cadence(&s.counters),
+        audio: audio_egress(&s.counters),
+        frames_sent: s.tally.map(|t| t.frames_sent),
+        frames_dropped: s.tally.and_then(|t| t.frames_dropped),
+        bringup_ms: s.ttff_ms.load(Ordering::Relaxed),
+        path_mtu: s.tally.map(|t| t.path_mtu),
+        // Nothing latched means the loop never reached its tail, which is a fault.
+        ended: SessionEndReason::from_u8(s.end_reason.load(Ordering::SeqCst))
+            .unwrap_or(SessionEndReason::HostError),
+    }
+}
+
+/// Inputs for [`register`]. Named fields: half are same-typed `Arc<Atomic…>`
+/// handles, so a transposed pair would compile and report the wrong figure.
+pub struct Registration {
+    /// Packed `w:16|h:16|hz:16` ([`crate::native::pack_mode`]); live on a mode switch.
+    pub mode: Arc<AtomicU64>,
+    /// Encoder target, kbps. Same Arc the ABR path writes.
+    pub bitrate_kbps: Arc<AtomicU32>,
+    pub codec: Codec,
+    /// Teardown flag ([`stop_all`]).
+    pub stop: Arc<AtomicBool>,
+    /// Deliberate-stop flag ([`stop_all_quit`]). Distinct from `stop`.
+    pub quit: Arc<AtomicBool>,
+    /// One-shot force-keyframe ([`force_idr_all`]).
+    pub force_idr: Arc<AtomicBool>,
+    /// Client label: 12-hex cert-fingerprint prefix, or peer IP if anonymous.
+    pub client: String,
+    /// Display name (trust-store, else sanitized Hello). `None` if nameless.
+    pub client_name: Option<String>,
+    /// Which plane serves it.
+    pub plane: crate::events::Plane,
+    pub hdr: bool,
+    /// Bring-up total slot (hello → first packet), ms. 0 until first packet.
+    pub ttff_ms: Arc<AtomicU32>,
+    /// Last mid-stream resize total, ms. 0 = none yet.
+    pub last_resize_ms: Arc<AtomicU32>,
+    /// Launched title's lease, if this session launched one.
+    pub game: Option<Arc<crate::gamelease::LeaseShared>>,
+    /// The video loop's capture-health slot; it stores the capturer's report on its own cadence.
+    pub capture_health: Arc<Mutex<Option<pf_capture::CaptureHealth>>>,
+    /// Sharing another session's display (`mode_conflict: join`) rather than owning one.
+    pub join: bool,
+    /// Handles the per-session management routes act on.
+    pub controls: SessionControls,
+    /// 8 or 10, and the encoder's chroma. Both fixed for the session.
+    pub bit_depth: u8,
+    pub chroma: ChromaFormat,
+    /// [`SessionEndReason`] latch, shared with the paths that know why: the connection
+    /// watcher, the game-exit close, an operator stop, and the loop's own clean tail.
+    pub end_reason: Arc<AtomicU8>,
+    /// The session's shared counter block, already being bumped by its side threads.
+    pub counters: Arc<SessionCounters>,
+    /// Client address. `None` only where there is no connection (tests).
+    pub peer: Option<std::net::IpAddr>,
+}
+
+/// Publish a live native session. The guard removes it on drop and pairs
+/// `session.started` with `session.ended` on every exit path, including panic.
+pub fn register(reg: Registration) -> LiveSessionGuard {
+    let Registration {
+        mode,
+        bitrate_kbps,
+        codec,
+        stop,
+        quit,
+        force_idr,
+        client,
+        client_name,
+        plane,
+        hdr,
+        ttff_ms,
+        last_resize_ms,
+        game,
+        capture_health,
+        join,
+        controls,
+        bit_depth,
+        chroma,
+        end_reason,
+        counters,
+        peer,
+    } = reg;
+    let id = next_id();
+    // A standing title policy reaches a session that arrives under it.
+    if let Some(p) = AUDIO_POLICY
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_mut()
+    {
+        if plane != crate::events::Plane::Gamestream
+            && policy_mutes(p.sessions, &p.launcher, &client, join)
+        {
+            controls.set_muted(true);
+            p.muted.push(id);
+        }
+    }
+    let session = LiveSession {
+        id,
+        mode,
+        bitrate_kbps,
+        codec,
+        stop,
+        quit,
+        force_idr,
+        client,
+        client_name,
+        plane,
+        hdr,
+        ttff_ms,
+        last_resize_ms,
+        game,
+        capture_health,
+        join,
+        controls,
+        started: std::time::Instant::now(),
+        started_unix: crate::clock::unix_secs(),
+        bit_depth,
+        chroma,
+        end_reason,
+        tally: None,
+        counters,
+        peer: peer.map(|ip| ip.to_canonical()),
+    };
+    // The opening rate, so the span has a floor before adaptive bitrate moves it. Registration
+    // is after the encoder opened, so this is what it actually runs at.
+    session
+        .counters
+        .note_bitrate(session.bitrate_kbps.load(Ordering::Relaxed));
+    // The link-health lines carry this id, so a line ties to a `/status` row.
+    session.counters.link.set_session_id(id);
+    crate::events::emit(crate::events::EventKind::SessionStarted {
+        session: session_ref(&session),
+    });
+    let mut reg = registry();
+    let sharing = shared_path(&reg, session.id, session.peer);
+    if !sharing.is_empty() {
+        // Same address is one NAT or tunnel, not proof of one bottleneck, so the
+        // governor divides only what the group is short of ([`share_for`]).
+        tracing::info!(
+            session = session.id,
+            peer = ?session.peer,
+            others = ?sharing,
+            "sessions share one client address — Automatic ones take equal shares of it"
+        );
+    }
+    reg.push(session);
+    drop(reg);
+    LiveSessionGuard {
+        id,
+        _sleep: crate::sleep_inhibit::hold(),
+    }
+}
+
+/// Drops the registry entry for this session (any video-loop scope exit).
+pub struct LiveSessionGuard {
+    /// Same id `/status` reports; the video loop's log span names it.
+    pub(crate) id: u64,
+    /// Sleep inhibit for the session lifetime: a passive viewer must not let
+    /// the box auto-suspend ([`crate::sleep_inhibit`]).
+    _sleep: crate::sleep_inhibit::StreamHold,
+}
+
+impl Drop for LiveSessionGuard {
+    /// Retires the entry, then publishes the session's own numbers twice: onto
+    /// `session.ended` for a live consumer, and into the ring a bug report reads back.
+    fn drop(&mut self) {
+        let mut reg = registry();
+        if let Some(pos) = reg.iter().position(|s| s.id == self.id) {
+            let session = reg.remove(pos);
+            drop(reg); // emit outside the registry lock; the bus takes its own
+            let summary = summary(&session);
+            push_recent(summary.clone());
+            crate::events::emit(crate::events::EventKind::SessionEnded {
+                session: session_ref(&session),
+                summary: Box::new(summary),
+            });
+        }
+    }
+}
+
+/// Eight finished sessions: the one that just broke, plus the handful before it a
+/// reporter is asked about. A host that streams for weeks must not grow a log here.
+const RECENT_SESSIONS: usize = 8;
+
+fn recent_ring() -> &'static Mutex<VecDeque<SessionSummary>> {
+    static RING: OnceLock<Mutex<VecDeque<SessionSummary>>> = OnceLock::new();
+    RING.get_or_init(|| Mutex::new(VecDeque::with_capacity(RECENT_SESSIONS)))
+}
+
+/// Newest at the front, oldest evicted. Split out so the bound is testable without
+/// the process-global ring, which every other test in this binary also writes to.
+fn push_bounded(ring: &mut VecDeque<SessionSummary>, s: SessionSummary) {
+    if ring.len() == RECENT_SESSIONS {
+        ring.pop_back();
+    }
+    ring.push_front(s);
+}
+
+fn push_recent(s: SessionSummary) {
+    push_bounded(
+        &mut recent_ring().lock().unwrap_or_else(|e| e.into_inner()),
+        s,
+    );
+}
+
+/// Finished sessions, newest first. Empty on a host that has not streamed since it
+/// started — `GET /session/last` answers with the empty list, not an error.
+pub fn recent() -> Vec<SessionSummary> {
+    recent_ring()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .cloned()
+        .collect()
+}
+
+/// Hand the video loop's totals to the registry as it finishes, so the summary the
+/// guard builds a moment later carries them. Unknown id = the entry is already gone.
+pub fn record_tally(id: u64, tally: SessionTally) {
+    if let Some(s) = registry().iter_mut().find(|s| s.id == id) {
+        s.tally = Some(tally);
+    }
+}
+
+/// Ids of the other live sessions from `peer`, oldest first.
+fn shared_path(reg: &[LiveSession], id: u64, peer: Option<std::net::IpAddr>) -> Vec<u64> {
+    let Some(peer) = peer else {
+        return Vec::new();
+    };
+    reg.iter()
+        .filter(|s| s.id != id && s.peer == Some(peer))
+        .map(|s| s.id)
+        .collect()
+}
+
+/// Report age after which a session no longer contributes to a shared path.
+/// Four 750 ms windows leave one discarded report fresh; a legacy client's
+/// startup-only sample expires.
+const DELIVERY_STALE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// A sibling silent this long has left the path as far as the governor can
+/// tell, and the survivor is handed it. Shorter would read a client's own
+/// stall as a departure.
+const GROUP_DISSOLVE: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// What the shared-path governor reads across the sessions of one client
+/// address, published by each session's control task on its own report cadence.
+///
+/// Here rather than in the control task because the governor divides a path
+/// between sessions, and no task can see its siblings' locals. Relaxed atomics
+/// carry policy inputs; the report timestamp has its own mutex.
+#[derive(Default)]
+pub struct AbrShare {
+    /// Automatic bitrate, so a share may move it. A fixed rate and a PyroWave
+    /// pin are never touched.
+    automatic: AtomicBool,
+    /// Wire rate the host put out for this session over the last window.
+    offered_kbps: AtomicU32,
+    /// What the client's last `DeliveryReport` came to. `0` = none yet.
+    delivered_kbps: AtomicU32,
+    /// The session was already streaming when that window opened, so the two
+    /// rates above are a reading of the path (`governor::Member::streaming`).
+    streaming: AtomicBool,
+    /// Non-zero delivery samples seen on the report cadence. Two distinguish a
+    /// current client from the legacy one-shot startup report.
+    delivery_samples: AtomicU32,
+    /// Arrival time of the last report. A wedged or legacy control plane must
+    /// not leave a permanent path reading.
+    last_delivery: Mutex<Option<std::time::Instant>>,
+    /// The share this session was last told (`0` = none), the most its group
+    /// has been seen to carry between them, and whether it had a group at all.
+    share_kbps: AtomicU32,
+    path_kbps: AtomicU32,
+    grouped: AtomicBool,
+}
+
+impl AbrShare {
+    /// This session's own view, as its control task takes it.
+    pub fn publish(
+        &self,
+        now: std::time::Instant,
+        automatic: bool,
+        offered_kbps: u32,
+        delivered_kbps: u32,
+        streaming: bool,
+    ) {
+        let mut last = self.last_delivery.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_none_or(|at| now.saturating_duration_since(at) > DELIVERY_STALE) {
+            self.delivery_samples.store(0, Ordering::Relaxed);
+        }
+        *last = Some(now);
+        if delivered_kbps > 0 {
+            self.delivery_samples.fetch_add(1, Ordering::Relaxed);
+        }
+        self.automatic.store(automatic, Ordering::Relaxed);
+        self.offered_kbps.store(offered_kbps, Ordering::Relaxed);
+        self.delivered_kbps.store(delivered_kbps, Ordering::Relaxed);
+        self.streaming.store(streaming, Ordering::Relaxed);
+    }
+
+    /// Whether repeated, recent reports make this a current path member.
+    fn delivery_ready(&self, now: std::time::Instant) -> bool {
+        self.delivery_samples.load(Ordering::Relaxed) >= 2
+            && self
+                .last_delivery
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some_and(|at| now.saturating_duration_since(at) <= DELIVERY_STALE)
+    }
+
+    /// Whether the last report is older than `after`, or never came.
+    fn silent_for(&self, now: std::time::Instant, after: std::time::Duration) -> bool {
+        self.last_delivery
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none_or(|at| now.saturating_duration_since(at) >= after)
+    }
+
+    /// The ceiling this session is running under. `0` = none.
+    pub fn share_kbps(&self) -> u32 {
+        self.share_kbps.load(Ordering::Relaxed)
+    }
+
+    fn note_share(&self, kbps: u32) {
+        self.share_kbps.store(kbps, Ordering::Relaxed);
+    }
+}
+
+/// This session's ceiling on the path it shares, if the governor has one to
+/// send. `None` leaves the standing share alone.
+///
+/// Every member computes the whole group and applies only its own, so a share
+/// is only ever sent by the task that owns the control stream it goes down.
+/// Only sessions with repeated, fresh delivery reports form the group; one
+/// capable reporter beside a legacy or stale client is left alone. A fixed or
+/// pinned session is never told anything. A survivor is handed the path once
+/// and holds no share afterwards: [`AbrShare::share_kbps`] reads `0`.
+pub fn share_for(id: u64, clocks: punktfunk_core::abr::governor::Clocks) -> Option<u32> {
+    share_for_at(id, std::time::Instant::now(), clocks)
+}
+
+/// Time-injected [`share_for`] for cadence and expiry tests.
+fn share_for_at(
+    id: u64,
+    now: std::time::Instant,
+    clocks: punktfunk_core::abr::governor::Clocks,
+) -> Option<u32> {
+    use punktfunk_core::abr::governor;
+    let reg = registry();
+    let me = reg.iter().find(|s| s.id == id)?;
+    if !me.counters.share.automatic.load(Ordering::Relaxed)
+        || !me.counters.share.delivery_ready(now)
+    {
+        return None;
+    }
+    let peer = me.peer?;
+    let peers: Vec<&LiveSession> = reg.iter().filter(|s| s.peer == Some(peer)).collect();
+    let group: Vec<&LiveSession> = peers
+        .iter()
+        .copied()
+        .filter(|s| s.counters.share.delivery_ready(now))
+        .collect();
+    let mine = group.iter().position(|s| s.id == id)?;
+    let share = &me.counters.share;
+    if group.len() < 2 {
+        // A sibling that stopped reporting may still be using the path: leave
+        // the standing share until every one of them has been silent long
+        // enough to have gone.
+        let silent = peers
+            .iter()
+            .filter(|s| s.id != id)
+            .all(|s| s.counters.share.silent_for(now, GROUP_DISSOLVE));
+        if !silent {
+            return None;
+        }
+        // Alone on the path: hand over the whole of what the group proved it
+        // carried, once, as a ceiling. The wall this session measured beside
+        // them was their residual, and nobody but this host knows they have gone.
+        let path = share.path_kbps.swap(0, Ordering::Relaxed);
+        if !share.grouped.swap(false, Ordering::Relaxed) || path == 0 {
+            return None;
+        }
+        share.note_share(0);
+        tracing::info!(
+            session = id,
+            peer = %peer,
+            path_kbps = path,
+            "adaptive bitrate: alone on this path again — all of it is this session's"
+        );
+        return Some(path);
+    }
+    share.grouped.store(true, Ordering::Relaxed);
+    let members: Vec<governor::Member> = group.iter().map(|s| member(s)).collect();
+    // What the path has carried for this group, kept per session because each
+    // asks on its own clock: the most it has been seen to carry, until the group
+    // is short of what it offers, which is the path being re-measured (L1). A
+    // member yet to report leaves it unmeasured, and that is never remembered.
+    let now = governor::path_kbps(&members)?;
+    let path = if governor::crowded(&members) {
+        share.path_kbps.store(now, Ordering::Relaxed);
+        now
+    } else {
+        share.path_kbps.fetch_max(now, Ordering::Relaxed).max(now)
+    };
+    let share = governor::shares(&members, path, clocks)[mine]?;
+    me.counters.share.note_share(share);
+    tracing::info!(
+        session = id,
+        peer = %peer,
+        share_kbps = share,
+        rate_kbps = me.bitrate_kbps.load(Ordering::Relaxed),
+        others = group.len() - 1,
+        "adaptive bitrate: this session's share of a path it is not alone on"
+    );
+    Some(share)
+}
+
+/// One live session as the governor reads it.
+fn member(s: &LiveSession) -> punktfunk_core::abr::governor::Member {
+    let share = &s.counters.share;
+    punktfunk_core::abr::governor::Member {
+        automatic: share.automatic.load(Ordering::Relaxed),
+        current_kbps: s.bitrate_kbps.load(Ordering::Relaxed),
+        offered_kbps: share.offered_kbps.load(Ordering::Relaxed),
+        // `0` is "no report yet": the client has not told this host anything
+        // about what is arriving, which is not the same as nothing arriving.
+        delivered_kbps: match share.delivered_kbps.load(Ordering::Relaxed) {
+            0 => None,
+            kbps => Some(kbps),
+        },
+        // The capturer's own verdict that the source has nothing new, so the
+        // host is repeating the last picture rather than encoding motion.
+        idle: s
+            .capture_health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|h| h.class == "idle"),
+        share_kbps: match share.share_kbps.load(Ordering::Relaxed) {
+            0 => None,
+            kbps => Some(kbps),
+        },
+        streaming: share.streaming.load(Ordering::Relaxed),
+    }
+}
+
+pub fn count() -> usize {
+    registry().len()
+}
+
+/// Snapshot of every live native session; mode/bitrate read live. Newest last.
+pub fn snapshot() -> Vec<SessionSnapshot> {
+    let reg = registry();
+    reg.iter()
+        .map(|s| {
+            let (width, height, fps) = crate::native::unpack_mode(s.mode.load(Ordering::Relaxed));
+            SessionSnapshot {
+                id: s.id,
+                client: s.client.clone(),
+                hdr: s.hdr,
+                join: s.join,
+                muted: s.controls.muted.load(Ordering::SeqCst),
+                grants: s.controls.grants.load(Ordering::Relaxed),
+                uptime_s: s.started.elapsed().as_secs(),
+                width,
+                height,
+                fps,
+                bitrate_kbps: s.bitrate_kbps.load(Ordering::Relaxed),
+                codec: s.codec,
+                client_name: s.client_name.clone(),
+                preset_name: s.controls.preset.as_ref().map(|p| p.name.clone()),
+                plane: s.plane,
+                capture_health: s
+                    .capture_health
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+                time_to_first_frame_ms: s.ttff_ms.load(Ordering::Relaxed),
+                last_resize_ms: s.last_resize_ms.load(Ordering::Relaxed),
+                pads: s.controls.pads(),
+                preferred_pad_slot: s.controls.player(),
+                link: s.counters.link.last(),
+                shared_path_with: shared_path(&reg, s.id, s.peer),
+            }
+        })
+        .collect()
+}
+
+/// One launched game as `/status` reports it.
+pub struct GameSnapshot {
+    /// Streaming session, or `None` if the session is gone and the game is in
+    /// its reconnect window.
+    pub session_id: Option<u64>,
+    pub client: String,
+    pub app_id: Option<String>,
+    pub title: String,
+    pub store: Option<String>,
+    pub plane: crate::events::Plane,
+    /// `launching` / `running` / `window` / `exited` / `untracked`, `grace` on
+    /// the reconnect window, or `detached`: still running, no session holds it.
+    pub state: &'static str,
+    /// `running`, and `window` will follow once the game's window is up.
+    pub awaiting_window: bool,
+    /// Seconds left before the game is ended. Set only on a `grace` row.
+    pub grace_remaining_s: Option<u64>,
+    /// Hex fingerprint of the device that launched it; `None` if anonymous.
+    pub launched_by: Option<String>,
+}
+
+/// Compat plane's launched game, while it has one.
+///
+/// GameStream is not in the native registry: that holds the loop's `Arc`
+/// handles, which the compat plane does not have. One `AppState.launch`
+/// means one slot; this is what keeps a Moonlight game on `/status`
+/// alongside a native session.
+fn gs_game() -> &'static Mutex<Option<Arc<crate::gamelease::LeaseShared>>> {
+    static SLOT: OnceLock<Mutex<Option<Arc<crate::gamelease::LeaseShared>>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Publish the compat plane's game. The guard retracts it on any stream-loop
+/// exit ([`LiveSessionGuard`]'s counterpart).
+pub fn publish_gamestream_game(shared: Arc<crate::gamelease::LeaseShared>) -> GamestreamGameGuard {
+    *gs_game().lock().unwrap_or_else(|e| e.into_inner()) = Some(shared);
+    GamestreamGameGuard
+}
+
+/// Retracts the compat plane's published game on drop.
+pub struct GamestreamGameGuard;
+
+impl Drop for GamestreamGameGuard {
+    fn drop(&mut self) {
+        *gs_game().lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// Every launched game the host currently knows: live sessions first, then
+/// the compat plane, then games waiting out a reconnect window, then launches
+/// still running with no session ([`crate::launchreg::detached`]).
+///
+/// Sources stay separate — a grace-pending or detached game has no session
+/// to hang off, and omitting it would hide a game the player can still end.
+pub fn games() -> Vec<GameSnapshot> {
+    let mut out: Vec<GameSnapshot> = registry()
+        .iter()
+        .filter_map(|s| {
+            let g = s.game.as_ref()?;
+            Some(GameSnapshot {
+                session_id: Some(s.id),
+                client: g.client.clone(),
+                app_id: g.game.id.clone(),
+                title: g.game.title.clone(),
+                store: g.game.store.clone(),
+                plane: g.plane,
+                state: g.state().as_str(),
+                awaiting_window: g.awaits_window(),
+                grace_remaining_s: None,
+                launched_by: g.fingerprint.clone(),
+            })
+        })
+        .collect();
+    out.extend(
+        gs_game()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|g| GameSnapshot {
+                // Compat plane has no session id. State is never `grace` while
+                // streaming, so the console tells this from a grace row by state.
+                session_id: None,
+                client: g.client.clone(),
+                app_id: g.game.id.clone(),
+                title: g.game.title.clone(),
+                store: g.game.store.clone(),
+                plane: g.plane,
+                state: g.state().as_str(),
+                awaiting_window: g.awaits_window(),
+                grace_remaining_s: None,
+                launched_by: g.fingerprint.clone(),
+            }),
+    );
+    out.extend(
+        crate::gamelease::pending_snapshot()
+            .into_iter()
+            .map(|(g, remaining)| GameSnapshot {
+                session_id: None,
+                client: g.client.clone(),
+                app_id: g.game.id.clone(),
+                title: g.game.title.clone(),
+                store: g.game.store.clone(),
+                plane: g.plane,
+                state: "grace",
+                awaiting_window: false,
+                grace_remaining_s: Some(remaining),
+                launched_by: g.fingerprint.clone(),
+            }),
+    );
+    out.extend(
+        crate::launchreg::detached()
+            .into_iter()
+            .map(|d| GameSnapshot {
+                session_id: None,
+                client: d.client().to_string(),
+                app_id: d.game.id.clone(),
+                title: d.game.title.clone(),
+                store: d.game.store.clone(),
+                plane: d.plane,
+                state: "detached",
+                awaiting_window: false,
+                grace_remaining_s: None,
+                launched_by: Some(d.fingerprint),
+            }),
+    );
+    out
+}
+
+/// Leases on games that are still on a streaming session, filtered by `app_id`
+/// (`None` = all of them). What `POST /game/end` reaches when a title is up
+/// rather than waiting out a reconnect window.
+pub fn live_games(app_id: Option<&str>) -> Vec<Arc<crate::gamelease::LeaseShared>> {
+    let mine =
+        |g: &Arc<crate::gamelease::LeaseShared>| app_id.is_none() || g.game.id.as_deref() == app_id;
+    let mut out: Vec<Arc<crate::gamelease::LeaseShared>> = registry()
+        .iter()
+        .filter_map(|s| s.game.clone())
+        .filter(&mine)
+        .collect();
+    out.extend(
+        gs_game()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|g| mine(g))
+            .cloned(),
+    );
+    out
+}
+
+/// Tear down every live native session. Best-effort: loops observe the
+/// flag and exit; the guard then clears the entry. Not intended teardown —
+/// prefer [`stop_all_quit`] for an operator action.
+pub fn stop_all() {
+    for s in registry().iter() {
+        s.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Tear down live native sessions for `fp_hex` (lowercase hex cert SHA-256)
+/// deliberately — unpair must not leave a mid-stream client streaming.
+///
+/// Match is the registry client label: the fingerprint's 12-hex prefix.
+/// An anonymous/TOFU session carries an IP label and never matches.
+/// Returns how many sessions were signalled.
+pub fn stop_by_fingerprint(fp_hex: &str) -> usize {
+    let mut n = 0;
+    for s in registry().iter() {
+        if s.client.len() == 12 && fp_hex.starts_with(s.client.as_str()) {
+            SessionEndReason::StoppedByOperator.latch(&s.end_reason);
+            s.quit.store(true, Ordering::SeqCst);
+            s.stop.store(true, Ordering::SeqCst);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Whether any live native session belongs to a client other than `fp_hex`.
+///
+/// Busy check for host-power: a granted guest must not power off the host
+/// while someone else is streaming. Label match as in [`stop_by_fingerprint`].
+/// An anonymous IP-labelled session always counts as another client.
+pub fn other_client_live(fp_hex: &str) -> bool {
+    registry()
+        .iter()
+        .any(|s| !(s.client.len() == 12 && fp_hex.starts_with(s.client.as_str())))
+}
+
+/// Whether `fp_hex` owns a live session: its own display, not a join onto another's.
+///
+/// Who may switch the streamed monitor (`display.next`). Label match as in
+/// [`stop_by_fingerprint`], so an anonymous IP-labelled session owns nothing.
+pub fn owns_live_session(fp_hex: &str) -> bool {
+    registry()
+        .iter()
+        .any(|s| !s.join && s.client.len() == 12 && fp_hex.starts_with(s.client.as_str()))
+}
+
+/// Tear down every live native session deliberately (mgmt `DELETE /session`).
+///
+/// Sets `quit` before `stop` so teardown matches a client's own Stop: the
+/// display skips keep-alive linger and end-game-on-session-end sees intent.
+/// The summary says `stopped_by_operator`; the client only ever sees `host_ended`.
+pub fn stop_all_quit() {
+    for s in registry().iter() {
+        SessionEndReason::StoppedByOperator.latch(&s.end_reason);
+        s.quit.store(true, Ordering::SeqCst);
+        s.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Tear down ONE live native session deliberately (`DELETE /session/{id}`).
+/// `false` = no such session. Same `quit`-before-`stop` order and same
+/// `stopped_by_operator` summary as [`stop_all_quit`].
+pub fn stop_quit(id: u64) -> bool {
+    with_session(id, |s| {
+        SessionEndReason::StoppedByOperator.latch(&s.end_reason);
+        s.quit.store(true, Ordering::SeqCst);
+        s.stop.store(true, Ordering::SeqCst);
+    })
+    .is_some()
+}
+
+/// Force a keyframe on ONE live native session (`POST /session/{id}/idr`).
+/// `false` = no such session.
+pub fn force_idr(id: u64) -> bool {
+    with_session(id, |s| s.force_idr.store(true, Ordering::Relaxed)).is_some()
+}
+
+/// Whether this session is served by the plane whose per-session mute, access and player
+/// lanes exist. `None` = no such session. The compat plane registers (so it has an id, a
+/// stop and a keyframe) but carries none of those three.
+pub fn has_native_lanes(id: u64) -> Option<bool> {
+    with_session(id, |s| s.plane != crate::events::Plane::Gamestream)
+}
+
+/// This session's management handles, cloned out so the caller acts without the
+/// registry lock. `None` = no such session (the routes' 404).
+pub fn controls(id: u64) -> Option<SessionControls> {
+    with_session(id, |s| s.controls.clone())
+}
+
+/// Force a keyframe on every live native session (`POST /session/idr`).
+/// The encode loop drains the flag like a client decode-recovery request.
+pub fn force_idr_all() {
+    for s in registry().iter() {
+        s.force_idr.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// Controller-only passes the pad and counts keyboard and pointer drops per class;
+    /// the summary lists only classes that dropped, in bit order.
+    #[test]
+    fn grant_drops_pass_the_granted_class_and_count_the_rest() {
+        use punktfunk_core::input::InputKind;
+        use punktfunk_core::quic::{classify, GRANT_PRESET_CONTROLLER_ONLY};
+        let mut drops = GrantDrops::new(Plane::Gamestream);
+        assert_eq!(drops.summary(), None);
+        let mask = GRANT_PRESET_CONTROLLER_ONLY;
+        assert!(drops.permitted(mask, classify(InputKind::GamepadButton)));
+        assert!(!drops.permitted(mask, classify(InputKind::KeyDown)));
+        assert!(!drops.permitted(mask, classify(InputKind::TextInput)));
+        assert!(!drops.permitted(mask, classify(InputKind::MouseMove)));
+        assert!(!drops.permitted(mask, GrantClass::Pointer));
+        drops.note(GrantClass::Mic);
+        assert_eq!(
+            drops.summary().as_deref(),
+            Some("Pointer=2 Keyboard=2 Mic=1")
+        );
+    }
+
+    /// The live-session registry is one table for the whole test binary: a
+    /// session one test registers is an active stream to another test's route,
+    /// a row in its `/status`, and an entry in the recent ring. Every test that
+    /// registers a session or reads the registry's shape holds this.
+    ///
+    /// A test that also needs `native::tests`' admission lock takes this one
+    /// first. One order, so the pair cannot deadlock.
+    pub(crate) static REGISTRY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// The registry lock for a test that has no runtime of its own.
+    /// [`tokio::sync::Mutex::blocking_lock`] panics inside one, so an
+    /// `#[tokio::test]` takes `REGISTRY.lock().await` instead.
+    pub(crate) fn registry_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        REGISTRY.blocking_lock()
+    }
+
+    /// A compat-plane session is a registry entry like any other, which is what gives the
+    /// console an id to stop — before, a Moonlight session could only be ended host-wide.
+    #[test]
+    fn a_compat_session_is_stoppable_by_its_own_id() {
+        let _registry = registry_lock();
+        let stop = Arc::new(AtomicBool::new(false));
+        let quit = Arc::new(AtomicBool::new(false));
+        let _guard = register(Registration {
+            stop: stop.clone(),
+            quit: quit.clone(),
+            client_name: Some("Living Room TV".into()),
+            plane: crate::events::Plane::Gamestream,
+            hdr: true,
+            bit_depth: 10,
+            ..Registration::fake("9f86d0818840")
+        });
+        let row = snapshot()
+            .into_iter()
+            .find(|s| s.plane == crate::events::Plane::Gamestream)
+            .expect("the compat session is listed like a native one");
+        assert_eq!(row.client_name.as_deref(), Some("Living Room TV"));
+        assert!(stop_quit(row.id), "its id addresses it");
+        assert!(
+            stop.load(Ordering::SeqCst),
+            "the stream loop is told to end"
+        );
+        assert!(
+            quit.load(Ordering::SeqCst),
+            "and that the end was deliberate"
+        );
+        assert!(!stop_quit(u64::MAX), "an id nothing holds stops nothing");
+    }
+
+    impl Registration {
+        /// A native 8-bit H.265 session for `client` at 20 Mbps, every handle fresh and
+        /// zeroed, no peer. A test overrides only the fields it reads.
+        pub(crate) fn fake(client: &str) -> Registration {
+            Registration {
+                mode: Arc::new(AtomicU64::new(0)),
+                bitrate_kbps: Arc::new(AtomicU32::new(20_000)),
+                codec: Codec::H265,
+                stop: Arc::new(AtomicBool::new(false)),
+                quit: Arc::new(AtomicBool::new(false)),
+                force_idr: Arc::new(AtomicBool::new(false)),
+                client: client.into(),
+                client_name: None,
+                plane: crate::events::Plane::Native,
+                hdr: false,
+                ttff_ms: Arc::new(AtomicU32::new(0)),
+                last_resize_ms: Arc::new(AtomicU32::new(0)),
+                game: None,
+                capture_health: Arc::new(Mutex::new(None)),
+                join: false,
+                controls: SessionControls::open(),
+                bit_depth: 8,
+                chroma: ChromaFormat::Yuv420,
+                end_reason: Arc::new(AtomicU8::new(0)),
+                counters: Arc::new(SessionCounters::default()),
+                peer: None,
+            }
+        }
+    }
+
+    fn fake_session(client: &str) -> (LiveSessionGuard, Arc<AtomicBool>, Arc<AtomicBool>) {
+        fake_session_with_reason(
+            client,
+            Arc::new(AtomicU8::new(0)),
+            Arc::new(SessionCounters::default()),
+        )
+    }
+
+    fn fake_session_with_reason(
+        client: &str,
+        end_reason: Arc<AtomicU8>,
+        counters: Arc<SessionCounters>,
+    ) -> (LiveSessionGuard, Arc<AtomicBool>, Arc<AtomicBool>) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let quit = Arc::new(AtomicBool::new(false));
+        let guard = register(Registration {
+            stop: stop.clone(),
+            quit: quit.clone(),
+            end_reason,
+            counters,
+            ..Registration::fake(client)
+        });
+        (guard, stop, quit)
+    }
+
+    /// A panic under the registry lock costs the next caller nothing: a new session
+    /// registers, and the per-id and host-wide stops still reach it.
+    #[test]
+    fn a_poisoned_registry_keeps_answering() {
+        let _registry = registry_lock();
+        let _ = std::thread::spawn(|| {
+            let _held = registry();
+            panic!("poison the registry");
+        })
+        .join();
+        let (guard, stop, quit) = fake_session("aabbccddeeff");
+        assert!(count() >= 1);
+        assert!(force_idr(guard.id), "the per-id routes find it");
+        stop_all_quit();
+        assert!(stop.load(Ordering::SeqCst) && quit.load(Ordering::SeqCst));
+    }
+
+    fn fake_joiner(client: &str, join: bool) -> (LiveSessionGuard, SessionControls) {
+        fake_at(client, join, None)
+    }
+
+    fn fake_at(
+        client: &str,
+        join: bool,
+        peer: Option<std::net::IpAddr>,
+    ) -> (LiveSessionGuard, SessionControls) {
+        let controls = SessionControls::open();
+        let guard = register(Registration {
+            join,
+            controls: controls.clone(),
+            peer,
+            ..Registration::fake(client)
+        });
+        (guard, controls)
+    }
+
+    /// A live session at `peer` with its own counter block, so a test can
+    /// publish what the governor reads and move the rate it hands out.
+    pub(crate) fn fake_member(
+        client: &str,
+        peer: std::net::IpAddr,
+        kbps: u32,
+    ) -> (LiveSessionGuard, Arc<SessionCounters>, Arc<AtomicU32>) {
+        let counters = Arc::new(SessionCounters::default());
+        let bitrate_kbps = Arc::new(AtomicU32::new(kbps));
+        let guard = register(Registration {
+            bitrate_kbps: bitrate_kbps.clone(),
+            counters: counters.clone(),
+            peer: Some(peer),
+            ..Registration::fake(client)
+        });
+        (guard, counters, bitrate_kbps)
+    }
+
+    fn both_clocks() -> punktfunk_core::abr::governor::Clocks {
+        punktfunk_core::abr::governor::Clocks {
+            room: true,
+            lift: true,
+        }
+    }
+
+    /// Publish two non-zero cadence samples, which makes a member current.
+    fn publish_ready(
+        counters: &SessionCounters,
+        now: std::time::Instant,
+        automatic: bool,
+        offered_kbps: u32,
+        delivered_kbps: u32,
+    ) -> std::time::Instant {
+        counters
+            .share
+            .publish(now, automatic, offered_kbps, delivered_kbps, true);
+        let ready = now + std::time::Duration::from_millis(750);
+        counters
+            .share
+            .publish(ready, automatic, offered_kbps, delivered_kbps, true);
+        ready
+    }
+
+    /// Two Automatic sessions from one address, each asking an 18 Mbps path
+    /// for 12: each is told half of what is actually arriving.
+    #[test]
+    fn two_automatic_sessions_on_one_address_take_equal_shares() {
+        let _registry = registry_lock();
+        let peer: std::net::IpAddr = "203.0.113.90".parse().unwrap();
+        let (a, ac, _ar) = fake_member("phone", peer, 12_000);
+        let (b, bc, _br) = fake_member("pc", peer, 12_000);
+        let now = std::time::Instant::now();
+        let ready = publish_ready(&ac, now, true, 12_000, 9_000);
+        publish_ready(&bc, now, true, 12_000, 9_000);
+        assert_eq!(share_for_at(a.id, ready, both_clocks()), Some(9_000));
+        assert_eq!(share_for_at(b.id, ready, both_clocks()), Some(9_000));
+        assert_eq!(ac.share.share_kbps(), 9_000, "and it is remembered");
+    }
+
+    /// One startup sample does not prove a report cadence; the second fresh
+    /// sample admits both members and produces the ordinary equal split.
+    #[test]
+    fn two_fresh_samples_are_required_before_a_group_is_governed() {
+        let _registry = registry_lock();
+        let peer: std::net::IpAddr = "203.0.113.96".parse().unwrap();
+        let (a, ac, _ar) = fake_member("phone", peer, 12_000);
+        let (_b, bc, _br) = fake_member("pc", peer, 12_000);
+        let now = std::time::Instant::now();
+        for c in [&ac, &bc] {
+            c.share.publish(now, true, 12_000, 9_000, true);
+        }
+        assert_eq!(share_for_at(a.id, now, both_clocks()), None);
+        let ready = now + std::time::Duration::from_millis(750);
+        for c in [&ac, &bc] {
+            c.share.publish(ready, true, 12_000, 9_000, true);
+        }
+        assert_eq!(share_for_at(a.id, ready, both_clocks()), Some(9_000));
+    }
+
+    /// A new client beside a legacy startup-only reporter is one capable
+    /// member, not a group with a permanent stale second path reading.
+    #[test]
+    fn a_mixed_old_and_new_pair_is_left_ungoverned() {
+        let _registry = registry_lock();
+        let peer: std::net::IpAddr = "203.0.113.97".parse().unwrap();
+        let (_old, old_c, _or) = fake_member("old", peer, 12_000);
+        let (new, new_c, _nr) = fake_member("new", peer, 12_000);
+        let now = std::time::Instant::now();
+        old_c.share.publish(now, true, 12_000, 9_000, true);
+        let ready = publish_ready(&new_c, now, true, 12_000, 9_000);
+        assert_eq!(share_for_at(new.id, ready, both_clocks()), None);
+        assert_eq!(old_c.share.share_kbps(), 0);
+        assert_eq!(new_c.share.share_kbps(), 0);
+    }
+
+    /// A sibling whose reports stop is excluded without handing its share to
+    /// the current member: the stale session is still live and may consume it.
+    #[test]
+    fn a_stale_sibling_neither_governs_nor_triggers_a_handback() {
+        let _registry = registry_lock();
+        let peer: std::net::IpAddr = "203.0.113.98".parse().unwrap();
+        let (a, ac, _ar) = fake_member("phone", peer, 12_000);
+        let (_b, bc, _br) = fake_member("pc", peer, 12_000);
+        let now = std::time::Instant::now();
+        let ready = publish_ready(&ac, now, true, 12_000, 9_000);
+        publish_ready(&bc, now, true, 12_000, 9_000);
+        assert_eq!(share_for_at(a.id, ready, both_clocks()), Some(9_000));
+        let stale = ready + DELIVERY_STALE + std::time::Duration::from_millis(1);
+        publish_ready(
+            &ac,
+            stale - std::time::Duration::from_millis(750),
+            true,
+            12_000,
+            9_000,
+        );
+        assert!(!bc.share.delivery_ready(stale));
+        assert_eq!(share_for_at(a.id, stale, both_clocks()), None);
+        assert_eq!(ac.share.share_kbps(), 9_000, "no stale-sibling handback");
+    }
+
+    /// What the control task asks the governor with: registration stamps the
+    /// session's id onto the counter block its side threads already hold, and
+    /// that id is what `share_for` takes. A source that never registers leaves
+    /// it `0`, which the control task reads as "nothing to share with".
+    #[test]
+    fn registration_latches_the_id_the_governor_is_asked_for() {
+        let _registry = registry_lock();
+        let peer: std::net::IpAddr = "203.0.113.95".parse().unwrap();
+        let (a, ac, _ar) = fake_member("phone", peer, 12_000);
+        let (b, bc, _br) = fake_member("pc", peer, 12_000);
+        let now = std::time::Instant::now();
+        let ready = publish_ready(&ac, now, true, 12_000, 9_000);
+        publish_ready(&bc, now, true, 12_000, 9_000);
+        assert_eq!(ac.link.session_id(), a.id, "the id the link lines carry");
+        assert_eq!(bc.link.session_id(), b.id);
+        assert_ne!(ac.link.session_id(), 0);
+        assert_eq!(
+            share_for_at(ac.link.session_id(), ready, both_clocks()),
+            Some(9_000)
+        );
+        assert_eq!(
+            share_for_at(bc.link.session_id(), ready, both_clocks()),
+            Some(9_000)
+        );
+    }
+
+    /// A fixed-rate session takes what it is set to off the top and is never
+    /// told anything; the Automatic one gets what is left.
+    #[test]
+    fn a_fixed_rate_session_is_never_told_a_share() {
+        let _registry = registry_lock();
+        let peer: std::net::IpAddr = "203.0.113.91".parse().unwrap();
+        let (auto, auto_c, _ar) = fake_member("phone", peer, 14_000);
+        let (fixed, fixed_c, _fr) = fake_member("pc", peer, 8_000);
+        let now = std::time::Instant::now();
+        let ready = publish_ready(&auto_c, now, true, 14_000, 10_000);
+        publish_ready(&fixed_c, now, false, 8_000, 8_000);
+        assert_eq!(share_for_at(fixed.id, ready, both_clocks()), None);
+        assert_eq!(fixed_c.share.share_kbps(), 0, "nothing was written either");
+        assert_eq!(
+            share_for_at(auto.id, ready, both_clocks()),
+            Some(10_000),
+            "18 Mbps arriving, less the fixed 8"
+        );
+    }
+
+    /// One session is not a group, whatever it reports.
+    #[test]
+    fn a_session_alone_on_its_address_is_never_governed() {
+        let _registry = registry_lock();
+        let peer: std::net::IpAddr = "203.0.113.92".parse().unwrap();
+        let (only, c, _r) = fake_member("phone", peer, 20_000);
+        let now = std::time::Instant::now();
+        let ready = publish_ready(&c, now, true, 20_000, 9_000);
+        assert_eq!(share_for_at(only.id, ready, both_clocks()), None);
+    }
+
+    /// A path that has degraded since the group's best window: the moment they
+    /// are short of what they offer, the group has re-measured it, and the
+    /// survivor is handed what it carries now rather than what it once did.
+    #[test]
+    fn a_path_that_shrank_is_not_handed_over_at_its_old_figure() {
+        let _registry = registry_lock();
+        let peer: std::net::IpAddr = "203.0.113.94".parse().unwrap();
+        let (a, ac, _ar) = fake_member("phone", peer, 15_000);
+        let (b, bc, _br) = fake_member("pc", peer, 15_000);
+        let now = std::time::Instant::now();
+        // Both clean at 15 Mbps: the pair has carried 30 between them.
+        let ready = publish_ready(&ac, now, true, 15_000, 15_000);
+        publish_ready(&bc, now, true, 15_000, 15_000);
+        assert_eq!(
+            share_for_at(a.id, ready, both_clocks()),
+            None,
+            "nothing to divide"
+        );
+        assert_eq!(ac.share.path_kbps.load(Ordering::Relaxed), 30_000);
+        // The path halves. Both are short, so what it carried before is gone.
+        let short_at = ready + std::time::Duration::from_millis(750);
+        for c in [&ac, &bc] {
+            c.share.publish(short_at, true, 15_000, 6_000, true);
+        }
+        assert_eq!(
+            share_for_at(a.id, short_at, both_clocks()),
+            Some(6_000),
+            "half of 12"
+        );
+        drop(b);
+        assert_eq!(
+            share_for_at(a.id, short_at, both_clocks()),
+            Some(12_000),
+            "the path as it is now, not the 30 000 the pair once carried"
+        );
+    }
+
+    /// The sibling leaves: the survivor is handed the whole of what the pair
+    /// proved the path carried, because the wall it measured beside them was
+    /// their residual. Once, and then never again.
+    #[test]
+    fn a_survivor_is_handed_the_path_its_group_proved() {
+        let _registry = registry_lock();
+        let peer: std::net::IpAddr = "203.0.113.93".parse().unwrap();
+        let (a, ac, _ar) = fake_member("phone", peer, 12_000);
+        let (b, bc, _br) = fake_member("pc", peer, 12_000);
+        let now = std::time::Instant::now();
+        let ready = publish_ready(&ac, now, true, 12_000, 9_000);
+        publish_ready(&bc, now, true, 12_000, 9_000);
+        assert_eq!(share_for_at(a.id, ready, both_clocks()), Some(9_000));
+        drop(b);
+        assert_eq!(
+            share_for_at(a.id, ready, both_clocks()),
+            Some(18_000),
+            "all of what the two of them were carrying"
+        );
+        assert_eq!(ac.share.share_kbps(), 0, "as a ceiling: nothing binds it");
+        assert_eq!(
+            share_for_at(a.id, ready, both_clocks()),
+            None,
+            "and only the once"
+        );
+    }
+
+    /// A fixed-rate survivor is never handed the path: nothing may move a rate
+    /// the player set, or a PyroWave pin.
+    #[test]
+    fn a_fixed_rate_survivor_is_never_handed_the_path() {
+        let _registry = registry_lock();
+        let peer: std::net::IpAddr = "203.0.113.89".parse().unwrap();
+        let (auto, auto_c, _ar) = fake_member("phone", peer, 14_000);
+        let (fixed, fixed_c, _fr) = fake_member("pc", peer, 8_000);
+        let now = std::time::Instant::now();
+        let ready = publish_ready(&auto_c, now, true, 14_000, 10_000);
+        publish_ready(&fixed_c, now, false, 8_000, 8_000);
+        assert_eq!(share_for_at(fixed.id, ready, both_clocks()), None);
+        assert_eq!(share_for_at(auto.id, ready, both_clocks()), Some(10_000));
+        drop(auto);
+        assert_eq!(share_for_at(fixed.id, ready, both_clocks()), None);
+        assert_eq!(fixed_c.share.share_kbps(), 0);
+    }
+
+    /// A sibling silent for [`GROUP_DISSOLVE`] has gone as far as the governor
+    /// can tell: the survivor is handed the path, and the share it held goes.
+    #[test]
+    fn a_long_silent_sibling_hands_the_path_over() {
+        let _registry = registry_lock();
+        let peer: std::net::IpAddr = "203.0.113.88".parse().unwrap();
+        let (a, ac, _ar) = fake_member("phone", peer, 12_000);
+        let (_b, bc, _br) = fake_member("pc", peer, 12_000);
+        let now = std::time::Instant::now();
+        let ready = publish_ready(&ac, now, true, 12_000, 9_000);
+        publish_ready(&bc, now, true, 12_000, 9_000);
+        assert_eq!(share_for_at(a.id, ready, both_clocks()), Some(9_000));
+        let gone = ready + GROUP_DISSOLVE;
+        publish_ready(
+            &ac,
+            gone - std::time::Duration::from_millis(750),
+            true,
+            12_000,
+            9_000,
+        );
+        assert_eq!(share_for_at(a.id, gone, both_clocks()), Some(18_000));
+        assert_eq!(ac.share.share_kbps(), 0);
+    }
+
+    /// One address is one NAT or tunnel: each session names the others there, and an
+    /// IPv4-mapped IPv6 peer is the same address.
+    #[test]
+    fn sessions_from_one_address_name_each_other() {
+        let _registry = registry_lock();
+        let v4: std::net::IpAddr = "203.0.113.77".parse().unwrap();
+        let mapped: std::net::IpAddr = "::ffff:203.0.113.77".parse().unwrap();
+        let (a, _) = fake_at("phone", false, Some(v4));
+        let (b, _) = fake_at("pc", false, Some(mapped));
+        let (c, _) = fake_at("tv", false, Some("203.0.113.78".parse().unwrap()));
+        let rows = snapshot();
+        let with = |id| {
+            rows.iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .shared_path_with
+                .clone()
+        };
+        assert_eq!(with(a.id), vec![b.id]);
+        assert_eq!(with(b.id), vec![a.id]);
+        assert!(with(c.id).is_empty());
+        drop(b);
+        assert!(snapshot()
+            .iter()
+            .find(|s| s.id == a.id)
+            .unwrap()
+            .shared_path_with
+            .is_empty());
+    }
+
+    #[test]
+    fn policy_picks_the_sessions_it_names() {
+        use AudioSessions::*;
+        // (policy, client, join) → muted
+        for (policy, client, join, want) in [
+            (All, "aaaaaaaaaaaa", true, false),
+            (Owner, "aaaaaaaaaaaa", false, false),
+            (Owner, "bbbbbbbbbbbb", true, true),
+            (Joined, "aaaaaaaaaaaa", false, true),
+            (Joined, "bbbbbbbbbbbb", true, false),
+            (Launcher, "aaaaaaaaaaaa", false, false),
+            (Launcher, "bbbbbbbbbbbb", true, true),
+        ] {
+            assert_eq!(
+                policy_mutes(policy, "aaaaaaaaaaaa", client, join),
+                want,
+                "{policy:?} {client} join={join}"
+            );
+        }
+    }
+
+    /// A policy mutes by role, reaches a joiner that registers later, and its end
+    /// unmutes only what it muted: an operator's own mute stays.
+    #[test]
+    fn policy_mute_reaches_late_joiners_and_lifts_at_the_end() {
+        let _registry = registry_lock();
+        let (_owner, owner) = fake_joiner("cccccccccccc", false);
+        let guard = apply_audio_policy(AudioSessions::Owner, "cccccccccccc");
+        let (_joiner, joiner) = fake_joiner("dddddddddddd", true);
+        assert!(!owner.muted.load(Ordering::SeqCst));
+        assert!(
+            joiner.muted.load(Ordering::SeqCst),
+            "a joiner registered under the policy is muted"
+        );
+        owner.set_muted(true);
+        drop(guard);
+        assert!(
+            !joiner.muted.load(Ordering::SeqCst),
+            "the lease ending lifts the policy mute"
+        );
+        assert!(
+            owner.muted.load(Ordering::SeqCst),
+            "the operator's mute outlives the policy"
+        );
+    }
+
+    /// The owner of a live display may switch its monitor; a joiner watching it, a device with
+    /// nothing live, and an anonymous IP-labelled session may not.
+    #[test]
+    fn only_the_owner_of_a_live_display_owns_a_session() {
+        let _registry = registry_lock();
+        let owner = "cccccccccccc0011223344556677";
+        let joiner = "dddddddddddd0011223344556677";
+        assert!(!owns_live_session(owner), "nothing live yet");
+        let (_o, _) = fake_joiner(&owner[..12], false);
+        let (_j, _) = fake_joiner(&joiner[..12], true);
+        let (_a, ..) = fake_session("192.168.1.50");
+        assert!(owns_live_session(owner));
+        assert!(
+            !owns_live_session(joiner),
+            "a joiner follows the owner's picture"
+        );
+        assert!(!owns_live_session("eeeeeeeeeeee0011223344556677"));
+    }
+
+    /// A second lease replaces the first; the first to end lifts both, so nothing the
+    /// replaced policy muted stays muted with no policy left to lift it.
+    #[test]
+    fn a_replaced_policy_mute_still_lifts() {
+        let _registry = registry_lock();
+        let (_owner, _o) = fake_joiner("eeeeeeeeeeee", false);
+        let (_joiner, joiner) = fake_joiner("ffffffffffff", true);
+        let first = apply_audio_policy(AudioSessions::Launcher, "eeeeeeeeeeee");
+        assert!(joiner.muted.load(Ordering::SeqCst));
+        let second = apply_audio_policy(AudioSessions::All, "eeeeeeeeeeee");
+        drop(first);
+        assert!(
+            !joiner.muted.load(Ordering::SeqCst),
+            "the first lease ending lifts what either policy muted"
+        );
+        drop(second);
+    }
+
+    /// Unpair revokes a live session by the 12-hex fingerprint prefix
+    /// (`quit` + `stop`). Other clients and IP-labelled sessions stay up.
+    #[test]
+    fn stop_by_fingerprint_revokes_exactly_the_unpaired_client() {
+        let _registry = registry_lock();
+        let fp = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+        let (_g1, stop1, quit1) = fake_session(&fp[..12]);
+        let (_g2, stop2, _q2) = fake_session("112233445566"); // a different paired client
+        let (_g3, stop3, _q3) = fake_session("192.168.1.50"); // anonymous: IP label, never matches
+
+        assert_eq!(stop_by_fingerprint(fp), 1);
+        assert!(stop1.load(Ordering::SeqCst) && quit1.load(Ordering::SeqCst));
+        assert!(!stop2.load(Ordering::SeqCst));
+        assert!(!stop3.load(Ordering::SeqCst));
+    }
+
+    /// Each registered session carries its own pad feed, so a Controllers stream
+    /// opened on one id can never draw another session's input.
+    #[tokio::test]
+    async fn each_session_holds_its_own_pad_feed() {
+        let (a, _s, _q) = fake_session("aaaaaaaaaaaa");
+        let (b, _s2, _q2) = fake_session("bbbbbbbbbbbb");
+        let feed_a = controls(a.id).expect("A is live").pads;
+        let feed_b = controls(b.id).expect("B is live").pads;
+        assert!(!Arc::ptr_eq(&feed_a, &feed_b));
+
+        let mut rx = feed_a.subscribe();
+        // B has no subscriber, so its publish is a no-op; A's must not receive it either way.
+        feed_b.publish(|| unreachable!("an unwatched feed must not build a frame"));
+        assert!(rx.try_recv().is_err(), "A's stream holds only A's pads");
+    }
+
+    /// A Moonlight game has no live-session entry, so it is only on `/status`
+    /// while [`publish_gamestream_game`]'s guard is alive.
+    #[test]
+    fn a_gamestream_game_is_visible_only_while_its_stream_runs() {
+        let _registry = registry_lock();
+        let id = "steam:1701";
+        let mine = || {
+            games()
+                .into_iter()
+                .find(|g| g.app_id.as_deref() == Some(id))
+        };
+
+        let lease = crate::gamelease::open(
+            crate::gamelease::LeaseRequest {
+                game: crate::gamelease::GameRef {
+                    id: Some(id.to_string()),
+                    store: Some("steam".into()),
+                    title: "Test Title".into(),
+                },
+                client: "192.0.2.7".into(),
+                fingerprint: None,
+                preset: None,
+                plane: crate::events::Plane::Gamestream,
+                // No signals: inert lease, so no watcher thread races the assertions.
+                spec: crate::library::DetectSpec::default(),
+                nested: false,
+                scope_pid: None,
+                launcher: false,
+                child: None,
+                spawned: None,
+                launch_stamp: None,
+                procs: None,
+                #[cfg(target_os = "linux")]
+                workspace: None,
+                window: None,
+                outcome: None,
+            },
+            Box::new(|| {}),
+        );
+        assert!(mine().is_none(), "not published yet");
+
+        {
+            let _pub = publish_gamestream_game(lease.shared());
+            let row = mine().expect("the compat plane's game is reported");
+            assert_eq!(
+                row.session_id, None,
+                "no live-session entry to attribute it to"
+            );
+            assert_eq!(row.plane, crate::events::Plane::Gamestream);
+            assert_eq!(row.client, "192.0.2.7");
+            assert_eq!(row.title, "Test Title");
+            // Not `grace` while the stream is up: the console keys
+            // countdown / End now off that state.
+            assert_ne!(row.state, "grace");
+            // The same row is what `POST /game/end` reaches with `streaming`,
+            // and only ever under its own id.
+            assert_eq!(live_games(Some(id)).len(), 1);
+            assert!(live_games(Some("steam:9999")).is_empty());
+        }
+        assert!(mine().is_none(), "the row goes with the stream");
+        assert!(
+            live_games(Some(id)).is_empty(),
+            "a game with no stream left is the grace registry's, not this list's"
+        );
+    }
+
+    fn one_summary(id: u64) -> SessionSummary {
+        SessionSummary {
+            id,
+            client: "192.0.2.7".into(),
+            client_name: None,
+            started_unix: 0,
+            duration_s: 0,
+            mode: "1920x1080@60".into(),
+            hdr: false,
+            join: false,
+            codec: "hevc".into(),
+            bit_depth: 8,
+            chroma: "4:2:0".into(),
+            bitrate_kbps: 0,
+            bitrate: None,
+            frames_sent: None,
+            frames_dropped: None,
+            input: InputCounts {
+                events: 0,
+                mic: 0,
+                rich: 0,
+                dropped: 0,
+            },
+            gyro: None,
+            audio: None,
+            bringup_ms: 0,
+            path_mtu: None,
+            ended: SessionEndReason::HostEnded,
+        }
+    }
+
+    /// A host that has not streamed answers with nothing, and a host that streams for
+    /// weeks still answers with eight — newest first.
+    #[test]
+    fn the_recent_ring_starts_empty_and_keeps_only_the_newest() {
+        let mut ring: VecDeque<SessionSummary> = VecDeque::new();
+        assert!(ring.iter().next().is_none(), "no sessions is not an error");
+
+        for id in 1..=(RECENT_SESSIONS as u64 * 3) {
+            push_bounded(&mut ring, one_summary(id));
+        }
+        assert_eq!(ring.len(), RECENT_SESSIONS);
+        assert_eq!(ring.front().map(|s| s.id), Some(RECENT_SESSIONS as u64 * 3));
+        assert_eq!(
+            ring.back().map(|s| s.id),
+            Some(RECENT_SESSIONS as u64 * 3 - RECENT_SESSIONS as u64 + 1)
+        );
+    }
+
+    /// The whole feature end to end: the numbers the video loop hands over, and the
+    /// reason an operator stop latched, survive into the ring `GET /session/last` reads.
+    #[test]
+    fn a_finished_session_lands_in_the_ring_with_its_numbers() {
+        let _registry = registry_lock();
+        let reason = Arc::new(AtomicU8::new(0));
+        let counters = Arc::new(SessionCounters::default());
+        let (guard, _stop, _quit) =
+            fake_session_with_reason("192.0.2.9", reason.clone(), counters.clone());
+        let id = guard.id;
+        // What the side threads bump while the session runs, each through its own note.
+        counters.input_events.fetch_add(7457, Ordering::Relaxed);
+        counters.input_rich.fetch_add(150_983, Ordering::Relaxed);
+        for stalled in [false, false, true] {
+            counters.note_motion(stalled);
+        }
+        counters.note_audio_started();
+        counters.note_audio_frame(std::time::Duration::from_millis(11), true, true);
+        counters.note_audio_frame(std::time::Duration::from_millis(1), false, false);
+        counters.note_audio_reanchor();
+        // 20 000 was seeded at registration, so these two are the moves.
+        counters.note_bitrate(10_000);
+        counters.note_bitrate(30_000);
+        record_tally(
+            id,
+            SessionTally {
+                frames_sent: 4096,
+                frames_dropped: Some(3),
+                path_mtu: 1369,
+            },
+        );
+        SessionEndReason::StoppedByOperator.latch(&reason);
+        drop(guard);
+
+        // By id: other tests in this binary drop their own sessions into the same ring.
+        let mine = recent()
+            .into_iter()
+            .find(|s| s.id == id)
+            .expect("the finished session is in the ring");
+        assert_eq!(mine.frames_sent, Some(4096));
+        assert_eq!(mine.frames_dropped, Some(3));
+        assert_eq!(mine.path_mtu, Some(1369));
+        assert_eq!(mine.ended, SessionEndReason::StoppedByOperator);
+        assert_eq!(mine.codec, "hevc");
+        assert_eq!(mine.chroma, "4:2:0");
+        assert_eq!(mine.bitrate_kbps, 20_000);
+
+        let input = &mine.input;
+        assert_eq!((input.events, input.rich, input.mic), (7457, 150_983, 0));
+
+        let gyro = mine.gyro.expect("a pad sent motion");
+        assert_eq!((gyro.samples, gyro.stalls), (3, 1));
+
+        let audio = mine.audio.expect("the audio plane ran");
+        assert_eq!((audio.sent, audio.infilled, audio.late), (2, 1, 1));
+        assert_eq!(audio.max_late_ms, 11, "the worst miss, not the last");
+        assert_eq!(audio.reanchors, 1);
+
+        // Mean of 20 000, 10 000 and 30 000 — the targets, not their durations.
+        let b = mine.bitrate.expect("an encoder opened");
+        assert_eq!(
+            (b.min_kbps, b.avg_kbps, b.max_kbps),
+            (10_000, 20_000, 30_000)
+        );
+        assert_eq!(b.adaptive_steps, 2, "the opening rate is not a move");
+    }
+
+    /// A session whose loop never reached its tail reports the fault and no totals,
+    /// rather than a clean end with zeros in it.
+    #[test]
+    fn a_session_that_never_finished_reports_a_host_error() {
+        let _registry = registry_lock();
+        let (guard, _stop, _quit) = fake_session("192.0.2.10");
+        let id = guard.id;
+        drop(guard);
+
+        let mine = recent()
+            .into_iter()
+            .find(|s| s.id == id)
+            .expect("an abandoned session is still summarized");
+        assert_eq!(mine.ended, SessionEndReason::HostError);
+        assert_eq!(mine.frames_sent, None);
+        assert_eq!(mine.path_mtu, None);
+        // No pad, no audio thread: absent, not a row of zeros that reads as "all fine".
+        assert!(mine.gyro.is_none());
+        assert!(mine.audio.is_none());
+        // The datagram reader is up before a session registers, so its counts are always a claim.
+        assert_eq!(mine.input.events, 0);
+    }
+}

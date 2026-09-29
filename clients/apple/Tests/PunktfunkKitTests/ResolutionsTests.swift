@@ -37,6 +37,29 @@ final class ResolutionsTests: XCTestCase {
             Resolutions.aspects.count, "a standard screen adds nothing")
     }
 
+    /// `clients/shared/custom-resolution-vectors.json`, read from the source tree like the
+    /// render-scale vectors: every client clamps a typed size the same way.
+    func testCustomMatchesTheSharedVectors() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // PunktfunkKitTests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // apple
+            .deletingLastPathComponent() // clients
+            .appendingPathComponent("shared/custom-resolution-vectors.json")
+        let root = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        let cases = try XCTUnwrap(root["custom"] as? [[String: Any]])
+        XCTAssertGreaterThanOrEqual(cases.count, 10, "the vector file is the contract; keep it rich")
+        for c in cases {
+            let name = c["name"] as? String ?? "?"
+            let typed = try XCTUnwrap(c["typed"] as? [Int], name)
+            let want = try XCTUnwrap(c["want"] as? [Int], name)
+            let got = Resolutions.custom(
+                typed[0], typed[1], codec: try XCTUnwrap(c["codec"] as? String, name))
+            XCTAssertEqual([got.w, got.h], want, name)
+        }
+    }
+
     func testNearestFollowsHeightAndNativeMeans1080() {
         XCTAssertTrue(Resolutions.nearest(0, height: 0) == (1920, 1080))
         XCTAssertTrue(Resolutions.nearest(1, height: 1080) == (1920, 1200))

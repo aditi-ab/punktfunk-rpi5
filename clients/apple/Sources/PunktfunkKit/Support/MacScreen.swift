@@ -1,5 +1,5 @@
 // What a Mac's screen really measures — read by the settings mode list AND by the fullscreen
-// video fit, which must agree or the picture is laid out against a box the settings never offered.
+// choice, which must agree or the offered below-the-notch mode gets the wrong fullscreen.
 
 #if os(macOS)
 import AppKit

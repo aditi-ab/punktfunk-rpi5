@@ -68,25 +68,7 @@ fn settings_path() -> PathBuf {
 
 /// Absent or malformed file → all on (warn, do not fail the library read).
 fn load_settings() -> ScannerSettings {
-    match std::fs::read_to_string(settings_path()) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "library-scanners.json malformed — all scanners on");
-            ScannerSettings::default()
-        }),
-        Err(_) => ScannerSettings::default(),
-    }
-}
-
-fn save_settings(settings: &ScannerSettings) -> Result<()> {
-    let dir = pf_paths::config_dir();
-    pf_paths::create_private_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let json = serde_json::to_string_pretty(settings)?;
-    // Write-then-rename like the catalog, so a crash mid-write never truncates the settings.
-    let tmp = settings_path().with_extension("json.tmp");
-    pf_paths::write_secret_file(&tmp, json.as_bytes())
-        .with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, settings_path()).context("rename library-scanners.json")?;
-    Ok(())
+    read_json_or_default(&settings_path())
 }
 
 /// Disabled source ids. [`all_games`] filters each entry on this set.
@@ -95,8 +77,9 @@ pub(crate) fn disabled_scanners() -> HashSet<String> {
 }
 
 /// Every source on this host with its enable state: claimed stores, then
-/// providers that have entries but never claimed a store (rom-manager, playnite).
-/// Sorted by id for the console.
+/// providers that have entries but never claimed a store (rom-manager, playnite), then
+/// plugins with nothing published yet whose folder requests wait for the operator — the
+/// source line is where those requests are shown. Sorted by id for the console.
 pub fn list_scanners() -> Vec<ScannerInfo> {
     let off = disabled_scanners();
     let claims = crate::library::claimed_stores();
@@ -112,6 +95,12 @@ pub fn list_scanners() -> Vec<ScannerInfo> {
         };
         if e.store.is_none() && !plugin_ids.iter().any(|(id, _)| id == provider) {
             plugin_ids.push((provider.to_string(), provider.to_string()));
+        }
+    }
+    let access = crate::plugins::access::AccessStore::open(pf_paths::config_dir());
+    for s in access.snapshot().unwrap_or_default() {
+        if !s.pending.is_empty() && !plugin_ids.iter().any(|(_, p)| *p == s.plugin) {
+            plugin_ids.push((s.plugin.clone(), s.plugin));
         }
     }
     plugin_ids.sort();
@@ -167,7 +156,7 @@ pub fn set_scanner_enabled(id: &str, enabled: bool) -> Result<Option<Vec<Scanner
         settings.disabled.sort();
         settings.disabled.dedup();
     }
-    save_settings(&settings)?;
+    save_json(&settings_path(), &serde_json::to_string_pretty(&settings)?)?;
     crate::events::emit(crate::events::EventKind::LibraryChanged {
         source: id.to_string(),
     });

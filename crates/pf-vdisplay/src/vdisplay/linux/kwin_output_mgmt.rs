@@ -12,7 +12,6 @@
 //! wait for `applied` / `failed`.
 
 use std::collections::HashMap;
-use std::os::fd::{AsFd, AsRawFd};
 use std::time::{Duration, Instant};
 use wayland_client::backend::ObjectId;
 use wayland_client::protocol::wl_callback::{self, WlCallback};
@@ -86,9 +85,6 @@ const REGISTRY_OUTPUT_EVENT_OPCODE: u16 = 1;
 /// Budget for one enumerate-then-apply. A healthy roundtrip is a few ms; this only
 /// exists so a wedged compositor cannot pin the stream thread.
 const OP_BUDGET: Duration = Duration::from_secs(3);
-
-/// Poll slice on the Wayland fd (same cadence as the keepalive loop in `kwin.rs`).
-const POLL_MS: i32 = 100;
 
 // KWin's CVT generator aligns custom-mode width down to this grain, so the generated
 // mode may be a few px narrower than asked. Imported from `kwin.rs` — a second copy
@@ -212,11 +208,10 @@ impl State {
 
     /// Drop a `kde_output_device_mode_v2` the compositor has destroyed.
     ///
-    /// `removed` is not `type="destructor"`; the compositor destroys the object right
-    /// after sending it, but wayland-rs keeps the proxy. Handing that id back in
-    /// `kde_output_configuration_v2.mode` is a protocol error that kills the connection.
-    /// `set_custom_modes` replaces the custom list, so a previous session's mode is
-    /// destroyed the moment this one installs its own.
+    /// The vendored XML marks `removed` a destructor, so wayland-rs frees the id KWin
+    /// hands its next mode; any proxy kept here names a dead object. `set_custom_modes`
+    /// replaces the custom list, so a previous session's mode is destroyed the moment
+    /// this one installs its own.
     fn forget_mode(&mut self, id: &ObjectId) {
         self.mode_dims.remove(id);
         for dev in self.devices.values_mut() {
@@ -445,7 +440,13 @@ impl Dispatch<WlCallback, u32> for State {
     }
 }
 
-struct Session {
+impl crate::wl_pump::SyncDone for State {
+    fn sync_done(&self) -> u32 {
+        self.sync_done
+    }
+}
+
+pub(crate) struct Session {
     conn: Connection,
     queue: wayland_client::EventQueue<State>,
     state: State,
@@ -546,51 +547,28 @@ impl Session {
     fn sync_barrier(&mut self, deadline: Instant) -> bool {
         self.next_sync += 1;
         let serial = self.next_sync;
-        let qh = self.queue.handle();
-        let _cb = self.conn.display().sync(&qh, serial);
-        self.pump_until(deadline, |st| st.sync_done >= serial)
+        let barrier = crate::wl_pump::sync_barrier(
+            &self.conn,
+            &mut self.queue,
+            &mut self.state,
+            serial,
+            deadline,
+            None,
+        );
+        matches!(barrier, Ok(crate::wl_pump::Pumped::Done))
     }
 
-    /// Bounded event loop: flush, dispatch, poll the fd up to [`POLL_MS`].
-    /// `blocking_dispatch` cannot be interrupted, so we poll instead (same as
-    /// `kwin.rs::run`). Returns `true` once `done(&state)` holds.
+    /// Dispatch until `done` holds or `deadline` passes ([`crate::wl_pump`]).
     fn pump_until(&mut self, deadline: Instant, done: impl Fn(&State) -> bool) -> bool {
-        loop {
-            if done(&self.state) {
-                return true;
-            }
-            if self.queue.dispatch_pending(&mut self.state).is_err() {
-                return false;
-            }
-            if done(&self.state) {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            if self.conn.flush().is_err() {
-                return false;
-            }
-            let Some(guard) = self.conn.prepare_read() else {
-                continue; // events already queued — loop dispatches them
-            };
-            let mut pfd = libc::pollfd {
-                fd: self.conn.as_fd().as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let timeout = (remaining.as_millis() as i32).clamp(0, POLL_MS);
-            // SAFETY: `&mut pfd` points at one live, fully-initialized `libc::pollfd` on the stack and
-            // the count `1` matches that single element, so `poll` reads `fd`/`events` and writes
-            // `revents` strictly within `pfd`. `pfd.fd` is the Wayland connection's fd, valid because
-            // `self.conn` (and the `prepare_read` guard) outlive the call. `poll` blocks up to
-            // `timeout` ms and writes only `revents`; `pfd` is a fresh local that aliases nothing.
-            let r = unsafe { libc::poll(&mut pfd, 1, timeout) };
-            if r > 0 && (pfd.revents & libc::POLLIN) != 0 {
-                let _ = guard.read();
-            } // else: timeout/signal — drop the guard, re-check the deadline
-        }
+        let pumped = crate::wl_pump::pump_until(
+            &self.conn,
+            &mut self.queue,
+            &mut self.state,
+            Some(deadline),
+            None,
+            done,
+        );
+        matches!(pumped, Ok(crate::wl_pump::Pumped::Done))
     }
 
     fn new_config(&self) -> OutputConfig {
@@ -640,10 +618,10 @@ impl Session {
         })
     }
 
-    /// Our just-created virtual output: managed-prefix name AND current size equal to
-    /// the size we created it at. During a supersede the replacement reuses the
-    /// per-slot name while the predecessor is still alive; only the new one sits at
-    /// this size. Newest wins remaining ties: global `name`, else [`DeviceState::seq`].
+    /// Our just-created virtual output: managed-prefix name AND current size `our_w`×`our_h`.
+    /// During a supersede the predecessor keeps the per-slot name and KWin restores its
+    /// stored mode onto the new one, so both can match. Newest wins: global `name`, else
+    /// [`DeviceState::seq`], which is creation order only on a [`watch`] connection.
     fn resolve_ours(&self, our_prefix: &str, our_w: u32, our_h: u32) -> Option<DeviceState> {
         self.state
             .devices
@@ -705,10 +683,31 @@ pub(crate) fn list_monitors() -> anyhow::Result<Vec<crate::monitors::PhysicalMon
     Ok(out)
 }
 
+/// The connection for one create, opened before the output exists. KWin announces
+/// an output made later after every one this connection already holds, so
+/// newest-wins resolves ours while a same-named predecessor shares its name, UUID
+/// and restored mode. A later connection cannot: KWin ≥ 6.7 announces existing
+/// outputs in hash order.
+pub(crate) fn watch() -> Option<Session> {
+    Session::open("watch").ok()
+}
+
+/// `sess` once it has taken in what KWin announced since it last looked: new outputs
+/// on one round, their property bursts on the next. `None` sends the caller to its
+/// fallback.
+fn caught_up(sess: Option<&mut Session>, deadline: Instant) -> Option<&mut Session> {
+    let sess = sess?;
+    let done = sess.sync_barrier(deadline)
+        && (sess.state.devices.values().all(|d| d.seen_done) || sess.sync_barrier(deadline));
+    done.then_some(sess)
+}
+
 /// Place the streamed output (name starts with `our_prefix`, current size
 /// `our_w`×`our_h`) in the desktop: primary unless `Extend`, and for `Exclusive`
-/// every other enabled output goes dark. In-process; a miss leaves `handled = false` for the `kscreen-doctor` path.
+/// every other enabled output goes dark. Runs on `sess` from [`watch`]; a miss
+/// leaves `handled = false` for the `kscreen-doctor` path.
 pub(crate) fn apply_topology(
+    sess: Option<&mut Session>,
     our_prefix: &str,
     our_w: u32,
     our_h: u32,
@@ -719,10 +718,10 @@ pub(crate) fn apply_topology(
         disabled: Vec::new(),
         handled: false,
     };
-    let Ok(mut sess) = Session::open("topology") else {
+    let deadline = Instant::now() + OP_BUDGET;
+    let Some(sess) = caught_up(sess, deadline) else {
         return miss();
     };
-    let deadline = Instant::now() + OP_BUDGET;
 
     let Some(ours) = sess.resolve_ours(our_prefix, our_w, our_h) else {
         tracing::warn!(
@@ -763,26 +762,20 @@ pub(crate) fn apply_topology(
     // Extend adds a screen beside the others and never takes primary.
     let take_primary = kind != TopologyKind::Extend && !sibling_is_primary;
 
-    // Monitors the operator asked to keep lit through an exclusive stream (§5.5). Matched
-    // case-insensitively: a connector reaches us from the console, from a config file and
-    // from KWin itself, and `DP-1` / `dp-1` are the same screen to the person who typed it.
+    // Monitors the operator asked to keep lit through an exclusive stream (§5.5).
     let keep_lit = crate::policy::prefs().get().keep_monitors;
-    let kept = |name: &str| keep_lit.iter().any(|k| k.eq_ignore_ascii_case(name));
 
     let mut to_disable: Vec<(OutputDevice, String, String)> = Vec::new();
     if kind == TopologyKind::Exclusive {
         for d in sess.state.devices.values() {
-            let is_ours = d.proxy.as_ref().map(|p| p.id()) == our_id;
-            let managed = d
-                .name
-                .as_deref()
-                .is_some_and(|n| n.starts_with(MANAGED_PREFIX));
-            let stays_lit = d.name.as_deref().is_some_and(kept);
-            if d.enabled && !is_ours && !managed && !stays_lit {
-                if let (Some(name), Some(proxy)) = (d.name.clone(), d.proxy.clone()) {
-                    let spec = sess.current_dims(d).map(mode_spec).unwrap_or_default();
-                    to_disable.push((proxy, name, spec));
-                }
+            let (Some(name), Some(proxy)) = (d.name.clone(), d.proxy.clone()) else {
+                continue;
+            };
+            let is_ours = Some(proxy.id()) == our_id;
+            let managed = name.starts_with(MANAGED_PREFIX);
+            if crate::monitors::darkens(&name, d.enabled, managed, is_ours, &keep_lit) {
+                let spec = sess.current_dims(d).map(mode_spec).unwrap_or_default();
+                to_disable.push((proxy, name, spec));
             }
         }
     }
@@ -931,12 +924,17 @@ pub(crate) fn apply_topology(
 /// user's screens is what they exist to avoid. A stored `replicationSource`
 /// is not an arrangement; it makes our output show a physical panel. Apply
 /// only when ours is actually mirroring; the ordinary session pays one
-/// bounded enumerate and no apply.
-pub(crate) fn clear_replication_source(our_prefix: &str, our_w: u32, our_h: u32) {
-    let Ok(mut sess) = Session::open("clear_replication_source") else {
+/// bounded roundtrip on `sess` ([`watch`]) and no apply.
+pub(crate) fn clear_replication_source(
+    sess: Option<&mut Session>,
+    our_prefix: &str,
+    our_w: u32,
+    our_h: u32,
+) {
+    let deadline = Instant::now() + OP_BUDGET;
+    let Some(sess) = caught_up(sess, deadline) else {
         return;
     };
-    let deadline = Instant::now() + OP_BUDGET;
     let mgmt_version = sess
         .state
         .mgmt_name_version
@@ -980,26 +978,39 @@ pub(crate) fn clear_replication_source(our_prefix: &str, our_w: u32, our_h: u32)
 /// per-output mode and scale from `kwinoutputconfig.json` by name, and ours is
 /// stable, so a previous session's mode can overlay the one we just requested.
 ///
-/// Resolve by name alone and decline unless exactly one output carries our
-/// prefix. Two matches is a supersede in flight; picking wrong would hand
-/// back the doomed output's size. (`-7` vs `-70` is the same decline.)
+/// Resolve by exact name alone ([`newest_named`]) on `sess` from [`watch`]: a
+/// supersede or a kept display leaves a predecessor with our name, and KWin gives
+/// the new one its stored mode. `None` while our output is mid-announce.
 ///
 /// Returns `(width, height, refresh_mHz, scale)`. Scale is for the log:
 /// KWin's screencast streams pixel size, so a restored scale shifts logical
 /// layout without changing capture.
-pub(crate) fn actual_dims(our_prefix: &str) -> Option<(u32, u32, u32, f64)> {
-    let sess = Session::open("verify_dims").ok()?;
-    let mut matches = sess.state.devices.values().filter(|d| {
-        // Mid-announce has no coherent `current_mode`; reading one anyway is a
-        // 0×0 "correction" that stomps a healthy output.
-        d.seen_done && d.name.as_deref().is_some_and(|n| n.starts_with(our_prefix))
-    });
-    let ours = matches.next()?;
-    if matches.next().is_some() {
+pub(crate) fn actual_dims(
+    sess: Option<&mut Session>,
+    our_name: &str,
+) -> Option<(u32, u32, u32, f64)> {
+    let sess = caught_up(sess, Instant::now() + OP_BUDGET)?;
+    let ours = newest_named(sess.state.devices.values(), our_name)?;
+    // Mid-announce has no coherent `current_mode`; reading one anyway is a
+    // 0×0 "correction" that stomps a healthy output.
+    if !ours.seen_done {
         return None;
     }
     let (w, h, mhz) = sess.current_dims(ours)?;
     Some((w, h, mhz, ours.scale.filter(|s| *s > 0.0).unwrap_or(1.0)))
+}
+
+/// The newest output named exactly `name`. On a connection opened before the create
+/// ([`watch`]) this is the one just created, even when a predecessor shares its name
+/// and, after KWin restored the stored mode, its size.
+fn newest_named<'a>(
+    devices: impl IntoIterator<Item = &'a DeviceState>,
+    name: &str,
+) -> Option<&'a DeviceState> {
+    devices
+        .into_iter()
+        .filter(|d| d.name.as_deref() == Some(name))
+        .max_by_key(|d| (d.global, d.seq))
 }
 
 /// Install and select a `want_w`×`want_h`@`want_hz` custom mode on the virtual output
@@ -1009,10 +1020,11 @@ pub(crate) fn actual_dims(our_prefix: &str) -> Option<(u32, u32, u32, f64)> {
 ///
 /// `set_custom_modes` hands KWin a one-entry list; KWin generates CVT timing
 /// (width may align down — [`CVT_H_GRANULARITY`]) and we then select it, which
-/// changes size and renegotiates the screencast (`kwin::create`). Returns the
-/// active mode read back (Hz rounded), or `None` so the caller falls back.
-/// `set_custom_modes` replaces the custom list (`since 18`).
+/// changes size and renegotiates the screencast (`kwin::create`). Runs on `sess`
+/// from [`watch`]. Returns the active mode read back (Hz rounded), or `None` so the
+/// caller falls back. `set_custom_modes` replaces the custom list (`since 18`).
 pub(crate) fn set_custom_mode(
+    sess: Option<&mut Session>,
     our_prefix: &str,
     at_w: u32,
     at_h: u32,
@@ -1020,8 +1032,8 @@ pub(crate) fn set_custom_mode(
     want_h: u32,
     want_hz: u32,
 ) -> Option<(u32, u32, u32)> {
-    let mut sess = Session::open("custom_mode").ok()?;
     let deadline = Instant::now() + OP_BUDGET;
+    let sess = caught_up(sess, deadline)?;
 
     // `set_custom_modes` is `since 18`; calling it on an older bind is a protocol
     // error. Bound version is `min(advertised, MGMT_MAX)`.
@@ -1353,5 +1365,37 @@ mod tests {
     #[test]
     fn registry_output_event_opcode_is_one() {
         assert_eq!(REGISTRY_OUTPUT_EVENT_OPCODE, 1);
+    }
+
+    fn device(name: &str, global: u32, seq: u32) -> DeviceState {
+        DeviceState {
+            name: Some(name.to_string()),
+            global,
+            seq,
+            ..Default::default()
+        }
+    }
+
+    /// A supersede leaves two outputs with our name. The new one is ours on both the
+    /// per-global model and the ≥ 6.7 registry model (`global` 0), and a longer slot
+    /// name that merely starts with ours is someone else's.
+    #[test]
+    fn a_same_named_predecessor_resolves_to_the_new_output() {
+        let classic = [
+            device("Virtual-punktfunk-1", 41, 1),
+            device("Virtual-punktfunk-12", 57, 2),
+            device("Virtual-punktfunk-1", 52, 3),
+        ];
+        let ours = newest_named(&classic, "Virtual-punktfunk-1").expect("resolved");
+        assert_eq!(ours.global, 52);
+
+        let registry = [
+            device("Virtual-punktfunk-1", 0, 4),
+            device("Virtual-punktfunk-1", 0, 2),
+        ];
+        let ours = newest_named(&registry, "Virtual-punktfunk-1").expect("resolved");
+        assert_eq!(ours.seq, 4);
+
+        assert!(newest_named(&classic, "Virtual-punktfunk").is_none());
     }
 }

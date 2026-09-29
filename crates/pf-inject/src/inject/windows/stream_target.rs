@@ -119,14 +119,15 @@ pub(crate) fn desktop_px_to_virtualdesk(px: (i32, i32)) -> (i32, i32) {
     px_to_abs(virtual_desktop_rect(), px)
 }
 
-/// SendInput absolute coordinates span 0..65535 over the chosen surface.
-const ABS_MAX: f64 = 65535.0;
-
+/// SendInput absolute coordinates span 0..65535 over the chosen surface, and win32k maps them
+/// back as `px = ax * vw / 65536` (floor). The ceiling of `px * 65536 / vw` is the smallest
+/// value that lands on `px`, for every column.
 fn px_to_abs((vx, vy, vw, vh): Rect, (px, py): (i32, i32)) -> (i32, i32) {
-    (
-        ((px - vx) as f64 * ABS_MAX / (vw - 1).max(1) as f64).round() as i32,
-        ((py - vy) as f64 * ABS_MAX / (vh - 1).max(1) as f64).round() as i32,
-    )
+    let axis = |p: i32, n: i32| {
+        let n = i64::from(n.max(1));
+        ((i64::from(p) * 65536 + n - 1) / n).clamp(0, 65535) as i32
+    };
+    (axis(px - vx, vw), axis(py - vy, vh))
 }
 
 #[cfg(test)]
@@ -160,11 +161,22 @@ mod tests {
     /// pixels and a streamed origin must survive that.
     #[test]
     fn virtualdesk_normalization_round_trips() {
-        let v = (0, 0, 4480, 1080);
-        assert_eq!(px_to_abs(v, (0, 0)), (0, 0));
-        assert_eq!(px_to_abs(v, (4479, 1079)), (65535, 65535));
-        let (ax, _) = px_to_abs(v, (1920, 0));
-        assert_eq!((ax as i64 * 4480 / 65536) as i32, 1920);
+        // Every column and row, not just the edges: rounding once lost ~40 columns near the
+        // origin of a 4480-wide desktop.
+        for (w, h) in [(4480, 1080), (1920, 1080), (7, 3)] {
+            let v = (0, 0, w, h);
+            for px in 0..w {
+                let (ax, _) = px_to_abs(v, (px, 0));
+                assert!((0..=65535).contains(&ax));
+                assert_eq!(
+                    (i64::from(ax) * i64::from(w) / 65536) as i32,
+                    px,
+                    "{w}: {px}"
+                );
+            }
+            let (_, ay) = px_to_abs(v, (0, h - 1));
+            assert_eq!((i64::from(ay) * i64::from(h) / 65536) as i32, h - 1);
+        }
         // Negative-origin desktops still normalize from 0.
         let v = (-2560, 0, 4480, 1440);
         assert_eq!(px_to_abs(v, (-2560, 0)), (0, 0));

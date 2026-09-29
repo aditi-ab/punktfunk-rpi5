@@ -36,6 +36,22 @@ label and its options and knows what to pick. If it needs a paragraph, it is not
 - **Ask first.** A PR that adds a player setting names the problem, who hits it, and what was
   tried to make it automatic — and has the maintainer's yes before it is opened.
 
+## Advanced settings
+
+Every client hides its advanced rows until **Show advanced** is on (the last row of General). A
+row is advanced when most players never change it and its default is right for them: codec,
+decoder, V-Sync, audio quality, controller forwarding, stats position and size. The tier is not
+an escape from the questions above; an advanced setting is still a setting.
+
+- **The catalogue is the list.** `clients/shared/settings-catalog.json` holds each shared
+  setting's key, label, category and tier. Change it first; the console, Android and Apple
+  tests read it.
+- **A hidden value still applies.** A category with advanced values off their default shows
+  "N advanced settings changed", which turns Show advanced on.
+- **A preset shows what it overrides.** An advanced row a preset overrides stays visible in that
+  preset's scope, whatever the switch says.
+- **Show advanced is this device's.** It never rides a preset.
+
 ## Examples
 
 Good — **Aspect ratio + Resolution** (#1088). One extra field turned a single oversized list into
@@ -46,4 +62,5 @@ memory** (#1176) started good links at 2 Mbps from a quiet last session. Both re
 **Stepping the mode down** under Automatic (#1177) overrode the player's choice; closed.
 
 Bad — **an overlay size picker** (#530) duplicated the OS display scale on four settings screens.
-The picker was taken out before merge; the overlay follows the OS scale.
+The picker was taken out before merge; the overlay follows the OS scale. **Statistics size** is
+the agreed exception: an advanced multiplier on top of the OS scale, for the overlay only.

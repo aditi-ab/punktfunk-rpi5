@@ -10,7 +10,7 @@
        also export the public .cer; Azure does not (see below). The ephemeral fallback is for
        canary/CI/dev ONLY: on a v* tag build a missing cert (or -NoSign) is a hard failure, never
        a silent downgrade to a throwaway cert - see -RequireSignedCert,
-    2. signs the inner punktfunk-host.exe,
+    2. stamps -Version into the inner punktfunk-host.exe (stamp-version.ps1), then signs it,
     3. stages the pf-vdisplay virtual-display driver bundle (unless -NoDriver),
     4. builds the wizard and packs it over the {app} tree as punktfunk-host-setup-<ver>.exe,
     5. signs the setup.exe (timestamped - MANDATORY under Azure signing, see Sign-File),
@@ -72,6 +72,11 @@ if (-not (Test-Path $exe)) { throw "missing build artifact 'punktfunk-host.exe' 
 $trayExe = Join-Path $TargetDir 'punktfunk-tray.exe'
 if (-not (Test-Path $trayExe)) { throw "missing build artifact 'punktfunk-tray.exe' in $TargetDir (did 'cargo build --release -p punktfunk-tray' run?)" }
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+# The version goes into a copy: cargo re-links its own output on the next build.
+$stampedExe = Join-Path $OutDir 'punktfunk-host.exe'
+Copy-Item -LiteralPath $exe -Destination $stampedExe -Force
+& (Join-Path $here 'stamp-version.ps1') -Path $stampedExe -Version $Version
+$exe = $stampedExe
 
 # --- locate signtool (Windows SDK) -----------------------------------------------------------
 function Find-SdkTool([string]$name) {

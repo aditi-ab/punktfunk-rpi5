@@ -208,28 +208,37 @@ pub(crate) fn resolve_topology() -> SessionTopology {
 /// * **Linux**: the encoder is the compositing stage. Blend for a cursor-forward
 ///   session (capture-mouse flip needs the host composite on demand), for
 ///   gamescope (no pointer in the capture; XFixes must be drawn), and for a
-///   no-channel session when the backend can composite. Mutter virtual streams
-///   never re-record on cursor-only motion, so compositor-embeds is not a
-///   fallback except on backends that cannot blend (VAAPI, software).
+///   no-channel session whose compositor cannot embed the pointer
+///   ([`compositor_embeds_pointer`]) when the backend can composite. A blend
+///   costs the zero-CSC encode sources (RGB-direct, producer NV12): a
+///   full-frame compute pass per frame, on the shader cores a game saturates.
 /// * **Everywhere else**: never. Windows IDD composites the pointer itself
 ///   (`cursor_blend.rs` / DWM); no Windows encode backend reads `frame.cursor`.
 ///   Gated on Linux because the VAAPI/CUDA prediction and zero-copy switch
 ///   exist only there.
 pub(crate) fn cursor_blend_for(
     cursor_forward: bool,
-    gamescope: bool,
+    compositor: pf_vdisplay::Compositor,
     codec: crate::encode::Codec,
     bit_depth: u8,
+    hdr: bool,
     gamescope_route: Option<&pf_vdisplay::GamescopeRoute>,
 ) -> bool {
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (cursor_forward, gamescope, codec, bit_depth, gamescope_route);
+        let _ = (
+            cursor_forward,
+            compositor,
+            codec,
+            bit_depth,
+            hdr,
+            gamescope_route,
+        );
         false
     }
     #[cfg(target_os = "linux")]
     {
-        if gamescope {
+        if compositor == pf_vdisplay::Compositor::Gamescope {
             // gamescope capture has no SPA_META_Cursor; skip the blend-capable term or a
             // gamescope that paints its own pointer loses native-NV12 for a blend that
             // never receives an overlay.
@@ -238,11 +247,26 @@ pub(crate) fn cursor_blend_for(
         if cursor_forward {
             return true;
         }
+        if compositor_embeds_pointer(compositor) {
+            return false;
+        }
         // Same CUDA-payload prediction as `handshake::cursor_forward`: NVIDIA plus
         // the zero-copy switch. Only a CUDA payload reaches the blend.
         let cuda_planned = !crate::encode::linux_zero_copy_is_vaapi() && crate::zerocopy::enabled();
-        crate::encode::cursor_blend_capable(codec, cuda_planned, bit_depth == 10)
+        crate::encode::cursor_blend_capable(codec, cuda_planned, bit_depth == 10, hdr)
     }
+}
+
+/// Whether a no-channel session can leave the pointer to the compositor (portal
+/// `Embedded`, KWin `POINTER_EMBEDDED`). Mutter cannot: a virtual stream drops its
+/// software cursor whenever a physical head holds a hardware one, and cursor-only
+/// motion schedules no re-record (mutter#4939). Gamescope has its own arm.
+pub(crate) fn compositor_embeds_pointer(compositor: pf_vdisplay::Compositor) -> bool {
+    use pf_vdisplay::Compositor;
+    matches!(
+        compositor,
+        Compositor::Kwin | Compositor::Wlroots | Compositor::Hyprland
+    )
 }
 
 /// Gamescope keeps the cursor on a hardware plane and does not paint it into
@@ -376,6 +400,7 @@ pub(crate) fn open_encoder_fitted(
 mod tests {
     use super::*;
     use crate::encode::{ChromaFormat, Codec};
+    use pf_vdisplay::Compositor;
 
     #[test]
     fn resolve_limits_single_slice_clients() {
@@ -395,13 +420,43 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn cursor_forward_forces_blend_on_linux() {
-        assert!(cursor_blend_for(true, false, Codec::H264, 8, None));
+        assert!(cursor_blend_for(
+            true,
+            Compositor::Kwin,
+            Codec::H264,
+            8,
+            false,
+            None
+        ));
+        assert!(cursor_blend_for(
+            true,
+            Compositor::Mutter,
+            Codec::H264,
+            8,
+            false,
+            None
+        ));
+    }
+
+    /// The no-channel session on an embedding compositor keeps the zero-CSC encode
+    /// sources: no blend, whatever the backend could composite.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn embedding_compositor_skips_the_blend_without_a_channel() {
+        for c in [Compositor::Kwin, Compositor::Wlroots, Compositor::Hyprland] {
+            assert!(compositor_embeds_pointer(c));
+            assert!(!cursor_blend_for(false, c, Codec::Av1, 8, false, None));
+            assert!(!cursor_blend_for(false, c, Codec::H265, 10, false, None));
+        }
+        assert!(!compositor_embeds_pointer(Compositor::Mutter));
+        assert!(!compositor_embeds_pointer(Compositor::Gamescope));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn gamescope_cursor_reader_matches_blend_rule() {
-        let cursor_blend = cursor_blend_for(false, true, Codec::H265, 10, None);
+        let cursor_blend =
+            cursor_blend_for(false, Compositor::Gamescope, Codec::H265, 10, true, None);
         let gamescope_cursor = gamescope_cursor_for(true, None);
 
         assert_eq!(cursor_blend, gamescope_cursor);
@@ -413,15 +468,19 @@ mod tests {
     #[test]
     fn cursor_rules_are_disabled_on_windows() {
         for cursor_forward in [false, true] {
-            for gamescope in [false, true] {
+            for compositor in [Compositor::Windows, Compositor::Gamescope] {
                 assert!(!cursor_blend_for(
                     cursor_forward,
-                    gamescope,
+                    compositor,
                     Codec::H265,
                     10,
+                    true,
                     None
                 ));
-                assert!(!gamescope_cursor_for(gamescope, None));
+                assert!(!gamescope_cursor_for(
+                    compositor == Compositor::Gamescope,
+                    None
+                ));
             }
         }
     }

@@ -96,20 +96,10 @@ pub struct AccessState {
     pub revoked: bool,
 }
 
-/// Re-exported for the stream marker's quoting. `imp` is `cfg(unix)` — gate alike, or
-/// Windows trips `-D unused-imports`.
-#[cfg(unix)]
+/// Shared by the stream marker's quoting and the plugin-text sanitizers.
 pub(crate) use sanitize::is_spoofy_char;
 /// Stable path for the native accept loop.
 pub(crate) use sanitize::sanitize_device_name;
-
-/// Host wall clock, unix seconds. An NTP step moves stored deadlines with the clock.
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
 
 /// How long a "this session" record outlives its last session. A router blip, a client
 /// restart or a sleeping laptop must not cost the guest a re-pair; anything longer starts to
@@ -611,7 +601,9 @@ impl NativePairing {
     ) -> PairingDecision {
         self.approval
             .wait_for_decision(fp_hex, knock_seq, timeout, |fp| {
-                self.store.effective(fp, unix_now()).is_some()
+                self.store
+                    .effective(fp, crate::clock::unix_secs())
+                    .is_some()
             })
             .await
     }
@@ -1143,14 +1135,12 @@ mod tests {
     #[test]
     fn knock_sources_classify_by_address() {
         use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-        let lan: [IpAddr; 7] = [
+        let lan: [IpAddr; 6] = [
             Ipv4Addr::LOCALHOST.into(),
             Ipv4Addr::new(10, 1, 2, 3).into(),
             Ipv4Addr::new(172, 16, 0, 1).into(),
             Ipv4Addr::new(192, 168, 1, 44).into(),
             Ipv4Addr::new(169, 254, 3, 4).into(),
-            // Tailscale hands its peers 100.64/10.
-            Ipv4Addr::new(100, 96, 0, 7).into(),
             Ipv6Addr::LOCALHOST.into(),
         ];
         for ip in lan {
@@ -1191,6 +1181,32 @@ mod tests {
             classify_source(Some("fe80::1".parse().unwrap())),
             KnockSource::Lan
         );
+    }
+
+    /// 100.64/10 is Tailscale's range and a CGNAT ISP's alike, so the route back decides.
+    #[test]
+    fn a_cgnat_peer_is_lan_only_over_the_tailnet() {
+        use super::approval::{classify_with, is_tailscale_iface};
+        let peer: IpAddr = "100.96.0.7".parse().unwrap();
+        assert_eq!(classify_with(Some(peer), |_| true), KnockSource::Lan);
+        // The CGNAT neighbour: the same range, answered out of the ordinary uplink.
+        assert_eq!(classify_with(Some(peer), |_| false), KnockSource::Wan);
+        let mapped = "::ffff:100.96.0.7".parse().ok();
+        assert_eq!(classify_with(mapped, |_| false), KnockSource::Wan);
+        // The tailnet is asked about 100.64/10 only.
+        for ip in ["203.0.113.5", "100.128.0.1"] {
+            assert_eq!(classify_with(ip.parse().ok(), |_| true), KnockSource::Wan);
+        }
+
+        for name in ["tailscale0", "Tailscale", "utun4"] {
+            assert!(is_tailscale_iface(name, peer), "{name}");
+        }
+        // An ISP puts its CGNAT address on the uplink.
+        for name in ["eth0", "en0", "ppp0", "Ethernet", "wlan0"] {
+            assert!(!is_tailscale_iface(name, peer), "{name}");
+        }
+        // A utun without a 100.64/10 address is some other VPN.
+        assert!(!is_tailscale_iface("utun4", "10.8.0.2".parse().unwrap()));
     }
 
     /// A knock from the internet carries a name it chose for itself, so the one-click approve

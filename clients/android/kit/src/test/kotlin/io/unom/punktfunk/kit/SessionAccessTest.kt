@@ -1,44 +1,59 @@
 package io.unom.punktfunk.kit
 
+import java.io.File
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Pure JVM test of [SessionAccess] — the bit values are an ABI contract with
- * `punktfunk_core::quic::access` (wire == store == this mirror), and the preset labels are the
- * §3.2 naming rule the Access chip renders from: three levels people reason about, "Custom" for
- * anything else, derived from the mask so they cannot drift. Run: `./gradlew :kit:testDebugUnitTest`.
+ * Pure JVM test of [SessionAccess] against `crates/punktfunk-core/testdata/grant-vectors.json`,
+ * which core writes: the bit values are the wire, and the preset label is derived from the mask
+ * by the rule every client shares. Run: `./gradlew :kit:testDebugUnitTest`.
  */
 class SessionAccessTest {
 
-    /** Bit-for-bit the core vocabulary — a reorder here would mislabel every session. */
-    @Test
-    fun `bits mirror punktfunk-core`() {
-        assertEquals(1, SessionAccess.GAMEPAD)
-        assertEquals(2, SessionAccess.POINTER)
-        assertEquals(4, SessionAccess.KEYBOARD)
-        assertEquals(8, SessionAccess.CLIPBOARD)
-        assertEquals(16, SessionAccess.MIC)
-        assertEquals(32, SessionAccess.LAUNCH)
-        assertEquals(64, SessionAccess.POWER)
-        assertEquals(0x7F, SessionAccess.ALL)
+    private val vectors: JSONObject by lazy {
+        // Gradle runs unit tests with the module dir as cwd; `../../../` is the repo root.
+        val file = File("../../../crates/punktfunk-core/testdata/grant-vectors.json")
+        assertTrue("the vector file must be reachable at ${file.absolutePath}", file.isFile)
+        JSONObject(file.readText())
     }
 
+    /** Bit-for-bit the core vocabulary — a reorder here would mislabel every session. */
     @Test
-    fun `preset labels derive from the mask`() {
-        assertEquals("Full control", SessionAccess.label(SessionAccess.ALL))
-        assertEquals("Controller only", SessionAccess.label(SessionAccess.GAMEPAD))
-        assertEquals("View only", SessionAccess.label(0))
-        // Any other combination is Custom — including controller + clipboard, the design's
-        // media-remote example.
-        assertEquals(
-            "Custom",
-            SessionAccess.label(SessionAccess.GAMEPAD or SessionAccess.CLIPBOARD),
+    fun `bits match the core vectors`() {
+        val bits = vectors.getJSONObject("bits")
+        val mine = mapOf(
+            "GAMEPAD" to SessionAccess.GAMEPAD,
+            "POINTER" to SessionAccess.POINTER,
+            "KEYBOARD" to SessionAccess.KEYBOARD,
+            "CLIPBOARD" to SessionAccess.CLIPBOARD,
+            "MIC" to SessionAccess.MIC,
+            "LAUNCH" to SessionAccess.LAUNCH,
+            "POWER" to SessionAccess.POWER,
         )
-        assertEquals("Custom", SessionAccess.label(SessionAccess.ALL and SessionAccess.LAUNCH.inv()))
-        // The legacy-full read rule (host-actions §4.3): an old host's pre-power "Full control"
-        // (exactly 0x3F) still labels Full, never Custom.
-        assertEquals("Full control", SessionAccess.label(0x3F))
+        assertEquals(bits.keys().asSequence().toSet(), mine.keys)
+        mine.forEach { (name, bit) -> assertEquals(name, bits.getInt(name), bit) }
+        assertEquals(vectors.getInt("all"), SessionAccess.ALL)
+    }
+
+    /** The legacy-full read and the derived preset, per mask, as core computes them. */
+    @Test
+    fun `labels match the core vectors`() {
+        val masks = vectors.getJSONArray("masks")
+        val labels = mapOf(
+            "full" to "Full control",
+            "controller" to "Controller only",
+            "view" to "View only",
+            "custom" to "Custom",
+        )
+        for (i in 0 until masks.length()) {
+            val case = masks.getJSONObject(i)
+            val mask = case.getInt("mask")
+            assertEquals("normalize $mask", case.getInt("normalized"), SessionAccess.normalizeLegacyFull(mask))
+            assertEquals("label $mask", labels.getValue(case.getString("level")), SessionAccess.label(mask))
+        }
     }
 
     @Test

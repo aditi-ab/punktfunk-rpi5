@@ -1,11 +1,10 @@
 //! Premultiplied-alpha overlay quad over the swapchain after the video blit.
 //!
-//! Views and framebuffers are per swapchain image: take, destroy after GPU idle,
-//! then rebuild.
+//! Views and framebuffers are per swapchain image: destroy after GPU idle, then rebuild.
 
 use super::gpu::subresource_range;
 use super::OverlayPipe;
-use crate::csc::build_fullscreen_pipeline;
+use crate::csc::{build_fullscreen_pipeline, color_pass};
 use anyhow::{Context as _, Result};
 use ash::vk;
 
@@ -13,38 +12,13 @@ impl OverlayPipe {
     /// `pq`: the target is an HDR10 swapchain, so the sRGB UI is re-encoded as PQ.
     pub(super) fn new(device: &ash::Device, format: vk::Format, pq: bool) -> Result<OverlayPipe> {
         // This pass owns the last layout transition on overlay frames (LOAD, end PRESENT-ready).
-        let attachment = [vk::AttachmentDescription::default()
-            .format(format)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .load_op(vk::AttachmentLoadOp::LOAD)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)];
-        let color_ref = [vk::AttachmentReference::default()
-            .attachment(0)
-            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
-        let subpass = [vk::SubpassDescription::default()
-            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-            .color_attachments(&color_ref)];
-        let deps = [vk::SubpassDependency::default()
-            .src_subpass(vk::SUBPASS_EXTERNAL)
-            .dst_subpass(0)
-            .src_stage_mask(vk::PipelineStageFlags::ALL_COMMANDS)
-            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .dst_access_mask(
-                vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-            )];
-        // SAFETY: `device` is live; CreateInfo and its borrowed slices outlive the call.
-        let render_pass = unsafe {
-            device.create_render_pass(
-                &vk::RenderPassCreateInfo::default()
-                    .attachments(&attachment)
-                    .subpasses(&subpass)
-                    .dependencies(&deps),
-                None,
-            )
-        }
+        let render_pass = color_pass(
+            device,
+            format,
+            vk::AttachmentLoadOp::LOAD,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::PRESENT_SRC_KHR,
+        )
         .context("overlay render pass")?;
 
         // SAFETY: `device` is live; CreateInfo is a local that outlives the call.
@@ -125,16 +99,8 @@ impl OverlayPipe {
         })
     }
 
-    /// Caller destroys these after the GPU is idle.
-    pub(super) fn take_targets(&mut self) -> (Vec<vk::ImageView>, Vec<vk::Framebuffer>) {
-        (
-            std::mem::take(&mut self.views),
-            std::mem::take(&mut self.framebuffers),
-        )
-    }
-
-    /// Caller must have taken the old targets; otherwise `destroy_targets` frees them
-    /// while still in flight.
+    /// Caller must have destroyed the old targets once the GPU was idle for them;
+    /// otherwise `destroy_targets` here frees them while still in flight.
     pub(super) fn rebuild_targets(
         &mut self,
         device: &ash::Device,
@@ -142,7 +108,7 @@ impl OverlayPipe {
         format: vk::Format,
         extent: vk::Extent2D,
     ) -> Result<()> {
-        self.destroy_targets(device); // no-op after take_targets; safety net otherwise
+        self.destroy_targets(device); // no-op after the caller's; safety net otherwise
         for &image in images {
             // SAFETY: `image` is a live swapchain image; CreateInfo outlives the call.
             let view = unsafe {
@@ -174,9 +140,10 @@ impl OverlayPipe {
         Ok(())
     }
 
-    fn destroy_targets(&mut self, device: &ash::Device) {
+    /// Only once the GPU is done with every command buffer that drew through them.
+    pub(super) fn destroy_targets(&mut self, device: &ash::Device) {
         // SAFETY: these views and framebuffers are owned here; the GPU is idle for them
-        // (fence wait or the swapchain already retired).
+        // (the caller's fence or queue wait, or the swapchain already retired).
         unsafe {
             for fb in self.framebuffers.drain(..) {
                 device.destroy_framebuffer(fb, None);

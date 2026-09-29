@@ -1,5 +1,4 @@
-// Explicit left-stick/dpad-driven menu navigation for the gamepad UI's host carousel and library
-// coverflow (iOS/iPadOS only — see GamepadUIEnvironment).
+// Left-stick/dpad menu navigation outside a stream: the console, and the trust card.
 //
 // Polls the active controller at 60 Hz rather than installing `valueChangedHandler`/
 // `pressedChangedHandler` callbacks — mirroring `ControllerTestView`'s "Input" card (see its own
@@ -120,8 +119,8 @@ public final class GamepadMenuInput {
 
     /// Stick magnitude below this reads as neutral (dead zone).
     private let deadzone: Float = 0.5
-    private let initialRepeatDelay: TimeInterval = 0.38
-    private let repeatInterval: TimeInterval = 0.16
+    static let initialRepeatDelay: TimeInterval = 0.38
+    static let repeatInterval: TimeInterval = 0.16
     private let pollInterval: TimeInterval = 1.0 / 60.0
 
     public init(manager: GamepadManager) {
@@ -254,14 +253,14 @@ public final class GamepadMenuInput {
         guard let direction else { return }
         onMove?(direction)
         // First repeat after a longer delay (so a quick tap doesn't double-move), then steady.
-        let timer = Timer(timeInterval: initialRepeatDelay, repeats: false) { [weak self] _ in
+        let timer = Timer(timeInterval: Self.initialRepeatDelay, repeats: false) { [weak self] _ in
             Task { @MainActor in
                 // Re-checked after the hop: a `stop()` landing in this window has already
                 // invalidated the one-shot, and without this it would install a repeat on a
                 // stopped poller — which then drives a screen that is no longer on top.
                 guard let self, self.isActive else { return }
                 self.repeatTimer?.invalidate()
-                let repeating = Timer(timeInterval: self.repeatInterval, repeats: true) { [weak self] _ in
+                let repeating = Timer(timeInterval: Self.repeatInterval, repeats: true) { [weak self] _ in
                     Task { @MainActor in self?.onMove?(direction) }
                 }
                 RunLoop.main.add(repeating, forMode: .common)

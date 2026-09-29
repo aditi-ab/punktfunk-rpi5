@@ -206,7 +206,7 @@ function PluginLink({
 }: {
 	id: string;
 	title: string;
-	icon?: string;
+	icon?: string | null;
 }) {
 	const Icon = pluginIcon(icon);
 	return (
@@ -454,7 +454,7 @@ function MorePluginRow({
 	plugin,
 	onNavigate,
 }: {
-	plugin: { id: string; title: string; ui?: { icon?: string } };
+	plugin: { id: string; title: string; ui?: { icon?: string | null } | null };
 	onNavigate: () => void;
 }) {
 	const Icon = pluginIcon(plugin.ui?.icon);

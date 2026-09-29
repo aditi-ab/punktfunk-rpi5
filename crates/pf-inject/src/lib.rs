@@ -24,11 +24,14 @@ pub use keymap::KEY_FLAG_SEMANTIC_VK;
 pub use keymap::vk_to_evdev;
 
 /// Dedup for HID-output reports (0xCD), shared by [`uhid_manager`].
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/hidout_dedup.rs"]
 pub mod hidout_dedup;
 
-/// Normalized scroll ([`InputKind::Scroll`]) → per-backend primitive plans.
+/// Presses a session still holds, released at its end by both planes.
+#[path = "inject/held.rs"]
+pub mod held;
+
+/// Scroll, normalized and legacy → per-backend primitive plans.
 /// Pure and ungated so tests on any platform assert the same mapping the
 /// injectors execute.
 #[path = "inject/scroll.rs"]
@@ -38,6 +41,16 @@ pub mod scroll;
 /// thread that created it.
 pub trait InputInjector {
     fn inject(&mut self, event: &InputEvent) -> Result<()>;
+
+    /// When the injector next needs [`InputInjector::on_deadline`] with no event arriving
+    /// (a held scroll stop).
+    fn deadline(&self) -> Option<std::time::Instant> {
+        None
+    }
+
+    fn on_deadline(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Preferred injection backend. Variants are per-OS so [`open`] cannot name a backend the
@@ -150,6 +163,11 @@ pub(crate) fn bump_aim_gen() {
 pub(crate) fn aim_gen() -> u64 {
     AIM_GEN.load(std::sync::atomic::Ordering::Relaxed)
 }
+
+/// Largest normalised absolute position. A client may send `x == w` (a touch on the far edge);
+/// mapped as 1.0 that lands one pixel past the head, on the neighbouring monitor.
+#[cfg(target_os = "linux")]
+pub(crate) const ABS_EDGE: f32 = 1.0 - 1.0 / 65536.0;
 
 /// Streamed head's mode, published beside the aim at capture bring-up.
 static STREAM_EXTENT: std::sync::RwLock<Option<(u16, u16)>> = std::sync::RwLock::new(None);
@@ -358,35 +376,22 @@ pub fn scroll_supported() -> bool {
 }
 
 /// Full-fidelity stylus (`HOST_CAP_PEN`). Linux only: [`pen::VirtualPen`] uinput tablet.
-/// Probe is "can we open /dev/uinput" (same permission as virtual gamepads) plus
-/// `PUNKTFUNK_PEN=0`. Welcome-time; clients without the bit fold pen into touch/pointer.
+/// Probe is "can we open /dev/uinput" (same permission as virtual gamepads) plus the
+/// `PUNKTFUNK_PEN` row. Welcome-time; clients without the bit fold pen into touch/pointer.
 #[cfg(target_os = "linux")]
 pub fn pen_supported() -> bool {
-    if pf_host_config::knob("PUNKTFUNK_PEN").as_deref() == Some("0") {
+    if !pf_host_config::row_bool("PUNKTFUNK_PEN") {
         return false;
     }
-    // SAFETY: 'static NUL-terminated path literal; `open` returns a fresh fd (or -1) and
-    // retains nothing.
-    let fd = unsafe {
-        libc::open(
-            c"/dev/uinput".as_ptr(),
-            libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return false;
-    }
-    // SAFETY: `fd >= 0` is the fd opened above, owned by no one else; closed exactly once here.
-    unsafe { libc::close(fd) };
-    true
+    uapi::open_nonblock("/dev/uinput").is_ok()
 }
 
 /// Synthetic PT_PEN/PT_TOUCH on Win10 1809+. Probe creates then destroys a PT_PEN device.
-/// Same `PUNKTFUNK_PEN=0` kill-switch. Result also stands in for PT_TOUCH (both APIs arrived
+/// Same `PUNKTFUNK_PEN` kill-switch. Result also stands in for PT_TOUCH (both APIs arrived
 /// in 1809).
 #[cfg(target_os = "windows")]
 pub fn pen_supported() -> bool {
-    if pf_host_config::knob("PUNKTFUNK_PEN").as_deref() == Some("0") {
+    if !pf_host_config::row_bool("PUNKTFUNK_PEN") {
         return false;
     }
     pen::synthetic_pen_available()
@@ -420,29 +425,16 @@ pub enum UinputVerdict {
 /// Nodes every virtual input device needs, in report order: `/dev/uinput` kills pen and
 /// evdev pads; `/dev/uhid` kills DualSense/Switch Pro HID.
 #[cfg(target_os = "linux")]
-const INPUT_NODES: &[(&std::ffi::CStr, &str)] =
-    &[(c"/dev/uinput", "/dev/uinput"), (c"/dev/uhid", "/dev/uhid")];
+const INPUT_NODES: &[&str] = &["/dev/uinput", "/dev/uhid"];
 
 /// Probe `/dev/uinput` and `/dev/uhid` as the backends will, keeping the errno. Two
 /// `open()`s; diagnostics can re-run on demand.
 #[cfg(target_os = "linux")]
 pub fn uinput_probe() -> UinputVerdict {
-    for &(c_path, path) in INPUT_NODES {
-        // SAFETY: 'static NUL-terminated path literal; `open` returns a fresh fd (or -1) and
-        // retains nothing.
-        let fd = unsafe {
-            libc::open(
-                c_path.as_ptr(),
-                libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            )
-        };
-        if fd >= 0 {
-            // SAFETY: `fd >= 0` is the fd opened above, owned by no one else; closed exactly once.
-            unsafe { libc::close(fd) };
+    for &path in INPUT_NODES {
+        let Err(err) = uapi::open_nonblock(path) else {
             continue;
-        }
-        // Read errno immediately: any further libc call (including the close above) clobbers it.
-        let err = std::io::Error::last_os_error();
+        };
         return match err.raw_os_error() {
             Some(libc::EACCES) | Some(libc::EPERM) => UinputVerdict::PermissionDenied { path },
             Some(libc::ENOENT) | Some(libc::ENXIO) | Some(libc::ENODEV) => {
@@ -522,6 +514,130 @@ pub fn vhci_probe() -> VhciVerdict {
     }
 }
 
+/// The Windows virtual-gamepad driver as the last pad that met it saw it — [`pad_driver_probe`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PadDriverVerdict {
+    /// No virtual pad has met its driver this run.
+    Unseen,
+    /// The driver attached at this host's revision.
+    Current,
+    /// The driver attached with an older revision: an old package still serves the pads.
+    Stale { driver_rev: u32, host_rev: u32 },
+    /// The driver speaks another channel protocol, so it refuses every pad.
+    ProtocolMismatch { driver_proto: u32, host_proto: u32 },
+    /// The pad reports another controller's VID/PID than its hardware id names.
+    WrongIdentity { want: (u16, u16), got: (u16, u16) },
+    /// No driver attached to the pad within the grace period.
+    NotAttached,
+}
+
+/// Verdict for a pad whose driver just attached. `devtype` is the identity its hardware id
+/// names, `driver_rev` what the driver stamped, `vid_pid` what its HID collection reports.
+pub fn pad_attach_verdict(
+    devtype: u8,
+    driver_rev: u32,
+    vid_pid: Option<(u16, u16)>,
+) -> PadDriverVerdict {
+    use pf_driver_proto::gamepad::{identity_vid_pid, GAMEPAD_DRIVER_REV};
+    if let (Some(want), Some(got)) = (identity_vid_pid(devtype), vid_pid)
+        && want != got
+    {
+        return PadDriverVerdict::WrongIdentity { want, got };
+    }
+    if driver_rev < GAMEPAD_DRIVER_REV {
+        return PadDriverVerdict::Stale {
+            driver_rev,
+            host_rev: GAMEPAD_DRIVER_REV,
+        };
+    }
+    PadDriverVerdict::Current
+}
+
+/// Whether a pad devnode that failed to start (`CM_PROB_FAILED_START`, 10) is one the driver
+/// refused: its lowercase hardware ids name no identity. UMDF reports that refusal as
+/// `STATUS_DEVICE_DATA_ERROR`, not the driver's own status, so the ids are the evidence.
+pub fn pad_refused(problem: u32, hwids: &str) -> bool {
+    problem == 10 && pf_driver_proto::gamepad::devtype_from_hwids(hwids).is_none()
+}
+
+#[cfg(target_os = "windows")]
+static PAD_DRIVER: std::sync::Mutex<PadDriverVerdict> =
+    std::sync::Mutex::new(PadDriverVerdict::Unseen);
+
+/// The latest verdict a pad recorded this run; every pad binds the same driver package.
+#[cfg(target_os = "windows")]
+pub fn pad_driver_probe() -> PadDriverVerdict {
+    PAD_DRIVER
+        .lock()
+        .map_or(PadDriverVerdict::Unseen, |v| v.clone())
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn note_pad_driver(verdict: PadDriverVerdict) {
+    if let Ok(mut v) = PAD_DRIVER.lock() {
+        *v = verdict;
+    }
+}
+
+#[cfg(test)]
+mod pad_driver_verdict_tests {
+    use super::*;
+    use pf_driver_proto::gamepad::{DEVTYPE_DUALSENSE, DEVTYPE_XBOX_ELITE, GAMEPAD_DRIVER_REV};
+
+    /// An attached driver below this host's revision still serves pads, with old behaviour.
+    /// Only the revision tells; the channel protocol matches.
+    #[test]
+    fn an_older_driver_revision_reads_as_stale() {
+        let ds = Some((0x054C, 0x0CE6));
+        assert_eq!(
+            pad_attach_verdict(DEVTYPE_DUALSENSE, GAMEPAD_DRIVER_REV, ds),
+            PadDriverVerdict::Current
+        );
+        assert_eq!(
+            pad_attach_verdict(DEVTYPE_DUALSENSE, 0, ds),
+            PadDriverVerdict::Stale {
+                driver_rev: 0,
+                host_rev: GAMEPAD_DRIVER_REV
+            },
+            "a driver older than the revision field stamps 0"
+        );
+        assert_eq!(
+            pad_attach_verdict(DEVTYPE_DUALSENSE, GAMEPAD_DRIVER_REV, None),
+            PadDriverVerdict::Current,
+            "an unread VID/PID is no evidence against the pad"
+        );
+    }
+
+    /// A failed start on a devnode whose ids carry no pf_* token is the driver's refusal; the
+    /// ids as the devnode reported them on .173.
+    #[test]
+    fn a_failed_pad_with_no_pf_id_reads_as_refused() {
+        let unknown =
+            "zz_unknown_pad;usb\\vid_054c&pid_0ce6&rev_0100&mi_03;usb\\vid_054c&pid_0ce6&mi_03;";
+        assert!(pad_refused(10, unknown));
+        assert!(!pad_refused(
+            10,
+            "pf_dualsense;usb\\vid_054c&pid_0ce6&mi_03;"
+        ));
+        assert!(
+            !pad_refused(28, unknown),
+            "no driver bound is not a refusal"
+        );
+    }
+
+    /// An old driver that does not know a hardware id answers as a DualSense.
+    #[test]
+    fn a_pad_answering_as_another_controller_is_named() {
+        assert_eq!(
+            pad_attach_verdict(DEVTYPE_XBOX_ELITE, 0, Some((0x054C, 0x0CE6))),
+            PadDriverVerdict::WrongIdentity {
+                want: (0x045E, 0x0B22),
+                got: (0x054C, 0x0CE6)
+            }
+        );
+    }
+}
+
 #[path = "inject/service.rs"]
 mod service;
 pub use service::InjectorService;
@@ -562,7 +678,6 @@ pub mod dualsense;
 pub mod dualsense_edge_windows;
 /// DualSense HID contract, shared by Linux UHID ([`dualsense`]) and Windows UMDF
 /// ([`dualsense_windows`]).
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/proto/dualsense_proto.rs"]
 pub mod dualsense_proto;
 /// Virtual DualSense over USB/IP (`vhci_hcd`) with its own USB Audio Class card — real USB
@@ -580,13 +695,23 @@ pub mod dualsense_windows;
 pub mod dualshock4;
 /// DualShock 4 HID codec, shared by Linux UHID ([`dualshock4`]) and Windows UMDF
 /// ([`dualshock4_windows`]).
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/proto/dualshock4_proto.rs"]
 pub mod dualshock4_proto;
 /// Virtual DualShock 4 via UMDF + shm (device-type 1).
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/dualshock4_windows.rs"]
 pub mod dualshock4_windows;
+/// Virtual 8BitDo pads in their own HID mode via UHID (`hid-generic`; SDL and Steam read hidraw).
+#[cfg(target_os = "linux")]
+#[path = "inject/linux/eightbitdo.rs"]
+pub mod eightbitdo;
+/// 8BitDo HID-mode codec. Not cfg-gated: pure byte-packing, so layout tests run on any host.
+#[path = "inject/proto/eightbitdo_proto.rs"]
+pub mod eightbitdo_proto;
+/// Virtual 8BitDo pads via UMDF + shm (device types 9–11).
+#[cfg(target_os = "windows")]
+#[path = "inject/windows/eightbitdo_windows.rs"]
+pub mod eightbitdo_windows;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/gamepad.rs"]
 pub mod gamepad;
@@ -599,6 +724,17 @@ pub mod gamepad;
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/gamepad_raii.rs"]
 mod gamepad_raii;
+/// HORIPAD for Steam codec. Not cfg-gated, like [`eightbitdo_proto`].
+#[path = "inject/proto/hori_proto.rs"]
+pub mod hori_proto;
+/// Virtual HORIPAD for Steam via UHID (`hid-generic`; SDL and Steam read hidraw).
+#[cfg(target_os = "linux")]
+#[path = "inject/linux/hori_steam.rs"]
+pub mod hori_steam;
+/// Virtual HORIPAD for Steam via UMDF + shm (device type 12).
+#[cfg(target_os = "windows")]
+#[path = "inject/windows/hori_windows.rs"]
+pub mod hori_windows;
 /// Resident virtual HID mouse via pf-mouse UMDF. Keeps `SM_MOUSEPRESENT` true on headless
 /// hosts so DWM composites a cursor into the IDD frame — `SendInput` alone moves an
 /// invisible pointer with no physical mouse.
@@ -624,6 +760,16 @@ pub mod pad_gate;
 /// nowhere.
 #[path = "inject/pad_pool.rs"]
 pub mod pad_pool;
+/// One sealed-channel UMDF pad ([`pad_shm::ShmPad`]): section, devnode and attach watcher, shared
+/// by every Windows HID pad identity.
+#[cfg(target_os = "windows")]
+#[path = "inject/windows/pad_shm.rs"]
+mod pad_shm;
+/// Host half of a Windows pad's `PadShm` section: stamp order, input seqlock, output-ring
+/// reader. Every access goes through the bounds-checked `SectionView`, so its tests run on
+/// every OS.
+#[path = "inject/pad_shm_ring.rs"]
+mod pad_shm_ring;
 /// Virtual-pad slot table + create lifecycle ([`pad_slots::PadSlots`]): `Vec<Option<Pad>>`,
 /// `active_mask` unplug sweep, gate-checked create.
 ///
@@ -633,6 +779,10 @@ pub mod pad_pool;
 /// everywhere or nowhere.
 #[path = "inject/pad_slots.rs"]
 pub mod pad_slots;
+/// Report-descriptor walk for the codec tests.
+#[cfg(test)]
+#[path = "inject/proto/rdesc_walk.rs"]
+mod rdesc_walk;
 /// Per-seat device visibility ([`seat_dev::SeatDev`]): the symlinks a sandboxed seat's Steam
 /// resolves its pads through, and the host-wide lock every create takes.
 ///
@@ -640,10 +790,8 @@ pub mod pad_slots;
 /// window arithmetic and the cross-seat rule are what a test pins, everywhere or nowhere.
 #[path = "inject/seat_dev.rs"]
 pub mod seat_dev;
-/// `sensor_timestamp` every virtual Sony pad stamps into its input reports
-/// ([`sensor_clock::SensorClock`]) — elapsed time in DualSense 1/3 µs and DualShock 4
-/// 5.33 µs units, shared by all four backends.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+/// The IMU clock virtual pads stamp into their input reports ([`sensor_clock::SensorClock`]):
+/// elapsed time in DualSense 1/3 µs, DualShock 4 5.33 µs, and µs for 8BitDo and HORIPAD.
 #[path = "inject/sensor_clock.rs"]
 pub mod sensor_clock;
 /// Virtual Steam Deck via UHID — kernel `hid-steam` binds it as a real Deck.
@@ -668,13 +816,11 @@ pub mod steam_gadget;
 /// Steam Controller / Steam Deck HID contract (descriptor, byte-exact Deck serializer,
 /// XInput/rich mappers, rumble parser). Linux UHID ([`steam_controller`]) and Windows UMDF
 /// ([`steam_deck_windows`]).
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/proto/steam_proto.rs"]
 pub mod steam_proto;
 /// Fallback remap of Steam-only inputs onto a non-Steam backend, plus Deck motion rescale.
 /// Shared by DualSense/DS4 (slot-less pads that must fold Steam back grips). Deck rescale
-/// is Linux-only but harmless to compile on Windows.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+/// is Linux-only but builds everywhere, so its tests run on any host.
 #[path = "inject/proto/steam_remap.rs"]
 pub mod steam_remap;
 /// Virtual Steam Deck over USB/IP (`vhci_hcd`). Steam-Input-promotable on non-SteamOS hosts
@@ -682,13 +828,25 @@ pub mod steam_remap;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/steam_usbip.rs"]
 pub mod steam_usbip;
+/// Switch 2 Pro / GameCube codec for `switch2_usbip`. Not cfg-gated: pure byte-packing.
+#[path = "inject/proto/switch2_proto.rs"]
+pub mod switch2_proto;
+/// Virtual Switch 2 Pro / GameCube controllers over USB/IP: the libusb-only pads.
+#[cfg(target_os = "linux")]
+#[path = "inject/linux/switch2_usbip.rs"]
+pub mod switch2_usbip;
 /// Virtual Switch Pro via UHID (kernel `hid-nintendo`).
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/switch_pro.rs"]
 pub mod switch_pro;
-/// Switch Pro codec + canned `hid-nintendo` handshake replies, used by [`switch_pro`].
-/// Not cfg-gated (same reason as `triton_proto`): pure byte-packing, so layout tests and
-/// the IMU unit contract in `tests/motion_contract.rs` run on any host, Windows included.
+/// Virtual Switch Pro Controller (`057E:2009`) via UMDF + shm (device-type 8). The driver
+/// answers the handshake; the host publishes `0x30` state and reads rumble and player lights.
+#[cfg(target_os = "windows")]
+#[path = "inject/windows/switch_pro_windows.rs"]
+pub mod switch_pro_windows;
+/// Switch Pro state mapping and feedback parsing, used by [`switch_pro`] and
+/// `switch_pro_windows`. Not cfg-gated (same reason as `triton_proto`): pure byte-packing, so
+/// layout tests and the IMU unit contract in `tests/motion_contract.rs` run on any host.
 #[path = "inject/proto/switch_proto.rs"]
 pub mod switch_proto;
 /// Sysfs/procfs poll helpers shared by the Linux backends' `#[ignore]`d device tests.
@@ -712,17 +870,25 @@ pub mod triton_usbip;
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/triton_windows.rs"]
 pub mod triton_windows;
-/// `/dev/uhid` event ABI shared by every UHID gamepad backend — constants each used to
-/// transcribe, plus field accessors that read a payload's real length.
+/// Device-node `open` and typed `ioctl`, shared by [`uinput_abi`], [`steam_gadget`] and the
+/// `/dev/uinput` probes.
+#[cfg(target_os = "linux")]
+#[path = "inject/linux/uapi.rs"]
+mod uapi;
+/// `/dev/uhid` event ABI and [`uhid_abi::UhidDevice`], the one device every UHID gamepad
+/// backend drives.
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/uhid_abi.rs"]
 pub mod uhid_abi;
-/// Stateful virtual-pad manager ([`uhid_manager::UhidManager`]) — event routing, frame
-/// merge, heartbeat, and feedback pump shared by the five UHID/UMDF backends; each supplies
-/// only its protocol via [`uhid_manager::PadProto`].
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+/// Virtual-pad manager ([`uhid_manager::UhidManager`]) — event routing, frame merge,
+/// heartbeat, and feedback pump shared by every UHID and UMDF pad, XUSB included; each
+/// supplies only its protocol via [`uhid_manager::PadProto`].
 #[path = "inject/uhid_manager.rs"]
 pub mod uhid_manager;
+/// `/dev/uinput` ABI and device shared by the uinput pad and pen.
+#[cfg(target_os = "linux")]
+#[path = "inject/linux/uinput_abi.rs"]
+mod uinput_abi;
 /// Byte-level tracing of the USB/IP socket (`PUNKTFUNK_USBIP_TRACE`). A framing bug in that
 /// stream is only visible as damage the kernel notices later, so the wire itself has to be
 /// recoverable.

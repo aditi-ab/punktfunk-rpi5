@@ -7,7 +7,7 @@
 //
 // Read per request, like `omarchyTheme`. The console polls `ui-config` every two seconds, so an
 // accent changed on the desktop reaches the page on the same tick.
-import { loopbackTls, mgmtToken, mgmtUrl } from "./auth";
+import { mgmtFetch } from "./forward";
 
 export interface HostTheme {
 	/** `gnome` | `kde` | `portal` | `windows`, or `null` when nothing answered. */
@@ -33,13 +33,10 @@ const HEX = /^#[0-9a-f]{6}$/i;
  * this process controls.
  */
 export async function hostTheme(): Promise<HostTheme | null> {
-	const base = mgmtUrl();
 	try {
-		const res = await fetch(`${base}/api/v1/host/theme`, {
-			headers: { authorization: `Bearer ${mgmtToken()}` },
+		const res = await mgmtFetch("/api/v1/host/theme", {
 			// A theme is decoration: it must never hold up the page it decorates.
 			signal: AbortSignal.timeout(1500),
-			...(loopbackTls(base) ?? {}),
 		});
 		if (!res.ok) return null;
 		const body = (await res.json()) as Partial<HostTheme>;

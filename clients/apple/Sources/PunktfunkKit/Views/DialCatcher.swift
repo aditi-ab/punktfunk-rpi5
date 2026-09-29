@@ -3,7 +3,7 @@
 // real gesture with the real thresholds (design/touch-client-overlay.md §3.3 — "the editor is the
 // tutorial"). A one-finger tap reports separately; the editor closes the ring on it.
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 import SwiftUI
 import UIKit
 

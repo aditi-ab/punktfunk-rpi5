@@ -321,10 +321,8 @@ struct SpeedTestView: View {
         let pin = host.pinnedSHA256
         // Probe at the mode this host would actually stream at: the measurement IS the streaming
         // path, so it should be the streaming path's mode.
-        let mode = EffectiveSettings.resolve(host: host, catalog: presets.catalog)
-        let (w, h, fps) = (
-            UInt32(clamping: mode.width), UInt32(clamping: mode.height),
-            UInt32(clamping: mode.refreshHz))
+        let (w, h, fps) = EffectiveSettings.resolve(host: host, catalog: presets.catalog)
+            .streamMode(native: NativeDisplay.mode)
         Task.detached(priority: .userInitiated) {
             // Same identity and trust as a session, but a TOFU result is not persisted from here.
             let identity = (try? ClientIdentityStore.shared.load())?.identity

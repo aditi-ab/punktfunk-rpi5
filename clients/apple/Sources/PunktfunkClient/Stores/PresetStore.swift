@@ -94,6 +94,15 @@ final class PresetStore: ObservableObject {
         catalog.presets.append(preset)
     }
 
+    /// Insert or replace by id: the console's editor saves a preset whole.
+    func put(_ preset: StreamPreset) {
+        if let i = catalog.presets.firstIndex(where: { $0.id == preset.id }) {
+            catalog.presets[i] = preset
+        } else {
+            catalog.presets.append(preset)
+        }
+    }
+
     func rename(_ id: String, to name: String) {
         guard let i = catalog.presets.firstIndex(where: { $0.id == id }) else { return }
         catalog.presets[i].name = name

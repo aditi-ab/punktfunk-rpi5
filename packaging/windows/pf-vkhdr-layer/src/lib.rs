@@ -1,9 +1,9 @@
 //! Vulkan implicit layer `VK_LAYER_PUNKTFUNK_hdr_inject` for IddCx displays.
 //!
 //! Some Windows ICDs accept HDR swapchains on indirect displays but omit their HDR surface formats.
-//! The layer intercepts both surface-format queries and appends HDR10/scRGB formats when Windows
-//! reports advanced color enabled for that surface's monitor. Existing formats are deduplicated;
-//! SDR and already-HDR surfaces pass through unchanged.
+//! The layer intercepts both surface-format queries and appends HDR10/scRGB formats when that
+//! surface's monitor is a Punktfunk virtual display in HDR (advanced color on, not ACM). Existing
+//! formats are deduplicated; physical, SDR and already-HDR surfaces pass through unchanged.
 //!
 //! `vkCreateWin32SurfaceKHR` supplies the `VkSurfaceKHR -> HWND` association used by the HDR gate.
 //! Every other command follows the Vulkan loader's normal dispatch chain. Win32 query structures
@@ -185,6 +185,18 @@ unsafe fn key(raw: u64) -> usize {
     // SAFETY: per this function's contract, `raw` points at a live dispatchable object whose
     // first pointer-sized word exists and is initialized (the loader wrote it at creation).
     unsafe { *(raw as usize as *const usize) }
+}
+
+/// Pick one field of the instance chain `raw` dispatches through. `None` when that chain was
+/// never hooked, or the map is poisoned.
+///
+/// # Safety
+/// `raw` must be a live dispatchable handle of an instance chain (`VkInstance` or
+/// `VkPhysicalDevice`) — the contract of [`key`].
+unsafe fn lookup<T>(raw: u64, pick: impl FnOnce(&InstanceData) -> Option<T>) -> Option<T> {
+    // SAFETY: `raw` is a live dispatchable handle per this function's contract.
+    let k = unsafe { key(raw) };
+    instances().lock().ok()?.get(&k).and_then(pick)
 }
 
 /// Reinterpret a function address as the loader's type-erased void-function pointer.
@@ -375,6 +387,18 @@ mod hdr {
         pub header: Header,
         pub gdi: [u16; 32],
     }
+    /// `DISPLAYCONFIG_TARGET_DEVICE_NAME`.
+    #[repr(C)]
+    pub struct TargetName {
+        pub header: Header,
+        pub flags: u32,
+        pub tech: i32,
+        pub edid_manufacture_id: u16,
+        pub edid_product_code_id: u16,
+        pub connector_instance: u32,
+        pub friendly: [u16; 64],
+        pub path: [u16; 128],
+    }
 
     #[link(name = "user32")]
     unsafe extern "system" {
@@ -393,7 +417,10 @@ mod hdr {
     }
     const QDC_ONLY_ACTIVE_PATHS: u32 = 2;
     const GET_SOURCE_NAME: i32 = 1;
+    const GET_TARGET_NAME: i32 = 2;
     const GET_ADVANCED_COLOR_INFO: i32 = 9;
+    /// The EDID manufacturer the Punktfunk virtual display carries (pf-win-display's match).
+    const PF_EDID_MANUFACTURER: &str = "PNK";
     const MONITOR_DEFAULTTONEAREST: u32 = 2;
 
     // Safe fn: every invariant below is local (out-params point at live locals / exact-length
@@ -443,8 +470,36 @@ mod hdr {
         if unsafe { DisplayConfigGetDeviceInfo(&mut ai as *mut _ as *mut c_void) } != 0 {
             return false;
         }
-        // value bitfield: bit0 advancedColorSupported, bit1 advancedColorEnabled.
-        (ai.value & 0b10) != 0
+        // value bitfield: bit1 advancedColorEnabled, bit2 wideColorEnforced. Enabled with wide
+        // colour enforced is ACM on an SDR panel, not HDR.
+        (ai.value & 0b110) == 0b010
+    }
+
+    /// The target is a Punktfunk virtual display; its monitor path names our EDID manufacturer.
+    fn target_is_ours(p: &PathInfo) -> bool {
+        // SAFETY: TargetName is a #[repr(C)] aggregate of integers — all-zero is a valid value.
+        let mut tn: TargetName = unsafe { std::mem::zeroed() };
+        tn.header.typ = GET_TARGET_NAME;
+        tn.header.size = std::mem::size_of::<TargetName>() as u32;
+        tn.header.adapter = p.tgt.adapter;
+        tn.header.id = p.tgt.id;
+        // SAFETY: the request header carries this struct's exact size, which is the documented
+        // bound for DisplayConfigGetDeviceInfo's write; `tn` is a live local across the call.
+        if unsafe { DisplayConfigGetDeviceInfo(&mut tn as *mut _ as *mut c_void) } != 0 {
+            return false;
+        }
+        let end = tn
+            .path
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(tn.path.len());
+        String::from_utf16_lossy(&tn.path[..end])
+            .to_ascii_uppercase()
+            .contains(PF_EDID_MANUFACTURER)
+    }
+
+    fn inject_for(p: &PathInfo) -> bool {
+        target_is_ours(p) && target_hdr_enabled(p)
     }
 
     fn source_gdi(p: &PathInfo) -> [u16; 32] {
@@ -460,8 +515,9 @@ mod hdr {
         sn.gdi
     }
 
-    /// Is HDR (Windows advanced color) currently enabled on the display this surface lives on?
-    /// `hwnd == 0`/unknown falls back to "any active display has HDR enabled".
+    /// Is the display this surface lives on a Punktfunk virtual display in HDR? Physical panels
+    /// and ACM never qualify: their ICD lists its own formats. `hwnd == 0`/unknown falls back to
+    /// "any of our displays is in HDR".
     ///
     /// Safe fn: `MonitorFromWindow` with `DEFAULTTONEAREST` tolerates any HWND value — including
     /// a destroyed or foreign one (our map can be stale) — so callers carry no obligations.
@@ -479,12 +535,12 @@ mod hdr {
             if unsafe { GetMonitorInfoW(mon, &mut mi) } != 0 {
                 for p in &paths {
                     if source_gdi(p) == mi.sz_device {
-                        return target_hdr_enabled(p);
+                        return inject_for(p);
                     }
                 }
             }
         }
-        paths.iter().any(target_hdr_enabled)
+        paths.iter().any(inject_for)
     }
 }
 
@@ -571,14 +627,9 @@ unsafe extern "system" fn layer_gipa(
     if instance == vk::Instance::null() {
         return None;
     }
-    let next = {
-        let g = instances().lock().ok()?;
-        // SAFETY: `instance` is non-null, and vkGetInstanceProcAddr's valid-usage rules make a
-        // non-null instance argument a live instance handle — a dispatchable object whose first
-        // word is the dispatch key.
-        g.get(&unsafe { key(instance.as_raw()) })
-            .map(|d| d.next_gipa)
-    };
+    // SAFETY: `instance` is non-null, and vkGetInstanceProcAddr's valid-usage rules make a
+    // non-null instance argument a live instance handle.
+    let next = unsafe { lookup(instance.as_raw(), |d| Some(d.next_gipa)) };
     // SAFETY: `next` is the down-chain GetInstanceProcAddr captured from the loader's link at
     // create_instance for this very chain; `p_name` is still valid NUL-terminated.
     next.and_then(|gipa| unsafe { gipa(instance, p_name) })
@@ -612,13 +663,8 @@ unsafe extern "system" fn layer_gpdpa(
     if instance == vk::Instance::null() {
         return None;
     }
-    let next = {
-        let g = instances().lock().ok()?;
-        // SAFETY: `instance` is non-null and (per the caller's contract) a live instance
-        // handle — a dispatchable object whose first word is the dispatch key.
-        g.get(&unsafe { key(instance.as_raw()) })
-            .and_then(|d| d.next_gpdpa)
-    };
+    // SAFETY: `instance` is non-null and (per the caller's contract) a live instance handle.
+    let next = unsafe { lookup(instance.as_raw(), |d| d.next_gpdpa) };
     // SAFETY: `next` is the down-chain GPDPA captured from the loader's link at create_instance
     // for this very chain; `p_name` is still valid NUL-terminated.
     next.and_then(|gpdpa| unsafe { gpdpa(instance, p_name) })
@@ -825,14 +871,11 @@ unsafe extern "system" fn create_device(
         (gipa, gdpa)
     };
 
-    let inst = instances()
-        .lock()
-        .ok()
-        // SAFETY: vkCreateDevice requires `pdev` to be a live physical-device handle — a
-        // dispatchable object sharing its instance's dispatch table, so its first word is the
-        // same dispatch key create_instance stored.
-        .and_then(|g| g.get(&unsafe { key(pdev.as_raw()) }).map(|d| d.instance))
-        .unwrap_or(vk::Instance::null());
+    // SAFETY: vkCreateDevice requires `pdev` to be a live physical-device handle — a
+    // dispatchable object sharing its instance's dispatch table, so its first word is the same
+    // dispatch key create_instance stored.
+    let inst =
+        unsafe { lookup(pdev.as_raw(), |d| Some(d.instance)) }.unwrap_or(vk::Instance::null());
 
     // SAFETY: `next_gipa` is the loader-supplied down-chain GIPA for this create call, `inst` is
     // the (possibly null) instance owning `pdev`, and FnCreateDevice mirrors vkCreateDevice's
@@ -865,13 +908,8 @@ unsafe extern "system" fn create_win32_surface(
     p_alloc: *const c_void,
     p_surface: *mut vk::SurfaceKHR,
 ) -> vk::Result {
-    let down = instances().lock().ok().and_then(|g| {
-        // SAFETY: vkCreateWin32SurfaceKHR requires `inst` to be a live instance handle — a
-        // dispatchable object whose first word is the dispatch key.
-        g.get(&unsafe { key(inst.as_raw()) })
-            .and_then(|d| d.create_win32_surface)
-    });
-    let down = match down {
+    // SAFETY: vkCreateWin32SurfaceKHR requires `inst` to be a live instance handle.
+    let down = match unsafe { lookup(inst.as_raw(), |d| d.create_win32_surface) } {
         Some(f) => f,
         None => return vk::Result::ERROR_EXTENSION_NOT_PRESENT,
     };
@@ -900,13 +938,8 @@ unsafe extern "system" fn destroy_surface(
     if let Ok(mut m) = surface_hwnds().lock() {
         m.remove(&surface.as_raw());
     }
-    let down = instances().lock().ok().and_then(|g| {
-        // SAFETY: vkDestroySurfaceKHR requires `inst` to be a live instance handle — a
-        // dispatchable object whose first word is the dispatch key.
-        g.get(&unsafe { key(inst.as_raw()) })
-            .and_then(|d| d.destroy_surface)
-    });
-    if let Some(f) = down {
+    // SAFETY: vkDestroySurfaceKHR requires `inst` to be a live instance handle.
+    if let Some(f) = unsafe { lookup(inst.as_raw(), |d| d.destroy_surface) } {
         // SAFETY: `f` is the down-chain vkDestroySurfaceKHR resolved for this instance at
         // create time; forwarding the caller's own arguments unchanged.
         unsafe { f(inst, surface, p_alloc) };
@@ -924,13 +957,9 @@ unsafe extern "system" fn get_surface_formats(
     if p_count.is_null() {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
-    let down = instances().lock().ok().and_then(|g| {
-        // SAFETY: vkGetPhysicalDeviceSurfaceFormatsKHR requires `pdev` to be a live
-        // physical-device handle — a dispatchable object whose first word is the dispatch key.
-        g.get(&unsafe { key(pdev.as_raw()) })
-            .and_then(|d| d.get_surface_formats)
-    });
-    let down = match down {
+    // SAFETY: vkGetPhysicalDeviceSurfaceFormatsKHR requires `pdev` to be a live physical-device
+    // handle.
+    let down = match unsafe { lookup(pdev.as_raw(), |d| d.get_surface_formats) } {
         Some(f) => f,
         None => return vk::Result::ERROR_INITIALIZATION_FAILED,
     };
@@ -996,13 +1025,9 @@ unsafe extern "system" fn get_surface_formats2(
     if p_info.is_null() || p_count.is_null() {
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
-    let down = instances().lock().ok().and_then(|g| {
-        // SAFETY: vkGetPhysicalDeviceSurfaceFormats2KHR requires `pdev` to be a live
-        // physical-device handle — a dispatchable object whose first word is the dispatch key.
-        g.get(&unsafe { key(pdev.as_raw()) })
-            .and_then(|d| d.get_surface_formats2)
-    });
-    let down = match down {
+    // SAFETY: vkGetPhysicalDeviceSurfaceFormats2KHR requires `pdev` to be a live physical-device
+    // handle.
+    let down = match unsafe { lookup(pdev.as_raw(), |d| d.get_surface_formats2) } {
         Some(f) => f,
         None => return vk::Result::ERROR_INITIALIZATION_FAILED,
     };

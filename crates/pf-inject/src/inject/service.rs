@@ -50,8 +50,113 @@ impl InjectorService {
 /// 2 s between reopen attempts after open/worker death, so a dead portal is not hit once per event.
 const INJECTOR_REOPEN_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Lazy-open worker. Reopen after [`INJECTOR_REOPEN_BACKOFF`] on open failure, on an unpinned
-/// backend change, or if the worker dies. Exits when every sender drops (host shutdown, or
+/// The service thread's injector and its reopen policy.
+#[derive(Default)]
+struct InjectorSlot {
+    injector: Option<Box<dyn InputInjector>>,
+    /// Backend of the last open. `None` while pinned or after a failure.
+    open_backend: Option<Backend>,
+    /// Last open or inject failure. The next open waits [`INJECTOR_REOPEN_BACKOFF`] from it.
+    last_failed: Option<std::time::Instant>,
+    /// What the open injector's keyboard holds; repeats and stale ups stop here.
+    gate: KeyGate,
+}
+
+impl InjectorSlot {
+    /// Block for the next event, running the injector's `on_deadline` whenever its deadline
+    /// passes first, then drain the backlog behind it. `None` once every sender has dropped.
+    fn next_batch(
+        &mut self,
+        rx: &std::sync::mpsc::Receiver<InputEvent>,
+    ) -> Option<Vec<InputEvent>> {
+        use std::sync::mpsc::RecvTimeoutError;
+        let first = loop {
+            let Some(due) = self.injector.as_ref().and_then(|i| i.deadline()) else {
+                break rx.recv().ok()?;
+            };
+            match rx.recv_timeout(due.saturating_duration_since(std::time::Instant::now())) {
+                Ok(ev) => break ev,
+                Err(RecvTimeoutError::Timeout) => {
+                    if let Some(Err(e)) = self.injector.as_mut().map(|i| i.on_deadline()) {
+                        self.fail(&e);
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => return None,
+            }
+        };
+        let mut batch = vec![first];
+        batch.extend(rx.try_iter());
+        Some(batch)
+    }
+
+    /// Drop a dead injector (portal or EIS worker gone). The next open waits out the backoff.
+    fn fail(&mut self, e: &anyhow::Error) {
+        tracing::warn!(error = %format!("{e:#}"), "inject failed — reopening injector");
+        self.injector = None;
+        self.open_backend = None;
+        self.last_failed = Some(std::time::Instant::now());
+    }
+
+    /// Unpinned: drop an injector serving another backend than `want`, so input follows the
+    /// active session instead of a stale EIS socket. The reopen skips the backoff.
+    fn follow(&mut self, want: Backend) {
+        if self.injector.is_some() && self.open_backend != Some(want) {
+            tracing::info!(
+                open_backend = ?self.open_backend,
+                ?want,
+                "input: backend changed — reopening injector for the active session"
+            );
+            self.injector = None;
+            self.last_failed = None;
+        }
+    }
+
+    /// Open with `open` when closed and the backoff since the last failure has run out. Events
+    /// that arrive inside the backoff drop; input is lossy.
+    fn ensure_open(
+        &mut self,
+        want: Option<Backend>,
+        open: impl FnOnce() -> Result<Box<dyn InputInjector>>,
+    ) {
+        let backing_off = self
+            .last_failed
+            .is_some_and(|t| t.elapsed() < INJECTOR_REOPEN_BACKOFF);
+        if self.injector.is_some() || backing_off {
+            return;
+        }
+        match open() {
+            Ok(i) => {
+                self.injector = Some(i);
+                self.open_backend = want;
+                self.last_failed = None;
+                self.gate.reset();
+            }
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "pointer/keyboard injection unavailable — will retry");
+                self.last_failed = Some(std::time::Instant::now());
+            }
+        }
+    }
+
+    /// Inject in order, key transitions only ([`KeyGate`]). A failure drops the injector and
+    /// the rest of the batch, which is stale by the time a later event reopens it.
+    fn inject_batch(&mut self, batch: Vec<InputEvent>) {
+        let Some(inj) = self.injector.as_mut() else {
+            return;
+        };
+        for ev in batch {
+            if !self.gate.admit(&ev) {
+                continue;
+            }
+            if let Err(e) = inj.inject(&ev) {
+                self.fail(&e);
+                return;
+            }
+        }
+    }
+}
+
+/// Lazy-open worker over an [`InjectorSlot`]. Exits when every sender drops (host shutdown, or
 /// session end for a pin). `pin` is the gamescope relay ([`InjectorService::start_at`]); `None`
 /// follows [`default_backend`]. Each wake drains the backlog and [`coalesce`]s motion so a slow
 /// backend cannot queue stale relative-mouse/scroll; buttons, keys, and absolute moves stay ordered.
@@ -59,87 +164,74 @@ fn injector_service_thread(
     rx: std::sync::mpsc::Receiver<InputEvent>,
     pin: Option<std::path::PathBuf>,
 ) {
-    let mut injector: Option<Box<dyn InputInjector>> = None;
-    let mut open_backend: Option<Backend> = None;
-    let mut last_failed: Option<std::time::Instant> = None;
+    let mut slot = InjectorSlot::default();
     let mut warped_gen = crate::aim_gen();
-    while let Ok(first) = rx.recv() {
-        let mut batch = vec![first];
-        while let Ok(ev) = rx.try_recv() {
-            batch.push(ev);
+    while let Some(batch) = slot.next_batch(&rx) {
+        // Read the published backend from its `RwLock`, not `getenv`: `setenv` on connect raced
+        // this hot path. A pin never follows; its target can only die.
+        let want = pin.is_none().then(default_backend);
+        if let Some(want) = want {
+            slot.follow(want);
         }
-
-        // Unpinned: reopen if the published backend changed, so input follows the active session
-        // instead of a stale EIS socket. Read the `RwLock`, not `getenv` — `setenv` on connect
-        // raced this hot path. A pin never follows; its target can only die (reopen arm below).
-        let want = if pin.is_none() {
-            let want = default_backend();
-            if injector.is_some() && open_backend != Some(want) {
-                tracing::info!(
-                    ?open_backend,
-                    ?want,
-                    "input: backend changed — reopening injector for the active session"
-                );
-                injector = None;
-                last_failed = None; // skip backoff; resolve now
+        // Lazy open also covers pin ordering: the service is created before gamescope, and the
+        // relay exists by the first event (the libei worker polls it).
+        slot.ensure_open(want, || {
+            let opened = match (&pin, want) {
+                #[cfg(target_os = "linux")]
+                (Some(relay), _) => crate::open_gamescope_at(relay.clone()),
+                #[cfg(not(target_os = "linux"))]
+                (Some(_), _) => unreachable!("pinned injector is Linux-only (start_at)"),
+                (None, Some(want)) => open(want),
+                (None, None) => unreachable!("unpinned resolve always yields a backend"),
+            }?;
+            match &pin {
+                Some(relay) => tracing::info!(relay = %relay.display(),
+                    "input injector ready (session-pinned gamescope)"),
+                None => tracing::info!(backend = ?want, "input injector ready (host-lifetime)"),
             }
-            Some(want)
-        } else {
-            None
-        };
-        if injector.is_none() {
-            // First event opens; after failure wait the backoff (a few events drop; input is lossy).
-            // Lazy open also covers pin ordering: the service is created before gamescope, and the
-            // relay exists by the first event (the libei worker polls it).
-            let ready = last_failed.is_none_or(|t| t.elapsed() >= INJECTOR_REOPEN_BACKOFF);
-            if ready {
-                let opened = match (&pin, want) {
-                    #[cfg(target_os = "linux")]
-                    (Some(relay), _) => crate::open_gamescope_at(relay.clone()),
-                    #[cfg(not(target_os = "linux"))]
-                    (Some(_), _) => unreachable!("pinned injector is Linux-only (start_at)"),
-                    (None, Some(want)) => open(want),
-                    (None, None) => unreachable!("unpinned resolve always yields a backend"),
-                };
-                match opened {
-                    Ok(i) => {
-                        match &pin {
-                            Some(relay) => tracing::info!(relay = %relay.display(),
-                                "input injector ready (session-pinned gamescope)"),
-                            None => {
-                                tracing::info!(backend = ?want, "input injector ready (host-lifetime)")
-                            }
-                        }
-                        injector = Some(i);
-                        open_backend = want;
-                        last_failed = None;
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %format!("{e:#}"), "pointer/keyboard injection unavailable — will retry");
-                        last_failed = Some(std::time::Instant::now());
-                    }
-                }
-            }
-        }
-        if let Some(inj) = injector.as_mut() {
-            for ev in warp_onto_stream_head(
+            Ok(opened)
+        });
+        if slot.injector.is_some() {
+            slot.inject_batch(warp_onto_stream_head(
                 coalesce(batch),
                 crate::aim_gen(),
                 &mut warped_gen,
                 crate::stream_extent(),
-            ) {
-                if let Err(e) = inj.inject(&ev) {
-                    // Portal / EIS worker died. Drop and reopen on a later event (gamescope respawns).
-                    tracing::warn!(error = %format!("{e:#}"), "inject failed — reopening injector");
-                    injector = None;
-                    open_backend = None;
-                    last_failed = Some(std::time::Instant::now());
-                    break; // rest of this batch is stale; the next recv reopens
-                }
-            }
+            ));
         }
     }
     tracing::debug!("injector service stopped (host shutting down)");
+}
+
+/// Key transitions only, toward a compositor. A client forwards its OS auto-repeat as more
+/// downs; a Wayland app repeats a held key itself, and Hyprland matches binds on every press
+/// it is handed, so a repeat re-ran a chord's bind and could eat the key's release. A down
+/// for a held key and an up for a key that is not held stop here. Windows keeps repeats:
+/// `SendInput` never repeats on its own.
+#[derive(Default)]
+struct KeyGate {
+    held: std::collections::HashSet<u8>,
+}
+
+impl KeyGate {
+    /// Whether `ev` changes what the compositor holds. Every other kind passes.
+    fn admit(&mut self, ev: &InputEvent) -> bool {
+        if cfg!(target_os = "windows") {
+            return true;
+        }
+        // The injectors take the low byte as the VK; so does the gate.
+        let vk = ev.code as u8;
+        match ev.kind {
+            InputKind::KeyDown => self.held.insert(vk),
+            InputKind::KeyUp => self.held.remove(&vk),
+            _ => true,
+        }
+    }
+
+    /// New devices hold nothing: the next down of a still-held key is a press again.
+    fn reset(&mut self) {
+        self.held.clear();
+    }
 }
 
 /// Centre of the streamed head: a sample at half of `extent`, which is the head's own mode when
@@ -214,6 +306,8 @@ fn coalesce(events: Vec<InputEvent>) -> Vec<InputEvent> {
 mod tests {
     use super::*;
     use punktfunk_core::input::{InputEvent, InputKind, SCROLL_FLAG_PRECISE};
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     fn mk(kind: InputKind, code: u32, x: i32, y: i32) -> InputEvent {
         InputEvent {
@@ -328,6 +422,98 @@ mod tests {
         assert_eq!(out.len(), 2);
     }
 
+    /// Records the codes it injected and fails on `fail_on`.
+    struct Fake {
+        log: Rc<RefCell<Vec<u32>>>,
+        fail_on: Option<u32>,
+    }
+
+    impl InputInjector for Fake {
+        fn inject(&mut self, ev: &InputEvent) -> Result<()> {
+            self.log.borrow_mut().push(ev.code);
+            if self.fail_on == Some(ev.code) {
+                anyhow::bail!("worker died");
+            }
+            Ok(())
+        }
+    }
+
+    fn fake(log: &Rc<RefCell<Vec<u32>>>, fail_on: Option<u32>) -> Result<Box<dyn InputInjector>> {
+        Ok(Box::new(Fake {
+            log: log.clone(),
+            fail_on,
+        }))
+    }
+
+    fn keys(codes: &[u32]) -> Vec<InputEvent> {
+        codes
+            .iter()
+            .map(|&c| mk(InputKind::KeyDown, c, 0, 0))
+            .collect()
+    }
+
+    /// A dead portal is retried once per backoff, not once per event.
+    #[test]
+    fn a_failed_open_waits_out_the_backoff() {
+        let mut slot = InjectorSlot::default();
+        let mut opens = 0;
+        for _ in 0..2 {
+            slot.ensure_open(None, || {
+                opens += 1;
+                anyhow::bail!("portal down")
+            });
+        }
+        assert_eq!(opens, 1);
+        slot.last_failed = std::time::Instant::now().checked_sub(INJECTOR_REOPEN_BACKOFF);
+        let log = Rc::default();
+        slot.ensure_open(None, || fake(&log, None));
+        assert!(slot.injector.is_some() && slot.last_failed.is_none());
+    }
+
+    /// A dead worker takes the stale rest of its batch with it, and the reopen backs off.
+    #[test]
+    fn an_inject_failure_drops_the_rest_of_the_batch() {
+        let log = Rc::default();
+        let mut slot = InjectorSlot::default();
+        slot.ensure_open(None, || fake(&log, Some(2)));
+        slot.inject_batch(keys(&[1, 2, 3]));
+        assert_eq!(*log.borrow(), [1, 2]);
+        assert!(slot.injector.is_none() && slot.last_failed.is_some());
+        let mut opened = false;
+        slot.ensure_open(None, || {
+            opened = true;
+            fake(&log, None)
+        });
+        assert!(!opened);
+    }
+
+    /// Input follows the session's published backend instead of a stale EIS socket.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_backend_change_reopens_for_the_active_session() {
+        let log = Rc::default();
+        let mut slot = InjectorSlot::default();
+        slot.ensure_open(Some(Backend::WlrVirtual), || fake(&log, None));
+        slot.follow(Backend::WlrVirtual);
+        assert!(slot.injector.is_some());
+        slot.follow(Backend::Libei);
+        assert!(slot.injector.is_none());
+        slot.ensure_open(Some(Backend::Libei), || fake(&log, None));
+        assert_eq!(slot.open_backend, Some(Backend::Libei));
+    }
+
+    #[test]
+    fn a_wake_drains_the_backlog_and_the_last_sender_ends_the_loop() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for ev in keys(&[1, 2, 3]) {
+            tx.send(ev).unwrap();
+        }
+        drop(tx);
+        let mut slot = InjectorSlot::default();
+        assert_eq!(slot.next_batch(&rx).map(|b| b.len()), Some(3));
+        assert!(slot.next_batch(&rx).is_none());
+    }
+
     #[test]
     fn coalesce_handles_empty_and_singleton() {
         assert!(coalesce(vec![]).is_empty());
@@ -345,5 +531,28 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!((out[0].x, out[0].flags), (24, SCROLL_FLAG_PRECISE));
         assert_eq!((out[1].x, out[1].flags), (240, 0));
+    }
+
+    /// A repeat and a stale up stop at the gate; the one up after repeats passes, and a
+    /// reopened device sees the still-held key pressed again.
+    #[test]
+    #[cfg_attr(target_os = "windows", ignore = "SendInput keeps every repeat")]
+    fn the_key_gate_passes_transitions_only() {
+        let mut gate = KeyGate::default();
+        let down = mk(InputKind::KeyDown, 0x41, 0, 0);
+        let up = mk(InputKind::KeyUp, 0x41, 0, 0);
+        assert!(gate.admit(&down));
+        assert!(!gate.admit(&down), "auto-repeat");
+        assert!(gate.admit(&mk(InputKind::MouseMove, 0, 1, 1)));
+        assert!(gate.admit(&mk(InputKind::KeyDown, 0x42, 0, 0)));
+        assert!(gate.admit(&up));
+        assert!(!gate.admit(&up), "stale up");
+        assert!(gate.admit(&down));
+        gate.reset();
+        assert!(gate.admit(&down), "a new device holds nothing");
+        assert!(
+            !gate.admit(&mk(InputKind::KeyDown, 0x141, 0, 0)),
+            "same low byte"
+        );
     }
 }

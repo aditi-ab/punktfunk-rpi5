@@ -37,6 +37,13 @@ final class LibraryFavorites: ObservableObject {
         UserDefaults.standard.set(list, forKey: Self.key(hostID))
     }
 
+    /// Replace `hostID`'s list whole: the console's settings document carries it.
+    func set(_ ids: [String], host hostID: String) {
+        guard ids != self.ids(for: hostID) else { return }
+        changed[hostID] = ids
+        UserDefaults.standard.set(ids, forKey: Self.key(hostID))
+    }
+
     /// Part of removing a host: nothing it held stays behind on the device.
     func forget(hostID: String) {
         changed[hostID] = nil

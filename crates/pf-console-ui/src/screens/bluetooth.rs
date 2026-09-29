@@ -28,7 +28,7 @@ enum Row {
 }
 
 pub(crate) struct BluetoothScreen {
-    list: MenuList,
+    pub(crate) list: MenuList,
     rows: Vec<Row>,
     selected: Option<String>,
     forget: Option<String>,
@@ -150,7 +150,7 @@ impl BluetoothScreen {
         let state = bluetooth::snapshot();
         self.sync(&state);
         if self.editing {
-            if ctx.deck {
+            if ctx.device.deck {
                 if matches!(ev, MenuEvent::Back | MenuEvent::Confirm) {
                     self.editing = false;
                 }
@@ -170,7 +170,7 @@ impl BluetoothScreen {
     pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, _fx: &mut Outbox) -> bool {
         let state = bluetooth::snapshot();
         self.sync(&state);
-        if self.editing && !ctx.deck {
+        if self.editing && !ctx.device.deck {
             if !self.keyboard.covers(p) {
                 if p.press() {
                     self.editing = false;
@@ -296,6 +296,15 @@ impl BluetoothScreen {
     pub(crate) fn editing(&self) -> bool {
         self.editing
     }
+    pub(crate) fn edit_field(&self) -> Option<crate::screens::EditField> {
+        self.editing.then(|| {
+            crate::screens::EditField::new(
+                if self.passkey { "Passkey" } else { "PIN" },
+                &self.input,
+                self.passkey,
+            )
+        })
+    }
     pub(crate) fn edit_key(&mut self, key: crate::input::Key) -> bool {
         use crate::input::Key;
         if !self.editing {
@@ -389,9 +398,9 @@ impl BluetoothScreen {
                 PromptKind::Pin | PromptKind::Passkey => {
                     format!("Enter the pairing code for {}.", p.device)
                 }
-                PromptKind::Display { code } => format!(
-                    "Enter {code} on {}, then press Enter.", p.device
-                ),
+                PromptKind::Display { code } => {
+                    format!("Enter {code} on {}, then press Enter.", p.device)
+                }
                 PromptKind::Authorize => format!("Allow {} to connect?", p.device),
             };
         }
@@ -428,7 +437,7 @@ impl BluetoothScreen {
     ) {
         let state = bluetooth::snapshot();
         self.sync(&state);
-        let seat = self.keyboard.seat(self.editing && !ctx.deck, dt);
+        let seat = self.keyboard.seat(self.editing && !ctx.device.deck, dt);
         let tray_h = (Keyboard::tray_height() + 12.0) * k * seat;
         let specs: Vec<_> = self.rows.iter().map(|r| self.spec(r, &state)).collect();
         self.list.render(

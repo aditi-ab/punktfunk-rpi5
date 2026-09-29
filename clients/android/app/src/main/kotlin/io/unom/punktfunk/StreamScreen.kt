@@ -25,9 +25,6 @@ import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -53,6 +50,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -71,10 +69,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.LifecycleOwner
-import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.GamepadRouter
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.security.IdentityLoad
@@ -85,7 +79,11 @@ import io.unom.punktfunk.kit.SessionEndReason
 import io.unom.punktfunk.kit.VideoDecoders
 import io.unom.punktfunk.kit.VideoFit
 import io.unom.punktfunk.models.ActiveSession
+import io.unom.punktfunk.kit.library.GameEnd
+import io.unom.punktfunk.kit.library.LibraryClient
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -150,37 +148,8 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             ui.motionHint = false
         }
     }
-    // The start-of-stream banner: what this session's shortcuts ARE, said once. A stream takes the
-    // whole screen and answers to none of the device's usual gestures, so it has to say how to get
-    // back out — the desktop console draws the same pill for the same reason
-    // (`pf-console-ui/src/skia_overlay.rs`, BANNER_S = 6 s with a BANNER_FADE_S = 0.6 s tail).
-    // Two states because the fade and the removal are different moments: `bannerUp` composes the
-    // pill at all, `bannerFading` runs its alpha down over the last 600 ms.
-    var bannerUp by remember(handle) { mutableStateOf(true) }
-    var bannerFading by remember(handle) { mutableStateOf(false) }
-    val bannerAlpha by animateFloatAsState(
-        targetValue = if (bannerFading) 0f else 1f,
-        // Linear, like the desktop's (BANNER_S - age) / BANNER_FADE_S ramp — Compose's default
-        // easing would hold near-opaque and then drop, which reads as a glitch rather than a fade.
-        animationSpec = tween(600, easing = LinearEasing),
-        label = "streamStartBanner",
-    )
-    LaunchedEffect(handle) {
-        delay(5400) // 6 s − the 0.6 s tail: fully opaque until here, exactly as on the desktop
-        bannerFading = true
-        delay(600)
-        bannerUp = false // stop composing it once it is invisible
-    }
-    // Live decode stats for the HUD. `statsOn` (verbosity != OFF) gates the whole native pipeline:
-    // the per-frame sampling (nativeSetVideoStatsEnabled — a hidden HUD costs one atomic load per
-    // frame) AND the 1 s poll loop, which only runs while the overlay is visible. Enabling resets
-    // the native window, so re-showing never renders stale data. A 3-finger tap — or the Select + X
-    // pad chord, which is the only route a TV or a passthrough-touch session has — cycles the
-    // verbosity tier live (Off → Compact → Normal → Detailed → Off); the default comes from
-    // Settings. The tier is read at each poll, so switching between visible tiers never blanks the
-    // numbers (the effect keys on `statsOn`, not the tier); the new tier shows at the next poll.
-    var statsLines by remember { mutableStateOf<List<HudLine>>(emptyList()) }
-    val statsOn = ui.statsVerbosity != StatsVerbosity.OFF
+    // The start-of-stream banner: what this session's shortcuts ARE, said once.
+    val banner = rememberStartBanner(handle)
     // Touch model is fixed per session (re-keys the gesture handler below if it ever changes).
     // Passthrough needs a host that injects touch; without the bit every contact would vanish, so
     // the session runs the trackpad model instead and `touchHint` below says so, once.
@@ -206,17 +175,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     // How the picture fills the container, and the frame it places: the SurfaceView, the touch and
     // pen lanes and the mouse all map through this one placement (kit `VideoFit`).
     val videoFit = remember(handle) { VideoFit.fromName(initialSettings.videoFit) }
-    // The decoder's picture size once known: a host framing the picture for this device (a join,
-    // a mirrored head) sends a size other than the mode, and the placement follows the frames.
-    var decodedSize by remember(handle) { mutableStateOf<IntArray?>(null) }
-    LaunchedEffect(handle) {
-        while (true) {
-            NativeBridge.nativeVideoDecodedSize(handle)
-                ?.takeIf { it.size >= 2 && it[0] > 0 && it[1] > 0 && !it.contentEquals(decodedSize) }
-                ?.let { decodedSize = it }
-            delay(500)
-        }
-    }
+    val decodedSize by rememberDecodedSize(handle)
     fun videoFrame() = decodedSize?.let { VideoFrame(videoFit, it[0], it[1]) }
         ?: VideoFrame(videoFit, requestedMode.getOrElse(0) { 0 }, requestedMode.getOrElse(1) { 0 })
     val haptics = rememberConsoleHaptics()
@@ -224,6 +183,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     // TV form factor (leanback): the decoder actively switches the HDMI output mode to the stream
     // refresh; a phone/tablet gets the softer seamless frame-rate hint instead.
     val isTv = remember { context.packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK) }
+    val isChromeOs = remember { context.packageManager.hasSystemFeature("org.chromium.arc") }
     // Focus anchor the soft keyboard is summoned onto AND the pointer-capture grab target (a grab
     // needs a focusable view; captured-pointer events land on it). Declared before the effect
     // below so the capture callbacks can reach the view once it exists.
@@ -247,30 +207,9 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         )
     }
 
-    // The virtual controller (design §4): shown from the ring's `pad` slot, per session. While
-    // up it holds one wire pad on the router, so the host sees one controller arrive and, on
-    // hide, one leave (§9). Never toggled by the ring's own open and close (§8 trap 4).
+    // The virtual controller (design §4), shown from the ring's `pad` slot, per session.
     var padShown by remember(handle) { mutableStateOf(false) }
-    var virtualPad by remember(handle) { mutableStateOf<GamepadRouter.ExternalPad?>(null) }
-    // Its kind follows the Controller type setting. Automatic is an Xbox 360 pad, or a
-    // DualSense when this phone's gyro is to speak for it — a 360 has no motion plane.
-    val virtualPadKind = when {
-        initialSettings.gamepad != Gamepad.PREF_AUTO -> initialSettings.gamepad
-        initialSettings.gyroOnPhone -> Gamepad.PREF_DUALSENSE
-        else -> Gamepad.PREF_XBOX360
-    }
-    DisposableEffect(padShown) {
-        val ext = if (padShown) {
-            activity?.gamepadRouter?.openExternal(virtualPadKind, ownMotion = false)
-        } else {
-            null
-        }
-        virtualPad = ext
-        onDispose {
-            ext?.close()
-            virtualPad = null
-        }
-    }
+    val virtualPad by rememberVirtualPad(handle, padShown, initialSettings, activity)
     var touchHint by remember { mutableStateOf(touchUnsupported) }
     LaunchedEffect(touchHint) {
         if (touchHint) {
@@ -293,117 +232,49 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     LaunchedEffect(handle) {
         NativeBridge.nativeSetInvertScroll(handle, ui.invertScroll)
     }
-    LaunchedEffect(handle, statsOn) {
-        NativeBridge.nativeSetVideoStatsEnabled(handle, statsOn)
-        if (statsOn) {
-            while (true) {
-                delay(1000)
-                // The panel's LIVE rate, re-read each poll: a governor that ignored the mode pin
-                // leaves the panel below the stream, which the overlay names as a warning line.
-                val display = runCatching { context.display }.getOrNull()
-                statsLines = decodeHudLines(
-                    NativeBridge.nativeVideoStatsLines(
-                        handle, ui.statsVerbosity.ordinal, initialSettings.advancedStats,
-                        display?.refreshRate ?: 0f, display?.mode?.refreshRate ?: 0f,
-                        session.presetName,
-                    ),
-                )
-            }
-        } else {
-            statsLines = emptyList() // drop the last window so a re-show never flashes stale numbers
-        }
-    }
+    // The companion panel (design/android-dual-screen.md): a second screen below the picture —
+    // the lower half of a hinge with room for it, else a small second display — carries pages the
+    // player flips between. Only while streaming; showing the pad brings its page forward.
+    val density = LocalDensity.current
+    var rootSize by remember { mutableStateOf(IntSize.Zero) }
+    val fold = rememberFoldHinge()?.let { foldSplit(it, rootSize) }
+    val hingeCompanion = fold?.carriesCompanion(rootSize.height) == true
+    val companionDisplay = rememberCompanionDisplay().takeUnless { hingeCompanion }
+    val companionUp = hingeCompanion || companionDisplay != null
+    // The POINTER grant gates every touch capture layer: "don't capture what can't land".
+    val pointerOk = ui.accessGrants and SessionAccess.POINTER != 0
+    val companionPages = companionPages(pointerOk, padShown || activity?.gamepadRouter?.sendsEnabled() == true)
+    var companionPick by remember { mutableStateOf(CompanionMemory.page(context)) }
+    val companionPage = companionPick.takeIf { it in companionPages } ?: CompanionPage.STATS
+    LaunchedEffect(padShown) { if (padShown) companionPick = CompanionPage.PAD }
 
-    // Host-gone watchdog. When the host suspends/sleeps (or crashes, or drops off the network) it
-    // stops answering the QUIC keep-alive and the connection idle-times out (~8 s) — no more frames
-    // arrive and the decoder would otherwise sit frozen on its last decoded frame until the user
-    // manually backed out. Poll the native session-liveness flag (one atomic load, independent of the
-    // stats HUD) and, the moment the session is dead, drop back to the menu so the user can
-    // Wake-on-LAN the host instead of being stranded on a frozen picture. Mirrors the Apple client's
-    // onSessionEnd → sessionEnded() → disconnect(). The 1 s cadence + the ~8 s idle timeout is a
-    // deliberately generous window: the keep-alive holds a merely-quiet connection (a static desktop)
-    // open, so this fires only on a genuinely dead peer, never a false positive. Keyed on `handle`, so
-    // it stops the moment we navigate away (the handle is only freed later, in onDispose).
-    LaunchedEffect(handle) {
-        var lastAccessSeq = initialAccess?.getOrNull(2) ?: 0
-        while (true) {
-            delay(1000)
-            // Access first, ended second: a session about to close on its expiry gets its final
-            // countdown read, which is what lets the ended branch word that close honestly.
-            NativeBridge.nativeAccessState(handle)?.let { st ->
-                val grants = st.getOrNull(0) ?: SessionAccess.ALL
-                val seq = st.getOrNull(2) ?: 0
-                if (grants != ui.accessGrants) {
-                    ui.accessGrants = grants
-                    peripherals.applyAccess(grants)
-                }
-                ui.accessRemaining = st.getOrNull(1) ?: 0
-                if (seq != lastAccessSeq) {
-                    lastAccessSeq = seq
-                    // A fresh AccessUpdate close to the deadline is the host's T−5 m / T−1 m
-                    // courtesy warning — surface it. Grant edits (and a warning's grant echo)
-                    // otherwise just move the chip; a toast per edit would be noise.
-                    if (ui.accessRemaining in 1..330) {
-                        val mins = (ui.accessRemaining + 30) / 60
-                        Toast.makeText(
-                            context,
-                            if (mins <= 1) {
-                                "Access expires in about a minute."
-                            } else {
-                                "Access expires in about $mins minutes."
-                            },
-                            Toast.LENGTH_LONG,
-                        ).show()
-                    }
-                }
-            }
-            // The operator's per-session mute rides the control stream, so the badge learns it
-            // on this tick. The local bit is in the same mask — the toggle writes it at once.
-            ui.audioMute = NativeBridge.nativeAudioMute(handle)
-            if (NativeBridge.nativeSessionEnded(handle)) {
-                // WHY it ended decides what the user is told. This used to show the "host may be
-                // asleep" line for EVERY ending — including a game the player had just quit and a
-                // session the host ended on purpose — which reads as a failure report for
-                // something nobody did wrong. Only a connection that actually died says that now.
-                val reason = SessionEndReason.fromNative(NativeBridge.nativeEndReason(handle))
-                when {
-                    // The session died inside the access countdown's final stretch: that IS the
-                    // typed expiry close (ACCESS_EXPIRED), worded with the shared rejection
-                    // sentence rather than the generic host-ended silence. Recognized off the
-                    // countdown because the generic end-reason byte predates the expiry code.
-                    ui.accessRemaining in 1..75 ->
-                        Toast.makeText(
-                            context,
-                            "Your access to this host has expired.",
-                            Toast.LENGTH_LONG,
-                        ).show()
-                    reason == SessionEndReason.LOST ->
-                        Toast.makeText(
-                            context,
-                            "Connection lost — the host may be asleep. Wake it to reconnect.",
-                            Toast.LENGTH_LONG,
-                        ).show()
-                    reason == SessionEndReason.HOST_ERROR ->
-                        Toast.makeText(
-                            context,
-                            "The host ended the session with an error.",
-                            Toast.LENGTH_LONG,
-                        ).show()
-                    // Deliberate endings — the player quit the game, the host was stopped, or we
-                    // closed it. Leaving the stream IS the feedback; a toast would only add noise.
-                    else -> {}
-                }
-                onSessionEnded(reason)
-                return@LaunchedEffect
-            }
-        }
+    // The tier the HUD is polled at. `statsOn` gates the whole native pipeline: the per-frame
+    // sampling (a hidden HUD costs one atomic load per frame) and the 1 s poll. With a companion
+    // up the picture stays clear and the stats page is the only reader, never at Off. A 3-finger
+    // tap or Select + X cycles `ui.statsVerbosity` live (Off → Compact → Normal → Detailed → Off).
+    val hudTier = when {
+        !companionUp -> ui.statsVerbosity
+        companionPage != CompanionPage.STATS -> StatsVerbosity.OFF
+        ui.statsVerbosity == StatsVerbosity.OFF -> StatsVerbosity.NORMAL
+        else -> ui.statsVerbosity
     }
+    val statsOn = hudTier != StatsVerbosity.OFF
+    val statsLines by rememberStatsLines(session, statsOn, hudTier)
+
+    // Host-gone watchdog and the live access level.
+    SessionWatchEffect(handle, initialAccess, ui, peripherals, onSessionEnded)
 
     // One-shot teardown guard. Both the SurfaceView callback and DisposableEffect tear down on the
     // way out, but `nativeClose` frees the handle — so once it's closed, NO path may touch the handle
     // again (use-after-free → SIGSEGV: the consistent back-while-streaming crash). Both run on the
     // main thread, so a plain flag is race-free; AtomicBoolean just makes the intent explicit.
     val closed = remember { AtomicBoolean(false) }
+    // The mic opens off the UI thread (AAudio input opens can take hundreds of ms), one start at a
+    // time. Every stop bumps `micGen`, so a start that lost its surface meanwhile undoes itself.
+    val micStarter = remember {
+        Executors.newSingleThreadExecutor { r -> Thread(r, "pf-mic-start").apply { isDaemon = true } }
+    }
+    val micGen = remember { AtomicInteger(0) }
 
     // Everything this stream does to the window — wake/Wi-Fi locks, the refresh pin, ALLM, the
     // cutout and soft-keyboard modes, the landscape lock — and the prior values it puts back.
@@ -415,10 +286,12 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     DisposableEffect(handle) {
         streamWindow.attach()
         peripherals.start()
-        // The panel's refresh pin, unbuffered pointer dispatch and the render-rate vote.
+        // The panel's refresh pin, unbuffered input dispatch and the render-rate vote.
         streamWindow.pinDisplay()
         onDispose {
             closed.set(true) // from here the handle gets freed; surfaceDestroyed must not touch it
+            micGen.incrementAndGet()
+            micStarter.shutdown()
             peripherals.stop()
             streamWindow.detach()
             // Leaving the stream: stop the mic + audio + decode threads and tear down the session.
@@ -427,45 +300,32 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             NativeBridge.nativeStopAudio(handle)
             NativeBridge.nativeStopVideo(handle)
             NativeBridge.nativeVideoDrain(handle, false)
-            NativeBridge.nativeClose(handle)
+            SessionGate.close(handle) // the QUIC close drains for up to 300 ms, off this thread
         }
     }
 
     // The twist and the three-finger tap live in the pointer touch models only — passthrough gives
     // every finger to the host verbatim — and need a screen plus the POINTER grant.
-    val gestures = hasTouch && touchMode != TouchMode.TOUCH && ui.accessGrants and SessionAccess.POINTER != 0
+    val gestures = hasTouch && touchMode != TouchMode.TOUCH && pointerOk
     // Settings can turn Back off, but only while another opener exists: the ring holds End stream.
     val backOpensRing = initialSettings.backOpensRing || !(ui.padPresent || keyboard || gestures)
+    val openRingCentred = { ring.openAt(Offset(containerSize.width / 2f, containerSize.height / 2f)) }
     // The quick-action ring (design/touch-client-overlay.md §2). Back opens it at the screen
     // centre instead of ending the session; "End stream" is a slot inside, behind a two-press arm.
     // Back never falls through: an edge swipe mid-game must not tear the session down.
     BackHandler {
         when {
+            activity?.mouseForwarder?.backIsMouseEcho() == true -> {}
             ring.sheet -> ring.sheet = false
             ring.committed -> ring.close()
-            backOpensRing -> ring.openAt(Offset(containerSize.width / 2f, containerSize.height / 2f))
+            backOpensRing -> openRingCentred()
         }
     }
-    // Host actions are PRE-FETCHED on the session tick, never fetched when the ring opens: two
-    // of these buttons shut a machine down, and buttons that appear under a moving finger are a
-    // hazard. Empty toward an older host, an unreachable one, or without the record.
-    var hostActions by remember(handle) { mutableStateOf<List<HostActions.Action>>(emptyList()) }
     val hostRecord = remember(session.hostId) {
         session.hostId?.let { id -> KnownHostStore(context).all().firstOrNull { it.id == id } }
     }
-    LaunchedEffect(handle) {
-        val kh = hostRecord ?: return@LaunchedEffect
-        if (kh.fpHex.isEmpty()) return@LaunchedEffect
-        val identity = withContext(Dispatchers.IO) {
-            (IdentityStore(context).load() as? IdentityLoad.Ok)?.identity
-        } ?: return@LaunchedEffect
-        while (true) {
-            hostActions = withContext(Dispatchers.IO) {
-                HostActions.list(identity, kh.address, kh.effectiveMgmtPort, kh.fpHex)
-            }
-            delay(300_000)
-        }
-    }
+    val hostActions by rememberHostActions(handle, hostRecord)
+    val streamedGame by rememberStreamedGame(handle, hostRecord, ring.committed)
     val scope = rememberCoroutineScope()
 
     // The background keep-alive (Settings › General). Off — the default, and what every build
@@ -474,24 +334,6 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     // outside the app could stop.
     val keepAliveSpan = keepAliveSpanMs(initialSettings, isTv)
     val keepAlive = keepAliveSpan != null
-    var away by remember(handle) { mutableStateOf(false) }
-    val startedAt = remember(handle) { System.currentTimeMillis() }
-    // What the notification says. All of it is fixed at the handshake, so it is read once.
-    val noteHost = hostRecord?.name?.takeIf { it.isNotEmpty() }
-        ?: context.getString(R.string.app_name)
-    val noteTitle = session.launchHold?.game?.title
-    val modeLine = remember(handle) {
-        val mode = NativeBridge.nativeVideoSize(handle)
-        val w = mode?.getOrNull(0) ?: 0
-        val h = mode?.getOrNull(1) ?: 0
-        val hz = mode?.getOrNull(2) ?: 0
-        listOfNotNull(
-            if (w > 0 && h > 0) "$w×$h" else null,
-            if (hz > 0) "$hz Hz" else null,
-            NativeBridge.nativeVideoCodecLabel(handle).takeIf { it.isNotEmpty() },
-        ).joinToString(" · ")
-    }
-    fun note(deadline: Long?) = StreamNote(noteHost, noteTitle, modeLine, startedAt, deadline)
 
     // Ending from a path that fires while the app is already away — minutes after the recomposer
     // paused, so the disposal that `onSessionEnded` schedules will not run until the user comes
@@ -504,58 +346,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         onSessionEnded(reason)
     }
 
-    // The ongoing notification goes up when the session starts, not when the user leaves: an app
-    // already in the background may not start a foreground service, and without that service the
-    // OS freezes the process the moment the app is away — taking the audio and the QUIC traffic
-    // with it. Its End action is the ring's, a deliberate quit that closes the host session.
-    DisposableEffect(handle, keepAlive) {
-        if (keepAlive) {
-            StreamKeepAliveService.onEnd = { endAway(deliberate = true) }
-            StreamKeepAliveService.start(context, note(null))
-        }
-        onDispose {
-            StreamKeepAliveService.onEnd = null
-            StreamKeepAliveService.stop(context)
-        }
-    }
-
-    // Leaving the app (Home, task switch, screen off). Without the keep-alive this MUST end the
-    // session: Android does not suspend a process for going to background, so the native worker
-    // kept running and its QUIC connection kept answering the host's keep-alives — the user long
-    // gone, the host still holding the session (and its display + encoder) open until the OS
-    // reclaimed the process, which on a TV box is effectively never.
-    //
-    // Route it through `onSessionEnded()` so the composable's `onDispose` above runs the one real
-    // teardown path. Deliberately NOT a `nativeDisconnectQuit`: backgrounding isn't a user "quit",
-    // so the host should linger the display and make coming straight back a fast reconnect.
-    DisposableEffect(handle, keepAlive) {
-        val lifecycle = (context as? LifecycleOwner)?.lifecycle
-        val obs = LifecycleEventObserver { _, event ->
-            when (event) {
-                Lifecycle.Event.ON_STOP -> if (keepAlive) away = true else onSessionEnded(SessionEndReason.LOCAL)
-                Lifecycle.Event.ON_START -> away = false
-                else -> {}
-            }
-        }
-        lifecycle?.addObserver(obs)
-        onDispose { lifecycle?.removeObserver(obs) }
-    }
-
-    // While away the notification counts down instead of up, and the session gets exactly that
-    // long: a host cannot tell a player who walked off from one who is watching, so something has
-    // to decide. Coming back re-keys this effect, which cancels the wait. The give-up is the same
-    // non-deliberate end as backgrounding without the keep-alive — the host lingers the display,
-    // so returning later still reconnects fast.
-    LaunchedEffect(handle, keepAliveSpan, away) {
-        val span = keepAliveSpan ?: return@LaunchedEffect
-        if (!away) {
-            StreamKeepAliveService.update(context, note(null))
-            return@LaunchedEffect
-        }
-        StreamKeepAliveService.update(context, note(System.currentTimeMillis() + span))
-        delay(span)
-        endAway(deliberate = false)
-    }
+    KeepAliveEffects(session, hostRecord, keepAliveSpan, { endAway(it) }, onSessionEnded)
 
     // Auto-engage pointer capture at stream start (setting on + a mouse actually present).
     // Delayed a beat: the grab needs window focus and the capture view attached.
@@ -564,15 +355,125 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         activity?.mouseForwarder?.engageFromStart()
     }
 
-    // Tabletop foldable (design §4.4): with the pad up on a half-opened device the picture keeps
-    // the upright half and the controls take the flat one, instead of thumbs sitting on the game.
-    // The stream half is a container like any other — the video fit, the gesture layer, the ring
-    // and the hints all measure against it, so none of them knows a fold happened.
-    val density = LocalDensity.current
-    var rootSize by remember { mutableStateOf(IntSize.Zero) }
+    // A hinge splits the stream (design §4.4): the picture keeps the upper half, the lower one the
+    // companion panel, or the pad alone on a fold too shallow for the panel. The stream half is a
+    // container like any other — the video fit, the gesture layer, the ring and the hints all
+    // measure against it, so none of them knows a fold happened.
     var padSize by remember { mutableStateOf(IntSize.Zero) }
-    val hinge = rememberFoldHinge()
-    val split = if (padShown) hinge?.let { foldSplit(it, rootSize) } else null
+    val split = fold?.takeIf { hingeCompanion || (padShown && !companionUp) }
+    // What the ring's slots and the companion's action tiles do this session.
+    val ringActions = RingActions(
+        endStream = { NativeBridge.nativeDisconnectQuit(handle); onSessionEnded(SessionEndReason.LOCAL) },
+        disconnectLinger = { onSessionEnded(SessionEndReason.LOCAL) },
+        touchMode = { touchMode },
+        cycleTouchMode = {
+            // Passthrough is skipped toward a host that drops contacts (§5.4).
+            val order = if (hostAcceptsTouch) TouchMode.entries else TouchMode.entries - TouchMode.TOUCH
+            touchMode = order[(order.indexOf(touchMode) + 1) % order.size]
+        },
+        keyboardGranted = { ui.accessGrants and SessionAccess.KEYBOARD != 0 },
+        keyboard = { keyCapture?.setImeVisible(true) },
+        textSupported = NativeBridge.nativeTextInputSupported(handle),
+        sendText = { NativeBridge.nativeSendText(handle, it) },
+        stats = { ui.statsVerbosity },
+        cycleStats = { ui.statsVerbosity = ui.statsVerbosity.next() },
+        micAvailable = { ui.micRunning },
+        micMuted = { ui.micMuted },
+        toggleMic = { ui.mute(!ui.micMuted) },
+        hostActions = { hostActions },
+        invokeHost = { act ->
+            hostRecord?.let { kh ->
+                scope.launch(Dispatchers.IO) {
+                    (IdentityStore(context).load() as? IdentityLoad.Ok)?.identity?.let { id ->
+                        HostActions.invoke(id, kh.address, kh.effectiveMgmtPort, kh.fpHex, kh.name, act.id, act.label)
+                    }
+                }
+            }
+        },
+        sendShortcut = { sendChord(handle, it) },
+        padAvailable = { activity?.gamepadRouter?.sendsEnabled() == true },
+        padShown = { padShown },
+        togglePad = { padShown = !padShown },
+        tapPadButton = { bit -> activity?.gamepadRouter?.tapButton(bit) },
+        pointerGranted = { ui.accessGrants and SessionAccess.POINTER != 0 },
+        padMouseTarget = { padMouseTarget(ring, activity?.gamepadRouter) },
+        padMouseOn = {
+            val t = padMouseTarget(ring, activity?.gamepadRouter)
+            t != 0 && (NativeBridge.nativePadMouse(handle) and t) == t
+        },
+        togglePadMouse = {
+            val t = padMouseTarget(ring, activity?.gamepadRouter)
+            val on = NativeBridge.nativePadMouse(handle)
+            NativeBridge.nativeSetPadMouse(handle, if ((on and t) == t) on and t.inv() else on or t)
+        },
+        audioMute = { ui.audioMute },
+        audioMuteLabel = { ui.audioMuteLabel },
+        toggleStreamMute = { ui.muteStream(!ui.streamMuted) },
+        scrollInverted = { ui.invertScroll },
+        toggleScrollInversion = { ui.setScrollInverted(!ui.invertScroll) },
+        streamedGame = { streamedGame },
+        endGame = {
+            val game = streamedGame
+            val appId = game?.appId
+            val kh = hostRecord
+            if (game != null && appId != null && kh != null) {
+                scope.launch {
+                    val outcome = withContext(Dispatchers.IO) {
+                        (IdentityStore(context).load() as? IdentityLoad.Ok)?.identity?.let { id ->
+                            LibraryClient.endGame(
+                                kh.address, kh.effectiveMgmtPort, id.certPem, id.privateKeyPem,
+                                kh.fpHex, appId,
+                            )
+                        } ?: GameEnd.Failed("this device has no identity yet")
+                    }
+                    // Gone either way: leave as End stream does. A refusal keeps the stream.
+                    if (outcome.gameGone) {
+                        NativeBridge.nativeDisconnectQuit(handle)
+                        onSessionEnded(SessionEndReason.LOCAL)
+                    } else {
+                        Toast.makeText(context, outcome.notice(game.title), Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+        },
+        currentMode = { requestedMode },
+        requestMode = { w, h, hz ->
+            if (NativeBridge.nativeRequestMode(handle, w, h, hz)) {
+                requestedMode = intArrayOf(w, h, hz)
+                scope.launch {
+                    delay(500)
+                    NativeBridge.nativeVideoSize(handle)?.takeIf { it.size >= 3 }?.let { requestedMode = it }
+                }
+            }
+        },
+    )
+    // The summon rides a pointer gesture but TYPES, so it also needs the KEYBOARD grant
+    // (dismissing is always allowed).
+    val showKeyboard: (Boolean) -> Unit = { show ->
+        if (!show || ui.accessGrants and SessionAccess.KEYBOARD != 0) keyCapture?.setImeVisible(show)
+    }
+    val companion: @Composable () -> Unit = {
+        CompanionPanel(
+            pages = companionPages,
+            page = companionPage,
+            onPage = { companionPick = it; CompanionMemory.keep(context, it) },
+            stats = statsLines,
+            tier = hudTier,
+            onTier = { ui.statsVerbosity = it },
+            cfg = overlayCfg,
+            actions = ringActions,
+            haptics = haptics,
+            trackpad = {
+                streamTouchInput(
+                    NativeTouchSink(handle), null, ::videoFrame, trackpad = true,
+                    onCycleStats = { ui.statsVerbosity = ui.statsVerbosity.next() },
+                    onKeyboard = showKeyboard,
+                    onDial = {},
+                )
+            },
+            pad = { size -> PadHalf(virtualPad, overlayCfg.pad, size, haptics, openRingCentred) },
+        )
+    }
     // A safe-area mode asked the host for a picture narrower than the panel by the housing, so the
     // box it lands in is the window's live cutout-safe width: it follows a flip to the other
     // landscape. Left and right are physical sides, so an RTL layout cannot swap them.
@@ -647,6 +548,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                                     lowLatencyMode,
                                     choice?.lowLatencyFeature ?: false,
                                     isTv,
+                                    isChromeOs,
                                     initialSettings.presentPriorityWire(),
                                     initialSettings.smoothBuffer,
                                     // The panel's own refresh — from the mode TABLE (streamPanelFps),
@@ -669,16 +571,31 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                                 // service, so the platform's recording indicator would announce a
                                 // mic nobody can hear.
                                 if (micWanted && ui.accessGrants and SessionAccess.MIC != 0) {
-                                    val sessionId =
-                                        NativeBridge.nativeStartMic(handle, initialSettings.echoCancel)
-                                    if (initialSettings.echoCancel) {
-                                        attachMicEffects(sessionId, micEffects)
+                                    val gen = micGen.incrementAndGet()
+                                    val echo = initialSettings.echoCancel
+                                    val main = ContextCompat.getMainExecutor(context)
+                                    if (!micStarter.isShutdown) micStarter.execute {
+                                        if (micGen.get() != gen) return@execute
+                                        val sessionId = NativeBridge.nativeStartMic(handle, echo)
+                                        // Stopped during the open: that stop found nothing to stop.
+                                        if (micGen.get() != gen) {
+                                            NativeBridge.nativeStopMic(handle)
+                                            return@execute
+                                        }
+                                        main.execute {
+                                            if (micGen.get() != gen) return@execute
+                                            if (ui.accessGrants and SessionAccess.MIC == 0) {
+                                                NativeBridge.nativeStopMic(handle) // revoked meanwhile
+                                                return@execute
+                                            }
+                                            if (echo) attachMicEffects(sessionId, micEffects)
+                                            // Did a capture actually open? That — not the setting —
+                                            // puts the mute control on screen. A restart after a
+                                            // surface recreate comes back already muted if the user
+                                            // muted: the flag lives on the session handle.
+                                            ui.micRunning = NativeBridge.nativeMicActive(handle)
+                                        }
                                     }
-                                    // Did a capture actually open? That — not the setting — is what
-                                    // puts the mute control on screen. A restart after a surface
-                                    // recreate comes back already muted if the user muted: the flag
-                                    // lives on the session handle, so nothing has to be re-applied.
-                                    ui.micRunning = NativeBridge.nativeMicActive(handle)
                                 }
                             }
 
@@ -718,6 +635,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                                 // DisposableEffect has closed it, the handle is freed; dereferencing it
                                 // here is the use-after-free that crashed on back-navigation.
                                 if (!closed.get()) {
+                                    micGen.incrementAndGet()
                                     releaseMicEffects(micEffects)
                                     NativeBridge.nativeStopMic(handle)
                                     // No capture, no control — but the MUTE state is deliberately left
@@ -741,9 +659,12 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             )
             // Live stats HUD (FPS / throughput / capture→client latency), drawn over the video but
             // BEFORE the transparent gesture layer below, so it shows through and never eats touches.
-            if (statsOn && statsLines.isNotEmpty()) {
-                val placement = Modifier.align(Alignment.TopStart).padding(12.dp)
-                OsdScaled { StatsOverlay(statsLines, placement) }
+            // A companion panel carries it instead.
+            val statsShown = !companionUp && statsOn && statsLines.isNotEmpty()
+            val statsCorner = hudAlignment(initialSettings.hudPlacement)
+            if (statsShown) {
+                val placement = Modifier.align(statsCorner).padding(12.dp)
+                OsdScaled { StatsOverlay(statsLines, placement, initialSettings.statsScalePct / 100f) }
             }
             // The Access chip — what this session is allowed to do, said in the preset vocabulary
             // ("Controller only · 1 h 58 m left"), shown while the stats HUD is on. It rides the
@@ -754,7 +675,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             // stream. TopEnd, in the shared pill family (TopStart is the HUD's, TopCentre the
             // transient cues', BottomCentre the banner's).
             val accessChip = when {
-                !statsOn -> null
+                ui.statsVerbosity == StatsVerbosity.OFF -> null
                 ui.accessGrants and SessionAccess.ALL == SessionAccess.ALL && ui.accessRemaining == 0 -> null
                 ui.accessRemaining > 0 ->
                     "${SessionAccess.label(ui.accessGrants)} · " +
@@ -762,70 +683,47 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                 else -> SessionAccess.label(ui.accessGrants)
             }
             // Same corner, stacked: the mute sentence stands whatever the stats tier, because a
-            // player who cannot hear is owed the reason even with chrome off.
+            // player who cannot hear is owed the reason even with chrome off. Top left while the
+            // stats panel holds the top right.
             if (accessChip != null || ui.audioMuteLabel != null) {
-                Column(
-                    Modifier.align(Alignment.TopEnd).padding(12.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                    horizontalAlignment = Alignment.End,
-                ) {
-                    ui.audioMuteLabel?.let { AccessChip(it) }
-                    accessChip?.let { AccessChip(it) }
+                val left = statsShown && statsCorner == Alignment.TopEnd
+                OsdScaled {
+                    Column(
+                        Modifier.align(if (left) Alignment.TopStart else Alignment.TopEnd).padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        horizontalAlignment = if (left) Alignment.Start else Alignment.End,
+                    ) {
+                        ui.audioMuteLabel?.let { AccessChip(it) }
+                        accessChip?.let { AccessChip(it) }
+                    }
                 }
             }
             // "Hold to quit" hint while the gamepad exit chord is armed — the exit debounces on a ~1 s
             // hold, so without this cue a couch user reads the (deliberately no-longer-instant) chord as
             // broken. Purely visual; it sits above the video and below the gesture layer.
             if (ui.exitArming) {
-                ExitChordHint(Modifier.align(Alignment.TopCenter).padding(top = 16.dp))
+                OsdScaled { ExitChordHint(Modifier.align(Alignment.TopCenter).padding(top = 16.dp)) }
             }
             // Remote-pointer mode hint — the remote's keys are remapped while it's on, so say so.
             if (ui.remotePointerOn) {
-                RemotePointerHint(Modifier.align(Alignment.TopCenter).padding(top = 16.dp))
+                OsdScaled { RemotePointerHint(Modifier.align(Alignment.TopCenter).padding(top = 16.dp)) }
             }
-            // The start banner (desktop parity), naming ONLY the shortcuts this session actually has:
-            // pad chords when a controller is here, the Back gesture and the three-finger tap when it
-            // is not. Recomputed rather than captured, because both inputs change under it — a pad can
-            // wake mid-banner, and `ui.micRunning` only settles once the capture has actually opened.
-            // Above the video and below the gesture layer: it teaches touches, it must never eat one.
+            // The exit hint (desktop parity): one line on how to leave with the input in hand, the
+            // pad chord when a controller is here. Without one, leaving is a slot in the quick-action
+            // dial, so the line names what opens it. Recomputed rather than captured: a pad can wake
+            // mid-hint. Above the video and below the gesture layer, so it never eats a touch.
             //
-            // Bottom-centre is the desktop's placement and the only edge left — TopStart is the HUD,
-            // TopEnd the Access chip, TopCentre the three transient cues — but MotionUnreachableHint
-            // already owns it, and both of these can be up at t≈0. The banner YIELDS rather than
-            // stacking or sliding off-centre: the notice reports something broken about THIS session
-            // and names the setting that fixes it, while the banner repeats shortcuts that will be
-            // there next stream too. Two pills sharing an edge for six seconds would cost the reader
-            // both.
-            if (bannerUp && !ui.motionHint && !touchHint) {
+            // Bottom-centre, which MotionUnreachableHint also owns at t≈0. The hint YIELDS: the
+            // notice reports something broken about THIS session, the hint repeats every stream.
+            if (initialSettings.exitHint && banner.up && !ui.motionHint && !touchHint) OsdScaled {
                 StreamStartBanner(
-                    text = buildList {
-                        if (ui.padPresent) {
-                            // The dial leads: it is the one chord that reaches every other action.
-                            add("Select + A quick actions")
-                            add("Hold Select + Start + L1 + R1 to leave")
-                            // Only while a capture is actually running: the chord itself no-ops
-                            // without one, and offering a mute for a mic nobody has is the lie the
-                            // whole control exists to avoid.
-                            if (ui.micRunning) add("Select + Y mic")
-                            add("Select + X stats")
-                        } else {
-                            // No pad: Back opens the dial (the gesture, or a TV remote's button; a
-                            // mouse's Back goes to the host) unless Settings turned it off.
-                            // Leaving is a slot inside it, not this.
-                            add(
-                                when {
-                                    backOpensRing && gestures -> "Back or a two-finger twist opens quick actions"
-                                    backOpensRing -> "Back opens quick actions"
-                                    gestures -> "A two-finger twist opens quick actions"
-                                    else -> "Ctrl+Alt+Shift+O opens quick actions"
-                                }
-                            )
-                            if (gestures) add("three-finger tap for stats")
-                            // Android keeps Alt+Tab; the alias is only learnable from here.
-                            if (keyboard && !KeyCaptureService.running) add("Alt+` for Alt+Tab")
-                        }
-                    }.joinToString(" · "),
-                    alpha = bannerAlpha,
+                    text = when {
+                        ui.padPresent -> "Hold L1 + R1 + Start + Select to leave"
+                        backOpensRing -> "Back opens quick actions"
+                        gestures -> "A two-finger twist opens quick actions"
+                        else -> "Ctrl+Alt+Shift+O opens quick actions"
+                    },
+                    alpha = banner.alpha,
                     modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 24.dp),
                 )
             }
@@ -848,7 +746,8 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                 },
             )
             // Touch input per the Settings model: trackpad/direct-pointer mouse (the shared gesture
-            // vocabulary) or real multi-touch passthrough — see TouchInput.kt. Passthrough gets no
+            // vocabulary), the same gestures with nothing sent (Off, so a miss beside the pad stays
+            // put), or real multi-touch passthrough — see TouchInput.kt. Passthrough gets no
             // keyboard gesture: its fingers belong to the host verbatim (a swipe there may BE a
             // host-OS gesture), so intercepting three fingers would corrupt real multi-touch.
             // Stylus lane (design/pen-tablet-input.md §7): against a HOST_CAP_PEN host a stylus
@@ -858,7 +757,6 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             // can't land": ungranted, no gesture handler is installed at all (and no pen lane opens),
             // rather than fingers being read into events the host will drop. Keyed on the grant so an
             // AccessUpdate flipping it mid-session swaps the layer live.
-            val pointerOk = ui.accessGrants and SessionAccess.POINTER != 0
             val stylus = remember(handle, pointerOk) {
                 if (pointerOk && NativeBridge.nativeHostSupportsPen(handle)) StylusStream(handle) else null
             }
@@ -872,18 +770,12 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                         touchMode == TouchMode.TOUCH ->
                             streamTouchPassthrough(NativeTouchSink(handle), stylus, ::videoFrame)
                         else -> streamTouchInput(
-                            NativeTouchSink(handle),
+                            if (touchMode == TouchMode.OFF) DroppedTouchSink else NativeTouchSink(handle),
                             stylus,
                             ::videoFrame,
-                            trackpad = touchMode == TouchMode.TRACKPAD,
+                            trackpad = touchMode != TouchMode.POINTER,
                             onCycleStats = { ui.statsVerbosity = ui.statsVerbosity.next() },
-                            // The summon rides the pointer gesture but TYPES — so it also needs the
-                            // KEYBOARD grant (dismissing is always allowed).
-                            onKeyboard = { show ->
-                                if (!show || ui.accessGrants and SessionAccess.KEYBOARD != 0) {
-                                    keyCapture?.setImeVisible(show)
-                                }
-                            },
+                            onKeyboard = showKeyboard,
                             // The two-finger twist turns the quick-action ring, frame by frame.
                             onDial = { ev ->
                                 when (ev) {
@@ -905,95 +797,41 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             // that never registered.
             // The virtual controller: above the gesture layer, so its controls take their fingers
             // first and every other finger falls through; below the ring, whose scrim owns every
-            // finger while it is up. Composed only while shown (tenet 1) — and on a tabletop fold
-            // it leaves this half entirely for the flat one below.
-            if (split == null) PadHalf(virtualPad, overlayCfg.pad, containerSize, haptics)
+            // finger while it is up. Composed only while shown (tenet 1) — and with a lower half or
+            // a companion panel it leaves this half entirely for that.
+            if (split == null && !companionUp) PadHalf(virtualPad, overlayCfg.pad, containerSize, haptics, openRingCentred)
             // The ring, above the gesture layer so its buttons take the finger first. Composed only
             // while open: a closed overlay costs nothing (tenet 1).
             OsdScaled {
                 RingOverlay(
                     state = ring,
                     cfg = overlayCfg,
-                    actions = RingActions(
-                        endStream = { NativeBridge.nativeDisconnectQuit(handle); onSessionEnded(SessionEndReason.LOCAL) },
-                        disconnectLinger = { onSessionEnded(SessionEndReason.LOCAL) },
-                        touchMode = { touchMode },
-                        cycleTouchMode = {
-                            // Passthrough is skipped toward a host that drops contacts (§5.4).
-                            val order = if (hostAcceptsTouch) TouchMode.entries else listOf(TouchMode.TRACKPAD, TouchMode.POINTER)
-                            touchMode = order[(order.indexOf(touchMode) + 1) % order.size]
-                        },
-                        keyboardGranted = { ui.accessGrants and SessionAccess.KEYBOARD != 0 },
-                        keyboard = { keyCapture?.setImeVisible(true) },
-                        textSupported = NativeBridge.nativeTextInputSupported(handle),
-                        sendText = { NativeBridge.nativeSendText(handle, it) },
-                        stats = { ui.statsVerbosity },
-                        cycleStats = { ui.statsVerbosity = ui.statsVerbosity.next() },
-                        micAvailable = { ui.micRunning },
-                        micMuted = { ui.micMuted },
-                        toggleMic = { ui.mute(!ui.micMuted) },
-                        hostActions = { hostActions },
-                        invokeHost = { act ->
-                            hostRecord?.let { kh ->
-                                scope.launch(Dispatchers.IO) {
-                                    (IdentityStore(context).load() as? IdentityLoad.Ok)?.identity?.let { id ->
-                                        HostActions.invoke(id, kh.address, kh.effectiveMgmtPort, kh.fpHex, kh.name, act.id, act.label)
-                                    }
-                                }
-                            }
-                        },
-                        sendShortcut = { sendChord(handle, it) },
-                        padAvailable = { activity?.gamepadRouter?.sendsEnabled() == true },
-                        padShown = { padShown },
-                        togglePad = { padShown = !padShown },
-                        tapPadButton = { bit -> activity?.gamepadRouter?.tapButton(bit) },
-                        pointerGranted = { ui.accessGrants and SessionAccess.POINTER != 0 },
-                        padMouseTarget = { padMouseTarget(ring, activity?.gamepadRouter) },
-                        padMouseOn = {
-                            val t = padMouseTarget(ring, activity?.gamepadRouter)
-                            t != 0 && (NativeBridge.nativePadMouse(handle) and t) == t
-                        },
-                        togglePadMouse = {
-                            val t = padMouseTarget(ring, activity?.gamepadRouter)
-                            val on = NativeBridge.nativePadMouse(handle)
-                            NativeBridge.nativeSetPadMouse(handle, if ((on and t) == t) on and t.inv() else on or t)
-                        },
-                        audioMute = { ui.audioMute },
-                        audioMuteLabel = { ui.audioMuteLabel },
-                        toggleStreamMute = { ui.muteStream(!ui.streamMuted) },
-                        scrollInverted = { ui.invertScroll },
-                        toggleScrollInversion = { ui.setScrollInverted(!ui.invertScroll) },
-                        currentMode = { requestedMode },
-                        requestMode = { w, h, hz ->
-                            if (NativeBridge.nativeRequestMode(handle, w, h, hz)) {
-                                requestedMode = intArrayOf(w, h, hz)
-                                scope.launch {
-                                    delay(500)
-                                    NativeBridge.nativeVideoSize(handle)?.takeIf { it.size >= 3 }?.let { requestedMode = it }
-                                }
-                            }
-                        },
-                    ),
+                    actions = ringActions,
                     containerSize = containerSize,
                     haptics = haptics,
                 )
             }
-            ui.micHint?.let { MicChordHint(it, Modifier.align(Alignment.TopCenter).padding(top = 16.dp)) }
+            ui.micHint?.let {
+                OsdScaled { MicChordHint(it, Modifier.align(Alignment.TopCenter).padding(top = 16.dp)) }
+            }
             // Bottom, not top: this can coincide with a mic-chord confirmation or the exit cue, and a
             // notice landing on top of one of those would cost the user both.
-            if (ui.motionHint) {
-                MotionUnreachableHint(Modifier.align(Alignment.BottomCenter).padding(bottom = 24.dp))
-            } else if (touchHint) {
-                TouchFallbackHint(Modifier.align(Alignment.BottomCenter).padding(bottom = 24.dp))
+            OsdScaled {
+                if (ui.motionHint) {
+                    MotionUnreachableHint(Modifier.align(Alignment.BottomCenter).padding(bottom = 24.dp))
+                } else if (touchHint) {
+                    TouchFallbackHint(Modifier.align(Alignment.BottomCenter).padding(bottom = 24.dp))
+                }
             }
         }
         if (split != null) {
             // The hinge itself: nothing on a creased panel, a real strip on a two-panel device.
             Spacer(Modifier.height(with(density) { split.hingePx.toDp() }))
             Box(modifier = Modifier.fillMaxWidth().weight(1f).onSizeChanged { padSize = it }) {
-                PadHalf(virtualPad, overlayCfg.pad, padSize, haptics)
+                if (hingeCompanion) companion() else PadHalf(virtualPad, overlayCfg.pad, padSize, haptics, openRingCentred)
             }
         }
+        companionDisplay?.let { CompanionOnDisplay(it, companion) }
         // Last, so it covers everything: the launched title's poster until its game is up.
         var launchHold by remember(session) { mutableStateOf(session.launchHold) }
         launchHold?.let {
@@ -1009,14 +847,15 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
 }
 
 /**
- * The virtual controller in whichever half is holding it: overlaid on the picture, or alone on the
- * flat half of a tabletop fold. The wire pad itself lives above (`DisposableEffect(padShown)`), so
- * moving the layer between the two never makes the host see a controller reconnect.
+ * The virtual controller wherever it is held: overlaid on the picture, alone on the lower half of a
+ * fold, or on the companion's controller page. The wire pad itself lives in [rememberVirtualPad],
+ * so moving the layer never makes the host see a controller reconnect.
  */
 @Composable
-private fun PadHalf(pad: GamepadRouter.ExternalPad?, cfg: PadConfig, size: IntSize, haptics: ConsoleHaptics) {
+private fun PadHalf(pad: GamepadRouter.ExternalPad?, cfg: PadConfig, size: IntSize, haptics: ConsoleHaptics, openRing: () -> Unit) {
     if (pad == null) return
-    val sink = remember(pad) { PadSink(pad::button, pad::axis) }
+    val ring by rememberUpdatedState(openRing)
+    val sink = remember(pad) { PadSink(pad::button, pad::axis) { ring() } }
     VirtualPadLayer(cfg, size, sink, haptics)
 }
 
@@ -1250,6 +1089,22 @@ internal class KeyCaptureView(context: Context) : View(context) {
     init {
         isFocusable = true
         isFocusableInTouchMode = true
+    }
+
+    // A leaf keeps its unbuffered request; a ViewGroup's is recomputed whenever focus moves below
+    // it. Pointer classes rise from any child, the rest through this view while it holds focus.
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            requestUnbufferedDispatch(STREAM_UNBUFFERED_SOURCES)
+        }
+    }
+
+    override fun onDetachedFromWindow() {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            requestUnbufferedDispatch(0)
+        }
+        super.onDetachedFromWindow()
     }
 
     /** The session handle when the host types committed text; `0` = VK-only fallback. */

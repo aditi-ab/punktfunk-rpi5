@@ -15,7 +15,7 @@ fallback that also runs locally and is committed as a baseline.
 By default it covers the WHOLE workspace, which is what the root file must be (the host and
 the desktop clients ship out of it). `--packages <name>[,<name>…]` restricts it to the transitive
 dependency closure of the named workspace members instead — the Apple and Android clients link
-exactly one Rust crate each (`punktfunk-core`, and the JNI bridge over it), so a workspace-wide
+exactly one Rust crate each (`punktfunk-ffi`, and the JNI bridge over the core), so a workspace-wide
 copy attributed them things they do not contain: FFmpeg, the NVENC SDK, GTK, windows-rs. Listing a
 dependency that is not there is not a licence violation, but it is a false statement in a file
 whose entire job is to be true.
@@ -29,6 +29,9 @@ import json
 import os
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ci"))
+from cargo_graph import closure  # noqa: E402
 
 LICENSE_GLOBS = ("license", "licence", "copying", "notice", "unlicense", "copyright")
 
@@ -68,6 +71,9 @@ VENDORED_TREES = [
     ("Lucide 0.462.0 (icon path data, crates/pf-console-ui)",
      "crates/pf-console-ui/LUCIDE-LICENSE",
      "https://lucide.dev"),
+    ("Kenney Input Prompts 1.5 (controller outlines, crates/pf-console-ui)",
+     "crates/pf-console-ui/KENNEY-LICENSE",
+     "https://kenney.nl/assets/input-prompts"),
     ("pyrowave (vendored, crates/pyrowave-sys)",
      "crates/pyrowave-sys/vendor/pyrowave/LICENSE",
      "https://github.com/Themaister/pyrowave"),
@@ -106,35 +112,6 @@ VENDORED_TREES = [
 ]
 
 
-def closure(meta, roots):
-    """Package ids reachable from `roots` through `cargo metadata`'s resolve graph.
-
-    Deliberately the WHOLE resolve graph, not a per-target one: `cargo metadata` resolves
-    every `cfg()`-gated dependency of every member, so this OVER-approximates (an
-    `cfg(windows)`-only crate is reachable from a root even on a Linux build). Over-listing an
-    attribution is the safe direction; under-listing one is the failure this file exists to
-    prevent. What it does NOT do is pull in crates reachable only from OTHER workspace members,
-    which is the whole point.
-    """
-    by_name = {}
-    for p in meta["packages"]:
-        by_name.setdefault(p["name"], p["id"])
-    nodes = {n["id"]: n for n in meta.get("resolve", {}).get("nodes", [])}
-    seen, stack = set(), []
-    for r in roots:
-        pid = by_name.get(r)
-        if pid is None:
-            raise SystemExit(f"--packages: no package named {r!r} in this workspace")
-        stack.append(pid)
-    while stack:
-        pid = stack.pop()
-        if pid in seen:
-            continue
-        seen.add(pid)
-        stack.extend(nodes.get(pid, {}).get("dependencies", []))
-    return seen
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="THIRD-PARTY-NOTICES.txt")
@@ -161,6 +138,8 @@ def main():
         text=True))
     ws_members = set(meta.get("workspace_members", []))
 
+    # No --filter-platform either: a `cfg(windows)` crate stays listed for a Linux build, the
+    # safe direction for an attribution file.
     keep = None
     if args.packages.strip():
         keep = closure(meta, [n.strip() for n in args.packages.split(",") if n.strip()])

@@ -480,6 +480,34 @@ mod tests {
         assert_eq!(colour, (0, 1, 1, 1), "expected BT.709 limited signalling");
     }
 
+    /// The stream through the client's planner: one AU in, one picture out.
+    #[test]
+    fn the_client_shows_each_picture_in_its_own_au() {
+        let (w, h, fps) = (640u32, 480u32, 60u32);
+        let mut enc =
+            OpenH264Encoder::open(PixelFormat::Bgrx, w, h, fps, 2_000_000).expect("open openh264");
+        let mut planner = pf_vaapi::H264Planner::new();
+        for i in 0..20u64 {
+            let frame = CapturedFrame {
+                provenance: Default::default(),
+                width: w,
+                height: h,
+                pts_ns: i * 16_666_667,
+                format: PixelFormat::Bgrx,
+                payload: FramePayload::Cpu(vec![(i * 8) as u8; (w * h * 4) as usize]),
+                cursor: None,
+            };
+            enc.submit(&frame).expect("submit");
+            let au = enc.poll().expect("poll").expect("an AU");
+            let plan = planner.plan_au(&au.data).expect("plan");
+            assert_eq!(
+                plan.dpb.outputs,
+                [plan.dpb.stored.expect("stored")],
+                "AU {i}"
+            );
+        }
+    }
+
     /// Portrait 2160×3840 is legal; `w <= 3840 && h <= 2160` would reject it.
     #[test]
     fn openh264_accepts_up_to_4k_in_either_orientation() {

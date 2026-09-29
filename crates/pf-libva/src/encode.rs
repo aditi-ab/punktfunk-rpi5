@@ -174,8 +174,9 @@ pub struct Encoder {
     /// Collected early because a submit needed the coded buffer back.
     ready: VecDeque<EncodedPicture>,
     /// Ingest: RGB captures are converted — a larger one scaled — into the input
-    /// surface here. A producer's own NV12/P010 skips it (`direct`).
-    vpp: Vpp,
+    /// surface here. A producer's own NV12/P010 skips it (`direct`). `None` only
+    /// once `Drop` has destroyed it.
+    vpp: Option<Vpp>,
     /// Where CPU RGB lands before conversion, and the (fourcc, width, height) it
     /// was made for.
     staging: Option<(VaSurfaceId, (u32, u32, u32))>,
@@ -449,7 +450,7 @@ impl Encoder {
             coded_free,
             pending: VecDeque::new(),
             ready: VecDeque::new(),
-            vpp,
+            vpp: Some(vpp),
             staging: None,
             direct: None,
             direct_seen: false,
@@ -581,9 +582,17 @@ impl Encoder {
         })
     }
 
+    fn vpp(&self) -> &Vpp {
+        self.vpp.as_ref().expect("the VPP context lives until drop")
+    }
+
+    fn vpp_mut(&mut self) -> &mut Vpp {
+        self.vpp.as_mut().expect("the VPP context lives until drop")
+    }
+
     /// Take only `crop` (`x, y, width, height`) of every later picture; `None` is the whole.
     pub fn set_source_crop(&mut self, crop: Option<[u32; 4]>) {
-        self.vpp.crop = crop;
+        self.vpp_mut().crop = crop;
     }
 
     /// Ingest a `width`×`height` packed RGB picture from the CPU — eight-bit or
@@ -618,7 +627,7 @@ impl Encoder {
             }
         };
         self.display.write_packed(staging, bytes, row_bytes)?;
-        self.vpp.convert(
+        self.vpp().convert(
             &self.display,
             staging,
             (width, height),
@@ -645,7 +654,7 @@ impl Encoder {
             (source.width, source.height),
             (self.params.width, self.params.height),
             self.ten_bit(),
-            self.vpp.crop.is_some(),
+            self.vpp().crop.is_some(),
         ) {
             self.clear_direct();
             self.direct = Some(surface);
@@ -659,7 +668,7 @@ impl Encoder {
             }
             return Ok(true);
         }
-        let converted = self.vpp.convert(
+        let converted = self.vpp().convert(
             &self.display,
             surface,
             (source.width, source.height),
@@ -1313,7 +1322,9 @@ impl Drop for Encoder {
     /// the driver may still be writing one — and each pending direct import goes
     /// with its picture. The display is dropped last, by its own `Drop`.
     fn drop(&mut self) {
-        self.vpp.destroy(&self.display);
+        if let Some(vpp) = self.vpp.take() {
+            vpp.destroy(&self.display);
+        }
         self.clear_direct();
         if let Some((staging, _)) = self.staging.take() {
             self.display.destroy_surface(staging);

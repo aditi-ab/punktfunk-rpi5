@@ -8,8 +8,10 @@
 //! one fused GPU pass into a free pool slot — or drops at the pool. Nothing else: telemetry is
 //! stamped after `FinishedProcessingFrame`, because the window is what DWM waits on for this head.
 //!
-//! Spike S6 (`pool-bypass`) widens that window on purpose: the encoder reads the acquired surface
-//! and the window stays open until the access unit is out. That is the cadence risk being measured.
+//! A bypass pool issues no pass where it can: the encoder reads the acquired surface, which
+//! stays the driver's until the next acquire returns a frame. So the worker holds that acquire
+//! until the access unit is out, and `FinishedProcessingFrame` still goes out at once. Once the
+//! desktop goes still the worker copies that surface into the pool, the one pass of the run.
 //!
 //! The `wdk_iddcx` DDI wrappers return a RAW `NTSTATUS` (`i32`) that is HRESULT-shaped for the
 //! swap-chain DDIs, so we classify it by hand (`hr >= 0` = success; `0x8000_000A` = E_PENDING;
@@ -34,12 +36,12 @@ use wdk_sys::iddcx::{
 use wdk_sys::{HANDLE, NTSTATUS, WDFOBJECT, call_unsafe_wdf_function_binding};
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, HANDLE as WHANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        Foundation::{HANDLE as WHANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
         Graphics::{
             Direct3D11::ID3D11Texture2D,
             Dxgi::{IDXGIDevice, IDXGIResource},
         },
-        System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects, WaitForSingleObject},
+        System::Threading::{SetEvent, WaitForMultipleObjects, WaitForSingleObject},
     },
     core::Interface,
 };
@@ -47,7 +49,7 @@ use windows::{
 use crate::{
     direct_3d_device::Direct3DDevice,
     monitor::Monitor,
-    worker::{Mmcss, Sendable},
+    worker::{Mmcss, OwnedHandle, Sendable},
 };
 
 /// E_PENDING — `ReleaseAndAcquireBuffer2` returns this (HRESULT-shaped) when the swap-chain is valid but
@@ -87,23 +89,15 @@ pub struct SwapChainProcessor {
     terminate: Arc<AtomicBool>,
     /// AUTO-reset event that releases the worker's idle wait: a fresh encode session or a stop
     /// reaches it at once instead of waiting out [`IDLE_WAIT_MS`]. `None` when the event could not
-    /// be created — the worker then only has its timeout. Closed by `Drop` AFTER the worker is
-    /// joined, so [`Self::wake`] can never signal a closed handle.
-    wake: Option<WHANDLE>,
+    /// be created — the worker then only has its timeout. It closes as a field, after `Drop` has
+    /// joined the worker, so [`Self::wake`] can never signal a closed handle.
+    wake: Option<OwnedHandle>,
     thread: Option<JoinHandle<()>>,
 }
 
-// SAFETY: Raw ptr is managed by external library; access is serialised by the worker thread + the
-// terminate flag.
-unsafe impl Send for SwapChainProcessor {}
-// SAFETY: as above — the raw pointer is only touched by the serialised worker, so a shared
-// `&SwapChainProcessor` reference exposes no unsynchronised access.
-unsafe impl Sync for SwapChainProcessor {}
-
 impl SwapChainProcessor {
     pub fn new() -> Self {
-        // SAFETY: plain event creation — auto-reset, unsignalled, unnamed, no security descriptor.
-        let wake = unsafe { CreateEventW(None, false, false, None) }.ok();
+        let wake = OwnedHandle::event(false);
         if wake.is_none() {
             dbglog!("[pf-vd] swap-chain: wake event creation failed — timeout-only idle wait");
         }
@@ -118,9 +112,9 @@ impl SwapChainProcessor {
     /// pool lands, and from `Drop`. `SetEvent` never blocks, so a caller may hold the monitor's
     /// `swap` guard across it. No-op when the event could not be created (the worker polls).
     pub fn wake(&self) {
-        if let Some(h) = self.wake {
-            // SAFETY: `h` is our own event handle; `Drop` closes it only after joining the worker.
-            let _ = unsafe { SetEvent(h) };
+        if let Some(h) = &self.wake {
+            // SAFETY: `h` is our own event handle; it closes only after `Drop` joins the worker.
+            let _ = unsafe { SetEvent(h.as_raw()) };
         }
     }
 
@@ -137,7 +131,8 @@ impl SwapChainProcessor {
         available_buffer_event: HANDLE,
         monitor: Weak<Monitor>,
     ) {
-        let events = Sendable((self.wake, available_buffer_event));
+        let wake = self.wake.as_ref().map(|h| Sendable(h.as_raw()));
+        let available_buffer_event = Sendable(available_buffer_event);
         let swap_chain = Sendable(swap_chain);
         let terminate = self.terminate.clone();
         // For the log lines: 0 for a monitor the registry does not hold, whose worker only drains.
@@ -147,12 +142,12 @@ impl SwapChainProcessor {
         // swap-chain and must delete it, or IddCx keeps an undrained chain.
         let sc_raw = swap_chain.0;
         let spawned = thread::Builder::new().name("pf-vd-swapchain".into()).spawn(move || {
-            // Rust 2021 disjoint closure captures would otherwise grab the raw `swap_chain.0` /
-            // `events.0` FIELDS directly (defeating the `Sendable` Send wrapper, since the inner
-            // `*mut IDDCX_SWAPCHAIN__` / `HANDLE` are `!Send`). Rebind the WHOLE wrappers here so the
-            // closure captures them as `Sendable<_>` (which IS `Send`), then unwrap from the locals.
+            // Rust 2021 disjoint closure captures would otherwise grab the raw `.0` FIELDS
+            // directly (defeating the `Sendable` Send wrapper, since the handles inside are
+            // `!Send`). Rebind the WHOLE wrappers here so the closure captures them as `Sendable`.
             let swap_chain = swap_chain;
-            let events = events;
+            let wake = wake;
+            let available_buffer_event = available_buffer_event;
             // This thread is the whole display's frame pump: at normal priority a display-stack
             // disturbance (DDC/HPD servicing, poller-software storms) starves it into
             // multi-hundred-ms delivery holes. Reverted when the registration drops, at exit.
@@ -161,7 +156,7 @@ impl SwapChainProcessor {
             Self::run_core(
                 swap_chain.0,
                 &device,
-                events.0,
+                (wake.map(|w| w.0), available_buffer_event.0),
                 &terminate,
                 &monitor,
                 target_id,
@@ -219,9 +214,9 @@ impl SwapChainProcessor {
                 return;
             }
         };
-        // Built zeroed + field-assigned (driver style) — robust against a bindgen field-set difference.
-        let mut set_device = pod_init!(IDARG_IN_SWAPCHAINSETDEVICE);
-        set_device.pDevice = dxgi_device.as_raw().cast();
+        let set_device = IDARG_IN_SWAPCHAINSETDEVICE {
+            pDevice: dxgi_device.as_raw().cast(),
+        };
         // One shot: a failure here means the OS already unassigned this swap-chain, and
         // DXGI_ERROR_ACCESS_LOST on that handle never recovers. Returning lets the thread epilogue
         // delete it so the OS mints a fresh one — the reassign is what succeeds.
@@ -243,8 +238,9 @@ impl SwapChainProcessor {
         // while our borrowed device reference is still alive (IddCx uses it synchronously); the
         // DDI may still decline (e.g. E_NOTIMPL on pre-WDDM-3.0 hardware).
         if rt_gpu_enabled() {
-            let mut rt = pod_init!(IDARG_IN_SETREALTIMEGPUPRIORITY);
-            rt.pDevice = dxgi_device.as_raw().cast();
+            let rt = IDARG_IN_SETREALTIMEGPUPRIORITY {
+                pDevice: dxgi_device.as_raw().cast(),
+            };
             // SAFETY: driver is loaded; `swap_chain` is the live assigned swap-chain whose
             // device bind just succeeded; `rt.pDevice` is that same bound DXGI device,
             // alive across the synchronous call; `rt` points to valid local storage.
@@ -269,6 +265,8 @@ impl SwapChainProcessor {
 
         let mut logged_pending = false;
         let mut logged_frame = false;
+        // The surface the encoder last read in place: ours until an acquire returns a frame.
+        let mut last: Option<ID3D11Texture2D> = None;
         loop {
             // Check terminate at the TOP, every iteration. The success branch below does NOT re-check it,
             // so during a CONTINUOUS frame burst (DWM rendering the freshly-activated desktop) a thread the
@@ -303,16 +301,15 @@ impl SwapChainProcessor {
             // keeps the GPU surface (out.MetaData.pSurface), which the fused pass below reads.
             // Built zeroed + field-assigned (driver style) so a bindgen field-set difference
             // can't break a positional struct literal.
-            let mut in_args = pod_init!(IDARG_IN_RELEASEANDACQUIREBUFFER2);
+            let mut in_args = IDARG_IN_RELEASEANDACQUIREBUFFER2::default();
             #[allow(clippy::cast_possible_truncation)]
             {
                 in_args.Size = size_of::<IDARG_IN_RELEASEANDACQUIREBUFFER2>() as u32;
             }
             in_args.AcquireSystemMemoryBuffer = 0;
-            // `pod_init!` (zeroed, not `::default()`) — consistent with every other IddCx out-struct
-            // in this driver, and robust whether or not bindgen derives `Default` for this type (its
-            // `MetaData` field carries a raw `pSurface` pointer + union which can suppress the derive).
-            let mut buffer = pod_init!(IDARG_OUT_RELEASEANDACQUIREBUFFER2);
+            // Zeroed: bindgen (`derive_default`) derives `Default` or, for a raw pointer or a
+            // union such as `MetaData`'s, emits one that zero-fills.
+            let mut buffer = IDARG_OUT_RELEASEANDACQUIREBUFFER2::default();
             // SAFETY: driver is loaded; `swap_chain` is valid; in/out point to valid local storage.
             let hr: NTSTATUS = unsafe {
                 wdk_iddcx::IddCxSwapChainReleaseAndAcquireBuffer2(
@@ -346,6 +343,12 @@ impl SwapChainProcessor {
                 // which re-checks terminate, device removal and the encode slots. The wake event
                 // is auto-reset with ONE waiter, so a `SetEvent` raised while this thread is not
                 // waiting stays latched until its next wait — no wakeup is lost.
+                if waited == WAIT_TIMEOUT
+                    && let Some(tex) = last.take()
+                {
+                    // A whole idle wait with nothing composed: the desktop is still.
+                    attached.retain(&tex);
+                }
                 if waited == WAIT_OBJECT_0
                     || waited == WAIT_TIMEOUT
                     || waited.0 == WAIT_OBJECT_0.0 + 1
@@ -362,6 +365,8 @@ impl SwapChainProcessor {
                 // The OS's display time for this frame — the provenance stamp the access unit
                 // this frame becomes carries to the host.
                 let display_qpc = buffer.MetaData.PresentDisplayQPCTime;
+                // DWM composes on the previous surface from here on.
+                last = None;
                 if !logged_frame {
                     dbglog!(
                         "[pf-vd] swap-chain run_core: first frame acquired (target={target_id}) — DWM is compositing the virtual display"
@@ -372,6 +377,7 @@ impl SwapChainProcessor {
                 // leaks the swap-chain's whole surface set per assign/unassign cycle: adopt it
                 // unconditionally and release it before `FinishedProcessingFrame`. The queued
                 // GPU pass survives that (D3D defers destruction).
+                let mut held = false;
                 {
                     let raw = buffer.MetaData.pSurface as *mut core::ffi::c_void;
                     if !raw.is_null() {
@@ -380,15 +386,12 @@ impl SwapChainProcessor {
                         let res = unsafe { IDXGIResource::from_raw(raw) };
                         if let Ok(tex) = res.cast::<ID3D11Texture2D>() {
                             // The one fused pass into a free pool slot, or a drop at the pool.
-                            // Under S6 there is no pass and the surface is the encoder's, so
-                            // the window stays open until the pool hands it back (bounded).
-                            let held = attached.offer(device, &tex, display_qpc);
+                            // A bypass pool may hand the encoder the surface itself instead.
+                            held = attached.offer(device, &tex, display_qpc);
+                            last = held.then(|| tex.clone());
                             // Spike S5: one `CopyResource` into the probe's ring, or nothing.
                             #[cfg(feature = "encode-probe")]
                             crate::encode_probe::offer(device, &tex, display_qpc, target_id);
-                            if held {
-                                attached.wait_release();
-                            }
                         }
                         // `res` drops here: the acquire's surface reference is released,
                         // pre-Finished.
@@ -403,6 +406,12 @@ impl SwapChainProcessor {
                 // Stamped only now: nothing may sit between acquire and Finished. The present
                 // stamp feeds the compose-cadence histogram both modes are compared on.
                 attached.note_frame(display_qpc);
+                // The surface is the driver's until the next acquire returns a frame, so an
+                // encoder still reading it holds that acquire (bounded). Never Finished: DWM
+                // composes this head's next frame on it.
+                if held {
+                    attached.wait_release();
+                }
             } else {
                 // The swap-chain was likely abandoned (e.g. DXGI_ERROR_ACCESS_LOST) — exit the loop.
                 break;
@@ -422,13 +431,9 @@ impl Drop for SwapChainProcessor {
             // wake, an idle worker would sit out its whole timeout before seeing the flag.
             self.terminate.store(true, Ordering::Relaxed);
             self.wake();
-            // The worker deletes the swap-chain object before returning.
+            // The worker deletes the swap-chain object before returning. `wake` closes after
+            // this, as a field.
             let _ = handle.join();
-        }
-        if let Some(h) = self.wake.take() {
-            // SAFETY: the worker has been joined (or never started), so nothing can signal `h` any
-            // more; this is its sole close.
-            let _ = unsafe { CloseHandle(h) };
         }
     }
 }

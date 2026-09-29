@@ -50,8 +50,8 @@ impl ActionInfo {
     }
 }
 
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
-#[derive(Deserialize)]
+#[cfg(desktop)]
+#[derive(Deserialize, Default)]
 struct ActionList {
     #[serde(default)]
     actions: Vec<ActionInfo>,
@@ -60,36 +60,22 @@ struct ActionList {
 /// `GET /api/v1/actions`. Empty on any miss, never an error — same contract as [`crate::library::fetch_running`].
 ///
 /// An older host has no such route. A missing menu row is cheaper than failing the host card.
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 pub fn fetch_actions(
     addr: &str,
     mgmt_port: u16,
     identity: &(String, String),
     pin: Option<[u8; 32]>,
 ) -> Vec<ActionInfo> {
-    let Ok(agent) = crate::library::agent(identity, pin) else {
-        return Vec::new();
-    };
-    let url = format!(
-        "{}/api/v1/actions",
-        crate::library::base_url(addr, mgmt_port)
-    );
-    let Ok(mut resp) = agent.get(&url).call() else {
-        return Vec::new();
-    };
-    let Ok(body) = resp.body_mut().read_to_string() else {
-        return Vec::new();
-    };
-    serde_json::from_str::<ActionList>(&body)
-        .map(|l| l.actions)
-        .unwrap_or_default()
+    crate::library::get_json::<ActionList>(addr, mgmt_port, identity, pin, "/api/v1/actions")
+        .actions
 }
 
 /// `POST /api/v1/actions/{id}` with an empty body.
 ///
 /// `Ok(())` is 202 Accepted: the host then ends every session and acts ~1 s later.
 /// 4xx becomes [`crate::library::LibraryError::Http`]; other failures go through [`crate::library::classify`].
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 pub fn invoke(
     addr: &str,
     mgmt_port: u16,
@@ -113,82 +99,67 @@ pub fn invoke(
     }
 }
 
-/// 300 s. Grant and suspend-capability change when an operator edits access, not
-/// minute-to-minute; each refresh is a TLS handshake against an idle host.
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
-pub const TTL: std::time::Duration = std::time::Duration::from_secs(300);
-
-/// Process-wide, keyed by host fingerprint.
-///
-/// Settled before a menu draws: a row that appears under a cursor already moving toward
-/// it can shut the machine down. One cache so the console, GTK, and Windows tiles agree.
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
-type Cache =
-    std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Vec<ActionInfo>)>>;
-
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
-fn cache() -> &'static Cache {
-    static C: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
-    C.get_or_init(Default::default)
-}
-
-/// Offerable rows last stored for this fingerprint. Empty until [`refresh`] answers, and for no-route / no-grant hosts.
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
-pub fn cached(fp_hex: &str) -> Vec<ActionInfo> {
-    cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(fp_hex)
-        .map(|(_, a)| a.clone())
-        .unwrap_or_default()
-}
-
-/// Spawn a worker unless the cache is still inside [`TTL`]. Idempotent; call it on any shell tick.
-///
-/// The freshness stamp is taken before the request so a hang cannot spawn another worker
-/// every tick. Identity is loaded on the worker so menus do not have to thread it through.
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
-pub fn refresh(addr: &str, mgmt_port: u16, fp_hex: &str) {
-    if fp_hex.is_empty() {
-        return; // empty fingerprint cannot authenticate or key the cache
-    }
-    {
-        let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
-        match c.get_mut(fp_hex) {
-            Some(entry) if entry.0.elapsed() < TTL => return,
-            Some(entry) => entry.0 = std::time::Instant::now(),
-            None => {
-                c.insert(fp_hex.to_string(), (std::time::Instant::now(), Vec::new()));
-            }
+/// [`invoke`] with the outcome every shell shows. The cached rows go first: whatever the
+/// host said about itself is about to be wrong. A 202 is the last word, so there is
+/// nothing to poll.
+#[cfg(desktop)]
+pub fn run(
+    host_name: &str,
+    addr: &str,
+    mgmt_port: u16,
+    identity: &(String, String),
+    fp_hex: &str,
+    action_id: &str,
+    label: &str,
+) -> String {
+    invalidate(fp_hex);
+    let pin = crate::trust::parse_hex32(fp_hex);
+    match invoke(addr, mgmt_port, identity, pin, action_id) {
+        Ok(()) => {
+            tracing::info!(host = %host_name, action = %action_id, "host action accepted");
+            format!("{host_name}: {label} — on its way")
+        }
+        Err(e) => {
+            tracing::warn!(host = %host_name, action = %action_id, error = %e, "host action refused");
+            format!("{label} failed — {e}")
         }
     }
-    let (addr, fp_hex) = (addr.to_string(), fp_hex.to_string());
-    std::thread::Builder::new()
-        .name("punktfunk-hostactions".into())
-        .spawn(move || {
-            let Ok(identity) = crate::trust::load_or_create_identity() else {
-                return;
-            };
-            let pin = crate::trust::parse_hex32(&fp_hex);
-            let found: Vec<ActionInfo> = fetch_actions(&addr, mgmt_port, &identity, pin)
-                .into_iter()
-                .filter(ActionInfo::offerable)
-                .collect();
-            cache()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(fp_hex, (std::time::Instant::now(), found));
-        })
-        .ok();
+}
+
+/// 300 s. Grant and suspend-capability change when an operator edits access, not
+/// minute-to-minute; each refresh is a TLS handshake against an idle host.
+#[cfg(desktop)]
+pub const TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Settled before a menu draws: a row that appears under a cursor already moving toward
+/// it can shut the machine down. One cache so the console, GTK, and Windows tiles agree.
+#[cfg(desktop)]
+static ACTIONS: crate::library::FpCache<ActionInfo> =
+    crate::library::FpCache::new(TTL, "punktfunk-hostactions");
+
+/// Offerable rows last stored for this fingerprint. Empty until [`refresh`] answers, and for no-route / no-grant hosts.
+#[cfg(desktop)]
+pub fn cached(fp_hex: &str) -> Vec<ActionInfo> {
+    ACTIONS.get(fp_hex)
+}
+
+/// Ask the host for its rows unless [`TTL`] says the last answer still stands.
+/// Idempotent; call it on any shell tick.
+#[cfg(desktop)]
+pub fn refresh(addr: &str, mgmt_port: u16, fp_hex: &str) {
+    ACTIONS.refresh(
+        addr,
+        mgmt_port,
+        fp_hex,
+        fetch_actions,
+        ActionInfo::offerable,
+    );
 }
 
 /// Drop the cache after [`invoke`]: otherwise the menu still offers Sleep until [`TTL`] lapses on an already-asleep host.
-#[cfg(all(feature = "desktop", any(target_os = "linux", windows)))]
+#[cfg(desktop)]
 pub fn invalidate(fp_hex: &str) {
-    cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(fp_hex);
+    ACTIONS.invalidate(fp_hex);
 }
 
 #[cfg(test)]

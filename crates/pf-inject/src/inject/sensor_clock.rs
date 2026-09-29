@@ -31,6 +31,11 @@ impl SensorClock {
         SensorClock::new(3, 16)
     }
 
+    /// Microsecond ticks: the 8BitDo u32 IMU clock and the HORIPAD's u16 one.
+    pub fn micros() -> SensorClock {
+        SensorClock::new(1, 1)
+    }
+
     fn new(ticks_num: u64, ticks_den: u64) -> SensorClock {
         SensorClock {
             epoch: None,

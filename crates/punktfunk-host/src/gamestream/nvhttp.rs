@@ -9,7 +9,8 @@
 //! Pairing and grants: `design/per-client-access.md`.
 
 use super::tls::{PeerAddr, PeerCertFingerprint};
-use super::{serverinfo, AppState, LaunchSession, HTTPS_PORT, HTTP_PORT, RTSP_PORT};
+use super::{serverinfo, LaunchSession, HTTPS_PORT, HTTP_PORT, RTSP_PORT};
+use crate::host::AppState;
 use anyhow::{anyhow, Context, Result};
 use axum::{
     extract::{Query, Request, State},
@@ -30,7 +31,7 @@ struct Https(bool);
 
 pub async fn run(state: Arc<AppState>) -> Result<()> {
     // Request and verify the client cert; Moonlight presents one after pairing.
-    let tls = super::tls::server_config(&state.identity.cert_pem, &state.identity.key_pem)?;
+    let tls = super::tls::server_config(&state.gs.identity.cert_pem, &state.gs.identity.key_pem)?;
 
     let http_addr = SocketAddr::from(([0, 0, 0, 0], HTTP_PORT));
     let https_addr = SocketAddr::from(([0, 0, 0, 0], HTTPS_PORT));
@@ -75,7 +76,7 @@ fn peer_grants(peer: &Option<Extension<PeerCertFingerprint>>, st: &AppState) -> 
         return None;
     };
     match st.access.get() {
-        Some(np) => np.moonlight_effective(fp, super::wall_unix_now()),
+        Some(np) => np.moonlight_effective(fp, crate::clock::unix_secs()),
         // No registry (tests / embedders that skip `serve`): pre-grants = full control.
         None => Some(GRANT_ALL),
     }
@@ -545,8 +546,9 @@ async fn h_pair(
     let result = if phrase == Some("getservercert") {
         match (q.get("salt"), q.get("clientcert")) {
             (Some(salt), Some(cc)) => {
-                st.pairing
-                    .getservercert(&st.identity, &uniqueid, salt, cc, peer_ip)
+                st.gs
+                    .pairing
+                    .getservercert(&st.gs.identity, &uniqueid, salt, cc, peer_ip)
                     .await
             }
             _ => Ok(pair_error_xml()),
@@ -561,13 +563,16 @@ async fn h_pair(
             Ok(pair_error_xml())
         }
     } else if let Some(v) = q.get("clientchallenge") {
-        st.pairing
-            .clientchallenge(&st.identity, &uniqueid, v, peer_ip)
+        st.gs
+            .pairing
+            .clientchallenge(&st.gs.identity, &uniqueid, v, peer_ip)
     } else if let Some(v) = q.get("serverchallengeresp") {
-        st.pairing
-            .serverchallengeresp(&st.identity, &uniqueid, v, peer_ip)
+        st.gs
+            .pairing
+            .serverchallengeresp(&st.gs.identity, &uniqueid, v, peer_ip)
     } else if let Some(v) = q.get("clientpairingsecret") {
         let r = st
+            .gs
             .pairing
             .clientpairingsecret(&uniqueid, v, &st.paired, peer_ip);
         // First pairing: bring ENet control up now (idempotent). Moonlight connects control
@@ -606,7 +611,7 @@ mod tests {
     use super::*;
 
     fn test_state() -> Arc<AppState> {
-        let host = super::super::Host {
+        let host = crate::host::Host {
             hostname: "t".into(),
             uniqueid: "id".into(),
             http_port: HTTP_PORT,
@@ -618,7 +623,11 @@ mod tests {
         let stats = crate::stats_recorder::StatsRecorder::new(
             std::env::temp_dir().join(format!("pf-nvhttp-stats-{}", std::process::id())),
         );
-        Arc::new(AppState::new(host, identity, stats))
+        Arc::new(AppState::new(
+            host,
+            stats,
+            super::super::GsState::new(identity),
+        ))
     }
 
     fn fp_of(der: &[u8]) -> String {
@@ -840,7 +849,7 @@ mod tests {
             &fp_hex,
             Access {
                 grants: GRANT_ALL,
-                expires_unix: Some(super::super::wall_unix_now() - 5),
+                expires_unix: Some(crate::clock::unix_secs() - 5),
                 until_disconnect: false,
             },
         )
@@ -894,7 +903,7 @@ mod tests {
         .await;
         assert!(ok.contains("<resume>1</resume>"), "ungoverned resume: {ok}");
 
-        let now = super::super::wall_unix_now();
+        let now = crate::clock::unix_secs();
         np.add_with_access(
             "Guest",
             &fp_hex,
@@ -1138,7 +1147,7 @@ mod tests {
         assert!(!st.end_if_preempted(), "nothing stole it");
         assert!(st.streaming.load(SeqCst));
 
-        st.preempted.store(true, SeqCst); // what `Admission::Steal` does to each victim
+        st.gs.preempted.store(true, SeqCst); // what `Admission::Steal` does to each victim
         assert!(st.end_if_preempted());
         assert!(!st.streaming.load(SeqCst) && !st.audio_streaming.load(SeqCst));
         assert!(st.launch.lock().unwrap().is_none());

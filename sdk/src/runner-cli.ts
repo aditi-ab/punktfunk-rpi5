@@ -19,8 +19,8 @@
 //
 // Package-op flags: --exact pins the resolved version instead of a caret range, and
 // --registry @scope=https://… maps a scope to its registry in bunfig.toml. Both exist for the
-// plugin store (crates/punktfunk-host/src/store), which installs one reviewed version of a
-// package that may live on somebody else's registry — but they are ordinary CLI flags too.
+// plugin store (crates/punktfunk-host/src/plugin_host/store), which installs one reviewed version
+// of a package that may live on somebody else's registry — but they are ordinary CLI flags too.
 import { Effect, Fiber } from "effect";
 import { publishedMgmtUrl } from "./config.js";
 import { installLogShipper } from "./log-ship.js";
@@ -30,7 +30,9 @@ import {
 	reconcileSharedSdk,
 	removePlugins,
 } from "./plugins.js";
-import { discoverUnits, runner, runOneUnit } from "./runner.js";
+import { discoverUnits } from "./discover.js";
+import { runner, runOneUnit } from "./runner.js";
+import { redirectUiServe } from "./ui-forward.js";
 
 const arg = (flag: string): string | undefined => {
 	const i = process.argv.indexOf(flag);
@@ -159,6 +161,9 @@ switch (process.argv[2]) {
 const runUnit = arg("--run-unit");
 if (runUnit) {
 	const unit = { name: arg("--unit-name") ?? runUnit, file: runUnit };
+	// Set only for a plugin without network, whose UI the supervisor forwards.
+	const uiPort = Number(process.env.PUNKTFUNK_UI_PORT);
+	if (uiPort > 0) redirectUiServe(uiPort);
 	const unitShipper = installLogShipper();
 	const unitFiber = Effect.runFork(runOneUnit(unit));
 	const stopUnit = (): void => {

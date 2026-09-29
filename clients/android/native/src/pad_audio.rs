@@ -40,9 +40,12 @@
 //! either hypothesis, and it is what keeps a rumble-only title rumbling — it renders no haptics
 //! audio, the host's silence gate emits nothing, and the pad simply keeps its motors.
 
-use std::collections::VecDeque;
-
+use punktfunk_core::audio::pad_mix::HapticsLiveness;
+#[cfg(target_os = "android")]
+use punktfunk_core::audio::pad_mix::{plc_frames, QuadMixer, PAD_CHANNELS};
+#[cfg(target_os = "android")]
 use punktfunk_core::audio::AudioGapTracker;
+#[cfg(target_os = "android")]
 use punktfunk_core::quic::{PAD_AUDIO_KIND_HAPTICS, PAD_AUDIO_KIND_SPEAKER};
 
 #[cfg(target_os = "android")]
@@ -54,12 +57,7 @@ use std::sync::Arc;
 #[cfg(target_os = "android")]
 use std::thread::JoinHandle;
 #[cfg(target_os = "android")]
-use std::time::Duration;
-
-/// The pad's render layout: 4 interleaved channels — speaker FL/FR on 0/1, the voice coils on
-/// 2/3. Feeding a 2-channel stream would leave the coils silent rather than fail, which is the
-/// failure mode most worth not having.
-const PAD_CHANNELS: usize = 4;
+use std::time::{Duration, Instant};
 
 /// Both plane kinds decode as 48 kHz stereo.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
@@ -67,6 +65,7 @@ const SAMPLE_RATE: u32 = 48_000;
 
 /// Ring ceiling, in sample frames. 60 ms — far above the in-flight depth, because this bounds
 /// *decoder* backlog when the USB side stalls, not stream latency. Overflow drops the oldest.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 const MAX_BUFFER_FRAMES: usize = (SAMPLE_RATE as usize / 1000) * 60;
 
 /// Largest Opus frame this decodes in one call: 120 ms at 48 kHz, the codec's maximum.
@@ -113,49 +112,15 @@ pub(crate) fn haptics_armed(pad: u8) -> bool {
     TIER_A_PADS.load(std::sync::atomic::Ordering::Relaxed) & (1u32 << (pad & 0x0f)) != 0
 }
 
-/// Last instant a real (non-concealed) haptics frame was decoded for each pad, as ms on the
-/// process clock; `0` = never. Written by the render thread, read by the rumble poll thread.
-static HAPTICS_SEEN_MS: [std::sync::atomic::AtomicU64; 16] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 16];
-
-/// Process epoch for [`HAPTICS_SEEN_MS`] — `Instant` is not `const`-constructible.
-fn epoch() -> std::time::Instant {
-    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    *EPOCH.get_or_init(std::time::Instant::now)
-}
-
-/// Milliseconds since [`epoch`], **1-based**. The `+ 1` reserves `0` as an unambiguous "never
-/// stamped" sentinel: without it, a haptics frame arriving in the first millisecond of the process
-/// would stamp `0` and be read as never-arrived, handing the coils to wire rumble mid-effect.
-/// Stamp and comparison share this clock, so the offset cancels and adds no skew.
-fn now_ms() -> u64 {
-    epoch().elapsed().as_millis() as u64 + 1
-}
-
-/// A pad is only silent for haptics once the host has stopped sending for longer than its own
-/// silence gate can explain. The host gates at −60 dBFS with a 250 ms hangover, so a title that
-/// renders no haptics audio emits NOTHING on the 0xD1 plane; doubling the hangover covers wire
-/// jitter and concealment without letting a real gap read as "live".
-const HAPTICS_IDLE_MS: u64 = 500;
-
-/// Stamp a decoded haptics frame. Concealment (PLC) deliberately does not count — filling a gap
-/// is not evidence that the game is still driving the coils.
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
-pub(crate) fn note_haptics_frame(pad: u8) {
-    HAPTICS_SEEN_MS[(pad & 0x0f) as usize].store(now_ms(), std::sync::atomic::Ordering::Relaxed);
-}
+/// Last real (non-concealed) haptics frame per pad. Written by the render thread, read by the
+/// rumble poll thread.
+static HAPTICS: HapticsLiveness = HapticsLiveness::new();
 
 /// Clear a pad's liveness (slot teardown). Wire indices are recycled, so a stale stamp would let
 /// a fresh pad inherit the previous one's ownership.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub(crate) fn clear_haptics_liveness(pad: u8) {
-    HAPTICS_SEEN_MS[(pad & 0x0f) as usize].store(0, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// The arbitration, pure and testable: haptics owns the coils only while frames are ACTUALLY
-/// arriving. `seen_ms == 0` (never) is never live.
-pub(crate) fn haptics_owns_at(armed: bool, seen_ms: u64, now: u64) -> bool {
-    armed && seen_ms != 0 && now.saturating_sub(seen_ms) < HAPTICS_IDLE_MS
+    HAPTICS.clear(pad);
 }
 
 /// Does this pad's haptics stream currently own the coils, so wire rumble must stand down?
@@ -167,111 +132,7 @@ pub(crate) fn haptics_owns_at(armed: bool, seen_ms: u64, now: u64) -> bool {
 /// suppressing its rumble on the assumption that "the stream carries the feedback" silences it
 /// outright. Frame arrival is the signal that tells the two cases apart, and it costs nothing.
 pub(crate) fn haptics_owns_coils(pad: u8) -> bool {
-    let i = (pad & 0x0f) as usize;
-    haptics_owns_at(
-        haptics_armed(pad),
-        HAPTICS_SEEN_MS[i].load(std::sync::atomic::Ordering::Relaxed),
-        now_ms(),
-    )
-}
-
-// ---- the 4-channel mixer ---------------------------------------------------------------------
-
-/// Interleave the two independent stereo streams into one 4-channel frame stream.
-///
-/// The kinds arrive on different cadences (haptics 5 ms, speaker 10 ms), so each has its own
-/// write cursor and [`pop`](Self::pop) emits everything the further-ahead kind has filled, with
-/// the lagging or absent kind's pair reading silence. A haptics-only session therefore renders
-/// the coils with a silent speaker pair, and vice versa, instead of stalling on the missing kind.
-///
-/// Samples are `i16` — the DualSense's own wire format — so nothing converts on the hot path.
-/// Pure logic, unit-tested below; pacing lives in the USB ring downstream.
-pub(crate) struct QuadMixer {
-    /// Interleaved 4-channel samples; the front is the next frame out. Always
-    /// `ready_frames() * PAD_CHANNELS` long.
-    ring: VecDeque<i16>,
-    /// Per-kind write cursor in FRAMES relative to the ring front, indexed by the wire `kind`.
-    written: [usize; 2],
-    /// Frames dropped to the ceiling — a stalled USB side, visible in the logs.
-    dropped: u64,
-}
-
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
-impl QuadMixer {
-    pub(crate) fn new() -> QuadMixer {
-        QuadMixer {
-            ring: VecDeque::new(),
-            written: [0; 2],
-            dropped: 0,
-        }
-    }
-
-    /// Write one decoded stereo chunk (interleaved L/R) for `kind` at that kind's cursor,
-    /// zero-extending as needed. Both cursors shift together on overflow, so the two kinds can
-    /// never skew relative to one another.
-    pub(crate) fn push(&mut self, kind: u8, stereo: &[i16]) {
-        // Name both kinds rather than defaulting: a kind this build does not know belongs
-        // nowhere in a 4-channel frame, and quietly folding it into the coil pair would render
-        // an unknown stream straight into the actuators.
-        let (k, off) = match kind {
-            PAD_AUDIO_KIND_HAPTICS => (0usize, 2usize),
-            PAD_AUDIO_KIND_SPEAKER => (1usize, 0usize),
-            _ => return,
-        };
-        let frames = stereo.len() / 2;
-        let base = self.written[k];
-        let need = (base + frames) * PAD_CHANNELS;
-        if self.ring.len() < need {
-            self.ring.resize(need, 0);
-        }
-        for (i, fr) in stereo.chunks_exact(2).enumerate() {
-            let at = (base + i) * PAD_CHANNELS + off;
-            self.ring[at] = fr[0];
-            self.ring[at + 1] = fr[1];
-        }
-        self.written[k] = base + frames;
-        let over = self.ready_frames().saturating_sub(MAX_BUFFER_FRAMES);
-        if over > 0 {
-            self.dropped += over as u64;
-            self.drop_front(over);
-        }
-    }
-
-    /// Frames ready to output: the further-ahead kind's cursor.
-    pub(crate) fn ready_frames(&self) -> usize {
-        self.written[0].max(self.written[1])
-    }
-
-    /// Frames discarded to the ceiling since construction.
-    pub(crate) fn dropped_frames(&self) -> u64 {
-        self.dropped
-    }
-
-    /// Append every ready frame (interleaved 4-channel) to `out`; returns the frame count.
-    pub(crate) fn pop(&mut self, out: &mut Vec<i16>) -> usize {
-        let frames = self.ready_frames();
-        let n = frames * PAD_CHANNELS;
-        out.extend(self.ring.drain(..n.min(self.ring.len())));
-        for w in &mut self.written {
-            *w = w.saturating_sub(frames);
-        }
-        frames
-    }
-
-    /// Throw the ready frames away — no sink to render them on right now.
-    pub(crate) fn discard(&mut self) {
-        let f = self.ready_frames();
-        self.drop_front(f);
-    }
-
-    fn drop_front(&mut self, frames: usize) {
-        let n = (frames * PAD_CHANNELS).min(self.ring.len());
-        self.ring.drain(..n);
-        let f = n / PAD_CHANNELS;
-        for w in &mut self.written {
-            *w = w.saturating_sub(f);
-        }
-    }
+    haptics_armed(pad) && HAPTICS.live(pad)
 }
 
 // ---- decode + packet loss concealment ---------------------------------------------------------
@@ -285,27 +146,11 @@ struct KindStream {
     frame_samples: usize,
 }
 
-/// Concealment frames to synthesise before decoding `seq`, capped at 50 ms of `frame_samples`
-/// (speaker frames are 10 ms, haptics 5 ms).
-///
-/// Zero until something has decoded, because there is nothing to size the PLC from yet. The
-/// tracker is fed regardless, so a gap seen before the first real frame cannot resurface later as
-/// a phantom. Pure, and unit-tested.
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
-fn plc_frames(gaps: &mut AudioGapTracker, seq: u32, frame_samples: usize) -> u32 {
-    if frame_samples == 0 {
-        gaps.missing_before(seq);
-        return 0;
-    }
-    gaps.set_frame_us((frame_samples as u64 * 1_000_000 / SAMPLE_RATE as u64) as u32);
-    gaps.missing_before(seq)
-}
-
 // ---- the USB sink ------------------------------------------------------------------------------
 
 /// Everything that talks to the pad. Linux and Android only: `usbfs` is a Linux kernel ABI, and
-/// this crate also builds as a host cdylib on macOS dev boxes, where the mixer and PLC above still
-/// compile and still run their tests.
+/// this crate also builds as a host cdylib on macOS dev boxes, where the registry above still
+/// compiles and runs its tests.
 #[cfg(target_os = "android")]
 mod sink {
     use super::{IN_FLIGHT_MS, PAD_CHANNELS, SAMPLE_RATE};
@@ -484,10 +329,12 @@ impl Drop for PadAudio {
 /// Start the renderer for a pad whose descriptor Java has handed over.
 ///
 /// Returns `None` when neither kind is enabled (nothing to render) or the thread will not start.
-/// **The caller must keep the `UsbDeviceConnection` open until the returned handle is dropped** —
-/// the renderer borrows the descriptor and never closes it.
+///
+/// # Safety
+/// `fd` is a live usbfs descriptor whose `UsbDeviceConnection` stays open until the returned
+/// handle is dropped — the renderer borrows it and never closes it.
 #[cfg(target_os = "android")]
-pub(crate) fn start(
+pub(crate) unsafe fn start(
     client: Arc<NativeClient>,
     pad: u8,
     fd: i32,
@@ -498,7 +345,8 @@ pub(crate) fn start(
         return None;
     }
     let stop = Arc::new(AtomicBool::new(false));
-    let join = spawn(client, Arc::clone(&stop), pad, fd, haptics, speaker)?;
+    // SAFETY: forwarded from this function's contract; dropping the handle joins the thread.
+    let join = unsafe { spawn(client, Arc::clone(&stop), pad, fd, haptics, speaker) }?;
     Some(PadAudio {
         pad,
         stop,
@@ -506,13 +354,14 @@ pub(crate) fn start(
     })
 }
 
-/// Spawn the pad-audio renderer — the 0xD1 plane's single consumer on Android.
+/// Spawn the pad-audio renderer — the 0xD1 plane's single consumer on Android. Returns `None` if
+/// the thread could not be started.
 ///
-/// `fd` is the pad's usbfs descriptor from `UsbDeviceConnection.getFileDescriptor()`; the caller
-/// **must** keep that connection open until [`stop`](AtomicBool) has been observed and the handle
-/// joined. Returns `None` if the thread could not be started.
+/// # Safety
+/// `fd` is the pad's usbfs descriptor from `UsbDeviceConnection.getFileDescriptor()`, and that
+/// connection stays open until the returned handle is joined.
 #[cfg(target_os = "android")]
-pub(crate) fn spawn(
+unsafe fn spawn(
     client: Arc<NativeClient>,
     stop: Arc<AtomicBool>,
     pad: u8,
@@ -522,22 +371,31 @@ pub(crate) fn spawn(
 ) -> Option<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("pf-pad-audio".into())
-        .spawn(move || run(&client, &stop, pad, fd, haptics, speaker))
+        // SAFETY: the caller keeps `fd` open until this thread is joined.
+        .spawn(move || unsafe { run(&client, &stop, pad, fd, haptics, speaker) })
         .map_err(|e| log::warn!("pad-audio thread not started: {e}"))
         .ok()
 }
 
+/// The renderer thread's body.
+///
+/// # Safety
+/// `fd` stays open until this returns (see [`spawn`]).
 #[cfg(target_os = "android")]
-fn run(client: &NativeClient, stop: &AtomicBool, pad: u8, fd: i32, haptics: bool, speaker: bool) {
+unsafe fn run(
+    client: &NativeClient,
+    stop: &AtomicBool,
+    pad: u8,
+    fd: i32,
+    haptics: bool,
+    speaker: bool,
+) {
     // Ask the scheduler for audio priority. Android does not hand SCHED_FIFO to ordinary app
     // threads, so -16 (ANDROID_PRIORITY_AUDIO) is the realistic knob — and WP7 measured that it
     // both applies and is enough to hold the 4 ms floor against eight busy cores.
-    // SAFETY: `setpriority` on the calling thread; no pointers, no shared state.
-    unsafe {
-        libc::setpriority(libc::PRIO_PROCESS, 0, -16);
-    }
+    let _ = crate::sys::set_thread_nice(None, -16);
 
-    // SAFETY: the caller's contract — the Java connection outlives this thread.
+    // SAFETY: forwarded from this function's contract.
     let dev = unsafe { sink::device(fd) };
     // Through a reference, deliberately: `UsbFsDevice` has a `Drop`, and opening the stream in
     // this same scope would make the borrow outlive the value it borrows.
@@ -624,7 +482,7 @@ fn pump(
     speaker: bool,
     playback: &mut uac_host::Playback<'_>,
 ) {
-    let mut mixer = QuadMixer::new();
+    let mut mixer = QuadMixer::<i16>::new(MAX_BUFFER_FRAMES);
     let mut streams: [Option<KindStream>; 2] = [None, None];
     let mut tally = Tally::new();
     let mut pcm: Vec<i16> = Vec::with_capacity(MAX_FRAME_SAMPLES * 2);
@@ -637,7 +495,8 @@ fn pump(
         // that state indistinguishable from the renderer being dead.
         tally.report(playback);
 
-        let Some(frame) = client.next_pad_audio(Duration::from_millis(10)) else {
+        let mut next = client.next_pad_audio(Duration::from_millis(10));
+        if next.is_none() {
             // R12: `next_pad_audio` collapses a DISCONNECTED channel into the same `None` as an
             // ordinary timeout, so this arm cannot tell "nothing arrived in 10 ms" from "the
             // session is gone and nothing will ever arrive again". Left to `continue`, a closed
@@ -648,62 +507,69 @@ fn pump(
                 break;
             }
             continue;
-        };
-
-        // R14: `PadAudioFrame` carries the wire pad it was addressed to, and this renderer serves
-        // exactly one. A frame for another pad — a queue still holding the previous occupant's
-        // when a slot is re-used, or a host bug — would otherwise be decoded here AND seed the
-        // gap tracker from a foreign sequence space, which shows up as a burst of phantom
-        // concealment rather than as anything obviously wrong.
-        if frame.pad != pad {
-            log::debug!(
-                "pad audio: dropping frame for pad {} on pad {pad}",
-                frame.pad
-            );
-            continue;
         }
+        // Everything queued goes into the mixer before one write, so its MAX_BUFFER_FRAMES
+        // ceiling bounds the backlog. One frame per USB-paced write never sheds a burst.
+        while let Some(frame) = next.take() {
+            next = client.next_pad_audio(Duration::ZERO);
 
-        // The settings gate each kind independently: haptics off but speaker on is a legitimate
-        // configuration, and the host may still be sending both.
-        let wanted = match frame.kind {
-            PAD_AUDIO_KIND_HAPTICS => haptics,
-            PAD_AUDIO_KIND_SPEAKER => speaker,
-            _ => false,
-        };
-        if !wanted {
-            continue;
+            // R14: `PadAudioFrame` carries the wire pad it was addressed to, and this renderer serves
+            // exactly one. A frame for another pad — a queue still holding the previous occupant's
+            // when a slot is re-used, or a host bug — would otherwise be decoded here AND seed the
+            // gap tracker from a foreign sequence space, which shows up as a burst of phantom
+            // concealment rather than as anything obviously wrong.
+            if frame.pad != pad {
+                log::debug!(
+                    "pad audio: dropping frame for pad {} on pad {pad}",
+                    frame.pad
+                );
+                continue;
+            }
+
+            // The settings gate each kind independently: haptics off but speaker on is a legitimate
+            // configuration, and the host may still be sending both.
+            let wanted = match frame.kind {
+                PAD_AUDIO_KIND_HAPTICS => haptics,
+                PAD_AUDIO_KIND_SPEAKER => speaker,
+                _ => false,
+            };
+            if !wanted {
+                continue;
+            }
+
+            // A real haptics frame is the evidence that the game is driving the coils, and therefore
+            // that wire rumble must stand down for this pad (see `haptics_owns_coils`). Stamped on
+            // arrival rather than after decode so a decoder hiccup cannot hand the coils back
+            // mid-effect; concealment never reaches here, so PLC still does not count.
+            if frame.kind == PAD_AUDIO_KIND_HAPTICS {
+                HAPTICS.note(pad);
+            }
+
+            tally.frames_in += 1;
+            let k = usize::from(frame.kind).min(1);
+            let st = match &mut streams[k] {
+                Some(s) => s,
+                slot @ None => match opus::Decoder::new(SAMPLE_RATE, opus::Channels::Stereo) {
+                    Ok(dec) => slot.insert(KindStream {
+                        dec,
+                        gaps: AudioGapTracker::default(),
+                        frame_samples: 0,
+                    }),
+                    Err(e) => {
+                        log::warn!("pad audio: no Opus decoder for kind {}: {e}", frame.kind);
+                        continue;
+                    }
+                },
+            };
+            decode_into(st, &frame, &mut pcm, &mut mixer, &mut tally);
         }
-
-        // A real haptics frame is the evidence that the game is driving the coils, and therefore
-        // that wire rumble must stand down for this pad (see `haptics_owns_coils`). Stamped on
-        // arrival rather than after decode so a decoder hiccup cannot hand the coils back
-        // mid-effect; concealment never reaches here, so PLC still does not count.
-        if frame.kind == PAD_AUDIO_KIND_HAPTICS {
-            note_haptics_frame(pad);
-        }
-
-        tally.frames_in += 1;
-        let k = usize::from(frame.kind).min(1);
-        let st = match &mut streams[k] {
-            Some(s) => s,
-            slot @ None => match opus::Decoder::new(SAMPLE_RATE, opus::Channels::Stereo) {
-                Ok(dec) => slot.insert(KindStream {
-                    dec,
-                    gaps: AudioGapTracker::default(),
-                    frame_samples: 0,
-                }),
-                Err(e) => {
-                    log::warn!("pad audio: no Opus decoder for kind {}: {e}", frame.kind);
-                    continue;
-                }
-            },
-        };
-        decode_into(st, &frame, &mut pcm, &mut mixer, &mut tally);
 
         // Hand over whole frames only. `write` stages any remainder internally, so a partial
         // chunk is never padded with silence mid-stream.
         out.clear();
-        if mixer.pop(&mut out) > 0 && !write_out(playback, &out, &mut mixer, &mut tally) {
+        if mixer.pop(&mut out, Instant::now()) > 0
+            && !write_out(playback, &out, &mut mixer, &mut tally)
+        {
             return;
         }
     }
@@ -726,14 +592,14 @@ fn decode_into(
     st: &mut KindStream,
     frame: &punktfunk_core::quic::PadAudioFrame,
     pcm: &mut Vec<i16>,
-    mixer: &mut QuadMixer,
+    mixer: &mut QuadMixer<i16>,
     tally: &mut Tally,
 ) {
     let missing = plc_frames(&mut st.gaps, frame.seq, st.frame_samples);
     for _ in 0..missing {
         pcm.resize(st.frame_samples * 2, 0);
         match st.dec.decode(&[], pcm, false) {
-            Ok(n) => mixer.push(frame.kind, &pcm[..n * 2]),
+            Ok(n) => mixer.push(frame.kind, &pcm[..n * 2], Instant::now()),
             Err(_) => break,
         }
     }
@@ -755,7 +621,7 @@ fn decode_into(
                     .max()
                     .unwrap_or(0),
             );
-            mixer.push(frame.kind, &pcm[..n * 2]);
+            mixer.push(frame.kind, &pcm[..n * 2], Instant::now());
         }
         Err(e) => log::debug!("pad audio: opus decode failed: {e}"),
     }
@@ -769,7 +635,7 @@ fn decode_into(
 fn write_out(
     playback: &mut uac_host::Playback<'_>,
     out: &[i16],
-    mixer: &mut QuadMixer,
+    mixer: &mut QuadMixer<i16>,
     tally: &mut Tally,
 ) -> bool {
     match playback.write_interleaved(out) {
@@ -865,83 +731,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn speaker_lands_on_the_front_pair_and_haptics_on_the_coils() {
-        let mut m = QuadMixer::new();
-        m.push(PAD_AUDIO_KIND_SPEAKER, &[100, 200]);
-        m.push(PAD_AUDIO_KIND_HAPTICS, &[300, 400]);
-        let mut out = Vec::new();
-        assert_eq!(m.pop(&mut out), 1);
-        // Channels 0/1 are the speaker, 2/3 are the voice coils — the pad's own layout.
-        assert_eq!(out, vec![100, 200, 300, 400]);
-    }
-
-    #[test]
-    fn a_haptics_only_session_still_renders_with_a_silent_speaker_pair() {
-        // The case that matters most: `pad_speaker = "off"` must not stall the coils waiting for
-        // a kind that will never arrive.
-        let mut m = QuadMixer::new();
-        m.push(PAD_AUDIO_KIND_HAPTICS, &[7, 8, 9, 10]);
-        let mut out = Vec::new();
-        assert_eq!(m.pop(&mut out), 2);
-        assert_eq!(out, vec![0, 0, 7, 8, 0, 0, 9, 10]);
-    }
-
-    #[test]
-    fn the_two_kinds_never_skew_when_the_ceiling_drops_frames() {
-        let mut m = QuadMixer::new();
-        // Push well past the ceiling on one kind, then a marker on the other. Both cursors must
-        // have moved together, so the marker still lands on the same output frame boundary.
-        let flood = vec![1i16; (MAX_BUFFER_FRAMES + 500) * 2];
-        m.push(PAD_AUDIO_KIND_HAPTICS, &flood);
-        assert!(m.dropped_frames() > 0);
-        assert_eq!(m.ready_frames(), MAX_BUFFER_FRAMES);
-
-        m.push(PAD_AUDIO_KIND_SPEAKER, &[42, 43]);
-        let mut out = Vec::new();
-        let frames = m.pop(&mut out);
-        assert_eq!(frames, MAX_BUFFER_FRAMES);
-        assert_eq!(out.len(), frames * PAD_CHANNELS);
-        // The speaker sample went to the FRONT of the ring (its cursor was reset with the drop),
-        // not to wherever the flooded kind happened to be.
-        assert_eq!(&out[..4], &[42, 43, 1, 1]);
-    }
-
-    #[test]
-    fn interleaving_survives_uneven_cadences() {
-        // Haptics arrive at 5 ms and the speaker at 10 ms; popping mid-flight must not lose the
-        // lagging kind's alignment.
-        let mut m = QuadMixer::new();
-        m.push(PAD_AUDIO_KIND_HAPTICS, &[1, 1, 2, 2]);
-        m.push(PAD_AUDIO_KIND_SPEAKER, &[9, 9]);
-        let mut out = Vec::new();
-        assert_eq!(m.pop(&mut out), 2);
-        assert_eq!(out, vec![9, 9, 1, 1, 0, 0, 2, 2]);
-
-        // Next round: both cursors are back at zero, so a fresh speaker frame aligns with a fresh
-        // haptics frame rather than inheriting the previous round's offset.
-        out.clear();
-        m.push(PAD_AUDIO_KIND_SPEAKER, &[5, 5]);
-        m.push(PAD_AUDIO_KIND_HAPTICS, &[6, 6]);
-        assert_eq!(m.pop(&mut out), 1);
-        assert_eq!(out, vec![5, 5, 6, 6]);
-    }
-
-    #[test]
-    fn an_unknown_kind_is_dropped_rather_than_rendered_into_the_coils() {
-        let mut m = QuadMixer::new();
-        m.push(9, &[999, 999]);
-        assert_eq!(
-            m.ready_frames(),
-            0,
-            "an unknown kind must not occupy a channel pair"
-        );
-        let mut out = Vec::new();
-        m.push(PAD_AUDIO_KIND_HAPTICS, &[1, 2]);
-        assert_eq!(m.pop(&mut out), 1);
-        assert_eq!(out, vec![0, 0, 1, 2]);
-    }
-
-    #[test]
     fn tier_a_registry_tracks_pads_independently() {
         // A rumble command reaching a tier-A pad mutes its coils for the session, so this gate
         // has to be exact rather than approximately right.
@@ -967,54 +756,16 @@ mod tests {
         assert!(!haptics_armed(0x1f));
     }
 
-    /// The arbitration that keeps a rumble-only game working. Armed alone is NOT ownership: a
-    /// title that never renders haptics audio produces no frames, so the host's silence gate
-    /// emits nothing on 0xD1 and the pad must keep its motors.
+    /// Armed alone is not ownership, and teardown drops the stamp: wire indices are recycled,
+    /// and a fresh pad must not inherit the previous occupant's coils.
     #[test]
-    fn haptics_owns_the_coils_only_while_frames_actually_arrive() {
-        // Never seen a frame — armed, but the game is not driving the coils.
+    fn haptics_own_the_coils_only_while_armed_and_live() {
+        HAPTICS.note(2);
         assert!(
-            !haptics_owns_at(true, 0, 10_000),
-            "an armed pad that has never received a frame must keep its rumble"
+            !haptics_owns_coils(2),
+            "frames without a renderer own nothing"
         );
-        // A frame just arrived: haptics owns, rumble stands down.
-        assert!(haptics_owns_at(true, 10_000, 10_000));
-        // Still inside the idle window (the host's own 250 ms hangover, doubled).
-        assert!(haptics_owns_at(true, 10_000, 10_000 + HAPTICS_IDLE_MS - 1));
-        // The stream went quiet: the coils go back to wire rumble.
-        assert!(
-            !haptics_owns_at(true, 10_000, 10_000 + HAPTICS_IDLE_MS),
-            "the coils must return to rumble once haptics stops arriving"
-        );
-        // Not armed (speaker-only, or no renderer): frames or not, rumble always owns.
-        assert!(!haptics_owns_at(false, 10_000, 10_000));
-    }
-
-    /// Clock skew must never strand a pad in the suppressed state.
-    #[test]
-    fn a_stamp_ahead_of_now_does_not_wrap_the_idle_window() {
-        // The clock is monotonic so this should not arise, but an unsigned underflow would wrap
-        // to ~2^64 ms and read as EXPIRED — handing the coils back mid-effect. `saturating_sub`
-        // pins it to 0 (still live), and it self-corrects once the clock catches up.
-        assert!(haptics_owns_at(true, 10_000, 9_000));
-        // The 1-based clock is what makes this distinguishable: a frame stamped in the process's
-        // first millisecond must read as LIVE, not as never-stamped.
-        assert!(
-            haptics_owns_at(true, 1, 1),
-            "a frame stamped at t=0 must not be mistaken for never-stamped"
-        );
-        assert!(
-            !haptics_owns_at(true, 0, 0),
-            "never-seen stays never-seen at t=0"
-        );
-    }
-
-    /// Teardown drops the liveness stamp: wire indices are recycled, and a fresh pad must not
-    /// inherit the previous occupant's ownership of the coils.
-    #[test]
-    fn clearing_liveness_hands_the_coils_back() {
         set_tier_a(2, true);
-        note_haptics_frame(2);
         assert!(haptics_owns_coils(2));
         clear_haptics_liveness(2);
         assert!(
@@ -1022,44 +773,5 @@ mod tests {
             "a cleared stamp must release the coils"
         );
         set_tier_a(2, false);
-    }
-
-    #[test]
-    fn discard_empties_without_disturbing_alignment() {
-        let mut m = QuadMixer::new();
-        m.push(PAD_AUDIO_KIND_HAPTICS, &[1, 2, 3, 4]);
-        m.discard();
-        assert_eq!(m.ready_frames(), 0);
-        let mut out = Vec::new();
-        m.push(PAD_AUDIO_KIND_SPEAKER, &[8, 9]);
-        assert_eq!(m.pop(&mut out), 1);
-        assert_eq!(out, vec![8, 9, 0, 0]);
-    }
-
-    #[test]
-    fn plc_stays_silent_until_something_has_decoded() {
-        let mut g = AudioGapTracker::default();
-        // A gap before the first decode has nothing to size concealment from, and must not be
-        // replayed later as a phantom.
-        assert_eq!(plc_frames(&mut g, 5, 0), 0);
-        assert_eq!(plc_frames(&mut g, 6, 480), 0);
-    }
-
-    #[test]
-    fn plc_conceals_a_real_gap_once_a_frame_size_is_known() {
-        let mut g = AudioGapTracker::default();
-        assert_eq!(plc_frames(&mut g, 0, 0), 0);
-        assert_eq!(plc_frames(&mut g, 1, 480), 0);
-        // Sequence 2 and 3 never arrived.
-        assert_eq!(plc_frames(&mut g, 4, 480), 2);
-    }
-
-    /// The cap is 50 ms of the stream's own frames, not of the session plane's 5 ms default.
-    #[test]
-    fn plc_caps_a_burst_at_fifty_ms_of_the_decoded_frame() {
-        let mut g = AudioGapTracker::default();
-        assert_eq!(plc_frames(&mut g, 0, 480), 0);
-        assert_eq!(plc_frames(&mut g, 1000, 480), 5, "10 ms speaker frames");
-        assert_eq!(plc_frames(&mut g, 2000, 240), 10, "5 ms haptics frames");
     }
 }

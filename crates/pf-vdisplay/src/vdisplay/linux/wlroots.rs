@@ -1,4 +1,5 @@
-//! wlroots/Sway virtual-output backend via sway IPC + xdg-desktop-portal-wlr.
+//! wlroots/Sway virtual-output backend via sway IPC + xdg-desktop-portal-wlr. scroll, a sway
+//! fork, takes the same path through `scrollmsg`.
 //!
 //! 1. `swaymsg create_output` adds a headless output (`HEADLESS-N`). Sway must run the
 //!    headless backend (or co-load it). The name is the before/after diff of
@@ -8,21 +9,20 @@
 //! 3. The ScreenCast portal yields the PipeWire node. There is no GUI picker, so a
 //!    managed `~/.config/xdg-desktop-portal-wlr/config` sets `chooser_type=simple` and a
 //!    `chooser_cmd` that cats a per-session file (`Monitor: <NAME>` — xdpw 0.8 parses
-//!    that prefix strictly). Written once; the portal restarts on change.
+//!    that prefix strictly). Host shutdown puts the user's chooser back
+//!    ([`restore_chooser_on_shutdown`]); the portal restarts on each change.
 //! 4. Teardown is ordered: drop closes the ScreenCast session and waits for the portal
-//!    to confirm, then `swaymsg output <NAME> unplug` (sway ≥1.8). See [`StopGuard`].
+//!    to confirm, then `swaymsg output <NAME> unplug` (sway ≥1.8). See [`Keepalive`].
 //!
 //! Requirements: `SWAYSOCK` inherited or discovered per child ([`swaymsg_command`]),
 //! portal env via `scripts/headless/prepare-session.sh`, ScreenCast routed to xdpw
 //! (`scripts/headless/portals.conf`).
 
 use super::{DisplayOwnership, Mode, VirtualDisplay, VirtualOutput};
+use crate::portal_cast::StopGuard;
 use anyhow::{anyhow, bail, Context, Result};
 use std::os::fd::OwnedFd;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -34,16 +34,30 @@ fn chooser_file() -> String {
     format!("{dir}/punktfunk-xdpw-output")
 }
 
+/// `Monitor: <NAME>`: xdpw 0.8 parses that prefix strictly.
+fn chooser_line(output: &str) -> String {
+    format!("Monitor: {output}\n")
+}
+
 /// xdpw runs this via `/bin/sh -c` and reads stdout. The `|| echo` fallback is a guess
-/// at sway's own first headless output — right only when that backend has one. [`ChooserFile`]
-/// removes the per-session file with the handshake so it cannot name an already-unplugged
-/// output.
+/// at sway's own first headless output — right only when that backend has one.
+/// [`crate::portal_cast`] removes the per-session file with the handshake so it cannot
+/// name an already-unplugged output.
 fn chooser_cmd() -> String {
     format!(
         "cat {} 2>/dev/null || echo 'Monitor: HEADLESS-1'",
         chooser_file()
     )
 }
+
+/// xdpw's chooser cats [`chooser_file`].
+pub(crate) const SELECTOR: crate::portal_cast::Selector = crate::portal_cast::Selector {
+    file: chooser_file,
+    line: chooser_line,
+    ensure_config: ensure_xdpw_config,
+    thread: "punktfunk-wlr-cast",
+    portal: "xdpw",
+};
 
 /// wlroots/Sway virtual-display driver. Each [`create`](VirtualDisplay::create) adds one
 /// headless output; a portal thread owns the cast.
@@ -111,7 +125,7 @@ impl WlrootsDisplay {
 
     /// Another portal cast of `name`, beside any cast already on it.
     fn cast_existing(&mut self, name: &str) -> Result<crate::backend::SessionCastParts> {
-        let stream = stream_existing_output(name, self.hw_cursor)?;
+        let stream = crate::portal_cast::stream_existing_output(&SELECTOR, name, self.hw_cursor)?;
         self.last_cursor_mode = stream.cursor_mode;
         Ok(stream.into_cast())
     }
@@ -251,12 +265,8 @@ impl VirtualDisplay for WlrootsDisplay {
 
         focus_output(&name);
 
-        // One chooser file per user: a concurrent write between ours and xdpw's read
-        // captures the wrong output. Handshake holds SELECTION_LOCK, not just the write.
-        let (fd, node_id, cursor_mode, stop) = {
-            let _sel = SELECTION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            select_and_cast(&name, self.hw_cursor)?
-        };
+        let (fd, node_id, cursor_mode, stop) =
+            crate::portal_cast::cast(&SELECTOR, &name, self.hw_cursor)?;
         // xdpw refuses metadata, so this is `embedded` regardless of `hw_cursor`.
         self.last_cursor_mode = Some(cursor_mode);
         tracing::info!(
@@ -313,44 +323,6 @@ impl VirtualDisplay for WlrootsDisplay {
 struct Keepalive {
     _stop: StopGuard,
     _output: OutputGuard,
-}
-
-/// 3 s to wait for portal Close before unplugging under a live session.
-const CAST_CLOSE_BUDGET: Duration = Duration::from_secs(3);
-
-/// Whole ScreenCast handshake; sits under the caller's 20 s wait.
-const HANDSHAKE_BUDGET: Duration = Duration::from_secs(15);
-
-/// Signals the portal thread, then waits until it has closed the ScreenCast session
-/// so the caller may unplug the output.
-///
-/// Only `Session.Close` tears an xdpw session down (`src/core/session.c`); xdpw has
-/// no peer-vanished watcher and relies on xdg-desktop-portal's `peer_died_cb`, which
-/// runs after our bus name is gone — after an unplug-first Drop would already have
-/// yanked the captured output. `screencast.c` then busy-waits
-/// `while (cast->node_id == SPA_ID_INVALID) pw_loop_iterate(..., 0)` with no timeout.
-/// Close before unplug. Proof also in `hyprland.rs`'s [`StopGuard`].
-struct StopGuard {
-    stop: Arc<AtomicBool>,
-    /// Signalled once the portal thread has closed the session. `None` if no cast ran.
-    closed: Option<std::sync::mpsc::Receiver<()>>,
-}
-
-impl Drop for StopGuard {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        let Some(closed) = self.closed.take() else {
-            return;
-        };
-        match closed.recv_timeout(CAST_CLOSE_BUDGET) {
-            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => tracing::warn!(
-                budget_s = CAST_CLOSE_BUDGET.as_secs(),
-                "the ScreenCast session did not close in time — unplugging the output underneath \
-                 it; the next cast may find the portal busy"
-            ),
-        }
-    }
 }
 
 /// Serializes snapshot → `create_output` → identify, process-wide. Sway names the
@@ -618,22 +590,13 @@ fn warn_primary_is_not_expressible() {
     );
 }
 
-/// Enabled, not ours, not managed. Pure so the sibling-spare rule is testable
-/// without a compositor. `managed` is the `HEADLESS-` prefix, so a concurrent
-/// session's output is never blacked out.
+/// Disable every head [`crate::monitors::darkens`] names for `exclusive`. Returns
+/// those actually disabled ([`restore_heads`]). One refusal costs that screen, not
+/// the session. `keep_monitors` stays lit.
 ///
-/// The prefix is blunt: sway's own bootstrap `HEADLESS-1` is spared too. Leaving a
-/// headless box's only screen lit is the cheaper failure vs disabling a sibling.
-fn heads_to_disable(heads: &[crate::monitors::PhysicalMonitor], ours: &str) -> Vec<String> {
-    heads
-        .iter()
-        .filter(|h| h.enabled && !h.managed && h.connector != ours)
-        .map(|h| h.connector.clone())
-        .collect()
-}
-
-/// Disable every non-managed head for `exclusive`. Returns those actually disabled
-/// ([`restore_heads`]). One refusal costs that screen, not the session.
+/// `managed` is the `HEADLESS-` prefix, so a concurrent session's output is never
+/// blacked out. The prefix is blunt: sway's own bootstrap `HEADLESS-1` is spared
+/// too. Leaving a headless box's only screen lit is the cheaper failure.
 fn disable_other_heads(ours: &str) -> Vec<String> {
     let heads = match list_monitors() {
         Ok(h) => h,
@@ -646,11 +609,12 @@ fn disable_other_heads(ours: &str) -> Vec<String> {
             return Vec::new();
         }
     };
-    let targets = heads_to_disable(&heads, ours);
+    let keep = crate::policy::prefs().get().keep_monitors;
+    let targets = crate::monitors::heads_to_darken(&heads, ours, &keep);
     if targets.is_empty() {
         tracing::info!(
             "wlroots: `topology: exclusive` had nothing to disable — no enabled output besides the \
-             headless ones (a headless box, or a sibling session already took the desk)"
+             headless and kept ones (a headless box, or a sibling session already took the desk)"
         );
         return Vec::new();
     }
@@ -703,14 +667,15 @@ fn dpms_argv(name: &str, on: bool) -> [&str; 4] {
 ///
 /// Not [`disable_other_heads`]: gamescope is its own compositor and owns no sway
 /// output, so disable would move workspaces for a stream that is not on this
-/// compositor. Empty `ours` still spares a concurrent session's `HEADLESS-*`.
+/// compositor. Empty `ours` still spares a concurrent session's `HEADLESS-*`. No
+/// keep list: the gamescope darken ignores `keep_monitors` on every compositor.
 /// Returns the heads actually changed. One refusal costs a lit screen, not the stream.
 pub(crate) fn dpms_other_heads(on: bool) -> Vec<String> {
     let Ok(heads) = list_monitors() else {
         return Vec::new();
     };
     let mut changed = Vec::new();
-    for name in heads_to_disable(&heads, "") {
+    for name in crate::monitors::heads_to_darken(&heads, "", &[]) {
         match swaymsg(&dpms_argv(&name, on)) {
             Ok(_) => changed.push(name),
             Err(e) => tracing::warn!(
@@ -807,13 +772,25 @@ const SWAYMSG_BUDGET: Duration = Duration::from_secs(5);
 /// 10 s for `systemctl --user try-restart` (waits for the job; result is ignored).
 const PORTAL_RESTART_BUDGET: Duration = Duration::from_secs(10);
 
-/// Bare `swaymsg` with `SWAYSOCK` on the child only. `Command::env` avoids a process
+/// The IPC tool with its socket on the child only. `Command::env` avoids a process
 /// `setenv` racing every `getenv` on a live host. `sock` is `None` when no IPC is
 /// found: leave the child's env alone so an inherited socket still wins.
+///
+/// A `scroll-ipc.*` socket gets `scrollmsg`, which reads `SCROLLSOCK` before `SWAYSOCK`.
 fn swaymsg_command(sock: Option<String>) -> Command {
-    let mut cmd = Command::new("swaymsg");
+    let scroll = sock.as_deref().is_some_and(|s| {
+        std::path::Path::new(s)
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("scroll-ipc."))
+    });
+    let (bin, var) = if scroll {
+        ("scrollmsg", "SCROLLSOCK")
+    } else {
+        ("swaymsg", "SWAYSOCK")
+    };
+    let mut cmd = Command::new(bin);
     if let Some(sock) = sock {
-        cmd.env("SWAYSOCK", sock);
+        cmd.env(var, sock);
     }
     cmd
 }
@@ -822,11 +799,12 @@ fn swaymsg_command(sock: Option<String>) -> Command {
 /// Non-zero exit covers `{"success": false}` too.
 fn swaymsg(args: &[&str]) -> Result<String> {
     let mut cmd = swaymsg_command(crate::session::sway_socket());
+    let prog = cmd.get_program().to_string_lossy().into_owned();
     let out = crate::proc::output_within(cmd.arg("--").args(args), SWAYMSG_BUDGET)
-        .context("run swaymsg (is sway installed?)")?;
+        .with_context(|| format!("run {prog}"))?;
     if !out.status.success() {
         bail!(
-            "swaymsg {:?} failed: {}{}",
+            "{prog} {:?} failed: {}{}",
             args,
             String::from_utf8_lossy(&out.stdout).trim(),
             String::from_utf8_lossy(&out.stderr).trim()
@@ -839,11 +817,12 @@ fn swaymsg(args: &[&str]) -> Result<String> {
 /// `--`, so `-t` is read as a sway command (`Unknown/invalid command '-t'`).
 fn swaymsg_query(kind: &str) -> Result<serde_json::Value> {
     let mut cmd = swaymsg_command(crate::session::sway_socket());
+    let prog = cmd.get_program().to_string_lossy().into_owned();
     let out = crate::proc::output_within(cmd.args(["-t", kind, "--raw"]), SWAYMSG_BUDGET)
-        .context("run swaymsg (is sway installed?)")?;
+        .with_context(|| format!("run {prog}"))?;
     if !out.status.success() {
         bail!(
-            "swaymsg -t {kind} failed: {}",
+            "{prog} -t {kind} failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
@@ -859,86 +838,6 @@ fn output_names() -> Result<Vec<String>> {
         .iter()
         .filter_map(|o| o.get("name").and_then(|n| n.as_str()).map(str::to_owned))
         .collect())
-}
-
-/// Serializes write-the-chooser → complete-the-handshake, process-wide. One file
-/// per user: last writer before xdpw reads wins, and the loser silently captures
-/// the other session's output. Held across the handshake because the read is inside it.
-static SELECTION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Per-session chooser file, removed when the handshake it steers ends.
-///
-/// Lifetime is the handshake, not the cast: xdpw reads once inside [`select_and_cast`].
-/// A leftover `Monitor: HEADLESS-N` shadows [`chooser_cmd`]'s fallback after Drop
-/// unplugs that output. Tying removal to the cast would delete a sibling's selection.
-struct ChooserFile(String);
-
-impl Drop for ChooserFile {
-    fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_file(&self.0) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::debug!(path = %self.0, error = %e, "xdpw chooser file not removed");
-            }
-        }
-    }
-}
-
-/// Point xdpw's chooser at `output` and run the ScreenCast handshake. Caller holds
-/// [`SELECTION_LOCK`].
-fn select_and_cast(
-    output: &str,
-    hw_cursor: bool,
-) -> Result<(OwnedFd, u32, crate::portal_cursor::Mode, StopGuard)> {
-    ensure_xdpw_config()?;
-    let chooser = chooser_file();
-    std::fs::write(&chooser, format!("Monitor: {output}\n"))
-        .with_context(|| format!("write {chooser}"))?;
-    // Drop removes it; every `?` below leaves the handshake, the only reader.
-    let _chooser = ChooserFile(chooser);
-    // Negotiated inside the portal thread (only there is the proxy). `hw_cursor` is
-    // the request, not the answer.
-    let (setup_tx, setup_rx) =
-        std::sync::mpsc::channel::<Result<(OwnedFd, u32, crate::portal_cursor::Mode), String>>();
-    // Teardown channel, not setup: it fires after `setup_rx` is consumed, when
-    // `StopGuard::drop` must wait before unplug.
-    let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_thread = stop.clone();
-    thread::Builder::new()
-        .name("punktfunk-wlr-cast".into())
-        .spawn(move || portal_thread(setup_tx, closed_tx, stop_thread, hw_cursor))
-        .context("spawn wlroots portal thread")?;
-    // Build the guard before the wait so every error arm sets `stop` on the way
-    // out. Wrapping later left failure arms dropping an unset flag: the thread can
-    // still `send` after `recv_timeout`, report success, then park forever on a
-    // live ScreenCast against an output that is gone.
-    let mut guard = StopGuard { stop, closed: None };
-    match setup_rx.recv_timeout(Duration::from_secs(20)) {
-        Ok(Ok((fd, node_id, cursor_mode))) => {
-            // Cast is live: teardown must wait for Close.
-            guard.closed = Some(closed_rx);
-            Ok((fd, node_id, cursor_mode, guard))
-        }
-        Ok(Err(e)) => bail!("ScreenCast portal on {output} failed: {e}"),
-        Err(_) => bail!("timed out waiting for the ScreenCast portal on {output}"),
-    }
-}
-
-/// Cast an existing sway output (monitor-mirror; see
-/// `design/per-monitor-portal-capture.md`). Same chooser, physical connector, no
-/// GUI picker. Keepalive stops the cast only — we never created the monitor.
-pub(crate) fn stream_existing_output(
-    connector: &str,
-    hw_cursor: bool,
-) -> Result<crate::mirror::MirrorStream> {
-    let _sel = SELECTION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (fd, node_id, cursor_mode, stop) = select_and_cast(connector, hw_cursor)?;
-    Ok(crate::mirror::MirrorStream {
-        node_id,
-        remote_fd: Some(fd),
-        cursor_mode: Some(cursor_mode),
-        keepalive: Box::new(stop),
-    })
 }
 
 /// Every head `get_outputs` reports, for [`crate::monitors::list`]. `rect` is
@@ -1015,170 +914,75 @@ fn wait_new_output(before: &[String], timeout: Duration) -> Result<String> {
     }
 }
 
+const XDPW_BLOCK: crate::portal_config::Block<'static> =
+    crate::portal_config::Block::Ini("screencast");
+
+fn xdpw_config_path() -> Result<std::path::PathBuf> {
+    Ok(crate::portal_config::user_config_dir()?
+        .join("xdg-desktop-portal-wlr")
+        .join("config"))
+}
+
 /// Point xdpw at our chooser. It reads config only at startup, so `try-restart` on
 /// change (D-Bus activation starts it later if it is not running). Selection is the
-/// chooser file; this config is static.
+/// chooser file; this config is static. The edit records what it replaced, so
+/// [`restore_chooser_on_shutdown`] can put it back.
 fn ensure_xdpw_config() -> Result<()> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
-        .ok_or_else(|| anyhow!("neither XDG_CONFIG_HOME nor HOME set"))?;
-    let path = base.join("xdg-desktop-portal-wlr").join("config");
-    // Only the two keys we own, in place. A full-file write would wipe the user's other xdpw settings.
-    let mut changed = crate::portal_config::ensure_key(
-        &path,
-        crate::portal_config::Block::Ini("screencast"),
-        "chooser_type",
-        "simple",
-    )?;
-    changed |= crate::portal_config::ensure_key(
-        &path,
-        crate::portal_config::Block::Ini("screencast"),
-        "chooser_cmd",
-        &chooser_cmd(),
-    )?;
-    if !changed {
+    let path = xdpw_config_path()?;
+    if !take_chooser(&path)? {
         return Ok(());
     }
     tracing::info!(path = %path.display(), "pointed xdg-desktop-portal-wlr at the managed output chooser");
-    // Stream thread: `systemctl --user` blocks on the job queue. Result already ignored.
+    restart_xdpw();
+    Ok(())
+}
+
+/// Only the two keys we own, in place. A full-file write would wipe the user's
+/// other xdpw settings. `true` when the file changed.
+fn take_chooser(path: &std::path::Path) -> Result<bool> {
+    let mut changed = crate::portal_config::ensure_key(path, XDPW_BLOCK, "chooser_type", "simple")?;
+    changed |= crate::portal_config::ensure_key(path, XDPW_BLOCK, "chooser_cmd", &chooser_cmd())?;
+    Ok(changed)
+}
+
+/// Hand `chooser_type` and `chooser_cmd` back and restart xdpw if either changed.
+/// Host shutdown only, never per cast: the restart cuts a live cast. Safe on a box
+/// we never touched (no-op).
+///
+/// Left in place, every screen share on the box goes to our chooser and falls back
+/// to `HEADLESS-1` once the selection file is gone.
+pub(crate) fn restore_chooser_on_shutdown() {
+    let Ok(path) = xdpw_config_path() else { return };
+    if !give_back_chooser(&path) {
+        return;
+    }
+    tracing::info!(
+        path = %path.display(),
+        "restored the screen-share chooser xdg-desktop-portal-wlr had before this host"
+    );
+    restart_xdpw();
+}
+
+/// Undo [`take_chooser`]. `true` when the file changed.
+fn give_back_chooser(path: &std::path::Path) -> bool {
+    let mut changed = false;
+    for key in ["chooser_type", "chooser_cmd"] {
+        match crate::portal_config::restore_key(path, XDPW_BLOCK, key) {
+            Ok(c) => changed |= c,
+            Err(e) => tracing::warn!(path = %path.display(), key, error = %format!("{e:#}"),
+                "previous xdpw chooser key not restored"),
+        }
+    }
+    changed
+}
+
+/// Bounded: `systemctl --user` blocks on the job queue, and this can run on the
+/// stream thread. A timeout means xdpw picks the config up when it next starts.
+fn restart_xdpw() {
     let _ = crate::proc::status_within(
         Command::new("systemctl").args(["--user", "try-restart", "xdg-desktop-portal-wlr.service"]),
         PORTAL_RESTART_BUDGET,
     );
-    Ok(())
-}
-
-/// ScreenCast handshake: report fd + node id, then park. The zbus connection is the
-/// cast's lifetime. xdpw selects via the chooser, no dialog.
-fn portal_thread(
-    setup_tx: Sender<Result<(OwnedFd, u32, crate::portal_cursor::Mode), String>>,
-    closed_tx: Sender<()>,
-    stop: Arc<AtomicBool>,
-    hw_cursor: bool,
-) {
-    use ashpd::desktop::screencast::{Screencast, SelectSourcesOptions, SourceType};
-    use ashpd::desktop::PersistMode;
-    use ashpd::enumflags2::BitFlags;
-
-    // Multi-thread: zbus's reader must run across create_session → select_sources →
-    // start. Shared, never dropped ([`pf_capture::portal_rt`]): a per-cast runtime kills
-    // ashpd's process-global cached connection and every later handshake hangs.
-    let rt = match pf_capture::portal_rt::portal_runtime() {
-        Ok(rt) => rt,
-        Err(e) => {
-            let _ = setup_tx.send(Err(e));
-            return;
-        }
-    };
-    let err_tx = setup_tx.clone();
-
-    rt.block_on(async move {
-        let result: Result<()> = async {
-            // Orphaned cached connection hangs here, before any handshake call.
-            let connect = async {
-                Screencast::new().await.context(
-                    "connect ScreenCast portal (is xdg-desktop-portal running with the wlr backend?)",
-                )
-            };
-            let proxy = match tokio::time::timeout(HANDSHAKE_BUDGET, connect).await {
-                Ok(v) => v?,
-                Err(_) => bail!(
-                    "connecting to the ScreenCast portal did not return within {}s",
-                    HANDSHAKE_BUDGET.as_secs()
-                ),
-            };
-            // Negotiate against what xdpw advertises, never from `hw_cursor` alone.
-            // screencast.c cancels the session if METADATA is set.
-            let cursor_mode = crate::portal_cursor::negotiate(&proxy, hw_cursor, "xdpw").await;
-            // A wedged portal never returns; `stop` is only read in the park loop, so
-            // an unbounded await leaks a half-handshake and poisons later requests.
-            // xdpw has the same unbounded node-id spin as xdph (`screencast.c`).
-            let handshake = async {
-                let session = proxy
-                    .create_session(Default::default())
-                    .await
-                    .context("create_session")?;
-                proxy
-                    .select_sources(
-                        &session,
-                        SelectSourcesOptions::default()
-                            .set_cursor_mode(cursor_mode.to_ashpd())
-                            // xdpw offers MONITOR only; the chooser picks our output.
-                            .set_sources(BitFlags::from_flag(SourceType::Monitor))
-                            .set_multiple(false)
-                            .set_persist_mode(PersistMode::DoNot),
-                    )
-                    .await
-                    .context("select_sources")?
-                    .response()
-                    .context("select_sources rejected")?;
-                let streams = proxy
-                    .start(&session, None, Default::default())
-                    .await
-                    .context("start cast")?
-                    .response()
-                    .context(
-                        "start response (chooser declined? check the xdpw config/chooser file)",
-                    )?;
-                let stream = streams
-                    .streams()
-                    .first()
-                    .context("portal returned no streams")?
-                    .clone();
-                let node_id = stream.pipe_wire_node_id();
-                let fd = proxy
-                    .open_pipe_wire_remote(&session, Default::default())
-                    .await
-                    .context("open_pipe_wire_remote")?;
-                Ok::<_, anyhow::Error>((session, fd, node_id))
-            };
-            let (session, fd, node_id) =
-                match tokio::time::timeout(HANDSHAKE_BUDGET, handshake).await {
-                    Ok(v) => v?,
-                    Err(_) => bail!(
-                        "the ScreenCast portal did not complete the handshake within {}s — \
-                         abandoning it instead of parking this thread on it forever (a hung \
-                         request poisons every later one from this process)",
-                        HANDSHAKE_BUDGET.as_secs()
-                    ),
-                };
-
-            setup_tx
-                .send(Ok((fd, node_id, cursor_mode)))
-                .map_err(|_| anyhow!("virtual-output opener went away"))?;
-
-            // Keep `proxy` + `session` alive. 20 ms poll: teardown waits on Close.
-            let _keep_alive = (&proxy, &session);
-            while !stop.load(Ordering::Relaxed) {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-
-            // Session.Close is the only xdpw teardown (`src/core/session.c`); dropping
-            // the connection is not. `StopGuard::drop` is blocked on the send below.
-            // Bounded so a wedged portal cannot hang unplug.
-            match tokio::time::timeout(CAST_CLOSE_BUDGET, session.close()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!(
-                    error = %e,
-                    "closing the ScreenCast session failed — the next cast may find the portal busy"
-                ),
-                Err(_) => tracing::warn!(
-                    budget_s = CAST_CLOSE_BUDGET.as_secs(),
-                    "the ScreenCast portal did not answer Session.Close in time — it is probably \
-                     already wedged"
-                ),
-            }
-            // Best-effort: the receiver is gone if the caller already gave up.
-            let _ = closed_tx.send(());
-            Ok(())
-        }
-        .await;
-
-        if let Err(e) = result {
-            let _ = err_tx.send(Err(format!("{e:#}")));
-        }
-    });
 }
 
 #[cfg(test)]
@@ -1312,6 +1116,16 @@ mod tests {
         assert!(overrides(None).is_empty());
     }
 
+    /// scroll ships `scrollmsg`, not `swaymsg`, and it reads `SCROLLSOCK` first.
+    #[test]
+    fn a_scroll_socket_runs_scrollmsg() {
+        let cmd = swaymsg_command(Some("/run/user/1000/scroll-ipc.1000.42.sock".to_string()));
+        assert_eq!(cmd.get_program(), "scrollmsg");
+        let envs: Vec<_> = cmd.get_envs().map(|(k, _)| k.to_owned()).collect();
+        assert_eq!(envs, ["SCROLLSOCK"]);
+        assert_eq!(swaymsg_command(None).get_program(), "swaymsg");
+    }
+
     fn head(connector: &str, enabled: bool) -> crate::monitors::PhysicalMonitor {
         crate::monitors::PhysicalMonitor {
             connector: connector.to_string(),
@@ -1344,7 +1158,10 @@ mod tests {
             // Already off: must not enter the restore list or teardown would switch it on.
             head("DP-3", false),
         ];
-        assert_eq!(heads_to_disable(&heads, ours), vec!["DP-1", "HDMI-A-1"]);
+        assert_eq!(
+            crate::monitors::heads_to_darken(&heads, ours, &[]),
+            vec!["DP-1", "HDMI-A-1"]
+        );
     }
 
     /// `dpms` ≠ `disable`: disable moves workspaces; `dpms off` only stops the panel.
@@ -1365,12 +1182,36 @@ mod tests {
             head("HEADLESS-1", true),
             head("DP-3", false),
         ];
-        assert_eq!(heads_to_disable(&heads, ""), vec!["DP-1"]);
+        assert_eq!(
+            crate::monitors::heads_to_darken(&heads, "", &[]),
+            vec!["DP-1"]
+        );
+    }
+
+    /// Shutdown hands both chooser keys back byte for byte; left taken, every share on
+    /// the box goes to our chooser.
+    #[test]
+    fn shutdown_hands_the_users_chooser_back_byte_for_byte() {
+        let dir = std::env::temp_dir().join(format!("pf-vd-xdpw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("config");
+        let user = "[screencast]\nchooser_type=dmenu\nchooser_cmd=wofi -d\noutput_name=DP-1\n";
+        std::fs::write(&path, user).expect("seed");
+        assert!(take_chooser(&path).expect("take"));
+        let taken = std::fs::read_to_string(&path).expect("taken");
+        assert!(give_back_chooser(&path));
+        let back = std::fs::read_to_string(&path).expect("restored");
+        let again = give_back_chooser(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(taken.contains("chooser_type=simple"), "{taken}");
+        assert_eq!(back, user);
+        assert!(!again, "a second restore finds nothing of ours");
     }
 
     #[test]
     fn exclusive_on_a_headless_box_disables_nothing() {
         let ours = "HEADLESS-1";
-        assert!(heads_to_disable(&[head(ours, true)], ours).is_empty());
+        assert!(crate::monitors::heads_to_darken(&[head(ours, true)], ours, &[]).is_empty());
     }
 }

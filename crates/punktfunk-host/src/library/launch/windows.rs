@@ -179,6 +179,8 @@ fn windows_launch_for(spec: &LaunchSpec) -> Option<WinRecipe> {
             .map(|uri| WinRecipe::handoff(format!("explorer.exe \"{uri}\""))),
         // Direct exe spawn (not a Galaxy hand-off). `gog_spawn` re-confines the plugin triple.
         "gog" => gog_spawn(&spec.value).map(|(cmdline, workdir)| WinRecipe::game(cmdline, workdir)),
+        // Direct exe spawn, only of a path a signed-in user's Game Bar list names.
+        "gamebar" => gamebar_spawn_in(&spec.value, &gamebar_exes()),
         // shell:AppsFolder AUMID. UWP activation fails as SYSTEM/session-0; spawn uses the user token.
         "aumid" => valid_aumid(&spec.value).then(|| {
             WinRecipe::handoff(format!("explorer.exe \"shell:AppsFolder\\{}\"", spec.value))
@@ -215,6 +217,26 @@ fn windows_launch_for(spec: &LaunchSpec) -> Option<WinRecipe> {
                 spec.value
             ))
         }),
+        // The EA app answers `origin2://` for a game's content id, the `uplay` shape.
+        "ea" => valid_ea_id(&spec.value).then(|| {
+            WinRecipe::handoff(format!(
+                "explorer.exe \"origin2://game/launch/?offerIds={}\"",
+                spec.value
+            ))
+        }),
+        // Rockstar's launcher starts a title by its folder. Both paths come from the
+        // launcher's uninstall entries, so the plugin names only the title id.
+        "rockstar" => {
+            if !valid_rockstar_title(&spec.value) {
+                return None;
+            }
+            let (launcher, dir) = rockstar_paths(&spec.value)?;
+            Some(WinRecipe::handoff(format!(
+                "\"{}\" -launchTitleInFolder \"{}\"",
+                launcher.display(),
+                dir.display()
+            )))
+        }
         // `battlenet://<code>` only opens the game's page; `--exec="launch <code>"` on the
         // client's exe starts it. No exe found refuses the launch rather than opening a page.
         "battlenet" => {
@@ -322,6 +344,47 @@ fn battlenet_exe() -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+/// The Rockstar Games Launcher's `Launcher.exe` and `title`'s install folder, from the
+/// machine-wide uninstall entries the launcher writes. Either missing refuses the launch.
+fn rockstar_paths(title: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let (mut launcher, mut folder) = (None, None);
+    for path in [
+        r"Software\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+    ] {
+        let Ok(uninstall) = hklm.open_subkey_with_flags(path, KEY_READ) else {
+            continue;
+        };
+        for name in uninstall.enum_keys().flatten() {
+            let Ok(entry) = uninstall.open_subkey_with_flags(&name, KEY_READ) else {
+                continue;
+            };
+            let location = entry
+                .get_value::<String, _>("InstallLocation")
+                .map(|l| std::path::PathBuf::from(l.trim().trim_matches('"')))
+                .unwrap_or_default();
+            if location.as_os_str().is_empty() || location.to_string_lossy().contains('"') {
+                continue;
+            }
+            let display: String = entry.get_value("DisplayName").unwrap_or_default();
+            let uninstall_cmd: String = entry.get_value("UninstallString").unwrap_or_default();
+            if display == "Rockstar Games Launcher" {
+                launcher = Some(location.join("Launcher.exe")).filter(|p| p.is_file());
+            } else if rockstar_uninstall_title(&uninstall_cmd)
+                .is_some_and(|t| t.eq_ignore_ascii_case(title))
+                && location.is_dir()
+            {
+                folder = Some(location);
+            }
+        }
+    }
+    Some((launcher?, folder?))
 }
 
 /// PackageFamilyName from `AppRepository\Packages\<PackageFullName>`:
@@ -590,6 +653,63 @@ fn gog_install_dirs() -> Vec<String> {
         .collect()
 }
 
+/// A `gamebar` exe, run from its own folder, when `listed` names that exact path. The list
+/// decides what may run; the plugin only picks from it.
+fn gamebar_spawn_in(exe: &str, listed: &[String]) -> Option<WinRecipe> {
+    if !valid_gamebar_exe(exe) {
+        return None;
+    }
+    if !listed.iter().any(|l| l.eq_ignore_ascii_case(exe)) {
+        tracing::warn!(
+            exe,
+            "gamebar launch: no signed-in user's Game Bar list names the exe — refusing it"
+        );
+        return None;
+    }
+    let workdir = Path::new(exe).parent().map(Path::to_path_buf);
+    Some(WinRecipe::game(format!("\"{exe}\""), workdir))
+}
+
+/// A signed-in person's hive. Service hives are writable by their service, and the plugin
+/// runner is LocalService (`S-1-5-19`).
+fn user_sid(name: &str) -> bool {
+    name.strip_prefix("S-1-5-21-").is_some_and(|rest| {
+        !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+    })
+}
+
+/// Every `MatchedExeFullPath` under each loaded user hive's `System\GameConfigStore\Children`:
+/// the exes Game Bar recorded as games. A signed-out user's hive is not loaded.
+fn gamebar_exes() -> Vec<String> {
+    use winreg::enums::{HKEY_USERS, KEY_READ};
+    use winreg::RegKey;
+
+    let users = RegKey::predef(HKEY_USERS);
+    users
+        .enum_keys()
+        .flatten()
+        .filter(|sid| user_sid(sid))
+        .filter_map(|sid| {
+            users
+                .open_subkey_with_flags(format!(r"{sid}\System\GameConfigStore\Children"), KEY_READ)
+                .ok()
+        })
+        .flat_map(|children| {
+            children
+                .enum_keys()
+                .flatten()
+                .filter_map(|n| {
+                    children
+                        .open_subkey_with_flags(&n, KEY_READ)
+                        .ok()?
+                        .get_value::<String, _>("MatchedExeFullPath")
+                        .ok()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// Windows path containment: case-insensitive, either separator, `..` refused
 /// (it climbs out of the prefix the test just accepted). String compare, not
 /// [`Path::starts_with`], which is case-sensitive — plugin spelling may differ.
@@ -620,12 +740,6 @@ pub fn launch_gamestream_command(cmd: &str) -> Result<WindowsLaunch> {
         pid,
         owns_game: true,
     })
-}
-
-/// Launches a GameStream `/applist` title through [`launch_title`] in this host's
-/// WTS session. Linux uses [`resolve_launch`] then [`launch_session_command`].
-pub fn launch_gamestream_library(id: &str) -> Result<WindowsLaunch> {
-    launch_title(id)
 }
 
 #[cfg(test)]
@@ -773,6 +887,35 @@ mod tests {
         assert!(wd2.is_none());
         assert!(spawn("").is_none());
     }
+    /// The exe arrives over the provider API: Game Bar's list, read by the host, decides.
+    #[test]
+    fn gamebar_spawn_runs_only_a_listed_exe_from_its_folder() {
+        let listed = [r"D:\Games\Hollow Knight\hollow_knight.exe".to_string()];
+        let r = gamebar_spawn_in(r"d:\games\hollow knight\HOLLOW_KNIGHT.exe", &listed).unwrap();
+        assert_eq!(r.cmdline, r#""d:\games\hollow knight\HOLLOW_KNIGHT.exe""#);
+        assert_eq!(r.workdir, Some(PathBuf::from(r"d:\games\hollow knight")));
+        assert!(r.owns_game);
+        // Not on the list, or on it but no longer one quoted argv element: nothing runs.
+        assert!(gamebar_spawn_in(r"C:\Windows\System32\cmd.exe", &listed).is_none());
+        assert!(gamebar_spawn_in(r"D:\Games\Hollow Knight\hollow_knight.exe", &[]).is_none());
+        let quoted = [r#"C:\x.exe" /c calc"#.to_string()];
+        assert!(gamebar_spawn_in(&quoted[0], &quoted).is_none());
+    }
+
+    #[test]
+    fn gamebar_reads_only_the_hives_of_people() {
+        assert!(user_sid("S-1-5-21-2040749213-3813789928-2098397110-1001"));
+        for sid in [
+            "S-1-5-19",
+            "S-1-5-18",
+            ".DEFAULT",
+            "S-1-5-21-",
+            "S-1-5-21-2040749213-3813789928-2098397110-1001_Classes",
+        ] {
+            assert!(!user_sid(sid), "{sid}");
+        }
+    }
+
     /// Triple arrives over the provider API: exe must sit in a host-found GOG install.
     #[test]
     fn gog_spawn_refuses_an_exe_outside_every_gog_install() {
@@ -843,17 +986,20 @@ mod tests {
         );
         assert!(windows_launch_for(&LaunchSpec {
             kind: "aumid".into(),
-            value: "no-bang".into()
+            value: "no-bang".into(),
+            args: None,
         })
         .is_none());
         assert!(windows_launch_for(&LaunchSpec {
             kind: "command".into(),
-            value: "  ".into()
+            value: "  ".into(),
+            args: None,
         })
         .is_none());
         assert!(windows_launch_for(&LaunchSpec {
             kind: "wat".into(),
-            value: "x".into()
+            value: "x".into(),
+            args: None,
         })
         .is_none());
         let uplay = windows_launch_for(&LaunchSpec {
@@ -876,12 +1022,31 @@ mod tests {
         );
         assert!(windows_launch_for(&LaunchSpec {
             kind: "uplay".into(),
-            value: "5595\" & calc".into()
+            value: "5595\" & calc".into(),
+            args: None,
         })
         .is_none());
         assert!(windows_launch_for(&LaunchSpec {
             kind: "battlenet".into(),
-            value: "WTCG\" & calc".into()
+            value: "WTCG\" & calc".into(),
+            args: None,
+        })
+        .is_none());
+        let ea = windows_launch_for(&LaunchSpec {
+            kind: "ea".into(),
+            value: "Origin.SFT.50.0000123".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            ea.cmdline,
+            "explorer.exe \"origin2://game/launch/?offerIds=Origin.SFT.50.0000123\""
+        );
+        assert!(!ea.owns_game);
+        assert!(windows_launch_for(&LaunchSpec {
+            kind: "rockstar".into(),
+            value: "gta5\" & calc".into(),
+            args: None,
         })
         .is_none());
     }

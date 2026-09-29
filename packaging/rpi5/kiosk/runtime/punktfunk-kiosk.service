@@ -1,0 +1,29 @@
+[Unit]
+Description=Punktfunk fullscreen console
+Requires=punktfunk-prepare.service punktfunk-dbus.service punktfunk-weston.service
+After=punktfunk-prepare.service punktfunk-dbus.service punktfunk-weston.service punktfunk-pipewire.service punktfunk-wireplumber.service
+PartOf=punktfunk-session.target
+StartLimitIntervalSec=0
+
+[Service]
+User=punktfunk
+Group=punktfunk
+SupplementaryGroups=video render input audio
+EnvironmentFile=/etc/default/punktfunk
+Environment=SDL_VIDEODRIVER=wayland
+Environment=PIPEWIRE_RUNTIME_DIR=/run/punktfunk
+Environment=XDG_CONFIG_HOME=/data/.config
+Environment=PUNKTFUNK_DECODER=v4l2-request
+Environment=PUNKTFUNK_PRESENT_MODE=immediate
+Environment=PUNKTFUNK_SWAPCHAIN_IMAGES=8
+Environment=PUNKTFUNK_PRESENT_DEBUG=1
+Environment=RUST_LOG=info,pf_client_core::audio=debug,pf_client_core::session=debug
+ExecStartPre=/usr/libexec/punktfunk/wait-for-wayland
+ExecStart=/opt/punktfunk-rpi5/punktfunk-session --browse --fullscreen
+Restart=always
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=10
+
+[Install]
+WantedBy=punktfunk-session.target

@@ -54,6 +54,22 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeLogWifiLink
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `NativeBridge.nativeLogDisplay(line)` — one `pf.display` line in the ring: the displays and
+/// fold features a stream sees, so a bundle says which dual-screen shape a device reports.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeLogDisplay<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    line: JString<'local>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        let line = line.try_to_string(env)?;
+        log::info!(target: "pf.display", "{line}");
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// `WifiInfo.getWifiStandard()` by its IEEE name (`ScanResult.WIFI_STANDARD_*`).
 fn wifi_standard(code: jint) -> &'static str {
     match code {

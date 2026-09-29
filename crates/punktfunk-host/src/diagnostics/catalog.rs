@@ -31,6 +31,8 @@ pub(crate) fn register_all(reg: &Diagnostics) {
     reg.register(omarchy_updates);
     reg.register(vdisplay_driver);
     reg.register(pad_audio);
+    reg.register(pad_driver);
+    reg.register(encoder_sharing);
     reg.register(plugin_sandbox);
     reg.register(restart_pending);
 }
@@ -68,9 +70,7 @@ fn plugin_sandbox() -> HostCheck {
     if !crate::plugins::runtime_status().installed {
         return HostCheck::inapplicable(id, "The plugin runner is not installed on this host.");
     }
-    if std::env::var("PUNKTFUNK_PLUGIN_SANDBOX")
-        .is_ok_and(|v| matches!(v.trim(), "0" | "off" | "false"))
-    {
+    if crate::plugins::runner_sandbox_off() {
         return HostCheck::problem(
             id,
             CheckStatus::Warn,
@@ -81,9 +81,9 @@ fn plugin_sandbox() -> HostCheck {
                 .to_string(),
         )
         .with_remedy(Remedy {
-            text: "Remove PUNKTFUNK_PLUGIN_SANDBOX from host.env and restart the plugin runner."
+            text: "Remove PUNKTFUNK_PLUGIN_SANDBOX from the plugin runner's override, then restart it."
                 .into(),
-            command: Some("systemctl --user restart punktfunk-scripting".into()),
+            command: Some("systemctl --user edit punktfunk-scripting".into()),
             relogin_required: false,
         });
     }
@@ -274,6 +274,116 @@ fn pad_audio() -> HostCheck {
     HostCheck::inapplicable(
         ids::PAD_AUDIO,
         "The controller speaker endpoint is a Windows component.",
+    )
+}
+
+/// Another app on the NVENC engine right now. Only NVIDIA reports its sessions.
+fn encoder_sharing() -> HostCheck {
+    let id = ids::ENCODER_SHARING;
+    if !crate::encoder_sessions::available() {
+        return HostCheck::inapplicable(id, "Only NVIDIA GPUs report who uses the video encoder.");
+    }
+    let others = crate::encoder_sessions::foreign();
+    if others.is_empty() {
+        return HostCheck::ok(id, "No other app is using the video encoder right now.");
+    }
+    let who = crate::encoder_sessions::describe(&others);
+    HostCheck::problem(
+        id,
+        CheckStatus::Warn,
+        Severity::Warning,
+        "Another app is using the video encoder",
+        format!(
+            "{who} shares the encoder with the stream, so stream frames wait behind its frames \
+             and the picture stutters."
+        ),
+    )
+    .with_remedy(Remedy {
+        text: "Close or pause the other recorder (NVIDIA Instant Replay, OBS, Discord) while you \
+               stream. On Windows, Pause Instant Replay in the host settings handles Instant \
+               Replay by itself."
+            .to_string(),
+        command: None,
+        relogin_required: false,
+    })
+    .with_param("sessions", who)
+}
+
+/// What the last virtual pad saw of the Windows gamepad driver. A stale package still attaches,
+/// so nothing but this row and a log line says the pads run old behaviour.
+#[cfg(windows)]
+fn pad_driver() -> HostCheck {
+    use crate::inject::PadDriverVerdict as V;
+    let id = ids::PAD_DRIVER;
+    let reinstall = || Remedy {
+        text: "Reinstall the host (the installer bundles the matching controller drivers), then \
+               reconnect the controller."
+            .to_string(),
+        command: None,
+        relogin_required: false,
+    };
+    match crate::inject::pad_driver_probe() {
+        V::Unseen => HostCheck::ok(id, "No controller has connected since the host started."),
+        V::Current => HostCheck::ok(id, "The virtual controller driver matches this host."),
+        V::Stale {
+            driver_rev,
+            host_rev,
+        } => HostCheck::problem(
+            id,
+            CheckStatus::Warn,
+            Severity::Warning,
+            format!("The virtual controller driver is revision {driver_rev}; this host needs {host_rev}"),
+            "Controllers work, but with the old driver's bugs.",
+        )
+        .with_remedy(reinstall())
+        .with_param("driver_rev", driver_rev.to_string())
+        .with_param("host_rev", host_rev.to_string()),
+        V::ProtocolMismatch {
+            driver_proto,
+            host_proto,
+        } => HostCheck::problem(
+            id,
+            CheckStatus::Fail,
+            Severity::Critical,
+            format!(
+                "The virtual controller driver speaks protocol {driver_proto}; this host needs \
+                 {host_proto}"
+            ),
+            "Games see the controller, but it never moves: the driver refuses the host.",
+        )
+        .with_remedy(reinstall())
+        .with_param("driver_protocol", driver_proto.to_string())
+        .with_param("host_protocol", host_proto.to_string()),
+        V::WrongIdentity { want, got } => {
+            let hex = |(v, p): (u16, u16)| format!("{v:04X}:{p:04X}");
+            HostCheck::problem(
+                id,
+                CheckStatus::Fail,
+                Severity::Warning,
+                format!("A virtual controller showed up as {}, not {}", hex(got), hex(want)),
+                "Games see a different controller than the player picked, so buttons and \
+                 prompts can be wrong.",
+            )
+            .with_remedy(reinstall())
+            .with_param("want", hex(want))
+            .with_param("got", hex(got))
+        }
+        V::NotAttached => HostCheck::problem(
+            id,
+            CheckStatus::Fail,
+            Severity::Warning,
+            "No driver picked up the last virtual controller",
+            "Games get no input from that controller.",
+        )
+        .with_remedy(reinstall()),
+    }
+}
+
+#[cfg(not(windows))]
+fn pad_driver() -> HostCheck {
+    HostCheck::inapplicable(
+        ids::PAD_DRIVER,
+        "The virtual controller driver is a Windows component.",
     )
 }
 

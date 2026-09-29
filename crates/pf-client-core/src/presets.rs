@@ -495,6 +495,22 @@ impl PresetsFile {
         }
     }
 
+    /// Copy a preset's overrides and accent under the first free "Name N" and return the
+    /// copy's id; `None` when `id` names no preset. The caller saves.
+    pub fn duplicate(&mut self, id: &str) -> Option<String> {
+        let source = self.find_by_id(id)?.clone();
+        let name = (2..)
+            .map(|n| format!("{} {n}", source.name))
+            .find(|n| !self.name_taken(n, None))
+            .unwrap_or_else(|| source.name.clone());
+        let mut copy = StreamPreset::new(name);
+        copy.overrides = source.overrides;
+        copy.accent = source.accent;
+        let copy_id = copy.id.clone();
+        self.presets.push(copy);
+        Some(copy_id)
+    }
+
     /// True if another preset already uses this name (case-insensitive).
     /// `except` is the preset being renamed, so "Work" → "work" is allowed.
     pub fn name_taken(&self, name: &str, except: Option<&str>) -> bool {
@@ -527,13 +543,30 @@ pub fn new_record_uuid() -> String {
     )
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_duplicate_takes_the_first_free_name_and_the_overrides() {
+        let mut work = StreamPreset::new("Work");
+        work.overrides.bitrate_kbps = Some(8000);
+        work.accent = Some("#ff0000".into());
+        let mut catalog = PresetsFile {
+            version: 0,
+            presets: vec![work.clone(), StreamPreset::new("work 2")],
+        };
+        let id = catalog.duplicate(&work.id).expect("a copy");
+        let copy = catalog.find_by_id(&id).expect("stored");
+        assert_eq!(copy.name, "Work 3");
+        assert_eq!(copy.overrides, work.overrides);
+        assert_eq!(copy.accent, work.accent);
+        assert_eq!(catalog.duplicate("gone"), None);
+    }
 
     #[test]
     fn overlay_applies_only_what_it_overrides() {

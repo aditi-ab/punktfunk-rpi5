@@ -14,16 +14,16 @@
 //!
 //! Design: `host-update-from-web-console.md`.
 
-// `deny` not `forbid`: `effective_uid` is the one `#[allow(unsafe_code)]` in this root helper.
+// `deny` not `forbid`: the `effective_uid` declaration is the one `#[allow(unsafe_code)]` here.
 #![deny(unsafe_code)]
 
 #[cfg(target_os = "linux")]
 mod linux_main {
+    use pf_update_check::detect::{self, Product};
     use serde::Serialize;
     use std::path::Path;
     use std::process::Command;
 
-    const OSTREE_BOOTED: &str = "/run/ostree-booted";
     const PACMAN_OPTIN_CONF: &str = "/etc/punktfunk/update.conf";
 
     /// Which marker to read and which binary the post-install gate runs. Two units, two
@@ -35,17 +35,10 @@ mod linux_main {
     }
 
     impl Mode {
-        fn marker(self) -> &'static str {
+        fn product(self) -> Product {
             match self {
-                Mode::Host => "/usr/share/punktfunk/install-kind",
-                Mode::Client => "/usr/share/punktfunk-client/install-kind",
-            }
-        }
-
-        fn sysext_marker(self) -> &'static str {
-            match self {
-                Mode::Host => "/usr/lib/extension-release.d/extension-release.punktfunk",
-                Mode::Client => "/usr/lib/extension-release.d/extension-release.punktfunk-client",
+                Mode::Host => Product::Host,
+                Mode::Client => Product::Client,
             }
         }
 
@@ -95,7 +88,7 @@ mod linux_main {
 
     /// Kind from root-owned markers and `/run/ostree-booted`, not from argv.
     fn detect_kind(mode: Mode) -> Result<&'static str, String> {
-        if Path::new(mode.sysext_marker()).exists() {
+        if Path::new(mode.product().sysext_marker()).exists() {
             return match mode {
                 Mode::Host => Ok("sysext"),
                 // The signed sysext feed is the host image. Running it here would replace a client-only box.
@@ -106,16 +99,14 @@ mod linux_main {
                 ),
             };
         }
-        let marker_path = mode.marker();
+        let marker_path = mode.product().marker_path();
         let marker = std::fs::read_to_string(marker_path)
             .map_err(|e| format!("no install-kind marker at {marker_path}: {e}"))?;
-        match marker.split_whitespace().next() {
-            Some("apt") => Ok("apt"),
-            Some("dnf") if Path::new(OSTREE_BOOTED).exists() => Ok("rpm-ostree"),
-            Some("dnf") => Ok("dnf"),
-            Some("pacman") => Ok("pacman"),
-            other => Err(format!(
-                "install-kind marker says {other:?} — no root apply leg for it"
+        match detect::parse_marker(&marker, Path::new(detect::OSTREE_BOOTED).exists()) {
+            Some((kind, _)) => Ok(kind.as_str()),
+            None => Err(format!(
+                "install-kind marker says {:?} — no root apply leg for it",
+                marker.split_whitespace().next()
             )),
         }
     }
@@ -358,21 +349,13 @@ mod linux_main {
         std::process::exit(if ok { 0 } else { 1 });
     }
 
-    // Direct `geteuid` — a libc crate is not worth it here. Edition 2024 `unsafe extern`
-    // trips `unsafe_code`; the allow matches `effective_uid` below.
+    // Direct `geteuid` — a libc crate is not worth it here, nor `rustix::process::geteuid()`:
+    // Cargo.toml's zero-dep posture is the point. `safe fn`: no arguments, no memory, cannot
+    // fail. The `unsafe extern` block is the crate's sole `unsafe_code`.
     #[allow(unsafe_code)]
     unsafe extern "C" {
         #[link_name = "geteuid"]
-        fn libc_geteuid() -> u32;
-    }
-
-    /// Sole `unsafe` in the crate so `deny(unsafe_code)` can stand. Do not swap in
-    /// `rustix::process::geteuid()` — Cargo.toml's zero-dep posture is the point of this helper.
-    #[allow(unsafe_code)]
-    fn effective_uid() -> u32 {
-        // SAFETY: `geteuid` is a POSIX syscall wrapper that takes no arguments, reads no memory
-        // through a pointer, cannot fail, and has no preconditions whatsoever.
-        unsafe { libc_geteuid() }
+        safe fn effective_uid() -> u32;
     }
 }
 

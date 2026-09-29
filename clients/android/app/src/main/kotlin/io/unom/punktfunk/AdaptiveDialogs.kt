@@ -22,12 +22,6 @@ import io.unom.punktfunk.models.PendingTrust
 
 // The touch UI's prompts, each described once — a title, a list of [DialogAction]s (primary
 // first) and a body — and drawn as a Material `AlertDialog`.
-//
-// History: these used to be drawn a second way, as the Compose console's glass card, and the two
-// renderers drifted by hand until the descriptions were shared here. The Compose console is gone
-// (the console is the Skia shell now — design/android-skia-console-port.md — and it draws its own
-// pairing/trust screens), so only the touch renderer remains; the shared-description shape stays
-// because it is the right shape regardless.
 
 /** One button of a prompt. [primary] lifts it into the confirm slot; the rest lay out beside. */
 class DialogAction(
@@ -48,8 +42,7 @@ fun PunktfunkDialog(
     actions: List<DialogAction>,
     /**
      * False pins the prompt open against a stray tap outside it — for a dialog sitting over work
-     * in flight, where a mis-tap would abandon it. Console-side there is no outside to tap, so
-     * this only reaches the touch renderer.
+     * in flight, where a mis-tap would abandon it.
      */
     dismissOnOutsideTap: Boolean = true,
     body: @Composable ColumnScope.() -> Unit,

@@ -9,7 +9,7 @@
 //! persists the pairing; this queue records the admitted knock generation and
 //! clears the entry ([`ApprovalQueue::admit_and_clear`]).
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -26,6 +26,8 @@ struct Pending {
     requested_at: Instant,
     /// QUIC-validated knock source, used for the per-source cap. `None` if unknown.
     src_ip: Option<IpAddr>,
+    /// [`classify_source`] of `src_ip`, taken when the knock arrived.
+    source: KnockSource,
     /// True while [`ApprovalQueue::wait_for_decision`] holds this knock open.
     /// Eviction skips a parked entry unless every candidate is parked.
     parked: bool,
@@ -51,9 +53,8 @@ struct PendingState {
 /// address instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KnockSource {
-    /// Loopback, RFC 1918, link-local, IPv6 unique-local, or the 100.64/10 range Tailscale
-    /// hands its peers. Reaching any of these means the peer is already on a network the
-    /// operator let it onto.
+    /// Loopback, RFC 1918, link-local, IPv6 unique-local, or a Tailscale tailnet. Reaching any
+    /// of these means the peer is already on a network the operator let it onto.
     Lan,
     /// Routable from the internet, or an address we could not read. Fails closed: every rule
     /// that treats a source as untrusted must land here rather than on a guess.
@@ -63,6 +64,15 @@ pub enum KnockSource {
 /// Classify a knock's source. `None` is [`KnockSource::Wan`] — an admission rule reading an
 /// unknown address must refuse, not admit.
 pub fn classify_source(ip: Option<IpAddr>) -> KnockSource {
+    classify_with(ip, routes_over_tailnet)
+}
+
+/// [`classify_source`] with the tailnet test injected. `over_tailnet` is asked only about a
+/// 100.64/10 peer: that range is carrier-grade NAT space too, so the address alone proves nothing.
+pub(super) fn classify_with(
+    ip: Option<IpAddr>,
+    over_tailnet: impl Fn(Ipv4Addr) -> bool,
+) -> KnockSource {
     let Some(ip) = ip else {
         return KnockSource::Wan;
     };
@@ -83,16 +93,41 @@ pub fn classify_source(ip: Option<IpAddr>) -> KnockSource {
             if v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
-                // 100.64/10: the range Tailscale assigns, which authenticates a peer before we
-                // see the packet. It is also carrier-grade NAT space, so a host whose own uplink
-                // is CGNAT could in principle be reached from it by another subscriber — that
-                // host cannot forward a port to begin with, which is why this stays LAN.
-                || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1])) =>
+                || (is_cgnat(v4) && over_tailnet(v4)) =>
         {
             KnockSource::Lan
         }
         _ => KnockSource::Wan,
     }
+}
+
+/// RFC 6598 shared space, 100.64/10: Tailscale's addresses and a CGNAT ISP's subscribers alike.
+fn is_cgnat(v4: Ipv4Addr) -> bool {
+    v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1])
+}
+
+/// The host routes its replies to `peer` out of its Tailscale interface. A handshake needs those
+/// replies, so a CGNAT neighbour that borrows a tailnet address never completes one. A UDP
+/// `connect` looks the route up without sending; any failure reads as not the tailnet.
+fn routes_over_tailnet(peer: Ipv4Addr) -> bool {
+    let Ok(src) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).and_then(|s| {
+        s.connect((peer, 9))?;
+        s.local_addr()
+    }) else {
+        return false;
+    };
+    if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .iter()
+        .any(|i| i.ip() == src.ip() && is_tailscale_iface(&i.name, i.ip()))
+}
+
+/// Tailscale's interface: `tailscale0` on Linux, `Tailscale` on Windows, a `utun` on macOS. No ISP
+/// puts a 100.64/10 address on any of those names.
+pub(super) fn is_tailscale_iface(name: &str, addr: IpAddr) -> bool {
+    let name = name.to_ascii_lowercase();
+    (name.starts_with("tailscale") || name.starts_with("utun"))
+        && matches!(addr, IpAddr::V4(v4) if is_cgnat(v4))
 }
 
 /// Pending-approval snapshot for the management API.
@@ -213,6 +248,7 @@ impl ApprovalQueue {
     /// [`MAX_PENDING_PER_IP`] then [`PENDING_CAP`]; the name is untrusted.
     pub(super) fn note_pending(&self, name: &str, fp_hex: &str, src_ip: Option<IpAddr>) -> u32 {
         let name = super::sanitize_device_name(name, fp_hex);
+        let source = classify_source(src_ip);
         let mut pending = self.pending.lock().unwrap();
         Self::expire_pending(&mut pending);
         if let Some(p) = pending
@@ -226,6 +262,7 @@ impl ApprovalQueue {
             // came back from the internet inside the TTL would otherwise still read as LAN, and a
             // bare approve would admit it.
             p.src_ip = src_ip;
+            p.source = source;
             p.knock_seq = p.knock_seq.wrapping_add(1);
             let seq = p.knock_seq;
             drop(pending);
@@ -264,6 +301,7 @@ impl ApprovalQueue {
             fp_hex: fp_hex.to_string(),
             requested_at: Instant::now(),
             src_ip,
+            source,
             parked: false,
             knock_seq: 0,
         });
@@ -311,7 +349,7 @@ impl ApprovalQueue {
                 name: p.name.clone(),
                 fingerprint: p.fp_hex.clone(),
                 age_secs: p.requested_at.elapsed().as_secs(),
-                source: classify_source(p.src_ip),
+                source: p.source,
             })
             .collect()
     }
@@ -331,11 +369,7 @@ impl ApprovalQueue {
     pub(super) fn source_of(&self, id: u32) -> Option<KnockSource> {
         let mut pending = self.pending.lock().unwrap();
         Self::expire_pending(&mut pending);
-        pending
-            .items
-            .iter()
-            .find(|p| p.id == id)
-            .map(|p| classify_source(p.src_ip))
+        pending.items.iter().find(|p| p.id == id).map(|p| p.source)
     }
 
     /// `(name, fingerprint)` of pending `id` without removing it. `None` if missing

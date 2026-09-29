@@ -40,6 +40,9 @@ internal class StylusStream(private val handle: Long) {
     private val last = FloatArray(STRIDE)
     private val batch = FloatArray(MAX_SAMPLES * STRIDE)
 
+    /** Root-view → gesture-layer offset of the event being consumed. */
+    private var origin = 0f to 0f
+
     init {
         idle(last)
     }
@@ -62,6 +65,10 @@ internal class StylusStream(private val handle: Long) {
             me.getToolType(it) == MotionEvent.TOOL_TYPE_STYLUS ||
                 me.getToolType(it) == MotionEvent.TOOL_TYPE_ERASER
         } ?: return true
+        // The MotionEvent is in root-view pixels; `rect` is this layer's, which a cutout inset
+        // moves. The change's own position says by how much.
+        val at = stylusChanges.first().position
+        origin = (at.x - me.getX(idx)) to (at.y - me.getY(idx))
 
         when (me.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN,
@@ -176,9 +183,10 @@ internal class StylusStream(private val handle: Long) {
         if (buttons and MotionEvent.BUTTON_STYLUS_SECONDARY != 0) state += PEN_BARREL2
         out[off + 0] = state
         out[off + 1] = if (tool == MotionEvent.TOOL_TYPE_ERASER) 1f else 0f
-        // Normalised across the visible frame (a contact on a bar clamps to its edge).
-        out[off + 2] = rect.nx(x)
-        out[off + 3] = rect.ny(y)
+        // Normalised across the visible frame (a contact on a bar clamps to its edge), in this
+        // layer's coordinates.
+        out[off + 2] = rect.nx(x + origin.first)
+        out[off + 3] = rect.ny(y + origin.second)
         out[off + 4] = if (touching) pressure.coerceIn(0f, 1f) else 0f
         // AXIS_DISTANCE units are device-arbitrary; 0..1 covers real hardware, and 0 while
         // hovering legitimately means "at the hover floor".

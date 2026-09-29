@@ -15,11 +15,14 @@ use std::rc::Rc;
 
 use cros_codecs::codec::av1::parser::FrameHeaderObu;
 use cros_codecs::codec::av1::parser::ObuAction;
+use cros_codecs::codec::av1::parser::ObuType;
 use cros_codecs::codec::av1::parser::ParsedObu;
 use cros_codecs::codec::av1::parser::Parser;
 use cros_codecs::codec::av1::parser::SequenceHeaderObu;
 
 use crate::h264::ColourDescription;
+
+pub mod tiles;
 
 /// Parsed types a backend conversion names. Re-exported so backends do not reach
 /// into the vendored crate — the same courtesy [`crate::h264`] does for `Sps`/`Pps`.
@@ -244,7 +247,7 @@ pub enum PlanWarning {
 
 impl PlanWarning {
     /// Does this warning mean the picture is damaged? Same contract as
-    /// [`crate::h264::PlanWarning::is_integrity`]; `pf_vkdecode` delegates here.
+    /// [`crate::h264::PlanWarning::is_integrity`]; every backend conceals on this.
     ///
     /// Every AV1 variant is damage: the codec has no reorder envelope and no MMCO
     /// to report, so the only warnings are missing or wrong pictures and a walk
@@ -370,23 +373,22 @@ impl Av1Planner {
             let obu_start = consumed;
             consumed += used;
 
+            // A new header ends the previous frame; its tile groups are all in.
+            // Plan it before the parse: planning runs the 7.20 update, and the
+            // new header reads the order hints and sizes that update writes.
+            if matches!(obu.header.obu_type, ObuType::Frame | ObuType::FrameHeader) {
+                if let Some((h, t)) = pending.take() {
+                    plans.push(self.plan_one(h, t, std::mem::take(&mut warnings))?);
+                }
+            }
+
             match self.parser.parse_obu(obu) {
                 Ok(ParsedObu::SequenceHeader(seq)) => self.sequence = Some(seq),
-                Ok(ParsedObu::FrameHeader(fh)) => {
-                    // A new header ends the previous frame; its tile groups are
-                    // all in by now.
-                    if let Some((h, t)) = pending.take() {
-                        plans.push(self.plan_one(h, t, std::mem::take(&mut warnings))?);
-                    }
-                    pending = Some((fh, Vec::new()));
-                }
+                Ok(ParsedObu::FrameHeader(fh)) => pending = Some((fh, Vec::new())),
                 Ok(ParsedObu::Frame(frame)) => {
-                    // A Frame OBU is a header plus its first tile group, so it
-                    // ends any previous frame. It stays open like a bare header:
-                    // 5.10 lets further tile-group OBUs follow it.
-                    if let Some((h, t)) = pending.take() {
-                        plans.push(self.plan_one(h, t, std::mem::take(&mut warnings))?);
-                    }
+                    // A Frame OBU is a header plus its first tile group. It stays
+                    // open like a bare header: 5.10 lets further tile-group OBUs
+                    // follow it.
                     let tile = TilePlan {
                         data: obu_start..consumed,
                         tg_start: frame.tile_group.tg_start,
@@ -632,6 +634,72 @@ impl Av1Planner {
     }
 }
 
+/// What an ISOBMFF `av1C` record and a colour description take from a sequence header.
+/// Colour codes are ITU-T H.273; 2 (unspecified) when the header codes none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SequenceInfo {
+    pub profile: u8,
+    /// Operating point 0's `seq_level_idx`.
+    pub level_idx0: u8,
+    /// Operating point 0's `seq_tier`.
+    pub tier0: u8,
+    pub high_bitdepth: bool,
+    pub twelve_bit: bool,
+    pub mono_chrome: bool,
+    pub subsampling_x: bool,
+    pub subsampling_y: bool,
+    pub chroma_sample_position: u8,
+    pub color_primaries: u8,
+    pub transfer_characteristics: u8,
+    pub matrix_coefficients: u8,
+    pub full_range: bool,
+    pub max_width: u32,
+    pub max_height: u32,
+}
+
+/// The first sequence header in `obus`, a low-overhead temporal unit or any run of sized
+/// OBUs. None when it carries none, or the walk hits a malformed OBU first.
+pub fn sequence_info(obus: &[u8]) -> Option<SequenceInfo> {
+    let mut parser = Parser::default();
+    let mut consumed = 0usize;
+    while consumed < obus.len() {
+        let obu = match parser.read_obu(&obus[consumed..]).ok()? {
+            ObuAction::Process(obu) => obu,
+            ObuAction::Drop(n) => {
+                consumed += n as usize;
+                continue;
+            }
+        };
+        consumed += obu.bytes_used;
+        if obu.header.obu_type != ObuType::SequenceHeader {
+            continue;
+        }
+        let ParsedObu::SequenceHeader(seq) = parser.parse_obu(obu).ok()? else {
+            return None;
+        };
+        let color = &seq.color_config;
+        let op0 = &seq.operating_points[0];
+        return Some(SequenceInfo {
+            profile: seq.seq_profile as u8,
+            level_idx0: op0.seq_level_idx,
+            tier0: op0.seq_tier,
+            high_bitdepth: color.high_bitdepth,
+            twelve_bit: color.twelve_bit,
+            mono_chrome: color.mono_chrome,
+            subsampling_x: color.subsampling_x,
+            subsampling_y: color.subsampling_y,
+            chroma_sample_position: color.chroma_sample_position as u8,
+            color_primaries: color.color_primaries as u8,
+            transfer_characteristics: color.transfer_characteristics as u8,
+            matrix_coefficients: color.matrix_coefficients as u8,
+            full_range: color.color_range,
+            max_width: u32::from(seq.max_frame_width_minus_1) + 1,
+            max_height: u32::from(seq.max_frame_height_minus_1) + 1,
+        });
+    }
+    None
+}
+
 fn picture_plan(
     header: &FrameHeaderObu,
     sequence: &SequenceHeaderObu,
@@ -683,6 +751,7 @@ fn picture_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::AV1_25FPS;
     use cros_codecs::bitstream_utils::IvfIterator;
 
     /// `PF_AV1_DUMP=<capture>` with its `.idx`: print each frame's type, entropy source and
@@ -721,10 +790,46 @@ mod tests {
         }
     }
 
-    /// Vendored 25 fps conformance vector. Driven through the planner; the
-    /// crate's vendor-pin smoke test walks the same file through the parser.
-    const AV1_25FPS: &[u8] =
-        include_bytes!("../vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1");
+    /// An SVT-AV1 320x180 keyframe's temporal delimiter and sequence-header OBU: Main, level 0,
+    /// 8-bit 4:2:0, no colour description, studio range. The Apple client's AV1Tests uses it too.
+    const SVT_KEY_HEAD: [u8; 15] = [
+        0x12, 0x00, 0x0a, 0x0b, 0x00, 0x00, 0x00, 0x04, 0x3c, 0xfe, 0xcc, 0x4a, 0xf9, 0x00, 0x40,
+    ];
+
+    #[test]
+    fn sequence_info_reads_what_av1c_needs() {
+        let want = SequenceInfo {
+            profile: 0,
+            level_idx0: 0,
+            tier0: 0,
+            high_bitdepth: false,
+            twelve_bit: false,
+            mono_chrome: false,
+            subsampling_x: true,
+            subsampling_y: true,
+            chroma_sample_position: 0,
+            color_primaries: 2,
+            transfer_characteristics: 2,
+            matrix_coefficients: 2,
+            full_range: false,
+            max_width: 320,
+            max_height: 180,
+        };
+        assert_eq!(sequence_info(&SVT_KEY_HEAD), Some(want), "a temporal unit");
+        assert_eq!(
+            sequence_info(&SVT_KEY_HEAD[2..]),
+            Some(want),
+            "the bare OBU"
+        );
+        for cut in 2..SVT_KEY_HEAD.len() {
+            assert_eq!(sequence_info(&SVT_KEY_HEAD[..cut]), None, "cut at {cut}");
+        }
+        let first = IvfIterator::new(AV1_25FPS).next().expect("a temporal unit");
+        assert!(
+            sequence_info(first).is_some(),
+            "the vendored vector's first unit"
+        );
+    }
 
     /// Walk the whole vector and check the plan is self-consistent at every frame.
     ///
@@ -733,6 +838,29 @@ mod tests {
     /// references; damage would surface later as missing-reference concealment
     /// on frames that were never damaged.
     ///
+    /// A header reads the reference state the frame before it wrote (7.20), also
+    /// when both share a temporal unit. 24 units of this vector carry two frames.
+    #[test]
+    fn order_hints_name_the_pictures_the_planner_resolved() {
+        let mut planner = Av1Planner::new();
+        let mut checked = 0usize;
+        for (unit, packet) in IvfIterator::new(AV1_25FPS).enumerate() {
+            for plan in planner.plan_au(packet).unwrap() {
+                for (name, r) in plan.refs.iter().enumerate() {
+                    let Some(r) = r else { continue };
+                    // `order_hints` is indexed by reference frame; `INTRA_FRAME` is 0.
+                    assert_eq!(
+                        plan.header.order_hints[name + 1],
+                        r.state.order_hint,
+                        "unit {unit}, reference name {name}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0);
+    }
+
     /// This vector has no `show_existing_frame`, so [`Av1Planner::plan_frame`]'s
     /// display-only path (including the key-frame slot reset) is untested here.
     #[test]

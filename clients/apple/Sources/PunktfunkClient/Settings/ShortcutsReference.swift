@@ -46,7 +46,7 @@ enum ShortcutsCatalog {
         #if os(tvOS)
         return false // no app-accessible microphone
         #else
-        guard UserDefaults.standard.object(forKey: DefaultsKey.micEnabled) as? Bool ?? true
+        guard UserDefaults.standard.object(forKey: DefaultsKey.micEnabled) as? Bool ?? false
         else { return false }
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized, .notDetermined: return true
@@ -71,7 +71,7 @@ enum ShortcutsCatalog {
             keyboard.append(.init(keys: "⌃⌥⇧A", text: "Mute or unmute the microphone"))
         }
         groups.append(.init(title: "Keyboard", items: keyboard))
-        #elseif os(iOS)
+        #elseif os(iOS) || os(visionOS)
         // iPad with a hardware keyboard gets the same cross-client set as the Mac (StreamCommands
         // publishes it either way); a phone simply never sees a keyboard to press it on.
         var keyboard: [ShortcutItem] = [

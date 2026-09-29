@@ -17,6 +17,8 @@ struct TitleDetailSheet: View {
     /// nil ⇒ browse-only, the same gate the poster tap uses.
     var onPlay: (() -> Void)?
     var onCopyLink: (() -> Void)?
+    /// Set while the host runs a launch of this device's: End Game (the caller confirms).
+    var onEndGame: (() -> Void)?
     /// The host the title is on, among a TV page's facts.
     var host: StoredHost?
     @Environment(\.dismiss) private var dismiss
@@ -62,7 +64,7 @@ struct TitleDetailSheet: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(20)
             }
-            #if os(iOS)
+            #if os(iOS) || os(visionOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
             .toolbar {
@@ -106,6 +108,11 @@ struct TitleDetailSheet: View {
                 Button(action: onCopyLink) { Image(systemName: "link") }
                     .buttonStyle(.bordered)
                     .accessibilityLabel("Copy Link")
+            }
+            if let onEndGame {
+                Button(role: .destructive, action: onEndGame) { Image(systemName: "xmark.circle") }
+                    .buttonStyle(.bordered)
+                    .accessibilityLabel("End Game")
             }
         }
         #if os(tvOS)

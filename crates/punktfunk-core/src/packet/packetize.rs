@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::config::Config;
+use crate::config::FecScheme;
 use crate::error::{PunktfunkError, Result};
 use crate::fec::ErasureCoder;
 use zerocopy::IntoBytes;
@@ -155,6 +156,34 @@ impl Packetizer {
         Ok(packets)
     }
 
+    /// One AU's shard geometry: what the data pass, the parity pass and a parity thread
+    /// agree on before any of them runs.
+    pub fn geometry(&self, frame_len: usize) -> Geometry {
+        let payload = self.shard_payload;
+        let total_data = frame_len.div_ceil(payload).max(1);
+        let max_block = self.fec.max_data_per_block as usize;
+        Geometry {
+            payload,
+            total_data,
+            max_block,
+            block_count: total_data.div_ceil(max_block).max(1),
+            frame_bytes: frame_len as u32,
+            fec: self.fec,
+            max_total_shards: self.max_total_shards,
+        }
+    }
+
+    /// The parity pool, for a caller that fills it off-thread with [`parity`] and hands
+    /// it back through [`put_recovery`](Self::put_recovery) before
+    /// [`emit_parity`](Self::emit_parity).
+    pub fn take_recovery(&mut self) -> Vec<Vec<Vec<u8>>> {
+        std::mem::take(&mut self.recovery)
+    }
+
+    pub fn put_recovery(&mut self, recovery: Vec<Vec<Vec<u8>>>) {
+        self.recovery = recovery;
+    }
+
     /// Packetize one AU, yielding `(header, shard)` to `emit` in wire order — also the
     /// order the session nonce advances. No per-packet allocation: the caller can seal
     /// into a pooled buffer ([`Session::seal_frame`](crate::session::Session::seal_frame)).
@@ -176,30 +205,51 @@ impl Packetizer {
         coder: &dyn ErasureCoder,
         mut emit: impl FnMut(&PacketHeader, &[u8]) -> Result<()>,
     ) -> Result<()> {
-        let payload = self.shard_payload;
         let frame_index = frame_index.unwrap_or_else(|| {
             let i = self.next_frame_index;
             self.next_frame_index = i.wrapping_add(1);
             i
         });
+        let geo = self.geometry(frame.len());
+        geo.check()?;
+        let mut recovery = std::mem::take(&mut self.recovery);
+        let fec = parity(&geo, frame, coder, &mut recovery);
+        self.recovery = recovery;
+        fec?;
+        self.emit_data(
+            &geo,
+            frame,
+            pts_ns,
+            user_flags,
+            frame_index,
+            coder.scheme(),
+            &mut emit,
+        )?;
+        self.emit_parity(
+            &geo,
+            pts_ns,
+            user_flags,
+            frame_index,
+            coder.scheme(),
+            &mut emit,
+        )
+    }
 
-        // At least one (zero-padded) data shard even for an empty frame.
-        let total_data = frame.len().div_ceil(payload).max(1);
-        let max_block = self.fec.max_data_per_block as usize;
-        let block_count = total_data.div_ceil(max_block).max(1);
-        let frame_bytes = frame.len() as u32;
-
-        // Guard u16 wire fields. `Config::validate` already rejects configs that could
-        // reach these at the negotiated max; this catches an oversize frame anyway.
-        if payload > u16::MAX as usize {
-            return Err(PunktfunkError::InvalidArg("shard_payload exceeds u16"));
-        }
-        if block_count > u16::MAX as usize {
-            return Err(PunktfunkError::Unsupported(
-                "frame too large: block count exceeds u16",
-            ));
-        }
-
+    /// Pass 1 of [`packetize_each`](Self::packetize_each): every block's data shards, in
+    /// order. `FLAG_SOF` on the first; `FLAG_EOF` on the last only when the frame carries
+    /// no parity. `frame_index` is the caller's, already resolved.
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_data(
+        &mut self,
+        geo: &Geometry,
+        frame: &[u8],
+        pts_ns: u64,
+        user_flags: u32,
+        frame_index: u32,
+        scheme: FecScheme,
+        emit: &mut dyn FnMut(&PacketHeader, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let payload = geo.payload;
         let full_shards = frame.len() / payload;
         self.tail.clear();
         self.tail.resize(payload, 0);
@@ -207,100 +257,81 @@ impl Packetizer {
         if rem > 0 {
             self.tail[..rem].copy_from_slice(&frame[full_shards * payload..]);
         }
-        let tail = &self.tail;
-        let shard_at = |s: usize| -> &[u8] {
-            if s < full_shards {
-                &frame[s * payload..(s + 1) * payload]
-            } else {
-                tail.as_slice()
-            }
-        };
-        // Per-block shard geometry (deterministic — recomputed in both passes).
-        let block_data_count = |b: usize| ((b + 1) * max_block).min(total_data) - b * max_block;
-        // Locals, not a `&self` method: `emit_one` would capture all of `self` and
-        // collide with the `&mut self.recovery[b]` parity borrow. Clamp is `max_total_shards`.
-        let (fec, max_total_shards) = (self.fec, self.max_total_shards);
-        let recovery_for =
-            move |k: usize| fec.recovery_for(k).min(max_total_shards.saturating_sub(k));
-
-        if self.recovery.len() < block_count {
-            self.recovery.resize_with(block_count, Vec::new);
-        }
-
-        // Total parity across the frame decides where FLAG_EOF lands (the last emitted packet).
-        let mut total_recovery = 0usize;
-        for b in 0..block_count {
-            let k = block_data_count(b);
-            let m = recovery_for(k);
-            if k + m > u16::MAX as usize {
-                return Err(PunktfunkError::Unsupported("block shard count exceeds u16"));
-            }
-            total_recovery += m;
-        }
-
-        let mut emit_one =
-            |next_seq: &mut u32, b: usize, shard_index: usize, body: &[u8], flags: u8| {
-                let seq = *next_seq;
-                *next_seq = next_seq.wrapping_add(1);
-                let k = block_data_count(b);
-                let hdr = PacketHeader {
-                    pts_ns,
-                    frame_index,
-                    stream_seq: seq,
-                    frame_bytes,
-                    user_flags,
-                    block_index: b as u16,
-                    block_count: block_count as u16,
-                    data_shards: k as u16,
-                    recovery_shards: recovery_for(k) as u16,
-                    shard_index: shard_index as u16,
-                    shard_bytes: payload as u16,
-                    magic: PUNKTFUNK_MAGIC,
-                    version: self.version,
-                    fec_scheme: coder.scheme() as u8,
-                    flags,
+        let total_recovery = geo.total_recovery();
+        let mut seq = self.next_seq;
+        for b in 0..geo.block_count {
+            let first = b * geo.max_block;
+            let k = geo.data_count(b);
+            for shard_index in 0..k {
+                let s = first + shard_index;
+                let body: &[u8] = if s < full_shards {
+                    &frame[s * payload..(s + 1) * payload]
+                } else {
+                    &self.tail
                 };
-                emit(&hdr, body)
-            };
-        let mut next_seq = self.next_seq;
-
-        // Pass 1 — per block: generate parity into the block's pool, emit the DATA shards.
-        for b in 0..block_count {
-            let first = b * max_block;
-            let k = block_data_count(b);
-
-            let data_shards: Vec<&[u8]> = (first..first + k).map(shard_at).collect();
-            let recovery_count = recovery_for(k);
-            coder.encode_into(&data_shards, recovery_count, &mut self.recovery[b])?;
-
-            for (shard_index, body) in data_shards.iter().enumerate() {
                 let mut flags = FLAG_PIC;
                 if b == 0 && shard_index == 0 {
                     flags |= FLAG_SOF;
                 }
-                if total_recovery == 0 && b + 1 == block_count && shard_index + 1 == k {
+                if total_recovery == 0 && b + 1 == geo.block_count && shard_index + 1 == k {
                     flags |= FLAG_EOF;
                 }
-                emit_one(&mut next_seq, b, shard_index, body, flags)?;
+                let hdr = geo.header(
+                    pts_ns,
+                    frame_index,
+                    user_flags,
+                    self.version,
+                    scheme,
+                    b,
+                    shard_index,
+                    seq,
+                    flags,
+                );
+                seq = seq.wrapping_add(1);
+                emit(&hdr, body)?;
             }
         }
+        self.next_seq = seq;
+        Ok(())
+    }
 
-        // Pass 2 — per block: emit the parity shards (the frame's tail on the wire).
-        let mut parity_left = total_recovery;
-        for b in 0..block_count {
-            let k = block_data_count(b);
-            let recovery_count = recovery_for(k);
-            for r in 0..recovery_count {
-                parity_left -= 1;
+    /// Pass 2: every block's parity, the frame's tail on the wire; `FLAG_EOF` on the
+    /// last. The pool must hold this frame's parity ([`parity`]).
+    pub fn emit_parity(
+        &mut self,
+        geo: &Geometry,
+        pts_ns: u64,
+        user_flags: u32,
+        frame_index: u32,
+        scheme: FecScheme,
+        emit: &mut dyn FnMut(&PacketHeader, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let mut left = geo.total_recovery();
+        let mut seq = self.next_seq;
+        for b in 0..geo.block_count {
+            let k = geo.data_count(b);
+            for r in 0..geo.recovery_count(k) {
+                left -= 1;
                 let mut flags = FLAG_PIC;
-                if parity_left == 0 {
+                if left == 0 {
                     flags |= FLAG_EOF;
                 }
-                let body: &[u8] = &self.recovery[b][r];
-                emit_one(&mut next_seq, b, k + r, body, flags)?;
+                let hdr = geo.header(
+                    pts_ns,
+                    frame_index,
+                    user_flags,
+                    self.version,
+                    scheme,
+                    b,
+                    k + r,
+                    seq,
+                    flags,
+                );
+                seq = seq.wrapping_add(1);
+                emit(&hdr, &self.recovery[b][r])?;
             }
         }
-        self.next_seq = next_seq;
+        self.next_seq = seq;
         Ok(())
     }
 
@@ -533,4 +564,130 @@ impl Packetizer {
         self.next_seq = next_seq;
         Ok(())
     }
+}
+
+/// One AU's shard geometry. One arithmetic for every pass, so the data thread and the
+/// parity thread cannot disagree about a block.
+#[derive(Clone, Copy, Debug)]
+pub struct Geometry {
+    pub payload: usize,
+    pub total_data: usize,
+    pub max_block: usize,
+    pub block_count: usize,
+    /// `frame.len()`, as the header carries it.
+    pub frame_bytes: u32,
+    fec: crate::config::FecConfig,
+    max_total_shards: usize,
+}
+
+impl Geometry {
+    pub fn data_count(&self, b: usize) -> usize {
+        ((b + 1) * self.max_block).min(self.total_data) - b * self.max_block
+    }
+
+    pub fn recovery_count(&self, k: usize) -> usize {
+        self.fec
+            .recovery_for(k)
+            .min(self.max_total_shards.saturating_sub(k))
+    }
+
+    pub fn total_recovery(&self) -> usize {
+        (0..self.block_count)
+            .map(|b| self.recovery_count(self.data_count(b)))
+            .sum()
+    }
+
+    /// Data shards plus parity.
+    pub fn wire_packets(&self) -> usize {
+        self.total_data + self.total_recovery()
+    }
+
+    /// The u16 wire fields hold this frame. `Config::validate` covers the negotiated
+    /// max; this catches an oversize frame anyway.
+    pub fn check(&self) -> Result<()> {
+        if self.payload > u16::MAX as usize {
+            return Err(PunktfunkError::InvalidArg("shard_payload exceeds u16"));
+        }
+        if self.block_count > u16::MAX as usize {
+            return Err(PunktfunkError::Unsupported(
+                "frame too large: block count exceeds u16",
+            ));
+        }
+        for b in 0..self.block_count {
+            let k = self.data_count(b);
+            if k + self.recovery_count(k) > u16::MAX as usize {
+                return Err(PunktfunkError::Unsupported("block shard count exceeds u16"));
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn header(
+        &self,
+        pts_ns: u64,
+        frame_index: u32,
+        user_flags: u32,
+        version: u8,
+        scheme: FecScheme,
+        b: usize,
+        shard_index: usize,
+        seq: u32,
+        flags: u8,
+    ) -> PacketHeader {
+        let k = self.data_count(b);
+        PacketHeader {
+            pts_ns,
+            frame_index,
+            stream_seq: seq,
+            frame_bytes: self.frame_bytes,
+            user_flags,
+            block_index: b as u16,
+            block_count: self.block_count as u16,
+            data_shards: k as u16,
+            recovery_shards: self.recovery_count(k) as u16,
+            shard_index: shard_index as u16,
+            shard_bytes: self.payload as u16,
+            magic: PUNKTFUNK_MAGIC,
+            version,
+            fec_scheme: scheme as u8,
+            flags,
+        }
+    }
+}
+
+/// Every block's parity into `out[b]`, from the frame alone, so it can run beside the
+/// data pass on another thread. `out` is the packetizer's pool
+/// ([`Packetizer::take_recovery`]).
+pub fn parity(
+    geo: &Geometry,
+    frame: &[u8],
+    coder: &dyn ErasureCoder,
+    out: &mut Vec<Vec<Vec<u8>>>,
+) -> Result<()> {
+    let payload = geo.payload;
+    let full_shards = frame.len() / payload;
+    let mut tail = vec![0u8; payload];
+    let rem = frame.len() % payload;
+    if rem > 0 {
+        tail[..rem].copy_from_slice(&frame[full_shards * payload..]);
+    }
+    if out.len() < geo.block_count {
+        out.resize_with(geo.block_count, Vec::new);
+    }
+    for (b, parity) in out.iter_mut().enumerate().take(geo.block_count) {
+        let first = b * geo.max_block;
+        let k = geo.data_count(b);
+        let shards: Vec<&[u8]> = (first..first + k)
+            .map(|s| {
+                if s < full_shards {
+                    &frame[s * payload..(s + 1) * payload]
+                } else {
+                    tail.as_slice()
+                }
+            })
+            .collect();
+        coder.encode_into(&shards, geo.recovery_count(k), parity)?;
+    }
+    Ok(())
 }

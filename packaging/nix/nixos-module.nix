@@ -7,7 +7,7 @@
 # (`services.punktfunk.scripting`, likewise on by default — the game-library scanners are plugins).
 #
 # Usage (flake):
-#   { inputs.punktfunk.url = "git+https://git.unom.io/unom/punktfunk";
+#   { inputs.punktfunk.url = "git+https://git.unom.io/unom/punktfunk?ref=nix-stable";
 #     outputs = { punktfunk, nixpkgs, ... }: {
 #       nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
 #         modules = [ punktfunk.nixosModules.default
@@ -82,8 +82,9 @@ let
   nativeTCP = [ 47990 ]; # mgmt/library REST API (HTTPS + mTLS)
   nativeUDP = [
     9777
+    9778
     5353
-  ]; # QUIC control plane + mDNS
+  ]; # QUIC control plane + browser streaming (closed until switched on) + mDNS
   # GameStream/Moonlight-compat fixed ports (opt-in with `host.gamestream`).
   gamestreamTCP = [
     47984
@@ -227,8 +228,8 @@ in
         type = types.bool;
         default = false;
         description = ''
-          Open the host's inbound ports. Native punktfunk/1 always: UDP 9777 (QUIC) + 5353 (mDNS),
-          TCP 47990 (mgmt API). With `gamestream = true` also TCP 47984/47989/48010 and UDP
+          Open the host's inbound ports. Native punktfunk/1 always: UDP 9777 (QUIC), 9778 (browser
+          streaming) + 5353 (mDNS), TCP 47990 (mgmt API). With `gamestream = true` also TCP 47984/47989/48010 and UDP
           47998/47999/48000. The ephemeral media UDP port is hole-punched, so a default-deny
           firewall still streams (it just adds ~2.5 s at session start).
         '';
@@ -613,6 +614,23 @@ in
         # the resolved binary keeps a build-less box SDR. `gamescopeHdr` only controls whether
         # the patched binary is on PATH; `settings`/`environmentFile` can still set =0 to force SDR.
       };
+
+      # A switch reloads user managers but never restarts a user service. A changed package
+      # reloads this unit instead, which restarts the running host, console and runner.
+      systemd.services.punktfunk-restart-user-units = {
+        description = "Restart the punktfunk user services after a package change";
+        wantedBy = [ "multi-user.target" ];
+        reloadTriggers =
+          [ cfg.host.package ]
+          ++ optional cfg.web.enable cfg.web.package
+          ++ optional cfg.scripting.enable cfg.scripting.package;
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          ExecStart = "${pkgs.coreutils}/bin/true";
+          ExecReload = "${pkgs.runtimeShell} ${../linux/restart-user-units.sh}";
+        };
+      };
     })
 
     # --- client --------------------------------------------------------------------------------
@@ -770,6 +788,9 @@ in
         serviceConfig = {
           Type = "simple";
           ExecStart = "${cfg.scripting.package}/bin/punktfunk-scripting";
+          # `+` runs outside the namespace: the plugin-run and plugin-state binds need both
+          # directories, and inside the read-only home nothing can create them.
+          ExecStartPre = "+${pkgs.coreutils}/bin/mkdir -p -m 0700 %h/.config/punktfunk/plugin-run %h/.config/punktfunk/plugin-state";
           Restart = "on-failure";
           RestartSec = 2;
           # Deliver SIGTERM to the runner (it orchestrates the structural shutdown of its unit
@@ -804,8 +825,8 @@ in
           # unprivileged user namespaces. On a kernel/config that restricts those they fail the
           # unit rather than degrading — drop them via
           #   systemctl --user edit punktfunk-scripting
-          # which is also where a plugin that must reach elsewhere gets `ReadWritePaths=/mnt/games`
-          # (outside the home) or `BindReadOnlyPaths=` (inside it).
+          # which is also where a loose script that must reach elsewhere gets `ReadWritePaths=`
+          # (outside the home) or `BindReadOnlyPaths=` (inside it). Plugins get folder grants.
           ProtectHome = "tmpfs";
           InaccessiblePaths = [
             "-%h/.config/punktfunk/mgmt-token"
@@ -829,29 +850,22 @@ in
           # it), the port the host really bound, the operator's loose scripts, and the drop box
           # another local account fills.
           #
-          # The launcher roots are there because on Linux a game library lives IN the home, so an
-          # empty home is an EMPTY LIBRARY — the scanner plugins read exactly these. A scanner for
-          # a launcher not listed needs a drop-in.
+          # What the plugins read in the home — manifest paths and folder grants — the host writes
+          # into ~/.config/systemd/user/punktfunk-scripting.service.d/50-plugin-roots.conf.
           #
           # The punktfunk-scripting entries cover the SteamOS layout, which builds the runner under
-          # the home and points ExecStart at it. Every path is '-' because none is guaranteed.
+          # the home and points ExecStart at it. Every path but plugin-run is `-`: ExecStartPre
+          # creates that one.
           BindReadOnlyPaths = [
             "-%h/.config/punktfunk/plugin-token"
-            # What the supervisor hands each sandbox: that plugin's own minted token, and the roots
-            # `plugins grant` added. Without them no plugin with a manifest starts at all.
-            "-%h/.config/punktfunk/plugin-tokens.json"
-            "-%h/.config/punktfunk/plugin-grants.json"
+            # Per-plugin tokens and grants. A directory bind keeps the host's atomic replacements
+            # visible; a file bind would pin the deleted inode.
+            "%h/.config/punktfunk/plugin-run"
             "-%h/.config/punktfunk/native-cert.pem"
             "-%h/.config/punktfunk/cert.pem"
             "-%h/.config/punktfunk/mgmt-endpoint"
             "-%h/.config/punktfunk/scripts"
             "-%h/.config/punktfunk/ingest"
-            "-%h/.local/share/Steam"
-            "-%h/.steam"
-            "-%h/.var/app"
-            "-%h/.local/share/lutris"
-            "-%h/.config/lutris"
-            "-%h/.config/heroic"
             "-%h/.local/bin/punktfunk-scripting"
             "-%h/.local/lib/punktfunk-scripting"
             "-%h/.local/share/punktfunk-scripting"

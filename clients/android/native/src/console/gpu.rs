@@ -7,8 +7,9 @@ use anyhow::{anyhow, Result};
 use skia_safe::gpu::{self, DirectContext, SurfaceOrigin};
 use skia_safe::{ColorType, Surface};
 
-/// GL_RGBA8 — the sized internal format of the RGBA8888 EGL config's default framebuffer.
+/// GL_RGBA8 / GL_RGB10_A2 — the sized internal format of the EGL config's default framebuffer.
 const GL_RGBA8: u32 = 0x8058;
+const GL_RGB10_A2: u32 = 0x8059;
 
 pub(super) struct Gpu {
     pub(super) context: DirectContext,
@@ -38,9 +39,14 @@ impl Gpu {
         width: u32,
         height: u32,
     ) -> Result<Surface> {
+        let (format, color_type) = if egl.ten_bit {
+            (GL_RGB10_A2, ColorType::RGBA1010102)
+        } else {
+            (GL_RGBA8, ColorType::RGBA8888)
+        };
         let fb = gpu::gl::FramebufferInfo {
             fboid: 0,
-            format: GL_RGBA8,
+            format,
             protected: gpu::Protected::No,
         };
         let samples = usize::try_from(egl.samples).unwrap_or(0);
@@ -55,7 +61,7 @@ impl Gpu {
             &mut self.context,
             &target,
             SurfaceOrigin::BottomLeft,
-            ColorType::RGBA8888,
+            color_type,
             None,
             None,
         )

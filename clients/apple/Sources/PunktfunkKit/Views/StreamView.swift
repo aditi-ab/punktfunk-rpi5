@@ -57,19 +57,38 @@ private final class CursorCapture {
     /// `disassociate: false` (cursor-visible mode) it always engages — there is no grab to
     /// be refused, the cursor stays free and visible.
     func capture(in view: NSView, disassociate: Bool) -> Bool {
-        guard !captured, let window = view.window, view.bounds.width > 0 else { return false }
+        guard !captured, view.window != nil, view.bounds.width > 0 else { return false }
         if disassociate {
             // Park the cursor mid-view so a click can't land in (and activate) another app.
-            let rectOnScreen = window.convertToScreen(view.convert(view.bounds, to: nil))
-            let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
-            CGWarpMouseCursorPosition(
-                CGPoint(x: rectOnScreen.midX, y: primaryHeight - rectOnScreen.midY))
+            park(in: view)
             guard CGAssociateMouseAndMouseCursorPosition(0) == .success else { return false }
             NSCursor.hide()
         }
         captured = true
         disassociated = disassociate
         return true
+    }
+
+    /// The view moved under a frozen cursor (a resize, leaving fullscreen): park it mid-view
+    /// again, or the next click lands on whatever window is under the old spot. Only on a
+    /// real move: every warp suppresses local mouse events for a moment.
+    func repark(in view: NSView) {
+        guard disassociated, let window = view.window else { return }
+        if window.convertToScreen(view.convert(view.bounds, to: nil)) != parkedRect {
+            park(in: view)
+        }
+    }
+
+    /// The view's screen rect at the last park.
+    private var parkedRect: NSRect?
+
+    private func park(in view: NSView) {
+        guard let window = view.window, view.bounds.width > 0 else { return }
+        let rectOnScreen = window.convertToScreen(view.convert(view.bounds, to: nil))
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+        CGWarpMouseCursorPosition(
+            CGPoint(x: rectOnScreen.midX, y: primaryHeight - rectOnScreen.midY))
+        parkedRect = rectOnScreen
     }
 
     func release() {
@@ -175,9 +194,9 @@ public final class StreamLayerView: NSView {
     /// bounds change and a resize-END has none, so without this the layer keeps its pre-resize aspect
     /// and the shader stretches the new frame into it (black bars + squish). Main-thread only.
     private var lastDecodedContentSize: CGSize?
-    /// This screen's below-the-notch mode, as of the last layout — the one input to `videoBounds`
-    /// too expensive to read per mouse event (see `layoutPresenter`). Main-thread only.
-    private var safeModePixels: (width: Int, height: Int)?
+    /// The screen, its parameters or the backing scale changed since the screen's values were
+    /// read. Main-thread only.
+    private var screenValuesStale = true
     private let cursorCapture = CursorCapture()
     private var inputCapture: InputCapture?
     private var appObservers: [NSObjectProtocol] = []
@@ -208,6 +227,8 @@ public final class StreamLayerView: NSView {
     /// flipped live by ⌃⌥⇧M. A live flip re-engages capture in the new model so
     /// disassociation + the abs/rel choice swap atomically. Main-thread only.
     private var desktopMouse = false
+    /// Wire buttons whose press reached the host; only their releases follow. Main-thread only.
+    private var pressedButtons = Set<UInt32>()
     /// Cursor channel (M2): the host forwards shape/state and WE draw the pointer. Active
     /// when the Welcome carried `HOST_CAP_CURSOR` (only sessions that advertised the client
     /// cap get it). Shapes cache by serial; state is latest-wins. Main-thread only.
@@ -239,8 +260,6 @@ public final class StreamLayerView: NSView {
     private var sentClientDraws: Bool?
     /// M3 hint tracking: edge-triggered so a manual ⌃⌥⇧M isn't fought — the override latch
     /// holds until the HOST's intent next changes.
-    private var lastHint: Bool?
-    private var hintOverride = false
     /// One-shot auto-engage request (stream start, trust confirmed) — attempted as soon
     /// as the view is in a window with real bounds, then dropped, so it can never fire
     /// surprisingly later (e.g. on a resize).
@@ -324,6 +343,7 @@ public final class StreamLayerView: NSView {
         super.viewDidMoveToWindow()
         windowObservers.forEach(NotificationCenter.default.removeObserver(_:))
         windowObservers.removeAll()
+        screenValuesStale = true
         guard let window else {
             releaseCapture()
             return
@@ -355,6 +375,16 @@ public final class StreamLayerView: NSView {
         windowObservers.append(NotificationCenter.default.addObserver(
             forName: NSWindow.didChangeScreenNotification, object: window, queue: .main
         ) { [weak self] _ in
+            self?.screenValuesStale = true
+            self?.layoutPresenter()
+            self?.presenter.screenChanged()
+        })
+        // The same screen with a new mode, or a housing that came or went with it.
+        windowObservers.append(NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.screenValuesStale = true
             self?.layoutPresenter()
         })
         attemptPendingCapture()
@@ -364,6 +394,7 @@ public final class StreamLayerView: NSView {
         super.layout()
         attemptPendingCapture() // bounds become real here on first presentation
         layoutPresenter() // keep the stage-2 sublayer aspect-fit to the view
+        cursorCapture.repark(in: self) // a frozen cursor must stay over the moved view
     }
 
     public override func setFrameSize(_ newSize: NSSize) {
@@ -394,6 +425,10 @@ public final class StreamLayerView: NSView {
 
     /// A click from another app counts (one click into the video captures, not two).
     public override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    /// The video runs under the hidden title bar, where AppKit drags the window for any view that
+    /// allows it and never delivers the click. Captured, that press is the host's.
+    public override var mouseDownCanMoveWindow: Bool { !captured && window?.isMovable == true }
 
     /// The engage click is complete — drop its suppression latch (see InputCapture;
     /// guards against GC delivering both halves of the click before our mouseDown).
@@ -498,6 +533,18 @@ public final class StreamLayerView: NSView {
             return
         }
         super.flagsChanged(with: event)
+    }
+
+    // Forward captured Control shortcuts before AppKit can consume them ahead of keyDown
+    public override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if captured, window?.firstResponder === self,
+           let inputCapture, inputCapture.forwarding, event.type == .keyDown,
+           InputCapture.chordFlags(event) == .control,
+           let vk = InputCapture.keyCodeToVK[event.keyCode] {
+            inputCapture.sendKey(vk, down: true)
+            return true // Own this press once; its release follows the ordinary keyUp path
+        }
+        return super.performKeyEquivalent(with: event)
     }
 
     private func requestAutoCapture() {
@@ -695,7 +742,6 @@ public final class StreamLayerView: NSView {
         // buttons (a spurious button-up ~200 ms into every press → broke window drags). Until
         // the host exposes a real pointer-LOCK signal (ClipCursor/raw-input, not visibility),
         // the mouse model is user-driven only (⌃⌥⇧M). The hint still rides the wire, unused.
-        _ = (lastHint, hintOverride)
     }
 
     /// Decode a forwarded straight-alpha RGBA shape into a CGImage + hotspot. The on-screen SIZE is
@@ -739,29 +785,14 @@ public final class StreamLayerView: NSView {
         return (mode.width, mode.height)
     }
 
-    /// The rect the picture is fit into — `bounds`, except for a full-screen session whose mode is
-    /// exactly this screen's below-the-notch mode, which is trimmed to sit under the camera
-    /// housing (see `SafeDisplay.videoBox`). EVERY measurement against the picture reads this:
-    /// the presenter's fit, the pointer mapping both ways, and the cursor scale.
-    private var videoBounds: CGRect {
-        guard let window, window.styleMask.contains(.fullScreen), let screen = window.screen
-        else { return bounds }
-        let content = hostContentSize()
-        guard content.width > 0, content.height > 0 else { return bounds }
-        return SafeDisplay.videoBox(
-            bounds: bounds, topInsetPoints: Double(screen.safeAreaInsets.top),
-            content: (Int(content.width), Int(content.height)),
-            safeMode: safeModePixels)
-    }
-
-    /// Where the picture sits in `videoBounds`: the presenter's placement in backing pixels, the
+    /// Where the picture sits in `bounds`: the presenter's placement in backing pixels, the
     /// points→pixels scale, and the frame size. Every pointer mapping reads this, so a click lands on
     /// the pixel drawn there.
     private func videoPlacement()
         -> (placement: VideoPlacement, box: CGRect, scale: CGFloat, width: UInt32, height: UInt32)? {
         guard let connection else { return nil }
         let content = hostContentSize()
-        let box = videoBounds
+        let box = bounds
         let scale = window?.backingScaleFactor ?? 1
         guard content.width > 0, content.height > 0, box.width > 0, box.height > 0 else { return nil }
         let p = VideoFit(name: connection.settings.videoFit).place(
@@ -818,7 +849,8 @@ public final class StreamLayerView: NSView {
     ///
     /// In the desktop mouse model the cursor is NOT frozen, so bare `.mouseMoved` events are
     /// only generated while `window.acceptsMouseMovedEvents` is true — we enable it here and
-    /// restore it on removal so absolute hover-motion keeps flowing without a click held.
+    /// restore it on removal so absolute hover-motion keeps flowing without a click held. A
+    /// press there reaches the host only on the video.
     private func installMouseMonitor() {
         guard mouseEventMonitor == nil else { return }
         if desktopMouse {
@@ -843,12 +875,22 @@ public final class StreamLayerView: NSView {
                 } else {
                     ic.sendMotion(dx: Float(event.deltaX), dy: Float(event.deltaY)) // no y-negation
                 }
-            case .leftMouseDown: ic.sendMouseButton(1, pressed: true)
-            case .leftMouseUp: ic.sendMouseButton(1, pressed: false)
-            case .rightMouseDown: ic.sendMouseButton(3, pressed: true)
-            case .rightMouseUp: ic.sendMouseButton(3, pressed: false)
-            case .otherMouseDown: ic.sendMouseButton(self.wireButton(for: event), pressed: true)
-            case .otherMouseUp: ic.sendMouseButton(self.wireButton(for: event), pressed: false)
+            case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+                if self.desktopMouse {
+                    // The pointer is free: a press on the title bar, a bar or a HUD button is
+                    // the local UI's. One on the video lands where it was pressed.
+                    guard let p = self.hostPoint(from: event) else { break }
+                    ic.sendMouseAbs(x: p.x, y: p.y, surfaceWidth: p.w, surfaceHeight: p.h)
+                }
+                let button = self.wireButton(for: event)
+                self.pressedButtons.insert(button)
+                ic.sendMouseButton(button, pressed: true)
+            case .leftMouseUp, .rightMouseUp, .otherMouseUp:
+                // Only the release of a press the host saw.
+                let button = self.wireButton(for: event)
+                if self.pressedButtons.remove(button) != nil {
+                    ic.sendMouseButton(button, pressed: false)
+                }
             default: break
             }
             return event
@@ -857,6 +899,7 @@ public final class StreamLayerView: NSView {
     }
 
     private func removeMouseMonitor() {
+        pressedButtons.removeAll() // the release flushes them host-side
         if let monitor = mouseEventMonitor {
             NSEvent.removeMonitor(monitor)
             mouseEventMonitor = nil
@@ -899,10 +942,12 @@ public final class StreamLayerView: NSView {
         return HostPoint(x: hx, y: hy, w: v.width, h: v.height)
     }
 
-    /// NSEvent `buttonNumber` → GameStream wire id for the "other" buttons: 2 = middle,
-    /// 3 = first side (X1), 4 = second side (X2). Unknown extras fall back to middle.
+    /// NSEvent `buttonNumber` → GameStream wire id: 1 = left, 3 = right, 2 = middle,
+    /// 4 = first side (X1), 5 = second side (X2). Unknown extras fall back to middle.
     private func wireButton(for event: NSEvent) -> UInt32 {
         switch event.buttonNumber {
+        case 0: return 1 // left
+        case 1: return 3 // right
         case 2: return 2 // middle
         case 3: return 4 // X1
         case 4: return 5 // X2
@@ -963,8 +1008,6 @@ public final class StreamLayerView: NSView {
                 streamInputLog.info("mouse-mode chord ignored: gamescope host is relative-only")
                 return
             }
-            // A manual flip outranks the standing host hint until the hint next CHANGES.
-            self.hintOverride = true
             self.setDesktopMouse(!self.desktopMouse, reappearAt: nil)
             streamInputLog.info("chord: mouse mode \(self.desktopMouse ? "desktop" : "capture", privacy: .public)")
         }
@@ -1042,7 +1085,7 @@ public final class StreamLayerView: NSView {
                 DispatchQueue.main.async { self?.noteDecodedContentSize(width: w, height: h) }
                 overlayDecodedSize?(w, h)
             },
-            adaptiveSync: Self.isAdaptiveSync(window?.screen ?? NSScreen.main))
+            adaptiveSync: { [weak self] in Self.isAdaptiveSync(self?.window?.screen ?? NSScreen.main) })
         // Match-window (C3): when ON, follow the window's pixel size so a windowed session streams
         // 1:1 (pixel-exact) instead of the presenter resampling a fixed-mode frame into a
         // non-matching window. The first real `layout()` feeds the initial size, so the stream
@@ -1061,22 +1104,18 @@ public final class StreamLayerView: NSView {
         requestAutoCapture() // entering a session is the deliberate "capture me" moment
     }
 
-    /// Aspect-fit the stage-2 metal sublayer to the video box (`videoBounds`, which is the view
-    /// except under a camera housing); refresh contentsScale on a retina↔non-retina move (see
-    /// SessionPresenter.layout). Also feeds the Match-window follower the WINDOW's physical-pixel
-    /// size (bounds → backing) — it follows the window, not the box — so a resize / retina move
-    /// follows. A screen-change observer re-runs this so the display-link range follows the view.
+    /// Aspect-fit the stage-2 metal sublayer to the view; refresh contentsScale on a
+    /// retina↔non-retina move (see SessionPresenter.layout). Also feeds the Match-window follower
+    /// the view's physical-pixel size (bounds → backing), so a resize / retina move follows. A
+    /// screen-change observer re-runs this so the display-link range follows the view.
     private func layoutPresenter() {
-        // Refresh BEFORE the fit below reads it. Enumerating display modes costs ~150 µs, and
-        // `videoBounds` is read on every mouse event — that belongs on layout, not on input.
-        safeModePixels = window?.screen?.notchSafePixelSize
-        presenter.layout(in: videoBounds, contentsScale: window?.backingScaleFactor ?? 1)
+        // Only when the screen can have changed: a live resize lays out twice per step.
+        if screenValuesStale {
+            screenValuesStale = window == nil // a view with no window has no screen to keep
+            presenter.setPanel(Self.panelInfo(window?.screen ?? NSScreen.main))
+        }
+        presenter.layout(in: bounds, contentsScale: window?.backingScaleFactor ?? 1)
         displayLayer.videoGravity = SessionPresenter.gravity(VideoFit(name: connection?.settings.videoFit))
-        // Present routing tracks the window's composited state (fullscreen transitions always
-        // re-layout, so this stays current): a windowed session presents through a Core Animation
-        // transaction — the DCP swapID kernel-panic mitigation (see SessionPresenter.setComposited).
-        // A view not yet in a window counts as composited (the safe default).
-        presenter.setComposited(!(window?.styleMask.contains(.fullScreen) ?? false))
         // Feed the follower only once in a window (backing scale is real then) and with real
         // bounds — a pre-window layout would report point-sized dimensions.
         if window != nil, bounds.width > 0, bounds.height > 0 {
@@ -1098,8 +1137,18 @@ public final class StreamLayerView: NSView {
         return screen.maximumRefreshInterval - screen.minimumRefreshInterval > 0.001
     }
 
+    /// The screen's refresh range and the step its interval moves in (0 = any interval).
+    static func panelInfo(_ screen: NSScreen?) -> PanelInfo {
+        guard let screen, screen.minimumRefreshInterval > 0, screen.maximumRefreshInterval > 0
+        else { return PanelInfo(minHz: 0, maxHz: 0) }
+        return PanelInfo(
+            minHz: 1 / screen.maximumRefreshInterval, maxHz: 1 / screen.minimumRefreshInterval,
+            granularity: screen.displayUpdateGranularity)
+    }
+
     public override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
+        screenValuesStale = true
         layoutPresenter() // backing scale changed (e.g. moved to a non-retina display)
     }
 
@@ -1132,6 +1181,7 @@ public final class StreamLayerView: NSView {
         cursorChannelActive = false
         cursorState = nil
         hostCursors.removeAll()
+        lastWornShape = nil
         sentClientDraws = nil
         window?.invalidateCursorRects(for: self)
     }

@@ -20,24 +20,29 @@
 //! pointer UI (`webos-pointer-ui-overhaul.md` D3). No stability promise; a
 //! kit change there is a re-pin plus a compile fix, by design.
 
-// The shell runs on Linux, Windows, Android and wasm. Cargo.toml gates every
-// dependency on the same list, so macOS gets an empty crate — the Mac client is
-// clients/apple.
+// The shell runs on Linux, Windows, Android, wasm and Apple's platforms (Metal there; the
+// Mac also runs the tests). Cargo.toml gates every dependency on the same list.
 #![cfg(any(
     target_os = "linux",
     windows,
     target_os = "android",
+    target_vendor = "apple",
     target_family = "wasm"
 ))]
 
 pub mod anim;
 pub mod art_stats;
+mod blur;
 pub mod brand;
+pub mod bridge;
 // The sort/group policy moved to pf-client-core so the GTK and WinUI dialogs share it rather
 // than growing a second order. Aliased here because every screen names `crate::collate`.
 pub(crate) use pf_client_core::collate;
 pub mod console;
+pub mod coverflow;
+pub mod el;
 pub mod glyphs;
+pub mod grid;
 pub mod icons;
 pub mod input;
 pub mod launcher_icons;
@@ -45,6 +50,7 @@ pub mod library;
 pub mod model;
 pub mod os_marks;
 pub mod os_theme;
+pub mod palette;
 pub mod platform;
 pub mod pointer;
 // In-stream ring: the desktop overlay hosts it, and so does a GL shell (webOS) through
@@ -59,24 +65,29 @@ mod skia_overlay;
 /// same rows out its own way (the webOS pointer UI's page map). Same kit terms as
 /// [`widgets`]: one consumer, no stability promise.
 pub mod settings_rows {
-    pub use crate::screens::settings::{adjust, detail, row_applies, row_on, row_spec, RowId};
-    pub use crate::screens::Ctx;
+    pub use crate::screens::settings::{
+        adjust, advanced, changed, detail, row_applies, row_on, row_spec, RowId,
+    };
+    pub use crate::screens::{Ctx, Device};
 }
 pub mod store;
 pub mod theme;
 pub mod widgets;
 
 pub use art_stats::{art_stats, ArtStats};
+pub use blur::{set_style_override, Style as BackdropStyle};
 pub use console::{Console, ConsoleEntry, ConsoleHandles, InputSource, Insets, Viewport};
 pub use input::Key;
 pub use library::decode_poster_off_thread;
 pub use library::{DecodedPoster, LibraryGame, LibraryPhase, LibraryShared, Stale};
 pub use model::{
-    ConsoleBus, ConsoleCmd, ConsoleShared, HostAction, HostRow, PairPhase, PresetChip, SpeedPhase,
-    SpeedStatus, WakeStatus,
+    ConsoleBus, ConsoleCmd, ConsoleShared, HostAction, HostRow, LicenseSection, OtherDevice,
+    PadTestState, PairPhase, PresetChip, SpeedPhase, SpeedStatus, WakeStatus,
 };
 pub use platform::{Platform, PlatformScreen};
 pub use ring::Ring;
+pub use screens::prompt::Prompt;
+pub use screens::EditField;
 pub use shell::{ConsoleOptions, DeviceScreen, DEFAULT_GPU_CACHE_BYTES, MIN_GPU_CACHE_BYTES};
 #[cfg(all(any(target_os = "linux", windows), feature = "vulkan-overlay"))]
 pub use skia_overlay::SkiaOverlay;

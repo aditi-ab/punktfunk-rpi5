@@ -23,7 +23,8 @@
 mod cli {
     use pf_client_core::deeplink::{self, DeepLink, HostResolution};
     use pf_client_core::orchestrate::{
-        self, ConnectPlan, PlanOutcome, SessionEvent, WakeOutcome, WakeWait,
+        self, ConnectOutcome, ConnectPlan, PlanOutcome, SessionEvent, WakeOutcome, WakeTick,
+        WAKE_TIMEOUT_SECS,
     };
     use pf_client_core::presets::PresetsFile;
     use pf_client_core::trust::{self, KnownHost, KnownHosts, Settings};
@@ -31,9 +32,8 @@ mod cli {
     use std::time::Duration;
 
     pub const OK: u8 = 0;
-    pub const CONNECT_FAILED: u8 = 2;
-    pub const TRUST_REJECTED: u8 = 3;
-    pub const RENDERER_FAILED: u8 = 4;
+    // The session's own codes pass through; 5 and 6 are the CLI's.
+    pub use orchestrate::exit::{CONNECT_FAILED, RENDERER_FAILED, TRUST_REJECTED};
     /// Nothing here matches what you named (host, preset, game).
     pub const UNRESOLVED: u8 = 5;
     /// Refused because it needs a person: pairing, or trusting an unknown host.
@@ -57,6 +57,7 @@ punktfunk — the Punktfunk client, headless
   punktfunk default-host [<host-ref>] [--clear]
   punktfunk wake <host-ref> [--wait]
   punktfunk library [<host-ref>] [--json]
+  punktfunk end-game [<host-ref>] --game ID
   punktfunk launch [<host-ref>] [--game ID] [--preset REF] [--request-access]
                                 [--exec] [--fullscreen]
   punktfunk open <punktfunk://…> [--yes]
@@ -130,8 +131,9 @@ punktfunk hosts — the saved-hosts store (shared with the desktop client)
       a changed identity is a decision for a person.
 
   punktfunk hosts forget <host-ref>
-      Remove a saved host, its pinned fingerprint included. A later connect
-      must pair or trust it again."
+      Remove a saved host with its pinned fingerprint and cached game list,
+      and stop opening on it by default. A later connect must pair or trust
+      it again."
             }
             "default-host" => {
                 "\
@@ -169,6 +171,18 @@ this. Needs a paired host (exit 6 otherwise).
 
 With no <host-ref> it asks the default host (`punktfunk default-host`), and
 exits 5 when there is none."
+            }
+            "end-game" => {
+                "\
+punktfunk end-game [<host-ref>] --game ID — end a title this device launched
+
+Asks the host to close the game, live stream included. The host ends only a
+title this device launched; one another device started stays up. Prints the
+outcome on stdout.
+
+Exit 0 when it ended, 5 when the host had nothing of it running, 3 when this
+device's access expired, 2 when the host couldn't be asked or is too old,
+6 when the host isn't paired."
             }
             "launch" => {
                 "\
@@ -420,6 +434,7 @@ from the config directory for a true factory reset."
             "default-host" => default_host_cmd(&rest),
             "wake" => wake(&rest),
             "library" => library_cmd(&rest),
+            "end-game" => end_game_cmd(&rest),
             "launch" => launch(&rest),
             "open" => open(&rest),
             "reachable" => reachable(&rest),
@@ -518,6 +533,10 @@ from the config directory for a true factory reset."
                         "mgmt": d.mgmt_port.unwrap_or(0),
                         "os": d.os,
                         "saved": saved.is_some(),
+                        // The record's stable id, so a consumer pairs the advert with the row
+                        // it already listed instead of re-deriving the match. `null` when the
+                        // record predates ids: this verb reads the store and never mints.
+                        "saved_id": saved.and_then(|h| h.id.as_deref()),
                         "paired": saved.is_some_and(|h| h.paired),
                     })
                 })
@@ -544,13 +563,13 @@ from the config directory for a true factory reset."
         OK
     }
 
-    /// The saved record an advert belongs to, if any: fingerprint first, address second.
+    /// The saved record an advert belongs to, if any: an exact fingerprint first, then
+    /// [`same_host`](pf_client_core::discovery::same_host).
     ///
-    /// Fingerprint FIRST is deliberate and load-bearing — a host that moved to a new DHCP lease
-    /// still matches its record, and a *different* host that inherited the old address does not
-    /// inherit its pairing. This is the rule the plugin's `mergeHosts` and the shells' hosts
-    /// pages already use; keeping one copy is what stops two surfaces disagreeing about whether
-    /// the box in front of you is paired.
+    /// Two known fingerprints settle it on their own, so a host that moved lease still matches
+    /// its record and a different box at the old address (the other OS of a dual-boot machine,
+    /// or whoever inherited the lease) does not inherit its pairing. The plugin's `mergeHosts`
+    /// and the shells' hosts pages use the same rule.
     fn match_saved<'a>(
         known: &'a KnownHosts,
         advert: &pf_client_core::discovery::DiscoveredHost,
@@ -558,16 +577,12 @@ from the config directory for a true factory reset."
         known
             .hosts
             .iter()
-            .find(|h| {
-                !h.fp_hex.is_empty()
-                    && !advert.fp_hex.is_empty()
-                    && h.fp_hex.eq_ignore_ascii_case(&advert.fp_hex)
-            })
+            .find(|h| !h.fp_hex.is_empty() && h.fp_hex.eq_ignore_ascii_case(&advert.fp_hex))
             .or_else(|| {
                 known
                     .hosts
                     .iter()
-                    .find(|h| h.addr == advert.addr && h.port == advert.port)
+                    .find(|h| pf_client_core::discovery::same_host(h, advert))
             })
     }
 
@@ -606,7 +621,7 @@ from the config directory for a true factory reset."
         match trust::pair_with_host(&addr, port, &identity, &pin, &name) {
             Ok(fp) => {
                 let fp_hex = trust::hex(&fp);
-                if let Err(e) = trust::persist_host(&addr, &addr, port, &fp_hex, true) {
+                if let Err(e) = trust::persist_host(&addr, &addr, port, &fp_hex, true, &[]) {
                     eprintln!("couldn't save the host: {e:#}");
                 }
                 trust::forget_placeholder(&addr, port);
@@ -734,8 +749,7 @@ from the config directory for a true factory reset."
                     .position(|h| !fp.is_empty() && h.fp_hex.eq_ignore_ascii_case(&fp))
                 {
                     let was = format!("{}:{}", known.hosts[i].addr, known.hosts[i].port);
-                    known.hosts[i].addr = addr.clone();
-                    known.hosts[i].port = port;
+                    known.hosts[i].move_to(&addr, port);
                     return match known.save() {
                         Ok(()) => {
                             println!("moved {was} to {addr}:{port}");
@@ -774,9 +788,8 @@ from the config directory for a true factory reset."
                     Ok(v) => v,
                     Err(code) => return code,
                 };
-                let gone = known.hosts.remove(i);
-                match known.save() {
-                    Ok(()) => {
+                match orchestrate::forget_host(&mut known, i) {
+                    Ok(gone) => {
                         println!("forgot {}", gone.name);
                         OK
                     }
@@ -857,8 +870,8 @@ from the config directory for a true factory reset."
         AddOutcome::Pinned
     }
 
-    /// `wake <host-ref> [--wait]` — a magic packet, and with `--wait` the same bounded
-    /// wake-and-wait the shells run (`WakeWait`: a packet every 6 s, presence polled every
+    /// `wake <host-ref> [--wait]` — a magic packet, and with `--wait` the bounded wake-and-wait
+    /// the console runs (`orchestrate::wake_by_probe`: a packet every 6 s, a probe every
     /// second, 90 s budget).
     fn wake(args: &[String]) -> u8 {
         let Some(reference) = positional(args, 0) else {
@@ -881,29 +894,23 @@ from the config directory for a true factory reset."
             println!("sent a wake packet to {}", host.name);
             return OK;
         }
-        let mut wait = WakeWait::new();
-        loop {
-            let online = trust::probe_reachable_many(
-                vec![(host.addr.clone(), host.port, host.fp_hex.clone())],
-                Duration::from_millis(900),
-            )
-            .first()
-            .copied()
-            .unwrap_or(false);
-            let tick = wait.tick(online);
-            if tick.send_packet {
-                wol::wake(&host.mac, host.addr.parse().ok());
+        let last =
+            orchestrate::wake_by_probe(&host.addr, host.port, &host.fp_hex, &host.mac, |_| true);
+        match last {
+            Some(WakeTick {
+                outcome: Some(WakeOutcome::Online),
+                seconds,
+                ..
+            }) => {
+                println!("{} is up after {seconds}s", host.name);
+                OK
             }
-            match tick.outcome {
-                Some(WakeOutcome::Online) => {
-                    println!("{} is up after {}s", host.name, tick.seconds);
-                    return OK;
-                }
-                Some(WakeOutcome::TimedOut) => {
-                    eprintln!("{} didn't come online within {}s", host.name, tick.seconds);
-                    return CONNECT_FAILED;
-                }
-                None => std::thread::sleep(Duration::from_secs(1)),
+            _ => {
+                eprintln!(
+                    "{} didn't come online within {WAKE_TIMEOUT_SECS}s",
+                    host.name
+                );
+                CONNECT_FAILED
             }
         }
     }
@@ -956,6 +963,48 @@ from the config directory for a true factory reset."
                 eprintln!("library: {e}");
                 CONNECT_FAILED
             }
+        }
+    }
+
+    /// `end-game [<host-ref>] --game ID` — close a title this device launched on the host.
+    fn end_game_cmd(args: &[String]) -> u8 {
+        let usage = "punktfunk end-game [<host-ref>] --game ID";
+        let Some(game) = value(args, "--game") else {
+            eprintln!("usage: {usage}");
+            return UNRESOLVED;
+        };
+        let (known, i) = match resolve_or_default(args, usage) {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+        let host = &known.hosts[i];
+        let Some(pin) = trust::parse_hex32(&host.fp_hex) else {
+            eprintln!(
+                "{} isn't paired yet — punktfunk pair {}",
+                host.name, host.addr
+            );
+            return NEEDS_INTERACTION;
+        };
+        let identity = match trust::load_or_create_identity() {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("client identity: {e:#}");
+                return CONNECT_FAILED;
+            }
+        };
+        let outcome = library::end_game(
+            &host.addr,
+            host.effective_mgmt_port(),
+            &identity,
+            Some(pin),
+            &game,
+        );
+        println!("{}", outcome.notice(&game));
+        match outcome {
+            library::GameEnd::Ended => OK,
+            library::GameEnd::NotRunning => UNRESOLVED,
+            library::GameEnd::Expired => TRUST_REJECTED,
+            library::GameEnd::Unsupported | library::GameEnd::Failed(_) => CONNECT_FAILED,
         }
     }
 
@@ -1084,45 +1133,26 @@ from the config directory for a true factory reset."
         }
         // Wake first when the host is asleep and we know how to reach it. This is the thing the
         // old exec-style CLI never did: it fired a packet at best and dialled into the void.
+        let fp = plan.host.fp_hex.as_deref().unwrap_or_default();
         if plan.wake
-            && !trust::probe_reachable_many(
-                vec![(
-                    plan.host.addr.clone(),
-                    plan.host.port,
-                    plan.host.fp_hex.clone().unwrap_or_default(),
-                )],
+            && !trust::probe_one(
+                &plan.host.addr,
+                plan.host.port,
+                fp,
                 Duration::from_millis(900),
             )
-            .first()
-            .copied()
-            .unwrap_or(false)
         {
             eprintln!("waking {}…", plan.host.name);
-            let mut wait = WakeWait::new();
-            loop {
-                let online = trust::probe_reachable_many(
-                    vec![(
-                        plan.host.addr.clone(),
-                        plan.host.port,
-                        plan.host.fp_hex.clone().unwrap_or_default(),
-                    )],
-                    Duration::from_millis(900),
-                )
-                .first()
-                .copied()
-                .unwrap_or(false);
-                let tick = wait.tick(online);
-                if tick.send_packet {
-                    wol::wake(&plan.host.mac, plan.host.addr.parse().ok());
-                }
-                match tick.outcome {
-                    Some(WakeOutcome::Online) => break,
-                    Some(WakeOutcome::TimedOut) => {
-                        eprintln!("{} didn't come online", plan.host.name);
-                        return CONNECT_FAILED;
-                    }
-                    None => std::thread::sleep(Duration::from_secs(1)),
-                }
+            let last = orchestrate::wake_by_probe(
+                &plan.host.addr,
+                plan.host.port,
+                fp,
+                &plan.host.mac,
+                |_| true,
+            );
+            if last.and_then(|t| t.outcome) != Some(WakeOutcome::Online) {
+                eprintln!("{} didn't come online", plan.host.name);
+                return CONNECT_FAILED;
             }
         }
         if let Some(p) = &plan.preset {
@@ -1157,6 +1187,7 @@ from the config directory for a true factory reset."
                                 plan.host.port,
                                 fp_hex,
                                 true,
+                                &[],
                             ) {
                                 eprintln!("couldn't save the host: {e:#}");
                             }
@@ -1169,20 +1200,21 @@ from the config directory for a true factory reset."
                     trust_rejected,
                 } => failure = Some((msg, trust_rejected)),
                 SessionEvent::Ended(reason) => eprintln!("{reason}"),
-                // Persisted by the brain on the way past; nothing to report here.
-                SessionEvent::Window { .. } => {}
+                // The window size is persisted by the brain on the way past.
+                SessionEvent::Window { .. } | SessionEvent::Stats(_) => {}
+                // `ended` is printed as it arrives; its absence changes no exit code.
                 SessionEvent::Exited(code) => {
-                    return match failure {
-                        Some((msg, true)) => {
+                    return match ConnectOutcome::from_exit(code, failure.take(), None, false) {
+                        ConnectOutcome::TrustRejected(msg) => {
                             eprintln!("{msg}");
                             TRUST_REJECTED
                         }
-                        Some((msg, false)) => {
+                        ConnectOutcome::ConnectFailed(msg) => {
                             eprintln!("{msg}");
                             CONNECT_FAILED
                         }
-                        None if code == 0 => OK,
-                        None => RENDERER_FAILED,
+                        ConnectOutcome::RendererFailed { .. } => RENDERER_FAILED,
+                        ConnectOutcome::Ended(_) | ConnectOutcome::Cancelled => OK,
                     };
                 }
             }
@@ -1247,30 +1279,24 @@ from the config directory for a true factory reset."
                 return CONNECT_FAILED;
             }
         };
-        let client = match punktfunk_core::client::NativeClient::connect(
-            &host.addr,
-            host.port,
-            punktfunk_core::config::Mode {
-                width: 1280,
-                height: 720,
-                refresh_hz: 60,
-            },
-            punktfunk_core::config::CompositorPref::Auto,
-            punktfunk_core::config::GamepadPref::Auto,
-            0,     // bitrate_kbps: the host's default; this connect never presents
-            0,     // video_caps: nothing decodes here
-            2,     // audio_channels
-            0,     // video_codecs: the probe carries no video
-            0,     // preferred_codec
-            None,  // display_hdr
-            0,     // client_caps: nothing renders a cursor
-            false, // frame_parts: probe/whole-AU consumer
-            None,  // launch
-            Some(punktfunk_core::client::device_name()),
-            Some(pin),
-            Some(identity),
-            Duration::from_secs(15),
-        ) {
+        // Every Hello field at its default: this connect only runs the probe and never presents.
+        let mode = punktfunk_core::config::Mode {
+            width: 1280,
+            height: 720,
+            refresh_hz: 60,
+        };
+        let params = punktfunk_core::client::ConnectParams {
+            name: Some(punktfunk_core::client::device_name()),
+            pin: Some(pin),
+            identity: Some(identity),
+            ..punktfunk_core::client::ConnectParams::new(
+                &host.addr,
+                host.port,
+                mode,
+                Duration::from_secs(15),
+            )
+        };
+        let client = match punktfunk_core::client::NativeClient::connect(params) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("connect: {e:?}");
@@ -1401,6 +1427,45 @@ from the config directory for a true factory reset."
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// The other OS of a dual-boot box answers at the saved one's lease with its own pin.
+        /// It is not that record, so `discover` must not call it saved or paired.
+        #[test]
+        fn a_second_os_at_a_saved_address_is_not_saved() {
+            let saved = KnownHost {
+                addr: "192.168.1.9".into(),
+                port: 9777,
+                fp_hex: "aa".into(),
+                paired: true,
+                ..Default::default()
+            };
+            let known = KnownHosts { hosts: vec![saved] };
+            let mut advert = pf_client_core::discovery::DiscoveredHost {
+                key: "id-2".into(),
+                fullname: "desk._punktfunk._udp.local.".into(),
+                name: "desk".into(),
+                addr: "192.168.1.9".into(),
+                port: 9777,
+                fp_hex: "bb".into(),
+                pair: "required".into(),
+                mgmt_port: None,
+                mac: vec![],
+                os: String::new(),
+            };
+            assert!(match_saved(&known, &advert).is_none());
+            advert.fp_hex = "AA".into();
+            advert.addr = "192.168.1.20".into();
+            assert!(
+                match_saved(&known, &advert).is_some(),
+                "a moved lease keeps its record"
+            );
+            advert.fp_hex = String::new();
+            advert.addr = "192.168.1.9".into();
+            assert!(
+                match_saved(&known, &advert).is_some(),
+                "no pin: the address decides"
+            );
+        }
 
         fn argv(v: &[&str]) -> Vec<String> {
             v.iter().map(|s| s.to_string()).collect()

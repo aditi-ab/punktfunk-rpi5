@@ -1,7 +1,7 @@
-//! Virtual Nintendo Switch Pro Controller on `/dev/uhid`, bound by `hid-nintendo`
-//! (≥ 5.16). Codec and canned replies live in [`super::switch_proto`]; this file
-//! is the UHID plumbing that answers the driver's probe from [`UhidManager`]'s
-//! `service` pass.
+//! Virtual Nintendo Switch pads on `/dev/uhid`, bound by `hid-nintendo` (≥ 5.16): the Pro
+//! Controller, and a Joy-Con pair as two Bluetooth halves that SDL and Steam combine. State
+//! mapping lives in [`super::switch_proto`], the replies in `pf_driver_proto::switch`; this file
+//! is the UHID plumbing that answers the driver's probe from [`UhidManager`]'s `service` pass.
 //!
 //! `hid-nintendo` is not DualSense's three GET_REPORTs: it runs a blocking probe
 //! (`0x80` USB commands, then subcommands for device info, SPI calibration, IMU,
@@ -13,187 +13,129 @@
 //! re-runs the whole init; nothing probe-specific is latched here.
 
 use super::switch_proto::{
-    build_subcmd_reply, build_usb_ack, device_info_payload, parse_output, player_leds_bits,
-    serialize_report_0x30, spi_flash_read, switch_mac, SwitchOutput, SwitchState, PROCON_RDESC,
-    SWITCH_PRODUCT, SWITCH_REPORT_LEN, SWITCH_VENDOR,
+    parse_output, player_leds_bits, serialize_for, Half, SwitchOutput, SwitchState, SWITCH_PRODUCT,
+    SWITCH_VENDOR,
 };
-use crate::uhid_abi::{
-    put_cstr, BUS_USB, HID_MAX_DESCRIPTOR_SIZE, UHID_CREATE2, UHID_DESTROY, UHID_EVENT_SIZE,
-    UHID_GET_REPORT, UHID_GET_REPORT_REPLY, UHID_INPUT2, UHID_OUTPUT, UHID_PATH,
-};
+use crate::uhid_abi::{Create2, UhidDevice, UhidEvent};
 use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
-use anyhow::{Context, Result};
+use anyhow::Result;
+use pf_driver_proto::gamepad::DEVTYPE_SWITCH_PRO;
+use pf_driver_proto::switch as wire;
 use punktfunk_core::quic::{HidOutput, RichInput};
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
 
-/// Virtual Pro Controller on `/dev/uhid`. Drop sends `UHID_DESTROY` and unbinds `hid-nintendo`.
-pub struct SwitchProPad {
-    fd: File,
+/// One virtual Switch pad on `/dev/uhid`: a Pro Controller or one Joy-Con half. Drop unbinds
+/// `hid-nintendo`.
+pub struct SwitchPad {
+    dev: UhidDevice,
+    device_type: u8,
     index: u8,
     /// Rolling report timer (byte 1 of every input report).
     timer: u8,
     /// Last written state. Subcommand replies embed this header so probe reports stay coherent.
     state: SwitchState,
+    /// The last output's rumble as `(side 0, side 1)`; a half drives only its own side.
+    rumble: (u16, u16),
 }
 
-impl SwitchProPad {
-    /// `index` is name/uniq and the virtual MAC.
-    pub fn open(index: u8) -> Result<SwitchProPad> {
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(UHID_PATH)
-            .with_context(|| {
-                format!("open {UHID_PATH} (is the 60-punktfunk.rules uhid rule installed + are you in 'input'?)")
-            })?;
-        let mut pad = SwitchProPad {
-            fd,
+impl SwitchPad {
+    /// `index` is name/uniq and the virtual MAC. A Pro is a USB pad, so `hid-nintendo` runs its
+    /// USB probe; a Joy-Con half is a Bluetooth one, as the real pads are.
+    pub fn open(index: u8, device_type: u8) -> Result<SwitchPad> {
+        let (bus, product, name, tag) = match Half::of(device_type) {
+            None => (
+                crate::uhid_abi::BUS_USB,
+                SWITCH_PRODUCT,
+                "Switch Pro Controller",
+                "switchpro",
+            ),
+            Some(Half::Left) => (
+                crate::uhid_abi::BUS_BLUETOOTH,
+                Half::Left.product(),
+                "Joy-Con (L)",
+                "joycon-l",
+            ),
+            Some(Half::Right) => (
+                crate::uhid_abi::BUS_BLUETOOTH,
+                Half::Right.product(),
+                "Joy-Con (R)",
+                "joycon-r",
+            ),
+        };
+        let dev = UhidDevice::open(&Create2 {
+            bus,
+            name: &format!("Punktfunk {name} {index}"),
+            phys: &format!("punktfunk/{tag}/{index}"),
+            uniq: &format!("punktfunk-{tag}-{index}"),
+            rdesc: &wire::RDESC,
+            vendor: SWITCH_VENDOR,
+            product,
+            version: 0x0200, // bcdDevice 2.00
+        })?;
+        Ok(SwitchPad {
+            dev,
+            device_type,
             index,
             timer: 0,
             state: SwitchState::neutral(),
-        };
-        pad.send_create2(index).context("UHID_CREATE2 Switch Pro")?;
-        Ok(pad)
+            rumble: (0, 0),
+        })
     }
 
-    fn send_create2(&mut self, index: u8) -> Result<()> {
-        let mut ev = [0u8; UHID_EVENT_SIZE];
-        ev[0..4].copy_from_slice(&UHID_CREATE2.to_ne_bytes());
-        // uhid_create2_req at 4: name[128] phys[64] uniq[64] rd_size bus vid pid version country rd_data.
-        // BUS_USB selects hid-nintendo's USB probe, not Bluetooth.
-        put_cstr(
-            &mut ev,
-            4,
-            128,
-            &format!("Punktfunk Switch Pro Controller {index}"),
-        );
-        put_cstr(&mut ev, 132, 64, &format!("punktfunk/switchpro/{index}"));
-        put_cstr(&mut ev, 196, 64, &format!("punktfunk-swpro-{index}"));
-        ev[260..262].copy_from_slice(&(PROCON_RDESC.len() as u16).to_ne_bytes());
-        ev[262..264].copy_from_slice(&BUS_USB.to_ne_bytes());
-        ev[264..268].copy_from_slice(&SWITCH_VENDOR.to_ne_bytes());
-        ev[268..272].copy_from_slice(&SWITCH_PRODUCT.to_ne_bytes());
-        ev[272..276].copy_from_slice(&0x0200u32.to_ne_bytes()); // bcdDevice 2.00
-        ev[276..280].copy_from_slice(&0u32.to_ne_bytes());
-        ev[280..280 + PROCON_RDESC.len()].copy_from_slice(PROCON_RDESC);
-        self.fd.write_all(&ev).context("write UHID_CREATE2")?;
-        Ok(())
-    }
-
-    fn write_report(&mut self, r: &[u8; SWITCH_REPORT_LEN]) -> Result<()> {
-        let mut ev = [0u8; UHID_EVENT_SIZE];
-        ev[0..4].copy_from_slice(&UHID_INPUT2.to_ne_bytes());
-        // uhid_input2_req: size u16 at 4, data at 6.
-        ev[4..6].copy_from_slice(&(r.len() as u16).to_ne_bytes());
-        ev[6..6 + r.len()].copy_from_slice(r);
-        self.fd.write_all(&ev).context("write UHID_INPUT2")?;
-        Ok(())
+    /// A Pro Controller at `index`.
+    pub fn pro(index: u8) -> Result<SwitchPad> {
+        SwitchPad::open(index, DEVTYPE_SWITCH_PRO)
     }
 
     pub fn write_state(&mut self, st: &SwitchState) -> Result<()> {
         self.state = *st;
         self.timer = self.timer.wrapping_add(1);
-        let r = serialize_report_0x30(st, self.timer);
-        self.write_report(&r)
-    }
-
-    fn answer_subcmd(&mut self, id: u8, args: &[u8]) {
-        self.timer = self.timer.wrapping_add(1);
-        let st = self.state;
-        let reply = match id {
-            // Device info: probe aborts without it. Hardware acks with 0x82.
-            0x02 => build_subcmd_reply(
-                &st,
-                self.timer,
-                0x82,
-                id,
-                &device_info_payload(&switch_mac(self.index)),
-            ),
-            // SPI flash: unknown addresses read as zero. Kernel and SDL ask for
-            // the same calibration in different shapes — see `spi_flash_read`.
-            0x10 => {
-                let addr = args
-                    .get(..4)
-                    .map(|a| u32::from_le_bytes([a[0], a[1], a[2], a[3]]))
-                    .unwrap_or(0);
-                let len = args.get(4).copied().unwrap_or(0);
-                let payload = spi_flash_read(addr, len);
-                build_subcmd_reply(&st, self.timer, 0x90, id, &payload)
-            }
-            // Input mode 0x03, IMU 0x40, vibration 0x48, lights 0x30/0x38, …: ack + echoed id.
-            _ => build_subcmd_reply(&st, self.timer, 0x80, id, &[]),
-        };
-        let _ = self.write_report(&reply);
+        let r = serialize_for(self.device_type, st, self.timer);
+        self.dev.write_input(&r)
     }
 
     /// Drain UHID events. Each probe step blocks `hid-nintendo` until answered; call often.
+    /// A handshake command or subcommand is answered as the Windows driver does. Every `0x80`
+    /// is acked, including no-timeout (0x04): that skips the driver's 2 × 100 ms wait. Rumble
+    /// comes back as `(side 0, side 1)`.
     pub fn service(&mut self, pad: u8) -> PadFeedback {
         let mut fb = PadFeedback::default();
-        let mut ev = [0u8; UHID_EVENT_SIZE];
-        while let Ok(n) = self.fd.read(&mut ev) {
-            if n < UHID_EVENT_SIZE {
-                break;
-            }
-            match u32::from_ne_bytes([ev[0], ev[1], ev[2], ev[3]]) {
-                UHID_OUTPUT => {
-                    // uhid_output_req: data[4096] at [4..4100], size u16 at [4100..4102].
-                    let size = u16::from_ne_bytes([ev[4100], ev[4101]]) as usize;
-                    let end = 4 + size.min(HID_MAX_DESCRIPTOR_SIZE);
-                    match parse_output(&ev[4..end]) {
-                        Some(SwitchOutput::UsbCmd(cmd)) => {
-                            // Ack every 0x80, including no-timeout (0x04): skips the driver's 2 × 100 ms wait.
-                            let _ = self.write_report(&build_usb_ack(cmd));
+        let (timer, state, index, dt) =
+            (&mut self.timer, &self.state, self.index, self.device_type);
+        let last = &mut self.rumble;
+        self.dev.poll(|dev, ev| match ev {
+            UhidEvent::Output(data) => {
+                match parse_output(data) {
+                    Some(SwitchOutput::Subcmd { id, args, rumble }) => {
+                        *last = rumble;
+                        // No trigger motors on this protocol — see `PadFeedback::rumble`.
+                        fb.rumble = Some((rumble.0, rumble.1, 0, 0));
+                        // Player lights are the subcommand payload; the reply still acks it.
+                        if let (0x30, Some(&arg)) = (id, args.first()) {
+                            fb.hidout.push(HidOutput::PlayerLeds {
+                                pad,
+                                bits: player_leds_bits(arg),
+                            });
                         }
-                        Some(SwitchOutput::Subcmd { id, args, rumble }) => {
-                            // No trigger motors on this protocol — see `PadFeedback::rumble`.
-                            fb.rumble = Some((rumble.0, rumble.1, 0, 0));
-                            if id == 0x30 {
-                                // Player lights are the subcommand payload; still ack via `answer_subcmd`.
-                                if let Some(&arg) = args.first() {
-                                    fb.hidout.push(HidOutput::PlayerLeds {
-                                        pad,
-                                        bits: player_leds_bits(arg),
-                                    });
-                                }
-                            }
-                            self.answer_subcmd(id, &args);
-                        }
-                        Some(SwitchOutput::Rumble(r)) => fb.rumble = Some((r.0, r.1, 0, 0)),
-                        None => {}
                     }
+                    Some(SwitchOutput::Rumble(r)) => {
+                        *last = r;
+                        fb.rumble = Some((r.0, r.1, 0, 0));
+                    }
+                    Some(SwitchOutput::UsbCmd(_)) | None => {}
                 }
-                UHID_GET_REPORT => {
-                    // hid-nintendo never GET_REPORTs; EIO so a stray request cannot block.
-                    let req_id = u32::from_ne_bytes([ev[4], ev[5], ev[6], ev[7]]);
-                    let _ = self.reply_get_report_err(req_id);
+                *timer = timer.wrapping_add(1);
+                let report = serialize_for(dt, state, *timer);
+                if let Some(reply) = wire::reply(&report, data, dt, index) {
+                    let _ = dev.write_input(&reply);
                 }
-                _ => {}
             }
-        }
+            // hid-nintendo never GET_REPORTs; EIO so a stray request cannot block.
+            UhidEvent::GetReport { id, .. } => {
+                let _ = dev.reply_get_report(id, None);
+            }
+            UhidEvent::SetReport(_) => {}
+        });
         fb
-    }
-
-    fn reply_get_report_err(&mut self, id: u32) -> Result<()> {
-        let mut ev = [0u8; UHID_EVENT_SIZE];
-        ev[0..4].copy_from_slice(&UHID_GET_REPORT_REPLY.to_ne_bytes());
-        // uhid_get_report_reply_req: id u32 [4..8], err u16 [8..10], size u16 [10..12].
-        ev[4..8].copy_from_slice(&id.to_ne_bytes());
-        ev[8..10].copy_from_slice(&5u16.to_ne_bytes()); // EIO
-        self.fd
-            .write_all(&ev)
-            .context("write UHID_GET_REPORT_REPLY")?;
-        Ok(())
-    }
-}
-
-impl Drop for SwitchProPad {
-    fn drop(&mut self) {
-        let mut ev = [0u8; UHID_EVENT_SIZE];
-        ev[0..4].copy_from_slice(&UHID_DESTROY.to_ne_bytes());
-        let _ = self.fd.write_all(&ev);
     }
 }
 
@@ -213,14 +155,14 @@ impl Default for SwitchProProto {
 }
 
 impl PadProto for SwitchProProto {
-    type Pad = SwitchProPad;
+    type Pad = SwitchPad;
     type State = SwitchState;
     const LABEL: &'static str = "Switch Pro";
     const DEVICE: &'static str = "Switch Pro Controller";
     const CREATE_HINT: &'static str = "";
 
-    fn open(&mut self, idx: u8) -> Result<SwitchProPad> {
-        let p = SwitchProPad::open(idx)?;
+    fn open(&mut self, idx: u8) -> Result<SwitchPad> {
+        let p = SwitchPad::pro(idx)?;
         tracing::info!(
             index = idx,
             "virtual Switch Pro Controller created (UHID hid-nintendo)"
@@ -228,52 +170,25 @@ impl PadProto for SwitchProProto {
         Ok(p)
     }
 
-    fn neutral(&self) -> SwitchState {
-        SwitchState::neutral()
-    }
-
-    /// Button/stick/trigger frame. Keep prev motion — it arrives on the rich plane.
     fn merge_frame(
         &self,
         prev: &SwitchState,
         f: &punktfunk_core::input::GamepadFrame,
     ) -> SwitchState {
         let buttons = crate::steam_remap::fold_paddles(f.buttons, self.remap.paddles);
-        let mut s = SwitchState::from_gamepad(
-            buttons,
-            f.ls_x,
-            f.ls_y,
-            f.rs_x,
-            f.rs_y,
-            f.left_trigger,
-            f.right_trigger,
-        );
-        s.gyro = prev.gyro;
-        s.accel = prev.accel;
-        s
+        SwitchState::merge_frame(prev, f, buttons)
     }
 
-    /// IMU samples only; a Pro Controller has no touchpad.
     fn apply_rich(&self, st: &mut SwitchState, rich: RichInput) {
-        if let RichInput::Motion { gyro, accel, .. } = rich {
-            st.apply_motion(gyro, accel);
-        }
+        st.apply_rich(rich);
     }
 
-    fn neutralize_gyro(&self, st: &mut SwitchState) -> bool {
-        st.neutralize_gyro()
-    }
-
-    fn clear_rich(&self, st: &mut SwitchState) {
-        st.clear_rich();
-    }
-
-    fn write_state(&self, pad: &mut SwitchProPad, st: &SwitchState) {
+    fn write_state(&self, pad: &mut SwitchPad, st: &SwitchState) {
         let _ = pad.write_state(st);
     }
 
     /// Probe conversation + feedback: HD-rumble on 0xCA, player lights on 0xCD.
-    fn service(&self, pad: &mut SwitchProPad, idx: u8) -> PadFeedback {
+    fn service(&self, pad: &mut SwitchPad, idx: u8) -> PadFeedback {
         let mut fb = pad.service(idx);
         // hid-nintendo embeds rumble in every command, so a poll that saw rumble is
         // the activity signal. Physical HD-rumble decays faster than the idle window;
@@ -285,3 +200,131 @@ impl PadProto for SwitchProProto {
 
 /// Session Switch Pro pads (`PUNKTFUNK_GAMEPAD=switchpro`, or a Nintendo-family per-pad kind).
 pub type SwitchProManager = UhidManager<SwitchProProto>;
+
+/// A Joy-Con pair: both halves of one pad slot. The left half drives the low motor, the right
+/// half the high one.
+pub struct JoyConPair {
+    left: SwitchPad,
+    right: SwitchPad,
+}
+
+/// Joy-Con pair [`PadProto`]. SL/SR carry the paddles, so nothing folds.
+#[derive(Default)]
+pub struct JoyConPairProto;
+
+impl PadProto for JoyConPairProto {
+    type Pad = JoyConPair;
+    type State = SwitchState;
+    const LABEL: &'static str = "Joy-Con pair";
+    const DEVICE: &'static str = "Joy-Con pair";
+    const CREATE_HINT: &'static str = "";
+
+    fn open(&mut self, idx: u8) -> Result<JoyConPair> {
+        let pair = JoyConPair {
+            left: SwitchPad::open(idx, Half::Left.device_type())?,
+            right: SwitchPad::open(idx, Half::Right.device_type())?,
+        };
+        tracing::info!(
+            index = idx,
+            "virtual Joy-Con pair created (UHID hid-nintendo)"
+        );
+        Ok(pair)
+    }
+
+    fn merge_frame(
+        &self,
+        prev: &SwitchState,
+        f: &punktfunk_core::input::GamepadFrame,
+    ) -> SwitchState {
+        SwitchState::merge_joycon_frame(prev, f)
+    }
+
+    fn apply_rich(&self, st: &mut SwitchState, rich: RichInput) {
+        st.apply_rich(rich);
+    }
+
+    fn write_state(&self, pad: &mut JoyConPair, st: &SwitchState) {
+        let _ = pad.left.write_state(st);
+        let _ = pad.right.write_state(st);
+    }
+
+    /// Both probes, rumble from each half's own side, player lights from the left half (a host
+    /// lights both halves alike).
+    fn service(&self, pad: &mut JoyConPair, idx: u8) -> PadFeedback {
+        let left = pad.left.service(idx);
+        let right = pad.right.service(idx);
+        let drove = left.rumble.is_some() || right.rumble.is_some();
+        let mut fb = left;
+        fb.rumble = drove.then(|| {
+            let low = Half::Left.rumble(pad.left.rumble);
+            let high = Half::Right.rumble(pad.right.rumble);
+            (low, high, 0, 0)
+        });
+        fb.rumble_drove = Some(drove);
+        fb
+    }
+}
+
+/// Session Joy-Con pairs (a Joy-Con pair client, or `PUNKTFUNK_GAMEPAD=joyconpair`).
+pub type JoyConPairManager = UhidManager<JoyConPairProto>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use punktfunk_core::input::gamepad as gs;
+    use punktfunk_core::input::{GamepadEvent, GamepadFrame};
+    use std::time::{Duration, Instant};
+
+    /// Holds a Joy-Con pair live for `PF_PAD_HOLD_SECS` (default 3) so an SDL probe can read it:
+    /// all four paddles beat every 400 ms, a steady 100 °/s pitch, rumble echoed to stdout.
+    #[test]
+    #[ignore = "creates real /dev/uhid devices; needs the input group"]
+    fn joycon_pair_holds_for_a_probe() {
+        let secs = std::env::var("PF_PAD_HOLD_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+        let (idx, mut pair) = (4u8, JoyConPairManager::new());
+        pair.handle(&GamepadEvent::Arrival {
+            index: idx,
+            kind: 0,
+            capabilities: 0,
+            audio_caps: 0,
+        });
+        assert_eq!(pair.live_pads(), 1, "the pair must be created");
+        println!("Joy-Con pair up for {secs}s");
+        let paddles = gs::BTN_PADDLE1 | gs::BTN_PADDLE2 | gs::BTN_PADDLE3 | gs::BTN_PADDLE4;
+        let (start, mut last, mut beat) = (Instant::now(), Instant::now(), 0u32);
+        let mut last_motion = Instant::now();
+        while start.elapsed() < Duration::from_secs(secs) {
+            // 50 Hz: under the manager's 100 ms idle watchdog, which zeroes a stalled gyro.
+            if last_motion.elapsed() >= Duration::from_millis(20) {
+                last_motion = Instant::now();
+                pair.apply_rich(RichInput::Motion {
+                    pad: idx,
+                    gyro: [(100 * gs::MOTION_GYRO_LSB_PER_DEG_S) as i16, 0, 0],
+                    accel: [0, gs::MOTION_ACCEL_LSB_PER_G as i16, 0],
+                });
+            }
+            if last.elapsed() >= Duration::from_millis(400) {
+                last = Instant::now();
+                beat += 1;
+                let buttons = if beat % 2 == 0 {
+                    gs::BTN_A | gs::BTN_DPAD_UP | paddles
+                } else {
+                    0
+                };
+                pair.handle(&GamepadEvent::State(GamepadFrame {
+                    index: idx as i16,
+                    active_mask: 1 << idx,
+                    buttons,
+                    ..Default::default()
+                }));
+            }
+            let echo = |pad, low, high, _, _| println!("rumble pad={pad} low={low} high={high}");
+            pair.pump(echo, |_| {});
+            pair.heartbeat(Duration::from_millis(8));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}

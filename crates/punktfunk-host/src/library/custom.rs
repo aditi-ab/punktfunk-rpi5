@@ -9,6 +9,7 @@
 //! resolves. Tests pin the id scheme, the v1→v2 load, and the privileged-field allowlist.
 
 use super::*;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// One stored row. Same shape the API returns and the console edits.
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
@@ -50,6 +51,9 @@ pub struct CustomEntry {
     /// Which sessions hear this title. Absent = every session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<AudioPolicy>,
+    /// Catalog ids a metadata source matches on. Set only by provider reconcile.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ids: BTreeMap<String, String>,
     #[serde(flatten)]
     pub meta: GameMeta,
 }
@@ -125,6 +129,10 @@ pub struct ProviderEntryInput {
     pub on_window: OnWindow,
     #[serde(default)]
     pub audio: Option<AudioPolicy>,
+    /// Catalog ids a metadata source matches on: `steam` → appid, `libretro` →
+    /// `<system>/<No-Intro name>`. Keys `[a-z0-9_]{1,16}`, at most eight; a bad pair is dropped.
+    #[serde(default)]
+    pub ids: BTreeMap<String, String>,
     #[serde(flatten)]
     pub meta: GameMeta,
 }
@@ -153,6 +161,8 @@ impl From<CustomEntry> for GameEntry {
             detect,
             on_window: c.on_window,
             stats: None,
+            ids: c.ids,
+            filled: BTreeMap::new(),
             meta: c.meta,
         }
     }
@@ -203,19 +213,48 @@ pub fn load_catalog() -> Catalog {
     }
 }
 
+type CatalogCache = Mutex<Option<((Option<SystemTime>, u64), Arc<Catalog>)>>;
+
+fn catalog_cache() -> &'static CatalogCache {
+    static CACHE: OnceLock<CatalogCache> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// The catalog for readers, parsed once and kept until `library.json`'s mtime or length moves.
+/// Every list, launch and cover request reads it; parsing megabytes for each would dominate a
+/// large library. Writers parse their own copy ([`load_catalog`]) and drop this one on save.
+pub(crate) fn catalog() -> Arc<Catalog> {
+    let Ok(md) = std::fs::metadata(custom_path()) else {
+        return Arc::default();
+    };
+    let stamp = (md.modified().ok(), md.len());
+    if let Some((s, c)) = catalog_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+    {
+        if *s == stamp {
+            return c.clone();
+        }
+    }
+    let parsed = Arc::new(load_catalog());
+    *catalog_cache().lock().unwrap_or_else(|e| e.into_inner()) = Some((stamp, parsed.clone()));
+    parsed
+}
+
 pub fn load_custom() -> Vec<CustomEntry> {
-    load_catalog().entries
+    catalog().entries.clone()
 }
 
 /// One stored row by host id, as written — `detect` and `prep` included, which the
 /// catalog read model leaves out.
 pub fn get_custom(id: &str) -> Option<CustomEntry> {
-    load_catalog().entries.into_iter().find(|e| e.id == id)
+    catalog().entries.iter().find(|e| e.id == id).cloned()
 }
 
 /// Store ids a plugin has claimed, so library scans skip the matching built-in scanner.
 pub fn claimed_stores() -> BTreeMap<String, String> {
-    load_catalog().claims
+    catalog().claims.clone()
 }
 
 /// Surfaced library id. Every `GameEntry` mapping and id→entry lookup goes through here.
@@ -235,55 +274,69 @@ pub(crate) fn source_id_for(e: &CustomEntry) -> Option<&str> {
     e.store.as_deref().or(e.provider.as_deref())
 }
 
-/// Gated on [`super::collect_games`]: a source the operator switched off must not serve art
+/// Gated like [`super::collect_games`]: a source the operator switched off must not serve art
 /// (`GET /library/art` is on the paired-cert allowlist). Per-entry hide is not applied here —
 /// the console draws a dimmed cover, and this resolver cannot see the caller's lane.
 pub fn entry_for_library_id(library_id: &str) -> Option<CustomEntry> {
-    let entry = load_custom()
-        .into_iter()
-        .find(|e| library_id_for(e) == library_id)?;
-    super::collect_games()
+    let off = disabled_scanners();
+    catalog()
+        .entries
         .iter()
-        .any(|g| g.id == library_id)
-        .then_some(entry)
+        .find(|e| library_id_for(e) == library_id)
+        .filter(|e| !source_id_for(e).is_some_and(|src| off.contains(src)))
+        .cloned()
+}
+
+/// The entry's art as `GET /library` lists it: its own, merged with picks and metadata sources.
+pub(crate) fn merged_art(library_id: &str) -> Option<Artwork> {
+    let mut g = GameEntry::from(entry_for_library_id(library_id)?);
+    Fills::load().apply(&mut g);
+    Some(g.art)
 }
 
 /// Art bytes for one [`ArtKind`], or `None` — no row, no such field, or art the proxy may not
 /// serve. A remote URL comes from the host's store, which fetches it on the first miss.
 /// Blocking IO — call off the async runtime.
 pub fn library_art_bytes(library_id: &str, kind: ArtKind) -> Option<(Vec<u8>, String)> {
-    let field = art_field(&entry_for_library_id(library_id)?.art, kind)?;
+    let field = art_field(&merged_art(library_id)?, kind)?;
     resolve_art_bytes(&field)
 }
 
 pub(crate) fn art_field(art: &Artwork, kind: ArtKind) -> Option<String> {
+    art_slot_ref(art, kind).clone()
+}
+
+fn art_slot_ref(art: &Artwork, kind: ArtKind) -> &Option<String> {
     match kind {
-        ArtKind::Portrait => art.portrait.clone(),
-        ArtKind::Hero => art.hero.clone(),
-        ArtKind::Logo => art.logo.clone(),
-        ArtKind::Header => art.header.clone(),
+        ArtKind::Portrait => &art.portrait,
+        ArtKind::Hero => &art.hero,
+        ArtKind::Logo => &art.logo,
+        ArtKind::Header => &art.header,
     }
 }
 
-/// Held across load-modify-save: two providers syncing at once share one `library.json.tmp`,
-/// and the later save would drop the earlier one's rows.
+pub(crate) fn art_slot(art: &mut Artwork, kind: ArtKind) -> &mut Option<String> {
+    match kind {
+        ArtKind::Portrait => &mut art.portrait,
+        ArtKind::Hero => &mut art.hero,
+        ArtKind::Logo => &mut art.logo,
+        ArtKind::Header => &mut art.header,
+    }
+}
+
+/// Held across load-modify-save: two providers syncing at once would each write back what
+/// they loaded, and the later save would drop the earlier one's rows.
 fn catalog_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Every mutation path goes through here, so the first write upgrades v1.
+/// Every mutation path goes through here, so the first write upgrades v1. Owner-only, like
+/// hooks.json: a local user must not plant `prep`/`launch`.
 fn save_catalog(catalog: &Catalog) -> Result<()> {
-    let dir = pf_paths::config_dir();
-    // 0700 / SYSTEM+Admins, matching hooks.json: a local user must not plant `prep`/`launch`.
-    pf_paths::create_private_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let json = serde_json::to_string_pretty(catalog)?;
-    // Crash mid-write must not truncate. `write_secret_file` applies 0600 / SYSTEM+Admins before
-    // the rename carries them to the final path.
-    let tmp = custom_path().with_extension("json.tmp");
-    pf_paths::write_secret_file(&tmp, json.as_bytes())
-        .with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, custom_path()).context("rename library.json")?;
+    save_json(&custom_path(), &serde_json::to_string_pretty(catalog)?)?;
+    // Two saves inside one mtime tick can leave the same stamp on different bytes.
+    *catalog_cache().lock().unwrap_or_else(|e| e.into_inner()) = None;
     Ok(())
 }
 
@@ -326,6 +379,7 @@ pub fn add_custom(input: CustomInput) -> Result<CustomEntry> {
         detect: input.detect.unwrap_or_default(),
         on_window: input.on_window.unwrap_or_default(),
         audio: audio_policy(input.audio),
+        ids: BTreeMap::new(),
         meta: input.meta,
     };
     catalog.entries.push(entry.clone());
@@ -405,7 +459,8 @@ pub fn privileged_field(
 /// so the entry names a title rather than carrying a program. `exec` names a template in the
 /// publishing plugin's manifest, which the host resolves ([`crate::library::exec`]).
 /// Fail closed: a kind added to `launch.rs` and forgotten here is operator-only.
-/// `gog` is listed because `launch::gog_spawn` confines the exe to a GOG install;
+/// `gog` is listed because `launch::gog_spawn` confines the exe to a GOG install, `gamebar`
+/// because the exe must be on a signed-in user's Game Bar list;
 /// `command` is never listed (`cmd.exe /c` / `sh -c`).
 const UNPRIVILEGED_LAUNCH_KINDS: &[&str] = &[
     "steam_appid",
@@ -421,8 +476,11 @@ const UNPRIVILEGED_LAUNCH_KINDS: &[&str] = &[
     "uplay",
     "amazon",
     "battlenet",
+    "ea",
+    "rockstar",
     "exec",
     "desktop_id",
+    "gamebar",
 ];
 
 /// Path segment / event source / console label. `manual` is reserved (the no-provider sentinel
@@ -463,9 +521,8 @@ pub fn validate_store_claim(store: &str) -> Result<(), String> {
     }
 }
 
-/// A plugin reconciles its whole set at once, so a 400 on one tile would drop every game.
-/// Vocabulary errors still 400 in [`validate_provider_payload`]. Drop the row, not just
-/// `launch`: a launcher tile with no launch is not shown.
+/// A plugin reconciles its whole set at once, so a 400 on one tile would drop every game. Drop
+/// the row, not just `launch`: a launcher tile with no launch is not shown.
 pub fn sanitize_launcher_entries(inputs: &mut Vec<ProviderEntryInput>) -> Vec<(String, String)> {
     let mut dropped = Vec::new();
     inputs.retain(|e| {
@@ -479,12 +536,13 @@ pub fn sanitize_launcher_entries(inputs: &mut Vec<ProviderEntryInput>) -> Vec<(S
     dropped
 }
 
-/// Non-empty titles and unique, non-empty `external_id`s. A duplicate would make ownership of
-/// the surviving row ambiguous.
+/// Refuse a payload whose rows would be ambiguous: an empty or duplicate `external_id`, or an
+/// empty title. Any other fault belongs to one entry, so that entry is dropped and returned with
+/// its reason — one odd title must not empty the provider's library.
 pub fn validate_provider_payload(
     provider: &str,
-    inputs: &[ProviderEntryInput],
-) -> Result<(), String> {
+    inputs: &mut Vec<ProviderEntryInput>,
+) -> Result<Vec<(String, String)>, String> {
     let mut seen = std::collections::HashSet::new();
     for (i, e) in inputs.iter().enumerate() {
         if e.external_id.trim().is_empty() {
@@ -499,86 +557,106 @@ pub fn validate_provider_payload(
                 e.external_id
             ));
         }
-        // Closed-vocabulary kinds are 400 here as well as at launch, so the plugin can act.
-        if let Some(launch) = &e.launch {
-            if launch.kind == "steam_ui" && !valid_steam_ui(&launch.value) {
-                return Err(format!(
-                    "entries[{i}]: `launch.value` for kind `steam_ui` must be `bigpicture` or `desktop`"
-                ));
-            }
-            // Vocabulary only. "Not installed" is not a payload bug — [`sanitize_launcher_entries`]
-            // drops just that tile instead of 400ing the whole reconcile.
-            if launch.kind == "launcher_ui" && !known_launcher_ui(&launch.value) {
-                return Err(format!(
-                    "entries[{i}]: `launch.value` for kind `launcher_ui` is not a launcher this \
-                     host's platform supports (`{}`)",
-                    launch.value
-                ));
-            }
-            // Interpolated into a `playnite://` URI; charset-checked here and at launch.
-            if launch.kind == "playnite" && !valid_playnite_id(&launch.value) {
-                return Err(format!(
-                    "entries[{i}]: `launch.value` for kind `playnite` must be a Playnite game GUID"
-                ));
-            }
-            // `<Identity>!<AppId>` from `MicrosoftGame.config`. The host fills the publisher hash
-            // at launch (the runner cannot), so the shape is checked here.
-            if launch.kind == "xbox" && !valid_aumid(&launch.value) {
-                return Err(format!(
-                    "entries[{i}]: `launch.value` for kind `xbox` must be `<Identity>!<AppId>`"
-                ));
-            }
-            // Store ids interpolated into a protocol URI or a launcher argv: charset-checked
-            // here, where the author sees it, and again at launch.
-            if launch.kind == "uplay" && !valid_uplay_id(&launch.value) {
-                return Err(format!(
-                    "entries[{i}]: `launch.value` for kind `uplay` must be a numeric game id"
-                ));
-            }
-            if launch.kind == "amazon" && !valid_amazon_id(&launch.value) {
-                return Err(format!(
-                    "entries[{i}]: `launch.value` for kind `amazon` must be a product id \
-                     (`amzn1.adg.product.…`)"
-                ));
-            }
-            if launch.kind == "battlenet" && !valid_battlenet_code(&launch.value) {
-                return Err(format!(
-                    "entries[{i}]: `launch.value` for kind `battlenet` must be a launch code \
-                     of [A-Za-z0-9_]"
-                ));
-            }
-            #[cfg(not(windows))]
-            if launch.kind == "desktop_id" && !crate::library::valid_desktop_id(&launch.value) {
-                return Err(format!(
-                    "entries[{i}]: `launch.value` for kind `desktop_id` must be a desktop entry id"
-                ));
-            }
-            // A template name in the publishing plugin's manifest, with its arguments. Resolved
-            // here so a bad entry is refused at publish time rather than at launch.
-            if launch.kind == "exec" {
-                if let Err(reason) = crate::library::exec_spec_is_publishable(provider, launch) {
-                    return Err(format!("entries[{i}]: `launch` for kind `exec` {reason}"));
-                }
-            }
+    }
+    let exec = inputs
+        .iter()
+        .any(|e| e.launch.as_ref().is_some_and(|l| l.kind == "exec"));
+    let manifest = exec
+        .then(|| crate::plugins::manifest::for_provider(provider))
+        .flatten();
+    for e in inputs.iter_mut() {
+        sanitize_ids(&mut e.ids);
+    }
+    let mut dropped = Vec::new();
+    inputs.retain(|e| match entry_fault(provider, manifest.as_ref(), e) {
+        None => true,
+        Some(reason) => {
+            dropped.push((e.external_id.clone(), reason));
+            false
         }
-        if let Some(marker) = &e.detect.env_marker {
-            if !valid_env_key(&marker.key) {
-                return Err(format!(
-                    "entries[{i}]: `detect.env_marker.key` must be 1–64 chars of [A-Za-z0-9_]"
-                ));
-            }
-            if marker
-                .value
-                .as_ref()
-                .is_some_and(|v| v.len() > MAX_ENV_VALUE)
-            {
-                return Err(format!(
-                    "entries[{i}]: `detect.env_marker.value` must be at most {MAX_ENV_VALUE} chars"
-                ));
-            }
+    });
+    Ok(dropped)
+}
+
+/// Why this host would never launch or detect `e`, if it would not. Closed vocabularies are
+/// checked here as well as at launch, so the plugin's author sees the reason.
+fn entry_fault(
+    provider: &str,
+    manifest: Option<&crate::plugins::manifest::PluginManifest>,
+    e: &ProviderEntryInput,
+) -> Option<String> {
+    if let Some(launch) = &e.launch {
+        let bad = |ok: bool, what: &str| {
+            (!ok).then(|| format!("`launch.value` for kind `{}` {what}", launch.kind))
+        };
+        let fault = match launch.kind.as_str() {
+            "steam_ui" => bad(
+                valid_steam_ui(&launch.value),
+                "must be `bigpicture` or `desktop`",
+            ),
+            // Vocabulary only: "not installed" is [`sanitize_launcher_entries`]'s business.
+            "launcher_ui" => bad(
+                known_launcher_ui(&launch.value),
+                "is not a launcher this host's platform supports",
+            ),
+            // Interpolated into a `playnite://` URI.
+            "playnite" => bad(
+                valid_playnite_id(&launch.value),
+                "must be a Playnite game GUID",
+            ),
+            // `<Identity>!<AppId>`: the host fills the publisher hash at launch.
+            "xbox" => bad(valid_aumid(&launch.value), "must be `<Identity>!<AppId>`"),
+            "uplay" => bad(valid_uplay_id(&launch.value), "must be a numeric game id"),
+            "amazon" => bad(
+                valid_amazon_id(&launch.value),
+                "must be a product id (`amzn1.adg.product.…`)",
+            ),
+            "battlenet" => bad(
+                valid_battlenet_code(&launch.value),
+                "must be a launch code of [A-Za-z0-9_]",
+            ),
+            "ea" => bad(
+                valid_ea_id(&launch.value),
+                "must be a content id of [A-Za-z0-9._-]",
+            ),
+            "rockstar" => bad(
+                valid_rockstar_title(&launch.value),
+                "must be a title id of [A-Za-z0-9_]",
+            ),
+            "gamebar" => bad(
+                valid_gamebar_exe(&launch.value),
+                "must be an absolute path to an `.exe`",
+            ),
+            #[cfg(not(windows))]
+            "desktop_id" => bad(
+                crate::library::valid_desktop_id(&launch.value),
+                "must be a desktop entry id",
+            ),
+            // A template in the publishing plugin's manifest, resolved now rather than at launch.
+            "exec" => match manifest {
+                None => Some(format!(
+                    "`launch` for kind `exec` needs an installed plugin whose manifest declares \
+                     the provider id '{provider}'"
+                )),
+                Some(m) => crate::library::exec_spec_is_valid(m, launch)
+                    .err()
+                    .map(|reason| format!("`launch` for kind `exec` is not resolvable: {reason}")),
+            },
+            _ => None,
+        };
+        if fault.is_some() {
+            return fault;
         }
     }
-    Ok(())
+    let marker = e.detect.env_marker.as_ref()?;
+    if !valid_env_key(&marker.key) {
+        return Some("`detect.env_marker.key` must be 1–64 chars of [A-Za-z0-9_]".into());
+    }
+    marker
+        .value
+        .as_ref()
+        .is_some_and(|v| v.len() > MAX_ENV_VALUE)
+        .then(|| format!("`detect.env_marker.value` must be at most {MAX_ENV_VALUE} chars"))
 }
 
 /// Replace `provider`'s rows with `inputs`. Surviving titles keep their host id (keyed on
@@ -616,6 +694,7 @@ fn reconcile_entries(
             detect: input.detect,
             on_window: input.on_window,
             audio: audio_policy(input.audio),
+            ids: input.ids,
             meta: input.meta,
         });
     }
@@ -766,6 +845,7 @@ mod tests {
             detect: DetectHint::default(),
             on_window: OnWindow::default(),
             audio: None,
+            ids: BTreeMap::new(),
             meta: GameMeta::default(),
         }
     }
@@ -782,6 +862,7 @@ mod tests {
             detect: DetectHint::default(),
             on_window: OnWindow::default(),
             audio: None,
+            ids: BTreeMap::new(),
             meta: GameMeta::default(),
         }
     }
@@ -1109,25 +1190,23 @@ mod tests {
             });
             i
         };
-        assert!(
-            validate_provider_payload("demo", &[with_launch("steam_ui", "bigpicture")]).is_ok()
-        );
-        assert!(validate_provider_payload("demo", &[with_launch("steam_ui", "desktop")]).is_ok());
-        assert!(validate_provider_payload("demo", &[with_launch("steam_ui", "gamepad")]).is_err());
-        assert!(validate_provider_payload("demo", &[with_launch("steam_ui", "")]).is_err());
+        // How many entries one bad field drops: never the whole payload.
+        let dropped = |i: ProviderEntryInput| {
+            validate_provider_payload("demo", &mut vec![i]).map(|d| d.len())
+        };
+        assert_eq!(dropped(with_launch("steam_ui", "bigpicture")), Ok(0));
+        assert_eq!(dropped(with_launch("steam_ui", "desktop")), Ok(0));
+        assert_eq!(dropped(with_launch("steam_ui", "gamepad")), Ok(1));
+        assert_eq!(dropped(with_launch("steam_ui", "")), Ok(1));
         // Other kinds are unconstrained here (validated per-kind at launch).
-        assert!(validate_provider_payload("demo", &[with_launch("command", "anything")]).is_ok());
+        assert_eq!(dropped(with_launch("command", "anything")), Ok(0));
 
-        // `launcher_ui`: unknown names 400 here. Not-installed is dropped later, not 400.
-        assert!(
-            validate_provider_payload("demo", &[with_launch("launcher_ui", "nonesuch")]).is_err()
-        );
+        // `launcher_ui`: an unknown name drops that entry; not-installed is dropped later.
+        assert_eq!(dropped(with_launch("launcher_ui", "nonesuch")), Ok(1));
         #[cfg(windows)]
-        assert!(
-            validate_provider_payload("demo", &[with_launch("launcher_ui", "playnite")]).is_ok()
-        );
+        assert_eq!(dropped(with_launch("launcher_ui", "playnite")), Ok(0));
         #[cfg(target_os = "linux")]
-        assert!(validate_provider_payload("demo", &[with_launch("launcher_ui", "lutris")]).is_ok());
+        assert_eq!(dropped(with_launch("launcher_ui", "lutris")), Ok(0));
 
         let with_env = |key: &str, value: Option<&str>| {
             let mut i = input("a", "A");
@@ -1137,17 +1216,29 @@ mod tests {
             });
             i
         };
-        assert!(
-            validate_provider_payload("demo", &[with_env("HEROIC_APP_NAME", Some("Quail"))])
-                .is_ok()
+        assert_eq!(dropped(with_env("HEROIC_APP_NAME", Some("Quail"))), Ok(0));
+        assert_eq!(dropped(with_env("BAD-KEY", None)), Ok(1));
+        assert_eq!(dropped(with_env("", None)), Ok(1));
+        assert_eq!(
+            dropped(with_env("K", Some(&"x".repeat(MAX_ENV_VALUE + 1)))),
+            Ok(1)
         );
-        assert!(validate_provider_payload("demo", &[with_env("BAD-KEY", None)]).is_err());
-        assert!(validate_provider_payload("demo", &[with_env("", None)]).is_err());
-        assert!(validate_provider_payload(
-            "demo",
-            &[with_env("K", Some(&"x".repeat(MAX_ENV_VALUE + 1)))]
-        )
-        .is_err());
+    }
+
+    #[test]
+    fn one_bad_entry_drops_only_itself() {
+        let mut bad = input("b", "B");
+        bad.launch = Some(LaunchSpec {
+            kind: "steam_ui".into(),
+            value: "gamepad".into(),
+            ..Default::default()
+        });
+        let mut inputs = vec![input("a", "A"), bad, input("c", "C")];
+        let dropped = validate_provider_payload("demo", &mut inputs).unwrap();
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].0, "b");
+        let kept: Vec<_> = inputs.iter().map(|e| e.external_id.as_str()).collect();
+        assert_eq!(kept, ["a", "c"]);
     }
 
     #[test]
@@ -1175,7 +1266,7 @@ mod tests {
     }
 
     /// Unlisted kinds are operator-privileged. The listed set is pinned so widening it is an
-    /// edit to this test.
+    /// edit to this test and to the console's password gate, which keeps the same list.
     #[test]
     fn an_unlisted_launch_kind_is_operator_privileged() {
         let kind = |k: &str| {
@@ -1202,8 +1293,11 @@ mod tests {
                 "uplay",
                 "amazon",
                 "battlenet",
+                "ea",
+                "rockstar",
                 "exec",
                 "desktop_id",
+                "gamebar",
             ],
             "widening this set hands the plugin lane a new launch kind — do it on purpose"
         );
@@ -1214,6 +1308,19 @@ mod tests {
         assert_eq!(kind(""), Some("launch.kind"));
         // Resolvers match the exact string; `GOG` is not `gog`.
         assert_eq!(kind("GOG"), Some("launch.kind"));
+
+        let web = include_str!("../../../../web/src/lib/command-execution.ts");
+        let list = web
+            .split_once("UNPRIVILEGED_LAUNCH_KINDS")
+            .and_then(|(_, rest)| rest.split_once("= ["))
+            .and_then(|(_, rest)| rest.split_once("];"))
+            .map(|(list, _)| list)
+            .expect("console list");
+        let console: Vec<&str> = list.split('"').skip(1).step_by(2).collect();
+        assert_eq!(
+            console, UNPRIVILEGED_LAUNCH_KINDS,
+            "a kind the console lists and the host does not skips the console password"
+        );
     }
 
     #[test]
@@ -1226,11 +1333,12 @@ mod tests {
         assert!(validate_provider_name("-lead").is_err());
         assert!(validate_provider_name(&"x".repeat(65)).is_err());
 
-        assert!(validate_provider_payload("demo", &[input("a", "A")]).is_ok());
-        assert!(validate_provider_payload("demo", &[input("", "A")]).is_err());
-        assert!(validate_provider_payload("demo", &[input("a", " ")]).is_err());
+        let check = |mut v: Vec<ProviderEntryInput>| validate_provider_payload("demo", &mut v);
+        assert!(check(vec![input("a", "A")]).is_ok());
+        assert!(check(vec![input("", "A")]).is_err());
+        assert!(check(vec![input("a", " ")]).is_err());
         assert!(
-            validate_provider_payload("demo", &[input("a", "A"), input("a", "B")]).is_err(),
+            check(vec![input("a", "A"), input("a", "B")]).is_err(),
             "duplicate external_id"
         );
     }

@@ -382,12 +382,7 @@ impl GpuPrefStore {
 
     /// Persist then apply. Memory changes only after the disk write succeeds.
     pub fn set(&self, pref: GpuPreference) -> Result<()> {
-        if let Some(dir) = self.path.parent() {
-            pf_paths::create_private_dir(dir)?;
-        }
-        let tmp = self.path.with_extension("json.tmp");
-        pf_paths::write_secret_file(&tmp, &serde_json::to_vec_pretty(&pref)?)?;
-        std::fs::rename(&tmp, &self.path)?;
+        pf_paths::replace_secret_file(&self.path, &serde_json::to_vec_pretty(&pref)?)?;
         *self.cur.lock().unwrap() = pref;
         Ok(())
     }

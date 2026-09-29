@@ -101,6 +101,16 @@ workspace. See `docs/agents/domain.md`.
   it does not compile the Linux/Windows presenter or injector implementations.
 - `swift test --package-path clients/apple --filter ScrollCaptureTests` needs an ABI-matched,
   signed XCFramework. Its packaged header must define `PUNKTFUNK_FEATURE_QUIC`.
+- `scroll-probe` (`tools/scroll-probe`), run in a Linux host's session, prints what an app
+  receives from injected scroll: source, distance, value120, stops, cadence. `--listen N` only
+  listens, for a real client scrolling over its window; the host's
+  `RUST_LOG=pf_inject::scroll=trace` logs the same scroll as it came off the wire.
 - Scope ripwire source reviews with `--exclude=clients/apple/.build`
   `--exclude=clients/apple/PunktfunkCore.xcframework`; downloaded sources and packaged headers
   otherwise pollute the symbol graph and clone findings.
+
+## Console verification
+
+- `cargo test -p pf-console-ui` runs the console's tests on macOS; CPU raster, no GPU.
+- `PF_CONSOLE_DUMP=<dir> cargo test -p pf-console-ui --lib -- --ignored dump` writes every
+  screen as a PNG.

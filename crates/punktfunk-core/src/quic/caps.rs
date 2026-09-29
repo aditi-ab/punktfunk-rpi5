@@ -186,6 +186,13 @@ pub const HOST_CAP2_RAMP: u8 = 0x10;
 /// after its first window, and its groups are left alone.
 pub const HOST_CAP2_DELIVERY: u8 = 0x20;
 
+/// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host reads
+/// [`InputEdge`](super::control::InputEdge) off the control stream. Toward this bit the
+/// client sends every key press and release there, where QUIC resends what the network
+/// drops; a lost `KeyUp` on the datagram plane otherwise holds the key until its next edge.
+/// Motion, scroll and pads stay datagrams. Without the bit every event is a datagram, as before.
+pub const HOST_CAP2_INPUT_EDGES: u8 = 0x40;
+
 /// [`Hello::video_codecs`]: H.264 / AVC. The software encode path emits H.264, so a client
 /// that wants to stream from a GPU-less host must advertise this.
 pub const CODEC_H264: u8 = 0x01;
@@ -382,6 +389,7 @@ mod tests {
                 ("HOST_CAP2_SCROLL", HOST_CAP2_SCROLL),
                 ("HOST_CAP2_RAMP", HOST_CAP2_RAMP),
                 ("HOST_CAP2_DELIVERY", HOST_CAP2_DELIVERY),
+                ("HOST_CAP2_INPUT_EDGES", HOST_CAP2_INPUT_EDGES),
             ],
         ),
         (
@@ -400,6 +408,7 @@ mod tests {
         ("EXT_TAG_PADDING", EXT_TAG_PADDING),
         ("EXT_TAG_CLIENT", EXT_TAG_CLIENT),
         ("EXT_TAG_ABR", EXT_TAG_ABR),
+        ("EXT_TAG_PRESET", EXT_TAG_PRESET),
     ];
 
     /// Within a byte, each constant is one bit and no bit is spent twice; tags are distinct

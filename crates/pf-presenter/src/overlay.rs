@@ -40,12 +40,19 @@ pub struct FrameCtx<'a> {
     /// Swapchain size in pixels. Overlay renders 1:1.
     pub width: u32,
     pub height: u32,
+    /// The swapchain is 10-bit; the overlay draws in 10 too, or its gradients band.
+    pub ten_bit: bool,
     /// Window display scale (`1.0` at 96 dpi / 100 %) × `PUNKTFUNK_OSD_SCALE`.
     /// Overlay chrome is physical pixels; multiply every metric by this. The
     /// run loop (`overlay_scale`) clamps it finite and > 0.
     pub scale: f32,
     /// Stats overlay lines, painted by role. `None` = overlay off.
     pub stats: Option<&'a [HudLine]>,
+    /// The stats panel's corner, and its size on top of [`Self::scale`].
+    pub stats_corner: punktfunk_core::hud::HudCorner,
+    pub stats_scale: f32,
+    /// Show the exit hint when a stream starts; the overlay owns its timing.
+    pub exit_hint: bool,
     pub hint: Option<&'a str>,
     /// Access chip. `None` for a full-control permanent session.
     pub access: Option<&'a str>,
@@ -74,6 +81,8 @@ pub struct FrameCtx<'a> {
 pub struct OverlayFrame {
     pub image: vk::Image,
     pub view: vk::ImageView,
+    /// The image's format; the native Wayland lane copies it into a buffer of the same.
+    pub format: vk::Format,
     pub width: u32,
     pub height: u32,
     /// Vertical pixel band containing non-transparent overlay content.
@@ -82,7 +91,7 @@ pub struct OverlayFrame {
 }
 
 // Shared with the Android GL host; lives in `pf_client_core::console`
-// (pf-console-ui sits above this crate). Re-exported so `run.rs` and the
+// (pf-console-ui sits above this crate). Re-exported so the run loop and the
 // console keep the `pf_presenter::overlay::…` path.
 pub use pf_client_core::console::{OverlayAction, PointerButton, PointerInput, SessionPhase};
 pub use pf_client_core::ring::{RingCommand, RingFacts, RingInput};

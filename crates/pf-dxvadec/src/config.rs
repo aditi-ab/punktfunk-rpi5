@@ -4,7 +4,7 @@
 //!
 //! `video_d3d11_native.rs` enumerates and creates; this module chooses, against
 //! values the driver already returned. Same split as `pf-vkdecode`'s
-//! [`caps`](pf_vkdecode::caps). Profile GUIDs match `video_d3d11.rs`.
+//! `caps`. Profile GUIDs match `video_d3d11.rs`.
 
 /// GUID `ID3D11VideoDevice::GetVideoDecoderProfile` returns and
 /// `D3D11_VIDEO_DECODER_DESC::Guid` takes.

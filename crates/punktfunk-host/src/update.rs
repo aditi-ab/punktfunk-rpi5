@@ -23,14 +23,10 @@ pub(crate) use pf_update_check::manifest;
 pub(crate) mod windows;
 
 use manifest::Manifest;
-use pf_update_check::{FeedError, PublicKey};
+use pf_update_check::{floor, FeedError};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-/// Same Ed25519 signers the client trusts. A host that pinned a different set
-/// would accept a feed the client rejects (or the reverse).
-pub(crate) use pf_update_check::OFFICIAL_UPDATE_KEYS as UPDATE_KEYS;
+use std::time::{Duration, Instant};
 
 /// 6 h: long enough not to hammer the signed feed; status polls kick refresh.
 const AUTO_REFRESH_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
@@ -42,92 +38,115 @@ pub(crate) const FORCE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 const STALE_AFTER: Duration = Duration::from_secs(45 * 24 * 60 * 60);
 
 pub(crate) fn check_disabled() -> bool {
-    matches!(
-        pf_host_config::knob("PUNKTFUNK_UPDATE_CHECK").as_deref(),
-        Some("0") | Some("false") | Some("off")
-    )
+    !pf_host_config::row_bool("PUNKTFUNK_UPDATE_CHECK")
 }
 
 /// Operator kill switch: apply 409s and status reports `notify` even when a
 /// one-click leg exists. Check is unaffected.
 pub(crate) fn apply_disabled() -> bool {
-    matches!(
-        pf_host_config::knob("PUNKTFUNK_UPDATE_APPLY").as_deref(),
-        Some("0") | Some("false") | Some("off")
-    )
+    !pf_host_config::row_bool("PUNKTFUNK_UPDATE_APPLY")
 }
 
-/// `full` (one-click), `staged` (apply then reboot — rpm-ostree), or `notify`
-/// (show the command). Linux `full`/`staged` also need the packaged root helper
-/// and the operator's group; pacman also the root-owned full-sysupgrade config.
-pub(crate) fn apply_support() -> &'static str {
-    if apply_disabled() {
-        return "notify";
+/// What an apply can use on this box, probed once so [`apply_leg`] is a pure table.
+#[derive(Debug, Clone, Copy, Default)]
+struct Caps {
+    apply_disabled: bool,
+    /// The only OS with helper and source-rebuild legs.
+    linux: bool,
+    /// Omarchy owns `pacman`: a one-click apply would hit its `pacman -Syu` guard or skip the
+    /// snapper snapshot. Packages ride its transaction once the repo is configured.
+    omarchy: bool,
+    /// The packaged root helper's unit exists.
+    helper: bool,
+    /// The operator is in `punktfunk-update`, which polkit checks.
+    opted_in: bool,
+    /// Pacman's root-owned full-sysupgrade opt-in; the helper refuses pacman without it.
+    pacman_optin: bool,
+}
+
+impl Caps {
+    fn probe() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            let helper = linux::helper_installed();
+            Self {
+                apply_disabled: apply_disabled(),
+                linux: true,
+                omarchy: crate::osinfo::is_omarchy(),
+                helper,
+                // Both shell out or read root-owned config, and neither matters without a helper.
+                opted_in: helper && linux::opted_in(),
+                pacman_optin: helper && linux::pacman_opted_in(),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        Self {
+            apply_disabled: apply_disabled(),
+            ..Self::default()
+        }
     }
-    // Omarchy owns `pacman` (snapper snapshot, then sysupgrade). A one-click
-    // apply here would hit their `pacman -Syu` guard or skip that snapshot.
-    // Packages ride their transaction once the repo is configured.
-    #[cfg(target_os = "linux")]
-    if crate::osinfo::is_omarchy() {
-        return "notify";
+}
+
+/// How [`start_apply`] installs a newer build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Leg {
+    /// Download, verify and run the Windows installer.
+    Installer,
+    /// Start the `pf-update` root oneshot.
+    Helper,
+    /// Rebuild the Deck's own checkout. User-owned: no helper, no group.
+    SteamosSource,
+}
+
+/// Kinds the root helper applies.
+fn helper_kind(kind: detect::InstallKind) -> bool {
+    use detect::InstallKind as K;
+    matches!(kind, K::Apt | K::Dnf | K::Sysext | K::RpmOstree | K::Pacman)
+}
+
+/// The leg [`start_apply`] may run, or `None` where the console shows the command instead.
+/// Group membership is not checked here: polkit enforces it when the helper starts.
+fn apply_leg(kind: detect::InstallKind, c: Caps) -> Option<Leg> {
+    use detect::InstallKind as K;
+    if c.apply_disabled || c.omarchy {
+        return None;
     }
-    let (kind, _) = detect::detect();
     match kind {
-        detect::InstallKind::WindowsInstaller => "full",
-        #[cfg(target_os = "linux")]
-        detect::InstallKind::Apt | detect::InstallKind::Dnf | detect::InstallKind::Sysext
-            if linux::helper_installed() && linux::opted_in() =>
-        {
-            "full"
-        }
-        #[cfg(target_os = "linux")]
-        detect::InstallKind::RpmOstree if linux::helper_installed() && linux::opted_in() => {
-            "staged"
-        }
-        #[cfg(target_os = "linux")]
-        detect::InstallKind::Pacman
-            if linux::helper_installed() && linux::opted_in() && linux::pacman_opted_in() =>
-        {
-            "full"
-        }
-        // SteamOS source rebuild is user-owned: no helper, no group.
-        #[cfg(target_os = "linux")]
-        detect::InstallKind::SteamosSource => "full",
-        _ => "notify",
+        K::WindowsInstaller => Some(Leg::Installer),
+        K::SteamosSource if c.linux => Some(Leg::SteamosSource),
+        K::Pacman if !c.pacman_optin => None,
+        k if helper_kind(k) && c.helper => Some(Leg::Helper),
+        _ => None,
     }
 }
 
-/// Status copy when the helper is installed but the operator is not in
-/// `punktfunk-update`.
+/// `full` (one-click), `staged` (apply then reboot, rpm-ostree) or `notify` (show the command).
+/// A helper leg also needs the operator's group before the console offers it.
+fn support(kind: detect::InstallKind, c: Caps) -> &'static str {
+    match apply_leg(kind, c) {
+        Some(Leg::Helper) if !c.opted_in => "notify",
+        Some(Leg::Helper) if kind == detect::InstallKind::RpmOstree => "staged",
+        Some(_) => "full",
+        None => "notify",
+    }
+}
+
+/// Joining `punktfunk-update` would turn the command into a button.
+fn opt_in_would_help(kind: detect::InstallKind, c: Caps) -> bool {
+    !c.apply_disabled && !c.omarchy && c.helper && !c.opted_in && helper_kind(kind)
+}
+
+/// Shown instead of an Apply button when joining the group would enable one.
+pub(crate) const OPT_IN_HINT: &str =
+    "sudo usermod -aG punktfunk-update $USER   # enables web-triggered updates for this host";
+
+pub(crate) fn apply_support() -> &'static str {
+    support(detect::detect().0, Caps::probe())
+}
+
+/// Status copy when the helper is installed but the operator is not in `punktfunk-update`.
 pub(crate) fn opt_in_hint() -> Option<String> {
-    #[cfg(target_os = "linux")]
-    {
-        // Apply is notify-only on Omarchy; the group would buy no button.
-        if crate::osinfo::is_omarchy() {
-            return None;
-        }
-        let (kind, _) = detect::detect();
-        let capable = matches!(
-            kind,
-            detect::InstallKind::Apt
-                | detect::InstallKind::Dnf
-                | detect::InstallKind::Sysext
-                | detect::InstallKind::RpmOstree
-                | detect::InstallKind::Pacman
-        );
-        if capable && !apply_disabled() && linux::helper_installed() && !linux::opted_in() {
-            return Some(linux::opt_in_hint());
-        }
-    }
-    None
-}
-
-fn pinned_keys() -> Vec<PublicKey> {
-    UPDATE_KEYS
-        .iter()
-        .filter(|k| !k.is_empty())
-        .filter_map(|k| PublicKey::parse(k).ok())
-        .collect()
+    opt_in_would_help(detect::detect().0, Caps::probe()).then(|| OPT_IN_HINT.to_string())
 }
 
 #[derive(Clone)]
@@ -162,55 +181,15 @@ fn runtime() -> &'static Mutex<Runtime> {
     RT.get_or_init(|| Mutex::new(Runtime::default()))
 }
 
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Highest accepted manifest serial per channel. Persist this or a replayed
-/// older manifest becomes a silent downgrade of knowledge.
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-struct FloorFile {
-    #[serde(default)]
-    serial_floor: std::collections::BTreeMap<String, u64>,
-}
-
+/// The [`floor`] file: highest accepted manifest serial per channel.
 fn state_path() -> PathBuf {
     pf_paths::config_dir().join("update-state.json")
 }
 
-fn load_floor(path: &Path, channel: &str) -> u64 {
-    std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<FloorFile>(&b).ok())
-        .and_then(|f| f.serial_floor.get(channel).copied())
-        .unwrap_or(0)
-}
-
-/// Raise (never lower) the floor. Atomic tmp+rename so a power cut cannot
-/// half-write it.
-fn store_floor(path: &Path, channel: &str, serial: u64) {
-    let mut file: FloorFile = std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
-    let slot = file.serial_floor.entry(channel.to_string()).or_insert(0);
-    if serial <= *slot {
-        return;
-    }
-    *slot = serial;
-    let Ok(bytes) = serde_json::to_vec_pretty(&file) else {
-        return;
-    };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, &bytes).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    }
+/// The floor's write: [`pf_paths::replace_file`], else in place, since an unraised floor lets a
+/// replayed older manifest through.
+fn write_floor(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    pf_paths::replace_file(path, bytes).or_else(|_| std::fs::write(path, bytes))
 }
 
 /// Is a newer build out, for an install with no published artifact to compare?
@@ -222,16 +201,30 @@ pub(crate) fn source_newer(behind: Option<u64>) -> bool {
     behind.is_some_and(|n| n > 0)
 }
 
+/// Does `manifest` offer an update to an install of `kind` running `current`? Status, the
+/// `update.available` event and apply all ask this, so apply never refuses an offer.
+/// A source build answers from its checkout: its version names a commit, not a published build.
+pub(crate) fn offers_update(
+    kind: detect::InstallKind,
+    channel: detect::Channel,
+    current: &str,
+    manifest: &Manifest,
+    source_behind: Option<u64>,
+) -> bool {
+    if kind == detect::InstallKind::SteamosSource {
+        source_newer(source_behind)
+    } else {
+        detect::is_newer(&manifest.version, manifest.ci_run, current, channel)
+    }
+}
+
 /// Blocking feed fetch; call from a blocking thread.
 fn fetch_manifest_blocking(channel: &str) -> Result<Manifest, FeedError> {
     pf_update_check::feed::fetch_manifest_blocking(
         &pf_update_check::feed::feed_base(),
         channel,
-        &pinned_keys(),
-        &format!(
-            "punktfunk-host/{} (update-check)",
-            env!("PUNKTFUNK_VERSION")
-        ),
+        &pf_update_check::pinned_keys(),
+        &format!("punktfunk-host/{} (update-check)", crate::version::get()),
     )
 }
 
@@ -239,21 +232,18 @@ pub(crate) fn refresh_blocking() -> Result<Checked, FeedError> {
     let (kind, channel) = detect::detect();
     // Before the lock: this talks to the network. The manifest still fetches for the
     // "latest published" row, but it cannot decide a source build's answer.
-    let source_build = kind == detect::InstallKind::SteamosSource;
     #[cfg(target_os = "linux")]
-    let behind = source_build.then(linux::source_behind).flatten();
+    let behind = (kind == detect::InstallKind::SteamosSource)
+        .then(linux::source_behind)
+        .flatten();
     #[cfg(not(target_os = "linux"))]
     let behind: Option<u64> = None;
     let result = fetch_manifest_blocking(channel.as_str()).and_then(|m| {
         let path = state_path();
-        let floor = load_floor(&path, channel.as_str());
-        if m.serial < floor {
-            return Err(FeedError::Failed(format!(
-                "manifest serial {} is older than the last accepted {} — refusing rollback",
-                m.serial, floor
-            )));
+        floor::check(&path, channel.as_str(), m.serial).map_err(FeedError::Failed)?;
+        if let Err(e) = floor::raise(&path, channel.as_str(), m.serial, write_floor) {
+            tracing::warn!(path = %path.display(), error = %e, "update serial floor not raised");
         }
-        store_floor(&path, channel.as_str(), m.serial);
         Ok(m)
     });
 
@@ -267,18 +257,15 @@ pub(crate) fn refresh_blocking() -> Result<Checked, FeedError> {
         Ok(m) => {
             let checked = Checked {
                 manifest: m,
-                fetched_unix: now_unix(),
+                fetched_unix: crate::clock::unix_secs_u64(),
             };
-            let newer = if source_build {
-                source_newer(rt.source_behind)
-            } else {
-                detect::is_newer(
-                    &checked.manifest.version,
-                    checked.manifest.ci_run,
-                    env!("PUNKTFUNK_VERSION"),
-                    channel,
-                )
-            };
+            let newer = offers_update(
+                kind,
+                channel,
+                crate::version::get(),
+                &checked.manifest,
+                rt.source_behind,
+            );
             if newer && rt.announced.as_deref() != Some(checked.manifest.version.as_str()) {
                 rt.announced = Some(checked.manifest.version.clone());
                 crate::events::emit(crate::events::EventKind::UpdateAvailable {
@@ -396,42 +383,9 @@ pub(crate) fn start_apply(force: bool, session_active: bool) -> Result<(), Apply
         return Err(ApplyError::Disabled);
     }
     let (kind, channel) = detect::detect();
-    let windows_leg = kind == detect::InstallKind::WindowsInstaller;
-    let linux_leg = matches!(
-        kind,
-        detect::InstallKind::Apt
-            | detect::InstallKind::Dnf
-            | detect::InstallKind::Sysext
-            | detect::InstallKind::RpmOstree
-            | detect::InstallKind::Pacman
-            | detect::InstallKind::SteamosSource
-    );
-    if !windows_leg && !linux_leg {
-        return Err(ApplyError::Unsupported);
-    }
-    // Same Omarchy refusal as [`apply_support`], enforced here so a direct POST
-    // cannot run `pacman -Syu` into their guard or past the snapper snapshot.
-    #[cfg(target_os = "linux")]
-    if crate::osinfo::is_omarchy() {
-        return Err(ApplyError::Unsupported);
-    }
-    #[cfg(target_os = "linux")]
-    if linux_leg && kind != detect::InstallKind::SteamosSource {
-        // SteamOS source rebuild is user-owned; every other Linux leg needs
-        // the root helper.
-        if !linux::helper_installed() {
-            return Err(ApplyError::Unsupported);
-        }
-        // Helper enforces the full-sysupgrade opt-in too; refuse here so the
-        // console never spawns a job that will fail.
-        if kind == detect::InstallKind::Pacman && !linux::pacman_opted_in() {
-            return Err(ApplyError::Unsupported);
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    if linux_leg {
-        return Err(ApplyError::Unsupported);
-    }
+    // The table [`apply_support`] reads, so a direct POST meets the same refusals.
+    let leg = apply_leg(kind, Caps::probe()).ok_or(ApplyError::Unsupported)?;
+    let windows_leg = leg == Leg::Installer;
     if session_active && !force {
         return Err(ApplyError::SessionActive);
     }
@@ -446,8 +400,8 @@ pub(crate) fn start_apply(force: bool, session_active: bool) -> Result<(), Apply
         if matches!(
             jobs::reconcile(
                 jobs::read_intent(&jobs::intent_path()),
-                env!("PUNKTFUNK_VERSION"),
-                now_unix()
+                crate::version::get(),
+                crate::clock::unix_secs_u64()
             ),
             jobs::Reconciled::StillApplying
         ) {
@@ -456,11 +410,12 @@ pub(crate) fn start_apply(force: bool, session_active: bool) -> Result<(), Apply
         let Some(checked) = rt.checked.as_ref() else {
             return Err(ApplyError::NothingToApply);
         };
-        let newer = detect::is_newer(
-            &checked.manifest.version,
-            checked.manifest.ci_run,
-            env!("PUNKTFUNK_VERSION"),
+        let newer = offers_update(
+            kind,
             channel,
+            crate::version::get(),
+            &checked.manifest,
+            rt.source_behind,
         );
         if !newer {
             return Err(ApplyError::NothingToApply);
@@ -486,7 +441,7 @@ pub(crate) fn start_apply(force: bool, session_active: bool) -> Result<(), Apply
             },
             received_bytes: 0,
             total_bytes: None,
-            started_unix: now_unix(),
+            started_unix: crate::clock::unix_secs_u64(),
         });
         (version, serial, asset)
     };
@@ -515,7 +470,7 @@ pub(crate) fn start_apply(force: bool, session_active: bool) -> Result<(), Apply
             #[cfg(target_os = "linux")]
             {
                 let _ = &asset; // unused: Linux legs use the package manager
-                let run = if detect::detect().0 == detect::InstallKind::SteamosSource {
+                let run = if leg == Leg::SteamosSource {
                     linux::run_apply_steamos(&target_version, serial, &stage)
                 } else {
                     linux::run_apply(&target_version, serial, &stage)
@@ -544,9 +499,9 @@ pub(crate) fn start_apply(force: bool, session_active: bool) -> Result<(), Apply
             Err((stage_name, error)) => {
                 let record = jobs::ResultRecord {
                     ok: false,
-                    from: env!("PUNKTFUNK_VERSION").into(),
+                    from: crate::version::get().into(),
                     to: target_version.clone(),
-                    finished_unix: now_unix(),
+                    finished_unix: crate::clock::unix_secs_u64(),
                     stage: Some(stage_name.into()),
                     error: Some(error),
                     log_path: None,
@@ -575,7 +530,7 @@ enum PostApply {
 pub(crate) fn reconcile_at_boot() {
     let path = jobs::intent_path();
     let intent = jobs::read_intent(&path);
-    match jobs::reconcile(intent, env!("PUNKTFUNK_VERSION"), now_unix()) {
+    match jobs::reconcile(intent, crate::version::get(), crate::clock::unix_secs_u64()) {
         jobs::Reconciled::None | jobs::Reconciled::StillApplying => {}
         jobs::Reconciled::Success(record) => {
             tracing::info!(from = %record.from, to = %record.to, "host update applied");
@@ -621,7 +576,11 @@ impl Snapshot {
             return None;
         }
         let intent = jobs::read_intent(&jobs::intent_path())?;
-        match jobs::reconcile(Some(intent.clone()), env!("PUNKTFUNK_VERSION"), now_unix()) {
+        match jobs::reconcile(
+            Some(intent.clone()),
+            crate::version::get(),
+            crate::clock::unix_secs_u64(),
+        ) {
             jobs::Reconciled::StillApplying => Some(intent),
             _ => None,
         }
@@ -632,7 +591,10 @@ impl Snapshot {
     pub(crate) fn stale(&self) -> bool {
         self.checked
             .as_ref()
-            .map(|c| now_unix().saturating_sub(c.manifest.serial) > STALE_AFTER.as_secs())
+            .map(|c| {
+                crate::clock::unix_secs_u64().saturating_sub(c.manifest.serial)
+                    > STALE_AFTER.as_secs()
+            })
             .unwrap_or(false)
     }
 }
@@ -641,34 +603,157 @@ impl Snapshot {
 mod tests {
     use super::*;
 
+    /// A temp file that cannot be written beside the floor still raises it.
     #[test]
-    fn floor_roundtrip_and_monotonicity() {
-        let dir = std::env::temp_dir().join(format!("pf-update-floor-{}", std::process::id()));
-        let path = dir.join("update-state.json");
-        let _ = std::fs::remove_dir_all(&dir);
+    fn floor_rises_when_the_temp_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        // A 255-byte name fits, but its temp name does not: the temp write fails, as a failed
+        // rename would.
+        let path = dir.path().join(format!("{}.json", "f".repeat(250)));
+        floor::raise(&path, "stable", 5, write_floor).unwrap();
+        floor::raise(&path, "stable", 9, write_floor).unwrap();
+        assert_eq!(floor::load(&path, "stable"), 9);
+        let files = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(files, 1, "no temp is left behind");
+    }
 
-        assert_eq!(load_floor(&path, "stable"), 0);
-        store_floor(&path, "stable", 100);
-        assert_eq!(load_floor(&path, "stable"), 100);
-        store_floor(&path, "stable", 50);
-        assert_eq!(load_floor(&path, "stable"), 100);
-        store_floor(&path, "canary", 7);
-        assert_eq!(load_floor(&path, "canary"), 7);
-        assert_eq!(load_floor(&path, "stable"), 100);
+    fn ready() -> Caps {
+        Caps {
+            apply_disabled: false,
+            linux: true,
+            omarchy: false,
+            helper: true,
+            opted_in: true,
+            pacman_optin: true,
+        }
+    }
 
-        let _ = std::fs::remove_dir_all(&dir);
+    const KINDS: [detect::InstallKind; 10] = {
+        use detect::InstallKind as K;
+        [
+            K::WindowsInstaller,
+            K::Flatpak,
+            K::Sysext,
+            K::RpmOstree,
+            K::Apt,
+            K::Dnf,
+            K::Pacman,
+            K::SteamosSource,
+            K::Nix,
+            K::Source,
+        ]
+    };
+
+    /// The kill switch and Omarchy refuse every kind, in status and in apply alike.
+    #[test]
+    fn kill_switch_and_omarchy_refuse_every_leg() {
+        for caps in [
+            Caps {
+                apply_disabled: true,
+                ..ready()
+            },
+            Caps {
+                omarchy: true,
+                ..ready()
+            },
+        ] {
+            for kind in KINDS {
+                assert_eq!(apply_leg(kind, caps), None, "{}", kind.as_str());
+                assert_eq!(support(kind, caps), "notify", "{}", kind.as_str());
+                assert!(!opt_in_would_help(
+                    kind,
+                    Caps {
+                        opted_in: false,
+                        ..caps
+                    }
+                ));
+            }
+        }
     }
 
     #[test]
-    fn corrupt_floor_file_reads_as_zero() {
-        let dir = std::env::temp_dir().join(format!("pf-update-floor2-{}", std::process::id()));
-        let path = dir.join("update-state.json");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(&path, b"not json").unwrap();
-        assert_eq!(load_floor(&path, "stable"), 0);
-        store_floor(&path, "stable", 5);
-        assert_eq!(load_floor(&path, "stable"), 5);
-        let _ = std::fs::remove_dir_all(&dir);
+    fn each_kind_routes_to_its_leg() {
+        use detect::InstallKind as K;
+        for (kind, leg, tier) in [
+            (K::WindowsInstaller, Some(Leg::Installer), "full"),
+            (K::Apt, Some(Leg::Helper), "full"),
+            (K::Dnf, Some(Leg::Helper), "full"),
+            (K::Sysext, Some(Leg::Helper), "full"),
+            (K::Pacman, Some(Leg::Helper), "full"),
+            (K::RpmOstree, Some(Leg::Helper), "staged"),
+            (K::SteamosSource, Some(Leg::SteamosSource), "full"),
+            (K::Flatpak, None, "notify"),
+            (K::Nix, None, "notify"),
+            (K::Source, None, "notify"),
+        ] {
+            assert_eq!(apply_leg(kind, ready()), leg, "{}", kind.as_str());
+            assert_eq!(support(kind, ready()), tier, "{}", kind.as_str());
+        }
+    }
+
+    /// No helper, no helper leg. The Deck's source rebuild needs neither helper nor group.
+    #[test]
+    fn helper_legs_need_the_helper_and_pacman_its_opt_in() {
+        use detect::InstallKind as K;
+        let bare = Caps {
+            helper: false,
+            opted_in: false,
+            pacman_optin: false,
+            ..ready()
+        };
+        for kind in [K::Apt, K::Dnf, K::Sysext, K::RpmOstree, K::Pacman] {
+            assert_eq!(apply_leg(kind, bare), None, "{}", kind.as_str());
+        }
+        assert_eq!(apply_leg(K::SteamosSource, bare), Some(Leg::SteamosSource));
+        let no_sysupgrade = Caps {
+            pacman_optin: false,
+            ..ready()
+        };
+        assert_eq!(apply_leg(K::Pacman, no_sysupgrade), None);
+        assert_eq!(apply_leg(K::Apt, no_sysupgrade), Some(Leg::Helper));
+    }
+
+    /// Apply runs a helper leg without the group, since polkit decides; status shows the
+    /// command and the hint until the operator joins.
+    #[test]
+    fn the_group_gates_the_button_and_the_hint_only() {
+        use detect::InstallKind as K;
+        let outside = Caps {
+            opted_in: false,
+            ..ready()
+        };
+        assert_eq!(apply_leg(K::Apt, outside), Some(Leg::Helper));
+        assert_eq!(support(K::Apt, outside), "notify");
+        assert!(opt_in_would_help(K::Apt, outside));
+        assert!(opt_in_would_help(
+            K::Pacman,
+            Caps {
+                pacman_optin: false,
+                ..outside
+            }
+        ));
+        assert!(!opt_in_would_help(K::SteamosSource, outside));
+        assert!(!opt_in_would_help(K::Apt, ready()));
+        assert!(!opt_in_would_help(
+            K::Apt,
+            Caps {
+                helper: false,
+                ..outside
+            }
+        ));
+    }
+
+    /// Source-rebuild and helper legs are Linux-only.
+    #[test]
+    fn off_linux_only_the_installer_applies() {
+        let elsewhere = Caps {
+            apply_disabled: false,
+            ..Caps::default()
+        };
+        for kind in KINDS {
+            let want = (kind == detect::InstallKind::WindowsInstaller).then_some(Leg::Installer);
+            assert_eq!(apply_leg(kind, elsewhere), want, "{}", kind.as_str());
+        }
     }
 
     /// `last_error` and `not_published` never arrive together. The benign
@@ -697,12 +782,6 @@ mod tests {
     }
 
     #[test]
-    fn pinned_keys_skip_empty_rotation_slot() {
-        let keys = pinned_keys();
-        assert_eq!(keys.len(), 1, "one live key, one empty rotation slot");
-    }
-
-    #[test]
     fn stale_math() {
         let mk = |serial| Snapshot {
             checked: Some(Checked {
@@ -717,7 +796,7 @@ mod tests {
                     "stable",
                 )
                 .unwrap(),
-                fetched_unix: now_unix(),
+                fetched_unix: crate::clock::unix_secs_u64(),
             }),
             last_error: None,
             not_published: false,
@@ -725,8 +804,8 @@ mod tests {
             last_result: None,
             source_behind: None,
         };
-        assert!(!mk(now_unix()).stale());
-        assert!(mk(now_unix() - STALE_AFTER.as_secs() - 10).stale());
+        assert!(!mk(crate::clock::unix_secs_u64()).stale());
+        assert!(mk(crate::clock::unix_secs_u64() - STALE_AFTER.as_secs() - 10).stale());
     }
 
     #[test]
@@ -736,5 +815,22 @@ mod tests {
         assert!(source_newer(Some(3)));
         assert!(!source_newer(Some(0)));
         assert!(!source_newer(None));
+    }
+
+    /// A canary Deck stamps the canary base, so the feed's run-number compare cannot answer
+    /// for it. Apply must still accept what status offered.
+    #[test]
+    fn a_deck_build_is_offered_what_its_checkout_is_behind() {
+        use detect::{Channel, InstallKind};
+        let m: Manifest = serde_json::from_value(serde_json::json!({
+            "schema": 1, "channel": "canary", "serial": 1,
+            "version": "0.41.0~ci32773.gdeadbeef", "ci_run": 32773,
+        }))
+        .unwrap();
+        let deck = "0.41.0+g17d166764";
+        let offer = |kind, behind| offers_update(kind, Channel::Canary, deck, &m, behind);
+        assert!(offer(InstallKind::SteamosSource, Some(2)));
+        assert!(!offer(InstallKind::SteamosSource, Some(0)));
+        assert!(!offer(InstallKind::Pacman, Some(2)));
     }
 }

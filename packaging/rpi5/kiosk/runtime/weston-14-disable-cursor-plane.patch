@@ -1,0 +1,14 @@
+--- a/libweston/backend-drm/drm.c
++++ b/libweston/backend-drm/drm.c
+@@ -4116,6 +4116,11 @@
+ 
+ 	/* A this point we have some idea of whether or not we have a working
+ 	 * cursor plane. */
++	if (getenv("WESTON_DRM_DISABLE_CURSOR_PLANE")) {
++		device->cursors_are_broken = true;
++		weston_log("Hardware cursor disabled by environment\n");
++	}
++
+ 	if (!device->cursors_are_broken)
+ 		compositor->capabilities |= WESTON_CAP_CURSOR_PLANE;
+ 

@@ -41,17 +41,13 @@ RUN pacman -Syu --noconfirm --needed \
         # below. It does NOT affect the gamescope companion leg — that is meson + its own linker,
         # and its `-static-libstdc++` link is untouched.
         mold \
-        # bun builds the punktfunk-web console + the punktfunk-scripting runner AND is vendored as
-        # their runtime (PF_WITH_WEB=1 / PF_WITH_SCRIPTING=1) — so these bytes end up inside the
-        # package arch.yml signs and publishes. Arch ships bun in [extra], so take the
-        # pacman-signed package (pacman verifies package signatures by default) instead of piping
-        # bun.sh's installer into root's shell, which would be upstream code choosing them. Same
-        # call as arch.yml's bootstrap guard. It rides THIS transaction rather than a later layer
-        # on purpose: -Syu refreshes the db in the same step that installs, so a cache-hit rebuild
-        # can never resolve bun against a stale snapshot the mirrors no longer carry.
-        bun \
-    && pacman -Scc --noconfirm \
-    && bun --version
+    && pacman -Scc --noconfirm
+
+# bun builds the punktfunk-web console + the punktfunk-scripting runner AND is vendored as their
+# runtime (PF_WITH_WEB=1 / PF_WITH_SCRIPTING=1), so these bytes end up in the package arch.yml
+# signs. The pinned asset from ci/bun.env, not [extra]'s rolling bun.
+COPY bun.env install-bun.sh /tmp/
+RUN sh /tmp/install-bun.sh && rm /tmp/bun.env /tmp/install-bun.sh
 
 # Shared compile cache: jobs set RUSTC_WRAPPER=sccache (backend = RustFS S3 on the LAN,
 # see .gitea/workflows — the env lives there so dev use of this image stays uncached).

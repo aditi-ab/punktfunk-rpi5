@@ -12,7 +12,7 @@ final class GamepadMotionReachTests: XCTestCase {
     private typealias Pad = PunktfunkConnection.GamepadType
 
     func testOnlyTheXboxClassesLackAMotionPlane() {
-        for kind: Pad in [.xbox360, .xboxOne] {
+        for kind: Pad in [.xbox360, .xboxOne, .xboxElite] {
             XCTAssertFalse(kind.hasMotion, "\(kind) should have no motion plane")
         }
         for kind: Pad in [
@@ -58,5 +58,23 @@ final class GamepadMotionReachTests: XCTestCase {
         XCTAssertTrue(Pad.motionReaches(declared: .dualSense, asked: .dualSense, resolved: .auto))
         // Even then the declaration still speaks when it is the thing without a plane.
         XCTAssertFalse(Pad.motionReaches(declared: .xbox360, asked: .dualSense, resolved: .auto))
+    }
+
+    /// An Elite echo decodes as the Elite, not as the unknown `.auto` that assumes a gyro.
+    func testAnEliteEchoHasNoMotionPlane() {
+        let echo = Pad(rawValue: UInt32(PUNKTFUNK_GAMEPAD_XBOXELITE)) ?? .auto
+        XCTAssertFalse(Pad.motionReaches(declared: .auto, asked: .auto, resolved: echo))
+    }
+
+    /// The env/dev hooks take the host's `GamepadPref` / `CompositorPref::from_name` names.
+    func testNamesMatchTheHostParser() {
+        XCTAssertEqual(Pad(name: " Elite2 "), .xboxElite)
+        XCTAssertEqual(Pad(name: "xone"), .xboxOne)
+        XCTAssertEqual(Pad(name: "xbox1"), .xboxOne)
+        XCTAssertNil(Pad(name: "ds5"))
+        typealias Comp = PunktfunkConnection.Compositor
+        XCTAssertEqual(Comp(name: "plasma"), .kwin)
+        XCTAssertEqual(Comp(name: "wlr"), .wlroots)
+        XCTAssertEqual(Comp(name: " detect "), .auto)
     }
 }

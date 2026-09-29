@@ -1,39 +1,23 @@
-// Session audio, both directions:
+// Session audio, both directions.
 //
-//   host → speaker: a drain thread pulls audio packets off their own plane in the core, which
-//   decodes them there (nextAudioPcm) and hands back interleaved f32, and writes that into a
-//   jitter ring; an AVAudioSourceNode pulls from the ring (silence on underrun with re-priming,
-//   so a network gap costs one dip, not permanent crackle).
+// Host → speaker: a drain thread pulls decoded audio off its plane in the core (nextAudioPcm)
+// into a jitter ring, and an AVAudioSourceNode plays the ring. An underrun plays silence and
+// re-primes. The ring, the A/V sync loop and the render format are built from the NEGOTIATED
+// rate and channel count (`connection.resolvedAudioRateHz`), never from 48 kHz stereo: the
+// lossless plane carries other rates and surround (design/hi-res-audio.md §9).
 //
-//   mic → host: a tap on the input node folds the capture to one mono bus (the chosen channel
-//   of a multi-channel interface, or a sum of all channels), resamples to 48 kHz mono, slices
-//   10 ms chunks, Opus-encodes, and sendMic()s each packet — the host feeds them into a
-//   virtual PipeWire source.
+// Mic → host: `MicUplink` folds each IO quantum to mono, and a worker resamples to 48 kHz,
+// slices 10 ms chunks, Opus-encodes and sends them. The uplink is always 48 kHz Opus.
 //
-// The downlink's FORMAT is negotiated, not assumed. `connection.resolvedAudioRateHz` is 48 kHz
-// for every Opus session and every host older than the lossless plane, and any rate on the
-// lossless ladder (44 100 / 48 000 / 88 200 / 96 000 / 176 400) on `0xD3` — and it is what the
-// ring, the A/V sync loop and the render graph's AVAudioFormat are all built from
-// (design/hi-res-audio.md §9). Its CHANNEL count is negotiated the same way and is no longer
-// stereo on the lossless plane either: the frame ladder is sized per channel count, so a 5.1/7.1
-// lossless session simply arrives on a shorter frame. The UPLINK is deliberately untouched: Opus
-// is 48 kHz by construction and the mic carries voice, so §3 excludes it.
+// Topology. With the mic and echo cancellation on, both defaults, both directions run on ONE
+// engine with the voice processor engaged: it cancels echo only when render and capture share
+// a unit. It follows the system default devices only, so a pinned endpoint takes two engines
+// instead. See `wantsCombined`.
 //
-// Engine topology. With the mic enabled and echo cancellation on (both defaults), BOTH
-// directions run on ONE AVAudioEngine with the system voice processor engaged
-// (`setVoiceProcessingEnabled`) — AEC needs render and capture on the same unit so it can
-// subtract what the speaker is playing from what the mic hears; without it, a loudspeaker
-// client feeds the host's own game audio straight back to it (the primary reported echo
-// source). The voice processor can only follow the system DEFAULT devices, so explicit
-// endpoint choices fall back to the old two-engine topology — see `wantsCombined` for the
-// exact decision, and `startCapture` for why two engines handle arbitrary device pairs.
+// Devices are chosen by UID. "" is the system default, and the engine then follows it.
 //
-// Devices are chosen by UID ("" = system default: the engine is then never pinned to a
-// concrete device and follows default-device changes).
-//
-// Surviving the hardware. An AVAudioEngine does NOT follow the audio hardware: when the output
-// device changes underneath a running engine, the engine stops itself and stays stopped. The
-// session therefore watches for that and rebuilds its engines — see "Device changes" below.
+// An AVAudioEngine does not follow the hardware: when its device changes it stops and stays
+// stopped. The session watches for that and rebuilds its engines. See "Device changes".
 
 import AVFoundation
 import os
@@ -63,6 +47,11 @@ public final class SessionAudio {
     /// The one engine running BOTH directions when the voice processor is engaged;
     /// `playbackEngine`/`captureEngine` stay nil while this is set.
     private var combinedEngine: AVAudioEngine?
+    #if !os(tvOS)
+    /// The capture behind whichever engine carries the mic. Guarded by `stateLock`, and
+    /// published with its engine.
+    private var micUplink: MicUplink?
+    #endif
     private var drainStarted = false
     /// The mute LATCH: the effective mute the owner last asked for (see `setMicMuted`). Held
     /// because the uplink engine can appear LATER than the request — the mic permission prompt
@@ -263,7 +252,7 @@ public final class SessionAudio {
         let session = AVAudioSession.sharedInstance()
         let wanted = Double(wireRateHz)
         do {
-            #if os(iOS)
+            #if os(iOS) || os(visionOS)
             if micEnabled {
                 // NO .defaultToSpeaker here, deliberately. It reads like "prefer the speaker over
                 // the earpiece", and the comment that used to sit here claimed headphones and
@@ -323,6 +312,12 @@ public final class SessionAudio {
                 try? session.setPreferredOutputNumberOfChannels(wireChannels)
             }
             try session.setActive(true)
+            // Apple validates the channel ask against the ACTIVE route's maximum, so the ask
+            // above can come back as 2. Ask again, clamped: an 8-channel wire on a 5.1 AVR gets 6.
+            let reachable = min(wireChannels, session.maximumOutputNumberOfChannels)
+            if reachable > 2, session.outputNumberOfChannels < reachable {
+                try? session.setPreferredOutputNumberOfChannels(reachable)
+            }
             // What we were actually GRANTED, not what we asked for. All three are best-effort, and
             // the ring's behaviour depends on the quantum it really gets — without this, a report of
             // audio jitter arrives with no way to tell a 10 ms session from a 5 ms or a 23 ms one,
@@ -350,7 +345,7 @@ public final class SessionAudio {
                     buffer at this size.
                     """)
             }
-            #if os(iOS)
+            #if os(iOS) || os(visionOS)
             // Only the `.playAndRecord` session can land on the earpiece, and only it accepts an
             // output override — so the mic-off (`.playback`) path deliberately does neither.
             // (The route OBSERVER that re-applies this per route is installed by
@@ -364,7 +359,7 @@ public final class SessionAudio {
     }
     #endif
 
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     /// `.playAndRecord` parks the BUILT-IN output on the earpiece — right for a phone call,
     /// useless for a game. Move it to the speaker, but ONLY when the route we were actually given
     /// is the receiver: anything external (Bluetooth, wired, CarPlay, AirPlay) is left strictly
@@ -408,7 +403,7 @@ public final class SessionAudio {
             // other call into it.
             SessionAudio.sessionQueue.async {
                 guard let self, !self.flag.isStopped else { return }
-                #if os(iOS)
+                #if os(iOS) || os(visionOS)
                 self.steerBuiltInOutputToSpeaker(AVAudioSession.sharedInstance())
                 #endif
                 self.reviveStoppedEngines("the audio route changed")
@@ -477,6 +472,12 @@ public final class SessionAudio {
                 guard let self else { return }
                 self.engineQueue.async { [weak self] in
                     guard let self, granted, !self.flag.isStopped else { return }
+                    // A rebuild during the prompt asks again, so a grant can call back twice, and
+                    // a rebuild after it may have started the mic already. Never start a second.
+                    self.stateLock.lock()
+                    let micLive = self.captureEngine != nil || self.combinedEngine != nil
+                    self.stateLock.unlock()
+                    guard !micLive else { return }
                     if combined {
                         self.stateLock.lock()
                         let playback = self.playbackEngine
@@ -579,16 +580,17 @@ public final class SessionAudio {
         playbackEngine = nil
         let combined = combinedEngine
         combinedEngine = nil
+        #if !os(tvOS)
+        let uplink = micUplink
+        micUplink = nil
+        #endif
         stateLock.unlock()
-        if let capture {
-            capture.inputNode.removeTap(onBus: 0)
-            capture.stop()
-        }
+        capture?.stop()
         playback?.stop()
-        if let combined {
-            combined.inputNode.removeTap(onBus: 0)
-            combined.stop()
-        }
+        combined?.stop()
+        #if !os(tvOS)
+        uplink?.stop() // after its engine: see `MicUplink.stop`
+        #endif
     }
 
     // MARK: - Device changes
@@ -679,6 +681,15 @@ public final class SessionAudio {
             #else
             break // the watcher only raises this one on macOS
             #endif
+        case .deviceList:
+            #if os(macOS)
+            // Only a pinned endpoint returns without the default moving. Unpinned sessions skip
+            // it: the voice processor's own aggregate device churns this list.
+            stateLock.lock()
+            let pinned = startConfig.map { !$0.speakerUID.isEmpty || !$0.micUID.isEmpty } ?? false
+            stateLock.unlock()
+            if pinned { defaultOutputChanged() }
+            #endif
         }
     }
 
@@ -765,7 +776,7 @@ public final class SessionAudio {
     /// Runs on `engineQueue`.
     ///
     /// A full rebuild rather than a `start()` on the stopped engine, because the mic side has to
-    /// follow too: `installMicTap` reads the input's live format, and the voice processor
+    /// follow too: `installMicCapture` reads the input's live format, and the voice processor
     /// renegotiates its own. The RING is deliberately not touched — it is the one thing carried
     /// across (`makePlaybackChain` reuses it, `startDrain` is idempotent), so the drain thread
     /// keeps decoding right through the switch and its overflow policy has already dropped
@@ -816,11 +827,11 @@ public final class SessionAudio {
     }
 
     #if os(macOS)
-    /// The system's output device moved. Rebuild only when it actually concerns this session: the
-    /// engine is gone or stopped, or it is playing to a device that is no longer the one we should
-    /// be on. Somebody changing the default while we are pinned to a named speaker is none of our
-    /// business, and rebuilding for it would cost an audible gap for nothing. Main queue (the
-    /// listener block is registered against it).
+    /// The system's output device moved, or a device came or went. Rebuild only when it concerns
+    /// this session: the engine is gone or stopped, or the speaker or pinned mic is not the device
+    /// it should be on (a pinned one that came back). Somebody changing the default while we are
+    /// pinned to a named speaker is none of our business, and rebuilding for it would cost an
+    /// audible gap for nothing. Main queue (the listener block is registered against it).
     private func defaultOutputChanged() {
         guard !flag.isStopped, let config = startConfig else { return }
         stateLock.lock()
@@ -838,8 +849,21 @@ public final class SessionAudio {
         let shouldBeOn = config.speakerUID.isEmpty
             ? AudioDevices.defaultOutputDevice()
             : AudioDevices.deviceID(forUID: config.speakerUID)
-        guard let shouldBeOn, shouldBeOn != playingOn else { return }
-        scheduleEngineRebuild(reason: "the output device changed under the session")
+        if let shouldBeOn, shouldBeOn != playingOn {
+            scheduleEngineRebuild(reason: "the output device changed under the session")
+            return
+        }
+        // The split capture engine fell back to the default when its pinned mic went away.
+        guard !config.micUID.isEmpty,
+              let wanted = AudioDevices.deviceID(forUID: config.micUID)
+        else { return }
+        stateLock.lock()
+        let capture = captureEngine
+        stateLock.unlock()
+        guard let unit = capture?.inputNode.audioUnit, let micOn = Self.currentDevice(of: unit),
+              micOn != wanted
+        else { return }
+        scheduleEngineRebuild(reason: "the pinned microphone came back")
     }
     #endif
 
@@ -904,20 +928,34 @@ public final class SessionAudio {
     ///
     /// Two-engine sessions pause/resume the capture engine; a combined session instead mutes the
     /// voice processor's input (playback shares that engine and must keep running, so the engine
-    /// itself never pauses — the mute zeroes the mic at the IO unit, and the tap encodes silence).
-    /// Local and instant either way: nothing is negotiated with the host, and the packets that do
+    /// itself never pauses — the mute zeroes the mic at the IO unit, and the uplink encodes
+    /// silence).
+    /// Local either way: nothing is negotiated with the host, and the packets that do
     /// leave carry silence. A no-op when there's no uplink (playback-only / tvOS / mic disabled),
     /// except that the state is LATCHED for an uplink that starts later. The audio SESSION stays
     /// active for background playback, so iOS may keep showing the recording indicator until a
     /// full reconfigure — either path stops room audio leaving the device, which is the
-    /// privacy-relevant part. Main thread.
+    /// privacy-relevant part. Main thread; the engine work runs on `engineQueue`, where an unmute's
+    /// start can block on a Bluetooth mic, and where it can't race a rebuild's teardown.
     public func setMicMuted(_ muted: Bool) {
         stateLock.lock()
         micMuted = muted
-        let capture = captureEngine
-        let combined = combinedEngine
         stateLock.unlock()
-        apply(micMuted: muted, capture: capture, combined: combined)
+        engineQueue.async { [weak self] in
+            guard let self else { return }
+            self.stateLock.lock()
+            let muted = self.micMuted // the newest request, if several queued
+            let capture = self.captureEngine
+            let combined = self.combinedEngine
+            self.stateLock.unlock()
+            self.apply(micMuted: muted, capture: capture, combined: combined)
+        }
+    }
+
+    private var latchedMicMute: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return micMuted
     }
 
     /// Push the latched mute onto whichever engine carries the uplink. Split out from
@@ -995,22 +1033,15 @@ public final class SessionAudio {
         // for the rate — `resolvedAudioRateHz`, never the 96 kHz this client may have asked for.
         let channels = Int(connection.resolvedAudioChannels)
         let rateHz = wireRateHz
-        // One SECOND of interleaved capacity at the session's format. The de-jitter depth itself is
-        // the ring's own business now (`AudioRing.targetMS`, mirroring `JitterTuning::COREAUDIO`)
-        // rather than a prefill passed in here.
+        // One second of capacity at the session's format. The de-jitter depth is the ring's
+        // `JitterPolicy`, not a prefill passed in here.
         stateLock.lock()
         let ring = self.ring ?? AudioRing(seconds: 1, channels: channels, rateHz: rateHz)
         self.ring = ring
         stateLock.unlock()
-        // The session's REAL frame, which the ring cannot know at construction and must not assume:
-        // the shed drops exactly one frame and the target floor is a device quantum plus one, so a
-        // ring left on the 5 ms default sheds two and a half frames at a time on a 96 kHz session
-        // and fades across a whole one. Idempotent, so the rebuild path that reuses this very ring
-        // simply sets it again.
+        // The session's real frame: the shed and the priming lift are one frame. Idempotent, so
+        // a rebuild that reuses this ring sets it again.
         ring.setFrameUs(wireFrameUs)
-        // The device behind this engine may be a different one, or the same one with a different
-        // buffer grant. The largest callback the PREVIOUS engine saw is not a floor for this one.
-        ring.forgetRenderQuantum()
 
         // Engine-native deinterleaved float; the render block deinterleaves the ring's wire order,
         // surround with an explicit channel layout (`wireChannelLayout` is failable — hence
@@ -1048,6 +1079,20 @@ public final class SessionAudio {
         return (ring, source, format)
     }
 
+    /// Connect the main mixer to the output at the output's own width. The connection the engine
+    /// makes on first use of `mainMixerNode` is stereo whatever the route carries, so a 5.1 or 7.1
+    /// source folds to 2 channels inside the engine and HDMI gets PCM 2.0 in 8 slots. A stereo
+    /// route keeps the default connection.
+    private func connectMixerAtOutputWidth(_ engine: AVAudioEngine) {
+        let hw = engine.outputNode.outputFormat(forBus: 0)
+        guard hw.channelCount > 2, hw.sampleRate > 0,
+              let layout = hw.channelLayout ?? wireChannelLayout(channels: Int(hw.channelCount)),
+              layout.channelCount == hw.channelCount
+        else { return }
+        let format = AVAudioFormat(standardFormatWithSampleRate: hw.sampleRate, channelLayout: layout)
+        engine.connect(engine.mainMixerNode, to: engine.outputNode, format: format)
+    }
+
     /// Say — out loud, in the log — what rate and channel count this engine is REALLY rendering
     /// at, versus what the session negotiated. Call it after `prepare()`, when the output node
     /// has settled on the device's format; on iOS/tvOS that follows the AVAudioSession, on macOS
@@ -1061,12 +1106,29 @@ public final class SessionAudio {
     /// graph — the mixer's conversion is the correct fallback; somebody just has to say it
     /// happened.
     private func noteOutputFormat(_ engine: AVAudioEngine, wireRateHz: Int) {
+        // What the device adds behind the ring; A/V sync counts it as audio already queued.
+        #if os(macOS)
+        let latency = engine.outputNode.presentationLatency
+        #else
+        let latency = AVAudioSession.sharedInstance().outputLatency
+        #endif
+        stateLock.lock()
+        let ring = self.ring
+        stateLock.unlock()
+        ring?.noteOutputLatency(ns: Int64(max(0, latency) * 1_000_000_000))
         let outFormat = engine.outputNode.outputFormat(forBus: 0)
         let deviceRate = Int(outFormat.sampleRate)
         // 0 = the node has no device yet (a start that is about to fail) — nothing to compare.
         guard deviceRate > 0 else { return }
         let outChannels = Int(outFormat.channelCount)
         let wireChannels = Int(connection.resolvedAudioChannels)
+        let mixerChannels = Int(engine.mainMixerNode.outputFormat(forBus: 0).channelCount)
+        if mixerChannels < wireChannels, outChannels >= wireChannels {
+            log.warning("""
+                the engine mixes to \(mixerChannels)ch before a \(outChannels)ch output — the \
+                \(wireChannels)ch session folds inside the engine
+                """)
+        }
         if deviceRate == wireRateHz, outChannels == wireChannels {
             log.info("""
                 audio output opened at \(wireRateHz) Hz \(outChannels)ch — the negotiated format
@@ -1111,6 +1173,7 @@ public final class SessionAudio {
         #endif
         engine.attach(source)
         engine.connect(source, to: engine.mainMixerNode, format: format)
+        connectMixerAtOutputWidth(engine)
         engine.prepare()
         do {
             try engine.start()
@@ -1183,16 +1246,15 @@ public final class SessionAudio {
 
     /// One engine, both directions: engage the system voice processor on the shared IO unit
     /// (AEC + noise suppression + AGC), hang the playback source off its render side and the
-    /// mic tap off its capture side. Every failure falls back to a WORKING configuration —
+    /// mic capture off its input. Every failure falls back to a WORKING configuration —
     /// the split path (no AEC) when the voice processor won't engage, plain playback when the
     /// mic chain can't be built — a session never loses audio to the echo-cancel feature.
     private func startCombined(speakerUID: String, micUID: String, micChannel: Int) {
         let engine = AVAudioEngine()
         let input = engine.inputNode
         do {
-            // Before anything reads the input's format: the voice processor changes it (often
-            // to its own mono mix, sometimes at a lower rate) — installMicTap reads the format
-            // AFTER this, so the converter chain adapts to whatever the processor emits.
+            // Before anything reads the input's format: the voice processor changes it, often
+            // to its own mono mix and sometimes to a lower rate.
             try input.setVoiceProcessingEnabled(true)
         } catch {
             log.warning("""
@@ -1220,47 +1282,29 @@ public final class SessionAudio {
         }
         engine.attach(source)
         engine.connect(source, to: engine.mainMixerNode, format: format)
+        connectMixerAtOutputWidth(engine)
 
-        // The capture side must be PULLED, and only the render graph pulls anything. An input
-        // node carrying nothing but a tap is not part of that graph, so on the combined engine
-        // nobody drove it: the IO unit came up (the recording indicator lit for a beat, then went
-        // out as the input went idle) and NOT ONE BUFFER ever reached the tap — no error, no
-        // failed start, just a session that quietly sent no microphone at all. Routing the input
-        // through a silent sink puts it in the graph, which is what Apple's own voice-processing
-        // sample does. The split path never needed it: a capture-only engine has the input node
-        // AS its graph, so it is pulled by definition — which is why this only broke when the
-        // combined topology became the default.
-        //
-        // `outputVolume = 0` on the sink: the mic has to reach the graph, never the speaker. At
-        // any audible volume this is a microphone wired straight to the earpiece.
-        let micSink = AVAudioMixerNode()
-        engine.attach(micSink)
-        micSink.outputVolume = 0
-        engine.connect(engine.inputNode, to: micSink, format: nil)
-        engine.connect(micSink, to: engine.mainMixerNode, format: nil)
-
-        // BEFORE the tap reads a format. Enabling voice processing swaps the engine's IO unit
-        // for the VPIO one and renegotiates its formats, and until the engine is prepared the
-        // input node can still report the pre-swap state — 0 Hz / 0 channels included, which
-        // `installMicTap` (correctly) refuses as "no usable input device". Preparing first means
-        // the chain is built against what the voice processor will actually emit.
+        // Prepared before the capture reads a format: enabling voice processing swaps the IO
+        // unit, and until then the input can report 0 Hz, which reads as no input device.
         engine.prepare()
-        guard installMicTap(on: engine.inputNode, micUID: micUID, micChannel: micChannel) else {
-            // Mic chain unavailable on the voice-processed engine (logged). The mic outranks
-            // echo cancellation: fall back to the split path — own engine, no voice processor —
-            // rather than dropping the uplink for the session.
+        guard let uplink = installMicCapture(
+            on: engine, micUID: micUID, micChannel: micChannel)
+        else {
+            // The mic outranks echo cancellation: fall back to the split path.
             engine.stop()
             noteCombinedFailure()
             startPlayback(speakerUID: speakerUID)
             startCapture(micUID: micUID, micChannel: micChannel)
             return
         }
+        // Mute before the IO unit opens: applied after start, the first quantum is room audio.
+        engine.inputNode.isVoiceProcessingInputMuted = latchedMicMute
         do {
             try engine.start()
         } catch {
             log.error("combined engine failed to start: \(error.localizedDescription)")
-            engine.inputNode.removeTap(onBus: 0)
             engine.stop()
+            uplink.stop()
             noteCombinedFailure()
             // Same rule: a working mic without echo cancellation beats no mic at all.
             startPlayback(speakerUID: speakerUID)
@@ -1270,17 +1314,17 @@ public final class SessionAudio {
         stateLock.lock()
         if flag.isStopped {
             stateLock.unlock()
-            input.removeTap(onBus: 0)
             engine.stop() // stop() already ran — don't strand a started engine (or a hot mic)
+            uplink.stop()
             return
         }
         combinedEngine = engine
+        micUplink = uplink
         let muted = micMuted // latched before this engine existed (a mute during the prompt)
         stateLock.unlock()
         apply(micMuted: muted, capture: nil, combined: engine)
-        // Worth its own read on this path rather than only the plain one: the voice processor picks
-        // its OWN formats when it engages (that is why the mic tap reads them after `prepare()`),
-        // and a VPIO unit is the least likely thing in the graph to have honoured a 96 kHz request.
+        // Read on this path too: the voice processor picks its own formats, and a VPIO unit
+        // is the least likely thing in the graph to have honoured a 96 kHz request.
         noteOutputFormat(engine, wireRateHz: wireRateHz)
         startDrain(into: ring)
         log.info("audio engines joined — voice processing (echo cancellation) active")
@@ -1306,21 +1350,23 @@ public final class SessionAudio {
             }
         }
         #endif
-        // Prepared before the tap reads a format, for the same reason the combined path does it:
-        // a node that hasn't been through `prepare()` can still report the pre-negotiation
-        // format (0 Hz / 0 channels on a device that is perfectly fine), which reads downstream
-        // as "no microphone".
+        // Prepared before the capture reads a format: an unprepared input can report 0 Hz on
+        // a working device, which reads as no microphone.
         engine.prepare()
-        guard installMicTap(on: engine.inputNode, micUID: micUID, micChannel: micChannel) else {
+        guard let uplink = installMicCapture(
+            on: engine, micUID: micUID, micChannel: micChannel)
+        else {
             log.error("mic uplink unavailable — this session sends no microphone audio")
             engine.stop()
             return
         }
+        // A muted uplink stays unstarted (the unmute starts it): a start opens the mic before
+        // the mute could pause it.
         do {
-            try engine.start()
+            if !latchedMicMute { try engine.start() }
         } catch {
             log.error("capture engine failed to start: \(error.localizedDescription)")
-            input.removeTap(onBus: 0)
+            uplink.stop()
             return
         }
         stateLock.lock()
@@ -1328,61 +1374,71 @@ public final class SessionAudio {
             // stop() ran while we were starting (the permission prompt resolves at the
             // user's leisure) — tear the engine down ourselves, nobody else owns it now.
             stateLock.unlock()
-            input.removeTap(onBus: 0)
             engine.stop()
+            uplink.stop()
             return
         }
         captureEngine = engine
+        micUplink = uplink
         let muted = micMuted // latched before this engine existed (a mute during the prompt)
         stateLock.unlock()
         apply(micMuted: muted, capture: engine, combined: nil)
         log.info("mic uplink started (\(micUID.isEmpty ? "default input" : micUID))")
     }
 
-    /// Resolve the input's live format + fold plan, build the mono→Opus chain, and install the
-    /// capture tap on `input` — everything mic except engine ownership, shared verbatim by the
-    /// combined and split topologies. Reads `input.outputFormat(forBus:)` at call time, so the
-    /// chain follows whatever the node emits: the raw device format, or the voice processor's
-    /// own mix when that's enabled. False (logged) when no input is usable or the encoder
-    /// can't be built; the tap is installed on true.
-    private func installMicTap(
-        on input: AVAudioInputNode, micUID: String, micChannel: Int
-    ) -> Bool {
-        let inFormat = input.outputFormat(forBus: 0)
-        // The tap carries the node's OUTPUT format, but AVFAudio validates that against the input
-        // HARDWARE format and raises an uncatchable Objective-C exception when the two don't line
-        // up. With no default input device the hardware side reads 0 Hz / 0 ch while the output
-        // side still reports the default-device aggregate — 2 ch of AirPlay, seemingly recordable.
+    /// Everything mic except engine ownership, shared by the combined and split topologies:
+    /// put a `MicUplink` on the engine's input, read the format the input then emits (the
+    /// device's, or the voice processor's own mix), and start the mono→Opus chain behind it.
+    /// nil (logged) when no input is usable or the encoder can't be built.
+    ///
+    /// The sink node is also what puts a combined engine's input in the render graph. Nothing
+    /// else pulls it, and an input nobody pulls delivers no audio and reports no error.
+    ///
+    /// Call with the engine prepared and not running.
+    private func installMicCapture(
+        on engine: AVAudioEngine, micUID: String, micChannel: Int
+    ) -> MicUplink? {
+        let input = engine.inputNode
+        // Without an input device the hardware side reads 0 Hz while the output side reports
+        // the default-device aggregate. Connecting an input like that raises, and Swift can't
+        // catch it.
         let hwFormat = input.inputFormat(forBus: 0)
-        guard inFormat.sampleRate > 0, inFormat.channelCount > 0,
-              hwFormat.sampleRate > 0, hwFormat.channelCount > 0 else {
+        guard hwFormat.sampleRate > 0, hwFormat.channelCount > 0,
+              input.outputFormat(forBus: 0).sampleRate > 0
+        else {
             log.error("no usable input device — mic uplink disabled")
-            return false
+            return nil
+        }
+        let uplink = MicUplink(pinned: micChannel >= 1 ? micChannel - 1 : nil)
+        engine.attach(uplink.node)
+        // nil follows the bus. A format read a moment ago can be stale by now, and a stale one
+        // raises.
+        engine.connect(input, to: uplink.node, format: nil)
+        engine.prepare()
+        let inFormat = input.outputFormat(forBus: 0)
+        guard inFormat.sampleRate > 0, inFormat.channelCount > 0,
+              inFormat.commonFormat == .pcmFormatFloat32
+        else {
+            log.error("input format unusable (\(inFormat)) — mic uplink disabled")
+            engine.detach(uplink.node)
+            return nil
         }
 
-        // Multi-channel-interface handling. A pro interface exposes N discrete inputs with the mic
-        // on ONE of them, but AVAudioConverter's N→stereo downmix takes channels 0/1 — dead
-        // silence when the mic sits higher up (the classic "host receives zeros"). So we fold the
-        // input to a single mono bus OURSELVES and resample that. micChannel: 0 = Auto (sum every
-        // channel — a lone hot mic passes at full level), n≥1 pins 1-based input channel n.
+        // A pro interface has the mic on one of N inputs, and a converter's downmix takes
+        // channels 0 and 1. So the uplink folds to mono itself: 0 sums every channel, n ≥ 1
+        // pins 1-based input channel n.
         let inChannels = Int(inFormat.channelCount)
-        let pinnedChannel: Int? = {
-            guard micChannel >= 1 else { return nil }
-            let idx = micChannel - 1
-            guard idx < inChannels else {
-                log.warning(
-                    "mic channel \(micChannel) out of range (device has \(inChannels)) — mixing all")
-                return nil
-            }
-            return idx
-        }()
-        let channelPlan = pinnedChannel.map { "channel \($0 + 1)/\(inChannels)" }
-            ?? (inChannels > 1 ? "mix \(inChannels)ch→mono" : "mono")
+        if micChannel > inChannels {
+            log.warning(
+                "mic channel \(micChannel) out of range (device has \(inChannels)) — mixing all")
+        }
+        let channelPlan = (1...inChannels).contains(micChannel)
+            ? "channel \(micChannel)/\(inChannels)"
+            : (inChannels > 1 ? "mix \(inChannels)ch→mono" : "mono")
 
-        // Name the device we're ACTUALLY recording from + its format + how we fold it, once per
-        // session. This single line localizes the whole class of "host receives silence" failures
-        // that otherwise need a host-side tone injection to pin down: a UID that silently fell back
-        // to the default, the wrong device being live, or the wrong channel picked.
+        // The device being recorded, its format and the fold, once per session. A UID that
+        // fell back to the default, or a wrong channel, reads here and not as silence at the
+        // host.
         #if os(macOS)
         if let unit = input.audioUnit, let live = Self.currentDevice(of: unit),
            let dev = AudioDevices.describe(live) {
@@ -1408,16 +1464,10 @@ public final class SessionAudio {
             "mic capture: \(Int(inFormat.sampleRate)) Hz, \(inChannels) ch, \(channelPlan)")
         #endif
 
-        // Encode a single mono bus (folded from the tap's own buffer format): the resampler goes
-        // mono@inputSR → the encoder's 48 kHz mono, so it handles the rate change and the
-        // wrong-channel downmix never happens. Mono end to end — the host's decoder upmixes,
-        // so the old duplicate-into-stereo step only cost bits and cycles.
-        //
-        // `chain` carries the rate-dependent pieces INCLUDING the per-callback scratch buffers,
-        // preallocated HERE for the rate the input currently reports — the steady-state tap path
-        // allocates nothing. The tap rebuilds it if the device's real rate or quantum differ,
-        // which is the price of installing the tap with the bus's own format (see below).
-        let scratchFrames: AVAudioFrameCount = 8192
+        // Mono end to end: the resampler takes mono at the input's rate onto the encoder's
+        // 48 kHz mono, and the host's decoder upmixes. Every buffer is allocated here, so the
+        // worker allocates nothing in steady state.
+        let scratchFrames = AVAudioFrameCount(MicUplink.batchLimit)
         guard let encoder = try? OpusEncoder(),
               var chain = Self.micChain(
                   rate: inFormat.sampleRate, frames: scratchFrames, to: encoder.pcmFormat),
@@ -1425,58 +1475,54 @@ public final class SessionAudio {
                   pcmFormat: encoder.pcmFormat, frameCapacity: encoder.framesPerPacket)
         else {
             log.error("Opus encoder unavailable — mic uplink disabled")
-            return false
+            engine.detach(uplink.node)
+            return nil
         }
 
-        // Tap-thread-confined state: fold into `chain.mono`, resample into `chain.staging`,
-        // accumulate in `fifo`, slice `framesPerPacket` (10 ms) chunks for the encoder.
+        // Worker-confined from here: copy into `chain.mono`, resample into `chain.staging`,
+        // gather in `fifo`, slice `framesPerPacket` (10 ms) chunks for the encoder.
         var fifo: [Float] = []
         fifo.reserveCapacity(48_000)
         var seq: UInt32 = 0
+        var batches = 0
         let connection = connection
         let flag = flag
+        let node = uplink.node
 
-        // Silence tripwire (tap-confined): a "recording" app can be handed pure digital zeros —
-        // a zeroed input-volume slider, a stale TCC grant, a muted device, OR the wrong channel
-        // picked — and everything downstream looks alive while the host gets silence. Track the
-        // peak of the EXTRACTED mono bus over the first ~10 s (not the raw device — a mic present
-        // on a channel we didn't grab must still read as silence) and emit exactly ONE verdict.
-        // This is the log line whose absence made the last occurrence take a host-side tone.
+        // An app can be handed digital zeros (a zeroed input slider, a stale grant, the wrong
+        // channel) while everything downstream looks alive. One verdict on the first 10 s of
+        // the folded bus says which.
         let silenceWindow = Int(inFormat.sampleRate * 10)
         let deviceLabel = micUID.isEmpty ? "default input" : micUID
         var framesInspected = 0
         var inputPeak: Float = 0
         var levelReported = false
+        var firstBatch = true
 
-        // 480 frames = 10 ms, matching the packet duration — advisory, CoreAudio delivers the
-        // device quantum whatever we ask. `format: nil` (not the format read above) means
-        // "whatever the bus emits": a format read a moment earlier can go stale under a device
-        // switch or a rate change, and a stale one raises where nil follows the bus.
-        input.installTap(onBus: 0, bufferSize: 480, format: nil) { buffer, _ in
+        uplink.start { samples, frames in
             if flag.isStopped { return }
-            let frames = Int(buffer.frameLength)
-            guard frames > 0, let src = buffer.floatChannelData else { return }
-            // Rebuild the rate-dependent chain when the device changes rate under a live tap
-            // (resampling by the old ratio would pitch-shift the mic), and when a quantum larger
-            // than the scratch arrives (`bufferSize` is advisory both ways) — regrown once to the
-            // new high-water mark, so the steady state stays allocation-free.
-            if buffer.format.sampleRate != chain.monoFormat.sampleRate
-                || buffer.frameLength > chain.mono.frameCapacity {
-                guard let rebuilt = Self.micChain(
-                          rate: buffer.format.sampleRate,
-                          frames: max(buffer.frameLength, scratchFrames),
-                          to: encoder.pcmFormat)
-                else { return }
-                chain = rebuilt
+            if firstBatch {
+                firstBatch = false
+                // One IO quantum when the capture is healthy. 4800 is a 100 ms batch.
+                log.info("mic capture: first batch is \(frames) frames")
+            }
+            // Every 64 batches, about 0.7 s. An input whose rate moved under a running engine
+            // would otherwise be resampled by the old ratio, which shifts the mic's pitch.
+            batches &+= 1
+            if batches % 64 == 0 {
+                let live = node.inputFormat(forBus: 0).sampleRate
+                if live > 0, live != chain.monoFormat.sampleRate,
+                   let rebuilt = Self.micChain(
+                       rate: live, frames: scratchFrames, to: encoder.pcmFormat) {
+                    chain = rebuilt
+                }
             }
             let mono = chain.mono, staging = chain.staging, resampler = chain.resampler
-            guard let dst = mono.floatChannelData?[0] else { return }
-            mono.frameLength = buffer.frameLength
-
-            // Fold the multi-channel input down to the one mono bus we encode.
-            Self.foldToMono(
-                input: src, frames: frames, channels: Int(buffer.format.channelCount),
-                interleaved: buffer.format.isInterleaved, pinned: pinnedChannel, out: dst)
+            guard frames > 0, frames <= Int(mono.frameCapacity),
+                  let dst = mono.floatChannelData?[0]
+            else { return }
+            dst.update(from: samples, count: frames)
+            mono.frameLength = AVAudioFrameCount(frames)
 
             if !levelReported {
                 var localPeak: Float = 0
@@ -1517,9 +1563,8 @@ public final class SessionAudio {
             fifo.append(contentsOf: UnsafeBufferPointer(
                 start: p, count: Int(staging.frameLength)))
 
-            // Consume whole chunks through a head index, then drop the eaten prefix in ONE
-            // move of the sub-chunk remainder. The old per-chunk removeFirst memmoved the
-            // entire backlog for every packet — O(n) on the render-adjacent tap thread.
+            // Whole chunks go out through a head index, and the eaten prefix is dropped in one
+            // move of the remainder.
             let samplesPerChunk = Int(encoder.framesPerPacket)
             var head = 0
             while fifo.count - head >= samplesPerChunk {
@@ -1538,12 +1583,12 @@ public final class SessionAudio {
             }
             if head > 0 { fifo.removeFirst(head) } // keeps capacity — no realloc
         }
-        return true
+        return uplink
     }
 
     /// The rate-dependent half of the mic chain: a mono bus at `rate`, the resampler from it onto
-    /// the encoder's 48 kHz mono, and the two scratch buffers sized for `frames`. Grouped so the
-    /// tap can swap all four together — they are only ever valid as a set.
+    /// the encoder's 48 kHz mono, and the two scratch buffers sized for `frames`. Grouped
+    /// because they are only ever valid as a set.
     struct MicChain {
         let monoFormat: AVAudioFormat
         let resampler: AVAudioConverter
@@ -1552,9 +1597,8 @@ public final class SessionAudio {
     }
 
     /// Build a `MicChain` for `rate`, or nil if the rate is unusable or an allocation fails.
-    /// Built once up front for the format the input reports, and again from the tap whenever the
-    /// device's real rate differs — a macOS input can change rate under a live tap, and a chain
-    /// pinned to the old rate resamples by the wrong ratio (a pitch-shifted mic).
+    /// Built for the format the input reports, and again by the uplink's worker if the
+    /// input's rate moves: a chain pinned to the old rate resamples by the wrong ratio.
     /// `internal` for unit testing: it needs no engine, device or permission.
     static func micChain(
         rate: Double, frames: AVAudioFrameCount, to pcmFormat: AVAudioFormat

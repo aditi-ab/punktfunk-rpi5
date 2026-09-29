@@ -11,11 +11,12 @@
 //! `Global\pfmouse-boot-<index>` ([`mouse_index_for_slot`] — one host per seat, one index each).
 //! [`ensure_resident`] never drops the devnode; it dies with the host service.
 
-use super::dualsense_windows::{create_swdevice, SwDeviceProfile};
-use super::gamepad_raii::{DriverAttach, PadChannel, ProofTransport};
+use super::gamepad_raii::{
+    create_swdevice, DriverAttach, PadChannel, ProofTransport, SwDevice, SwDeviceProfile,
+};
 use anyhow::Result;
 use pf_driver_proto::mouse::{input_report, mouse_boot_name, MouseShm, MOUSE_MAGIC};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 use windows::Win32::Foundation::POINT;
@@ -27,9 +28,10 @@ const OFF_REPORT: usize = core::mem::offset_of!(MouseShm, report);
 const OFF_DRIVER_PROTO: usize = core::mem::offset_of!(MouseShm, driver_proto);
 const OFF_DRIVER_HEARTBEAT: usize = core::mem::offset_of!(MouseShm, driver_heartbeat);
 const OFF_PAD_INDEX: usize = core::mem::offset_of!(MouseShm, pad_index);
+const OFF_MAGIC: usize = core::mem::offset_of!(MouseShm, magic);
 
 /// The reserved display connector a seat host owns; unset on the console.
-/// `docs-site/content/docs/multi-seat-contract.md` is the contract of record.
+/// `docs-site/content/docs/developers/multi-seat-contract.md` is the contract of record.
 const SEAT_SLOT_ENV: &str = "PUNKTFUNK_SEAT_DISPLAY_SLOT";
 const FIRST_SEAT_SLOT: u8 = 12;
 const LAST_SEAT_SLOT: u8 = 15;
@@ -50,7 +52,7 @@ fn mouse_index_for_slot(raw: Option<&std::ffi::OsStr>) -> u8 {
 /// Process-lifetime `pf_mouse_<index>` plus sealed `MouseShm`. Dropping it removes the pointer.
 pub struct VirtualMouse {
     /// `None` if `SwDeviceCreate` failed; injection then uses an out-of-band devnode.
-    _sw: Option<super::gamepad_raii::SwDevice>,
+    _sw: Option<SwDevice>,
     channel: PadChannel,
     attach: DriverAttach,
     seq: u32,
@@ -63,26 +65,24 @@ impl VirtualMouse {
         let index = mouse_index_for_slot(std::env::var_os(SEAT_SLOT_ENV).as_deref());
         let boot_name = mouse_boot_name(index);
         let mut channel = PadChannel::create(boot_name.clone(), SHM_SIZE)?;
-        let base = channel.data_base();
-        // SAFETY: base points at SHM_SIZE writable bytes; the OFF_* offsets are in range. Index
-        // first, magic LAST — the same publish order the pads use.
-        unsafe {
-            std::ptr::write_unaligned(base.add(OFF_PAD_INDEX) as *mut u32, u32::from(index));
-            std::ptr::write_unaligned(base as *mut u32, MOUSE_MAGIC);
-        }
+        // Index first, magic LAST — the same publish order the pads use.
+        let shm = channel.data();
+        shm.store_u32(OFF_PAD_INDEX, u32::from(index), Ordering::Relaxed);
+        shm.store_u32(OFF_MAGIC, MOUSE_MAGIC, Ordering::Relaxed);
         let instance = format!("pf_mouse_{index}");
-        let (hsw, instance_id) = match create_swdevice(&SwDeviceProfile {
+        let (sw, instance_id) = match create_swdevice(&SwDeviceProfile {
             instance: &instance,
             container_tag: 0x5046_4D4F, // "PFMO" — never grouped with a pad's container
             container_index: index,
             hwid: "pf_mouse",
             // Virtual identity (PF:MO). USB tokens are inert for a mouse; shared profile = one path.
-            usb_vid_pid: "VID_5046&PID_4D4F",
+            usb_vid_pid: Some("VID_5046&PID_4D4F"),
             usb_mi: None,
+            bluetooth: false,
             description: "Punktfunk Virtual Mouse",
             enumerator: "punktfunk",
         }) {
-            Ok((h, i)) => (Some(h), i),
+            Ok((sw, id)) => (Some(sw), id),
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "SwDeviceCreate failed; falling back to an out-of-band pf_mouse devnode");
                 (None, None)
@@ -94,10 +94,9 @@ impl VirtualMouse {
             instance_id.clone(),
             ProofTransport::HidSerialString,
         );
-        let _sw = hsw.map(super::gamepad_raii::SwDevice::new);
         channel.deliver_eager(Duration::from_millis(1500));
         Ok(VirtualMouse {
-            _sw,
+            _sw: sw,
             channel,
             attach: DriverAttach::new(
                 "pf_mouse",
@@ -114,15 +113,11 @@ impl VirtualMouse {
     pub fn send_report(&mut self, buttons: u8, x: u16, y: u16, wheel: i8, pan: i8) {
         let r = input_report(buttons, x, y, wheel, pan);
         self.seq = self.seq.wrapping_add(1).max(1); // never publish seq 0 (= "nothing yet")
-        let base = self.channel.data_base();
-        // SAFETY: base points at SHM_SIZE bytes; the report slot is OFF_REPORT..+8 and OFF_IN_SEQ
-        // (== 4) is 4-aligned off the page-aligned base, so the AtomicU32 view is valid. The report
-        // bytes are published BEFORE the seq (Release) — the driver's Acquire load of `in_seq`
-        // therefore observes the matching report.
-        unsafe {
-            std::ptr::copy_nonoverlapping(r.as_ptr(), base.add(OFF_REPORT), r.len());
-            (*(base.add(OFF_IN_SEQ) as *const AtomicU32)).store(self.seq, Ordering::Release);
-        }
+                                                    // The report before the seq (Release): the driver's Acquire load of `in_seq` observes
+                                                    // the matching report.
+        let shm = self.channel.data();
+        shm.write_bytes(OFF_REPORT, &r);
+        shm.store_u32(OFF_IN_SEQ, self.seq, Ordering::Release);
     }
 
     /// Pump sealed-channel delivery and feed the attach watcher (8 ms timer stamps `driver_proto`).
@@ -132,19 +127,15 @@ impl VirtualMouse {
     }
 
     fn driver_proto(&self) -> u32 {
-        // SAFETY: base points at SHM_SIZE bytes; OFF_DRIVER_PROTO is in range.
-        unsafe {
-            std::ptr::read_unaligned(self.channel.data_base().add(OFF_DRIVER_PROTO) as *const u32)
-        }
+        self.channel
+            .data()
+            .load_u32(OFF_DRIVER_PROTO, Ordering::Relaxed)
     }
 
     fn driver_heartbeat(&self) -> u32 {
-        // SAFETY: base points at SHM_SIZE bytes; OFF_DRIVER_HEARTBEAT is in range.
-        unsafe {
-            std::ptr::read_unaligned(
-                self.channel.data_base().add(OFF_DRIVER_HEARTBEAT) as *const u32
-            )
-        }
+        self.channel
+            .data()
+            .load_u32(OFF_DRIVER_HEARTBEAT, Ordering::Relaxed)
     }
 }
 
@@ -183,9 +174,9 @@ pub(crate) fn hid_kick(rect: (i32, i32, i32, i32), bounds: (i32, i32, i32, i32))
     true
 }
 
-/// Park at `rect` center, dwell one composition interval, wiggle ~2 px, restore.
-/// 35 ms is load-bearing: DWM samples at the next vsync, and the driver's 8 ms
-/// report timer coalesces back-to-back writes. Restore via `GetCursorPos` is
+/// Park at `rect` center (or where the pointer already is on it), dwell one composition
+/// interval, wiggle ~2 px, restore. 35 ms is load-bearing: DWM samples at the next vsync, and
+/// the driver's 8 ms report timer coalesces back-to-back writes. Restore via `GetCursorPos` is
 /// best-effort — a wrong-session host sees the wrong pointer and leaves it at center.
 fn perform_kick(m: &mut VirtualMouse, aim: KickAim) {
     let (bx, by, bw, bh) = aim.bounds;
@@ -197,18 +188,24 @@ fn perform_kick(m: &mut VirtualMouse, aim: KickAim) {
         bounds = ?aim.bounds,
         "HID compose kick — parking the pointer on the target display (display wake + damage)"
     );
-    let map = |px: i32, py: i32| -> (u16, u16) {
-        let nx = ((px - bx).clamp(0, bw - 1) as i64 * 0x7FFF) / i64::from(bw - 1).max(1);
-        let ny = ((py - by).clamp(0, bh - 1) as i64 * 0x7FFF) / i64::from(bh - 1).max(1);
-        (nx as u16, ny as u16)
+    // Rounded, so the restore lands on the pixel it read rather than creeping up-left.
+    let scale = |v: i32, extent: i32| {
+        let span = i64::from(extent - 1).max(1);
+        ((i64::from(v.clamp(0, extent - 1)) * 0x7FFF + span / 2) / span) as u16
     };
+    let map = |px: i32, py: i32| -> (u16, u16) { (scale(px - bx, bw), scale(py - by, bh)) };
     let mut p = POINT::default();
     // SAFETY: plain FFI; `p` is a valid out-param for this synchronous call.
     let orig = unsafe { GetCursorPos(&mut p) }
         .is_ok()
         .then_some((p.x, p.y));
     let (rx, ry, rw, rh) = aim.rect;
-    let (cx, cy) = map(rx + rw / 2, ry + rh / 2);
+    // Already on the target: wiggle where it is, so the pointer the client sees does not jump.
+    let on_target = orig.filter(|&(x, y)| x >= rx && y >= ry && x < rx + rw && y < ry + rh);
+    let (cx, cy) = match on_target {
+        Some((x, y)) => map(x, y),
+        None => map(rx + rw / 2, ry + rh / 2),
+    };
     // ~2 desktop pixels in HID units, at least 1 — the wiggle must actually move the pointer.
     let dx = ((2 * 0x7FFF) / bw.max(1)).max(1) as u16;
     m.send_report(0, cx, cy, 0, 0);
@@ -356,17 +353,17 @@ pub fn channel_proof_probe() -> Result<()> {
     const PROBE_INDEX: u8 = 9;
 
     println!("creating a throwaway pf_mouse devnode (pad index {PROBE_INDEX})…");
-    let (hsw, instance_id) = create_swdevice(&SwDeviceProfile {
+    let (_sw, instance_id) = create_swdevice(&SwDeviceProfile {
         instance: "pf_mouse_probe",
         container_tag: 0x5046_4D4F, // "PFMO"
         container_index: PROBE_INDEX,
         hwid: "pf_mouse",
-        usb_vid_pid: "VID_5046&PID_4D4F",
+        usb_vid_pid: Some("VID_5046&PID_4D4F"),
         usb_mi: None,
+        bluetooth: false,
         description: "Punktfunk Virtual Mouse (channel-proof probe)",
         enumerator: "punktfunk",
     })?;
-    let _sw = super::gamepad_raii::SwDevice::new(hsw);
     let Some(instance_id) = instance_id else {
         anyhow::bail!("SwDeviceCreate reported no instance id to look the devnode up by");
     };

@@ -8,3 +8,6 @@ for f in *.vert *.frag; do
     glslc -O "$f" -o "$f.spv"
     echo "compiled $f -> $f.spv"
 done
+glslc -O chroma_interleave.comp -o chroma_rg8.comp.spv
+glslc -O -DWIDE chroma_interleave.comp -o chroma_rg16.comp.spv
+echo "compiled chroma_interleave.comp -> chroma_rg8/rg16.comp.spv"

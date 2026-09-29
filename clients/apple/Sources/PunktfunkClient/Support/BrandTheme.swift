@@ -4,7 +4,7 @@
 // edge (the large title floats on the content), blurred once scrolled — so only the typeface
 // changes: Geist, matching the cards and the website.
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 import PunktfunkKit
 import UIKit
 

@@ -242,6 +242,7 @@ pub(super) fn cursor_forward(
     compositor: Option<crate::vdisplay::Compositor>,
     codec: crate::encode::Codec,
     bit_depth: u8,
+    hdr: bool,
 ) -> bool {
     if client_caps & punktfunk_core::quic::CLIENT_CAP_CURSOR == 0 {
         return false;
@@ -251,14 +252,14 @@ pub(super) fn cursor_forward(
         // Same CUDA prediction `SessionPlan` makes: NVENC blends a CUDA payload only.
         let cuda_planned = !crate::encode::linux_zero_copy_is_vaapi() && crate::zerocopy::enabled();
         compositor.is_some_and(|c| c != crate::vdisplay::Compositor::Gamescope)
-            && crate::encode::cursor_blend_capable(codec, cuda_planned, bit_depth == 10)
+            && crate::encode::cursor_blend_capable(codec, cuda_planned, bit_depth == 10, hdr)
     }
     #[cfg(not(target_os = "linux"))]
     {
         // Windows: the v5 IddCx hardware-cursor channel. Without it DWM paints the pointer
         // into the IDD frame and a second copy doubles it. The encoder is not consulted: the
         // IDD capturer composites on the capture-mouse flip; no Windows encode backend blends.
-        let _ = (compositor, codec, bit_depth);
+        let _ = (compositor, codec, bit_depth, hdr);
         crate::windows::idd::hw_cursor_capable()
     }
 }
@@ -295,9 +296,33 @@ fn codec_miss_note(miss: punktfunk_core::quic::CodecMiss, preferred: &str, picke
     }
 }
 
+/// What [`negotiate`] settled, for the session runner.
+pub(super) struct Negotiated {
+    pub(super) hello: Hello,
+    pub(super) welcome: Welcome,
+    /// The data socket's port; `0` for a browser.
+    pub(super) udp_port: u16,
+    pub(super) data_sock: Option<std::net::UdpSocket>,
+    pub(super) start: Start,
+    /// What the client calls itself (`EXT_TAG_CLIENT` on `Start`); `None` from one that sent no
+    /// block. Log only: two dialers from one device are told apart by that line.
+    pub(super) client_label: Option<String>,
+    /// `EXT_TAG_PRESET` on `Start`: the settings preset the client dialled with.
+    pub(super) preset: Option<crate::events::PresetRef>,
+    /// `EXT_TAG_ABR` on `Start` (`0` = absent): the ABR wire features this client reads.
+    pub(super) abr_features: u8,
+    pub(super) compositor: Option<crate::vdisplay::Compositor>,
+    /// Gamescope sub-mode as a value, not process env — a concurrent connect would overwrite env.
+    pub(super) gamescope_route: Option<crate::vdisplay::GamescopeRoute>,
+    pub(super) prep: Option<super::stream::PrepHandle>,
+    /// Admitted by `mode_conflict: join`: the owner's display, which this session shares, and
+    /// the size this client asked for.
+    pub(super) joined: Option<(crate::vdisplay::admission::LiveDisplay, (u32, u32))>,
+}
+
 /// Hello → Welcome → Start. Borrows the control streams; the caller keeps them for mid-stream
 /// renegotiation. `first` is the already-read first control message.
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn negotiate(
     conn: &super::link::SessionLink,
     send: &mut super::link::CtlSend,
@@ -317,31 +342,14 @@ pub(super) async fn negotiate(
     // Effective grant mask and seconds until expiry (`0` = permanent), resolved at admission.
     grants: u32,
     expires_in_secs: u32,
-) -> Result<(
-    Hello,
-    Welcome,
-    u16,
-    Option<std::net::UdpSocket>,
-    Start,
-    // What the client calls itself (`EXT_TAG_CLIENT` on `Start`); `None` from one that sent no
-    // block. Log only: two dialers from one device are told apart by that line.
-    Option<String>,
-    // `EXT_TAG_ABR` on `Start` (`0` = absent): the ABR wire features this client reads.
-    u8,
-    Option<crate::vdisplay::Compositor>,
-    // Gamescope sub-mode as a value, not process env — a concurrent connect would overwrite env.
-    Option<crate::vdisplay::GamescopeRoute>,
-    Option<super::stream::PrepHandle>,
-    // Admitted by `mode_conflict: join`: the owner's display, which this session shares, and
-    // the size this client asked for.
-    Option<(crate::vdisplay::admission::LiveDisplay, (u32, u32))>,
-)> {
+) -> Result<Negotiated> {
     let mut hello = Hello::decode(first).map_err(|e| anyhow!("Hello decode: {e:?}"))?;
     if hello.abi_version != punktfunk_core::WIRE_VERSION {
         close_rejected(
             conn,
             punktfunk_core::reject::RejectReason::WireVersionMismatch,
-        );
+        )
+        .await;
         anyhow::bail!(
             "wire version mismatch: client {} host {}",
             hello.abi_version,
@@ -467,7 +475,7 @@ pub(super) async fn negotiate(
                 tracing::warn!("mode-conflict: REJECT — {reason}");
                 // Typed refusal: BUSY + reason bytes. The client reads `ApplicationClosed`,
                 // not a bare drop, so the UI can name the live session.
-                conn.close(REJECT_BUSY_CODE, reason.as_bytes());
+                conn.refuse(REJECT_BUSY_CODE, &reason).await;
                 anyhow::bail!("{reason}");
             }
         }
@@ -622,9 +630,10 @@ pub(super) async fn negotiate(
         // Negotiated codec; the client must not assume HEVC.
         codec: codec_bit,
         // Sequence-gated gamepad snapshots; capable clients send those, not per-transition events.
-        // Clipboard only when operator policy and a platform backend both exist.
+        // Clipboard only when operator policy and a platform backend both exist, and never to a
+        // browser: its transfers ride quinn streams.
         host_caps: punktfunk_core::quic::HOST_CAP_GAMEPAD_STATE
-            | if pf_clipboard::cap_advertised() {
+            | if pf_clipboard::cap_advertised() && !conn.is_web() {
                 punktfunk_core::quic::HOST_CAP_CLIPBOARD
             } else {
                 0
@@ -638,7 +647,7 @@ pub(super) async fn negotiate(
             }
             // Client turns its local renderer on only when it sees this bit; serve_session
             // wires forwarding by reading the bit back.
-            | if cursor_forward(hello.client_caps, compositor, codec, bit_depth) {
+            | if cursor_forward(hello.client_caps, compositor, codec, bit_depth, session_hdr) {
                 punktfunk_core::quic::HOST_CAP_CURSOR
             } else {
                 0
@@ -702,6 +711,9 @@ pub(super) async fn negotiate(
         // Idle-keepalive re-encodes are marked `USER_FLAG_REPEAT` so client ABR treats an
         // unflagged AU as new content.
         host_caps2: punktfunk_core::quic::HOST_CAP2_REPEAT_MARK
+            // The control loop feeds key edges into the input queue, so a client sends
+            // them there and a lost release cannot hold a key.
+            | punktfunk_core::quic::HOST_CAP2_INPUT_EDGES
             // Without the bit the client falls back to trackpad instead of sending contacts
             // the injector cannot land (wlroots) or cannot create a device for (Windows < 1809).
             | if crate::inject::touch_supported() {
@@ -821,22 +833,24 @@ pub(super) async fn negotiate(
     // Which ABR wire features this client understands. Bits it does not set are bits it
     // cannot read, and bits this host does not know are ignored.
     let abr_features = punktfunk_core::quic::ext_abr_features(&start_ext);
+    let preset = punktfunk_core::quic::SessionPreset::from_ext(&start_ext).map(Into::into);
     bringup.mark("start");
     // `wire_mtu::spawn_watch` is started by `serve_session` once the control-task channels
     // exist; it also drives mid-session shard renegotiation (needs the control writer).
-    Ok::<_, anyhow::Error>((
+    Ok(Negotiated {
         hello,
         welcome,
         udp_port,
         data_sock,
         start,
         client_label,
+        preset,
         abr_features,
         compositor,
         gamescope_route,
         prep,
         joined,
-    ))
+    })
 }
 
 /// Compositor for Welcome plus the gamescope route as a value; synthetic has neither.
@@ -863,9 +877,11 @@ async fn negotiate_compositor(
             let dedicated =
                 crate::vdisplay::wants_dedicated_game_session(has_resolvable_launch, client);
             Some(
-                tokio::task::spawn_blocking(move || resolve_compositor(pref, dedicated))
-                    .await
-                    .context("resolve compositor task")??,
+                tokio::task::spawn_blocking(move || {
+                    resolve_compositor(pref, dedicated, true, true)
+                })
+                .await
+                .context("resolve compositor task")??,
             )
         }
         Punktfunk1Source::Synthetic

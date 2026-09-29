@@ -23,6 +23,11 @@ pub enum RingInput {
 #[derive(Clone, Debug, PartialEq)]
 pub enum RingCommand {
     EndStream,
+    /// End [`RingFacts::streamed_game`] on the host, then the stream.
+    EndGame {
+        app_id: String,
+        title: String,
+    },
     DisconnectLinger,
     CycleStats,
     ToggleMic,
@@ -92,7 +97,7 @@ mod geometry_tests {
 pub struct RingFacts {
     /// Empty means the platform default ring.
     pub overlay_actions: String,
-    /// Touch-model name: `trackpad` / `pointer` / `touch`.
+    /// Touch-model name: `trackpad` / `pointer` / `touch` / `off`.
     pub touch_mode: String,
     pub invert_scroll: bool,
     /// Without this the `touch` model is skipped.
@@ -118,4 +123,7 @@ pub struct RingFacts {
     pub mgmt_port: u16,
     pub fp_hex: String,
     pub host_name: String,
+    /// `(app_id, title)` of the game this device launched that this stream plays
+    /// ([`crate::library::RunningGame::streamed_here`]). `None` offers no End game.
+    pub streamed_game: Option<(String, String)>,
 }

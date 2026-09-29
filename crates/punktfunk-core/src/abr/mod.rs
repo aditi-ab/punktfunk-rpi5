@@ -97,6 +97,9 @@ pub enum Action {
     /// Session total packets received. The host escalates on a dead plane, and
     /// divides a path two of its sessions share by these.
     Delivery(u64),
+    /// What the bring-up ramp proved the link carries, kbps. Once. The host
+    /// paces a pinned stream against it.
+    LinkRate(u32),
     /// Ask the host for a new encoder rate.
     SetBitrate(u32),
     /// Ask for a capacity burst. `ramp` = a bring-up step, before any video
@@ -444,8 +447,9 @@ impl Driver {
         self.probe.ramp_summary()
     }
 
-    /// A measured link capacity. Never lowers the climb ceiling: a
-    /// congested-moment measurement must not shrink what was negotiated.
+    /// A measured link capacity. The first one binds up or down — the rate the
+    /// Welcome resolved is not evidence about the link — and later ones only
+    /// raise: a congested moment must not shrink what a measurement proved.
     pub fn set_ceiling(&mut self, kbps: u32) {
         self.abr.set_ceiling(kbps);
     }
@@ -538,6 +542,11 @@ impl Driver {
             self.abr.no_link_evidence(self.stream_cap_kbps);
         }
         if let Some(ramped) = self.probe.take_ramped(now) {
+            // A cut-short ramp still proved a floor the link delivered.
+            let proven = ramped.proven_kbps();
+            if proven > 0 {
+                actions.push(Action::LinkRate(proven));
+            }
             if let Some(kbps) = self.on_ramped(ramped, now) {
                 actions.push(Action::SetBitrate(kbps));
             }
@@ -705,6 +714,7 @@ mod tests {
         let mut step: Option<Step> = None;
         let mut asked: Vec<(u64, u32)> = Vec::new();
         let mut opened_at: Option<(u64, u32)> = None;
+        let mut link_rate: Option<u32> = None;
         let mut completed_when_asked: Vec<u64> = Vec::new();
         // Video starts once two steps are done — a bring-up the ramp fits in.
         let mut video_from_ms = u64::MAX;
@@ -772,6 +782,7 @@ mod tests {
                         }
                     }
                     Action::SetBitrate(kbps) => opened_at = Some((ms, kbps)),
+                    Action::LinkRate(kbps) => link_rate = Some(kbps),
                     _ => {}
                 }
             }
@@ -811,6 +822,10 @@ mod tests {
             opened_ms <= first_au_ms + 2,
             "the ramp's verdict is spent at once: opened at {opened_ms} ms, first \
              picture at {first_au_ms} ms"
+        );
+        assert!(
+            link_rate.is_some_and(|k| k >= asked[0].1),
+            "the ramp's proof goes to the host as a link rate: {link_rate:?}"
         );
     }
 

@@ -1,7 +1,9 @@
 package io.unom.punktfunk.kit.library
 
 import android.util.Log
+import io.unom.punktfunk.kit.NativeBridge
 import okhttp3.Cache
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -36,10 +38,45 @@ import javax.net.ssl.X509TrustManager
 /** The management API's default port — matches `mgmt::DEFAULT_PORT` on the host and the Apple client. */
 const val DEFAULT_MGMT_PORT = 47990
 
+/**
+ * `https://<address>:<port>` for the management API. An IPv6 literal goes in brackets, whether it
+ * was saved bare or bracketed — the desktop's `base_url` and Apple's `baseURL`.
+ */
+fun mgmtBase(address: String, port: Int): String {
+    val bare = address.removeSurrounding("[", "]")
+    return if (':' in bare) "https://[$bare]:$port" else "https://$bare:$port"
+}
+
 /** Cover-art URLs. Steam art arrives as host-relative proxy paths, resolved to absolute by [LibraryClient]. */
 data class Artwork(val portrait: String?, val header: String?, val hero: String?) {
     /** Poster preference for a 2:3 tile: portrait capsule → header → hero (near-universal fallbacks). */
     val posterCandidates: List<String> get() = listOfNotNull(portrait, header, hero)
+}
+
+/** A title's play numbers as the host keeps them (`GameEntry.stats`), in the host's keys. */
+data class GameStats(
+    val lastPlayedUnixMs: Long = 0,
+    val playTimeMs: Long = 0,
+    val lastRunMs: Long = 0,
+    val launchCount: Int = 0,
+) {
+    fun toJson(): JSONObject = JSONObject()
+        .put("last_played_unix_ms", lastPlayedUnixMs)
+        .put("play_time_ms", playTimeMs)
+        .put("last_run_ms", lastRunMs)
+        .put("launch_count", launchCount)
+
+    companion object {
+        /** A missing number reads as zero: numbers are never worth an empty library. */
+        fun from(o: JSONObject?): GameStats? = o?.let {
+            GameStats(
+                lastPlayedUnixMs = it.optLong("last_played_unix_ms"),
+                playTimeMs = it.optLong("play_time_ms"),
+                lastRunMs = it.optLong("last_run_ms"),
+                launchCount = it.optInt("launch_count"),
+            )
+        }
+    }
 }
 
 /**
@@ -73,6 +110,8 @@ data class GameEntry(
     val developer: String? = null,
     val releaseYear: Int? = null,
     val genres: List<String> = emptyList(),
+    /** Null until the host has launched the title once. */
+    val stats: GameStats? = null,
 ) {
     val isCustom: Boolean get() = store == "custom"
 
@@ -173,14 +212,21 @@ data class RunningGame(
     val appId: String?,
     val title: String,
     /**
-     * `launching` | `running` | `window` | `exited` | `untracked` | `grace`. A plain String on
-     * purpose: the host owns the vocabulary and adds to it (`untracked` arrived in 0.30), so an
-     * unknown value must never fail the decode of the whole list.
+     * `launching` | `running` | `window` | `exited` | `untracked` | `grace` | `detached`. A plain
+     * String on purpose: the host owns the vocabulary and adds to it, so an unknown value must
+     * never fail the decode of the whole list.
      */
     val state: String,
     /** `running`, and the host will report `window` once the game's window is up. */
     val awaitingWindow: Boolean = false,
+    /** The live session streaming it; null for a game nobody streams. */
+    val sessionId: Long? = null,
+    /** This device may end it ([LibraryClient.endGame]): a game it launched. False from an older host. */
+    val endable: Boolean = false,
 ) {
+    /** A game this device launched that a live session streams: what an in-stream End game ends. */
+    val streamedHere: Boolean get() = endable && sessionId != null && appId != null
+
     /**
      * Is this title *up on the host right now* — i.e. would picking it take the player back into
      * it rather than start it?
@@ -193,13 +239,88 @@ data class RunningGame(
     val isUp: Boolean get() = state != "exited"
 }
 
+/** What asking the host to end a game came to (`POST /api/v1/game/end`). The Rust client's `GameEnd`. */
+sealed class GameEnd {
+    data object Ended : GameEnd()
+    /** 409: the host had nothing of this title left to end. */
+    data object NotRunning : GameEnd()
+    /** 401/404: a host that predates ending games from a device. */
+    data object Unsupported : GameEnd()
+    /** 403: this device's access to the host expired. */
+    data object Expired : GameEnd()
+    data class Failed(val why: String) : GameEnd()
+
+    /** The game is gone, so a stream that was playing it can end. */
+    val gameGone: Boolean get() = this == Ended || this == NotRunning
+
+    /** The player-facing line. The Rust, Swift and web clients use the same words. */
+    fun notice(title: String): String = when (this) {
+        Ended -> "Ended $title."
+        NotRunning -> "$title isn't running any more."
+        Unsupported -> "This host needs an update to end games from here."
+        Expired -> "This device's access to the host has expired."
+        is Failed -> "Couldn't end $title \u2014 $why"
+    }
+
+    companion object {
+        fun fromStatus(code: Int): GameEnd = when (code) {
+            in 200..299 -> Ended
+            409 -> NotRunning
+            401, 404 -> Unsupported
+            403 -> Expired
+            else -> Failed("the host refused it ($code)")
+        }
+    }
+}
+
 object LibraryClient {
     private const val TAG = "LibraryClient"
+
+    /** Titles a request: the host's ceiling for one page. */
+    internal const val PAGE_LIMIT = 200
+
+    /** 500 pages of 200 is 100 000 titles. A host whose cursor never runs out stops here. */
+    internal const val MAX_PAGES = 500
+
+    /** What walking the pages came to: the catalog, or the status that stopped it. */
+    internal sealed class Walk {
+        data class Done(val games: List<GameEntry>) : Walk()
+        data class Refused(val code: Int) : Walk()
+    }
+
+    /** The request path of one page. The cursor is the host's own text, so it is encoded. */
+    internal fun pagePath(cursor: String?): String =
+        "/api/v1/library/page?limit=$PAGE_LIMIT" +
+            (cursor?.let { "&cursor=" + java.net.URLEncoder.encode(it, "UTF-8") } ?: "")
+
     /**
-     * `GET https://<address>:<mgmtPort>/api/v1/library`, authenticated by mTLS. [fpHex] is the pinned
-     * host-cert SHA-256 (64 hex, from the paired [io.unom.punktfunk.kit.security.KnownHost]); a blank
-     * value means the host was never connected/paired, so there's nothing authorized to browse.
-     * BLOCKING — call from a background dispatcher.
+     * The whole catalog, a page at a time, so no answer grows with the library. [get] takes the
+     * cursor of the page before and answers one page's status and body. Any page failing fails
+     * the walk: half a catalog is not one.
+     */
+    internal fun walkPages(base: String, get: (cursor: String?) -> Pair<Int, String>): Walk {
+        val games = ArrayList<GameEntry>()
+        var cursor: String? = null
+        repeat(MAX_PAGES) {
+            val (code, body) = get(cursor)
+            if (code != 200) return Walk.Refused(code)
+            val page = JSONObject(body)
+            games += parseItems(page.getJSONArray("items"), base)
+            val next = str(page, "next_cursor")
+            // A cursor that does not move would ask for the same page forever.
+            if (next == null || next == cursor) return Walk.Done(games)
+            cursor = next
+        }
+        return Walk.Done(games)
+    }
+
+    /**
+     * The host's catalog, walked by `GET /api/v1/library/page` at [mgmtBase] and authenticated
+     * by mTLS. A host older than the paged route refuses it on this lane, so `GET
+     * /api/v1/library` answers whole instead. [fpHex] is the pinned host-cert SHA-256 (64 hex,
+     * from the paired [io.unom.punktfunk.kit.security.KnownHost]); a blank value means the host
+     * was never paired. A refusal maps through [refused]. BLOCKING — call from a background
+     * dispatcher.
      */
     fun fetch(
         address: String,
@@ -219,16 +340,19 @@ object LibraryClient {
             Log.w(TAG, "mTLS client for $address", e)
             return LibraryResult.Error("couldn't set up a secure connection to the host")
         }
-        val base = "https://$address:$mgmtPort"
-        val req = Request.Builder().url("$base/api/v1/library").build()
+        val base = mgmtBase(address, mgmtPort)
+        val get = { path: String ->
+            client.newCall(Request.Builder().url(base + path).build()).execute()
+                .use { it.code to it.body?.string().orEmpty() }
+        }
         return try {
-            client.newCall(req).execute().use { resp ->
-                when (resp.code) {
-                    200 -> LibraryResult.Ok(parse(resp.body?.string().orEmpty(), base))
-                    401 -> LibraryResult.Unauthorized(
-                        "the host doesn't recognize this device — pair with it first",
-                    )
-                    else -> LibraryResult.Error("the host refused it (${resp.code})")
+            when (val walked = walkPages(base) { cursor -> get(pagePath(cursor)) }) {
+                is Walk.Done -> LibraryResult.Ok(walked.games.launchersFirst())
+                is Walk.Refused -> if (walked.code in setOf(401, 403, 404)) {
+                    val (code, body) = get("/api/v1/library")
+                    if (code == 200) LibraryResult.Ok(parse(body, base)) else refused(code)
+                } else {
+                    refused(walked.code)
                 }
             }
         } catch (e: Exception) {
@@ -259,7 +383,7 @@ object LibraryClient {
         if (fpHex.isBlank()) return emptyList()
         return try {
             val client = mtlsHttpClient(certPem, keyPem, address, fpHex)
-            val req = Request.Builder().url("https://$address:$mgmtPort/api/v1/status").build()
+            val req = Request.Builder().url("${mgmtBase(address, mgmtPort)}/api/v1/status").build()
             client.newCall(req).execute().use { resp ->
                 if (resp.code != 200) return emptyList()
                 parseRunning(resp.body?.string().orEmpty())
@@ -270,12 +394,8 @@ object LibraryClient {
     }
 
     /**
-     * `POST /api/v1/game/end` for one title, live session included (`streaming`).
-     *
-     * The move a player has when a launch never produced a game: the host drops what it thinks is
-     * running for the title, so the next attempt starts it. `true` on 200; `false` on a 409 (the
-     * host had nothing to end) and on any error, which reads the same to the player. BLOCKING;
-     * call from IO.
+     * `POST /api/v1/game/end` for one title, live session included (`streaming`). The host ends it
+     * only if this device launched it. BLOCKING; call from IO.
      */
     fun endGame(
         address: String,
@@ -284,24 +404,92 @@ object LibraryClient {
         keyPem: String,
         fpHex: String,
         appId: String,
-    ): Boolean {
-        if (fpHex.isBlank() || appId.isBlank()) return false
+    ): GameEnd {
+        if (fpHex.isBlank() || appId.isBlank()) return GameEnd.Failed("this host isn't paired")
         return try {
             val body = JSONObject().put("app_id", appId).put("streaming", true)
             val req = Request.Builder()
-                .url("https://$address:$mgmtPort/api/v1/game/end")
+                .url("${mgmtBase(address, mgmtPort)}/api/v1/game/end")
                 .post(body.toString().toRequestBody("application/json".toMediaType()))
                 .build()
             mtlsHttpClient(certPem, keyPem, address, fpHex).newCall(req).execute()
-                .use { it.code == 200 }
+                .use { GameEnd.fromStatus(it.code) }
         } catch (e: Exception) {
             Log.w(TAG, "end game failed", e)
-            false
+            GameEnd.Failed(e.message ?: "couldn't reach the host")
         }
     }
 
+    /** A non-200 answer. 401 and 403 both mean "not paired", as on desktop and Apple. */
+    internal fun refused(code: Int): LibraryResult =
+        if (code == 401 || code == 403) {
+            LibraryResult.Unauthorized("the host doesn't recognize this device — pair with it first")
+        } else {
+            LibraryResult.Error("the host refused it ($code)")
+        }
+
+    /** Tries per wake: a cold box takes 20–60 s to serve, and 12 × 5 s covers that. */
+    internal const val WAKE_ATTEMPTS = 12
+    internal const val WAKE_RETRY_MS = 5_000L
+
+    /** Re-send the magic packet every other attempt: one packet can be missed. */
+    internal const val WAKE_RESEND_EVERY = 2
+
+    /**
+     * [fetch] across a host's boot window, for both Android shells (the desktop's `spawn_fetch`).
+     *
+     * With [autoWake] on and a MAC to send to, a magic packet goes out first, [onWaking] runs
+     * once, and the fetch is retried [WAKE_ATTEMPTS] times while it stays transient, resending
+     * the packet on the way. Otherwise it is one plain fetch and no packet. Null only when
+     * [isCancelled] stopped it before an answer. BLOCKING.
+     */
+    fun fetchAcrossWake(
+        address: String,
+        mgmtPort: Int,
+        certPem: String,
+        keyPem: String,
+        fpHex: String,
+        macs: List<String>,
+        autoWake: Boolean,
+        isCancelled: () -> Boolean = { false },
+        onWaking: () -> Unit = {},
+    ): LibraryResult? = acrossWake(
+        waking = autoWake && macs.isNotEmpty(),
+        fetch = { fetch(address, mgmtPort, certPem, keyPem, fpHex) },
+        wake = { NativeBridge.nativeWakeOnLan(macs.joinToString(","), address) },
+        isCancelled = isCancelled,
+        onWaking = onWaking,
+        sleep = { Thread.sleep(it) },
+    )
+
+    /** [fetchAcrossWake] with its effects passed in, so the cadence is testable off-device. */
+    internal fun acrossWake(
+        waking: Boolean,
+        fetch: () -> LibraryResult,
+        wake: () -> Unit,
+        isCancelled: () -> Boolean,
+        onWaking: () -> Unit,
+        sleep: (Long) -> Unit,
+    ): LibraryResult? {
+        if (waking) {
+            wake()
+            onWaking()
+        }
+        val attempts = if (waking) WAKE_ATTEMPTS else 1
+        var last: LibraryResult? = null
+        for (attempt in 0 until attempts) {
+            if (isCancelled()) break
+            val res = fetch()
+            last = res
+            if (!res.isTransient || attempt + 1 >= attempts) break
+            if (attempt % WAKE_RESEND_EVERY == WAKE_RESEND_EVERY - 1) wake()
+            sleep(WAKE_RETRY_MS)
+        }
+        return last
+    }
+
     /** Just the `games[]` slice of `/status`; everything else on that payload is the console's. */
-    private fun parseRunning(json: String): List<RunningGame> {
+    internal fun parseRunning(json: String): List<RunningGame> {
         val arr = JSONObject(json).optJSONArray("games") ?: return emptyList()
         val out = ArrayList<RunningGame>(arr.length())
         for (i in 0 until arr.length()) {
@@ -312,14 +500,19 @@ object LibraryClient {
                     title = o.optString("title"),
                     state = o.optString("state"),
                     awaitingWindow = o.optBoolean("awaiting_window"),
+                    sessionId = if (o.isNull("session_id")) null else o.optLong("session_id"),
+                    endable = o.optBoolean("endable"),
                 ),
             )
         }
         return out
     }
 
-    private fun parse(json: String, base: String): List<GameEntry> {
-        val arr = JSONArray(json)
+    private fun parse(json: String, base: String): List<GameEntry> =
+        parseItems(JSONArray(json), base).launchersFirst()
+
+    /** The titles of one answer, in the host's order. */
+    private fun parseItems(arr: JSONArray, base: String): List<GameEntry> {
         val out = ArrayList<GameEntry>(arr.length())
         for (i in 0 until arr.length()) {
             val o = arr.getJSONObject(i)
@@ -342,10 +535,11 @@ object LibraryClient {
                     genres = o.optJSONArray("genres")?.let { g ->
                         (0 until g.length()).mapNotNull { g.optString(it).ifBlank { null } }
                     } ?: emptyList(),
+                    stats = GameStats.from(o.optJSONObject("stats")),
                 ),
             )
         }
-        return out.launchersFirst()
+        return out
     }
 
     /** A present, non-null, non-blank JSON string field, else null. */
@@ -363,18 +557,29 @@ object LibraryClient {
  * reaches the host's own art proxy). The pinning trust manager trusts the host by fingerprint and
  * defers to normal public trust for any other origin (an external CDN URL).
  *
- * The two checks are only sound TOGETHER, and the composition is the point: the trust manager
- * cannot fail closed on its own (it has no hostname, so it must let a CDN chain through), so the
- * hostname verifier is what makes the pinned host pin-only. Loosen either and a publicly-trusted
- * certificate for any name is accepted for the host — which is exactly what 2026-08-05 review M-2
- * found. The host's own cert is self-signed with no matching SAN, so it can never satisfy the
- * default verifier; the pin is its only credential, on purpose.
- */
-/**
- * `cache`: an HTTP cache the client honours (`Cache-Control` / `ETag`, which the host's art proxy
+ * The two checks are only sound TOGETHER: the trust manager cannot fail closed on its own (it has
+ * no hostname, so it must let a CDN chain through), so the hostname verifier is what makes [host]
+ * pin-only, matched by the name OkHttp gives it ([urlHost]). Loosen either and a publicly-trusted
+ * certificate for any name is accepted for the host. The host's own cert is self-signed with no
+ * matching SAN, so it can never satisfy the default verifier; the pin is its only credential.
+ *
+ * [cache]: an HTTP cache the client honours (`Cache-Control` / `ETag`, which the host's art proxy
  * sends). One instance per directory: OkHttp forbids two on the same path.
+ *
+ * One connection pool per identity, host and pin, shared by every caller: a pool per call leaves
+ * each connection idle for five minutes, and the host drops a peer's 33rd connection.
  */
 fun mtlsHttpClient(certPem: String, keyPem: String, host: String, fpHex: String, cache: Cache? = null): OkHttpClient {
+    val base = mtlsClients.computeIfAbsent("$host|${fpHex.lowercase()}|$certPem") {
+        buildMtlsClient(certPem, keyPem, host, fpHex)
+    }
+    return if (cache == null) base else base.newBuilder().cache(cache).build()
+}
+
+private val mtlsClients = java.util.concurrent.ConcurrentHashMap<String, OkHttpClient>()
+
+private fun buildMtlsClient(certPem: String, keyPem: String, host: String, fpHex: String): OkHttpClient {
+    val pinnedHost = urlHost(host)
     val clientCert = CertificateFactory.getInstance("X.509")
         .generateCertificate(ByteArrayInputStream(certPem.toByteArray())) as X509Certificate
     val privateKey = parsePrivateKey(keyPem)
@@ -406,16 +611,10 @@ fun mtlsHttpClient(certPem: String, keyPem: String, host: String, fpHex: String,
 
     val defaultVerifier = HttpsURLConnection.getDefaultHostnameVerifier()
     val verifier = HostnameVerifier { hostname, session ->
-        if (hostname == host) {
-            // The PINNED host fails closed: only the pinned leaf is acceptable for this name.
-            //
-            // This used to be a bare `hostname == host`, which composed with the trust manager's
-            // system-CA fall-through into "any publicly-trusted certificate, for any name, is
-            // accepted for the pinned host" — the pin was decorative (2026-08-05 review M-2). A
-            // MITM with any free CA-issued cert intercepted the connection, received the client's
-            // mTLS IDENTITY certificate, and served attacker-chosen library JSON and art URLs.
-            // The Rust (`pf-client-core`) and Apple (`ClientTLS`) paths already fail closed here;
-            // only Android did not.
+        if (hostname == pinnedHost) {
+            // The PINNED host fails closed: only the pinned leaf is acceptable for this name. The
+            // trust manager lets any public chain through, so without this a CA-issued cert for
+            // any name would stand in for the host and receive the client's mTLS identity.
             try {
                 sha256Hex((session.peerCertificates.firstOrNull() as? X509Certificate)?.encoded ?: return@HostnameVerifier false) == pinned
             } catch (_: Exception) {
@@ -433,9 +632,12 @@ fun mtlsHttpClient(certPem: String, keyPem: String, host: String, fpHex: String,
         .hostnameVerifier(verifier)
         .connectTimeout(8, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
-        .cache(cache)
         .build()
 }
+
+/** [address] as OkHttp names it to a hostname verifier: lowercased, IPv6 unbracketed. */
+internal fun urlHost(address: String): String =
+    mgmtBase(address, DEFAULT_MGMT_PORT).toHttpUrlOrNull()?.host ?: address
 
 /** Parse a PKCS#8 PEM private key (rcgen emits `-----BEGIN PRIVATE KEY-----`), trying EC then RSA/Ed25519. */
 private fun parsePrivateKey(pem: String): PrivateKey {

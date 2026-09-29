@@ -21,13 +21,13 @@
 // retired swapchain) — that is the per-site proof. Anything else needs its own.
 
 #[cfg(any(target_os = "linux", windows))]
-pub mod csc;
+pub(crate) mod csc;
 #[cfg(any(target_os = "linux", windows))]
 pub mod cursor;
 #[cfg(windows)]
-pub mod d3d11;
+pub(crate) mod d3d11;
 #[cfg(target_os = "linux")]
-pub mod dmabuf;
+pub(crate) mod dmabuf;
 #[cfg(any(target_os = "linux", windows))]
 pub mod input;
 #[cfg(any(target_os = "linux", windows))]
@@ -39,7 +39,7 @@ mod present_pace;
 #[cfg(any(target_os = "linux", windows))]
 mod run;
 #[cfg(any(target_os = "linux", windows))]
-pub mod scale;
+pub(crate) mod scale;
 // Pure scroll-frame accumulation — no Wayland or Vulkan dependency.
 pub mod scroll;
 #[cfg(any(target_os = "linux", windows))]
@@ -52,6 +52,8 @@ pub mod vk;
 pub mod wayland_scroll;
 #[cfg(windows)]
 mod win32;
+#[cfg(target_os = "linux")]
+pub mod wl_native;
 
 #[cfg(any(target_os = "linux", windows))]
 pub use run::{run_browse, run_session, ActionOutcome, Outcome, SessionOpts};

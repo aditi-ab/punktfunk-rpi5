@@ -40,7 +40,30 @@
         system:
         import nixpkgs {
           inherit system;
-          overlays = [ (import rust-overlay) ];
+          overlays = [
+            (import rust-overlay)
+            # nixpkgs lags bun; the web console and plugin runner exec this one. Same release as
+            # the deb/rpm/arch/windows pins — bump them together (SHASUMS256.txt, as SRI).
+            (final: prev: {
+              bun = prev.bun.overrideAttrs (old: {
+                version = "1.4.2";
+                # src is read from passthru.sources, so it follows without being set here.
+                __intentionallyOverridingVersion = true;
+                passthru = old.passthru // {
+                  sources = {
+                    x86_64-linux = final.fetchurl {
+                      url = "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64-baseline.zip";
+                      hash = "sha256-xngEDxT+BEDrg503y9DOTAUaMtpygGrJfeamqra/co8=";
+                    };
+                    aarch64-linux = final.fetchurl {
+                      url = "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-aarch64.zip";
+                      hash = "sha256-VDKLvC2cjgyfiSxUTWbFeoO4QTnjSQnl7oF1jxrI/ac=";
+                    };
+                  };
+                };
+              });
+            })
+          ];
         };
 
       # Pin cargo/rustc EXACTLY to rust-toolchain.toml (channel 1.96.0 + rustfmt/clippy) so a Nix
@@ -59,6 +82,8 @@
           craneLib = craneLibFor pkgs;
           src = self;
           inherit version;
+          # A dirty tree has no `shortRev`; Nix before 2.20 has no `dirtyShortRev` either.
+          rev = self.shortRev or self.dirtyShortRev or null;
           # `.hook` + `.fetchBunDeps` (bun2nix v2 API) — see packages.nix.
           bun2nix = bun2nix.packages.${system}.default;
         }

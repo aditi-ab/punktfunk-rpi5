@@ -115,4 +115,14 @@ class PresenceTest {
         assertTrue(Presence.isSelf(unpinned, theirs))
         assertFalse(Presence.isSelf(unpinned, null))
     }
+
+    /** A warm advert is not a woken host: only a probe answer is, at the advert's new lease. */
+    @Test
+    fun a_wake_probe_follows_the_advert_and_never_trusts_it_alone() {
+        val asked = mutableListOf<String>()
+        assertFalse(Presence.probeSelf(desk, advert("192.168.1.20")) { addr, _ -> asked += addr; null })
+        assertEquals(listOf("192.168.1.20"), asked)
+        assertTrue(Presence.probeSelf(desk, advert("192.168.1.20")) { addr, _ -> fp.takeIf { addr == "192.168.1.20" } })
+        assertTrue(Presence.probeSelf(desk, null) { addr, _ -> fp.takeIf { addr == "192.168.1.9" } })
+    }
 }

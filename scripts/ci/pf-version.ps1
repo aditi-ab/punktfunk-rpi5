@@ -10,6 +10,9 @@
 #     $base = $pf.PF_BASE          # e.g. "0.7.0"
 #     # numeric-version channels (MSIX/host installer) build "<major>.<minor>.<run>":
 #     $v = "$($pf.PF_MAJOR).$($pf.PF_MINOR).$env:GITHUB_RUN_NUMBER"
+# `-SelfTest` checks the keys it emits against scripts/ci/pf-version.vectors, shared with the bash
+# twin. Run it in its own process: it rewrites GITHUB_REF and friends.
+param([switch]$SelfTest)
 $ErrorActionPreference = 'Stop'
 # A non-zero native-command exit (e.g. a `git fetch` with no network) must NOT abort — the
 # Cargo.toml fallback below covers it. On PS 7.4+ this pref would otherwise throw under -Stop.
@@ -17,10 +20,37 @@ $PSNativeCommandUseErrorActionPreference = $false
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 
-# checkout is shallow + tagless by default — canary needs the tag list. Best-effort.
-try { git -C $root fetch --tags --force --quiet 2>$null } catch { }
+if ($SelfTest) {
+  $fail = 0
+  foreach ($line in Get-Content (Join-Path $PSScriptRoot 'pf-version.vectors')) {
+    if ($line -match '^\s*(#|$)') { continue }
+    $tags, $ref, $fmt, $want = ($line -split '\|').Trim()
+    $env:PF_VERSION_TAGS = $tags
+    $env:GITHUB_REF = $ref
+    $env:GITHUB_REF_NAME = $ref -replace '^refs/[^/]+/', ''
+    $env:GITHUB_ENV = $null
+    $got = & $PSCommandPath
+    foreach ($kv in -split $want) {
+      $k, $v = $kv -split '=', 2
+      if ($got.Contains($k) -and $got[$k] -ne $v) {
+        Write-Host "pf-version.ps1: $ref ${fmt}: want $kv, got $k=$($got[$k])"
+        $fail = 1
+      }
+    }
+  }
+  if ($fail -eq 0) { Write-Host 'pf-version.ps1: every vector matches' }
+  exit $fail
+}
 
-$stable = (git -C $root tag -l 'v*' 2>$null) |
+if ($null -ne $env:PF_VERSION_TAGS) {
+  $tags = -split $env:PF_VERSION_TAGS   # -SelfTest's tag list
+} else {
+  # checkout is shallow + tagless by default — canary needs the tag list. Best-effort.
+  try { git -C $root fetch --tags --force --quiet 2>$null } catch { }
+  $tags = git -C $root tag -l 'v*' 2>$null
+}
+
+$stable = $tags |
   ForEach-Object { if ($_ -match '^v(\d+\.\d+\.\d+)$') { $Matches[1] } } |
   Sort-Object { [version]$_ } |
   Select-Object -Last 1

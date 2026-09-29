@@ -50,7 +50,7 @@ class SettingsRoundTripTest {
         gamepadUiEnabled = false,
         reduceUiResolution = true,
         gamepadUiMode = GAMEPAD_UI_ALWAYS,
-        uiPalette = "ember",
+        uiPalette = "crimson",
         lowLatencyMode = false,
         presentPriority = "smooth",
         smoothBuffer = 2,

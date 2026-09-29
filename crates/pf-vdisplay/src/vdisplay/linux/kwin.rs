@@ -6,14 +6,15 @@
 //!
 //! The global is restricted: KWin advertises it only to a client whose `.desktop` lists it
 //! under `X-KDE-Wayland-Interfaces` (matched by `/proc/<pid>/exe` → `Exec=`). Packages ship
-//! `io.unom.Punktfunk.Host.desktop` for that. The host binary must carry no file capability —
-//! the kernel then refuses KWin the `/proc/<pid>/exe` read ([`capability_denial_hint`]).
+//! `io.unom.Punktfunk.Host.desktop` for that. The host binary must carry no file capability and
+//! must still be the file at its path ([`screencast_withheld`] names which one broke).
 //! Headless tests use `KWIN_WAYLAND_NO_PERMISSION_CHECKS=1`. `createVirtualOutput` needs the
 //! DRM backend, or VirtualBackend since KWin 6.5.6.
 
 use super::{Mode, VirtualDisplay, VirtualOutput};
+use crate::proc::StopFlag;
+use crate::wl_pump::{pump_until, sync_barrier, Pumped, SyncDone};
 use anyhow::{anyhow, bail, Context, Result};
-use std::os::fd::{AsFd, AsRawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -56,6 +57,10 @@ const POINTER_EMBEDDED: u32 = 2;
 /// matches, so wrapping a repaired refusal would kill the retry that consumes the repair.
 /// Keep it a phrase, not a code.
 const REPAIRED_HINT: &str = "enabled it over output management";
+
+/// Lead of the missing-grant refusal ([`screencast_withheld`]); the opener keys on it.
+/// The docs quote this text, so it stays verbatim.
+const WITHHELD: &str = "KWin does not expose zkde_screencast_unstable_v1 to this client";
 
 /// KWin exposes the created output to output-management as `Virtual-<name>`.
 const VOUT_NAME: &str = "punktfunk";
@@ -117,9 +122,10 @@ impl KwinDisplay {
     /// KWin may apply a stored setup for the new monitor set that already has physicals
     /// disabled — so a post-create enumerate can miss them. The snapshot is the only
     /// unpolluted read: `Exclusive` unions it into restore; other topologies
-    /// [`reenable_stranded`].
+    /// [`reenable_stranded`]. `mgmt` is this create's [`crate::kwin_output_mgmt::watch`].
     fn apply_topology(
         &mut self,
+        mut mgmt: Option<&mut crate::kwin_output_mgmt::Session>,
         name: &str,
         our_prefix: &str,
         dims: (u32, u32),
@@ -138,6 +144,7 @@ impl KwinDisplay {
                 // onto our stable name, so the apply still has to clear a mirror source
                 // and keep our origin off a live screen.
                 let outcome = crate::kwin_output_mgmt::apply_topology(
+                    mgmt.as_deref_mut(),
                     our_prefix,
                     dims.0,
                     dims.1,
@@ -146,7 +153,9 @@ impl KwinDisplay {
                 if outcome.handled {
                     self.our_uuid = outcome.our_uuid;
                 } else {
-                    crate::kwin_output_mgmt::clear_replication_source(our_prefix, dims.0, dims.1);
+                    crate::kwin_output_mgmt::clear_replication_source(
+                        mgmt, our_prefix, dims.0, dims.1,
+                    );
                 }
                 // These topologies promise physicals stay lit; undo KWin switching them off
                 // in reaction to our output appearing.
@@ -155,7 +164,8 @@ impl KwinDisplay {
             }
         };
         // In-process Wayland; immune to a wedged kscreen-doctor.
-        let outcome = crate::kwin_output_mgmt::apply_topology(our_prefix, dims.0, dims.1, kind);
+        let outcome =
+            crate::kwin_output_mgmt::apply_topology(mgmt, our_prefix, dims.0, dims.1, kind);
         if outcome.handled {
             self.our_uuid = outcome.our_uuid;
             if kind == TopologyKind::Primary {
@@ -285,7 +295,7 @@ impl VirtualDisplay for KwinDisplay {
         } else {
             POINTER_EMBEDDED
         };
-        let spawn_vout = |w: u32, h: u32| -> Result<(u32, Arc<AtomicBool>)> {
+        let spawn_vout = |w: u32, h: u32| -> Result<(u32, StopFlag)> {
             let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
             let stop = Arc::new(AtomicBool::new(false));
             let stop_thread = stop.clone();
@@ -296,12 +306,17 @@ impl VirtualDisplay for KwinDisplay {
                     virtual_output_thread(w, h, name_thread, pointer_mode, setup_tx, stop_thread)
                 })
                 .context("spawn KWin virtual-output thread")?;
+            // Built before the wait so every error arm stops the worker, which on a timeout
+            // is still inside `await_created` holding a half-built output.
+            let stop = StopFlag(stop);
             match setup_rx.recv_timeout(OPENER_BUDGET) {
                 Ok(Ok(v)) => Ok((v, stop)),
                 // Report as-is. The wrapper below prepends the "permanent, do not retry"
                 // phrase; this is the one refusal whose retry is the point — the repair
                 // only fixes the NEXT request.
                 Ok(Err(e)) if e.contains(REPAIRED_HINT) => bail!("{e}"),
+                // Still permanent, but KWin never saw a request: the text below would mislead.
+                Ok(Err(e)) if e.contains(WITHHELD) => bail!("KWin virtual output failed: {e}"),
                 // KWin's reason is translated; log the compositor-side cause once here.
                 Ok(Err(e)) => bail!(
                     "KWin virtual output failed: {e} — KWin declined to create the output. It \
@@ -311,13 +326,7 @@ impl VirtualDisplay for KwinDisplay {
                      ~/.config/kwinoutputconfig.json, or a display config it refused to apply) \
                      reports the same. kwin_wayland's own journal says which"
                 ),
-                Err(_) => {
-                    // `StopGuard` is only built on success, so nothing else will flip
-                    // `stop`. The worker is still inside `await_created` holding a
-                    // half-built output KWin keeps alive for this connection.
-                    stop.store(true, Ordering::Relaxed);
-                    bail!("timed out creating the KWin virtual output")
-                }
+                Err(_) => bail!("timed out creating the KWin virtual output"),
             }
         };
         // `stream_virtual_output` has no refresh; the PipeWire offer (including the
@@ -329,6 +338,9 @@ impl VirtualDisplay for KwinDisplay {
         // Snapshot enabled physicals before our output exists: create changes the
         // monitor set and KWin may disable them. Later reads can already be polluted.
         let pre_enabled = enabled_physicals();
+        // Bound before our output exists: a mode switch's predecessor shares our name,
+        // UUID and restored mode, and only this connection tells the two apart.
+        let mut mgmt = crate::kwin_output_mgmt::watch();
         let (mut node_id, mut stop) = spawn_vout(width, birth_h)?;
         // `requested_*`: `spawn_vout` returns a node id, not a size. `width`/`height`
         // here would look like a KWin readback; the real size is below.
@@ -346,7 +358,7 @@ impl VirtualDisplay for KwinDisplay {
         let (final_dims, expect_exact_dims, achieved_hz) = if want_high {
             // Both resolvers address the output by the size it is at, and KWin's stored
             // setup can move it off its birth size before we ever look. Ask where it is.
-            let at = crate::kwin_output_mgmt::actual_dims(&our_prefix)
+            let at = crate::kwin_output_mgmt::actual_dims(mgmt.as_mut(), &our_prefix)
                 .map(|(w, h, _, _)| (w, h))
                 .unwrap_or((width, birth_h));
             if at != (width, birth_h) {
@@ -362,6 +374,7 @@ impl VirtualDisplay for KwinDisplay {
             // Install+select the high-refresh custom mode. In-process first; kscreen-doctor
             // if KWin has no `set_custom_modes` or misses its budget.
             let active = crate::kwin_output_mgmt::set_custom_mode(
+                mgmt.as_mut(),
                 &our_prefix,
                 at.0,
                 at.1,
@@ -393,7 +406,7 @@ impl VirtualDisplay for KwinDisplay {
                         "KWin rejected the custom mode — recreating the virtual output at the real \
                          size (60 Hz ceiling on this KWin)"
                     );
-                    stop.store(true, Ordering::Relaxed);
+                    stop.0.store(true, Ordering::Relaxed);
                     // Let KWin retire the doomed output before re-using its name.
                     std::thread::sleep(Duration::from_millis(300));
                     let (nid, st) = spawn_vout(width, height)?;
@@ -407,18 +420,20 @@ impl VirtualDisplay for KwinDisplay {
                     );
                     // The recreate takes the same stored slot as a ≤60 Hz create. Unverified,
                     // the session streams whatever `kwinoutputconfig.json` restored.
-                    let (dims, exact) = verify_or_reassert(&our_prefix, width, height);
+                    let (dims, exact) =
+                        verify_or_reassert(mgmt.as_mut(), &our_prefix, width, height);
                     (dims, exact, 60)
                 }
             }
         } else {
             // ≤60 Hz installs no mode, so nothing here learned what KWin built.
-            let (dims, exact) = verify_or_reassert(&our_prefix, width, height);
+            let (dims, exact) = verify_or_reassert(mgmt.as_mut(), &our_prefix, width, height);
             (dims, exact, mode.refresh_hz)
         };
-        let disabled = self.apply_topology(&name, &our_prefix, final_dims, &pre_enabled);
+        let disabled =
+            self.apply_topology(mgmt.as_mut(), &name, &our_prefix, final_dims, &pre_enabled);
         // Stash restore on the group, not this session's keepalive: a per-session
-        // `StopGuard` would re-enable physicals when the FIRST exclusive member drops
+        // keepalive would re-enable physicals when the FIRST exclusive member drops
         // under a still-live sibling. Empty ⇒ nothing to restore.
         let prepared = (!disabled.is_empty()).then(|| {
             let disabled = disabled.clone();
@@ -449,7 +464,8 @@ impl VirtualDisplay for KwinDisplay {
         let mut out = VirtualOutput::owned(
             node_id,
             Some((final_dims.0, final_dims.1, achieved_hz)),
-            Box::new(StopGuard { stop }),
+            // Dropping it releases the output: the worker's Wayland connection goes with it.
+            Box::new(stop),
         );
         out.expect_exact_dims = expect_exact_dims;
         out.input_output = Some(our_prefix);
@@ -811,9 +827,14 @@ fn mode_satisfies(active: (u32, u32), want_w: u32, want_h: u32) -> bool {
 /// 1080p comes back 1080p on a 4K request. Unverified, capture and encoder open at KWin's size
 /// while the client decodes the size it negotiated. A size we cannot correct is returned as it
 /// is: everything dims-keyed runs off it, and a monitor mirror legitimately streams a size the
-/// client never asked for.
-fn verify_or_reassert(our_prefix: &str, width: u32, height: u32) -> ((u32, u32), bool) {
-    match crate::kwin_output_mgmt::actual_dims(our_prefix) {
+/// client never asked for. `mgmt` is this create's [`crate::kwin_output_mgmt::watch`].
+fn verify_or_reassert(
+    mut mgmt: Option<&mut crate::kwin_output_mgmt::Session>,
+    our_prefix: &str,
+    width: u32,
+    height: u32,
+) -> ((u32, u32), bool) {
+    match crate::kwin_output_mgmt::actual_dims(mgmt.as_deref_mut(), our_prefix) {
         // Honoured. Do not force scale 1.0: the stable name exists so KDE reapplies this
         // client's scale. Screencast is PIXEL size, so scale should not move captured dims.
         Some((aw, ah, _, scale)) if (aw, ah) == (width, height) => {
@@ -842,7 +863,9 @@ fn verify_or_reassert(our_prefix: &str, width: u32, height: u32) -> ((u32, u32),
             );
             // 60 Hz, not the client's rate: only the size is wrong here, and a 30 fps client
             // would install 30 Hz and throttle the compositor.
-            match crate::kwin_output_mgmt::set_custom_mode(our_prefix, aw, ah, width, height, 60) {
+            match crate::kwin_output_mgmt::set_custom_mode(
+                mgmt, our_prefix, aw, ah, width, height, 60,
+            ) {
                 Some((cw, ch, _)) if mode_satisfies((cw, ch), width, height) => {
                     tracing::info!(
                         active_w = cw,
@@ -867,13 +890,13 @@ fn verify_or_reassert(our_prefix: &str, width: u32, height: u32) -> ((u32, u32),
                 }
             }
         }
-        // Management unavailable, or a same-name supersede in flight. Do not reconfigure an
+        // Management unavailable, or our output still mid-announce. Do not reconfigure an
         // output we cannot identify.
         None => {
             tracing::debug!(
                 our_prefix,
                 "KWin: could not read back the virtual output's actual mode (management \
-                 unavailable or a same-named supersede in flight) — proceeding unverified"
+                 unavailable or the output still announcing) — proceeding unverified"
             );
             ((width, height), false)
         }
@@ -1233,19 +1256,6 @@ fn apply_virtual_primary_only(ours: &str) {
     }
 }
 
-/// Dropping this releases the KWin virtual output: it flips the keepalive thread's
-/// `stop`, which drops the Wayland connection. Topology restore lives on the registry
-/// group and runs when the last member drops, before this keepalive is dropped.
-struct StopGuard {
-    stop: Arc<AtomicBool>,
-}
-
-impl Drop for StopGuard {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-    }
-}
-
 #[derive(Default)]
 struct State {
     screencast: Option<Screencast>,
@@ -1330,6 +1340,12 @@ impl Dispatch<WlCallback, u32> for State {
         if let wl_callback::Event::Done { .. } = event {
             state.sync_done = state.sync_done.max(*serial);
         }
+    }
+}
+
+impl SyncDone for State {
+    fn sync_done(&self) -> u32 {
+        self.sync_done
     }
 }
 
@@ -1423,15 +1439,12 @@ pub(crate) fn stream_existing_output(
             }
         })
         .context("spawn KWin monitor-mirror thread")?;
+    // Built before the wait so a timeout stops the recording too.
+    let stop = StopFlag(stop);
     let node_id = match setup_rx.recv_timeout(OPENER_BUDGET) {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => bail!("KWin monitor mirror failed: {e}"),
-        Err(_) => {
-            // Same leak as the virtual-output opener: `StopOnDrop` only owns `stop` on
-            // success, so without this the mirror thread keeps recording until its budget.
-            stop.store(true, Ordering::Relaxed);
-            bail!("timed out recording the KWin output {connector:?}")
-        }
+        Err(_) => bail!("timed out recording the KWin output {connector:?}"),
     };
     Ok(crate::mirror::MirrorStream {
         node_id,
@@ -1440,37 +1453,68 @@ pub(crate) fn stream_existing_output(
         // Not an xdg-portal session: the `zkde_screencast` pointer mode was asked of
         // KWin directly, so the request is the answer.
         cursor_mode: None,
-        keepalive: Box::new(StopOnDrop(stop)),
+        keepalive: Box::new(stop),
     })
 }
 
-/// Stops the mirror thread (and thus the recording) when the capturer drops it.
-struct StopOnDrop(Arc<AtomicBool>);
-
-impl Drop for StopOnDrop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
-    }
-}
-
-/// Extra sentence on "KWin never advertised the screencast global" when this process
-/// carries capabilities — invisible from the Wayland side.
+/// The refusal for a registry without `zkde_screencast`, naming the path KWin read and
+/// why it missed.
 ///
-/// KWin authorizes a restricted interface by resolving `/proc/<pid>/exe` against an
-/// installed `.desktop`. The kernel refuses that readlink unless the reader's effective
-/// set is a superset of the target's permitted set (`cap_ptrace_access_check`); KWin
-/// has none. A host with any file capability is unidentifiable. `PR_SET_DUMPABLE` and
-/// systemd `AmbientCapabilities=` leave the permitted-set check failing.
-fn capability_denial_hint() -> String {
+/// KWin (through 6.6) re-checks every new connection: it reads `/proc/<pid>/exe` and
+/// matches that path against an installed `.desktop`'s `Exec=`. Two host-side states
+/// defeat it: a file capability (the kernel refuses KWin the readlink, see
+/// [`capability_denial_hint_for`]) and a binary replaced since start (the link then
+/// reads `… (deleted)` or a stale mount's path). A restart is the only repair for the
+/// second.
+fn screencast_withheld() -> anyhow::Error {
+    let exe = std::fs::read_link("/proc/self/exe").unwrap_or_default();
+    let replaced = !exe.as_os_str().is_empty()
+        && std::fs::metadata("/proc/self/exe").is_ok_and(|run| replaced_on_disk(&exe, &run));
     let permitted = std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|status| permitted_caps_from_status(&status));
-    capability_denial_hint_for(permitted)
+    anyhow!(
+        "{WITHHELD} ({}) — KWin grants it only to a binary whose path is the Exec= of an \
+         installed .desktop listing it in X-KDE-Wayland-Interfaces \
+         (io.unom.Punktfunk.Host.desktop){}",
+        exe.display(),
+        identity_hint(replaced, permitted)
+    )
 }
 
-/// Message half of [`capability_denial_hint`], split from `/proc/self/status` so it
+/// Tail of [`screencast_withheld`]: every cause the host can see, else the install advice.
+fn identity_hint(replaced: bool, permitted: Option<u64>) -> String {
+    let mut hint = capability_denial_hint_for(permitted);
+    if replaced {
+        hint.insert_str(
+            0,
+            " — this binary was replaced on disk after the host started (a package update?), \
+             so KWin no longer matches it: restart the host",
+        );
+    }
+    if hint.is_empty() {
+        hint = " — install that .desktop and log in again, or run KWin with \
+                KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 for a headless test"
+            .into();
+    }
+    hint
+}
+
+/// Whether the file at `path` is no longer the `running` binary: a package update
+/// swaps the inode, a sysext refresh swaps the mount, a deleted path is gone.
+fn replaced_on_disk(path: &std::path::Path, running: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    !std::fs::metadata(path)
+        .is_ok_and(|now| (now.dev(), now.ino()) == (running.dev(), running.ino()))
+}
+
+/// Capability sentence of [`identity_hint`], split from `/proc/self/status` so it
 /// is testable against a given mask. Calling the real reader in CI sees the runner's
 /// root permitted set (`CapPrm=0x000001ffffffffff`) and the hint fires on a clean host.
+///
+/// KWin has no capabilities, and the kernel refuses a `/proc/<pid>/exe` readlink unless
+/// the reader's effective set covers the target's permitted set. `PR_SET_DUMPABLE` and
+/// systemd `AmbientCapabilities=` leave that check failing.
 fn capability_denial_hint_for(permitted: Option<u64>) -> String {
     match permitted {
         Some(caps) if caps != 0 => format!(
@@ -1533,6 +1577,41 @@ mod capability_hint_tests {
         );
         assert!(hint.contains("setcap -r"), "names the repair: {hint}");
     }
+
+    /// A package manager renames a new file over the path; the kernel suffixes a
+    /// deleted exe's link with ` (deleted)`. Both must read as replaced.
+    #[test]
+    fn spots_a_binary_swapped_under_the_process() {
+        let dir = std::env::temp_dir().join(format!("pf-kwin-exe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("punktfunk-host");
+        std::fs::write(&path, b"old").unwrap();
+        let running = std::fs::metadata(&path).unwrap();
+        assert!(!replaced_on_disk(&path, &running));
+
+        let staged = dir.join("punktfunk-host.new");
+        std::fs::write(&staged, b"new").unwrap();
+        std::fs::rename(&staged, &path).unwrap();
+        assert!(replaced_on_disk(&path, &running));
+        assert!(replaced_on_disk(
+            &dir.join("punktfunk-host (deleted)"),
+            &running
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A replaced binary names the restart; the install advice appears only when
+    /// the host sees no cause of its own.
+    #[test]
+    fn picks_the_repair_the_host_can_see() {
+        let replaced = identity_hint(true, Some(0));
+        assert!(replaced.contains("restart the host"), "{replaced}");
+        assert!(!replaced.contains("install that .desktop"), "{replaced}");
+        let clean = identity_hint(false, Some(0));
+        assert!(clean.contains("install that .desktop"), "{clean}");
+        let capped = identity_hint(false, permitted_caps_from_status(CAPPED));
+        assert!(!capped.contains("install that .desktop"), "{capped}");
+    }
 }
 
 /// Readiness probe: connect, roundtrip the registry, confirm `zkde_screencast` is
@@ -1555,14 +1634,7 @@ pub fn probe() -> Result<()> {
         "registry roundtrip",
     )?;
     if state.screencast.is_none() {
-        bail!(
-            "KWin is up but does not expose zkde_screencast_unstable_v1 to this client — KWin gates \
-             it on the host's .desktop X-KDE-Wayland-Interfaces (install \
-             io.unom.Punktfunk.Host.desktop with Exec=/usr/bin/punktfunk-host, then re-login so KWin \
-             re-reads it — the grant is cached per-exe on first connect), or set \
-             KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 for the headless test; needs KWin ≥ 6.5.6{}",
-            capability_denial_hint()
-        );
+        return Err(screencast_withheld());
     }
     Ok(())
 }
@@ -1609,15 +1681,7 @@ fn run_existing(
         "wl_output property roundtrip",
     )?;
 
-    let screencast = state.screencast.clone().ok_or_else(|| {
-        anyhow!(
-            "KWin does not expose zkde_screencast_unstable_v1 to this client — install the host's \
-             .desktop (io.unom.Punktfunk.Host.desktop, X-KDE-Wayland-Interfaces) and re-login so \
-             KWin authorizes it, or run KWin with KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 (headless \
-             test){}",
-            capability_denial_hint()
-        )
-    })?;
+    let screencast = state.screencast.clone().ok_or_else(screencast_withheld)?;
 
     // A miss is a hard error naming what is there: mirroring some other monitor
     // because the requested one is unplugged is worse than a refused session.
@@ -1698,15 +1762,7 @@ fn run(
     let mut state = State::default();
     roundtrip_within(&conn, &mut queue, &mut state, stop, 1, "registry roundtrip")?;
 
-    let screencast = state.screencast.clone().ok_or_else(|| {
-        anyhow!(
-            "KWin does not expose zkde_screencast_unstable_v1 to this client — install the host's \
-             .desktop (io.unom.Punktfunk.Host.desktop, X-KDE-Wayland-Interfaces) and re-login so \
-             KWin authorizes it, or run KWin with KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 (headless \
-             test){}",
-            capability_denial_hint()
-        )
-    })?;
+    let screencast = state.screencast.clone().ok_or_else(screencast_withheld)?;
 
     // Pointer rides as stream metadata (cursor-channel) or KWin embeds it.
     let stream = screencast.stream_virtual_output(
@@ -1764,10 +1820,6 @@ fn run(
     Ok(())
 }
 
-/// Poll slice while waiting on the Wayland fd — granularity at which `stop` and a
-/// deadline are observed (matches `kwin_output_mgmt`'s `POLL_MS`).
-const POLL_MS: i32 = 200;
-
 /// Budget for one compositor roundtrip. Healthy is a few ms; this exists so a KWin
 /// that accepted the connection and then stopped serving cannot pin the calling thread.
 const ROUNDTRIP_BUDGET: Duration = Duration::from_secs(3);
@@ -1786,66 +1838,6 @@ const WORKER_MARGIN: Duration = Duration::from_millis(500);
 /// therefore takes the worker's start instant and bounds by whichever comes first.
 const CREATE_BUDGET: Duration = Duration::from_secs(15);
 
-enum Pumped {
-    Done,
-    /// `stop` was set — the caller's output/recording was released while we waited.
-    Stopped,
-    Expired,
-}
-
-/// Bounded event loop: dispatch, poll the connection fd up to [`POLL_MS`], read,
-/// until `done`, `stop`, or `deadline`.
-///
-/// `blocking_dispatch` and `roundtrip` cannot be interrupted and have no ceiling.
-/// `deadline: None` is correct only for [`park_until_stopped`], where the wait IS
-/// the output's lifetime.
-fn pump_until(
-    conn: &Connection,
-    queue: &mut wayland_client::EventQueue<State>,
-    state: &mut State,
-    deadline: Option<Instant>,
-    stop: &AtomicBool,
-    done: impl Fn(&State) -> bool,
-) -> Result<Pumped> {
-    loop {
-        queue.dispatch_pending(state).context("dispatch_pending")?;
-        if done(state) {
-            return Ok(Pumped::Done);
-        }
-        if stop.load(Ordering::Relaxed) {
-            return Ok(Pumped::Stopped);
-        }
-        let timeout = match deadline {
-            Some(d) => {
-                let remaining = d.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Ok(Pumped::Expired);
-                }
-                (remaining.as_millis() as i64).clamp(0, i64::from(POLL_MS)) as i32
-            }
-            None => POLL_MS,
-        };
-        conn.flush().context("wayland flush")?;
-        let Some(guard) = conn.prepare_read() else {
-            continue; // events already queued — loop dispatches them
-        };
-        let mut pfd = libc::pollfd {
-            fd: conn.as_fd().as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `&mut pfd` points at a single live, fully-initialized `libc::pollfd` on the stack, and
-        // the count `1` matches that one-element array, so `poll` reads `fd`/`events` and writes `revents`
-        // strictly within `pfd`. `pfd.fd` is the Wayland connection's fd, valid because `conn` (and the
-        // `prepare_read` guard) are alive across the call. `poll` blocks up to `timeout` ms and writes
-        // only `revents`; `pfd` outlives the synchronous call and aliases nothing (a fresh local).
-        let r = unsafe { libc::poll(&mut pfd, 1, timeout) };
-        if r > 0 && (pfd.revents & libc::POLLIN) != 0 {
-            let _ = guard.read();
-        } // else: timeout or signal — drop the guard, re-check `stop` and the deadline
-    }
-}
-
 /// A `wl_display.sync` barrier bounded by [`ROUNDTRIP_BUDGET`] — replacement for
 /// `EventQueue::roundtrip`, which waits on the socket with no ceiling. `serial`
 /// must be unique per connection (callers number from 1).
@@ -1857,12 +1849,8 @@ fn roundtrip_within(
     serial: u32,
     what: &str,
 ) -> Result<()> {
-    let qh = queue.handle();
-    let _cb = conn.display().sync(&qh, serial);
     let deadline = Instant::now() + ROUNDTRIP_BUDGET;
-    match pump_until(conn, queue, state, Some(deadline), stop, |st| {
-        st.sync_done >= serial
-    })? {
+    match sync_barrier(conn, queue, state, serial, deadline, Some(stop))? {
         Pumped::Done => Ok(()),
         Pumped::Stopped => bail!("{what} abandoned — the stream was released while we waited"),
         Pumped::Expired => bail!(
@@ -1883,7 +1871,7 @@ fn park_until_stopped(
     output: &str,
     node_id: u32,
 ) -> Result<()> {
-    match pump_until(conn, queue, state, None, stop, |st| st.closed)? {
+    match pump_until(conn, queue, state, None, Some(stop), |st| st.closed)? {
         Pumped::Done => {
             tracing::warn!(output = %output, node_id, "KWin closed the screencast stream");
         }
@@ -1909,7 +1897,7 @@ fn await_created(
     let began = Instant::now();
     let deadline = (began + CREATE_BUDGET).min(started + OPENER_BUDGET - WORKER_MARGIN);
     let settled = |st: &State| st.node_id.is_some() || st.failed.is_some() || st.closed;
-    match pump_until(conn, queue, state, Some(deadline), stop, settled)? {
+    match pump_until(conn, queue, state, Some(deadline), Some(stop), settled)? {
         // Node id first: a `closed` in the same burst as `created` is a stream that
         // was made and then torn down, not a failure to make one.
         Pumped::Done => match (state.node_id, state.failed.take()) {
@@ -2147,5 +2135,48 @@ mod tests {
             .filter(|n| !n.starts_with(MANAGED_PREFIX))
             .collect();
         assert_eq!(to_disable, vec!["eDP-1"]);
+    }
+
+    /// Live mid-stream mode switches: each create runs while its predecessor still holds
+    /// the name and KWin's stored mode, as the registry's create-before-drop does. The
+    /// 60 Hz steps take the `verify_or_reassert` path. Needs
+    /// `KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 kwin_wayland --virtual` (6.5.6+) and PipeWire.
+    #[test]
+    #[ignore = "needs a live KWin and PipeWire; run with --ignored"]
+    fn live_kwin_mode_switch_lands_on_the_new_output() {
+        use super::{KwinDisplay, Mode, VirtualDisplay};
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("pf_vdisplay=info"));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_test_writer()
+            .try_init();
+        let modes = [
+            (1920, 1080, 120),
+            (1280, 720, 120),
+            (1920, 1080, 60),
+            (1280, 720, 60),
+        ];
+        let mode = |(width, height, refresh_hz)| Mode {
+            width,
+            height,
+            refresh_hz,
+        };
+        let name = format!("Virtual-{}", super::VOUT_NAME);
+        let mut vd = KwinDisplay::new().unwrap();
+        let mut live = vd.create(mode(modes[0])).expect("first create");
+        for i in 1..=8 {
+            let want = modes[i % modes.len()];
+            let next = vd.create(mode(want)).expect("mode-switch create");
+            drop(std::mem::replace(&mut live, next));
+            // KWin re-applies its stored setup once the predecessor is gone.
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let got = crate::kwin_output_mgmt::actual_dims(
+                crate::kwin_output_mgmt::watch().as_mut(),
+                &name,
+            )
+            .map(|(w, h, mhz, _)| (w, h, (mhz + 500) / 1000));
+            assert_eq!(got, Some(want), "switch {i}");
+        }
     }
 }

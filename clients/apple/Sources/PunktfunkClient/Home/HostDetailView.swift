@@ -116,7 +116,7 @@ struct HostDetailView: View {
         #if !os(tvOS)
         .navigationTitle(pageTitle(host))
         #endif
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         .navigationBarTitleDisplayMode(.inline)
         #endif
     }
@@ -127,7 +127,7 @@ struct HostDetailView: View {
     /// The host's name, except in the iPad's sheet of sections: its sidebar names the host, so the
     /// pane names its section.
     private func pageTitle(_ host: StoredHost) -> String {
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         if let only { return only.title }
         #endif
         return host.displayName
@@ -265,10 +265,23 @@ struct HostDetailView: View {
                     Button("Wake Host", systemImage: "power", action: wake)
                 }
                 ForEach(a.power) { action in
-                    Button(
-                        action.available ? action.label : "\(action.label) (Unavailable)",
-                        systemImage: "power", role: action.danger ? .destructive : nil
-                    ) { a.runPower(action) }
+                    // iOS reddens a destructive title and leaves the symbol on the accent, so
+                    // the symbol is coloured itself. The tint is for the Mac, whose form
+                    // draws a destructive title in the window's tint.
+                    Button(role: action.danger ? .destructive : nil) {
+                        a.runPower(action)
+                    } label: {
+                        Label {
+                            Text(action.available ? action.label : "\(action.label) (Unavailable)")
+                        } icon: {
+                            if action.danger {
+                                Image(systemName: "power").foregroundStyle(.red)
+                            } else {
+                                Image(systemName: "power")
+                            }
+                        }
+                    }
+                    .tint(action.danger ? Color.red : nil)
                 }
             } header: {
                 Text("Power")
@@ -384,7 +397,7 @@ private struct HostConnectionFields: View {
                 .labelsHidden()
                 .multilineTextAlignment(.trailing)
                 .autocorrectionDisabled()
-                #if os(iOS)
+                #if os(iOS) || os(visionOS)
                 .textInputAutocapitalization(field == .name ? .words : .never)
                 .keyboardType(field == .port ? .numberPad : .default)
                 #endif

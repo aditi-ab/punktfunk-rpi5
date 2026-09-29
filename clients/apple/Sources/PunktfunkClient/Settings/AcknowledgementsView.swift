@@ -65,8 +65,7 @@ struct AcknowledgementsView: View {
 
                     Text("Swift packages")
                         .font(.geist(Self.headlineFont, .semibold, relativeTo: .headline))
-                    Text("Punktfunk uses Glur (progressive backdrop blur), "
-                        + "© 2023 João Gabriel, under the MIT License.")
+                    Text(Licenses.swiftPackages)
                         .font(.geist(Self.captionFont, relativeTo: .caption))
                         .foregroundStyle(.secondary)
 
@@ -74,11 +73,7 @@ struct AcknowledgementsView: View {
 
                     Text("Third-party software")
                         .font(.geist(Self.headlineFont, .semibold, relativeTo: .headline))
-                    Text(
-                        "Punktfunk uses the open-source components below, each under its own license. "
-                            + "Video decoding uses the system's own VideoToolbox framework, so nothing "
-                            + "is bundled for it — and no Punktfunk client bundles FFmpeg on any platform."
-                    )
+                    Text(Licenses.thirdPartyIntro)
                     .font(.geist(Self.captionFont, relativeTo: .caption))
                     .foregroundStyle(.secondary)
                 }

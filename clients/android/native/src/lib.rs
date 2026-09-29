@@ -37,11 +37,7 @@ mod console;
 // "Send logs to host": the log-ring upload (`pf-client-core` is Android-target-only here).
 #[cfg(target_os = "android")]
 mod logs;
-// The RESOLVED audio format + its ms ⇄ sample arithmetic, split out of `audio` and — unlike it —
-// ungated, because that arithmetic is what a rate the ladder does not divide gets wrong (44 100 Hz
-// used to come out 2.3 % off in every direction at once) and it must be provable without a phone.
-// Nothing in it touches AAudio. `test`-gated for the host build on top of the Android one so the
-// off-device leg still compiles and runs the proof; `audio` is its only non-test user.
+// AAudio callback arithmetic, `test`-gated on top of Android so its proof runs off-device.
 #[cfg(any(target_os = "android", test))]
 mod audio_format;
 #[cfg(target_os = "android")]
@@ -50,6 +46,9 @@ mod decode;
 // (and its unit test runs there) exactly like `session`/`stats`. Kotlin only ever calls it on device.
 mod discovery;
 mod feedback;
+// `decode`'s hung-decoder checks, `test`-gated like `audio_format` so their proof runs off-device.
+#[cfg(any(target_os = "android", test))]
+mod input_stall;
 #[cfg(target_os = "android")]
 mod mic;
 /// Tier-A DualSense pad audio: the 0xD1 plane rendered on the pad's own USB endpoint.
@@ -60,6 +59,7 @@ mod pad_audio;
 mod pyro;
 mod session;
 mod stats;
+mod sys;
 // Ungated like `discovery`: pure `jni` + `punktfunk_core::wol` (no Android framework), so it links
 // into the host workspace build too. Kotlin only ever calls it on device.
 mod wol;
@@ -157,4 +157,39 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleAvai
     _this: JObject,
 ) -> jni::sys::jboolean {
     cfg!(target_os = "android")
+}
+
+/// The symbol `name` in the `dlopen` handle `lib`, as the fn-pointer type `F`; `None` when absent.
+///
+/// # Safety
+/// `lib` is a live `dlopen` handle, and `F` is the `extern "C" fn` type of the symbol's C
+/// signature. The size assert only rules out a non-pointer `F`.
+#[cfg(target_os = "android")]
+pub(crate) unsafe fn sym<F: Copy>(lib: *mut std::ffi::c_void, name: &std::ffi::CStr) -> Option<F> {
+    const { assert!(size_of::<F>() == size_of::<*mut std::ffi::c_void>()) };
+    // SAFETY: `lib` is live (caller) and `name` is NUL-terminated.
+    let p = unsafe { libc::dlsym(lib, name.as_ptr()) };
+    // SAFETY: a non-null symbol is a code address, and `F` is a pointer-sized fn type matching
+    // its signature (caller).
+    (!p.is_null()).then(|| unsafe { std::mem::transmute_copy::<*mut std::ffi::c_void, F>(&p) })
+}
+
+/// The `ANativeWindow` behind a Java `Surface`, holding its own reference; `None` when the
+/// Surface has no window.
+///
+/// # Safety
+/// `surface` is a non-null `android.view.Surface`.
+#[cfg(target_os = "android")]
+pub(crate) unsafe fn window_from_surface(
+    env: &jni::Env<'_>,
+    surface: &JObject<'_>,
+) -> Option<ndk::native_window::NativeWindow> {
+    // SAFETY: `env` is this thread's live JNIEnv and `surface` a live Surface reference (caller).
+    // The casts bridge the jni-sys 0.4 (`jni`) / 0.3 (vendored `ndk`) pointer types.
+    unsafe {
+        ndk::native_window::NativeWindow::from_surface(
+            env.get_raw() as *mut _,
+            surface.as_raw() as *mut _,
+        )
+    }
 }

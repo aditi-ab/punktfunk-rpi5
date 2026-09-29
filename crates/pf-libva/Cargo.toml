@@ -14,11 +14,13 @@ tracing = "0.1"
 # Profile/entrypoint constants; this crate binds the library, pf-vaapi describes the API.
 pf-vaapi = { path = "../pf-vaapi" }
 # The encode session names the parser's `Sps`/`Pps`, which pf-vaapi builds.
-cros-codecs = { path = "../pf-bitstream/vendor/cros-codecs" }
+cros-codecs = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # libva is dlopen'd, never linked: a machine without it refuses cleanly.
 libloading = "0.9"
+# `fstat` on a borrowed dmabuf fd, for its size.
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 # The hardware test reads the encoder's own output back through the client's planner:

@@ -13,7 +13,6 @@ use super::proto::{
 };
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
-use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 use std::process::Child;
@@ -185,68 +184,11 @@ impl RemoteImporter {
         }
     }
 
+    /// One import round trip; see [`super::EglImporter::import`] for `kind`.
     pub fn import(
         &mut self,
-        plane: &DmabufPlane,
-        width: u32,
-        height: u32,
-        fourcc: u32,
-        modifier: Option<u64>,
-    ) -> Result<DeviceBuffer> {
-        self.import_impl(plane, ImportKind::Tiled, width, height, fourcc, modifier)
-    }
-
-    pub fn import_nv12(
-        &mut self,
-        plane: &DmabufPlane,
-        width: u32,
-        height: u32,
-        fourcc: u32,
-        modifier: Option<u64>,
-    ) -> Result<DeviceBuffer> {
-        self.import_impl(
-            plane,
-            ImportKind::TiledNv12,
-            width,
-            height,
-            fourcc,
-            modifier,
-        )
-    }
-
-    pub fn import_yuv444(
-        &mut self,
-        plane: &DmabufPlane,
-        width: u32,
-        height: u32,
-        fourcc: u32,
-        modifier: Option<u64>,
-    ) -> Result<DeviceBuffer> {
-        self.import_impl(plane, ImportKind::Tiled444, width, height, fourcc, modifier)
-    }
-
-    pub fn import_linear(
-        &mut self,
-        plane: &DmabufPlane,
-        width: u32,
-        height: u32,
-    ) -> Result<DeviceBuffer> {
-        self.import_impl(plane, ImportKind::Linear, width, height, 0, None)
-    }
-
-    pub fn import_linear_nv12(
-        &mut self,
-        plane: &DmabufPlane,
-        width: u32,
-        height: u32,
-    ) -> Result<DeviceBuffer> {
-        self.import_impl(plane, ImportKind::LinearNv12, width, height, 0, None)
-    }
-
-    fn import_impl(
-        &mut self,
-        plane: &DmabufPlane,
         kind: ImportKind,
+        plane: &DmabufPlane,
         width: u32,
         height: u32,
         fourcc: u32,
@@ -255,17 +197,17 @@ impl RemoteImporter {
         if self.dead() {
             bail!("zerocopy worker is dead");
         }
-        let key = dmabuf_key(plane.fd)?;
+        // SAFETY: `plane.fd` is the dmabuf fd of the PipeWire buffer the capture thread still
+        // holds for this callback (`consume_frame`'s contract), so it is open and stays open
+        // for this synchronous call; the `BorrowedFd` never outlives it (the key and the `send`).
+        let fd = unsafe { BorrowedFd::borrow_raw(plane.fd) };
+        let key = dmabuf_key(fd)?;
         // One retry: NeedFd (worker evicted this key) clears sent_keys so the resend carries the fd.
         let mut attempts = 0;
         let reply = loop {
             attempts += 1;
             let has_fd = self.sent_keys.insert(key);
-            // SAFETY: `plane.fd` is the dmabuf fd of the PipeWire buffer the capture thread still
-            // holds for this callback (`consume_frame`'s contract), so it is open and stays open
-            // for this synchronous call; the `BorrowedFd` never outlives it (used only for the
-            // `send`).
-            let pass = has_fd.then(|| unsafe { BorrowedFd::borrow_raw(plane.fd) });
+            let pass = has_fd.then_some(fd);
             let req = Request::Import {
                 key,
                 kind,
@@ -327,29 +269,27 @@ impl RemoteImporter {
                     entry.m
                 };
                 let shared = self.shared.clone();
-                Ok(DeviceBuffer::remote(
-                    m.y,
-                    m.y_pitch,
-                    m.width,
-                    m.height,
-                    m.uv,
-                    // Wire has no plane format; layout is the ImportKind we asked for.
-                    kind == ImportKind::Tiled444,
-                    Box::new(move || {
-                        // Recycle is fire-and-forget (EPIPE if dead). This Arc keeps mapping
-                        // and socket alive until the last frame drops; a retired mapping
-                        // closes here with its last ref.
-                        let _ = ipc::send(shared.sock.as_fd(), &Request::Release { id }, None);
-                        let mut g = shared.mappings.lock().unwrap();
-                        if let Some(entry) = g.get_mut(&id) {
-                            entry.refs = entry.refs.saturating_sub(1);
-                            if entry.retired && entry.refs == 0 {
-                                let entry = g.remove(&id).expect("entry exists");
-                                close_mapping(&entry.m);
-                            }
+                let release = Box::new(move || {
+                    // Recycle is fire-and-forget (EPIPE if dead). This Arc keeps mapping
+                    // and socket alive until the last frame drops; a retired mapping
+                    // closes here with its last ref.
+                    let _ = ipc::send(shared.sock.as_fd(), &Request::Release { id }, None);
+                    let mut g = shared.mappings.lock().unwrap();
+                    if let Some(entry) = g.get_mut(&id) {
+                        entry.refs = entry.refs.saturating_sub(1);
+                        if entry.retired && entry.refs == 0 {
+                            let entry = g.remove(&id).expect("entry exists");
+                            close_mapping(&entry.m);
                         }
-                    }),
-                ))
+                    }
+                });
+                // Wire has no plane format; layout is the ImportKind we asked for.
+                let yuv444 = kind.layout() == cuda::PlaneLayout::Yuv444;
+                // SAFETY: `m` is the IPC mapping `open_mapping` opened for this id, with the
+                // worker's layout; the ref taken above keeps it open until `release` drops it.
+                Ok(unsafe {
+                    DeviceBuffer::remote(m.y, m.y_pitch, m.width, m.height, m.uv, yuv444, release)
+                })
             }
             Reply::Err { message } => bail!("zerocopy worker import failed: {message}"),
             other => {
@@ -443,13 +383,14 @@ impl RemoteImporter {
         out: &ConvertOut,
         cursor: Option<CursorRect>,
     ) -> Result<u64> {
-        let key = dmabuf_key(src.fd)?;
+        // SAFETY: `src.fd` is the caller's live dmabuf for the duration of this call.
+        let fd = unsafe { BorrowedFd::borrow_raw(src.fd) };
+        let key = dmabuf_key(fd)?;
         let mut attempts = 0;
         loop {
             attempts += 1;
             let has_fd = self.sent_keys.insert(key);
-            // SAFETY: `src.fd` is the caller's live dmabuf for the duration of this call.
-            let pass = has_fd.then(|| unsafe { BorrowedFd::borrow_raw(src.fd) });
+            let pass = has_fd.then_some(fd);
             let req = Request::Convert {
                 key,
                 has_fd,
@@ -528,18 +469,8 @@ impl Drop for RemoteImporter {
 /// dma-buf identity, stable across frames and SCM_RIGHTS re-numbering: the
 /// kernel gives each dma-buf a unique inode for its lifetime. Worker fd-cache
 /// key, so the fd itself is passed once.
-fn dmabuf_key(fd: i32) -> Result<u64> {
-    // SAFETY: `libc::stat` is plain-old-data for which all-zero is a valid value, so
-    // `mem::zeroed()` is a sound initializer. `fd` is the caller's live dmabuf fd; `fstat` writes
-    // into `&mut st`, a live, correctly-sized stack struct that outlives the synchronous call,
-    // and `st_ino` is read only after the return value is checked.
-    unsafe {
-        let mut st: libc::stat = std::mem::zeroed();
-        if libc::fstat(fd, &mut st) != 0 {
-            bail!("fstat(dmabuf fd): {}", io::Error::last_os_error());
-        }
-        Ok(st.st_ino)
-    }
+fn dmabuf_key(fd: BorrowedFd<'_>) -> Result<u64> {
+    Ok(super::fd_identity(fd).context("fstat dmabuf fd")?.1)
 }
 
 fn open_mapping(desc: &BufferDesc) -> Result<Mapping> {
@@ -576,18 +507,23 @@ fn open_mapping(desc: &BufferDesc) -> Result<Mapping> {
     })
 }
 
-/// A sealed memfd holding `bytes`, for a bitmap that must not ride the socket.
+/// A memfd holding `bytes`, for a bitmap that must not ride the socket. Written once, then
+/// sealed against any change, so the worker's mapping of it cannot fault on a shrink.
 fn memfd_with(bytes: &[u8]) -> Result<OwnedFd> {
+    use rustix::fs::{MemfdFlags, SealFlags};
     use std::io::Write as _;
-    // SAFETY: a NUL-terminated literal name; the flags are plain constants.
-    let raw = unsafe { libc::memfd_create(c"punktfunk-cursor".as_ptr(), libc::MFD_CLOEXEC) };
-    if raw < 0 {
-        return Err(std::io::Error::last_os_error()).context("memfd_create(cursor)");
-    }
-    // SAFETY: `raw` is a fresh descriptor this function owns.
-    let fd = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) };
+    let fd = rustix::fs::memfd_create(
+        c"punktfunk-cursor",
+        MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+    )
+    .context("memfd_create(cursor)")?;
     let mut f = std::fs::File::from(fd);
     f.write_all(bytes).context("write cursor memfd")?;
+    rustix::fs::fcntl_add_seals(
+        &f,
+        SealFlags::SHRINK | SealFlags::GROW | SealFlags::WRITE | SealFlags::SEAL,
+    )
+    .context("seal cursor memfd")?;
     Ok(OwnedFd::from(f))
 }
 
@@ -680,7 +616,7 @@ mod tests {
                 let needs_reply = matches!(req, Request::Modifiers { .. } | Request::Import { .. });
                 let ino = fd
                     .as_ref()
-                    .map(|f| dmabuf_key(f.as_raw_fd()).expect("fstat received fd"));
+                    .map(|f| dmabuf_key(f.as_fd()).expect("fstat received fd"));
                 seen.push((req, ino));
                 if needs_reply {
                     match replies.next() {
@@ -734,11 +670,15 @@ mod tests {
         };
         // First sight of the key: fd rides along. Err keeps the key marked sent
         // (worker cached the fd before failing).
-        assert!(imp.import(&plane, 64, 64, 1, Some(2)).is_err());
-        assert!(imp.import(&plane, 64, 64, 1, Some(2)).is_err());
+        assert!(imp
+            .import(ImportKind::Tiled, &plane, 64, 64, 1, Some(2))
+            .is_err());
+        assert!(imp
+            .import(ImportKind::Tiled, &plane, 64, 64, 1, Some(2))
+            .is_err());
         assert!(!imp.dead(), "NeedFd handling must not mark the worker dead");
         // SCM_RIGHTS re-numbers the fd; st_ino of the open file survives.
-        let key = dmabuf_key(plane.fd).unwrap();
+        let key = dmabuf_key(pr.as_fd()).unwrap();
         drop(imp);
         let fd_sends: Vec<(bool, Option<u64>)> = join
             .join()
@@ -769,19 +709,19 @@ mod tests {
             offset: 0,
             stride: 256,
         };
-        let Err(err) = imp.import(&plane, 64, 64, 1, Some(2)) else {
+        let Err(err) = imp.import(ImportKind::Tiled, &plane, 64, 64, 1, Some(2)) else {
             panic!("scripted Err reply must fail the import")
         };
         assert!(format!("{err:#}").contains("EGL_BAD_MATCH"));
         assert!(!imp.dead(), "an Err reply must not mark the worker dead");
 
         // Replies exhausted → server closes → next import dies.
-        let Err(err) = imp.import(&plane, 64, 64, 1, Some(2)) else {
+        let Err(err) = imp.import(ImportKind::Tiled, &plane, 64, 64, 1, Some(2)) else {
             panic!("a closed worker must fail the import")
         };
         assert!(format!("{err:#}").contains("died"), "{err:#}");
         assert!(imp.dead());
-        let key = dmabuf_key(plane.fd).unwrap();
+        let key = dmabuf_key(pr.as_fd()).unwrap();
         drop(imp);
         let seen = join.join().unwrap();
         match (&seen[0], &seen[1]) {

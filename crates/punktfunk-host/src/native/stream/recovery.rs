@@ -7,41 +7,79 @@ use super::state::{announce_pipeline_gap, Inflight, StreamState};
 use super::*;
 
 impl StreamState {
-    /// Apply adaptive FEC behind the encoder rate it implies. A budget-identity
-    /// codec needs no retarget; a synchronous encoder publishes after accepting.
-    /// An asynchronous or refused retarget leaves both on the previous FEC.
+    /// Apply adaptive FEC behind the encoder rate it implies.
+    ///
+    /// A budget-identity codec, or a move that leaves the encoder rate where
+    /// it is, publishes at once. A synchronous encoder publishes when it
+    /// accepts; an asynchronous one is asked, and the parity waits in
+    /// `fec_pending` until the encoder has settled no higher than the rate the
+    /// parity leaves room for. A newer proposal or a moved budget asks again. A
+    /// refusal keeps the previous FEC and is logged once per proposal.
     pub(super) fn on_fec_moved(&mut self) {
         let requested = self.fec_requested.load(Ordering::Acquire);
-        if requested == self.last_fec {
-            return;
+        if let Some((fec, want)) = self.fec_pending.take() {
+            if fec == requested && want == self.enc_derive(fec).enc_kbps(self.bitrate_kbps) {
+                if !self.enc.retarget_settled() {
+                    self.fec_pending = Some((fec, want));
+                    return;
+                }
+                let want_bps = u64::from(want) * 1000;
+                let applied = self.enc.applied_bitrate_bps().unwrap_or(want_bps);
+                let moved = settle_fec(
+                    applied,
+                    want_bps,
+                    &self.fec_target,
+                    &self.fec_requested,
+                    &mut self.last_fec,
+                    requested,
+                );
+                self.note_fec_move(requested, want, moved);
+                return;
+            }
         }
-        if self.budget_identity {
-            publish_fec(&self.fec_target, &mut self.last_fec, requested);
+        if requested == self.last_fec {
             return;
         }
         let prev = self.enc_derive(self.last_fec).enc_kbps(self.bitrate_kbps);
         let want = self.enc_derive(requested).enc_kbps(self.bitrate_kbps);
-        if fec_retarget(
+        if self.budget_identity || want == prev {
+            publish_fec(&self.fec_target, &mut self.last_fec, requested);
+            return;
+        }
+        match fec_retarget(
             self.enc.bitrate_retarget_is_synchronous(),
-            |bps| want == prev || self.enc.reconfigure_bitrate(bps),
-            want as u64 * 1000,
+            |bps| self.enc.reconfigure_bitrate(bps),
+            u64::from(want) * 1000,
             &self.fec_target,
             &self.fec_requested,
             &mut self.last_fec,
             requested,
         ) {
+            FecMove::Published => self.note_fec_move(requested, want, true),
+            FecMove::Pending => self.fec_pending = Some((requested, want)),
+            FecMove::Held => self.note_fec_move(requested, want, false),
+        }
+    }
+
+    /// Say what a proposal came to. A hold the control task re-proposes every
+    /// window is logged at warn once, then at debug.
+    fn note_fec_move(&mut self, requested: u8, encoder_kbps: u32, moved: bool) {
+        if moved {
+            self.fec_hold_logged = 0;
             tracing::debug!(
                 fec_pct = requested,
-                encoder_kbps = want,
+                encoder_kbps,
                 budget_kbps = self.bitrate_kbps,
                 "adaptive FEC moved — encoder rate re-derived within the wire budget"
             );
-        } else {
+        } else if std::mem::replace(&mut self.fec_hold_logged, requested) != requested {
             tracing::warn!(
                 requested_fec_pct = requested,
                 applied_fec_pct = self.last_fec,
-                "adaptive FEC held — encoder refused the matching bitrate"
+                "adaptive FEC held — encoder did not take the matching bitrate"
             );
+        } else {
+            tracing::debug!(requested_fec_pct = requested, "adaptive FEC still held");
         }
     }
 
@@ -122,8 +160,7 @@ impl StreamState {
                 self.bitrate_kbps = applied_kbps;
                 self.live_bitrate.store(applied_kbps, Ordering::Relaxed);
                 self.inflight.clear();
-                self.last_au_at = std::time::Instant::now();
-                self.encoder_resets = 0;
+                self.watchdog.on_au();
                 self.last_forced_idr = Some(std::time::Instant::now());
                 self.behind_score = 0;
                 self.depth_frames = 0;
@@ -150,7 +187,9 @@ impl StreamState {
     /// the session's own is acted on: an encoder that answers in place cannot
     /// trip it, because the session rate came from this same read-back.
     fn settle_applied_rate(&mut self) {
-        if !self.retargeted {
+        // A pending FEC ask is the encoder's answer to parity, not to the
+        // budget: read against the applied FEC it would look like a clamp.
+        if !self.retargeted || self.fec_pending.is_some() {
             return;
         }
         let ed = self.enc_now();
@@ -217,6 +256,13 @@ impl StreamState {
             self.inflight.clear();
             self.last_forced_idr = Some(std::time::Instant::now());
             announce_pipeline_gap(&self.gap_tx, outage_ms);
+        }
+        if self.capturer.take_reference_risk() {
+            tracing::info!(
+                "capture re-held a re-sent buffer — forcing an IDR over the reference it may \
+                 have torn"
+            );
+            want_kf = true;
         }
         while self.keyframe.try_recv().is_ok() {
             want_kf = true;
@@ -434,9 +480,21 @@ fn publish_fec(fec_target: &AtomicU8, last_fec: &mut u8, requested: u8) {
     fec_target.store(requested, Ordering::Release);
 }
 
-/// Apply a control-proposed FEC target behind the encoder's answer. Only a
-/// synchronous accepted retarget moves applied FEC; an asynchronous or refused
-/// request returns the slot to the applied value unless a newer proposal landed.
+/// What a FEC proposal came to.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum FecMove {
+    /// Parity moved with the encoder.
+    Published,
+    /// An asynchronous encoder queued the rate; parity waits for it to settle.
+    Pending,
+    /// The encoder refused the rate; parity stays where it was.
+    Held,
+}
+
+/// Apply a control-proposed FEC target behind the encoder's answer. A
+/// synchronous accepted retarget moves applied FEC at once and an asynchronous
+/// one waits for [`settle_fec`]. A refusal returns the slot to the applied
+/// value unless a newer proposal landed.
 pub(super) fn fec_retarget(
     synchronous: bool,
     retarget: impl FnOnce(u64) -> bool,
@@ -445,19 +503,43 @@ pub(super) fn fec_retarget(
     fec_requested: &AtomicU8,
     last_fec: &mut u8,
     requested: u8,
+) -> FecMove {
+    if !retarget(bps) {
+        hold_fec(fec_requested, *last_fec, requested);
+        return FecMove::Held;
+    }
+    if synchronous {
+        publish_fec(fec_target, last_fec, requested);
+        FecMove::Published
+    } else {
+        FecMove::Pending
+    }
+}
+
+/// An asynchronous retarget the encoder has settled. Parity follows only when
+/// the encoder is no higher than the rate the new parity leaves room for:
+/// above it, the wire would carry more than the budget.
+pub(super) fn settle_fec(
+    applied_bps: u64,
+    want_bps: u64,
+    fec_target: &AtomicU8,
+    fec_requested: &AtomicU8,
+    last_fec: &mut u8,
+    requested: u8,
 ) -> bool {
-    if synchronous && retarget(bps) {
+    if applied_bps <= want_bps {
         publish_fec(fec_target, last_fec, requested);
         true
     } else {
-        let _ = fec_requested.compare_exchange(
-            requested,
-            *last_fec,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        hold_fec(fec_requested, *last_fec, requested);
         false
     }
+}
+
+/// Return the proposal slot to the applied value, unless the control task has
+/// written a newer proposal since.
+fn hold_fec(fec_requested: &AtomicU8, applied: u8, requested: u8) {
+    let _ = fec_requested.compare_exchange(requested, applied, Ordering::AcqRel, Ordering::Acquire);
 }
 
 /// Rebuild the encoder in place and drop owed in-flight AUs. `false` = no in-place reset.
@@ -823,25 +905,61 @@ mod tests {
         assert_eq!(applied.load(Ordering::Relaxed), 30);
     }
 
-    /// An asynchronous encoder has only queued the rate when it returns true.
-    /// FEC stays applied at the old value and no retarget is attempted here.
+    /// An asynchronous encoder has only queued the rate when it returns true:
+    /// it is asked, and parity stays where it was with the proposal standing.
     #[test]
-    fn on_fec_moved_holds_fec_for_an_asynchronous_encoder() {
+    fn on_fec_moved_asks_an_asynchronous_encoder_and_waits() {
         let applied = AtomicU8::new(10);
         let requested = AtomicU8::new(30);
         let mut last_fec = 10;
-        assert!(!fec_retarget(
-            false,
-            |_| panic!("an asynchronous FEC retarget must not be queued"),
-            12_000_000,
-            &applied,
-            &requested,
-            &mut last_fec,
-            30,
-        ));
+        let mut enc = RetargetEnc {
+            accepts: true,
+            asks: Vec::new(),
+        };
+        assert_eq!(
+            fec_retarget(
+                false,
+                |bps| enc.reconfigure_bitrate(bps),
+                12_000_000,
+                &applied,
+                &requested,
+                &mut last_fec,
+                30,
+            ),
+            FecMove::Pending
+        );
+        assert_eq!(enc.asks, [12_000_000], "the encoder was asked");
         assert_eq!(last_fec, 10);
         assert_eq!(applied.load(Ordering::Relaxed), 10);
-        assert_eq!(requested.load(Ordering::Relaxed), 10);
+        assert_eq!(requested.load(Ordering::Relaxed), 30, "the proposal stands");
+    }
+
+    /// Settled: parity follows an encoder that made room for it, and is held
+    /// behind one that stayed above the rate the new parity leaves — that
+    /// wire would carry more than the budget.
+    #[test]
+    fn a_settled_retarget_moves_parity_only_inside_the_budget() {
+        for (applied_bps, moved) in [(12_000_000, true), (11_500_000, true), (13_000_000, false)] {
+            let target = AtomicU8::new(10);
+            let requested = AtomicU8::new(30);
+            let mut last_fec = 10;
+            assert_eq!(
+                settle_fec(
+                    applied_bps,
+                    12_000_000,
+                    &target,
+                    &requested,
+                    &mut last_fec,
+                    30
+                ),
+                moved,
+                "{applied_bps}"
+            );
+            let (fec, slot) = if moved { (30, 30) } else { (10, 10) };
+            assert_eq!(last_fec, fec, "{applied_bps}");
+            assert_eq!(target.load(Ordering::Relaxed), fec, "{applied_bps}");
+            assert_eq!(requested.load(Ordering::Relaxed), slot, "{applied_bps}");
+        }
     }
 
     /// The `want == prev` leg aside, [`StreamState::on_fec_moved`] is this helper:
@@ -856,15 +974,18 @@ mod tests {
             accepts: true,
             asks: Vec::new(),
         };
-        assert!(fec_retarget(
-            true,
-            |bps| enc.reconfigure_bitrate(bps),
-            12_000_000,
-            &applied,
-            &requested,
-            &mut last_fec,
-            30,
-        ));
+        assert_eq!(
+            fec_retarget(
+                true,
+                |bps| enc.reconfigure_bitrate(bps),
+                12_000_000,
+                &applied,
+                &requested,
+                &mut last_fec,
+                30,
+            ),
+            FecMove::Published
+        );
         assert_eq!(enc.asks, [12_000_000]);
         assert_eq!(last_fec, 30);
         assert_eq!(applied.load(Ordering::Relaxed), 30);
@@ -882,15 +1003,18 @@ mod tests {
             accepts: false,
             asks: Vec::new(),
         };
-        assert!(!fec_retarget(
-            true,
-            |bps| enc.reconfigure_bitrate(bps),
-            12_000_000,
-            &applied,
-            &requested,
-            &mut last_fec,
-            30,
-        ));
+        assert_eq!(
+            fec_retarget(
+                true,
+                |bps| enc.reconfigure_bitrate(bps),
+                12_000_000,
+                &applied,
+                &requested,
+                &mut last_fec,
+                30,
+            ),
+            FecMove::Held
+        );
         assert_eq!(last_fec, 10);
         assert_eq!(applied.load(Ordering::Relaxed), 10);
         assert_eq!(requested.load(Ordering::Relaxed), 10);
@@ -909,15 +1033,18 @@ mod tests {
             accepts: false,
             asks: Vec::new(),
         };
-        assert!(!fec_retarget(
-            true,
-            |bps| enc.reconfigure_bitrate(bps),
-            12_000_000,
-            &applied,
-            &requested,
-            &mut last_fec,
-            30,
-        ));
+        assert_eq!(
+            fec_retarget(
+                true,
+                |bps| enc.reconfigure_bitrate(bps),
+                12_000_000,
+                &applied,
+                &requested,
+                &mut last_fec,
+                30,
+            ),
+            FecMove::Held
+        );
         assert_eq!(last_fec, 10);
         assert_eq!(applied.load(Ordering::Relaxed), 10);
         assert_eq!(requested.load(Ordering::Relaxed), 50);

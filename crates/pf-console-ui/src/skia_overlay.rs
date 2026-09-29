@@ -3,16 +3,17 @@
 //! presenter may still sample the previous image), and damage-driven redraws.
 //!
 //! Two personas on one `Overlay`: the console shell (home, library, settings,
-//! pairing — always dirty; the aurora animates) and stream chrome (stats OSD,
+//! pairing — redrawn every frame, at 30 Hz once idle) and stream chrome (stats OSD,
 //! capture hint, auto-fading start banner).
 
-use crate::console::{Console, ConsoleEntry, ConsoleHandles};
+use crate::console::{Console, ConsoleEntry, ConsoleHandles, FrameCost};
 use crate::shell::{ConsoleOptions, Shell};
 use crate::theme::{fill, match_first_family, Fonts};
 use anyhow::{anyhow, Context as _, Result};
 use ash::vk as avk;
 use ash::vk::Handle as _;
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
+use pf_client_core::trust::HudCorner;
 use pf_presenter::overlay::{
     FrameCtx, HudLine, Overlay, OverlayAction, OverlayFrame, PointerInput, RingCommand, RingInput,
     Role, SessionPhase, SharedDevice,
@@ -20,9 +21,12 @@ use pf_presenter::overlay::{
 use skia_safe::gpu::vk as skvk;
 use skia_safe::gpu::{self, DirectContext, SurfaceOrigin};
 use skia_safe::{Canvas, Color4f, Font, FontMgr, Point, RRect, Rect, Surface};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-/// Long enough to read the leave/stats chords; the last `BANNER_FADE_S` fade out.
+/// An idle console redraws at most this often. 30 Hz keeps the aurora moving.
+const IDLE_FRAME: Duration = Duration::from_nanos(1_000_000_000 / 30);
+
+/// Long enough to read the exit hint; the last `BANNER_FADE_S` fade out.
 const BANNER_S: f64 = 6.0;
 const BANNER_FADE_S: f64 = 0.6;
 
@@ -31,8 +35,24 @@ struct Slot {
     surface: Surface,
     image: avk::Image,
     view: avk::ImageView,
+    format: avk::Format,
     width: u32,
     height: u32,
+    ten_bit: bool,
+}
+
+impl Slot {
+    fn frame(&self) -> OverlayFrame {
+        OverlayFrame {
+            image: self.image,
+            view: self.view,
+            format: self.format,
+            width: self.width,
+            height: self.height,
+            scissor_y: 0,
+            scissor_height: self.height,
+        }
+    }
 }
 
 /// Damage key for the current ring slot — re-render only when this changes.
@@ -41,6 +61,9 @@ struct Drawn {
     width: u32,
     height: u32,
     stats: Option<Vec<HudLine>>,
+    /// The stats panel's corner (`HudCorner::ALL` index) and size in percent.
+    stats_corner: u8,
+    stats_pct: u16,
     hint: Option<String>,
     /// Chip text. Countdown ticks once a minute, so a still chip is free per frame.
     access: Option<String>,
@@ -97,6 +120,9 @@ pub struct SkiaOverlay {
     ring_touch: crate::pointer::Touch,
     /// Scale the ring last drew at; its touch slop and drag ticks grow with it.
     ring_k: f64,
+    /// Last console render, for the idle rate. `None` once stream chrome took the slots.
+    console_at: Option<Instant>,
+    console_cost: FrameCost,
 }
 
 struct Gpu {
@@ -130,6 +156,8 @@ impl SkiaOverlay {
             ring_touch: crate::pointer::Touch::default(),
             ring_k: 1.0,
             resizing_since: None,
+            console_at: None,
+            console_cost: FrameCost::default(),
         }
     }
 
@@ -239,7 +267,7 @@ impl Overlay for SkiaOverlay {
         // The console is built before the presenter, so the codec row starts optimistic.
         // This is the first moment the real device can answer, and it runs before any frame.
         if let Some(shell) = &mut self.shell {
-            shell.av1_ok = shared.av1_decode;
+            shell.device.av1_ok = shared.av1_decode;
         }
 
         let typeface = match_first_family(
@@ -345,8 +373,9 @@ impl Overlay for SkiaOverlay {
             return false;
         }
         let ring = &mut self.ring;
+        // The ring takes no pans or long presses, so its finger needs no clock.
         self.ring_touch
-            .feed(input, self.ring_k, |p| ring.pointer(p))
+            .feed(input, self.ring_k, 0.0, |p| ring.pointer(p))
     }
 
     fn take_action(&mut self) -> Option<OverlayAction> {
@@ -374,21 +403,32 @@ impl Overlay for SkiaOverlay {
     }
 
     fn session_phase(&mut self, phase: SessionPhase) {
-        let Some(shell) = &mut self.shell else { return };
-        // Banner clock is the overlay's; everything else is the shell's.
+        // The exit hint's clock is the overlay's, in a plain `--connect` session too; the
+        // phase itself is the console shell's.
         match &phase {
             SessionPhase::Streaming => self.streaming_since = Some(Instant::now()),
             SessionPhase::Ended(_) | SessionPhase::Reconnecting(_) => self.streaming_since = None,
             SessionPhase::Connecting | SessionPhase::Failed(_) => {}
         }
-        shell.session_phase(phase);
+        if let Some(shell) = &mut self.shell {
+            shell.session_phase(phase);
+        }
     }
 
     fn frame(&mut self, ctx: &FrameCtx) -> Result<Option<OverlayFrame>> {
-        // Full-screen, opaque, always dirty — the aurora animates every frame.
+        // Full-screen and opaque; the aurora animates every frame. Idle, the slot on glass
+        // is handed back until `IDLE_FRAME` passes, and the presenter skips its present.
         if self.console_visible() {
+            let idle = self.shell.as_ref().is_some_and(Shell::idle)
+                && self.console_at.is_some_and(|t| t.elapsed() < IDLE_FRAME);
+            if let Some(slot) = self.slots[self.current].as_ref().filter(|s| {
+                idle && (s.width, s.height, s.ten_bit) == (ctx.width, ctx.height, ctx.ten_bit)
+            }) {
+                return Ok(Some(slot.frame()));
+            }
+            let drew = Instant::now();
             let next = 1 - self.current;
-            self.ensure_slot(next, ctx.width, ctx.height)?;
+            self.ensure_slot(next, ctx.width, ctx.height, ctx.ten_bit)?;
             let Self {
                 gpu,
                 slots,
@@ -423,16 +463,25 @@ impl Overlay for SkiaOverlay {
             }
             self.current = next;
             self.drawn = Drawn::default(); // stream chrome re-renders when it returns
-            let slot = self.slots[next].as_ref().expect("just rendered");
-            return Ok(Some(OverlayFrame {
-                image: slot.image,
-                view: slot.view,
-                width: slot.width,
-                height: slot.height,
-                scissor_y: 0,
-                scissor_height: slot.height,
-            }));
+            let now = Instant::now();
+            self.console_at = Some(now);
+            if let Some(r) = self.console_cost.add(now - drew, now) {
+                tracing::debug!(
+                    width = ctx.width,
+                    height = ctx.height,
+                    frames = r.frames,
+                    mean_ms = %format_args!("{:.1}", r.mean_ms),
+                    peak_ms = %format_args!("{:.1}", r.peak_ms),
+                    "console frame cost"
+                );
+            }
+            return Ok(Some(
+                self.slots[next].as_ref().expect("just rendered").frame(),
+            ));
         }
+        // A cost window never spans a stream: it would report minutes for a few frames.
+        self.console_at = None;
+        self.console_cost = FrameCost::default();
 
         let banner_alpha = self.banner_alpha(ctx);
         let banner_step = (banner_alpha * 32.0).round() as u8;
@@ -471,6 +520,11 @@ impl Overlay for SkiaOverlay {
             width: ctx.width,
             height: ctx.height,
             stats: ctx.stats.map(<[HudLine]>::to_vec),
+            stats_corner: HudCorner::ALL
+                .iter()
+                .position(|c| *c == ctx.stats_corner)
+                .unwrap_or(0) as u8,
+            stats_pct: (ctx.stats_scale * 100.0).round() as u16,
             hint: ctx.hint.map(str::to_owned),
             access: ctx.access.map(str::to_owned),
             notice: ctx.notice.map(str::to_owned),
@@ -487,7 +541,7 @@ impl Overlay for SkiaOverlay {
         // requests the full surface.
         let top = want.stats.is_some() || want.access.is_some() || want.mic_muted;
         let bottom = want.hint.is_some() || want.notice.is_some() || banner_step > 0;
-        let full = ctx.resizing || ring_key != 0 || (top && bottom);
+        let full = want.stats.is_some() || ctx.resizing || ring_key != 0 || (top && bottom);
         let band = ((384.0 * scale).ceil() as u32).min(ctx.height);
         let (scissor_y, scissor_height) = if full {
             (0, ctx.height)
@@ -497,19 +551,16 @@ impl Overlay for SkiaOverlay {
             (ctx.height.saturating_sub(band), band)
         };
         if want == self.drawn {
-            return Ok(self.slots[self.current].as_ref().map(|s| OverlayFrame {
-                image: s.image,
-                view: s.view,
-                width: s.width,
-                height: s.height,
+            return Ok(self.slots[self.current].as_ref().map(|slot| OverlayFrame {
                 scissor_y,
                 scissor_height,
+                ..slot.frame()
             }));
         }
 
         // Other slot: the presenter may still be sampling this one (one frame in flight).
         let next = 1 - self.current;
-        self.ensure_slot(next, ctx.width, ctx.height)?;
+        self.ensure_slot(next, ctx.width, ctx.height, ctx.ten_bit)?;
         let gpu = self.gpu.as_mut().expect("init ran");
         let slot = self.slots[next].as_mut().expect("just ensured");
 
@@ -523,22 +574,29 @@ impl Overlay for SkiaOverlay {
             draw_resize_scrim(canvas, font, ctx.width, ctx.height, phase, scale);
         }
         if let Some(stats) = &want.stats {
-            draw_osd_panel(canvas, font, stats, ctx.width, scale);
+            let osd_scale = scale * ctx.stats_scale.clamp(0.5, 4.0);
+            let size = (ctx.width, ctx.height);
+            draw_osd_panel(canvas, font, stats, size, osd_scale, ctx.stats_corner);
         }
-        // Top-right, stacked in a fixed order: never collides with the stats panel or the
-        // bottom pill, even at stats Off.
+        // Top-right, stacked in a fixed order, and top-left while the stats panel holds the
+        // top right: never under the panel or the bottom pill, even at stats Off. The mute
+        // badges persist, because what they report does not go away on its own.
+        let left = want.stats.is_some() && ctx.stats_corner == HudCorner::TopRight;
         let mut row = 0;
         if want.mic_muted {
-            draw_badge(canvas, font, "Microphone muted", ctx.width, row, scale);
+            let at = (ctx.width, row, left);
+            corner_pill(canvas, font, "Microphone muted", true, at, scale);
             row += 1;
         }
         if !want.audio_mute.is_empty() {
-            draw_badge(canvas, font, &want.audio_mute, ctx.width, row, scale);
+            let at = (ctx.width, row, left);
+            corner_pill(canvas, font, &want.audio_mute, true, at, scale);
             row += 1;
         }
-        // Same corner as the badges (must survive stats Off); stacks under them.
+        // The access chip (preset label + countdown) stacks under them. A full-control
+        // permanent session has none.
         if let Some(access) = &want.access {
-            draw_access_chip(canvas, font, access, ctx.width, row, scale);
+            corner_pill(canvas, font, access, false, (ctx.width, row, left), scale);
         }
         // Access toast outranks the capture hint for its few seconds.
         if let Some(notice) = &want.notice {
@@ -546,7 +604,7 @@ impl Overlay for SkiaOverlay {
         } else if let Some(hint) = &want.hint {
             draw_hint_pill(canvas, font, hint, ctx.width, ctx.height, 1.0, scale);
         } else if banner_step > 0 {
-            // Leave/stats shortcuts, fading so they are discoverable without the OSD.
+            // The exit hint, fading out.
             if let Some(text) = &self.banner_text {
                 draw_hint_pill(
                     canvas,
@@ -587,14 +645,10 @@ impl Overlay for SkiaOverlay {
 
         self.current = next;
         self.drawn = want;
-        let slot = self.slots[next].as_ref().expect("just rendered");
         Ok(Some(OverlayFrame {
-            image: slot.image,
-            view: slot.view,
-            width: slot.width,
-            height: slot.height,
             scissor_y,
             scissor_height,
+            ..self.slots[next].as_ref().expect("just rendered").frame()
         }))
     }
 }
@@ -610,10 +664,10 @@ fn ring_dt(drawn_at: &mut Option<Instant>) -> f64 {
 }
 
 impl SkiaOverlay {
-    /// Banner alpha 1→0 across the fade tail. Refresh the words while visible
-    /// so a pad hot-plug updates the leave hint.
+    /// Exit-hint alpha 1→0 across the fade tail; 0 when the player turned the hint off.
+    /// The words refresh while visible so a pad hot-plug swaps them.
     fn banner_alpha(&mut self, ctx: &FrameCtx) -> f64 {
-        let Some(since) = self.streaming_since else {
+        let Some(since) = self.streaming_since.filter(|_| ctx.exit_hint) else {
             self.banner_text = None;
             return 0.0;
         };
@@ -623,17 +677,7 @@ impl SkiaOverlay {
             self.banner_text = None;
             return 0.0;
         }
-        // The dial's opener leads: it is the one shortcut that reaches every other action, so a
-        // reader who remembers only this line still has stats, mic and disconnect.
-        self.banner_text = Some(if ctx.pad.is_some() {
-            "Select + A quick actions · Hold L1 + R1 + Start + Select to leave · \
-             Ctrl+Alt+Shift+S stats"
-                .to_string()
-        } else {
-            "Ctrl+Alt+Shift+O quick actions · Ctrl+Alt+Shift+Q releases input · \
-             Ctrl+Alt+Shift+D disconnects · Ctrl+Alt+Shift+S stats"
-                .to_string()
-        });
+        self.banner_text = Some(exit_hint(ctx.pad.is_some()).to_string());
         ((BANNER_S - age) / BANNER_FADE_S).min(1.0)
     }
 
@@ -653,10 +697,12 @@ impl SkiaOverlay {
         )
     }
 
-    fn ensure_slot(&mut self, i: usize, width: u32, height: u32) -> Result<()> {
+    /// `ten_bit` follows the swapchain: a deep slot under an 8-bit blit gains nothing. F16,
+    /// not 10/10/10/2: the overlay blends over video, and two bits of alpha step its fades.
+    fn ensure_slot(&mut self, i: usize, width: u32, height: u32, ten_bit: bool) -> Result<()> {
         if self.slots[i]
             .as_ref()
-            .is_some_and(|s| s.width == width && s.height == height)
+            .is_some_and(|s| s.width == width && s.height == height && s.ten_bit == ten_bit)
         {
             return Ok(());
         }
@@ -667,8 +713,16 @@ impl SkiaOverlay {
             // before each record), so the GPU is done with it.
             unsafe { gpu.device.destroy_image_view(old.view, None) };
         }
-        let info =
-            skia_safe::ImageInfo::new_n32_premul((width.max(1) as i32, height.max(1) as i32), None);
+        let info = skia_safe::ImageInfo::new(
+            (width.max(1) as i32, height.max(1) as i32),
+            if ten_bit {
+                skia_safe::ColorType::RGBAF16
+            } else {
+                skia_safe::ColorType::N32
+            },
+            skia_safe::AlphaType::Premul,
+            None,
+        );
         let mut surface = gpu::surfaces::render_target(
             &mut gpu.context,
             gpu::Budgeted::Yes,
@@ -712,8 +766,10 @@ impl SkiaOverlay {
             surface,
             image,
             view,
+            format: avk::Format::from_raw(image_info.format as i32),
             width,
             height,
+            ten_bit,
         });
         Ok(())
     }
@@ -759,8 +815,24 @@ fn fit_scale(scale: f32, width_at_scale: f32, budget: f32) -> f32 {
     }
 }
 
-/// Stats OSD: translucent rounded panel, top-left, one line each, painted by role.
-fn draw_osd_panel(canvas: &Canvas, base_font: &Font, lines: &[HudLine], width: u32, scale: f32) {
+/// How to leave a stream, in one line: the pad chord when a pad is forwarded, else the key.
+pub(crate) fn exit_hint(pad: bool) -> &'static str {
+    if pad {
+        "Hold L1 + R1 + Start + Select to leave"
+    } else {
+        "Ctrl+Alt+Shift+D to leave"
+    }
+}
+
+/// Stats OSD: translucent rounded panel in `corner`, one line each, painted by role.
+fn draw_osd_panel(
+    canvas: &Canvas,
+    base_font: &Font,
+    lines: &[HudLine],
+    (width, height): (u32, u32),
+    scale: f32,
+    corner: HudCorner,
+) {
     // Width is linear in scale; measure once, then fit so Detailed-tier lines stay in-window.
     let width_at = |s: f32| {
         let font = chrome_font(base_font, s);
@@ -780,13 +852,22 @@ fn draw_osd_panel(canvas: &Canvas, base_font: &Font, lines: &[HudLine], width: u
         .map(|l| font.measure_str(&l.text, None).0)
         .fold(0.0f32, f32::max);
     let (pad_x, pad_y) = (base::OSD_PAD_X * scale, base::OSD_PAD_Y * scale);
-    let (x, y) = (base::OSD_MARGIN * scale, base::OSD_MARGIN * scale);
-    let panel = Rect::from_xywh(
-        x,
-        y,
+    let (w, h) = (
         widest + 2.0 * pad_x,
         line_h * lines.len() as f32 + 2.0 * pad_y,
     );
+    let margin = base::OSD_MARGIN * scale;
+    let x = if corner.right() {
+        width as f32 - w - margin
+    } else {
+        margin
+    };
+    let y = if corner.bottom() {
+        height as f32 - h - margin
+    } else {
+        margin
+    };
+    let panel = Rect::from_xywh(x, y, w, h);
     let radius = base::OSD_RADIUS * scale;
     canvas.draw_rrect(
         RRect::new_rect_xy(panel, radius, radius),
@@ -812,73 +893,48 @@ fn role_color(role: Role) -> Color4f {
     }
 }
 
-/// Standing badge (error-colour dot + words), top-right at `row`. Drawn from state, not
-/// from the stats text, so it survives stats Off. Words: the runtime monospace may not ship
-/// a mute glyph. Persistent, because what it reports does not go away on its own.
-fn draw_badge(canvas: &Canvas, base_font: &Font, label: &str, width: u32, row: usize, scale: f32) {
+/// A standing pill in a top corner, `row` pills down: words, led by an error-colour dot when
+/// `dot`. `at` is the window width, the row and whether it sits top-left. Drawn from state,
+/// not from the stats text, so it survives stats Off. Words: the runtime monospace may not
+/// ship a mute glyph. Every pill is one line tall, so rows stack on one pitch.
+fn corner_pill(
+    canvas: &Canvas,
+    base_font: &Font,
+    text: &str,
+    dot: bool,
+    (width, row, left): (u32, usize, bool),
+    scale: f32,
+) {
     // Short; it fits any stream window, so take the display scale as-is.
     let font = &chrome_font(base_font, scale);
     let (_, metrics) = font.metrics();
     let line_h = metrics.descent - metrics.ascent;
     let (pad_x, pad_y) = (base::PILL_PAD_X * scale, base::PILL_PAD_Y * scale);
     let dot_r = 4.0 * scale;
-    let dot_gap = 8.0 * scale;
-    let text_w = font.measure_str(label, None).0;
-    let w = text_w + 2.0 * dot_r + dot_gap + 2.0 * pad_x;
+    let lead = if dot { 2.0 * dot_r + 8.0 * scale } else { 0.0 };
+    let w = font.measure_str(text, None).0 + lead + 2.0 * pad_x;
     let h = line_h + 2.0 * pad_y;
     let margin = base::OSD_MARGIN * scale;
-    let x = width as f32 - w - margin;
+    let x = if left {
+        margin
+    } else {
+        width as f32 - w - margin
+    };
     let y = margin + row as f32 * (h + 8.0 * scale);
     canvas.draw_rrect(
         RRect::new_rect_xy(Rect::from_xywh(x, y, w, h), h / 2.0, h / 2.0),
         &fill(Color4f::new(0.0, 0.0, 0.0, 0.62)),
     );
-    canvas.draw_circle(
-        Point::new(x + pad_x + dot_r, y + h / 2.0),
-        dot_r,
-        &fill(crate::theme::ERROR),
-    );
-    canvas.draw_str(
-        label,
-        Point::new(
-            x + pad_x + 2.0 * dot_r + dot_gap,
-            y + pad_y - metrics.ascent,
-        ),
-        font,
-        &fill(Color4f::new(1.0, 1.0, 1.0, 0.92)),
-    );
-}
-
-/// Access chip: preset label + countdown, top-right, under whatever badges hold the
-/// corner. Standing, like them: must stay readable at every stats tier including Off.
-/// Omitted for a full-control permanent session (`None` from the run loop).
-fn draw_access_chip(
-    canvas: &Canvas,
-    base_font: &Font,
-    text: &str,
-    width: u32,
-    rows_above: usize,
-    scale: f32,
-) {
-    let font = &chrome_font(base_font, scale);
-    let (_, metrics) = font.metrics();
-    let line_h = metrics.descent - metrics.ascent;
-    let (pad_x, pad_y) = (base::PILL_PAD_X * scale, base::PILL_PAD_Y * scale);
-    let text_w = font.measure_str(text, None).0;
-    let w = text_w + 2.0 * pad_x;
-    let h = line_h + 2.0 * pad_y;
-    let margin = base::OSD_MARGIN * scale;
-    // One row per badge already in the corner (same height formula; a badge's dot fits
-    // inside the shared line height).
-    let y = margin + rows_above as f32 * (h + 8.0 * scale);
-    let x = width as f32 - w - margin;
-    canvas.draw_rrect(
-        RRect::new_rect_xy(Rect::from_xywh(x, y, w, h), h / 2.0, h / 2.0),
-        &fill(Color4f::new(0.0, 0.0, 0.0, 0.62)),
-    );
+    if dot {
+        canvas.draw_circle(
+            Point::new(x + pad_x + dot_r, y + h / 2.0),
+            dot_r,
+            &fill(crate::theme::ERROR),
+        );
+    }
     canvas.draw_str(
         text,
-        Point::new(x + pad_x, y + pad_y - metrics.ascent),
+        Point::new(x + pad_x + lead, y + pad_y - metrics.ascent),
         font,
         &fill(Color4f::new(1.0, 1.0, 1.0, 0.92)),
     );

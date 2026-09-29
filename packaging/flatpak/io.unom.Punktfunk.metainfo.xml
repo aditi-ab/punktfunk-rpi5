@@ -1,33 +1,52 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- AppStream metainfo for the punktfunk Linux client flatpak. Validate with:
-       appstreamcli validate packaging/flatpak/io.unom.Punktfunk.metainfo.xml
-     The component id MUST equal the flatpak app-id; the <launchable> MUST name the installed
-     desktop file (io.unom.Punktfunk.desktop). -->
+<!-- AppStream metainfo for the punktfunk Linux client flatpak. Validate with the appstream
+     check of ghcr.io/flathub-infra/flatpak-builder-lint. The component id MUST equal the flatpak app-id; the <launchable> MUST name the installed
+     desktop file (io.unom.Punktfunk.desktop). Each stable tag adds a <release> on top. -->
 <component type="desktop-application">
   <id>io.unom.Punktfunk</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT OR Apache-2.0</project_license>
   <name>Punktfunk</name>
-  <summary>Low-latency desktop and game streaming client</summary>
+  <summary>Stream your PC's games and desktop</summary>
 
   <description>
     <p>
-      Punktfunk is the native Linux client for the punktfunk low-latency desktop and game
-      streaming stack. It discovers hosts on the LAN over mDNS, trusts them via certificate
-      pinning with a SPAKE2 PIN pairing ceremony, and streams HEVC video (GF(2^16) Leopard
-      FEC plus AES-GCM over UDP, with a QUIC control plane) at exactly the requested
-      resolution and refresh rate — no scaling.
+      Punktfunk plays games and uses the desktop of a computer running the Punktfunk host, with
+      low latency over your network. The stream arrives at this screen's resolution and refresh
+      rate, without scaling.
     </p>
-    <p>Features:</p>
+    <p>
+      You need the Punktfunk host on the computer you stream from. It runs on Linux and Windows.
+    </p>
     <ul>
-      <li>Hardware-accelerated HEVC decode (VAAPI zero-copy on AMD and Intel, software fallback)</li>
-      <li>PipeWire audio playback and microphone uplink</li>
-      <li>Full gamepad support including DualSense touchpad, motion, adaptive triggers and lightbar (SDL3)</li>
-      <li>LAN host discovery, TOFU fingerprint pinning and PIN pairing</li>
+      <li>Hardware decoding with Vulkan Video or VA-API: H.264, HEVC and AV1, with HDR</li>
+      <li>A controller interface for the couch and the Steam Deck</li>
+      <li>Gamepads, including the DualSense touchpad, motion, adaptive triggers and lightbar</li>
+      <li>Game audio and your microphone</li>
+      <li>Finds hosts on your network and pairs with a PIN</li>
     </ul>
   </description>
 
   <launchable type="desktop-id">io.unom.Punktfunk.desktop</launchable>
+
+  <screenshots>
+    <screenshot type="default">
+      <caption>Hosts on your network</caption>
+      <image>https://git.unom.io/unom/punktfunk/raw/branch/main/packaging/flatpak/screenshots/hosts.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>A host's game library</caption>
+      <image>https://git.unom.io/unom/punktfunk/raw/branch/main/packaging/flatpak/screenshots/library.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Pairing with a PIN</caption>
+      <image>https://git.unom.io/unom/punktfunk/raw/branch/main/packaging/flatpak/screenshots/pair.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Settings</caption>
+      <image>https://git.unom.io/unom/punktfunk/raw/branch/main/packaging/flatpak/screenshots/settings.png</image>
+    </screenshot>
+  </screenshots>
 
   <categories>
     <category>Network</category>
@@ -42,7 +61,14 @@
     <keyword>moonlight</keyword>
   </keywords>
 
-  <url type="homepage">https://git.unom.io/unom/punktfunk</url>
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+    <control>gamepad</control>
+  </supports>
+
+  <url type="homepage">https://punktfunk.unom.io/</url>
+  <url type="help">https://docs.punktfunk.unom.io/</url>
   <url type="bugtracker">https://git.unom.io/unom/punktfunk/issues</url>
   <url type="vcs-browser">https://git.unom.io/unom/punktfunk</url>
 
@@ -57,11 +83,23 @@
     <color type="primary" scheme_preference="dark">#6c5bf3</color>
   </branding>
 
-  <!-- Bump on each release; the version/date should track the published bundle. -->
   <releases>
-    <release version="0.0.1" date="2026-06-15">
+    <release version="0.41.0" date="2026-09-28">
+      <url type="details">https://git.unom.io/unom/punktfunk/releases/tag/v0.41.0</url>
       <description>
-        <p>Initial flatpak packaging of the native Linux client for the Steam Deck and Wayland desktops.</p>
+        <p>A game you launched can be ended from any client, keys no longer stick when a packet is lost, and large libraries load a page at a time.</p>
+      </description>
+    </release>
+    <release version="0.40.0" date="2026-09-25">
+      <url type="details">https://git.unom.io/unom/punktfunk/releases/tag/v0.40.0</url>
+      <description>
+        <p>The console is rebuilt for the TV remote, with Hosts, Games, Controllers and Settings tabs and a Games tab laid out like the Mac library.</p>
+      </description>
+    </release>
+    <release version="0.39.0" date="2026-09-20">
+      <url type="details">https://git.unom.io/unom/punktfunk/releases/tag/v0.39.0</url>
+      <description>
+        <p>Two players can share one host, a launch waits for the game's window, and automatic bitrate measures the link before the first frame.</p>
       </description>
     </release>
   </releases>

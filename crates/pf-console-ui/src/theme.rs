@@ -108,6 +108,31 @@ pub fn layer() -> Paint {
     Paint::default()
 }
 
+/// A 10/10/10/2 canvas has two bits of alpha, so a fade or a mask layered on it steps in
+/// quarters: the layer goes F16 there. Every `save_layer` in the crate carries this.
+pub fn layer_flags(canvas: &Canvas) -> skia_safe::canvas::SaveLayerFlags {
+    use skia_safe::ColorType::{BGRA1010102, RGBA1010102};
+    if matches!(canvas.image_info().color_type(), RGBA1010102 | BGRA1010102) {
+        skia_safe::canvas::SaveLayerFlags::F16_COLOR_TYPE
+    } else {
+        skia_safe::canvas::SaveLayerFlags::empty()
+    }
+}
+
+/// `Canvas::save_layer_alpha_f` with [`layer_flags`].
+pub fn save_layer_alpha(canvas: &Canvas, bounds: impl Into<Option<Rect>>, alpha: f32) -> usize {
+    let mut paint = layer();
+    paint.set_alpha_f(alpha);
+    let bounds = bounds.into();
+    let mut rec = skia_safe::canvas::SaveLayerRec::default()
+        .paint(&paint)
+        .flags(layer_flags(canvas));
+    if let Some(b) = bounds.as_ref() {
+        rec = rec.bounds(b);
+    }
+    canvas.save_layer(&rec)
+}
+
 /// Linear + linear mipmap. `draw_image_rect` defaults to nearest with no mipmaps;
 /// a poster shrunk into a cell then drops whole source rows.
 pub fn art_sampling() -> skia_safe::SamplingOptions {
@@ -118,34 +143,99 @@ pub fn art_sampling() -> skia_safe::SamplingOptions {
 pub const ERROR: Color4f = Color4f::new(1.0, 0.576, 0.541, 1.0);
 pub const ONLINE_GREEN: Color4f = Color4f::new(0.20, 0.84, 0.29, 1.0);
 
+/// Green text for what is live (online, playing) on glass: pastel under white ink, deep
+/// under dark ink.
+pub fn live() -> Color4f {
+    if ink().scrim.r > 0.5 {
+        Color4f::new(0.06, 0.50, 0.18, 1.0)
+    } else {
+        Color4f::new(0.64, 0.95, 0.60, 1.0)
+    }
+}
+
 /// Palette-derived fg, accent, glass, and scrim. Pale fields need dark text;
 /// a brand-violet wash on a copper field clashes.
 #[derive(Clone, Copy)]
 pub struct Ink {
     fg: Color4f,
     accent: Color4f,
+    /// Glass at a panel's top and at its foot.
     glass: Color4f,
+    glass_low: Color4f,
+    /// A coverless card's face at tint 0 and at tint 1 ([`card_face`]).
+    face: [Color4f; 2],
+    /// Drop shadow strength against a dark field's.
+    shadow: f32,
     /// Ground the vignette leans toward (black on dark, white on pale) and how
     /// hard (`a`). Mixing toward white at dark-field strength bleaches chroma.
     pub scrim: Color4f,
 }
 
-/// Shipped dark look, and the fallback before any palette is applied.
+const BLACK: Color4f = Color4f::new(0.0, 0.0, 0.0, 1.0);
+const WHITE: Color4f = Color4f::new(1.0, 1.0, 1.0, 1.0);
+
+/// Dark look, and the fallback before any palette is applied.
 const DARK_INK: Ink = Ink {
-    fg: Color4f::new(1.0, 1.0, 1.0, 1.0),
+    fg: WHITE,
     // Brand violet, dark-appearance `#8678F5`.
     accent: Color4f::new(0.525, 0.471, 0.961, 1.0),
     glass: Color4f::new(0.086, 0.086, 0.125, 0.62),
-    scrim: Color4f::new(0.0, 0.0, 0.0, 1.0),
+    glass_low: Color4f::new(0.086, 0.086, 0.125, 0.62),
+    face: [BLACK, Color4f::new(0.525, 0.471, 0.961, 1.0)],
+    shadow: 1.0,
+    scrim: BLACK,
 };
+
+/// A mid-bright field (the brand default): white ink, violet glass clearing toward white at
+/// its foot, violet faces deep enough for white titles, an indigo accent (white would hide
+/// a switch's knob), and a whisper of vignette.
+const VIVID_INK: Ink = Ink {
+    fg: WHITE,
+    accent: Color4f::new(0.28, 0.20, 0.70, 1.0),
+    glass: Color4f::new(0.32, 0.24, 0.42, 0.30),
+    glass_low: Color4f::new(1.0, 1.0, 1.0, 0.16),
+    face: [
+        Color4f::new(0.56, 0.42, 0.93, 1.0),
+        Color4f::new(0.40, 0.26, 0.82, 1.0),
+    ],
+    shadow: 0.55,
+    scrim: Color4f::new(0.0, 0.0, 0.0, 0.12),
+};
+
+/// A pale field: white frost (0.66 vs dark's 0.62, a bright gradient has less to separate
+/// it), a softer shadow, and scrims that lean white. `fg` and `accent` are the palette's.
+const PALE_INK: Ink = Ink {
+    fg: BLACK,
+    accent: BLACK,
+    glass: Color4f::new(1.0, 1.0, 1.0, 0.66),
+    glass_low: Color4f::new(1.0, 1.0, 1.0, 0.66),
+    face: [WHITE, BLACK],
+    shadow: 0.40,
+    scrim: Color4f::new(1.0, 1.0, 1.0, 0.45),
+};
+
+/// A white-ink field whose ground is brighter than this takes [`VIVID_INK`].
+const VIVID_GROUND: f64 = 0.3;
+
+/// Relative luminance of an sRGB colour, for picking ink against a ground.
+pub(crate) fn luma((r, g, b): (f64, f64, f64)) -> f64 {
+    0.2126 * r + 0.7152 * g + 0.0722 * b
+}
 
 impl Ink {
     /// Palette ink. Pale fields get near-black fg tinted toward the ground (a
     /// foreign grey reads as a second palette) and white-frost glass.
-    pub fn of(p: &crate::library::Palette) -> Ink {
+    pub fn of(p: &crate::palette::Palette) -> Ink {
         let accent = Color4f::new(p.accent.0 as f32, p.accent.1 as f32, p.accent.2 as f32, 1.0);
+        if !p.light && luma(p.ground) > VIVID_GROUND {
+            return VIVID_INK;
+        }
         if !p.light {
-            return Ink { accent, ..DARK_INK };
+            return Ink {
+                accent,
+                face: [BLACK, accent],
+                ..DARK_INK
+            };
         }
         let g = p.ground;
         Ink {
@@ -156,31 +246,34 @@ impl Ink {
                 1.0,
             ),
             accent,
-            // 0.66 vs dark's 0.62: white frost over a bright gradient has less to separate it.
-            glass: Color4f::new(1.0, 1.0, 1.0, 0.66),
-            scrim: Color4f::new(1.0, 1.0, 1.0, 0.45),
+            face: [WHITE, accent],
+            ..PALE_INK
         }
     }
 
     /// OS-theme ink. The accent is already lifted by [`crate::os_theme::readable_accent`];
     /// an arbitrary OS colour is not contrast-safe as focus. Fg is the theme's own.
     pub fn of_os(t: &crate::os_theme::OsTheme) -> Ink {
-        let c = |(r, g, b): (f64, f64, f64), a: f32| Color4f::new(r as f32, g as f32, b as f32, a);
+        let c =
+            |crate::os_theme::Rgb(r, g, b), a: f32| Color4f::new(r as f32, g as f32, b as f32, a);
         let accent = c(crate::os_theme::readable_accent(t), 1.0);
         if !t.light {
+            // Theme field, not brand violet-grey: a panel sits a shade above the ground it covers.
+            let glass = c(t.background.mix(t.foreground, 0.10), 0.62);
             return Ink {
                 fg: c(t.foreground, 1.0),
                 accent,
-                // Theme field, not brand violet-grey: a panel sits a shade above the ground it covers.
-                glass: c(crate::os_theme::mix(t.background, t.foreground, 0.10), 0.62),
-                scrim: Color4f::new(0.0, 0.0, 0.0, 1.0),
+                glass,
+                glass_low: glass,
+                face: [BLACK, accent],
+                ..DARK_INK
             };
         }
         Ink {
             fg: c(t.foreground, 1.0),
             accent,
-            glass: Color4f::new(1.0, 1.0, 1.0, 0.66),
-            scrim: Color4f::new(1.0, 1.0, 1.0, 0.45),
+            face: [WHITE, accent],
+            ..PALE_INK
         }
     }
 }
@@ -193,6 +286,18 @@ thread_local! {
     /// Per-frame `trust::Settings::reduce_motion`. Same thread-local as [`INK`].
     /// Set by [`crate::shell::Shell::render`].
     static REDUCE_MOTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static REDUCED_UI: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Publish the reduced interface for this frame, as with [`set_ink`].
+pub fn set_reduced_ui(on: bool) {
+    REDUCED_UI.with(|r| r.set(on));
+}
+
+/// The reduced interface is on this frame: a TV-class GPU. Passes that read back what is
+/// already drawn (a backdrop blur) break a tiled GPU's render pass and are skipped.
+pub fn reduced_ui() -> bool {
+    REDUCED_UI.with(std::cell::Cell::get)
 }
 
 pub fn set_ink(ink: Ink) {
@@ -230,14 +335,18 @@ pub fn shade(alpha: f32) -> Color4f {
     Color4f::new(s.r, s.g, s.b, alpha * s.a)
 }
 
-/// Opaque coverless-card face, `tint` of the way from the field's ground toward accent.
-/// Coverflow sides overlap, so glass would show the neighbour. Face and [`fg`] move
-/// opposite ways with the palette; a fixed near-black face under pale `fg` fails contrast.
+/// Opaque coverless-card face, `tint` of the way along the ink's face ramp. Coverflow
+/// sides overlap, so glass would show the neighbour. Face and [`fg`] move opposite ways
+/// with the palette; a fixed near-black face under pale `fg` fails contrast.
 pub fn card_face(tint: f32) -> Color4f {
-    let a = ink().accent;
-    let base = if ink().scrim.r > 0.5 { 1.0 } else { 0.0 };
-    let mix = |c: f32| c * tint + base * (1.0 - tint);
-    Color4f::new(mix(a.r), mix(a.g), mix(a.b), 1.0)
+    let [a, b] = ink().face;
+    let mix = |x: f32, y: f32| x + (y - x) * tint;
+    Color4f::new(mix(a.r, b.r), mix(a.g, b.g), mix(a.b, b.b), 1.0)
+}
+
+/// A drop shadow's alpha: `alpha` is dark-field strength, softened on brighter fields.
+pub fn shadow(alpha: f32) -> f32 {
+    alpha * ink().shadow
 }
 
 /// Black or white on the accent, by luminance not `light`: an accent is picked
@@ -263,7 +372,9 @@ pub enum PanelStroke {
     Brand(f32),
 }
 
-/// Glass panel. `corner` and the dash pattern are design units; the caller's `k` scales them.
+/// Glass panel with its gloss: glass deepest at the top and clearing toward its foot, and a
+/// sheen from the top left, gone by the middle. `corner` and the dash pattern are design
+/// units; the caller's `k` scales them.
 pub fn panel(
     canvas: &Canvas,
     rect: Rect,
@@ -273,10 +384,43 @@ pub fn panel(
     k: f32,
 ) {
     let rr = RRect::new_rect_xy(rect, corner * k, corner * k);
-    canvas.draw_rrect(rr, &fill(ink().glass));
+    let mut glass = shaded();
+    glass.set_shader(gradient::shaders::linear_gradient(
+        (
+            Point::new(rect.left, rect.top),
+            Point::new(rect.left, rect.bottom),
+        ),
+        &gradient::Gradient::new(
+            gradient::Colors::new_evenly_spaced(
+                &[ink().glass, ink().glass_low],
+                TileMode::Clamp,
+                None,
+            ),
+            gradient::Interpolation::default(),
+        ),
+        None,
+    ));
+    canvas.draw_rrect(rr, &glass);
     if let Some(tint) = tint {
         canvas.draw_rrect(rr, &fill(tint));
     }
+    let mut sheen = shaded();
+    let colors = [
+        Color4f::new(1.0, 1.0, 1.0, SHEEN),
+        Color4f::new(1.0, 1.0, 1.0, 0.0),
+    ];
+    sheen.set_shader(gradient::shaders::linear_gradient(
+        (
+            Point::new(rect.left, rect.top),
+            Point::new(rect.center_x(), rect.center_y()),
+        ),
+        &gradient::Gradient::new(
+            gradient::Colors::new_evenly_spaced(&colors, TileMode::Clamp, None),
+            gradient::Interpolation::default(),
+        ),
+        None,
+    ));
+    canvas.draw_rrect(rr, &sheen);
     // Opaque: Plain/Brand overwrite colour; a shader's output is scaled by this paint's alpha.
     let mut sp = shaded_stroke(1.0);
     match stroke {
@@ -377,6 +521,13 @@ pub fn panel_highlight(canvas: &Canvas, rect: Rect, corner: f32, k: f32) {
     canvas.draw_rrect(RRect::new_rect_xy(inset, r, r), &p);
 }
 
+/// The accent hairline round a focused card, with no glass: a poster under it keeps its
+/// brightness. `corner` is design units.
+pub fn focus_ring(canvas: &Canvas, rect: Rect, corner: f32, k: f32) {
+    let rr = RRect::new_rect_xy(rect, corner * k, corner * k);
+    canvas.draw_rrect(rr, &stroke(accent(0.9), 1.0));
+}
+
 /// [`focus_halo`] growth past the card, design units. Applied to both rect and corner radius.
 const HALO_OUTSET: f32 = 4.0;
 
@@ -412,24 +563,31 @@ pub fn focus_halo(canvas: &Canvas, rect: Rect, corner: f32, k: f32, f: f32) {
     // Radius grows by the same `d` as the rect or the arcs do not share a centre
     // and the halo reads squarer than the card at the corners.
     let r = (corner + HALO_OUTSET) * k;
+    // The blur's nine-patch can seam across the card's middle; glass would show it.
+    canvas.save();
+    let card = RRect::new_rect_xy(rect, corner * k, corner * k);
+    canvas.clip_rrect(card, skia_safe::ClipOp::Difference, true);
     canvas.draw_rrect(RRect::new_rect_xy(spread, r, r), &p);
+    canvas.restore();
 }
 
+/// The gloss's peak white, at a panel's top-left corner.
+const SHEEN: f32 = 0.07;
+
+/// A soft shadow falling below `rect`, drawn only outside it: glass shows what lies under.
 pub fn drop_shadow(canvas: &Canvas, rect: Rect, corner: f32, k: f32, alpha: f32) {
-    // Scale 0.40 at the pale pole so the caller's alpha stays dark-field strength.
-    let alpha = if ink().scrim.r > 0.5 {
-        alpha * 0.40
-    } else {
-        alpha
-    };
-    let mut p = fill(Color4f::new(0.0, 0.0, 0.0, alpha));
+    let mut p = fill(Color4f::new(0.0, 0.0, 0.0, shadow(alpha)));
     p.set_mask_filter(MaskFilter::blur(
         skia_safe::BlurStyle::Normal,
         10.0 * k,
         None,
     ));
     let shifted = rect.with_offset((0.0, 10.0 * k));
+    canvas.save();
+    let card = RRect::new_rect_xy(rect, corner * k, corner * k);
+    canvas.clip_rrect(card, skia_safe::ClipOp::Difference, true);
     canvas.draw_rrect(RRect::new_rect_xy(shifted, corner * k, corner * k), &p);
+    canvas.restore();
 }
 
 /// Loading spinner. `t` is the shell clock.
@@ -451,10 +609,27 @@ pub fn spinner(canvas: &Canvas, cx: f64, cy: f64, r: f64, t: f64) {
     );
 }
 
-/// Chrome inset from the screen edge, design units. 24 matches Apple `.horizontal, 24`
-/// and Android `ConsoleEdgeInset`. Not the legend's 18 (a pill edge). Screen inset,
-/// not content margin: rows and coverflow are centred columns.
-pub const EDGE_INSET: f64 = 24.0;
+/// Content inset from the screen edge, design units: a ten-foot column, read from a sofa.
+pub const EDGE_INSET: f64 = 40.0;
+/// Least air between the safe area and content, design units. A notch or a rounded
+/// corner is not a margin.
+const EDGE_AIR: f64 = 20.0;
+
+thread_local! {
+    /// The safe area's left inset this frame, px. Set by [`crate::shell::Shell::render`].
+    static SIDE_INSET: Cell<f64> = const { Cell::new(0.0) };
+}
+
+pub fn set_side_inset(px: f64) {
+    SIDE_INSET.with(|s| s.set(px));
+}
+
+/// The margin every screen shares, px from the layout's edge: [`EDGE_INSET`] from the
+/// screen's edge, of which a safe-area inset gives its share, and never under
+/// [`EDGE_AIR`] past the safe area.
+pub fn edge(k: f64) -> f64 {
+    (EDGE_INSET * k - SIDE_INSET.with(Cell::get)).max(EDGE_AIR * k)
+}
 
 /// Geist weights, matching the Apple client's `.geist(size, weight)`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -744,7 +919,8 @@ impl Fonts {
     }
 
     /// Left-aligned twin of [`centered`](Self::centered). Same paragraph path (CJK
-    /// fallback); chrome cannot use `draw`/`draw_clipped` instead.
+    /// fallback); chrome cannot use `draw`/`draw_clipped` instead. Returns the laid-out
+    /// height, so what follows can sit under the wrap.
     #[allow(clippy::too_many_arguments)]
     pub fn leading(
         &self,
@@ -756,9 +932,9 @@ impl Fonts {
         x: f64,
         y: f64,
         max_w: f64,
-    ) {
+    ) -> f64 {
         let at = Point::new(x as f32, y as f32);
-        self.draw_paragraph(Some(canvas), text, Para::Leading, w, size, color, max_w, at);
+        self.draw_paragraph(Some(canvas), text, Para::Leading, w, size, color, max_w, at)
     }
 
     /// Left-aligned title at `(x, y)` top edge, at most three lines then an ellipsis.
@@ -851,9 +1027,80 @@ pub fn match_first_family(mgr: &FontMgr, families: &[&str], style: FontStyle) ->
         .find_map(|f| mgr.match_family_style(f, style))
 }
 
+/// `src` composited over an opaque `dst`, for tests that read contrast off stacked paints.
+#[cfg(test)]
+pub(crate) fn over(src: Color4f, dst: Color4f) -> Color4f {
+    let m = |s: f32, d: f32| s * src.a + d * (1.0 - src.a);
+    Color4f::new(m(src.r, dst.r), m(src.g, dst.g), m(src.b, dst.b), 1.0)
+}
+
+/// WCAG contrast of two opaque colours ([`pf_client_core::rgb::contrast`]).
+#[cfg(test)]
+pub(crate) fn contrast(a: Color4f, b: Color4f) -> f64 {
+    use pf_client_core::rgb::Rgb;
+    let rgb = |c: Color4f| Rgb(f64::from(c.r), f64::from(c.g), f64::from(c.b));
+    pf_client_core::rgb::contrast(rgb(a), rgb(b))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `cargo test -p pf-console-ui --lib dump_theme_lab -- --ignored` refreshes
+    /// `tools/theme-lab/lab-data.json`: the palette table, the inks [`Ink::of`] picks from, and
+    /// the field shader around its gradient, which the lab rebuilds from edited stops.
+    #[test]
+    #[ignore]
+    fn dump_theme_lab() {
+        use crate::palette::{field_sksl, CELL_RAMP, MESH_COLORS, PALETTES, VIOLET_FIELD};
+        use serde_json::json;
+        let rgb = |c: (f64, f64, f64)| json!([c.0, c.1, c.2]);
+        let c4 = |c: Color4f| json!([c.r, c.g, c.b, c.a]);
+        let ink = |i: &Ink| {
+            json!({
+                "fg": c4(i.fg), "accent": c4(i.accent), "glass": c4(i.glass),
+                "glass_low": c4(i.glass_low), "face": [c4(i.face[0]), c4(i.face[1])],
+                "shadow": i.shadow, "scrim": c4(i.scrim),
+            })
+        };
+        let palettes: Vec<_> = (PALETTES.iter())
+            .map(|p| {
+                json!({
+                    "id": p.id, "name": p.name, "light": p.light,
+                    "stops": p.stops.map(|s| s.iter().map(|c| rgb(*c)).collect::<Vec<_>>()),
+                    "ground": rgb(p.ground), "accent": rgb(p.accent),
+                })
+            })
+            .collect();
+        let p = &PALETTES[1];
+        let stops = p.stops.expect("the second palette has its own ramp");
+        let sksl = field_sksl(p.ground, stops);
+        let (head, rest) = (sksl.split_once("    float x = clamp(t, 0.0, 1.0) * "))
+            .expect("the gradient's first line");
+        let tail = &rest[rest
+            .find("    f = f * f * (3.0")
+            .expect("the gradient's blend")..];
+        let data = json!({
+            "palettes": palettes,
+            "violet_field": VIOLET_FIELD.iter().map(|c| rgb(*c)).collect::<Vec<_>>(),
+            "vivid_ground": VIVID_GROUND,
+            // The palette gate's inputs (`palette.rs` tests): it samples this mesh, not the field.
+            "cell_ramp": CELL_RAMP,
+            "mesh_colors": MESH_COLORS.iter().map(|c| rgb(*c)).collect::<Vec<_>>(),
+            "inks": { "dark": ink(&DARK_INK), "vivid": ink(&VIVID_INK), "pale": ink(&PALE_INK) },
+            "sksl": { "head": head, "tail": tail },
+            "check": {
+                "ground": rgb(p.ground),
+                "stops": stops.iter().map(|c| rgb(*c)).collect::<Vec<_>>(),
+                "sksl": sksl,
+            },
+        });
+        let out = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tools/theme-lab/lab-data.json"
+        );
+        std::fs::write(out, serde_json::to_string_pretty(&data).unwrap() + "\n").unwrap();
+    }
 
     /// A bad embedded face takes out every console screen at init.
     #[test]
@@ -918,11 +1165,11 @@ mod tests {
         let lum = |v: [f32; 4]| 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
         let card = [0.55f32, 0.55, 0.6, 1.0];
 
-        set_ink(Ink::of(crate::library::palette("violet")));
+        set_ink(Ink::of(crate::palette::palette("violet")));
         assert!(ink().scrim.r < 0.5, "violet is a dark field");
         let dark_side = apply(&recede_matrix(1.0), card);
 
-        set_ink(Ink::of(crate::library::palette("mint")));
+        set_ink(Ink::of(crate::palette::palette("sky")));
         assert!(ink().scrim.r > 0.5, "mint is a pale field");
         let pale_side = apply(&recede_matrix(1.0), card);
 
@@ -947,7 +1194,7 @@ mod tests {
     #[test]
     fn a_dark_card_face_survives_a_full_recede() {
         // Coverless card at the quieter placeholder tint: the darkest face the shelf has.
-        for p in crate::library::PALETTES.iter().filter(|p| !p.light) {
+        for p in crate::palette::PALETTES.iter().filter(|p| !p.light) {
             set_ink(Ink::of(p));
             let f = card_face(0.20);
             let out = apply(&recede_matrix(1.0), [f.r, f.g, f.b, 1.0]);

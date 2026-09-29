@@ -218,7 +218,7 @@ impl IddPushCapturer {
         // declares a hardware cursor, so this session has no pointer to forward
         // and none to blend.
         let cursor_shared = cursor_sender.as_ref().and_then(|send_cursor| {
-            match cursor::CursorShared::create(ccd) {
+            match cursor::CursorShared::create() {
                 Ok(cs) => {
                     // Shared helper: also re-delivers after a driver monitor re-arrival.
                     deliver_cursor_channel(&broker, target.target_id, &cs, send_cursor)

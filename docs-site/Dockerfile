@@ -4,7 +4,7 @@
 #   docker build -t punktfunk-docs docs-site
 #
 # Runtime: PORT (default 3000).
-FROM oven/bun:1 AS build
+FROM oven/bun:1.4.2 AS build
 WORKDIR /app
 
 COPY package.json bun.lock ./
@@ -14,7 +14,7 @@ COPY . .
 # fumadocs-mdx's vite plugin emits the .source typegen + content collections during build.
 RUN bun run build
 
-FROM oven/bun:1-slim
+FROM oven/bun:1.4.2-slim
 WORKDIR /app
 COPY --from=build /app/.output ./.output
 USER bun

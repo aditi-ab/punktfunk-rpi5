@@ -14,7 +14,8 @@
 //! for a stream). Init/import failure disables the importer; CPU mmap takes over.
 
 use super::cuda::{self, DeviceBuffer};
-use anyhow::{anyhow, bail, Context as _, Result};
+use super::vkdev;
+use anyhow::{anyhow, Context as _, Result};
 use ash::vk;
 use std::collections::HashMap;
 
@@ -48,7 +49,8 @@ fn nv12_layout(width: u32, height: u32) -> Option<Nv12Layout> {
     }
     let pitch = u64::from(width).checked_add(3)? & !3;
     let uv_offset = pitch.checked_mul(u64::from(height))?;
-    let uv_size = pitch.checked_mul(u64::from(height.div_ceil(2)))?;
+    let [_, (_, uv_rows), _] = cuda::PlaneLayout::Nv12.planes(width, height);
+    let uv_size = pitch.checked_mul(uv_rows as u64)?;
     Some(Nv12Layout {
         uv_offset,
         size: uv_offset.checked_add(uv_size)?,
@@ -104,174 +106,42 @@ unsafe impl Send for VkBridge {}
 
 impl VkBridge {
     pub fn new() -> Result<VkBridge> {
-        // SAFETY: ash cannot check Vulkan CreateInfo/handle validity. Every `*CreateInfo` is a
-        // local that outlives the synchronous `create_*`/`enumerate_*` that reads it; the priority
-        // ladder rebuilds `prio`/`gp_info`/`qci`/`exts` per attempt. Handles are created and
-        // `?`-checked in this function. Constructor shares nothing across threads.
+        // CSC shares SM with the game: request elevated global priority so it schedules first.
+        // `PUNKTFUNK_VK_QUEUE_PRIORITY` = off | high | realtime (default realtime); a refused
+        // class steps down to the next, so it never fails the bridge.
+        let priorities: &[vk::QueueGlobalPriorityKHR] =
+            match std::env::var("PUNKTFUNK_VK_QUEUE_PRIORITY").as_deref() {
+                Ok("off" | "0") => &[],
+                Ok("high") => &[vk::QueueGlobalPriorityKHR::HIGH],
+                _ => &[
+                    vk::QueueGlobalPriorityKHR::REALTIME,
+                    vk::QueueGlobalPriorityKHR::HIGH,
+                ],
+            };
+        let nv = vkdev::NvComputeDevice::open(
+            vkdev::DeviceWants {
+                dma_buf: true,
+                modifiers: true,
+            },
+            priorities,
+        )?;
+        if let Some(p) = nv.priority {
+            tracing::info!(
+                priority = ?p,
+                "VkBridge queue at elevated global priority (CSC schedules ahead of a GPU-bound \
+                 game where the driver honors it)"
+            );
+        }
+        let (instance, device, qf) = (nv.instance, nv.device, nv.queue_family);
+        // SAFETY: `instance` and `device` are the live handles just opened; ash cannot check
+        // create infos, so every one below is a local that outlives its synchronous call.
         unsafe {
-            let entry = ash::Entry::load().context("load libvulkan")?;
-            let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
-            let instance = entry
-                .create_instance(
-                    &vk::InstanceCreateInfo::default().application_info(&app),
-                    None,
-                )
-                .context("vkCreateInstance")?;
-
-            // 0x10DE = NVIDIA, matching CUDA device 0. Destroy the instance on failure: `Drop`
-            // is not wired yet, and a refused bridge retries every frame.
-            let phys = match instance
-                .enumerate_physical_devices()
-                .context("enumerate GPUs")
-                .map(|devs| {
-                    devs.into_iter()
-                        .find(|&p| instance.get_physical_device_properties(p).vendor_id == 0x10DE)
-                }) {
-                Ok(Some(p)) => p,
-                Ok(None) => {
-                    instance.destroy_instance(None);
-                    return Err(anyhow!("no NVIDIA Vulkan device"));
-                }
-                Err(e) => {
-                    instance.destroy_instance(None);
-                    return Err(e);
-                }
-            };
-            let mem_props = instance.get_physical_device_memory_properties(phys);
-
-            // Compute implies transfer. Copy only needs transfer; the NV12 CSC dispatch needs
-            // compute.
-            let qf = match instance
-                .get_physical_device_queue_family_properties(phys)
-                .iter()
-                .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
-            {
-                Some(i) => i as u32,
-                None => {
-                    instance.destroy_instance(None);
-                    return Err(anyhow!("no compute-capable queue family"));
-                }
-            };
-
-            // CSC shares SM with the game: request elevated global priority so it schedules
-            // first. `PUNKTFUNK_VK_QUEUE_PRIORITY` = off | high | realtime (default realtime).
-            // The create loop walks REALTIME→HIGH→none on NOT_PERMITTED / INITIALIZATION_FAILED
-            // so a refused class never fails the bridge.
-            let gp_ext = std::env::var("PUNKTFUNK_VK_QUEUE_PRIORITY")
-                .ok()
-                .as_deref()
-                .map_or(Some(vk::QueueGlobalPriorityKHR::REALTIME), |v| match v {
-                    "off" | "0" => None,
-                    "high" => Some(vk::QueueGlobalPriorityKHR::HIGH),
-                    _ => Some(vk::QueueGlobalPriorityKHR::REALTIME),
-                })
-                .and_then(|want| {
-                    // KHR is the promoted name; fall back to EXT.
-                    let props = instance.enumerate_device_extension_properties(phys).ok()?;
-                    let has = |name: &std::ffi::CStr| {
-                        props
-                            .iter()
-                            .any(|p| p.extension_name_as_c_str() == Ok(name))
-                    };
-                    if has(vk::KHR_GLOBAL_PRIORITY_NAME) {
-                        Some((vk::KHR_GLOBAL_PRIORITY_NAME, want))
-                    } else if has(vk::EXT_GLOBAL_PRIORITY_NAME) {
-                        Some((vk::EXT_GLOBAL_PRIORITY_NAME, want))
-                    } else {
-                        None
-                    }
-                });
-            let base_exts = [
-                ash::khr::external_memory_fd::NAME.as_ptr(),
-                ash::ext::external_memory_dma_buf::NAME.as_ptr(),
-            ];
-            let dev_exts = instance
-                .enumerate_device_extension_properties(phys)
-                .unwrap_or_default();
-            let has = |name: &std::ffi::CStr| {
-                dev_exts
-                    .iter()
-                    .any(|p| p.extension_name_as_c_str() == Ok(name))
-            };
-            let modifier_import = has(ash::ext::image_drm_format_modifier::NAME)
-                && has(ash::khr::image_format_list::NAME);
-            let timeline_export = has(ash::khr::timeline_semaphore::NAME)
-                && has(ash::khr::external_semaphore_fd::NAME)
-                && {
-                    let mut tl = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
-                    let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut tl);
-                    instance.get_physical_device_features2(phys, &mut f2);
-                    tl.timeline_semaphore == vk::TRUE
-                };
-            let mut try_priority = gp_ext.map(|(_, want)| want);
-            let device = loop {
-                let prio = [1.0f32];
-                let mut gp_info = vk::DeviceQueueGlobalPriorityCreateInfoKHR::default()
-                    .global_priority(try_priority.unwrap_or(vk::QueueGlobalPriorityKHR::MEDIUM));
-                let mut qci0 = vk::DeviceQueueCreateInfo::default()
-                    .queue_family_index(qf)
-                    .queue_priorities(&prio);
-                let mut exts: Vec<*const std::ffi::c_char> = base_exts.to_vec();
-                if modifier_import {
-                    exts.push(ash::ext::image_drm_format_modifier::NAME.as_ptr());
-                    exts.push(ash::khr::image_format_list::NAME.as_ptr());
-                }
-                if timeline_export {
-                    exts.push(ash::khr::timeline_semaphore::NAME.as_ptr());
-                    exts.push(ash::khr::external_semaphore_fd::NAME.as_ptr());
-                }
-                let mut tl_enable =
-                    vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
-                if try_priority.is_some() {
-                    qci0 = qci0.push_next(&mut gp_info);
-                    exts.push(gp_ext.expect("try_priority implies gp_ext").0.as_ptr());
-                }
-                let qci = [qci0];
-                let mut dci = vk::DeviceCreateInfo::default()
-                    .queue_create_infos(&qci)
-                    .enabled_extension_names(&exts);
-                if timeline_export {
-                    dci = dci.push_next(&mut tl_enable);
-                }
-                match instance.create_device(phys, &dci, None) {
-                    Ok(d) => {
-                        if let Some(p) = try_priority {
-                            tracing::info!(
-                                priority = ?p,
-                                "VkBridge queue at elevated global priority (CSC schedules \
-                                 ahead of a GPU-bound game where the driver honors it)"
-                            );
-                        }
-                        break d;
-                    }
-                    Err(
-                        vk::Result::ERROR_NOT_PERMITTED_KHR
-                        | vk::Result::ERROR_INITIALIZATION_FAILED,
-                    ) if try_priority == Some(vk::QueueGlobalPriorityKHR::REALTIME) => {
-                        try_priority = Some(vk::QueueGlobalPriorityKHR::HIGH);
-                    }
-                    Err(
-                        vk::Result::ERROR_NOT_PERMITTED_KHR
-                        | vk::Result::ERROR_INITIALIZATION_FAILED,
-                    ) if try_priority.is_some() => {
-                        tracing::debug!(
-                            "global-priority queue not permitted — VkBridge at default priority"
-                        );
-                        try_priority = None;
-                    }
-                    Err(e) => {
-                        instance.destroy_instance(None);
-                        return Err(e)
-                            .context("vkCreateDevice (external-memory extensions supported?)");
-                    }
-                }
-            };
             // `Drop` is now live and no-ops on VK_NULL_HANDLE. Fill remaining objects in
             // place so a later `?` unwinds instead of leaking instance + device.
             let ext_fd = ash::khr::external_memory_fd::Device::new(&instance, &device);
             let queue = device.get_device_queue(qf, 0);
             let mut me = VkBridge {
-                _entry: entry,
+                _entry: nv.entry,
                 instance,
                 device,
                 ext_fd,
@@ -279,13 +149,13 @@ impl VkBridge {
                 cmd_pool: vk::CommandPool::null(),
                 cmd: vk::CommandBuffer::null(),
                 fence: vk::Fence::null(),
-                mem_props,
+                mem_props: nv.mem_props,
                 src_cache: HashMap::new(),
                 dst: None,
                 csc: None,
                 qf,
-                modifier_import,
-                timeline_export,
+                modifier_import: nv.modifier_import,
+                timeline_export: nv.timeline_export,
                 conv: None,
             };
             me.cmd_pool = me
@@ -317,30 +187,23 @@ impl VkBridge {
     }
 
     fn memory_type(&self, type_bits: u32, flags: vk::MemoryPropertyFlags) -> Result<u32> {
-        (0..self.mem_props.memory_type_count)
-            .find(|&i| {
-                type_bits & (1 << i) != 0
-                    && self.mem_props.memory_types[i as usize]
-                        .property_flags
-                        .contains(flags)
-            })
-            .ok_or_else(|| anyhow!("no compatible Vulkan memory type"))
+        vkdev::memory_type(&self.mem_props, type_bits, flags)
     }
 
     /// Import `fd` (dup'd internally; Vulkan owns the dup) as a transfer-src buffer of `size`.
+    /// The caller keeps `fd` open for the call.
     unsafe fn import_src(&mut self, fd: i32, size: u64) -> Result<()> {
-        // SAFETY: caller contract: this thread owns the handles. Every builder info is a local
-        // that outlives the call that reads it. Each fallible step destroys what it created.
+        // SAFETY: caller contract: this thread owns the handles and `fd` is open. Every builder
+        // info is a local that outlives the call that reads it. Each fallible step destroys what
+        // it created.
         unsafe {
-            use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
-            let dup = libc::dup(fd);
-            if dup < 0 {
-                bail!("dup(dmabuf fd)");
-            }
+            use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd};
             // Own the dup until `allocate_memory` succeeds (Vulkan then consumes it). `SrcBuf`
             // has no Drop and is filled only on success, so each fallible step must destroy the
             // buffer it created: a failed import retries every frame.
-            let dup = OwnedFd::from_raw_fd(dup);
+            let dup = BorrowedFd::borrow_raw(fd)
+                .try_clone_to_owned()
+                .context("dup(dmabuf fd)")?;
             let mut ext_info = vk::ExternalMemoryBufferCreateInfo::default()
                 .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
             let buffer = self
@@ -377,11 +240,9 @@ impl VkBridge {
                     return Err(e);
                 }
             };
-            // Successful import consumes the fd. On failure close it and destroy the buffer.
-            let raw = dup.into_raw_fd();
             let mut import = vk::ImportMemoryFdInfoKHR::default()
                 .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-                .fd(raw);
+                .fd(dup.as_raw_fd());
             let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(buffer);
             let memory = match self.device.allocate_memory(
                 &vk::MemoryAllocateInfo::default()
@@ -391,9 +252,12 @@ impl VkBridge {
                     .push_next(&mut dedicated),
                 None,
             ) {
-                Ok(m) => m,
+                Ok(m) => {
+                    let _ = dup.into_raw_fd(); // Vulkan owns the dup now
+                    m
+                }
                 Err(e) => {
-                    libc::close(raw); // failed import does not consume the fd
+                    // A failed import does not consume the fd: `dup` drops and closes it.
                     self.device.destroy_buffer(buffer, None);
                     return Err(anyhow!("import dmabuf memory: {e}"));
                 }
@@ -419,7 +283,8 @@ impl VkBridge {
     /// Recreate the exportable destination if it is smaller than `size`, plus its CUDA mapping.
     unsafe fn ensure_dst(&mut self, size: u64) -> Result<()> {
         // SAFETY: caller contract: this thread owns the handles. Builder infos are locals that
-        // outlive the call. Created handles are destroyed on error or owned by `DstBuf`.
+        // outlive the call. Created handles are destroyed on error or owned by `DstBuf`; the
+        // exported fd is fresh, so `OwnedFd` is its only owner.
         unsafe {
             if self.dst.as_ref().is_some_and(|d| d.size >= size) {
                 return Ok(());
@@ -479,15 +344,16 @@ impl VkBridge {
                     .memory(memory)
                     .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD),
             ) {
-                Ok(f) => f,
+                // A fresh descriptor this call alone owns.
+                Ok(f) => <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(f),
                 Err(e) => {
                     self.device.free_memory(memory, None);
                     self.device.destroy_buffer(buffer, None);
                     return Err(e).context("vkGetMemoryFdKHR");
                 }
             };
-            // CUDA owns the fd on success. Size must match the allocation. `import_owned_fd`
-            // closes `opaque_fd` on failure, so only Vulkan objects unwind here.
+            // CUDA owns the fd on success. Size must match the allocation. A failed import drops
+            // `opaque_fd`, so only Vulkan objects unwind here.
             let cuda = match cuda::ExternalDmabuf::import_owned_fd(opaque_fd, reqs.size) {
                 Ok(c) => c,
                 Err(e) => {
@@ -636,7 +502,7 @@ impl VkBridge {
     /// Convert one LINEAR RGB dmabuf into a pooled NV12 CUDA buffer through the Vulkan CSC.
     /// Source and destination spans are validated before any import, allocation, or dispatch.
     /// The checked layout must fit Vulkan's byte sizes, the shader's u32 word offsets, and CUDA's
-    /// host `usize`; `pool` must come from [`cuda::BufferPool::new_nv12`].
+    /// host `usize`; `pool` must come from an NV12 [`cuda::BufferPool`].
     pub fn import_linear_nv12(
         &mut self,
         fd: i32,
@@ -650,11 +516,17 @@ impl VkBridge {
             offset % 4 == 0 && stride % 4 == 0,
             "LINEAR dmabuf offset/stride not word-aligned ({offset}/{stride})"
         );
+        // The shader reads `width` texels per row; a shorter stride runs the last row off the span.
+        anyhow::ensure!(
+            u64::from(stride) >= u64::from(width) * 4,
+            "LINEAR dmabuf stride {stride} shorter than a {width}-pixel row"
+        );
         let layout = nv12_layout(width, height)
             .context("NV12 destination layout exceeds addressable buffer or shader offsets")?;
         // SAFETY: `fd` is the caller's live dmabuf (`import_src` dups it). This frame's source
         // span is checked below. `nv12_layout` proved dest sizes and shader offsets;
-        // `ensure_dst(layout.size)` covers the write range. Descriptor binds live src/dst
+        // `ensure_dst(layout.size)` covers the shader writes and the CUDA de-stride reads
+        // (`copy_pitched_nv12_to_buffer`). Descriptor binds live src/dst
         // WHOLE_SIZE; `*Info` arrays are locals; `cmd`/`queue`/`fence` are this thread's.
         // Dispatch is ⌈w/32⌉×⌈h/16⌉ groups of 8×8, writing whole words inside that range.
         // `wait_for_fences` retires the compute pass (shader-write barrier recorded) before

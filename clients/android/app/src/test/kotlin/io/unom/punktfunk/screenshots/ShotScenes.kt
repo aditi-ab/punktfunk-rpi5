@@ -1,7 +1,6 @@
 package io.unom.punktfunk.screenshots
 
 import android.content.Context
-import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.BlendMode
@@ -61,31 +60,17 @@ import androidx.compose.ui.unit.dp
 import io.unom.punktfunk.BrandDark
 import io.unom.punktfunk.ConnectModal
 import io.unom.punktfunk.ConnectPhase
-import androidx.compose.runtime.CompositionLocalProvider
-import io.unom.punktfunk.GamepadInk
 import io.unom.punktfunk.OsdScaled
-import io.unom.punktfunk.GamepadPalette
 import coil.ImageLoader
 import coil.test.FakeImageLoaderEngine
-import dev.chrisbanes.haze.HazeState
-import dev.chrisbanes.haze.hazeSource
 import io.unom.punktfunk.AddHostSheet
-import io.unom.punktfunk.ConsoleHeader
-import io.unom.punktfunk.ConsoleLegendInset
-import io.unom.punktfunk.ConsoleLicensesScreen
 import io.unom.punktfunk.ControllersScreen
 import io.unom.punktfunk.TouchGrid
-import io.unom.punktfunk.GamepadHintBar
-import io.unom.punktfunk.PadGlyph
 import io.unom.punktfunk.PadInfo
-import io.unom.punktfunk.consoleLegendInsets
-import io.unom.punktfunk.consoleSafeArea
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.library.Artwork
 import io.unom.punktfunk.kit.library.GameEntry
 import androidx.compose.ui.platform.LocalConfiguration
-import io.unom.punktfunk.LocalGamepadInk
-import io.unom.punktfunk.LocalGamepadPalette
 import io.unom.punktfunk.Settings
 import io.unom.punktfunk.TouchMode
 import io.unom.punktfunk.SettingsCategory
@@ -568,34 +553,25 @@ internal fun StreamBannerScene(pad: Boolean) {
 }
 
 /**
- * Publish the palette locals `App` would normally provide. A scene that calls a console screen
- * directly gets the DEFAULT dark ink without this, and a pale-palette shot would then silently
- * prove nothing at all.
+ * The companion panel on a dual-screen handheld's lower screen: the real [CompanionPanel] on
+ * [page], with the stream scene's Normal lines and a session where every action is available.
  */
 @Composable
-private fun ConsolePalette(paletteId: String, content: @Composable () -> Unit) {
-    val palette = GamepadPalette.named(paletteId)
-    CompositionLocalProvider(
-        LocalGamepadPalette provides palette,
-        LocalGamepadInk provides GamepadInk.of(palette),
-    ) {
-        content()
-    }
+internal fun CompanionScene(page: io.unom.punktfunk.CompanionPage) {
+    io.unom.punktfunk.CompanionPanel(
+        pages = io.unom.punktfunk.CompanionPage.entries,
+        page = page,
+        onPage = {},
+        stats = shotLines(StatsVerbosity.NORMAL, 1920, 1080, 120, 119.0, 92.1, loss = false),
+        tier = StatsVerbosity.NORMAL,
+        onTier = {},
+        cfg = io.unom.punktfunk.OverlayConfig.platformDefault(),
+        actions = io.unom.punktfunk.fakeRingActions(),
+        haptics = remember { io.unom.punktfunk.ConsoleHaptics(null) },
+        trackpad = {},
+        pad = {},
+    )
 }
-
-/**
- * The one Compose screen the console still opens over itself — the open-source notices — in its
- * console presentation. (Connected controllers used to be its sibling here; it is the console's
- * own Skia screen now, covered by pf-console-ui's tests.)
- *
- * Worth a shot, and worth a PALE one: it is an ordinary Material screen underneath, and the
- * console shows it through a `ColorScheme` derived from the palette's ink. That derivation is the
- * whole risk. Its touch presentation is inked by the app theme, which is always dark, so nothing
- * before this could catch light-grey body text stranded on a pastel field.
- */
-@Composable
-internal fun ConsoleLicensesScene(paletteId: String = "violet") =
-    ConsolePalette(paletteId) { ConsoleLicensesScreen(onBack = {}, navActive = false) }
 
 /**
  * The controllers screen with [shotPads] injected — Robolectric enumerates no input devices, and

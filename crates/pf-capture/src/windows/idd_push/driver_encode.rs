@@ -223,6 +223,7 @@ impl AuSection {
 }
 
 /// Open the driver's encoder for `endpoint` and hand back the stream loop's [`Encoder`].
+/// Every open re-raises the WUDFHost's GPU scheduling class, which a driver reload resets.
 /// Structured failure: [`DriverEncodeOpenError`] when the driver walked the list and none
 /// opened, else the delivery error. There is no fallback.
 pub fn open_driver_encoder(
@@ -234,21 +235,13 @@ pub fn open_driver_encoder(
     let heap = au::heap_bytes_for(params.bitrate_kbps, params.fps);
     let section = AuSection::create(heap, params.wire_seq_base)?;
     let broker = ChannelBroker::open(endpoint.wudf_pid)?;
-    // SAFETY: both handles are live members of `section`, borrowed for the duplication.
-    let (section_v, event_v) = unsafe {
-        let s = broker.dup_into(
-            HANDLE(section.section.handle.as_raw_handle()),
-            Some(SECTION_MAP_RW),
-        )?;
-        match broker.dup_into(
-            HANDLE(section.event.as_raw_handle()),
-            Some(EVENT_MODIFY_STATE),
-        ) {
-            Ok(e) => (s, e),
-            Err(e) => {
-                broker.close_remote(s);
-                return Err(e);
-            }
+    broker.raise_gpu_priority();
+    let section_v = broker.dup_into(section.section.handle.as_handle(), Some(SECTION_MAP_RW))?;
+    let event_v = match broker.dup_into(section.event.as_handle(), Some(EVENT_MODIFY_STATE)) {
+        Ok(e) => e,
+        Err(e) => {
+            broker.close_remote(section_v);
+            return Err(e);
         }
     };
     let req = SetEncodeRequest {
@@ -392,10 +385,6 @@ pub struct EncoderProxy {
     /// The backend the driver opened, for the status surface.
     backend: &'static str,
 }
-
-// SAFETY: `!Send` only through the mapping's raw pointers. Built on the prep thread, used on
-// the stream thread, one owner at a time; the driver's writes arrive through atomics.
-unsafe impl Send for EncoderProxy {}
 
 impl Drop for EncoderProxy {
     /// Stop the driver's session: without this a lingering display keeps a hardware encoder
@@ -662,6 +651,11 @@ impl Encoder for EncoderProxy {
 
     fn bitrate_retarget_is_synchronous(&self) -> bool {
         false
+    }
+
+    /// The driver has published an access unit past the last ask, so its stamp is the answer.
+    fn retarget_settled(&self) -> bool {
+        self.snapshot().published_total > self.retarget_after
     }
 
     /// What the driver's backend is encoding at.

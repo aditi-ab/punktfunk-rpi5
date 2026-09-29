@@ -198,10 +198,10 @@ mod tests {
         );
         assert_eq!(store.snapshot().1, 0);
         let mut s = store.load();
-        s.ui_palette = "mint".into();
+        s.ui_palette = "sky".into();
         store.save(&s);
         let (after, generation) = store.snapshot();
-        assert_eq!(after.ui_palette, "mint");
+        assert_eq!(after.ui_palette, "sky");
         assert_eq!(generation, 1);
         assert_eq!(
             store.presets(),

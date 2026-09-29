@@ -84,6 +84,8 @@ suspend fun runSpeedTest(
     host: String,
     port: Int,
     pinHex: String,
+    // The burst's live throughput (kbps) at every poll, for a caller that graphs it.
+    onProgress: (Int) -> Unit = {},
     onPhase: (SpeedTestPhase) -> Unit,
 ) {
     onPhase(SpeedTestPhase.Connecting)
@@ -122,7 +124,10 @@ suspend fun runSpeedTest(
                 onPhase(SpeedTestPhase.Failed("The session ended before the measurement finished."))
                 return
             }
-            if (r[0] == 0.0) continue
+            if (r[0] == 0.0) {
+                onProgress(r[1].toInt())
+                continue
+            }
             // Let the last UDP shards land before tearing the session down, or the tail of the
             // burst is counted as loss that never happened.
             delay(SETTLE_MS)

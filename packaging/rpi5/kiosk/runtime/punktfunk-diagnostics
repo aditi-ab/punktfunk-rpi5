@@ -1,0 +1,52 @@
+#!/bin/bash
+set -uo pipefail
+[[ $EUID == 0 ]] || { echo 'Run sudo punktfunk-diagnostics'; exit 1; }
+umask 077
+output=$(mktemp /data/logs/punktfunk-diagnostics.XXXXXX.txt)
+{
+    date --iso-8601=seconds
+    cat /etc/punktfunk-kiosk-release
+    uname -a
+    id punktfunk
+    echo '=== Network ==='
+    ip -brief address
+    echo '=== Service configuration ==='
+    systemctl show punktfunk-kiosk.service -p User -p Group -p SupplementaryGroups -p Environment -p ExecStart
+    echo '=== Device ownership and kiosk read/write access ==='
+    for device in /dev/dri/* /dev/video* /dev/media* /dev/dma_heap/*; do
+        [[ -c "$device" ]] || continue
+        stat -Lc '%n %a %U:%G %t:%T' "$device"
+        if runuser -u punktfunk -- test -r "$device" && runuser -u punktfunk -- test -w "$device"; then
+            echo 'kiosk_access=read-write'
+        else
+            echo 'kiosk_access=DENIED'
+        fi
+    done
+    echo '=== V4L2 devices and media topology ==='
+    v4l2-ctl --list-devices
+    for node in /dev/media*; do
+        [[ -e "$node" ]] && media-ctl -d "$node" -p
+    done
+    echo '=== Bundled FFmpeg ABI and configuration ==='
+    LD_LIBRARY_PATH=/opt/punktfunk-rpi5/lib python3 - <<'PY'
+import ctypes
+from pathlib import Path
+prefix = Path('/opt/punktfunk-rpi5')
+for name in ('build-version', 'fork-commit', 'rpi-ffmpeg-commit'):
+    print(name, (prefix / name).read_text().strip())
+lib = ctypes.CDLL(str(prefix / 'lib/libavcodec.so.62'))
+lib.avcodec_configuration.restype = ctypes.c_char_p
+print(lib.avcodec_configuration().decode())
+lib.avcodec_version.restype = ctypes.c_uint
+print('avcodec_version', lib.avcodec_version())
+PY
+    echo '=== Kernel log ==='
+    journalctl -b -k --no-pager -n 300
+    echo '=== Full client log, including FFmpeg stderr ==='
+    journalctl -b -u punktfunk-kiosk.service --no-pager -o short-precise -n 5000
+    echo '=== Previous boot client log ==='
+    journalctl -b -1 -u punktfunk-kiosk.service --no-pager -n 1000
+    echo '=== Weston ==='
+    tail -100 /data/logs/weston.log
+} >"$output" 2>&1
+echo "$output"

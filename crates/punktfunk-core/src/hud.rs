@@ -9,7 +9,7 @@
 //!   and round trip. No end-to-end figure, because Moonlight has none to compare it with.
 //! - **Advanced**: the capture→glass headline as p50/p95 and every stage that tiles it.
 //!
-//! Platforms draw the returned lines and nothing else. `docs-site/content/docs/stats.md`
+//! Platforms draw the returned lines and nothing else. `docs-site/content/docs/(guide)/(streaming)/stats.md`
 //! explains every number.
 
 use std::collections::VecDeque;
@@ -76,6 +76,66 @@ impl StatsVerbosity {
     }
 }
 
+/// Corner the stats overlay sits in. Stored by Apple's `HUDPlacement` names, which devices
+/// already hold; an empty or unknown name is the client's own corner.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HudCorner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl HudCorner {
+    pub const ALL: [HudCorner; 4] = [
+        HudCorner::TopLeft,
+        HudCorner::TopRight,
+        HudCorner::BottomLeft,
+        HudCorner::BottomRight,
+    ];
+
+    pub fn from_name(s: &str) -> Option<HudCorner> {
+        HudCorner::ALL.into_iter().find(|c| c.as_name() == s)
+    }
+
+    pub fn as_name(self) -> &'static str {
+        match self {
+            HudCorner::TopLeft => "topLeading",
+            HudCorner::TopRight => "topTrailing",
+            HudCorner::BottomLeft => "bottomLeading",
+            HudCorner::BottomRight => "bottomTrailing",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            HudCorner::TopLeft => "Top left",
+            HudCorner::TopRight => "Top right",
+            HudCorner::BottomLeft => "Bottom left",
+            HudCorner::BottomRight => "Bottom right",
+        }
+    }
+
+    pub fn right(self) -> bool {
+        matches!(self, HudCorner::TopRight | HudCorner::BottomRight)
+    }
+
+    pub fn bottom(self) -> bool {
+        matches!(self, HudCorner::BottomLeft | HudCorner::BottomRight)
+    }
+}
+
+/// Stats overlay sizes offered, in percent of the display scale.
+pub const STATS_SCALE_PCTS: [u16; 6] = [75, 100, 125, 150, 175, 200];
+
+/// A stored stats size as a multiplier: clamped to [`STATS_SCALE_PCTS`]' range, `0` = 100 %.
+pub fn stats_scale(pct: u16) -> f32 {
+    if pct == 0 {
+        return 1.0;
+    }
+    f32::from(pct.clamp(STATS_SCALE_PCTS[0], STATS_SCALE_PCTS[5])) / 100.0
+}
+
 /// One stage over a window, µs. `n == 0` means unmeasured, never zero latency.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[cfg_attr(
@@ -93,24 +153,29 @@ pub struct Summary {
     pub p99_us: u32,
 }
 
+/// Percentile `pct` of an ascending, non-empty slice: rank `len * pct / 100`, clamped to the
+/// last sample. The rule every client stat uses.
+pub fn rank<T: Copy>(sorted: &[T], pct: usize) -> T {
+    sorted[(sorted.len() * pct / 100).min(sorted.len() - 1)]
+}
+
 impl Summary {
-    /// Sorts `samples` in place. Rank `len * p / 100`, the rule every client already used.
+    /// Sorts `samples` in place and ranks them with [`rank`].
     pub fn of(samples: &mut [u32]) -> Summary {
         let n = samples.len();
         if n == 0 {
             return Summary::default();
         }
         samples.sort_unstable();
-        let at = |p: usize| samples[(n * p / 100).min(n - 1)];
         let sum: u64 = samples.iter().map(|&s| u64::from(s)).sum();
         Summary {
             n: n.min(u32::MAX as usize) as u32,
             mean_us: (sum / n as u64) as u32,
             min_us: samples[0],
             max_us: samples[n - 1],
-            p50_us: samples[n / 2],
-            p95_us: at(95),
-            p99_us: at(99),
+            p50_us: rank(samples, 50),
+            p95_us: rank(samples, 95),
+            p99_us: rank(samples, 99),
         }
     }
 
@@ -418,6 +483,20 @@ impl StatsSnapshot {
         pct(self.lost, self.received.saturating_add(self.lost))
     }
 
+    /// [`lost_pct`](Self::lost_pct), or `None` when the window held under
+    /// [`THIN_WINDOW_FRAMES`] frames and a share would mislead.
+    fn lost_share(&self) -> Option<f64> {
+        (self.received.saturating_add(self.lost) >= THIN_WINDOW_FRAMES).then(|| self.lost_pct())
+    }
+
+    /// `lost x.x%`, or `lost N` in a thin window.
+    fn lost_label(&self) -> String {
+        match self.lost_share() {
+            Some(p) => format!("lost {p:.1}%"),
+            None => format!("lost {}", self.lost),
+        }
+    }
+
     /// Where the Advanced headline stops: the furthest point this window measured.
     pub fn endpoint(&self) -> Option<Endpoint> {
         if self.e2e.is_measured() {
@@ -443,6 +522,10 @@ impl StatsSnapshot {
         }
     }
 }
+
+/// Below this many frames in a window, loss shows as a count. A still screen on a
+/// Windows host sends almost none, so one lost frame would read as tens of percent.
+const THIN_WINDOW_FRAMES: u32 = 30;
 
 fn pct(part: u32, whole: u32) -> f64 {
     if whole == 0 {
@@ -757,6 +840,21 @@ impl Stats {
         submitted_ns: u64,
         displayed_ns: u64,
     ) {
+        self.note_displayed_split(pts_ns, decoded_ns, submitted_ns, 0, displayed_ns);
+    }
+
+    /// [`Self::note_displayed`] with the instant our own GPU work for the present was
+    /// done. Then `latch` is submit → GPU done, ours, and `os_floor` is GPU done → glass:
+    /// the compositor's margin and the vblank, which no pacing on our side gets under.
+    /// `gpu_done_ns` 0 keeps `latch` as submit → glass.
+    pub fn note_displayed_split(
+        &self,
+        pts_ns: u64,
+        decoded_ns: u64,
+        submitted_ns: u64,
+        gpu_done_ns: u64,
+        displayed_ns: u64,
+    ) {
         if !self.live() {
             return;
         }
@@ -773,13 +871,27 @@ impl Stats {
         if let Some(us) = local(displayed_ns, decoded_ns) {
             w.display.push(us);
         }
-        if submitted_ns != 0 {
-            if let (Some(p), Some(l)) = (
-                local(submitted_ns, decoded_ns),
-                local(displayed_ns, submitted_ns),
-            ) {
+        if submitted_ns == 0 {
+            return;
+        }
+        let Some(p) = local(submitted_ns, decoded_ns) else {
+            return;
+        };
+        // A GPU-done stamp before the submit is a clock artefact: fall back to the whole.
+        let split = (gpu_done_ns >= submitted_ns && gpu_done_ns <= displayed_ns)
+            .then(|| local(gpu_done_ns, submitted_ns).zip(local(displayed_ns, gpu_done_ns)))
+            .flatten();
+        match split {
+            Some((ours, floor)) => {
                 w.pace.push(p);
-                w.latch.push(l);
+                w.latch.push(ours);
+                w.os_floor.push(floor);
+            }
+            None => {
+                if let Some(l) = local(displayed_ns, submitted_ns) {
+                    w.pace.push(p);
+                    w.latch.push(l);
+                }
             }
         }
     }
@@ -1071,10 +1183,15 @@ fn equation(s: &StatsSnapshot, ep: Endpoint) -> Option<HudLine> {
         // With the floor shaved, display is already pace alone; the split would count latch twice.
         if floor == 0 && s.pace.is_measured() && s.latch.is_measured() {
             t.push_str(&format!(
-                " (pace {} + latch {})",
+                " (pace {} + latch {}",
                 ms(s.pace.p50_us),
                 ms(s.latch.p50_us)
             ));
+            // A measured, unshaved floor is the compositor's share, named beside ours.
+            if s.os_floor.is_measured() {
+                t.push_str(&format!(" + os floor {}", ms(s.os_floor.p50_us)));
+            }
+            t.push(')');
         }
         terms.push(t);
     }
@@ -1098,7 +1215,7 @@ fn advanced_lines(s: &StatsSnapshot, tier: StatsVerbosity) -> Vec<HudLine> {
         }
         f.push(mbps(s.mbps()));
         if s.lost > 0 {
-            f.push(format!("lost {:.1}%", s.lost_pct()));
+            f.push(s.lost_label());
         }
         f.extend(s.preset.clone());
         out.push(line(Role::Primary, f));
@@ -1184,7 +1301,10 @@ fn advanced_lines(s: &StatsSnapshot, tier: StatsVerbosity) -> Vec<HudLine> {
     out.extend(audio_format(s));
     let mut counters = Vec::new();
     if s.lost > 0 {
-        counters.push(format!("lost {} ({:.1}%)", s.lost, s.lost_pct()));
+        counters.push(match s.lost_share() {
+            Some(p) => format!("lost {} ({p:.1}%)", s.lost),
+            None => format!("lost {}", s.lost),
+        });
     }
     if detailed {
         match s.skipped {
@@ -1223,7 +1343,7 @@ fn standard_lines(s: &StatsSnapshot, tier: StatsVerbosity) -> Vec<HudLine> {
             f.push(format!("decode {} ms", ms(s.decode.mean_us)));
         }
         if s.lost > 0 {
-            f.push(format!("lost {:.1}%", s.lost_pct()));
+            f.push(s.lost_label());
         }
         f.extend(s.preset.clone());
         out.push(line(Role::Primary, f));
@@ -1258,7 +1378,7 @@ fn standard_lines(s: &StatsSnapshot, tier: StatsVerbosity) -> Vec<HudLine> {
         out.push(text(Role::Detail, format!("{} (avg)", times.join(" · "))));
     }
 
-    let mut link = vec![format!("lost {:.1}%", s.lost_pct())];
+    let mut link = vec![s.lost_label()];
     if let Some(k) = s.skipped {
         let shown = s.decoded.unwrap_or(s.received);
         link.push(format!("skipped {:.1}%", pct(k, shown.max(k))));
@@ -1281,11 +1401,20 @@ fn standard_lines(s: &StatsSnapshot, tier: StatsVerbosity) -> Vec<HudLine> {
             ));
         }
         if floor == 0 && s.pace.is_measured() && s.latch.is_measured() {
-            spread.push(format!(
-                "display queue {} + render {} ms (incl. vsync)",
-                ms(s.pace.mean_us),
-                ms(s.latch.mean_us)
-            ));
+            spread.push(if s.os_floor.is_measured() {
+                format!(
+                    "display queue {} + render {} + compositor {} ms",
+                    ms(s.pace.mean_us),
+                    ms(s.latch.mean_us),
+                    ms(s.os_floor.mean_us)
+                )
+            } else {
+                format!(
+                    "display queue {} + render {} ms (incl. vsync)",
+                    ms(s.pace.mean_us),
+                    ms(s.latch.mean_us)
+                )
+            });
         }
         if !spread.is_empty() {
             out.push(line(Role::Detail, spread));
@@ -1301,6 +1430,40 @@ fn standard_lines(s: &StatsSnapshot, tier: StatsVerbosity) -> Vec<HudLine> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Apple devices already store these names; they must round-trip unchanged.
+    #[test]
+    fn hud_corner_reads_apples_names() {
+        for c in HudCorner::ALL {
+            assert_eq!(HudCorner::from_name(c.as_name()), Some(c));
+        }
+        assert_eq!(
+            HudCorner::from_name("topTrailing"),
+            Some(HudCorner::TopRight)
+        );
+        assert_eq!(HudCorner::from_name(""), None);
+        assert_eq!(HudCorner::from_name("middle"), None);
+        assert!(HudCorner::BottomRight.right() && HudCorner::BottomRight.bottom());
+        assert!(!HudCorner::TopLeft.right() && !HudCorner::TopLeft.bottom());
+    }
+
+    #[test]
+    fn stats_scale_clamps_and_reads_zero_as_default() {
+        assert_eq!(stats_scale(100), 1.0);
+        assert_eq!(stats_scale(150), 1.5);
+        assert_eq!(stats_scale(0), 1.0);
+        assert_eq!(stats_scale(10), 0.75);
+        assert_eq!(stats_scale(900), 2.0);
+    }
+
+    #[test]
+    fn rank_is_len_times_pct_clamped() {
+        let hundred: Vec<u32> = (0..100).collect();
+        assert_eq!(rank(&hundred, 50), 50);
+        assert_eq!(rank(&hundred, 99), 99);
+        assert_eq!(rank(&hundred, 100), 99);
+        assert_eq!(rank(&[7u32], 95), 7);
+    }
 
     fn sum(n: u32, p50_us: u32, p95_us: u32) -> Summary {
         Summary {
@@ -1399,6 +1562,49 @@ mod tests {
         // Without glass stamps the unsplit figure stands alone rather than a zero latch.
         s.latch = Summary::default();
         assert!(!all(&s, StatsVerbosity::Detailed, true).contains("pace 1.1"));
+    }
+
+    /// A desktop compositor's share is named, not shaved: the headline stays the glass truth.
+    #[test]
+    fn a_measured_compositor_floor_is_named_beside_latch() {
+        let mut s = desktop();
+        s.display = sum(119, 12_400, 14_000);
+        s.pace = sum(119, 400, 600);
+        s.latch = sum(119, 1_200, 1_500);
+        s.os_floor = sum(119, 10_800, 12_000);
+        let text = all(&s, StatsVerbosity::Detailed, true);
+        assert!(
+            text.contains("display 12.4 (pace 0.4 + latch 1.2 + os floor 10.8)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_gpu_done_stamp_splits_latch_from_the_floor() {
+        let st = Stats::new(Arc::new(AtomicI64::new(0)));
+        st.set_enabled(true, &Counters::default());
+        // decoded → submitted 400 µs → GPU done 1.6 ms → glass 12.4 ms.
+        st.note_displayed_split(
+            1,
+            1_000_000_000,
+            1_000_400_000,
+            1_001_600_000,
+            1_012_400_000,
+        );
+        // A GPU stamp before the submit cannot split: latch stays submit → glass.
+        st.note_displayed_split(
+            2,
+            2_000_000_000,
+            2_000_400_000,
+            2_000_100_000,
+            2_012_400_000,
+        );
+        let s = st.drain(&Counters::default());
+        assert_eq!(s.pace.n, 2);
+        assert_eq!(s.latch.n, 2);
+        assert_eq!(s.os_floor.n, 1);
+        assert_eq!(s.os_floor.max_us, 10_800);
+        assert_eq!(s.latch.max_us, 12_000);
     }
 
     #[test]
@@ -1652,6 +1858,28 @@ mod tests {
         s.fec = 0;
         assert!(!all(&s, StatsVerbosity::Detailed, true).contains("lost"));
         assert!(!all(&s, StatsVerbosity::Compact, true).contains("lost"));
+    }
+
+    /// A still screen sends few frames; one loss there shows as a count, not a share.
+    #[test]
+    fn thin_window_counts_loss() {
+        let mut s = desktop();
+        s.received = 4;
+        s.lost = 1;
+        for advanced in [true, false] {
+            for tier in [
+                StatsVerbosity::Compact,
+                StatsVerbosity::Normal,
+                StatsVerbosity::Detailed,
+            ] {
+                let text = all(&s, tier, advanced);
+                assert!(text.contains("lost 1"), "{tier:?} {advanced}: {text}");
+                assert!(!text.contains("lost 20.0%"), "{tier:?} {advanced}: {text}");
+                assert!(!text.contains("(20.0%)"), "{tier:?} {advanced}: {text}");
+            }
+        }
+        s.received = 29;
+        assert!(all(&s, StatsVerbosity::Compact, true).contains("lost 3.3%"));
     }
 
     #[test]

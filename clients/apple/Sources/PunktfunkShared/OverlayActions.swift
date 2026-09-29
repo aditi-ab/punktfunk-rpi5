@@ -12,6 +12,8 @@ import Foundation
 /// `OverlayConfig.shortcuts` by id.
 public enum SlotId: Equatable, Sendable {
     case endStream, disconnectLinger, touchMode, keyboard, stats, mic, pad, sendText
+    /// End the game this device launched, then the stream.
+    case endGame
     /// The host's guide button (Xbox / PS / Steam) and its quick-access `…`, as synthetic pad taps.
     case guide, qam
     /// Controller mouse: the pad drives the host pointer instead of its virtual pad.
@@ -23,6 +25,7 @@ public enum SlotId: Equatable, Sendable {
     public var id: String {
         switch self {
         case .endStream: return "end_stream"
+        case .endGame: return "end_game"
         case .disconnectLinger: return "disconnect_linger"
         case .touchMode: return "touch_mode"
         case .keyboard: return "keyboard"
@@ -42,6 +45,7 @@ public enum SlotId: Equatable, Sendable {
     public static func parse(_ s: String) -> SlotId? {
         switch s {
         case "end_stream": return .endStream
+        case "end_game": return .endGame
         case "disconnect_linger": return .disconnectLinger
         case "touch_mode": return .touchMode
         case "keyboard": return .keyboard
@@ -160,7 +164,8 @@ public struct PadTweak: Equatable, Sendable {
 
 /// The virtual controller: `layout` is `full`, `sticks` or `dpad`; `opacity` and `scale` are
 /// the two sliders. `controls` carries the per-control overrides keyed by control id (`ls`,
-/// `rs`, `dpad`, `face`, `lb`, `rb`, `lt`, `rt`, `select`, `guide`, `start`), `controlsNarrow`
+/// `rs`, `dpad`, `face`, `lb`, `rb`, `lt`, `rt`, `l3`, `r3`, `select`, `guide`, `start`,
+/// `ring`), `controlsNarrow`
 /// the same for a narrow (upright) layer — the two classes the preset already lays out
 /// differently.
 public struct PadConfig: Equatable, Sendable {

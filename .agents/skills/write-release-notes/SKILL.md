@@ -19,7 +19,7 @@ Ordinary PRs do not run this and do not edit `CHANGELOG.md`.
    - C ABI: `ABI_VERSION` / `PUNKTFUNK_ABI_VERSION` in that file and `include/punktfunk_core.h`
    - Driver protocol: `MIN_DRIVER_PROTOCOL_VERSION` in `crates/pf-driver-proto/src/lib.rs`
    - Gamepad channel, plugin schema, OpenAPI (`api/openapi.json` info.version), gamescope `+pfhdrN`, SDK / plugin-kit tags — copy the rows the previous CHANGELOG section already lists; mark unchanged.
-5. Knobs, mechanically: `git grep -ohE 'PUNKTFUNK_[A-Z0-9_]+' vPrev -- crates | sort -u` against the same at HEAD; every new name is a Knobs line or a conscious skip. Same for new `punktfunk` / `punktfunk-host` subcommands (`docs-site/content/docs/host-cli.md` diff).
+5. Knobs, mechanically: `git grep -ohE 'PUNKTFUNK_[A-Z0-9_]+' vPrev -- crates | sort -u` against the same at HEAD; every new name is a Knobs line or a conscious skip. Same for new `punktfunk` / `punktfunk-host` subcommands (`docs-site/content/docs/(reference)/host-cli.md` diff).
 6. `git diff --stat vPrev HEAD -- docs-site/content` — every changed page is a user-facing fact; a new page is a bullet.
 
 ## Outputs (same bump commit; drafts may exist earlier)
@@ -28,7 +28,8 @@ Ordinary PRs do not run this and do not edit `CHANGELOG.md`.
    Discord (`scripts/ci/discord-announce.sh`) posts **everything before the first `## `**. Put the 3–8 highlight bullets in that lead-in. A later `## Highlights` heading is optional duplication; prefer no heading so Discord gets the scan.
 2. `docs/releases/whatsnew/vX.Y.Z.txt` — Android only, 500 **characters** (`len()`, not `wc -c`), `whatsnew/TEMPLATE.txt`.
 3. `CHANGELOG.md` card: lead, version table, Breaking, short **Knobs / embedder** list (env, JNI arity, CLI) for actions that do not move a version integer. No Added/Changed/Fixed diary.
-4. Stop. A human reads the lead-in before the tag.
+4. A `<release version="X.Y.Z" date="…">` on top of `packaging/flatpak/io.unom.Punktfunk.metainfo.xml`: one-sentence description, `details` URL to the release. Software centres show its version.
+5. Stop. A human reads the lead-in before the tag.
 
 Voice: `docs/writing.md` §2. Name the thing, then what the reader gets. Do not paste `git log`. Do not invent version numbers.
 

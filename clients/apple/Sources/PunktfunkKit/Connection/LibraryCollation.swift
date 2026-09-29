@@ -179,6 +179,21 @@ public enum LibraryCollation {
         return trimmed
     }
 
+    /// `sortTitle`, remembered: a shelf collates on every redraw, and its titles don't change.
+    /// 4096 titles is past any library; a full table starts over.
+    private static func sortKey(_ title: String) -> String {
+        sortKeyLock.withLock {
+            if let known = sortKeys[title] { return known }
+            if sortKeys.count >= 4096 { sortKeys.removeAll(keepingCapacity: true) }
+            let key = sortTitle(title)
+            sortKeys[title] = key
+            return key
+        }
+    }
+
+    private static let sortKeyLock = NSLock()
+    nonisolated(unsafe) private static var sortKeys: [String: String] = [:]
+
     /// The desktop's fold table, scalar for scalar.
     private static func fold(_ scalar: Unicode.Scalar) -> Unicode.Scalar {
         switch scalar {
@@ -250,8 +265,10 @@ public enum LibraryCollation {
             }
         }
 
-        // Fold every title once; the comparator below runs O(n log n) times per group.
-        let titleKeys = games.map { sortTitle($0.title) }
+        // Fold every title once; the comparator below runs O(n log n) times per group. Only
+        // these three sorts read a title.
+        let readsTitles = sort == .title || sort == .platform || sort == .store
+        let titleKeys = readsTitles ? games.map { sortKey($0.title) } : []
         // Every comparator falls back to the index, so equal keys keep the host's order rather
         // than an arbitrary one — and the result is the same whether or not `sorted` is stable.
         func precedes(_ a: Int, _ b: Int) -> Bool {

@@ -93,6 +93,14 @@ jobs:
       - name: Drop a partial target restore
         run: sh scripts/ci/drop-partial-target.sh "${{ steps.target.outputs.cache-hit }}" "cargo-target-shots-release-v1-${{ env.rustc }}-${{ hashFiles('Cargo.lock') }}"
 
+      # Cargo judges path crates by mtime, and this checkout is new. Every job that saves this
+      # target cache must run this first: scripts/ci/src-mtimes.rs.
+      - name: Carry source mtimes (unchanged crates stay fresh)
+        continue-on-error: true
+        run: |
+          rustc -O scripts/ci/src-mtimes.rs -o /tmp/src-mtimes
+          /tmp/src-mtimes target
+
       - name: Build client
         run: cargo build --release -p punktfunk-client-linux --locked
 

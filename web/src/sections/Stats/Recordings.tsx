@@ -23,9 +23,10 @@ import {
 	TableRow,
 } from "@/components/ui/table";
 import { apiErrorMessage } from "@/lib/errors";
+import { fmtClockDuration } from "@/lib/format";
 import type { Loadable } from "@/lib/query";
 import { m } from "@/paraglide/messages";
-import { fmtDuration, fmtTimestamp, kindLabel } from "./helpers";
+import { fmtTimestamp, kindLabel } from "./helpers";
 
 /**
  * Container: the saved recordings. Owns the list query, delete, and the JSON export. Selection is
@@ -188,7 +189,7 @@ export const RecordingsCard: FC<{
 											{r.encoder_backend || "—"}
 										</TableCell>
 										<TableCell className="text-right tabular-nums">
-											{fmtDuration(r.duration_ms)}
+											{fmtClockDuration(r.duration_ms / 1000)}
 										</TableCell>
 										<TableCell className="text-right tabular-nums">
 											{r.sample_count}

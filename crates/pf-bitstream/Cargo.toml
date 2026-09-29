@@ -9,8 +9,12 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-cros-codecs = { path = "vendor/cros-codecs" }
+cros-codecs = { workspace = true }
 tracing = "0.1"
+
+[features]
+# `pf_bitstream::testing`: vendored vectors and splitters for other crates' tests.
+test-vectors = []
 
 [lints]
 workspace = true

@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
@@ -25,21 +26,30 @@ internal fun decodeHudLines(encoded: String?): List<HudLine> =
 /**
  * The live stats overlay: the lines `punktfunk_core::hud` built for this window, painted by role.
  * The tier, the vocabulary and every label are decided natively, the same as on every other
- * client; this only draws them.
+ * client; this only draws them. [scale] is the player's Statistics size on top of the density.
  */
 @Composable
-internal fun StatsOverlay(lines: List<HudLine>, modifier: Modifier = Modifier) {
+internal fun StatsOverlay(lines: List<HudLine>, modifier: Modifier = Modifier, scale: Float = 1f) {
     if (lines.isEmpty()) return
+    val k = scale.coerceIn(0.5f, 4f)
     Column(
         modifier = modifier
-            .background(Color.Black.copy(alpha = 0.45f), RoundedCornerShape(6.dp))
-            .padding(horizontal = 8.dp, vertical = 4.dp),
+            .background(Color.Black.copy(alpha = 0.45f), RoundedCornerShape((6 * k).dp))
+            .padding(horizontal = (8 * k).dp, vertical = (4 * k).dp),
     ) {
-        lines.forEach { statLine(it.text, roleColor(it.role)) }
+        lines.forEach { statLine(it.text, roleColor(it.role), k) }
     }
 }
 
-private fun roleColor(role: Int): Color = when (role) {
+/** A cross-client `hud_placement` name as a Compose corner; "" and unknown are top left. */
+internal fun hudAlignment(name: String): Alignment = when (name) {
+    "topTrailing" -> Alignment.TopEnd
+    "bottomLeading" -> Alignment.BottomStart
+    "bottomTrailing" -> Alignment.BottomEnd
+    else -> Alignment.TopStart
+}
+
+internal fun roleColor(role: Int): Color = when (role) {
     1 -> Color(0xFFB0D0FF)
     2 -> Color(0xFF9AA6B8)
     3 -> Color(0xFFFFD9A0)
@@ -51,9 +61,9 @@ private fun roleColor(role: Int): Color = when (role) {
  * are pinned: the theme's `bodyLarge` would set 12 sp text on a 24 sp line.
  */
 @Composable
-private fun statLine(text: String, color: Color) {
+private fun statLine(text: String, color: Color, k: Float) {
     Text(
-        text, color = color, fontFamily = FontFamily.Monospace, fontSize = 12.sp,
-        lineHeight = 16.sp, letterSpacing = 0.sp,
+        text, color = color, fontFamily = FontFamily.Monospace, fontSize = (12 * k).sp,
+        lineHeight = (16 * k).sp, letterSpacing = 0.sp,
     )
 }

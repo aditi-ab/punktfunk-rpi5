@@ -57,29 +57,36 @@ struct ARect {
 const TRANSFORM_IDENTITY: i32 = 0;
 /// `ASURFACE_TRANSACTION_VISIBILITY_SHOW`.
 const VISIBILITY_SHOW: i8 = 1;
+/// `ASURFACE_TRANSACTION_VISIBILITY_HIDE`.
+const VISIBILITY_HIDE: i8 = 0;
 
 /// [`HdrMeta`](punktfunk_core::quic::HdrMeta) (ST.2086 G, B, R in 1/50000; mastering luminance in
-/// 0.0001 nits) as the NDK's float structs.
-fn hdr_metadata(m: &punktfunk_core::quic::HdrMeta) -> (AHdrMetadataSmpte2086, AHdrMetadataCta8613) {
+/// 0.0001 nits) as the NDK's float structs. A block with a zero field means "unknown" and is
+/// `None`, as Codec2 treats it for the decoder's own Surface: SurfaceFlinger takes a sent MaxCLL
+/// as the layer's peak, so a zero one declares a 0-nit picture.
+fn hdr_metadata(
+    m: &punktfunk_core::quic::HdrMeta,
+) -> (Option<AHdrMetadataSmpte2086>, Option<AHdrMetadataCta8613>) {
     let xy = |[x, y]: [u16; 2]| AColorXy {
         x: f32::from(x) / 50_000.0,
         y: f32::from(y) / 50_000.0,
     };
     let [g, b, r] = m.display_primaries;
-    (
-        AHdrMetadataSmpte2086 {
+    let mastering = (m.max_display_mastering_luminance > 0
+        && m.min_display_mastering_luminance > 0)
+        .then(|| AHdrMetadataSmpte2086 {
             red: xy(r),
             green: xy(g),
             blue: xy(b),
             white: xy(m.white_point),
             max_luminance: m.max_display_mastering_luminance as f32 / 10_000.0,
             min_luminance: m.min_display_mastering_luminance as f32 / 10_000.0,
-        },
-        AHdrMetadataCta8613 {
-            max_content_light_level: f32::from(m.max_cll),
-            max_frame_average_light_level: f32::from(m.max_fall),
-        },
-    )
+        });
+    let light_level = (m.max_cll > 0 && m.max_fall > 0).then(|| AHdrMetadataCta8613 {
+        max_content_light_level: f32::from(m.max_cll),
+        max_frame_average_light_level: f32::from(m.max_fall),
+    });
+    (mastering, light_level)
 }
 
 // ---- The `dlsym`-resolved entry-point table ----------------------------------------------------
@@ -184,71 +191,36 @@ impl Api {
     /// symbol absent). The two optional entries (`setBufferDataSpace`, `setFrameRate`) do not gate.
     fn resolve() -> Option<Api> {
         // SAFETY: `dlopen` of the always-mapped `libandroid.so` (only bumps its refcount; never
-        // closed — a process-lifetime handle). Each `dlsym` returns null when the symbol is absent
-        // (device below API 29), checked before transmuting the non-null pointer to its fn type.
+        // closed — a process-lifetime handle; null is checked). Each `sym` type is the NDK header's
+        // signature for that name; a required one absent = API < 29.
         unsafe {
             let lib = libc::dlopen(c"libandroid.so".as_ptr(), libc::RTLD_NOW);
             if lib.is_null() {
                 return None;
             }
-            let req = |name: &std::ffi::CStr| -> Option<*mut c_void> {
-                let p = libc::dlsym(lib, name.as_ptr());
-                (!p.is_null()).then_some(p)
-            };
+            use crate::sym;
             Some(Api {
-                create_from_window: std::mem::transmute::<*mut c_void, CreateFromWindowFn>(req(
-                    c"ASurfaceControl_createFromWindow",
-                )?),
-                ac_release: std::mem::transmute::<*mut c_void, AcReleaseFn>(req(
-                    c"ASurfaceControl_release",
-                )?),
-                txn_create: std::mem::transmute::<*mut c_void, TxnCreateFn>(req(
-                    c"ASurfaceTransaction_create",
-                )?),
-                txn_delete: std::mem::transmute::<*mut c_void, TxnDeleteFn>(req(
-                    c"ASurfaceTransaction_delete",
-                )?),
-                txn_apply: std::mem::transmute::<*mut c_void, TxnApplyFn>(req(
-                    c"ASurfaceTransaction_apply",
-                )?),
-                txn_set_buffer: std::mem::transmute::<*mut c_void, TxnSetBufferFn>(req(
-                    c"ASurfaceTransaction_setBuffer",
-                )?),
-                txn_set_visibility: std::mem::transmute::<*mut c_void, TxnSetVisibilityFn>(req(
-                    c"ASurfaceTransaction_setVisibility",
-                )?),
-                txn_set_z_order: std::mem::transmute::<*mut c_void, TxnSetZOrderFn>(req(
-                    c"ASurfaceTransaction_setZOrder",
-                )?),
-                txn_set_geometry: std::mem::transmute::<*mut c_void, TxnSetGeometryFn>(req(
-                    c"ASurfaceTransaction_setGeometry",
-                )?),
-                txn_set_present_time: std::mem::transmute::<*mut c_void, TxnSetDesiredPresentTimeFn>(
-                    req(c"ASurfaceTransaction_setDesiredPresentTime")?,
-                ),
-                txn_set_dataspace: req(c"ASurfaceTransaction_setBufferDataSpace")
-                    .map(|p| std::mem::transmute::<*mut c_void, TxnSetBufferDataSpaceFn>(p)),
-                txn_set_frame_rate: req(c"ASurfaceTransaction_setFrameRate")
-                    .map(|p| std::mem::transmute::<*mut c_void, TxnSetFrameRateFn>(p)),
-                txn_set_hdr_smpte2086: req(c"ASurfaceTransaction_setHdrMetadata_smpte2086")
-                    .map(|p| std::mem::transmute::<*mut c_void, TxnSetHdrSmpte2086Fn>(p)),
-                txn_set_hdr_cta861_3: req(c"ASurfaceTransaction_setHdrMetadata_cta861_3")
-                    .map(|p| std::mem::transmute::<*mut c_void, TxnSetHdrCta8613Fn>(p)),
-                txn_set_on_complete: std::mem::transmute::<*mut c_void, TxnSetOnCompleteFn>(req(
-                    c"ASurfaceTransaction_setOnComplete",
-                )?),
-                stats_latch_time: std::mem::transmute::<*mut c_void, StatsGetLatchTimeFn>(req(
-                    c"ASurfaceTransactionStats_getLatchTime",
-                )?),
-                stats_prev_release_fence: std::mem::transmute::<
-                    *mut c_void,
-                    StatsGetPrevReleaseFenceFn,
-                >(req(
+                create_from_window: sym(lib, c"ASurfaceControl_createFromWindow")?,
+                ac_release: sym(lib, c"ASurfaceControl_release")?,
+                txn_create: sym(lib, c"ASurfaceTransaction_create")?,
+                txn_delete: sym(lib, c"ASurfaceTransaction_delete")?,
+                txn_apply: sym(lib, c"ASurfaceTransaction_apply")?,
+                txn_set_buffer: sym(lib, c"ASurfaceTransaction_setBuffer")?,
+                txn_set_visibility: sym(lib, c"ASurfaceTransaction_setVisibility")?,
+                txn_set_z_order: sym(lib, c"ASurfaceTransaction_setZOrder")?,
+                txn_set_geometry: sym(lib, c"ASurfaceTransaction_setGeometry")?,
+                txn_set_present_time: sym(lib, c"ASurfaceTransaction_setDesiredPresentTime")?,
+                txn_set_dataspace: sym(lib, c"ASurfaceTransaction_setBufferDataSpace"),
+                txn_set_frame_rate: sym(lib, c"ASurfaceTransaction_setFrameRate"),
+                txn_set_hdr_smpte2086: sym(lib, c"ASurfaceTransaction_setHdrMetadata_smpte2086"),
+                txn_set_hdr_cta861_3: sym(lib, c"ASurfaceTransaction_setHdrMetadata_cta861_3"),
+                txn_set_on_complete: sym(lib, c"ASurfaceTransaction_setOnComplete")?,
+                stats_latch_time: sym(lib, c"ASurfaceTransactionStats_getLatchTime")?,
+                stats_prev_release_fence: sym(
+                    lib,
                     c"ASurfaceTransactionStats_getPreviousReleaseFenceFd",
-                )?),
-                stats_present_fence: std::mem::transmute::<*mut c_void, StatsGetPresentFenceFn>(
-                    req(c"ASurfaceTransactionStats_getPresentFenceFd")?,
-                ),
+                )?,
+                stats_present_fence: sym(lib, c"ASurfaceTransactionStats_getPresentFenceFd")?,
             })
         }
     }
@@ -483,12 +455,13 @@ impl Layer {
                 }
             }
             if let Some(m) = hdr {
+                // Each setter replaces the layer's whole HDR metadata, so send one block: the
+                // content light level when known, else the mastering volume.
                 let (mdcv, cll) = hdr_metadata(m);
-                if let Some(f) = self.api.txn_set_hdr_smpte2086 {
-                    f(txn, sc, &mdcv);
-                }
-                if let Some(f) = self.api.txn_set_hdr_cta861_3 {
+                if let (Some(f), Some(cll)) = (self.api.txn_set_hdr_cta861_3, cll) {
                     f(txn, sc, &cll);
+                } else if let (Some(f), Some(mdcv)) = (self.api.txn_set_hdr_smpte2086, mdcv) {
+                    f(txn, sc, &mdcv);
                 }
             }
             if !self.configured {
@@ -522,6 +495,22 @@ impl Layer {
             (self.api.txn_delete)(txn);
         }
         true
+    }
+
+    /// Take the layer off the screen. Dropping it does not: a released child stays on display
+    /// as long as its parent does, over whatever layer replaced it.
+    pub(super) fn hide(&self) {
+        // SAFETY: as in `present`: a fresh transaction or null, this layer's live `sc`, applied
+        // and deleted once.
+        unsafe {
+            let txn = (self.api.txn_create)();
+            if txn.is_null() {
+                return;
+            }
+            (self.api.txn_set_visibility)(txn, self.sc.sc, VISIBILITY_HIDE);
+            (self.api.txn_apply)(txn);
+            (self.api.txn_delete)(txn);
+        }
     }
 }
 
@@ -559,21 +548,16 @@ struct SyncApi {
 fn sync_api() -> Option<&'static SyncApi> {
     static API: OnceLock<Option<SyncApi>> = OnceLock::new();
     API.get_or_init(|| {
-        // SAFETY: `dlopen` of the public `libsync.so` (process-lifetime handle); each `dlsym`
-        // is null-checked before the transmute to its documented signature.
+        // SAFETY: `dlopen` of the public `libsync.so` (process-lifetime handle; null is checked);
+        // each `sym` type is libsync's documented signature for that name.
         unsafe {
             let lib = libc::dlopen(c"libsync.so".as_ptr(), libc::RTLD_NOW);
             if lib.is_null() {
                 return None;
             }
-            let info = libc::dlsym(lib, c"sync_file_info".as_ptr());
-            let free = libc::dlsym(lib, c"sync_file_info_free".as_ptr());
-            if info.is_null() || free.is_null() {
-                return None;
-            }
             Some(SyncApi {
-                info: std::mem::transmute::<*mut c_void, SyncFileInfoFn>(info),
-                free: std::mem::transmute::<*mut c_void, SyncFileInfoFreeFn>(free),
+                info: crate::sym(lib, c"sync_file_info")?,
+                free: crate::sym(lib, c"sync_file_info_free")?,
             })
         }
     })

@@ -10,14 +10,14 @@ use crate::model::ConsoleCmd;
 use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox};
 use crate::theme::{fg, Fonts, W};
-use crate::widgets::{ListMsg, MenuList, RowSpec};
+use crate::widgets::{ListMsg, MenuList, RowSpec, FOOT_DETAIL_H};
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Rect};
 
 pub(crate) struct PinHostsScreen {
     preset_id: String,
     preset_name: String,
-    list: MenuList,
+    pub(super) list: MenuList,
 }
 
 /// Saved hosts, primary tiles only: a pinned card is this screen's output, not a row.
@@ -46,16 +46,12 @@ impl PinHostsScreen {
     /// Read from the model — the pinned card's row is the state, so the toggle cannot
     /// disagree with the carousel.
     fn pinned(&self, ctx: &Ctx, host_idx: usize) -> bool {
-        let host = &ctx.hosts[host_idx];
-        // The host half of the key (a pinned card appends its preset id past a NUL), not the
-        // address: two OS installs of a dual-boot box are two hosts at one address.
-        fn host_key(k: &str) -> &str {
-            k.split('\0').next().unwrap_or(k)
-        }
-        let key = host_key(&host.key);
-        ctx.hosts.iter().any(|r| {
-            host_key(&r.key) == key && r.pin.as_ref().is_some_and(|p| p.id == self.preset_id)
-        })
+        // The host key, not the address: two OS installs of a dual-boot box are two hosts
+        // at one address.
+        let key = ctx.hosts[host_idx].host_key();
+        ctx.hosts
+            .iter()
+            .any(|r| r.host_key() == key && r.pin.as_ref().is_some_and(|p| p.id == self.preset_id))
     }
 
     pub(crate) fn menu(
@@ -145,13 +141,11 @@ impl PinHostsScreen {
             );
             return;
         }
-        // Detail band under the list; 34 matches the settings screen.
-        let detail_h = 34.0 * k;
         let list_rect = Rect::from_ltrb(
             rect.left,
             rect.top,
             rect.right,
-            rect.bottom - detail_h as f32,
+            rect.bottom - (FOOT_DETAIL_H * k) as f32,
         );
         let rows: Vec<RowSpec> = indices
             .iter()
@@ -176,16 +170,13 @@ impl PinHostsScreen {
             .collect();
         self.list
             .render(canvas, list_rect, &rows, fonts, k, dt, true);
-        fonts.centered(
-            canvas,
+    }
+
+    /// The explainer under the list, once there is a list.
+    pub(crate) fn foot(&self, ctx: &Ctx) -> Option<&'static str> {
+        (!host_indices(ctx).is_empty()).then_some(
             "A pinned preset appears as its own card on the host — one press connects with it.",
-            W::Regular,
-            13.0 * k,
-            fg(0.55),
-            cx,
-            f64::from(rect.bottom) - detail_h + 6.0 * k,
-            f64::from(rect.width()) * 0.8,
-        );
+        )
     }
 }
 
@@ -198,53 +189,25 @@ mod tests {
 
     fn host(key: &str, saved: bool, pin: Option<&str>) -> HostRow {
         HostRow {
-            key: key.into(),
-            id: None,
-            name: key.into(),
-            addr: "10.0.0.9".into(),
-            port: 9777,
-            fp_hex: key.into(),
-            paired: true,
             saved,
-            online: true,
-            mgmt_port: 47990,
-            can_wake: false,
-            clipboard_sync: false,
-            last_used: None,
-            os: String::new(),
-            actions: Vec::new(),
             pin: pin.map(|id| PresetChip {
                 id: id.into(),
                 name: "Work".into(),
                 accent: None,
                 bitrate_kbps: None,
             }),
-            bound_preset: None,
-            running: String::new(),
-            game_presets: Default::default(),
+            ..HostRow::fixture(key, key)
         }
     }
 
     #[test]
     fn toggling_sends_set_pin_for_the_focused_host() {
         let mut settings = Settings::default();
-        let pads = Vec::new();
         let library = crate::library::LibraryShared::default();
         let hosts = [host("aa", true, None), host("bb", true, None)];
         let mut ctx = Ctx {
             hosts: &hosts,
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
+            ..Ctx::test(&mut settings, &library)
         };
         let mut s = PinHostsScreen::new("p1".into(), "Work".into());
         let mut fx = Outbox::default();
@@ -272,24 +235,12 @@ mod tests {
     #[test]
     fn state_reads_from_the_models_pinned_rows() {
         let mut settings = Settings::default();
-        let pads = Vec::new();
         let library = crate::library::LibraryShared::default();
         // Primary "aa" plus a pinned-card row for p1: Confirm on the primary unpins.
         let hosts = [host("aa", true, None), host("aa\0p1", true, Some("p1"))];
         let mut ctx = Ctx {
             hosts: &hosts,
-            library: &library,
-            settings: &mut settings,
-            store: crate::store::file_store(),
-            platform: crate::platform::Platform::Desktop,
-            screen: None,
-            pads: &pads,
-            deck: false,
-            fallback_ui: false,
-            pyrowave_ok: true,
-            av1_ok: true,
-            device_name: "t",
-            t: 0.0,
+            ..Ctx::test(&mut settings, &library)
         };
         let mut s = PinHostsScreen::new("p1".into(), "Work".into());
         assert_eq!(host_indices(&ctx).len(), 1);

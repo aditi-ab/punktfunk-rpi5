@@ -1,8 +1,8 @@
 //! Presenter bring-up: instance → surface → device → swapchain over an SDL window.
 //!
 //! [`Presenter::new`] is the only construction path. Device creation and
-//! [`probe_decode`] share [`VIDEO_BASE`], [`VIDEO_CODECS`], and [`video_decode_gate`]
-//! so a probe cannot report a capability the session then refuses.
+//! [`probe_decode`] both read a [`DecodeProbe`] into [`video_decode_gate`], so a probe
+//! cannot report a capability the session then refuses.
 //!
 //! Pinning: `PUNKTFUNK_VK_DEVICE=<index>` is raw `vkEnumeratePhysicalDevices` order;
 //! `PUNKTFUNK_VK_ADAPTER=<name>` matches the marketing name, then discrete-first;
@@ -41,7 +41,7 @@ pub(crate) const VIDEO_CODECS: [&std::ffi::CStr; 3] = [
 ];
 
 /// All five conjuncts of "this device can host Vulkan Video decode".
-/// Device creation and [`probe_decode`] call this same function.
+/// [`DecodeProbe::usable`] is its one caller.
 pub(crate) fn video_decode_gate(
     api_1_3: bool,
     features_ok: bool,
@@ -50,6 +50,96 @@ pub(crate) fn video_decode_gate(
     any_codec_ext: bool,
 ) -> bool {
     api_1_3 && features_ok && has_decode_family && base_exts_present && any_codec_ext
+}
+
+/// The inputs to [`video_decode_gate`] for one physical device, read without a logical
+/// device. Device creation and [`probe_decode`] both take them from here.
+struct DecodeProbe {
+    api_1_3: bool,
+    /// Sampler YCbCr conversion, timeline semaphores and synchronization2.
+    features_ok: bool,
+    /// The first decode-capable family and its codec ops. Reported even without the
+    /// extensions: hardware-can and driver-does-not-expose are different answers.
+    family: Option<(u32, vk::VideoCodecOperationFlagsKHR)>,
+    base_missing: Vec<&'static std::ffi::CStr>,
+    codec_exts: Vec<&'static std::ffi::CStr>,
+}
+
+impl DecodeProbe {
+    /// `has` answers whether `pdev` offers a device extension.
+    fn of(
+        instance: &ash::Instance,
+        pdev: vk::PhysicalDevice,
+        has: impl Fn(&std::ffi::CStr) -> bool,
+    ) -> DecodeProbe {
+        // SAFETY: read-only query on the live instance; `pdev` was enumerated from it.
+        let props = unsafe { instance.get_physical_device_properties(pdev) };
+        let mut f11 = vk::PhysicalDeviceVulkan11Features::default();
+        let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
+        let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
+        let mut feats = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut f11)
+            .push_next(&mut f12)
+            .push_next(&mut f13);
+        // SAFETY: read-only query; the pNext chain locals outlive the call.
+        unsafe { instance.get_physical_device_features2(pdev, &mut feats) };
+        let features_ok = f11.sampler_ycbcr_conversion == vk::TRUE
+            && f12.timeline_semaphore == vk::TRUE
+            && f13.synchronization2 == vk::TRUE;
+
+        // SAFETY: read-only query; length only.
+        let n = unsafe { instance.get_physical_device_queue_family_properties2_len(pdev) };
+        let mut video: Vec<vk::QueueFamilyVideoPropertiesKHR> =
+            vec![vk::QueueFamilyVideoPropertiesKHR::default(); n];
+        let mut qprops: Vec<vk::QueueFamilyProperties2> = video
+            .iter_mut()
+            .map(|v| vk::QueueFamilyProperties2::default().push_next(v))
+            .collect();
+        // SAFETY: read-only query; `qprops` / `video` outlive the call and receive the fill.
+        unsafe { instance.get_physical_device_queue_family_properties2(pdev, &mut qprops) };
+        // `qprops` mutably borrows `video` via push_next; copy the flags, drop `qprops`,
+        // then read the driver-filled video properties.
+        let flags: Vec<vk::QueueFlags> = qprops
+            .iter()
+            .map(|p| p.queue_family_properties.queue_flags)
+            .collect();
+        drop(qprops);
+        let family = flags
+            .iter()
+            .zip(&video)
+            .enumerate()
+            .find(|(_, (f, _))| f.contains(vk::QueueFlags::VIDEO_DECODE_KHR))
+            .map(|(i, (_, v))| (i as u32, v.video_codec_operations));
+
+        DecodeProbe {
+            api_1_3: vk::api_version_major(props.api_version) > 1
+                || vk::api_version_minor(props.api_version) >= 3,
+            features_ok,
+            family,
+            base_missing: VIDEO_BASE.into_iter().filter(|n| !has(n)).collect(),
+            codec_exts: VIDEO_CODECS.into_iter().filter(|n| has(n)).collect(),
+        }
+    }
+
+    fn usable(&self) -> bool {
+        video_decode_gate(
+            self.api_1_3,
+            self.features_ok,
+            self.family.is_some(),
+            self.base_missing.is_empty(),
+            !self.codec_exts.is_empty(),
+        )
+    }
+}
+
+/// Discrete, then integrated, then everything else: the order `pick_device` tries and
+/// the adapter listings print. Hybrids enumerate the iGPU first.
+fn device_rank(props: &vk::PhysicalDeviceProperties) -> u8 {
+    match props.device_type {
+        vk::PhysicalDeviceType::DISCRETE_GPU => 0,
+        vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
+        _ => 2,
+    }
 }
 
 /// One physical device's Vulkan Video decode capability: no logical device, no
@@ -187,10 +277,16 @@ impl Presenter {
         };
         #[cfg(target_os = "linux")]
         let hw_capable = dmabuf::DEVICE_EXTENSIONS.iter().all(|n| has(n));
+        // Optional on top: the decode fence as a semaphore instead of a CPU poll.
+        #[cfg(target_os = "linux")]
+        let sync_fd_ext = hw_capable && has(ash::khr::external_semaphore_fd::NAME);
         let mut dev_exts = vec![ash::khr::swapchain::NAME.as_ptr()];
         #[cfg(target_os = "linux")]
         if hw_capable {
             dev_exts.extend(dmabuf::DEVICE_EXTENSIONS.iter().map(|n| n.as_ptr()));
+            if sync_fd_ext {
+                dev_exts.push(ash::khr::external_semaphore_fd::NAME.as_ptr());
+            }
         } else {
             tracing::info!(
                 "device lacks the dmabuf import extensions — VAAPI hardware frames \
@@ -232,8 +328,8 @@ impl Presenter {
         // the exported `video_decode` fact stays `false`.
         // SAFETY: read-only query on the live instance; `pdev` was enumerated from it.
         let dev_props = unsafe { instance.get_physical_device_properties(pdev) };
-        let dev_is_13 = vk::api_version_major(dev_props.api_version) > 1
-            || vk::api_version_minor(dev_props.api_version) >= 3;
+        let decode = DecodeProbe::of(&instance, pdev, has);
+        let dev_is_13 = decode.api_1_3;
         let mut have_pid = vk::PhysicalDevicePresentIdFeaturesKHR::default();
         let mut have_pwait = vk::PhysicalDevicePresentWaitFeaturesKHR::default();
         let mut have_f11 = vk::PhysicalDeviceVulkan11Features::default();
@@ -270,9 +366,6 @@ impl Presenter {
         let present_wait_ok = present_wait_exts
             && have_pid.present_id == vk::TRUE
             && have_pwait.present_wait == vk::TRUE;
-        let features_ok = have_f11.sampler_ycbcr_conversion == vk::TRUE
-            && have_f12.timeline_semaphore == vk::TRUE
-            && have_f13.synchronization2 == vk::TRUE;
         // PyroWave is Vulkan 1.3 compute on this device — no video extensions.
         // Probe here so a capable device enables the features and advertises the codec.
         let pyrowave_ok = dev_is_13
@@ -283,47 +376,15 @@ impl Presenter {
             && have_f13.compute_full_subgroups == vk::TRUE
             && have_f13.synchronization2 == vk::TRUE;
 
-        let decode_family: Option<(u32, vk::VideoCodecOperationFlagsKHR)> = {
-            // SAFETY: read-only query; length only.
-            let n = unsafe { instance.get_physical_device_queue_family_properties2_len(pdev) };
-            let mut video: Vec<vk::QueueFamilyVideoPropertiesKHR> =
-                vec![vk::QueueFamilyVideoPropertiesKHR::default(); n];
-            let mut props: Vec<vk::QueueFamilyProperties2> = video
-                .iter_mut()
-                .map(|v| vk::QueueFamilyProperties2::default().push_next(v))
-                .collect();
-            // SAFETY: read-only query; `props` / `video` outlive the call and receive the fill.
-            unsafe { instance.get_physical_device_queue_family_properties2(pdev, &mut props) };
-            // `props` mutably borrows `video` via push_next; copy the flags, drop `props`,
-            // then read the driver-filled video properties.
-            let flags: Vec<vk::QueueFlags> = props
-                .iter()
-                .map(|p| p.queue_family_properties.queue_flags)
-                .collect();
-            drop(props);
-            flags
-                .iter()
-                .zip(&video)
-                .enumerate()
-                .find(|(_, (f, _))| f.contains(vk::QueueFlags::VIDEO_DECODE_KHR))
-                .map(|(i, (_, v))| (i as u32, v.video_codec_operations))
-        };
-
-        let codec_exts: Vec<&std::ffi::CStr> =
-            VIDEO_CODECS.into_iter().filter(|n| has(n)).collect();
-        let video_ok = video_decode_gate(
-            dev_is_13,
-            features_ok,
-            decode_family.is_some(),
-            VIDEO_BASE.iter().all(|n| has(n)),
-            !codec_exts.is_empty(),
-        );
+        let video_ok = decode.usable();
+        let decode_family = decode.family;
+        let codec_exts = &decode.codec_exts;
 
         let (decode_qf, decode_caps) = decode_family.unwrap_or((qfi, Default::default()));
         let mut video_ext_names: Vec<&std::ffi::CStr> = Vec::new();
         if video_ok {
             video_ext_names.extend(VIDEO_BASE);
-            video_ext_names.extend(&codec_exts);
+            video_ext_names.extend(codec_exts);
             // Optional; pf-vkdecode probes these rather than requiring them.
             for opt in [c"VK_KHR_video_maintenance1", c"VK_KHR_video_maintenance2"] {
                 if has(opt) {
@@ -340,9 +401,9 @@ impl Presenter {
         } else {
             // Log every conjunct. Empty `codec_exts` next to non-empty `queue_codec_ops`
             // means the extensions are missing, not the hardware.
-            let base_missing: Vec<&str> = VIDEO_BASE
+            let base_missing: Vec<&str> = decode
+                .base_missing
                 .iter()
-                .filter(|n| !has(n))
                 .map(|n| n.to_str().unwrap_or("?"))
                 .collect();
             let codec_ext_names: Vec<&str> = codec_exts
@@ -351,7 +412,7 @@ impl Presenter {
                 .collect();
             tracing::info!(
                 dev_is_13,
-                features_ok,
+                features_ok = decode.features_ok,
                 decode_family = decode_family.is_some(),
                 video_base_missing = ?base_missing,
                 codec_exts_present = ?codec_ext_names,
@@ -430,9 +491,10 @@ impl Presenter {
         .context("vkCreateDevice")?;
         let swap_d = ash::khr::swapchain::Device::new(&instance, &device);
         let present_timer = present_wait_ok.then(|| {
-            super::present_timing::PresentTimer::spawn(ash::khr::present_wait::Device::new(
-                &instance, &device,
-            ))
+            super::present_timing::PresentTimer::spawn(
+                ash::khr::present_wait::Device::new(&instance, &device),
+                device.clone(),
+            )
         });
         tracing::info!(
             present_wait = present_wait_ok,
@@ -444,9 +506,26 @@ impl Presenter {
         let queue = unsafe { device.get_device_queue(qfi, 0) };
         #[cfg(target_os = "linux")]
         let hw = if hw_capable {
+            let sync = sync_fd_ext
+                .then(|| crate::dmabuf::SyncImport::new(&instance, pdev, &device))
+                .flatten();
+            tracing::info!(
+                semaphore = sync.is_some(),
+                "dmabuf decode sync (a decode fence the sampling submit waits; \
+                 `false` polls the fence on the presenter thread)"
+            );
+            // SAFETY: live, paired handles; the extension and feature are checked alongside.
+            let timelines = (sync_fd_ext && have_f12.timeline_semaphore == vk::TRUE)
+                .then(|| unsafe {
+                    super::sync_timeline::TimelineMaker::new(&instance, pdev, &device)
+                })
+                .flatten();
             Some(HwCtx {
                 ext_mem_fd: ash::khr::external_memory_fd::Device::new(&instance, &device),
                 modifier_cache: Default::default(),
+                imports: Default::default(),
+                sync,
+                timelines,
             })
         } else {
             None
@@ -456,11 +535,10 @@ impl Presenter {
             ext_mem_win32: ash::khr::external_memory_win32::Device::new(&instance, &device),
             imports: crate::d3d11::ImportCache::default(),
         });
-        let csc = CscPass::new(&device, vk::Format::R8G8B8A8_UNORM)?;
-        // Starts SDR like `csc`; an HDR session rebuilds it at 10-bit via `set_hdr_mode`.
-        // Always built: the software decode rung renders through it. Gating on the
-        // pyrowave probe would hide software frames.
-        let csc_planar = CscPass::new_planar(&device, vk::Format::R8G8B8A8_UNORM)?;
+        let csc = CscPass::new(&device, super::VIDEO_FORMAT)?;
+        // Writes the same intermediate as `csc`. Always built: the software decode rung
+        // renders through it. Gating on the pyrowave probe would hide software frames.
+        let csc_planar = CscPass::new_planar(&device, super::VIDEO_FORMAT)?;
 
         // Export the selected device facts when any consumer needs the handles —
         // on Linux always: the presenter has a selected device and every consumer
@@ -492,6 +570,8 @@ impl Presenter {
                 device_extensions.push(CString::from(ash::ext::hdr_metadata::NAME));
             }
             device_extensions.extend(video_ext_names.iter().map(|n| CString::from(*n)));
+            let decode_ops =
+                pf_client_core::video::usable_decode_ops(dev_props.vendor_id, decode_caps.as_raw());
             Some(pf_client_core::video::VulkanDecodeDevice {
                 get_instance_proc_addr: entry.static_fn().get_instance_proc_addr as usize,
                 instance: instance.handle().as_raw() as usize,
@@ -504,7 +584,7 @@ impl Presenter {
                     .unwrap_or_default(),
                 graphics_qf: qfi,
                 decode_qf,
-                decode_video_caps: decode_caps.as_raw(),
+                decode_video_caps: decode_ops,
                 instance_extensions: instance_extensions
                     .iter()
                     .map(|e| CString::new(e.as_str()).unwrap())
@@ -532,6 +612,16 @@ impl Presenter {
                 dmabuf_import: hw_capable,
                 #[cfg(not(target_os = "linux"))]
                 dmabuf_import: false,
+                #[cfg(target_os = "linux")]
+                vaapi_av1_decode: hw_capable
+                    && pf_client_core::video::vaapi_av1_decodable(
+                        dev_props.vendor_id,
+                        video_ok
+                            && decode_ops & vk::VideoCodecOperationFlagsKHR::DECODE_AV1.as_raw()
+                                != 0,
+                    ),
+                #[cfg(not(target_os = "linux"))]
+                vaapi_av1_decode: false,
                 // HDR10 surface facts arrive with `pick_formats` below.
                 d3d11_hdr10: false,
                 d3d11_nv12: false,
@@ -572,6 +662,12 @@ impl Presenter {
         );
         let overlay_pipe = OverlayPipe::new(&device, format.format, false)?;
         let scale = crate::scale::ScalePass::new(&device, format.format)?;
+        let direct = crate::csc::DirectPass::new(
+            &device,
+            format.format,
+            csc.pipeline_layout,
+            csc_planar.pipeline_layout,
+        )?;
 
         // SAFETY: CREATE — CreateInfo is a local; the pool is owned by the Presenter being built.
         let cmd_pool = unsafe {
@@ -594,6 +690,21 @@ impl Presenter {
         let acquire_sem =
             // SAFETY: CREATE — CreateInfo is a local; the handle is stored on the Presenter.
             unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?;
+        let mut timeline_type = vk::SemaphoreTypeCreateInfo::default()
+            .semaphore_type(vk::SemaphoreType::TIMELINE)
+            .initial_value(0);
+        // Null without the timeline feature: the waiter then keeps latch whole.
+        let done_sem = if have_f12.timeline_semaphore == vk::TRUE {
+            // SAFETY: CREATE — CreateInfo chains a local; the handle is stored on the Presenter.
+            unsafe {
+                device.create_semaphore(
+                    &vk::SemaphoreCreateInfo::default().push_next(&mut timeline_type),
+                    None,
+                )
+            }?
+        } else {
+            vk::Semaphore::null()
+        };
         // SAFETY: CREATE — CreateInfo is a local; SIGNALED so the first wait is a no-op.
         let fence = unsafe {
             device.create_fence(
@@ -608,6 +719,8 @@ impl Presenter {
             .then(|| super::wayland_frame::WaylandFramePacer::new(window))
             .flatten();
 
+        #[cfg(target_os = "linux")]
+        let native_timelines = hw.as_ref().is_some_and(|h| h.timelines.is_some());
         let mut p = Presenter {
             entry,
             instance,
@@ -629,6 +742,8 @@ impl Presenter {
             video_export,
             overlay_pipe,
             scale,
+            direct,
+            direct_last: None,
             retired_hw: None,
             #[cfg(windows)]
             retained_slot: None,
@@ -644,19 +759,20 @@ impl Presenter {
             hdr_downgrade_warned: false,
             hdr_metadata_d,
             hdr_meta: None,
-            video_format: vk::Format::R8G8B8A8_UNORM,
             present_mode,
             swapchain: vk::SwapchainKHR::null(),
             images: Vec::new(),
             extent: vk::Extent2D::default(),
             render_sems: Vec::new(),
             acquire_sem,
+            done_sem,
             fence,
             cmd_pool,
             cmd_buf,
             staging: None,
             video: None,
             submitted: false,
+            acquired: None,
             present_timer,
             next_present_id: 0,
             last_presented: None,
@@ -664,6 +780,35 @@ impl Presenter {
             placement_logged: None,
             #[cfg(target_os = "linux")]
             wayland_frame,
+            #[cfg(target_os = "linux")]
+            native: if crate::wl_native::enabled() {
+                crate::wl_native::NativeLane::new(window, native_timelines).unwrap_or_else(|e| {
+                    tracing::warn!(error = %format!("{e:#}"), "native scanout lane unavailable");
+                    None
+                })
+            } else {
+                None
+            },
+            #[cfg(target_os = "linux")]
+            export_ring: None,
+            #[cfg(target_os = "linux")]
+            export_refused: None,
+            #[cfg(target_os = "linux")]
+            export_gen: 0,
+            #[cfg(target_os = "linux")]
+            overlay_ring: None,
+            #[cfg(target_os = "linux")]
+            overlay_refused: None,
+            #[cfg(target_os = "linux")]
+            overlay_shown: None,
+            #[cfg(target_os = "linux")]
+            vaapi_sync: Default::default(),
+            native_pq: false,
+            #[cfg(target_os = "linux")]
+            native_flip: crate::wl_native::flip_mode().then(std::time::Instant::now),
+            overlay_blocks_native: false,
+            native_last: false,
+            suspended: false,
         };
         p.recreate_swapchain(window)?;
         Ok(p)
@@ -706,78 +851,16 @@ pub fn probe_decode() -> Result<Vec<AdapterDecode>> {
         if name.is_empty() {
             continue;
         }
-        let rank = match props.device_type {
-            vk::PhysicalDeviceType::DISCRETE_GPU => 0u8,
-            vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
-            _ => 2,
-        };
-        let api_1_3 = vk::api_version_major(props.api_version) > 1
-            || vk::api_version_minor(props.api_version) >= 3;
-
-        // Same three features the creation path demands (`features_ok` there).
-        let mut f11 = vk::PhysicalDeviceVulkan11Features::default();
-        let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
-        let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
-        let mut feats = vk::PhysicalDeviceFeatures2::default()
-            .push_next(&mut f11)
-            .push_next(&mut f12)
-            .push_next(&mut f13);
-        // SAFETY: read-only query; the pNext chain locals outlive the call.
-        unsafe { instance.get_physical_device_features2(pdev, &mut feats) };
-        let features_ok = f11.sampler_ycbcr_conversion == vk::TRUE
-            && f12.timeline_semaphore == vk::TRUE
-            && f13.synchronization2 == vk::TRUE;
-
+        let rank = device_rank(&props);
         // SAFETY: read-only query on the live instance; `pdev` was enumerated from it.
         let ext_props =
             unsafe { instance.enumerate_device_extension_properties(pdev) }.unwrap_or_default();
-        let has = |n: &std::ffi::CStr| {
+        let decode = DecodeProbe::of(&instance, pdev, |n: &std::ffi::CStr| {
             ext_props
                 .iter()
                 .any(|e| e.extension_name_as_c_str() == Ok(n))
-        };
-        let base_missing: Vec<String> = VIDEO_BASE
-            .iter()
-            .filter(|n| !has(n))
-            .map(|n| n.to_string_lossy().into_owned())
-            .collect();
-        let codec_exts: Vec<String> = VIDEO_CODECS
-            .iter()
-            .filter(|n| has(n))
-            .map(|n| n.to_string_lossy().into_owned())
-            .collect();
-
-        // Report the family's codec ops even without the extensions: hardware-can vs
-        // driver-does-not-expose is a different answer from "this GPU cannot".
-        // SAFETY: read-only query; length only.
-        let n = unsafe { instance.get_physical_device_queue_family_properties2_len(pdev) };
-        let mut video: Vec<vk::QueueFamilyVideoPropertiesKHR> =
-            vec![vk::QueueFamilyVideoPropertiesKHR::default(); n];
-        let mut qprops: Vec<vk::QueueFamilyProperties2> = video
-            .iter_mut()
-            .map(|v| vk::QueueFamilyProperties2::default().push_next(v))
-            .collect();
-        // SAFETY: read-only query; `qprops` / `video` outlive the call and receive the fill.
-        unsafe { instance.get_physical_device_queue_family_properties2(pdev, &mut qprops) };
-        let flags: Vec<vk::QueueFlags> = qprops
-            .iter()
-            .map(|p| p.queue_family_properties.queue_flags)
-            .collect();
-        drop(qprops);
-        let found = flags
-            .iter()
-            .zip(&video)
-            .enumerate()
-            .find(|(_, (f, _))| f.contains(vk::QueueFlags::VIDEO_DECODE_KHR))
-            .map(|(i, (_, v))| (i as u32, v.video_codec_operations));
-
-        let usable = video_decode_gate(
-            api_1_3,
-            features_ok,
-            found.is_some(),
-            base_missing.is_empty(),
-            !codec_exts.is_empty(),
-        );
+        });
+        let usable = decode.usable();
         // Format queries need `VK_KHR_video_queue` entry points; asking without them
         // is a null dispatch, not an answer.
         let formats = if usable {
@@ -792,12 +875,12 @@ pub fn probe_decode() -> Result<Vec<AdapterDecode>> {
                 index: raw_index,
                 name,
                 discrete: rank == 0,
-                api_1_3,
-                features_ok,
-                decode_family: found.map(|(i, _)| i),
-                codec_ops: found.map_or(0, |(_, ops)| ops.as_raw()),
-                base_missing,
-                codec_exts,
+                api_1_3: decode.api_1_3,
+                features_ok: decode.features_ok,
+                decode_family: decode.family.map(|(i, _)| i),
+                codec_ops: decode.family.map_or(0, |(_, ops)| ops.as_raw()),
+                base_missing: names(&decode.base_missing),
+                codec_exts: names(&decode.codec_exts),
                 usable,
                 formats,
             },
@@ -807,6 +890,12 @@ pub fn probe_decode() -> Result<Vec<AdapterDecode>> {
     // SAFETY: DESTROY — no logical device was created against this instance.
     unsafe { instance.destroy_instance(None) };
     Ok(out.into_iter().map(|(_, a)| a).collect())
+}
+
+fn names(exts: &[&std::ffi::CStr]) -> Vec<String> {
+    exts.iter()
+        .map(|n| n.to_string_lossy().into_owned())
+        .collect()
 }
 
 /// Physical-device marketing names for the shells' GPU picker
@@ -834,11 +923,7 @@ pub fn list_adapters() -> Result<Vec<String>> {
         .map(|d| {
             // SAFETY: read-only query on the live instance; `d` was enumerated from it.
             let props = unsafe { instance.get_physical_device_properties(d) };
-            let rank = match props.device_type {
-                vk::PhysicalDeviceType::DISCRETE_GPU => 0u8,
-                vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
-                _ => 2,
-            };
+            let rank = device_rank(&props);
             let name = props
                 .device_name_as_c_str()
                 .map(|c| c.to_string_lossy().into_owned())
@@ -896,12 +981,7 @@ fn pick_device(
                 Some(_) => 2,
                 None => 0,
             };
-            let type_rank = match props.device_type {
-                vk::PhysicalDeviceType::DISCRETE_GPU => 0,
-                vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
-                _ => 2,
-            };
-            (name_rank, type_rank)
+            (name_rank, device_rank(&props))
         });
     }
     for pdev in candidates {
@@ -921,8 +1001,9 @@ fn pick_device(
     bail!("no Vulkan device with a graphics+present queue family")
 }
 
-/// SDR: BGRA8 UNORM, then RGBA8, then any sRGB-space UNORM, else the first format. UNORM not SRGB —
-/// decoded RGBA is already display-referred; an SRGB blit would re-encode it.
+/// SDR: a 10-bit UNORM, then BGRA8, then RGBA8, then any sRGB-space UNORM, else the first
+/// format. 10-bit first: the console's gradients band in 8. UNORM not SRGB — decoded RGBA is
+/// already display-referred; an SRGB blit would re-encode it.
 /// HDR: a 10-bit UNORM + HDR10/ST.2084 colorspace when the instance ext and surface
 /// offer one; otherwise the shader tonemaps.
 pub(super) fn pick_formats(
@@ -939,7 +1020,12 @@ pub(super) fn pick_formats(
     // SAFETY: read-only query; `pdev` and `surface` are live on this instance.
     let formats = unsafe { surface_i.get_physical_device_surface_formats(pdev, surface) }?;
     let mut sdr = None;
-    for want in [vk::Format::B8G8R8A8_UNORM, vk::Format::R8G8B8A8_UNORM] {
+    for want in [
+        vk::Format::A2B10G10R10_UNORM_PACK32,
+        vk::Format::A2R10G10B10_UNORM_PACK32,
+        vk::Format::B8G8R8A8_UNORM,
+        vk::Format::R8G8B8A8_UNORM,
+    ] {
         if let Some(f) = formats
             .iter()
             .find(|f| f.format == want && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR)

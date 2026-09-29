@@ -42,7 +42,9 @@ import io.unom.punktfunk.kit.RingNav
 import io.unom.punktfunk.kit.Sc2BleLink
 import io.unom.punktfunk.kit.Sc2Device
 import io.unom.punktfunk.kit.SessionAccess
+import io.unom.punktfunk.kit.isExternalDevice
 import io.unom.punktfunk.kit.ringNavForKey
+import io.unom.punktfunk.kit.discovery.HostDiscovery
 import io.unom.punktfunk.kit.link.DeepLinkResult
 import io.unom.punktfunk.kit.link.DeepLinks
 import io.unom.punktfunk.kit.link.HostResolution
@@ -170,8 +172,7 @@ class MainActivity : ComponentActivity() {
     /**
      * One screen's claim on the pad while not streaming: its key/motion observers, consulted for
      * every event before the focus-navigation fallbacks below; a `true` return consumes the event.
-     * Holders are the Skia console shell, [GamepadNavEffect2D] on the Compose screens the console
-     * opens over itself, and the Controllers screen's input test.
+     * Holders are the Skia console shell and the Controllers screen's input test.
      */
     class PadProbes(val key: (KeyEvent) -> Boolean, val motion: (MotionEvent) -> Boolean)
 
@@ -221,36 +222,22 @@ class MainActivity : ComponentActivity() {
     var remotePointer: RemotePointer? = null
 
     /**
+     * Set by the stream's peripherals: capture a USB pad plugged in mid-stream. Called on an
+     * attach and on resume, since the default handler's grant lands after the attach broadcast.
+     */
+    var recaptureUsbPads: (() -> Unit)? = null
+
+    /**
      * Set by [StreamScreen] to its disconnect action. The emergency-exit chord (below) invokes it so a
      * couch user with no keyboard/Back can always leave a stream.
      */
     var requestStreamExit: (() -> Unit)? = null
 
-    /**
-     * Whether the last console input came from a real gamepad (face buttons / stick) vs. a TV D-pad
-     * remote (which has no A/B/X/Y). The console UI reads this to show glyphs the user recognises — pad
-     * face buttons, or a select glyph + arrows for a remote. Compose observes it (a snapshot state).
-     * Defaults to the remote glyphs on a TV (its D-pad remote is the typical first input, and often the
-     * only one) and to gamepad glyphs everywhere else (the console UI on a phone/tablet only activates
-     * via a real controller, so a TV-remote glyph would be a wrong first impression there) — set from
-     * [onCreate] once a [Context] is available, then kept live by real input.
-     */
-    var lastPadIsGamepad by mutableStateOf(true)
-        private set
 
     /**
-     * The glyph family of the controller driving the console UI (Xbox letters / PlayStation shapes /
-     * Nintendo monochrome) — seeded from the first connected pad, then kept live by real input the
-     * same way [lastPadIsGamepad] is. Compose observes it (a snapshot state); the hint bar picks its
-     * button glyphs from it so a DualSense user isn't shown Xbox lettering.
-     */
-    var lastPadStyle by mutableStateOf(Gamepad.PadStyle.GENERIC)
-        private set
-
-    /**
-     * The `InputDevice.id` of the controller driving the console UI, or 0 for none. Kept beside
-     * [lastPadStyle] because the console's menu haptics render on the DRIVING pad's own motors when
-     * it has any — a rumble that comes out of the device you are not holding is worse than none.
+     * The `InputDevice.id` of the controller driving the console UI, or 0 for none. The console's
+     * menu haptics render on the DRIVING pad's own motors when it has any — a rumble that comes out
+     * of the device you are not holding is worse than none.
      * Falls back to the phone body (see `rememberConsoleHaptics`), and to silence on a TV, where
      * neither a remote nor the box has an actuator.
      */
@@ -330,8 +317,6 @@ class MainActivity : ComponentActivity() {
             return
         }
         pendingDeepLink = deepLinkFrom(intent)
-        lastPadIsGamepad = !isTvDevice(this)
-        lastPadStyle = Gamepad.styleFor(Gamepad.firstPad())
         resolveHighRefreshMode()
         setConsoleHighRefreshRate(true) // the console UI wants max refresh; streaming manages its own
         // Dark, transparent system bars regardless of the system theme — our UI is always dark, so
@@ -352,6 +337,9 @@ class MainActivity : ComponentActivity() {
                     UsbManager.ACTION_USB_DEVICE_ATTACHED,
                     UsbManager.ACTION_USB_DEVICE_DETACHED,
                     -> {
+                        if (intent.action == UsbManager.ACTION_USB_DEVICE_ATTACHED) {
+                            recaptureUsbPads?.invoke()
+                        }
                         sc2PermissionAsked = false // a fresh attach may ask once again
                         startSc2MenuNav()
                         dsPermissionAsked = false
@@ -410,8 +398,20 @@ class MainActivity : ComponentActivity() {
     private fun deepLinkFrom(intent: Intent?): String? =
         intent?.takeIf { it.action == Intent.ACTION_VIEW }?.data?.toString()
 
+    // Discovery and its Wi-Fi locks follow the app on screen, whichever shell subscribed.
+    override fun onStart() {
+        super.onStart()
+        HostDiscovery.shared(this).onAppStart()
+    }
+
+    override fun onStop() {
+        HostDiscovery.shared(this).onAppStop()
+        super.onStop()
+    }
+
     override fun onResume() {
         super.onResume()
+        recaptureUsbPads?.invoke()
         startSc2MenuNav()
         maybeAskDsPermission()
     }
@@ -562,8 +562,6 @@ class MainActivity : ComponentActivity() {
      */
     private fun sc2NavKey(keyCode: Int, down: Boolean) {
         if (streamHandle != 0L) return // raced a stream start — the wire path owns input now
-        lastPadIsGamepad = true
-        lastPadStyle = Gamepad.PadStyle.XBOX // Valve pads carry A/B/X/Y in Xbox positions
         val action = if (down) KeyEvent.ACTION_DOWN else KeyEvent.ACTION_UP
         // The console UI navigates through padKeyProbe, not the focus system, so a synthesized
         // key has to reach it exactly like a real one. The Skia probe asks the event's source,
@@ -849,15 +847,9 @@ class MainActivity : ComponentActivity() {
         if (streamHandle != 0L) {
             if (streamKey(event)) return true
         } else {
-            // Note which input the console UI is being driven by, so its glyphs match (a TV remote's
-            // D-pad is not from SOURCE_GAMEPAD; a pad's face buttons / D-pad are) — and, for a real
-            // pad, WHICH pad family, so the glyphs wear its lettering/shapes.
-            if (event.action == KeyEvent.ACTION_DOWN && isConsoleNavKey(event.keyCode)) {
-                lastPadIsGamepad = fromPad(event)
-                if (lastPadIsGamepad) {
-                    lastPadStyle = Gamepad.styleFor(event.device)
-                    lastPadDeviceId = event.deviceId
-                }
+            // The pad driving the console: its motors play the menu haptics.
+            if (event.action == KeyEvent.ACTION_DOWN && isConsoleNavKey(event.keyCode) && fromPad(event)) {
+                lastPadDeviceId = event.deviceId
             }
             // The Controllers debug screen sees pad events before the navigation remap below.
             padKeyProbe?.let { if (it(event)) return true }
@@ -920,6 +912,7 @@ class MainActivity : ComponentActivity() {
                 device.supportsSource(InputDevice.SOURCE_MOUSE_RELATIVE),
             dpad = device.supportsSource(InputDevice.SOURCE_DPAD),
             mousePresent = hasPhysicalMouse(),
+            gestureIsKey = android.os.Build.VERSION.SDK_INT < 36,
         )
         return if (claimed) back else null
     }
@@ -960,8 +953,6 @@ class MainActivity : ComponentActivity() {
             if (dir != lastNavDir) {
                 lastNavDir = dir
                 if (dir != 0) {
-                    lastPadIsGamepad = true // a stick/HAT push can only come from a real gamepad
-                    lastPadStyle = Gamepad.styleFor(event.device)
                     lastPadDeviceId = event.deviceId
                     super.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, dir))
                     super.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, dir))

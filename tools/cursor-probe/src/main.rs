@@ -75,37 +75,26 @@ mod linux {
         println!("cursor-probe: node_id = {}", vout.node_id);
 
         // Encode-backend facts don't matter to the metadata question; all-off = CPU-friendly.
-        let policy = pf_capture::ZeroCopyPolicy {
-            backend_is_vaapi: false,
-            backend_is_gpu: gpu,
-            pyrowave_session: false,
-            native_nv12_session: false,
-            hdr_cuda_ok: false,
-            nvenc_raw_dmabuf: false,
-            gamescope_tiled: false,
-            encoder_modifiers: Vec::new(),
+        let producer = match compositor {
+            pf_vdisplay::Compositor::Kwin => pf_capture::Producer::Kwin,
+            pf_vdisplay::Compositor::Gamescope => pf_capture::Producer::Gamescope,
+            _ => pf_capture::Producer::Other,
         };
-        let kwin = compositor == pf_vdisplay::Compositor::Kwin;
         let mut cap = pf_capture::open_virtual_output(
             vout.remote_fd,
             vout.node_id,
             vout.preferred_mode,
             vout.keepalive,
-            gpu,
-            false,
-            false,
-            false,
-            policy,
-            vout.expect_exact_dims,
-            kwin,
-            compositor == pf_vdisplay::Compositor::Gamescope,
-            if kwin {
-                pf_capture::KWIN_POOL_MIN
-            } else {
-                pf_capture::POOL_MIN
+            pf_capture::VirtualOutputOpts {
+                allow_zerocopy: gpu,
+                expect_exact_dims: vout.expect_exact_dims,
+                producer,
+                policy: pf_capture::ZeroCopyPolicy {
+                    backend_is_gpu: gpu,
+                    ..Default::default()
+                },
+                ..Default::default()
             },
-            kwin.then_some(pf_capture::KWIN_POOL_MAX),
-            kwin && pf_capture::unpaced_capture(),
         )
         .context("attach the PipeWire capturer")?;
         cap.set_active(true);

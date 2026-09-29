@@ -112,27 +112,17 @@ public enum SafeDisplay {
         max(Int(value.rounded(.down)), minimum) / 2 * 2
     }
 
-    /// The box a FULL-SCREEN picture is aspect-fit into on a Mac with a camera housing.
+    /// Whether a full-screen picture of `content` shows bigger over the whole panel than below
+    /// the camera housing — the one case a Mac stream covers the housing.
     ///
-    /// The whole view by default: a full-screen stream is meant to fill the panel, housing and
-    /// all — a thin occluded strip at top centre is the deal the viewer took. The one exception is
-    /// a mode that is EXACTLY this screen's safe-area mode, which was chosen to clear the housing:
-    /// centred in the full panel its top rows land back under the notch, so it fits the shortened
-    /// box and sits flush below instead. Those are the two cases, and the chosen mode is what
-    /// picks between them.
-    ///
-    /// `bounds` is a non-flipped view rect (origin bottom-left), so the top is trimmed off the
-    /// height. Everything the picture is measured against — the fit, the pointer mapping, the
-    /// cursor scale — must use this rect or a click lands the height of the housing off.
-    public static func videoBox(
-        bounds: CGRect, topInsetPoints: Double,
-        content: (width: Int, height: Int)?, safeMode: (width: Int, height: Int)?
-    ) -> CGRect {
-        guard topInsetPoints > 0, let content, let safeMode,
-            content.width == safeMode.width, content.height == safeMode.height
-        else { return bounds }
-        return CGRect(
-            x: bounds.minX, y: bounds.minY,
-            width: bounds.width, height: max(bounds.height - topInsetPoints, 1))
+    /// macOS fullscreen stops below the housing, so covering it costs a custom fullscreen.
+    /// Aspect-fit makes that a pure ratio test: the safe area is exactly as wide as the panel, so
+    /// only a picture taller than the safe area's aspect gains from the extra rows. 16:9, 16:10
+    /// and the below-the-notch mode itself fit the safe area whole and never qualify.
+    public static func coversHousing(
+        content: (width: Int, height: Int),
+        panel: (width: Int, height: Int), safe: (width: Int, height: Int)
+    ) -> Bool {
+        panel.height > safe.height && safe.height * content.width < safe.width * content.height
     }
 }

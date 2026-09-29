@@ -298,9 +298,9 @@ let
         && has appliance "punktfunk-scripting" "InaccessiblePaths=-%h/.config/punktfunk/key.pem";
     }
     {
-      # Everything ProtectHome=tmpfs takes away that the runner genuinely needs. Drop one of these
-      # and the runner comes up unable to authenticate, unable to persist, or with an EMPTY
-      # LIBRARY — on Linux a game library lives in the home the tmpfs just hid.
+      # Everything ProtectHome=tmpfs takes away that the runner itself needs. Drop one of these and
+      # the runner comes up unable to authenticate or persist. Library roots are not listed here:
+      # the host binds them through its 50-plugin-roots.conf drop-in.
       name = "the plugin runner keeps the paths it needs through the empty home";
       ok =
         has appliance "punktfunk-scripting" "BindPaths=-%h/.config/punktfunk/plugins"
@@ -308,16 +308,15 @@ let
         # $XDG_RUNTIME_DIR: the host's live-stream marker, the session bus, compositor sockets.
         && has appliance "punktfunk-scripting" "BindPaths=%t"
         && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/plugin-token"
-        # The supervisor reads these per sandbox; without them no plugin with a manifest starts.
-        && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/plugin-tokens.json"
-        && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/plugin-grants.json"
+        # A directory bind keeps atomic replacements visible; ExecStartPre makes it exist.
+        && has appliance "punktfunk-scripting" "BindReadOnlyPaths=%h/.config/punktfunk/plugin-run"
+        && has appliance "punktfunk-scripting" "bin/mkdir -p -m 0700 %h/.config/punktfunk/plugin-run %h/.config/punktfunk/plugin-state"
         # The TLS pin is native-cert.pem after the identity split, cert.pem before it.
         && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/native-cert.pem"
         && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/cert.pem"
         # Without this a moved listener leaves every plugin dialling 47990 forever.
         && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/mgmt-endpoint"
-        && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/scripts"
-        && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.local/share/Steam";
+        && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/scripts";
     }
     {
       # Without bwrap on its PATH the runner starts no plugin at all, and the library is empty.
@@ -361,13 +360,25 @@ let
       ok = !(has noScripting "punktfunk-host" "/pf-stub/punktfunk-scripting/bin");
     }
 
+    # --- a switch that changes a package restarts the running user services --------------------
+    {
+      name = "a host package change reloads the unit that restarts the user services";
+      ok =
+        let
+          u = desktop.systemd.services.punktfunk-restart-user-units;
+        in
+        lib.elem desktop.services.punktfunk.host.package u.reloadTriggers
+        && lib.hasInfix "restart-user-units" u.serviceConfig.ExecReload;
+    }
+
     # --- the client half must not drag the host's system wiring in -----------------------------
     {
       name = "a client-only machine defines no host/web/scripting units";
       ok =
         !(clientOnly.systemd.user.services ? punktfunk-host)
         && !(clientOnly.systemd.user.services ? punktfunk-web)
-        && !(clientOnly.systemd.user.services ? punktfunk-scripting);
+        && !(clientOnly.systemd.user.services ? punktfunk-scripting)
+        && !(clientOnly.systemd.services ? punktfunk-restart-user-units);
     }
   ];
 

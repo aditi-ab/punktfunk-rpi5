@@ -62,7 +62,9 @@ fi
 # ---------------------------------------------------------------- gate 2: docs env vars exist
 git grep -ohE 'PUNKTFUNK_[A-Z0-9_]+' -- docs-site/content | sort -u > "$tmp/docs-vars"
 while IFS= read -r var; do
-    if ! git grep -qF "$var" -- ':!docs-site' ':!docs/releases' ':!CHANGELOG.md'; then
+    # Read by another repository; listed with its owner.
+    grep -qx "$var" scripts/ci/docs-external-env.txt && continue
+    if ! git grep -qF "$var" -- ':!docs-site' ':!docs/releases' ':!CHANGELOG.md' ':!scripts/ci/docs-external-env.txt'; then
         echo "::error::docs-site documents $var but nothing outside the docs mentions it — the knob was removed or renamed; fix the docs page"
         fail=1
     fi
@@ -92,7 +94,7 @@ fi
 # ---------------------------------------------------------------- gate 4: documented CLI exists
 # First table cell of every row in host-cli.md: subcommands, sub-actions and flags. Multi-word
 # cells (flag + argument) are skipped — they don't map to one string literal.
-grep -E '^\|' docs-site/content/docs/host-cli.md | awk -F'|' '{print $2}' \
+grep -E '^\|' 'docs-site/content/docs/(reference)/host-cli.md' | awk -F'|' '{print $2}' \
     | grep -oE '`[a-z0-9-]+`|`--[a-z-]+`' | tr -d '`' | sort -u > "$tmp/cli-cmds"
 while IFS= read -r cmd; do
     if ! git grep -qF "\"$cmd\"" -- crates/punktfunk-host; then

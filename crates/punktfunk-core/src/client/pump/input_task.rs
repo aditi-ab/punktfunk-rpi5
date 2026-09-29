@@ -15,34 +15,66 @@
 //!
 //! A controller-mouse pad ([`super::super::pad_mouse`]) bypasses the fold: its host snapshot
 //! stays neutral and alive on the refresh, and its events become pointer, scroll and key events.
+//!
+//! Every datagram passes [`send_granted`]: what the live grants refuse never goes out. The host
+//! drops the same classes; the gate runs after the controller-mouse fold, so those pads need
+//! only the pointer grant.
 
-use super::super::pad_mouse::{PadMouse, PadMouseShared, TICK};
+use super::super::pad_mouse::{PadMouse, TICK};
 use super::*;
 use crate::input::scroll::ScrollOutput;
-use crate::input::{GamepadSnapshot, MAX_PADS};
-use std::sync::atomic::AtomicBool;
+use crate::input::{GamepadSnapshot, InputKind, MAX_PADS};
 
-/// What the controller-mouse translator reads beside the input queue.
+/// What the input task reads beside its queue.
 pub(super) struct MouseArgs {
-    pub(super) shared: Arc<PadMouseShared>,
-    /// Live grants: pointer and key outputs each need theirs.
-    pub(super) grants: Arc<AtomicU32>,
-    /// Current stream mode; pointer speed scales with its height.
-    pub(super) mode: Arc<std::sync::Mutex<Mode>>,
-    /// Live invert-scroll toggle ([`NativeClient::set_invert_scroll`]).
-    pub(super) scroll_invert: Arc<AtomicBool>,
+    /// Live grants (pointer and key outputs each need theirs), the stream mode pointer speed
+    /// scales with, the invert-scroll toggle, the pad-mouse request and pad-audio caps.
+    pub(super) client: Arc<ClientShared>,
     /// Host advertised `HOST_CAP2_SCROLL`: normalized events go out unchanged.
     pub(super) normalized_scroll: bool,
+    /// The control stream's writer, toward a host that reads key edges there
+    /// (`HOST_CAP2_INPUT_EDGES`). `None` keeps every event on the datagram plane.
+    pub(super) edges: Option<tokio::sync::mpsc::Sender<CtrlRequest>>,
 }
 
 /// The final outbound gate for every ordinary input event — raw embedder sends
-/// and controller-mouse output share it, so validation, the invert toggle and
-/// the old-host `MouseScroll` conversion each happen exactly once.
+/// and controller-mouse output share it, so validation, the invert toggle, the
+/// old-host `MouseScroll` conversion and the key lane each happen exactly once.
 fn send_input(conn: &quinn::Connection, out: &mut ScrollOutput, args: &MouseArgs, ev: InputEvent) {
     let invert = args
+        .client
         .scroll_invert
         .load(std::sync::atomic::Ordering::Relaxed);
-    if let Some(ev) = out.prepare(ev, invert) {
+    let Some(ev) = out.prepare(ev, invert) else {
+        return;
+    };
+    if !granted(&args.client.access_grants, ev) {
+        return;
+    }
+    // A key edge goes reliable when the host reads it there. A full control queue means
+    // the control task is wedged; the datagram is then the better bet than a stall.
+    if let Some(ctrl) = args.edges.as_ref().filter(|_| is_edge(ev.kind)) {
+        if ctrl.try_send(CtrlRequest::InputEdge(ev)).is_ok() {
+            return;
+        }
+    }
+    let _ = conn.send_datagram(ev.encode().to_vec().into());
+}
+
+/// The kinds whose loss sticks: a release the network drops holds the key.
+fn is_edge(kind: InputKind) -> bool {
+    matches!(kind, InputKind::KeyDown | InputKind::KeyUp)
+}
+
+/// Whether the live grants cover `ev`'s [`crate::quic::classify`] class.
+fn granted(grants: &AtomicU32, ev: InputEvent) -> bool {
+    let grants = grants.load(std::sync::atomic::Ordering::Relaxed);
+    grants & crate::quic::classify(ev.kind).bit() != 0
+}
+
+/// Send `ev` as a datagram when the live grants cover it.
+fn send_granted(conn: &quinn::Connection, grants: &AtomicU32, ev: InputEvent) {
+    if granted(grants, ev) {
         let _ = conn.send_datagram(ev.encode().to_vec().into());
     }
 }
@@ -68,11 +100,14 @@ fn sync_mouse(
     pads: &mut [Option<GamepadSnapshot>; MAX_PADS],
     dirty: &mut [bool; MAX_PADS],
 ) {
-    let grants = args.grants.load(std::sync::atomic::Ordering::Relaxed);
+    let grants = args
+        .client
+        .access_grants
+        .load(std::sync::atomic::Ordering::Relaxed);
     if grants & crate::quic::GRANT_POINTER == 0 {
-        args.shared.clear_all();
+        args.client.pad_mouse.clear_all();
     }
-    let want = args.shared.active(grants);
+    let want = args.client.pad_mouse.active(grants);
     let on = mouse.on_mask();
     for idx in 0..MAX_PADS {
         let bit = 1u16 << idx;
@@ -102,6 +137,7 @@ fn sync_mouse(
 /// One seq-stamped snapshot per pad flagged in `dirty`; clears the flags.
 fn flush_dirty(
     conn: &quinn::Connection,
+    grants: &AtomicU32,
     pads: &mut [Option<GamepadSnapshot>; MAX_PADS],
     seq: &mut [u8; MAX_PADS],
     dirty: &mut [bool; MAX_PADS],
@@ -113,7 +149,7 @@ fn flush_dirty(
         if let Some(snap) = pads[idx].as_mut() {
             seq[idx] = seq[idx].wrapping_add(1);
             snap.seq = seq[idx];
-            let _ = conn.send_datagram(snap.to_event().encode().to_vec().into());
+            send_granted(conn, grants, snap.to_event());
         }
     }
 }
@@ -125,13 +161,12 @@ pub(super) async fn run(
     // HOST_CAP_PAD_AUDIO: only then do arrivals carry flags 8/9. An older host
     // reads the whole flags word as the pad index and would drop the kind.
     pad_audio: bool,
-    // bit0 haptics, bit1 speaker. Fed by [`NativeClient::set_pad_audio_caps`] and
-    // by arrival events that already carry the bits.
-    pad_audio_caps: std::sync::Arc<[std::sync::atomic::AtomicU8; crate::input::MAX_PADS]>,
     mouse_args: MouseArgs,
 ) {
-    use crate::input::InputKind;
     use std::sync::atomic::Ordering;
+    // bit0 haptics, bit1 speaker. Fed by [`NativeClient::set_pad_audio_caps`] and
+    // by arrival events that already carry the bits.
+    let pad_audio_caps = &mouse_args.client.pad_audio_caps;
     let mut mouse = PadMouse::default();
     // One seam for every outbound input event: Scroll stays whole toward a
     // normalized host, converts once to MouseScroll against an older one, and
@@ -184,14 +219,14 @@ pub(super) async fn run(
                     if matches!(ev.kind, InputKind::GamepadButton | InputKind::GamepadAxis)
                         && mouse.is_on(idx)
                     {
-                        flush_dirty(&conn, &mut pads, &mut seq, &mut dirty);
-                        let grants = mouse_args.grants.load(Ordering::Relaxed);
+                        flush_dirty(&conn, &mouse_args.client.access_grants, &mut pads, &mut seq, &mut dirty);
+                        let grants = mouse_args.client.access_grants.load(Ordering::Relaxed);
                         send_all(&conn, &mut scroll_out, &mouse_args, mouse.fold(idx, &ev, grants));
                         continue;
                     }
                     if ev.kind == InputKind::GamepadRemove && mouse.is_on(idx) {
                         send_all(&conn, &mut scroll_out, &mouse_args, mouse.leave(idx));
-                        mouse_args.shared.clear(idx);
+                        mouse_args.client.pad_mouse.clear(idx);
                     }
                     if gamepad_snapshots
                         && matches!(ev.kind, InputKind::GamepadButton | InputKind::GamepadAxis)
@@ -208,7 +243,7 @@ pub(super) async fn run(
                         continue;
                     }
                     // Anything else goes out behind the snapshots folded so far.
-                    flush_dirty(&conn, &mut pads, &mut seq, &mut dirty);
+                    flush_dirty(&conn, &mouse_args.client.access_grants, &mut pads, &mut seq, &mut dirty);
                     if gamepad_snapshots && ev.kind == InputKind::GamepadRemove && idx < MAX_PADS {
                         // Seq-stamped removal in the shared seq space so no reorder resurrects
                         // the pad. Arm the burst; drop owed arrival (a re-plug sends its own).
@@ -221,7 +256,7 @@ pub(super) async fn run(
                             flags: crate::input::encode_gamepad_remove(idx as u8, seq[idx]),
                             ..ev
                         };
-                        let _ = conn.send_datagram(rem.encode().to_vec().into());
+                        send_granted(&conn, &mouse_args.client.access_grants, rem);
                         continue;
                     }
                     if gamepad_snapshots && ev.kind == InputKind::GamepadArrival {
@@ -241,24 +276,24 @@ pub(super) async fn run(
                                 flags: arrival_flags(idx),
                                 ..ev
                             };
-                            let _ = conn.send_datagram(arr.encode().to_vec().into());
+                            send_granted(&conn, &mouse_args.client.access_grants, arr);
                             continue;
                         }
                     }
                     send_input(&conn, &mut scroll_out, &mouse_args, ev);
                 }
-                flush_dirty(&conn, &mut pads, &mut seq, &mut dirty);
+                flush_dirty(&conn, &mouse_args.client.access_grants, &mut pads, &mut seq, &mut dirty);
                 if !mouse.moving() {
                     last_mouse_tick = None;
                 }
                 let live = (0..MAX_PADS)
                     .filter(|&i| pads[i].is_some() || arrival[i].is_some())
                     .fold(0u16, |m, i| m | 1 << i);
-                mouse_args.shared.set_live(live);
+                mouse_args.client.pad_mouse.set_live(live);
             }
-            _ = mouse_args.shared.changed.notified() => {
+            _ = mouse_args.client.pad_mouse.changed.notified() => {
                 sync_mouse(&conn, &mut mouse, &mouse_args, &mut scroll_out, &mut pads, &mut dirty);
-                flush_dirty(&conn, &mut pads, &mut seq, &mut dirty);
+                flush_dirty(&conn, &mouse_args.client.access_grants, &mut pads, &mut seq, &mut dirty);
                 if !mouse.moving() {
                     last_mouse_tick = None;
                 }
@@ -267,8 +302,8 @@ pub(super) async fn run(
                 let now = std::time::Instant::now();
                 let dt = last_mouse_tick.map_or(TICK, |t| now.duration_since(t));
                 last_mouse_tick = Some(now);
-                let height = mouse_args.mode.lock().map(|m| m.height).unwrap_or(0);
-                let grants = mouse_args.grants.load(Ordering::Relaxed);
+                let height = mouse_args.client.mode.lock().map(|m| m.height).unwrap_or(0);
+                let grants = mouse_args.client.access_grants.load(Ordering::Relaxed);
                 send_all(&conn, &mut scroll_out, &mouse_args, mouse.tick(dt.as_secs_f64(), height, grants));
             }
             _ = refresh.tick() => {
@@ -296,7 +331,7 @@ pub(super) async fn run(
                                 y: 0,
                                 flags: arrival_flags(idx),
                             };
-                            let _ = conn.send_datagram(arr.encode().to_vec().into());
+                            send_granted(&conn, &mouse_args.client.access_grants, arr);
                         } else {
                             arrival_owed[idx] = 0;
                         }
@@ -315,10 +350,10 @@ pub(super) async fn run(
                             y: 0,
                             flags: crate::input::encode_gamepad_remove(idx as u8, seq[idx]),
                         };
-                        let _ = conn.send_datagram(rem.encode().to_vec().into());
+                        send_granted(&conn, &mouse_args.client.access_grants, rem);
                     }
                 }
-                flush_dirty(&conn, &mut pads, &mut seq, &mut dirty);
+                flush_dirty(&conn, &mouse_args.client.access_grants, &mut pads, &mut seq, &mut dirty);
             }
         }
     }
@@ -328,7 +363,6 @@ pub(super) async fn run(
 mod tests {
     use super::*;
     use crate::input::{gamepad, InputEvent, InputKind};
-    use std::sync::atomic::AtomicU8;
 
     async fn loopback() -> (quinn::Endpoint, quinn::Connection, quinn::Connection) {
         let server = crate::quic::endpoint::server("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -348,17 +382,86 @@ mod tests {
         (server, client_conn, host_conn)
     }
 
-    fn mouse_args(shared: &Arc<PadMouseShared>) -> MouseArgs {
+    fn client(grants: u32) -> Arc<ClientShared> {
+        let c = ClientShared::new(Mode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+        });
+        c.access_grants.store(grants, Ordering::Relaxed);
+        Arc::new(c)
+    }
+
+    fn mouse_args(client: &Arc<ClientShared>) -> MouseArgs {
         MouseArgs {
-            shared: shared.clone(),
-            grants: Arc::new(AtomicU32::new(crate::quic::GRANT_ALL)),
-            mode: Arc::new(std::sync::Mutex::new(Mode {
-                width: 1920,
-                height: 1080,
-                refresh_hz: 60,
-            })),
-            scroll_invert: Arc::new(AtomicBool::new(false)),
+            client: client.clone(),
             normalized_scroll: true,
+            edges: None,
+        }
+    }
+
+    fn key_up(vk: u32) -> InputEvent {
+        InputEvent {
+            kind: InputKind::KeyUp,
+            ..key_down(vk)
+        }
+    }
+
+    /// Toward a host that reads them, key edges leave on the control stream and nothing
+    /// else does; a closed control lane falls back to the datagram.
+    #[tokio::test]
+    async fn key_edges_take_the_control_stream_when_the_host_reads_them() {
+        let (_server, client_conn, host_conn) = loopback().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::channel(4);
+        let client = client(crate::quic::GRANT_ALL);
+        let args = MouseArgs {
+            edges: Some(ctrl_tx),
+            ..mouse_args(&client)
+        };
+        let task = tokio::spawn(run(client_conn, rx, true, false, args));
+
+        tx.send(key_down(0x41)).unwrap();
+        tx.send(key_up(0x41)).unwrap();
+        tx.send(InputEvent {
+            kind: InputKind::MouseMove,
+            _pad: [0; 3],
+            code: 0,
+            x: 3,
+            y: -2,
+            flags: 0,
+        })
+        .unwrap();
+        for want in [key_down(0x41), key_up(0x41)] {
+            match ctrl_rx.recv().await {
+                Some(CtrlRequest::InputEdge(ev)) => assert_eq!(ev, want),
+                _ => panic!("a key edge on the control lane"),
+            }
+        }
+        let motion = next_event(&host_conn, &[]).await;
+        assert_eq!((motion.kind, motion.x), (InputKind::MouseMove, 3));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), host_conn.read_datagram())
+                .await
+                .is_err(),
+            "no key edge as a datagram"
+        );
+
+        drop(ctrl_rx);
+        tx.send(key_down(0x42)).unwrap();
+        let fallback = next_event(&host_conn, &[]).await;
+        assert_eq!((fallback.kind, fallback.code), (InputKind::KeyDown, 0x42));
+        task.abort();
+    }
+
+    fn key_down(vk: u32) -> InputEvent {
+        InputEvent {
+            kind: InputKind::KeyDown,
+            _pad: [0; 3],
+            code: vk,
+            x: 0,
+            y: 0,
+            flags: 0,
         }
     }
 
@@ -395,9 +498,8 @@ mod tests {
     async fn a_mouse_pad_goes_neutral_and_its_buttons_become_keys() {
         let (_server, client_conn, host_conn) = loopback().await;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let caps = Arc::new(std::array::from_fn(|_| AtomicU8::new(0)));
-        let shared = Arc::new(PadMouseShared::default());
-        let task = tokio::spawn(run(client_conn, rx, true, false, caps, mouse_args(&shared)));
+        let client = client(crate::quic::GRANT_ALL);
+        let task = tokio::spawn(run(client_conn, rx, true, false, mouse_args(&client)));
 
         tx.send(button(gamepad::BTN_A, 0)).unwrap();
         let held = next_event(&host_conn, &[]).await;
@@ -406,7 +508,7 @@ mod tests {
             gamepad::BTN_A
         );
 
-        shared.request(1);
+        client.pad_mouse.request(1);
         // A refresh of the held A may still be in flight; the neutral snapshot follows it.
         loop {
             let snap = GamepadSnapshot::from_event(&next_event(&host_conn, &[]).await)
@@ -425,15 +527,60 @@ mod tests {
         let other = next_event(&host_conn, &[0]).await;
         let other = GamepadSnapshot::from_event(&other).expect("pad 1 forwards");
         assert_eq!((other.pad, other.buttons), (1, gamepad::BTN_A));
-        assert_eq!(shared.live(), 0b11, "both pads are live on the host");
+        assert_eq!(
+            client.pad_mouse.live(),
+            0b11,
+            "both pads are live on the host"
+        );
 
-        shared.request(0);
+        client.pad_mouse.request(0);
         let up = next_event(&host_conn, &[0, 1]).await;
         assert_eq!(
             (up.kind, up.code),
             (InputKind::KeyUp, 0x1B),
             "leaving releases Escape"
         );
+        task.abort();
+    }
+
+    /// A controller-only session sends its pad and never the key queued ahead of it.
+    #[tokio::test]
+    async fn a_key_without_the_keyboard_grant_stays_off_the_wire() {
+        let (_server, client_conn, host_conn) = loopback().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let client = client(crate::quic::GRANT_GAMEPAD);
+        let task = tokio::spawn(run(client_conn, rx, true, false, mouse_args(&client)));
+
+        tx.send(key_down(0x41)).unwrap();
+        tx.send(button(gamepad::BTN_A, 0)).unwrap();
+        let first = next_event(&host_conn, &[]).await;
+        let snap = GamepadSnapshot::from_event(&first).expect("the pad, not the key");
+        assert_eq!((snap.pad, snap.buttons), (0, gamepad::BTN_A));
+        task.abort();
+    }
+
+    /// Without the gamepad grant a pad sends nothing, but a controller-mouse pad still
+    /// drives keys: the gate runs after the fold.
+    #[tokio::test]
+    async fn a_pad_without_the_gamepad_grant_only_reaches_the_host_as_a_mouse() {
+        let (_server, client_conn, host_conn) = loopback().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let client = client(crate::quic::GRANT_POINTER | crate::quic::GRANT_KEYBOARD);
+        client.pad_mouse.request(1);
+        let task = tokio::spawn(run(client_conn, rx, true, false, mouse_args(&client)));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        tx.send(button(gamepad::BTN_B, 0)).unwrap();
+        tx.send(button(gamepad::BTN_A, 1)).unwrap();
+        tx.send(key_down(0x41)).unwrap();
+        for want in [0x1B, 0x41] {
+            let ev = next_event(&host_conn, &[]).await;
+            assert_eq!(
+                (ev.kind, ev.code),
+                (InputKind::KeyDown, want),
+                "no pad snapshot"
+            );
+        }
         task.abort();
     }
 
@@ -444,9 +591,8 @@ mod tests {
     async fn one_pad_report_leaves_as_one_snapshot() {
         let (_server, client_conn, host_conn) = loopback().await;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let caps = Arc::new(std::array::from_fn(|_| AtomicU8::new(0)));
-        let shared = Arc::new(PadMouseShared::default());
-        let task = tokio::spawn(run(client_conn, rx, true, false, caps, mouse_args(&shared)));
+        let client = client(crate::quic::GRANT_ALL);
+        let task = tokio::spawn(run(client_conn, rx, true, false, mouse_args(&client)));
         let axes = [
             (gamepad::AXIS_LS_X, 1_000),
             (gamepad::AXIS_LS_Y, -2_000),

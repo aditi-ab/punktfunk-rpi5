@@ -55,24 +55,42 @@ pub fn load_or_generate() -> Result<String> {
     load_or_generate_impl(ENV_VAR, FILE)
 }
 
-/// One token per installed plugin, by plugin id, in `plugin-tokens.json`.
+/// One token per installed plugin, by plugin id, in `plugin-run/plugin-tokens.json`.
 ///
 /// The shared [`load_or_generate_plugin`] token authenticates the RUNNER; these authenticate a
 /// PLUGIN, which is what lets the management API refuse a plugin writing another's registration.
-/// Ids that disappear (an uninstall) lose their token on the next `serve`.
-pub fn load_or_generate_per_plugin(ids: &[String]) -> Result<BTreeMap<String, String>> {
-    let dir = pf_paths::config_dir();
+/// Keyed by what is installed now: every install path calls this before it restarts the runner.
+pub fn load_or_generate_per_plugin() -> Result<BTreeMap<String, String>> {
+    let ids: Vec<String> = crate::plugins::manifest::installed().into_keys().collect();
+    load_or_generate_per_plugin_in(&pf_paths::config_dir(), &ids)
+}
+
+/// The per-plugin tokens on disk under `config_dir`, or `None` while the file is missing or
+/// mid-rewrite. Never mints: the host reads this when another process minted.
+pub(crate) fn read_per_plugin(config_dir: &Path) -> Option<BTreeMap<String, String>> {
+    let path = config_dir
+        .join(crate::plugins::RUNNER_DATA_DIR)
+        .join(PER_PLUGIN_FILE);
+    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
+}
+
+fn load_or_generate_per_plugin_in(
+    config_dir: &Path,
+    ids: &[String],
+) -> Result<BTreeMap<String, String>> {
+    let dir = config_dir.join(crate::plugins::RUNNER_DATA_DIR);
     let path = dir.join(PER_PLUGIN_FILE);
     let planted = crate::planted::quarantine_planted_secret(&path);
-    pf_paths::create_private_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let mut tokens: BTreeMap<String, String> = if planted {
-        BTreeMap::new()
-    } else {
-        fs::read_to_string(&path)
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
-    };
+    pf_paths::create_secret_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let current = (!planted).then(|| fs::read_to_string(&path).ok()).flatten();
+    let legacy = config_dir.join(PER_PLUGIN_FILE);
+    let migrated =
+        current.is_none() && !crate::planted::quarantine_planted_secret(&legacy) && legacy.exists();
+    let source = current.or_else(|| migrated.then(|| fs::read_to_string(&legacy).ok()).flatten());
+    let mut tokens: BTreeMap<String, String> = source
+        .as_deref()
+        .and_then(|text| serde_json::from_str(text).ok())
+        .unwrap_or_default();
     let before = tokens.clone();
     tokens.retain(|id, _| ids.contains(id));
     for id in ids {
@@ -82,7 +100,7 @@ pub fn load_or_generate_per_plugin(ids: &[String]) -> Result<BTreeMap<String, St
             hex::encode(buf)
         });
     }
-    if tokens != before {
+    if tokens != before || migrated || !path.exists() {
         let body = serde_json::to_string_pretty(&tokens)?;
         pf_paths::write_secret_file(&path, body.as_bytes())
             .with_context(|| format!("write {}", path.display()))?;
@@ -91,6 +109,11 @@ pub fn load_or_generate_per_plugin(ids: &[String]) -> Result<BTreeMap<String, St
             plugins = tokens.len(),
             "minted per-plugin API tokens (owner-only)"
         );
+    }
+    // Unconditional: `create_secret_dir` above resets the directory ACL on Windows even when
+    // the file is unchanged. A failure costs the runner, never `serve`.
+    if let Err(e) = crate::plugins::converge_runner_credential(&path) {
+        tracing::warn!(path = %path.display(), error = %format!("{e:#}"), "runner token grant did not apply");
     }
     Ok(tokens)
 }
@@ -199,5 +222,32 @@ mod tests {
             assert_eq!(mode, 0o600);
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn per_plugin_tokens_migrate_without_rotating() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(PER_PLUGIN_FILE),
+            r#"{"demo":"keep-me","gone":"discard-me"}"#,
+        )
+        .unwrap();
+        let tokens =
+            load_or_generate_per_plugin_in(dir.path(), &["demo".to_string(), "new".to_string()])
+                .unwrap();
+        assert_eq!(tokens.get("demo").map(String::as_str), Some("keep-me"));
+        assert_eq!(tokens.len(), 2);
+        assert!(!tokens.contains_key("gone"));
+        let migrated = fs::read_to_string(
+            dir.path()
+                .join(crate::plugins::RUNNER_DATA_DIR)
+                .join(PER_PLUGIN_FILE),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<BTreeMap<_, _>>(&migrated).unwrap(),
+            tokens
+        );
     }
 }

@@ -14,11 +14,11 @@
 // UIKit is silent for a stationary Pencil, and the host force-releases the stroke after
 // 200 ms without samples (its dead-client failsafe) — the timer keeps a held stroke alive.
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 import PunktfunkCore
 import UIKit
 
-final class PencilStream: NSObject, UIPencilInteractionDelegate {
+final class PencilStream: NSObject {
     enum Phase { case down, move, up, cancel }
 
     /// One assembled batch (≤ `PUNKTFUNK_PEN_BATCH_MAX` samples) ready for the connection.
@@ -120,37 +120,6 @@ final class PencilStream: NSObject, UIPencilInteractionDelegate {
         default:
             return hoverActive
         }
-    }
-
-    // MARK: - UIPencilInteractionDelegate (squeeze → barrel 1 held, tap → barrel 2 click)
-
-    @available(iOS 17.5, *)
-    func pencilInteraction(
-        _ interaction: UIPencilInteraction, didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze
-    ) {
-        switch squeeze.phase {
-        case .began:
-            squeezeHeld = true
-        case .ended, .cancelled:
-            squeezeHeld = false
-        default:
-            return
-        }
-        guard inRange || touching else { return }
-        var s = last
-        s.state = stateBits()
-        emit([s])
-    }
-
-    func pencilInteractionDidTap(_ interaction: UIPencilInteraction) {
-        guard inRange || touching else { return }
-        // A momentary barrel-2 click: press + release as two state-full samples in ONE batch
-        // — the host's tracker emits the button press and release in order.
-        var press = last
-        press.state = stateBits() | UInt8(PUNKTFUNK_PEN_BARREL2)
-        var releaseS = last
-        releaseS.state = stateBits()
-        emit([press, releaseS])
     }
 
     // MARK: - Lifecycle
@@ -292,4 +261,38 @@ final class PencilStream: NSObject, UIPencilInteractionDelegate {
             _reserved: (0, 0, 0))
     }
 }
+
+#if os(iOS)
+// Squeeze → barrel 1 held, tap → barrel 2 click. visionOS has no Apple Pencil interaction.
+extension PencilStream: UIPencilInteractionDelegate {
+    @available(iOS 17.5, *)
+    func pencilInteraction(
+        _ interaction: UIPencilInteraction, didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze
+    ) {
+        switch squeeze.phase {
+        case .began:
+            squeezeHeld = true
+        case .ended, .cancelled:
+            squeezeHeld = false
+        default:
+            return
+        }
+        guard inRange || touching else { return }
+        var s = last
+        s.state = stateBits()
+        emit([s])
+    }
+
+    func pencilInteractionDidTap(_ interaction: UIPencilInteraction) {
+        guard inRange || touching else { return }
+        // A momentary barrel-2 click: press + release as two state-full samples in ONE batch
+        // — the host's tracker emits the button press and release in order.
+        var press = last
+        press.state = stateBits() | UInt8(PUNKTFUNK_PEN_BARREL2)
+        var releaseS = last
+        releaseS.state = stateBits()
+        emit([press, releaseS])
+    }
+}
+#endif
 #endif

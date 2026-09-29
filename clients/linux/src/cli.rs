@@ -42,18 +42,19 @@ pub fn arg_flag(flag: &str) -> bool {
 /// "Open Punktfunk?" prompt ends up invoking. Validation happens later, in the shared parser —
 /// this only decides whether argv contains something addressed to us.
 pub fn deep_link_arg() -> Option<String> {
-    std::env::args().skip(1).find(|a| {
-        let lower = a.to_ascii_lowercase();
-        lower.starts_with("punktfunk://") || lower.starts_with("pf://")
-    })
+    std::env::args()
+        .skip(1)
+        .find(|a| pf_client_core::deeplink::is_link_arg(a))
 }
 
-/// Fullscreen the shell — the Gaming-Mode fallback for a bare launch (streams and the
-/// console library exec the session binary, which handles its own fullscreen). Gaming Mode
-/// means gamescope, never `SteamDeck`: that variable says which MACHINE this is, so it is set
-/// in desktop mode too, where a fullscreen shell is just wrong.
-pub fn fullscreen_mode() -> bool {
-    arg_flag("--fullscreen") || pf_client_core::gamescope::under_gamescope()
+/// A bare launch under Gaming Mode opens the console, not the desktop shell. Gaming Mode
+/// means gamescope, never `SteamDeck`: that variable names the machine, so it is set in
+/// desktop mode too.
+pub fn couch_launch() -> bool {
+    cfg!(feature = "console")
+        && pf_client_core::gamescope::under_gamescope()
+        && deep_link_arg().is_none()
+        && shot_scene().is_none()
 }
 
 /// Split `host[:port]`: no colon defaults the port to 9777; a colon with an unparsable
@@ -77,8 +78,9 @@ fn parse_host_port(target: &str) -> (String, Option<u16>) {
 
 /// `--connect` / `--browse`: streams and the console library live in the
 /// `punktfunk-session` Vulkan binary — replace this process with it, forwarding the
-/// relevant argv verbatim. This keeps the Decky wrapper (which launches the SHELL with
-/// these flags) working unchanged until it's repointed at the session binary.
+/// relevant argv verbatim. With neither flag (a [`couch_launch`]) it opens the console home.
+/// This keeps the Decky wrapper (which launches the SHELL with these flags) working unchanged
+/// until it's repointed at the session binary.
 pub fn exec_session() -> glib::ExitCode {
     use std::os::unix::process::CommandExt as _;
     let forward = [
@@ -107,6 +109,9 @@ pub fn exec_session() -> glib::ExitCode {
                 }
             }
         }
+    }
+    if !arg_flag("--browse") && arg_value("--connect").is_none() {
+        cmd.arg("--browse");
     }
     let err = cmd.exec(); // only returns on failure
     eprintln!("exec punktfunk-session: {err}");
@@ -245,8 +250,9 @@ fn headless_omarchy_menu(verb: &str) -> glib::ExitCode {
 }
 
 /// `--set-host <fp|host[:port]> [--host-label NAME] [--addr ADDR] [--port PORT]` — edit a saved
-/// host: rename and/or re-point its address. Identified by fingerprint (survives IP changes) or
-/// current address. Prints `updated <name>`; fails if nothing matched.
+/// host: rename and/or re-point its address, remembering the address it leaves. Identified by
+/// fingerprint (survives IP changes) or current address. Prints `updated <name>`; fails if
+/// nothing matched.
 pub fn headless_set_host(selector: &str) -> glib::ExitCode {
     let sel = parse_selector(selector);
     let mut known = KnownHosts::load();
@@ -259,14 +265,14 @@ pub fn headless_set_host(selector: &str) -> glib::ExitCode {
             h.name = name;
         }
     }
-    if let Some(addr) = arg_value("--addr").map(|a| a.trim().to_string()) {
-        if !addr.is_empty() {
-            h.addr = addr;
-        }
-    }
-    if let Some(port) = arg_value("--port").and_then(|p| p.trim().parse::<u16>().ok()) {
-        h.port = port;
-    }
+    let addr = arg_value("--addr")
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+        .unwrap_or_else(|| h.addr.clone());
+    let port = arg_value("--port")
+        .and_then(|p| p.trim().parse::<u16>().ok())
+        .unwrap_or(h.port);
+    h.move_to(&addr, port);
     let label = h.name.clone();
     match known.save() {
         Ok(()) => {
@@ -280,8 +286,9 @@ pub fn headless_set_host(selector: &str) -> glib::ExitCode {
     }
 }
 
-/// `--forget-host <fp|host[:port]>` — remove a saved host (drops the pinned fingerprint; a later
-/// connect must re-pair/trust). Prints `forgot N`; succeeds even if nothing matched (idempotent).
+/// `--forget-host <fp|host[:port]>` — remove a saved host, its cached catalog and a default
+/// pointing at it (a later connect must re-pair/trust). Prints `forgot N`; succeeds even if
+/// nothing matched (idempotent).
 ///
 /// An address naming two PINNED records is refused: both OS installs of a dual-boot box answer
 /// at one lease, and forgetting a host is not undoable. The fingerprint selects one of them.
@@ -306,16 +313,16 @@ pub fn headless_forget_host(selector: &str) -> glib::ExitCode {
             return glib::ExitCode::FAILURE;
         }
     }
-    let before = known.hosts.len();
-    known.hosts.retain(|h| !sel.matches(h));
-    let removed = before - known.hosts.len();
-    if removed > 0 {
-        if let Err(e) = known.save() {
+    let hits: Vec<usize> = (0..known.hosts.len())
+        .filter(|&i| sel.matches(&known.hosts[i]))
+        .collect();
+    for &i in hits.iter().rev() {
+        if let Err(e) = pf_client_core::orchestrate::forget_host(&mut known, i) {
             eprintln!("forget-host: {e:#}");
             return glib::ExitCode::FAILURE;
         }
     }
-    println!("forgot {removed}");
+    println!("forgot {}", hits.len());
     glib::ExitCode::SUCCESS
 }
 

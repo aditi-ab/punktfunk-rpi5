@@ -26,6 +26,26 @@ impl ChannelBroker {
         Ok(Self { process, wudf_pid })
     }
 
+    /// Raise WUDFHost's GPU scheduling class. The driver's encoder submits its GPU work
+    /// there, so the host's own class covers none of it. Best-effort. `self.process` keeps
+    /// the verified WUDFHost alive, so `wudf_pid` cannot name another process meanwhile.
+    pub(super) fn raise_gpu_priority(&self) {
+        // SAFETY: plain open by pid; the result is checked before use.
+        let h = match unsafe { OpenProcess(PROCESS_SET_INFORMATION, false, self.wudf_pid) } {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(wudf_pid = self.wudf_pid, error = %e, "WUDFHost GPU priority not raised");
+                return;
+            }
+        };
+        // SAFETY: `h` was just opened here; `OwnedHandle` becomes its sole owner.
+        let owned = unsafe { OwnedHandle::from_raw_handle(h.0 as _) };
+        // SAFETY: `owned` is live for the call and carries PROCESS_SET_INFORMATION.
+        unsafe {
+            pf_frame::dxgi::elevate_gpu_priority_of(HANDLE(owned.as_raw_handle()), "WUDFHost")
+        };
+    }
+
     /// `SYNCHRONIZE` wait: signaled ⇔ WUDFHost exited. A dead driver and an idle desktop
     /// both just stop advancing the source counter, so this is the only death signal.
     pub(super) fn driver_alive(&self) -> bool {
@@ -37,22 +57,19 @@ impl ChannelBroker {
     /// Duplicate `h` into the WUDFHost table. The returned value is valid only there.
     /// `Some(rights)` grants exactly those rights; `None` copies the source
     /// (`DUPLICATE_SAME_ACCESS`).
-    ///
-    /// # Safety
-    /// `h` must be a live handle of the current process.
-    pub(super) unsafe fn dup_into(&self, h: HANDLE, access: Option<u32>) -> Result<u64> {
+    pub(super) fn dup_into(&self, h: BorrowedHandle<'_>, access: Option<u32>) -> Result<u64> {
         let mut out = HANDLE::default();
         let (desired, options) = match access {
             Some(rights) => (rights, DUPLICATE_HANDLE_OPTIONS(0)),
             None => (0, DUPLICATE_SAME_ACCESS),
         };
-        // SAFETY: `h` is live per the contract; `self.process` is the live PROCESS_DUP_HANDLE
+        // SAFETY: `h` is borrowed, so live; `self.process` is the live PROCESS_DUP_HANDLE
         // target; `&mut out` is a valid out-param. Explicit mask (options == 0) or
         // `DUPLICATE_SAME_ACCESS` (desired ignored) — never both.
         unsafe {
             DuplicateHandle(
                 GetCurrentProcess(),
-                h,
+                HANDLE(h.as_raw_handle()),
                 HANDLE(self.process.as_raw_handle()),
                 &mut out,
                 desired,
@@ -66,12 +83,8 @@ impl ChannelBroker {
 
     /// Duplicate a cursor section into WUDFHost with the same `SECTION_MAP_RW` as the
     /// AU section.
-    ///
-    /// # Safety
-    /// `h` must be a live handle of the current process.
-    pub(super) unsafe fn dup_into_public(&self, h: HANDLE) -> Result<u64> {
-        // SAFETY: forwarded — `h` is live per this fn's contract.
-        unsafe { self.dup_into(h, Some(SECTION_MAP_RW)) }
+    pub(super) fn dup_into_public(&self, h: BorrowedHandle<'_>) -> Result<u64> {
+        self.dup_into(h, Some(SECTION_MAP_RW))
     }
 
     /// Failure-path reaper for a cursor-channel duplicate the driver never adopted.

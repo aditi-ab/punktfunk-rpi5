@@ -28,98 +28,113 @@ import { useEffect, useSyncExternalStore } from "react";
 import { getListPairedClientsQueryKey } from "@/api/gen/clients/clients";
 import { getGetDiagnosticsQueryKey } from "@/api/gen/diagnostics/diagnostics";
 import { getGetDisplayStateQueryKey } from "@/api/gen/display/display";
+import { getGetEmulatorsQueryKey } from "@/api/gen/emulators/emulators";
 import {
 	getGetHostSettingsQueryKey,
 	getGetStatusQueryKey,
 } from "@/api/gen/host/host";
-import { getGetLibraryQueryKey } from "@/api/gen/library/library";
+import {
+	getGetLibraryPageQueryKey,
+	getGetLibraryQueryKey,
+	getListLibraryScannersQueryKey,
+} from "@/api/gen/library/library";
 import {
 	getListNativeClientsQueryKey,
 	getListPendingDevicesQueryKey,
 } from "@/api/gen/native/native";
 import { getGetPairingStatusQueryKey } from "@/api/gen/pairing/pairing";
 import { getGetPluginAccessQueryKey } from "@/api/gen/plugin-access/plugin-access";
+import { getListPluginsQueryKey } from "@/api/gen/plugins/plugins";
 import { getGetRecentSessionsQueryKey } from "@/api/gen/session/session";
+import {
+	getGetPluginCatalogQueryKey,
+	getGetPluginRuntimeQueryKey,
+	getListInstalledPluginsQueryKey,
+} from "@/api/gen/store/store";
 import { getGetUpdateStatusQueryKey } from "@/api/gen/update/update";
-import { boostPluginPolling, PLUGINS_KEY } from "@/api/plugins";
-import { storeKeys } from "@/api/store";
+import { boostPluginPolling } from "@/api/plugins";
+import { HOST_EVENT_KINDS, type HostEventKind } from "@/lib/event-kinds";
 import { m } from "@/paraglide/messages";
 import { type ActivityEntry, mergeActivity } from "./activity-ring";
 
 export type { ActivityEntry } from "./activity-ring";
 
-/** Snapshots invalidated by one event kind. `plugins.changed` also refreshes folder access;
- * unknown kinds stay ignored, and generated helpers supply React Query's readonly keys. */
-function keysFor(kind: string): readonly (readonly unknown[])[] {
-	const status = [getGetStatusQueryKey()];
-	switch (kind) {
-		// Anything that changes what the host is doing right now moves the dashboard's status.
-		case "client.connected":
-		case "client.disconnected":
-		case "session.started":
-		case "stream.started":
-		case "stream.stopped":
-		case "game.running":
-		case "game.exited":
-			return status;
-		// Plus the summary card: a session that just ended is the one it exists to show.
-		case "session.ended":
-			return [...status, getGetRecentSessionsQueryKey()];
-		// A display appearing or going away changes the live list, and its policy card shows
-		// "in effect" values derived from the same state.
-		case "display.created":
-		case "display.released":
-			return [...status, getGetDisplayStateQueryKey()];
-		// A knock (and a denial clearing one) changes the pending list itself — which is the one
-		// an operator sits and waits on. It used to refresh only on its own 10 s timer.
-		case "pairing.pending":
-		case "pairing.denied":
-			return [
-				...status,
-				getGetPairingStatusQueryKey(),
-				getListPendingDevicesQueryKey(),
-			];
-		// A completed pairing also adds a device to whichever plane's list is on screen.
-		case "pairing.completed":
-			return [
-				...status,
-				getGetPairingStatusQueryKey(),
-				getListPairedClientsQueryKey(),
-				getListNativeClientsQueryKey(),
-			];
-		// The base key with no params is a PREFIX of every parameterised library query, and React
-		// Query invalidates by prefix — so this catches the Dashboard's and the Library page's alike.
-		case "library.changed":
-			return [getGetLibraryQueryKey()];
-		case "update.available":
-		case "update.applied":
-			return [getGetUpdateStatusQueryKey()];
-		// Registration and folder-access changes move plugin views; store changes move packages.
-		case "plugins.changed":
-			return [
-				PLUGINS_KEY,
-				storeKeys.catalog,
-				storeKeys.installed,
-				storeKeys.runtime,
-				getGetPluginAccessQueryKey(),
-			];
-		case "store.changed":
-			return [
-				PLUGINS_KEY,
-				storeKeys.catalog,
-				storeKeys.installed,
-				storeKeys.runtime,
-			];
-		// A restart-class change also moves the restart-pending check on Home.
-		case "settings.changed":
-			return [getGetHostSettingsQueryKey(), getGetDiagnosticsQueryKey()];
-		// The host came back: everything we hold predates it.
-		case "host.started":
-			return [];
-		default:
-			return [];
-	}
-}
+const STATUS = [getGetStatusQueryKey()];
+const PACKAGES = [
+	getListPluginsQueryKey(),
+	getGetPluginCatalogQueryKey(),
+	getListInstalledPluginsQueryKey(),
+	getGetPluginRuntimeQueryKey(),
+];
+
+/**
+ * Snapshots each kind invalidates, keyed by the generated union so a kind the host adds fails the
+ * typecheck until it is listed here. `host.started` names none: `resyncAll` covers it.
+ */
+const INVALIDATES = {
+	// Anything that changes what the host is doing right now moves the dashboard's status.
+	"client.connected": STATUS,
+	"client.disconnected": STATUS,
+	"session.started": STATUS,
+	// Plus the summary card: a session that just ended is the one it exists to show.
+	"session.ended": [...STATUS, getGetRecentSessionsQueryKey()],
+	"stream.started": STATUS,
+	"stream.stopped": STATUS,
+	"game.launching": STATUS,
+	"game.running": STATUS,
+	"game.window": [],
+	"game.exited": STATUS,
+	// A knock (and a denial clearing one) changes the pending list the operator waits on.
+	"pairing.pending": [
+		...STATUS,
+		getGetPairingStatusQueryKey(),
+		getListPendingDevicesQueryKey(),
+	],
+	"pairing.denied": [
+		...STATUS,
+		getGetPairingStatusQueryKey(),
+		getListPendingDevicesQueryKey(),
+	],
+	// A completed pairing also adds a device to whichever plane's list is on screen.
+	"pairing.completed": [
+		...STATUS,
+		getGetPairingStatusQueryKey(),
+		getListPairedClientsQueryKey(),
+		getListNativeClientsQueryKey(),
+	],
+	"access.granted": [getListNativeClientsQueryKey()],
+	"access.changed": [getListNativeClientsQueryKey()],
+	"access.expired": [getListNativeClientsQueryKey()],
+	// The live list, and the policy card's "in effect" values derived from the same state.
+	"display.created": [...STATUS, getGetDisplayStateQueryKey()],
+	"display.released": [...STATUS, getGetDisplayStateQueryKey()],
+	// Each bare key prefixes its parameterised queries; the pages have a key of their own.
+	// The source list counts entries per provider, so it moves with the library.
+	"library.changed": [
+		getGetLibraryQueryKey(),
+		getGetLibraryPageQueryKey(),
+		getListLibraryScannersQueryKey(),
+	],
+	"emulators.changed": [getGetEmulatorsQueryKey()],
+	"update.available": [getGetUpdateStatusQueryKey()],
+	"update.applied": [getGetUpdateStatusQueryKey()],
+	// Registration and folder-access changes move plugin views; a new pending request can add a
+	// source line, so the source list moves too.
+	"plugins.changed": [
+		...PACKAGES,
+		getGetPluginAccessQueryKey(),
+		getListLibraryScannersQueryKey(),
+	],
+	"store.changed": PACKAGES,
+	// A restart-class change also moves the restart-pending check on Home.
+	"settings.changed": [
+		getGetHostSettingsQueryKey(),
+		getGetDiagnosticsQueryKey(),
+	],
+	"action.invoked": [],
+	"host.started": [],
+	"host.stopping": [],
+} satisfies Record<HostEventKind, readonly (readonly unknown[])[]>;
 
 /**
  * Mark one key's data wrong and refetch it.
@@ -197,30 +212,6 @@ export function useActivityReady(): boolean {
 	);
 }
 
-/** Every kind we act on. A kind the host adds later simply has no listener — never a mis-handle. */
-const KINDS = [
-	"client.connected",
-	"client.disconnected",
-	"session.started",
-	"session.ended",
-	"stream.started",
-	"stream.stopped",
-	"game.running",
-	"game.exited",
-	"pairing.pending",
-	"pairing.completed",
-	"pairing.denied",
-	"display.created",
-	"display.released",
-	"library.changed",
-	"update.available",
-	"update.applied",
-	"plugins.changed",
-	"store.changed",
-	"settings.changed",
-	"host.started",
-] as const;
-
 // ---------------------------------------------------------------------------------------------
 // The connection is a module-level singleton, refcounted, NOT a per-component resource.
 //
@@ -271,9 +262,10 @@ function startReplay(): void {
 }
 
 /** Note what a replayed frame WOULD have done, deduplicated, instead of doing it now. */
-function holdReplayed(kind: string, entry: ActivityEntry | null): void {
+function holdReplayed(kind: HostEventKind, entry: ActivityEntry | null): void {
 	if (entry) replayed.push(entry);
-	for (const key of keysFor(kind)) replayedKeys.set(JSON.stringify(key), key);
+	for (const key of INVALIDATES[kind])
+		replayedKeys.set(JSON.stringify(key), key);
 	if (kind === "plugins.changed" || kind === "store.changed")
 		replayedBoost = true;
 	if (kind === "host.started") replayedResync = true;
@@ -311,7 +303,8 @@ function attach(): void {
 	// Every (re)connect replays first; `open` fires before any frame, on auto-reconnect too.
 	source.addEventListener("open", startReplay);
 	source.addEventListener("live", finishReplay);
-	for (const kind of KINDS) {
+	// Every kind the generated union names, so the feed records each one the host publishes.
+	for (const kind of HOST_EVENT_KINDS) {
 		source.addEventListener(kind, (ev) => {
 			const entry = parseEntry(kind, ev);
 			if (!live) {
@@ -329,7 +322,7 @@ function attach(): void {
 			// checking for a while rather than trusting this one refetch (see boostPluginPolling).
 			if (kind === "plugins.changed" || kind === "store.changed")
 				boostPluginPolling();
-			for (const key of keysFor(kind)) invalidate(client, key);
+			for (const key of INVALIDATES[kind]) invalidate(client, key);
 			// `host.started` names no keys — the host is NEW, so everything we hold predates it.
 			if (kind === "host.started") resyncAll(client);
 		});

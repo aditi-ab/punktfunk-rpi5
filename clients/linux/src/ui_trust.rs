@@ -1,7 +1,6 @@
 //! The trust dialogs in front of a connect: TOFU, the SPAKE2 PIN ceremony, and
-//! delegated (request-access) approval. The trust GATE itself (rules 1–3) lives in
-//! `AppModel::update` (`AppMsg::Connect`); these are the interaction surfaces it opens,
-//! each resolving into typed [`AppMsg`]s.
+//! delegated (request-access) approval. The trust GATE itself is `orchestrate::trust_route`;
+//! `AppModel::connect` opens these surfaces for it, each resolving into typed [`AppMsg`]s.
 
 use crate::app::{AppModel, AppMsg};
 use crate::spawn::{CancelHandle, SpawnOpts};
@@ -19,15 +18,13 @@ pub type WaitingSlot =
     std::rc::Rc<std::cell::RefCell<Option<(adw::AlertDialog, glib::SignalHandlerId)>>>;
 
 /// Wake-and-wait: the FALLBACK after a failed dial to a non-advertising saved host with a
-/// known MAC (`AppMsg::WakeConnect` dials first — mDNS absence ≠ unreachable). The host is
-/// sent a magic packet, then we poll mDNS until it comes back online — re-sending every few
-/// seconds up to a timeout — and route back into the trust gate, **re-keying the saved
-/// record if the host woke on a new DHCP IP** (matched by fingerprint). A "Waking…" dialog
+/// known MAC (`AppMsg::WakeConnect` dials first — mDNS absence ≠ unreachable). A magic packet,
+/// then mDNS polled until the host advertises — re-sending every few seconds up to a timeout —
+/// and back into the trust gate, dialling the address it came back on. A "Waking…" dialog
 /// lets the user cancel.
 ///
-/// The cadence itself is [`WakeWait`] — the same state machine the WinUI shell drives, ported
-/// from Apple's `HostWaker` (design/client-architecture-split.md §3). What is left here is the
-/// GTK half: the dialog, the advert drain, the re-key, and the route back into the trust gate.
+/// The cadence is [`WakeWait`] and the advert match `AdvertWatch`, both shared with the WinUI
+/// shell (design/client-architecture-split.md §3).
 pub fn wake_and_connect(
     window: &adw::ApplicationWindow,
     sender: &ComponentSender<AppModel>,
@@ -52,33 +49,15 @@ pub fn wake_and_connect(
     let sender = sender.clone();
     glib::spawn_future_local(async move {
         use std::time::Duration;
-        let (events, rescan) = crate::discovery::browse();
+        let mut adverts = crate::discovery::AdvertWatch::start();
         let mut wait = WakeWait::new();
-        // A waking host starts advertising at a moment we can't predict, and `mdns-sd`'s own
-        // re-query interval has doubled well past a minute by the time a boot finishes — so ask
-        // again periodically instead of waiting to be told. Every 5th tick: often enough that a
-        // host that came up is noticed promptly, rare enough not to hammer multicast.
-        let mut ticks: u32 = 0;
         loop {
             if cancel.get() {
                 waiting.close();
                 return;
             }
-            // Drain resolved adverts; a match (fingerprint, else addr:port) means it is up,
-            // and carries the address it came back on.
-            let mut seen: Option<(String, u16)> = None;
-            while let Ok(ev) = events.try_recv() {
-                let crate::discovery::DiscoveryEvent::Resolved(h) = ev else {
-                    continue;
-                };
-                let matched = match &req.fp_hex {
-                    Some(fp) => !h.fp_hex.is_empty() && &h.fp_hex == fp,
-                    None => h.addr == req.addr && h.port == req.port,
-                };
-                if matched {
-                    seen = Some((h.addr, h.port));
-                }
-            }
+            // A match carries the address the host came back on.
+            let seen = adverts.poll(req.fp_hex.as_deref(), &req.addr, req.port);
             let tick = wait.tick(seen.is_some());
             if tick.send_packet {
                 crate::wol::wake(&req.mac, req.addr.parse().ok());
@@ -107,10 +86,6 @@ pub fn wake_and_connect(
                     return;
                 }
                 None => {}
-            }
-            ticks += 1;
-            if ticks % 5 == 0 {
-                rescan.request();
             }
             glib::timeout_future(Duration::from_secs(1)).await;
         }
@@ -247,7 +222,8 @@ pub fn pin_dialog(
             match rx.recv().await {
                 Ok(Ok(fp)) => {
                     let fp_hex = trust::hex(&fp);
-                    let saved = trust::persist_host(&req.name, &req.addr, req.port, &fp_hex, true);
+                    let saved =
+                        trust::persist_host(&req.name, &req.addr, req.port, &fp_hex, true, &[]);
                     sender.input(AppMsg::Toast(match saved {
                         Ok(()) => "Paired — connecting…".into(),
                         // The ceremony succeeded and this session will connect; the pairing

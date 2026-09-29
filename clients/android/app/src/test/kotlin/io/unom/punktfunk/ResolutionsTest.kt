@@ -58,6 +58,26 @@ class ResolutionsTest {
         assertEquals(Resolutions.ASPECTS.size, Resolutions.families(1920 to 1080, 1920 to 1080).size)
     }
 
+    /** `clients/shared/custom-resolution-vectors.json`: every client clamps a typed size alike. */
+    @Test
+    fun customMatchesTheSharedVectors() {
+        // Gradle runs unit tests with the module dir as cwd (clients/android/app).
+        val file = java.io.File("../../shared/custom-resolution-vectors.json")
+        assertTrue("the shared vector file must be reachable at ${file.absolutePath}", file.isFile)
+        val cases = org.json.JSONObject(file.readText()).getJSONArray("custom")
+        assertTrue("the vector file is the contract; keep it rich", cases.length() >= 10)
+        for (i in 0 until cases.length()) {
+            val case = cases.getJSONObject(i)
+            val typed = case.getJSONArray("typed")
+            val want = case.getJSONArray("want")
+            assertEquals(
+                case.getString("name"),
+                want.getInt(0) to want.getInt(1),
+                Resolutions.custom(typed.getInt(0), typed.getInt(1), case.getString("codec")),
+            )
+        }
+    }
+
     @Test
     fun customIsWhatNoFamilyLists() {
         assertTrue(Settings(width = 1500, height = 1000).isCustomResolution())

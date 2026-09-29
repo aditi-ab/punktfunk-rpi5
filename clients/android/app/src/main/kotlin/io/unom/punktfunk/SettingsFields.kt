@@ -66,6 +66,10 @@ internal object SettingsFields {
             overlay({ it.statsVerbosity }, { o, v -> o.copy(statsVerbosity = v) }),
             console = Console(EnumKind(StatsVerbosity.entries) { it.name.lowercase() })),
         field("advancedStats", "advanced_stats", BoolKind, { it.advancedStats }, { s, v -> s.copy(advancedStats = v) }),
+        field("hudPlacement", "hud_placement", StrKind, { it.hudPlacement }, { s, v -> s.copy(hudPlacement = v) }),
+        field("statsScalePct", "stats_scale_pct", IntKind, { it.statsScalePct }, { s, v -> s.copy(statsScalePct = v) }),
+        field("exitHint", "exit_hint", BoolKind, { it.exitHint }, { s, v -> s.copy(exitHint = v) }),
+        field("showAdvanced", "show_advanced", BoolKind, { it.showAdvanced }, { s, v -> s.copy(showAdvanced = v) }),
         field("touchMode", "touch_mode", TouchModeKind, { it.touchMode }, { s, v -> s.copy(touchMode = v) },
             overlay({ it.touchMode }, { o, v -> o.copy(touchMode = v) }),
             console = Console(EnumKind(TouchMode.entries) { it.name.lowercase() })),
@@ -163,6 +167,10 @@ internal object SettingsFields {
         fun overlayToConsoleJson(o: SettingsOverlay, j: JSONObject) {
             overlay?.get?.invoke(o)?.let { consoleKind.write(j, consoleKey, it) }
         }
+
+        /** The console's saved override for this field, set or cleared. */
+        fun overlayFromConsoleJson(o: SettingsOverlay, j: JSONObject): SettingsOverlay =
+            overlay?.set?.invoke(o, consoleKind.read(j, consoleKey)) ?: o
 
         private val consoleKey get() = console?.key ?: key
         private val consoleKind get() = console?.kind ?: kind

@@ -7,12 +7,6 @@ import VideoToolbox
 import XCTest
 @testable import PunktfunkKit
 
-private final class FrameBox: @unchecked Sendable {
-    let lock = NSLock()
-    var frame: ReadyFrame?
-    var error: OSStatus?
-}
-
 final class Stage444Tests: XCTestCase {
     /// The capability probe is device-static and cached — reading it twice must return the same value
     /// (and must never crash, including where 4:4:4 is unsupported → false).
@@ -36,21 +30,10 @@ final class Stage444Tests: XCTestCase {
             VideoDecoder.isHDRFormat(format), "the probe blob carries no PQ/HLG transfer")
         let au = AccessUnit(data: data, ptsNs: 9_000_000, frameIndex: 0, flags: 0, receivedNs: 0)
 
-        let box = FrameBox()
-        let done = DispatchSemaphore(value: 0)
-        let decoder = VideoDecoder(
-            onDecoded: { f in box.lock.lock(); box.frame = f; box.lock.unlock(); done.signal() },
-            onDecodeError: { s in box.lock.lock(); box.error = s; box.lock.unlock(); done.signal() })
-        decoder.setChroma444(true)
-        decoder.setBitDepth(10)
-
-        XCTAssertTrue(decoder.decode(au: au, format: format), "10-bit frame submit should succeed")
-        XCTAssertEqual(done.wait(timeout: .now() + 10), .success, "the decode callback must fire")
-        decoder.reset()
-
-        box.lock.lock(); let frame = box.frame; let error = box.error; box.lock.unlock()
-        XCTAssertNil(error.map { "decode error \($0)" })
-        let ready = try XCTUnwrap(frame, "a 10-bit ReadyFrame must be delivered")
+        let ready = try decodeOnce(au, format: format) { decoder in
+            decoder.setChroma444(true)
+            decoder.setBitDepth(10)
+        }
         guard case .video(let buffer, let isHDR) = ready.image else {
             return XCTFail("a VideoToolbox decode must deliver a .video frame")
         }
@@ -74,20 +57,7 @@ final class Stage444Tests: XCTestCase {
             AnnexB.formatDescription(fromIDR: data, codec: .hevc), "the 4:4:4 blob must yield a format description")
         let au = AccessUnit(data: data, ptsNs: 7_000_000, frameIndex: 0, flags: 0, receivedNs: 0)
 
-        let box = FrameBox()
-        let done = DispatchSemaphore(value: 0)
-        let decoder = VideoDecoder(
-            onDecoded: { f in box.lock.lock(); box.frame = f; box.lock.unlock(); done.signal() },
-            onDecodeError: { s in box.lock.lock(); box.error = s; box.lock.unlock(); done.signal() })
-        decoder.setChroma444(true)
-
-        XCTAssertTrue(decoder.decode(au: au, format: format), "4:4:4 frame submit should succeed")
-        XCTAssertEqual(done.wait(timeout: .now() + 10), .success, "the decode callback must fire")
-        decoder.reset()
-
-        box.lock.lock(); let frame = box.frame; let error = box.error; box.lock.unlock()
-        XCTAssertNil(error.map { "decode error \($0)" })
-        let ready = try XCTUnwrap(frame, "a 4:4:4 ReadyFrame must be delivered")
+        let ready = try decodeOnce(au, format: format) { $0.setChroma444(true) }
         guard case .video(let buffer, let isHDR) = ready.image else {
             return XCTFail("a VideoToolbox decode must deliver a .video frame")
         }

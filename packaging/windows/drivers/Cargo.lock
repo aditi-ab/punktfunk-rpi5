@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "libvpl-sys"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "bindgen",
  "cmake",
@@ -694,6 +694,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "pf-dmabuf"
+version = "0.41.0"
+dependencies = [
+ "libc",
+ "rustix",
+]
+
+[[package]]
 name = "pf-driver-proto"
 version = "0.0.1"
 dependencies = [
@@ -701,13 +709,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-encode-core"
+version = "0.41.0"
+dependencies = [
+ "anyhow",
+ "nvidia-video-codec-sdk",
+ "pf-driver-proto",
+ "pf-frame",
+ "pyrowave-sys",
+ "tracing",
+]
+
+[[package]]
 name = "pf-encode-win"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "anyhow",
  "libvpl-sys",
  "nvidia-video-codec-sdk",
- "pf-driver-proto",
+ "pf-encode-core",
  "pf-frame",
  "pyrowave-sys",
  "tracing",
@@ -717,7 +737,7 @@ dependencies = [
 
 [[package]]
 name = "pf-frame"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -785,13 +805,16 @@ dependencies = [
 
 [[package]]
 name = "pf-zerocopy"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "anyhow",
  "ash",
+ "bytemuck",
  "khronos-egl",
  "libc",
  "libloading 0.9.0",
+ "pf-dmabuf",
+ "rustix",
  "serde",
  "serde_json",
  "tracing",
@@ -833,7 +856,7 @@ dependencies = [
 
 [[package]]
 name = "pyrowave-sys"
-version = "0.39.0"
+version = "0.41.0"
 dependencies = [
  "bindgen",
  "cmake",

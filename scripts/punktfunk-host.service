@@ -1,9 +1,8 @@
 # punktfunk streaming host — systemd USER unit. Runs the SECURE native-only host by default
 # (punktfunk/1 clients + the management API; no plain-HTTP pairing / legacy GCM nonce reuse —
-# security-review #5/#9). Stock-Moonlight (GameStream) compat is OPT-IN: add
-#   PUNKTFUNK_GAMESTREAM=1
-# to ~/.config/punktfunk/host.env (the EnvironmentFile below) and restart — no unit editing
-# needed. Only do that on a TRUSTED LAN; it opens the compat planes' extra ports too.
+# security-review #5/#9). Stock-Moonlight (GameStream) compat is OPT-IN: turn on GameStream
+# under Host → Settings in the web console and restart — no unit editing needed. Only do that
+# on a TRUSTED LAN; the compat planes need their extra ports too.
 #
 # Install (against an already-running compositor session — the host auto-detects and follows it,
 # so host.env needs no backend config):
@@ -38,7 +37,7 @@
 # unit (when present) just needs to be up by the time a client streams (seconds later, user-driven).
 # A missing After= unit (e.g. gamescope backend, no kde-session installed) is simply ignored.
 [Unit]
-Description=punktfunk streaming host (punktfunk/1; +GameStream when PUNKTFUNK_GAMESTREAM=1)
+Description=punktfunk streaming host
 After=pipewire.service punktfunk-kde-session.service
 # Capture and audio ride PipeWire. A desktop login starts it; a lingering headless manager has
 # nothing else that would, so pull it in (a missing unit is ignored).

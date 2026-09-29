@@ -22,20 +22,27 @@ pub const KWIN_POOL_MIN: i32 = 4;
 /// (`error alloc buffers: Invalid argument`).
 pub const KWIN_POOL_MAX: i32 = 4;
 
-/// Whether to ask a KWin output for unpaced delivery (`maxFramerate = 0/1`).
+/// Whether to ask a KWin output for delivery on its own frame signal.
 ///
 /// KWin schedules each screencast frame on a QTimer whose wait it rounds *up* to a whole
 /// millisecond, so an 8.333 ms frame is scheduled at 9 and the cadence jitters against the
-/// real refresh. Offering no ceiling zeroes its `frameInterval()`, and the timer then fires
-/// on the compositor's own frame signal. KWin 6.7+ accepts the value; older KWin floors at
-/// 1/1, rejects that pod, and fixates the plain twin listed behind it.
-///
-/// That timer also coalesces cursor-only records, which KWin schedules from
-/// `Cursors::positionChanged` — pointer cadence, not vblank. Uncapped, each such record
-/// takes a pool buffer, and KWin drops a frame outright when it finds none free.
-/// `PUNKTFUNK_KWIN_PACED=1` restores the throttle if that bites.
+/// real refresh. A ceiling well above the stream rate keeps that gate below one refresh, so
+/// every real frame passes; without one, a game far above the stream rate and cursor-only
+/// records take a pool buffer each, and KWin drops a frame outright when none is free.
+/// The ceiling is `KWIN_UNPACED_HEADROOM` times the rate, or none when the rate is unknown.
+/// `PUNKTFUNK_KWIN_PACED=1` asks for the stream rate itself.
 pub fn unpaced_capture() -> bool {
-    !pf_host_config::env_on("PUNKTFUNK_KWIN_PACED").unwrap_or(false)
+    !pf_host_config::row_bool("PUNKTFUNK_KWIN_PACED")
+}
+
+/// Offer PipeWire explicit sync (`SPA_META_SyncTimeline`) on the dmabuf lane.
+///
+/// A producer that takes it hands over a fence at each buffer's acquire point and waits on
+/// the release point this side signals, instead of finishing the GPU itself. KWin on NVIDIA
+/// `glFinish()`es its compositor thread per cast frame otherwise — ~9 ms under a game's
+/// load, the whole 120 → 111 fps gap. `PUNKTFUNK_EXPLICIT_SYNC=0` keeps the implicit path.
+pub fn explicit_sync() -> bool {
+    pf_host_config::env_on("PUNKTFUNK_EXPLICIT_SYNC").unwrap_or(true)
 }
 
 /// Whether to capture a compositor's output directly with `ext-image-copy-capture-v1`
@@ -47,7 +54,7 @@ pub fn unpaced_capture() -> bool {
 /// `PUNKTFUNK_DIRECT_CAPTURE=0` keeps the portal.
 #[cfg(target_os = "linux")]
 pub fn direct_capture() -> bool {
-    pf_host_config::env_on("PUNKTFUNK_DIRECT_CAPTURE").unwrap_or(true)
+    pf_host_config::row_bool("PUNKTFUNK_DIRECT_CAPTURE")
 }
 
 /// Whether a virtual output may be driven as a PipeWire lazy driver.
@@ -59,7 +66,7 @@ pub fn direct_capture() -> bool {
 /// producer-driven stream.
 #[cfg(target_os = "linux")]
 pub fn lazy_capture() -> bool {
-    pf_host_config::env_on("PUNKTFUNK_LAZY_CAPTURE").unwrap_or(true)
+    pf_host_config::row_bool("PUNKTFUNK_LAZY_CAPTURE")
 }
 
 /// A FATAL capture fault: retrying `try_latest` cannot help — the caller must rebuild the
@@ -144,11 +151,30 @@ pub struct CaptureEpisode {
 #[cfg(target_os = "linux")]
 use pf_frame::DmabufFrame;
 
+/// Context on a capture loss whose display is still up (the import side broke, not the
+/// compositor): the host may re-attach a capturer to the same output instead of creating
+/// another one — on KWin every create is a new virtual output, and a burst of them wedges it.
+#[derive(Debug, Clone, Copy)]
+pub struct DisplayStillAlive;
+
+impl std::fmt::Display for DisplayStillAlive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the output itself is still up")
+    }
+}
+
 /// Produces frames without blocking the compositor. The Linux portal publishes
 /// into a one-deep overwriting slot (drop-oldest): a stalled consumer still
 /// sees the freshest frame.
 pub trait Capturer: Send {
     fn next_frame(&mut self) -> Result<CapturedFrame>;
+
+    /// Hand the virtual output's keepalive back so a capture-only rebuild can re-attach to the
+    /// live output. `None` when this capturer holds none, or already gave it up; the output is
+    /// then released when the capturer drops, as before.
+    fn take_keepalive(&mut self) -> Option<Box<dyn Send>> {
+        None
+    }
 
     /// [`next_frame`](Self::next_frame) with a caller-chosen first-frame budget.
     /// A PipeWire stream can sit in `Streaming` with no buffer; retry shortens
@@ -209,7 +235,9 @@ pub trait Capturer: Send {
 
     /// Cursor-render flip: `true` keeps the pointer out of the video (client
     /// draws it); `false` puts it back in. A declared IddCx hardware cursor is
-    /// irrevocable — DWM cannot take the job back. Default no-op.
+    /// irrevocable — DWM cannot take the job back. On Linux either call means
+    /// the host places [`cursor`](Self::cursor), so a CPU copy stops baking it.
+    /// Default no-op.
     fn set_cursor_forward(&mut self, _on: bool) {}
 
     /// Attach a gamescope cursor source. gamescope paints no `SPA_META_Cursor`,
@@ -266,6 +294,13 @@ pub trait Capturer: Send {
     /// and announces the gap. `None` = nothing recovered.
     fn take_recovered_outage(&mut self) -> Option<std::time::Duration> {
         None
+    }
+
+    /// Since the last call, the frame the encoder last read may be torn (a
+    /// producer re-sent a buffer this side still held). The stream loop
+    /// answers with one IDR. Default: never.
+    fn take_reference_risk(&mut self) -> bool {
+        false
     }
 
     /// Live capture health for the operator surface (WP18). `None` = this
@@ -674,9 +709,8 @@ pub use idd_push::driver_encode::{open_driver_encoder, DriverEncodeOpenError, Dr
 #[cfg(target_os = "linux")]
 #[path = "linux/mod.rs"]
 mod linux;
-/// Never-dropped tokio runtime for portal handshakes. Outlives ashpd's
-/// process-global cached D-Bus connection; every portal thread in the process
-/// parks on it, pf-vdisplay's and pf-inject's included.
+/// ScreenCast handshake bounds and cursor-mode negotiation, shared with pf-vdisplay.
+/// They run on `pf_portal`'s never-dropped runtime.
 #[cfg(target_os = "linux")]
 #[path = "linux/portal_rt.rs"]
 pub mod portal_rt;
@@ -709,64 +743,77 @@ pub fn open_portal_monitor(
     .map(|c| Box::new(c) as Box<dyn Capturer>)
 }
 
-/// Linux capturer for an existing virtual output's PipeWire node.
-/// `keepalive` owns the output. `want_hdr` holds on a gamescope node only: every other
-/// virtual output is SDR, and a desktop that refuses the offer would latch gamescope's SDR.
-/// `cursor_id0_hides` selects KWin's rewritten cursor-meta contract.
-/// `producer_is_gamescope` selects its no-meta contract and gated tiled modifier offer.
-/// KWin also needs [`KWIN_POOL_MIN`], [`KWIN_POOL_MAX`] as `pool_max`, and [`unpaced_capture`].
-/// `pool_max` is the deepest pool the producer serves; `None` when it serves any depth asked.
+/// The compositor behind a virtual output's PipeWire node. Node ids and remote fds do not
+/// name it, so the host does.
 #[cfg(target_os = "linux")]
-#[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Producer {
+    /// KWin: rewrites `SPA_META_Cursor` every buffer (`id == 0` hides the pointer), serves
+    /// pools of [`KWIN_POOL_MIN`] to [`KWIN_POOL_MAX`], and records unpaced while
+    /// [`unpaced_capture`] holds.
+    Kwin,
+    /// gamescope: no cursor metadata, a gated tiled modifier offer, and the only HDR producer.
+    Gamescope,
+    /// Mutter and every other producer.
+    #[default]
+    Other,
+}
+
+/// What [`open_virtual_output`] negotiates. Named fields: adjacent bools transpose silently
+/// and negotiate the wrong pod family (black screen).
+#[cfg(target_os = "linux")]
+#[derive(Clone, Default)]
+pub struct VirtualOutputOpts {
+    /// `false` forces CPU mmap even when `PUNKTFUNK_ZEROCOPY` is set.
+    pub allow_zerocopy: bool,
+    /// Tiled dmabufs convert to planar YUV444.
+    pub want_444: bool,
+    /// Offer 10-bit PQ/BT.2020. Holds on a [`Producer::Gamescope`] node only: every other
+    /// virtual output is SDR, and a desktop that refuses the offer would latch gamescope's SDR.
+    pub want_hdr: bool,
+    /// 10-bit SDR: keep packed RGB so direct NVENC widens 8→10.
+    pub ten_bit_sdr: bool,
+    /// Skip buffers until the negotiated size matches the preferred mode (KWin's
+    /// sacrificial birth mode).
+    pub expect_exact_dims: bool,
+    pub producer: Producer,
+    pub policy: ZeroCopyPolicy,
+}
+
+/// Linux capturer for an existing virtual output's PipeWire node. `keepalive` owns the output.
+#[cfg(target_os = "linux")]
 pub fn open_virtual_output(
     remote_fd: Option<std::os::fd::OwnedFd>,
     node_id: u32,
     preferred_mode: Option<(u32, u32, u32)>,
     keepalive: Box<dyn Send>,
-    allow_zerocopy: bool,
-    want_444: bool,
-    want_hdr: bool,
-    ten_bit_sdr: bool,
-    policy: ZeroCopyPolicy,
-    expect_exact_dims: bool,
-    cursor_id0_hides: bool,
-    producer_is_gamescope: bool,
-    pool_min: i32,
-    pool_max: Option<i32>,
-    unpaced: bool,
+    opts: VirtualOutputOpts,
 ) -> Result<Box<dyn Capturer>> {
+    let want_hdr = opts.want_hdr
+        && opts.producer == Producer::Gamescope
+        && !hdr_capture_failed(HdrSource::VirtualOutput);
     linux::PortalCapturer::from_virtual_output(
         remote_fd,
         node_id,
         preferred_mode,
         keepalive,
-        allow_zerocopy,
-        want_444,
-        want_hdr && producer_is_gamescope && !hdr_capture_failed(HdrSource::VirtualOutput),
-        ten_bit_sdr,
-        policy,
-        expect_exact_dims,
-        cursor_id0_hides,
-        producer_is_gamescope,
-        pool_min,
-        pool_max,
-        unpaced,
+        VirtualOutputOpts { want_hdr, ..opts },
     )
     .map(|c| Box::new(c) as Box<dyn Capturer>)
 }
 
 /// Direct `ext-image-copy-capture-v1` capturer for a compositor output the host has
-/// already created, named by its `wl_output.name`.
+/// already created, named by its `wl_output.name`. The capturer owns `keepalive`.
 ///
-/// Returns `Err` for every reason the caller should fall back to the portal: the
-/// compositor lacks the protocol, the output is gone, or nothing it offers can be
-/// imported by this session's encoder.
+/// Fails for every reason the caller should fall back to the portal: the compositor
+/// lacks the protocol, the output is gone, or nothing it offers can be imported by this
+/// session's encoder. The failure hands `keepalive` back for that fallback.
 #[cfg(target_os = "linux")]
 pub fn open_direct_output(
     output_name: String,
     keepalive: Box<dyn Send>,
     policy: ZeroCopyPolicy,
-) -> Result<Box<dyn Capturer>> {
+) -> std::result::Result<Box<dyn Capturer>, (anyhow::Error, Box<dyn Send>)> {
     linux::WlCapturer::open(output_name, keepalive, policy)
         .map(|c| Box::new(c) as Box<dyn Capturer>)
 }

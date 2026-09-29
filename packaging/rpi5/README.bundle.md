@@ -1,7 +1,8 @@
 # Punktfunk for Raspberry Pi 5
 
-This ARM64 bundle runs independently of StreamOS. It targets 64-bit Raspberry Pi
-OS Bookworm and compatible newer Linux distributions on Raspberry Pi 5.
+This standalone ARM64 bundle targets 64-bit Raspberry Pi OS Bookworm and
+compatible newer Linux distributions on Raspberry Pi 5. A complete bootable
+kiosk image is also available from the matching GitHub release.
 
 Install the system runtime first:
 

@@ -1,0 +1,25 @@
+# On-glass probe for host scroll injection: opens a fullscreen Wayland window, parks the pointer
+# on it, replays scripted scroll gestures through the production injector service, and prints
+# what the window's wl_pointer received (source, distance, value120, stops, cadence). Answers
+# "what does an app on THIS compositor get from a streamed trackpad" without a client.
+[package]
+name = "scroll-probe"
+description = "On-glass probe: what an app receives from injected scroll on this compositor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pf-inject = { path = "../../crates/pf-inject" }
+punktfunk-core = { path = "../../crates/punktfunk-core", features = ["quic"] }
+anyhow = "1"
+rustix = { version = "1", features = ["event"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+
+[lints]
+workspace = true

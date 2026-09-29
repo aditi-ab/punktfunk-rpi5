@@ -21,11 +21,12 @@
 mod common;
 
 use ash::vk;
-use common::TestDecoder;
 use pf_vkdecode::DecodeStatus;
 use pf_vkdecode::DecodedVkFrame;
 use pf_vkdecode::NoopQueueLock;
 use pf_vkdecode::VkAv1Decoder;
+use pf_vkdecode::VkCodec;
+use pf_vkdecode::VkDecoder;
 use pf_vkdecode::VkH264Decoder;
 use pf_vkdecode::VkH265Decoder;
 
@@ -50,7 +51,7 @@ struct Geometry {
 /// Decode [`AUS`] AUs holding [`CLIENT_HOLD`] frames; COMPLETE before each release.
 ///
 /// Shared across codecs so the AV1 leg cannot prove less than the H.264 leg.
-fn smoke(decoder: &mut impl TestDecoder, aus: &[&[u8]], geometry: &Geometry) {
+fn smoke(decoder: &mut VkDecoder<impl VkCodec>, aus: &[&[u8]], geometry: &Geometry) {
     // PF_VKD_TEST_READBACK adds TRANSFER_SRC to the picture pool. Production
     // never carries that usage; a leftover from the parity legs would pass
     // this test against a pool that is not the one we ship.
@@ -255,7 +256,7 @@ fn av1_decodes_48_aus_holding_four_frames_like_the_real_client() {
         );
         smoke(
             &mut decoder,
-            &common::split_av1_aus(common::TEST_25FPS_AV1),
+            &common::split_ivf(common::TEST_25FPS_AV1),
             &Geometry {
                 display: (320, 240),
                 // AV1 decode extent is the post-superres width and granularity is
@@ -313,7 +314,7 @@ fn the_delivery_floor_is_under_what_the_planners_emit_from_the_first_48_aus() {
         let mut planner = pf_bitstream::av1::Av1Planner::new();
         let mut outputs = 0usize;
         let mut frames = 0usize;
-        for (index, au) in common::split_av1_aus(common::TEST_25FPS_AV1)
+        for (index, au) in common::split_ivf(common::TEST_25FPS_AV1)
             .iter()
             .take(AUS)
             .enumerate()

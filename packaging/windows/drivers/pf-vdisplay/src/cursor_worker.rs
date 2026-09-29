@@ -8,8 +8,8 @@
 //! shape + position + visibility into the host-created section; the host polls it at its
 //! encode-tick pace (no event crosses the process boundary).
 //!
-//! Coordinates are published VERBATIM in the OS's desktop space (`IDARG_OUT_QUERY_HWCURSOR::X/Y`
-//! = the shape's top-left, can be negative); the host subtracts its monitor's desktop origin.
+//! Coordinates are published VERBATIM (`IDARG_OUT_QUERY_HWCURSOR::X/Y` = the shape's top-left
+//! in this monitor's "screen co-ordinates", negative past its top-left edge).
 //! Shape pixels are the OS's 32-bpp rows at `Pitch` — BGRA for ALPHA cursors, color+mask for
 //! MASKED_COLOR — copied raw; the host converts.
 //!
@@ -26,17 +26,19 @@ use pf_driver_proto::cursor::{
 use wdk_iddcx::nt_success;
 use wdk_sys::iddcx;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
-use windows::Win32::System::Memory::{FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile};
+use windows::Win32::System::Memory::{
+    FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+};
 use windows::Win32::System::Threading::WaitForMultipleObjects;
 
 use crate::cursor_cell::{CursorCell, CursorImage};
-use crate::worker::{OwnedHandle, OwnedView, Sendable, Worker};
+use crate::worker::{OwnedHandle, OwnedView, Worker};
 
 /// The host's `IOCTL_SET_CURSOR_CHANNEL` delivery: the [`CursorShm`] mapping handle VALUE,
 /// already duplicated into this WUDFHost process. Owning a `CursorChannel` means owning the
 /// handle; `Drop` closes it unless [`into_unowned`](Self::into_unowned) disarmed that — the
-/// not-adopted reject path (the host reaps remotely), or [`setup_and_spawn`], which moves the
-/// handle into an [`OwnedHandle`] that closes it instead.
+/// not-adopted reject path (the host reaps remotely), or [`setup_and_spawn`], which moves a
+/// validated handle into an [`OwnedHandle`] that closes it instead.
 pub struct CursorChannel {
     handle: u64,
     owned: bool,
@@ -112,60 +114,57 @@ pub fn setup_hardware_cursor(monitor: iddcx::IDDCX_MONITOR, data_event: isize) -
 
 /// Map the delivered section and start the query→publish worker for `monitor`.
 ///
-/// Ownership is the point of this function. The section handle is adopted out of `ch` into an
-/// [`OwnedView`] that unmaps the view and closes the mapping on EVERY exit — including a failed
-/// spawn, which drops the closure holding it, so nothing is left behind in the host process's
-/// handle table. That view then travels into the thread and is released when the thread returns.
-/// `data_event` is only borrowed: the monitor entry owns it and closes it after the join.
+/// The handle value is untrusted until it maps and the view carries [`CURSOR_MAGIC`]: a value
+/// that fails either check is never closed, since it could name an unrelated handle in this
+/// process, and comes back as `Err(Some(ch))` for the host to reap its duplicate. A value that
+/// passes is adopted into an [`OwnedView`] that unmaps and closes on EVERY later exit —
+/// including a failed spawn, which drops the closure holding it — and then travels into the
+/// thread. `data_event` is only borrowed: the monitor entry owns it and closes it after the join.
 ///
-/// `None` on any failure (mapping, magic, DDI); the caller keeps the composited cursor, which is
-/// also what the host falls back to when no seqlock publish arrives.
+/// `Err(None)` when the adopted channel failed later (spawn, DDI) and is released already. On
+/// any `Err` the caller keeps the composited cursor, which is also what the host falls back to
+/// when no seqlock publish arrives.
 pub fn setup_and_spawn(
     monitor: iddcx::IDDCX_MONITOR,
     ch: CursorChannel,
     declare: bool,
     data_event: isize,
     cell: Arc<CursorCell>,
-) -> Option<Worker> {
-    // SAFETY: the host duplicated this section handle into our process and `CursorChannel` hands
-    // its ownership over here — `into_unowned` below disarms its own close.
-    let mapping = unsafe { OwnedHandle::from_raw(HANDLE(ch.handle as *mut core::ffi::c_void)) };
-    ch.into_unowned();
-    // SAFETY: `mapping` is the section handle we just adopted; size is the fixed contract size.
-    // FILE_MAP_READ|WRITE because we write the cursor state and the host reads it.
-    let view = unsafe {
-        MapViewOfFile(
-            mapping.as_raw(),
-            FILE_MAP_READ | FILE_MAP_WRITE,
-            0,
-            0,
-            CURSOR_SHM_SIZE,
-        )
-    };
+) -> Result<Worker, Option<CursorChannel>> {
+    let raw = HANDLE(ch.handle as *mut core::ffi::c_void);
+    // SAFETY: MapViewOfFile validates `raw` itself and fails on a value that names no section;
+    // size is the fixed contract size. READ|WRITE: we write the cursor state, the host reads it.
+    let view = unsafe { MapViewOfFile(raw, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, CURSOR_SHM_SIZE) };
     if view.Value.is_null() {
         dbglog!("[pf-vd] cursor: MapViewOfFile failed — keeping composited cursor");
-        return None; // `mapping` drops here and closes
+        return Err(Some(ch));
     }
-    // SAFETY: `view` is the single mapping of `mapping` we just made; from here one value owns
-    // both, and every return below unmaps and closes them.
-    let view = unsafe { OwnedView::from_raw(view.Value, mapping) };
-    let shm = view.base().cast::<CursorShm>();
+    let shm = view.Value.cast::<CursorShm>();
     // SAFETY: the view spans CURSOR_SHM_SIZE >= size_of::<CursorShm>(); reading the host stamp.
     if unsafe { core::ptr::addr_of!((*shm).magic).read_volatile() } != CURSOR_MAGIC {
         dbglog!("[pf-vd] cursor: section magic mismatch — rejecting");
-        return None;
+        // SAFETY: the view mapped just above, unmapped once here; the handle stays open.
+        let _ = unsafe { UnmapViewOfFile(view) };
+        return Err(Some(ch));
     }
+    // SAFETY: the section carries our magic, so `raw` is the handle the host duplicated for us;
+    // `into_unowned` disarms the channel's own close, leaving this value its sole closer.
+    let mapping = unsafe { OwnedHandle::from_raw(raw) };
+    ch.into_unowned();
+    // SAFETY: `view` is the single mapping of `mapping` made above; from here one value owns
+    // both, and every return below unmaps and closes them.
+    let view = unsafe { OwnedView::from_raw(view.Value, mapping) };
 
     // Spawn BEFORE declaring: a declaration names `data_event`, which the caller closes when
-    // this returns `None`. `declare = false` (a delivery landing in COMPOSITE render mode)
+    // this returns `Err`. `declare = false` (a delivery landing in COMPOSITE render mode)
     // already spawns undeclared, so a later enable-flip has an event to declare against.
-    // The IddCx monitor handle is a raw pointer; the view carries its own `Send` wrapper.
+    // The IddCx monitor handle travels as an integer; the view is `Send` itself.
     let monitor_v = monitor as usize;
-    let view = Sendable(view);
     let worker = Worker::spawn("pf-vd-cursor", move |stop| {
-        let view = view; // the wrapper, not the field: the view unmaps when this thread returns
-        run_worker(monitor_v, view.0.base() as usize, data_event, stop, &cell);
-    })?;
+        // The view unmaps when this thread returns.
+        run_worker(monitor_v, view.base() as usize, data_event, stop, &cell);
+    })
+    .ok_or(None)?;
 
     if declare {
         let st = setup_hardware_cursor(monitor, data_event);
@@ -175,13 +174,13 @@ pub fn setup_and_spawn(
                 st as u32
             );
             // `worker` drops here → stops and joins the thread it just started.
-            return None;
+            return Err(None);
         }
         dbglog!("[pf-vd] cursor: hardware cursor declared — worker started");
     } else {
         dbglog!("[pf-vd] cursor: channel adopted UNdeclared (composite mode) — worker started");
     }
-    Some(worker)
+    Ok(worker)
 }
 
 /// The wait→query→publish loop, exiting when `stop` signals.
@@ -196,7 +195,9 @@ fn run_worker(monitor_v: usize, view_v: usize, data_v: isize, stop: HANDLE, cell
     let shape_dst = (view_v + CURSOR_SHAPE_OFFSET) as *mut u8;
     let mut shape_buf = vec![0u8; CURSOR_SHAPE_BYTES];
     let mut last_shape_id: u32 = 0;
-    let mut query_warned = false;
+    // Consecutive failed queries: ~100 ms at the poll rate before the blend drops the pointer.
+    const QUERY_FAILS_HIDE: u32 = 3;
+    let mut query_fails: u32 = 0;
     let mut published = false;
     // The pool's copy of the latest publish; its position outlives shape-less ticks.
     let mut image: Option<CursorImage> = None;
@@ -221,26 +222,39 @@ fn run_worker(monitor_v: usize, view_v: usize, data_v: isize, stop: HANDLE, cell
             ShapeBufferSizeInBytes: CURSOR_SHAPE_BYTES as u32,
             pShapeBuffer: shape_buf.as_mut_ptr(),
         };
-        // SAFETY: zero-init is a valid OUT arg (the OS writes every field it reports). v3: the
-        // base query DDI slot is stubbed to NOT_SUPPORTED on current IddCx.
-        let mut out: iddcx::IDARG_OUT_QUERY_HWCURSOR3 = unsafe { core::mem::zeroed() };
+        // Zeroed, the OS writes every field it reports. v3: the base query DDI slot is stubbed
+        // to NOT_SUPPORTED on current IddCx.
+        let mut out = iddcx::IDARG_OUT_QUERY_HWCURSOR3::default();
         // SAFETY: `monitor` is live (departure drops this worker FIRST), args outlive the call.
         let st =
             unsafe { wdk_iddcx::IddCxMonitorQueryHardwareCursor3(monitor, &in_args, &mut out) };
         if !nt_success(st) {
-            if !query_warned {
-                query_warned = true;
+            query_fails += 1;
+            if query_fails == 1 {
                 dbglog!(
                     "[pf-vd] cursor: query failed 0x{:08x} (logged once)",
                     st as u32
                 );
             }
+            // A lost declare answers STATUS_NOT_SUPPORTED for good: past a few polls, stop the
+            // pool blending a pointer frozen where it last was.
+            if query_fails == QUERY_FAILS_HIDE {
+                // SAFETY: `shm` points at the mapped CursorShm for the worker's lifetime.
+                let hdr = unsafe { core::ptr::read_volatile(shm) };
+                cell.publish(&mut image, &hdr, None, false);
+            }
             continue;
         }
-        query_warned = false;
+        query_fails = 0;
         if !published {
             published = true;
-            dbglog!("[pf-vd] cursor: publishes live");
+            // The raw position: monitor-relative per the IddCx docs; this line shows it.
+            dbglog!(
+                "[pf-vd] cursor: publishes live (x={} y={} posvalid={})",
+                out.X,
+                out.Y,
+                out.PositionValid
+            );
         }
         // Log each distinct SHAPE (human-paced): type (1=masked_color, 2=alpha), dims,
         // visibility. Shows which cursors reach us (does VSCode's hand arrive?) and their
@@ -249,7 +263,7 @@ fn run_worker(monitor_v: usize, view_v: usize, data_v: isize, stop: HANDLE, cell
             dbglog!(
                 "[pf-vd] cursor SHAPE id={} type={} {}x{} vis={} posvalid={}",
                 out.CursorShapeInfo.ShapeId,
-                out.CursorShapeInfo.CursorType as u32,
+                out.CursorShapeInfo.CursorType,
                 out.CursorShapeInfo.Width,
                 out.CursorShapeInfo.Height,
                 out.IsCursorVisible,
@@ -267,7 +281,7 @@ fn run_worker(monitor_v: usize, view_v: usize, data_v: isize, stop: HANDLE, cell
         let visible = out.IsCursorVisible != 0;
         let mut shape = None;
         // SAFETY: exclusive writer (single worker per section); plain volatile field writes,
-        // then one volatile read of the header for the host-stamped origin and scale.
+        // then one volatile read of the header for the host-stamped scale.
         let hdr = unsafe {
             core::ptr::addr_of_mut!((*shm).visible).write_volatile(u32::from(visible));
             // v3 `X`/`Y` are only meaningful when `PositionValid`; otherwise keep the prior
@@ -279,7 +293,7 @@ fn run_worker(monitor_v: usize, view_v: usize, data_v: isize, stop: HANDLE, cell
             if out.IsCursorShapeUpdated != 0 && visible {
                 let info = &out.CursorShapeInfo;
                 let stamp = CursorShm {
-                    cursor_type: info.CursorType as u32,
+                    cursor_type: info.CursorType,
                     width: info.Width,
                     height: info.Height,
                     pitch: info.Pitch,

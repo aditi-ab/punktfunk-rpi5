@@ -5,18 +5,18 @@
 //! starts the media stages.
 //!
 //! One native thread per connection, not the per-frame hot path. DESCRIBE offers
-//! `SS_ENC_VIDEO` (per-shard AES-128-GCM, on by default, never REQUIRED;
-//! `PUNKTFUNK_GS_ENCRYPT=0` opts out) and `SS_ENC_CONTROL_V2` (per-direction control
-//! nonces; also lets the client seal RTSP; `PUNKTFUNK_GS_ENCRYPT=video` drops just
-//! this). Audio is AES-CBC regardless; `SS_ENC_AUDIO` is not offered (layout not in
-//! the wire reference). See [`EncOffer`].
+//! `SS_ENC_VIDEO` (per-shard AES-128-GCM), `SS_ENC_CONTROL_V2` (per-direction
+//! control nonces and sealed RTSP), and `SS_ENC_AUDIO` (AES-CBC Opus). Shipping
+//! modes never require them. `PUNKTFUNK_GAMESTREAM_ENCRYPT=0` opts out;
+//! `video` offers only video. See [`EncOffer`].
 //!
 //! A sealed connection is recognised, not negotiated: [`ENCRYPTED_MESSAGE_TYPE_BIT`].
 
 use super::audio;
 use super::stream::{self, StreamConfig};
-use super::{AppState, LaunchSession, AUDIO_PORT, CONTROL_PORT, RTSP_PORT, VIDEO_PORT};
+use super::{LaunchSession, AUDIO_PORT, CONTROL_PORT, RTSP_PORT, VIDEO_PORT};
 use crate::encode::Codec;
+use crate::host::AppState;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -275,13 +275,13 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
             match stream_config(&map) {
                 Some(cfg) => {
                     tracing::info!(?cfg, "RTSP ANNOUNCE — negotiated stream config");
-                    *state.stream.lock().unwrap() = Some(cfg);
+                    *state.gs.stream.lock().unwrap() = Some(cfg);
                 }
                 None => tracing::warn!("RTSP ANNOUNCE — missing required video config keys"),
             }
-            let ap = audio_params(&map);
+            let ap = audio_params(&map, gs_encryption_offer());
             tracing::info!(?ap, "RTSP ANNOUNCE — negotiated audio params");
-            *state.audio_params.lock().unwrap() = ap;
+            *state.gs.audio_params.lock().unwrap() = ap;
             response(&req.cseq, &[], None)
         }
         "PLAY" => {
@@ -289,7 +289,7 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                 tracing::warn!(?peer, "RTSP PLAY — refused: not the paired `/launch` owner");
                 return response_status("401 Unauthorized", &req.cseq, &[], None);
             };
-            let cfg = *state.stream.lock().unwrap();
+            let cfg = *state.gs.stream.lock().unwrap();
             // Ends the whole session (both planes + launch). One plane detecting a
             // dead client must not leave the other streaming or a stale launch.
             let on_lost: super::OnSessionLost = {
@@ -309,10 +309,10 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                         state.force_idr.clone(),
                         state.rfi_range.clone(),
                         state.loss_stats.clone(),
-                        state.video_hdr.clone(),
+                        state.gs.video_hdr.clone(),
                         // Rikey reaches the video plane only when `SS_ENC_VIDEO` was negotiated.
                         cfg.encrypt_video.then_some(ls.gcm_key),
-                        state.video_cap.clone(),
+                        state.gs.video_cap.clone(),
                         state.stats.clone(),
                         on_lost.clone(),
                         state.media_exited.clone(),
@@ -321,7 +321,7 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                         // distinction as the native close code; teardown policy keys off it.
                         stream::GameLifetime {
                             quit: state.quit.clone(),
-                            preempted: state.preempted.clone(),
+                            preempted: state.gs.preempted.clone(),
                             fingerprint: ls.owner_fp.map(hex::encode),
                             owner_ip: ls.peer_ip,
                             av_ping: state.av_ping_payload(),
@@ -337,15 +337,16 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                 Some(_) => tracing::info!("RTSP PLAY — stream already running"),
                 None => tracing::warn!("RTSP PLAY — no negotiated config (ANNOUNCE missing)"),
             }
-            // Audio is independent (Opus UDP 48000). Needs the launch key for the
-            // AES-CBC payload the client expects.
+            // Audio is independent (Opus UDP 48000). The client decides whether
+            // its Opus payload is AES-CBC sealed.
             if !state.audio_streaming.swap(true, Ordering::SeqCst) {
                 tracing::info!("RTSP PLAY — starting audio stream");
+                let params = *state.gs.audio_params.lock().unwrap();
                 audio::start(
                     state.audio_streaming.clone(),
-                    ls.gcm_key,
+                    params.encrypt.then_some(ls.gcm_key),
                     ls.rikeyid,
-                    *state.audio_params.lock().unwrap(),
+                    params,
                     state.audio_cap.clone(),
                     on_lost,
                     // Same owner-IP bind as video: only the launching peer's pings count.
@@ -381,9 +382,14 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
 /// `SS_PEN`/`SS_TOUCH` instead of synthesizing mouse input.
 const SS_FF_PEN_TOUCH_EVENTS: u32 = 0x01;
 
-/// Per-shard AES-128-GCM video (`Limelight-internal.h`). `SS_ENC_AUDIO` 0x04
-/// is not offered: audio-GCM layout is not in the wire reference.
+/// Per-shard AES-128-GCM video (`Limelight-internal.h`).
 const SS_ENC_VIDEO: u32 = 0x02;
+
+/// AES-128-CBC audio payloads; RTP headers stay clear.
+const SS_ENC_AUDIO: u32 = 0x04;
+
+/// Legacy `x-nv-general.featureFlags` audio-encryption bit.
+const NVFF_AUDIO_ENCRYPTION: u32 = 0x20;
 
 /// Direction byte in the GCM nonce: `[10..12]` = `b"CC"` client→host, `b"HC"`
 /// host→client. Legacy nonce is just the sender's `seq`, so host and client
@@ -391,13 +397,12 @@ const SS_ENC_VIDEO: u32 = 0x02;
 /// catastrophic failure. Also lets the client seal RTSP; [`read_sealed_message`].
 const SS_ENC_CONTROL_V2: u32 = 0x01;
 
-/// Video-encryption offer from `PUNKTFUNK_GS_ENCRYPT`.
+/// Stream-encryption offer from `PUNKTFUNK_GS_ENCRYPT`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum EncOffer {
     /// `0` — advertise nothing. Escape hatch for a client that mis-negotiates.
     Off,
-    /// Default. Advertise `SS_ENC_VIDEO` and `SS_ENC_CONTROL_V2` as SUPPORTED
-    /// and let the client decide.
+    /// Default. Advertise control, video, and audio encryption as supported.
     Supported,
     /// `video` — video encryption only; control stays on the legacy nonce.
     /// `Off` would drop video encryption too.
@@ -408,8 +413,8 @@ enum EncOffer {
 }
 
 /// Encryption offer from the `gamestream_encrypt` setting. Default is [`EncOffer::Supported`].
-/// `0` is plaintext; `video` drops the control offer; `require` also REQUESTS both.
-fn gs_video_encryption_offer() -> EncOffer {
+/// `0` is plaintext; `video` offers only video; `require` requests every offered plane.
+fn gs_encryption_offer() -> EncOffer {
     static ON: std::sync::OnceLock<EncOffer> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         match pf_host_config::knob("PUNKTFUNK_GAMESTREAM_ENCRYPT")
@@ -433,10 +438,10 @@ fn enc_flags(offer: EncOffer) -> (u32, u32) {
     match offer {
         EncOffer::Off => (0, 0),
         EncOffer::VideoOnly => (SS_ENC_VIDEO, 0),
-        EncOffer::Supported => (SS_ENC_VIDEO | SS_ENC_CONTROL_V2, 0),
+        EncOffer::Supported => (SS_ENC_VIDEO | SS_ENC_CONTROL_V2 | SS_ENC_AUDIO, 0),
         EncOffer::Required => (
-            SS_ENC_VIDEO | SS_ENC_CONTROL_V2,
-            SS_ENC_VIDEO | SS_ENC_CONTROL_V2,
+            SS_ENC_VIDEO | SS_ENC_CONTROL_V2 | SS_ENC_AUDIO,
+            SS_ENC_VIDEO | SS_ENC_CONTROL_V2 | SS_ENC_AUDIO,
         ),
     }
 }
@@ -572,7 +577,7 @@ fn describe_sdp() -> String {
     } else {
         0
     };
-    let (supported, requested) = enc_flags(gs_video_encryption_offer());
+    let (supported, requested) = enc_flags(gs_encryption_offer());
     let mut lines: Vec<String> = vec![
         format!("a=x-ss-general.featureFlags:{feature_flags}"),
         format!("a=x-ss-general.encryptionSupported:{supported}"),
@@ -762,7 +767,7 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
         .unwrap_or(1);
     // Client echo of DESCRIBE's offer. Mask by what we advertised; a client
     // cannot enable a mode the host never offered.
-    let (offered, _) = enc_flags(gs_video_encryption_offer());
+    let (offered, _) = enc_flags(gs_encryption_offer());
     let enabled = parse_u("x-ss-general.encryptionEnabled").unwrap_or(0) & offered;
     let encrypt_video = enabled & SS_ENC_VIDEO != 0;
     if encrypt_video {
@@ -793,7 +798,7 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
 /// `numChannels`/`channelMask` and `packetDuration` always; `AudioQuality`
 /// is 1 only when the client saw our second surround-params line. Unknown
 /// channel counts fall back to stereo.
-fn audio_params(map: &HashMap<String, String>) -> audio::AudioParams {
+fn audio_params(map: &HashMap<String, String>, offer: EncOffer) -> audio::AudioParams {
     let parse_u = |k: &str| map.get(k).and_then(|s| s.trim().parse::<u32>().ok());
     let requested = parse_u("x-nv-audio.surround.numChannels").unwrap_or(2);
     let channels = match requested {
@@ -810,10 +815,16 @@ fn audio_params(map: &HashMap<String, String>) -> audio::AudioParams {
         Some(d) if d >= 10 => 10,
         _ => 5,
     };
+    let (offered, _) = enc_flags(offer);
+    let ss_enabled = parse_u("x-ss-general.encryptionEnabled").unwrap_or(0);
+    let legacy_enabled = parse_u("x-nv-general.featureFlags").unwrap_or(0);
+    let encrypt = offered & SS_ENC_AUDIO != 0
+        && (ss_enabled & SS_ENC_AUDIO != 0 || legacy_enabled & NVFF_AUDIO_ENCRYPTION != 0);
     audio::AudioParams {
         channels,
         high_quality,
         packet_duration_ms,
+        encrypt,
     }
 }
 
@@ -982,28 +993,52 @@ mod tests {
 
     #[test]
     fn announce_audio_params() {
-        assert_eq!(audio_params(&announce(&[])), audio::AudioParams::default());
-        let ap = audio_params(&announce(&[
-            ("x-nv-audio.surround.numChannels", "6"),
-            ("x-nv-audio.surround.channelMask", "63"),
-            ("x-nv-audio.surround.AudioQuality", "0"),
-            ("x-nv-aqos.packetDuration", "5"),
-        ]));
+        assert_eq!(
+            audio_params(&announce(&[]), EncOffer::Supported),
+            audio::AudioParams::default()
+        );
+        let ap = audio_params(
+            &announce(&[
+                ("x-nv-audio.surround.numChannels", "6"),
+                ("x-nv-audio.surround.channelMask", "63"),
+                ("x-nv-audio.surround.AudioQuality", "0"),
+                ("x-nv-aqos.packetDuration", "5"),
+            ]),
+            EncOffer::Supported,
+        );
         assert_eq!(
             (ap.channels, ap.high_quality, ap.packet_duration_ms),
             (6, false, 5)
         );
-        let ap = audio_params(&announce(&[
-            ("x-nv-audio.surround.numChannels", "8"),
-            ("x-nv-audio.surround.AudioQuality", "1"),
-            ("x-nv-aqos.packetDuration", "10"),
-        ]));
+        let ap = audio_params(
+            &announce(&[
+                ("x-nv-audio.surround.numChannels", "8"),
+                ("x-nv-audio.surround.AudioQuality", "1"),
+                ("x-nv-aqos.packetDuration", "10"),
+            ]),
+            EncOffer::Supported,
+        );
         assert_eq!(
             (ap.channels, ap.high_quality, ap.packet_duration_ms),
             (8, true, 10)
         );
-        let ap = audio_params(&announce(&[("x-nv-audio.surround.numChannels", "4")]));
+        let ap = audio_params(
+            &announce(&[("x-nv-audio.surround.numChannels", "4")]),
+            EncOffer::Supported,
+        );
         assert_eq!(ap.channels, 2);
+    }
+
+    #[test]
+    fn audio_encryption_follows_the_clients_announce() {
+        let ss = announce(&[("x-ss-general.encryptionEnabled", "4")]);
+        assert!(audio_params(&ss, EncOffer::Supported).encrypt);
+
+        let legacy = announce(&[("x-nv-general.featureFlags", "32")]);
+        assert!(audio_params(&legacy, EncOffer::Supported).encrypt);
+
+        assert!(!audio_params(&ss, EncOffer::VideoOnly).encrypt);
+        assert!(!audio_params(&announce(&[]), EncOffer::Supported).encrypt);
     }
 
     /// Offer ladder. Only `require` sets REQUESTED: a client allowed to
@@ -1018,19 +1053,18 @@ mod tests {
         );
         assert_eq!(
             enc_flags(EncOffer::Supported),
-            (SS_ENC_VIDEO | SS_ENC_CONTROL_V2, 0),
-            "the default offers both, and requires neither"
+            (SS_ENC_VIDEO | SS_ENC_CONTROL_V2 | SS_ENC_AUDIO, 0),
+            "the default offers every implemented stream, and requires none"
         );
         assert_eq!(
             enc_flags(EncOffer::Required),
             (
-                SS_ENC_VIDEO | SS_ENC_CONTROL_V2,
-                SS_ENC_VIDEO | SS_ENC_CONTROL_V2
+                SS_ENC_VIDEO | SS_ENC_CONTROL_V2 | SS_ENC_AUDIO,
+                SS_ENC_VIDEO | SS_ENC_CONTROL_V2 | SS_ENC_AUDIO
             ),
             "the test lever must also REQUEST it, or a client may decline"
         );
-        // Never advertise a bit we cannot serve. `SS_ENC_AUDIO` (0x04) especially.
-        let servable = SS_ENC_VIDEO | SS_ENC_CONTROL_V2;
+        let servable = SS_ENC_VIDEO | SS_ENC_CONTROL_V2 | SS_ENC_AUDIO;
         for offer in [
             EncOffer::Off,
             EncOffer::VideoOnly,
@@ -1133,7 +1167,7 @@ mod tests {
         let sdp = describe_sdp();
         // Assert against `enc_flags`, not a literal: `PUNKTFUNK_GS_ENCRYPT`
         // can still steer the offer.
-        let (supported, requested) = enc_flags(gs_video_encryption_offer());
+        let (supported, requested) = enc_flags(gs_encryption_offer());
         assert!(sdp.contains(&format!("a=x-ss-general.encryptionSupported:{supported}")));
         assert!(sdp.contains(&format!("a=x-ss-general.encryptionRequested:{requested}")));
         assert!(

@@ -36,6 +36,7 @@ mod datagram;
 mod handshake;
 mod pairing;
 mod pen;
+mod wire;
 
 /// quinn endpoint constructors: host identity ([`endpoint::server_with_identity`]),
 /// client pin / TOFU ([`endpoint::client_pinned`]).

@@ -1,0 +1,11 @@
+[Unit]
+Description=Wait briefly for initial network clock synchronization
+Wants=systemd-timesyncd.service
+After=systemd-timesyncd.service NetworkManager.service
+Before=punktfunk-kiosk.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/systemd/systemd-time-wait-sync
+TimeoutStartSec=60
+RemainAfterExit=yes

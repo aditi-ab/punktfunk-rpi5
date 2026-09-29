@@ -29,11 +29,12 @@
 # ⚠ And it is NOT enough to leave it out here: pacman scriptlets never run for a sysext, so the
 # `setcap` in punktfunk-host.install cannot reach this image either way. The encode worker is
 # therefore capped on the staging tree below — this is the only place a sysext can acquire it — and
-# both halves of the matrix are asserted before mksquashfs, exactly as
-# packaging/bazzite/build-sysext.sh does. `punktfunk-gamescope` is a compositor, not a KWin client,
+# both halves of the matrix are asserted before mksquashfs by packaging/linux/sysext-lib.sh, which
+# the Bazzite image shares. `punktfunk-gamescope` is a compositor, not a KWin client,
 # so it is unaffected by the host rule and simply runs without a capability here, pacing slightly
 # worse.
 set -euo pipefail
+. "$(cd "$(dirname "$0")" && pwd)/../linux/sysext-lib.sh"
 
 GAMESCOPE=""
 if [ "${1:-}" = "--gamescope" ]; then
@@ -61,11 +62,9 @@ else
   tar -C "$STAGE" -xf "$PKG" usr
 fi
 
-# The HDR gamescope companion (see --gamescope in the header). Verified by its banner marker
-# rather than trusted by filename: an unpatched gamescope shipped under this name would make the
-# host promise HDR it cannot deliver, and the punktfunk/1 Welcome cannot take that back
-# mid-session. Executing the staged binary needs a build box the binary runs on (the Arch CI
-# container qualifies; it built it).
+# The HDR gamescope companion (see --gamescope in the header), verified by its banner and its WSI
+# layer rather than trusted by filename. Executing the staged binary needs a build box the binary
+# runs on (the Arch CI container qualifies; it built it).
 if [ -n "$GAMESCOPE" ]; then
   [ -f "$GAMESCOPE" ] || { echo "no such package: $GAMESCOPE" >&2; exit 1; }
   if command -v bsdtar >/dev/null 2>&1; then
@@ -73,19 +72,8 @@ if [ -n "$GAMESCOPE" ]; then
   else
     tar -C "$STAGE" -xf "$GAMESCOPE" usr
   fi
-  GS_BIN="$STAGE/usr/bin/punktfunk-gamescope"
-  [ -x "$GS_BIN" ] || { echo "$GAMESCOPE did not provide usr/bin/punktfunk-gamescope" >&2; exit 1; }
-  "$GS_BIN" --version 2>&1 | grep -q '+pfhdr' || {
-    echo "$GAMESCOPE's binary has no +pfhdr marker — it is not a punktfunk HDR build" >&2; exit 1; }
-  # The package carries the Vulkan WSI layer alongside the compositor and the extraction above takes
-  # the whole `usr`, so this is an assertion rather than a step — but a silent one is exactly how
-  # this went wrong before: an image with the compositor and no layer streams HDR while every game
-  # inside it renders SDR, and nothing anywhere says why.
-  for f in usr/lib/punktfunk/libVkLayer_PUNKTFUNK_gamescope_wsi.so \
-           usr/lib/punktfunk/vulkan/implicit_layer.d/punktfunk_gamescope_wsi.json; do
-    [ -f "$STAGE/$f" ] || { echo "$GAMESCOPE has no $f — no game HDR without it" >&2; exit 1; }
-  done
-  echo "folded in $("$GS_BIN" --version 2>&1 | head -1) + its WSI layer"
+  pf_verify_gamescope "$STAGE" "$GAMESCOPE"
+  echo "folded in $("$STAGE/usr/bin/punktfunk-gamescope" --version 2>&1 | head -1) + its WSI layer"
 fi
 
 # The marker systemd-sysext requires to merge the image. ID=_any merges onto ANY host os-release
@@ -96,71 +84,10 @@ ID=_any
 ARCHITECTURE=x86-64
 EOF
 
-# CAP_SYS_NICE on the encode worker (see the header). A pacman payload carries no capabilities and
-# no scriptlet ever runs for a sysext, so without this the SteamOS image ships the lever inert —
-# on the box with the smallest GPU shared between game and encode. Needs CAP_SETFCAP, i.e. root or
-# fakeroot; a plain-user build simply ships without it, which is a pacing loss and nothing more.
-#
-# `getcap` on an uncapped file exits 0 and prints nothing, so an empty read is unambiguous; the
-# output form differs across libcap versions ("path cap_sys_nice=ep" since ~2.36, "path =
-# cap_sys_nice+ep" before), hence the normalizer.
-_pf_caps_of() {
-  local raw; raw="$(getcap "$1" 2>/dev/null || true)"
-  [ -n "$raw" ] || { printf ''; return 0; }
-  printf '%s' "${raw#* }" | sed -e 's/^= *//' -e 's/+/=/' -e 's/[[:space:]]*$//'
-}
-
-# BEFORE granting: refuse a capability that arrived from somewhere else. The setcap below would
-# overwrite it and ship a correct-looking image while the surprise went unreported everywhere else.
-# Order matters: assert first, then grant, or the "anything else" arm can never fire.
-if command -v getcap >/dev/null 2>&1 && [ -f "$STAGE/usr/bin/punktfunk-encode-worker" ]; then
-  arrived_caps="$(_pf_caps_of "$STAGE/usr/bin/punktfunk-encode-worker")"
-  case "$arrived_caps" in
-    ''|cap_sys_nice=ep) : ;;
-    *)
-      echo "ERROR: staged usr/bin/punktfunk-encode-worker ARRIVED carrying '$arrived_caps'." >&2
-      echo "       A pacman payload carries no capabilities, so something else granted it — find" >&2
-      echo "       out what, because it is doing the same on the plain package path, unchecked." >&2
-      exit 1 ;;
-  esac
-fi
-
-if [ -f "$STAGE/usr/bin/punktfunk-encode-worker" ]; then
-  if setcap 'cap_sys_nice=ep' "$STAGE/usr/bin/punktfunk-encode-worker" 2>/dev/null; then
-    echo "granted CAP_SYS_NICE to usr/bin/punktfunk-encode-worker (GPU-priority lever active)"
-  else
-    echo "WARNING: could not setcap CAP_SYS_NICE on usr/bin/punktfunk-encode-worker (need" >&2
-    echo "         root/CAP_SETFCAP) — the image ships without it and PyroWave encodes at" >&2
-    echo "         default GPU priority." >&2
-  fi
-fi
-
-# Assert the final matrix before it is sealed into a read-only squashfs: host EMPTY (hard fail),
-# worker exactly cap_sys_nice=ep or nothing at all (missing is fine — the grant is best-effort).
-if command -v getcap >/dev/null 2>&1; then
-  if [ -f "$STAGE/usr/bin/punktfunk-host" ]; then
-    staged_caps="$(_pf_caps_of "$STAGE/usr/bin/punktfunk-host")"
-    if [ -n "$staged_caps" ]; then
-      echo "ERROR: staged usr/bin/punktfunk-host carries capabilities: $staged_caps" >&2
-      echo "       A capability makes the host unidentifiable to KWin and breaks every Desktop-mode" >&2
-      echo "       session on a merged image, which cannot be repaired on the box (read-only /usr)." >&2
-      echo "       The GPU-priority capability belongs on usr/bin/punktfunk-encode-worker, never here." >&2
-      exit 1
-    fi
-  fi
-  if [ -f "$STAGE/usr/bin/punktfunk-encode-worker" ]; then
-    worker_caps="$(_pf_caps_of "$STAGE/usr/bin/punktfunk-encode-worker")"
-    case "$worker_caps" in
-      '')              echo "note: usr/bin/punktfunk-encode-worker ships uncapped — PyroWave encodes at default GPU priority" ;;
-      cap_sys_nice=ep) : ;;
-      *)
-        echo "ERROR: staged usr/bin/punktfunk-encode-worker carries '$worker_caps'," >&2
-        echo "       expected exactly 'cap_sys_nice=ep' (or nothing at all)." >&2
-        echo "       Refusing to bake an unexpected capability into a read-only image." >&2
-        exit 1 ;;
-    esac
-  fi
-fi
+# CAP_SYS_NICE on the encode worker, never the host, then both halves of the matrix (see the
+# header). Needs CAP_SETFCAP, i.e. root or fakeroot; a plain-user build ships the worker uncapped,
+# which is a pacing loss and nothing more.
+pf_seal_caps "$STAGE" "A pacman payload carries no capabilities, so something else granted it."
 
 OUT="$NAME.raw"
 rm -f "$OUT"

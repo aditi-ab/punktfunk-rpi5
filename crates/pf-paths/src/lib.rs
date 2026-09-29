@@ -7,10 +7,16 @@
 //! [`seat_home`] is the XDG data dir a seat's nested Steam runs under.
 //! [`create_private_dir`] / [`create_secret_dir`] / [`write_secret_file`] apply
 //! 0700 / 0600 on Unix and a restrictive DACL on Windows. Secret dirs omit the
-//! `BUILTIN\Users` read grant the config dir needs for the tray.
+//! `BUILTIN\Users` read grant the config dir needs for the tray. [`replace_file`] /
+//! [`replace_secret_file`] are the one temp-and-rename writer for stores. [`system32`] is how a
+//! privileged process names a Windows system tool; [`remove_device`] runs one. [`seat`] is the
+//! Windows multi-seat marker.
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
+
+#[cfg(target_os = "windows")]
+pub mod seat;
 
 /// `$XDG_RUNTIME_DIR/punktfunk-gamescope-ei` (per-user 0700), or `/tmp/…`
 /// when the runtime dir is unset. `pf-vdisplay` writes it under the session
@@ -86,21 +92,39 @@ pub fn seat_record(id: &str) -> PathBuf {
 }
 
 /// `$XDG_DATA_HOME/punktfunk`, else `~/.local/share/punktfunk`. Separate from
-/// [`config_dir`]: a seat home holds a Steam install, not configuration.
-#[cfg(target_os = "linux")]
-fn data_dir() -> PathBuf {
-    std::env::var_os("XDG_DATA_HOME")
+/// [`config_dir`]: it holds installs (a seat's Steam, managed emulators), and the plugin
+/// runner shares nothing under the config dir.
+#[cfg(not(target_os = "windows"))]
+pub fn data_dir() -> PathBuf {
+    xdg_home("XDG_DATA_HOME", ".local/share").join("punktfunk")
+}
+
+/// `$var` when it holds an absolute path, else `$HOME/<fallback>`. The XDG base-dir spec
+/// ignores an empty or relative value.
+#[cfg(not(windows))]
+fn xdg_home(var: &str, fallback: &str) -> PathBuf {
+    xdg_home_from(std::env::var_os(var), std::env::var_os("HOME"), fallback)
+}
+
+#[cfg(not(windows))]
+fn xdg_home_from(
+    value: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    fallback: &str,
+) -> PathBuf {
+    value
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .filter(|p| p.is_absolute())
+        .or_else(|| home.map(|h| PathBuf::from(h).join(fallback)))
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("punktfunk")
 }
 
 /// Host identity, pairing, mgmt token, library.
 ///
 /// Windows uses `%ProgramData%` so the SYSTEM service and the interactive
-/// user share one dir that survives logout. `PUNKTFUNK_CONFIG_DIR` overrides.
+/// user share one dir that survives logout. Elsewhere `$XDG_CONFIG_HOME`, ignored
+/// when empty or relative. `PUNKTFUNK_CONFIG_DIR` overrides.
 pub fn config_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("PUNKTFUNK_CONFIG_DIR").filter(|s| !s.is_empty()) {
         return PathBuf::from(dir);
@@ -111,10 +135,7 @@ pub fn config_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     #[cfg(not(target_os = "windows"))]
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."));
+    let base = xdg_home("XDG_CONFIG_HOME", ".config");
     base.join("punktfunk")
 }
 
@@ -135,6 +156,31 @@ pub fn published_mgmt_port_in(dir: &std::path::Path) -> Option<u16> {
         .trim_end_matches('/')
         .rsplit_once(':')
         .and_then(|(_, port)| port.parse().ok())
+}
+
+/// `host.env`'s `KEY=VALUE` grammar, as the Windows service loads it into its environment.
+pub mod env_file {
+    /// Each entry in file order: lines trimmed, `#` comments and lines without `=` skipped,
+    /// split on the first `=`, both sides trimmed, surrounding quotes stripped.
+    pub fn parse(text: &str) -> impl Iterator<Item = (&str, &str)> {
+        text.lines().filter_map(|line| {
+            let line = line.trim();
+            if line.starts_with('#') {
+                return None;
+            }
+            let (key, value) = line.split_once('=')?;
+            let key = key.trim();
+            (!key.is_empty()).then(|| (key, value.trim().trim_matches('"')))
+        })
+    }
+
+    /// The value `key` ends up with: a later line wins.
+    pub fn get<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+        parse(text)
+            .filter(|(k, _)| *k == key)
+            .last()
+            .map(|(_, v)| v)
+    }
 }
 
 /// Tightens an already-existing dir. Windows refuses a reparse point
@@ -262,7 +308,7 @@ pub fn restrict_existing_secret_file(path: &std::path::Path) {
     if !path.exists() {
         return;
     }
-    let icacls = icacls_path();
+    let icacls = system32("icacls.exe");
     let _ = std::process::Command::new(&icacls)
         .arg(path.as_os_str())
         .args(["/setowner", "*S-1-5-32-544"]) // BUILTIN\Administrators
@@ -278,12 +324,40 @@ pub fn restrict_existing_secret_file(path: &std::path::Path) {
 #[cfg(not(windows))]
 pub fn restrict_existing_secret_file(_path: &std::path::Path) {}
 
-/// `icacls` by absolute path — a privileged service must never resolve it through `PATH`.
+/// `%SystemRoot%\System32\<rel>`, else under `%WINDIR%`, else `C:\Windows`.
+///
+/// `CreateProcess` searches the exe's directory and the cwd before `PATH`, and the callers run
+/// elevated or as SYSTEM, so a system tool is never spawned by bare name. `rel` may carry a
+/// subdirectory (`WindowsPowerShell\v1.0\powershell.exe`). Ungated: string work only.
+pub fn system32(rel: &str) -> String {
+    let root = std::env::var("SystemRoot")
+        .or_else(|_| std::env::var("WINDIR"))
+        .unwrap_or_else(|_| r"C:\Windows".to_string());
+    format!(r"{root}\System32\{rel}")
+}
+
+/// `pnputil /remove-device` by absolute path: an uninstaller must not depend on `%PATH%`.
+/// `Err` carries pnputil's exit status and message, or why it did not run.
 #[cfg(windows)]
-fn icacls_path() -> String {
-    std::env::var("SystemRoot")
-        .map(|r| format!("{r}\\System32\\icacls.exe"))
-        .unwrap_or_else(|_| "icacls".to_string())
+pub fn remove_device(instance_id: &str) -> std::io::Result<()> {
+    let o = std::process::Command::new(system32("pnputil.exe"))
+        .args(["/remove-device", instance_id])
+        .output()
+        .map_err(|e| std::io::Error::new(e.kind(), format!("run pnputil: {e}")))?;
+    if o.status.success() {
+        return Ok(());
+    }
+    // Whichever stream pnputil wrote its reason to.
+    let msg = if o.stderr.is_empty() {
+        &o.stdout
+    } else {
+        &o.stderr
+    };
+    Err(std::io::Error::other(format!(
+        "pnputil /remove-device {}: {}",
+        o.status,
+        String::from_utf8_lossy(msg).trim()
+    )))
 }
 
 /// Default `%ProgramData%` lets `BUILTIN\Users` create and become
@@ -292,7 +366,7 @@ fn icacls_path() -> String {
 /// `(OI)(CI)(RX)` so the tray can read non-secret config. Hard-coded SIDs; never fatal.
 #[cfg(windows)]
 fn restrict_dir_to_system_admins(dir: &std::path::Path, deep: bool, users_read: bool) {
-    let icacls = icacls_path();
+    let icacls = system32("icacls.exe");
     // Re-own to Administrators first: an owner keeps WRITE_DAC.
     // `deep` (once per dir per process) also re-owns contents; directory-only
     // left planted files still writable by their creator.
@@ -348,6 +422,7 @@ fn restrict_dir_to_system_admins(dir: &std::path::Path, deep: bool, users_read: 
 /// The DACL step is fatal; a failure unlinks the still-empty file. Do not
 /// write first: the config dir grants `Users (OI)(CI)(RX)`, so a newborn
 /// secret is Users-readable for the life of the `icacls` child.
+/// The bytes reach the disk before return, so a rename after it never publishes an empty file.
 pub fn write_secret_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     // Never write a secret through a link: the bytes would land on the attacker's target.
@@ -392,7 +467,7 @@ pub fn write_secret_file(path: &std::path::Path, contents: &[u8]) -> std::io::Re
         return Err(e);
     }
     f.write_all(contents)?;
-    f.flush()?;
+    f.sync_all()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -401,13 +476,82 @@ pub fn write_secret_file(path: &std::path::Path, contents: &[u8]) -> std::io::Re
     Ok(())
 }
 
+/// Replace `path` with `contents` through a synced sibling temp and a rename: a reader or a
+/// power cut sees the old file or the new one, never half of either. Default permissions; the
+/// parent is made with `create_dir_all`.
+pub fn replace_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    replace(path, contents, false)
+}
+
+/// [`replace_file`] for an owner-only file: the parent is a [`create_private_dir`] and the temp
+/// a [`write_secret_file`], whose mode or DACL the rename carries to `path`.
+pub fn replace_secret_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    replace(path, contents, true)
+}
+
+/// The temp is removed on every error. A crash between write and rename leaves it behind:
+/// nothing reaps `*.tmp`, since another writer may own an in-flight one.
+fn replace(path: &std::path::Path, contents: &[u8], secret: bool) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        if secret {
+            create_private_dir(dir)?;
+        } else {
+            std::fs::create_dir_all(dir)?;
+        }
+    }
+    let tmp = TmpFile(Some(unique_tmp_path(path)));
+    if secret {
+        write_secret_file(tmp.path(), contents)?;
+    } else {
+        use std::io::Write;
+        let mut f = std::fs::File::create(tmp.path())?;
+        f.write_all(contents)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(tmp.path(), path)?;
+    tmp.published();
+    Ok(())
+}
+
+/// `<name>.<pid>.<n>.tmp`. The pid keeps the CLI and the service apart; `n` keeps threads
+/// apart, since [`write_secret_file`] unlinks whatever already holds the name.
+fn unique_tmp_path(path: &std::path::Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.{n}.tmp", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// Owns a temp until [`Self::published`]; dropping it earlier deletes the file.
+struct TmpFile(Option<PathBuf>);
+
+impl TmpFile {
+    fn path(&self) -> &std::path::Path {
+        self.0.as_deref().expect("disarmed only by consuming self")
+    }
+    /// The rename landed: the path is the real file now.
+    fn published(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for TmpFile {
+    fn drop(&mut self) {
+        if let Some(p) = &self.0 {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 /// OWNER RIGHTS is the creating account (SYSTEM service or a manual run).
 /// Failure is returned: [`write_secret_file`] treats it as fatal (only
 /// control over the bytes about to be written); [`restrict_existing_secret_file`]
 /// only warns.
 #[cfg(windows)]
 fn restrict_to_system_admins(path: &std::path::Path) -> std::io::Result<()> {
-    let icacls = icacls_path();
+    let icacls = system32("icacls.exe");
     let status = std::process::Command::new(icacls)
         .arg(path.as_os_str())
         .args([
@@ -435,6 +579,22 @@ fn restrict_to_system_admins(path: &std::path::Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_file_reads_host_env_as_the_service_does() {
+        let text = "# PUNKTFUNK_MGMT_BIND=commented\n  PUNKTFUNK_MGMT_BIND = \"0.0.0.0:48123\" \n\
+                    no equals\n=orphan\nRUST_LOG=info\nRUST_LOG=debug\n";
+        assert_eq!(
+            env_file::parse(text).collect::<Vec<_>>(),
+            [
+                ("PUNKTFUNK_MGMT_BIND", "0.0.0.0:48123"),
+                ("RUST_LOG", "info"),
+                ("RUST_LOG", "debug"),
+            ]
+        );
+        assert_eq!(env_file::get(text, "RUST_LOG"), Some("debug"));
+        assert_eq!(env_file::get(text, "PUNKTFUNK_UI_BIND"), None);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -481,6 +641,42 @@ mod tests {
         let record = seat_record("cafe0123");
         assert_eq!(record.parent(), seat.parent());
         assert!(!record.starts_with(&seat), "{}", record.display());
+    }
+
+    #[test]
+    fn system_tools_resolve_under_system32_never_by_bare_name() {
+        let p = system32("icacls.exe");
+        assert!(p.ends_with(r"\System32\icacls.exe"), "{p}");
+        assert!(
+            p.len() > r"\System32\icacls.exe".len(),
+            "a root, not a bare name: {p}"
+        );
+        let ps = system32(r"WindowsPowerShell\v1.0\powershell.exe");
+        assert!(
+            ps.ends_with(r"\System32\WindowsPowerShell\v1.0\powershell.exe"),
+            "{ps}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn an_empty_or_relative_xdg_value_falls_back_to_home() {
+        let home = || Some("/home/u".into());
+        for bad in ["", "punktfunk-rel"] {
+            assert_eq!(
+                xdg_home_from(Some(bad.into()), home(), ".config"),
+                PathBuf::from("/home/u/.config"),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            xdg_home_from(Some("/xdg".into()), home(), ".config"),
+            PathBuf::from("/xdg")
+        );
+        assert_eq!(
+            xdg_home_from(None, home(), ".local/share"),
+            PathBuf::from("/home/u/.local/share")
+        );
     }
 
     #[test]
@@ -558,6 +754,52 @@ mod tests {
         std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o644)).unwrap();
         write_secret_file(&planted, b"new").unwrap();
         assert_eq!(mode(&planted), 0o600);
+
+        let store = dir.join("store").join("hooks.json");
+        replace_file(&store, b"plain").unwrap();
+        replace_secret_file(&store, b"secret").unwrap();
+        assert_eq!(mode(&store), 0o600, "the rename carries the temp's mode");
+        assert_eq!(mode(store.parent().unwrap()), 0o700);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn names(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn temp_names_never_repeat_and_stay_beside_the_file() {
+        let path = PathBuf::from("/tmp/pf/display-settings.json");
+        let (a, b) = (unique_tmp_path(&path), unique_tmp_path(&path));
+        assert_ne!(a, b, "a shared temp name is what two writers collide on");
+        assert_eq!(a.parent(), path.parent(), "rename stays intra-filesystem");
+        let name = a.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("display-settings.json."), "{name}");
+        assert!(name.ends_with(".tmp"), "{name}");
+    }
+
+    #[test]
+    fn a_replace_lands_whole_and_a_failed_one_leaves_no_temp() {
+        let dir = std::env::temp_dir().join(format!("pf-paths-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("store.json");
+        replace_file(&path, b"first").unwrap();
+        replace_secret_file(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        assert_eq!(names(&dir), ["store.json"]);
+
+        // A non-empty directory on the target refuses the rename on every platform.
+        let blocked = dir.join("blocked.json");
+        std::fs::create_dir_all(blocked.join("child")).unwrap();
+        assert!(replace_file(&blocked, b"x").is_err());
+        assert!(replace_secret_file(&blocked, b"x").is_err());
+        assert_eq!(names(&dir), ["blocked.json", "store.json"]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

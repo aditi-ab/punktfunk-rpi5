@@ -58,8 +58,8 @@ enum PresenterChoice: Equatable {
     ///
     /// Stage-2 remains a faithful arrival-pacing A/B. Stage-4 is limited to iOS/tvOS because the
     /// macOS path has separate synchronization constraints. `decoded` is tvOS-only because its
-    /// latency win and displayed-IOSurface metering are validated there. Stage-1 additionally
-    /// requires the caller's release-build gate.
+    /// displayed-IOSurface metering is validated there. Stage-1 additionally requires the
+    /// caller's release-build gate.
     static func explicit(setting: String?, env: String?, allowStage1: Bool) -> PresenterChoice? {
         let raw = env.flatMap { $0.isEmpty ? nil : $0 } ?? setting
         switch raw {
@@ -83,21 +83,17 @@ enum PresenterChoice: Equatable {
         }
     }
 
-    /// iOS uses deadline-paced Metal, tvOS the decoded video plane, and macOS arrival-paced Metal.
+    /// iOS and tvOS use deadline-paced Metal, macOS arrival-paced Metal.
     ///
-    /// A fixed-rate Apple TV vends CAMetalDisplayLink drawables about two refreshes before glass.
-    /// Passing VideoToolbox's decoded IOSurface directly to AVSampleBufferVideoRenderer removes
-    /// that reservation and the Metal FIFO: the measured display stage falls from 28–32 ms to
-    /// about 10–12 ms at 60 fps. tvOS before 17.4 retains deadline pacing because it cannot query
-    /// the displayed IOSurface for metrics; PyroWave, 4:4:4, and Smoothness retain Metal.
+    /// The deadline link late-latches each drawable to one refresh + 4 ms before glass
+    /// (`LatchBudget`). Filmed at 240 fps on a 60 Hz Apple TV, that answered controller presses
+    /// 9 ms sooner than the decoded video plane, whose displayed-surface metric reads about a
+    /// refresh early. `decoded` stays an explicit A/B on tvOS 17.4+.
     static var platformDefault: PresenterChoice {
-        #if os(iOS)
-        return .stage4
-        #elseif os(tvOS)
-        if #available(tvOS 17.4, *) { return .decoded }
-        return .stage4
-        #else
+        #if os(macOS)
         return .stage2
+        #else
+        return .stage4
         #endif
     }
 }
@@ -138,22 +134,32 @@ enum PresentPriority: Equatable {
     }
 }
 
+/// The system video renderers a visionOS theater screen and its floor reflection draw from.
+/// While a session holds them it presents into them in place of its view.
+public final class TheaterRenderers {
+    public let screen = AVSampleBufferVideoRenderer()
+    public let reflection = AVSampleBufferVideoRenderer()
+
+    public init() {}
+
+    /// Whether `connection`'s frames can reach a system video renderer: the decoded path takes
+    /// VideoToolbox's biplanar 4:2:0 output, so PyroWave and 4:4:4 stay on Metal.
+    public static func supports(_ connection: PunktfunkConnection) -> Bool {
+        connection.videoCodec != .pyrowave && !connection.isChroma444
+    }
+}
+
 final class SessionPresenter {
     /// Map a presenter choice and codec to its execution path.
     ///
     /// The decoded tvOS path requires a CVPixelBuffer, so PyroWave retains deadline-paced Metal.
-    /// Stage-3 and stage-4 map directly to glass and deadline pacing. On macOS, default PyroWave
-    /// uses glass gating to coalesce its bursty, near-instant decode output; an explicit stage-2
-    /// selection remains a faithful arrival-pacing comparison. Other stage-2 sessions use arrival.
-    static func pacing(
-        for choice: PresenterChoice, explicit: PresenterChoice?, codec: VideoCodec
-    ) -> PresentPacing {
+    /// Stage-3 and stage-4 map directly to glass and deadline pacing; stage-2 is arrival for every
+    /// codec. Glass gating waits for the previous frame's on-glass callback, about a refresh per
+    /// frame.
+    static func pacing(for choice: PresenterChoice, codec: VideoCodec) -> PresentPacing {
         if choice == .decoded { return codec == .pyrowave ? .deadline : .decoded }
         if choice == .stage4 { return .deadline }
         if choice == .stage3 { return .glass }
-        #if os(macOS)
-        if explicit == nil, codec == .pyrowave { return .glass }
-        #endif
         return .arrival
     }
 
@@ -177,21 +183,10 @@ final class SessionPresenter {
     /// build that queue—deadline pacing or tvOS's decoded video plane—not a deeper gate.
     ///
     #if os(macOS)
-    /// Resolve the windowed (composited) present MECHANISM for this session — the DCP
-    /// swapID-panic mitigation picker (see `WindowedPresentMode`). The
-    /// `PUNKTFUNK_WINDOWED_PRESENT=async|transaction|surface` env lever wins (dev A/B);
-    /// otherwise the user's safe-present setting: ON/unset → `.transaction` (the validated
-    /// mitigation), OFF → `.async` (the fast pre-mitigation path — the panic returns on
-    /// affected high-refresh setups; the Settings caption says so). `.surface` is currently
-    /// env-only (prototype — HDR-composite verification owed). Fullscreen always presents
-    /// async regardless (`setComposited`). Internal (not private) for unit tests.
-    static func windowedPresentMode(setting: Bool?, env: String?) -> WindowedPresentMode {
-        if let env, let mode = WindowedPresentMode(rawValue: env) { return mode }
-        return (setting ?? true) ? .transaction : .async
-    }
-
     /// Adaptive-refresh latency sessions choose immediate sparse presents or one dense present per
-    /// display-link target. Smoothness and the other presenters keep their own pacing mechanisms.
+    /// display-link target: on arrival, a 120 fps stream on a ProMotion panel loses about a tenth
+    /// to a fifth of its frames, PyroWave included. Smoothness and the other presenters keep their
+    /// own pacing mechanisms.
     static func adaptiveSlotPaced(
         adaptiveSync: Bool, priority: PresentPriority, pacing: PresentPacing
     ) -> Bool {
@@ -201,8 +196,7 @@ final class SessionPresenter {
 
     /// `PUNKTFUNK_GATE_DEPTH` (1…3) still overrides on iOS/tvOS so the standing-queue ladder
     /// stays reproducible on-device; macOS is pinned to 1, env ignored — a deeper gate only builds
-    /// a standing queue (see above), and macOS glass pacing exists for PyroWave smoothness
-    /// (see `pacing`), where depth 1 is the point. Internal (not private) for unit tests.
+    /// a standing queue (see above). Internal (not private) for unit tests.
     static func gateDepth(env: String?) -> Int {
         #if os(macOS)
         return 1
@@ -226,22 +220,28 @@ final class SessionPresenter {
         #endif
     }
 
+    private(set) var theater: TheaterRenderers?
+
+    /// Move a running session into `renderers`, or back to the view with nil. Costs one IDR.
+    /// Main thread.
+    func setTheater(_ renderers: TheaterRenderers?) {
+        guard renderers !== theater else { return }
+        theater = renderers
+        restartPresentation()
+    }
+
     private var pump: StreamPump?
     private var stage2: Stage2Pipeline?
     private var stage2Link: CADisplayLink?
+    private var panel = PanelInfo(minHz: 0, maxHz: 0)
+
+    /// The hosting screen's refresh range and granularity, from the view on start and every
+    /// layout (a window can move screens). Main thread. Diagnostics only.
+    func setPanel(_ info: PanelInfo) {
+        panel = info
+        stage2?.setPanel(info)
+    }
     private var metalLayer: CAMetalLayer?
-    #if os(macOS)
-    /// The windowed present MECHANISM this session runs while composited (resolved once per
-    /// session in `start` — the user's safe-present setting + the PUNKTFUNK_WINDOWED_PRESENT
-    /// dev override) and the routing last pushed to the pipeline — see `setComposited` (the DCP
-    /// swapID-panic mitigation). Main-thread only, like all of this.
-    private var windowedMode: WindowedPresentMode = .transaction
-    private var windowedPresentApplied: WindowedPresentMode = .async
-    /// The windowed `surface` present target (sibling above `metalLayer`, transparent while
-    /// unused) — installed whenever stage-2 runs so a mechanism flip never has to mutate the
-    /// layer tree mid-session.
-    private var surfaceLayer: CALayer?
-    #endif
     private var connection: PunktfunkConnection?
     /// Re-runs this session's `start` with its own arguments on the given base layer — the
     /// wedged-presenter cure (`rebuildPresentation`) and the move between screens (`move(to:)`).
@@ -261,16 +261,20 @@ final class SessionPresenter {
     /// one here is the "black bars + stretched" resize artifact. nil until the first frame → `layout`
     /// falls back to `currentMode()`. Main-thread only.
     private var contentSize: CGSize?
+    /// The screen verdict the running pipeline chose its pacing from, and its live source.
+    private var builtAdaptive = false
+    private var adaptiveSync: () -> Bool = { false }
 
     /// Start the resolved presenter for `connection`.
     ///
     /// Stage-1 sends compressed samples to `baseLayer`; tvOS's decoded path sends it VideoToolbox
-    /// output. Metal paths leave that layer idle and overlay their own CAMetalLayer. The supplied
+    /// output, and a visionOS theater takes that output in `baseLayer`'s place. Metal paths leave
+    /// that layer idle and overlay their own CAMetalLayer. The supplied
     /// display-link factory tracks the hosting display for ordinary pacing and decoded-frame
     /// metering; deadline pacing owns a CAMetalDisplayLink instead.
     ///
     /// Call `layout(in:contentsScale:)` after start so any Metal sublayer has valid geometry.
-    /// `adaptiveSync` is the hosting screen's fixed-vs-adaptive verdict on macOS.
+    /// `adaptiveSync` reads the hosting screen's fixed-vs-adaptive verdict on macOS, once per build.
     func start(
         connection: PunktfunkConnection,
         baseLayer: AVSampleBufferDisplayLayer,
@@ -280,17 +284,23 @@ final class SessionPresenter {
         onSessionEnd: (@Sendable () -> Void)?,
         onDecodedSize: (@Sendable (Int, Int) -> Void)? = nil,
         onFrameHDR: (@Sendable (Bool) -> Void)? = nil,
-        adaptiveSync: Bool = false
+        adaptiveSync: @escaping () -> Bool = { false }
     ) {
         stop()
         self.connection = connection
         self.baseLayer = baseLayer
+        self.adaptiveSync = adaptiveSync
+        builtAdaptive = adaptiveSync()
         restart = { [weak self] layer in
-            self?.start(
+            guard let self else { return }
+            // The Pencil reports proximity on its edges only, so the new pipeline is told here.
+            let boost = interactionBoost
+            start(
                 connection: connection, baseLayer: layer, endToEndMeter: endToEndMeter,
                 makeDisplayLink: makeDisplayLink,
                 onFrame: onFrame, onSessionEnd: onSessionEnd, onDecodedSize: onDecodedSize,
                 onFrameHDR: onFrameHDR, adaptiveSync: adaptiveSync)
+            setInteractionBoost(boost)
         }
 
         // Explicit decode stays default so loss recovery and decode metering survive. Presentation
@@ -311,19 +321,20 @@ final class SessionPresenter {
             env: ProcessInfo.processInfo.environment["PUNKTFUNK_PRESENTER"],
             allowStage1: allowStage1)
         let choice = explicit ?? PresenterChoice.platformDefault
-        let selectedPacing = Self.pacing(
-            for: choice, explicit: explicit, codec: connection.videoCodec)
+        let selectedPacing = Self.pacing(for: choice, codec: connection.videoCodec)
         let priority = PresentPriority.resolve(
             setting: connection.settings.presentPriority,
             bufferSetting: connection.settings.smoothBuffer)
         // Direct video presentation is the zero-buffer latency path. A user who asks for a
         // smoothness buffer keeps the existing deadline engine, where FrameStore owns that buffer.
-        let pacing = Self.effectivePacing(
+        var pacing = Self.effectivePacing(
             selectedPacing, priority: priority, videoLayerCompatible: !connection.isChroma444)
+        let theater = theater.flatMap { TheaterRenderers.supports(connection) ? $0 : nil }
+        if theater != nil { pacing = .decoded }
         #if os(macOS)
         let vsyncPaced = priority != .latency && pacing == .arrival
         let adaptiveSlotPaced = Self.adaptiveSlotPaced(
-            adaptiveSync: adaptiveSync, priority: priority, pacing: pacing)
+            adaptiveSync: builtAdaptive, priority: priority, pacing: pacing)
         #else
         let vsyncPaced = false
         let adaptiveSlotPaced = false
@@ -331,7 +342,9 @@ final class SessionPresenter {
         if choice != .stage1,
            let pipeline = Stage2Pipeline(
                endToEndMeter: endToEndMeter,
-               displayLayer: pacing == .decoded ? baseLayer : nil,
+               videoRenderer: pacing == .decoded
+                   ? theater?.screen ?? baseLayer.sampleBufferRenderer : nil,
+               mirrorRenderer: theater?.reflection,
                pacing: pacing,
                gateDepth: Self.gateDepth(
                    env: ProcessInfo.processInfo.environment["PUNKTFUNK_GATE_DEPTH"]),
@@ -339,7 +352,9 @@ final class SessionPresenter {
                vsyncPaced: vsyncPaced,
                adaptiveSlotPaced: adaptiveSlotPaced) {
             pipeline.onPresentWedged = { [weak self] in
-                DispatchQueue.main.async { self?.rebuildPresentation() }
+                // The presenter lives on main; the hop only carries the reference back there.
+                nonisolated(unsafe) let presenter = self
+                DispatchQueue.main.async { presenter?.rebuildPresentation() }
             }
             let metal = pipeline.layer
             // Metal pacing overlays the idle video layer. The decoded path leaves the backing
@@ -348,18 +363,6 @@ final class SessionPresenter {
                 baseLayer.addSublayer(metal)
                 metalLayer = metal
             }
-            #if os(macOS)
-            windowedPresentApplied = .async
-            // Resolve THIS session's windowed mechanism once (setting + dev env lever) —
-            // `setComposited` routes between it and fullscreen-async from every layout.
-            windowedMode = Self.windowedPresentMode(
-                setting: connection.settings.windowedSafePresent,
-                env: ProcessInfo.processInfo.environment["PUNKTFUNK_WINDOWED_PRESENT"])
-            // The surface present target sits ABOVE the metal layer: transparent (nil contents)
-            // unless the surface mechanism actually presents, covering it while it does.
-            baseLayer.addSublayer(pipeline.surfaceLayer)
-            surfaceLayer = pipeline.surfaceLayer
-            #endif
             stage2 = pipeline
             // The ordinary link supplies the vsync grid, retries transient Metal drawable misses,
             // and polls which decoded IOSurface reached glass. Frame arrival remains the render
@@ -376,6 +379,7 @@ final class SessionPresenter {
                 stage2Link = link
             }
             syncFrameRate(hz: connection.currentMode().refreshHz)
+            pipeline.setPanel(panel)
             pipeline.start(
                 connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd,
                 onDecodedSize: onDecodedSize, onFrameHDR: onFrameHDR)
@@ -387,6 +391,16 @@ final class SessionPresenter {
             self.pump = pump
         }
     }
+
+    /// Pen-proximity panel-rate boost pass-through (Stage2Pipeline.setInteractionBoost):
+    /// deadline pacing only — under arrival/glass the staged hint feeds no link, so this
+    /// is a no-op there. Kept here so a rebuilt pipeline starts boosted. MAIN thread.
+    func setInteractionBoost(_ on: Bool) {
+        interactionBoost = on
+        stage2?.setInteractionBoost(on)
+    }
+
+    private var interactionBoost = false
 
     /// Hint the display link with the stream's cadence. On iOS/tvOS a range is always required:
     /// without one, ProMotion devices cap CADisplayLink at 60 Hz (iPhones additionally need
@@ -400,13 +414,6 @@ final class SessionPresenter {
     /// drop its physical refresh to match the content. VRR off falls back to a fixed floor:
     /// iOS keeps 30 Hz; macOS pins the link at the stream rate (see `frameRateRange`).
     /// Re-applied from `layout` so a mid-session `Reconfigure` picks up a new refresh.
-    /// Pen-proximity panel-rate boost pass-through (Stage2Pipeline.setInteractionBoost):
-    /// deadline pacing only — under arrival/glass the staged hint feeds no link, so this
-    /// is a no-op there. MAIN thread.
-    func setInteractionBoost(_ on: Bool) {
-        stage2?.setInteractionBoost(on)
-    }
-
     private func syncFrameRate(hz: UInt32) {
         guard hz > 0 else { return }
         // Deadline pacing: the hint goes to the pipeline's CAMetalDisplayLink instead (staged;
@@ -502,12 +509,6 @@ final class SessionPresenter {
         CATransaction.setDisableActions(true)
         metalLayer.contentsScale = contentsScale
         metalLayer.frame = snapped
-        #if os(macOS)
-        // The surface present target mirrors the metal layer's geometry exactly — its IOSurfaces
-        // are sized to the same snapped pixel rect, so the contents composite is a 1:1 blit too.
-        surfaceLayer?.contentsScale = contentsScale
-        surfaceLayer?.frame = snapped
-        #endif
         CATransaction.commit()
         // Hand the resulting pixel size to the render thread (it must not read layer geometry
         // cross-thread) — this is what the presenter sizes its drawable to. Uses the SNAPPED size so
@@ -535,35 +536,6 @@ final class SessionPresenter {
         contentSize = size
     }
 
-    #if os(macOS)
-    /// Route presents for the window's composited state (MAIN thread — the view pushes it on
-    /// every layout, which fullscreen transitions always trigger). A COMPOSITED (windowed)
-    /// session presents through this session's resolved mitigation mechanism (`windowedMode` —
-    /// transactional by default, see `windowedPresentMode`) instead of the async image queue —
-    /// the DCP "mismatched swapID's" kernel-panic mitigation (see `MetalVideoPresenter`; the
-    /// async-swap race survives glass pacing, so pacing alone was not enough). ALL codecs:
-    /// PyroWave hit it 2026-07-18 and windowed HEVC hit the same 240 Hz Mac Studio 2026-07-21 —
-    /// it is the async image queue itself, not any codec or present rate. Fullscreen keeps the
-    /// async path (direct scanout, lowest latency, no panic there). The full HDR/EDR render
-    /// path is preserved in every mechanism.
-    func setComposited(_ composited: Bool) {
-        guard let stage2 else { return }
-        let mode: WindowedPresentMode = composited ? windowedMode : .async
-        guard mode != windowedPresentApplied else { return }
-        let wasSurface = windowedPresentApplied == .surface
-        windowedPresentApplied = mode
-        stage2.setWindowedPresent(mode)
-        if wasSurface {
-            // Uncover the metal layer NOW (its last drawable is still attached, so fullscreen
-            // entry shows the previous frame until the next present — no black flash).
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            surfaceLayer?.contents = nil
-            CATransaction.commit()
-        }
-    }
-    #endif
-
     /// Rebuild the presentation on `layer`, keeping the connection: the picture moving between
     /// the phone and an attached monitor. The fresh display link binds to the screen `layer` is
     /// on. Costs one IDR; the caller re-runs `layout` for the new geometry. No-op before a session
@@ -573,6 +545,13 @@ final class SessionPresenter {
         let size = contentSize
         restart(layer)
         contentSize = size // the view drops the new pipeline's repeat of this size
+    }
+
+    /// The window moved to another screen. Pacing is chosen at build time, so rebuild (one IDR)
+    /// only when the fixed-vs-adaptive verdict flipped. Main thread.
+    func screenChanged() {
+        guard restart != nil, adaptiveSync() != builtAdaptive else { return }
+        restartPresentation()
     }
 
     /// `onPresentWedged`'s cure, hopped to MAIN: a fresh pipeline, presenter and CAMetalLayer on
@@ -602,6 +581,7 @@ final class SessionPresenter {
         restart = nil
         baseLayer = nil
         contentSize = nil // a new session re-derives it from its first frame
+        interactionBoost = false
         pump?.stop()
         pump = nil
         stage2Link?.invalidate()
@@ -610,11 +590,6 @@ final class SessionPresenter {
         stage2 = nil
         metalLayer?.removeFromSuperlayer()
         metalLayer = nil
-        #if os(macOS)
-        surfaceLayer?.removeFromSuperlayer()
-        surfaceLayer = nil
-        windowedPresentApplied = .async
-        #endif
         connection = nil
     }
 

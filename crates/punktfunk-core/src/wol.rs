@@ -1,7 +1,7 @@
 //! Wake-on-LAN magic-packet builder and broadcast sender.
 //!
 //! Fire-and-forget UDP; no `quic` feature and no async runtime. Rust clients
-//! call the `pub fn`s; Swift/iOS uses `punktfunk_wake_on_lan` in [`crate::abi`].
+//! call the `pub fn`s; Swift/iOS uses `punktfunk_wake_on_lan` in `punktfunk-ffi`.
 //!
 //! A sleeping host has no ARP entry, so unicast alone cannot wake it, and
 //! `255.255.255.255` from an unbound socket follows only the default route

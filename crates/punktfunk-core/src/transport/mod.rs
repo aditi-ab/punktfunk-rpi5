@@ -47,6 +47,10 @@ pub trait Transport: Send + Sync {
         self.send_batch(packets)
     }
 
+    /// Ask for GSO on this transport regardless of `PUNKTFUNK_GSO`. A path
+    /// that refused GSO stays on `sendmmsg`. Default: nothing to switch.
+    fn set_gso(&self, _on: bool) {}
+
     fn recv(&self) -> std::io::Result<Option<Vec<u8>>>;
 
     /// Receive up to `out.len()` datagrams into caller-owned `out[i]` buffers,

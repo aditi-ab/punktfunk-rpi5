@@ -97,6 +97,7 @@ impl<'a> Drive<'a> {
             au_published: false,
             submit_failures: 0,
             want_republish: false,
+            cursor_only: false,
             qpc_hz: qpc_frequency(),
             frame_interval: Duration::from_micros(1_000_000 / u64::from(fps.max(1))),
             last_frame: None,
@@ -161,6 +162,8 @@ pub struct Drive<'a> {
     submit_failures: u32,
     /// A keyframe was asked for; if nothing composes, re-encode the stash instead of waiting.
     want_republish: bool,
+    /// The frame last taken is a cursor-only re-encode.
+    cursor_only: bool,
     qpc_hz: u64,
     /// The display's frame period — the gap a cursor-only re-encode may fill.
     frame_interval: Duration,
@@ -272,7 +275,7 @@ impl Drive<'_> {
                         self.applied_kbps,
                     );
                 }
-                Ctl::SetHdrMeta(bytes) => self.enc.set_hdr_meta(Some(hdr_meta(&bytes))),
+                Ctl::SetHdrMeta(bytes) => self.enc.set_hdr_meta(hdr_meta(&bytes)),
                 Ctl::Flush => {
                     if let Err(e) = self.enc.flush() {
                         dbglog!("[pf-vd] encode: flush failed: {e:#}");
@@ -288,16 +291,27 @@ impl Drive<'_> {
     /// stash slot busy — the AU owed on it is about to free it. Every frame taken stamps
     /// `last_frame`: that is the clock the cursor-only cap runs on.
     fn take_next(&mut self) -> Option<(usize, u64, u64)> {
-        let next = self
+        let mut next = self
             .pool
             .take_full()
-            .or_else(|| self.want_republish.then(|| self.pool.republish()).flatten())
-            .or_else(|| self.cursor_frame());
+            .or_else(|| self.want_republish.then(|| self.pool.republish()).flatten());
+        self.cursor_only = next.is_none();
+        if self.cursor_only {
+            next = self.cursor_frame();
+        }
         if next.is_some() {
             self.want_republish = false;
             self.last_frame = Some(Instant::now());
         }
         next
+    }
+
+    fn drop_slot(&mut self, slot: usize) {
+        self.release_if_live(slot);
+        self.count_drop();
+        if self.cursor_only {
+            self.pool.cursor_changed();
+        }
     }
 
     /// Hand a slot back unless this thread was detached: its successor reclaimed every slot
@@ -308,21 +322,20 @@ impl Drive<'_> {
         }
     }
 
-    /// Submit one pool slot, or drop it where dropping is free. `false` means the backend has
-    /// failed [`MAX_SUBMIT_FAILURES`] times running and the thread leaves.
+    /// Submit one pool slot, or drop it where dropping is free. A dropped cursor-only frame
+    /// marks the pointer changed again, or the gesture's last position is never sent. `false`
+    /// means the backend has failed [`MAX_SUBMIT_FAILURES`] times running and the thread leaves.
     fn submit_one(&mut self, (slot, qpc, seq): (usize, u64, u64)) -> bool {
         // Back-pressure lands here: no free AU slot, no submit.
         if !self.section_has_free() {
-            self.release_if_live(slot);
-            self.count_drop();
+            self.drop_slot(slot);
             return true;
         }
         let pts = qpc_to_ns(if qpc == 0 { qpc_now() } else { qpc }, self.qpc_hz);
         let frame = match self.pool.frame(slot, pts) {
             Ok(f) => f,
             Err(_) => {
-                self.release_if_live(slot);
-                self.count_drop();
+                self.drop_slot(slot);
                 return true;
             }
         };

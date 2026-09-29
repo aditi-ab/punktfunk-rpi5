@@ -48,12 +48,12 @@ struct HomeView: View {
     /// The host whose page is pushed.
     @State private var detailTarget: StoredHost.ID?
     #endif
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     @Environment(\.horizontalSizeClass) private var sizeClass
     /// The host whose page is up as the iPad's sheet of sections.
     @State private var sectionsHost: StoredHost?
     #endif
-    #if os(iOS) || os(tvOS)
+    #if os(iOS) || os(visionOS) || os(tvOS)
     /// An act the sectioned page handed back, run once the page is gone.
     @State private var pendingHandOff: HostPageRequest?
     #endif
@@ -146,31 +146,6 @@ struct HomeView: View {
             #if !os(tvOS)
             .navigationTitle("Punktfunk")
             #endif
-            // Browse the LAN for advertised hosts only while the grid is up — not during a
-            // session. The home appears/disappears as the stream swaps in and out.
-            .onAppear { discovery.start() }
-            .onDisappear { discovery.stop() }
-            // Reachability sweep while the grid is up: a saved host reached only over a routed
-            // network (Tailscale/VPN) never advertises on mDNS, so `advertises` can't see it. Probe
-            // every non-advertising saved host ~every 10 s and publish the reachable set for the
-            // pips (`isOnline` above OR's it in). The `.task` is cancelled on disappear, matching
-            // `discovery.stop()`.
-            .task {
-                while !Task.isCancelled {
-                    await store.refreshReachability(discovery: discovery)
-                    // Keep each reachable paired host's advertised actions warm on the same
-                    // beat, so a card's menu is BUILT from a settled answer rather than one
-                    // arriving while the menu is open. TTL-gated inside, so this costs nothing
-                    // on an ordinary lap.
-                    for host in store.hosts where host.pinnedSHA256 != nil && isOnline(host) {
-                        hostPower.refresh(host)
-                        // What it is PLAYING changes while somebody is looking at the card, so
-                        // this one has a 20 s TTL against the actions' 300 s.
-                        nowPlaying.refresh(host)
-                    }
-                    try? await Task.sleep(for: .seconds(10))
-                }
-            }
             // The host page, from a card's ⓘ or its menu (design §2.4), and the speed test pushed
             // from it. The Mac opens both in the host's own window (`MacHostWindow`).
             #if !os(macOS)
@@ -190,7 +165,7 @@ struct HomeView: View {
             .navigationDestination(item: $speedTestTarget) { host in
                 SpeedTestView(host: host)
                     .navigationTitle("Speed Test")
-                    #if os(iOS)
+                    #if os(iOS) || os(visionOS)
                     .navigationBarTitleDisplayMode(.inline)
                     #endif
             }
@@ -207,7 +182,7 @@ struct HomeView: View {
             #endif
             #if !os(tvOS)
             .toolbar {
-                #if os(iOS)
+                #if os(iOS) || os(visionOS)
                 // Adjacent trailing items share one glass pill (the system default).
                 ToolbarItem(placement: .topBarTrailing) { settingsButton }
                 if showsArrangeMenu {
@@ -215,6 +190,9 @@ struct HomeView: View {
                 }
                 ToolbarItem(placement: .topBarTrailing) { refreshButton }
                 ToolbarItem(placement: .topBarTrailing) { addHostButton }
+                #if os(visionOS)
+                ToolbarItem(placement: .topBarTrailing) { NewWindowButton() }
+                #endif
                 #else
                 if showsArrangeMenu {
                     ToolbarItem(placement: .primaryAction) {
@@ -291,7 +269,7 @@ struct HomeView: View {
         .sheet(isPresented: $showAddHost) {
             AddHostSheet { store.add($0) }
         }
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         // SettingsView owns its own NavigationSplitView (sidebar + detail) and Done button, so it
         // is presented directly — wrapping it in a NavigationStack here would nest a split view in
         // a stack (double title bars). `settingsSheetSizing()` widens the sheet on iPad for the
@@ -381,14 +359,14 @@ struct HomeView: View {
     private func showDetails(_ host: StoredHost) {
         #if os(macOS)
         openWindow(id: MacHostWindow.sceneID, value: host.id)
-        #elseif os(iOS)
+        #elseif os(iOS) || os(visionOS)
         if sizeClass == .regular { sectionsHost = host } else { detailTarget = host.id }
         #else
         detailTarget = host.id
         #endif
     }
 
-    #if os(iOS) || os(tvOS)
+    #if os(iOS) || os(visionOS) || os(tvOS)
     /// The iPad's host sheet or the TV's host page closed on an act that belongs to the grid: run
     /// it now it is gone.
     private func runHandOff() {
@@ -467,14 +445,14 @@ struct HomeView: View {
         } actions: {
             Button("Add Host") { showAddHost = true }
                 .glassProminentButtonStyle()
-                #if os(iOS)
+                #if os(iOS) || os(visionOS)
                 .controlSize(.large)
                 #endif
             // The screen a host SHOULD have appeared on is where a rescan is worth offering
             // outright rather than hiding behind a pull gesture.
             Button("Scan Again") { discovery.refresh() }
                 .disabled(discovery.isScanning)
-                #if os(iOS)
+                #if os(iOS) || os(visionOS)
                 .controlSize(.large)
                 #endif
         }
@@ -579,5 +557,22 @@ extension View {
         #else
         self
         #endif
+    }
+}
+
+/// LAN browse and host presence for as long as the home is up, whichever tab or page shows.
+/// On the container, because a grid that owns them stops both when a tab or a push covers it.
+struct HomePresence: ViewModifier {
+    let store: HostStore
+    let discovery: HostDiscovery
+
+    func body(content: Content) -> some View {
+        content
+            .onAppear { discovery.start() }
+            .onDisappear { discovery.stop() }
+            .task {
+                await store.keepPresence(
+                    discovery: discovery, power: .shared, nowPlaying: .shared)
+            }
     }
 }

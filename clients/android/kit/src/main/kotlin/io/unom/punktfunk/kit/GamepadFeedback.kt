@@ -35,16 +35,16 @@ import java.nio.ByteBuffer
  * With no controller connected (emulator) rumble/lights become logged no-ops — exactly the
  * verification path; the `Log.i` receipt lines fire regardless of rendering hardware.
  *
- * [deviceVibrator] is the opt-in phone mirror ("Rumble on this phone", off by default): when
- * non-null, rumble the host addresses to wire pad 0 (controller 1) is ALSO played on this
- * device's own vibration motor — for clip-on gamepads that ship without rumble motors, where the
- * phone body is the only actuator in the player's hands. StreamScreen passes it only when the
- * setting is on (see [deviceBodyVibrator]).
+ * [bodyVibrator] is this device's own motor ([deviceBodyVibrator]). It plays a controller's rumble
+ * when [bodyRumbleFor] says the body stands in for that pad. With [mirrorPad0] ("Rumble on this
+ * phone", off by default) it also plays every rumble addressed to wire pad 0 (controller 1) — for
+ * clip-on gamepads that ship without rumble motors.
  */
 class GamepadFeedback(
     private val handle: Long,
     private val router: GamepadRouter?,
-    private val deviceVibrator: Vibrator? = null,
+    private val bodyVibrator: Vibrator? = null,
+    private val mirrorPad0: Boolean = false,
 ) {
     /**
      * A capture link's feedback renderer for the wire pads it owns, consulted BEFORE the
@@ -70,6 +70,9 @@ class GamepadFeedback(
         /** Player-indicator LED bitmask (low 5 bits, hid-playstation layout). */
         fun playerLeds(pad: Int, bits: Int)
 
+        /** Mic-mute LED: [mode] 0 off, 1 on, 2 pulse. A pad without one ignores it. */
+        fun micLed(pad: Int, mode: Int) {}
+
         /** One adaptive-trigger effect: [which] 0 = L2, 1 = R2; [effect] = the raw DS5 trigger
          *  block (mode byte + parameters) exactly as the game wrote it host-side. */
         fun trigger(pad: Int, which: Int, effect: ByteArray)
@@ -88,12 +91,16 @@ class GamepadFeedback(
         const val TAG_PLAYER_LEDS: Byte = 0x02
         const val TAG_TRIGGER: Byte = 0x03
         const val TAG_HID_RAW: Byte = 0x05
+        const val TAG_MIC_LED: Byte = 0x07
 
         /** Sparse-log cadence for swallowed render failures — see [noteRenderFailure]. */
         const val LOG_EVERY = 128L
     }
 
-    /** One controller's rumble binding — VibratorManager (API 31+) OR the legacy single Vibrator (API 28–30). */
+    /**
+     * One controller's rumble binding — VibratorManager (API 31+) OR one legacy Vibrator: the
+     * pad's own on API 28–30, or the device body's ([bodyRumbleFor]).
+     */
     private class RumbleBind(
         val vm: VibratorManager?,
         val legacy: Vibrator?,
@@ -190,9 +197,9 @@ class GamepadFeedback(
         runCatching { hidoutThread?.join() }
         rumbleThread = null
         hidoutThread = null
-        // Threads are dead — drop any held rumble (incl. the phone mirror's) and close every
+        // Threads are dead — drop any held rumble (incl. the device body's) and close every
         // lights session.
-        runCatching { deviceVibrator?.cancel() }
+        runCatching { bodyVibrator?.cancel() }
         synchronized(bindsLock) {
             for (b in rumbleBinds.values) b?.let {
                 runCatching { it.vm?.cancel() }
@@ -238,6 +245,11 @@ class GamepadFeedback(
     }
 
     private fun bindRumble(dev: InputDevice): RumbleBind? {
+        // The body is one actuator, so it renders as a single legacy motor.
+        bodyRumbleFor(dev, bodyVibrator)?.let {
+            Log.i(TAG, "rumble: built-in controller '${dev.name}' has no vibrators — bound the device body")
+            return RumbleBind(null, it, IntArray(0), it.hasAmplitudeControl())
+        }
         if (Build.VERSION.SDK_INT >= 31) {
             val m = dev.vibratorManager
             val ids = m.vibratorIds
@@ -269,11 +281,10 @@ class GamepadFeedback(
      */
     private fun renderRumble(pad: Int, low: Int, high: Int, durationMs: Long) {
         Log.i(TAG, "rumble pad=$pad low=$low high=$high backstopMs=$durationMs") // verification line — BEFORE any no-op return
-        // Opt-in phone mirror, BEFORE the controller-bind early-return: the exact pads this
-        // serves have no vibrator of their own, so their bind below is null. It follows
-        // controller 1 unconditionally rather than only motor-less pads — capability probing
-        // already decided the bind, and the user opted in.
-        if (pad == 0) renderDeviceRumble(low, high, durationMs)
+        // The opt-in phone mirror plays before the capture and bind returns below: it follows
+        // controller 1 whatever that pad is, because the player opted in.
+        val mirrored = pad == 0 && mirrorPad0
+        if (mirrored) renderDeviceRumble(low, high, durationMs)
         // A captured pad's link renders on the physical controller itself (its slot has no
         // InputDevice, so the vibrator bind below would resolve null and drop the command).
         sink?.takeIf { it.ownsPad(pad) }?.let {
@@ -281,6 +292,7 @@ class GamepadFeedback(
             return
         }
         val bind = rumbleBindFor(pad) ?: return
+        if (mirrored && bind.legacy === bodyVibrator) return // the mirror already drove the body
         val lo = wireAmplitudeToByte(low)
         val hi = wireAmplitudeToByte(high)
         val m = bind.vm
@@ -324,13 +336,13 @@ class GamepadFeedback(
     }
 
     /**
-     * The opt-in phone mirror: play a wire-pad-0 rumble on this device's own vibration motor —
+     * The opt-in phone mirror: play a wire-pad-0 rumble on [bodyVibrator] —
      * one physical actuator, so both wire motors blend into one effect (the same blend as the
      * single-motor controller path). Same envelope semantics too: a one-shot held for the host's
      * TTL, cancel on (0,0).
      */
     private fun renderDeviceRumble(low: Int, high: Int, durationMs: Long) {
-        val v = deviceVibrator ?: return
+        val v = bodyVibrator ?: return
         val lo = wireAmplitudeToByte(low)
         val hi = wireAmplitudeToByte(high)
         if (lo == 0 && hi == 0) {
@@ -377,6 +389,11 @@ class GamepadFeedback(
                 val s = sink?.takeIf { it.ownsPad(pad) }
                 if (s != null) s.playerLeds(pad, bits)
                 else if (Build.VERSION.SDK_INT >= 33) setPlayerId(pad, player)
+            }
+            TAG_MIC_LED -> {
+                // No platform API lights it: only a captured DualSense can.
+                val mode = buf.get().toInt() and 0xFF
+                sink?.takeIf { it.ownsPad(pad) }?.micLed(pad, mode)
             }
             TAG_TRIGGER -> {
                 val which = buf.get().toInt() and 0xFF // 0 = L2, 1 = R2
@@ -481,8 +498,7 @@ class GamepadFeedback(
 
 /**
  * This device's own body vibrator (the phone, not a controller), or null where there is none
- * (TVs) — gates the "Rumble on this phone" setting's visibility and feeds
- * [GamepadFeedback.deviceVibrator] when it's on.
+ * (TVs) — gates the "Rumble on this phone" setting's visibility and feeds [GamepadFeedback].
  */
 fun deviceBodyVibrator(context: Context): Vibrator? {
     val v = if (Build.VERSION.SDK_INT >= 31) {
@@ -493,3 +509,28 @@ fun deviceBodyVibrator(context: Context): Vibrator? {
     }
     return v?.takeIf { it.hasVibrator() }
 }
+
+/**
+ * [body] when it plays [dev]'s rumble, else null. A controller built into this device with no
+ * motor of its own rumbles through the body: on a handheld the body is the controller. An
+ * external pad without motors stays silent.
+ */
+fun bodyRumbleFor(dev: InputDevice, body: Vibrator?): Vibrator? =
+    body?.takeIf { rumblesOnBody(padHasMotor(dev), dev.isExternalDevice()) }
+
+/** [bodyRumbleFor]'s rule on plain facts. */
+internal fun rumblesOnBody(padHasMotor: Boolean, external: Boolean): Boolean =
+    !padHasMotor && !external
+
+/** Whether [dev] reports a rumble motor — via VibratorManager (API 31+) or the legacy Vibrator. */
+fun padHasMotor(dev: InputDevice): Boolean =
+    if (Build.VERSION.SDK_INT >= 31) {
+        dev.vibratorManager.vibratorIds.isNotEmpty()
+    } else {
+        @Suppress("DEPRECATION")
+        dev.vibrator.hasVibrator()
+    }
+
+/** Below API 29 there is no `isExternal`; built-in keys and the nav bar carry no vendor id. */
+fun InputDevice.isExternalDevice(): Boolean =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) isExternal else vendorId != 0

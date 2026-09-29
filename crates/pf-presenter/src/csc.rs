@@ -247,6 +247,111 @@ impl CscPass {
     }
 }
 
+/// CSC straight into a swapchain image, taken when the whole picture lands on the surface at
+/// an exact scale. Skips the video image and its blit: at 4K that is two writes and a read of
+/// 33 MB per frame, most of an iGPU's present cost. Pipelines reuse the two CSC layouts, so
+/// their descriptor sets and push constants bind unchanged; the passes fit the overlay's
+/// per-image framebuffers. `clear` paints the letterbox first, `keep` skips that fill.
+pub struct DirectPass {
+    pub clear: vk::RenderPass,
+    pub keep: vk::RenderPass,
+    pub nv12: vk::Pipeline,
+    pub planar: vk::Pipeline,
+}
+
+impl DirectPass {
+    /// `format` is the swapchain's. Rebuilt with the overlay pipe when that changes.
+    pub fn new(
+        device: &ash::Device,
+        format: vk::Format,
+        nv12_layout: vk::PipelineLayout,
+        planar_layout: vk::PipelineLayout,
+    ) -> Result<DirectPass> {
+        let (from, out) = (
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+        let clear = color_pass(device, format, vk::AttachmentLoadOp::CLEAR, from, out)?;
+        let mut pass = DirectPass {
+            clear,
+            keep: vk::RenderPass::null(),
+            nv12: vk::Pipeline::null(),
+            planar: vk::Pipeline::null(),
+        };
+        let built = (|| {
+            pass.keep = color_pass(device, format, vk::AttachmentLoadOp::DONT_CARE, from, out)?;
+            let frag = pf_client_core::video_csc_spv::NV12_CSC_FRAG;
+            pass.nv12 = build_fullscreen_pipeline(device, pass.keep, nv12_layout, frag, false)?;
+            let frag = pf_client_core::video_csc_spv::PLANAR_CSC_FRAG;
+            pass.planar = build_fullscreen_pipeline(device, pass.keep, planar_layout, frag, false)?;
+            Ok::<(), anyhow::Error>(())
+        })();
+        match built {
+            Ok(()) => Ok(pass),
+            Err(e) => {
+                pass.destroy(device);
+                Err(e).context("direct CSC pass")
+            }
+        }
+    }
+
+    /// GPU idle on the last submit that used these.
+    pub fn destroy(&self, device: &ash::Device) {
+        // SAFETY: DESTROY per the crate contract; null handles are skipped by Vulkan.
+        unsafe {
+            device.destroy_pipeline(self.planar, None);
+            device.destroy_pipeline(self.nv12, None);
+            device.destroy_render_pass(self.keep, None);
+            device.destroy_render_pass(self.clear, None);
+        }
+    }
+}
+
+/// One colour attachment behind the one subpass dependency every composite pass shares.
+/// Passes that differ only in load op and layouts are compatible, so a framebuffer made
+/// for any of them (the overlay's per-image ones) fits the scale and direct passes too.
+pub(crate) fn color_pass(
+    device: &ash::Device,
+    format: vk::Format,
+    load: vk::AttachmentLoadOp,
+    initial: vk::ImageLayout,
+    final_layout: vk::ImageLayout,
+) -> Result<vk::RenderPass> {
+    let attachment = [vk::AttachmentDescription::default()
+        .format(format)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .load_op(load)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .initial_layout(initial)
+        .final_layout(final_layout)];
+    let color_ref = [vk::AttachmentReference::default()
+        .attachment(0)
+        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+    let subpass = [vk::SubpassDescription::default()
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .color_attachments(&color_ref)];
+    let deps = [vk::SubpassDependency::default()
+        .src_subpass(vk::SUBPASS_EXTERNAL)
+        .dst_subpass(0)
+        .src_stage_mask(vk::PipelineStageFlags::ALL_COMMANDS)
+        .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .dst_access_mask(
+            vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+        )];
+    // SAFETY: CREATE per the crate contract.
+    unsafe {
+        device.create_render_pass(
+            &vk::RenderPassCreateInfo::default()
+                .attachments(&attachment)
+                .subpasses(&subpass)
+                .dependencies(&deps),
+            None,
+        )
+    }
+    .context("composite render pass")
+}
+
 /// Bufferless fullscreen triangle (`fullscreen.vert` + `frag_spv`), dynamic
 /// viewport/scissor. `blend` is premultiplied-alpha over the destination
 /// (overlay); `false` is opaque write (CSC).

@@ -11,6 +11,7 @@
 //! Every COM object the backends see is a [`bridge`]d `QueryInterface` of the driver's own
 //! 0.58 object, so the two crates never wrap each other's pointer.
 
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::{Arc, Mutex};
 
 use pf_driver_proto::encode::EncodeInput;
@@ -22,7 +23,6 @@ use pf_frame::{CapturedFrame, CursorOverlay, FramePayload, PixelFormat, Provenan
 use windows::Win32::Foundation::LUID;
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::core::Interface;
-use windows62::Win32::Foundation::{CloseHandle, HANDLE};
 use windows62::Win32::Graphics::Direct3D11 as d3d;
 use windows62::Win32::Graphics::Dxgi::Common as dxgi;
 use windows62::core::{Interface as _, PCWSTR};
@@ -158,14 +158,8 @@ fn srv(dev: &d3d::ID3D11Device, t: &Tex) -> Result<Srv, Fail> {
 pub struct SharedFence {
     pub fence: d3d::ID3D11Fence,
     pub ctx4: d3d::ID3D11DeviceContext4,
-    pub handle: HANDLE,
+    pub handle: OwnedHandle,
 }
-
-// SAFETY: the NT handle is a process-wide token this value alone closes; the COM objects are
-// agile. Every use is serialized by the pool's state mutex.
-unsafe impl Send for SharedFence {}
-// SAFETY: as above — a shared reference hands out only by-value copies of the handle.
-unsafe impl Sync for SharedFence {}
 
 impl SharedFence {
     pub fn new(dev: &d3d::ID3D11Device, ctx: &d3d::ID3D11DeviceContext) -> Result<Self, Fail> {
@@ -188,20 +182,13 @@ impl SharedFence {
                 .CreateSharedHandle(None, 0x1000_0000, PCWSTR::null())
                 .map_err(|e| fail("Fence CreateSharedHandle", e))?
         };
+        // SAFETY: the NT handle `CreateSharedHandle` just minted; nothing else closes it.
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
         Ok(Self {
             fence: fence.ok_or((-2, "fence"))?,
             ctx4,
             handle,
         })
-    }
-}
-
-impl Drop for SharedFence {
-    fn drop(&mut self) {
-        // SAFETY: the NT handle `new` minted; the encoder holds its own duplicate.
-        unsafe {
-            let _ = CloseHandle(self.handle);
-        }
     }
 }
 
@@ -687,7 +674,7 @@ impl Targets {
                 }
                 let share = PyroFrameShare {
                     cbcr: cbcr[i].0.clone(),
-                    fence_handle: Some(fence.handle.0 as isize),
+                    fence_handle: Some(fence.handle.as_raw_handle() as isize),
                     fence_value: *fence_value,
                     ring_gen: 1,
                 };

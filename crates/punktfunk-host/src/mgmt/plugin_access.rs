@@ -10,12 +10,12 @@ use crate::events::{emit, EventKind};
 use crate::plugins::access::Decision;
 use axum::Extension;
 
-/// Plugin-authored text: it lands on the console as a caption, so controls go and it is
-/// capped like a catalog string.
+/// Plugin-authored text: it lands on the console as a caption, so controls and bidi marks go,
+/// as in a device name, and it is capped like a catalog string.
 fn sanitize_reason(s: &str) -> Option<String> {
     let out: String = s
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|&c| !c.is_control() && !crate::native_pairing::is_spoofy_char(c))
         .take(120)
         .collect::<String>()
         .trim()
@@ -34,7 +34,16 @@ pub(crate) struct AccessPathRequest {
 
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct AccessRequest {
+    #[serde(default)]
     pub paths: Vec<AccessPathRequest>,
+    /// Catalog ids of emulators the plugin wants installed (`pcsx2`). Each answers with the
+    /// folder the install lands in; the operator's yes installs it, then grants that folder.
+    #[serde(default)]
+    pub emulators: Vec<String>,
+    /// libretro cores the plugin wants in RetroArch (`snes9x`). Each answers with RetroArch's
+    /// cores folder; `refused:no_retroarch` without one on this host.
+    #[serde(default)]
+    pub cores: Vec<String>,
     /// Why the plugin wants it, in the plugin's words. Optional, sanitized, ≤120 chars.
     #[serde(default)]
     pub reason: Option<String>,
@@ -60,7 +69,31 @@ pub(crate) struct DecideRequest {
     /// The path as it appears in the request or grant list.
     pub path: String,
     pub decision: DecisionInput,
+    /// With `allow`: grant the path directly, pending request or not, read-write when true.
+    /// A file grants its folder. The same refusals apply as to a request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write: Option<bool>,
+    /// With `allow` and `write`: the plugin form handing the path over (`config`,
+    /// `game:<entry id>`). Its grant goes once every form that handed it lets go.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form: Option<String>,
 }
+
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct ReleaseRequest {
+    /// The plugin form letting go, as named when it handed the paths over.
+    pub form: String,
+    /// Every path the form still hands over, as saved.
+    pub keep: Vec<String>,
+}
+
+/// A form name is a key the console makes up, never a path; the grants file stores it.
+fn valid_form(form: &str) -> bool {
+    !form.is_empty() && form.len() <= 300 && !form.chars().any(char::is_control)
+}
+
+const FORM_INVALID: &str =
+    "the form name must be 1 to 300 characters, none of them control characters";
 
 fn store_err(e: std::io::Error, what: &str) -> Response {
     match e.kind() {
@@ -119,24 +152,72 @@ pub(crate) async fn request_plugin_access(
         .iter()
         .map(|p| (p.path.clone(), p.write))
         .collect();
-    match st.access.request(&id, &paths, reason) {
+    let mut changed = false;
+    let mut outcomes = match st.access.request(&id, &paths, reason.clone()) {
         Ok(m) => {
-            if m.changed {
-                emit(EventKind::PluginsChanged { id });
-            }
-            Json(
-                m.value
-                    .into_iter()
-                    .map(|o| AccessPathOutcome {
-                        path: o.path,
-                        outcome: o.outcome,
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .into_response()
+            changed |= m.changed;
+            m.value
         }
-        Err(e) => store_err(e, "record the access request"),
+        Err(e) => return store_err(e, "record the access request"),
+    };
+    for emulator in &req.emulators {
+        let (path, _) = crate::emulators::grant_target(emulator);
+        let refused = |rule: &str| crate::plugins::access::RequestOutcome {
+            path: emulator.clone(),
+            outcome: format!("refused:{rule}"),
+        };
+        let outcome = match crate::emulators::offered(emulator) {
+            Ok(true) => match st
+                .access
+                .request_emulator(&id, emulator, &path, reason.clone())
+            {
+                Ok(m) => {
+                    changed |= m.changed;
+                    m.value
+                }
+                Err(e) => return store_err(e, "record the emulator request"),
+            },
+            Ok(false) => refused("not_offered"),
+            Err(_) => refused("not_in_catalog"),
+        };
+        outcomes.push(outcome);
     }
+    if !req.cores.is_empty() {
+        let cores_dir = crate::emulators::cores_dir().ok().flatten();
+        for core in &req.cores {
+            let refused = |rule: &str| crate::plugins::access::RequestOutcome {
+                path: core.clone(),
+                outcome: format!("refused:{rule}"),
+            };
+            let outcome = if !crate::emulators::valid_core(core) {
+                refused("bad_core")
+            } else if let Some(dir) = &cores_dir {
+                match st.access.request_core(&id, core, dir, reason.clone()) {
+                    Ok(m) => {
+                        changed |= m.changed;
+                        m.value
+                    }
+                    Err(e) => return store_err(e, "record the core request"),
+                }
+            } else {
+                refused("no_retroarch")
+            };
+            outcomes.push(outcome);
+        }
+    }
+    if changed {
+        emit(EventKind::PluginsChanged { id });
+    }
+    Json(
+        outcomes
+            .into_iter()
+            .map(|o| AccessPathOutcome {
+                path: o.path,
+                outcome: o.outcome,
+            })
+            .collect::<Vec<_>>(),
+    )
+    .into_response()
 }
 
 /// List this plugin's own access rows
@@ -190,7 +271,8 @@ pub(crate) async fn get_plugin_access(State(st): State<Arc<MgmtState>>) -> Respo
 /// Grant, deny, or forget an access request
 ///
 /// `allow` turns a pending request into a grant (the platform ACL lands first, so a failed
-/// grant stores nothing); `deny` remembers the no; `forget` removes a grant or denial.
+/// grant stores nothing), or with `write` set grants a path the operator handed over, on
+/// behalf of `form` when named; `deny` remembers the no; `forget` removes a grant or denial.
 #[utoipa::path(
     post,
     path = "/plugin-access/{plugin}/decide",
@@ -217,11 +299,128 @@ pub(crate) async fn decide_plugin_access(
         DecisionInput::Deny => Decision::Deny,
         DecisionInput::Forget => Decision::Forget,
     };
-    match st.access.decide(&plugin, &req.path, decision, "console") {
+    if req.form.as_deref().is_some_and(|f| !valid_form(f)) {
+        return api_error(StatusCode::BAD_REQUEST, FORM_INVALID);
+    }
+    let outcome = match (decision, req.write) {
+        (Decision::Allow, Some(write)) => {
+            let path = std::path::Path::new(&req.path);
+            let dir = match path.parent() {
+                Some(parent) if path.is_file() => parent,
+                _ => path,
+            };
+            match &req.form {
+                Some(form) => st.access.hand(&plugin, dir, write, form),
+                None => st.access.grant(&plugin, dir, write, "console"),
+            }
+            .and_then(|_| st.access.snapshot_for(&plugin))
+            .map(|value| crate::plugins::access::Mutation {
+                value,
+                changed: true,
+            })
+        }
+        (Decision::Allow, None) => {
+            // An emulator request: the install lands first, so the grant has a folder and a
+            // failed download leaves the row for another try.
+            if let Some(emulator) = st.access.pending_emulator(&plugin, &req.path) {
+                let target = emulator.clone();
+                match tokio::task::spawn_blocking(move || crate::emulators::install(&target)).await
+                {
+                    Ok(Ok(_)) => emit(EventKind::EmulatorsChanged { id: emulator }),
+                    Ok(Err(e)) => {
+                        return super::emulators::hermir_err(&e, "The emulator didn't install");
+                    }
+                    Err(e) => {
+                        tracing::error!("emulator worker panicked: {e}");
+                        return api_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "The emulator manager stopped responding",
+                        );
+                    }
+                }
+            }
+            // Core rows share RetroArch's folder: one yes installs every core asked for there.
+            let cores = st.access.pending_cores(&plugin, &req.path);
+            if !cores.is_empty() {
+                let batch = cores.clone();
+                let done = tokio::task::spawn_blocking(move || {
+                    batch
+                        .iter()
+                        .map(|c| crate::emulators::install_core(c).map(|_| ()))
+                        .collect::<Result<Vec<()>, _>>()
+                })
+                .await;
+                match done {
+                    Ok(Ok(_)) => emit(EventKind::EmulatorsChanged {
+                        id: "retroarch".into(),
+                    }),
+                    Ok(Err(e)) => {
+                        return super::emulators::hermir_err(&e, "The core didn't install");
+                    }
+                    Err(e) => {
+                        tracing::error!("core worker panicked: {e}");
+                        return api_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "The emulator manager stopped responding",
+                        );
+                    }
+                }
+            }
+            st.access
+                .decide(&plugin, &req.path, Decision::Allow, "console")
+        }
+        (decision, _) => st.access.decide(&plugin, &req.path, decision, "console"),
+    };
+    match outcome {
         Ok(m) => {
+            // Not awaited: a changed root restarts the runner, which this answer need not wait on.
+            tokio::task::spawn_blocking(crate::plugins::converge_runner_roots);
             emit(EventKind::PluginsChanged { id: plugin });
             Json(m.value).into_response()
         }
         Err(e) => store_err(e, "record the decision"),
+    }
+}
+
+/// Let a plugin form go of the paths it no longer hands over
+///
+/// `keep` is every path the form still holds. Each grant the form holds outside it loses the
+/// form, and a grant only forms made goes with its last one. The operator's own grants stay.
+#[utoipa::path(
+    post,
+    path = "/plugin-access/{plugin}/release",
+    tag = "plugin-access",
+    operation_id = "releasePluginAccess",
+    params(("plugin" = String, Path, description = "The plugin id")),
+    request_body = ReleaseRequest,
+    responses(
+        (status = OK, description = "The plugin's access state after the release", body = crate::plugins::access::PluginAccessSnapshot),
+        (status = BAD_REQUEST, description = "Invalid form name", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = FORBIDDEN, description = "Not reachable on the plugin or device lane", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "The release could not be recorded", body = ApiError),
+    )
+)]
+pub(crate) async fn release_plugin_access(
+    State(st): State<Arc<MgmtState>>,
+    Path(plugin): Path<String>,
+    ApiJson(req): ApiJson<ReleaseRequest>,
+) -> Response {
+    if !valid_form(&req.form) {
+        return api_error(StatusCode::BAD_REQUEST, FORM_INVALID);
+    }
+    match st
+        .access
+        .release(&plugin, &req.form, &req.keep)
+        .and_then(|m| Ok((m.changed, st.access.snapshot_for(&plugin)?)))
+    {
+        Ok((changed, snap)) => {
+            if changed {
+                tokio::task::spawn_blocking(crate::plugins::converge_runner_roots);
+                emit(EventKind::PluginsChanged { id: plugin });
+            }
+            Json(snap).into_response()
+        }
+        Err(e) => store_err(e, "record the release"),
     }
 }

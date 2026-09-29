@@ -158,7 +158,7 @@ package_punktfunk-host() {
   pkgdesc="Low-latency desktop/game streaming HOST (Moonlight-compatible + punktfunk/1)"
   # NVENC + GPU EGL/CUDA come from the NVIDIA driver (nvidia-utils) — kept an optdepend, never a
   # hard dep, exactly as the RPM (__requires_exclude libcuda) and deb (shlibdeps filter) do.
-  # The host captures the sink monitor through NATIVE PipeWire (audio/linux.rs) — it never
+  # The host captures the sink monitor through NATIVE PipeWire (pf-audio) — it never
   # opens a Pulse socket itself, so pipewire-pulse is an OPTdepend, not a depend: it exists
   # for the GAMES, which commonly emit through the PulseAudio API. Hard-depending on it made
   # the package uninstallable next to real `pulseaudio`, which serves those games just as well.
@@ -234,6 +234,10 @@ package_punktfunk-host() {
     "$pkgdir/usr/lib/systemd/system/punktfunk-update.service"
   install -Dm0644 "$R/packaging/linux/49-punktfunk-update.rules" \
     "$pkgdir/usr/share/polkit-1/rules.d/49-punktfunk-update.rules"
+  # An upgrade of any punktfunk server package restarts the running services, once per transaction.
+  install -Dm0755 "$R/packaging/linux/restart-user-units.sh" "$pkgdir/usr/lib/punktfunk/restart-user-units"
+  install -Dm0644 "$R/packaging/arch/punktfunk-restart.hook" \
+    "$pkgdir/usr/share/libalpm/hooks/punktfunk-restart.hook"
   # vhci-hcd autoload — usbip transport for the virtual Steam Deck pad (Steam only adopts USB pads)
   install -Dm0644 "$R/scripts/punktfunk-modules.conf" "$pkgdir/usr/lib/modules-load.d/punktfunk.conf"
   # 32 MB UDP socket buffers (send-side headroom at high bitrate)

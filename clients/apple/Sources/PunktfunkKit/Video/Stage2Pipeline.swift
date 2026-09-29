@@ -63,7 +63,7 @@ public enum FrameStorePolicy: Sendable, Equatable {
 
 public final class FrameStore<Frame>: @unchecked Sendable {
     private let lock = NSLock()
-    private let capacity: Int // 1 = newest-wins semantics
+    let capacity: Int // 1 = newest-wins semantics
     private let isFifo: Bool
     private var frames: [Frame] = []
     private var prerolled = false
@@ -241,10 +241,43 @@ struct AdaptiveSlotRegime {
     }
 }
 
+/// Arrival and glass pacing's schedule against the ordinary display link, resolved once per
+/// session. `PUNKTFUNK_PRESENT_MODE` (`slot`, `immediate`, `vsync`) picks one for on-device A/B.
+struct PresentPolicy: Equatable {
+    /// Adaptive-refresh latency: sparse input presents at once, dense input one frame per slot.
+    var adaptiveSlot: Bool
+    /// At most one present per display-link slot.
+    var fixedSlot: Bool
+    /// Schedule each present on the next vsync.
+    var fixedVsync: Bool
+
+    static func resolve(
+        env: String?, vsync: Bool, vsyncPaced: Bool, adaptiveSlotPaced: Bool
+    ) -> PresentPolicy {
+        let forcedSlot = env == "slot"
+        return PresentPolicy(
+            adaptiveSlot: adaptiveSlotPaced && !vsync && env != "immediate" && env != "vsync"
+                && !forcedSlot,
+            fixedSlot: vsyncPaced || forcedSlot,
+            fixedVsync: env == "vsync" || (env != "immediate" && vsync))
+    }
+
+    /// The pace the pf-present line names under `pacing`.
+    func label(_ pacing: PresentPacing) -> String {
+        switch pacing {
+        case .decoded: return "decoded"
+        case .deadline: return "deadline"
+        case .glass: return "glass"
+        case .arrival:
+            return adaptiveSlot ? "adaptive" : fixedSlot ? "slot" : fixedVsync ? "vsync" : "immediate"
+        }
+    }
+}
+
 /// Selects when a decoded frame enters the layer; decode and the newest-wins store are shared.
 ///
-/// - `arrival` (stage-2): render from frame arrival. This is the macOS default and remains an
-///   explicit A/B elsewhere; macOS smoothness can additionally schedule it on the vsync grid.
+/// - `arrival` (stage-2): render from frame arrival. This is the macOS default for every codec and
+///   an explicit A/B elsewhere; macOS smoothness can additionally schedule it on the vsync grid.
 /// - `glass` (stage-3): admit a bounded number of presents and reopen each slot from its on-glass
 ///   callback. Frames decoded while closed coalesce in the store instead of joining the layer FIFO.
 /// - `deadline` (stage-4): pair the newest frame with a CAMetalDisplayLink-vended drawable. This is
@@ -252,8 +285,6 @@ struct AdaptiveSlotRegime {
 ///   fixed-rate refreshes.
 /// - `decoded`: send VideoToolbox's IOSurface-backed output directly to the system video renderer.
 ///   This is tvOS's latency default and avoids compressed decode buffering plus the Metal FIFO.
-///
-/// macOS PyroWave defaults to `glass` to prevent burst presents in its composited layer.
 public enum PresentPacing: Sendable, Equatable {
     case arrival
     case glass
@@ -261,30 +292,38 @@ public enum PresentPacing: Sendable, Equatable {
     case decoded
 }
 
-/// Direct decoded-frame handoff to AVSampleBufferDisplayLayer's background-safe renderer.
+/// Direct decoded-frame handoff to a system video renderer: a video layer's, or the renderer
+/// behind a visionOS theater screen.
 ///
 /// VideoToolbox already produced an IOSurface-backed YUV image, so wrapping it as an immediate
 /// uncompressed sample adds no copy or second decode. Backpressure drops the frame instead of
 /// building a queue; the next decoder callback supplies a fresher image. Display-link polling maps
 /// the renderer's current IOSurface ID back to its capture/decode stamp for on-glass metrics.
+/// `mirror` gets the same surface when it has room and never throttles or meters the stream.
 /// The renderer owns each sample after enqueue. Sendable because AVSampleBufferVideoRenderer
 /// explicitly permits background-thread enqueueing.
 final class DecodedVideoSink: @unchecked Sendable {
-    private struct Stamp {
+    struct Stamp {
         let ptsNs: UInt64
         let decodedNs: Int64
+        /// Client CLOCK_REALTIME at enqueue — the pf-present `latchMs` origin on this path.
+        let submittedNs: Int64
+        let isRepeat: Bool
     }
 
     private let renderer: AVSampleBufferVideoRenderer
+    private let mirror: AVSampleBufferVideoRenderer?
     private let lock = NSLock()
     private var stamps: [IOSurfaceID: Stamp] = [:]
 
-    init(layer: AVSampleBufferDisplayLayer) {
-        renderer = layer.sampleBufferRenderer
+    init(renderer: AVSampleBufferVideoRenderer, mirror: AVSampleBufferVideoRenderer? = nil) {
+        self.renderer = renderer
+        self.mirror = mirror
     }
 
     func reset() {
         renderer.flush()
+        mirror?.flush()
         lock.lock()
         stamps.removeAll()
         lock.unlock()
@@ -301,21 +340,29 @@ final class DecodedVideoSink: @unchecked Sendable {
         lock.lock()
         // More than one second of unmatched 60 fps surfaces cannot yield a live latency sample.
         if stamps.count >= 64 { stamps.removeAll(keepingCapacity: true) }
-        stamps[surfaceID] = Stamp(ptsNs: frame.ptsNs, decodedNs: frame.decodedNs)
+        stamps[surfaceID] = Stamp(
+            ptsNs: frame.ptsNs, decodedNs: frame.decodedNs,
+            submittedNs: Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: CACurrentMediaTime()),
+            isRepeat: frame.flags & PunktfunkConnection.userFlagRepeat != 0)
         lock.unlock()
         renderer.enqueue(sample)
+        if let mirror {
+            if mirror.requiresFlushToResumeDecoding || mirror.status == .failed { mirror.flush() }
+            if mirror.isReadyForMoreMediaData, let copy = Self.immediateSample(pixelBuffer) {
+                mirror.enqueue(copy)
+            }
+        }
         return true
     }
 
-    func takeDisplayedStamp() -> (ptsNs: UInt64, decodedNs: Int64)? {
+    func takeDisplayedStamp() -> Stamp? {
         guard #available(macOS 14.4, iOS 17.4, tvOS 17.4, *),
               let pixelBuffer = renderer.displayedPixelBuffer(),
               let surfaceID = Self.surfaceID(pixelBuffer)
         else { return nil }
         lock.lock()
         defer { lock.unlock() }
-        guard let stamp = stamps.removeValue(forKey: surfaceID) else { return nil }
-        return (stamp.ptsNs, stamp.decodedNs)
+        return stamps.removeValue(forKey: surfaceID)
     }
 
     private static func surfaceID(_ pixelBuffer: CVPixelBuffer) -> IOSurfaceID? {
@@ -397,6 +444,109 @@ final class LatestBox<T>: @unchecked Sendable {
         let v = value
         value = nil
         return v
+    }
+}
+
+/// A drawable the deadline link vended, with when it did and the refresh it is for (both
+/// `CACurrentMediaTime`).
+struct VendedDrawable {
+    let drawable: CAMetalDrawable
+    let vendAt: CFTimeInterval
+    let target: CFTimeInterval
+}
+
+/// Late latch for deadline pacing: hold a vended drawable until `target − budget`, then render
+/// the newest decoded frame. The link vends two refreshes before its target, but a present needs
+/// only one refresh plus ~1.5 ms, so a frame decoded in between still makes that refresh instead
+/// of waiting for the next vend — one refresh less, measured on glass on the Apple TV.
+///
+/// The budget is half the vend lead (one refresh) + 4 ms, after 120 presents at the vend (the
+/// first second or two can miss while the panel settles). A held present that misses its refresh
+/// adds 2 ms; 600 on-target presents take 1 ms back, never below the base. A fixed delay (sweeps)
+/// holds `vendAt + delay` and only counts. Lock-guarded: the render thread asks, Metal's
+/// completion thread reports.
+final class LatchBudget: @unchecked Sendable {
+    static let margin: CFTimeInterval = 0.004
+    static let warmup = 120, recovery = 600
+    private let lock = NSLock()
+    private let fixedDelay: CFTimeInterval?
+    private var extra: CFTimeInterval = 0
+    private var budget: CFTimeInterval = 0 // the last one handed out
+    private var presents = 0, clean = 0
+    private var held = 0, misses = 0, superseded = 0
+    private var wakeLateMax: CFTimeInterval = 0
+
+    init(fixedDelay: CFTimeInterval?) { self.fixedDelay = fixedDelay }
+
+    /// When to render a drawable vended at `vendAt` for `target`: never before the vend, never
+    /// after the target.
+    func latchAt(vendAt: CFTimeInterval, target: CFTimeInterval) -> CFTimeInterval {
+        lock.lock()
+        defer { lock.unlock() }
+        budget = budgetFor(lead: target - vendAt)
+        return max(vendAt, target - budget)
+    }
+
+    /// How far before its target a present goes out: the display-pipeline minimum the stats
+    /// overlay excludes from end-to-end.
+    func presentFloor(lead: CFTimeInterval) -> CFTimeInterval {
+        lock.lock()
+        defer { lock.unlock() }
+        return budgetFor(lead: lead)
+    }
+
+    private func budgetFor(lead: CFTimeInterval) -> CFTimeInterval {
+        if let fixedDelay { return max(lead - fixedDelay, 0) }
+        guard presents >= Self.warmup else { return lead }
+        return min(lead / 2 + Self.margin + extra, lead)
+    }
+
+    /// A present issued at `issuedNs` for `targetNs` reached glass at `presentedNs` (nil:
+    /// dropped). Every on-target present counts toward recovery — at a budget backed off to the
+    /// whole lead nothing is held any more. Only a held miss issued under the current budget
+    /// backs off: a late frame, or one already in flight at the last back-off, says nothing new.
+    /// Any refresh is ≥ 4.17 ms, so 3 ms past the target is a miss.
+    func observe(issuedNs: Int64, presentedNs: Int64?, targetNs: Int64, held wasHeld: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        presents += 1
+        if wasHeld { held += 1 }
+        if let presentedNs, presentedNs - targetNs <= 3_000_000 {
+            clean += 1
+            if fixedDelay == nil, clean >= Self.recovery, extra > 0 {
+                clean = 0
+                extra = max(0, extra - 0.001)
+            }
+            return
+        }
+        guard wasHeld else { return }
+        misses += 1
+        clean = 0
+        let offset = Double(targetNs - issuedNs) / 1e9
+        guard fixedDelay == nil, offset >= budget - 0.0005 else { return }
+        extra = min(extra + 0.002, 0.05)
+        budget += 0.002
+    }
+
+    func noteSuperseded() { lock.lock(); superseded += 1; lock.unlock() }
+
+    func noteWake(late: CFTimeInterval) {
+        lock.lock()
+        wakeLateMax = max(wakeLateMax, late)
+        lock.unlock()
+    }
+
+    /// The once-a-second `PUNKTFUNK_PRESENT_DEBUG` line; resets the window counters.
+    func windowLine() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        let line = String(
+            format: "pf-latch mode=%@ budgetMs=%.2f held=%d misses=%d superseded=%d "
+                + "wakeLateMaxMs=%.2f",
+            fixedDelay.map { String(format: "fixed%.0f", $0 * 1000) } ?? "auto",
+            budget * 1000, held, misses, superseded, wakeLateMax * 1000)
+        held = 0; misses = 0; superseded = 0; wakeLateMax = 0
+        return line
     }
 }
 
@@ -491,7 +641,7 @@ final class PresentGate: @unchecked Sendable {
 /// closure (the link holds it weak); captures only the shared boxes, never the pipeline — the
 /// same no-self-capture rule as the pump/render threads.
 private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
-    private let stash: LatestBox<CAMetalDrawable>
+    private let stash: LatestBox<VendedDrawable>
     private let renderSignal: DispatchSemaphore
     private let hint: FrameRateHint
     private let stats: PresentDebugStats?
@@ -509,6 +659,7 @@ private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
     /// The `preferredFrameLatency` this session asks for — 1 by default, PUNKTFUNK_FRAME_LATENCY
     /// for the on-device ladder (see `startDeadlinePresenter` for the ladder's design).
     private let latencyAsk: Float
+    private let latch: LatchBudget?
     /// One-shot: log the link's preferredFrameLatency READBACK after the first re-assert. A
     /// readback differing from the ask ⇒ the system clamps the property (the one clamp signal
     /// it can give); a readback EQUAL to the ask proves nothing — only vendLeadMs does (see
@@ -516,9 +667,9 @@ private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
     private var loggedEffective = false
 
     init(
-        stash: LatestBox<CAMetalDrawable>, renderSignal: DispatchSemaphore,
+        stash: LatestBox<VendedDrawable>, renderSignal: DispatchSemaphore,
         hint: FrameRateHint, stats: PresentDebugStats?, hud: HudSink?,
-        phase: PhaseReporter?, drawableCount: Int, latencyAsk: Float
+        phase: PhaseReporter?, drawableCount: Int, latencyAsk: Float, latch: LatchBudget?
     ) {
         self.stash = stash
         self.renderSignal = renderSignal
@@ -528,6 +679,7 @@ private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
         self.phase = phase
         self.drawableCount = drawableCount
         self.latencyAsk = latencyAsk
+        self.latch = latch
     }
 
     func metalDisplayLink(_ link: CAMetalDisplayLink, needsUpdate update: CAMetalDisplayLink.Update) {
@@ -557,20 +709,25 @@ private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
             presentLog.info("\(msg, privacy: .public)")
         }
         // The link's own pipeline depth, measured: how far ahead of glass this vend runs.
-        let leadS = update.targetPresentationTimestamp - CACurrentMediaTime()
+        let vendAt = CACurrentMediaTime()
+        let leadS = update.targetPresentationTimestamp - vendAt
         stats?.vendLead(ms: leadS * 1000)
-        // The same lead, as an OS-floor sample for the overlay.
-        if leadS > 0 { hud?.floor(ns: Int64(leadS * 1_000_000_000)) }
+        // The OS floor for the overlay: how far before glass this vend's present goes out —
+        // the late-latch budget, else the whole lead.
+        let floorS = latch?.presentFloor(lead: leadS) ?? leadS
+        if floorS > 0 { hud?.floor(ns: Int64(floorS * 1_000_000_000)) }
         // Phase-locked capture: this update's target present, converted into the arrival
-        // stamps' CLOCK_REALTIME domain. Per-update cost is one clock read; the reporter
-        // itself flushes ~1 Hz.
+        // stamps' CLOCK_REALTIME domain, and how far before it this drawable renders — so the
+        // host aims frames at the latch point, not the refresh. One clock read per update; the
+        // reporter itself flushes ~1 Hz.
         if let phase {
-            var ts = timespec()
-            clock_gettime(CLOCK_REALTIME, &ts)
-            let nowNs = Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
-            phase.noteGrid(nextLatchRealNs: nowNs + Int64(leadS * 1_000_000_000))
+            let nowNs = realtimeNowNs()
+            phase.noteGrid(
+                targetRealNs: nowNs + Int64(leadS * 1_000_000_000),
+                latchLeadNs: Int64(floorS * 1_000_000_000))
         }
-        stash.put(update.drawable)
+        stash.put(VendedDrawable(
+            drawable: update.drawable, vendAt: vendAt, target: update.targetPresentationTimestamp))
         renderSignal.signal()
     }
 }
@@ -677,6 +834,9 @@ public final class Stage2Pipeline {
     /// Deadline pacing's staged CAMetalDisplayLink frame-rate hint (see `FrameRateHint`).
     /// Created unconditionally (cheap); only the deadline link thread drains it.
     private let frameRateHint = FrameRateHint()
+    /// The pf-present line, on every pacing. Built in `init` so the decode callback can count
+    /// decoder output; `start` names the pace once the session's policy is resolved.
+    private let debugStats: PresentDebugStats
 
     /// The Metal layer the hosting view installs + sizes.
     public var layer: CAMetalLayer { presenter.layer }
@@ -688,11 +848,13 @@ public final class Stage2Pipeline {
     /// overlay's stamps reach the core through the connection. Metering never gates the
     /// presenter choice. Returns nil if Metal can't be set up (headless / no GPU) — caller
     /// falls back to the stage-1 presenter. `pacing` also selects the decoded video sink when its
-    /// `displayLayer` is supplied. `gateDepth` bounds glass presents; `vsyncPaced` schedules macOS
-    /// smoothness, while `adaptiveSlotPaced` schedules latency onto the ordinary display-link grid.
+    /// `videoRenderer` is supplied; `mirrorRenderer` gets a copy of each surface. `gateDepth`
+    /// bounds glass presents; `vsyncPaced` schedules macOS smoothness, while `adaptiveSlotPaced`
+    /// schedules latency onto the ordinary display-link grid.
     public init?(
         endToEndMeter: LatencyMeter?,
-        displayLayer: AVSampleBufferDisplayLayer? = nil,
+        videoRenderer: AVSampleBufferVideoRenderer? = nil,
+        mirrorRenderer: AVSampleBufferVideoRenderer? = nil,
         pacing: PresentPacing = .arrival,
         gateDepth: Int = 1,
         storePolicy: FrameStorePolicy = .newestWins,
@@ -701,8 +863,8 @@ public final class Stage2Pipeline {
     ) {
         let decodedSink: DecodedVideoSink?
         if pacing == .decoded {
-            guard let displayLayer else { return nil }
-            decodedSink = DecodedVideoSink(layer: displayLayer)
+            guard let videoRenderer else { return nil }
+            decodedSink = DecodedVideoSink(renderer: videoRenderer, mirror: mirrorRenderer)
         } else {
             decodedSink = nil
         }
@@ -729,6 +891,12 @@ public final class Stage2Pipeline {
         let phaseReporter = phaseReporter
         let cadence = cadence
         let rateHint = frameRateHint
+        let vsyncClock = vsyncClock
+        let paceName = { rateHint.pace() }
+        let debugStats = PresentDebugStats(
+            cadence: cadence, pace: paceName,
+            linkPeriod: { vsyncClock.lastPeriod() }, panel: { rateHint.panel() })
+        self.debugStats = debugStats
         self.decoder = VideoDecoder(
             onDecoded: { frame in
                 // Decode stage = received→decoded, both client CLOCK_REALTIME (offset 0 — no
@@ -736,13 +904,18 @@ public final class Stage2Pipeline {
                 // including ones the re-anchor gate withholds or the newest-wins ring drops.
                 hud.decoded(
                     ptsNs: frame.ptsNs, receivedNs: frame.receivedNs, decodedNs: frame.decodedNs)
+                debugStats.decoded(
+                    isRepeat: frame.flags & PunktfunkConnection.userFlagRepeat != 0)
                 // Same interval, reported to the core bitrate controller so Automatic caps at this
                 // device's real decode limit instead of the network link ceiling. Every decoded
                 // frame (not just presented ones), so a newest-wins drop can't hide the backlog.
                 decodeReport.record(receivedNs: frame.receivedNs, decodedNs: frame.decodedNs)
                 // The decoded video plane reanchors independently of host submit phase. Feeding
                 // it to the phase controller adds a standing grid period without moving display.
-                if pacing != .decoded { phaseReporter.noteArrival(receivedNs: frame.receivedNs) }
+                if pacing != .decoded {
+                    phaseReporter.noteArrival(
+                        receivedNs: frame.receivedNs, decodedNs: frame.decodedNs)
+                }
                 // Freeze-until-reanchor: WITHHOLD a decoder-concealed post-loss frame (the gray/
                 // garbage VideoToolbox returns Ok for a reference-missing delta) — don't submit it,
                 // so the CAMetalLayer keeps its last good drawable on glass. The gate lifts (returns
@@ -751,7 +924,10 @@ public final class Stage2Pipeline {
                 guard gate.onDecoded(flags: frame.flags) else { return }
                 if case .video(_, let isHDR) = frame.image { frameHDR.note(isHDR) }
                 if let decodedSink {
-                    decodedSink.submit(frame)
+                    let submitStarted = CACurrentMediaTime()
+                    let submitted = decodedSink.submit(frame)
+                    debugStats.renderReturned(
+                        ok: submitted, tookMs: (CACurrentMediaTime() - submitStarted) * 1000)
                     return
                 }
                 // Decoder OUTPUT is where the cadence loop is sampled — the instant the frame
@@ -814,195 +990,66 @@ public final class Stage2Pipeline {
         presenter.configure(hdr: connection.isHDR, tenBitSDR: connection.bitDepth >= 10)
         decodedSink?.reset()
 
-        let token = token
-        let decoder = decoder
-        let recovery = recovery
-        let presenter = presenter
-        let pumpStopped = pumpStopped
-        let reanchorGate = gate
         // PyroWave rides a different decode half: no CMFormatDescription/VideoToolbox machinery
         // (a wavelet AU has no parameter sets), no keyframe recovery or re-anchor freeze (the
         // stream is all-intra and Phase 4's partial delivery WANTS lossy frames on glass as
         // localized blur, not a freeze). The ready ring, render thread, pacing and meters are
         // shared unchanged.
-        let thread: Thread
-        if connection.videoCodec == .pyrowave {
-            thread = Self.makePyroWavePump(
+        let presenter = presenter
+        let thread =
+            connection.videoCodec == .pyrowave
+            ? Self.makePyroWavePump(
                 connection: connection, token: token, pumpStopped: pumpStopped,
                 ring: ring, renderSignal: renderSignal,
                 device: presenter.metalDevice, queue: presenter.metalQueue,
-                hud: hud, cadence: cadence, rateHint: frameRateHint,
+                hud: hud, stats: debugStats, cadence: cadence, rateHint: frameRateHint,
                 onFrame: onFrame, onSessionEnd: onSessionEnd, onDecodedSize: onDecodedSize,
                 frameHDR: frameHDR,
                 onHdrMeta: { [weak presenter] meta in presenter?.setHdrMeta(meta) })
-        } else {
-            thread = Thread {
-            defer { pumpStopped.signal() } // let stop() join the pump (bounded) before decoder.reset()
-            // Format, decoded size, straggler filter and the keyframe WANT — the same rules the
-            // stage-1 pump follows, in one tested place. Loss itself goes through the gate, where
-            // an RFI anchor heals it without an IDR.
-            var pump = AUPumpState()
-            // VideoToolbox reads the RPS itself, so a lost reference must be concealed in the
-            // bitstream before submit (see HevcConcealer). Thread-confined; one per session.
-            let concealer: HevcConcealer? = connection.videoCodec == .hevc ? HevcConcealer() : nil
-            var wasUnrecoverable = false
-            // 4:4:4 backstop: a run of decode/create failures in a 4:4:4 session means this device can't
-            // decode 4:4:4 at the negotiated resolution (the HW probe clears the common case but not a
-            // resolution-ceiling miss). End cleanly instead of looping on a black screen.
-            var decodeFailRun = 0
-            // Every iteration drains its own autorelease pool: this thread has no runloop, so
-            // autoreleased VT/CM temporaries would otherwise accumulate until session end.
-            // `false` = session over — exit the loop (the closure can't `break` across itself).
-            var alive = true
-            while alive, !token.isStopped {
-                alive = autoreleasepool { () -> Bool in
-                do {
-                    // Background keep-alive: drain one AU (flow control + host pacing) and discard it
-                    // BEFORE any VideoToolbox decode or Metal render — no GPU work off-screen. The
-                    // decoder session is left intact; exitBackground requests a fresh IDR and the
-                    // re-anchor gate arms on the resumed frame-index gap so concealed frames are
-                    // withheld until it lands.
-                    if connection.isVideoDropped {
-                        _ = try connection.nextAU(timeoutMs: 100)
-                        return true
-                    }
-                    if pump.awaitingIDR { recovery.request() }
-                    // Loss recovery through the shared gate: a drop-count climb beyond the gap's
-                    // credit arms the freeze and asks (the decoder conceals reference-missing
-                    // deltas without an error), and an overdue freeze re-asks for the re-anchor.
-                    if reanchorGate.poll(framesDropped: connection.framesDropped()) {
-                        recovery.request()
-                    }
-                    // Drain HDR mastering metadata (0xCE) and hand it to the PRESENTER (→ CAEDRMetadata).
-                    // Polled UNCONDITIONALLY (not gated on connection.isHDR, the fixed Welcome flag): the
-                    // host sends 0xCE only for HDR, INCLUDING a mid-session SDR→HDR transition (a game
-                    // entering HDR — the host re-inits its encoder) the Welcome flag would never reflect.
-                    // Non-blocking; nil for an SDR stream.
-                    if let meta = try? connection.nextHdrMeta(timeoutMs: 0) {
-                        presenter.setHdrMeta(meta)
-                    }
-                    guard let received = try connection.nextAU(timeoutMs: 100) else { return true }
-                    var au = received // the concealer may swap its bytes below
-                    // A forward frame-index gap fires a throttled RFI (a clean P-frame, no IDR)
-                    // and arms the freeze, credited with the gap width so the reassembler's
-                    // ~120 ms-later framesDropped climb for the same loss cannot re-freeze a
-                    // stream the anchor already healed. A lost anchor lapses into the gate's
-                    // overdue re-ask above.
-                    let gapWidth = connection.noteFrameIndexGapWidth(au.frameIndex)
-                    if gapWidth > 0 { reanchorGate.arm(expectingDrops: UInt64(gapWidth)) }
-                    onFrame?(au)
-                    if pump.isStraggler(frameIndex: au.frameIndex) { return true }
-                    var concealed = AUPumpState.Concealment.none
-                    if let concealer {
-                        switch concealer.conceal(au.data) {
-                        case .intact:
-                            concealed = .decodable
-                        case .rewritten(let data):
-                            concealed = .decodable
-                            au = au.replacing(data: data)
-                            pumpLog.notice(
-                                "video: frame \(au.frameIndex, privacy: .public) names a lost reference — moved to a present picture until the re-anchor"
-                            )
-                        case .unrecoverable:
-                            concealed = .unrecoverable
-                        }
-                        if concealed == .unrecoverable, !wasUnrecoverable {
-                            pumpLog.warning(
-                                "video: frame \(au.frameIndex, privacy: .public) names a lost reference with nothing to stand in — withholding until an IDR"
-                            )
-                        }
-                        wasUnrecoverable = concealed == .unrecoverable
-                    }
-                    let step = pump.note(
-                        frameIndex: au.frameIndex,
-                        idrFormat: connection.videoCodec.formatDescription(fromKeyframe: au.data),
-                        lossAhead: gapWidth > 0, flags: au.flags, concealed: concealed)
-                    if step.straggler { return true }
-                    if let size = step.newSize { onDecodedSize?(size.width, size.height) }
-                    if step.startedFormatWait {
-                        pumpLog.warning(
-                            "video: received AUs but no decodable format (missing/unparsed parameter sets) — requesting an IDR until one seeds it"
-                        )
-                    }
-                    if step.askKeyframe { recovery.request() }
-                    // A delta between a loss and its re-anchor references the lost picture. Fed to
-                    // VideoToolbox it poisons the session — every later non-IDR AU, the anchor too,
-                    // comes back kVTVideoDecoderBadDataErr. Withheld, the anchor decodes and lifts.
-                    if step.withhold { return true }
-                    guard let f = pump.format, !token.isStopped else { return true }
-                    if decoder.decode(au: au, format: f) {
-                        decodeFailRun = 0
-                    } else {
-                        // Submit/decoder error: drop the session and re-gate on the next IDR's in-band
-                        // parameter sets (a delta frame can't recover) and keep asking for that IDR.
-                        decoder.reset()
-                        pump.requireIDR()
-                        decodeFailRun += 1
-                        // ~3 s of solid failure in a 4:4:4 session (and only there — a 4:2:0 loss
-                        // recovers within a GOP) ⇒ 4:4:4 isn't decodable here; end the session.
-                        if connection.isChroma444, decodeFailRun >= 180 {
-                            if !token.isStopped { onSessionEnd?() }
-                            return false
-                        }
-                    }
-                    return true
-                } catch {
-                    if !token.isStopped { onSessionEnd?() }
-                    return false // session closed
-                }
-                }
-            }
-            }
-        }
+            : Self.makeVideoToolboxPump(
+                connection: connection, token: token, pumpStopped: pumpStopped,
+                decoder: decoder, gate: gate, recovery: recovery,
+                onFrame: onFrame, onSessionEnd: onSessionEnd, onDecodedSize: onDecodedSize,
+                onHdrMeta: { presenter.setHdrMeta($0) })
         thread.name = "punktfunk-stage2-pump"
         thread.qualityOfService = .userInteractive
         pumpJoinable = true
         thread.start()
 
+        // Present policy, resolved once per session before the stats so each line names it.
+        // Adaptive-refresh latency chooses immediate sparse or slotted dense input.
+        let policy = PresentPolicy.resolve(
+            env: ProcessInfo.processInfo.environment["PUNKTFUNK_PRESENT_MODE"],
+            vsync: connection.settings.vsync, vsyncPaced: vsyncPaced,
+            adaptiveSlotPaced: adaptiveSlotPaced)
+        frameRateHint.stagePace(policy.label(pacing))
+        // The video plane has no present thread: `renderTick` stamps and flushes its line.
+        let debugStats: PresentDebugStats? = self.debugStats
         if decodedSink != nil { return }
 
-        // Present policy, resolved once per session before the stats so each line names it.
-        // Adaptive-refresh latency chooses immediate sparse or slotted dense input. The env selects
-        // slot, immediate or legacy scheduled V-Sync explicitly for A/B.
-        let presentMode = ProcessInfo.processInfo.environment["PUNKTFUNK_PRESENT_MODE"]
-        let forcedSlot = presentMode == "slot"
-        let adaptiveSlot = adaptiveSlotPaced && !connection.settings.vsync
-            && presentMode != "immediate" && presentMode != "vsync" && !forcedSlot
-        let fixedSlot = vsyncPaced || forcedSlot
-        let fixedVsync = presentMode == "vsync"
-            || (presentMode != "immediate" && connection.settings.vsync)
-        let vsyncClock = vsyncClock
-        let pace = pacing == .deadline ? "deadline"
-            : adaptiveSlot ? "adaptive" : fixedSlot ? "slot" : fixedVsync ? "vsync" : "immediate"
-        #if os(macOS)
-        // The windowed mechanism can flip mid-session (fullscreen ↔ composited), so the suffix
-        // is read live per line rather than baked into the resolved name.
-        let paceName = { presenter.presentsComposited ? pace + "(composited)" : pace }
-        #else
-        let paceName = { pace }
-        #endif
-
         // The present half. Deadline pacing (stage-4) swaps it wholesale: a CAMetalDisplayLink
-        // vends the drawables and its per-refresh updates co-drive the render thread — see
-        // startDeadlinePresenter. The V-Sync policy above doesn't apply there (the link deadline-
-        // times every present). Deadline sessions ALWAYS carry the stats (their pf-present line
-        // streams to Console.app via presentLog — the on-device pacing decomposition).
-        let debugStats =
-            (presentDebug || pacing == .deadline)
-            ? PresentDebugStats(
-                cadence: cadence, pace: paceName,
-                linkPeriod: { vsyncClock.lastPeriod() })
-            : nil
+        // vends the drawables and its per-refresh updates co-drive the render thread. The policy
+        // above doesn't apply there (the link deadline-times every present).
         if pacing == .deadline {
             startDeadlinePresenter(debugStats: debugStats)
-            return
+        } else {
+            startArrivalPresenter(policy: policy, debugStats: debugStats)
         }
+    }
 
-        // The render thread: one present per display-link signal. It owns every layer format/colour/
-        // drawable interaction (see MetalVideoPresenter's threading notes); with displaySyncEnabled on,
-        // nextDrawable's up-to-a-frame wait lands here instead of on main. The 100 ms timed wait is
-        // only the stop-flag poll for a session whose link stopped ticking.
+    /// Arrival and glass pacing's present half (stage-2/3 — see `PresentPacing`): one render
+    /// thread, one present per wake. Decoded frames are the primary wake; display-link ticks
+    /// retry a put-back frame and refresh the vsync grid `policy` schedules against.
+    ///
+    /// The thread owns every layer format/colour/drawable interaction (see MetalVideoPresenter's
+    /// threading notes); with displaySyncEnabled on, nextDrawable's up-to-a-frame wait lands here
+    /// instead of on main. The 100 ms timed wait is only the stop-flag poll for a session whose
+    /// link stopped ticking. Like the pump, the thread never captures `self`.
+    private func startArrivalPresenter(policy: PresentPolicy, debugStats: PresentDebugStats?) {
+        let token = token
         let ring = ring
+        let presenter = presenter
+        let vsyncClock = vsyncClock
         let endToEndMeter = endToEndMeter
         let hud = hud
         let clockOffset = clockOffset
@@ -1034,7 +1081,7 @@ public final class Stage2Pipeline {
                 // Fixed slot pacing can reject the wake before touching the store. Adaptive pacing
                 // resolves after taking a frame because its source stamp selects the regime.
                 let fixedSlotTarget =
-                    fixedSlot ? vsyncClock.nextVsync(after: CACurrentMediaTime()) : nil
+                    policy.fixedSlot ? vsyncClock.nextVsync(after: CACurrentMediaTime()) : nil
                 if let fixedSlotTarget, abs(fixedSlotTarget - lastPresentTarget) < 0.002 {
                     debugStats?.gatedWake()
                     debugStats?.flushIfDue(ring: ring, gate: gate)
@@ -1056,7 +1103,7 @@ public final class Stage2Pipeline {
                     return
                 }
                 let now = CACurrentMediaTime()
-                let adaptiveSlotActive = adaptiveSlot && adaptiveRegime.update(ptsNs: frame.ptsNs)
+                let adaptiveSlotActive = policy.adaptiveSlot && adaptiveRegime.update(ptsNs: frame.ptsNs)
                 let slotTarget = fixedSlotTarget
                     ?? (adaptiveSlotActive ? vsyncClock.nextVsync(after: now) : nil)
                 if adaptiveSlotActive, let slotTarget,
@@ -1068,7 +1115,7 @@ public final class Stage2Pipeline {
                     return
                 }
                 // A stale grid yields no target and falls back to an immediate present.
-                let scheduleOnGrid = fixedSlot || fixedVsync || adaptiveSlotActive
+                let scheduleOnGrid = policy.fixedSlot || policy.fixedVsync || adaptiveSlotActive
                 let presentAt = scheduleOnGrid
                     ? slotTarget
                         ?? vsyncClock.nextVsync(after: max(now, frame.dueMediaTime ?? now))
@@ -1092,7 +1139,10 @@ public final class Stage2Pipeline {
                     // Display stage = decoded → on-glass. Both instants are client CLOCK_REALTIME,
                     // so no skew offset applies.
                     hud.displayed(ptsNs: frame.ptsNs, decodedNs: frame.decodedNs, atNs: atNs)
-                    debugStats?.presented(atNs: presentedNs, issuedNs: issuedNs)
+                    debugStats?.presented(
+                        atNs: presentedNs, issuedNs: issuedNs, ptsNs: frame.ptsNs,
+                        decodedNs: frame.decodedNs,
+                        isRepeat: frame.flags & PunktfunkConnection.userFlagRepeat != 0)
                 }
                 // One present tail, two decode sources: the VideoToolbox biplanar buffer or the
                 // PyroWave Metal planes — the ring, pacing and meters are agnostic to which.
@@ -1151,7 +1201,7 @@ public final class Stage2Pipeline {
         let hint = frameRateHint
         let layer = presenter.layer
         let onWedged = onPresentWedged
-        let stash = LatestBox<CAMetalDrawable>()
+        let stash = LatestBox<VendedDrawable>()
         // Cadence targeting under deadline pacing: the link's vend IS the grid snap, so the clock
         // only has to hold a frame back until it is due and the next update presents it — at most
         // one refresh later. Same holding-buffer rule as the arrival/glass loop (§4.3); latency
@@ -1200,6 +1250,13 @@ public final class Stage2Pipeline {
             ProcessInfo.processInfo.environment["PUNKTFUNK_FRAME_LATENCY"]
                 .flatMap(Float.init)
                 .flatMap { $0.isFinite ? min(max($0, 0), 4) : nil } ?? 1
+        // Late latch (LatchBudget) under the latency intent; Smoothness keeps its cadence clock's
+        // timing. PUNKTFUNK_LATE_LATCH=off renders on pairing, a number holds that many ms after
+        // the vend (sweeps).
+        let latchEnv = ProcessInfo.processInfo.environment["PUNKTFUNK_LATE_LATCH"]
+        let latch: LatchBudget? =
+            cadence != nil || latchEnv == "off" ? nil
+            : LatchBudget(fixedDelay: latchEnv.flatMap(Double.init).map { min(max($0, 0), 50) / 1000 })
 
         let phaseReporter = phaseReporter
         // The link starts LAZILY — the render thread triggers this after the FIRST decoded
@@ -1216,7 +1273,7 @@ public final class Stage2Pipeline {
                 let delegate = DeadlineLinkDelegate(
                     stash: stash, renderSignal: renderSignal, hint: hint, stats: debugStats,
                     hud: hud, phase: phaseReporter,
-                    drawableCount: drawableCount, latencyAsk: latencyAsk)
+                    drawableCount: drawableCount, latencyAsk: latencyAsk, latch: latch)
                 let link = CAMetalDisplayLink(metalLayer: layer)
                 link.preferredFrameLatency = latencyAsk // see the ladder note above
                 if let range = hint.drain() { link.preferredFrameRateRange = range }
@@ -1261,6 +1318,7 @@ public final class Stage2Pipeline {
             // When the link last handed over a drawable, for the stale-link watchdog. Reset on
             // every (re)start too, so a fresh link gets its first vend before it can be judged.
             var lastVend = CACurrentMediaTime()
+            var lastLatchLine = lastVend
             // Relink once, rebuild if it stalls again (see LinkStallPolicy). `wedged` latches:
             // the rebuild replaces this pipeline, so the watchdog stops after one report.
             var stallPolicy = LinkStallPolicy()
@@ -1277,11 +1335,12 @@ public final class Stage2Pipeline {
                 // layer's CURRENT config, so drawableSize/format have to be right before a vend
                 // can succeed at all (see reconcileLayer — the session-start bootstrap, where
                 // the layer still has its initial 0×0 size and every vend fails allocation).
-                guard !token.isStopped, let frame = takeReady() else {
+                guard !token.isStopped, let ready = takeReady() else {
                     debugStats?.emptyWake()
                     debugStats?.flushIfDue(ring: ring, gate: nil)
                     return
                 }
+                var frame = ready
                 switch frame.image {
                 case .video(let pixelBuffer, let isHDR):
                     presenter.reconcileLayer(
@@ -1301,7 +1360,7 @@ public final class Stage2Pipeline {
                     lastVend = CACurrentMediaTime()
                     startLink(stop)
                 }
-                guard let drawable = stash.take() else {
+                guard let vended = stash.take() else {
                     // No vend yet (session start: the reconcile above just unblocked the
                     // allocator, the link's next update delivers; steady state: decode beat the
                     // link's phase). putBack keeps newest-wins — a fresher decode replaces this
@@ -1335,18 +1394,46 @@ public final class Stage2Pipeline {
                     debugStats?.flushIfDue(ring: ring, gate: nil)
                     return
                 }
+                let drawable = vended.drawable
+                // Late latch: wait out the drawable's slack, then take whatever decoded since.
+                var held = false
+                if let latch {
+                    let at = latch.latchAt(vendAt: vended.vendAt, target: vended.target)
+                    if at > CACurrentMediaTime() {
+                        Stage2Pipeline.wait(untilMediaTime: at)
+                        latch.noteWake(late: CACurrentMediaTime() - at)
+                        held = true
+                        if let newer = takeReady() {
+                            frame = newer
+                            latch.noteSuperseded()
+                        }
+                    }
+                    if presentDebug, CACurrentMediaTime() - lastLatchLine >= 1 {
+                        lastLatchLine = CACurrentMediaTime()
+                        print(latch.windowLine())
+                        fflush(stdout)
+                    }
+                }
+                let shown = frame
+                let targetNs = Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: vended.target)
                 let renderStarted = CACurrentMediaTime()
                 lastVend = renderStarted
                 let issuedNs = Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: renderStarted)
-                let onGlass: (Int64?) -> Void = { presentedNs in
+                let onGlass: (Int64?) -> Void = { [held] presentedNs in
+                    latch?.observe(
+                        issuedNs: issuedNs, presentedNs: presentedNs, targetNs: targetNs,
+                        held: held)
                     let atNs = presentedNs
                         ?? Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: CACurrentMediaTime())
-                    endToEndMeter?.record(ptsNs: frame.ptsNs, atNs: atNs, offsetNs: clockOffset())
-                    hud.displayed(ptsNs: frame.ptsNs, decodedNs: frame.decodedNs, atNs: atNs)
-                    debugStats?.presented(atNs: presentedNs, issuedNs: issuedNs)
+                    endToEndMeter?.record(ptsNs: shown.ptsNs, atNs: atNs, offsetNs: clockOffset())
+                    hud.displayed(ptsNs: shown.ptsNs, decodedNs: shown.decodedNs, atNs: atNs)
+                    debugStats?.presented(
+                        atNs: presentedNs, issuedNs: issuedNs, ptsNs: shown.ptsNs,
+                        decodedNs: shown.decodedNs,
+                        isRepeat: shown.flags & PunktfunkConnection.userFlagRepeat != 0)
                 }
                 let rendered: Bool
-                switch frame.image {
+                switch shown.image {
                 case .video(let pixelBuffer, let isHDR):
                     rendered = presenter.render(
                         pixelBuffer, isHDR: isHDR, into: drawable, onPresented: onGlass)
@@ -1361,7 +1448,7 @@ public final class Stage2Pipeline {
                     // back to the pool); the frame retries on the link's next vend. A format
                     // mismatch (mid-session HDR flip caught between the layer reconfigure and
                     // the next vend) self-heals the same way — see encodePresent's guard.
-                    ring.putBack(frame)
+                    ring.putBack(shown)
                 }
                 debugStats?.flushIfDue(ring: ring, gate: nil)
             } }
@@ -1384,14 +1471,26 @@ public final class Stage2Pipeline {
         period: CFTimeInterval
     ) {
         vsyncClock.set(target: targetMediaTime, period: period)
-        #if os(tvOS)
+        #if os(tvOS) || os(visionOS)
         if let stamp = decodedSink?.takeDisplayedStamp() {
             let atNs = Self.realtimeNs(forDisplayLinkTimestamp: displayedMediaTime)
             endToEndMeter?.record(ptsNs: stamp.ptsNs, atNs: atNs, offsetNs: clockOffset())
             hud.displayed(ptsNs: stamp.ptsNs, decodedNs: stamp.decodedNs, atNs: atNs)
+            debugStats.presented(
+                atNs: atNs, issuedNs: stamp.submittedNs, ptsNs: stamp.ptsNs,
+                decodedNs: stamp.decodedNs, isRepeat: stamp.isRepeat)
         }
         #endif
-        if pacing != .decoded { renderSignal.signal() }
+        if pacing != .decoded {
+            renderSignal.signal()
+        } else {
+            debugStats.flushIfDue(ring: ring, gate: nil)
+        }
+    }
+
+    /// MAIN thread: the hosting panel, for the pf-present line's grid and `panel=` field.
+    public func setPanel(_ info: PanelInfo) {
+        frameRateHint.stagePanel(info)
     }
 
     /// MAIN thread (SessionPresenter — session start + every layout/Reconfigure): hint the
@@ -1423,18 +1522,6 @@ public final class Stage2Pipeline {
     public func setSourceRect(_ rect: CGRect) {
         presenter.setSourceRect(rect)
     }
-
-    #if os(macOS)
-    /// Forward the windowed present mechanism (MAIN thread — see
-    /// `MetalVideoPresenter.setWindowedPresent`, the DCP swapID-panic mitigation).
-    func setWindowedPresent(_ mode: WindowedPresentMode) {
-        presenter.setWindowedPresent(mode)
-    }
-
-    /// The windowed `surface` present target the hosting SessionPresenter installs as a sibling
-    /// ABOVE `layer` (transparent while unused — see `MetalVideoPresenter.surfaceLayer`).
-    var surfaceLayer: CALayer { presenter.surfaceLayer }
-    #endif
 
     /// Forward the display's current EDR headroom to the presenter (MAIN thread — a `UIScreen`
     /// read). tvOS flips HDR presentation between PQ passthrough and the in-shader tone-map on
@@ -1473,6 +1560,70 @@ public final class Stage2Pipeline {
         renderSignal.signal() // wake the render thread so it can observe the stop and exit
     }
 
+    /// The VideoToolbox pump: the shared AU intake vets each AU and `decoder` decodes it; the
+    /// decoder's own callback fills the ready ring. A failed submit drops the decode session and
+    /// waits for the next IDR's parameter sets. Static + capture-by-parameter so a missed stop
+    /// can't leak a live pipeline.
+    private static func makeVideoToolboxPump(
+        connection: PunktfunkConnection, token: StopFlag, pumpStopped: DispatchSemaphore,
+        decoder: VideoDecoder, gate: ReanchorGate, recovery: KeyframeRecovery,
+        onFrame: (@Sendable (AccessUnit) -> Void)?,
+        onSessionEnd: (@Sendable () -> Void)?,
+        onDecodedSize: (@Sendable (Int, Int) -> Void)?,
+        onHdrMeta: @escaping @Sendable (PunktfunkConnection.HdrMeta) -> Void
+    ) -> Thread {
+        Thread {
+            defer { pumpStopped.signal() } // let stop() join the pump (bounded) before decoder.reset()
+            var intake = AUIntake(connection: connection, gate: gate, recovery: recovery)
+            // Hardware-only backstop (4:4:4, AV1): 3 s in which every decode fails means this device
+            // can't decode the mode at all, e.g. past a resolution ceiling. End instead of looping on
+            // black. Timed, not counted: after a failure only IDRs reach the decoder.
+            let hardwareOnly = connection.isChroma444 || connection.videoCodec == .av1
+            var failingSinceNs: UInt64?
+            // Every iteration drains its own autorelease pool: this thread has no runloop, so
+            // autoreleased VT/CM temporaries would otherwise accumulate until session end.
+            // `false` = session over — exit the loop (the closure can't `break` across itself).
+            var alive = true
+            while alive, !token.isStopped {
+                alive = autoreleasepool { () -> Bool in
+                    do {
+                        // Background time is not failure time: the intake drains without decoding.
+                        if connection.isVideoDropped { failingSinceNs = nil }
+                        // HDR mastering metadata (0xCE) goes to the presenter (→ CAEDRMetadata).
+                        guard let ready = try intake.next(
+                            onFrame: onFrame, onDecodedSize: onDecodedSize, onHdrMeta: onHdrMeta)
+                        else { return true }
+                        let au = ready.au
+                        // A delta between a loss and its re-anchor references the lost picture. Fed
+                        // to VideoToolbox it poisons the session — every later non-IDR AU, the anchor
+                        // too, comes back kVTVideoDecoderBadDataErr. Withheld, the anchor decodes.
+                        if ready.step.withhold { return true }
+                        guard let f = intake.pump.format, !token.isStopped else { return true }
+                        if decoder.decode(au: au, format: f) {
+                            failingSinceNs = nil
+                        } else {
+                            // Submit/decoder error: drop the session and re-gate on the next IDR's
+                            // in-band parameter sets (a delta frame can't recover) and keep asking.
+                            decoder.reset()
+                            intake.requireIDR()
+                            let nowNs = DispatchTime.now().uptimeNanoseconds
+                            let sinceNs = failingSinceNs ?? nowNs
+                            failingSinceNs = sinceNs
+                            if hardwareOnly, nowNs - sinceNs >= 3_000_000_000 {
+                                if !token.isStopped { onSessionEnd?() }
+                                return false
+                            }
+                        }
+                        return true
+                    } catch {
+                        if !token.isStopped { onSessionEnd?() }
+                        return false // session closed
+                    }
+                }
+            }
+        }
+    }
+
     /// The PyroWave pump: AUs go straight into the Metal wavelet decoder (no VideoToolbox, no
     /// format descriptions), decoded planes ride the same ready ring / render thread. All-intra
     /// stream, so none of the VT pump's recovery machinery applies: keyframe/RFI requests are
@@ -1483,7 +1634,7 @@ public final class Stage2Pipeline {
         connection: PunktfunkConnection, token: StopFlag, pumpStopped: DispatchSemaphore,
         ring: FrameStore<ReadyFrame>, renderSignal: DispatchSemaphore,
         device: MTLDevice, queue: MTLCommandQueue,
-        hud: HudSink, cadence: CadenceClock?, rateHint: FrameRateHint,
+        hud: HudSink, stats: PresentDebugStats, cadence: CadenceClock?, rateHint: FrameRateHint,
         onFrame: (@Sendable (AccessUnit) -> Void)?,
         onSessionEnd: (@Sendable () -> Void)?,
         onDecodedSize: (@Sendable (Int, Int) -> Void)?,
@@ -1498,7 +1649,11 @@ public final class Stage2Pipeline {
             // Compiles the two compute kernels on the session's first frames' thread — ~tens of
             // ms, once per session. Failure = this device can't run the negotiated codec (the
             // advertisement probe should have prevented this); end the session cleanly.
-            guard let decoder = MetalWaveletDecoder(device: device, queue: queue) else {
+            // Ring past the store: its queued frames, the render thread's, a put-back, the decode.
+            guard let decoder = MetalWaveletDecoder(
+                device: device, queue: queue, tenBit: connection.bitDepth >= 10,
+                ringDepth: max(4, ring.capacity + 3))
+            else {
                 if !token.isStopped { onSessionEnd?() }
                 return
             }
@@ -1544,12 +1699,11 @@ public final class Stage2Pipeline {
                             // Metal completed-handler thread — stamp + enqueue, don't block
                             // (the exact contract of the VT output callback).
                             guard let planes else { return }
-                            var ts = timespec()
-                            clock_gettime(CLOCK_REALTIME, &ts)
-                            let decodedNs =
-                                Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
+                            let decodedNs = realtimeNowNs()
                             hud.decoded(
                                 ptsNs: ptsNs, receivedNs: receivedNs, decodedNs: decodedNs)
+                            stats.decoded(
+                                isRepeat: flags & PunktfunkConnection.userFlagRepeat != 0)
                             frameHDR.note(planes.pq)
                             // Same cadence sample as the VideoToolbox half: the wavelet decode's
                             // completion IS this frame's presentable instant.
@@ -1584,14 +1738,24 @@ public final class Stage2Pipeline {
         }
     }
 
+    /// Block until `t` (`CACurrentMediaTime` seconds) as an absolute deadline on the mach clock
+    /// that time counts in, so a late start does not stretch the wait.
+    static func wait(untilMediaTime t: CFTimeInterval) {
+        mach_wait_until(UInt64(t * 1e9 * Double(timebase.denom) / Double(timebase.numer)))
+    }
+
+    private static let timebase: mach_timebase_info_data_t = {
+        var info = mach_timebase_info_data_t()
+        mach_timebase_info(&info)
+        return info
+    }()
+
     /// Convert a `CADisplayLink.targetTimestamp` (CACurrentMediaTime basis) to a `CLOCK_REALTIME`
     /// nanosecond instant — the present clock the AU pts + skew offset live in. Projects to the target
     /// present time (when the frame is actually on glass), not the moment we drew.
     public static func realtimeNs(forDisplayLinkTimestamp t: CFTimeInterval) -> Int64 {
         let caNow = CACurrentMediaTime()
-        var ts = timespec()
-        clock_gettime(CLOCK_REALTIME, &ts)
-        let realtimeNow = Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
+        let realtimeNow = realtimeNowNs()
         return realtimeNow + Int64((t - caNow) * 1_000_000_000)
     }
 
@@ -1610,9 +1774,7 @@ public final class Stage2Pipeline {
     /// rather than once per session.)
     static func mediaTimeNs(forRealtimeNs t: Int64) -> Int64 {
         let caNow = CACurrentMediaTime()
-        var ts = timespec()
-        clock_gettime(CLOCK_REALTIME, &ts)
-        let realtimeNow = Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
+        let realtimeNow = realtimeNowNs()
         return Int64(caNow * 1_000_000_000) + (t - realtimeNow)
     }
 

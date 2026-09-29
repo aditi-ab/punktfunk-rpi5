@@ -44,9 +44,10 @@ impl IddPushCapturer {
             last_source: self.last_drain,
             source_seq: self.drain_seq,
             heartbeat_age: self.heartbeat_age(),
-            // With the pointer composited in the driver, cursor travel dirties nothing and the
-            // input canary can never be answered: neither is evidence of a changed desktop.
-            cursor_gap_px: if self.composite_cursor {
+            // With an IddCx hardware cursor declared — the client draws it or the driver
+            // composites it — DWM composes nothing for pointer travel and the input canary can
+            // never be answered: neither is evidence of a changed desktop.
+            cursor_gap_px: if self.cursor_shared.is_some() || self.composite_cursor {
                 0
             } else {
                 self.cursor.gap_px()

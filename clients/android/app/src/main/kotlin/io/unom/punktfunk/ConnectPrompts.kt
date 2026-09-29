@@ -69,11 +69,7 @@ internal fun ConnectPrompts(
     onCancelConnect: () -> Unit,
 ) {
     pendingTrust?.let { pt ->
-        // Same trust/pairing logic, console-styled + controller-navigable in gamepad mode.
         val onPair = { onPendingTrustChange(pt.copy(kind = PendingTrust.Kind.PAIR)) }
-        // Three of the four say the same thing in both interfaces, so they are ONE prompt that
-        // knows which one is running. Only the PIN ceremony genuinely differs — a keyboard field
-        // against four D-pad digit slots is a different input model, not a different skin.
         when (pt.kind) {
             PendingTrust.Kind.TRUST_NEW -> TrustNewHostPrompt(
                 pt,

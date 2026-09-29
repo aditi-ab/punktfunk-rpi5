@@ -11,9 +11,8 @@
 use anyhow::{Context, Result};
 use punktfunk_core::abr::metrics;
 use punktfunk_core::abr::WindowRecord;
-use punktfunk_core::client::NativeClient;
-use punktfunk_core::config::GamepadPref;
-use punktfunk_core::{CompositorPref, Mode};
+use punktfunk_core::client::{ConnectParams, NativeClient};
+use punktfunk_core::Mode;
 use std::io::Write;
 
 /// What the shaped link is, for the metrics the client cannot measure from
@@ -271,16 +270,9 @@ pub fn run(
         .rsplit_once(':')
         .context("--connect wants HOST:PORT")?;
     let port: u16 = port.parse().context("--connect port")?;
-    let client = NativeClient::connect(
-        host,
-        port,
-        mode,
-        CompositorPref::Auto,
-        GamepadPref::Auto,
+    let client = NativeClient::connect(ConnectParams {
         bitrate_kbps,
-        0,
-        2,
-        punktfunk_core::quic::CODEC_H264
+        video_codecs: punktfunk_core::quic::CODEC_H264
             | punktfunk_core::quic::CODEC_HEVC
             | punktfunk_core::quic::CODEC_AV1
             | if preferred_codec == punktfunk_core::quic::CODEC_PYROWAVE {
@@ -289,15 +281,11 @@ pub fn run(
                 0
             },
         preferred_codec,
-        None,
-        0,
-        false,
-        None,
-        Some(client_name.to_string()),
+        name: Some(client_name.to_string()),
         pin,
         identity,
-        std::time::Duration::from_secs(15),
-    )
+        ..ConnectParams::new(host, port, mode, std::time::Duration::from_secs(15))
+    })
     .map_err(|e| anyhow::anyhow!("connect to the host: {e:?}"))?;
     tracing::info!(
         start_kbps = client.current_bitrate_kbps(),

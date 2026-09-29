@@ -12,7 +12,7 @@ import SwiftUI
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     // Which LAYER this surface is editing (SettingsView+Scope): the global defaults, or one
-    // preset's overrides. A TV picks it in its Editing pane; the gamepad UI never edits presets.
+    // preset's overrides. A TV picks it in its Editing pane.
     @ObservedObject var presets = PresetStore.shared
     @State var scope: SettingsScope = .defaults
     /// The preset editor (create / duplicate / edit), when it is open, and the preset a delete
@@ -25,9 +25,9 @@ struct SettingsView: View {
     #if os(macOS)
     @State private var macTab: MacTab = .general
     #endif
-    @AppStorage(DefaultsKey.streamWidth) var width = 1920
-    @AppStorage(DefaultsKey.streamHeight) var height = 1080
-    @AppStorage(DefaultsKey.streamHz) var hz = 60
+    @AppStorage(DefaultsKey.streamWidth) var width = 0
+    @AppStorage(DefaultsKey.streamHeight) var height = 0
+    @AppStorage(DefaultsKey.streamHz) var hz = 0
     // Opt-in (default OFF): the explicit mode below is used and never auto-resized. When ON, a
     // windowed session instead streams at the window's native pixels (1:1, no scaling) so it stays
     // pixel-exact rather than the presenter resampling a fixed-mode frame into the window.
@@ -48,7 +48,6 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.smoothBuffer) var smoothBuffer = 0
     #if os(macOS)
     @AppStorage(DefaultsKey.vsync) var vsync = false
-    @AppStorage(DefaultsKey.windowedSafePresent) var windowedSafePresent = true
     #endif
     #if !os(tvOS)
     @AppStorage(DefaultsKey.allowVRR) var allowVRR = true
@@ -56,14 +55,14 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.hdrEnabled) var hdrEnabled = true
     @AppStorage(DefaultsKey.enable444) var enable444 = false
     @AppStorage(DefaultsKey.tenBitSdr) var tenBitSdr = false
-    /// The gamepad library's arrangement and its collections-first switch — device preferences,
-    /// stored as the cross-client `library_view` / `library_collections` values.
+    /// The gamepad library's arrangement — a device preference, stored as the cross-client
+    /// `library_view` value.
     @AppStorage(DefaultsKey.libraryView) var libraryViewRaw = LibraryArrangement.shelf.stored
-    @AppStorage(DefaultsKey.libraryCollections) var libraryCollections = false
     @AppStorage(DefaultsKey.startIn) var startInRaw = StartIn.hosts.stored
     @AppStorage(DefaultsKey.defaultHost) var defaultHostID = ""
     @AppStorage(DefaultsKey.fullscreenWhileStreaming) var fullscreenWhileStreaming = true
-    @AppStorage(DefaultsKey.micEnabled) var micEnabled = true
+    @AppStorage(DefaultsKey.fullscreenAlways) var fullscreenAlways = false
+    @AppStorage(DefaultsKey.micEnabled) var micEnabled = false
     @AppStorage(DefaultsKey.echoCancel) var echoCancel = true
     @AppStorage(DefaultsKey.keepHostAudio) var keepHostAudio = false
     @AppStorage(DefaultsKey.audioChannels) var audioChannels = 2
@@ -74,6 +73,10 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.statsVerbosity) var statsVerbosityRaw = StatsVerbosity.current.rawValue
     @AppStorage(DefaultsKey.hudPlacement) var hudPlacement = HUDPlacement.topTrailing.rawValue
     @AppStorage(DefaultsKey.advancedStats) var advancedStats = false
+    @AppStorage(DefaultsKey.statsScalePct) var statsScalePct = 100
+    @AppStorage(DefaultsKey.exitHint) var exitHint = true
+    /// Lists each category's advanced rows (`advancedSection`). Device-wide, never a preset's.
+    @AppStorage(DefaultsKey.showAdvanced) var showAdvanced = false
     @ObservedObject var gamepads = GamepadManager.shared
     @AppStorage(DefaultsKey.gamepadUIEnabled) var gamepadUIEnabled = true
     /// When the switch above takes over — read (and shown) only while it is on.
@@ -99,7 +102,11 @@ struct SettingsView: View {
     #if DEBUG && !os(tvOS)
     @State var showControllerTest = false
     #endif
-    #if os(iOS)
+    #if !os(tvOS)
+    /// The OS keeps the controller's Home press from the stream (`watchHomeButton`).
+    @State var homeButtonKept = false
+    #endif
+    #if os(iOS) || os(visionOS)
     @AppStorage(DefaultsKey.pointerCapture) var pointerCapture = true
     @AppStorage(DefaultsKey.touchMode) var touchMode = TouchInputMode.trackpad.rawValue
     @AppStorage(DefaultsKey.rumbleOnDevice) var rumbleOnDevice = false
@@ -113,9 +120,11 @@ struct SettingsView: View {
     // — not just on iPhone, but on any iPad layout that collapses the sidebar to an overlay. Starts
     // .doubleColumn so iPad reliably opens with the sidebar (and its Done) visible.
     @State private var columnVisibility: NavigationSplitViewVisibility = .doubleColumn
-    // Sticky once the wheel lands on "Custom…", so editing a width/height that briefly equals a
-    // preset doesn't snap the wheel back off Custom. A stored non-preset value reads as custom even
-    // when this is false (see `isCustomResolution`), so it survives relaunches without persisting.
+    #endif
+    #if os(iOS) || os(visionOS) || os(macOS)
+    // Sticky once the list lands on "Custom…", so editing a width/height that briefly equals a
+    // preset doesn't snap it back off Custom. A stored non-preset value reads as custom even when
+    // this is false (see `isCustomResolution`), so it survives relaunches without persisting.
     @State var customMode = false
     #endif
     #if os(tvOS)
@@ -127,6 +136,8 @@ struct SettingsView: View {
 
     /// The system keyboard is up for the Custom bitrate row.
     @State var typingBitrate = false
+    /// The system keyboard is up for the Custom size row.
+    @State var typingSize = false
     /// Focus on a sidebar row picks what the pane shows, as on a tab bar.
     @State private var tvPane: TVPane = .category(.general)
     @FocusState private var tvFocusedPane: TVPane?
@@ -142,10 +153,6 @@ struct SettingsView: View {
     /// instead of the app menu while captured). macOS-only: it is the one platform whose window
     /// system hands a plain app no keyboard grab, so the client has to claim the chords itself.
     @AppStorage(DefaultsKey.inhibitShortcuts) var inhibitShortcuts = true
-    /// Accessibility granted? Gates the system-shortcut half of `inhibit_shortcuts` (⌘Space, ⌘Tab…
-    /// need the event tap). Re-read whenever the app comes back to the front — that is when the
-    /// user returns from flipping the switch in System Settings.
-    @State var accessibilityTrusted = InputCapture.systemShortcutsAvailable
     @AppStorage(DefaultsKey.speakerUID) var speakerUID = ""
     @AppStorage(DefaultsKey.micUID) var micUID = ""
     @AppStorage(DefaultsKey.micChannel) var micChannel = 0
@@ -156,7 +163,7 @@ struct SettingsView: View {
     @State var micChannelCount = 0
     #endif
 
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     /// `initialCategory` is nil in the app (the list opens un-selected on iPhone; iPad lands on
     /// General via `onAppear`). The screenshot harness passes an explicit category so the captured
     /// shot opens on a real settings page (a populated detail) rather than the bare category list.
@@ -228,6 +235,8 @@ struct SettingsView: View {
                 sessionSection
                 overlaySection
                 librarySection
+                showAdvancedSection
+                generalAdvancedSection
             }
             .formStyle(.grouped)
             .tabItem { Label("General", systemImage: "gearshape") }
@@ -235,9 +244,8 @@ struct SettingsView: View {
 
             Form {
                 resolutionSection
-                qualitySection
-                presentationSection
-                hostOutputSection
+                pictureSection
+                displayAdvancedSection
             }
             .formStyle(.grouped)
             .tabItem { Label("Display", systemImage: "display") }
@@ -288,7 +296,7 @@ struct SettingsView: View {
 
     // MARK: - iOS / iPadOS: adaptive split view
 
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     private var iosBody: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             List(selection: $settingsSelection) {
@@ -374,6 +382,8 @@ struct SettingsView: View {
                 sessionSection
                 overlaySection
                 librarySection
+                showAdvancedSection
+                generalAdvancedSection
             }
             .formStyle(.grouped)
             .navigationTitle("General")
@@ -381,9 +391,8 @@ struct SettingsView: View {
         case .display:
             Form {
                 resolutionSection
-                qualitySection
-                presentationSection
-                hostOutputSection
+                pictureSection
+                displayAdvancedSection
             }
             .formStyle(.grouped)
             .navigationTitle("Display")
@@ -510,13 +519,14 @@ struct SettingsView: View {
                 sessionSection
                 overlaySection
                 librarySection
+                showAdvancedSection
+                generalAdvancedSection
             }
         case .category(.display):
             Form {
                 resolutionSection
-                qualitySection
-                presentationSection
-                hostOutputSection
+                pictureSection
+                displayAdvancedSection
             }
         case .category(.audio):
             Form { audioSection }
@@ -583,7 +593,9 @@ struct SettingsView: View {
                     Button(role: .destructive) {
                         presetPendingDelete = active
                     } label: {
+                        // Text and symbol in one colour: the role reddens only the text.
                         Label("Delete…", systemImage: "trash")
+                            .foregroundStyle(.red)
                     }
                 }
             }

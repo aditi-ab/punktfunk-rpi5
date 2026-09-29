@@ -1,6 +1,7 @@
-//! Read-side gamescope probes: PipeWire node, EIS socket, version, capability, game-exit.
+//! Read-side gamescope probes: PipeWire node, EIS socket, version, capability, game-exit, and a
+//! session's display env from `/proc`.
 //!
-//! Spawn and teardown stay in [`super`]. The capture target is the log line
+//! Nothing here spawns or stops a gamescope. The capture target is the log line
 //! `stream available on node ID: N`; `pw-dump` is a last resort scoped to this
 //! spawn, because `node.name=gamescope` exists on both the adapter and the stream.
 //!
@@ -9,6 +10,7 @@
 //! Every helper that shells out is bounded; a miss is `None`/`false`, never a hang.
 
 use super::*;
+use std::process::Child;
 
 /// Unbounded `pw-dump` is polled every 300–500 ms from 45 s loops on the session
 /// stream thread; below [`MIN_GAMESCOPE`] a wedged link never returns.
@@ -706,6 +708,83 @@ fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
         }
     }
     None
+}
+
+/// A gamescope we didn't spawn, for this uid. Our own bare-spawns are children of this process
+/// (ppid walk), so one client's nested gamescope never makes the next client attach to it.
+pub fn foreign_gamescope_running() -> bool {
+    let our_pid = std::process::id();
+    crate::proc::own_pids().any(|(pid, path)| {
+        // Resolved name: nixpkgs wraps gamescope, so the kernel reports `.gamescope-wrap`.
+        crate::proc::match_name(&path)
+            .is_some_and(|comm| matches!(comm.as_str(), "gamescope" | "gamescope-wl"))
+            // A killed gamescope its parent has not reaped serves no node to attach to.
+            && crate::proc::pid_alive(pid)
+            && !descends_from(pid, our_pid)
+    })
+}
+
+/// Walk the ppid chain. Hop cap so a racing/exiting process cannot loop us.
+pub(super) fn descends_from(mut pid: u32, ancestor: u32) -> bool {
+    for _ in 0..64 {
+        if pid == ancestor {
+            return true;
+        }
+        if pid <= 1 {
+            return false;
+        }
+        let Some(ppid) = crate::proc::ppid(pid) else {
+            return false;
+        };
+        pid = ppid;
+    }
+    false
+}
+
+/// Every nested Xwayland `(DISPLAY, XAUTHORITY)` ONE seat exposes. Gaming Mode uses two
+/// (`--xwayland-count`); the pointer lives on whichever is focused, so the XFixes source connects
+/// to all of that seat's. `seat` is the instance's `GAMESCOPE_WAYLAND_DISPLAY`; `None` keeps every
+/// gamescope, which is only right when the caller has no seat to be wrong about.
+#[cfg(target_os = "linux")]
+pub(crate) fn xwayland_cursor_targets(seat: Option<&str>) -> Vec<(String, Option<String>)> {
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    for (_, path) in crate::proc::own_pids() {
+        let Some(env) = crate::proc::display_env(&path) else {
+            continue;
+        };
+        // A sandboxed client rewrites the seat name to a bind path (`/run/pressure-vessel/…`), so
+        // it never matches. That is fine: the un-sandboxed members — the wrapper, `steam.sh`, the
+        // splash — all carry the real name, and one is enough.
+        let on_seat = env
+            .gamescope_wayland
+            .as_deref()
+            .is_some_and(|v| seat.is_none_or(|want| v == want));
+        let (true, Some(d)) = (on_seat, env.display) else {
+            continue;
+        };
+        // Distinct DISPLAY only; prefer the first non-empty XAUTHORITY seen for it.
+        match out.iter_mut().find(|(dd, _)| *dd == d) {
+            Some((_, xa)) if xa.is_none() => *xa = env.xauthority,
+            Some(_) => {}
+            None => out.push((d, env.xauthority)),
+        }
+    }
+    out
+}
+
+/// `(DISPLAY, WAYLAND_DISPLAY, XAUTHORITY)` from a same-uid process on `seat` — matched by its
+/// `GAMESCOPE_WAYLAND_DISPLAY`. Any one can be absent. Without the key this took the first
+/// gamescope in `/proc`, which on a multi-seat host launches into somebody else's session.
+pub(super) fn discover_session_display_env(
+    seat: Option<&str>,
+) -> Option<(Option<String>, Option<String>, Option<String>)> {
+    crate::proc::own_pids().find_map(|(_, path)| {
+        let env = crate::proc::display_env(&path)?;
+        let gs_wayland = env
+            .gamescope_wayland
+            .filter(|v| seat.is_none_or(|want| v == want))?;
+        Some((env.display, Some(gs_wayland), env.xauthority))
+    })
 }
 
 #[cfg(test)]

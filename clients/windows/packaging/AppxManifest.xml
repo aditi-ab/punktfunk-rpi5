@@ -90,6 +90,7 @@
         </uap5:Extension>
       </Extensions>
     </Application>
+    <!-- console:begin -->
     <!--
       Second entry point: the couch/console UI, for an HTPC or a TV-attached box where the
       desktop shell is the wrong first screen. Its own executable (punktfunk-console.exe)
@@ -112,6 +113,7 @@
         <uap:DefaultTile Square71x71Logo="Assets\Square71x71Logo.png" />
       </uap:VisualElements>
     </Application>
+    <!-- console:end -->
     <!--
       The headless CLI (design/client-architecture-split.md §4). AppListEntry="none" keeps it
       out of the Start menu: it is a command, not a tile. Its alias is what a plugin or a

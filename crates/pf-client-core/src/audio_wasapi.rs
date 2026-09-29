@@ -28,9 +28,6 @@ const SAMPLE_RATE: usize = 48_000;
 /// Capture stereo: WASAPI autoconvert matrixes any endpoint layout into the requested format.
 /// Downmix to mono in code before encode — voice is mono, half the samples, half the wire.
 const CAPT_CHANNELS: usize = 2;
-/// 10 ms at 48 kHz (480 mono samples). Host accepts any size ≤ 120 ms; 10 ms is the fill share
-/// of mouth-to-ear latency.
-const MIC_FRAME: usize = 480;
 
 /// Named once so the decode thread and the render loop share the same de-prime fuse.
 pub(crate) const TUNING: punktfunk_core::audio::JitterTuning =
@@ -299,6 +296,39 @@ impl Drop for AudioPlayer {
     }
 }
 
+/// A running shared-mode stream signals every engine period (~10 ms); this many silent 100 ms
+/// waits in a row mean the endpoint is gone without an error (unplug, exclusive grab).
+const EVENT_SILENT_WAITS: u32 = 10;
+/// How often a stream on the default endpoint checks that the default is still it.
+const DEFAULT_CHECK_EVERY: Duration = Duration::from_secs(1);
+/// Settle between losing an endpoint and reopening: a route change is not instantaneous.
+const REOPEN_SETTLE: Duration = Duration::from_millis(250);
+/// Reopens that may fail back to back before playback gives up (~2 s).
+const REOPEN_ATTEMPTS: u32 = 8;
+
+/// One opened render endpoint. COM objects: they stay on the render thread.
+struct Endpoint {
+    client: wasapi::AudioClient,
+    render: wasapi::AudioRenderClient,
+    event: wasapi::Handle,
+    engine_hz: Option<u32>,
+    name: String,
+    /// Endpoint id, for noticing that the default moved to another device.
+    id: Option<String>,
+    /// No picked endpoint: this stream follows the default when it changes.
+    follows_default: bool,
+}
+
+/// Why [`play`] returned.
+enum Played {
+    Stopped,
+    Reopen(&'static str),
+}
+
+/// Own the render endpoint for the session: open it, play into it, and open it again when it
+/// goes away (a Bluetooth disconnect, a USB DAC pulled, an exclusive-mode grab) or when the
+/// default output moves. The ring and its policy carry over. Only the first open answers
+/// [`AudioPlayer::spawn`]; a failure there means the session streams video-only.
 fn render_thread(
     pcm_rx: Receiver<Vec<f32>>,
     recycle_tx: SyncSender<Vec<f32>>,
@@ -317,150 +347,244 @@ fn render_thread(
     }
     // A missed period is a click the ring cannot conceal. Best-effort MMCSS (`audio_rt`).
     crate::audio_rt::boost_and_log("wasapi-render");
-    let res = (|| -> Result<Option<u32>> {
-        let channels = fmt.channels.clamp(1, 8) as u8;
-        // f32 interleaved at every rate. Core already decoded 16/24-bit to f32; a 24-bit
-        // WASAPI integer format would rewrite the ring, crossfade, and policy arithmetic.
-        let block_align = channels as usize * 4;
-        let enumerator = DeviceEnumerator::new().context("DeviceEnumerator")?;
-        let device = pick_device(&enumerator, &Direction::Render, "PUNKTFUNK_AUDIO_SINK")
-            .context("render endpoint")?;
-        let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;
-        // Engine mix format before init. Report, not a gate — the wire format is already
-        // negotiated; declining here is silence. The gate is `can_render_at`. A mismatch
-        // means the endpoint changed under us (unplug, shared-mode rate change).
-        let engine_hz = audio_client
-            .get_mixformat()
-            .ok()
-            .map(|f| f.get_samplespersec())
-            .filter(|&hz| hz > 0);
-        if let Some(hz) = engine_hz {
-            if hz < fmt.rate_hz {
-                tracing::warn!(
-                    engine_hz = hz,
-                    stream_hz = fmt.rate_hz,
-                    endpoint = %device.get_friendlyname().unwrap_or_default(),
-                    "the render endpoint's audio engine runs BELOW this session's negotiated \
-                     rate — WASAPI's shared-mode autoconvert is downsampling every frame on \
-                     arrival, so the extra bandwidth is being spent for nothing (raise the rate \
-                     in Windows' Sound → Device properties → Advanced, then reconnect)"
-                );
-            }
-        } else if fmt.rate_hz != SAMPLE_RATE as u32 {
-            tracing::warn!(
-                stream_hz = fmt.rate_hz,
-                "the render endpoint would not report its engine mix format — there is no way to \
-                 tell whether this session's audio is being downsampled on arrival"
-            );
-        }
-        // dwChannelMask is the wire order (5.1 = 0x3F, 7.1 = 0x63F). WASAPI delivers in
-        // ascending mask-bit order, so the mapping is identity. Autoconvert downmixes.
-        let desired = WaveFormat::new(
-            32,
-            32,
-            &SampleType::Float,
-            fmt.rate_hz as usize,
-            channels as usize,
-            Some(punktfunk_core::audio::wasapi_channel_mask(channels)),
-        );
-        let (default_period, _min_period) =
-            audio_client.get_device_period().context("device period")?;
-        let mode = StreamMode::EventsShared {
-            autoconvert: true,
-            buffer_duration_hns: default_period,
-        };
-        audio_client
-            .initialize_client(&desired, &Direction::Render, &mode)
-            .context("initialize render client")?;
-        let h_event = audio_client.set_get_eventhandle().context("event handle")?;
-        let render_client = audio_client
-            .get_audiorenderclient()
-            .context("IAudioRenderClient")?;
-        audio_client.start_stream().context("start render stream")?;
-        let _ = ready.send(Ok(engine_hz));
-
-        let mut ring: VecDeque<f32> = VecDeque::new();
-        // Resolved rate + frame_us: defaults would shed 2.5 frames at a time at 96 kHz.
-        let mut policy =
-            punktfunk_core::audio::JitterPolicy::new_at_rate(TUNING, channels, fmt.rate_hz);
-        policy.set_frame_us(fmt.frame_us);
-        let mut out = Vec::new();
-
-        while !stop.load(Ordering::Relaxed) {
-            if h_event.wait_for_event(100).is_err() {
-                continue;
-            }
-            while let Ok(mut chunk) = pcm_rx.try_recv() {
-                ring.extend(chunk.iter().copied());
-                chunk.clear();
-                let _ = recycle_tx.try_send(chunk);
-            }
-            let avail_frames = audio_client
-                .get_available_space_in_frames()
-                .context("available space")? as usize;
-            if avail_frames == 0 {
-                continue;
-            }
-            let want = avail_frames * channels as usize;
-            // First quantum is the engine period; decode thread prints it.
-            if !vitals.quantum_known() {
-                vitals.note_quantum(
-                    avail_frames as u32,
-                    avail_frames as u32,
-                    avail_frames as u32,
-                );
-            }
-
-            // Policy clamps the sync request against its underrun floor: continuity outranks
-            // alignment.
-            policy.set_sync_target(sync.target());
-            sync.publish_depth(ring.len());
-
-            let step = policy.step(ring.len(), want);
-            if step.drop_front > 0 {
-                punktfunk_core::audio::crossfade_drop(&mut ring, step.drop_front, step.crossfade);
-            }
-            // Deeper-ring request: duplicate one crossfaded frame, do not de-prime.
-            if step.insert_front > 0 {
-                punktfunk_core::audio::crossfade_insert(
-                    &mut ring,
-                    step.insert_front,
-                    step.crossfade,
-                );
-            }
-
-            out.clear();
-            out.resize(avail_frames * block_align, 0);
-            let mut ran_short = false;
-            if !step.silence {
-                for dst in out.chunks_exact_mut(4) {
-                    let s = ring.pop_front().unwrap_or_else(|| {
-                        ran_short = true;
-                        0.0
-                    });
-                    dst.copy_from_slice(&s.to_le_bytes());
+    let channels = fmt.channels.clamp(1, 8) as u8;
+    let mut ring: VecDeque<f32> = VecDeque::new();
+    // Resolved rate + frame_us: defaults would shed 2.5 frames at a time at 96 kHz.
+    let mut policy =
+        punktfunk_core::audio::JitterPolicy::new_at_rate(TUNING, channels, fmt.rate_hz);
+    policy.set_frame_us(fmt.frame_us);
+    let mut ready = Some(ready);
+    let mut failures: u32 = 0;
+    while !stop.load(Ordering::Relaxed) {
+        let ep = match open_render(fmt, channels) {
+            Ok(ep) => ep,
+            Err(e) => {
+                if let Some(r) = ready.take() {
+                    let _ = r.send(Err(anyhow!("{e:#}")));
+                    return Ok(());
                 }
+                failures += 1;
+                if failures > REOPEN_ATTEMPTS {
+                    return Err(e.context("reopen the render endpoint"));
+                }
+                sleep_unless_stopped(&stop, REOPEN_SETTLE);
+                continue;
             }
-            // Unprimed silence is ignored, so priming is not counted as an underrun.
-            policy.note_read(ran_short);
-            vitals.note_callback(
-                ran_short,
-                step.drop_front > 0,
-                step.insert_front > 0,
-                policy.avg_depth_ms(),
-                policy.target_ms(),
-            );
-            render_client
-                .write_to_device(avail_frames, &out, None)
-                .context("write_to_device")?;
+        };
+        failures = 0;
+        match ready.take() {
+            Some(r) => {
+                let _ = r.send(Ok(ep.engine_hz));
+            }
+            None => tracing::info!(endpoint = %ep.name, "WASAPI render reopened"),
         }
-        audio_client.stop_stream().ok();
-        Ok(engine_hz)
-    })();
-    if let Err(ref e) = res {
-        let _ = ready.send(Err(anyhow!("{e:#}")));
+        let played = play(
+            &ep,
+            &pcm_rx,
+            &recycle_tx,
+            &stop,
+            &sync,
+            &vitals,
+            &mut ring,
+            &mut policy,
+            fmt,
+        );
+        ep.client.stop_stream().ok();
+        match played {
+            Ok(Played::Stopped) => break,
+            Ok(Played::Reopen(why)) => {
+                tracing::info!(endpoint = %ep.name, why, "WASAPI render reopening")
+            }
+            Err(e) => tracing::warn!(endpoint = %ep.name, error = %format!("{e:#}"),
+                "WASAPI render failed — reopening"),
+        }
+        sleep_unless_stopped(&stop, REOPEN_SETTLE);
     }
-    res.map(|_| ())
+    Ok(())
+}
+
+fn sleep_unless_stopped(stop: &AtomicBool, total: Duration) {
+    let until = std::time::Instant::now() + total;
+    while std::time::Instant::now() < until && !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Open and start a shared-mode render stream at the session's format.
+fn open_render(fmt: PlaybackFormat, channels: u8) -> Result<Endpoint> {
+    let enumerator = DeviceEnumerator::new().context("DeviceEnumerator")?;
+    let follows_default = std::env::var("PUNKTFUNK_AUDIO_SINK").map_or(true, |v| v.is_empty());
+    let device = pick_device(&enumerator, &Direction::Render, "PUNKTFUNK_AUDIO_SINK")
+        .context("render endpoint")?;
+    let name = device.get_friendlyname().unwrap_or_default();
+    let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;
+    // Engine mix format before init. Report, not a gate — the wire format is already
+    // negotiated; declining here is silence. The gate is `can_render_at`. A mismatch
+    // means the endpoint changed under us (unplug, shared-mode rate change).
+    let engine_hz = audio_client
+        .get_mixformat()
+        .ok()
+        .map(|f| f.get_samplespersec())
+        .filter(|&hz| hz > 0);
+    if let Some(hz) = engine_hz {
+        if hz < fmt.rate_hz {
+            tracing::warn!(
+                engine_hz = hz,
+                stream_hz = fmt.rate_hz,
+                endpoint = %name,
+                "the render endpoint's audio engine runs BELOW this session's negotiated \
+                 rate — WASAPI's shared-mode autoconvert is downsampling every frame on \
+                 arrival, so the extra bandwidth is being spent for nothing (raise the rate \
+                 in Windows' Sound → Device properties → Advanced, then reconnect)"
+            );
+        }
+    } else if fmt.rate_hz != SAMPLE_RATE as u32 {
+        tracing::warn!(
+            stream_hz = fmt.rate_hz,
+            "the render endpoint would not report its engine mix format — there is no way to \
+             tell whether this session's audio is being downsampled on arrival"
+        );
+    }
+    // dwChannelMask is the wire order (5.1 = 0x3F, 7.1 = 0x63F). WASAPI delivers in
+    // ascending mask-bit order, so the mapping is identity. Autoconvert downmixes.
+    let desired = WaveFormat::new(
+        32,
+        32,
+        &SampleType::Float,
+        fmt.rate_hz as usize,
+        channels as usize,
+        Some(punktfunk_core::audio::wasapi_channel_mask(channels)),
+    );
+    let (default_period, _min_period) =
+        audio_client.get_device_period().context("device period")?;
+    let mode = StreamMode::EventsShared {
+        autoconvert: true,
+        buffer_duration_hns: default_period,
+    };
+    audio_client
+        .initialize_client(&desired, &Direction::Render, &mode)
+        .context("initialize render client")?;
+    let event = audio_client.set_get_eventhandle().context("event handle")?;
+    let render = audio_client
+        .get_audiorenderclient()
+        .context("IAudioRenderClient")?;
+    audio_client.start_stream().context("start render stream")?;
+    Ok(Endpoint {
+        client: audio_client,
+        render,
+        event,
+        engine_hz,
+        name,
+        id: device.get_id().ok(),
+        follows_default,
+    })
+}
+
+/// Play the ring into `ep` until stop, a render error, or the endpoint going away.
+#[allow(clippy::too_many_arguments)] // one call site, `render_thread`
+fn play(
+    ep: &Endpoint,
+    pcm_rx: &Receiver<Vec<f32>>,
+    recycle_tx: &SyncSender<Vec<f32>>,
+    stop: &AtomicBool,
+    sync: &punktfunk_core::audio::AudioSyncCell,
+    vitals: &crate::audio_vitals::PlaybackVitals,
+    ring: &mut VecDeque<f32>,
+    policy: &mut punktfunk_core::audio::JitterPolicy,
+    fmt: PlaybackFormat,
+) -> Result<Played> {
+    let channels = fmt.channels.clamp(1, 8) as usize;
+    // f32 interleaved at every rate. Core already decoded 16/24-bit to f32; a 24-bit
+    // WASAPI integer format would rewrite the ring, crossfade, and policy arithmetic.
+    let block_align = channels * 4;
+    let enumerator = DeviceEnumerator::new().context("DeviceEnumerator")?;
+    let mut out = Vec::new();
+    let mut silent_waits: u32 = 0;
+    let mut default_checked = std::time::Instant::now();
+    while !stop.load(Ordering::Relaxed) {
+        if ep.event.wait_for_event(100).is_err() {
+            silent_waits += 1;
+            if silent_waits >= EVENT_SILENT_WAITS {
+                return Ok(Played::Reopen("the render event stopped"));
+            }
+            continue;
+        }
+        silent_waits = 0;
+        if ep.follows_default && default_checked.elapsed() >= DEFAULT_CHECK_EVERY {
+            default_checked = std::time::Instant::now();
+            let now = enumerator
+                .get_default_device(&Direction::Render)
+                .ok()
+                .and_then(|d| d.get_id().ok());
+            if now.is_some() && now != ep.id {
+                return Ok(Played::Reopen("the default output changed"));
+            }
+        }
+        while let Ok(mut chunk) = pcm_rx.try_recv() {
+            ring.extend(chunk.iter().copied());
+            chunk.clear();
+            let _ = recycle_tx.try_send(chunk);
+        }
+        let avail_frames = ep
+            .client
+            .get_available_space_in_frames()
+            .context("available space")? as usize;
+        if avail_frames == 0 {
+            continue;
+        }
+        let want = avail_frames * channels;
+        // First quantum is the engine period; decode thread prints it.
+        if !vitals.quantum_known() {
+            vitals.note_quantum(
+                avail_frames as u32,
+                avail_frames as u32,
+                avail_frames as u32,
+            );
+        }
+
+        // Policy clamps the sync request against its underrun floor: continuity outranks
+        // alignment.
+        policy.set_sync_target(sync.target());
+        sync.publish_depth(ring.len());
+        // What this write lands behind: the frames the endpoint already holds.
+        let padding = u64::from(ep.client.get_current_padding().unwrap_or(0));
+        sync.publish_output_latency_ns(padding * 1_000_000_000 / u64::from(fmt.rate_hz.max(1)));
+
+        let step = policy.step(ring.len(), want);
+        if step.drop_front > 0 {
+            punktfunk_core::audio::crossfade_drop(ring, step.drop_front, step.crossfade);
+        }
+        // Deeper-ring request: duplicate one crossfaded frame, do not de-prime.
+        if step.insert_front > 0 {
+            punktfunk_core::audio::crossfade_insert(ring, step.insert_front, step.crossfade);
+        }
+
+        out.clear();
+        out.resize(avail_frames * block_align, 0);
+        let mut ran_short = false;
+        if !step.silence {
+            for dst in out.chunks_exact_mut(4) {
+                let s = ring.pop_front().unwrap_or_else(|| {
+                    ran_short = true;
+                    0.0
+                });
+                dst.copy_from_slice(&s.to_le_bytes());
+            }
+        }
+        // Unprimed silence is ignored, so priming is not counted as an underrun.
+        policy.note_read(ran_short);
+        vitals.note_callback(
+            ran_short,
+            step.drop_front > 0,
+            step.insert_front > 0,
+            policy.avg_depth_ms(),
+            policy.target_ms(),
+        );
+        ep.render
+            .write_to_device(avail_frames, &out, None)
+            .context("write_to_device")?;
+    }
+    Ok(Played::Stopped)
 }
 
 /// Capture → Opus 10 ms mono → 0xCB into the host's virtual mic.
@@ -522,17 +646,9 @@ fn mic_thread(
         .context("CoInitializeEx (MTA)")?;
     crate::audio_rt::boost_and_log("wasapi-mic");
 
-    let mut encoder = opus::Encoder::new(
-        SAMPLE_RATE as u32,
-        opus::Channels::Mono,
-        opus::Application::Voip,
-    )
-    .map_err(|e| anyhow!("opus encoder: {e}"))?;
-    // 48 kbps mono is transparent for speech. In-band FEC + 10 % assumed loss: 0xCB is
-    // fire-and-forget, so this is the only redundancy.
-    let _ = encoder.set_bitrate(opus::Bitrate::Bits(48_000));
-    let _ = encoder.set_inband_fec(true);
-    let _ = encoder.set_packet_loss_perc(10);
+    // Each event drains the bounded endpoint buffer, so no backlog builds to self-heal.
+    let mut mic = punktfunk_core::audio::mic::MicEncoder::new(false)
+        .map_err(|e| anyhow!("opus encoder: {e}"))?;
 
     let enumerator = DeviceEnumerator::new().context("DeviceEnumerator")?;
     let device = pick_device(&enumerator, &Direction::Capture, "PUNKTFUNK_AUDIO_SOURCE")
@@ -567,9 +683,6 @@ fn mic_thread(
         .context("start capture stream")?;
 
     let mut bytes: VecDeque<u8> = VecDeque::new();
-    let mut ring: VecDeque<f32> = VecDeque::new();
-    let mut out = vec![0u8; 4000];
-    let mut seq = 0u32;
 
     while !stop.load(Ordering::Relaxed) {
         if h_event.wait_for_event(100).is_err() {
@@ -589,36 +702,16 @@ fn mic_thread(
         // Autoconvert already matrixed the endpoint layout to stereo; average L/R to mono.
         let stereo_frame = 4 * CAPT_CHANNELS;
         let whole = (bytes.len() / stereo_frame) * stereo_frame;
-        for c in bytes
-            .drain(..whole)
-            .collect::<Vec<u8>>()
-            .chunks_exact(stereo_frame)
-        {
+        let stereo: Vec<u8> = bytes.drain(..whole).collect();
+        mic.push(stereo.chunks_exact(stereo_frame).map(|c| {
             let l = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
             let r = f32::from_le_bytes([c[4], c[5], c[6], c[7]]);
-            ring.push_back((l + r) * 0.5);
-        }
-        // Keep the client started. Discard whole frames so the ring cannot grow. Do not
-        // advance `seq` — the host would conceal a mute-sized gap frame by frame.
-        if muted.load(Ordering::Relaxed) {
-            let drop_n = (ring.len() / MIC_FRAME) * MIC_FRAME;
-            ring.drain(..drop_n);
-            continue;
-        }
-        while ring.len() >= MIC_FRAME {
-            let pcm: Vec<f32> = ring.drain(..MIC_FRAME).collect();
-            match encoder.encode_float(&pcm, &mut out) {
-                Ok(len) => {
-                    let pts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as u64)
-                        .unwrap_or(0);
-                    let _ = connector.send_mic(seq, pts, out[..len].to_vec());
-                    seq = seq.wrapping_add(1);
-                }
-                Err(e) => tracing::debug!(error = %e, "opus mic encode"),
-            }
-        }
+            (l + r) * 0.5
+        }));
+        // Muted, the client stays started and frames drop unencoded.
+        mic.drain(muted.load(Ordering::Relaxed), |seq, pts, packet| {
+            let _ = connector.send_mic(seq, pts, packet.to_vec());
+        });
     }
     audio_client.stop_stream().ok();
     Ok(())

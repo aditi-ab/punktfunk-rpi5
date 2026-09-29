@@ -8,19 +8,10 @@ use punktfunk_core::quic::{
     GRANT_RESERVED,
 };
 
-/// Host wall clock (unix seconds). Stored access deadlines use this clock;
-/// the API takes relative `expires_in_secs` so the client never needs it.
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 /// Saturating add: a `u64` of seconds can overflow `i64`. Wrap would look
 /// like a past deadline; overflow means "effectively forever".
 fn absolute_expiry(expires_in_secs: u64) -> i64 {
-    unix_now().saturating_add(i64::try_from(expires_in_secs).unwrap_or(i64::MAX))
+    crate::clock::unix_secs().saturating_add(i64::try_from(expires_in_secs).unwrap_or(i64::MAX))
 }
 
 /// 400 when reserved bits are set. Never silently cleared: a newer console
@@ -537,7 +528,7 @@ pub(crate) async fn update_native_client_access(
                     fingerprint: current.fingerprint,
                     grants: Some(access.grants),
                     expires_unix: access.expires_unix,
-                    granted_unix: Some(unix_now()),
+                    granted_unix: Some(crate::clock::unix_secs()),
                     until_disconnect: access.until_disconnect,
                     preferred_pad_slot: current.preferred_pad_slot,
                 });

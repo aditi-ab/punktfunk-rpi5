@@ -25,7 +25,7 @@ pub struct PresetChip {
 
 /// Home carousel row, fully resolved by the service thread. The shell renders it
 /// verbatim.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct HostRow {
     /// Fingerprint when pinned, else `addr:port` — cursor identity across snapshot churn.
     pub key: String,
@@ -79,6 +79,41 @@ pub struct HostRow {
     /// outranks `bound_preset` at launch, which the host resolves.
     #[serde(default)]
     pub game_presets: BTreeMap<String, String>,
+}
+
+#[cfg(test)]
+impl HostRow {
+    /// A paired, saved, online host at `10.0.0.9:9777` pinned as `key`. Tests override what
+    /// they are about.
+    pub(crate) fn fixture(key: &str, name: &str) -> HostRow {
+        HostRow {
+            key: key.into(),
+            fp_hex: key.into(),
+            name: name.into(),
+            addr: "10.0.0.9".into(),
+            port: 9777,
+            mgmt_port: 47990,
+            paired: true,
+            saved: true,
+            online: true,
+            ..Default::default()
+        }
+    }
+}
+
+impl HostRow {
+    /// The host half of [`Self::key`]: commands, bindings and the store address the host,
+    /// never a pinned card's composite key.
+    pub fn host_key(&self) -> &str {
+        self.key.split('\0').next().unwrap_or(&self.key)
+    }
+}
+
+/// A pinned card's row key: the host's key, then the preset id past a NUL, which no
+/// fingerprint or `addr:port` holds. Apple and Android build the same string, pinned by
+/// `pinned_key` in `clients/shared/console-vectors.json`.
+pub fn pinned_key(host: &str, preset: &str) -> String {
+    format!("{host}\0{preset}")
 }
 
 /// One host-offered action, resolved from `GET /api/v1/actions`
@@ -136,6 +171,23 @@ pub struct SpeedStatus {
     pub key: String,
     pub name: String,
     pub phase: SpeedPhase,
+    /// The burst's live throughput as it arrived: seconds since measuring began, kbps.
+    #[serde(default)]
+    pub trace: Vec<(f32, u32)>,
+    #[serde(skip)]
+    pub trace_start: Option<std::time::Instant>,
+}
+
+impl SpeedStatus {
+    pub fn new(key: String, name: String) -> SpeedStatus {
+        SpeedStatus {
+            key,
+            name,
+            phase: SpeedPhase::Connecting,
+            trace: Vec::new(),
+            trace_start: None,
+        }
+    }
 }
 
 /// Where a speed test is: it connects, it measures, then it has an answer or a reason.
@@ -143,6 +195,11 @@ pub struct SpeedStatus {
 pub enum SpeedPhase {
     Connecting,
     Measuring,
+    /// A mid-burst report of the live throughput. The status stays `Measuring` and the
+    /// value joins its trace, stamped on arrival: drivers poll at their own pace.
+    Progress {
+        kbps: u32,
+    },
     Failed(String),
     /// `recommended_kbps` keeps headroom under `throughput_kbps` for FEC and for the loss a
     /// real stream meets — [`pf_client_core::speed::recommended_kbps`], so every client
@@ -164,6 +221,40 @@ struct ConsoleState {
     /// One-shot toast. The shell `take`s it on the next sync — unlike [`PairPhase`]
     /// there is no modal state, so a take-once string is the whole protocol.
     notice: Option<String>,
+    /// What the host bundles, for the Licences screen. Kept once sent.
+    licenses: Option<Arc<Vec<LicenseSection>>>,
+    /// The latest controller reading while the input test is on.
+    pad_test: Option<PadTestState>,
+    /// Keyboards, mice and the like: listed on the Controllers tab, never sent as a pad.
+    other_devices: Vec<OtherDevice>,
+}
+
+/// One reading of the controller under test. `held` names buttons by Xbox position: `A` `B`
+/// `X` `Y` `LB` `RB` `LT` `RT` `Back` `Start` `Guide` `LS` `RS` `Up` `Down` `Left` `Right`.
+/// `axes` are `LX` `LY` `RX` `RY` (−1…1, +y down) and `LT` `RT` (0…1).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PadTestState {
+    #[serde(default)]
+    pub held: Vec<String>,
+    #[serde(default)]
+    pub axes: Vec<(String, f32)>,
+}
+
+/// An input device that is not a controller: `kind` is `keyboard`, `mouse` or `other`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OtherDevice {
+    pub name: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub detail: String,
+}
+
+/// One block of a host's bundled licences: a heading, then its text as the file has it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LicenseSection {
+    pub heading: String,
+    pub text: String,
 }
 
 /// Service threads write; the shell polls per frame. Cheap locks; no GPU data.
@@ -186,6 +277,30 @@ impl ConsoleShared {
     pub(crate) fn hosts_snapshot(&self) -> (Vec<HostRow>, u64) {
         let s = self.0.lock().unwrap();
         (s.hosts.clone(), s.hosts_gen)
+    }
+
+    pub fn set_pad_test(&self, state: PadTestState) {
+        self.0.lock().unwrap().pad_test = Some(state);
+    }
+
+    pub(crate) fn take_pad_test(&self) -> Option<PadTestState> {
+        self.0.lock().unwrap().pad_test.take()
+    }
+
+    pub fn set_other_devices(&self, devices: Vec<OtherDevice>) {
+        self.0.lock().unwrap().other_devices = devices;
+    }
+
+    pub(crate) fn other_devices(&self) -> Vec<OtherDevice> {
+        self.0.lock().unwrap().other_devices.clone()
+    }
+
+    pub fn set_licenses(&self, sections: Vec<LicenseSection>) {
+        self.0.lock().unwrap().licenses = Some(Arc::new(sections));
+    }
+
+    pub(crate) fn licenses(&self) -> Option<Arc<Vec<LicenseSection>>> {
+        self.0.lock().unwrap().licenses.clone()
     }
 
     pub fn set_pair(&self, phase: PairPhase) {
@@ -213,11 +328,28 @@ impl ConsoleShared {
 
     /// Report a new phase for the test on `key`. A no-op once the shell has cleared the slot,
     /// and a no-op for a different host: the burst outlives a dismiss, so its result must
-    /// neither reopen the takeover nor land under the name of a test started since.
+    /// neither reopen the takeover nor land under the name of a test started since. A
+    /// `Progress` after the answer is a straggler and changes nothing.
     pub fn advance_speed(&self, key: &str, phase: SpeedPhase) {
         let mut s = self.0.lock().unwrap();
-        if let Some(sp) = s.speed.as_mut().filter(|sp| sp.key == key) {
-            sp.phase = phase;
+        let Some(sp) = s.speed.as_mut().filter(|sp| sp.key == key) else {
+            return;
+        };
+        match phase {
+            SpeedPhase::Progress { kbps } => {
+                if matches!(sp.phase, SpeedPhase::Failed(_) | SpeedPhase::Done { .. }) {
+                    return;
+                }
+                let start = *sp.trace_start.get_or_insert_with(std::time::Instant::now);
+                sp.trace.push((start.elapsed().as_secs_f32(), kbps));
+                sp.phase = SpeedPhase::Measuring;
+            }
+            phase => {
+                if phase == SpeedPhase::Measuring {
+                    sp.trace_start.get_or_insert_with(std::time::Instant::now);
+                }
+                sp.phase = phase;
+            }
         }
     }
 
@@ -338,7 +470,38 @@ pub enum ConsoleCmd {
     OpenPlatformScreen {
         id: String,
     },
-    /// Platform-only pad work. `action` is [`crate::screens::controllers::PadAction::id`];
+    /// Forget a saved host's identity and keep the record: its pin and paired flag clear, so
+    /// the next connect asks for a PIN again. `key` as in [`Self::ForgetHost`].
+    UnpairHost {
+        key: String,
+    },
+    /// Create or replace one preset. `overrides` is a [`SettingsOverlay`] in the shared
+    /// presets file's spelling; the host persists it and pushes its catalog back.
+    ///
+    /// [`SettingsOverlay`]: pf_client_core::presets::SettingsOverlay
+    SavePreset {
+        id: String,
+        name: String,
+        overrides: serde_json::Value,
+    },
+    /// Remove one preset; a host bound or pinned to it falls back as a dangling id does.
+    DeletePreset {
+        id: String,
+    },
+    /// The input test is on screen (`true`) or gone. While on, the host sends
+    /// [`PadTestState`]s and keeps the pad out of menu moves, so every button can be tried.
+    PadTest {
+        on: bool,
+    },
+    /// The Licences screen opened: send this host's [`LicenseSection`]s.
+    LoadLicenses,
+    /// The answer to a [`crate::screens::prompt::Prompt`]: the row picked, or `None` for
+    /// Back. Only a host that raised the prompt receives one.
+    PromptAnswer {
+        id: String,
+        choice: Option<usize>,
+    },
+    /// Platform-only pad work. `action` is [`crate::screens::players::PadAction::id`];
     /// `pad_key` indexes [`crate::screens::Ctx::pads`] and is empty when the pad list
     /// cannot name the device. One command, not one per button: the host's answer is
     /// always "do it, report as a notice", and a command per grant would span three crates.
@@ -359,6 +522,15 @@ pub enum ConsoleCmd {
         /// Resolved label for the toast — the service thread must not re-derive wording
         /// the screen already settled.
         label: String,
+    },
+    /// End a title this device launched (`POST /api/v1/game/end`). The outcome is a
+    /// notice ([`pf_client_core::library::GameEnd::notice`]), then a running refresh.
+    EndGame {
+        addr: String,
+        mgmt: u16,
+        fp_hex: String,
+        app_id: String,
+        title: String,
     },
 }
 
@@ -383,30 +555,38 @@ impl ConsoleBus {
 mod tests {
     use super::*;
 
+    fn tower() -> HostRow {
+        HostRow {
+            addr: "10.0.0.2".into(),
+            online: false,
+            ..HostRow::fixture("aa", "Tower")
+        }
+    }
+
+    #[test]
+    fn pinned_keys_match_the_shared_vectors() {
+        let raw = include_str!("../../../clients/shared/console-vectors.json");
+        let file: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let cases = file["pinned_key"].as_array().expect("pinned_key cases");
+        assert!(!cases.is_empty());
+        for c in cases {
+            let s = |k: &str| c[k].as_str().unwrap_or_else(|| panic!("{k} missing"));
+            let key = pinned_key(s("host"), s("preset"));
+            assert_eq!(key, s("key"));
+            let card = HostRow { key, ..tower() };
+            assert_eq!(card.host_key(), s("host"));
+        }
+        assert_eq!(
+            tower().host_key(),
+            "aa",
+            "a primary row's key is its host key"
+        );
+    }
+
     #[test]
     fn hosts_generation_bumps_only_on_change() {
         let shared = ConsoleShared::default();
-        let row = HostRow {
-            key: "aa".into(),
-            id: None,
-            name: "Tower".into(),
-            addr: "10.0.0.2".into(),
-            port: 9777,
-            fp_hex: "aa".into(),
-            paired: true,
-            saved: true,
-            online: false,
-            mgmt_port: 47990,
-            can_wake: false,
-            clipboard_sync: false,
-            last_used: None,
-            os: String::new(),
-            actions: Vec::new(),
-            pin: None,
-            bound_preset: None,
-            running: String::new(),
-            game_presets: Default::default(),
-        };
+        let row = tower();
         shared.set_hosts(vec![row.clone()]);
         let g1 = shared.hosts_gen();
         shared.set_hosts(vec![row.clone()]);

@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import type { StoreEntry } from "@/api/store";
+import type { CatalogEntry } from "@/api/gen/model";
 import { StoreCard } from "@/sections/Store/Browse";
 
 // The store catalog card, rendered straight from a fixture entry — it fetches nothing, so
@@ -16,7 +16,7 @@ const meta = {
 export default meta;
 type Story = StoryObj<typeof meta>;
 
-const BASE: StoreEntry = {
+const BASE: CatalogEntry = {
 	id: "rom-manager",
 	pkg: "@punktfunk/plugin-rom-manager",
 	title: "ROM Manager",
@@ -31,6 +31,7 @@ const BASE: StoreEntry = {
 	tier: "verified",
 	// The catalog stores lowercase platform IDENTIFIERS; the card renders display names.
 	platforms: ["linux", "windows"],
+	categories: [],
 	compatible: true,
 	update_available: false,
 };
@@ -55,6 +56,10 @@ export const SinglePlatform: Story = {
 			platforms: ["windows"],
 		},
 	},
+};
+
+export const Detected: Story = {
+	args: { entry: { ...BASE, detected: true } },
 };
 
 export const Installed: Story = {

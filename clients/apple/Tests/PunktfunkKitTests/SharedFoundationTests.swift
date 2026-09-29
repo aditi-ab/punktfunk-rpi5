@@ -679,6 +679,18 @@ final class SharedFoundationTests: XCTestCase {
         defaults.removePersistentDomain(forName: "io.unom.punktfunk.tests.effective")
     }
 
+    /// The console's Native is a zero; a host refuses a 0 Hz or 0 px mode, so it never goes out.
+    func testStreamModeResolvesNativeZeros() {
+        var s = EffectiveSettings()
+        (s.width, s.height, s.refreshHz) = (0, 0, 0)
+        let native = s.streamMode(native: (width: 3_840, height: 2_160, hz: 60))
+        XCTAssertEqual([native.width, native.height, native.hz], [3_840, 2_160, 60])
+        XCTAssertEqual(s.streamMode(native: (width: 3_840, height: 2_160, hz: 0)).hz, 30)
+        (s.width, s.height, s.refreshHz) = (1_920, 1_080, 120)
+        let set = s.streamMode(native: (width: 3_840, height: 2_160, hz: 60))
+        XCTAssertEqual([set.width, set.height, set.hz], [1_920, 1_080, 120])
+    }
+
     // MARK: - The audio format a preset carries
 
     /// `AudioFormatChoice`'s raw values are a CROSS-CLIENT contract, not an implementation detail:

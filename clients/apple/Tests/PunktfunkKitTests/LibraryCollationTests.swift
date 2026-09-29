@@ -10,7 +10,7 @@ import XCTest
 /// same change; if it goes red after an edit here, the port drifted.
 final class LibraryCollationTests: XCTestCase {
     /// Four `deletingLastPathComponent()` calls walk `Tests/PunktfunkKitTests/` → `Tests/` →
-    /// `apple/` → `clients/`, the same way `ConsoleVectorsTests` finds its file.
+    /// `apple/` → `clients/`, the same way `StartScreenVectorsTests` finds its file.
     private static var vectorFileURL: URL {
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

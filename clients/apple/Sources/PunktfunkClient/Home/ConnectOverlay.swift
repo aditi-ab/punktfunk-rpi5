@@ -9,11 +9,8 @@
 //     Wake-on-LAN and waiting for it to advertise again, escalating to a retry/cancel prompt on
 //     timeout.
 //
-// Presentation is mode-aware: the gamepad ("console") UI gets a full-screen aurora takeover — the
-// same living backdrop the console home wears, so it reads as a deliberate 10-foot moment; the
-// default touch/desktop UI gets a Liquid Glass modal over a dim scrim, which sits right at home among
-// the app's other floating surfaces (the trust card, the HUD) instead of a full-screen aurora that
-// looked out of place there.
+// A Liquid Glass modal over a dim scrim, among the app's other floating surfaces (the trust card,
+// the HUD). The console draws its own dial and wake wait, so this is the touch UI's.
 //
 // The two phases hand off within a single view update (HostWaker clears `waking` and starts the
 // connect in the same MainActor step), so the overlay never blinks between them. It swallows input to
@@ -27,9 +24,6 @@ struct ConnectOverlay: View {
     /// passes nil here). Drives the "Connecting…" phase.
     let connectingHostName: String?
     @ObservedObject var waker: HostWaker
-    /// The console launcher is up → full-screen aurora takeover; otherwise the default UI's Liquid
-    /// Glass modal.
-    var gamepadUI: Bool
     /// Cancel a dial in flight — tears down the (uncancelable) connect and returns the UI; the late
     /// result is discarded by SessionModel's connect guard.
     var onCancelConnect: () -> Void
@@ -47,37 +41,24 @@ struct ConnectOverlay: View {
         return nil
     }
 
-    @Environment(\.gamepadInk) private var ink
-
     var body: some View {
         if let phase {
             ZStack {
-                if gamepadUI {
-                    // Console: an opaque, living aurora over everything, in the chosen palette.
-                    // The takeover's own text rides `ink`, so a pale palette flips it here too —
-                    // without that this is the one console screen that stays white-on-white.
-                    ink.isLight ? Color.white.ignoresSafeArea() : Color.black.ignoresSafeArea()
-                    GamepadScreenBackground().ignoresSafeArea()
-                    Color.clear.contentShape(Rectangle()).onTapGesture {}
-                    content(phase).padding(40).frame(maxWidth: 460)
-                } else {
-                    // Default UI: a Liquid Glass modal over a dim scrim.
-                    Rectangle().fill(.black.opacity(0.5)).ignoresSafeArea()
-                        .contentShape(Rectangle()).onTapGesture {}
-                    content(phase)
-                        .padding(28)
-                        .frame(maxWidth: 380)
-                        .glassBackground(RoundedRectangle(cornerRadius: 26, style: .continuous))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 26, style: .continuous)
-                                .strokeBorder(.white.opacity(0.12), lineWidth: 1))
-                        .padding(40)
-                }
+                Rectangle().fill(.black.opacity(0.5)).ignoresSafeArea()
+                    .contentShape(Rectangle()).onTapGesture {}
+                content(phase)
+                    .padding(28)
+                    .frame(maxWidth: 380)
+                    .glassBackground(RoundedRectangle(cornerRadius: 26, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 26, style: .continuous)
+                            .strokeBorder(.white.opacity(0.12), lineWidth: 1))
+                    .padding(40)
             }
-            // The console takeover follows the palette; the default UI's modal stays dark.
-            .environment(\.colorScheme, gamepadUI && ink.isLight ? .light : .dark)
+            // Dark over its black scrim, whatever the system look.
+            .environment(\.colorScheme, .dark)
             .transition(.opacity)
-            #if os(iOS) || os(macOS) || os(tvOS)
+            #if os(iOS) || os(visionOS) || os(macOS) || os(tvOS)
             .background { ConnectControllerInput(waker: waker, onCancelConnect: onCancelConnect) }
             #endif
             #if os(tvOS)
@@ -88,16 +69,13 @@ struct ConnectOverlay: View {
         }
     }
 
-    /// The overlay's text/glyph colour: the palette's ink in the console takeover — over a pale
-    /// aurora, literal white was the one console surface that stayed white-on-white — and white
-    /// in the touch modal, whose branch is deliberately forced dark over a black scrim.
-    private var overlayFG: Color { gamepadUI ? ink.fg : .white }
+    /// White: the modal is forced dark over a black scrim.
+    private let overlayFG: Color = .white
 
     @ViewBuilder private func content(_ phase: Phase) -> some View {
-        // The takeover carries larger type than the compact modal.
-        let titleSize: CGFloat = gamepadUI ? 24 : 19
-        let bodySize: CGFloat = gamepadUI ? 14 : 13
-        VStack(spacing: gamepadUI ? 16 : 14) {
+        let titleSize: CGFloat = 19
+        let bodySize: CGFloat = 13
+        VStack(spacing: 14) {
             switch phase {
             case .connecting(let name):
                 ProgressView().controlSize(.large).tint(overlayFG)
@@ -110,7 +88,7 @@ struct ConnectOverlay: View {
                 Button("Cancel") { onCancelConnect() }.buttonStyle(.bordered).padding(.top, 6)
             case .waking(let w) where w.timedOut:
                 Image(systemName: "moon.zzz.fill")
-                    .font(.system(size: gamepadUI ? 40 : 34))
+                    .font(.system(size: 34))
                     .foregroundStyle(overlayFG.opacity(0.9))
                 Text("\(w.hostName) didn't wake")
                     .font(.geist(titleSize, .bold, relativeTo: .title3)).foregroundStyle(overlayFG)
@@ -140,7 +118,7 @@ struct ConnectOverlay: View {
     }
 }
 
-#if os(iOS) || os(macOS) || os(tvOS)
+#if os(iOS) || os(visionOS) || os(macOS) || os(tvOS)
 /// Controller binding for the overlay: B cancels whatever's in flight (a dial or the wake wait); A
 /// retries once a wake has timed out. The closures read the live state on each press, so they stay
 /// correct across the Connecting ↔ Waking handoff without the view re-mounting. A zero-size backing
@@ -151,10 +129,9 @@ struct ConnectOverlay: View {
 /// platform that drives these buttons some other way: the console home it sits over runs this same
 /// binding on tvOS, so with the home inactive and no binding here, nothing read the pad at all.
 ///
-/// `GamepadMenuInput` needs an EXTENDED gamepad, which is the same thing `gamepadUIActive` needs,
-/// so this covers the console takeover exactly. A Siri Remote is not an extended gamepad and does
-/// not reach these buttons through here — that path is the tvOS focus engine's, which lands in
-/// this overlay because ContentView disables everything under it.
+/// `GamepadMenuInput` needs an EXTENDED gamepad. A Siri Remote is not one and does not reach these
+/// buttons through here — that path is the tvOS focus engine's, which lands in this overlay
+/// because ContentView disables everything under it.
 private struct ConnectControllerInput: View {
     @ObservedObject var waker: HostWaker
     var onCancelConnect: () -> Void

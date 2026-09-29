@@ -67,17 +67,24 @@ fn edid_lock_available() -> bool {
     false
 }
 
-/// Whether KWin is the backend this host will drive. Cached like the gamescope probe beside
-/// it, and for the same reason: `available()` walks /proc and forks.
+/// Can any backend here keep a listed monitor lit under `exclusive`? Cached like the
+/// gamescope probe beside it, and for the same reason: `available()` walks /proc and forks.
 #[cfg(target_os = "linux")]
-fn kwin_available() -> bool {
+fn keep_monitors_available() -> bool {
+    use crate::vdisplay::Compositor;
     static PRESENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *PRESENT
-        .get_or_init(|| crate::vdisplay::available().contains(&crate::vdisplay::Compositor::Kwin))
+    *PRESENT.get_or_init(|| {
+        crate::vdisplay::available().iter().any(|c| {
+            matches!(
+                c,
+                Compositor::Kwin | Compositor::Hyprland | Compositor::Wlroots
+            )
+        })
+    })
 }
 
 /// Can any backend here put a launch on a workspace of its own
-/// (`vdisplay::claim_workspace`)? Cached: see [`kwin_available`].
+/// (`vdisplay::claim_workspace`)? Cached: see [`keep_monitors_available`].
 #[cfg(target_os = "linux")]
 fn workspace_placement_available() -> bool {
     use crate::vdisplay::Compositor;
@@ -131,7 +138,7 @@ pub(crate) fn display_settings_state() -> DisplaySettingsState {
         "layout".into(),
     ];
     // `game_session: dedicated` routes a launch to its own headless gamescope
-    // (`native/compositor.rs`), so without the binary the axis stores and does nothing.
+    // (`compositor_route.rs`), so without the binary the axis stores and does nothing.
     // Probed once: `available()` forks `gamescope --version` and walks /proc, and an
     // install mid-run is a host restart away either way.
     if gamescope_present() {
@@ -159,11 +166,10 @@ pub(crate) fn display_settings_state() -> DisplaySettingsState {
     if workspace_placement_available() {
         enforced.push("launch_workspace".into());
     }
-    // KWin only. wlroots, Hyprland, Mutter and the Windows CCD isolate all darken every head
-    // they find, so the keep-list would store and do nothing there — the dead control this
-    // whole gate exists to prevent.
+    // KWin, Hyprland and sway. Mutter and the Windows CCD isolate darken every head they
+    // find, so the keep-list would store and do nothing there.
     #[cfg(target_os = "linux")]
-    if kwin_available() {
+    if keep_monitors_available() {
         enforced.push("keep_monitors".into());
     }
     // What acts per device. The rest are stored and served but read inside a backend
@@ -252,11 +258,25 @@ pub(crate) async fn set_display_settings(
              with the host policy.",
         );
     }
+    if let Err(e) = write(policy) {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Couldn't save the display policy — {e:#}"),
+        );
+    }
+    tracing::info!("management API: display policy updated");
+    Json(display_settings_state()).into_response()
+}
+
+/// Store a host-wide policy, keeping the stored overlays, then re-aim absolute input at its
+/// pin (or clear the anchor) without a restart. The PUT and `display.next` both write here.
+///
+/// Off Linux there is no mirror backend, so `capture_monitor` is dropped rather than refused:
+/// the PUT is whole-object, and a stored pin would reject every later save over a field the
+/// operator cannot see.
+pub(super) fn write(policy: crate::vdisplay::policy::DisplayPolicy) -> anyhow::Result<()> {
     #[cfg_attr(target_os = "linux", allow(unused_mut))]
     let mut policy = policy;
-    // Off Linux there is no mirror backend. Drop `capture_monitor` rather than 400: this PUT is
-    // whole-object, so a stored pin would reject every later save over a field the operator cannot
-    // see. Self-heals on write; the response shows what was stored.
     #[cfg(not(target_os = "linux"))]
     if let Some(dropped) = policy.capture_monitor.take() {
         tracing::warn!(
@@ -266,17 +286,10 @@ pub(crate) async fn set_display_settings(
     }
     let store = crate::vdisplay::policy::prefs();
     let policy = with_stored_overlays(policy, &store.get());
-    if let Err(e) = store.set(policy) {
-        return api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Couldn't save the display policy — {e:#}"),
-        );
-    }
-    tracing::info!("management API: display policy updated");
-    // Re-aim absolute input now (and clear it when the pin is cleared); do not wait for a restart.
+    store.set(policy)?;
     #[cfg(target_os = "linux")]
     crate::refresh_capture_monitor_anchor("display policy updated");
-    Json(display_settings_state()).into_response()
+    Ok(())
 }
 
 /// Carry the stored per-device overlays across a host-wide write.

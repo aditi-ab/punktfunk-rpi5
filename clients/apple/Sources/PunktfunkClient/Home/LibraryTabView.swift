@@ -7,7 +7,7 @@
 import PunktfunkKit
 import SwiftUI
 
-#if os(iOS) || os(tvOS)
+#if os(iOS) || os(visionOS) || os(tvOS)
 /// The touch UI's destinations: the remote-desktop face and the gaming face. A TV adds Settings,
 /// which a remote reaches best from the tab bar.
 enum TouchTab: Hashable {

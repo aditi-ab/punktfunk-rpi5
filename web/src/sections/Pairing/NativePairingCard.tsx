@@ -1,7 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { KeyRound, Smartphone, Timer } from "lucide-react";
 import { type FC, useEffect, useRef, useState } from "react";
-import { ApiError } from "@/api/fetcher";
 import type { ArmNativePairing } from "@/api/gen/model/armNativePairing";
 import type { NativePairStatus } from "@/api/gen/model/nativePairStatus";
 import {
@@ -11,11 +10,15 @@ import {
 	useGetNativePairing,
 } from "@/api/gen/native/native";
 import { useArmNativePairing } from "@/api/pairing";
+import {
+	PasswordConfirmField,
+	type PasswordFailure,
+	usePasswordFailure,
+} from "@/components/password-confirm";
 import { QueryState } from "@/components/query-state";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
+import { fmtClockDuration } from "@/lib/format";
 import type { Loadable } from "@/lib/query";
 import { m } from "@/paraglide/messages";
 import {
@@ -34,12 +37,6 @@ import {
 export interface BoundDevice {
 	fingerprint: string;
 	name: string;
-}
-
-/** Seconds → `m:ss`. */
-function fmtTime(secs: number): string {
-	const s = Math.max(0, Math.floor(secs));
-	return `${Math.floor(s / 60)}:${(s % 60).toString().padStart(2, "0")}`;
 }
 
 /**
@@ -82,11 +79,11 @@ export const NativePairingSection: FC<{
 	// leaves the password-gated arm response as the console's only copy. A reload therefore loses
 	// it and the card falls back to its arm form, where re-arming mints a fresh PIN.
 	const [pin, setPin] = useState<string | null>(null);
-	const [wrongPassword, setWrongPassword] = useState(false);
+	const refusal = usePasswordFailure();
 	// `access` carries the window's device-access choice (grants + expiry) — NOT the window TTL;
 	// whichever device completes this window's ceremony gets it.
 	const onArm = (access: Partial<ArmNativePairing>, password: string) => {
-		setWrongPassword(false);
+		refusal.reset();
 		arm.mutate(
 			{
 				ttl_secs: 120,
@@ -99,9 +96,7 @@ export const NativePairingSection: FC<{
 					setPin(status.pin ?? null);
 					refresh();
 				},
-				onError: (e) => {
-					if (e instanceof ApiError && e.status === 401) setWrongPassword(true);
-				},
+				onError: refusal.classify,
 			},
 		);
 	};
@@ -123,7 +118,7 @@ export const NativePairingSection: FC<{
 			onArm={onArm}
 			onDisarm={onDisarm}
 			isArming={arm.isPending}
-			wrongPassword={wrongPassword}
+			failure={refusal.failure}
 			isDisarming={disarm.isPending}
 		/>
 	);
@@ -144,8 +139,8 @@ export const NativePairingCard: FC<{
 	onArm: (access: Partial<ArmNativePairing>, password: string) => void;
 	onDisarm: () => void;
 	isArming: boolean;
-	/** The last arm was refused: the password was wrong. */
-	wrongPassword: boolean;
+	/** Why the BFF refused the last arm's password, if it did. */
+	failure: PasswordFailure;
 	isDisarming: boolean;
 }> = ({
 	status,
@@ -155,7 +150,7 @@ export const NativePairingCard: FC<{
 	onArm,
 	onDisarm,
 	isArming,
-	wrongPassword,
+	failure,
 	isDisarming,
 }) => {
 	const d = status.data;
@@ -225,7 +220,8 @@ export const NativePairingCard: FC<{
 							{d.expires_in_secs != null && (
 								<p className="flex items-center justify-center gap-1.5 text-sm text-muted-foreground">
 									<Timer className="size-4" />
-									{m.pairing_native_expires()} {fmtTime(d.expires_in_secs)}
+									{m.pairing_native_expires()}{" "}
+									{fmtClockDuration(d.expires_in_secs)}
 								</p>
 							)}
 							<Button
@@ -275,26 +271,13 @@ export const NativePairingCard: FC<{
 							    machine, so arming re-confirms the console password — the BFF verifies and
 							    strips it (util/confirm.ts). */}
 							<div className="grid gap-4 @xl:grid-cols-2">
-								<div className="space-y-2">
-									<Label htmlFor="arm-password">
-										{m.store_spec_password()}
-									</Label>
-									<Input
-										id="arm-password"
-										type="password"
-										autoComplete="current-password"
-										value={password}
-										onChange={(e) => setPassword(e.target.value)}
-									/>
-									<p className="text-xs text-muted-foreground">
-										{m.pairing_password_help()}
-									</p>
-									{wrongPassword && (
-										<p role="alert" className="text-xs text-destructive">
-											{m.update_apply_wrong_password()}
-										</p>
-									)}
-								</div>
+								<PasswordConfirmField
+									id="arm-password"
+									value={password}
+									onChange={setPassword}
+									failure={failure}
+									help={m.pairing_password_help()}
+								/>
 							</div>
 							<Button
 								disabled={isArming || password.length === 0}

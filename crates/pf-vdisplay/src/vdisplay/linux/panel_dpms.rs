@@ -18,7 +18,6 @@
 //! non-persistent: a dead host leaves nothing to journal.
 
 use std::collections::HashMap;
-use std::os::fd::{AsFd, AsRawFd};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use wayland_client::protocol::wl_callback::{self, WlCallback};
@@ -58,9 +57,6 @@ const WL_OUTPUT_MAX: u32 = 4;
 /// 3 s budget for one darken/re-light so a wedged compositor cannot pin the
 /// session-create or group-teardown thread. Same as `kwin_output_mgmt::OP_BUDGET`.
 const OP_BUDGET: Duration = Duration::from_secs(3);
-
-/// 100 ms poll slice; matches `kwin_output_mgmt`.
-const POLL_MS: i32 = 100;
 
 #[derive(Default)]
 struct OutputState {
@@ -183,6 +179,12 @@ impl Dispatch<WlCallback, u32> for State {
     }
 }
 
+impl crate::wl_pump::SyncDone for State {
+    fn sync_done(&self) -> u32 {
+        self.sync_done
+    }
+}
+
 /// Why [`Session::open`] declined. Which rung said no decides the log level
 /// and whether `kscreen-doctor` is worth attempting.
 enum OpenFailure {
@@ -293,51 +295,28 @@ impl Session {
     fn sync_barrier(&mut self, deadline: Instant) -> bool {
         self.next_sync += 1;
         let serial = self.next_sync;
-        let qh = self.queue.handle();
-        let _cb = self.conn.display().sync(&qh, serial);
-        self.pump_until(deadline, |st| st.sync_done >= serial)
+        let barrier = crate::wl_pump::sync_barrier(
+            &self.conn,
+            &mut self.queue,
+            &mut self.state,
+            serial,
+            deadline,
+            None,
+        );
+        matches!(barrier, Ok(crate::wl_pump::Pumped::Done))
     }
 
-    /// Bounded event loop. `blocking_dispatch` cannot be interrupted, so the fd
-    /// is polled in [`POLL_MS`] slices against `deadline`.
+    /// Dispatch until `done` holds or `deadline` passes ([`crate::wl_pump`]).
     fn pump_until(&mut self, deadline: Instant, done: impl Fn(&State) -> bool) -> bool {
-        loop {
-            if done(&self.state) {
-                return true;
-            }
-            if self.queue.dispatch_pending(&mut self.state).is_err() {
-                return false;
-            }
-            if done(&self.state) {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            if self.conn.flush().is_err() {
-                return false;
-            }
-            let Some(guard) = self.conn.prepare_read() else {
-                continue; // events already queued — loop dispatches them
-            };
-            let mut pfd = libc::pollfd {
-                fd: self.conn.as_fd().as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let timeout = (remaining.as_millis() as i32).clamp(0, POLL_MS);
-            // SAFETY: `&mut pfd` points at one live, fully-initialized `libc::pollfd` on the stack
-            // and the count `1` matches that single element, so `poll` reads `fd`/`events` and
-            // writes `revents` strictly within `pfd`. `pfd.fd` is the Wayland connection's fd,
-            // valid because `self.conn` (and the `prepare_read` guard) outlive the call. `poll`
-            // blocks up to `timeout` ms and writes only `revents`; `pfd` is a fresh local that
-            // aliases nothing.
-            let r = unsafe { libc::poll(&mut pfd, 1, timeout) };
-            if r > 0 && (pfd.revents & libc::POLLIN) != 0 {
-                let _ = guard.read();
-            } // timeout/signal: drop the guard, re-check the deadline
-        }
+        let pumped = crate::wl_pump::pump_until(
+            &self.conn,
+            &mut self.queue,
+            &mut self.state,
+            Some(deadline),
+            None,
+            done,
+        );
+        matches!(pumped, Ok(crate::wl_pump::Pumped::Done))
     }
 
     /// Request `target` on every DPMS-supporting output not already there.

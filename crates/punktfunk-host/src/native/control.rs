@@ -19,7 +19,7 @@
 
 use super::*;
 use pf_clipboard::ClipCoordCmd;
-use punktfunk_core::abr::governor::ShareWindow;
+use punktfunk_core::abr::governor::{ShareWindow, NO_SHARE_KBPS};
 use punktfunk_core::quic::{AckReason, ClipControl, ClipOffer, ClipState};
 
 /// The ack this client can read. The reason byte goes only to a client that
@@ -93,14 +93,59 @@ fn delivery_share(
         .flatten()
 }
 
-/// Whether this probe request skips the one-per-10 s spacing: a bring-up ramp
-/// step, which is short and lands on a data plane with no video on it.
+/// Whether this probe request is as short as a bring-up ramp step.
 ///
-/// The length bound is the exemption's own limit. Without it a client could
-/// hold the window open with 5 s bursts at the probe ceiling, which is the
-/// uplink-pinning the spacing exists against.
-fn is_ramp_step(req: &ProbeRequest, ramp_open: bool) -> bool {
-    ramp_open && req.duration_ms <= super::stream::RAMP_STEP_MAX_MS
+/// The length bound is the ramp's exemption from the spacing. Without it a
+/// client could hold the window open with 5 s bursts at the probe ceiling,
+/// which is the uplink-pinning the spacing exists against.
+fn is_ramp_length(req: &ProbeRequest) -> bool {
+    req.duration_ms <= super::stream::RAMP_STEP_MAX_MS
+}
+
+/// One speed-test burst per 10 s. Each burst is already clamped (5 s, 10 Gbps);
+/// without a count cap a client can pause video and pin the uplink.
+///
+/// A ramp step neither waits on the spacing nor starts it: a ramp cut short
+/// by the first frame asks for its burst two seconds later, and that burst is
+/// the only measurement the session gets. A short step just after the window
+/// closed is still the ramp's — the client asks each step once the last one
+/// drained, and a re-ask can cross the close.
+#[derive(Default)]
+struct ProbeSpacing {
+    last: Option<std::time::Instant>,
+    /// When a short step last arrived with the ramp window open.
+    last_ramp_step: Option<std::time::Instant>,
+}
+
+impl ProbeSpacing {
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+    /// How long after the last in-window step a short step still counts as the
+    /// ramp's. A step settles within a round trip of its answer; only in-window
+    /// steps restart this clock, so it cannot be chained past the window.
+    const RAMP_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// Whether to serve this request. `short` is ramp length
+    /// ([`is_ramp_length`]); `open` is the ramp window.
+    fn admit(&mut self, now: std::time::Instant, short: bool, open: bool) -> bool {
+        if short && open {
+            self.last_ramp_step = Some(now);
+            return true;
+        }
+        let in_grace = self
+            .last_ramp_step
+            .is_some_and(|t| now.duration_since(t) < Self::RAMP_GRACE);
+        if short && in_grace {
+            return true;
+        }
+        if self
+            .last
+            .is_some_and(|t| now.duration_since(t) < Self::INTERVAL)
+        {
+            return false;
+        }
+        self.last = Some(now);
+        true
+    }
 }
 
 /// A PyroWave session's pin against `SetBitrate` asks.
@@ -141,6 +186,9 @@ impl PyroWavePin {
 pub(super) struct Task {
     pub(super) ctrl_send: super::link::CtlSend,
     pub(super) ctrl_recv: super::link::CtlRecv,
+    /// The input thread's queue, shared with the datagram loop: a key edge off the
+    /// control stream lands in the same order-preserving line as the pointer.
+    pub(super) input_tx: std::sync::mpsc::SyncSender<super::input::ClientInput>,
     pub(super) initial_mode: punktfunk_core::Mode,
     pub(super) codec: crate::encode::Codec,
     pub(super) live_reconfig_ok: bool,
@@ -164,54 +212,11 @@ pub(super) struct Task {
     /// may carry the reason byte. Clear for every shipped client, which rejects
     /// a longer ack, and for every client behind a host without `HOST_CAP2_EXT`.
     pub(super) ack_reason: bool,
-    /// Encoder-applied rate, codec ceiling (`0` = unknown), and cadence-miss
-    /// flag. Read at `SetBitrate` so the ack never exceeds what the encoder
-    /// will actually run.
-    pub(super) live_bitrate: Arc<AtomicU32>,
-    /// See [`Self::live_bitrate`]. The sole place a ceiling decides an ask:
-    /// the data plane learns it, this task spends it.
-    pub(super) encoder_ceiling: Arc<std::sync::Mutex<super::EncoderCeiling>>,
-    /// See [`Self::live_bitrate`].
-    pub(super) cadence_degraded: Arc<AtomicBool>,
-    /// See [`Self::live_bitrate`].
-    pub(super) cadence_behind_score: Arc<AtomicU32>,
-    /// `u32::MAX` is the pre-seed: an old client never sent a `DeliveryReport`.
-    pub(super) client_packets_received: Arc<AtomicU32>,
-    /// FEC in force: what the packetizer runs. Read here; only the stream loop writes.
-    pub(super) fec_target: Arc<AtomicU8>,
-    /// This task's adaptive-FEC proposals. The stream loop publishes them to
-    /// `fec_target` once the encoder accepts the rate the proposal implies.
-    pub(super) fec_requested: Arc<AtomicU8>,
-    /// Encode loop drains at its own cadence (`design/phase-locked-capture.md`).
-    pub(super) phase_ctl: Arc<super::stream::PhaseCtl>,
-    pub(super) reconfig_tx: std::sync::mpsc::Sender<punktfunk_core::Mode>,
-    pub(super) keyframe_tx: std::sync::mpsc::Sender<()>,
-    pub(super) rfi_tx: std::sync::mpsc::Sender<(u32, u32)>,
-    pub(super) bitrate_tx: std::sync::mpsc::Sender<u32>,
-    pub(super) probe_tx: std::sync::mpsc::Sender<ProbeRequest>,
-    /// The client's bring-up ramp may still be running: its steps are served
-    /// on the punched-but-idle data plane, and the spacing below would let
-    /// one step through and refuse the rest. Cleared when the send thread
-    /// takes the session over (`stream::ramp`).
-    pub(super) ramp_open: Arc<AtomicBool>,
-    pub(super) probe_result_rx: tokio::sync::mpsc::UnboundedReceiver<ProbeResult>,
-    pub(super) reconfig_result_rx: tokio::sync::mpsc::UnboundedReceiver<Reconfigured>,
-    /// The rate the encoder settled on, with what settled it. Forwarded as
-    /// `BitrateChanged` so the client's climb base tracks the encoder: a
-    /// rebuild's own re-resolve is `Granted`, a short apply an `EncoderLimit`.
-    pub(super) retarget_rx: tokio::sync::mpsc::UnboundedReceiver<(u32, AckReason)>,
-    /// Rebuild stall duration in ms. Forwarded as `PipelineGap` so the client
-    /// bitrate controller drops the report window that straddled our stall.
-    pub(super) gap_rx: tokio::sync::mpsc::UnboundedReceiver<u32>,
-    /// Wire-MTU watcher → `ShardPayloadChanged` (this task is the sole writer).
-    /// Client `ShardPayloadAck`s return on `shard_ack_tx` and gate a grow.
-    pub(super) shard_change_rx: tokio::sync::mpsc::UnboundedReceiver<u16>,
-    pub(super) shard_ack_tx: tokio::sync::mpsc::UnboundedSender<u16>,
-    /// Depth-1 latest-wins slot: the encode loop overwrites a shape this task
-    /// has not drained, so a stalled peer cannot grow the host.
-    pub(super) cursor_shape_rx:
-        tokio::sync::watch::Receiver<Option<punktfunk_core::quic::CursorShape>>,
-    pub(super) cursor_client_draws: Arc<AtomicBool>,
+    /// The control halves of the session's channels to the stream thread.
+    pub(super) ends: super::wiring::ControlEnds,
+    /// Encoder truth read at `SetBitrate`, so the ack never exceeds what the encoder will run,
+    /// and the FEC, link, ramp and cursor values this task shares with the stream thread.
+    pub(super) shared: super::wiring::SessionShared,
     pub(super) clip_enabled: Arc<AtomicBool>,
     pub(super) clip: pf_clipboard::ClipCoord,
     /// LIVE grant mask, same atomic the datagram filter reads. Deadline/watch
@@ -232,6 +237,8 @@ pub(super) struct Task {
         tokio::sync::mpsc::UnboundedReceiver<punktfunk_core::quic::LaunchOutcome>,
     /// Named on the per-minute `link health` line, so a journal sorts by client.
     pub(super) peer: std::net::IpAddr,
+    /// Which plane carries this session; named on grant-drop warnings.
+    pub(super) plane: crate::events::Plane,
     /// Shared block the encode and send threads bump; this task drains its link half.
     pub(super) counters: Arc<crate::session_status::SessionCounters>,
     /// Armed capture the per-minute line is also written into, so a bug report is one file.
@@ -243,6 +250,7 @@ pub(super) async fn run(task: Task) {
     let Task {
         mut ctrl_send,
         ctrl_recv,
+        input_tx,
         initial_mode,
         codec,
         live_reconfig_ok,
@@ -253,28 +261,35 @@ pub(super) async fn run(task: Task) {
         wire_bytes,
         audio_kbps,
         ack_reason,
-        live_bitrate,
-        encoder_ceiling,
-        cadence_degraded,
-        cadence_behind_score,
-        client_packets_received,
-        fec_target,
-        fec_requested,
-        phase_ctl,
-        reconfig_tx,
-        keyframe_tx,
-        rfi_tx,
-        bitrate_tx,
-        probe_tx,
-        mut probe_result_rx,
-        ramp_open,
-        mut reconfig_result_rx,
-        mut retarget_rx,
-        mut gap_rx,
-        mut shard_change_rx,
-        shard_ack_tx,
-        mut cursor_shape_rx,
-        cursor_client_draws,
+        ends:
+            super::wiring::ControlEnds {
+                reconfig_tx,
+                keyframe_tx,
+                rfi_tx,
+                bitrate_tx,
+                probe_tx,
+                mut probe_result_rx,
+                mut reconfig_result_rx,
+                mut retarget_rx,
+                mut gap_rx,
+                mut shard_change_rx,
+                shard_ack_tx,
+                mut cursor_shape_rx,
+            },
+        shared:
+            super::wiring::SessionShared {
+                live_bitrate,
+                encoder_ceiling,
+                cadence_degraded,
+                cadence_behind_score,
+                client_packets_received,
+                fec_target,
+                fec_requested,
+                link_kbps,
+                phase: phase_ctl,
+                ramp_open,
+                cursor_client_draws,
+            },
         clip_enabled,
         clip,
         session_grants,
@@ -283,6 +298,7 @@ pub(super) async fn run(task: Task) {
         mut pad_slots_rx,
         mut launch_outcome_rx,
         peer,
+        plane,
         counters,
         stats,
     } = task;
@@ -296,7 +312,7 @@ pub(super) async fn run(task: Task) {
     let mut clip_offer_closed = false;
     // First-of-class `warn!` for grant drops. A revoked client spamming the
     // gated messages must not flood the log.
-    let denied = GrantDrops::new();
+    let mut denied = crate::session_status::GrantDrops::new(plane);
     // Same closed-channel discipline as `clip_offer_closed`.
     let mut shard_change_closed = false;
     // `--open` anonymous sessions never spawn deadline/watch; the sender
@@ -321,10 +337,7 @@ pub(super) async fn run(task: Task) {
     // coalesces a resize drag; 500 ms is half the client's 1 s self-limit.
     const MIN_SWITCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
     let mut last_accepted_switch: Option<std::time::Instant> = None;
-    // One probe per 10 s. Each probe is already clamped (5 s, 10 Gbps);
-    // without a count cap a client can pause video and pin the uplink.
-    const MIN_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-    let mut last_probe: Option<std::time::Instant> = None;
+    let mut probe_spacing = ProbeSpacing::default();
     // An RFI ask is a frame parity could not repair; the LossReport that
     // closes the window carries only what parity did repair.
     let mut unrecovered = UnrecoveredRun::default();
@@ -350,7 +363,9 @@ pub(super) async fn run(task: Task) {
         tokio::select! {
             msg = ctrl_reader.read_msg() => {
                 let Ok(msg) = msg else { break };
-                if let Ok(req) = Reconfigure::decode(&msg) {
+                if let Ok(edge) = punktfunk_core::quic::InputEdge::decode(&msg) {
+                    offer_edge(edge.0, &session_grants, &input_tx, &counters, &mut denied);
+                } else if let Ok(req) = Reconfigure::decode(&msg) {
                     let now = std::time::Instant::now();
                     // Same bound as the handshake: `> 0` alone acked a mode that cannot land.
                     let valid = crate::encode::validate_refresh(req.mode.refresh_hz).is_ok()
@@ -429,16 +444,30 @@ pub(super) async fn run(task: Task) {
                     ) {
                         // A share under the live rate is a retarget the encoder
                         // takes now; one above it is a ceiling the client still
-                        // has to earn, so nothing is applied for it.
+                        // has to earn. A hand-back binds nothing: the path goes
+                        // as a ceiling, and the release follows it.
+                        let binds = counters.share.share_kbps() > 0;
                         let live = live_bitrate.load(Ordering::Relaxed);
-                        if share > 0 && live > share && bitrate_tx.send(share).is_err() {
+                        if binds && live > share && bitrate_tx.send(share).is_err() {
                             break;
                         }
                         let ack = bitrate_ack(share, AckReason::Governor, ack_reason);
                         if io::write_msg(&mut ctrl_send, &ack.encode()).await.is_err() {
                             break;
                         }
+                        if !binds && ack_reason {
+                            let release = bitrate_ack(NO_SHARE_KBPS, AckReason::Governor, true);
+                            if io::write_msg(&mut ctrl_send, &release.encode()).await.is_err() {
+                                break;
+                            }
+                        }
                     }
+                } else if let Ok(rep) = LinkReport::decode(&msg) {
+                    link_kbps.store(rep.proven_kbps, Ordering::Relaxed);
+                    tracing::info!(
+                        proven_kbps = rep.proven_kbps,
+                        "client's ramp proved the link rate"
+                    );
                 } else if let Ok(rep) = LossReport::decode(&msg) {
                     let unrecovered_run = unrecovered.report(std::time::Instant::now());
                     link.note_loss(rep.loss_ppm, unrecovered_run);
@@ -571,18 +600,19 @@ pub(super) async fn run(task: Task) {
                     );
                     let _ = shard_ack_tx.send(ack.shard_payload);
                 } else if let Ok(req) = ProbeRequest::decode(&msg) {
-                    let now = std::time::Instant::now();
-                    let ramping = is_ramp_step(&req, ramp_open.load(Ordering::SeqCst));
-                    if !ramping
-                        && last_probe.is_some_and(|t| now.duration_since(t) < MIN_PROBE_INTERVAL)
-                    {
+                    let open = ramp_open.load(Ordering::SeqCst);
+                    if !probe_spacing.admit(std::time::Instant::now(), is_ramp_length(&req), open) {
                         tracing::warn!(
                             target_kbps = req.target_kbps,
                             "speed-test probe rejected (rate-limited)"
                         );
+                        // The client holds its reports until a probe is answered.
+                        let declined = super::stream::declined();
+                        if io::write_msg(&mut ctrl_send, &declined.encode()).await.is_err() {
+                            break;
+                        }
                         continue;
                     }
-                    last_probe = Some(now);
                     tracing::info!(
                         target_kbps = req.target_kbps,
                         duration_ms = req.duration_ms,
@@ -873,6 +903,34 @@ fn clip_offer_permitted(grants: u32, clip_enabled: bool) -> bool {
     grants & punktfunk_core::quic::GRANT_CLIPBOARD != 0 && clip_enabled
 }
 
+/// A key edge off the control stream joins the datagram plane's queue: the same grant
+/// gate, the same count, and the same drop when the input thread is behind — stale
+/// input is already worthless. The lane keeps its order; the queue keeps it too.
+fn offer_edge(
+    ev: InputEvent,
+    grants: &AtomicU32,
+    input_tx: &std::sync::mpsc::SyncSender<super::input::ClientInput>,
+    counters: &crate::session_status::SessionCounters,
+    denied: &mut crate::session_status::GrantDrops,
+) {
+    let class = punktfunk_core::quic::classify(ev.kind);
+    if grants.load(Ordering::Relaxed) & class.bit() == 0 {
+        denied.note(class);
+        return;
+    }
+    counters.input_events.fetch_add(1, Ordering::Relaxed);
+    let mut ev = ev;
+    // KEY_FLAG_SEMANTIC_VK is in-process (GameStream ingest). Strip it from the wire.
+    if matches!(ev.kind, InputKind::KeyDown | InputKind::KeyUp) {
+        ev.flags &= !crate::inject::KEY_FLAG_SEMANTIC_VK;
+    }
+    if let Err(std::sync::mpsc::TrySendError::Full(_)) =
+        input_tx.try_send(super::input::ClientInput::Event(ev))
+    {
+        counters.input_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1152,23 +1210,69 @@ mod tests {
         assert!(!clip_offer_permitted(GRANT_ALL, false));
     }
 
-    /// The bring-up exemption is bounded twice: the window has to be open,
-    /// and the step short. An 800 ms burst or a 5 s one is spaced like any
-    /// other, open window or not.
+    /// The bring-up exemption is bounded twice: the step has to be short, and
+    /// it has to be in the window or just after an in-window step. An 800 ms
+    /// burst is spaced like any other, open window or not, and a short step
+    /// with no ramp behind it is spaced too.
     #[test]
-    fn only_a_short_step_inside_the_window_skips_the_spacing() {
+    fn only_a_short_step_of_the_ramp_skips_the_spacing() {
         let req = |duration_ms| ProbeRequest {
             target_kbps: 40_000,
             duration_ms,
         };
-        assert!(is_ramp_step(&req(25), true));
-        assert!(is_ramp_step(&req(super::stream::RAMP_STEP_MAX_MS), true));
-        assert!(!is_ramp_step(
-            &req(super::stream::RAMP_STEP_MAX_MS + 1),
-            true
-        ));
-        assert!(!is_ramp_step(&req(800), true));
-        assert!(!is_ramp_step(&req(25), false));
+        assert!(is_ramp_length(&req(25)));
+        assert!(is_ramp_length(&req(super::stream::RAMP_STEP_MAX_MS)));
+        assert!(!is_ramp_length(&req(super::stream::RAMP_STEP_MAX_MS + 1)));
+
+        let t0 = std::time::Instant::now();
+        let at = |ms| t0 + std::time::Duration::from_millis(ms);
+        let mut spacing = ProbeSpacing::default();
+        assert!(spacing.admit(at(0), false, true), "a long burst: served");
+        assert!(
+            !spacing.admit(at(10), false, true),
+            "and spaced, window or not"
+        );
+        let mut spacing = ProbeSpacing::default();
+        assert!(
+            spacing.admit(at(0), true, false),
+            "a short step, no ramp: served"
+        );
+        assert!(
+            !spacing.admit(at(10), true, false),
+            "and it started the spacing"
+        );
+    }
+
+    /// A ramp cut short by the first frame asks for its burst two seconds
+    /// later. The steps before it — including a re-ask that reached the host
+    /// just after the window closed — must not start the spacing, or that
+    /// burst is refused and the session gets no measurement at all.
+    #[test]
+    fn ramp_steps_leave_the_spacing_to_the_burst_after_them() {
+        let t0 = std::time::Instant::now();
+        let at = |ms| t0 + std::time::Duration::from_millis(ms);
+        let mut spacing = ProbeSpacing::default();
+        for ms in [0, 72] {
+            assert!(spacing.admit(at(ms), true, true), "an in-window step");
+        }
+        // The rig: the window closed at 103 ms, the re-ask arrived at 157 ms.
+        assert!(
+            spacing.admit(at(157), true, false),
+            "a re-ask across the close"
+        );
+        assert!(
+            spacing.admit(at(2_628), false, false),
+            "the burst after the ramp"
+        );
+        assert!(
+            !spacing.admit(at(5_000), false, false),
+            "spaced from that burst"
+        );
+        assert!(
+            !spacing.admit(at(5_010), true, false),
+            "past the grace a short step is spaced"
+        );
+        assert!(spacing.admit(at(12_629), false, false), "ten seconds on");
     }
 
     /// The ramp's verdict ask — lower than the pin, inside the bring-up
@@ -1264,5 +1368,45 @@ mod tests {
             800_000,
             "a zero ask is not a measurement"
         );
+    }
+
+    /// A key edge off the control stream takes the datagram path's grant gate, count and
+    /// queue; the in-process flag never survives the wire; a full queue drops and counts.
+    #[test]
+    fn an_edge_off_the_control_stream_joins_the_input_queue() {
+        use punktfunk_core::quic::{GRANT_ALL, GRANT_PRESET_CONTROLLER_ONLY};
+        let (tx, rx) = std::sync::mpsc::sync_channel::<super::super::input::ClientInput>(1);
+        let counters = crate::session_status::SessionCounters::default();
+        let mut denied = crate::session_status::GrantDrops::new(crate::events::Plane::Native);
+        let key = InputEvent {
+            kind: InputKind::KeyDown,
+            _pad: [0; 3],
+            code: 0x41,
+            x: 0,
+            y: 0,
+            flags: crate::inject::KEY_FLAG_SEMANTIC_VK | 4,
+        };
+        offer_edge(
+            key,
+            &AtomicU32::new(GRANT_PRESET_CONTROLLER_ONLY),
+            &tx,
+            &counters,
+            &mut denied,
+        );
+        assert!(rx.try_recv().is_err(), "no keyboard grant, no event");
+        assert_eq!(counters.input_events.load(Ordering::Relaxed), 0);
+
+        let grants = AtomicU32::new(GRANT_ALL);
+        offer_edge(key, &grants, &tx, &counters, &mut denied);
+        match rx.try_recv() {
+            Ok(super::super::input::ClientInput::Event(ev)) => {
+                assert_eq!((ev.kind, ev.code, ev.flags), (InputKind::KeyDown, 0x41, 4))
+            }
+            other => panic!("the edge, unflagged: {}", other.is_ok()),
+        }
+        offer_edge(key, &grants, &tx, &counters, &mut denied);
+        offer_edge(key, &grants, &tx, &counters, &mut denied);
+        assert_eq!(counters.input_events.load(Ordering::Relaxed), 3);
+        assert_eq!(counters.input_dropped.load(Ordering::Relaxed), 1);
     }
 }

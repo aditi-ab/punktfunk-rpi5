@@ -9,7 +9,9 @@
 name = "pf-clipboard"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# Not workspace-inherited (1.85): the Wayland transfer pipe is `std::io::pipe`, stable in 1.87.
+# rust-toolchain.toml pins 1.96, so this records reality rather than raising it.
+rust-version = "1.87"
 license = "MIT OR Apache-2.0"
 description = "punktfunk host shared clipboard: per-OS session-clipboard backends behind one HostClipboard + the QUIC clipboard-plane coordinator."
 publish = false
@@ -19,15 +21,7 @@ pf-host-config = { path = "../pf-host-config" }
 punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
 anyhow = "1"
 tracing = "0.1"
-# Backend features mirror punktfunk-core's quinn exactly — quinn's default `rustls-ring` would
-# drag a second crypto stack into every build that links this crate.
-quinn = { version = "0.11", default-features = false, features = [
-    "log",
-    "platform-verifier",
-    "runtime-tokio",
-    "rustls-aws-lc-rs",
-    "bloom",
-] }
+quinn = { workspace = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 # CF_DIB <-> PNG conversion (winfmt) - most Windows apps paste bitmaps, not the "PNG" format.
 # Unconditional (not windows-gated) so winfmt's pure-conversion unit tests run on every host.

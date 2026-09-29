@@ -24,17 +24,16 @@ use ndk::media::media_codec::MediaCodec;
 use ndk::native_window::NativeWindow;
 use punktfunk_core::phase::{pace_slot, CadenceClock, CadenceTuning, SlotClock, SlotIntervals};
 use std::collections::VecDeque;
-use std::ffi::CStr;
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 
 use super::async_loop::DecodeEvent;
-use super::latency::{now_realtime_ns, p50_max_ms};
+use super::latency::{now_realtime_ns, p50_max_ms, take_by_pts};
 use super::presenter::{cadence_suffix, PresentPriority};
 use super::surface_control::{fence_signal_ns, Layer, PresentComplete};
-use super::vsync::now_monotonic_ns;
+use crate::sys::{now_monotonic_ns, sysprop};
 
 /// Reader pool depth. Must cover the codec's own in-flight outputs + the presenter's held candidate
 /// / FIFO + the buffers still latched on SurfaceFlinger awaiting their release fence. Eight is
@@ -202,8 +201,8 @@ pub(super) struct AscBackend {
     // -- bookkeeping --
     next_seq: u64,
     /// Decode stamps parked at `on_output`, keyed by the pts the codec echoes onto the buffer:
-    /// `(pts_us, decoded_real_ns, decoded_mono_ns)`.
-    stamps: VecDeque<(u64, i128, i64)>,
+    /// `(pts_us, (decoded_real_ns, decoded_mono_ns))`.
+    stamps: VecDeque<(u64, (i128, i64))>,
 
     // -- 1 Hz pf.present window --
     released: u64,
@@ -395,7 +394,8 @@ impl AscBackend {
         present: bool,
     ) {
         if present {
-            self.stamps.push_back((pts_us, decoded_real, decoded_mono));
+            self.stamps
+                .push_back((pts_us, (decoded_real, decoded_mono)));
             if self.stamps.len() > 128 {
                 self.stamps.pop_front();
             }
@@ -403,20 +403,6 @@ impl AscBackend {
         if let Err(e) = codec.release_output_buffer_by_index(index, present) {
             log::warn!("asc: release_output_buffer_by_index({index}, {present}): {e}");
         }
-    }
-
-    /// Pop the decode stamps for `pts_us`, evicting older entries (decode order == input order).
-    fn take_stamp(&mut self, pts_us: u64) -> Option<(i128, i64)> {
-        while let Some(&(p, real, mono)) = self.stamps.front() {
-            if p > pts_us {
-                break;
-            }
-            self.stamps.pop_front();
-            if p == pts_us {
-                return Some((real, mono));
-            }
-        }
-        None
     }
 
     /// Slot scheduling is live: pacing wanted and the clock has a real present behind it.
@@ -619,8 +605,7 @@ impl AscBackend {
         // The buffer timestamp is the pts the codec echoed (ns); pair the parked decode stamps.
         let pts_ns = image.timestamp().unwrap_or(0).max(0);
         let pts_us = (pts_ns / 1000) as u64;
-        let (decoded_real, decoded_mono) = self
-            .take_stamp(pts_us)
+        let (decoded_real, decoded_mono) = take_by_pts(&mut self.stamps, pts_us)
             .unwrap_or((now_realtime_ns(), now_monotonic_ns()));
         let due_ns = self.cadence.as_mut().map(|c| {
             c.due_ns(
@@ -882,12 +867,41 @@ impl AscBackend {
         self.presented.clear();
         self.awaiting.clear();
     }
+
+    /// Tear down everything but the layer, which keeps showing its last frame. A rebuilt
+    /// decoder hides it once its own layer presents (see [`Layer::hide`]).
+    pub(super) fn into_layer(mut self) -> Layer {
+        self.release_all();
+        self.layer
+    }
 }
 
 impl AscBackend {
     /// The HDR10 volume sent with every subsequent transaction.
     pub(super) fn set_hdr_meta(&mut self, meta: Option<punktfunk_core::quic::HdrMeta>) {
         self.hdr_meta = meta;
+    }
+
+    /// Wake the decode loop when a rendered frame reaches the reader. Codec2 queues it inside
+    /// the render call, OMX later on ACodec's looper — without a wake the pass that could
+    /// present it is the next AU, vsync or 5 ms timeout.
+    pub(super) fn wake_on_image(&mut self, tx: mpsc::Sender<DecodeEvent>) {
+        let wake = Box::new(move |_: &ImageReader| {
+            let _ = tx.send(DecodeEvent::ImageAvailable);
+        });
+        if let Err(e) = self.reader.set_image_listener(wake) {
+            log::warn!("asc: image listener not set ({e:?}) — frames wait for the next wake");
+        }
+    }
+
+    /// The decoded picture's size, which the layer's source rect crops against. The reader was
+    /// sized at the session's first mode; an in-session mode change keeps the same reader.
+    pub(super) fn set_src_size(&mut self, w: i32, h: i32) {
+        if (self.src_w, self.src_h) != (w.max(1), h.max(1)) {
+            self.src_w = w.max(1);
+            self.src_h = h.max(1);
+            log::info!("asc: source picture now {w}x{h}");
+        }
     }
 
     /// Update the `ADataSpace` applied to every subsequent transaction (a refinement from the
@@ -901,21 +915,14 @@ impl AscBackend {
     }
 }
 
-/// A `debug.punktfunk.*` system property, trimmed; `None` when unset.
-fn sysprop(name: &CStr) -> Option<String> {
-    let mut buf = [0u8; 92]; // PROP_VALUE_MAX
-                             // SAFETY: __system_property_get with a valid name + PROP_VALUE_MAX buffer is always safe.
-    let n = unsafe { libc::__system_property_get(name.as_ptr(), buf.as_mut_ptr().cast()) };
-    (n > 0).then(|| {
-        String::from_utf8_lossy(&buf[..n as usize])
-            .trim()
-            .to_string()
-    })
-}
-
-/// Whether the ASurfaceControl backend is selected. Default ON; `debug.punktfunk.present_backend =
-/// surfaceview` forces the legacy SurfaceView presenter (the field escape hatch, no rebuild). Any
-/// other value — or an ASC init failure downstream — still lands on ASC-then-fallback.
-pub(super) fn asc_backend_selected() -> bool {
-    sysprop(c"debug.punktfunk.present_backend").as_deref() != Some("surfaceview")
+/// Whether the ASurfaceControl backend is selected: ON everywhere but ChromeOS. ARC latches the
+/// child layer and signals its present fence, yet Chrome can leave it undrawn, and nothing on
+/// the Android side can tell. `debug.punktfunk.present_backend` overrides both ways: `surfaceview`
+/// forces the SurfaceView presenter, `asc` forces this backend on ChromeOS.
+pub(super) fn asc_backend_selected(chromeos: bool) -> bool {
+    match sysprop(c"debug.punktfunk.present_backend").as_deref() {
+        Some("surfaceview") => false,
+        Some("asc") => true,
+        _ => !chromeos,
+    }
 }

@@ -1,8 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { PadFrame } from "@/api/gen/model/padFrame";
 import {
 	appendLog,
 	BIT,
+	BUTTON_NAMES,
 	familyOf,
 	LOG_MAX,
 	logText,
@@ -23,6 +26,29 @@ const frame = (over: Partial<PadFrame> = {}): PadFrame => ({
 	rs_x: 0,
 	rs_y: 0,
 	...over,
+});
+
+// Hand-written beside core's gamepad consts; core and pf-inject test the same rows.
+const vectors = JSON.parse(
+	readFileSync(
+		join(
+			import.meta.dir,
+			"../../../../crates/punktfunk-core/testdata/gamepad-button-vectors.json",
+		),
+		"utf8",
+	),
+) as { buttons: { name: string; bit: number; evdev: string }[] };
+
+describe("the wire buttons", () => {
+	test("bits match core", () => {
+		expect(BIT).toEqual(
+			Object.fromEntries(vectors.buttons.map((b) => [b.name, b.bit])),
+		);
+	});
+
+	test("names match the virtual pad, in log order", () => {
+		expect(BUTTON_NAMES).toEqual(vectors.buttons.map((b) => [b.bit, b.evdev]));
+	});
 });
 
 describe("padEvents", () => {
@@ -109,6 +135,13 @@ describe("shapes", () => {
 			"steamcontroller2",
 			"steamcontroller2puck",
 			"switchpro",
+			"8bitdoultimate2",
+			"8bitdopro2",
+			"8bitdopro3",
+			"horipadsteam",
+			"joyconpair",
+			"switch2pro",
+			"switch2gamecube",
 			"auto",
 		];
 		for (const k of kinds) expect(SHAPES[familyOf(k)]).toBeDefined();
@@ -116,6 +149,10 @@ describe("shapes", () => {
 		expect(familyOf("steamdeck")).toBe("steam");
 		expect(familyOf("switchpro")).toBe("switch");
 		expect(familyOf("xboxelite")).toBe("xbox");
+		expect(familyOf("8bitdopro2")).toBe("switch");
+		expect(familyOf("joyconpair")).toBe("switch");
+		expect(familyOf("switch2pro")).toBe("switch");
+		expect(familyOf("8bitdoultimate2")).toBe("xbox");
 	});
 
 	test("each shape places two sticks and a full face cluster", () => {

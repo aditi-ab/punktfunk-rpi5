@@ -390,23 +390,18 @@ fi
 
 gs="$WORK/gs/punktfunk"
 mkdir -p "$gs"
-printf 'PUNKTFUNK_MGMT_BIND=127.0.0.1:47990\n#PUNKTFUNK_GAMESTREAM=1\n' > "$gs/host.env"
-XDG_CONFIG_HOME="$WORK/gs" enable_gamestream_env
-if grep -qx 'PUNKTFUNK_GAMESTREAM=1' "$gs/host.env" &&
-   grep -qx 'PUNKTFUNK_MGMT_BIND=127.0.0.1:47990' "$gs/host.env"; then
-  printf '  ok   GameStream opt-in appends host.env and keeps other keys\n'
+punktfunk-host() { printf '%s\n' "$*" > "$WORK/gs/host-cmd"; }
+printf 'PUNKTFUNK_MGMT_BIND=127.0.0.1:47990\nPUNKTFUNK_GAMESTREAM=0\n' > "$gs/host.env"
+XDG_CONFIG_HOME="$WORK/gs" enable_gamestream
+if ! grep -q '^PUNKTFUNK_GAMESTREAM=' "$gs/host.env" &&
+   grep -qx 'PUNKTFUNK_MGMT_BIND=127.0.0.1:47990' "$gs/host.env" &&
+   grep -qx 'settings set gamestream true' "$WORK/gs/host-cmd"; then
+  printf '  ok   GameStream opt-in stores the setting and drops the host.env pin\n'
 else
-  printf '  FAIL GameStream opt-in clobbered host.env\n'; fails=$((fails + 1))
+  printf '  FAIL GameStream opt-in left a host.env pin or skipped the store\n'; fails=$((fails + 1))
   cat "$gs/host.env"
 fi
-printf 'PUNKTFUNK_GAMESTREAM=0\n' > "$gs/host.env"
-XDG_CONFIG_HOME="$WORK/gs" enable_gamestream_env
-if grep -qx 'PUNKTFUNK_GAMESTREAM=1' "$gs/host.env"; then
-  printf '  ok   GameStream opt-in flips an existing 0 to 1\n'
-else
-  printf '  FAIL GameStream opt-in did not replace PUNKTFUNK_GAMESTREAM=0\n'
-  fails=$((fails + 1))
-fi
+unset -f punktfunk-host
 
 pin_json='{"v":1,"data":{"pin_pending":true,"pending":[{"uniqueid":"u1","fingerprint":"abc123def456","peer_ip":"10.0.0.8"}]}}'
 if rows=$(ctl_json_rows "$pin_json" pin) && [[ "$rows" == $'u1\tabc123def456\t10.0.0.8' ]]; then

@@ -2,15 +2,14 @@
 resolver = "2"
 members = [
     "crates/punktfunk-core",
+    "crates/punktfunk-ffi",
     "crates/punktfunk-host",
-    "crates/punktfunk-host/vendor/usbip-sim",
     # The capability-carrying PyroWave encode worker. A SEPARATE binary by design — never a
     # hardlink of, or a subcommand of, punktfunk-host (design/gpu-priority-capability-worker.md).
     "crates/punktfunk-encode-worker",
     "crates/punktfunk-tray",
     "crates/punktfunk-setup",
-    # The Windows installer wizard (WinUI 3 over the same engine). Stub bin off-Windows;
-    # shares clients/windows' windows-reactor pin, bumped together.
+    # The Windows installer wizard (WinUI 3 over the same engine). Stub bin off-Windows.
     "crates/punktfunk-setup-win",
     "crates/pf-bitstream",
     "crates/pf-bitstream/vendor/cros-codecs",
@@ -26,12 +25,17 @@ members = [
     "crates/pf-host-config",
     "crates/pf-gpu",
     "crates/pf-zerocopy",
+    "crates/pf-dmabuf",
+    "crates/pf-portal",
     "crates/pf-frame",
     "crates/pf-win-display",
     "crates/pf-encode",
+    "crates/pf-encode-core",
     "crates/pf-encode-win",
     "crates/pf-capture",
     "crates/pf-inject",
+    "crates/pf-audio",
+    "crates/pf-inject/vendor/usbip-sim",
     "crates/pf-vdisplay",
     "crates/pf-vkdecode",
     "crates/pf-dxvadec",
@@ -45,11 +49,13 @@ members = [
     "clients/session",
     "clients/windows",
     "clients/android/native",
+    "clients/apple/native",
     "tools/cursor-probe",
     "tools/display-disturb",
-    "tools/fence-ring-spike",
-    "tools/latency-probe",
+    "tools/gen-headers",
     "tools/loss-harness",
+    "tools/scroll-probe",
+    "tools/wl-scanout-probe",
 ]
 # Standalone PoC (built on its own; pulls usbip/tokio/libusb we don't want in the workspace).
 # The vendored `ndk` is a [patch.crates-io] source, not a member: it only compiles for the
@@ -62,6 +68,9 @@ exclude = [
     # what they can see. Neither belongs in `cargo build --workspace` or on a CI leg with no pad.
     "tools/hid-descriptor-dump",
     "tools/win-input-matrix",
+    # A Windows-only design spike: its ring states are the design it tested, not the shipped au
+    # ring's, so it builds on its own and no CI leg compiles it.
+    "tools/fence-ring-spike",
 ]
 
 # ndk 0.9.0 with a small maintained patch set: public `MediaCodec::as_ptr` for the missing
@@ -72,12 +81,48 @@ exclude = [
 ndk = { path = "clients/android/native/vendor/ndk" }
 
 [workspace.package]
-version = "0.39.0"
+version = "0.41.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 authors = ["unom"]
 repository = "https://github.com/aditi-ab/punktfunk-rpi5"
+
+# Pins every member must share. A member adds `optional` and its own features on top; cargo
+# unions them with the entry's.
+[workspace.dependencies]
+# The TLS stack runs on aws-lc-rs. rustls, quinn, rcgen and ureq each pick a backend on their own
+# and default to ring, so each entry turns defaults off and names aws-lc-rs. quinn's list is its
+# default set with `rustls-ring` swapped out; ureq takes `rustls-no-provider` because its `rustls`
+# feature pulls ring. `prefer-post-quantum` leads with the X25519MLKEM768 hybrid; ring has no
+# ML-KEM. `prebuilt-nasm` keeps aws-lc-sys building on Windows without NASM.
+aws-lc-rs = { version = "1.18", features = ["prebuilt-nasm"] }
+quinn = { version = "0.11", default-features = false, features = [
+    "log",
+    "platform-verifier",
+    "runtime-tokio",
+    "rustls-aws-lc-rs",
+    "bloom",
+] }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std"] }
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
+
+# microsoft/windows-rs at one verified commit: windows-reactor is unpublished (0.0.0), and
+# `windows` comes from the same rev so its `windows-core` unifies with reactor's. Re-run
+# clients/windows' tests/reactor_semantics.rs on every bump. Host crates declare crates.io
+# `windows = "0.62"` inline: cargo can't rename a workspace entry per member.
+windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
+windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
+windows-reactor-setup = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
+test_reactor = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a7441033d9312b16842af02eb0c2b403dc" }
+
+windows-sys = "0.61"
+
+# One generation owns every Vulkan handle, including the ones sdl3's `ash` feature types.
+ash = "0.38"
+# The vendored parser snapshot the decode crates share.
+cros-codecs = { path = "crates/pf-bitstream/vendor/cros-codecs" }
 
 # The `unsafe` discipline the `packaging/windows/drivers/*` crates already run, extended to the
 # workspace. `unsafe fn` marks a CONTRACT the caller must uphold; it is not a licence for the whole
@@ -92,7 +137,7 @@ repository = "https://github.com/aditi-ab/punktfunk-rpi5"
 # lies about its own severity is worse than a strict one, so this now states what CI already does,
 # and the exemptions are written down per file instead of hiding in a 689-warning wall nobody reads.
 #
-# THE EXEMPTIONS. Nine GPU/FFI backend files carry `#![allow(unsafe_op_in_unsafe_fn)]` with a
+# THE EXEMPTIONS. Eight GPU/FFI backend files carry `#![allow(unsafe_op_in_unsafe_fn)]` with a
 # one-line reason each. They are not "not done yet" — they are where this lint stops paying:
 # their bodies are ash/CUDA/AMF/libav calls almost line for line (measured: 64% of the sites are a
 # single third-party FFI call, and of the 44 `unsafe fn`s in them only 4 have a body containing no
@@ -102,7 +147,7 @@ repository = "https://github.com/aditi-ab/punktfunk-rpi5"
 # meaning anything here before (see the header of `pf-win-display/src/win_display.rs`).
 #
 # Everything else in the workspace is at zero and enforced. Removing one of those allows, file by
-# file, is real work with a real payoff; blanket-narrowing all nine is not. Prefer DELETING an
+# file, is real work with a real payoff; blanket-narrowing all eight is not. Prefer DELETING an
 # `unsafe fn` marker over wrapping its body: keep the marker only where a caller can actually break
 # something (a raw pointer, a borrowed HANDLE, a GPU object that must not be in flight).
 [workspace.lints.rust]
@@ -115,7 +160,7 @@ unsafe_op_in_unsafe_fn = "deny"
 # with `[lints] workspace = true`; `packaging/windows/drivers` and `packaging/windows/pf-vkhdr-layer`
 # are SEPARATE workspaces and restate it (any "workspace-wide" claim must be made three times or it
 # is false). Of the members, only the two vendored snapshots (pf-bitstream/vendor/cros-codecs,
-# punktfunk-host/vendor/usbip-sim) stay out, deliberately — upstream code stays pristine.
+# pf-inject/vendor/usbip-sim) stay out, deliberately — upstream code stays pristine.
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"
 
@@ -123,7 +168,7 @@ undocumented_unsafe_blocks = "deny"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-# NOTE: deliberately NOT `panic = "abort"`. punktfunk-core ships as a cdylib/staticlib into
+# NOTE: deliberately NOT `panic = "abort"`. punktfunk-ffi ships as a cdylib/staticlib into
 # third-party apps (Swift/Kotlin/C) and its C ABI catches panics at the boundary
 # (`catch_unwind` → `PunktfunkStatus::Panic`). `panic = "abort"` would make that guard a
 # no-op and let a stray panic abort the embedding application. Unwinding keeps the

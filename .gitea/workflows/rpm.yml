@@ -30,16 +30,19 @@ on:
       - 'crates/pf-client-core/**'
       - 'crates/pf-clipboard/**'
       - 'crates/pf-console-ui/**'
+      - 'crates/pf-dmabuf/**'
       - 'crates/pf-driver-proto/**'
       - 'crates/pf-encode/**'
-      - 'crates/pf-encode-win/**'
+      - 'crates/pf-encode-core/**'
       - 'crates/pf-frame/**'
       - 'crates/pf-gpu/**'
       - 'crates/pf-host-config/**'
       - 'crates/pf-inject/**'
+      - 'crates/pf-audio/**'
       - 'crates/pf-libva/**'
       - 'crates/pf-paths/**'
       - 'crates/pf-paths-win/**'
+      - 'crates/pf-portal/**'
       - 'crates/pf-presenter/**'
       - 'crates/pf-update/**'
       - 'crates/pf-update-check/**'
@@ -49,6 +52,7 @@ on:
       - 'crates/pf-win-display/**'
       - 'crates/pf-zerocopy/**'
       - 'crates/punktfunk-core/**'
+      - 'crates/punktfunk-ffi/**'
       - 'crates/punktfunk-encode-worker/**'
       - 'crates/punktfunk-host/**'
       - 'crates/punktfunk-tray/**'
@@ -68,6 +72,7 @@ on:
       - 'packaging/linux/*.desktop'
       - 'packaging/linux/*.rules'
       - 'packaging/linux/*.service'
+      - 'packaging/linux/*.sh'
       - 'packaging/linux/*.xml'
       - 'packaging/linux/icons/**'
       - 'LICENSE-MIT'
@@ -102,6 +107,8 @@ on:
       - 'scripts/ci/pf-version.sh'
       - 'scripts/ci/retry.sh'
       - 'scripts/alsa-ucm2/**'
+      - 'ci/bun.env'
+      - 'ci/install-bun.sh'
       - '.gitea/workflows/rpm.yml'
     # Single project version: a `vX.Y.Z` tag is THE release. main publishes to the `*-canary` rpm
     # groups, tags to the base groups (`bazzite`/`fedora-44`) — separate repos, so the old
@@ -183,28 +190,10 @@ jobs:
           # on a cache hit (the common case) nothing else in this job would have pulled libavif /
           # luajit / seatd / SDL2 in. Cheap, and it tracks gamescope's dep list for us.
           dnf -y install gamescope || true
-          # bun builds the punktfunk-web console (--with web). Baked into the image; install it
-          # here too so the job stays green against the PREVIOUS image (docker.yml bootstrap note).
-          #
-          # A PINNED release asset, checked by SHA-256 — never `curl https://bun.sh/install | bash`.
-          # This job holds RPM_GPG_PRIVATE_KEY, and the spec VENDORS this very binary into
-          # punktfunk-bun, so an install script piped into root's shell is upstream code running in
-          # front of the signing key AND choosing bytes we then sign. Same discipline as
-          # windows-host.yml's bun pin. Bump BUN_VER and BUN_SHA together (the sums are published in
-          # the release's SHASUMS256.txt). `-baseline` on purpose: it needs no AVX2, so the bun we
-          # ship starts on every x86-64 box — something the auto-detecting installer never promised,
-          # since it reads the BUILDER's CPU, not the user's.
-          command -v bun >/dev/null || {
-            dnf -y install unzip
-            BUN_VER=bun-v1.3.14
-            BUN_SHA=a063908ae08b7852ca10939bbdc6ceed3ddabce8fb9402dce83d65d73b36e6c7
-            curl -fsSL -o /tmp/bun.zip \
-              "https://github.com/oven-sh/bun/releases/download/$BUN_VER/bun-linux-x64-baseline.zip"
-            echo "$BUN_SHA  /tmp/bun.zip" | sha256sum -c -
-            unzip -q -o -j /tmp/bun.zip '*/bun' -d /tmp
-            install -m0755 /tmp/bun /usr/local/bin/bun
-          }
-          bun --version
+          # bun builds the punktfunk-web console (--with web) and the spec vendors it into
+          # punktfunk-bun, so this job signs those bytes. Baked into the image; the script heals an
+          # image that lags the pin in ci/bun.env (docker.yml bootstrap note).
+          sh ci/install-bun.sh
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /usr/local/cargo/registry
@@ -214,20 +203,16 @@ jobs:
       - name: Version + channel
         # vX.Y.Z tag -> X.Y.Z-1 in the base group (a real release); main push -> <next-minor>-0.ciN.g<sha>
         # in the `<base>-canary` group, whose "0." release sorts below the eventual <next-minor>-1 yet
-        # climbs by run number. The canary base is derived one minor ahead of the latest stable tag
-        # (scripts/ci/pf-version.sh) so a stable->canary box re-point still moves forward. The spec %build stamps
+        # climbs by run number (scripts/ci/pf-version.sh owns the rule). The spec %build stamps
         # PUNKTFUNK_BUILD_VERSION from these macros into the binary (--version provenance).
         run: |
-          eval "$(bash scripts/ci/pf-version.sh)"   # -> PF_BASE (one minor ahead of the latest stable tag)
-          SHORT=$(echo "$GITHUB_SHA" | cut -c1-8)
-          case "$GITHUB_REF" in
-            refs/tags/v*) V="${GITHUB_REF_NAME#v}"; R="1"; GROUP="${{ matrix.group }}" ;;
-            *)            V="$PF_BASE"; R="0.ci${GITHUB_RUN_NUMBER}.g${SHORT}"; GROUP="${{ matrix.group }}-canary" ;;
+          eval "$(bash scripts/ci/pf-version.sh --format rpm)"   # -> PF_VERSION, PF_RELEASE, PF_CHANNEL
+          case "$PF_CHANNEL" in
+            stable) GROUP="${{ matrix.group }}" ;;
+            *)      GROUP="${{ matrix.group }}-canary" ;;
           esac
-          echo "PF_VERSION=$V" >> "$GITHUB_ENV"
-          echo "PF_RELEASE=$R" >> "$GITHUB_ENV"
           echo "GROUP=$GROUP" >> "$GITHUB_ENV"
-          echo "rpm $V-$R -> group '$GROUP'"
+          echo "rpm $PF_VERSION-$PF_RELEASE -> group '$GROUP'"
 
       # ── The web console, built once per (web+sdk content, bun) instead of once per leg ─────────
       # Two legs run here (f43 + f44) and each built its own identical copy of a bundle that is a

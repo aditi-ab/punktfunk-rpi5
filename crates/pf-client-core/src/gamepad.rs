@@ -27,10 +27,15 @@ const GYRO_LSB_PER_RAD_S: f32 =
 const ACCEL_LSB_PER_G: f32 = wire::MOTION_ACCEL_LSB_PER_G as f32;
 const G: f32 = 9.80665;
 
-/// L1+R1+Start+Select: leave fullscreen and release capture. Still forwarded; also
-/// raises the UI escape. A hold of [`DISCONNECT_HOLD`] disconnects. Not Guide/QAM —
-/// those pass through to the host.
-const ESCAPE_CHORD: [u32; 4] = [wire::BTN_LB, wire::BTN_RB, wire::BTN_START, wire::BTN_BACK];
+/// L1+R1+Start+Select: raises the UI escape (on a desktop the presenter releases capture,
+/// which masks forwarding until capture returns). A hold of [`DISCONNECT_HOLD`]
+/// disconnects, mask or not. Not Guide/QAM — those pass through to the host.
+const ESCAPE_CHORD: [sdl3::gamepad::Button; 4] = [
+    sdl3::gamepad::Button::LeftShoulder,
+    sdl3::gamepad::Button::RightShoulder,
+    sdl3::gamepad::Button::Start,
+    sdl3::gamepad::Button::Back,
+];
 
 /// 1500 ms is long enough to be deliberate over a leave-fullscreen press.
 const DISCONNECT_HOLD: Duration = Duration::from_millis(1500);
@@ -96,10 +101,31 @@ fn pref_for_type(t: sdl3::gamepad::GamepadType) -> GamepadPref {
         T::PS5 => GamepadPref::DualSense,
         T::PS4 => GamepadPref::DualShock4,
         T::XboxOne => GamepadPref::XboxOne,
-        // A Joy-Con pair exposes the full Pro surface; a single Joy-Con is half a pad
-        // and stays on the Xbox 360 fallback.
-        T::NintendoSwitchPro | T::NintendoSwitchJoyconPair => GamepadPref::SwitchPro,
+        T::NintendoSwitchPro => GamepadPref::SwitchPro,
+        // A single Joy-Con is half a pad and stays on the Xbox 360 fallback.
+        T::NintendoSwitchJoyconPair => GamepadPref::JoyConPair,
         _ => GamepadPref::Xbox360,
+    }
+}
+
+/// Pads whose own identity SDL's type cannot name: no Valve, 8BitDo or HORI type, the Edge
+/// reads as a PS5 and the Elite as an Xbox One. The host then builds that identity, so the
+/// extras land natively.
+fn pref_for_ids(vid: u16, pid: u16) -> Option<GamepadPref> {
+    match (vid, pid) {
+        (0x28DE, 0x1205) => Some(GamepadPref::SteamDeck),
+        (0x28DE, 0x1102 | 0x1142) => Some(GamepadPref::SteamController),
+        (0x054C, 0x0DF2) => Some(GamepadPref::DualSenseEdge),
+        // Elite Series 1, Series 2 USB, Bluetooth and BLE.
+        (0x045E, 0x02E3 | 0x0B00 | 0x0B05 | 0x0B22) => Some(GamepadPref::XboxElite),
+        // 8BitDo in its own HID mode; X-input mode is `310B` and stays Xbox 360.
+        (0x2DC8, 0x6012) => Some(GamepadPref::EightBitDoUltimate2),
+        (0x2DC8, 0x6003 | 0x6006) => Some(GamepadPref::EightBitDoPro2),
+        (0x2DC8, 0x6009) => Some(GamepadPref::EightBitDoPro3),
+        (0x0F0D, 0x01AB | 0x0196) => Some(GamepadPref::HoripadSteam),
+        (0x057E, 0x2069) => Some(GamepadPref::Switch2Pro),
+        (0x057E, 0x2073) => Some(GamepadPref::Switch2GameCube),
+        _ => crate::sc2_capture::pref_for(vid, pid),
     }
 }
 
@@ -113,6 +139,9 @@ fn declared_kind(setting: GamepadPref, physical: GamepadPref) -> GamepadPref {
         explicit => explicit,
     }
 }
+
+/// What SDL's HIDAPI driver calls the Deck's built-in controller.
+const DECK_NAME: &str = "Steam Deck";
 
 /// Steam Deck probe. `SteamDeck=1` short-circuits; else DMI (Valve + Jupiter/Galileo,
 /// readable in the flatpak). Cached — the answer cannot change while we run.
@@ -387,16 +416,13 @@ impl GamepadService {
         let _ = self.ctl.send(Ctl::Detach);
     }
 
-    /// Physical pad's virtual kind, or the host default if none. Read *before* attach,
-    /// when Valve HIDAPI is still off ([`set_valve_hidapi`]) so the Deck's 28DE:1205 is
-    /// not enumerable; Steam Input shows only a virtual X360. On a Deck, a virtual pad
-    /// (or none) is the built-in controller — resolve to Steam Deck so paddles/gyro land.
-    /// A real external controller still wins.
+    /// The active pad's kind, or the host default if none. Read *before* attach, when a
+    /// Deck's built-in controls are still Steam Input's pad, which already reads as a Deck.
+    /// A Deck with no pad at all is still a Deck, so paddles and gyro land.
     pub fn auto_pref(&self) -> GamepadPref {
         match self.active() {
-            Some(p) if !p.steam_virtual => p.pref,
-            _ if is_steam_deck() => GamepadPref::SteamDeck,
             Some(p) => p.pref,
+            None if is_steam_deck() => GamepadPref::SteamDeck,
             None => GamepadPref::Auto,
         }
     }
@@ -438,6 +464,17 @@ impl Drop for GamepadPump {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// A Deck's pad list: Steam Input's pads are shadows of the built-in controls and of each
+/// external pad SDL already lists (the session clears Steam's device filter). The built-in
+/// controller is listed once: the raw 28DE:1205 when a session has it, else one Steam pad.
+/// A pad only Steam can see (a Steam Controller while Valve HIDAPI is off) gets no card.
+fn fold_deck_shadows(list: &mut Vec<PadInfo>) {
+    let mut stand_in = !list
+        .iter()
+        .any(|p| !p.steam_virtual && p.pref == GamepadPref::SteamDeck);
+    list.retain(|p| !p.steam_virtual || std::mem::take(&mut stand_in));
 }
 
 /// Lowest free wire index, or `None` when every slot is taken. Lowest-free keeps indices
@@ -579,9 +616,11 @@ impl Ds5Feedback {
     const RIGHT_TRIGGER: usize = 11 - Self::REPORT_ID_LEN;
     const LEFT_TRIGGER: usize = 22 - Self::REPORT_ID_LEN;
     const PAD_LIGHTS: usize = 44 - Self::REPORT_ID_LEN;
+    /// `ucMicLightMode`: USB report byte 9.
+    const MIC_LED: usize = 9 - Self::REPORT_ID_LEN;
     const LED_RGB: usize = 45 - Self::REPORT_ID_LEN;
-    /// Mode byte plus 10 parameters — same width as `PUNKTFUNK_HID_EFFECT_MAX`.
-    const TRIGGER_LEN: usize = punktfunk_core::abi::PUNKTFUNK_HID_EFFECT_MAX as usize;
+    /// Mode byte plus 10 parameters: the wire's trigger-effect clamp.
+    const TRIGGER_LEN: usize = punktfunk_core::quic::TRIGGER_EFFECT_MAX;
 
     fn trigger_packet(which: u8, effect: &[u8]) -> [u8; 47] {
         let mut p = [0u8; 47];
@@ -609,6 +648,13 @@ impl Ds5Feedback {
         let mut p = [0u8; 47];
         p[1] = 0x10; // valid_flag1 player LEDs
         p[Self::PAD_LIGHTS] = bits & 0x1F;
+        p
+    }
+
+    fn mic_led_packet(mode: u8) -> [u8; 47] {
+        let mut p = [0u8; 47];
+        p[1] = 0x01; // valid_flag1 mic-mute LED
+        p[Self::MIC_LED] = mode;
         p
     }
 
@@ -674,9 +720,12 @@ struct Slot {
     /// Log-once: this path runs at the pad's sensor rate.
     motion_unreachable_logged: bool,
     gesture: SelectGesture,
-    /// bit0 = haptics, bit1 = speaker. Nonzero only for tier-A; bit0 also suppresses wire rumble.
+    /// bit0 = haptics, bit1 = speaker. Nonzero only for tier-A; bit0 also suppresses wire rumble
+    /// while haptics frames arrive.
     audio_caps: u8,
     rumble_suppressed_logged: bool,
+    /// A wire rumble went out since the coils were last armed; SDL's rumble bits mute them.
+    coils_muted: bool,
     /// Raw passthrough for a Steam Controller 2 declared as one.
     sc2: Option<crate::sc2_capture::Sc2Capture>,
     /// The host sent raw writes, so its `0x80` reports own the motors and wire rumble is skipped.
@@ -709,6 +758,7 @@ impl Slot {
             gesture: SelectGesture::default(),
             audio_caps: 0,
             rumble_suppressed_logged: false,
+            coils_muted: false,
             sc2: None,
             raw_rumble: false,
         }
@@ -874,6 +924,18 @@ struct Worker {
     ring_nav: bool,
 }
 
+/// The attached session and the open slot SDL's `which` names. Takes the two fields,
+/// not `&mut Worker`, so a caller still reads the worker's flags while holding the slot.
+fn attached_slot<'a>(
+    attached: &Option<Arc<NativeClient>>,
+    slots: &'a mut [Slot],
+    which: u32,
+) -> Option<(Arc<NativeClient>, &'a mut Slot)> {
+    let c = attached.clone()?;
+    let slot = slots.iter_mut().find(|s| s.id == which)?;
+    Some((c, slot))
+}
+
 impl Worker {
     fn active_id(&self) -> Option<u32> {
         // Pin matches by stable key (most-recent wins if two share one); unmatched falls
@@ -909,28 +971,27 @@ impl Worker {
             self.subsystem.vendor_for_id(jid).unwrap_or(0),
             self.subsystem.product_for_id(jid).unwrap_or(0),
         );
-        // SDL has no Valve pad types; VID/PID picks the matching Deck / Steam Controller kind.
-        if vid == 0x28DE && pid == 0x1205 {
-            pref = GamepadPref::SteamDeck;
-        }
-        if vid == 0x28DE && matches!(pid, 0x1102 | 0x1142) {
-            pref = GamepadPref::SteamController;
-        }
-        if let Some(sc2) = crate::sc2_capture::pref_for(vid, pid) {
-            pref = sc2;
-        }
-        // Edge reports as PS5; VID/PID so paddles land on native slots, not the fold/drop policy.
-        if vid == 0x054C && pid == 0x0DF2 {
-            pref = GamepadPref::DualSenseEdge;
+        if let Some(own) = pref_for_ids(vid, pid) {
+            pref = own;
         }
         let name = self
             .subsystem
             .name_for_id(jid)
             .unwrap_or_else(|_| "Controller".into());
+        let key = format!("{vid:04x}:{pid:04x}:{name}");
+        let steam_virtual =
+            (vid == 0x28DE && pid == 0x11FF) || name.starts_with("Steam Virtual Gamepad");
+        // On a Deck, Steam Input's pad is the built-in controls until a session enables Valve
+        // HIDAPI and the raw 28DE:1205 appears. The key keeps SDL's name so a pin still matches.
+        let name = if steam_virtual && is_steam_deck() {
+            pref = GamepadPref::SteamDeck;
+            DECK_NAME.to_string()
+        } else {
+            name
+        };
         Some(PadInfo {
-            key: format!("{vid:04x}:{pid:04x}:{name}"),
-            steam_virtual: (vid == 0x28DE && pid == 0x11FF)
-                || name.starts_with("Steam Virtual Gamepad"),
+            key,
+            steam_virtual,
             name,
             pref,
             // SDL reports power only for an OPEN device; `publish` fills the one we hold.
@@ -1048,13 +1109,7 @@ impl Worker {
             );
             return;
         };
-        let pref = match self.pad_info(id) {
-            // Virtual pad in front of the Deck's built-in controls: declare Deck, not X360.
-            // The host honors per-pad arrival over the session default ([`Self::auto_pref`]).
-            Some(p) if p.steam_virtual && is_steam_deck() => GamepadPref::SteamDeck,
-            Some(p) => p.pref,
-            None => GamepadPref::Xbox360,
-        };
+        let pref = self.pad_info(id).map_or(GamepadPref::Xbox360, |p| p.pref);
         let declared = declared_kind(self.kind_override, pref);
         match self.subsystem.open(sdl3::sys::joystick::SDL_JoystickID(id)) {
             Ok(pad) => {
@@ -1066,6 +1121,10 @@ impl Worker {
                     Self::set_slot_sensors(&mut slot, true);
                 }
                 slot.audio_caps = self.pad_audio_caps_for(id, &slot.pad);
+                if let Some(path) = slot.pad.path() {
+                    let (vid, pid) = (slot.pad.vendor_id(), slot.pad.product_id());
+                    crate::sc2_capture::log_descriptor(&path, vid.unwrap_or(0), pid.unwrap_or(0));
+                }
                 // Kind before any input so the host builds a matching virtual device. Core
                 // re-sends against datagram loss; an older host ignores it.
                 if let Some(c) = &self.attached {
@@ -1105,9 +1164,9 @@ impl Worker {
                 if slot.audio_caps != 0 {
                     if slot.audio_caps & 0x01 != 0 {
                         // SDL rumble sets ucEnableBits1 0x01|0x02, muting the 0xD1 coils.
-                        // Clear those bits once; render_feedback suppresses wire rumble so
-                        // SDL never re-arms them. Fails if hid-playstation owns the HID link
-                        // — that driver asserts the same bit on every FF update.
+                        // Clear those bits at open; render_feedback clears them again when
+                        // haptics resume after a rumble. Fails if hid-playstation owns the HID
+                        // link — that driver asserts the same bit on every FF update.
                         if let Err(e) = slot.pad.send_effect(&Ds5Feedback::audio_haptics_packet()) {
                             tracing::info!(
                                 index,
@@ -1197,6 +1256,7 @@ impl Worker {
         let slot = self.slots.remove(i);
         if slot.audio_caps != 0 {
             crate::pad_audio::unregister_tier_a(slot.index);
+            crate::pad_audio::clear_haptics_liveness(slot.index);
         }
         tracing::info!(
             id = slot.id,
@@ -1404,10 +1464,12 @@ impl Worker {
         self.rearm_escape();
     }
 
+    /// Read from the pads, not `held_buttons`: the mask drops button events, and a hold
+    /// that began before it must still complete or let go.
     fn chord_held(&self) -> bool {
         self.slots
             .iter()
-            .any(|s| ESCAPE_CHORD.iter().all(|b| s.held_buttons.contains(b)))
+            .any(|s| ESCAPE_CHORD.iter().all(|&b| s.pad.button(b)))
     }
 
     fn maybe_fire_escape(&mut self) {
@@ -1451,8 +1513,9 @@ impl Worker {
         }
     }
 
-    /// Polled so the hold completes without new events.
+    /// Polled so the hold completes, or lets go, without new events — a mask drops them.
     fn maybe_fire_disconnect(&mut self) {
+        self.rearm_escape();
         if self.disconnect_fired {
             return;
         }
@@ -1580,6 +1643,9 @@ impl Worker {
             .copied()
             .filter_map(with_battery)
             .collect();
+        if is_steam_deck() {
+            fold_deck_shadows(&mut list);
+        }
         list.reverse();
         *self.pads_out.lock().unwrap() = list;
         *self.active_out.lock().unwrap() = self.active_id().and_then(with_battery);
@@ -1687,12 +1753,12 @@ impl Worker {
                     self.push_sc2_gate();
                     if on {
                         // Neutral now, slots stay open — the host must not see an unplug.
+                        // An escape hold carries on: the escape itself raises this mask.
                         if let Some(c) = self.attached.clone() {
                             for slot in &mut self.slots {
                                 Self::flush_slot(&c, slot);
                             }
                         }
-                        self.reset_chord();
                     } else {
                         self.readopt_held();
                         self.menu_nav.reset();
@@ -1795,102 +1861,12 @@ impl Worker {
                     self.refresh_active();
                 }
             }
-            Event::ControllerButtonDown { which, button, .. } => {
-                let Some(c) = self.attached.clone() else {
-                    return;
-                };
-                let Some(slot) = self.slots.iter_mut().find(|s| s.id == which) else {
-                    return;
-                };
-                if let Some(surface) = Self::steam_click_surface(slot, button) {
-                    Self::forward_click(&c, slot, surface, true);
-                    return;
-                }
-                if let Some(bit) = button_bit(button) {
-                    if !self.system_forward && matches!(bit, wire::BTN_GUIDE | wire::BTN_MISC1) {
-                        return;
-                    }
-                    // Claimed only where the client can act on it: the ring withholds the press
-                    // it takes, and eating a face button nothing receives is worse than the
-                    // chord not working.
-                    let chord = self
-                        .chords_live
-                        .then(|| select_chord(&slot.held_buttons, bit, slot.gesture.as_guide))
-                        .flatten();
-                    if let Some(chord) = chord {
-                        let _ = self.chord_tx.try_send((slot.index, chord));
-                        // A is the ring's own confirm, so the host must not also see it — a
-                        // pending Select goes with it, and one already on the wire is lifted by
-                        // the ring's mask flush. Stats changes nothing on the host, so that
-                        // press carries on to the game, as it does on the Apple clients.
-                        if chord == SelectChord::Ring {
-                            slot.gesture.swallow_for_ring();
-                            slot.swallow_btn = Some(bit);
-                            slot.held_buttons.push(bit);
-                            return;
-                        }
-                    }
-                    let mut due = Vec::new();
-                    let held_back = if !self.guide_gesture {
-                        false
-                    } else if bit == wire::BTN_BACK {
-                        let alone = slot.held_buttons.is_empty();
-                        slot.gesture.on_select_down(Instant::now(), alone, &mut due)
-                    } else {
-                        slot.gesture.on_other_down(&mut due);
-                        false
-                    };
-                    for (b, down) in due {
-                        send(&c, InputKind::GamepadButton, b, down as i32, slot.index);
-                    }
-                    // Chord bookkeeping sees the physical press even when the gesture holds it back.
-                    slot.held_buttons.push(bit);
-                    if !held_back {
-                        send(&c, InputKind::GamepadButton, bit, 1, slot.index);
-                    }
-                    self.maybe_fire_escape();
-                }
-            }
-            Event::ControllerButtonUp { which, button, .. } => {
-                let Some(c) = self.attached.clone() else {
-                    return;
-                };
-                let Some(slot) = self.slots.iter_mut().find(|s| s.id == which) else {
-                    return;
-                };
-                if let Some(surface) = Self::steam_click_surface(slot, button) {
-                    Self::forward_click(&c, slot, surface, false);
-                    return;
-                }
-                if let Some(bit) = button_bit(button) {
-                    if !self.system_forward && matches!(bit, wire::BTN_GUIDE | wire::BTN_MISC1) {
-                        return;
-                    }
-                    slot.held_buttons.retain(|&b| b != bit);
-                    if slot.swallow_btn == Some(bit) {
-                        slot.swallow_btn = None;
-                        return;
-                    }
-                    let mut due = Vec::new();
-                    let owned = self.guide_gesture
-                        && bit == wire::BTN_BACK
-                        && slot.gesture.on_select_up(Instant::now(), &mut due);
-                    for (b, down) in due {
-                        send(&c, InputKind::GamepadButton, b, down as i32, slot.index);
-                    }
-                    if !owned {
-                        send(&c, InputKind::GamepadButton, bit, 0, slot.index);
-                    }
-                    self.rearm_escape();
-                }
-            }
+            Event::ControllerButtonDown { which, button, .. } => self.on_button_down(which, button),
+            Event::ControllerButtonUp { which, button, .. } => self.on_button_up(which, button),
             Event::ControllerAxisMotion {
                 which, axis, value, ..
             } => {
-                let Some(c) = self.attached.clone() else {
-                    return;
-                };
-                let Some(slot) = self.slots.iter_mut().find(|s| s.id == which) else {
+                let Some((c, slot)) = attached_slot(&self.attached, &mut self.slots, which) else {
                     return;
                 };
                 let (id, v) = axis_value(axis, value);
@@ -1915,13 +1891,9 @@ impl Worker {
                 y,
                 ..
             } => {
-                let Some(c) = self.attached.clone() else {
-                    return;
-                };
-                let Some(slot) = self.slots.iter_mut().find(|s| s.id == which) else {
-                    return;
-                };
-                Self::forward_touch(&c, slot, touchpad as u32, finger as u8, x, y, true);
+                if let Some((c, slot)) = attached_slot(&self.attached, &mut self.slots, which) {
+                    Self::forward_touch(&c, slot, touchpad as u32, finger as u8, x, y, true);
+                }
             }
             Event::ControllerTouchpadUp {
                 which,
@@ -1931,68 +1903,149 @@ impl Worker {
                 y,
                 ..
             } => {
-                let Some(c) = self.attached.clone() else {
-                    return;
-                };
-                let Some(slot) = self.slots.iter_mut().find(|s| s.id == which) else {
-                    return;
-                };
-                Self::forward_touch(&c, slot, touchpad as u32, finger as u8, x, y, false);
+                if let Some((c, slot)) = attached_slot(&self.attached, &mut self.slots, which) {
+                    Self::forward_touch(&c, slot, touchpad as u32, finger as u8, x, y, false);
+                }
             }
             Event::ControllerSensorUpdated {
                 which,
                 sensor,
                 data,
                 ..
-            } => {
-                let Some(c) = self.attached.clone() else {
+            } => self.on_sensor(which, sensor, data),
+            _ => {}
+        }
+    }
+
+    /// Steam pad click, Select chord, guide gesture, then the wire press. The escape
+    /// chord is checked last, once the slot borrow has ended.
+    fn on_button_down(&mut self, which: u32, button: sdl3::gamepad::Button) {
+        let Some((c, slot)) = attached_slot(&self.attached, &mut self.slots, which) else {
+            return;
+        };
+        if let Some(surface) = Self::steam_click_surface(slot, button) {
+            Self::forward_click(&c, slot, surface, true);
+            return;
+        }
+        if let Some(bit) = button_bit(button) {
+            if !self.system_forward && matches!(bit, wire::BTN_GUIDE | wire::BTN_MISC1) {
+                return;
+            }
+            // Claimed only where the client can act on it: the ring withholds the press
+            // it takes, and eating a face button nothing receives is worse than the
+            // chord not working.
+            let chord = self
+                .chords_live
+                .then(|| select_chord(&slot.held_buttons, bit, slot.gesture.as_guide))
+                .flatten();
+            if let Some(chord) = chord {
+                let _ = self.chord_tx.try_send((slot.index, chord));
+                // A is the ring's own confirm, so the host must not also see it — a
+                // pending Select goes with it, and one already on the wire is lifted by
+                // the ring's mask flush. Stats changes nothing on the host, so that
+                // press carries on to the game, as it does on the Apple clients.
+                if chord == SelectChord::Ring {
+                    slot.gesture.swallow_for_ring();
+                    slot.swallow_btn = Some(bit);
+                    slot.held_buttons.push(bit);
                     return;
-                };
-                let Some(slot) = self.slots.iter_mut().find(|s| s.id == which) else {
-                    return;
-                };
-                use sdl3::sensor::SensorType;
-                match sensor {
-                    SensorType::Accelerometer => {
-                        for (i, v) in data.iter().enumerate() {
-                            slot.last_accel[i] =
-                                (v / G * ACCEL_LSB_PER_G).clamp(-32768.0, 32767.0) as i16;
-                        }
-                    }
-                    SensorType::Gyroscope => {
-                        // Per-pad declaration, not the session echo: under Auto the Hello
-                        // carries pad 0's kind while pad 1 may still have a gyro.
-                        if !punktfunk_core::config::pad_motion_reaches(
-                            slot.declared,
-                            c.requested_gamepad,
-                            c.resolved_gamepad,
-                        ) {
-                            if !slot.motion_unreachable_logged {
-                                slot.motion_unreachable_logged = true;
-                                tracing::warn!(
-                                    pad = slot.index,
-                                    declared = ?slot.declared,
-                                    resolved = ?c.resolved_gamepad,
-                                    "this controller has a gyro but the host built it a backend \
-                                     without one — motion will not reach the game; pick a \
-                                     DualSense-class controller type to get it"
-                                );
-                            }
-                            return;
-                        }
-                        let mut gyro = [0i16; 3];
-                        for (i, v) in data.iter().enumerate() {
-                            gyro[i] = (v * GYRO_LSB_PER_RAD_S).clamp(-32768.0, 32767.0) as i16;
-                        }
-                        slot.sent_motion = true;
-                        let _ = c.send_rich_input(RichInput::Motion {
-                            pad: slot.index,
-                            gyro,
-                            accel: slot.last_accel,
-                        });
-                    }
-                    _ => {}
                 }
+            }
+            let mut due = Vec::new();
+            let held_back = if !self.guide_gesture {
+                false
+            } else if bit == wire::BTN_BACK {
+                let alone = slot.held_buttons.is_empty();
+                slot.gesture.on_select_down(Instant::now(), alone, &mut due)
+            } else {
+                slot.gesture.on_other_down(&mut due);
+                false
+            };
+            for (b, down) in due {
+                send(&c, InputKind::GamepadButton, b, down as i32, slot.index);
+            }
+            // Chord bookkeeping sees the physical press even when the gesture holds it back.
+            slot.held_buttons.push(bit);
+            if !held_back {
+                send(&c, InputKind::GamepadButton, bit, 1, slot.index);
+            }
+            self.maybe_fire_escape();
+        }
+    }
+
+    fn on_button_up(&mut self, which: u32, button: sdl3::gamepad::Button) {
+        let Some((c, slot)) = attached_slot(&self.attached, &mut self.slots, which) else {
+            return;
+        };
+        if let Some(surface) = Self::steam_click_surface(slot, button) {
+            Self::forward_click(&c, slot, surface, false);
+            return;
+        }
+        if let Some(bit) = button_bit(button) {
+            if !self.system_forward && matches!(bit, wire::BTN_GUIDE | wire::BTN_MISC1) {
+                return;
+            }
+            slot.held_buttons.retain(|&b| b != bit);
+            if slot.swallow_btn == Some(bit) {
+                slot.swallow_btn = None;
+                return;
+            }
+            let mut due = Vec::new();
+            let owned = self.guide_gesture
+                && bit == wire::BTN_BACK
+                && slot.gesture.on_select_up(Instant::now(), &mut due);
+            for (b, down) in due {
+                send(&c, InputKind::GamepadButton, b, down as i32, slot.index);
+            }
+            if !owned {
+                send(&c, InputKind::GamepadButton, bit, 0, slot.index);
+            }
+            self.rearm_escape();
+        }
+    }
+
+    fn on_sensor(&mut self, which: u32, sensor: sdl3::sensor::SensorType, data: [f32; 3]) {
+        let Some((c, slot)) = attached_slot(&self.attached, &mut self.slots, which) else {
+            return;
+        };
+        use sdl3::sensor::SensorType;
+        match sensor {
+            SensorType::Accelerometer => {
+                for (i, v) in data.iter().enumerate() {
+                    slot.last_accel[i] = (v / G * ACCEL_LSB_PER_G).clamp(-32768.0, 32767.0) as i16;
+                }
+            }
+            SensorType::Gyroscope => {
+                // Per-pad declaration, not the session echo: under Auto the Hello
+                // carries pad 0's kind while pad 1 may still have a gyro.
+                if !punktfunk_core::config::pad_motion_reaches(
+                    slot.declared,
+                    c.requested_gamepad,
+                    c.resolved_gamepad,
+                ) {
+                    if !slot.motion_unreachable_logged {
+                        slot.motion_unreachable_logged = true;
+                        tracing::warn!(
+                            pad = slot.index,
+                            declared = ?slot.declared,
+                            resolved = ?c.resolved_gamepad,
+                            "this controller has a gyro but the host built it a backend \
+                             without one — motion will not reach the game; pick a \
+                             DualSense-class controller type to get it"
+                        );
+                    }
+                    return;
+                }
+                let mut gyro = [0i16; 3];
+                for (i, v) in data.iter().enumerate() {
+                    gyro[i] = (v * GYRO_LSB_PER_RAD_S).clamp(-32768.0, 32767.0) as i16;
+                }
+                slot.sent_motion = true;
+                let _ = c.send_rich_input(RichInput::Motion {
+                    pad: slot.index,
+                    gyro,
+                    accel: slot.last_accel,
+                });
             }
             _ => {}
         }
@@ -2044,17 +2097,29 @@ impl Worker {
 
     /// Single consumer of rumble + HID output. Engine commands are already effective;
     /// this worker applies them verbatim. A raw SC2 hands its motors to the host's raw writes.
+    /// A tier-A pad's coils go to whichever of wire rumble and haptics audio is arriving.
     fn render_feedback(&mut self) {
         let Some(connector) = self.attached.clone() else {
             return;
         };
+        // Haptics resumed after a rumble muted the coils: arm them again.
+        for slot in &mut self.slots {
+            if slot.coils_muted && crate::pad_audio::haptics_live(slot.index) {
+                slot.coils_muted = false;
+                if let Err(e) = slot.pad.send_effect(&Ds5Feedback::audio_haptics_packet()) {
+                    tracing::debug!(pad = slot.index, error = %e, "audio-haptics re-arm");
+                }
+            }
+        }
         while let Ok(cmd) = connector.next_rumble_command(Duration::ZERO) {
             if let Some(slot) = self.slots.iter_mut().find(|s| s.index as u16 == cmd.pad) {
                 if slot.raw_rumble {
                     continue;
                 }
-                // SDL rumble sets ucEnableBits1 0x01|0x02, muting the 0xD1 coils.
-                if slot.audio_caps & 0x01 != 0 {
+                // SDL rumble sets ucEnableBits1 0x01|0x02, muting the 0xD1 coils. A title that
+                // renders no haptics audio sends no frames, so it keeps its rumble.
+                let haptics = slot.audio_caps & 0x01 != 0;
+                if haptics && crate::pad_audio::haptics_live(slot.index) {
                     if !slot.rumble_suppressed_logged {
                         slot.rumble_suppressed_logged = true;
                         tracing::info!(
@@ -2064,6 +2129,7 @@ impl Worker {
                     }
                     continue;
                 }
+                slot.coils_muted |= haptics;
                 Self::issue_rumble(slot, cmd.low, cmd.high, cmd.backstop_ms);
             }
         }
@@ -2088,6 +2154,9 @@ impl Worker {
                 }
                 HidOutput::PlayerLeds { bits, .. } => {
                     let _ = set_player_leds(&slot.pad, bits);
+                }
+                HidOutput::MicLed { mode, .. } if is_ds => {
+                    let _ = slot.pad.send_effect(&Ds5Feedback::mic_led_packet(mode));
                 }
                 HidOutput::Trigger {
                     which, ref effect, ..
@@ -2118,7 +2187,8 @@ impl Worker {
                 }
                 HidOutput::Trigger { .. }
                 | HidOutput::TrackpadHaptic { .. }
-                | HidOutput::AudioCtl { .. } => {}
+                | HidOutput::AudioCtl { .. }
+                | HidOutput::MicLed { .. } => {}
             }
         }
     }
@@ -2146,7 +2216,8 @@ fn hidout_pad(h: &HidOutput) -> u8 {
         | HidOutput::PlayerLeds { pad, .. }
         | HidOutput::Trigger { pad, .. }
         | HidOutput::TrackpadHaptic { pad, .. }
-        | HidOutput::HidRaw { pad, .. } => *pad,
+        | HidOutput::HidRaw { pad, .. }
+        | HidOutput::MicLed { pad, .. } => *pad,
         // AudioCtl's pad is the plane's only u16; decode already rejects ≥ MAX_PADS.
         HidOutput::AudioCtl { pad, .. } => *pad as u8,
     }
@@ -2249,6 +2320,33 @@ fn run(
         w.menu_poll();
         w.battery_poll();
         w.render_feedback();
+    }
+}
+
+#[cfg(test)]
+mod pref_for_ids_tests {
+    use super::*;
+
+    #[test]
+    fn named_pads_declare_their_own_kind() {
+        use GamepadPref as P;
+        assert_eq!(pref_for_ids(0x28DE, 0x1205), Some(P::SteamDeck));
+        assert_eq!(pref_for_ids(0x28DE, 0x1142), Some(P::SteamController));
+        assert_eq!(pref_for_ids(0x28DE, 0x1302), Some(P::SteamController2));
+        assert_eq!(pref_for_ids(0x054C, 0x0DF2), Some(P::DualSenseEdge));
+        for elite in [0x02E3, 0x0B00, 0x0B05, 0x0B22] {
+            assert_eq!(pref_for_ids(0x045E, elite), Some(P::XboxElite));
+        }
+        assert_eq!(pref_for_ids(0x2DC8, 0x6012), Some(P::EightBitDoUltimate2));
+        assert_eq!(pref_for_ids(0x2DC8, 0x6006), Some(P::EightBitDoPro2));
+        assert_eq!(pref_for_ids(0x2DC8, 0x6009), Some(P::EightBitDoPro3));
+        assert_eq!(pref_for_ids(0x0F0D, 0x0196), Some(P::HoripadSteam));
+        assert_eq!(pref_for_ids(0x057E, 0x2069), Some(P::Switch2Pro));
+        assert_eq!(pref_for_ids(0x057E, 0x2073), Some(P::Switch2GameCube));
+        // A plain Series pad keeps SDL's type.
+        assert_eq!(pref_for_ids(0x045E, 0x0B12), None);
+        // X-input mode is an Xbox 360 pad.
+        assert_eq!(pref_for_ids(0x2DC8, 0x310B), None);
     }
 }
 
@@ -2453,6 +2551,35 @@ mod slot_tests {
     }
 
     #[test]
+    fn a_deck_lists_its_built_in_controller_once() {
+        let pad = |name: &str, pref, steam_virtual| PadInfo {
+            name: name.into(),
+            key: name.into(),
+            pref,
+            steam_virtual,
+            battery: None,
+            detail: String::new(),
+            forwarded: true,
+            rumble: false,
+        };
+        let names = |mut list: Vec<PadInfo>| {
+            fold_deck_shadows(&mut list);
+            list.into_iter().map(|p| p.name).collect::<Vec<_>>()
+        };
+        let shadow = || pad(DECK_NAME, GamepadPref::SteamDeck, true);
+        let ds = || pad("DualSense", GamepadPref::DualSense, false);
+        // Idle: Steam's pads only; one stands in for the built-in controls.
+        assert_eq!(names(vec![shadow()]), [DECK_NAME]);
+        assert_eq!(
+            names(vec![shadow(), ds(), shadow()]),
+            [DECK_NAME, "DualSense"]
+        );
+        // In session the raw 28DE:1205 is there, so every Steam pad is a shadow.
+        let raw = pad(DECK_NAME, GamepadPref::SteamDeck, false);
+        assert_eq!(names(vec![shadow(), raw, ds()]), [DECK_NAME, "DualSense"]);
+    }
+
+    #[test]
     fn an_explicit_setting_is_what_every_pad_declares() {
         assert_eq!(
             declared_kind(GamepadPref::DualShock4, GamepadPref::DualSense),
@@ -2600,6 +2727,7 @@ mod ds5_feedback_tests {
             (22, Ds5Feedback::LEFT_TRIGGER),
             (44, Ds5Feedback::PAD_LIGHTS),
             (45, Ds5Feedback::LED_RGB),
+            (9, Ds5Feedback::MIC_LED),
         ] {
             assert_eq!(payload, usb - 1, "payload offset for USB byte {usb}");
         }
@@ -2643,6 +2771,16 @@ mod ds5_feedback_tests {
         );
         let p = Ds5Feedback::player_packet(0b0000_0101);
         assert_eq!(p[Ds5Feedback::PAD_LIGHTS], 0b0000_0101);
+    }
+
+    /// SDL's `ucEnableBits2` 0x01 enables `ucMicLightMode`; nothing else is claimed.
+    #[test]
+    fn mic_led_sets_only_its_enable_bit_and_mode() {
+        let p = Ds5Feedback::mic_led_packet(2);
+        assert_eq!(p[1], 0x01, "valid_flag1 mic-mute LED bit");
+        assert_eq!(p[0], 0, "must not claim any valid_flag0 field");
+        assert_eq!(p[Ds5Feedback::MIC_LED], 2);
+        assert_eq!(p.iter().filter(|&&b| b != 0).count(), 2);
     }
 
     /// which 1 = R2, which 0 = L2; the RIGHT block sits first in the report.

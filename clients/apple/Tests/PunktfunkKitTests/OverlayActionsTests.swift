@@ -98,7 +98,7 @@ final class OverlayActionsTests: XCTestCase {
 
     func testSlotIdsAreStableStrings() {
         for id in [
-            "end_stream", "disconnect_linger", "touch_mode", "keyboard", "stats", "mic", "pad",
+            "end_stream", "end_game", "disconnect_linger", "touch_mode", "keyboard", "stats", "mic", "pad",
             "send_text", "guide", "qam", "pad_mouse", "host:power.reboot", "shortcut:s2",
         ] {
             XCTAssertEqual(SlotId.parse(id)?.id, id)

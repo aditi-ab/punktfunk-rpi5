@@ -1,4 +1,4 @@
-// Button glyphs for the gamepad UI's legends, for a controller that ISN'T currently attached.
+// Button glyphs for a legend, for a controller that ISN'T currently attached.
 //
 // While a pad is connected the truth is GameController's own `sfSymbolsName` on the live element —
 // nothing here competes with that. The problem this file solves is the other half of the time: the
@@ -35,7 +35,7 @@ public enum GamepadButtonRole: Sendable {
     case rightShoulder
 
     /// The role a `GCExtendedGamepad` key path names, so a caller that already spells its buttons
-    /// as key paths (every legend in the gamepad UI does — it reads `sfSymbolsName` off the live
+    /// as key paths (every legend does — it reads `sfSymbolsName` off the live
     /// element through one) can reach this table without restating itself. nil for any other
     /// button: the legends only ever name these six, and a role invented for, say, the menu button
     /// would have no honest glyph on half the families.
@@ -108,8 +108,8 @@ public enum GamepadGlyphs {
         // Xbox, the Steam pads (Deck included — its ABXY is the Xbox layout), and `.auto`, which
         // is what a client with no remembered pad has. Xbox letters double as the neutral default
         // because they ARE the positional names in `GCExtendedGamepad`.
-        case .auto, .xbox360, .xboxOne, .steamController, .steamDeck, .steamController2,
-             .steamController2Puck:
+        case .auto, .xbox360, .xboxOne, .xboxElite, .steamController, .steamDeck,
+             .steamController2, .steamController2Puck:
             switch role {
             case .a: return "a.circle"
             case .b: return "b.circle"

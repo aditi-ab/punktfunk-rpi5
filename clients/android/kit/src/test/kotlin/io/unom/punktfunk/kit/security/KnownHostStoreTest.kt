@@ -69,6 +69,17 @@ class KnownHostStoreTest {
         assertEquals(0, legacy.getJSONObject("game_presets").length())
     }
 
+    /** The console's sort stamps survive a round trip; a record without them reads back undated. */
+    @Test
+    fun addedAndLastUsedRoundTripAndDefaultNull() {
+        val plain = KnownHost("10.0.0.5", 9777, "HTPC", "a".repeat(64), true)
+        val back = KnownHostStore.decode(KnownHostStore.encode(plain))!!
+        assertEquals(null, back.addedAt)
+        assertEquals(null, back.lastUsed)
+        val stamped = plain.copy(addedAt = 1_700_000_000, lastUsed = 1_700_000_100)
+        assertEquals(stamped, KnownHostStore.decode(KnownHostStore.encode(stamped)))
+    }
+
     /** A record from before the rename keeps its bindings, and encoding writes both spellings. */
     @Test
     fun aPreRenameRecordKeepsItsBindings() {

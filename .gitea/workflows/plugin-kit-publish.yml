@@ -27,7 +27,7 @@ jobs:
   publish:
     runs-on: ubuntu-24.04
     container:
-      image: oven/bun:1
+      image: oven/bun:1.4.2
     timeout-minutes: 15
     steps:
       # oven/bun's slim base ships neither git, a CA bundle, nor node — actions/checkout's HTTPS

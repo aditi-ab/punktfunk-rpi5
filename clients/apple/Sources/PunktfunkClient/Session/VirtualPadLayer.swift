@@ -6,16 +6,18 @@
 // input rules as the Android `VirtualPad.kt` (`padControls`, `dpadBits`, `stickWire`,
 // `triggerWire` live in the kit).
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 import PunktfunkKit
 import PunktfunkShared
 import SwiftUI
 import UIKit
 
-/// The controller over the stream. Mounted only while the pad is shown (tenet 1).
+/// The controller over the stream. Mounted only while the pad is shown (tenet 1). `openRing`
+/// takes the ring button's centre in the layer's points.
 struct VirtualPadLayer: View {
     let config: PadConfig
     let wire: VirtualPadWire
+    let openRing: (CGPoint) -> Void
 
     var body: some View {
         GeometryReader { geo in
@@ -25,10 +27,12 @@ struct VirtualPadLayer: View {
                                        w: Float(geo.size.width / scale), h: Float(geo.size.height / scale))
                 .filter { !$0.hidden }
             ForEach(controls, id: \.id) { c in
-                PadControlHost(control: c, scale: scale, opacity: opacity, wire: wire)
+                let centre = CGPoint(x: (CGFloat(c.rect.x) + CGFloat(c.rect.w) / 2) * scale,
+                                     y: (CGFloat(c.rect.y) + CGFloat(c.rect.h) / 2) * scale)
+                PadControlHost(control: c, scale: scale, opacity: opacity, wire: wire,
+                               openRing: { openRing(centre) })
                     .frame(width: CGFloat(c.rect.w) * scale, height: CGFloat(c.rect.h) * scale)
-                    .position(x: (CGFloat(c.rect.x) + CGFloat(c.rect.w) / 2) * scale,
-                              y: (CGFloat(c.rect.y) + CGFloat(c.rect.h) / 2) * scale)
+                    .position(centre)
                     .accessibilityLabel(c.label)
             }
         }
@@ -44,6 +48,7 @@ struct PadControlHost: UIViewRepresentable {
     let opacity: CGFloat
     let wire: VirtualPadWire?
     var interactive = true
+    var openRing: (() -> Void)?
 
     func makeUIView(context: Context) -> PadControlUIView {
         PadControlUIView(control: control, scale: scale)
@@ -53,6 +58,7 @@ struct PadControlHost: UIViewRepresentable {
         view.control = control
         view.scale = scale
         view.wire = wire
+        view.openRing = openRing
         view.baseAlpha = opacity
         view.isUserInteractionEnabled = interactive
         view.refresh()
@@ -64,13 +70,14 @@ private let fillOn = UIColor(white: 1, alpha: 0.55)
 private let edge = UIColor(white: 1, alpha: 0.75)
 
 /// One control: its fingers, its wire state, and its drawing. Buttons and the D-pad resolve to a
-/// set of bits (the union over every finger, sent on change); a stick and a trigger are owned by
-/// their first finger.
+/// set of bits (the union over every finger, sent on change); a stick, a trigger and the ring
+/// button are owned by their first finger, and the ring button fires on a lift inside it.
 final class PadControlUIView: UIView {
     /// Refreshed by `updateUIView`: a tweak resizes a control mid-life without remaking it.
     var control: PadControl
     var scale: CGFloat
     var wire: VirtualPadWire?
+    var openRing: (() -> Void)?
     var baseAlpha: CGFloat = 0.45
 
     private var fingers: [ObjectIdentifier: UInt32] = [:]
@@ -86,7 +93,16 @@ final class PadControlUIView: UIView {
     private var pull: CGFloat = 0
     private var active = false
 
+    #if os(visionOS)
+    /// visionOS has no haptics, so the pad's tick is silent there.
+    private struct SilentTick {
+        func prepare() {}
+        func impactOccurred() {}
+    }
+    private static let tick = SilentTick()
+    #else
     private static let tick = UIImpactFeedbackGenerator(style: .light)
+    #endif
 
     /// Half the 1.5 pt stroke. A stroke is centred on its path, and the single discs, the
     /// D-pad cross and the trigger pill run their paths along the view's own edge — without
@@ -121,7 +137,10 @@ final class PadControlUIView: UIView {
         for t in touches { move(t, t.location(in: self)) }
     }
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-        for t in touches { up(t) }
+        for t in touches {
+            if case .ring = control.kind, t === owner, bounds.contains(t.location(in: self)) { openRing?() }
+            up(t)
+        }
     }
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         for t in touches { up(t) }
@@ -146,6 +165,12 @@ final class PadControlUIView: UIView {
             owner = t
             Self.tick.impactOccurred()
             emitTrigger(p.y)
+        case .ring:
+            guard owner == nil else { return }
+            owner = t
+            Self.tick.impactOccurred()
+            active = true
+            refresh()
         }
     }
 
@@ -161,6 +186,8 @@ final class PadControlUIView: UIView {
         case .trigger:
             guard t === owner else { return }
             emitTrigger(p.y)
+        case .ring:
+            break
         }
     }
 
@@ -177,6 +204,11 @@ final class PadControlUIView: UIView {
             guard t === owner else { return }
             owner = nil
             emitTrigger(0)
+        case .ring:
+            guard t === owner else { return }
+            owner = nil
+            active = false
+            refresh()
         }
     }
 
@@ -187,6 +219,7 @@ final class PadControlUIView: UIView {
         case .buttons, .dpad: sync()
         case .stick: emitStick(.zero)
         case .trigger: emitTrigger(0)
+        case .ring: active = false
         }
     }
 
@@ -207,7 +240,7 @@ final class PadControlUIView: UIView {
         case .dpad:
             let c = bounds.width / 2
             return dpadBits(dx: Float(p.x - c), dy: Float(p.y - c), dead: VirtualPad.dpadDead * Float(scale) * control.sc)
-        case .stick, .trigger:
+        case .stick, .trigger, .ring:
             return 0
         }
     }
@@ -318,6 +351,14 @@ final class PadControlUIView: UIView {
             pill.lineWidth = 1.5
             pill.stroke()
             glyph(axis == GamepadWire.axisLT ? "LT" : "RT", at: CGPoint(x: bounds.midX, y: bounds.midY), size: 15 * scale * CGFloat(control.sc))
+        case .ring:
+            let circle = UIBezierPath(ovalIn: bounds.insetBy(dx: Self.strokeInset, dy: Self.strokeInset))
+            (active ? fillOn : fill).setFill()
+            circle.fill()
+            edge.setStroke()
+            circle.lineWidth = 1.5
+            circle.stroke()
+            glyph("•••", at: CGPoint(x: bounds.midX, y: bounds.midY), size: bounds.width * 0.3)
         }
     }
 

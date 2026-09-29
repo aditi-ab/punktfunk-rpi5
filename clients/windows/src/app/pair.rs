@@ -6,8 +6,7 @@ use super::connect::{connect, request_access};
 use super::lucide;
 use super::style::*;
 use super::{Screen, Svc};
-use crate::trust::{self, KnownHost, KnownHosts};
-use punktfunk_core::client::NativeClient;
+use crate::trust;
 use windows_reactor::*;
 
 pub(crate) fn pair_page(props: &Svc, cx: &mut RenderCx) -> Element {
@@ -40,31 +39,28 @@ pub(crate) fn pair_page(props: &Svc, cx: &mut RenderCx) -> Element {
                 let (ctx3, ss, st, target3) =
                     (ctx2.clone(), ss.clone(), st.clone(), target2.clone());
                 std::thread::spawn(move || {
-                    let name =
-                        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "windows-client".into());
-                    match NativeClient::pair(
+                    match trust::pair_with_host(
                         &target3.addr,
                         target3.port,
-                        (&ctx3.identity.0, &ctx3.identity.1),
+                        &ctx3.identity,
                         &pin,
-                        &name,
-                        std::time::Duration::from_secs(90),
+                        &trust::device_name(),
                     ) {
                         Ok(fp) => {
-                            // The PIN ceremony is an authorised trust decision, so this also
-                            // retires a dead record for the same address (a re-keyed host).
-                            let mut k = KnownHosts::load();
-                            k.upsert_trusted(KnownHost {
-                                name: target3.name.clone(),
-                                addr: target3.addr.clone(),
-                                port: target3.port,
-                                fp_hex: trust::hex(&fp),
-                                paired: true,
-                                mac: target3.mac.clone(),
-                                ..Default::default()
-                            });
-                            let _ = k.save();
+                            let saved = trust::persist_host(
+                                &target3.name,
+                                &target3.addr,
+                                target3.port,
+                                &trust::hex(&fp),
+                                true,
+                                &target3.mac,
+                            );
                             connect(&ctx3, &target3, Some(fp), &ss, &st);
+                            // After `connect`, which clears the status line. The stream runs
+                            // on the pin in memory; the next launch asks for a PIN again.
+                            if let Err(e) = saved {
+                                st.call(format!("Paired, but couldn't save — {e:#}"));
+                            }
                         }
                         Err(e) => {
                             // Cause-specific: wrong PIN vs pairing-not-armed vs unreachable —

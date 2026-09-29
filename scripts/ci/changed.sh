@@ -37,11 +37,13 @@ classify() {
             case "$path" in
                 .cargo/*|Cargo.toml|Cargo.lock|rust-toolchain.toml|rustfmt.toml|\
                 crates/*|tools/*|clients/cli/*|clients/linux/*|clients/probe/*|clients/session/*|\
-                clients/shared/*|clients/android/native/*|include/*|api/openapi.json|\
-                data/platforms.json|ci/rust-ci.Dockerfile|\
+                clients/shared/*|clients/android/native/*|clients/apple/native/*|include/*|\
+                api/openapi.json|\
+                data/platforms.json|ci/rust-ci.Dockerfile|web/src/lib/command-execution.ts|\
                 scripts/ci/ensure-sccache.sh|scripts/ci/install-retrying-curl.sh|\
                 scripts/ci/check-installer-behavior.sh|scripts/ci/check-install-defaults.sh|\
                 scripts/ci/check-unsafe-hygiene.sh|\
+                scripts/ci/check-workflow-paths.py|scripts/ci/cargo_graph.py|\
                 scripts/gen-third-party-notices.sh|scripts/gen-third-party-notices.py|\
                 about.toml|about.hbs|\
                 assets/os-icons/LICENSES/*|assets/launcher-icons/LICENSES/*|\
@@ -54,9 +56,9 @@ classify() {
             case "$path" in
                 .cargo/*|Cargo.toml|Cargo.lock|rust-toolchain.toml|rustfmt.toml|\
                 clients/linux/*|clients/session/*|clients/shared/*|\
-                crates/punktfunk-core/*|\
+                crates/punktfunk-core/*|crates/punktfunk-ffi/*|\
                 crates/pf-bitstream/*|crates/pf-client-core/*|crates/pf-console-ui/*|\
-                crates/pf-dxvadec/*|crates/pf-libva/*|crates/pf-presenter/*|\
+                crates/pf-dmabuf/*|crates/pf-dxvadec/*|crates/pf-libva/*|crates/pf-presenter/*|\
                 crates/pf-update-check/*|crates/pf-vaapi/*|crates/pf-vkdecode/*|\
                 crates/pyrowave-sys/*|ci/rust-ci-arm64cross.Dockerfile|\
                 scripts/ci/ensure-sccache.sh|scripts/ci/install-retrying-curl.sh)
@@ -64,7 +66,10 @@ classify() {
                     ;;
             esac
             case "$path" in
-                web/*|api/openapi.json|scripts/ci/retry.sh)
+                web/*|api/openapi.json|scripts/ci/retry.sh|clients/shared/library-id-vectors.json|\
+                crates/punktfunk-host/src/library/custom.rs|\
+                crates/punktfunk-core/testdata/grant-vectors.json|\
+                crates/punktfunk-core/testdata/gamepad-button-vectors.json)
                     web=true
                     ;;
             esac
@@ -74,7 +79,8 @@ classify() {
                     ;;
             esac
             case "$path" in
-                sdk/*|plugin-kit/*|api/openapi.json|scripts/ci/retry.sh)
+                sdk/*|plugin-kit/*|api/openapi.json|scripts/ci/retry.sh|\
+                clients/shared/library-id-vectors.json)
                     sdk_plugin_kit=true
                     ;;
             esac
@@ -121,6 +127,9 @@ self_test() {
     # (cargo-ndk, android cfg) does not stand in for that.
     check android-native 'clients/android/native/src/lib.rs' \
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    # The console header's drift gate runs in the rust job.
+    check apple-console 'clients/apple/native/src/console.rs' \
+        'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     check notice-config 'about.toml' \
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     check notice-template 'about.hbs' \
@@ -131,10 +140,23 @@ self_test() {
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     check notice-generator 'scripts/gen-third-party-notices.py' \
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    check workflow-paths 'scripts/ci/cargo_graph.py' \
+        'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     check notice-license 'assets/os-icons/LICENSES/simple-icons.txt' \
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     check client-shared 'clients/shared/deeplink-vectors.json' \
         'rust=true rust_arm64=true web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    check library-id-vectors 'clients/shared/library-id-vectors.json' \
+        'rust=true rust_arm64=true web=true docs_site=false sdk_plugin_kit=true decky_typecheck=false'
+    # The host's unprivileged launch kinds and the console's copy: each side's test reads the other.
+    check launch-kinds-console 'web/src/lib/command-execution.ts' \
+        'rust=true rust_arm64=false web=true docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    check launch-kinds-host 'crates/punktfunk-host/src/library/custom.rs' \
+        'rust=true rust_arm64=false web=true docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    check grant-vectors 'crates/punktfunk-core/testdata/grant-vectors.json' \
+        'rust=true rust_arm64=true web=true docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    check gamepad-button-vectors 'crates/punktfunk-core/testdata/gamepad-button-vectors.json' \
+        'rust=true rust_arm64=true web=true docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     check openapi 'api/openapi.json' \
         'rust=true rust_arm64=false web=true docs_site=false sdk_plugin_kit=true decky_typecheck=false'
     check platforms 'data/platforms.json' \

@@ -13,6 +13,9 @@ use super::video::{FrameType, VideoPacketizer};
 use super::VIDEO_PORT;
 use crate::capture::{self, Capturer, FastSyntheticCapturer};
 use crate::encode::{self, Codec};
+use crate::encode_recovery::{
+    EncoderWatchdog, RebuildBudget, MAX_CAPTURE_REBUILDS, MAX_ENCODER_RESETS,
+};
 use anyhow::{Context, Result};
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,15 +55,15 @@ pub type PooledCapturer = (Box<dyn Capturer>, bool, bool, Option<String>);
 pub type CapturerSlot = Arc<std::sync::Mutex<Option<PooledCapturer>>>;
 
 /// A pending client reference-frame-invalidation range (lost `firstFrame..=lastFrame`), set by the
-/// control plane and drained by the video thread (see [`AppState::rfi_range`](super::AppState)).
+/// control plane and drained by the video thread (see [`AppState::rfi_range`](crate::host::AppState::rfi_range)).
 pub type RfiSlot = Arc<std::sync::Mutex<Option<(i64, i64)>>>;
 
 /// Game-lifetime wiring spent by the stream thread (`design/session-game-lifetime.md`).
 /// The control plane builds these from live `AppState` at RTSP PLAY; they only exist together.
 pub struct GameLifetime {
-    /// [`super::AppState::quit`]: a decision may end the game; a drop gets a reconnect window.
+    /// [`crate::host::AppState::quit`]: a decision may end the game; a drop gets a reconnect window.
     pub quit: Arc<AtomicBool>,
-    /// [`super::AppState::preempted`]: the stop flag admission raises on a steal.
+    /// [`super::GsState::preempted`]: the stop flag admission raises on a steal.
     pub preempted: Arc<AtomicBool>,
     /// Paired client's cert fingerprint; only it can reclaim the launch. `None` if unread.
     pub fingerprint: Option<String>,
@@ -129,11 +132,13 @@ pub fn start(
                 fingerprint: life.fingerprint.clone(),
                 launch: app.as_ref().map(|a| a.title.clone()),
                 plane: crate::events::Plane::Gamestream,
+                preset: None,
             });
             let event_client = crate::events::ClientRef {
                 name: client_label.clone(),
                 fingerprint: life.fingerprint.clone(),
                 plane: crate::events::Plane::Gamestream,
+                preset: None,
             };
             crate::events::emit(crate::events::EventKind::ClientConnected {
                 client: event_client.clone(),
@@ -226,11 +231,11 @@ pub fn start(
             if let Err(e) = result {
                 tracing::error!(error = %format!("{e:#}"), "video stream failed");
             }
-            // `session.ended` before the stream and client events, as the native loop orders them.
+            // `session.ended`, then the stream marker, then `client.disconnected`. Native emits
+            // its disconnect from the connection task, so there it can come first.
             drop(live_session);
             running.store(false, Ordering::SeqCst);
             *video_hdr.lock().unwrap() = None;
-            // Before `client.disconnected` — native loop event order.
             drop(stream_marker);
             crate::events::emit(crate::events::EventKind::ClientDisconnected {
                 client: event_client,
@@ -287,35 +292,16 @@ fn run(
 
     // Not pooled: a reconnect at a different resolution needs a freshly-sized output.
     if pf_host_config::config().video_source.as_deref() == Some("virtual") {
-        // Before prep, source, and launch — a later stamp would reject the process it is meant to find.
-        let fresh_stamp = crate::gamelease::launch_clock();
         let target = resolve_gs_app(app);
-        // Moonlight has no resume; relaunch must reprieve the leftover game before anything starts.
-        if let Some(t) = target.as_ref() {
-            let reprieved =
-                crate::gamelease::readopt(life.fingerprint.as_deref(), t.game.id.as_deref());
-            if !reprieved.is_empty() {
-                tracing::info!(
-                    reprieved = reprieved.len(),
-                    title = %t.game.title,
-                    "gamestream: this client came back for its game — keeping it"
-                );
-            }
-        }
-        // Do not start a second copy or mint a stamp the running game could never satisfy.
-        // Anonymous / no library id is unrecordable.
-        let launch_claim = target.as_ref().map(|t| {
-            crate::launchreg::claim(
-                life.fingerprint.as_deref(),
-                t.game.id.as_deref(),
-                t.launcher,
-                fresh_stamp,
-            )
-        });
-        let launch_stamp = launch_claim.as_ref().map_or(fresh_stamp, |c| c.stamp());
-        let adopt_launch = launch_claim.as_ref().is_some_and(|c| !c.must_spawn());
-        // Before the virtual output opens: HDR toggle / sink switch must land first.
-        // Guard drop undoes in reverse, including panic-unwind.
+        // RTSP carries no device name; the peer IP is the stats-capture label too.
+        let owner = crate::session_launch::LaunchOwner {
+            client: client_label.clone(),
+            fingerprint: life.fingerprint.clone(),
+            plane: crate::events::Plane::Gamestream,
+            preset: None,
+        };
+        // The entry's own `apps.json` prep, then its library entry's. `PF_APP_TITLE` and the
+        // `PF_STREAM_*` names the native plane's prep env and the marker file use.
         let mut prep_cmds = app.map(|a| a.prep.clone()).unwrap_or_default();
         if let Some(lib_id) = app.and_then(|a| a.library_id.as_deref()) {
             prep_cmds.extend(crate::library::prep_for(lib_id));
@@ -324,17 +310,29 @@ fn run(
             "PF_APP_TITLE".to_string(),
             app.map(|a| a.title.clone()).unwrap_or_default(),
         )];
-        // Same `PF_STREAM_*` names as the native plane's prep env and the marker file.
         prep_env.extend(crate::hooks::prep_mode_env(
             cfg.width, cfg.height, cfg.fps, cfg.hdr,
         ));
-        let _prep = (!prep_cmds.is_empty()).then(|| crate::hooks::run_prep(&prep_cmds, &prep_env));
+        // Moonlight has no resume, so a relaunch is what reprieves the leftover game.
+        let crate::session_launch::Prepared {
+            claim: launch_claim,
+            stamp: launch_stamp,
+            prep: _prep,
+        } = crate::session_launch::prepare(target.as_ref(), &owner, &prep_cmds, &prep_env);
         // Re-runnable: the encode loop calls it again on a mid-stream capture loss.
-        let (mut capturer, compositor, gamescope_route) =
-            open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit)?;
-        // Only Linux `launch_is_nested` reads it; gamescope does not exist on Windows.
+        let GsSource {
+            mut capturer,
+            compositor,
+            route: gamescope_route,
+            nested_launch_started,
+            #[cfg(target_os = "linux")]
+            seat,
+            #[cfg(target_os = "linux")]
+            lease,
+        } = open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit, true)?;
+        // Only Linux `launch_is_nested` reads them; gamescope does not exist on Windows.
         #[cfg(not(target_os = "linux"))]
-        let _ = &gamescope_route;
+        let _ = (&gamescope_route, nested_launch_started);
         // GameStream holds a real display; without this, Windows `admit` budgets cannot see it.
         // `None` identity is the anonymous slot. Dropped at the end of `run`.
         let _admission_guard = crate::vdisplay::admission::register(
@@ -357,160 +355,46 @@ fn run(
             "video source: virtual display (native client resolution)"
         );
         // Launch now that capture is live, for backends that do not nest via `set_launch_command`.
-        // Library id wins over an operator-typed `cmd`. Skip spawn when `adopt_launch`.
-        #[allow(unused_mut)]
-        let mut spawned_now = false;
-        // Windows pid for the lease. `None` when nothing spawned, or the spawn only forwards.
-        #[allow(unused_mut)]
-        let mut spawned_pid: Option<u32> = None;
-        // `GameOnNewLaunch`: Moonlight is cert-paired, so the fingerprint keys the same records.
-        if !adopt_launch {
-            if let Some(t) = target.as_ref() {
-                crate::gamelease::end_others_for_new_launch(
-                    life.fingerprint.as_deref(),
-                    t.game.id.as_deref(),
-                );
-            }
-        }
-        #[cfg(windows)]
-        if let Some(t) = target.as_ref() {
-            if adopt_launch {
-                tracing::info!(
-                    title = %t.game.title,
-                    "gamestream: this client's copy of this title is already running — not starting \
-                     a second one"
-                );
-            } else {
-                let launched = match (t.game.id.as_deref(), t.command.as_deref()) {
-                    (Some(id), _) => crate::library::launch_gamestream_library(id).map(Some),
-                    (None, Some(cmd)) => crate::library::launch_gamestream_command(cmd).map(Some),
-                    (None, None) => Ok(None),
-                };
-                match launched {
-                    Ok(l) => {
-                        spawned_pid = l.and_then(|l| l.tracked_pid());
-                        spawned_now = true;
-                    }
-                    Err(e) => {
-                        tracing::warn!(title = %t.game.title, error = %e, "gamestream: app not launched")
-                    }
-                }
-            }
-        }
-        // Keep the child: it is the liveness signal and the termination-ladder handle.
-        // Gamescope bare-spawn already nested the command; launching again would start it twice.
-        // Workspace this launch owns on the streamed head; handed to the lease, which
-        // releases it when the game is done.
-        #[cfg(target_os = "linux")]
-        let mut launch_workspace: Option<crate::vdisplay::WorkspaceClaim> = None;
-        #[cfg(target_os = "linux")]
-        let spawned_launch = match target.as_ref().and_then(|t| t.command.as_deref()) {
-            Some(cmd) if adopt_launch => {
-                tracing::info!(
-                    command = %cmd,
-                    "gamestream: this client's copy of this title is already running — not starting \
-                     a second one"
-                );
-                // The claim belongs to the launch, not to us: go back to the game's
-                // workspace rather than opening an empty one beside it.
-                launch_workspace = launch_claim
-                    .as_ref()
-                    .and_then(|c| c.workspace())
-                    .and_then(|ws| crate::library::adopt_launch_workspace(compositor, ws));
-                None
-            }
-            Some(_) if crate::vdisplay::launch_is_nested(compositor, gamescope_route.as_ref()) => {
-                spawned_now = true;
-                None
-            }
-            Some(cmd) => {
-                let own = target.as_ref().is_some_and(|t| t.own_workspace);
-                match crate::library::launch_session_command(compositor, cmd, None, own, None) {
-                    Ok(mut spawned) => {
-                        spawned_now = true;
-                        launch_workspace = spawned.workspace.take();
-                        Some(spawned)
-                    }
-                    Err(e) => {
-                        tracing::warn!(command = %cmd, error = %e, "gamestream: app not launched");
-                        None
-                    }
-                }
-            }
-            None => None,
-        };
-        if let Some(c) = launch_claim.as_ref() {
-            if spawned_now {
-                c.launched();
-                if let Some(id) = c.credits() {
-                    crate::library::record_launch(id);
-                }
-            } else if c.must_spawn() {
-                c.abandon();
-            }
-            // On the record, not on the session: the next reconnect focuses it.
+        let spawned = crate::session_launch::spawn(
+            target.as_ref(),
+            &owner,
+            launch_claim.as_ref(),
             #[cfg(target_os = "linux")]
-            if let Some(ws) = launch_workspace.as_ref() {
-                c.placed(ws.id());
-            }
-        }
+            crate::session_launch::SpawnAt {
+                compositor,
+                nested_spawn: crate::vdisplay::launch_is_nested(
+                    compositor,
+                    gamescope_route.as_ref(),
+                ) && nested_launch_started,
+                seat: seat.as_deref(),
+                steam_home: None,
+            },
+        );
 
         // Exit ends the session; session end can end the game only if asked, and a drop waits
         // the reconnect window (`design/session-game-lifetime.md`).
         let _game_life = target.as_ref().map(|t| {
-            #[cfg(target_os = "linux")]
-            let nested = crate::vdisplay::launch_is_nested(compositor, gamescope_route.as_ref());
-            #[cfg(not(target_os = "linux"))]
-            let nested = false;
-            #[cfg(target_os = "linux")]
-            let child = spawned_launch.map(|s| (s.child, s.group_leader));
-            #[cfg(not(target_os = "linux"))]
-            let child = None;
-
-            let on_exit: crate::gamelease::OnExit = {
-                let on_game_exit = life.on_game_exit.clone();
-                Box::new(move || {
-                    // Read at fire time so a mid-session flip takes effect. The lease still runs.
-                    if !crate::session_settings::get().session_on_game_exit {
-                        tracing::info!(
-                            "the launched game exited, but ending the session on game exit is off — \
-                             leaving the stream up"
-                        );
-                        return;
-                    }
-                    tracing::info!("the launched game exited — ending the session");
-                    // Skip keep-alive linger so the next `/launch` starts clean.
-                    on_game_exit();
-                })
-            };
-            let lease = crate::gamelease::open(
-                crate::gamelease::LeaseRequest {
-                    game: t.game.clone(),
-                    // RTSP carries no device name; peer IP is the stats-capture label too.
-                    client: client_label.clone(),
-                    fingerprint: life.fingerprint.clone(),
-                    plane: crate::events::Plane::Gamestream,
-                    spec: t.detect.clone(),
-                    // Native plane only: this one has no per-session head to
-                    // watch, so a Moonlight launch keeps the `running` stage.
-                    window: None,
-                    nested,
-                    // No pool generation on this plane, and a GameStream session never isolates,
-                    // so there is no sibling seat to be confused with.
-                    scope_pid: None,
-                    launcher: t.launcher,
-                    child,
-                    spawned: spawned_pid,
-                    launch_stamp,
-                    // Adopted launch keeps the original slot across the handover.
-                    procs: launch_claim.as_ref().and_then(|c| c.procs()),
+            let on_game_exit = life.on_game_exit.clone();
+            let on_exit = crate::session_launch::end_on_game_exit(move || {
+                tracing::info!("the launched game exited — ending the session");
+                // Skip keep-alive linger so the next `/launch` starts clean.
+                on_game_exit();
+            });
+            let lease = crate::session_launch::lease(
+                t,
+                &owner,
+                launch_stamp,
+                launch_claim.as_ref(),
+                spawned,
+                // No per-session head to watch, no pool generation, no control channel of
+                // ours: a Moonlight launch keeps the `running` stage, never isolates, and its
+                // launch findings stay in the log.
+                crate::session_launch::LeaseExtras {
                     #[cfg(target_os = "linux")]
-                    workspace: launch_workspace,
-                    // Moonlight has no control channel of ours to say it on; the
-                    // finding stays in the log, as it did before.
-                    outcome: None,
+                    nested: crate::vdisplay::launch_is_nested(compositor, gamescope_route.as_ref()),
+                    ..Default::default()
                 },
-                on_exit,
+                Box::new(on_exit),
             );
             // Drops first so the console does not briefly show live and `grace` rows together.
             let published = crate::session_status::publish_gamestream_game(lease.shared());
@@ -525,16 +409,44 @@ fn run(
                 ),
             )
         });
-        // Re-detect the live compositor so a Desktop↔Game switch is followed in place.
-        // WxH is locked at ANNOUNCE — a resolution change cannot follow mid-stream.
-        let rebuild =
-            || open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit).map(|(c, _, _)| c);
+        // The output the stream captures now, for a re-attach after a loss that leaves it up.
+        #[cfg(target_os = "linux")]
+        let attached = std::cell::RefCell::new((compositor, gamescope_route.clone(), lease));
+        // A handed-back keepalive re-attaches to its output first: on KWin every create is a new
+        // virtual output, and a burst of them wedges the compositor. Otherwise re-detect the live
+        // compositor so a Desktop↔Game switch is followed. WxH is locked at ANNOUNCE.
+        let rebuild = |keepalive: Option<Box<dyn Send>>| {
+            #[cfg(target_os = "linux")]
+            if let Some(keepalive) = keepalive {
+                let (c, route, lease) = attached.borrow().clone();
+                if let Some(lease) = lease {
+                    match gs_capture_output(lease.into_output(keepalive), &cfg, c, route.as_ref()) {
+                        Ok(capturer) => {
+                            tracing::info!(
+                                "gamestream: capture loss — re-attached to the live output, no new \
+                                 display"
+                            );
+                            return Ok((capturer, gs_cursor_blend(c, route.as_ref(), &cfg)));
+                        }
+                        Err(e) => tracing::warn!(error = %format!("{e:#}"),
+                            "gamestream: re-attach to the live output failed — creating another"),
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = keepalive;
+            let s = open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit, false)?;
+            let blend = gs_cursor_blend(s.compositor, s.route.as_ref(), &cfg);
+            #[cfg(target_os = "linux")]
+            {
+                *attached.borrow_mut() = (s.compositor, s.route, s.lease);
+            }
+            Ok((s.capturer, blend))
+        };
         return stream_body(
             &mut capturer,
             Some(&rebuild),
-            // Gamescope capture carries no cursor either way; Mutter embed never paints.
-            compositor != crate::vdisplay::Compositor::Gamescope
-                && blend_capable_metadata_cursor(&cfg),
+            gs_cursor_blend(compositor, gamescope_route.as_ref(), &cfg),
             &sock,
             cfg,
             running,
@@ -552,7 +464,14 @@ fn run(
     }
 
     // Reuse gated on HDR + cursor mode + pin. Depth is a PipeWire-negotiation property;
-    // mismatch needs a fresh session. Embed the pointer unless this backend composites it.
+    // mismatch needs a fresh session. The pointer follows the compositor that is up now.
+    #[cfg(target_os = "linux")]
+    let metadata_cursor =
+        match crate::vdisplay::compositor_for_kind(crate::vdisplay::detect_active_session().kind) {
+            Some(c) => host_composites_metadata_cursor(c, &cfg),
+            None => blend_capable_metadata_cursor(&cfg),
+        };
+    #[cfg(not(target_os = "linux"))]
     let metadata_cursor = blend_capable_metadata_cursor(&cfg);
     // Host-wide pin: without this, Moonlight gets whichever head the portal hands back.
     #[cfg(target_os = "linux")]
@@ -661,15 +580,13 @@ fn open_gs_mirror_source(
     metadata_cursor: bool,
 ) -> Result<Box<dyn Capturer>> {
     // Enumerate against the compositor that is up now — Desktop↔Game may have switched.
-    let active = crate::vdisplay::detect_active_session();
-    crate::vdisplay::observe_session_instance(&active);
-    crate::vdisplay::apply_session_env(&active);
-    let compositor = crate::vdisplay::compositor_for_kind(active.kind)
-        .map(Ok)
-        .unwrap_or_else(crate::vdisplay::detect)
-        .context("detect compositor")?;
-    // Mirror streams an existing head: no gamescope sub-mode, no route.
-    crate::inject::set_backend_id(crate::vdisplay::input_backend_id(compositor));
+    // Mirror streams an existing head: no gamescope sub-mode, and no session to stand up.
+    let (compositor, _) = crate::compositor_route::resolve_compositor(
+        punktfunk_core::config::CompositorPref::Auto,
+        false,
+        false,
+        false,
+    )?;
     let mut vd = crate::vdisplay::open_mirror(compositor, connector)?;
     vd.set_hw_cursor(metadata_cursor);
     // Panel runs at the owner's mode; the client scales. Pass the client's anyway.
@@ -694,33 +611,13 @@ fn open_gs_mirror_source(
     .context("attach a capturer to the mirrored monitor")
 }
 
-/// Resolved launch: lease identity, detect signals, and the command to run.
-struct GsApp {
-    game: crate::gamelease::GameRef,
-    /// Launcher tile, not a game — the lease stays untracked ([`crate::library::LaunchTarget`]).
-    launcher: bool,
-    detect: crate::library::DetectSpec,
-    /// `Some` on Linux (host runs it). `None` for a Windows library title (launch by id).
-    command: Option<String>,
-    /// Own workspace on the streamed head ([`crate::library::LaunchTarget`]).
-    own_workspace: bool,
-}
-
 /// Resolve a `/launch` catalog entry against the host's own library. The client sends only
 /// an appid. `None` = nothing to launch (Desktop, or an unresolvable entry).
-fn resolve_gs_app(app: Option<&super::apps::AppEntry>) -> Option<GsApp> {
+fn resolve_gs_app(app: Option<&super::apps::AppEntry>) -> Option<crate::library::LaunchTarget> {
     let app = app?;
     if let Some(id) = app.library_id.as_deref() {
         match crate::library::resolve_launch(id) {
-            Some(t) => {
-                return Some(GsApp {
-                    game: t.game,
-                    launcher: t.launcher,
-                    detect: t.detect,
-                    command: t.command,
-                    own_workspace: t.own_workspace,
-                })
-            }
+            Some(t) => return Some(t),
             None => tracing::warn!(
                 launch_id = id,
                 "requested launch id not in this host's library (or no launch recipe) — ignoring"
@@ -732,7 +629,7 @@ fn resolve_gs_app(app: Option<&super::apps::AppEntry>) -> Option<GsApp> {
         .as_deref()
         .map(str::trim)
         .filter(|c| !c.is_empty())?;
-    Some(GsApp {
+    Some(crate::library::LaunchTarget {
         launcher: false,
         game: crate::gamelease::GameRef {
             id: None,
@@ -747,17 +644,44 @@ fn resolve_gs_app(app: Option<&super::apps::AppEntry>) -> Option<GsApp> {
         command: Some(cmd.to_string()),
         // A bare `apps.json` command names no entry, so the host default decides.
         own_workspace: crate::library::OnWindow::default().own_workspace(),
+        on_window: crate::library::OnWindow::default(),
     })
 }
 
+/// Cursor-as-metadata only where the encoder composites `frame.cursor` and the compositor
+/// cannot embed the pointer itself. Gamescope carries no metadata cursor either way. Shared by
+/// `set_hw_cursor`, the pooled mirror and [`gs_cursor_blend`] so they cannot drift.
+fn host_composites_metadata_cursor(
+    compositor: crate::vdisplay::Compositor,
+    cfg: &StreamConfig,
+) -> bool {
+    compositor != crate::vdisplay::Compositor::Gamescope
+        && !crate::session_plan::compositor_embeds_pointer(compositor)
+        && blend_capable_metadata_cursor(cfg)
+}
+
+/// The encoder draws the pointer: a metadata cursor the compositor cannot embed, or gamescope's
+/// XFixes pointer when its node carries none. One rule for the plan, the reader and `stream_body`.
+fn gs_cursor_blend(
+    compositor: crate::vdisplay::Compositor,
+    route: Option<&crate::vdisplay::GamescopeRoute>,
+    cfg: &StreamConfig,
+) -> bool {
+    host_composites_metadata_cursor(compositor, cfg)
+        || crate::session_plan::gamescope_cursor_for(
+            compositor == crate::vdisplay::Compositor::Gamescope,
+            route,
+        )
+}
+
 /// Cursor-as-metadata only where this session's encode backend composites `frame.cursor`.
-/// Shared by the mirror and virtual-output sources so `set_hw_cursor` and `stream_body`'s
-/// blend flag cannot drift. GameStream has no cursor channel.
+/// The answer when no compositor is known; [`host_composites_metadata_cursor`] adds the
+/// compositor. GameStream has no cursor channel.
 fn blend_capable_metadata_cursor(cfg: &StreamConfig) -> bool {
     #[cfg(target_os = "linux")]
     {
         let cuda_planned = !crate::encode::linux_zero_copy_is_vaapi() && crate::zerocopy::enabled();
-        crate::encode::cursor_blend_capable(cfg.codec, cuda_planned, cfg.hdr)
+        crate::encode::cursor_blend_capable(cfg.codec, cuda_planned, cfg.hdr, cfg.hdr)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -766,60 +690,56 @@ fn blend_capable_metadata_cursor(cfg: &StreamConfig) -> bool {
     }
 }
 
-/// Virtual-display source at the client's mode. Re-run on mid-stream capture loss to follow a
+/// An opened virtual source.
+struct GsSource {
+    capturer: Box<dyn Capturer>,
+    compositor: crate::vdisplay::Compositor,
+    route: Option<crate::vdisplay::GamescopeRoute>,
+    /// This acquire spawned gamescope with the launch as its primary child. A keep-alive reuse
+    /// spawned nothing.
+    nested_launch_started: bool,
+    /// The gamescope seat a launch that did not nest goes to. `None` off a gamescope spawn.
+    #[cfg(target_os = "linux")]
+    seat: Option<String>,
+    /// The output, for a re-attach after a capture loss that leaves it up. `None` for a portal fd.
+    #[cfg(target_os = "linux")]
+    lease: Option<crate::capture::OutputLease>,
+}
+
+/// Virtual-display source at the client's mode. The app's own `compositor` wins; otherwise the
+/// native plane's [`crate::compositor_route::resolve_compositor`] picks, pin included. Only a
+/// connect (`revive`) may revive a session. Re-run on mid-stream capture loss to follow a
 /// Desktop↔Game switch. Does not launch the app — a rebuild must not re-spawn it. The capturer
 /// owns the output keepalive; the factory is dropped here.
 fn open_gs_virtual_source(
     cfg: StreamConfig,
     app: Option<&super::apps::AppEntry>,
     // Resolved once by the caller so a rebuild cannot re-resolve to something different.
-    launch: Option<&GsApp>,
+    launch: Option<&crate::library::LaunchTarget>,
     quit: &Arc<AtomicBool>,
-) -> Result<(
-    Box<dyn Capturer>,
-    crate::vdisplay::Compositor,
-    Option<crate::vdisplay::GamescopeRoute>,
-)> {
+    revive: bool,
+) -> Result<GsSource> {
     let (compositor, gamescope_route) = if let Some(c) = app.and_then(|a| a.compositor) {
         // Still resolve a route, or `create` falls through to a bare spawn on a managed box.
         let r = crate::vdisplay::resolve_gamescope_route(c, false);
         (c, r)
     } else {
-        // Windows has one backend; skip Linux `detect()`, which bails there.
-        #[cfg(target_os = "windows")]
-        {
-            (crate::vdisplay::Compositor::Windows, None)
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            crate::vdisplay::cancel_pending_tv_restore();
-            let active = crate::vdisplay::detect_active_session();
-            // Fold an idle-time Game↔Desktop instance change into the epoch before acquire.
-            crate::vdisplay::observe_session_instance(&active);
-            crate::vdisplay::apply_session_env(&active);
-            // Gate on a resolved command so an unresolvable entry falls back to auto routing.
-            // Host policy only: a Moonlight cert is not a console device, same as admission.
-            let has_launch = launch.and_then(|t| t.command.as_deref()).is_some();
-            if crate::vdisplay::wants_dedicated_game_session(has_launch, None) {
-                let c = crate::vdisplay::Compositor::Gamescope;
-                crate::inject::set_backend_id(crate::vdisplay::input_backend_id(c));
-                (c, crate::vdisplay::resolve_gamescope_route(c, true))
-            } else {
-                let c = crate::vdisplay::compositor_for_kind(active.kind)
-                    .map(Ok)
-                    .unwrap_or_else(crate::vdisplay::detect)
-                    .context("detect compositor")?;
-                crate::inject::set_backend_id(crate::vdisplay::input_backend_id(c));
-                (c, crate::vdisplay::resolve_gamescope_route(c, false))
-            }
-        }
+        // Gate on a resolved command so an unresolvable entry falls back to auto routing.
+        // Host policy only: a Moonlight cert is not a console device, same as admission.
+        let has_launch = launch.and_then(|t| t.command.as_deref()).is_some();
+        // No per-session injector on this plane: input always takes the shared backend.
+        crate::compositor_route::resolve_compositor(
+            punktfunk_core::config::CompositorPref::Auto,
+            crate::vdisplay::wants_dedicated_game_session(has_launch, None),
+            false,
+            revive,
+        )?
     };
     let mut vd = crate::vdisplay::open(compositor).context("open virtual display")?;
-    // Mutter virtual never paints an embedded pointer. Gamescope stays off: no metadata
-    // either way, and the request would cost the native-NV12 shape for nothing.
-    vd.set_hw_cursor(
-        compositor != crate::vdisplay::Compositor::Gamescope && blend_capable_metadata_cursor(&cfg),
-    );
+    vd.set_hw_cursor(host_composites_metadata_cursor(compositor, &cfg));
+    // gamescope takes its HDR flags and display-reuse key from this. An HDR plan captures PQ
+    // only, so without it an SDR gamescope streams SDR inside a PQ container.
+    vd.set_hdr(cfg.hdr);
     // Per-session, not a process-global env: concurrent sessions must not stomp launch targets.
     vd.set_launch_command(launch.and_then(|t| t.command.clone()));
     // Same reason: a process env let either plane retarget the other's `create`.
@@ -844,11 +764,35 @@ fn open_gs_virtual_source(
         None,
     )
     .context("create virtual output at client resolution")?;
-    // Linux virtual-output capture is SDR-only (Mutter RecordVirtual); HDR is portal mirror.
-    let plan = gs_session_plan(
-        &cfg,
-        compositor != crate::vdisplay::Compositor::Gamescope && blend_capable_metadata_cursor(&cfg),
-    );
+    let nested_launch_started = vd.nested_launch_started();
+    #[cfg(target_os = "linux")]
+    let seat = vout.seat.clone();
+    #[cfg(target_os = "linux")]
+    let lease = crate::capture::OutputLease::of(&vout);
+    let capturer = gs_capture_output(vout, &cfg, compositor, gamescope_route.as_ref())?;
+    Ok(GsSource {
+        capturer,
+        compositor,
+        route: gamescope_route,
+        nested_launch_started,
+        #[cfg(target_os = "linux")]
+        seat,
+        #[cfg(target_os = "linux")]
+        lease,
+    })
+}
+
+/// An active capturer on `vout` at this session's plan. On gamescope it also blends the XFixes
+/// pointer when the node carries none.
+fn gs_capture_output(
+    vout: crate::vdisplay::VirtualOutput,
+    cfg: &StreamConfig,
+    compositor: crate::vdisplay::Compositor,
+    route: Option<&crate::vdisplay::GamescopeRoute>,
+) -> Result<Box<dyn Capturer>> {
+    let plan = gs_session_plan(cfg, gs_cursor_blend(compositor, route, cfg));
+    #[cfg(target_os = "linux")]
+    let cursor_seat = vout.seat.clone();
     let mut capturer = capture::capture_virtual_output(
         vout,
         capture::VirtualCaptureRequest {
@@ -860,8 +804,17 @@ fn open_gs_virtual_source(
         },
     )
     .context("capture virtual output")?;
+    #[cfg(target_os = "linux")]
+    if crate::session_plan::gamescope_cursor_for(
+        compositor == crate::vdisplay::Compositor::Gamescope,
+        route,
+    ) {
+        capturer.attach_gamescope_cursor(Arc::new(move || {
+            pf_vdisplay::gamescope_xwayland_cursor_targets(cursor_seat.as_deref())
+        }));
+    }
     capturer.set_active(true);
-    Ok((capturer, compositor, gamescope_route))
+    Ok(capturer)
 }
 
 /// Shared [`SessionPlan`](crate::session_plan::SessionPlan) at this plane's shape: 4:2:0,
@@ -1149,14 +1102,16 @@ fn spawn_sender(
     Ok(())
 }
 
-use crate::send_pacing::percentile;
-
 /// Ignore further IDR requests after emitting one. Floor is 100 ms: `frame_interval * 2` is
 /// 16.7 ms at 120 fps, while a client under loss re-asks every ~30 ms — every request would
 /// pass and the IDR storm would feed the loss that prompts the next request.
 fn keyframe_coalesce_window(frame_interval: Duration) -> Duration {
     (frame_interval * 2).max(Duration::from_millis(100))
 }
+
+/// Re-opens the virtual source on capture loss: the new capturer and its `cursor_blend`. Takes
+/// the old capturer's keepalive when the loss left its display up.
+type GsRebuild<'a> = &'a dyn Fn(Option<Box<dyn Send>>) -> Result<(Box<dyn Capturer>, bool)>;
 
 /// Encode loop over a borrowed capturer. Send is a dedicated thread so a send spike cannot
 /// stall capture/encode.
@@ -1165,9 +1120,9 @@ fn stream_body(
     // `&mut Box` so a capture-loss rebuild can swap the capturer in place.
     capturer: &mut Box<dyn Capturer>,
     // Virtual-display: re-open on capture loss. `None` for portal/synthetic — propagate.
-    rebuild: Option<&dyn Fn() -> Result<Box<dyn Capturer>>>,
+    rebuild: Option<GsRebuild<'_>>,
     // Encoder composites cursor bitmaps. `false` = pointer is embedded (or absent).
-    cursor_blend: bool,
+    mut cursor_blend: bool,
     sock: &UdpSocket,
     cfg: StreamConfig,
     running: &Arc<AtomicBool>,
@@ -1216,7 +1171,7 @@ fn stream_body(
     // with Moonlight across in-place rebuilds (an internal counter would desync).
     let mut au_seq: u32 = 0;
     let mut enc_inflight: u32 = 0;
-    let plan = gs_session_plan(&cfg, cursor_blend);
+    let mut plan = gs_session_plan(&cfg, cursor_blend);
     let mut enc = gs_open_encoder(
         &plan,
         &**capturer,
@@ -1292,13 +1247,8 @@ fn stream_body(
         (0u128, 0u128, 0u128, 0u128, 0u32);
     let codec_name = cfg.codec.label();
     let mut sid: Option<(u64, u32)> = None;
-    // Windows driver: the per-tick present → arrival lump and the pool's drops.
-    let mut v_driver: Vec<u32> = Vec::new();
-    let mut driver_path = false;
-    // The driver's own split of that lump, once it stamps its slots.
-    let (mut v_pool, mut v_denc, mut v_ipc): (Vec<u32>, Vec<u32>, Vec<u32>) =
-        (Vec::new(), Vec::new(), Vec::new());
-    let mut driver_split = false;
+    // Windows driver: its own stages per tick, and the pool's drops.
+    let mut driver = crate::stats_recorder::DriverStages::default();
     let mut last_driver_dropped: u64 = 0;
     let (mut v_cap, mut v_enc, mut v_pkt, mut v_send): (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -1310,13 +1260,9 @@ fn stream_body(
     let mut supports_rfi = enc.caps().supports_rfi;
 
     // A delivered frame clears this; a permanently dead source ends the stream after the cap.
-    const MAX_REBUILDS: u32 = 5;
     let mut rebuilds: u32 = 0;
-    // Submit/poll failure or a silent stall rebuilds in place (native `reset_stalled_encoder`).
-    // `last_au_at` is the silent-wedge watchdog: poll returning `None` forever never errors.
-    const MAX_ENCODER_RESETS: u32 = 5;
-    let mut encoder_resets: u32 = 0;
-    let mut last_au_at = Instant::now();
+    // Submit/poll failure or a stall rebuilds in place (native `reset_stalled_encoder`).
+    let mut watchdog = EncoderWatchdog::new();
 
     // Without RFI each request is a full IDR. One IDR resolves pending loss; NVENC
     // invalidate is never rate-limited.
@@ -1361,38 +1307,31 @@ fn stream_body(
                     return Err(e).context("capture frame");
                 };
                 rebuilds += 1;
-                if rebuilds > MAX_REBUILDS {
+                if rebuilds > MAX_CAPTURE_REBUILDS {
                     return Err(e).context("capture lost — rebuild attempts exhausted");
                 }
                 tracing::warn!(error = %format!("{e:#}"), rebuild = rebuilds,
                     "gamestream: capture lost — rebuilding source in place (following a session switch)");
-                // Attach-only holdoff: right after a capture loss the session detection can still
-                // be STALE, and a rebuild acting on a stale "Gaming" answer restarts
-                // gamescope-session.target — on SteamOS that steals the seat back from the session
-                // the user just switched to. Until it lapses, builds attach to live outputs only.
-                const PROBE_HOLDOFF: Duration = Duration::from_secs(4);
-                // A managed/attach gamescope (re)launch legitimately takes up to 45 s (the Steam
-                // Big Picture cold start), so a flat 40 s expires INSIDE the first attempt — a
-                // single-shot failure where a second, warm attempt would have succeeded.
-                // `detect_active_session` answers `none` off Linux, where gamescope does not exist.
-                let loss_at = Instant::now();
-                let budget = if crate::vdisplay::compositor_for_kind(
+                // The budget follows the session live at the loss; `detect_active_session`
+                // answers `none` off Linux, where gamescope does not exist.
+                let budget = RebuildBudget::start();
+                let live = crate::vdisplay::compositor_for_kind(
                     crate::vdisplay::detect_active_session().kind,
-                ) == Some(crate::vdisplay::Compositor::Gamescope)
-                {
-                    Duration::from_secs(100)
-                } else {
-                    Duration::from_secs(40)
-                };
-                let rebuild_deadline = loss_at + budget;
+                );
+                // The import side broke under a live display: re-attach instead of creating one.
+                let mut keepalive = e
+                    .downcast_ref::<pf_capture::DisplayStillAlive>()
+                    .and_then(|_| capturer.take_keepalive());
                 let new_cap = loop {
-                    let _probe = (loss_at.elapsed() < PROBE_HOLDOFF)
-                        .then(crate::vdisplay::rebuild_probe_scope);
-                    match rebuild() {
-                        Ok(c) => break c,
+                    let _probe = budget.probe_scope();
+                    match rebuild(keepalive.take()) {
+                        Ok((c, blend)) => {
+                            cursor_blend = blend;
+                            plan = gs_session_plan(&cfg, blend);
+                            break c;
+                        }
                         Err(e2) => {
-                            if !running.load(Ordering::SeqCst) || Instant::now() >= rebuild_deadline
-                            {
+                            if !running.load(Ordering::SeqCst) || budget.expired(live) {
                                 return Err(e2)
                                     .context("capture lost — no source within the rebuild budget");
                             }
@@ -1423,11 +1362,22 @@ fn stream_body(
                 next_frame = Instant::now();
                 // Old encoder died with in-flight AUs; numbering restarts at `au_seq`.
                 enc_inflight = 0;
+                watchdog.on_au();
                 tracing::info!("gamestream: source rebuilt — stream continues");
                 continue;
             }
         }
         let t_cap = tick.elapsed();
+        // Blend the live pointer, not the one this frame was captured with: a still desktop
+        // repeats its frame while pointer-only buffers (Mutter) or XFixes move it.
+        #[cfg(target_os = "linux")]
+        if cursor_blend {
+            capturer.set_cursor_forward(false);
+            frame.cursor = capturer.cursor();
+        }
+        if frame.cursor.as_ref().is_some_and(|c| !c.visible) {
+            frame.cursor = None;
+        }
         // Source changed size/format with nothing negotiating it. The encoder cannot follow a
         // resolution change in place; reopen at the delivered size. GameStream has no mid-stream
         // mode message — the client is not told.
@@ -1458,18 +1408,14 @@ fn stream_body(
                     last_keyframe = Some(Instant::now());
                     // Old encoder died with in-flight AUs; numbering restarts at `au_seq`.
                     enc_inflight = 0;
-                    encoder_resets = 0;
-                    last_au_at = Instant::now();
+                    watchdog.on_au();
                 }
                 Err(e) => {
                     // First failed open is a settling driver; spend the shared reset budget.
-                    encoder_resets += 1;
-                    if encoder_resets > MAX_ENCODER_RESETS {
+                    let Some(backoff) = watchdog.spend(frame_interval) else {
                         return Err(e).context("reopen encoder at the source's new mode");
-                    }
-                    let backoff = frame_interval
-                        .max(Duration::from_millis(100u64 << (encoder_resets - 1).min(4)));
-                    tracing::warn!(error = %format!("{e:#}"), reset = encoder_resets,
+                    };
+                    tracing::warn!(error = %format!("{e:#}"), reset = watchdog.resets(),
                         max = MAX_ENCODER_RESETS,
                         "gamestream: reopening the encoder at the source's new mode failed — retrying");
                     next_frame = Instant::now() + backoff;
@@ -1489,6 +1435,10 @@ fn stream_body(
             }
         }
         if force_idr.swap(false, Ordering::SeqCst) {
+            want_keyframe = true;
+        }
+        // A re-held PipeWire buffer may have torn the reference the encoder last read.
+        if capturer.take_reference_risk() {
             want_keyframe = true;
         }
         if want_keyframe {
@@ -1526,27 +1476,22 @@ fn stream_body(
             None => enc.submit_indexed(&frame, au_seq.wrapping_add(enc_inflight)),
         };
         if let Err(e) = submitted {
-            encoder_resets += 1;
-            if encoder_resets > MAX_ENCODER_RESETS || !enc.reset() {
+            let Some(backoff) = watchdog.recover(frame_interval, || enc.reset()) else {
                 tracing::error!(
                     error = %format!("{e:#}"),
-                    resets = encoder_resets,
+                    resets = watchdog.resets(),
                     "encoder did not recover after repeated in-place rebuilds — ending the \
                      stream (see the error above for the cause)"
                 );
                 return Err(e).context("encoder submit");
-            }
+            };
             // Owed AUs died with the discarded state. IDR bypasses coalesce: the client must resync.
             enc_inflight = 0;
             enc.request_keyframe();
             last_keyframe = Some(Instant::now());
-            last_au_at = Instant::now();
-            tracing::warn!(error = %format!("{e:#}"), reset = encoder_resets,
+            tracing::warn!(error = %format!("{e:#}"), reset = watchdog.resets(),
                 max = MAX_ENCODER_RESETS,
                 "encoder submit failed — encoder rebuilt in place, forcing an IDR");
-            // Five instant retries burn out inside one driver hiccup.
-            let backoff =
-                frame_interval.max(Duration::from_millis(100u64 << (encoder_resets - 1).min(4)));
             next_frame = Instant::now() + backoff;
             std::thread::sleep(backoff);
             continue;
@@ -1576,8 +1521,7 @@ fn stream_body(
             let idx = au_seq.wrapping_add(aus.len() as u32);
             aus.push((au.data, ft, idx));
             enc_inflight = enc_inflight.saturating_sub(1);
-            last_au_at = Instant::now();
-            encoder_resets = 0;
+            watchdog.on_au();
         }
         let t_pkt = tick.elapsed();
 
@@ -1613,30 +1557,27 @@ fn stream_body(
                 }
             }
         }
-        // Poll error, or no AU while frames are owed. Window scales so low-fps cannot false-trip.
-        let stall_window = Duration::from_secs(2).max(frame_interval * 8);
-        if poll_err.is_some() || (enc_inflight > 0 && last_au_at.elapsed() >= stall_window) {
+        // Poll error, or the shared stall rule. The driver path drains at depth 1.
+        let depth = if owed.is_some() {
+            1
+        } else {
+            capturer.pipeline_depth().max(1)
+        };
+        let stalled = watchdog.stalled(enc_inflight as usize, depth, frame_interval);
+        if poll_err.is_some() || stalled.is_some() {
             let why = match &poll_err {
                 Some(e) => format!("poll failed: {e:#}"),
-                None => format!(
-                    "no AU for {} ms with {} frame(s) owed",
-                    last_au_at.elapsed().as_millis(),
-                    enc_inflight
-                ),
+                None => stalled.unwrap_or_default(),
             };
-            encoder_resets += 1;
-            if encoder_resets > MAX_ENCODER_RESETS || !enc.reset() {
+            let Some(backoff) = watchdog.recover(frame_interval, || enc.reset()) else {
                 return Err(poll_err.unwrap_or_else(|| anyhow::anyhow!("{why}")))
                     .context("encoder stalled — in-place rebuild unavailable or exhausted");
-            }
+            };
             enc_inflight = 0;
             enc.request_keyframe();
             last_keyframe = Some(Instant::now());
-            last_au_at = Instant::now();
-            tracing::warn!(reset = encoder_resets, max = MAX_ENCODER_RESETS, %why,
+            tracing::warn!(reset = watchdog.resets(), max = MAX_ENCODER_RESETS, %why,
                 "encode stall detected — encoder rebuilt in place, forcing an IDR");
-            let backoff =
-                frame_interval.max(Duration::from_millis(100u64 << (encoder_resets - 1).min(4)));
             next_frame = Instant::now() + backoff;
             std::thread::sleep(backoff);
             continue;
@@ -1657,18 +1598,9 @@ fn stream_body(
             v_pkt.push(poll_us as u32);
             v_send.push(enqueue_us as u32);
             if owed.is_some() {
-                driver_path = true;
-                let us = |d: Duration| d.as_micros().min(u128::from(u32::MAX)) as u32;
-                let t = enc.telemetry();
-                match t.as_ref().and_then(|t| t.driver_split) {
-                    Some(s) => {
-                        driver_split = true;
-                        v_pool.extend(s.pool.map(us));
-                        v_denc.push(us(s.encode));
-                        v_ipc.push(us(s.ipc));
-                    }
-                    None => v_driver.extend(t.and_then(|t| t.present_to_arrival).map(us)),
-                }
+                driver.note(crate::stats_recorder::DriverSample::from_telemetry(
+                    enc.telemetry().as_ref(),
+                ));
             }
         }
 
@@ -1702,53 +1634,35 @@ fn stream_body(
                 .map_or(last_driver_dropped, |t| t.dropped_total);
             // The host sees no receiver loss, FEC recovery or EAGAIN here: those stay absent.
             if stats.is_armed() {
-                let capture_gen = stats.generation();
-                let session_id = match sid {
-                    Some((g, id)) if g == capture_gen => id,
-                    _ => {
-                        let id = stats.register_session(
-                            "gamestream",
-                            cfg.width,
-                            cfg.height,
-                            cfg.fps,
-                            codec_name,
-                            client_label,
-                        );
-                        sid = Some((capture_gen, id));
-                        id
-                    }
-                };
-                let stage = |name: &str, v: &mut Vec<u32>| crate::stats_recorder::StageTiming {
-                    name: name.into(),
-                    p50_us: percentile(v, 0.50) as f32,
-                    p99_us: percentile(v, 0.99) as f32,
-                };
+                let session_id = stats.session_id(&mut sid, || {
+                    stats.register_session(
+                        "gamestream",
+                        cfg.width,
+                        cfg.height,
+                        cfg.fps,
+                        codec_name,
+                        client_label,
+                    )
+                });
+                use crate::stats_recorder::stage;
                 // On the driver, `capture` is host bookkeeping and `encode` the wait for the
-                // driver's next AU: its own stamps replace both, or its lump when it has none.
-                let stages = if driver_split {
-                    vec![
-                        stage("pool", &mut v_pool),
-                        stage("encode", &mut v_denc),
-                        stage("ipc", &mut v_ipc),
-                        stage("copy", &mut v_pkt),
-                        stage("send", &mut v_send),
-                        stage("send_spread", &mut v_spread),
-                    ]
-                } else if driver_path {
-                    vec![
-                        stage("driver", &mut v_driver),
-                        stage("copy", &mut v_pkt),
-                        stage("send", &mut v_send),
-                        stage("send_spread", &mut v_spread),
-                    ]
-                } else {
-                    vec![
+                // driver's next AU: its own stages replace both.
+                let stages = match driver.stages() {
+                    Some(mut s) => {
+                        s.extend([
+                            stage("copy", &mut v_pkt),
+                            stage("send", &mut v_send),
+                            stage("send_spread", &mut v_spread),
+                        ]);
+                        s
+                    }
+                    None => vec![
                         stage("capture", &mut v_cap),
                         stage("encode", &mut v_enc),
                         stage("packetize", &mut v_pkt),
                         stage("send", &mut v_send),
                         stage("send_spread", &mut v_spread),
-                    ]
+                    ],
                 };
                 let queue_drops = dropped_batches.saturating_sub(last_dropped_batches);
                 let pool_drops = driver_dropped.saturating_sub(last_driver_dropped);
@@ -1777,12 +1691,7 @@ fn stream_body(
                 stats.push_sample(session_id, sample);
             }
             last_driver_dropped = driver_dropped;
-            v_driver.clear();
-            driver_path = false;
-            v_pool.clear();
-            v_denc.clear();
-            v_ipc.clear();
-            driver_split = false;
+            driver.reset();
             // Wire never exceeds the live budget. A refused in-place retarget disables
             // adaptation: raising FEC with a frozen encoder rate would overshoot.
             if adapt_supported && gs_adapt_enabled() {
@@ -1865,11 +1774,12 @@ fn gs_encoder_bps(bitrate_kbps: u32, fec_pct: u8, packet_size: usize) -> u64 {
     video.max(500_000)
 }
 
-/// `PUNKTFUNK_GS_ADAPT=0` pins the GameStream plane's loss adaptation off — FEC percent and
-/// wire budget stay at their configured values for the whole session (the A/B lever).
+/// `PUNKTFUNK_GAMESTREAM_ADAPT` off pins the GameStream plane's loss adaptation off — FEC
+/// percent and wire budget stay at their configured values for the whole session (the A/B
+/// lever). A restart-class row, so the first read holds.
 fn gs_adapt_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| pf_host_config::knob("PUNKTFUNK_GAMESTREAM_ADAPT").as_deref() != Some("0"))
+    *ON.get_or_init(|| pf_host_config::row_bool("PUNKTFUNK_GAMESTREAM_ADAPT"))
 }
 
 /// Loss-driven FEC percent and wire budget, stepped ~1 s from client `0x0201` reports.

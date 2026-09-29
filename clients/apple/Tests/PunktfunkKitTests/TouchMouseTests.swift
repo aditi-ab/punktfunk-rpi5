@@ -1,4 +1,4 @@
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 import XCTest
 
 @testable import PunktfunkKit
@@ -11,6 +11,7 @@ final class TouchMouseTests: XCTestCase {
         XCTAssertEqual(TouchInputMode(rawValue: "trackpad"), .trackpad)
         XCTAssertEqual(TouchInputMode(rawValue: "pointer"), .pointer)
         XCTAssertEqual(TouchInputMode(rawValue: "touch"), .touch)
+        XCTAssertEqual(TouchInputMode(rawValue: "off"), .off)
         // Unknown/unset values must fall back to trackpad — never crash or go touch-silent.
         XCTAssertNil(TouchInputMode(rawValue: "bogus"))
     }

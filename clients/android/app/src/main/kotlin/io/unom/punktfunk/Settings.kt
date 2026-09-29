@@ -133,13 +133,22 @@ data class Settings(
      * carries it.
      */
     val advancedStats: Boolean = false,
+    /** The stats overlay's corner, a cross-client `hud_placement` name; "" = top left. */
+    val hudPlacement: String = "",
+    /** The stats overlay's size in percent, on top of the display density. The overlay only. */
+    val statsScalePct: Int = 100,
+    /** Show how to leave for a few seconds when a stream starts. */
+    val exitHint: Boolean = true,
+    /** Settings show their advanced rows. Hiding a row keeps its value. */
+    val showAdvanced: Boolean = false,
     /**
      * Touch input model — how touchscreen fingers drive the host. [TouchMode.TRACKPAD] (default):
      * the cursor stays put on touch-down and moves by the finger's relative delta (swipe to nudge,
      * lift and re-swipe to walk it across), tap to click where it is. [TouchMode.POINTER]: the
      * cursor jumps to the finger (direct pointing). [TouchMode.TOUCH]: real multi-touch
      * passthrough — every finger reaches the host as a touchscreen contact, for apps/games that
-     * understand touch. Mirrors the Apple client's TouchInputMode.
+     * understand touch. [TouchMode.OFF]: fingers reach the host as nothing; the ring twist and
+     * the three-finger gestures still work. Mirrors the Apple client's TouchInputMode.
      */
     val touchMode: TouchMode = TouchMode.TRACKPAD,
     /**
@@ -180,14 +189,9 @@ data class Settings(
      */
     val gamepadUiMode: String = GAMEPAD_UI_WHEN_CONNECTED,
     /**
-     * Which colour family the console (gamepad) UI's living backdrop drifts through — the
-     * cross-client `ui_palette` key: `"violet"` (the brand default), then `"oled"`, `"nebula"`,
-     * `"abyss"`, `"ember"`, `"moss"`, `"graphite"`, then the six pale fields. See
-     * [GamepadPalette], whose table and maths mirror the desktop console's and the Apple
-     * client's under the same names. Presentation only: nothing
-     * about a stream depends on it, so it is a device preference and never part of a preset.
-     * An unknown value reads as the default rather than failing — a newer client may have shipped
-     * a palette this build doesn't know.
+     * The console's backdrop palette — the cross-client `ui_palette` key, named by the table in
+     * `pf-console-ui`'s `theme.rs`. A device preference, never part of a preset. An unknown value
+     * reads as the default: a newer client may have shipped a palette this build doesn't know.
      */
     val uiPalette: String = "violet",
     /**
@@ -242,7 +246,7 @@ data class Settings(
      * Opt-in: ALSO play the rumble the host addresses to controller 1 (wire pad 0) on this
      * phone's own vibration motor — for clip-on gamepads that ship without rumble motors, where
      * the phone body is the only actuator in the player's hands. Off by default; read once per
-     * session by StreamScreen (it hands GamepadFeedback the device vibrator only when set). The
+     * session by StreamScreen. A motorless built-in pad rumbles through the body either way. The
      * toggle is hidden on devices without a vibrator (TVs), where this would be a silent no-op.
      */
     val rumbleOnPhone: Boolean = false,
@@ -342,7 +346,7 @@ data class Settings(
 )
 
 /** [Settings.touchMode] values; persisted by name. */
-enum class TouchMode { TRACKPAD, POINTER, TOUCH }
+enum class TouchMode { TRACKPAD, POINTER, TOUCH, OFF }
 
 /**
  * How a physical mouse drives the host — the cross-client mouse model (the Rust `MouseMode`,
@@ -654,6 +658,18 @@ object Resolutions {
         if (w <= 0 || h <= 0) return null
         val shape = w.toDouble() / h
         return ASPECTS.indexOfFirst { kotlin.math.abs(shape / it.shape - 1) < TOLERANCE }.takeIf { it >= 0 }
+    }
+
+    /** Smallest stream mode the host accepts, per side. */
+    const val MIN_WIDTH = 320
+    const val MIN_HEIGHT = 200
+
+    /** A typed `w`×`h` as a mode the host takes: each side at least [MIN_WIDTH]×[MIN_HEIGHT], at
+     * most the codec's per-side ceiling, then floored even. Twin of
+     * `punktfunk_core::resolutions::custom`. */
+    fun custom(w: Int, h: Int, codec: String): Pair<Int, Int> {
+        val cap = RenderScale.maxDimension(codec)
+        return w.coerceIn(MIN_WIDTH, cap) / 2 * 2 to h.coerceIn(MIN_HEIGHT, cap) / 2 * 2
     }
 
     /** The size in family [aspect] nearest in height to [h]; native (`0` or a sentinel) looks for
@@ -974,6 +990,17 @@ val COMPOSITOR_OPTIONS = listOf(
 /** (verbosity, label) for the stats-overlay detail picker. Order = the live 3-finger-tap cycle. */
 val STATS_VERBOSITY_OPTIONS = StatsVerbosity.entries.map { it to it.label }
 
+/** (cross-client `hud_placement` name, label) — core's `HudCorner`. */
+val HUD_PLACEMENT_OPTIONS = listOf(
+    "topLeading" to "Top left",
+    "topTrailing" to "Top right",
+    "bottomLeading" to "Bottom left",
+    "bottomTrailing" to "Bottom right",
+)
+
+/** The overlay's size in percent — core's `STATS_SCALE_PCTS`. */
+val STATS_SCALE_OPTIONS = listOf(75, 100, 125, 150, 175, 200).map { it to "$it %" }
+
 /** [Settings.presentPriority] as the wire int `nativeStartVideo` takes (0 = latency, 1 = smooth).
  * Unrecognized values resolve to latency — same rule as the Apple client. */
 fun Settings.presentPriorityWire(): Int = if (presentPriority == "smooth") 1 else 0
@@ -1020,6 +1047,7 @@ val TOUCH_MODE_OPTIONS = listOf(
     TouchMode.TRACKPAD to "Trackpad",
     TouchMode.POINTER to "Direct pointer",
     TouchMode.TOUCH to "Touch passthrough",
+    TouchMode.OFF to "Off",
 )
 
 /** (mode, label) for the physical-mouse model. */

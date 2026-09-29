@@ -1,8 +1,29 @@
 # Raspberry Pi 5 client
 
 The RPi5 fork is a standalone Punktfunk client for 64-bit Raspberry Pi 5 Linux
-systems. StreamOS uses it, but the binaries do not require StreamOS services or
-libraries.
+systems. Choose a complete kiosk image or a portable client bundle from
+[GitHub Releases](https://github.com/aditi-ab/punktfunk-rpi5/releases/latest).
+
+## Install the kiosk image
+
+Download the release's `punktfunk-<release>-rpi5-kiosk.img.xz`, matching
+`.img.sha256`, `.img.packages.txt`, and `.img.build.txt` files into one directory.
+The checksum file covers the compressed image and both reports. Verify all files:
+
+```sh
+sha256sum --check punktfunk-*-rpi5-kiosk.img.sha256
+```
+
+Use Raspberry Pi Imager's **Use custom** option to write the `.img.xz` to your
+chosen microSD card or USB drive. Writing replaces the contents of that drive.
+Connect HDMI, Ethernet, and a USB controller or keyboard, then boot the Pi 5.
+The image starts Punktfunk directly; pair a host from the home screen. Ethernet
+uses DHCP. Bluetooth controllers can be paired from Settings after first boot.
+Remote login is disabled by default and no shared login credentials are supplied.
+
+The image contains the portable bundle built from the same release tag and commit,
+a Raspberry Pi OS Lite system, Weston, the Pi graphics drivers, PipeWire, and BlueZ.
+The build report records the base image, source commit, and bundle checksum.
 
 ## Supported baseline
 
@@ -27,15 +48,16 @@ Download the archive and its `.sha256` file from the GitHub release. Verify it
 before extracting:
 
 ```sh
-sha256sum --check punktfunk-0.39.0-rpi5.1-linux-arm64.tar.gz.sha256
-tar -xzf punktfunk-0.39.0-rpi5.1-linux-arm64.tar.gz
-cd punktfunk-0.39.0-rpi5.1-linux-arm64
+read -r -p 'Archive filename: ' archive
+sha256sum --check "${archive}.sha256"
+tar -xzf "$archive"
+cd "${archive%.tar.gz}"
 sudo ./install.sh
 ```
 
 The installer places the self-contained runtime in `/opt/punktfunk-rpi5` and
 creates links in `/usr/local/bin`. It does not install or modify compositor,
-PipeWire, kernel, controller, or StreamOS configuration.
+PipeWire, kernel, or controller configuration.
 
 Use `punktfunk --help` for discovery, pairing, library, and streaming commands.
 Force the Pi decoder while validating the hardware path with:
@@ -53,34 +75,6 @@ PUNKTFUNK_DECODER=v4l2-request RUST_LOG=info punktfunk stream HOST
 
 ## Build locally
 
-On Windows with Docker Desktop, create a local candidate tag at the commit to be
-tested and run the ARM64 release container:
-
-```powershell
-git tag -a v0.39.0-rpi5.1-local.1 -m "Local Raspberry Pi 5 release test"
-./packaging/rpi5/build-release-local.ps1 v0.39.0-rpi5.1-local.1
-```
-
-The container runs as ARM64 even on an x86-64 workstation and mirrors the
-Debian Bookworm build environment used by GitHub Actions. Named Docker volumes
-retain Cargo downloads and compiled dependencies between isolated test runs. On
-an ARM64 Linux host, install the packages listed in
-`.github/workflows/rpi5-release.yml` and run:
-
-```sh
-packaging/rpi5/build-release.sh v0.39.0-rpi5.1 dist
-```
-
-The script checks out the tag into a temporary tree, builds the pinned Raspberry
-Pi FFmpeg fork, builds the CLI and Vulkan session renderer, applies relative
-runtime paths, verifies that bundled SDL exposes the Wayland video driver, checks
-dynamic dependencies, and emits a reproducible archive plus SHA-256 file. Building
-requires no StreamOS checkout.
-
-## StreamOS consumption
-
-StreamOS may download and verify this same archive during its image build, then
-copy the extracted directory to `/opt/streamos-shell/punktfunk`. Alternatively,
-it may build the tagged source with the same pinned FFmpeg revision. StreamOS
-continues to own its real-time PipeWire settings, compositor policy, readiness
-detection, controller forwarding, and global quit monitor.
+See [fork maintenance](rpi5-fork.md) for the ARM64 release bundle, complete image
+builder, verification steps, and tag-based GitHub release workflow. The bundle and
+kiosk image are built entirely from this repository.

@@ -18,6 +18,7 @@
 //! `PUNKTFUNK_DECODER=native-vaapi`. Evidence: `video::native_evidence` and the
 //! ignored tests in this file.
 
+use std::os::fd::AsFd as _;
 use std::os::fd::FromRawFd as _;
 use std::os::fd::OwnedFd;
 use std::os::raw::c_int;
@@ -36,6 +37,7 @@ use crate::video::DmabufPlane;
 use crate::video::DrmFrameGuard;
 use crate::video::StreamFormat;
 use crate::video_color::ColorDesc;
+use crate::video_types::trim_deliverable;
 
 /// `PUNKTFUNK_DECODER=native-vaapi`. Skips the vendor order so a box that would
 /// pick Vulkan first can still reach this rung; gating the pin would make the
@@ -364,29 +366,6 @@ fn max_deliverable(s: &Session) -> usize {
     s.shape.max_dpb_frames
 }
 
-/// First drop in full, then a heartbeat (~every 5 s at 60 fps). A drop-every-AU
-/// shape would bury the log at frame rate.
-const DROP_WARN_EVERY: u64 = 300;
-
-/// Drop oldest first after this AU's own frame is taken off the front, so `cap`
-/// bounds carry-over. Trimming before the take would invert display order inside
-/// one AU. Returned frames drop via [`VaFrameGuard`]; the caller counts first.
-fn trim_deliverable(
-    queue: &mut std::collections::VecDeque<DmabufFrame>,
-    cap: usize,
-) -> Vec<DmabufFrame> {
-    let mut dropped = Vec::new();
-    while queue.len() > cap {
-        match queue.pop_front() {
-            Some(frame) => dropped.push(frame),
-            // `len() > cap` means non-empty. Break, not `expect`: a bound of 0
-            // on an empty queue must not panic in the decode path.
-            None => break,
-        }
-    }
-    dropped
-}
-
 pub(crate) struct NativeVaapiDecoder {
     display: Display,
     planner: Planner,
@@ -402,6 +381,25 @@ pub(crate) struct NativeVaapiDecoder {
     release_rx: mpsc::Receiver<VaRelease>,
     /// Releases for a retired generation. Counted so the outstanding log stays honest.
     stale_releases: u64,
+}
+
+/// Does the node this rung would open for `presenter_vendor` decode AV1 Profile 0?
+/// Opens and closes a display, so callers ask once and keep the answer.
+pub(crate) fn av1_decodable(presenter_vendor: u32) -> bool {
+    let answer = pf_vaapi::profile_for(pf_vaapi::Codec::Av1, 1, 8)
+        .map_err(|e| anyhow!("{e}"))
+        .and_then(|profile| {
+            let va = Libva::load().context("libva")?;
+            Display::open_for_vendor(va, Some(presenter_vendor))?.require_entrypoint(profile.value)
+        });
+    match &answer {
+        Ok(()) => tracing::info!("the presenter's VAAPI node decodes AV1"),
+        Err(e) => tracing::info!(
+            reason = %format!("{e:#}"),
+            "the presenter's VAAPI node does not decode AV1"
+        ),
+    }
+    answer.is_ok()
 }
 
 impl NativeVaapiDecoder {
@@ -481,7 +479,8 @@ impl NativeVaapiDecoder {
 
     /// One AU in, at most one frame out. Surplus waits in [`Self::deliverable`].
     /// `Ok(None)` is not an error: buffering, concealment (re-anchor, not demotion),
-    /// HEVC RASL skip (8.1.3 NOTE — must not re-anchor), or no session yet.
+    /// HEVC RASL skip (8.1.3 NOTE — must not re-anchor), the idle wait for an IDR
+    /// (re-anchor, no verdict), or no session yet.
     pub(crate) fn decode(&mut self, au: &[u8]) -> Result<Option<DmabufFrame>> {
         self.drain_releases();
         let result = match self.planner {
@@ -493,11 +492,14 @@ impl NativeVaapiDecoder {
         // One verdict, here. Damage is reported by the codec arm; a failure after a
         // clean plan is a refusal only — not also a clean AU that would reset the run.
         match &result {
-            Ok((_, damaged)) => self.health.note(*damaged, false, 0),
+            Ok(Some((_, damaged))) => self.health.note(*damaged, false, 0),
+            Ok(None) => {}
             Err(_) => self.health.note(false, true, 0),
         }
         // Codec arms return exported frames only on `Ok`; an error never reaches the queue.
-        let (fresh, damaged) = result?;
+        let Some((fresh, damaged)) = result? else {
+            return Ok(None);
+        };
         if damaged {
             // Do not drain the queue. Shipping here reports `delivered` on a concealed
             // AU and zeros the demotion streak (`delivered || !concealed`).
@@ -512,6 +514,7 @@ impl NativeVaapiDecoder {
     }
 
     /// This AU's frame off the front first so [`trim_deliverable`] bounds carry-over.
+    /// Trimmed frames free their surface through [`VaFrameGuard`] on drop.
     fn take_deliverable(&mut self) -> Option<DmabufFrame> {
         let shipped = self.deliverable.pop_front();
         // No session means no pool; cap 0 is "no surfaces exist".
@@ -519,8 +522,7 @@ impl NativeVaapiDecoder {
         // Pre-trim depth: after the trim this would be `cap` every time.
         let queued = self.deliverable.len();
         for frame in trim_deliverable(&mut self.deliverable, cap) {
-            self.health.note_dropped();
-            if self.health.dropped == 1 || self.health.dropped % DROP_WARN_EVERY == 0 {
+            if self.health.note_dropped() {
                 tracing::warn!(
                     queued,
                     cap,
@@ -582,133 +584,133 @@ impl NativeVaapiDecoder {
         out
     }
 
-    fn decode_h264(&mut self, au: &[u8]) -> Result<(Vec<DmabufFrame>, bool)> {
-        let plan = match &mut self.planner {
-            Planner::H264(p) => p.plan_au(au).map_err(|e| anyhow!("{e:?}"))?,
-            _ => unreachable!("dispatched on the planner's own arm"),
-        };
-        let shape = shape_of(
-            plan.picture.coded_width,
-            plan.picture.coded_height,
-            plan.picture.display_crop,
-            plan.picture.max_dpb_frames,
-            plan.picture.chroma_format_idc,
-            8 + plan.picture.bit_depth_luma_minus8,
-        )?;
-        let damaged = plan.warnings.iter().any(pf_vaapi::is_integrity_warning);
-        if !plan.warnings.is_empty() {
-            tracing::debug!(warnings = ?plan.warnings, damaged, "native VAAPI plan warnings");
-        }
-
-        let Self {
-            display, session, ..
-        } = self;
-        let s = ensure_session(
-            display,
-            session,
-            pf_vaapi::Codec::H264,
-            shape,
-            &mut self.generation,
-        )?;
-        let (free, target, table) = s
-            .acquire_target()
-            .ok_or_else(|| anyhow!("surface pool exhausted ({} surfaces)", s.surfaces.len()))?;
-        let converted = pf_vaapi::plan_to_va(&plan, au, &mut s.slots, &table, target)
-            .map_err(|e| anyhow!("{e}"))?;
-
-        // This picture's facts, not the later display AU's ([`PictureFacts`]).
-        let facts = PictureFacts {
-            keyframe: plan.picture.is_idr,
-            references_clean: plan.picture.references_clean,
-            color: colour_of(&plan.picture.colour),
-            display: (s.shape.display_width, s.shape.display_height),
-        };
-        bind_setup(s, plan.dpb.stored, Some(free), facts);
-
-        let iq = Some(as_ptr(&converted.iq_matrix));
-        let slices = one_record_each(&converted.slices, &converted.slice_data)?;
-        submit(
-            display,
-            s,
-            target,
-            as_ptr(&converted.pic_params),
-            iq,
-            &slices,
-            au,
-        )?;
-
-        let frames = finish(
-            display,
-            s,
-            &plan.dpb.outputs,
-            &plan.dpb.removed,
-            damaged,
-            &mut self.recovery_request,
-            &self.release_tx,
-        )?;
-        Ok((frames, damaged))
+    /// Nothing to feed until the IDR and its parameter sets land: a decoder built mid-GOP
+    /// sees slices first. Idle, not a refusal, so no health verdict (`None`).
+    fn idle_until_idr(&mut self, e: impl std::fmt::Display) -> Option<(Vec<DmabufFrame>, bool)> {
+        self.recovery_request = true;
+        tracing::debug!(error = %e, "native VAAPI idle until the next IDR");
+        None
     }
 
-    fn decode_h265(&mut self, au: &[u8]) -> Result<(Vec<DmabufFrame>, bool)> {
+    fn decode_h264(&mut self, au: &[u8]) -> Result<Option<(Vec<DmabufFrame>, bool)>> {
         let plan = match &mut self.planner {
-            Planner::H265(p) => match p.plan_au(au) {
+            Planner::H264(p) => match p.plan_au(au) {
                 Ok(plan) => plan,
-                // Spec 8.1.3 NOTE: skipped RASL is Ok, never a re-anchor.
-                Err(pf_vaapi::PlanErrorH265::RaslSkipped { .. }) => return Ok((Vec::new(), false)),
+                Err(e) if e.awaits_idr() => return Ok(self.idle_until_idr(e)),
                 Err(e) => return Err(anyhow!("{e:?}")),
             },
             _ => unreachable!("dispatched on the planner's own arm"),
         };
+        let pic = &plan.picture;
         let shape = shape_of(
-            plan.picture.coded_width,
-            plan.picture.coded_height,
-            plan.picture.display_crop,
-            plan.picture.max_dpb_frames,
-            plan.picture.chroma_format_idc,
-            8 + plan.picture.bit_depth_luma_minus8,
+            pic.coded_width,
+            pic.coded_height,
+            pic.display_crop,
+            pic.max_dpb_frames,
+            pic.chroma_format_idc,
+            8 + pic.bit_depth_luma_minus8,
         )?;
         let damaged = plan
             .warnings
             .iter()
-            .any(pf_vaapi::is_integrity_warning_h265);
+            .any(pf_vaapi::PlanWarning::is_integrity);
         if !plan.warnings.is_empty() {
             tracing::debug!(warnings = ?plan.warnings, damaged, "native VAAPI plan warnings");
         }
+        let planned = PlannedPicture {
+            codec: pf_vaapi::Codec::H264,
+            shape,
+            damaged,
+            keyframe: pic.is_idr,
+            references_clean: pic.references_clean,
+            color: colour_of(&pic.colour),
+            stored: plan.dpb.stored,
+            outputs: &plan.dpb.outputs,
+            removed: &plan.dpb.removed,
+        };
+        self.decode_planned(au, planned, |slots, table, target| {
+            pf_vaapi::plan_to_va(&plan, au, slots, table, target)
+        })
+    }
 
+    fn decode_h265(&mut self, au: &[u8]) -> Result<Option<(Vec<DmabufFrame>, bool)>> {
+        let plan = match &mut self.planner {
+            Planner::H265(p) => match p.plan_au(au) {
+                Ok(plan) => plan,
+                // Spec 8.1.3 NOTE: skipped RASL is Ok, never a re-anchor.
+                Err(pf_vaapi::PlanErrorH265::RaslSkipped { .. }) => {
+                    return Ok(Some((Vec::new(), false)))
+                }
+                Err(e) if e.awaits_idr() => return Ok(self.idle_until_idr(e)),
+                Err(e) => return Err(anyhow!("{e:?}")),
+            },
+            _ => unreachable!("dispatched on the planner's own arm"),
+        };
+        let pic = &plan.picture;
+        let shape = shape_of(
+            pic.coded_width,
+            pic.coded_height,
+            pic.display_crop,
+            pic.max_dpb_frames,
+            pic.chroma_format_idc,
+            8 + pic.bit_depth_luma_minus8,
+        )?;
+        let damaged = plan
+            .warnings
+            .iter()
+            .any(pf_vaapi::PlanWarningH265::is_integrity);
+        if !plan.warnings.is_empty() {
+            tracing::debug!(warnings = ?plan.warnings, damaged, "native VAAPI plan warnings");
+        }
+        let planned = PlannedPicture {
+            codec: pf_vaapi::Codec::H265,
+            shape,
+            damaged,
+            keyframe: pic.is_idr,
+            references_clean: pic.references_clean,
+            color: colour_of(&pic.colour),
+            stored: plan.dpb.stored,
+            outputs: &plan.dpb.outputs,
+            removed: &plan.dpb.removed,
+        };
+        self.decode_planned(au, planned, |slots, table, target| {
+            pf_vaapi::plan_to_va_h265(&plan, au, slots, table, target)
+        })
+    }
+
+    /// The H.264/H.265 tail: session, target surface, `convert`, setup binding, submit,
+    /// then [`finish`]. `convert` is the codec's `plan_to_va*` over this AU's plan.
+    fn decode_planned<B: VaBuffers, E: std::fmt::Display>(
+        &mut self,
+        au: &[u8],
+        p: PlannedPicture<'_>,
+        convert: impl FnOnce(&mut pf_vaapi::SlotMap, &[VaSurfaceId], VaSurfaceId) -> Result<B, E>,
+    ) -> Result<Option<(Vec<DmabufFrame>, bool)>> {
         let Self {
             display, session, ..
         } = self;
-        let s = ensure_session(
-            display,
-            session,
-            pf_vaapi::Codec::H265,
-            shape,
-            &mut self.generation,
-        )?;
+        let s = ensure_session(display, session, p.codec, p.shape, &mut self.generation)?;
         let (free, target, table) = s
             .acquire_target()
             .ok_or_else(|| anyhow!("surface pool exhausted ({} surfaces)", s.surfaces.len()))?;
-        let converted = pf_vaapi::plan_to_va_h265(&plan, au, &mut s.slots, &table, target)
-            .map_err(|e| anyhow!("{e}"))?;
+        let converted = convert(&mut s.slots, &table, target).map_err(|e| anyhow!("{e}"))?;
 
+        // This picture's facts, not the later display AU's ([`PictureFacts`]).
         let facts = PictureFacts {
-            keyframe: plan.picture.is_idr,
-            references_clean: plan.picture.references_clean,
-            color: colour_of(&plan.picture.colour),
+            keyframe: p.keyframe,
+            references_clean: p.references_clean,
+            color: p.color,
             display: (s.shape.display_width, s.shape.display_height),
         };
-        bind_setup(s, plan.dpb.stored, Some(free), facts);
+        bind_setup(s, p.stored, Some(free), facts);
 
-        // Only when the sequence codes scaling lists. An all-zero matrix on a
-        // "use the defaults" stream dequantises every residual to zero.
-        let iq = converted.iq_matrix.as_ref().map(as_ptr);
-        let slices = one_record_each(&converted.slices, &converted.slice_data)?;
+        let slices = converted.slice_pairs()?;
         submit(
             display,
             s,
             target,
-            as_ptr(&converted.pic_params),
-            iq,
+            converted.pic_params(),
+            converted.iq_matrix(),
             &slices,
             au,
         )?;
@@ -716,13 +718,13 @@ impl NativeVaapiDecoder {
         let frames = finish(
             display,
             s,
-            &plan.dpb.outputs,
-            &plan.dpb.removed,
-            damaged,
+            p.outputs,
+            p.removed,
+            p.damaged,
             &mut self.recovery_request,
             &self.release_tx,
         )?;
-        Ok((frames, damaged))
+        Ok(Some((frames, p.damaged)))
     }
 
     /// One temporal unit: decode every frame, present at most one. Hidden frames
@@ -731,7 +733,7 @@ impl NativeVaapiDecoder {
     /// a later `show_existing_frame` must not export unwritten memory) but withhold
     /// display. Lost-ref slots get a live surface (`va_dec_av1.h:352`); lost tile
     /// groups bind nothing ([`Self::frame_av1`]).
-    fn decode_av1(&mut self, au: &[u8]) -> Result<(Vec<DmabufFrame>, bool)> {
+    fn decode_av1(&mut self, au: &[u8]) -> Result<Option<(Vec<DmabufFrame>, bool)>> {
         let plans = match &mut self.planner {
             Planner::Av1(p) => p.plan_au(au).map_err(|e| anyhow!("{e}"))?,
             _ => unreachable!("dispatched on the planner's own arm"),
@@ -739,7 +741,10 @@ impl NativeVaapiDecoder {
         let mut shown: Vec<DmabufFrame> = Vec::new();
         let mut damaged_unit = false;
         for plan in &plans {
-            let damaged = plan.warnings.iter().any(pf_vaapi::is_integrity_warning_av1);
+            let damaged = plan
+                .warnings
+                .iter()
+                .any(pf_vaapi::PlanWarningAv1::is_integrity);
             damaged_unit |= damaged;
             if !plan.warnings.is_empty() {
                 tracing::debug!(warnings = ?plan.warnings, damaged, "native VAAPI AV1 plan warnings");
@@ -750,9 +755,9 @@ impl NativeVaapiDecoder {
             // A later frame of the same unit may have been the damaged one; the
             // guard returns already-exported surfaces.
             drop(shown);
-            return Ok((Vec::new(), true));
+            return Ok(Some((Vec::new(), true)));
         }
-        Ok((shown, false))
+        Ok(Some((shown, false)))
     }
 
     /// Convert and submit. `damaged` gates display ([`finish`]) and turns a lost
@@ -1050,6 +1055,53 @@ fn bind_setup(s: &mut Session, stored: Option<u64>, surface: Option<usize>, fact
     }
 }
 
+/// One H.264/H.265 plan, codec-neutral: what [`NativeVaapiDecoder::decode_planned`] reads.
+struct PlannedPicture<'p> {
+    codec: pf_vaapi::Codec,
+    shape: StreamShape,
+    damaged: bool,
+    keyframe: bool,
+    references_clean: bool,
+    color: ColorDesc,
+    stored: Option<u64>,
+    outputs: &'p [u64],
+    removed: &'p [u64],
+}
+
+/// A converted H.264/H.265 plan as the buffers [`submit`] takes. Pointers borrow `self`.
+trait VaBuffers {
+    fn pic_params(&self) -> (*const c_void, usize);
+    /// `None` submits no IQ buffer.
+    fn iq_matrix(&self) -> Option<(*const c_void, usize)>;
+    fn slice_pairs(&self) -> Result<Vec<SlicePair>>;
+}
+
+impl VaBuffers for pf_vaapi::DecodePlanVa {
+    fn pic_params(&self) -> (*const c_void, usize) {
+        as_ptr(&self.pic_params)
+    }
+    fn iq_matrix(&self) -> Option<(*const c_void, usize)> {
+        Some(as_ptr(&self.iq_matrix))
+    }
+    fn slice_pairs(&self) -> Result<Vec<SlicePair>> {
+        one_record_each(&self.slices, &self.slice_data)
+    }
+}
+
+impl VaBuffers for pf_vaapi::DecodePlanVaH265 {
+    fn pic_params(&self) -> (*const c_void, usize) {
+        as_ptr(&self.pic_params)
+    }
+    /// Only when the sequence codes scaling lists. An all-zero matrix on a
+    /// "use the defaults" stream dequantises every residual to zero.
+    fn iq_matrix(&self) -> Option<(*const c_void, usize)> {
+        self.iq_matrix.as_ref().map(as_ptr)
+    }
+    fn slice_pairs(&self) -> Result<Vec<SlicePair>> {
+        one_record_each(&self.slices, &self.slice_data)
+    }
+}
+
 /// Parameter buffer plus the AU-coordinate bitstream its records address.
 /// `vaRenderPicture` is what makes `slice_data_offset` relative to that data.
 struct SlicePair {
@@ -1229,7 +1281,7 @@ fn ship(
     let surface = s.surfaces[surface_index];
 
     // Fds are owned from the successful export; later refusals close them by drop.
-    let (exported, fds) = export(d, surface)?;
+    let (exported, fds, sync_fds) = export(d, surface)?;
     if exported.fourcc != s.fourcc {
         // Driver silently substituted a different layout than the pool was created with.
         bail!(
@@ -1268,6 +1320,8 @@ fn ship(
         color: picture.facts.color,
         keyframe: picture.facts.keyframe,
         references_clean: picture.facts.references_clean,
+        sync_fds,
+        pool_key: (s.generation << 32) | surface_index as u64,
         guard: DrmFrameGuard(VaFrameGuard {
             _fds: fds,
             tx: tx.clone(),
@@ -1303,15 +1357,73 @@ fn finish(
     Ok(frames)
 }
 
-/// Sync then export. VAAPI has no fence for the importer; without the wait the
-/// presenter would sample a surface still being written. Fds are owned from success
-/// so later refusals close them. One fd per object, even when planes share it.
-fn export(d: &Display, surface: VaSurfaceId) -> Result<(pf_vaapi::ExportedSurface, Vec<OwnedFd>)> {
-    // SAFETY: a live display and a surface from its own pool.
-    d.va.check("vaSyncSurface", unsafe {
-        (d.va.sync_surface)(d.display, surface)
-    })?;
+/// How the importer learns the decode is done. The kernel fence on the surface's
+/// dma-buf is the default; `PUNKTFUNK_VAAPI_EXPLICIT_SYNC=0`, or a kernel without
+/// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`, falls back to `vaSyncSurface` on the pump.
+/// Process-wide: a kernel fact, not a per-decoder one.
+static SYNC_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(SYNC_UNDECIDED);
+const SYNC_UNDECIDED: u8 = 0;
+const SYNC_EXPLICIT: u8 = 1;
+const SYNC_CPU: u8 = 2;
 
+fn sync_mode() -> u8 {
+    use std::sync::atomic::Ordering;
+    match SYNC_MODE.load(Ordering::Relaxed) {
+        SYNC_UNDECIDED => {
+            let off = std::env::var_os("PUNKTFUNK_VAAPI_EXPLICIT_SYNC").is_some_and(|v| v == "0");
+            let mode = if off { SYNC_CPU } else { SYNC_EXPLICIT };
+            SYNC_MODE.store(mode, Ordering::Relaxed);
+            mode
+        }
+        mode => mode,
+    }
+}
+
+/// Export, then hand out the decode's write fence as sync_files (one per object).
+/// The pump never waits: the presenter waits them on the GPU. Without the ioctl the
+/// old CPU wait runs here and `sync_fds` is empty. Fds are owned from success so
+/// later refusals close them. One fd per object, even when planes share it.
+fn export(
+    d: &Display,
+    surface: VaSurfaceId,
+) -> Result<(pf_vaapi::ExportedSurface, Vec<OwnedFd>, Vec<OwnedFd>)> {
+    if sync_mode() == SYNC_CPU {
+        // SAFETY: a live display and a surface from its own pool.
+        d.va.check("vaSyncSurface", unsafe {
+            (d.va.sync_surface)(d.display, surface)
+        })?;
+    }
+    let (exported, fds) = export_handle(d, surface)?;
+    if sync_mode() == SYNC_CPU {
+        return Ok((exported, fds, Vec::new()));
+    }
+    let mut sync_fds = Vec::with_capacity(fds.len());
+    for fd in &fds {
+        match pf_dmabuf::fence::export_sync_file(fd.as_fd()) {
+            Ok(Some(sync)) => sync_fds.push(sync),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "native VAAPI: the kernel exports no dma-buf sync_file — the pump \
+                     waits each decode on the CPU instead"
+                );
+                SYNC_MODE.store(SYNC_CPU, std::sync::atomic::Ordering::Relaxed);
+                // SAFETY: a live display and a surface from its own pool.
+                d.va.check("vaSyncSurface", unsafe {
+                    (d.va.sync_surface)(d.display, surface)
+                })?;
+                return Ok((exported, fds, Vec::new()));
+            }
+        }
+    }
+    Ok((exported, fds, sync_fds))
+}
+
+fn export_handle(
+    d: &Display,
+    surface: VaSurfaceId,
+) -> Result<(pf_vaapi::ExportedSurface, Vec<OwnedFd>)> {
     let mut desc = pf_vaapi::VaDrmPrimeSurfaceDescriptor::zeroed();
     // SAFETY: a live display and surface; `desc` is a local of exactly the layout
     // `VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2` writes (measured by
@@ -1355,6 +1467,10 @@ fn export(d: &Display, surface: VaSurfaceId) -> Result<(pf_vaapi::ExportedSurfac
 
 #[cfg(test)]
 mod tests {
+    use pf_bitstream::testing::split_h264_aus;
+    use pf_bitstream::testing::split_h265_aus;
+    use pf_bitstream::testing::split_ivf;
+
     use super::*;
 
     /// Bookkeeping only; libva handles are never used. Small so exhaustion is reachable.
@@ -1756,6 +1872,8 @@ mod tests {
             color: PLAIN.color,
             keyframe: PLAIN.keyframe,
             references_clean: PLAIN.references_clean,
+            sync_fds: Vec::new(),
+            pool_key: (1 << 32) | surface as u64,
             guard: DrmFrameGuard(VaFrameGuard {
                 _fds: Vec::new(),
                 tx: tx.clone(),
@@ -2038,29 +2156,7 @@ mod tests {
     }
 
     /// 250 temporal units, 274 coded, 24 hidden, 250 shown. Same file the other rungs walk.
-    pub(super) const AV1_25FPS: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1"
-    );
-
-    /// `[u32 size][u64 pts][size bytes]` after the `DKIF` header. No vendored parser dep.
-    pub(super) fn split_ivf(stream: &[u8]) -> Vec<&[u8]> {
-        assert_eq!(&stream[0..4], b"DKIF", "the AV1 vector must be an IVF file");
-        let header = usize::from(u16::from_le_bytes([stream[6], stream[7]]));
-        let mut out = Vec::new();
-        let mut at = header;
-        while at + 12 <= stream.len() {
-            let size =
-                u32::from_le_bytes(stream[at..at + 4].try_into().expect("four bytes")) as usize;
-            at += 12;
-            assert!(
-                at + size <= stream.len(),
-                "an IVF frame header claims {size} bytes past the end of the file"
-            );
-            out.push(&stream[at..at + size]);
-            at += size;
-        }
-        out
-    }
+    pub(super) const AV1_25FPS: &[u8] = pf_bitstream::testing::AV1_25FPS;
 
     /// Decode measurement, not pixels. Pixels are the `parity` module. `#[ignore]`
     /// so a missing entry point fails loudly rather than skips.
@@ -2120,15 +2216,91 @@ mod tests {
         );
     }
 
+    /// The presenter's AV1 fact on this box, for `PF_VAAPI_VENDOR` (hex, default Intel).
+    #[test]
+    #[ignore = "needs a machine with a libva runtime"]
+    fn av1_decodable_answers_on_this_machine() {
+        let vendor = std::env::var("PF_VAAPI_VENDOR")
+            .ok()
+            .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x8086);
+        eprintln!(
+            "VAAPI AV1 for vendor {vendor:#06x}: {}",
+            av1_decodable(vendor)
+        );
+    }
+
+    /// Wall time of each `decode` call — submit, sync and export, the span the
+    /// session reports as decode time — on `PF_VAAPI_BENCH_STREAM` (Annex-B H.265).
+    /// Three frames stay held, as a presenter holds them.
+    #[test]
+    #[ignore = "needs a machine with a libva runtime and PF_VAAPI_BENCH_STREAM"]
+    fn h265_decode_time_on_this_machines_vaapi() {
+        let path = std::env::var("PF_VAAPI_BENCH_STREAM").expect("PF_VAAPI_BENCH_STREAM");
+        let stream = std::fs::read(&path).expect("read the bench stream");
+        let units = split_h265_aus(&stream);
+        let mut decoder = NativeVaapiDecoder::new(pf_vaapi::Codec::H265, StreamFormat::SDR_420_8)
+            .expect("this box is supposed to have a VAAPI HEVC decode entry point");
+        let mut us = Vec::with_capacity(units.len());
+        let mut fence_us = Vec::with_capacity(units.len());
+        let mut fence_outcomes = [0u32; 4]; // cpu-synced, signaled, already-done, timed-out
+        let mut held = std::collections::VecDeque::new();
+        let start = std::time::Instant::now();
+        for (index, unit) in units.iter().enumerate() {
+            let t = std::time::Instant::now();
+            let frame = decoder
+                .decode(unit)
+                .unwrap_or_else(|e| panic!("unit {index}: {e:#}"));
+            us.push(t.elapsed().as_micros() as u64);
+            // The fence the presenter would wait: how long after the call it signals, and
+            // whether the kernel handed one out at all.
+            if let Some(f) = &frame {
+                use pf_dmabuf::fence::{wait_sync_file, WaitOutcome};
+                match f.sync_fds.first() {
+                    None => fence_outcomes[0] += 1,
+                    Some(fd) => {
+                        let w = std::time::Instant::now();
+                        let slot = match wait_sync_file(fd.as_fd(), 100) {
+                            Ok(WaitOutcome::Signaled) => 1,
+                            Ok(WaitOutcome::NoFence) => 2,
+                            _ => 3,
+                        };
+                        fence_outcomes[slot] += 1;
+                        fence_us.push(w.elapsed().as_micros() as u64);
+                    }
+                }
+            }
+            held.extend(frame);
+            if held.len() > 3 {
+                held.pop_front();
+            }
+        }
+        let total = start.elapsed();
+        us.sort_unstable();
+        fence_us.sort_unstable();
+        let at = |v: &[u64], p: usize| v.get((v.len().max(1) - 1) * p / 100).copied().unwrap_or(0);
+        eprintln!(
+            "{path}: {} AUs in {total:?} ({:.0} fps); decode call p50 {} us, p95 {} us, max {} us; \
+             fence: cpu-synced {} signaled {} already-done {} timed-out {}; wait p50 {} us p95 {} us",
+            us.len(),
+            us.len() as f64 / total.as_secs_f64(),
+            at(&us, 50),
+            at(&us, 95),
+            us[us.len() - 1],
+            fence_outcomes[0],
+            fence_outcomes[1],
+            fence_outcomes[2],
+            fence_outcomes[3],
+            at(&fence_us, 50),
+            at(&fence_us, 95),
+        );
+    }
+
     /// 250 AUs, two slices per picture. Same file the other rungs decode.
-    pub(super) const H264_25FPS: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264"
-    );
+    pub(super) const H264_25FPS: &[u8] = pf_bitstream::testing::H264_25FPS;
 
     /// 250 AUs, one slice per picture.
-    pub(super) const H265_25FPS: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265"
-    );
+    pub(super) const H265_25FPS: &[u8] = pf_bitstream::testing::H265_25FPS;
 
     /// 50 AUs, Main 10: different profile, RT format, and P010. Catches NV12 for 10-bit.
     pub(super) const MAIN10_H265: &[u8] =
@@ -2147,62 +2319,6 @@ mod tests {
     const H264_LAST_ONLY: usize = 225;
     const H265_LAST_ONLY: usize = 204;
     const MAIN10_LAST_ONLY: usize = 45;
-
-    /// Start-code scan. Emulation prevention means `00 00 01` is never payload.
-    fn nal_headers(stream: &[u8]) -> Vec<usize> {
-        let mut out = Vec::new();
-        let mut i = 0usize;
-        while i + 3 <= stream.len() {
-            if stream[i..i + 3] == [0x00, 0x00, 0x01] {
-                out.push(i + 3);
-                i += 3;
-            } else {
-                i += 1;
-            }
-        }
-        out
-    }
-
-    /// New AU at a non-VCL after slices, or a first-of-picture slice while the AU already has slices.
-    fn split_aus(stream: &[u8], classify: impl Fn(&[u8], usize) -> (bool, bool)) -> Vec<&[u8]> {
-        let mut aus = Vec::new();
-        let mut au_start = 0usize;
-        let mut au_has_slice = false;
-        for header in nal_headers(stream) {
-            let (is_slice, first_in_picture) = classify(stream, header);
-            // Three-byte start code, plus the optional leading zero of the four-byte form.
-            let mut start = header - 3;
-            if start > 0 && stream[start - 1] == 0x00 {
-                start -= 1;
-            }
-            if au_has_slice && (!is_slice || first_in_picture) {
-                aus.push(&stream[au_start..start]);
-                au_start = start;
-                au_has_slice = false;
-            }
-            au_has_slice |= is_slice;
-        }
-        aus.push(&stream[au_start..]);
-        aus
-    }
-
-    /// `first_mb_in_slice == 0` is load-bearing: this vector codes two slices per picture.
-    pub(super) fn split_h264_aus(stream: &[u8]) -> Vec<&[u8]> {
-        split_aus(stream, |s, h| {
-            let is_slice = matches!(s[h] & 0x1f, 1 | 5);
-            let first = is_slice && s.get(h + 1).is_some_and(|b| b & 0x80 != 0);
-            (is_slice, first)
-        })
-    }
-
-    /// Two-byte NAL header; first-slice flag is at `+2`, not H.264's `+1`.
-    pub(super) fn split_h265_aus(stream: &[u8]) -> Vec<&[u8]> {
-        split_aus(stream, |s, h| {
-            let is_slice = (s[h] >> 1) & 0x3f < 32;
-            let first = is_slice && s.get(h + 2).is_some_and(|b| b & 0x80 != 0);
-            (is_slice, first)
-        })
-    }
 
     /// Not ignored: a regenerated 8-bit "Main 10" vector would pass the ten-bit leg.
     #[test]
@@ -2692,9 +2808,9 @@ mod parity {
 
     use sha2::Digest;
 
-    use super::tests::split_h264_aus;
-    use super::tests::split_h265_aus;
-    use super::tests::split_ivf;
+    use pf_bitstream::testing::split_h264_aus;
+    use pf_bitstream::testing::split_h265_aus;
+    use pf_bitstream::testing::split_ivf;
     // Test-only `ImageApi` re-dlopens libva and names these; the lib itself does not.
     use pf_libva::VaDisplay;
     use pf_libva::VaStatus;

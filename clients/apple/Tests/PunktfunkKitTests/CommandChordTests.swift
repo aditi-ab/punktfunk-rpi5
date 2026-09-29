@@ -10,8 +10,8 @@ import XCTest
 ///
 ///  * ⌘Q reaching the host at all. That is the whole point — it is the compositor chord on
 ///    Hyprland/KDE/GNOME, and it used to quit the client.
-///  * ⌘⎋ and ⌃⌘F NOT reaching it, under every combination. They are the way out of a captured
-///    stream; forward either and the user is locked in.
+///  * ⌘⎋ NOT reaching it, under every combination. It is the way out of a captured stream;
+///    forward it and the user is locked in.
 ///
 /// The mouse model is deliberately absent from the rule (and from its signature): the chords are
 /// forwarded under the desktop model too, as they are on the SDL clients. Gating it there read as
@@ -40,21 +40,21 @@ final class CommandChordTests: XCTestCase {
         XCTAssertTrue(forwards(m, [.command, .control, .option, .shift]))
     }
 
-    func testTheEscapeHatchesAreNeverForwarded() {
-        // ⌘⎋ releases capture, ⌃⌘F leaves fullscreen. Neither may ever reach the host.
+    func testTheEscapeHatchIsNeverForwarded() {
         XCTAssertFalse(forwards(esc, .command))
-        XCTAssertFalse(forwards(f, [.control, .command]))
-        XCTAssertTrue(InputCapture.isClientReservedChord(keyCode: esc, flags: .command))
-        XCTAssertTrue(
-            InputCapture.isClientReservedChord(keyCode: f, flags: [.control, .command]))
     }
 
-    /// The reservation is exact: it is ⌘⎋ and ⌃⌘F specifically, not "anything with Esc or F in
-    /// it". ⇧⌘⎋ and ⌘F are the host's like any other chord.
+    /// Capturing system shortcuts includes the Mac's own fullscreen chord; the monitor keeps ⌃⌘F
+    /// only with the setting off.
+    func testFullscreenChordGoesToTheHostWithTheSetting() {
+        XCTAssertTrue(forwards(f, [.control, .command]))
+        XCTAssertFalse(forwards(f, [.control, .command], inhibit: false))
+    }
+
+    /// The reservation is exact: ⌘⎋ specifically, not "anything with Esc in it".
     func testNeighbouringChordsAreNotReserved() {
         XCTAssertTrue(forwards(esc, [.command, .shift]))
         XCTAssertTrue(forwards(f, .command))
-        XCTAssertFalse(InputCapture.isClientReservedChord(keyCode: f, flags: .command))
     }
 
     func testNothingWithoutCommandIsClaimedHere() {
@@ -104,28 +104,116 @@ final class CommandChordTests: XCTestCase {
         XCTAssertEqual(InputCapture.keyCodeToVK[leftArrow], 0x25) // VK_LEFT
     }
 
-    /// The system-shortcut tap (⌘Space, ⌘Tab — the keys macOS claims before the app sees them)
-    /// takes keys off the system ONLY while captured, with the app frontmost. Any other state must
-    /// pass through: a tap that eats keys for the whole Mac is the failure to pin here.
-    func testTheSystemShortcutTapOnlyClaimsWhileCapturedAndFrontmost() {
-        XCTAssertTrue(InputCapture.tapClaims(forwarding: true, appActive: true))
-        XCTAssertFalse(InputCapture.tapClaims(forwarding: false, appActive: true))
-        XCTAssertFalse(InputCapture.tapClaims(forwarding: true, appActive: false))
+    /// The Mac's global shortcuts are off only while a capture holds them AND the main thread
+    /// answers — a hung client must not keep ⌥⌘⎋ from the user.
+    func testSystemShortcutsAreOffOnlyWhileHeldByALiveApp() {
+        XCTAssertTrue(SystemHotKeys.shouldBeOff(holders: 1, mainSilentFor: 0.5))
+        XCTAssertFalse(SystemHotKeys.shouldBeOff(holders: 0, mainSilentFor: 0))
+        XCTAssertFalse(SystemHotKeys.shouldBeOff(holders: 1, mainSilentFor: 2.5))
     }
 
-    /// The keys the tap exists for must have host VKs — it reposts them into the ordinary key path,
-    /// which drops unmapped keyCodes on the floor.
+    /// The watchdog end to end, against WindowServer: hang main, the shortcuts come back; main
+    /// answers again, they go off again; release, they are back for good.
+    func testAHungMainThreadGivesTheSystemShortcutsBack() throws {
+        try XCTSkipIf(ProcessInfo.processInfo.environment["CI"] != nil, "toggles this Mac's shortcuts")
+        SystemHotKeys.hold()
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.3))
+        XCTAssertTrue(SystemHotKeys.isOff)
+        Thread.sleep(forTimeInterval: 3) // main hangs
+        XCTAssertFalse(SystemHotKeys.isOff)
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 1))
+        XCTAssertTrue(SystemHotKeys.isOff)
+        SystemHotKeys.release()
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.3))
+        XCTAssertFalse(SystemHotKeys.isOff)
+    }
+
+    /// Captured, ⌘Space, ⌘Tab and Mission Control arrive as ordinary key events and need host
+    /// VKs: the key path ignores an unmapped keyCode.
     func testTheSystemShortcutKeysMapToHostVKs() {
         XCTAssertEqual(InputCapture.keyCodeToVK[49], 0x20) // Space (⌘Space)
         XCTAssertEqual(InputCapture.keyCodeToVK[48], 0x09) // Tab (⌘Tab)
         XCTAssertEqual(InputCapture.keyCodeToVK[126], 0x26) // Up arrow (⌃↑ Mission Control)
     }
 
-    private func keyEvent(_ keyCode: UInt16, _ flags: NSEvent.ModifierFlags) -> NSEvent? {
+    /// A Mac JIS board sends the VKs an iPad sends for the same keys: kVK_JIS_* → HID usage.
+    func testTheJISKeysMapLikeTheHIDPath() {
+        let kvkToHID: [UInt16: Int] = [0x5D: 0x89, 0x5E: 0x87, 0x5F: 0x85, 0x68: 0x90, 0x66: 0x91]
+        for (kvk, hid) in kvkToHID {
+            XCTAssertNotNil(InputCapture.hidToVK[hid])
+            XCTAssertEqual(InputCapture.keyCodeToVK[kvk], InputCapture.hidToVK[hid], "kVK \(kvk)")
+        }
+    }
+
+    // Release ownership follows the forwarded physical key, not the current modifier chord
+    func testTrackedReleasesIgnoreModifierChanges() throws {
+        for flags: NSEvent.ModifierFlags in [.command, [], .control, [.control, .command]] {
+            var tracked: Set<UInt32> = [0x46]
+            let event = try XCTUnwrap(keyEvent(f, flags, type: .keyUp))
+            XCTAssertEqual(InputCapture.takeRelease(
+                event, forwarding: true, pressedVKs: [0x46], chordVKs: &tracked), 0x46)
+            XCTAssertTrue(tracked.isEmpty)
+        }
+    }
+
+    // One key's release cannot clear another held chord key or generate a duplicate release
+    func testRepeatedTapsClaimEachReleaseOnce() throws {
+        var tracked: Set<UInt32> = [0x51, 0x57]
+        let event = try XCTUnwrap(keyEvent(w, .command, type: .keyUp))
+        for _ in 0..<3 {
+            tracked.insert(0x57)
+            XCTAssertEqual(InputCapture.takeRelease(
+                event, forwarding: true, pressedVKs: [0x51, 0x57], chordVKs: &tracked), 0x57)
+            XCTAssertEqual(tracked, [0x51])
+            XCTAssertNil(InputCapture.takeRelease(
+                event, forwarding: true, pressedVKs: [0x51], chordVKs: &tracked))
+        }
+    }
+
+    // Held-key repeats keep their release outstanding for the eventual physical key-up
+    func testHeldKeyRepeatDoesNotTakeReleaseOwnership() throws {
+        var tracked: Set<UInt32> = [0x57]
+        let repeatedDown = try XCTUnwrap(keyEvent(w, .command, isRepeat: true))
+        XCTAssertNil(InputCapture.takeRelease(
+            repeatedDown, forwarding: true, pressedVKs: [0x57], chordVKs: &tracked))
+        XCTAssertEqual(tracked, [0x57])
+        let release = try XCTUnwrap(keyEvent(w, .command, type: .keyUp))
+        XCTAssertEqual(InputCapture.takeRelease(
+            release, forwarding: true, pressedVKs: [0x57], chordVKs: &tracked), 0x57)
+    }
+
+    // A key held before ⌘ went down still reaches the host when it is released under ⌘
+    func testAHeldKeyReleasedUnderCommandIsTaken() throws {
+        var tracked: Set<UInt32> = []
+        let underCommand = try XCTUnwrap(keyEvent(leftArrow, .command, type: .keyUp))
+        XCTAssertEqual(InputCapture.takeRelease(
+            underCommand, forwarding: true, pressedVKs: [0x25], chordVKs: &tracked), 0x25)
+        let plain = try XCTUnwrap(keyEvent(leftArrow, [], type: .keyUp))
+        XCTAssertNil(InputCapture.takeRelease(
+            plain, forwarding: true, pressedVKs: [0x25], chordVKs: &tracked))
+    }
+
+    // Unowned releases and local input retain the responder-chain path
+    func testUntrackedAndReleasedCaptureKeysPassThrough() throws {
+        var tracked: Set<UInt32> = [0x57]
+        let untracked = try XCTUnwrap(keyEvent(q, .command, type: .keyUp))
+        XCTAssertNil(InputCapture.takeRelease(
+            untracked, forwarding: true, pressedVKs: [0x57], chordVKs: &tracked))
+        let released = try XCTUnwrap(keyEvent(w, .command, type: .keyUp))
+        XCTAssertNil(InputCapture.takeRelease(
+            released, forwarding: false, pressedVKs: [0x57], chordVKs: &tracked))
+        XCTAssertEqual(tracked, [0x57])
+    }
+
+    // Construct physical key events without keyboard layout or window dependencies
+    private func keyEvent(
+        _ keyCode: UInt16, _ flags: NSEvent.ModifierFlags,
+        type: NSEvent.EventType = .keyDown, isRepeat: Bool = false
+    ) -> NSEvent? {
         NSEvent.keyEvent(
-            with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0,
+            with: type, location: .zero, modifierFlags: flags, timestamp: 0,
             windowNumber: 0, context: nil, characters: "", charactersIgnoringModifiers: "",
-            isARepeat: false, keyCode: keyCode)
+            isARepeat: isRepeat, keyCode: keyCode)
     }
 }
 #endif

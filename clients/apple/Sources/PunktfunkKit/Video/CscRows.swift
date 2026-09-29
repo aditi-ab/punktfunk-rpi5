@@ -1,8 +1,7 @@
 // The Y′CbCr→RGB conversion as three shader rows, ported from pf-client-core's `csc_rows`
-// (crates/pf-client-core/src/video.rs) — the ONE coefficient implementation every punktfunk
-// presenter derives its CSC from. Keep the two in LOCKSTEP: both carry the same unit tests
-// (CscRowsTests.swift ↔ the Rust `csc_rows` tests), and a coefficient change lands in both or
-// neither.
+// (crates/pf-client-core/src/video_color.rs) — the ONE coefficient implementation every
+// punktfunk presenter derives its CSC from. `clients/shared/csc-vectors.json`, which the Rust
+// side writes, holds this port to it (`CscRowsTests`).
 //
 // The rows follow each decoded buffer's signalled matrix (VideoToolbox propagates the HEVC VUI /
 // AV1 colour config onto the CVPixelBuffer's attachments), so a BT.601-tagged stream renders

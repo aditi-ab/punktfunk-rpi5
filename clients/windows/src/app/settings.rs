@@ -22,8 +22,9 @@ use pf_client_core::presets::{PresetsFile, StreamPreset};
 // shared table exists to prevent — which is why this row has no `const` beside AUDIO_CHANNELS.
 use pf_client_core::session::AUDIO_FORMATS;
 use pf_client_core::start;
-use pf_client_core::trust::StatsVerbosity;
+use pf_client_core::trust::{HudCorner, StatsVerbosity};
 use punktfunk_core::config::GamepadPref;
+use punktfunk_core::hud::{stats_scale, STATS_SCALE_PCTS};
 use std::sync::Arc;
 use windows_reactor::*;
 
@@ -108,6 +109,7 @@ const TOUCH_MODES: &[(&str, &str)] = &[
     ("trackpad", "Trackpad"),
     ("pointer", "Direct pointer"),
     ("touch", "Touch passthrough"),
+    ("off", "Off"),
 ];
 /// Physical-mouse presets: `(stored value, display label)` — capture (pointer lock,
 /// relative, for games) vs desktop (uncaptured absolute pointer, for remote desktop
@@ -313,18 +315,9 @@ fn edit_preset_modal(
                     .icon(lucide::icon("copy"))
                     .on_click(move || {
                         let mut catalog = PresetsFile::load();
-                        let Some(source) = catalog.find_by_id(&id).cloned() else {
+                        let Some(new_id) = catalog.duplicate(&id) else {
                             return;
                         };
-                        let name = (2..)
-                            .map(|n| format!("{} {n}", source.name))
-                            .find(|n| !catalog.name_taken(n, None))
-                            .unwrap_or_else(|| source.name.clone());
-                        let mut copy = StreamPreset::new(name);
-                        copy.overrides = source.overrides.clone();
-                        copy.accent = source.accent.clone();
-                        let new_id = copy.id.clone();
-                        catalog.presets.push(copy);
                         if catalog.save().is_ok() {
                             // The sheet stays open and now edits the copy — scope follows it.
                             set_scope.call(new_id);
@@ -468,15 +461,30 @@ pub(super) fn commit(
     rev.1.call(rev.0 + 1);
 }
 
-/// Re-base the process-lifetime settings snapshot on the file — called from the navigation
-/// handlers that (re)enter this page, NOT per render pass. `ctx.settings` is loaded once at
-/// process start and this process is not the file's only writer (a spawned session persists
-/// its match-window size, the console UI and Decky save too — presets.rs documents the
-/// family), so without this the page opens showing values another process already replaced,
-/// which then visibly "jump" the moment a row is touched and `commit`'s rebase pulls the
-/// file in. The field report this fixes: a codec setting that "changed by itself".
+/// Re-base the process-lifetime settings snapshot on the file, and re-probe this device's
+/// hardware — called from the navigation handlers that (re)enter this page, NOT per render
+/// pass. `ctx.settings` is loaded once at process start and this process is not the file's
+/// only writer (a spawned session persists its match-window size, the console UI and Decky
+/// save too — presets.rs documents the family), so without this the page opens showing values
+/// another process already replaced, which then visibly "jump" the moment a row is touched and
+/// `commit`'s rebase pulls the file in.
 pub(crate) fn refresh_snapshot(ctx: &Arc<AppCtx>) {
     *ctx.settings.lock().unwrap() = Settings::load();
+    let (speakers, mics) = pf_client_core::audio::devices().unwrap_or_default();
+    *ctx.probes.lock().unwrap() = DeviceProbes {
+        gpus: crate::gpu::adapter_names(),
+        speakers,
+        mics,
+    };
+}
+
+/// This device's pickable hardware: DXGI adapters and WASAPI endpoints. Probed once per
+/// visit by [`refresh_snapshot`], never on the render each settings commit triggers.
+#[derive(Default)]
+pub(crate) struct DeviceProbes {
+    gpus: Vec<String>,
+    speakers: Vec<pf_client_core::audio::AudioDevice>,
+    mics: Vec<pf_client_core::audio::AudioDevice>,
 }
 
 /// Which tier-P rows the preset in scope overrides. Plain bools rather than a lookup so the
@@ -782,50 +790,230 @@ fn group(header: Option<&str>, fields: Vec<Element>, footer: Option<&str>) -> Ve
     out
 }
 
-/// The settings screen: a stock WinUI `NavigationView` (the Windows-Settings sidebar pattern) —
-/// one pane item per section, the section's card as the content, the built-in back arrow
-/// returning to the host list. `section`/`set_section` are the selected pane tag, held in ROOT
-/// state (this page stays hook-free): `on_selection_changed` is wired in the reactor backend, so
-/// only a root `AsyncSetState` reliably re-renders the new section in. `progress` is the
-/// section-switch entrance tween (0 → 1), mapped onto the content column's opacity + offset.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn settings_page(
-    ctx: &Arc<AppCtx>,
-    set_screen: &AsyncSetState<Screen>,
-    section: &str,
-    set_section: &AsyncSetState<String>,
-    scope_id: &str,
-    set_scope: &AsyncSetState<String>,
-    delete_pending: &Option<String>,
-    set_delete: &AsyncSetState<Option<String>>,
-    edit_open: bool,
-    set_edit: &AsyncSetState<bool>,
-    rev: u64,
-    set_rev: &AsyncSetState<u64>,
-    progress: f64,
-) -> Element {
-    // The layer being edited. A scope pointing at a deleted preset degrades to the defaults,
-    // the same rule a dangling host binding follows.
-    let active = active_preset(scope_id);
-    let scope: &str = match &active {
-        Some(p) => &p.id,
-        None => "",
+/// A section's advanced rows: under an Advanced heading while Show advanced is on or this
+/// preset overrides one of them; otherwise one button naming how many hold a changed value,
+/// which shows them. Nothing when none changed.
+fn advanced_group(cx: &Cx, fields: Vec<Element>, changed: usize, overridden: bool) -> Vec<Element> {
+    if cx.s.show_advanced || overridden {
+        return group(Some("Advanced"), fields, None);
+    }
+    if changed == 0 || cx.preset_mode {
+        return Vec::new();
+    }
+    let label = match changed {
+        1 => "1 advanced setting changed".to_string(),
+        n => format!("{n} advanced settings changed"),
     };
-    let preset_mode = active.is_some();
-    // Which rows this preset overrides — the marker + reset each of them carries. In the
-    // defaults scope nothing is marked, and `described_overridable` degrades to `described_labeled`.
-    let over = OverrideFlags::of(active.as_ref());
-    // Every control shows the EFFECTIVE value: the global underneath with this preset's
-    // overrides on top, so a row the preset doesn't override reads as the live global.
-    let s = {
-        let base = ctx.settings.lock().unwrap().clone();
-        match &active {
-            Some(p) => p.overrides.apply(&base),
-            None => base,
-        }
-    };
+    let (ctx, rev, set_rev) = (cx.ctx.clone(), cx.rev, cx.set_rev.clone());
+    let show = button(label).on_click(move || {
+        // Device-wide, so the global layer whatever the scope.
+        commit(&ctx, "", (rev, &set_rev), |s| s.show_advanced = true);
+    });
+    group(None, vec![show.into()], None)
+}
 
-    // --- Display ---------------------------------------------------------------------------
+/// What every section's rows read: the layer in scope, its effective values, which of them
+/// the preset overrides, and the revision a commit bumps.
+struct Cx<'a> {
+    ctx: &'a Arc<AppCtx>,
+    scope: &'a str,
+    rev: u64,
+    set_rev: &'a AsyncSetState<u64>,
+    s: Settings,
+    over: OverrideFlags,
+    preset_mode: bool,
+    /// Resolution sits on Custom… though the stored size is a listed one.
+    custom_res: bool,
+    set_custom_res: &'a AsyncSetState<bool>,
+}
+
+/// General: session, statistics.
+fn general_section(cx: &Cx) -> Vec<Element> {
+    let Cx {
+        ctx,
+        scope,
+        rev,
+        set_rev,
+        ref s,
+        ref over,
+        preset_mode,
+        ..
+    } = *cx;
+    let auto_wake_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.auto_wake, |s, on| {
+        s.auto_wake = on
+    });
+    // Where a bare launch opens. A device preference like auto-wake beside it: which host this
+    // machine opens on says nothing about how a stream should look, so it is never presetable.
+    let start_in_combo = {
+        let want = start::StartIn::parse(&s.start_in);
+        let names = start::StartIn::ALL
+            .iter()
+            .map(|v| v.label().to_string())
+            .collect();
+        let current = start::StartIn::ALL
+            .iter()
+            .position(|v| *v == want)
+            .unwrap_or(1);
+        setting_combo(ctx, scope, (rev, set_rev), names, current, |s, i| {
+            s.start_in = start::StartIn::ALL[i].as_str().to_string();
+        })
+    };
+    let fullscreen_toggle = setting_toggle(
+        ctx,
+        scope,
+        (rev, set_rev),
+        s.fullscreen_on_stream,
+        |s, on| s.fullscreen_on_stream = on,
+    );
+
+    let (hud_names, hud_i) = presets(STATS_TIERS, |v| *v == s.stats_verbosity());
+    let hud_combo = setting_combo(ctx, scope, (rev, set_rev), hud_names, hud_i, |s, i| {
+        s.set_stats_verbosity(STATS_TIERS[i].0);
+    });
+    let advanced_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.advanced_stats, |s, on| {
+        s.advanced_stats = on
+    });
+    // Explorer hands a URL to the default browser; best-effort, like About's log folder.
+    let stats_docs_button = button("What each number means").on_click(|| {
+        let _ = std::process::Command::new("explorer.exe")
+            .arg("https://docs.punktfunk.unom.io/docs/stats")
+            .spawn();
+    });
+
+    let mut out = group(
+        Some("Session"),
+        vec![described_overridable(
+            (rev, set_rev),
+            scope,
+            "fullscreen_on_stream",
+            "Start streams fullscreen",
+            over.fullscreen_on_stream,
+            fullscreen_toggle,
+            "Go fullscreen when a session starts; F11 or Alt+Enter switches back \
+                 live.",
+        )]
+        .into_iter()
+        // Auto-wake is about this host and this network, not about "Game vs Work" —
+        // it stays global in v1 (design §3, tier H/G).
+        .chain((!preset_mode).then(|| {
+            described_labeled(
+                "Auto-wake on connect",
+                auto_wake_toggle,
+                "Connecting to a saved host that\u{2019}s offline sends Wake-on-LAN and \
+                 waits for it to boot. Turn off if hosts behind a VPN look offline when \
+                 they aren\u{2019}t.",
+            )
+        }))
+        .chain(
+            (!preset_mode).then(|| described_labeled("Start in", start_in_combo, &start_in_help())),
+        )
+        .collect(),
+        None,
+    );
+    let mut stats_rows = vec![described_overridable(
+        (rev, set_rev),
+        scope,
+        "stats_verbosity",
+        "Statistics overlay",
+        over.stats_verbosity,
+        hud_combo,
+        "Live session stats in a corner overlay \u{2014} Compact is a one-line pill, \
+         Detailed adds the stage breakdown. Ctrl+Alt+Shift+S cycles the tiers any time.",
+    )];
+    if !preset_mode {
+        stats_rows.push(stats_docs_button.into());
+    }
+    out.extend(group(Some("Statistics"), stats_rows, None));
+    // Device-wide, and shown in both scopes: it changes what this page lists, not a stream.
+    let show_toggle = setting_toggle(ctx, "", (rev, set_rev), s.show_advanced, |s, on| {
+        s.show_advanced = on
+    });
+    out.extend(group(
+        None,
+        vec![described_labeled(
+            "Show advanced",
+            show_toggle,
+            "Adds the settings most players never need to change.",
+        )],
+        None,
+    ));
+    // Device-wide rows: a preset never carries them.
+    if !preset_mode {
+        let corner = s.hud_corner(HudCorner::TopLeft);
+        let corner_combo = setting_combo(
+            ctx,
+            scope,
+            (rev, set_rev),
+            HudCorner::ALL
+                .iter()
+                .map(|c| c.label().to_string())
+                .collect(),
+            HudCorner::ALL
+                .iter()
+                .position(|c| *c == corner)
+                .unwrap_or(0),
+            |s, i| s.hud_placement = HudCorner::ALL[i].as_name().into(),
+        );
+        let pct = (stats_scale(s.stats_scale_pct) * 100.0).round() as u16;
+        let size_combo = setting_combo(
+            ctx,
+            scope,
+            (rev, set_rev),
+            STATS_SCALE_PCTS.iter().map(|p| format!("{p} %")).collect(),
+            STATS_SCALE_PCTS.iter().position(|p| *p == pct).unwrap_or(1),
+            |s, i| s.stats_scale_pct = STATS_SCALE_PCTS[i],
+        );
+        let hint_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.exit_hint, |s, on| {
+            s.exit_hint = on
+        });
+        let changed = usize::from(s.advanced_stats)
+            + usize::from(corner != HudCorner::TopLeft)
+            + usize::from(pct != 100)
+            + usize::from(!s.exit_hint);
+        out.extend(advanced_group(
+            cx,
+            vec![
+                described_labeled(
+                    "Advanced statistics",
+                    advanced_toggle,
+                    "Off shows the figures Moonlight's overlay also shows. On shows capture \
+                     to glass as p50/p95 and every stage between.",
+                ),
+                described_labeled(
+                    "Statistics position",
+                    corner_combo,
+                    "The corner the statistics overlay sits in.",
+                ),
+                described_labeled(
+                    "Statistics size",
+                    size_combo,
+                    "The overlay's size, on top of your display's scaling.",
+                ),
+                described_labeled(
+                    "Exit hint",
+                    hint_toggle,
+                    "Shows how to leave for a few seconds when a stream starts.",
+                ),
+            ],
+            changed,
+            false,
+        ));
+    }
+    out
+}
+
+/// Display: resolution, quality, decoding, presentation, host output.
+fn display_section(cx: &Cx) -> Vec<Element> {
+    let Cx {
+        ctx,
+        scope,
+        rev,
+        set_rev,
+        ref s,
+        ref over,
+        preset_mode,
+        ..
+    } = *cx;
     // The Aspect combo picks a family and lands on its size nearest the current height. The
     // Resolution combo is the D1 tri-state — Native, Match window (a virtual index 1, stored
     // as the `match_window` flag) — then that family's sizes.
@@ -841,14 +1029,22 @@ pub(crate) fn settings_page(
             (s.width, s.height) = nearest(i, s.height);
         },
     );
+    // Native, Match window, the family's sizes, then Custom…, which shows Width and Height.
+    // A size no family lists is Custom whatever the flag says.
     let sizes = ASPECTS[family].sizes;
+    let custom_i = sizes.len() + 2;
+    let custom =
+        !s.match_window && s.width != 0 && (cx.custom_res || !sizes.contains(&(s.width, s.height)));
     let (res_names, res_i) = {
         let names: Vec<String> = ["Native display".to_string(), "Match window".to_string()]
             .into_iter()
             .chain(sizes.iter().map(|&(w, h)| format!("{w} \u{00D7} {h}")))
+            .chain(["Custom\u{2026}".to_string()])
             .collect();
         let i = if s.match_window {
             1
+        } else if custom {
+            custom_i
         } else {
             sizes
                 .iter()
@@ -857,10 +1053,57 @@ pub(crate) fn settings_page(
         };
         (names, i)
     };
-    let res_combo = setting_combo(ctx, scope, (rev, set_rev), res_names, res_i, move |s, i| {
-        s.match_window = i == 1;
-        (s.width, s.height) = if i <= 1 { (0, 0) } else { sizes[i - 2] };
-    });
+    let res_combo = {
+        let set_custom = cx.set_custom_res.clone();
+        setting_combo(ctx, scope, (rev, set_rev), res_names, res_i, move |s, i| {
+            set_custom.call(i == custom_i);
+            s.match_window = i == 1;
+            (s.width, s.height) = match i {
+                0 | 1 => (0, 0),
+                // Custom starts from the size shown, or 1080p from Native.
+                i if i == custom_i && s.width == 0 => (1920, 1080),
+                i if i == custom_i => (s.width, s.height),
+                i => sizes[i - 2],
+            };
+        })
+    };
+    // Each box writes its side through the shared rule, keeping the other side as stored.
+    let size_box = |value: u32, min: u32, width: bool| {
+        let (ctx, scope, set_rev) = (ctx.clone(), scope.to_string(), set_rev.clone());
+        NumberBox::new(f64::from(value))
+            .range(f64::from(min), 8192.0)
+            .on_value_changed(move |v: f64| {
+                commit(&ctx, &scope, (rev, &set_rev), |s| {
+                    let typed = v.clamp(0.0, 8192.0) as u32;
+                    let (w, h) = if width {
+                        (typed, s.height)
+                    } else {
+                        (s.width, typed)
+                    };
+                    (s.width, s.height) = punktfunk_core::resolutions::custom(w, h, &s.codec);
+                    s.match_window = false;
+                });
+            })
+    };
+    let res_control: Element = if custom {
+        vstack((
+            Element::from(res_combo),
+            hstack((
+                size_box(s.width, punktfunk_core::resolutions::MIN_WIDTH, true)
+                    .header("Width")
+                    .width(120.0),
+                text_block("\u{00D7}").vertical_alignment(VerticalAlignment::Bottom),
+                size_box(s.height, punktfunk_core::resolutions::MIN_HEIGHT, false)
+                    .header("Height")
+                    .width(120.0),
+            ))
+            .spacing(8.0),
+        ))
+        .spacing(8.0)
+        .into()
+    } else {
+        res_combo.into()
+    };
     let (hz_names, hz_i) = {
         let names: Vec<String> = REFRESH
             .iter()
@@ -896,34 +1139,6 @@ pub(crate) fn settings_page(
     let comp_combo = setting_combo(ctx, scope, (rev, set_rev), comp_names, comp_i, |s, i| {
         s.compositor = COMPOSITORS[i].0.to_string();
     });
-    let auto_wake_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.auto_wake, |s, on| {
-        s.auto_wake = on
-    });
-    // Where a bare launch opens. A device preference like auto-wake beside it: which host this
-    // machine opens on says nothing about how a stream should look, so it is never presetable.
-    let start_in_combo = {
-        let want = start::StartIn::parse(&s.start_in);
-        let names = start::StartIn::ALL
-            .iter()
-            .map(|v| v.label().to_string())
-            .collect();
-        let current = start::StartIn::ALL
-            .iter()
-            .position(|v| *v == want)
-            .unwrap_or(1);
-        setting_combo(ctx, scope, (rev, set_rev), names, current, |s, i| {
-            s.start_in = start::StartIn::ALL[i].as_str().to_string();
-        })
-    };
-    let fullscreen_toggle = setting_toggle(
-        ctx,
-        scope,
-        (rev, set_rev),
-        s.fullscreen_on_stream,
-        |s, on| s.fullscreen_on_stream = on,
-    );
-
-    // --- Video -----------------------------------------------------------------------------
     // Migrated for the LOOKUP only (the store is left alone): a pre-M10 settings file
     // holds `vulkan`/`d3d11va`, which match no preset — the combo would show Automatic and
     // a save would silently rewrite the user's hardware preference to `auto`.
@@ -934,7 +1149,7 @@ pub(crate) fn settings_page(
     });
     // GPU picker, only on a multi-GPU box (hybrid laptop, eGPU): which adapter decodes + presents.
     // Stored as the adapter description; empty = automatic (the window's monitor's adapter).
-    let gpus = crate::gpu::adapter_names();
+    let gpus = ctx.probes.lock().unwrap().gpus.clone();
     let gpu_combo = (gpus.len() > 1).then(|| {
         let mut names = vec!["Automatic (the display's GPU)".to_string()];
         names.extend(gpus.iter().cloned());
@@ -963,6 +1178,8 @@ pub(crate) fn settings_page(
         let (ctx, scope, set_rev) = (ctx.clone(), scope.to_string(), set_rev.clone());
         NumberBox::new(f64::from(s.bitrate_kbps) / 1000.0)
             .range(0.0, 3000.0)
+            // PyroWave sets its own rate; the stored one stays for the other codecs.
+            .enabled(s.codec != "pyrowave")
             .on_value_changed(move |v: f64| {
                 commit(&ctx, &scope, (rev, &set_rev), |s| {
                     s.bitrate_kbps = (v.clamp(0.0, 3000.0) * 1000.0) as u32;
@@ -1009,7 +1226,362 @@ pub(crate) fn settings_page(
         s.allow_vrr = on
     });
 
-    // --- Input -----------------------------------------------------------------------------
+    let mut out = group(
+        Some("Resolution"),
+        vec![
+            described_labeled(
+                "Aspect ratio",
+                aspect_combo,
+                "Which shapes the Resolution list offers. Picking one moves to its \
+                 size nearest the current height.",
+            ),
+            described_overridable(
+                (rev, set_rev),
+                scope,
+                "resolution",
+                "Resolution",
+                over.resolution,
+                res_control,
+                "The host drives a real virtual output at exactly this size \u{2014} true \
+                 pixels, no scaling. \u{201C}Native display\u{201D} follows the monitor this \
+                 window is on; \u{201C}Match window\u{201D} keeps the picture pixel-exact \
+                 (1:1) through every resize.",
+            ),
+            described_overridable(
+                (rev, set_rev),
+                scope,
+                "refresh_hz",
+                "Refresh rate",
+                over.refresh_hz,
+                hz_combo,
+                "\u{201C}Native\u{201D} resolves to this display\u{2019}s refresh rate at \
+                 connect.",
+            ),
+        ],
+        None,
+    );
+    out.extend(group(
+        Some("Picture"),
+        vec![
+            described_overridable(
+                (rev, set_rev),
+                scope,
+                "bitrate_kbps",
+                "Bitrate (Mb/s, 0 = automatic)",
+                over.bitrate_kbps,
+                bitrate_box,
+                if s.codec == "pyrowave" {
+                    "PyroWave sets its own rate from the stream mode."
+                } else {
+                    "0 lets the host decide (its default, clamped to what it supports). A \
+                     host card\u{2019}s context menu has a network speed test."
+                },
+            ),
+            described_overridable(
+                (rev, set_rev),
+                scope,
+                "video_fit",
+                "Picture fit",
+                over.video_fit,
+                fit_combo,
+                "When the stream's shape differs from the window. Fit shows the whole \
+                 picture with black bars, Crop to fill cuts the edges off, Stretch to \
+                 fill distorts it.",
+            ),
+            described_overridable(
+                (rev, set_rev),
+                scope,
+                "hdr_enabled",
+                "10-bit HDR",
+                over.hdr_enabled,
+                hdr_toggle,
+                "HDR10, when the host has HDR content and this display supports it. \
+                 With H.264 the stream stays SDR.",
+            ),
+            described_overridable(
+                (rev, set_rev),
+                scope,
+                "present_priority",
+                "Prioritize",
+                over.present_priority,
+                present_combo,
+                "Lowest latency shows each frame the moment the display can take \
+                 it \u{2014} a network hiccup becomes an occasional repeated or \
+                 skipped frame. Smoothness buffers a little to even those out.",
+            ),
+        ],
+        // The one form-level note, exactly as on Apple.
+        Some("Display changes apply from the next session."),
+    ));
+
+    let d = Settings::default();
+    let mut advanced = Vec::new();
+    if smoothing {
+        advanced.push(described_overridable(
+            (rev, set_rev),
+            scope,
+            "smooth_buffer",
+            "Smoothness buffer",
+            over.smooth_buffer,
+            buffer_combo,
+            "Frames held back before showing. Each one absorbs about a refresh of \
+             network hiccup and adds a refresh of delay. Automatic holds two.",
+        ));
+    }
+    advanced.extend([
+        described_overridable(
+            (rev, set_rev),
+            scope,
+            "render_scale",
+            "Render scale",
+            over.render_scale,
+            scale_combo,
+            "Above native supersamples for sharpness; below renders lighter on the \
+             host and the link. This device resamples the result to the window.",
+        ),
+        described_overridable(
+            (rev, set_rev),
+            scope,
+            "codec",
+            "Video codec",
+            over.codec,
+            codec_combo,
+            "A preference \u{2014} the host falls back if it can\u{2019}t encode it. \
+             PyroWave is the low-latency wavelet codec for a WIRED link: it trades \
+             bitrate (hundreds of Mb/s) for near-zero decode time, so it wants \
+             gigabit Ethernet.",
+        ),
+        // First sentence shared with the GTK client (its chroma_row); the constraint
+        // sentence names the real gate (host: PyroWave || NVENC).
+        described_overridable(
+            (rev, set_rev),
+            scope,
+            "enable_444",
+            "Full chroma (4:4:4)",
+            over.enable_444,
+            chroma_toggle,
+            "Full-colour video: crisp small text and thin lines, at more bandwidth. \
+             Requires an NVIDIA host (NVENC) or the PyroWave codec \u{2014} other \
+             encoders stream 4:2:0.",
+        ),
+        described_overridable(
+            (rev, set_rev),
+            scope,
+            "ten_bit_sdr",
+            "10-bit SDR",
+            over.ten_bit_sdr,
+            ten_bit_sdr_toggle,
+            "Smoother gradients without HDR \u{2014} the picture is encoded at 10-bit \
+             precision. Needs an NVIDIA host; HDR takes over when it engages.",
+        ),
+        described_overridable(
+            (rev, set_rev),
+            scope,
+            "vsync",
+            "V-Sync",
+            over.vsync,
+            vsync_toggle,
+            "Tear-free. Turning it off removes the wait for the screen\u{2019}s refresh \
+             \u{2014} the lowest possible delay, at the cost of visible tearing. Not \
+             every driver offers it; the stats overlay names the mode actually in use.",
+        ),
+        described_overridable(
+            (rev, set_rev),
+            scope,
+            "allow_vrr",
+            "Follow variable refresh",
+            over.allow_vrr,
+            vrr_toggle,
+            "On a VRR/FreeSync/G-Sync screen, let the panel refresh in step with the \
+             stream instead of on a fixed cadence. Applies to fullscreen sessions; \
+             harmless on a fixed-refresh screen.",
+        ),
+        described_overridable(
+            (rev, set_rev),
+            scope,
+            "compositor",
+            "Host compositor",
+            over.compositor,
+            comp_combo,
+            "The backend the host uses for its virtual output (Linux hosts only). A \
+             specific choice falls back to auto-detection when that backend \
+             isn\u{2019}t available.",
+        ),
+    ]);
+    // Decoder and GPU are facts about THIS device's hardware — never per preset.
+    if !preset_mode {
+        advanced.push(described_labeled(
+            "Video decoder",
+            decoder_combo,
+            "Automatic picks the hardware path this GPU does best \u{2014} Direct3D 11 on \
+             Intel, Vulkan Video on NVIDIA and AMD \u{2014} and falls back to the CPU. \
+             Change it only when debugging.",
+        ));
+        if let Some(c) = gpu_combo {
+            advanced.push(described_labeled(
+                "GPU",
+                c,
+                "Which adapter decodes and presents the stream. Automatic uses the GPU \
+                 driving this window\u{2019}s display.",
+            ));
+        }
+    }
+    let changed = [
+        smoothing && s.smooth_buffer != d.smooth_buffer,
+        s.render_scale != d.render_scale,
+        s.codec != d.codec,
+        s.enable_444 != d.enable_444,
+        s.ten_bit_sdr != d.ten_bit_sdr,
+        s.vsync != d.vsync,
+        s.allow_vrr != d.allow_vrr,
+        s.compositor != d.compositor,
+        stored_decoder != d.decoder,
+        !s.adapter.is_empty(),
+    ];
+    let overridden = over.smooth_buffer
+        || over.render_scale
+        || over.codec
+        || over.enable_444
+        || over.ten_bit_sdr
+        || over.vsync
+        || over.allow_vrr
+        || over.compositor;
+    out.extend(advanced_group(
+        cx,
+        advanced,
+        changed.into_iter().filter(|c| *c).count(),
+        overridden,
+    ));
+    out
+}
+
+/// Input: touch, keyboard and mouse.
+fn input_section(cx: &Cx) -> Vec<Element> {
+    let Cx {
+        ctx,
+        scope,
+        rev,
+        set_rev,
+        ref s,
+        ref over,
+        ..
+    } = *cx;
+    let (touch_names, touch_i) = presets(TOUCH_MODES, |v| *v == s.touch_mode);
+    let touch_combo = setting_combo(ctx, scope, (rev, set_rev), touch_names, touch_i, |s, i| {
+        s.touch_mode = TOUCH_MODES[i].0.to_string();
+    });
+    let (mouse_names, mouse_i) = presets(MOUSE_MODES, |v| *v == s.mouse_mode);
+    let mouse_combo = setting_combo(ctx, scope, (rev, set_rev), mouse_names, mouse_i, |s, i| {
+        s.mouse_mode = MOUSE_MODES[i].0.to_string();
+    });
+    let invert_scroll_toggle =
+        setting_toggle(ctx, scope, (rev, set_rev), s.invert_scroll, |s, on| {
+            s.invert_scroll = on
+        });
+    let shortcuts_toggle =
+        setting_toggle(ctx, scope, (rev, set_rev), s.inhibit_shortcuts, |s, on| {
+            s.inhibit_shortcuts = on
+        });
+
+    let mut out = group(
+        Some("Touch & pointer"),
+        vec![described_overridable(
+            (rev, set_rev),
+            scope,
+            "touch_mode",
+            "Touch input",
+            over.touch_mode,
+            touch_combo,
+            "How a touchscreen drives the host: Trackpad moves the host cursor like a \
+             laptop trackpad (tap to click), Direct pointer jumps the cursor to wherever \
+             you touch, Touch passthrough sends real multi-touch through.",
+        )],
+        None,
+    );
+    out.extend(group(
+        Some("Keyboard & mouse"),
+        vec![
+            described_overridable(
+                (rev, set_rev),
+                scope,
+                "mouse_mode",
+                "Mouse input",
+                over.mouse_mode,
+                mouse_combo,
+                "Capture locks the pointer to the stream and sends relative motion — \
+                 best for games. Desktop leaves the pointer free to enter and leave \
+                 the stream and sends absolute positions — best for remote desktop \
+                 work. Ctrl+Alt+Shift+M switches live.",
+            ),
+            described_overridable(
+                (rev, set_rev),
+                scope,
+                "inhibit_shortcuts",
+                "Capture system shortcuts",
+                over.inhibit_shortcuts,
+                shortcuts_toggle,
+                "Alt+Tab, the Windows key and friends reach the host while the stream \
+                 has input captured. Off, they act on this machine instead.",
+            ),
+            described_overridable(
+                (rev, set_rev),
+                scope,
+                "invert_scroll",
+                "Invert scroll direction",
+                over.invert_scroll,
+                invert_scroll_toggle,
+                "Reverses the wheel and trackpad scroll direction sent to the host.",
+            ),
+        ],
+        None,
+    ));
+    out
+}
+
+/// The quick-action ring, edited on the ring itself (design touch-client-overlay.md
+/// §3.3). The editor commits every edit itself; the override marker is the page's.
+fn quick_actions_section(cx: &Cx) -> Vec<Element> {
+    let Cx {
+        ctx,
+        scope,
+        rev,
+        set_rev,
+        ref over,
+        ..
+    } = *cx;
+    vec![described_overridable(
+        (rev, set_rev),
+        scope,
+        "overlay_actions",
+        "Quick actions",
+        over.overlay_actions,
+        component(
+            super::quick_actions::quick_actions_section,
+            super::quick_actions::Props {
+                ctx: ctx.clone(),
+                scope: scope.to_string(),
+                rev,
+                set_rev: set_rev.clone(),
+            },
+        ),
+        "The dial Ctrl+Alt+Shift+O, a two-finger twist or Select+A opens in a stream: what \
+         its six buttons hold, and the shortcut chords they can send. A preset that \
+         changes it owns the whole dial.",
+    )]
+}
+
+/// Controllers: the pad inventory, forwarding and the emulated pad.
+fn controllers_section(cx: &Cx) -> Vec<Element> {
+    let Cx {
+        ctx,
+        scope,
+        rev,
+        set_rev,
+        ref s,
+        ref over,
+        preset_mode,
+        ..
+    } = *cx;
     // Controller forwarding: Automatic forwards EVERY real controller, each as its own pad;
     // pinning one restricts the session to that single controller (single-player). Persisted
     // by stable key (`Settings::forward_pad`, GTK parity) so the pin survives restarts AND
@@ -1054,12 +1626,9 @@ pub(crate) fn settings_page(
                 s.forward_pad = key.unwrap_or_default();
                 s.save();
             })
-            // Dimmed with the master switch above it, like echo cancellation under the mic
-            // (see that row) — this and the three below have nothing to act on while no
-            // controller is forwarded at all. Every commit bumps `rev` and re-renders this
-            // screen, so they follow the toggle live. Brings this client in line with how GTK
-            // (`set_sensitive`), the touch settings on both mobile clients (`enabled`) and the
-            // console UI (dim + refuse the step) have always drawn the same relationship.
+            // Dimmed with the master switch above it, like echo cancellation under the mic:
+            // this and the three below have nothing to act on while no controller is
+            // forwarded. Every commit bumps `rev` and re-renders, so they follow it live.
             .enabled(s.gamepad_forwarding)
     };
     let pad_forward_toggle =
@@ -1110,24 +1679,165 @@ pub(crate) fn settings_page(
         },
     )
     .enabled(s.gamepad_forwarding);
-    let (touch_names, touch_i) = presets(TOUCH_MODES, |v| *v == s.touch_mode);
-    let touch_combo = setting_combo(ctx, scope, (rev, set_rev), touch_names, touch_i, |s, i| {
-        s.touch_mode = TOUCH_MODES[i].0.to_string();
-    });
-    let (mouse_names, mouse_i) = presets(MOUSE_MODES, |v| *v == s.mouse_mode);
-    let mouse_combo = setting_combo(ctx, scope, (rev, set_rev), mouse_names, mouse_i, |s, i| {
-        s.mouse_mode = MOUSE_MODES[i].0.to_string();
-    });
-    let invert_scroll_toggle =
-        setting_toggle(ctx, scope, (rev, set_rev), s.invert_scroll, |s, on| {
-            s.invert_scroll = on
-        });
-    let shortcuts_toggle =
-        setting_toggle(ctx, scope, (rev, set_rev), s.inhibit_shortcuts, |s, on| {
-            s.inhibit_shortcuts = on
-        });
 
-    // --- Audio -----------------------------------------------------------------------------
+    let mut out = group(
+        None,
+        [
+            // The read-only pad inventory (GTK parity): what THIS device sees right
+            // now — the fastest answer to "is my controller even detected?". A
+            // device fact, so defaults scope only, like the forward picker below.
+            (!preset_mode).then(|| {
+                let inventory: Element = if pads.is_empty() {
+                    text_block("No controllers detected")
+                        .font_size(12.0)
+                        .foreground(ThemeRef::SecondaryText)
+                        .into()
+                } else {
+                    vstack(
+                        pads.iter()
+                            .map(|p| {
+                                let sub = if p.steam_virtual {
+                                    "Steam Input's virtual pad \u{2014} Automatic skips \
+                                     it while a real pad is connected"
+                                        .to_string()
+                                } else {
+                                    p.kind_label().to_string()
+                                };
+                                vstack((
+                                    text_block(p.name.clone()).semibold(),
+                                    text_block(sub)
+                                        .font_size(11.0)
+                                        .foreground(ThemeRef::SecondaryText),
+                                ))
+                                .spacing(1.0)
+                                .into()
+                            })
+                            .collect::<Vec<Element>>(),
+                    )
+                    .spacing(8.0)
+                    .into()
+                };
+                described_labeled(
+                    "Detected controllers",
+                    inventory,
+                    "Plug in or pair a controller and it appears here.",
+                )
+            }),
+            Some(described_overridable(
+                (rev, set_rev),
+                scope,
+                "gamepad",
+                "Controller type",
+                over.gamepad,
+                pad_combo,
+                "The virtual pad created on the host. Automatic matches your controller \
+                 \u{2014} a DualSense keeps adaptive triggers, lightbar, touchpad and \
+                 motion.",
+            )),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        Some("Applies from the next session."),
+    );
+
+    let d = Settings::default();
+    let mut advanced = vec![
+        // Whether ANY controller is forwarded — presetable, so it renders in both scopes
+        // (a "Work" preset can decline what "Game" forwards).
+        described_overridable(
+            (rev, set_rev),
+            scope,
+            "gamepad_forwarding",
+            "Forward controllers",
+            over.gamepad_forwarding,
+            pad_forward_toggle,
+            "Sends controllers connected to this PC to the host. Turn it off when your \
+             controller already reaches the host another way \u{2014} USB passthrough \
+             such as VirtualHere, or a pad plugged into the host itself \u{2014} so games \
+             don't see two of them. Off, this PC never opens the controller at all, which \
+             is what leaves it free for a passthrough tool to claim.",
+        ),
+    ];
+    // Which physical pad this device forwards is a device fact (tier G): defaults scope
+    // only. Apple forwards ONE pad as player 1; this client forwards each as its own player.
+    if !preset_mode {
+        advanced.push(described_labeled(
+            "Use controller",
+            forward_combo,
+            "Every connected controller is forwarded, each as its own player. Pick one to \
+             force single-player \u{2014} only it reaches the host.",
+        ));
+    }
+    advanced.extend([
+        described_overridable(
+            (rev, set_rev),
+            scope,
+            "system_buttons",
+            "Guide button",
+            over.system_buttons,
+            sysbtn_combo,
+            "Where the guide (Xbox/PS) and quick-access presses go while streaming. \
+             Automatic sends them to the host \u{2014} except on devices whose own overlay \
+             reacts to the same press (Gaming Mode), where they stay local and the gesture \
+             below reaches the host.",
+        ),
+        described_overridable(
+            (rev, set_rev),
+            scope,
+            "guide_gesture",
+            "Hold Select for guide",
+            over.guide_gesture,
+            gesture_combo,
+            "Hold Select on its own to press the host's guide button \u{2014} keep holding \
+             for a Gaming-Mode host's quick-access menu. A Select tap still goes through, \
+             slightly delayed. Automatic arms it only where the real button can't reach \
+             the host.",
+        ),
+    ]);
+    if !preset_mode {
+        advanced.push(described_labeled(
+            "Controller haptics",
+            pad_haptics_toggle,
+            "Play a DualSense's voice-coil haptics on the pad itself. Wired pads only, and \
+             only while controllers are forwarded.",
+        ));
+        advanced.push(described_labeled(
+            "Controller speaker",
+            pad_speaker_toggle,
+            "Play the audio a game sends to the pad's own speaker on the pad, not through \
+             this PC.",
+        ));
+    }
+    let changed = [
+        s.gamepad_forwarding != d.gamepad_forwarding,
+        !s.forward_pad.is_empty(),
+        s.system_buttons != d.system_buttons,
+        s.guide_gesture != d.guide_gesture,
+        s.pad_haptics != d.pad_haptics,
+        s.pad_speaker != d.pad_speaker,
+    ];
+    out.extend(advanced_group(
+        cx,
+        advanced,
+        changed.into_iter().filter(|c| *c).count(),
+        over.gamepad_forwarding || over.system_buttons || over.guide_gesture,
+    ));
+    out
+}
+
+/// Audio: channels, format, host audio, microphone and this device's endpoints.
+fn audio_section(cx: &Cx) -> Vec<Element> {
+    let Cx {
+        ctx,
+        scope,
+        rev,
+        set_rev,
+        ref s,
+        ref over,
+        preset_mode,
+        ..
+    } = *cx;
     let (ac_names, ac_i) = presets(AUDIO_CHANNELS, |v| *v == s.audio_channels);
     let channels_combo = setting_combo(ctx, scope, (rev, set_rev), ac_names, ac_i, |s, i| {
         s.audio_channels = AUDIO_CHANNELS[i].0;
@@ -1149,8 +1859,12 @@ pub(crate) fn settings_page(
     // Endpoint pickers (the WASAPI probe — the GTK client's PipeWire twins): visible
     // labels are friendly names, the stored value is the endpoint id. Hidden when the
     // probe found at most the default; a saved device that's gone keeps a revertable
-    // "(not detected)" entry, like the GPU row. Device facts — defaults scope only.
-    let (speakers, mics) = pf_client_core::audio::devices().unwrap_or_default();
+    // "(not detected)" entry, like the GPU row. Device facts — defaults scope only, probed
+    // once per visit (`refresh_snapshot`).
+    let (speakers, mics) = {
+        let p = ctx.probes.lock().unwrap();
+        (p.speakers.clone(), p.mics.clone())
+    };
     let dev_combo = |saved: &str,
                      devs: &[pf_client_core::audio::AudioDevice],
                      apply: fn(&mut Settings, String)| {
@@ -1180,42 +1894,135 @@ pub(crate) fn settings_page(
     })
     .enabled(s.mic_enabled);
 
-    let (hud_names, hud_i) = presets(STATS_TIERS, |v| *v == s.stats_verbosity());
-    let hud_combo = setting_combo(ctx, scope, (rev, set_rev), hud_names, hud_i, |s, i| {
-        s.set_stats_verbosity(STATS_TIERS[i].0);
-    });
-    let advanced_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.advanced_stats, |s, on| {
-        s.advanced_stats = on
-    });
-    // Explorer hands a URL to the default browser; best-effort, like the log folder below.
-    let stats_docs_button = button("What each number means").on_click(|| {
-        let _ = std::process::Command::new("explorer.exe")
-            .arg("https://docs.punktfunk.unom.io/docs/stats")
-            .spawn();
-    });
+    let mut out = group(
+        None,
+        [
+            Some(described_overridable(
+                (rev, set_rev),
+                scope,
+                "audio_channels",
+                "Audio channels",
+                over.audio_channels,
+                channels_combo,
+                "The speaker layout requested from the host. It downmixes if its own \
+                 output has fewer channels.",
+            )),
+            // The endpoint picks are facts about THIS device's hardware — never
+            // per preset, like Decoder/GPU.
+            (!preset_mode)
+                .then(|| {
+                    speaker_combo.map(|c| {
+                        described_labeled(
+                            "Speaker",
+                            c,
+                            "Host audio plays here \u{2014} System default follows \
+                             the Windows output device.",
+                        )
+                    })
+                })
+                .flatten(),
+            Some(described_overridable(
+                (rev, set_rev),
+                scope,
+                "mic_enabled",
+                "Stream microphone",
+                over.mic_enabled,
+                mic_toggle,
+                "This device\u{2019}s microphone feeds the host\u{2019}s virtual mic. \
+                 Ctrl+Alt+Shift+V mutes and unmutes it during a stream.",
+            )),
+            (!preset_mode)
+                .then(|| {
+                    mic_dev_combo.map(|c| {
+                        described_labeled(
+                            "Microphone",
+                            c,
+                            "The input that feeds the host\u{2019}s virtual mic.",
+                        )
+                    })
+                })
+                .flatten(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        Some("Applies from the next session."),
+    );
 
+    let d = Settings::default();
+    let stereo = s.audio_channels == 2;
+    let mut advanced = Vec::new();
+    // Stereo-only, so HIDDEN under 5.1/7.1: a lossless surround frame does not fit one
+    // QUIC datagram at the default MTU (design/hi-res-audio.md §4.2).
+    if stereo {
+        advanced.push(described_overridable(
+            (rev, set_rev),
+            scope,
+            "audio_format",
+            "Audio quality",
+            over.audio_format,
+            format_combo,
+            "Lossless sends uncompressed PCM instead of Opus \u{2014} bit-exact, at \
+             2.3\u{2013}4.6 Mb/s taken off the top of the link and outside the \
+             automatic-bitrate loop. The host has its own switch, off by default, and \
+             quietly stays on Opus if it can\u{2019}t deliver the rate; the stats overlay \
+             names what the session actually got.",
+        ));
+    }
+    advanced.extend([
+        described_overridable(
+            (rev, set_rev),
+            scope,
+            "keep_host_audio",
+            "Keep host audio playing",
+            over.keep_host_audio,
+            keep_host_audio_toggle,
+            "The host\u{2019}s own speakers or headphones keep playing while you stream \
+             \u{2014} both ends hear the same audio. Needs a host on 0.32 or newer.",
+        ),
+        described_overridable(
+            (rev, set_rev),
+            scope,
+            "echo_cancel",
+            "Echo cancellation",
+            over.echo_cancel,
+            echo_toggle,
+            "Keeps the host\u{2019}s audio, playing from this machine\u{2019}s speakers, \
+             from being picked up and sent straight back. Turn it off if your microphone \
+             already does its own processing.",
+        ),
+    ]);
+    let changed = [
+        stereo && s.audio_format != d.audio_format,
+        s.keep_host_audio != d.keep_host_audio,
+        s.echo_cancel != d.echo_cancel,
+    ];
+    out.extend(advanced_group(
+        cx,
+        advanced,
+        changed.into_iter().filter(|c| *c).count(),
+        over.audio_format || over.keep_host_audio || over.echo_cancel,
+    ));
+    out
+}
+
+/// About: identity and version, the log folder, licenses.
+fn about_section(set_screen: &AsyncSetState<Screen>) -> Vec<Element> {
     let licenses_button = {
         let ss = set_screen.clone();
         button("Third-party licenses").on_click(move || ss.call(Screen::Licenses))
     };
-    // The client log's home — the file every "check the client log" message means, which until
-    // this row had no way in from the UI at all. The folder rather than the file so the rotated
-    // `.old` generation is in reach too.
-    //
-    // `real_dir` (not the literal %LOCALAPPDATA% path) because Explorer lives outside our MSIX
-    // container: handed a path the package redirection keeps from ever existing, it silently
-    // opens the user's Documents folder instead of failing, which is precisely what this button
-    // shipped doing. The `is_dir` guard keeps that fallback unreachable — if the resolve ever
-    // comes back wrong, the click does nothing rather than landing somewhere misleading.
-    // Best-effort otherwise, like the log itself: a failed spawn stays silent.
+    // The client log's folder, so the rotated `.old` generation is in reach too. `real_dir`,
+    // not the literal %LOCALAPPDATA% path: Explorer lives outside the MSIX container and opens
+    // Documents for a redirected path. The `is_dir` guard keeps that fallback unreachable; a
+    // failed spawn stays silent.
     let logs_button = button("Open log folder").on_click(|| {
         if let Some(dir) = crate::logfile::real_dir().filter(|d| d.is_dir()) {
             let _ = std::process::Command::new("explorer.exe").arg(&dir).spawn();
         }
     });
-    // App identity + version at the top of the About card (the WinUI Settings convention; the About
-    // screen previously showed no version at all). CARGO_PKG_VERSION is the workspace version, baked
-    // in at compile time.
+    // App identity + version at the top of the About card (the WinUI Settings convention).
+    // CARGO_PKG_VERSION is the workspace version, baked in at compile time.
     let about_identity = vstack((
         text_block("Punktfunk").font_size(20.0).semibold(),
         text_block(concat!("Version ", env!("CARGO_PKG_VERSION")))
@@ -1224,614 +2031,89 @@ pub(crate) fn settings_page(
     ))
     .spacing(2.0);
 
+    group(
+        None,
+        vec![
+            about_identity.into(),
+            described_labeled(
+                "Diagnostics",
+                logs_button,
+                "The client log (client.log, plus the session\u{2019}s whole \
+                 receive/decode/present trail) \u{2014} attach it to a bug report.",
+            ),
+            licenses_button.into(),
+        ],
+        None,
+    )
+}
+
+/// The settings screen: a stock WinUI `NavigationView` (the Windows-Settings sidebar pattern) —
+/// one pane item per section, the section's card as the content, the built-in back arrow
+/// returning to the host list. `section`/`set_section` are the selected pane tag, held in ROOT
+/// state (this page stays hook-free): `on_selection_changed` is wired in the reactor backend, so
+/// only a root `AsyncSetState` reliably re-renders the new section in. `progress` is the
+/// section-switch entrance tween (0 → 1), mapped onto the content column's opacity + offset.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn settings_page(
+    ctx: &Arc<AppCtx>,
+    set_screen: &AsyncSetState<Screen>,
+    section: &str,
+    set_section: &AsyncSetState<String>,
+    scope_id: &str,
+    set_scope: &AsyncSetState<String>,
+    delete_pending: &Option<String>,
+    set_delete: &AsyncSetState<Option<String>>,
+    edit_open: bool,
+    set_edit: &AsyncSetState<bool>,
+    custom_res: bool,
+    set_custom_res: &AsyncSetState<bool>,
+    rev: u64,
+    set_rev: &AsyncSetState<u64>,
+    progress: f64,
+) -> Element {
+    // The layer being edited. A scope pointing at a deleted preset degrades to the defaults,
+    // the same rule a dangling host binding follows.
+    let active = active_preset(scope_id);
+    let scope: &str = match &active {
+        Some(p) => &p.id,
+        None => "",
+    };
+    let preset_mode = active.is_some();
+    // Which rows this preset overrides — the marker + reset each of them carries. In the
+    // defaults scope nothing is marked, and `described_overridable` degrades to `described_labeled`.
+    let over = OverrideFlags::of(active.as_ref());
+    // Every control shows the EFFECTIVE value: the global underneath with this preset's
+    // overrides on top, so a row the preset doesn't override reads as the live global.
+    let s = {
+        let base = ctx.settings.lock().unwrap().clone();
+        match &active {
+            Some(p) => p.overrides.apply(&base),
+            None => base,
+        }
+    };
+
+    let cx = Cx {
+        ctx,
+        scope,
+        rev,
+        set_rev,
+        s,
+        over,
+        preset_mode,
+        custom_res,
+        set_custom_res,
+    };
     // The selected section's content, grouped exactly like the Apple client's categories
-    // (SettingsCategory + SettingsView+Sections.swift). Each field's explanation sits under
-    // it; the only form-level notes are the "applies from the next session" footers, matching
-    // Apple's decision to keep exactly one of those per affected category.
+    // (SettingsCategory + SettingsView+Sections.swift). Each section builds only its own rows.
     let (title, groups): (&str, Vec<Element>) = match section {
-        "display" => {
-            let mut out = group(
-                Some("Resolution"),
-                vec![
-                    described_labeled(
-                        "Aspect ratio",
-                        aspect_combo,
-                        "Which shapes the Resolution list offers. Picking one moves to its \
-                         size nearest the current height.",
-                    ),
-                    described_overridable(
-                        (rev, set_rev),
-                        scope,
-                        "resolution",
-                        "Resolution",
-                        over.resolution,
-                        res_combo,
-                        "The host drives a real virtual output at exactly this size \u{2014} true \
-                         pixels, no scaling. \u{201C}Native display\u{201D} follows the monitor this \
-                         window is on; \u{201C}Match window\u{201D} keeps the picture pixel-exact \
-                         (1:1) through every resize.",
-                    ),
-                    described_overridable(
-                        (rev, set_rev),
-                        scope,
-                        "refresh_hz",
-                        "Refresh rate",
-                        over.refresh_hz,
-                        hz_combo,
-                        "\u{201C}Native\u{201D} resolves to this display\u{2019}s refresh rate at \
-                         connect.",
-                    ),
-                ],
-                None,
-            );
-            out.extend(group(
-                Some("Quality"),
-                vec![
-                    described_overridable(
-                        (rev, set_rev),
-                        scope,
-                        "render_scale",
-                        "Render scale",
-                        over.render_scale,
-                        scale_combo,
-                        "Above native supersamples for sharpness; below renders lighter on the \
-                         host and the link. This device resamples the result to the window.",
-                    ),
-                    described_overridable(
-                        (rev, set_rev),
-                        scope,
-                        "bitrate_kbps",
-                        "Bitrate (Mb/s, 0 = automatic)",
-                        over.bitrate_kbps,
-                        bitrate_box,
-                        "0 lets the host decide (its default, clamped to what it supports). A \
-                         host card\u{2019}s context menu has a network speed test.",
-                    ),
-                    described_overridable(
-                        (rev, set_rev),
-                        scope,
-                        "codec",
-                        "Video codec",
-                        over.codec,
-                        codec_combo,
-                        "A preference \u{2014} the host falls back if it can\u{2019}t encode it. \
-                         PyroWave is the low-latency wavelet codec for a WIRED link: it trades \
-                         bitrate (hundreds of Mb/s) for near-zero decode time, so it wants \
-                         gigabit Ethernet.",
-                    ),
-                    described_overridable(
-                        (rev, set_rev),
-                        scope,
-                        "hdr_enabled",
-                        "HDR (10-bit, BT.2020 PQ)",
-                        over.hdr_enabled,
-                        hdr_toggle,
-                        "HDR10, when the host has HDR content and this display supports it. \
-                         HEVC only; otherwise the stream stays SDR.",
-                    ),
-                    // First sentence shared with the GTK client (its chroma_row); the
-                    // constraint sentence names the real gate (host: PyroWave || NVENC) —
-                    // "where the host can encode it" cost field users the discovery time.
-                    described_overridable(
-                        (rev, set_rev),
-                        scope,
-                        "enable_444",
-                        "Full chroma (4:4:4)",
-                        over.enable_444,
-                        chroma_toggle,
-                        "Full-colour video: crisp small text and thin lines, at more \
-                         bandwidth. Requires an NVIDIA host (NVENC) or the PyroWave \
-                         codec \u{2014} other encoders stream 4:2:0.",
-                    ),
-                    described_overridable(
-                        (rev, set_rev),
-                        scope,
-                        "ten_bit_sdr",
-                        "10-bit SDR",
-                        over.ten_bit_sdr,
-                        ten_bit_sdr_toggle,
-                        "Smoother gradients without HDR \u{2014} the picture is encoded at \
-                         10-bit precision. Needs an NVIDIA host; HDR takes over when it \
-                         engages.",
-                    ),
-                ],
-                None,
-            ));
-            // Decoder and GPU are facts about THIS device's hardware — never per preset.
-            out.extend(group(
-                Some("Decoding"),
-                if preset_mode {
-                    Vec::new()
-                } else {
-                    let mut fields = vec![described_labeled(
-                        "Video decoder",
-                        decoder_combo,
-                        "Automatic picks the hardware path this GPU does best \u{2014} Direct3D \
-                         11 on Intel, Vulkan Video on NVIDIA and AMD \u{2014} and falls back to \
-                         the CPU. Change it only when debugging.",
-                    )];
-                    if let Some(c) = gpu_combo {
-                        fields.push(described_labeled(
-                            "GPU",
-                            c,
-                            "Which adapter decodes and presents the stream. Automatic uses the \
-                             GPU driving this window\u{2019}s display.",
-                        ));
-                    }
-                    fields
-                },
-                None,
-            ));
-            out.extend(group(
-                Some("Presentation"),
-                {
-                    let mut fields = vec![described_overridable(
-                        (rev, set_rev),
-                        scope,
-                        "video_fit",
-                        "Picture fit",
-                        over.video_fit,
-                        fit_combo,
-                        "When the stream's shape differs from the window. Fit shows the whole \
-                         picture with black bars, Crop to fill cuts the edges off, Stretch to \
-                         fill distorts it.",
-                    )];
-                    fields.push(described_overridable(
-                        (rev, set_rev),
-                        scope,
-                        "present_priority",
-                        "Prioritize",
-                        over.present_priority,
-                        present_combo,
-                        "Lowest latency shows each frame the moment the display can take \
-                         it \u{2014} a network hiccup becomes an occasional repeated or \
-                         skipped frame. Smoothness buffers a little to even those out.",
-                    ));
-                    if smoothing {
-                        fields.push(described_overridable(
-                            (rev, set_rev),
-                            scope,
-                            "smooth_buffer",
-                            "Smoothness buffer",
-                            over.smooth_buffer,
-                            buffer_combo,
-                            "Frames held back before showing. Each one absorbs about a \
-                             refresh of network hiccup and adds a refresh of delay. \
-                             Automatic holds two.",
-                        ));
-                    }
-                    fields.push(described_overridable(
-                        (rev, set_rev),
-                        scope,
-                        "vsync",
-                        "V-Sync",
-                        over.vsync,
-                        vsync_toggle,
-                        "Tear-free. Turning it off removes the wait for the screen\u{2019}s \
-                         refresh \u{2014} the lowest possible delay, at the cost of visible \
-                         tearing. Not every driver offers it; the stats overlay names the \
-                         mode actually in use.",
-                    ));
-                    fields.push(described_overridable(
-                        (rev, set_rev),
-                        scope,
-                        "allow_vrr",
-                        "Follow variable refresh rate",
-                        over.allow_vrr,
-                        vrr_toggle,
-                        "On a VRR/FreeSync/G-Sync screen, let the panel refresh in step with \
-                         the stream instead of on a fixed cadence. Applies to fullscreen \
-                         sessions; harmless on a fixed-refresh screen.",
-                    ));
-                    fields
-                },
-                None,
-            ));
-            out.extend(group(
-                Some("Host output"),
-                vec![described_overridable(
-                    (rev, set_rev),
-                    scope,
-                    "compositor",
-                    "Host compositor",
-                    over.compositor,
-                    comp_combo,
-                    "The backend the host uses for its virtual output (Linux hosts only). A \
-                     specific choice falls back to auto-detection when that backend \
-                     isn\u{2019}t available.",
-                )],
-                // The one form-level note, exactly as on Apple.
-                Some("Display changes apply from the next session."),
-            ));
-            ("Display", out)
-        }
-        "input" => {
-            let mut out = group(
-                Some("Touch & pointer"),
-                vec![described_overridable(
-                    (rev, set_rev),
-                    scope,
-                    "touch_mode",
-                    "Touch input",
-                    over.touch_mode,
-                    touch_combo,
-                    "How a touchscreen drives the host: Trackpad moves the host cursor like a \
-                     laptop trackpad (tap to click), Direct pointer jumps the cursor to wherever \
-                     you touch, Touch passthrough sends real multi-touch through.",
-                )],
-                None,
-            );
-            out.extend(group(
-                Some("Keyboard & mouse"),
-                vec![
-                    described_overridable(
-                        (rev, set_rev),
-                        scope,
-                        "mouse_mode",
-                        "Mouse input",
-                        over.mouse_mode,
-                        mouse_combo,
-                        "Capture locks the pointer to the stream and sends relative motion — \
-                         best for games. Desktop leaves the pointer free to enter and leave \
-                         the stream and sends absolute positions — best for remote desktop \
-                         work. Ctrl+Alt+Shift+M switches live.",
-                    ),
-                    described_overridable(
-                        (rev, set_rev),
-                        scope,
-                        "inhibit_shortcuts",
-                        "Capture system shortcuts (Alt+Tab, Win, \u{2026})",
-                        over.inhibit_shortcuts,
-                        shortcuts_toggle,
-                        "Alt+Tab, the Windows key and friends reach the host while the stream \
-                         has input captured. Off, they act on this machine instead.",
-                    ),
-                    described_overridable(
-                        (rev, set_rev),
-                        scope,
-                        "invert_scroll",
-                        "Invert scroll direction",
-                        over.invert_scroll,
-                        invert_scroll_toggle,
-                        "Reverses the wheel and trackpad scroll direction sent to the host.",
-                    ),
-                ],
-                None,
-            ));
-            ("Input", out)
-        }
-        // The quick-action ring, edited on the ring itself (design touch-client-overlay.md
-        // §3.3). The editor commits every edit itself; the override marker is the page's.
-        "quick_actions" => (
-            "Quick actions",
-            vec![described_overridable(
-                (rev, set_rev),
-                scope,
-                "overlay_actions",
-                "Quick actions",
-                over.overlay_actions,
-                component(
-                    super::quick_actions::quick_actions_section,
-                    super::quick_actions::Props {
-                        ctx: ctx.clone(),
-                        scope: scope.to_string(),
-                        rev,
-                        set_rev: set_rev.clone(),
-                    },
-                ),
-                "The dial Ctrl+Alt+Shift+O, a two-finger twist or Select+A opens in a stream: what \
-                 its six buttons hold, and the shortcut chords they can send. A preset that \
-                 changes it owns the whole dial.",
-            )],
-        ),
-        "controllers" => (
-            "Controllers",
-            group(
-                None,
-                [
-                    // The read-only pad inventory (GTK parity): what THIS device sees right
-                    // now — the fastest answer to "is my controller even detected?". A
-                    // device fact, so defaults scope only, like the forward picker below.
-                    (!preset_mode).then(|| {
-                        let inventory: Element = if pads.is_empty() {
-                            text_block("No controllers detected")
-                                .font_size(12.0)
-                                .foreground(ThemeRef::SecondaryText)
-                                .into()
-                        } else {
-                            vstack(
-                                pads.iter()
-                                    .map(|p| {
-                                        let sub = if p.steam_virtual {
-                                            "Steam Input's virtual pad \u{2014} Automatic skips \
-                                             it while a real pad is connected"
-                                                .to_string()
-                                        } else {
-                                            p.kind_label().to_string()
-                                        };
-                                        vstack((
-                                            text_block(p.name.clone()).semibold(),
-                                            text_block(sub)
-                                                .font_size(11.0)
-                                                .foreground(ThemeRef::SecondaryText),
-                                        ))
-                                        .spacing(1.0)
-                                        .into()
-                                    })
-                                    .collect::<Vec<Element>>(),
-                            )
-                            .spacing(8.0)
-                            .into()
-                        };
-                        described_labeled(
-                            "Detected controllers",
-                            inventory,
-                            "Plug in or pair a controller and it appears here.",
-                        )
-                    }),
-                    // Whether ANY controller is forwarded — presetable, so it renders in
-                    // both scopes (a "Work" preset can decline what "Game" forwards),
-                    // unlike the device-fact picker below it.
-                    Some(described_overridable(
-                        (rev, set_rev),
-                        scope,
-                        "gamepad_forwarding",
-                        "Forward controllers",
-                        over.gamepad_forwarding,
-                        pad_forward_toggle,
-                        "Sends controllers connected to this PC to the host. Turn it off when \
-                         your controller already reaches the host another way \u{2014} USB \
-                         passthrough such as VirtualHere, or a pad plugged into the host \
-                         itself \u{2014} so games don't see two of them. Off, this PC never \
-                         opens the controller at all, which is what leaves it free for a \
-                         passthrough tool to claim.",
-                    )),
-                    // NOT Apple's wording: Apple forwards ONE pad as player 1, this client
-                    // forwards every controller as its own player. Same picker, different rule.
-                    // Which physical pad this device forwards is a device fact (tier G), so it
-                    // renders only in the defaults scope; the EMULATED type below is presetable.
-                    (!preset_mode).then(|| {
-                        described_labeled(
-                        "Forwarded controller",
-                        forward_combo,
-                        "Every connected controller is forwarded, each as its own player. Pick \
-                         one to force single-player \u{2014} only it reaches the host.",
-                    )
-                    }),
-                    Some(described_overridable(
-                        (rev, set_rev),
-                        scope,
-                        "gamepad",
-                        "Gamepad type",
-                        over.gamepad,
-                        pad_combo,
-                        "The virtual pad created on the host. Automatic matches your controller \
-                         \u{2014} a DualSense keeps adaptive triggers, lightbar, touchpad and \
-                         motion.",
-                    )),
-                    Some(described_overridable(
-                        (rev, set_rev),
-                        scope,
-                        "system_buttons",
-                        "Steam / guide button",
-                        over.system_buttons,
-                        sysbtn_combo,
-                        "Where the guide (Xbox/PS) and quick-access presses go while \
-                         streaming. Automatic sends them to the host \u{2014} except on \
-                         devices whose own overlay reacts to the same press (Gaming Mode), \
-                         where they stay local and the gesture below reaches the host.",
-                    )),
-                    Some(described_overridable(
-                        (rev, set_rev),
-                        scope,
-                        "guide_gesture",
-                        "Hold Select for guide",
-                        over.guide_gesture,
-                        gesture_combo,
-                        "Hold Select on its own to press the host's guide button \u{2014} keep \
-                         holding for a Gaming-Mode host's quick-access menu. A Select tap \
-                         still goes through, slightly delayed. Automatic arms it only where \
-                         the real button can't reach the host.",
-                    )),
-                    (!preset_mode).then(|| {
-                        described_labeled(
-                            "Controller haptics",
-                            pad_haptics_toggle,
-                            "Play a DualSense's voice-coil haptics on the pad itself. Wired \
-                             pads only, and only while controllers are forwarded.",
-                        )
-                    }),
-                    (!preset_mode).then(|| {
-                        described_labeled(
-                            "Controller speaker",
-                            pad_speaker_toggle,
-                            "Play the audio a game sends to the pad's own speaker on the pad, \
-                             not through this PC.",
-                        )
-                    }),
-                ]
-                .into_iter()
-                .flatten()
-                .collect(),
-                Some("Applies from the next session."),
-            ),
-        ),
-        "audio" => (
-            "Audio",
-            group(
-                None,
-                [
-                    Some(described_overridable(
-                        (rev, set_rev),
-                        scope,
-                        "audio_channels",
-                        "Audio channels",
-                        over.audio_channels,
-                        channels_combo,
-                        "The speaker layout requested from the host. It downmixes if its own \
-                         output has fewer channels.",
-                    )),
-                    // Stereo-only, so the row is HIDDEN under 5.1/7.1 rather than offered and
-                    // declined: a lossless surround frame does not fit one QUIC datagram at the
-                    // default MTU, and the host refuses it outright (design/hi-res-audio.md §4.2).
-                    // The stored value survives the hide — it is a preference, not a live request,
-                    // and going back to Stereo brings it back exactly as it was.
-                    //
-                    // ⚠ Hidden means its per-row Reset is unreachable too. That is the same
-                    // trade the mic-dependent rows make, and it is the lesser evil: a visible
-                    // control for a request this session cannot make is the worse lie.
-                    (s.audio_channels == 2).then(|| {
-                        described_overridable(
-                            (rev, set_rev),
-                            scope,
-                            "audio_format",
-                            "Audio format",
-                            over.audio_format,
-                            format_combo,
-                            "Lossless sends uncompressed PCM instead of Opus \u{2014} bit-exact, \
-                             at 2.3\u{2013}4.6 Mb/s taken off the top of the link and outside \
-                             the automatic-bitrate loop. The host has its own switch, off by \
-                             default, and quietly stays on Opus if it can\u{2019}t deliver the \
-                             rate; the stats overlay names what the session actually got.",
-                        )
-                    }),
-                    Some(described_overridable(
-                        (rev, set_rev),
-                        scope,
-                        "keep_host_audio",
-                        "Keep host audio playing",
-                        over.keep_host_audio,
-                        keep_host_audio_toggle,
-                        "The host\u{2019}s own speakers or headphones keep playing while you \
-                         stream \u{2014} both ends hear the same audio. Needs a host on 0.32 \
-                         or newer.",
-                    )),
-                    // The endpoint picks are facts about THIS device's hardware — never
-                    // per preset, like Decoder/GPU.
-                    (!preset_mode)
-                        .then(|| {
-                            speaker_combo.map(|c| {
-                                described_labeled(
-                                    "Speaker",
-                                    c,
-                                    "Host audio plays here \u{2014} System default follows \
-                                     the Windows output device.",
-                                )
-                            })
-                        })
-                        .flatten(),
-                    Some(described_overridable(
-                        (rev, set_rev),
-                        scope,
-                        "mic_enabled",
-                        "Stream microphone to the host",
-                        over.mic_enabled,
-                        mic_toggle,
-                        "This device\u{2019}s microphone feeds the host\u{2019}s virtual mic. \
-                         Ctrl+Alt+Shift+V mutes and unmutes it during a stream.",
-                    )),
-                    (!preset_mode)
-                        .then(|| {
-                            mic_dev_combo.map(|c| {
-                                described_labeled(
-                                    "Microphone",
-                                    c,
-                                    "The input that feeds the host\u{2019}s virtual mic.",
-                                )
-                            })
-                        })
-                        .flatten(),
-                    Some(described_overridable(
-                        (rev, set_rev),
-                        scope,
-                        "echo_cancel",
-                        "Echo cancellation",
-                        over.echo_cancel,
-                        echo_toggle,
-                        "Keeps the host\u{2019}s audio, playing from this machine\u{2019}s \
-                         speakers, from being picked up and sent straight back. Turn it off if \
-                         your microphone already does its own processing.",
-                    )),
-                ]
-                .into_iter()
-                .flatten()
-                .collect(),
-                Some("Applies from the next session."),
-            ),
-        ),
-        "about" => (
-            "About",
-            group(
-                None,
-                vec![
-                    about_identity.into(),
-                    described_labeled(
-                        "Diagnostics",
-                        logs_button,
-                        "The client log (client.log, plus the session\u{2019}s whole \
-                         receive/decode/present trail) \u{2014} attach it to a bug report.",
-                    ),
-                    licenses_button.into(),
-                ],
-                None,
-            ),
-        ),
+        "display" => ("Display", display_section(&cx)),
+        "input" => ("Input", input_section(&cx)),
+        "quick_actions" => ("Quick actions", quick_actions_section(&cx)),
+        "controllers" => ("Controllers", controllers_section(&cx)),
+        "audio" => ("Audio", audio_section(&cx)),
+        "about" => ("About", about_section(set_screen)),
         // "general" and anything unrecognized.
-        _ => {
-            let mut out = group(
-                Some("Session"),
-                vec![described_overridable(
-                    (rev, set_rev),
-                    scope,
-                    "fullscreen_on_stream",
-                    "Start streams fullscreen",
-                    over.fullscreen_on_stream,
-                    fullscreen_toggle,
-                    "Go fullscreen when a session starts; F11 or Alt+Enter switches back \
-                         live.",
-                )]
-                .into_iter()
-                // Auto-wake is about this host and this network, not about "Game vs Work" —
-                // it stays global in v1 (design §3, tier H/G).
-                .chain((!preset_mode).then(|| {
-                    described_labeled(
-                        "Auto-wake on connect",
-                        auto_wake_toggle,
-                        "Connecting to a saved host that\u{2019}s offline sends Wake-on-LAN and \
-                         waits for it to boot. Turn off if hosts behind a VPN look offline when \
-                         they aren\u{2019}t.",
-                    )
-                }))
-                .chain(
-                    (!preset_mode)
-                        .then(|| described_labeled("Start in", start_in_combo, &start_in_help())),
-                )
-                .collect(),
-                None,
-            );
-            let mut stats_rows = vec![described_overridable(
-                (rev, set_rev),
-                scope,
-                "stats_verbosity",
-                "Stats overlay (HUD)",
-                over.stats_verbosity,
-                hud_combo,
-                "Live session stats in a corner overlay \u{2014} Compact is a one-line pill, \
-                 Detailed adds the stage breakdown. Ctrl+Alt+Shift+S cycles the tiers any time.",
-            )];
-            // Device-wide: a preset never carries the vocabulary.
-            if !preset_mode {
-                stats_rows.push(described_labeled(
-                    "Advanced statistics",
-                    advanced_toggle,
-                    "Off shows the figures Moonlight's overlay also shows. On shows capture to \
-                     glass as p50/p95 and every stage between.",
-                ));
-                stats_rows.push(stats_docs_button.into());
-            }
-            out.extend(group(Some("Statistics"), stats_rows, None));
-            ("General", out)
-        }
+        _ => ("General", general_section(&cx)),
     };
 
     // The stock WinUI sidebar (Windows-Settings pattern): pane on the left, the section's card

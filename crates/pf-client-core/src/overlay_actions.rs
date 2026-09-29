@@ -21,6 +21,8 @@ pub const RING_SLOTS: usize = 6;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SlotId {
     EndStream,
+    /// End the game this device launched, then the stream.
+    EndGame,
     DisconnectLinger,
     TouchMode,
     Keyboard,
@@ -45,6 +47,7 @@ impl SlotId {
     pub fn id(&self) -> String {
         match self {
             SlotId::EndStream => "end_stream".into(),
+            SlotId::EndGame => "end_game".into(),
             SlotId::DisconnectLinger => "disconnect_linger".into(),
             SlotId::TouchMode => "touch_mode".into(),
             SlotId::Keyboard => "keyboard".into(),
@@ -65,6 +68,7 @@ impl SlotId {
     pub fn parse(s: &str) -> Option<SlotId> {
         Some(match s {
             "end_stream" => SlotId::EndStream,
+            "end_game" => SlotId::EndGame,
             "disconnect_linger" => SlotId::DisconnectLinger,
             "touch_mode" => SlotId::TouchMode,
             "keyboard" => SlotId::Keyboard,
@@ -137,6 +141,89 @@ pub fn key_legend(k: &str) -> String {
                 None => String::new(),
             }
         }
+    }
+}
+
+/// The shortcut editors' modifier toggles, in host send order.
+pub const CHORD_MODIFIERS: [&str; 4] = ["ctrl", "alt", "shift", "win"];
+
+/// Every name [`key_vk`] knows that is not a modifier, row by row as a keyboard lays them
+/// out. The console, GTK and WinUI shortcut editors all draw these rows.
+pub const KEY_GRID: [&[&str]; 6] = [
+    &[
+        "escape", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
+    ],
+    &[
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "0",
+        "backspace",
+    ],
+    &[
+        "tab", "q", "w", "e", "r", "t", "y", "u", "i", "o", "p", "insert", "delete",
+    ],
+    &[
+        "capslock", "a", "s", "d", "f", "g", "h", "j", "k", "l", "enter",
+    ],
+    &[
+        "z", "x", "c", "v", "b", "n", "m", "home", "end", "pageup", "pagedown",
+    ],
+    &[
+        "space",
+        "left",
+        "up",
+        "down",
+        "right",
+        "printscreen",
+        "pause",
+    ],
+];
+
+/// A shortcut's chord as an editor holds it: one toggle per [`CHORD_MODIFIERS`] entry and
+/// one [`KEY_GRID`] key.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Chord {
+    pub mods: [bool; 4],
+    pub key: Option<String>,
+}
+
+impl Chord {
+    /// Read stored keys: modifier aliases (`control`, `option`, `cmd`, `super`, `meta`) fold
+    /// onto their toggle, and the last grid key wins.
+    pub fn parse(keys: &[String]) -> Chord {
+        let has = |names: &[&str]| keys.iter().any(|k| names.contains(&k.as_str()));
+        Chord {
+            mods: [
+                has(&["ctrl", "control"]),
+                has(&["alt", "option"]),
+                has(&["shift"]),
+                has(&["win", "cmd", "super", "meta"]),
+            ],
+            key: keys
+                .iter()
+                .rev()
+                .find(|k| KEY_GRID.iter().any(|row| row.contains(&k.as_str())))
+                .cloned(),
+        }
+    }
+
+    /// Host send order: marked modifiers, then the key.
+    pub fn keys(&self) -> Vec<String> {
+        let mut v: Vec<String> = CHORD_MODIFIERS
+            .iter()
+            .zip(self.mods)
+            .filter(|(_, on)| *on)
+            .map(|(m, _)| m.to_string())
+            .collect();
+        v.extend(self.key.clone());
+        v
     }
 }
 
@@ -359,6 +446,7 @@ pub fn catalogue(cfg: &OverlayConfig, platform: RingPlatform) -> Vec<CatalogueGr
             title: "Session",
             entries: vec![
                 e("end_stream", "End stream", ""),
+                e("end_game", "End game", "Only a game this device launched"),
                 e("disconnect_linger", "Disconnect, keep the game running", ""),
             ],
         },
@@ -445,6 +533,7 @@ pub fn catalogue(cfg: &OverlayConfig, platform: RingPlatform) -> Vec<CatalogueGr
 pub fn slot_icon(id: &str, state: &str) -> Option<&'static str> {
     Some(match id {
         "end_stream" => "square",
+        "end_game" => "x",
         "disconnect_linger" => "log-out",
         "touch_mode" => "pointer",
         "keyboard" => "keyboard",
@@ -656,9 +745,35 @@ mod tests {
     }
 
     #[test]
+    fn the_key_grid_holds_every_key_once_and_no_modifier() {
+        let mut seen: Vec<&str> = Vec::new();
+        for name in KEY_GRID.iter().flat_map(|row| row.iter()) {
+            assert!(key_vk(name).is_some(), "{name} is unknown to the wire");
+            assert!(!CHORD_MODIFIERS.contains(name), "{name} is a modifier");
+            assert!(!seen.contains(name), "{name} twice");
+            seen.push(name);
+        }
+        assert_eq!(seen.len(), 66);
+        for m in CHORD_MODIFIERS {
+            assert!(key_vk(m).is_some(), "{m} is unknown to the wire");
+        }
+    }
+
+    #[test]
+    fn a_chord_folds_aliases_and_sends_modifiers_first() {
+        let keys = |k: &[&str]| k.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let c = Chord::parse(&keys(&["escape", "control", "meta", "a"]));
+        assert_eq!(c.mods, [true, false, false, true]);
+        assert_eq!(c.key.as_deref(), Some("a"), "the last grid key wins");
+        assert_eq!(c.keys(), keys(&["ctrl", "win", "a"]));
+        assert_eq!(Chord::parse(&keys(&["option", "hyper"])).key, None);
+    }
+
+    #[test]
     fn slot_ids_are_stable_strings() {
         for id in [
             "end_stream",
+            "end_game",
             "disconnect_linger",
             "touch_mode",
             "keyboard",

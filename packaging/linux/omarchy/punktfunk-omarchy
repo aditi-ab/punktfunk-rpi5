@@ -138,7 +138,9 @@ open_firewall() {
   # GameStream stays CLOSED unless the operator turned the plane on. Its ports are exactly the ones
   # `omarchy install service sunshine` claims, so opening them by default invites a bind conflict
   # and a confusing "which host answered?" on a box that has both.
-  if grep -qs '^PUNKTFUNK_GAMESTREAM=1' "$HOST_ENV"; then
+  # The store line is the host's own pretty-printed JSON.
+  if grep -qs '^PUNKTFUNK_GAMESTREAM=1' "$HOST_ENV" ||
+     grep -qs '"gamestream": true' "${HOST_ENV%/*}/host-settings.json"; then
     profiles+=(punktfunk-gamestream)
   fi
   local src
@@ -335,7 +337,7 @@ setup_webapp() {
       # `|| echo`: a stopped host makes `ctl console-url` fail, and an EMPTY `--app=` opens a
       # plain browser window instead of an app window — the bare URL keeps the shape right and
       # shows the console's own login page.
-      sed -i "s|^Exec=.*|Exec=sh -c 'omarchy-launch-webapp \"\$(punktfunk-host ctl console-url \|\| echo https://localhost:47992)\"'|" "$entry"
+      sed -i "s|^Exec=.*|Exec=sh -c 'omarchy-launch-webapp \"\$(punktfunk-host ctl console-url \|\| echo https://127.0.0.1:47992)\"'|" "$entry"
       sed -i "s|^Icon=.*|Icon=$icon|" "$entry"
       grep -q '^Icon=' "$entry" || printf 'Icon=%s\n' "$icon" >> "$entry"
       ok "the console entry opens already logged in, with the Punktfunk mark"
@@ -363,7 +365,7 @@ readonly MENU_END="// <<< punktfunk"
 menu_rows() {
   cat <<'EOF'
   "punktfunk-host": {"icon":"󰒋","label":"Punktfunk Host","aliases":["streaming","hosting"]},
-  "punktfunk-host.console": {"icon":"󰖟","label":"Open web console","description":"Pairing, devices, settings — opens already logged in","action":"sh -c 'omarchy-launch-webapp \"$(punktfunk-host ctl console-url || echo https://localhost:47992)\"'"},
+  "punktfunk-host.console": {"icon":"󰖟","label":"Open web console","description":"Pairing, devices, settings — opens already logged in","action":"sh -c 'omarchy-launch-webapp \"$(punktfunk-host ctl console-url || echo https://127.0.0.1:47992)\"'"},
   "punktfunk-host.dedicated": {"icon":"󰍹","label":"Dedicated display","description":"Stream a virtual display at the client's size","checked":"punktfunk-omarchy mode --status | grep -qx dedicated","action":"punktfunk-omarchy mode dedicated"},
   "punktfunk-host.mirror": {"icon":"󰹑","label":"This screen","description":"Stream the primary monitor on this box","checked":"punktfunk-omarchy mode --status | grep -qx mirror","action":"punktfunk-omarchy mode mirror"},
   "punktfunk-host.pair": {"icon":"󰐕","label":"Pair a device","description":"Open a pairing window and show the PIN","action":"omarchy-launch-or-focus-tui \"bash -c 'punktfunk-host ctl pair arm; echo; read -n1 -r -p \\\"Press any key…\\\"'\""},
@@ -1182,29 +1184,22 @@ cmd_unpair() {
   tui_pause
 }
 
-# Opt in the GameStream/Moonlight plane: pin host.env, restart, open the
-# extra ufw profile. Trusted LAN only.
-enable_gamestream_env() {
+# Turn GameStream on in the console's settings. A host.env line would lock the console's toggle,
+# so it goes. Trusted LAN only.
+enable_gamestream() {
   local f tmp
   f="$(host_env_file)"
-  mkdir -p "$(dirname "$f")"
   if [[ -f "$f" ]] && grep -q '^PUNKTFUNK_GAMESTREAM=' "$f"; then
     tmp="$(mktemp "${f}.XXXXXX")"
-    sed 's/^PUNKTFUNK_GAMESTREAM=.*/PUNKTFUNK_GAMESTREAM=1/' "$f" > "$tmp"
+    sed '/^PUNKTFUNK_GAMESTREAM=/d' "$f" > "$tmp"
     mv -f "$tmp" "$f"
-  else
-    if [[ -f "$f" && -s "$f" ]]; then
-      local last
-      last="$(tail -c1 "$f" 2>/dev/null || true)"
-      [[ "$last" == $'\n' || -z "$last" ]] || printf '\n' >> "$f"
-    fi
-    printf 'PUNKTFUNK_GAMESTREAM=1\n' >> "$f"
   fi
+  punktfunk-host settings set gamestream true >/dev/null
 }
 
 cmd_gamestream() {
   step "GameStream"
-  enable_gamestream_env
+  enable_gamestream
   reload_host
   open_firewall
   ok "GameStream is on — stock Moonlight can pair on this LAN"

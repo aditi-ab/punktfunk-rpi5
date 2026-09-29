@@ -39,20 +39,21 @@ pub(super) fn resolve_pad_kind(kind: GamepadPref) -> GamepadPref {
         cfg!(target_os = "linux"),
         cfg!(target_os = "windows"),
     );
-    degrade_xbox_identity(degrade_steam_on_conflict(degrade_if_no_uhid(chosen)))
+    degrade_missing_driver_identity(degrade_xbox_identity(degrade_steam_on_conflict(
+        degrade_if_no_uhid(chosen),
+    )))
 }
 
 /// Session backend from client `pref`, then `PUNKTFUNK_GAMEPAD` under Auto, then Xbox 360.
 ///
-/// `linux`/`windows` are the host OS. DualSense, DualShock 4, DualSense Edge, Xbox One, and
-/// Steam Deck have both a Linux and a Windows backend; other wishes fold to Xbox 360 (never
-/// an error — a session without rich pads still streams). Xbox Elite has no Linux identity
-/// (`PadIdentity` stops at One S). Steam Controller and Switch Pro are Linux-only.
-/// Steam Controller 2 is Linux UHID and Windows DEVTYPE_TRITON; the SC2 Puck has a native
-/// Linux identity and folds onto the wired one on Windows.
+/// `linux`/`windows` are the host OS. Every kind has a Linux and a Windows backend except the
+/// Steam Controller (Linux only); other wishes fold to Xbox 360 (never an error — a session
+/// without rich pads still streams). Steam Controller 2 is Linux UHID and Windows
+/// DEVTYPE_TRITON; the SC2 Puck has a native Linux identity and folds onto the wired one on
+/// Windows.
 ///
-/// Compile-time OS flags only. `PUNKTFUNK_XBOX_BACKEND=xusb` un-varies Windows identity at
-/// runtime; that fold is [`degrade_xbox_identity`], not this function.
+/// Compile-time OS flags only. The Windows XUSB backend un-varies Xbox identity at runtime;
+/// that fold is [`degrade_xbox_identity`], not this function.
 fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool, windows: bool) -> GamepadPref {
     let want = match pref {
         GamepadPref::Auto => env
@@ -64,14 +65,14 @@ fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool, windows: bool
         GamepadPref::DualSense if linux || windows => GamepadPref::DualSense,
         GamepadPref::DualShock4 if linux || windows => GamepadPref::DualShock4,
         GamepadPref::XboxOne if linux || windows => GamepadPref::XboxOne,
-        // No Linux uinput Elite identity (`PadIdentity` stops at One S); `_` → Xbox360.
-        GamepadPref::XboxElite if windows => GamepadPref::XboxElite,
+        // Linux: uinput `045E:0B00`, the one Xbox identity whose paddles SDL maps.
+        GamepadPref::XboxElite if linux || windows => GamepadPref::XboxElite,
         GamepadPref::SteamDeck if linux => GamepadPref::SteamDeck,
         GamepadPref::SteamController if linux => GamepadPref::SteamController,
         GamepadPref::SteamDeck if windows => GamepadPref::SteamDeck,
         GamepadPref::DualSenseEdge if linux || windows => GamepadPref::DualSenseEdge,
-        // Linux UHID hid-nintendo (≥ 5.16). No Windows backend.
-        GamepadPref::SwitchPro if linux => GamepadPref::SwitchPro,
+        // Linux UHID hid-nintendo (≥ 5.16); Windows UMDF device type 8.
+        GamepadPref::SwitchPro if linux || windows => GamepadPref::SwitchPro,
         // Linux: UHID passthrough under 28DE:1302; no kernel driver, Steam Input consumes hidraw.
         GamepadPref::SteamController2 if linux => GamepadPref::SteamController2,
         GamepadPref::SteamController2 if windows => GamepadPref::SteamController2,
@@ -82,14 +83,37 @@ fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool, windows: bool
         // same 28DE:1302 pad a cabled one mints. That descriptor declares 0x79, so the client's
         // forwarded connect edge stays legal on it.
         GamepadPref::SteamController2Puck if windows => GamepadPref::SteamController2,
+        // Linux UHID, read by SDL and Steam through hidraw; Windows UMDF device types 9–14.
+        GamepadPref::EightBitDoUltimate2 if linux || windows => GamepadPref::EightBitDoUltimate2,
+        GamepadPref::EightBitDoPro2 if linux || windows => GamepadPref::EightBitDoPro2,
+        GamepadPref::EightBitDoPro3 if linux || windows => GamepadPref::EightBitDoPro3,
+        GamepadPref::HoripadSteam if linux || windows => GamepadPref::HoripadSteam,
+        GamepadPref::JoyConPair if linux || windows => GamepadPref::JoyConPair,
+        // usbip on Linux: SDL and Steam read these through libusb, which a UMDF HID devnode lacks.
+        GamepadPref::Switch2Pro if linux => GamepadPref::Switch2Pro,
+        GamepadPref::Switch2GameCube if linux => GamepadPref::Switch2GameCube,
+        GamepadPref::Switch2Pro | GamepadPref::Switch2GameCube if windows => GamepadPref::SwitchPro,
         _ => GamepadPref::Xbox360,
     }
 }
 
-/// If `/dev/uhid` is not writable *now*, fold UHID backends to the uinput Xbox 360 pad.
-/// Opens and drops the char device — no `UHID_CREATE2`, so nothing is created. No-op off Linux.
+/// Fold a pad whose transport is missing *now*: a Switch 2 pad without `vhci_hcd` to the Switch
+/// Pro, then UHID backends without a writable `/dev/uhid` to the uinput Xbox 360 pad. Opens and
+/// drops the char device — no `UHID_CREATE2`, so nothing is created. No-op off Linux.
 #[cfg(target_os = "linux")]
 fn degrade_if_no_uhid(chosen: GamepadPref) -> GamepadPref {
+    let chosen = match chosen {
+        GamepadPref::Switch2Pro | GamepadPref::Switch2GameCube
+            if !crate::inject::switch2_usbip::available() =>
+        {
+            tracing::warn!(
+                wanted = chosen.as_str(),
+                "vhci_hcd not loaded — falling back to the Switch Pro pad"
+            );
+            GamepadPref::SwitchPro
+        }
+        other => other,
+    };
     let needs_uhid = matches!(
         chosen,
         GamepadPref::DualSense
@@ -100,6 +124,11 @@ fn degrade_if_no_uhid(chosen: GamepadPref) -> GamepadPref {
             | GamepadPref::SteamController2
             | GamepadPref::SteamController2Puck
             | GamepadPref::SwitchPro
+            | GamepadPref::EightBitDoUltimate2
+            | GamepadPref::EightBitDoPro2
+            | GamepadPref::EightBitDoPro3
+            | GamepadPref::HoripadSteam
+            | GamepadPref::JoyConPair
     );
     if needs_uhid
         && std::fs::OpenOptions::new()
@@ -259,16 +288,15 @@ fn degrade_steam_on_conflict(chosen: GamepadPref) -> GamepadPref {
     chosen
 }
 
-/// Fold Xbox One / Elite to 360 when `PUNKTFUNK_XBOX_BACKEND=xusb`.
+/// Fold Xbox One / Elite to 360 when [`windows_xbox_hid`] picks XUSB.
 /// The XUSB companion has one fixed 360 identity; folding here keeps the `Welcome` echo honest.
-/// No-op off Windows (`XboxElite` never survives [`pick_gamepad`] there; `XboxOne` is uinput).
+/// No-op off Windows: `XboxOne` and `XboxElite` are uinput identities there.
 #[cfg(target_os = "windows")]
 fn degrade_xbox_identity(chosen: GamepadPref) -> GamepadPref {
     if matches!(chosen, GamepadPref::XboxOne | GamepadPref::XboxElite) && !windows_xbox_hid() {
         tracing::warn!(
             wanted = chosen.as_str(),
-            "PUNKTFUNK_XBOX_BACKEND=xusb selects the XUSB companion, which has one fixed X-Box 360 \
-             identity — falling back to the 360 pad"
+            "the XUSB backend has one fixed X-Box 360 identity — falling back to the 360 pad"
         );
         return GamepadPref::Xbox360;
     }
@@ -280,23 +308,82 @@ fn degrade_xbox_identity(chosen: GamepadPref) -> GamepadPref {
     chosen
 }
 
+/// UMDF identities newer than the first driver package, with the INF model token each needs. One
+/// package carries both Joy-Con halves, so the left one stands for the pair.
+#[cfg(target_os = "windows")]
+const DRIVER_IDENTITIES: [(GamepadPref, &str); 6] = [
+    (GamepadPref::SwitchPro, "pf_switchpro"),
+    (GamepadPref::EightBitDoUltimate2, "pf_8bitdo_ultimate2"),
+    (GamepadPref::EightBitDoPro2, "pf_8bitdo_pro2"),
+    (GamepadPref::EightBitDoPro3, "pf_8bitdo_pro3"),
+    (GamepadPref::HoripadSteam, "pf_horipad_steam"),
+    (GamepadPref::JoyConPair, "pf_joycon_left"),
+];
+
+/// Fold an identity to the 360 pad when no driver-store package declares its hardware id. An
+/// older package cannot bind that devnode, so the pad would sit dead in Device Manager.
+#[cfg(target_os = "windows")]
+fn degrade_missing_driver_identity(chosen: GamepadPref) -> GamepadPref {
+    static STAGED: std::sync::OnceLock<[bool; DRIVER_IDENTITIES.len()]> =
+        std::sync::OnceLock::new();
+    let Some(i) = DRIVER_IDENTITIES.iter().position(|(k, _)| *k == chosen) else {
+        return chosen;
+    };
+    let staged = STAGED.get_or_init(|| {
+        DRIVER_IDENTITIES.map(|(_, hwid)| crate::windows::install::store_declares_hwid(hwid))
+    });
+    if !staged[i] {
+        tracing::warn!(
+            wanted = chosen.as_str(),
+            fix = "reinstall the host with its controller drivers",
+            "the installed controller driver predates this pad — falling back to the X-Box 360 \
+             pad"
+        );
+        return GamepadPref::Xbox360;
+    }
+    chosen
+}
+
+#[cfg(not(target_os = "windows"))]
+fn degrade_missing_driver_identity(chosen: GamepadPref) -> GamepadPref {
+    chosen
+}
+
 /// Build Xbox-family pads as HID ([`crate::inject::xbox_windows`]) instead of XUSB
-/// ([`crate::inject::gamepad`]). Windows only. HID is the default; `PUNKTFUNK_XBOX_BACKEND=xusb`
-/// restores the companion.
+/// ([`crate::inject::gamepad`]). Windows only; decided once per process by [`xbox_backend_hid`]
+/// and logged.
 ///
 /// XUSB registers only `GUID_DEVINTERFACE_XUSB` — no HID collection — so Steam, DirectInput,
-/// `joy.cpl`, and WGI/GameInput never see it. HID plus inbox `xinputhid` is a superset.
-/// `xusb` stays because a servicing update or a third-party filter can break that promotion;
-/// one env var restores XUSB without a reinstall.
+/// `joy.cpl`, and WGI/GameInput never see it. HID plus inbox `xinputhid` is a superset, but
+/// without that filter (Windows Server) XInput cannot see the HID pad at all.
 ///
 /// The two backends are mutually exclusive per pad: both would be two controllers for one pair
 /// of hands. Read by both input planes (`Pads::handle` and `gamestream::control::SessionPads`).
 #[cfg(target_os = "windows")]
 pub(crate) fn windows_xbox_hid() -> bool {
-    match std::env::var("PUNKTFUNK_XBOX_BACKEND") {
-        Ok(v) if v.trim().eq_ignore_ascii_case("xusb") => false,
-        // Unset, empty, "hid", or a typo → HID. A misspelled opt-out on the XUSB path is invisible.
-        _ => true,
+    static HID: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HID.get_or_init(|| {
+        let env = std::env::var("PUNKTFUNK_XBOX_BACKEND").ok();
+        let xinputhid = crate::inject::xbox_windows::xinputhid_registered();
+        let hid = xbox_backend_hid(env.as_deref(), xinputhid);
+        tracing::info!(
+            backend = if hid { "hid" } else { "xusb" },
+            env = env.as_deref().unwrap_or(""),
+            xinputhid,
+            "virtual Xbox pad backend"
+        );
+        hid
+    })
+}
+
+/// `PUNKTFUNK_XBOX_BACKEND` (`hid` / `xusb`) wins; unset or unrecognised follows `xinputhid`.
+/// Without that filter the HID pad sits on the unfiltered line, where XInput cannot see it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn xbox_backend_hid(env: Option<&str>, xinputhid: bool) -> bool {
+    match env.map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("xusb") => false,
+        Some(v) if v.eq_ignore_ascii_case("hid") => true,
+        _ => xinputhid,
     }
 }
 
@@ -312,6 +399,7 @@ pub(super) fn resolve_gamepad(pref: GamepadPref) -> GamepadPref {
     let chosen = degrade_if_no_uhid(chosen);
     let chosen = degrade_steam_on_conflict(chosen);
     let chosen = degrade_xbox_identity(chosen);
+    let chosen = degrade_missing_driver_identity(chosen);
     warn_if_ds_inhibit_storm(chosen);
     match pref {
         GamepadPref::Auto => {
@@ -341,8 +429,22 @@ pub(super) fn resolve_gamepad(pref: GamepadPref) -> GamepadPref {
 
 #[cfg(test)]
 mod tests {
-    use super::{pick_gamepad, route_decision};
+    use super::{pick_gamepad, route_decision, xbox_backend_hid};
     use punktfunk_core::config::GamepadPref;
+
+    /// The env override wins either way; otherwise HID only where `xinputhid` can promote it.
+    #[test]
+    fn xbox_backend_follows_xinputhid_unless_overridden() {
+        assert!(xbox_backend_hid(None, true));
+        assert!(!xbox_backend_hid(None, false), "no xinputhid → XUSB");
+        assert!(!xbox_backend_hid(Some(" XUSB "), true));
+        assert!(xbox_backend_hid(Some("hid"), false), "operator forces HID");
+        assert!(
+            !xbox_backend_hid(Some("hdi"), false),
+            "a typo follows the machine"
+        );
+        assert!(xbox_backend_hid(Some(""), true));
+    }
 
     #[test]
     fn per_pad_route_decision() {
@@ -401,10 +503,32 @@ mod tests {
         assert_eq!(pick_gamepad(Auto, Some("series"), true, false), XboxOne);
         assert_eq!(pick_gamepad(XboxOne, None, false, true), XboxOne);
         assert_eq!(pick_gamepad(XboxOne, None, false, false), Xbox360);
-        // Windows-only; no Linux uinput Elite identity.
+        // Linux UHID; Windows UMDF (the driver-store gate is `degrade_missing_driver_identity`).
+        for p in [
+            EightBitDoUltimate2,
+            EightBitDoPro2,
+            EightBitDoPro3,
+            HoripadSteam,
+            JoyConPair,
+        ] {
+            assert_eq!(pick_gamepad(p, None, true, false), p);
+            assert_eq!(pick_gamepad(p, None, false, true), p);
+            assert_eq!(pick_gamepad(p, None, false, false), Xbox360);
+        }
+        assert_eq!(
+            pick_gamepad(Auto, Some("ultimate2"), true, false),
+            EightBitDoUltimate2
+        );
+        // Switch 2 pads are usbip devices: Linux only, the Switch Pro on Windows.
+        for p in [Switch2Pro, Switch2GameCube] {
+            assert_eq!(pick_gamepad(p, None, true, false), p);
+            assert_eq!(pick_gamepad(p, None, false, true), SwitchPro);
+            assert_eq!(pick_gamepad(p, None, false, false), Xbox360);
+        }
+        // Linux uinput 045E:0B00; Windows UMDF.
         assert_eq!(pick_gamepad(XboxElite, None, false, true), XboxElite);
         assert_eq!(pick_gamepad(Auto, Some("elite"), false, true), XboxElite);
-        assert_eq!(pick_gamepad(XboxElite, None, true, false), Xbox360);
+        assert_eq!(pick_gamepad(XboxElite, None, true, false), XboxElite);
         assert_eq!(pick_gamepad(XboxElite, None, false, false), Xbox360);
 
         assert_eq!(pick_gamepad(SteamDeck, None, true, false), SteamDeck);
@@ -437,7 +561,7 @@ mod tests {
             SwitchPro
         );
         assert_eq!(pick_gamepad(Auto, Some("switch"), true, false), SwitchPro);
-        assert_eq!(pick_gamepad(SwitchPro, None, false, true), Xbox360);
+        assert_eq!(pick_gamepad(SwitchPro, None, false, true), SwitchPro);
         assert_eq!(pick_gamepad(SwitchPro, None, false, false), Xbox360);
         assert_eq!(
             pick_gamepad(SteamController2, None, true, false),

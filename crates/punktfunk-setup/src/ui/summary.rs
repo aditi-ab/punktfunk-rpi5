@@ -68,14 +68,11 @@ pub struct Screen {
 
 impl Screen {
     pub fn new(facts: Facts, choices: Choices) -> Screen {
-        // SteamOS builds `main` on the device and its script owns the groups, linger and the
-        // unit start. Those rows would be toggles nothing reads, so they are not offered.
+        // SteamOS's build script owns the groups, linger and the unit start. Those rows would be
+        // toggles nothing reads, so they are not offered. Its channel is the checkout's branch.
         let steamos = facts.family == Family::Steamos;
         let mut items = vec![Item::Go];
-        items.push(Item::Row(Field::Components));
-        if !steamos {
-            items.push(Item::Row(Field::Channel));
-        }
+        items.extend([Item::Row(Field::Components), Item::Row(Field::Channel)]);
         // A client listens on nothing fixed, so none of the host wiring rows apply to it.
         if choices.components.host {
             if !steamos {
@@ -307,47 +304,14 @@ impl Screen {
 mod tests {
     use super::*;
     use crate::choices::Pins;
-    use crate::facts::{Family, Firewall, Nvidia, OsRelease};
+    use crate::facts::{Family, Firewall};
 
     fn facts(id: &str, family: Family) -> Facts {
         Facts {
-            os: OsRelease {
-                id: id.into(),
-                id_like: String::new(),
-                version_id: String::new(),
-                pretty: id.into(),
-            },
-            family,
-            omarchy: false,
-            docs_page: String::new(),
-            host_punt: None,
-            has_flatpak_client: false,
-            rpm_group: None,
-            floor: None,
-            couch_box: false,
-            graphical_seat: true,
-            desktop_sessions: true,
-            sunshine_active: false,
-            current_channel: None,
-            installed_pf: vec![],
             missing: vec!["host".into()],
-            host_version: None,
-            has_web_server: false,
-            has_omarchy_bin: false,
-            has_ujust: false,
-            in_input_group: false,
-            in_punktfunk_group: false,
-            has_input_group: true,
-            nvidia: Nvidia::Absent,
             firewall: Firewall::Ufw,
-            systemd_pid1: true,
-            user_manager: true,
-            web_unit_present: true,
-            web_password_present: false,
-            web_bind: None,
-            scripting_unit_disabled: false,
             ip: None,
-            user: "pf".into(),
+            ..crate::fixtures::fresh_facts(id, family)
         }
     }
 

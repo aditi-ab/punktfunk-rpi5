@@ -25,7 +25,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     container:
-      image: oven/bun:1
+      image: oven/bun:1.4.2
     timeout-minutes: 30
     defaults:
       run:

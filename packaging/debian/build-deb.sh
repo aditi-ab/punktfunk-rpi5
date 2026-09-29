@@ -23,19 +23,19 @@ ROOTDIR="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOTDIR"
 
 BIN="target/release/$PKG"
-if [ ! -x "$BIN" ]; then
-  echo "==> building $PKG (release)"
-  PUNKTFUNK_BUILD_VERSION="$VERSION" cargo build --release -p "$PKG" --locked   # stamp --version (build.rs)
-fi
 # The PyroWave encode worker — the capability-carrying half. A SEPARATE executable, never a
 # hardlink or a host subcommand: a shared inode would share the file capability and make the host
 # unidentifiable to KWin all over again (see the postinst note below). It ships in this same .deb
 # because host and worker version-check each other over their socket and fall back to the
 # in-process encoder on any mismatch, so they must move in lockstep.
 WORKER_BIN="target/release/punktfunk-encode-worker"
-if [ ! -x "$WORKER_BIN" ]; then
-  echo "==> building punktfunk-encode-worker (release)"
-  PUNKTFUNK_BUILD_VERSION="$VERSION" cargo build --release -p punktfunk-encode-worker --locked
+# Host and worker build together with the encoder features every Linux package ships (deb.yml,
+# the rpm spec, the PKGBUILD). Without them the host has no NVENC and no Vulkan encode.
+if [ ! -x "$BIN" ] || [ ! -x "$WORKER_BIN" ]; then
+  echo "==> building $PKG + punktfunk-encode-worker (release)"
+  PUNKTFUNK_BUILD_VERSION="$VERSION" cargo build --release --locked \
+    --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode \
+    -p "$PKG" -p punktfunk-encode-worker   # PUNKTFUNK_BUILD_VERSION stamps --version (build.rs)
 fi
 TRAY_BIN="target/release/punktfunk-tray"
 # ALWAYS built here, in its OWN cargo invocation — load-bearing, not tidiness, and deliberately not
@@ -70,6 +70,8 @@ install -Dm0644 packaging/linux/punktfunk-update.service \
                                                    "$STAGE/usr/lib/systemd/system/punktfunk-update.service"
 install -Dm0644 packaging/linux/49-punktfunk-update.rules \
                                                    "$STAGE/usr/share/polkit-1/rules.d/49-punktfunk-update.rules"
+# postinst runs this on configure and on the file trigger below (web, runner, bun).
+install -Dm0755 packaging/linux/restart-user-units.sh "$STAGE/usr/libexec/punktfunk/restart-user-units"
 install -Dm0644 scripts/60-punktfunk.rules         "$STAGE/usr/lib/udev/rules.d/60-punktfunk.rules"
 install -Dm0644 scripts/60-punktfunk-dualsense.conf "$STAGE/usr/share/wireplumber/wireplumber.conf.d/60-punktfunk-dualsense.conf"
 # ALSA UCM for the DualSense's own sound card — the `SpeakerHaptic` device alsa-ucm-conf has
@@ -337,7 +339,8 @@ if [ "$1" = "configure" ]; then
     echo "virtual Steam Deck pad: sudo usermod -aG punktfunk \"\$USER\"   # then log out and back in"
     echo "  — it authorizes stopping the display manager for a managed gamescope session, and the"
     echo "    pad's usbip nodes; it can emulate arbitrary USB devices, so join it only on a box you trust."
-    echo "Config:  mkdir -p ~/.config/punktfunk && cp /usr/share/punktfunk-host/host.env.example ~/.config/punktfunk/host.env"
+    echo "Settings: the console (Host -> Settings). A line in ~/.config/punktfunk/host.env locks that setting there;"
+    echo "  annotated templates: /usr/share/punktfunk-host/host.env.{example,kde}"
     echo "Enable:  systemctl --user enable --now punktfunk-host"
     # Debian ships no active firewall and Ubuntu's ufw is inactive by default; hint whichever is present.
     if command -v ufw >/dev/null 2>&1; then
@@ -348,12 +351,9 @@ if [ "$1" = "configure" ]; then
         echo "    sudo firewall-cmd --permanent --add-service=punktfunk-native && sudo firewall-cmd --reload"
         echo "    (use punktfunk-gamestream for the Moonlight-compat host)"
     fi
-    # An ALREADY-OPEN firewall does not pick up a port we later added to a profile. ufw expands an
-    # app profile into concrete rules at `ufw allow` time and keeps those, so editing
-    # /etc/ufw/applications.d on upgrade changes nothing; firewalld re-reads its XML, but only on a
-    # reload. 47993 (the separate origin plugin UIs are served from) arrived exactly this way, and
-    # an unrefreshed rule turns every plugin interface in the console into an empty panel.
-    # `ufw status verbose` prints expanded ports, so it can tell "allowed" from "allowed, stale".
+    # An open firewall keeps the ports a profile had when it was allowed: ufw stores the expanded
+    # rules, firewalld serves the service it last loaded. Name each profile missing a port this
+    # package added. `ufw status verbose` prints expanded ports, so it can tell stale from current.
     if command -v ufw >/dev/null 2>&1 &&
        ufw status verbose 2>/dev/null | grep -q 'punktfunk-web' &&
        ! ufw status verbose 2>/dev/null | grep -q '47993'; then
@@ -361,6 +361,14 @@ if [ "$1" = "configure" ]; then
         echo "punktfunk: your ufw rule for 'punktfunk-web' predates TCP 47993 (plugin UIs, served"
         echo "  from their own origin). Plugin interfaces will not load in the console until:"
         echo "    sudo ufw app update punktfunk-web && sudo ufw reload"
+    fi
+    if command -v ufw >/dev/null 2>&1 &&
+       ufw status verbose 2>/dev/null | grep -q 'punktfunk-native' &&
+       ! ufw status verbose 2>/dev/null | grep -q '9778'; then
+        echo ""
+        echo "punktfunk: your ufw rule for 'punktfunk-native' predates UDP 9778 (browser streaming)."
+        echo "  A browser cannot connect to this host until:"
+        echo "    sudo ufw app update punktfunk-native && sudo ufw reload"
     fi
     # --info-service answers from the definition the daemon loaded, i.e. the stale one.
     if command -v firewall-cmd >/dev/null 2>&1 &&
@@ -371,6 +379,14 @@ if [ "$1" = "configure" ]; then
         echo "punktfunk: the punktfunk-web firewalld service now also covers TCP 47993 (plugin UIs)."
         echo "  Plugin interfaces will not load in the console until:  sudo firewall-cmd --reload"
     fi
+    if command -v firewall-cmd >/dev/null 2>&1 &&
+       firewall-cmd --state >/dev/null 2>&1 &&
+       firewall-cmd --query-service=punktfunk-native >/dev/null 2>&1 &&
+       ! firewall-cmd --info-service=punktfunk-native 2>/dev/null | grep -q '9778'; then
+        echo ""
+        echo "punktfunk: the punktfunk-native firewalld service now also covers UDP 9778 (browser"
+        echo "  streaming). A browser cannot connect to this host until:  sudo firewall-cmd --reload"
+    fi
     # Conflicting Moonlight-compatible host (Sunshine/Apollo/...): reuse the host's own detector so
     # the warning lives in one place. Exit 1 = found; never fail the install on it.
     if command -v punktfunk-host >/dev/null 2>&1; then
@@ -380,9 +396,16 @@ if [ "$1" = "configure" ]; then
         fi
     fi
 fi
+# Restart the running services. configure restarts all three: dpkg may fold a pending trigger into it.
+case "$1" in configure|triggered) /usr/libexec/punktfunk/restart-user-units ;; esac
 exit 0
 EOF
 chmod 0755 "$STAGE/DEBIAN/postinst"
+cat > "$STAGE/DEBIAN/triggers" <<'EOF'
+interest-noawait /usr/share/punktfunk-web
+interest-noawait /usr/share/punktfunk-scripting
+interest-noawait /usr/lib/punktfunk-bun
+EOF
 
 mkdir -p dist
 OUT="dist/${PKG}_${VERSION}_${ARCH}.deb"

@@ -13,7 +13,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::{seat_id, session_isolation, wall_unix_now};
+use super::{seat_id, session_isolation};
 use crate::vdisplay::{Compositor, GamescopeRoute};
 use punktfunk_core::Mode;
 
@@ -69,7 +69,7 @@ pub(crate) fn record(fp_hex: &str, mode: Mode, hdr: bool, hw_cursor: bool) {
         refresh_hz: mode.refresh_hz,
         hdr,
         hw_cursor,
-        last_steam_launch: wall_unix_now(),
+        last_steam_launch: crate::clock::unix_secs(),
     };
     if let Err(e) = write(&seat_id(fp_hex), &rec) {
         tracing::warn!(error = %e, "seat record not written — this seat is not pre-warmed");
@@ -119,7 +119,7 @@ fn run(why: &'static str) {
     // takes, whichever seat asks. Only a spawn of its own can be stood up ahead of a connect.
     let route = crate::vdisplay::resolve_gamescope_route(Compositor::Gamescope, true);
     if !matches!(route, Some(GamescopeRoute::Spawn))
-        || !super::compositor::session_is_isolated(Compositor::Gamescope, route.as_ref())
+        || !crate::compositor_route::session_is_isolated(Compositor::Gamescope, route.as_ref())
     {
         tracing::info!(
             why,
@@ -128,7 +128,7 @@ fn run(why: &'static str) {
         );
         return;
     }
-    for (id, rec) in candidates(wall_unix_now(), all_records()) {
+    for (id, rec) in candidates(crate::clock::unix_secs(), all_records()) {
         if parked.len() >= cap {
             break;
         }
@@ -236,16 +236,13 @@ fn read(path: &Path) -> Option<SeatRecord> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
-/// Write through a temporary and rename, so a half-written record never reads as a seat at the
-/// wrong mode — the one shape the registry would refuse to hand its parked display back for.
+/// [`pf_paths::replace_file`], so a half-written record never reads as a seat at the wrong
+/// mode — the one shape the registry would refuse to hand its parked display back for.
 fn write(id: &str, rec: &SeatRecord) -> anyhow::Result<()> {
     use anyhow::Context;
-    let path = pf_paths::seat_record(id);
     pf_paths::create_private_dir(&pf_paths::seats_dir()).context("create the seats directory")?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(rec)?).context("write the seat record")?;
-    std::fs::rename(&tmp, &path).context("replace the seat record")?;
-    Ok(())
+    pf_paths::replace_file(&pf_paths::seat_record(id), &serde_json::to_vec(rec)?)
+        .context("replace the seat record")
 }
 
 /// The 32-byte fingerprint a record names. `None` on anything that is not 64 hex digits.

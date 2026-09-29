@@ -98,8 +98,33 @@ pub(super) struct CompositeLog {
 const PARK_ATTEMPTS_MAX: u32 = 10;
 
 impl StreamState {
+    /// Re-derive the cursor plan for compositor `c` on `route` before the next pipeline is built
+    /// from it: blend, gamescope reader, both composite flags. Returns whether the display asks
+    /// for a metadata cursor ([`crate::vdisplay::VirtualDisplay::set_hw_cursor`]). Shared by the
+    /// capture-loss retarget and the session switch so neither keeps the old compositor's plan.
+    pub(super) fn retarget_cursor_plan(
+        &mut self,
+        c: crate::vdisplay::Compositor,
+        route: Option<&crate::vdisplay::GamescopeRoute>,
+    ) -> bool {
+        let gamescope = c == crate::vdisplay::Compositor::Gamescope;
+        self.plan.cursor_blend = crate::session_plan::cursor_blend_for(
+            self.plan.cursor_forward,
+            c,
+            self.plan.codec,
+            self.plan.bit_depth,
+            self.plan.hdr,
+            route,
+        );
+        self.plan.gamescope_cursor = crate::session_plan::gamescope_cursor_for(gamescope, route);
+        (self.gamescope_composite, self.metadata_composite) =
+            composite_plan(&self.plan, self.cursor_fwd.is_some(), gamescope);
+        self.plan.cursor_forward || self.metadata_composite
+    }
+
     /// Route this tick's cursor: forward it when the client draws, else put the live overlay on
-    /// the frame for the encoder blend. An invisible cursor never reaches the encoder.
+    /// the frame for the encoder blend. Either way the capturer hears the host places it, so it
+    /// bakes no second copy. An invisible cursor never reaches the encoder.
     pub(super) fn tick_cursor(&mut self) {
         if let Some(fwd) = self.cursor_fwd.as_mut() {
             let client_draws = self.cursor_client_draws.load(Ordering::Relaxed);
@@ -141,10 +166,13 @@ impl StreamState {
             }
         } else if self.gamescope_composite || self.metadata_composite {
             #[cfg(not(target_os = "windows"))]
-            self.composite_live_cursor(
-                "host-composite active but the capture has no live cursor overlay yet (no \
-                 SPA_META_Cursor bitmap) — the stream is cursorless until one arrives",
-            );
+            {
+                self.capturer.set_cursor_forward(false);
+                self.composite_live_cursor(
+                    "host-composite active but the capture has no live cursor overlay yet (no \
+                     SPA_META_Cursor bitmap) — the stream is cursorless until one arrives",
+                );
+            }
         }
         if self.frame.cursor.as_ref().is_some_and(|c| !c.visible) {
             self.frame.cursor = None;

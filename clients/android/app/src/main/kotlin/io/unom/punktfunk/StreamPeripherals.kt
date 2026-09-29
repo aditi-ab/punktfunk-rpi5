@@ -2,6 +2,7 @@ package io.unom.punktfunk
 
 import android.content.BroadcastReceiver
 import android.content.Context
+import android.hardware.usb.UsbManager
 import android.util.Log
 import android.view.SurfaceView
 import androidx.compose.ui.geometry.Offset
@@ -57,6 +58,8 @@ internal class StreamPeripherals(
     private var dsUsbReceiver: BroadcastReceiver? = null
     private var decor: android.view.View? = null
     private var priorPointerIcon: android.view.PointerIcon? = null
+    private val hiddenPointer =
+        android.view.PointerIcon.getSystemIcon(context, android.view.PointerIcon.TYPE_NULL)
 
     fun start() {
         activity?.streamHandle = handle // route hardware keys to this session
@@ -114,6 +117,9 @@ internal class StreamPeripherals(
         ring.onOpenChange = { open ->
             router.setRingOpen(open)
             activity?.ringKeys = if (open) ({ nav -> ring.nav(nav) }) else null
+            // A mouse drives the ring like a finger: its own pointer, and no click lands in the game.
+            mouse.setSuspended(open)
+            decor?.pointerIcon = if (open) priorPointerIcon else hiddenPointer
         }
         // Physical mouse: uncaptured hover/click/wheel forwards as absolute pointing; captured
         // (setting or the Ctrl+Alt+Shift+Q chord) raw deltas forward as relative mouse-look.
@@ -121,10 +127,7 @@ internal class StreamPeripherals(
         // the video, is the one the user sees (twin of the desktop clients' hidden cursor).
         decor = activity?.window?.decorView
         priorPointerIcon = decor?.pointerIcon
-        decor?.pointerIcon = android.view.PointerIcon.getSystemIcon(
-            context,
-            android.view.PointerIcon.TYPE_NULL,
-        )
+        decor?.pointerIcon = hiddenPointer
         val viewConfig = android.view.ViewConfiguration.get(context)
         mouse = MouseForwarder(
             handle,
@@ -160,14 +163,20 @@ internal class StreamPeripherals(
                 }
             }
         }
-        mouse.onReleaseCapture = { keyCapture()?.releasePointerCapture() }
+        // Capture is the window's, so the decor view releases it too — and unlike the capture
+        // view it is still attached when stop() runs from the composable's dispose.
+        mouse.onReleaseCapture = { decor?.releasePointerCapture() }
         activity?.mouseForwarder = mouse
         // TV remote-as-pointer: hold SELECT ≈ 0.8 s to toggle; the D-pad then glides the host
         // cursor (see RemotePointer). TV only — a phone's remote-less keys stay on the VK path.
         remote = if (isTv) {
             RemotePointer(
                 handle,
-                surfaceWidth = { videoView()?.width?.takeIf { it > 0 } ?: decor?.width ?: 1920 },
+                // Moves are host pixels, so the glide scales with the stream's width, not the TV's.
+                surfaceWidth = {
+                    video().width.takeIf { it > 0 }
+                        ?: videoView()?.width?.takeIf { it > 0 } ?: decor?.width ?: 1920
+                },
                 onActiveChanged = { on -> ui.remotePointerOn = on },
                 // The toggle TYPES — summoning also needs the KEYBOARD grant (hiding is free).
                 onKeyboardToggle = {
@@ -201,12 +210,13 @@ internal class StreamPeripherals(
         }
         // Host→client feedback (rumble + DualSense lightbar/LEDs), routed to each controller by pad
         // index via the router; poll threads stopped + joined before the router is released and the
-        // session closed. "Rumble on this phone" (opt-in) additionally mirrors controller 1's
-        // rumble onto the device's own vibrator — for clip-on pads without rumble motors.
+        // session closed. The device's own vibrator plays a motorless built-in pad's rumble, and
+        // with "Rumble on this phone" (opt-in) it also mirrors controller 1's.
         feedback = GamepadFeedback(
             handle,
             router,
-            deviceVibrator = if (settings.rumbleOnPhone) deviceBodyVibrator(context) else null,
+            bodyVibrator = deviceBodyVibrator(context),
+            mirrorPad0 = settings.rumbleOnPhone,
         ).also { it.start() }
         // "Gyro from this phone" (opt-in): this device's IMU speaks for controller 1's motion
         // while wire pad 0 is a controller without a gyro of its own — the rumble mirror's
@@ -325,6 +335,18 @@ internal class StreamPeripherals(
                 )
             }
         }
+        activity?.recaptureUsbPads = ::recaptureUsbPads
+    }
+
+    /**
+     * A pad plugged back in mid-stream: capture it again when its grant already stands. An unplug
+     * ends the link; without this the pad stays on the plain input path for the rest of the
+     * session. Never asks — a permission dialog does not belong in the middle of a game.
+     */
+    private fun recaptureUsbPads() {
+        val usb = context.getSystemService(Context.USB_SERVICE) as UsbManager
+        ds?.takeIf { !it.isActive }?.findUsbDevice()?.takeIf(usb::hasPermission)?.let { ds?.startUsb(it) }
+        sc2?.takeIf { !it.isActive }?.findUsbDevice()?.takeIf(usb::hasPermission)?.let { sc2?.startUsb(it) }
     }
 
     /**
@@ -358,6 +380,7 @@ internal class StreamPeripherals(
 
     /** Release in the order the handle's lifetime needs; the caller closes the handle after. */
     fun stop() {
+        activity?.recaptureUsbPads = null
         clip?.stop() // stop + join the clipboard poll thread BEFORE the handle is freed
         feedback.onHidRaw = null
         feedback.sink = null

@@ -1,5 +1,6 @@
 //! Codec creation, low-latency config, thread/frame-rate tuning, HDR static-info encode.
 
+use crate::sys::{set_thread_nice, sysprop};
 use ndk::media::media_codec::MediaCodec;
 use ndk::media::media_format::MediaFormat;
 use ndk::native_window::NativeWindow;
@@ -62,9 +63,18 @@ pub(super) fn create_codec(mime: &str, preferred: Option<&str>) -> Option<MediaC
 /// picture-order + low-latency, Exynos (also Google Tensor), Amlogic, HiSilicon, MediaTek. NVIDIA
 /// Tegra / Rockchip / Realtek expose no such key (nor does Moonlight) — they're covered by the
 /// standard key + clock hint + being ranked first in `VideoDecoders`.
-pub(super) fn configure_low_latency(format: &mut MediaFormat, codec_name: &str, aggressive: bool) {
+///
+/// `standard_key` = false leaves out the standard `low-latency` key (see [`low_latency_format`]).
+pub(super) fn configure_low_latency(
+    format: &mut MediaFormat,
+    codec_name: &str,
+    aggressive: bool,
+    standard_key: bool,
+) {
     // Standard key: request the no-reorder low-latency path where the platform decoder supports it.
-    format.set_i32("low-latency", 1);
+    if standard_key {
+        format.set_i32("low-latency", 1);
+    }
     if !aggressive {
         // The original profile: the Qualcomm vendor twin set blind (unknown keys are ignored by
         // other vendors' codecs), realtime priority, and the AOSP "unbounded" operating-rate
@@ -134,24 +144,22 @@ fn decoder_supports_max_operating_rate(name_lower: &str) -> bool {
 }
 
 /// Raise the pipeline's OTHER hot threads — the core's data-plane pump (UDP receive + FEC
-/// reassembly) and the audio decode thread — toward the display band, matching this decode thread's
-/// own boost. `setpriority(PRIO_PROCESS, tid)` targets any task in the process, so we do it from
-/// here once their tids are known (the same set ADPF hints), without a per-platform priority hook
-/// in the shared core. Slightly below the decode thread's -10 so the display path still wins.
-/// Best-effort; skips this thread (already boosted) and is non-fatal if the platform refuses.
+/// reassembly) and any other registered thread — toward the display band, matching this decode
+/// thread's own boost. `setpriority(PRIO_PROCESS, tid)` targets any task in the process, so we do
+/// it from here once their tids are known (the same set ADPF hints), without a per-platform
+/// priority hook in the shared core. Slightly below the decode thread's -10 so the display path
+/// still wins. Only ever raises: the audio and mic threads already sit at
+/// [`crate::audio::AUDIO_NICE`]. Best-effort; skips this thread and is non-fatal if refused.
 pub(super) fn boost_hot_threads(tids: &[i32]) {
-    // SAFETY: `gettid` is an always-safe syscall on the calling thread.
-    let self_tid = unsafe { libc::gettid() };
-    for &tid in tids {
-        if tid == self_tid {
+    let self_tid = crate::sys::gettid();
+    for &tid in tids.iter().filter(|&&tid| tid != self_tid) {
+        // SAFETY: `getpriority` takes no pointers. A failed read returns -1, above -8, so the set
+        // is tried and fails the same way.
+        if unsafe { libc::getpriority(libc::PRIO_PROCESS, tid as libc::id_t) } <= -8 {
             continue;
         }
-        // SAFETY: `setpriority` with PRIO_PROCESS + a live tid in our own process is an always-safe
-        // syscall; a refusal is reported via the return value, not UB.
-        unsafe {
-            if libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, -8) != 0 {
-                log::debug!("decode: setpriority(-8) on hot tid {tid} failed (non-fatal)");
-            }
+        if set_thread_nice(Some(tid), -8).is_err() {
+            log::debug!("decode: setpriority(-8) on hot tid {tid} failed (non-fatal)");
         }
     }
 }
@@ -160,16 +168,8 @@ pub(super) fn boost_hot_threads(tids: &[i32]) {
 /// can't preempt it under load (which shows up as late/dropped frames). Non-fatal if the platform
 /// refuses (foreground apps may set their own threads; the exact floor is policy-dependent).
 pub(crate) fn boost_thread_priority() {
-    // SAFETY: `gettid`/`setpriority` on the calling thread are always-safe syscalls. PRIO_PROCESS
-    // with a TID targets that one task on Linux — the same idiom `Process.setThreadPriority` uses.
-    unsafe {
-        let tid = libc::gettid();
-        if libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, -10) != 0 {
-            log::warn!(
-                "decode: setpriority(-10) failed (non-fatal): {}",
-                std::io::Error::last_os_error()
-            );
-        }
+    if let Err(e) = set_thread_nice(None, -10) {
+        log::warn!("decode: setpriority(-10) failed (non-fatal): {e}");
     }
 }
 
@@ -201,9 +201,8 @@ pub(super) fn try_set_frame_rate(window: &NativeWindow, frame_rate: f32, is_tv: 
     //     ANativeWindow*, float frameRate, int8_t compatibility, int8_t changeFrameRateStrategy)
     type SetFrameRateStrategyFn = unsafe extern "C" fn(*mut c_void, f32, i8, i8) -> i32;
     // SAFETY: `dlopen` of the always-mapped `libandroid.so` (only bumps its refcount; never closed —
-    // process-lifetime handle). Each `dlsym` returns null when the symbol is absent (device below the
-    // symbol's API level), checked before transmuting the non-null pointer to its fn-pointer type.
-    // `window.ptr()` is the live `ANativeWindow` this `NativeWindow` owns for the call's duration.
+    // process-lifetime handle; null is checked). Each `sym` type is the NDK header's signature;
+    // absent = below its API level. `window.ptr()` is live for the call (`&NativeWindow`).
     unsafe {
         let lib = libc::dlopen(c"libandroid.so".as_ptr(), libc::RTLD_NOW);
         if lib.is_null() {
@@ -214,21 +213,17 @@ pub(super) fn try_set_frame_rate(window: &NativeWindow, frame_rate: f32, is_tv: 
         // TV: prefer the API-31 change-strategy form to force the mode switch (strategy 1 =
         // ALWAYS). Absent on API 30 ⇒ fall through to the 2-arg hint below.
         if is_tv {
-            let sym = libc::dlsym(
+            if let Some(set) = crate::sym::<SetFrameRateStrategyFn>(
                 lib,
-                c"ANativeWindow_setFrameRateWithChangeStrategy".as_ptr(),
-            );
-            if !sym.is_null() {
-                let set = std::mem::transmute::<*mut c_void, SetFrameRateStrategyFn>(sym);
+                c"ANativeWindow_setFrameRateWithChangeStrategy",
+            ) {
                 return set(window.ptr().as_ptr().cast(), frame_rate, FIXED_SOURCE, 1) == 0;
             }
         }
-        let sym = libc::dlsym(lib, c"ANativeWindow_setFrameRate".as_ptr());
-        if sym.is_null() {
+        let Some(set) = crate::sym::<SetFrameRateFn>(lib, c"ANativeWindow_setFrameRate") else {
             return false; // device API < 30 — no per-surface frame-rate hint
-        }
-        let set_frame_rate = std::mem::transmute::<*mut c_void, SetFrameRateFn>(sym);
-        set_frame_rate(window.ptr().as_ptr().cast(), frame_rate, FIXED_SOURCE) == 0
+        };
+        set(window.ptr().as_ptr().cast(), frame_rate, FIXED_SOURCE) == 0
     }
 }
 
@@ -269,29 +264,58 @@ pub(super) fn android_hdr_static_info(m: &punktfunk_core::quic::HdrMeta) -> [u8;
 /// host sends a 0xCE right after the handshake, so it's typically already queued; wait briefly
 /// otherwise. The Surface DataSpace (applied on the format change) carries transfer/primaries
 /// regardless — this adds the luminance the tone-mapper needs. `None` on an SDR session.
+/// The newest entry, not the first: the host follows its generic baseline with the source's grade.
 pub(super) fn hdr_static(client: &NativeClient) -> Option<punktfunk_core::quic::HdrMeta> {
     if !client.color.is_hdr() {
         return None;
     }
-    match client.next_hdr_meta(Duration::from_millis(250)) {
-        Ok(meta) => {
+    match client.latest_hdr_meta(Duration::from_millis(250)) {
+        Some(meta) => {
             log::info!("decode: HDR static metadata applied (KEY_HDR_STATIC_INFO)");
             Some(meta)
         }
-        Err(_) => {
+        None => {
             log::info!("decode: HDR session but no mastering metadata yet — DataSpace only");
             None
         }
     }
 }
 
+/// Overrides the low-latency profile: `standard` (the default), `off` (no standard `low-latency`
+/// key), `mtk-tv` (no standard key; the TV decoder's game keys and `operating-rate` = fps instead).
+/// `adb shell setprop debug.punktfunk.low_latency_key standard`.
+pub(super) const LOW_LATENCY_KEY_PROP: &std::ffi::CStr = c"debug.punktfunk.low_latency_key";
+
+/// TV platforms that show half the stream rate, as (`ro.product.manufacturer`, `ro.product.device`):
+/// Philips' Pentonic 1000 sets (OLED809/810/888, PUS8508) and TCL's Pentonic 700 `G08` (C6K, C755,
+/// C805). Under the standard `low-latency` key their display stack registers the stream at the
+/// 120 Hz panel maximum, runs VRR only for HDMI inputs, and drops every other frame to fit the
+/// 60 Hz app output (HWC log `PqLink … => 1/2`). They get the `mtk-tv` profile.
+const HALF_RATE_TVS: &[(&str, &str)] = &[("TPV", "PH1M_WW_9972"), ("TCL", "G08")];
+
+fn half_rate_tv() -> bool {
+    let (Some(maker), Some(device)) = (
+        sysprop(c"ro.product.manufacturer"),
+        sysprop(c"ro.product.device"),
+    ) else {
+        return false;
+    };
+    HALF_RATE_TVS
+        .iter()
+        .any(|(m, d)| maker.eq_ignore_ascii_case(m) && device == *d)
+}
+
 /// The decoder's configure format: the mode, an input buffer generous enough that a large keyframe
-/// AU is never truncated, the low-latency keys for `codec_name`, and the HDR static info.
+/// AU is never truncated, the HDR static info, and the low-latency keys for `codec_name`.
+/// `keys` is `Some(aggressive)` for [`configure_low_latency`]'s profile, `None` for no
+/// low-latency key at all. A `c2.mtk` decoder on a [`HALF_RATE_TVS`] platform swaps the `Some`
+/// profile for `mtk-tv`; [`LOW_LATENCY_KEY_PROP`] overrides either way.
+/// ACodec ignores a refused `max-input-size`, so that key stays.
 pub(super) fn low_latency_format(
     mime: &str,
     mode: &Mode,
     codec_name: &str,
-    aggressive: bool,
+    keys: Option<bool>,
     hdr_static: Option<&punktfunk_core::quic::HdrMeta>,
 ) -> MediaFormat {
     let mut format = MediaFormat::new();
@@ -302,7 +326,25 @@ pub(super) fn low_latency_format(
         "max-input-size",
         (mode.width * mode.height).max(2_000_000) as i32,
     );
-    configure_low_latency(&mut format, codec_name, aggressive);
+    if let Some(aggressive) = keys {
+        let forced = sysprop(LOW_LATENCY_KEY_PROP);
+        let profile = match forced.as_deref() {
+            Some(p @ ("standard" | "off" | "mtk-tv")) => p,
+            _ if codec_name.to_ascii_lowercase().starts_with("c2.mtk") && half_rate_tv() => {
+                "mtk-tv"
+            }
+            _ => "standard",
+        };
+        configure_low_latency(&mut format, codec_name, aggressive, profile == "standard");
+        if profile != "standard" {
+            log::info!("decode: low-latency profile {profile} — standard low-latency key left out");
+        }
+        if profile == "mtk-tv" {
+            format.set_i32("vendor.mtk-codec2.game-mode", 1);
+            format.set_i32("vendor.mtk-codec2.low-latency-mode", 1);
+            format.set_i32("operating-rate", mode.refresh_hz as i32);
+        }
+    }
     if let Some(meta) = hdr_static {
         format.set_buffer("hdr-static-info", &android_hdr_static_info(meta));
     }

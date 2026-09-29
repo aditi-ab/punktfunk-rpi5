@@ -169,7 +169,8 @@ fn std_frame_type(frame_type: pf_bitstream::av1::FrameType) -> hh::StdVideoAV1Fr
     }
 }
 
-/// Convert one planned AV1 frame.
+/// Convert one planned AV1 frame: `refs` and `picture_info` build the
+/// sections, then the slot commit.
 ///
 /// `slots` is untouched until every fallible step has passed. A half-applied
 /// DPB update is a corrupt reference.
@@ -180,30 +181,7 @@ pub fn plan_to_vk_av1(
     let setup_id = plan.dpb.stored.ok_or(PlanToVkAv1Error::NoDecode)?;
     let header = &*plan.header;
 
-    // Unique refs, first appearance first, plus the per-name slot table.
-    // `plan.refs` is indexed by name; holes are lost refs. Skip them —
-    // compacting would rename every name after the first hole.
-    let mut refs: Vec<VkRefAv1> = Vec::new();
-    let mut reference_name_slot_indices = [REFERENCE_NAME_UNUSED; REFS_PER_FRAME];
-    for (name, r) in plan.refs.iter().enumerate() {
-        let Some(r) = r else { continue };
-        let slot = slots
-            .slot_of(r.id)
-            .ok_or(PlanToVkAv1Error::UnresolvedReference(r.id))?;
-        reference_name_slot_indices[name] = i32::from(slot);
-        if !refs.iter().any(|existing| existing.id == r.id) {
-            refs.push(VkRefAv1 {
-                slot,
-                // The reference's own state, never this frame's.
-                std: reference_info(&r.state)?,
-                id: r.id,
-            });
-        }
-    }
-    if refs.len() > NUM_REF_SLOTS {
-        return Err(PlanToVkAv1Error::TooManyReferences(refs.len()));
-    }
-
+    let (refs, reference_name_slot_indices) = refs(plan, slots)?;
     let pic = picture_info(header, &plan.sequence)?;
     // Setup needs the same answers a later frame will read from this slot.
     // Built through `reference_info` so the cached copy matches a reference
@@ -245,6 +223,37 @@ pub fn plan_to_vk_av1(
     })
 }
 
+/// Unique refs, first appearance first, plus the per-name slot table.
+/// `plan.refs` is indexed by name; holes are lost refs. Skip them —
+/// compacting would rename every name after the first hole. Read-only on
+/// `slots`.
+fn refs(
+    plan: &AuPlan,
+    slots: &SlotMap,
+) -> Result<(Vec<VkRefAv1>, [i32; REFS_PER_FRAME]), PlanToVkAv1Error> {
+    let mut refs: Vec<VkRefAv1> = Vec::new();
+    let mut reference_name_slot_indices = [REFERENCE_NAME_UNUSED; REFS_PER_FRAME];
+    for (name, r) in plan.refs.iter().enumerate() {
+        let Some(r) = r else { continue };
+        let slot = slots
+            .slot_of(r.id)
+            .ok_or(PlanToVkAv1Error::UnresolvedReference(r.id))?;
+        reference_name_slot_indices[name] = i32::from(slot);
+        if !refs.iter().any(|existing| existing.id == r.id) {
+            refs.push(VkRefAv1 {
+                slot,
+                // The reference's own state, never this frame's.
+                std: reference_info(&r.state)?,
+                id: r.id,
+            });
+        }
+    }
+    if refs.len() > NUM_REF_SLOTS {
+        return Err(PlanToVkAv1Error::TooManyReferences(refs.len()));
+    }
+    Ok((refs, reference_name_slot_indices))
+}
+
 /// One picture's `StdVideoDecodeAV1ReferenceInfo` from that picture's header.
 ///
 /// Every field is about the reference. Filling any from the frame currently
@@ -276,7 +285,8 @@ fn reference_info(
     Ok(std)
 }
 
-/// Frame header plus sequence (film-grain gate) into Std picture info.
+/// Frame header plus sequence (film-grain gate) into Std picture info: one
+/// helper per boxed block, assembled here.
 ///
 /// Headers rather than [`AuPlan`] so a unit test can convert a hand-built
 /// header without inventing a plan. The vendored vector never codes grain.
@@ -284,304 +294,22 @@ fn picture_info(
     p: &pf_bitstream::av1::ParsedFrameHeader,
     sequence: &pf_bitstream::av1::ParsedSequenceHeader,
 ) -> Result<OwnedStdAv1PictureInfo, PlanToVkAv1Error> {
-    let tile = &p.tile_info;
-    // `pMiColStarts`/`pMiRowStarts` take SUPERBLOCK starts, not the 4x4 units their
-    // names read as; libavcodec writes `tile_start_col_sb`/`tile_start_row_sb` there.
-    // The parser holds MI, so shift. Only entry 0 is common to both readings, which
-    // is why a one-tile frame survives either way and a tiled one does not.
-    let sb_shift = if sequence.use_128x128_superblock {
-        5
-    } else {
-        4
-    };
-    let mi_col_starts: Box<[u16]> = tile
-        .mi_col_starts
-        .iter()
-        .map(|v| (*v >> sb_shift) as u16)
-        .collect();
-    let mi_row_starts: Box<[u16]> = tile
-        .mi_row_starts
-        .iter()
-        .map(|v| (*v >> sb_shift) as u16)
-        .collect();
-    let width_in_sbs: Box<[u16]> = tile
-        .width_in_sbs_minus_1
-        .iter()
-        .map(|v| *v as u16)
-        .collect();
-    let height_in_sbs: Box<[u16]> = tile
-        .height_in_sbs_minus_1
-        .iter()
-        .map(|v| *v as u16)
-        .collect();
-    // SAFETY: plain-C bindgen structs throughout this function — a bitfield word,
-    // integers, fixed arrays and const pointers. All-zero is valid for every field,
-    // and every pointer is assigned before use.
-    let mut tile_std: hh::StdVideoAV1TileInfo = unsafe { std::mem::zeroed() };
-    tile_std
-        .flags
-        .set_uniform_tile_spacing_flag(tile.uniform_tile_spacing_flag.into());
-    tile_std.TileCols = narrow("TileCols", tile.tile_cols)?;
-    tile_std.TileRows = narrow("TileRows", tile.tile_rows)?;
-    tile_std.context_update_tile_id = tile.context_update_tile_id as u16;
-    tile_std.tile_size_bytes_minus_1 = narrow(
-        "tile_size_bytes_minus_1",
-        tile.tile_size_bytes.saturating_sub(1),
-    )?;
-    tile_std.pMiColStarts = mi_col_starts.as_ptr();
-    tile_std.pMiRowStarts = mi_row_starts.as_ptr();
-    tile_std.pWidthInSbsMinus1 = width_in_sbs.as_ptr();
-    tile_std.pHeightInSbsMinus1 = height_in_sbs.as_ptr();
+    let (tile_std, tile_arrays) = tiles(p, sequence)?;
     let tile_info = Box::new(tile_std);
-    let tile_arrays = TileArrays {
-        _mi_col_starts: mi_col_starts,
-        _mi_row_starts: mi_row_starts,
-        _width_in_sbs_minus_1: width_in_sbs,
-        _height_in_sbs_minus_1: height_in_sbs,
-    };
+    let quantization = Box::new(quantization(p)?);
+    let segmentation = Box::new(segmentation(p));
+    let loop_filter = Box::new(loop_filter(p));
+    let cdef = Box::new(cdef(p)?);
+    let loop_restoration = Box::new(loop_restoration(p));
+    let global_motion = Box::new(global_motion(p));
+    let film_grain = film_grain(p, sequence)?.map(Box::new);
 
-    let q = &p.quantization_params;
-    // SAFETY: see above.
-    let mut q_std: hh::StdVideoAV1Quantization = unsafe { std::mem::zeroed() };
-    q_std.flags.set_using_qmatrix(q.using_qmatrix.into());
-    q_std.flags.set_diff_uv_delta(q.diff_uv_delta.into());
-    q_std.base_q_idx = narrow("base_q_idx", q.base_q_idx)?;
-    q_std.DeltaQYDc = q.delta_q_y_dc as i8;
-    q_std.DeltaQUDc = q.delta_q_u_dc as i8;
-    q_std.DeltaQUAc = q.delta_q_u_ac as i8;
-    q_std.DeltaQVDc = q.delta_q_v_dc as i8;
-    q_std.DeltaQVAc = q.delta_q_v_ac as i8;
-    q_std.qm_y = narrow("qm_y", q.qm_y)?;
-    q_std.qm_u = narrow("qm_u", q.qm_u)?;
-    q_std.qm_v = narrow("qm_v", q.qm_v)?;
-    let quantization = Box::new(q_std);
-
-    let s = &p.segmentation_params;
-    // SAFETY: see above.
-    let mut s_std: hh::StdVideoAV1Segmentation = unsafe { std::mem::zeroed() };
-    for (seg, enabled) in s.feature_enabled.iter().enumerate() {
-        let mut bits = 0u8;
-        for (feature, on) in enabled.iter().enumerate() {
-            if *on {
-                bits |= 1 << feature;
-            }
-        }
-        s_std.FeatureEnabled[seg] = bits;
-        s_std.FeatureData[seg] = s.feature_data[seg];
-    }
-    let segmentation = Box::new(s_std);
-
-    let lf = &p.loop_filter_params;
-    // SAFETY: see above.
-    let mut lf_std: hh::StdVideoAV1LoopFilter = unsafe { std::mem::zeroed() };
-    lf_std
-        .flags
-        .set_loop_filter_delta_enabled(lf.loop_filter_delta_enabled.into());
-    lf_std
-        .flags
-        .set_loop_filter_delta_update(lf.loop_filter_delta_update.into());
-    lf_std.loop_filter_level = lf.loop_filter_level;
-    lf_std.loop_filter_sharpness = lf.loop_filter_sharpness;
-    lf_std.loop_filter_ref_deltas = lf.loop_filter_ref_deltas;
-    lf_std.loop_filter_mode_deltas = lf.loop_filter_mode_deltas;
-    let loop_filter = Box::new(lf_std);
-
-    // Secondary strengths are the coded two-bit values, not the spec fixup
-    // (`== 3` becomes 4). Sending 4 overflows the two bits every driver
-    // packs; strongest secondary filter reads back as none.
-    // `coded_cdef_sec_strength` is the inverse.
-    let c = &p.cdef_params;
-    // SAFETY: see above.
-    let mut c_std: hh::StdVideoAV1CDEF = unsafe { std::mem::zeroed() };
-    c_std.cdef_damping_minus_3 = narrow("cdef_damping_minus_3", c.cdef_damping.saturating_sub(3))?;
-    c_std.cdef_bits = narrow("cdef_bits", c.cdef_bits)?;
-    for i in 0..8 {
-        c_std.cdef_y_pri_strength[i] = c.cdef_y_pri_strength[i] as u8;
-        c_std.cdef_y_sec_strength[i] = coded_cdef_sec_strength(c.cdef_y_sec_strength[i]);
-        c_std.cdef_uv_pri_strength[i] = c.cdef_uv_pri_strength[i] as u8;
-        c_std.cdef_uv_sec_strength[i] = coded_cdef_sec_strength(c.cdef_uv_sec_strength[i]);
-    }
-    let cdef = Box::new(c_std);
-
-    // `LoopRestorationSize` is the coded value, not pixels. RADV stores
-    // `log2_restoration_size_minus5`; libavcodec sends `1 + lr_unit_shift`.
-    // The parser holds 64/128/256. Sending 64 where the driver expects 1
-    // asks for a 2^69-pixel restoration unit.
-    let lr = &p.loop_restoration_params;
-    // SAFETY: see above.
-    let mut lr_std: hh::StdVideoAV1LoopRestoration = unsafe { std::mem::zeroed() };
-    let luma_size = 1 + u16::from(lr.lr_unit_shift);
-    // `lr_uv_shift` is 0 or 1 and `luma_size` ≥ 1, so this cannot wrap.
-    // Saturation is so a malformed parse cannot send 65535 as log2(size)−5.
-    let chroma_size = luma_size.saturating_sub(u16::from(lr.lr_uv_shift));
-    for i in 0..3 {
-        lr_std.FrameRestorationType[i] = lr.frame_restoration_type[i] as u32;
-        lr_std.LoopRestorationSize[i] = if i == 0 { luma_size } else { chroma_size };
-    }
-    let loop_restoration = Box::new(lr_std);
-
-    let gm = &p.global_motion_params;
-    // SAFETY: see above.
-    let mut gm_std: hh::StdVideoAV1GlobalMotion = unsafe { std::mem::zeroed() };
-    for i in 0..NUM_REF_SLOTS {
-        gm_std.GmType[i] = gm.gm_type[i] as u8;
-        gm_std.gm_params[i] = gm.gm_params[i];
-    }
-    let global_motion = Box::new(gm_std);
-
-    // Grain only when the sequence enables it and this frame applies it.
-    // Either gate false: a zeroed block behind a live pointer would ask
-    // the decoder to synthesise grain the stream never described.
-    let film_grain = if sequence.film_grain_params_present && p.film_grain_params.apply_grain {
-        let fg = &p.film_grain_params;
-        // SAFETY: see above.
-        let mut fg_std: hh::StdVideoAV1FilmGrain = unsafe { std::mem::zeroed() };
-        fg_std
-            .flags
-            .set_chroma_scaling_from_luma(fg.chroma_scaling_from_luma.into());
-        fg_std.flags.set_overlap_flag(fg.overlap_flag.into());
-        fg_std
-            .flags
-            .set_clip_to_restricted_range(fg.clip_to_restricted_range.into());
-        fg_std.flags.set_update_grain(fg.update_grain.into());
-        fg_std.grain_scaling_minus_8 = fg.grain_scaling_minus_8;
-        fg_std.ar_coeff_lag = narrow("ar_coeff_lag", fg.ar_coeff_lag)?;
-        fg_std.ar_coeff_shift_minus_6 = fg.ar_coeff_shift_minus_6;
-        fg_std.grain_scale_shift = fg.grain_scale_shift;
-        fg_std.grain_seed = fg.grain_seed;
-        fg_std.film_grain_params_ref_idx = fg.film_grain_params_ref_idx;
-        // Chroma scaling (7.18.3.5 `scaling_lut`). Zeroes are not "less
-        // grain": they synthesise different chroma noise. libavcodec and
-        // the DXVA conversion set all six.
-        fg_std.cb_mult = fg.cb_mult;
-        fg_std.cb_luma_mult = fg.cb_luma_mult;
-        fg_std.cb_offset = fg.cb_offset;
-        fg_std.cr_mult = fg.cr_mult;
-        fg_std.cr_luma_mult = fg.cr_luma_mult;
-        fg_std.cr_offset = fg.cr_offset;
-
-        // Parser arrays are 16; Std is 14 (luma) and 10 (chroma) — spec
-        // maxima. Refuse overflow rather than truncate: fewer scaling
-        // points than the stream declared synthesises different grain.
-        let points =
-            |name: &'static str, count: u8, cap: usize| -> Result<usize, PlanToVkAv1Error> {
-                if usize::from(count) > cap {
-                    return Err(PlanToVkAv1Error::FieldOverflow {
-                        field: name,
-                        value: u32::from(count),
-                    });
-                }
-                Ok(usize::from(count))
-            };
-        let ny = points("num_y_points", fg.num_y_points, fg_std.point_y_value.len())?;
-        let ncb = points(
-            "num_cb_points",
-            fg.num_cb_points,
-            fg_std.point_cb_value.len(),
-        )?;
-        let ncr = points(
-            "num_cr_points",
-            fg.num_cr_points,
-            fg_std.point_cr_value.len(),
-        )?;
-        fg_std.num_y_points = fg.num_y_points;
-        fg_std.num_cb_points = fg.num_cb_points;
-        fg_std.num_cr_points = fg.num_cr_points;
-        fg_std.point_y_value[..ny].copy_from_slice(&fg.point_y_value[..ny]);
-        fg_std.point_y_scaling[..ny].copy_from_slice(&fg.point_y_scaling[..ny]);
-        fg_std.point_cb_value[..ncb].copy_from_slice(&fg.point_cb_value[..ncb]);
-        fg_std.point_cb_scaling[..ncb].copy_from_slice(&fg.point_cb_scaling[..ncb]);
-        fg_std.point_cr_value[..ncr].copy_from_slice(&fg.point_cr_value[..ncr]);
-        fg_std.point_cr_scaling[..ncr].copy_from_slice(&fg.point_cr_scaling[..ncr]);
-        for (dst, src) in fg_std
-            .ar_coeffs_y_plus_128
-            .iter_mut()
-            .zip(fg.ar_coeffs_y_plus_128.iter())
-        {
-            *dst = *src as i8;
-        }
-        for (dst, src) in fg_std
-            .ar_coeffs_cb_plus_128
-            .iter_mut()
-            .zip(fg.ar_coeffs_cb_plus_128.iter())
-        {
-            *dst = *src as i8;
-        }
-        for (dst, src) in fg_std
-            .ar_coeffs_cr_plus_128
-            .iter_mut()
-            .zip(fg.ar_coeffs_cr_plus_128.iter())
-        {
-            *dst = *src as i8;
-        }
-        Some(Box::new(fg_std))
-    } else {
-        None
-    };
-
-    // SAFETY: see above.
+    // SAFETY: StdVideoDecodeAV1PictureInfo is a plain-C bindgen struct of a
+    // bitfield word, integers, byte arrays and const pointers; all-zero is valid
+    // for every field, and every pointer is assigned below.
     let mut std: hh::StdVideoDecodeAV1PictureInfo = unsafe { std::mem::zeroed() };
-    std.flags
-        .set_error_resilient_mode(p.error_resilient_mode.into());
-    std.flags
-        .set_disable_cdf_update(p.disable_cdf_update.into());
-    std.flags.set_use_superres(p.use_superres.into());
-    // `allow_intrabc` is only codeable when `allow_screen_content_tools`
-    // is on; the two disagreeing is a contradiction a driver may resolve
-    // either way.
-    std.flags
-        .set_allow_screen_content_tools(u32::from(p.allow_screen_content_tools != 0));
-    std.flags
-        .set_allow_warped_motion(p.allow_warped_motion.into());
-    std.flags
-        .set_is_filter_switchable(p.is_filter_switchable.into());
-    std.flags
-        .set_force_integer_mv(u32::from(p.force_integer_mv != 0));
-    std.flags
-        .set_render_and_frame_size_different(p.render_and_frame_size_different.into());
-    std.flags
-        .set_frame_size_override_flag(p.frame_size_override_flag.into());
-    std.flags
-        .set_buffer_removal_time_present_flag(p.buffer_removal_time_present_flag.into());
-    std.flags
-        .set_frame_refs_short_signaling(p.frame_refs_short_signaling.into());
-    std.flags.set_allow_intrabc(p.allow_intrabc.into());
-    std.flags
-        .set_allow_high_precision_mv(p.allow_high_precision_mv.into());
-    std.flags
-        .set_is_motion_mode_switchable(p.is_motion_mode_switchable.into());
-    std.flags.set_use_ref_frame_mvs(p.use_ref_frame_mvs.into());
-    std.flags
-        .set_disable_frame_end_update_cdf(p.disable_frame_end_update_cdf.into());
-    std.flags.set_reduced_tx_set(p.reduced_tx_set.into());
-    std.flags.set_reference_select(p.reference_select.into());
-    std.flags.set_skip_mode_present(p.skip_mode_present.into());
-    std.flags
-        .set_delta_q_present(p.quantization_params.delta_q_present.into());
-    std.flags
-        .set_delta_lf_present(p.loop_filter_params.delta_lf_present.into());
-    std.flags
-        .set_delta_lf_multi(p.loop_filter_params.delta_lf_multi.into());
-    std.flags
-        .set_segmentation_enabled(p.segmentation_params.segmentation_enabled.into());
-    std.flags
-        .set_segmentation_update_map(p.segmentation_params.segmentation_update_map.into());
-    std.flags.set_segmentation_temporal_update(
-        p.segmentation_params.segmentation_temporal_update.into(),
-    );
-    std.flags
-        .set_segmentation_update_data(p.segmentation_params.segmentation_update_data.into());
-    // Derived, not coded: any plane's restoration type other than NONE.
-    std.flags.set_UsesLr(u32::from(
-        lr.frame_restoration_type.iter().any(|t| *t as u32 != 0),
-    ));
-    // `usesChromaLr` stays 0 — `zeroed()` above, not an omission.
-    // libavcodec never sets it; drivers were validated against that.
-    // A truthful 1 would be the first implementation to send one.
-
     // Matches the `pFilmGrain` gate: grain applied iff a block is attached.
-    std.flags.set_apply_grain(u32::from(film_grain.is_some()));
-
+    std.flags = frame_flags(p, film_grain.is_some());
     std.frame_type = std_frame_type(p.frame_type);
     std.current_frame_id = p.current_frame_id;
     std.OrderHint = narrow("OrderHint", p.order_hint)?;
@@ -633,15 +361,331 @@ fn picture_info(
     })
 }
 
+/// `StdVideoAV1TileInfo` plus the four arrays its pointers target. The
+/// arrays live on the heap, so moving `TileArrays` keeps the pointers valid.
+fn tiles(
+    p: &pf_bitstream::av1::ParsedFrameHeader,
+    sequence: &pf_bitstream::av1::ParsedSequenceHeader,
+) -> Result<(hh::StdVideoAV1TileInfo, TileArrays), PlanToVkAv1Error> {
+    let tile = &p.tile_info;
+    // `pMiColStarts`/`pMiRowStarts` take SUPERBLOCK starts, not the 4x4 units their
+    // names read as; libavcodec writes `tile_start_col_sb`/`tile_start_row_sb` there.
+    // The parser holds MI, so shift. Only entry 0 is common to both readings, which
+    // is why a one-tile frame survives either way and a tiled one does not.
+    let sb_shift = if sequence.use_128x128_superblock {
+        5
+    } else {
+        4
+    };
+    let mi_col_starts: Box<[u16]> = tile
+        .mi_col_starts
+        .iter()
+        .map(|v| (*v >> sb_shift) as u16)
+        .collect();
+    let mi_row_starts: Box<[u16]> = tile
+        .mi_row_starts
+        .iter()
+        .map(|v| (*v >> sb_shift) as u16)
+        .collect();
+    let width_in_sbs: Box<[u16]> = tile
+        .width_in_sbs_minus_1
+        .iter()
+        .map(|v| *v as u16)
+        .collect();
+    let height_in_sbs: Box<[u16]> = tile
+        .height_in_sbs_minus_1
+        .iter()
+        .map(|v| *v as u16)
+        .collect();
+    // SAFETY: StdVideoAV1TileInfo is a plain-C bindgen struct of a bitfield
+    // word, integers and const pointers; all-zero is valid for every field, and
+    // every pointer is assigned below.
+    let mut tile_std: hh::StdVideoAV1TileInfo = unsafe { std::mem::zeroed() };
+    tile_std
+        .flags
+        .set_uniform_tile_spacing_flag(tile.uniform_tile_spacing_flag.into());
+    tile_std.TileCols = narrow("TileCols", tile.tile_cols)?;
+    tile_std.TileRows = narrow("TileRows", tile.tile_rows)?;
+    tile_std.context_update_tile_id = tile.context_update_tile_id as u16;
+    tile_std.tile_size_bytes_minus_1 = narrow(
+        "tile_size_bytes_minus_1",
+        tile.tile_size_bytes.saturating_sub(1),
+    )?;
+    tile_std.pMiColStarts = mi_col_starts.as_ptr();
+    tile_std.pMiRowStarts = mi_row_starts.as_ptr();
+    tile_std.pWidthInSbsMinus1 = width_in_sbs.as_ptr();
+    tile_std.pHeightInSbsMinus1 = height_in_sbs.as_ptr();
+    let tile_arrays = TileArrays {
+        _mi_col_starts: mi_col_starts,
+        _mi_row_starts: mi_row_starts,
+        _width_in_sbs_minus_1: width_in_sbs,
+        _height_in_sbs_minus_1: height_in_sbs,
+    };
+    Ok((tile_std, tile_arrays))
+}
+
+fn quantization(
+    p: &pf_bitstream::av1::ParsedFrameHeader,
+) -> Result<hh::StdVideoAV1Quantization, PlanToVkAv1Error> {
+    let q = &p.quantization_params;
+    // SAFETY: StdVideoAV1Quantization is a plain-C bindgen struct of a bitfield
+    // word and integers; all-zero is valid for every field.
+    let mut q_std: hh::StdVideoAV1Quantization = unsafe { std::mem::zeroed() };
+    q_std.flags.set_using_qmatrix(q.using_qmatrix.into());
+    q_std.flags.set_diff_uv_delta(q.diff_uv_delta.into());
+    q_std.base_q_idx = narrow("base_q_idx", q.base_q_idx)?;
+    q_std.DeltaQYDc = q.delta_q_y_dc as i8;
+    q_std.DeltaQUDc = q.delta_q_u_dc as i8;
+    q_std.DeltaQUAc = q.delta_q_u_ac as i8;
+    q_std.DeltaQVDc = q.delta_q_v_dc as i8;
+    q_std.DeltaQVAc = q.delta_q_v_ac as i8;
+    q_std.qm_y = narrow("qm_y", q.qm_y)?;
+    q_std.qm_u = narrow("qm_u", q.qm_u)?;
+    q_std.qm_v = narrow("qm_v", q.qm_v)?;
+    Ok(q_std)
+}
+
+fn segmentation(p: &pf_bitstream::av1::ParsedFrameHeader) -> hh::StdVideoAV1Segmentation {
+    let s = &p.segmentation_params;
+    // SAFETY: StdVideoAV1Segmentation is a plain-C bindgen struct of integer
+    // arrays; all-zero is valid for every field.
+    let mut s_std: hh::StdVideoAV1Segmentation = unsafe { std::mem::zeroed() };
+    for (seg, enabled) in s.feature_enabled.iter().enumerate() {
+        let mut bits = 0u8;
+        for (feature, on) in enabled.iter().enumerate() {
+            if *on {
+                bits |= 1 << feature;
+            }
+        }
+        s_std.FeatureEnabled[seg] = bits;
+        s_std.FeatureData[seg] = s.feature_data[seg];
+    }
+    s_std
+}
+
+fn loop_filter(p: &pf_bitstream::av1::ParsedFrameHeader) -> hh::StdVideoAV1LoopFilter {
+    let lf = &p.loop_filter_params;
+    // SAFETY: StdVideoAV1LoopFilter is a plain-C bindgen struct of a bitfield
+    // word and integer arrays; all-zero is valid for every field.
+    let mut lf_std: hh::StdVideoAV1LoopFilter = unsafe { std::mem::zeroed() };
+    lf_std
+        .flags
+        .set_loop_filter_delta_enabled(lf.loop_filter_delta_enabled.into());
+    lf_std
+        .flags
+        .set_loop_filter_delta_update(lf.loop_filter_delta_update.into());
+    lf_std.loop_filter_level = lf.loop_filter_level;
+    lf_std.loop_filter_sharpness = lf.loop_filter_sharpness;
+    lf_std.loop_filter_ref_deltas = lf.loop_filter_ref_deltas;
+    lf_std.loop_filter_mode_deltas = lf.loop_filter_mode_deltas;
+    lf_std
+}
+
+/// Secondary strengths are the coded two-bit values, not the spec fixup
+/// (`== 3` becomes 4). Sending 4 overflows the two bits every driver packs;
+/// strongest secondary filter reads back as none. `coded_cdef_sec_strength`
+/// is the inverse.
+fn cdef(p: &pf_bitstream::av1::ParsedFrameHeader) -> Result<hh::StdVideoAV1CDEF, PlanToVkAv1Error> {
+    let c = &p.cdef_params;
+    // SAFETY: StdVideoAV1CDEF is a plain-C bindgen struct of integers and
+    // integer arrays; all-zero is valid for every field.
+    let mut c_std: hh::StdVideoAV1CDEF = unsafe { std::mem::zeroed() };
+    c_std.cdef_damping_minus_3 = narrow("cdef_damping_minus_3", c.cdef_damping.saturating_sub(3))?;
+    c_std.cdef_bits = narrow("cdef_bits", c.cdef_bits)?;
+    for i in 0..8 {
+        c_std.cdef_y_pri_strength[i] = c.cdef_y_pri_strength[i] as u8;
+        c_std.cdef_y_sec_strength[i] = coded_cdef_sec_strength(c.cdef_y_sec_strength[i]);
+        c_std.cdef_uv_pri_strength[i] = c.cdef_uv_pri_strength[i] as u8;
+        c_std.cdef_uv_sec_strength[i] = coded_cdef_sec_strength(c.cdef_uv_sec_strength[i]);
+    }
+    Ok(c_std)
+}
+
+/// `LoopRestorationSize` is the coded value, not pixels. RADV stores
+/// `log2_restoration_size_minus5`; libavcodec sends `1 + lr_unit_shift`. The
+/// parser holds 64/128/256. Sending 64 where the driver expects 1 asks for a
+/// 2^69-pixel restoration unit.
+fn loop_restoration(p: &pf_bitstream::av1::ParsedFrameHeader) -> hh::StdVideoAV1LoopRestoration {
+    let lr = &p.loop_restoration_params;
+    // SAFETY: StdVideoAV1LoopRestoration is a plain-C bindgen struct of integer
+    // arrays; all-zero is valid for every field.
+    let mut lr_std: hh::StdVideoAV1LoopRestoration = unsafe { std::mem::zeroed() };
+    let luma_size = 1 + u16::from(lr.lr_unit_shift);
+    // `lr_uv_shift` is 0 or 1 and `luma_size` ≥ 1, so this cannot wrap.
+    // Saturation is so a malformed parse cannot send 65535 as log2(size)−5.
+    let chroma_size = luma_size.saturating_sub(u16::from(lr.lr_uv_shift));
+    for i in 0..3 {
+        lr_std.FrameRestorationType[i] = lr.frame_restoration_type[i] as u32;
+        lr_std.LoopRestorationSize[i] = if i == 0 { luma_size } else { chroma_size };
+    }
+    lr_std
+}
+
+fn global_motion(p: &pf_bitstream::av1::ParsedFrameHeader) -> hh::StdVideoAV1GlobalMotion {
+    let gm = &p.global_motion_params;
+    // SAFETY: StdVideoAV1GlobalMotion is a plain-C bindgen struct of integer
+    // arrays; all-zero is valid for every field.
+    let mut gm_std: hh::StdVideoAV1GlobalMotion = unsafe { std::mem::zeroed() };
+    for i in 0..NUM_REF_SLOTS {
+        gm_std.GmType[i] = gm.gm_type[i] as u8;
+        gm_std.gm_params[i] = gm.gm_params[i];
+    }
+    gm_std
+}
+
+/// Grain only when the sequence enables it and this frame applies it. Either
+/// gate false: a zeroed block behind a live pointer would ask the decoder to
+/// synthesise grain the stream never described.
+fn film_grain(
+    p: &pf_bitstream::av1::ParsedFrameHeader,
+    sequence: &pf_bitstream::av1::ParsedSequenceHeader,
+) -> Result<Option<hh::StdVideoAV1FilmGrain>, PlanToVkAv1Error> {
+    if !(sequence.film_grain_params_present && p.film_grain_params.apply_grain) {
+        return Ok(None);
+    }
+    let fg = &p.film_grain_params;
+    // SAFETY: StdVideoAV1FilmGrain is a plain-C bindgen struct of a bitfield
+    // word, integers and integer arrays; all-zero is valid for every field.
+    let mut fg_std: hh::StdVideoAV1FilmGrain = unsafe { std::mem::zeroed() };
+    fg_std
+        .flags
+        .set_chroma_scaling_from_luma(fg.chroma_scaling_from_luma.into());
+    fg_std.flags.set_overlap_flag(fg.overlap_flag.into());
+    fg_std
+        .flags
+        .set_clip_to_restricted_range(fg.clip_to_restricted_range.into());
+    fg_std.flags.set_update_grain(fg.update_grain.into());
+    fg_std.grain_scaling_minus_8 = fg.grain_scaling_minus_8;
+    fg_std.ar_coeff_lag = narrow("ar_coeff_lag", fg.ar_coeff_lag)?;
+    fg_std.ar_coeff_shift_minus_6 = fg.ar_coeff_shift_minus_6;
+    fg_std.grain_scale_shift = fg.grain_scale_shift;
+    fg_std.grain_seed = fg.grain_seed;
+    fg_std.film_grain_params_ref_idx = fg.film_grain_params_ref_idx;
+    // Chroma scaling (7.18.3.5 `scaling_lut`). Zeroes are not "less
+    // grain": they synthesise different chroma noise. libavcodec and
+    // the DXVA conversion set all six.
+    fg_std.cb_mult = fg.cb_mult;
+    fg_std.cb_luma_mult = fg.cb_luma_mult;
+    fg_std.cb_offset = fg.cb_offset;
+    fg_std.cr_mult = fg.cr_mult;
+    fg_std.cr_luma_mult = fg.cr_luma_mult;
+    fg_std.cr_offset = fg.cr_offset;
+
+    // Parser arrays are 16; Std is 14 (luma) and 10 (chroma) — spec
+    // maxima. Refuse overflow rather than truncate: fewer scaling
+    // points than the stream declared synthesises different grain.
+    let points = |name: &'static str, count: u8, cap: usize| -> Result<usize, PlanToVkAv1Error> {
+        if usize::from(count) > cap {
+            return Err(PlanToVkAv1Error::FieldOverflow {
+                field: name,
+                value: u32::from(count),
+            });
+        }
+        Ok(usize::from(count))
+    };
+    let ny = points("num_y_points", fg.num_y_points, fg_std.point_y_value.len())?;
+    let ncb = points(
+        "num_cb_points",
+        fg.num_cb_points,
+        fg_std.point_cb_value.len(),
+    )?;
+    let ncr = points(
+        "num_cr_points",
+        fg.num_cr_points,
+        fg_std.point_cr_value.len(),
+    )?;
+    fg_std.num_y_points = fg.num_y_points;
+    fg_std.num_cb_points = fg.num_cb_points;
+    fg_std.num_cr_points = fg.num_cr_points;
+    fg_std.point_y_value[..ny].copy_from_slice(&fg.point_y_value[..ny]);
+    fg_std.point_y_scaling[..ny].copy_from_slice(&fg.point_y_scaling[..ny]);
+    fg_std.point_cb_value[..ncb].copy_from_slice(&fg.point_cb_value[..ncb]);
+    fg_std.point_cb_scaling[..ncb].copy_from_slice(&fg.point_cb_scaling[..ncb]);
+    fg_std.point_cr_value[..ncr].copy_from_slice(&fg.point_cr_value[..ncr]);
+    fg_std.point_cr_scaling[..ncr].copy_from_slice(&fg.point_cr_scaling[..ncr]);
+    for (dst, src) in fg_std
+        .ar_coeffs_y_plus_128
+        .iter_mut()
+        .zip(fg.ar_coeffs_y_plus_128.iter())
+    {
+        *dst = *src as i8;
+    }
+    for (dst, src) in fg_std
+        .ar_coeffs_cb_plus_128
+        .iter_mut()
+        .zip(fg.ar_coeffs_cb_plus_128.iter())
+    {
+        *dst = *src as i8;
+    }
+    for (dst, src) in fg_std
+        .ar_coeffs_cr_plus_128
+        .iter_mut()
+        .zip(fg.ar_coeffs_cr_plus_128.iter())
+    {
+        *dst = *src as i8;
+    }
+    Ok(Some(fg_std))
+}
+
+/// Picture-level flags, `apply_grain` from whether a grain block is attached.
+fn frame_flags(
+    p: &pf_bitstream::av1::ParsedFrameHeader,
+    apply_grain: bool,
+) -> hh::StdVideoDecodeAV1PictureInfoFlags {
+    // SAFETY: StdVideoDecodeAV1PictureInfoFlags is a plain-C bindgen bitfield
+    // word; all-zero is valid.
+    let mut flags: hh::StdVideoDecodeAV1PictureInfoFlags = unsafe { std::mem::zeroed() };
+    flags.set_error_resilient_mode(p.error_resilient_mode.into());
+    flags.set_disable_cdf_update(p.disable_cdf_update.into());
+    flags.set_use_superres(p.use_superres.into());
+    // `allow_intrabc` is only codeable when `allow_screen_content_tools`
+    // is on; the two disagreeing is a contradiction a driver may resolve
+    // either way.
+    flags.set_allow_screen_content_tools(u32::from(p.allow_screen_content_tools != 0));
+    flags.set_allow_warped_motion(p.allow_warped_motion.into());
+    flags.set_is_filter_switchable(p.is_filter_switchable.into());
+    flags.set_force_integer_mv(u32::from(p.force_integer_mv != 0));
+    flags.set_render_and_frame_size_different(p.render_and_frame_size_different.into());
+    flags.set_frame_size_override_flag(p.frame_size_override_flag.into());
+    flags.set_buffer_removal_time_present_flag(p.buffer_removal_time_present_flag.into());
+    flags.set_frame_refs_short_signaling(p.frame_refs_short_signaling.into());
+    flags.set_allow_intrabc(p.allow_intrabc.into());
+    flags.set_allow_high_precision_mv(p.allow_high_precision_mv.into());
+    flags.set_is_motion_mode_switchable(p.is_motion_mode_switchable.into());
+    flags.set_use_ref_frame_mvs(p.use_ref_frame_mvs.into());
+    flags.set_disable_frame_end_update_cdf(p.disable_frame_end_update_cdf.into());
+    flags.set_reduced_tx_set(p.reduced_tx_set.into());
+    flags.set_reference_select(p.reference_select.into());
+    flags.set_skip_mode_present(p.skip_mode_present.into());
+    flags.set_delta_q_present(p.quantization_params.delta_q_present.into());
+    flags.set_delta_lf_present(p.loop_filter_params.delta_lf_present.into());
+    flags.set_delta_lf_multi(p.loop_filter_params.delta_lf_multi.into());
+    let s = &p.segmentation_params;
+    flags.set_segmentation_enabled(s.segmentation_enabled.into());
+    flags.set_segmentation_update_map(s.segmentation_update_map.into());
+    flags.set_segmentation_temporal_update(s.segmentation_temporal_update.into());
+    flags.set_segmentation_update_data(s.segmentation_update_data.into());
+    // Derived, not coded: any plane's restoration type other than NONE.
+    flags.set_UsesLr(u32::from(
+        p.loop_restoration_params
+            .frame_restoration_type
+            .iter()
+            .any(|t| *t as u32 != 0),
+    ));
+    // `usesChromaLr` stays 0 — `zeroed()` above, not an omission.
+    // libavcodec never sets it; drivers were validated against that.
+    // A truthful 1 would be the first implementation to send one.
+    flags.set_apply_grain(u32::from(apply_grain));
+    flags
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cros_codecs::bitstream_utils::IvfIterator;
     use pf_bitstream::av1::Av1Planner;
 
-    const AV1_25FPS: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/av1/test_data/test-25fps.ivf.av1"
-    );
+    const AV1_25FPS: &[u8] = pf_bitstream::testing::AV1_25FPS;
 
     /// Convert the way a backend must: conversion, then the deferred
     /// [`DecodePlanVkAv1::release_after_decode`]. Skipping the second half

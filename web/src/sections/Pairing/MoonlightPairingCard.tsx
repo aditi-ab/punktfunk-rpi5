@@ -1,7 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { Info, KeyRound } from "lucide-react";
 import { type FC, useEffect, useRef, useState } from "react";
-import { ApiError } from "@/api/fetcher";
 import { getListPairedClientsQueryKey } from "@/api/gen/clients/clients";
 import type { PairingStatus } from "@/api/gen/model/pairingStatus";
 import {
@@ -9,6 +8,11 @@ import {
 	useGetPairingStatus,
 } from "@/api/gen/pairing/pairing";
 import { useSubmitPairingPin } from "@/api/pairing";
+import {
+	PasswordConfirmField,
+	type PasswordFailure,
+	usePasswordFailure,
+} from "@/components/password-confirm";
 import { QueryState } from "@/components/query-state";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -24,8 +28,21 @@ import {
 import type { Loadable } from "@/lib/query";
 import { m } from "@/paraglide/messages";
 
-const ceremonyKey = (c: PairingStatus["pending"][number]) =>
+type Ceremony = PairingStatus["pending"][number];
+
+const ceremonyKey = (c: Ceremony) =>
 	`${c.uniqueid}\u0000${c.fingerprint}\u0000${c.peer_ip}`;
+
+/** The ceremony a PIN goes to: the picked one, else the sole one. Never a default among several. */
+export const addressedCeremony = (
+	ceremonies: readonly Ceremony[],
+	target: string,
+): Ceremony | undefined =>
+	target
+		? ceremonies.find((c) => ceremonyKey(c) === target)
+		: ceremonies.length === 1
+			? ceremonies[0]
+			: undefined;
 
 /** Container: GameStream/Moonlight pairing — poll status, own the PIN entry, submit it. */
 export const MoonlightPairingSection: FC = () => {
@@ -33,8 +50,8 @@ export const MoonlightPairingSection: FC = () => {
 	const [pin, setPin] = useState("");
 	const [label, setLabel] = useState("");
 	const [password, setPassword] = useState("");
-	const [wrongPassword, setWrongPassword] = useState(false);
-	// Fingerprint of the ceremony the PIN is addressed to; "" = the first (sole) one.
+	const refusal = usePasswordFailure();
+	// Key of the ceremony the PIN is addressed to; "" = the sole one.
 	const [target, setTarget] = useState("");
 	const pairing = useGetPairingStatus({ query: { refetchInterval: 2_000 } });
 	const submit = useSubmitPairingPin();
@@ -54,20 +71,17 @@ export const MoonlightPairingSection: FC = () => {
 			setPin("");
 			setLabel("");
 			setPassword("");
-			setWrongPassword(false);
+			refusal.reset();
 			setTarget("");
 		}
 		wasPending.current = pending;
-	}, [pending, submit.reset]);
+	}, [pending, submit.reset, refusal.reset]);
 
 	const onSubmit = () => {
-		setWrongPassword(false);
-		// Address the PIN to the ceremony the operator saw (the selected one, else the sole
-		// one) — never to whichever handshake is parked at delivery time (security-review
-		// 2026-08-31 H-4).
-		const ceremonies = pairing.data?.pending ?? [];
-		const chosen =
-			ceremonies.find((c) => ceremonyKey(c) === target) ?? ceremonies[0];
+		refusal.reset();
+		// Address the PIN to the ceremony the operator saw: the one they picked, or the sole one.
+		// A second knock never inherits a default — the list order is client-chosen fields.
+		const chosen = addressedCeremony(pairing.data?.pending ?? [], target);
 		if (!chosen) return;
 		submit.mutate(
 			{
@@ -88,9 +102,7 @@ export const MoonlightPairingSection: FC = () => {
 					// both planes, since this card's count spans them.
 					qc.invalidateQueries({ queryKey: getListPairedClientsQueryKey() });
 				},
-				onError: (e) => {
-					if (e instanceof ApiError && e.status === 401) setWrongPassword(true);
-				},
+				onError: refusal.classify,
 			},
 		);
 	};
@@ -104,7 +116,7 @@ export const MoonlightPairingSection: FC = () => {
 			onLabelChange={setLabel}
 			password={password}
 			onPasswordChange={setPassword}
-			wrongPassword={wrongPassword}
+			failure={refusal.failure}
 			target={target}
 			onTargetChange={setTarget}
 			onSubmit={onSubmit}
@@ -126,8 +138,8 @@ export const MoonlightPairing: FC<{
 	/** The console password, re-confirmed because delivering the PIN completes a pairing. */
 	password: string;
 	onPasswordChange: (v: string) => void;
-	wrongPassword: boolean;
-	/** Fingerprint of the ceremony the PIN is addressed to; "" = the first (sole) one. */
+	failure: PasswordFailure;
+	/** Key of the ceremony the PIN is addressed to; "" = the sole one. */
 	target: string;
 	onTargetChange: (v: string) => void;
 	onSubmit: () => void;
@@ -142,7 +154,7 @@ export const MoonlightPairing: FC<{
 	onLabelChange,
 	password,
 	onPasswordChange,
-	wrongPassword,
+	failure,
 	target,
 	onTargetChange,
 	onSubmit,
@@ -152,6 +164,9 @@ export const MoonlightPairing: FC<{
 }) => {
 	const pending = pairing.data?.pin_pending ?? false;
 	const ceremonies = pairing.data?.pending ?? [];
+	const addressed = addressedCeremony(ceremonies, target);
+	// A pick that vanished keeps the picker up: the survivor is not the device they chose.
+	const picking = ceremonies.length > 1 || (target !== "" && !addressed);
 	return (
 		<Card>
 			<CardHeader>
@@ -182,7 +197,7 @@ export const MoonlightPairing: FC<{
 							    they can SEE — and, with several parked, picks the one they mean; the
 							    host delivers the PIN only to the named handshake (security-review
 							    2026-08-31 H-4). */}
-							{ceremonies.length === 1 && ceremonies[0] && (
+							{!picking && ceremonies[0] && (
 								<p className="font-mono text-xs text-muted-foreground">
 									{m.pairing_ceremony_device({
 										uniqueid: ceremonies[0].uniqueid,
@@ -191,17 +206,12 @@ export const MoonlightPairing: FC<{
 									})}
 								</p>
 							)}
-							{ceremonies.length > 1 && (
+							{picking && (
 								<div className="space-y-2">
 									<p className="text-sm">{m.pairing_ceremony_select()}</p>
-									<Select
-										value={
-											target || (ceremonies[0] && ceremonyKey(ceremonies[0]))
-										}
-										onValueChange={onTargetChange}
-									>
+									<Select value={target} onValueChange={onTargetChange}>
 										<SelectTrigger id="pair-target">
-											<SelectValue />
+											<SelectValue placeholder={m.pairing_ceremony_select()} />
 										</SelectTrigger>
 										<SelectContent>
 											{ceremonies.map((c) => (
@@ -250,28 +260,20 @@ export const MoonlightPairing: FC<{
 							    same trust decision as approving a native knock — so the same password gate
 							    (util/confirm.ts). Anyone can point their OWN Moonlight at this host and read
 							    the PIN off their own screen; the password is what they don't have. */}
-							<div className="space-y-2">
-								<Label htmlFor="pair-password">{m.store_spec_password()}</Label>
-								<Input
-									id="pair-password"
-									type="password"
-									autoComplete="current-password"
-									value={password}
-									onChange={(e) => onPasswordChange(e.target.value)}
-								/>
-								<p className="text-xs text-muted-foreground">
-									{m.pairing_password_help()}
-								</p>
-								{wrongPassword && (
-									<p role="alert" className="text-xs text-destructive">
-										{m.update_apply_wrong_password()}
-									</p>
-								)}
-							</div>
+							<PasswordConfirmField
+								id="pair-password"
+								value={password}
+								onChange={onPasswordChange}
+								failure={failure}
+								help={m.pairing_password_help()}
+							/>
 							<Button
 								type="submit"
 								disabled={
-									pin.length < 4 || password.length === 0 || isSubmitting
+									pin.length < 4 ||
+									password.length === 0 ||
+									isSubmitting ||
+									!addressed
 								}
 							>
 								{m.pairing_submit()}

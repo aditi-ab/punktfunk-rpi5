@@ -8,20 +8,8 @@
 //! until 2026-08-27, which is why both Start-menu tiles opened a black console window that
 //! then sat behind the couch UI for the whole session.
 
-use std::path::PathBuf;
+use pf_client_core::orchestrate::session_binary;
 use std::process::{Command, Stdio};
-
-/// The session binary: installed next to us (the MSIX layout and dev `target\…` runs both
-/// land on the sibling), else `PATH`.
-pub(crate) fn session_binary() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        let sibling = exe.with_file_name("punktfunk-session.exe");
-        if sibling.exists() {
-            return sibling;
-        }
-    }
-    "punktfunk-session".into()
-}
 
 /// Run `punktfunk-session --browse` (fullscreen unless `--windowed`) and exit with the
 /// child's code, so whatever supervises this process sees the real result. Never returns.
@@ -53,7 +41,7 @@ pub(crate) fn run_browse() -> ! {
     // Spawn (not `status()`) so the stderr pipe can be drained into the client log.
     let run = cmd.spawn().and_then(|mut child| {
         if let Some(stderr) = child.stderr.take() {
-            crate::logfile::forward_child_stderr(stderr);
+            pf_client_core::logring::forward_child_stderr(stderr, crate::logfile::Tee);
         }
         child.wait()
     });

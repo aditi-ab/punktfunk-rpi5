@@ -107,8 +107,23 @@ pub struct Session {
 /// frames return as the last shard lands, so this is reassembly completion. CLOCK_REALTIME
 /// to match `pts_ns` and the skew handshake — not monotonic; the math is cross-machine.
 fn stamp_received(mut f: Frame) -> Frame {
-    f.received_ns = crate::stats::now_realtime_ns();
+    f.received_ns = crate::quic::wall_clock_ns();
     f
+}
+
+/// Write one packet's plaintext at its final wire offset: `seq(8) ‖ header ‖ body ‖
+/// TAG_LEN zeros` for a sealed wire (`seq` is `Some`), `header ‖ body` in the clear.
+/// [`Session::open_from_wire`] reads the sealed layout back.
+fn stage_wire(wire: &mut Vec<u8>, seq: Option<u64>, hdr: &PacketHeader, body: &[u8]) {
+    wire.clear();
+    if let Some(seq) = seq {
+        wire.extend_from_slice(&seq.to_be_bytes());
+    }
+    wire.extend_from_slice(hdr.as_bytes());
+    wire.extend_from_slice(body);
+    if seq.is_some() {
+        wire.resize(wire.len() + crate::crypto::TAG_LEN, 0);
+    }
 }
 
 mod perf;
@@ -119,7 +134,10 @@ pub use perf::{PumpPerf, SealPerf};
 
 use perf::TimedCoder;
 use replay::{seq_of, ReplayWindow};
-use seal::{seal_wire_slice, SealJob, SealLane, TWO_LANE_MIN_PACKETS};
+use seal::{
+    hand_chunk, seal_wire_slice, SealJob, SealLane, SEAL_CHUNK_SHARDS, TWO_LANE_MIN_PACKETS,
+};
+pub use seal::{SealSink, SendFn};
 
 /// Datagrams per client `recvmmsg` (the reused ring). 128 keeps the syscall rate
 /// ≤ ~3.4k/s at ~430k pkt/s (~4.8 Gbps) and drains the kernel buffer deeper per pump;
@@ -297,6 +315,229 @@ impl Session {
         })
     }
 
+    /// Bytes one AU of `frame_len` puts on the wire at the current geometry.
+    pub fn frame_wire_len(&self, frame_len: usize) -> usize {
+        let crypto = if self.crypto.is_some() {
+            crate::packet::CRYPTO_OVERHEAD
+        } else {
+            0
+        };
+        self.packetizer.geometry(frame_len).wire_packets()
+            * (self.packetizer.shard_payload() + crate::packet::HEADER_LEN + crypto)
+    }
+
+    /// Host: [`seal_frame_at`](Self::seal_frame_at) that hands `sink` the frame in wire
+    /// order as it is sealed — [`SEAL_CHUNK_SHARDS`] data shards at a time, the parity
+    /// last — so the first packet leaves after one chunk instead of the whole frame. The
+    /// seal lane seals chunk k+1 while `sink` sends chunk k through the `send` it is
+    /// given, and a third thread computes the parity meanwhile. Byte-identical to
+    /// `seal_frame_at`. A small or unencrypted frame reaches `sink` whole. The buffers
+    /// return to the pool when this returns.
+    pub fn seal_frame_chunks_at(
+        &mut self,
+        data: &[u8],
+        pts_ns: u64,
+        user_flags: u32,
+        frame_index: u32,
+        sink: &mut SealSink<'_>,
+    ) -> Result<()> {
+        if self.config.role != Role::Host {
+            return Err(PunktfunkError::InvalidArg(
+                "seal_frame called on a client session",
+            ));
+        }
+        let geo = self.packetizer.geometry(data.len());
+        let pipelined =
+            self.seal_two_lane && self.crypto.is_some() && geo.total_data >= 2 * SEAL_CHUNK_SHARDS;
+        if pipelined && self.seal_lane.is_none() {
+            self.seal_lane = SealLane::spawn(self.crypto.clone().expect("checked above"));
+        }
+        if !pipelined || self.seal_lane.is_none() {
+            let wires = self.seal_frame_inner(data, pts_ns, user_flags, Some(frame_index))?;
+            let r = sink(&wires, &mut |p| self.send_sealed(p));
+            self.reclaim_wires(wires);
+            return r;
+        }
+        self.seal_chunks_pipelined(geo, data, pts_ns, user_flags, frame_index, sink)
+    }
+
+    /// The encrypted, multi-chunk half of [`seal_frame_chunks_at`](Self::seal_frame_chunks_at).
+    /// `emit` writes plaintext into pooled wires; every [`SEAL_CHUNK_SHARDS`] data wires
+    /// go to the lane and the chunk before them comes back sealed for `sink`. The parity
+    /// is computed on a scoped thread while the data streams and is sealed here last.
+    fn seal_chunks_pipelined(
+        &mut self,
+        geo: crate::packet::Geometry,
+        data: &[u8],
+        pts_ns: u64,
+        user_flags: u32,
+        frame_index: u32,
+        sink: &mut SealSink<'_>,
+    ) -> Result<()> {
+        geo.check()?;
+        let perf_armed = self.seal_perf.is_some();
+        let fec_ns = std::sync::atomic::AtomicU64::new(0);
+        let Session {
+            packetizer,
+            coder,
+            crypto,
+            next_seq,
+            wire_pool,
+            seal_lane,
+            lane_scratch,
+            transport,
+            stats,
+            seal_perf,
+            ..
+        } = self;
+        let c = crypto.as_ref().expect("pipelined seal needs crypto");
+        let lane = seal_lane.take().expect("pipelined seal needs the lane");
+        let timed_coder;
+        let coder_ref: &dyn ErasureCoder = if perf_armed {
+            timed_coder = TimedCoder {
+                inner: coder.as_ref(),
+                ns: &fec_ns,
+            };
+            &timed_coder
+        } else {
+            coder.as_ref()
+        };
+        let scheme = coder_ref.scheme();
+        let mut send = |p: &[&[u8]]| -> Result<usize> {
+            let sent = transport.send_gso(p)?;
+            if sent < p.len() {
+                StatsCounters::add(&stats.packets_send_dropped, (p.len() - sent) as u64);
+            }
+            Ok(sent)
+        };
+        let mut wires = std::mem::take(wire_pool);
+        let mut done: Vec<Vec<u8>> = Vec::with_capacity(wires.len());
+        let mut scratch = std::mem::take(lane_scratch);
+        let mut recovery = packetizer.take_recovery();
+        let seq_first = *next_seq;
+        let (mut used, mut chunk_start, mut chunk_seq) = (0usize, 0usize, seq_first);
+        let mut in_flight = false;
+        let (mut seal_ns, mut bytes) = (0u64, 0u64);
+        let mut lane_ok = true;
+        let mut emit = |hdr: &crate::packet::PacketHeader, body: &[u8]| -> Result<()> {
+            let is_data = hdr.shard_index < hdr.data_shards;
+            // The data/parity boundary closes a partial chunk; parity gathers as the tail.
+            if !is_data && chunk_start < used {
+                hand_chunk(
+                    &lane,
+                    &mut wires,
+                    &mut used,
+                    chunk_start,
+                    chunk_seq,
+                    perf_armed,
+                    &mut scratch,
+                    &mut in_flight,
+                    &mut done,
+                    &mut seal_ns,
+                    sink,
+                    &mut send,
+                )?;
+                chunk_start = used;
+                chunk_seq = *next_seq;
+            }
+            if used == wires.len() {
+                wires.push(Vec::new());
+            }
+            let wire = &mut wires[used];
+            used += 1;
+            stage_wire(wire, Some(*next_seq), hdr, body);
+            *next_seq = next_seq.wrapping_add(1);
+            bytes += wire.len() as u64;
+            if is_data && used - chunk_start >= SEAL_CHUNK_SHARDS {
+                hand_chunk(
+                    &lane,
+                    &mut wires,
+                    &mut used,
+                    chunk_start,
+                    chunk_seq,
+                    perf_armed,
+                    &mut scratch,
+                    &mut in_flight,
+                    &mut done,
+                    &mut seal_ns,
+                    sink,
+                    &mut send,
+                )?;
+                chunk_start = used;
+                chunk_seq = *next_seq;
+            }
+            Ok(())
+        };
+        // The data streams out while the parity is computed beside it.
+        let mut result = std::thread::scope(|s| {
+            let fec = s.spawn(|| crate::packet::parity(&geo, data, coder_ref, &mut recovery));
+            let emitted = packetizer.emit_data(
+                &geo,
+                data,
+                pts_ns,
+                user_flags,
+                frame_index,
+                scheme,
+                &mut emit,
+            );
+            let parity = fec
+                .join()
+                .unwrap_or(Err(PunktfunkError::Unsupported("parity thread panicked")));
+            emitted.and(parity)
+        });
+        packetizer.put_recovery(recovery);
+        if result.is_ok() {
+            result =
+                packetizer.emit_parity(&geo, pts_ns, user_flags, frame_index, scheme, &mut emit);
+        }
+        if result.is_ok() {
+            // The tail seals here while the lane finishes the last chunk; wire order holds.
+            let t0 = perf_armed.then(std::time::Instant::now);
+            result = seal_wire_slice(c, &mut wires[chunk_start..used], chunk_seq);
+            if let Some(t0) = t0 {
+                seal_ns += t0.elapsed().as_nanos() as u64;
+            }
+        }
+        if in_flight {
+            match lane.from_worker.recv() {
+                Ok(mut job) => {
+                    seal_ns += job.ns;
+                    if result.is_ok() {
+                        result = job.result.and_then(|()| sink(&job.bufs, &mut send));
+                    }
+                    done.append(&mut job.bufs);
+                    scratch = job.bufs;
+                }
+                Err(_) => {
+                    lane_ok = false;
+                    if result.is_ok() {
+                        result = Err(PunktfunkError::Unsupported("seal lane died"));
+                    }
+                }
+            }
+        }
+        if result.is_ok() {
+            result = sink(&wires[chunk_start..used], &mut send);
+        }
+        let packets = next_seq.wrapping_sub(seq_first);
+        done.append(&mut wires);
+        *wire_pool = done;
+        *lane_scratch = scratch;
+        if lane_ok {
+            *seal_lane = Some(lane);
+        }
+        if let Some(p) = seal_perf.as_mut() {
+            p.fec_ns += fec_ns.load(std::sync::atomic::Ordering::Relaxed);
+            p.seal_ns += seal_ns;
+            p.frames += 1;
+            p.packets += packets;
+        }
+        StatsCounters::add(&stats.frames_submitted, 1);
+        StatsCounters::add(&stats.packets_sent, packets);
+        StatsCounters::add(&stats.bytes_sent, bytes);
+        result
+    }
+
     /// Host: open a streamed AU ([`crate::quic::VIDEO_CAP_STREAMED_AU`]) — only toward a
     /// client that advertised it; anyone else uses [`seal_frame_at`](Self::seal_frame_at).
     /// Feed with [`seal_streamed_chunk`](Self::seal_streamed_chunk), close with
@@ -385,9 +626,8 @@ impl Session {
         };
         let mut wires = std::mem::take(wire_pool);
         let mut used = 0usize;
-        // Packetize: plaintext at the final wire offset (`seq(8) ‖ header(40) ‖ shard ‖
-        // tag(16)` with crypto; `header ‖ shard` off). Nonce advances in emission order;
-        // sealing is a later pass so it can split across lanes.
+        // Packetize through `stage_wire`. Nonce advances in emission order; sealing is a
+        // later pass so it can split across lanes.
         let seq_base = *next_seq;
         let encrypting = crypto.is_some();
         let result = {
@@ -399,18 +639,8 @@ impl Session {
                 }
                 let wire = &mut wires[*used];
                 *used += 1;
-                let seq = *next_seq;
+                stage_wire(wire, encrypting.then_some(*next_seq), hdr, body);
                 *next_seq = next_seq.wrapping_add(1);
-                wire.clear();
-                if encrypting {
-                    wire.extend_from_slice(&seq.to_be_bytes());
-                    wire.extend_from_slice(hdr.as_bytes());
-                    wire.extend_from_slice(body);
-                    wire.resize(wire.len() + crate::crypto::TAG_LEN, 0);
-                } else {
-                    wire.extend_from_slice(hdr.as_bytes());
-                    wire.extend_from_slice(body);
-                }
                 Ok(())
             };
             run(packetizer, coder_ref, &mut emit)
@@ -502,6 +732,12 @@ impl Session {
     /// Optional: dropping them only forfeits reuse.
     pub fn reclaim_wires(&mut self, wires: Vec<Vec<u8>>) {
         self.wire_pool = wires;
+    }
+
+    /// Host: GSO on this session's transport where the platform has it. The env gate
+    /// (`PUNKTFUNK_GSO`) stays beside it; a path that refused GSO stays refused.
+    pub fn set_gso(&self, on: bool) {
+        self.transport.set_gso(on);
     }
 
     /// Host: send one chunk of already-sealed packets in one `sendmmsg`. Returns how many
@@ -642,6 +878,11 @@ impl Session {
     /// completed-AU delay reading loses exactly when the queue is deepest.
     pub fn take_shard_delays(&mut self) -> std::vec::Drain<'_, i64> {
         self.reassembler.take_shard_delays()
+    }
+
+    /// See [`Reassembler::missing_beyond_parity`].
+    pub fn missing_beyond_parity(&self, frame_index: u32) -> Option<(u32, u32)> {
+        self.reassembler.missing_beyond_parity(frame_index)
     }
 
     /// Negotiated wire shard payload (bytes of AU per datagram) — the window size for
@@ -887,6 +1128,52 @@ mod wire_equivalence_tests {
                             "two-lane seal lane should have spawned for the large frame"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// The chunk pipeline puts the same bytes on the wire as the whole-frame seal, in
+    /// the same order, and hands a large frame over one chunk at a time.
+    #[test]
+    fn chunk_pipeline_matches_the_whole_frame_seal() {
+        for encrypt in [true, false] {
+            for fec_percent in [0u8, 50] {
+                let cfg = host_cfg(FecScheme::Gf16, fec_percent, encrypt);
+                let mut piped = host_session(cfg.clone());
+                let mut whole = host_session(cfg);
+                // At shard 64: 47, 2, 313 and 1 data shards; 313 is three chunks of 128.
+                let frames = [pattern(3000), pattern(100), pattern(20000), Vec::new()];
+                for (i, frame) in frames.iter().enumerate() {
+                    let pts = 1000 * i as u64;
+                    let want = whole.seal_frame_at(frame, pts, i as u32, i as u32).unwrap();
+                    let mut got: Vec<Vec<u8>> = Vec::new();
+                    let mut calls = 0usize;
+                    piped
+                        .seal_frame_chunks_at(frame, pts, i as u32, i as u32, &mut |chunk, send| {
+                            calls += 1;
+                            let refs: Vec<&[u8]> = chunk.iter().map(|b| b.as_slice()).collect();
+                            send(&refs)?;
+                            got.extend(chunk.iter().cloned());
+                            Ok(())
+                        })
+                        .unwrap();
+                    assert_eq!(got, want, "encrypt={encrypt} fec={fec_percent} frame#{i}");
+                    let shards = piped.packetizer.geometry(frame.len()).total_data;
+                    if encrypt && shards >= 2 * SEAL_CHUNK_SHARDS {
+                        assert!(
+                            calls >= shards / SEAL_CHUNK_SHARDS,
+                            "{calls} sink calls for {shards} data shards"
+                        );
+                    } else {
+                        assert_eq!(calls, 1, "a whole frame reaches the sink once");
+                    }
+                    assert_eq!(
+                        piped.frame_wire_len(frame.len()),
+                        want.iter().map(Vec::len).sum::<usize>(),
+                        "frame_wire_len frame#{i}"
+                    );
+                    whole.reclaim_wires(want);
                 }
             }
         }

@@ -21,7 +21,7 @@ use pf_client_core::trust::{MouseMode, TouchMode};
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::input::scroll::{ScrollAccumulator, ScrollEvent, ScrollPhase, ScrollSource};
 use punktfunk_core::input::{InputEvent, InputKind};
-use punktfunk_core::quic::{classify, GRANT_KEYBOARD, GRANT_POINTER};
+use punktfunk_core::quic::{GRANT_KEYBOARD, GRANT_POINTER};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -78,10 +78,13 @@ pub struct Capture {
     user_released: bool,
     held_keys: HashSet<u8>,
     held_buttons: HashSet<u32>,
-    /// Relative motion not yet on the wire, summed per loop iteration.
-    pending_rel: (i32, i32),
+    /// Relative motion not yet on the wire, summed per loop iteration. Fractional: a slow
+    /// touchpad moves less than a pixel per event, and the remainder carries to the next send.
+    pending_rel: (f32, f32),
     /// Desktop-model position not yet on the wire, latest-wins per loop iteration.
     pending_abs: Option<Abs>,
+    /// See [`Self::last_abs`].
+    last_abs: Option<(i32, i32)>,
     /// Never true unless `abs_ok`.
     desktop: bool,
     /// Host injector accepts `MouseMoveAbs` (any compositor but gamescope).
@@ -97,25 +100,12 @@ pub struct Capture {
     touch_slots: HashMap<u64, u32>,
     touch_mode: TouchMode,
     gestures: Gestures,
-    /// Session access mask. `send` uses the same [`classify`] as the host filter
-    /// so a new `InputKind` cannot slip one side. Live via [`Capture::set_grants`].
+    /// Session access mask: the capture gate. Core drops refused events on send.
+    /// Live via [`Capture::set_grants`].
     grants: u32,
 }
 
-/// Drop locally if `grants` does not cover `kind`. Shares [`classify`] with the
-/// host so a new `InputKind` cannot pass one side only.
-fn send(
-    connector: &NativeClient,
-    grants: u32,
-    kind: InputKind,
-    code: u32,
-    x: i32,
-    y: i32,
-    flags: u32,
-) {
-    if grants & classify(kind).bit() == 0 {
-        return;
-    }
+fn send(connector: &NativeClient, kind: InputKind, code: u32, x: i32, y: i32, flags: u32) {
     let _ = connector.send_input(&InputEvent {
         kind,
         _pad: [0; 3],
@@ -145,15 +135,16 @@ impl Capture {
             user_released: false,
             held_keys: HashSet::new(),
             held_buttons: HashSet::new(),
-            pending_rel: (0, 0),
+            pending_rel: (0.0, 0.0),
             pending_abs: None,
+            last_abs: None,
             desktop: abs_ok && mouse_mode == MouseMode::Desktop,
             abs_ok,
             scroll_acc: ScrollAccumulator::new(),
             scroll_axes: [None; 2],
             touch_slots: HashMap::new(),
             touch_mode,
-            gestures: Gestures::new(touch_mode == TouchMode::Trackpad),
+            gestures: Gestures::new(touch_mode != TouchMode::Pointer),
             grants,
         }
     }
@@ -177,9 +168,9 @@ impl Capture {
         self.grants & (GRANT_POINTER | GRANT_KEYBOARD) != 0
     }
 
-    /// Mid-session `AccessUpdate`. Lost classes flush held ups under the OLD
-    /// mask first — the host may still honor them. The run loop then re-applies
-    /// lock/grab, and releases capture if [`Capture::can_capture`] went false.
+    /// Mid-session `AccessUpdate`. Lost classes drop their held state. The run
+    /// loop then re-applies lock/grab, and releases capture if
+    /// [`Capture::can_capture`] went false.
     pub fn set_grants(&mut self, grants: u32) {
         if grants == self.grants {
             return;
@@ -189,7 +180,7 @@ impl Capture {
             self.release_keys();
         }
         if lost & GRANT_POINTER != 0 {
-            self.pending_rel = (0, 0);
+            self.pending_rel = (0.0, 0.0);
             self.pending_abs = None;
             self.release_contacts();
             self.reset_touch_gestures();
@@ -202,6 +193,11 @@ impl Capture {
         self.desktop
     }
 
+    /// A mouse button is down on the host: a model flip now would cut the drag.
+    pub fn buttons_held(&self) -> bool {
+        !self.held_buttons.is_empty()
+    }
+
     /// Ctrl+Alt+Shift+M. `None` if the host cannot take absolute events
     /// (gamescope). Pending motion from the old model is dropped, not sent.
     pub fn toggle_desktop(&mut self) -> Option<bool> {
@@ -209,7 +205,7 @@ impl Capture {
             return None;
         }
         self.desktop = !self.desktop;
-        self.pending_rel = (0, 0);
+        self.pending_rel = (0.0, 0.0);
         self.pending_abs = None;
         Some(self.desktop)
     }
@@ -222,7 +218,7 @@ impl Capture {
             return false;
         }
         self.desktop = on;
-        self.pending_rel = (0, 0);
+        self.pending_rel = (0.0, 0.0);
         self.pending_abs = None;
         true
     }
@@ -255,40 +251,16 @@ impl Capture {
 
     fn release_keys(&mut self) {
         for vk in self.held_keys.drain() {
-            send(
-                &self.connector,
-                self.grants,
-                InputKind::KeyUp,
-                vk as u32,
-                0,
-                0,
-                0,
-            );
+            send(&self.connector, InputKind::KeyUp, vk as u32, 0, 0, 0);
         }
     }
 
     fn release_contacts(&mut self) {
         for button in self.held_buttons.drain() {
-            send(
-                &self.connector,
-                self.grants,
-                InputKind::MouseButtonUp,
-                button,
-                0,
-                0,
-                0,
-            );
+            send(&self.connector, InputKind::MouseButtonUp, button, 0, 0, 0);
         }
         for slot in self.touch_slots.drain().map(|(_, slot)| slot) {
-            send(
-                &self.connector,
-                self.grants,
-                InputKind::TouchUp,
-                slot,
-                0,
-                0,
-                0,
-            );
+            send(&self.connector, InputKind::TouchUp, slot, 0, 0, 0);
         }
     }
 
@@ -312,15 +284,7 @@ impl Capture {
                     delta: 0,
                 }
                 .to_event();
-                send(
-                    &self.connector,
-                    self.grants,
-                    ev.kind,
-                    ev.code,
-                    ev.x,
-                    ev.y,
-                    ev.flags,
-                );
+                send(&self.connector, ev.kind, ev.code, ev.x, ev.y, ev.flags);
             }
         }
     }
@@ -334,31 +298,31 @@ impl Capture {
         if !std::mem::replace(&mut self.captured, false) {
             return false;
         }
-        self.pending_rel = (0, 0); // never send motion gathered while captured
+        self.pending_rel = (0.0, 0.0); // never send motion gathered while captured
         self.pending_abs = None;
         self.flush_held();
         true
     }
 
     /// One datagram per loop. Only one store is populated; the run loop routes
-    /// by [`desktop`](Self::desktop).
+    /// by [`desktop`](Self::desktop). Relative motion goes out in whole pixels.
     pub fn flush_motion(&mut self) {
-        let (dx, dy) = std::mem::take(&mut self.pending_rel);
-        if dx != 0 || dy != 0 {
+        let (dx, dy) = (self.pending_rel.0.trunc(), self.pending_rel.1.trunc());
+        self.pending_rel.0 -= dx;
+        self.pending_rel.1 -= dy;
+        if dx != 0.0 || dy != 0.0 {
             send(
                 &self.connector,
-                self.grants,
                 InputKind::MouseMove,
                 0,
-                dx,
-                dy,
+                dx as i32,
+                dy as i32,
                 0,
             );
         }
         if let Some(a) = self.pending_abs.take() {
             send(
                 &self.connector,
-                self.grants,
                 InputKind::MouseMoveAbs,
                 0,
                 a.x,
@@ -370,8 +334,8 @@ impl Capture {
 
     pub fn on_motion(&mut self, xrel: f32, yrel: f32) {
         if self.captured && !self.desktop {
-            self.pending_rel.0 += xrel as i32;
-            self.pending_rel.1 += yrel as i32;
+            self.pending_rel.0 += xrel;
+            self.pending_rel.1 += yrel;
         }
     }
 
@@ -379,8 +343,20 @@ impl Capture {
     /// (deltas must sum).
     pub fn on_motion_abs(&mut self, abs: Abs) {
         if self.captured && self.desktop {
+            self.last_abs = Some((abs.x, abs.y));
             self.pending_abs = Some(abs);
         }
+    }
+
+    /// Where this client last put the host pointer, in frame pixels; `None` before any
+    /// desktop-model motion. The local cursor follows the host from here when they differ.
+    pub fn last_abs(&self) -> Option<(i32, i32)> {
+        self.last_abs
+    }
+
+    /// The local cursor was moved to the host's `pos`: that is now where we put it.
+    pub fn followed_host(&mut self, pos: (i32, i32)) {
+        self.last_abs = Some(pos);
     }
 
     pub fn on_key_down(&mut self, sc: sdl3::keyboard::Scancode) {
@@ -391,15 +367,7 @@ impl Capture {
             // Host must see the cursor where the user does when the key lands.
             self.flush_motion();
             self.held_keys.insert(vk);
-            send(
-                &self.connector,
-                self.grants,
-                InputKind::KeyDown,
-                vk as u32,
-                0,
-                0,
-                0,
-            );
+            send(&self.connector, InputKind::KeyDown, vk as u32, 0, 0, 0);
         }
     }
 
@@ -415,15 +383,7 @@ impl Capture {
         if let Some(vk) = keymap_sdl::scancode_to_vk(sc) {
             // Flush-on-release may have already sent this up.
             if self.held_keys.remove(&vk) {
-                send(
-                    &self.connector,
-                    self.grants,
-                    InputKind::KeyUp,
-                    vk as u32,
-                    0,
-                    0,
-                    0,
-                );
+                send(&self.connector, InputKind::KeyUp, vk as u32, 0, 0, 0);
             }
         }
     }
@@ -437,15 +397,7 @@ impl Capture {
         self.flush_motion();
         if let Some(gs) = keymap_sdl::mouse_button_to_gs(b) {
             self.held_buttons.insert(gs);
-            send(
-                &self.connector,
-                self.grants,
-                InputKind::MouseButtonDown,
-                gs,
-                0,
-                0,
-                0,
-            );
+            send(&self.connector, InputKind::MouseButtonDown, gs, 0, 0, 0);
         }
     }
 
@@ -453,15 +405,7 @@ impl Capture {
         self.flush_motion(); // the release must not beat the motion before it
         if let Some(gs) = keymap_sdl::mouse_button_to_gs(b) {
             if self.held_buttons.remove(&gs) {
-                send(
-                    &self.connector,
-                    self.grants,
-                    InputKind::MouseButtonUp,
-                    gs,
-                    0,
-                    0,
-                    0,
-                );
+                send(&self.connector, InputKind::MouseButtonUp, gs, 0, 0, 0);
             }
         }
     }
@@ -477,15 +421,7 @@ impl Capture {
         }
         self.flush_motion(); // scroll happens at the latest cursor position
         for ev in crate::scroll::sdl_wheel(&mut self.scroll_acc, dx, dy) {
-            send(
-                &self.connector,
-                self.grants,
-                ev.kind,
-                ev.code,
-                ev.x,
-                ev.y,
-                ev.flags,
-            );
+            send(&self.connector, ev.kind, ev.code, ev.x, ev.y, ev.flags);
         }
     }
 
@@ -505,15 +441,7 @@ impl Capture {
         } else {
             Some(se.source)
         };
-        send(
-            &self.connector,
-            self.grants,
-            ev.kind,
-            ev.code,
-            ev.x,
-            ev.y,
-            ev.flags,
-        );
+        send(&self.connector, ev.kind, ev.code, ev.x, ev.y, ev.flags);
     }
 
     fn touch_slot(&mut self, finger_id: u64) -> u32 {
@@ -541,7 +469,6 @@ impl Capture {
         let slot = self.touch_slot(finger_id);
         send(
             &self.connector,
-            self.grants,
             InputKind::TouchDown,
             slot,
             x,
@@ -558,7 +485,6 @@ impl Capture {
         if let Some(&slot) = self.touch_slots.get(&finger_id) {
             send(
                 &self.connector,
-                self.grants,
                 InputKind::TouchMove,
                 slot,
                 x,
@@ -572,22 +498,14 @@ impl Capture {
     /// a stray up must not leave a pressed contact on the host.
     pub fn on_touch_up(&mut self, finger_id: u64) {
         if let Some(slot) = self.touch_slots.remove(&finger_id) {
-            send(
-                &self.connector,
-                self.grants,
-                InputKind::TouchUp,
-                slot,
-                0,
-                0,
-                0,
-            );
+            send(&self.connector, InputKind::TouchUp, slot, 0, 0, 0);
         }
     }
 
     /// `wx`/`wy` are physical window pixels (trackpad ballistics); `abs` is the
     /// frame position under the video fit (pointer / passthrough). `Touch` goes on the
-    /// wire; `Trackpad`/`Pointer` drive the gesture engine. Returns run-loop
-    /// intents (`CycleStats`, dial); everything else is sent here.
+    /// wire; `Trackpad`/`Pointer`/`Off` drive the gesture engine. Returns run-loop
+    /// intents (`CycleStats`, dial); everything else is sent here, or dropped under `Off`.
     pub fn dispatch_finger(
         &mut self,
         phase: FingerPhase,
@@ -606,7 +524,7 @@ impl Capture {
                 }
                 Vec::new()
             }
-            TouchMode::Trackpad | TouchMode::Pointer => {
+            TouchMode::Trackpad | TouchMode::Pointer | TouchMode::Off => {
                 // Down/Move only while captured. Up always runs so a lift can
                 // finish a gesture after focus-loss mid-touch.
                 if !self.captured && phase != FingerPhase::Up {
@@ -634,32 +552,16 @@ impl Capture {
         self.release_contacts();
         self.reset_touch_gestures();
         self.touch_mode = mode;
-        self.gestures = Gestures::new(mode == TouchMode::Trackpad);
+        self.gestures = Gestures::new(mode != TouchMode::Pointer);
     }
 
     /// Down in order, up in reverse so modifiers stay held until the last key.
     pub fn send_chord(&mut self, vks: &[u8]) {
         for &vk in vks {
-            send(
-                &self.connector,
-                self.grants,
-                InputKind::KeyDown,
-                u32::from(vk),
-                0,
-                0,
-                0,
-            );
+            send(&self.connector, InputKind::KeyDown, u32::from(vk), 0, 0, 0);
         }
         for &vk in vks.iter().rev() {
-            send(
-                &self.connector,
-                self.grants,
-                InputKind::KeyUp,
-                u32::from(vk),
-                0,
-                0,
-                0,
-            );
+            send(&self.connector, InputKind::KeyUp, u32::from(vk), 0, 0, 0);
         }
     }
 
@@ -675,41 +577,27 @@ impl Capture {
     }
 
     /// Track button holds in `held_buttons` so capture release flushes a
-    /// tap-drag. Returns [`Act::CycleStats`] and dial intents to the run loop.
+    /// tap-drag. Returns [`Act::CycleStats`] and dial intents to the run loop;
+    /// under [`TouchMode::Off`] every other act is dropped.
     fn apply_touch_act(&mut self, act: Act) -> Option<Act> {
         match act {
             Act::CycleStats | Act::Dial { .. } | Act::DialCommit | Act::DialCancel => {
                 return Some(act)
             }
+            _ if self.touch_mode == TouchMode::Off => {}
             Act::Button { gs, down } => {
                 if down {
                     self.flush_motion(); // the press lands where the cursor now is
                     self.held_buttons.insert(gs);
-                    send(
-                        &self.connector,
-                        self.grants,
-                        InputKind::MouseButtonDown,
-                        gs,
-                        0,
-                        0,
-                        0,
-                    );
+                    send(&self.connector, InputKind::MouseButtonDown, gs, 0, 0, 0);
                 } else if self.held_buttons.remove(&gs) {
                     self.flush_motion();
-                    send(
-                        &self.connector,
-                        self.grants,
-                        InputKind::MouseButtonUp,
-                        gs,
-                        0,
-                        0,
-                        0,
-                    );
+                    send(&self.connector, InputKind::MouseButtonUp, gs, 0, 0, 0);
                 }
             }
             other => {
                 if let Some((kind, code, x, y, flags)) = other.wire() {
-                    send(&self.connector, self.grants, kind, code, x, y, flags);
+                    send(&self.connector, kind, code, x, y, flags);
                 }
             }
         }

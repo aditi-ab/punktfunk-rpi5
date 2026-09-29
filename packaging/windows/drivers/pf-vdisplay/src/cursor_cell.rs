@@ -3,8 +3,8 @@
 //!
 //! `blend` is the render model: on while the client draws no pointer and a hardware cursor is
 //! declared on the adapter, which excludes the pointer from every frame for the WUDFHost's
-//! life. The image is frame-relative (the desktop position minus the host-stamped origin) so
-//! the pool can draw it without knowing where the monitor sits.
+//! life. The image is frame-relative as IddCx reports it: "screen co-ordinates" of this
+//! monitor, negative past its top-left, so the pool never needs to know where it sits.
 //!
 //! A hardware cursor moves without DWM composing, so while the pool blends, a publish that
 //! changes what the client would see is DAMAGE: the cell marks itself dirty and wakes the
@@ -44,6 +44,9 @@ impl CursorImage {
 pub struct CursorCell {
     pub image: Mutex<Option<CursorImage>>,
     blend: AtomicBool,
+    /// A worker runs under a declared hardware cursor, so the blend can turn on at any moment.
+    /// The pool keeps a clean plate of every composed frame while this holds.
+    armed: AtomicBool,
     /// The host's SDR-white scale for an FP16 frame, as `f32` bits; 0 until the first publish.
     pub sdr_white_scale: AtomicU32,
     /// A blended pointer changed since the encode thread last consumed it.
@@ -59,21 +62,29 @@ impl CursorCell {
         self.blend.load(Ordering::Relaxed)
     }
 
-    /// Flip the render model. Turning the blend on is itself damage: the stash was encoded
-    /// without a pointer and the client just stopped drawing its own. Only the off→on edge is
-    /// damage, so a re-declare that leaves it on encodes nothing.
+    /// A worker runs under a declared hardware cursor: the pool keeps a clean plate.
+    pub fn armed(&self) -> bool {
+        self.armed.load(Ordering::Relaxed)
+    }
+
+    pub fn set_armed(&self, armed: bool) {
+        self.armed.store(armed, Ordering::Relaxed);
+    }
+
+    /// Flip the render model. Either edge is damage: on, the stash was encoded without a
+    /// pointer and the client just stopped drawing its own; off, the stash still carries the
+    /// last blend under the pointer the client now draws. A re-declare that keeps the model
+    /// encodes nothing.
     pub fn set_blend(&self, on: bool) {
-        if on && !self.blend.swap(on, Ordering::Release) {
+        if self.blend.swap(on, Ordering::Release) != on {
             self.mark_dirty();
-        } else {
-            self.blend.store(on, Ordering::Release);
         }
     }
 
-    /// A blended pointer has changed since the encode thread last consumed it — a peek that
-    /// leaves the mark, so the drive loop can rate-limit before it takes it.
+    /// The pointer changed since the encode thread last consumed it — a peek that leaves the
+    /// mark, so the drive loop can rate-limit before it takes it.
     pub fn is_dirty(&self) -> bool {
-        self.blends() && self.dirty.load(Ordering::Acquire)
+        self.dirty.load(Ordering::Acquire)
     }
 
     /// The pool this cell wakes; set once per pool build.
@@ -81,13 +92,15 @@ impl CursorCell {
         *crate::registry::lock(&self.waker) = Some(pool);
     }
 
-    /// Consume the dirty mark: `true` once per changed pointer while blending, so the caller
-    /// encodes the latest position exactly once however many publishes coalesced into it.
+    /// Consume the dirty mark: `true` once per changed pointer or render-model flip, so the
+    /// caller encodes the latest state exactly once however many publishes coalesced into it.
     pub fn take_dirty(&self) -> bool {
-        self.blends() && self.dirty.swap(false, Ordering::AcqRel)
+        self.dirty.swap(false, Ordering::AcqRel)
     }
 
-    fn mark_dirty(&self) {
+    /// Mark the pointer changed and wake the pool's encode thread. Also how a pointer-only
+    /// frame that could not be sent asks to be tried again.
+    pub fn mark_dirty(&self) {
         self.dirty.store(true, Ordering::Release);
         let pool = crate::registry::lock(&self.waker)
             .as_ref()
@@ -141,8 +154,8 @@ impl CursorCell {
         let Some(img) = image.as_mut() else {
             return;
         };
-        img.x = hdr.x - hdr.origin_x;
-        img.y = hdr.y - hdr.origin_y;
+        img.x = hdr.x;
+        img.y = hdr.y;
         img.visible = visible;
         let changed = {
             let mut slot = crate::registry::lock(&self.image);
@@ -204,6 +217,30 @@ mod tests {
         assert!(!cell.take_dirty());
         cell.set_blend(false);
         assert!(!cell.take_dirty());
+    }
+
+    #[test]
+    fn handing_the_pointer_back_is_one_frame_that_erases_the_blend() {
+        let cell = CursorCell::default();
+        let mut image = None;
+        cell.set_blend(true);
+        cell.publish(&mut image, &shm(10, 10, 1), Some(arrow()), true);
+        assert!(cell.take_dirty());
+        cell.set_blend(false);
+        assert!(
+            cell.take_dirty(),
+            "the stash still carries the blended pointer"
+        );
+        assert!(
+            cell.to_blend().is_none(),
+            "the erase frame draws no pointer"
+        );
+        cell.set_blend(false);
+        cell.publish(&mut image, &shm(40, 40, 1), None, true);
+        assert!(
+            !cell.take_dirty(),
+            "while the client draws, nothing more is damage"
+        );
     }
 
     #[test]

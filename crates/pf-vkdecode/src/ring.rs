@@ -16,6 +16,7 @@ use crate::caps::DecodeProfile;
 use crate::device::find_memory_type;
 use crate::device::AllocError;
 use crate::device::DecodeDevice;
+use crate::device::Unwind;
 
 /// 2 MiB covers a 4K IDR at streaming rates; a larger AU grows the ring.
 pub const INITIAL_SLOT_SIZE: u64 = 2 * 1024 * 1024;
@@ -94,29 +95,14 @@ pub(crate) struct PackedSlices {
     pub(crate) offsets: Vec<u32>,
 }
 
-/// `segment` with any Annex-B `zero_byte`s ahead of its start code dropped, so it
-/// begins at exactly `00 00 01`.
+/// Pack the slice NAL ranges `nals` into one slot, each with the three bytes
+/// before it, offsets rebased out of AU coordinates.
 ///
-/// Annex-B admits a three-byte start code and a four-byte one (`zero_byte` plus
-/// the start code, B.1.2/B.2.2). Vulkan slice offsets are consumed by drivers
-/// written against libavcodec's `ff_vk_decode_add_slice`, which discards the
-/// stream prefix and writes `{ 0x00, 0x00, 0x01 }`. NVIDIA then reads the slice
-/// header at `offset + 3 + 2` rather than scanning for a prefix. A four-byte
-/// prefix shifts the bit reader onto the NAL header's second byte.
-///
-/// Dropping leading zeros matches that rewrite without a second copy. A range
-/// that is not a start code is returned unchanged: the loop only drops a zero
-/// followed by two more zeros, so it cannot eat into `00 00 01` itself.
-fn three_byte_prefix(au: &[u8], segment: &std::ops::Range<usize>) -> std::ops::Range<usize> {
-    let mut start = segment.start;
-    while segment.end - start > 3 && au[start..start + 3] == [0, 0, 0] {
-        start += 1;
-    }
-    start..segment.end
-}
-
-/// Pack `segments` of `au` into one slot: prefixes normalised, offsets rebased
-/// out of AU coordinates.
+/// Vulkan slice offsets are consumed by drivers written against libavcodec's
+/// `ff_vk_decode_add_slice`, which writes `{ 0x00, 0x00, 0x01 }` before each
+/// slice. NVIDIA then reads the slice header at `offset + 3 + 2`, so a four-byte
+/// Annex-B prefix would shift it. The three bytes before a NAL header are
+/// always `00 00 01`, so the upload stays zero-copy.
 ///
 /// The bitstream buffer carries slice NALUs only (non-VCL NALUs in the submitted
 /// range hang VCN firmware). Both planners hand out AU-relative offsets, so
@@ -125,12 +111,13 @@ fn three_byte_prefix(au: &[u8], segment: &std::ops::Range<usize>) -> std::ops::R
 ///
 /// Offsets are `u32` because Vulkan's are. The sum is taken in `u64` so overflow
 /// is a real check; 4 GiB of slice data cannot fit any slot this crate allocates.
-pub(crate) fn pack_slices(au: &[u8], segments: &[std::ops::Range<usize>]) -> Option<PackedSlices> {
-    let mut packed = Vec::with_capacity(segments.len());
-    let mut offsets = Vec::with_capacity(segments.len());
+/// A NAL starting before byte 3 has no start code and is `None` too.
+pub(crate) fn pack_slices(nals: &[std::ops::Range<usize>]) -> Option<PackedSlices> {
+    let mut packed = Vec::with_capacity(nals.len());
+    let mut offsets = Vec::with_capacity(nals.len());
     let mut cursor: u64 = 0;
-    for segment in segments {
-        let segment = three_byte_prefix(au, segment);
+    for nal in nals {
+        let segment = nal.start.checked_sub(3)?..nal.end;
         offsets.push(u32::try_from(cursor).ok()?);
         cursor += segment.len() as u64;
         packed.push(segment);
@@ -276,6 +263,15 @@ pub(crate) struct UploadedAu {
 /// Timeline `(semaphore, value)` signalled by the submit that consumed the slot.
 pub(crate) type Token = (vk::Semaphore, u64);
 
+/// One ring backing: the buffer, its memory, the mapping, and the export if asked.
+struct Backing {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    ptr: *mut u8,
+    #[cfg(unix)]
+    dmabuf: Option<std::os::fd::OwnedFd>,
+}
+
 /// Buffer + memory + persistent map. The spec requires the src buffer to be
 /// profile-listed.
 pub(crate) struct BitstreamRing {
@@ -285,10 +281,18 @@ pub(crate) struct BitstreamRing {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     ptr: *mut u8,
+    /// Export the memory as a dma-buf ([`Self::dmabuf_fd`]).
+    export: bool,
+    #[cfg(unix)]
+    dmabuf: Option<std::os::fd::OwnedFd>,
     pub(crate) pending: SlotStates<Token>,
 }
 
 impl BitstreamRing {
+    /// `export`: also hand the memory out as a dma-buf, so the owner can wait the decode
+    /// through the kernel's own GEM interface. Needs `VK_KHR_external_memory_fd` on the
+    /// device; a refused export leaves [`Self::dmabuf_fd`] `None`.
+    ///
     /// # Safety
     ///
     /// `dev` wraps live handles ([`crate::DeviceHandles`] contract).
@@ -296,22 +300,33 @@ impl BitstreamRing {
         dev: &DecodeDevice,
         layout: RingLayout,
         profile: DecodeProfile,
+        export: bool,
     ) -> Result<Self, AllocError> {
         // SAFETY: live device; allocate_backing only creates objects it returns.
-        let (buffer, memory, ptr) = unsafe { Self::allocate_backing(dev, &layout, profile)? };
+        let backing = unsafe { Self::allocate_backing(dev, &layout, profile, export)? };
         Ok(Self {
             device: dev.ash().clone(),
             layout,
             profile,
-            buffer,
-            memory,
-            ptr,
+            buffer: backing.buffer,
+            memory: backing.memory,
+            ptr: backing.ptr,
+            export,
+            #[cfg(unix)]
+            dmabuf: backing.dmabuf,
             pending: SlotStates::new(layout.slots as usize),
         })
     }
 
     pub(crate) fn buffer(&self) -> vk::Buffer {
         self.buffer
+    }
+
+    /// The memory as a dma-buf, while this backing lives. A grown ring has a new one.
+    #[cfg(unix)]
+    pub(crate) fn dmabuf_fd(&self) -> Option<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd as _;
+        self.dmabuf.as_ref().map(|fd| fd.as_raw_fd())
     }
 
     /// # Safety
@@ -321,72 +336,79 @@ impl BitstreamRing {
         dev: &DecodeDevice,
         layout: &RingLayout,
         decode_profile: DecodeProfile,
-    ) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8), AllocError> {
+        export: bool,
+    ) -> Result<Backing, AllocError> {
         let mut chain = decode_profile.chain();
         let profile = chain.wire();
         let mut profile_list =
             vk::VideoProfileListInfoKHR::default().profiles(std::slice::from_ref(profile));
-        let ci = vk::BufferCreateInfo::default()
+        let mut external = vk::ExternalMemoryBufferCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let mut ci = vk::BufferCreateInfo::default()
             .size(layout.buffer_size())
             .usage(vk::BufferUsageFlags::VIDEO_DECODE_SRC_KHR)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .push_next(&mut profile_list);
+        if export {
+            ci = ci.push_next(&mut external);
+        }
+        // SAFETY: only the buffer and memory created below go in, before any use.
+        let mut unwind = unsafe { Unwind::new(dev.ash()) };
         // SAFETY: live device; `ci` roots a chain of locals outliving the call.
         let buffer = unsafe { dev.ash().create_buffer(&ci, None)? };
+        unwind.buffer = buffer;
         // SAFETY: `buffer` was just created on this device.
         let req = unsafe { dev.ash().get_buffer_memory_requirements(buffer) };
-        let mem_props = dev.memory_properties();
-        let type_index = match find_memory_type(
-            &mem_props,
+        let type_index = find_memory_type(
+            &dev.memory_properties(),
             req.memory_type_bits,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        ) {
-            Ok(index) => index,
-            Err(e) => {
-                // SAFETY: destroying the just-created, never-bound buffer.
-                unsafe { dev.ash().destroy_buffer(buffer, None) };
-                return Err(e);
-            }
-        };
-        let alloc = vk::MemoryAllocateInfo::default()
+        )?;
+        let mut exportable = vk::ExportMemoryAllocateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let mut alloc = vk::MemoryAllocateInfo::default()
             .allocation_size(req.size)
             .memory_type_index(type_index);
-        // SAFETY: live device; on failure the buffer is destroyed before returning
-        // so nothing leaks.
-        let memory = match unsafe { dev.ash().allocate_memory(&alloc, None) } {
-            Ok(m) => m,
-            Err(e) => {
-                // SAFETY: destroying the just-created, never-bound buffer.
-                unsafe { dev.ash().destroy_buffer(buffer, None) };
-                return Err(e.into());
-            }
-        };
-        // SAFETY: fresh buffer + fresh memory of at least the required size.
-        if let Err(e) = unsafe { dev.ash().bind_buffer_memory(buffer, memory, 0) } {
-            // SAFETY: unwinding the two objects created above (unbound/unused).
-            unsafe {
-                dev.ash().destroy_buffer(buffer, None);
-                dev.ash().free_memory(memory, None);
-            }
-            return Err(e.into());
+        if export {
+            alloc = alloc.push_next(&mut exportable);
         }
+        // SAFETY: live device; `alloc` roots locals outliving the call.
+        let memory = unsafe { dev.ash().allocate_memory(&alloc, None)? };
+        unwind.memory = memory;
+        // SAFETY: fresh buffer + fresh memory of at least the required size.
+        unsafe { dev.ash().bind_buffer_memory(buffer, memory, 0)? };
         // SAFETY: `memory` is HOST_VISIBLE and unmapped; WHOLE_SIZE maps its full
         // range for the buffer's lifetime (vkFreeMemory implicitly unmaps).
-        let ptr = match unsafe {
+        let ptr = unsafe {
             dev.ash()
-                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-        } {
-            Ok(p) => p.cast::<u8>(),
-            Err(e) => {
-                // SAFETY: unwinding the two objects created above.
-                unsafe {
-                    dev.ash().destroy_buffer(buffer, None);
-                    dev.ash().free_memory(memory, None);
-                }
-                return Err(e.into());
-            }
+                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?
         };
-        Ok((buffer, memory, ptr))
+        // A refused export is not a failed ring: the owner just gets no fd to wait on.
+        #[cfg(unix)]
+        let dmabuf = if export {
+            let info = vk::MemoryGetFdInfoKHR::default()
+                .memory(memory)
+                .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+            // SAFETY: `memory` is live and was allocated exportable as DMA_BUF.
+            match unsafe { dev.external_memory_fd().get_memory_fd(&info) } {
+                // SAFETY: the fd is the dma-buf the driver just created for this process.
+                Ok(fd) => Some(unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) }),
+                Err(e) => {
+                    debug!(error = ?e, "bitstream ring memory does not export as a dma-buf");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        unwind.disarm();
+        Ok(Backing {
+            buffer,
+            memory,
+            ptr: ptr.cast::<u8>(),
+            #[cfg(unix)]
+            dmabuf,
+        })
     }
 
     /// Upload one AU, recycling or growing as needed.
@@ -430,16 +452,22 @@ impl BitstreamRing {
                 au = len,
                 "bitstream ring grows for an oversized AU"
             );
+            // Allocate before destroying: a failed grow keeps the old mapping and
+            // layout, never a null `ptr` for the next AU that fits.
+            // SAFETY: caller's live-device contract.
+            let backing =
+                unsafe { Self::allocate_backing(dev, &grown, self.profile, self.export)? };
             // SAFETY: every in-flight read was drained above; destroy_backing only
             // touches this ring's own objects.
             unsafe { self.destroy_backing() };
-            // SAFETY: caller's live-device contract.
-            let (buffer, memory, ptr) =
-                unsafe { Self::allocate_backing(dev, &grown, self.profile)? };
             self.layout = grown;
-            self.buffer = buffer;
-            self.memory = memory;
-            self.ptr = ptr;
+            self.buffer = backing.buffer;
+            self.memory = backing.memory;
+            self.ptr = backing.ptr;
+            #[cfg(unix)]
+            {
+                self.dmabuf = backing.dmabuf;
+            }
             self.pending = SlotStates::new(grown.slots as usize);
         }
 
@@ -509,6 +537,9 @@ impl Drop for BitstreamRing {
 
 #[cfg(test)]
 mod tests {
+    use pf_bitstream::testing::split_h264_aus;
+    use pf_bitstream::testing::split_h265_aus;
+
     use super::*;
 
     #[test]
@@ -576,34 +607,28 @@ mod tests {
 
     #[test]
     fn slice_offsets_rebase_out_of_au_coordinates_into_the_packed_slot() {
-        // AUD/SPS/PPS then two three-byte slices at 40 and 900. Only the slices
-        // upload, so packed offsets are 0 and 860 (length of the first slice).
-        let mut au = vec![0xAAu8; 1500];
-        au[40..43].copy_from_slice(&[0, 0, 1]);
-        au[900..903].copy_from_slice(&[0, 0, 1]);
-        let segments = [40..900, 900..1500];
-        let packed = pack_slices(&au, &segments).unwrap();
+        // AUD/SPS/PPS then two slices whose start codes sit at 40 and 900. Only
+        // the slices upload, so packed offsets are 0 and 860.
+        let packed = pack_slices(&[43..900, 903..1500]).unwrap();
         assert_eq!(packed.offsets, vec![0, 860]);
-        assert_eq!(packed.segments, segments);
+        assert_eq!(packed.segments, vec![40..900, 900..1500]);
 
         // Offset 0 regardless of the AU start. `from_ref`: a one-element array
         // of a range looks like a range-fill to clippy.
-        let single = 400usize..1000;
+        let single = 403usize..1000;
         assert_eq!(
-            pack_slices(&au, std::slice::from_ref(&single))
-                .unwrap()
-                .offsets,
+            pack_slices(std::slice::from_ref(&single)).unwrap().offsets,
             vec![0]
         );
-        assert_eq!(pack_slices(&au, &[]).unwrap().offsets, Vec::<u32>::new());
+        assert_eq!(pack_slices(&[]).unwrap().offsets, Vec::<u32>::new());
 
         // Offsets accumulate by length, not AU position: an SEI gap must not
         // shift the third offset.
-        let segments = [0..100, 500..600, 1000..1100];
-        assert_eq!(
-            pack_slices(&au, &segments).unwrap().offsets,
-            vec![0, 100, 200]
-        );
+        let nals = [3..100, 503..600, 1003..1100];
+        assert_eq!(pack_slices(&nals).unwrap().offsets, vec![0, 100, 200]);
+
+        // No start code before byte 3.
+        assert!(pack_slices(std::slice::from_ref(&(2usize..40))).is_none());
     }
 
     #[test]
@@ -614,7 +639,7 @@ mod tests {
         let mut au = vec![0xAAu8; 200];
         au[0..4].copy_from_slice(&[0, 0, 0, 1]);
         au[100..103].copy_from_slice(&[0, 0, 1]);
-        let packed = pack_slices(&au, &[0..100, 100..200]).unwrap();
+        let packed = pack_slices(&[4..100, 103..200]).unwrap();
         assert_eq!(packed.segments, vec![1..100, 100..200]);
         assert_eq!(packed.offsets, vec![0, 99], "99, not 100");
 
@@ -635,24 +660,12 @@ mod tests {
         let packed_len: usize = packed.segments.iter().map(|s| s.len()).sum();
         assert!(slot[packed_len..].iter().all(|&b| b == 0));
 
-        // Annex-B allows more than one leading zero byte; all of them go.
-        let mut au = vec![0xAAu8; 64];
-        au[0..6].copy_from_slice(&[0, 0, 0, 0, 0, 1]);
+        // Annex-B allows more than one leading zero byte; all of them stay out.
         assert_eq!(
-            pack_slices(&au, std::slice::from_ref(&(0usize..64)))
+            pack_slices(std::slice::from_ref(&(6usize..64)))
                 .unwrap()
                 .segments,
             vec![3..64]
-        );
-
-        // A range that is not a start code is left unchanged: the trim only
-        // drops a zero followed by two more.
-        let au = vec![0x42u8; 32];
-        assert_eq!(
-            pack_slices(&au, std::slice::from_ref(&(0usize..32)))
-                .unwrap()
-                .segments,
-            vec![0..32]
         );
     }
 
@@ -674,8 +687,8 @@ mod tests {
         for au in split_h265_aus(TEST_25FPS_H265) {
             let plan = planner.plan_au(au).expect("the clean vector plans");
             let plan_segments: Vec<std::ops::Range<usize>> =
-                plan.slices.iter().map(|s| s.data.clone()).collect();
-            let packed = pack_slices(au, &plan_segments).expect("offsets fit u32");
+                plan.slices.iter().map(|s| s.nal.clone()).collect();
+            let packed = pack_slices(&plan_segments).expect("offsets fit u32");
             assert_eq!(packed.offsets.len(), plan.slices.len(), "one per segment");
             let slot = packed_slot(au, &packed);
             for (index, offset) in packed.offsets.iter().enumerate() {
@@ -717,8 +730,8 @@ mod tests {
         for au in split_h264_aus(TEST_25FPS_H264) {
             let plan = planner.plan_au(au).expect("the clean vector plans");
             let plan_segments: Vec<std::ops::Range<usize>> =
-                plan.slices.iter().map(|s| s.data.clone()).collect();
-            let packed = pack_slices(au, &plan_segments).expect("offsets fit u32");
+                plan.slices.iter().map(|s| s.nal.clone()).collect();
+            let packed = pack_slices(&plan_segments).expect("offsets fit u32");
             let slot = packed_slot(au, &packed);
             for (index, offset) in packed.offsets.iter().enumerate() {
                 let at = &slot[*offset as usize..];
@@ -747,14 +760,10 @@ mod tests {
         assert_eq!(aus, 250, "the vector's own golden");
     }
 
-    /// Vendored H.265 vector, same path as `pic_h265`'s tests.
-    const TEST_25FPS_H265: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/h265/test_data/test-25fps.h265"
-    );
+    /// Vendored H.265 vector, as in `pic_h265`'s tests.
+    const TEST_25FPS_H265: &[u8] = pf_bitstream::testing::H265_25FPS;
     /// H.264 twin — same packer, different prefix convention.
-    const TEST_25FPS_H264: &[u8] = include_bytes!(
-        "../../pf-bitstream/vendor/cros-codecs/src/codec/h264/test_data/test-25fps.h264"
-    );
+    const TEST_25FPS_H264: &[u8] = pf_bitstream::testing::H264_25FPS;
 
     /// One AU packed as [`BitstreamRing::upload`] would. 256 is the widest
     /// `minBitstreamBufferSizeAlignment` we size the recorded range for.
@@ -764,61 +773,6 @@ mod tests {
         let mut slot = vec![0xFFu8; layout.record_range(len) as usize];
         pack_into(&mut slot, au, &packed.segments);
         slot
-    }
-
-    /// H.265 AU split (same rule as `pic_h265` / GPU `tests/common`, private
-    /// there): a new AU starts at a non-VCL NALU after slices, or at a slice
-    /// whose `first_slice_segment_in_pic_flag` (top bit of the byte after the
-    /// two-byte NAL header) is set while the current AU already has slices.
-    fn split_h265_aus(stream: &[u8]) -> Vec<&[u8]> {
-        use cros_codecs::codec::h265::parser::Nalu;
-
-        let mut aus = Vec::new();
-        let mut cursor = std::io::Cursor::new(stream);
-        let mut au_start = 0usize;
-        let mut au_has_slice = false;
-        while let Ok(nalu) = Nalu::next(&mut cursor) {
-            let header_start = cursor.position() as usize;
-            let start = header_start - nalu.offset;
-            let is_slice = (nalu.header.type_ as u32) < 32;
-            let first_slice_flag =
-                is_slice && stream.get(header_start + 2).is_some_and(|b| b & 0x80 != 0);
-            if au_has_slice && (!is_slice || first_slice_flag) {
-                aus.push(&stream[au_start..start]);
-                au_start = start;
-                au_has_slice = false;
-            }
-            au_has_slice |= is_slice;
-        }
-        aus.push(&stream[au_start..]);
-        aus
-    }
-
-    /// [`split_h265_aus`]' H.264 twin: one-byte NAL header, so
-    /// `first_mb_in_slice` is the top bit of the next byte.
-    fn split_h264_aus(stream: &[u8]) -> Vec<&[u8]> {
-        use cros_codecs::codec::h264::parser::Nalu;
-        use cros_codecs::codec::h264::parser::NaluType;
-
-        let mut aus = Vec::new();
-        let mut cursor = std::io::Cursor::new(stream);
-        let mut au_start = 0usize;
-        let mut au_has_slice = false;
-        while let Ok(nalu) = Nalu::next(&mut cursor) {
-            let nalu_offset = cursor.position() as usize;
-            let start = nalu_offset - nalu.offset;
-            let is_slice = matches!(nalu.header.type_, NaluType::Slice | NaluType::SliceIdr);
-            let first_mb_zero =
-                is_slice && stream.get(nalu_offset + 1).is_some_and(|b| b & 0x80 != 0);
-            if au_has_slice && (!is_slice || first_mb_zero) {
-                aus.push(&stream[au_start..start]);
-                au_start = start;
-                au_has_slice = false;
-            }
-            au_has_slice |= is_slice;
-        }
-        aus.push(&stream[au_start..]);
-        aus
     }
 
     #[test]

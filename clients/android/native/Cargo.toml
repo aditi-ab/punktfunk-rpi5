@@ -89,8 +89,8 @@ ndk = { version = "0.9", features = ["media", "audio", "nativewindow", "api-leve
 ndk-sys = { version = "0.6", features = ["media"] }
 # setpriority/gettid to raise the decode thread toward URGENT_DISPLAY (see decode::boost_thread_priority).
 libc = "0.2"
-# Opus decode for the host→client audio plane (0xC9: 48 kHz stereo, 5 ms frames). Same crate the
-# host + Linux client use. audiopus_sys vendors libopus (pure C) and builds it static via cmake —
+# Opus decode for pad audio (0xD1); the main audio plane and the mic uplink run in core. Same
+# crate the host + Linux client use. audiopus_sys vendors libopus (pure C) and builds it static via cmake —
 # the cargo-ndk build sets LIBOPUS_STATIC=1/LIBOPUS_NO_PKG=1 so it links the bundled lib, not the host's.
 opus = "0.3"
 # Tier-A pad audio (WP9). Android's audio framework denylists the DualSense's output by VID/PID,
@@ -127,9 +127,8 @@ pf-client-core = { path = "../../../crates/pf-client-core", default-features = f
 # The PyroWave lane's own Vulkan: device bring-up, swapchain on the `SurfaceView`, and the
 # planar CSC pipeline (`src/pyro/`). `loaded` dlopens libvulkan.so at RUNTIME rather than
 # linking it, which is what keeps the `.so` loading on a device with no Vulkan at all — there
-# the probe simply answers no and the client never advertises the codec. Same pinned version as
-# pf-client-core/pf-presenter so one ash generation owns the handles.
-ash = { version = "0.38", features = ["loaded"] }
+# the probe simply answers no and the client never advertises the codec.
+ash = { workspace = true, features = ["loaded"] }
 # `gl` + `textlayout` = the prebuilt key `gl-jpegd-jpege-pdf-textlayout` (verify
 # `DOWNLOAD AND INSTALL SUCCEEDED` in the build log on every bump — see pf-console-ui/Cargo.toml).
 skia-safe = { version = "0.99", features = ["gl", "textlayout"] }

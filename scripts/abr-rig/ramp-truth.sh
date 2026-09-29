@@ -18,7 +18,7 @@ OUT=$HERE/out
 for p in $PROFILES; do
   echo "== $p =="
   for r in $(seq "$RUNS"); do
-    PF_RIG_SKIP_BUILD=${PF_RIG_SKIP_BUILD:-1} "$HERE/run.sh" "$p" 8 \
+    "$HERE/run.sh" "$p" 8 \
       > "$OUT/truth-$p-$r.run" 2>&1 || { echo "  run $r FAILED"; continue; }
     cp "$OUT/$p-1.jsonl" "$OUT/truth-$p-$r.jsonl"
     cp "$OUT/$p-1.log" "$OUT/truth-$p-$r-client.log"

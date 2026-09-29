@@ -608,7 +608,9 @@
       </description>
     </event>
 
-    <event name="removed">
+    <!-- Local: type="destructor" is not upstream. It frees the id, which KWin
+         reuses for its next mode object on the same connection. -->
+    <event name="removed" type="destructor">
       <description summary="the mode has been destroyed">
         The compositor will destroy the object immediately after sending this
         event, so it will become invalid and the client should release any

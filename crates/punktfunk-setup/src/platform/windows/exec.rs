@@ -182,7 +182,14 @@ impl WinExecutor<'_> {
         }
     }
 
+    /// One step: its [`dry_line`] in a dry run where it has one, else the step itself.
     fn step(&self, action: &WinAction) -> Result<(), Failed> {
+        if self.dry
+            && let Some(line) = dry_line(action)
+        {
+            self.ui.ok(&line);
+            return Ok(());
+        }
         match action {
             WinAction::Run(argv) => self.spawn(argv, false),
             WinAction::RunLenient(argv) => self.spawn(argv, true),
@@ -202,86 +209,13 @@ impl WinExecutor<'_> {
                 self.ui.warn(text);
                 Ok(())
             }
-            WinAction::DeployFiles { dest } => {
-                if self.dry {
-                    self.ui.ok(&format!("would unpack the payload into {dest}"));
-                    return Ok(());
-                }
-                let deferred = self
-                    .payload
-                    .deploy(Path::new(&self.sub(dest)))
-                    .map_err(Failed)?;
-                if deferred.is_empty() {
-                    self.ui.ok(&format!("payload unpacked into {dest}"));
-                } else {
-                    self.ui.warn(&format!(
-                        "payload unpacked into {dest}; {} in-use file(s) ({}) are replaced at the \
-                         next restart",
-                        deferred.len(),
-                        deferred
-                            .iter()
-                            .map(|p| p.file_name().unwrap_or_default().to_string_lossy())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
-                }
-                Ok(())
-            }
+            WinAction::DeployFiles { dest } => self.deploy_files(dest),
             WinAction::DeleteFiles { paths } => {
-                if self.dry {
-                    self.ui.ok(&format!("would delete {}", paths.join(", ")));
-                    return Ok(());
-                }
-                for path in paths {
-                    // `<start menu>` and friends resolve here, not in the dry run: the
-                    // transcript keeps the placeholder, the real run needs the folder.
-                    let path = self.sub(path);
-                    match std::fs::remove_file(&path) {
-                        Ok(()) => self.ui.ok(&format!("deleted {path}")),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            self.ui.detail(&format!("{path} — already gone"));
-                        }
-                        Err(e) => self.ui.warn(&format!("couldn't delete {path}: {e}")),
-                    }
-                }
+                self.delete_files(paths);
                 Ok(())
             }
             WinAction::RemoveFiles { dir } => {
-                if self.dry {
-                    self.ui.ok(&format!("would remove {dir}"));
-                    return Ok(());
-                }
-                // Best-effort: the uninstaller still lives here; a locked file must not fail
-                // teardown, and must not stop the sweep either (`remove_dir_all` aborts at
-                // the first one — WP3.5's VM smoke left 862 files behind that way).
-                let mut locked = Vec::new();
-                sweep(Path::new(dir), &mut locked);
-                if locked.is_empty() {
-                    self.ui.ok(&format!("removed {dir}"));
-                } else {
-                    let deferred = locked
-                        .iter()
-                        .filter(|p| super::sys::delete_on_reboot(p))
-                        .count();
-                    // The dir itself goes last, after its files — Windows replays the list
-                    // in order at boot.
-                    let dir_deferred =
-                        deferred == locked.len() && super::sys::delete_on_reboot(Path::new(dir));
-                    self.ui.warn(&format!(
-                        "{} in-use file(s) under {dir} ({}) go with the next restart{}",
-                        locked.len(),
-                        locked
-                            .iter()
-                            .map(|p| p.file_name().unwrap_or_default().to_string_lossy())
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                        if dir_deferred {
-                            ""
-                        } else {
-                            " - or remove the folder by hand"
-                        }
-                    ));
-                }
+                self.remove_tree(dir);
                 Ok(())
             }
             WinAction::PathAdd { machine, dir } => self.path_edit(*machine, dir, true),
@@ -293,19 +227,9 @@ impl WinExecutor<'_> {
                 location,
             } => self.arp_register(key, display_name, version, location),
             WinAction::ArpRemove { key } => {
-                if self.dry {
-                    self.ui.ok(&format!(
-                        "would remove the Add/Remove Programs entry ({key})"
-                    ));
-                    return Ok(());
-                }
                 self.spawn(&["reg", "delete", key, "/f"].map(str::to_string), true)
             }
             WinAction::Shortcut { link, target } => {
-                if self.dry {
-                    self.ui.ok(&format!("would create {link} → {target}"));
-                    return Ok(());
-                }
                 match sys::create_shortcut(&self.sub(link), &self.sub(target)) {
                     Ok(()) => self.ui.ok(&format!("created {link}")),
                     Err(e) => self.ui.warn(&format!("couldn't create {link}: {e}")),
@@ -313,11 +237,6 @@ impl WinExecutor<'_> {
                 Ok(())
             }
             WinAction::MakeNetworkPrivate { network } => {
-                if self.dry {
-                    self.ui
-                        .ok(&format!("would set network '{network}' to Private"));
-                    return Ok(());
-                }
                 if self.net.make_private(network) {
                     self.ui.ok(&format!("network '{network}' is now Private"));
                 } else {
@@ -331,24 +250,7 @@ impl WinExecutor<'_> {
             WinAction::RestoreTasks {
                 web_enabled,
                 scripting_enabled,
-            } => {
-                if self.dry {
-                    self.ui
-                        .ok("would re-enable only the tasks that were enabled before the stop");
-                    return Ok(());
-                }
-                for (task, enabled) in [
-                    ("PunktfunkWeb", web_enabled),
-                    ("PunktfunkScripting", scripting_enabled),
-                ] {
-                    if *enabled == Some(true) {
-                        self.spawn_quiet(&["schtasks", "/Change", "/TN", task, "/ENABLE"], true)?;
-                    }
-                }
-                self.ui
-                    .ok("re-enabled the tasks that were enabled before the stop");
-                Ok(())
-            }
+            } => self.restore_tasks(*web_enabled, *scripting_enabled),
             WinAction::WebSetup {
                 app_dir,
                 fresh_password,
@@ -362,19 +264,112 @@ impl WinExecutor<'_> {
         }
     }
 
+    fn deploy_files(&self, dest: &str) -> Result<(), Failed> {
+        let deferred = self
+            .payload
+            .deploy(Path::new(&self.sub(dest)))
+            .map_err(Failed)?;
+        if deferred.is_empty() {
+            self.ui.ok(&format!("payload unpacked into {dest}"));
+        } else {
+            self.ui.warn(&format!(
+                "payload unpacked into {dest}; {} in-use file(s) ({}) are replaced at the \
+                 next restart",
+                deferred.len(),
+                file_names(&deferred)
+            ));
+        }
+        Ok(())
+    }
+
+    /// Best-effort: a missing file is already gone, a locked one warns.
+    fn delete_files(&self, paths: &[String]) {
+        for path in paths {
+            // `<start menu>` and friends resolve here, not in the dry run: the
+            // transcript keeps the placeholder, the real run needs the folder.
+            let path = self.sub(path);
+            match std::fs::remove_file(&path) {
+                Ok(()) => self.ui.ok(&format!("deleted {path}")),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    self.ui.detail(&format!("{path} — already gone"));
+                }
+                Err(e) => self.ui.warn(&format!("couldn't delete {path}: {e}")),
+            }
+        }
+    }
+
+    /// Best-effort: the uninstaller still lives here; a locked file must not fail teardown,
+    /// and must not stop the sweep either (`remove_dir_all` aborts at the first one). What
+    /// stays is queued for deletion at the next boot.
+    fn remove_tree(&self, dir: &str) {
+        let mut locked = Vec::new();
+        sweep(Path::new(dir), &mut locked);
+        if locked.is_empty() {
+            self.ui.ok(&format!("removed {dir}"));
+            return;
+        }
+        let deferred = locked
+            .iter()
+            .filter(|p| super::sys::delete_on_reboot(p))
+            .count();
+        // The dir itself goes last, after its files — Windows replays the list
+        // in order at boot.
+        let dir_deferred = deferred == locked.len() && super::sys::delete_on_reboot(Path::new(dir));
+        self.ui.warn(&format!(
+            "{} in-use file(s) under {dir} ({}) go with the next restart{}",
+            locked.len(),
+            file_names(&locked),
+            if dir_deferred {
+                ""
+            } else {
+                " - or remove the folder by hand"
+            }
+        ));
+    }
+
+    /// Re-enable only the tasks the stop found enabled, then start the scripting runner again
+    /// or put back the operator's off: the stop ended it and `/Create /F` left it enabled,
+    /// and its boot trigger alone would wait for the next reboot.
+    fn restore_tasks(
+        &self,
+        web_enabled: Option<bool>,
+        scripting_enabled: Option<bool>,
+    ) -> Result<(), Failed> {
+        if self.dry {
+            self.ui
+                .ok("would re-enable only the tasks that were enabled before the stop");
+        } else {
+            for (task, enabled) in [
+                ("PunktfunkWeb", web_enabled),
+                ("PunktfunkScripting", scripting_enabled),
+            ] {
+                if enabled == Some(true) {
+                    self.spawn_quiet(&["schtasks", "/Change", "/TN", task, "/ENABLE"], true)?;
+                }
+            }
+            self.ui
+                .ok("re-enabled the tasks that were enabled before the stop");
+        }
+        let runner: &[&str] = match scripting_enabled {
+            Some(true) => &["schtasks", "/Run", "/TN", "PunktfunkScripting"],
+            Some(false) => &[
+                "schtasks",
+                "/Change",
+                "/TN",
+                "PunktfunkScripting",
+                "/DISABLE",
+            ],
+            None => return Ok(()),
+        };
+        self.spawn(
+            &runner.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            true,
+        )
+    }
+
     /// PATH via `reg.exe` so FakeRunner pins the write; type is REG_EXPAND_SZ.
     fn path_edit(&self, machine: bool, dir: &str, add: bool) -> Result<(), Failed> {
-        let scope = if machine { "machine" } else { "user" };
-        if self.dry {
-            if add {
-                self.ui.ok(&format!("would add {dir} to the {scope} PATH"));
-            } else {
-                self.ui.ok(&format!(
-                    "would remove {dir} from the {scope} PATH (entry-by-entry, never a substring delete)"
-                ));
-            }
-            return Ok(());
-        }
+        let scope = path_scope(machine);
         let key = if machine {
             r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
         } else {
@@ -424,12 +419,6 @@ impl WinExecutor<'_> {
         version: &str,
         location: &str,
     ) -> Result<(), Failed> {
-        if self.dry {
-            self.ui.ok(&format!(
-                "would register '{display_name}' in Add/Remove Programs ({key})"
-            ));
-            return Ok(());
-        }
         let location = self.sub(location);
         let uninstall = format!("\"{location}\\unins000.exe\"");
         let values: [(&str, &str, String); 8] = [
@@ -463,11 +452,6 @@ impl WinExecutor<'_> {
     }
 
     fn stop_host_runtime(&self, app_dir: &str) -> Result<(), Failed> {
-        if self.dry {
-            self.ui
-                .ok("would stop the service, every tray, and the console/plugin tasks");
-            return Ok(());
-        }
         if let Err(e) = sys::stop_service_wait("PunktfunkHost") {
             self.ui.warn(&format!("service stop: {e}"));
         }
@@ -581,12 +565,6 @@ impl WinExecutor<'_> {
     /// De-elevate via `/IT` without `/RL`: limited interactive token from an elevated process.
     /// No COM, no PowerShell.
     fn launch_tray(&self, exe: &str) -> Result<(), Failed> {
-        if self.dry {
-            self.ui.ok(&format!(
-                "would start the tray ({exe}) — skipped in silent installs"
-            ));
-            return Ok(());
-        }
         if self.silent {
             self.ui
                 .ok("tray launch skipped (silent install) — the host's supervision starts one");
@@ -608,12 +586,6 @@ impl WinExecutor<'_> {
     }
 
     fn ensure_app_runtime(&self, arch: &str) -> Result<(), Failed> {
-        if self.dry {
-            self.ui.ok(&format!(
-                "would ensure the Windows App Runtime ({arch}; downloaded when missing — a failure warns and never aborts)"
-            ));
-            return Ok(());
-        }
         if sys::app_runtime_present() {
             self.ui.ok("Windows App Runtime already installed");
             return Ok(());
@@ -652,16 +624,6 @@ impl WinExecutor<'_> {
     }
 
     fn kill_port_listeners(&self, ports: &[u16]) -> Result<(), Failed> {
-        if self.dry {
-            let list = ports
-                .iter()
-                .map(u16::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            self.ui
-                .ok(&format!("would stop anything still listening on {list}"));
-            return Ok(());
-        }
         let Some(out) = self
             .run
             .probe("netstat", &["-ano", "-p", "TCP"])
@@ -674,6 +636,74 @@ impl WinExecutor<'_> {
         }
         Ok(())
     }
+}
+
+/// What a dry run reports instead of the step, for every step whose real run only mutates.
+/// `None` for the steps that echo their own commands in a dry run, refuse, or note.
+fn dry_line(action: &WinAction) -> Option<String> {
+    Some(match action {
+        WinAction::DeployFiles { dest } => format!("would unpack the payload into {dest}"),
+        WinAction::DeleteFiles { paths } => format!("would delete {}", paths.join(", ")),
+        WinAction::RemoveFiles { dir } => format!("would remove {dir}"),
+        WinAction::PathAdd { machine, dir } => {
+            format!("would add {dir} to the {} PATH", path_scope(*machine))
+        }
+        WinAction::PathRemove { machine, dir } => format!(
+            "would remove {dir} from the {} PATH (entry-by-entry, never a substring delete)",
+            path_scope(*machine)
+        ),
+        WinAction::ArpRegister {
+            key, display_name, ..
+        } => format!("would register '{display_name}' in Add/Remove Programs ({key})"),
+        WinAction::ArpRemove { key } => {
+            format!("would remove the Add/Remove Programs entry ({key})")
+        }
+        WinAction::Shortcut { link, target } => format!("would create {link} → {target}"),
+        WinAction::MakeNetworkPrivate { network } => {
+            format!("would set network '{network}' to Private")
+        }
+        WinAction::StopHostRuntime { .. } => {
+            "would stop the service, every tray, and the console/plugin tasks".to_string()
+        }
+        WinAction::LaunchTray { exe } => {
+            format!("would start the tray ({exe}) — skipped in silent installs")
+        }
+        WinAction::EnsureAppRuntime { arch } => format!(
+            "would ensure the Windows App Runtime ({arch}; downloaded when missing — a failure warns and never aborts)"
+        ),
+        WinAction::KillPortListeners { ports } => format!(
+            "would stop anything still listening on {}",
+            ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        WinAction::Run(_)
+        | WinAction::RunLenient(_)
+        | WinAction::Refuse(_)
+        | WinAction::Note(..)
+        | WinAction::RestoreTasks { .. }
+        | WinAction::WebSetup { .. }
+        | WinAction::RegisterScriptingTask { .. } => return None,
+    })
+}
+
+fn path_scope(machine: bool) -> &'static str {
+    if machine {
+        "machine"
+    } else {
+        "user"
+    }
+}
+
+/// `a.dll, b.exe` for a warning line.
+fn file_names(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| p.file_name().unwrap_or_default().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// `None` = already an entry (case-insensitive, slash-insensitive).
@@ -779,31 +809,11 @@ fn to_utf16le_bom(text: &str) -> Vec<u8> {
 mod tests {
     use super::super::choices::WinChoices;
     use super::super::plan::{self, Artifact};
-    use super::super::{FakeNet, TaskState, WinFacts, WinInstall};
+    use super::super::{FakeNet, WinFacts, WinInstall};
     use super::*;
+    use crate::fixtures::fresh_win as fresh_facts;
     use crate::seam::FakeRunner;
     use crate::ui::Plain;
-
-    fn fresh_facts() -> WinFacts {
-        WinFacts {
-            os_build: 26200,
-            arch: "x64".into(),
-            installed: None,
-            host_env_present: false,
-            web_password_present: false,
-            mgmt_bind_set: false,
-            competing_hosts: vec![],
-            mgmt_port_in_use: false,
-            networks: vec![],
-            steam_audio_drivers: true,
-            tray_autostart: false,
-            vulkan_layer_registered: false,
-            web_task: TaskState::Absent,
-            scripting_task: TaskState::Absent,
-            inno_uninstaller: false,
-            client_installed: None,
-        }
-    }
 
     fn executor<'a>(
         run: &'a FakeRunner,

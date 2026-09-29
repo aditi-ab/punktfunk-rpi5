@@ -11,20 +11,17 @@ import {
 import { motion } from "motion/react";
 import { type FC, useMemo, useState } from "react";
 import {
-	getGetLibraryQueryKey,
 	getListLibraryScannersQueryKey,
 	useDeleteProviderEntries,
 	useListLibraryScanners,
 	useSetLibraryScanner,
 } from "@/api/gen/library/library";
+import type { CatalogEntry } from "@/api/gen/model";
 import type { PluginAccessSnapshot } from "@/api/gen/model/pluginAccessSnapshot";
 import type { ScannerInfo } from "@/api/gen/model/scannerInfo";
+import { useGetPluginCatalog } from "@/api/gen/store/store";
 import { usePlugins } from "@/api/plugins";
-import {
-	type StoreEntry,
-	useInstallPlugin,
-	useStoreCatalog,
-} from "@/api/store";
+import { useInstallPlugin } from "@/api/store";
 import { useDialogs } from "@/components/dialogs";
 import { ROW, ROW_GAP, Stagger } from "@/components/stagger";
 import { Badge } from "@/components/ui/badge";
@@ -32,7 +29,9 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { apiErrorMessage } from "@/lib/errors";
 import { m } from "@/paraglide/messages";
+import { EmulatorsCard } from "@/sections/Library/Emulators";
 import { PendingAccess, usePluginAccess } from "@/sections/PluginAccess";
+import { refreshLibrary } from "./helpers";
 import { SourceSettingsDialog } from "./SourceSettings";
 
 /**
@@ -52,7 +51,7 @@ export const SourcesSection: FC<{
 	const toggle = useSetLibraryScanner();
 	const purge = useDeleteProviderEntries();
 	const plugins = usePlugins();
-	const catalog = useStoreCatalog();
+	const catalog = useGetPluginCatalog();
 	const install = useInstallPlugin();
 	const access = usePluginAccess();
 	const [settingsFor, setSettingsFor] = useState<ScannerInfo | null>(null);
@@ -67,7 +66,7 @@ export const SourcesSection: FC<{
 				data: { enabled: !source.enabled },
 			});
 			qc.setQueryData(getListLibraryScannersQueryKey(), list);
-			await qc.invalidateQueries({ queryKey: getGetLibraryQueryKey() });
+			await refreshLibrary(qc);
 		} catch {
 			toast.error(m.library_sources_failed());
 		}
@@ -88,7 +87,7 @@ export const SourcesSection: FC<{
 		if (!ok) return;
 		try {
 			await purge.mutateAsync({ provider });
-			qc.invalidateQueries({ queryKey: getGetLibraryQueryKey() });
+			refreshLibrary(qc);
 			qc.invalidateQueries({ queryKey: getListLibraryScannersQueryKey() });
 			if (activeFilter === provider) onFilter(null);
 			toast.success(m.library_provider_purged({ provider: source.label }));
@@ -97,7 +96,7 @@ export const SourcesSection: FC<{
 		}
 	};
 
-	const onInstall = async (entry: StoreEntry) => {
+	const onInstall = async (entry: CatalogEntry) => {
 		try {
 			// Install by (source, id) — the catalogued, integrity-pinned path. The raw-spec form is
 			// for unverified installs and must never be reachable from a one-click rail.
@@ -125,13 +124,16 @@ export const SourcesSection: FC<{
 	);
 	// Compatible only: this rail is a row of Install buttons, and one for a scanner that cannot
 	// run on this OS is a control that does nothing (design/web-console-overhaul.md §2.1). The
-	// full catalog, incompatible entries included, is a checkbox away on the Store page.
-	const available = (catalog.data?.plugins ?? []).filter(
-		(p) =>
-			p.categories?.includes("library") &&
-			!installedPkgs.has(p.pkg) &&
-			p.compatible,
-	);
+	// full catalog, incompatible entries included, is a checkbox away on the Store page. A launcher
+	// found on this host leads.
+	const available = (catalog.data?.plugins ?? [])
+		.filter(
+			(p) =>
+				p.categories?.includes("library") &&
+				!installedPkgs.has(p.pkg) &&
+				p.compatible,
+		)
+		.sort((a, b) => Number(b.detected === true) - Number(a.detected === true));
 	// Every live registration, NOT just the `library`-category ones. A plugin's nav categorisation
 	// cannot decide whether its liveness badge is honest: a library plugin that registers without
 	// `category` is live, and filtering on it here badges a running plugin "Stopped".
@@ -150,7 +152,9 @@ export const SourcesSection: FC<{
 			source: s,
 			entry: available.find((p) => p.id === s.id),
 		}))
-		.filter((r): r is { source: ScannerInfo; entry: StoreEntry } => !!r.entry);
+		.filter(
+			(r): r is { source: ScannerInfo; entry: CatalogEntry } => !!r.entry,
+		);
 
 	return (
 		<>
@@ -177,6 +181,7 @@ export const SourcesSection: FC<{
 				accessBusy={access.busy}
 				onAccessDecision={access.onDecide}
 			/>
+			<EmulatorsCard />
 			{settingsFor && (
 				<SourceSettingsDialog
 					source={settingsFor}
@@ -197,9 +202,9 @@ export const SourcesSection: FC<{
  * migration is a valid state rather than a mess.
  */
 export const MigrationBanner: FC<{
-	rows: ReadonlyArray<{ source: ScannerInfo; entry: StoreEntry }>;
+	rows: ReadonlyArray<{ source: ScannerInfo; entry: CatalogEntry }>;
 	busy: boolean;
-	onInstall: (entry: StoreEntry) => void;
+	onInstall: (entry: CatalogEntry) => void;
 }> = ({ rows, busy, onInstall }) => (
 	<Card>
 		<CardHeader className="pb-3">
@@ -234,7 +239,7 @@ export const MigrationBanner: FC<{
 export const SourcesCard: FC<{
 	sources: ScannerInfo[];
 	/** Catalog rows offering a library source that isn't installed yet. */
-	available: StoreEntry[];
+	available: CatalogEntry[];
 	/** Ids of every plugin whose lease is currently live, whatever its category. */
 	running: Set<string>;
 	/** Source id whose toggle is in flight, or null — only that row disables. */
@@ -245,7 +250,7 @@ export const SourcesCard: FC<{
 	onFilter: (provider: string | null) => void;
 	onSettings: (source: ScannerInfo) => void;
 	onPurge: (source: ScannerInfo) => void;
-	onInstall: (entry: StoreEntry) => void;
+	onInstall: (entry: CatalogEntry) => void;
 	access?: PluginAccessSnapshot[];
 	accessBusy?: boolean;
 	accessInitiallyOpen?: boolean;

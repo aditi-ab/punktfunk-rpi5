@@ -10,26 +10,20 @@
 //! pad is [`super::gamepad`].
 
 use super::dualsense_proto::{
-    ds_pairing_reply, edge_paddle_bits, parse_ds_output, serialize_state, DsFeedback, DsState,
-    DsTriggers, DS_EDGE_PRODUCT, DS_FEATURE_CALIBRATION, DS_FEATURE_FIRMWARE, DS_INPUT_REPORT_LEN,
-    DS_PRODUCT, DS_TOUCH_H, DS_TOUCH_W, DS_VENDOR, DUALSENSE_EDGE_RDESC, DUALSENSE_RDESC,
+    ds_pairing_reply, edge_paddle_bits, parse_ds_output, DsEncoder, DsFeedback, DsState,
+    DEVTYPE_DUALSENSE, DEVTYPE_DUALSENSE_EDGE, DS_EDGE_PRODUCT, DS_FEATURE_CALIBRATION,
+    DS_FEATURE_FIRMWARE, DS_PRODUCT, DS_TOUCH_H, DS_TOUCH_W, DS_VENDOR, DUALSENSE_EDGE_RDESC,
+    DUALSENSE_RDESC,
 };
-use crate::sensor_clock::SensorClock;
-use crate::uhid_abi::{
-    put_cstr, BUS_USB, HID_MAX_DESCRIPTOR_SIZE, UHID_CREATE2, UHID_DESTROY, UHID_EVENT_SIZE,
-    UHID_GET_REPORT, UHID_GET_REPORT_REPLY, UHID_INPUT2, UHID_OUTPUT, UHID_PATH, UHID_SET_REPORT,
-    UHID_SET_REPORT_REPLY,
-};
+use crate::uhid_abi::{Create2, UhidDevice, UhidEvent};
 use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use punktfunk_core::quic::RichInput;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
-use std::time::Instant;
 
 /// CREATE2 identity: DualSense vs Edge. Same codec; Edge is PID, descriptor, and `buttons[2]`.
 pub struct DsUhidIdentity {
+    /// `pf_driver_proto::gamepad` device type; keys the pairing MAC.
+    device_type: u8,
     product: u32,
     rdesc: &'static [u8],
     name: &'static str,
@@ -40,6 +34,7 @@ pub struct DsUhidIdentity {
 impl DsUhidIdentity {
     pub const fn dualsense() -> DsUhidIdentity {
         DsUhidIdentity {
+            device_type: DEVTYPE_DUALSENSE,
             product: DS_PRODUCT,
             rdesc: DUALSENSE_RDESC,
             name: "DualSense",
@@ -50,6 +45,7 @@ impl DsUhidIdentity {
 
     pub const fn dualsense_edge() -> DsUhidIdentity {
         DsUhidIdentity {
+            device_type: DEVTYPE_DUALSENSE_EDGE,
             product: DS_EDGE_PRODUCT,
             rdesc: DUALSENSE_EDGE_RDESC,
             name: "DualSense Edge",
@@ -59,144 +55,62 @@ impl DsUhidIdentity {
     }
 }
 
-/// Virtual DualSense on `/dev/uhid`. Drop sends `UHID_DESTROY` and unbinds `hid-playstation`.
+/// Virtual DualSense on `/dev/uhid`. Drop unbinds `hid-playstation`.
 pub struct DualSensePad {
-    fd: File,
-    seq: u8,
-    clock: SensorClock,
-    triggers: DsTriggers,
+    dev: UhidDevice,
+    device_type: u8,
+    enc: DsEncoder,
 }
 
 impl DualSensePad {
-    /// `index` is only for unique name/uniq; identity is `id`.
+    /// `index` is only for unique name/uniq; identity is `id`. The uniq is cosmetic:
+    /// `hid-playstation` replaces it with the pairing-report MAC ([`ds_pairing_reply`]).
     pub fn open(index: u8, id: &DsUhidIdentity) -> Result<DualSensePad> {
-        let fd = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(UHID_PATH)
-            .with_context(|| {
-                format!("open {UHID_PATH} (is the 60-punktfunk.rules uhid rule installed + are you in 'input'?)")
-            })?;
-        let mut ds = DualSensePad {
-            fd,
-            seq: 0,
-            clock: SensorClock::dualsense(),
-            triggers: DsTriggers::default(),
-        };
-        ds.send_create2(index, id)
-            .context("UHID_CREATE2 DualSense")?;
-        Ok(ds)
-    }
-
-    /// CREATE2. The uniq is cosmetic: `hid-playstation` replaces it with the pairing-report MAC ([`ds_pairing_reply`]).
-    fn send_create2(&mut self, index: u8, id: &DsUhidIdentity) -> Result<()> {
-        let mut ev = [0u8; UHID_EVENT_SIZE];
-        ev[0..4].copy_from_slice(&UHID_CREATE2.to_ne_bytes());
-        // uhid_create2_req at 4: name[128] phys[64] uniq[64] rd_size bus vid pid version country rd_data.
-        put_cstr(&mut ev, 4, 128, &format!("Punktfunk {} {index}", id.name));
-        put_cstr(&mut ev, 132, 64, &format!("punktfunk/{}/{index}", id.phys));
-        put_cstr(&mut ev, 196, 64, &format!("punktfunk-{}-{index}", id.slug));
-        ev[260..262].copy_from_slice(&(id.rdesc.len() as u16).to_ne_bytes());
-        ev[262..264].copy_from_slice(&BUS_USB.to_ne_bytes());
-        ev[264..268].copy_from_slice(&DS_VENDOR.to_ne_bytes());
-        ev[268..272].copy_from_slice(&id.product.to_ne_bytes());
-        ev[272..276].copy_from_slice(&0x0100u32.to_ne_bytes());
-        ev[276..280].copy_from_slice(&0u32.to_ne_bytes());
-        ev[280..280 + id.rdesc.len()].copy_from_slice(id.rdesc);
-        self.fd.write_all(&ev).context("write UHID_CREATE2")?;
-        Ok(())
+        let dev = UhidDevice::open(&Create2 {
+            bus: crate::uhid_abi::BUS_USB,
+            name: &format!("Punktfunk {} {index}", id.name),
+            phys: &format!("punktfunk/{}/{index}", id.phys),
+            uniq: &format!("punktfunk-{}-{index}", id.slug),
+            rdesc: id.rdesc,
+            vendor: DS_VENDOR,
+            product: id.product,
+            version: 0x0100,
+        })?;
+        Ok(DualSensePad {
+            dev,
+            device_type: id.device_type,
+            enc: DsEncoder::default(),
+        })
     }
 
     pub fn write_state(&mut self, st: &DsState) -> Result<()> {
-        self.seq = self.seq.wrapping_add(1);
-        let ts = self.clock.ds_ticks(Instant::now());
-        let mut r = [0u8; DS_INPUT_REPORT_LEN];
-        serialize_state(&mut r, st, self.seq, ts);
-        self.triggers.stamp(&mut r, st.l2, st.r2);
-
-        let mut ev = [0u8; UHID_EVENT_SIZE];
-        ev[0..4].copy_from_slice(&UHID_INPUT2.to_ne_bytes());
-        // uhid_input2_req: size u16 at 4, data at 6.
-        ev[4..6].copy_from_slice(&(r.len() as u16).to_ne_bytes());
-        ev[6..6 + r.len()].copy_from_slice(&r);
-        self.fd.write_all(&ev).context("write UHID_INPUT2")?;
-        Ok(())
+        let r = self.enc.encode(st);
+        self.dev.write_input(&r)
     }
 
-    /// Drain UHID events. GET_REPORT (0x05/0x09/0x20) must be answered or `hid-playstation` never binds; call often right after [`open`].
+    /// Drain UHID events. GET_REPORT (0x05/0x09/0x20) must be answered or `hid-playstation`
+    /// never binds; call often right after [`open`](Self::open). DualSense feedback is OUTPUT,
+    /// so a SET_REPORT needs only the ack `poll` sends.
     pub fn service(&mut self, pad: u8) -> DsFeedback {
         let mut fb = DsFeedback::default();
-        let mut ev = [0u8; UHID_EVENT_SIZE];
-        while let Ok(n) = self.fd.read(&mut ev) {
-            if n < UHID_EVENT_SIZE {
-                break;
+        let device_type = self.device_type;
+        self.dev.poll(|dev, ev| match ev {
+            UhidEvent::Output(data) => parse_ds_output(pad, data, &mut fb),
+            UhidEvent::GetReport { id, rnum } => {
+                // Per-pad MAC becomes HID uniq; SDL/Steam dedup on it (`ds_pairing_reply`).
+                let pairing = ds_pairing_reply(device_type, pad);
+                let data: Option<&[u8]> = match rnum {
+                    0x05 => Some(DS_FEATURE_CALIBRATION),
+                    0x09 => Some(&pairing),
+                    0x20 => Some(DS_FEATURE_FIRMWARE),
+                    _ => None,
+                };
+                let _ = dev.reply_get_report(id, data);
             }
-            match u32::from_ne_bytes([ev[0], ev[1], ev[2], ev[3]]) {
-                UHID_OUTPUT => {
-                    // uhid_output_req: data[4096] at [4..4100], size u16 at [4100..4102].
-                    let size = u16::from_ne_bytes([ev[4100], ev[4101]]) as usize;
-                    let end = 4 + size.min(HID_MAX_DESCRIPTOR_SIZE);
-                    parse_ds_output(pad, &ev[4..end], &mut fb);
-                }
-                UHID_GET_REPORT => {
-                    // uhid_get_report_req: id u32 [4..8], rnum u8 [8].
-                    let id = u32::from_ne_bytes([ev[4], ev[5], ev[6], ev[7]]);
-                    // Per-pad MAC becomes HID uniq; SDL/Steam dedup on it (`ds_pairing_reply`).
-                    let pairing = ds_pairing_reply(pad);
-                    let data: &[u8] = match ev[8] {
-                        0x05 => DS_FEATURE_CALIBRATION,
-                        0x09 => &pairing,
-                        0x20 => DS_FEATURE_FIRMWARE,
-                        _ => &[],
-                    };
-                    let _ = self.reply_get_report(id, data);
-                }
-                UHID_SET_REPORT => {
-                    // Ack SET_REPORT (err=0): kernel waits 5 s otherwise. DualSense feedback is OUTPUT, not SET_REPORT.
-                    let id = u32::from_ne_bytes([ev[4], ev[5], ev[6], ev[7]]);
-                    let _ = self.reply_set_report(id);
-                }
-                _ => {}
-            }
-        }
-        self.triggers.observe(&fb.hidout);
+            UhidEvent::SetReport(_) => {}
+        });
+        self.enc.observe(&fb.hidout);
         fb
-    }
-
-    fn reply_get_report(&mut self, id: u32, data: &[u8]) -> Result<()> {
-        let mut ev = [0u8; UHID_EVENT_SIZE];
-        ev[0..4].copy_from_slice(&UHID_GET_REPORT_REPLY.to_ne_bytes());
-        // uhid_get_report_reply_req: id u32 [4..8], err u16 [8..10], size u16 [10..12], data [12..].
-        ev[4..8].copy_from_slice(&id.to_ne_bytes());
-        let err: u16 = if data.is_empty() { 5 } else { 0 }; // EIO if unknown report
-        ev[8..10].copy_from_slice(&err.to_ne_bytes());
-        ev[10..12].copy_from_slice(&(data.len() as u16).to_ne_bytes());
-        ev[12..12 + data.len()].copy_from_slice(data);
-        self.fd
-            .write_all(&ev)
-            .context("write UHID_GET_REPORT_REPLY")?;
-        Ok(())
-    }
-
-    fn reply_set_report(&mut self, id: u32) -> Result<()> {
-        let mut ev = [0u8; UHID_EVENT_SIZE];
-        ev[0..4].copy_from_slice(&UHID_SET_REPORT_REPLY.to_ne_bytes());
-        // uhid_set_report_reply_req: id u32 [4..8], err u16 [8..10].
-        ev[4..8].copy_from_slice(&id.to_ne_bytes());
-        ev[8..10].copy_from_slice(&0u16.to_ne_bytes());
-        self.fd
-            .write_all(&ev)
-            .context("write UHID_SET_REPORT_REPLY")?;
-        Ok(())
-    }
-}
-
-impl Drop for DualSensePad {
-    fn drop(&mut self) {
-        let mut ev = [0u8; UHID_EVENT_SIZE];
-        ev[0..4].copy_from_slice(&UHID_DESTROY.to_ne_bytes());
-        let _ = self.fd.write_all(&ev);
     }
 }
 
@@ -253,40 +167,14 @@ impl PadProto for DsLinuxProto {
         open_transport(idx)
     }
 
-    fn neutral(&self) -> DsState {
-        DsState::neutral()
-    }
-
-    /// Button/stick/trigger frame. Keep prev touch/motion/click — they arrive on the rich plane.
     fn merge_frame(&self, prev: &DsState, f: &punktfunk_core::input::GamepadFrame) -> DsState {
         let buttons = crate::steam_remap::fold_paddles(f.buttons, self.remap.paddles);
-        let mut s = DsState::from_gamepad(
-            buttons,
-            f.ls_x,
-            f.ls_y,
-            f.rs_x,
-            f.rs_y,
-            f.left_trigger,
-            f.right_trigger,
-        );
-        s.touch = prev.touch;
-        s.gyro = prev.gyro;
-        s.accel = prev.accel;
-        s.touch_click = prev.touch_click;
-        s
+        DsState::merge_frame(prev, f, buttons)
     }
 
     /// Steam dual pads split the one touchpad left/right; clicks ride `touch_click`.
     fn apply_rich(&self, st: &mut DsState, rich: RichInput) {
         st.apply_rich(rich, DS_TOUCH_W, DS_TOUCH_H);
-    }
-
-    fn neutralize_gyro(&self, st: &mut DsState) -> bool {
-        st.neutralize_gyro()
-    }
-
-    fn clear_rich(&self, st: &mut DsState) {
-        st.clear_rich();
     }
 
     fn write_state(&self, pad: &mut DsTransport, st: &DsState) {
@@ -346,40 +234,16 @@ impl PadProto for DsEdgeLinuxProto {
         Ok(p)
     }
 
-    fn neutral(&self) -> DsState {
-        DsState::neutral()
-    }
-
     /// Same merge as DualSense, but paddles land on `buttons[2]` (rebuilt every frame, no persistence).
     fn merge_frame(&self, prev: &DsState, f: &punktfunk_core::input::GamepadFrame) -> DsState {
-        let mut s = DsState::from_gamepad(
-            f.buttons,
-            f.ls_x,
-            f.ls_y,
-            f.rs_x,
-            f.rs_y,
-            f.left_trigger,
-            f.right_trigger,
-        );
+        let mut s = DsState::merge_frame(prev, f, f.buttons);
         s.buttons[2] |= edge_paddle_bits(f.buttons);
-        s.touch = prev.touch;
-        s.gyro = prev.gyro;
-        s.accel = prev.accel;
-        s.touch_click = prev.touch_click;
         s
     }
 
     /// Steam dual pads split the one touchpad left/right; clicks ride `touch_click`.
     fn apply_rich(&self, st: &mut DsState, rich: RichInput) {
         st.apply_rich(rich, DS_TOUCH_W, DS_TOUCH_H);
-    }
-
-    fn neutralize_gyro(&self, st: &mut DsState) -> bool {
-        st.neutralize_gyro()
-    }
-
-    fn clear_rich(&self, st: &mut DsState) {
-        st.clear_rich();
     }
 
     fn write_state(&self, pad: &mut DualSensePad, st: &DsState) {

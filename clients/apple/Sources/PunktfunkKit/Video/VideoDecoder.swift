@@ -353,9 +353,7 @@ public final class VideoDecoder: @unchecked Sendable {
             onDecodeError(status)
             return
         }
-        var ts = timespec()
-        clock_gettime(CLOCK_REALTIME, &ts)
-        let decodedNs = Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
+        let decodedNs = realtimeNowNs()
         // pts was stamped at timescale 1e9 (AnnexB.sampleBuffer); normalize defensively.
         let p = CMTimeConvertScale(pts, timescale: 1_000_000_000, method: .default)
         let ptsNs = p.value > 0 ? UInt64(p.value) : 0

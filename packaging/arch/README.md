@@ -53,9 +53,8 @@ Arch machine (or an emulated Arch Linux ARM container, which is slow). Unlike th
 Then the standard first-run (printed by the install scriptlet):
 ```sh
 sudo usermod -aG input "$USER"          # virtual gamepads; re-login after
-mkdir -p ~/.config/punktfunk
-cp /usr/share/punktfunk/host.env.bazzite ~/.config/punktfunk/host.env   # gamescope backend
 systemctl --user enable --now punktfunk-host
+# Settings: the console. A line in ~/.config/punktfunk/host.env locks that setting there.
 # Web console (if you installed the punktfunk-web package): enable it + read the login password.
 systemctl --user enable --now punktfunk-web
 journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'   # open https://<host-ip>:47992

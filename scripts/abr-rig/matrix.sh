@@ -25,7 +25,7 @@ cell() {
   local tag=$1 kbps=$2 answer=$3 recovery=$4
   for r in $(seq "$REPEATS"); do
     PUNKTFUNK_ABR_PROBE_KBPS=$kbps PF_RIG_KEYFRAME_ANSWER=$answer \
-      PF_RIG_RECOVERY_MS=$recovery PF_RIG_SKIP_BUILD=${PF_RIG_SKIP_BUILD:-1} \
+      PF_RIG_RECOVERY_MS=$recovery \
       "$HERE/run.sh" "$PROFILE" "$SECONDS_RUN" > "$OUT/$tag-$r.run" 2>&1 ||
       { echo "$tag run $r FAILED — see $OUT/$tag-$r.run"; continue; }
     cp "$OUT/$PROFILE-1.jsonl" "$OUT/$tag-$r.jsonl"
@@ -34,8 +34,8 @@ cell() {
   done
 }
 
-# Build once, up front; every run then measures the same binaries.
-PF_RIG_SKIP_BUILD=0 "$HERE/run.sh" "$PROFILE" 1 >/dev/null 2>&1 || true
+# Build up front; every later run's cargo build is a no-op.
+"$HERE/run.sh" "$PROFILE" 1 >/dev/null 2>&1 || true
 
 cell webos-idr 320000 idr 700
 cell webos-wave 320000 wave:4 300

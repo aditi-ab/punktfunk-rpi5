@@ -26,7 +26,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::CStr;
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -149,7 +149,7 @@ pub(crate) enum ToWorker {
     /// Open the encoder. [`FromWorker::Ready`] (AU memfd) or [`FromWorker::InitErr`].
     ///
     /// `priority_intent` is the host-resolved `PYROWAVE_QUEUE_PRIORITY` (`None` =
-    /// default REALTIME→HIGH). Forwarded explicitly: the worker strips the
+    /// REALTIME→HIGH, HIGH on NVIDIA). Forwarded explicitly: the worker strips the
     /// variable so one knob cannot mean two things across the process boundary.
     Hello {
         proto: u32,
@@ -289,16 +289,7 @@ pub(crate) fn send_eintr<T: Serialize>(
 
 /// Grows on `pwrite`; callers never size it.
 fn memfd(name: &CStr) -> io::Result<File> {
-    // SAFETY: `memfd_create` reads a NUL-terminated name (a live `CStr` for the duration of the
-    // call) and returns a fresh descriptor or -1; it retains no pointer. The result is checked
-    // before use, and the returned fd is owned by nobody else, so `File::from_raw_fd` takes sole
-    // ownership and closes it exactly once.
-    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `fd` is the fresh, valid descriptor just created and checked above.
-    Ok(unsafe { File::from_raw_fd(fd) })
+    Ok(rustix::fs::memfd_create(name, rustix::fs::MemfdFlags::CLOEXEC)?.into())
 }
 
 pub(crate) fn cursor_upload(rgba: &[u8]) -> io::Result<(File, usize)> {
@@ -332,34 +323,7 @@ pub fn run_from_args(args: &[String]) -> Result<()> {
     // no-op. The worker is single-threaded, so this is the encode thread.
     pf_frame::thread_qos::boost_thread_priority(true);
 
-    let fd: i32 = args
-        .iter()
-        .skip_while(|a| *a != "--fd")
-        .nth(1)
-        .map(|s| s.parse())
-        .transpose()
-        .context("parse --fd")?
-        .unwrap_or(3);
-    // Refuse anything that cannot be the spawning host's socket: a negative fd is
-    // UB inside `OwnedFd` (its niche), and 0–2 would close stdio on exit. Then
-    // confirm the number really holds a socket — this binary is runnable by hand.
-    anyhow::ensure!(fd >= 3, "--fd must be >= 3 (got {fd})");
-    // SAFETY: `libc::stat` is plain-old-data for which all-zero is a valid value, so `mem::zeroed`
-    // is a sound initializer; `fstat` writes into the live, correctly-sized `&mut st` and only
-    // reads `fd`. `st_mode` is read only after the return value is checked.
-    let is_socket = unsafe {
-        let mut st: libc::stat = std::mem::zeroed();
-        libc::fstat(fd, &mut st) == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFSOCK
-    };
-    anyhow::ensure!(
-        is_socket,
-        "--fd {fd} is not an open socket (this binary is spawned by punktfunk-host, not run by hand)"
-    );
-    // SAFETY: the spawning host `dup2`'d its socketpair end onto exactly this fd number before
-    // exec (the worker's contract, just verified to be an open socket ≥ 3) and nothing else in
-    // this fresh process owns it, so `OwnedFd` takes sole ownership and closes it once at exit.
-    let sock = unsafe { OwnedFd::from_raw_fd(fd) };
-    run(sock)
+    run(ipc::adopt_spawned_socket(args)?)
 }
 
 /// Drop env this process must not act on. A denylist, not an allowlist: the
@@ -458,6 +422,8 @@ fn run(sock: OwnedFd) -> Result<()> {
 /// host reads as a death.
 fn serve(sock: &OwnedFd, mut enc: super::pyrowave::PyroWaveEncoder, au_buf: &File) -> Result<()> {
     use crate::Encoder as _;
+    // AUs are laid out in the return buffer itself; `encode_one` only reports the length.
+    enc.set_au_arena(au_buf.try_clone().context("dup the AU return buffer")?);
     let mut buf = Vec::new();
     let mut fds: HashMap<u64, OwnedFd> = HashMap::new();
     let mut fd_order: VecDeque<u64> = VecDeque::new();
@@ -651,12 +617,19 @@ fn encode_one(
         anyhow::bail!("encoder returned no AU for a submitted frame");
     };
     let encode_us = t0.elapsed().as_micros() as u32;
-    au_buf
-        .write_all_at(&au.data, 0)
-        .context("write the AU into the return buffer")?;
+    // On the arena the AU is already in the buffer; a CPU-side AU still comes as bytes.
+    let len = match enc.take_arena_len() {
+        Some(n) => n,
+        None => {
+            au_buf
+                .write_all_at(&au.data, 0)
+                .context("write the AU into the return buffer")?;
+            au.data.len()
+        }
+    };
     Ok(FromWorker::Au {
         key: req.key,
-        len: au.data.len(),
+        len,
         pts_ns: au.pts_ns,
         keyframe: au.keyframe,
         chunk_aligned: au.chunk_aligned,
@@ -848,6 +821,24 @@ mod tests {
         let mut back = vec![0u8; au.len()];
         File::from(fd.unwrap()).read_exact_at(&mut back, 0).unwrap();
         assert_eq!(back, au);
+    }
+
+    /// The arena lays out exactly the AU `build_au` would, in the file the host reads, and
+    /// regrows for a frame past its mapping.
+    #[test]
+    fn the_arena_lays_out_the_au_the_host_reads() {
+        let f = memfd(c"pf-encode-arena").unwrap();
+        let mut arena = super::super::pyrowave::AuArena::new(f.try_clone().unwrap());
+        let bs: Vec<u8> = (0..3000u32).map(|i| (i * 13) as u8).collect();
+        let pkts = [(0usize, 700usize), (700, 900), (1600, 20)];
+        let n = arena.build(&pkts, &bs, Some(1408)).unwrap();
+        let mut back = vec![0u8; n];
+        f.read_exact_at(&mut back, 0).unwrap();
+        assert_eq!(back, crate::pyrowave_wire::build_au(&pkts, &bs, Some(1408)));
+        let big = vec![7u8; 3 << 20];
+        let n2 = arena.build(&[(0, big.len())], &big, Some(1408)).unwrap();
+        assert!(n2 > big.len());
+        assert!(f.metadata().unwrap().len() >= n2 as u64);
     }
 
     #[test]

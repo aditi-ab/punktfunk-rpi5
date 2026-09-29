@@ -12,13 +12,12 @@ use std::process::ExitCode;
 
 use punktfunk_setup::platform::windows::args::InnoArgs;
 use punktfunk_setup::platform::windows::demo::WinPreset;
-use punktfunk_setup::platform::windows::exec::WinExecutor;
 use punktfunk_setup::platform::windows::{silent, sys};
 use punktfunk_setup::seam::Env;
 use punktfunk_setup::ui::{Plain, Reporter};
 
 use crate::real::Seams;
-use crate::wizard::{DemoSeams, RealSeams};
+use crate::wizard::{DemoSeams, LiveSeams, RealSeams};
 
 pub fn main(inno: &InnoArgs, preset: WinPreset, seams: &Seams, dry: bool) -> ExitCode {
     let log = inno
@@ -44,52 +43,19 @@ pub fn main(inno: &InnoArgs, preset: WinPreset, seams: &Seams, dry: bool) -> Exi
         return ExitCode::FAILURE;
     }
     let env = Env::from_env();
-    let outcome = match seams {
-        Seams::Demo { .. } => {
-            let s = DemoSeams::new(&preset, 0);
-            let exec = WinExecutor {
-                run: &s.run,
-                net: &s.net,
-                payload: &s.payload,
-                paths: &s.paths,
-                ui: &ui,
-                dry,
-                silent: true,
-                web_password: None,
-                subst: s.subst.clone(),
-            };
-            silent::run(
-                &exec,
-                &preset.facts,
-                preset.artifact,
-                preset.uninstall,
-                inno,
-                &env,
-            )
-        }
-        Seams::Real { root, version } => {
-            let s = RealSeams::new(root.as_deref(), version);
-            let exec = WinExecutor {
-                run: &s.run,
-                net: &s.net,
-                payload: s.payload.as_ref(),
-                paths: &s.paths,
-                ui: &ui,
-                dry,
-                silent: true,
-                web_password: None,
-                subst: s.subst.clone(),
-            };
-            silent::run(
-                &exec,
-                &preset.facts,
-                preset.artifact,
-                preset.uninstall,
-                inno,
-                &env,
-            )
-        }
+    let live = match seams {
+        Seams::Demo { .. } => LiveSeams::Demo(DemoSeams::new(&preset, 0)),
+        Seams::Real { root, version } => LiveSeams::Real(RealSeams::new(root.as_deref(), version)),
     };
+    let exec = live.executor(&ui, dry, true, None);
+    let outcome = silent::run(
+        &exec,
+        &preset.facts,
+        preset.artifact,
+        preset.uninstall,
+        inno,
+        &env,
+    );
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => ExitCode::FAILURE,

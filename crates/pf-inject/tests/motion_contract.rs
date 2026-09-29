@@ -9,16 +9,16 @@
 //! This file applies the consumer's arithmetic to each declaration and asserts the
 //! result is the wire constant. A new motion-capable backend belongs here.
 
-#![cfg(any(target_os = "linux", target_os = "windows"))]
-
 use pf_inject::dualsense_proto::{
     serialize_state as ds_serialize, DsState, DS_FEATURE_CALIBRATION, DS_INPUT_REPORT_LEN,
     DS_TOUCH_H, DS_TOUCH_W,
 };
 use pf_inject::dualshock4_proto::{
-    serialize_state as ds4_serialize, DS4_FEATURE_CALIBRATION, DS4_FEATURE_FIRMWARE,
-    DS4_FEATURE_PAIRING, DS4_INPUT_REPORT_LEN, DS4_RDESC, DS4_TOUCH_H, DS4_TOUCH_W,
+    serialize_state as ds4_serialize, DS4_FEATURE_CALIBRATION, DS4_INPUT_REPORT_LEN, DS4_TOUCH_H,
+    DS4_TOUCH_W,
 };
+use pf_inject::eightbitdo_proto::EightBitDoState;
+use pf_inject::hori_proto::HoriState;
 use pf_inject::steam_proto::SteamState;
 use pf_inject::steam_remap::motion_wire_to_deck;
 use pf_inject::switch_proto::SwitchState;
@@ -160,10 +160,47 @@ fn rescaling_backends_convert_the_wire_into_their_native_units() {
 
     // hid-nintendo: JC_IMU_GYRO_RES_PER_DPS = 14.247, ACCEL_RES_PER_G = 4096.
     // Identity factory-calibration blob, so report is 1:1. 100 °/s × 14.247 = 1424.7, truncated.
+    // Signs are the codec tests' job: the pad's axes are SDL's permutation of the wire's.
     let mut st = SwitchState::neutral();
     st.apply_motion([wire_gyro; 3], [wire_accel; 3]);
-    assert_eq!(st.gyro, [1424; 3], "Switch gyro: 100 °/s at 14.247 LSB/°·s");
-    assert_eq!(st.accel, [4096; 3], "Switch accel: 1 g at 4096 LSB/g");
+    assert_eq!(
+        st.gyro.map(i16::abs),
+        [1424; 3],
+        "Switch gyro: 100 °/s at 14.247 LSB/°·s"
+    );
+    assert_eq!(
+        st.accel.map(i16::abs),
+        [4096; 3],
+        "Switch accel: 1 g at 4096 LSB/g"
+    );
+
+    // SDL 8bitdo: INT16_MAX = 2000 °/s, accel 4096 LSB/g. Signs are the codec tests' job.
+    let mut st = EightBitDoState::neutral();
+    st.apply_motion([wire_gyro; 3], [wire_accel; 3]);
+    assert_eq!(
+        st.gyro.map(i16::abs),
+        [1638; 3],
+        "8BitDo gyro: 100 °/s at 32767/2000"
+    );
+    assert_eq!(
+        st.accel.map(i16::abs),
+        [4096; 3],
+        "8BitDo accel: 1 g at 4096 LSB/g"
+    );
+
+    // SDL steam_hori: the i16 range spans ±2048 °/s, 16 LSB/°·s; accel 4096 LSB/g.
+    let mut st = HoriState::neutral();
+    st.apply_motion([wire_gyro; 3], [wire_accel; 3]);
+    assert_eq!(
+        st.gyro.map(i16::abs),
+        [1600; 3],
+        "HORIPAD gyro: 100 °/s at 16 LSB/°·s"
+    );
+    assert_eq!(
+        st.accel.map(i16::abs),
+        [4096; 3],
+        "HORIPAD accel: 1 g at 4096 LSB/g"
+    );
 }
 
 /// Sony backends pass the wire sample unscaled. Correct only because the blobs above
@@ -287,95 +324,5 @@ fn every_backend_neutral_reads_as_a_still_pad_not_a_falling_one() {
             .sum::<f64>()
             .sqrt();
         assert!(mag > 0.0, "{what} neutral has no gravity at all");
-    }
-}
-
-/// Separate WDK workspace, cannot depend on pf-inject. Parse units from the
-/// driver's own source rather than trust a keep-in-sync comment.
-const DRIVER_SRC: &str = include_str!("../../../packaging/windows/drivers/pf-gamepad/src/lib.rs");
-
-/// Bytes of a `static NAME: [u8; N] = [ … ];` (or `const NAME: &[u8] = &[ … ];`)
-/// in source. The tables are `#[rustfmt::skip]` `0x..` bytes; a broken scan
-/// must fail loudly rather than pass vacuously.
-fn extract_byte_array(src: &str, name: &str) -> Vec<u8> {
-    let decl = src
-        .find(&format!("{name}:"))
-        .unwrap_or_else(|| panic!("{name} not found in the driver source"));
-    let eq = src[decl..]
-        .find('=')
-        .unwrap_or_else(|| panic!("{name}: no `=` after the declaration"))
-        + decl;
-    let open = src[eq..]
-        .find('[')
-        .unwrap_or_else(|| panic!("{name}: no `[` after the `=`"))
-        + eq;
-    let close = src[open..]
-        .find("];")
-        .unwrap_or_else(|| panic!("{name}: array literal is not closed by `];`"))
-        + open;
-    let bytes: Vec<u8> = src[open + 1..close]
-        .lines()
-        .map(|l| l.split("//").next().unwrap_or(""))
-        .flat_map(|l| l.split(','))
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(|t| {
-            let hex = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X"));
-            match hex {
-                Some(h) => u8::from_str_radix(h, 16),
-                None => t.parse(),
-            }
-            .unwrap_or_else(|_| panic!("{name}: {t:?} is not a byte literal"))
-        })
-        .collect();
-    assert!(!bytes.is_empty(), "{name}: extracted no bytes");
-    bytes
-}
-
-/// The driver's other DualShock 4 assets are byte copies: the descriptor fixes every
-/// length, so bytes compare. A shifted firmware word once served hw 0x00A0 on Windows.
-#[test]
-fn windows_driver_ds4_assets_are_byte_copies() {
-    for (name, canonical) in [
-        ("DS4_RDESC", DS4_RDESC),
-        ("DS4_FEATURE_PAIRING", DS4_FEATURE_PAIRING),
-        ("DS4_FEATURE_FIRMWARE", DS4_FEATURE_FIRMWARE),
-    ] {
-        assert_eq!(
-            extract_byte_array(DRIVER_SRC, name),
-            canonical,
-            "the UMDF driver's {name} has drifted from pf-inject's"
-        );
-    }
-}
-
-/// Driver blobs match pf-inject field-for-field. Trailing padding may differ
-/// (feature lengths differ by transport), so compare parsed fields, not bytes.
-#[test]
-fn windows_driver_blobs_match_the_canonical_ones() {
-    let wire_gyro = MOTION_GYRO_LSB_PER_DEG_S as i64;
-    let wire_accel = MOTION_ACCEL_LSB_PER_G as i64;
-
-    for (who, canonical, report_id) in [
-        ("DualSense 0x05", DS_FEATURE_CALIBRATION, 0x05u8),
-        ("DualShock 4 0x02", DS4_FEATURE_CALIBRATION, 0x02u8),
-    ] {
-        let name = if report_id == 0x05 {
-            "DS_FEATURE_CALIBRATION"
-        } else {
-            "DS4_FEATURE_CALIBRATION"
-        };
-        let driver_blob = extract_byte_array(DRIVER_SRC, name);
-        let driver = SonyImuCalibration::parse(&driver_blob, report_id, &format!("driver {who}"));
-        assert_eq!(
-            driver,
-            SonyImuCalibration::parse(canonical, report_id, who),
-            "the UMDF driver's {name} has drifted from pf-inject's"
-        );
-        for axis in 0..3 {
-            let d = format!("driver {who}");
-            assert_eq!(driver.kernel_gyro_lsb_per_deg_s(axis, &d), wire_gyro);
-            assert_eq!(driver.accel_lsb_per_g(axis, &d), wire_accel);
-        }
     }
 }

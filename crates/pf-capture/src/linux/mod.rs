@@ -8,14 +8,15 @@
 //!   drops.
 //! - **pipewire** — owns the `!Send` MainLoop/Stream and pumps frames.
 //!
-//! Frames leave through a one-deep overwriting [`FrameSlot`] plus a wakeup
-//! edge. Payload may be packed RGB, NV12, YUV444, 10-bit PQ, or a dmabuf
-//! that never touches the CPU. Size is the negotiated PipeWire format,
-//! not the portal hint. [`PortalCapturer`]'s `Drop` quits and joins the
+//! Frames leave through a queue that waits out each producer render
+//! ([`pipewire::FrameQueue`]) plus a wakeup edge; the direct capturer's are
+//! rendered on arrival and leave through a one-deep [`FrameSlot`]. Payload may
+//! be packed RGB, NV12, YUV444, 10-bit PQ, or a dmabuf that never touches the
+//! CPU. Size is the negotiated PipeWire format, not the portal hint. [`PortalCapturer`]'s `Drop` quits and joins the
 //! pipewire thread; [`PortalSession`]'s `Drop` fires the portal oneshot
 //! and waits bounded so the zbus drop ends the ScreenCast.
 
-use super::{CapturedFrame, Capturer, DmabufFrame, FramePayload, PixelFormat, ZeroCopyPolicy};
+use super::{CapturedFrame, Capturer, FramePayload, PixelFormat, ZeroCopyPolicy};
 use anyhow::{anyhow, Context, Result};
 
 // Gamescope's PipeWire node has no `SPA_META_Cursor`; this fills `cursor_live` from XFixes.
@@ -32,6 +33,43 @@ use std::time::Duration;
 /// [`CapturedFrame`] can own a dup'd dmabuf or CUDA buffer, so depth > 1
 /// pins compositor buffers.
 type FrameSlot = Arc<std::sync::Mutex<Option<CapturedFrame>>>;
+
+/// `wait_arrival` for the direct capturer: returns once `slot` holds a frame,
+/// `deadline` passes, or the producer is broken or gone. Never consumes: the
+/// frame stays for `try_latest`, which also classifies a dead producer.
+fn wait_for_frame(
+    slot: &FrameSlot,
+    wake: &Receiver<()>,
+    broken: &AtomicBool,
+    deadline: std::time::Instant,
+) {
+    if broken.load(Ordering::Relaxed) {
+        return;
+    }
+    loop {
+        if slot.lock().is_ok_and(|s| s.is_some()) {
+            return;
+        }
+        let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            return;
+        };
+        if wake.recv_timeout(left).is_err() {
+            return;
+        }
+    }
+}
+
+/// Drains stale wakeup edges so the next [`wait_for_frame`] cannot return
+/// early. `true` when the producer thread is gone (its sender dropped).
+fn drain_edges(wake: &Receiver<()>) -> bool {
+    loop {
+        match wake.try_recv() {
+            Ok(()) => continue,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => return true,
+        }
+    }
+}
 
 /// Named bools: four adjacent same-typed args transpose silently and
 /// negotiate the wrong pod family (black screen).
@@ -94,10 +132,10 @@ struct CaptureSignals {
     broken: Arc<AtomicBool>,
     /// The stream reached `Error` (e.g. "no more input formats"). Terminal: it never delivers.
     errored: Arc<AtomicBool>,
-    /// The producer sent a buffer this capture still holds, so the pool's ownership is broken:
-    /// pw_stream takes that buffer back once, its busy count never clears, and the pool is a
-    /// buffer short for good. Never cleared; only a new stream gets a whole pool back.
-    resent: Arc<AtomicBool>,
+    /// Buffers the producer sent again while this capture still held them (PipeWire < 1.6,
+    /// no `node.reliable`). Each is re-held under a new generation; the count rides the
+    /// provenance line, and [`Capturer::take_reference_risk`] turns a step into one IDR.
+    resent: Arc<std::sync::atomic::AtomicU64>,
     hdr_negotiated: Arc<AtomicBool>,
     /// Thread actually advertised the EGL→CUDA dmabuf-only offer. `plan.build_importer`
     /// is not enough: a failed importer means no dmabuf was offered, so a
@@ -106,6 +144,9 @@ struct CaptureSignals {
     /// Overlay from every buffer's `SPA_META_Cursor`, including cursor-only
     /// buffers that never become frames. Gamescope XFixes publishes here too.
     cursor_live: Arc<std::sync::Mutex<Option<pf_frame::CursorOverlay>>>,
+    /// The host forwards or blends [`Self::cursor_live`] itself, so the CPU copy must not
+    /// bake the pointer into its pixels as well. Set by [`Capturer::set_cursor_forward`].
+    host_places_cursor: Arc<AtomicBool>,
     /// Packed `(w << 32) | h`; `0` until `param_changed`. Gamescope cursor
     /// maps root-space into frame space (`-w/-h` vs `-W/-H` are independent).
     frame_size: Arc<std::sync::atomic::AtomicU64>,
@@ -139,10 +180,11 @@ impl CaptureSignals {
             driving: Arc::new(AtomicBool::new(false)),
             broken: Arc::new(AtomicBool::new(false)),
             errored: Arc::new(AtomicBool::new(false)),
-            resent: Arc::new(AtomicBool::new(false)),
+            resent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             hdr_negotiated: Arc::new(AtomicBool::new(false)),
             gpu_dmabuf_offer: Arc::new(AtomicBool::new(false)),
             cursor_live: Arc::new(std::sync::Mutex::new(None)),
+            host_places_cursor: Arc::new(AtomicBool::new(false)),
             frame_size: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             importer: Arc::new(std::sync::Mutex::new(None)),
             has_importer: Arc::new(AtomicBool::new(false)),
@@ -153,16 +195,22 @@ impl CaptureSignals {
 /// Portal + PipeWire capturer, reused across streams. [`set_active`] gates
 /// the per-frame de-pad so the screencast stays up between reconnects.
 pub struct PortalCapturer {
-    slot: FrameSlot,
-    /// Wakeup only — the slot holds the frame, so a coalesced edge loses
+    /// Arrivals awaiting their renders. The wait on a render runs on this side, never on
+    /// the PipeWire thread: that one hands the producer's buffers back.
+    queue: pipewire::FrameQueue,
+    /// Wakeup only — the queue holds the frames, so a coalesced edge loses
     /// nothing. Sender dies with the PipeWire thread (`Disconnected`).
     wake: Receiver<()>,
+    /// Arrival to take, per frame (`PUNKTFUNK_PERF`).
+    fence_wait: pipewire::FenceWaitStats,
     signals: CaptureSignals,
+    /// `signals.resent` as of the last [`Capturer::take_reference_risk`].
+    resent_acked: u64,
     /// First drop out of `Streaming` with no frame. Grace for a transient
     /// renegotiation; cleared on a frame or when `Streaming` again.
     stall_since: Option<std::time::Instant>,
     /// Raw-dmabuf passthrough offer, copied from the thread's
-    /// [`NegotiationPlan`](pipewire::NegotiationPlan) — never re-derived.
+    /// [`NegotiationPlan`](pipewire::plan::NegotiationPlan) — never re-derived.
     /// A failed offer latches this capture's [`pf_zerocopy::ZeroCopyHealth`].
     vaapi_dmabuf: bool,
     /// CUDA import choices for held frames ([`Self::import_held`]).
@@ -187,8 +235,9 @@ pub struct PortalCapturer {
     /// the next pipeline builds.
     join: Option<thread::JoinHandle<()>>,
     /// Virtual output; its `Drop` releases the compositor output. `None` on
-    /// the portal path (the portal thread closes its session).
-    _keepalive: Option<Box<dyn Send>>,
+    /// the portal path (the portal thread closes its session), or once a
+    /// capture-only rebuild took it back (`take_keepalive`).
+    keepalive: Option<Box<dyn Send>>,
     /// Portal-thread teardown. `None` on the virtual-output path. Its `Drop`
     /// ends the compositor's screencast.
     _portal: Option<PortalSession>,
@@ -239,7 +288,7 @@ impl PortalCapturer {
     /// inherits that grant (no second dialog). `false` is a plain ScreenCast
     /// (wlroots has no RemoteDesktop portal). `want_metadata_cursor` asks
     /// for `SPA_META_Cursor` vs compositor-embedded pointer
-    /// (`portal::choose_cursor_mode`).
+    /// ([`crate::portal_rt::negotiate_cursor_mode`]).
     pub fn open(
         anchored: bool,
         want_hdr: bool,
@@ -252,11 +301,7 @@ impl PortalCapturer {
         let join = thread::Builder::new()
             .name("punktfunk-portal".into())
             .spawn(move || {
-                if anchored {
-                    portal_thread_remote_desktop(setup_tx, quit_rx, want_metadata_cursor)
-                } else {
-                    portal_thread(setup_tx, quit_rx, want_metadata_cursor)
-                }
+                portal_thread(setup_tx, quit_rx, want_metadata_cursor, anchored);
                 // After the fn closed its portal session, so `Drop`'s
                 // `recv_timeout` means the cast is gone. Covers early returns.
                 let _ = done_tx.send(());
@@ -307,72 +352,62 @@ impl PortalCapturer {
     }
 
     /// Capturer for an already-created virtual output's PipeWire node.
-    /// The host supplies producer contracts because node ids do not identify
-    /// a compositor. `keepalive` releases the output with the capturer.
-    #[allow(clippy::too_many_arguments)]
+    /// `opts.producer` supplies the producer contracts a node id cannot reveal.
+    /// `keepalive` releases the output with the capturer.
     pub fn from_virtual_output(
         remote_fd: Option<OwnedFd>,
         node_id: u32,
         preferred_mode: Option<(u32, u32, u32)>,
         keepalive: Box<dyn Send>,
-        allow_zerocopy: bool,
-        want_444: bool,
-        want_hdr: bool,
-        ten_bit_sdr: bool,
-        policy: ZeroCopyPolicy,
-        expect_exact_dims: bool,
-        cursor_id0_hides: bool,
-        producer_is_gamescope: bool,
-        pool_min: i32,
-        pool_max: Option<i32>,
-        unpaced: bool,
+        opts: super::VirtualOutputOpts,
     ) -> Result<PortalCapturer> {
+        let kwin = opts.producer == super::Producer::Kwin;
+        let capture = CaptureOpts {
+            allow_zerocopy: opts.allow_zerocopy,
+            want_444: opts.want_444,
+            want_hdr: opts.want_hdr,
+            ten_bit_sdr: opts.ten_bit_sdr,
+            expect_exact_dims: opts.expect_exact_dims,
+            cursor_id0_hides: kwin,
+            producer_is_gamescope: opts.producer == super::Producer::Gamescope,
+            pool_min: if kwin {
+                crate::KWIN_POOL_MIN
+            } else {
+                crate::POOL_MIN
+            },
+            pool_max: kwin.then_some(crate::KWIN_POOL_MAX),
+            unpaced: kwin && crate::unpaced_capture(),
+            lazy: crate::lazy_capture(),
+        };
         tracing::info!(
             node_id,
-            allow_zerocopy,
-            want_444,
-            want_hdr,
-            expect_exact_dims,
-            cursor_id0_hides,
-            producer_is_gamescope,
-            pool_min,
-            ?pool_max,
-            unpaced,
+            allow_zerocopy = capture.allow_zerocopy,
+            want_444 = capture.want_444,
+            want_hdr = capture.want_hdr,
+            expect_exact_dims = capture.expect_exact_dims,
+            producer = ?opts.producer,
+            pool_min = capture.pool_min,
+            pool_max = ?capture.pool_max,
+            unpaced = capture.unpaced,
             "connecting PipeWire to virtual output"
         );
         // Virtual outputs are SDR-only except a gamescope node from our
         // `pipewire-hdr` build — the host checks before Welcome
         // (`capture::capturer_supports_hdr_for`).
-        Ok(spawn_pipewire(
-            remote_fd,
-            node_id,
-            preferred_mode,
-            CaptureOpts {
-                allow_zerocopy,
-                want_444,
-                want_hdr,
-                ten_bit_sdr,
-                expect_exact_dims,
-                cursor_id0_hides,
-                producer_is_gamescope,
-                pool_min,
-                pool_max,
-                unpaced,
-                lazy: crate::lazy_capture(),
-            },
-            policy,
-        )?
-        .into_capturer(
-            node_id,
-            Some(keepalive),
-            None,
-            super::HdrSource::VirtualOutput,
-        ))
+        Ok(
+            spawn_pipewire(remote_fd, node_id, preferred_mode, capture, opts.policy)?
+                .into_capturer(
+                    node_id,
+                    Some(keepalive),
+                    None,
+                    super::HdrSource::VirtualOutput,
+                ),
+        )
     }
 }
 
 struct PwHandles {
-    slot: FrameSlot,
+    queue: pipewire::FrameQueue,
     wake: Receiver<()>,
     signals: CaptureSignals,
     vaapi_dmabuf: bool,
@@ -396,9 +431,11 @@ impl PwHandles {
         hdr_source: super::HdrSource,
     ) -> PortalCapturer {
         PortalCapturer {
-            slot: self.slot,
+            queue: self.queue,
             wake: self.wake,
+            fence_wait: Default::default(),
             signals: self.signals,
+            resent_acked: 0,
             stall_since: None,
             vaapi_dmabuf: self.vaapi_dmabuf,
             import_policy: self.import_policy,
@@ -410,7 +447,7 @@ impl PwHandles {
             node_id,
             quit: Some(self.quit),
             join: Some(self.join),
-            _keepalive: keepalive,
+            keepalive,
             _portal: portal,
             _gs_cursor: None,
         }
@@ -435,9 +472,9 @@ fn spawn_pipewire(
         ..
     } = opts;
     // Wakeup edges only; depth 1 is right — a coalesced edge loses nothing
-    // because the slot holds the frame.
-    let slot: FrameSlot = Arc::new(std::sync::Mutex::new(None));
-    let slot_cb = slot.clone();
+    // because the queue holds the frames.
+    let queue = pipewire::FrameQueue::default();
+    let queue_cb = queue.clone();
     let (wake_tx, wake_rx) = sync_channel::<()>(1);
     // Portal-fd vs virtual-output with the same node number are different sources.
     let identity = u64::from(node_id) | (u64::from(fd.is_some()) << 32);
@@ -488,7 +525,7 @@ fn spawn_pipewire(
             if let Err(e) = pipewire::pipewire_thread(
                 fd,
                 node_id,
-                slot_cb,
+                queue_cb,
                 wake_tx,
                 signals_cb,
                 plan,
@@ -503,7 +540,7 @@ fn spawn_pipewire(
         })
         .context("spawn pipewire thread")?;
     Ok(PwHandles {
-        slot,
+        queue,
         wake: wake_rx,
         signals,
         vaapi_dmabuf,
@@ -527,6 +564,14 @@ impl Capturer for PortalCapturer {
             .lock()
             .ok()
             .and_then(|slot| slot.clone())
+    }
+
+    fn set_cursor_forward(&mut self, _on: bool) {
+        // Either way the host places the pointer from `cursor()`: forwarded, or on the frame
+        // for the encoder blend.
+        self.signals
+            .host_places_cursor
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn attach_gamescope_cursor(&mut self, targets: crate::GamescopeCursorTargets) {
@@ -558,24 +603,17 @@ impl Capturer for PortalCapturer {
     }
 
     fn wait_arrival(&mut self, deadline: std::time::Instant) {
-        // Must not consume: observe the slot, leave the frame for `try_latest`.
-        // Broken/ended: return; `try_latest` surfaces the error. A driven producer
-        // paints on its own requests (`pipewire::Pacer`), so this never triggers.
-        if self.signals.broken.load(Ordering::Relaxed) {
-            return;
+        // A driven producer paints on its own requests (`pipewire::pacer::Pacer`), so
+        // this wait never triggers a paint. It returns on a finished render, not on an
+        // arrival: the producer sends a buffer before it has painted it.
+        if !self.signals.broken.load(Ordering::Relaxed) {
+            let _ = pipewire::wait_ready(&self.queue, &self.wake, deadline);
         }
-        loop {
-            if self.slot.lock().is_ok_and(|s| s.is_some()) {
-                return;
-            }
-            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
-                return;
-            };
-            // Timeout or a dead producer: stop waiting; `try_latest` classifies.
-            if self.wake.recv_timeout(left).is_err() {
-                return;
-            }
-        }
+    }
+
+    /// Only the virtual-output path holds one; the portal thread owns its own session.
+    fn take_keepalive(&mut self) -> Option<Box<dyn Send>> {
+        self.keepalive.take()
     }
 
     fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
@@ -584,29 +622,11 @@ impl Capturer for PortalCapturer {
                 "zero-copy GPU import lost (node {}): the import worker died or tiled imports \
                  failed repeatedly — rebuilding capture",
                 self.node_id
-            ));
+            )
+            .context(super::DisplayStillAlive));
         }
-        if self.signals.resent.load(Ordering::Relaxed) {
-            return Err(anyhow!(
-                "producer re-sent a held buffer (node {}): the pool is a buffer short until the \
-                 stream is rebuilt — rebuilding capture",
-                self.node_id
-            ));
-        }
-        // Drain wakeup edges first — stale ones must not make the next
-        // `wait_arrival` return early. `Disconnected` is a dead thread;
-        // a leftover frame is still served first.
-        let mut producer_gone = false;
-        loop {
-            match self.wake.try_recv() {
-                Ok(()) => continue,
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    producer_gone = true;
-                    break;
-                }
-            }
-        }
+        // A dead thread's leftover frame is still served first.
+        let producer_gone = drain_edges(&self.wake);
         let latest = self.take_frame();
         if producer_gone && latest.is_none() {
             return Err(anyhow!("PipeWire capture thread ended"));
@@ -637,8 +657,8 @@ impl Capturer for PortalCapturer {
             // Flush: a reused capturer would hand the next stream the previous
             // session's last frame (`pts_ns` from the old clock). Producer
             // stops publishing while inactive.
-            if let Ok(mut slot) = self.slot.lock() {
-                *slot = None;
+            if let Ok(mut queue) = self.queue.lock() {
+                queue.clear();
             }
             // Else a leftover `Instant` expires the 1500 ms grace on the first
             // `try_latest` of a stream that has been running for microseconds.
@@ -651,9 +671,17 @@ impl Capturer for PortalCapturer {
     /// static desktop stays `Streaming` (no buffers) and is not reported dead.
     fn is_alive(&self) -> bool {
         !self.signals.broken.load(Ordering::Relaxed)
-            && !self.signals.resent.load(Ordering::Relaxed)
             && self.signals.streaming.load(Ordering::Relaxed)
             && self.join.as_ref().is_some_and(|j| !j.is_finished())
+    }
+
+    /// A re-sent buffer since the last call: the frame encoded from the earlier read may be
+    /// torn, so the loop refreshes the reference with one IDR.
+    fn take_reference_risk(&mut self) -> bool {
+        let n = self.signals.resent.load(Ordering::Relaxed);
+        let risk = n != self.resent_acked;
+        self.resent_acked = n;
+        risk
     }
 
     /// Standard HDR10 default block once 10-bit PQ negotiated. Neither Linux
@@ -743,7 +771,7 @@ impl PortalCapturer {
                     self.node_id
                 ));
             }
-            // Slot before wakeup: a coalesced edge (or a publish while we
+            // Queue before wakeup: a coalesced edge (or a publish while we
             // were not waiting) is still visible.
             if let Some(f) = self.take_frame() {
                 self.note_negotiation_confirmed();
@@ -756,22 +784,31 @@ impl PortalCapturer {
             }
             let slice = Duration::from_millis(500)
                 .min(deadline.saturating_duration_since(std::time::Instant::now()));
-            match self.wake.recv_timeout(slice) {
-                Ok(()) => continue,
-                Err(RecvTimeoutError::Timeout) if std::time::Instant::now() < deadline => continue,
-                Err(e) => {
-                    // A last frame can sit in the slot even as the producer exits.
-                    if let Some(f) = self.take_frame() {
-                        return Ok(f);
-                    }
-                    return self.next_frame_timed_out(e, budget, verdict);
-                }
+            let until = std::time::Instant::now() + slice;
+            let end = if !pipewire::wait_ready(&self.queue, &self.wake, until) {
+                RecvTimeoutError::Disconnected
+            } else if std::time::Instant::now() >= deadline {
+                RecvTimeoutError::Timeout
+            } else {
+                continue;
+            };
+            // A last frame can sit in the queue even as the producer exits.
+            if let Some(f) = self.take_frame() {
+                return Ok(f);
             }
+            return self.next_frame_timed_out(end, budget, verdict);
         }
     }
 
+    /// The next frame whose render finished; a frame it passes over goes back to the producer.
     fn take_frame(&mut self) -> Option<CapturedFrame> {
-        let frame = self.slot.lock().ok().and_then(|mut s| s.take())?;
+        let taken = self
+            .queue
+            .lock()
+            .ok()?
+            .take_ready(std::time::Instant::now())?;
+        self.fence_wait.took(&taken);
+        let frame = taken.frame;
         if self.vaapi_dmabuf
             || self.raw_for_encoder
             || !matches!(frame.payload, FramePayload::Dmabuf(_))
@@ -965,18 +1002,20 @@ pub struct WlCapturer {
     output_name: String,
     quit: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
-    /// Holds the compositor output; dropped after the thread is joined.
-    _keepalive: Box<dyn Send>,
+    /// Holds the compositor output; dropped after the thread is joined, unless a
+    /// capture-only rebuild took it back (`take_keepalive`).
+    keepalive: Option<Box<dyn Send>>,
 }
 
 impl WlCapturer {
     /// Open the named compositor output with identity-scoped failure health.
-    /// Missing protocol/output or no consumer-importable dmabuf keeps the portal path.
+    /// Missing protocol/output or no consumer-importable dmabuf keeps the portal path,
+    /// so a failure hands `keepalive` back for it.
     pub fn open(
         output_name: String,
         keepalive: Box<dyn Send>,
         policy: ZeroCopyPolicy,
-    ) -> Result<WlCapturer> {
+    ) -> std::result::Result<WlCapturer, (anyhow::Error, Box<dyn Send>)> {
         let slot: FrameSlot = Arc::new(std::sync::Mutex::new(None));
         use std::hash::{Hash, Hasher};
         let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -984,7 +1023,10 @@ impl WlCapturer {
         let identity = health_identity(hash.finish() | (1 << 63), &policy);
         let signals = CaptureSignals::new(pf_zerocopy::zero_copy_health(identity));
         signals.active.store(true, Ordering::Relaxed);
-        let h = wl_capture::spawn(output_name.clone(), policy, slot, signals)?;
+        let h = match wl_capture::spawn(output_name.clone(), policy, slot, signals) {
+            Ok(h) => h,
+            Err(e) => return Err((e, keepalive)),
+        };
         Ok(WlCapturer {
             slot: h.slot,
             wake: h.wake,
@@ -992,7 +1034,7 @@ impl WlCapturer {
             output_name,
             quit: h.quit,
             join: Some(h.join),
-            _keepalive: keepalive,
+            keepalive: Some(keepalive),
         })
     }
 
@@ -1042,21 +1084,7 @@ impl Capturer for WlCapturer {
     }
 
     fn wait_arrival(&mut self, deadline: std::time::Instant) {
-        // Must not consume: the frame stays for `try_latest`.
-        if self.signals.broken.load(Ordering::Relaxed) {
-            return;
-        }
-        loop {
-            if self.slot.lock().is_ok_and(|s| s.is_some()) {
-                return;
-            }
-            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
-                return;
-            };
-            if self.wake.recv_timeout(left).is_err() {
-                return;
-            }
-        }
+        wait_for_frame(&self.slot, &self.wake, &self.signals.broken, deadline);
     }
 
     fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
@@ -1066,9 +1094,14 @@ impl Capturer for WlCapturer {
                 self.output_name
             ));
         }
-        // Drain stale edges so the next `wait_arrival` cannot return early.
-        while self.wake.try_recv().is_ok() {}
-        Ok(self.take_frame())
+        // A thread that ended without a failure (the compositor stopped the
+        // session) fails here too, after its leftover frame, so the loop rebuilds.
+        let producer_gone = drain_edges(&self.wake);
+        let latest = self.take_frame();
+        if producer_gone && latest.is_none() {
+            return Err(anyhow!("direct wayland capture thread ended"));
+        }
+        Ok(latest)
     }
 
     fn cursor(&mut self) -> Option<pf_frame::CursorOverlay> {
@@ -1078,6 +1111,10 @@ impl Capturer for WlCapturer {
     fn is_alive(&self) -> bool {
         !self.signals.broken.load(Ordering::Relaxed)
             && self.join.as_ref().is_some_and(|j| !j.is_finished())
+    }
+
+    fn take_keepalive(&mut self) -> Option<Box<dyn Send>> {
+        self.keepalive.take()
     }
 }
 
@@ -1108,10 +1145,10 @@ impl Drop for PortalCapturer {
 // not per-frame. `gnome_hdr_monitor_active` is re-exported from `lib.rs`.
 mod portal;
 pub use portal::gnome_hdr_monitor_active;
-use portal::{portal_thread, portal_thread_remote_desktop};
+use portal::portal_thread;
 
-// PipeWire consumer (`!Send`, owns its thread). Directory `mod pipewire`
-// resolves to `linux/pipewire.rs`; `super` inside still means `linux`.
+// PipeWire consumer (`!Send`, owns its thread). Inner `mod pipewire` shadows
+// the crate, hence `::pipewire` in this file.
 mod pipewire;
 // Client-allocated dmabufs for the direct capture path.
 mod gbm_pool;
@@ -1121,6 +1158,8 @@ mod wl_capture;
 // to unit-test without a compositor.
 mod pw_cursor;
 mod pw_pods;
+// Explicit sync (`SPA_META_SyncTimeline`): syncobj waits and release signals.
+mod sync_timeline;
 
 #[cfg(test)]
 mod first_frame_timeout_tests {
@@ -1203,5 +1242,36 @@ mod first_frame_timeout_tests {
             classify_first_frame_timeout(false, false, true, true, true),
             TimeoutOffer::NoFormat
         );
+    }
+}
+
+#[cfg(test)]
+mod wl_capturer_tests {
+    use super::{CaptureSignals, Capturer, WlCapturer};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc::sync_channel;
+    use std::sync::Arc;
+
+    /// A thread that ended cleanly drops its wake sender. `try_latest` must say so,
+    /// or the encode loop repeats the last frame and never rebuilds capture.
+    #[test]
+    fn try_latest_reports_an_ended_thread() {
+        let (edge, wake) = sync_channel::<()>(1);
+        let mut cap = WlCapturer {
+            slot: Arc::default(),
+            wake,
+            signals: CaptureSignals::new(pf_zerocopy::zero_copy_health(u64::MAX)),
+            output_name: "TEST-1".into(),
+            quit: Arc::new(AtomicBool::new(false)),
+            join: None,
+            keepalive: None,
+        };
+        edge.try_send(()).expect("empty channel");
+        assert!(
+            matches!(cap.try_latest(), Ok(None)),
+            "a live thread with no frame is idle"
+        );
+        drop(edge);
+        assert!(cap.try_latest().is_err());
     }
 }

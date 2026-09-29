@@ -9,7 +9,7 @@
 //! [`hdr_p010_selftest_at`] and [`hdr_p010_convert_bars_on_luid`] are re-exported
 //! by the parent so `crate::capture::dxgi::…` / `pf_capture::dxgi::…` keep resolving.
 //! Evidence: `f16_tests`, ignored `hdr_p010_selftest_intel_1080_live`,
-//! `docs-site/content/docs/hdr.md`.
+//! `docs-site/content/docs/(guide)/(streaming)/hdr.md`.
 
 use anyhow::{bail, Context, Result};
 use pf_encode_win::convert::HdrP010Converter;
@@ -452,14 +452,19 @@ pub fn hdr_p010_selftest_at(w: u32, h: u32, vendor: Option<u32>) -> Result<()> {
                 max_y_err = max_y_err.max((got - ry).abs());
             }
         }
-        // Cb/Cr only on flat 2×2 footprints; a mixed block has no single reference.
+        // Cb/Cr only where the [1 2 1] footprint (columns sx-1..=sx+1, clamped; both rows)
+        // is one flat colour; a mixed footprint has no single reference.
         let mut max_u_err = 0.0f64;
         let mut max_v_err = 0.0f64;
         for cy in 0..ch {
             for cx in 0..cw {
                 let (sx, sy) = (cx * 2, cy * 2);
-                let all_flat =
-                    (0..2).all(|dy| (0..2).all(|dx| flat[((sy + dy) * W + (sx + dx)) as usize]));
+                let at = pixel_rgb(sx, sy);
+                let all_flat = (0..2).all(|dy| {
+                    [sx.saturating_sub(1), sx, sx + 1]
+                        .iter()
+                        .all(|&x| flat[((sy + dy) * W + x) as usize] && pixel_rgb(x, sy + dy) == at)
+                });
                 if !all_flat {
                     continue;
                 }

@@ -41,9 +41,9 @@ const RAMP_START_KBPS: u32 = 5_000;
 const RAMP_STEP_BYTES: u64 = 16_000_000;
 /// Delivered ÷ offered under this is a wall.
 const RAMP_WALL_PCT: u64 = 90;
-/// Loss a refused step may carry and still be asked a second time. At the
-/// ramp's step sizes this is one packet — what independent loss puts in a
-/// dozen — where a policer's step arrives a tenth short or worse.
+/// Loss a refused step may carry and still be asked a second time: one
+/// packet — what independent loss puts in the first step's dozen — or this
+/// share of a larger step. A policer's step arrives a tenth short or worse.
 const RAMP_LOSS_SLACK_PCT: u64 = 5;
 /// What a wall licenses. A wall measured once is a snapshot of a link that
 /// moves — Wi-Fi by ±30 % — and the 30 % held back is what a 100 ms airtime
@@ -120,7 +120,7 @@ pub(crate) enum Ramped {
 
 impl Ramped {
     /// The rate the ramp proved the link carries, whichever way it ended.
-    fn proven_kbps(self) -> u32 {
+    pub(crate) fn proven_kbps(self) -> u32 {
         match self {
             Ramped::Wall { delivered_kbps } => delivered_kbps,
             Ramped::NoWall { proven_kbps } => proven_kbps,
@@ -172,6 +172,8 @@ pub enum RampStepEnd {
     ReachedMax { proven_kbps: u32 },
     /// The report never arrived, so nothing judged it.
     NoReport,
+    /// The host answered without sending: nothing will drain.
+    Declined,
 }
 
 /// What the ramp came to, for a test that pins its arithmetic.
@@ -188,9 +190,9 @@ pub struct RampSummary {
 
 /// What one settled step says.
 enum Verdict {
-    /// The link did not carry it. `timing_only` = what went missing is
-    /// inside [`RAMP_LOSS_SLACK_PCT`], so the reading rests on when the
-    /// packets arrived rather than on how many.
+    /// The link did not carry it. `timing_only` = what went missing is one
+    /// packet or inside [`RAMP_LOSS_SLACK_PCT`], so the reading rests on when
+    /// the packets arrived rather than on how many.
     Refused {
         delivered_kbps: u32,
         timing_only: bool,
@@ -260,17 +262,27 @@ struct Ramp {
     history: Vec<RampStep>,
 }
 
-/// What one step proves, kbps: its delivered bytes over the interval they
-/// arrived in, and never more than the step asked for.
+/// What one step proves, kbps of wire: its delivered bytes over the interval
+/// they arrived in, and never more than the step offered.
 ///
 /// The clamp is the whole of what a short step can honestly say. A 5 Mbps
 /// step is a dozen packets; whether the last one lands 6 ms or 15 ms after
 /// the first swings the implied rate 2.5× (rig, every profile), and an
 /// unclamped reading opened sessions on a rate no step ever offered.
+///
+/// What a step offered is its wire when that is more than it asked: filler
+/// frames are small, so parity and headers put a 10 Mbps step on the wire
+/// at ~17 Mbps, and a wall read against the asked rate sat a fifth under
+/// the link.
 fn step_rate_kbps(step: &Step, r: &ProbeReport) -> u32 {
     let us = u64::from(r.client_interval_us.max(1));
-    let rate = (r.delivered_bytes.saturating_mul(8_000) / us) as u32;
-    rate.min(step.target_kbps)
+    let rate = r.delivered_bytes.saturating_mul(8_000) / us;
+    // The host reports packets, not their size; what arrived carries it.
+    let per_packet = r.delivered_bytes / r.delivered_packets.max(1);
+    let wire =
+        (u64::from(r.wire_packets_sent) * per_packet).saturating_mul(8_000) / step.asked_us.max(1);
+    let offered = wire.max(u64::from(step.target_kbps));
+    rate.min(offered).min(u64::from(u32::MAX)) as u32
 }
 
 /// Did the link refuse what was offered? The legacy burst's version of the
@@ -380,8 +392,9 @@ impl Ramp {
 
     /// A step the link did not carry.
     ///
-    /// A step the link thinned by more than [`RAMP_LOSS_SLACK_PCT`] is
-    /// decisive: it dropped them, and no second reading makes that untrue.
+    /// A step the link thinned by more than one packet and more than
+    /// [`RAMP_LOSS_SLACK_PCT`] is decisive: it dropped them, and no second
+    /// reading makes that untrue.
     /// Inside the slack the verdict rests on WHEN the packets arrived, and a
     /// few milliseconds of scheduling on a 25 ms window is the difference
     /// between 0.86 and 0.91. So the same rate goes out once more and only a
@@ -448,8 +461,9 @@ impl Ramp {
         let delivered = r.delivered_packets * offered_span;
         let offered = u64::from(r.wire_packets_sent) * interval;
         if delivered * 100 < offered * RAMP_WALL_PCT {
-            let timing_only = r.delivered_packets * 100
-                >= u64::from(r.wire_packets_sent) * (100 - RAMP_LOSS_SLACK_PCT);
+            let sent = u64::from(r.wire_packets_sent);
+            let timing_only = r.delivered_packets + 1 >= sent
+                || r.delivered_packets * 100 >= sent * (100 - RAMP_LOSS_SLACK_PCT);
             tracing::info!(
                 target_kbps = step.target_kbps,
                 delivered_kbps,
@@ -471,7 +485,17 @@ impl Ramp {
     /// Fold a report into the step in flight. Reports repeat: the pump
     /// re-presents the probe state every iteration, and the bytes keep
     /// growing while the receive buffer drains.
+    ///
+    /// A step the host declined put nothing on the wire, so there is no drain
+    /// to wait for: it ends the ramp on the report, not on the step's deadline.
     fn on_report(&mut self, r: ProbeReport, now: Instant) {
+        if r.host_duration_ms == 0 && r.host_bytes_sent == 0 {
+            if let Some(step) = self.step.take() {
+                self.note(&step, Some(&r), RampStepEnd::Declined, now);
+                self.no_wall();
+            }
+            return;
+        }
         let Some(step) = self.step.as_mut() else {
             return;
         };
@@ -640,10 +664,11 @@ impl CapacityProbe {
         }
     }
 
-    /// A pinned session's ramp, sized by the pin it has to fit: the verdict
-    /// is a wall under `pin × 10/7` or the proof that none exists. `armed` is
-    /// `PUNKTFUNK_ABR_PROBE` plus the host's `HOST_CAP2_RAMP`; an old host
-    /// runs no measurement and keeps the pin it resolved.
+    /// A pinned session's ramp. It climbs to [`PINNED_RAMP_HEADROOM`] times
+    /// the pin: a wall under the pin sizes the pin, and the rate it proves is
+    /// what the host paces the stream at. `armed` is `PUNKTFUNK_ABR_PROBE`
+    /// plus the host's `HOST_CAP2_RAMP`; an old host runs no measurement and
+    /// keeps the pin it resolved.
     ///
     /// No burst follows: a cut-short ramp leaves the pin as it is rather
     /// than costing a started picture a measurement nobody would use.
@@ -656,7 +681,7 @@ impl CapacityProbe {
         CapacityProbe {
             // Never fired: `fire_at` stays `None` for a pinned session.
             target_kbps: 0,
-            ramp: armed.then(|| Ramp::new(ramp_max_kbps(pin_kbps, target_kbps), now)),
+            ramp: armed.then(|| Ramp::new(pinned_ramp_max_kbps(pin_kbps, target_kbps), now)),
             fire_at: None,
             result_by: None,
             active: false,
@@ -912,6 +937,19 @@ fn ramp_max_kbps(stream_cap_kbps: u32, env_kbps: Option<u32>) -> u32 {
     env_kbps.map_or(by_stream, |k| k.min(by_stream))
 }
 
+/// How far past its pin a pinned ramp climbs. The host paces a pinned
+/// stream at the rate the ramp proved, so the proof has to reach the link's
+/// rate, not the stream's: 8× takes a 1440p120 PyroWave pin to 10 GbE in
+/// three more steps.
+const PINNED_RAMP_HEADROOM: u32 = 8;
+
+/// A pinned ramp's ceiling: the pin times [`PINNED_RAMP_HEADROOM`], or
+/// `PUNKTFUNK_ABR_PROBE_KBPS` when it is lower.
+fn pinned_ramp_max_kbps(pin_kbps: u32, env_kbps: Option<u32>) -> u32 {
+    let by_pin = pin_kbps.saturating_mul(PINNED_RAMP_HEADROOM);
+    env_kbps.map_or(by_pin, |k| k.min(by_pin))
+}
+
 /// What the session opens at, given what the ramp proved: half of it, and
 /// never more than a clean picture at this mode wants. The caller floors it.
 ///
@@ -1104,6 +1142,15 @@ mod tests {
         );
     }
 
+    /// A pinned ramp climbs past the pin: the proof is what the host paces
+    /// the stream at. The env cap still binds.
+    #[test]
+    fn a_pinned_ramp_climbs_to_eight_times_the_pin() {
+        assert_eq!(pinned_ramp_max_kbps(778_000, None), 6_224_000);
+        assert_eq!(pinned_ramp_max_kbps(778_000, Some(320_000)), 320_000);
+        assert_eq!(pinned_ramp_max_kbps(u32::MAX, None), u32::MAX);
+    }
+
     /// Video is the end of the ramp, whatever step is in flight: from the
     /// first frame nothing the controller does may cost a picture (L4).
     #[test]
@@ -1134,6 +1181,29 @@ mod tests {
             rig.p.take_ramped(rig.now),
             Some(Ramped::NoWall { proven_kbps: 0 }),
             "nothing was measured, and nothing is claimed"
+        );
+    }
+
+    /// A step the host declined ends the ramp when the answer lands, with what
+    /// the steps before it proved — not 1.5 s later on the step's deadline.
+    #[test]
+    fn a_declined_step_ends_the_ramp_at_once() {
+        let mut rig = Rig::new(1_000_000, None);
+        assert_eq!(rig.step(1_000_000, u32::MAX), None);
+        rig.pending.take().expect("a second step went out");
+        let at = rig.at(5);
+        rig.p.on_result(ProbeReport::default(), at);
+        let Some(Ramped::NoWall { proven_kbps }) = rig.p.take_ramped(at) else {
+            panic!("a declined step ends the ramp with what it had")
+        };
+        assert!(proven_kbps >= 4_000, "step one still counts: {proven_kbps}");
+        assert!(
+            rig.p.ramp_cut_short(),
+            "nothing above step one was measured"
+        );
+        assert_eq!(
+            rig.p.ramp_steps().last().map(|s| s.end),
+            Some(RampStepEnd::Declined)
         );
     }
 
@@ -1224,6 +1294,9 @@ mod tests {
         for (sent, delivered, again) in [
             (24u32, 24u64, true),
             (24, 23, true),
+            // The first step's dozen: one packet is 8 % of it.
+            (12, 11, true),
+            (12, 10, false),
             (60, 53, false),
             (112, 55, false),
         ] {
@@ -1264,13 +1337,14 @@ mod tests {
     /// one step alone must never open a session above the 20 000 it would
     /// have opened at with no measurement at all.
     #[test]
-    fn a_step_cannot_prove_more_than_it_asked_for() {
+    fn a_step_cannot_prove_more_than_it_offered() {
         let mut rig = Rig::new(46_656, None);
         let (target, duration_ms) = rig.p.poll(rig.now, 0, 0).expect("the first step");
         assert_eq!(target, RAMP_START_KBPS);
-        // The rig's own numbers: a 5 Mbps step's bytes, all of them, in 6 ms.
+        // The rig's own numbers: a 5 Mbps step's 24 wire packets, all of them,
+        // in 6 ms. Filler parity puts 11 120 kbps of it on the wire.
         let r = ProbeReport {
-            delivered_bytes: 15_624,
+            delivered_bytes: 34_752,
             delivered_packets: 24,
             window_ms: 6,
             host_duration_ms: duration_ms,
@@ -1291,13 +1365,49 @@ mod tests {
             panic!("one step, cut short by video, proves no wall")
         };
         assert_eq!(
-            proven_kbps, RAMP_START_KBPS,
-            "20 Mbps of arithmetic from a 5 Mbps step"
+            proven_kbps, 11_120,
+            "the wire the step offered, not 46 Mbps of arithmetic from its 6 ms"
         );
         assert!(
             ramp_start_kbps(proven_kbps, 46_656) < 20_000,
             "a one-step ramp must not open a session above the unmeasured rate"
         );
+    }
+
+    /// A wall is what the link carried of the step's wire. The rig's tunnel
+    /// (12.5 Mbit) refused a 10 Mbps step whose filler put 16.7 Mbps on the
+    /// wire, twice, delivering 35 of 36 packets in 34 ms each time: the link
+    /// carried 11.9 Mbps, and a wall read as the asked 10 Mbps sat a fifth low.
+    #[test]
+    fn a_wall_is_the_wire_the_link_carried() {
+        let mut rig = Rig::new(93_312, None);
+        let report = |packets: u64, sent: u32, bytes: u64, us: u32, asked: u32| ProbeReport {
+            delivered_bytes: bytes,
+            delivered_packets: packets,
+            window_ms: us / 1_000,
+            host_duration_ms: 25,
+            client_interval_ms: us / 1_000,
+            client_interval_us: us,
+            host_bytes_sent: u64::from(asked) * 25 / 8,
+            wire_packets_sent: sent,
+            send_dropped: 0,
+        };
+        let (first, _) = rig.p.poll(rig.now, 0, 0).expect("the first step");
+        let at = rig.at(20);
+        rig.p.on_result(report(24, 24, 34_752, 20_000, first), at);
+        let at = rig.at(RAMP_DRAIN_MS + 1);
+        let (second, _) = rig.p.poll(at, 0, 0).expect("the second step");
+        assert_eq!(second, 10_000);
+        for _ in 0..2 {
+            let at = rig.at(34);
+            rig.p.on_result(report(35, 36, 50_680, 34_000, second), at);
+            let at = rig.at(RAMP_DRAIN_MS + 1);
+            rig.p.poll(at, 0, 0);
+        }
+        let Some(Ramped::Wall { delivered_kbps }) = rig.p.take_ramped(rig.now) else {
+            panic!("refused twice is a wall")
+        };
+        assert_eq!(delivered_kbps, 11_924, "not the asked 10 000");
     }
 
     /// A ramp cut short by video hands the job to the legacy burst: it leaves

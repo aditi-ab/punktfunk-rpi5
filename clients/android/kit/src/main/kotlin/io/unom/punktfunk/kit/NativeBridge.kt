@@ -101,6 +101,9 @@ object NativeBridge {
         standard: Int,
     )
 
+    /** One `pf.display` line in the log ring above, as written: the displays and fold features. */
+    external fun nativeLogDisplay(line: String)
+
     /**
      * The machine token of the most recent failed [nativeConnect]/[nativePair], cleared on read
      * (`""` when none) — call right after a `0` handle / `""` fingerprint. A typed host rejection
@@ -208,8 +211,9 @@ object NativeBridge {
 
     /**
      * The MediaCodec MIME the host resolved for this session (`"video/hevc"` / `"video/avc"` /
-     * `"video/av01"`), or `""` on a `0` handle. Kotlin ranks `MediaCodecList` decoders for this
-     * MIME (see [io.unom.punktfunk.kit.VideoDecoders]) before [nativeStartVideo]. Cheap; UI-safe.
+     * `"video/av01"`), or `""` on a `0` or closed handle. Kotlin ranks `MediaCodecList` decoders
+     * for this MIME (see [io.unom.punktfunk.kit.VideoDecoders]) before [nativeStartVideo]. Cheap;
+     * UI-safe.
      */
     external fun nativeVideoMime(handle: Long): String
 
@@ -265,6 +269,9 @@ object NativeBridge {
         lowLatencyMode: Boolean,
         lowLatencyFeature: Boolean,
         isTv: Boolean,
+        /** ChromeOS (`org.chromium.arc`): present through [surface] itself, never an
+         *  ASurfaceControl child layer, which ARC accepts but Chrome can leave undrawn. */
+        chromeOs: Boolean,
         presentPriority: Int,
         smoothBuffer: Int,
         /** The display mode's own refresh rate (0 = unknown) — the latch grid the presenter
@@ -677,7 +684,8 @@ object NativeBridge {
      * Block up to ~100 ms for the next HID-output event, written into [buf] (a direct ByteBuffer,
      * capacity >= 128) as `[pad][kind][fields…]` (leading pad = the wire pad index to route to):
      * Led=pad 01 r g b, PlayerLeds=pad 02 bits, Trigger=pad 03 which effect…, raw as-is
-     * passthrough report=pad 05 kind report-bytes (kind 0 = output report, 1 = feature report).
+     * passthrough report=pad 05 kind report-bytes (kind 0 = output report, 1 = feature report),
+     * MicLed=pad 07 mode.
      * Returns the byte count, or -1 on timeout / session closed.
      */
     external fun nativeNextHidout(handle: Long, buf: java.nio.ByteBuffer): Int
@@ -737,8 +745,9 @@ object NativeBridge {
 
     /**
      * A discrete menu event: 0..3 move up/down/left/right, 4 confirm, 5 back, 6 secondary (Y),
-     * 7 tertiary (X), 8 jump back (L1), 9 jump forward (R1). For input that is already an event on
-     * this side (a TV remote's D-pad keys, the touch legend).
+     * 7 tertiary (X), 8 jump back (L1), 9 jump forward (R1), 10/11 a remote's OK down/up (acts on
+     * release; held, it opens the card's menu). For input that is already an event on this side
+     * (a TV remote's D-pad keys, the touch legend).
      */
     external fun nativeConsoleMenu(handle: Long, event: Int)
 
@@ -802,6 +811,12 @@ object NativeBridge {
 
     /** A one-shot toast from a service worker. */
     external fun nativeConsoleNotice(handle: Long, text: String)
+
+    /** `[{"heading", "text"}]`: what this app bundles, for the console's Licences screen. */
+    external fun nativeConsoleSetLicenses(handle: Long, json: String)
+
+    /** `{"held": [..], "axes": [[name, v]]}`: the pad's reading while the input test is on. */
+    external fun nativeConsoleSetPadTest(handle: Long, json: String)
 
     /** A library fetch is starting for the shelf on screen (bumps the epoch, sets Loading). */
     external fun nativeConsoleLibraryBegin(handle: Long)
