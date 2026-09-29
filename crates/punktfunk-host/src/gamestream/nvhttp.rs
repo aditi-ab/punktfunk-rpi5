@@ -163,7 +163,7 @@ async fn require_paired(State(st): State<Arc<AppState>>, req: Request, next: Nex
     if gate_for(path) == Some(Gate::PairedAsset) {
         StatusCode::FORBIDDEN.into_response()
     } else {
-        xml(error_xml()).into_response()
+        xml(error_xml(NOT_PAIRED)).into_response()
     }
 }
 
@@ -239,16 +239,16 @@ async fn launch_under(
     conflict: crate::vdisplay::policy::ModeConflict,
 ) -> Response {
     // GRANT_LAUNCH + unexpired, besides pairing. GameStream has no join of an owner-launched
-    // session, and no reject vocabulary — the client sees the generic error XML.
+    // session and no reject codes; the client shows the refusal's `status_message`.
     match peer_grants(&peer, &st) {
         Some(g) if g & GRANT_LAUNCH != 0 => {}
         Some(_) => {
             tracing::warn!("launch rejected — this client's access grants do not include Launch");
-            return xml(error_xml()).into_response();
+            return xml(error_xml(NO_LAUNCH)).into_response();
         }
         None => {
             tracing::warn!("launch rejected — this client's access has expired");
-            return xml(error_xml()).into_response();
+            return xml(error_xml(EXPIRED)).into_response();
         }
     }
     let req_fp: Option<[u8; 32]> = peer_fp(&peer);
@@ -270,7 +270,7 @@ async fn launch_under(
                     why,
                     "GameStream launch REJECTED — the session belongs to another client"
                 );
-                return (StatusCode::SERVICE_UNAVAILABLE, xml(error_xml())).into_response();
+                return (StatusCode::SERVICE_UNAVAILABLE, xml(error_xml(BUSY))).into_response();
             }
         }
     }
@@ -309,7 +309,7 @@ async fn launch_under(
         }
         Err(e) => {
             tracing::warn!(error = %format!("{e:#}"), "launch failed");
-            xml(error_xml()).into_response()
+            xml(error_xml(LAUNCH_FAILED)).into_response()
         }
     }
 }
@@ -325,16 +325,16 @@ async fn h_resume(
         Some(g) if g & GRANT_LAUNCH != 0 => {}
         Some(_) => {
             tracing::warn!("resume rejected — this client's access grants do not include Launch");
-            return xml(error_xml());
+            return xml(error_xml(NO_LAUNCH));
         }
         None => {
             tracing::warn!("resume rejected — this client's access has expired");
-            return xml(error_xml());
+            return xml(error_xml(EXPIRED));
         }
     }
     if !peer_may_control_session(&peer, &st) {
         tracing::warn!("resume rejected — caller does not own the session");
-        return xml(error_xml());
+        return xml(error_xml(NOT_OWNER));
     }
     // PLAY skips if `streaming` is still true, so clear the flags and wait for exit.
     let before = st.media_exited.load(std::sync::atomic::Ordering::SeqCst);
@@ -353,7 +353,7 @@ async fn h_resume(
     {
         let mut launch = st.launch.lock().unwrap();
         let Some(session) = launch.as_mut() else {
-            return xml(error_xml());
+            return xml(error_xml(NO_SESSION));
         };
         if q.contains_key("rikey") {
             match parse_rikey(&q) {
@@ -367,7 +367,7 @@ async fn h_resume(
                 }
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "resume rejected — malformed rikey");
-                    return xml(error_xml());
+                    return xml(error_xml(RESUME_FAILED));
                 }
             }
         }
@@ -393,11 +393,11 @@ async fn h_cancel(
     // (`peer_may_control_session`); denying it wedges the session they are ending.
     if peer_grants(&peer, &st).is_none() {
         tracing::warn!("cancel rejected — this client's access has expired");
-        return xml(error_xml());
+        return xml(error_xml(EXPIRED));
     }
     if !peer_may_control_session(&peer, &st) {
         tracing::warn!("cancel rejected — caller does not own the session");
-        return xml(error_xml());
+        return xml(error_xml(NOT_OWNER));
     }
     // `/cancel` is Quit App, not a drop: `quit_session` sets the quit flag so the virtual
     // display skips keep-alive linger and end-game policy treats it as operator intent.
@@ -613,9 +613,24 @@ fn pair_error_xml() -> String {
         .to_string()
 }
 
-fn error_xml() -> String {
-    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<root status_code=\"400\"></root>\n".to_string()
+/// Refusal XML. Moonlight puts `status_message` on screen after "Host PC returned error:".
+fn error_xml(message: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<root status_code=\"400\" status_message=\"{}\"></root>\n",
+        super::apps::xml_escape(message)
+    )
 }
+
+const NOT_PAIRED: &str = "This device isn't paired with the host. Pair it again from Moonlight.";
+const NO_LAUNCH: &str = "This device isn't allowed to start games on this host";
+const EXPIRED: &str =
+    "This device's access to the host has expired. Ask the host's owner to renew it.";
+const BUSY: &str = "Another device is streaming from this host. Try again when it finishes.";
+const LAUNCH_FAILED: &str =
+    "The host couldn't start this app. Refresh the app list, then try again.";
+const NOT_OWNER: &str = "This session belongs to another device";
+const NO_SESSION: &str = "There's no session to resume. Start the app again.";
+const RESUME_FAILED: &str = "The host couldn't resume this session. Start the app again.";
 
 #[cfg(test)]
 mod tests {
@@ -696,7 +711,7 @@ mod tests {
                     assert_eq!(status, StatusCode::OK, "{path}: the nvhttp error is a 200");
                     assert_eq!(
                         body,
-                        error_xml(),
+                        error_xml(NOT_PAIRED),
                         "{path} must answer a stranger with the error XML"
                     );
                 }
@@ -710,7 +725,11 @@ mod tests {
         // argument check (400, not the gate's 403).
         let (status, body) = drive(&st, "/applist", Some(pinned.clone())).await;
         assert_eq!(status, StatusCode::OK);
-        assert_ne!(body, error_xml(), "a pinned cert must not be rejected");
+        assert_ne!(
+            body,
+            error_xml(NOT_PAIRED),
+            "a pinned cert must not be rejected"
+        );
         let (status, _) = drive(&st, "/appasset", Some(pinned)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
