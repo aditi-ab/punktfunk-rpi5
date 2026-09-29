@@ -1267,7 +1267,11 @@ fn do_restore_tv_session(verify: bool) {
                 clear_takeover();
                 return;
             }
-            match issue_restore_verb(&["restart", STEAMOS_SESSION_TARGET]) {
+            // Our headless Steam may be under 60 s old; its stop must not count as a failure.
+            forget_host_short_sessions();
+            let restarted = issue_restore_verb(&["restart", STEAMOS_SESSION_TARGET]);
+            forget_host_short_sessions();
+            match restarted {
                 RestoreVerb::Done => tracing::info!(
                     "gamescope (SteamOS): restored the physical gaming session (removed headless \
                      override)"

@@ -119,6 +119,20 @@ static MANAGED_LAUNCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 const SESSION_UNIT: &str = "punktfunk-gamescope";
 const SESSION_PLUS_BIN: &str = "/usr/share/gamescope-session-plus/gamescope-session-plus";
 
+/// Game Mode's crash counters: a line per run that ends inside 60 s. [`SESSION_PLUS_BIN`]
+/// re-bootstraps Steam and switches to desktop at five; SteamOS's `steam-short-session-tracker`
+/// moves `~/.steam` aside at three. A run the host ends or restarts is never Steam failing.
+const SHORT_SESSION_TRACKERS: [&str; 2] = [
+    "/tmp/chimeraos-short-session-tracker",
+    "/tmp/steamos-short-session-tracker",
+];
+
+fn forget_host_short_sessions() {
+    for tracker in SHORT_SESSION_TRACKERS {
+        let _ = std::fs::remove_file(tracker);
+    }
+}
+
 /// SteamOS session launcher (not Bazzite session-plus). `gamescope-session.service` execs
 /// gamescope with hardcoded panel args. PATH-shim to `--backend headless -W <client> …` so
 /// Steam starts inside that headless compositor.
@@ -616,7 +630,10 @@ fn create_managed_session_steamos(mode: Mode, hdr: bool) -> Result<VirtualOutput
     let shim_dir = write_headless_shim()?;
     write_steamos_dropin(&shim_dir, mode, hdr)?;
     systemctl_user(&["daemon-reload"]);
+    // The restart's stop logs a line when Steam is under 60 s old; its start reads the count.
+    forget_host_short_sessions();
     systemctl_user(&["restart", STEAMOS_SESSION_TARGET]);
+    forget_host_short_sessions();
     t.steamos = true;
     drop(t); // `persist_takeover` takes the same lock
     persist_takeover();
@@ -1032,6 +1049,8 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
         }
     }
     let start_unit = |bind: Option<&SessionBind>| -> Result<()> {
+        // A relaunch follows our own failed run; its line must not count toward the box's reset.
+        forget_host_short_sessions();
         let mut cmd = Command::new("systemd-run");
         cmd.args(["--user", "--collect", &format!("--unit={unit_name}")]);
         for arg in bind.map(SessionBind::run_args).unwrap_or_default() {
@@ -1138,6 +1157,7 @@ fn unit_starting_or_active(unit: &str) -> bool {
 fn stop_session(unit_name: &str) {
     kill_unit(unit_name);
     let _ = std::fs::remove_file(ei_socket_file());
+    forget_host_short_sessions();
 }
 
 /// `$XDG_RUNTIME_DIR`, never world-writable `/tmp`: a second local user must not plant a rogue
