@@ -1,7 +1,7 @@
 //! GameStream audio data plane (UDP 48000). On RTSP PLAY we learn the client's
 //! endpoint from its port-learning ping, capture the default-sink monitor at the
-//! negotiated channel count, Opus-encode fixed frames, and send each as an RTP
-//! audio packet.
+//! negotiated channel count, Opus-encode fixed frames (or pass 16-bit PCM when
+//! Moonlight V+ asks for it), and send each as an RTP audio packet.
 //!
 //! Wire (moonlight-common-c `AudioStream.c` / `RtpAudioQueue.c`): 12-byte BE
 //! `RTP_PACKET` (`packetType = 97`, `sequenceNumber++`,
@@ -58,6 +58,8 @@ pub struct AudioParams {
     pub encrypt: bool,
     /// Capture must leave the host's own output playing (`localAudioPlayMode`).
     pub host_audio: bool,
+    /// 16-bit PCM instead of Opus: Moonlight V+ passthrough (`x-ml-audio.codec=pcm`).
+    pub pcm: bool,
 }
 
 impl Default for AudioParams {
@@ -68,6 +70,7 @@ impl Default for AudioParams {
             packet_duration_ms: 5,
             encrypt: false,
             host_audio: false,
+            pcm: false,
         }
     }
 }
@@ -282,6 +285,15 @@ fn audio_payload(opus: &[u8], aes_key: Option<&[u8; 16]>, iv_seq: u32) -> Vec<u8
     Aes128CbcEnc::new(key.into(), (&iv).into()).encrypt_padded_vec::<Pkcs7>(opus)
 }
 
+/// Interleaved f32 → clamped little-endian i16, what V+ writes straight into an Android
+/// `ENCODING_PCM_16BIT` track. Returns the bytes written.
+fn pcm_s16le(frame: &[f32], out: &mut [u8]) -> usize {
+    for (s, o) in frame.iter().zip(out.chunks_exact_mut(2)) {
+        o.copy_from_slice(&((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
+    }
+    frame.len() * 2
+}
+
 /// Longest capture wait per loop turn: how late a stop is seen.
 const STOP_POLL: Duration = Duration::from_millis(100);
 /// How far behind the pacer may fall before it re-anchors instead of catching up.
@@ -301,9 +313,15 @@ fn audio_body(
 ) -> Result<()> {
     let layout = layout_for(&params);
     // Hard CBR: FEC shards must be equal length, and the client asserts a constant
-    // per-stream TOC.
-    let mut enc = audio::OpusEnc::new(layout, layout.bitrate, audio::RateControl::HardCbr)
-        .context("create Opus encoder")?;
+    // per-stream TOC. PCM needs no encoder and is one size by construction.
+    let mut enc = if params.pcm {
+        None
+    } else {
+        Some(
+            audio::OpusEnc::new(layout, layout.bitrate, audio::RateControl::HardCbr)
+                .context("create Opus encoder")?,
+        )
+    };
     // Snap to a legal Opus frame (48 kHz × {5,10} ms = 240/480). Parse already
     // clamps; a bad value here would reach the encoder.
     let frame_ms = if params.packet_duration_ms >= 10 {
@@ -314,7 +332,7 @@ fn audio_body(
     let samples_per_channel = SAMPLE_RATE as usize * frame_ms / 1000;
     let frame_len = samples_per_channel * layout.channels as usize;
     let mut acc: Vec<f32> = Vec::with_capacity(frame_len * 4);
-    let mut out = vec![0u8; 1400];
+    let mut out = vec![0u8; (frame_len * 2).max(1400)];
     let mut seq: u16 = 0;
     let mut timestamp: u32 = 0;
     let mut sent: u64 = 0;
@@ -338,6 +356,7 @@ fn audio_body(
         bitrate = layout.bitrate,
         frame_ms,
         fec,
+        pcm = params.pcm,
         "audio: encoder configured"
     );
 
@@ -353,7 +372,10 @@ fn audio_body(
             if gain != 1.0 {
                 punktfunk_core::audio::apply_gain(&mut frame, gain);
             }
-            let n = enc.encode_float(&frame, &mut out).context("opus encode")?;
+            let n = match enc.as_mut() {
+                Some(enc) => enc.encode_float(&frame, &mut out).context("opus encode")?,
+                None => pcm_s16le(&frame, &mut out),
+            };
             let iv_seq = (rikeyid as u32).wrapping_add(seq as u32);
             let payload = audio_payload(&out[..n], aes_key, iv_seq);
             let pkt = build_rtp(seq, timestamp, &payload);
@@ -434,6 +456,13 @@ mod tests {
         assert_eq!(&p[4..8], &[0x03, 0x04, 0x05, 0x06]);
         assert_eq!(&p[8..12], &[0, 0, 0, 0]);
         assert_eq!(&p[12..], &[0xaa, 0xbb]);
+    }
+
+    #[test]
+    fn pcm_is_clamped_little_endian_i16() {
+        let mut out = [0u8; 8];
+        assert_eq!(pcm_s16le(&[0.0, 1.0, -1.0, 2.0], &mut out), 8);
+        assert_eq!(out, [0x00, 0x00, 0xff, 0x7f, 0x01, 0x80, 0xff, 0x7f]);
     }
 
     #[test]

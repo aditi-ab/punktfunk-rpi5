@@ -277,6 +277,13 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                 return response_status("401 Unauthorized", &req.cseq, &[], None);
             }
             let map = parse_announce(&req.body);
+            if let Err(codec) = audio_passthrough(&map) {
+                tracing::warn!(
+                    codec,
+                    "RTSP ANNOUNCE — refused: this host can't encode that audio passthrough codec"
+                );
+                return response_status("415 Unsupported Media Type", &req.cseq, &[], None);
+            }
             match stream_config(&map) {
                 Some(cfg) => {
                     tracing::info!(?cfg, "RTSP ANNOUNCE — negotiated stream config");
@@ -842,6 +849,18 @@ fn audio_params(map: &HashMap<String, String>, offer: EncOffer) -> audio::AudioP
         encrypt,
         // `/launch` carries it; PLAY fills it in.
         host_audio: false,
+        pcm: audio_passthrough(map) == Ok(true),
+    }
+}
+
+/// Moonlight V+'s passthrough ask (`x-ml-audio.codec`, absent for Opus): `Ok(true)` for 16-bit
+/// PCM, `Err` for a codec this host can't encode. Opus under another codec's label plays as
+/// noise or silence, so ANNOUNCE refuses those.
+fn audio_passthrough(map: &HashMap<String, String>) -> Result<bool, String> {
+    match map.get("x-ml-audio.codec").map(|s| s.trim()) {
+        None | Some("opus") => Ok(false),
+        Some("pcm" | "pcm_s16" | "s16") => Ok(true),
+        Some(other) => Err(other.to_string()),
     }
 }
 
@@ -1019,6 +1038,17 @@ mod tests {
             stream_type("rtsp://10.0.0.2:48010/streamid=bogus/0/0"),
             None
         );
+    }
+
+    /// Moonlight V+ passthrough: PCM is served, AC3/E-AC3 refused rather than sent Opus.
+    #[test]
+    fn announce_audio_passthrough() {
+        assert_eq!(audio_passthrough(&announce(&[])), Ok(false));
+        let pcm = announce(&[("x-ml-audio.codec", "pcm")]);
+        assert_eq!(audio_passthrough(&pcm), Ok(true));
+        assert!(audio_params(&pcm, EncOffer::Supported).pcm);
+        let ac3 = announce(&[("x-ml-audio.codec", "ac3")]);
+        assert_eq!(audio_passthrough(&ac3), Err("ac3".to_string()));
     }
 
     #[test]
