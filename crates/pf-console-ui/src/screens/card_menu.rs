@@ -286,9 +286,16 @@ impl CardMenu {
         a
     }
 
-    /// Host details, section by section. An empty section drops out.
+    /// Host details, section by section; the tab strip takes the sections in this order.
+    /// Power leads: sleep and shut down are the rows a player reaches for nightly, the
+    /// rest is set once. An empty section drops out.
     fn details(&self, host: &HostRow, store: &dyn SettingsStore) -> Vec<Action> {
-        let mut a = vec![Action::BindPreset];
+        let mut a = Vec::new();
+        if host.can_wake && !host.online {
+            a.push(Action::Wake);
+        }
+        a.extend((0..host.actions.len()).map(Action::Host));
+        a.push(Action::BindPreset);
         a.extend((0..store.presets().len()).map(Action::Pin));
         if host.paired && host.online {
             a.push(Action::SpeedTest);
@@ -302,10 +309,6 @@ impl CardMenu {
         if host.paired {
             a.push(Action::Unpair);
         }
-        if host.can_wake && !host.online {
-            a.push(Action::Wake);
-        }
-        a.extend((0..host.actions.len()).map(Action::Host));
         // Upload authenticates with the streaming cert and needs a live host.
         if host.paired && host.online {
             a.push(Action::SendLogs);
@@ -1211,6 +1214,21 @@ mod tests {
             go(&mut s, MenuEvent::JumpBack);
             assert_eq!(s.tab, 0, "L1 walks back from the rows");
         });
+    }
+
+    /// Power is the first tab when the host offers it: sleep is a nightly row, presets are
+    /// set once. A host with nothing to offer opens on Presets.
+    #[test]
+    fn power_leads_the_details_when_the_host_offers_it() {
+        let first = |h: &HostRow| details(h).sections(crate::store::file_store())[0];
+        assert_eq!(first(&powered()), "Power");
+        assert_eq!(first(&host()), "Presets");
+        let asleep = HostRow {
+            online: false,
+            can_wake: true,
+            ..host()
+        };
+        assert_eq!(first(&asleep), "Power");
     }
 
     #[test]
