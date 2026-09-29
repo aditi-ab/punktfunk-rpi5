@@ -297,13 +297,14 @@ impl BluetoothScreen {
         self.editing
     }
     pub(crate) fn edit_field(&self) -> Option<crate::screens::EditField> {
-        self.editing.then(|| {
-            crate::screens::EditField::new(
-                if self.passkey { "Passkey" } else { "PIN" },
-                &self.input,
-                self.passkey,
-            )
-        })
+        if !self.editing {
+            return None;
+        }
+        crate::screens::EditField::new(
+            if self.passkey { "Passkey" } else { "PIN" },
+            &self.input,
+            self.passkey,
+        )
     }
     pub(crate) fn edit_key(&mut self, key: crate::input::Key) -> bool {
         use crate::input::Key;
