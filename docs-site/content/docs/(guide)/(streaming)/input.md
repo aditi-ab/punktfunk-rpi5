@@ -239,11 +239,27 @@ host that takes typed text.
 
 ### Controller mouse
 
-For a launcher, dialog or desktop that ignores controllers, fire **Controller mouse** on the dial:
-the controller that opened the dial now drives the host's pointer, and the game sees an idle pad.
-Fire it again to hand the controller back. Each stream starts with controllers in the game.
+For a launcher, dialog or desktop that ignores controllers, fire **Controller mouse** on the dial.
+Each press moves the controller that opened the dial to the next mode, and each stream starts
+with **Off**:
 
-| Controller | Controller mouse |
+- **Off**: the controller plays.
+- **Touchpad**: the controller still plays, and its touchpads move the host's pointer.
+- **Full**: the whole controller drives the pointer, and the game sees an idle pad.
+
+The touchpads work the same in both modes. A tap never clicks, so a thumb resting on the pad
+mid-game fires nothing.
+
+| Touchpad | Touchpad and Full |
+|---|---|
+| DualSense, DualShock 4 | Pointer — slide a finger, as on a laptop trackpad. Click for left click, click with two fingers for right click |
+| Steam Deck, Steam Controller: right pad | Pointer; click for left click |
+| Steam Deck, Steam Controller: left pad | Scroll; click for right click |
+
+A controller without a touchpad plays on unchanged in **Touchpad**. In **Full**, the rest of the
+controller works like this:
+
+| Controller | Full |
 |---|---|
 | Left stick | Pointer — push further to move faster |
 | Right stick | Scroll |

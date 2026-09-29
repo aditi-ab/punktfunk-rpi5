@@ -435,35 +435,37 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendGamepad
     })
 }
 
-/// `NativeBridge.nativeSetPadMouse(handle, mask)` — controller mouse on the wire pads in `mask`
-/// (bit = pad index); `0` returns every pad to passthrough. `false` when the session is gone or the
-/// host did not grant pointer input.
+/// `NativeBridge.nativePadMouseMode(handle, target)` — the controller-mouse mode the wire pads in
+/// `target` share: `0` off, `1` touchpad, `2` full. `0` once the session is gone.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetPadMouse(
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePadMouseMode(
     _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
-    mask: jint,
-) -> jboolean {
-    jni_guard(false, || {
-        SESSIONS
-            .get(handle)
-            .is_some_and(|h| h.client.set_pad_mouse(mask as u16).is_ok())
+    target: jint,
+) -> jint {
+    jni_guard(0, || {
+        SESSIONS.get(handle).map_or(0, |h| {
+            jint::from(h.client.pad_mouse_mode(target as u16) as u8)
+        })
     })
 }
 
-/// `NativeBridge.nativePadMouse(handle)` — the pads in controller mouse now; `0` once the session is
-/// gone.
+/// `NativeBridge.nativeCyclePadMouse(handle, target)` — step the wire pads in `target` to the next
+/// controller-mouse mode (off, touchpad, full) and return it. `-1` when the session is gone or the
+/// host did not grant pointer input.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePadMouse(
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeCyclePadMouse(
     _env: EnvUnowned,
     _this: JObject,
     handle: jlong,
+    target: jint,
 ) -> jint {
-    jni_guard(0, || {
+    jni_guard(-1, || {
         SESSIONS
             .get(handle)
-            .map_or(0, |h| jint::from(h.client.pad_mouse()))
+            .and_then(|h| h.client.cycle_pad_mouse(target as u16).ok())
+            .map_or(-1, |mode| jint::from(mode as u8))
     })
 }
 

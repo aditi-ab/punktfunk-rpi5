@@ -320,7 +320,7 @@ private val previewActions = RingActions(
     },
     invokeHost = {}, sendShortcut = {},
     padAvailable = { true }, padShown = { false }, togglePad = {}, tapPadButton = {},
-    pointerGranted = { true }, padMouseTarget = { 1 }, padMouseOn = { false }, togglePadMouse = {},
+    pointerGranted = { true }, padMouseTarget = { 1 }, padMouseMode = { 0 }, cyclePadMouse = {},
     audioMute = { 0 }, audioMuteLabel = { null }, toggleStreamMute = {},
     currentMode = { intArrayOf(1920, 1080, 60) }, requestMode = { _, _, _ -> },
 )

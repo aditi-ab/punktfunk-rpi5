@@ -343,7 +343,7 @@ pub(super) fn ring_facts(
         mic_available: st.params.mic_enabled,
         mic_muted,
         pad_mouse_target: target,
-        pad_mouse_on: target != 0 && c.pad_mouse() & target == target,
+        pad_mouse: c.pad_mouse_mode(target),
         audio_mute: c.audio_mute(),
         pointer_granted: c.access_grants() & punktfunk_core::quic::GRANT_POINTER != 0,
         mode: (m.width, m.height, m.refresh_hz),
@@ -374,16 +374,9 @@ pub(super) fn pad_mouse_target(c: &NativeClient, ring_opener: Option<u8>) -> u16
     )
 }
 
-/// All target pads in controller mouse go back to passthrough; otherwise they all switch.
-pub(super) fn toggle_pad_mouse(c: &NativeClient, ring_opener: Option<u8>) {
-    let target = pad_mouse_target(c, ring_opener);
-    let on = c.pad_mouse();
-    let next = if on & target == target {
-        on & !target
-    } else {
-        on | target
-    };
-    if let Err(e) = c.set_pad_mouse(next) {
+/// Step the target pads to the next controller-mouse mode: off, touchpad, full.
+pub(super) fn cycle_pad_mouse(c: &NativeClient, ring_opener: Option<u8>) {
+    if let Err(e) = c.cycle_pad_mouse(pad_mouse_target(c, ring_opener)) {
         tracing::warn!(error = %e, "ring: controller mouse");
     }
 }
@@ -766,9 +759,9 @@ impl Shell {
                     bump_stats_tier(&mut self.stats_verbosity, stream);
                 }
                 RingCommand::Keyboard => self.ring_keyboard = !self.ring_keyboard,
-                RingCommand::TogglePadMouse => {
+                RingCommand::CyclePadMouse => {
                     if let Some(c) = stream.as_ref().and_then(|st| st.connector.as_ref()) {
-                        toggle_pad_mouse(c, self.ring_opener);
+                        cycle_pad_mouse(c, self.ring_opener);
                     }
                 }
                 RingCommand::ToggleStreamMute => {
@@ -887,7 +880,7 @@ impl Shell {
             RingCommand::CycleStats
             | RingCommand::Keyboard
             | RingCommand::TapButton(_)
-            | RingCommand::TogglePadMouse
+            | RingCommand::CyclePadMouse
             | RingCommand::ToggleStreamMute => {}
         }
     }
