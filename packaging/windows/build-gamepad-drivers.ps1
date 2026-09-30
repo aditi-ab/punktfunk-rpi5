@@ -73,8 +73,8 @@ if (-not $env:Version_Number) { $env:Version_Number = '10.0.26100.0' }
 if (-not $env:LIBCLANG_PATH -and (Test-Path 'C:\Program Files\LLVM\bin\libclang.dll')) {
     $env:LIBCLANG_PATH = 'C:\Program Files\LLVM\bin'
 }
-# Build into the DEFAULT workspace target dir (not an external CARGO_TARGET_DIR) - wdk-build walks up
-# from OUT_DIR for a Cargo.lock and doesn't support out-of-tree target dirs. See build-pf-vdisplay.ps1.
+# Builds through drivers-cargo.ps1 like build-pf-vdisplay.ps1: the in-tree target dir from one fixed
+# X: root, so a target kept between CI runs never sees two checkout paths.
 $triple = if ($Arch -eq 'arm64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
 $stampArch = if ($Arch -eq 'arm64') { 'arm64' } else { 'amd64' }
 $catOs = if ($Arch -eq 'arm64') { '10_NI_ARM64' } else { '10_X64' }   # both floor at 22H2 (22621)
@@ -83,13 +83,8 @@ $rel = Join-Path $DriversDir "target\$triple\release"
 # --- 1. build (release) - one build covers the whole workspace --------------------------------
 if (-not $SkipBuild) {
     Write-Host "==> cargo build --release --target $triple (drivers workspace) in $DriversDir"
-    $prevTarget = $env:CARGO_TARGET_DIR
-    Remove-Item Env:\CARGO_TARGET_DIR -ErrorAction SilentlyContinue
-    Push-Location $DriversDir
-    & cargo build --release --target $triple
+    & (Join-Path $PSScriptRoot 'drivers-cargo.ps1') "build --release --target $triple"
     $rc = $LASTEXITCODE
-    Pop-Location
-    if ($prevTarget) { $env:CARGO_TARGET_DIR = $prevTarget } else { Remove-Item Env:\CARGO_TARGET_DIR -ErrorAction SilentlyContinue }
     if ($rc -ne 0) { throw "gamepad drivers cargo build failed ($rc)" }
 }
 foreach ($d in $drivers) {
