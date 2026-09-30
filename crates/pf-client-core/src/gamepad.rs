@@ -95,6 +95,38 @@ pub fn preinit_disable_valve_hidapi() {
     set_valve_hidapi(false);
 }
 
+/// Log every joystick SDL sees, gamepad or not. A controller SDL has no mapping
+/// for never becomes a pad, so this line is the only place it shows up.
+fn log_joysticks(subsystem: &sdl3::GamepadSubsystem) {
+    let mut count = 0i32;
+    // SAFETY: the subsystem exists, so SDL's joystick code is initialised. The
+    // call returns null or an array of `count` ids that the caller frees.
+    let ids = unsafe { sdl3::sys::joystick::SDL_GetJoysticks(&mut count) };
+    if ids.is_null() {
+        return;
+    }
+    // SAFETY: non-null, `count` ids long, and not freed until the line below.
+    let list = unsafe { std::slice::from_raw_parts(ids, count.max(0) as usize) }.to_vec();
+    // SAFETY: `ids` came from `SDL_GetJoysticks` and is freed exactly once.
+    unsafe { sdl3::sys::stdinc::SDL_free(ids.cast()) };
+    if list.is_empty() {
+        tracing::info!("no controller seen at session start");
+    }
+    for id in list {
+        tracing::info!(
+            id = format_args!(
+                "{:04x}:{:04x}",
+                subsystem.vendor_for_id(id).unwrap_or(0),
+                subsystem.product_for_id(id).unwrap_or(0)
+            ),
+            name = %subsystem.name_for_id(id).unwrap_or_default(),
+            path = %subsystem.path_for_id(id).unwrap_or_default(),
+            gamepad = subsystem.is_gamepad(id),
+            "controller seen at session start"
+        );
+    }
+}
+
 fn pref_for_type(t: sdl3::gamepad::GamepadType) -> GamepadPref {
     use sdl3::gamepad::GamepadType as T;
     match t {
@@ -1697,6 +1729,7 @@ impl Worker {
                         set_valve_hidapi(true);
                     }
                     self.sync_open();
+                    log_joysticks(&self.subsystem);
                 }
                 Ok(Ctl::Detach) => {
                     self.close_all_slots();
