@@ -232,8 +232,8 @@ libc = "0.2"
 # needed — pf-capture and pf-audio drive PipeWire with the `pipewire` crate.
 # `settings` adds the org.freedesktop.portal.Settings proxy the console's theme route reads
 # (design/web-console-overhaul.md §7) — the only cross-desktop source for the desktop's own
-# mode and accent.
-ashpd = { version = "0.13", features = ["screencast", "remote_desktop", "settings"] }
+# mode and accent. `inhibit` vetoes the desktop's idle suspend during a stream.
+ashpd = { version = "0.13", features = ["screencast", "remote_desktop", "settings", "inhibit"] }
 # (ashpd 0.13 drives the one-time portal handshake on tokio; the unconditional `tokio = "full"`
 # in [dependencies] already covers that — this block used to re-declare a strict subset of it.)
 # NOTE: the Wayland stack (wayland-client / -protocols{,-wlr,-misc} / -scanner / -backend),
