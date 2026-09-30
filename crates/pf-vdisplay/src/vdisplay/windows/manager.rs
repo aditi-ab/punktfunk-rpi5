@@ -1325,8 +1325,8 @@ impl VirtualDisplayManager {
         None
     }
 
-    /// Adds the exact logical connector, resolves its GDI path, sets its mode,
-    /// and applies group topology. A driver's fallback connector is removed and
+    /// Wakes a dark console display, adds the exact logical connector, resolves its GDI
+    /// path, sets its mode, and applies group topology. A driver's fallback connector is removed and
     /// rejected because it could enter another process's reserved range.
     /// `Monitor.mode` records the committed mode while `requested_mode` retains
     /// the negotiated value for the join/resize gate.
@@ -1339,6 +1339,7 @@ impl VirtualDisplayManager {
         hw_cursor: bool,
         inner: &mut MgrInner,
     ) -> Result<Monitor> {
+        wake_console_display()?;
         // Slot id doubles as the driver-preferred monitor id (EDID serial /
         // ConnectorIndex) so Windows reapplies saved DPI on reconnect; `0`
         // (anonymous) = driver auto-allocates.
@@ -2263,6 +2264,24 @@ pub fn slot_id_for(client_fp: Option<[u8; 32]>, mode: (u32, u32)) -> Option<u32>
             None
         }
     }
+}
+
+/// Wake a dark console display: IddCx commits a new monitor's path inactive while it is off,
+/// and no swap-chain follows. A process outside the console session has nothing to wake.
+fn wake_console_display() -> Result<()> {
+    use pf_win_display::console_display::{ensure_on, Wake};
+    if pf_win_display::console_session_mismatch().is_some() {
+        return Ok(());
+    }
+    match ensure_on(Duration::from_secs(3)) {
+        Wake::Woken(t) => tracing::info!(
+            wake_ms = t.as_millis() as u64,
+            "console display woken for the virtual monitor"
+        ),
+        Wake::StillOff => return Err(crate::DisplayAsleep.into()),
+        Wake::AlreadyOn | Wake::Unknown => {}
+    }
+    Ok(())
 }
 
 /// Render-GPU pin: IDD-push NVENC runs on the render adapter, so it must be

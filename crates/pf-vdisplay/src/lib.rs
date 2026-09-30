@@ -521,6 +521,25 @@ pub mod policy;
 #[path = "vdisplay/monitors.rs"]
 pub mod monitors;
 
+/// Windows kept the console display off, so a new virtual monitor would get no swap-chain.
+#[derive(Debug)]
+pub struct DisplayAsleep;
+
+impl std::fmt::Display for DisplayAsleep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("wake the console display: Windows kept it off")
+    }
+}
+
+impl std::error::Error for DisplayAsleep {}
+
+impl DisplayAsleep {
+    /// The sentence the client shows.
+    pub fn user_message(&self) -> String {
+        "The host's screen is asleep and couldn't be woken. Wake it, then connect again.".into()
+    }
+}
+
 // Stream a head the compositor already has. `VirtualDisplay` so session
 // machinery is unchanged; `DisplayOwnership::External` so lifecycle policy
 // is not applied to someone else's monitor.

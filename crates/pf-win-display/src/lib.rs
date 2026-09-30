@@ -9,12 +9,15 @@
 //!   display-config lock, and timestamps events so a capture stall can say whether an OS display
 //!   event coincided with it.
 //! - [`snapshot`]: the platform-neutral snapshot types and cache rules (tested everywhere).
+//! - [`console_display`]: the console display's power state and the wake a new monitor needs.
 
 #[cfg(target_os = "windows")]
 pub mod adl_emul;
 /// Typed per-target CCD packets behind one SAFETY proof.
 #[cfg(target_os = "windows")]
 mod ccd_info;
+#[cfg(target_os = "windows")]
+pub mod console_display;
 #[cfg(target_os = "windows")]
 pub mod display_events;
 /// Bind display-config writes to the input desktop so a UAC / lock screen can't refuse them.
