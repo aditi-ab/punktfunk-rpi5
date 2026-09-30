@@ -270,8 +270,9 @@ Read by the Linux and Windows clients, the Decky plugin and the `punktfunk` CLI 
 
 | Variable | Values | What it does |
 |---|---|---|
-| `PUNKTFUNK_DECODER` | `native-vulkan` · `native-vaapi` (Linux) · `native-d3d11va` (Windows) · `software` | Pins the decoder; the order it replaces is in the [Support matrix](/docs/support-matrix#client-decode). The older `vulkan`, `vaapi` and `d3d11va` still work. |
+| `PUNKTFUNK_DECODER` | `native-vulkan` · `native-vaapi` · `native-v4l2` (Linux) · `native-d3d11va` (Windows) · `software` | Pins the decoder; the order it replaces is in the [Support matrix](/docs/support-matrix#client-decode). The older `vulkan`, `vaapi` and `d3d11va` still work. |
 | `PUNKTFUNK_VAAPI_DEVICE` | path, e.g. `/dev/dri/renderD129` | Linux: the render node VAAPI decodes on. Unset: the first node where VAAPI starts, the presenting GPU's vendor first. |
+| `PUNKTFUNK_V4L2_DEVICE` | path, e.g. `/dev/video0` | Linux: the decoder node V4L2 decodes on. Unset: the first `/dev/video*` node that takes the codec. |
 | `PUNKTFUNK_VK_ADAPTER` | name substring | The GPU the client presents on. Unset prefers a discrete GPU. |
 | `PUNKTFUNK_PREFER_PYROWAVE` | `1` | Ask for [PyroWave](/docs/pyrowave) where the client's own setting isn't reachable, such as a headless launch. |
 | `PUNKTFUNK_PAD_SPEAKER_PATH` · `PUNKTFUNK_PAD_SPEAKER_VOLUME` | byte (default `0x20` / `0x7F`) | Which DualSense output [controller audio](/docs/controller-audio) plays to, and how loud. Change them only if the pad's speaker stays silent. |

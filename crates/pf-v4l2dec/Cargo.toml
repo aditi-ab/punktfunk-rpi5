@@ -1,0 +1,18 @@
+[package]
+name = "pf-v4l2dec"
+description = "Hand-declared V4L2 decoder uAPI and the stateful decoder state machine, CPU-testable: the device-free half of the Linux client's V4L2 decode rung."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[features]
+# `testing::FakeDecoder`, for the client rung's tests.
+testing = []
+
+[lints]
+workspace = true

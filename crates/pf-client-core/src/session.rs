@@ -212,7 +212,13 @@ impl SessionParams {
         // Off on the desktop (see the field). The report path stays for a client that asks.
         let phase_lock = false;
         let caps_444 = settings.enable_444 && probes.hevc_444_hardware;
-        let advertise_hdr = settings.hdr_enabled && probes.hdr_enabled;
+        // The CPU rung is 8-bit: without a hardware 10-bit path the host would
+        // build a stream this client tears down.
+        let ten_bit = crate::video::ten_bit_decodable(probes.vulkan.as_ref(), &settings.decoder);
+        if !ten_bit && (settings.hdr_enabled || settings.ten_bit_sdr) {
+            tracing::info!("10-bit not advertised: no hardware decoder here has a 10-bit path");
+        }
+        let advertise_hdr = settings.hdr_enabled && probes.hdr_enabled && ten_bit;
         // The host writes the volume into its display's EDID, so it rides only with HDR on.
         let display_hdr = advertise_hdr.then_some(probes.display_hdr).flatten();
         Self {
@@ -229,7 +235,7 @@ impl SessionParams {
             exclude_codecs: 0,
             video_caps: crate::video::video_caps_for(
                 advertise_hdr,
-                settings.ten_bit_sdr,
+                settings.ten_bit_sdr && ten_bit,
                 caps_444,
                 crate::video::multi_slice_decodable(probes.vulkan.as_ref().map(|v| v.vendor_id)),
             ),

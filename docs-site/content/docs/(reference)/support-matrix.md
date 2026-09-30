@@ -172,7 +172,7 @@ decoders, with openh264 and rav1d as the software floor on the desktop.
 
 | Client | Decode path | Codecs | 10-bit / HDR | 4:4:4 |
 |---|---|---|---|---|
-| Linux desktop | Vulkan Video → VAAPI → software ¹ | H.264, HEVC, AV1 ² | ✅ ³ | ⚠️ ⁴ |
+| Linux desktop | Vulkan Video → VAAPI → V4L2 → software ¹ | H.264, HEVC, AV1 ² | ✅ ³ | ⚠️ ⁴ |
 | Windows desktop (x64, ARM64) | Vulkan Video / D3D11VA → software ¹ | H.264, HEVC, AV1 ² | ✅ ³ | ⚠️ ⁴ |
 | Steam Deck (Decky) | as Linux desktop ⁵ | H.264, HEVC, AV1 ² | ✅ | ⚠️ ⁴ |
 | macOS · iOS · tvOS | VideoToolbox; Metal for PyroWave ⁶ | H.264, HEVC, AV1 ⁶ | ⚠️ ⁷ | ⚠️ ⁸ |
@@ -181,13 +181,14 @@ decoders, with openh264 and rav1d as the software floor on the desktop.
 | LG webOS · browser | ❓ ¹² | ❓ | ❓ | ❓ |
 
 1. Linux tries Vulkan Video first wherever it decodes the codec, then VAAPI (skipped on NVIDIA),
+   then a V4L2 decoder node (the hardware path on ARM boards, where the other two don't exist),
    then software. Windows tries Vulkan Video first on NVIDIA and AMD, D3D11VA first on Intel and
    others. Pin one in the client's decoder setting or with
    [`PUNKTFUNK_DECODER`](/docs/configuration#client-side-native-clients); a pinned decoder that
    fails still falls through. Mid-session, three decode errors spread over at least a second move
    to the next decoder, and the session log names the one in use.
 2. The software floor covers H.264 (openh264) and AV1 (rav1d), 8-bit only, with no HEVC. AV1 is
-   offered only where the GPU decodes it; Windows drops HEVC when the GPU has no HEVC decoder. If
+   offered only where hardware decodes it, and so is HEVC; 10-bit needs a hardware decoder too. If
    every HEVC decoder fails, the client reconnects on a codec with a software floor. PyroWave is
    offered when the GPU passes its probe.
 3. HDR is on by default. Linux presents HDR10 where the desktop offers it and tone-maps otherwise;
