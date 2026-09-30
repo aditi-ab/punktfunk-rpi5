@@ -844,6 +844,8 @@ struct InFlight {
     hw: HwDone,
     received_ns: u64,
     pts_ns: u64,
+    /// The host re-encoded the picture already sent (`USER_FLAG_REPEAT`).
+    repeat: bool,
     image: Option<DecodedImage>,
 }
 
@@ -899,6 +901,7 @@ fn hand_on(
             let sent = frame_tx.force_send(DecodedFrame {
                 pts_ns: p.pts_ns,
                 decoded_ns,
+                repeat: p.repeat,
                 image,
             });
             // A displaced frame decoded and was never shown: newest wins.
@@ -1066,6 +1069,8 @@ fn pump(
     let wants_decode = connector.wants_decode_latency();
     // The hardware decode submitted last, handed on when its pixels are done.
     let mut in_flight: Option<InFlight> = None;
+    // Host marks a re-encoded hold (`USER_FLAG_REPEAT`); an older host never sets the bit.
+    let marks_repeats = connector.host_caps2() & punktfunk_core::quic::HOST_CAP2_REPEAT_MARK != 0;
     // What actually decoded the last frame — VAAPI can demote mid-session.
     let mut dec_path: &'static str = "";
     let mut kf = KeyframeAsk::default();
@@ -1310,6 +1315,8 @@ fn pump(
                             hw: hw_fence,
                             received_ns,
                             pts_ns: frame.pts_ns,
+                            repeat: marks_repeats
+                                && frame.flags & punktfunk_core::packet::USER_FLAG_REPEAT != 0,
                             image: present.then_some(image),
                         };
                         // This AU is submitted; the one before it goes on first, in order.

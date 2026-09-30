@@ -153,6 +153,8 @@ impl Shell {
             let native_zero_copy = (0u32, 0u32);
             tracing::info!(
                 smoothing = present.smoothing,
+                // The latency intent held for its due time: a measured VRR panel.
+                paced = st.pacer.paces_latency(),
                 mode = present.mode,
                 // Where the display stamps came from; `none` means the glass fields
                 // below (steps, judder, misses, gated) measured nothing.
@@ -163,6 +165,7 @@ impl Shell {
                 q_drop,
                 q_dry,
                 forwarded = present.forwarded,
+                repeats = st.win.repeats,
                 gated,
                 forced,
                 misses = st.win.misses,
@@ -280,6 +283,13 @@ impl StreamState {
     /// make buffering moot.
     pub(super) fn intake(&mut self) {
         while let Ok(f) = self.frames.try_recv() {
+            // A repeat carries the picture already on glass: presenting it refreshes
+            // nothing, anchors the cadence clock on a hold, and on a VRR panel moves
+            // the next real frame's earliest slot.
+            if f.repeat {
+                self.win.repeats += 1;
+                continue;
+            }
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             if self.store.is_smoothing() && matches!(f.image, DecodedImage::PyroWave(_)) {
                 self.store.force_latency();
@@ -306,7 +316,12 @@ impl StreamState {
     /// smoothness serves the frame whose due time has come. `grid_known`: on-glass
     /// stamps feed the latch clock; without them the due time itself is the target.
     pub(super) fn pick(&mut self, now_ns: u64, grid_known: bool) -> Option<Paced> {
-        self.pacer.follow(self.cadence.verdict(), grid_known);
+        self.pacer.follow(
+            self.cadence.verdict(),
+            grid_known,
+            self.store.is_smoothing(),
+        );
+        self.store.set_paced(self.pacer.paces_latency());
         if self.store.is_smoothing() {
             if self.pacer.free_running() {
                 // Variable refresh, measured: the panel refreshes when we present, so
@@ -333,7 +348,8 @@ impl StreamState {
                 }
             }
         } else {
-            self.store.take(|_| true)
+            // Arrival-driven; a paced store (measured VRR) holds the newest for its due time.
+            self.store.take(|p| p.due_ns <= now_ns as i64)
         }
     }
 
@@ -351,6 +367,7 @@ impl StreamState {
                 DecodedFrame {
                     pts_ns,
                     decoded_ns,
+                    repeat: _,
                     image,
                 },
             due_ns,
@@ -538,6 +555,8 @@ pub(super) struct PresentWindow {
     steps: [u32; 6],
     /// Non-blocking presents that came back busy this window: [fence, acquire].
     busy: [u32; 2],
+    /// Host repeats dropped at intake: the picture was already on glass.
+    repeats: u32,
     /// This window's on-glass frames: the lead each had to its first latch, and whether
     /// it landed on a later one.
     leads: Vec<(i64, bool)>,
@@ -556,6 +575,7 @@ impl PresentWindow {
             out_max: 0,
             steps: [0; 6],
             busy: [0; 2],
+            repeats: 0,
             leads: Vec::with_capacity(256),
         }
     }
@@ -592,6 +612,7 @@ impl PresentWindow {
         self.out_max = 0;
         self.steps = [0; 6];
         self.busy = [0; 2];
+        self.repeats = 0;
         self.leads.clear();
     }
 }
@@ -712,6 +733,8 @@ impl StreamState {
                 frame: DecodedFrame {
                     pts_ns,
                     decoded_ns,
+                    // Repeats never reach the store (dropped at intake).
+                    repeat: false,
                     image,
                 },
                 due_ns,
@@ -722,9 +745,9 @@ impl StreamState {
         self.busy_retry = true;
     }
 
-    /// Smoothness with a frame in hand sleeps only to the pass that can still serve it;
-    /// everything else uses a 15 ms housekeeping tick. Must stay the present decision's
-    /// mirror — a rule changed on one side oversleeps a smooth stream past its due time.
+    /// A paced store with a frame in hand sleeps only to the pass that can still serve
+    /// it; everything else uses a 15 ms housekeeping tick. Must stay the present
+    /// decision's mirror — a rule changed on one side oversleeps a frame past its due time.
     pub(super) fn wake_timeout(&self) -> Duration {
         const TICK: Duration = Duration::from_millis(15);
         if self.busy_retry {
@@ -735,7 +758,7 @@ impl StreamState {
                 crate::vk::BusyOn::Acquire => Duration::from_millis(1),
             };
         }
-        if !self.store.is_smoothing() {
+        if !self.store.is_smoothing() && !self.pacer.paces_latency() {
             return TICK;
         }
         let Some(p) = self.store.front() else {

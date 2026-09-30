@@ -251,6 +251,15 @@ impl CadenceTuning {
             ..CadenceTuning::snapping()
         }
     }
+
+    /// The latency intent on a measured VRR panel: the panel shows every millisecond of
+    /// arrival jitter, so a small cushion buys evenness. One MAD, floor 0.5 ms.
+    pub const fn vrr_latency() -> CadenceTuning {
+        CadenceTuning {
+            cushion_num: 1,
+            ..CadenceTuning::snapping()
+        }
+    }
 }
 
 /// No residual percentiles: allocation-free, no histogram. Distributions live

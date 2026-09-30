@@ -43,6 +43,8 @@ pub struct DecodedFrame {
     /// Local wall (ns) when the decoder emitted this image (`decoded` stage).
     /// The presenter subtracts it from its paintable-set stamp for `display`.
     pub decoded_ns: u64,
+    /// The host re-encoded the picture already sent (`USER_FLAG_REPEAT`): nothing new.
+    pub repeat: bool,
     pub image: DecodedImage,
 }
 

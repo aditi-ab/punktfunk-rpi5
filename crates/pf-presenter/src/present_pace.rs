@@ -30,6 +30,9 @@ pub(crate) struct FrameStore<T> {
     capacity: usize,
     frames: VecDeque<T>,
     prerolled: bool,
+    /// Newest-wins holds its frame until due or until the next one arrives (the latency
+    /// intent on a measured VRR panel).
+    paced: bool,
     /// Newest-wins displacements; not a fault.
     replaced: u32,
     overflow_drops: u32,
@@ -42,6 +45,7 @@ impl<T> FrameStore<T> {
             capacity,
             frames: VecDeque::with_capacity(capacity.max(1) + 1),
             prerolled: false,
+            paced: false,
             replaced: 0,
             overflow_drops: 0,
             underflows: 0,
@@ -52,8 +56,22 @@ impl<T> FrameStore<T> {
         self.capacity > 0
     }
 
+    /// Newest-wins holds its frame for the due time. Off, a frame is due the instant it
+    /// exists. FIFO stores always ask.
+    pub(crate) fn set_paced(&mut self, paced: bool) {
+        self.paced = paced;
+    }
+
     pub(crate) fn submit(&mut self, f: T) {
-        if self.capacity == 0 {
+        if self.capacity == 0 && self.paced {
+            // A held frame is never overwritten: its successor queues behind it and
+            // `take` releases the older one at once. Three deep bounds a stalled loop.
+            self.frames.push_back(f);
+            while self.frames.len() > 3 {
+                self.frames.pop_front();
+                self.replaced += 1;
+            }
+        } else if self.capacity == 0 {
             if self.frames.pop_front().is_some() {
                 self.replaced += 1;
             }
@@ -68,10 +86,16 @@ impl<T> FrameStore<T> {
         }
     }
 
-    /// FIFO: vend the front once `due` is true. Newest-wins never calls `due`: a frame
-    /// is due the instant it exists, so the cadence clock stays off the latency path.
+    /// FIFO: vend the front once `due` is true. Newest-wins asks `due` only when paced,
+    /// and only while nothing newer waits behind the frame: pacing may delay a frame
+    /// until its successor arrives, never drop it. Unpaced, a frame is due the instant
+    /// it exists and the cadence clock stays off the latency path.
     pub(crate) fn take(&mut self, due: impl FnOnce(&T) -> bool) -> Option<T> {
         if self.capacity == 0 {
+            let alone = self.frames.len() == 1;
+            if self.paced && alone && self.frames.front().is_some_and(|f| !due(f)) {
+                return None;
+            }
             return self.frames.pop_front();
         }
         if !self.prerolled {
@@ -100,9 +124,9 @@ impl<T> FrameStore<T> {
     }
 
     /// Unpresented frame (gate closed / present failed). Newest-wins reinserts only
-    /// into an empty slot; FIFO puts it at the front (it is the oldest).
+    /// into an empty slot; FIFO and the paced slot put it at the front (it is the oldest).
     pub(crate) fn put_back(&mut self, f: T) {
-        if self.capacity == 0 {
+        if self.capacity == 0 && !self.paced {
             if self.frames.is_empty() {
                 self.frames.push_back(f);
             }
@@ -371,6 +395,17 @@ impl CadenceProbe {
     }
 }
 
+/// How the pacer serves frames.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaceMode {
+    /// Smoothness on a fixed panel: due time snapped onto the latch grid.
+    Snap,
+    /// Smoothness at the due time: measured VRR, or no glass grid to snap to.
+    Free,
+    /// The latency intent on a measured VRR panel: the due time with a tight cushion.
+    VrrLatency,
+}
+
 /// Plays frames on the source cadence: a [`CadenceClock`] plus the two client
 /// policies — which intent applies, and which cushion the measured refresh asks for.
 ///
@@ -379,23 +414,23 @@ impl CadenceProbe {
 /// would be a bug.
 pub(crate) struct SourcePacer {
     clock: CadenceClock,
-    /// Last [`follow`](Self::follow) verdict was [`Cadence::Variable`]: free-running tuning.
-    free_running: bool,
+    mode: PaceMode,
 }
 
 impl SourcePacer {
     pub(crate) fn new() -> SourcePacer {
         SourcePacer {
             clock: CadenceClock::new(CadenceTuning::snapping()),
-            free_running: false,
+            mode: PaceMode::Snap,
         }
     }
 
     /// Fold an arriving frame and return when it is due, in `ready_ns`'s clock domain.
     ///
-    /// `None` under latency: arrival-driven, so the loop never carries an estimate
-    /// built from samples it then ignored. Called at submit, not take: dropped frames
-    /// are part of the arrival process; folding only survivors hides the jitter.
+    /// `None` under latency on a fixed panel: arrival-driven, so the loop never carries
+    /// an estimate built from samples it then ignored. Called at submit, not take:
+    /// dropped frames are part of the arrival process; folding only survivors hides
+    /// the jitter.
     pub(crate) fn due_ns(
         &mut self,
         smoothing: bool,
@@ -403,26 +438,33 @@ impl SourcePacer {
         ready_ns: u64,
         frame_interval_ns: i64,
     ) -> Option<i64> {
-        smoothing.then(|| {
+        (smoothing || self.paces_latency()).then(|| {
             self.clock
                 .due_ns(src_pts_ns, ready_ns as i64, frame_interval_ns)
         })
     }
 
-    /// Follow the measured refresh verdict. Snapping onto the latch grid carries
-    /// roughly half a refresh of slack; presenting at the due time carries none, so
-    /// the cushions differ. Re-tuning re-anchors (tuning is fixed at construction),
+    /// Follow the measured refresh verdict for this intent. Snapping onto the latch grid
+    /// carries roughly half a refresh of slack; presenting at the due time carries none,
+    /// so the cushions differ. Re-tuning re-anchors (tuning is fixed at construction),
     /// so this keys off the probe's published verdict, not a per-window reading.
-    /// No glass grid (`grid_known` false: no present-wait) runs free as well — a grid
-    /// anchored on submit instants learns the stream's own cadence as the panel.
-    pub(crate) fn follow(&mut self, verdict: Cadence, grid_known: bool) {
-        let free = verdict == Cadence::Variable || !grid_known;
-        if free != self.free_running {
-            self.free_running = free;
-            self.clock = CadenceClock::new(if free {
-                CadenceTuning::free_running()
-            } else {
-                CadenceTuning::snapping()
+    /// Smoothness with no glass grid (`grid_known` false: no present-wait) runs free — a
+    /// grid anchored on submit instants learns the stream's own cadence as the panel.
+    /// The latency intent paces only where VRR is measured: a VRR panel shows every
+    /// millisecond of arrival jitter; a fixed one hides it under the quantization.
+    pub(crate) fn follow(&mut self, verdict: Cadence, grid_known: bool, smoothing: bool) {
+        let mode = match (verdict == Cadence::Variable, smoothing) {
+            (true, true) => PaceMode::Free,
+            (true, false) => PaceMode::VrrLatency,
+            (false, true) if !grid_known => PaceMode::Free,
+            _ => PaceMode::Snap,
+        };
+        if mode != self.mode {
+            self.mode = mode;
+            self.clock = CadenceClock::new(match mode {
+                PaceMode::Snap => CadenceTuning::snapping(),
+                PaceMode::Free => CadenceTuning::free_running(),
+                PaceMode::VrrLatency => CadenceTuning::vrr_latency(),
             });
         }
     }
@@ -430,7 +472,12 @@ impl SourcePacer {
     /// Present at the due time instead of snapping to the latch grid: variable refresh
     /// measured live (the panel refreshes when we present), or no glass grid at all.
     pub(crate) fn free_running(&self) -> bool {
-        self.free_running
+        self.mode != PaceMode::Snap
+    }
+
+    /// The latency intent is paced: measured VRR, newest-wins held for its due time.
+    pub(crate) fn paces_latency(&self) -> bool {
+        self.mode == PaceMode::VrrLatency
     }
 
     /// Re-anchor on the next frame (display change, accepted mode switch). Measured
@@ -601,6 +648,29 @@ mod tests {
             "arrival-driven: the frame goes out regardless"
         );
         assert!(!asked, "…and the due time was never consulted");
+        // Paced (a measured VRR panel): held for its due time, never overwritten.
+        s.set_paced(true);
+        s.submit(8);
+        assert_eq!(s.take(|_| false), None, "paced: held until due");
+        s.submit(9);
+        assert_eq!(
+            s.take(|_| false),
+            Some(8),
+            "its successor arrived: the held frame goes out, it is not replaced"
+        );
+        assert_eq!(
+            s.take(|_| false),
+            None,
+            "the successor waits for its own due time"
+        );
+        assert_eq!(s.take(|_| true), Some(9));
+        assert_eq!(s.take_counters(), (0, 0, 0), "pacing dropped nothing");
+        // A stalled loop is still bounded: the fourth arrival evicts the oldest.
+        for v in 10..14 {
+            s.submit(v);
+        }
+        assert_eq!(s.take(|_| false), Some(11));
+        assert_eq!(s.take_counters(), (1, 0, 0));
     }
 
     #[cfg(feature = "pyrowave")]
@@ -902,28 +972,28 @@ mod tests {
         let mut p = SourcePacer::new();
         assert!(!p.free_running(), "snapping until the panel says otherwise");
         fold(&mut p, true, 200);
-        p.follow(Cadence::Fixed, true);
+        p.follow(Cadence::Fixed, true, true);
         assert!(!p.free_running());
         assert_eq!(
             p.health().frames,
             200,
             "a verdict that changes nothing must not re-anchor"
         );
-        p.follow(Cadence::Variable, true);
+        p.follow(Cadence::Variable, true, true);
         assert!(p.free_running());
         assert_eq!(p.health().frames, 0, "re-tuning is a fresh loop");
-        p.follow(Cadence::Unknown, true);
+        p.follow(Cadence::Unknown, true, true);
         assert!(
             !p.free_running(),
             "Unknown is the absence of a measurement, not a measurement of VRR"
         );
         // No on-glass stamps (no present-wait): nothing to snap to, so the due time
         // is the target here too, whatever the verdict.
-        p.follow(Cadence::Unknown, false);
+        p.follow(Cadence::Unknown, false, true);
         assert!(p.free_running(), "without a glass grid the drain runs free");
-        p.follow(Cadence::Fixed, false);
+        p.follow(Cadence::Fixed, false, true);
         assert!(p.free_running());
-        p.follow(Cadence::Unknown, true);
+        p.follow(Cadence::Unknown, true, true);
         assert!(!p.free_running());
 
         // With no jitter yet, free-running already holds a frame back more than
@@ -931,13 +1001,43 @@ mod tests {
         let mut snap = SourcePacer::new();
         snap.due_ns(true, SRC_PTS0, SRC_READY0, SRC_P);
         let mut free = SourcePacer::new();
-        free.follow(Cadence::Variable, true);
+        free.follow(Cadence::Variable, true, true);
         free.due_ns(true, SRC_PTS0, SRC_READY0, SRC_P);
         assert!(
             free.health().cushion_ns > snap.health().cushion_ns,
             "free-running {} must cushion past snapping {}",
             free.health().cushion_ns,
             snap.health().cushion_ns
+        );
+    }
+
+    /// The latency intent folds nothing on a fixed panel or with no grid at all, and
+    /// paces on a measured VRR panel with a cushion below the smooth intent's.
+    #[test]
+    fn the_latency_intent_paces_only_on_a_measured_vrr_panel() {
+        let mut p = SourcePacer::new();
+        p.follow(Cadence::Unknown, false, false);
+        assert!(
+            !p.paces_latency() && !p.free_running(),
+            "no grid is not VRR: latency stays arrival-driven"
+        );
+        assert_eq!(p.due_ns(false, SRC_PTS0, SRC_READY0, SRC_P), None);
+        p.follow(Cadence::Variable, true, false);
+        assert!(p.paces_latency() && p.free_running());
+        assert!(p.due_ns(false, SRC_PTS0, SRC_READY0, SRC_P).is_some());
+        let tight = p.health().cushion_ns;
+        let mut smooth = SourcePacer::new();
+        smooth.follow(Cadence::Variable, true, true);
+        smooth.due_ns(true, SRC_PTS0, SRC_READY0, SRC_P);
+        assert!(
+            tight < smooth.health().cushion_ns,
+            "latency under VRR ({tight}) must cushion less than smooth ({})",
+            smooth.health().cushion_ns
+        );
+        p.follow(Cadence::Fixed, true, false);
+        assert!(
+            !p.paces_latency(),
+            "a fixed verdict returns the latency intent to arrival"
         );
     }
 

@@ -331,7 +331,7 @@ struct Shell {
 struct Paced {
     frame: DecodedFrame,
     /// `session::now_ns` domain (`DecodedFrame::decoded_ns` is the same clock). `0`
-    /// under the latency intent, which never asks.
+    /// under the latency intent on a fixed panel, which never asks.
     due_ns: i64,
 }
 
