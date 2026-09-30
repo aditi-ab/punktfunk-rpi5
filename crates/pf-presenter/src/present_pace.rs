@@ -1,7 +1,7 @@
 //! Presentation intents the run loop composes: store, latch clock, gate, source pacer.
 //!
-//! * [`FrameStore`] — newest-wins (`capacity == 0`) or smoothing FIFO with preroll
-//!   (`capacity 1..=3`). Same contract as the Apple and Android presenters.
+//! * [`FrameStore`] — newest-wins (`capacity == 0`) or smoothing FIFO held for the due
+//!   time (`capacity 1..=3`). Same contract as the Apple presenter's cadence take.
 //! * [`LatchClock`] — panel latch grid from `VK_KHR_present_wait` on-glass stamps.
 //!   A reported refresh is a mode claim; VRR makes it unusable. Without present-wait
 //!   there is no grid: the drain presents at the due time and the panel quantizes.
@@ -24,19 +24,18 @@ pub(crate) const MARGIN_STEP_NS: u64 = 500_000;
 pub(crate) const MARGIN_MAX_NS: u64 = 2_500_000;
 
 /// Newest-wins (`capacity == 0`: `submit` replaces, `take` clears) or smoothing FIFO
-/// (`capacity 1..=3`: preroll-to-capacity, drop-oldest overflow). Underflow after
-/// preroll re-arms; the previous frame stays on glass while headroom rebuilds.
+/// (`capacity 1..=3`: held until due, drop-oldest overflow). The due time's cushion is
+/// the headroom, so an empty store is the steady state and starvation reads as
+/// `CadenceHealth::late`.
 pub(crate) struct FrameStore<T> {
     capacity: usize,
     frames: VecDeque<T>,
-    prerolled: bool,
     /// Newest-wins holds its frame until due or until the next one arrives (the latency
     /// intent on a measured VRR panel).
     paced: bool,
     /// Newest-wins displacements; not a fault.
     replaced: u32,
     overflow_drops: u32,
-    underflows: u32,
 }
 
 impl<T> FrameStore<T> {
@@ -44,11 +43,9 @@ impl<T> FrameStore<T> {
         FrameStore {
             capacity,
             frames: VecDeque::with_capacity(capacity.max(1) + 1),
-            prerolled: false,
             paced: false,
             replaced: 0,
             overflow_drops: 0,
-            underflows: 0,
         }
     }
 
@@ -98,21 +95,9 @@ impl<T> FrameStore<T> {
             }
             return self.frames.pop_front();
         }
-        if !self.prerolled {
-            // Without preroll a steady stream drains on arrival and never builds jitter headroom.
-            if self.frames.len() < self.capacity {
-                return None;
-            }
-            self.prerolled = true;
-        }
-        let Some(f) = self.frames.front() else {
-            self.underflows += 1;
-            self.prerolled = false;
-            return None;
-        };
-        // Held for its slot, not dry: no counter, preroll stays. An underflow
-        // count here would re-arm preroll on every well-paced frame.
-        if !due(f) {
+        // No preroll: a stream below the panel rate empties the store between frames,
+        // and refilling to capacity each time shows its frames in bursts.
+        if !due(self.frames.front()?) {
             return None;
         }
         self.frames.pop_front()
@@ -143,17 +128,15 @@ impl<T> FrameStore<T> {
             return;
         }
         self.capacity = 0;
-        self.prerolled = false;
         while self.frames.len() > 1 {
             self.frames.pop_front();
         }
     }
 
-    pub(crate) fn take_counters(&mut self) -> (u32, u32, u32) {
-        let c = (self.replaced, self.overflow_drops, self.underflows);
+    pub(crate) fn take_counters(&mut self) -> (u32, u32) {
+        let c = (self.replaced, self.overflow_drops);
         self.replaced = 0;
         self.overflow_drops = 0;
-        self.underflows = 0;
         c
     }
 }
@@ -558,42 +541,35 @@ mod tests {
         assert_eq!(s.take(|_| true), Some(6));
         assert_eq!(
             s.take_counters(),
-            (2, 0, 0),
+            (2, 0),
             "two displacements, no fifo counters"
         );
     }
 
     #[test]
-    fn fifo_prerolls_overflows_oldest_and_rearms_on_dry() {
+    fn fifo_vends_in_order_and_overflows_oldest() {
         let mut s: FrameStore<u32> = FrameStore::new(2);
         assert!(s.is_smoothing());
         s.submit(1);
-        assert_eq!(
-            s.take(|_| true),
-            None,
-            "prerolling: below capacity, nothing vends"
-        );
+        assert_eq!(s.take(|_| true), Some(1), "a due frame goes out alone");
+        assert_eq!(s.take(|_| true), None);
+        // A stream below the panel rate: the store empties between frames and
+        // each one still goes out at its own due time.
         s.submit(2);
-        assert_eq!(s.take(|_| true), Some(1), "preroll reached — FIFO order");
         assert_eq!(
             s.take(|_| true),
             Some(2),
-            "once prerolled the buffer drains normally"
+            "an empty store does not re-buffer"
         );
-        assert_eq!(s.take(|_| true), None);
         s.submit(3);
-        assert_eq!(s.take(|_| true), None, "re-armed preroll holds again");
         s.submit(4);
-        assert_eq!(s.take(|_| true), Some(3));
+        assert_eq!(s.take(|_| true), Some(3), "FIFO order");
         s.submit(5);
         s.submit(6);
         s.submit(7);
         assert_eq!(s.take(|_| true), Some(6));
         assert_eq!(s.take(|_| true), Some(7));
-        let (replaced, drops, dry) = s.take_counters();
-        assert_eq!(replaced, 0);
-        assert_eq!(drops, 2, "6 evicted 4, 7 evicted 5");
-        assert_eq!(dry, 1);
+        assert_eq!(s.take_counters(), (0, 2), "6 evicted 4, 7 evicted 5");
     }
 
     #[test]
@@ -610,25 +586,16 @@ mod tests {
         );
     }
 
-    /// Held-for-due is not dry: counting it as underflow re-arms preroll on every
-    /// well-paced frame.
     #[test]
-    fn a_frame_held_for_its_due_time_is_not_an_underflow() {
+    fn a_fifo_frame_is_held_until_due() {
         let mut s: FrameStore<u32> = FrameStore::new(2);
         s.submit(10);
         s.submit(20);
-        assert_eq!(s.take(|_| false), None, "prerolled, but nothing is due yet");
-        assert_eq!(s.take(|&v| v >= 10), Some(10));
-        assert_eq!(s.take(|&v| v >= 30), None, "20 is not due yet either");
+        assert_eq!(s.take(|_| false), None, "nothing is due yet");
+        assert_eq!(s.take(|&v| v <= 10), Some(10));
+        assert_eq!(s.take(|&v| v <= 10), None, "20 is not due yet either");
         assert_eq!(s.take(|_| true), Some(20));
-        assert_eq!(s.take(|_| true), None);
-        s.submit(30);
-        assert_eq!(s.take(|_| true), None, "re-armed preroll holds again");
-        assert_eq!(
-            s.take_counters(),
-            (0, 0, 1),
-            "one dry, nothing from the holds"
-        );
+        assert_eq!(s.take_counters(), (0, 0), "a hold drops nothing");
     }
 
     /// Newest-wins never consults `due`, so a caller-supplied cadence clock cannot
@@ -664,13 +631,13 @@ mod tests {
             "the successor waits for its own due time"
         );
         assert_eq!(s.take(|_| true), Some(9));
-        assert_eq!(s.take_counters(), (0, 0, 0), "pacing dropped nothing");
+        assert_eq!(s.take_counters(), (0, 0), "pacing dropped nothing");
         // A stalled loop is still bounded: the fourth arrival evicts the oldest.
         for v in 10..14 {
             s.submit(v);
         }
         assert_eq!(s.take(|_| false), Some(11));
-        assert_eq!(s.take_counters(), (1, 0, 0));
+        assert_eq!(s.take_counters(), (1, 0));
     }
 
     #[cfg(feature = "pyrowave")]

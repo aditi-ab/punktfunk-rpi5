@@ -94,7 +94,7 @@ impl Shell {
         let [import, submit, fence, acquire, queue_present] = st.win.take_timings();
         // Drained once per window and shared by the HUD and the log line — a
         // second `take_counters` would read zeros.
-        let (replaced, q_drop, q_dry) = st.store.take_counters();
+        let (replaced, q_drop) = st.store.take_counters();
         let (gated, forced) = st.gate.take_counters();
         let forwarded = st.forwarder_drops.swap(0, Ordering::Relaxed);
         let cadence_err = hud::Summary::of(&mut st.win.cadence_err_us);
@@ -105,7 +105,6 @@ impl Shell {
             vrr: st.cadence.verdict(),
             smoothing: st.store.is_smoothing(),
             q_drop,
-            q_dry,
             gated,
             forced,
             forwarded,
@@ -169,7 +168,6 @@ impl Shell {
                 native_zero_copy = ?native_zero_copy,
                 replaced,
                 q_drop,
-                q_dry,
                 forwarded = present.forwarded,
                 repeats = st.win.repeats,
                 // On-glass spacing error against the source's spacing, per shown frame.
@@ -916,7 +914,6 @@ pub(super) struct PresentCounters {
     pub(super) vrr: Cadence,
     pub(super) smoothing: bool,
     pub(super) q_drop: u32,
-    pub(super) q_dry: u32,
     pub(super) gated: u32,
     pub(super) forced: u32,
     /// Wake-forwarder displacements: the loop stalled two frame intervals.
@@ -1009,7 +1006,6 @@ pub(super) fn desktop_extras(
         }
         for (name, n) in [
             ("qdrop", p.q_drop),
-            ("qdry", p.q_dry),
             ("fwd", p.forwarded),
             ("gated", p.gated),
             ("forced", p.forced),
@@ -1174,7 +1170,6 @@ mod tests {
             vrr: Cadence::Unknown,
             smoothing: false,
             q_drop: 0,
-            q_dry: 0,
             gated: 0,
             forced: 0,
             forwarded: 0,
@@ -1196,14 +1191,13 @@ mod tests {
             vrr: Cadence::Variable,
             smoothing: true,
             q_drop: 2,
-            q_dry: 1,
             gated: 7,
             forced: 1,
             ..counters()
         };
         assert_eq!(
             desktop_extras(&busy, None, None, 0)[0].text,
-            "present: fifo · vrr yes · smoothing · qdrop 2 · qdry 1 · gated 7 · forced 1"
+            "present: fifo · vrr yes · smoothing · qdrop 2 · gated 7 · forced 1"
         );
         let no_mode = PresentCounters {
             mode: "",
