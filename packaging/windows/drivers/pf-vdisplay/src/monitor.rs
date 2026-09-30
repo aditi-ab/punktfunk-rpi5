@@ -116,6 +116,8 @@ pub struct Monitor {
     encode: Mutex<Option<Arc<EncodeSession>>>,
     /// The encode pool, kept across sessions for its retained slot; dropped at teardown.
     pool: Mutex<Option<Arc<crate::encode::pool::Pool>>>,
+    /// The newest surface no pool took, which the next pool opens on.
+    seed: Arc<crate::encode::pool::Seed>,
     /// Bumped (Release) by every session install or removal, and by every pool change. The
     /// drain loop compares it with its last-seen value and re-reads the slots only then.
     pub encode_gen: AtomicU32,
@@ -176,6 +178,7 @@ impl Monitor {
             }),
             encode: Mutex::new(None),
             pool: Mutex::new(None),
+            seed: Arc::new(crate::encode::pool::Seed::new()),
             encode_gen: AtomicU32::new(0),
             render_luid: std::sync::atomic::AtomicI64::new(0),
             gone: AtomicBool::new(false),
@@ -283,6 +286,11 @@ impl Monitor {
     /// The encode pool, if one was ever built.
     pub fn pool(&self) -> Option<Arc<crate::encode::pool::Pool>> {
         lock(&self.pool).clone()
+    }
+
+    /// The surface the next pool opens on ([`crate::encode::pool::Seed`]).
+    pub fn seed(&self) -> Arc<crate::encode::pool::Seed> {
+        self.seed.clone()
     }
 
     /// Install a freshly built pool (the encode thread, once its session's kind is known) and
