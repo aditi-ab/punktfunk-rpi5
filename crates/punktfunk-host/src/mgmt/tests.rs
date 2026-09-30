@@ -2193,6 +2193,7 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         // the operator's, like every install.
         ("GET", "/api/v1/emulators", true, false),
         ("POST", "/api/v1/emulators/{id}/install", false, false),
+        ("POST", "/api/v1/emulators/{id}/prepare", true, false),
         ("POST", "/api/v1/emulators/{id}/remove", false, false),
         (
             "POST",

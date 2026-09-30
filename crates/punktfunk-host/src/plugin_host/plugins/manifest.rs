@@ -96,32 +96,41 @@ impl PluginManifest {
             .collect()
     }
 
-    /// Is `candidate` inside one of the declared roots or grants? A `..` segment is refused
-    /// outright. Lexical first; a path that resolves then matches through its canonical form,
-    /// because `/home` may be a link (`/var/home` on Fedora Atomic) and grants are stored
-    /// canonical. Windows compares the way grants are stored (`\\?\`, either slash, any case).
+    /// Is `candidate` inside one of the declared roots or grants? See [`Self::root_of`].
     pub fn confines(&self, candidate: &Path) -> bool {
+        self.root_of(candidate).is_some()
+    }
+
+    /// The most specific declared root or grant that holds `candidate`. A `..` segment is
+    /// refused outright. Lexical first; a path that resolves then matches through its canonical
+    /// form, because `/home` may be a link (`/var/home` on Fedora Atomic) and grants are stored
+    /// canonical. Windows compares the way grants are stored (`\\?\`, either slash, any case).
+    pub fn root_of(&self, candidate: &Path) -> Option<PathBuf> {
         if !candidate.is_absolute()
             || candidate
                 .components()
                 .any(|c| matches!(c, std::path::Component::ParentDir))
         {
-            return false;
+            return None;
         }
+        let longest = |hits: Vec<PathBuf>| hits.into_iter().max_by_key(|r| r.as_os_str().len());
         let roots = self.roots();
-        if roots
+        let lexical: Vec<PathBuf> = roots
             .iter()
-            .any(|root| super::access::within(candidate, root))
-        {
-            return true;
+            .filter(|root| super::access::within(candidate, root))
+            .cloned()
+            .collect();
+        if !lexical.is_empty() {
+            return longest(lexical);
         }
-        let Ok(real) = candidate.canonicalize() else {
-            return false;
-        };
-        roots
-            .iter()
-            .filter_map(|root| root.canonicalize().ok())
-            .any(|root| super::access::within(&real, &root))
+        let real = candidate.canonicalize().ok()?;
+        longest(
+            roots
+                .iter()
+                .filter_map(|root| root.canonicalize().ok())
+                .filter(|root| super::access::within(&real, root))
+                .collect(),
+        )
     }
 }
 

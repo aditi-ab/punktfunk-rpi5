@@ -167,6 +167,10 @@ export type Position = { readonly "x": number, readonly "y": number }
 export const Position = Schema.Struct({ "x": Schema.Number.annotate({ "format": "int32" }).check(Schema.isInt()), "y": Schema.Number.annotate({ "format": "int32" }).check(Schema.isInt()) }).annotate({ "description": "Desktop-space offset (top-left origin)." })
 export type PrepCmd = { readonly "do": string, readonly "undo"?: string | null }
 export const PrepCmd = Schema.Struct({ "do": Schema.String.annotate({ "description": "Command run before launch. Same recipe and ownership checks as hook `run`; stdin is `{}`." }), "undo": Schema.optionalKey(Schema.Union([Schema.String, Schema.Null]).annotate({ "description": "After session end. Skipped when its `do` failed (it never took effect)." })) }).annotate({ "description": "Per-app prep (Sunshine `prep-cmd` parity): `do` runs synchronously before launch;\n`undo` runs at session end, reverse order, best-effort, including panic-unwind ([`PrepGuard`])." })
+export type PrepareEmulatorRequest = { readonly "firmware_dir"?: string | null, readonly "platform"?: string | null }
+export const PrepareEmulatorRequest = Schema.Struct({ "firmware_dir": Schema.optionalKey(Schema.Union([Schema.String, Schema.Null]).annotate({ "description": "A folder whose files are that platform's firmware. From a plugin, a path relative to its\nown state directory (`firmware/ps2`); from the operator, an absolute path." })), "platform": Schema.optionalKey(Schema.Union([Schema.String, Schema.Null]).annotate({ "description": "The platform about to play: a catalog id like `ps2`, or an alias (RomM slug, ES-DE\nfolder, libretro name). Without it only first-run questions are answered." })) })
+export type PreparedStep = { readonly "kind": string, readonly "note"?: string | null, readonly "outcome": string, readonly "target": string }
+export const PreparedStep = Schema.Struct({ "kind": Schema.String.annotate({ "description": "`first_run`, `firmware`, `firmware_install`, `players` or `config_root`." }), "note": Schema.optionalKey(Schema.Union([Schema.String, Schema.Null])), "outcome": Schema.String.annotate({ "description": "`applied`, `present`, `skipped` or `failed`." }), "target": Schema.String.annotate({ "description": "The file the step is about." }) })
 export type Preset = "custom" | "default" | "gaming-rig" | "shared-desktop" | "hotdesk" | "workstation"
 export const Preset = Schema.Literals(["custom", "default", "gaming-rig", "shared-desktop", "hotdesk", "workstation"]).annotate({ "description": "Named bundle of the fields below. `Custom` uses the explicit fields;\nany other preset ignores them and expands ([`DisplayPolicy::effective`])." })
 export type ProviderRemoved = { readonly "removed": number }
@@ -305,6 +309,8 @@ export type DisplayLayoutRequest = { readonly "positions"?: { readonly [x: strin
 export const DisplayLayoutRequest = Schema.Struct({ "positions": Schema.optionalKey(Schema.Record(Schema.String, Position).annotate({ "description": "`{\"<identity_slot>\": {\"x\": …, \"y\": …}}` desktop top-left per slot." }).check(Schema.isPropertyNames(Schema.String))) }).annotate({ "description": "Manual layout: identity-slot id as string (same id `/display/state` reports) → desktop offset." })
 export type Layout = { readonly "mode"?: LayoutMode, readonly "positions"?: { readonly [x: string]: Position } }
 export const Layout = Schema.Struct({ "mode": Schema.optionalKey(LayoutMode), "positions": Schema.optionalKey(Schema.Record(Schema.String, Position).annotate({ "description": "Canonical decimal identity-slot ids (`\"1\"`..`\"15\"`) — the exact\nstring `arrange` looks up. [`DisplayPolicy::sanitized`] maps `\"01\"`\n→ `\"1\"` and drops non-ids; a key that never matches is a pin the\nconsole still shows while every session auto-rows past it." }).check(Schema.isPropertyNames(Schema.String))) })
+export type PreparedCopy = { readonly "exe": string, readonly "steps": ReadonlyArray<PreparedStep> }
+export const PreparedCopy = Schema.Struct({ "exe": Schema.String.annotate({ "description": "The program, or `flatpak run <app id>`, as the emulator list names it." }), "steps": Schema.Array(PreparedStep) }).annotate({ "description": "One copy of the emulator, and what preparing it did." })
 export type HostCheck = { readonly "id": string, readonly "impact": string, readonly "params": { readonly [x: string]: string }, readonly "remedy"?: null | Remedy, readonly "severity": "info" | "warning" | "critical", readonly "since_unix"?: number | null, readonly "source": CheckSource, readonly "status": CheckStatus, readonly "summary": string }
 export const HostCheck = Schema.Struct({ "id": Schema.String.annotate({ "description": "Console i18n key. See [`ids`]." }), "impact": Schema.String.annotate({ "description": "What breaks. Empty only on `ok`/`inapplicable`." }), "params": Schema.Record(Schema.String, Schema.String).annotate({ "description": "Interpolation for localized strings (`{user}`, `{group}`). Only the host can see these." }).check(Schema.isPropertyNames(Schema.String)), "remedy": Schema.optionalKey(Schema.Union([Schema.Null, Remedy], { mode: "oneOf" })), "severity": Schema.Literals(["info", "warning", "critical"]).annotate({ "description": "Meaningless on `ok`/`inapplicable`; carried so the wire shape never changes as status flips." }), "since_unix": Schema.optionalKey(Schema.Union([Schema.Number.annotate({ "format": "int64" }).check(Schema.isInt()).check(Schema.isGreaterThanOrEqualTo(0)), Schema.Null]).annotate({ "description": "First non-ok observation this run. Per-run stamp, not a history." })), "source": CheckSource, "status": CheckStatus, "summary": Schema.String.annotate({ "description": "English fallback. Console localizes when it knows `id`." }) }).annotate({ "description": "One health verdict — the wire shape." })
 export type ProviderRunningInput = { readonly "running"?: ReadonlyArray<RunningTitle> }
@@ -562,6 +568,20 @@ export type InstallEmulator500 = ApiError
 export const InstallEmulator500 = ApiError
 export type InstallEmulator502 = ApiError
 export const InstallEmulator502 = ApiError
+export type PrepareEmulatorRequestJson = PrepareEmulatorRequest
+export const PrepareEmulatorRequestJson = PrepareEmulatorRequest
+export type PrepareEmulator200 = ReadonlyArray<PreparedCopy>
+export const PrepareEmulator200 = Schema.Array(PreparedCopy)
+export type PrepareEmulator400 = ApiError
+export const PrepareEmulator400 = ApiError
+export type PrepareEmulator401 = ApiError
+export const PrepareEmulator401 = ApiError
+export type PrepareEmulator403 = ApiError
+export const PrepareEmulator403 = ApiError
+export type PrepareEmulator404 = ApiError
+export const PrepareEmulator404 = ApiError
+export type PrepareEmulator500 = ApiError
+export const PrepareEmulator500 = ApiError
 export type RemoveEmulatorRequestJson = RemoveEmulatorRequest
 export const RemoveEmulatorRequestJson = RemoveEmulatorRequest
 export type RemoveEmulator401 = ApiError
@@ -1542,6 +1562,18 @@ export const make = (
       orElse: unexpectedStatus
     }))
   ),
+    "prepareEmulator": (id, options) => HttpClientRequest.post(`/api/v1/emulators/${id}/prepare`).pipe(
+    HttpClientRequest.bodyJsonUnsafe(options.payload),
+    withResponse(options.config)(HttpClientResponse.matchStatus({
+      "2xx": decodeSuccess(PrepareEmulator200),
+      "400": decodeError("PrepareEmulator400", PrepareEmulator400),
+      "401": decodeError("PrepareEmulator401", PrepareEmulator401),
+      "403": decodeError("PrepareEmulator403", PrepareEmulator403),
+      "404": decodeError("PrepareEmulator404", PrepareEmulator404),
+      "500": decodeError("PrepareEmulator500", PrepareEmulator500),
+      orElse: unexpectedStatus
+    }))
+  ),
     "removeEmulator": (id, options) => HttpClientRequest.post(`/api/v1/emulators/${id}/remove`).pipe(
     HttpClientRequest.bodyJsonUnsafe(options.payload),
     withResponse(options.config)(HttpClientResponse.matchStatus({
@@ -2494,6 +2526,14 @@ readonly "getEmulators": <Config extends OperationConfig>(options: { readonly co
 * Reinstalls an existing copy. Admin lane only.
 */
 readonly "installEmulator": <Config extends OperationConfig>(id: string, options: { readonly config?: Config | undefined } | undefined) => Effect.Effect<WithOptionalResponse<typeof InstallEmulator200.Type, Config>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"InstallEmulator400", typeof InstallEmulator400.Type> | PunktfunkError<"InstallEmulator401", typeof InstallEmulator401.Type> | PunktfunkError<"InstallEmulator404", typeof InstallEmulator404.Type> | PunktfunkError<"InstallEmulator409", typeof InstallEmulator409.Type> | PunktfunkError<"InstallEmulator500", typeof InstallEmulator500.Type> | PunktfunkError<"InstallEmulator502", typeof InstallEmulator502.Type>>
+  /**
+* Every copy of the emulator on this host answers its first-run questions (a setup wizard, a
+* welcome box) the way clicking through would, gets the platform's firmware — copied into
+* its firmware folder, or installed by the emulator itself — and has this session's pads
+* bound in seat order, which the host undoes when the game exits. Idempotent; each step says
+* what it did, and a platform still missing its firmware says so.
+*/
+readonly "prepareEmulator": <Config extends OperationConfig>(id: string, options: { readonly payload: typeof PrepareEmulatorRequestJson.Encoded; readonly config?: Config | undefined }) => Effect.Effect<WithOptionalResponse<typeof PrepareEmulator200.Type, Config>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"PrepareEmulator400", typeof PrepareEmulator400.Type> | PunktfunkError<"PrepareEmulator401", typeof PrepareEmulator401.Type> | PunktfunkError<"PrepareEmulator403", typeof PrepareEmulator403.Type> | PunktfunkError<"PrepareEmulator404", typeof PrepareEmulator404.Type> | PunktfunkError<"PrepareEmulator500", typeof PrepareEmulator500.Type>>
   /**
 * Takes the release's files away and keeps the emulator's own data unless `purge` is set.
 * A Flatpak is uninstalled. Grants on its folder stay until the operator forgets them.
