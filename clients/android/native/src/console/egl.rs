@@ -9,6 +9,7 @@
 //! poster/glyph caches survive a trip through the stream.
 
 use anyhow::{anyhow, bail, Result};
+use ndk::data_space::DataSpace;
 use std::ffi::c_void;
 
 pub(super) type EGLDisplay = *mut c_void;
@@ -208,7 +209,10 @@ impl EglContext {
     }
 
     /// A window surface over `window`, made current on the calling thread with a vsync-locked
-    /// swap interval. Returns the surface and its pixel size.
+    /// swap interval, its buffers tagged sRGB. Returns the surface and its pixel size.
+    ///
+    /// EGL leaves a window's dataspace UNKNOWN, and a composer has to guess what a
+    /// 10/10/10/2 buffer holds. The console draws sRGB, so the buffers say so.
     pub(super) fn window_surface(
         &self,
         window: &ndk::native_window::NativeWindow,
@@ -224,6 +228,10 @@ impl EglContext {
             );
             if surface == EGL_NO_SURFACE {
                 bail!("eglCreateWindowSurface: 0x{:x}", eglGetError());
+            }
+            // After the create: EGL writes the window's dataspace there.
+            if let Err(e) = window.set_buffers_data_space(DataSpace::Srgb) {
+                log::warn!("console: window stays without an sRGB dataspace: {e}");
             }
             if eglMakeCurrent(self.display, surface, surface, self.context) != EGL_TRUE {
                 let e = eglGetError();
