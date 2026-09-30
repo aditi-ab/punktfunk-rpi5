@@ -112,6 +112,9 @@ fn build(
         }
         argv.push(substitute(arg, &values)?);
     }
+    if program == "flatpak" && argv.first().is_some_and(|a| a == "run") {
+        argv.splice(1..1, sandbox_reads(manifest, tmpl, &values));
+    }
     let cwd = match tmpl.cwd.as_deref() {
         None => None,
         Some(dir) => {
@@ -128,6 +131,30 @@ fn build(
         args: argv,
         cwd,
     })
+}
+
+/// `--filesystem=<root>:ro` for the root that holds each `path` value. A Flatpak sees nothing
+/// outside its sandbox, and a folder game needs its whole tree, so the emulator may read what
+/// the operator granted the plugin: that root, read-only, for this run only.
+fn sandbox_reads(
+    manifest: &PluginManifest,
+    tmpl: &crate::plugins::manifest::ExecTemplate,
+    values: &BTreeMap<&str, &str>,
+) -> Vec<String> {
+    let roots: std::collections::BTreeSet<String> = tmpl
+        .params
+        .iter()
+        .filter(|(_, kind)| **kind == ParamKind::Path)
+        .filter_map(|(name, _)| values.get(name.as_str()))
+        .filter_map(|v| manifest.root_of(Path::new(v)))
+        .map(|root| root.to_string_lossy().into_owned())
+        // `:` ends the path in Flatpak's own syntax.
+        .filter(|root| !root.contains(':'))
+        .collect();
+    roots
+        .into_iter()
+        .map(|root| format!("--filesystem={root}:ro"))
+        .collect()
 }
 
 /// A bare program name (resolved from `PATH` by the spawn) or an absolute path inside the roots
@@ -394,6 +421,46 @@ mod exec_tests {
         );
         // ...but only inside the roots the plugin may reach.
         assert!(build(&m, "game", Some(&args(&[("game", "/usr/bin/sudo")]))).is_err());
+    }
+
+    #[test]
+    fn a_flatpak_reads_the_root_that_holds_its_game_and_nothing_more() {
+        let mut m = manifest();
+        m.reads.push("/games/ps3".into());
+        m.exec.insert(
+            "rpcs3-flatpak".into(),
+            ExecTemplate {
+                exe: "flatpak".into(),
+                args: vec![
+                    "run".into(),
+                    "net.rpcs3.RPCS3".into(),
+                    "--no-gui".into(),
+                    "{rom}".into(),
+                ],
+                params: BTreeMap::from([("rom".to_string(), ParamKind::Path)]),
+                cwd: None,
+            },
+        );
+        let rom = "/games/ps3/Ratchet/PS3_GAME/USRDIR/EBOOT.BIN";
+        let r = build(&m, "rpcs3-flatpak", Some(&args(&[("rom", rom)]))).unwrap();
+        assert_eq!(
+            r.args,
+            vec![
+                "run",
+                "--filesystem=/games/ps3:ro",
+                "net.rpcs3.RPCS3",
+                "--no-gui",
+                rom
+            ]
+        );
+        // Not a Flatpak: the argv is the template's, untouched.
+        let r = build(
+            &m,
+            "retroarch",
+            Some(&args(&[("core", "snes9x"), ("rom", "/games/snes/M.sfc")])),
+        )
+        .unwrap();
+        assert!(!r.args.iter().any(|a| a.starts_with("--filesystem")));
     }
 
     #[test]
