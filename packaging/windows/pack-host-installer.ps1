@@ -201,6 +201,10 @@ function Sign-File([string]$Path) {
         if ($PfxPassword) { $signArgs += @('/p', $PfxPassword) }
         $ts = 'http://timestamp.digicert.com'
     }
+    # UAC names a signed file by /d. The exe's own FileDescription stays the one source.
+    $desc = (Get-Item $Path).VersionInfo.FileDescription
+    if ($desc) { $signArgs += @('/d', $desc) }
+    $signArgs += @('/du', 'https://punktfunk.unom.io')
     & $signtool ($signArgs + @('/tr', $ts, '/td', 'SHA256', $Path))
     if ($LASTEXITCODE -eq 0) { return }
     if ($signMode -eq 'azure') {

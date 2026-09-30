@@ -1,6 +1,7 @@
-//! Embed the Windows version-info + icon resources into `punktfunk-client.exe`. The icon drives
-//! Explorer / Alt-Tab / the unpackaged taskbar, and `app::run` stamps it onto the WinUI window's
-//! title bar via `WM_SETICON` (the MSIX taskbar/Start icons come from the package assets instead).
+//! Embed the Windows version-info + icon resources into `punktfunk-client.exe` and
+//! `punktfunk-console.exe`; both bins share the one resource. The icon drives Explorer /
+//! Alt-Tab / the unpackaged taskbar, and `app::run` stamps it onto the WinUI window's title bar
+//! via `WM_SETICON` (the MSIX taskbar/Start icons come from the package assets instead).
 
 fn main() {
     // cfg(windows) is the HOST (skips the Linux/macOS workspace stub build); CARGO_CFG_WINDOWS
@@ -31,6 +32,10 @@ fn main() {
         winresource::WindowsResource::new()
             // Ordinal 1 — app/mod.rs loads it by this id for WM_SETICON.
             .set_icon_with_id(icon, "1")
+            // UAC, firewall prompts and Task Manager name the exe by FileDescription.
+            .set("FileDescription", "Punktfunk")
+            .set("ProductName", "Punktfunk")
+            .set("CompanyName", "unom")
             .compile()
             .expect("embed windows icon resource");
     }
