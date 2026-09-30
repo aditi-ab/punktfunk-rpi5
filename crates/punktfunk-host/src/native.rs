@@ -1160,8 +1160,11 @@ pub(crate) enum Served {
 /// `downcast_ref` walks the context chain, so a failure keeps its sentence however
 /// deep under `.context()` it was raised.
 pub(crate) fn setup_failed_sentence(e: &anyhow::Error) -> Option<String> {
-    e.downcast_ref::<pf_vdisplay::monitors::MonitorNotFound>()
-        .map(|m| m.user_message())
+    if let Some(m) = e.downcast_ref::<pf_vdisplay::monitors::MonitorNotFound>() {
+        return Some(m.user_message());
+    }
+    e.downcast_ref::<pf_vdisplay::DisplayAsleep>()
+        .map(|d| d.user_message())
 }
 
 // One session's whole context, threaded down rather than bundled: every argument is owned by a
@@ -2796,6 +2799,12 @@ mod tests {
             "one close frame, uncut: {} bytes",
             said.len()
         );
+
+        let asleep = anyhow::Error::new(pf_vdisplay::DisplayAsleep)
+            .context("acquire virtual output for the session (retry-hold lease)");
+        let said = setup_failed_sentence(&asleep).expect("a dark display has words for the user");
+        assert!(said.starts_with("The host's screen is asleep"), "{said}");
+        assert!(said.len() <= punktfunk_core::quic::REFUSED_REASON_MAX);
 
         // Anything else keeps the client's own wording rather than leaking a chain.
         let other =

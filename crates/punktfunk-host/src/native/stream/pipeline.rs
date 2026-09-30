@@ -241,11 +241,14 @@ fn cycled_driver_for(_: &anyhow::Error) -> bool {
     false
 }
 
-/// `SET_ENCODE` answered `NO_DEVICE`: the driver has no render device for the monitor.
+/// `SET_ENCODE` answered `NO_DEVICE` for a render device that would not create. A missing
+/// swap-chain is Windows' decision, which a reload does not change.
 #[cfg(target_os = "windows")]
 fn is_driver_no_device(e: &anyhow::Error) -> bool {
     e.downcast_ref::<pf_capture::DriverEncodeOpenError>()
-        .is_some_and(|d| d.status == pf_driver_proto::encode::SET_ENCODE_NO_DEVICE)
+        .is_some_and(|d| {
+            d.status == pf_driver_proto::encode::SET_ENCODE_NO_DEVICE && !d.is_no_swap_chain()
+        })
 }
 
 /// Permanent = retrying cannot help this session. Match our English prefix, not KWin's translated payload.
@@ -649,16 +652,18 @@ mod tests {
     #[test]
     fn driver_no_device_is_found_through_the_context_chain() {
         use pf_driver_proto::encode::{SET_ENCODE_NO_BACKEND, SET_ENCODE_NO_DEVICE};
-        let open = |status| {
+        let open = |status, name: &str| {
             anyhow::Error::new(pf_capture::DriverEncodeOpenError {
                 backends: [1, 0, 0, 0],
                 status,
                 error: 0x8007_000Eu32 as i32,
-                name: "d3d11".into(),
+                name: name.into(),
             })
             .context("open video encoder")
         };
-        assert!(is_driver_no_device(&open(SET_ENCODE_NO_DEVICE)));
-        assert!(!is_driver_no_device(&open(SET_ENCODE_NO_BACKEND)));
+        assert!(is_driver_no_device(&open(SET_ENCODE_NO_DEVICE, "d3d11")));
+        assert!(!is_driver_no_device(&open(SET_ENCODE_NO_BACKEND, "d3d11")));
+        // A dark console display: Windows never assigned a swap-chain. No reload.
+        assert!(!is_driver_no_device(&open(SET_ENCODE_NO_DEVICE, "noswap")));
     }
 }

@@ -36,10 +36,7 @@ use windows::Win32::System::Threading::{
     PROCESS_DUP_HANDLE, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_SET_INFORMATION, PROCESS_SYNCHRONIZE,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_MOVE, MOUSEINPUT,
-};
-use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
+use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
 /// Map-only on the driver's section duplicate. No OWNER / `WRITE_DAC` / DELETE.
 const SECTION_MAP_RW: u32 = 0x0004 | 0x0002;
@@ -171,18 +168,14 @@ mod capturer;
 #[path = "idd_push/channel.rs"]
 mod channel;
 // Construction: adapter, HDR, cursor opt-in.
-#[path = "idd_push/open.rs"]
-mod open;
-// Synthetic DWM compose kick — the first-frame lever on an idle desktop.
-#[path = "idd_push/compose_kick.rs"]
-mod compose_kick;
-use compose_kick::kick_dwm_compose;
 #[path = "idd_push/cursor.rs"]
 mod cursor;
 #[path = "idd_push/cursor_model.rs"]
 mod cursor_model;
 #[path = "idd_push/cursor_poll.rs"]
 mod cursor_poll;
+#[path = "idd_push/open.rs"]
+mod open;
 use cursor_model::deliver_cursor_channel;
 #[path = "idd_push/descriptor.rs"]
 mod descriptor;
@@ -306,8 +299,6 @@ pub struct IddPushCapturer {
     last_drain: Instant,
     /// One 0 ms wait per second, and only while stale.
     last_liveness: Instant,
-    /// Mid-session [`kick_dwm_compose`] (recovery window only).
-    last_kick: Instant,
     /// Multi-hundred-ms DWM holes during active flow; warns when they turn metronomic.
     stall_watch: StallWatch,
     /// The stalest drain heartbeat (µs) seen since the last fresh frame.
@@ -322,7 +313,7 @@ pub struct IddPushCapturer {
     /// DxgKrnl ETW; `None` unless [`diag_dir`] is on, or the session refused to start.
     etw: Option<Arc<dxgkrnl_etw::EtwWatch>>,
     /// `PowerRequestDisplayRequired` for this capturer's life: DWM composes nothing
-    /// once the console goes dark. Waking an already-off display is the HID kick.
+    /// once the console goes dark. It only keeps a lit display on; the monitor create wakes one.
     _display_wake: Option<pf_frame::session_tuning::DisplayWakeRequest>,
     _keepalive: Box<dyn Send>,
 }

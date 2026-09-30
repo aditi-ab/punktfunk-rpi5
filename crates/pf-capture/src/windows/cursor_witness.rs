@@ -2,7 +2,7 @@
 //!
 //! A wedged-but-alive display and an idle desktop both just stop delivering frames. Cursor
 //! travel is the evidence that separates them, so this accumulator decides whether a silent
-//! stretch escalates into a reset. Pure over a `(now, kicked, position)` triple, so the rule
+//! stretch escalates into a reset. Pure over a `(now, position)` pair, so the rule
 //! is a table test rather than a soak — the capturer owns the `GetCursorPos` call and the
 //! classifier owns the verdict ([`recovery::Inputs::cursor_gap_px`]).
 //!
@@ -17,10 +17,6 @@ use std::time::{Duration, Instant};
 
 /// Two user32 reads; 8 ms so a ≥150 ms hole still gets many samples.
 pub(crate) const SAMPLE_INTERVAL: Duration = Duration::from_millis(8);
-
-/// The compose kick parks the pointer itself (~70 ms on the HID path). Its travel is not user
-/// input, and counting it would escalate an idle desktop into a reset.
-pub(crate) const KICK_BLIND: Duration = Duration::from_millis(200);
 
 /// Accumulated pointer travel since the last fresh frame, plus the one-call lag that keeps a
 /// stall-ending frame's own move out of the gap it ended.
@@ -48,21 +44,7 @@ impl CursorWitness {
     /// folded here belongs to the gap. `pos` is called only when the rate limit allows a
     /// sample, so the caller's `GetCursorPos` is skipped rather than discarded; `None` from it
     /// is a failed read, which leaves the accumulator alone.
-    ///
-    /// `kicked` (a compose kick within [`KICK_BLIND`]) drops the pending sample AND the anchor.
-    /// [`KICK_BLIND`] outlasts the kick, so the whole parking trip falls inside it and the first
-    /// sample after it re-anchors rather than charging the distance travelled.
-    pub(crate) fn sample(
-        &mut self,
-        now: Instant,
-        kicked: bool,
-        pos: impl FnOnce() -> Option<(i32, i32)>,
-    ) {
-        if kicked {
-            self.last = None;
-            self.pending_px = 0;
-            return;
-        }
+    pub(crate) fn sample(&mut self, now: Instant, pos: impl FnOnce() -> Option<(i32, i32)>) {
         self.gap_px = self.gap_px.saturating_add(self.pending_px);
         self.pending_px = 0;
         if now.duration_since(self.sampled_at) < SAMPLE_INTERVAL {
@@ -105,7 +87,7 @@ mod tests {
     fn walk(w: &mut CursorWitness, t: &mut Instant, path: &[(i32, i32)]) {
         for &p in path {
             *t += SAMPLE_INTERVAL;
-            w.sample(*t, false, || Some(p));
+            w.sample(*t, || Some(p));
         }
     }
 
@@ -145,36 +127,6 @@ mod tests {
         assert_eq!(w.moved_px(), Some(0), "the anchor survives it");
     }
 
-    /// The kick parks the pointer itself, and counting that travel escalates an idle desktop
-    /// into a reset. Dropping the anchor is only half the answer — what makes it work is that
-    /// `KICK_BLIND` outlasts the kick, so the exit re-anchors instead of charging the trip.
-    #[test]
-    fn a_kick_charges_the_gap_nothing_and_re_anchors_on_the_way_out() {
-        let mut t = Instant::now();
-        let mut w = CursorWitness::new(t);
-        walk(&mut w, &mut t, &[(0, 0)]);
-
-        // The kick drags the pointer 500 px away and back, all inside the blind window.
-        for p in [(250, 0), (500, 0), (250, 0), (0, 0)] {
-            t += SAMPLE_INTERVAL;
-            w.sample(t, true, || Some(p));
-        }
-        walk(&mut w, &mut t, &[(0, 0), (0, 0)]);
-        assert_eq!(w.gap_px(), 0, "the kick's own travel is not user input");
-
-        // A kick that ends somewhere new costs nothing either — the exit re-anchors.
-        for p in [(700, 700), (900, 900)] {
-            t += SAMPLE_INTERVAL;
-            w.sample(t, true, || Some(p));
-        }
-        walk(&mut w, &mut t, &[(900, 900), (900, 900)]);
-        assert_eq!(w.gap_px(), 0, "re-anchored, not charged the jump");
-
-        // Real travel after the window is charged again: the blind spot does not persist.
-        walk(&mut w, &mut t, &[(910, 900), (910, 900)]);
-        assert_eq!(w.gap_px(), 10);
-    }
-
     /// The rate limit is what keeps this off the capture thread's hot path — and a skipped call
     /// must not silently drop travel: the next sample measures from the last anchor.
     #[test]
@@ -185,7 +137,7 @@ mod tests {
 
         let mut asked = 0;
         t += SAMPLE_INTERVAL / 4;
-        w.sample(t, false, || {
+        w.sample(t, || {
             asked += 1;
             Some((100, 0))
         });
@@ -207,7 +159,7 @@ mod tests {
         walk(&mut w, &mut t, &[(0, 0)]);
 
         t += SAMPLE_INTERVAL;
-        w.sample(t, false, || None);
+        w.sample(t, || None);
         walk(&mut w, &mut t, &[(7, 0), (7, 0)]);
         assert_eq!(w.gap_px(), 7);
     }
@@ -218,9 +170,9 @@ mod tests {
         let t = Instant::now();
         let mut w = CursorWitness::new(t);
         assert_eq!(w.moved_px(), None);
-        w.sample(t + SAMPLE_INTERVAL, false, || None);
+        w.sample(t + SAMPLE_INTERVAL, || None);
         assert_eq!(w.moved_px(), None, "a failed read is still no evidence");
-        w.sample(t + SAMPLE_INTERVAL * 2, false, || Some((1, 1)));
+        w.sample(t + SAMPLE_INTERVAL * 2, || Some((1, 1)));
         assert_eq!(w.moved_px(), Some(0));
     }
 }
