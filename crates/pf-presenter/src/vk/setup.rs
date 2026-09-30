@@ -857,6 +857,16 @@ impl Presenter {
                     ),
                 #[cfg(not(target_os = "linux"))]
                 vaapi_av1_decode: false,
+                #[cfg(target_os = "linux")]
+                vaapi_hevc_decode: hw_capable
+                    && pf_client_core::video::vaapi_hevc_decodable(
+                        dev_props.vendor_id,
+                        video_ok
+                            && decode_ops & vk::VideoCodecOperationFlagsKHR::DECODE_H265.as_raw()
+                                != 0,
+                    ),
+                #[cfg(not(target_os = "linux"))]
+                vaapi_hevc_decode: false,
                 // HDR10 surface facts arrive with `pick_formats` below.
                 d3d11_hdr10: false,
                 d3d11_nv12: false,

@@ -152,6 +152,12 @@ mod video_software;
 // Only VAAPI rung; `auto` reaches it when vendor order puts VAAPI first, or pin `PUNKTFUNK_DECODER=native-vaapi`. Evidence: `video`.
 #[cfg(all(desktop, target_os = "linux"))]
 pub mod video_vaapi_native;
+// V4L2 decode: the hardware rung of SoCs with no Vulkan Video and no VA-API. `auto` reaches it after both; pin `PUNKTFUNK_DECODER=native-v4l2`.
+#[cfg(all(desktop, target_os = "linux"))]
+mod video_v4l2;
+// The stateless half of that rung: HEVC on decoders that take parsed slices (Raspberry Pi 5, RK3588).
+#[cfg(all(desktop, target_os = "linux"))]
+mod video_v4l2_hevc;
 // Native Vulkan Video (H.264/H.265/AV1) on the presenter's device. Auto's top rung on both desktop OSes; pin `PUNKTFUNK_DECODER=native-vulkan`. Evidence: `video`.
 #[cfg(desktop)]
 mod video_vk_native;

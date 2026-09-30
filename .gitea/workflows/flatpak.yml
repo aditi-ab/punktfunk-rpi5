@@ -47,6 +47,8 @@ on:
       - 'crates/pf-bitstream/**'
       - 'crates/pf-vkdecode/**'
       - 'crates/pf-vaapi/**'
+      - 'crates/pf-v4l2dec/**'
+      - 'crates/pf-v4l2/**'
       - 'crates/pf-libva/**'
       - 'crates/pf-dmabuf/**'
       - 'crates/pf-update-check/**'
