@@ -84,6 +84,12 @@
   </branding>
 
   <releases>
+    <release version="0.42.0" date="2026-10-01">
+      <url type="details">https://git.unom.io/unom/punktfunk/releases/tag/v0.42.0</url>
+      <description>
+        <p>The Linux client is redesigned with Hosts and Library tabs and decodes in hardware on ARM devices, controller mouse gains a Touchpad mode, and 4K streams at 120 fps and above keep up again.</p>
+      </description>
+    </release>
     <release version="0.41.0" date="2026-09-28">
       <url type="details">https://git.unom.io/unom/punktfunk/releases/tag/v0.41.0</url>
       <description>

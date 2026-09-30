@@ -14,6 +14,53 @@ short; the version-bump commit retitles it. Older sections stay as they are.
 
 ---
 
+## v0.42.0
+
+98 commits since v0.41.0. Wire stays 2. **C ABI 42**, additive. Driver protocol floor stays 9.
+Deep dive: `git log v0.41.0..v0.42.0`
+
+### Versions
+
+| | v0.41.0 | v0.42.0 | Notes |
+|---|---|---|---|
+| Wire protocol | 2 | **2** | unchanged |
+| C ABI | 41 | **42** | additive. 42 `punktfunk_connection_pad_mouse_mode` + `punktfunk_connection_cycle_pad_mouse`, modes `PUNKTFUNK_PAD_MOUSE_{OFF,TOUCHPAD,FULL}`; `punktfunk_connection_set_pad_mouse` keeps its meaning |
+| C headers | — | — | `punktfunk_core.h` gains the pad-mouse modes. `punktfunk_console.h` unchanged |
+| Rust edition / MSRV | 2024 / 1.85 | **2024 / 1.85** | unchanged |
+| Workspace crate dirs | 37 | **39** | `pf-v4l2` (V4L2 ioctls, links only libc) and `pf-v4l2dec` (the client's V4L2 decode rung) |
+| Virtual-display driver protocol | 9 | **9** | unchanged; the driver keeps a monitor's first composed frame as the next session's seed |
+| Windows virtual-gamepad channel | 3 | **3** | unchanged |
+| Plugin index schema | 1 | **1** | unchanged |
+| Host event schema | 1 | **1** | unchanged |
+| `api/openapi.json` | 0.41.0 | **0.42.0** | `POST /emulators/{id}/prepare`: first-run answers and firmware for each copy, pads bound before launch |
+| gamescope patch level (`+pfhdrN`) | 24 | **24** | unchanged |
+| `@punktfunk/host` (SDK) | 0.3.3 | **0.3.3** | unchanged; the tree's `prepareEmulator` ships with the next SDK cut |
+| `@punktfunk/plugin-kit` | 0.8.0 | **0.9.0** | `requestEmulators`, `requestCores`, the `ea` and `rockstar` kinds, the full provider entry (`audio`, `on_window`) and the host's library id rule. Peer `@punktfunk/host` stays ^0.3.0 |
+
+### Breaking
+
+- None.
+
+### Knobs
+
+- Desktop client: `PUNKTFUNK_VRR_PACE=0` presents on arrival on a variable-refresh panel.
+  `PUNKTFUNK_PRESENT_WAIT2=1` times presents with `VK_KHR_present_wait2` (off by default: it drops
+  frames on AMD's Windows driver). `PUNKTFUNK_FULLSCREEN_EXCLUSIVE=1` takes the monitor with
+  `VK_EXT_full_screen_exclusive` in a Windows fullscreen session.
+- Desktop client stats: the presenter line gains `glass=` (stamp source; `none` measured nothing),
+  `forwarded`, on-glass spacing p50/p95 and a pass count. `q_dry` is gone; starvation reads as `late`.
+- Android kit JNI: `nativeSetPadMouse` and `nativePadMouse` are replaced by
+  `nativePadMouseMode(handle, target)` and `nativeCyclePadMouse(handle, target)`.
+- Plugins: declare `@punktfunk/host` in `dependencies` beside the kit. A plugin with only the kit
+  crash-loops when an older plugin's kit owns the host's plugins folder.
+- iOS: the release `.ipa` is unsigned, for AltStore, SideStore and Sideloadly.
+- Flatpak: an aarch64 bundle (`-aarch64`) joins the release and the OSTree repo.
+- Linux client: `PUNKTFUNK_DECODER=native-v4l2` pins the V4L2 rung; `PUNKTFUNK_V4L2_DEVICE=/dev/videoN`
+  names its node. The Hello advertises HEVC and 10-bit only where a hardware rung decodes them.
+- Linux: ioctl requests and `recvmmsg` flags use the libc's own types, so musl (Alpine) compiles.
+- Windows: every shipped exe carries a version resource, signing passes `/d` from its
+  FileDescription, and `SDL3.dll` is signed.
+
 ## v0.41.0
 
 732 commits since v0.40.0. Wire stays 2. **C ABI 41**, additive. Driver protocol floor stays 9.
