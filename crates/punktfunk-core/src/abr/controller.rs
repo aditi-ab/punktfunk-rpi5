@@ -1255,13 +1255,16 @@ impl BitrateController {
         if v.bad {
             // What the rate is the lever for, read before the streaks move:
             // loss share, a delay rise, a flush, drops the clean run does not
-            // vouch for, and a decoder past its budget. Keyframe asks, host
-            // encode and one lost frame behind a clean window are not.
+            // vouch for, and a decoder past its budget. Keyframe asks and one
+            // lost frame behind a clean window are not.
             let repeated_drops = w.dropped > 1 || (w.dropped == 1 && self.clean_windows == 0);
             let link = w.loss_ppm >= HEAVY_LOSS_PPM || v.owd_bad || w.flushed || repeated_drops;
             // A decoder past its budget is a rate verdict but not a link one:
-            // the link delivered, the client could not decode it.
-            self.rate_verdict = link || v.decode_bad;
+            // the link delivered, the client could not decode it. Host encode
+            // says nothing until its notch is answered: the answer writes this.
+            if v.reason != Reason::Encode {
+                self.rate_verdict = link || v.decode_bad;
+            }
             // The link showed itself in one of two ways: a queue filling on
             // this session's own delay floor, or a window that carried less
             // than it was asked for. A link with room shows neither, so
