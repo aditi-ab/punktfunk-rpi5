@@ -409,6 +409,38 @@ mod mic_jitter;
 mod mic_pump;
 pub use mic_pump::{mic_source_id, MicFrame, MicPump};
 
+/// A session's hold on the shared virtual mic as the box's default source. The mic loses the
+/// default election on its own, so the box's own mic stays the default when nobody streams.
+#[must_use = "the claim ends when this drops"]
+pub struct DefaultMicClaim(());
+
+/// Games bind capture once at launch, so a session takes this before it launches one.
+pub fn claim_default_mic() -> DefaultMicClaim {
+    #[cfg(target_os = "linux")]
+    linux::claim_default_mic();
+    DefaultMicClaim(())
+}
+
+impl Drop for DefaultMicClaim {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        linux::release_default_mic();
+    }
+}
+
+/// Host stopping: write back every audio default a session claimed. The process exits without
+/// the destructors that would.
+pub fn restore_audio_defaults() {
+    #[cfg(target_os = "linux")]
+    linux::restore_defaults();
+}
+
+/// Host start: undo audio defaults a crashed host left pointing at its own nodes.
+pub fn heal_audio_defaults() {
+    #[cfg(target_os = "linux")]
+    linux::heal_defaults();
+}
+
 /// Apps playing audio on the host right now, lowercased. Empty where the host cannot list them.
 /// Blocks on a PipeWire round trip; call it off the async runtime.
 pub fn playing_apps() -> Vec<String> {

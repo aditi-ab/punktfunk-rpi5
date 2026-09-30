@@ -362,6 +362,9 @@ pub(crate) async fn serve(
     // Host-lifetime injector: one RemoteDesktop-portal grant. A CreateSession per session
     // races portal teardown on reconnect and wedges KWin EIS. Gamepads stay per-session.
     let injector = crate::inject::InjectorService::start();
+    // A crashed host's claims left the box's audio defaults on its own nodes. Off-thread: a
+    // sick PipeWire must not hold up serving; a session's claim waits on the same lock.
+    std::thread::spawn(crate::audio::heal_audio_defaults);
     // Host-lifetime virtual mic ([`crate::audio::MicPump`]): 0xCB Opus → a persistent source
     // games can bind before they launch. Opens eagerly; self-heals if the backend dies.
     let mic_service = crate::audio::MicPump::start();
@@ -569,6 +572,7 @@ fn install_shutdown_restore() {
             "host stopping — handing the box's session back"
         );
         let restore = tokio::task::spawn_blocking(|| {
+            crate::audio::restore_audio_defaults();
             // Monitors come back before the outputs go, and before the slower Game Mode restart.
             crate::vdisplay::registry::teardown_all();
             crate::vdisplay::restore_takeover_now();
@@ -2234,6 +2238,10 @@ struct SessionPlanes {
     mic_tx: std::sync::mpsc::SyncSender<crate::audio::MicFrame>,
     #[cfg(target_os = "linux")]
     _mic: Option<crate::audio::MicPump>,
+    /// The shared mic is the box's default source while this session lives. An isolated
+    /// session's own mic is pinned by `PULSE_SOURCE` and claims nothing.
+    #[cfg(target_os = "linux")]
+    _mic_default: Option<crate::audio::DefaultMicClaim>,
     #[cfg(target_os = "linux")]
     _injector: Option<crate::inject::InjectorService>,
 }
@@ -2290,6 +2298,7 @@ impl SessionPlanes {
                 .and_then(|i| i.mic_source.clone())
                 .map(|name| crate::audio::MicPump::start_named(Some(name)));
             let mic_tx = mic.as_ref().map(|p| p.sender()).unwrap_or(mic_tx);
+            let mic_default = mic.is_none().then(crate::audio::claim_default_mic);
             SessionPlanes {
                 isolation,
                 seat_dev,
@@ -2297,6 +2306,7 @@ impl SessionPlanes {
                 inj_session_tx,
                 mic_tx,
                 _mic: mic,
+                _mic_default: mic_default,
                 _injector: injector,
             }
         }

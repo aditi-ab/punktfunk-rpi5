@@ -32,6 +32,8 @@ pipewire = "0.9"
 pf-capture = { path = "../pf-capture" }
 # The USB/IP DualSense's audio channel, and its pairing reply for the `{mac}` sink template.
 pf-inject = { path = "../pf-inject" }
+# `state_dir`: the pre-claim audio defaults, kept for the host start after a crash.
+pf-paths = { path = "../pf-paths" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Config dir, owner-private writes, the seat marker and `pnputil /remove-device`.

@@ -99,6 +99,13 @@ pub fn data_dir() -> PathBuf {
     xdg_home("XDG_DATA_HOME", ".local/share").join("punktfunk")
 }
 
+/// `$XDG_STATE_HOME/punktfunk`, else `~/.local/state/punktfunk`: what must outlive a crash and
+/// a reboot, such as the audio defaults a session claimed.
+#[cfg(not(target_os = "windows"))]
+pub fn state_dir() -> PathBuf {
+    xdg_home("XDG_STATE_HOME", ".local/state").join("punktfunk")
+}
+
 /// `$var` when it holds an absolute path, else `$HOME/<fallback>`. The XDG base-dir spec
 /// ignores an empty or relative value.
 #[cfg(not(windows))]
