@@ -181,7 +181,8 @@ decoders, with openh264 and rav1d as the software floor on the desktop.
 | LG webOS · browser | ❓ ¹² | ❓ | ❓ | ❓ |
 
 1. Linux tries Vulkan Video first wherever it decodes the codec, then VAAPI (skipped on NVIDIA),
-   then a V4L2 decoder node (the hardware path on ARM boards, where the other two don't exist),
+   then a V4L2 decoder node (the hardware path on [ARM devices](/docs/linux-arm), where the
+   other two don't exist),
    then software. Windows tries Vulkan Video first on NVIDIA and AMD, D3D11VA first on Intel and
    others. Pin one in the client's decoder setting or with
    [`PUNKTFUNK_DECODER`](/docs/configuration#client-side-native-clients); a pinned decoder that
