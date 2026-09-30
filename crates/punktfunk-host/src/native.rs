@@ -542,10 +542,10 @@ pub(crate) async fn serve(
 /// 90 s `TimeoutStopSec`.
 const SHUTDOWN_RESTORE_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// Catch `SIGTERM`/`SIGINT`, restore the box's session, then exit. A takeover that stopped
-/// the display manager leaves no graphical session if killed; crash-restore lives in
-/// `$XDG_RUNTIME_DIR`, which logind removes with the user manager. Blocking restore under
-/// [`SHUTDOWN_RESTORE_GRACE`]; a host that took nothing over exits immediately.
+/// Catch `SIGTERM`/`SIGINT`, give the box back, then exit. `exit(0)` runs no destructor, so
+/// this is where the audio defaults, every display's topology restore and output, and a Game
+/// Mode takeover are undone. Crash-restore lives in `$XDG_RUNTIME_DIR`, which logind removes
+/// with the user manager. Blocking, under [`SHUTDOWN_RESTORE_GRACE`].
 fn install_shutdown_restore() {
     #[cfg(unix)]
     tokio::spawn(async {
@@ -568,7 +568,11 @@ fn install_shutdown_restore() {
             signal = sig,
             "host stopping — handing the box's session back"
         );
-        let restore = tokio::task::spawn_blocking(crate::vdisplay::restore_takeover_now);
+        let restore = tokio::task::spawn_blocking(|| {
+            // Monitors come back before the outputs go, and before the slower Game Mode restart.
+            crate::vdisplay::registry::teardown_all();
+            crate::vdisplay::restore_takeover_now();
+        });
         if tokio::time::timeout(SHUTDOWN_RESTORE_GRACE, restore)
             .await
             .is_err()

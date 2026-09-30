@@ -607,12 +607,15 @@ pub(crate) fn window_gen() -> Option<u64> {
 /// [`OutputGuard::drop`] is the only unplug, so a SIGKILLed host leaves heads
 /// in the compositor for the session's life. Keyed on the owner pid so a
 /// second live host (or this process) cannot have its output pulled. `Once`
-/// puts the sweep strictly before this process owns anything.
+/// puts the sweep strictly before this process owns anything. A dead host's
+/// `exclusive` session also left the real heads disabled; they come back too.
 fn reclaim_leftovers_once() {
     static RECLAIMED: Once = Once::new();
     RECLAIMED.call_once(|| {
         let Ok(names) = monitor_names() else { return };
-        for name in names {
+        let mut removed = false;
+        for name in &names {
+            let name = name.clone();
             let Some(pid) = output_owner_pid(&name) else {
                 // Not ours, or legacy `PF-<n>` with no owner — a still-running
                 // older host may be streaming it.
@@ -626,10 +629,22 @@ fn reclaim_leftovers_once() {
                 continue;
             }
             match hyprctl_dispatch(&["output", "remove", &name]) {
-                Ok(()) => tracing::info!(output = %name, owner_pid = pid, "removed a headless \
-                     output left behind by a host that is no longer running"),
+                Ok(()) => {
+                    removed = true;
+                    tracing::info!(output = %name, owner_pid = pid, "removed a headless \
+                         output left behind by a host that is no longer running")
+                }
                 Err(e) => tracing::warn!(output = %name, owner_pid = pid, error = %format!("{e:#}"),
                     "leftover headless output not removed"),
+            }
+        }
+        if removed {
+            let dark: Vec<String> = names
+                .into_iter()
+                .filter(|n| matches!(head_is_enabled(n), Ok(Some(false))))
+                .collect();
+            if !dark.is_empty() {
+                restore_heads(&dark);
             }
         }
     });
