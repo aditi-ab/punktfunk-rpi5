@@ -54,29 +54,16 @@ impl IddPushCapturer {
         self.sample_cursor_witness();
         // A "Use HDR" flip or a resize re-opens the encoder at the matching format.
         self.poll_display_hdr();
-        // Recover-or-drop: a presentation restart that never resumes ends the session.
-        if let Some(since) = self.recovering_since {
-            // Under a recovery episode the ladder's stage deadlines govern instead.
-            if since.elapsed() > Duration::from_secs(3) && !self.recovery.owns_episode() {
-                bail!(
-                    "IDD-push: the display was restarted in place and no frame followed within 3s \
-                     — dropping the session so the client reconnects"
-                );
-            }
-            // Idle desktop after the restart: no compose, and recover-or-drop would kill a
-            // healthy session. The driver's retained pool slot covers most of it; this kick is
-            // the fallback. Rate-limited; may block ~35 ms on the sibling-display branch.
-            if since.elapsed() > Duration::from_millis(600)
-                && self.last_kick.elapsed() > Duration::from_millis(800)
-            {
-                self.last_kick = Instant::now();
-                tracing::debug!(
-                    target_id = self.target_id,
-                    "IDD push: no frame after the presentation restart — falling back to a \
-                     synthetic compose kick"
-                );
-                kick_dwm_compose(self.ccd);
-            }
+        // Recover-or-drop: a presentation restart that never resumes ends the session. The
+        // restart's own mode commit composes a frame; the ladder's deadlines govern an episode.
+        if let Some(since) = self.recovering_since
+            && since.elapsed() > Duration::from_secs(3)
+            && !self.recovery.owns_episode()
+        {
+            bail!(
+                "IDD-push: the display was restarted in place and no frame followed within 3s \
+                 — dropping the session so the client reconnects"
+            );
         }
         // A dead WUDFHost and an idle desktop both stop advancing the source counter. Probe
         // while stale so the driver cycle fires instead of the session streaming nothing.
@@ -93,16 +80,6 @@ impl IddPushCapturer {
                 return Ok(None);
             }
         }
-        // First frame: DWM presents a display only when something dirties it, and the driver's
-        // retained pool slot is empty on a monitor's first session. Kick until the pool takes
-        // one. Rate-limited, and only once the encoder is open — before that nobody would see it.
-        if self.driver_source_seq == 0
-            && self.encoder.is_some()
-            && self.last_kick.elapsed() > Duration::from_millis(800)
-        {
-            self.last_kick = Instant::now();
-            kick_dwm_compose(self.ccd);
-        }
         // Staged recovery — after the driver-death watch, so an episode means the WUDFHost is
         // ALIVE and the presentation path is what stopped.
         self.recovery_tick()?;
@@ -118,7 +95,7 @@ impl IddPushCapturer {
         let driver_seq = self.encoder.map_or(0, |t| t.source_seq);
         let geometry = (self.width, self.height, self.out_format());
         // A re-opened encoder's fresh section reads 0 until the pool takes a frame: no news,
-        // not a delivery — a delivered 0 would re-arm the first-frame kick mid-session.
+        // not a delivery.
         if opened
             && (driver_seq == 0 || driver_seq == self.driver_source_seq)
             && self.delivered == Some(geometry)

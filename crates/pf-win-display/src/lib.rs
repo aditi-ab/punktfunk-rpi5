@@ -10,12 +10,15 @@
 //!   event coincided with it.
 //! - [`snapshot`]: the platform-neutral snapshot types and cache rules (tested everywhere).
 //! - [`console_display`]: the console display's power state and the wake a new monitor needs.
+//! - [`compose_probe`]: the recovery canary — a 1-pixel window repaint, never input.
 
 #[cfg(target_os = "windows")]
 pub mod adl_emul;
 /// Typed per-target CCD packets behind one SAFETY proof.
 #[cfg(target_os = "windows")]
 mod ccd_info;
+#[cfg(target_os = "windows")]
+pub mod compose_probe;
 #[cfg(target_os = "windows")]
 pub mod console_display;
 #[cfg(target_os = "windows")]

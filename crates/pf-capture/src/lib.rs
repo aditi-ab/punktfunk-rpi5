@@ -623,16 +623,6 @@ pub fn capturer_supports_444(_encoder_ingests_rgb_444: bool) -> bool {
     false
 }
 
-/// Host-registered HID compose-kick: `(target_rect, desktop_bounds) -> accepted`,
-/// both `(x, y, w, h)` in desktop coordinates (CCD). Device-level input wakes a
-/// powered-off display regardless of session; `SendInput` does not. `false` →
-/// `SendInput` fallback. This crate never reaches the host inject module.
-#[cfg(target_os = "windows")]
-pub static HID_COMPOSE_KICK: std::sync::OnceLock<HidKickFn> = std::sync::OnceLock::new();
-
-#[cfg(target_os = "windows")]
-pub type HidKickFn = fn((i32, i32, i32, i32), (i32, i32, i32, i32)) -> bool;
-
 /// v5 hardware-cursor channel (`IOCTL_SET_CURSOR_CHANNEL`). Host-built so this
 /// crate never reaches the orchestrator; on IOCTL success the driver owns the
 /// handle duplicated into WUDFHost. `Some` opts in: the capturer creates

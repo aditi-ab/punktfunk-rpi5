@@ -1467,9 +1467,6 @@ fn anchor_kept_sources_at_origin(
 
 /// The desktop-space rectangle `(x, y, w, h)` of `target_id`'s SOURCE — where this display's
 /// region lives in the desktop coordinate space. `None` while the target isn't an active path.
-/// Used by the IDD-push compose kick to dirty THE TARGET display: with parallel displays the
-/// cursor sits on ONE of them, and a cursor wiggle only dirties that one — a sibling display's
-/// kick must first know where to send the cursor (Stage W3 on-glass finding).
 pub fn source_desktop_rect(key: CcdTargetKey) -> Option<(i32, i32, i32, i32)> {
     let (paths, modes) = query_active_config()?;
     for p in &paths {
