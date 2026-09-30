@@ -23,14 +23,26 @@ impl Shell {
             }
         }
         st.intake();
+        st.win.ticks += 1;
+        if let Some(refresh_ns) = self.presenter.measured_refresh_ns() {
+            if self.presenter.vblank_locked() {
+                st.cadence.note_refresh(refresh_ns, st.mode_period_ns);
+            }
+        }
         let now_ns = session::now_ns();
-        let mut to_present = st.pick(now_ns, self.presenter.present_timing_active());
+        // An estimated stamp is a measurement, never a pacing input: on a VRR panel the
+        // vblanks it reads follow our own presents, and a grid built on them chases itself.
+        let grid_known =
+            self.presenter.present_timing_active() && !self.presenter.glass_estimated();
+        let mut to_present = st.pick(now_ns, grid_known);
         // FIFO glass budget: one undisplayed present in flight, so the swapchain's
         // own FIFO can never become a standing queue. Only FIFO modes queue and only
-        // present timing can count; everywhere else this stays inert.
+        // present-wait can count: an estimated stamp confirms a vblank late, and gating
+        // on it spaces presents two or three refreshes apart.
         if self.pacing_active
             && self.presenter.needs_glass_gate()
             && self.presenter.present_timing_active()
+            && !self.presenter.glass_estimated()
         {
             if let Some(f) = to_present.take() {
                 if st.gate.open(self.presenter.presents_outstanding(), now_ns) {
@@ -88,17 +100,20 @@ impl Shell {
         let [import, submit, fence, acquire, queue_present] = st.win.take_timings();
         // Drained once per window and shared by the HUD and the log line — a
         // second `take_counters` would read zeros.
-        let (replaced, q_drop, q_dry) = st.store.take_counters();
+        let (replaced, q_drop) = st.store.take_counters();
         let (gated, forced) = st.gate.take_counters();
+        let forwarded = st.forwarder_drops.swap(0, Ordering::Relaxed);
+        let cadence_err = hud::Summary::of(&mut st.win.cadence_err_us);
+        st.win.cadence_err_us.clear();
         st.last_forced = forced;
         let present = PresentCounters {
             mode: self.presenter.present_mode_name(),
             vrr: st.cadence.verdict(),
             smoothing: st.store.is_smoothing(),
             q_drop,
-            q_dry,
             gated,
             forced,
+            forwarded,
         };
         let (pace_ms, latch_ms) = close_window(
             st,
@@ -149,12 +164,23 @@ impl Shell {
             let native_zero_copy = (0u32, 0u32);
             tracing::info!(
                 smoothing = present.smoothing,
+                // The latency intent held for its due time: a measured VRR panel.
+                paced = st.pacer.paces_latency(),
                 mode = present.mode,
+                // Where the display stamps came from; `none` means the glass fields
+                // below (steps, judder, misses, gated) measured nothing.
+                glass = self.presenter.glass_source(),
                 vrr = present.vrr.label(),
                 native_zero_copy = ?native_zero_copy,
                 replaced,
                 q_drop,
-                q_dry,
+                forwarded = present.forwarded,
+                repeats = st.win.repeats,
+                // Loop passes this second: far above the frame rate is a spin.
+                ticks = st.win.ticks,
+                // On-glass spacing error against the source's spacing, per shown frame.
+                cadence_err_us = cadence_err.p50_us,
+                cadence_err_p95_us = cadence_err.p95_us,
                 gated,
                 forced,
                 misses = st.win.misses,
@@ -173,6 +199,8 @@ impl Shell {
                 acquire_max_us = acquire.max_us,
                 present_us = queue_present.p50_us,
                 period_us = st.clock.period_ns() / 1000,
+                // The output's own vblank spacing where a waiter measures it; 0 elsewhere.
+                refresh_us = self.presenter.measured_refresh_ns().unwrap_or(0) / 1000,
                 margin_us = st.margin_ns / 1000,
                 // Hand-over to first latch: what it takes, the window's median,
                 // and the frames that landed a latch later all the same.
@@ -242,6 +270,17 @@ impl StreamState {
                     (s.displayed_ns.saturating_sub(self.last_displayed_ns) + period / 2) / period;
                 self.win.steps[(steps as usize).min(5)] += 1;
             }
+            // On-glass spacing against the source's own: valid on a fixed panel and a
+            // variable one alike, where whole-period steps mean nothing.
+            if self.last_displayed_ns != 0 && s.pts_ns > self.last_shown_pts_ns {
+                let glass = s.displayed_ns.saturating_sub(self.last_displayed_ns);
+                let source = s.pts_ns - self.last_shown_pts_ns;
+                let err_us = glass.abs_diff(source) / 1000;
+                self.win
+                    .cadence_err_us
+                    .push(err_us.min(u64::from(u32::MAX)) as u32);
+            }
+            self.last_shown_pts_ns = s.pts_ns;
             self.last_displayed_ns = s.displayed_ns;
             stamps.push(s.displayed_ns);
         }
@@ -272,6 +311,8 @@ impl StreamState {
     /// make buffering moot.
     pub(super) fn intake(&mut self) {
         while let Ok(f) = self.frames.try_recv() {
+            let repeat = f.repeat;
+            self.win.repeats += u32::from(repeat);
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             if self.store.is_smoothing() && matches!(f.image, DecodedImage::PyroWave(_)) {
                 self.store.force_latency();
@@ -286,10 +327,16 @@ impl StreamState {
             // Intent after any PyroWave collapse above, so a wavelet stream folds
             // nothing into a loop it will never consult.
             let smoothing = self.store.is_smoothing();
-            let due_ns = self
-                .pacer
-                .due_ns(smoothing, f.pts_ns, f.decoded_ns, self.source_interval_ns)
-                .unwrap_or(0);
+            // A repeat is shown on arrival and stays out of the cadence clock: it is the
+            // picture already on glass, and its near-free encode would read as an early
+            // arrival. Shown, it keeps a VRR panel off its own refresh filler.
+            let due_ns = if repeat {
+                0
+            } else {
+                self.pacer
+                    .due_ns(smoothing, f.pts_ns, f.decoded_ns, self.source_interval_ns)
+                    .unwrap_or(0)
+            };
             self.store.submit(Paced { frame: f, due_ns });
         }
     }
@@ -298,7 +345,12 @@ impl StreamState {
     /// smoothness serves the frame whose due time has come. `grid_known`: on-glass
     /// stamps feed the latch clock; without them the due time itself is the target.
     pub(super) fn pick(&mut self, now_ns: u64, grid_known: bool) -> Option<Paced> {
-        self.pacer.follow(self.cadence.verdict(), grid_known);
+        self.pacer.follow(
+            self.cadence.verdict(),
+            grid_known,
+            self.store.is_smoothing(),
+        );
+        self.store.set_paced(self.pacer.paces_latency());
         if self.store.is_smoothing() {
             if self.pacer.free_running() {
                 // Variable refresh, measured: the panel refreshes when we present, so
@@ -325,7 +377,8 @@ impl StreamState {
                 }
             }
         } else {
-            self.store.take(|_| true)
+            // Arrival-driven; a paced store (measured VRR) holds the newest for its due time.
+            self.store.take(|p| p.due_ns <= now_ns as i64)
         }
     }
 
@@ -343,6 +396,7 @@ impl StreamState {
                 DecodedFrame {
                     pts_ns,
                     decoded_ns,
+                    repeat: _,
                     image,
                 },
             due_ns,
@@ -530,6 +584,12 @@ pub(super) struct PresentWindow {
     steps: [u32; 6],
     /// Non-blocking presents that came back busy this window: [fence, acquire].
     busy: [u32; 2],
+    /// Host repeats taken in: shown, and kept out of the cadence clock.
+    repeats: u32,
+    /// Run-loop passes.
+    ticks: u32,
+    /// Per shown frame: |on-glass spacing − source spacing| to the frame before it, µs.
+    cadence_err_us: Vec<u32>,
     /// This window's on-glass frames: the lead each had to its first latch, and whether
     /// it landed on a later one.
     leads: Vec<(i64, bool)>,
@@ -548,6 +608,9 @@ impl PresentWindow {
             out_max: 0,
             steps: [0; 6],
             busy: [0; 2],
+            repeats: 0,
+            ticks: 0,
+            cadence_err_us: Vec::with_capacity(256),
             leads: Vec::with_capacity(256),
         }
     }
@@ -584,6 +647,8 @@ impl PresentWindow {
         self.out_max = 0;
         self.steps = [0; 6];
         self.busy = [0; 2];
+        self.repeats = 0;
+        self.ticks = 0;
         self.leads.clear();
     }
 }
@@ -704,6 +769,8 @@ impl StreamState {
                 frame: DecodedFrame {
                     pts_ns,
                     decoded_ns,
+                    // Counted at intake; nothing reads the flag past it.
+                    repeat: false,
                     image,
                 },
                 due_ns,
@@ -714,9 +781,9 @@ impl StreamState {
         self.busy_retry = true;
     }
 
-    /// Smoothness with a frame in hand sleeps only to the pass that can still serve it;
-    /// everything else uses a 15 ms housekeeping tick. Must stay the present decision's
-    /// mirror — a rule changed on one side oversleeps a smooth stream past its due time.
+    /// A paced store with a frame in hand sleeps only to the pass that can still serve
+    /// it; everything else uses a 15 ms housekeeping tick. Must stay the present
+    /// decision's mirror — a rule changed on one side oversleeps a frame past its due time.
     pub(super) fn wake_timeout(&self) -> Duration {
         const TICK: Duration = Duration::from_millis(15);
         if self.busy_retry {
@@ -727,7 +794,7 @@ impl StreamState {
                 crate::vk::BusyOn::Acquire => Duration::from_millis(1),
             };
         }
-        if !self.store.is_smoothing() {
+        if !self.store.is_smoothing() && !self.pacer.paces_latency() {
             return TICK;
         }
         let Some(p) = self.store.front() else {
@@ -745,8 +812,16 @@ impl StreamState {
         } else {
             self.clock.next_slot_after(p.due_ns.max(0) as u64) as i64 - lead_ns
         };
+        // Windows sleeps its short waits itself ([`wait_event`](super::wait_event)), so the
+        // floor there is what a due time may slip by; elsewhere SDL's wait takes a
+        // millisecond at least.
+        let floor = if cfg!(windows) {
+            Duration::from_micros(200)
+        } else {
+            Duration::from_millis(1)
+        };
         Duration::from_nanos(wake_ns.saturating_sub(session::now_ns() as i64).max(0) as u64)
-            .clamp(Duration::from_millis(1), TICK)
+            .clamp(floor, TICK)
     }
 }
 
@@ -862,9 +937,10 @@ pub(super) struct PresentCounters {
     pub(super) vrr: Cadence,
     pub(super) smoothing: bool,
     pub(super) q_drop: u32,
-    pub(super) q_dry: u32,
     pub(super) gated: u32,
     pub(super) forced: u32,
+    /// Wake-forwarder displacements: the loop stalled two frame intervals.
+    pub(super) forwarded: u32,
 }
 
 /// Close the overlay window: the connector's snapshot plus what only the presenter knows,
@@ -879,9 +955,14 @@ pub(super) fn close_window(
     let Some(c) = st.connector.clone() else {
         return (0.0, 0.0);
     };
-    // Replaced before display, or dropped from a full smoothing queue: decoded, never shown.
-    c.hud()
-        .note_skipped(replaced.saturating_add(present.q_drop), 0);
+    // Replaced before display, dropped from a full smoothing queue, or displaced in the
+    // wake forwarder: decoded, never shown.
+    c.hud().note_skipped(
+        replaced
+            .saturating_add(present.q_drop)
+            .saturating_add(present.forwarded),
+        0,
+    );
     let mut snap = c.hud_snapshot();
     snap.decoder = st.facts.decoder.to_string();
     snap.hdr = hdr_shown(st.hdr, presenter.hdr_active(), st.hdr_untonemapped);
@@ -948,7 +1029,7 @@ pub(super) fn desktop_extras(
         }
         for (name, n) in [
             ("qdrop", p.q_drop),
-            ("qdry", p.q_dry),
+            ("fwd", p.forwarded),
             ("gated", p.gated),
             ("forced", p.forced),
         ] {
@@ -1112,9 +1193,9 @@ mod tests {
             vrr: Cadence::Unknown,
             smoothing: false,
             q_drop: 0,
-            q_dry: 0,
             gated: 0,
             forced: 0,
+            forwarded: 0,
         }
     }
 
@@ -1133,14 +1214,13 @@ mod tests {
             vrr: Cadence::Variable,
             smoothing: true,
             q_drop: 2,
-            q_dry: 1,
             gated: 7,
             forced: 1,
             ..counters()
         };
         assert_eq!(
             desktop_extras(&busy, None, None, 0)[0].text,
-            "present: fifo · vrr yes · smoothing · qdrop 2 · qdry 1 · gated 7 · forced 1"
+            "present: fifo · vrr yes · smoothing · qdrop 2 · gated 7 · forced 1"
         );
         let no_mode = PresentCounters {
             mode: "",

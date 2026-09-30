@@ -203,6 +203,116 @@ pub(crate) mod fifo_latest_ready {
     }
 }
 
+/// `VK_KHR_present_id2` + `VK_KHR_present_wait2`, hand-declared: ash 0.38 predates them.
+///
+/// The per-surface successors of present-id/present-wait. A driver that cannot promise
+/// the wait on every surface withholds the old pair altogether (AMD on Windows); this
+/// pair is advertised per surface and asked for per swapchain. Values are the registry's
+/// (`vk.xml`, extensions 480 and 481).
+pub(crate) mod present_wait2 {
+    use ash::vk;
+    use std::ffi::c_void;
+
+    pub(super) const ID_NAME: &std::ffi::CStr = c"VK_KHR_present_id2";
+    pub(super) const WAIT_NAME: &std::ffi::CStr = c"VK_KHR_present_wait2";
+    /// Loaded by name: no ash wrapper.
+    pub(super) const WAIT_FN: &std::ffi::CStr = c"vkWaitForPresent2KHR";
+    /// `PRESENT_ID_2_BIT_KHR | PRESENT_WAIT_2_BIT_KHR`: the swapchain opts in at create.
+    pub(crate) const SWAPCHAIN_FLAGS: vk::SwapchainCreateFlagsKHR =
+        vk::SwapchainCreateFlagsKHR::from_raw(0x40 | 0x80);
+
+    const CAPS_ID: i32 = 1_000_479_000;
+    const PRESENT_ID: i32 = 1_000_479_001;
+    const FEATURE_ID: i32 = 1_000_479_002;
+    const CAPS_WAIT: i32 = 1_000_480_000;
+    const FEATURE_WAIT: i32 = 1_000_480_001;
+    const WAIT_INFO: i32 = 1_000_480_002;
+
+    /// One `VkBool32` behind an sType: the two feature structs and the two
+    /// surface-capability structs share this layout.
+    #[repr(C)]
+    pub(super) struct Flag {
+        pub s_type: vk::StructureType,
+        pub p_next: *mut c_void,
+        pub value: vk::Bool32,
+    }
+
+    impl Flag {
+        fn new(s_type: i32, value: vk::Bool32) -> Flag {
+            Flag {
+                s_type: vk::StructureType::from_raw(s_type),
+                p_next: std::ptr::null_mut(),
+                value,
+            }
+        }
+
+        /// `VkPhysicalDevicePresentId2FeaturesKHR`.
+        pub(super) fn id_feature(value: vk::Bool32) -> Flag {
+            Flag::new(FEATURE_ID, value)
+        }
+
+        /// `VkPhysicalDevicePresentWait2FeaturesKHR`.
+        pub(super) fn wait_feature(value: vk::Bool32) -> Flag {
+            Flag::new(FEATURE_WAIT, value)
+        }
+
+        /// `VkSurfaceCapabilitiesPresentId2KHR`.
+        pub(super) fn id_caps() -> Flag {
+            Flag::new(CAPS_ID, vk::FALSE)
+        }
+
+        /// `VkSurfaceCapabilitiesPresentWait2KHR`.
+        pub(super) fn wait_caps() -> Flag {
+            Flag::new(CAPS_WAIT, vk::FALSE)
+        }
+    }
+
+    /// `VkPresentId2KHR`, chained onto `VkPresentInfoKHR`. Borrows `ids` by pointer: the
+    /// slice must outlive the present call.
+    #[repr(C)]
+    pub(crate) struct PresentId2 {
+        pub s_type: vk::StructureType,
+        pub p_next: *const c_void,
+        pub swapchain_count: u32,
+        pub p_present_ids: *const u64,
+    }
+
+    impl PresentId2 {
+        pub(crate) fn new(ids: &[u64]) -> PresentId2 {
+            PresentId2 {
+                s_type: vk::StructureType::from_raw(PRESENT_ID),
+                p_next: std::ptr::null(),
+                swapchain_count: ids.len() as u32,
+                p_present_ids: ids.as_ptr(),
+            }
+        }
+    }
+
+    /// `VkPresentWait2InfoKHR`.
+    #[repr(C)]
+    pub(crate) struct WaitInfo {
+        pub s_type: vk::StructureType,
+        pub p_next: *const c_void,
+        pub present_id: u64,
+        pub timeout: u64,
+    }
+
+    impl WaitInfo {
+        pub(crate) fn new(present_id: u64, timeout: u64) -> WaitInfo {
+            WaitInfo {
+                s_type: vk::StructureType::from_raw(WAIT_INFO),
+                p_next: std::ptr::null(),
+                present_id,
+                timeout,
+            }
+        }
+    }
+
+    /// `vkWaitForPresent2KHR`.
+    pub(crate) type WaitFn =
+        unsafe extern "system" fn(vk::Device, vk::SwapchainKHR, *const WaitInfo) -> vk::Result;
+}
+
 impl Presenter {
     /// Instance → surface → device → swapchain over an SDL window.
     /// `instance_extensions` is `VideoSubsystem::vulkan_instance_extensions()`.
@@ -231,6 +341,16 @@ impl Presenter {
         if has_colorspace_ext {
             instance_extensions.push("VK_EXT_swapchain_colorspace".into());
         }
+        // Per-surface queries (present-wait2, exclusive fullscreen) go through
+        // `VK_KHR_get_surface_capabilities2`.
+        let has_caps2_ext = inst_available
+            .iter()
+            .any(|e| e.extension_name_as_c_str() == Ok(ash::khr::get_surface_capabilities2::NAME));
+        if has_caps2_ext {
+            instance_extensions.push("VK_KHR_get_surface_capabilities2".into());
+        }
+        #[cfg(windows)]
+        let want_fse = fullscreen_exclusive_opt_in();
         let ext_cstrings: Vec<CString> = instance_extensions
             .iter()
             .map(|e| CString::new(e.as_str()).unwrap())
@@ -366,6 +486,46 @@ impl Presenter {
         let present_wait_ok = present_wait_exts
             && have_pid.present_id == vk::TRUE
             && have_pwait.present_wait == vk::TRUE;
+        // The per-surface successors: the device features, then what this surface promises.
+        let present_wait2_ok =
+            has_caps2_ext && has(present_wait2::ID_NAME) && has(present_wait2::WAIT_NAME) && {
+                let mut wait = present_wait2::Flag::wait_feature(vk::FALSE);
+                let mut id = present_wait2::Flag::id_feature(vk::FALSE);
+                id.p_next = (&mut wait) as *mut _ as *mut std::ffi::c_void;
+                let mut probe = vk::PhysicalDeviceFeatures2 {
+                    p_next: (&mut id) as *mut _ as *mut std::ffi::c_void,
+                    ..Default::default()
+                };
+                // SAFETY: read-only query; the chained locals outlive the call.
+                unsafe { instance.get_physical_device_features2(pdev, &mut probe) };
+                let mut wait_caps = present_wait2::Flag::wait_caps();
+                let mut id_caps = present_wait2::Flag::id_caps();
+                id_caps.p_next = (&mut wait_caps) as *mut _ as *mut std::ffi::c_void;
+                let mut caps2 = vk::SurfaceCapabilities2KHR {
+                    p_next: (&mut id_caps) as *mut _ as *mut std::ffi::c_void,
+                    ..Default::default()
+                };
+                let surface_info = vk::PhysicalDeviceSurfaceInfo2KHR::default().surface(surface);
+                let caps2_i = ash::khr::get_surface_capabilities2::Instance::new(&entry, &instance);
+                // SAFETY: live handles; the chained locals outlive the call.
+                let queried = unsafe {
+                    caps2_i.get_physical_device_surface_capabilities2(
+                        pdev,
+                        &surface_info,
+                        &mut caps2,
+                    )
+                }
+                .is_ok();
+                queried
+                    && id.value == vk::TRUE
+                    && wait.value == vk::TRUE
+                    && id_caps.value == vk::TRUE
+                    && wait_caps.value == vk::TRUE
+            };
+        // The successors only on request: AMD's Windows driver completes the wait late
+        // enough that the glass gate drops frames. Without them the vblank waiter runs.
+        let use_wait2 = present_wait2_ok && present_wait2_opt_in();
+        let present_wait_ok = present_wait_ok && !use_wait2;
         // PyroWave is Vulkan 1.3 compute on this device — no video extensions.
         // Probe here so a capable device enables the features and advertises the codec.
         let pyrowave_ok = dev_is_13
@@ -432,8 +592,22 @@ impl Presenter {
             dev_exts.push(ash::khr::present_id::NAME.as_ptr());
             dev_exts.push(ash::khr::present_wait::NAME.as_ptr());
         }
+        if use_wait2 {
+            dev_exts.push(present_wait2::ID_NAME.as_ptr());
+            dev_exts.push(present_wait2::WAIT_NAME.as_ptr());
+        }
         if flr_ok {
             dev_exts.push(fifo_latest_ready::NAME.as_ptr());
+        }
+        // Exclusive fullscreen, opt-in and fullscreen sessions only.
+        #[cfg(windows)]
+        let fse_ok = want_fse
+            && has_caps2_ext
+            && pref.fullscreen
+            && has(ash::ext::full_screen_exclusive::NAME);
+        #[cfg(windows)]
+        if fse_ok {
+            dev_exts.push(ash::ext::full_screen_exclusive::NAME.as_ptr());
         }
         let mut en_flr = fifo_latest_ready::Features {
             present_mode_fifo_latest_ready: vk::TRUE,
@@ -464,6 +638,14 @@ impl Presenter {
             en_flr.p_next = en_f2.p_next;
             en_f2.p_next = (&mut en_flr) as *mut _ as *mut std::ffi::c_void;
         }
+        let mut en_wait2 = present_wait2::Flag::wait_feature(vk::TRUE);
+        let mut en_id2 = present_wait2::Flag::id_feature(vk::TRUE);
+        if use_wait2 {
+            // Hand-rolled structs again: id2 → wait2 → the rest of the chain.
+            en_wait2.p_next = en_f2.p_next;
+            en_id2.p_next = (&mut en_wait2) as *mut _ as *mut std::ffi::c_void;
+            en_f2.p_next = (&mut en_id2) as *mut _ as *mut std::ffi::c_void;
+        }
         en_f2.features.shader_int16 = if pyrowave_ok { vk::TRUE } else { vk::FALSE };
 
         let priorities = [1.0f32];
@@ -490,16 +672,69 @@ impl Presenter {
         }
         .context("vkCreateDevice")?;
         let swap_d = ash::khr::swapchain::Device::new(&instance, &device);
-        let present_timer = present_wait_ok.then(|| {
-            super::present_timing::PresentTimer::spawn(
-                ash::khr::present_wait::Device::new(&instance, &device),
-                device.clone(),
-            )
-        });
+        use super::present_timing::{PresentTimer, Waiter};
+        let present_timer = if present_wait_ok {
+            let wait_d = ash::khr::present_wait::Device::new(&instance, &device);
+            Some(PresentTimer::spawn(Waiter::V1(wait_d), device.clone()))
+        } else if use_wait2 {
+            // SAFETY: a name lookup on the live device; `None` if the driver has no such entry.
+            let raw = unsafe {
+                instance.get_device_proc_addr(device.handle(), present_wait2::WAIT_FN.as_ptr())
+            };
+            raw.map(|f| {
+                // SAFETY: the registry declares `vkWaitForPresent2KHR` with this signature.
+                let wait = unsafe {
+                    std::mem::transmute::<unsafe extern "system" fn(), present_wait2::WaitFn>(f)
+                };
+                let waiter = Waiter::V2 {
+                    device: device.handle(),
+                    wait,
+                };
+                PresentTimer::spawn(waiter, device.clone())
+            })
+        } else {
+            None
+        };
+        // The swapchain and every present opt into the successors only with a live waiter.
+        let present_id2 = use_wait2 && present_timer.is_some();
         tracing::info!(
             present_wait = present_wait_ok,
-            "on-glass present timing (VK_KHR_present_wait)"
+            present_wait2 = present_id2,
+            "on-glass present timing (VK_KHR_present_wait / present_wait2)"
         );
+        // No present-wait in use: the output's vblank stands in for the ledger and the VRR
+        // verdict; the ledger says `glass=est`.
+        #[cfg(windows)]
+        let vblank_timer = present_timer
+            .is_none()
+            .then(|| crate::win32::window_monitor(window))
+            .flatten()
+            .and_then(|m| super::vblank_timing::VblankTimer::spawn(device.clone(), m));
+        #[cfg(windows)]
+        if present_timer.is_none() {
+            tracing::info!(
+                active = vblank_timer.is_some(),
+                "glass clock from the output's vblank (estimated stamps)"
+            );
+        }
+        #[cfg(windows)]
+        let fse = fse_ok
+            .then(|| crate::win32::window_monitor(window))
+            .flatten()
+            .map(|monitor| super::FullScreenExclusive {
+                device: ash::ext::full_screen_exclusive::Device::new(&instance, &device),
+                instance: ash::ext::full_screen_exclusive::Instance::new(&entry, &instance),
+                caps2: ash::khr::get_surface_capabilities2::Instance::new(&entry, &instance),
+                monitor,
+            });
+        #[cfg(windows)]
+        if want_fse {
+            tracing::info!(
+                active = fse.is_some(),
+                fullscreen = pref.fullscreen,
+                "exclusive fullscreen (VK_EXT_full_screen_exclusive)"
+            );
+        }
         let hdr_metadata_d =
             has_hdr_metadata.then(|| ash::ext::hdr_metadata::Device::new(&instance, &device));
         // SAFETY: `device` is live; queue 0 of `qfi` was requested at create.
@@ -768,6 +1003,11 @@ impl Presenter {
             submitted: false,
             acquired: None,
             present_timer,
+            present_id2,
+            #[cfg(windows)]
+            vblank_timer,
+            #[cfg(windows)]
+            fse,
             next_present_id: 0,
             last_presented: None,
             video_fit: Default::default(),
@@ -1114,6 +1354,17 @@ fn present_mode_chain(pref: PresentPref) -> Vec<vk::PresentModeKHR> {
 /// `PUNKTFUNK_VRR_FIFO=1` opts into the FIFO-first ladder for variable-refresh panels.
 fn vrr_fifo_opt_in() -> bool {
     std::env::var("PUNKTFUNK_VRR_FIFO").is_ok_and(|v| v != "0")
+}
+
+/// `PUNKTFUNK_PRESENT_WAIT2=1`: time presents with `VK_KHR_present_wait2`.
+fn present_wait2_opt_in() -> bool {
+    std::env::var("PUNKTFUNK_PRESENT_WAIT2").is_ok_and(|v| v != "0")
+}
+
+/// `PUNKTFUNK_FULLSCREEN_EXCLUSIVE=1`: take the monitor with `VK_EXT_full_screen_exclusive`.
+#[cfg(windows)]
+fn fullscreen_exclusive_opt_in() -> bool {
+    std::env::var("PUNKTFUNK_FULLSCREEN_EXCLUSIVE").is_ok_and(|v| v != "0")
 }
 
 /// Resolve the present mode. `PUNKTFUNK_PRESENT_MODE` pins one; otherwise the first

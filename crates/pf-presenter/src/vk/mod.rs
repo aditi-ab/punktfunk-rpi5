@@ -27,6 +27,8 @@ pub(crate) mod gpu;
 mod overlay_pipe;
 mod present;
 mod present_timing;
+#[cfg(windows)]
+mod vblank_timing;
 pub(crate) use present_timing::PresentedSample;
 mod reconfig;
 mod resources;
@@ -304,9 +306,19 @@ pub struct Presenter {
     /// Swapchain image acquired and not yet submitted: the non-blocking probe's, or one an
     /// error left behind. Its `acquire_sem` signal is pending until a batch waits it.
     acquired: Option<u32>,
-    /// `VK_KHR_present_wait` on-glass timing. `None` without present-id/present-wait;
-    /// the run loop then keeps its submit-time display stamp.
+    /// On-glass timing from present-wait, either generation. `None` without it; the run
+    /// loop then keeps its submit-time display stamp (or the vblank waiter's estimate).
     present_timer: Option<present_timing::PresentTimer>,
+    /// The waiter runs on `VK_KHR_present_wait2`: presents chain `VkPresentId2KHR` and the
+    /// swapchain is created with the present-id2/present-wait2 flags.
+    present_id2: bool,
+    /// The output's vblank as the glass clock where present-wait is missing (AMD on
+    /// Windows). Estimated stamps, `glass=est`.
+    #[cfg(windows)]
+    vblank_timer: Option<vblank_timing::VblankTimer>,
+    /// Exclusive fullscreen, opt-in: the swapchain owns the monitor's flips.
+    #[cfg(windows)]
+    fse: Option<FullScreenExclusive>,
     /// Strictly increasing present id (spec: per swapchain). 0 = none presented with an id.
     next_present_id: u64,
     /// Last successful id-carrying present, awaiting [`Presenter::note_presented`].
@@ -435,7 +447,65 @@ impl Presenter {
     /// the display stamp. The run loop then defers e2e/display windows to
     /// [`Presenter::take_presented_samples`].
     pub(crate) fn present_timing_active(&self) -> bool {
-        self.present_timer.is_some() || self.native_last
+        self.glass_active() || self.native_last
+    }
+
+    /// A glass clock follows the swapchain's presents: present-wait, or the vblank waiter.
+    pub(crate) fn glass_active(&self) -> bool {
+        self.present_timer.is_some() || self.vblank_active()
+    }
+
+    fn vblank_active(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.vblank_timer.is_some()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    /// The display stamps are the vblank waiter's estimate. Good for the grid and the
+    /// ledger; not for counting undisplayed presents, which it confirms a vblank late.
+    pub(crate) fn glass_estimated(&self) -> bool {
+        self.present_timer.is_none() && self.vblank_active() && !self.native_last
+    }
+
+    /// The output's own vblank spacing, where a vblank waiter measures it.
+    pub(crate) fn measured_refresh_ns(&self) -> Option<u64> {
+        #[cfg(windows)]
+        {
+            let t = self.vblank_timer.as_ref()?;
+            Some(t.refresh_ns()).filter(|&p| p > 0)
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
+    /// Where the display stamp comes from, for the ledger: `wait` (present-wait), `est`
+    /// (the vblank waiter), `feedback` (the native lane), `none`.
+    pub(crate) fn glass_source(&self) -> &'static str {
+        if self.native_last {
+            "feedback"
+        } else if self.present_timer.is_some() {
+            "wait"
+        } else if self.vblank_active() {
+            "est"
+        } else {
+            "none"
+        }
+    }
+
+    /// The window changed display: the vblank waiter follows it. No-op elsewhere.
+    #[cfg_attr(not(windows), allow(unused_variables))]
+    pub(crate) fn retarget_glass(&self, window: &sdl3::video::Window) {
+        #[cfg(windows)]
+        if let (Some(t), Some(m)) = (&self.vblank_timer, crate::win32::window_monitor(window)) {
+            t.retarget(m);
+        }
     }
 
     /// The native Wayland lane first: `Shown` when the compositor took the dma-buf as the
@@ -1104,28 +1174,40 @@ impl Presenter {
     /// `present()` that returned `true`, with that frame's capture + decode stamps.
     /// No-op when timing is inactive.
     pub(crate) fn note_presented(&mut self, pts_ns: u64, decoded_ns: u64) {
-        if let (Some(t), Some((sc, id))) = (&self.present_timer, self.last_presented.take()) {
-            // Submit stamp: `present()` has returned, so "now" is the present-call tail.
-            // The submit signalled `done_sem` with this id when its GPU work finished.
-            t.enqueue(
-                sc,
-                id,
-                (self.done_sem != vk::Semaphore::null()).then_some((self.done_sem, id)),
-                pts_ns,
-                decoded_ns,
-                pf_client_core::session::now_ns(),
-            );
+        let Some((sc, id)) = self.last_presented.take() else {
+            return;
+        };
+        // Submit stamp: `present()` has returned, so "now" is the present-call tail.
+        // The submit signalled `done_sem` with this id when its GPU work finished.
+        let done = (self.done_sem != vk::Semaphore::null()).then_some((self.done_sem, id));
+        let now_ns = pf_client_core::session::now_ns();
+        if let Some(t) = &self.present_timer {
+            t.enqueue(sc, id, done, pts_ns, decoded_ns, now_ns);
+        }
+        #[cfg(windows)]
+        if let Some(t) = &self.vblank_timer {
+            t.enqueue(done, pts_ns, decoded_ns, now_ns);
         }
     }
 
     /// Undisplayed id-carrying presents in flight (0 when timing is inactive) — the
     /// FIFO glass gate's budget count.
     pub(crate) fn presents_outstanding(&self) -> usize {
-        self.present_timer.as_ref().map_or(0, |t| t.outstanding())
+        let waited = self.present_timer.as_ref().map_or(0, |t| t.outstanding());
+        #[cfg(windows)]
+        let waited = waited + self.vblank_timer.as_ref().map_or(0, |t| t.outstanding());
+        waited
     }
 
     /// Run-loop wake for present completions (SDL event push). No-op without timing.
     pub(crate) fn set_present_wake(&self, cb: Box<dyn Fn() + Send>) {
+        #[cfg(windows)]
+        if self.present_timer.is_none() {
+            if let Some(t) = &self.vblank_timer {
+                t.set_wake(cb);
+            }
+            return;
+        }
         if let Some(t) = &self.present_timer {
             t.set_wake(cb);
         }
@@ -1194,6 +1276,10 @@ impl Presenter {
             .as_ref()
             .map(|t| t.take_samples())
             .unwrap_or_default();
+        #[cfg(windows)]
+        if let Some(t) = &self.vblank_timer {
+            out.extend(t.take_samples());
+        }
         #[cfg(target_os = "linux")]
         if let Some(lane) = self.native.as_mut() {
             out.extend(lane.take_samples().into_iter().map(|s| {
@@ -1243,11 +1329,117 @@ impl Presenter {
     }
 }
 
+/// `VK_EXT_full_screen_exclusive`, application-controlled: the swapchain takes the
+/// monitor's flips, so a variable-refresh panel follows our presents where the desktop
+/// compositor would hold the window. Opt-in (`PUNKTFUNK_FULLSCREEN_EXCLUSIVE=1`); the
+/// PresentMon leg of the pacing plan decides the default. Every query the exclusive
+/// swapchain is built from carries the same pNext chain, as the spec requires.
+#[cfg(windows)]
+pub(crate) struct FullScreenExclusive {
+    pub(crate) device: ash::ext::full_screen_exclusive::Device,
+    pub(crate) instance: ash::ext::full_screen_exclusive::Instance,
+    pub(crate) caps2: ash::khr::get_surface_capabilities2::Instance,
+    /// The window's `HMONITOR`; the one the swapchain claims.
+    pub(crate) monitor: isize,
+}
+
+#[cfg(windows)]
+impl FullScreenExclusive {
+    fn chain(
+        &self,
+    ) -> (
+        vk::SurfaceFullScreenExclusiveInfoEXT<'static>,
+        vk::SurfaceFullScreenExclusiveWin32InfoEXT<'static>,
+    ) {
+        (
+            vk::SurfaceFullScreenExclusiveInfoEXT::default()
+                .full_screen_exclusive(vk::FullScreenExclusiveEXT::APPLICATION_CONTROLLED),
+            vk::SurfaceFullScreenExclusiveWin32InfoEXT::default()
+                .hmonitor(self.monitor as vk::HMONITOR),
+        )
+    }
+
+    /// Surface capabilities as the exclusive swapchain will see them.
+    pub(crate) fn capabilities(
+        &self,
+        pdev: vk::PhysicalDevice,
+        surface: vk::SurfaceKHR,
+    ) -> anyhow::Result<vk::SurfaceCapabilitiesKHR> {
+        use anyhow::Context as _;
+        let (mut info, mut win32) = self.chain();
+        let surface_info = vk::PhysicalDeviceSurfaceInfo2KHR::default()
+            .surface(surface)
+            .push_next(&mut info)
+            .push_next(&mut win32);
+        let mut caps2 = vk::SurfaceCapabilities2KHR::default();
+        // SAFETY: live handles; the chained locals outlive the call.
+        unsafe {
+            self.caps2
+                .get_physical_device_surface_capabilities2(pdev, &surface_info, &mut caps2)
+        }
+        .context("vkGetPhysicalDeviceSurfaceCapabilities2KHR")?;
+        Ok(caps2.surface_capabilities)
+    }
+
+    /// `want` if the exclusive surface offers it, else FIFO (guaranteed).
+    pub(crate) fn present_mode(
+        &self,
+        pdev: vk::PhysicalDevice,
+        surface: vk::SurfaceKHR,
+        want: vk::PresentModeKHR,
+    ) -> vk::PresentModeKHR {
+        let (mut info, mut win32) = self.chain();
+        let surface_info = vk::PhysicalDeviceSurfaceInfo2KHR::default()
+            .surface(surface)
+            .push_next(&mut info)
+            .push_next(&mut win32);
+        // SAFETY: live handles; the chained locals outlive the call.
+        let modes = unsafe {
+            self.instance
+                .get_physical_device_surface_present_modes2(pdev, &surface_info)
+        }
+        .unwrap_or_default();
+        if modes.contains(&want) {
+            want
+        } else {
+            vk::PresentModeKHR::FIFO
+        }
+    }
+
+    /// Chain the exclusive request onto a swapchain create. The pair must outlive it.
+    pub(crate) fn extend<'a>(
+        &self,
+        info: vk::SwapchainCreateInfoKHR<'a>,
+        pair: &'a mut (
+            vk::SurfaceFullScreenExclusiveInfoEXT<'static>,
+            vk::SurfaceFullScreenExclusiveWin32InfoEXT<'static>,
+        ),
+    ) -> vk::SwapchainCreateInfoKHR<'a> {
+        *pair = self.chain();
+        info.push_next(&mut pair.0).push_next(&mut pair.1)
+    }
+
+    /// Take the monitor for `swapchain`. A refusal leaves a windowed swapchain.
+    pub(crate) fn acquire(&self, swapchain: vk::SwapchainKHR) {
+        // SAFETY: `swapchain` was just created on this device.
+        match unsafe { self.device.acquire_full_screen_exclusive_mode(swapchain) } {
+            Ok(()) => tracing::info!("exclusive fullscreen acquired"),
+            Err(e) => tracing::warn!(
+                error = ?e,
+                "exclusive fullscreen refused — presenting windowed"
+            ),
+        }
+    }
+}
+
 impl Drop for Presenter {
     fn drop(&mut self) {
         // The present-wait waiter holds the swapchain. Drop it (joins in-flight waits,
-        // 250 ms cap in `present_timing`) before swapchain teardown below.
+        // 250 ms cap in `present_timing`) before swapchain teardown below. The vblank
+        // waiter reads `done_sem`: it goes before the semaphore does.
         self.present_timer.take();
+        #[cfg(windows)]
+        self.vblank_timer.take();
         // The ring waits its own copies; the lane's buffers go before the images behind them.
         #[cfg(target_os = "linux")]
         {

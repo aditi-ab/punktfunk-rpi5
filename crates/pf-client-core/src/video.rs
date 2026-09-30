@@ -43,6 +43,8 @@ pub struct DecodedFrame {
     /// Local wall (ns) when the decoder emitted this image (`decoded` stage).
     /// The presenter subtracts it from its paintable-set stamp for `display`.
     pub decoded_ns: u64,
+    /// The host re-encoded the picture already sent (`USER_FLAG_REPEAT`): nothing new.
+    pub repeat: bool,
     pub image: DecodedImage,
 }
 
@@ -1441,6 +1443,24 @@ impl Decoder {
     pub fn wait_hw_decoded(&mut self, timeline_sem: u64, value: u64, timeout_ns: u64) -> bool {
         match &mut self.backend {
             Backend::NativeVulkan(d) => d.wait_timeline(timeline_sem, value, timeout_ns),
+            _ => false,
+        }
+    }
+
+    /// Whether a Vulkan-Video decode is complete now, without waiting. `true` off that
+    /// backend: nothing is pending there.
+    pub fn hw_decoded_now(&mut self, timeline_sem: u64, value: u64) -> bool {
+        match &mut self.backend {
+            Backend::NativeVulkan(d) => d.timeline_done(timeline_sem, value),
+            _ => true,
+        }
+    }
+
+    /// The decode wait is also the media clock boost (Intel on i915): the pump waits
+    /// it at once instead of one AU behind.
+    pub fn hw_wait_boosted(&self) -> bool {
+        match &self.backend {
+            Backend::NativeVulkan(d) => d.boosted(),
             _ => false,
         }
     }

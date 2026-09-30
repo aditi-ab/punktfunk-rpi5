@@ -42,6 +42,7 @@ impl Shell {
                 display,
                 ..
             } if self.window.get_display().is_ok_and(|d| d == display) => {
+                self.presenter.retarget_glass(&self.window);
                 if let Some(st) = stream.as_mut() {
                     st.relearn_grid(&self.window);
                 }
@@ -221,6 +222,7 @@ impl Shell {
             // Dragged to another monitor: latch grid and VRR verdict belong to
             // the old panel. A 60 Hz-seeded clock must not keep pacing a 144 Hz panel.
             WindowEvent::DisplayChanged(..) => {
+                self.presenter.retarget_glass(&self.window);
                 if let Some(st) = stream.as_mut() {
                     st.relearn_grid(&self.window);
                 }
