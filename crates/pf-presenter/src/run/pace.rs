@@ -30,19 +30,19 @@ impl Shell {
             }
         }
         let now_ns = session::now_ns();
-        // An estimated stamp is a measurement, never a pacing input: on a VRR panel the
-        // vblanks it reads follow our own presents, and a grid built on them chases itself.
-        let grid_known =
-            self.presenter.present_timing_active() && !self.presenter.glass_estimated();
+        // An estimated stamp never builds the latch grid: on a VRR panel the vblanks it
+        // reads follow our own presents, and a grid built on them chases itself.
+        let estimated = self.presenter.glass_estimated();
+        let grid_known = self.presenter.present_timing_active() && !estimated;
         let mut to_present = st.pick(now_ns, grid_known);
         // FIFO glass budget: one undisplayed present in flight, so the swapchain's
-        // own FIFO can never become a standing queue. Only FIFO modes queue and only
-        // present-wait can count: an estimated stamp confirms a vblank late, and gating
-        // on it spaces presents two or three refreshes apart.
+        // own FIFO can never become a standing queue. Only FIFO modes queue. The
+        // estimate counts only while the panel runs at its mode rate, where that queue
+        // stands two deep; under variable refresh nothing queues.
         if self.pacing_active
             && self.presenter.needs_glass_gate()
             && self.presenter.present_timing_active()
-            && !self.presenter.glass_estimated()
+            && (!estimated || st.cadence.verdict() == Cadence::Fixed)
         {
             if let Some(f) = to_present.take() {
                 if st.gate.open(self.presenter.presents_outstanding(), now_ns) {

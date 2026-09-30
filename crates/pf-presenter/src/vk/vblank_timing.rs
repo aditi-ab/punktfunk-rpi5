@@ -1,12 +1,13 @@
 //! Glass stamps without `VK_KHR_present_wait`: a waiter on the window's output vblank.
 //!
-//! A driver without `VK_KHR_present_wait` (AMD on Windows) leaves the panel unmeasured. `IDXGIOutput::WaitForVBlank` returns once per refresh of
-//! the monitor under the window; a FIFO present is taken to be on glass at the first
-//! vblank after it was submitted with its GPU work done, one present per vblank. An
-//! estimate, labelled `glass=est`: it feeds the latch grid, the VRR probe and the
-//! ledger, and never the glass gate — it confirms too late to pace on. Under variable
-//! refresh the vblanks follow the presents; the waiter publishes their spacing, the one
-//! direct reading of the panel's refresh this path has.
+//! A driver without `VK_KHR_present_wait` (AMD on Windows) leaves the panel unmeasured.
+//! `IDXGIOutput::WaitForVBlank` returns once per refresh of the monitor under the
+//! window; a FIFO present is taken to be on glass at the first vblank after it was
+//! submitted with its GPU work done, one present per vblank. An estimate, labelled
+//! `glass=est`: it feeds the ledger and the VRR verdict, never the latch grid, and the
+//! glass gate only while the panel runs at its mode rate. Under variable refresh the
+//! vblanks follow the presents; the waiter publishes their spacing, the one direct
+//! reading of the panel's refresh this path has.
 //!
 //! Never touches the swapchain, so no drain before a swapchain teardown. It reads the
 //! presenter's `done_sem` only, which outlives it: the presenter drops this waiter first.
