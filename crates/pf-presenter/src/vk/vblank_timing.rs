@@ -1,7 +1,6 @@
 //! Glass stamps without `VK_KHR_present_wait`: a waiter on the window's output vblank.
 //!
-//! A driver with no present-wait of either generation (AMD on Windows before 2.0.395)
-//! leaves the panel unmeasured. `IDXGIOutput::WaitForVBlank` returns once per refresh of
+//! A driver without `VK_KHR_present_wait` (AMD on Windows) leaves the panel unmeasured. `IDXGIOutput::WaitForVBlank` returns once per refresh of
 //! the monitor under the window; a FIFO present is taken to be on glass at the first
 //! vblank after it was submitted with its GPU work done, one present per vblank. An
 //! estimate, labelled `glass=est`: it feeds the latch grid, the VRR probe and the

@@ -522,8 +522,9 @@ impl Presenter {
                     && id_caps.value == vk::TRUE
                     && wait_caps.value == vk::TRUE
             };
-        // The proven pair first; the successors where it is missing, or for the A/B.
-        let use_wait2 = present_wait2_ok && (!present_wait_ok || present_wait2_forced());
+        // The successors only on request: AMD's Windows driver completes the wait late
+        // enough that the glass gate drops frames. Without them the vblank waiter runs.
+        let use_wait2 = present_wait2_ok && present_wait2_opt_in();
         let present_wait_ok = present_wait_ok && !use_wait2;
         // PyroWave is Vulkan 1.3 compute on this device — no video extensions.
         // Probe here so a capable device enables the features and advertises the codec.
@@ -701,8 +702,8 @@ impl Presenter {
             present_wait2 = present_id2,
             "on-glass present timing (VK_KHR_present_wait / present_wait2)"
         );
-        // No present-wait of either generation: the output's vblank stands in, so the gate,
-        // the latch grid and the VRR probe still run; the ledger says `glass=est`.
+        // No present-wait in use: the output's vblank stands in for the ledger and the VRR
+        // verdict; the ledger says `glass=est`.
         #[cfg(windows)]
         let vblank_timer = present_timer
             .is_none()
@@ -1355,8 +1356,8 @@ fn vrr_fifo_opt_in() -> bool {
     std::env::var("PUNKTFUNK_VRR_FIFO").is_ok_and(|v| v != "0")
 }
 
-/// `PUNKTFUNK_PRESENT_WAIT2=1`: use `VK_KHR_present_wait2` where the older pair also works.
-fn present_wait2_forced() -> bool {
+/// `PUNKTFUNK_PRESENT_WAIT2=1`: time presents with `VK_KHR_present_wait2`.
+fn present_wait2_opt_in() -> bool {
     std::env::var("PUNKTFUNK_PRESENT_WAIT2").is_ok_and(|v| v != "0")
 }
 
