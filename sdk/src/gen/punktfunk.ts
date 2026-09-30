@@ -170,7 +170,7 @@ export const PrepCmd = Schema.Struct({ "do": Schema.String.annotate({ "descripti
 export type PrepareEmulatorRequest = { readonly "firmware_dir"?: string | null, readonly "platform"?: string | null }
 export const PrepareEmulatorRequest = Schema.Struct({ "firmware_dir": Schema.optionalKey(Schema.Union([Schema.String, Schema.Null]).annotate({ "description": "A folder whose files are that platform's firmware. From a plugin, a path relative to its\nown state directory (`firmware/ps2`); from the operator, an absolute path." })), "platform": Schema.optionalKey(Schema.Union([Schema.String, Schema.Null]).annotate({ "description": "The platform about to play: a catalog id like `ps2`, or an alias (RomM slug, ES-DE\nfolder, libretro name). Without it only first-run questions are answered." })) })
 export type PreparedStep = { readonly "kind": string, readonly "note"?: string | null, readonly "outcome": string, readonly "target": string }
-export const PreparedStep = Schema.Struct({ "kind": Schema.String.annotate({ "description": "`first_run`, `firmware`, `firmware_install` or `config_root`." }), "note": Schema.optionalKey(Schema.Union([Schema.String, Schema.Null])), "outcome": Schema.String.annotate({ "description": "`applied`, `present` or `failed`." }), "target": Schema.String.annotate({ "description": "The file the step is about." }) })
+export const PreparedStep = Schema.Struct({ "kind": Schema.String.annotate({ "description": "`first_run`, `firmware`, `firmware_install`, `players` or `config_root`." }), "note": Schema.optionalKey(Schema.Union([Schema.String, Schema.Null])), "outcome": Schema.String.annotate({ "description": "`applied`, `present`, `skipped` or `failed`." }), "target": Schema.String.annotate({ "description": "The file the step is about." }) })
 export type Preset = "custom" | "default" | "gaming-rig" | "shared-desktop" | "hotdesk" | "workstation"
 export const Preset = Schema.Literals(["custom", "default", "gaming-rig", "shared-desktop", "hotdesk", "workstation"]).annotate({ "description": "Named bundle of the fields below. `Custom` uses the explicit fields;\nany other preset ignores them and expands ([`DisplayPolicy::effective`])." })
 export type ProviderRemoved = { readonly "removed": number }
@@ -2528,9 +2528,10 @@ readonly "getEmulators": <Config extends OperationConfig>(options: { readonly co
 readonly "installEmulator": <Config extends OperationConfig>(id: string, options: { readonly config?: Config | undefined } | undefined) => Effect.Effect<WithOptionalResponse<typeof InstallEmulator200.Type, Config>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"InstallEmulator400", typeof InstallEmulator400.Type> | PunktfunkError<"InstallEmulator401", typeof InstallEmulator401.Type> | PunktfunkError<"InstallEmulator404", typeof InstallEmulator404.Type> | PunktfunkError<"InstallEmulator409", typeof InstallEmulator409.Type> | PunktfunkError<"InstallEmulator500", typeof InstallEmulator500.Type> | PunktfunkError<"InstallEmulator502", typeof InstallEmulator502.Type>>
   /**
 * Every copy of the emulator on this host answers its first-run questions (a setup wizard, a
-* welcome box) the way clicking through would, and gets the platform's firmware: copied into
-* its firmware folder, or installed by the emulator itself. Idempotent; each step says what it
-* did, and a platform still missing its firmware says so.
+* welcome box) the way clicking through would, gets the platform's firmware — copied into
+* its firmware folder, or installed by the emulator itself — and has this session's pads
+* bound in seat order, which the host undoes when the game exits. Idempotent; each step says
+* what it did, and a platform still missing its firmware says so.
 */
 readonly "prepareEmulator": <Config extends OperationConfig>(id: string, options: { readonly payload: typeof PrepareEmulatorRequestJson.Encoded; readonly config?: Config | undefined }) => Effect.Effect<WithOptionalResponse<typeof PrepareEmulator200.Type, Config>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"PrepareEmulator400", typeof PrepareEmulator400.Type> | PunktfunkError<"PrepareEmulator401", typeof PrepareEmulator401.Type> | PunktfunkError<"PrepareEmulator403", typeof PrepareEmulator403.Type> | PunktfunkError<"PrepareEmulator404", typeof PrepareEmulator404.Type> | PunktfunkError<"PrepareEmulator500", typeof PrepareEmulator500.Type>>
   /**

@@ -1519,7 +1519,7 @@
           "emulators"
         ],
         "summary": "Prepare an emulator for a launch",
-        "description": "Every copy of the emulator on this host answers its first-run questions (a setup wizard, a\nwelcome box) the way clicking through would, and gets the platform's firmware: copied into\nits firmware folder, or installed by the emulator itself. Idempotent; each step says what it\ndid, and a platform still missing its firmware says so.",
+        "description": "Every copy of the emulator on this host answers its first-run questions (a setup wizard, a\nwelcome box) the way clicking through would, gets the platform's firmware — copied into\nits firmware folder, or installed by the emulator itself — and has this session's pads\nbound in seat order, which the host undoes when the game exits. Idempotent; each step says\nwhat it did, and a platform still missing its firmware says so.",
         "operationId": "prepareEmulator",
         "parameters": [
           {
@@ -11808,7 +11808,7 @@
         "properties": {
           "kind": {
             "type": "string",
-            "description": "`first_run`, `firmware`, `firmware_install` or `config_root`."
+            "description": "`first_run`, `firmware`, `firmware_install`, `players` or `config_root`."
           },
           "note": {
             "type": [
@@ -11818,7 +11818,7 @@
           },
           "outcome": {
             "type": "string",
-            "description": "`applied`, `present` or `failed`."
+            "description": "`applied`, `present`, `skipped` or `failed`."
           },
           "target": {
             "type": "string",

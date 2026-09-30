@@ -72,11 +72,11 @@ pub(crate) struct PreparedCopy {
 
 #[derive(Serialize, ToSchema)]
 pub(crate) struct PreparedStep {
-    /// `first_run`, `firmware`, `firmware_install` or `config_root`.
+    /// `first_run`, `firmware`, `firmware_install`, `players` or `config_root`.
     pub kind: String,
     /// The file the step is about.
     pub target: String,
-    /// `applied`, `present` or `failed`.
+    /// `applied`, `present`, `skipped` or `failed`.
     pub outcome: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -224,9 +224,10 @@ pub(crate) async fn install_emulator(Path(id): Path<String>) -> Response {
 /// Prepare an emulator for a launch
 ///
 /// Every copy of the emulator on this host answers its first-run questions (a setup wizard, a
-/// welcome box) the way clicking through would, and gets the platform's firmware: copied into
-/// its firmware folder, or installed by the emulator itself. Idempotent; each step says what it
-/// did, and a platform still missing its firmware says so.
+/// welcome box) the way clicking through would, gets the platform's firmware — copied into
+/// its firmware folder, or installed by the emulator itself — and has this session's pads
+/// bound in seat order, which the host undoes when the game exits. Idempotent; each step says
+/// what it did, and a platform still missing its firmware says so.
 #[utoipa::path(
     post,
     path = "/emulators/{id}/prepare",
