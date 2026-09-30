@@ -93,7 +93,7 @@ impl DrmSync {
         let r = unsafe {
             libc::ioctl(
                 self.fd.as_raw_fd(),
-                DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE,
+                DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE as _,
                 &mut req,
             )
         };
@@ -110,7 +110,13 @@ impl DrmSync {
         };
         // SAFETY: `self.fd` is the live render-node fd; `DRM_IOCTL_SYNCOBJ_DESTROY` encodes
         // `size_of::<DrmSyncobjDestroy>()`, and `&mut req` is a live correctly-sized struct the kernel reads.
-        unsafe { libc::ioctl(self.fd.as_raw_fd(), DRM_IOCTL_SYNCOBJ_DESTROY, &mut req) };
+        unsafe {
+            libc::ioctl(
+                self.fd.as_raw_fd(),
+                DRM_IOCTL_SYNCOBJ_DESTROY as _,
+                &mut req,
+            )
+        };
     }
 
     /// Buffer contents are ready only after this returns Ok.
@@ -142,7 +148,7 @@ impl DrmSync {
         let r = unsafe {
             libc::ioctl(
                 self.fd.as_raw_fd(),
-                DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT,
+                DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT as _,
                 &mut req,
             )
         };
@@ -172,7 +178,7 @@ impl DrmSync {
         let r = unsafe {
             libc::ioctl(
                 self.fd.as_raw_fd(),
-                DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL,
+                DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL as _,
                 &mut req,
             )
         };
@@ -220,14 +226,14 @@ mod tests {
         let mut c = Create::default();
         // SAFETY: `sync.fd` is the live render-node fd; `CREATE` encodes `size_of::<Create>()`, and
         // `&mut c` is a live correctly-sized struct the kernel fills (`handle`).
-        assert!(unsafe { libc::ioctl(sync.fd.as_raw_fd(), CREATE, &mut c) } >= 0);
+        assert!(unsafe { libc::ioctl(sync.fd.as_raw_fd(), CREATE as _, &mut c) } >= 0);
         let mut h = DrmSyncobjHandle {
             handle: c.handle,
             ..Default::default()
         };
         // SAFETY: `sync.fd` is live; `HANDLE_TO_FD` encodes `size_of::<DrmSyncobjHandle>()`; `&mut h`
         // is a live correctly-sized struct (the kernel reads `handle`, writes `fd`).
-        assert!(unsafe { libc::ioctl(sync.fd.as_raw_fd(), HANDLE_TO_FD, &mut h) } >= 0);
+        assert!(unsafe { libc::ioctl(sync.fd.as_raw_fd(), HANDLE_TO_FD as _, &mut h) } >= 0);
         sync.signal_point(h.fd, 1).expect("signal");
         sync.wait_point(h.fd, 1, 100).expect("wait after signal");
         // SAFETY: `h.fd` is the fd HANDLE_TO_FD just exported; we own it and close it exactly once here.

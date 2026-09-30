@@ -434,7 +434,7 @@ mod tests {
         const EVIOCGKEY: libc::c_ulong = (2 << 30) | (96 << 16) | (0x45 << 8) | 0x18;
         // SAFETY: `f` is a valid evdev fd. EVIOCGKEY copies the key-state bitmap into `bits`.
         // 96 bytes is KEY_MAX/8, so the kernel never writes past the buffer.
-        let rc = unsafe { libc::ioctl(f.as_raw_fd(), EVIOCGKEY, bits.as_mut_ptr()) };
+        let rc = unsafe { libc::ioctl(f.as_raw_fd(), EVIOCGKEY as _, bits.as_mut_ptr()) };
         rc >= 0 && (bits[(code / 8) as usize] >> (code % 8)) & 1 == 1
     }
 
@@ -446,7 +446,7 @@ mod tests {
             (2 << 30) | (24 << 16) | (0x45 << 8) | (0x40 + abs as libc::c_ulong);
         // SAFETY: `f` is a valid evdev fd. EVIOCGABS writes 24-byte `input_absinfo` into `info`.
         // We read only the leading i32 `value`; the buffer is exactly that size.
-        let rc = unsafe { libc::ioctl(f.as_raw_fd(), req, info.as_mut_ptr()) };
+        let rc = unsafe { libc::ioctl(f.as_raw_fd(), req as _, info.as_mut_ptr()) };
         (rc >= 0).then(|| i32::from_ne_bytes([info[0], info[1], info[2], info[3]]))
     }
 

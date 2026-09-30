@@ -51,7 +51,13 @@ pub fn export_sync_file(dmabuf: BorrowedFd<'_>) -> std::io::Result<Option<OwnedF
     // SAFETY: `dmabuf` is open for the borrow; we never close it. The ioctl size is
     // `size_of::<DmaBufExportSyncFile>()`. `&mut req` is a live `#[repr(C)]` value the kernel
     // reads (`flags`) and writes (`fd`); it outlives this call and is not aliased.
-    let r = unsafe { libc::ioctl(dmabuf.as_raw_fd(), DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &mut req) };
+    let r = unsafe {
+        libc::ioctl(
+            dmabuf.as_raw_fd(),
+            DMA_BUF_IOCTL_EXPORT_SYNC_FILE as _,
+            &mut req,
+        )
+    };
     if r < 0 {
         return Err(std::io::Error::last_os_error());
     }
