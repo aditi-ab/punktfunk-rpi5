@@ -446,7 +446,6 @@ impl WlrootsInjector {
                     self.pointer.axis_source(match src {
                         AxisSource::Wheel => wl_pointer::AxisSource::Wheel,
                         AxisSource::Finger => wl_pointer::AxisSource::Finger,
-                        AxisSource::Continuous => wl_pointer::AxisSource::Continuous,
                     });
                 }
                 ScrollOp::Continuous { horizontal, value } => {
