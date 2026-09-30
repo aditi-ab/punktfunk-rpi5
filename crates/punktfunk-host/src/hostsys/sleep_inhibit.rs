@@ -1,10 +1,15 @@
-//! Refcounted, session-scoped Linux suspend inhibition for passive streams.
+//! Refcounted, session-scoped Linux suspend inhibition for live streams.
 //!
-//! After [`QUIET_BEFORE_VETO`] without client input, the host holds a logind
-//! `sleep:idle` block so an idle timer cannot suspend the machine.
-//! [`note_input`] releases it synchronously: the same inhibitor would refuse
-//! an intentional Sleep. Silence re-arms it. A local Sleep during a passive
-//! stream is indistinguishable from idle and stays blocked.
+//! The desktop is asked first: the Inhibit portal's `Suspend | Idle` vetoes its
+//! idle suspend and blanking while any session lives, whether or not client
+//! input reaches the desktop (a headless gamescope's never does). KDE and GNOME
+//! back it, and neither refuses a deliberate Sleep.
+//!
+//! Without such a backend, after [`QUIET_BEFORE_VETO`] without client input the
+//! host holds a logind `sleep:idle` block so an idle timer cannot suspend the
+//! machine. [`note_input`] releases it synchronously: the same inhibitor would
+//! refuse an intentional Sleep. Silence re-arms it. A local Sleep during a
+//! passive stream is indistinguishable from idle there and stays blocked.
 //!
 //! Acquisition is best-effort, shared by native and GameStream sessions, and
 //! a no-op off Linux. The hold count's 0↔1 edges also drive the Windows
@@ -22,6 +27,11 @@ const QUIET_BEFORE_VETO: Duration = Duration::from_secs(30);
 /// [`watch`] poll interval. Only re-arm waits for a tick; [`note_input`] releases synchronously.
 #[cfg(target_os = "linux")]
 const WATCH_TICK: Duration = Duration::from_secs(5);
+
+/// Inhibit portal answer budget. A silent portal still leaves the logind veto
+/// armed inside [`QUIET_BEFORE_VETO`].
+#[cfg(target_os = "linux")]
+const PORTAL_REPLY: Duration = Duration::from_secs(10);
 
 /// One RAII share of the host-wide inhibitor. Hold one per live session.
 pub struct StreamHold(());
@@ -73,8 +83,8 @@ pub fn note_input() {
     }
 }
 
-/// Take a share. The inhibitor is not acquired here: [`watch`] takes it after
-/// [`QUIET_BEFORE_VETO`] of quiet, never while someone is driving the box.
+/// Take a share. Nothing is acquired here: [`watch`] takes the desktop's inhibit at
+/// once, or the logind block after [`QUIET_BEFORE_VETO`] of quiet.
 pub fn hold() -> StreamHold {
     // Seed the quiet clock so a connect never vetoes and costs no D-Bus round trip.
     LAST_INPUT_MS.store(now_ms(), Ordering::Relaxed);
@@ -144,12 +154,16 @@ fn release_locked(st: &mut State, why: &str) {
     }
 }
 
-/// Own the veto's arm/disarm edges while any session lives.
+/// Hold the desktop's inhibit while any session lives. Without one, own the
+/// logind veto's arm/disarm edges.
 ///
 /// Acquire is the expensive edge (thread spawn + D-Bus). It happens here,
 /// outside the lock, so a hot `note_input` never queues behind a logind call.
 #[cfg(target_os = "linux")]
 fn watch() {
+    if hold_desktop_inhibit() {
+        return;
+    }
     loop {
         std::thread::sleep(WATCH_TICK);
         {
@@ -181,6 +195,60 @@ fn watch() {
         st.fd = Some(fd);
         VETOING.store(true, Ordering::Relaxed);
     }
+}
+
+/// Veto the desktop's idle suspend and blanking through the Inhibit portal until the
+/// last session ends. False when no backend takes `Suspend`: GTK's without a GNOME
+/// session refuses it. The connection is private, so the portal drops the inhibit
+/// if this process dies, and ashpd's shared one never binds to this runtime.
+#[cfg(target_os = "linux")]
+fn hold_desktop_inhibit() -> bool {
+    use ashpd::desktop::inhibit::{InhibitFlags, InhibitOptions, InhibitProxy};
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return false;
+    };
+    // One `block_on` for the whole hold keeps the connection's reader pumped.
+    rt.block_on(async {
+        let take = async {
+            let conn = ashpd::zbus::Connection::session().await?;
+            InhibitProxy::with_connection(conn)
+                .await?
+                .inhibit(
+                    None,
+                    InhibitFlags::Suspend | InhibitFlags::Idle,
+                    InhibitOptions::default().set_reason("a client is streaming"),
+                )
+                .await
+        };
+        let request = match tokio::time::timeout(PORTAL_REPLY, take).await {
+            Ok(Ok(request)) => request,
+            Ok(Err(e)) => {
+                tracing::info!(error = %e, "desktop suspend inhibit unavailable, using logind");
+                return false;
+            }
+            Err(_) => {
+                tracing::info!("desktop suspend inhibit timed out, using logind");
+                return false;
+            }
+        };
+        tracing::info!("holding the desktop's suspend inhibit while a client streams");
+        loop {
+            tokio::time::sleep(WATCH_TICK).await;
+            let mut st = state().lock().unwrap_or_else(|e| e.into_inner());
+            if st.count == 0 {
+                st.watching = false;
+                break;
+            }
+        }
+        if let Err(e) = request.close().await {
+            tracing::warn!(error = %e, "desktop suspend inhibit did not close");
+        }
+        tracing::info!("released the desktop's suspend inhibit");
+        true
+    })
 }
 
 /// One logind `Inhibit` on a dedicated plain thread. zbus's blocking API panics
