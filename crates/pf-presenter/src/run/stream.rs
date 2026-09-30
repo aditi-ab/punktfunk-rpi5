@@ -86,6 +86,7 @@ impl StreamState {
             need: punktfunk_core::phase::LatchNeed::default(),
             busy_on: crate::vk::BusyOn::Fence,
             last_displayed_ns: 0,
+            last_shown_pts_ns: 0,
             last_slot_ns: 0,
             busy_retry: false,
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]

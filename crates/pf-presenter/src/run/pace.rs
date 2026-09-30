@@ -24,7 +24,11 @@ impl Shell {
         }
         st.intake();
         let now_ns = session::now_ns();
-        let mut to_present = st.pick(now_ns, self.presenter.present_timing_active());
+        // An estimated stamp is a measurement, never a pacing input: on a VRR panel the
+        // vblanks it reads follow our own presents, and a grid built on them chases itself.
+        let grid_known =
+            self.presenter.present_timing_active() && !self.presenter.glass_estimated();
+        let mut to_present = st.pick(now_ns, grid_known);
         // FIFO glass budget: one undisplayed present in flight, so the swapchain's
         // own FIFO can never become a standing queue. Only FIFO modes queue and only
         // present-wait can count: an estimated stamp confirms a vblank late, and gating
@@ -93,6 +97,8 @@ impl Shell {
         let (replaced, q_drop, q_dry) = st.store.take_counters();
         let (gated, forced) = st.gate.take_counters();
         let forwarded = st.forwarder_drops.swap(0, Ordering::Relaxed);
+        let cadence_err = hud::Summary::of(&mut st.win.cadence_err_us);
+        st.win.cadence_err_us.clear();
         st.last_forced = forced;
         let present = PresentCounters {
             mode: self.presenter.present_mode_name(),
@@ -166,6 +172,9 @@ impl Shell {
                 q_dry,
                 forwarded = present.forwarded,
                 repeats = st.win.repeats,
+                // On-glass spacing error against the source's spacing, per shown frame.
+                cadence_err_us = cadence_err.p50_us,
+                cadence_err_p95_us = cadence_err.p95_us,
                 gated,
                 forced,
                 misses = st.win.misses,
@@ -253,6 +262,17 @@ impl StreamState {
                     (s.displayed_ns.saturating_sub(self.last_displayed_ns) + period / 2) / period;
                 self.win.steps[(steps as usize).min(5)] += 1;
             }
+            // On-glass spacing against the source's own: valid on a fixed panel and a
+            // variable one alike, where whole-period steps mean nothing.
+            if self.last_displayed_ns != 0 && s.pts_ns > self.last_shown_pts_ns {
+                let glass = s.displayed_ns.saturating_sub(self.last_displayed_ns);
+                let source = s.pts_ns - self.last_shown_pts_ns;
+                let err_us = glass.abs_diff(source) / 1000;
+                self.win
+                    .cadence_err_us
+                    .push(err_us.min(u64::from(u32::MAX)) as u32);
+            }
+            self.last_shown_pts_ns = s.pts_ns;
             self.last_displayed_ns = s.displayed_ns;
             stamps.push(s.displayed_ns);
         }
@@ -557,6 +577,8 @@ pub(super) struct PresentWindow {
     busy: [u32; 2],
     /// Host repeats dropped at intake: the picture was already on glass.
     repeats: u32,
+    /// Per shown frame: |on-glass spacing − source spacing| to the frame before it, µs.
+    cadence_err_us: Vec<u32>,
     /// This window's on-glass frames: the lead each had to its first latch, and whether
     /// it landed on a later one.
     leads: Vec<(i64, bool)>,
@@ -576,6 +598,7 @@ impl PresentWindow {
             steps: [0; 6],
             busy: [0; 2],
             repeats: 0,
+            cadence_err_us: Vec::with_capacity(256),
             leads: Vec::with_capacity(256),
         }
     }

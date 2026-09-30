@@ -409,6 +409,8 @@ struct StreamState {
     /// channel first: a newer frame replaces the held one instead of queuing behind it.
     busy_on: crate::vk::BusyOn,
     last_displayed_ns: u64,
+    /// Source stamp of the frame last seen on glass, for the spacing-error ledger.
+    last_shown_pts_ns: u64,
     /// Smoothing: the latch slot the last vended frame was aimed at. One present per
     /// slot; a second frame due before the same slot waits for the next.
     last_slot_ns: u64,
