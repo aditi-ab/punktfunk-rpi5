@@ -264,7 +264,16 @@ pub(super) fn gamescope_node_present(node_id: u32) -> bool {
         // `pw-dump` unavailable: do not block reuse. `mark_failed` is the backstop.
         return true;
     };
-    let Ok(dump) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+    dump_has_node(out.status.success(), &out.stdout, node_id)
+}
+
+/// `pw-dump <id>` answers with the object, or with nothing at all (PipeWire 1.6) for an id that
+/// is gone. Unparseable output counts as present.
+fn dump_has_node(success: bool, stdout: &[u8], node_id: u32) -> bool {
+    if success && stdout.trim_ascii().is_empty() {
+        return false;
+    }
+    let Ok(dump) = serde_json::from_slice::<serde_json::Value>(stdout) else {
         return true;
     };
     dump.as_array()
@@ -850,6 +859,16 @@ mod tests {
         assert_eq!(parse_patch_level("3.16.25+pfhdr (gcc)"), 0);
         // The version triple must never be mistaken for the level.
         assert_eq!(parse_patch_level("gamescope version 3.16.25"), 0);
+    }
+
+    #[test]
+    fn a_gone_node_is_an_empty_dump() {
+        let node = br#"[{ "id": 150, "type": "PipeWire:Interface:Node" }]"#;
+        assert!(super::dump_has_node(true, node, 150));
+        assert!(!super::dump_has_node(true, node, 151));
+        assert!(!super::dump_has_node(true, b"", 150));
+        assert!(!super::dump_has_node(true, b"[]\n", 150));
+        assert!(super::dump_has_node(false, b"", 150));
     }
 
     #[test]
