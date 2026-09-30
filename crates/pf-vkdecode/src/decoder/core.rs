@@ -1075,8 +1075,8 @@ impl<C: VkCodec> VkDecoder<C> {
         };
 
         let mut decode_info = vk::VideoDecodeInfoKHR::default()
-            .src_buffer(state.ring.buffer())
-            .src_buffer_offset(upload.offset)
+            .src_buffer(upload.buffer)
+            .src_buffer_offset(0)
             .src_buffer_range(upload.range)
             .dst_picture_resource(dst_resource)
             .setup_reference_slot(&setup_slot_info)

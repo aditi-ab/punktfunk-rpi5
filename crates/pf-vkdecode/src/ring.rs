@@ -1,6 +1,10 @@
-//! Host-visible bitstream upload ring: one persistent-mapped `VIDEO_DECODE_SRC`
-//! buffer cut into equal slots, honouring the profile's
-//! `minBitstreamBufferOffsetAlignment`/`SizeAlignment`.
+//! Host-visible bitstream upload ring: one persistent-mapped allocation cut into
+//! equal slots, honouring the profile's `minBitstreamBufferOffsetAlignment`/`SizeAlignment`.
+//!
+//! Each slot is its own `VIDEO_DECODE_SRC` buffer, so every decode reads at
+//! `srcBufferOffset` 0. Mesa ANV's H.265 slice parse maps `srcBufferOffset + range`
+//! bytes and unmaps `range`: a nonzero offset leaks one mapping per picture until
+//! `vm.max_map_count` runs out.
 //!
 //! [`RingLayout`] and [`SlotStates`] are the unit-tested halves (offset math
 //! including growth, and recycle bookkeeping). [`BitstreamRing`] allocates the
@@ -251,11 +255,12 @@ impl<T> SlotStates<T> {
     }
 }
 
-/// One uploaded AU: what `vkCmdDecodeVideoKHR` needs, plus the slot to mark
-/// pending once the submit's timeline token exists.
+/// One uploaded AU: what `vkCmdDecodeVideoKHR` needs (the slot's buffer, read
+/// from offset 0), plus the slot to mark pending once the submit's timeline
+/// token exists.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct UploadedAu {
-    pub offset: u64,
+    pub buffer: vk::Buffer,
     pub range: u64,
     pub slot: usize,
 }
@@ -263,22 +268,23 @@ pub(crate) struct UploadedAu {
 /// Timeline `(semaphore, value)` signalled by the submit that consumed the slot.
 pub(crate) type Token = (vk::Semaphore, u64);
 
-/// One ring backing: the buffer, its memory, the mapping, and the export if asked.
+/// One ring backing: a buffer per slot, their memory, the mapping, and the export if asked.
 struct Backing {
-    buffer: vk::Buffer,
+    buffers: Vec<vk::Buffer>,
     memory: vk::DeviceMemory,
     ptr: *mut u8,
     #[cfg(unix)]
     dmabuf: Option<std::os::fd::OwnedFd>,
 }
 
-/// Buffer + memory + persistent map. The spec requires the src buffer to be
+/// Slot buffers + memory + persistent map. The spec requires a src buffer to be
 /// profile-listed.
 pub(crate) struct BitstreamRing {
     device: ash::Device,
     layout: RingLayout,
     profile: DecodeProfile,
-    buffer: vk::Buffer,
+    /// `buffers[slot]` is bound at `layout.offset_of(slot)`.
+    buffers: Vec<vk::Buffer>,
     memory: vk::DeviceMemory,
     ptr: *mut u8,
     /// Export the memory as a dma-buf ([`Self::dmabuf_fd`]).
@@ -308,7 +314,7 @@ impl BitstreamRing {
             device: dev.ash().clone(),
             layout,
             profile,
-            buffer: backing.buffer,
+            buffers: backing.buffers,
             memory: backing.memory,
             ptr: backing.ptr,
             export,
@@ -316,10 +322,6 @@ impl BitstreamRing {
             dmabuf: backing.dmabuf,
             pending: SlotStates::new(layout.slots as usize),
         })
-    }
-
-    pub(crate) fn buffer(&self) -> vk::Buffer {
-        self.buffer
     }
 
     /// The memory as a dma-buf, while this backing lives. A grown ring has a new one.
@@ -345,20 +347,28 @@ impl BitstreamRing {
         let mut external = vk::ExternalMemoryBufferCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
         let mut ci = vk::BufferCreateInfo::default()
-            .size(layout.buffer_size())
+            .size(layout.slot_size)
             .usage(vk::BufferUsageFlags::VIDEO_DECODE_SRC_KHR)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .push_next(&mut profile_list);
         if export {
             ci = ci.push_next(&mut external);
         }
-        // SAFETY: only the buffer and memory created below go in, before any use.
+        // SAFETY: only the buffers and memory created below go in, before any use.
         let mut unwind = unsafe { Unwind::new(dev.ash()) };
-        // SAFETY: live device; `ci` roots a chain of locals outliving the call.
-        let buffer = unsafe { dev.ash().create_buffer(&ci, None)? };
-        unwind.buffer = buffer;
-        // SAFETY: `buffer` was just created on this device.
-        let req = unsafe { dev.ash().get_buffer_memory_requirements(buffer) };
+        for _ in 0..layout.slots {
+            // SAFETY: live device; `ci` roots a chain of locals outliving the call.
+            unwind
+                .buffers
+                .push(unsafe { dev.ash().create_buffer(&ci, None)? });
+        }
+        // SAFETY: the buffer was just created on this device. Identical create
+        // infos give identical requirements.
+        let req = unsafe { dev.ash().get_buffer_memory_requirements(unwind.buffers[0]) };
+        // Slot sizes are powers of two from 2 MiB, so any sane alignment divides them.
+        if layout.slot_size % req.alignment != 0 {
+            return Err(AllocError::Vk(vk::Result::ERROR_INITIALIZATION_FAILED));
+        }
         let type_index = find_memory_type(
             &dev.memory_properties(),
             req.memory_type_bits,
@@ -366,8 +376,9 @@ impl BitstreamRing {
         )?;
         let mut exportable = vk::ExportMemoryAllocateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let last = layout.slots - 1;
         let mut alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(req.size)
+            .allocation_size(layout.offset_of(last) + req.size)
             .memory_type_index(type_index);
         if export {
             alloc = alloc.push_next(&mut exportable);
@@ -375,10 +386,16 @@ impl BitstreamRing {
         // SAFETY: live device; `alloc` roots locals outliving the call.
         let memory = unsafe { dev.ash().allocate_memory(&alloc, None)? };
         unwind.memory = memory;
-        // SAFETY: fresh buffer + fresh memory of at least the required size.
-        unsafe { dev.ash().bind_buffer_memory(buffer, memory, 0)? };
+        for (slot, &buffer) in (0..).zip(&unwind.buffers) {
+            // SAFETY: fresh buffer + fresh memory; the offset is a multiple of
+            // `req.alignment` (checked above) and leaves `req.size` bytes after it.
+            unsafe {
+                dev.ash()
+                    .bind_buffer_memory(buffer, memory, layout.offset_of(slot))?
+            };
+        }
         // SAFETY: `memory` is HOST_VISIBLE and unmapped; WHOLE_SIZE maps its full
-        // range for the buffer's lifetime (vkFreeMemory implicitly unmaps).
+        // range for the ring's lifetime (vkFreeMemory implicitly unmaps).
         let ptr = unsafe {
             dev.ash()
                 .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?
@@ -401,9 +418,10 @@ impl BitstreamRing {
         } else {
             None
         };
+        let buffers = std::mem::take(&mut unwind.buffers);
         unwind.disarm();
         Ok(Backing {
-            buffer,
+            buffers,
             memory,
             ptr: ptr.cast::<u8>(),
             #[cfg(unix)]
@@ -461,7 +479,7 @@ impl BitstreamRing {
             // touches this ring's own objects.
             unsafe { self.destroy_backing() };
             self.layout = grown;
-            self.buffer = backing.buffer;
+            self.buffers = backing.buffers;
             self.memory = backing.memory;
             self.ptr = backing.ptr;
             #[cfg(unix)]
@@ -486,7 +504,7 @@ impl BitstreamRing {
 
         let offset = self.layout.offset_of(slot as u32);
         let range = self.layout.record_range(len);
-        // SAFETY: `ptr` is the live persistent mapping of a buffer of
+        // SAFETY: `ptr` is the live persistent mapping of the ring memory, at least
         // `layout.buffer_size()` bytes; `offset + range <= buffer_size` because
         // `range <= slot_size` (fits/grown above) and offset is `slot * slot_size`
         // with `slot < slots`, so the `range` bytes from `offset` are one whole
@@ -500,14 +518,14 @@ impl BitstreamRing {
         // `pack_into` cannot panic.
         pack_into(slot_bytes, au, segments);
         Ok(UploadedAu {
-            offset,
+            buffer: self.buffers[slot],
             range,
             slot,
         })
     }
 
-    /// Destroy buffer + memory (which implicitly unmaps). Callers must have
-    /// drained in-flight reads first.
+    /// Destroy the slot buffers + memory (which implicitly unmaps). Callers must
+    /// have drained in-flight reads first.
     ///
     /// # Safety
     ///
@@ -515,10 +533,11 @@ impl BitstreamRing {
     unsafe fn destroy_backing(&mut self) {
         // SAFETY: the fn-level contract — objects are this ring's own, reads drained.
         unsafe {
-            self.device.destroy_buffer(self.buffer, None);
+            for buffer in self.buffers.drain(..) {
+                self.device.destroy_buffer(buffer, None);
+            }
             self.device.free_memory(self.memory, None);
         }
-        self.buffer = vk::Buffer::null();
         self.memory = vk::DeviceMemory::null();
         self.ptr = std::ptr::null_mut();
     }
@@ -526,7 +545,7 @@ impl BitstreamRing {
 
 impl Drop for BitstreamRing {
     fn drop(&mut self) {
-        if self.buffer == vk::Buffer::null() {
+        if self.buffers.is_empty() {
             return;
         }
         // SAFETY: the owning decoder drains its queue before dropping state (and the
