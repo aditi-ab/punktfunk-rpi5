@@ -9,6 +9,11 @@
 //! Per segment it prints what went in (wire events, distance) beside what the window got on
 //! the vertical axis: the `axis_source` seen, Σ`axis`, Σ`value120`, stops, and cadence.
 //! `PUNKTFUNK_INPUT_BACKEND` picks the injector like it does for the host.
+//!
+//! `--listen N` injects nothing and records a real client for N seconds. `--inject-at WxH`
+//! opens no window: the script lands on whatever app sits at the centre of a desktop that
+//! size, e.g. `gtk-scroll-logger.py` beside this file. `--script ticks` is a wheel turned
+//! into a trackpad; it runs only when named.
 
 #![forbid(unsafe_code)]
 
@@ -137,6 +142,27 @@ mod linux {
             }
             tick(&mut s, scroll(Finger, MomentumEnd, 0.0));
             s.push(Step::Wait(600));
+        }
+        // A wheel turned into a trackpad (Mac Mouse Fix): every tick is a short tracked
+        // gesture, a lift, and a momentum tail the next tick cuts short.
+        if wanted.split(',').any(|w| w == "ticks") {
+            mark(&mut s, "wheel-as-trackpad ticks");
+            for tick_no in 0..8 {
+                tick(&mut s, scroll(Finger, Begin, 1.5));
+                for k in 0..9 {
+                    tick(&mut s, scroll(Finger, Update, 2.0 + 0.5 * f64::from(k)));
+                }
+                tick(&mut s, scroll(Finger, End, 0.0));
+                let mut v = 6.0;
+                tick(&mut s, scroll(Finger, MomentumBegin, v));
+                let tail = if tick_no == 7 { 60 } else { 3 };
+                for _ in 0..tail {
+                    v *= 0.94;
+                    tick(&mut s, scroll(Finger, Momentum, v));
+                }
+                tick(&mut s, scroll(Finger, MomentumEnd, 0.0));
+            }
+            s.push(Step::Wait(1500));
         }
         if want("lift") {
             mark(&mut s, "finger lift, no momentum");
@@ -271,6 +297,41 @@ mod linux {
         // Listen only: a real client scrolls over the window, nothing is injected.
         let listen: Option<u64> = arg("--listen").and_then(|s| s.parse().ok());
         let raw = args.iter().any(|a| a == "--raw");
+
+        // Inject only: no window of our own, the script lands on whatever app sits at
+        // the centre of a `WxH` desktop.
+        if let Some(at) = arg("--inject-at") {
+            let (w, h) = at
+                .split_once('x')
+                .and_then(|(w, h)| Some((w.parse::<i32>().ok()?, h.parse::<i32>().ok()?)))
+                .context("--inject-at WxH")?;
+            let svc = pf_inject::InjectorService::start();
+            let tx = svc.sender();
+            let centre = InputEvent {
+                kind: InputKind::MouseMoveAbs,
+                _pad: [0; 3],
+                code: 0,
+                x: w / 2,
+                y: h / 2,
+                flags: ((w as u32) << 16) | h as u32,
+            };
+            // libei drops events until its devices resume.
+            for _ in 0..12 {
+                let _ = tx.send(centre);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            for step in script(&wanted) {
+                match step {
+                    Step::Mark(name) => println!("── injecting {name}"),
+                    Step::Send(e) => {
+                        let _ = tx.send(e);
+                    }
+                    Step::Wait(ms) => std::thread::sleep(Duration::from_millis(ms)),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            return Ok(());
+        }
 
         let conn = Connection::connect_to_env().context("connect to the Wayland display")?;
         let mut queue = conn.new_event_queue();
