@@ -266,6 +266,8 @@ fn run(
     life: &GameLifetime,
 ) -> Result<()> {
     pf_frame::session_tuning::on_hot_thread();
+    // Every source below resolves the compositor, which cancels a pending Game Mode hand-back.
+    let _gamescope_hold = crate::native::GamescopeHold::new();
     // Reject an out-of-range mode before allocating capture/encode buffers.
     encode::validate_dimensions(cfg.codec, cfg.width, cfg.height)
         .context("client-requested video mode")?;

@@ -27,6 +27,24 @@ pub mod pad_usb;
 mod pw_oneshot;
 mod stream_sink;
 
+pub(super) fn claim_default_mic() {
+    stream_sink::SOURCE.claim(stream_sink::MIC_NAME);
+}
+
+pub(super) fn release_default_mic() {
+    stream_sink::SOURCE.release(stream_sink::MIC_NAME);
+}
+
+pub(super) fn restore_defaults() {
+    stream_sink::SINK.release_all();
+    stream_sink::SOURCE.release_all();
+}
+
+pub(super) fn heal_defaults() {
+    stream_sink::SINK.heal();
+    stream_sink::SOURCE.heal();
+}
+
 use super::{AudioCapturer, MicBackendStats, VirtualMic, SAMPLE_RATE};
 use anyhow::{anyhow, Context, Result};
 use punktfunk_core::audio::{spa_channel_order, spa_positions};
@@ -477,7 +495,7 @@ impl PwMicSource {
             matches!(channels, 1 | 2),
             "virtual mic supports 1 or 2 channels, got {channels}"
         );
-        let node_name = source_name.unwrap_or("punktfunk-mic").to_string();
+        let node_name = source_name.unwrap_or(stream_sink::MIC_NAME).to_string();
         let (pcm_tx, pcm_rx) = sync_channel::<(std::time::Instant, Vec<f32>)>(64);
         let (quit_tx, quit_rx) = pipewire::channel::channel::<Terminate>();
         let alive = Arc::new(AtomicBool::new(true));
@@ -660,11 +678,10 @@ fn mic_pw_thread(
                 *pw::keys::NODE_DESCRIPTION  => "Punktfunk Remote Microphone",
                 // ~5 ms quantum (one Opus frame) so recorders get low-latency chunks.
                 *pw::keys::NODE_LATENCY      => "240/48000",
-                // Win default-source election. Default-input apps otherwise hear
-                // silence; PipeWire 1.4 never drives a non-default `Audio/Source`
-                // recorded by target (`QUANT/RATE` 0). 3000 clears typical
-                // hardware (~1000–1900); an explicit configured default still wins.
-                "priority.session"           => "3000",
+                // Lose default-source election: a session claims the default
+                // (`stream_sink::SOURCE`), so the box's own mic stays default when
+                // nobody streams. Hardware sits around 1000–1900.
+                "priority.session"           => "50",
             },
         )
         .context("pw mic Stream")?;
@@ -1203,8 +1220,8 @@ fn capture_props(
                 *pw::keys::MEDIA_CLASS      => "Audio/Sink",
                 *pw::keys::NODE_DESCRIPTION => "Punktfunk Stream Speaker",
                 *pw::keys::NODE_VIRTUAL     => "true",
-                // Low on purpose — opposite of the mic's 3000. Parked sink
-                // must not win auto default election; routing is the claim.
+                // Low on purpose, like the mic. Parked sink must not win
+                // auto default election; routing is the claim.
                 "priority.session"          => "50",
                 // Wine churns its device at launch; each suspend/resume is a
                 // hole in a live stream. Not `node.always-process`: that

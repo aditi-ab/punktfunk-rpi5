@@ -362,6 +362,9 @@ pub(crate) async fn serve(
     // Host-lifetime injector: one RemoteDesktop-portal grant. A CreateSession per session
     // races portal teardown on reconnect and wedges KWin EIS. Gamepads stay per-session.
     let injector = crate::inject::InjectorService::start();
+    // A crashed host's claims left the box's audio defaults on its own nodes. Off-thread: a
+    // sick PipeWire must not hold up serving; a session's claim waits on the same lock.
+    std::thread::spawn(crate::audio::heal_audio_defaults);
     // Host-lifetime virtual mic ([`crate::audio::MicPump`]): 0xCB Opus → a persistent source
     // games can bind before they launch. Opens eagerly; self-heals if the backend dies.
     let mic_service = crate::audio::MicPump::start();
@@ -542,10 +545,10 @@ pub(crate) async fn serve(
 /// 90 s `TimeoutStopSec`.
 const SHUTDOWN_RESTORE_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// Catch `SIGTERM`/`SIGINT`, restore the box's session, then exit. A takeover that stopped
-/// the display manager leaves no graphical session if killed; crash-restore lives in
-/// `$XDG_RUNTIME_DIR`, which logind removes with the user manager. Blocking restore under
-/// [`SHUTDOWN_RESTORE_GRACE`]; a host that took nothing over exits immediately.
+/// Catch `SIGTERM`/`SIGINT`, give the box back, then exit. `exit(0)` runs no destructor, so
+/// this is where the audio defaults, every display's topology restore and output, and a Game
+/// Mode takeover are undone. Crash-restore lives in `$XDG_RUNTIME_DIR`, which logind removes
+/// with the user manager. Blocking, under [`SHUTDOWN_RESTORE_GRACE`].
 fn install_shutdown_restore() {
     #[cfg(unix)]
     tokio::spawn(async {
@@ -568,7 +571,12 @@ fn install_shutdown_restore() {
             signal = sig,
             "host stopping — handing the box's session back"
         );
-        let restore = tokio::task::spawn_blocking(crate::vdisplay::restore_takeover_now);
+        let restore = tokio::task::spawn_blocking(|| {
+            crate::audio::restore_audio_defaults();
+            // Monitors come back before the outputs go, and before the slower Game Mode restart.
+            crate::vdisplay::registry::teardown_all();
+            crate::vdisplay::restore_takeover_now();
+        });
         if tokio::time::timeout(SHUTDOWN_RESTORE_GRACE, restore)
             .await
             .is_err()
@@ -1445,6 +1453,8 @@ pub(crate) async fn run_admitted(
     let counters = Arc::new(crate::session_status::SessionCounters::default());
     spawn_end_watch(conn.clone(), stop.clone(), quit.clone(), end_reason.clone());
 
+    // Before the handshake resolves the compositor: a handshake that fails still hands back.
+    let gamescope_hold = GamescopeHold::new();
     let handshake::Negotiated {
         hello,
         welcome,
@@ -1488,8 +1498,6 @@ pub(crate) async fn run_admitted(
     });
     // Filled by the stream thread's encoder open; the input thread reads it.
     let frame_map = input::FrameMap::default();
-    let gamescope_hold =
-        (compositor == Some(crate::vdisplay::Compositor::Gamescope)).then(GamescopeHold::new);
     // Live reconfigure is off for gamescope (resize must not relaunch the title),
     // `identity: per-client-mode` (resize would resolve a different slot), a monitor
     // mirror (physical head ignores the requested mode) and a `join` session (the mode
@@ -2086,12 +2094,8 @@ pub(crate) async fn run_admitted(
     .await;
 
     teardown(&stop, &conn, &result, audio_handle, input_handle).await;
-    // Managed gamescope on an autologin box: put the TV's gaming session back once no session
-    // streams gamescope. A `join` session still shows the owner's game after the owner leaves.
+    // After teardown: the last hold out hands the TV's gaming session back.
     drop(gamescope_hold);
-    if LIVE_GAMESCOPE.load(Ordering::SeqCst) == 0 {
-        crate::vdisplay::restore_managed_session();
-    }
     result.map(|()| Served::Session)
 }
 
@@ -2237,6 +2241,10 @@ struct SessionPlanes {
     mic_tx: std::sync::mpsc::SyncSender<crate::audio::MicFrame>,
     #[cfg(target_os = "linux")]
     _mic: Option<crate::audio::MicPump>,
+    /// The shared mic is the box's default source while this session lives. An isolated
+    /// session's own mic is pinned by `PULSE_SOURCE` and claims nothing.
+    #[cfg(target_os = "linux")]
+    _mic_default: Option<crate::audio::DefaultMicClaim>,
     #[cfg(target_os = "linux")]
     _injector: Option<crate::inject::InjectorService>,
 }
@@ -2293,6 +2301,7 @@ impl SessionPlanes {
                 .and_then(|i| i.mic_source.clone())
                 .map(|name| crate::audio::MicPump::start_named(Some(name)));
             let mic_tx = mic.as_ref().map(|p| p.sender()).unwrap_or(mic_tx);
+            let mic_default = mic.is_none().then(crate::audio::claim_default_mic);
             SessionPlanes {
                 isolation,
                 seat_dev,
@@ -2300,6 +2309,7 @@ impl SessionPlanes {
                 inj_session_tx,
                 mic_tx,
                 _mic: mic,
+                _mic_default: mic_default,
                 _injector: injector,
             }
         }
@@ -2568,14 +2578,15 @@ async fn teardown(
     }
 }
 
-/// Live native sessions on a gamescope display, for the managed TV restore above.
+/// Live sessions, on either plane, that may stream a gamescope the host took over.
 static LIVE_GAMESCOPE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// One count in [`LIVE_GAMESCOPE`] for the session's lifetime, early returns included.
-struct GamescopeHold;
+/// One count in [`LIVE_GAMESCOPE`], taken before the session resolves its compositor. Resolving
+/// cancels a pending Game Mode hand-back; the last hold dropped, on any path, schedules it again.
+pub(crate) struct GamescopeHold;
 
 impl GamescopeHold {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         LIVE_GAMESCOPE.fetch_add(1, Ordering::SeqCst);
         GamescopeHold
     }
@@ -2583,7 +2594,10 @@ impl GamescopeHold {
 
 impl Drop for GamescopeHold {
     fn drop(&mut self) {
-        LIVE_GAMESCOPE.fetch_sub(1, Ordering::SeqCst);
+        // A `join` session still shows the owner's game after the owner leaves.
+        if LIVE_GAMESCOPE.fetch_sub(1, Ordering::SeqCst) == 1 {
+            crate::vdisplay::restore_managed_session();
+        }
     }
 }
 

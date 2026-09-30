@@ -144,6 +144,9 @@ pub struct SpawnedLaunch {
     /// Workspace this launch owns on the streamed head. Hand it to the lease:
     /// the claim ends with the game, not with this call.
     pub workspace: Option<crate::vdisplay::WorkspaceClaim>,
+    /// A `steam …` forwarder, which becomes the Steam client itself when none runs. Never the
+    /// lease's child: End game would signal Steam. The lease finds the game by its app id.
+    pub steam_forwarder: bool,
 }
 
 /// Aim the streamed head at this launch, and — when `own` and the backend can
@@ -210,15 +213,33 @@ pub fn launch_session_command(
     // Before the spawn, so the game's first window maps where it belongs. Same
     // head as the absolute-input pointer, so focus and cursor share one.
     let workspace = focus_and_claim(compositor, own_workspace, None);
+    let steam_forwarder = crate::vdisplay::launch_is_steam(cmd);
     let (child, group_leader) = match compositor {
         crate::vdisplay::Compositor::Gamescope => (
             crate::vdisplay::launch_into_gamescope_session(cmd, seat, steam_home)?,
             false,
         ),
         _ => {
-            let mut c = std::process::Command::new("sh");
-            c.arg("-c")
-                .arg(cmd)
+            // A Steam this forwarder cold-starts gets its own scope, outside the host's unit: a
+            // host restart would take it down mid-write.
+            let mut c = if steam_forwarder && user_manager_up() {
+                let mut c = std::process::Command::new("systemd-run");
+                c.args([
+                    "--user",
+                    "--scope",
+                    "--collect",
+                    "--quiet",
+                    "--",
+                    "sh",
+                    "-c",
+                ]);
+                c
+            } else {
+                let mut c = std::process::Command::new("sh");
+                c.arg("-c");
+                c
+            };
+            c.arg(cmd)
                 // Own process group: later teardown signals the shell and its
                 // children, and not the host's group.
                 .process_group(0);
@@ -240,7 +261,8 @@ pub fn launch_session_command(
                     "no X display for the launch — an X11 app (Steam, Lutris) will refuse to start"
                 ),
             }
-            (c.spawn().context("spawn launch command")?, true)
+            // A Steam forwarder's group can hold the Steam client; never signal it as a group.
+            (c.spawn().context("spawn launch command")?, !steam_forwarder)
         }
     };
     tracing::info!(
@@ -253,7 +275,14 @@ pub fn launch_session_command(
         child,
         group_leader,
         workspace,
+        steam_forwarder,
     })
+}
+
+/// A user manager to open a scope under; without one `systemd-run --user` fails the launch.
+fn user_manager_up() -> bool {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .is_some_and(|dir| std::path::Path::new(&dir).join("systemd/private").exists())
 }
 
 #[cfg(test)]

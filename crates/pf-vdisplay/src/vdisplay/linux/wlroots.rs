@@ -39,15 +39,27 @@ fn chooser_line(output: &str) -> String {
     format!("Monitor: {output}\n")
 }
 
-/// xdpw runs this via `/bin/sh -c` and reads stdout. The `|| echo` fallback is a guess
-/// at sway's own first headless output — right only when that backend has one.
-/// [`crate::portal_cast`] removes the per-session file with the handshake so it cannot
-/// name an already-unplugged output.
-fn chooser_cmd() -> String {
-    format!(
-        "cat {} 2>/dev/null || echo 'Monitor: HEADLESS-1'",
-        chooser_file()
-    )
+/// xdpw runs this via `/bin/sh -c` and reads stdout. With no session casting (the file
+/// is gone), a share on the box goes to `fallback`. [`crate::portal_cast`] removes the
+/// per-session file with the handshake so it cannot name an already-unplugged output.
+fn chooser_cmd(fallback: &str) -> String {
+    format!("cat {} 2>/dev/null || {fallback}", chooser_file())
+}
+
+/// What xdpw's own default chooser tries first.
+const XDPW_DEFAULT_CHOOSER: &str = "slurp -f 'Monitor: %o' -or";
+
+/// The user's own `simple` command, else [`XDPW_DEFAULT_CHOOSER`]. A `dmenu`-type command
+/// reads xdpw's output list on stdin, which a `simple` chooser never gets.
+fn chooser_fallback(path: &std::path::Path) -> String {
+    let theirs = |key| match crate::portal_config::peek(path, XDPW_BLOCK, key) {
+        (_, Some(prior)) => prior,
+        (current, None) => current,
+    };
+    match (theirs("chooser_type").as_deref(), theirs("chooser_cmd")) {
+        (Some("simple"), Some(cmd)) if !cmd.contains(&chooser_file()) => cmd,
+        _ => XDPW_DEFAULT_CHOOSER.to_string(),
+    }
 }
 
 /// xdpw's chooser cats [`chooser_file`].
@@ -940,8 +952,10 @@ fn ensure_xdpw_config() -> Result<()> {
 /// Only the two keys we own, in place. A full-file write would wipe the user's
 /// other xdpw settings. `true` when the file changed.
 fn take_chooser(path: &std::path::Path) -> Result<bool> {
+    // Read before the edit: once taken, the file holds ours and marks theirs as prior.
+    let cmd = chooser_cmd(&chooser_fallback(path));
     let mut changed = crate::portal_config::ensure_key(path, XDPW_BLOCK, "chooser_type", "simple")?;
-    changed |= crate::portal_config::ensure_key(path, XDPW_BLOCK, "chooser_cmd", &chooser_cmd())?;
+    changed |= crate::portal_config::ensure_key(path, XDPW_BLOCK, "chooser_cmd", &cmd)?;
     Ok(changed)
 }
 
@@ -949,8 +963,7 @@ fn take_chooser(path: &std::path::Path) -> Result<bool> {
 /// Host shutdown only, never per cast: the restart cuts a live cast. Safe on a box
 /// we never touched (no-op).
 ///
-/// Left in place, every screen share on the box goes to our chooser and falls back
-/// to `HEADLESS-1` once the selection file is gone.
+/// Left in place, every screen share on the box goes through our chooser first.
 pub(crate) fn restore_chooser_on_shutdown() {
     let Ok(path) = xdpw_config_path() else { return };
     if !give_back_chooser(&path) {
@@ -1207,6 +1220,32 @@ mod tests {
         assert!(taken.contains("chooser_type=simple"), "{taken}");
         assert_eq!(back, user);
         assert!(!again, "a second restore finds nothing of ours");
+    }
+
+    /// With no session casting, a share on the box reaches the user's own chooser, never a
+    /// guessed headless output.
+    #[test]
+    fn an_idle_share_falls_back_to_the_users_chooser() {
+        let dir = std::env::temp_dir().join(format!("pf-vd-xdpw-fb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("config");
+        std::fs::write(
+            &path,
+            "[screencast]\nchooser_type=simple\nchooser_cmd=my-picker\n",
+        )
+        .expect("seed");
+        assert_eq!(chooser_fallback(&path), "my-picker");
+        assert!(take_chooser(&path).expect("take"));
+        // Taken: the prior is still theirs, not our own command.
+        assert_eq!(chooser_fallback(&path), "my-picker");
+        std::fs::write(
+            &path,
+            "[screencast]\nchooser_type=dmenu\nchooser_cmd=wofi -d\n",
+        )
+        .expect("seed");
+        assert_eq!(chooser_fallback(&path), XDPW_DEFAULT_CHOOSER);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
