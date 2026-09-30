@@ -38,6 +38,8 @@ pub enum SlotId {
     PadMouse,
     /// Silence this client's speakers. Local: the host keeps playing for anyone joined to it.
     StreamMute,
+    /// A dual-screen handheld's two screens trade the picture and the companion panel.
+    SwapScreens,
     Host(String),
     Shortcut(String),
 }
@@ -59,6 +61,7 @@ impl SlotId {
             SlotId::Qam => "qam".into(),
             SlotId::PadMouse => "pad_mouse".into(),
             SlotId::StreamMute => "stream_mute".into(),
+            SlotId::SwapScreens => "swap_screens".into(),
             SlotId::Host(id) => format!("host:{id}"),
             SlotId::Shortcut(id) => format!("shortcut:{id}"),
         }
@@ -80,6 +83,7 @@ impl SlotId {
             "qam" => SlotId::Qam,
             "pad_mouse" => SlotId::PadMouse,
             "stream_mute" => SlotId::StreamMute,
+            "swap_screens" => SlotId::SwapScreens,
             _ => {
                 if let Some(id) = s.strip_prefix("host:").filter(|id| !id.is_empty()) {
                     SlotId::Host(id.into())
@@ -484,7 +488,10 @@ pub fn catalogue(cfg: &OverlayConfig, platform: RingPlatform) -> Vec<CatalogueGr
         },
         CatalogueGroup {
             title: "View",
-            entries: vec![e("stats", "Statistics", "")],
+            entries: vec![
+                e("stats", "Statistics", ""),
+                e("swap_screens", "Swap screens", "Dual-screen handhelds only"),
+            ],
         },
         CatalogueGroup {
             title: "Audio",
@@ -546,6 +553,7 @@ pub fn slot_icon(id: &str, state: &str) -> Option<&'static str> {
         "qam" => "panel-right",
         "pad_mouse" => "mouse",
         "stream_mute" => "volume-2",
+        "swap_screens" => "arrow-up-down",
         "more" => "ellipsis",
         "host:power.sleep" => "moon",
         "host:power.reboot" => "rotate-cw",
@@ -785,6 +793,7 @@ mod tests {
             "qam",
             "pad_mouse",
             "stream_mute",
+            "swap_screens",
             "host:power.reboot",
             "shortcut:s2",
         ] {

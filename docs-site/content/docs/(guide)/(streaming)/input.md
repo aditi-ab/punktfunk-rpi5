@@ -230,7 +230,7 @@ What the dial can hold:
 |---|---|
 | Session | **End stream**, **End game** (a game this device launched, then the stream), **Disconnect, keep the game running** |
 | Input | **Touch mode**, **Keyboard**, **Virtual controller**, **Send text**, **Guide button**, **Quick access menu**, **Controller mouse** |
-| View · Audio | **Statistics**, **Microphone**, **Mute this stream** (this device only) |
+| View · Audio | **Statistics**, **Swap screens** (dual-screen handhelds), **Microphone**, **Mute this stream** (this device only) |
 | Host | **Sleep host**, **Restart host**, **Shut down host** ([Host power](/docs/host-power)) |
 | Shortcuts | Key combinations you add, such as Alt+F4 |
 
@@ -284,6 +284,14 @@ elsewhere still drive the touch mode. Set **Touch mode** to **Off** to keep them
 the host. Under **Quick actions** in settings, pick a **Layout**
 (**Full**, **Sticks and shoulders**, **D-pad and face buttons**), set **Opacity** and **Scale**,
 or use **Edit layout** to move, resize and hide controls, separately for wide and upright screens.
+
+### Dual-screen handhelds
+
+On an Android handheld with a second screen of 7 inches or less, or a foldable half open, the
+stream takes one screen and a panel takes the other: statistics, the dial's actions, a trackpad
+and the virtual controller. **Swap screens**, on the dial or the panel, trades the two. The
+handheld remembers the swap, and an **Automatic** resolution or refresh follows the picture: at
+once where the host can change mode mid-stream, else from the next connect.
 
 ## Pen and stylus
 

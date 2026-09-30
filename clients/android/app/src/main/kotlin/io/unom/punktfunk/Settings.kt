@@ -7,6 +7,7 @@ import android.util.Log
 import android.view.Display
 import android.view.WindowInsets
 import android.view.WindowManager
+import androidx.core.content.ContextCompat
 
 /**
  * User-tunable stream settings, persisted in `SharedPreferences`. A `0` resolution/refresh means
@@ -407,22 +408,22 @@ class SettingsStore(
 }
 
 /**
- * The display to probe for capability/mode queries: the context's own display when it is already
- * associated with one, else the DEFAULT display via [DisplayManager]. A `punktfunk://` deep-link
- * COLD start can reach the connect before the activity is attached to its display —
- * `context.display` then throws, and the old `false`/1080p60 fallbacks silently downgraded the
- * whole session (no HDR advertised / non-native mode) with nothing in the log. The default
- * display IS the panel on phones and TVs; the activity-display distinction only matters on
- * multi-display setups, where the attached path still wins whenever it is available.
+ * The display the picture goes to, for capability/mode queries: the second screen the player
+ * swapped it onto ([pictureDisplay]), else the context's own display, else the DEFAULT display.
+ * A `punktfunk://` deep-link COLD start can reach the connect before the activity is attached to
+ * its display — `context.display` then throws, and without the DEFAULT fallback the session would
+ * open at 1080p60 with no HDR and nothing in the log.
  */
 private fun probeDisplay(context: Context): Display? =
-    runCatching { context.display }.getOrNull()
-        ?: runCatching {
-            context.getSystemService(DisplayManager::class.java)
-                ?.getDisplay(Display.DEFAULT_DISPLAY)
-        }.getOrNull().also {
-            if (it != null) Log.i("punktfunk", "display probe: context unattached — using DEFAULT_DISPLAY")
-        }
+    (
+        runCatching { context.display }.getOrNull()
+            ?: runCatching {
+                context.getSystemService(DisplayManager::class.java)
+                    ?.getDisplay(Display.DEFAULT_DISPLAY)
+            }.getOrNull().also {
+                if (it != null) Log.i("punktfunk", "display probe: context unattached — using DEFAULT_DISPLAY")
+            }
+        )?.let { pictureDisplay(context, it) }
 
 /**
  * The device's native display mode as a landscape `(width, height, hz)` — the long edge is the
@@ -437,7 +438,7 @@ fun nativeDisplayMode(context: Context): Triple<Int, Int, Int> {
     // ROUNDED, not truncated: TVs report the fractional NTSC rates over HDMI (59.94, 29.97,
     // 23.976), and `toInt()` turns 59.94 into 59 — a rate no display mode anywhere has, which the
     // host then serves by clamping DOWN to the highest mode it advertises at or below it. Rounding
-    // also keeps this agreeing with `MainActivity.streamPanelFps`, which already rounds; the two
+    // also keeps this agreeing with `Display.streamPanelFps`, which already rounds; the two
     // describe the same panel and must not disagree.
     val hz = kotlin.math.round(mode.refreshRate).toInt().coerceAtLeast(1)
     return Triple(maxOf(w, h), minOf(w, h), hz)
@@ -491,15 +492,20 @@ object SafeArea {
 }
 
 /**
- * The housing a landscape stream must clear on this display, in pixels ([SafeArea.landscapeInset]).
+ * The housing a landscape stream must clear on the picture's display, in pixels
+ * ([SafeArea.landscapeInset]).
  *
- * Read from the window manager's inset state, the one the stream window is laid out against, so the
- * mode and the placement agree. [Display.getCutout] adjusts for the calling context's rotation and
- * can read wider than the window does. Rounded corners are not charged: clearing a corner of radius
- * `r` costs `r` on every row to uncover two small arcs.
+ * On the activity's own display, read from the window manager's inset state, the one the stream
+ * window is laid out against, so the mode and the placement agree: [Display.getCutout] adjusts for
+ * the calling context's rotation and can read wider than the window does. A second screen the
+ * picture was swapped onto has no window here to ask, so its cutout comes from the display. Rounded
+ * corners are not charged: clearing a corner of radius `r` costs `r` on every row to uncover two
+ * small arcs.
  */
 fun displayCutoutInset(context: Context): Int {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+    val own = ContextCompat.getDisplayOrDefault(context).displayId
+    val swapped = probeDisplay(context)?.let { it.displayId != own } == true
+    if (!swapped && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
         val i = runCatching {
             context.getSystemService(WindowManager::class.java).currentWindowMetrics.windowInsets
                 .getInsets(WindowInsets.Type.displayCutout())

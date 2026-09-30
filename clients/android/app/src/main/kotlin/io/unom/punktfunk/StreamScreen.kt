@@ -241,6 +241,10 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     val hingeCompanion = fold?.carriesCompanion(rootSize.height) == true
     val companionDisplay = rememberCompanionDisplay().takeUnless { hingeCompanion }
     val companionUp = hingeCompanion || companionDisplay != null
+    // Which screen of the pair holds the picture: the player's swap, kept per second screen. A
+    // hinge's two halves are one display, so they share one key.
+    val swapKey = companionDisplay?.name ?: "hinge".takeIf { hingeCompanion }
+    var swapped by remember(swapKey) { mutableStateOf(swapKey != null && CompanionMemory.swapped(context, swapKey)) }
     // The POINTER grant gates every touch capture layer: "don't capture what can't land".
     val pointerOk = ui.accessGrants and SessionAccess.POINTER != 0
     val companionPages = companionPages(pointerOk, padShown || activity?.gamepadRouter?.sendsEnabled() == true)
@@ -361,6 +365,36 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     // measure against it, so none of them knows a fold happened.
     var padSize by remember { mutableStateOf(IntSize.Zero) }
     val split = fold?.takeIf { hingeCompanion || (padShown && !companionUp) }
+    // A live mode switch: the asked-for mode shows at once, the host's answer half a second later.
+    fun switchMode(w: Int, h: Int, hz: Int) {
+        if (NativeBridge.nativeRequestMode(handle, w, h, hz)) {
+            requestedMode = intArrayOf(w, h, hz)
+            scope.launch {
+                delay(500)
+                NativeBridge.nativeVideoSize(handle)?.takeIf { it.size >= 3 }?.let { requestedMode = it }
+            }
+        }
+    }
+    // A mode the player picked in the sheet this stream, which a swap never changes.
+    var modePicked by remember(handle) { mutableStateOf(false) }
+
+    /**
+     * The picture and the panel trade screens, and the pair remembers it. What Automatic resolved
+     * follows the picture to the other display: live where the host takes the switch, else from
+     * the next connect, which resolves against the same screen ([pictureDisplay]).
+     */
+    fun swapScreens(key: String) {
+        swapped = !swapped
+        CompanionMemory.keepSwap(context, key, swapped)
+        runCatching { NativeBridge.nativeLogDisplay("swap: picture ${if (swapped) "on" else "off"} $key") }
+        val automatic = initialSettings.width <= 0 || initialSettings.height <= 0 || initialSettings.hz <= 0
+        if (companionDisplay == null || modePicked || !automatic) return
+        val (baseW, baseH, hz) = initialSettings.effectiveMode(context)
+        val (w, h) = RenderScale.apply(
+            baseW, baseH, initialSettings.renderScale, RenderScale.maxDimension(initialSettings.codec),
+        )
+        if (!intArrayOf(w, h, hz).contentEquals(requestedMode)) switchMode(w, h, hz)
+    }
     // What the ring's slots and the companion's action tiles do this session.
     val ringActions = RingActions(
         endStream = { NativeBridge.nativeDisconnectQuit(handle); onSessionEnded(SessionEndReason.LOCAL) },
@@ -435,14 +469,11 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         },
         currentMode = { requestedMode },
         requestMode = { w, h, hz ->
-            if (NativeBridge.nativeRequestMode(handle, w, h, hz)) {
-                requestedMode = intArrayOf(w, h, hz)
-                scope.launch {
-                    delay(500)
-                    NativeBridge.nativeVideoSize(handle)?.takeIf { it.size >= 3 }?.let { requestedMode = it }
-                }
-            }
+            modePicked = true
+            switchMode(w, h, hz)
         },
+        screensSwappable = { swapKey != null },
+        swapScreens = { swapKey?.let(::swapScreens) },
     )
     // The summon rides a pointer gesture but TYPES, so it also needs the KEYBOARD grant
     // (dismissing is always allowed).
@@ -475,17 +506,12 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     // box it lands in is the window's live cutout-safe width: it follows a flip to the other
     // landscape. Left and right are physical sides, so an RTL layout cannot swap them.
     val safe = initialSettings.width == SAFE_AREA_MODE
-    Column(modifier = Modifier.fillMaxSize().background(Color.Black).onSizeChanged { rootSize = it }) {
+    // The picture and everything drawn on it or read off it: the video, the HUD and hints, the
+    // gesture layer, the pad and the ring. It measures against its own box, so it runs the same in
+    // the activity's window and on a second screen.
+    val picture: @Composable (Modifier) -> Unit = { modifier ->
         Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .then(
-                    if (split != null) {
-                        Modifier.height(with(density) { split.videoPx.toDp() })
-                    } else {
-                        Modifier.weight(1f)
-                    },
-                )
+            modifier = modifier
                 .then(
                     if (safe) {
                         Modifier.windowInsetsPadding(WindowInsets.displayCutout.only(WindowInsetsSides.Horizontal))
@@ -548,12 +574,11 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                                     isChromeOs,
                                     initialSettings.presentPriorityWire(),
                                     initialSettings.smoothBuffer,
-                                    // The panel's own refresh — from the mode TABLE (streamPanelFps),
-                                    // because display.refreshRate reports a per-uid override, not the
-                                    // panel. Fallback: the (possibly lying) live rate.
-                                    activity?.streamPanelFps(streamHz)?.takeIf { it > 0 }
-                                        ?: (runCatching { context.display }.getOrNull()?.refreshRate ?: 0f)
-                                            .roundToInt(),
+                                    // The refresh of the panel this view is on — from the mode TABLE
+                                    // (streamPanelFps), because display.refreshRate reports a per-uid
+                                    // override, not the panel. Fallback: the (possibly lying) live rate.
+                                    this@apply.display?.streamPanelFps(streamHz)?.takeIf { it > 0 }
+                                        ?: (this@apply.display?.refreshRate ?: 0f).roundToInt(),
                                     // The SurfaceView's on-screen pixel size — the coordinate space the
                                     // ASurfaceControl layer composites in (the aspect-fitted video rect,
                                     // not the window's rotated buffer geometry). 0 if not laid out yet;
@@ -724,24 +749,6 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                     modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 24.dp),
                 )
             }
-            // Invisible 1-px focus anchor for the host-typing soft keyboard (three-finger swipe up
-            // in the mouse modes) AND the pointer-capture grab target — it never draws or takes
-            // touches, it just owns IME focus and receives captured-pointer events.
-            AndroidView(
-                modifier = Modifier.size(1.dp),
-                factory = { ctx ->
-                    KeyCaptureView(ctx).also { v ->
-                        keyCapture = v
-                        // Real IME text path when the host types committed text (see KeyCaptureView).
-                        v.textHandle =
-                            if (NativeBridge.nativeTextInputSupported(handle)) handle else 0L
-                        v.setOnCapturedPointerListener { _, ev ->
-                            (ctx as? MainActivity)?.mouseForwarder?.onCapturedPointer(ev) ?: false
-                        }
-                        v.preIme = { ev -> (ctx as? MainActivity)?.streamKey(ev) == true }
-                    }
-                },
-            )
             // Touch input per the Settings model: trackpad/direct-pointer mouse (the shared gesture
             // vocabulary), the same gestures with nothing sent (Off, so a miss beside the pad stays
             // put), or real multi-touch passthrough — see TouchInput.kt. Passthrough gets no
@@ -821,24 +828,61 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                 }
             }
         }
-        if (split != null) {
-            // The hinge itself: nothing on a creased panel, a real strip on a two-panel device.
-            Spacer(Modifier.height(with(density) { split.hingePx.toDp() }))
-            Box(modifier = Modifier.fillMaxWidth().weight(1f).onSizeChanged { padSize = it }) {
-                if (hingeCompanion) companion() else PadHalf(virtualPad, overlayCfg.pad, padSize, haptics, openRingCentred)
-            }
-        }
-        companionDisplay?.let { CompanionOnDisplay(it, companion) }
-        // Last, so it covers everything: the launched title's poster until its game is up.
-        var launchHold by remember(session) { mutableStateOf(session.launchHold) }
-        launchHold?.let {
-            LaunchHoldOverlay(
-                it,
-                // Retry is the shelf the launch came off: ending as `GAME_EXITED` puts a library
-                // launch back on it, one press from the same tile.
-                onRetry = { endAway(true, SessionEndReason.GAME_EXITED) },
-                onShow = { launchHold = null },
+    }
+    Box(Modifier.fillMaxSize().background(Color.Black).onSizeChanged { rootSize = it }) {
+        // Invisible 1-px focus anchor for the host-typing soft keyboard (three-finger swipe up in
+        // the mouse modes) AND the pointer-capture grab target. It never draws or takes touches,
+        // and it stays in the activity's window wherever the picture is: that window keeps focus.
+        AndroidView(
+            modifier = Modifier.size(1.dp),
+            factory = { ctx ->
+                KeyCaptureView(ctx).also { v ->
+                    keyCapture = v
+                    // Real IME text path when the host types committed text (see KeyCaptureView).
+                    v.textHandle =
+                        if (NativeBridge.nativeTextInputSupported(handle)) handle else 0L
+                    v.setOnCapturedPointerListener { _, ev ->
+                        (ctx as? MainActivity)?.mouseForwarder?.onCapturedPointer(ev) ?: false
+                    }
+                    v.preIme = { ev -> (ctx as? MainActivity)?.streamKey(ev) == true }
+                }
+            },
+        )
+        Column(Modifier.fillMaxSize()) {
+            val upper = Modifier.fillMaxWidth().then(
+                if (split != null) Modifier.height(with(density) { split.videoPx.toDp() }) else Modifier.weight(1f),
             )
+            // Swapped, the panel and the picture trade places.
+            if (swapped) Box(upper) { companion() } else picture(upper)
+            if (split != null) {
+                // The hinge itself: nothing on a creased panel, a real strip on a two-panel device.
+                Spacer(Modifier.height(with(density) { split.hingePx.toDp() }))
+                Box(modifier = Modifier.fillMaxWidth().weight(1f).onSizeChanged { padSize = it }) {
+                    when {
+                        !hingeCompanion -> PadHalf(virtualPad, overlayCfg.pad, padSize, haptics, openRingCentred)
+                        swapped -> picture(Modifier.fillMaxSize())
+                        else -> companion()
+                    }
+                }
+            }
+            companionDisplay?.let {
+                if (swapped) {
+                    CompanionOnDisplay(it, pictureHz = streamHz) { picture(Modifier.fillMaxSize()) }
+                } else {
+                    CompanionOnDisplay(it, content = companion)
+                }
+            }
+            // Last, so it covers everything: the launched title's poster until its game is up.
+            var launchHold by remember(session) { mutableStateOf(session.launchHold) }
+            launchHold?.let {
+                LaunchHoldOverlay(
+                    it,
+                    // Retry is the shelf the launch came off: ending as `GAME_EXITED` puts a library
+                    // launch back on it, one press from the same tile.
+                    onRetry = { endAway(true, SessionEndReason.GAME_EXITED) },
+                    onShow = { launchHold = null },
+                )
+            }
         }
     }
 }

@@ -72,8 +72,9 @@ internal fun companionPages(pointer: Boolean, pad: Boolean): List<CompanionPage>
     CompanionPage.entries.filter { (it != CompanionPage.TRACKPAD || pointer) && (it != CompanionPage.PAD || pad) }
 
 /**
- * The page the player last picked, kept across streams. The controller page is never kept:
- * showing it connects a pad, and a stream must not connect one on its own.
+ * The page the player last picked, and which screen of each pair holds the picture, kept across
+ * streams. The controller page is never kept: showing it connects a pad, and a stream must not
+ * connect one on its own.
  */
 internal object CompanionMemory {
     private const val PREFS = "punktfunk_companion"
@@ -90,6 +91,13 @@ internal object CompanionMemory {
     fun keep(context: Context, page: CompanionPage) {
         if (page != CompanionPage.PAD) prefs(context).edit().putString(PAGE, page.name).apply()
     }
+
+    /** True when the player moved the picture onto the second screen [screen] names. */
+    fun swapped(context: Context, screen: String): Boolean = prefs(context).getBoolean("swap:$screen", false)
+
+    fun keepSwap(context: Context, screen: String, swapped: Boolean) {
+        prefs(context).edit().putBoolean("swap:$screen", swapped).apply()
+    }
 }
 
 /**
@@ -99,7 +107,7 @@ internal object CompanionMemory {
  */
 private val ACTION_SLOTS = listOf(
     SlotId.Guide, SlotId.Qam, SlotId.Keyboard, SlotId.TouchMode, SlotId.PadMouse, SlotId.Pad,
-    SlotId.Mic, SlotId.StreamMute,
+    SlotId.SwapScreens, SlotId.Mic, SlotId.StreamMute,
 )
 private val EXIT_SLOTS = listOf(SlotId.DisconnectLinger, SlotId.EndStream)
 

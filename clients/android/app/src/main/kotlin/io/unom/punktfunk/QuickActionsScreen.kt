@@ -323,6 +323,7 @@ private val previewActions = RingActions(
     pointerGranted = { true }, padMouseTarget = { 1 }, padMouseMode = { 0 }, cyclePadMouse = {},
     audioMute = { 0 }, audioMuteLabel = { null }, toggleStreamMute = {},
     currentMode = { intArrayOf(1920, 1080, 60) }, requestMode = { _, _, _ -> },
+    screensSwappable = { true },
 )
 
 private data class SlotOption(val id: String, val label: String, val note: String? = null)
@@ -346,7 +347,10 @@ private fun slotGroups(cfg: OverlayConfig): List<SlotGroup> {
             SlotOption("qam", "Quick access menu", "Only where the host's pad is Steam-shaped"),
             SlotOption("pad_mouse", "Controller mouse", "Your controller moves the host's pointer"),
         )),
-        SlotGroup("View", listOf(SlotOption("stats", "Statistics"))),
+        SlotGroup("View", listOf(
+            SlotOption("stats", "Statistics"),
+            SlotOption("swap_screens", "Swap screens", "Dual-screen handhelds only"),
+        )),
         SlotGroup("Audio", listOf(
             SlotOption("mic", "Microphone"),
             SlotOption("stream_mute", "Mute this stream", "This device only — the host keeps playing"),
