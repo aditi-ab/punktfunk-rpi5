@@ -1445,6 +1445,24 @@ impl Decoder {
         }
     }
 
+    /// Whether a Vulkan-Video decode is complete now, without waiting. `true` off that
+    /// backend: nothing is pending there.
+    pub fn hw_decoded_now(&mut self, timeline_sem: u64, value: u64) -> bool {
+        match &mut self.backend {
+            Backend::NativeVulkan(d) => d.timeline_done(timeline_sem, value),
+            _ => true,
+        }
+    }
+
+    /// The decode wait is also the media clock boost (Intel on i915): the pump waits
+    /// it at once instead of one AU behind.
+    pub fn hw_wait_boosted(&self) -> bool {
+        match &self.backend {
+            Backend::NativeVulkan(d) => d.boosted(),
+            _ => false,
+        }
+    }
+
     /// Decode-integrity counters, or `None` where the backend cannot answer
     /// (CPU, PyroWave). `None` is "cannot see corruption"; `Some(default)` is "looked and saw none".
     pub fn decode_health(&self) -> Option<DecodeHealth> {

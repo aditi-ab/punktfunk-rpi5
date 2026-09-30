@@ -826,7 +826,7 @@ fn spawn_plane_threads(
     }
 }
 
-/// How the pump waits a hardware decode to completion before it hands the frame on.
+/// How the pump learns that a hardware decode is complete.
 enum HwDone {
     /// Vulkan Video: the picture's timeline semaphore reaches `value`.
     Timeline(u64, u64),
@@ -835,6 +835,85 @@ enum HwDone {
     SyncFile(std::os::fd::OwnedFd),
     /// The decoder returned with the pixels done.
     Cpu,
+}
+
+/// A hardware decode submitted and not yet handed on: the picture (`None` when the freeze
+/// gate withholds it), its fence, and the stamps the hand-off needs. One at a time: the
+/// next AU's submit is what overlaps it, so the pump holds two pictures at most.
+struct InFlight {
+    hw: HwDone,
+    received_ns: u64,
+    pts_ns: u64,
+    image: Option<DecodedImage>,
+}
+
+/// Whether `hw` is complete right now, without waiting.
+fn hw_done_now(decoder: &mut crate::video::Decoder, hw: &HwDone) -> bool {
+    match hw {
+        HwDone::Timeline(sem, value) => decoder.hw_decoded_now(*sem, *value),
+        #[cfg(target_os = "linux")]
+        HwDone::SyncFile(fd) => {
+            use std::os::fd::AsFd as _;
+            !matches!(
+                pf_dmabuf::fence::wait_sync_file(fd.as_fd(), 0),
+                Ok(pf_dmabuf::fence::WaitOutcome::TimedOut)
+            )
+        }
+        HwDone::Cpu => true,
+    }
+}
+
+/// Wait `hw` out. 50 ms bounds a wedged pipeline; the presenter waits the GPU too.
+fn wait_hw_done(decoder: &mut crate::video::Decoder, hw: &HwDone) {
+    match hw {
+        HwDone::Timeline(sem, value) => {
+            decoder.wait_hw_decoded(*sem, *value, 50_000_000);
+        }
+        #[cfg(target_os = "linux")]
+        HwDone::SyncFile(fd) => {
+            use std::os::fd::AsFd as _;
+            let _ = pf_dmabuf::fence::wait_sync_file(fd.as_fd(), 50);
+        }
+        HwDone::Cpu => {}
+    }
+}
+
+/// Hand one decoded picture on, its pixels done: stamp `decoded`, send it (newest wins),
+/// report received → pixels done to the HUD, the ABR and the phase report.
+fn hand_on(
+    p: InFlight,
+    frame_tx: &async_channel::Sender<DecodedFrame>,
+    connector: &NativeClient,
+    wants_decode: bool,
+    phase_decodes: Option<&mut Vec<u64>>,
+) {
+    // Travels with the frame so the presenter can measure `display`.
+    let decoded_ns = now_ns();
+    connector.hud().note_decoded(p.pts_ns, decoded_ns);
+    let span_ns = decoded_ns.saturating_sub(p.received_ns);
+    if let Some(v) = phase_decodes.filter(|v| v.len() < 256) {
+        v.push(span_ns);
+    }
+    match p.image {
+        Some(image) => {
+            let sent = frame_tx.force_send(DecodedFrame {
+                pts_ns: p.pts_ns,
+                decoded_ns,
+                image,
+            });
+            // A displaced frame decoded and was never shown: newest wins.
+            if let Ok(Some(_)) = sent {
+                connector.hud().note_skipped(1, 0);
+            }
+        }
+        // Withheld: the presenter redraws the last good picture.
+        None => tracing::trace!("holding last frame — awaiting post-loss re-anchor"),
+    }
+    let us = span_ns / 1000;
+    connector.hud().note_decode_us(us, false);
+    if wants_decode {
+        connector.report_decode_us(us.min(u32::MAX as u64) as u32);
+    }
 }
 
 /// One keyframe ask per 100 ms, shared by every recovery site in the pump.
@@ -985,6 +1064,8 @@ fn pump(
     let mut launch_told: Option<punktfunk_core::quic::LaunchOutcome> = None;
     // Report decode stage to ABR only when armed. Constant for the session.
     let wants_decode = connector.wants_decode_latency();
+    // The hardware decode submitted last, handed on when its pixels are done.
+    let mut in_flight: Option<InFlight> = None;
     // What actually decoded the last frame — VAAPI can demote mid-session.
     let mut dec_path: &'static str = "";
     let mut kf = KeyframeAsk::default();
@@ -1053,10 +1134,23 @@ fn pump(
                 let _ = ev_tx.send_blocking(SessionEvent::Access { access, notice });
             }
         }
-        // 20 ms wait: audio has its own thread, so this only bounds stop-flag
-        // responsiveness and the per-iteration recovery check. A frame arrives every
-        // ~8–16 ms at 60–120 Hz, so this rarely times out mid-stream.
-        match connector.next_frame(Duration::from_millis(20)) {
+        // A decode still on the GPU is polled every half millisecond and handed on the
+        // moment its pixels are done. 50 ms bounds a wedged one.
+        let done = in_flight.take_if(|p| {
+            hw_done_now(&mut decoder, &p.hw) || now_ns().saturating_sub(p.received_ns) > 50_000_000
+        });
+        if let Some(p) = done {
+            let phase = params.phase_lock.then_some(&mut phase_decodes);
+            hand_on(p, &frame_tx, &connector, wants_decode, phase);
+        }
+        // Otherwise 20 ms: audio has its own thread, so this only bounds stop-flag
+        // responsiveness and the per-iteration recovery check.
+        let frame_wait = if in_flight.is_some() {
+            Duration::from_micros(500)
+        } else {
+            Duration::from_millis(20)
+        };
+        match connector.next_frame(frame_wait) {
             Ok(frame) => {
                 // Reassembly completion, stamped by the core session as the AU crossed
                 // `poll_frame`. Stamping here at the pull would fold pre-decode queue
@@ -1192,11 +1286,10 @@ fn pump(
                             let (width, height) = image.dimensions();
                             tracing::info!(width, height, path = dec_path, "first frame decoded");
                         }
-                        // Hardware rungs return at submission. Wait the decode's own fence
-                        // here, on the pump: i915 raises the media engine's clock only for
-                        // a thread that waits (a 4K decode on a Meteor Lake Arc takes 6.8 ms
-                        // unboosted, 2.7 boosted), and `decoded_ns` then means complete.
-                        // 50 ms bounds a wedged pipeline; the presenter waits the GPU too.
+                        // Hardware rungs return at submission. A picture is handed on when its
+                        // own fence completes, so the presenter never waits on a decode; the
+                        // next AU is submitted meanwhile, so the decoder always has a picture
+                        // queued behind the one it is working on.
                         let hw_fence = match &image {
                             // Native rung: decode signals `semaphore_value` when pixels
                             // are ready (presenter write-back is `+ 1`).
@@ -1213,42 +1306,26 @@ fn pump(
                                 .map_or(HwDone::Cpu, HwDone::SyncFile),
                             _ => HwDone::Cpu,
                         };
-                        match hw_fence {
-                            HwDone::Timeline(sem, value) => {
-                                decoder.wait_hw_decoded(sem, value, 50_000_000);
-                            }
-                            #[cfg(target_os = "linux")]
-                            HwDone::SyncFile(fd) => {
-                                use std::os::fd::AsFd as _;
-                                let _ = pf_dmabuf::fence::wait_sync_file(fd.as_fd(), 50);
-                            }
-                            HwDone::Cpu => {}
+                        let next = InFlight {
+                            hw: hw_fence,
+                            received_ns,
+                            pts_ns: frame.pts_ns,
+                            image: present.then_some(image),
+                        };
+                        // This AU is submitted; the one before it goes on first, in order.
+                        if let Some(prev) = in_flight.take() {
+                            wait_hw_done(&mut decoder, &prev.hw);
+                            let phase = params.phase_lock.then_some(&mut phase_decodes);
+                            hand_on(prev, &frame_tx, &connector, wants_decode, phase);
                         }
-                        // Travels with the frame so the presenter can measure `display`.
-                        let decoded_ns = now_ns();
-                        connector.hud().note_decoded(frame.pts_ns, decoded_ns);
-                        if params.phase_lock && phase_decodes.len() < 256 {
-                            phase_decodes.push(decoded_ns.saturating_sub(received_ns));
-                        }
-                        if present {
-                            // A displaced frame decoded and was never shown: newest wins.
-                            if let Ok(Some(_)) = frame_tx.force_send(DecodedFrame {
-                                pts_ns: frame.pts_ns,
-                                decoded_ns,
-                                image,
-                            }) {
-                                connector.hud().note_skipped(1, 0);
-                            }
+                        // A CPU decode is done already. Intel on i915 waits at once: that
+                        // wait is the media clock boost, and its GEM wait covers the ring.
+                        if matches!(next.hw, HwDone::Cpu) || decoder.hw_wait_boosted() {
+                            wait_hw_done(&mut decoder, &next.hw);
+                            let phase = params.phase_lock.then_some(&mut phase_decodes);
+                            hand_on(next, &frame_tx, &connector, wants_decode, phase);
                         } else {
-                            // Withhold this frame so the presenter redraws the last good
-                            // picture.
-                            tracing::trace!("holding last frame — awaiting post-loss re-anchor");
-                        }
-                        // Received → pixels done, every frame; the ABR's decoder-backlog too.
-                        let us = decoded_ns.saturating_sub(received_ns) / 1000;
-                        connector.hud().note_decode_us(us, false);
-                        if wants_decode {
-                            connector.report_decode_us(us.min(u32::MAX as u64) as u32);
+                            in_flight = Some(next);
                         }
                     }
                     // No output under one-in/one-out LOW_DELAY means wedged on missing
