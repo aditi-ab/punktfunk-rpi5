@@ -15,7 +15,10 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
-/** A full-control session with no pad shown, whose actions land in [fired]. The screenshots use it too. */
+/**
+ * A full-control session on a two-screen device with no pad shown, whose actions land in [fired].
+ * The screenshots use it too.
+ */
 internal fun fakeRingActions(fired: MutableList<String> = mutableListOf()) = RingActions(
     endStream = { fired += "end" },
     disconnectLinger = { fired += "linger" },
@@ -46,6 +49,8 @@ internal fun fakeRingActions(fired: MutableList<String> = mutableListOf()) = Rin
     toggleStreamMute = {},
     currentMode = { intArrayOf(1920, 1080, 60) },
     requestMode = { _, _, _ -> },
+    screensSwappable = { true },
+    swapScreens = { fired += "swap" },
 )
 
 /**
@@ -90,6 +95,14 @@ class CompanionPanelTest {
     }
 
     @Test
+    fun theSwapTileTradesTheScreens() {
+        show(CompanionPage.ACTIONS)
+        compose.onNode(hasScrollAction()).performScrollToNode(hasText("Swap screens"))
+        compose.onNodeWithText("Swap screens").performClick()
+        assertEquals(listOf("swap"), fired)
+    }
+
+    @Test
     fun theControllerTabConnectsThePad() {
         var picked: CompanionPage? = null
         show(CompanionPage.STATS) { picked = it }
@@ -113,5 +126,15 @@ class CompanionPanelTest {
         CompanionMemory.keep(context, CompanionPage.ACTIONS)
         CompanionMemory.keep(context, CompanionPage.PAD)
         assertEquals(CompanionPage.ACTIONS, CompanionMemory.page(context))
+    }
+
+    @Test
+    fun eachSecondScreenKeepsItsOwnSwap() {
+        val context = compose.activity
+        CompanionMemory.keepSwap(context, "Built-in Screen 2", true)
+        assertEquals(true, CompanionMemory.swapped(context, "Built-in Screen 2"))
+        assertEquals(false, CompanionMemory.swapped(context, "HDMI Screen"))
+        CompanionMemory.keepSwap(context, "Built-in Screen 2", false)
+        assertEquals(false, CompanionMemory.swapped(context, "Built-in Screen 2"))
     }
 }

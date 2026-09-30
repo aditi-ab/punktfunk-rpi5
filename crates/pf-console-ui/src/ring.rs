@@ -481,6 +481,11 @@ impl Ring {
                 reason: "Not on this client yet — use the keyboard".into(),
                 ..plain("send_text", "Send text", "Text")
             },
+            SlotId::SwapScreens => Spec {
+                enabled: false,
+                reason: "This device has one screen".into(),
+                ..plain("swap_screens", "Swap screens", "Swap")
+            },
             SlotId::Guide => plain("guide", "Guide button", "Guide"),
             SlotId::Qam => plain("qam", "Quick access menu", "QAM"),
             SlotId::PadMouse => Spec {
@@ -606,7 +611,7 @@ impl Ring {
             SlotId::Mic => self.pending.push_back(RingCommand::ToggleMic),
             SlotId::PadMouse => self.pending.push_back(RingCommand::CyclePadMouse),
             SlotId::StreamMute => self.pending.push_back(RingCommand::ToggleStreamMute),
-            SlotId::Pad | SlotId::SendText => {}
+            SlotId::Pad | SlotId::SendText | SlotId::SwapScreens => {}
             // The host's own overlay is about to take the screen: close first, like End stream.
             SlotId::Guide | SlotId::Qam => {
                 let bit = if *slot == SlotId::Guide {
