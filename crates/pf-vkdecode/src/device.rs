@@ -147,7 +147,7 @@ pub(crate) fn find_memory_type_preferring(
 /// set. [`Self::disarm`] once the chain succeeds and the caller owns them.
 pub(crate) struct Unwind<'a> {
     device: &'a ash::Device,
-    pub(crate) buffer: vk::Buffer,
+    pub(crate) buffers: Vec<vk::Buffer>,
     pub(crate) image: vk::Image,
     pub(crate) memory: vk::DeviceMemory,
 }
@@ -161,7 +161,7 @@ impl<'a> Unwind<'a> {
     pub(crate) unsafe fn new(device: &'a ash::Device) -> Self {
         Self {
             device,
-            buffer: vk::Buffer::null(),
+            buffers: Vec::new(),
             image: vk::Image::null(),
             memory: vk::DeviceMemory::null(),
         }
@@ -175,10 +175,12 @@ impl<'a> Unwind<'a> {
 impl Drop for Unwind<'_> {
     fn drop(&mut self) {
         // SAFETY: `new`'s contract: each handle is null (a no-op) or fresh on `device`
-        // and unreferenced. The buffer or image goes before the memory bound to it;
+        // and unreferenced. Buffers and image go before the memory bound to them;
         // freeing mapped memory unmaps it.
         unsafe {
-            self.device.destroy_buffer(self.buffer, None);
+            for &buffer in &self.buffers {
+                self.device.destroy_buffer(buffer, None);
+            }
             self.device.destroy_image(self.image, None);
             self.device.free_memory(self.memory, None);
         }
