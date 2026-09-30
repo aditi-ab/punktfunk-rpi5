@@ -103,7 +103,6 @@ impl Presenter {
         let old = self.swapchain;
         #[cfg(windows)]
         let mut fse_chain = Default::default();
-        #[cfg_attr(not(windows), allow(unused_mut))]
         let mut info = vk::SwapchainCreateInfoKHR::default()
             .surface(self.surface)
             .min_image_count(min_images)
@@ -120,6 +119,10 @@ impl Presenter {
             .present_mode(self.present_mode)
             .clipped(true)
             .old_swapchain(old);
+        // Present-id2/present-wait2 are asked for per swapchain.
+        if self.present_id2 {
+            info = info.flags(super::setup::present_wait2::SWAPCHAIN_FLAGS);
+        }
         #[cfg(windows)]
         if let Some(f) = &self.fse {
             info = f.extend(info, &mut fse_chain);

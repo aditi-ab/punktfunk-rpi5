@@ -75,13 +75,42 @@ pub(crate) struct PresentTimer {
     join: Option<std::thread::JoinHandle<()>>,
 }
 
-/// `vkWaitForPresentKHR` for up to 250 ms in [`SLICE_NS`] calls, each under the swapchain
+/// The driver call that blocks until a present is visible.
+pub(crate) enum Waiter {
+    /// `VK_KHR_present_wait`.
+    V1(ash::khr::present_wait::Device),
+    /// `VK_KHR_present_wait2`, its entry point loaded by name.
+    V2 {
+        device: vk::Device,
+        wait: super::setup::present_wait2::WaitFn,
+    },
+}
+
+impl Waiter {
+    /// # Safety
+    /// `swapchain` is live and host-synchronised by the caller for this call.
+    unsafe fn wait(
+        &self,
+        swapchain: vk::SwapchainKHR,
+        present_id: u64,
+        timeout_ns: u64,
+    ) -> ash::prelude::VkResult<()> {
+        match self {
+            // SAFETY: the caller's contract is this call's.
+            Waiter::V1(d) => unsafe { d.wait_for_present(swapchain, present_id, timeout_ns) },
+            Waiter::V2 { device, wait } => {
+                let info = super::setup::present_wait2::WaitInfo::new(present_id, timeout_ns);
+                // SAFETY: the caller's contract; `info` outlives the call, and `wait` is
+                // this device's own `vkWaitForPresent2KHR`.
+                unsafe { wait(*device, swapchain, &info) }.result()
+            }
+        }
+    }
+}
+
+/// The present wait for up to 250 ms in [`SLICE_NS`] calls, each under the swapchain
 /// lock. 250 ms: ids complete in order; longer means the pipeline is wedged.
-fn wait_sliced(
-    wait_d: &ash::khr::present_wait::Device,
-    sync: &SwapchainSync,
-    job: &Job,
-) -> ash::prelude::VkResult<()> {
+fn wait_sliced(wait_d: &Waiter, sync: &SwapchainSync, job: &Job) -> ash::prelude::VkResult<()> {
     let deadline = Instant::now() + Duration::from_millis(250);
     loop {
         // Sleep, not spin: a boosted waiter could starve the presenter on a shared core.
@@ -93,7 +122,7 @@ fn wait_sliced(
             // SAFETY: `job.swapchain` stays live for this call — enqueue runs while the
             // swapchain exists, and `drain`/Drop wait it out first. The lock above is the
             // swapchain's host sync against the presenter's acquire and present.
-            unsafe { wait_d.wait_for_present(job.swapchain, job.present_id, SLICE_NS) }
+            unsafe { wait_d.wait(job.swapchain, job.present_id, SLICE_NS) }
         };
         match r {
             Err(vk::Result::TIMEOUT) if Instant::now() < deadline => {}
@@ -103,7 +132,7 @@ fn wait_sliced(
 }
 
 impl PresentTimer {
-    pub(crate) fn spawn(wait_d: ash::khr::present_wait::Device, device: ash::Device) -> Self {
+    pub(crate) fn spawn(wait_d: Waiter, device: ash::Device) -> Self {
         let (tx, rx) = mpsc::channel::<Job>();
         let pending = Arc::new(AtomicUsize::new(0));
         let results = Arc::new(Mutex::new(Vec::with_capacity(256)));

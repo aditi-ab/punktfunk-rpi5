@@ -1118,16 +1118,20 @@ impl Presenter {
             // Monotonic present id for `PresentTimer`'s `vkWaitForPresentKHR`.
             let ids = [self.next_present_id + 1];
             let mut pid_info = vk::PresentIdKHR::default().present_ids(&ids);
+            let pid2_info = super::setup::present_wait2::PresentId2::new(&ids);
             let mut present_info = vk::PresentInfoKHR::default()
                 .wait_semaphores(&present_sems)
                 .swapchains(&swapchains)
                 .image_indices(&indices);
             // The id names the `done_sem` value either way; only present-wait carries it
-            // to the driver.
+            // to the driver, in the struct of the generation the waiter runs on.
             if self.glass_active() {
                 self.next_present_id += 1;
             }
-            if self.present_timer.is_some() {
+            if self.present_id2 {
+                // Hand-rolled struct: the chain is empty here, so it is the whole chain.
+                present_info.p_next = (&pid2_info) as *const _ as *const std::ffi::c_void;
+            } else if self.present_timer.is_some() {
                 present_info = present_info.push_next(&mut pid_info);
             }
             let present_started = std::time::Instant::now();

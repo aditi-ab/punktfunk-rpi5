@@ -306,9 +306,12 @@ pub struct Presenter {
     /// Swapchain image acquired and not yet submitted: the non-blocking probe's, or one an
     /// error left behind. Its `acquire_sem` signal is pending until a batch waits it.
     acquired: Option<u32>,
-    /// `VK_KHR_present_wait` on-glass timing. `None` without present-id/present-wait;
-    /// the run loop then keeps its submit-time display stamp.
+    /// On-glass timing from present-wait, either generation. `None` without it; the run
+    /// loop then keeps its submit-time display stamp (or the vblank waiter's estimate).
     present_timer: Option<present_timing::PresentTimer>,
+    /// The waiter runs on `VK_KHR_present_wait2`: presents chain `VkPresentId2KHR` and the
+    /// swapchain is created with the present-id2/present-wait2 flags.
+    present_id2: bool,
     /// The output's vblank as the glass clock where present-wait is missing (AMD on
     /// Windows). Estimated stamps, `glass=est`.
     #[cfg(windows)]
