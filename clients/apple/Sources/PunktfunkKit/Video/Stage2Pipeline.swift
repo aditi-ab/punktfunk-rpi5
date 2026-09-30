@@ -637,10 +637,12 @@ final class PresentGate: @unchecked Sendable {
 /// The CAMetalDisplayLink delegate for deadline pacing: each per-refresh update stashes its
 /// vended drawable (newest wins) and nudges the render thread — which also wakes on decoder
 /// arrivals, so whichever half completes the (frame, drawable) pair triggers the present. Also
-/// applies the staged frame-rate hint from the link's own thread. Retained by the link thread's
-/// closure (the link holds it weak); captures only the shared boxes, never the pipeline — the
-/// same no-self-capture rule as the pump/render threads.
+/// applies the staged frame-rate hint and the presenter's queued layer writes from the link's own
+/// thread. Retained by the link thread's closure (the link holds it weak); captures only the shared
+/// boxes and the presenter, never the pipeline — the same no-self-capture rule as the pump/render
+/// threads.
 private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
+    private let presenter: MetalVideoPresenter
     private let stash: LatestBox<VendedDrawable>
     private let renderSignal: DispatchSemaphore
     private let hint: FrameRateHint
@@ -667,10 +669,12 @@ private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
     private var loggedEffective = false
 
     init(
+        presenter: MetalVideoPresenter,
         stash: LatestBox<VendedDrawable>, renderSignal: DispatchSemaphore,
         hint: FrameRateHint, stats: PresentDebugStats?, hud: HudSink?,
         phase: PhaseReporter?, drawableCount: Int, latencyAsk: Float, latch: LatchBudget?
     ) {
+        self.presenter = presenter
         self.stash = stash
         self.renderSignal = renderSignal
         self.hint = hint
@@ -683,6 +687,7 @@ private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
     }
 
     func metalDisplayLink(_ link: CAMetalDisplayLink, needsUpdate update: CAMetalDisplayLink.Update) {
+        presenter.applyLayerWrites()
         if let range = hint.drain(), link.preferredFrameRateRange != range {
             link.preferredFrameRateRange = range
         }
@@ -1210,24 +1215,10 @@ public final class Stage2Pipeline {
             ? { ring.take() }
             : { ring.take(dueBy: CACurrentMediaTime(), due: { $0.dueMediaTime }) }
 
-        // ⭐ Shrink the drawable pool to 2 for THIS pacing — the measured fix for a present floor
-        // stuck at two refreshes (field 2026-08-13, Apple TV 4K / tvOS 27: `os present +32.5` at
-        // 60 Hz = 1.95 × 16.67, i.e. the system running a whole frame ahead of us).
-        //
-        // `maximumDrawableCount` is 3 from MetalVideoPresenter.make(), and its rationale there —
-        // "more in-flight drawables before nextDrawable() has to block" — is a STAGE-2 concern.
-        // Stage-4 never calls nextDrawable(): every drawable is vended by the link
-        // (`update.drawable` → stash → `render(into:)`), so the third slot buys this path nothing
-        // and costs it a refresh — a pool of 3 is exactly the room the compositor needs to keep
-        // two presents queued ahead of scanout, which is what `preferredFrameLatency = 1` is
-        // asking it not to do. Two slots is the shallowest pool that still double-buffers: one
-        // vended (stashed or being rendered), one being scanned out.
-        //
-        // Set HERE, not on the link thread: this runs before either the render thread or the link
-        // thread exists, so the layer still has a single writer (the render thread owns
-        // drawableSize/format afterwards — see MetalVideoPresenter's threading notes).
-        // PUNKTFUNK_DRAWABLE_COUNT=3 restores the old depth for an on-glass A/B without a
-        // rebuild; values outside 2...3 are ignored (CAMetalLayer's own accepted range).
+        // Two drawables: the link vends every one, so a third only lets the compositor queue a
+        // second present ahead of scanout — a refresh of latency. Set before either thread exists;
+        // afterwards the link thread applies layer writes (`deferLayerWrites`).
+        // PUNKTFUNK_DRAWABLE_COUNT=3 restores the old depth; values outside 2...3 are ignored.
         let drawableCount =
             ProcessInfo.processInfo.environment["PUNKTFUNK_DRAWABLE_COUNT"]
                 .flatMap(Int.init)
@@ -1271,6 +1262,7 @@ public final class Stage2Pipeline {
         let startLink: (StopFlag) -> Void = { linkStop in
             let linkThread = Thread {
                 let delegate = DeadlineLinkDelegate(
+                    presenter: presenter,
                     stash: stash, renderSignal: renderSignal, hint: hint, stats: debugStats,
                     hud: hud, phase: phaseReporter,
                     drawableCount: drawableCount, latencyAsk: latencyAsk, latch: latch)
@@ -1354,7 +1346,9 @@ public final class Stage2Pipeline {
                         isHDR: planes.pq)
                 }
                 // First frame: the layer now has a real config — start vending (see startLink).
+                // From here the link thread vends, so it also applies every layer write.
                 if linkStop == nil {
+                    presenter.deferLayerWrites()
                     let stop = StopFlag()
                     linkStop = stop
                     lastVend = CACurrentMediaTime()
