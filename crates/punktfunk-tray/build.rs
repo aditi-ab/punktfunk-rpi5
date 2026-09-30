@@ -26,6 +26,7 @@ fn main() {
         // Task Manager / Explorer identity. Matches the host's "Punktfunk Host".
         res.set("FileDescription", "Punktfunk Tray");
         res.set("ProductName", "Punktfunk");
+        res.set("CompanyName", "unom");
         // PerMonitorV2. Without a DPI manifest the process is virtualized and GDI-stretches the menu.
         res.set_manifest(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>

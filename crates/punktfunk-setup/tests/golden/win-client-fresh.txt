@@ -8,6 +8,7 @@
   + taskkill /F /IM punktfunk.exe
 ==> Files → %LocalAppData%\Programs\Punktfunk
   ok would unpack the payload into %LocalAppData%\Programs\Punktfunk
+  + icacls %LocalAppData%\Programs\Punktfunk /grant *S-1-5-19:(OI)(CI)RX /Q
 ==> Registry
   + reg add HKCU\Software\Classes\punktfunk /ve /t REG_SZ /d "URL:Punktfunk stream link" /f
   + reg add HKCU\Software\Classes\punktfunk /v "URL Protocol" /t REG_SZ /d  /f

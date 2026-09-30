@@ -12,7 +12,7 @@
 
   Steps:
     1. stage the runtime file set from -LayoutDir (drops AppxManifest.xml + the tile Assets),
-    2. sign the four exes individually (the MSIX only signs its container),
+    2. sign the four exes and SDL3.dll individually (the MSIX only signs its container),
     3. zip the stage -> the portable build,
     4. pack the unelevated client wizard over the same stage, sign the setup.exe,
     5. emit CLIENT_SETUP_PATH / CLIENT_ZIP_PATH to GITHUB_ENV for the publish step.
@@ -173,6 +173,10 @@ function Sign-File([string]$Path) {
         if ($PfxPassword) { $signArgs += @('/p', $PfxPassword) }
         $ts = 'http://timestamp.digicert.com'
     }
+    # UAC names a signed file by /d. The exe's own FileDescription stays the one source.
+    $desc = (Get-Item $Path).VersionInfo.FileDescription
+    if ($desc) { $signArgs += @('/d', $desc) }
+    $signArgs += @('/du', 'https://punktfunk.unom.io')
     & $signtool ($signArgs + @('/tr', $ts, '/td', 'SHA256', $Path))
     if ($LASTEXITCODE -eq 0) { return }
     if ($signMode -eq 'azure') {
@@ -186,7 +190,8 @@ function Sign-File([string]$Path) {
 }
 
 # --- sign the inner exes, zip the stage (portable build), then build + sign the installer ------
-foreach ($f in $required | Where-Object { $_ -like '*.exe' }) {
+# SDL3.dll arrives unsigned; the WinAppRuntime bootstrap is already Microsoft-signed.
+foreach ($f in $required | Where-Object { $_ -like '*.exe' -or $_ -eq 'SDL3.dll' }) {
     Sign-File (Join-Path $stage $f)
 }
 

@@ -3844,6 +3844,7 @@ dependencies = [
  "punktfunk-core",
  "serde_json",
  "tracing-subscriber",
+ "winresource",
 ]
 
 [[package]]

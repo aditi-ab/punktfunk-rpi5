@@ -23,6 +23,11 @@ fn main() {
         println!("cargo:rerun-if-changed={icon}");
         winresource::WindowsResource::new()
             .set_icon_with_id(icon, "1")
+            // UAC names the installer by FileDescription (and by signtool's /d, which the
+            // packers read from here).
+            .set("FileDescription", "Punktfunk Setup")
+            .set("ProductName", "Punktfunk")
+            .set("CompanyName", "unom")
             .compile()
             .expect("embed the icon resource");
     }
