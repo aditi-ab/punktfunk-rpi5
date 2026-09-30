@@ -303,7 +303,7 @@ mod tests {
         let req: libc::c_ulong = (2 << 30) | (8 << 16) | (0x45 << 8) | 0x20;
         // SAFETY: EVIOCGBIT(0) copies at most 8 bytes (EV_MAX/8 < 8) into the live `bits` buffer
         // behind the valid evdev fd `f`; the kernel never writes past the ioctl's size argument.
-        let rc = unsafe { libc::ioctl(f.as_raw_fd(), req, bits.as_mut_ptr()) };
+        let rc = unsafe { libc::ioctl(f.as_raw_fd(), req as _, bits.as_mut_ptr()) };
         rc >= 0 && (bits[0x15 / 8] >> (0x15 % 8)) & 1 == 1
     }
 
@@ -326,7 +326,7 @@ mod tests {
         let req: libc::c_ulong = (1 << 30) | (48 << 16) | (0x45 << 8) | 0x80;
         // SAFETY: EVIOCSFF reads/writes the 48-byte ff_effect behind the valid fd `f`; `eff` is
         // exactly sizeof(struct ff_effect) and outlives the synchronous call.
-        let rc = unsafe { libc::ioctl(f.as_raw_fd(), req, eff.as_mut_ptr()) };
+        let rc = unsafe { libc::ioctl(f.as_raw_fd(), req as _, eff.as_mut_ptr()) };
         if rc < 0 {
             return Err(std::io::Error::last_os_error());
         }

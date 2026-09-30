@@ -109,7 +109,7 @@ fn ioctl<T>(fd: libc::c_int, req: libc::c_ulong, arg: &mut T) -> std::io::Result
     // five `_IO`/`_IOWR` codes declared above, each paired with the `T` its size field names (the
     // const asserts pin that); and `arg` is a live, uniquely-borrowed, `repr(C)` value of that
     // exact type, so the kernel's read/write of `size_of::<T>()` bytes stays inside it.
-    let rc = unsafe { libc::ioctl(fd, req, arg as *mut T) };
+    let rc = unsafe { libc::ioctl(fd, req as _, arg as *mut T) };
     if rc < 0 {
         Err(std::io::Error::last_os_error())
     } else {

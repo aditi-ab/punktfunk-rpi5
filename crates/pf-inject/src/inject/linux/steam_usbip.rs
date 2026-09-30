@@ -845,7 +845,7 @@ mod tests {
             (3 << 30) | ((buf.len() as libc::c_ulong) << 16) | (0x48 << 8) | 0x06;
         // SAFETY: HIDIOCSFEATURE reads the 12-byte report from the live `buf` behind the valid
         // hidraw fd `f`; the length is encoded in the request, so nothing is written past it.
-        let rc = unsafe { libc::ioctl(f.as_raw_fd(), req, buf.as_mut_ptr()) };
+        let rc = unsafe { libc::ioctl(f.as_raw_fd(), req as _, buf.as_mut_ptr()) };
         assert!(
             rc >= 0,
             "HIDIOCSFEATURE: {}",
