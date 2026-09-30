@@ -399,8 +399,10 @@ pub(crate) fn plugin_may_access(method: &Method, path: &str) -> bool {
         (&Method::DELETE, "/api/v1/stats/recordings/{}"),
         (&Method::GET, "/api/v1/plugins"),
         (&Method::POST, "/api/v1/plugins/logs"),
-        // Where a managed emulator's program is, for the plugin that launches it.
+        // Where a managed emulator's program is, for the plugin that launches it, and making it
+        // ready to: first-run answers, and firmware from that plugin's own state folder.
         (&Method::GET, "/api/v1/emulators"),
+        (&Method::POST, "/api/v1/emulators/{}/prepare"),
         // A plugin asks for a folder and reads its own rows; deciding is admin-only, so the
         // overview and `/plugin-access/{}/decide` are deliberately absent here.
         (&Method::GET, "/api/v1/plugin-access/requests"),

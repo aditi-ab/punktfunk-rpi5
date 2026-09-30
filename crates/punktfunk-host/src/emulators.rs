@@ -74,6 +74,49 @@ pub fn install_core(core: &str) -> hermir::Result<PathBuf> {
     open()?.install_core(core, &Quiet)
 }
 
+/// Every copy of `id` answers its first-run questions and gets `platform`'s firmware from
+/// `firmware_dir` (the regular files in it, not below). `platform` is a catalog id or any of
+/// its aliases (RomM slug, ES-DE folder, libretro name). Blocking: an installer may run.
+pub fn prepare(
+    id: &str,
+    platform: Option<&str>,
+    firmware_dir: Option<&Path>,
+) -> hermir::Result<Vec<(String, hermir::Prepared)>> {
+    let h = open()?;
+    let emulator = h.emulator(id)?;
+    let platform = platform.map(|p| {
+        h.catalog()
+            .platforms()
+            .iter()
+            .find(|x| x.id == p || x.aliases.values().any(|a| a == p))
+            .map_or_else(|| p.to_string(), |x| x.id.clone())
+    });
+    let platform = platform.as_deref();
+    let firmware: Vec<PathBuf> = match firmware_dir {
+        None => Vec::new(),
+        Some(dir) => std::fs::read_dir(dir)
+            .map_err(|e| hermir::Error::Io {
+                op: "read",
+                path: dir.to_path_buf(),
+                source: e,
+            })?
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .map(|e| e.path())
+            .collect(),
+    };
+    Ok(emulator
+        .copies()?
+        .iter()
+        .map(|copy| {
+            (
+                copy.exe.to_string(),
+                emulator.prepare(copy, platform, &firmware),
+            )
+        })
+        .collect())
+}
+
 /// A core name as the buildbot spells it: `snes9x`, `mupen64plus_next`.
 pub fn valid_core(core: &str) -> bool {
     !core.is_empty()

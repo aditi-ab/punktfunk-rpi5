@@ -469,6 +469,7 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
         .routes(routes!(plugin_access::release_plugin_access))
         .routes(routes!(emulators::get_emulators))
         .routes(routes!(emulators::install_emulator))
+        .routes(routes!(emulators::prepare_emulator))
         .routes(routes!(emulators::remove_emulator))
         .routes(routes!(store::get_catalog))
         .routes(routes!(store::refresh_catalog))
