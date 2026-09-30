@@ -38,19 +38,17 @@ pub fn launch_into_session(
         c.envs(seat::env(home));
     }
     match discover_session_display_env(seat) {
-        Some((x11, wayland, _xauth)) => {
+        Some((x11, gamescope, _xauth)) => {
             tracing::info!(
                 command = %cmd,
                 x11_display = x11.as_deref().unwrap_or("-"),
-                wayland = wayland.as_deref().unwrap_or("-"),
+                gamescope = gamescope.as_deref().unwrap_or("-"),
                 "gamescope: launching into the live session"
             );
             if let Some(d) = x11 {
                 c.env("DISPLAY", d);
             }
-            if let Some(w) = wayland {
-                c.env("WAYLAND_DISPLAY", w);
-            }
+            c.env("WAYLAND_DISPLAY", NESTED_WAYLAND_DISPLAY);
         }
         None => tracing::warn!(
             command = %cmd,
