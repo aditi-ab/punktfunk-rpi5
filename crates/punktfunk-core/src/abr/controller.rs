@@ -178,6 +178,10 @@ struct DecodeProbe {
 enum DecodeProbeKind {
     Retreat,
     Lift,
+    /// A ×0.7 the decode verdict named, answered by the verdict itself: still
+    /// decode-bad at the new rate is "did not follow", a window it cleared is
+    /// "followed".
+    Cut,
 }
 
 /// One notch off `from_kbps`, never under the floor.
@@ -532,11 +536,27 @@ impl BitrateController {
         let mut p = self.decode_probe?;
         let budget_us = self.frame_budget_us?;
         let at_new_rate = match p.kind {
-            DecodeProbeKind::Retreat => self.current_kbps < p.step.from_kbps,
+            DecodeProbeKind::Retreat | DecodeProbeKind::Cut => self.current_kbps < p.step.from_kbps,
             DecodeProbeKind::Lift => self.current_kbps > p.step.from_kbps,
         };
+        let readable = at_new_rate && !v.quiet && !v.starved && !w.flushed;
+        if p.kind == DecodeProbeKind::Cut && readable && !v.decode_bad {
+            if !self.full_rate(w, budget_us) {
+                return None;
+            }
+            // The verdict ended at the new rate: the cut answered.
+            self.decode_probe = None;
+            tracing::info!(
+                from_kbps = p.step.from_kbps,
+                at_kbps = self.current_kbps,
+                decode_us = v.decode_mean_us.unwrap_or(-1),
+                "adaptive bitrate: the decode verdict ended at the lower rate — cut kept"
+            );
+            return None;
+        }
+        // A cut counts the windows still over the verdict, not their means.
         let mean_us = v.decode_mean_us.filter(|_| {
-            at_new_rate && !v.quiet && !v.starved && !w.flushed && self.full_rate(w, budget_us)
+            readable && (p.kind == DecodeProbeKind::Cut || self.full_rate(w, budget_us))
         });
         let verdict = p.step.note(mean_us);
         let expired = p.step.expired();
@@ -623,7 +643,7 @@ impl BitrateController {
                 );
                 None
             }
-            DecodeProbeKind::Retreat => {
+            DecodeProbeKind::Retreat | DecodeProbeKind::Cut => {
                 // Latency is not a function of the rate: a pipelined decoder,
                 // or something else on the SoC. Give the rate back, stand the
                 // driver down and withhold its verdict; the cap the bands parked
@@ -1284,8 +1304,8 @@ impl BitrateController {
             }
             self.clean_windows = 0;
             self.decode_headroom.note_bad();
-            // A lift that ran into damage failed. A retreat is answered by the
-            // latency at its new rate, this window's included.
+            // A lift that ran into damage failed. A retreat or a cut is answered
+            // by the latency at its new rate, this window's included.
             if let Some(p) = self
                 .decode_probe
                 .filter(|p| p.kind == DecodeProbeKind::Lift)
@@ -1513,7 +1533,16 @@ impl BitrateController {
             );
             next
         } else {
-            ((self.cut_base_kbps() as u64 * 7 / 10) as u32).max(self.floor_kbps)
+            let from = self.cut_base_kbps();
+            // The decoder's cut is judged like its notch: the verdict at the
+            // new rate is its answer, and a rate it does not answer comes back.
+            if decode_named(w, v) && self.frame_budget_us.is_some() {
+                self.decode_probe = Some(DecodeProbe {
+                    kind: DecodeProbeKind::Cut,
+                    step: StepProbe::new(from, v.decode_mean_us.unwrap_or(0)),
+                });
+            }
+            ((from as u64 * 7 / 10) as u32).max(self.floor_kbps)
         };
         self.warn_low_rate(next);
         self.bad_windows = 0;
@@ -3310,6 +3339,44 @@ mod tests {
             "the cuts on this latency were not the rate's"
         );
         // Stood down: the swing is no verdict.
+        for _ in 0..8 {
+            if let Some(k) = loaded(&mut c, ticks(start, t), 21_000) {
+                assert!(k > c.current_kbps, "only climbs, never a cut");
+                c.on_ack(k, None);
+            }
+            t += 1;
+        }
+        assert!(c.current_kbps >= 100_000);
+    }
+
+    /// The field trace at its worst: no window is ever clean, so the bands
+    /// never get to retreat and the verdict cuts straight from the first
+    /// swing. The cut is judged by the verdict it came from: still bad at the
+    /// lower rate is not the rate's, and the rate comes back.
+    #[test]
+    fn a_decode_cut_the_verdict_outlives_is_given_back() {
+        let (mut c, start, mut t) = seeded_120(100_000);
+        // 21 000 µs over an 8 000 floor: severe, ×0.7 at once.
+        let cut = loaded(&mut c, ticks(start, t), 21_000).expect("severe decode cuts");
+        t += 1;
+        assert_eq!(cut, 70_000);
+        c.on_ack(cut, None);
+        // Still 21 000 at the lower rate, inside the cooldown and past it:
+        // the cut owns the question, so neither window cuts again.
+        assert_eq!(loaded(&mut c, ticks(start, t), 21_000), None);
+        t += 1;
+        assert_eq!(
+            loaded(&mut c, ticks(start, t), 21_000),
+            None,
+            "a second cut"
+        );
+        t += 1;
+        // Two windows over the verdict at the new rate: not the rate's.
+        assert_eq!(loaded(&mut c, ticks(start, t), 21_000), Some(100_000));
+        t += 1;
+        c.on_ack(100_000, None);
+        assert!(c.decode_headroom.disarmed());
+        assert_eq!(c.decode_cap.kbps(), None);
         for _ in 0..8 {
             if let Some(k) = loaded(&mut c, ticks(start, t), 21_000) {
                 assert!(k > c.current_kbps, "only climbs, never a cut");
