@@ -63,6 +63,14 @@ impl std::fmt::Display for DriverEncodeOpenError {
 
 impl std::error::Error for DriverEncodeOpenError {}
 
+impl DriverEncodeOpenError {
+    /// Windows assigned the monitor no swap-chain within the driver's wait: it committed the
+    /// path inactive, as it does while the console display is off. A driver reload changes nothing.
+    pub fn is_no_swap_chain(&self) -> bool {
+        self.status == encode::SET_ENCODE_NO_DEVICE && self.name == "noswap"
+    }
+}
+
 fn backend_name(b: u32) -> &'static str {
     pf_driver_proto::encode::backend::name(b).unwrap_or("?")
 }
