@@ -487,6 +487,21 @@ fn capture_mut(stream: &mut Option<StreamState>) -> Option<&mut Capture> {
     stream.as_mut().and_then(|s| s.capture.as_mut())
 }
 
+/// One event, waiting up to `timeout` for it.
+///
+/// SDL's Windows wait floors what is left of a timeout to whole milliseconds, so a wait
+/// under 2 ms returns at once and a loop holding a frame for its due time spins a core.
+/// Those waits sleep here in half-millisecond slices: that is how long an arriving
+/// frame or a key can wait to be seen while one is held.
+fn wait_event(pump: &mut sdl3::EventPump, timeout: Duration) -> Option<Event> {
+    const SLICE: Duration = Duration::from_micros(500);
+    if cfg!(windows) && !timeout.is_zero() && timeout < Duration::from_millis(2) {
+        std::thread::sleep(timeout.min(SLICE));
+        return pump.poll_event();
+    }
+    pump.wait_event_timeout(timeout)
+}
+
 fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Outcome> {
     let mut sh = Shell::open(opts, matches!(mode, ModeCtl::Browse(_)))?;
     let mut stream: Option<StreamState> = match &mut mode {
@@ -511,7 +526,7 @@ fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Outcome> {
         let timeout = stream
             .as_ref()
             .map_or(Duration::from_millis(15), |st| st.wake_timeout());
-        let first = sh.event_pump.wait_event_timeout(timeout);
+        let first = wait_event(&mut sh.event_pump, timeout);
         let mut queued: Vec<Event> = Vec::new();
         if let Some(e) = first {
             queued.push(e);

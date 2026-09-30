@@ -23,6 +23,7 @@ impl Shell {
             }
         }
         st.intake();
+        st.win.ticks += 1;
         if let Some(refresh_ns) = self.presenter.measured_refresh_ns() {
             if self.presenter.vblank_locked() {
                 st.cadence.note_refresh(refresh_ns, st.mode_period_ns);
@@ -175,6 +176,8 @@ impl Shell {
                 q_drop,
                 forwarded = present.forwarded,
                 repeats = st.win.repeats,
+                // Loop passes this second: far above the frame rate is a spin.
+                ticks = st.win.ticks,
                 // On-glass spacing error against the source's spacing, per shown frame.
                 cadence_err_us = cadence_err.p50_us,
                 cadence_err_p95_us = cadence_err.p95_us,
@@ -583,6 +586,8 @@ pub(super) struct PresentWindow {
     busy: [u32; 2],
     /// Host repeats taken in: shown, and kept out of the cadence clock.
     repeats: u32,
+    /// Run-loop passes.
+    ticks: u32,
     /// Per shown frame: |on-glass spacing − source spacing| to the frame before it, µs.
     cadence_err_us: Vec<u32>,
     /// This window's on-glass frames: the lead each had to its first latch, and whether
@@ -604,6 +609,7 @@ impl PresentWindow {
             steps: [0; 6],
             busy: [0; 2],
             repeats: 0,
+            ticks: 0,
             cadence_err_us: Vec::with_capacity(256),
             leads: Vec::with_capacity(256),
         }
@@ -642,6 +648,7 @@ impl PresentWindow {
         self.steps = [0; 6];
         self.busy = [0; 2];
         self.repeats = 0;
+        self.ticks = 0;
         self.leads.clear();
     }
 }
@@ -805,8 +812,16 @@ impl StreamState {
         } else {
             self.clock.next_slot_after(p.due_ns.max(0) as u64) as i64 - lead_ns
         };
+        // Windows sleeps its short waits itself ([`wait_event`](super::wait_event)), so the
+        // floor there is what a due time may slip by; elsewhere SDL's wait takes a
+        // millisecond at least.
+        let floor = if cfg!(windows) {
+            Duration::from_micros(200)
+        } else {
+            Duration::from_millis(1)
+        };
         Duration::from_nanos(wake_ns.saturating_sub(session::now_ns() as i64).max(0) as u64)
-            .clamp(Duration::from_millis(1), TICK)
+            .clamp(floor, TICK)
     }
 }
 
