@@ -42,6 +42,7 @@ members = [
     "crates/pf-libva",
     "crates/pf-vaapi",
     "crates/pf-v4l2dec",
+    "crates/pf-v4l2",
     "crates/pyrowave-sys",
     "crates/libvpl-sys",
     "clients/probe",

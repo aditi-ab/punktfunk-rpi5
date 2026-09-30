@@ -1,26 +1,22 @@
-//! V4L2 stateful decode: the hardware rung on SoCs whose decoder is a
-//! memory-to-memory video node (Qualcomm `iris`/`venus`, MediaTek, Amlogic).
-//! No ARM Mesa driver has Vulkan Video or VA-API, so this is their only rung.
+//! V4L2 decode: the hardware rung on SoCs whose decoder is a memory-to-memory
+//! video node. No ARM Mesa driver has Vulkan Video or VA-API, so this is
+//! their only rung.
 //!
-//! [`pf_v4l2dec::stateful`] runs the queue flow; this module is its ioctl
-//! [`Device`], the node probe, and the hand-off. The driver parses the stream,
-//! but the pump's facts — keyframe, colour, clean references, damage — still
-//! come from the shared `pf-bitstream` planners, as on the CPU rung. Pictures
-//! leave as [`DecodedImage::NativeDmabuf`]: each CAPTURE buffer is exported
-//! once as a dma-buf and imported by the presenter as linear NV12 or P010.
+//! Two kinds of node. A stateful one (Qualcomm `iris`/`venus`, MediaTek,
+//! Amlogic) parses the stream itself: [`StatefulRung`] here feeds it access
+//! units. A stateless one (Raspberry Pi 5, Rockchip) takes parsed slices:
+//! `video_v4l2_hevc`. Either way the pump's facts — keyframe, colour, clean
+//! references, damage — come from the shared `pf-bitstream` planners, and the
+//! queue flows and ioctls live in `pf-v4l2dec` and `pf-v4l2`.
 //!
 //! The driver's enumeration is the only truth: [`caps`] lists a codec only
-//! where a node takes it and offers a linear picture format for it. Pin with
-//! `PUNKTFUNK_DECODER=native-v4l2`; `PUNKTFUNK_V4L2_DEVICE` names the node.
-//!
-//! [`DecodedImage::NativeDmabuf`]: crate::video::DecodedImage::NativeDmabuf
+//! where a node takes it and offers a picture format this client can show.
+//! Pin with `PUNKTFUNK_DECODER=native-v4l2`; `PUNKTFUNK_V4L2_DEVICE` names
+//! the node.
 
 use std::collections::VecDeque;
 use std::os::fd::AsRawFd as _;
-use std::os::fd::FromRawFd as _;
 use std::os::fd::OwnedFd;
-use std::os::fd::RawFd;
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -33,18 +29,18 @@ use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::Context as _;
 use anyhow::Result;
+use pf_v4l2::Node;
+use pf_v4l2::RequestNode;
 use pf_v4l2dec::stateful::fourcc_name;
-use pf_v4l2dec::stateful::CaptureFormat;
-use pf_v4l2dec::stateful::Dequeued;
 use pf_v4l2dec::stateful::Device;
-use pf_v4l2dec::stateful::Event;
-use pf_v4l2dec::stateful::Interest;
 use pf_v4l2dec::stateful::Picture;
 use pf_v4l2dec::stateful::Queue;
 use pf_v4l2dec::stateful::Stateful;
 use pf_v4l2dec::uapi;
+use pf_v4l2dec::uapi_stateless;
 
 use crate::video::DecodeHealth;
+use crate::video::DecodedImage;
 use crate::video::DmabufFrame;
 use crate::video::DmabufPlane;
 use crate::video::DrmFrameGuard;
@@ -58,7 +54,7 @@ pub(crate) const DECODER_PIN: &str = "native-v4l2";
 
 /// `DRM_FORMAT_MOD_LINEAR`. V4L2 buffers carry no modifier; the linear
 /// formats this rung accepts are, by definition, this one.
-const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+pub(crate) const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 
 /// Wait for a picture when none is in hand. A working decoder answers in a
 /// few milliseconds; past this the pump moves on and takes it next call.
@@ -86,6 +82,8 @@ pub(crate) struct Caps {
     h264: Option<CodecNode>,
     hevc: Option<CodecNode>,
     av1: Option<CodecNode>,
+    /// A node that decodes HEVC from parsed slices, frame by frame.
+    hevc_stateless: Option<PathBuf>,
 }
 
 impl Caps {
@@ -111,6 +109,10 @@ impl Caps {
                     s.ten_bit |= wire;
                 }
             }
+        }
+        // 8-bit only: no stateless decoder here has a 10-bit format we show.
+        if self.hevc_stateless.is_some() {
+            s.codecs |= punktfunk_core::quic::CODEC_HEVC;
         }
         s
     }
@@ -174,6 +176,12 @@ fn probe() -> Caps {
                 ten_bit: pictures.contains(&uapi::V4L2_PIX_FMT_P010),
             });
         }
+        if caps.hevc_stateless.is_none()
+            && inputs.contains(&uapi_stateless::V4L2_PIX_FMT_HEVC_SLICE)
+            && frame_based(&path)
+        {
+            caps.hevc_stateless = Some(path.clone());
+        }
     }
     let s = caps.summary();
     if s.codecs != 0 {
@@ -181,11 +189,29 @@ fn probe() -> Caps {
             h264 = ?caps.h264.as_ref().map(|n| n.path.display().to_string()),
             hevc = ?caps.hevc.as_ref().map(|n| n.path.display().to_string()),
             av1 = ?caps.av1.as_ref().map(|n| n.path.display().to_string()),
+            hevc_stateless = ?caps.hevc_stateless.as_ref().map(|n| n.display().to_string()),
             ten_bit = format_args!("{:#04x}", s.ten_bit),
-            "V4L2 stateful decoders found"
+            "V4L2 decoders found"
         );
     }
     caps
+}
+
+/// Can the stateless node at `path` take a whole picture per request? It
+/// also has to open: a node no media device claims has no requests.
+fn frame_based(path: &Path) -> bool {
+    use pf_v4l2dec::stateless::Device as _;
+    let Ok(mut node) = RequestNode::open(path) else {
+        return false;
+    };
+    match node.control(uapi_stateless::V4L2_CID_STATELESS_HEVC_DECODE_MODE) {
+        Ok(Some(range)) => {
+            range.maximum >= uapi_stateless::V4L2_STATELESS_HEVC_DECODE_MODE_FRAME_BASED
+        }
+        // No mode control: the driver has one mode, and it is per picture.
+        Ok(None) => true,
+        Err(_) => false,
+    }
 }
 
 /// `PUNKTFUNK_V4L2_DEVICE`, else every `/dev/video*` in numeric order.
@@ -208,400 +234,37 @@ fn candidate_nodes() -> Vec<PathBuf> {
     nodes.into_iter().map(|(_, p)| p).collect()
 }
 
-/// One mapped OUTPUT buffer.
-struct Mapping {
-    ptr: std::ptr::NonNull<u8>,
-    len: usize,
-}
-
-// SAFETY: the mapping is owned by exactly one `Node`, which is used from one
-// thread at a time; nothing else holds the pointer.
-unsafe impl Send for Mapping {}
-
-impl Drop for Mapping {
-    fn drop(&mut self) {
-        // SAFETY: `ptr`/`len` are a live `mmap` result this value owns; it is
-        // unmapped exactly once, here.
-        unsafe { libc::munmap(self.ptr.as_ptr().cast(), self.len) };
-    }
-}
-
-/// What the rung needs of a decoder beyond the queue flow.
+/// What the stateful rung needs of a decoder beyond the queue flow.
 pub(crate) trait Opened: Device + Sized {
     fn open(path: &Path) -> std::io::Result<Self>;
     /// Export CAPTURE buffer `index` as a dma-buf.
     fn export(&mut self, index: u32) -> std::io::Result<OwnedFd>;
 }
 
-/// An open decoder node: the ioctl side of [`Device`].
-pub(crate) struct Node {
-    fd: OwnedFd,
-    inputs: Vec<Mapping>,
-}
-
-/// `ioctl` with `EINTR` retried. `T` must be the struct `request` encodes.
-fn ioctl<T>(fd: RawFd, request: u32, arg: &mut T) -> std::io::Result<()> {
-    loop {
-        // SAFETY: `fd` is an open video node and `arg` is a live, exclusively
-        // borrowed `T` whose size is the one encoded in `request`, so the
-        // kernel reads and writes only inside it.
-        let r = unsafe { libc::ioctl(fd, request as _, std::ptr::from_mut(arg)) };
-        if r >= 0 {
-            return Ok(());
-        }
-        let e = std::io::Error::last_os_error();
-        if e.kind() != std::io::ErrorKind::Interrupted {
-            return Err(e);
-        }
-    }
-}
-
-fn queue_type(queue: Queue) -> u32 {
-    match queue {
-        Queue::Output => uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
-        Queue::Capture => uapi::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-    }
-}
-
-/// `EAGAIN` and, on the CAPTURE queue after a drain, `EPIPE`: nothing to take.
-fn nothing_ready(e: &std::io::Error) -> bool {
-    matches!(e.raw_os_error(), Some(libc::EAGAIN | libc::EPIPE))
-}
-
-impl Node {
-    fn raw(&self) -> RawFd {
-        self.fd.as_raw_fd()
-    }
-
-    fn formats(&mut self, queue: Queue) -> std::io::Result<Vec<u32>> {
-        let mut out = Vec::new();
-        for index in 0.. {
-            let mut desc = uapi::V4l2Fmtdesc {
-                index,
-                type_: queue_type(queue),
-                ..Default::default()
-            };
-            match ioctl(self.raw(), uapi::VIDIOC_ENUM_FMT, &mut desc) {
-                Ok(()) => out.push(desc.pixelformat),
-                Err(e) if e.raw_os_error() == Some(libc::EINVAL) => break,
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(out)
-    }
-
-    fn read_format(&mut self, queue: Queue) -> std::io::Result<uapi::V4l2Format> {
-        let mut fmt = uapi::V4l2Format {
-            type_: queue_type(queue),
-            ..Default::default()
-        };
-        ioctl(self.raw(), uapi::VIDIOC_G_FMT, &mut fmt)?;
-        Ok(fmt)
-    }
-
-    /// A `v4l2_buffer` for `queue` over `plane`, which must outlive the ioctl.
-    fn buffer(queue: Queue, index: u32, plane: &mut uapi::V4l2Plane) -> uapi::V4l2Buffer {
-        uapi::V4l2Buffer {
-            index,
-            type_: queue_type(queue),
-            memory: uapi::V4L2_MEMORY_MMAP,
-            m: std::ptr::from_mut(plane) as u64,
-            length: 1,
-            ..Default::default()
-        }
-    }
-
-    /// Map OUTPUT buffer `index` for writing access units into.
-    fn map_input(&mut self, index: u32) -> std::io::Result<Mapping> {
-        let mut plane = uapi::V4l2Plane::default();
-        let mut buf = Node::buffer(Queue::Output, index, &mut plane);
-        ioctl(self.raw(), uapi::VIDIOC_QUERYBUF, &mut buf)?;
-        let len = plane.length as usize;
-        // SAFETY: a fresh shared mapping of this fd at the offset and length
-        // the driver just reported for the buffer; no existing memory is
-        // named, and the result is checked before use.
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                self.raw(),
-                (plane.m as u32).into(),
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            return Err(std::io::Error::last_os_error());
-        }
-        let ptr = std::ptr::NonNull::new(ptr.cast::<u8>())
-            .ok_or_else(|| std::io::Error::other("mmap returned null"))?;
-        Ok(Mapping { ptr, len })
-    }
-}
-
 impl Opened for Node {
-    /// A multi-planar memory-to-memory streaming node, or a refusal.
     fn open(path: &Path) -> std::io::Result<Node> {
-        let fd: OwnedFd = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(path)?
-            .into();
-        let mut cap = uapi::V4l2Capability::default();
-        ioctl(fd.as_raw_fd(), uapi::VIDIOC_QUERYCAP, &mut cap)?;
-        let device = if cap.capabilities & uapi::V4L2_CAP_DEVICE_CAPS != 0 {
-            cap.device_caps
-        } else {
-            cap.capabilities
-        };
-        let needed = uapi::V4L2_CAP_VIDEO_M2M_MPLANE | uapi::V4L2_CAP_STREAMING;
-        if device & needed != needed {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "not a multi-planar memory-to-memory node",
-            ));
-        }
-        Ok(Node {
-            fd,
-            inputs: Vec::new(),
-        })
+        Node::open(path)
     }
 
     fn export(&mut self, index: u32) -> std::io::Result<OwnedFd> {
-        let mut exp = uapi::V4l2Exportbuffer {
-            type_: uapi::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-            index,
-            flags: (libc::O_CLOEXEC | libc::O_RDWR) as u32,
-            ..Default::default()
-        };
-        ioctl(self.raw(), uapi::VIDIOC_EXPBUF, &mut exp)?;
-        // SAFETY: a successful EXPBUF returns a new fd this process owns and
-        // nothing else has seen.
-        Ok(unsafe { OwnedFd::from_raw_fd(exp.fd) })
-    }
-}
-
-fn capture_format_of(fmt: &uapi::V4l2Format) -> CaptureFormat {
-    // Copied out: the mplane struct is packed.
-    let pix = fmt.pix_mp;
-    let planes = pix.plane_fmt;
-    CaptureFormat {
-        fourcc: pix.pixelformat,
-        width: pix.width,
-        height: pix.height,
-        stride: planes[0].bytesperline,
-        planes: pix.num_planes,
-    }
-}
-
-impl Device for Node {
-    fn set_output_format(
-        &mut self,
-        fourcc: u32,
-        width: u32,
-        height: u32,
-        buffer_size: u32,
-    ) -> std::io::Result<()> {
-        let mut fmt = uapi::V4l2Format {
-            type_: uapi::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
-            ..Default::default()
-        };
-        fmt.pix_mp.width = width;
-        fmt.pix_mp.height = height;
-        fmt.pix_mp.pixelformat = fourcc;
-        fmt.pix_mp.field = uapi::V4L2_FIELD_NONE;
-        fmt.pix_mp.num_planes = 1;
-        fmt.pix_mp.plane_fmt[0].sizeimage = buffer_size;
-        ioctl(self.raw(), uapi::VIDIOC_S_FMT, &mut fmt)
-    }
-
-    fn subscribe_source_change(&mut self) -> std::io::Result<()> {
-        let mut sub = uapi::V4l2EventSubscription {
-            type_: uapi::V4L2_EVENT_SOURCE_CHANGE,
-            ..Default::default()
-        };
-        ioctl(self.raw(), uapi::VIDIOC_SUBSCRIBE_EVENT, &mut sub)
-    }
-
-    fn request_buffers(&mut self, queue: Queue, count: u32) -> std::io::Result<u32> {
-        if queue == Queue::Output {
-            self.inputs.clear();
-        }
-        let mut req = uapi::V4l2Requestbuffers {
-            count,
-            type_: queue_type(queue),
-            memory: uapi::V4L2_MEMORY_MMAP,
-            ..Default::default()
-        };
-        ioctl(self.raw(), uapi::VIDIOC_REQBUFS, &mut req)?;
-        if queue == Queue::Output {
-            for index in 0..req.count {
-                let mapping = self.map_input(index)?;
-                self.inputs.push(mapping);
-            }
-        }
-        Ok(req.count)
-    }
-
-    fn stream(&mut self, queue: Queue, on: bool) -> std::io::Result<()> {
-        let mut kind = queue_type(queue) as i32;
-        let request = if on {
-            uapi::VIDIOC_STREAMON
-        } else {
-            uapi::VIDIOC_STREAMOFF
-        };
-        ioctl(self.raw(), request, &mut kind)
-    }
-
-    fn queue_output(&mut self, index: u32, data: &[u8], stamp: u64) -> std::io::Result<()> {
-        let mapping = self
-            .inputs
-            .get(index as usize)
-            .ok_or_else(|| std::io::Error::other("no such input buffer"))?;
-        if data.len() > mapping.len {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "a {} byte access unit does not fit the {} byte input buffer",
-                    data.len(),
-                    mapping.len
-                ),
-            ));
-        }
-        // SAFETY: `mapping` is a live writable mapping of `mapping.len` bytes
-        // and `data.len()` was just checked against it. The buffer is not
-        // queued (the state machine only passes free indices), so the driver
-        // is not reading it, and `data` cannot overlap a private mapping.
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), mapping.ptr.as_ptr(), data.len());
-        }
-        let mut plane = uapi::V4l2Plane {
-            bytesused: data.len() as u32,
-            ..Default::default()
-        };
-        let mut buf = Node::buffer(Queue::Output, index, &mut plane);
-        buf.timestamp_sec = (stamp / 1_000_000) as i64;
-        buf.timestamp_usec = (stamp % 1_000_000) as i64;
-        ioctl(self.raw(), uapi::VIDIOC_QBUF, &mut buf)
-    }
-
-    fn dequeue_output(&mut self) -> std::io::Result<Option<u32>> {
-        let mut plane = uapi::V4l2Plane::default();
-        let mut buf = Node::buffer(Queue::Output, 0, &mut plane);
-        match ioctl(self.raw(), uapi::VIDIOC_DQBUF, &mut buf) {
-            Ok(()) => Ok(Some(buf.index)),
-            Err(e) if nothing_ready(&e) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    fn queue_capture(&mut self, index: u32) -> std::io::Result<()> {
-        let mut plane = uapi::V4l2Plane::default();
-        let mut buf = Node::buffer(Queue::Capture, index, &mut plane);
-        ioctl(self.raw(), uapi::VIDIOC_QBUF, &mut buf)
-    }
-
-    fn dequeue_capture(&mut self) -> std::io::Result<Option<Dequeued>> {
-        let mut plane = uapi::V4l2Plane::default();
-        let mut buf = Node::buffer(Queue::Capture, 0, &mut plane);
-        match ioctl(self.raw(), uapi::VIDIOC_DQBUF, &mut buf) {
-            Ok(()) => Ok(Some(Dequeued {
-                index: buf.index,
-                stamp: (buf.timestamp_sec as u64) * 1_000_000 + buf.timestamp_usec as u64,
-                error: buf.flags & uapi::V4L2_BUF_FLAG_ERROR != 0,
-                empty: plane.bytesused == 0,
-            })),
-            Err(e) if nothing_ready(&e) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    fn dequeue_event(&mut self) -> std::io::Result<Option<Event>> {
-        let mut ev = uapi::V4l2Event::default();
-        match ioctl(self.raw(), uapi::VIDIOC_DQEVENT, &mut ev) {
-            Ok(()) => {
-                let resolution = ev.u[0] as u32 & uapi::V4L2_EVENT_SRC_CH_RESOLUTION != 0;
-                Ok(Some(
-                    if ev.type_ == uapi::V4L2_EVENT_SOURCE_CHANGE && resolution {
-                        Event::SourceChange
-                    } else {
-                        Event::Other
-                    },
-                ))
-            }
-            // No event pending.
-            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    fn capture_format(&mut self) -> std::io::Result<CaptureFormat> {
-        Ok(capture_format_of(&self.read_format(Queue::Capture)?))
-    }
-
-    fn capture_formats(&mut self) -> std::io::Result<Vec<u32>> {
-        self.formats(Queue::Capture)
-    }
-
-    fn set_capture_format(&mut self, fourcc: u32) -> std::io::Result<CaptureFormat> {
-        let mut fmt = self.read_format(Queue::Capture)?;
-        fmt.pix_mp.pixelformat = fourcc;
-        ioctl(self.raw(), uapi::VIDIOC_S_FMT, &mut fmt)?;
-        Ok(capture_format_of(&fmt))
-    }
-
-    fn min_capture_buffers(&mut self) -> std::io::Result<u32> {
-        let mut ctrl = uapi::V4l2Control {
-            id: uapi::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE,
-            value: 0,
-        };
-        ioctl(self.raw(), uapi::VIDIOC_G_CTRL, &mut ctrl)?;
-        Ok(ctrl.value.max(0) as u32)
-    }
-
-    fn wait(&mut self, interest: Interest, timeout: Duration) -> std::io::Result<()> {
-        let events = match interest {
-            Interest::Capture => libc::POLLIN | libc::POLLPRI,
-            Interest::Output => libc::POLLOUT | libc::POLLPRI,
-        };
-        let mut pfd = libc::pollfd {
-            fd: self.raw(),
-            events,
-            revents: 0,
-        };
-        let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-        // SAFETY: `pfd` is one live `pollfd` and the count passed is 1.
-        let r = unsafe { libc::poll(&mut pfd, 1, ms) };
-        if r < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() != std::io::ErrorKind::Interrupted {
-                return Err(e);
-            }
-        }
-        // A queue that is not streaming polls as an error at once; without
-        // this the caller's deadline loop would spin.
-        if r > 0 && pfd.revents & events == 0 {
-            std::thread::sleep(timeout.min(Duration::from_millis(2)));
-        }
-        Ok(())
+        Node::export(self, index)
     }
 }
 
 /// Which buffer a shipped frame gives back, and to which pool.
 #[derive(Debug, Clone, Copy)]
-struct Release {
-    pool: u32,
-    generation: u64,
-    index: u32,
+pub(crate) struct Release {
+    pub(crate) pool: u32,
+    pub(crate) generation: u64,
+    pub(crate) index: u32,
 }
 
 /// Holds one shipped picture's buffer until the presenter is done reading it.
 /// The fds stay open past a pool rebuild so an imported frame never dangles.
 pub struct V4l2FrameGuard {
-    _fds: Arc<Vec<OwnedFd>>,
-    tx: mpsc::Sender<Release>,
-    release: Release,
+    pub(crate) _fds: Arc<Vec<OwnedFd>>,
+    pub(crate) tx: mpsc::Sender<Release>,
+    pub(crate) release: Release,
 }
 
 impl Drop for V4l2FrameGuard {
@@ -612,14 +275,14 @@ impl Drop for V4l2FrameGuard {
 
 /// Facts of the access unit a picture decodes, recorded when it was queued.
 #[derive(Debug, Clone, Copy)]
-struct Facts {
-    keyframe: bool,
-    references_clean: bool,
-    color: ColorDesc,
-    display: (u32, u32),
-    /// The planner saw damage: decode it to keep the driver's references in
-    /// step, but do not show it.
-    damaged: bool,
+pub(crate) struct Facts {
+    pub(crate) keyframe: bool,
+    pub(crate) references_clean: bool,
+    pub(crate) color: ColorDesc,
+    pub(crate) display: (u32, u32),
+    /// The planner saw damage: decode it to keep the references in step, but
+    /// do not show it.
+    pub(crate) damaged: bool,
 }
 
 /// What decides the input buffer size and the picture format.
@@ -657,7 +320,79 @@ struct Session<D: Opened> {
     pending: VecDeque<(u64, Facts)>,
 }
 
-pub(crate) struct NativeV4l2Decoder<D: Opened = Node> {
+/// The V4L2 rung: whichever kind of node takes the session's codec.
+pub(crate) enum NativeV4l2Decoder {
+    Stateful(Box<StatefulRung>),
+    StatelessHevc(Box<crate::video_v4l2_hevc::StatelessHevc>),
+}
+
+impl NativeV4l2Decoder {
+    /// Refuses when no node takes this codec and shape, so the ladder falls
+    /// through at construction instead of on the first access unit.
+    pub(crate) fn new(wire: u8, stream: StreamFormat) -> Result<NativeV4l2Decoder> {
+        if stream.chroma_format_idc != punktfunk_core::quic::CHROMA_IDC_420 {
+            bail!("V4L2 decode is 4:2:0 only");
+        }
+        let caps = caps();
+        if let Some(node) = caps.slot(wire) {
+            if stream.bit_depth > 8 && !node.ten_bit {
+                bail!("the V4L2 decoder offers no linear 10-bit picture format");
+            }
+            return Ok(NativeV4l2Decoder::Stateful(Box::new(
+                StatefulRung::on_node(wire, node.path.clone()),
+            )));
+        }
+        match &caps.hevc_stateless {
+            Some(path) if wire == punktfunk_core::quic::CODEC_HEVC => {
+                if stream.bit_depth > 8 {
+                    bail!("the stateless V4L2 decoder has no 10-bit picture format we show");
+                }
+                Ok(NativeV4l2Decoder::StatelessHevc(Box::new(
+                    crate::video_v4l2_hevc::StatelessHevc::on_node(path.clone()),
+                )))
+            }
+            _ => bail!("no V4L2 decoder node takes this codec"),
+        }
+    }
+
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            NativeV4l2Decoder::Stateful(d) => d.name(),
+            NativeV4l2Decoder::StatelessHevc(_) => "native-v4l2 h265 (stateless)",
+        }
+    }
+
+    pub(crate) fn health(&self) -> DecodeHealth {
+        match self {
+            NativeV4l2Decoder::Stateful(d) => d.health(),
+            NativeV4l2Decoder::StatelessHevc(d) => d.health(),
+        }
+    }
+
+    pub(crate) fn take_recovery_request(&mut self) -> bool {
+        match self {
+            NativeV4l2Decoder::Stateful(d) => d.take_recovery_request(),
+            NativeV4l2Decoder::StatelessHevc(d) => d.take_recovery_request(),
+        }
+    }
+
+    pub(crate) fn forgive_unclean(&mut self) {
+        match self {
+            NativeV4l2Decoder::Stateful(d) => d.forgive_unclean(),
+            NativeV4l2Decoder::StatelessHevc(d) => d.forgive_unclean(),
+        }
+    }
+
+    pub(crate) fn decode(&mut self, au: &[u8]) -> Result<Option<DecodedImage>> {
+        match self {
+            NativeV4l2Decoder::Stateful(d) => Ok(d.decode(au)?.map(DecodedImage::NativeDmabuf)),
+            NativeV4l2Decoder::StatelessHevc(d) => d.decode(au),
+        }
+    }
+}
+
+/// A stateful decoder node: access units in, pictures out, its own parser.
+pub(crate) struct StatefulRung<D: Opened = Node> {
     wire: u8,
     node: PathBuf,
     planner: Planner,
@@ -673,7 +408,7 @@ pub(crate) struct NativeV4l2Decoder<D: Opened = Node> {
     release_rx: mpsc::Receiver<Release>,
 }
 
-fn colour_of(c: &pf_bitstream::h264::ColourDescription) -> ColorDesc {
+pub(crate) fn colour_of(c: &pf_bitstream::h264::ColourDescription) -> ColorDesc {
     ColorDesc {
         primaries: c.colour_primaries,
         transfer: c.transfer_characteristics,
@@ -684,7 +419,7 @@ fn colour_of(c: &pf_bitstream::h264::ColourDescription) -> ColorDesc {
 
 /// The visible size of a cropped picture. Planes are sampled from (0,0), so
 /// a crop with another origin is refused rather than shown shifted.
-fn display_of(crop: pf_bitstream::h264::DisplayCrop) -> Result<(u32, u32)> {
+pub(crate) fn display_of(crop: pf_bitstream::h264::DisplayCrop) -> Result<(u32, u32)> {
     if crop.x != 0 || crop.y != 0 {
         bail!(
             "conformance window at ({}, {}) — this rung hands the buffer over uncropped",
@@ -695,26 +430,9 @@ fn display_of(crop: pf_bitstream::h264::DisplayCrop) -> Result<(u32, u32)> {
     Ok((crop.width, crop.height))
 }
 
-impl NativeV4l2Decoder {
-    /// Refuses when no node takes this codec and shape, so the ladder falls
-    /// through at construction instead of on the first access unit.
-    pub(crate) fn new(wire: u8, stream: StreamFormat) -> Result<NativeV4l2Decoder> {
-        let node = caps()
-            .slot(wire)
-            .ok_or_else(|| anyhow!("no V4L2 decoder node takes this codec"))?;
-        if stream.chroma_format_idc != punktfunk_core::quic::CHROMA_IDC_420 {
-            bail!("V4L2 decode is 4:2:0 only");
-        }
-        if stream.bit_depth > 8 && !node.ten_bit {
-            bail!("the V4L2 decoder offers no linear 10-bit picture format");
-        }
-        Ok(NativeV4l2Decoder::on_node(wire, node.path.clone()))
-    }
-}
-
-impl<D: Opened> NativeV4l2Decoder<D> {
+impl<D: Opened> StatefulRung<D> {
     /// The rung over the decoder at `node`, opened on the first access unit.
-    fn on_node(wire: u8, node: PathBuf) -> NativeV4l2Decoder<D> {
+    fn on_node(wire: u8, node: PathBuf) -> StatefulRung<D> {
         let planner = match wire {
             punktfunk_core::quic::CODEC_H264 => {
                 Planner::H264(Box::new(pf_bitstream::h264::H264Planner::new()))
@@ -725,7 +443,7 @@ impl<D: Opened> NativeV4l2Decoder<D> {
             _ => Planner::Av1(Box::new(pf_bitstream::av1::Av1Planner::new())),
         };
         let (release_tx, release_rx) = mpsc::channel();
-        NativeV4l2Decoder {
+        StatefulRung {
             wire,
             node,
             planner,
@@ -1112,11 +830,11 @@ mod tests {
         }
     }
 
-    fn rung() -> NativeV4l2Decoder<FakeDecoder> {
-        NativeV4l2Decoder::on_node(punktfunk_core::quic::CODEC_H264, PathBuf::from("fake"))
+    fn rung() -> StatefulRung<FakeDecoder> {
+        StatefulRung::on_node(punktfunk_core::quic::CODEC_H264, PathBuf::from("fake"))
     }
 
-    fn fake(d: &mut NativeV4l2Decoder<FakeDecoder>) -> &mut FakeDecoder {
+    fn fake(d: &mut StatefulRung<FakeDecoder>) -> &mut FakeDecoder {
         d.session.as_mut().expect("a session").decoder.device()
     }
 

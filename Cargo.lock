@@ -3214,6 +3214,7 @@ dependencies = [
  "pf-dxvadec",
  "pf-libva",
  "pf-update-check",
+ "pf-v4l2",
  "pf-v4l2dec",
  "pf-vaapi",
  "pf-vkdecode",
@@ -3503,8 +3504,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-v4l2"
+version = "0.41.0"
+dependencies = [
+ "libc",
+ "pf-bitstream",
+ "pf-v4l2dec",
+]
+
+[[package]]
 name = "pf-v4l2dec"
 version = "0.41.0"
+dependencies = [
+ "cros-codecs",
+ "pf-bitstream",
+]
 
 [[package]]
 name = "pf-vaapi"

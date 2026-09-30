@@ -281,7 +281,7 @@ impl DecodedImage {
     /// interface: additive only, and surviving tags keep their exact spelling.
     pub fn path_label(&self) -> &'static str {
         match self {
-            DecodedImage::Cpu(_) => "software",
+            DecodedImage::Cpu(f) => f.path,
             #[cfg(target_os = "linux")]
             DecodedImage::NativeDmabuf(f) => f.path,
             #[cfg(windows)]
@@ -313,6 +313,9 @@ pub struct CpuPlanarFrame {
     /// Intra-refresh recovery (`RecoveryWatch`). [`Self::keyframe`] cannot answer
     /// for a wave. H.264 only; AV1 reports [`punktfunk_core::reanchor::LocalRecovery::NONE`].
     pub recovery: punktfunk_core::reanchor::LocalRecovery,
+    /// The rung that decoded it, as the `stats:` decode-path tag: the CPU
+    /// rung, or a hardware rung whose pictures only reach the screen by copy.
+    pub path: &'static str,
 }
 
 impl CpuPlanarFrame {
@@ -386,6 +389,53 @@ impl CpuPlanarFrame {
             color,
             keyframe,
             recovery,
+            path: "software",
+        })
+    }
+
+    /// Take three already tight planes. Refuses a plane whose length is not
+    /// its size: uploading it would shear the picture.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn from_planes(
+        width: u32,
+        height: u32,
+        planes: [Vec<u8>; 3],
+        color: ColorDesc,
+        keyframe: bool,
+        path: &'static str,
+    ) -> Result<CpuPlanarFrame> {
+        let (cw, ch) = Self::chroma_dims(width, height);
+        let sizes = [
+            width as usize * height as usize,
+            cw as usize * ch as usize,
+            cw as usize * ch as usize,
+        ];
+        anyhow::ensure!(width > 0 && height > 0, "empty picture {width}x{height}");
+        let mut offsets = [0usize; 3];
+        let mut at = 0usize;
+        for i in 0..3 {
+            anyhow::ensure!(
+                planes[i].len() == sizes[i],
+                "plane {i}: {} bytes for a {} byte plane",
+                planes[i].len(),
+                sizes[i]
+            );
+            offsets[i] = at;
+            at += sizes[i];
+        }
+        let [mut data, cb, cr] = planes;
+        data.reserve_exact(sizes[1] + sizes[2]);
+        data.extend_from_slice(&cb);
+        data.extend_from_slice(&cr);
+        Ok(CpuPlanarFrame {
+            width,
+            height,
+            data,
+            offsets,
+            color,
+            keyframe,
+            recovery: punktfunk_core::reanchor::LocalRecovery::NONE,
+            path,
         })
     }
 }
@@ -463,8 +513,8 @@ enum Backend {
     /// proven Vulkan ([`native_rung_admitted`]). Boxed: two planners + pools.
     #[cfg(target_os = "linux")]
     NativeVaapi(Box<crate::video_vaapi_native::NativeVaapiDecoder>),
-    /// V4L2 stateful node (`video_v4l2`): the hardware rung where neither
-    /// Vulkan Video nor VA-API exists. Pinnable as `native-v4l2`.
+    /// A V4L2 decoder node (`video_v4l2`), stateful or stateless: the hardware
+    /// rung where neither Vulkan Video nor VA-API exists. Pinnable as `native-v4l2`.
     #[cfg(target_os = "linux")]
     NativeV4l2(Box<crate::video_v4l2::NativeV4l2Decoder>),
     /// Native D3D11VA (`pf-dxvadec`): plans into the shareable-RGBA hand-off ring.
@@ -646,7 +696,7 @@ pub enum NativeRung {
     D3d11va,
     /// pf-vaapi driving a dlopen'd libva (`video_vaapi_native`, Linux).
     Vaapi,
-    /// A V4L2 stateful decoder node (`video_v4l2`, Linux).
+    /// A V4L2 decoder node, stateful or stateless (`video_v4l2`, Linux).
     V4l2,
     /// openh264 + rav1d (`video_software`).
     Software,
@@ -1347,7 +1397,7 @@ impl Decoder {
                     tracing::info!(
                         codec = codec_name,
                         decoder = d.name(),
-                        "native V4L2 hardware decode active (stateful node, zero-copy dmabuf)"
+                        "native V4L2 hardware decode active"
                     );
                     return done(Backend::NativeV4l2(Box::new(d)));
                 }
@@ -1557,7 +1607,7 @@ impl Decoder {
                     tracing::info!(
                         codec = codec_name,
                         decoder = d.name(),
-                        "native V4L2 hardware decode active (stateful node, zero-copy dmabuf)"
+                        "native V4L2 hardware decode active"
                     );
                     return done(Backend::NativeV4l2(Box::new(d)));
                 }
@@ -1779,10 +1829,7 @@ impl Decoder {
                 v.take_recovery_request(),
             ),
             #[cfg(target_os = "linux")]
-            Backend::NativeV4l2(d) => (
-                d.decode(au).map(|f| f.map(DecodedImage::NativeDmabuf)),
-                d.take_recovery_request(),
-            ),
+            Backend::NativeV4l2(d) => (d.decode(au), d.take_recovery_request()),
             #[cfg(windows)]
             Backend::NativeD3d11va(d) => (
                 d.decode(au).map(|f| f.map(DecodedImage::D3d11)),

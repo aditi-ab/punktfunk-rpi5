@@ -1,6 +1,6 @@
 [package]
 name = "pf-v4l2dec"
-description = "Hand-declared V4L2 decoder uAPI and the stateful decoder state machine, CPU-testable: the device-free half of the Linux client's V4L2 decode rung."
+description = "Hand-declared V4L2 decoder uAPI, the stateful and stateless decoder flows, and the HEVC control fill, CPU-testable: the device-free half of the Linux client's V4L2 decode rungs."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,9 +9,16 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+# The HEVC control fill reads the parser's `Sps`/`Pps`/`SliceHeader` wholesale.
+cros-codecs = { workspace = true }
+pf-bitstream = { path = "../pf-bitstream" }
+
+[dev-dependencies]
+# `pf_bitstream::testing`: the vendored vectors and access-unit splitters.
+pf-bitstream = { path = "../pf-bitstream", features = ["test-vectors"] }
 
 [features]
-# `testing::FakeDecoder`, for the client rung's tests.
+# The fake decoders in `testing`, for the rungs' tests.
 testing = []
 
 [lints]
