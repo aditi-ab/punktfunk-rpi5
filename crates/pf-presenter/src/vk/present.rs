@@ -224,7 +224,8 @@ impl Presenter {
                     Err(vk::Result::NOT_READY) | Err(vk::Result::TIMEOUT) => {
                         return Ok(Presented::Busy(input, BusyOn::Acquire));
                     }
-                    Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                    Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
+                    | Err(vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => {
                         self.recreate_swapchain(window)?;
                         return Ok(Presented::Stale);
                     }
@@ -314,7 +315,8 @@ impl Presenter {
         };
         let (index, _suboptimal) = match acquired {
             Ok(r) => r,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
+            | Err(vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => {
                 // Acquire failed: GPU never saw the import; destroy it here.
                 #[cfg(target_os = "linux")]
                 if let Lane::Dmabuf(f) = lane {
@@ -1146,7 +1148,8 @@ impl Presenter {
                     }
                     Ok(Presented::Shown)
                 }
-                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
+                | Err(vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => {
                     self.recreate_swapchain(window)?;
                     Ok(Presented::Stale)
                 }

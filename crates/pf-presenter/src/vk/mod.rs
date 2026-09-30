@@ -313,6 +313,9 @@ pub struct Presenter {
     /// Windows). Estimated stamps, `glass=est`.
     #[cfg(windows)]
     vblank_timer: Option<vblank_timing::VblankTimer>,
+    /// Exclusive fullscreen, opt-in: the swapchain owns the monitor's flips.
+    #[cfg(windows)]
+    fse: Option<FullScreenExclusive>,
     /// Strictly increasing present id (spec: per swapchain). 0 = none presented with an id.
     next_present_id: u64,
     /// Last successful id-carrying present, awaiting [`Presenter::note_presented`].
@@ -1307,6 +1310,109 @@ impl Presenter {
             .ok()
             .flatten();
         overlay_api_version_of(INSTANCE_API_VERSION, loader)
+    }
+}
+
+/// `VK_EXT_full_screen_exclusive`, application-controlled: the swapchain takes the
+/// monitor's flips, so a variable-refresh panel follows our presents where the desktop
+/// compositor would hold the window. Opt-in (`PUNKTFUNK_FULLSCREEN_EXCLUSIVE=1`); the
+/// PresentMon leg of the pacing plan decides the default. Every query the exclusive
+/// swapchain is built from carries the same pNext chain, as the spec requires.
+#[cfg(windows)]
+pub(crate) struct FullScreenExclusive {
+    pub(crate) device: ash::ext::full_screen_exclusive::Device,
+    pub(crate) instance: ash::ext::full_screen_exclusive::Instance,
+    pub(crate) caps2: ash::khr::get_surface_capabilities2::Instance,
+    /// The window's `HMONITOR`; the one the swapchain claims.
+    pub(crate) monitor: isize,
+}
+
+#[cfg(windows)]
+impl FullScreenExclusive {
+    fn chain(
+        &self,
+    ) -> (
+        vk::SurfaceFullScreenExclusiveInfoEXT<'static>,
+        vk::SurfaceFullScreenExclusiveWin32InfoEXT<'static>,
+    ) {
+        (
+            vk::SurfaceFullScreenExclusiveInfoEXT::default()
+                .full_screen_exclusive(vk::FullScreenExclusiveEXT::APPLICATION_CONTROLLED),
+            vk::SurfaceFullScreenExclusiveWin32InfoEXT::default()
+                .hmonitor(self.monitor as vk::HMONITOR),
+        )
+    }
+
+    /// Surface capabilities as the exclusive swapchain will see them.
+    pub(crate) fn capabilities(
+        &self,
+        pdev: vk::PhysicalDevice,
+        surface: vk::SurfaceKHR,
+    ) -> anyhow::Result<vk::SurfaceCapabilitiesKHR> {
+        use anyhow::Context as _;
+        let (mut info, mut win32) = self.chain();
+        let surface_info = vk::PhysicalDeviceSurfaceInfo2KHR::default()
+            .surface(surface)
+            .push_next(&mut info)
+            .push_next(&mut win32);
+        let mut caps2 = vk::SurfaceCapabilities2KHR::default();
+        // SAFETY: live handles; the chained locals outlive the call.
+        unsafe {
+            self.caps2
+                .get_physical_device_surface_capabilities2(pdev, &surface_info, &mut caps2)
+        }
+        .context("vkGetPhysicalDeviceSurfaceCapabilities2KHR")?;
+        Ok(caps2.surface_capabilities)
+    }
+
+    /// `want` if the exclusive surface offers it, else FIFO (guaranteed).
+    pub(crate) fn present_mode(
+        &self,
+        pdev: vk::PhysicalDevice,
+        surface: vk::SurfaceKHR,
+        want: vk::PresentModeKHR,
+    ) -> vk::PresentModeKHR {
+        let (mut info, mut win32) = self.chain();
+        let surface_info = vk::PhysicalDeviceSurfaceInfo2KHR::default()
+            .surface(surface)
+            .push_next(&mut info)
+            .push_next(&mut win32);
+        // SAFETY: live handles; the chained locals outlive the call.
+        let modes = unsafe {
+            self.instance
+                .get_physical_device_surface_present_modes2(pdev, &surface_info)
+        }
+        .unwrap_or_default();
+        if modes.contains(&want) {
+            want
+        } else {
+            vk::PresentModeKHR::FIFO
+        }
+    }
+
+    /// Chain the exclusive request onto a swapchain create. The pair must outlive it.
+    pub(crate) fn extend<'a>(
+        &self,
+        info: vk::SwapchainCreateInfoKHR<'a>,
+        pair: &'a mut (
+            vk::SurfaceFullScreenExclusiveInfoEXT<'static>,
+            vk::SurfaceFullScreenExclusiveWin32InfoEXT<'static>,
+        ),
+    ) -> vk::SwapchainCreateInfoKHR<'a> {
+        *pair = self.chain();
+        info.push_next(&mut pair.0).push_next(&mut pair.1)
+    }
+
+    /// Take the monitor for `swapchain`. A refusal leaves a windowed swapchain.
+    pub(crate) fn acquire(&self, swapchain: vk::SwapchainKHR) {
+        // SAFETY: `swapchain` was just created on this device.
+        match unsafe { self.device.acquire_full_screen_exclusive_mode(swapchain) } {
+            Ok(()) => tracing::info!("exclusive fullscreen acquired"),
+            Err(e) => tracing::warn!(
+                error = ?e,
+                "exclusive fullscreen refused — presenting windowed"
+            ),
+        }
     }
 }
 

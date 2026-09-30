@@ -231,6 +231,18 @@ impl Presenter {
         if has_colorspace_ext {
             instance_extensions.push("VK_EXT_swapchain_colorspace".into());
         }
+        // Exclusive fullscreen queries its surface through `VK_KHR_get_surface_capabilities2`.
+        #[cfg(windows)]
+        let want_fse = fullscreen_exclusive_opt_in();
+        #[cfg(windows)]
+        let has_caps2_ext = want_fse
+            && inst_available.iter().any(|e| {
+                e.extension_name_as_c_str() == Ok(ash::khr::get_surface_capabilities2::NAME)
+            });
+        #[cfg(windows)]
+        if has_caps2_ext {
+            instance_extensions.push("VK_KHR_get_surface_capabilities2".into());
+        }
         let ext_cstrings: Vec<CString> = instance_extensions
             .iter()
             .map(|e| CString::new(e.as_str()).unwrap())
@@ -435,6 +447,13 @@ impl Presenter {
         if flr_ok {
             dev_exts.push(fifo_latest_ready::NAME.as_ptr());
         }
+        // Exclusive fullscreen, opt-in and fullscreen sessions only.
+        #[cfg(windows)]
+        let fse_ok = has_caps2_ext && pref.fullscreen && has(ash::ext::full_screen_exclusive::NAME);
+        #[cfg(windows)]
+        if fse_ok {
+            dev_exts.push(ash::ext::full_screen_exclusive::NAME.as_ptr());
+        }
         let mut en_flr = fifo_latest_ready::Features {
             present_mode_fifo_latest_ready: vk::TRUE,
             ..Default::default()
@@ -512,6 +531,24 @@ impl Presenter {
             tracing::info!(
                 active = vblank_timer.is_some(),
                 "glass clock from the output's vblank (estimated stamps)"
+            );
+        }
+        #[cfg(windows)]
+        let fse = fse_ok
+            .then(|| crate::win32::window_monitor(window))
+            .flatten()
+            .map(|monitor| super::FullScreenExclusive {
+                device: ash::ext::full_screen_exclusive::Device::new(&instance, &device),
+                instance: ash::ext::full_screen_exclusive::Instance::new(&entry, &instance),
+                caps2: ash::khr::get_surface_capabilities2::Instance::new(&entry, &instance),
+                monitor,
+            });
+        #[cfg(windows)]
+        if want_fse {
+            tracing::info!(
+                active = fse.is_some(),
+                fullscreen = pref.fullscreen,
+                "exclusive fullscreen (VK_EXT_full_screen_exclusive)"
             );
         }
         let hdr_metadata_d =
@@ -784,6 +821,8 @@ impl Presenter {
             present_timer,
             #[cfg(windows)]
             vblank_timer,
+            #[cfg(windows)]
+            fse,
             next_present_id: 0,
             last_presented: None,
             video_fit: Default::default(),
@@ -1130,6 +1169,12 @@ fn present_mode_chain(pref: PresentPref) -> Vec<vk::PresentModeKHR> {
 /// `PUNKTFUNK_VRR_FIFO=1` opts into the FIFO-first ladder for variable-refresh panels.
 fn vrr_fifo_opt_in() -> bool {
     std::env::var("PUNKTFUNK_VRR_FIFO").is_ok_and(|v| v != "0")
+}
+
+/// `PUNKTFUNK_FULLSCREEN_EXCLUSIVE=1`: take the monitor with `VK_EXT_full_screen_exclusive`.
+#[cfg(windows)]
+fn fullscreen_exclusive_opt_in() -> bool {
+    std::env::var("PUNKTFUNK_FULLSCREEN_EXCLUSIVE").is_ok_and(|v| v != "0")
 }
 
 /// Resolve the present mode. `PUNKTFUNK_PRESENT_MODE` pins one; otherwise the first
