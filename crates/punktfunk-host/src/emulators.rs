@@ -225,6 +225,23 @@ pub fn prepare(
         .collect())
 }
 
+/// A core name as the buildbot spells it: `snes9x`, `mupen64plus_next`.
+pub fn valid_core(core: &str) -> bool {
+    !core.is_empty()
+        && core.len() <= 64
+        && core.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The grant a plugin's request asks for: read-only, on the emulator's folder.
+pub fn grant_target(id: &str) -> (PathBuf, bool) {
+    (home_of(id), false)
+}
+
+/// True when `path` is an emulator home under the prefix.
+pub fn is_home(path: &Path) -> bool {
+    path.starts_with(prefix())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,21 +266,4 @@ I: Bus=0011 Vendor=0001 Product=0001 Version=ab41\nN: Name=\"AT Translated Set 2
         assert_eq!(pads[0].sdl_guid(true), "030081b85e0400008e02000010010000");
         assert!(virtual_pads("").is_empty());
     }
-}
-
-/// A core name as the buildbot spells it: `snes9x`, `mupen64plus_next`.
-pub fn valid_core(core: &str) -> bool {
-    !core.is_empty()
-        && core.len() <= 64
-        && core.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-/// The grant a plugin's request asks for: read-only, on the emulator's folder.
-pub fn grant_target(id: &str) -> (PathBuf, bool) {
-    (home_of(id), false)
-}
-
-/// True when `path` is an emulator home under the prefix.
-pub fn is_home(path: &Path) -> bool {
-    path.starts_with(prefix())
 }
