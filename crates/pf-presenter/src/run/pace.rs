@@ -308,13 +308,8 @@ impl StreamState {
     /// make buffering moot.
     pub(super) fn intake(&mut self) {
         while let Ok(f) = self.frames.try_recv() {
-            // A repeat carries the picture already on glass: presenting it refreshes
-            // nothing, anchors the cadence clock on a hold, and on a VRR panel moves
-            // the next real frame's earliest slot.
-            if f.repeat {
-                self.win.repeats += 1;
-                continue;
-            }
+            let repeat = f.repeat;
+            self.win.repeats += u32::from(repeat);
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             if self.store.is_smoothing() && matches!(f.image, DecodedImage::PyroWave(_)) {
                 self.store.force_latency();
@@ -329,10 +324,16 @@ impl StreamState {
             // Intent after any PyroWave collapse above, so a wavelet stream folds
             // nothing into a loop it will never consult.
             let smoothing = self.store.is_smoothing();
-            let due_ns = self
-                .pacer
-                .due_ns(smoothing, f.pts_ns, f.decoded_ns, self.source_interval_ns)
-                .unwrap_or(0);
+            // A repeat is shown on arrival and stays out of the cadence clock: it is the
+            // picture already on glass, and its near-free encode would read as an early
+            // arrival. Shown, it keeps a VRR panel off its own refresh filler.
+            let due_ns = if repeat {
+                0
+            } else {
+                self.pacer
+                    .due_ns(smoothing, f.pts_ns, f.decoded_ns, self.source_interval_ns)
+                    .unwrap_or(0)
+            };
             self.store.submit(Paced { frame: f, due_ns });
         }
     }
@@ -580,7 +581,7 @@ pub(super) struct PresentWindow {
     steps: [u32; 6],
     /// Non-blocking presents that came back busy this window: [fence, acquire].
     busy: [u32; 2],
-    /// Host repeats dropped at intake: the picture was already on glass.
+    /// Host repeats taken in: shown, and kept out of the cadence clock.
     repeats: u32,
     /// Per shown frame: |on-glass spacing − source spacing| to the frame before it, µs.
     cadence_err_us: Vec<u32>,
@@ -761,7 +762,7 @@ impl StreamState {
                 frame: DecodedFrame {
                     pts_ns,
                     decoded_ns,
-                    // Repeats never reach the store (dropped at intake).
+                    // Counted at intake; nothing reads the flag past it.
                     repeat: false,
                     image,
                 },
