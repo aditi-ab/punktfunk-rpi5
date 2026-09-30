@@ -124,6 +124,14 @@ struct Mapping {
 // thread at a time; nothing else holds the pointer.
 unsafe impl Send for Mapping {}
 
+impl Mapping {
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: a live mapping of `len` readable bytes owned by `self`,
+        // borrowed for no longer than `self`.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+}
+
 impl Drop for Mapping {
     fn drop(&mut self) {
         // SAFETY: `ptr`/`len` are a live `mmap` result this value owns; it is
@@ -636,10 +644,7 @@ impl RequestNode {
     /// The bytes of CAPTURE buffer `index`. Meaningful for a buffer the
     /// decoder has returned: until it is queued again the driver only reads it.
     pub fn picture(&self, index: u32) -> Option<&[u8]> {
-        let m = self.pictures.get(index as usize)?;
-        // SAFETY: a live read-only mapping of `m.len` bytes owned by `self`,
-        // borrowed for no longer than `self`.
-        Some(unsafe { std::slice::from_raw_parts(m.ptr.as_ptr(), m.len) })
+        Some(self.pictures.get(index as usize)?.bytes())
     }
 }
 
@@ -784,5 +789,159 @@ impl pf_v4l2dec::stateless::Device for RequestNode {
             error: d.flags & uapi::V4L2_BUF_FLAG_ERROR != 0,
             empty: d.bytesused == 0,
         }))
+    }
+}
+
+/// Against the kernel's reference stateful codec, `vicodec`:
+/// `sudo modprobe vicodec multiplanar=1`, then
+/// `PF_V4L2_VICODEC_ENC=/dev/videoA PF_V4L2_VICODEC_DEC=/dev/videoB cargo test
+/// -p pf-v4l2 --lib -- --ignored`. The encoder node makes the stream the
+/// decoder node is then driven with.
+#[cfg(test)]
+mod tests {
+    use pf_v4l2dec::stateful::Stateful;
+
+    use super::*;
+
+    const FWHT: u32 = u32::from_le_bytes(*b"FWHT");
+
+    /// Raw NV12 picture `n`: a moving gradient, so pictures differ.
+    fn raw_frame(width: usize, height: usize, n: usize) -> Vec<u8> {
+        let mut frame = vec![128u8; width * height * 3 / 2];
+        for y in 0..height {
+            for x in 0..width {
+                frame[y * width + x] = (x / 4 + y / 4 + n * 8) as u8;
+            }
+        }
+        frame
+    }
+
+    /// Wait for and take the next buffer of `queue`.
+    fn take(video: &Video, queue: Queue) -> Done {
+        for _ in 0..100 {
+            if let Some(done) = video.dequeue_due(queue).expect("dequeue") {
+                return done;
+            }
+        }
+        panic!("the encoder returned no buffer");
+    }
+
+    /// Encode `frames` pictures with the vicodec encoder node.
+    fn encode(path: &Path, width: u32, height: u32, frames: usize) -> Vec<Vec<u8>> {
+        let enc = Video::open(path).expect("open the encoder");
+        enc.set_output_format(uapi::V4L2_PIX_FMT_NV12, width, height, 0)
+            .expect("set the raw format");
+        let mut fmt = enc
+            .read_format(Queue::Capture)
+            .expect("read the coded format");
+        fmt.pix_mp.pixelformat = FWHT;
+        fmt.pix_mp.width = width;
+        fmt.pix_mp.height = height;
+        ioctl(enc.raw(), uapi::VIDIOC_S_FMT, &mut fmt).expect("set the coded format");
+        assert!(enc.request_buffers(Queue::Output, 1).expect("raw buffers") >= 1);
+        let coded_count = enc
+            .request_buffers(Queue::Capture, 2)
+            .expect("coded buffers");
+        let input = enc.map(Queue::Output, 0).expect("map the raw buffer");
+        let coded: Vec<Mapping> = (0..coded_count)
+            .map(|i| enc.map(Queue::Capture, i).expect("map a coded buffer"))
+            .collect();
+        for index in 0..coded_count {
+            enc.queue_capture(index).expect("queue a coded buffer");
+        }
+        enc.stream(Queue::Output, true).expect("start raw");
+        enc.stream(Queue::Capture, true).expect("start coded");
+        let mut out = Vec::with_capacity(frames);
+        for n in 0..frames {
+            let raw = raw_frame(width as usize, height as usize, n);
+            enc.queue_input(&input, 0, &raw, n as u64, None)
+                .expect("queue a raw picture");
+            let done = take(&enc, Queue::Capture);
+            out.push(coded[done.index as usize].bytes()[..done.bytesused as usize].to_vec());
+            enc.queue_capture(done.index).expect("requeue");
+            take(&enc, Queue::Output);
+        }
+        out
+    }
+
+    /// The bytes behind a dma-buf, read through its own mapping.
+    fn read_dmabuf(fd: &OwnedFd, len: usize) -> Vec<u8> {
+        // SAFETY: a fresh read-only shared mapping of `len` bytes of a dma-buf
+        // this test owns; checked before use and unmapped below.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED, "map the exported picture");
+        // SAFETY: `ptr` is the live mapping of `len` bytes made above.
+        let copy = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) }.to_vec();
+        // SAFETY: the same mapping, unmapped once.
+        unsafe { libc::munmap(ptr, len) };
+        copy
+    }
+
+    #[test]
+    #[ignore = "needs the kernel's vicodec codec: see the module comment"]
+    fn a_kernel_stateful_decoder_runs_the_whole_flow() {
+        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("set {name}"));
+        let encoder = var("PF_V4L2_VICODEC_ENC");
+        let decoder = var("PF_V4L2_VICODEC_DEC");
+        let streams = [(640u32, 360u32, 12usize), (1280, 720, 6)];
+        let coded: Vec<Vec<Vec<u8>>> = streams
+            .iter()
+            .map(|(w, h, n)| encode(Path::new(&encoder), *w, *h, *n))
+            .collect();
+
+        let node = Node::open(Path::new(&decoder)).expect("open the decoder");
+        assert!(node
+            .formats(Queue::Output)
+            .expect("enumerate")
+            .contains(&FWHT));
+        let nv12 = uapi::V4L2_PIX_FMT_NV12;
+        let mut d = Stateful::open(node, FWHT, 640, 360, &[nv12]).expect("start the decoder");
+        let mut stamp = 0u64;
+        for ((width, height, _), frames) in streams.iter().zip(&coded) {
+            for (n, frame) in frames.iter().enumerate() {
+                stamp += 1;
+                d.submit(frame, stamp).expect("queue an access unit");
+                let picture = d
+                    .pump(Duration::from_millis(1000))
+                    .expect("pump")
+                    .unwrap_or_else(|| panic!("no picture for unit {stamp}"));
+                assert_eq!(picture.stamp, stamp, "the stamp follows its picture");
+                assert!(!picture.corrupt);
+                let format = d.capture().expect("configured").format;
+                // The coded size: the driver pads the visible one to its blocks.
+                assert!(format.width >= *width && format.height >= *height);
+                assert!(format.width < *width + 64 && format.height < *height + 64);
+                assert_eq!((format.fourcc, format.planes), (nv12, 1));
+
+                // The picture, through the dma-buf the presenter would import:
+                // FWHT is lossy, so the luma is near the source, not equal.
+                let fd = d.device().export(picture.index).expect("export");
+                let luma = (format.stride * format.height) as usize;
+                let pixels = read_dmabuf(&fd, luma * 3 / 2);
+                let source = raw_frame(*width as usize, *height as usize, n);
+                let mut error = 0u64;
+                for y in 0..*height as usize {
+                    for x in 0..*width as usize {
+                        let got = pixels[y * format.stride as usize + x];
+                        error += u64::from(got.abs_diff(source[y * *width as usize + x]));
+                    }
+                }
+                let mean = error / u64::from(width * height);
+                assert!(mean < 24, "unit {stamp}: mean luma error {mean}");
+                d.release(picture.index, picture.generation)
+                    .expect("return the buffer");
+            }
+        }
+        // The second stream's size replaced the pool once.
+        assert_eq!(d.capture().expect("configured").generation, 2);
     }
 }
