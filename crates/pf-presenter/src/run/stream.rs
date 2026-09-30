@@ -27,12 +27,17 @@ impl StreamState {
         let handle = session::start(params);
         let (wake_tx, wake_rx) = async_channel::bounded(2);
         let pump_rx = handle.frames.clone();
+        let forwarder_drops = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let displaced = forwarder_drops.clone();
         let _ = std::thread::Builder::new()
             .name("pf-frame-wake".into())
             .spawn(move || {
                 pf_client_core::audio_rt::boost_and_log("frame-wake");
                 while let Ok(f) = pump_rx.recv_blocking() {
-                    let _ = wake_tx.force_send(f); // newest wins, like the pump's queue
+                    // Newest wins, like the pump's queue; a displaced frame is counted.
+                    if let Ok(Some(_)) = wake_tx.force_send(f) {
+                        displaced.fetch_add(1, Ordering::Relaxed);
+                    }
                     let _ = wake.push_custom_event(FrameWake);
                 }
             });
@@ -70,6 +75,7 @@ impl StreamState {
             health_seen: None,
             last_forced: 0,
             store: FrameStore::new(usize::from(priority.fifo_capacity())),
+            forwarder_drops,
             clock: LatchClock::new(native_refresh_hz),
             pacer: SourcePacer::new(),
             source_interval_ns,

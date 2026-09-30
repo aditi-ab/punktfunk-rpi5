@@ -3476,6 +3476,7 @@ dependencies = [
  "wayland-client",
  "wayland-protocols",
  "wayland-sys",
+ "windows 0.62.2 (git+https://github.com/microsoft/windows-rs?rev=acb5a1a7441033d9312b16842af02eb0c2b403dc)",
  "windows-sys 0.61.2",
 ]
 

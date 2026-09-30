@@ -500,6 +500,20 @@ impl Presenter {
             present_wait = present_wait_ok,
             "on-glass present timing (VK_KHR_present_wait)"
         );
+        // No present-wait: the output's vblank stands in, so the gate, the latch grid and
+        // the VRR probe still run; the ledger says `glass=est`.
+        #[cfg(windows)]
+        let vblank_timer = (!present_wait_ok)
+            .then(|| crate::win32::window_monitor(window))
+            .flatten()
+            .and_then(|m| super::vblank_timing::VblankTimer::spawn(device.clone(), m));
+        #[cfg(windows)]
+        if !present_wait_ok {
+            tracing::info!(
+                active = vblank_timer.is_some(),
+                "glass clock from the output's vblank (estimated stamps)"
+            );
+        }
         let hdr_metadata_d =
             has_hdr_metadata.then(|| ash::ext::hdr_metadata::Device::new(&instance, &device));
         // SAFETY: `device` is live; queue 0 of `qfi` was requested at create.
@@ -768,6 +782,8 @@ impl Presenter {
             submitted: false,
             acquired: None,
             present_timer,
+            #[cfg(windows)]
+            vblank_timer,
             next_present_id: 0,
             last_presented: None,
             video_fit: Default::default(),

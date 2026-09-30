@@ -27,6 +27,8 @@ pub(crate) mod gpu;
 mod overlay_pipe;
 mod present;
 mod present_timing;
+#[cfg(windows)]
+mod vblank_timing;
 pub(crate) use present_timing::PresentedSample;
 mod reconfig;
 mod resources;
@@ -307,6 +309,10 @@ pub struct Presenter {
     /// `VK_KHR_present_wait` on-glass timing. `None` without present-id/present-wait;
     /// the run loop then keeps its submit-time display stamp.
     present_timer: Option<present_timing::PresentTimer>,
+    /// The output's vblank as the glass clock where present-wait is missing (AMD on
+    /// Windows). Estimated stamps, `glass=est`.
+    #[cfg(windows)]
+    vblank_timer: Option<vblank_timing::VblankTimer>,
     /// Strictly increasing present id (spec: per swapchain). 0 = none presented with an id.
     next_present_id: u64,
     /// Last successful id-carrying present, awaiting [`Presenter::note_presented`].
@@ -435,7 +441,52 @@ impl Presenter {
     /// the display stamp. The run loop then defers e2e/display windows to
     /// [`Presenter::take_presented_samples`].
     pub(crate) fn present_timing_active(&self) -> bool {
-        self.present_timer.is_some() || self.native_last
+        self.glass_active() || self.native_last
+    }
+
+    /// A glass clock follows the swapchain's presents: present-wait, or the vblank waiter.
+    pub(crate) fn glass_active(&self) -> bool {
+        self.present_timer.is_some() || self.vblank_active()
+    }
+
+    fn vblank_active(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.vblank_timer.is_some()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    /// The display stamps are the vblank waiter's estimate. Good for the grid and the
+    /// ledger; not for counting undisplayed presents, which it confirms a vblank late.
+    pub(crate) fn glass_estimated(&self) -> bool {
+        self.present_timer.is_none() && self.vblank_active() && !self.native_last
+    }
+
+    /// Where the display stamp comes from, for the ledger: `wait` (present-wait), `est`
+    /// (the vblank waiter), `feedback` (the native lane), `none`.
+    pub(crate) fn glass_source(&self) -> &'static str {
+        if self.native_last {
+            "feedback"
+        } else if self.present_timer.is_some() {
+            "wait"
+        } else if self.vblank_active() {
+            "est"
+        } else {
+            "none"
+        }
+    }
+
+    /// The window changed display: the vblank waiter follows it. No-op elsewhere.
+    #[cfg_attr(not(windows), allow(unused_variables))]
+    pub(crate) fn retarget_glass(&self, window: &sdl3::video::Window) {
+        #[cfg(windows)]
+        if let (Some(t), Some(m)) = (&self.vblank_timer, crate::win32::window_monitor(window)) {
+            t.retarget(m);
+        }
     }
 
     /// The native Wayland lane first: `Shown` when the compositor took the dma-buf as the
@@ -1104,28 +1155,40 @@ impl Presenter {
     /// `present()` that returned `true`, with that frame's capture + decode stamps.
     /// No-op when timing is inactive.
     pub(crate) fn note_presented(&mut self, pts_ns: u64, decoded_ns: u64) {
-        if let (Some(t), Some((sc, id))) = (&self.present_timer, self.last_presented.take()) {
-            // Submit stamp: `present()` has returned, so "now" is the present-call tail.
-            // The submit signalled `done_sem` with this id when its GPU work finished.
-            t.enqueue(
-                sc,
-                id,
-                (self.done_sem != vk::Semaphore::null()).then_some((self.done_sem, id)),
-                pts_ns,
-                decoded_ns,
-                pf_client_core::session::now_ns(),
-            );
+        let Some((sc, id)) = self.last_presented.take() else {
+            return;
+        };
+        // Submit stamp: `present()` has returned, so "now" is the present-call tail.
+        // The submit signalled `done_sem` with this id when its GPU work finished.
+        let done = (self.done_sem != vk::Semaphore::null()).then_some((self.done_sem, id));
+        let now_ns = pf_client_core::session::now_ns();
+        if let Some(t) = &self.present_timer {
+            t.enqueue(sc, id, done, pts_ns, decoded_ns, now_ns);
+        }
+        #[cfg(windows)]
+        if let Some(t) = &self.vblank_timer {
+            t.enqueue(done, pts_ns, decoded_ns, now_ns);
         }
     }
 
     /// Undisplayed id-carrying presents in flight (0 when timing is inactive) — the
     /// FIFO glass gate's budget count.
     pub(crate) fn presents_outstanding(&self) -> usize {
-        self.present_timer.as_ref().map_or(0, |t| t.outstanding())
+        let waited = self.present_timer.as_ref().map_or(0, |t| t.outstanding());
+        #[cfg(windows)]
+        let waited = waited + self.vblank_timer.as_ref().map_or(0, |t| t.outstanding());
+        waited
     }
 
     /// Run-loop wake for present completions (SDL event push). No-op without timing.
     pub(crate) fn set_present_wake(&self, cb: Box<dyn Fn() + Send>) {
+        #[cfg(windows)]
+        if self.present_timer.is_none() {
+            if let Some(t) = &self.vblank_timer {
+                t.set_wake(cb);
+            }
+            return;
+        }
         if let Some(t) = &self.present_timer {
             t.set_wake(cb);
         }
@@ -1194,6 +1257,10 @@ impl Presenter {
             .as_ref()
             .map(|t| t.take_samples())
             .unwrap_or_default();
+        #[cfg(windows)]
+        if let Some(t) = &self.vblank_timer {
+            out.extend(t.take_samples());
+        }
         #[cfg(target_os = "linux")]
         if let Some(lane) = self.native.as_mut() {
             out.extend(lane.take_samples().into_iter().map(|s| {
@@ -1246,8 +1313,11 @@ impl Presenter {
 impl Drop for Presenter {
     fn drop(&mut self) {
         // The present-wait waiter holds the swapchain. Drop it (joins in-flight waits,
-        // 250 ms cap in `present_timing`) before swapchain teardown below.
+        // 250 ms cap in `present_timing`) before swapchain teardown below. The vblank
+        // waiter reads `done_sem`: it goes before the semaphore does.
         self.present_timer.take();
+        #[cfg(windows)]
+        self.vblank_timer.take();
         // The ring waits its own copies; the lane's buffers go before the images behind them.
         #[cfg(target_os = "linux")]
         {

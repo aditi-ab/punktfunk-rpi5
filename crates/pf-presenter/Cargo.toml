@@ -59,6 +59,9 @@ rustix = { version = "1", features = ["time"] }
 
 [target.'cfg(windows)'.dependencies]
 sdl3 = { version = "0.18", features = ["hidapi", "ash", "build-from-source"] }
+# The vblank waiter (vk/vblank_timing.rs): DXGI output enumeration + WaitForVBlank, the
+# glass clock where the driver offers no VK_KHR_present_wait.
+windows = { workspace = true, features = ["dxgi", "windef", "minwindef"] }
 # Window branding only (win32.rs): the exe-embedded icon onto the SDL window's title
 # bar/taskbar (WM_SETICON) and the shared AppUserModelID for unpackaged runs, so the
 # shell and the session window group as ONE taskbar app across the visibility handoff. Gdi: the

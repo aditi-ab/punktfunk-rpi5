@@ -378,6 +378,9 @@ struct StreamState {
     /// holds decoder-pool frames up to `buffer` deep on top of the depth-2 wake
     /// channels — headroom for 1..=3; deeper must revisit pool sizing.
     store: FrameStore<Paced>,
+    /// Frames the wake forwarder displaced (three arrivals between two intakes: the loop
+    /// stalled two frame intervals). Drained into `skipped` once a second.
+    forwarder_drops: Arc<std::sync::atomic::AtomicU32>,
     /// Panel latch grid (present-wait glass stamps; submit-anchored fallback). Smoothness
     /// slot clock, and the values published to the host-facing `latch_grid`.
     clock: LatchClock,

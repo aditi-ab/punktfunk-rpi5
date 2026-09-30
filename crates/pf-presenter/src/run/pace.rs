@@ -27,10 +27,12 @@ impl Shell {
         let mut to_present = st.pick(now_ns, self.presenter.present_timing_active());
         // FIFO glass budget: one undisplayed present in flight, so the swapchain's
         // own FIFO can never become a standing queue. Only FIFO modes queue and only
-        // present timing can count; everywhere else this stays inert.
+        // present-wait can count: an estimated stamp confirms a vblank late, and gating
+        // on it spaces presents two or three refreshes apart.
         if self.pacing_active
             && self.presenter.needs_glass_gate()
             && self.presenter.present_timing_active()
+            && !self.presenter.glass_estimated()
         {
             if let Some(f) = to_present.take() {
                 if st.gate.open(self.presenter.presents_outstanding(), now_ns) {
@@ -90,6 +92,7 @@ impl Shell {
         // second `take_counters` would read zeros.
         let (replaced, q_drop, q_dry) = st.store.take_counters();
         let (gated, forced) = st.gate.take_counters();
+        let forwarded = st.forwarder_drops.swap(0, Ordering::Relaxed);
         st.last_forced = forced;
         let present = PresentCounters {
             mode: self.presenter.present_mode_name(),
@@ -99,6 +102,7 @@ impl Shell {
             q_dry,
             gated,
             forced,
+            forwarded,
         };
         let (pace_ms, latch_ms) = close_window(
             st,
@@ -150,11 +154,15 @@ impl Shell {
             tracing::info!(
                 smoothing = present.smoothing,
                 mode = present.mode,
+                // Where the display stamps came from; `none` means the glass fields
+                // below (steps, judder, misses, gated) measured nothing.
+                glass = self.presenter.glass_source(),
                 vrr = present.vrr.label(),
                 native_zero_copy = ?native_zero_copy,
                 replaced,
                 q_drop,
                 q_dry,
+                forwarded = present.forwarded,
                 gated,
                 forced,
                 misses = st.win.misses,
@@ -865,6 +873,8 @@ pub(super) struct PresentCounters {
     pub(super) q_dry: u32,
     pub(super) gated: u32,
     pub(super) forced: u32,
+    /// Wake-forwarder displacements: the loop stalled two frame intervals.
+    pub(super) forwarded: u32,
 }
 
 /// Close the overlay window: the connector's snapshot plus what only the presenter knows,
@@ -879,9 +889,14 @@ pub(super) fn close_window(
     let Some(c) = st.connector.clone() else {
         return (0.0, 0.0);
     };
-    // Replaced before display, or dropped from a full smoothing queue: decoded, never shown.
-    c.hud()
-        .note_skipped(replaced.saturating_add(present.q_drop), 0);
+    // Replaced before display, dropped from a full smoothing queue, or displaced in the
+    // wake forwarder: decoded, never shown.
+    c.hud().note_skipped(
+        replaced
+            .saturating_add(present.q_drop)
+            .saturating_add(present.forwarded),
+        0,
+    );
     let mut snap = c.hud_snapshot();
     snap.decoder = st.facts.decoder.to_string();
     snap.hdr = hdr_shown(st.hdr, presenter.hdr_active(), st.hdr_untonemapped);
@@ -949,6 +964,7 @@ pub(super) fn desktop_extras(
         for (name, n) in [
             ("qdrop", p.q_drop),
             ("qdry", p.q_dry),
+            ("fwd", p.forwarded),
             ("gated", p.gated),
             ("forced", p.forced),
         ] {
@@ -1115,6 +1131,7 @@ mod tests {
             q_dry: 0,
             gated: 0,
             forced: 0,
+            forwarded: 0,
         }
     }
 

@@ -1032,7 +1032,7 @@ impl Presenter {
             }
             // With present timing the submit also signals `done_sem` with the id the
             // present below will carry: the waiter splits our GPU time from the compositor's.
-            let timed = self.present_timer.is_some() && self.done_sem != vk::Semaphore::null();
+            let timed = self.glass_active() && self.done_sem != vk::Semaphore::null();
             if timed {
                 signal_sems.push(self.done_sem);
                 signal_values.push(self.next_present_id + 1);
@@ -1120,8 +1120,12 @@ impl Presenter {
                 .wait_semaphores(&present_sems)
                 .swapchains(&swapchains)
                 .image_indices(&indices);
-            if self.present_timer.is_some() {
+            // The id names the `done_sem` value either way; only present-wait carries it
+            // to the driver.
+            if self.glass_active() {
                 self.next_present_id += 1;
+            }
+            if self.present_timer.is_some() {
                 present_info = present_info.push_next(&mut pid_info);
             }
             let present_started = std::time::Instant::now();
@@ -1137,7 +1141,7 @@ impl Presenter {
             match present_res {
                 Ok(_) => {
                     // A failed present's id may never signal — claim it only on Ok.
-                    if self.present_timer.is_some() {
+                    if self.glass_active() {
                         self.last_presented = Some((self.swapchain, self.next_present_id));
                     }
                     Ok(Presented::Shown)
