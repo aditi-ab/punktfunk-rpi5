@@ -359,6 +359,18 @@ public final class MetalVideoPresenter {
     /// in-shader tone-map keeps the picture from blowing out. 1 (the default) is the safe start.
     private var stagedDisplayHeadroom: CGFloat = 1.0
 
+    /// Deadline pacing's layer handoff. The link thread vends every drawable there and reads the
+    /// layer's format, colour space and EDR metadata as it allocates one, so a write from the
+    /// render thread can free the metadata mid-vend. After `deferLayerWrites`, `writeLayer` queues
+    /// and the link thread applies the queue between vends (`applyLayerWrites`).
+    private let layerWriteLock = NSLock()
+    private var layerWritesDeferred = false
+    private var layerWrites: [(CAMetalLayer) -> Void] = []
+    /// The pixel format and drawable size last written or queued. Render-thread confined: the
+    /// config the next vend carries, which a queued write has not reached the layer with yet.
+    private var layerFormat: MTLPixelFormat = .bgra8Unorm
+    private var layerSize: CGSize?
+
     #if DEBUG
     /// Last logged "decoded→drawable" signature, so the diagnostic logs only on a size/HDR change.
     private var lastSizeSig = ""
@@ -560,47 +572,87 @@ public final class MetalVideoPresenter {
         stagingLock.unlock()
     }
 
-    /// Set the layer's pixel format + colour config for SDR or HDR. MAIN THREAD ONLY. EDR is requested
-    /// on macOS + iOS (the old `#if os(macOS)` guard left iOS EDR half-engaged). tvOS has NO EDR API
+    /// Set the layer's pixel format + colour config for SDR or HDR through `writeLayer`, on
+    /// `configure`'s thread. EDR is requested on macOS + iOS. tvOS has NO EDR API
     /// (`wantsExtendedDynamicRangeContent`/`edrMetadata`/`CAEDRMetadata` are all unavailable there) —
     /// and a bare PQ colour-space tag composites UNtone-mapped (the "overblown HDR" Apple TV report),
     /// so tvOS instead tone-maps PQ→SDR in the shader (pf_frag_hdr_tv) and keeps the SDR layer config.
     private func configureColor(hdr: Bool, tenBitSDR: Bool) {
         if hdr {
             #if os(tvOS)
-            if hdrPassthroughActive {
-                // Display composited WITH HDR headroom (the session's AVDisplayManager request
-                // landed): emit PQ passthrough — in a real HDR10 output that's the correct
-                // emission, and the TV applies its own tone-map.
-                layer.pixelFormat = .rgba16Float
-                layer.colorspace = CGColorSpace(name: CGColorSpace.itur_2100_PQ)
-            } else {
-                // SDR-composited display: PQ would render untone-mapped (blown out) — the
-                // pf_frag_hdr_tv shader tone-maps to SDR instead. Its output is BT.709, so it
-                // carries the same SDR tag as a genuinely SDR session.
-                layer.pixelFormat = .bgra8Unorm
-                layer.colorspace = sdrColorspace
+            // With HDR headroom (the session's AVDisplayManager request landed) PQ passes through
+            // and the TV tone-maps. Without it PQ would composite blown out, so pf_frag_hdr_tv
+            // tone-maps to BT.709 and the layer carries the SDR tag.
+            let passthrough = hdrPassthroughActive
+            let format: MTLPixelFormat = passthrough ? .rgba16Float : .bgra8Unorm
+            let space = passthrough ? CGColorSpace(name: CGColorSpace.itur_2100_PQ) : sdrColorspace
+            layerFormat = format
+            writeLayer {
+                $0.pixelFormat = format
+                $0.colorspace = space
             }
             #else
-            layer.pixelFormat = .rgba16Float
-            layer.colorspace = CGColorSpace(name: CGColorSpace.itur_2100_PQ)
-            layer.wantsExtendedDynamicRangeContent = true
             // Anchor reference white. Re-apply the real grade if one already arrived (0xCE before the
             // flip); otherwise the bare 203-nit anchor. Without this anchor the PQ signal is too bright.
-            layer.edrMetadata = makeEDR(lastHdrMeta)
+            let edr = makeEDR(lastHdrMeta)
+            layerFormat = .rgba16Float
+            writeLayer {
+                $0.pixelFormat = .rgba16Float
+                $0.colorspace = CGColorSpace(name: CGColorSpace.itur_2100_PQ)
+                $0.wantsExtendedDynamicRangeContent = true
+                $0.edrMetadata = edr
+            }
             #endif
         } else {
             // SDR: gamma-encoded BT.709 [0,1], tagged so CoreAnimation colour-matches it into
             // the output rather than drawing it in the panel's native space (see sdrColorspace;
             // PUNKTFUNK_SDR_COLORSPACE=none restores untagged). A 10-bit session takes the
             // 10-bit drawable so the decode's depth reaches the panel.
-            layer.pixelFormat = tenBitSDR ? sdr10Drawable : .bgra8Unorm
-            layer.colorspace = sdrColorspace
-            #if !os(tvOS)
-            layer.wantsExtendedDynamicRangeContent = false
-            layer.edrMetadata = nil
-            #endif
+            let format = tenBitSDR ? sdr10Drawable : .bgra8Unorm
+            layerFormat = format
+            writeLayer {
+                $0.pixelFormat = format
+                $0.colorspace = sdrColorspace
+                #if !os(tvOS)
+                $0.wantsExtendedDynamicRangeContent = false
+                $0.edrMetadata = nil
+                #endif
+            }
         }
+    }
+
+    /// Apply `write` to the layer now, or queue it for the link thread once `deferLayerWrites`
+    /// ran. Queued writes apply in order.
+    private func writeLayer(_ write: @escaping (CAMetalLayer) -> Void) {
+        layerWriteLock.lock()
+        defer { layerWriteLock.unlock() }
+        if layerWritesDeferred { layerWrites.append(write) } else { write(layer) }
+    }
+
+    /// Deadline pacing, RENDER THREAD, before the link starts: every later layer write queues
+    /// for `applyLayerWrites`. The layer already carries the first frame's config.
+    func deferLayerWrites() {
+        layerWriteLock.lock()
+        layerWritesDeferred = true
+        layerWriteLock.unlock()
+    }
+
+    /// Deadline pacing, LINK THREAD, once per update: apply the queued writes. The update's
+    /// drawable is already vended, so they reach the next vend and never race one.
+    func applyLayerWrites() {
+        layerWriteLock.lock()
+        let writes = layerWrites
+        layerWrites.removeAll()
+        layerWriteLock.unlock()
+        for write in writes { write(layer) }
+    }
+
+    /// Size the next drawable. Compared against the last requested size, not the layer's: a
+    /// queued write has not reached the layer yet.
+    private func sizeLayer(_ size: CGSize) {
+        guard layerSize != size else { return }
+        layerSize = size
+        writeLayer { $0.drawableSize = size }
     }
 
     #if !os(tvOS)
@@ -641,23 +693,12 @@ public final class MetalVideoPresenter {
         stagingLock.unlock()
     }
 
-    /// Deadline pacing only, RENDER THREAD: reconcile the layer with a decoded frame BEFORE a
-    /// drawable exists. The link vends from the layer's CURRENT config, and the layer starts
-    /// with `drawableSize` 0 (it never tracks bounds once set explicitly, and the sublayer's
-    /// frame isn't even laid out when the link spins up) — so leaving all reconciliation to the
-    /// render path (which needs a frame AND a vended drawable) deadlocks at session start:
-    /// every vend fails allocation at 0×0, the stash stays empty, no pair ever completes, and
-    /// the size is never set. The 2026-07-19 iPad black screen ("[CAMetalLayer nextDrawable]
-    /// returning nil because allocation failed" every refresh). Called on EVERY frame arrival:
-    /// drains the same staging the render path drains (both are idempotent about it) and
-    /// applies size + HDR config, so the next vend always matches the frame about to present —
-    /// this also makes a mid-session HDR flip cost at most one skipped vend instead of waiting
-    /// for a paired present to retag the layer.
-    /// Drain the staged HDR grade and apply it. RENDER THREAD (or `reconcileLayer`'s caller):
-    /// idempotent, so every present path can call it and the first one to run wins. Every path
-    /// must — a stream whose path skipped it tone-maps against the bare reference-white anchor
-    /// with no mastering volume for the whole session. The host repeats the grade on every
-    /// keyframe (every PyroWave frame); an unchanged one leaves the layer alone.
+    /// Drain the staged HDR grade and apply it through `writeLayer`. RENDER THREAD (or
+    /// `reconcileLayer`'s caller): idempotent, so every present path can call it and the first
+    /// one to run wins. Every path must — a stream whose path skipped it tone-maps against the
+    /// bare reference-white anchor with no mastering volume for the whole session. The host
+    /// repeats the grade on every keyframe (every PyroWave frame); an unchanged one leaves the
+    /// layer alone.
     private func applyStagedHdrMeta() {
         stagingLock.lock()
         let newHdrMeta = pendingHdrMeta
@@ -668,7 +709,10 @@ public final class MetalVideoPresenter {
         // tvOS has no edrMetadata — the cached grade still matters for a later flip's
         // configureColor. macOS/iOS refine the live tone-map now.
         #if !os(tvOS)
-        if hdrActive { layer.edrMetadata = makeEDR(newHdrMeta) }
+        if hdrActive {
+            let edr = makeEDR(newHdrMeta)
+            writeLayer { $0.edrMetadata = edr }
+        }
         #endif
     }
 
@@ -681,15 +725,20 @@ public final class MetalVideoPresenter {
             || pf == kCVPixelFormatType_444YpCbCr10BiPlanarFullRange
     }
 
+    /// Deadline pacing, RENDER THREAD, on every frame arrival: bring the layer's size and colour
+    /// config in line with the frame before a drawable exists. The link vends from the layer's
+    /// current config, and the layer starts at `drawableSize` 0×0, where every vend fails
+    /// allocation — so the first frame's reconcile is what lets the first vend succeed. Drains
+    /// the same staging as the render path; both are idempotent about it.
     func reconcileLayer(decodedSize: CGSize, isHDR: Bool, tenBitSDR: Bool = false) {
         stagingLock.lock()
         let targetFromLayout = drawableTarget
         stagingLock.unlock()
         configure(hdr: isHDR, tenBitSDR: tenBitSDR)
         applyStagedHdrMeta()
-        let targetSize = (targetFromLayout.width > 0 && targetFromLayout.height > 0)
-            ? targetFromLayout : decodedSize
-        if layer.drawableSize != targetSize { layer.drawableSize = targetSize }
+        sizeLayer(
+            (targetFromLayout.width > 0 && targetFromLayout.height > 0)
+                ? targetFromLayout : decodedSize)
     }
 
     /// Draw one decoded frame to the next drawable and present it. RENDER THREAD;
@@ -812,10 +861,10 @@ public final class MetalVideoPresenter {
     ///
     /// `providedDrawable` (deadline pacing) is the CAMetalDisplayLink-vended drawable to render
     /// into instead of `nextDrawable()`. It was vended against the layer's config at vend time,
-    /// so after a mid-session reconfigure (HDR flip: `configure` above already retagged the
-    /// layer) its pixel format can lag the pipeline's attachment format — encoding would be a
-    /// Metal validation failure. The guard returns false instead: the drawable drops back to
-    /// the pool, the caller re-rings the frame, and the link's next vend carries the new format.
+    /// so after a mid-session reconfigure (HDR flip) its pixel format can lag `layerFormat`, the
+    /// pipeline's attachment format — encoding would be a Metal validation failure. The guard
+    /// returns false instead: the drawable drops back to the pool, the caller re-rings the frame,
+    /// and a vend after the link applied the queued write carries the new format.
     private func encodePresent(
         decodedSize: CGSize, targetFromLayout: CGSize, pipeline: MTLRenderPipelineState,
         presentAtMediaTime: CFTimeInterval?, providedDrawable: CAMetalDrawable? = nil,
@@ -829,13 +878,12 @@ public final class MetalVideoPresenter {
             ? targetFromLayout : decodedSize
         // Under a provided (link-vended) drawable this sizes the NEXT vend — the one in hand
         // keeps its size, and a live-resize transient composites via contentsGravity as ever.
-        if layer.drawableSize != targetSize { layer.drawableSize = targetSize }
+        sizeLayer(targetSize)
         #if DEBUG
         logSizeIfChanged(decoded: decodedSize, drawable: targetSize)
         #endif
-        if let providedDrawable,
-           providedDrawable.texture.pixelFormat != layer.pixelFormat {
-            return false // config outran the vend (HDR flip) — next vend has the new format
+        if let providedDrawable, providedDrawable.texture.pixelFormat != layerFormat {
+            return false // config outran the vend (HDR flip) — a later vend has the new format
         }
         guard let drawable = providedDrawable ?? layer.nextDrawable(),
               let commandBuffer = queue.makeCommandBuffer()

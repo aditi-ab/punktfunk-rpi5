@@ -44,6 +44,23 @@ final class MetalPresenterTests: XCTestCase {
         XCTAssertNil(presenter.layer.edrMetadata)
     }
 
+    /// Deadline pacing: once the link vends, layer writes wait for the link thread to apply them
+    /// between vends, in order.
+    func testDeferredLayerWritesWaitForTheLink() throws {
+        guard let presenter = MetalVideoPresenter.make() else {
+            throw XCTSkip("no Metal device available in this environment")
+        }
+        presenter.configure(hdr: false)
+        presenter.deferLayerWrites()
+        presenter.reconcileLayer(decodedSize: CGSize(width: 64, height: 32), isHDR: true)
+        XCTAssertEqual(presenter.layer.pixelFormat, .bgra8Unorm, "a queued write leaves the layer")
+        XCTAssertNil(presenter.layer.edrMetadata)
+        presenter.applyLayerWrites()
+        XCTAssertEqual(presenter.layer.pixelFormat, .rgba16Float)
+        XCTAssertNotNil(presenter.layer.edrMetadata)
+        XCTAssertEqual(presenter.layer.drawableSize, CGSize(width: 64, height: 32))
+    }
+
     /// A 10-bit SDR session presents through the 10-bit SDR drawable: sRGB-tagged like 8-bit SDR,
     /// no EDR, no metadata — and the layer must actually vend that format, which is the one thing
     /// the SDK's stale "two supported values" comment cannot tell us. HDR outranks the depth flag,
