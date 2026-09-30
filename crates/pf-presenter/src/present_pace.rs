@@ -288,6 +288,9 @@ pub(crate) struct CadenceProbe {
     candidate: Cadence,
     agree_rounds: u8,
     verdict: Cadence,
+    /// The output's own vblank spacing reads off the mode period, or on it; `None` where no
+    /// waiter measures it. It outranks the stamps ([`CadenceProbe::note_refresh`]).
+    refresh_variable: Option<bool>,
 }
 
 /// Enough deltas to distinguish jitter from a real off-grid cadence.
@@ -310,6 +313,21 @@ impl CadenceProbe {
             candidate: Cadence::Unknown,
             agree_rounds: 0,
             verdict: Cadence::Unknown,
+            refresh_variable: None,
+        }
+    }
+
+    /// The output's measured vblank spacing, where a waiter reads it. A fixed panel
+    /// refreshes at its mode period whatever is presented, so a spacing well off it is
+    /// variable refresh — also at a whole divisor of the mode rate (60 on 120), where
+    /// present stamps alone read as grid-locked. At the mode period the panel is fixed,
+    /// or a variable one runs flat out: nothing to pace either way.
+    pub(crate) fn note_refresh(&mut self, refresh_ns: u64, mode_period_ns: u64) {
+        // 10 % on, 3 % off: a stream hovering at the panel's top rate does not flap.
+        if refresh_ns * 100 > mode_period_ns * 110 {
+            self.refresh_variable = Some(true);
+        } else if refresh_ns * 100 < mode_period_ns * 103 || self.refresh_variable.is_none() {
+            self.refresh_variable = Some(false);
         }
     }
 
@@ -365,7 +383,11 @@ impl CadenceProbe {
     }
 
     pub(crate) fn verdict(&self) -> Cadence {
-        self.verdict
+        match self.refresh_variable {
+            Some(true) => Cadence::Variable,
+            Some(false) => Cadence::Fixed,
+            None => self.verdict,
+        }
     }
 
     /// A mode switch or display change invalidates the evidence.
@@ -375,6 +397,7 @@ impl CadenceProbe {
         self.candidate = Cadence::Unknown;
         self.agree_rounds = 0;
         self.verdict = Cadence::Unknown;
+        self.refresh_variable = None;
     }
 }
 
@@ -846,6 +869,38 @@ mod tests {
             .collect();
         probe.note(&stamps, 0, true);
         assert_eq!(probe.verdict(), Cadence::Unknown);
+    }
+
+    /// Half the mode rate on a VRR panel: the stamps sit on the mode grid, the output's
+    /// own refresh does not. Where it is measured it decides, both ways.
+    #[test]
+    fn a_measured_refresh_outranks_the_stamps() {
+        const P: u64 = 6_060_606;
+        let mut p = CadenceProbe::new();
+        let stamps: Vec<u64> = (1..=60).map(|i| i * 2 * P).collect();
+        p.note(&stamps, P, true);
+        assert_eq!(p.verdict(), Cadence::Fixed, "stamps alone: on the grid");
+        p.note_refresh(2 * P, P);
+        assert_eq!(p.verdict(), Cadence::Variable);
+        p.note_refresh(P + P / 20, P);
+        assert_eq!(
+            p.verdict(),
+            Cadence::Variable,
+            "5 % off: inside the hysteresis"
+        );
+        p.note_refresh(P, P);
+        assert_eq!(
+            p.verdict(),
+            Cadence::Fixed,
+            "at the mode period: nothing to pace"
+        );
+        let mut fresh = CadenceProbe::new();
+        fresh.note_refresh(P + P / 20, P);
+        assert_eq!(
+            fresh.verdict(),
+            Cadence::Fixed,
+            "first reading, inside the band"
+        );
     }
 
     /// Batching must not change the verdict: live drain is one stamp, tests hand over

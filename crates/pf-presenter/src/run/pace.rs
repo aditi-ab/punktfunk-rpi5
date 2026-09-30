@@ -23,6 +23,11 @@ impl Shell {
             }
         }
         st.intake();
+        if let Some(refresh_ns) = self.presenter.measured_refresh_ns() {
+            if self.presenter.vblank_locked() {
+                st.cadence.note_refresh(refresh_ns, st.mode_period_ns);
+            }
+        }
         let now_ns = session::now_ns();
         // An estimated stamp is a measurement, never a pacing input: on a VRR panel the
         // vblanks it reads follow our own presents, and a grid built on them chases itself.
@@ -191,6 +196,8 @@ impl Shell {
                 acquire_max_us = acquire.max_us,
                 present_us = queue_present.p50_us,
                 period_us = st.clock.period_ns() / 1000,
+                // The output's own vblank spacing where a waiter measures it; 0 elsewhere.
+                refresh_us = self.presenter.measured_refresh_ns().unwrap_or(0) / 1000,
                 margin_us = st.margin_ns / 1000,
                 // Hand-over to first latch: what it takes, the window's median,
                 // and the frames that landed a latch later all the same.

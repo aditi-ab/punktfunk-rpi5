@@ -472,6 +472,19 @@ impl Presenter {
         self.present_timer.is_none() && self.vblank_active() && !self.native_last
     }
 
+    /// The output's own vblank spacing, where a vblank waiter measures it.
+    pub(crate) fn measured_refresh_ns(&self) -> Option<u64> {
+        #[cfg(windows)]
+        {
+            let t = self.vblank_timer.as_ref()?;
+            Some(t.refresh_ns()).filter(|&p| p > 0)
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
     /// Where the display stamp comes from, for the ledger: `wait` (present-wait), `est`
     /// (the vblank waiter), `feedback` (the native lane), `none`.
     pub(crate) fn glass_source(&self) -> &'static str {

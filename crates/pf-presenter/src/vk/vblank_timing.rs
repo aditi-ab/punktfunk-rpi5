@@ -6,13 +6,14 @@
 //! vblank after it was submitted with its GPU work done, one present per vblank. An
 //! estimate, labelled `glass=est`: it feeds the latch grid, the VRR probe and the
 //! ledger, and never the glass gate — it confirms too late to pace on. Under variable
-//! refresh the vblanks follow the presents, which is what the cadence probe reads.
+//! refresh the vblanks follow the presents; the waiter publishes their spacing, the one
+//! direct reading of the panel's refresh this path has.
 //!
 //! Never touches the swapchain, so no drain before a swapchain teardown. It reads the
 //! presenter's `done_sem` only, which outlives it: the presenter drops this waiter first.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -46,10 +47,15 @@ pub(crate) struct VblankTimer {
     /// Enqueued and not yet on glass: the glass gate's in-flight count.
     pending: Arc<AtomicUsize>,
     results: Arc<Mutex<Vec<PresentedSample>>>,
+    /// Median spacing of the last [`REFRESH_SPANS`] vblanks; 0 until measured.
+    refresh_ns: Arc<AtomicU64>,
     wake: WakeSlot,
     stop: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
 }
+
+/// Vblank spacings per published median: a tenth of a second at 165 Hz.
+const REFRESH_SPANS: usize = 16;
 
 /// The DXGI output whose monitor is `monitor`, on any adapter: a hybrid box scans out on
 /// one of them.
@@ -99,6 +105,7 @@ fn run(
     ready_tx: mpsc::Sender<bool>,
     pending: Arc<AtomicUsize>,
     results: Arc<Mutex<Vec<PresentedSample>>>,
+    refresh_ns: Arc<AtomicU64>,
     wake: WakeSlot,
     stop: Arc<AtomicBool>,
 ) {
@@ -109,6 +116,8 @@ fn run(
         return;
     }
     let mut queue: VecDeque<Job> = VecDeque::new();
+    let mut last_vblank_ns = 0u64;
+    let mut spans: Vec<u64> = Vec::with_capacity(REFRESH_SPANS);
     while !stop.load(Ordering::Acquire) {
         // SAFETY: a COM call on the live output; it blocks until the monitor's next vblank.
         let waited = output
@@ -120,6 +129,18 @@ fn run(
             std::thread::sleep(Duration::from_millis(16));
         }
         let vblank_ns = pf_client_core::session::now_ns();
+        if !waited {
+            spans.clear();
+            refresh_ns.store(0, Ordering::Relaxed);
+        } else if last_vblank_ns != 0 {
+            spans.push(vblank_ns.saturating_sub(last_vblank_ns));
+            if spans.len() == REFRESH_SPANS {
+                spans.sort_unstable();
+                refresh_ns.store(spans[REFRESH_SPANS / 2], Ordering::Relaxed);
+                spans.clear();
+            }
+        }
+        last_vblank_ns = if waited { vblank_ns } else { 0 };
         // Presents handed over during the wait are candidates for this vblank too.
         loop {
             match rx.try_recv() {
@@ -171,17 +192,19 @@ impl VblankTimer {
         let (ready_tx, ready_rx) = mpsc::channel::<bool>();
         let pending = Arc::new(AtomicUsize::new(0));
         let results = Arc::new(Mutex::new(Vec::with_capacity(256)));
+        let refresh_ns = Arc::new(AtomicU64::new(0));
         let wake: WakeSlot = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         let (pending_t, results_t, wake_t, stop_t) =
             (pending.clone(), results.clone(), wake.clone(), stop.clone());
+        let refresh_t = refresh_ns.clone();
         let join = std::thread::Builder::new()
             .name("pf-vblank".into())
             .spawn(move || {
                 // The stamp is taken at wake; scheduler delay would read as latch.
                 pf_client_core::audio_rt::boost_and_log("vblank");
                 run(
-                    device, monitor, rx, ready_tx, pending_t, results_t, wake_t, stop_t,
+                    device, monitor, rx, ready_tx, pending_t, results_t, refresh_t, wake_t, stop_t,
                 );
             })
             .expect("spawn pf-vblank");
@@ -192,6 +215,7 @@ impl VblankTimer {
             tx: Some(tx),
             pending,
             results,
+            refresh_ns,
             wake,
             stop,
             join: Some(join),
@@ -201,6 +225,11 @@ impl VblankTimer {
 
     pub(crate) fn set_wake(&self, cb: Box<dyn Fn() + Send>) {
         *self.wake.lock().unwrap() = Some(cb);
+    }
+
+    /// The output's measured refresh spacing; 0 until a median exists.
+    pub(crate) fn refresh_ns(&self) -> u64 {
+        self.refresh_ns.load(Ordering::Relaxed)
     }
 
     /// Presents not yet on glass by the estimate, plus any that will drop out stale.
