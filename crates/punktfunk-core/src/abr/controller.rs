@@ -15,9 +15,9 @@
 //! similar decode-driven backoffs latch `decode_cap_kbps`, and so does decode
 //! headroom on a clean window (park at 80 % of the frame budget, retreat a
 //! notch at 90 %, each step kept only if the decoder's latency follows the
-//! rate). Both re-probe on [`CAP_REPROBE_WINDOWS_MIN`]. Climbs require
-//! utilization (delivered ≈ target) and stay within ×1.5 of the windowed
-//! proven mark. Tests in this module pin the contract.
+//! rate; one that does not stands the decode signal down). Both re-probe on
+//! [`CAP_REPROBE_WINDOWS_MIN`]. Climbs require utilization (delivered ≈
+//! target) and stay within ×1.5 of the windowed proven mark. Tests pin this.
 
 use super::cap::{LearnedCap, StandDown, StepProbe};
 use super::growth::{self, Proven, CLEAN_WINDOWS_TO_INCREASE};
@@ -189,6 +189,12 @@ fn notch(from_kbps: u32, floor_kbps: u32) -> u32 {
 /// is the signal that named it, and no loss share came with it.
 fn encode_named(w: &WindowSample, v: &Verdict) -> bool {
     v.reason == Reason::Encode && w.loss_ppm < HEAVY_LOSS_PPM
+}
+
+/// This window's damage is the client decoder's and nothing else's: decode
+/// latency is the signal that named it, and no loss share came with it.
+fn decode_named(w: &WindowSample, v: &Verdict) -> bool {
+    v.reason == Reason::Decode && w.loss_ppm < HEAVY_LOSS_PPM
 }
 
 /// One decision per report window; `Some(kbps)` = send a [`crate::quic::SetBitrate`].
@@ -517,28 +523,41 @@ impl BitrateController {
         );
     }
 
-    /// Decode headroom on a clean full-rate window. First the verdict on a
-    /// step in flight, then the bands: park at [`DECODE_HOLD_PCT`], retreat a
-    /// notch at [`DECODE_RETREAT_PCT`]. `Some` is a rate to request.
-    fn judge_decode_headroom(&mut self, mean_us: i64, budget_us: i64, now: Instant) -> Option<u32> {
-        if let Some(mut p) = self.decode_probe {
-            let at_new_rate = match p.kind {
-                DecodeProbeKind::Retreat => self.current_kbps < p.step.from_kbps,
-                DecodeProbeKind::Lift => self.current_kbps > p.step.from_kbps,
-            };
-            let verdict = p.step.note(at_new_rate.then_some(mean_us));
-            let expired = p.step.expired();
-            self.decode_probe = Some(p);
-            let Some(mean) = verdict else {
-                if expired {
-                    self.decode_probe = None; // the step never reached its rate
-                }
-                return None;
-            };
-            self.decode_probe = None;
-            if let Some(kbps) = self.settle_decode_step(p, mean, budget_us, now) {
-                return Some(kbps);
+    /// The decoder's answer to a headroom step, one window at a time, damaged
+    /// windows included: the latency at the new rate is the answer whatever
+    /// else the window carried. A quiet or starved window's mean describes an
+    /// interruption, a flush's the jump-to-live and a low-fps window's a
+    /// bigger frame; none is a reading at the new rate, but time passes.
+    fn judge_decode_step(&mut self, w: &WindowSample, v: &Verdict) -> Option<u32> {
+        let mut p = self.decode_probe?;
+        let budget_us = self.frame_budget_us?;
+        let at_new_rate = match p.kind {
+            DecodeProbeKind::Retreat => self.current_kbps < p.step.from_kbps,
+            DecodeProbeKind::Lift => self.current_kbps > p.step.from_kbps,
+        };
+        let mean_us = v.decode_mean_us.filter(|_| {
+            at_new_rate && !v.quiet && !v.starved && !w.flushed && self.full_rate(w, budget_us)
+        });
+        let verdict = p.step.note(mean_us);
+        let expired = p.step.expired();
+        self.decode_probe = Some(p);
+        let Some(mean) = verdict else {
+            if expired {
+                self.decode_probe = None; // the step never reached its rate
             }
+            return None;
+        };
+        self.decode_probe = None;
+        self.settle_decode_step(p, mean, budget_us, w.now)
+    }
+
+    /// Decode headroom on a clean full-rate window, the bands: park at
+    /// [`DECODE_HOLD_PCT`], retreat a notch at [`DECODE_RETREAT_PCT`]. `Some`
+    /// is a rate to request. `None` while a step is still being judged: the
+    /// step in flight owns the question.
+    fn judge_decode_headroom(&mut self, mean_us: i64, budget_us: i64, now: Instant) -> Option<u32> {
+        if self.decode_probe.is_some() {
+            return None;
         }
         if self.decode_headroom.disarmed() {
             if self.decode_headroom.note_clean() {
@@ -582,9 +601,9 @@ impl BitrateController {
         None
     }
 
-    /// The decoder's answer to a step, averaged over its clean windows at the
-    /// new rate. `Some` gives the rate back; `None` keeps the step, and this
-    /// window is fresh evidence for the bands.
+    /// The decoder's answer to a step, averaged over the windows that reached
+    /// the new rate. `Some` gives the rate back; `None` keeps the step, and
+    /// this window is fresh evidence for the bands.
     fn settle_decode_step(
         &mut self,
         p: DecodeProbe,
@@ -605,11 +624,17 @@ impl BitrateController {
                 None
             }
             DecodeProbeKind::Retreat => {
-                // Latency is not a function of the rate here: pipelined
-                // decoder, or something else on the SoC. Give the rate
-                // back and stand down; the cap ladder still probes up.
+                // Latency is not a function of the rate: a pipelined decoder,
+                // or something else on the SoC. Give the rate back, stand the
+                // driver down and withhold its verdict; the cap the bands parked
+                // and the cuts they named were not the rate's either.
                 self.decode_headroom.disarm();
-                self.decode_cap.park(p.step.from_kbps);
+                self.baselines.clear_decode();
+                self.decode_backoff_kbps = 0;
+                if self.streak_cut == Some(Reason::Decode) {
+                    self.rate_verdict = false;
+                }
+                self.decode_cap.drop_cap();
                 tracing::info!(
                     restore_kbps = p.step.from_kbps,
                     decode_us = mean,
@@ -847,6 +872,7 @@ impl BitrateController {
             self.current_kbps,
             self.frame_budget_us,
             self.encode_down.disarmed(),
+            self.decode_headroom.disarmed(),
             self.clean_windows,
             draining,
             self.link_vouches_for(w),
@@ -871,6 +897,9 @@ impl BitrateController {
             return Some(kbps);
         }
         if let Some(kbps) = self.judge_encode_step(w, &v) {
+            return Some(kbps);
+        }
+        if let Some(kbps) = self.judge_decode_step(w, &v) {
             return Some(kbps);
         }
         if (self.bad_windows >= BAD_WINDOWS_TO_DECREASE || (v.severe && self.bad_windows >= 1))
@@ -1226,13 +1255,16 @@ impl BitrateController {
         if v.bad {
             // What the rate is the lever for, read before the streaks move:
             // loss share, a delay rise, a flush, drops the clean run does not
-            // vouch for, and a decoder past its budget. Keyframe asks, host
-            // encode and one lost frame behind a clean window are not.
+            // vouch for, and a decoder past its budget. Keyframe asks and one
+            // lost frame behind a clean window are not.
             let repeated_drops = w.dropped > 1 || (w.dropped == 1 && self.clean_windows == 0);
             let link = w.loss_ppm >= HEAVY_LOSS_PPM || v.owd_bad || w.flushed || repeated_drops;
             // A decoder past its budget is a rate verdict but not a link one:
-            // the link delivered, the client could not decode it.
-            self.rate_verdict = link || v.decode_bad;
+            // the link delivered, the client could not decode it. Host encode
+            // says nothing until its notch is answered: the answer writes this.
+            if v.reason != Reason::Encode {
+                self.rate_verdict = link || v.decode_bad;
+            }
             // The link showed itself in one of two ways: a queue filling on
             // this session's own delay floor, or a window that carried less
             // than it was asked for. A link with room shows neither, so
@@ -1252,14 +1284,16 @@ impl BitrateController {
             }
             self.clean_windows = 0;
             self.decode_headroom.note_bad();
-            // A lift that ran into damage failed; a retreat learns nothing here.
-            match self.decode_probe.take() {
-                Some(p)
-                    if p.kind == DecodeProbeKind::Lift && self.current_kbps > p.step.from_kbps =>
-                {
+            // A lift that ran into damage failed. A retreat is answered by the
+            // latency at its new rate, this window's included.
+            if let Some(p) = self
+                .decode_probe
+                .filter(|p| p.kind == DecodeProbeKind::Lift)
+            {
+                self.decode_probe = None;
+                if self.current_kbps > p.step.from_kbps {
                     self.undo_decode_lift(p, v.decode_mean_us.unwrap_or(p.step.ref_us));
                 }
-                _ => {}
             }
             // Any congestion ends slow start until a later idle-onset re-arm.
             self.probing = false;
@@ -1438,8 +1472,20 @@ impl BitrateController {
 
     /// The ×0.7 step, and what this window taught on the way down: a decoder
     /// knee when the evidence is the decoder's, a host-encode level when the
-    /// encoder is the only explanation.
+    /// encoder is the only explanation. Nothing while a decode step at its new
+    /// rate is still being judged on this same latency.
     fn back_off(&mut self, w: &WindowSample, v: &Verdict) -> Option<u32> {
+        // A decode step at its new rate owns the question: this window's
+        // latency is its answer, not a second cut. Any other cut moves the
+        // rate from under the step, so the step is dropped.
+        if decode_named(w, v)
+            && self
+                .decode_probe
+                .is_some_and(|p| self.current_kbps < p.step.from_kbps)
+        {
+            return None;
+        }
+        self.decode_probe = None;
         if encode_named(w, v) {
             return self.retreat_encode(w);
         }
@@ -1636,17 +1682,22 @@ impl BitrateController {
     fn judge_headroom(&mut self, w: &WindowSample, v: &Verdict) -> Option<u32> {
         let budget_us = self.frame_budget_us?;
         let mean_us = v.decode_mean_us?;
-        let full_rate = match w.activity {
+        if budget_us <= 0 || v.bad || v.quiet || v.starved || !self.full_rate(w, budget_us) {
+            return None;
+        }
+        self.judge_decode_headroom(mean_us, budget_us, w.now)
+    }
+
+    /// Enough frames for the window's decode mean to describe the full-rate
+    /// load: ≥ ¾ of the refresh's frames. Fewer share the same bits.
+    fn full_rate(&self, w: &WindowSample, budget_us: i64) -> bool {
+        match w.activity {
             WindowActivity::Active(n) if budget_us > 0 => {
                 i64::from(n) * DECODE_FULL_RATE_DEN
                     >= (sample::WINDOW_US / budget_us) * DECODE_FULL_RATE_NUM
             }
             _ => true,
-        };
-        if budget_us <= 0 || v.bad || v.quiet || v.starved || !full_rate {
-            return None;
         }
-        self.judge_decode_headroom(mean_us, budget_us, w.now)
     }
 
     /// A clean window under the ceilings: come down to a ceiling this session
@@ -3207,10 +3258,66 @@ mod tests {
         let restore = until_request(&mut c, start, &mut t, 7_800, 6).expect("restore");
         assert_eq!(restore, 100_000);
         assert!(c.decode_headroom.disarmed());
-        assert_eq!(c.decode_cap.kbps(), Some(100_000));
-        // Stood down: the same 93 % no longer retreats.
-        assert_eq!(until_request(&mut c, start, &mut t, 7_800, 10), None);
-        assert_eq!(c.current_kbps, 100_000);
+        // No cap either: the bands parked one on a level the rate does not move.
+        assert_eq!(c.decode_cap.kbps(), None);
+        // Stood down: the same 93 % no longer retreats, and the climb is free.
+        for _ in 0..10 {
+            if let Some(k) = loaded(&mut c, ticks(start, t), 7_800) {
+                assert!(k > c.current_kbps, "only climbs, never a retreat");
+                c.on_ack(k, None);
+            }
+            t += 1;
+        }
+        assert!(c.current_kbps >= 100_000);
+    }
+
+    /// The field trace: a pipelined decoder whose latency swings at every
+    /// rate. Each swing is a severe rise over the rolling minimum, so the
+    /// retreat has to be answered through the damage, and once the driver
+    /// has stood down the swing cuts nothing.
+    #[test]
+    fn a_swinging_decoder_answers_the_retreat_and_stops_cutting_once_stood_down() {
+        let (mut c, start, mut t) = seeded_120(100_000);
+        // 7 800 µs: 93 % — one notch, the step pending.
+        let r = loaded(&mut c, ticks(start, t), 7_800).expect("retreat");
+        t += 1;
+        assert_eq!(r, 87_500);
+        c.on_ack(r, None);
+        // 21 000 µs is severe over the 7 800 floor, inside the cooldown and
+        // past it. Neither window cuts: the step owns the question.
+        assert_eq!(loaded(&mut c, ticks(start, t), 21_000), None);
+        t += 1;
+        assert_eq!(
+            loaded(&mut c, ticks(start, t), 21_000),
+            None,
+            "a cut over the step"
+        );
+        t += 1;
+        assert!(c.decode_probe.is_some(), "the step survives the damage");
+        // Its second window at the new rate answers: 14 400 mean, over the
+        // reference — not the rate's. The rate comes back, the driver stands down.
+        assert_eq!(loaded(&mut c, ticks(start, t), 7_800), Some(100_000));
+        t += 1;
+        c.on_ack(100_000, None);
+        assert!(c.decode_headroom.disarmed());
+        assert_eq!(
+            c.decode_cap.kbps(),
+            None,
+            "no cap on a level the rate does not move"
+        );
+        assert!(
+            !c.rate_verdict,
+            "the cuts on this latency were not the rate's"
+        );
+        // Stood down: the swing is no verdict.
+        for _ in 0..8 {
+            if let Some(k) = loaded(&mut c, ticks(start, t), 21_000) {
+                assert!(k > c.current_kbps, "only climbs, never a cut");
+                c.on_ack(k, None);
+            }
+            t += 1;
+        }
+        assert!(c.current_kbps >= 100_000);
     }
 
     #[test]
