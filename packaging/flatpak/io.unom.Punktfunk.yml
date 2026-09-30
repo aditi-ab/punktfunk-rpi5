@@ -323,20 +323,16 @@ modules:
         # placeholders needed: a template without them is used verbatim.
         SKIA_BINARIES_URL: file:///run/build/punktfunk-client/skia-binaries.tar.gz
     build-commands:
-      # Drop every reference to the windows-rs GIT dependency before building. That git
-      # source is deliberately NOT vendored into cargo-sources.json — see
-      # packaging/flatpak/prune-windows-lock.py, which strips it so flatpak-builder doesn't
-      # full-clone the multi-GB windows-rs repo. But `cargo --offline` needs every DECLARED
-      # dependency's source just to build the unit graph (cfg(windows)-gated or not), so any
-      # manifest still pinning it fails with "can't checkout ... you are in the offline
-      # mode". Three declare it: the Windows client and the Windows installer wizard (both
-      # removed from the workspace members) and pf-client-core's D3D11VA backend (entry pruned
-      # in place — nothing cfg(windows) compiles here). The edits touch only the sandbox
-      # copies. (No --locked: the lock no longer matches the reduced graph; --offline still
-      # pins every crate to the vendored cargo-sources.json, so the build stays reproducible.)
+      # cargo-sources.json leaves out the windows-rs git source (prune-windows-lock.py), but
+      # `cargo --offline` needs a source for every declared dependency, cfg(windows) or not.
+      # The Windows client and installer leave the workspace; every Linux-built member that
+      # inherits the pin is pruned in place, so a member that adds the pin is listed here.
+      # No --locked: the lock no longer matches the reduced graph; --offline still pins every
+      # crate to cargo-sources.json.
       - sed -i '\#"clients/windows",#d' Cargo.toml
       - sed -i '\#"crates/punktfunk-setup-win",#d' Cargo.toml
       - python3 packaging/flatpak/prune-windows-toml.py crates/pf-client-core/Cargo.toml
+          crates/pf-presenter/Cargo.toml
       # One cargo invocation for both binaries: the shell and the Vulkan session binary it
       # execs for --connect/--browse. Building them together keeps skia-bindings' feature
       # unification identical to a workspace build (the pinned skia-binaries archive's
