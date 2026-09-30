@@ -38,14 +38,20 @@ export const PasswordConfirmField: FC<{
 	failure: PasswordFailure;
 	help?: ReactNode;
 	autoFocus?: boolean;
-}> = ({ id, value, onChange, failure, help, autoFocus }) => (
+	/** Out of the password manager's fill, for a page field under a dialog that asks too. */
+	disabled?: boolean;
+}> = ({ id, value, onChange, failure, help, autoFocus, disabled }) => (
 	<div className="space-y-2">
 		<Label htmlFor={id}>{m.store_spec_password()}</Label>
+		{/* `name` matches sign-in, so the saved console login maps onto this field. */}
 		<Input
 			id={id}
+			name="password"
 			type="password"
 			autoComplete="current-password"
 			autoFocus={autoFocus}
+			disabled={disabled}
+			data-1p-ignore={disabled || undefined}
 			value={value}
 			onChange={(e) => onChange(e.target.value)}
 		/>
