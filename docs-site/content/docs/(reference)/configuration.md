@@ -283,6 +283,7 @@ Read by the Linux and Windows clients, the Decky plugin and the `punktfunk` CLI 
 | `PUNKTFUNK_PRESENT_MODE` | `mailbox` · `fifo` · `immediate` · `fifo_relaxed` | Vulkan present mode. With V-sync on the default is `mailbox`, else `fifo` (AMD's Windows driver has no mailbox); with V-sync off `immediate` comes first. |
 | `PUNKTFUNK_PRESENTER` | `arrival` | Show frames the moment they decode, bypassing frame pacing. A diagnostic. |
 | `PUNKTFUNK_VRR_FIFO` | `1` | Follow a variable-refresh screen on a driver too old for the modern mode; costs latency on a fixed-refresh screen. The Detailed [stats overlay](/docs/stats) shows `vrr yes` when it works. |
+| `PUNKTFUNK_VRR_PACE` | `0` | Shows each frame as it arrives on a variable-refresh screen, instead of holding it a moment to even out the spacing. Try it if *Lowest latency* feels uneven on such a screen. |
 | `PUNKTFUNK_PRESENT_WAIT2` | `1` | Time frames with the newer `VK_KHR_present_wait2` on a driver that also has the older extension. A diagnostic; drivers with only the newer one use it on their own. |
 | `PUNKTFUNK_FULLSCREEN_EXCLUSIVE` | `1` | Windows: take the screen with exclusive fullscreen (`VK_EXT_full_screen_exclusive`), so a variable-refresh screen follows the stream where the desktop would otherwise hold the window. An experiment; switching windows flickers. |
 | `PUNKTFUNK_PRESENT_DEBUG` | `1` | Windows: log the D3D11VA hand-off window every second. The presenter's own summary line is always logged. |

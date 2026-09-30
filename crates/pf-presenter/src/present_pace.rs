@@ -412,6 +412,13 @@ enum PaceMode {
     VrrLatency,
 }
 
+/// `PUNKTFUNK_VRR_PACE=0` keeps the latency intent arrival-driven on a VRR panel: the
+/// A/B for the pacing, and the way out where a panel takes it badly.
+fn vrr_latency_pacing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PUNKTFUNK_VRR_PACE").map_or(true, |v| v != "0"))
+}
+
 /// Plays frames on the source cadence: a [`CadenceClock`] plus the two client
 /// policies — which intent applies, and which cushion the measured refresh asks for.
 ///
@@ -461,7 +468,7 @@ impl SourcePacer {
     pub(crate) fn follow(&mut self, verdict: Cadence, grid_known: bool, smoothing: bool) {
         let mode = match (verdict == Cadence::Variable, smoothing) {
             (true, true) => PaceMode::Free,
-            (true, false) => PaceMode::VrrLatency,
+            (true, false) if vrr_latency_pacing() => PaceMode::VrrLatency,
             (false, true) if !grid_known => PaceMode::Free,
             _ => PaceMode::Snap,
         };
