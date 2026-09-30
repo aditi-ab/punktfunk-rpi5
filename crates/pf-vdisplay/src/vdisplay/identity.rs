@@ -483,9 +483,11 @@ mod tests {
         f
     }
 
+    /// Its own dir: every persist re-ACLs the parent on Windows, and `%TEMP%` itself is huge.
     fn temp_map(tag: &str) -> DisplayIdentityMap {
+        let dir = std::env::temp_dir().join(format!("pf-id-{tag}-{}", std::process::id()));
         DisplayIdentityMap {
-            path: std::env::temp_dir().join(format!("pf-id-{tag}-{}.json", std::process::id())),
+            path: dir.join(FILE),
             store: Store::default(),
         }
     }
@@ -590,7 +592,7 @@ mod tests {
             None,
             "a full console range must not spill into a reserved seat slot"
         );
-        let _ = std::fs::remove_file(&m.path);
+        let _ = std::fs::remove_dir_all(m.path.parent().unwrap());
     }
 
     #[test]
@@ -609,7 +611,7 @@ mod tests {
             m.store.entries.iter().find(|e| e.key == key).unwrap().id,
             migrated
         );
-        let _ = std::fs::remove_file(&m.path);
+        let _ = std::fs::remove_dir_all(m.path.parent().unwrap());
     }
 
     #[test]
@@ -622,7 +624,7 @@ mod tests {
         assert_ne!(a1, b, "distinct clients → distinct ids");
         assert!(a1.is_some_and(|i| (1..=MAX_ID).contains(&i)));
         assert!(b.is_some_and(|i| (1..=MAX_ID).contains(&i)));
-        let _ = std::fs::remove_file(&m.path);
+        let _ = std::fs::remove_dir_all(m.path.parent().unwrap());
     }
 
     #[test]
@@ -633,7 +635,7 @@ mod tests {
         let hd2 = m.resolve(&identity_key(fp(1), (1920, 1080), true), &nothing_live());
         assert_ne!(hd, uhd, "same client, different resolution → different id");
         assert_eq!(hd, hd2, "same client + resolution → same id");
-        let _ = std::fs::remove_file(&m.path);
+        let _ = std::fs::remove_dir_all(m.path.parent().unwrap());
     }
 
     #[test]
@@ -650,7 +652,7 @@ mod tests {
         assert!((1..=MAX_ID).contains(&id16));
         assert_eq!(m.store.entries.len(), 15, "cap holds at 15 entries");
         assert!(m.store.entries.iter().all(|e| (1..=MAX_ID).contains(&e.id)));
-        let _ = std::fs::remove_file(&m.path);
+        let _ = std::fs::remove_dir_all(m.path.parent().unwrap());
     }
 
     #[test]
@@ -675,7 +677,7 @@ mod tests {
             m.resolve(&identity_key(fp(1), (1920, 1080), false), &live),
             Some(lru_id)
         );
-        let _ = std::fs::remove_file(&m.path);
+        let _ = std::fs::remove_dir_all(m.path.parent().unwrap());
     }
 
     #[test]
@@ -697,7 +699,7 @@ mod tests {
         assert!(m
             .resolve(&identity_key(fp(3), (1920, 1080), false), &live)
             .is_some());
-        let _ = std::fs::remove_file(&m.path);
+        let _ = std::fs::remove_dir_all(m.path.parent().unwrap());
     }
 
     #[test]
