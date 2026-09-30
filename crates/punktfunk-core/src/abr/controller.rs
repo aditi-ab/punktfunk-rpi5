@@ -626,15 +626,15 @@ impl BitrateController {
             DecodeProbeKind::Retreat => {
                 // Latency is not a function of the rate: a pipelined decoder,
                 // or something else on the SoC. Give the rate back, stand the
-                // driver down and withhold its verdict; the cuts it named were
-                // not the rate's either (no knee, slow start may come back).
+                // driver down and withhold its verdict; the cap the bands parked
+                // and the cuts they named were not the rate's either.
                 self.decode_headroom.disarm();
                 self.baselines.clear_decode();
                 self.decode_backoff_kbps = 0;
                 if self.streak_cut == Some(Reason::Decode) {
                     self.rate_verdict = false;
                 }
-                self.decode_cap.park(p.step.from_kbps);
+                self.decode_cap.drop_cap();
                 tracing::info!(
                     restore_kbps = p.step.from_kbps,
                     decode_us = mean,
@@ -3255,10 +3255,17 @@ mod tests {
         let restore = until_request(&mut c, start, &mut t, 7_800, 6).expect("restore");
         assert_eq!(restore, 100_000);
         assert!(c.decode_headroom.disarmed());
-        assert_eq!(c.decode_cap.kbps(), Some(100_000));
-        // Stood down: the same 93 % no longer retreats.
-        assert_eq!(until_request(&mut c, start, &mut t, 7_800, 10), None);
-        assert_eq!(c.current_kbps, 100_000);
+        // No cap either: the bands parked one on a level the rate does not move.
+        assert_eq!(c.decode_cap.kbps(), None);
+        // Stood down: the same 93 % no longer retreats, and the climb is free.
+        for _ in 0..10 {
+            if let Some(k) = loaded(&mut c, ticks(start, t), 7_800) {
+                assert!(k > c.current_kbps, "only climbs, never a retreat");
+                c.on_ack(k, None);
+            }
+            t += 1;
+        }
+        assert!(c.current_kbps >= 100_000);
     }
 
     /// The field trace: a pipelined decoder whose latency swings at every
@@ -3290,6 +3297,11 @@ mod tests {
         t += 1;
         c.on_ack(100_000, None);
         assert!(c.decode_headroom.disarmed());
+        assert_eq!(
+            c.decode_cap.kbps(),
+            None,
+            "no cap on a level the rate does not move"
+        );
         assert!(
             !c.rate_verdict,
             "the cuts on this latency were not the rate's"
