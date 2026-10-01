@@ -3,8 +3,11 @@ package io.unom.punktfunk
 import android.app.Presentation
 import android.content.Context
 import android.hardware.display.DisplayManager
+import android.os.Build
 import android.util.Log
 import android.view.Display
+import android.view.View
+import android.view.Window
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.compose.runtime.Composable
@@ -54,6 +57,12 @@ internal fun companionDisplay(context: Context, dm: DisplayManager): Display? {
     }
 }
 
+/** The screen the picture goes to: the second screen the player swapped it onto, else [own]. */
+internal fun pictureDisplay(context: Context, own: Display): Display {
+    val dm = context.getSystemService(DisplayManager::class.java) ?: return own
+    return companionDisplay(context, dm)?.takeIf { CompanionMemory.swapped(context, it.name) } ?: own
+}
+
 /** Every display as one `pf.display` line: what a dual-screen device reports, for its bundle. */
 internal fun describeDisplays(context: Context, dm: DisplayManager): String {
     val presentation = dm.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION).map { it.displayId }
@@ -86,25 +95,27 @@ internal fun rememberCompanionDisplay(): Display? {
 /**
  * [content] on [display], as a `Presentation` shown while the activity is started. Its window is
  * not focusable: a tap on a focusable window moves key focus to that display, and the handheld's
- * own buttons would stop reaching the stream.
+ * own buttons would stop reaching the stream. A [pictureHz] means the window holds the picture:
+ * it stays lit, pins the panel to the stream's refresh and takes input unbuffered, as
+ * [StreamWindow] does for the activity's window.
  */
 @Composable
-internal fun CompanionOnDisplay(display: Display, content: @Composable () -> Unit) {
+internal fun CompanionOnDisplay(display: Display, pictureHz: Int? = null, content: @Composable () -> Unit) {
     val activity = LocalContext.current as? ComponentActivity ?: return
     val latest by rememberUpdatedState(content)
     // A Presentation cancels itself when its display's metrics change; the next one takes the new ones.
     var generation by remember { mutableIntStateOf(0) }
-    DisposableEffect(activity, display.displayId, generation) {
+    DisposableEffect(activity, display.displayId, generation, pictureHz) {
         val p = Presentation(activity, display)
         p.window?.addFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
-        p.setContentView(
-            ComposeView(p.context).apply {
-                setViewTreeLifecycleOwner(activity)
-                setViewTreeViewModelStoreOwner(activity)
-                setViewTreeSavedStateRegistryOwner(activity)
-                setContent { latest() }
-            },
-        )
+        val view = ComposeView(p.context).apply {
+            setViewTreeLifecycleOwner(activity)
+            setViewTreeViewModelStoreOwner(activity)
+            setViewTreeSavedStateRegistryOwner(activity)
+            setContent { latest() }
+        }
+        if (pictureHz != null) p.window?.let { holdPicture(it, view, display, pictureHz) }
+        p.setContentView(view)
         var disposed = false
         p.setOnDismissListener { if (!disposed) generation++ }
         // Added while started, the observer sees ON_START at once: that is the first show.
@@ -123,4 +134,14 @@ internal fun CompanionOnDisplay(display: Display, content: @Composable () -> Uni
             p.dismiss()
         }
     }
+}
+
+/** The picture's window: lit, pinned to a [hz] stream's mode, input off the vsync batch. Dies with it. */
+private fun holdPicture(window: Window, view: View, display: Display, hz: Int) {
+    window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    display.streamModeFor(hz)?.let { m ->
+        window.attributes = window.attributes.apply { preferredDisplayModeId = m.modeId }
+    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) view.requestUnbufferedDispatch(STREAM_UNBUFFERED_SOURCES)
+    if (Build.VERSION.SDK_INT >= 35 && hz > 0) view.requestedFrameRate = hz.toFloat()
 }

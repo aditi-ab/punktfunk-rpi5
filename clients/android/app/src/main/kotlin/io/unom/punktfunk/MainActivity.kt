@@ -624,19 +624,12 @@ class MainActivity : ComponentActivity() {
      */
     private fun resolveHighRefreshMode() {
         if (isTvDevice(this)) return
-        highRefreshModeId = sameResolutionModes().maxByOrNull { it.refreshRate }?.modeId ?: 0
+        highRefreshModeId = ownDisplay()?.sameResolutionModes()?.maxByOrNull { it.refreshRate }?.modeId ?: 0
     }
 
-    /** The display's modes at its current resolution, which is the one the user picked: no pin
-     * this activity sets ever leaves it. */
-    private fun sameResolutionModes(): List<android.view.Display.Mode> {
-        @Suppress("DEPRECATION")
-        val disp = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) display else windowManager.defaultDisplay
-        val current = disp?.mode ?: return emptyList()
-        return disp.supportedModes.filter {
-            it.physicalWidth == current.physicalWidth && it.physicalHeight == current.physicalHeight
-        }
-    }
+    @Suppress("DEPRECATION")
+    private fun ownDisplay(): android.view.Display? =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) display else windowManager.defaultDisplay
 
     /**
      * Opt the CONSOLE UI into the panel's highest refresh mode. Some OEMs (Nothing OS among them) pin
@@ -652,56 +645,21 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Pin the panel to a display mode matching the STREAM's refresh for the session's duration —
-     * exact rate first, else the smallest integer multiple (120 for a 60 stream: judder-free 2:1
-     * pulldown), else the highest available. Same-resolution modes only.
-     *
-     * The window-level mode pin is the belt to the decoder's `ANativeWindow_setFrameRate` braces:
-     * the surface hint alone is advisory, and several OEM refresh governors (Nothing OS's LTPO
-     * logic among them) ignore it entirely for third-party apps — leaving a 120 Hz session
-     * presenting on a 60/90 Hz panel, which reads as judder + a refresh of extra latency. The
-     * preferredDisplayModeId is the one signal they all honor. [hz] ≤ 0 falls back to releasing
-     * the pin (the pre-pin behaviour).
+     * Pin the panel to a display mode matching the STREAM's refresh for the session's duration
+     * ([streamModeFor]). The window-level mode pin is the belt to the decoder's
+     * `ANativeWindow_setFrameRate` braces: the surface hint alone is advisory, and several OEM
+     * refresh governors (Nothing OS's LTPO logic among them) ignore it entirely for third-party
+     * apps — leaving a 120 Hz session presenting on a 60/90 Hz panel, which reads as judder + a
+     * refresh of extra latency. The preferredDisplayModeId is the one signal they all honor. [hz]
+     * ≤ 0 falls back to releasing the pin (the pre-pin behaviour).
      */
     fun setStreamDisplayMode(hz: Int) {
         if (hz <= 0) {
             setConsoleHighRefreshRate(false)
             return
         }
-        val target = streamModeFor(hz) ?: return
+        val target = ownDisplay()?.streamModeFor(hz) ?: return
         window.attributes = window.attributes.apply { preferredDisplayModeId = target.modeId }
-    }
-
-    /**
-     * The panel refresh rate a [hz] stream runs against — [streamModeFor]'s pick, from the mode
-     * TABLE rather than `display.refreshRate`. The distinction matters: under a per-uid frame
-     * rate override (games get a 60 fps default on Android 15+) `refreshRate` reports the
-     * override, not the panel — observed on-glass as a 120 Hz panel reading back as 60. The
-     * supported-modes list is not override-filtered. `0` when unresolvable.
-     */
-    fun streamPanelFps(hz: Int): Int =
-        streamModeFor(hz)?.refreshRate?.let { kotlin.math.round(it).toInt() } ?: 0
-
-    /** The same-resolution display mode [setStreamDisplayMode] pins for a [hz] stream. */
-    private fun streamModeFor(hz: Int): android.view.Display.Mode? {
-        if (hz <= 0) return null
-        val sameRes = sameResolutionModes()
-        fun multiple(rate: Float): Int {
-            val k = (rate / hz).toInt()
-            return if (k >= 2 && kotlin.math.abs(rate - hz * k) < 1f) k else 0
-        }
-        return sameRes.minWithOrNull(
-            compareBy(
-                {
-                    when {
-                        kotlin.math.abs(it.refreshRate - hz) < 1f -> 0 // exact
-                        multiple(it.refreshRate) > 0 -> 1 // integer multiple — prefer smallest
-                        else -> 2 // no relation — prefer highest so at least nothing is halved
-                    }
-                },
-                { if (multiple(it.refreshRate) > 0) it.refreshRate else -it.refreshRate },
-            ),
-        )
     }
 
     /** The grave key went down as Tab ([Keymap.altTabAlias]); its repeats and release follow. */

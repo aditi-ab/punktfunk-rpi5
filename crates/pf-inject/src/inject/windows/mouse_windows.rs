@@ -16,11 +16,8 @@ use super::gamepad_raii::{
 };
 use anyhow::Result;
 use pf_driver_proto::mouse::{input_report, mouse_boot_name, MouseShm, MOUSE_MAGIC};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
-use windows::Win32::Foundation::POINT;
-use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
 const SHM_SIZE: usize = core::mem::size_of::<MouseShm>();
 const OFF_IN_SEQ: usize = core::mem::offset_of!(MouseShm, in_seq);
@@ -139,88 +136,6 @@ impl VirtualMouse {
     }
 }
 
-/// Newest-wins compose-kick aim: target display rect + virtual-desktop bounds (both CCD,
-/// so they describe the console's layout). Queueing would only multiply pointer blips.
-struct KickAim {
-    rect: (i32, i32, i32, i32),
-    bounds: (i32, i32, i32, i32),
-}
-
-struct KickSlot {
-    slot: Mutex<Option<KickAim>>,
-    wake: Condvar,
-}
-
-static KICK: KickSlot = KickSlot {
-    slot: Mutex::new(None),
-    wake: Condvar::new(),
-};
-
-/// True while the keeper's mouse is open AND the pf-mouse driver is attached (its 8 ms timer
-/// stamps `driver_proto`) — the only state in which a kick's reports actually reach win32k.
-static MOUSE_READY: AtomicBool = AtomicBool::new(false);
-
-/// Queue a pointer jiggle on `rect` via the resident HID mouse. A HID report is real
-/// input to win32k: it wakes a powered-off display, resets idle, and is delivered
-/// regardless of this process's session or desktop — every case `SendInput` no-ops.
-/// Newest-wins; the keeper thread runs it. `false` if the mouse isn't up (caller
-/// falls back to `SendInput`).
-pub(crate) fn hid_kick(rect: (i32, i32, i32, i32), bounds: (i32, i32, i32, i32)) -> bool {
-    if !MOUSE_READY.load(Ordering::Relaxed) {
-        return false;
-    }
-    *KICK.slot.lock().unwrap() = Some(KickAim { rect, bounds });
-    KICK.wake.notify_one();
-    true
-}
-
-/// Park at `rect` center (or where the pointer already is on it), dwell one composition
-/// interval, wiggle ~2 px, restore. 35 ms is load-bearing: DWM samples at the next vsync, and
-/// the driver's 8 ms report timer coalesces back-to-back writes. Restore via `GetCursorPos` is
-/// best-effort — a wrong-session host sees the wrong pointer and leaves it at center.
-fn perform_kick(m: &mut VirtualMouse, aim: KickAim) {
-    let (bx, by, bw, bh) = aim.bounds;
-    if bw <= 0 || bh <= 0 {
-        return;
-    }
-    tracing::debug!(
-        rect = ?aim.rect,
-        bounds = ?aim.bounds,
-        "HID compose kick — parking the pointer on the target display (display wake + damage)"
-    );
-    // Rounded, so the restore lands on the pixel it read rather than creeping up-left.
-    let scale = |v: i32, extent: i32| {
-        let span = i64::from(extent - 1).max(1);
-        ((i64::from(v.clamp(0, extent - 1)) * 0x7FFF + span / 2) / span) as u16
-    };
-    let map = |px: i32, py: i32| -> (u16, u16) { (scale(px - bx, bw), scale(py - by, bh)) };
-    let mut p = POINT::default();
-    // SAFETY: plain FFI; `p` is a valid out-param for this synchronous call.
-    let orig = unsafe { GetCursorPos(&mut p) }
-        .is_ok()
-        .then_some((p.x, p.y));
-    let (rx, ry, rw, rh) = aim.rect;
-    // Already on the target: wiggle where it is, so the pointer the client sees does not jump.
-    let on_target = orig.filter(|&(x, y)| x >= rx && y >= ry && x < rx + rw && y < ry + rh);
-    let (cx, cy) = match on_target {
-        Some((x, y)) => map(x, y),
-        None => map(rx + rw / 2, ry + rh / 2),
-    };
-    // ~2 desktop pixels in HID units, at least 1 — the wiggle must actually move the pointer.
-    let dx = ((2 * 0x7FFF) / bw.max(1)).max(1) as u16;
-    m.send_report(0, cx, cy, 0, 0);
-    std::thread::sleep(Duration::from_millis(35));
-    m.send_report(0, cx.saturating_add(dx).min(0x7FFF), cy, 0, 0);
-    std::thread::sleep(Duration::from_millis(35));
-    match orig {
-        Some((ox, oy)) => {
-            let (ox, oy) = map(ox, oy);
-            m.send_report(0, ox, oy, 0, 0);
-        }
-        None => m.send_report(0, cx, cy, 0, 0),
-    }
-}
-
 /// Ensure the one process-wide virtual mouse exists. Called from
 /// [`InjectorService`](crate::InjectorService) start; native + GameStream share it.
 /// The keeper thread owns the devnode for the process lifetime.
@@ -237,8 +152,6 @@ pub(crate) fn ensure_resident() {
             );
             return;
         }
-        // One-way: pf-capture never reaches inject. Until attach, `hid_kick` is not-ready.
-        let _ = pf_capture::HID_COMPOSE_KICK.set(hid_kick);
         if let Err(e) = std::thread::Builder::new()
             .name("punktfunk-vmouse".into())
             .spawn(keeper_thread)
@@ -248,9 +161,9 @@ pub(crate) fn ensure_resident() {
     });
 }
 
-/// Open-with-retry, then hold + pump. Open fails on a mailbox squat (another host);
-/// a missing driver is not an open failure (`DriverAttach` diagnoses via the pump).
-/// Condvar wait: kick latency is immediate, idle wake is 250 ms (4×/s).
+/// Open-with-retry, then hold + pump every 250 ms. Open fails on a mailbox squat (another
+/// host); a missing driver is not an open failure (`DriverAttach` diagnoses via the pump).
+/// The device only exists: it never reports motion of its own.
 fn keeper_thread() {
     loop {
         match VirtualMouse::open() {
@@ -261,22 +174,7 @@ fn keeper_thread() {
                 );
                 loop {
                     m.service();
-                    MOUSE_READY.store(m.driver_proto() != 0, Ordering::Relaxed);
-                    let (mut slot, _timeout) = KICK
-                        .wake
-                        .wait_timeout_while(
-                            KICK.slot.lock().unwrap(),
-                            Duration::from_millis(250),
-                            |k| k.is_none(),
-                        )
-                        .unwrap();
-                    let aim = slot.take();
-                    drop(slot);
-                    if let Some(aim) = aim {
-                        if m.driver_proto() != 0 {
-                            perform_kick(&mut m, aim);
-                        }
-                    }
+                    std::thread::sleep(Duration::from_millis(250));
                 }
             }
             Err(e) => {

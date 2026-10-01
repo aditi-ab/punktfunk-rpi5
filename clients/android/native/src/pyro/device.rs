@@ -277,6 +277,7 @@ impl PyroDevice {
             d3d11_import: false,
             dmabuf_import: false,
             vaapi_av1_decode: false,
+            vaapi_hevc_decode: false,
             d3d11_nv12: false,
             d3d11_p010: false,
             d3d11_hdr10: false,

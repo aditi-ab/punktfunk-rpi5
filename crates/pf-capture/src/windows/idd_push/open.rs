@@ -331,7 +331,6 @@ impl IddPushCapturer {
             drain_seq: 0,
             last_drain: Instant::now(),
             last_liveness: Instant::now(),
-            last_kick: Instant::now(),
             stall_watch: StallWatch::new(),
             max_hb_age_us: 0,
             cursor: CursorWitness::new(Instant::now()),

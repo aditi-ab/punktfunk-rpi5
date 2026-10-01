@@ -99,7 +99,7 @@ impl I915Boost {
         let r = unsafe {
             libc::ioctl(
                 self.node.as_raw_fd(),
-                DRM_IOCTL_PRIME_FD_TO_HANDLE,
+                DRM_IOCTL_PRIME_FD_TO_HANDLE as _,
                 &mut req,
             )
         };
@@ -123,14 +123,20 @@ impl I915Boost {
             timeout_ns,
         };
         // SAFETY: as in `track`; `handle` is one this node handed out and has not closed.
-        unsafe { libc::ioctl(self.node.as_raw_fd(), DRM_IOCTL_I915_GEM_WAIT, &mut req) == 0 }
+        unsafe {
+            libc::ioctl(
+                self.node.as_raw_fd(),
+                DRM_IOCTL_I915_GEM_WAIT as _,
+                &mut req,
+            ) == 0
+        }
     }
 
     fn close_tracked(&mut self) {
         if let Some((_, handle)) = self.tracked.take() {
             let mut req = DrmGemClose { handle, pad: 0 };
             // SAFETY: as in `track`; closing a handle this node owns.
-            unsafe { libc::ioctl(self.node.as_raw_fd(), DRM_IOCTL_GEM_CLOSE, &mut req) };
+            unsafe { libc::ioctl(self.node.as_raw_fd(), DRM_IOCTL_GEM_CLOSE as _, &mut req) };
         }
     }
 }
@@ -157,7 +163,7 @@ fn driver_name(fd: RawFd) -> Option<String> {
     };
     // SAFETY: `fd` is a live DRM node; the kernel writes at most `name_len` bytes into
     // `name`, which outlives the call, and leaves the null-pointed fields alone.
-    if unsafe { libc::ioctl(fd, DRM_IOCTL_VERSION, &mut v) } < 0 {
+    if unsafe { libc::ioctl(fd, DRM_IOCTL_VERSION as _, &mut v) } < 0 {
         return None;
     }
     let len = v.name_len.min(name.len());

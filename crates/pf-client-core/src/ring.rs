@@ -45,8 +45,9 @@ pub enum RingCommand {
     /// A synthetic tap of one system button on the host's pad — a `gamepad::wire::BTN_*` bit
     /// (guide or `MISC1`), the same verb the session control socket exposes.
     TapButton(u32),
-    /// Flip [`RingFacts::pad_mouse_target`] between controller mouse and passthrough.
-    TogglePadMouse,
+    /// Step [`RingFacts::pad_mouse_target`] to the next controller-mouse mode: off, touchpad,
+    /// full.
+    CyclePadMouse,
     /// Flip this client's own speakers ([`punktfunk_core::client::AUDIO_MUTE_LOCAL`]). Never
     /// reaches the host, so a session joined to the same display keeps hearing the game.
     ToggleStreamMute,
@@ -111,8 +112,8 @@ pub struct RingFacts {
     /// Wire pads the controller-mouse toggle acts on: the pad that opened the ring, else every
     /// live pad. `0` = no controller.
     pub pad_mouse_target: u16,
-    /// Every target pad is in controller mouse.
-    pub pad_mouse_on: bool,
+    /// The controller-mouse mode every target pad shares; a mixed set reads as off.
+    pub pad_mouse: punktfunk_core::input::PadMouseMode,
     /// The host grants pointer input; controller mouse needs it.
     pub pointer_granted: bool,
     /// Live `(w, h, hz)`. `native_mode` is the Welcome native.

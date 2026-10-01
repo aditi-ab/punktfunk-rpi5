@@ -137,9 +137,8 @@ impl<'a> Drive<'a> {
 
 /// The steady state: pool slot → `submit` → `poll` → heap + slot table → `latest` + event.
 ///
-/// Idle desktop: nothing is re-encoded at cadence — a pool with no new frame means no AU, and
-/// the host, which reads `source_seq` standing still with `drain_heartbeat_qpc` moving, kicks
-/// a compose when it wants one. The stash rule (§2.2) covers only the first frame.
+/// Idle desktop: nothing is re-encoded at cadence — a pool with no new frame means no AU. A
+/// keyframe request re-encodes the stash; the first frame is the pool's or the seed's.
 pub struct Drive<'a> {
     enc: Box<dyn Encoder>,
     pool: &'a Pool,

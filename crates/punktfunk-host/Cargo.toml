@@ -10,7 +10,7 @@ repository.workspace = true
 
 [dependencies]
 # Managed emulators: install, detect, remove. Pinned to a commit until it is on crates.io.
-hermir = { git = "https://github.com/unom-io/hermir", rev = "26f87cb857670517b83f59d7a56d651ebfd403fe" }
+hermir = { git = "https://github.com/unom-io/hermir", rev = "704ff84ade1877f06cfc67912bd4b9e4b69e430f" }
 # `ureq-tls` is for `ctl`: ureq's own `TlsConfig` has no hook for a custom certificate verifier,
 # so the pinned operator client hands rustls a `ClientConfig` through core's shared glue — the same
 # path the tray and the desktop client already take. `quic` brings `tls` (and `PinVerify`) with it.
@@ -232,8 +232,8 @@ libc = "0.2"
 # needed — pf-capture and pf-audio drive PipeWire with the `pipewire` crate.
 # `settings` adds the org.freedesktop.portal.Settings proxy the console's theme route reads
 # (design/web-console-overhaul.md §7) — the only cross-desktop source for the desktop's own
-# mode and accent.
-ashpd = { version = "0.13", features = ["screencast", "remote_desktop", "settings"] }
+# mode and accent. `inhibit` vetoes the desktop's idle suspend during a stream.
+ashpd = { version = "0.13", features = ["screencast", "remote_desktop", "settings", "inhibit"] }
 # (ashpd 0.13 drives the one-time portal handshake on tokio; the unconditional `tokio = "full"`
 # in [dependencies] already covers that — this block used to re-declare a strict subset of it.)
 # NOTE: the Wayland stack (wayland-client / -protocols{,-wlr,-misc} / -scanner / -backend),

@@ -430,6 +430,7 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                     peer.reset(&inj_tx);
                 }
                 peer.pump_outbound(&mut host, &state);
+                peer.pump_repeat(&inj_tx, access.as_ref().map(|a| a.mask).unwrap_or(GRANT_ALL));
                 // ENet handshake/keepalive/retransmit pacing is the socket's 2 ms read
                 // timeout in the drain above. Do not sleep on top of it.
             }
@@ -486,6 +487,8 @@ struct ControlPeer {
     pointer: super::pen::GsPointer,
     /// The injector outlives the peer: whatever it still holds is released when it goes.
     held: crate::inject::held::HeldInput,
+    /// Windows auto-repeat for the last held key; the tick injects what falls due.
+    repeat: super::input::KeyRepeat,
     drops: GrantDrops,
     /// One host→client seq for every outbound message (rumble, HDR, termination). The GCM
     /// nonce is derived from it; a per-type counter would reuse (key, nonce) pairs.
@@ -505,9 +508,19 @@ impl ControlPeer {
             pads: SessionPads::new(),
             pointer: super::pen::GsPointer::new(),
             held: Default::default(),
+            repeat: super::input::KeyRepeat::for_this_host(),
             drops: GrantDrops::new(Plane::Gamestream),
             host_seq: 0,
             last_key: None,
+        }
+    }
+
+    /// Inject the held key's repeat when it falls due, under the same grant as the key.
+    fn pump_repeat(&mut self, inj_tx: &Sender<InputEvent>, grants: u32) {
+        if let Some(ev) = self.repeat.due(std::time::Instant::now()) {
+            if self.drops.permitted(grants, classify(ev.kind)) {
+                let _ = inj_tx.send(ev);
+            }
         }
     }
 
@@ -526,6 +539,7 @@ impl ControlPeer {
         self.hdr_signalled = None;
         self.pads = SessionPads::new();
         self.pointer = super::pen::GsPointer::new();
+        self.repeat = super::input::KeyRepeat::for_this_host();
         for ev in self.held.release() {
             let _ = inj_tx.send(ev);
         }
@@ -610,6 +624,16 @@ fn decode_rfi_range(pt: &[u8]) -> Option<(i64, i64)> {
     let first = i64::from_le_bytes(pt[4..12].try_into().ok()?);
     let last = i64::from_le_bytes(pt[12..20].try_into().ok()?);
     (first >= 0 && last >= first).then_some((first, last))
+}
+
+/// Data shards parity could not restore, from a per-frame FEC status (0x5502,
+/// `SS_FRAME_FEC_STATUS`: 21 packed BE bytes after `[u16 type][u16 length]`). Loss FEC
+/// recovered counts 0: it is FEC doing its job, not a reason to cut the bitrate.
+fn decode_fec_status_loss(pt: &[u8]) -> Option<u64> {
+    let body = pt.get(4..25)?;
+    let be16 = |at: usize| u64::from(u16::from_be_bytes([body[at], body[at + 1]]));
+    let (total_data, received_data, received_parity) = (be16(10), be16(14), be16(16));
+    Some(total_data.saturating_sub(received_data + received_parity))
 }
 
 /// Decrypt one control packet (lock GCM scheme on the first authenticating one),
@@ -700,6 +724,24 @@ fn on_receive(
             }
             return;
         }
+        // A client that sees our Sunshine version never sends 0x0201; this per-frame report,
+        // sent only when FEC had work to do, is its loss signal.
+        if inner == 0x5502 {
+            if let Some(lost) = decode_fec_status_loss(&pt) {
+                state
+                    .loss_stats
+                    .lost
+                    .fetch_add(lost, std::sync::atomic::Ordering::Relaxed);
+                state
+                    .loss_stats
+                    .reports
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if lost > 0 {
+                    tracing::debug!(lost, "control: frame lost past FEC");
+                }
+            }
+            return;
+        }
     }
 
     // Gate gamepad before the manager sees it: without GAMEPAD the creating event never
@@ -760,6 +802,7 @@ fn on_receive(
         if peer.drops.permitted(grants, classify(ev.kind)) {
             state.counters.input_events.fetch_add(1, Ordering::Relaxed);
             peer.held.note(&ev);
+            peer.repeat.note(&ev, std::time::Instant::now());
             let _ = inj_tx.send(ev);
         }
     }
@@ -1052,7 +1095,7 @@ pub(super) fn gcm_open(key: &[u8; 16], nonce: &[u8], ct_tag: &[u8], aad: &[u8]) 
 
 #[cfg(test)]
 mod tests {
-    use super::decode_rfi_range;
+    use super::{decode_fec_status_loss, decode_rfi_range};
 
     /// Build a 0x0301 invalidate-ref-frames plaintext: `[type LE][len LE][firstFrame i64 LE][last i64 LE]`.
     fn rfi_msg(first: i64, last: i64) -> Vec<u8> {
@@ -1070,6 +1113,7 @@ mod tests {
             height: 1080,
             fps: 60,
             appid: 1,
+            host_audio: false,
             peer_ip,
             owner_fp: None,
         })
@@ -1095,6 +1139,38 @@ mod tests {
     fn decodes_a_valid_rfi_range() {
         assert_eq!(decode_rfi_range(&rfi_msg(40, 47)), Some((40, 47)));
         assert_eq!(decode_rfi_range(&rfi_msg(5, 5)), Some((5, 5))); // single frame
+    }
+
+    /// moonlight-common-c `reportFinalFrameFecStatus` layout, big-endian.
+    fn fec_status_msg(total_data: u16, received_data: u16, received_parity: u16) -> Vec<u8> {
+        let mut m = vec![0x02, 0x55, 21, 0];
+        m.extend_from_slice(&7u32.to_be_bytes()); // frameIndex
+        m.extend_from_slice(&[0; 6]); // highest, next contiguous, missing
+        m.extend_from_slice(&total_data.to_be_bytes());
+        m.extend_from_slice(&4u16.to_be_bytes()); // totalParityPackets
+        m.extend_from_slice(&received_data.to_be_bytes());
+        m.extend_from_slice(&received_parity.to_be_bytes());
+        m.extend_from_slice(&[20, 0, 1]); // fecPercentage, block index, block count
+        m
+    }
+
+    #[test]
+    fn fec_status_counts_only_loss_parity_could_not_restore() {
+        assert_eq!(
+            decode_fec_status_loss(&fec_status_msg(10, 8, 2)),
+            Some(0),
+            "recovered"
+        );
+        assert_eq!(
+            decode_fec_status_loss(&fec_status_msg(10, 6, 1)),
+            Some(3),
+            "dropped frame"
+        );
+        assert_eq!(
+            decode_fec_status_loss(&fec_status_msg(10, 6, 1)[..24]),
+            None,
+            "short"
+        );
     }
 
     #[test]

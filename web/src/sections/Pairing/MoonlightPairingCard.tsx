@@ -45,7 +45,10 @@ export const addressedCeremony = (
 			: undefined;
 
 /** Container: GameStream/Moonlight pairing — poll status, own the PIN entry, submit it. */
-export const MoonlightPairingSection: FC = () => {
+export const MoonlightPairingSection: FC<{
+	/** The approve dialog is open and owns the console password. */
+	passwordLocked?: boolean;
+}> = ({ passwordLocked }) => {
 	const qc = useQueryClient();
 	const [pin, setPin] = useState("");
 	const [label, setLabel] = useState("");
@@ -123,6 +126,7 @@ export const MoonlightPairingSection: FC = () => {
 			isSubmitting={submit.isPending}
 			isSuccess={submit.isSuccess}
 			isError={submit.isError}
+			passwordLocked={passwordLocked}
 		/>
 	);
 };
@@ -146,6 +150,8 @@ export const MoonlightPairing: FC<{
 	isSubmitting: boolean;
 	isSuccess: boolean;
 	isError: boolean;
+	/** The approve dialog is open and owns the console password. */
+	passwordLocked?: boolean;
 }> = ({
 	pairing,
 	pin,
@@ -161,6 +167,7 @@ export const MoonlightPairing: FC<{
 	isSubmitting,
 	isSuccess,
 	isError,
+	passwordLocked,
 }) => {
 	const pending = pairing.data?.pin_pending ?? false;
 	const ceremonies = pairing.data?.pending ?? [];
@@ -266,6 +273,7 @@ export const MoonlightPairing: FC<{
 								onChange={onPasswordChange}
 								failure={failure}
 								help={m.pairing_password_help()}
+								disabled={passwordLocked}
 							/>
 							<Button
 								type="submit"

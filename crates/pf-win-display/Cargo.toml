@@ -40,6 +40,8 @@ windows = { version = "0.62", features = [
     # follow the input desktop so a UAC/lock screen can't refuse them.
     "Win32_System_StationsAndDesktops",
     "Win32_System_Threading",
+    # console_display: GUID_CONSOLE_DISPLAY_STATE subscription + the ES_DISPLAY_REQUIRED wake.
+    "Win32_System_Power",
 ] }
 
 [lints]

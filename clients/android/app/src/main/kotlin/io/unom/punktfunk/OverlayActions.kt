@@ -40,6 +40,9 @@ sealed class SlotId {
 
     /** Silence this device's speakers. Local: the host keeps playing for anyone joined to it. */
     object StreamMute : SlotId()
+
+    /** A dual-screen handheld's two screens trade the picture and the companion panel. */
+    object SwapScreens : SlotId()
     data class Host(val actionId: String) : SlotId()
     data class Shortcut(val shortcutId: String) : SlotId()
 
@@ -59,6 +62,7 @@ sealed class SlotId {
             Qam -> "qam"
             PadMouse -> "pad_mouse"
             StreamMute -> "stream_mute"
+            SwapScreens -> "swap_screens"
             is Host -> "host:$actionId"
             is Shortcut -> "shortcut:$shortcutId"
         }
@@ -79,6 +83,7 @@ sealed class SlotId {
             "qam" -> Qam
             "pad_mouse" -> PadMouse
             "stream_mute" -> StreamMute
+            "swap_screens" -> SwapScreens
             else -> when {
                 s.startsWith("host:") && s.length > 5 -> Host(s.substring(5))
                 s.startsWith("shortcut:") && s.length > 9 -> Shortcut(s.substring(9))

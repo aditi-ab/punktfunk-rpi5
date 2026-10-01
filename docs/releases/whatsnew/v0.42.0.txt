@@ -1,0 +1,6 @@
+• Swap screens: on a dual-screen handheld the picture and the panel trade places.
+• Controller mouse has a Touchpad mode: the game keeps the controller while its touchpad moves the pointer.
+• Aspect ratio choices wrap to a second line on phones instead of hiding.
+• The console on TVs such as the TCL P7K no longer shows block corruption.
+• The console no longer runs a TV out of memory on a large library.
+• Sleep host is closer in the console: Power leads Host details.

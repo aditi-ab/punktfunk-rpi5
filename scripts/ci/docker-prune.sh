@@ -17,6 +17,7 @@ MIN_FREE_GB=${MIN_FREE_GB:-60}  # ...or this little is left: three concurrent Ru
                                 # dirs can eat the rest inside one interval.
 EMERGENCY_FREE_GB=${EMERGENCY_FREE_GB:-25}  # below this, one killed pull beats every job's ENOSPC
 CK_MAX_AGE_H=${CK_MAX_AGE_H:-48}  # a superseded ck-* tag older than this is retired
+DISK=${DISK:-/}                   # the filesystem holding Docker's data
 
 # containerd (moby namespace) lists an active ingest per pull. No ctr means assume a pull.
 pull_in_flight() {
@@ -60,8 +61,8 @@ docker network prune -f --filter until=2h || true
 
 # 3) Burst guard: free space as a floor as well as a percentage, since the headroom three jobs
 #    need does not move when the disk is resized.
-PCT=$(df --output=pcent / | tr -dc '0-9')
-FREE_GB=$(df --output=avail -BG / | tr -dc '0-9')
+PCT=$(df --output=pcent "$DISK" | tr -dc '0-9')
+FREE_GB=$(df --output=avail -BG "$DISK" | tr -dc '0-9')
 BURST=0
 [ -n "$PCT" ] && [ "$PCT" -ge "$BURST_PCT" ] && BURST=1
 [ -n "$FREE_GB" ] && [ "$FREE_GB" -lt "$MIN_FREE_GB" ] && BURST=1

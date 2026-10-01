@@ -921,6 +921,19 @@ impl NativeVulkanDecoder {
         native
     }
 
+    /// Intel on i915: the decode wait is the media clock boost, and its GEM wait covers
+    /// the whole bitstream ring, so the pump waits each AU at once rather than one behind.
+    pub(crate) fn boosted(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.boost.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
     /// Bounded wait for a shipped frame's decode-complete signal (pump decode-latency).
     /// Lookup is the liveness proof: an unreleased frame pins its pool; a pair matching
     /// nothing (already settled, or stray) declines the sample instead of unknown handles.
@@ -936,6 +949,16 @@ impl NativeVulkanDecoder {
             .iter()
             .find(|s| s.frame.semaphore.as_raw() == sem && s.frame.value == value)
             .is_some_and(|s| self.dec.wait_decoded(&s.frame, timeout_ns))
+    }
+
+    /// Whether a shipped frame's decode is complete now, without waiting. A pair the
+    /// ledger no longer holds was released by the presenter, whose own GPU wait covered
+    /// the decode: done.
+    pub(crate) fn timeline_done(&mut self, sem: u64, value: u64) -> bool {
+        self.outstanding
+            .iter()
+            .find(|s| s.frame.semaphore.as_raw() == sem && s.frame.value == value)
+            .is_none_or(|s| self.dec.wait_decoded(&s.frame, 0))
     }
 
     /// Drain the release channel. Actual pool release waits for the status read.

@@ -230,7 +230,7 @@ What the dial can hold:
 |---|---|
 | Session | **End stream**, **End game** (a game this device launched, then the stream), **Disconnect, keep the game running** |
 | Input | **Touch mode**, **Keyboard**, **Virtual controller**, **Send text**, **Guide button**, **Quick access menu**, **Controller mouse** |
-| View · Audio | **Statistics**, **Microphone**, **Mute this stream** (this device only) |
+| View · Audio | **Statistics**, **Swap screens** (dual-screen handhelds), **Microphone**, **Mute this stream** (this device only) |
 | Host | **Sleep host**, **Restart host**, **Shut down host** ([Host power](/docs/host-power)) |
 | Shortcuts | Key combinations you add, such as Alt+F4 |
 
@@ -239,11 +239,27 @@ host that takes typed text.
 
 ### Controller mouse
 
-For a launcher, dialog or desktop that ignores controllers, fire **Controller mouse** on the dial:
-the controller that opened the dial now drives the host's pointer, and the game sees an idle pad.
-Fire it again to hand the controller back. Each stream starts with controllers in the game.
+For a launcher, dialog or desktop that ignores controllers, fire **Controller mouse** on the dial.
+Each press moves the controller that opened the dial to the next mode, and each stream starts
+with **Off**:
 
-| Controller | Controller mouse |
+- **Off**: the controller plays.
+- **Touchpad**: the controller still plays, and its touchpads move the host's pointer.
+- **Full**: the whole controller drives the pointer, and the game sees an idle pad.
+
+The touchpads work the same in both modes. A tap never clicks, so a thumb resting on the pad
+mid-game fires nothing.
+
+| Touchpad | Touchpad and Full |
+|---|---|
+| DualSense, DualShock 4 | Pointer — slide a finger, as on a laptop trackpad. Click for left click, click with two fingers for right click |
+| Steam Deck, Steam Controller: right pad | Pointer; click for left click |
+| Steam Deck, Steam Controller: left pad | Scroll; click for right click |
+
+A controller without a touchpad plays on unchanged in **Touchpad**. In **Full**, the rest of the
+controller works like this:
+
+| Controller | Full |
 |---|---|
 | Left stick | Pointer — push further to move faster |
 | Right stick | Scroll |
@@ -268,6 +284,14 @@ elsewhere still drive the touch mode. Set **Touch mode** to **Off** to keep them
 the host. Under **Quick actions** in settings, pick a **Layout**
 (**Full**, **Sticks and shoulders**, **D-pad and face buttons**), set **Opacity** and **Scale**,
 or use **Edit layout** to move, resize and hide controls, separately for wide and upright screens.
+
+### Dual-screen handhelds
+
+On an Android handheld with a second screen of 7 inches or less, or a foldable half open, the
+stream takes one screen and a panel takes the other: statistics, the dial's actions, a trackpad
+and the virtual controller. **Swap screens**, on the dial or the panel, trades the two. The
+handheld remembers the swap, and an **Automatic** resolution or refresh follows the picture: at
+once where the host can change mode mid-stream, else from the next connect.
 
 ## Pen and stylus
 

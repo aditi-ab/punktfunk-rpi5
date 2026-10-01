@@ -163,8 +163,8 @@ impl Presenter {
         }
     }
 
-    /// Present one frame. `Stale` means the swapchain is out of date — the caller
-    /// recreates it (current window state) and may retry. `Busy` hands the frame back:
+    /// Present one frame. `Stale` means the swapchain was recreated and the caller
+    /// may retry. `Busy` hands the frame back:
     /// the swapchain has no image yet (FIFO with no glass stamps to gate on), so the
     /// caller keeps the frame and tries again shortly instead of blocking on the queue.
     pub fn present<'a>(
@@ -224,7 +224,8 @@ impl Presenter {
                     Err(vk::Result::NOT_READY) | Err(vk::Result::TIMEOUT) => {
                         return Ok(Presented::Busy(input, BusyOn::Acquire));
                     }
-                    Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                    Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
+                    | Err(vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => {
                         self.recreate_swapchain(window)?;
                         return Ok(Presented::Stale);
                     }
@@ -279,6 +280,57 @@ impl Presenter {
             self.device.reset_fences(&[self.fence])?;
         }
         self.last_fence_us = fence_started.elapsed().as_micros() as u32;
+
+        // Acquire before anything below retires the picture on screen. An out-of-date
+        // swapchain drops this frame, and the next `Redraw` must still replay the last one.
+        let acquire_started = std::time::Instant::now();
+        // An image taken by the non-blocking probe above is used as is.
+        let acquired = match self.acquired {
+            Some(index) => Ok((index, false)),
+            None => {
+                // With a present waiter, each call holds the swapchain for one bounded slice.
+                let timeout = match self.present_timer {
+                    Some(_) => SLICE_NS,
+                    None => u64::MAX,
+                };
+                loop {
+                    let _swapchain = self.present_timer.as_ref().map(|t| t.swapchain_guard());
+                    // SAFETY: `swapchain` and `acquire_sem` are owned here; the guard above is
+                    // the swapchain's host sync. No image is held, so every wait on
+                    // `acquire_sem` is complete: a present's by the fence wait above, a
+                    // discarded image's by `recreate_swapchain`'s queue drain.
+                    let r = unsafe {
+                        self.swap_d.acquire_next_image(
+                            self.swapchain,
+                            timeout,
+                            self.acquire_sem,
+                            vk::Fence::null(),
+                        )
+                    };
+                    if r != Err(vk::Result::TIMEOUT) {
+                        break r;
+                    }
+                }
+            }
+        };
+        let (index, acquire_suboptimal) = match acquired {
+            Ok(r) => r,
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
+            | Err(vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => {
+                // Acquire failed: GPU never saw the import; destroy it here.
+                #[cfg(target_os = "linux")]
+                if let Lane::Dmabuf(f) = lane {
+                    f.destroy(&self.device);
+                }
+                self.recreate_swapchain(window)?;
+                return Ok(Presented::Stale);
+            }
+            Err(e) => return Err(e).context("vkAcquireNextImageKHR"),
+        };
+        // Held until the submit waits `acquire_sem`: an error before then leaves the image
+        // for the next present, or for `recreate_swapchain` to retire.
+        self.acquired = Some(index);
+        self.last_acquire_us = acquire_started.elapsed().as_micros() as u32;
         // A `Redraw` samples the retired frame again through the direct pass, so it goes
         // with the next real frame, whose fence covers the redraw's reads too.
         if !redraw {
@@ -454,53 +506,6 @@ impl Presenter {
             self.log_placement(w, h, &p, path);
         }
 
-        let acquire_started = std::time::Instant::now();
-        // An image taken by the non-blocking probe above is used as is.
-        let acquired = match self.acquired {
-            Some(index) => Ok((index, false)),
-            None => {
-                // With a present waiter, each call holds the swapchain for one bounded slice.
-                let timeout = match self.present_timer {
-                    Some(_) => SLICE_NS,
-                    None => u64::MAX,
-                };
-                loop {
-                    let _swapchain = self.present_timer.as_ref().map(|t| t.swapchain_guard());
-                    // SAFETY: `swapchain` and `acquire_sem` are owned here; the guard above is
-                    // the swapchain's host sync. No image is held, so every wait on
-                    // `acquire_sem` is complete: a present's by the fence wait above, a
-                    // discarded image's by `recreate_swapchain`'s queue drain.
-                    let r = unsafe {
-                        self.swap_d.acquire_next_image(
-                            self.swapchain,
-                            timeout,
-                            self.acquire_sem,
-                            vk::Fence::null(),
-                        )
-                    };
-                    if r != Err(vk::Result::TIMEOUT) {
-                        break r;
-                    }
-                }
-            }
-        };
-        let (index, acquire_suboptimal) = match acquired {
-            Ok(r) => r,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                // Acquire failed: GPU never saw the import; destroy it here.
-                #[cfg(target_os = "linux")]
-                if let Lane::Dmabuf(f) = lane {
-                    f.destroy(&self.device);
-                }
-                self.recreate_swapchain(window)?;
-                return Ok(Presented::Stale);
-            }
-            Err(e) => return Err(e).context("vkAcquireNextImageKHR"),
-        };
-        // Held until the submit waits `acquire_sem`: an error before then leaves the image
-        // for the next present, or for `recreate_swapchain` to retire.
-        self.acquired = Some(index);
-        self.last_acquire_us = acquire_started.elapsed().as_micros() as u32;
         let swap_image = self.images[index as usize];
         let direct_target = direct.map(|(_, plan)| CscTarget::Direct {
             framebuffer: self.overlay_pipe.framebuffers[index as usize],
@@ -1041,7 +1046,7 @@ impl Presenter {
             }
             // With present timing the submit also signals `done_sem` with the id the
             // present below will carry: the waiter splits our GPU time from the compositor's.
-            let timed = self.present_timer.is_some() && self.done_sem != vk::Semaphore::null();
+            let timed = self.glass_active() && self.done_sem != vk::Semaphore::null();
             if timed {
                 signal_sems.push(self.done_sem);
                 signal_values.push(self.next_present_id + 1);
@@ -1125,12 +1130,20 @@ impl Presenter {
             // Monotonic present id for `PresentTimer`'s `vkWaitForPresentKHR`.
             let ids = [self.next_present_id + 1];
             let mut pid_info = vk::PresentIdKHR::default().present_ids(&ids);
+            let pid2_info = super::setup::present_wait2::PresentId2::new(&ids);
             let mut present_info = vk::PresentInfoKHR::default()
                 .wait_semaphores(&present_sems)
                 .swapchains(&swapchains)
                 .image_indices(&indices);
-            if self.present_timer.is_some() {
+            // The id names the `done_sem` value either way; only present-wait carries it
+            // to the driver, in the struct of the generation the waiter runs on.
+            if self.glass_active() {
                 self.next_present_id += 1;
+            }
+            if self.present_id2 {
+                // Hand-rolled struct: the chain is empty here, so it is the whole chain.
+                present_info.p_next = (&pid2_info) as *const _ as *const std::ffi::c_void;
+            } else if self.present_timer.is_some() {
                 present_info = present_info.push_next(&mut pid_info);
             }
             let present_started = std::time::Instant::now();
@@ -1148,7 +1161,7 @@ impl Presenter {
             match present_res {
                 Ok(present_suboptimal) => {
                     // A failed present's id may never signal — claim it only on Ok.
-                    if self.present_timer.is_some() {
+                    if self.glass_active() {
                         self.last_presented = Some((self.swapchain, self.next_present_id));
                     }
                     if acquire_suboptimal || present_suboptimal {
@@ -1161,7 +1174,8 @@ impl Presenter {
                     }
                     Ok(Presented::Shown)
                 }
-                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
+                | Err(vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => {
                     self.recreate_swapchain(window)?;
                     Ok(Presented::Stale)
                 }

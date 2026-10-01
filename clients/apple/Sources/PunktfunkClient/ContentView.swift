@@ -1239,15 +1239,8 @@ struct ContentView: View {
             tapPadButton: { [model] bit in model.tapPadButton(bit) },
             pointerGranted: { conn.canSendPointer },
             padMouseTarget: { [ring] in Self.padMouseTarget(ring, conn) },
-            padMouseOn: { [ring] in
-                let t = Self.padMouseTarget(ring, conn)
-                return t != 0 && conn.padMouse & t == t
-            },
-            togglePadMouse: { [ring] in
-                let t = Self.padMouseTarget(ring, conn)
-                let on = conn.padMouse
-                conn.setPadMouse(on & t == t ? on & ~t : on | t)
-            },
+            padMouseMode: { [ring] in conn.padMouseMode(Self.padMouseTarget(ring, conn)) },
+            cyclePadMouse: { [ring] in conn.cyclePadMouse(Self.padMouseTarget(ring, conn)) },
             currentMode: {
                 let m = conn.currentMode()
                 return (m.width, m.height, m.refreshHz)

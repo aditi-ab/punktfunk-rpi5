@@ -484,6 +484,7 @@ public final class SessionAudio {
                         self.playbackEngine = nil
                         self.stateLock.unlock()
                         playback?.stop()
+                        self.retire(playback)
                         self.startCombined(
                             speakerUID: speakerUID, micUID: micUID, micChannel: micChannel)
                     } else {
@@ -569,9 +570,19 @@ public final class SessionAudio {
         }
     }
 
-    /// Stop and release every engine we own, leaving the ring, the drain thread, the observers and
-    /// the audio session alone — the teardown half shared by `stop()` and a rebuild. Safe from any
-    /// thread; the engines are taken under the lock before any of them is touched.
+    /// Hold engines past their last use and drop them later on `engineQueue`. An engine's IO unit
+    /// posts its configuration change from a block that does not retain the engine; freeing the
+    /// engine while a device change has that block queued crashes inside AVFAudio. 3 s outlasts
+    /// a device switch's notification burst.
+    private func retire(_ engines: AVAudioEngine?...) {
+        let held = engines.compactMap { $0 }
+        guard !held.isEmpty else { return }
+        engineQueue.asyncAfter(deadline: .now() + 3) { withExtendedLifetime(held) {} }
+    }
+
+    /// Stop every engine we own and `retire` it, leaving the ring, the drain thread, the observers
+    /// and the audio session alone — the teardown half shared by `stop()` and a rebuild. Safe from
+    /// any thread; the engines are taken under the lock before any of them is touched.
     private func tearDownEngines() {
         stateLock.lock()
         let capture = captureEngine
@@ -591,6 +602,7 @@ public final class SessionAudio {
         #if !os(tvOS)
         uplink?.stop() // after its engine: see `MicUplink.stop`
         #endif
+        retire(capture, playback, combined)
     }
 
     // MARK: - Device changes
@@ -1159,6 +1171,7 @@ public final class SessionAudio {
     private func startPlayback(speakerUID: String) {
         guard let (ring, source, format) = makePlaybackChain() else { return }
         let engine = AVAudioEngine()
+        defer { retire(engine) } // covers every failure return below
         #if os(macOS)
         if !speakerUID.isEmpty {
             if let dev = AudioDevices.deviceID(forUID: speakerUID),
@@ -1251,6 +1264,7 @@ public final class SessionAudio {
     /// mic chain can't be built — a session never loses audio to the echo-cancel feature.
     private func startCombined(speakerUID: String, micUID: String, micChannel: Int) {
         let engine = AVAudioEngine()
+        defer { retire(engine) } // covers every failure return below
         let input = engine.inputNode
         do {
             // Before anything reads the input's format: the voice processor changes it, often
@@ -1338,6 +1352,7 @@ public final class SessionAudio {
     /// here — see `wantsCombined`.
     private func startCapture(micUID: String, micChannel: Int) {
         let engine = AVAudioEngine()
+        defer { retire(engine) } // covers every failure return below
         let input = engine.inputNode
         #if os(macOS)
         if !micUID.isEmpty {

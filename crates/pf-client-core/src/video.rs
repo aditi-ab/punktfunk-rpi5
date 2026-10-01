@@ -43,6 +43,8 @@ pub struct DecodedFrame {
     /// Local wall (ns) when the decoder emitted this image (`decoded` stage).
     /// The presenter subtracts it from its paintable-set stamp for `display`.
     pub decoded_ns: u64,
+    /// The host re-encoded the picture already sent (`USER_FLAG_REPEAT`): nothing new.
+    pub repeat: bool,
     pub image: DecodedImage,
 }
 
@@ -53,8 +55,8 @@ pub use crate::video_d3d11::{D3d11Frame, SlotFormat, SlotHandle};
 pub enum DecodedImage {
     /// Tightly-packed 8-bit I420 for the presenter's planar CSC upload.
     Cpu(CpuPlanarFrame),
-    /// Native VAAPI DRM-PRIME export (`pf-vaapi`). The variant name is the
-    /// `stats:` decode-path tag; renaming it would rename that.
+    /// A hardware picture as dma-bufs: a VAAPI DRM-PRIME export or a V4L2
+    /// CAPTURE buffer. [`DmabufFrame::path`] names which for `stats:`.
     #[cfg(target_os = "linux")]
     NativeDmabuf(DmabufFrame),
     /// Raspberry Pi HEVC V4L2 Request output after NEON SAND detiling.
@@ -288,9 +290,9 @@ impl DecodedImage {
     /// interface: additive only, and surviving tags keep their exact spelling.
     pub fn path_label(&self) -> &'static str {
         match self {
-            DecodedImage::Cpu(_) => "software",
+            DecodedImage::Cpu(f) => f.path,
             #[cfg(target_os = "linux")]
-            DecodedImage::NativeDmabuf(_) => "native-vaapi",
+            DecodedImage::NativeDmabuf(f) => f.path,
             #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
             DecodedImage::V4l2Planar(_) => "v4l2-request",
             #[cfg(windows)]
@@ -322,6 +324,9 @@ pub struct CpuPlanarFrame {
     /// Intra-refresh recovery (`RecoveryWatch`). [`Self::keyframe`] cannot answer
     /// for a wave. H.264 only; AV1 reports [`punktfunk_core::reanchor::LocalRecovery::NONE`].
     pub recovery: punktfunk_core::reanchor::LocalRecovery,
+    /// The rung that decoded it, as the `stats:` decode-path tag: the CPU
+    /// rung, or a hardware rung whose pictures only reach the screen by copy.
+    pub path: &'static str,
 }
 
 impl CpuPlanarFrame {
@@ -395,6 +400,53 @@ impl CpuPlanarFrame {
             color,
             keyframe,
             recovery,
+            path: "software",
+        })
+    }
+
+    /// Take three already tight planes. Refuses a plane whose length is not
+    /// its size: uploading it would shear the picture.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn from_planes(
+        width: u32,
+        height: u32,
+        planes: [Vec<u8>; 3],
+        color: ColorDesc,
+        keyframe: bool,
+        path: &'static str,
+    ) -> Result<CpuPlanarFrame> {
+        let (cw, ch) = Self::chroma_dims(width, height);
+        let sizes = [
+            width as usize * height as usize,
+            cw as usize * ch as usize,
+            cw as usize * ch as usize,
+        ];
+        anyhow::ensure!(width > 0 && height > 0, "empty picture {width}x{height}");
+        let mut offsets = [0usize; 3];
+        let mut at = 0usize;
+        for i in 0..3 {
+            anyhow::ensure!(
+                planes[i].len() == sizes[i],
+                "plane {i}: {} bytes for a {} byte plane",
+                planes[i].len(),
+                sizes[i]
+            );
+            offsets[i] = at;
+            at += sizes[i];
+        }
+        let [mut data, cb, cr] = planes;
+        data.reserve_exact(sizes[1] + sizes[2]);
+        data.extend_from_slice(&cb);
+        data.extend_from_slice(&cr);
+        Ok(CpuPlanarFrame {
+            width,
+            height,
+            data,
+            offsets,
+            color,
+            keyframe,
+            recovery: punktfunk_core::reanchor::LocalRecovery::NONE,
+            path,
         })
     }
 }
@@ -432,6 +484,8 @@ pub struct DmabufFrame {
     /// importer keeps one `VkImage` per key instead of re-importing every frame.
     /// The high 32 bits change when the pool is rebuilt.
     pub pool_key: u64,
+    /// The rung that decoded it, as the `stats:` decode-path tag.
+    pub path: &'static str,
     pub guard: DrmFrameGuard,
 }
 
@@ -447,12 +501,19 @@ pub struct DmabufPlane {
 /// the guard until its fence is waited.
 #[cfg(target_os = "linux")]
 pub struct DrmFrameGuard(
-    /// Unread: the type is its `Drop` (close PRIME fds, return the surface).
-    /// Removing the field releases the surface at construction; an alias would
-    /// leak a pf-vaapi name the presenter must treat as opaque.
+    /// Unread: the type is its `Drop` (return the surface or buffer to its
+    /// decoder). Removing the field releases it at construction.
     #[allow(dead_code)]
-    pub(crate) crate::video_vaapi_native::VaFrameGuard,
+    pub(crate) FrameGuard,
 );
+
+/// The rung's own hold behind a [`DrmFrameGuard`]; opaque to the presenter.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+pub(crate) enum FrameGuard {
+    Va(crate::video_vaapi_native::VaFrameGuard),
+    V4l2(crate::video_v4l2::V4l2FrameGuard),
+}
 
 enum Backend {
     /// pf-vkdecode on the presenter's device. Auto's top rung; pinnable as
@@ -465,6 +526,10 @@ enum Backend {
     V4l2Request(Box<crate::video_v4l2_request::V4l2RequestDecoder>),
     #[cfg(target_os = "linux")]
     NativeVaapi(Box<crate::video_vaapi_native::NativeVaapiDecoder>),
+    /// A V4L2 decoder node (`video_v4l2`), stateful or stateless: the hardware
+    /// rung where neither Vulkan Video nor VA-API exists. Pinnable as `native-v4l2`.
+    #[cfg(target_os = "linux")]
+    NativeV4l2(Box<crate::video_v4l2::NativeV4l2Decoder>),
     /// Native D3D11VA (`pf-dxvadec`): plans into the shareable-RGBA hand-off ring.
     /// Pinnable as `native-d3d11va`; `auto` reaches it. Boxed: two planners + session.
     #[cfg(windows)]
@@ -607,6 +672,64 @@ fn vaapi_auto_ok(vk: Option<&VulkanDecodeDevice>) -> bool {
     vk.is_none_or(|v| v.dmabuf_import && v.vendor_id != crate::video_vk::VENDOR_NVIDIA)
 }
 
+/// May a V4L2 picture reach this presenter? Its buffers are dma-bufs, so the
+/// selected device must import them. `None` preserves non-presenter callers.
+#[cfg(target_os = "linux")]
+fn v4l2_auto_ok(vk: Option<&VulkanDecodeDevice>) -> bool {
+    vk.is_none_or(|v| v.dmabuf_import)
+}
+
+/// V4L2 decode on this machine as `quic::CODEC_*` masks. Empty off Linux.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct V4l2Summary {
+    /// Codecs a decoder node takes and returns as an importable picture.
+    pub codecs: u8,
+    /// Subset of `codecs` with a 10-bit decode path the presenter can consume.
+    pub ten_bit: u8,
+}
+
+/// What the selected V4L2 rung can deliver. The Pi FFmpeg pin uploads planar
+/// pixels and accepts Main10 independently of native dma-buf import support.
+fn v4l2_summary(vk: Option<&VulkanDecodeDevice>, decoder_pref: &str) -> V4l2Summary {
+    #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
+    {
+        let pin = resolve_decoder_pref(
+            std::env::var("PUNKTFUNK_DECODER").ok().as_deref(),
+            decoder_pref,
+        );
+        if let Some(summary) = rpi_request_summary(&pin, || {
+            let Ok(nodes) = std::fs::read_dir("/sys/class/video4linux") else {
+                return false;
+            };
+            nodes.flatten().any(|node| {
+                std::fs::read_to_string(node.path().join("name"))
+                    .is_ok_and(|name| name.trim() == "rpi-hevc-dec")
+                    && pf_v4l2::Node::open(&std::path::Path::new("/dev").join(node.file_name()))
+                        .is_ok()
+            })
+        }) {
+            return summary;
+        }
+    }
+    let _ = decoder_pref;
+    #[cfg(target_os = "linux")]
+    if v4l2_auto_ok(vk) && !vk.is_some_and(|v| v.video_decode) {
+        return crate::video_v4l2::caps().summary();
+    }
+    let _ = vk;
+    V4l2Summary::default()
+}
+
+/// The FFmpeg pin supports Main10 through NEON transfer on an accessible Pi
+/// HEVC device. Other pins keep the native driver's format-based capability probe.
+#[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
+fn rpi_request_summary(pin: &str, available: impl FnOnce() -> bool) -> Option<V4l2Summary> {
+    (pin == crate::video_v4l2_request::DECODER_PIN && available()).then_some(V4l2Summary {
+        codecs: punktfunk_core::quic::CODEC_HEVC,
+        ten_bit: punktfunk_core::quic::CODEC_HEVC,
+    })
+}
+
 /// One decode rung, named so evidence and admission can talk without a
 /// per-platform [`Backend`] variant. The CPU rung is in the table only ([`native_evidence`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -617,6 +740,8 @@ pub enum NativeRung {
     D3d11va,
     /// pf-vaapi driving a dlopen'd libva (`video_vaapi_native`, Linux).
     Vaapi,
+    /// A V4L2 decoder node, stateful or stateless (`video_v4l2`, Linux).
+    V4l2,
     /// openh264 + rav1d (`video_software`).
     Software,
 }
@@ -628,6 +753,7 @@ impl NativeRung {
             NativeRung::Vulkan => "native-vulkan",
             NativeRung::D3d11va => "native-d3d11va",
             NativeRung::Vaapi => "native-vaapi",
+            NativeRung::V4l2 => "native-v4l2",
             NativeRung::Software => "software",
         }
     }
@@ -847,6 +973,15 @@ pub fn vaapi_av1_decodable(vendor_id: u32, vulkan_av1: bool) -> bool {
         && crate::video_vaapi_native::av1_decodable(vendor_id)
 }
 
+/// Does the presenter's VAAPI node decode HEVC, where its Vulkan does not? Same
+/// one-time question as [`vaapi_av1_decodable`].
+#[cfg(target_os = "linux")]
+pub fn vaapi_hevc_decodable(vendor_id: u32, vulkan_hevc: bool) -> bool {
+    !vulkan_hevc
+        && vendor_id != crate::video_vk::VENDOR_NVIDIA
+        && crate::video_vaapi_native::hevc_decodable(vendor_id)
+}
+
 /// Can this machine decode AV1 in hardware? Device facts only, never a decoder existing:
 /// Vulkan `DECODE_AV1` on the decode family; (Windows) D3D11 import so DXVA can run
 /// Profile 0; (Linux) the presenter's VAAPI AV1 entry point, on a presenter the VAAPI
@@ -953,6 +1088,32 @@ pub fn multi_slice_decodable(vendor_id: Option<u32>) -> bool {
     !(cfg!(windows) && vendor_id == Some(VENDOR_INTEL))
 }
 
+/// Can a 10-bit stream be decoded here? The CPU rung is 8-bit, so this needs a
+/// hardware rung with a 10-bit path: Vulkan Video, the platform rung, V4L2 with
+/// an importable or planar-transfer 10-bit format, or PyroWave. A software pin
+/// has only the last one.
+pub fn ten_bit_decodable(vk: Option<&VulkanDecodeDevice>, decoder_pref: &str) -> bool {
+    ten_bit_decodable_with(vk, decoder_pref, v4l2_summary(vk, decoder_pref))
+}
+
+/// [`ten_bit_decodable`] over an explicit V4L2 answer; tests need no device node.
+pub(crate) fn ten_bit_decodable_with(
+    vk: Option<&VulkanDecodeDevice>,
+    decoder_pref: &str,
+    v4l2: V4l2Summary,
+) -> bool {
+    // No device facts: keep the promise and let the rungs decide.
+    let Some(v) = vk else {
+        return !decode_pinned_to_software(decoder_pref);
+    };
+    #[cfg(target_os = "linux")]
+    let platform = vaapi_auto_ok(Some(v)) && (v.vaapi_hevc_decode || v.vaapi_av1_decode);
+    #[cfg(not(target_os = "linux"))]
+    let platform = v.d3d11_import;
+    let hardware = v.video_decode || platform || v4l2.ten_bit != 0;
+    v.pyrowave_decode || (hardware && !decode_pinned_to_software(decoder_pref))
+}
+
 /// Desktop `video_caps` from the user switches, testable without a GPU.
 /// Callers AND `want_444` with [`hevc_444_hardware_decodable`], `hdr_enabled`
 /// with [`hdr_presentable`] and pass [`multi_slice_decodable`] as `multi_slice`
@@ -984,10 +1145,37 @@ pub fn video_caps_for(
 /// codecs `decoder_pref` makes unreachable. Advertisement only: `resolve_codec`
 /// never auto-picks PyroWave.
 pub fn decodable_codecs_for(vk: Option<&VulkanDecodeDevice>, decoder_pref: &str) -> u8 {
+    let v4l2 = v4l2_summary(vk, decoder_pref);
+    let bits = decodable_codecs_with(vk, decoder_pref, v4l2);
+    tracing::info!(
+        vulkan = format_args!(
+            "{:#x}",
+            vk.filter(|v| v.video_decode)
+                .map_or(0, |v| v.decode_video_caps)
+        ),
+        vaapi_hevc = vk.is_some_and(|v| v.vaapi_hevc_decode),
+        vaapi_av1 = vk.is_some_and(|v| v.vaapi_av1_decode),
+        v4l2 = format_args!("{:#04x}", v4l2.codecs),
+        v4l2_ten_bit = format_args!("{:#04x}", v4l2.ten_bit),
+        advertised = format_args!("{bits:#04x}"),
+        "decode ladder"
+    );
+    bits
+}
+
+/// [`decodable_codecs_for`] over an explicit V4L2 answer; tests need no device node.
+pub(crate) fn decodable_codecs_with(
+    vk: Option<&VulkanDecodeDevice>,
+    decoder_pref: &str,
+    v4l2: V4l2Summary,
+) -> u8 {
     let mut bits = decodable_codecs();
     // AV1 is hardware-gated. Without this the CPU rung's existence advertises
     // AV1 to a machine that would decode it in software, and negotiation has no fallback.
-    if bits & punktfunk_core::quic::CODEC_AV1 != 0 && !av1_hardware_decodable(vk) {
+    if bits & punktfunk_core::quic::CODEC_AV1 != 0
+        && !av1_hardware_decodable(vk)
+        && v4l2.codecs & punktfunk_core::quic::CODEC_AV1 == 0
+    {
         tracing::info!(
             "AV1 not advertised: no hardware AV1 decode on this device (a software \
              decoder exists, but a 4K AV1 stream is not survivable on it)"
@@ -1006,12 +1194,14 @@ pub fn decodable_codecs_for(vk: Option<&VulkanDecodeDevice>, decoder_pref: &str)
         );
         bits &= !punktfunk_core::quic::CODEC_HEVC;
     }
-    // HEVC has no software rung, so the promise needs a hardware decoder: Vulkan
-    // `DECODE_H265` or a DXVA HEVC profile. Advertised blind, the host builds an HEVC
-    // session the client tears down and re-dials without — every launch.
-    #[cfg(windows)]
-    if bits & punktfunk_core::quic::CODEC_HEVC != 0 && !hevc_hardware_decodable(vk) {
-        tracing::info!("HEVC not advertised: this adapter exposes no HEVC decode profile");
+    // HEVC has no software rung, so the promise needs a hardware decoder. Advertised
+    // blind, the host builds an HEVC session the client tears down and re-dials
+    // without — every launch.
+    if bits & punktfunk_core::quic::CODEC_HEVC != 0
+        && !hevc_hardware_decodable(vk)
+        && v4l2.codecs & punktfunk_core::quic::CODEC_HEVC == 0
+    {
+        tracing::info!("HEVC not advertised: no hardware HEVC decoder on this device");
         bits &= !punktfunk_core::quic::CODEC_HEVC;
     }
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
@@ -1023,15 +1213,19 @@ pub fn decodable_codecs_for(vk: Option<&VulkanDecodeDevice>, decoder_pref: &str)
     bits
 }
 
-/// Can this adapter decode HEVC in hardware? Vulkan `DECODE_H265`, else a DXVA HEVC
-/// profile on the presenter's adapter. Device facts only, never a decoder existing.
-#[cfg(windows)]
+/// Can this adapter decode HEVC in hardware? Vulkan `DECODE_H265`, else the platform
+/// rung: a DXVA HEVC profile on the presenter's adapter, or its VAAPI node where
+/// `auto` may feed it. Device facts only, never a decoder existing.
 fn hevc_hardware_decodable(vk: Option<&VulkanDecodeDevice>) -> bool {
     let Some(v) = vk else {
         return false;
     };
-    (v.video_decode && v.decode_video_caps & VIDEO_CODEC_OP_DECODE_H265 != 0)
-        || (v.d3d11_import && crate::video_d3d11_native::adapter_decodes_hevc(v.adapter_luid))
+    #[cfg(windows)]
+    let platform =
+        v.d3d11_import && crate::video_d3d11_native::adapter_decodes_hevc(v.adapter_luid);
+    #[cfg(target_os = "linux")]
+    let platform = v.vaapi_hevc_decode && vaapi_auto_ok(Some(v));
+    (v.video_decode && v.decode_video_caps & VIDEO_CODEC_OP_DECODE_H265 != 0) || platform
 }
 
 /// Log what `PUNKTFUNK_AU_FAULT` will do, including when the answer is nothing.
@@ -1080,6 +1274,11 @@ fn log_rung(backend: &Backend, wire: u8) {
         Backend::NativeVaapi(_) => (
             NativeRung::Vaapi.name(),
             Some(native_evidence(NativeRung::Vaapi, wire)),
+        ),
+        #[cfg(target_os = "linux")]
+        Backend::NativeV4l2(_) => (
+            NativeRung::V4l2.name(),
+            Some(native_evidence(NativeRung::V4l2, wire)),
         ),
         Backend::Software(_) => (
             NativeRung::Software.name(),
@@ -1248,6 +1447,22 @@ impl Decoder {
                     "PUNKTFUNK_DECODER=native-vaapi refused (needs an H.264, HEVC or \
                      AV1 session) — standard ladder"
                 ),
+            }
+            choice = "auto".to_string();
+        }
+        #[cfg(target_os = "linux")]
+        if choice == crate::video_v4l2::DECODER_PIN {
+            match crate::video_v4l2::NativeV4l2Decoder::new(wire, stream) {
+                Ok(d) => {
+                    tracing::info!(
+                        codec = codec_name,
+                        decoder = d.name(),
+                        "native V4L2 hardware decode active"
+                    );
+                    return done(Backend::NativeV4l2(Box::new(d)));
+                }
+                Err(e) => tracing::warn!(reason = %format!("{e:#}"),
+                    "native V4L2 init failed — demoting to the standard ladder"),
             }
             choice = "auto".to_string();
         }
@@ -1444,6 +1659,22 @@ impl Decoder {
                 return done(b);
             }
         }
+        // V4L2 last: it is the rung of devices that have neither of the above.
+        #[cfg(target_os = "linux")]
+        if choice != "software" && v4l2_auto_ok(vk) {
+            match crate::video_v4l2::NativeV4l2Decoder::new(wire, stream) {
+                Ok(d) => {
+                    tracing::info!(
+                        codec = codec_name,
+                        decoder = d.name(),
+                        "native V4L2 hardware decode active"
+                    );
+                    return done(Backend::NativeV4l2(Box::new(d)));
+                }
+                Err(e) => tracing::info!(reason = %format!("{e:#}"),
+                    "native V4L2 unavailable — continuing down the ladder"),
+            }
+        }
         // D3D11VA fallback when Vulkan is missing or failed. `d3d11_tried` skips the Intel/unknown first try.
         #[cfg(windows)]
         if choice != "software" && !d3d11_tried {
@@ -1471,6 +1702,24 @@ impl Decoder {
         }
     }
 
+    /// Whether a Vulkan-Video decode is complete now, without waiting. `true` off that
+    /// backend: nothing is pending there.
+    pub fn hw_decoded_now(&mut self, timeline_sem: u64, value: u64) -> bool {
+        match &mut self.backend {
+            Backend::NativeVulkan(d) => d.timeline_done(timeline_sem, value),
+            _ => true,
+        }
+    }
+
+    /// The decode wait is also the media clock boost (Intel on i915): the pump waits
+    /// it at once instead of one AU behind.
+    pub fn hw_wait_boosted(&self) -> bool {
+        match &self.backend {
+            Backend::NativeVulkan(d) => d.boosted(),
+            _ => false,
+        }
+    }
+
     /// Decode-integrity counters, or `None` where the backend cannot answer
     /// (CPU, PyroWave). `None` is "cannot see corruption"; `Some(default)` is "looked and saw none".
     pub fn decode_health(&self) -> Option<DecodeHealth> {
@@ -1483,6 +1732,8 @@ impl Decoder {
             // Same as DXVA: libva has no per-picture decode-status query.
             #[cfg(target_os = "linux")]
             Backend::NativeVaapi(d) => Some(d.health()),
+            #[cfg(target_os = "linux")]
+            Backend::NativeV4l2(d) => Some(d.health()),
             _ => None,
         }
     }
@@ -1613,6 +1864,8 @@ impl Decoder {
             Backend::NativeVulkan(n) => n.forgive_unclean(),
             #[cfg(target_os = "linux")]
             Backend::NativeVaapi(v) => v.forgive_unclean(),
+            #[cfg(target_os = "linux")]
+            Backend::NativeV4l2(d) => d.forgive_unclean(),
             #[cfg(windows)]
             Backend::NativeD3d11va(d) => d.forgive_unclean(),
             _ => {}
@@ -1657,6 +1910,8 @@ impl Decoder {
                 v.decode(au).map(|f| f.map(DecodedImage::NativeDmabuf)),
                 v.take_recovery_request(),
             ),
+            #[cfg(target_os = "linux")]
+            Backend::NativeV4l2(d) => (d.decode(au), d.take_recovery_request()),
             #[cfg(windows)]
             Backend::NativeD3d11va(d) => (
                 d.decode(au).map(|f| f.map(DecodedImage::D3d11)),
@@ -1693,6 +1948,8 @@ impl Decoder {
                     Backend::V4l2Request(_) => "V4L2 Request",
                     #[cfg(target_os = "linux")]
                     Backend::NativeVaapi(_) => "native VAAPI",
+                    #[cfg(target_os = "linux")]
+                    Backend::NativeV4l2(_) => "native V4L2",
                     // PyroWave returns above and software never reaches here.
                     _ => "hardware",
                 };
@@ -2116,6 +2373,7 @@ mod tests {
             d3d11_import: false,
             dmabuf_import: true,
             vaapi_av1_decode: false,
+            vaapi_hevc_decode: false,
             d3d11_hdr10: false,
             d3d11_nv12: false,
             d3d11_p010: false,
@@ -2290,6 +2548,122 @@ mod tests {
         dev.video_decode = false;
         #[cfg(not(windows))]
         assert!(!av1_hardware_decodable(Some(&dev)));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "rpi5-v4l2-request"))]
+    #[test]
+    fn pi_request_pin_advertises_main10_without_dmabuf_import() {
+        if std::env::var_os("PUNKTFUNK_DECODER").is_some() {
+            return;
+        }
+        let summary = rpi_request_summary("v4l2-request", || true).unwrap();
+        let mut pi = decode_device(0x14e4, "V3D");
+        pi.video_decode = false;
+        pi.dmabuf_import = false;
+        assert_ne!(
+            decodable_codecs_with(Some(&pi), "v4l2-request", summary) & CODEC_HEVC,
+            0
+        );
+        assert!(ten_bit_decodable_with(Some(&pi), "v4l2-request", summary));
+        assert!(rpi_request_summary("v4l2-request", || false).is_none());
+        for pin in ["auto", "native-v4l2", "software"] {
+            assert!(rpi_request_summary(pin, || panic!("must not probe another pin")).is_none());
+        }
+    }
+
+    /// HEVC has no CPU rung, so it is advertised only where hardware decodes
+    /// it: Vulkan, the platform rung, or a V4L2 node. An ARM board with none
+    /// of them starts on H.264 instead of re-dialling.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hevc_is_advertised_only_where_hardware_decodes_it() {
+        if std::env::var_os("PUNKTFUNK_DECODER").is_some() {
+            return;
+        }
+        let none = V4l2Summary::default();
+        let mut soc = decode_device(0x5143, "Turnip Adreno (TM) 750");
+        soc.video_decode = false;
+        assert_eq!(
+            decodable_codecs_with(Some(&soc), "auto", none),
+            CODEC_H264,
+            "no hardware decoder: only the codec with a CPU rung"
+        );
+        let iris = V4l2Summary {
+            codecs: CODEC_H264 | CODEC_HEVC,
+            ten_bit: 0,
+        };
+        assert_eq!(
+            decodable_codecs_with(Some(&soc), "auto", iris),
+            CODEC_H264 | CODEC_HEVC
+        );
+        let av1_too = V4l2Summary {
+            codecs: CODEC_H264 | CODEC_HEVC | CODEC_AV1,
+            ten_bit: CODEC_HEVC,
+        };
+        assert_eq!(
+            decodable_codecs_with(Some(&soc), "auto", av1_too),
+            CODEC_H264 | CODEC_HEVC | CODEC_AV1
+        );
+
+        // Vulkan and VAAPI answer as before.
+        let mut radv = decode_device(0x1002, "AMD RADV NAVI32");
+        radv.decode_video_caps = VIDEO_CODEC_OP_DECODE_H264 | VIDEO_CODEC_OP_DECODE_H265;
+        assert_ne!(
+            decodable_codecs_with(Some(&radv), "auto", none) & CODEC_HEVC,
+            0
+        );
+        let mut old_intel = decode_device(0x8086, "Intel(R) HD Graphics 530");
+        old_intel.video_decode = false;
+        assert_eq!(
+            decodable_codecs_with(Some(&old_intel), "auto", none) & CODEC_HEVC,
+            0
+        );
+        old_intel.vaapi_hevc_decode = true;
+        assert_ne!(
+            decodable_codecs_with(Some(&old_intel), "auto", none) & CODEC_HEVC,
+            0
+        );
+        old_intel.dmabuf_import = false;
+        assert_eq!(
+            decodable_codecs_with(Some(&old_intel), "auto", none) & CODEC_HEVC,
+            0,
+            "VAAPI frames need dmabuf import"
+        );
+    }
+
+    /// 10-bit is a promise about a hardware rung; the CPU rung refuses it.
+    #[test]
+    fn ten_bit_is_advertised_only_with_a_hardware_ten_bit_path() {
+        if std::env::var_os("PUNKTFUNK_DECODER").is_some() {
+            return;
+        }
+        let none = V4l2Summary::default();
+        let vulkan = decode_device(0x10DE, "NVIDIA GeForce RTX 3070 Ti");
+        assert!(ten_bit_decodable_with(Some(&vulkan), "auto", none));
+        assert!(
+            !ten_bit_decodable_with(Some(&vulkan), "software", none),
+            "a software pin makes the hardware unreachable"
+        );
+
+        let mut soc = decode_device(0x5143, "Turnip Adreno (TM) 750");
+        soc.video_decode = false;
+        assert!(!ten_bit_decodable_with(Some(&soc), "auto", none));
+        let eight_bit_only = V4l2Summary {
+            codecs: CODEC_H264 | CODEC_HEVC,
+            ten_bit: 0,
+        };
+        assert!(!ten_bit_decodable_with(Some(&soc), "auto", eight_bit_only));
+        let p010 = V4l2Summary {
+            codecs: CODEC_H264 | CODEC_HEVC,
+            ten_bit: CODEC_HEVC,
+        };
+        assert!(ten_bit_decodable_with(Some(&soc), "auto", p010));
+
+        // PyroWave carries its own depth and its own decoder.
+        soc.pyrowave_decode = true;
+        assert!(ten_bit_decodable_with(Some(&soc), "software", none));
+        // No device facts: the promise stays, as before.
+        assert!(ten_bit_decodable_with(None, "auto", none));
     }
 
     /// A pin with stray whitespace is still a pin. `"native-vulkan "` matched

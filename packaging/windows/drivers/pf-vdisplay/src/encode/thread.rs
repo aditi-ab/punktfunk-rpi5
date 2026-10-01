@@ -197,8 +197,9 @@ impl EncodeThread {
 
 /// The thread body: open, build or reuse the monitor's pool, report, then drive until stopped.
 /// The pool is reused — retained slot included — when it already fits this session's device,
-/// size and input kind; anything else is a fresh pool installed on the monitor. The open line
-/// names the frame path (`pool` or `bypass`), so a comparison run can prove which it got.
+/// size and input kind; anything else is a fresh pool installed on the monitor. The session
+/// opens on the pool's newest frame or the monitor's seed, and its sequence is in the header
+/// before the reply. The open line names the frame path (`pool` or `bypass`) and that frame.
 fn run(stop: HANDLE, ctx: ThreadCtx, live: Arc<AtomicBool>) {
     let _mmcss = Mmcss::distribution("encode");
     let section = &ctx.session.section;
@@ -249,14 +250,16 @@ fn run(stop: HANDLE, ctx: ThreadCtx, live: Arc<AtomicBool>) {
             Err(f) => return fail(wire::SET_ENCODE_POOL, f),
         },
     };
+    let first = pool.first_frame(&monitor.seed());
     drop(monitor);
     dbglog!(
-        "[pf-vd] encode: backend {} open {}x{} {:?} mode={} (target {})",
+        "[pf-vd] encode: backend {} open {}x{} {:?} mode={} first_frame={} (target {})",
         reply.backend_opened,
         spec.width,
         spec.height,
         spec.kind,
         if pool.bypass() { "bypass" } else { "pool" },
+        first.map_or("none".into(), |s| format!("seq {s}")),
         ctx.session.request.target_id
     );
     // What the pool guarantees, so a backend that can encode an input texture where it lies skips
@@ -273,6 +276,10 @@ fn run(stop: HANDLE, ctx: ThreadCtx, live: Arc<AtomicBool>) {
     // declines before it ever accepts one still reads back as the rate that is encoding.
     let opened_kbps = reply.applied_bitrate_kbps;
     section.store_u32(offset_of!(AuHeader, applied_bitrate_kbps), opened_kbps);
+    // The host counts a first frame by this sequence moving, and a queued frame is one.
+    if let Some(seq) = first {
+        section.store_u64(offset_of!(AuHeader, source_seq), seq);
+    }
     if ctx.opened.send(reply).is_err() {
         // The caller gave up waiting: nothing will install this session.
         return;

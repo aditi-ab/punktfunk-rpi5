@@ -51,8 +51,7 @@ fn stage_name(s: Stage) -> &'static str {
 /// Cursor travel over a frozen image that counts as INPUT evidence — a couple of real mouse
 /// movements, comfortably above sub-pixel jitter (the WP3b value).
 const INPUT_EVIDENCE_PX: u32 = 64;
-/// No canary before this much missed source, and at most one per interval: the only canary we
-/// have is the input kick (plan: "old-OS fallback"), which briefly parks the pointer.
+/// No canary before this much missed source, and at most one per interval.
 const CANARY_AFTER: Duration = Duration::from_secs(5);
 /// A canary that no source frame answered within this much is strong evidence.
 const CANARY_ANSWER: Duration = Duration::from_secs(1);
@@ -81,7 +80,7 @@ pub(super) struct Inputs {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Step {
     Nothing,
-    /// Present the composition canary (the input kick).
+    /// Present the composition canary (`pf_win_display::compose_probe`).
     Canary,
     Run(Stage),
     /// The episode closed on proof; `outage` spans the last good frame to the proving one.
@@ -106,8 +105,10 @@ pub(super) struct Supervisor {
     opened: Option<(Duration, Instant)>,
     /// When cursor travel first crossed the evidence bar in this gap.
     input_at: Option<Instant>,
-    /// When the last canary went out.
+    /// When the last canary was asked for; it rate-limits the next.
     canary_at: Option<Instant>,
+    /// That canary reached the screen, so an unanswered one is evidence.
+    canary_shown: bool,
     /// The encoder's `published_total` at the last tick: its delta is AU progress.
     published_last: u64,
 }
@@ -122,6 +123,7 @@ impl Supervisor {
             opened: None,
             input_at: None,
             canary_at: None,
+            canary_shown: false,
             published_last: 0,
         }
     }
@@ -213,7 +215,12 @@ impl Supervisor {
             source_seq: i.source_seq,
             last_au: i.encoder.map(|t| t.last_au),
             present_to_arrival: i.encoder.and_then(|t| t.present_to_arrival),
-            activity: evidence(i.now, i.last_source, self.input_at, self.canary_at),
+            activity: evidence(
+                i.now,
+                i.last_source,
+                self.input_at,
+                self.canary_at.filter(|_| self.canary_shown),
+            ),
             topology_in_transaction: i.topology_held,
             rebuilding: i.recreating,
             secure_desktop: i.secure_desktop,
@@ -262,9 +269,16 @@ impl Supervisor {
                 .is_none_or(|t| i.now.saturating_duration_since(t) >= CANARY_AFTER)
         {
             self.canary_at = Some(i.now);
+            self.canary_shown = true;
             return Step::Canary;
         }
         Step::Nothing
+    }
+
+    /// The canary [`Step::Canary`] asked for could not be shown: it never counts as unanswered.
+    /// The next interval asks again.
+    pub(super) fn canary_not_shown(&mut self) {
+        self.canary_shown = false;
     }
 
     /// The running stage's actuator finished.
@@ -453,6 +467,20 @@ mod tests {
         // The outage is the whole hole: 62 s of missed source before the episode plus 1 s in it.
         assert_eq!(outage, Duration::from_secs(63));
         assert!(!sv.owns_episode());
+    }
+
+    /// A canary that never reached the screen is no evidence: the ladder stays shut, and the
+    /// next canary waits out the interval.
+    #[test]
+    fn a_canary_nobody_saw_opens_nothing() {
+        let t0 = Instant::now();
+        let s = |n: u64| t0 + Duration::from_secs(n);
+        let mut sv = Supervisor::new(t0);
+        assert_eq!(sv.tick(inputs(s(61), t0, 200)), Step::Canary);
+        sv.canary_not_shown();
+        assert_eq!(sv.tick(inputs(s(62), t0, 200)), Step::Nothing);
+        assert!(!sv.owns_episode());
+        assert_eq!(sv.tick(inputs(s(66), t0, 200)), Step::Canary);
     }
 
     /// A wedged encoder whose two resets already detached threads (`detached == 2`) skips a

@@ -164,7 +164,15 @@ pub(crate) fn spawn(
             Ok(mut spawned) => {
                 out.now = true;
                 out.workspace = spawned.workspace.take();
-                out.child = Some((spawned.child, spawned.group_leader));
+                if spawned.steam_forwarder {
+                    // Reaped here, never leased: it may be the Steam client itself.
+                    let mut child = spawned.child;
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                } else {
+                    out.child = Some((spawned.child, spawned.group_leader));
+                }
             }
             Err(e) => tracing::warn!(
                 command = %cmd,

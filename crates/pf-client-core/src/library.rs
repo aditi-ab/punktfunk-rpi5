@@ -667,30 +667,11 @@ pub fn spawn_art_fetch(
                     }
                     let job = queue.lock().unwrap().pop_front();
                     let Some((id, candidates)) = job else { break };
-                    // Every candidate is asked of disk before any of them is asked of the
-                    // network: last launch's winner is often the second URL, and walking in
-                    // order would spend a round trip on the first one's known miss.
-                    if let Some(bytes) = candidates.iter().find_map(|u| crate::art_cache::load(u)) {
+                    let bytes = resolve_art(&agent, &base, &id, &candidates, || tx.is_closed());
+                    // Receiver dropped (page popped): stop fetching.
+                    if let Some(bytes) = bytes {
                         if tx.send_blocking((id, bytes)).is_err() {
                             return;
-                        }
-                        continue;
-                    }
-                    for url in &candidates {
-                        if tx.is_closed() {
-                            return;
-                        }
-                        match fetch_art(&agent, &base, url) {
-                            Ok(bytes) => {
-                                crate::art_cache::store(url, &bytes);
-                                // Receiver dropped (page popped) — stop fetching.
-                                if tx.send_blocking((id, bytes)).is_err() {
-                                    return;
-                                }
-                                break;
-                            }
-                            // Miss (often 404 on a guessed CDN path) — try the next URL.
-                            Err(e) => tracing::debug!(%id, url, error = %e, "poster miss"),
                         }
                     }
                 }
@@ -700,16 +681,180 @@ pub fn spawn_art_fetch(
     rx
 }
 
+/// One poster's bytes: every candidate is asked of disk before any of the network, since last
+/// launch's winner is often the second URL. A network hit is written back to disk. `gone` is
+/// asked between requests, so a closed page stops the walk.
+#[cfg(desktop)]
+fn resolve_art(
+    agent: &ureq::Agent,
+    base: &str,
+    id: &str,
+    candidates: &[String],
+    gone: impl Fn() -> bool,
+) -> Option<Vec<u8>> {
+    if let Some(bytes) = candidates.iter().find_map(|u| crate::art_cache::load(u)) {
+        return Some(bytes);
+    }
+    for url in candidates {
+        if gone() {
+            return None;
+        }
+        match fetch_art(agent, base, url) {
+            Ok(bytes) => {
+                crate::art_cache::store(url, &bytes);
+                return Some(bytes);
+            }
+            // Miss (often 404 on a guessed CDN path): try the next URL.
+            Err(e) => tracing::debug!(%id, url, error = %e, "poster miss"),
+        }
+    }
+    None
+}
+
+/// Posters most shown right now: newer requests are served first, and past this many waiting
+/// the oldest are dropped, since a fast scroll asks for thousands it has already passed.
+#[cfg(desktop)]
+const ART_QUEUE_MAX: usize = 256;
+
+/// One poster to find: its title's id, the URLs to try, and a hint the decoder reads.
+#[cfg(desktop)]
+pub struct ArtJob<H> {
+    pub id: String,
+    pub candidates: Vec<String>,
+    pub hint: H,
+}
+
+/// The waiting jobs, newest last.
+#[cfg(desktop)]
+struct ArtQueue<H> {
+    jobs: VecDeque<ArtJob<H>>,
+    closed: bool,
+}
+
+#[cfg(desktop)]
+impl<H> ArtQueue<H> {
+    /// Queue `job`; returns the ids that fell off the old end.
+    fn push(&mut self, job: ArtJob<H>) -> Vec<String> {
+        self.jobs.push_back(job);
+        let over = self.jobs.len().saturating_sub(ART_QUEUE_MAX);
+        self.jobs.drain(..over).map(|j| j.id).collect()
+    }
+
+    fn pop(&mut self) -> Option<ArtJob<H>> {
+        self.jobs.pop_back()
+    }
+}
+
+/// Posters on demand for one host: jobs arrive as posters are drawn, and each worker keeps its
+/// one connection for the pool's life. `decode` runs on the worker, so the thread that draws
+/// only wraps finished pixels. Dropping the pool stops the workers.
+#[cfg(desktop)]
+pub struct ArtPool<H> {
+    shared: Arc<(Mutex<ArtQueue<H>>, std::sync::Condvar)>,
+}
+
+#[cfg(desktop)]
+impl<H: Send + 'static> ArtPool<H> {
+    /// Start the workers. Each result is the job's id and its decoded poster, `None` when no
+    /// candidate loaded or decoded.
+    pub fn start<T: Send + 'static>(
+        base: String,
+        identity: (String, String),
+        pin: Option<[u8; 32]>,
+        decode: impl Fn(Vec<u8>, &H) -> Option<T> + Send + Sync + 'static,
+    ) -> (ArtPool<H>, async_channel::Receiver<(String, Option<T>)>) {
+        let shared = Arc::new((
+            Mutex::new(ArtQueue {
+                jobs: VecDeque::new(),
+                closed: false,
+            }),
+            std::sync::Condvar::new(),
+        ));
+        let (tx, rx) = async_channel::unbounded();
+        let decode = Arc::new(decode);
+        for _ in 0..ART_WORKERS {
+            let (shared, tx, base, identity, decode) = (
+                shared.clone(),
+                tx.clone(),
+                base.clone(),
+                identity.clone(),
+                decode.clone(),
+            );
+            let spawned = std::thread::Builder::new()
+                .name("punktfunk-lib-art".into())
+                .spawn(move || {
+                    let Ok(agent) = agent(&identity, pin) else {
+                        return;
+                    };
+                    let gone = || tx.is_closed() || shared.0.lock().unwrap().closed;
+                    loop {
+                        let job = {
+                            let mut queue = shared.0.lock().unwrap();
+                            loop {
+                                if queue.closed {
+                                    return;
+                                }
+                                if let Some(job) = queue.pop() {
+                                    break job;
+                                }
+                                queue = shared.1.wait(queue).unwrap();
+                            }
+                        };
+                        let bytes = resolve_art(&agent, &base, &job.id, &job.candidates, gone);
+                        let decoded = bytes.and_then(|b| decode(b, &job.hint));
+                        if tx.send_blocking((job.id, decoded)).is_err() {
+                            return;
+                        }
+                    }
+                });
+            if let Err(e) = spawned {
+                tracing::warn!(error = %e, "poster worker did not start");
+            }
+        }
+        (ArtPool { shared }, rx)
+    }
+
+    /// Ask for a poster ahead of everything already waiting. Returns the ids dropped from the
+    /// old end, which were never fetched.
+    pub fn push(&self, job: ArtJob<H>) -> Vec<String> {
+        let dropped = self.shared.0.lock().unwrap().push(job);
+        self.shared.1.notify_one();
+        dropped
+    }
+}
+
+#[cfg(desktop)]
+impl<H> Drop for ArtPool<H> {
+    fn drop(&mut self) {
+        self.shared.0.lock().unwrap().closed = true;
+        self.shared.1.notify_all();
+    }
+}
+
 #[cfg(desktop)]
 pub(crate) fn classify(e: ureq::Error) -> LibraryError {
+    // `PinVerify`'s fingerprint-mismatch error, and only that: a broader cert arm would also
+    // catch unrelated TLS failures. The pinned connector hands it back inside an io error.
+    let pin_failure = |r: &rustls::Error| {
+        matches!(
+            r,
+            rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure
+            )
+        )
+    };
     match e {
         ureq::Error::StatusCode(401 | 403) => LibraryError::NotPaired,
         ureq::Error::StatusCode(code) => LibraryError::Http(code),
-        // `PinVerify`'s fingerprint-mismatch error. Match this variant only —
-        // a broader cert-error arm would also fire on unrelated TLS failures.
-        ureq::Error::Rustls(rustls::Error::InvalidCertificate(
-            rustls::CertificateError::ApplicationVerificationFailure,
-        )) => LibraryError::PinMismatch,
+        ureq::Error::Rustls(ref r) if pin_failure(r) => LibraryError::PinMismatch,
+        ureq::Error::Io(ref io)
+            if io
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+                .is_some_and(pin_failure) =>
+        {
+            LibraryError::PinMismatch
+        }
         other => LibraryError::Unreachable(other.to_string()),
     }
 }
@@ -717,6 +862,62 @@ pub(crate) fn classify(e: ureq::Error) -> LibraryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The newest request is served first, and a full queue drops its oldest.
+    #[cfg(desktop)]
+    #[test]
+    fn the_art_queue_serves_the_newest_and_drops_the_oldest() {
+        let job = |i: usize| ArtJob {
+            id: format!("t{i}"),
+            candidates: Vec::new(),
+            hint: (),
+        };
+        let mut queue = ArtQueue {
+            jobs: VecDeque::new(),
+            closed: false,
+        };
+        for i in 0..ART_QUEUE_MAX {
+            assert!(queue.push(job(i)).is_empty());
+        }
+        assert_eq!(queue.push(job(ART_QUEUE_MAX)), ["t0"]);
+        assert_eq!(queue.pop().map(|j| j.id), Some(format!("t{ART_QUEUE_MAX}")));
+        assert_eq!(
+            queue.pop().map(|j| j.id),
+            Some(format!("t{}", ART_QUEUE_MAX - 1))
+        );
+    }
+
+    /// A changed host certificate is a pin mismatch however ureq wraps it, never a host that
+    /// could not be reached.
+    #[cfg(desktop)]
+    #[test]
+    fn a_failed_pin_is_a_pin_mismatch() {
+        let pin = || {
+            rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            )
+        };
+        let wrapped = std::io::Error::new(std::io::ErrorKind::InvalidData, pin());
+        assert!(matches!(
+            classify(ureq::Error::Io(wrapped)),
+            LibraryError::PinMismatch
+        ));
+        assert!(matches!(
+            classify(ureq::Error::Rustls(pin())),
+            LibraryError::PinMismatch
+        ));
+        let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        assert!(matches!(
+            classify(ureq::Error::Io(refused)),
+            LibraryError::Unreachable(_)
+        ));
+        let expired = rustls::Error::InvalidCertificate(rustls::CertificateError::Expired);
+        let wrapped = std::io::Error::new(std::io::ErrorKind::InvalidData, expired);
+        assert!(matches!(
+            classify(ureq::Error::Io(wrapped)),
+            LibraryError::Unreachable(_)
+        ));
+    }
 
     fn row(json: &str) -> RunningGame {
         serde_json::from_str(json).unwrap()

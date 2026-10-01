@@ -216,6 +216,8 @@ pub struct LaunchSession {
     pub fps: u32,
     /// `/launch?appid=N` — app-catalog entry for this session.
     pub appid: u32,
+    /// `localAudioPlayMode=1`: the player wants sound on the host too.
+    pub host_audio: bool,
     /// Source IP of the paired HTTPS client that issued `/launch`. Unauthenticated
     /// RTSP/UDP binds to this so an unpaired peer cannot ride the launch. `None` if
     /// the address could not be captured (RTSP then falls back to launch-present only).

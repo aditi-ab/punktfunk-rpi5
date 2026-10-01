@@ -13,6 +13,8 @@ bundle, and [patch rationale](rpi5-patch-rationale.md) before updating the fork.
 - HEVC V4L2 Request decoding uses the matching Raspberry Pi FFmpeg build. NEON
   transfer converts Broadcom SAND surfaces into planar pixels for Vulkan upload.
   Ten-bit decode output is rounded to eight bits; this is not HDR presentation.
+  The kiosk selects this Pi-tested path explicitly; upstream's native V4L2
+  backend remains available without replacing it.
 - Wayland compositor callbacks pace presentation. Swapchain recreation handles
   updated compositor feedback, and overlay damage limits unnecessary GPU work.
 - Audio reconciliation discards delayed packets whose timeline positions already

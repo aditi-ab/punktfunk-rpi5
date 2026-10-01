@@ -238,7 +238,7 @@ impl ConnectPlan {
             args.push("--connect-timeout".into());
             args.push(secs.to_string());
         }
-        if self.settings.fullscreen_on_stream {
+        if self.settings.fullscreen_on_stream || self.settings.fullscreen_always() {
             args.push("--fullscreen".into());
         }
         // No `--window-pos`: Wayland compositors own placement, so the flag is a silent
@@ -835,6 +835,34 @@ impl CancelHandle {
         }
     }
 
+    /// End the session the way its own window does: SIGTERM, which the session's SDL turns
+    /// into a quit event and so a quit-close of the host. A child still up after `grace` is
+    /// killed. Windows has no SIGTERM, so it kills at once.
+    pub fn terminate(&self, grace: std::time::Duration) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        #[cfg(unix)]
+        {
+            let slot = self.child.lock().unwrap();
+            let Some(child) = slot.as_ref() else { return };
+            // SAFETY: the lock is held, and the reaper takes the child out under it before
+            // `wait`, so this pid is still our unreaped child and names no other process.
+            unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+            drop(slot);
+            let me = self.clone();
+            let _ = std::thread::Builder::new()
+                .name("pf-session-term".into())
+                .spawn(move || {
+                    std::thread::sleep(grace);
+                    me.kill();
+                });
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = grace;
+            self.kill();
+        }
+    }
+
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
@@ -1115,6 +1143,10 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["--preset", "aaaaaaaaaaaa"]));
         assert!(args.windows(2).any(|w| w == ["--connect-timeout", "185"]));
         assert!(args.contains(&"--fullscreen".to_string()));
+        // Fullscreen Always outranks a preset that turned streams fullscreen off.
+        plan.settings.fullscreen_on_stream = false;
+        plan.settings.set_fullscreen_always(true);
+        assert!(plan.session_args().contains(&"--fullscreen".to_string()));
 
         // "Connect with ▸ Default settings" on a bound host is an empty override, not
         // the same as no override — it has to survive as a flag.

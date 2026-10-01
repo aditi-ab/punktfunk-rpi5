@@ -213,6 +213,7 @@ impl Shell {
             _sdl: sdl,
             opts,
             browse,
+            pad_absence: PadAbsence::default(),
         })
     }
 
@@ -274,9 +275,10 @@ impl Shell {
             let (pw, ph) = self.window.size_in_pixels();
             let (stats, hint) = match &stream {
                 Some(st) if st.connector.is_some() => {
-                    // No "click to capture" over a session with nothing to capture for.
+                    // No "click to capture" over a session with nothing to capture for, or
+                    // while another window has focus: the hint returns with the focus.
                     let hint = match &st.capture {
-                        Some(cap) if !cap.captured() && cap.can_capture() => {
+                        Some(cap) if !cap.captured() && cap.can_capture() && !self.focus_lost => {
                             Some(if self.gamepad.active().is_some() {
                                 HINT_WITH_PAD
                             } else {

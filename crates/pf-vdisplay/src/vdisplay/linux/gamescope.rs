@@ -119,6 +119,32 @@ static MANAGED_LAUNCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 const SESSION_UNIT: &str = "punktfunk-gamescope";
 const SESSION_PLUS_BIN: &str = "/usr/share/gamescope-session-plus/gamescope-session-plus";
 
+/// `WAYLAND_DISPLAY` for a command run inside gamescope: empty names no socket, so it draws
+/// through gamescope's Xwayland. Unset means `wayland-0`, the desktop's socket on a desktop box:
+/// flatpak then withholds X11 from a `fallback-x11` app, and a Qt app that forces xcb aborts.
+const NESTED_WAYLAND_DISPLAY: &str = "";
+
+/// Game Mode's crash counters: a line per run that ends inside 60 s. [`SESSION_PLUS_BIN`]
+/// re-bootstraps Steam and switches to desktop at five; SteamOS's `steam-short-session-tracker`
+/// moves `~/.steam` aside at three. A run the host ends or restarts is never Steam failing.
+const SHORT_SESSION_TRACKERS: [&str; 2] = [
+    "/tmp/chimeraos-short-session-tracker",
+    "/tmp/steamos-short-session-tracker",
+];
+
+fn forget_host_short_sessions() {
+    for tracker in SHORT_SESSION_TRACKERS {
+        let _ = std::fs::remove_file(tracker);
+    }
+}
+
+/// Steam's reboot / power-off requests, which [`SESSION_PLUS_BIN`] honours only after Steam exits.
+/// A run the host kills first leaves them behind, and the box's next Game Mode exit would obey.
+const POWER_SENTINELS: [&str; 2] = [
+    "/tmp/steamos-reboot-sentinel",
+    "/tmp/steamos-shutdown-sentinel",
+];
+
 /// SteamOS session launcher (not Bazzite session-plus). `gamescope-session.service` execs
 /// gamescope with hardcoded panel args. PATH-shim to `--backend headless -W <client> …` so
 /// Steam starts inside that headless compositor.
@@ -333,6 +359,13 @@ impl VirtualDisplay for GamescopeDisplay {
                 .as_ref()
                 .map(|i| i.ei_relay.clone())
                 .unwrap_or_else(ei_socket_file),
+            steam_home: steam
+                .then(|| {
+                    seat_home
+                        .clone()
+                        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+                })
+                .flatten(),
         };
         // Give up early if the process is already gone: a `vkCreateDevice` failure exits in under
         // a second, and waiting 15 s on its corpse would blame the GPU.
@@ -585,6 +618,32 @@ fn systemctl_user(args: &[&str]) {
     );
 }
 
+/// SteamOS's session deletes the oldest installed games on every start while home has under
+/// 500 MiB free. A takeover starts it twice, so it needs this much headroom.
+const STEAMOS_MIN_FREE_MIB: u64 = 600;
+
+fn refuse_low_disk_restart() -> Result<()> {
+    match home_free_mib() {
+        Some(free) if free < STEAMOS_MIN_FREE_MIB => bail!(
+            "refusing the SteamOS takeover: home has {free} MiB free, and its Game Mode deletes \
+             installed games on start to get back to 500 MiB"
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn home_free_mib() -> Option<u64> {
+    use std::os::unix::ffi::OsStringExt;
+    let home = std::ffi::CString::new(std::env::var_os("HOME")?.into_vec()).ok()?;
+    // SAFETY: all-zero is a valid `statvfs`; the call only writes through the out-pointer.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `home` is NUL-terminated and outlives the call; `st` is a live out-pointer.
+    if unsafe { libc::statvfs(home.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some(st.f_bavail as u64 * st.f_frsize as u64 / (1024 * 1024))
+}
+
 /// SteamOS: PATH-shim + drop-in, restart `gamescope-session.target`. Restart kills any prior
 /// gamescope, so discovery sees one node. Same-mode reconnect reuses.
 fn create_managed_session_steamos(mode: Mode, hdr: bool) -> Result<VirtualOutput> {
@@ -613,13 +672,22 @@ fn create_managed_session_steamos(mode: Mode, hdr: bool) -> Result<VirtualOutput
              re-detection follows it)"
         ));
     }
+    refuse_low_disk_restart()?;
     let shim_dir = write_headless_shim()?;
-    write_steamos_dropin(&shim_dir, mode, hdr)?;
-    systemctl_user(&["daemon-reload"]);
-    systemctl_user(&["restart", STEAMOS_SESSION_TARGET]);
+    // Recorded before the drop-in exists: a crash from here on still owes the box its panel.
     t.steamos = true;
-    drop(t); // `persist_takeover` takes the same lock
-    persist_takeover();
+    persist_takeover_held(&t);
+    if let Err(e) = write_steamos_dropin(&shim_dir, mode, hdr) {
+        t.steamos = false;
+        persist_takeover_held(&t);
+        return Err(e);
+    }
+    systemctl_user(&["daemon-reload"]);
+    // The restart's stop logs a line when Steam is under 60 s old; its start reads the count.
+    forget_host_short_sessions();
+    systemctl_user(&["restart", STEAMOS_SESSION_TARGET]);
+    forget_host_short_sessions();
+    drop(t);
     // Takeover already happened; a bare `?` would leave the box headless with PENDING_RESTORE unset.
     let node_id = match poll_managed_node(Duration::from_secs(30)) {
         Some(id) => id,
@@ -837,9 +905,20 @@ fn running_autologin_gamescope_unit() -> Option<String> {
         .map(|u| u.to_string())
 }
 
+/// Steam first, asked to quit: a SIGKILL mid-write loses `config.vdf` or `registry.vdf`. Then
 /// SIGKILL, not SIGTERM: gamescope's SIGTERM handler leaks the NVIDIA GPU context, after which
 /// every later `vkCreateDevice` fails until reboot. Then `stop` + `reset-failed` so relaunch is clean.
 fn kill_unit(unit: &str) {
+    if let Some(pid) = steam_pid_in_unit(unit) {
+        if !shut_steam_down(pid, STEAM_STOP_WAIT, None) {
+            tracing::warn!(
+                unit,
+                pid,
+                secs = STEAM_STOP_WAIT.as_secs(),
+                "gamescope: Steam did not quit when asked — killing its session anyway"
+            );
+        }
+    }
     // All three budgeted: this runs on disconnect restore and on shutdown, where the whole
     // sequence has ~20 s before `native.rs` gives up. Three unbounded `systemctl` calls against
     // a busy user manager spend that budget on their own.
@@ -1031,7 +1110,15 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
             );
         }
     }
+    let launch_gen = restore_generation();
     let start_unit = |bind: Option<&SessionBind>| -> Result<()> {
+        // A hand-back since this launch began stopped the unit on purpose; relaunching it would
+        // start a second Steam beside the box's own.
+        if restore_generation() != launch_gen {
+            bail!("the box's own session was handed back while this launch ran");
+        }
+        // A relaunch follows our own failed run; its line must not count toward the box's reset.
+        forget_host_short_sessions();
         let mut cmd = Command::new("systemd-run");
         cmd.args(["--user", "--collect", &format!("--unit={unit_name}")]);
         for arg in bind.map(SessionBind::run_args).unwrap_or_default() {
@@ -1135,9 +1222,27 @@ fn unit_starting_or_active(unit: &str) -> bool {
     )
 }
 
+/// [`unit_starting_or_active`]'s opposite bias: unknown and timeout report `false`.
+fn unit_known_active(unit: &str) -> bool {
+    crate::proc::output_within(
+        Command::new("systemctl").args(["--user", "is-active", unit]),
+        UNIT_STATE_BUDGET,
+    )
+    .is_ok_and(|out| {
+        matches!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "active" | "activating" | "reloading"
+        )
+    })
+}
+
 fn stop_session(unit_name: &str) {
     kill_unit(unit_name);
     let _ = std::fs::remove_file(ei_socket_file());
+    forget_host_short_sessions();
+    for sentinel in POWER_SENTINELS {
+        let _ = std::fs::remove_file(sentinel);
+    }
 }
 
 /// `$XDG_RUNTIME_DIR`, never world-writable `/tmp`: a second local user must not plant a rogue

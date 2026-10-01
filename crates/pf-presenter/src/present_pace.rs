@@ -1,10 +1,10 @@
 //! Presentation intents the run loop composes: store, latch clock, gate, source pacer.
 //!
-//! * [`FrameStore`] — newest-wins (`capacity == 0`) or smoothing FIFO with preroll
-//!   (`capacity 1..=3`). Same contract as the Apple and Android presenters.
+//! * [`FrameStore`] — newest-wins (`capacity == 0`) or smoothing FIFO held for the due
+//!   time (`capacity 1..=3`). Same contract as the Apple presenter's cadence take.
 //! * [`LatchClock`] — panel latch grid from `VK_KHR_present_wait` on-glass stamps.
 //!   A reported refresh is a mode claim; VRR makes it unusable. Without present-wait
-//!   the grid is last submit plus the mode period.
+//!   there is no grid: the drain presents at the due time and the panel quantizes.
 //! * [`PresentGate`] — at most one undisplayed FIFO present. MAILBOX cannot queue.
 //! * [`SourcePacer`] — smoothness plays on the source [`CadenceClock`], not arrival.
 //!
@@ -24,16 +24,18 @@ pub(crate) const MARGIN_STEP_NS: u64 = 500_000;
 pub(crate) const MARGIN_MAX_NS: u64 = 2_500_000;
 
 /// Newest-wins (`capacity == 0`: `submit` replaces, `take` clears) or smoothing FIFO
-/// (`capacity 1..=3`: preroll-to-capacity, drop-oldest overflow). Underflow after
-/// preroll re-arms; the previous frame stays on glass while headroom rebuilds.
+/// (`capacity 1..=3`: held until due, drop-oldest overflow). The due time's cushion is
+/// the headroom, so an empty store is the steady state and starvation reads as
+/// `CadenceHealth::late`.
 pub(crate) struct FrameStore<T> {
     capacity: usize,
     frames: VecDeque<T>,
-    prerolled: bool,
+    /// Newest-wins holds its frame until due or until the next one arrives (the latency
+    /// intent on a measured VRR panel).
+    paced: bool,
     /// Newest-wins displacements; not a fault.
     replaced: u32,
     overflow_drops: u32,
-    underflows: u32,
 }
 
 impl<T> FrameStore<T> {
@@ -41,10 +43,9 @@ impl<T> FrameStore<T> {
         FrameStore {
             capacity,
             frames: VecDeque::with_capacity(capacity.max(1) + 1),
-            prerolled: false,
+            paced: false,
             replaced: 0,
             overflow_drops: 0,
-            underflows: 0,
         }
     }
 
@@ -52,8 +53,22 @@ impl<T> FrameStore<T> {
         self.capacity > 0
     }
 
+    /// Newest-wins holds its frame for the due time. Off, a frame is due the instant it
+    /// exists. FIFO stores always ask.
+    pub(crate) fn set_paced(&mut self, paced: bool) {
+        self.paced = paced;
+    }
+
     pub(crate) fn submit(&mut self, f: T) {
-        if self.capacity == 0 {
+        if self.capacity == 0 && self.paced {
+            // A held frame is never overwritten: its successor queues behind it and
+            // `take` releases the older one at once. Three deep bounds a stalled loop.
+            self.frames.push_back(f);
+            while self.frames.len() > 3 {
+                self.frames.pop_front();
+                self.replaced += 1;
+            }
+        } else if self.capacity == 0 {
             if self.frames.pop_front().is_some() {
                 self.replaced += 1;
             }
@@ -68,27 +83,21 @@ impl<T> FrameStore<T> {
         }
     }
 
-    /// FIFO: vend the front once `due` is true. Newest-wins never calls `due`: a frame
-    /// is due the instant it exists, so the cadence clock stays off the latency path.
+    /// FIFO: vend the front once `due` is true. Newest-wins asks `due` only when paced,
+    /// and only while nothing newer waits behind the frame: pacing may delay a frame
+    /// until its successor arrives, never drop it. Unpaced, a frame is due the instant
+    /// it exists and the cadence clock stays off the latency path.
     pub(crate) fn take(&mut self, due: impl FnOnce(&T) -> bool) -> Option<T> {
         if self.capacity == 0 {
-            return self.frames.pop_front();
-        }
-        if !self.prerolled {
-            // Without preroll a steady stream drains on arrival and never builds jitter headroom.
-            if self.frames.len() < self.capacity {
+            let alone = self.frames.len() == 1;
+            if self.paced && alone && self.frames.front().is_some_and(|f| !due(f)) {
                 return None;
             }
-            self.prerolled = true;
+            return self.frames.pop_front();
         }
-        let Some(f) = self.frames.front() else {
-            self.underflows += 1;
-            self.prerolled = false;
-            return None;
-        };
-        // Held for its slot, not dry: no counter, preroll stays. An underflow
-        // count here would re-arm preroll on every well-paced frame.
-        if !due(f) {
+        // No preroll: a stream below the panel rate empties the store between frames,
+        // and refilling to capacity each time shows its frames in bursts.
+        if !due(self.frames.front()?) {
             return None;
         }
         self.frames.pop_front()
@@ -100,9 +109,9 @@ impl<T> FrameStore<T> {
     }
 
     /// Unpresented frame (gate closed / present failed). Newest-wins reinserts only
-    /// into an empty slot; FIFO puts it at the front (it is the oldest).
+    /// into an empty slot; FIFO and the paced slot put it at the front (it is the oldest).
     pub(crate) fn put_back(&mut self, f: T) {
-        if self.capacity == 0 {
+        if self.capacity == 0 && !self.paced {
             if self.frames.is_empty() {
                 self.frames.push_back(f);
             }
@@ -119,17 +128,15 @@ impl<T> FrameStore<T> {
             return;
         }
         self.capacity = 0;
-        self.prerolled = false;
         while self.frames.len() > 1 {
             self.frames.pop_front();
         }
     }
 
-    pub(crate) fn take_counters(&mut self) -> (u32, u32, u32) {
-        let c = (self.replaced, self.overflow_drops, self.underflows);
+    pub(crate) fn take_counters(&mut self) -> (u32, u32) {
+        let c = (self.replaced, self.overflow_drops);
         self.replaced = 0;
         self.overflow_drops = 0;
-        self.underflows = 0;
         c
     }
 }
@@ -281,6 +288,9 @@ pub(crate) struct CadenceProbe {
     candidate: Cadence,
     agree_rounds: u8,
     verdict: Cadence,
+    /// The output's own vblank spacing reads off the mode period, or on it; `None` where no
+    /// waiter measures it. It outranks the stamps ([`CadenceProbe::note_refresh`]).
+    refresh_variable: Option<bool>,
 }
 
 /// Enough deltas to distinguish jitter from a real off-grid cadence.
@@ -303,6 +313,21 @@ impl CadenceProbe {
             candidate: Cadence::Unknown,
             agree_rounds: 0,
             verdict: Cadence::Unknown,
+            refresh_variable: None,
+        }
+    }
+
+    /// The output's measured vblank spacing, where a waiter reads it. A fixed panel
+    /// refreshes at its mode period whatever is presented, so a spacing well off it is
+    /// variable refresh — also at a whole divisor of the mode rate (60 on 120), where
+    /// present stamps alone read as grid-locked. At the mode period the panel is fixed,
+    /// or a variable one runs flat out: nothing to pace either way.
+    pub(crate) fn note_refresh(&mut self, refresh_ns: u64, mode_period_ns: u64) {
+        // 10 % on, 3 % off: a stream hovering at the panel's top rate does not flap.
+        if refresh_ns * 100 > mode_period_ns * 110 {
+            self.refresh_variable = Some(true);
+        } else if refresh_ns * 100 < mode_period_ns * 103 || self.refresh_variable.is_none() {
+            self.refresh_variable = Some(false);
         }
     }
 
@@ -358,7 +383,11 @@ impl CadenceProbe {
     }
 
     pub(crate) fn verdict(&self) -> Cadence {
-        self.verdict
+        match self.refresh_variable {
+            Some(true) => Cadence::Variable,
+            Some(false) => Cadence::Fixed,
+            None => self.verdict,
+        }
     }
 
     /// A mode switch or display change invalidates the evidence.
@@ -368,7 +397,26 @@ impl CadenceProbe {
         self.candidate = Cadence::Unknown;
         self.agree_rounds = 0;
         self.verdict = Cadence::Unknown;
+        self.refresh_variable = None;
     }
+}
+
+/// How the pacer serves frames.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaceMode {
+    /// Smoothness on a fixed panel: due time snapped onto the latch grid.
+    Snap,
+    /// Smoothness at the due time: measured VRR, or no glass grid to snap to.
+    Free,
+    /// The latency intent on a measured VRR panel: the due time with a tight cushion.
+    VrrLatency,
+}
+
+/// `PUNKTFUNK_VRR_PACE=0` keeps the latency intent arrival-driven on a VRR panel: the
+/// A/B for the pacing, and the way out where a panel takes it badly.
+fn vrr_latency_pacing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PUNKTFUNK_VRR_PACE").map_or(true, |v| v != "0"))
 }
 
 /// Plays frames on the source cadence: a [`CadenceClock`] plus the two client
@@ -379,23 +427,23 @@ impl CadenceProbe {
 /// would be a bug.
 pub(crate) struct SourcePacer {
     clock: CadenceClock,
-    /// Last [`follow`](Self::follow) verdict was [`Cadence::Variable`]: free-running tuning.
-    free_running: bool,
+    mode: PaceMode,
 }
 
 impl SourcePacer {
     pub(crate) fn new() -> SourcePacer {
         SourcePacer {
             clock: CadenceClock::new(CadenceTuning::snapping()),
-            free_running: false,
+            mode: PaceMode::Snap,
         }
     }
 
     /// Fold an arriving frame and return when it is due, in `ready_ns`'s clock domain.
     ///
-    /// `None` under latency: arrival-driven, so the loop never carries an estimate
-    /// built from samples it then ignored. Called at submit, not take: dropped frames
-    /// are part of the arrival process; folding only survivors hides the jitter.
+    /// `None` under latency on a fixed panel: arrival-driven, so the loop never carries
+    /// an estimate built from samples it then ignored. Called at submit, not take:
+    /// dropped frames are part of the arrival process; folding only survivors hides
+    /// the jitter.
     pub(crate) fn due_ns(
         &mut self,
         smoothing: bool,
@@ -403,32 +451,46 @@ impl SourcePacer {
         ready_ns: u64,
         frame_interval_ns: i64,
     ) -> Option<i64> {
-        smoothing.then(|| {
+        (smoothing || self.paces_latency()).then(|| {
             self.clock
                 .due_ns(src_pts_ns, ready_ns as i64, frame_interval_ns)
         })
     }
 
-    /// Follow the measured refresh verdict. Snapping onto the latch grid carries
-    /// roughly half a refresh of slack; presenting at the due time carries none, so
-    /// the cushions differ. Re-tuning re-anchors (tuning is fixed at construction),
+    /// Follow the measured refresh verdict for this intent. Snapping onto the latch grid
+    /// carries roughly half a refresh of slack; presenting at the due time carries none,
+    /// so the cushions differ. Re-tuning re-anchors (tuning is fixed at construction),
     /// so this keys off the probe's published verdict, not a per-window reading.
-    pub(crate) fn follow(&mut self, verdict: Cadence) {
-        let free = verdict == Cadence::Variable;
-        if free != self.free_running {
-            self.free_running = free;
-            self.clock = CadenceClock::new(if free {
-                CadenceTuning::free_running()
-            } else {
-                CadenceTuning::snapping()
+    /// Smoothness with no glass grid (`grid_known` false: no present-wait) runs free — a
+    /// grid anchored on submit instants learns the stream's own cadence as the panel.
+    /// The latency intent paces only where VRR is measured: a VRR panel shows every
+    /// millisecond of arrival jitter; a fixed one hides it under the quantization.
+    pub(crate) fn follow(&mut self, verdict: Cadence, grid_known: bool, smoothing: bool) {
+        let mode = match (verdict == Cadence::Variable, smoothing) {
+            (true, true) => PaceMode::Free,
+            (true, false) if vrr_latency_pacing() => PaceMode::VrrLatency,
+            (false, true) if !grid_known => PaceMode::Free,
+            _ => PaceMode::Snap,
+        };
+        if mode != self.mode {
+            self.mode = mode;
+            self.clock = CadenceClock::new(match mode {
+                PaceMode::Snap => CadenceTuning::snapping(),
+                PaceMode::Free => CadenceTuning::free_running(),
+                PaceMode::VrrLatency => CadenceTuning::vrr_latency(),
             });
         }
     }
 
-    /// Present at the due time instead of snapping to the latch grid. True only
-    /// where variable refresh is measured live — the panel refreshes when we present.
+    /// Present at the due time instead of snapping to the latch grid: variable refresh
+    /// measured live (the panel refreshes when we present), or no glass grid at all.
     pub(crate) fn free_running(&self) -> bool {
-        self.free_running
+        self.mode != PaceMode::Snap
+    }
+
+    /// The latency intent is paced: measured VRR, newest-wins held for its due time.
+    pub(crate) fn paces_latency(&self) -> bool {
+        self.mode == PaceMode::VrrLatency
     }
 
     /// Re-anchor on the next frame (display change, accepted mode switch). Measured
@@ -509,42 +571,35 @@ mod tests {
         assert_eq!(s.take(|_| true), Some(6));
         assert_eq!(
             s.take_counters(),
-            (2, 0, 0),
+            (2, 0),
             "two displacements, no fifo counters"
         );
     }
 
     #[test]
-    fn fifo_prerolls_overflows_oldest_and_rearms_on_dry() {
+    fn fifo_vends_in_order_and_overflows_oldest() {
         let mut s: FrameStore<u32> = FrameStore::new(2);
         assert!(s.is_smoothing());
         s.submit(1);
-        assert_eq!(
-            s.take(|_| true),
-            None,
-            "prerolling: below capacity, nothing vends"
-        );
+        assert_eq!(s.take(|_| true), Some(1), "a due frame goes out alone");
+        assert_eq!(s.take(|_| true), None);
+        // A stream below the panel rate: the store empties between frames and
+        // each one still goes out at its own due time.
         s.submit(2);
-        assert_eq!(s.take(|_| true), Some(1), "preroll reached — FIFO order");
         assert_eq!(
             s.take(|_| true),
             Some(2),
-            "once prerolled the buffer drains normally"
+            "an empty store does not re-buffer"
         );
-        assert_eq!(s.take(|_| true), None);
         s.submit(3);
-        assert_eq!(s.take(|_| true), None, "re-armed preroll holds again");
         s.submit(4);
-        assert_eq!(s.take(|_| true), Some(3));
+        assert_eq!(s.take(|_| true), Some(3), "FIFO order");
         s.submit(5);
         s.submit(6);
         s.submit(7);
         assert_eq!(s.take(|_| true), Some(6));
         assert_eq!(s.take(|_| true), Some(7));
-        let (replaced, drops, dry) = s.take_counters();
-        assert_eq!(replaced, 0);
-        assert_eq!(drops, 2, "6 evicted 4, 7 evicted 5");
-        assert_eq!(dry, 1);
+        assert_eq!(s.take_counters(), (0, 2), "6 evicted 4, 7 evicted 5");
     }
 
     #[test]
@@ -561,25 +616,16 @@ mod tests {
         );
     }
 
-    /// Held-for-due is not dry: counting it as underflow re-arms preroll on every
-    /// well-paced frame.
     #[test]
-    fn a_frame_held_for_its_due_time_is_not_an_underflow() {
+    fn a_fifo_frame_is_held_until_due() {
         let mut s: FrameStore<u32> = FrameStore::new(2);
         s.submit(10);
         s.submit(20);
-        assert_eq!(s.take(|_| false), None, "prerolled, but nothing is due yet");
-        assert_eq!(s.take(|&v| v >= 10), Some(10));
-        assert_eq!(s.take(|&v| v >= 30), None, "20 is not due yet either");
+        assert_eq!(s.take(|_| false), None, "nothing is due yet");
+        assert_eq!(s.take(|&v| v <= 10), Some(10));
+        assert_eq!(s.take(|&v| v <= 10), None, "20 is not due yet either");
         assert_eq!(s.take(|_| true), Some(20));
-        assert_eq!(s.take(|_| true), None);
-        s.submit(30);
-        assert_eq!(s.take(|_| true), None, "re-armed preroll holds again");
-        assert_eq!(
-            s.take_counters(),
-            (0, 0, 1),
-            "one dry, nothing from the holds"
-        );
+        assert_eq!(s.take_counters(), (0, 0), "a hold drops nothing");
     }
 
     /// Newest-wins never consults `due`, so a caller-supplied cadence clock cannot
@@ -599,6 +645,29 @@ mod tests {
             "arrival-driven: the frame goes out regardless"
         );
         assert!(!asked, "…and the due time was never consulted");
+        // Paced (a measured VRR panel): held for its due time, never overwritten.
+        s.set_paced(true);
+        s.submit(8);
+        assert_eq!(s.take(|_| false), None, "paced: held until due");
+        s.submit(9);
+        assert_eq!(
+            s.take(|_| false),
+            Some(8),
+            "its successor arrived: the held frame goes out, it is not replaced"
+        );
+        assert_eq!(
+            s.take(|_| false),
+            None,
+            "the successor waits for its own due time"
+        );
+        assert_eq!(s.take(|_| true), Some(9));
+        assert_eq!(s.take_counters(), (0, 0), "pacing dropped nothing");
+        // A stalled loop is still bounded: the fourth arrival evicts the oldest.
+        for v in 10..14 {
+            s.submit(v);
+        }
+        assert_eq!(s.take(|_| false), Some(11));
+        assert_eq!(s.take_counters(), (1, 0));
     }
 
     #[cfg(feature = "pyrowave")]
@@ -809,6 +878,38 @@ mod tests {
         assert_eq!(probe.verdict(), Cadence::Unknown);
     }
 
+    /// Half the mode rate on a VRR panel: the stamps sit on the mode grid, the output's
+    /// own refresh does not. Where it is measured it decides, both ways.
+    #[test]
+    fn a_measured_refresh_outranks_the_stamps() {
+        const P: u64 = 6_060_606;
+        let mut p = CadenceProbe::new();
+        let stamps: Vec<u64> = (1..=60).map(|i| i * 2 * P).collect();
+        p.note(&stamps, P, true);
+        assert_eq!(p.verdict(), Cadence::Fixed, "stamps alone: on the grid");
+        p.note_refresh(2 * P, P);
+        assert_eq!(p.verdict(), Cadence::Variable);
+        p.note_refresh(P + P / 20, P);
+        assert_eq!(
+            p.verdict(),
+            Cadence::Variable,
+            "5 % off: inside the hysteresis"
+        );
+        p.note_refresh(P, P);
+        assert_eq!(
+            p.verdict(),
+            Cadence::Fixed,
+            "at the mode period: nothing to pace"
+        );
+        let mut fresh = CadenceProbe::new();
+        fresh.note_refresh(P + P / 20, P);
+        assert_eq!(
+            fresh.verdict(),
+            Cadence::Fixed,
+            "first reading, inside the band"
+        );
+    }
+
     /// Batching must not change the verdict: live drain is one stamp, tests hand over
     /// vectors.
     #[test]
@@ -900,34 +1001,72 @@ mod tests {
         let mut p = SourcePacer::new();
         assert!(!p.free_running(), "snapping until the panel says otherwise");
         fold(&mut p, true, 200);
-        p.follow(Cadence::Fixed);
+        p.follow(Cadence::Fixed, true, true);
         assert!(!p.free_running());
         assert_eq!(
             p.health().frames,
             200,
             "a verdict that changes nothing must not re-anchor"
         );
-        p.follow(Cadence::Variable);
+        p.follow(Cadence::Variable, true, true);
         assert!(p.free_running());
         assert_eq!(p.health().frames, 0, "re-tuning is a fresh loop");
-        p.follow(Cadence::Unknown);
+        p.follow(Cadence::Unknown, true, true);
         assert!(
             !p.free_running(),
             "Unknown is the absence of a measurement, not a measurement of VRR"
         );
+        // No on-glass stamps (no present-wait): nothing to snap to, so the due time
+        // is the target here too, whatever the verdict.
+        p.follow(Cadence::Unknown, false, true);
+        assert!(p.free_running(), "without a glass grid the drain runs free");
+        p.follow(Cadence::Fixed, false, true);
+        assert!(p.free_running());
+        p.follow(Cadence::Unknown, true, true);
+        assert!(!p.free_running());
 
         // With no jitter yet, free-running already holds a frame back more than
         // snapping, which rides the half-refresh the snap-up gives it.
         let mut snap = SourcePacer::new();
         snap.due_ns(true, SRC_PTS0, SRC_READY0, SRC_P);
         let mut free = SourcePacer::new();
-        free.follow(Cadence::Variable);
+        free.follow(Cadence::Variable, true, true);
         free.due_ns(true, SRC_PTS0, SRC_READY0, SRC_P);
         assert!(
             free.health().cushion_ns > snap.health().cushion_ns,
             "free-running {} must cushion past snapping {}",
             free.health().cushion_ns,
             snap.health().cushion_ns
+        );
+    }
+
+    /// The latency intent folds nothing on a fixed panel or with no grid at all, and
+    /// paces on a measured VRR panel with a cushion below the smooth intent's.
+    #[test]
+    fn the_latency_intent_paces_only_on_a_measured_vrr_panel() {
+        let mut p = SourcePacer::new();
+        p.follow(Cadence::Unknown, false, false);
+        assert!(
+            !p.paces_latency() && !p.free_running(),
+            "no grid is not VRR: latency stays arrival-driven"
+        );
+        assert_eq!(p.due_ns(false, SRC_PTS0, SRC_READY0, SRC_P), None);
+        p.follow(Cadence::Variable, true, false);
+        assert!(p.paces_latency() && p.free_running());
+        assert!(p.due_ns(false, SRC_PTS0, SRC_READY0, SRC_P).is_some());
+        let tight = p.health().cushion_ns;
+        let mut smooth = SourcePacer::new();
+        smooth.follow(Cadence::Variable, true, true);
+        smooth.due_ns(true, SRC_PTS0, SRC_READY0, SRC_P);
+        assert!(
+            tight < smooth.health().cushion_ns,
+            "latency under VRR ({tight}) must cushion less than smooth ({})",
+            smooth.health().cushion_ns
+        );
+        p.follow(Cadence::Fixed, true, false);
+        assert!(
+            !p.paces_latency(),
+            "a fixed verdict returns the latency intent to arrival"
         );
     }
 

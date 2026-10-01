@@ -175,6 +175,11 @@ tokio = { version = "1", features = ["time"], optional = true }
 # ordinary macOS and container gates, exactly as pf-dxvadec does for Windows.
 pf-vaapi = { path = "../pf-vaapi", optional = true }
 pf-libva = { path = "../pf-libva", optional = true }
+# V4L2 stateful decode: the hand-declared uAPI and the queue state machine that
+# `video_v4l2` drives with ioctls. Device-free, so its tests run on every gate.
+pf-v4l2dec = { path = "../pf-v4l2dec", optional = true }
+# Its ioctl half: decoder nodes, media requests, buffer mapping, dma-buf export.
+pf-v4l2 = { path = "../pf-v4l2", optional = true }
 # `fence`: the decode's write fence as a sync_file, so the presenter waits it
 # on the GPU instead of the pump blocking in `vaSyncSurface`.
 pf-dmabuf = { path = "../pf-dmabuf", optional = true }
@@ -248,6 +253,10 @@ tracing-subscriber = { version = "0.3" }
 # `pf_bitstream::testing`: the vendored vectors and access-unit splitters.
 pf-bitstream = { path = "../pf-bitstream", features = ["test-vectors"] }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# `pf_v4l2dec::testing`: the device-free decoder the V4L2 rung's tests drive.
+pf-v4l2dec = { path = "../pf-v4l2dec", features = ["testing"] }
+
 # PyroWave decode (the opt-in wired-LAN wavelet codec, design/pyrowave-codec-plan.md
 # §4.5) — pure Vulkan compute on the device the frame is presented from, so it builds
 # wherever a Vulkan present path exists: the spawned session presenter on Linux and
@@ -280,7 +289,7 @@ desktop = [
     "dep:pf-vkdecode", "dep:pf-bitstream", "dep:async-channel", "dep:openh264", "dep:rav1d",
     "dep:libc", "dep:opus", "discovery", "dep:ureq", "dep:pf-update-check", "dep:rustls",
     "dep:tracing-subscriber", "dep:tracing-log",
-    "dep:pipewire", "dep:sdl3", "dep:zbus", "dep:tokio", "dep:pf-vaapi", "dep:pf-libva", "dep:libloading", "dep:x11rb",
+    "dep:pipewire", "dep:sdl3", "dep:zbus", "dep:tokio", "dep:pf-vaapi", "dep:pf-libva", "dep:pf-v4l2dec", "dep:pf-v4l2", "dep:libloading", "dep:x11rb",
     "dep:pf-dmabuf",
     "dep:wasapi", "dep:winreg", "d3d11va",
 ]

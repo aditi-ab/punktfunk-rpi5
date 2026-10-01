@@ -172,11 +172,11 @@ struct RingActions {
     /// One synthetic system-button tap on the host's pad (a `GamepadWire` bit).
     var tapPadButton: (UInt32) -> Void
     /// Controller mouse: the pointer grant it needs, the wire pads it acts on (a bit per pad,
-    /// `0` = none), whether they are all on, and the toggle.
+    /// `0` = none), the mode they share, and the step to the next one.
     var pointerGranted: () -> Bool
     var padMouseTarget: () -> UInt16
-    var padMouseOn: () -> Bool
-    var togglePadMouse: () -> Void
+    var padMouseMode: () -> PunktfunkConnection.PadMouseMode
+    var cyclePadMouse: () -> Void
     var currentMode: () -> (w: UInt32, h: UInt32, hz: UInt32)
     var requestMode: (UInt32, UInt32, UInt32) -> Void
     var scrollInverted: () -> Bool = { false }
@@ -220,6 +220,15 @@ private let noTouchScreenReason = "A Mac has no touch screen"
 
 /// Why the two system-button slots are dimmed: they ride the wire pad, like the virtual one.
 private let padOffReason = "Controller input is not forwarded this session"
+
+/// The controller-mouse slot's state; the Rust and Android rings say the same.
+func padMouseState(_ mode: PunktfunkConnection.PadMouseMode) -> String {
+    switch mode {
+    case .off: return "Off"
+    case .touchpad: return "Touchpad"
+    case .full: return "Full"
+    }
+}
 
 func spec(_ slot: SlotId, _ cfg: OverlayConfig, _ a: RingActions) -> SlotSpec {
     switch slot {
@@ -287,7 +296,7 @@ func spec(_ slot: SlotId, _ cfg: OverlayConfig, _ a: RingActions) -> SlotSpec {
                         enabled: a.pointerGranted() && a.padMouseTarget() != 0,
                         reason: a.pointerGranted() ? "No controller is connected"
                             : "This host only allows controller input",
-                        toggle: true, state: a.padMouseOn() ? "On" : "Off")
+                        toggle: true, state: padMouseState(a.padMouseMode()))
     case .host(let id):
         let act = a.hostActions().first { $0.id == id }
         // Three power actions, three glyphs — the same icon on all three made them one button.
@@ -599,7 +608,7 @@ struct RingOverlay: View {
         // The host's own overlay is taking the screen: close first, like End stream.
         case .guide: state.close(); actions.tapPadButton(GamepadWire.guide)
         case .qam: state.close(); actions.tapPadButton(GamepadWire.misc1)
-        case .padMouse: actions.togglePadMouse()
+        case .padMouse: actions.cyclePadMouse()
         case .host(let id):
             if let act = actions.hostActions().first(where: { $0.id == id }) {
                 state.close()
@@ -830,7 +839,7 @@ extension RingOverlay {
         }
         let pm = spec(.padMouse, cfg, a)
         rows.append(SheetRowSpec(label: pm.label, value: pm.enabled ? pm.state : pm.reason, enabled: pm.enabled) {
-            if pm.enabled { a.togglePadMouse() }
+            if pm.enabled { a.cyclePadMouse() }
         })
         rows.append(SheetRowSpec(header: "View", label: "Statistics", value: a.stats().label) { a.cycleStats() })
         let mic = spec(.mic, cfg, a)

@@ -21,6 +21,7 @@ fn main() {
             // the exe appears as its raw filename).
             .set("FileDescription", "Punktfunk Session")
             .set("ProductName", "Punktfunk")
+            .set("CompanyName", "unom")
             .compile()
             .expect("embed windows icon resource");
     }

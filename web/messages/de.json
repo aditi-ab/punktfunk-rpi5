@@ -355,6 +355,7 @@
 	"library_metadata_down": "Nach unten",
 	"library_metadata_found": "Etwas für {found} von {wanted} Spielen",
 	"library_metadata_failed": "Die Einstellungen der Quellen wurden nicht gespeichert.",
+	"library_metadata_silent": "Hat noch nichts geliefert. Bleibt sie gestoppt, steht der Grund unter Logs.",
 	"library_media_from": "Von {source}",
 	"library_media_picked": "Ausgewählt",
 	"library_media_choose": "Auswählen…",

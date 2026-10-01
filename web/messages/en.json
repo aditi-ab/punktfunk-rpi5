@@ -367,6 +367,7 @@
 	"library_metadata_down": "Move down",
 	"library_metadata_found": "Something for {found} of {wanted} games",
 	"library_metadata_failed": "The source settings weren't saved.",
+	"library_metadata_silent": "Hasn't sent anything yet. If it stays stopped, Logs says why.",
 	"library_media_from": "From {source}",
 	"library_media_picked": "Picked",
 	"library_media_choose": "Choose…",

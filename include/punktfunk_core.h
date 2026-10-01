@@ -292,6 +292,15 @@
 // hosts that do not know the bit ignore it.
 #define PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO 32
 
+// Controller mouse is off: the pad plays. Equals `PadMouseMode::Off`.
+#define PUNKTFUNK_PAD_MOUSE_OFF 0
+
+// The pad plays; its touchpads drive the pointer.
+#define PUNKTFUNK_PAD_MOUSE_TOUCHPAD 1
+
+// The whole pad drives the pointer and a few keys; the host pad sits neutral.
+#define PUNKTFUNK_PAD_MOUSE_FULL 2
+
 // `*ttl_ms` sentinel from [`punktfunk_connection_next_rumble2`] when the host sent
 // no self-termination lease. Fall back to a client-side staleness heuristic.
 #define PUNKTFUNK_RUMBLE_NO_TTL 4294967295
@@ -348,7 +357,7 @@
 // Not [`WIRE_VERSION`]. The C surface can grow without a wire byte changing.
 // Pin the integer in `punktfunk-ffi` (`abi_version_is_pinned`). Per-bump notes live
 // in `CHANGELOG.md`.
-#define PUNKTFUNK_ABI_VERSION 41
+#define PUNKTFUNK_ABI_VERSION 42
 
 // punktfunk/1 wire version. `Hello`/`Welcome` carry it; hosts equality-check it.
 //
@@ -2761,13 +2770,37 @@ PunktfunkStatus punktfunk_connection_set_pad_audio_caps(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Switch the pads in `mask` (bit = wire pad index) to controller mouse: their buttons and sticks
-// drive the host pointer and a few keys while the host pad sits neutral. `0` returns every pad
-// to passthrough. Session-scoped. `Unsupported` without `PUNKTFUNK_GRANT_POINTER`.
+// Switch exactly the pads in `mask` (bit = wire pad index) to full controller mouse: their
+// buttons, sticks and touchpads drive the host pointer and a few keys while the host pad sits
+// neutral. Every other full-mouse pad returns to passthrough. Session-scoped. `Unsupported`
+// without `PUNKTFUNK_GRANT_POINTER`.
 //
 // # Safety
 // `c` is a valid connection handle. Callable from any thread.
 PunktfunkStatus punktfunk_connection_set_pad_mouse(PunktfunkConnection *c, uint16_t mask);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The controller-mouse mode every pad in `target` shares: `PUNKTFUNK_PAD_MOUSE_OFF`, `_TOUCHPAD`
+// or `_FULL`. A mixed set reads as off.
+//
+// # Safety
+// `c` is a valid connection handle; `mode` is writable (NULL is skipped).
+PunktfunkStatus punktfunk_connection_pad_mouse_mode(const PunktfunkConnection *c,
+                                                    uint16_t target,
+                                                    uint8_t *mode);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Step the pads in `target` to the next controller-mouse mode (off, touchpad, full, off) and
+// write it to `mode`. In touchpad mode the pads stay in the game and their touchpads drive the
+// pointer. `Unsupported` without `PUNKTFUNK_GRANT_POINTER`; `mode` is then left alone.
+//
+// # Safety
+// `c` is a valid connection handle; `mode` is writable (NULL is skipped).
+PunktfunkStatus punktfunk_connection_cycle_pad_mouse(PunktfunkConnection *c,
+                                                     uint16_t target,
+                                                     uint8_t *mode);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

@@ -270,8 +270,9 @@ Read by the Linux and Windows clients, the Decky plugin and the `punktfunk` CLI 
 
 | Variable | Values | What it does |
 |---|---|---|
-| `PUNKTFUNK_DECODER` | `native-vulkan` · `native-vaapi` (Linux) · `native-d3d11va` (Windows) · `software` | Pins the decoder; the order it replaces is in the [Support matrix](/docs/support-matrix#client-decode). The older `vulkan`, `vaapi` and `d3d11va` still work. |
+| `PUNKTFUNK_DECODER` | `native-vulkan` · `native-vaapi` · `native-v4l2` (Linux) · `native-d3d11va` (Windows) · `software` | Pins the decoder; the order it replaces is in the [Support matrix](/docs/support-matrix#client-decode). The older `vulkan`, `vaapi` and `d3d11va` still work. |
 | `PUNKTFUNK_VAAPI_DEVICE` | path, e.g. `/dev/dri/renderD129` | Linux: the render node VAAPI decodes on. Unset: the first node where VAAPI starts, the presenting GPU's vendor first. |
+| `PUNKTFUNK_V4L2_DEVICE` | path, e.g. `/dev/video0` | Linux: the decoder node V4L2 decodes on. Unset: the first `/dev/video*` node that takes the codec. |
 | `PUNKTFUNK_VK_ADAPTER` | name substring | The GPU the client presents on. Unset prefers a discrete GPU. |
 | `PUNKTFUNK_PREFER_PYROWAVE` | `1` | Ask for [PyroWave](/docs/pyrowave) where the client's own setting isn't reachable, such as a headless launch. |
 | `PUNKTFUNK_PAD_SPEAKER_PATH` · `PUNKTFUNK_PAD_SPEAKER_VOLUME` | byte (default `0x20` / `0x7F`) | Which DualSense output [controller audio](/docs/controller-audio) plays to, and how loud. Change them only if the pad's speaker stays silent. |
@@ -283,6 +284,9 @@ Read by the Linux and Windows clients, the Decky plugin and the `punktfunk` CLI 
 | `PUNKTFUNK_PRESENT_MODE` | `mailbox` · `fifo` · `immediate` · `fifo_relaxed` | Vulkan present mode. With V-sync on the default is `mailbox`, else `fifo` (AMD's Windows driver has no mailbox); with V-sync off `immediate` comes first. |
 | `PUNKTFUNK_PRESENTER` | `arrival` | Show frames the moment they decode, bypassing frame pacing. A diagnostic. |
 | `PUNKTFUNK_VRR_FIFO` | `1` | Follow a variable-refresh screen on a driver too old for the modern mode; costs latency on a fixed-refresh screen. The Detailed [stats overlay](/docs/stats) shows `vrr yes` when it works. |
+| `PUNKTFUNK_VRR_PACE` | `0` | Shows each frame as it arrives on a variable-refresh screen, instead of holding it a moment to even out the spacing. Try it if *Lowest latency* feels uneven on such a screen. |
+| `PUNKTFUNK_PRESENT_WAIT2` | `1` | Time frames with the newer `VK_KHR_present_wait2`. An experiment: on AMD's Windows driver it drops frames below the screen's refresh rate. |
+| `PUNKTFUNK_FULLSCREEN_EXCLUSIVE` | `1` | Windows: take the screen with exclusive fullscreen (`VK_EXT_full_screen_exclusive`), so a variable-refresh screen follows the stream where the desktop would otherwise hold the window. An experiment; switching windows flickers. |
 | `PUNKTFUNK_PRESENT_DEBUG` | `1` | Windows: log the D3D11VA hand-off window every second. The presenter's own summary line is always logged. |
 | `PUNKTFUNK_THREAD_BOOST` | `0` | Leave the video threads (receive, decode, present) at normal priority instead of raising them. An A/B, and the way out if a driver misbehaves under a boosted thread. |
 | `PUNKTFUNK_VAAPI_EXPLICIT_SYNC` | `0` | Linux: wait each VAAPI decode on the CPU before handing it to the presenter, instead of passing the GPU's own fence along. Costs one decode time of pipelining per frame; the way out if a driver shows a frame before it is done. |

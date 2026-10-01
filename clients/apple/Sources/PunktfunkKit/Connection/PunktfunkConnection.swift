@@ -721,22 +721,29 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// The session's grants allow mic injection — hide the mic UI without it.
     public var canUseMic: Bool { accessGrants & Self.grantMic != 0 }
 
-    /// Wire pads in controller mouse, a bit per pad: their buttons and sticks drive the host
-    /// pointer while the host pad sits neutral. A removed pad or a lost pointer grant clears its bit.
-    public var padMouse: UInt16 {
-        return withLiveHandle(or: 0) { h in
-            var mask: UInt16 = 0
-            _ = punktfunk_connection_pad_mouse(h, &mask)
-            return mask
+    /// What controller mouse does with a pad: `touchpad` keeps it in the game and moves the
+    /// pointer with its touchpads; `full` makes the whole pad a mouse.
+    public enum PadMouseMode: UInt8 {
+        case off = 0, touchpad = 1, full = 2
+    }
+
+    /// The controller-mouse mode every wire pad in `target` shares; a mixed set reads as off.
+    public func padMouseMode(_ target: UInt16) -> PadMouseMode {
+        return withLiveHandle(or: .off) { h in
+            var mode = UInt8(PUNKTFUNK_PAD_MOUSE_OFF)
+            _ = punktfunk_connection_pad_mouse_mode(h, target, &mode)
+            return PadMouseMode(rawValue: mode) ?? .off
         }
     }
 
-    /// Switch the pads in `mask` to controller mouse; `0` returns every pad to passthrough.
-    /// False when the session is gone or the host did not grant pointer input.
+    /// Step the pads in `target` to the next mode: off, touchpad, full. Nil when the session is
+    /// gone or the host did not grant pointer input.
     @discardableResult
-    public func setPadMouse(_ mask: UInt16) -> Bool {
-        return withLiveHandle(or: false) { h in
-            return punktfunk_connection_set_pad_mouse(h, mask) == statusOK
+    public func cyclePadMouse(_ target: UInt16) -> PadMouseMode? {
+        return withLiveHandle(or: nil) { h in
+            var mode = UInt8(PUNKTFUNK_PAD_MOUSE_OFF)
+            guard punktfunk_connection_cycle_pad_mouse(h, target, &mode) == statusOK else { return nil }
+            return PadMouseMode(rawValue: mode)
         }
     }
 

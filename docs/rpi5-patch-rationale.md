@@ -23,9 +23,11 @@ the Pi 5 and Weston stack.
 
 ## Decoder feature boundary
 
-Upstream's normal client uses native decoder backends. The Pi decoder requires
-the Raspberry Pi FFmpeg fork, gated by `rpi5-v4l2-request`. The kiosk session build
-uses `--no-default-features --features ui,rpi5-v4l2-request`.
+Upstream's normal client includes a native V4L2 backend selected by
+`PUNKTFUNK_DECODER=native-v4l2`. The kiosk retains the Pi-tested FFmpeg path
+selected by `PUNKTFUNK_DECODER=v4l2-request`; the two backends are distinct.
+The latter requires the Raspberry Pi FFmpeg fork, gated by `rpi5-v4l2-request`.
+The kiosk session build uses `--no-default-features --features ui,rpi5-v4l2-request`.
 
 Inspect decoded-image dispatch, presenter dependency features, session feature
 forwarding, and the release builder during upstream updates. The image methods

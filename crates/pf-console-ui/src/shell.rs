@@ -1307,11 +1307,13 @@ impl Shell {
     /// the way a player does, from a Hosts home through Games, Players and Settings, on a
     /// stand-in library with covers and a bus nobody reads, then puts every part of the shell
     /// back: nothing reaches the host, and the first real visits build and fetch as before.
+    /// `frame_done` runs after every frame of the tour — see [`crate::Console::warm_up`].
     pub(crate) fn warm_up(
         &mut self,
         canvas: &Canvas,
         viewport: &crate::console::Viewport,
         fonts: &crate::theme::Fonts,
+        frame_done: &mut dyn FnMut(&Canvas),
     ) {
         let tab = std::mem::replace(&mut self.tab, Tab::Hosts);
         let stack = std::mem::replace(&mut self.stack, vec![Screen::Home(HomeScreen::new())]);
@@ -1330,12 +1332,13 @@ impl Shell {
         self.hosts_gen = self.console.hosts_gen();
         self.library.set_games(stand_in_games());
         let poster = stand_in_poster();
-        let draw = |s: &mut Shell, frames: usize| {
+        let mut draw = |s: &mut Shell, frames: usize| {
             for _ in 0..frames {
                 s.render_in(canvas, viewport, fonts, None, None, &[]);
                 if let Some(p) = &poster {
                     s.warm_shelves(p);
                 }
+                frame_done(canvas);
             }
         };
         draw(self, 3);

@@ -601,14 +601,17 @@ object NativeBridge {
     external fun nativeSendGamepadAxis(handle: Long, axisId: Int, value: Int, pad: Int)
 
     /**
-     * Controller mouse on the wire pads in [mask] (bit = pad index): their buttons and sticks drive
-     * the host pointer and a few keys while the host pad sits neutral. `0` returns every pad to
-     * passthrough. False when the session is gone or the host did not grant pointer input.
+     * The controller-mouse mode the wire pads in [target] (bit = pad index) share: 0 off, 1 touchpad
+     * (the pad plays, its touchpads drive the pointer), 2 full (the whole pad is a mouse). A mixed
+     * set reads as off.
      */
-    external fun nativeSetPadMouse(handle: Long, mask: Int): Boolean
+    external fun nativePadMouseMode(handle: Long, target: Int): Int
 
-    /** The pads in controller mouse now. A removed pad or a lost pointer grant clears its bit. */
-    external fun nativePadMouse(handle: Long): Int
+    /**
+     * Step the pads in [target] to the next controller-mouse mode (off, touchpad, full) and return
+     * it. -1 when the session is gone or the host did not grant pointer input.
+     */
+    external fun nativeCyclePadMouse(handle: Long, target: Int): Int
 
     /**
      * Declare the controller KIND presented on wire pad [pad] (0..15) so the host builds a matching

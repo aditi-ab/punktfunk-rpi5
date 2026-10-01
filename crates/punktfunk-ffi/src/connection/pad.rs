@@ -4,9 +4,17 @@
 #[cfg(feature = "quic")]
 use crate::*;
 
-/// Switch the pads in `mask` (bit = wire pad index) to controller mouse: their buttons and sticks
-/// drive the host pointer and a few keys while the host pad sits neutral. `0` returns every pad
-/// to passthrough. Session-scoped. `Unsupported` without `PUNKTFUNK_GRANT_POINTER`.
+/// Controller mouse is off: the pad plays. Equals `PadMouseMode::Off`.
+pub const PUNKTFUNK_PAD_MOUSE_OFF: u8 = 0;
+/// The pad plays; its touchpads drive the pointer.
+pub const PUNKTFUNK_PAD_MOUSE_TOUCHPAD: u8 = 1;
+/// The whole pad drives the pointer and a few keys; the host pad sits neutral.
+pub const PUNKTFUNK_PAD_MOUSE_FULL: u8 = 2;
+
+/// Switch exactly the pads in `mask` (bit = wire pad index) to full controller mouse: their
+/// buttons, sticks and touchpads drive the host pointer and a few keys while the host pad sits
+/// neutral. Every other full-mouse pad returns to passthrough. Session-scoped. `Unsupported`
+/// without `PUNKTFUNK_GRANT_POINTER`.
 ///
 /// # Safety
 /// `c` is a valid connection handle. Callable from any thread.
@@ -18,6 +26,46 @@ pub unsafe extern "C" fn punktfunk_connection_set_pad_mouse(
 ) -> PunktfunkStatus {
     with_conn!(c => {
         status_of(c.inner.set_pad_mouse(mask))
+    })
+}
+
+/// The controller-mouse mode every pad in `target` shares: `PUNKTFUNK_PAD_MOUSE_OFF`, `_TOUCHPAD`
+/// or `_FULL`. A mixed set reads as off.
+///
+/// # Safety
+/// `c` is a valid connection handle; `mode` is writable (NULL is skipped).
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connection_pad_mouse_mode(
+    c: *const PunktfunkConnection,
+    target: u16,
+    mode: *mut u8,
+) -> PunktfunkStatus {
+    conn_out!(c, mode => c.inner.pad_mouse_mode(target) as u8)
+}
+
+/// Step the pads in `target` to the next controller-mouse mode (off, touchpad, full, off) and
+/// write it to `mode`. In touchpad mode the pads stay in the game and their touchpads drive the
+/// pointer. `Unsupported` without `PUNKTFUNK_GRANT_POINTER`; `mode` is then left alone.
+///
+/// # Safety
+/// `c` is a valid connection handle; `mode` is writable (NULL is skipped).
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connection_cycle_pad_mouse(
+    c: *mut PunktfunkConnection,
+    target: u16,
+    mode: *mut u8,
+) -> PunktfunkStatus {
+    with_conn!(c => {
+        match c.inner.cycle_pad_mouse(target) {
+            Ok(next) => {
+                // SAFETY: the `# Safety` above makes `mode` null or writable for one byte.
+                unsafe { put(mode, next as u8) };
+                PunktfunkStatus::Ok
+            }
+            Err(e) => e.status(),
+        }
     })
 }
 
@@ -266,4 +314,20 @@ pub unsafe extern "C" fn punktfunk_connection_next_hidout(
             Err(e) => e.status(),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use punktfunk_core::input::PadMouseMode;
+
+    #[test]
+    fn pad_mouse_constants_are_the_core_modes() {
+        for (c, mode) in [
+            (super::PUNKTFUNK_PAD_MOUSE_OFF, PadMouseMode::Off),
+            (super::PUNKTFUNK_PAD_MOUSE_TOUCHPAD, PadMouseMode::Touchpad),
+            (super::PUNKTFUNK_PAD_MOUSE_FULL, PadMouseMode::Full),
+        ] {
+            assert_eq!(PadMouseMode::from_u8(c), Some(mode));
+        }
+    }
 }

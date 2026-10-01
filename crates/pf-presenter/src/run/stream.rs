@@ -27,12 +27,17 @@ impl StreamState {
         let handle = session::start(params);
         let (wake_tx, wake_rx) = async_channel::bounded(2);
         let pump_rx = handle.frames.clone();
+        let forwarder_drops = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let displaced = forwarder_drops.clone();
         let _ = std::thread::Builder::new()
             .name("pf-frame-wake".into())
             .spawn(move || {
                 pf_client_core::audio_rt::boost_and_log("frame-wake");
                 while let Ok(f) = pump_rx.recv_blocking() {
-                    let _ = wake_tx.force_send(f); // newest wins, like the pump's queue
+                    // Newest wins, like the pump's queue; a displaced frame is counted.
+                    if let Ok(Some(_)) = wake_tx.force_send(f) {
+                        displaced.fetch_add(1, Ordering::Relaxed);
+                    }
                     let _ = wake.push_custom_event(FrameWake);
                 }
             });
@@ -70,6 +75,7 @@ impl StreamState {
             health_seen: None,
             last_forced: 0,
             store: FrameStore::new(usize::from(priority.fifo_capacity())),
+            forwarder_drops,
             clock: LatchClock::new(native_refresh_hz),
             pacer: SourcePacer::new(),
             source_interval_ns,
@@ -80,6 +86,7 @@ impl StreamState {
             need: punktfunk_core::phase::LatchNeed::default(),
             busy_on: crate::vk::BusyOn::Fence,
             last_displayed_ns: 0,
+            last_shown_pts_ns: 0,
             last_slot_ns: 0,
             busy_retry: false,
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
@@ -343,7 +350,7 @@ pub(super) fn ring_facts(
         mic_available: st.params.mic_enabled,
         mic_muted,
         pad_mouse_target: target,
-        pad_mouse_on: target != 0 && c.pad_mouse() & target == target,
+        pad_mouse: c.pad_mouse_mode(target),
         audio_mute: c.audio_mute(),
         pointer_granted: c.access_grants() & punktfunk_core::quic::GRANT_POINTER != 0,
         mode: (m.width, m.height, m.refresh_hz),
@@ -374,16 +381,9 @@ pub(super) fn pad_mouse_target(c: &NativeClient, ring_opener: Option<u8>) -> u16
     )
 }
 
-/// All target pads in controller mouse go back to passthrough; otherwise they all switch.
-pub(super) fn toggle_pad_mouse(c: &NativeClient, ring_opener: Option<u8>) {
-    let target = pad_mouse_target(c, ring_opener);
-    let on = c.pad_mouse();
-    let next = if on & target == target {
-        on & !target
-    } else {
-        on | target
-    };
-    if let Err(e) = c.set_pad_mouse(next) {
+/// Step the target pads to the next controller-mouse mode: off, touchpad, full.
+pub(super) fn cycle_pad_mouse(c: &NativeClient, ring_opener: Option<u8>) {
+    if let Err(e) = c.cycle_pad_mouse(pad_mouse_target(c, ring_opener)) {
         tracing::warn!(error = %e, "ring: controller mouse");
     }
 }
@@ -720,6 +720,13 @@ impl Shell {
                 }
             }
         }
+        if self.opts.until_no_pads {
+            let pads = stream.is_none().then(|| self.gamepad.pads().len());
+            if self.pad_absence.tick(pads, Instant::now()) {
+                tracing::info!("no controller left — returning to the desktop");
+                return ControlFlow::Break(Outcome::Ended(None));
+            }
+        }
         ControlFlow::Continue(())
     }
 }
@@ -766,9 +773,9 @@ impl Shell {
                     bump_stats_tier(&mut self.stats_verbosity, stream);
                 }
                 RingCommand::Keyboard => self.ring_keyboard = !self.ring_keyboard,
-                RingCommand::TogglePadMouse => {
+                RingCommand::CyclePadMouse => {
                     if let Some(c) = stream.as_ref().and_then(|st| st.connector.as_ref()) {
-                        toggle_pad_mouse(c, self.ring_opener);
+                        cycle_pad_mouse(c, self.ring_opener);
                     }
                 }
                 RingCommand::ToggleStreamMute => {
@@ -887,7 +894,7 @@ impl Shell {
             RingCommand::CycleStats
             | RingCommand::Keyboard
             | RingCommand::TapButton(_)
-            | RingCommand::TogglePadMouse
+            | RingCommand::CyclePadMouse
             | RingCommand::ToggleStreamMute => {}
         }
     }

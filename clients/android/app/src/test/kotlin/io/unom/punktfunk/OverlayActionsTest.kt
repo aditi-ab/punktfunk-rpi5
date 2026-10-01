@@ -112,7 +112,8 @@ class OverlayActionsTest {
     fun slotIdsAreStableStrings() {
         for (id in listOf(
             "end_stream", "end_game", "disconnect_linger", "touch_mode", "keyboard", "stats", "mic", "pad",
-            "send_text", "guide", "qam", "pad_mouse", "stream_mute", "host:power.reboot", "shortcut:s2",
+            "send_text", "guide", "qam", "pad_mouse", "stream_mute", "swap_screens", "host:power.reboot",
+            "shortcut:s2",
         )) {
             assertEquals(id, SlotId.parse(id)!!.id)
         }

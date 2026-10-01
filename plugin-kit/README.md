@@ -14,11 +14,12 @@ The package is on the unom npm registry. Point the `@punktfunk` scope at it once
 ```
 
 ```sh
-bun add @punktfunk/plugin-kit effect
+bun add @punktfunk/plugin-kit @punktfunk/host effect
 ```
 
 `effect` and `@punktfunk/host` are peer dependencies; `react` is an optional one for
-`@punktfunk/plugin-kit/react`.
+`@punktfunk/plugin-kit/react`. Declare the SDK yourself: when an older plugin's kit owns the
+host's plugins folder, bun places no SDK for yours, and it fails to start.
 
 ## Usage
 

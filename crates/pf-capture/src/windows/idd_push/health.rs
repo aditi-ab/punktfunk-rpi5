@@ -12,10 +12,9 @@ use super::*;
 
 impl IddPushCapturer {
     /// Feed [`CursorWitness`] the one thing it cannot read for itself. The rule — the one-call
-    /// lag, the rate limit, the kick blind spot — lives there and is tested there.
+    /// lag and the rate limit — lives there and is tested there.
     pub(super) fn sample_cursor_witness(&mut self) {
-        let kicked = self.last_kick.elapsed() < crate::cursor_witness::KICK_BLIND;
-        self.cursor.sample(Instant::now(), kicked, || {
+        self.cursor.sample(Instant::now(), || {
             let mut pos = POINT::default();
             // SAFETY: plain FFI; `pos` is a valid out-param for this synchronous call.
             unsafe { GetCursorPos(&mut pos) }
@@ -80,12 +79,16 @@ impl IddPushCapturer {
             match step {
                 recovery::Step::Nothing => return Ok(()),
                 recovery::Step::Canary => {
-                    tracing::info!(
-                        target = %self.ccd,
-                        "IDD push: source suspect on weak evidence — presenting the compose canary"
-                    );
-                    self.last_kick = Instant::now();
-                    kick_dwm_compose(self.ccd);
+                    let rect = pf_win_display::display_events::snapshot().source_rect(self.ccd);
+                    if rect.is_some_and(pf_win_display::compose_probe::present) {
+                        tracing::info!(
+                            target = %self.ccd,
+                            "IDD push: source suspect on weak evidence — presenting the compose canary"
+                        );
+                    } else {
+                        // A canary nobody saw proves nothing: it must not age into strong evidence.
+                        self.recovery.canary_not_shown();
+                    }
                     return Ok(());
                 }
                 recovery::Step::Run(stage) => {

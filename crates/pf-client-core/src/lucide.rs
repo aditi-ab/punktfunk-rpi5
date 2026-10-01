@@ -18,6 +18,8 @@ pub const ACTIVITY: &str = "M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0
 pub const ARROW_LEFT: &str = "M12 19l-7-7 7-7M19 12H5";
 /// Lucide `arrow-right`.
 pub const ARROW_RIGHT: &str = "M5 12h14M12 5l7 7-7 7";
+/// Lucide `arrow-up-down`.
+pub const ARROW_UP_DOWN: &str = "M21 16l-4 4-4-4M17 20V4M3 8l4-4 4 4M7 4v16";
 /// Lucide `bug`.
 pub const BUG: &str = "M8 2l1.88 1.88M14.12 3.88 16 2M9 7.13v-1a3.003 3.003 0 1 1 6 0v1M12 20c-3.3 0-6-2.7-6-6v-3a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v3c0 3.3-2.7 6-6 6M12 20v-9M6.53 9C4.6 8.8 3 7.1 3 5M6 13H2M3 21c0-2.1 1.7-3.9 3.8-4M20.97 5c0 2.1-1.6 3.8-3.5 4M22 13h-4M17.2 17c2.1.1 3.8 1.9 3.8 4";
 /// Lucide `chart-column`.
@@ -55,6 +57,8 @@ pub const GAMEPAD_2: &str = "M6 11L10 11M8 9L8 13M15 12L15.01 12M18 10L18.01 10M
 pub const GAUGE: &str = "M12 14l4-4M3.34 19a10 10 0 1 1 17.32 0";
 /// Lucide `grip-vertical`.
 pub const GRIP_VERTICAL: &str = "M8 12a1 1 0 1 0 2 0a1 1 0 1 0 -2 0M8 5a1 1 0 1 0 2 0a1 1 0 1 0 -2 0M8 19a1 1 0 1 0 2 0a1 1 0 1 0 -2 0M14 12a1 1 0 1 0 2 0a1 1 0 1 0 -2 0M14 5a1 1 0 1 0 2 0a1 1 0 1 0 -2 0M14 19a1 1 0 1 0 2 0a1 1 0 1 0 -2 0";
+/// Lucide `heart`.
+pub const HEART: &str = "M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z";
 /// Lucide `house`.
 pub const HOUSE: &str = "M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8M3 10a2 2 0 0 1 .709-1.528l7-5.999a2 2 0 0 1 2.582 0l7 5.999A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z";
 /// Lucide `info`.
@@ -108,13 +112,19 @@ pub const ROTATE_CW: &str = "M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8M2
 pub const SAVE: &str = "M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zM17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7M7 3v4a1 1 0 0 0 1 1h7";
 /// Lucide `scroll-text`.
 pub const SCROLL_TEXT: &str = "M15 12h-5M15 8h-5M19 17V5a2 2 0 0 0-2-2H4M8 21h12a2 2 0 0 0 2-2v-1a1 1 0 0 0-1-1H11a1 1 0 0 0-1 1v1a2 2 0 1 1-4 0V5a2 2 0 1 0-4 0v2a1 1 0 0 0 1 1h3";
+/// Lucide `search`.
+pub const SEARCH: &str = "M3 11a8 8 0 1 0 16 0a8 8 0 1 0 -16 0M21 21l-4.3-4.3";
 /// Lucide `send`.
 pub const SEND: &str = "M14.536 21.686a.5.5 0 0 0 .937-.024l6.5-19a.496.496 0 0 0-.635-.635l-19 6.5a.5.5 0 0 0-.024.937l7.93 3.18a2 2 0 0 1 1.112 1.11zM21.854 2.147l-10.94 10.939";
 /// Lucide `settings`.
 pub const SETTINGS: &str = "M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2zM9 12a3 3 0 1 0 6 0a3 3 0 1 0 -6 0";
+/// Lucide `sliders-horizontal`.
+pub const SLIDERS_HORIZONTAL: &str = "M21 4L14 4M10 4L3 4M21 12L12 12M8 12L3 12M21 20L16 20M12 20L3 20M14 2L14 6M8 10L8 14M16 18L16 22";
 /// Lucide `square`.
 pub const SQUARE: &str =
     "M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2z";
+/// Lucide `star`.
+pub const STAR: &str = "M11.525 2.295a.53.53 0 0 1 .95 0l2.31 4.679a2.123 2.123 0 0 0 1.595 1.16l5.166.756a.53.53 0 0 1 .294.904l-3.736 3.638a2.123 2.123 0 0 0-.611 1.878l.882 5.14a.53.53 0 0 1-.771.56l-4.618-2.428a2.122 2.122 0 0 0-1.973 0L6.396 21.01a.53.53 0 0 1-.77-.56l.881-5.139a2.122 2.122 0 0 0-.611-1.879L2.16 9.795a.53.53 0 0 1 .294-.906l5.165-.755a2.122 2.122 0 0 0 1.597-1.16z";
 /// Lucide `sun`.
 pub const SUN: &str = "M8 12a4 4 0 1 0 8 0a4 4 0 1 0 -8 0M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41";
 /// Lucide `trash-2`.
@@ -136,6 +146,7 @@ pub const ALL: &[(&str, &str, char)] = &[
     ("activity", ACTIVITY, '\u{e038}'),
     ("arrow-left", ARROW_LEFT, '\u{e04c}'),
     ("arrow-right", ARROW_RIGHT, '\u{e04d}'),
+    ("arrow-up-down", ARROW_UP_DOWN, '\u{e381}'),
     ("bug", BUG, '\u{e20c}'),
     ("chart-column", CHART_COLUMN, '\u{e2a3}'),
     ("check", CHECK, '\u{e070}'),
@@ -154,6 +165,7 @@ pub const ALL: &[(&str, &str, char)] = &[
     ("gamepad-2", GAMEPAD_2, '\u{e0e2}'),
     ("gauge", GAUGE, '\u{e1bf}'),
     ("grip-vertical", GRIP_VERTICAL, '\u{e0ee}'),
+    ("heart", HEART, '\u{e0f5}'),
     ("house", HOUSE, '\u{e0f8}'),
     ("info", INFO, '\u{e0fe}'),
     ("keyboard", KEYBOARD, '\u{e284}'),
@@ -179,9 +191,12 @@ pub const ALL: &[(&str, &str, char)] = &[
     ("rotate-cw", ROTATE_CW, '\u{e14d}'),
     ("save", SAVE, '\u{e151}'),
     ("scroll-text", SCROLL_TEXT, '\u{e464}'),
+    ("search", SEARCH, '\u{e155}'),
     ("send", SEND, '\u{e156}'),
     ("settings", SETTINGS, '\u{e158}'),
+    ("sliders-horizontal", SLIDERS_HORIZONTAL, '\u{e29a}'),
     ("square", SQUARE, '\u{e16b}'),
+    ("star", STAR, '\u{e17a}'),
     ("sun", SUN, '\u{e17c}'),
     ("trash-2", TRASH_2, '\u{e18e}'),
     ("tv", TV, '\u{e195}'),

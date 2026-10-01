@@ -3,7 +3,9 @@
 //! thread. The monitor owns it, not the session: between sessions the newest frame keeps
 //! landing in it, so a new `SET_ENCODE` on an idle desktop encodes the retained slot as its
 //! first IDR and needs no compose. A pool built for another device epoch, size or format is
-//! replaced by the next session; nothing rebuilds in place.
+//! replaced by the next session; nothing rebuilds in place. A surface no pool can take is kept
+//! as the monitor's [`Seed`], which the next pool opens on — the compose at swap-chain assign
+//! is a monitor's first picture, and it arrives before any `SET_ENCODE`.
 //!
 //! [`Attached`] is the drain worker's cached view of the monitor's pool and session,
 //! re-read only when `Monitor::encode_gen` moved, so the steady state takes no lock. It also
@@ -22,7 +24,10 @@ use pf_driver_proto::encode as wire;
 use pf_driver_proto::encode::au::AuHeader;
 use pf_frame::CapturedFrame;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
-use windows::Win32::Graphics::Direct3D11::{D3D11_TEXTURE2D_DESC, ID3D11Texture2D};
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT, ID3D11Texture2D,
+};
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::Win32::System::Threading::{ResetEvent, SetEvent, WaitForSingleObject};
 use windows62::Win32::Graphics::Direct3D11 as d3d;
@@ -90,6 +95,73 @@ struct State {
 fn unhold(st: &mut State) -> bool {
     st.full.retain(|f| f.0 != DIRECT);
     st.held.take().is_some()
+}
+
+/// The newest composed frame no pool took: before the monitor's first `SET_ENCODE`, or while
+/// its pool no longer fits the surface. The next pool opens on it ([`Pool::first_frame`]), so
+/// a session's first IDR needs no compose. One texture, on the drain worker's device.
+pub struct Seed(Mutex<Option<Kept>>);
+
+struct Kept {
+    epoch: u32,
+    size: (u32, u32),
+    format: DXGI_FORMAT,
+    tex: ID3D11Texture2D,
+}
+
+impl Seed {
+    pub fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    /// Copy `tex` over the kept frame; a new device, size or format gets a new texture.
+    fn keep(&self, device: &Direct3DDevice, tex: &ID3D11Texture2D) {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: `tex` is the live acquired surface; `desc` is a valid local out-param.
+        unsafe { tex.GetDesc(&mut desc) };
+        let key = (device.epoch(), (desc.Width, desc.Height), desc.Format);
+        let mut kept = lock(&self.0);
+        if kept
+            .as_ref()
+            .is_none_or(|k| (k.epoch, k.size, k.format) != key)
+        {
+            let seed_desc = D3D11_TEXTURE2D_DESC {
+                MipLevels: 1,
+                ArraySize: 1,
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+                ..desc
+            };
+            let mut t = None;
+            // SAFETY: `seed_desc` is a fully-initialized local; `t` a valid out-param.
+            let made = unsafe {
+                device
+                    .device
+                    .CreateTexture2D(&seed_desc, None, Some(&mut t))
+            };
+            *kept = made.ok().and(t).map(|tex| Kept {
+                epoch: key.0,
+                size: key.1,
+                format: key.2,
+                tex,
+            });
+        }
+        if let Some(k) = kept.as_ref() {
+            // SAFETY: same device, size and format; both textures are alive for the call.
+            unsafe { device.device_context.CopyResource(&k.tex, tex) };
+        }
+    }
+
+    /// The kept frame, handed over, if it was composed on `epoch` at `size` in `format`.
+    fn take(&self, epoch: u32, size: (u32, u32), format: DXGI_FORMAT) -> Option<ID3D11Texture2D> {
+        let mut kept = lock(&self.0);
+        let fits = kept
+            .as_ref()
+            .is_some_and(|k| (k.epoch, k.size, k.format) == (epoch, size, format));
+        fits.then(|| kept.take()).flatten().map(|k| k.tex)
+    }
 }
 
 /// One monitor's pool. See the module docs.
@@ -291,6 +363,30 @@ impl Pool {
         st.stash = Some((i, 0, self.source_seq.load(Ordering::Relaxed)));
         drop(st);
         self.wake();
+    }
+
+    /// The frame a new session opens on, as its source sequence: the newest queued one, else
+    /// the monitor's seed passed into a free slot. `None` when neither exists.
+    pub fn first_frame(&self, seed: &Seed) -> Option<u64> {
+        let mut st = lock(&self.state);
+        if let Some(&(.., seq)) = st.full.back() {
+            return Some(seq);
+        }
+        let tex = seed.take(
+            self.device_epoch,
+            (self.width, self.height),
+            self.source_format,
+        )?;
+        let i = *st.free.last()?;
+        let plate = self.cursor.blends() || self.cursor.armed();
+        bridge::<d3d::ID3D11Texture2D>(&tex)
+            .and_then(|src| st.targets.pass(&src, i, plate))
+            .ok()?;
+        st.free.pop();
+        let seq = self.source_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        // QPC 0: the drive stamps it with now, not a present that predates the session.
+        st.full.push_back((i, 0, seq));
+        Some(seq)
     }
 
     /// One more frame dropped; the new total, for the header.
@@ -502,9 +598,11 @@ impl Pool {
 pub struct Attached {
     pool: Option<Arc<Pool>>,
     session: Option<Arc<EncodeSession>>,
+    /// Where a surface no pool takes waits for the next one.
+    seed: Option<Arc<Seed>>,
     seen_gen: u32,
     cadence: Cadence,
-    /// One line per worker, not one per discarded surface.
+    /// One line per worker, not one per seeded surface.
     warned_no_pool: AtomicBool,
 }
 
@@ -513,6 +611,7 @@ impl Attached {
         Self {
             pool: None,
             session: None,
+            seed: None,
             seen_gen: u32::MAX,
             cadence: Cadence::new(),
             warned_no_pool: AtomicBool::new(false),
@@ -528,6 +627,7 @@ impl Attached {
         self.seen_gen = generation;
         self.pool = monitor.pool();
         self.session = monitor.encode();
+        self.seed = Some(monitor.seed());
         // Which pool this worker now fills, so it can be matched against the one the encode
         // thread drains: a worker filling a pool nobody drains starves the encoder silently.
         dbglog!(
@@ -538,16 +638,18 @@ impl Attached {
         );
     }
 
-    /// The hook, per acquired surface (see [`Pool::offer`]). A pool on another device epoch
-    /// marks the session stale — logged once — and the frame goes nowhere. `true` means the
-    /// encoder reads the surface itself, so the caller owes [`Self::wait_release`] before its
-    /// next acquire.
+    /// The hook, per acquired surface (see [`Pool::offer`]). With no pool, or one that cannot
+    /// take the surface, it becomes the seed the next pool opens on; a refusal also marks the
+    /// session stale, logged once. `true` means the encoder reads the surface itself, so the
+    /// caller owes [`Self::wait_release`] before its next acquire.
     pub fn offer(&self, device: &Direct3DDevice, tex: &ID3D11Texture2D, display_qpc: u64) -> bool {
         let Some(pool) = &self.pool else {
-            // No pool attached: every acquired surface goes nowhere, with nothing else logging it.
+            if let Some(seed) = &self.seed {
+                seed.keep(device, tex);
+            }
             if !self.warned_no_pool.swap(true, Ordering::AcqRel) {
                 dbglog!(
-                    "[pf-vd] pool attach: NO pool for this worker - surfaces are being discarded"
+                    "[pf-vd] pool attach: no pool yet - keeping the newest surface as the seed"
                 );
             }
             return false;
@@ -582,6 +684,9 @@ impl Attached {
                 }
             }
             Offer::Refused { got, want } => {
+                if let Some(seed) = &self.seed {
+                    seed.keep(device, tex);
+                }
                 if let Some(s) = session
                     && !s.stale.swap(true, Ordering::AcqRel)
                 {

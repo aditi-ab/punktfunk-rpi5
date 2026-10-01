@@ -59,7 +59,7 @@ classify() {
                 crates/punktfunk-core/*|crates/punktfunk-ffi/*|\
                 crates/pf-bitstream/*|crates/pf-client-core/*|crates/pf-console-ui/*|\
                 crates/pf-dmabuf/*|crates/pf-dxvadec/*|crates/pf-libva/*|crates/pf-presenter/*|\
-                crates/pf-update-check/*|crates/pf-vaapi/*|crates/pf-vkdecode/*|\
+                crates/pf-update-check/*|crates/pf-vaapi/*|crates/pf-v4l2dec/*|crates/pf-v4l2/*|crates/pf-vkdecode/*|\
                 crates/pyrowave-sys/*|ci/rust-ci-arm64cross.Dockerfile|\
                 scripts/ci/ensure-sccache.sh|scripts/ci/install-retrying-curl.sh)
                     rust_arm64=true

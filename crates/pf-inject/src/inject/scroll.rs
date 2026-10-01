@@ -16,6 +16,10 @@
 //! the client's momentum then continues the same interaction, and the stop goes
 //! out at `MomentumEnd`. The injector flushes a held stop that falls due
 //! ([`ScrollMapper::stop_due`], [`ScrollMapper::flush_due`]).
+//!
+//! A phased finger or touch gesture passes [`Gesture`] first: the host is the
+//! touchpad driver for a remote finger, so libinput's start threshold and
+//! direction lock apply here, once, for every client and backend.
 
 use std::time::{Duration, Instant};
 
@@ -28,6 +32,93 @@ use punktfunk_core::input::{InputEvent, InputKind, PRECISE_PX_PER_DETENT, SCROLL
 /// starts momentum a frame after the lift; the rest is network jitter. Momentum
 /// that comes later opens a new interaction.
 pub const MOMENTUM_GRACE: Duration = Duration::from_millis(50);
+
+/// DIP a gesture travels on an axis before that axis scrolls; less is the
+/// fingers landing. libinput's `scroll.threshold`, in its 1000-dpi units.
+pub const SCROLL_START_DIP: f64 = 5.0;
+
+/// DIP one delta must move on the other axis of a scrolling gesture for that
+/// axis to scroll too; less is drift. libinput's `direction_lock_threshold`.
+pub const DIRECTION_LOCK_DIP: f64 = 5.0;
+
+/// Where the client's finger stands on one axis of a [`Gesture`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Axis {
+    /// Nothing open: no delta yet, or a cancel or momentum end came.
+    #[default]
+    Closed,
+    /// Deltas may still come: between a begin and its stop, or in momentum.
+    Open,
+    /// The finger lifted (`End`); its momentum continues this gesture, a
+    /// `Begin` starts the next one.
+    Lifted,
+}
+
+/// One finger or touch gesture's start threshold and direction lock, libinput's
+/// `evdev_post_scroll` rule per axis: motion builds up until it passes
+/// [`SCROLL_START_DIP`], the axis that passes first scrolls, the other joins
+/// only on a single delta of [`DIRECTION_LOCK_DIP`], and a delta outside the
+/// lock is zero. A gesture runs from its first phased delta through the
+/// momentum after the lift; the next `Begin` starts a new one.
+#[derive(Default)]
+struct Gesture {
+    /// Motion on an axis that is not yet scrolling, in DIP.
+    buildup: [f64; 2],
+    /// Axes that scroll in this gesture.
+    scrolling: [bool; 2],
+    axis: [Axis; 2],
+}
+
+impl Gesture {
+    /// Apply the rule to `se`, zeroing a delta outside the lock. `false` drops
+    /// the event: a stop on an axis this gesture never scrolled, which no
+    /// backend has open. A wheel, a controller, or a phaseless delta passes.
+    fn admit(&mut self, se: &mut ScrollEvent) -> bool {
+        if !matches!(se.source, ScrollSource::Finger | ScrollSource::Touch)
+            || se.phase == ScrollPhase::None
+        {
+            return true;
+        }
+        let a = se.axis as usize;
+        if se.is_stop() {
+            let scrolled = self.scrolling[a];
+            self.axis[a] = if se.phase == ScrollPhase::End {
+                Axis::Lifted
+            } else {
+                Axis::Closed
+            };
+            if self.axis == [Axis::Closed; 2] {
+                *self = Self::default();
+            }
+            return scrolled;
+        }
+        // A `Begin` after a lift is the next gesture; on an axis still open it
+        // is one whose stop was lost. Its partner axis begins into the same
+        // gesture.
+        if se.phase == ScrollPhase::Begin
+            && (self.axis[a] != Axis::Closed || self.axis.contains(&Axis::Lifted))
+        {
+            *self = Self::default();
+        }
+        self.axis[a] = Axis::Open;
+        if self.scrolling[a] {
+            return true;
+        }
+        let d = delta_units(se);
+        self.buildup[a] += d;
+        let starts = if self.scrolling[1 - a] {
+            d.abs() >= DIRECTION_LOCK_DIP
+        } else {
+            self.buildup[a].abs() >= SCROLL_START_DIP
+        };
+        if starts {
+            self.scrolling[a] = true;
+        } else {
+            se.delta = 0;
+        }
+        true
+    }
+}
 
 /// Injection backend a plan is built for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,11 +141,13 @@ pub enum ScrollBackend {
 }
 
 /// wlroots `axis_source` the next axis ops in the frame are counted under.
+/// Never `continuous`: GTK hands that source to a trackpoint device, and
+/// Firefox pans by distance only for a touchpad. A finger is the one source
+/// every toolkit scrolls by the distance sent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AxisSource {
     Wheel,
     Finger,
-    Continuous,
 }
 
 /// One primitive in backend-native units and sign.
@@ -100,13 +193,14 @@ pub struct ScrollMapper {
     /// When a finger's `End` arrived that has not gone out yet; the
     /// interaction stays open for its momentum until [`MOMENTUM_GRACE`] ends.
     held: [Option<Instant>; 2],
+    /// The open finger or touch gesture's threshold and lock.
+    gesture: Gesture,
 }
 
 /// Mutter `RemoteDesktop.Session.NotifyPointerAxis` flags.
 pub const MUTTER_AXIS_FINISH: u32 = 1 << 0;
 pub const MUTTER_AXIS_WHEEL: u32 = 1 << 1;
 pub const MUTTER_AXIS_FINGER: u32 = 1 << 2;
-pub const MUTTER_AXIS_CONTINUOUS: u32 = 1 << 3;
 
 /// A Mutter plan as `NotifyPointerAxis(dx, dy, flags)` calls: each distance
 /// under the source ahead of it, a stop as a zero `FINISH`, which ends both
@@ -121,7 +215,6 @@ pub fn mutter_axis_calls(ops: &[ScrollOp]) -> Vec<(f64, f64, u32)> {
                 source = match s {
                     AxisSource::Wheel => MUTTER_AXIS_WHEEL,
                     AxisSource::Finger => MUTTER_AXIS_FINGER,
-                    AxisSource::Continuous => MUTTER_AXIS_CONTINUOUS,
                 }
             }
             ScrollOp::Continuous { horizontal, value } => calls.push(if horizontal {
@@ -170,15 +263,6 @@ fn delta_units(se: &ScrollEvent) -> f64 {
     f64::from(se.delta) / SCROLL_SCALE
 }
 
-/// The wl source a surface scrolls under: a finger's, or a continuous one's.
-fn axis_source(source: ScrollSource) -> AxisSource {
-    if matches!(source, ScrollSource::Finger | ScrollSource::Touch) {
-        AxisSource::Finger
-    } else {
-        AxisSource::Continuous
-    }
-}
-
 /// Mutter turns a wheel-sourced distance into `value120 = 12 × distance` and
 /// keeps the fraction, so v120 ÷ 12 arrives exact, hi-res wheels included.
 fn mutter_wheel(se: ScrollEvent, ops: &mut Vec<ScrollOp>) {
@@ -204,13 +288,15 @@ impl ScrollMapper {
             last_source: [None; 2],
             ongoing: [None; 2],
             held: [None; 2],
+            gesture: Gesture::default(),
         }
     }
 
     /// Ops for `ev` — a normalized or a legacy scroll — in wire order. Empty
-    /// when the event is malformed or the backend has nothing to say for it.
+    /// when the event is malformed, the gesture rule swallows it, or the
+    /// backend has nothing to say for it.
     pub fn plan(&mut self, ev: &InputEvent) -> Vec<ScrollOp> {
-        let Some(se) = ScrollEvent::from_event(&from_legacy(ev).unwrap_or(*ev)) else {
+        let Some(mut se) = ScrollEvent::from_event(&from_legacy(ev).unwrap_or(*ev)) else {
             return Vec::new();
         };
         tracing::trace!(source = ?se.source, phase = ?se.phase, axis = se.axis, delta = se.delta, "scroll in");
@@ -218,6 +304,10 @@ impl ScrollMapper {
         // A stale stop from a different source must not close the live
         // interaction or its residue.
         if se.is_stop() && self.ongoing[a].is_some_and(|open| open != se.source) {
+            return Vec::new();
+        }
+        // A stop the gesture drops is for an axis nothing below has open.
+        if !self.gesture.admit(&mut se) {
             return Vec::new();
         }
         // A held stop resolves on the axis's next event: the same source's
@@ -267,13 +357,13 @@ impl ScrollMapper {
         ops
     }
 
-    /// A stop in its own frame. wlroots and Mutter tag it with the
-    /// interaction's source: a frame without one is a wheel's, and an app
-    /// glides only from a finger's stop.
-    fn stop(&self, a: usize, source: ScrollSource, cancel: bool) -> Vec<ScrollOp> {
+    /// A stop in its own frame. wlroots and Mutter tag it finger: a frame
+    /// without a source is a wheel's, and an app glides only from a finger's
+    /// stop.
+    fn stop(&self, a: usize, cancel: bool) -> Vec<ScrollOp> {
         let mut ops = Vec::with_capacity(3);
         if matches!(self.backend, ScrollBackend::Wlr | ScrollBackend::Mutter) {
-            ops.push(ScrollOp::AxisSource(axis_source(source)));
+            ops.push(ScrollOp::AxisSource(AxisSource::Finger));
         }
         ops.extend([
             ScrollOp::Stop {
@@ -287,8 +377,8 @@ impl ScrollMapper {
 
     /// End the axis's interaction cleanly.
     fn close(&mut self, a: usize) -> Vec<ScrollOp> {
-        let source = self.ongoing[a].take().unwrap_or(ScrollSource::Finger);
-        self.stop(a, source, false)
+        self.ongoing[a] = None;
+        self.stop(a, false)
     }
 
     /// Stops for every axis still mid-interaction, held stops included,
@@ -297,8 +387,8 @@ impl ScrollMapper {
     pub fn cancel_all(&mut self) -> Vec<ScrollOp> {
         let mut ops = Vec::new();
         for a in 0..2 {
-            if let Some(source) = self.ongoing[a] {
-                ops.extend(self.stop(a, source, true));
+            if self.ongoing[a].is_some() {
+                ops.extend(self.stop(a, true));
             }
         }
         *self = ScrollMapper::new(self.backend);
@@ -332,7 +422,7 @@ impl ScrollMapper {
         match self.ongoing[a] {
             Some(open) if open != se.source || se.phase == ScrollPhase::Begin => {
                 self.ongoing[a] = None;
-                self.stop(a, open, true)
+                self.stop(a, true)
             }
             _ => Vec::new(),
         }
@@ -382,12 +472,12 @@ impl ScrollMapper {
                     se.source,
                     ScrollSource::Continuous | ScrollSource::Controller
                 ));
-        self.stop(a, se.source, cancel)
+        self.stop(a, cancel)
     }
 
     fn native_distance(&mut self, se: ScrollEvent, ops: &mut Vec<ScrollOp>) {
         if matches!(self.backend, ScrollBackend::Wlr | ScrollBackend::Mutter) {
-            ops.push(ScrollOp::AxisSource(axis_source(se.source)));
+            ops.push(ScrollOp::AxisSource(AxisSource::Finger));
         }
         let d = delta_units(&se);
         ops.push(ScrollOp::Continuous {
@@ -506,11 +596,11 @@ mod tests {
     const H: bool = true;
 
     /// A vertical stop as `backend` emits it: wlroots and Mutter put the
-    /// interaction's source in front.
-    fn stopped(backend: ScrollBackend, source: AxisSource, cancel: bool) -> Vec<ScrollOp> {
+    /// finger source in front.
+    fn stopped(backend: ScrollBackend, cancel: bool) -> Vec<ScrollOp> {
         let mut ops = Vec::new();
         if matches!(backend, ScrollBackend::Wlr | ScrollBackend::Mutter) {
-            ops.push(ScrollOp::AxisSource(source));
+            ops.push(ScrollOp::AxisSource(AxisSource::Finger));
         }
         ops.extend([
             ScrollOp::Stop {
@@ -526,7 +616,7 @@ mod tests {
     fn a_stop_carries_its_source_on_wlroots() {
         // No axis_source in a frame means a wheel: a finger's lift has to say finger.
         let mut m = ScrollMapper::new(ScrollBackend::Wlr);
-        m.plan(&ev(ScrollSource::Finger, ScrollPhase::Begin, 0, 4.0));
+        m.plan(&ev(ScrollSource::Finger, ScrollPhase::Begin, 0, 8.0));
         m.plan(&ev(ScrollSource::Finger, ScrollPhase::End, 0, 0.0));
         assert_eq!(
             m.flush_due(Instant::now() + MOMENTUM_GRACE),
@@ -544,7 +634,7 @@ mod tests {
     #[test]
     fn zero_momentum_keeps_backend_cancel_behavior() {
         for backend in [ScrollBackend::Libei, ScrollBackend::Wlr] {
-            let stop = stopped(backend, AxisSource::Continuous, true);
+            let stop = stopped(backend, true);
             let mut mapper = ScrollMapper::new(backend);
             mapper.plan(&ev(ScrollSource::Controller, ScrollPhase::Update, 0, 5.0));
             let ops = mapper.plan(&ev(
@@ -576,11 +666,7 @@ mod tests {
                         0.0
                     )]
                 ),
-                stopped(
-                    backend,
-                    AxisSource::Continuous,
-                    backend == ScrollBackend::Libei
-                )
+                stopped(backend, backend == ScrollBackend::Libei)
             );
         }
     }
@@ -693,16 +779,18 @@ mod tests {
 
     #[test]
     fn stops_by_backend() {
-        // libei: Finger ends clean, Continuous/Controller end cancelled,
-        // Cancel is always a cancel — and a zero-delta stop is not dropped.
+        // libei: a finger's or touch's lift is held for its momentum and ends
+        // clean, Cancel is always a cancel — once the axis scrolled.
+        let scrolled = |source| ev(source, ScrollPhase::Begin, 0, 8.0);
         for (source, phase, cancel) in [
             (ScrollSource::Finger, ScrollPhase::End, false),
             (ScrollSource::Touch, ScrollPhase::End, false),
-            (ScrollSource::Continuous, ScrollPhase::End, true),
-            (ScrollSource::Controller, ScrollPhase::End, true),
             (ScrollSource::Finger, ScrollPhase::Cancel, true),
         ] {
-            let ops = plan(ScrollBackend::Libei, &[ev(source, phase, 0, 0.0)]);
+            let mut m = ScrollMapper::new(ScrollBackend::Libei);
+            m.plan(&scrolled(source));
+            let mut ops = m.plan(&ev(source, phase, 0, 0.0));
+            ops.extend(m.flush_due(Instant::now() + MOMENTUM_GRACE));
             assert_eq!(
                 ops,
                 vec![
@@ -715,23 +803,55 @@ mod tests {
                 "{source:?} {phase:?}"
             );
         }
+        // Continuous/Controller end cancelled, and a zero-delta stop is not dropped.
+        for source in [ScrollSource::Continuous, ScrollSource::Controller] {
+            let ops = plan(
+                ScrollBackend::Libei,
+                &[ev(source, ScrollPhase::End, 0, 0.0)],
+            );
+            assert_eq!(
+                ops,
+                vec![
+                    ScrollOp::Stop {
+                        horizontal: V,
+                        cancel: true
+                    },
+                    ScrollOp::Frame,
+                ],
+                "{source:?}"
+            );
+        }
+        // A finger that never scrolled has nothing to stop.
+        assert!(plan(
+            ScrollBackend::Libei,
+            &[ev(ScrollSource::Finger, ScrollPhase::End, 0, 0.0)]
+        )
+        .is_empty());
         // wlr: a stop emits source + axis_stop + frame; cancel is informational only.
-        let ops = plan(
-            ScrollBackend::Wlr,
-            &[ev(ScrollSource::Finger, ScrollPhase::End, 0, 0.0)],
+        let mut m = ScrollMapper::new(ScrollBackend::Wlr);
+        m.plan(&scrolled(ScrollSource::Finger));
+        m.plan(&ev(ScrollSource::Finger, ScrollPhase::End, 0, 0.0));
+        assert_eq!(
+            m.flush_due(Instant::now() + MOMENTUM_GRACE),
+            stopped(ScrollBackend::Wlr, false)
         );
-        assert_eq!(ops, stopped(ScrollBackend::Wlr, AxisSource::Finger, false));
-        // gamescope/kwin/windows: stops are no-ops but still clear residue.
+        // gamescope/kwin/windows: stops are no-ops.
         for backend in [
             ScrollBackend::Gamescope,
             ScrollBackend::Kwin,
             ScrollBackend::Windows,
         ] {
-            assert!(plan(
+            let ops = plan(
                 backend,
-                &[ev(ScrollSource::Finger, ScrollPhase::End, 0, 0.0)]
-            )
-            .is_empty());
+                &[
+                    scrolled(ScrollSource::Finger),
+                    ev(ScrollSource::Finger, ScrollPhase::End, 0, 0.0),
+                ],
+            );
+            assert!(
+                !ops.iter().any(|o| matches!(o, ScrollOp::Stop { .. })),
+                "{backend:?}: {ops:?}"
+            );
         }
     }
 
@@ -741,7 +861,7 @@ mod tests {
         m.plan(&ev(ScrollSource::Finger, ScrollPhase::Update, 0, 5.0));
         // A new Begin on the same axis cancels the stale interaction first,
         // in its own frame — ei forbids scroll + stop on one axis per frame.
-        let ops = m.plan(&ev(ScrollSource::Finger, ScrollPhase::Begin, 0, 1.0));
+        let ops = m.plan(&ev(ScrollSource::Finger, ScrollPhase::Begin, 0, 6.0));
         assert_eq!(
             ops,
             vec![
@@ -752,7 +872,7 @@ mod tests {
                 ScrollOp::Frame,
                 ScrollOp::Continuous {
                     horizontal: V,
-                    value: -1.0
+                    value: -6.0
                 },
                 ScrollOp::Frame,
             ]
@@ -810,10 +930,7 @@ mod tests {
         let mut m = ScrollMapper::new(ScrollBackend::Wlr);
         m.plan(&ev(ScrollSource::Controller, ScrollPhase::Update, 0, 10.0));
         let ops = m.plan(&ev(ScrollSource::Finger, ScrollPhase::Update, 0, 5.0));
-        assert_eq!(
-            &ops[..3],
-            &stopped(ScrollBackend::Wlr, AxisSource::Continuous, true)[..]
-        );
+        assert_eq!(&ops[..3], &stopped(ScrollBackend::Wlr, true)[..]);
     }
 
     #[test]
@@ -829,7 +946,7 @@ mod tests {
             let mut m = ScrollMapper::new(backend);
             m.plan(&ev(ScrollSource::Controller, ScrollPhase::Begin, 0, 10.0));
             let ops = m.plan(&ev(ScrollSource::Finger, ScrollPhase::Momentum, 0, 5.0));
-            let stop = stopped(backend, AxisSource::Continuous, true);
+            let stop = stopped(backend, true);
             assert_eq!(&ops[..stop.len()], &stop[..], "{backend:?}");
             assert!(
                 ops.contains(&ScrollOp::Continuous {
@@ -868,7 +985,7 @@ mod tests {
             .is_empty());
         assert_eq!(
             m.flush_due(Instant::now() + MOMENTUM_GRACE),
-            stopped(ScrollBackend::Wlr, AxisSource::Finger, false)
+            stopped(ScrollBackend::Wlr, false)
         );
     }
 
@@ -954,7 +1071,7 @@ mod tests {
             );
             assert_eq!(
                 m.plan(&ev(ScrollSource::Finger, ScrollPhase::MomentumEnd, 0, 0.0)),
-                stopped(backend, AxisSource::Finger, false),
+                stopped(backend, false),
                 "{backend:?}"
             );
             assert!(m.cancel_all().is_empty(), "{backend:?}");
@@ -973,11 +1090,7 @@ mod tests {
             m.plan(&ev(ScrollSource::Touch, ScrollPhase::End, 0, 0.0));
             let due = m.stop_due().expect("held");
             assert!(m.flush_due(due - Duration::from_millis(1)).is_empty());
-            assert_eq!(
-                m.flush_due(due),
-                stopped(backend, AxisSource::Finger, false),
-                "{backend:?}"
-            );
+            assert_eq!(m.flush_due(due), stopped(backend, false), "{backend:?}");
             assert!(m.stop_due().is_none());
             assert!(m.cancel_all().is_empty(), "{backend:?}");
         }
@@ -1010,14 +1123,14 @@ mod tests {
             m
         };
         // The next gesture: the old one ends clean, no cancel on top.
-        let ops = lifted().plan(&ev(ScrollSource::Finger, ScrollPhase::Begin, 0, 3.0));
+        let ops = lifted().plan(&ev(ScrollSource::Finger, ScrollPhase::Begin, 0, 6.0));
         assert_eq!(&ops[..2], &stop);
         assert_eq!(
             &ops[2..],
             &[
                 ScrollOp::Continuous {
                     horizontal: V,
-                    value: -3.0
+                    value: -6.0
                 },
                 ScrollOp::Frame,
             ]
@@ -1079,13 +1192,14 @@ mod tests {
             horizontal: V,
             value: 10
         }));
-        // wlr forwards continuous momentum as Continuous-sourced axis deltas.
+        // wlr forwards continuous momentum as finger-sourced axis deltas: the
+        // one source toolkits scroll by distance.
         let mut m = ScrollMapper::new(ScrollBackend::Wlr);
         let ops = m.plan(&ev(ScrollSource::Continuous, ScrollPhase::Momentum, 0, 5.0));
         assert_eq!(
             ops,
             vec![
-                ScrollOp::AxisSource(AxisSource::Continuous),
+                ScrollOp::AxisSource(AxisSource::Finger),
                 ScrollOp::Continuous {
                     horizontal: V,
                     value: -5.0
@@ -1296,8 +1410,9 @@ mod tests {
                 (0.0, 0.0, MUTTER_AXIS_FINGER | MUTTER_AXIS_FINISH),
             ]
         );
-        // A controller: continuous, and its end is a cancel — nothing, so the
-        // app starts no kinetic tail of its own.
+        // A controller: a finger to Mutter too (a continuous source lands on
+        // a trackpoint device in GTK), and its end is a cancel — nothing, so
+        // the app starts no kinetic tail of its own.
         let ops = plan(
             ScrollBackend::Mutter,
             &[
@@ -1307,7 +1422,7 @@ mod tests {
         );
         assert_eq!(
             mutter_axis_calls(&ops),
-            vec![(0.0, -8.0, MUTTER_AXIS_CONTINUOUS)]
+            vec![(0.0, -8.0, MUTTER_AXIS_FINGER)]
         );
     }
 
@@ -1392,5 +1507,157 @@ mod tests {
                 .map(|se| (se.source, se.phase, se.axis, se.delta)),
             Some((ScrollSource::Continuous, ScrollPhase::None, 1, -10 * 256))
         );
+    }
+
+    fn finger(phase: ScrollPhase, axis: u32, delta: f64) -> InputEvent {
+        ev(ScrollSource::Finger, phase, axis, delta)
+    }
+
+    fn clicks(value: i32) -> Vec<ScrollOp> {
+        vec![
+            ScrollOp::Discrete120 {
+                horizontal: V,
+                value,
+            },
+            ScrollOp::Frame,
+        ]
+    }
+
+    /// Vertical finger steps on Windows: each `(phase, DIP)` and the v120
+    /// clicks it plans, 0 for nothing.
+    fn gesture_steps(name: &str, steps: &[(ScrollPhase, f64, i32)]) {
+        let mut m = ScrollMapper::new(ScrollBackend::Windows);
+        for (i, &(phase, dip, v120)) in steps.iter().enumerate() {
+            let ops = m.plan(&finger(phase, 0, dip));
+            let want = if v120 == 0 { Vec::new() } else { clicks(v120) };
+            assert_eq!(ops, want, "{name}, step {i}");
+        }
+    }
+
+    #[test]
+    fn a_gesture_scrolls_only_past_the_start_threshold() {
+        use ScrollPhase::*;
+        // The delta that crosses 5 DIP goes out as itself, not as the
+        // buildup — no jump as scrolling engages; then every delta counts.
+        gesture_steps(
+            "buildup",
+            &[
+                (Begin, 2.0, 0),
+                (Update, 2.0, 0),
+                (Update, 2.0, 4),
+                (Update, 0.5, 1),
+            ],
+        );
+        // The fingers landing: a short move against the scroll cancels out
+        // in the buildup and the scroll starts in the finger's direction.
+        gesture_steps(
+            "landing",
+            &[
+                (Begin, 2.0, 0),
+                (Update, 1.0, 0),
+                (Update, -3.0, 0),
+                (Update, -6.0, -12),
+            ],
+        );
+        // No End arrived: the next Begin restarts the rule all the same.
+        gesture_steps(
+            "lost stop",
+            &[(Begin, 8.0, 16), (Begin, 3.0, 0), (Update, 3.0, 6)],
+        );
+    }
+
+    #[test]
+    fn drift_off_the_scrolling_axis_is_locked_out() {
+        // Vertical scrolls; the small horizontal deltas a hand adds never do,
+        // and their stop ends nothing — a FINISH would end the vertical
+        // interaction with it.
+        let mut m = ScrollMapper::new(ScrollBackend::Mutter);
+        let mut ops = m.plan(&finger(ScrollPhase::Begin, 0, 8.0));
+        ops.extend(m.plan(&finger(ScrollPhase::Begin, 1, 1.5)));
+        ops.extend(m.plan(&finger(ScrollPhase::Update, 0, 6.0)));
+        ops.extend(m.plan(&finger(ScrollPhase::Update, 1, 2.0)));
+        ops.extend(m.plan(&finger(ScrollPhase::Update, 1, 4.0)));
+        ops.extend(m.plan(&finger(ScrollPhase::End, 0, 0.0)));
+        ops.extend(m.plan(&finger(ScrollPhase::End, 1, 0.0)));
+        ops.extend(m.flush_due(Instant::now() + MOMENTUM_GRACE));
+        assert_eq!(
+            mutter_axis_calls(&ops),
+            vec![
+                (0.0, -8.0, MUTTER_AXIS_FINGER),
+                (0.0, -6.0, MUTTER_AXIS_FINGER),
+                (0.0, 0.0, MUTTER_AXIS_FINGER | MUTTER_AXIS_FINISH),
+            ]
+        );
+        // A deliberate sideways move joins the scroll: one delta of 5 DIP,
+        // and its lift is then a real stop, held for momentum like the other.
+        let mut m = ScrollMapper::new(ScrollBackend::Libei);
+        m.plan(&finger(ScrollPhase::Begin, 0, 8.0));
+        assert!(m.plan(&finger(ScrollPhase::Begin, 1, 4.0)).is_empty());
+        assert_eq!(
+            m.plan(&finger(ScrollPhase::Update, 1, 5.0)),
+            vec![
+                ScrollOp::Continuous {
+                    horizontal: H,
+                    value: 5.0
+                },
+                ScrollOp::Frame,
+            ]
+        );
+        assert!(m.plan(&finger(ScrollPhase::End, 1, 0.0)).is_empty());
+        assert!(m.stop_due().is_some());
+    }
+
+    #[test]
+    fn momentum_keeps_the_gestures_lock() {
+        // The lift ends the tracking, not the gesture: momentum scrolls from
+        // its first delta with no new threshold, the locked-out axis stays
+        // out, and MomentumEnd closes the gesture for the next Begin.
+        let mut m = ScrollMapper::new(ScrollBackend::Libei);
+        m.plan(&finger(ScrollPhase::Begin, 0, 8.0));
+        m.plan(&finger(ScrollPhase::Begin, 1, 1.0));
+        m.plan(&finger(ScrollPhase::End, 0, 0.0));
+        m.plan(&finger(ScrollPhase::End, 1, 0.0));
+        assert_eq!(
+            m.plan(&finger(ScrollPhase::MomentumBegin, 0, 3.0)),
+            vec![
+                ScrollOp::Continuous {
+                    horizontal: V,
+                    value: -3.0
+                },
+                ScrollOp::Frame,
+            ]
+        );
+        assert!(m
+            .plan(&finger(ScrollPhase::MomentumBegin, 1, 2.0))
+            .is_empty());
+        assert!(m.plan(&finger(ScrollPhase::MomentumEnd, 1, 0.0)).is_empty());
+        assert_eq!(
+            m.plan(&finger(ScrollPhase::MomentumEnd, 0, 0.0)),
+            vec![
+                ScrollOp::Stop {
+                    horizontal: V,
+                    cancel: false
+                },
+                ScrollOp::Frame,
+            ]
+        );
+        assert!(m.plan(&finger(ScrollPhase::Begin, 0, 3.0)).is_empty());
+    }
+
+    #[test]
+    fn wheels_and_phaseless_fingers_skip_the_gesture_rule() {
+        for (source, phase) in [
+            (ScrollSource::Finger, ScrollPhase::None),
+            (ScrollSource::Continuous, ScrollPhase::Update),
+            (ScrollSource::Controller, ScrollPhase::Update),
+        ] {
+            let ops = plan(ScrollBackend::Windows, &[ev(source, phase, 0, 1.0)]);
+            assert_eq!(ops, clicks(2), "{source:?}");
+        }
+        let ops = plan(
+            ScrollBackend::Windows,
+            &[ev(ScrollSource::Wheel, ScrollPhase::None, 0, 30.0)],
+        );
+        assert_eq!(ops, clicks(30));
     }
 }

@@ -16,6 +16,7 @@ use std::ffi::c_void;
 /// Named only for the codes this module branches on; others stay numeric (`result_name`).
 pub type AmfResult = i32;
 pub const AMF_OK: AmfResult = 0;
+pub const AMF_OUT_OF_RANGE: AmfResult = 5;
 pub const AMF_EOF: AmfResult = 23;
 pub const AMF_REPEAT: AmfResult = 24;
 pub const AMF_INPUT_FULL: AmfResult = 25;

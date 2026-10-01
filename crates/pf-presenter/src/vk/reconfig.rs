@@ -36,10 +36,25 @@ impl Presenter {
         }
         self.quiesce_own()?;
         // SAFETY: `pdev` and `surface` are live handles owned by this presenter.
-        let caps = unsafe {
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut caps = unsafe {
             self.surface_i
                 .get_physical_device_surface_capabilities(self.pdev, self.surface)
         }?;
+        // An exclusive swapchain is sized and moded through its own chained queries.
+        #[cfg(windows)]
+        if let Some(f) = &self.fse {
+            caps = f.capabilities(self.pdev, self.surface)?;
+            let mode = f.present_mode(self.pdev, self.surface, self.present_mode);
+            if mode != self.present_mode {
+                tracing::info!(
+                    requested = ?self.present_mode,
+                    active = ?mode,
+                    "exclusive fullscreen does not offer the present mode"
+                );
+                self.present_mode = mode;
+            }
+        }
         let (pw, ph) = window.size_in_pixels();
         let extent = if caps.current_extent.width != u32::MAX {
             caps.current_extent
@@ -97,7 +112,9 @@ impl Presenter {
         // between this drain and the destroy below.
         self.last_presented = None;
         let old = self.swapchain;
-        let info = vk::SwapchainCreateInfoKHR::default()
+        #[cfg(windows)]
+        let mut fse_chain = Default::default();
+        let mut info = vk::SwapchainCreateInfoKHR::default()
             .surface(self.surface)
             .min_image_count(min_images)
             .image_format(self.format.format)
@@ -113,6 +130,14 @@ impl Presenter {
             .present_mode(self.present_mode)
             .clipped(true)
             .old_swapchain(old);
+        // Present-id2/present-wait2 are asked for per swapchain.
+        if self.present_id2 {
+            info = info.flags(super::setup::present_wait2::SWAPCHAIN_FLAGS);
+        }
+        #[cfg(windows)]
+        if let Some(f) = &self.fse {
+            info = f.extend(info, &mut fse_chain);
+        }
         // SAFETY: `device`/`surface` are live; `info` is a local that outlives the call.
         let swapchain = unsafe { self.swap_d.create_swapchain(&info, None) }.map_err(|e| {
             anyhow!(
@@ -125,6 +150,10 @@ impl Presenter {
                 kmsdrm_swapchain_hint()
             )
         })?;
+        #[cfg(windows)]
+        if let Some(f) = &self.fse {
+            f.acquire(swapchain);
+        }
         // Quiesce covered our cmd bufs, queue drain the presentation-engine
         // semaphore waits, present-timer drain the last waiter — nothing
         // still names these objects.

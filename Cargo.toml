@@ -41,6 +41,8 @@ members = [
     "crates/pf-dxvadec",
     "crates/pf-libva",
     "crates/pf-vaapi",
+    "crates/pf-v4l2dec",
+    "crates/pf-v4l2",
     "crates/pyrowave-sys",
     "crates/libvpl-sys",
     "clients/probe",
@@ -81,7 +83,7 @@ exclude = [
 ndk = { path = "clients/android/native/vendor/ndk" }
 
 [workspace.package]
-version = "0.41.0"
+version = "0.42.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"

@@ -35,6 +35,7 @@ use crate::video::DecodeHealth;
 use crate::video::DmabufFrame;
 use crate::video::DmabufPlane;
 use crate::video::DrmFrameGuard;
+use crate::video::FrameGuard;
 use crate::video::StreamFormat;
 use crate::video_color::ColorDesc;
 use crate::video_types::trim_deliverable;
@@ -110,6 +111,15 @@ pub struct VaFrameGuard {
 impl Drop for VaFrameGuard {
     fn drop(&mut self) {
         let _ = self.tx.send(self.release);
+    }
+}
+
+/// The release token of a frame this rung shipped.
+#[cfg(test)]
+fn release_of(guard: &DrmFrameGuard) -> VaRelease {
+    match &guard.0 {
+        FrameGuard::Va(g) => g.release,
+        FrameGuard::V4l2(_) => unreachable!("a VAAPI frame carries a VAAPI guard"),
     }
 }
 
@@ -386,17 +396,27 @@ pub(crate) struct NativeVaapiDecoder {
 /// Does the node this rung would open for `presenter_vendor` decode AV1 Profile 0?
 /// Opens and closes a display, so callers ask once and keep the answer.
 pub(crate) fn av1_decodable(presenter_vendor: u32) -> bool {
-    let answer = pf_vaapi::profile_for(pf_vaapi::Codec::Av1, 1, 8)
+    codec_decodable(pf_vaapi::Codec::Av1, "AV1", presenter_vendor)
+}
+
+/// [`av1_decodable`] for HEVC Main: the codec with no CPU rung to fall onto.
+pub(crate) fn hevc_decodable(presenter_vendor: u32) -> bool {
+    codec_decodable(pf_vaapi::Codec::H265, "HEVC", presenter_vendor)
+}
+
+fn codec_decodable(codec: pf_vaapi::Codec, name: &str, presenter_vendor: u32) -> bool {
+    let answer = pf_vaapi::profile_for(codec, 1, 8)
         .map_err(|e| anyhow!("{e}"))
         .and_then(|profile| {
             let va = Libva::load().context("libva")?;
             Display::open_for_vendor(va, Some(presenter_vendor))?.require_entrypoint(profile.value)
         });
     match &answer {
-        Ok(()) => tracing::info!("the presenter's VAAPI node decodes AV1"),
+        Ok(()) => tracing::info!(codec = name, "the presenter's VAAPI node decodes it"),
         Err(e) => tracing::info!(
+            codec = name,
             reason = %format!("{e:#}"),
-            "the presenter's VAAPI node does not decode AV1"
+            "the presenter's VAAPI node does not decode it"
         ),
     }
     answer.is_ok()
@@ -1322,14 +1342,15 @@ fn ship(
         references_clean: picture.facts.references_clean,
         sync_fds,
         pool_key: (s.generation << 32) | surface_index as u64,
-        guard: DrmFrameGuard(VaFrameGuard {
+        path: DECODER_PIN,
+        guard: DrmFrameGuard(FrameGuard::Va(VaFrameGuard {
             _fds: fds,
             tx: tx.clone(),
             release: VaRelease {
                 surface: surface_index,
                 generation: s.generation,
             },
-        }),
+        })),
     })
 }
 
@@ -1874,14 +1895,15 @@ mod tests {
             references_clean: PLAIN.references_clean,
             sync_fds: Vec::new(),
             pool_key: (1 << 32) | surface as u64,
-            guard: DrmFrameGuard(VaFrameGuard {
+            path: DECODER_PIN,
+            guard: DrmFrameGuard(FrameGuard::Va(VaFrameGuard {
                 _fds: Vec::new(),
                 tx: tx.clone(),
                 release: VaRelease {
                     surface,
                     generation: 1,
                 },
-            }),
+            })),
         }
     }
 
@@ -1900,7 +1922,7 @@ mod tests {
         assert_eq!(
             dropped
                 .iter()
-                .map(|f| f.guard.0.release.surface)
+                .map(|f| release_of(&f.guard).surface)
                 .collect::<Vec<_>>(),
             vec![0, 1],
             "the OLDEST two go: dropping the newest would keep the stalest picture and \
@@ -1909,7 +1931,7 @@ mod tests {
         assert_eq!(
             queue
                 .iter()
-                .map(|f| f.guard.0.release.surface)
+                .map(|f| release_of(&f.guard).surface)
                 .collect::<Vec<_>>(),
             vec![2, 3, 4],
             "and what survives keeps display order"
@@ -3585,7 +3607,7 @@ mod parity {
         frame: &DmabufFrame,
         what: &str,
     ) -> Vec<u8> {
-        let release = frame.guard.0.release;
+        let release = release_of(&frame.guard);
         let (surface, coded, fourcc) = {
             let s = decoder
                 .session
@@ -4054,7 +4076,7 @@ mod parity {
             }
         }
         let frame = frame.expect("some access unit of the vendored vector must deliver a frame");
-        let release = frame.guard.0.release;
+        let release = release_of(&frame.guard);
         let (surface, display, coded, fourcc) = {
             let s = decoder.session.as_ref().expect("a session");
             (

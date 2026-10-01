@@ -105,6 +105,10 @@ workspace. See `docs/agents/domain.md`.
   receives from injected scroll: source, distance, value120, stops, cadence. `--listen N` only
   listens, for a real client scrolling over its window; the host's
   `RUST_LOG=pf_inject::scroll=trace` logs the same scroll as it came off the wire.
+- `scroll-probe --inject-at WxH` opens no window and injects at that desktop's centre, onto a
+  real app. `tools/scroll-probe/gtk-scroll-logger.py <log>` is that app for GTK 4: it logs each
+  scroll event, each kinetic `decelerate`, and the scrolled window's position per frame. A
+  client's lumpy scroll shows there as large deltas tens of milliseconds apart.
 - Scope ripwire source reviews with `--exclude=clients/apple/.build`
   `--exclude=clients/apple/PunktfunkCore.xcframework`; downloaded sources and packaged headers
   otherwise pollute the symbol graph and clone findings.

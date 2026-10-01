@@ -54,6 +54,10 @@ pub struct GsPointer {
     touch_ids: Vec<u32>,
     /// One-shot: first SS_TOUCH is the breadcrumb if later stages stay silent.
     touch_seen: bool,
+    /// The injector drops touch (wlroots), but the pen flag already told Moonlight not to
+    /// emulate a mouse: the first finger drives the pointer and left button instead. Decided at
+    /// the first touch, once the session's injector is known.
+    touch_as_mouse: Option<bool>,
 }
 
 impl GsPointer {
@@ -65,6 +69,7 @@ impl GsPointer {
             saw_hover: false,
             touch_ids: Vec::new(),
             touch_seen: false,
+            touch_as_mouse: None,
         }
     }
 
@@ -176,6 +181,32 @@ impl GsPointer {
             y: (y.clamp(0.0, 1.0) * TOUCH_SURFACE as f32) as i32,
             flags: (TOUCH_SURFACE << 16) | TOUCH_SURFACE,
         };
+        if *self
+            .touch_as_mouse
+            .get_or_insert_with(|| !crate::inject::touch_supported())
+        {
+            // Moonlight's left button is 1. `touch_ids` holds only the finger that owns the pointer.
+            let owner = self.touch_ids.first() == Some(&t.pointer_id);
+            let (x, y) = (t.x, t.y);
+            match t.event_type {
+                LI_TOUCH_EVENT_DOWN if self.touch_ids.is_empty() => {
+                    self.touch_ids.push(t.pointer_id);
+                    sink(ev(InputKind::MouseMoveAbs, 0, x, y));
+                    sink(ev(InputKind::MouseButtonDown, 1, x, y));
+                }
+                LI_TOUCH_EVENT_MOVE if owner => sink(ev(InputKind::MouseMoveAbs, 0, x, y)),
+                LI_TOUCH_EVENT_UP | LI_TOUCH_EVENT_CANCEL if owner => {
+                    self.touch_ids.clear();
+                    sink(ev(InputKind::MouseButtonUp, 1, x, y));
+                }
+                LI_TOUCH_EVENT_CANCEL_ALL if !self.touch_ids.is_empty() => {
+                    self.touch_ids.clear();
+                    sink(ev(InputKind::MouseButtonUp, 1, 0.0, 0.0));
+                }
+                _ => {}
+            }
+            return;
+        }
         match t.event_type {
             LI_TOUCH_EVENT_DOWN => {
                 if !self.touch_ids.contains(&t.pointer_id) && self.touch_ids.len() < MAX_TOUCH_IDS {
@@ -284,8 +315,43 @@ mod tests {
     }
 
     #[test]
+    fn touch_without_an_injector_drives_the_pointer_with_the_first_finger() {
+        let mut g = GsPointer {
+            touch_as_mouse: Some(true),
+            ..GsPointer::new()
+        };
+        let mut got: Vec<InputEvent> = Vec::new();
+        let t = |event_type, pointer_id| SsTouch {
+            event_type,
+            rotation: 0,
+            pointer_id,
+            x: 0.5,
+            y: 0.5,
+            pressure_or_distance: 0.5,
+        };
+        g.apply_touch(&t(LI_TOUCH_EVENT_DOWN, 7), |e| got.push(e));
+        g.apply_touch(&t(LI_TOUCH_EVENT_DOWN, 9), |e| got.push(e)); // second finger: ignored
+        g.apply_touch(&t(LI_TOUCH_EVENT_MOVE, 7), |e| got.push(e));
+        g.apply_touch(&t(LI_TOUCH_EVENT_UP, 7), |e| got.push(e));
+        let kinds: Vec<(InputKind, u32)> = got.iter().map(|e| (e.kind, e.code)).collect();
+        assert_eq!(
+            kinds,
+            [
+                (InputKind::MouseMoveAbs, 0),
+                (InputKind::MouseButtonDown, 1),
+                (InputKind::MouseMoveAbs, 0),
+                (InputKind::MouseButtonUp, 1),
+            ]
+        );
+        assert_eq!(got[0].x, 32767);
+    }
+
+    #[test]
     fn touch_forwards_wire_touch_and_cancel_all_replays_ups() {
-        let mut g = GsPointer::new();
+        let mut g = GsPointer {
+            touch_as_mouse: Some(false),
+            ..GsPointer::new()
+        };
         let mut got: Vec<InputEvent> = Vec::new();
         let t = |event_type, pointer_id, x: f32| SsTouch {
             event_type,

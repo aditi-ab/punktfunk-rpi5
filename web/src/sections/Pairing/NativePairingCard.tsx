@@ -47,7 +47,9 @@ export const NativePairingSection: FC<{
 	/** Name this window for one device — set by a WAN knock's "Arm PIN". */
 	boundTo?: BoundDevice | null;
 	onClearBound?: () => void;
-}> = ({ boundTo = null, onClearBound }) => {
+	/** The approve dialog is open and owns the console password. */
+	passwordLocked?: boolean;
+}> = ({ boundTo = null, onClearBound, passwordLocked }) => {
 	const qc = useQueryClient();
 	const native = useGetNativePairing({
 		query: { refetchInterval: (q) => (q.state.data?.armed ? 1_000 : 4_000) },
@@ -120,6 +122,7 @@ export const NativePairingSection: FC<{
 			isArming={arm.isPending}
 			failure={refusal.failure}
 			isDisarming={disarm.isPending}
+			passwordLocked={passwordLocked}
 		/>
 	);
 };
@@ -142,6 +145,8 @@ export const NativePairingCard: FC<{
 	/** Why the BFF refused the last arm's password, if it did. */
 	failure: PasswordFailure;
 	isDisarming: boolean;
+	/** The approve dialog is open and owns the console password. */
+	passwordLocked?: boolean;
 }> = ({
 	status,
 	pin,
@@ -152,6 +157,7 @@ export const NativePairingCard: FC<{
 	isArming,
 	failure,
 	isDisarming,
+	passwordLocked,
 }) => {
 	const d = status.data;
 	// What the pairing device will be allowed to do — same defaults as the approve dialog (D1):
@@ -277,6 +283,7 @@ export const NativePairingCard: FC<{
 									onChange={setPassword}
 									failure={failure}
 									help={m.pairing_password_help()}
+									disabled={passwordLocked}
 								/>
 							</div>
 							<Button

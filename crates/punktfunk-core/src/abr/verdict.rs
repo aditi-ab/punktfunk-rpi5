@@ -131,11 +131,18 @@ impl Baselines {
         self.encode.clear();
     }
 
+    /// The decode driver stood down: its latency is not the rate's to read.
+    pub(crate) fn clear_decode(&mut self) {
+        self.decode.clear();
+    }
+
     /// Score one window, then record what it taught.
     ///
     /// `current_kbps` is the acked rate starvation is measured against,
     /// `frame_budget_us` sizes the decode and encode thresholds,
-    /// `encode_disarmed` withholds the host-encode signal entirely,
+    /// `encode_disarmed` withholds the host-encode signal entirely and
+    /// `decode_disarmed` the client-decode one (its driver found the latency
+    /// is not a function of the rate),
     /// `clean_run` is the undamaged windows this rate has already held —
     /// what tells a blip from the first window of congestion — and
     /// `draining` says the last link cut is still emptying the queue it
@@ -153,6 +160,7 @@ impl Baselines {
         current_kbps: u32,
         frame_budget_us: Option<i64>,
         encode_disarmed: bool,
+        decode_disarmed: bool,
         clean_run: u32,
         draining: bool,
         link_vouches: bool,
@@ -178,11 +186,12 @@ impl Baselines {
         // power.
         let owd_bad = owd_rise && !draining;
         // Decode rise ends slow start immediately; a far-past-baseline
-        // excursion is severe (one window). Sized in frame budgets.
+        // excursion is severe (one window). Sized in frame budgets. Stood
+        // down, the signal is withheld and teaches no baseline, as encode is.
         let (decode_rise_us, decode_severe_us) = decode_thresholds(frame_budget_us);
         let (decode_bad, decode_severe) = score_baseline(
             &mut self.decode,
-            decode_mean_us,
+            decode_mean_us.filter(|_| !decode_disarmed),
             decode_rise_us,
             decode_severe_us,
         );

@@ -11,23 +11,49 @@ fn headless_shim_dir() -> std::path::PathBuf {
 
 /// PATH shim: rewrite SteamOS's hardcoded panel args to headless at `PF_W`/`PF_H`/`PF_HZ`.
 /// `PF_HZ` is [`game_hz`] on `-r` only — it must not change the negotiated resolution.
-pub(super) fn write_headless_shim() -> Result<std::path::PathBuf> {
+///
+/// The session reads gamescope's ready line (`-R`) for 3 s, and its unit fails at 5 s without
+/// it. A headless start can take longer, so the shim takes the line on its own pipe for
+/// [`HEADLESS_READY_SECS`] and does what the session would: hand the line on, write
+/// `gamescope-environment`, notify systemd.
+fn headless_shim_body(bin: &str) -> String {
     // `$PF_HDR_ARGS` is unquoted for the same reason as in the GAMESCOPE_BIN wrapper: it is our
     // own flag list ([`hdr_args`]) and must word-split into separate argv entries.
-    let shim_body = format!(
+    format!(
         r#"#!/bin/bash
 W="${{PF_W:-1920}}"; H="${{PF_H:-1080}}"; HZ="${{PF_HZ:-60}}"
-keep=()
+keep=(); ready=
 while [ $# -gt 0 ]; do
   case "$1" in
     --generate-drm-mode|-w|-h|-W|-H|-O|--prefer-output) shift 2;;
+    -R) ready="$2"; shift 2;;
     *) keep+=("$1"); shift;;
   esac
 done
-exec {bin} --backend headless -W "$W" -H "$H" -w "$W" -h "$H" -r "$HZ" ${{PF_HDR_ARGS}} "${{keep[@]}}"
+set -- --backend headless -W "$W" -H "$H" -w "$W" -h "$H" -r "$HZ" ${{PF_HDR_ARGS}} "${{keep[@]}}"
+[ -n "$ready" ] || exec {bin} "$@"
+own="${{0%/*}}/ready.$$"
+rm -f "$own"; mkfifo "$own"
+{bin} "$@" -R "$own" &
+gs=$!
+if read -r -t {secs} x wl <> "$own"; then
+  printf '%s %s\n' "$x" "$wl" 1<> "$ready"
+  export DISPLAY="$x" GAMESCOPE_WAYLAND_DISPLAY="$wl"
+  env > "$XDG_RUNTIME_DIR/gamescope-environment"
+  systemd-notify --ready
+fi
+rm -f "$own"
+wait "$gs"
 "#,
-        bin = gamescope_bin()
-    );
+        secs = HEADLESS_READY_SECS,
+    )
+}
+
+/// How long a headless gamescope may take to answer. The drop-in's start timeout sits above it.
+const HEADLESS_READY_SECS: u32 = 40;
+
+pub(super) fn write_headless_shim() -> Result<std::path::PathBuf> {
+    let shim_body = headless_shim_body(gamescope_bin());
     let dir = headless_shim_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
     let shim = dir.join("gamescope");
@@ -38,26 +64,36 @@ exec {bin} --backend headless -W "$W" -H "$H" -w "$W" -h "$H" -r "$HZ" ${{PF_HDR
     Ok(dir)
 }
 
-/// `zz-` sorts last, overriding any distro drop-in.
+/// `zz-` sorts last, overriding any distro drop-in. Runtime dir, like the bind drop-in: a host that
+/// dies mid-takeover must not leave the panel's Game Mode headless past a reboot.
 fn steamos_dropin_path() -> std::path::PathBuf {
+    let base = crate::session::runtime_dir();
+    std::path::Path::new(&base)
+        .join("systemd/user/gamescope-session.service.d/zz-punktfunk-headless.conf")
+}
+
+/// `$HOME` copy an older host wrote. Nothing else removes it. Swept on sight.
+fn legacy_steamos_dropin_path() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/deck".to_string());
     std::path::Path::new(&home)
         .join(".config/systemd/user/gamescope-session.service.d/zz-punktfunk-headless.conf")
 }
+
+/// SIGKILL for gamescope when the target stops: its SIGTERM leaks the NVIDIA GPU context (see
+/// [`kill_unit`]). Steam stops first, cleanly, in its own `steam-launcher.service`.
+const STEAMOS_KILL_LINE: &str = "KillSignal=SIGKILL\n";
 
 pub(super) fn write_steamos_dropin(
     shim_dir: &std::path::Path,
     mode: Mode,
     hdr: bool,
 ) -> Result<()> {
-    let path = steamos_dropin_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
-    }
     // Stale desktop DISPLAY/WAYLAND_DISPLAY in the manager env would make gamescope attach instead
-    // of becoming the display server.
+    // of becoming the display server. The start timeout sits above the shim's ready wait.
     let body = format!(
         "[Service]\n\
+         {STEAMOS_KILL_LINE}\
+         TimeoutStartSec={timeout}\n\
          Environment=PATH={shim}:/usr/bin:/bin:/usr/local/bin\n\
          Environment=PF_W={w}\n\
          Environment=PF_H={h}\n\
@@ -65,6 +101,7 @@ pub(super) fn write_steamos_dropin(
          Environment=\"PF_HDR_ARGS={hdr_args}\"\n\
          {xkb}\
          UnsetEnvironment=DISPLAY WAYLAND_DISPLAY\n",
+        timeout = HEADLESS_READY_SECS + 20,
         shim = shim_dir.display(),
         xkb = xkb_unit_lines(),
         w = mode.width,
@@ -79,11 +116,26 @@ pub(super) fn write_steamos_dropin(
             .collect::<Vec<_>>()
             .join(" "),
     );
+    write_steamos_dropin_body(&body)
+}
+
+/// Hand-back: only the kill signal stays, so the restart that stops our headless gamescope uses it.
+pub(super) fn write_steamos_handback_dropin() -> Result<()> {
+    write_steamos_dropin_body(&format!("[Service]\n{STEAMOS_KILL_LINE}"))
+}
+
+fn write_steamos_dropin_body(body: &str) -> Result<()> {
+    let path = steamos_dropin_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
     std::fs::write(&path, body).with_context(|| format!("write drop-in {}", path.display()))
 }
 
-pub(super) fn remove_steamos_dropin() {
-    let _ = std::fs::remove_file(steamos_dropin_path());
+/// `true` when either copy existed.
+pub(super) fn remove_steamos_dropin() -> bool {
+    let runtime = std::fs::remove_file(steamos_dropin_path()).is_ok();
+    std::fs::remove_file(legacy_steamos_dropin_path()).is_ok() || runtime
 }
 
 /// Autologin-unit bind drop-in. Must live in `$XDG_RUNTIME_DIR`, not `$HOME`: it applies to the
@@ -223,5 +275,72 @@ mod tests {
         // bare `sleep` would depend on the unit's PATH, and an ExecStart that fails to execute is
         // the failing unit the display manager relogin-loops against.
         assert!(idle_dropin_body("/bin/sleep").contains("ExecStart=/bin/sleep infinity"));
+    }
+
+    /// The shim answers for a gamescope slower than the session's 3 s ready wait.
+    #[test]
+    fn headless_shim_relays_a_late_ready_line() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("pf-shim-{}", std::process::id()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = |path: &std::path::Path, body: &str| {
+            std::fs::write(path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let fake = dir.join("fake-gamescope");
+        script(
+            &fake,
+            "#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$PF_T/argv\"\n\
+             while [ $# -gt 0 ]; do [ \"$1\" = -R ] && r=\"$2\"; shift; done\n\
+             sleep 1; echo ':7 gamescope-7' > \"$r\"\n",
+        );
+        script(
+            &bin.join("systemd-notify"),
+            "#!/bin/sh\necho \"$1\" > \"$PF_T/notified\"\n",
+        );
+        let shim = dir.join("gamescope");
+        script(&shim, &headless_shim_body(fake.to_str().unwrap()));
+        let session_socket = dir.join("startup.socket");
+        let status = Command::new("mkfifo")
+            .arg(&session_socket)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let status = Command::new(&shim)
+            .args(["--generate-drm-mode", "fixed", "-e", "-R"])
+            .arg(&session_socket)
+            .args(["-T", "/dev/null", "-O", "*,eDP-1"])
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("XDG_RUNTIME_DIR", &dir)
+            .env("PF_T", &dir)
+            .env("PF_W", "1280")
+            .env("PF_H", "720")
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let argv = std::fs::read_to_string(dir.join("argv")).unwrap();
+        let argv: Vec<&str> = argv.lines().collect();
+        assert_eq!(&argv[..4], ["--backend", "headless", "-W", "1280"]);
+        assert!(
+            !argv.contains(&"-O"),
+            "panel args must not reach gamescope: {argv:?}"
+        );
+        let ready = argv[argv.iter().position(|a| *a == "-R").unwrap() + 1];
+        assert_ne!(
+            ready,
+            session_socket.to_str().unwrap(),
+            "the shim answers on its own pipe"
+        );
+        let env = std::fs::read_to_string(dir.join("gamescope-environment")).unwrap();
+        assert!(env.lines().any(|l| l == "DISPLAY=:7"), "{env}");
+        assert!(env
+            .lines()
+            .any(|l| l == "GAMESCOPE_WAYLAND_DISPLAY=gamescope-7"));
+        let notified = std::fs::read_to_string(dir.join("notified")).unwrap();
+        assert_eq!(notified.trim(), "--ready");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

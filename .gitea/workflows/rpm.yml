@@ -47,6 +47,8 @@ on:
       - 'crates/pf-update/**'
       - 'crates/pf-update-check/**'
       - 'crates/pf-vaapi/**'
+      - 'crates/pf-v4l2dec/**'
+      - 'crates/pf-v4l2/**'
       - 'crates/pf-vdisplay/**'
       - 'crates/pf-vkdecode/**'
       - 'crates/pf-win-display/**'

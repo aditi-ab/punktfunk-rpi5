@@ -13,17 +13,21 @@
 //! embedder pushes one pad report as one event per axis, and a datagram per axis was six
 //! per report on a stick being moved. The drain never waits, so nothing is delayed for it.
 //!
-//! A controller-mouse pad ([`super::super::pad_mouse`]) bypasses the fold: its host snapshot
+//! A full controller-mouse pad ([`super::super::pad_mouse`]) bypasses the fold: its host snapshot
 //! stays neutral and alive on the refresh, and its events become pointer, scroll and key events.
+//! A touchpad-mode pad folds as usual except its touchpad click; its touchpads, like a full
+//! pad's, arrive as contacts and move the pointer.
 //!
 //! Every datagram passes [`send_granted`]: what the live grants refuse never goes out. The host
 //! drops the same classes; the gate runs after the controller-mouse fold, so those pads need
 //! only the pointer grant.
 
 use super::super::pad_mouse::{PadMouse, TICK};
+use super::super::pad_touch::Contact;
 use super::*;
+use crate::input::gamepad::BTN_TOUCHPAD;
 use crate::input::scroll::ScrollOutput;
-use crate::input::{GamepadSnapshot, InputKind, MAX_PADS};
+use crate::input::{GamepadSnapshot, InputKind, PadMouseMode, MAX_PADS};
 
 /// What the input task reads beside its queue.
 pub(super) struct MouseArgs {
@@ -90,8 +94,9 @@ fn send_all(
     }
 }
 
-/// Match the translator to the embedder's mask under the live grants. An entering pad's host
-/// snapshot goes neutral; a leaving pad releases what it held. No pointer grant clears the mask.
+/// Match the translator to the embedder's masks under the live grants. A pad changing mode
+/// releases what it held first. A full-mouse pad's host snapshot goes neutral; a touchpad-mode
+/// pad's loses only its touchpad click. No pointer grant clears every mode.
 fn sync_mouse(
     conn: &quinn::Connection,
     mouse: &mut PadMouse,
@@ -107,29 +112,50 @@ fn sync_mouse(
     if grants & crate::quic::GRANT_POINTER == 0 {
         args.client.pad_mouse.clear_all();
     }
-    let want = args.client.pad_mouse.active(grants);
-    let on = mouse.on_mask();
+    let full = args.client.pad_mouse.active(grants);
+    let touchpad = args.client.pad_mouse.touchpad_active(grants);
     for idx in 0..MAX_PADS {
         let bit = 1u16 << idx;
-        if want & bit != 0 && on & bit == 0 {
-            let pad = idx as u8;
-            mouse.enter(
-                idx,
-                pads[idx].unwrap_or(GamepadSnapshot {
-                    pad,
-                    ..Default::default()
-                }),
-            );
-            if let Some(snap) = pads[idx].as_mut() {
-                *snap = GamepadSnapshot {
+        let want = if full & bit != 0 {
+            PadMouseMode::Full
+        } else if touchpad & bit != 0 {
+            PadMouseMode::Touchpad
+        } else {
+            PadMouseMode::Off
+        };
+        let have = mouse.mode(idx);
+        if want == have {
+            continue;
+        }
+        if have != PadMouseMode::Off {
+            send_all(conn, out, args, mouse.leave(idx));
+        }
+        if want == PadMouseMode::Off {
+            continue;
+        }
+        let pad = idx as u8;
+        mouse.enter(
+            idx,
+            want,
+            pads[idx].unwrap_or(GamepadSnapshot {
+                pad,
+                ..Default::default()
+            }),
+        );
+        if let Some(snap) = pads[idx].as_mut() {
+            *snap = if want == PadMouseMode::Full {
+                GamepadSnapshot {
                     pad,
                     seq: snap.seq,
                     ..Default::default()
-                };
-                dirty[idx] = true;
-            }
-        } else if want & bit == 0 && on & bit != 0 {
-            send_all(conn, out, args, mouse.leave(idx));
+                }
+            } else {
+                GamepadSnapshot {
+                    buttons: snap.buttons & !BTN_TOUCHPAD,
+                    ..*snap
+                }
+            };
+            dirty[idx] = true;
         }
     }
 }
@@ -157,6 +183,7 @@ fn flush_dirty(
 pub(super) async fn run(
     conn: quinn::Connection,
     mut input_rx: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
+    mut pad_touch_rx: tokio::sync::mpsc::UnboundedReceiver<Contact>,
     gamepad_snapshots: bool,
     // HOST_CAP_PAD_AUDIO: only then do arrivals carry flags 8/9. An older host
     // reads the whole flags word as the pad index and would drop the kind.
@@ -216,6 +243,15 @@ pub(super) async fn run(
                 let mut pending = Some(first);
                 while let Some(ev) = pending.take().or_else(|| input_rx.try_recv().ok()) {
                     let idx = ev.flags as usize;
+                    if ev.kind == InputKind::GamepadButton
+                        && ev.code == BTN_TOUCHPAD
+                        && mouse.mode(idx) != PadMouseMode::Off
+                    {
+                        flush_dirty(&conn, &mouse_args.client.access_grants, &mut pads, &mut seq, &mut dirty);
+                        let grants = mouse_args.client.access_grants.load(Ordering::Relaxed);
+                        send_all(&conn, &mut scroll_out, &mouse_args, mouse.touchpad_click(idx, ev.x != 0, grants));
+                        continue;
+                    }
                     if matches!(ev.kind, InputKind::GamepadButton | InputKind::GamepadAxis)
                         && mouse.is_on(idx)
                     {
@@ -224,7 +260,7 @@ pub(super) async fn run(
                         send_all(&conn, &mut scroll_out, &mouse_args, mouse.fold(idx, &ev, grants));
                         continue;
                     }
-                    if ev.kind == InputKind::GamepadRemove && mouse.is_on(idx) {
+                    if ev.kind == InputKind::GamepadRemove && mouse.mode(idx) != PadMouseMode::Off {
                         send_all(&conn, &mut scroll_out, &mouse_args, mouse.leave(idx));
                         mouse_args.client.pad_mouse.clear(idx);
                     }
@@ -297,6 +333,11 @@ pub(super) async fn run(
                 if !mouse.moving() {
                     last_mouse_tick = None;
                 }
+            }
+            Some(contact) = pad_touch_rx.recv() => {
+                let height = mouse_args.client.mode.lock().map(|m| m.height).unwrap_or(0);
+                let grants = mouse_args.client.access_grants.load(Ordering::Relaxed);
+                send_all(&conn, &mut scroll_out, &mouse_args, mouse.contact(contact, height, grants));
             }
             _ = mouse_tick.tick(), if mouse.moving() => {
                 let now = std::time::Instant::now();
@@ -419,7 +460,7 @@ mod tests {
             edges: Some(ctrl_tx),
             ..mouse_args(&client)
         };
-        let task = tokio::spawn(run(client_conn, rx, true, false, args));
+        let task = tokio::spawn(run(client_conn, rx, no_touch(), true, false, args));
 
         tx.send(key_down(0x41)).unwrap();
         tx.send(key_up(0x41)).unwrap();
@@ -452,6 +493,24 @@ mod tests {
         let fallback = next_event(&host_conn, &[]).await;
         assert_eq!((fallback.kind, fallback.code), (InputKind::KeyDown, 0x42));
         task.abort();
+    }
+
+    /// A touch queue nobody feeds.
+    fn no_touch() -> tokio::sync::mpsc::UnboundedReceiver<Contact> {
+        tokio::sync::mpsc::unbounded_channel().1
+    }
+
+    fn lead(pad: u8, x: f64) -> Contact {
+        Contact {
+            pad,
+            surface: 0,
+            finger: 0,
+            touch: true,
+            click: None,
+            x,
+            y: 0.0,
+            raw: false,
+        }
     }
 
     fn key_down(vk: u32) -> InputEvent {
@@ -493,13 +552,22 @@ mod tests {
         }
     }
 
-    /// Entering sends the pad neutral; its presses become keys while pad 1 still forwards.
+    /// Entering sends the pad neutral; its presses become keys and its touchpad moves the pointer
+    /// while pad 1 still forwards.
     #[tokio::test]
     async fn a_mouse_pad_goes_neutral_and_its_buttons_become_keys() {
         let (_server, client_conn, host_conn) = loopback().await;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (touch_tx, touch_rx) = tokio::sync::mpsc::unbounded_channel();
         let client = client(crate::quic::GRANT_ALL);
-        let task = tokio::spawn(run(client_conn, rx, true, false, mouse_args(&client)));
+        let task = tokio::spawn(run(
+            client_conn,
+            rx,
+            touch_rx,
+            true,
+            false,
+            mouse_args(&client),
+        ));
 
         tx.send(button(gamepad::BTN_A, 0)).unwrap();
         let held = next_event(&host_conn, &[]).await;
@@ -523,6 +591,13 @@ mod tests {
         let esc = next_event(&host_conn, &[0]).await;
         assert_eq!((esc.kind, esc.code), (InputKind::KeyDown, 0x1B));
 
+        for x in [0.0, 1.0 / 3.0] {
+            touch_tx.send(lead(0, x)).unwrap();
+        }
+        let moved = next_event(&host_conn, &[0]).await;
+        assert_eq!(moved.kind, InputKind::MouseMove);
+        assert!((539..=540).contains(&moved.x), "{}", moved.x);
+
         tx.send(button(gamepad::BTN_A, 1)).unwrap();
         let other = next_event(&host_conn, &[0]).await;
         let other = GamepadSnapshot::from_event(&other).expect("pad 1 forwards");
@@ -543,13 +618,56 @@ mod tests {
         task.abort();
     }
 
+    /// A touchpad-mode pad keeps playing: its buttons reach the host snapshot, its touchpad
+    /// click and touch become the mouse.
+    #[tokio::test]
+    async fn a_touchpad_mode_pad_plays_while_its_touchpad_clicks() {
+        let (_server, client_conn, host_conn) = loopback().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (touch_tx, touch_rx) = tokio::sync::mpsc::unbounded_channel();
+        let client = client(crate::quic::GRANT_ALL);
+        client.pad_mouse.set_mode(1, PadMouseMode::Touchpad);
+        let task = tokio::spawn(run(
+            client_conn,
+            rx,
+            touch_rx,
+            true,
+            false,
+            mouse_args(&client),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        tx.send(button(gamepad::BTN_A, 0)).unwrap();
+        let snap = GamepadSnapshot::from_event(&next_event(&host_conn, &[]).await).unwrap();
+        assert_eq!(snap.buttons, gamepad::BTN_A, "the game still gets A");
+
+        tx.send(button(BTN_TOUCHPAD, 0)).unwrap();
+        let click = next_event(&host_conn, &[0]).await;
+        assert_eq!((click.kind, click.code), (InputKind::MouseButtonDown, 1));
+        for x in [0.0, 0.5] {
+            touch_tx.send(lead(0, x)).unwrap();
+        }
+        assert_eq!(
+            next_event(&host_conn, &[0]).await.kind,
+            InputKind::MouseMove
+        );
+        task.abort();
+    }
+
     /// A controller-only session sends its pad and never the key queued ahead of it.
     #[tokio::test]
     async fn a_key_without_the_keyboard_grant_stays_off_the_wire() {
         let (_server, client_conn, host_conn) = loopback().await;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let client = client(crate::quic::GRANT_GAMEPAD);
-        let task = tokio::spawn(run(client_conn, rx, true, false, mouse_args(&client)));
+        let task = tokio::spawn(run(
+            client_conn,
+            rx,
+            no_touch(),
+            true,
+            false,
+            mouse_args(&client),
+        ));
 
         tx.send(key_down(0x41)).unwrap();
         tx.send(button(gamepad::BTN_A, 0)).unwrap();
@@ -567,7 +685,14 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let client = client(crate::quic::GRANT_POINTER | crate::quic::GRANT_KEYBOARD);
         client.pad_mouse.request(1);
-        let task = tokio::spawn(run(client_conn, rx, true, false, mouse_args(&client)));
+        let task = tokio::spawn(run(
+            client_conn,
+            rx,
+            no_touch(),
+            true,
+            false,
+            mouse_args(&client),
+        ));
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         tx.send(button(gamepad::BTN_B, 0)).unwrap();
@@ -592,7 +717,14 @@ mod tests {
         let (_server, client_conn, host_conn) = loopback().await;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let client = client(crate::quic::GRANT_ALL);
-        let task = tokio::spawn(run(client_conn, rx, true, false, mouse_args(&client)));
+        let task = tokio::spawn(run(
+            client_conn,
+            rx,
+            no_touch(),
+            true,
+            false,
+            mouse_args(&client),
+        ));
         let axes = [
             (gamepad::AXIS_LS_X, 1_000),
             (gamepad::AXIS_LS_Y, -2_000),

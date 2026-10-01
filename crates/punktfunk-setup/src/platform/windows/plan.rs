@@ -686,7 +686,12 @@ fn client_install(facts: &WinFacts, choices: &WinChoices) -> WinPlan {
     );
     plan.push(
         format!("Files → {app}"),
-        vec![WinAction::DeployFiles { dest: app.clone() }],
+        vec![
+            WinAction::DeployFiles { dest: app.clone() },
+            // The firewall service (LOCAL SERVICE) reads the exe to name it in its prompt; a
+            // profile dir denies it that. Lenient: a refused grant costs only the name.
+            run_lenient(&["icacls", &app, "/grant", "*S-1-5-19:(OI)(CI)RX", "/Q"]),
+        ],
     );
 
     let proto = r"HKCU\Software\Classes\punktfunk";

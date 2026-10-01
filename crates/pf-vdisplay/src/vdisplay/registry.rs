@@ -208,6 +208,19 @@ pub fn release(slot: Option<u64>) -> usize {
     released
 }
 
+/// Host stopping: run every display's topology restore and drop every output, active ones
+/// included. Windows keeps its own manager. Returns the count torn down.
+pub fn teardown_all() -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        linux::teardown_all()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
 /// Tear down a reused-but-dead pool entry by generation. The pipeline builder
 /// calls this when the first frame fails on a REUSED [`acquire`] so the next
 /// acquire creates fresh. No-op off Linux, if already gone (the later
@@ -2273,6 +2286,17 @@ mod linux {
 
     pub(super) fn force_release(slot: Option<u64>) -> usize {
         release_kept(slot, "released (mgmt /display/release)")
+    }
+
+    /// Host stopping: every entry, active ones included. The process exits without running a
+    /// destructor, so a restore or output left here stays on the box.
+    pub(super) fn teardown_all() -> usize {
+        let Some(r) = REG.get() else { return 0 };
+        let drained = {
+            let mut es = r.entries.lock().unwrap();
+            drain_where(&mut es, |_| true)
+        };
+        drained.finish("torn down (host stopping)")
     }
 
     /// Force-release a display superseded by a mid-stream mode switch. Same as

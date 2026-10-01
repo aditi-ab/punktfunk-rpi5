@@ -30,8 +30,9 @@
 set -uo pipefail
 
 log() { echo "ci-docker-reclaim: $*"; }
+DISK=${DISK:-/}  # the filesystem holding Docker's data
 
-before_avail=$(df --output=avail -BM / | tail -1 | tr -dc '0-9')
+before_avail=$(df --output=avail -BM "$DISK" | tail -1 | tr -dc '0-9')
 
 # 1. Leaked per-job volumes — dangling AND named by act_runner. In-use volumes are never listed as
 #    dangling, so a running job's volumes cannot be hit.
@@ -52,6 +53,6 @@ log "removed ${net_out:-0} stale job networks"
 cache_freed=$(docker builder prune -f --filter until=48h 2>&1 | awk '/^Total:/ {print $2}')
 log "build cache freed: ${cache_freed:-0B}"
 
-after_avail=$(df --output=avail -BM / | tail -1 | tr -dc '0-9')
+after_avail=$(df --output=avail -BM "$DISK" | tail -1 | tr -dc '0-9')
 log "avail ${before_avail}M -> ${after_avail}M (reclaimed $((after_avail - before_avail))M)"
-df -h / | tail -1 | sed 's/^/ci-docker-reclaim: /'
+df -h "$DISK" | tail -1 | sed 's/^/ci-docker-reclaim: /'

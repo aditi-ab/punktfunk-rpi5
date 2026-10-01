@@ -164,14 +164,21 @@ export const ApproveDialog: FC<{
 
 					{/* Approving pairs the device outright — no PIN — so it re-confirms the console
 					    password, which the BFF verifies and strips (util/confirm.ts). Both approve
-					    paths below carry it, the guest fast path included. */}
-					<PasswordConfirmField
-						id="approve-password"
-						value={password}
-						onChange={setPassword}
-						failure={failure}
-						help={m.pairing_password_help()}
-					/>
+					    paths below carry it. Its own form, so 1Password fills here, not the page. */}
+					<form
+						onSubmit={(e) => {
+							e.preventDefault();
+							if (!isPending && password.length > 0) submit();
+						}}
+					>
+						<PasswordConfirmField
+							id="approve-password"
+							value={password}
+							onChange={setPassword}
+							failure={failure}
+							help={m.pairing_password_help()}
+						/>
+					</form>
 
 					{/* The guest fast path — visually its own thing, deliberately not one of the footer
 					    buttons: one click grants Controller only for 4 hours, no dialog fiddling. */}

@@ -29,7 +29,9 @@ import { ApproveDialog } from "./ApproveDialog";
 export const PendingDevicesSection: FC<{
 	/** Hand a WAN knock to the arm card, which is the only way to admit one. */
 	onArmFor?: (device: PendingDevice) => void;
-}> = ({ onArmFor }) => {
+	/** The approve dialog opened or closed. The page locks its own password fields meanwhile. */
+	onApproveOpenChange?: (open: boolean) => void;
+}> = ({ onArmFor, onApproveOpenChange }) => {
 	const qc = useQueryClient();
 	// A knock arrives as a `pairing.pending` event (api/events.ts), so the timer is the fallback —
 	// but it stays reasonably brisk: this list is the one the operator is actively waiting on, and
@@ -45,9 +47,11 @@ export const PendingDevicesSection: FC<{
 		qc.invalidateQueries({ queryKey: getListPendingDevicesQueryKey() });
 		qc.invalidateQueries({ queryKey: getListNativeClientsQueryKey() });
 	};
+	// Every open and close goes through here. The lock lands in the same render as the dialog.
 	const openApprove = (device: PendingDevice | null) => {
 		refusal.reset();
 		setApproving(device);
+		onApproveOpenChange?.(device !== null);
 	};
 	const onApprove = (id: number, body: ApprovePending, password: string) => {
 		refusal.reset();
@@ -55,7 +59,7 @@ export const PendingDevicesSection: FC<{
 			{ id, data: body, password },
 			{
 				onSuccess: () => {
-					setApproving(null);
+					openApprove(null);
 					refresh();
 				},
 				onError: refusal.classify,

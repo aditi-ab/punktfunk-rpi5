@@ -9,6 +9,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import android.view.Display
 import android.view.View
 import android.view.WindowManager
 import androidx.core.view.WindowCompat
@@ -20,6 +21,47 @@ internal const val STREAM_UNBUFFERED_SOURCES = android.view.InputDevice.SOURCE_C
     android.view.InputDevice.SOURCE_CLASS_JOYSTICK or
     android.view.InputDevice.SOURCE_CLASS_TRACKBALL or
     android.view.InputDevice.SOURCE_CLASS_POSITION
+
+/** The display's modes at its current resolution, which is the one the user picked: no pin a
+ *  stream sets ever leaves it. */
+internal fun Display.sameResolutionModes(): List<Display.Mode> {
+    val current = mode
+    return supportedModes.filter {
+        it.physicalWidth == current.physicalWidth && it.physicalHeight == current.physicalHeight
+    }
+}
+
+/**
+ * The mode a [hz] stream pins this display to: the exact rate, else the smallest integer multiple
+ * (120 for a 60 stream: judder-free 2:1 pulldown), else the highest, so nothing is halved.
+ */
+internal fun Display.streamModeFor(hz: Int): Display.Mode? {
+    if (hz <= 0) return null
+    fun multiple(rate: Float): Int {
+        val k = (rate / hz).toInt()
+        return if (k >= 2 && kotlin.math.abs(rate - hz * k) < 1f) k else 0
+    }
+    return sameResolutionModes().minWithOrNull(
+        compareBy(
+            {
+                when {
+                    kotlin.math.abs(it.refreshRate - hz) < 1f -> 0 // exact
+                    multiple(it.refreshRate) > 0 -> 1 // integer multiple — prefer smallest
+                    else -> 2 // no relation — prefer highest
+                }
+            },
+            { if (multiple(it.refreshRate) > 0) it.refreshRate else -it.refreshRate },
+        ),
+    )
+}
+
+/**
+ * The panel refresh a [hz] stream runs against on this display, from the mode TABLE:
+ * `refreshRate` reports a per-uid frame-rate override (games get 60 on Android 15+), not the
+ * panel. `0` when unresolvable.
+ */
+internal fun Display.streamPanelFps(hz: Int): Int =
+    streamModeFor(hz)?.refreshRate?.let { kotlin.math.round(it).toInt() } ?: 0
 
 /**
  * Everything a stream does to the activity's WINDOW, and how to put it back: the wake and Wi-Fi

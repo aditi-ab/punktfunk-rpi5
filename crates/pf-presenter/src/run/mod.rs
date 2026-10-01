@@ -110,6 +110,71 @@ pub struct SessionOpts {
     /// How a frame of another aspect fills the window. The blit and every absolute input
     /// map through the same [`video_fit::place`].
     pub video_fit: VideoFit,
+    /// Browse mode: return, as Quit does, once no controller has been attached for
+    /// [`NO_PAD_GRACE`] while no stream is up. Set by a desktop shell that opened the
+    /// console because a controller connected.
+    pub until_no_pads: bool,
+}
+
+/// How long [`SessionOpts::until_no_pads`] waits: a Bluetooth reconnect or Steam Input
+/// re-enumerating a pad is not a player putting the controller down.
+pub const NO_PAD_GRACE: Duration = Duration::from_secs(3);
+
+/// [`SessionOpts::until_no_pads`]' clock: armed once a controller was seen, running while
+/// none is attached.
+#[derive(Default)]
+struct PadAbsence {
+    seen: bool,
+    since: Option<Instant>,
+}
+
+impl PadAbsence {
+    /// `pads` is `None` while a stream is up, which holds the clock. `true` once no
+    /// controller has been attached for [`NO_PAD_GRACE`].
+    fn tick(&mut self, pads: Option<usize>, now: Instant) -> bool {
+        match pads {
+            Some(0) if self.seen => {
+                now.duration_since(*self.since.get_or_insert(now)) >= NO_PAD_GRACE
+            }
+            Some(0) => false,
+            Some(_) => {
+                self.seen = true;
+                self.since = None;
+                false
+            }
+            None => {
+                self.since = None;
+                false
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod pad_absence_tests {
+    use super::{PadAbsence, NO_PAD_GRACE};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn leaves_after_the_grace_never_mid_stream() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut clock = PadAbsence::default();
+        // No controller yet: the console was opened some other way, or SDL is still counting.
+        assert!(!clock.tick(Some(0), at(0)));
+        assert!(!clock.tick(Some(0), at(10_000)));
+        assert!(!clock.tick(Some(1), at(10_000)));
+        assert!(!clock.tick(Some(0), at(11_000)));
+        // A pad back inside the grace resets it.
+        assert!(!clock.tick(Some(1), at(12_000)));
+        assert!(!clock.tick(Some(0), at(13_000)));
+        // A stream holds the clock; the grace starts again once it ends.
+        assert!(!clock.tick(None, at(20_000)));
+        assert!(!clock.tick(Some(0), at(21_000)));
+        let limit = 21_000 + NO_PAD_GRACE.as_millis() as u64;
+        assert!(!clock.tick(Some(0), at(limit - 1)));
+        assert!(clock.tick(Some(0), at(limit)));
+    }
 }
 
 pub enum Outcome {
@@ -258,6 +323,7 @@ struct Shell {
     opts: SessionOpts,
     /// Browse mode: the console idles between streams.
     browse: bool,
+    pad_absence: PadAbsence,
 }
 
 /// Decoded frame plus when the source cadence says it is due on glass. Due time is
@@ -265,7 +331,7 @@ struct Shell {
 struct Paced {
     frame: DecodedFrame,
     /// `session::now_ns` domain (`DecodedFrame::decoded_ns` is the same clock). `0`
-    /// under the latency intent, which never asks.
+    /// under the latency intent on a fixed panel, which never asks.
     due_ns: i64,
 }
 
@@ -312,6 +378,9 @@ struct StreamState {
     /// holds decoder-pool frames up to `buffer` deep on top of the depth-2 wake
     /// channels — headroom for 1..=3; deeper must revisit pool sizing.
     store: FrameStore<Paced>,
+    /// Frames the wake forwarder displaced (three arrivals between two intakes: the loop
+    /// stalled two frame intervals). Drained into `skipped` once a second.
+    forwarder_drops: Arc<std::sync::atomic::AtomicU32>,
     /// Panel latch grid (present-wait glass stamps; submit-anchored fallback). Smoothness
     /// slot clock, and the values published to the host-facing `latch_grid`.
     clock: LatchClock,
@@ -340,6 +409,8 @@ struct StreamState {
     /// channel first: a newer frame replaces the held one instead of queuing behind it.
     busy_on: crate::vk::BusyOn,
     last_displayed_ns: u64,
+    /// Source stamp of the frame last seen on glass, for the spacing-error ledger.
+    last_shown_pts_ns: u64,
     /// Smoothing: the latch slot the last vended frame was aimed at. One present per
     /// slot; a second frame due before the same slot waits for the next.
     last_slot_ns: u64,
@@ -416,6 +487,21 @@ fn capture_mut(stream: &mut Option<StreamState>) -> Option<&mut Capture> {
     stream.as_mut().and_then(|s| s.capture.as_mut())
 }
 
+/// One event, waiting up to `timeout` for it.
+///
+/// SDL's Windows wait floors what is left of a timeout to whole milliseconds, so a wait
+/// under 2 ms returns at once and a loop holding a frame for its due time spins a core.
+/// Those waits sleep here in half-millisecond slices: that is how long an arriving
+/// frame or a key can wait to be seen while one is held.
+fn wait_event(pump: &mut sdl3::EventPump, timeout: Duration) -> Option<Event> {
+    const SLICE: Duration = Duration::from_micros(500);
+    if cfg!(windows) && !timeout.is_zero() && timeout < Duration::from_millis(2) {
+        std::thread::sleep(timeout.min(SLICE));
+        return pump.poll_event();
+    }
+    pump.wait_event_timeout(timeout)
+}
+
 fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Outcome> {
     let mut sh = Shell::open(opts, matches!(mode, ModeCtl::Browse(_)))?;
     let mut stream: Option<StreamState> = match &mut mode {
@@ -440,7 +526,7 @@ fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Outcome> {
         let timeout = stream
             .as_ref()
             .map_or(Duration::from_millis(15), |st| st.wake_timeout());
-        let first = sh.event_pump.wait_event_timeout(timeout);
+        let first = wait_event(&mut sh.event_pump, timeout);
         let mut queued: Vec<Event> = Vec::new();
         if let Some(e) = first {
             queued.push(e);

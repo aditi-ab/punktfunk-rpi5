@@ -322,6 +322,15 @@ jobs:
           "HOST_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Output "host version $v"
 
+      - name: Keep the pack's driver target between runs
+        shell: pwsh
+        # The pack builds the UMDF drivers in-tree (wdk-build finds its Cargo.lock from OUT_DIR)
+        # from drivers-cargo.ps1's fixed X: root, so a kept target's paths stay valid. Before the
+        # carry, whose listing of packaging/windows/drivers must include `target`.
+        run: |
+          New-Item -ItemType Directory -Force -Path '${{ matrix.td }}\pack-drivers' | Out-Null
+          New-Item -ItemType Junction -Path packaging/windows/drivers/target -Target '${{ matrix.td }}\pack-drivers' | Out-Null
+
       - name: Carry source mtimes (unchanged crates stay fresh)
         shell: pwsh
         continue-on-error: true
@@ -565,14 +574,6 @@ jobs:
           }
           "SCRIPTING_BUNDLE=$scr\runner-cli.js" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      # NOT cached, and it must stay that way: the UMDF drivers build IN-TREE inside the pack
-      # step (a relocated CARGO_TARGET_DIR breaks wdk-build's manifest walk), and act rotates
-      # the job workspace path (~/.cache/act/<hash>/hostexecutor) between runs. A cargo target
-      # dir restored under a DIFFERENT absolute path brings state that points at the old one:
-      # measured 2026-07-30, `pf-umdf-util` died with 14 × "unable to create file lock (os
-      # error 3)" and took the whole job with it. ~1 min of rebuild is the correct price; the
-      # same rotation is why the other Windows jobs use a fixed C:\t instead of a cached
-      # workspace-relative target.
       # Every payload this job is SUPPOSED to bundle, asserted before packing. The packer treats each
       # one as optional — correct for a local debug pack, and the reason 0.22.1/0.22.2 shipped with no
       # web console: an unset WEB_OUTPUT_DIR omitted it behind a single Write-Host. CI knows it bundles

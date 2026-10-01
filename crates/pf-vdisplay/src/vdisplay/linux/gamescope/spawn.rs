@@ -257,6 +257,7 @@ pub(super) fn spawn(
         mark_seat_steam_log(home);
     }
     let mut nested_env = wsi.env(hdr);
+    nested_env.push(("WAYLAND_DISPLAY", NESTED_WAYLAND_DISPLAY.to_string()));
     if let Some(home) = nested_seat_home {
         nested_env.extend(seat::env(home));
     }
@@ -408,10 +409,21 @@ pub(super) struct GamescopeProc {
     /// The relay file THIS spawn's wrapper wrote — the global path, or the session's per-instance
     /// one when isolated — so teardown clears its own file and never a concurrent session's.
     pub(super) relay: std::path::PathBuf,
+    /// Home of the Steam this spawn nests, when it runs one: the seat's, or the box's own.
+    pub(super) steam_home: Option<std::path::PathBuf>,
 }
 
 impl Drop for GamescopeProc {
     fn drop(&mut self) {
+        // A Steam that loses its compositor dies mid-write; ask it to quit first.
+        if let Some(home) = &self.steam_home {
+            let nested = home_steam_pid(home).filter(|&pid| descends_from(pid, self.child.id()));
+            if let Some(pid) = nested {
+                let box_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                let seat = (box_home.as_ref() != Some(home)).then_some(home.as_path());
+                shut_steam_down(pid, STEAM_STOP_WAIT, seat);
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
         // Clear the relayed EIS socket name so an injector can't reconnect to this now-dead

@@ -186,8 +186,18 @@ impl Console {
     /// Draw every tab once into `canvas` before the first [`Self::frame`], so their GPU
     /// programs compile behind the host's splash rather than on first visit. A TV's GL driver
     /// takes 50–170 ms a program; the next frame overwrites what this draws.
-    pub fn warm_up(&mut self, canvas: &Canvas, viewport: &Viewport) {
-        self.shell.warm_up(canvas, viewport, &self.fonts);
+    ///
+    /// `frame_done` runs after each of the tour's ~50 frames. A GPU host flushes and waits
+    /// there: the tray blurs copy the framebuffer every frame, Mali never reuses those
+    /// textures, and one flush for the whole tour allocates them all at once.
+    pub fn warm_up(
+        &mut self,
+        canvas: &Canvas,
+        viewport: &Viewport,
+        mut frame_done: impl FnMut(&Canvas),
+    ) {
+        self.shell
+            .warm_up(canvas, viewport, &self.fonts, &mut frame_done);
     }
 
     pub fn menu(&mut self, event: MenuEvent, source: InputSource) -> Option<MenuPulse> {

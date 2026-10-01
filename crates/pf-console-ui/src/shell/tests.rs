@@ -385,7 +385,13 @@ fn a_warm_up_tours_the_tabs_and_changes_nothing() {
     let fonts = crate::theme::build_fonts().unwrap();
     let mut surface = skia_safe::surfaces::raster_n32_premul((480, 300)).unwrap();
     let viewport = crate::console::Viewport::plain(480, 300);
-    s.warm_up(surface.canvas(), &viewport, &fonts);
+    let mut frames = 0;
+    s.warm_up(surface.canvas(), &viewport, &fonts, &mut |_| frames += 1);
+    assert_eq!(
+        frames,
+        3 + 4 * 12,
+        "the caller gets every tour frame to flush"
+    );
     assert_eq!(s.tab, Tab::Hosts);
     assert!(matches!(s.stack.as_slice(), [Screen::Home(_)]));
     assert!(s.parked.iter().all(Option::is_none), "nothing parked");

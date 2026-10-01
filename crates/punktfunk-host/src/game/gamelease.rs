@@ -1224,6 +1224,7 @@ fn finish(shared: &Arc<LeaseShared>, on_exit: &OnExit, why: &str, run: Option<Ru
 
 /// Mark the game exited and emit `game.exited`, once per lease: the watcher and the session's
 /// own exit signals (gamescope's atoms, a nested capture going away) can both see one exit.
+/// The emulator bindings `prepare` wrote for this session's pads go back too.
 pub fn report_exit(shared: &LeaseShared) {
     if shared
         .state
@@ -1232,6 +1233,7 @@ pub fn report_exit(shared: &LeaseShared) {
     {
         return;
     }
+    std::thread::spawn(crate::emulators::revert_players);
     crate::events::emit(crate::events::EventKind::GameExited {
         game: game_event_ref(shared),
         reason: if shared.is_terminating() {
@@ -1550,6 +1552,7 @@ fn windows_term_ladder(shared: &LeaseShared) {
 /// End pids a launch with no lease left adopted: the set it published to
 /// [`crate::launchreg`], and only that set. For
 /// [`crate::session_settings::GameOnNewLaunch::End`] and [`end_detached`].
+/// No lease reports this exit, so the emulator bindings go back from here.
 ///
 /// Blocking, bounded by [`TERM_GRACE`].
 pub fn end_previous_launch(title: &str, procs: &[crate::procscan::ProcRef], why: &str) -> usize {
@@ -1572,6 +1575,7 @@ pub fn end_previous_launch(title: &str, procs: &[crate::procscan::ProcRef], why:
         std::thread::sleep(POLL);
         if live().is_empty() {
             tracing::info!(title, "the game closed when asked");
+            crate::emulators::revert_players();
             return first.len();
         }
     }
@@ -1583,6 +1587,7 @@ pub fn end_previous_launch(title: &str, procs: &[crate::procscan::ProcRef], why:
         "the game did not close when asked — killing it"
     );
     force_close(&remaining);
+    crate::emulators::revert_players();
     first.len()
 }
 

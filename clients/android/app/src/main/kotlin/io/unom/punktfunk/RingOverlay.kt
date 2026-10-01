@@ -46,6 +46,7 @@ import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.SpaceDashboard
 import androidx.compose.material.icons.filled.SportsEsports
+import androidx.compose.material.icons.filled.SwapVert
 import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material.icons.filled.TouchApp
 import androidx.compose.material3.AlertDialog
@@ -216,11 +217,12 @@ class RingActions(
     /** One synthetic system-button tap on the host's pad (a `Gamepad.BTN_*` bit). */
     val tapPadButton: (Int) -> Unit,
     /** Controller mouse: the pointer grant it needs, the wire pads it acts on (a bit per pad,
-     *  `0` = none), whether they are all on, and the toggle. */
+     *  `0` = none), the mode they share (`NativeBridge.nativePadMouseMode`), and the step to the
+     *  next one. */
     val pointerGranted: () -> Boolean,
     val padMouseTarget: () -> Int,
-    val padMouseOn: () -> Boolean,
-    val togglePadMouse: () -> Unit,
+    val padMouseMode: () -> Int,
+    val cyclePadMouse: () -> Unit,
     /** This device's speakers: the live mute mask (`StreamUi.AUDIO_MUTE_*`), the sentence for it,
      *  and the local-only toggle. */
     val audioMute: () -> Int,
@@ -236,6 +238,9 @@ class RingActions(
     val streamedGame: () -> RunningGame? = { null },
     /** End that game on the host, then the stream. */
     val endGame: () -> Unit = {},
+    /** A second screen is up, and the picture and the companion panel can trade screens. */
+    val screensSwappable: () -> Boolean = { false },
+    val swapScreens: () -> Unit = {},
 )
 
 /**
@@ -258,6 +263,14 @@ internal data class SlotSpec(
     val toggle: Boolean = false,
     val state: String = "",
 )
+
+/** The controller-mouse slot's state for a `nativePadMouseMode` value; the Rust and Apple rings
+ *  say the same. */
+internal fun padMouseState(mode: Int): String = when (mode) {
+    1 -> "Touchpad"
+    2 -> "Full"
+    else -> "Off"
+}
 
 internal fun spec(slot: SlotId, cfg: OverlayConfig, a: RingActions): SlotSpec = when (slot) {
     SlotId.EndStream -> SlotSpec("end_stream", "End stream", Icons.Filled.Close, armed = true)
@@ -316,13 +329,17 @@ internal fun spec(slot: SlotId, cfg: OverlayConfig, a: RingActions): SlotSpec = 
         "pad_mouse", "Controller mouse", Icons.Filled.Mouse,
         enabled = a.pointerGranted() && a.padMouseTarget() != 0,
         reason = if (a.pointerGranted()) "No controller is connected" else "This host only allows controller input",
-        toggle = true, state = if (a.padMouseOn()) "On" else "Off",
+        toggle = true, state = padMouseState(a.padMouseMode()),
     )
     SlotId.StreamMute -> SlotSpec(
         "stream_mute", "Mute this stream",
         if (a.audioMute() != 0) Icons.AutoMirrored.Filled.VolumeOff else Icons.AutoMirrored.Filled.VolumeUp,
         // The state describes the mute: "Off" while audible, else whose mute it is.
         toggle = true, state = a.audioMuteLabel() ?: "Off",
+    )
+    SlotId.SwapScreens -> SlotSpec(
+        "swap_screens", "Swap screens", Icons.Filled.SwapVert,
+        enabled = a.screensSwappable(), reason = "This device has one screen",
     )
     is SlotId.Host -> {
         val act = a.hostActions().firstOrNull { it.id == slot.actionId }
@@ -581,8 +598,10 @@ internal fun fireSlot(
         // The host's own overlay is taking the screen: close first, like End stream.
         SlotId.Guide -> { state.close(); actions.tapPadButton(Gamepad.BTN_GUIDE) }
         SlotId.Qam -> { state.close(); actions.tapPadButton(Gamepad.BTN_MISC1) }
-        SlotId.PadMouse -> actions.togglePadMouse()
+        SlotId.PadMouse -> actions.cyclePadMouse()
         SlotId.StreamMute -> actions.toggleStreamMute()
+        // The ring lives on the picture, which is about to change screens.
+        SlotId.SwapScreens -> { state.close(); actions.swapScreens() }
         is SlotId.Host -> {
             actions.hostActions().firstOrNull { it.id == slot.actionId }?.let { state.close(); actions.invokeHost(it) }
         }
@@ -879,8 +898,11 @@ private fun sheetRows(
         }
     }
     val pm = spec(SlotId.PadMouse, cfg, actions)
-    rows += SheetRowSpec(null, pm.label, if (pm.enabled) pm.state else pm.reason, pm.enabled) { if (pm.enabled) actions.togglePadMouse() }
+    rows += SheetRowSpec(null, pm.label, if (pm.enabled) pm.state else pm.reason, pm.enabled) { if (pm.enabled) actions.cyclePadMouse() }
     rows += SheetRowSpec("View", "Statistics", actions.stats().label) { actions.cycleStats() }
+    if (actions.screensSwappable()) {
+        rows += SheetRowSpec(null, "Swap screens") { state.close(); actions.swapScreens() }
+    }
     val mic = spec(SlotId.Mic, cfg, actions)
     rows += SheetRowSpec("Audio", mic.label, if (mic.enabled) mic.state else mic.reason, mic.enabled) { if (mic.enabled) actions.toggleMic() }
     actions.hostActions().forEachIndexed { i, act ->

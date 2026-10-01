@@ -12,7 +12,7 @@
 //! "what does ready mean" have exactly one answer.
 
 use crate::app::AppMsg;
-use crate::ui_hosts::ConnectRequest;
+use crate::hosts::ConnectRequest;
 use pf_client_core::orchestrate::{self, ConnectPlan, HostTarget, SessionEvent};
 
 /// Spawn tunables beyond a plain connect.
@@ -52,7 +52,7 @@ fn plan_for(req: &ConnectRequest, fp_hex: &str, tofu: bool, opts: &SpawnOpts) ->
             id: None,
             mgmt_port: None, // this shell resolves the library port itself (`mgmt_port_for`)
         },
-        req.launch.as_ref().map(|(id, _)| id.clone()),
+        req.launch.clone(),
         // A plain card click carries no one-off: the resolver honors the host's own binding
         // (design/client-settings-profiles.md §4.6). Only a "Connect with ▸" pick (or a URL's
         // `preset=`) sets one, and it applies to this session alone.
@@ -74,15 +74,15 @@ fn plan_for(req: &ConnectRequest, fp_hex: &str, tofu: bool, opts: &SpawnOpts) ->
 /// `tofu` persists an advertised fingerprint only after ready proves the host owns it.
 /// The plan supplies all effective settings, including preset fullscreen policy.
 ///
-/// The caller takes `busy`; [`AppMsg::SessionExited`] releases it. `Err` reports a
-/// spawn failure before supervision starts.
+/// The caller takes `busy`; [`AppMsg::SessionExited`] releases it. `Ok` is the child's
+/// handle; `Err` reports a spawn failure before supervision starts.
 pub fn spawn_session(
     sender: relm4::Sender<AppMsg>,
     req: ConnectRequest,
     fp_hex: String,
     tofu: bool,
     opts: SpawnOpts,
-) -> Result<(), String> {
+) -> Result<CancelHandle, String> {
     let plan = plan_for(&req, &fp_hex, tofu, &opts);
     let persist_paired = opts.persist_paired;
     let cancel = opts.cancel.clone();
@@ -113,8 +113,7 @@ pub fn spawn_session(
                 tofu,
             });
         }
-    })?;
-    Ok(())
+    })
 }
 
 #[cfg(test)]

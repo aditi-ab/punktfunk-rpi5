@@ -38,19 +38,17 @@ pub fn launch_into_session(
         c.envs(seat::env(home));
     }
     match discover_session_display_env(seat) {
-        Some((x11, wayland, _xauth)) => {
+        Some((x11, gamescope, _xauth)) => {
             tracing::info!(
                 command = %cmd,
                 x11_display = x11.as_deref().unwrap_or("-"),
-                wayland = wayland.as_deref().unwrap_or("-"),
+                gamescope = gamescope.as_deref().unwrap_or("-"),
                 "gamescope: launching into the live session"
             );
             if let Some(d) = x11 {
                 c.env("DISPLAY", d);
             }
-            if let Some(w) = wayland {
-                c.env("WAYLAND_DISPLAY", w);
-            }
+            c.env("WAYLAND_DISPLAY", NESTED_WAYLAND_DISPLAY);
         }
         None => tracing::warn!(
             command = %cmd,
@@ -70,6 +68,38 @@ const STEAM_SHUTDOWN_WAIT: Duration = Duration::from_secs(20);
 /// `status_within` killpg's the group, so a 5 s bound kills the request before it leaves.
 const STEAM_SHUTDOWN_SEND_BUDGET: Duration = Duration::from_secs(STEAM_SHUTDOWN_WAIT.as_secs() / 2);
 
+/// Clean-exit bound before the host SIGKILLs the unit or compositor a Steam runs in. An idle
+/// Steam is gone in a few seconds; the shutdown restore has 20 s for this and the box's restart.
+pub(super) const STEAM_STOP_WAIT: Duration = Duration::from_secs(8);
+
+/// Ask the Steam at `pid` to quit over its home's pipe, then wait out `wait` from the call.
+/// `true` once it is gone. `seat_home` aims the request at a seat's Steam.
+pub(super) fn shut_steam_down(
+    pid: u32,
+    wait: Duration,
+    seat_home: Option<&std::path::Path>,
+) -> bool {
+    let deadline = Instant::now() + wait;
+    let mut cmd = Command::new("steam");
+    cmd.arg("-shutdown")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(home) = seat_home {
+        cmd.envs(seat::env(home));
+    }
+    // Reaped: dropping Child does not wait, and the loop below polls the TARGET, not this helper.
+    let _ = crate::proc::status_within(&mut cmd, wait.min(STEAM_SHUTDOWN_SEND_BUDGET));
+    loop {
+        if !crate::proc::pid_alive(pid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 /// Desktop Steam holds the single instance; autologin stop cannot see it. Ours (host tree /
 /// SESSION_UNIT) are exempt. Timeout is an actionable error, not a no-frames retry loop.
 pub(super) fn free_desktop_steam() -> Result<()> {
@@ -80,21 +110,9 @@ pub(super) fn free_desktop_steam() -> Result<()> {
         pid,
         "freeing Steam: a desktop-session Steam holds the single instance — sending `steam -shutdown`"
     );
-    // Reaped: dropping Child does not wait, and the loop below polls the TARGET, not this helper.
-    let _ = crate::proc::status_within(
-        Command::new("steam")
-            .arg("-shutdown")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
-        STEAM_SHUTDOWN_SEND_BUDGET,
-    );
-    let deadline = Instant::now() + STEAM_SHUTDOWN_WAIT;
-    while Instant::now() < deadline {
-        if !crate::proc::pid_alive(pid) {
-            tracing::info!(pid, "desktop Steam exited — single instance free");
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(250));
+    if shut_steam_down(pid, STEAM_SHUTDOWN_WAIT, None) {
+        tracing::info!(pid, "desktop Steam exited — single instance free");
+        return Ok(());
     }
     bail!(
         "Steam is already running in the host's desktop session (pid {pid}) and did not exit \
@@ -103,18 +121,39 @@ pub(super) fn free_desktop_steam() -> Result<()> {
     )
 }
 
-/// Desktop Steam via `~/.steam/steam.pid`. `None` if stale, our descendant, or in SESSION_UNIT.
-fn desktop_steam_pid() -> Option<u32> {
-    let home = std::env::var("HOME").ok()?;
-    let pid = std::fs::read_to_string(format!("{home}/.steam/steam.pid"))
+/// The Steam client `home` runs, from its `.steam/steam.pid`. `None` once that pid is not Steam.
+pub(super) fn home_steam_pid(home: &std::path::Path) -> Option<u32> {
+    let pid = std::fs::read_to_string(home.join(".steam/steam.pid"))
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())?;
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
     // Steam's own processes report comm `steam` (the ubuntu12_32 binary) or `steam.sh`; anything
     // else means the pid was recycled since Steam last ran.
-    if !matches!(comm.trim(), "steam" | "steam.sh") || !crate::proc::pid_alive(pid) {
-        return None;
-    }
+    (matches!(comm.trim(), "steam" | "steam.sh") && crate::proc::pid_alive(pid)).then_some(pid)
+}
+
+/// The box home's Steam, when it runs inside `unit` (a Game Mode session or [`SESSION_UNIT`]).
+pub(super) fn steam_pid_in_unit(unit: &str) -> Option<u32> {
+    let home = std::env::var_os("HOME")?;
+    let pid = home_steam_pid(std::path::Path::new(&home))?;
+    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    cgroup_names_unit(&cgroup, unit).then_some(pid)
+}
+
+/// Does a `/proc/<pid>/cgroup` body place the process inside `unit`? A bare name is a service.
+fn cgroup_names_unit(cgroup: &str, unit: &str) -> bool {
+    let name = if unit.contains('.') {
+        unit.to_string()
+    } else {
+        format!("{unit}.service")
+    };
+    cgroup.split(['/', '\n']).any(|seg| seg == name)
+}
+
+/// Desktop Steam via `~/.steam/steam.pid`. `None` if stale, our descendant, or in SESSION_UNIT.
+fn desktop_steam_pid() -> Option<u32> {
+    let home = std::env::var_os("HOME")?;
+    let pid = home_steam_pid(std::path::Path::new(&home))?;
     if descends_from(pid, std::process::id()) {
         return None; // our own dedicated spawn's Steam
     }
@@ -349,6 +388,22 @@ fn hold_launch_until_steam_up(uri: &str, log: &std::path::Path, from: u64) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_steam_is_matched_to_its_own_unit_only() {
+        let game_mode = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/\
+                         gamescope-session-plus@steam.service\n";
+        assert!(cgroup_names_unit(
+            game_mode,
+            "gamescope-session-plus@steam.service"
+        ));
+        assert!(!cgroup_names_unit(game_mode, SESSION_UNIT));
+        let ours = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/\
+                    punktfunk-gamescope.service/sub\n";
+        assert!(cgroup_names_unit(ours, SESSION_UNIT));
+        // A prefix of another unit's name is not that unit.
+        assert!(!cgroup_names_unit(ours, "punktfunk"));
+    }
 
     #[test]
     fn exclusive_frees_the_box_session_for_a_non_steam_launch_too() {
