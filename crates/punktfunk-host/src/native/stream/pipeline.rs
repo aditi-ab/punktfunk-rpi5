@@ -77,6 +77,7 @@ pub(in crate::native) fn prepare_display(
         compositor == pf_vdisplay::Compositor::Gamescope,
         None,
     );
+    plan.sdr10_native = crate::session_plan::sdr10_native_for(&plan, compositor, None);
     if codec == crate::encode::Codec::PyroWave {
         plan.wire_chunk = Some(shard_payload as usize);
     }
@@ -139,7 +140,7 @@ pub(super) fn build_pipeline_with_retry(
     // IDD-push: hold one lease across attempts so a failed capturer drop does not Lingering-preempt.
     let _retry_hold = if matches!(plan.capture, crate::session_plan::CaptureBackend::IddPush) {
         Some(
-            vd.create(display_mode_for(mode))
+            vd.create(display_mode_for(mode, is_gamescope(vd.as_ref())))
                 .context("acquire virtual output for the session (retry-hold lease)")?,
         )
     } else {
@@ -273,13 +274,29 @@ pub(super) fn is_permanent_build_error(chain: &str) -> bool {
     PERMANENT.iter().any(|p| lower.contains(p))
 }
 
-/// Session mode with refresh × `PUNKTFUNK_VDISPLAY_HZ_MULT`. Wire rate is still [`pacing_hz`].
-pub(super) fn display_mode_for(session: punktfunk_core::Mode) -> punktfunk_core::Mode {
-    let mult = pf_host_config::config().vdisplay_hz_mult.max(1);
+/// Session mode with refresh × the display multiple ([`HostConfig::vdisplay_hz_mult_for`]).
+/// Wire rate is still [`pacing_hz`]. gamescope paints on the game's commit, so the multiplier
+/// would only raise its frame limit: ignored there.
+///
+/// [`HostConfig::vdisplay_hz_mult_for`]: pf_host_config::HostConfig::vdisplay_hz_mult_for
+pub(super) fn display_mode_for(
+    session: punktfunk_core::Mode,
+    gamescope: bool,
+) -> punktfunk_core::Mode {
+    let mult = if gamescope {
+        1
+    } else {
+        pf_host_config::config().vdisplay_hz_mult_for(session.refresh_hz)
+    };
     punktfunk_core::Mode {
         refresh_hz: session.refresh_hz.saturating_mul(mult).min(0xffff),
         ..session
     }
+}
+
+/// The virtual display is gamescope's: it paints on the game's commit.
+pub(super) fn is_gamescope(vd: &dyn crate::vdisplay::VirtualDisplay) -> bool {
+    vd.name() == pf_vdisplay::Compositor::Gamescope.id()
 }
 
 /// Pace and encode at min(session, achieved). Overdrive is display-only.
@@ -339,6 +356,7 @@ pub(super) fn open_session_encoder(
                 bitrate_bps(width, height),
                 frame.is_cuda(),
                 bit_depth,
+                plan.hdr,
                 plan.chroma,
                 plan.cursor_blend,
                 plan.max_slices,
@@ -368,7 +386,7 @@ pub(super) fn build_pipeline(
     client_hdr: Option<pf_frame::HdrMeta>,
     wire_seq_base: u32,
 ) -> Result<Pipeline> {
-    let display_mode = display_mode_for(mode);
+    let display_mode = display_mode_for(mode, is_gamescope(vd.as_ref()));
     let vout = crate::vdisplay::registry::acquire(vd, display_mode, quit.clone(), supersedes)
         .context("create virtual output")?;
     if let Some(t) = trace {
@@ -413,7 +431,7 @@ pub(super) fn reattach_pipeline(
         vd,
         lease.into_output(keepalive),
         mode,
-        display_mode_for(mode),
+        display_mode_for(mode, is_gamescope(vd.as_ref())),
         bitrate_kbps,
         bitrate_auto,
         bit_depth,
@@ -477,7 +495,7 @@ fn attach_pipeline(
     let effective_hz = pacing_hz(mode.refresh_hz, achieved_hz);
     // A mirrored KWin head is still KWin's stream: its id 0 hides the pointer.
     let cursor_id0_hides = vd.producer() == pf_vdisplay::Compositor::Kwin.id();
-    let producer_is_gamescope = vd.name() == pf_vdisplay::Compositor::Gamescope.id();
+    let producer_is_gamescope = is_gamescope(vd.as_ref());
     let mut capturer = crate::capture::capture_virtual_output(
         vout,
         crate::capture::VirtualCaptureRequest {
@@ -603,11 +621,16 @@ mod tests {
             height: 1440,
             refresh_hz: 60,
         };
-        let display = display_mode_for(session);
+        let display = display_mode_for(session, false);
         assert_eq!((display.width, display.height), (2560, 1440));
         assert_eq!(
             display.refresh_hz,
-            session.refresh_hz * pf_host_config::config().vdisplay_hz_mult.max(1)
+            session.refresh_hz * pf_host_config::config().vdisplay_hz_mult_for(60)
+        );
+        assert_eq!(
+            display_mode_for(session, true).refresh_hz,
+            session.refresh_hz,
+            "gamescope paints on commit: no multiplier"
         );
     }
 

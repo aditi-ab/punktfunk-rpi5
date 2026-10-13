@@ -179,6 +179,11 @@ impl OutputLease {
         })
     }
 
+    /// The gamescope instance this output belongs to; `None` for the box's own session.
+    pub(crate) fn seat(&self) -> Option<&str> {
+        self.seat.as_deref()
+    }
+
     /// The output as a fresh capture sees it. Never a birth-size gate: the output already
     /// sits at its mode.
     pub(crate) fn into_output(self, keepalive: Box<dyn Send>) -> crate::vdisplay::VirtualOutput {
@@ -235,6 +240,12 @@ pub fn capture_virtual_output(
     // PipeWire probes only where modifiers are offered: level-21 gamescope, or
     // non-gamescope PyroWave. Direct capture needs the same exact consumer lists.
     let gamescope_tiled = gamescope && pf_vdisplay::gamescope_tiled_capture(None);
+    // NVENC copies a producer's planar frame; an older gamescope composites it through system
+    // RAM, which costs more than the conversion it saves. VAAPI keeps its own rule.
+    let nv12_native = want.nv12_native
+        && (!gamescope
+            || crate::encode::linux_zero_copy_is_vaapi()
+            || pf_vdisplay::gamescope_planar_capture(None));
     let modifier_codec = if gamescope {
         gamescope_tiled.then_some(codec).flatten()
     } else if want.pyrowave {
@@ -253,7 +264,8 @@ pub fn capture_virtual_output(
         match pf_capture::open_direct_output(
             name.clone(),
             keepalive,
-            zero_copy_policy(want.pyrowave, want.nv12_native, codec, bit_depth, want.hdr),
+            zero_copy_policy(want.pyrowave, nv12_native, codec, bit_depth, want.hdr),
+            want.hdr,
         ) {
             Ok(c) => {
                 tracing::info!(output = %name, "capturing the compositor output directly");
@@ -286,6 +298,7 @@ pub fn capture_virtual_output(
             want_444: want.chroma_444,
             want_hdr: want.hdr,
             ten_bit_sdr: want.ten_bit_sdr,
+            sdr10_native: want.sdr10_native,
             expect_exact_dims: vout.expect_exact_dims,
             producer,
             policy: pf_capture::ZeroCopyPolicy {
@@ -293,7 +306,7 @@ pub fn capture_virtual_output(
                 gamescope_tiled,
                 ..zero_copy_policy(
                     want.pyrowave,
-                    want.nv12_native,
+                    nv12_native,
                     modifier_codec,
                     bit_depth,
                     want.hdr,
@@ -314,22 +327,69 @@ pub fn capture_virtual_output(
 /// Windows: IDD-push enables advanced colour, so the platform answer.
 /// Linux + gamescope: host knob, `packaging/gamescope` 10-bit BT.2020/PQ, a
 /// spawned (not attached-foreign) sub-mode, and no earlier virtual-output HDR
-/// downgrade latched. Anything else on Linux is 8-bit; GNOME 50+ portal HDR is
-/// the GameStream plane (`gamestream::host_hdr_capable` + live monitor probe).
+/// downgrade latched. Hyprland and wlroots: direct capture of a head lit in
+/// BT.2020 PQ ([`direct_capture_hdr`]). Anything else on Linux is 8-bit; GNOME
+/// 50+ portal HDR is the GameStream plane (`gamestream::host_hdr_capable`).
 pub fn capturer_supports_hdr_for(
     compositor: Option<crate::vdisplay::Compositor>,
     gamescope_route: Option<&crate::vdisplay::GamescopeRoute>,
 ) -> bool {
     #[cfg(target_os = "linux")]
     {
-        if compositor == Some(crate::vdisplay::Compositor::Gamescope) {
-            return pf_host_config::config().gamescope_hdr
-                && pf_vdisplay::gamescope_hdr_available(gamescope_route)
-                && !pf_capture::hdr_capture_failed(pf_capture::HdrSource::VirtualOutput);
+        use crate::vdisplay::Compositor;
+        match compositor {
+            Some(Compositor::Gamescope) => {
+                return pf_host_config::config().gamescope_hdr
+                    && pf_vdisplay::gamescope_hdr_available(gamescope_route)
+                    && !pf_capture::hdr_capture_failed(pf_capture::HdrSource::VirtualOutput);
+            }
+            Some(c @ (Compositor::Hyprland | Compositor::Wlroots)) => {
+                return direct_capture_hdr(c);
+            }
+            _ => {}
         }
     }
     let _ = (compositor, gamescope_route);
     pf_capture::capturer_supports_hdr()
+}
+
+/// Direct capture's HDR answer. A pinned head must already be lit in BT.2020 PQ (its
+/// `wp_color_management_v1` description); a Hyprland headless output is created in HDR
+/// by its backend. Needs an encoder that reads packed 10-bit RGB off a dmabuf, and no
+/// virtual-output latch from a rule or offer that did not take.
+#[cfg(target_os = "linux")]
+fn direct_capture_hdr(compositor: crate::vdisplay::Compositor) -> bool {
+    if !pf_capture::direct_capture()
+        || pf_capture::hdr_capture_failed(pf_capture::HdrSource::VirtualOutput)
+    {
+        return false;
+    }
+    let ingests_rgb10 = crate::encode::linux_zero_copy_is_vaapi()
+        || pf_encode::linux_hdr_cuda_ok()
+        || pf_encode::linux_nvenc_raw_dmabuf_ok();
+    if !ingests_rgb10 {
+        return false;
+    }
+    match pf_vdisplay::capture_monitor() {
+        Some(head) => pf_capture::output_hdr(&head) == Some(true),
+        None => compositor == crate::vdisplay::Compositor::Hyprland,
+    }
+}
+
+/// Does the source composite 10-bit SDR itself? Our gamescope from `+pfhdr26`, which offers
+/// its 10-bit formats under BT.709, and Windows composing the virtual display in SDR wide
+/// colour (FP16). Such a session needs no widening opt-in.
+pub fn capturer_delivers_sdr10_for(
+    compositor: Option<crate::vdisplay::Compositor>,
+    gamescope_route: Option<&crate::vdisplay::GamescopeRoute>,
+) -> bool {
+    match compositor {
+        Some(crate::vdisplay::Compositor::Gamescope) => {
+            pf_vdisplay::gamescope_sdr10_capture(gamescope_route)
+        }
+        Some(crate::vdisplay::Compositor::Windows) => pf_capture::capturer_delivers_sdr10(),
+        _ => false,
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -501,6 +561,7 @@ pub fn open_driver_encoder(
         bitrate_kbps: (bitrate_bps / 1000).min(u64::from(u32::MAX)) as u32,
         hdr,
         hdr_meta: capturer.hdr_meta().map(|m| client_hdr.unwrap_or(m)),
+        sdr_fp16: !hdr && capturer.composes_sdr_fp16(),
         wire_chunk_bytes: plan.wire_chunk.unwrap_or(0) as u32,
         backends: [backend, fallback, 0, 0],
         wire_seq_base,
@@ -561,6 +622,7 @@ mod live_tests {
             gpu: true,
             hdr: false,
             ten_bit_sdr: false,
+            sdr10_native: false,
             chroma_444: false,
             pyrowave: false,
             nv12_native: false,
@@ -682,6 +744,7 @@ mod live_tests {
             gpu: true,
             hdr: false,
             ten_bit_sdr: false,
+            sdr10_native: false,
             chroma_444: false,
             pyrowave: false,
             nv12_native: false,

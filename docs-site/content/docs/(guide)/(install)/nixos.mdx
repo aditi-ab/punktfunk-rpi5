@@ -8,8 +8,6 @@ module. The guided installer doesn't cover NixOS.
 
 ## 1. Add the binary cache
 
-Without it, the first build compiles everything from source, which takes about an hour:
-
 ```nix
 nix.settings = {
   substituters = [ "https://nix.unom.io" ];
@@ -17,8 +15,20 @@ nix.settings = {
 };
 ```
 
-Don't set `inputs.punktfunk.inputs.nixpkgs.follows`: it changes every store path and misses the
-cache ([packaging/nix](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/nix/README.md#binary-cache)).
+The host, the client and the patched gamescope build against your system's nixpkgs, so they can
+load its GPU driver. The cache holds them only for punktfunk's own nixpkgs; on any other, each
+update compiles them, which can take an hour or more. To take them from the cache, let your nixpkgs
+follow punktfunk's:
+
+```nix
+inputs.nixpkgs.follows = "punktfunk/nixpkgs";
+```
+
+Your system then runs the nixpkgs punktfunk pins: canary moves it to the newest nixos-unstable each
+night, stable carries the one from its release.
+
+Don't set `inputs.punktfunk.inputs.nixpkgs.follows`: the console and runner then miss the cache too
+([packaging/nix](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/nix/README.md#binary-cache)).
 
 ## 2. Import the module and enable the host
 

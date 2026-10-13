@@ -65,6 +65,9 @@ pub struct AppState {
     /// `/resume` waits on this so the old capturer-pool and lease teardown finish before
     /// the successor starts.
     pub media_exited: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Bumped as each media thread is started; less [`Self::media_exited`], the threads still
+    /// alive, which the flags cannot say once `end_session` has lowered them.
+    pub media_started: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Client IDR / reference-frame invalidation request. Video thread forces a keyframe and clears it.
     pub force_idr: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Client 0x0301 lost-frame range. Video thread drains it into `Encoder::invalidate_ref_frames`,
@@ -110,6 +113,7 @@ impl AppState {
             loss_stats: std::sync::Arc::new(crate::gamestream::GsLossStats::default()),
             counters: Arc::new(crate::session_status::SessionCounters::default()),
             media_exited: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            media_started: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             audio_cap: std::sync::Arc::new(std::sync::Mutex::new(None)),
             stats,
             access: std::sync::OnceLock::new(),
@@ -189,9 +193,7 @@ pub fn serve(
             .context("native pairing store")?,
     );
     // Native identity first. If GameStream writes `cert.pem` before a native pair
-    // exists, the console starts and serves the SAN-less RSA cert. Reading the dir
-    // first also stops `load_or_create` minting a new cert that `load_or_adopt`
-    // would then treat as the pin it was preserving.
+    // exists, the console starts and serves the SAN-less RSA cert.
     let native_ident = crate::identity::load_or_adopt(&np).context("native host identity")?;
     #[cfg(feature = "gamestream")]
     let gs = crate::gamestream::GsState::new(
@@ -407,7 +409,7 @@ fn sanitize_display_name(raw: &str) -> String {
     }
 }
 
-/// Load the persisted host uniqueid, or mint from `/proc/sys/kernel/random/uuid` and store it.
+/// Load the persisted host uniqueid, or mint 16 random bytes as hex and store it.
 fn load_or_create_uniqueid() -> Result<String> {
     let path = pf_paths::config_dir().join("uniqueid");
     if let Ok(s) = std::fs::read_to_string(&path) {
@@ -416,15 +418,7 @@ fn load_or_create_uniqueid() -> Result<String> {
             return Ok(t.to_string());
         }
     }
-    let id = std::fs::read_to_string("/proc/sys/kernel/random/uuid")
-        .map(|u| u.trim().replace('-', ""))
-        .unwrap_or_else(|_| {
-            format!(
-                "{:016x}{:016x}",
-                std::process::id(),
-                crate::gamestream::HTTP_PORT
-            )
-        });
+    let id = hex::encode(rand::random::<[u8; 16]>());
     std::fs::create_dir_all(pf_paths::config_dir()).ok();
     std::fs::write(&path, &id).with_context(|| format!("write {}", path.display()))?;
     Ok(id)

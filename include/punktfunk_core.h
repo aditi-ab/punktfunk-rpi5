@@ -335,6 +335,9 @@
 // `PunktfunkStatus` code).
 #define PUNKTFUNK_CLIP_ERROR 6
 
+// Most findings one report carries; the rules can produce seven.
+#define PUNKTFUNK_HEALTH_FINDINGS_MAX 8
+
 // [`punktfunk_au_admission_note`]'s `concealed`: the lane has no concealer.
 #define PUNKTFUNK_CONCEALED_NONE 0
 
@@ -350,14 +353,14 @@
 // symbols and leave every existing function's signature and behaviour alone.
 // New connect options append to `PunktfunkConnectOpts` behind `struct_size`;
 // do not mint another `connect_ex*` or grow `PunktfunkAudioPcm` / `PunktfunkStats`
-// (no size guard, allocated by value). v27 is the exception: `PunktfunkHidOutput`
-// grew 19 → 85 bytes and the version check is the overrun guard — a second pull
-// symbol would fork the hidout drain forever.
+// (no size guard, allocated by value). Growing a struct the library writes whole into
+// the caller's buffer is a bump: the version check is the overrun guard
+// (`PunktfunkHidOutput` at 27, `PunktfunkProbeResult` at 43).
 //
 // Not [`WIRE_VERSION`]. The C surface can grow without a wire byte changing.
 // Pin the integer in `punktfunk-ffi` (`abi_version_is_pinned`). Per-bump notes live
 // in `CHANGELOG.md`.
-#define PUNKTFUNK_ABI_VERSION 42
+#define PUNKTFUNK_ABI_VERSION 43
 
 // punktfunk/1 wire version. `Hello`/`Welcome` carry it; hosts equality-check it.
 //
@@ -625,11 +628,18 @@
 // Not a datagram; [`classify`] is untouched. Machine power only — never plugin actions.
 #define PUNKTFUNK_GRANT_POWER 64
 
+// Pause and remove a title's download on the mgmt cert lane (`design/plugin-downloads.md`).
+// Starting one is [`GRANT_LAUNCH`]: launching a missing title installs it anyway.
+#define PUNKTFUNK_GRANT_MANAGE_GAMES 128
+
 // An omitted Welcome or registry mask reads as this: every bit above.
-#define PUNKTFUNK_GRANT_ALL 127
+#define PUNKTFUNK_GRANT_ALL 255
 
 // Stored "Full control" before [`GRANT_POWER`]. [`normalize_legacy_full`] lifts it.
 #define PUNKTFUNK_GRANT_ALL_PRE_POWER 63
+
+// Stored "Full control" before [`GRANT_MANAGE_GAMES`]. [`normalize_legacy_full`] lifts it.
+#define PUNKTFUNK_GRANT_ALL_PRE_MANAGE 127
 
 // The management API rejects these; it never silently clears unknown bits
 // (that would grant less than the caller asked).
@@ -870,6 +880,9 @@
 // Rejections tolerated before the streak's best batch is applied anyway.
 #define ResyncGuard_MAX_REJECTED_STREAK 3
 
+// [`HostFacts::forced_profile`] when nothing is pinned.
+#define PUNKTFUNK_FORCED_PROFILE_NONE 255
+
 #define PUNKTFUNK_MSG_RECONFIGURE 1
 
 #define PUNKTFUNK_MSG_RECONFIGURED 2
@@ -896,9 +909,17 @@
 
 #define PUNKTFUNK_MSG_LINK_REPORT 12
 
+#define PUNKTFUNK_MSG_SET_DELIVERY 13
+
+#define PUNKTFUNK_MSG_DELIVERY_CHANGED 14
+
+#define PUNKTFUNK_MSG_HOST_FACTS 15
+
 #define PUNKTFUNK_MSG_PROBE_REQUEST 32
 
 #define PUNKTFUNK_MSG_PROBE_RESULT 33
+
+#define PUNKTFUNK_MSG_PROBE_SHAPED 34
 
 #define PUNKTFUNK_MSG_CLOCK_PROBE 48
 
@@ -1163,6 +1184,21 @@
 // nothing about the stream. Absent when the client streams with its plain settings.
 #define EXT_TAG_PRESET 4
 
+// Extension tag `5` on `Start`: `[profile, flags]` — the delivery profile this client
+// asks the host to stream under (`0` burst, `1` capped, `2` smooth) and what it wants
+// besides ([`EXT_DELIVERY_FACTS`], [`EXT_DELIVERY_PROBE_ONLY`]). A host that reads the tag
+// answers it with [`DeliveryChanged`](super::control::DeliveryChanged), and that answer is
+// the client's licence to send anything else about delivery; a host that skips it answers
+// nothing and streams as it always has. Absent = asks nothing.
+#define PUNKTFUNK_EXT_TAG_DELIVERY 5
+
+// [`EXT_TAG_DELIVERY`] flag bit 0: send [`HostFacts`](super::control::HostFacts) once.
+#define PUNKTFUNK_EXT_DELIVERY_FACTS 1
+
+// [`EXT_TAG_DELIVERY`] flag bit 1: a diagnostic session — serve probes from the punched
+// data plane and never build a pipeline.
+#define PUNKTFUNK_EXT_DELIVERY_PROBE_ONLY 2
+
 // Longest [`SessionPreset::id`], printable ASCII.
 #define PRESET_ID_MAX 32
 
@@ -1312,6 +1348,17 @@
 
 // Two missed 500 ms legacy refreshes. A quieter host is treated as gone.
 #define PUNKTFUNK_LEGACY_STALE_MS 1000
+
+// Interface kinds, as [`ifinfo`] reads them and the wire carries them
+// ([`crate::quic::HostFacts`]).
+#define PUNKTFUNK_IFACE_KIND_UNKNOWN 0
+
+#define PUNKTFUNK_IFACE_KIND_ETHERNET 1
+
+#define PUNKTFUNK_IFACE_KIND_WIFI 2
+
+// Loopback, a tunnel, a bridge: a link with no wire of its own.
+#define PUNKTFUNK_IFACE_KIND_OTHER 3
 
 // Stable C ABI status codes. `Ok` is 0; errors are negative so callers can
 // test `rc < 0`. Existing variants must not be renumbered — only append.
@@ -1709,6 +1756,14 @@ typedef struct {
     const char *preset_id;
     // The preset's display name, or null. Read only beside a non-null `preset_id`.
     const char *preset_name;
+    // The delivery ask (`EXT_TAG_DELIVERY`): the profile on the host's record (`1` capped,
+    // `2` smooth) and the flags a network check sets (`1` facts, `2` probes only). Both `0`
+    // asks nothing, which is what a shorter prefix defaults to.
+    uint8_t delivery_profile;
+    // See `delivery_profile`.
+    uint8_t delivery_flags;
+    // Always `0`. Fills what would otherwise be tail padding, as `reserved0` does.
+    uint8_t reserved2[6];
 } PunktfunkConnectOpts;
 #endif
 
@@ -2014,7 +2069,47 @@ typedef struct {
     // Wire packets the host put on the link, and the ones its send buffer dropped.
     uint32_t wire_packets_sent;
     uint32_t send_dropped;
+    // Probe inter-arrival gap, µs, to a tenth of a millisecond: median and 99th percentile.
+    // Their difference is the path's jitter.
+    uint32_t gap_p50_us;
+    uint32_t gap_p99_us;
+    // Probe packets that arrived behind a later one.
+    uint32_t reorders;
 } PunktfunkProbeResult;
+
+// One finding of the network check: the id names the text the app shows
+// ([`punktfunk_core::client::health::FindingId`] as a byte), `numbers` are its figures,
+// `profile` is the delivery profile that helps (`1` capped, `2` smooth, `0` none).
+typedef struct {
+    uint8_t id;
+    uint8_t severity;
+    uint8_t profile;
+    uint32_t numbers[3];
+} PunktfunkHealthFinding;
+
+// The network check's report ([`punktfunk_core::client::health::HealthReport`]), flat.
+// `has_clean` 0 = a host without a ramp (no loss figure is honest); `has_host` 0 = the
+// host sent no facts; a leg or fact that was not sampled reads `0`.
+typedef struct {
+    uint32_t ceiling_kbps;
+    uint8_t wall;
+    uint8_t has_clean;
+    uint32_t clean_rate_kbps;
+    float clean_loss_pct;
+    uint32_t clean_jitter_us;
+    uint8_t client_iface_kind;
+    uint32_t client_link_mbps;
+    uint32_t client_rcvbuf_kb;
+    uint8_t has_host;
+    uint8_t host_iface_kind;
+    uint32_t host_link_mbps;
+    uint32_t host_sndbuf_kb;
+    // Loss of the bursts leg and the capped leg, percent; `n_legs` says how many ran.
+    uint8_t n_legs;
+    float leg_loss_pct[2];
+    uint8_t n_findings;
+    PunktfunkHealthFinding findings[PUNKTFUNK_HEALTH_FINDINGS_MAX];
+} PunktfunkHealthReport;
 
 // [`punktfunk_av1_sequence_info`]'s answer: what an `av1C` record and a colour description
 // take from an AV1 sequence header. Colour codes are ITU-T H.273, 2 when none is coded.
@@ -3513,6 +3608,20 @@ PunktfunkStatus punktfunk_connection_speed_test(const PunktfunkConnection *c,
 // (NULL is an error).
 PunktfunkStatus punktfunk_connection_probe_result(const PunktfunkConnection *c,
                                                   PunktfunkProbeResult *out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Run the network check over this connection and write its report into `*out`. Blocking
+// for ten to twenty seconds — call it off the main thread. The connection should have been
+// dialled with a delivery ask of probes only and facts; without one the check is the speed
+// test alone. Errors: `Unsupported` when the host declined, `Timeout` when a round never
+// reported.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is writable for one `PunktfunkHealthReport`
+// (NULL is an error).
+PunktfunkStatus punktfunk_connection_network_check(const PunktfunkConnection *c,
+                                                   PunktfunkHealthReport *out);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

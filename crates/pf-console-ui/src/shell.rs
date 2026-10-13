@@ -246,6 +246,8 @@ struct Launching {
     poll_gen: u64,
     /// The game is up and the host is waiting for its window.
     window_wait: bool,
+    /// The title's files, while the host fetches them before it opens the stream.
+    download: Option<pf_client_core::library::DownloadProgress>,
     /// Why the hold gave up, once it has. Latched: the hold holds the screen and says this
     /// instead of sliding away onto a desktop nobody asked for.
     failed: Option<String>,
@@ -272,6 +274,8 @@ fn launch_gave_up(title: &str, state: Option<&str>, elapsed: f64) -> Option<Stri
 
 /// Poll interval for the launch hold, and the retry when an answer never lands.
 const LAUNCH_POLL: f64 = 1.0;
+/// Seconds between `/status` reads while a shelf tile shows a live download.
+const DOWNLOADS_POLL: f64 = 2.0;
 const LAUNCH_POLL_STALL: f64 = 5.0;
 /// The host lists nothing for the title: the launch did not resolve
 /// (no recipe, launcher missing). The host logs it and streams on; so do we.
@@ -285,6 +289,9 @@ const LAUNCH_HOLD_MAX: f64 = 120.0;
 pub struct ConsoleOptions {
     /// Hostname registered as the default pairing device name.
     pub device_name: String,
+    /// The About row's version, verbatim. `None` shows this kit's version: right where the
+    /// app ships from this workspace.
+    pub version: Option<String>,
     /// Steam Deck: Steam's keyboard types; this shell never draws one.
     pub deck: bool,
     /// A TV (Apple TV, Android TV): rows for a clipboard or a phone's sensors do nothing.
@@ -303,7 +310,7 @@ pub struct ConsoleOptions {
     /// Settings and preset catalog. `None` uses the desktop file store
     /// (`pf_client_core::trust`); every other host must supply one.
     pub store: Option<Arc<dyn SettingsStore>>,
-    /// Which settings rows exist and which platform-native screens may open.
+    /// Which settings rows exist.
     pub platform: Platform,
     /// Skia GPU resource-cache budget, bytes. Desktop default is
     /// [`DEFAULT_GPU_CACHE_BYTES`]; a memory-tight box may go down to
@@ -325,6 +332,7 @@ impl ConsoleOptions {
     pub fn desktop(device_name: String, deck: bool) -> ConsoleOptions {
         ConsoleOptions {
             device_name,
+            version: None,
             deck,
             tv: false,
             fallback_ui: false,
@@ -370,6 +378,9 @@ pub(crate) struct Shell {
     games_key: Option<String>,
     /// Whose list the shared library holds: the host of the last `FetchLibrary` sent.
     library_fp: Option<String>,
+    /// The host the last `Pair` went to. The one pairing phase is its, so another host's
+    /// Pair screen on top neither shows it nor closes on it.
+    pairing: Option<(String, u16)>,
     /// Focus is on the tab strip, not the screen.
     strip_focus: bool,
     /// The shell moved focus to the strip because the root had nothing to focus. It goes
@@ -384,6 +395,8 @@ pub(crate) struct Shell {
     motion: Motion,
     console: ConsoleShared,
     library: LibraryShared,
+    /// When [`Shell::tick_downloads`] last asked the host.
+    downloads_polled: f64,
     bus: ConsoleBus,
     actions: VecDeque<OverlayAction>,
     settings: trust::Settings,
@@ -507,6 +520,7 @@ impl Shell {
             parked: [None, None, None, None],
             games_key: None,
             library_fp: None,
+            pairing: None,
             strip_focus: false,
             strip_parked: false,
             root_targets: None,
@@ -515,6 +529,7 @@ impl Shell {
             motion: Motion::None,
             console,
             library,
+            downloads_polled: f64::NEG_INFINITY,
             bus,
             actions: VecDeque::new(),
             mesh_palette: settings.ui_palette.clone(),
@@ -530,6 +545,7 @@ impl Shell {
                 pyrowave_ok: opts.pyrowave_ok,
                 av1_ok: opts.av1_ok,
                 name: opts.device_name,
+                version: opts.version.unwrap_or_else(|| crate::VERSION.into()),
             },
             hosts: Vec::new(),
             hosts_gen: u64::MAX,
@@ -745,14 +761,19 @@ impl Shell {
     pub(crate) fn session_streaming(&mut self) {
         self.connecting = None;
         let t = self.t();
+        let reads = self.library.status_gen();
         let Some(l) = &mut self.launching else {
             self.in_stream = true;
             return;
         };
         l.connected = true;
         // The host has no lease to report until the session that launched the title
-        // exists, so the "never listed it" clock only starts making sense here.
+        // exists, so the "never listed it" clock only starts making sense here — and a read
+        // taken before it, while the files downloaded, is not this session's answer.
         l.since = t;
+        l.base_gen = reads;
+        l.last_poll = t - LAUNCH_POLL_STALL;
+        l.download = None;
         self.in_stream = false;
     }
 
@@ -797,6 +818,7 @@ impl Shell {
             base_gen: reads,
             poll_gen: reads,
             window_wait: false,
+            download: None,
             failed: None,
         })
     }
@@ -817,21 +839,37 @@ impl Shell {
         let t = self.t();
         let reads = self.library.status_gen();
         let Some(l) = &self.launching else { return };
-        // Nothing to ask about yet: the lease is the SESSION's, and a title that was
-        // already up would otherwise read as "running" and reveal a stream that does
-        // not exist.
-        if !l.connected || l.failed.is_some() {
+        if l.failed.is_some() {
             return;
         }
-        let state = (reads > l.base_gen)
+        let fresh = reads > l.base_gen;
+        let download = fresh
+            .then(|| self.library.launch_download(&l.host.id))
+            .flatten();
+        // Before the dial lands the host may be fetching the title's files: the only thing to
+        // read is how far they are. The lease is the SESSION's, so a title that was already up
+        // would otherwise read as "running" and reveal a stream that does not exist.
+        if !l.connected {
+            if let Some(l) = &mut self.launching {
+                l.download = download.filter(|d| d.live());
+            }
+            self.poll_launch(t, reads);
+            return;
+        }
+        let state = fresh
             .then(|| self.library.launch_state(&l.host.id))
             .flatten();
         let elapsed = t - l.since;
         let window_wait = matches!(&state, Some((s, true)) if s == "running");
         let word = state.as_ref().map(|(s, _)| s.as_str());
         // A launch that produced no game ends with a sentence, not by sliding away: a bare
-        // desktop reads the same whether the host refused it or the game is merely slow.
-        if let Some(why) = launch_gave_up(&l.title, word, elapsed) {
+        // desktop reads the same whether the host refused it or the game is merely slow. A
+        // download that stopped is that sentence, at once.
+        let stopped = word
+            .is_none()
+            .then(|| download.and_then(|d| d.stopped(&l.title)))
+            .flatten();
+        if let Some(why) = stopped.or_else(|| launch_gave_up(&l.title, word, elapsed)) {
             if let Some(l) = &mut self.launching {
                 l.failed = Some(why);
             }
@@ -850,6 +888,15 @@ impl Shell {
             self.reveal_stream();
             return;
         }
+        self.poll_launch(t, reads);
+        if let Some(l) = &mut self.launching {
+            l.window_wait = window_wait;
+        }
+    }
+
+    /// Ask the host again once the last answer landed, or once it is overdue.
+    fn poll_launch(&mut self, t: f64, reads: u64) {
+        let Some(l) = &self.launching else { return };
         let waited = t - l.last_poll;
         if (reads != l.poll_gen && waited >= LAUNCH_POLL) || waited >= LAUNCH_POLL_STALL {
             let poll = ConsoleCmd::RefreshRunning {
@@ -862,9 +909,6 @@ impl Shell {
                 l.poll_gen = reads;
             }
             self.bus.send(poll);
-        }
-        if let Some(l) = &mut self.launching {
-            l.window_wait = window_wait;
         }
     }
 
@@ -943,7 +987,29 @@ impl Shell {
         self.sync_wake();
         self.home_shelf();
         self.tick_launch();
+        self.tick_downloads();
         self.settle_focus();
+    }
+
+    /// While the shelf on top shows a live download and no launch hold polls already, re-read
+    /// `/status` every [`DOWNLOADS_POLL`] so its tile's percentage moves.
+    fn tick_downloads(&mut self) {
+        let t = self.t();
+        if self.launching.is_some() || t - self.downloads_polled < DOWNLOADS_POLL {
+            return;
+        }
+        if !self.library.any_live_download() {
+            return;
+        }
+        let Some(lib) = self.stack.last().and_then(Screen::shelf) else {
+            return;
+        };
+        self.downloads_polled = t;
+        self.bus.send(ConsoleCmd::RefreshRunning {
+            addr: lib.host_addr().to_string(),
+            mgmt: lib.host_mgmt_port(),
+            fp_hex: lib.host_fp_hex().to_string(),
+        });
     }
 
     /// Settings writes palette/follow-OS into `self.settings`; recompile here so the
@@ -1033,6 +1099,12 @@ impl Shell {
 
     fn sync_pair(&mut self) {
         let pair = self.console.pair();
+        let pairing = self.pairing.clone();
+        let ours = |s: &Screen| match (s, &pairing) {
+            (Screen::Pair(p), Some((addr, port))) => p.target() == (addr.as_str(), *port),
+            _ => false,
+        };
+        let top_is_ours = self.stack.last().is_some_and(ours);
         match &pair {
             PairPhase::Idle => {}
             PairPhase::Paired { key } => {
@@ -1043,7 +1115,8 @@ impl Shell {
                     .map_or_else(|| "the host".to_string(), |h| h.name.clone());
                 self.show_toast_kind(format!("Paired with {name}"), ToastKind::Success);
                 self.console.set_pair(PairPhase::Idle);
-                if matches!(self.stack.last(), Some(Screen::Pair(_))) {
+                self.pairing = None;
+                if top_is_ours {
                     self.apply_nav(Nav::Pop);
                 }
                 // The first pairing is where the default host comes into being, so show
@@ -1054,18 +1127,20 @@ impl Shell {
                 }
             }
             phase => {
-                if let Some(Screen::Pair(p)) = self.stack.last_mut() {
+                if let (true, Some(Screen::Pair(p))) = (top_is_ours, self.stack.last_mut()) {
                     p.apply_phase(phase);
                 }
                 if matches!(phase, PairPhase::Failed(_)) {
                     self.console.set_pair(PairPhase::Idle);
+                    self.pairing = None;
                 }
             }
         }
     }
 
     /// Mirrors the service's wake and speed status. A woken host with `then_connect` goes
-    /// straight into its connect.
+    /// straight into its connect, once: the slot is cleared here, not at the service's next
+    /// bus drain.
     fn sync_wake(&mut self) {
         match self.console.wake() {
             Some(w) => {
@@ -1087,6 +1162,7 @@ impl Shell {
                         .map(|h| ConnectIntent::to_host(h, None))
                 });
                 self.bus.send(ConsoleCmd::CancelWake);
+                self.console.set_wake(None);
                 self.wake = None;
                 if let Some(Some(intent)) = intent {
                     self.start_connect(intent);
@@ -1125,13 +1201,13 @@ impl Shell {
             return;
         };
         let host = host.clone();
-        self.library_fp = Some(host.fp_hex.clone());
+        home.set_shelf(crate::screens::library::LibraryScreen::embedded(&host));
+        self.note_fetch(&host.fp_hex);
         self.bus.send(ConsoleCmd::FetchLibrary {
             addr: host.addr.clone(),
             mgmt: host.mgmt_port,
             fp_hex: host.fp_hex.clone(),
         });
-        home.set_shelf(crate::screens::library::LibraryScreen::embedded(&host));
     }
 
     /// This pairing is what turned its host into the default one. False for a second or
@@ -1390,15 +1466,25 @@ impl Shell {
             .cloned()
     }
 
+    /// A library fetch for `fp_hex` is about to go out. Another host's list leaves the model
+    /// now, before a shelf pushed with the fetch syncs it as its own. Call it before the send:
+    /// after, it could wipe what the platform's fetch already delivered.
+    pub(crate) fn note_fetch(&mut self, fp_hex: &str) {
+        if self.library_fp.as_deref() != Some(fp_hex) {
+            self.library.begin_host_fetch();
+        }
+        self.library_fp = Some(fp_hex.to_string());
+    }
+
     /// A fresh shelf for `host`, its fetch sent.
     fn shelf_root(&mut self, host: &HostRow) -> Screen {
+        self.note_fetch(&host.fp_hex);
         self.bus.send(ConsoleCmd::FetchLibrary {
             addr: host.addr.clone(),
             mgmt: host.mgmt_port,
             fp_hex: host.fp_hex.clone(),
         });
         self.games_key = Some(host.key.clone());
-        self.library_fp = Some(host.fp_hex.clone());
         Screen::Library(crate::screens::library::LibraryScreen::new(host))
     }
 
@@ -1419,9 +1505,17 @@ impl Shell {
             return None;
         }
         match self.ok_down.take() {
-            Some((_, false)) => self.menu_event(MenuEvent::Confirm),
+            Some((_, false)) => {
+                let pulse = self.menu_event(MenuEvent::Confirm);
+                self.felt(pulse)
+            }
             _ => None,
         }
+    }
+
+    /// The pulse a pad may play: none while Controller rumble is off.
+    pub(crate) fn felt(&self, pulse: Option<MenuPulse>) -> Option<MenuPulse> {
+        pulse.filter(|_| self.settings.pad_rumble)
     }
 
     /// OK went down on what has focus: its plate and the element dip.
@@ -1452,7 +1546,8 @@ impl Shell {
         if ev == MenuEvent::Confirm {
             self.dip();
         }
-        self.menu_event(ev)
+        let pulse = self.menu_event(ev);
+        self.felt(pulse)
     }
 
     /// [`Self::handle_menu`] without the Confirm dip.
@@ -1517,6 +1612,17 @@ impl Shell {
                     let text = self.apply_speed_bitrate(kbps);
                     self.close_speed();
                     self.show_toast(text);
+                    return Some(MenuPulse::Confirm);
+                }
+                // The profile a finding offered goes on this host's record; the next
+                // connect asks for it.
+                MenuEvent::Secondary => {
+                    let (key, name, profile) = self.speed_offered_profile()?;
+                    self.bus.send(ConsoleCmd::SetHostDelivery { key, profile });
+                    self.close_speed();
+                    self.show_toast(format!(
+                        "Paced delivery set for {name} \u{2014} it applies from the next connect"
+                    ));
                     return Some(MenuPulse::Confirm);
                 }
                 _ => return None,
@@ -1675,8 +1781,8 @@ impl Shell {
         self.input_source = Some(source);
     }
 
-    /// Keyboard fallback. Arrows and Enter/Esc are menu events; Y/X mirror
-    /// Secondary/Tertiary (suppressed while editing — those keys are text).
+    /// Keyboard fallback. Arrows and Enter/Esc are menu events; Space confirms and Y/X
+    /// mirror Secondary/Tertiary (suppressed while editing — those keys are text).
     /// `shift` only affects Tab.
     pub(crate) fn key(&mut self, key: crate::input::Key, shift: bool, repeat: bool) -> bool {
         use crate::input::Key as S;
@@ -1695,7 +1801,8 @@ impl Shell {
             S::Right => MenuEvent::Move(MenuDir::Right),
             S::Up => MenuEvent::Move(MenuDir::Up),
             S::Down => MenuEvent::Move(MenuDir::Down),
-            S::Return | S::Space if !repeat => MenuEvent::Confirm,
+            S::Return if !repeat => MenuEvent::Confirm,
+            S::Space if !repeat && !editing => MenuEvent::Confirm,
             S::Escape | S::Backspace if !repeat => MenuEvent::Back,
             S::PageUp if !repeat => MenuEvent::JumpBack,
             S::PageDown if !repeat => MenuEvent::JumpForward,
@@ -1745,6 +1852,17 @@ impl Shell {
             .then_some(recommended_kbps)
     }
 
+    /// The host and the profile Secondary would remember, from the first finding that offers
+    /// one; `None` with no answer yet or nothing offered.
+    fn speed_offered_profile(&self) -> Option<(String, String, u8)> {
+        let sp = self.speed.as_ref()?;
+        let SpeedPhase::Done { findings, .. } = &sp.phase else {
+            return None;
+        };
+        let profile = findings.iter().find_map(|f| f.profile)?;
+        Some((sp.key.clone(), sp.name.clone(), profile))
+    }
+
     /// Name of the preset this host resolves bitrate from, when that preset PINS one.
     ///
     /// The console writes the global default and has no preset editor, so a pinned
@@ -1777,7 +1895,10 @@ impl Shell {
     fn apply(&mut self, fx: Outbox) {
         for cmd in fx.cmds {
             if let ConsoleCmd::FetchLibrary { fp_hex, .. } = &cmd {
-                self.library_fp = Some(fp_hex.clone());
+                self.note_fetch(fp_hex);
+            }
+            if let ConsoleCmd::Pair { addr, port, .. } = &cmd {
+                self.pairing = Some((addr.clone(), *port));
             }
             // Gate wake in this call, like `connecting`. First WakeStatus is
             // ~100 ms–1 s away; without a placeholder the cursor keeps moving
@@ -1890,10 +2011,10 @@ impl Shell {
     }
 
     /// Back on the tab strip. The same button backs out of every screen, so exit is a
-    /// question, not a press. An Apple app and a browser page cannot close themselves:
-    /// there the press does nothing, and a TV remote's Menu is the system's (`at_root`).
+    /// question, not a press. Where the app cannot quit the press does nothing, and a TV
+    /// remote's Menu is the system's (`at_root`).
     fn ask_exit(&mut self) -> Option<MenuPulse> {
-        if matches!(self.device.platform, Platform::Apple | Platform::Web) {
+        if !self.device.platform.can_quit() {
             return Some(MenuPulse::Boundary);
         }
         let exit = crate::screens::prompt::PromptScreen::exit();
@@ -2175,6 +2296,7 @@ fn stand_in_games() -> Vec<crate::library::LibraryGame> {
         stats: None,
         running: i == 1,
         endable: false,
+        install: None,
     };
     let stores = ["steam", "lutris", "gog", "epic", "custom", "heroic"];
     let mut out: Vec<_> = (0..12)

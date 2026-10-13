@@ -483,7 +483,10 @@ pub enum DriverHealth {
     Ok {
         protocol: u32,
     },
-    /// No device interface at all: not installed, or its host process crashed.
+    /// Installed, its control interface not up yet: still starting, or a crashed host
+    /// process the next connect reloads.
+    Installed,
+    /// No adapter with the driver bound: not installed.
     Absent,
     /// The interface opens but the driver's host process never answers.
     Wedged,
@@ -684,6 +687,27 @@ pub fn gamescope_tiled_capture(route: Option<&GamescopeRoute>) -> bool {
         route,
         #[cfg(target_os = "linux")]
         gamescope::gamescope_offers_tiled_capture,
+    )
+}
+
+/// May an NVENC capture take this gamescope's NV12/P010? Same two terms as
+/// [`gamescope_hdr_available`]; `false` keeps packed RGB, which costs NVIDIA less than a
+/// planar capture composited through system RAM.
+pub fn gamescope_planar_capture(route: Option<&GamescopeRoute>) -> bool {
+    gamescope_ours_and(
+        route,
+        #[cfg(target_os = "linux")]
+        gamescope::gamescope_planar_capture_in_vram,
+    )
+}
+
+/// May a 10-bit SDR session take this gamescope's own 10-bit SDR (P010 or packed RGB under
+/// BT.709)? Same two terms as [`gamescope_hdr_available`]; `false` captures 8-bit and widens.
+pub fn gamescope_sdr10_capture(route: Option<&GamescopeRoute>) -> bool {
+    gamescope_ours_and(
+        route,
+        #[cfg(target_os = "linux")]
+        gamescope::gamescope_captures_sdr10,
     )
 }
 

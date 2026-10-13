@@ -143,6 +143,8 @@ install -Dm0644 packaging/linux/io.unom.Punktfunk.Host.desktop \
 install -Dm0755 "$TRAY_BIN"                        "$STAGE/usr/bin/punktfunk-tray"
 install -Dm0644 packaging/linux/io.unom.Punktfunk.Tray.desktop \
     "$STAGE/etc/xdg/autostart/io.unom.Punktfunk.Tray.desktop"
+install -Dm0644 packaging/linux/io.unom.Punktfunk.StartHost.desktop \
+    "$STAGE/usr/share/applications/io.unom.Punktfunk.StartHost.desktop"
 for sz in 22x22 48x48; do
   for png in packaging/linux/icons/hicolor/$sz/apps/*.png; do
     install -Dm0644 "$png" "$STAGE/usr/share/icons/hicolor/$sz/apps/$(basename "$png")"
@@ -239,7 +241,9 @@ DEPENDS="$SHDEPS, libei1, pipewire, wireplumber"
 # headless/encoding-only box can opt out with --no-install-recommends.
 # punktfunk-scripting = the plugin/script runner (host automation on bun). Recommends so it's pulled
 # by default; its systemd --user unit ships disabled (inert until you add scripts/plugins).
-RECOMMENDS="gamescope, pipewire-pulse, mesa-va-drivers, intel-media-va-driver, punktfunk-web, punktfunk-scripting"
+# punktfunk-gamescope = HDR, the real mode and the cursor in a gamescope session. Recommends because
+# the repo carries no build for Ubuntu 24.04; apt skips a recommend it can't find.
+RECOMMENDS="gamescope, punktfunk-gamescope, pipewire-pulse, mesa-va-drivers, intel-media-va-driver, punktfunk-web, punktfunk-scripting"
 SUGGESTS="kwin-wayland, mutter"
 
 INSTALLED_KB="$(du -k -s "$STAGE" | cut -f1)"

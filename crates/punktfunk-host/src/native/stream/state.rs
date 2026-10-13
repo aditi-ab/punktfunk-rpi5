@@ -123,6 +123,9 @@ pub(super) struct StreamState {
     pub(super) interval: std::time::Duration,
     pub(super) cur_node_id: u32,
     pub(super) cur_display_gen: Option<u64>,
+    /// The `punktfunk/2` stream epoch every AU from now on carries. It moves whenever the
+    /// pipeline or the mode under it changes, so a client drops what was encoded before.
+    pub(super) epoch: u8,
     /// The live output's metadata for a capture-only rebuild (`on_capture_lost`).
     #[cfg(target_os = "linux")]
     pub(super) lease: Option<crate::capture::OutputLease>,
@@ -169,6 +172,9 @@ pub(super) struct StreamState {
     /// The live encoder's framing: forwarded cursor positions map through it, and so does
     /// the input thread's absolute input. Written on every encoder open.
     pub(super) frame_map: super::super::input::FrameMap,
+    /// The session gamescope's X displays, for the clipboard. Written on every capture attach.
+    #[cfg(target_os = "linux")]
+    pub(super) gamescope_xwayland: pf_clipboard::GamescopeXwayland,
     pub(super) bringup: Arc<crate::bringup::Trace>,
     pub(super) resize_ms: Arc<AtomicU32>,
     pub(super) stats: Arc<StatsRecorder>,
@@ -237,9 +243,11 @@ impl StreamState {
     }
 
     /// Swap the built pipeline in and forget every owed AU and the last forwarded cursor shape:
-    /// a new capturer numbers its shapes from 1 again. The caller retires the old lease,
-    /// re-arms the IDR clock, and re-reads `enc_src` as its path requires.
+    /// a new capturer numbers its shapes from 1 again. The clipboard follows the new capture's
+    /// gamescope. The caller retires the old lease, re-arms the IDR clock, and re-reads
+    /// `enc_src` as its path requires.
     pub(super) fn adopt_pipeline(&mut self, p: Pipeline) {
+        self.epoch = self.epoch.wrapping_add(1);
         // A ceiling was learned from the encoder this one replaces. It survives
         // a rebuild that opens on the same source; a different geometry or
         // format is a different encoder, whose limits are unknown again.
@@ -259,16 +267,46 @@ impl StreamState {
             *fwd = super::super::cursor_fwd::CursorForwarder::new();
         }
         self.enc = p.enc;
+        self.carry_pipelining();
         self.frame = p.frame;
         self.interval = p.interval;
         self.cur_node_id = p.node_id;
         self.cur_display_gen = p.display_gen;
         #[cfg(target_os = "linux")]
         {
+            publish_gamescope_xwayland(&self.gamescope_xwayland, p.lease.as_ref());
             self.lease = p.lease;
         }
         self.inflight.clear();
         self.watchdog.on_au();
+    }
+
+    /// Close a frame whose tail never came, as the loop does at the next first chunk, before a
+    /// replacement encoder opens at `au_seq`. Left to the loop, that close would land after the
+    /// new encoder numbered its first AU, one behind the wire for the rest of the session.
+    pub(super) fn close_open_frame(&mut self) {
+        if std::mem::take(&mut self.wire_frame_open) {
+            if self.inflight.len() > 1 {
+                self.inflight.pop_front();
+            }
+            self.au_seq = self.au_seq.wrapping_add(1);
+        }
+    }
+
+    /// A fresh encoder retrieves synchronously. The session's pipelined escalation carries onto
+    /// it, or the flags claim a mode the encoder is not in and escalation never fires again.
+    pub(super) fn carry_pipelining(&mut self) {
+        if self.deescalating {
+            // The wind-back the old encoder owed: the new one is already there.
+            self.deescalating = false;
+            self.pipelined_active = false;
+            self.pipeline_asked = false;
+        } else if self.pipelined_active {
+            self.pipelined_active = self.enc.set_pipelined(true);
+        } else {
+            // A refusal was the old encoder's; this one may say yes.
+            self.pipeline_asked = false;
+        }
     }
 
     pub(super) fn adopt_reframe(&self, reframe: punktfunk_core::video_fit::Reframe) {
@@ -338,6 +376,11 @@ impl StreamState {
             ctx.compositor == pf_vdisplay::Compositor::Gamescope,
             ctx.gamescope_route.as_ref(),
         );
+        plan.sdr10_native = crate::session_plan::sdr10_native_for(
+            &plan,
+            ctx.compositor,
+            ctx.gamescope_route.as_ref(),
+        );
         if ctx.common.codec == crate::encode::Codec::PyroWave {
             plan.wire_chunk = Some(ctx.common.session.shard_payload());
         }
@@ -380,6 +423,7 @@ impl StreamState {
                             fec_target,
                             fec_requested,
                             link_kbps,
+                            delivery,
                             phase,
                             ramp_open,
                             cursor_client_draws,
@@ -417,6 +461,8 @@ impl StreamState {
             join_live,
             reframe_to: _,
             frame_map,
+            #[cfg(target_os = "linux")]
+            gamescope_xwayland,
             resize_ms,
             #[cfg(target_os = "linux")]
             input_tx,
@@ -568,6 +614,8 @@ impl StreamState {
             lease,
         } = pipe;
         *frame_map.lock().unwrap_or_else(|e| e.into_inner()) = reframe;
+        #[cfg(target_os = "linux")]
+        publish_gamescope_xwayland(&gamescope_xwayland, lease.as_ref());
         let enc_src = (frame.format, frame.width, frame.height);
         #[cfg(target_os = "linux")]
         let no_overlay_means_off_output = settle_portal_cursor(&*vd, &mut metadata_composite);
@@ -805,6 +853,7 @@ impl StreamState {
             bitrate_kbps: live_bitrate.clone(),
             link_kbps,
             link_paced: budget_identity,
+            delivery,
             bringup: bringup.clone(),
             wire_sock,
             driver_dropped: driver_dropped.clone(),
@@ -854,6 +903,7 @@ impl StreamState {
             client: client_label,
             client_name,
             plane: conn.plane(),
+            wire: conn.wire(),
             hdr: plan.hdr,
             ttff_ms: bringup.total_slot(),
             last_resize_ms: resize_ms.clone(),
@@ -891,6 +941,8 @@ impl StreamState {
             client_hdr,
             join_live,
             frame_map,
+            #[cfg(target_os = "linux")]
+            gamescope_xwayland,
             bringup,
             resize_ms,
             stats,
@@ -943,6 +995,7 @@ impl StreamState {
             interval,
             cur_node_id,
             cur_display_gen,
+            epoch: 0,
             #[cfg(target_os = "linux")]
             lease,
             enc_src,
@@ -1052,13 +1105,14 @@ impl StreamState {
             if !self.follow_source_mode()? {
                 continue;
             }
+            let (t_cap, repeat) = (tick.t_cap, tick.repeat);
             match self.encode_and_send(tick)? {
                 Flow::Next => {}
                 Flow::Continue => continue,
                 Flow::Break => break,
             }
             self.adapt_depth();
-            self.sleep_to_next(tick.t_cap);
+            self.sleep_to_next(t_cap, repeat);
         }
         self.drain();
         drop(self.frame_tx);
@@ -1155,6 +1209,22 @@ fn launch_verdict(
             &format!("Couldn't start {title} — this host had nothing to run for it."),
         ),
     }
+}
+
+/// Point the clipboard at the gamescope behind `lease`. A lease with no seat is the box's own
+/// gamescope, which the unscoped lookup finds; a non-gamescope session never reads this.
+#[cfg(target_os = "linux")]
+fn publish_gamescope_xwayland(
+    xwayland: &pf_clipboard::GamescopeXwayland,
+    lease: Option<&crate::capture::OutputLease>,
+) {
+    let seat = lease.and_then(|l| l.seat()).map(str::to_owned);
+    xwayland.set(move || {
+        pf_vdisplay::gamescope_xwayland_cursor_targets(seat.as_deref())
+            .into_iter()
+            .map(|(display, _)| display)
+            .collect()
+    });
 }
 
 /// Announce a host-local rebuild gap so the client does not score a straddling window as congestion.

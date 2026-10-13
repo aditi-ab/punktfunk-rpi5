@@ -20,6 +20,7 @@ use bytemuck::{Pod, Zeroable};
 pub mod au;
 pub mod backend;
 pub mod codec;
+pub mod pace;
 
 /// The publish cell of [`au::AuHeader::latest`]: `(generation << 40) | (seq << 8) | slot`,
 /// with `generation` 24-bit, `seq` 32-bit and `slot` 8-bit. `generation` is bumped on every
@@ -108,7 +109,7 @@ pub struct SetEncodeRequest {
     pub wire_seq_base: u32,
     /// Ordered preference, 0-terminated. [`backend`] ids.
     pub backends: [u32; 4],
-    /// Reserved; send `0`.
+    /// `SET_ENCODE_FLAG_*` bits; unknown bits are ignored.
     pub flags: u32,
     /// Pads the prefix to its 8-byte alignment (Pod forbids implicit tail padding).
     pub _pad_tail: u32,
@@ -117,6 +118,11 @@ pub struct SetEncodeRequest {
     /// which is every backend's default; an old driver reads the prefix and ignores them.
     pub knobs: EncodeKnobs,
 }
+
+/// [`SetEncodeRequest::flags`]: the display composes FP16 scRGB under SDR wide colour, and the
+/// stream is BT.709 SDR. Sent only to a driver that declared wide colour, so an older one, which
+/// would read BGRA from an FP16 surface, never sees it.
+pub const SET_ENCODE_FLAG_SDR_FP16: u32 = 1;
 
 /// Bytes of [`SetEncodeRequest`] before [`SetEncodeRequest::knobs`]: what a host older than
 /// the knobs sends, and what a driver older than them reads.
@@ -358,45 +364,87 @@ pub enum EncodeInput {
     /// Shader FP16 scRGB→P010 PQ, 10-bit 4:2:0.
     P010,
     /// Video-engine BGRA→P010, 10-bit 4:2:0 BT.709 (10-bit SDR): an 8-bit capture widened to a
-    /// Main10 stream under BT.709, no HDR volume. AMF only — NVENC widens from `Bgra` itself.
+    /// Main10 stream under BT.709, no HDR volume. AMF and QSV; NVENC widens from `Bgra` itself.
     P010Sdr,
     /// Shader FP16 scRGB→packed `R10G10B10A2` PQ BT.2020; the backend CSCs to 4:4:4 itself.
     Rgb10,
+    /// FP16 scRGB straight into the backend, which converts to BT.2020 PQ itself. AMF only.
+    Fp16,
+    /// Shader FP16 scRGB→packed `R10G10B10A2`, sRGB curve on BT.709: SDR wide colour, the
+    /// desktop's own bits past 8. NVENC; it CSCs itself, at full chroma.
+    Rgb10Wcg,
+    /// Shader FP16 scRGB→P010 BT.709 studio range: SDR wide colour for AMF and QSV.
+    P010Wcg,
     /// Shareable Y + CbCr planes plus a fence, as PyroWave's own Vulkan device imports them.
-    Planar { hdr: bool, chroma444: bool },
+    /// `hdr` is BT.2020 PQ and `wcg` BT.709 from FP16; either writes 10-bit codes into 16-bit
+    /// planes.
+    Planar {
+        hdr: bool,
+        wcg: bool,
+        chroma444: bool,
+    },
 }
 
 impl EncodeInput {
     /// The input for `backend` (the [`SetEncodeRequest::backends`] numbering) under the
-    /// request's HDR, depth and 4:4:4 flags. NVENC and AMF ingest 8-bit BGRA and convert it
-    /// themselves, which keeps the conversion off the 3D engine a game renders on. Only
-    /// NVENC ingests packed 10-bit RGB, so only it can pair HDR with full chroma; AMF and QSV
-    /// take P010 and encode 4:2:0. `ten_bit` without `hdr` is 10-bit SDR: NVENC still widens
-    /// from `Bgra`, AMF takes a BT.709 P010 (`P010Sdr`). Media Foundation takes NV12 whatever
-    /// was asked for — no vendor's MFT accepts P010, so an HDR request that reaches it
-    /// encodes 8-bit rather than failing.
+    /// request's HDR, depth and 4:4:4 flags. NVENC, AMF and QSV ingest 8-bit BGRA and convert
+    /// it themselves, which keeps the conversion off the 3D engine a game renders on. AMF does
+    /// the same for HDR from the FP16 the display composes. Only NVENC ingests packed 10-bit
+    /// RGB at full chroma; QSV takes P010 under HDR and encodes 4:2:0. `ten_bit` without
+    /// `hdr` is 10-bit SDR: NVENC still widens from `Bgra`, AMF and QSV take a BT.709 P010
+    /// (`P010Sdr`). Media Foundation takes NV12 whatever was asked for — no vendor's MFT
+    /// accepts P010, so an HDR request that reaches it encodes 8-bit rather than failing.
+    ///
+    /// `sdr_fp16` ([`SET_ENCODE_FLAG_SDR_FP16`]) means the surface is FP16 under an SDR
+    /// transfer: every input then converts from it, and `None` is a backend that cannot read
+    /// it (Media Foundation), which the open reports instead of refusing every frame.
     #[must_use]
-    pub const fn choose(backend: u32, hdr: bool, ten_bit: bool, chroma444: bool) -> Self {
-        match (backend, hdr, chroma444) {
-            (backend::PYROWAVE, _, _) => Self::Planar { hdr, chroma444 },
+    pub const fn choose(
+        backend: u32,
+        hdr: bool,
+        ten_bit: bool,
+        chroma444: bool,
+        sdr_fp16: bool,
+    ) -> Option<Self> {
+        let wcg = sdr_fp16 && !hdr;
+        Some(match (backend, hdr, chroma444) {
+            (backend::PYROWAVE, _, _) => Self::Planar {
+                hdr,
+                wcg,
+                chroma444,
+            },
+            (backend::MEDIA_FOUNDATION, _, _) if wcg => return None,
             (backend::MEDIA_FOUNDATION, _, _) => Self::Nv12,
+            (backend::NVENC, false, _) if wcg => Self::Rgb10Wcg,
+            (backend::AMF | backend::QSV, false, _) if wcg => Self::P010Wcg,
             (backend::NVENC, true, true) => Self::Rgb10,
+            (backend::AMF, true, _) => Self::Fp16,
             (_, true, _) => Self::P010,
             (backend::NVENC, false, _) => Self::Bgra,
-            (backend::AMF, false, _) if ten_bit => Self::P010Sdr,
-            (backend::AMF, false, _) => Self::Bgra,
+            (backend::AMF | backend::QSV, false, _) if ten_bit => Self::P010Sdr,
+            (backend::AMF | backend::QSV, false, _) => Self::Bgra,
+            _ if wcg => return None,
             _ => Self::Nv12,
-        }
+        })
     }
 
-    /// What `backend` opens with after it refused `self`. Only AMF's BGRA has a second
-    /// choice: a VCN or runtime that declines it still encodes the video engine's NV12.
+    /// What `backend` opens with after it refused `self`. Only AMF's and QSV's RGB inputs
+    /// have a second choice: an encoder that declines one still encodes the YUV converted
+    /// for it.
     #[must_use]
     pub const fn fallback(self, backend: u32) -> Option<Self> {
         match (backend, self) {
-            (backend::AMF, Self::Bgra) => Some(Self::Nv12),
+            (backend::AMF | backend::QSV, Self::Bgra) => Some(Self::Nv12),
+            (backend::AMF, Self::Fp16) => Some(Self::P010),
             _ => None,
         }
+    }
+
+    /// The backend reads the format the display composes, so no converter runs and the
+    /// acquired surface itself can be the encoder's input ([`zero_copy`]).
+    #[must_use]
+    pub const fn composed(self) -> bool {
+        matches!(self, Self::Bgra | Self::Fp16)
     }
 
     /// Full chroma reaches the backend: packed RGB, or planes built at full resolution.
@@ -406,6 +454,8 @@ impl EncodeInput {
             self,
             Self::Bgra
                 | Self::Rgb10
+                | Self::Rgb10Wcg
+                | Self::Fp16
                 | Self::Planar {
                     chroma444: true,
                     ..
@@ -555,18 +605,20 @@ pub fn offer_slot(
 }
 
 /// Whether a session's encoder reads the acquired surface itself instead of a copy of it.
-/// Only a BGRA input can: every other kind needs its converter. On by default for AMF
-/// alone, where the copy runs on the 3D engine a game renders on. `knob` is
-/// `PFVD_POOL_BYPASS`: `0` turns it off, any other value turns it on for every backend.
+/// Only a `composed` input ([`EncodeInput::composed`]) can: every other kind needs its
+/// converter. On by default for AMF and QSV, where the copy runs on the 3D engine a game
+/// renders on. `knob` is `PFVD_POOL_BYPASS`: `0` turns it off, any other value turns it on
+/// for every backend.
 ///
 /// The driver's pool is Windows-only; the rule lives here so it is covered everywhere.
 #[must_use]
-pub fn zero_copy(backend: u32, bgra: bool, knob: Option<&str>) -> bool {
-    bgra && match knob.map(str::trim) {
-        Some("0") => false,
-        Some(_) => true,
-        None => backend == backend::AMF,
-    }
+pub fn zero_copy(backend: u32, composed: bool, knob: Option<&str>) -> bool {
+    composed
+        && match knob.map(str::trim) {
+            Some("0") => false,
+            Some(_) => true,
+            None => matches!(backend, backend::AMF | backend::QSV),
+        }
 }
 
 /// [`IOCTL_ENCODE_CTL`] input: one op against one monitor's live encoder. Unused `arg*` /
@@ -779,7 +831,7 @@ mod tests {
     /// the client's Welcome — still said 4:4:4.
     #[test]
     fn a_444_request_picks_a_full_chroma_input() {
-        use super::EncodeInput::{Bgra, Nv12, P010Sdr, Planar, Rgb10, P010};
+        use super::EncodeInput::{Bgra, Fp16, P010Sdr, Planar, Rgb10, P010};
 
         // (backend, hdr, ten_bit, chroma444) -> input. HDR implies ten_bit; 10-bit SDR is
         // ten_bit without hdr.
@@ -789,42 +841,84 @@ mod tests {
             ((1, false, false, true), Bgra),
             ((1, true, true, false), P010),
             ((1, true, true, true), Rgb10),
-            ((2, true, true, true), P010),
+            ((2, true, true, true), Fp16), // AMF HDR: VCN converts, and encodes 4:2:0
+            ((2, true, true, false), Fp16),
+            ((3, true, true, false), P010),
             ((2, false, true, false), P010Sdr), // AMF 10-bit SDR: BT.709 P010
             ((2, false, false, false), Bgra),   // AMF 8-bit SDR: VCN converts
-            ((3, false, false, false), Nv12),   // QSV 8-bit SDR
-            ((3, false, false, true), Nv12),
-            ((3, false, true, true), Nv12), // QSV 10-bit SDR not wired: 8-bit NV12
+            ((3, false, false, false), Bgra),   // QSV 8-bit SDR: the encoder converts
+            ((3, false, false, true), Bgra),
+            ((3, false, true, true), P010Sdr), // QSV 10-bit SDR: BT.709 P010
             (
                 (4, true, true, true),
                 Planar {
                     hdr: true,
+                    wcg: false,
                     chroma444: true,
                 },
             ),
         ];
         for ((backend, hdr, ten_bit, chroma444), want) in table {
-            let got = EncodeInput::choose(backend, hdr, ten_bit, chroma444);
+            let got = EncodeInput::choose(backend, hdr, ten_bit, chroma444, false);
             assert_eq!(
-                got, want,
+                got,
+                Some(want),
                 "backend {backend} hdr {hdr} 10bit {ten_bit} 444 {chroma444}"
             );
         }
         for backend in [1, 4] {
-            for hdr in [false, true] {
+            for (hdr, sdr_fp16) in [(false, false), (true, false), (false, true)] {
                 assert!(
-                    EncodeInput::choose(backend, hdr, hdr, true).full_chroma(),
-                    "backend {backend} hdr {hdr} asked 4:4:4 and got a subsampled input"
+                    EncodeInput::choose(backend, hdr, true, true, sdr_fp16)
+                        .is_some_and(EncodeInput::full_chroma),
+                    "backend {backend} hdr {hdr} fp16 {sdr_fp16} asked 4:4:4 and got a \
+                     subsampled input"
                 );
             }
         }
     }
 
-    /// Only AMF's BGRA has a second input, and it is the one AMF opened with before.
+    /// An FP16 SDR desktop must reach every backend through a converter that reads FP16, never
+    /// a BGRA input the pool would refuse frame by frame, and HDR still wins over the flag.
     #[test]
-    fn only_amf_bgra_falls_back() {
-        use super::EncodeInput::{Bgra, Nv12, P010Sdr, P010};
+    fn an_fp16_sdr_desktop_picks_an_fp16_input_or_none() {
+        use super::EncodeInput::{P010Wcg, Planar, Rgb10, Rgb10Wcg, P010};
+        let fp16 =
+            |backend, hdr, chroma444| EncodeInput::choose(backend, hdr, true, chroma444, true);
+        assert_eq!(fp16(1, false, false), Some(Rgb10Wcg));
+        assert_eq!(fp16(1, false, true), Some(Rgb10Wcg));
+        assert_eq!(fp16(2, false, false), Some(P010Wcg));
+        assert_eq!(fp16(3, false, false), Some(P010Wcg));
+        assert_eq!(
+            fp16(4, false, false),
+            Some(Planar {
+                hdr: false,
+                wcg: true,
+                chroma444: false
+            })
+        );
+        assert_eq!(
+            fp16(5, false, false),
+            None,
+            "Media Foundation reads no FP16"
+        );
+        assert_eq!(fp16(1, true, true), Some(Rgb10), "HDR wins over the flag");
+        assert_eq!(fp16(3, true, false), Some(P010));
+        for kind in [Rgb10Wcg, P010Wcg] {
+            assert!(!kind.composed(), "{kind:?} needs its converter");
+            assert_eq!(kind.fallback(2), None);
+        }
+    }
+
+    /// Only AMF's and QSV's RGB inputs have a second one: the YUV the converter kinds deliver.
+    #[test]
+    fn only_amf_and_qsv_rgb_inputs_fall_back() {
+        use super::EncodeInput::{Bgra, Fp16, Nv12, P010Sdr, P010};
         assert_eq!(Bgra.fallback(2), Some(Nv12));
+        assert_eq!(Bgra.fallback(3), Some(Nv12));
+        assert_eq!(P010.fallback(3), None);
+        assert_eq!(Fp16.fallback(2), Some(P010));
+        assert!(Bgra.composed() && Fp16.composed() && !P010.composed());
         assert_eq!(
             Bgra.fallback(1),
             None,
@@ -836,9 +930,10 @@ mod tests {
     }
 
     #[test]
-    fn zero_copy_defaults_to_amf_bgra() {
-        use super::backend::{AMF, NVENC};
+    fn zero_copy_defaults_to_amf_and_qsv() {
+        use super::backend::{AMF, NVENC, QSV};
         assert!(zero_copy(AMF, true, None));
+        assert!(zero_copy(QSV, true, None));
         assert!(!zero_copy(NVENC, true, None));
         assert!(!zero_copy(AMF, true, Some("0")));
         assert!(zero_copy(NVENC, true, Some("1")));

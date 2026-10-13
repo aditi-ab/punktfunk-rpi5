@@ -27,6 +27,21 @@ mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::send_uso_all;
 
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_family = "wasm"))
+))]
+#[cfg(feature = "quic")]
+pub(crate) use apple::wait_readable;
+/// Block until `socket` is readable or `timeout` passes; `true` when readable. The shared
+/// socket's reader waits here, since quinn-udp keeps the socket non-blocking.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(feature = "quic")]
+pub(crate) use linux::wait_readable;
+#[cfg(target_os = "windows")]
+#[cfg(feature = "quic")]
+pub(crate) use windows::wait_readable;
+
 /// One past [`MAX_DATAGRAM_BYTES`]. `Config::validate` keeps a well-formed datagram
 /// (header + shard + crypto) inside that bound; a full read is oversized, not truncated.
 const RECV_BUF: usize = MAX_DATAGRAM_BYTES + 1;
@@ -244,6 +259,12 @@ impl UdpTransport {
                 {
                     break
                 }
+                // A datagram past `buf` (Windows WSAEMSGSIZE, 10040), a stale ICMP or a signal:
+                // not the punch either, and the deadline still bounds the wait.
+                Err(e)
+                    if (cfg!(windows) && e.raw_os_error() == Some(10040))
+                        || e.kind() == std::io::ErrorKind::Interrupted
+                        || is_transient_io(&e) => {}
                 Err(e) => return Err(e),
             }
         }

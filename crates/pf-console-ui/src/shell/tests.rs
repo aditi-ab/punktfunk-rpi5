@@ -333,6 +333,16 @@ fn a_root_with_nothing_to_focus_parks_focus_on_the_strip() {
     assert!(!s.strip_focus, "the root's targets take it back");
 }
 
+/// Controller rumble off keeps the console's own pulses off the pad; the move still lands.
+#[test]
+fn rumble_off_silences_menu_pulses() {
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.sync();
+    s.settings.pad_rumble = false;
+    assert!(s.handle_menu(MenuEvent::Move(MenuDir::Up)).is_none());
+    assert!(s.strip_focus, "up from the host row still lands on its tab");
+}
+
 /// Up that a root screen bumps reaches its tab.
 #[test]
 fn a_bumped_up_at_a_root_reaches_the_strip() {
@@ -490,6 +500,7 @@ fn down_from_a_card_lands_on_its_games_and_launches_there() {
         stats: None,
         running: false,
         endable: false,
+        install: None,
     }]);
     frame(&mut s);
     let below = |s: &Shell| matches!(s.stack.last(), Some(Screen::Home(h)) if h.shelf().is_some());
@@ -507,6 +518,81 @@ fn down_from_a_card_lands_on_its_games_and_launches_there() {
         }
         _ => panic!("OK on the games launches the title"),
     }
+}
+
+/// A shelf pushed with its fetch never adopts the list the model still holds: until the
+/// platform answers, that list is the previous host's.
+#[test]
+fn a_fetch_clears_the_previous_hosts_list() {
+    let (mut s, _console, library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    library.set_games(vec![crate::library::LibraryGame {
+        id: "steam:570".into(),
+        title: "Dota 2".into(),
+        store: "steam".into(),
+        launcher: false,
+        icon: String::new(),
+        platform: None,
+        developer: None,
+        year: None,
+        genres: Vec::new(),
+        stats: None,
+        running: false,
+        endable: false,
+        install: None,
+    }]);
+    s.sync();
+    let snap = library.snapshot();
+    assert!(matches!(snap.phase, crate::library::LibraryPhase::Loading));
+    assert!(snap.games.is_empty());
+}
+
+/// A woken host connects once, though the service clears its status only at its next
+/// bus drain.
+#[test]
+fn a_woken_host_connects_once() {
+    let host = hosts().remove(0);
+    let (mut s, console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    console.set_wake(Some(crate::model::WakeStatus {
+        key: host.key.clone(),
+        name: host.name.clone(),
+        seconds: 12,
+        timed_out: false,
+        online: true,
+        then_connect: true,
+    }));
+    for _ in 0..5 {
+        s.sync();
+    }
+    let launches = std::iter::from_fn(|| s.take_action())
+        .filter(|a| matches!(a, OverlayAction::Launch { .. }))
+        .count();
+    assert_eq!(launches, 1);
+}
+
+/// A pairing result belongs to the host the PIN went to: another host's Pair screen on
+/// top neither shows it nor closes on it.
+#[test]
+fn a_pairing_result_stays_with_its_own_host() {
+    let rows = hosts();
+    let (a, b) = (rows[0].clone(), rows[1].clone());
+    let (mut s, console, _library) = shell(vec![
+        Screen::Home(HomeScreen::new()),
+        Screen::Pair(crate::screens::pair::PairScreen::new(&b, "deck")),
+    ]);
+    s.pairing = Some((a.addr.clone(), a.port));
+    console.set_pair(PairPhase::Paired { key: a.key.clone() });
+    s.sync();
+    assert!(
+        matches!(s.stack.last(), Some(Screen::Pair(_))),
+        "B's screen stays"
+    );
+    s.pairing = Some((b.addr.clone(), b.port));
+    console.set_pair(PairPhase::Paired { key: b.key.clone() });
+    s.sync();
+    assert!(
+        !matches!(s.stack.last(), Some(Screen::Pair(_))),
+        "its own result closes it"
+    );
 }
 
 /// Y on a pinned card must carry that preset into the library. Falling back to the
@@ -555,6 +641,7 @@ fn a_pinned_cards_library_launches_with_its_preset() {
         stats: None,
         running: false,
         endable: false,
+        install: None,
     }]);
     // Down past the Desktops band, which arrives focused and launches nothing.
     s.handle_menu(MenuEvent::Move(MenuDir::Down));
@@ -592,6 +679,7 @@ fn a_primary_tiles_library_leaves_the_preset_to_the_binding() {
         stats: None,
         running: false,
         endable: false,
+        install: None,
     }]);
     s.handle_menu(MenuEvent::Confirm);
     assert!(matches!(
@@ -783,6 +871,32 @@ fn the_licences_page_through_a_hosts_notices() {
     assert!(matches!(s.stack.last(), Some(Screen::Home(_))));
 }
 
+/// The stream controls draw without a host, and a pad leaves them with B.
+#[test]
+fn the_stream_controls_draw_and_a_pad_leaves_them() {
+    let fonts = crate::theme::build_fonts().unwrap();
+    let mut surface = skia_safe::surfaces::raster_n32_premul((1280, 800)).unwrap();
+    let mut settings = pf_client_core::trust::Settings::default();
+    let lib = crate::library::LibraryShared::default();
+    let controls = crate::screens::licenses::LicensesScreen::controls(&crate::screens::Ctx::test(
+        &mut settings,
+        &lib,
+    ))
+    .expect("a desktop has controls");
+    let (mut s, _console, _library) = shell(vec![
+        Screen::Home(HomeScreen::new()),
+        Screen::Licenses(controls),
+    ]);
+    s.render(surface.canvas(), 1280, 800, &fonts, None, None, &[]);
+    let Some(Screen::Licenses(l)) = s.stack.last() else {
+        panic!("the controls are on top");
+    };
+    assert!(!l.waiting() && l.title() == "Stream controls");
+    s.handle_menu(MenuEvent::Back);
+    finish_motion(&mut s);
+    assert!(matches!(s.stack.last(), Some(Screen::Home(_))));
+}
+
 /// The host's test mode follows the test screen: on while it is on top, drawn from the
 /// host's readings, and off again once a held B takes it away.
 #[test]
@@ -888,6 +1002,24 @@ fn a_search_and_its_empty_result_raster() {
         panic!("the results replace the search");
     };
     assert!(shelf.no_match());
+}
+
+/// A hardware Space types through TextInput alone. As Confirm it also typed the
+/// keyboard's focused key.
+#[test]
+fn a_hardware_space_types_one_space() {
+    let host = hosts().remove(0);
+    let search = crate::screens::search::SearchScreen::new(&host, &Default::default());
+    let (mut s, _console, _library) = shell(vec![
+        Screen::Home(HomeScreen::new()),
+        Screen::Search(search),
+    ]);
+    s.text_input("hollow");
+    s.key(crate::input::Key::Space, false, false);
+    s.text_input(" ");
+    s.text_input("knight");
+    let typed = s.edit_field().map(|f| f.text);
+    assert_eq!(typed.as_deref(), Some("hollow knight"));
 }
 
 #[test]
@@ -1335,6 +1467,7 @@ fn mixed_library(library: &LibraryShared) {
             stats: None,
             running: false,
             endable: false,
+            install: None,
         }
     };
     library.set_games(vec![
@@ -1783,6 +1916,7 @@ mod launch_hold {
             stats: None,
             running: false,
             endable: false,
+            install: None,
         }
     }
 
@@ -1861,11 +1995,13 @@ mod launch_hold {
             "platform, year, store — this mock has no year"
         );
 
-        // Nothing to ask the host until there is a session behind the launch.
+        // Before the dial lands the host may be fetching the title: the hold watches for that.
         s.sync();
         assert!(
-            bus.drain().is_empty(),
-            "no lease exists before the dial lands"
+            bus.drain()
+                .iter()
+                .any(|c| matches!(c, ConsoleCmd::RefreshRunning { .. })),
+            "the hold asks from the press"
         );
 
         s.session_streaming();
@@ -1997,6 +2133,60 @@ mod launch_hold {
         assert!(s.in_stream, "no window by the cap: show what is there");
     }
 
+    fn downloading(id: &str, state: &str) -> Vec<pf_client_core::library::DownloadProgress> {
+        vec![pf_client_core::library::DownloadProgress {
+            app_id: id.into(),
+            state: state.into(),
+            done_bytes: 5,
+            total_bytes: Some(10),
+            error: Some("the server is down".into()),
+            ..Default::default()
+        }]
+    }
+
+    /// The host fetches a title's files before it opens the stream: the hold shows them coming,
+    /// with no cap, and nothing read meanwhile counts as this launch's answer.
+    #[test]
+    fn a_title_still_downloading_holds_with_its_progress() {
+        let (mut s, library, _bus) = on_shelf();
+        s.start_connect(intent("steam:570"));
+        library.set_downloads(&downloading("steam:570", "downloading"), None);
+        library.set_running(&running("steam:570", "launching"));
+        at(&mut s, 100.0 + LAUNCH_HOLD_MAX * 3.0);
+        s.sync();
+        let l = s.launching.as_ref().expect("still holding");
+        assert_eq!(l.download.as_ref().map(|d| d.done_bytes), Some(5));
+        assert!(l.failed.is_none(), "no cap runs while the files come");
+
+        library.set_downloads(&[], None);
+        s.session_streaming();
+        assert!(s.launching.as_ref().is_some_and(|l| l.download.is_none()));
+        s.sync();
+        assert!(
+            s.holds_stream(),
+            "the pre-dial `launching` is not this session's"
+        );
+        library.set_running(&running("steam:570", "running"));
+        s.sync();
+        assert!(s.in_stream);
+    }
+
+    /// A download that stopped is why nothing started: the hold says so at once, rather than
+    /// waiting out the no-lease clock.
+    #[test]
+    fn a_download_that_stopped_is_the_holds_sentence() {
+        let (mut s, library, _bus) = on_shelf();
+        s.start_connect(intent("steam:570"));
+        s.session_streaming();
+        library.set_downloads(&downloading("steam:570", "failed"), None);
+        library.set_running(&[]);
+        s.sync();
+        assert_eq!(
+            s.launching.as_ref().and_then(|l| l.failed.as_deref()),
+            Some("Dota 2 didn't download \u{2014} the server is down")
+        );
+    }
+
     #[test]
     fn launcher_tiles_skip_the_hold_and_a_press_ends_it() {
         let (mut s, _library, _bus) = on_shelf();
@@ -2022,6 +2212,47 @@ mod launch_hold {
     }
 }
 
+/// A finding that names a profile is what offers paced delivery, for the tested host and
+/// that profile; a clean check, or one whose findings name none, offers nothing.
+#[test]
+fn a_finding_offers_paced_delivery_for_the_host() {
+    let done = |findings| SpeedPhase::Done {
+        throughput_kbps: 940_000,
+        wall: true,
+        clean: Some(crate::model::CleanRound {
+            rate_kbps: 470_000,
+            loss_pct: 0.0,
+            jitter_us: 300,
+        }),
+        recommended_kbps: 658_000,
+        findings,
+    };
+    let row = |id, profile| crate::model::FindingRow {
+        id,
+        severity: 2,
+        numbers: [2500, 1000, 200],
+        profile,
+    };
+    for (findings, want) in [
+        (vec![], None),
+        (vec![row(7, None)], None),
+        (
+            vec![row(7, None), row(1, Some(1))],
+            Some(("aa11".to_string(), "Living Room PC".to_string(), 1)),
+        ),
+    ] {
+        let (mut s, console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+        console.set_hosts(hosts());
+        console.set_speed(Some(SpeedStatus::new(
+            "aa11".into(),
+            "Living Room PC".into(),
+        )));
+        console.advance_speed("aa11", done(findings));
+        s.sync();
+        assert_eq!(s.speed_offered_profile(), want);
+    }
+}
+
 /// The console writes the GLOBAL bitrate and has no preset editor, so a measurement is only
 /// applicable when the tested host actually resolves bitrate from that layer. A preset that
 /// PINS one makes the answer read-only; a preset that inherits does not.
@@ -2029,8 +2260,14 @@ mod launch_hold {
 fn apply_is_offered_only_when_the_default_is_the_layer_that_wins() {
     let done = SpeedPhase::Done {
         throughput_kbps: 100_000,
-        loss_pct: 0.3,
+        wall: true,
+        clean: Some(crate::model::CleanRound {
+            rate_kbps: 50000,
+            loss_pct: 0.3,
+            jitter_us: 300,
+        }),
         recommended_kbps: 70_000,
+        findings: vec![],
     };
     let chip = |bitrate_kbps| {
         Some(crate::model::PresetChip {
@@ -2084,8 +2321,14 @@ fn progress_reports_trace_the_burst() {
 
     let done = SpeedPhase::Done {
         throughput_kbps: 840_000,
-        loss_pct: 0.1,
+        wall: true,
+        clean: Some(crate::model::CleanRound {
+            rate_kbps: 420000,
+            loss_pct: 0.1,
+            jitter_us: 300,
+        }),
         recommended_kbps: 588_000,
+        findings: vec![],
     };
     console.advance_speed("aa11", done.clone());
     console.advance_speed("aa11", SpeedPhase::Progress { kbps: 1 });
@@ -2113,8 +2356,14 @@ fn a_dismissed_speed_test_drops_its_late_result() {
         "aa11",
         SpeedPhase::Done {
             throughput_kbps: 100_000,
-            loss_pct: 0.0,
+            wall: true,
+            clean: Some(crate::model::CleanRound {
+                rate_kbps: 50000,
+                loss_pct: 0.0,
+                jitter_us: 300,
+            }),
             recommended_kbps: 70_000,
+            findings: vec![],
         },
     );
     s.sync();
@@ -2133,8 +2382,14 @@ fn a_superseded_speed_test_cannot_report_under_the_new_host() {
         "aa11",
         SpeedPhase::Done {
             throughput_kbps: 100_000,
-            loss_pct: 0.0,
+            wall: true,
+            clean: Some(crate::model::CleanRound {
+                rate_kbps: 50000,
+                loss_pct: 0.0,
+                jitter_us: 300,
+            }),
             recommended_kbps: 70_000,
+            findings: vec![],
         },
     );
     s.sync();
@@ -2345,6 +2600,7 @@ fn dump_phone_home() {
             stats: None,
             running: false,
             endable: false,
+            install: None,
         })
         .collect();
     library.set_games(games);
@@ -2405,8 +2661,14 @@ fn dump_phone_home() {
         "aa11",
         SpeedPhase::Done {
             throughput_kbps: 842_000,
-            loss_pct: 0.3,
+            wall: true,
+            clean: Some(crate::model::CleanRound {
+                rate_kbps: 421000,
+                loss_pct: 0.3,
+                jitter_us: 300,
+            }),
             recommended_kbps: 589_400,
+            findings: vec![],
         },
     );
     dump(&mut s, 30, "pf-speed-done");

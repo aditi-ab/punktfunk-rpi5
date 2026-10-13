@@ -58,7 +58,7 @@ Each session gets its own display at the client's resolution and refresh rate �
 
 | Host | Input backend | Approval dialog | Client-drawn cursor | HDR10 source |
 |---|---|---|---|---|
-| Windows | SendInput | none ¹ | ✅ ² | ✅ ³ |
+| Windows | virtual HID device ¹¹ | none ¹ | ✅ ² | ✅ ³ |
 | KDE Plasma (KWin) | KWin fake input | none ⁴ | ✅ | ❌ ⁵ |
 | GNOME (Mutter) | libei, direct to Mutter | none | ✅ ⁶ | ⚠️ ⁷ |
 | gamescope | libei (gamescope's own) | none | ⚠️ ⁸ | ⚠️ ⁹ |
@@ -83,6 +83,9 @@ Each session gets its own display at the client's resolution and refresh rate �
 9. Needs the patched `punktfunk-gamescope` and a session this host started or manages; an attached
    session streams SDR. See [HDR on gamescope](/docs/gamescope#hdr-on-gamescope).
 10. Their portals offer no separate cursor, so the pointer is always part of the video.
+11. Mouse and keyboard reach Windows as a USB-style HID device, so games that refuse injected input
+    take them. Text, touch and pen use `SendInput` and synthetic pointers. A seat host, and a point
+    off the primary monitor, use `SendInput` too.
 
 ### Version floors worth knowing
 
@@ -127,7 +130,8 @@ Each session gets its own display at the client's resolution and refresh rate �
    VAAPI. **Vulkan encoding** in
    [Host → Settings](/docs/configuration#settings-in-the-web-console) turns this backend off.
 8. [PyroWave](/docs/pyrowave) runs only when the client picks it. Full chroma on any vendor; modes
-   around 8K fall back to 4:2:0. 10-bit SDR on Linux only. Not in Windows ARM64 builds.
+   around 8K fall back to 4:2:0. 10-bit SDR on Linux, and on Windows 11 24H2 and later. Not in
+   Windows ARM64 builds.
 9. Only with `PUNKTFUNK_ENCODER=software`; `auto` never picks it on Linux.
 
 HEVC 4:4:4 means an NVIDIA host, or pick PyroWave. Asking for 4:4:4 is a client setting, off by
@@ -194,7 +198,8 @@ decoders, with openh264 and rav1d as the software floor on the desktop.
    offered when the GPU passes its probe.
 3. HDR is on by default. Linux presents HDR10 where the desktop offers it and tone-maps otherwise;
    Windows asks for HDR only when the selected output is in HDR mode. The software decoder refuses
-   10-bit. 10-bit SDR is a client setting.
+   10-bit. 10-bit SDR is a client setting the host must
+   [allow](/docs/hdr#10-bit-sdr).
 4. Opt-in **Full chroma**, off by default. The client asks for 4:4:4 only when its GPU
    hardware-decodes 4:4:4 HEVC, in practice NVIDIA; PyroWave needs no probe. There is no software
    fallback. The Detailed [stats overlay](/docs/stats) shows `4:4:4→4:2:0` when the host declined.

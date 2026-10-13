@@ -49,7 +49,12 @@ export const expandHome = (p: string, home: string): string =>
 export interface GrantedRoot {
 	path: string;
 	write: boolean;
+	/** Links the plugin asked through, each with the path under this root it resolves to. */
+	links?: { path: string; target: string }[];
 }
+
+/** `p` is `base` or inside it. */
+const under = (p: string, base: string): boolean => p === base || p.startsWith(`${base}/`);
 
 export interface SandboxPaths {
 	/** Where this plugin's own files live, bound read-write. */
@@ -66,7 +71,26 @@ export interface SandboxPaths {
 	home: string;
 	/** A plugin without network: the runner's dir its UI socket goes in, and the forwarded port. */
 	ui?: { dir: string; port: number };
+	/** The host's `/home` when it is a link ({@link homeLink}), mirrored inside. */
+	homeLink?: HomeLink;
 }
+
+/** A link at `path` holding `target` and resolving to `real`: Fedora Atomic's `/home` → `var/home`. */
+export interface HomeLink {
+	path: string;
+	target: string;
+	real: string;
+}
+
+/** `p` when it is a link, else `undefined`. */
+export const homeLink = (p = "/home"): HomeLink | undefined => {
+	try {
+		if (!fs.lstatSync(p).isSymbolicLink()) return undefined;
+		return { path: p, target: fs.readlinkSync(p), real: fs.realpathSync(p) };
+	} catch {
+		return undefined;
+	}
+};
 
 /**
  * The `bwrap` argv for one plugin: everything before the program it runs.
@@ -74,6 +98,11 @@ export interface SandboxPaths {
  * Read-only for the system, the plugin's own code, manifest `reads`, and granted roots; read-write
  * for exactly its state dir, manifest `writes`, grants marked `write: true`, and `/tmp` (VirtualHere's
  * client IPC is a FIFO pair there, which is why the unit keeps the real `/tmp`).
+ *
+ * The host's `/home` link is mirrored and every host path binds where it resolves, so a canonical
+ * grant and a launcher's `$HOME` path both resolve, and `realpath` inside agrees with the host.
+ * A link the plugin asked through into a grant (`~/Games/SteamLibrary` → `/mnt/ssd/games`) is
+ * recreated the same way.
  */
 /**
  * The namespaces and the minimal root every sandbox gets, shared with {@link sandboxProbe} so a
@@ -141,10 +170,17 @@ export const bwrapArgv = (
 		argv.push("--setenv", k, v);
 	}
 	if (manifest.network) argv.push("--share-net");
+	// Before any bind: a bind under the link's spelling would make it a directory.
+	const link = paths.homeLink;
+	if (link) argv.push("--symlink", link.target, link.path);
+	const at = (p: string): string =>
+		link && (p === link.path || p.startsWith(`${link.path}/`))
+			? link.real + p.slice(link.path.length)
+			: p;
 	// Its own code, its own state, its own token, and the way to the host.
-	argv.push("--ro-bind", paths.pluginsDir, paths.pluginsDir);
-	argv.push("--ro-bind", paths.bun, paths.bun);
-	argv.push("--ro-bind", paths.runner, paths.runner);
+	argv.push("--ro-bind", paths.pluginsDir, at(paths.pluginsDir));
+	argv.push("--ro-bind", paths.bun, at(paths.bun));
+	argv.push("--ro-bind", paths.runner, at(paths.runner));
 	// A Nix-built bun loads its libc from the store, and NixOS tools live under the system
 	// profile. Both are world-readable already.
 	if (paths.bun.startsWith("/nix/store/")) {
@@ -168,19 +204,56 @@ export const bwrapArgv = (
 	// than a sandbox that refuses to start.
 	for (const p of manifest.reads ?? []) {
 		const abs = expandHome(p, paths.home);
-		if (bindable(abs, paths.home)) argv.push("--ro-bind-try", abs, abs);
+		if (bindable(abs, paths.home)) argv.push("--ro-bind-try", abs, at(abs));
 	}
 	for (const p of manifest.writes ?? []) {
 		const abs = expandHome(p, paths.home);
-		if (bindable(abs, paths.home)) argv.push("--bind-try", abs, abs);
+		if (bindable(abs, paths.home)) argv.push("--bind-try", abs, at(abs));
 	}
 	// Operator grants are read-only unless one opts into write.
 	for (const grant of grants) {
 		const abs = expandHome(grant.path, paths.home);
 		if (bindable(abs, paths.home))
-			argv.push(grant.write ? "--bind-try" : "--ro-bind-try", abs, abs);
+			argv.push(grant.write ? "--bind-try" : "--ro-bind-try", abs, at(abs));
+	}
+	// bwrap fails on a link it can't place, so none lands on, in or above anything placed.
+	const placed = destinations(argv);
+	for (const grant of grants) {
+		if (!bindable(expandHome(grant.path, paths.home), paths.home)) continue;
+		for (const link of grant.links ?? []) {
+			const dest = at(link.path);
+			if (link.path !== path.resolve(link.path) || !bindable(link.path, paths.home)) continue;
+			if (placed.some((p) => under(p, dest) || under(dest, p))) continue;
+			argv.push("--symlink", link.target, dest);
+			placed.push(dest);
+		}
 	}
 	return argv;
+};
+
+/** Each bwrap op this file emits: how many arguments it takes, and whether the last is a path inside. */
+const OPS: Record<string, [number, boolean]> = {
+	"--setenv": [2, false],
+	"--add-seccomp-fd": [1, false],
+	"--proc": [1, true],
+	"--dev": [1, true],
+	"--tmpfs": [1, true],
+	"--ro-bind": [2, true],
+	"--ro-bind-try": [2, true],
+	"--bind": [2, true],
+	"--bind-try": [2, true],
+	"--symlink": [2, true],
+};
+
+/** Every path `argv` puts something at inside the sandbox. */
+const destinations = (argv: readonly string[]): string[] => {
+	const out: string[] = [];
+	for (let i = 0; i < argv.length; i++) {
+		const [n, places] = OPS[argv[i] as string] ?? [0, false];
+		if (places) out.push(argv[i + n] as string);
+		i += n;
+	}
+	return out;
 };
 
 /**
@@ -279,8 +352,9 @@ export const sandboxEnv = (
 
 /**
  * The operator's extra roots for `id` from `plugin-run/plugin-grants.json`. Accepts a legacy array
- * (read-only grants) and a `{ grants: [{ path, write }] }` record. Anything else — malformed JSON,
- * a missing entry, a shape that does not parse strictly — grants nothing.
+ * (read-only grants) and a `{ grants: [{ path, write }], links: { link: target } }` record; each
+ * link joins the grant its target is in. Anything else — malformed JSON, a missing entry, grants
+ * that do not parse strictly — grants nothing, and a malformed link is dropped alone.
  */
 export const grantedRoots = (configDir: string, id: string): GrantedRoot[] => {
 	try {
@@ -306,7 +380,17 @@ export const grantedRoots = (configDir: string, id: string): GrantedRoot[] => {
 			)
 		)
 			return [];
-		return grants as GrantedRoot[];
+		const raw = (entry as { links?: unknown }).links;
+		const links =
+			typeof raw === "object" && raw !== null && !Array.isArray(raw)
+				? Object.entries(raw).filter((l): l is [string, string] => typeof l[1] === "string")
+				: [];
+		return (grants as GrantedRoot[]).map((g) => {
+			const into = links
+				.filter(([, target]) => under(target, g.path))
+				.map(([p, target]) => ({ path: p, target }));
+			return into.length > 0 ? { ...g, links: into } : g;
+		});
 	} catch {
 		return [];
 	}

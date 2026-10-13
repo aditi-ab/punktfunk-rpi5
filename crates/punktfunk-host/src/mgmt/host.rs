@@ -127,6 +127,16 @@ pub(crate) struct RuntimeStatus {
     session_id: Option<u64>,
     /// Launched titles: live sessions plus `state: "grace"` reconnect-window rows. Empty for a desktop-only stream.
     games: Vec<ActiveGame>,
+    /// Titles downloading, queued, paused, or finished in the last ten minutes. A launch hold
+    /// joins its title's row by `app_id`. Absent when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schema(required = false)]
+    downloads: Vec<crate::library::downloads::Download>,
+    /// The calling device's live access grants (`GRANT_*` bits); 0 once expired. Absent for
+    /// the operator, who may do everything.
+    #[schema(value_type = u32, required = false)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grants: Option<u32>,
     /// Windows audio-wiring verdict; absent off-Windows and before the first pass. Present while idle.
     #[serde(skip_serializing_if = "Option::is_none")]
     audio: Option<AudioWiring>,
@@ -383,6 +393,11 @@ pub(crate) struct SessionRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<u64>,
     plane: crate::events::Plane,
+    /// The punktfunk protocol the session speaks, `1` or `2`. Absent on the compat plane.
+    // `value_type`: an `Option<u8>` alone generates as `never` in the SDK.
+    #[schema(value_type = u32, required = false)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wire: Option<u8>,
     /// Fingerprint prefix, or peer IP for an anonymous client.
     client: String,
     /// Display name (trust store, else the name the client sent). `null` if nameless.
@@ -635,6 +650,14 @@ pub(crate) async fn get_status(
     // Native plane, published by the video loop; lives outside `AppState` (see `session_status`).
     let native = crate::session_status::snapshot();
 
+    // A paired device reads every row but only its own identity: the others' names and
+    // fingerprints stay off its lane, as the rosters do. `client` is a fingerprint prefix.
+    let caller = match (lane, &device) {
+        (AuthLane::Cert, Some(d)) => Some(d.0 .0.as_str()),
+        (AuthLane::Cert, None) => Some(""),
+        _ => None,
+    };
+    let shown = |client: &str| caller.is_none_or(|fp| !client.is_empty() && fp.starts_with(client));
     // One row per live session, for the Dashboard's list and the per-session routes. Both
     // planes register, so a compat session carries an id like any other and its stop and
     // keyframe reach it. The lanes it does not have stay absent rather than reading as off.
@@ -642,11 +665,13 @@ pub(crate) async fn get_status(
         .iter()
         .map(|s| {
             let native_plane = s.plane != crate::events::Plane::Gamestream;
+            let own = shown(&s.client);
             SessionRow {
                 id: Some(s.id),
                 plane: s.plane,
-                client: s.client.clone(),
-                client_name: s.client_name.clone(),
+                wire: (s.wire != 0).then_some(s.wire),
+                client: if own { s.client.clone() } else { String::new() },
+                client_name: s.client_name.clone().filter(|_| own),
                 preset_name: s.preset_name.clone(),
                 mode: crate::events::mode_str(s.width, s.height, s.fps),
                 hdr: s.hdr,
@@ -744,7 +769,11 @@ pub(crate) async fn get_status(
             .into_iter()
             .map(|g| ActiveGame {
                 session_id: g.session_id,
-                client: g.client,
+                client: if shown(&g.client) {
+                    g.client
+                } else {
+                    String::new()
+                },
                 app_id: g.app_id,
                 title: g.title,
                 store: g.store,
@@ -755,6 +784,13 @@ pub(crate) async fn get_status(
                 endable: ender.may_end(g.state, g.launched_by.as_deref()),
             })
             .collect(),
+        downloads: crate::library::downloads::snapshot(),
+        grants: caller.map(|fp| {
+            st.native
+                .as_ref()
+                .and_then(|n| n.effective(fp, crate::clock::unix_secs()))
+                .unwrap_or(0)
+        }),
         audio: audio_wiring(),
     })
 }

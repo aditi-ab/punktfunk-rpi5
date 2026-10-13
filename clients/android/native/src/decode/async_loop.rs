@@ -314,9 +314,10 @@ fn run_codec(
     };
     let mut state = State::new(asc, presenter, ReanchorGate::new(client.frames_dropped()));
     state.admit = admission(client.codec, &ctx.codec.name().unwrap_or_default());
-    if rebuilt {
+    if rebuilt || opts.restart {
         // A fresh decoder holds no reference picture, so every P-frame before a keyframe is a
         // reference error, and reference errors can hang a hardware decoder. None reach this one.
+        // A session's first decoder needs no ask: the stream opens on an IDR.
         state.await_keyframe = true;
         state.gate.arm(Instant::now());
         let _ = client.request_keyframe();
@@ -354,7 +355,7 @@ fn run_codec(
         aux.after_pass(client, work_t0, had_output, presented_now);
         if presented_now {
             state.log_progress();
-            if let Some(layer) = stale.take() {
+            if let Some(mut layer) = stale.take() {
                 layer.hide();
             }
         }
@@ -606,6 +607,7 @@ fn bring_up(
                 mode.height as i32,
                 opts.surface_size.clone(),
                 opts.src_crop.clone(),
+                opts.layers.clone(),
                 opts.panel_hz,
                 color_dataspace(&client.color),
                 mode.refresh_hz,

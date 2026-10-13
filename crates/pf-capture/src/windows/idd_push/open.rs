@@ -211,6 +211,16 @@ impl IddPushCapturer {
                  set; None ⇒ the CCD read itself failed"
             );
         }
+        // SDR wide colour: a 10-bit SDR session composes FP16 under an SDR transfer, so its
+        // 10 bits are the desktop's own. Every other SDR session turns it off and the driver
+        // reads BGRA; an HDR session only observes it.
+        let display_wcg = if want_hdr {
+            !display_hdr
+                && pf_win_display::win_display::color_mode(ccd)
+                    == Some(pf_win_display::win_display::ColorMode::Wcg)
+        } else {
+            Self::pin_wcg(ccd, target.target_id, ten_bit_sdr && super::wcg_available())
+        };
         // The duplication target for the AU and cursor sections, and the driver-death probe.
         let broker = ChannelBroker::open(target.wudf_pid)?;
 
@@ -276,6 +286,7 @@ impl IddPushCapturer {
             wudf_pid = target.wudf_pid,
             mode = format!("{w}x{h}"),
             display_hdr,
+            display_wcg,
             want_hdr,
             ten_bit_sdr,
             want_444,
@@ -283,13 +294,17 @@ impl IddPushCapturer {
         );
         // The diagnostic posture, once per session: active probes and an ETW session alter the
         // very path a disturbance report describes, so every report needs this A/B label.
-        match super::diag_dir() {
-            Some(dir) => tracing::info!(
+        match (super::diag_dir(), super::flow_watch()) {
+            (Some(dir), _) => tracing::info!(
                 au_dump_dir = %dir.display(),
                 "IDD push: PUNKTFUNK_IDD_DIAG is ON — micro-probes, the DxgKrnl ETW session and \
                  the access-unit dump are running for this session"
             ),
-            None => tracing::info!(
+            (None, true) => tracing::info!(
+                "IDD push: PUNKTFUNK_IDD_FLOW is ON — the DxgKrnl ETW session is running and \
+                 prints a present-flow line every ten seconds"
+            ),
+            (None, false) => tracing::info!(
                 "IDD push: diagnostics off (set PUNKTFUNK_IDD_DIAG=1 for probes, DxgKrnl ETW and \
                  an access-unit dump)"
             ),
@@ -310,7 +325,9 @@ impl IddPushCapturer {
             height: h,
             want_hdr,
             ten_bit_sdr,
+            want_wcg: ten_bit_sdr && display_wcg,
             display_hdr,
+            display_wcg,
             hdr_pin_warned: false,
             hdr_pin_failures: 0,
             want_444,
@@ -319,6 +336,7 @@ impl IddPushCapturer {
                 ccd,
                 DisplayDescriptor {
                     hdr: display_hdr,
+                    wcg: display_wcg,
                     width: w,
                     height: h,
                 },
@@ -335,7 +353,9 @@ impl IddPushCapturer {
             max_hb_age_us: 0,
             cursor: CursorWitness::new(Instant::now()),
             probes: super::diag_dir().map(|_| super::probes::acquire()),
-            etw: super::diag_dir().and_then(|_| super::dxgkrnl_etw::acquire()),
+            etw: (super::diag_dir().is_some() || super::flow_watch())
+                .then(super::dxgkrnl_etw::acquire)
+                .flatten(),
             cursor_shared,
             cursor_poll,
             cursor_forward,
@@ -353,12 +373,13 @@ impl IddPushCapturer {
             // so a failed open can hand it back.
             _keepalive: Box::new(()),
         };
-        // Stamp both REALTIME GPU-priority opt-ins once per session. Stall
-        // WARNs repeat them only when they fire, so a quiet stalling log
-        // would otherwise omit the posture.
+        // Stamp both REALTIME GPU-priority opt-ins once per session, with the HAGS
+        // setting that decides who schedules them. Stall WARNs repeat the opt-ins only
+        // when they fire, so a quiet stalling log would otherwise omit the posture.
         tracing::info!(
             rt_gpu_driver = super::stall::rt_gpu_driver_posture(),
             rt_gpu_host = super::stall::rt_gpu_host_posture(),
+            hags = pf_win_display::hags_setting(),
             "GPU-priority posture for this capture session"
         );
         // The driver's blend needs this and session 0 cannot query it. No-op on SDR.

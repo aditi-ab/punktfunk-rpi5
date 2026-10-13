@@ -639,20 +639,26 @@ pub(crate) struct CapacityProbe {
 
 impl CapacityProbe {
     /// `target_kbps` of `None` sizes the burst from the stream cap, and caps
-    /// the ramp at what the stream can use. `armed` is `PUNKTFUNK_ABR_PROBE`
-    /// plus the session being Automatic at all; `ramp` is the host's
+    /// the ramp at what the stream can use — or, `probe_only`, at the link's
+    /// wall. `armed` is `PUNKTFUNK_ABR_PROBE` plus the session being
+    /// Automatic at all; `ramp` is the host's
     /// [`HOST_CAP2_RAMP`](crate::quic::HOST_CAP2_RAMP).
     pub(crate) fn new(
         armed: bool,
         ramp: bool,
         target_kbps: Option<u32>,
         stream_cap_kbps: u32,
+        probe_only: bool,
         now: Instant,
     ) -> Self {
+        let ramp_max = if probe_only {
+            target_kbps.map_or(LINK_RAMP_MAX_KBPS, |k| k.min(LINK_RAMP_MAX_KBPS))
+        } else {
+            ramp_max_kbps(stream_cap_kbps, target_kbps)
+        };
         CapacityProbe {
             target_kbps: target_kbps.unwrap_or_else(|| probe_target_kbps(stream_cap_kbps)),
-            ramp: (armed && ramp)
-                .then(|| Ramp::new(ramp_max_kbps(stream_cap_kbps, target_kbps), now)),
+            ramp: (armed && ramp).then(|| Ramp::new(ramp_max, now)),
             // The ramp replaces the burst; it never runs beside video.
             fire_at: (armed && !ramp).then(|| now + PROBE_DELAY),
             result_by: None,
@@ -724,12 +730,12 @@ impl CapacityProbe {
     /// IDR, so the burst waits another delay.
     ///
     /// Two counts, deliberately. `frames_completed` is the session's, which
-    /// includes the burst's own filler AUs — the reassembler has no
-    /// probe/video split at the completion (`session.rs`). `video_aus` is what
-    /// the embedder forwarded as picture. The legacy burst reads the first
-    /// because that is what it has always read and no filler exists before it;
-    /// the ramp must read the second, because its own filler would otherwise
-    /// end it one tick after its first step.
+    /// includes probe filler AUs — the reassembler has no probe/video split at
+    /// the completion (`session.rs`). `video_aus` is what the embedder
+    /// forwarded as picture. The ramp reads the second, or its own filler
+    /// would end it one tick after its first step, and so does the burst a
+    /// cut-short ramp arms behind that filler. A burst with no ramp before it
+    /// reads the first, which no filler precedes.
     pub(crate) fn poll(
         &mut self,
         now: Instant,
@@ -743,7 +749,12 @@ impl CapacityProbe {
         if !due {
             return None;
         }
-        if self.active || frames_completed == 0 {
+        let pictures = if self.ramp.is_some() {
+            video_aus
+        } else {
+            frames_completed
+        };
+        if self.active || pictures == 0 {
             self.fire_at = Some(now + PROBE_DELAY);
             return None;
         }
@@ -776,11 +787,12 @@ impl CapacityProbe {
     }
 
     /// The request never reached the control task: nothing is in flight, so
-    /// nothing is owed.
+    /// nothing is owed. A dropped burst measured nothing, as a timed-out one.
     pub(crate) fn on_dropped(&mut self) {
         self.result_by = None;
-        if let Some(r) = self.ramp.as_mut() {
-            r.no_wall();
+        match self.ramp.as_mut() {
+            Some(r) if !r.done => r.no_wall(),
+            _ => self.no_evidence = true,
         }
     }
 
@@ -937,6 +949,9 @@ fn ramp_max_kbps(stream_cap_kbps: u32, env_kbps: Option<u32>) -> u32 {
     env_kbps.map_or(by_stream, |k| k.min(by_stream))
 }
 
+/// A probe-only session's ramp ceiling: the host's own clamp on a probe.
+const LINK_RAMP_MAX_KBPS: u32 = 10_000_000;
+
 /// How far past its pin a pinned ramp climbs. The host paces a pinned
 /// stream at the rate the ramp proved, so the proof has to reach the link's
 /// rate, not the stream's: 8× takes a 1440p120 PyroWave pin to 10 GbE in
@@ -1000,7 +1015,7 @@ mod tests {
         fn new(stream_cap_kbps: u32, env_kbps: Option<u32>) -> Self {
             let now = Instant::now();
             Rig {
-                p: CapacityProbe::new(true, true, env_kbps, stream_cap_kbps, now),
+                p: CapacityProbe::new(true, true, env_kbps, stream_cap_kbps, false, now),
                 now,
                 asked: Vec::new(),
                 pending: None,
@@ -1112,6 +1127,23 @@ mod tests {
         );
     }
 
+    /// A speed test's 720p60 connect has no stream to stop at: on 2.5 GbE
+    /// the ramp climbs to the link's wall, not to the ~79 Mbps 720p60 uses.
+    #[test]
+    fn a_probe_only_ramp_climbs_to_the_link() {
+        let cap = super::super::stream_ceiling_kbps(1280, 720, 60, CODEC_H264, 8, CHROMA_IDC_420);
+        let mut rig = Rig::new(cap, None);
+        rig.p = CapacityProbe::new(true, true, None, cap, true, rig.now);
+        let end = rig.run(2_500_000, u32::MAX);
+        let Ramped::Wall { delivered_kbps } = end else {
+            panic!("2.5 GbE is a wall to a speed test: {end:?}");
+        };
+        assert!(
+            (2_000_000..=3_000_000).contains(&delivered_kbps),
+            "the wall read {delivered_kbps} kbps"
+        );
+    }
+
     /// A sender that cannot offer the asked rate is not a wall: the link was
     /// never asked for it, so nothing about the link was learned.
     #[test]
@@ -1149,6 +1181,29 @@ mod tests {
         assert_eq!(pinned_ramp_max_kbps(778_000, None), 6_224_000);
         assert_eq!(pinned_ramp_max_kbps(778_000, Some(320_000)), 320_000);
         assert_eq!(pinned_ramp_max_kbps(u32::MAX, None), u32::MAX);
+    }
+
+    /// The burst a cut-short ramp arms waits for a picture; the ramp's own
+    /// filler in the session's completions is not one.
+    #[test]
+    fn a_cut_short_ramps_burst_waits_for_video_not_filler() {
+        let mut rig = Rig::new(1_000_000, None);
+        assert_eq!(rig.step(1_000_000, u32::MAX), None);
+        rig.p.on_dropped();
+        assert!(
+            rig.p.take_ramped(rig.now).is_some(),
+            "cut short, burst armed"
+        );
+        let completed = rig.completed;
+        assert!(completed > 0, "step one's filler completed");
+        let wait = PROBE_DELAY.as_millis() as u64 + 1;
+        let at = rig.at(wait);
+        assert!(rig.p.poll(at, completed, 0).is_none(), "no picture yet");
+        let at = rig.at(wait);
+        assert!(
+            rig.p.poll(at, completed, 1).is_some(),
+            "video flows: it fires"
+        );
     }
 
     /// Video is the end of the ramp, whatever step is in flight: from the
@@ -1450,7 +1505,7 @@ mod tests {
     fn a_burst_the_link_refused_reports_the_wall_it_found() {
         let refused = |delivered_packets: u64, wire_packets_sent: u32, send_dropped: u32| {
             let now = Instant::now();
-            let mut p = CapacityProbe::new(true, false, Some(400_000), 100_000, now);
+            let mut p = CapacityProbe::new(true, false, Some(400_000), 100_000, false, now);
             assert!(p.poll(now + PROBE_DELAY, 1, 1).is_some(), "the burst fires");
             let r = ProbeReport {
                 delivered_bytes: delivered_packets * 1_448,
@@ -1550,7 +1605,7 @@ mod tests {
     #[test]
     fn a_finished_burst_is_measured_exactly_once() {
         let now = Instant::now();
-        let mut p = CapacityProbe::new(true, false, Some(400_000), 100_000, now);
+        let mut p = CapacityProbe::new(true, false, Some(400_000), 100_000, false, now);
         assert_eq!(p.poll(now + PROBE_DELAY, 1, 1), Some((400_000, PROBE_MS)));
         // 1 MB over 800 ms is 10 Mbps; the ceiling keeps 70 % of it.
         assert_eq!(
@@ -1572,7 +1627,7 @@ mod tests {
     #[test]
     fn an_old_host_still_gets_the_legacy_burst() {
         let now = Instant::now();
-        let mut p = CapacityProbe::new(true, false, None, 100_000, now);
+        let mut p = CapacityProbe::new(true, false, None, 100_000, false, now);
         assert!(
             p.poll(now, 0, 0).is_none(),
             "nothing goes out during bring-up"
@@ -1596,11 +1651,26 @@ mod tests {
     #[test]
     fn a_disabled_probe_neither_ramps_nor_bursts() {
         let now = Instant::now();
-        let mut p = CapacityProbe::new(false, true, None, 100_000, now);
+        let mut p = CapacityProbe::new(false, true, None, 100_000, false, now);
         assert!(p.poll(now, 0, 0).is_none());
         assert!(p.poll(now + PROBE_DELAY, 1, 1).is_none());
         assert_eq!(p.take_ramped(now), None);
         assert!(!p.ramping());
+    }
+
+    /// A burst the control queue dropped measured nothing, as a timed-out one:
+    /// the controller must not stay blind at its starting ceiling.
+    #[test]
+    fn a_dropped_burst_is_no_evidence() {
+        let now = Instant::now();
+        let mut p = CapacityProbe::new(true, false, None, 100_000, false, now);
+        assert!(!p.take_no_evidence());
+        assert!(
+            p.poll(now + PROBE_DELAY, 1, 1).is_some(),
+            "the burst goes out"
+        );
+        p.on_dropped();
+        assert!(p.take_no_evidence());
     }
 
     /// An embedder speed test finishes too, and its numbers are not the
@@ -1608,7 +1678,7 @@ mod tests {
     #[test]
     fn a_probe_nobody_asked_for_teaches_nothing() {
         let now = Instant::now();
-        let mut p = CapacityProbe::new(false, false, None, 100_000, now);
+        let mut p = CapacityProbe::new(false, false, None, 100_000, false, now);
         assert_eq!(p.on_result(report(9_000_000, 800), now), Measured::NotOurs);
     }
 

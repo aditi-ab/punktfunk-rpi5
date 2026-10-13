@@ -62,6 +62,24 @@ fn cadence_budget(
     }
 }
 
+/// How long past `next` the arrival wait runs before a repeat goes out: half an interval
+/// with no measured source cadence, else until 1.25× the source period after the last
+/// submit. A steady slower source gets no repeat between its own frames; a stalled one
+/// re-sends after that same wait.
+fn keepalive_wait(
+    interval: std::time::Duration,
+    src_period_ns: Option<u64>,
+) -> std::time::Duration {
+    let half = interval.mul_f32(0.5);
+    match src_period_ns {
+        Some(p) => std::time::Duration::from_nanos(p)
+            .mul_f32(1.25)
+            .saturating_sub(interval)
+            .max(half),
+        None => half,
+    }
+}
+
 /// 80% of the cadence budget spent inside the host's submit+poll chain is encode
 /// pressure: activation follows the measured encoder cost, not the consumed-frame
 /// clock — a chain at the bottleneck still reads ≥80% of a budget it stretched.
@@ -147,6 +165,8 @@ impl StreamState {
             Ok(None) => {
                 self.diag_repeat += 1;
                 repeat = true;
+                // The source stalled past its own cadence: the estimate no longer describes it.
+                self.src_period_ns = None;
             }
             Err(e) => {
                 if !self.on_capture_lost(e)? {
@@ -362,7 +382,9 @@ impl StreamState {
             self.st_submit.push(submit_us);
         }
         self.next = if frame_driven_enabled() && self.capturer.supports_arrival_wait() {
-            self.pace.charge();
+            if !repeat {
+                self.pace.charge();
+            }
             std::time::Instant::now() + self.interval
         } else {
             self.next + self.interval
@@ -410,6 +432,11 @@ impl StreamState {
             }
         }
         if send_gone {
+            // The send thread ended. With the loop stopping or the link closed that is the
+            // session ending; otherwise it died on an error it logged, which is not a clean end.
+            if !self.stop.load(Ordering::SeqCst) && self.conn.close_reason().is_none() {
+                anyhow::bail!("video send thread stopped");
+            }
             return Ok(Flow::Break);
         }
         self.check_encode_stall(depth, poll_err)?;
@@ -454,6 +481,7 @@ impl StreamState {
             } else {
                 cap_ns
             },
+            epoch: self.epoch,
             flags,
             frame_index: self.au_seq,
             deadline,
@@ -462,7 +490,7 @@ impl StreamState {
             cap_us: st.cap_us,
             submit_us: st.submit_us,
             wait_us,
-            repeat: st.repeat,
+            repeat: d.repeat.unwrap_or(st.repeat),
             was_measured: st.measure,
             driver: d.driver,
         }
@@ -757,25 +785,40 @@ impl StreamState {
         }
     }
 
-    /// Wait for the next tick: the capturer's arrival wait under the credit pacer, or the
-    /// fixed-interval sleep.
-    pub(super) fn sleep_to_next(&mut self, t_cap: std::time::Instant) {
-        if frame_driven_enabled() && self.capturer.supports_arrival_wait() {
+    /// Wait for the next tick: the capturer's arrival wait under the credit pacer, the next
+    /// access unit of an encoder that publishes its own, or the fixed-interval sleep. A
+    /// repeat holds no slot: the real frame after it goes out on arrival.
+    pub(super) fn sleep_to_next(&mut self, t_cap: std::time::Instant, repeat: bool) {
+        if !frame_driven_enabled() {
+            return self.sleep_to_grid();
+        }
+        if self.capturer.supports_arrival_wait() {
             // Anchor the 0.9× floor to `t_cap`, not `next`: a sync encoder folds encode into cadence.
-            let earliest = std::cmp::max(
-                t_cap + self.interval.mul_f32(0.9),
-                self.pace.earliest(std::time::Instant::now(), self.interval),
-            );
-            if let Some(d) = earliest.checked_duration_since(std::time::Instant::now()) {
-                std::thread::sleep(d);
+            if !repeat {
+                let earliest = std::cmp::max(
+                    t_cap + self.interval.mul_f32(0.9),
+                    self.pace.earliest(std::time::Instant::now(), self.interval),
+                );
+                if let Some(d) = earliest.checked_duration_since(std::time::Instant::now()) {
+                    std::thread::sleep(d);
+                }
             }
             self.capturer
-                .wait_arrival(self.next + self.interval.mul_f32(0.5));
+                .wait_arrival(self.next + keepalive_wait(self.interval, self.src_period_ns));
+        } else if self.enc.ready_aus(self.next).is_some() {
+            // An access unit landed or the period ran out. The grid restarts here: on its own
+            // phase it holds a finished AU for up to a period, a different one every session.
+            self.next = std::time::Instant::now();
         } else {
-            match self.next.checked_duration_since(std::time::Instant::now()) {
-                Some(d) => std::thread::sleep(d),
-                None => self.next = std::time::Instant::now(),
-            }
+            self.sleep_to_grid();
+        }
+    }
+
+    /// The fixed-cadence tick, re-anchored when the loop is behind it.
+    fn sleep_to_grid(&mut self) {
+        match self.next.checked_duration_since(std::time::Instant::now()) {
+            Some(d) => std::thread::sleep(d),
+            None => self.next = std::time::Instant::now(),
         }
     }
 
@@ -796,6 +839,7 @@ impl StreamState {
                 data: au.data,
                 meta: AuMeta {
                     capture_ns: cap_ns,
+                    epoch: self.epoch,
                     flags,
                     frame_index: self.au_seq,
                     deadline,
@@ -824,6 +868,9 @@ struct AuStages {
     queue_us: u32,
     encode_us: u32,
     driver: Option<DriverSample>,
+    /// The driver's own word on whether this AU repeats the last source frame. `None` leaves
+    /// it to the tick, which is right for an encoder the loop feeds.
+    repeat: Option<bool>,
 }
 
 impl AuStages {
@@ -832,18 +879,21 @@ impl AuStages {
             queue_us,
             encode_us,
             driver: None,
+            repeat: None,
         }
     }
 }
 
 /// The driver's stages for the AU just taken. Unmeasured before its first AU.
 fn driver_stages(enc: &dyn crate::encode::Encoder) -> AuStages {
-    let sample = DriverSample::from_telemetry(enc.telemetry().as_ref());
+    let telemetry = enc.telemetry();
+    let sample = DriverSample::from_telemetry(telemetry.as_ref());
     let (queue_us, encode_us) = sample.queue_encode_us();
     AuStages {
         queue_us,
         encode_us,
         driver: Some(sample),
+        repeat: telemetry.map(|t| t.au_repeat),
     }
 }
 
@@ -934,5 +984,22 @@ mod tests {
         assert!(!mark_recovery_boundary(&mut pos, false, period));
         assert!(!mark_recovery_boundary(&mut pos, false, period));
         assert!(mark_recovery_boundary(&mut pos, false, period));
+    }
+}
+
+#[cfg(test)]
+mod keepalive_tests {
+    use super::keepalive_wait;
+    use std::time::Duration;
+
+    /// A source at 2× the interval gets its next frame before any repeat; one at the
+    /// interval, or none measured, keeps the plain half-interval keep-alive.
+    #[test]
+    fn a_slower_steady_source_outlives_the_keepalive() {
+        let i = Duration::from_micros(8_333);
+        assert_eq!(keepalive_wait(i, None), i.mul_f32(0.5));
+        assert_eq!(keepalive_wait(i, Some(i.as_nanos() as u64)), i.mul_f32(0.5));
+        let two = keepalive_wait(i, Some(2 * i.as_nanos() as u64));
+        assert!(two > i.mul_f32(1.4) && two < i.mul_f32(1.6), "{two:?}");
     }
 }

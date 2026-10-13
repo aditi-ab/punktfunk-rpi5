@@ -135,6 +135,7 @@ fun SettingsScreen(
     if (scopeId != null && active == null) scopeId = null
 
     var showLicenses by remember { mutableStateOf(false) }
+    var showShortcuts by remember { mutableStateOf(false) }
     var showControllers by remember { mutableStateOf(false) }
     var showQuickActions by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<EditIntent?>(null) }
@@ -196,6 +197,10 @@ fun SettingsScreen(
     // Deep sub-screens replace the whole settings surface (they carry their own back).
     if (showLicenses) {
         LicensesScreen(onBack = { showLicenses = false })
+        return
+    }
+    if (showShortcuts) {
+        ShortcutsScreen(onBack = { showShortcuts = false })
         return
     }
     if (showControllers) {
@@ -287,6 +292,7 @@ fun SettingsScreen(
                         onOpenControllers = { showControllers = true },
                         onOpenQuickActions = { showQuickActions = true },
                         onOpenLicenses = { showLicenses = true },
+                        onOpenShortcuts = { showShortcuts = true },
                         onBack = back,
                     )
                 }
@@ -618,6 +624,7 @@ private fun CategoryDetail(
     onOpenControllers: () -> Unit,
     onOpenQuickActions: () -> Unit,
     onOpenLicenses: () -> Unit,
+    onOpenShortcuts: () -> Unit,
     onBack: (() -> Unit)?,
 ) {
     Column(
@@ -641,7 +648,7 @@ private fun CategoryDetail(
             SettingsCategory.Input -> InputSettings(settings, onChange, onOpenQuickActions)
             SettingsCategory.Audio -> AudioSettings(settings, onChange, onMicChange)
             SettingsCategory.Controllers -> ControllerSettings(settings, onChange, onOpenControllers)
-            SettingsCategory.About -> AboutSettings(context, onOpenLicenses)
+            SettingsCategory.About -> AboutSettings(context, onOpenShortcuts, onOpenLicenses)
         }
     }
 }
@@ -806,16 +813,17 @@ private fun GeneralSettings(s: Settings, update: (Settings) -> Unit) {
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: android.content.Context) {
-    val (nw, nh, nhz) = nativeDisplayMode(context)
+    val (nw, nh, nhz) = nativeDisplayMode(context, secondScreen = s.secondScreen)
     // The safe-area row carries its resolved size the same way the native row does. On a display with
     // no cutout this equals the native mode — the row stays, honestly showing that it changes nothing
     // here, rather than silently vanishing on some devices and not others.
-    val (sw, sh, _) = safeDisplayMode(context)
+    val (sw, sh, _) = safeDisplayMode(context, secondScreen = s.secondScreen)
     // "Custom…" picked while the stored size is still a preset — keeps the size fields visible
     // until an edit actually makes it custom (or a preset is re-picked). Custom itself is detected
     // from the stored size, never flagged (see [isCustomResolution]), so nothing new persists.
     var customPicked by remember { mutableStateOf(false) }
-    val families = remember(nw, nh, sw, sh) { Resolutions.families(nw to nh, sw to sh) }
+    val (panel, panelSafe) = panelScreens(context)
+    val families = remember(panel, panelSafe) { Resolutions.families(panel, panelSafe) }
     val showCustom = customPicked || s.isCustomResolution(families)
     var customBitratePicked by remember { mutableStateOf(false) }
     SettingsGroup("Resolution") {
@@ -961,6 +969,18 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
             caption = "Lowest latency shows each frame the moment it can reach the panel; " +
                 "Smoothness buffers a little to absorb network jitter.",
         ) { v -> update(s.copy(presentPriority = v)) }
+    }
+
+    SettingsGroup("Second screen") {
+        ToggleRow(
+            title = "Second screen",
+            subtitle = "A smaller second screen — a dual-screen handheld's lower panel, a foldable " +
+                "half open — shows the companion panel, or the picture with Screens. Off leaves it " +
+                "to the system: for a phone on a TV.",
+            checked = s.secondScreen,
+            field = "android.second_screen",
+            onCheckedChange = { on -> update(s.copy(secondScreen = on)) },
+        )
     }
 
     val d = Settings()
@@ -1197,6 +1217,13 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
                 "gyroscope, so pick a DualSense-class one if you want motion.",
         ) { g -> update(s.copy(gamepad = g)) }
         DeviceScopeOnly {
+            ToggleRow(
+                title = "Controller rumble",
+                subtitle = "Off, controllers don't vibrate from the stream or in the menus, whatever the game sends",
+                checked = s.padRumble,
+                enabled = s.gamepadForwarding,
+                onCheckedChange = { on -> update(s.copy(padRumble = on)) },
+            )
             ClickableRow(
                 title = "Connected controllers",
                 subtitle = "What the app detects, with a live input test",
@@ -1317,7 +1344,11 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
 }
 
 @Composable
-private fun AboutSettings(context: android.content.Context, onOpenLicenses: () -> Unit) {
+private fun AboutSettings(
+    context: android.content.Context,
+    onOpenShortcuts: () -> Unit,
+    onOpenLicenses: () -> Unit,
+) {
     // The app's own version, read from the installed package (the WinUI/Apple About convention:
     // identity first, then the legal rows). Empty on a harness with no real package info.
     val version = remember {
@@ -1337,6 +1368,11 @@ private fun AboutSettings(context: android.content.Context, onOpenLicenses: () -
                 )
             }
         }
+        ClickableRow(
+            title = "Stream controls",
+            subtitle = "Keys, gestures and controller chords",
+            onClick = onOpenShortcuts,
+        )
         ClickableRow(
             title = "Open-source licenses",
             subtitle = "Third-party notices and credits",

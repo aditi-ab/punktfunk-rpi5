@@ -26,6 +26,9 @@ pub struct DriverEncodeParams {
     pub bitrate_kbps: u32,
     pub hdr: bool,
     pub hdr_meta: Option<pf_frame::HdrMeta>,
+    /// The display composes FP16 for this SDR stream (SDR wide colour):
+    /// [`encode::SET_ENCODE_FLAG_SDR_FP16`].
+    pub sdr_fp16: bool,
     /// Slice-chunk target; `0` = whole access units.
     pub wire_chunk_bytes: u32,
     /// Ordered preference, 0-terminated: 1 NVENC, 2 AMF, 3 QSV, 4 PyroWave.
@@ -270,7 +273,11 @@ pub fn open_driver_encoder(
         wire_chunk_bytes: params.wire_chunk_bytes,
         wire_seq_base: params.wire_seq_base,
         backends: params.backends,
-        flags: 0,
+        flags: if params.sdr_fp16 {
+            encode::SET_ENCODE_FLAG_SDR_FP16
+        } else {
+            0
+        },
         _pad_tail: 0,
         // The host process carries `host.env`, so its environment is the knob source; the
         // driver reads these instead of WUDFHost's own (machine) environment.
@@ -317,6 +324,7 @@ pub fn open_driver_encoder(
         backend = backend_name(reply.backend_opened),
         ?caps,
         applied_kbps = reply.applied_bitrate_kbps,
+        sdr_fp16 = params.sdr_fp16,
         heap_bytes = heap,
         generation = header.generation,
         wire_seq_base = params.wire_seq_base,
@@ -335,11 +343,17 @@ pub fn open_driver_encoder(
         wire_chunk_warned: false,
         last_wire_seq: 0,
         last_source_seq: 0,
+        au_repeat: false,
         last_arrival: None,
         last_split: None,
         dump: AuDump::create(endpoint.target_id),
         opened_at: Instant::now(),
         backend: backend_name(reply.backend_opened),
+        // Opt-in: without it the card sits in its idle clocks under a stream.
+        _clock_boost: (reply.backend_opened == encode::backend::NVENC)
+            .then(pf_gpu::selected_gpu)
+            .flatten()
+            .and_then(|gpu| clock_boost::ClockBoost::hold(gpu.info.luid())),
     }))
 }
 
@@ -381,6 +395,8 @@ pub struct EncoderProxy {
     /// ground-truth clock (`progress`).
     last_wire_seq: u32,
     last_source_seq: u32,
+    /// The access unit being taken re-encodes its predecessor's source frame.
+    au_repeat: bool,
     /// Age of the last taken chunk's `qpc_pts` when the host took it — present→arrival.
     last_arrival: Option<Duration>,
     /// The driver's own split of that span, when its slot carried the stamps.
@@ -392,6 +408,8 @@ pub struct EncoderProxy {
     opened_at: Instant,
     /// The backend the driver opened, for the status surface.
     backend: &'static str,
+    /// NVENC only: the GPU's clocks stay up until this proxy drops.
+    _clock_boost: Option<clock_boost::ClockBoost>,
 }
 
 impl Drop for EncoderProxy {
@@ -445,6 +463,7 @@ impl EncoderProxy {
     /// its copy here, so a chunked session writes the same bytes in the same order.
     fn chunk(&mut self, t: Taken) -> AuChunk {
         self.last_wire_seq = t.wire_seq;
+        self.au_repeat = t.repeat;
         self.last_source_seq = t.source_seq;
         self.last_arrival =
             (t.qpc_pts != 0).then(|| Duration::from_micros(IddPushCapturer::qpc_age_us(t.qpc_pts)));
@@ -534,27 +553,34 @@ impl Encoder for EncoderProxy {
     }
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
-        // Whole access units: chunks concatenate in order until LAST closes it.
+        // Whole access units: chunks concatenate in order until LAST closes it. A FIRST
+        // mid-assembly means the driver dropped this AU's tail and moved on: the prefix is
+        // discarded and the next AU starts over, as `poll_chunked` does for the streamed wire.
+        let start = |c: AuChunk| EncodedFrame {
+            data: c.data,
+            pts_ns: c.pts_ns,
+            keyframe: c.keyframe,
+            recovery_anchor: c.recovery_anchor,
+            recovery_point: c.recovery_point,
+            recovery_close: c.recovery_close,
+            chunk_aligned: c.chunk_aligned,
+        };
         let Some(first) = self.poll_chunk()? else {
             return Ok(None);
         };
-        let mut frame = EncodedFrame {
-            data: first.data,
-            pts_ns: first.pts_ns,
-            keyframe: first.keyframe,
-            recovery_anchor: first.recovery_anchor,
-            recovery_point: first.recovery_point,
-            recovery_close: first.recovery_close,
-            chunk_aligned: first.chunk_aligned,
-        };
         let mut last = first.last;
+        let mut frame = start(first);
         while !last {
             let c = self
                 .poll_chunk()?
                 .context("driver encode: access unit ended without its LAST chunk")?;
-            frame.data.extend_from_slice(&c.data);
-            frame.keyframe |= c.keyframe;
             last = c.last;
+            if c.first {
+                frame = start(c);
+            } else {
+                frame.data.extend_from_slice(&c.data);
+                frame.keyframe |= c.keyframe;
+            }
         }
         Ok(Some(frame))
     }
@@ -608,6 +634,7 @@ impl Encoder for EncoderProxy {
             drain_heartbeat: stamp(h.drain_heartbeat_qpc),
             present_to_arrival: self.last_arrival,
             driver_split: self.last_split,
+            au_repeat: self.au_repeat,
             state: h.encoder_state,
             backend: self.backend,
         })

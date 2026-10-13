@@ -264,6 +264,12 @@ pub(super) fn cursor_forward(
     }
 }
 
+/// Whether the session's compositor reads the uinput tablet pen batches land on. gamescope
+/// reads none, so its clients send the pen as touch.
+fn pen_reaches(compositor: Option<crate::vdisplay::Compositor>) -> bool {
+    compositor != Some(crate::vdisplay::Compositor::Gamescope)
+}
+
 /// [`Hello::preferred_codec`] for the negotiation line. `none` is auto; a byte this build
 /// does not know is `unknown` rather than blank.
 fn codec_pref_label(preferred: u8) -> &'static str {
@@ -311,6 +317,9 @@ pub(super) struct Negotiated {
     pub(super) preset: Option<crate::events::PresetRef>,
     /// `EXT_TAG_ABR` on `Start` (`0` = absent): the ABR wire features this client reads.
     pub(super) abr_features: u8,
+    /// `EXT_TAG_DELIVERY` on `Start`: the profile and the extras the client asked for;
+    /// `None` asked nothing and is answered with nothing.
+    pub(super) delivery_ask: Option<punktfunk_core::quic::DeliveryAsk>,
     pub(super) compositor: Option<crate::vdisplay::Compositor>,
     /// Gamescope sub-mode as a value, not process env — a concurrent connect would overwrite env.
     pub(super) gamescope_route: Option<crate::vdisplay::GamescopeRoute>,
@@ -418,12 +427,25 @@ pub(super) async fn negotiate(
     // registers in the live set only once its data plane is up, so a later client can steal it.
     let mut joined = None;
     {
-        use crate::vdisplay::admission::{admit, preempt_same_identity, Admission};
+        use crate::vdisplay::admission::{
+            admit, preempt_resumed, preempt_same_identity, Admission,
+        };
         let peer_fp = conn.peer_fingerprint();
 
-        // Own prior session (QUIC idle has not fired). Stop it and wait the release grace so
-        // this reconnect reuses the kept display. Runs before we register, so we never stop ourselves.
-        let own_zombies = preempt_same_identity(peer_fp);
+        // Own prior session (QUIC idle has not fired), and on `punktfunk/2` the exact session a
+        // `resume` names. Stop them and wait for their release, so this reconnect reuses the
+        // kept display. Runs before we register, so we never stop ourselves.
+        let mut own_zombies = preempt_same_identity(peer_fp);
+        if let Some(id) = conn.v2_session().and_then(|v2| {
+            let rx = v2.rx.lock().unwrap_or_else(|e| e.into_inner());
+            rx.client.as_ref().and_then(|c| c.resume)
+        }) {
+            for s in preempt_resumed(id, peer_fp) {
+                if !own_zombies.iter().any(|z| Arc::ptr_eq(z, &s)) {
+                    own_zombies.push(s);
+                }
+            }
+        }
         if !own_zombies.is_empty() {
             tracing::info!(
                     count = own_zombies.len(),
@@ -432,8 +454,7 @@ pub(super) async fn negotiate(
             for z in &own_zombies {
                 z.store(true, Ordering::SeqCst);
             }
-            // 1500 ms: same release grace as steal, so the zombie drops its display before we acquire.
-            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            wait_released(&own_zombies).await;
         }
 
         match admit(peer_fp) {
@@ -461,6 +482,12 @@ pub(super) async fn negotiate(
                 joined = Some((display, view));
             }
             Admission::Steal(victims) => {
+                // A mode this session cannot encode fails below anyway: check it before the
+                // victims lose their stream for nothing. A steal keeps the requested mode.
+                crate::encode::validate_dimensions(codec, hello.mode.width, hello.mode.height)
+                    .context("client-requested mode")?;
+                crate::encode::validate_refresh(hello.mode.refresh_hz)
+                    .context("client-requested mode")?;
                 tracing::info!(
                     victims = victims.len(),
                     "mode-conflict: STEAL — preempting the live session(s)"
@@ -468,8 +495,7 @@ pub(super) async fn negotiate(
                 for v in &victims {
                     v.store(true, Ordering::SeqCst);
                 }
-                // 1500 ms release grace so victims drop their display before we acquire.
-                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                wait_released(&victims).await;
             }
             Admission::Reject(reason) => {
                 tracing::warn!("mode-conflict: REJECT — {reason}");
@@ -539,7 +565,7 @@ pub(super) async fn negotiate(
     // A browser's video rides this connection's datagrams, which are smaller than a UDP payload
     // (QUIC and HTTP/3 framing come out of the same budget). Ask, falling back to the 1200 every
     // QUIC path guarantees; a shard that does not fit is dropped at send, and FEC cannot cover all.
-    if data_port.is_none() {
+    if conn.is_web() {
         let budget = conn.max_datagram_size().unwrap_or(1200);
         shard_payload = shard_payload.min(punktfunk_core::config::shard_payload_for_udp_budget(
             budget,
@@ -633,7 +659,7 @@ pub(super) async fn negotiate(
         // Clipboard only when operator policy and a platform backend both exist, and never to a
         // browser: its transfers ride quinn streams.
         host_caps: punktfunk_core::quic::HOST_CAP_GAMEPAD_STATE
-            | if pf_clipboard::cap_advertised() && !conn.is_web() {
+            | if pf_clipboard::cap_advertised() && conn.as_quic().is_some() {
                 punktfunk_core::quic::HOST_CAP_CLIPBOARD
             } else {
                 0
@@ -654,7 +680,7 @@ pub(super) async fn negotiate(
             }
             // Pen batches → per-session uinput tablet. Without the bit, clients fold pen into
             // touch/pointer and `NativeClient::send_pen` refuses.
-            | if crate::inject::pen_supported() {
+            | if crate::inject::pen_supported() && pen_reaches(compositor) {
                 punktfunk_core::quic::HOST_CAP_PEN
             } else {
                 0
@@ -746,6 +772,16 @@ pub(super) async fn negotiate(
                 _ => 0,
             },
     };
+    // `punktfunk/2`: the suite goes out in the `ServerHello` this `Welcome` becomes, and keys
+    // the media. v1's chosen cipher maps onto it one for one; a browser's media goes unsealed,
+    // inside WebTransport's own encryption.
+    if let Some(v2) = conn.v2_session() {
+        v2.settle((!conn.is_web()).then_some(if chacha {
+            punktfunk_core::crypto::MediaSuite::ChaCha20Poly1305
+        } else {
+            punktfunk_core::crypto::MediaSuite::Aes128Gcm
+        }));
+    }
     io::write_msg(send, &welcome.encode()).await?;
     bringup.mark("welcome");
 
@@ -834,6 +870,7 @@ pub(super) async fn negotiate(
     // cannot read, and bits this host does not know are ignored.
     let abr_features = punktfunk_core::quic::ext_abr_features(&start_ext);
     let preset = punktfunk_core::quic::SessionPreset::from_ext(&start_ext).map(Into::into);
+    let delivery_ask = punktfunk_core::quic::DeliveryAsk::from_ext(&start_ext);
     bringup.mark("start");
     // `wire_mtu::spawn_watch` is started by `serve_session` once the control-task channels
     // exist; it also drives mid-session shard renegotiation (needs the control writer).
@@ -846,11 +883,21 @@ pub(super) async fn negotiate(
         client_label,
         preset,
         abr_features,
+        delivery_ask,
         compositor,
         gamescope_route,
         prep,
         joined,
     })
+}
+
+/// Waits until every stopped session has left the live set, its display lease dropped with it.
+/// Capped at the 1.5 s grace the host once always slept: a stuck teardown costs no more than that.
+async fn wait_released(stops: &[Arc<std::sync::atomic::AtomicBool>]) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
+    while !crate::vdisplay::admission::all_gone(stops) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 /// Compositor for Welcome plus the gamescope route as a value; synthetic has neither.
@@ -894,7 +941,7 @@ async fn negotiate_compositor(
     Ok((compositor, gamescope_route))
 }
 
-/// Bit depth, HDR verdict, and chroma, each gated by host, client, codec, and GPU probes.
+/// Bit depth, HDR verdict, and chroma, each gated by host, client, codec, source, and GPU probes.
 async fn negotiate_video_format(
     hello: &Hello,
     codec: crate::encode::Codec,
@@ -907,16 +954,21 @@ async fn negotiate_video_format(
     let client_supports_10bit = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_10BIT != 0;
     // `VIDEO_CAP_HDR` is BT.2020 PQ. `VIDEO_CAP_10BIT` alone is 10-bit SDR (Main10, display untouched).
     let client_wants_hdr = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_HDR != 0;
-    // Source-aware: Linux HDR depends on the compositor just resolved. Gamescope folds in
-    // `hdr_capture_failed(VirtualOutput)`; GameStream's rtsp.rs check has no twin here because
-    // that latch is per-source and this gate already used this session's source.
+    // Source-aware: Linux HDR depends on the compositor just resolved. Gamescope and direct
+    // capture fold in `hdr_capture_failed(VirtualOutput)`; GameStream's rtsp.rs check has no
+    // twin here: that latch is per-source and this gate already used this session's source.
     let capture_supports_hdr =
         crate::capture::capturer_supports_hdr_for(compositor, gamescope_route);
-    // SDR-10 needs a backend that writes 10 bits from an SDR desktop's 8-bit capture:
-    // direct-NVENC, VAAPI/Vulkan Video, or PyroWave's own CSC (`backend_carries_sdr10`).
-    // A Linux non-PyroWave 4:4:4 session is clamped to 8-bit separately at the
-    // resolved-chroma gate below, so depth needs no chroma input here.
-    let sdr10_chain_ok = codec_carries_sdr10(codec) && crate::encode::backend_carries_sdr10(codec);
+    // An 8-bit desktop's SDR-10 only widens: a colour pass per frame for no source detail, and
+    // the operator opts in (`sdr10_widen`). Our gamescope composites 10-bit SDR itself, and
+    // Windows 11 24H2 composes the virtual display in SDR wide colour (`sdr10_source`); neither
+    // needs the opt-in. Either way the backend must write the 10 bits. Linux non-PyroWave 4:4:4
+    // is clamped to 8-bit below.
+    let sdr10_widen = pf_host_config::row_bool("PUNKTFUNK_10BIT_SDR_WIDEN");
+    let sdr10_source = crate::capture::capturer_delivers_sdr10_for(compositor, gamescope_route);
+    let sdr10_chain_ok = (sdr10_widen || sdr10_source)
+        && codec_carries_sdr10(codec, sdr10_source)
+        && crate::encode::backend_carries_sdr10(codec);
     let depth_reachable = (client_wants_hdr && capture_supports_hdr) || sdr10_chain_ok;
     // Probe may open a tiny encoder; spawn_blocking, short-circuited behind the cheap gates.
     let gpu_can_10bit =
@@ -938,6 +990,8 @@ async fn negotiate_video_format(
         client_supports_10bit,
         client_wants_hdr,
         capture_supports_hdr,
+        sdr10_widen,
+        sdr10_source,
         sdr10_chain_ok,
         codec = ?codec,
         gpu_can_10bit,
@@ -1050,14 +1104,14 @@ fn linux_chroma_under_hdr(
     crate::encode::ChromaFormat::Yuv420
 }
 
-/// Codecs that carry 10-bit SDR off the packed-RGB capture. PyroWave is in on Linux: its CSC
-/// shaders widen 8-bit RGB to 10-bit codes in the same pass that does the colour matrix.
-/// (Windows PyroWave stays out — its capture there hands NV12 SDR.)
-fn codec_carries_sdr10(codec: crate::encode::Codec) -> bool {
+/// Codecs that carry 10-bit SDR. PyroWave on Linux widens 8-bit RGB to 10-bit codes in the
+/// pass that does the colour matrix; on Windows it takes only a real 10-bit source (SDR wide
+/// colour), since its planes from an 8-bit desktop are 8-bit.
+fn codec_carries_sdr10(codec: crate::encode::Codec, real_source: bool) -> bool {
     matches!(
         codec,
         crate::encode::Codec::H265 | crate::encode::Codec::Av1
-    ) || (codec == crate::encode::Codec::PyroWave && cfg!(target_os = "linux"))
+    ) || (codec == crate::encode::Codec::PyroWave && (cfg!(target_os = "linux") || real_source))
 }
 
 /// Whether Hello carried a format at all. Decode maps an absent one to 48 kHz/16-bit, so
@@ -1135,6 +1189,18 @@ mod tests {
         );
     }
 
+    /// gamescope reads no tablet, so its sessions withhold `HOST_CAP_PEN` and the pen
+    /// arrives as touch.
+    #[test]
+    fn pen_cap_skips_gamescope() {
+        use crate::vdisplay::Compositor;
+        assert!(!pen_reaches(Some(Compositor::Gamescope)));
+        for c in [Compositor::Kwin, Compositor::Mutter, Compositor::Windows] {
+            assert!(pen_reaches(Some(c)), "{c:?}");
+        }
+        assert!(pen_reaches(None));
+    }
+
     /// The negotiation line names the preference, and a preference that lost says which
     /// side lacks it — the reporter's 0x0b client against a 0x0f host, and the reverse.
     #[test]
@@ -1180,17 +1246,21 @@ mod tests {
     }
 
     /// AV1 carries 10-bit SDR like HEVC; Linux PyroWave widens RGB→10-bit in its own CSC,
-    /// so it is in there too (Windows PyroWave's NV12 SDR capture keeps it out).
+    /// so it is in there too. Windows PyroWave needs a real 10-bit source: its planes from an
+    /// 8-bit desktop are 8-bit.
     #[test]
-    fn sdr10_codecs_cover_hevc_av1_and_linux_pyrowave() {
+    fn sdr10_codecs_cover_hevc_av1_and_pyrowave_where_it_has_the_bits() {
         use crate::encode::Codec;
-        assert!(codec_carries_sdr10(Codec::Av1));
-        assert!(codec_carries_sdr10(Codec::H265));
+        for real in [false, true] {
+            assert!(codec_carries_sdr10(Codec::Av1, real));
+            assert!(codec_carries_sdr10(Codec::H265, real));
+            assert!(!codec_carries_sdr10(Codec::H264, real));
+        }
         assert_eq!(
-            codec_carries_sdr10(Codec::PyroWave),
+            codec_carries_sdr10(Codec::PyroWave, false),
             cfg!(target_os = "linux")
         );
-        assert!(!codec_carries_sdr10(Codec::H264));
+        assert!(codec_carries_sdr10(Codec::PyroWave, true));
     }
 
     /// 1472-byte discovery ceiling minus QUIC header + AEAD. Same number `pcm`'s ladder test uses.

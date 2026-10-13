@@ -15,6 +15,53 @@ use anyhow::Result;
 use ash::vk;
 use pf_frame::PixelFormat;
 
+/// Set when this process, not the operator, put `video-encode` into `ANV_DEBUG`.
+static ANV_ENCODE_OURS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The `ANV_DEBUG` value that opts Mesa's Intel driver into Vulkan Video encode, which it
+/// exposes only under `video-encode`. Appended, never clobbered, so an operator's flags survive;
+/// `PUNKTFUNK_VULKAN_ENCODE=0` still picks VAAPI. `None` when there is nothing to add.
+/// A `Some` marks the flag as ours: the caller exports it before any Vulkan instance exists.
+pub fn anv_video_encode_flag() -> Option<String> {
+    if !cfg!(feature = "vulkan-encode") {
+        return None;
+    }
+    let value = with_token(std::env::var("ANV_DEBUG").ok().as_deref(), "video-encode")?;
+    ANV_ENCODE_OURS.store(true, std::sync::atomic::Ordering::Relaxed);
+    Some(value)
+}
+
+/// `current` with `token` appended to its comma list; `None` when it is already there.
+fn with_token(current: Option<&str>, token: &str) -> Option<String> {
+    match current {
+        Some(v) if v.split(',').any(|t| t == token) => None,
+        Some(v) if !v.is_empty() => Some(format!("{v},{token}")),
+        _ => Some(token.to_owned()),
+    }
+}
+
+/// Whether this device's Vulkan Video encode may be used. Intel re-enabled Alchemist encode in
+/// Mesa 26.2; older ANV encodes only when the operator set `ANV_DEBUG` themselves.
+#[cfg(feature = "vulkan-encode")]
+pub(crate) fn encode_trusted(props: &vk::PhysicalDeviceProperties) -> bool {
+    encode_trusted_for(
+        props.vendor_id,
+        props.driver_version,
+        ANV_ENCODE_OURS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+#[cfg(feature = "vulkan-encode")]
+fn encode_trusted_for(vendor_id: u32, driver_version: u32, flag_is_ours: bool) -> bool {
+    const INTEL: u32 = 0x8086;
+    // ANV reports the Mesa release as `VK_MAKE_VERSION`; a `-devel` build reads one below.
+    let mesa = (
+        vk::api_version_major(driver_version),
+        vk::api_version_minor(driver_version),
+    );
+    vendor_id != INTEL || !flag_is_ours || mesa >= (26, 2)
+}
+
 pub(super) fn ext_advertised(exts: &[vk::ExtensionProperties], name: &std::ffi::CStr) -> bool {
     // Bounded: a missing NUL is `Err` (non-match), not a walk past the array.
     exts.iter().any(|e| e.extension_name_as_c_str() == Ok(name))
@@ -146,6 +193,57 @@ pub(crate) fn color_range(layer: u32) -> vk::ImageSubresourceRange {
     }
 }
 
+/// Ownership/visibility acquire for an EXCLUSIVE-sharing imported image: `foreign_qfi` →
+/// `dst_qfi`, discarding (`fresh`, UNDEFINED) or keeping (GENERAL) prior contents.
+pub(crate) fn imported_acquire_barrier(
+    image: vk::Image,
+    fresh: bool,
+    foreign_qfi: u32,
+    dst_qfi: u32,
+    dst_stage: vk::PipelineStageFlags2,
+    dst_access: vk::AccessFlags2,
+    new_layout: vk::ImageLayout,
+) -> vk::ImageMemoryBarrier2<'static> {
+    vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::NONE)
+        .src_access_mask(vk::AccessFlags2::NONE)
+        .dst_stage_mask(dst_stage)
+        .dst_access_mask(dst_access)
+        .old_layout(if fresh {
+            vk::ImageLayout::UNDEFINED
+        } else {
+            vk::ImageLayout::GENERAL
+        })
+        .new_layout(new_layout)
+        .src_queue_family_index(foreign_qfi)
+        .dst_queue_family_index(dst_qfi)
+        .image(image)
+        .subresource_range(color_range(0))
+}
+
+/// Ownership release back to the foreign producer family after the last read of an imported
+/// image, landing in GENERAL (the layout every later cached acquire expects).
+pub(crate) fn imported_release_barrier(
+    image: vk::Image,
+    old_layout: vk::ImageLayout,
+    src_qfi: u32,
+    foreign_qfi: u32,
+    src_stage: vk::PipelineStageFlags2,
+    src_access: vk::AccessFlags2,
+) -> vk::ImageMemoryBarrier2<'static> {
+    vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(src_stage)
+        .src_access_mask(src_access)
+        .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+        .dst_access_mask(vk::AccessFlags2::NONE)
+        .old_layout(old_layout)
+        .new_layout(vk::ImageLayout::GENERAL)
+        .src_queue_family_index(src_qfi)
+        .dst_queue_family_index(foreign_qfi)
+        .image(image)
+        .subresource_range(color_range(0))
+}
+
 /// First memory type in `bits` carrying every flag in `want`. A miss is an error, never
 /// index 0: that type may sit outside `bits` or lack a flag the caller relies on.
 pub(crate) fn find_mem(
@@ -273,6 +371,17 @@ pub(crate) fn import_failure_feeds_latch(e: &anyhow::Error) -> bool {
             r != vk::Result::ERROR_OUT_OF_DEVICE_MEMORY && r != vk::Result::ERROR_OUT_OF_HOST_MEMORY
         }
         None => true,
+    }
+}
+
+/// Context on an import error that [`reject_dmabuf`] took. The encode worker forwards only
+/// these as `capture_rebuild`, so the host's latch sees what an in-process encoder feeds it.
+#[derive(Debug)]
+pub(crate) struct ImportRejected;
+
+impl std::fmt::Display for ImportRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("dmabuf import refused")
     }
 }
 
@@ -467,6 +576,41 @@ pub(crate) unsafe fn make_plain_image(
 
 #[cfg(test)]
 mod tests {
+    /// Our `ANV_DEBUG` opt-in keeps the operator's flags and stays off ANV older than 26.2.
+    #[cfg(feature = "vulkan-encode")]
+    #[test]
+    fn anv_encode_opt_in_appends_and_gates_on_mesa() {
+        use super::{encode_trusted_for, with_token};
+        assert_eq!(
+            with_token(None, "video-encode").as_deref(),
+            Some("video-encode")
+        );
+        assert_eq!(
+            with_token(Some(""), "video-encode").as_deref(),
+            Some("video-encode")
+        );
+        assert_eq!(
+            with_token(Some("video-decode"), "video-encode").as_deref(),
+            Some("video-decode,video-encode")
+        );
+        assert_eq!(
+            with_token(Some("bindless,video-encode"), "video-encode"),
+            None
+        );
+
+        let mesa = |minor| ash::vk::make_api_version(0, 26, minor, 0);
+        assert!(!encode_trusted_for(0x8086, mesa(1), true));
+        assert!(encode_trusted_for(0x8086, mesa(2), true));
+        assert!(encode_trusted_for(
+            0x8086,
+            ash::vk::make_api_version(0, 27, 0, 0),
+            true
+        ));
+        // The operator's own flag, and every other vendor, pass on any version.
+        assert!(encode_trusted_for(0x8086, mesa(1), false));
+        assert!(encode_trusted_for(0x1002, mesa(1), true));
+    }
+
     #[test]
     fn ext_advertised_matches_exact_name() {
         let mut e = ash::vk::ExtensionProperties::default();

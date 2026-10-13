@@ -738,11 +738,22 @@ impl Presenter {
                     }
                 }
 
-                // `Redraw` on the direct path: the same planes and push constants, no new decode
-                // wait (the last real submit waited it) and no timeline signal (that value is
-                // spent). The native frame returns to its decode layout as on a real frame.
+                // `Redraw` of a frame drawn direct: the same planes and push constants, no new
+                // decode wait (the last real submit waited it) and no timeline signal (that value
+                // is spent). The native frame returns to its decode layout as on a real frame.
+                // Off the direct path (a new size or fit) the planes go to the video image first:
+                // a direct frame never wrote it.
                 Lane::Redraw => {
-                    if let (Some((l, _)), Some(target)) = (direct, direct_target) {
+                    let target = direct_target.or_else(|| {
+                        self.video.as_ref().map(|v| CscTarget::Video {
+                            framebuffer: v.framebuffer,
+                            extent: vk::Extent2D {
+                                width: v.width,
+                                height: v.height,
+                            },
+                        })
+                    });
+                    if let (Some(l), Some(target)) = (last, target) {
                         match l.src {
                             DirectSrc::Native => {
                                 if let Some(Retired::NativeVk(f)) = &self.retired_hw {
@@ -1130,18 +1141,39 @@ impl Presenter {
             // Monotonic present id for `PresentTimer`'s `vkWaitForPresentKHR`.
             let ids = [self.next_present_id + 1];
             let mut pid_info = vk::PresentIdKHR::default().present_ids(&ids);
-            let pid2_info = super::setup::present_wait2::PresentId2::new(&ids);
+            let mut pid2_info = super::setup::present_wait2::PresentId2::new(&ids);
+            // A stamp only while the swapchain's result queue has room: asking into a
+            // full one fails the present.
+            let ask = self
+                .timing
+                .as_ref()
+                .filter(|t| self.timing_armed && t.may_ask());
+            let timing_info = ask.map_or_else(
+                || super::timing_ext::TimingInfo::stamps(0, 0),
+                |t| t.request(),
+            );
+            let timings_info = super::timing_ext::TimingsInfo::new(&timing_info);
             let mut present_info = vk::PresentInfoKHR::default()
                 .wait_semaphores(&present_sems)
                 .swapchains(&swapchains)
                 .image_indices(&indices);
             // The id names the `done_sem` value either way; only present-wait carries it
             // to the driver, in the struct of the generation the waiter runs on.
-            if self.glass_active() {
+            let glass = self.glass_active();
+            if glass {
                 self.next_present_id += 1;
             }
+            // The compositor stamps the commit this present makes. Only a waiter's sample
+            // can take it; without one the answers would pile up unread.
+            #[cfg(target_os = "linux")]
+            if let Some(fb) = self.feedback.as_mut().filter(|_| glass && !redraw) {
+                fb.request(self.next_present_id);
+            }
             if self.present_id2 {
-                // Hand-rolled struct: the chain is empty here, so it is the whole chain.
+                // Hand-rolled structs: the chain is empty here, so they are the whole chain.
+                if ask.is_some() {
+                    pid2_info.p_next = (&timings_info) as *const _ as *const std::ffi::c_void;
+                }
                 present_info.p_next = (&pid2_info) as *const _ as *const std::ffi::c_void;
             } else if self.present_timer.is_some() {
                 present_info = present_info.push_next(&mut pid_info);
@@ -1158,11 +1190,16 @@ impl Presenter {
                 self.swap_d.queue_present(self.queue, &present_info)
             };
             self.last_present_us = present_started.elapsed().as_micros() as u32;
+            let asked = ask.is_some();
             match present_res {
                 Ok(present_suboptimal) => {
                     // A failed present's id may never signal — claim it only on Ok.
                     if self.glass_active() {
                         self.last_presented = Some((self.swapchain, self.next_present_id));
+                    }
+                    self.timing_asked = asked;
+                    if let Some(t) = self.timing.as_ref().filter(|_| asked) {
+                        t.note_asked();
                     }
                     if acquire_suboptimal || present_suboptimal {
                         tracing::info!(
@@ -1173,6 +1210,15 @@ impl Presenter {
                         self.recreate_swapchain(window)?;
                     }
                     Ok(Presented::Shown)
+                }
+                // The driver counted its result queue differently: stop asking, and take
+                // a swapchain whose queue is empty.
+                Err(super::timing_ext::QUEUE_FULL) => {
+                    tracing::warn!("present stamp queue full; presenting without stamps");
+                    self.timing = None;
+                    self.timing_armed = false;
+                    self.recreate_swapchain(window)?;
+                    Ok(Presented::Stale)
                 }
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
                 | Err(vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => {

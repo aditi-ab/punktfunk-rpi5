@@ -92,12 +92,10 @@ impl From<PixelFormat> for WireFormat {
             PixelFormat::Rgb => WireFormat::Rgb,
             PixelFormat::Bgr => WireFormat::Bgr,
             PixelFormat::Rgb10a2 => WireFormat::Rgb10a2,
-            // Windows-only (IDD-push 10-bit SDR). The Linux worker never sees it;
-            // the wire has no variant.
-            PixelFormat::Rgb10a2Sdr => {
-                unreachable!(
-                    "Rgb10a2Sdr is a Windows capture format — the Linux worker never sees it"
-                )
+            // Windows-only (IDD-push 10-bit SDR, and the HDR desktop's FP16). The Linux
+            // worker never sees them; the wire has no variant.
+            PixelFormat::Rgb10a2Sdr | PixelFormat::RgbaF16 => {
+                unreachable!("{f:?} is a Windows capture format — the Linux worker never sees it")
             }
             PixelFormat::Nv12 => WireFormat::Nv12,
             PixelFormat::P010 => WireFormat::P010,
@@ -257,7 +255,8 @@ pub(crate) fn recv_eintr<T: DeserializeOwned>(
     loop {
         if let Some(deadline) = deadline {
             let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
+            // Under a microsecond `set_recv_timeout` clears the timeout: that is spent too.
+            if left < Duration::from_micros(1) {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "encode worker did not answer within its budget",
@@ -608,9 +607,11 @@ fn encode_one(
     // AU is ready when `poll` returns and `frame` is alive across both halves.
     let t0 = Instant::now();
     if let Err(e) = enc.submit(&frame) {
+        // Only an import refusal: an OOM or a device loss must not latch the host's capture.
+        let rejected = e.downcast_ref::<super::vk_util::ImportRejected>().is_some();
         return Ok(FromWorker::EncodeErr {
             message: format!("{e:#}"),
-            capture_rebuild: true,
+            capture_rebuild: rejected,
         });
     }
     let Some(au) = enc.poll()? else {

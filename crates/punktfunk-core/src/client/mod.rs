@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 mod control;
 pub(crate) mod frame_channel;
+pub mod health;
 mod pad_mouse;
 mod pad_touch;
 mod pairing;
@@ -38,6 +39,7 @@ mod planes;
 mod probe;
 mod pump;
 mod recovery;
+mod resume;
 use crate::rumble;
 mod worker;
 
@@ -91,16 +93,28 @@ pub(crate) fn client_label() -> String {
         .clone()
 }
 
-/// Bracket a bare IPv6 literal so `SocketAddr` parse succeeds (`fd00::1` → `[fd00::1]:4770`).
-/// Without brackets the joined string never parses and the error blames the caller's input.
-/// V4, hostnames, and already-bracketed input pass through. A v6 dial still fails at connect
-/// while the sockets are IPv4-bound.
-fn join_host_port(host: &str, port: u16) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
+pub use crate::discovery::join_host_port;
+
+/// The address to dial: an IP literal as written, else the name's first IPv4 answer (MagicDNS,
+/// `.local`). The client endpoint binds IPv4, so a v6 answer is the fallback only.
+async fn dial_addr(host: &str, port: u16) -> Result<std::net::SocketAddr> {
+    if let Ok(addr) = join_host_port(host, port).parse() {
+        return Ok(addr);
     }
+    let mut first = None;
+    for addr in tokio::net::lookup_host((host, port)).await? {
+        if addr.is_ipv4() {
+            return Ok(addr);
+        }
+        first.get_or_insert(addr);
+    }
+    first.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{host} has no address"),
+        )
+        .into()
+    })
 }
 
 /// Hard cap, not working depth: 12 × 10–20 ms frames ≈ 120–240 ms. A filled tokio mpsc
@@ -264,9 +278,6 @@ pub struct NativeClient {
     pub host_caps2: u8,
     /// `0` when the host did not advertise a management port.
     pub mgmt_port: u16,
-    /// Shared loss-range detector for [`note_frame_index`](Self::note_frame_index): next
-    /// expected `frame_index` plus RFI throttle. Avoids per-embedder wrapping arithmetic.
-    rfi: Mutex<RfiRecovery>,
     /// `displayed + clock_offset − pts` (ns). `0` = nothing presented yet. Presenter writes;
     /// audio reads to land with the picture ([`crate::audio::AvSync`]). Lives next to
     /// `clock_offset` because neither plane owns the other.
@@ -426,6 +437,62 @@ fn register_hot_tid(reg: &Mutex<Vec<i32>>) {
     }
 }
 
+/// Queue an RFI and log it at info, the most Android keeps. `missing_shards` is what
+/// `first_frame` lacked past its parity when its tail arrived or a later frame overtook
+/// it; absent when none of it arrived.
+fn send_rfi(
+    shared: &ClientShared,
+    ctrl_tx: &tokio::sync::mpsc::Sender<CtrlRequest>,
+    first_frame: u32,
+    last_frame: u32,
+) -> Result<()> {
+    ctrl_tx
+        .try_send(CtrlRequest::Rfi(RfiRequest {
+            first_frame,
+            last_frame,
+        }))
+        .map_err(|_| PunktfunkError::Closed)?;
+    let short = shared.short_frames.lock().unwrap().get(first_frame);
+    tracing::info!(
+        first = first_frame,
+        last = last_frame,
+        missing_shards = short.map(|s| s.0),
+        recovery_shards = short.map(|s| s.1),
+        "reference-frame invalidation requested"
+    );
+    Ok(())
+}
+
+/// Queue an IDR ask and drop the lost range an RFI still owes; the IDR repairs it.
+fn send_keyframe(
+    shared: &ClientShared,
+    ctrl_tx: &tokio::sync::mpsc::Sender<CtrlRequest>,
+) -> Result<()> {
+    ctrl_tx
+        .try_send(CtrlRequest::Keyframe)
+        .map_err(|_| PunktfunkError::Closed)?;
+    shared.rfi.lock().unwrap().keyframe_requested();
+    Ok(())
+}
+
+/// Fire a recovery ask. Call with the `rfi` lock released.
+fn send_recovery(
+    shared: &ClientShared,
+    ctrl_tx: &tokio::sync::mpsc::Sender<CtrlRequest>,
+    ask: RecoveryAsk,
+) {
+    match ask {
+        RecoveryAsk::Rfi(first, last) => {
+            let _ = send_rfi(shared, ctrl_tx, first, last);
+        }
+        // Wider than RFI_MAX_RANGE: RFI cannot repair it; resync on a keyframe.
+        RecoveryAsk::Keyframe => {
+            let _ = send_keyframe(shared, ctrl_tx);
+        }
+        RecoveryAsk::None => {}
+    }
+}
+
 /// Default [`NativeClient::connect`] `name`: `/etc/hostname`, then env, then OS hostname.
 /// Lives here so the C ABI (`punktfunk_connect`) shares it.
 ///
@@ -533,6 +600,10 @@ pub struct ConnectParams {
     pub client_caps: u8,
     /// AU prefixes as [`Frame`]s with `part = Some`. Only for a decoder that takes parts.
     pub frame_parts: bool,
+    /// Offer `punktfunk/2` (ALPN `pkf2`) before `punktfunk/1`; the host picks. One that answers
+    /// it carries media on the connection's own socket; one that does not runs `punktfunk/1`.
+    /// [`ConnectParams::new`] sets it from [`offer_v2_from_env`].
+    pub offer_v2: bool,
     /// Store-qualified library id to launch (`steam:570`).
     pub launch: Option<String>,
     /// [`crate::quic::Hello::name`], usually [`device_name`]. `None` knocks as "device abcd1234".
@@ -545,11 +616,31 @@ pub struct ConnectParams {
     /// Settings preset this dial names ([`crate::quic::EXT_TAG_PRESET`]); the host shows it and
     /// hands it to hooks, the stream is unchanged. `None` names none.
     pub preset: Option<crate::quic::SessionPreset>,
+    /// The delivery profile to stream under and what to ask besides
+    /// ([`crate::quic::EXT_TAG_DELIVERY`]); `None` asks nothing. A host that reads it answers
+    /// in [`NativeClient::delivery`].
+    pub delivery: Option<crate::quic::DeliveryAsk>,
     /// Handshake budget. The dial re-dials inside it, so a waking host is not a failure.
     pub timeout: Duration,
     /// Abort while blocked: a request-access knock parks ~185 s. Never alias the session's
     /// `shutdown` onto it; that races the end reason. `None` = uncancelable.
     pub cancel: Option<Arc<AtomicBool>>,
+}
+
+/// Whether a dial offers `punktfunk/2`. `PUNKTFUNK_PROTOCOL=1` pins `punktfunk/1`; unset or
+/// `2` offers both and the host picks. Any other value is logged and offers both.
+pub fn offer_v2_from_env() -> bool {
+    match std::env::var("PUNKTFUNK_PROTOCOL") {
+        Err(_) => true,
+        Ok(v) => match v.trim() {
+            "1" => false,
+            "2" => true,
+            other => {
+                tracing::warn!(value = other, "unknown PUNKTFUNK_PROTOCOL value");
+                true
+            }
+        },
+    }
 }
 
 impl ConnectParams {
@@ -573,11 +664,13 @@ impl ConnectParams {
             display_hdr: None,
             client_caps: 0,
             frame_parts: false,
+            offer_v2: offer_v2_from_env(),
             launch: None,
             name: None,
             pin: None,
             identity: None,
             preset: None,
+            delivery: None,
             timeout,
             cancel: None,
         }
@@ -619,6 +712,7 @@ impl NativeClient {
             std::sync::mpsc::sync_channel::<crate::quic::AccessUpdate>(ACCESS_QUEUE);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Negotiated>>();
         let shared = Arc::new(ClientShared::new(params.mode));
+        *shared.delivery_ask.lock().unwrap() = params.delivery;
 
         let cancel = params.cancel.take();
         let (timeout, bitrate_kbps, requested_gamepad) =
@@ -677,7 +771,11 @@ impl NativeClient {
         let negotiated = loop {
             match ready_rx.recv_timeout(READY_POLL) {
                 Ok(Ok(t)) => break t,
-                Ok(Err(e)) => return Err(e),
+                Ok(Err(e)) => {
+                    // Stops what the handshake already started, such as the data punch.
+                    shared.shutdown.store(true, Ordering::SeqCst);
+                    return Err(e);
+                }
                 // Keep waiting unless budget spent or cancelled. Disconnected = worker died
                 // without reporting; the give-up arm below covers it. Cancel and expiry share
                 // that arm: both owe the host the same close.
@@ -721,7 +819,6 @@ impl NativeClient {
             host_caps2: negotiated.host_caps2,
             mgmt_port: negotiated.mgmt_port,
             worker: Some(worker),
-            rfi: Mutex::new(RfiRecovery::default()),
             video_e2e_ns: Arc::new(AtomicU64::new(0)),
             audio_av_offset_ms: Arc::new(AtomicI64::new(0)),
             audio_buffer_ms: Arc::new(AtomicU32::new(0)),
@@ -776,9 +873,7 @@ impl NativeClient {
             .ok()?;
         let host = host.to_string();
         rt.block_on(async move {
-            // Hostname (MagicDNS, `.local`), not always an IP literal — resolve, don't parse.
-            let mut addrs = tokio::net::lookup_host((host.as_str(), port)).await.ok()?;
-            let remote = addrs.next()?;
+            let remote = dial_addr(&host, port).await.ok()?;
             // pin = None accepts any cert and records it. Failures are DNS / no route /
             // connect timeout.
             let (ep, observed) = endpoint::client_pinned_with_identity(None, None);
@@ -825,11 +920,7 @@ impl NativeClient {
     /// requests flood the control stream. Drops the lost range an RFI still owes; the
     /// IDR repairs it.
     pub fn request_keyframe(&self) -> Result<()> {
-        self.ctrl_tx
-            .try_send(CtrlRequest::Keyframe)
-            .map_err(|_| PunktfunkError::Closed)?;
-        self.rfi.lock().unwrap().keyframe_requested();
-        Ok(())
+        send_keyframe(&self.shared, &self.ctrl_tx)
     }
 
     /// Recover `[first_frame, last_frame]` by RFI instead of a full IDR. Capable hosts emit a
@@ -837,29 +928,14 @@ impl NativeClient {
     /// ([`request_keyframe`](Self::request_keyframe)). Prefer on loss; keyframe is the backstop
     /// when the recovery frame itself is lost. Fire-and-forget; throttle like keyframe.
     ///
-    /// Every RFI a client sends passes here and is logged at info, the most Android keeps.
-    /// `missing_shards` is what `first_frame` lacked past its parity when a later frame
-    /// overtook it; absent when none of it arrived.
+    /// Every RFI a client sends is logged at info with what its first frame lacked.
     pub fn request_rfi(&self, first_frame: u32, last_frame: u32) -> Result<()> {
-        self.ctrl_tx
-            .try_send(CtrlRequest::Rfi(RfiRequest {
-                first_frame,
-                last_frame,
-            }))
-            .map_err(|_| PunktfunkError::Closed)?;
-        let short = self.shared.short_frames.lock().unwrap().get(first_frame);
-        tracing::info!(
-            first = first_frame,
-            last = last_frame,
-            missing_shards = short.map(|s| s.0),
-            recovery_shards = short.map(|s| s.1),
-            "reference-frame invalidation requested"
-        );
-        Ok(())
+        send_rfi(&self.shared, &self.ctrl_tx, first_frame, last_frame)
     }
 
     /// Feed each received AU's `frame_index` (receive order). A forward gap fires a throttled
-    /// [`request_rfi`](Self::request_rfi) for `[first_missing, frame_index-1]`. Call every frame;
+    /// [`request_rfi`](Self::request_rfi) for `[first_missing, frame_index-1]`, less frames the
+    /// pump already asked for when their tail arrived short. Call every frame;
     /// [`frames_dropped`](Self::frames_dropped) + [`request_keyframe`](Self::request_keyframe)
     /// stays the backstop when the recovery frame is lost.
     ///
@@ -871,11 +947,12 @@ impl NativeClient {
     pub fn observe_frame_index(&self, frame_index: u32) -> FrameOrder {
         // Update under the lock; fire the request after releasing it.
         let (order, ask) = self
+            .shared
             .rfi
             .lock()
             .unwrap()
             .observe(frame_index, Instant::now());
-        self.send_recovery(ask);
+        send_recovery(&self.shared, &self.ctrl_tx, ask);
         order
     }
 
@@ -884,22 +961,8 @@ impl NativeClient {
     /// the next arrival; [`observe_frame_index`](Self::observe_frame_index) sends it
     /// there too.
     pub fn flush_frame_recovery(&self) {
-        let ask = self.rfi.lock().unwrap().flush(Instant::now());
-        self.send_recovery(ask);
-    }
-
-    /// Fire a recovery ask. Called after the `rfi` lock is released.
-    fn send_recovery(&self, ask: RecoveryAsk) {
-        match ask {
-            RecoveryAsk::Rfi(first, last) => {
-                let _ = self.request_rfi(first, last);
-            }
-            // Wider than RFI_MAX_RANGE: RFI cannot repair it; resync on a keyframe.
-            RecoveryAsk::Keyframe => {
-                let _ = self.request_keyframe();
-            }
-            RecoveryAsk::None => {}
-        }
+        let ask = self.shared.rfi.lock().unwrap().flush(Instant::now());
+        send_recovery(&self.shared, &self.ctrl_tx, ask);
     }
 
     /// [`observe_frame_index`](Self::observe_frame_index) as the gap width, `0` when none.
@@ -1165,10 +1228,30 @@ impl NativeClient {
             }));
     }
 
-    /// Burst filler at `target_kbps` for `duration_ms`, pausing video. Non-blocking; poll
+    /// Burst filler at `target_kbps` for `duration_ms` beside the video. Non-blocking; poll
     /// [`NativeClient::probe_result`] until `done`. Resets any prior measurement. Host clamps
     /// ≤ 10 Gbps, ≤ 5 s.
     pub fn request_probe(&self, target_kbps: u32, duration_ms: u32) -> Result<()> {
+        self.send_probe(
+            duration_ms,
+            CtrlRequest::Probe(ProbeRequest {
+                target_kbps,
+                duration_ms,
+            }),
+        )
+    }
+
+    /// A shaped burst ([`crate::quic::ProbeShaped`]): frame-sized bursts at line rate, or
+    /// capped groups, at the same average rate. Same polling as [`Self::request_probe`].
+    /// Refused toward a host that never answered the delivery tag ([`Self::delivery`]).
+    pub fn request_probe_shaped(&self, shape: crate::quic::ProbeShaped) -> Result<()> {
+        self.delivery().ok_or(PunktfunkError::Unsupported(
+            "host does not read delivery messages",
+        ))?;
+        self.send_probe(shape.duration_ms, CtrlRequest::ProbeShaped(shape))
+    }
+
+    fn send_probe(&self, duration_ms: u32, req: CtrlRequest) -> Result<()> {
         *self.shared.probe.lock().unwrap() = ProbeState {
             active: true,
             duration_ms,
@@ -1176,10 +1259,7 @@ impl NativeClient {
         };
         let sent = self
             .ctrl_tx
-            .try_send(CtrlRequest::Probe(ProbeRequest {
-                target_kbps,
-                duration_ms,
-            }))
+            .try_send(req)
             .map_err(|_| PunktfunkError::Closed);
         if sent.is_err() {
             // Send failed: nothing will answer. Leaving `active` would suppress the pump's
@@ -1187,6 +1267,70 @@ impl NativeClient {
             self.shared.probe.lock().unwrap().active = false;
         }
         sent
+    }
+
+    /// Stream under `profile` (`0` burst, `1` capped, `2` smooth) from the next frame; the
+    /// host's answer lands in [`Self::delivery`]. Refused toward a host that never answered
+    /// the delivery tag.
+    pub fn set_delivery(&self, profile: u8) -> Result<()> {
+        self.delivery().ok_or(PunktfunkError::Unsupported(
+            "host does not read delivery messages",
+        ))?;
+        self.ctrl_tx
+            .try_send(CtrlRequest::SetDelivery(profile))
+            .map_err(|_| PunktfunkError::Closed)
+    }
+
+    /// The profile this session streams under, as the host last said, and whether the host
+    /// pins one for every session. `None` until the host answers — for ever, from one that
+    /// does not read the tag, or when the dial asked nothing.
+    pub fn delivery(&self) -> Option<crate::quic::DeliveryChanged> {
+        *self.shared.delivery.lock().unwrap()
+    }
+
+    /// The protocol this session runs: `2` when the host answered `punktfunk/2`, else `1`.
+    pub fn wire(&self) -> u8 {
+        self.shared.wire.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// What the host said about its end of the path, when the dial asked for it.
+    pub fn host_facts(&self) -> Option<crate::quic::HostFacts> {
+        *self.shared.host_facts.lock().unwrap()
+    }
+
+    /// This dial's delivery ask ([`ConnectParams::delivery`]).
+    pub fn delivery_ask(&self) -> Option<crate::quic::DeliveryAsk> {
+        *self.shared.delivery_ask.lock().unwrap()
+    }
+
+    /// A diagnostic session: the dial asked for probes only, so no video ever comes.
+    pub fn probe_only(&self) -> bool {
+        self.shared.probe_only()
+    }
+
+    /// Packets the OS dropped at this session's receive buffer so far; `None` where the
+    /// platform keeps no per-socket figure ([`crate::transport::sockstat`]).
+    pub fn socket_drops(&self) -> Option<u64> {
+        let sock = self.shared.data_sock.lock().unwrap();
+        sock.as_ref()
+            .and_then(crate::transport::sockstat::socket_drops)
+    }
+
+    /// The receive buffer the OS granted the data socket, KiB; `0` before the dial lands.
+    pub fn recv_buffer_kb(&self) -> u32 {
+        let sock = self.shared.data_sock.lock().unwrap();
+        sock.as_ref()
+            .map_or(0, crate::transport::sockstat::recv_buffer_kb)
+    }
+
+    /// The address this session's data leaves from, once the dial has landed.
+    pub fn local_ip(&self) -> Option<std::net::IpAddr> {
+        let sock = self.shared.data_sock.lock().unwrap();
+        sock.as_ref()
+            .and_then(|s| s.local_addr().ok())
+            .map(|a| a.ip())
+            .filter(|ip| !ip.is_unspecified())
+            .or(*self.shared.local_ip.lock().unwrap())
     }
 
     /// Whether a burst is in flight — an embedder speed test or the startup capacity probe. Loss
@@ -1245,6 +1389,9 @@ impl NativeClient {
             host_drop_pct,
             wire_packets_sent: p.host_wire_packets,
             send_dropped: p.host_send_dropped,
+            gap_p50_us: crate::stats::probe_gap_percentile(&p.gap_buckets, 0.5),
+            gap_p99_us: crate::stats::probe_gap_percentile(&p.gap_buckets, 0.99),
+            reorders: p.reorders,
         }
     }
 
@@ -1743,7 +1890,30 @@ mod latest_of_tests {
 
 #[cfg(test)]
 mod host_port_tests {
-    use super::join_host_port;
+    use super::{dial_addr, join_host_port};
+
+    #[test]
+    fn a_name_dials_its_ipv4_answer_and_a_literal_dials_as_written() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let at = |s: &str| s.parse::<std::net::SocketAddr>().unwrap();
+            assert_eq!(
+                dial_addr("localhost", 9777).await.unwrap(),
+                at("127.0.0.1:9777")
+            );
+            assert_eq!(
+                dial_addr("fd00::1", 9777).await.unwrap(),
+                at("[fd00::1]:9777")
+            );
+            assert_eq!(
+                dial_addr("192.168.1.9", 9777).await.unwrap(),
+                at("192.168.1.9:9777")
+            );
+        });
+    }
 
     #[test]
     fn brackets_bare_ipv6_only() {

@@ -38,6 +38,18 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
+/// A session found SDR wide colour refused on this host's virtual display. Later handshakes
+/// then stop offering a 10-bit SDR source without the widening opt-in.
+static WCG_REFUSED: AtomicBool = AtomicBool::new(false);
+
+/// A 10-bit SDR session can compose in SDR wide colour: Windows 11 24H2, and no refusal on
+/// this host yet. Before the first session tries, the OS build alone answers.
+pub(crate) fn wcg_available() -> bool {
+    static BUILD: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    !WCG_REFUSED.load(Ordering::Relaxed)
+        && *BUILD.get_or_init(pf_win_display::os_build) >= pf_win_display::WCG_MIN_BUILD
+}
+
 /// Map-only on the driver's section duplicate. No OWNER / `WRITE_DAC` / DELETE.
 const SECTION_MAP_RW: u32 = 0x0004 | 0x0002;
 /// Driver only `SetEvent`s; host keeps `SYNCHRONIZE` on its own handle.
@@ -50,7 +62,7 @@ fn now_ns() -> u64 {
         .unwrap_or(0)
 }
 
-/// `PUNKTFUNK_IDD_DIAG` — the one gate for this capturer's diagnostics: the micro-probe engine,
+/// `PUNKTFUNK_IDD_DIAG` — the gate for this capturer's full diagnostics: the micro-probe engine,
 /// the DxgKrnl ETW session and the access-unit dump. All three are off in a normal session,
 /// because standing fence/scanline/DWM traffic and an ETW session alter the very path a
 /// disturbance report describes.
@@ -71,6 +83,17 @@ pub(super) fn diag_dir() -> Option<&'static std::path::Path> {
         }
     })
     .as_deref()
+}
+
+/// `PUNKTFUNK_IDD_FLOW` — the DxgKrnl ETW session alone, printing a present-flow line every ten
+/// seconds. For a field host: [`diag_dir`] also dumps every access unit to disk. Read once per
+/// process.
+pub(super) fn flow_watch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("PUNKTFUNK_IDD_FLOW")
+            .is_ok_and(|v| !matches!(v.trim(), "" | "0" | "off" | "false"))
+    })
 }
 
 /// File mapping + mapped view. Drop unmaps, then [`OwnedHandle`] closes.
@@ -194,6 +217,9 @@ mod recovery;
 // The capturer end of that ladder: the classifier inputs and the rungs it runs here.
 #[path = "idd_push/health.rs"]
 mod health;
+// Full GPU clocks on NVIDIA for as long as the driver's NVENC session is open.
+#[path = "idd_push/clock_boost.rs"]
+mod clock_boost;
 // In-driver encode: the AU section, `SET_ENCODE`, and the `Encoder` proxy over `ENCODE_CTL`.
 #[path = "idd_push/driver_encode.rs"]
 pub(crate) mod driver_encode;
@@ -263,11 +289,16 @@ pub struct IddPushCapturer {
     /// Handshake advertised `VIDEO_CAP_HDR` (not merely 10-bit). Pins composition
     /// so an SDR client never gets in-band PQ.
     want_hdr: bool,
-    /// 10-bit SDR: the driver expands BGRA 8→10 into [`PixelFormat::Rgb10a2Sdr`]. Display
-    /// colour is never touched — `want_hdr` stays false.
+    /// 10-bit SDR: composed in SDR wide colour where Windows allows it (`want_wcg`), else the
+    /// driver's encoder widens BGRA itself. `want_hdr` stays false either way.
     ten_bit_sdr: bool,
+    /// Wide colour took at open, so the session keeps it pinned on; off pins it off.
+    want_wcg: bool,
     /// Live `advanced_color_enabled`. A change re-opens the driver's encoder.
     display_hdr: bool,
+    /// Live SDR wide colour: the driver reads FP16 for an SDR stream. A change re-opens the
+    /// driver's encoder.
+    display_wcg: bool,
     /// One-shot: the display refused the negotiated depth (poller is ~4 Hz).
     hdr_pin_warned: bool,
     /// Failed pin attempts. Past [`Self::HDR_PIN_EAGER`] retry every
@@ -310,7 +341,8 @@ pub struct IddPushCapturer {
     /// Micro-probe singleton; `None` unless [`diag_dir`] is on. A missing window reads as
     /// never-stalled, so a report never invents a leg.
     probes: Option<Arc<probes::ProbeEngine>>,
-    /// DxgKrnl ETW; `None` unless [`diag_dir`] is on, or the session refused to start.
+    /// DxgKrnl ETW; `None` unless [`diag_dir`] or [`flow_watch`] is on, or the session refused
+    /// to start.
     etw: Option<Arc<dxgkrnl_etw::EtwWatch>>,
     /// `PowerRequestDisplayRequired` for this capturer's life: DWM composes nothing
     /// once the console goes dark. It only keeps a lit display on; the monitor create wakes one.

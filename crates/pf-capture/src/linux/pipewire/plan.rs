@@ -13,6 +13,8 @@ pub(in crate::linux) struct NegotiationInputs {
     /// `PUNKTFUNK_FORCE_SHM` — race-free download path.
     pub force_shm: bool,
     pub want_hdr: bool,
+    /// The producer offers 10-bit SDR: a 10-bit SDR session takes its P010 where HDR does.
+    pub sdr10_native: bool,
     pub want_444: bool,
     pub backend_is_vaapi: bool,
     pub pyrowave_session: bool,
@@ -24,6 +26,8 @@ pub(in crate::linux) struct NegotiationInputs {
     /// Previous EGL→CUDA dmabuf-only offer timed out (compositor accepts none of the modifiers).
     pub gpu_dmabuf_negotiation_failed: bool,
     pub native_nv12_env_on: bool,
+    /// A planar frame this capture could not pass through (`ZeroCopyHealth::planar_refused`).
+    pub planar_refused: bool,
     /// Encoder can ingest packed 10-bit PQ CUDA. Only direct-SDK NVENC can.
     pub hdr_cuda_ok: bool,
     /// `PUNKTFUNK_NV12`: the CUDA import emits NV12 (tiled blit or LINEAR compute CSC).
@@ -80,8 +84,8 @@ pub(in crate::linux) struct NegotiationPlan {
     pub nvenc_raw: bool,
     pub vaapi_passthrough: bool,
     pub prefer_native_nv12: bool,
-    /// The HDR twin of [`prefer_native_nv12`](Self::prefer_native_nv12): gamescope's P010
-    /// pod goes first.
+    /// The 10-bit twin of [`prefer_native_nv12`](Self::prefer_native_nv12): gamescope's P010
+    /// pod goes first, PQ for HDR or BT.709 for its own 10-bit SDR.
     pub prefer_native_p010: bool,
     /// Carried so [`want_dmabuf`](Self::want_dmabuf) needs no second copy.
     pub force_shm: bool,
@@ -97,9 +101,10 @@ pub(in crate::linux) struct NegotiationPlan {
 /// 1. HDR never takes the 8-bit EGL de-tile blit. An EGL/CUDA fallback offers LINEAR;
 ///    direct raw lanes may offer proved tiled formats, guarded again per frame.
 /// 2. 4:4:4 never prefers producer NV12 or P010 (must not subsample).
-/// 3. Producer-native planar only on a `native_nv12_session` under active raw passthrough
-///    (the VAAPI session takes RGB; the CUDA importer expects packed RGB): NV12 for SDR,
-///    P010 for HDR.
+/// 3. Producer-native planar only on a `native_nv12_session` under a raw lane (VAAPI's
+///    passthrough or NVENC's): NV12 at 8 bits, P010 for HDR and for a producer's own 10-bit
+///    SDR. The CUDA importer expects packed RGB, so a tripped raw latch withdraws the planar
+///    offer, and so does a planar frame the passthrough declined (`planar_refused`).
 /// 4. Raw passthrough is off once its latch has fired.
 pub(in crate::linux) fn negotiation_plan(i: NegotiationInputs) -> NegotiationPlan {
     // Consumer imports raw dmabufs: VAAPI (libva + GPU CSC) or PyroWave (its Vulkan device).
@@ -115,21 +120,25 @@ pub(in crate::linux) fn negotiation_plan(i: NegotiationInputs) -> NegotiationPla
         && (!i.want_hdr || i.hdr_cuda_ok);
     let vaapi_passthrough =
         i.zerocopy && !i.force_shm && raw_passthrough && !i.raw_dmabuf_import_disabled;
+    let nvenc_raw = build_importer && i.nvenc_raw && !i.force_shm && !i.raw_dmabuf_import_disabled;
+    // NVENC's raw lane copies a producer NV12 or P010 into its slot.
+    let planar_lane = (i.backend_is_vaapi && vaapi_passthrough) || nvenc_raw;
     let native_planar = i.native_nv12_env_on
+        && !i.planar_refused
         && i.native_nv12_session
-        && i.backend_is_vaapi
-        && vaapi_passthrough
+        && planar_lane
         && !i.pyrowave_session
         && !i.want_444;
-    let prefer_native_nv12 = native_planar && !i.want_hdr;
-    let prefer_native_p010 = native_planar && i.want_hdr;
+    let ten_bit = i.want_hdr || i.sdr10_native;
+    let prefer_native_nv12 = native_planar && !ten_bit;
+    let prefer_native_p010 = native_planar && ten_bit;
     NegotiationPlan {
         build_importer,
         import_policy: ImportPolicy {
             nv12: i.nv12_env_on,
             yuv444: i.want_444,
         },
-        nvenc_raw: build_importer && i.nvenc_raw && !i.force_shm && !i.raw_dmabuf_import_disabled,
+        nvenc_raw,
         vaapi_passthrough,
         prefer_native_nv12,
         prefer_native_p010,
@@ -366,21 +375,28 @@ pub(super) enum PassthroughFallbackAction {
     Cpu,
     /// The tiled modifier failed: refuse it for this identity and rebuild on LINEAR.
     DropTiledAndRebuild,
+    /// A LINEAR NV12/P010 frame failed: refuse the planar offer for this identity and
+    /// rebuild on packed RGB.
+    DropPlanarAndRebuild,
 }
 
 /// The action for a passthrough break. A nonzero modifier is never de-padded: a
 /// tiled buffer read as linear is a scrambled picture, so any failure on it
-/// retires the tiled offer itself. On LINEAR, keep today's split.
+/// retires the tiled offer itself. The CPU de-pad reads one packed plane, so a
+/// planar frame bound for it retires the planar offer instead.
 pub(super) fn passthrough_fallback_action(
     reason: PassthroughFallback,
     modifier: u64,
+    planar: bool,
 ) -> PassthroughFallbackAction {
     if modifier != 0 {
         PassthroughFallbackAction::DropTiledAndRebuild
-    } else if reason.falls_back_to_cpu() {
-        PassthroughFallbackAction::Cpu
-    } else {
+    } else if !reason.falls_back_to_cpu() {
         PassthroughFallbackAction::Drop
+    } else if planar {
+        PassthroughFallbackAction::DropPlanarAndRebuild
+    } else {
+        PassthroughFallbackAction::Cpu
     }
 }
 
@@ -427,8 +443,8 @@ pub(in crate::linux) fn gpu_import(
         return ImportOutcome::Dropped; // format has no DRM fourcc mapping
     };
     let modifier = (modifier != 0).then_some(modifier);
-    let ten_bit = fmt.is_hdr_rgb10();
-    // The raw lane let go of a tiled HDR stream. Rebuild it on the LINEAR offer.
+    let ten_bit = fmt.is_rgb10();
+    // The raw lane let go of a tiled 10-bit stream. Rebuild it on the LINEAR offer.
     if ten_bit && modifier.is_some() {
         if signals.health.refuse_hdr_tiled() {
             tracing::warn!(
@@ -594,6 +610,7 @@ mod tests {
             zerocopy: true,
             force_shm: false,
             want_hdr: false,
+            sdr10_native: false,
             want_444: false,
             backend_is_vaapi: false,
             pyrowave_session: false,
@@ -602,6 +619,7 @@ mod tests {
             gpu_import_disabled: false,
             gpu_dmabuf_negotiation_failed: false,
             native_nv12_env_on: true,
+            planar_refused: false,
             hdr_cuda_ok: true,
             nv12_env_on: true,
             nvenc_raw: false,
@@ -615,6 +633,32 @@ mod tests {
             native_nv12_session: true,
             ..nvenc()
         }
+    }
+
+    /// A producer's own 10-bit SDR takes P010 where HDR does, on both planar lanes; 4:4:4
+    /// still refuses it.
+    #[test]
+    fn producer_sdr10_takes_p010() {
+        let nvenc_native = NegotiationInputs {
+            nvenc_raw: true,
+            native_nv12_session: true,
+            ..nvenc()
+        };
+        for base in [vaapi_native_nv12(), nvenc_native] {
+            let p = negotiation_plan(NegotiationInputs {
+                sdr10_native: true,
+                ..base
+            });
+            assert!(p.prefer_native_p010 && !p.prefer_native_nv12);
+        }
+        assert!(
+            !negotiation_plan(NegotiationInputs {
+                sdr10_native: true,
+                want_444: true,
+                ..vaapi_native_nv12()
+            })
+            .prefer_native_p010
+        );
     }
 
     /// Pins the four invariants documented on [`negotiation_plan`].
@@ -703,6 +747,72 @@ mod tests {
             .prefer_native_nv12,
             "no passthrough (force_shm) ⇒ no native NV12"
         );
+        for want_hdr in [false, true] {
+            let p = negotiation_plan(NegotiationInputs {
+                planar_refused: true,
+                want_hdr,
+                ..vaapi_native_nv12()
+            });
+            assert!(!p.prefer_native_nv12 && !p.prefer_native_p010);
+            assert!(
+                p.vaapi_passthrough,
+                "a planar refusal keeps packed passthrough"
+            );
+        }
+        // NVENC's raw lane takes a producer NV12 or P010 (copied into its slot), and a tripped
+        // raw latch or a lane-less session withdraws it: the importer reads RGB only.
+        let nvenc_native = NegotiationInputs {
+            nvenc_raw: true,
+            native_nv12_session: true,
+            ..nvenc()
+        };
+        assert!(negotiation_plan(nvenc_native).prefer_native_nv12);
+        let hdr = negotiation_plan(NegotiationInputs {
+            want_hdr: true,
+            ..nvenc_native
+        });
+        assert!(hdr.prefer_native_p010 && !hdr.prefer_native_nv12);
+        for (why, inputs) in [
+            (
+                "HDR raw latch",
+                NegotiationInputs {
+                    want_hdr: true,
+                    raw_dmabuf_import_disabled: true,
+                    ..nvenc_native
+                },
+            ),
+            (
+                "4:4:4",
+                NegotiationInputs {
+                    want_444: true,
+                    ..nvenc_native
+                },
+            ),
+            (
+                "raw latch",
+                NegotiationInputs {
+                    raw_dmabuf_import_disabled: true,
+                    ..nvenc_native
+                },
+            ),
+            (
+                "no raw lane",
+                NegotiationInputs {
+                    nvenc_raw: false,
+                    ..nvenc_native
+                },
+            ),
+            (
+                "SHM",
+                NegotiationInputs {
+                    force_shm: true,
+                    ..nvenc_native
+                },
+            ),
+        ] {
+            let p = negotiation_plan(inputs);
+            assert!(!p.prefer_native_nv12 && !p.prefer_native_p010, "{why}");
+        }
         // A PyroWave session takes the passthrough but its CSC ingests packed RGB only.
         for want_hdr in [false, true] {
             let p = negotiation_plan(NegotiationInputs {
@@ -987,11 +1097,11 @@ mod tests {
         assert!(PassthroughFallback::NoHold.falls_back_to_cpu());
     }
 
-    /// A tiled buffer can never take the CPU de-pad — any failure on a nonzero
-    /// modifier retires the tiled offer and rebuilds the capture on LINEAR.
-    /// LINEAR keeps the per-reason split.
+    /// Neither a tiled nor a planar buffer can take the CPU de-pad: a failure on a nonzero
+    /// modifier rebuilds on LINEAR, and a planar LINEAR one bound for the CPU rebuilds on
+    /// packed RGB. Packed LINEAR keeps the per-reason split.
     #[test]
-    fn tiled_passthrough_failures_rebuild_on_linear() {
+    fn tiled_and_planar_passthrough_failures_rebuild() {
         let all = [
             PassthroughFallback::NoFormat,
             PassthroughFallback::NotDmabuf,
@@ -1002,18 +1112,28 @@ mod tests {
         ];
         for reason in all {
             for modifier in [1u64, 0x100000000000001, 0x200000000000a04] {
-                assert_eq!(
-                    passthrough_fallback_action(reason, modifier),
-                    PassthroughFallbackAction::DropTiledAndRebuild,
-                    "{reason:?} on modifier {modifier:#x} must refuse the tiled offer"
-                );
+                for planar in [false, true] {
+                    assert_eq!(
+                        passthrough_fallback_action(reason, modifier, planar),
+                        PassthroughFallbackAction::DropTiledAndRebuild,
+                        "{reason:?} on modifier {modifier:#x} must refuse the tiled offer"
+                    );
+                }
             }
-            let linear = passthrough_fallback_action(reason, 0);
-            let want = match reason {
-                PassthroughFallback::NoFormat => PassthroughFallbackAction::Drop,
-                _ => PassthroughFallbackAction::Cpu,
+            let linear = passthrough_fallback_action(reason, 0, false);
+            let planar = passthrough_fallback_action(reason, 0, true);
+            let (want, want_planar) = match reason {
+                PassthroughFallback::NoFormat => (
+                    PassthroughFallbackAction::Drop,
+                    PassthroughFallbackAction::Drop,
+                ),
+                _ => (
+                    PassthroughFallbackAction::Cpu,
+                    PassthroughFallbackAction::DropPlanarAndRebuild,
+                ),
             };
             assert_eq!(linear, want, "{reason:?} on LINEAR");
+            assert_eq!(planar, want_planar, "{reason:?} on planar LINEAR");
         }
     }
 }

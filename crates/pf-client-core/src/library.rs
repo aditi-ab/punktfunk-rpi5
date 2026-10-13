@@ -93,6 +93,30 @@ pub struct GameEntry {
     /// Host play stats. `None` until the host has launched the title once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats: Option<GameStats>,
+    /// Whether the title's files are on the host. `None`: installed, as every title a plugin
+    /// doesn't install is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install: Option<TitleInstall>,
+}
+
+/// A title's files on the host, from the library entry's `install`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TitleInstall {
+    /// `installed` or `missing`; a word this build doesn't know reads as installed.
+    #[serde(default)]
+    pub state: String,
+    /// The download size while missing, the size on disk once installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    /// Free space where the download goes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_bytes: Option<u64>,
+}
+
+impl TitleInstall {
+    pub fn missing(&self) -> bool {
+        self.state == "missing"
+    }
 }
 
 /// One title's play numbers as the host keeps them: the last launch (unix ms), total and
@@ -343,6 +367,324 @@ pub struct RunningGame {
     pub endable: bool,
 }
 
+/// One title's download, from `GET /api/v1/status` `downloads[]`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct DownloadProgress {
+    #[serde(default)]
+    pub app_id: String,
+    /// `queued` | `downloading` | `paused` | `installing` | `done` | `failed` | `cancelled`.
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub done_bytes: u64,
+    #[serde(default)]
+    pub total_bytes: Option<u64>,
+    #[serde(default)]
+    pub rate_bps: Option<u64>,
+    #[serde(default)]
+    pub eta_s: Option<u64>,
+    /// The plugin's words: `File 2 of 3`, `Verifying`.
+    #[serde(default)]
+    pub phase: Option<String>,
+    /// Why it failed, one sentence.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl DownloadProgress {
+    /// Making progress, or expected to: a launch waits on it.
+    pub fn live(&self) -> bool {
+        matches!(self.state.as_str(), "queued" | "downloading" | "installing")
+    }
+
+    /// 0–1 of the total, when the total is known.
+    pub fn fraction(&self) -> Option<f64> {
+        self.total_bytes
+            .filter(|t| *t > 0)
+            .map(|t| (self.done_bytes as f64 / t as f64).clamp(0.0, 1.0))
+    }
+
+    /// What a launch screen says under the title: `12.3 GB of 26 GB · 48 MB/s · about 4 min
+    /// left`, `Installing…`, `Waiting for its turn to download…`.
+    pub fn line(&self) -> String {
+        match self.state.as_str() {
+            "queued" => return "Waiting for its turn to download\u{2026}".into(),
+            "installing" => {
+                return self
+                    .phase
+                    .clone()
+                    .unwrap_or_else(|| "Installing\u{2026}".into())
+            }
+            _ => {}
+        }
+        let mut parts = vec![match self.total_bytes.filter(|t| *t > 0) {
+            Some(total) => format!("{} of {}", human_bytes(self.done_bytes), human_bytes(total)),
+            None => format!("{} so far", human_bytes(self.done_bytes)),
+        }];
+        if let Some(rate) = self.rate_bps.filter(|_| self.state == "downloading") {
+            parts.push(format!("{}/s", human_bytes(rate)));
+        }
+        if let Some(eta) = self.eta_s.filter(|_| self.state == "downloading") {
+            parts.push(match eta {
+                0..60 => "less than a minute left".into(),
+                60..3600 => format!("about {} min left", (eta + 30) / 60),
+                _ => format!("about {} h {} min left", eta / 3600, (eta % 3600) / 60),
+            });
+        }
+        parts.join(" \u{b7} ")
+    }
+
+    /// Why a launch that waited on it didn't start the title; `None` while it may still.
+    pub fn stopped(&self, title: &str) -> Option<String> {
+        Some(match self.state.as_str() {
+            "failed" => match self.error.as_deref() {
+                Some(why) => format!("{title} didn't download \u{2014} {why}"),
+                None => format!("{title} didn't download."),
+            },
+            "cancelled" => format!("{title}'s download was cancelled."),
+            "paused" => format!("{title}'s download was paused. Start it again to resume."),
+            _ => return None,
+        })
+    }
+}
+
+/// What a title menu offers for a title's files. At most one applies at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InstallAction {
+    Install,
+    Pause,
+    Resume,
+    Remove,
+}
+
+impl InstallAction {
+    /// The one row a title menu shows, if any. `grants` is `/status` `grants`; `None` (a host
+    /// that predates it) allows starting a download and nothing else.
+    pub fn for_title(
+        install: Option<&TitleInstall>,
+        download: Option<&DownloadProgress>,
+        grants: Option<u32>,
+    ) -> Option<InstallAction> {
+        use punktfunk_core::quic::{GRANT_LAUNCH, GRANT_MANAGE_GAMES};
+        let install = install?;
+        let launch = grants.is_none_or(|g| g & GRANT_LAUNCH != 0);
+        let manage = grants.is_some_and(|g| g & GRANT_MANAGE_GAMES != 0);
+        let action = match download.map(|d| d.state.as_str()) {
+            Some("queued" | "downloading") => InstallAction::Pause,
+            Some("installing") => return None,
+            Some("paused") => InstallAction::Resume,
+            Some("done") => InstallAction::Remove,
+            _ if install.missing() => InstallAction::Install,
+            _ => InstallAction::Remove,
+        };
+        let allowed = match action {
+            InstallAction::Install | InstallAction::Resume => launch,
+            InstallAction::Pause | InstallAction::Remove => manage,
+        };
+        allowed.then_some(action)
+    }
+
+    /// The menu row: `Install · 26 GB (212 GB free)`, `Remove download · 26 GB`.
+    pub fn label(self, install: Option<&TitleInstall>) -> String {
+        let size = install.and_then(|i| i.size_bytes).map(human_bytes);
+        match self {
+            InstallAction::Install => {
+                let free = install.and_then(|i| i.free_bytes).map(human_bytes);
+                match (size, free) {
+                    (Some(s), Some(f)) => format!("Install \u{b7} {s} ({f} free)"),
+                    (Some(s), None) => format!("Install \u{b7} {s}"),
+                    _ => "Install".into(),
+                }
+            }
+            InstallAction::Pause => "Pause download".into(),
+            InstallAction::Resume => "Resume download".into(),
+            InstallAction::Remove => match size {
+                Some(s) => format!("Remove download \u{b7} {s}"),
+                None => "Remove download".into(),
+            },
+        }
+    }
+
+    fn verb(self) -> &'static str {
+        match self {
+            InstallAction::Install => "install",
+            InstallAction::Pause => "pause",
+            InstallAction::Resume => "resume",
+            InstallAction::Remove => "remove",
+        }
+    }
+}
+
+/// A tile's mark for a title's files: an installed title has none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TileBadge {
+    /// `download`, `pause` or `alert`. Each shell draws its own mark for it.
+    pub icon: &'static str,
+    /// `42 %`, `26 GB`, `Not installed`, `Queued`.
+    pub text: String,
+}
+
+impl TileBadge {
+    pub fn for_title(
+        install: Option<&TitleInstall>,
+        download: Option<&DownloadProgress>,
+    ) -> Option<TileBadge> {
+        let pct = |d: &DownloadProgress| match d.fraction() {
+            Some(f) => format!("{} %", (f * 100.0).floor()),
+            None => "Queued".into(),
+        };
+        match download {
+            Some(d) if d.live() => Some(TileBadge {
+                icon: "download",
+                text: pct(d),
+            }),
+            Some(d) if d.state == "paused" => Some(TileBadge {
+                icon: "pause",
+                text: pct(d),
+            }),
+            Some(d) if d.state == "failed" => Some(TileBadge {
+                icon: "alert",
+                text: "Not installed".into(),
+            }),
+            _ => {
+                let install = install.filter(|i| i.missing())?;
+                Some(TileBadge {
+                    icon: "download",
+                    text: install
+                        .size_bytes
+                        .map(human_bytes)
+                        .unwrap_or_else(|| "Not installed".into()),
+                })
+            }
+        }
+    }
+}
+
+/// What asking the host to change a title's files came to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InstallOutcome {
+    Done,
+    /// `403`/`404`/`409` with the host's own sentence.
+    Refused(String),
+    /// A host without the route.
+    Unsupported,
+    Failed(String),
+}
+
+impl InstallOutcome {
+    /// A non-2xx answer: the host's sentence when it sent one, else the route is missing.
+    pub fn from_reply(code: u16, message: Option<String>) -> InstallOutcome {
+        match (code, message) {
+            (200..=299, _) => InstallOutcome::Done,
+            (_, Some(m)) if !m.is_empty() => InstallOutcome::Refused(m),
+            (401 | 404 | 405, _) => InstallOutcome::Unsupported,
+            (code, _) => InstallOutcome::Failed(format!("the host refused it ({code})")),
+        }
+    }
+
+    /// The player-facing line. The Swift and Kotlin clients use the same words.
+    pub fn notice(&self, action: InstallAction, title: &str) -> String {
+        match self {
+            InstallOutcome::Done => match action {
+                InstallAction::Install | InstallAction::Resume => format!("Downloading {title}."),
+                InstallAction::Pause => format!("Paused {title}'s download."),
+                InstallAction::Remove => format!("Removed {title}. Saves stay on the host."),
+            },
+            InstallOutcome::Refused(why) => why.clone(),
+            InstallOutcome::Unsupported => {
+                "This host needs an update to manage games from here.".into()
+            }
+            InstallOutcome::Failed(why) => {
+                format!("Couldn't {} {title} \u{2014} {why}", action.verb())
+            }
+        }
+    }
+}
+
+/// Ask the host to start, resume, pause or remove a title's download. Blocking.
+#[cfg(desktop)]
+pub fn change_install(
+    addr: &str,
+    mgmt_port: u16,
+    identity: &(String, String),
+    pin: Option<[u8; 32]>,
+    app_id: &str,
+    action: InstallAction,
+) -> InstallOutcome {
+    let agent = match agent(identity, pin) {
+        Ok(a) => a,
+        Err(e) => return InstallOutcome::Failed(e.to_string()),
+    };
+    let url = format!(
+        "{}/api/v1/library/install/{}",
+        base_url(addr, mgmt_port),
+        path_segment(app_id)
+    );
+    let reply = match action {
+        InstallAction::Install | InstallAction::Resume => agent
+            .post(&url)
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .send_empty(),
+        InstallAction::Pause => agent
+            .post(format!("{url}/pause"))
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .send_empty(),
+        InstallAction::Remove => agent
+            .delete(&url)
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .call(),
+    };
+    match reply {
+        Ok(mut r) => {
+            let message = r
+                .body_mut()
+                .read_to_string()
+                .ok()
+                .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
+                .and_then(|v| v["message"].as_str().map(str::to_string));
+            InstallOutcome::from_reply(r.status().as_u16(), message)
+        }
+        Err(e) => InstallOutcome::Failed(classify(e).to_string()),
+    }
+}
+
+/// `id` as one URL path segment: unreserved characters and `:` stay, the rest is escaped.
+#[cfg(desktop)]
+fn path_segment(id: &str) -> String {
+    id.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b':' => {
+                (b as char).to_string()
+            }
+            b => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// Decimal units, as stores count: `12.3 GB`, `48 MB`, `512 kB`.
+pub fn human_bytes(n: u64) -> String {
+    let n = n as f64;
+    let (value, unit) = if n >= 1e9 {
+        (n / 1e9, "GB")
+    } else if n >= 1e6 {
+        (n / 1e6, "MB")
+    } else {
+        (n / 1e3, "kB")
+    };
+    let rounded = (value * 10.0).round() / 10.0;
+    if value >= 100.0 || rounded.fract() == 0.0 {
+        format!("{value:.0} {unit}")
+    } else {
+        format!("{rounded:.1} {unit}")
+    }
+}
+
 impl RunningGame {
     /// True unless `state == "exited"`. `untracked` (host cannot follow the
     /// process), `grace` and `detached` (session gone, process still up) count as up.
@@ -424,9 +766,16 @@ pub fn end_game(
 /// schema change there cannot break the library screen.
 #[cfg(desktop)]
 #[derive(Deserialize, Default)]
-struct HostStatus {
+pub struct HostStatus {
     #[serde(default)]
-    games: Vec<RunningGame>,
+    pub games: Vec<RunningGame>,
+    /// Kept apart from `games`: a launch the host declined over its download has no game
+    /// row left to carry it.
+    #[serde(default)]
+    pub downloads: Vec<DownloadProgress>,
+    /// This device's live grants; `None` from a host that predates the field.
+    #[serde(default)]
+    pub grants: Option<u32>,
 }
 
 /// `GET {path}` on the host's mgmt API, decoded. Any miss (unreachable, an older host
@@ -462,7 +811,18 @@ pub fn fetch_running(
     identity: &(String, String),
     pin: Option<[u8; 32]>,
 ) -> Vec<RunningGame> {
-    get_json::<HostStatus>(addr, mgmt_port, identity, pin, "/api/v1/status").games
+    fetch_status(addr, mgmt_port, identity, pin).games
+}
+
+/// `GET /api/v1/status`. Best-effort, as [`fetch_running`].
+#[cfg(desktop)]
+pub fn fetch_status(
+    addr: &str,
+    mgmt_port: u16,
+    identity: &(String, String),
+    pin: Option<[u8; 32]>,
+) -> HostStatus {
+    get_json::<HostStatus>(addr, mgmt_port, identity, pin, "/api/v1/status")
 }
 
 /// A process-wide list per host fingerprint, so every tile, shelf and menu reading it
@@ -933,6 +1293,186 @@ mod tests {
         let left = r#"{"app_id":"steam:1","state":"detached","endable":true}"#;
         assert!(!row(left).streamed_here(), "nobody streams it");
         assert!(row(left).is_up());
+    }
+
+    #[test]
+    fn a_download_reads_as_one_line_under_the_title() {
+        let d = |json: &str| -> DownloadProgress { serde_json::from_str(json).unwrap() };
+        let live = d(
+            r#"{"app_id":"a","state":"downloading","done_bytes":12300000000,
+            "total_bytes":26000000000,"rate_bps":48000000,"eta_s":240}"#,
+        );
+        assert!(live.live());
+        assert_eq!(
+            live.line(),
+            "12.3 GB of 26 GB \u{b7} 48 MB/s \u{b7} about 4 min left"
+        );
+        assert_eq!(live.fraction().map(|f| (f * 100.0).round()), Some(47.0));
+        let no_total = d(r#"{"state":"downloading","done_bytes":3100000000}"#);
+        assert_eq!(no_total.line(), "3.1 GB so far");
+        let slow = d(r#"{"state":"downloading","done_bytes":1,"total_bytes":9,"eta_s":5400}"#);
+        assert!(slow.line().ends_with("about 1 h 30 min left"));
+        let unpack = d(r#"{"state":"installing","phase":"Verifying"}"#);
+        assert_eq!(unpack.line(), "Verifying");
+        assert!(live.stopped("Quail").is_none());
+        let failed = d(r#"{"state":"failed","error":"the server is down"}"#);
+        assert_eq!(
+            failed.stopped("Quail").as_deref(),
+            Some("Quail didn't download \u{2014} the server is down")
+        );
+        assert!(!failed.live());
+        assert_eq!(human_bytes(512_000), "512 kB");
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn status_downloads_decode_beside_the_games_and_an_older_host_sends_none() {
+        let json = r#"{"games":[{"app_id":"custom:a","state":"launching"}],
+            "downloads":[{"app_id":"custom:a","state":"downloading","done_bytes":5,
+            "started_at":"x","title":"Quail"}]}"#;
+        let s: HostStatus = serde_json::from_str(json).unwrap();
+        assert_eq!(s.downloads[0].done_bytes, 5);
+        let old: HostStatus = serde_json::from_str(r#"{"games":[]}"#).unwrap();
+        assert!(old.downloads.is_empty());
+        assert_eq!(old.grants, None);
+    }
+
+    /// One row per title, by its files and download, and only what the device is granted.
+    #[test]
+    fn a_titles_menu_offers_the_one_action_its_files_allow() {
+        use punktfunk_core::quic::{GRANT_ALL, GRANT_GAMEPAD, GRANT_LAUNCH};
+        let missing = TitleInstall {
+            state: "missing".into(),
+            size_bytes: Some(26_000_000_000),
+            free_bytes: Some(212_000_000_000),
+        };
+        let installed = TitleInstall {
+            state: "installed".into(),
+            ..missing.clone()
+        };
+        let row = |state: &str| DownloadProgress {
+            state: state.into(),
+            ..Default::default()
+        };
+        let all = Some(GRANT_ALL);
+        let pick = InstallAction::for_title;
+        assert_eq!(pick(None, None, all), None, "not a plugin's title");
+        assert_eq!(
+            pick(Some(&missing), None, all),
+            Some(InstallAction::Install)
+        );
+        assert_eq!(
+            pick(Some(&missing), Some(&row("downloading")), all),
+            Some(InstallAction::Pause)
+        );
+        assert_eq!(pick(Some(&missing), Some(&row("installing")), all), None);
+        assert_eq!(
+            pick(Some(&missing), Some(&row("paused")), all),
+            Some(InstallAction::Resume)
+        );
+        assert_eq!(
+            pick(Some(&missing), Some(&row("failed")), all),
+            Some(InstallAction::Install)
+        );
+        assert_eq!(
+            pick(Some(&installed), None, all),
+            Some(InstallAction::Remove)
+        );
+        assert_eq!(
+            pick(Some(&missing), Some(&row("done")), all),
+            Some(InstallAction::Remove)
+        );
+        // Launch starts and resumes; pausing and removing need the manage grant.
+        let launch = Some(GRANT_LAUNCH);
+        assert_eq!(
+            pick(Some(&missing), None, launch),
+            Some(InstallAction::Install)
+        );
+        assert_eq!(pick(Some(&installed), None, launch), None);
+        assert_eq!(pick(Some(&missing), Some(&row("queued")), launch), None);
+        assert_eq!(pick(Some(&missing), None, Some(GRANT_GAMEPAD)), None);
+        // A host without grants on /status: starting only.
+        assert_eq!(
+            pick(Some(&missing), None, None),
+            Some(InstallAction::Install)
+        );
+        assert_eq!(pick(Some(&installed), None, None), None);
+
+        assert_eq!(
+            InstallAction::Install.label(Some(&missing)),
+            "Install \u{b7} 26 GB (212 GB free)"
+        );
+        assert_eq!(
+            InstallAction::Remove.label(Some(&installed)),
+            "Remove download \u{b7} 26 GB"
+        );
+        assert_eq!(InstallAction::Install.label(None), "Install");
+    }
+
+    #[test]
+    fn a_tile_marks_only_a_title_that_isnt_installed() {
+        let missing = TitleInstall {
+            state: "missing".into(),
+            size_bytes: Some(26_000_000_000),
+            free_bytes: None,
+        };
+        let badge = TileBadge::for_title;
+        assert_eq!(badge(None, None), None);
+        let installed = TitleInstall {
+            state: "installed".into(),
+            ..Default::default()
+        };
+        assert_eq!(badge(Some(&installed), None), None);
+        assert_eq!(badge(Some(&missing), None).unwrap().text, "26 GB");
+        let d = |state: &str, total: Option<u64>| DownloadProgress {
+            state: state.into(),
+            done_bytes: 429,
+            total_bytes: total,
+            ..Default::default()
+        };
+        let live = badge(Some(&missing), Some(&d("downloading", Some(1000)))).unwrap();
+        assert_eq!((live.icon, live.text.as_str()), ("download", "42 %"));
+        let paused = badge(Some(&missing), Some(&d("paused", Some(1000)))).unwrap();
+        assert_eq!((paused.icon, paused.text.as_str()), ("pause", "42 %"));
+        assert_eq!(
+            badge(Some(&missing), Some(&d("queued", None)))
+                .unwrap()
+                .text,
+            "Queued"
+        );
+        assert_eq!(
+            badge(Some(&missing), Some(&d("failed", None)))
+                .unwrap()
+                .icon,
+            "alert"
+        );
+    }
+
+    #[test]
+    fn an_install_answer_reads_in_the_hosts_words() {
+        let notice = |code, message: Option<&str>, action| {
+            InstallOutcome::from_reply(code, message.map(str::to_string)).notice(action, "Quail")
+        };
+        assert_eq!(
+            notice(202, None, InstallAction::Install),
+            "Downloading Quail."
+        );
+        assert_eq!(
+            notice(204, None, InstallAction::Remove),
+            "Removed Quail. Saves stay on the host."
+        );
+        assert_eq!(
+            notice(409, Some("Quit Quail first."), InstallAction::Remove),
+            "Quit Quail first."
+        );
+        assert_eq!(
+            notice(404, None, InstallAction::Pause),
+            "This host needs an update to manage games from here."
+        );
+        assert_eq!(
+            notice(500, None, InstallAction::Pause),
+            "Couldn't pause Quail \u{2014} the host refused it (500)"
+        );
     }
 
     #[test]

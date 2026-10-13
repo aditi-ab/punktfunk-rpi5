@@ -591,8 +591,12 @@ fn setting_combo(
     ComboBox::new(names)
         .selected_index(current as i32)
         .on_selection_changed(move |i: i32| {
+            // -1 is "nothing selected", which an in-place items rebuild raises: not a pick.
+            let Ok(i) = usize::try_from(i) else {
+                return;
+            };
             commit(&ctx, &scope, (rev, &set_rev), |s| {
-                apply(s, (i.max(0) as usize).min(max));
+                apply(s, i.min(max));
             });
         })
 }
@@ -1610,7 +1614,10 @@ fn controllers_section(cx: &Cx) -> Vec<Element> {
         ComboBox::new(fwd_names)
             .selected_index(fwd_i as i32)
             .on_selection_changed(move |i: i32| {
-                let sel = i.max(0) as usize;
+                // -1 is "nothing selected" (a pad list rebuilt in place): not a pick.
+                let Ok(sel) = usize::try_from(i) else {
+                    return;
+                };
                 let key = if sel == 0 {
                     None
                 } else {
@@ -1641,6 +1648,10 @@ fn controllers_section(cx: &Cx) -> Vec<Element> {
     let pad_haptics_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.pad_haptics, |s, on| {
         s.pad_haptics = on
     });
+    let pad_rumble_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.pad_rumble, |s, on| {
+        s.pad_rumble = on
+    })
+    .enabled(s.gamepad_forwarding);
     let pad_speaker_toggle = setting_toggle(
         ctx,
         scope,
@@ -1734,6 +1745,14 @@ fn controllers_section(cx: &Cx) -> Vec<Element> {
                  \u{2014} a DualSense keeps adaptive triggers, lightbar, touchpad and \
                  motion.",
             )),
+            // This device's motors, so defaults scope only, like Controller haptics.
+            (!preset_mode).then(|| {
+                described_labeled(
+                    "Controller rumble",
+                    pad_rumble_toggle,
+                    "Off, controllers don't vibrate from the stream or in the menus, whatever the game sends.",
+                )
+            }),
         ]
         .into_iter()
         .flatten()
@@ -1799,8 +1818,8 @@ fn controllers_section(cx: &Cx) -> Vec<Element> {
         advanced.push(described_labeled(
             "Controller haptics",
             pad_haptics_toggle,
-            "Play a DualSense's voice-coil haptics on the pad itself. Wired pads only, and \
-             only while controllers are forwarded.",
+            "Play a DualSense's voice-coil haptics on the pad itself, while controllers are \
+             forwarded.",
         ));
         advanced.push(described_labeled(
             "Controller speaker",

@@ -39,16 +39,19 @@ host too until you capture again.
 | Disconnect | Ctrl+Alt+Shift+D | ⌃⌥⇧D | ⌃⌥⇧D | — |
 | Cycle the [stats overlay](/docs/stats) | Ctrl+Alt+Shift+S | ⌃⌥⇧S | ⌃⌥⇧S | — |
 | [Mute your microphone](#muting-your-microphone) | Ctrl+Alt+Shift+V | ⌃⌥⇧A | ⌃⌥⇧A | — |
-| Open the [quick-action dial](#the-quick-action-dial) | Ctrl+Alt+Shift+O | ⌃⌥⇧O | — | Ctrl+Alt+Shift+O |
+| Open the [quick-action dial](#the-quick-action-dial) | Ctrl+Alt+Shift+O | ⌃⌥⇧O | ⌃⌥⇧O | Ctrl+Alt+Shift+O |
 | Start or stop [clipboard sharing](/docs/clipboard) | — | ⌃⌥⇧C | ⌃⌥⇧C | — |
 | Fullscreen | F11 or Alt+Enter | ⌃⌘F | — | — |
 
-On an iPad only ⌃⌥⇧Q and ⌘⎋ always work while input is captured. If another shortcut doesn't
+On an iPad only ⌃⌥⇧Q, ⌃⌥⇧O and ⌘⎋ always work while input is captured. If another shortcut doesn't
 respond, release input first.
 
 To see the list without a stream: **Keyboard Shortcuts** in the Linux client's main menu,
-**Shortcuts** on the Windows client's host list, or **About → Shortcuts** in the Apple apps'
-Settings. The macOS **Stream** menu lists them too.
+**Shortcuts** on the Windows client's host list, **Settings → About → Stream controls** on
+Android, or **About → Shortcuts** in the Apple apps' Settings. The macOS **Stream** menu lists
+them too. Each list covers the controller chords and touch gestures as well. With a pad alone,
+open the console's **Settings → About → Stream controls** (Linux, Windows, Steam Deck, Android
+and Apple).
 
 **macOS:** while input is captured, every other ⌘ chord goes to the host, ⌘Q included. Turn
 **Capture system shortcuts** off to keep them local. ⌘⎋ always stays with the Mac; press it,
@@ -208,7 +211,7 @@ presets. Pick its six buttons under **Quick actions** in settings, or edit the d
 | Linux, Windows | **Ctrl+Alt+Shift+O**, a two-finger twist on a touchscreen |
 | macOS | **⌃⌥⇧O**, **Stream → Quick Actions** |
 | Android | **Back**, a two-finger twist, **Ctrl+Alt+Shift+O** |
-| iPhone, iPad | A two-finger twist, the corner button; in **Touch passthrough**, two fingers pulled in from a side edge |
+| iPhone, iPad | A two-finger twist, the corner button, **⌃⌥⇧O** on a keyboard; in **Touch passthrough**, two fingers pulled in from a side edge |
 | Apple TV | A short press of the remote's **Back** |
 | Any client, with a controller | **Select + A** |
 
@@ -230,7 +233,7 @@ What the dial can hold:
 |---|---|
 | Session | **End stream**, **End game** (a game this device launched, then the stream), **Disconnect, keep the game running** |
 | Input | **Touch mode**, **Keyboard**, **Virtual controller**, **Send text**, **Guide button**, **Quick access menu**, **Controller mouse** |
-| View · Audio | **Statistics**, **Swap screens** (dual-screen handhelds), **Microphone**, **Mute this stream** (this device only) |
+| View · Audio | **Statistics**, **Screens** (dual-screen handhelds: the panel below, the picture below, or the picture across both), **Microphone**, **Mute this stream** (this device only) |
 | Host | **Sleep host**, **Restart host**, **Shut down host** ([Host power](/docs/host-power)) |
 | Shortcuts | Key combinations you add, such as Alt+F4 |
 
@@ -288,10 +291,16 @@ or use **Edit layout** to move, resize and hide controls, separately for wide an
 ### Dual-screen handhelds
 
 On an Android handheld with a second screen of 7 inches or less, or a foldable half open, the
-stream takes one screen and a panel takes the other: statistics, the dial's actions, a trackpad
-and the virtual controller. **Swap screens**, on the dial or the panel, trades the two. The
-handheld remembers the swap, and an **Automatic** resolution or refresh follows the picture: at
-once where the host can change mode mid-stream, else from the next connect.
+stream takes one screen and a panel takes the other: statistics, the dial's actions, a keyboard
+that types on the host while the handheld's own buttons stay on the game, a trackpad and the
+virtual controller. **Screens**, on the dial or the panel, cycles three layouts: the panel below
+the picture, the picture below the panel, or **one picture across both screens** — its top half
+above, its bottom half below, the lower screen's touch landing on its half. That last one is how a
+DS or 3DS emulator's two screens land on two screens: set the emulator to a vertical layout with
+no gap, and the split lands on the hinge. A DS, 3DS or Wii U title launched from the library
+starts that way. The handheld remembers the layout per second screen, and an **Automatic**
+resolution follows it — the picture screen's mode, or two of them stacked when the picture spans
+both — at once where the host can change mode mid-stream, else from the next connect.
 
 ## Pen and stylus
 

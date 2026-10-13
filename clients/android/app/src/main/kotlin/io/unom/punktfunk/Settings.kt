@@ -100,6 +100,14 @@ data class Settings(
      * preference — the host emits it when it can, else falls back. AMediaCodec decodes whichever
      * the host resolves (AV1 is only advertised/offered when the device has a real AV1 decoder). */
     val codec: String = "auto",
+    /**
+     * A second, smaller screen — a dual-screen handheld's lower panel, a foldable half open —
+     * shows the companion panel while streaming, or the picture (design/android-dual-screen.md).
+     * Off keeps the stream on this screen and leaves the other to the system: the phone on a
+     * TV that the size rule still takes for a handheld's panel. Presetable, so a TV preset
+     * carries it.
+     */
+    val secondScreen: Boolean = true,
     val micEnabled: Boolean = false,
     /**
      * Cancel acoustic echo on the mic uplink (plus noise suppression): the capture opens under
@@ -243,6 +251,8 @@ data class Settings(
      * Only read when [backgroundKeepAlive] is on; the UI offers 1/5/10/30.
      */
     val backgroundTimeoutMinutes: Int = 10,
+    /** Off, the host's rumble never reaches a pad or this phone's motor. Read once per session. */
+    val padRumble: Boolean = true,
     /**
      * Opt-in: ALSO play the rumble the host addresses to controller 1 (wire pad 0) on this
      * phone's own vibration motor — for clip-on gamepads that ship without rumble motors, where
@@ -414,7 +424,8 @@ class SettingsStore(
  * its display — `context.display` then throws, and without the DEFAULT fallback the session would
  * open at 1080p60 with no HDR and nothing in the log.
  */
-private fun probeDisplay(context: Context): Display? =
+/** The display a stream resolves against: the picture's screen while [secondScreen] lets a pair swap. */
+private fun probeDisplay(context: Context, secondScreen: Boolean = true): Display? =
     (
         runCatching { context.display }.getOrNull()
             ?: runCatching {
@@ -423,15 +434,19 @@ private fun probeDisplay(context: Context): Display? =
             }.getOrNull().also {
                 if (it != null) Log.i("punktfunk", "display probe: context unattached — using DEFAULT_DISPLAY")
             }
-        )?.let { pictureDisplay(context, it) }
+        )?.let { if (secondScreen) pictureDisplay(context, it) else it }
 
 /**
  * The device's native display mode as a landscape `(width, height, hz)` — the long edge is the
  * width, since we stream a desktop. Falls back to 1920×1080@60 if no display can be read at all
  * (see [probeDisplay] for the cold-start fallback that makes that a last resort).
  */
-fun nativeDisplayMode(context: Context): Triple<Int, Int, Int> {
-    val display = probeDisplay(context) ?: return Triple(1920, 1080, 60)
+fun nativeDisplayMode(
+    context: Context,
+    spanned: Boolean = pictureSpanned(context),
+    secondScreen: Boolean = true,
+): Triple<Int, Int, Int> {
+    val display = probeDisplay(context, secondScreen) ?: return Triple(1920, 1080, 60)
     val mode = display.mode
     val w = mode.physicalWidth
     val h = mode.physicalHeight
@@ -441,7 +456,21 @@ fun nativeDisplayMode(context: Context): Triple<Int, Int, Int> {
     // also keeps this agreeing with `Display.streamPanelFps`, which already rounds; the two
     // describe the same panel and must not disagree.
     val hz = kotlin.math.round(mode.refreshRate).toInt().coerceAtLeast(1)
-    return Triple(maxOf(w, h), minOf(w, h), hz)
+    // A picture spanning two screens is two equal halves at this screen's size
+    // (design/android-dual-screen.md §3.2); the codec ceiling clamps the ask later.
+    return Triple(maxOf(w, h), minOf(w, h) * (if (spanned && secondScreen) 2 else 1), hz)
+}
+
+/**
+ * The Aspect row's Screen and Safe area sizes, in the panel's own pixels
+ * ([Resolutions.panelScreens]). A phone set to a lower resolution renders below its panel, and
+ * [nativeDisplayMode] reads what it renders.
+ */
+fun panelScreens(context: Context): Pair<Pair<Int, Int>, Pair<Int, Int>> {
+    val (w, h, _) = nativeDisplayMode(context)
+    val (sw, sh, _) = safeDisplayMode(context)
+    val modes = probeDisplay(context)?.supportedModes.orEmpty().map { it.physicalWidth to it.physicalHeight }
+    return Resolutions.panelScreens(w to h, sw to sh, modes)
 }
 
 /**
@@ -522,8 +551,12 @@ fun displayCutoutInset(context: Context): Int {
  * landscape `(width, height, hz)`. Same height and refresh as [nativeDisplayMode]; only the width
  * moves, and the stream screen places the narrower picture at the window's left cutout inset.
  */
-fun safeDisplayMode(context: Context): Triple<Int, Int, Int> {
-    val (w, h, hz) = nativeDisplayMode(context)
+fun safeDisplayMode(
+    context: Context,
+    spanned: Boolean = pictureSpanned(context),
+    secondScreen: Boolean = true,
+): Triple<Int, Int, Int> {
+    val (w, h, hz) = nativeDisplayMode(context, spanned, secondScreen)
     return Triple(SafeArea.insetWidth(w, displayCutoutInset(context)), h, hz)
 }
 
@@ -565,13 +598,14 @@ fun displaySupportsHdr(context: Context): Boolean {
  * Resolve [Settings] (with its `0`=native and [SAFE_AREA_MODE] placeholders) to the concrete mode to
  * request. The safe-area sentinel is checked first because it resolves BOTH axes together — it is one
  * mode, not an independent width and height, and mixing half of it with a native height would ask
- * for a size neither sentinel means.
+ * for a size neither sentinel means. [spanned] is the pair's kept layout unless the stream knows
+ * a live one; with [secondScreen] off the pair does not exist and this screen's mode stands.
  */
-fun Settings.effectiveMode(context: Context): Triple<Int, Int, Int> {
+fun Settings.effectiveMode(context: Context, spanned: Boolean = pictureSpanned(context)): Triple<Int, Int, Int> {
     val base = if (width == SAFE_AREA_MODE && height == SAFE_AREA_MODE) {
-        safeDisplayMode(context)
+        safeDisplayMode(context, spanned, secondScreen)
     } else {
-        nativeDisplayMode(context)
+        nativeDisplayMode(context, spanned, secondScreen)
     }
     val w = if (width > 0) width else base.first
     val h = if (height > 0) height else base.second
@@ -724,6 +758,23 @@ object Resolutions {
         fun device(a: Aspect) = a.label == SCREEN || a.label == SAFE_AREA
         return families.indexOfFirst { device(it) && within(it, DEVICE_TOLERANCE) }.takeIf { it >= 0 }
             ?: families.indexOfFirst { !device(it) && within(it, TOLERANCE) }.takeIf { it >= 0 }
+    }
+
+    /** The panel as the largest of [modes] in the [current] mode's shape, and the [safe] area
+     * scaled up to it with even sides. Both stay at [current] when no mode is larger. */
+    fun panelScreens(
+        current: Pair<Int, Int>,
+        safe: Pair<Int, Int>,
+        modes: List<Pair<Int, Int>>,
+    ): Pair<Pair<Int, Int>, Pair<Int, Int>> {
+        val (cw, ch) = current
+        if (cw <= 0 || ch <= 0) return current to safe
+        val panel = (modes.map { (a, b) -> maxOf(a, b) to minOf(a, b) } + current)
+            .filter { (w, h) -> h > 0 && kotlin.math.abs(w.toDouble() * ch / (h.toDouble() * cw) - 1) < DEVICE_TOLERANCE }
+            .maxBy { (w, h) -> w.toLong() * h }
+        if (panel == current) return current to safe
+        fun up(side: Int) = (side.toLong() * panel.second / ch).toInt() / 2 * 2
+        return panel to if (safe == current) panel else up(safe.first) to up(safe.second)
     }
 }
 

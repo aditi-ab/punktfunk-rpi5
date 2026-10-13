@@ -35,6 +35,7 @@ mod resources;
 mod setup;
 #[cfg(target_os = "linux")]
 mod sync_timeline;
+mod timing_ext;
 #[cfg(target_os = "linux")]
 mod wayland_frame;
 
@@ -314,6 +315,13 @@ pub struct Presenter {
     /// The waiter runs on `VK_KHR_present_wait2`: presents chain `VkPresentId2KHR` and the
     /// swapchain is created with the present-id2/present-wait2 flags.
     present_id2: bool,
+    /// `VK_EXT_present_timing`: the engine stamps each present itself, and the waiter
+    /// reads the stamp in place of its own wake time.
+    timing: Option<std::sync::Arc<timing_ext::Engine>>,
+    /// The live swapchain was created for those stamps and its result queue is sized.
+    timing_armed: bool,
+    /// The last present asked for a stamp.
+    timing_asked: bool,
     /// The output's vblank as the glass clock where present-wait is missing (AMD on
     /// Windows). Estimated stamps, `glass=est`.
     #[cfg(windows)]
@@ -335,6 +343,22 @@ pub struct Presenter {
     /// Wayland lane that hands a dma-buf to the compositor as the window's own buffer.
     #[cfg(target_os = "linux")]
     native: Option<crate::wl_native::NativeLane>,
+    /// The compositor's own stamp per swapchain present, beside the driver's.
+    #[cfg(target_os = "linux")]
+    feedback: Option<crate::wl_feedback::SurfaceFeedback>,
+    /// (flipped without a copy, shown) since the last take, from the compositor's stamps.
+    #[cfg(target_os = "linux")]
+    scanout: (u32, u32),
+    /// The compositor has flagged a zero-copy flip at least once. KWin before 6.8 never
+    /// sets the bit, so until then a zero means nothing.
+    #[cfg(target_os = "linux")]
+    scanout_reported: bool,
+    /// Compositor stamps by present id, waiting for the driver's sample of the same present.
+    #[cfg(target_os = "linux")]
+    compositor_stamps: std::collections::HashMap<u64, u64>,
+    /// Driver samples without an exact stamp, held one pass for their compositor stamp.
+    #[cfg(target_os = "linux")]
+    held: Vec<present_timing::PresentedSample>,
     /// Exportable copies of Vulkan Video or PyroWave pictures for the lane; built on the
     /// first one.
     #[cfg(target_os = "linux")]
@@ -357,6 +381,9 @@ pub struct Presenter {
     /// Explicit-sync timelines per VAAPI pool slot the lane has shown.
     #[cfg(target_os = "linux")]
     vaapi_sync: std::collections::HashMap<u64, sync_timeline::Timelines>,
+    /// Pool slots offered to the lane, so a rebuilt pool's old ones can go.
+    #[cfg(target_os = "linux")]
+    native_keys: Vec<u64>,
     /// The lane's last frame was PQ, shown through the compositor's colour management.
     native_pq: bool,
     /// `flip` diagnostic: when it started; the lane owns even periods, the swapchain odd.
@@ -439,6 +466,16 @@ impl Presenter {
         if let Some(f) = self.retired_hw.take() {
             f.destroy(&self.device);
         }
+        // The ended decoder's pool: cached imports pin its memory, and only a later
+        // hardware frame would retire them.
+        #[cfg(target_os = "linux")]
+        if let Some(hw) = self.hw.as_mut() {
+            hw.imports.destroy_all(&self.device);
+        }
+        #[cfg(windows)]
+        if let Some(hw) = self.hw_win.as_mut() {
+            hw.imports.destroy_all(&self.device);
+        }
         self.direct_last = None;
         if let Some(v) = self.video.take() {
             v.destroy(&self.device);
@@ -491,11 +528,24 @@ impl Presenter {
         }
     }
 
-    /// Where the display stamp comes from, for the ledger: `wait` (present-wait), `est`
-    /// (the vblank waiter), `feedback` (the native lane), `none`.
+    /// The engine's refresh as `(cycle, interval)` in ns, where it stamps presents and has
+    /// reported one. The interval is the cycle on a fixed panel, `u64::MAX` under variable
+    /// refresh, 0 where the engine cannot tell.
+    pub(crate) fn engine_refresh(&self) -> Option<(u64, u64)> {
+        use std::sync::atomic::Ordering;
+        let r = &self.timing.as_ref().filter(|_| self.timing_armed)?.refresh;
+        let cycle = r.duration_ns.load(Ordering::Relaxed);
+        (cycle > 0).then(|| (cycle, r.interval_ns.load(Ordering::Relaxed)))
+    }
+
+    /// Where the display stamp comes from, for the ledger: `timing` (the engine's own
+    /// stamps), `wait` (present-wait), `est` (the vblank waiter), `feedback` (the native
+    /// lane), `none`.
     pub(crate) fn glass_source(&self) -> &'static str {
         if self.native_last {
             "feedback"
+        } else if self.timing_armed {
+            "timing"
         } else if self.present_timer.is_some() {
             "wait"
         } else if self.vblank_active() {
@@ -533,8 +583,26 @@ impl Presenter {
         let Some(lane) = self.native.as_mut().filter(|_| !self.overlay_blocks_native) else {
             return Outcome::Declined(d);
         };
+        // A rebuilt pool never shows its old slots again: their buffers and timelines go,
+        // or each rebuild keeps the old pool pinned in the compositor.
+        let generation = d.pool_key >> 32;
+        let (sync, device) = (&mut self.vaapi_sync, &self.device);
+        self.native_keys.retain(|&k| {
+            if k >> 32 == generation {
+                return true;
+            }
+            lane.forget(k);
+            if let Some(t) = sync.remove(&k) {
+                // SAFETY: host-signalled only; the compositor holds its own syncobj refs.
+                unsafe { t.destroy(device) };
+            }
+            false
+        });
         if !lane.takes(&d, view, self.video_fit) {
             return Outcome::Declined(d);
+        }
+        if !self.native_keys.contains(&d.pool_key) {
+            self.native_keys.push(d.pool_key);
         }
         // Owning the window, a new pool slot imports on the spot; before, it imports in the
         // background while the swapchain still draws.
@@ -1170,6 +1238,21 @@ impl Presenter {
         }
     }
 
+    /// Presents the engine reported as never shown since the last call: a newer one
+    /// replaced them before a refresh took them.
+    pub(crate) fn take_unshown(&self) -> u32 {
+        self.present_timer.as_ref().map_or(0, |t| t.take_unshown())
+    }
+
+    /// (flipped without a copy, shown) since the last call, by the compositor's own word.
+    /// `None` until the compositor has ever flagged a flip: a zero from one that never
+    /// says so is not "composited".
+    #[cfg(target_os = "linux")]
+    pub(crate) fn take_scanout(&mut self) -> Option<(u32, u32)> {
+        let out = std::mem::take(&mut self.scanout);
+        self.scanout_reported.then_some(out)
+    }
+
     /// (zero-copy, presented) the native lane counted since the last call.
     #[cfg(target_os = "linux")]
     pub(crate) fn take_native_zero_copy(&mut self) -> (u32, u32) {
@@ -1212,11 +1295,19 @@ impl Presenter {
         let done = (self.done_sem != vk::Semaphore::null()).then_some((self.done_sem, id));
         let now_ns = pf_client_core::session::now_ns();
         if let Some(t) = &self.present_timer {
-            t.enqueue(sc, id, done, pts_ns, decoded_ns, now_ns);
+            t.enqueue(present_timing::Job {
+                swapchain: sc,
+                present_id: id,
+                done,
+                stamped: std::mem::take(&mut self.timing_asked),
+                pts_ns,
+                decoded_ns,
+                submitted_ns: now_ns,
+            });
         }
         #[cfg(windows)]
         if let Some(t) = &self.vblank_timer {
-            t.enqueue(done, pts_ns, decoded_ns, now_ns);
+            t.enqueue(done, pts_ns, decoded_ns, now_ns, !self.vblank_locked());
         }
     }
 
@@ -1278,7 +1369,9 @@ impl Presenter {
     /// True when the swapchain itself can queue presents — the only modes the glass gate
     /// governs. MAILBOX and IMMEDIATE replace or drop stale images in the driver, and
     /// so does `FIFO_LATEST_READY` — except on Windows, where DXGI keeps up to three
-    /// composed presents queued ahead of DWM and LATEST_READY drains none of them.
+    /// composed presents queued ahead of DWM and LATEST_READY drains none of them. Under
+    /// Wayland the gate on LATEST_READY measured no gain at 60 fps and held a 120 fps
+    /// stream 20 ms: a completion there is not the flip.
     pub(crate) fn needs_glass_gate(&self) -> bool {
         let fifo = matches!(
             self.present_mode,
@@ -1310,20 +1403,112 @@ impl Presenter {
         if let Some(t) = &self.vblank_timer {
             out.extend(t.take_samples());
         }
+        // Both stamps per present: the compositor's joins the driver's below, by id.
+        #[cfg(target_os = "linux")]
+        if let Some(fb) = self.feedback.as_mut() {
+            for s in fb.take() {
+                if let Some(t) = s.displayed_ns {
+                    self.scanout.1 += 1;
+                    if s.zero_copy {
+                        self.scanout.0 += 1;
+                        self.scanout_reported = true;
+                    }
+                    self.compositor_stamps.insert(s.present_id, t);
+                }
+                tracing::trace!(
+                    target: "pf_glass",
+                    id = s.present_id,
+                    displayed_ns = s.displayed_ns.unwrap_or(0),
+                    zero_copy = s.zero_copy,
+                    refresh_ns = s.refresh_ns,
+                    "compositor stamp"
+                );
+            }
+        }
+        // The driver's half of the join, on every OS: a Windows build without it has no
+        // reader of the id at all.
+        for s in &out {
+            tracing::trace!(
+                target: "pf_glass",
+                id = s.present_id,
+                displayed_ns = s.displayed_ns,
+                submitted_ns = s.submitted_ns,
+                exact = s.exact,
+                "driver stamp"
+            );
+        }
         #[cfg(target_os = "linux")]
         if let Some(lane) = self.native.as_mut() {
             out.extend(lane.take_samples().into_iter().map(|s| {
                 present_timing::PresentedSample {
+                    present_id: 0,
                     pts_ns: s.pts_ns,
                     decoded_ns: s.decoded_ns,
                     submitted_ns: s.submitted_ns,
                     // No GPU work of ours on this lane: the whole latch is the compositor's.
                     gpu_done_ns: s.submitted_ns,
                     displayed_ns: s.displayed_ns,
+                    // The compositor's own presentation time.
+                    exact: true,
                 }
             }));
         }
+        #[cfg(target_os = "linux")]
+        {
+            out = self.join_compositor_stamps(out);
+        }
         out
+    }
+
+    /// A driver sample without the engine's stamp takes the compositor's for the same
+    /// present. One with neither yet waits a pass, and everything behind it waits too so
+    /// stamps leave in order; after that it goes out on its wake time. The map keeps only
+    /// ids newer than the last sample out.
+    #[cfg(target_os = "linux")]
+    fn join_compositor_stamps(
+        &mut self,
+        fresh: Vec<present_timing::PresentedSample>,
+    ) -> Vec<present_timing::PresentedSample> {
+        let mut ready = Vec::with_capacity(self.held.len() + fresh.len());
+        for mut s in self.held.drain(..) {
+            Self::take_stamp(&mut self.compositor_stamps, &mut s);
+            ready.push(s);
+        }
+        let mut holding = false;
+        for mut s in fresh {
+            let joined = Self::take_stamp(&mut self.compositor_stamps, &mut s);
+            holding |= !joined && s.present_id != 0;
+            if holding {
+                self.held.push(s);
+            } else {
+                ready.push(s);
+            }
+        }
+        if let Some(last) = ready.last() {
+            let floor = last.present_id.saturating_sub(64);
+            self.compositor_stamps.retain(|&id, _| id >= floor);
+        }
+        ready
+    }
+
+    /// `true` once the sample carries an exact display time, its own or the compositor's.
+    #[cfg(target_os = "linux")]
+    fn take_stamp(
+        stamps: &mut std::collections::HashMap<u64, u64>,
+        s: &mut present_timing::PresentedSample,
+    ) -> bool {
+        let stamp = stamps.remove(&s.present_id);
+        if s.exact {
+            return true;
+        }
+        match stamp {
+            Some(t) => {
+                s.displayed_ns = t;
+                s.exact = true;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Device handles the overlay renders on. Valid for the presenter's lifetime; the

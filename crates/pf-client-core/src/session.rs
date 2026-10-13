@@ -209,8 +209,9 @@ impl SessionParams {
             height,
             ..mode
         };
-        // Off on the desktop (see the field). The report path stays for a client that asks.
-        let phase_lock = false;
+        // Off on the desktop (see the field). `PUNKTFUNK_CLIENT_PHASE_LOCK=1` asks for it: the
+        // A/B for the host hold's cost against the free-running floor's drift.
+        let phase_lock = std::env::var("PUNKTFUNK_CLIENT_PHASE_LOCK").is_ok_and(|v| v == "1");
         let caps_444 = settings.enable_444 && probes.hevc_444_hardware;
         // The CPU rung is 8-bit: without a hardware 10-bit path the host would
         // build a stream this client tears down.
@@ -654,6 +655,9 @@ fn dial(
         preset: params.preset_id.as_deref().and_then(|id| {
             punktfunk_core::quic::SessionPreset::new(id, params.preset.as_deref().unwrap_or(""))
         }),
+        // What a network check found this host wants, kept on its record: the ask is per
+        // host, and a host that does not read it streams as it always has.
+        delivery: crate::trust::delivery_ask_for(params.pin.as_ref()),
         // Session stop flag, so cancel reaches a dial that has not landed. Without
         // it this parks the pump for the whole budget (185 s on a request-access
         // connect the host holds pending) and cancel cannot be answered until return.
@@ -788,7 +792,7 @@ fn spawn_plane_threads(
     // app-lifetime service. Audio runs on its own thread (one puller per plane).
     let audio_thread = spawn_audio(connector.clone(), stop.clone());
     // Own drain thread. The output device opens lazily once frames arrive — a
-    // session without a wired DualSense costs one idle 10 ms poll loop.
+    // session without a DualSense costs one idle 10 ms poll loop.
     let pad_audio_thread = settings
         .pad_audio_on
         .then(|| {
@@ -1379,6 +1383,17 @@ fn pump(
                 // demotion never fires.
                 if force_software.swap(false, Ordering::Relaxed) {
                     if let Err(e) = decoder.force_software() {
+                        // No software rung (HEVC, PyroWave): reconnect without the codec, as
+                        // the decode arm does, or the next Hello asks for it again.
+                        if let Some(nr) = e.downcast_ref::<crate::video::NoSoftwareRung>() {
+                            codec_fallback = Some(codec_fallback_event(
+                                connector.codec,
+                                advertised_codecs,
+                                nr.loss(),
+                                &e.to_string(),
+                            ));
+                            break None;
+                        }
                         break Some(format!("software decoder rebuild: {e}"));
                     }
                 }
@@ -1692,6 +1707,7 @@ fn spawn_audio(
             // Last decoded frame per channel: the PLC unit, 0 until something decodes.
             let mut frame_samples = 0usize;
             let mut av = punktfunk_core::audio::AvSync::new_at_rate(channels, rate_hz);
+            av.set_frame_us(frame_us);
             if !av_sync_enabled {
                 tracing::info!("A/V sync disabled by PUNKTFUNK_NO_AV_SYNC");
             }

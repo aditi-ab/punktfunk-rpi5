@@ -36,10 +36,10 @@ and forces it off for an SDR session; Windows' own **Use HDR** switch doesn't ma
 
 ### Linux + gamescope
 
-The only Linux route to HDR for the Punktfunk apps.
+The Linux route to HDR on KDE and GNOME, and in Game Mode everywhere.
 
-1. Install **`punktfunk-gamescope`**; stock gamescope captures 8-bit.
-   [HDR on gamescope](/docs/gamescope#hdr-on-gamescope) has the package for your distro.
+1. Have **`punktfunk-gamescope`**; stock gamescope captures 8-bit. The host packages install it;
+   [HDR on gamescope](/docs/gamescope#hdr-on-gamescope) covers every distro.
 2. Restart the host. It reads what the gamescope build can do once, at startup.
 3. Let the host start the gamescope session, which is the default. A session it attaches to
    instead streams SDR: turn off **Attach mode** under **Host → Settings → Game Mode**, or delete
@@ -67,10 +67,21 @@ A Punktfunk app connecting to a GNOME host gets SDR.
 With `PUNKTFUNK_CAPTURE_MONITOR=<connector>` set, only that monitor's HDR mode counts. If no
 monitor is in HDR mode, the session streams SDR and says so in the host log.
 
+### Linux + Hyprland
+
+A virtual display is lit in 10-bit HDR when the client asks for HDR: the host adds
+`bitdepth 10`, `cm hdr`, `supports_hdr` and `supports_wide_color` to the streamed head's
+monitor rule. SDR content inside it starts at **SDR brightness** (the Game Mode setting,
+203 nits). The client panel's volume, when the app sends it, becomes the head's mastering
+target. An older Hyprland that refuses those keys streams SDR until the host restarts.
+
+**Streaming a physical monitor** on Hyprland is HDR when that monitor is in HDR mode. Nothing
+to set on the host.
+
 ### Other Linux desktops
 
-SDR. KDE, GNOME's virtual displays and the wlroots-family compositors capture 8-bit, and so does
-streaming a physical monitor to a Punktfunk app. No setting changes this.
+SDR. KDE and GNOME's virtual displays capture 8-bit, and so does streaming a physical monitor
+on KDE to a Punktfunk app. No setting changes this.
 
 ## Per client
 
@@ -85,6 +96,19 @@ The toggle sits with the other [video settings](/docs/client-settings#video).
 | Apple TV | **10-bit HDR** | the setting is on **and** the TV is HDR-capable. The TV switches to HDR10 only with tvOS **Match Content** on; otherwise the stream is tone-mapped to SDR |
 | Android, Android TV | **HDR** | the setting is on. It is greyed out on a panel without HDR10 |
 | Moonlight | its own HDR toggle | the toggle appears when the host offers a 10-bit codec |
+
+## 10-bit SDR
+
+The client's **10-bit SDR** setting asks for a 10-bit stream without HDR.
+
+A Windows 11 24H2 (or later) host composes the virtual display in wide colour for that session,
+and Windows shows it as a 10-bit display. The stream then carries the desktop's own bits past 8,
+wherever a game or app renders them. Composing in wide colour costs some GPU time.
+
+Other desktops hand the host only 8 bits of SDR, so the host could only widen each frame:
+smoother gradients after the encoder, one more colour pass on the GPU, no detail the desktop
+didn't have. There the host streams 8-bit SDR unless **Host → Settings → Video → Allow 10-bit
+SDR** (`PUNKTFUNK_10BIT_SDR_WIDEN`, advanced, off by default) is on.
 
 ## HDR and 4:4:4
 

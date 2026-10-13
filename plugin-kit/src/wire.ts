@@ -26,7 +26,7 @@ export type Artwork = typeof Artwork.Type;
  * | `command` | a shell command (operator-trust tier) | both |
  * | `steam_appid` | digits — an appid, or a 64-bit non-Steam-shortcut game id | both |
  * | `steam_ui` | `bigpicture` \| `desktop` — opens the Steam client itself | both |
- * | `launcher_ui` | which launcher UI to open: `heroic` \| `heroic-console` \| `lutris` on linux; `playnite` \| `epic` \| `gog` \| `xbox` on windows | both |
+ * | `launcher_ui` | which launcher UI to open: `heroic` \| `heroic-console` \| `lutris` \| `hydra-big-picture` on linux; `playnite` \| `epic` \| `gog` \| `xbox` \| `hydra-big-picture` on windows | both |
  * | `lutris_id` | digits — a pga.db game id | linux |
  * | `heroic` | `<runner>:<appName>`, runner ∈ legendary/gog/nile | linux |
  * | `epic` | `<namespace>:<catalogItemId>:<appName>` or a bare appName | windows |
@@ -205,6 +205,19 @@ export const OnWindow = Schema.Struct({
 });
 export type OnWindow = typeof OnWindow.Type;
 
+/**
+ * Whether a title's files are on the host. Set it on every title the plugin can install or
+ * remove (`serveUi({ install })`); leave it off the rest, which then count as installed.
+ */
+export const Install = Schema.Struct({
+	state: Schema.Literals(["installed", "missing"]),
+	/** Download size while `missing`, size on disk once `installed`. */
+	size_bytes: Schema.optionalKey(Schema.Number),
+	/** The folder the files go into; the host shows its free space. One of the plugin's write grants. */
+	target: Schema.optionalKey(Schema.String),
+});
+export type Install = typeof Install.Type;
+
 export const ProviderEntry = Schema.Struct({
 	external_id: Schema.String,
 	title: Schema.String,
@@ -238,6 +251,7 @@ export const ProviderEntry = Schema.Struct({
 	ids: Schema.optionalKey(EntryIds),
 	on_window: Schema.optionalKey(OnWindow),
 	audio: Schema.optionalKey(Schema.NullOr(AudioPolicy)),
+	install: Schema.optionalKey(Install),
 	...GameMeta.fields,
 });
 export type ProviderEntry = typeof ProviderEntry.Type;

@@ -66,6 +66,8 @@ pub struct Device {
     pub av1_ok: bool,
     /// Name the host stores this client under when pairing.
     pub name: String,
+    /// The About row's version ([`crate::shell::ConsoleOptions::version`]).
+    pub version: String,
 }
 
 /// Per-event screen context. `settings` is mut — the settings screen persists in place.
@@ -96,6 +98,7 @@ impl Device {
             pyrowave_ok: true,
             av1_ok: true,
             name: "test".into(),
+            version: crate::VERSION.into(),
         }
     }
 }
@@ -596,7 +599,7 @@ impl Screen {
             Screen::Palette(_) => "Background".into(),
             Screen::Grants(_) => "Controller access".into(),
             Screen::Prompt(s) => s.title(),
-            Screen::Licenses(_) => "Open-source licences".into(),
+            Screen::Licenses(s) => s.title().into(),
             Screen::Search(s) => s.title(),
             Screen::PresetMenu(s) => s.title(),
             Screen::PresetName(s) => s.title(),

@@ -38,8 +38,9 @@ comes back.
    desktop clients).
 2. `punktfunk-core` encodes them as input events and sends them as QUIC datagrams.
 3. The host hands them to `pf-inject`. On Linux that is libei, KWin fake input or the wlroots
-   virtual pointer and keyboard, plus virtual pads over uhid or USB/IP. On Windows it is `SendInput`
-   plus the UMDF gamepad and mouse drivers.
+   virtual pointer and keyboard, plus virtual pads over uhid or USB/IP. On Windows mouse and keyboard
+   leave as reports from the UMDF HID mouse driver, with `SendInput` for text and as the fallback,
+   plus the UMDF gamepad drivers.
 4. Rumble, lights and other HID output go back to the client on the same session.
 
 ## Two protocols
@@ -58,6 +59,11 @@ Both run in one `punktfunk-host serve` process.
 `--no-default-features --features pyrowave` builds a host without the GameStream code. A third
 plane, WebTransport for the browser client, is off unless `--webtransport` is passed. Port numbers:
 [Ports](/docs/ports).
+
+`punktfunk/2` is the native protocol's successor, a preview the host answers under
+`PUNKTFUNK_PROTOCOL=2` (ALPN `pkf2`, beside `pkf1`). Control and media share the QUIC port, media
+keys come from the TLS exporter, and timestamps run on a per-session clock. Native clients offer
+it on every dial; the browser plane serves it at `/pf2` under the same opt-in.
 
 ## Control plane and management API
 

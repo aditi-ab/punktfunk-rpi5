@@ -8,6 +8,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+/// The delivery ask for a dial pinned to `fp`: the profile a network check left on that
+/// host's record, or `None` when there is no record or it asks nothing.
+pub fn delivery_ask_for(fp: Option<&[u8; 32]>) -> Option<punktfunk_core::quic::DeliveryAsk> {
+    let fp_hex: String = fp?.iter().map(|b| format!("{b:02x}")).collect();
+    let profile = KnownHosts::load().find_by_fp(&fp_hex)?.delivery?;
+    Some(punktfunk_core::quic::DeliveryAsk { profile, flags: 0 })
+}
+
 /// One trusted host: pinned cert fingerprint, how trust was granted, last-reached address.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(remote = "Self")]
@@ -43,6 +51,10 @@ pub struct KnownHost {
     /// `None` or a deleted id → global defaults; a dangling binding never blocks a connect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset_id: Option<String>,
+    /// The delivery profile to ask this host for (`1` capped, `2` smooth), set from a network
+    /// check's finding. Per host: a Wi-Fi TV and a wired desk differ. `None` asks nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<u8>,
     /// Extra preset cards for this host; order = card order. Presentation only — not
     /// the default (`preset_id`). Duplicates and dangling ids are dropped at resolve.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -124,6 +136,7 @@ impl Default for KnownHost {
             mgmt_port: None,
             clipboard_sync: false,
             preset_id: None,
+            delivery: None,
             pinned_presets: Vec::new(),
             game_presets: BTreeMap::new(),
             id: Some(crate::presets::new_record_uuid()),
@@ -499,7 +512,7 @@ impl KnownHosts {
     /// identity. Both OS installs of a dual-boot box answer at one lease with one MAC
     /// and a certificate each, so retiring by address takes the sibling the user
     /// paired. A re-keyed host leaves its old card behind for one Forget.
-    /// Box fields (MAC, OS, preset, pins, last_used) ride onto the survivor. Not
+    /// Box fields (typed name, MAC, OS, preset, pins, last_used) ride onto the survivor. Not
     /// carried: `paired`, `clipboard_sync` (cert decisions), and the stable id (a deep
     /// link must not silently retarget).
     ///
@@ -527,6 +540,13 @@ impl KnownHosts {
                 addr = %addr, port, kept_fp = %fp_hex,
                 "retiring the unpinned placeholder this decision pins"
             );
+            // Same rule as `upsert`: a synthesised name (empty, or the address) yields.
+            if (h.name.is_empty() || h.name == h.addr)
+                && !old.name.is_empty()
+                && old.name != old.addr
+            {
+                h.name = old.name;
+            }
             if h.mac.is_empty() {
                 h.mac = old.mac;
             }
@@ -868,6 +888,7 @@ mod tests {
                 mgmt_port: Some(47991),
                 clipboard_sync: true,
                 preset_id: Some("aaaaaaaaaaaa".into()),
+                delivery: None,
                 pinned_presets: vec!["bbbbbbbbbbbb".into()],
                 game_presets: [("halo".to_string(), "cccccccccccc".to_string())].into(),
                 id: Some("11111111-2222-4333-8444-555555555555".into()),
@@ -905,6 +926,7 @@ mod tests {
         k.upsert(KnownHost {
             fp_hex: fp.into(),
             preset_id: Some("cccccccccccc".into()),
+            delivery: None,
             pinned_presets: vec!["dddddddddddd".into()],
             ..Default::default()
         });
@@ -994,6 +1016,7 @@ mod tests {
                 mgmt_port: Some(47991),
                 clipboard_sync: true,
                 preset_id: Some("aaaaaaaaaaaa".into()),
+                delivery: None,
                 pinned_presets: vec!["bbbbbbbbbbbb".into()],
                 game_presets: [("halo".to_string(), "cccccccccccc".to_string())].into(),
                 id: Some("11111111-2222-4333-8444-555555555555".into()),
@@ -1040,6 +1063,7 @@ mod tests {
                 paired: true,
                 clipboard_sync: true,
                 preset_id: Some("aaaaaaaaaaaa".into()),
+                delivery: None,
                 id: Some("11111111-2222-4333-8444-555555555555".into()),
                 ..Default::default()
             }],
@@ -1466,8 +1490,9 @@ mod tests {
         assert_eq!(k.hosts.len(), 1);
         assert_eq!(k.hosts[0].name, "Desk");
 
+        // The CLI pairs with the address as the name.
         k.upsert_trusted(KnownHost {
-            name: "Desk".into(),
+            name: "192.168.1.9".into(),
             addr: "192.168.1.9".into(),
             port: 9777,
             fp_hex: fp('a'),
@@ -1475,6 +1500,7 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(k.hosts.len(), 1);
+        assert_eq!(k.hosts[0].name, "Desk");
         assert_eq!(k.hosts[0].mac, macs);
         assert!(k.add(&HostEdit::default()).is_err());
     }

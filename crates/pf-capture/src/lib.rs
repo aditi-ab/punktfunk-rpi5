@@ -26,11 +26,9 @@ pub const KWIN_POOL_MAX: i32 = 4;
 ///
 /// KWin schedules each screencast frame on a QTimer whose wait it rounds *up* to a whole
 /// millisecond, so an 8.333 ms frame is scheduled at 9 and the cadence jitters against the
-/// real refresh. A ceiling well above the stream rate keeps that gate below one refresh, so
-/// every real frame passes; without one, a game far above the stream rate and cursor-only
-/// records take a pool buffer each, and KWin drops a frame outright when none is free.
-/// The ceiling is `KWIN_UNPACED_HEADROOM` times the rate, or none when the rate is unknown.
-/// `PUNKTFUNK_KWIN_PACED=1` asks for the stream rate itself.
+/// real refresh. Unpaced, KWin up to 6.7 gets no ceiling and delivers on its damage
+/// signal; KWin 6.8 (millihertz offer) gets the stream rate as its ceiling and paces the
+/// cast at it. `PUNKTFUNK_KWIN_PACED=1` asks every KWin for the stream rate.
 pub fn unpaced_capture() -> bool {
     !pf_host_config::row_bool("PUNKTFUNK_KWIN_PACED")
 }
@@ -252,6 +250,12 @@ pub trait Capturer: Send {
     /// Forwarded to the encoder (SEI) and the client (`0xCE`). May change if regraded.
     fn hdr_meta(&self) -> Option<pf_frame::HdrMeta> {
         None
+    }
+
+    /// The display composes FP16 under an SDR transfer (Windows SDR wide colour), so an SDR
+    /// stream's encoder reads FP16. Default `false`.
+    fn composes_sdr_fp16(&self) -> bool {
+        false
     }
 
     /// How many frames the encode loop may keep in flight before it blocks.
@@ -488,9 +492,9 @@ pub struct ZeroCopyPolicy {
     /// imports raw dmabufs on any vendor, so take raw-dmabuf passthrough.
     /// Per-session, unlike `backend_is_vaapi`.
     pub pyrowave_session: bool,
-    /// Encoder can ingest producer-native NV12 (Linux raw Vulkan Video on
-    /// H265/AV1 — `pf_encode::linux_native_nv12_ok`). Every other arm takes
-    /// packed RGB; H264/GameStream/PyroWave must never see NV12.
+    /// Encoder can ingest producer-native NV12 (`pf_encode::linux_native_nv12_ok`:
+    /// the AMD/Intel passthrough or NVENC's raw lane). Every other arm takes
+    /// packed RGB; PyroWave must never see NV12.
     pub native_nv12_session: bool,
     /// Encoder can ingest packed 10-bit PQ CUDA (`pf_encode::linux_hdr_cuda_ok`,
     /// direct-SDK NVENC only). No other arm reads those 2:10:10:10 words as
@@ -547,6 +551,18 @@ pub fn capturer_supports_hdr() -> bool {
     false
 }
 
+/// Whether a 10-bit SDR session's IDD-push capture carries the desktop's own bits past 8:
+/// Windows composes the virtual display in SDR wide colour (FP16) for it. Windows 11 24H2,
+/// until a session on this host finds wide colour refused.
+#[cfg(target_os = "windows")]
+pub fn capturer_delivers_sdr10() -> bool {
+    idd_push::wcg_available()
+}
+#[cfg(not(target_os = "windows"))]
+pub fn capturer_delivers_sdr10() -> bool {
+    false
+}
+
 /// Which HDR capture source a `want_hdr` negotiation failure belongs to.
 /// The latch is per source so a portal-monitor failure cannot disable the
 /// virtual-output path, and vice versa, until host restart.
@@ -555,8 +571,9 @@ pub fn capturer_supports_hdr() -> bool {
 pub enum HdrSource {
     /// GNOME 50+ portal monitor mirror (`open_portal_monitor` with `want_hdr`).
     PortalMonitor,
-    /// Compositor virtual output (`open_virtual_output` with `want_hdr`) —
-    /// gamescope's PipeWire node with the carried `pipewire-hdr` patch.
+    /// Compositor virtual output (`open_virtual_output` with `want_hdr`): gamescope's
+    /// PipeWire node with the carried `pipewire-hdr` patch, or a Hyprland head that
+    /// would not light in 10-bit HDR.
     VirtualOutput,
 }
 
@@ -597,8 +614,8 @@ pub fn note_hdr_capture_failed(source: HdrSource) {
             ),
             HdrSource::VirtualOutput => tracing::warn!(
                 "HDR capture negotiation failed on the virtual output — this host will offer SDR \
-                 for gamescope until that display is torn down (is the spawned gamescope the \
-                 punktfunk build? see packaging/gamescope)"
+                 for virtual outputs until a gamescope display is torn down or the host restarts \
+                 (gamescope: is the spawned build punktfunk's? see packaging/gamescope)"
             ),
         }
     }
@@ -763,6 +780,9 @@ pub struct VirtualOutputOpts {
     pub want_hdr: bool,
     /// 10-bit SDR: keep packed RGB so direct NVENC widens 8→10.
     pub ten_bit_sdr: bool,
+    /// The producer composites 10-bit SDR itself (gamescope from `+pfhdr26`): offer its P010
+    /// and packed 10-bit formats under BT.709 ahead of the 8-bit ones. Implies `ten_bit_sdr`.
+    pub sdr10_native: bool,
     /// Skip buffers until the negotiated size matches the preferred mode (KWin's
     /// sacrificial birth mode).
     pub expect_exact_dims: bool,
@@ -795,6 +815,9 @@ pub fn open_virtual_output(
 /// Direct `ext-image-copy-capture-v1` capturer for a compositor output the host has
 /// already created, named by its `wl_output.name`. The capturer owns `keepalive`.
 ///
+/// `want_hdr` takes the output's packed 10-bit buffer and its `wp_color_management_v1`
+/// mastering volume; it fails unless the output is lit in BT.2020 PQ.
+///
 /// Fails for every reason the caller should fall back to the portal: the compositor
 /// lacks the protocol, the output is gone, or nothing it offers can be imported by this
 /// session's encoder. The failure hands `keepalive` back for that fallback.
@@ -803,9 +826,18 @@ pub fn open_direct_output(
     output_name: String,
     keepalive: Box<dyn Send>,
     policy: ZeroCopyPolicy,
+    want_hdr: bool,
 ) -> std::result::Result<Box<dyn Capturer>, (anyhow::Error, Box<dyn Send>)> {
-    linux::WlCapturer::open(output_name, keepalive, policy)
+    linux::WlCapturer::open(output_name, keepalive, policy, want_hdr)
         .map(|c| Box::new(c) as Box<dyn Capturer>)
+}
+
+/// Whether the compositor output named `output_name` is lit in HDR (BT.2020 PQ), read
+/// from its `wp_color_management_v1` description. `None` when the compositor has no colour
+/// management or no such output — direct capture then has no HDR to offer.
+#[cfg(target_os = "linux")]
+pub fn output_hdr(output_name: &str) -> Option<bool> {
+    linux::output_is_hdr10(output_name)
 }
 
 /// Windows IDD direct-push capturer on a pf-vdisplay target. `sender` delivers

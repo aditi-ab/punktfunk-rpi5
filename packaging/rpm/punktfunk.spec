@@ -63,6 +63,13 @@ ExclusiveArch:  x86_64 aarch64
 # from emitting an empty `punktfunk` package alongside the client.
 %bcond_without host
 
+# Debug packages. ON by default (COPR). CI builds `--without debuginfo`: it publishes no
+# -debuginfo/-debugsource packages, so it compiles no debug info either (see %%build).
+%bcond_without debuginfo
+%if %{without debuginfo}
+%global debug_package %{nil}
+%endif
+
 # --- Build toolchain ---------------------------------------------------------
 BuildRequires:  cargo
 BuildRequires:  rust
@@ -116,6 +123,9 @@ Requires:       opus
 Requires:       libei
 # A compositor to drive. Bazzite ships gamescope; the others are user choice.
 Recommends:     gamescope
+# HDR, the real mode and the cursor in a gamescope session. Weak because a Fedora major whose
+# gamescope build failed publishes none; dnf skips a weak dep it can't find.
+Recommends:     punktfunk-gamescope
 Suggests:       kwin
 Suggests:       mutter
 # NVENC + GPU EGL come from the NVIDIA driver; on Bazzite the -nvidia image has it.
@@ -216,6 +226,11 @@ The bun runtime the punktfunk web console and plugin runner run on, installed on
 # Release build of the host + client binaries (the workspace also has the core lib).
 # cargo fetches crates over the network; COPR build hosts allow this.
 export RUSTFLAGS="%{?build_rustflags}"
+%if %{without debuginfo}
+# Fedora's flags pin -Cdebuginfo=2 and -Ccodegen-units=1; drop both so Cargo.toml's release
+# profile (and CI's canary codegen-units) decide.
+RUSTFLAGS="$(printf '%s' "$RUSTFLAGS" | sed -E 's/ ?-C(debuginfo|codegen-units)=[^ ]*//g')"
+%endif
 # Use the toolchain baked into the builder image as-is, ignoring rust-toolchain.toml. The toml
 # floats `channel = "stable"` and requests rustfmt/clippy (lint-only — not needed for a build); when
 # a newer stable lands upstream, that combination makes rustup try to UPDATE the baked, minimal-
@@ -409,6 +424,8 @@ install -Dm0644 packaging/linux/50-punktfunk-nice.conf \
 install -Dm0755 target/release/punktfunk-tray %{buildroot}%{_bindir}/punktfunk-tray
 install -Dm0644 packaging/linux/io.unom.Punktfunk.Tray.desktop \
                 %{buildroot}%{_sysconfdir}/xdg/autostart/io.unom.Punktfunk.Tray.desktop
+install -Dm0644 packaging/linux/io.unom.Punktfunk.StartHost.desktop \
+                %{buildroot}%{_datadir}/applications/io.unom.Punktfunk.StartHost.desktop
 for sz in 22x22 48x48; do
   for png in packaging/linux/icons/hicolor/$sz/apps/*.png; do
     install -Dm0644 "$png" %{buildroot}%{_datadir}/icons/hicolor/$sz/apps/"$(basename "$png")"
@@ -541,6 +558,11 @@ chmod 0755 %{buildroot}%{_bindir}/punktfunk-scripting
 # systemd --user unit — installed but NOT auto-enabled (opt-in; the runner is inert until you add
 # scripts/plugins). Enable with `systemctl --user enable --now punktfunk-scripting`.
 install -Dm0644 scripts/punktfunk-scripting.service %{buildroot}%{_userunitdir}/punktfunk-scripting.service
+# Where AppArmor restricts unprivileged user namespaces, the generator trades the unit's namespace
+# sandbox for this profile.
+install -Dm0644 packaging/linux/apparmor/punktfunk-scripting %{buildroot}%{_sysconfdir}/apparmor.d/punktfunk-scripting
+install -Dm0755 packaging/linux/punktfunk-scripting-apparmor.generator \
+  %{buildroot}%{_prefix}/lib/systemd/user-generators/punktfunk-scripting-apparmor
 %endif
 
 %if %{with web} || %{with scripting}
@@ -627,6 +649,7 @@ install -Dm0755 "$(command -v bun)" %{buildroot}%{_libexecdir}/punktfunk-bun/bun
 %{_userunitdir}/punktfunk-kde-session.service
 %{_datadir}/applications/io.unom.Punktfunk.Host.desktop
 %{_sysconfdir}/xdg/autostart/io.unom.Punktfunk.Tray.desktop
+%{_datadir}/applications/io.unom.Punktfunk.StartHost.desktop
 %{_datadir}/icons/hicolor/*/apps/punktfunk-tray*.png
 %dir /etc/gamescope-session-plus
 %dir /etc/gamescope-session-plus/sessions.d
@@ -677,6 +700,9 @@ install -Dm0755 "$(command -v bun)" %{buildroot}%{_libexecdir}/punktfunk-bun/bun
 %dir %{_datadir}/punktfunk-scripting
 %{_datadir}/punktfunk-scripting/runner-cli.js
 %{_userunitdir}/punktfunk-scripting.service
+%dir %{_sysconfdir}/apparmor.d
+%config(noreplace) %{_sysconfdir}/apparmor.d/punktfunk-scripting
+%{_prefix}/lib/systemd/user-generators/punktfunk-scripting-apparmor
 %endif
 
 %if %{with web} || %{with scripting}
@@ -803,6 +829,10 @@ echo "Then open https://<host-ip>:47992"
 # symlink. $1 == 1 is a first INSTALL — on an upgrade ($1 > 1) this must not undo an operator's mask.
 if [ "$1" -eq 1 ] && command -v systemctl >/dev/null 2>&1; then
     systemctl --global enable punktfunk-scripting.service >/dev/null 2>&1 || :
+fi
+# Boot loads it from /etc/apparmor.d; this covers the running kernel.
+if command -v apparmor_parser >/dev/null 2>&1 && aa-enabled --quiet 2>/dev/null; then
+    apparmor_parser -r -T -W %{_sysconfdir}/apparmor.d/punktfunk-scripting || :
 fi
 echo "punktfunk-scripting installed and enabled for all users."
 echo "It runs your automation — game-library sources, scripts in"

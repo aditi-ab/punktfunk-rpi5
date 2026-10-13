@@ -28,6 +28,8 @@ pub(crate) struct ClientShared {
     /// [`NativeClient::disconnect_quit`] → [`crate::quic::QUIT_CLOSE_CODE`] (skip keep-alive
     /// linger). A plain drop leaves this false → close code 0.
     pub(crate) quit: AtomicBool,
+    /// The wire the host answered: `1` or `2`. Set before the embedder can read it.
+    pub(crate) wire: AtomicU8,
     /// Welcome mode, then every accepted switch the control task applies.
     pub(crate) mode: Mutex<Mode>,
     pub(crate) probe: Mutex<ProbeState>,
@@ -54,6 +56,21 @@ pub(crate) struct ClientShared {
     pub(crate) abr_windows: Mutex<std::collections::VecDeque<crate::abr::WindowRecord>>,
     /// What the bring-up ramp measured, once it stopped.
     pub(crate) abr_ramp: Mutex<Option<crate::abr::RampRecord>>,
+    /// The host's latest answer about the delivery profile; `None` until one arrives, which
+    /// toward an older host is for ever.
+    pub(crate) delivery: Mutex<Option<crate::quic::DeliveryChanged>>,
+    /// What the host said about its end of the path, when the dial asked.
+    pub(crate) host_facts: Mutex<Option<crate::quic::HostFacts>>,
+    /// What this dial asked about delivery, so a routine knows the session's kind.
+    pub(crate) delivery_ask: Mutex<Option<crate::quic::DeliveryAsk>>,
+    /// A clone of the data socket: the same socket as the pump's, so its receive drops and
+    /// buffer grant can be read on demand without touching the pump.
+    pub(crate) data_sock: Mutex<Option<std::net::UdpSocket>>,
+    /// The address the host's packets arrive at, where `data_sock` is unconnected
+    /// (`punktfunk/2`'s shared socket) and its own address names no interface.
+    pub(crate) local_ip: Mutex<Option<std::net::IpAddr>>,
+    /// The `punktfunk/2` session id the host issued, kept for a resume if the link is lost.
+    pub(crate) v2_session: Mutex<Option<[u8; 16]>>,
     /// Live encoder target (kbps): the Welcome seed, then every `BitrateChanged` ack.
     pub(crate) live_bitrate_kbps: AtomicU32,
     /// [`crate::hud::RateCut`] code the pump publishes each window; `0` = no standing cut.
@@ -62,6 +79,8 @@ pub(crate) struct ClientShared {
     pub(crate) recent_rfis: Mutex<RecentRfis>,
     /// What each frame the pump skipped past still lacked, for the RFI line.
     pub(crate) short_frames: Mutex<ShortFrames>,
+    /// Loss asks: the decode side's gaps and the pump's short tails, one throttle.
+    pub(crate) rfi: Mutex<RfiRecovery>,
     /// Per-pad render caps (bit0 haptics, bit1 speaker). OR'd into GamepadArrival flags
     /// (bits 8/9) toward a `HOST_CAP_PAD_AUDIO` host only.
     pub(crate) pad_audio_caps: [AtomicU8; crate::input::MAX_PADS],
@@ -95,6 +114,7 @@ impl ClientShared {
             shutdown: Arc::new(AtomicBool::new(false)),
             end_reason: AtomicU8::new(PunktfunkEndReason::None as u8),
             quit: AtomicBool::new(false),
+            wire: AtomicU8::new(1),
             mode: Mutex::new(mode),
             probe: Mutex::default(),
             frames_dropped: AtomicU64::new(0),
@@ -107,10 +127,17 @@ impl ClientShared {
             decode_lat: Mutex::default(),
             abr_windows: Mutex::default(),
             abr_ramp: Mutex::default(),
+            delivery: Mutex::default(),
+            host_facts: Mutex::default(),
+            delivery_ask: Mutex::default(),
+            data_sock: Mutex::default(),
+            local_ip: Mutex::default(),
+            v2_session: Mutex::default(),
             live_bitrate_kbps: AtomicU32::new(0),
             rate_cut: AtomicU8::new(0),
             recent_rfis: Mutex::default(),
             short_frames: Mutex::default(),
+            rfi: Mutex::default(),
             pad_audio_caps: std::array::from_fn(|_| AtomicU8::new(0)),
             pad_mouse: Default::default(),
             scroll_invert: AtomicBool::new(false),
@@ -122,6 +149,14 @@ impl ClientShared {
             end_reject_code: AtomicU32::new(0),
             end_reject_said: std::sync::OnceLock::new(),
         }
+    }
+
+    /// A diagnostic session: the dial asked for probes only, so no video ever comes.
+    pub(crate) fn probe_only(&self) -> bool {
+        self.delivery_ask
+            .lock()
+            .unwrap()
+            .is_some_and(|a| a.flags & crate::quic::EXT_DELIVERY_PROBE_ONLY != 0)
     }
 }
 

@@ -73,6 +73,8 @@ struct FrameBuf {
     block_count: usize,
     pts_ns: u64,
     user_flags: u32,
+    /// Config generation (`punktfunk/2`); every packet of the frame carries the same.
+    epoch: u8,
     /// Leading blocks already handed up as slice-progressive prefix parts.
     next_part_block: u16,
     /// AU shard offset of the next prefix part (`next_part_block`'s start).
@@ -83,6 +85,8 @@ struct FrameBuf {
     blocks: HashMap<u16, BlockState>,
     /// Blocks reconstructed into `buf`. A failed block never counts; the frame ages out.
     blocks_ok: usize,
+    /// A block's last shard arrived and parity could not close it. Reported once.
+    short_tail: bool,
 }
 
 /// Per-session header bounds, applied before any allocation. Derived from [`Config`].
@@ -156,6 +160,10 @@ const RECOVERY_POOL_MAX: usize = 512;
 /// clock read.
 const SHARD_DELAY_SAMPLES: usize = 256;
 
+/// Short tails held between drains ([`Reassembler::take_short_tails`]). The pump drains
+/// every iteration, so this bounds only a consumer that stopped reading.
+const SHORT_TAIL_SAMPLES: usize = 64;
+
 /// Bytes a [`BlockState`] charges the in-flight budget. Vectors size from header
 /// fields, so a slice-streamed frame can mint thousands of blocks while `buf` stays
 /// near zero — they must meter like the buffer. `pub(super)` so budget tests read
@@ -193,8 +201,21 @@ fn reclaim_parity(
     }
 }
 
+/// Which header the reassembler reads.
+#[derive(Clone, Copy, Debug)]
+enum RxFraming {
+    V1,
+    /// `pts_ref_us` is the newest capture time seen, which unwraps the 32-bit field; `None`
+    /// until the first packet seeds it.
+    V2 {
+        clock_origin_ns: u64,
+        pts_ref_us: Option<i64>,
+    },
+}
+
 pub struct Reassembler {
     limits: ReassemblerLimits,
+    framing: RxFraming,
     /// Opt-in: emit aged-out [`USER_FLAG_CHUNK_ALIGNED`] frames instead of dropping
     /// them. Still counted in `frames_dropped` — a partial is lost data.
     deliver_partial: bool,
@@ -217,12 +238,15 @@ pub struct Reassembler {
     /// is timed here and nowhere else, which is what keeps the delay signal alive
     /// while the queue is deepest.
     shard_delay_ns: Vec<i64>,
+    /// Video frames whose tail arrived short, oldest first ([`Self::take_short_tails`]).
+    short_tails: Vec<u32>,
 }
 
 impl Reassembler {
     pub fn new(limits: ReassemblerLimits) -> Self {
         Reassembler {
             limits,
+            framing: RxFraming::V1,
             deliver_partial: false,
             pending_partial: None,
             deliver_parts: false,
@@ -231,7 +255,17 @@ impl Reassembler {
             recovery_pool: Vec::new(),
             in_flight_bytes: 0,
             shard_delay_ns: Vec::with_capacity(SHARD_DELAY_SAMPLES),
+            short_tails: Vec::new(),
         }
+    }
+
+    /// Read `punktfunk/2` packets ([`decode_v2`]) from now on. `clock_origin_ns` is the host
+    /// instant the session's capture times count from.
+    pub fn set_v2(&mut self, clock_origin_ns: u64) {
+        self.framing = RxFraming::V2 {
+            clock_origin_ns,
+            pts_ref_us: None,
+        };
     }
 
     /// The first-shard delays since the last call, oldest first. Raw
@@ -239,6 +273,14 @@ impl Reassembler {
     /// completed AU.
     pub fn take_shard_delays(&mut self) -> std::vec::Drain<'_, i64> {
         self.shard_delay_ns.drain(..)
+    }
+
+    /// Video frames whose block tail arrived short of what parity can rebuild, since the
+    /// last call. A block sends its parity last, so its last shard closes it: without a
+    /// reordered shard still on the way, the frame is lost now, a frame interval before
+    /// the next frame's arrival shows the gap.
+    pub fn take_short_tails(&mut self) -> std::vec::Drain<'_, u32> {
+        self.short_tails.drain(..)
     }
 
     pub fn set_deliver_partial(&mut self, on: bool) {
@@ -281,18 +323,23 @@ impl Reassembler {
         coder: &dyn ErasureCoder,
         stats: &StatsCounters,
     ) -> std::result::Result<Option<Frame>, Dropped> {
-        if pkt.len() < HEADER_LEN {
-            return Err(Dropped);
+        let (hdr, epoch, body) = match &mut self.framing {
+            RxFraming::V1 => parse_v1(pkt).map(|(h, b)| (h, 0, b)),
+            RxFraming::V2 {
+                clock_origin_ns,
+                pts_ref_us,
+            } => decode_v2(pkt, *clock_origin_ns, pts_ref_us),
         }
-        let hdr = PacketHeader::read_from_bytes(&pkt[..HEADER_LEN]).map_err(|_| Dropped)?;
+        .ok_or(Dropped)?;
         let lim = self.limits;
-        let g = firewall(&hdr, pkt.len(), &lim).ok_or(Dropped)?;
-        let body = &pkt[HEADER_LEN..HEADER_LEN + g.shard_bytes];
+        let g = firewall(&hdr, body.len(), &lim).ok_or(Dropped)?;
+        let body = &body[..g.shard_bytes];
 
         // Split so the window, pool, and in-flight budget can be touched while a
         // frame entry is mutably borrowed.
         let Reassembler {
             limits: _,
+            framing: _,
             deliver_partial,
             pending_partial,
             deliver_parts,
@@ -301,6 +348,7 @@ impl Reassembler {
             recovery_pool,
             in_flight_bytes,
             shard_delay_ns,
+            short_tails,
         } = self;
         let parts = *deliver_parts;
 
@@ -323,6 +371,21 @@ impl Reassembler {
             stats
                 .probe_last_arrival_ns
                 .store(now_ns, std::sync::atomic::Ordering::Relaxed);
+            // The gap to the previous probe packet, and a key that must not go backwards.
+            let prev = stats
+                .probe_prev_arrival_ns
+                .swap(now_ns, std::sync::atomic::Ordering::Relaxed);
+            if prev != 0 {
+                let i = crate::stats::probe_gap_bucket(now_ns.saturating_sub(prev) / 1_000);
+                stats.probe_gap_buckets[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let key = (u64::from(hdr.frame_index) << 16 | u64::from(hdr.shard_index)) + 1;
+            let last = stats
+                .probe_last_key
+                .swap(key, std::sync::atomic::Ordering::Relaxed);
+            if last != 0 && key < last {
+                StatsCounters::add(&stats.probe_reorders, 1);
+            }
         } else if hdr.shard_index < hdr.data_shards {
             // DATA payload only. ABR compares delivered throughput to an encoder
             // target, so parity, headers, and probe filler stay out of the numerator.
@@ -379,11 +442,13 @@ impl Reassembler {
                     block_count: g.block_count,
                     pts_ns: hdr.pts_ns,
                     user_flags: hdr.user_flags,
+                    epoch,
                     next_part_block: 0,
                     delivered_shards: 0,
                     buf: vec![0; buf_len],
                     blocks: HashMap::new(),
                     blocks_ok: 0,
+                    short_tail: false,
                 })
             }
         };
@@ -392,6 +457,7 @@ impl Reassembler {
         // `shard_payload` change from landing a straggler in the wrong geometry.
         // Mixed slice/uniform would firewall under one rule and place under the other.
         if frame.shard_bytes != g.shard_bytes
+            || frame.epoch != epoch
             || (frame.user_flags ^ hdr.user_flags) & crate::packet::USER_FLAG_SLICE_STREAM != 0
         {
             return Err(Dropped);
@@ -434,6 +500,7 @@ impl Reassembler {
                 buf,
                 blocks,
                 blocks_ok,
+                short_tail,
                 ..
             } = &mut *frame;
             // First packet sizes the block. `data_shards` is already pinned;
@@ -543,6 +610,14 @@ impl Reassembler {
                 block.reconstructed = missing > 0;
                 StatsCounters::add(&stats.fec_recovered_shards, missing as u64);
                 *blocks_ok += 1;
+            } else if g.shard_index + 1 == g.data_shards + g.recovery_shards
+                && !is_probe
+                && !*short_tail
+            {
+                *short_tail = true;
+                if short_tails.len() < SHORT_TAIL_SAMPLES {
+                    short_tails.push(hdr.frame_index);
+                }
             }
         }
 
@@ -588,6 +663,7 @@ impl Reassembler {
         // Samples of the backlog that was just thrown away describe a queue the
         // session no longer has.
         self.shard_delay_ns.clear();
+        self.short_tails.clear();
     }
 
     /// Test-only in-flight byte commitment. Mixed-geometry tests assert it returns
@@ -666,13 +742,19 @@ struct Geom {
     base_shard: usize,
 }
 
+/// A `punktfunk/1` packet: the 40-byte header and the bytes after it.
+fn parse_v1(pkt: &[u8]) -> Option<(PacketHeader, &[u8])> {
+    let hdr = PacketHeader::read_from_bytes(pkt.get(..HEADER_LEN)?).ok()?;
+    Some((hdr, &pkt[HEADER_LEN..]))
+}
+
 /// Bound every attacker-controlled header field before anything allocates on it.
 /// `None` = drop the packet.
 ///
 /// `shard_bytes` is a range, not equality: geometry is per-frame, and `push` rejects a
 /// mid-frame change. Even size matches `Config::validate`. Reads only the header, the
-/// packet length and the limits, so it is tested directly.
-fn firewall(hdr: &PacketHeader, pkt_len: usize, lim: &ReassemblerLimits) -> Option<Geom> {
+/// length of the bytes after it and the limits, so it is tested directly.
+fn firewall(hdr: &PacketHeader, body_len: usize, lim: &ReassemblerLimits) -> Option<Geom> {
     let shard_bytes = hdr.shard_bytes as usize;
     let data_shards = hdr.data_shards as usize;
     let recovery_shards = hdr.recovery_shards as usize;
@@ -684,7 +766,7 @@ fn firewall(hdr: &PacketHeader, pkt_len: usize, lim: &ReassemblerLimits) -> Opti
         || shard_bytes < lim.min_shard_bytes
         || shard_bytes > lim.max_shard_bytes
         || shard_bytes % 2 != 0
-        || pkt_len < HEADER_LEN + shard_bytes
+        || body_len < shard_bytes
         || data_shards == 0
         || data_shards > lim.max_data_shards
         || total == 0
@@ -924,6 +1006,7 @@ impl FrameBuf {
             frame_index,
             pts_ns: self.pts_ns,
             flags: self.user_flags,
+            epoch: self.epoch,
             complete: true,
             part,
             received_ns: 0, // stamped by Session::poll_frame at the session boundary
@@ -963,6 +1046,7 @@ impl FrameBuf {
             frame_index,
             pts_ns: self.pts_ns,
             flags: self.user_flags,
+            epoch: self.epoch,
             complete: false,
             part: Some(FramePart {
                 offset: lo as u32,
@@ -1033,6 +1117,7 @@ impl ReassemblyWindow {
                                 frame_index: idx,
                                 pts_ns: f.pts_ns,
                                 flags: f.user_flags,
+                                epoch: f.epoch,
                                 complete: false,
                                 part: None,
                                 received_ns: 0, // stamped by Session::poll_frame at the session boundary
@@ -1089,6 +1174,7 @@ mod reset_tests {
             frame_index: 7,
             pts_ns: 1,
             flags: 0,
+            epoch: 0,
             complete: false,
             part: None,
             received_ns: 0,
@@ -1149,9 +1235,8 @@ mod firewall_tests {
     /// One header of each wire shape passes, with the base and extent it proves.
     #[test]
     fn each_wire_shape_passes_with_its_own_extent() {
-        let pkt = HEADER_LEN + 16;
         let geom =
-            |h: PacketHeader| firewall(&h, pkt, &lim()).map(|g| (g.base_shard, g.need_shards));
+            |h: PacketHeader| firewall(&h, 16, &lim()).map(|g| (g.base_shard, g.need_shards));
         // 20 data shards at K = 8: blocks of 8, 8, 4.
         assert_eq!(geom(header(16, 4, 2, 0, 2, 3, 320, false)), Some((16, 20)));
         assert_eq!(geom(header(16, 8, 2, 0, 1, 0, 0, false)), Some((8, 16)));
@@ -1181,9 +1266,9 @@ mod firewall_tests {
             let lim = lim();
             let h = header(shard_bytes, data, rec, shard_index, block_index, block_count,
                 frame_bytes, slice);
-            let pkt_len = HEADER_LEN + shard_bytes as usize - short;
-            if let Some(g) = firewall(&h, pkt_len, &lim) {
-                prop_assert!(pkt_len >= HEADER_LEN + g.shard_bytes);
+            let body_len = (shard_bytes as usize).saturating_sub(short);
+            if let Some(g) = firewall(&h, body_len, &lim) {
+                prop_assert!(body_len >= g.shard_bytes);
                 prop_assert!(g.shard_index < g.data_shards + g.recovery_shards);
                 prop_assert!(g.data_shards <= lim.max_data_shards);
                 prop_assert!(g.base_shard + g.data_shards <= g.need_shards);

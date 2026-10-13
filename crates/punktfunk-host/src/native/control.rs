@@ -93,12 +93,33 @@ fn delivery_share(
         .flatten()
 }
 
+/// The profile this session streams under from the next frame: the client's ask, unless
+/// `PUNKTFUNK_DELIVERY` pins one for every session. Stored for the send loop and answered.
+fn apply_delivery(
+    delivery: &std::sync::atomic::AtomicU8,
+    asked: u8,
+) -> punktfunk_core::quic::DeliveryChanged {
+    let forced = crate::send_pacing::forced_delivery();
+    let profile = forced.unwrap_or_else(|| crate::send_pacing::DeliveryProfile::from_u8(asked));
+    delivery.store(profile as u8, Ordering::Relaxed);
+    tracing::info!(
+        asked,
+        profile = ?profile,
+        forced = forced.is_some(),
+        "delivery profile set"
+    );
+    punktfunk_core::quic::DeliveryChanged {
+        profile: profile as u8,
+        forced: forced.is_some(),
+    }
+}
+
 /// Whether this probe request is as short as a bring-up ramp step.
 ///
 /// The length bound is the ramp's exemption from the spacing. Without it a
 /// client could hold the window open with 5 s bursts at the probe ceiling,
 /// which is the uplink-pinning the spacing exists against.
-fn is_ramp_length(req: &ProbeRequest) -> bool {
+fn is_ramp_length(req: &ProbeShaped) -> bool {
     req.duration_ms <= super::stream::RAMP_STEP_MAX_MS
 }
 
@@ -212,6 +233,13 @@ pub(super) struct Task {
     /// may carry the reason byte. Clear for every shipped client, which rejects
     /// a longer ack, and for every client behind a host without `HOST_CAP2_EXT`.
     pub(super) ack_reason: bool,
+    /// `EXT_TAG_DELIVERY` on the client's `Start`: answered once this task runs.
+    pub(super) delivery_ask: Option<punktfunk_core::quic::DeliveryAsk>,
+    /// Sent after the answer when the ask set `EXT_DELIVERY_FACTS`.
+    pub(super) host_facts: Option<punktfunk_core::quic::HostFacts>,
+    /// A diagnostic session (`EXT_DELIVERY_PROBE_ONLY`): every probe is served, with no
+    /// spacing. The session holds no pipeline, and the stream thread bounds what it costs.
+    pub(super) probe_only: bool,
     /// The control halves of the session's channels to the stream thread.
     pub(super) ends: super::wiring::ControlEnds,
     /// Encoder truth read at `SetBitrate`, so the ack never exceeds what the encoder will run,
@@ -261,6 +289,9 @@ pub(super) async fn run(task: Task) {
         wire_bytes,
         audio_kbps,
         ack_reason,
+        delivery_ask,
+        host_facts,
+        probe_only,
         ends:
             super::wiring::ControlEnds {
                 reconfig_tx,
@@ -286,6 +317,7 @@ pub(super) async fn run(task: Task) {
                 fec_target,
                 fec_requested,
                 link_kbps,
+                delivery,
                 phase: phase_ctl,
                 ramp_open,
                 cursor_client_draws,
@@ -356,6 +388,22 @@ pub(super) async fn run(task: Task) {
     link_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // `interval` fires immediately; the first tick would close an empty window at 0 s.
     link_tick.tick().await;
+    // Answer the Start tag: what this session streams under, then the host's facts when
+    // asked. The answer is also how the client learns this host reads delivery at all.
+    if let Some(ask) = delivery_ask {
+        let ack = apply_delivery(&delivery, ask.profile);
+        if io::write_msg(&mut ctrl_send, &ack.encode()).await.is_err() {
+            return;
+        }
+        if let Some(facts) = host_facts {
+            if io::write_msg(&mut ctrl_send, &facts.encode())
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
     // `select!` drops this future whenever a sibling fires. `io::read_msg`
     // would lose a partial frame and misalign the rest of the session.
     let mut ctrl_reader = io::MsgReader::new(ctrl_recv);
@@ -364,7 +412,7 @@ pub(super) async fn run(task: Task) {
             msg = ctrl_reader.read_msg() => {
                 let Ok(msg) = msg else { break };
                 if let Ok(edge) = punktfunk_core::quic::InputEdge::decode(&msg) {
-                    offer_edge(edge.0, &session_grants, &input_tx, &counters, &mut denied);
+                    offer_edge(edge.0, &session_grants, &input_tx, &counters, &mut denied).await;
                 } else if let Ok(req) = Reconfigure::decode(&msg) {
                     let now = std::time::Instant::now();
                     // Same bound as the handshake: `> 0` alone acked a mode that cannot land.
@@ -461,6 +509,11 @@ pub(super) async fn run(task: Task) {
                                 break;
                             }
                         }
+                    }
+                } else if let Ok(req) = punktfunk_core::quic::SetDelivery::decode(&msg) {
+                    let ack = apply_delivery(&delivery, req.profile);
+                    if io::write_msg(&mut ctrl_send, &ack.encode()).await.is_err() {
+                        break;
                     }
                 } else if let Ok(rep) = LinkReport::decode(&msg) {
                     link_kbps.store(rep.proven_kbps, Ordering::Relaxed);
@@ -599,9 +652,14 @@ pub(super) async fn run(task: Task) {
                         "client acked shard-payload change"
                     );
                     let _ = shard_ack_tx.send(ack.shard_payload);
-                } else if let Ok(req) = ProbeRequest::decode(&msg) {
+                } else if let Ok(req) = ProbeRequest::decode(&msg)
+                    .map(ProbeShaped::from)
+                    .or_else(|_| ProbeShaped::decode(&msg))
+                {
                     let open = ramp_open.load(Ordering::SeqCst);
-                    if !probe_spacing.admit(std::time::Instant::now(), is_ramp_length(&req), open) {
+                    if !probe_only
+                        && !probe_spacing.admit(std::time::Instant::now(), is_ramp_length(&req), open)
+                    {
                         tracing::warn!(
                             target_kbps = req.target_kbps,
                             "speed-test probe rejected (rate-limited)"
@@ -904,9 +962,10 @@ fn clip_offer_permitted(grants: u32, clip_enabled: bool) -> bool {
 }
 
 /// A key edge off the control stream joins the datagram plane's queue: the same grant
-/// gate, the same count, and the same drop when the input thread is behind — stale
-/// input is already worthless. The lane keeps its order; the queue keeps it too.
-fn offer_edge(
+/// gate and count, and a press drops when the input thread is behind. A release waits up
+/// to [`RELEASE_WAIT`] for room: a lost one holds the key down on the host, and this lane
+/// exists so none is lost. The lane keeps its order; the queue keeps it too.
+async fn offer_edge(
     ev: InputEvent,
     grants: &AtomicU32,
     input_tx: &std::sync::mpsc::SyncSender<super::input::ClientInput>,
@@ -924,12 +983,32 @@ fn offer_edge(
     if matches!(ev.kind, InputKind::KeyDown | InputKind::KeyUp) {
         ev.flags &= !crate::inject::KEY_FLAG_SEMANTIC_VK;
     }
-    if let Err(std::sync::mpsc::TrySendError::Full(_)) =
-        input_tx.try_send(super::input::ClientInput::Event(ev))
-    {
-        counters.input_dropped.fetch_add(1, Ordering::Relaxed);
+    let release = matches!(
+        ev.kind,
+        InputKind::KeyUp | InputKind::MouseButtonUp | InputKind::TouchUp
+    );
+    let deadline = tokio::time::Instant::now() + RELEASE_WAIT;
+    let mut msg = super::input::ClientInput::Event(ev);
+    loop {
+        match input_tx.try_send(msg) {
+            Err(std::sync::mpsc::TrySendError::Full(back))
+                if release && tokio::time::Instant::now() < deadline =>
+            {
+                msg = back;
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                counters.input_dropped.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return,
+        }
     }
 }
+
+/// A blocking pad create or the 200 ms "owned elsewhere" wait stalls the input thread; a
+/// release outlasts both. Longer, and the session is gone anyway.
+const RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[cfg(test)]
 mod tests {
@@ -992,6 +1071,7 @@ mod tests {
                     probe: false,
                     probe_target_kbps: None,
                     ramp: false,
+                    probe_only: false,
                     pin_kbps: None,
                 },
                 base,
@@ -1216,9 +1296,12 @@ mod tests {
     /// with no ramp behind it is spaced too.
     #[test]
     fn only_a_short_step_of_the_ramp_skips_the_spacing() {
-        let req = |duration_ms| ProbeRequest {
-            target_kbps: 40_000,
-            duration_ms,
+        let req = |duration_ms| -> ProbeShaped {
+            ProbeRequest {
+                target_kbps: 40_000,
+                duration_ms,
+            }
+            .into()
         };
         assert!(is_ramp_length(&req(25)));
         assert!(is_ramp_length(&req(super::stream::RAMP_STEP_MAX_MS)));
@@ -1371,9 +1454,10 @@ mod tests {
     }
 
     /// A key edge off the control stream takes the datagram path's grant gate, count and
-    /// queue; the in-process flag never survives the wire; a full queue drops and counts.
-    #[test]
-    fn an_edge_off_the_control_stream_joins_the_input_queue() {
+    /// queue; the in-process flag never survives the wire; a full queue drops a press and
+    /// counts it, and holds a release until there is room.
+    #[tokio::test]
+    async fn an_edge_off_the_control_stream_joins_the_input_queue() {
         use punktfunk_core::quic::{GRANT_ALL, GRANT_PRESET_CONTROLLER_ONLY};
         let (tx, rx) = std::sync::mpsc::sync_channel::<super::super::input::ClientInput>(1);
         let counters = crate::session_status::SessionCounters::default();
@@ -1392,21 +1476,39 @@ mod tests {
             &tx,
             &counters,
             &mut denied,
-        );
+        )
+        .await;
         assert!(rx.try_recv().is_err(), "no keyboard grant, no event");
         assert_eq!(counters.input_events.load(Ordering::Relaxed), 0);
 
         let grants = AtomicU32::new(GRANT_ALL);
-        offer_edge(key, &grants, &tx, &counters, &mut denied);
+        offer_edge(key, &grants, &tx, &counters, &mut denied).await;
         match rx.try_recv() {
             Ok(super::super::input::ClientInput::Event(ev)) => {
                 assert_eq!((ev.kind, ev.code, ev.flags), (InputKind::KeyDown, 0x41, 4))
             }
             other => panic!("the edge, unflagged: {}", other.is_ok()),
         }
-        offer_edge(key, &grants, &tx, &counters, &mut denied);
-        offer_edge(key, &grants, &tx, &counters, &mut denied);
+        offer_edge(key, &grants, &tx, &counters, &mut denied).await;
+        offer_edge(key, &grants, &tx, &counters, &mut denied).await;
         assert_eq!(counters.input_events.load(Ordering::Relaxed), 3);
+        assert_eq!(counters.input_dropped.load(Ordering::Relaxed), 1);
+
+        // The queue is full; a release waits for the input thread instead of dropping.
+        let drain = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let _ = rx.recv();
+            rx.recv().map(|m| match m {
+                super::super::input::ClientInput::Event(ev) => ev.kind,
+                _ => InputKind::KeyDown,
+            })
+        });
+        let up = InputEvent {
+            kind: InputKind::KeyUp,
+            ..key
+        };
+        offer_edge(up, &grants, &tx, &counters, &mut denied).await;
+        assert_eq!(drain.join().unwrap().ok(), Some(InputKind::KeyUp));
         assert_eq!(counters.input_dropped.load(Ordering::Relaxed), 1);
     }
 }

@@ -24,8 +24,8 @@ use crate::overlay::{
     RingFacts, RingInput, SessionPhase,
 };
 use crate::present_pace::{
-    Cadence, CadenceProbe, FrameStore, LatchClock, PresentGate, SourcePacer, MARGIN_MAX_NS,
-    MARGIN_STEP_NS,
+    off_grid_ns, Cadence, CadenceProbe, FrameStore, LatchClock, PresentGate, SourcePacer,
+    MARGIN_MAX_NS, MARGIN_STEP_NS,
 };
 use crate::touch::{Abs, Act};
 use crate::vk::{FrameInput, Presented, Presenter};
@@ -95,8 +95,9 @@ pub struct SessionOpts {
     /// `None` is the Skia-free build (stats stay stdout-only). Init failure degrades to `None`
     /// with a warning rather than killing the session. Browse mode requires one.
     pub overlay: Option<Box<dyn Overlay>>,
-    /// Starting logical size; `None` = 1280×720. Match-window passes the persisted last size
-    /// so the first connect's mode already matches the glass.
+    /// Starting logical size; `None` = 1280×720, which a single stream without Match-window
+    /// then resizes to the stream. Match-window passes the persisted last size so the first
+    /// connect's mode already matches the glass.
     pub window_size: Option<(u32, u32)>,
     /// `Some` = stream mode follows the window: start params use physical pixels, a mid-session
     /// resize sends a debounced `Reconfigure`. The callback gets logical size at each resize-end
@@ -489,13 +490,14 @@ fn capture_mut(stream: &mut Option<StreamState>) -> Option<&mut Capture> {
 
 /// One event, waiting up to `timeout` for it.
 ///
-/// SDL's Windows wait floors what is left of a timeout to whole milliseconds, so a wait
-/// under 2 ms returns at once and a loop holding a frame for its due time spins a core.
-/// Those waits sleep here in half-millisecond slices: that is how long an arriving
-/// frame or a key can wait to be seen while one is held.
+/// SDL's wait rounds what is left of a timeout to whole milliseconds: on Windows a wait
+/// under 2 ms returns at once and a loop holding a frame for its due time spins a core,
+/// on Linux it oversleeps the hold by up to a millisecond. Those waits sleep here in
+/// half-millisecond slices: that is how long an arriving frame or a key can wait to be
+/// seen while one is held.
 fn wait_event(pump: &mut sdl3::EventPump, timeout: Duration) -> Option<Event> {
     const SLICE: Duration = Duration::from_micros(500);
-    if cfg!(windows) && !timeout.is_zero() && timeout < Duration::from_millis(2) {
+    if !timeout.is_zero() && timeout < Duration::from_millis(2) {
         std::thread::sleep(timeout.min(SLICE));
         return pump.poll_event();
     }
@@ -514,77 +516,81 @@ fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Outcome> {
                 force_software.clone(),
                 sh.presenter.vulkan_decode(),
             );
+            sh.size_to_stream(params.mode);
             Some(sh.start_stream(params, force_software))
         }
         ModeCtl::Browse(_) => None,
     };
 
-    let outcome = 'main: loop {
-        // Block in SDL's wait: input/window events and decoded frames (FrameWake) all
-        // land in this queue. The timeout only bounds stop-flag/pump-tick latency.
-        // Smoothness tightens it to the next latch-slot deadline.
-        let timeout = stream
-            .as_ref()
-            .map_or(Duration::from_millis(15), |st| st.wake_timeout());
-        let first = wait_event(&mut sh.event_pump, timeout);
-        let mut queued: Vec<Event> = Vec::new();
-        if let Some(e) = first {
-            queued.push(e);
-        }
-        while let Some(e) = sh.event_pump.poll_event() {
-            queued.push(e);
-        }
-        sh.scroll_routing.begin(
-            stream.as_ref().and_then(|s| s.capture.as_ref()),
-            sh.overlay.as_deref(),
-        );
-        for event in queued {
-            if let ControlFlow::Break(outcome) = sh.on_event(&mut stream, event)? {
+    // A closure, so an error exit (device lost, a failed resize) still reaches the teardown.
+    let outcome = (|| -> Result<Outcome> {
+        Ok('main: loop {
+            // Block in SDL's wait: input/window events and decoded frames (FrameWake) all
+            // land in this queue. The timeout only bounds stop-flag/pump-tick latency.
+            // Smoothness tightens it to the next latch-slot deadline.
+            let timeout = stream
+                .as_ref()
+                .map_or(Duration::from_millis(15), |st| st.wake_timeout());
+            let first = wait_event(&mut sh.event_pump, timeout);
+            let mut queued: Vec<Event> = Vec::new();
+            if let Some(e) = first {
+                queued.push(e);
+            }
+            while let Some(e) = sh.event_pump.poll_event() {
+                queued.push(e);
+            }
+            sh.scroll_routing.begin(
+                stream.as_ref().and_then(|s| s.capture.as_ref()),
+                sh.overlay.as_deref(),
+            );
+            for event in queued {
+                if let ControlFlow::Break(outcome) = sh.on_event(&mut stream, event)? {
+                    break 'main outcome;
+                }
+            }
+            // Native events forward only when capture owns the entire SDL batch.
+            sh.scroll_routing
+                .finish(capture_mut(&mut stream), sh.overlay.as_deref());
+            let want_mask_ui = sh.ui_wants_mask(&stream);
+            sh.pump.tick();
+            // One coalesced MouseMove per iteration — pure motion must reach the host
+            // without waiting for a click/key to flush it.
+            if let Some(cap) = capture_mut(&mut stream) {
+                cap.flush_motion();
+            }
+            if let Some(st) = stream.as_mut() {
+                sh.cursor_tick(st);
+            }
+            sh.text_input_tick();
+            sh.pad_owner_tick(&mut stream, want_mask_ui);
+            if let ModeCtl::Browse(on_action) = &mut mode {
+                if let ControlFlow::Break(outcome) = sh.browse_tick(&mut stream, on_action) {
+                    break 'main outcome;
+                }
+            }
+
+            if let ControlFlow::Break(outcome) = sh.drain_session_events(&mut stream) {
                 break 'main outcome;
             }
-        }
-        // Native events forward only when capture owns the entire SDL batch.
-        sh.scroll_routing
-            .finish(capture_mut(&mut stream), sh.overlay.as_deref());
-        let want_mask_ui = sh.ui_wants_mask(&stream);
-        sh.pump.tick();
-        // One coalesced MouseMove per iteration — pure motion must reach the host
-        // without waiting for a click/key to flush it.
-        if let Some(cap) = capture_mut(&mut stream) {
-            cap.flush_motion();
-        }
-        if let Some(st) = stream.as_mut() {
-            sh.cursor_tick(st);
-        }
-        sh.text_input_tick();
-        sh.pad_owner_tick(&mut stream, want_mask_ui);
-        if let ModeCtl::Browse(on_action) = &mut mode {
-            if let ControlFlow::Break(outcome) = sh.browse_tick(&mut stream, on_action) {
-                break 'main outcome;
+
+            if let Some(st) = stream.as_mut() {
+                sh.stream_tick(st);
             }
-        }
+            sh.ring_tick(&mut stream);
+            sh.overlay_tick(&mut stream)?;
 
-        if let ControlFlow::Break(outcome) = sh.drain_session_events(&mut stream) {
-            break 'main outcome;
-        }
+            let presented_video = match stream.as_mut() {
+                Some(st) => sh.video_tick(st)?,
+                None => false,
+            };
 
-        if let Some(st) = stream.as_mut() {
-            sh.stream_tick(st);
-        }
-        sh.ring_tick(&mut stream);
-        sh.overlay_tick(&mut stream)?;
+            sh.present_overlay_alone(&stream, presented_video)?;
+        })
+    })();
 
-        let presented_video = match stream.as_mut() {
-            Some(st) => sh.video_tick(st)?,
-            None => false,
-        };
-
-        sh.present_overlay_alone(&stream, presented_video)?;
-    };
-
-    // Every loop exit converges here, so gamepad teardown belongs here, not on the
-    // individual breaks. `detach` only queues; the close (flush, GamepadRemove, rumble
-    // stop) runs when the pump drains it. Breaking immediately after detach leaves
+    // Every loop exit, errors included, converges here, so gamepad teardown belongs here,
+    // not on the individual breaks. `detach` only queues; the close (flush, GamepadRemove,
+    // rumble stop) runs when the pump drains it. Breaking immediately after detach leaves
     // pads unflushed and, if rumbling, still buzzing.
     sh.pump.shutdown();
     // Join the pump before the device-wide idle: its decode submissions would race
@@ -596,7 +602,7 @@ fn run_inner(opts: SessionOpts, mut mode: ModeCtl) -> Result<Outcome> {
     // the overlay, then the presenter tears down.
     sh.presenter.wait_idle();
     drop(sh.overlay.take());
-    Ok(outcome)
+    outcome
 }
 
 /// An `SDL_DisplayMode` as the panel's real pixels — the `0 = native` stream mode.

@@ -87,6 +87,9 @@ struct CaptureOpts {
     /// planar 8-bit surface fails a 10-bit NVENC session; packed RGB is the only 8-bit input
     /// it accepts there.
     ten_bit_sdr: bool,
+    /// The producer offers 10-bit SDR (gamescope from `+pfhdr26`): its P010 and packed 10-bit
+    /// pods go out under BT.709 ahead of the 8-bit ones, which stay as the fallback.
+    sdr10_native: bool,
     /// Skip buffers until negotiated size matches `preferred` — KWin virtual
     /// outputs birth a sacrificial mode then renegotiate (`kwin.rs` `create`).
     /// `false` elsewhere: Mutter sizes from negotiation; gamescope fixates.
@@ -127,8 +130,8 @@ struct CaptureSignals {
     /// This stream drives the graph: the producer paints only in cycles the
     /// loop thread's pacer starts on its requests. Cleared with `streaming`.
     driving: Arc<AtomicBool>,
-    /// GPU import is gone for this stream (worker death, or tiled imports
-    /// failed — CPU fallback would de-pad scrambled tiles). Never cleared.
+    /// GPU import is gone for this stream (worker death, or a tiled or planar
+    /// frame the CPU de-pad cannot read). Never cleared.
     broken: Arc<AtomicBool>,
     /// The stream reached `Error` (e.g. "no more input formats"). Terminal: it never delivers.
     errored: Arc<AtomicBool>,
@@ -156,6 +159,9 @@ struct CaptureSignals {
     importer: Arc<std::sync::Mutex<Option<pf_zerocopy::Importer>>>,
     /// `importer` is `Some`. Read per frame on the loop thread without the lock.
     has_importer: Arc<AtomicBool>,
+    /// `importer` runs in this process, its GL context current on the loop thread only. Read per
+    /// frame without the lock, which the consumer holds across a whole worker import.
+    importer_in_process: Arc<AtomicBool>,
 }
 
 /// Producer identity plus the consumer policy whose failures must stay independent.
@@ -188,6 +194,7 @@ impl CaptureSignals {
             frame_size: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             importer: Arc::new(std::sync::Mutex::new(None)),
             has_importer: Arc::new(AtomicBool::new(false)),
+            importer_in_process: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -334,6 +341,7 @@ impl PortalCapturer {
                 want_444: false,
                 want_hdr,
                 ten_bit_sdr: false,
+                sdr10_native: false,
                 expect_exact_dims: false,
                 // Portal-monitor is Mutter's stale-meta id-0 contract. KWin
                 // portal capture would rewrite per buffer; nothing routes
@@ -367,6 +375,7 @@ impl PortalCapturer {
             want_444: opts.want_444,
             want_hdr: opts.want_hdr,
             ten_bit_sdr: opts.ten_bit_sdr,
+            sdr10_native: opts.sdr10_native,
             expect_exact_dims: opts.expect_exact_dims,
             cursor_id0_hides: kwin,
             producer_is_gamescope: opts.producer == super::Producer::Gamescope,
@@ -469,6 +478,7 @@ fn spawn_pipewire(
         allow_zerocopy,
         want_444,
         want_hdr,
+        sdr10_native,
         ..
     } = opts;
     // Wakeup edges only; depth 1 is right — a coalesced edge loses nothing
@@ -503,6 +513,8 @@ fn spawn_pipewire(
         zerocopy,
         force_shm,
         want_hdr,
+        // SHM is 8-bit, like HDR above.
+        sdr10_native: sdr10_native && !force_shm,
         want_444,
         backend_is_vaapi: policy.backend_is_vaapi,
         pyrowave_session: policy.pyrowave_session,
@@ -512,9 +524,12 @@ fn spawn_pipewire(
         gpu_dmabuf_negotiation_failed: signals.health.gpu_negotiation_disabled(),
         // Default ON; `=0` (any falsy spelling, shared parser) restores packed RGB.
         native_nv12_env_on: pf_host_config::env_on("PUNKTFUNK_PIPEWIRE_NV12").unwrap_or(true),
+        planar_refused: signals.health.planar_refused(),
         hdr_cuda_ok: policy.hdr_cuda_ok,
         nv12_env_on: pf_zerocopy::nv12_enabled(),
-        nvenc_raw: policy.nvenc_raw_dmabuf,
+        // A tiled refusal keeps NVENC on the CUDA import, as on the direct path: the raw lane
+        // would be offered the same tiled modifiers again.
+        nvenc_raw: policy.nvenc_raw_dmabuf && !signals.health.passthrough_tiled_refused(),
     });
     let vaapi_dmabuf = plan.vaapi_passthrough;
     let import_policy = plan.import_policy;
@@ -619,8 +634,8 @@ impl Capturer for PortalCapturer {
     fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
         if self.signals.broken.load(Ordering::Relaxed) {
             return Err(anyhow!(
-                "zero-copy GPU import lost (node {}): the import worker died or tiled imports \
-                 failed repeatedly — rebuilding capture",
+                "zero-copy GPU import lost (node {}): the import worker died, or a tiled or \
+                 planar offer failed — rebuilding capture",
                 self.node_id
             )
             .context(super::DisplayStillAlive));
@@ -766,8 +781,8 @@ impl PortalCapturer {
         loop {
             if self.signals.broken.load(Ordering::Relaxed) {
                 return Err(anyhow!(
-                    "zero-copy GPU import lost (node {}): the import worker died or tiled imports \
-                     failed repeatedly — rebuilding capture",
+                    "zero-copy GPU import lost (node {}): the import worker died, or a tiled or \
+                     planar offer failed — rebuilding capture",
                     self.node_id
                 ));
             }
@@ -1005,16 +1020,21 @@ pub struct WlCapturer {
     /// Holds the compositor output; dropped after the thread is joined, unless a
     /// capture-only rebuild took it back (`take_keepalive`).
     keepalive: Option<Box<dyn Send>>,
+    /// The output's mastering volume while the pool is 10-bit PQ. Fixed for the capture's
+    /// life: a re-lit output ends the thread and the rebuild reads it again.
+    hdr_meta: Option<pf_frame::HdrMeta>,
 }
 
 impl WlCapturer {
     /// Open the named compositor output with identity-scoped failure health.
     /// Missing protocol/output or no consumer-importable dmabuf keeps the portal path,
-    /// so a failure hands `keepalive` back for it.
+    /// so a failure hands `keepalive` back for it. `want_hdr` captures the output's
+    /// packed 10-bit buffer and fails unless the output is lit in BT.2020 PQ.
     pub fn open(
         output_name: String,
         keepalive: Box<dyn Send>,
         policy: ZeroCopyPolicy,
+        want_hdr: bool,
     ) -> std::result::Result<WlCapturer, (anyhow::Error, Box<dyn Send>)> {
         let slot: FrameSlot = Arc::new(std::sync::Mutex::new(None));
         use std::hash::{Hash, Hasher};
@@ -1023,7 +1043,7 @@ impl WlCapturer {
         let identity = health_identity(hash.finish() | (1 << 63), &policy);
         let signals = CaptureSignals::new(pf_zerocopy::zero_copy_health(identity));
         signals.active.store(true, Ordering::Relaxed);
-        let h = match wl_capture::spawn(output_name.clone(), policy, slot, signals) {
+        let h = match wl_capture::spawn(output_name.clone(), policy, want_hdr, slot, signals) {
             Ok(h) => h,
             Err(e) => return Err((e, keepalive)),
         };
@@ -1035,6 +1055,7 @@ impl WlCapturer {
             quit: h.quit,
             join: Some(h.join),
             keepalive: Some(keepalive),
+            hdr_meta: h.hdr_meta,
         })
     }
 
@@ -1116,6 +1137,10 @@ impl Capturer for WlCapturer {
     fn take_keepalive(&mut self) -> Option<Box<dyn Send>> {
         self.keepalive.take()
     }
+
+    fn hdr_meta(&self) -> Option<pf_frame::HdrMeta> {
+        self.hdr_meta
+    }
 }
 
 impl Drop for WlCapturer {
@@ -1154,6 +1179,7 @@ mod pipewire;
 mod gbm_pool;
 // Direct `ext-image-copy-capture-v1` capture, with no portal and no PipeWire.
 mod wl_capture;
+pub(crate) use wl_capture::output_is_hdr10;
 // Negotiation POD builders and cursor-meta parser + CPU blits. Pure enough
 // to unit-test without a compositor.
 mod pw_cursor;
@@ -1265,6 +1291,7 @@ mod wl_capturer_tests {
             quit: Arc::new(AtomicBool::new(false)),
             join: None,
             keepalive: None,
+            hdr_meta: None,
         };
         edge.try_send(()).expect("empty channel");
         assert!(

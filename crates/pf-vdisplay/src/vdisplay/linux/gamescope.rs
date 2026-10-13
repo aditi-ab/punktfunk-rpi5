@@ -42,9 +42,9 @@ mod wsi;
 // One namespace across the split: the submodules `use super::*` and see each other through here.
 pub(crate) use discovery::{
     display_presenting, foreign_gamescope_running, game_session_exited,
-    gamescope_can_composite_cursor, gamescope_hdr_capable, gamescope_offers_tiled_capture,
-    is_available, steam_appid_from_launch, wait_for_steam_game_exit, xwayland_cursor_targets,
-    SteamGameWatch,
+    gamescope_can_composite_cursor, gamescope_captures_sdr10, gamescope_hdr_capable,
+    gamescope_offers_tiled_capture, gamescope_planar_capture_in_vram, is_available,
+    steam_appid_from_launch, wait_for_steam_game_exit, xwayland_cursor_targets, SteamGameWatch,
 };
 pub(crate) use heads::list_monitors;
 pub(crate) use splash::run as splash_run;
@@ -118,11 +118,6 @@ static MANAGED_LAUNCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const SESSION_UNIT: &str = "punktfunk-gamescope";
 const SESSION_PLUS_BIN: &str = "/usr/share/gamescope-session-plus/gamescope-session-plus";
-
-/// `WAYLAND_DISPLAY` for a command run inside gamescope: empty names no socket, so it draws
-/// through gamescope's Xwayland. Unset means `wayland-0`, the desktop's socket on a desktop box:
-/// flatpak then withholds X11 from a `fallback-x11` app, and a Qt app that forces xcb aborts.
-const NESTED_WAYLAND_DISPLAY: &str = "";
 
 /// Game Mode's crash counters: a line per run that ends inside 60 s. [`SESSION_PLUS_BIN`]
 /// re-bootstraps Steam and switches to desktop at five; SteamOS's `steam-short-session-tracker`
@@ -366,16 +361,17 @@ impl VirtualDisplay for GamescopeDisplay {
                         .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
                 })
                 .flatten(),
+            started: Instant::now(),
         };
         // Give up early if the process is already gone: a `vkCreateDevice` failure exits in under
-        // a second, and waiting 15 s on its corpse would blame the GPU.
+        // a second, and waiting 15 s on its corpse would blame the GPU. Dropping `proc` logs the
+        // tail of gamescope's own log, which says which.
         let node_id =
             wait_for_node(Duration::from_secs(15), &log, &mut proc.child).ok_or_else(|| {
                 anyhow!(
                     "gamescope published no PipeWire node within 15s (or exited first) — it may \
                      have failed to start, or headless capture may be unsupported on this \
-                     GPU/driver; its own log says which (see {})",
-                    log.display()
+                     GPU/driver; the tail of its log just above says which"
                 )
             })?;
         tracing::info!(
@@ -584,7 +580,7 @@ fn managed_output(node_id: u32, mode: Mode) -> VirtualOutput {
 
 /// SteamOS launcher present and Bazzite session-plus not: PATH-shim the Deck session, don't spawn
 /// a separate unit.
-fn steamos_session_present() -> bool {
+pub(crate) fn steamos_session_present() -> bool {
     std::path::Path::new(STEAMOS_SESSION_BIN).exists()
         && !std::path::Path::new(SESSION_PLUS_BIN).exists()
 }

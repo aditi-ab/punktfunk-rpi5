@@ -12,6 +12,8 @@ use super::*;
 pub(super) struct AuMeta {
     pub(super) capture_ns: u64,
     pub(super) flags: u32,
+    /// [`super::state::StreamState::epoch`] when this AU was encoded.
+    pub(super) epoch: u8,
     /// Predicted at submit as `au_seq + inflight`; stamped on the wire so RFI stays 1:1 across rebuilds.
     pub(super) frame_index: u32,
     /// Next frame's due time. Past = send immediately (catch up).
@@ -68,9 +70,7 @@ fn handle_chunk(
     open: &mut Option<StreamedOpen>,
     c: ChunkMsg,
     slice_wire: bool,
-    burst_cap: Option<usize>,
-    pace_rate_bps: u64,
-    max_spread: std::time::Duration,
+    pacing: &mut crate::send_pacing::Pacing,
 ) -> Result<Option<(AuMeta, PaceStat)>> {
     let m = c.meta;
     if c.first {
@@ -98,13 +98,10 @@ fn handle_chunk(
                 .map_err(|e| anyhow!("begin_streamed_frame: {e:?}"))?,
             spread_us: 0,
             paced: false,
-            burst_left: if pace_rate_bps == 0 && burst_cap.is_none() {
+            burst_left: if pacing.pace_rate_bps == 0 && pacing.burst_cap.is_none() {
                 None
             } else {
-                Some(
-                    burst_cap
-                        .unwrap_or_else(|| crate::send_pacing::auto_burst_bytes(pace_rate_bps, 0)),
-                )
+                Some(pacing.burst_bytes(0))
             },
         });
     }
@@ -124,9 +121,8 @@ fn handle_chunk(
             session,
             wires,
             m.deadline,
-            s.burst_left.or(burst_cap),
-            pace_rate_bps,
-            max_spread,
+            s.burst_left.or(pacing.burst_cap),
+            pacing,
         )?;
         if let Some(left) = s.burst_left.as_mut() {
             *left = left.saturating_sub(flush_bytes);
@@ -145,9 +141,8 @@ fn handle_chunk(
         session,
         tail,
         m.deadline,
-        s.burst_left.or(burst_cap),
-        pace_rate_bps,
-        max_spread,
+        s.burst_left.or(pacing.burst_cap),
+        pacing,
     )?;
     Ok(Some((
         m,
@@ -275,6 +270,9 @@ pub(super) struct SendStats {
     /// A pinned stream (PyroWave) is paced against `link_kbps`: its rate says
     /// nothing about the link. An adaptive stream keeps the factor.
     pub(super) link_paced: bool,
+    /// The profile this session streams under (`DeliveryProfile as u8`): what the
+    /// client asked for. `PUNKTFUNK_DELIVERY` overrides it.
+    pub(super) delivery: Arc<std::sync::atomic::AtomicU8>,
     pub(super) bringup: Arc<crate::bringup::Trace>,
     /// Data-socket clone for the kernel-queue probe behind the `wire egress` line.
     pub(super) wire_sock: Option<std::net::UdpSocket>,
@@ -316,7 +314,7 @@ pub(crate) fn reconfig_allowed(
 pub(super) fn send_loop(
     mut session: Session,
     frame_rx: std::sync::mpsc::Receiver<SendMsg>,
-    probe_rx: std::sync::mpsc::Receiver<ProbeRequest>,
+    probe_rx: std::sync::mpsc::Receiver<ProbeShaped>,
     probe_result_tx: tokio::sync::mpsc::UnboundedSender<ProbeResult>,
     stop: Arc<AtomicBool>,
     perf: bool,
@@ -358,6 +356,8 @@ pub(super) fn send_loop(
     let mut streamed: Option<StreamedOpen> = None;
     let mut burst: Option<ProbeBurst> = None;
     let mut link_gso = false;
+    let forced = crate::send_pacing::forced_delivery();
+    let mut pacing = crate::send_pacing::Pacing::new(burst_cap);
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
@@ -418,6 +418,18 @@ pub(super) fn send_loop(
                 } else {
                     crate::send_pacing::MAX_PACE_SPREAD
                 };
+                let profile = forced.unwrap_or_else(|| {
+                    crate::send_pacing::DeliveryProfile::from_u8(
+                        stats.delivery.load(Ordering::Relaxed),
+                    )
+                });
+                pacing.update(pace_rate, max_spread, profile);
+                // A new epoch takes effect at the AU that carries it, never mid-AU.
+                match &send_msg {
+                    SendMsg::Frame(f) => session.set_epoch(f.meta.epoch),
+                    SendMsg::Chunk(c) if c.first => session.set_epoch(c.meta.epoch),
+                    SendMsg::Chunk(_) => {}
+                }
                 let outcome = match send_msg {
                     SendMsg::Frame(FrameMsg { data, meta: m }) => paced_submit(
                         &mut session,
@@ -432,20 +444,12 @@ pub(super) fn send_loop(
                             },
                         m.frame_index,
                         m.deadline,
-                        burst_cap,
-                        pace_rate,
-                        max_spread,
+                        &mut pacing,
                     )
                     .map(|stat| Some((m, stat))),
-                    SendMsg::Chunk(c) => handle_chunk(
-                        &mut session,
-                        &mut streamed,
-                        c,
-                        slice_wire,
-                        burst_cap,
-                        pace_rate,
-                        max_spread,
-                    ),
+                    SendMsg::Chunk(c) => {
+                        handle_chunk(&mut session, &mut streamed, c, slice_wire, &mut pacing)
+                    }
                 };
                 match outcome {
                     Ok(None) => {}
@@ -618,6 +622,7 @@ mod tests {
     fn a_send_window_files_each_au_under_its_own_stages() {
         let meta = AuMeta {
             capture_ns: 0,
+            epoch: 0,
             flags: 0,
             frame_index: 0,
             deadline: std::time::Instant::now(),

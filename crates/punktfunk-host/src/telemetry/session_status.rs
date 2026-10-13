@@ -54,6 +54,8 @@ struct LiveSession {
     client_name: Option<String>,
     /// Which plane serves it. Both register here, so a stop or a keyframe reaches either.
     plane: crate::events::Plane,
+    /// `1` or `2` on a punktfunk session; `0` on GameStream.
+    wire: u8,
     hdr: bool,
     /// Bring-up total (hello → first packet), ms. 0 until the first packet left.
     ttff_ms: Arc<AtomicU32>,
@@ -509,6 +511,8 @@ pub struct SessionSnapshot {
     pub preset_name: Option<String>,
     /// Which plane serves it.
     pub plane: crate::events::Plane,
+    /// `1` or `2` on a punktfunk session; `0` on GameStream.
+    pub wire: u8,
     /// The capturer's live health, if it classifies.
     pub capture_health: Option<pf_capture::CaptureHealth>,
     /// Bring-up total (hello → first packet), ms. 0 while still bringing up.
@@ -647,6 +651,8 @@ pub struct Registration {
     pub client_name: Option<String>,
     /// Which plane serves it.
     pub plane: crate::events::Plane,
+    /// `1` or `2` on a punktfunk session; `0` on GameStream.
+    pub wire: u8,
     pub hdr: bool,
     /// Bring-up total slot (hello → first packet), ms. 0 until first packet.
     pub ttff_ms: Arc<AtomicU32>,
@@ -685,6 +691,7 @@ pub fn register(reg: Registration) -> LiveSessionGuard {
         client,
         client_name,
         plane,
+        wire,
         hdr,
         ttff_ms,
         last_resize_ms,
@@ -723,6 +730,7 @@ pub fn register(reg: Registration) -> LiveSessionGuard {
         client,
         client_name,
         plane,
+        wire,
         hdr,
         ttff_ms,
         last_resize_ms,
@@ -1088,6 +1096,7 @@ pub fn snapshot() -> Vec<SessionSnapshot> {
                 client_name: s.client_name.clone(),
                 preset_name: s.controls.preset.as_ref().map(|p| p.name.clone()),
                 plane: s.plane,
+                wire: s.wire,
                 capture_health: s
                     .capture_health
                     .lock()
@@ -1105,6 +1114,7 @@ pub fn snapshot() -> Vec<SessionSnapshot> {
 }
 
 /// One launched game as `/status` reports it.
+#[derive(Clone)]
 pub struct GameSnapshot {
     /// Streaming session, or `None` if the session is gone and the game is in
     /// its reconnect window.
@@ -1229,7 +1239,50 @@ pub fn games() -> Vec<GameSnapshot> {
                 launched_by: Some(d.fingerprint),
             }),
     );
+    // A waiting launch's row stands in until its session lists the game itself.
+    for (_, w) in waiting()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+    {
+        if !out
+            .iter()
+            .any(|g| g.app_id == w.app_id && g.launched_by == w.launched_by)
+        {
+            out.push(w.clone());
+        }
+    }
     out
+}
+
+/// Launches waiting for their title's files: `launching` rows before their session has a
+/// lease, so a client polling `/status` sees the launch it asked for.
+fn waiting() -> &'static Mutex<Vec<(u64, GameSnapshot)>> {
+    static W: OnceLock<Mutex<Vec<(u64, GameSnapshot)>>> = OnceLock::new();
+    W.get_or_init(Default::default)
+}
+
+/// One waiting launch's row in [`games`]; dropping it takes the row away.
+pub struct WaitingRow(u64);
+
+impl Drop for WaitingRow {
+    fn drop(&mut self) {
+        waiting()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(token, _)| *token != self.0);
+    }
+}
+
+/// List `row` (state `launching`) in [`games`] while the guard lives.
+pub fn waiting_launch(row: GameSnapshot) -> WaitingRow {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let token = NEXT.fetch_add(1, Ordering::Relaxed);
+    waiting()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push((token, row));
+    WaitingRow(token)
 }
 
 /// Leases on games that are still on a streaming session, filtered by `app_id`
@@ -1408,6 +1461,7 @@ pub(crate) mod tests {
             quit: quit.clone(),
             client_name: Some("Living Room TV".into()),
             plane: crate::events::Plane::Gamestream,
+            wire: 0,
             hdr: true,
             bit_depth: 10,
             ..Registration::fake("9f86d0818840")
@@ -1443,6 +1497,7 @@ pub(crate) mod tests {
                 client: client.into(),
                 client_name: None,
                 plane: crate::events::Plane::Native,
+                wire: 1,
                 hdr: false,
                 ttff_ms: Arc::new(AtomicU32::new(0)),
                 last_resize_ms: Arc::new(AtomicU32::new(0)),

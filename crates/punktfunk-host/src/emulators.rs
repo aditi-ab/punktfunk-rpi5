@@ -74,6 +74,15 @@ pub fn install_core(core: &str) -> hermir::Result<PathBuf> {
     open()?.install_core(core, &Quiet)
 }
 
+/// Whether RetroArch's cores folder `dir` already holds `core`, under the name hermir gives it.
+pub fn has_core(dir: &Path, core: &str) -> bool {
+    dir.join(format!(
+        "{core}_libretro.{}",
+        std::env::consts::DLL_EXTENSION
+    ))
+    .is_file()
+}
+
 /// The pads this host made for its players, in the order they appeared: seat 1 is the first.
 /// Linux reads them off `/proc/bus/input/devices` — a virtual device with a vendor the host's
 /// pad backends present is one of ours. With none up yet (the client's pad frames arrive
@@ -147,6 +156,8 @@ fn virtual_pads(text: &str) -> Vec<hermir::PadRef> {
                 index: 0,
                 evdev: (event != u32::MAX)
                     .then(|| PathBuf::from(format!("/dev/input/event{event}"))),
+                guid: None,
+                gamepad_name: None,
             },
         ));
     }
@@ -161,14 +172,22 @@ fn virtual_pads(text: &str) -> Vec<hermir::PadRef> {
 }
 
 /// Puts every emulator's own bindings back after a game: what `prepare` wrote for the
-/// session's pads is gone again, file by file. Nothing outstanding is a quiet no-op.
+/// session's pads is gone again, file by file. Forced: an emulator rewrites its config on
+/// exit, and that is no edit of the player's. Nothing outstanding is a quiet no-op.
 pub fn revert_players() {
     let Ok(h) = open() else { return };
     revert_with(&h);
 }
 
 fn revert_with(h: &Hermir) {
-    for (id, steps) in h.revert_all_players() {
+    let reverted = match h.revert_all(true) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "player bindings not reverted");
+            return;
+        }
+    };
+    for (id, steps) in reverted {
         for s in steps {
             tracing::info!(emulator = %id, target = %s.target.display(), outcome = ?s.outcome, note = s.note.as_deref().unwrap_or(""), "player bindings reverted");
         }
@@ -211,18 +230,19 @@ pub fn prepare(
             .map(|e| e.path())
             .collect(),
     };
-    let players = session_players();
-    Ok(emulator
+    let players = hermir::Patch {
+        players: Some(session_players()),
+        ..Default::default()
+    };
+    emulator
         .copies()?
         .iter()
         .map(|copy| {
-            let mut prepared = emulator.prepare(copy, platform, &firmware);
-            prepared
-                .steps
-                .extend(emulator.apply_players(copy, &players).steps);
-            (copy.exe.to_string(), prepared)
+            let mut prepared = emulator.prepare(copy, platform, &firmware)?;
+            prepared.steps.extend(emulator.apply(copy, &players)?.steps);
+            Ok((copy.exe.to_string(), prepared))
         })
-        .collect())
+        .collect()
 }
 
 /// A core name as the buildbot spells it: `snes9x`, `mupen64plus_next`.
@@ -265,5 +285,16 @@ I: Bus=0011 Vendor=0001 Product=0001 Version=ab41\nN: Name=\"AT Translated Set 2
         );
         assert_eq!(pads[0].sdl_guid(true), "030081b85e0400008e02000010010000");
         assert!(virtual_pads("").is_empty());
+    }
+
+    #[test]
+    fn a_core_counts_as_present_only_under_the_name_retroarch_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext = std::env::consts::DLL_EXTENSION;
+        std::fs::write(dir.path().join(format!("snes9x_libretro.{ext}")), b"").unwrap();
+        std::fs::write(dir.path().join("mgba_libretro.zip"), b"").unwrap();
+        assert!(has_core(dir.path(), "snes9x"));
+        assert!(!has_core(dir.path(), "mgba"));
+        assert!(!has_core(dir.path(), "ppsspp"));
     }
 }

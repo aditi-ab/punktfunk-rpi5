@@ -141,7 +141,13 @@ impl IddPushCapturer {
                 etw,
                 etw_counts,
                 // Gap accumulator only; this call's pending (ending-frame move) is still unfolded.
-                cursor_moved_px: self.cursor.moved_px(),
+                // Under a declared hardware cursor pointer travel composes nothing, so it is no
+                // witness: the hole reads as damage-idle, as `health` reads it.
+                cursor_moved_px: if self.cursor_shared.is_some() || self.composite_cursor {
+                    Some(0)
+                } else {
+                    self.cursor.moved_px()
+                },
             };
             self.stall_watch.report(&stall, now, &evidence);
         }
@@ -159,6 +165,14 @@ impl IddPushCapturer {
                 "IDD-push capture recovered from a degraded stretch — fresh frames arrived \
                  only between stall-sized holes for its whole span; the per-stall lines \
                  above cover at most its first hole"
+            );
+        }
+        // The opt-in present-flow line rides fresh frames, so a still desktop prints none.
+        if let Some(flow) = self.etw.as_ref().and_then(|w| w.flow_line(now)) {
+            tracing::info!(
+                window_ms = super::dxgkrnl_etw::FLOW_EVERY.as_millis() as u64,
+                etw = %flow,
+                "IDD push: present flow"
             );
         }
         // A recovery episode closes only on the budgeted count of NEW source frames.
@@ -291,6 +305,10 @@ impl Capturer for IddPushCapturer {
         self.display_hdr.then(pf_frame::hdr::generic_hdr10)
     }
 
+    fn composes_sdr_fp16(&self) -> bool {
+        self.display_wcg && !self.display_hdr
+    }
+
     fn capture_target_id(&self) -> Option<u32> {
         Some(self.target_id)
     }
@@ -313,7 +331,7 @@ impl Capturer for IddPushCapturer {
         // A mode outside the driver's frozen advertised list re-arrives the monitor, and a fresh
         // monitor composes SDR whatever the session negotiated. Re-assert before the encoder
         // re-opens, or it opens for FP16 against a BGRA surface the pool can only refuse.
-        self.display_hdr = self.pin_negotiated_depth();
+        self.pin_negotiated_depth();
         self.redeliver_cursor_channel();
         true
     }

@@ -1,8 +1,8 @@
 //! Per-user system-tray companion for the punktfunk host.
 //!
 //! Icon and menu: running / stopped / degraded / failed, plus open-console,
-//! start/stop/restart (UAC per action on Windows, `systemctl --user` on Linux),
-//! pairing, and exit.
+//! start/stop/restart (UAC per action on Windows; on Linux `systemctl --user` per
+//! unit for the host, web console and plugin runner), pairing, and exit.
 //!
 //! Process state is SCM / the systemd user unit first; a listener on the mgmt
 //! port cannot make a stopped service look running. Streaming detail is
@@ -31,6 +31,9 @@ pub struct Args {
     pub quit: bool,
     /// Autostart: exit silently when this user is not a host (Linux installs it for every user).
     pub autostart: bool,
+    /// Start-menu launcher: start a stopped host once — behind one UAC prompt on
+    /// Windows, with its web console and plugin runner on Linux.
+    pub start_host: bool,
     /// Loopback by default; the summary route rejects anything else.
     pub mgmt_addr: String,
     /// `None` re-reads the published endpoint every poll.
@@ -43,6 +46,7 @@ impl Default for Args {
         Args {
             quit: false,
             autostart: false,
+            start_host: false,
             mgmt_addr: "127.0.0.1".into(),
             mgmt_port: None,
             web_port: 47992,
@@ -61,6 +65,7 @@ fn parse_args() -> anyhow::Result<Args> {
         match a.as_str() {
             "--quit" => args.quit = true,
             "--autostart" => args.autostart = true,
+            "--start-host" => args.start_host = true,
             "--mgmt-addr" => args.mgmt_addr = value("--mgmt-addr")?,
             "--mgmt-port" => args.mgmt_port = Some(value("--mgmt-port")?.parse()?),
             "--web-port" => args.web_port = value("--web-port")?.parse()?,
@@ -70,7 +75,7 @@ fn parse_args() -> anyhow::Result<Args> {
             }
             other => anyhow::bail!(
                 "unknown argument '{other}'\n\nUSAGE:\n    punktfunk-tray [--autostart] [--quit] \
-                 [--mgmt-addr <IP>] [--mgmt-port <N>] [--web-port <N>]"
+                 [--start-host] [--mgmt-addr <IP>] [--mgmt-port <N>] [--web-port <N>]"
             ),
         }
     }

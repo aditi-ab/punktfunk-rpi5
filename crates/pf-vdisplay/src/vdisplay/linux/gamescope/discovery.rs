@@ -537,6 +537,18 @@ pub(crate) fn gamescope_offers_tiled_capture() -> bool {
     gamescope_patch_level() >= 21 && !flags_lost()
 }
 
+/// A planar (NV12/P010) capture composites through device memory. Below this its RGB
+/// intermediate sits in system RAM, and on a discrete GPU every frame crosses PCIe twice.
+pub(crate) fn gamescope_planar_capture_in_vram() -> bool {
+    gamescope_patch_level() >= 25 && !flags_lost()
+}
+
+/// The 10-bit capture formats are offered under BT.709 as well as PQ. Below this every 10-bit
+/// negotiation is HDR, so a 10-bit SDR session captures 8-bit and the encoder widens it.
+pub(crate) fn gamescope_captures_sdr10() -> bool {
+    gamescope_patch_level() >= 26 && !flags_lost()
+}
+
 /// `GAMESCOPE_SET_OUTPUT_MODE`. Below this a spawn serves the one mode it was started at, and
 /// a client asking for another retires it.
 pub(crate) fn gamescope_can_resize_output() -> bool {

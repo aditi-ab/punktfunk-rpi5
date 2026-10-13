@@ -82,6 +82,12 @@ extension ConsoleModel {
                 addr: a["addr"] as? String ?? "", mgmt: port(a["mgmt"]),
                 fp: a["fp_hex"] as? String ?? "", appID: a["app_id"] as? String ?? "",
                 title: a["title"] as? String ?? "")
+        case "Install":
+            guard let action = InstallAction(rawValue: a["action"] as? String ?? "") else { return }
+            changeInstall(
+                addr: a["addr"] as? String ?? "", mgmt: port(a["mgmt"]),
+                fp: a["fp_hex"] as? String ?? "", appID: a["app_id"] as? String ?? "",
+                title: a["title"] as? String ?? "", action: action)
         case "HostAction":
             hostAction(
                 fp: a["fp_hex"] as? String ?? "", id: a["action_id"] as? String ?? "",
@@ -140,35 +146,41 @@ extension ConsoleModel {
         Task.detached(priority: .userInitiated) { [weak self] in
             let conn: PunktfunkConnection
             do {
+                // A diagnostic session: probes only, the host's facts asked for.
                 conn = try PunktfunkConnection(
                     host: addr, port: port, width: 1280, height: 720, refreshHz: 60,
-                    pinSHA256: pin, identity: identity)
+                    pinSHA256: pin, identity: identity,
+                    deliveryFlags: PunktfunkConnection.deliveryFacts
+                        | PunktfunkConnection.deliveryProbeOnly)
             } catch {
                 await self?.pushSpeed(key, ["Failed": "Couldn't reach \(addr) — it may be asleep."])
                 return
             }
             defer { conn.close() }
-            conn.startSpeedTest(targetKbps: 3_000_000, durationMs: 5_000)
             await self?.pushSpeed(key, "Measuring")
-            // The host clamps the burst to five seconds; its report lands just after.
-            let deadline = Date().addingTimeInterval(13)
-            while Date() < deadline {
-                try? await Task.sleep(nanoseconds: 200_000_000)
-                guard let r = conn.probeResult() else { break }
-                guard r.done else {
-                    // The live figure, for the console's graph.
-                    await self?.pushSpeed(key, ["Progress": ["kbps": r.throughputKbps]])
-                    continue
-                }
-                let done: [String: Any] = [
-                    "throughput_kbps": r.throughputKbps, "loss_pct": r.lossPct,
-                    "recommended_kbps": r.throughputKbps / 10 * 7,
-                ]
-                await self?.pushSpeed(key, ["Done": done])
+            // The whole check, reported once: the ceiling, the clean round and the findings.
+            guard let r = conn.networkCheck() else {
+                await self?.pushSpeed(
+                    key, ["Failed": "The measurement never finished — the connection may have dropped."])
                 return
             }
-            await self?.pushSpeed(
-                key, ["Failed": "The measurement never finished — the connection may have dropped."])
+            var done: [String: Any] = [
+                "throughput_kbps": r.ceilingKbps, "wall": r.wall,
+                "loss_pct": r.clean?.lossPct ?? 0,
+                "recommended_kbps": r.ceilingKbps / 10 * 7,
+                "findings": r.findings.map { f -> [String: Any] in
+                    [
+                        "id": f.id, "severity": f.severity, "numbers": f.numbers,
+                        "profile": f.profile == 0 ? NSNull() : f.profile,
+                    ]
+                },
+            ]
+            if let c = r.clean {
+                done["clean"] = ["rate_kbps": c.rateKbps, "loss_pct": c.lossPct, "jitter_us": c.jitterUs]
+            } else {
+                done["clean"] = NSNull()
+            }
+            await self?.pushSpeed(key, ["Done": done])
         }
     }
 
@@ -204,6 +216,8 @@ extension ConsoleModel {
     /// runs, then what the host answers. `refreshOnly` asks about running titles alone.
     func fetchLibrary(addr: String, mgmt: UInt16, fp: String, refreshOnly: Bool) {
         guard let host = host(fp: fp, addr: addr, port: 0) else { return }
+        if !refreshOnly { fetchSerial += 1 }
+        let serial = fetchSerial
         // The demo host serves no management API; its shelf is built in. The shot harness has
         // no host to ask, so every host shows that shelf there.
         #if DEBUG
@@ -241,9 +255,13 @@ extension ConsoleModel {
             if let cached {
                 bridge.push(.libraryCached, ConsoleJSON.libraryGames(cached.games))
             }
-            let running = await LibraryClient.running(
+            let status = await LibraryClient.status(
                 address: addr, port: mgmt, certPEM: identity.certPEM, keyPEM: identity.keyPEM,
                 hostFingerprint: host.pinnedSHA256)
+            let running = status.games
+            // A newer fetch owns the shelf by the time a slow host answers: not its titles.
+            guard serial == self.fetchSerial else { return }
+            bridge.push(.libraryDownloads, ConsoleJSON.downloads(status.downloads, grants: status.grants))
             bridge.push(.libraryRunning, ConsoleJSON.runningGames(running))
             if refreshOnly { return }
             do {
@@ -395,6 +413,23 @@ extension ConsoleModel {
                 certPEM: identity.certPEM, keyPEM: identity.keyPEM, hostFingerprint: pin)
             self?.notice(outcome.notice(title: title))
             self?.fetchLibrary(addr: addr, mgmt: mgmt, fp: fp, refreshOnly: true)
+        }
+    }
+
+    /// Start, resume, pause or remove a title's download, say how it went, then re-read the host:
+    /// the whole catalog after a removal (the tile turns to "not installed"), else `/status`.
+    private func changeInstall(
+        addr: String, mgmt: UInt16, fp: String, appID: String, title: String, action: InstallAction
+    ) {
+        guard let host = host(fp: fp, addr: addr, port: 0), let pin = host.pinnedSHA256,
+              let identity = (try? ClientIdentityStore.shared.load())?.identity else { return }
+        Task { [weak self] in
+            let outcome = await LibraryClient.changeInstall(
+                appID: appID, action: action, address: addr, port: mgmt,
+                certPEM: identity.certPEM, keyPEM: identity.keyPEM, hostFingerprint: pin)
+            self?.notice(outcome.notice(action, title: title))
+            let removed = outcome == .done && action == .remove
+            self?.fetchLibrary(addr: addr, mgmt: mgmt, fp: fp, refreshOnly: !removed)
         }
     }
 

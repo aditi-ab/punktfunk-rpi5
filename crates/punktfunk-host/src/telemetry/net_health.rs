@@ -107,12 +107,30 @@ impl WireProbe {
     }
 }
 
+/// What this host knows about its own end of the path, for a client that asked
+/// ([`punktfunk_core::quic::HostFacts`]): the data socket's interface kind and link speed
+/// ([`punktfunk_core::transport::ifinfo`]), its granted send buffer, and the pinned profile.
+pub fn host_facts(sock: Option<&UdpSocket>) -> punktfunk_core::quic::HostFacts {
+    use punktfunk_core::quic::FORCED_PROFILE_NONE;
+    let link = sock
+        .and_then(|s| s.local_addr().ok())
+        .map_or(Default::default(), |a| {
+            punktfunk_core::transport::ifinfo::link_facts(a.ip())
+        });
+    let sndbuf_kb = sock
+        .and_then(|s| socket2::SockRef::from(s).send_buffer_size().ok())
+        .map_or(0, |b| (b / 1024) as u32);
+    punktfunk_core::quic::HostFacts {
+        iface_kind: link.kind,
+        link_mbps: link.mbps,
+        sndbuf_kb,
+        forced_profile: crate::send_pacing::forced_delivery()
+            .map_or(FORCED_PROFILE_NONE, |p| p as u8),
+    }
+}
+
 fn iface_for(ip: IpAddr) -> Option<String> {
-    if_addrs::get_if_addrs()
-        .ok()?
-        .into_iter()
-        .find(|i| i.ip() == ip)
-        .map(|i| i.name)
+    punktfunk_core::transport::ifinfo::iface_for(ip)
 }
 
 #[cfg(target_os = "linux")]
@@ -270,10 +288,19 @@ fn route_watch() {
         // SAFETY: `buf` is writable for `buf.len()` bytes and outlives the call.
         let n = unsafe { libc::recv(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
         if n < 0 {
-            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
+            let e = std::io::Error::last_os_error();
+            match e.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                // A burst overran the socket buffer: those events are gone, the socket is not.
+                Some(libc::ENOBUFS) => {
+                    suppressed += 1;
+                    continue;
+                }
+                _ => {
+                    tracing::debug!(error = %e, "netlink route watch ended — no network-change log");
+                    break;
+                }
             }
-            break;
         }
         if minute.elapsed() >= Duration::from_secs(60) {
             if suppressed > 0 || repeats > 0 {

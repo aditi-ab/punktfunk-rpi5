@@ -16,8 +16,9 @@
 #![allow(clippy::too_many_arguments)]
 
 use super::vk_util::{
-    color_range, find_mem_preferring, import_failure_feeds_latch, make_host_buffer,
-    make_plain_image, make_view, normalize_cpu_rgb, pixel_to_vk, reject_dmabuf,
+    color_range, find_mem_preferring, import_failure_feeds_latch, imported_acquire_barrier,
+    imported_release_barrier, make_host_buffer, make_plain_image, make_view, normalize_cpu_rgb,
+    pixel_to_vk, reject_dmabuf,
 };
 use crate::rfi::Wave;
 use crate::{Codec, EncodedFrame, Encoder, EncoderCaps};
@@ -68,56 +69,6 @@ const fn native_planar_format_matches(format: PixelFormat, ten_bit: bool) -> boo
     )
 }
 
-/// Ownership/visibility acquire for an EXCLUSIVE-sharing imported image: `foreign_qfi` →
-/// `dst_qfi`, discarding (`fresh`, UNDEFINED) or keeping (GENERAL) prior contents.
-fn imported_acquire_barrier(
-    image: vk::Image,
-    fresh: bool,
-    foreign_qfi: u32,
-    dst_qfi: u32,
-    dst_stage: vk::PipelineStageFlags2,
-    dst_access: vk::AccessFlags2,
-    new_layout: vk::ImageLayout,
-) -> vk::ImageMemoryBarrier2<'static> {
-    vk::ImageMemoryBarrier2::default()
-        .src_stage_mask(vk::PipelineStageFlags2::NONE)
-        .src_access_mask(vk::AccessFlags2::NONE)
-        .dst_stage_mask(dst_stage)
-        .dst_access_mask(dst_access)
-        .old_layout(if fresh {
-            vk::ImageLayout::UNDEFINED
-        } else {
-            vk::ImageLayout::GENERAL
-        })
-        .new_layout(new_layout)
-        .src_queue_family_index(foreign_qfi)
-        .dst_queue_family_index(dst_qfi)
-        .image(image)
-        .subresource_range(color_range(0))
-}
-
-/// Ownership release back to the foreign producer family after the last read of an imported
-/// image, landing in GENERAL (the layout every later cached acquire expects).
-fn imported_release_barrier(
-    image: vk::Image,
-    old_layout: vk::ImageLayout,
-    src_qfi: u32,
-    foreign_qfi: u32,
-    src_stage: vk::PipelineStageFlags2,
-    src_access: vk::AccessFlags2,
-) -> vk::ImageMemoryBarrier2<'static> {
-    vk::ImageMemoryBarrier2::default()
-        .src_stage_mask(src_stage)
-        .src_access_mask(src_access)
-        .dst_stage_mask(vk::PipelineStageFlags2::NONE)
-        .dst_access_mask(vk::AccessFlags2::NONE)
-        .old_layout(old_layout)
-        .new_layout(vk::ImageLayout::GENERAL)
-        .src_queue_family_index(src_qfi)
-        .dst_queue_family_index(foreign_qfi)
-        .image(image)
-        .subresource_range(color_range(0))
-}
 // RGB→NV12 BT.709 CSC. Source `rgb2yuv.comp`; regenerate with
 // `glslangValidator -V rgb2yuv.comp -o rgb2yuv.spv`.
 const CSC_SPV: &[u8] = include_bytes!("rgb2yuv.spv");
@@ -336,7 +287,8 @@ impl ProfileStack {
 }
 
 /// First physical device with a `VIDEO_ENCODE` queue family advertising `codec_op` (llvmpipe
-/// advertises none). Shared by [`VulkanVideoEncoder::open_inner`] and [`probe_encode_caps`].
+/// advertises none) whose driver [`super::vk_util::encode_trusted`] accepts. Shared by
+/// [`VulkanVideoEncoder::open_inner`] and [`probe_encode_caps`].
 ///
 /// # Safety
 /// `instance` must be a live `ash::Instance` and `devices` handles enumerated from it.
@@ -346,6 +298,9 @@ unsafe fn find_encode_device(
     codec_op: vk::VideoCodecOperationFlagsKHR,
 ) -> Option<(vk::PhysicalDevice, u32)> {
     for &pd in devices {
+        if !super::vk_util::encode_trusted(&instance.get_physical_device_properties(pd)) {
+            continue;
+        }
         let qf_len = instance.get_physical_device_queue_family_properties2_len(pd);
         let mut video = vec![vk::QueueFamilyVideoPropertiesKHR::default(); qf_len];
         let mut qf = vec![vk::QueueFamilyProperties2::default(); qf_len];
@@ -929,16 +884,18 @@ impl VulkanVideoEncoder {
         fps: u32,
         bitrate_bps: u64,
         cursor_blend: bool,
-        // Negotiated depth. A 10-bit SDR session captures an 8-bit surface, so `format` is not
-        // 10-bit and the depth must come from here; HDR is 10-bit by its packed/P010 format.
+        // Negotiated depth. A 10-bit SDR session may capture an 8-bit surface, so `format` is
+        // not 10-bit and the depth must come from here.
         bit_depth: u8,
+        // The session's colour: BT.2020 PQ, else BT.709. Not read off `format`: gamescope's
+        // P010 and packed 10-bit are SDR too.
+        hdr: bool,
     ) -> Result<Self> {
         // A producer's own planar picture: NV12 at eight bits, P010 at ten.
         let native_nv12 = matches!(format, PixelFormat::Nv12 | PixelFormat::P010);
-        // Colour: HDR is BT.2020 PQ, keyed on the packed-10/P010 capture format. Dispatcher already
-        // consulted `probe_encode_caps`; the profile query inside open re-checks.
-        let is_hdr = format.is_hdr();
-        // Depth: HDR, or a 10-bit SDR session on an 8-bit capture (`bit_depth == 10`, BT.709).
+        // Dispatcher already consulted `probe_encode_caps`; the profile query inside open re-checks.
+        let is_hdr = hdr;
+        // Depth: HDR, or a 10-bit SDR session (BT.709) on an 8-bit or a 10-bit capture.
         let ten_bit = is_hdr || bit_depth >= 10;
         // Native planar is NV12 at eight bits or P010 at ten — a crossed pair (e.g. P010 bytes
         // on an 8-bit session) describes no source this encoder can program.
@@ -2095,11 +2052,10 @@ impl VulkanVideoEncoder {
     /// `(st_dev, st_ino)` because each `DmabufFrame` owns a fresh dup (new fd, same inode).
     /// `fresh` is true only on first import (UNDEFINED old-layout preserves modifier-tiled data).
     ///
-    /// The cache is as deep as the ring and no deeper: one import per frame that can be in
-    /// flight, a repeat's among them. RADV lists every resident import in every submission,
-    /// and amdgpu then orders that submission behind whatever paints any of them: an import
-    /// of a buffer the producer is rendering into makes each encode wait on that render, and
-    /// the render on the encode.
+    /// A miss keeps only the imports that frames in flight read; a repeat hits the newest. Every
+    /// other buffer is back with the producer. RADV lists every resident import in every
+    /// submission, and amdgpu orders that submission against whatever paints any of them: the
+    /// producer's next render into a released buffer waits on this encode, or this encode on it.
     unsafe fn import_cached(
         &mut self,
         d: &pf_frame::DmabufFrame,
@@ -2125,6 +2081,7 @@ impl VulkanVideoEncoder {
             self.device.destroy_image(e.img, None);
             self.device.free_memory(e.mem, None);
         }
+        let t0 = std::time::Instant::now();
         // A deterministic packed import refusal rebuilds this capture on its safe offer.
         // Transient OOM and native NV12 stay out of that sticky verdict.
         let (img, mem, view) = match self.import_dmabuf(d, cw, ch) {
@@ -2141,10 +2098,10 @@ impl VulkanVideoEncoder {
                 return Err(e);
             }
         };
-        // Least recently used first. Every frame in flight read its import after the victim
-        // was last used, so none reads the victim; destroying one that is read is a GPU-side
-        // use-after-free, so a victim found in flight idles the device first.
-        while self.import_cache.len() >= self.frames.len().max(1) {
+        // Least recently used first. The frames in flight are the last ones submitted, so their
+        // imports are the newest entries and none is evicted. Destroying an image the GPU reads
+        // is a use-after-free, so a victim found in flight still idles the device first.
+        while self.import_cache.len() > self.in_flight.len() {
             let e = self.import_cache.remove(0);
             let read = |&s: &usize| self.frames[s].src_key == Some(e.key);
             if self.in_flight.iter().any(read) {
@@ -2163,6 +2120,7 @@ impl VulkanVideoEncoder {
         });
         tracing::debug!(
             resident = self.import_cache.len(),
+            miss_us = t0.elapsed().as_micros() as u64,
             "vulkan-encode: imported a new dmabuf buffer"
         );
         Ok((img, view, true))
@@ -5171,9 +5129,18 @@ mod tests {
     #[ignore = "needs VK_VALVE_video_encode_rgb_conversion (RADV >= Mesa 26.0 on EFC hardware)"]
     fn vulkan_encode_cursor_switch_follows_the_cursor() {
         let (w, h) = (256, 256);
-        let mut enc =
-            VulkanVideoEncoder::open(Codec::Av1, PixelFormat::Bgrx, w, h, 60, 10_000_000, true, 8)
-                .expect("open");
+        let mut enc = VulkanVideoEncoder::open(
+            Codec::Av1,
+            PixelFormat::Bgrx,
+            w,
+            h,
+            60,
+            10_000_000,
+            true,
+            8,
+            false,
+        )
+        .expect("open");
         assert!(
             enc.rgb.is_none() && enc.cursor_switch,
             "a blend session opens on the CSC"

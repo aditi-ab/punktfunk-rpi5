@@ -19,6 +19,7 @@
 //! certificate back to the host fingerprint it pinned.
 
 mod datagrams;
+pub(crate) mod mgmt;
 mod session;
 
 pub(crate) use datagrams::WebTransportPlane;
@@ -54,8 +55,8 @@ pub struct Published {
     pub cert_hash: String,
     /// Unix seconds. A client past this must re-fetch before dialling.
     pub expires_at: u64,
-    /// Proof that this plane belongs to the host a browser paired with. Absent on the legacy
-    /// RSA identity ([`crate::identity`]), which the browser verifier does not implement.
+    /// Proof that this plane belongs to the host a browser paired with. Absent when the native
+    /// identity ([`crate::identity`]) is not P-256, which the browser verifier does not implement.
     pub attestation: Option<CertAttestation>,
 }
 
@@ -81,8 +82,8 @@ const CERT_SIG_CONTEXT: &str = "punktfunk-wt-cert-v1:";
 
 /// Sign `cert_hash` with the native identity, and hand back the certificate that verifies it.
 ///
-/// `None` rather than an error on the legacy RSA identity: a host still serving that pair has no
-/// browser pairings to break, and failing start-up over it would be worse than not attesting.
+/// `None` rather than an error when the identity is not P-256: failing start-up over it would be
+/// worse than not attesting.
 fn attest(ident: &crate::identity::NativeIdentity, cert_hash: &str) -> Option<CertAttestation> {
     use base64::Engine as _;
     let key = rcgen::KeyPair::from_pem(&ident.key_pem).ok()?;
@@ -199,9 +200,9 @@ fn mint(
 
 /// Run the plane until the process ends, re-minting the identity as it ages out.
 ///
-/// A rotation rebuilds the endpoint, which drops whatever is connected. Once every twelve days,
-/// and a browser reconnects on its own — cheaper than teaching quinn to swap a certificate under
-/// live sessions, and the reconnect path has to work anyway.
+/// A rotation swaps the certificate on the bound endpoint: live sessions keep the one they
+/// authenticated against, new ones get the new one. A rebind would fail while any session
+/// still holds the socket.
 ///
 /// `sem` is the native plane's session pool. A browser takes a slot from it like any client, so
 /// `max_concurrent` means what it says whichever carrier the sessions arrive on.
@@ -211,6 +212,7 @@ pub(crate) async fn serve(
     sem: Arc<tokio::sync::Semaphore>,
 ) -> Result<()> {
     let port = plane.bind.port();
+    let mut bound = None;
     loop {
         let (identity, publish) = mint(port, &plane.sans, &plane.identity)?;
         // Sessions bind to this exact certificate, so a rotation cannot leave one authenticating
@@ -229,7 +231,16 @@ pub(crate) async fn serve(
         .build();
         // Bind first, publish second. The other order leaves the route advertising a hash for a
         // plane that never came up, which reads as the API lying.
-        let endpoint = match Endpoint::server(config).context("bind the WebTransport endpoint") {
+        let endpoint = match &bound {
+            None => Endpoint::server(config)
+                .context("bind the WebTransport endpoint")
+                .map(|e| &*bound.insert(e)),
+            Some(endpoint) => endpoint
+                .reload_config(config, false)
+                .context("swap the WebTransport certificate")
+                .map(|()| endpoint),
+        };
+        let endpoint = match endpoint {
             Ok(endpoint) => endpoint,
             Err(e) => {
                 withdraw();
@@ -258,7 +269,7 @@ pub(crate) async fn serve(
 }
 
 async fn accept_loop(
-    endpoint: Endpoint<wtransport::endpoint::endpoint_side::Server>,
+    endpoint: &Endpoint<wtransport::endpoint::endpoint_side::Server>,
     serving: Arc<Serving>,
     sem: Arc<tokio::sync::Semaphore>,
 ) {
@@ -280,8 +291,16 @@ async fn accept_loop(
 /// open can reach the plane — the browser will not stop it. An empty allowlist means "anything",
 /// which is what a host with no configured origins has to mean until the console can offer the
 /// choice; the log line below is what tells an operator which value to set.
+///
+/// A session with no `Origin` passes whatever the list says. A browser stamps the header on
+/// every page's dial and no page can strip it, so the list still stops every hostile page; what
+/// omits it is not a page — a packaged TV app, a native tool — and a client like that could
+/// send any origin it chose, so refusing it keeps out nobody. Pairing is what admits a device.
 fn origin_allowed(origin: Option<&str>, allowed: &[String]) -> bool {
-    allowed.is_empty() || origin.is_some_and(|o| allowed.iter().any(|a| a == o))
+    match origin {
+        None => true,
+        Some(o) => allowed.is_empty() || allowed.iter().any(|a| a == o),
+    }
 }
 
 /// May this plane bind at all?
@@ -295,8 +314,8 @@ pub fn is_confined(require_pairing: bool, origins: &[String]) -> bool {
     require_pairing || !origins.is_empty()
 }
 
-/// One browser session: check the origin, take a session slot, then hand the connection to
-/// [`session::run`]. `/echo` keeps Phase 1's loopback for the measurement pages.
+/// One browser session: check the origin, then hand the connection to [`session::run`], which
+/// takes the session slot. `/echo` keeps Phase 1's loopback for the measurement pages.
 async fn session(
     incoming: wtransport::endpoint::IncomingSession,
     serving: &Arc<Serving>,
@@ -338,18 +357,18 @@ async fn session(
     if path == "/echo" {
         return echo(connection).await;
     }
+    // The management API for a page that cannot `fetch` the host: no streaming slot, no
+    // handshake clock, its own caps (`mgmt`).
+    if path == "/mgmt" {
+        return mgmt::serve(connection, serving).await;
+    }
 
-    // Slot after the handshake, as the native plane does: a full host still accepts, so the
-    // browser sees a live path (keep-alive) instead of a silent dial timeout.
-    let permit = sem
-        .clone()
-        .acquire_owned()
-        .await
-        .expect("session semaphore is never closed");
+    // `/pf2` is `punktfunk/2`; every other path is the `punktfunk/1` browser session.
+    let v2 = path == "/pf2";
     let peer = connection.remote_address();
-    match session::run(connection.clone(), serving.clone(), permit, sem).await {
+    match session::run(connection.clone(), serving.clone(), sem, v2).await {
         Ok(crate::native::Served::Session) => tracing::info!(%peer, "browser session complete"),
-        Ok(crate::native::Served::ProbeClose) => {}
+        Ok(crate::native::Served::ProbeClose | crate::native::Served::Management) => {}
         Err(e) => {
             // The typed close the native plane would send, and the same code and sentence on a
             // stream first: WebKit hands a page nothing about an application close, so the
@@ -365,7 +384,7 @@ async fn session(
             while !said.is_char_boundary(cut) {
                 cut -= 1;
             }
-            refuse(&connection, code, &said[..cut]).await;
+            refuse(&connection, code, &said[..cut], v2).await;
             connection.close(wtransport::VarInt::from_u32(code), &said.as_bytes()[..cut]);
             tracing::warn!(%peer, code, error = %detail, "browser session ended with error");
         }
@@ -374,16 +393,21 @@ async fn session(
 }
 
 /// Say why on a fresh unidirectional stream, then give the browser a moment to read it. The
-/// close that follows carries no retransmit, so the wait is what makes the message arrive.
-pub(crate) async fn refuse(connection: &wtransport::Connection, code: u32, reason: &str) {
-    let msg = punktfunk_core::quic::Refused {
+/// close that follows carries no retransmit, so the wait is what makes the message arrive. On
+/// `/pf2` the stream carries the `Refused` frame alone.
+pub(crate) async fn refuse(connection: &wtransport::Connection, code: u32, reason: &str, v2: bool) {
+    let refused = punktfunk_core::quic::Refused {
         code,
         reason: reason.to_string(),
-    }
-    .encode();
+    };
     let sent = async {
         let mut uni = connection.open_uni().await?.await?;
-        punktfunk_core::quic::io::write_msg(&mut uni, &msg).await?;
+        if v2 {
+            use punktfunk_core::quic::v2::msg::V2Message;
+            tokio::io::AsyncWriteExt::write_all(&mut uni, &refused.encode_v2()).await?;
+        } else {
+            punktfunk_core::quic::io::write_msg(&mut uni, &refused.encode()).await?;
+        }
         uni.finish().await?;
         anyhow::Ok(())
     };
@@ -462,8 +486,9 @@ mod tests {
         let allowed = vec!["https://host.local:47990".to_string()];
         assert!(origin_allowed(Some("https://host.local:47990"), &allowed));
         assert!(!origin_allowed(Some("https://evil.example"), &allowed));
-        // A peer that sends no Origin at all must not slip past a configured list.
-        assert!(!origin_allowed(None, &allowed));
+        // No Origin is not a page: a packaged TV app dials without one, and a browser cannot.
+        // The list is a rule for pages, so it does not apply.
+        assert!(origin_allowed(None, &allowed));
         // Exact match only: a prefix or a suffix is a different origin.
         assert!(!origin_allowed(
             Some("https://host.local:47990.evil.example"),

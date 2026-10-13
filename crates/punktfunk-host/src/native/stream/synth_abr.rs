@@ -230,6 +230,8 @@ pub(crate) struct SynthAbrContext {
     /// plane carries it, and the client's address, which is how the shared-path governor
     /// groups sessions.
     pub(crate) plane: crate::events::Plane,
+    /// [`crate::session_status::Registration::wire`].
+    pub(crate) wire: u8,
     pub(crate) peer: std::net::IpAddr,
 }
 
@@ -261,6 +263,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
                     SessionShared {
                         live_bitrate,
                         fec_target,
+                        delivery,
                         phase,
                         ramp_open,
                         ..
@@ -288,6 +291,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
         bringup_delay,
         fit_pin,
         plane,
+        wire,
         peer,
     } = ctx;
     let fps = mode.refresh_hz.max(1);
@@ -329,6 +333,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
         // No client ramp reaches the synthetic source; the factor paces it.
         link_kbps: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         link_paced: false,
+        delivery,
         bringup: bringup.clone(),
         wire_sock,
         driver_dropped: Arc::new(AtomicU64::new(0)),
@@ -397,6 +402,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
         client: client_label,
         client_name,
         plane,
+        wire,
         hdr,
         ttff_ms: bringup.total_slot(),
         // Never written: a source that cannot reconfigure never resizes.
@@ -488,6 +494,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
                 data: test_frame(au_seq, len),
                 meta: AuMeta {
                     capture_ns: now_ns(),
+                    epoch: 0,
                     flags,
                     frame_index: au_seq,
                     deadline: due + interval,

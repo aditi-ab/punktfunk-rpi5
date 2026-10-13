@@ -116,6 +116,9 @@ pub struct DiscoveredHost {
     /// OS-identity chain from mDNS `os` (`windows` | `macos` | `linux[/<family>][/<id>]`),
     /// sanitized ([`sanitize_os`]). Empty if absent.
     pub os: String,
+    /// The punktfunk protocols the host answers, from mDNS `wire` (`1,2`). Empty from a host
+    /// that does not say, which answers `punktfunk/1`.
+    pub wire: Vec<u8>,
 }
 
 impl DiscoveredHost {
@@ -164,6 +167,11 @@ pub fn advert_from_txt<'a>(
             .map(String::from)
             .collect(),
         os: sanitize_os(val("os")),
+        wire: val("wire")
+            .split(',')
+            .filter_map(|w| w.trim().parse().ok())
+            .take(8)
+            .collect(),
     })
 }
 
@@ -185,6 +193,18 @@ pub fn sanitize_os(raw: &str) -> String {
         .take(5)
         .collect();
     tokens.join("/")
+}
+
+/// Bracket a bare IPv6 literal so `SocketAddr` parse succeeds (`fd00::1` → `[fd00::1]:4770`).
+/// Without brackets the joined string never parses and the error blames the caller's input.
+/// V4, hostnames, and already-bracketed input pass through. A v6 dial still fails at connect
+/// while the sockets are IPv4-bound.
+pub fn join_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 #[cfg(test)]
@@ -263,6 +283,14 @@ mod tests {
             &[ip("192.168.1.9")],
             |k| txt.iter().find(|(key, _)| *key == k).map(|(_, v)| *v),
         )
+    }
+
+    /// `wire` lists the protocols a host answers; an older host says nothing, junk is skipped.
+    #[test]
+    fn an_advert_names_the_protocols_its_host_answers() {
+        assert_eq!(advert(&[("wire", "1,2")]).unwrap().wire, vec![1, 2]);
+        assert_eq!(advert(&[("wire", "1, x,2")]).unwrap().wire, vec![1, 2]);
+        assert!(advert(&[]).unwrap().wire.is_empty());
     }
 
     #[test]

@@ -96,6 +96,15 @@ fn workspace_placement_available() -> bool {
     })
 }
 
+/// Can a backend here start a device's screen at its own scale? Mutter only: KWin and
+/// Windows remember each device's scale themselves. Cached: see [`keep_monitors_available`].
+#[cfg(target_os = "linux")]
+fn scale_available() -> bool {
+    static PRESENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PRESENT
+        .get_or_init(|| crate::vdisplay::available().contains(&crate::vdisplay::Compositor::Mutter))
+}
+
 /// Whether a gamescope backend is usable on this host. Cached: see the call site.
 fn gamescope_present() -> bool {
     #[cfg(target_os = "linux")]
@@ -183,12 +192,14 @@ pub(crate) fn display_settings_state() -> DisplaySettingsState {
     // The cap is applied in the native handshake, before Welcome, so the client is told the
     // mode it actually gets rather than the one it asked for.
     client_enforced.push("max_mode".into());
-    // Linux only. Topology: the backend reads it at `create`, where `set_client_identity`
-    // has already named the device — the Windows CCD isolate is one topology for the whole
-    // managed group, so there is no per-device answer to give. Scale: Mutter mints a fresh
-    // EDID serial per session, so it is the backend that cannot remember one on its own.
+    // Linux only. The backend reads it at `create`, where `set_client_identity` has already
+    // named the device — the Windows CCD isolate is one topology for the whole managed group.
     if cfg!(target_os = "linux") {
         client_enforced.push("topology".into());
+    }
+    // Mutter mints a fresh EDID serial per session, so the host remembers the scale for it.
+    #[cfg(target_os = "linux")]
+    if scale_available() {
         client_enforced.push("scale".into());
     }
     // Overlays ride their own field, never `settings`. The console PUTs `settings`
@@ -284,9 +295,18 @@ pub(super) fn write(policy: crate::vdisplay::policy::DisplayPolicy) -> anyhow::R
              monitor is Linux-only (no Windows mirror backend); the pin was NOT stored"
         );
     }
-    let store = crate::vdisplay::policy::prefs();
-    let policy = with_stored_overlays(policy, &store.get());
-    store.set(policy)?;
+    write_with(|stored| *stored = with_stored_overlays(policy, stored))
+}
+
+/// One edit of the stored host policy, read and written in one store transaction, then the
+/// anchor re-aim [`write`] does.
+pub(super) fn write_with(
+    edit: impl FnOnce(&mut crate::vdisplay::policy::DisplayPolicy),
+) -> anyhow::Result<()> {
+    crate::vdisplay::policy::prefs().update(|p| {
+        edit(p);
+        true
+    })?;
     #[cfg(target_os = "linux")]
     crate::refresh_capture_monitor_anchor("display policy updated");
     Ok(())
@@ -371,11 +391,13 @@ pub(crate) async fn set_display_client(
     if overlay.is_empty() && store.configured().is_none() {
         return Json(display_settings_state()).into_response();
     }
-    let mut policy = store.get();
     // `sanitized` drops an overlay that pins nothing, so this covers the reset
     // case too without a second path.
-    policy.clients.insert(key.clone(), overlay);
-    if let Err(e) = store.set(policy) {
+    let saved = store.update(|p| {
+        p.clients.insert(key.clone(), overlay);
+        true
+    });
+    if let Err(e) = saved {
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("Couldn't save the display settings for this device — {e:#}"),
@@ -401,17 +423,17 @@ pub(crate) async fn set_display_client(
 pub(crate) async fn delete_display_client(Path(fingerprint): Path<String>) -> Response {
     let key = fingerprint.trim().to_ascii_lowercase();
     let store = crate::vdisplay::policy::prefs();
-    let mut policy = store.get();
     // Already following the host: nothing to write, and a no-op write would
     // rewrite the file on every unpair.
-    if policy.clients.remove(&key).is_none() {
-        return Json(display_settings_state()).into_response();
-    }
-    if let Err(e) = store.set(policy) {
-        return api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Couldn't clear the display settings for this device — {e:#}"),
-        );
+    match store.update(|p| p.clients.remove(&key).is_some()) {
+        Ok(false) => return Json(display_settings_state()).into_response(),
+        Ok(true) => {}
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Couldn't clear the display settings for this device — {e:#}"),
+            );
+        }
     }
     tracing::info!(fingerprint = %key, "management API: per-device display overlay cleared");
     Json(display_settings_state()).into_response()
@@ -422,12 +444,9 @@ pub(crate) async fn delete_display_client(Path(fingerprint): Path<String>) -> Re
 pub(crate) fn forget_display_overlay(fingerprint: &str) {
     let key = fingerprint.trim().to_ascii_lowercase();
     let store = crate::vdisplay::policy::prefs();
-    let mut policy = store.get();
-    if policy.clients.remove(&key).is_none() {
-        return;
-    }
-    match store.set(policy) {
-        Ok(()) => tracing::info!(fingerprint = %key,
+    match store.update(|p| p.clients.remove(&key).is_some()) {
+        Ok(false) => {}
+        Ok(true) => tracing::info!(fingerprint = %key,
             "unpaired: dropped this device's display settings"),
         Err(e) => tracing::warn!(fingerprint = %key,
             "unpaired: could not drop this device's display settings ({e:#}) — a device \
@@ -690,8 +709,11 @@ pub(crate) struct DisplayLayoutRequest {
 )]
 pub(crate) async fn set_display_layout(ApiJson(req): ApiJson<DisplayLayoutRequest>) -> Response {
     let store = crate::vdisplay::policy::prefs();
-    let policy = store.get().with_manual_layout(req.positions);
-    if let Err(e) = store.set(policy) {
+    let saved = store.update(|p| {
+        *p = p.clone().with_manual_layout(req.positions);
+        true
+    });
+    if let Err(e) = saved {
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("Couldn't save the display layout — {e:#}"),

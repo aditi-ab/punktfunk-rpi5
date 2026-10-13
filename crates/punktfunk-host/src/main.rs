@@ -100,12 +100,12 @@ mod encode {
 
     /// Refresh rate a client may ask for, the companion to [`validate_dimensions`].
     ///
-    /// The driver multiplies it by `vdisplay_hz_mult` before advertising the mode, so bound the
-    /// product: an out-of-contract value otherwise reaches mode selection and kills the session
-    /// after Welcome, and a huge one overflows the multiply.
+    /// The driver multiplies it by `vdisplay_hz_mult_for` before advertising the mode, so bound
+    /// the product: an out-of-contract value otherwise reaches mode selection and kills the
+    /// session after Welcome, and a huge one overflows the multiply.
     pub(crate) fn validate_refresh(refresh_hz: u32) -> anyhow::Result<()> {
         const MAX_HZ: u32 = 1000;
-        let mult = pf_host_config::config().vdisplay_hz_mult.max(1);
+        let mult = pf_host_config::config().vdisplay_hz_mult_for(refresh_hz);
         let effective = refresh_hz.saturating_mul(mult);
         anyhow::ensure!(
             (1..=MAX_HZ).contains(&refresh_hz) && effective <= MAX_HZ,
@@ -231,17 +231,20 @@ fn main() {
         // past this filter, so the Logs tab keeps every line stderr drops.
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::Layer;
+        // Colour only on a terminal: the service child's stderr is `host.log`.
+        let fmt = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+        let fmt = if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+            fmt
+        } else {
+            fmt.with_ansi(false)
+        };
         log_capture::install_global(
             tracing_subscriber::registry()
                 .with(
                     log_capture::RingLayer
                         .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
                 )
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .with_writer(std::io::stderr)
-                        .with_filter(filter),
-                ),
+                .with(fmt.with_filter(filter)),
         );
     }
 
@@ -449,6 +452,13 @@ fn startup(args: &[String]) {
 
 fn real_main() -> Result<()> {
     take_env_credentials();
+    #[cfg(target_os = "linux")]
+    if let Some(value) = encode::anv_video_encode_flag() {
+        // SAFETY: right after `take_env_credentials`, so still single-threaded, and no Vulkan
+        // instance exists yet (Mesa reads the variable when its ICD loads).
+        unsafe { std::env::set_var("ANV_DEBUG", &value) };
+        tracing::debug!(value, "ANV_DEBUG opted into Mesa Vulkan Video encode");
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if matches!(
@@ -792,6 +802,7 @@ fn parse_punktfunk1(args: &[String]) -> Result<native::Punktfunk1Options> {
         // QUIC idle timeout; flag overrides env; absent = core default (8 s).
         idle_timeout: native::idle_timeout_from_env(),
         mdns: discovery::mdns_enabled(),
+        protocol2: native::protocol2_from_env(),
     };
     let mut source = "synthetic".to_string();
     // What `--source synthetic-abr` encodes; ignored by the other sources.

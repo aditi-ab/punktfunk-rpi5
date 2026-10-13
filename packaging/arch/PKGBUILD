@@ -165,13 +165,14 @@ package_punktfunk-host() {
   # punktfunk-icons: the brand mark the Omarchy webapp entry and the tray name. It lives in its
   # own package because the CLIENT needs the same file — two packages shipping one path is a
   # pacman file conflict the moment both land on one box (found exactly that way).
+  # punktfunk-gamescope: HDR, the real mode and the cursor in every gamescope session. A depend,
+  # not an optdepend: pacman has no weak deps, and apt/dnf pull it as a Recommends.
   depends=('pipewire' 'wireplumber' 'opus' 'libei'
-           'mesa' 'libglvnd' 'libxkbcommon' 'wayland' 'punktfunk-icons')
+           'mesa' 'libglvnd' 'libxkbcommon' 'wayland' 'punktfunk-icons' 'punktfunk-gamescope')
   optdepends=('rtkit: data-plane thread priority without a relogin (else the shipped LimitNICE drop-in applies from next login)'
               'pipewire-pulse: PulseAudio-API audio from games/apps (real `pulseaudio` also works)'
               'nvidia-utils: NVENC hardware encode + GPU EGL/CUDA zero-copy (REQUIRED to encode on NVIDIA)'
               'gamescope: per-session nested compositor backend (no desktop login needed) — needs >=3.16.22'
-              'punktfunk-gamescope: HDR (10-bit BT.2020 PQ) streaming on the gamescope backend — attempted by default when installed'
               'kwin: stream a KDE Plasma desktop (kwin VirtualDisplay backend)'
               'mutter: stream a GNOME desktop (Mutter RecordVirtual backend)'
               'sway: stream a wlroots desktop (Sway VirtualDisplay backend)'
@@ -278,6 +279,8 @@ package_punktfunk-host() {
   install -Dm0755 "$T/punktfunk-tray" "$pkgdir/usr/bin/punktfunk-tray"
   install -Dm0644 "$R/packaging/linux/io.unom.Punktfunk.Tray.desktop" \
     "$pkgdir/etc/xdg/autostart/io.unom.Punktfunk.Tray.desktop"
+  install -Dm0644 "$R/packaging/linux/io.unom.Punktfunk.StartHost.desktop" \
+    "$pkgdir/usr/share/applications/io.unom.Punktfunk.StartHost.desktop"
   local sz png
   for sz in 22x22 48x48; do
     for png in "$R"/packaging/linux/icons/hicolor/$sz/apps/*.png; do
@@ -450,6 +453,8 @@ package_punktfunk-scripting() {
   # bubblewrap builds each plugin's sandbox; the runner starts no plugin without it. The runtime is
   # punktfunk-bun's private bun (it import()s the operator's .ts plugins), pinned to this build.
   depends=('bubblewrap' "punktfunk-bun=${pkgver}-${pkgrel}")
+  install=punktfunk-scripting.install
+  backup=('etc/apparmor.d/punktfunk-scripting')
   local R; R="$(_repo)"
 
   # Pre-built self-contained bundle (from build()) + a PATH-stable launcher (matches the .deb/.rpm).
@@ -461,6 +466,11 @@ package_punktfunk-scripting() {
   # systemd USER unit — installed but NOT auto-enabled (opt-in). Enable once you have automation:
   #   systemctl --user enable --now punktfunk-scripting
   install -Dm0644 "$R/scripts/punktfunk-scripting.service" "$pkgdir/usr/lib/systemd/user/punktfunk-scripting.service"
+  # Where AppArmor restricts unprivileged user namespaces, the generator trades the unit's namespace
+  # sandbox for this profile.
+  install -Dm0644 "$R/packaging/linux/apparmor/punktfunk-scripting" "$pkgdir/etc/apparmor.d/punktfunk-scripting"
+  install -Dm0755 "$R/packaging/linux/punktfunk-scripting-apparmor.generator" \
+    "$pkgdir/usr/lib/systemd/user-generators/punktfunk-scripting-apparmor"
   install -Dm0644 "$R/LICENSE-MIT"    "$pkgdir/usr/share/licenses/punktfunk-scripting/LICENSE-MIT"
   install -Dm0644 "$R/LICENSE-APACHE" "$pkgdir/usr/share/licenses/punktfunk-scripting/LICENSE-APACHE"
 }

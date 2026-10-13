@@ -40,6 +40,11 @@ The patches here add the missing half, and nothing else. See
 | `0027-pipewire-repaint-the-composited-cursor-on-a-shape-ch.patch` | With `--pipewire-composite-cursor`, the capture repaints on a shape change without motion (a busy cursor, the I-beam over text) and erases a cursor that hides without moving: `MouseCursor` counts its image rebuilds and the repaint test compares the count, and a hidden or empty image counts as not drawn, as in `MouseCursor::paint` | **Yes** — the same gap exists wherever the capture composites the cursor |
 | `0028-wlserver-forget-the-pointer-bound-when-its-surface-g.patch` | Forget the X window extent 0017 caches for the pointer bound when its `wlr_surface` is destroyed, so a surface allocated later at the same address never inherits the old window's bounds | **Yes** — with 0017 |
 | `0029-steamcompmgr-take-a-game-out-of-iconic-when-input-re.patch` | When input focus returns from an overlay to the focus window, set its `WM_STATE` back to Normal. A fullscreen game that minimized itself on losing input to the Steam overlay otherwise stays iconic: gamescope fakes the iconic state and clears it only on a focus-window change, Wine keeps the client window at 160x31, and the WSI layer stops bypassing Xwayland | **Yes** — upstream already clears it on a focus-window change |
+| `0030-pipewire-keep-the-planar-capture-s-RGB-intermediate-.patch` | An NV12/P010 capture composites into a pooled RGB texture and converts from there. Allocate that capture pool in device memory; only the screenshot pool is read through a mapping. Upstream made every pooled texture mappable, which is system RAM on a discrete GPU: on an RTX 5070 Ti at 2560×1440 the planar capture moved 5.5 GB/s each way over PCIe and held the GPU at 85 % for a desktop | **Yes** — any discrete-GPU consumer of the NV12 capture pays it |
+| `0031-pipewire-offer-the-10-bit-capture-formats-as-SDR-too.patch` | Offer each 10-bit capture format (xBGR/xRGB 2:10:10:10, P010) a second time with BT.709 primaries and the sRGB-family transfer the SDR composite writes, after the PQ pod. `paint_pipewire` keys the PQ LUT set on the negotiated transfer function instead of the DRM format, and the P010 pass applies a 10-bit BT.709 matrix on the sRGB codes an SDR composite stores. Every YCbCr capture already composites through the 10-bit RGB intermediate, so a 10-bit SDR stream carries the composite's own precision | **Yes** — any consumer that wants 10-bit without PQ |
+| `0032-steamcompmgr-keep-framerate-limit-as-the-floor-under.patch` | A refresh-cycle request for 0 (Steam's "Framerate limit: Off", or the legacy `GAMESCOPE_FPS_LIMIT` atom at 0) falls back to the CLI `--framerate-limit` as a plain cap instead of clearing it. Steam's explicit values still win, and a request that only changes refresh (Steam's "Disable Frame Limiter") stays uncapped | **Yes** — on a headless output the limiter is the focused app's only pace; `0012` let Steam's default state remove it |
+| `0033-protocol-read-wayland-scanner-s-path-from-any-depend.patch` | `protocol/meson.build` reads `wayland_scanner` with the generic `get_variable`, as wlroots does, so a wayland built as a subproject configures (the pkg-config-only lookup fails on its internal dependency). Also stamps `+pfhdr30` | **Yes** — any build that takes wlroots' `wayland` fallback hits it |
+| `0034-rendervulkan-align-uploaded-constants-to-any-device-.patch` | Align each block `uploadBufferData` hands out to 256 bytes, the largest `minUniformBufferOffsetAlignment` Vulkan allows. A dispatch binds its constants as a uniform buffer at that offset. Since upstream's eight-layer bound, the 584-byte blit block leaves the NV12/P010 pass's constants off NVIDIA's and Intel's 64-byte boundary; the pass stores nothing and every planar frame is zeros (green). Also stamps `+pfhdr31` | **Yes** — upstream's own planar capture has the same fault |
 
 ### Why the headless patch matters
 
@@ -140,10 +145,17 @@ The number is a **monotonic patch-set revision**, so one probe answers every cap
 | `+pfhdr22` | …and a planar (NV12/P010) capture dmabuf exports its chroma plane where the driver put it (no new capability: the host reads a second data block whenever one is there) |
 | `+pfhdr23` | …and the composited cursor follows a shape change or a hide, and the pointer bound forgets a closed window (no new capability) |
 | `+pfhdr24` | …and input back from an overlay takes the focused game out of iconic (no new capability) |
+| `+pfhdr25` | …and a planar capture composites through device memory; NVENC hosts offer NV12/P010 from this level |
+| `+pfhdr26` | …and the 10-bit capture formats are offered as BT.709 SDR too; a 10-bit SDR session takes P010 or packed 10-bit from this level instead of widening 8-bit |
+| `+pfhdr27` | …and `--framerate-limit` is the floor a refresh-cycle request for 0 falls back to; Steam's "Off" no longer leaves a headless session unpaced |
+| `+pfhdr28` | …and the WSI layer accepts its socket under a container alias and leaves a native Wayland app's surface alone (no new capability) |
+| `+pfhdr29` | …and a focus re-apply keeps Steam's CEF browser subwindow focused, so Big Picture shows its focus highlight without pointer motion (no new capability) |
+| `+pfhdr30` | …on upstream 3.16.31, which carries 28 and 29 itself (no new capability) |
+| `+pfhdr31` | …and a planar (NV12/P010) capture carries a picture; `+pfhdr30` sends zeros on NVIDIA and Intel (no new capability) |
 
 Require `+pfhdr10` for headless `--adaptive-sync` with a CLI cap: `+pfhdr9` clears that cap
 on the first paint unless Steam or a control command supplies an override. The Arch package is
-`3.16.25.pfhdr10-1`; its build checks the complete upstream version and capability level.
+`3.16.31.pfhdr31-1`; its build checks the complete upstream version and capability level.
 
 Bump it whenever a patch adds or changes something the host must know about before it spawns.
 
@@ -186,15 +198,20 @@ distro's `gamescope`.
 
 ## Building
 
-Pinned upstream: `5fb8dce4a09d0a68d097b9faf9513782106bc843` (`3.16.25-11-g5fb8dce`).
+Pinned upstream: `6867f509874f9bc52e12d6f4c4596cdf0d5be6b4` (`3.16.31`).
 All patches apply in filename order to that commit.
 
-The bump from `8c676c39` is deliberate: it brings upstream's `vulkan_get_rgb10_capture_format()`
-(`ff6b924`), which probes `linearTilingFeatures` for STORAGE+SAMPLED and falls back to
-`DRM_FORMAT_XBGR2101010` on devices that cannot do linear-tiled `A2R10G10B10` — i.e. every
-NVIDIA. That covers the paths that are upstream's rather than ours: the RGB intermediate
-`paint_pipewire()` acquires when the stream is YCbCr, and AVIF screenshots. Our own 10-bit RGB
-node is covered by patch `0001`, which offers `xBGR_210LE` first for the same reason.
+Upstream's `vulkan_get_rgb10_capture_format()` falls back to `DRM_FORMAT_XBGR2101010` on devices
+that cannot store linear `A2R10G10B10` — every NVIDIA. Our own 10-bit RGB node gets the same
+outcome from patch `0001`, which offers `xBGR_210LE` first.
+
+The vendored wlroots 0.20 needs wayland ≥ 1.24, libdrm ≥ 2.4.129, xkbcommon ≥ 1.8 and pixman ≥ 0.46.
+Where the system is older (Debian 13: the `.deb` and the SteamOS box), the script builds the pinned
+wraps in `subprojects/` and links them into the compositor statically; Arch and Fedora keep their
+own. The WSI layer builds in a second pass that never bundles: it loads into every game beside the
+game's own libwayland-client, and the script fails if the layer does not link the system one.
+Every library compiled in ships its notice under `share/doc/punktfunk-gamescope/`. Bump the wraps
+with the pin; each names its release tag beside the commit.
 
 Build into a staging directory on Linux. The system gamescope and file capabilities stay untouched:
 
@@ -266,16 +283,14 @@ must not be decided twice.
 | Channel | Built by | Notes |
 |---|---|---|
 | Bazzite / Fedora Atomic | `.gitea/workflows/rpm.yml` → `build-sysext.sh --gamescope` | Inside the matching Fedora container, per major — the binary is soname-coupled to its base exactly like the RPM |
-| Arch / SteamOS | `.gitea/workflows/arch.yml` → `makepkg` on `./PKGBUILD` | Its own pkgbase in the same pacman repo; `pacman -S punktfunk-gamescope` |
+| Arch / SteamOS | `.gitea/workflows/arch.yml` → `makepkg` on `./PKGBUILD` | Its own pkgbase in the same pacman repo; `punktfunk-host` depends on it |
 | NixOS | `packaging/nix/gamescope.nix` (an `overrideAttrs` on nixpkgs' gamescope) | The one path that does NOT call the script — nixpkgs already solves the submodules, and a nix closure names every library it links |
 | Anything else | the script, by hand | See *Building* above |
 
-Both CI builds are **cached on `packaging/gamescope/**`** and **best-effort**. Cached because this
-tree depends on nothing else in the repo, so a normal push restores a binary instead of spending
-ten minutes on someone else's C++; best-effort because punktfunk works without it (SDR on the
-gamescope backend, which is what every release before this one did) and a hiccup building gamescope
-must not cost the packages those workflows exist to publish. A failed build emits a `::warning::`
-and is never cached, so the next run retries.
+Both CI builds are **cached on `packaging/gamescope/**`**: this tree depends on nothing else in the
+repo, so a normal push restores a binary instead of spending ten minutes on someone else's C++. A
+failed build is never cached, so the next run retries. The Fedora build warns and lets the rest
+publish. The Arch build is required: `punktfunk-host` depends on it, so a failure stops the publish.
 
 Note what is NOT in that table: the `.deb`. Debian/Ubuntu boxes build it by hand for now.
 

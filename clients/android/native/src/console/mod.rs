@@ -569,6 +569,15 @@ json_pusher!(
     |h, games| h.handles.library.set_running(&games)
 );
 
+json_pusher!(
+/// `NativeBridge.nativeConsoleLibraryDownloads(handle, json)` — the host's `/status`
+/// `{"downloads": [...], "grants": n}`, pushed before the same read's
+/// `nativeConsoleLibraryRunning`.
+    Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleLibraryDownloads,
+    pf_console_ui::DownloadsPush,
+    |h, p| h.handles.library.set_downloads(&p.downloads, p.grants)
+);
+
 /// `NativeBridge.nativeConsoleLibraryStale(handle, stale)` — 0 fresh, 1 waking, 2 offline.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleLibraryStale(

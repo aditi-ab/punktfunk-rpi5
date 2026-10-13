@@ -473,6 +473,16 @@ impl HomeScreen {
             if !self.below && shelf.has_titles() {
                 shelf.set_quiet(false);
                 self.below = true;
+                // A quiet shelf shows no focus, so a tap that wakes it only takes focus, as on
+                // any card not yet focused. A mouse wakes it on hover first.
+                if p.kind == PointerKind::Press {
+                    let take_focus = Pointer {
+                        kind: PointerKind::Move,
+                        ..p
+                    };
+                    shelf.pointer(take_focus, ctx, fx);
+                    return true;
+                }
             }
             return shelf.pointer(p, ctx, fx);
         }
@@ -594,7 +604,9 @@ impl HomeScreen {
             hints.push(Hint::new(HintKey::Secondary, "Options"));
         }
         hints.push(Hint::new(HintKey::Tertiary, "Settings"));
-        hints.push(Hint::new(HintKey::Back, "Quit"));
+        if ctx.device.platform.can_quit() {
+            hints.push(Hint::new(HintKey::Back, "Quit"));
+        }
         hints
     }
 
@@ -1457,6 +1469,32 @@ mod tests {
         assert_eq!(confirm(&s), "Connect");
         s.cursor = 1;
         assert_eq!(confirm(&s), "Resume");
+    }
+
+    /// Back offers Quit only where the app can close itself.
+    #[test]
+    fn quit_is_hinted_only_where_the_app_can_quit() {
+        let mut settings = ctx_settings();
+        let library = crate::library::LibraryShared::default();
+        for (platform, quits) in [
+            (crate::platform::Platform::Android, true),
+            (crate::platform::Platform::Apple, false),
+        ] {
+            let device = crate::screens::Device {
+                platform,
+                ..crate::screens::Device::test()
+            };
+            let ctx = Ctx {
+                device: &device,
+                ..Ctx::test(&mut settings, &library)
+            };
+            let hints = HomeScreen::new().hints(&ctx);
+            assert_eq!(
+                hints.iter().any(|h| h.key == HintKey::Back),
+                quits,
+                "{platform:?}"
+            );
+        }
     }
 
     /// Right goes through the tree, three presses between frames included (the culled

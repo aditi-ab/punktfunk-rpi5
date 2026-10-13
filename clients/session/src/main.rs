@@ -362,6 +362,7 @@ mod session_main {
             settings.pad_haptics,
             pf_client_core::pad_audio::speaker_active(&settings.pad_speaker),
         );
+        gamepad.set_rumble(settings.pad_rumble);
         // Short-circuit: Full chroma off must not build an HEVC decoder.
         // The probe constructs one to ask about 4:4:4 profiles.
         let hevc_444_hardware = settings.enable_444
@@ -423,7 +424,7 @@ mod session_main {
 
     /// The window's starting size under Match-window: the persisted last size, so the
     /// first connect's mode already matches the glass; `None` (policy off / never
-    /// stored) = the 1280×720 default.
+    /// stored) = the presenter's default.
     pub(crate) fn window_size(settings: &trust::Settings) -> Option<(u32, u32)> {
         (settings.match_window && settings.last_window_w > 0 && settings.last_window_h > 0)
             .then_some((settings.last_window_w, settings.last_window_h))
@@ -656,6 +657,25 @@ mod session_main {
         }
     }
 
+    /// SDL falls back to XWayland where the compositor lacks `wp_fifo_v1` (KWin before
+    /// 6.4, Mutter before 48). The compositor stamps, the native lane and colour
+    /// management live on the Wayland surface, so a Wayland session stays Wayland. A
+    /// driver the environment names, or gamescope's nested display, is left alone.
+    #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)] // the SAFETY-commented single-threaded-startup env write below
+    fn prefer_wayland() {
+        if std::env::var_os("WAYLAND_DISPLAY").is_none()
+            || std::env::var_os("SDL_VIDEO_DRIVER").is_some()
+            || std::env::var_os("SDL_VIDEODRIVER").is_some()
+            || pf_client_core::gamescope::under_gamescope()
+        {
+            return;
+        }
+        // SAFETY: called at the top of `run()`, before this process creates any thread.
+        unsafe { std::env::set_var("SDL_VIDEO_DRIVER", "wayland") };
+        tracing::info!("SDL kept on Wayland (WAYLAND_DISPLAY is set)");
+    }
+
     /// `current` with `token` appended to its comma list; `None` when it is already there.
     #[cfg(target_os = "linux")]
     fn with_token(current: Option<&str>, token: &str) -> Option<String> {
@@ -724,8 +744,12 @@ mod session_main {
 
     pub fn run() -> u8 {
         // Logs to STDERR — stdout is the machine interface (ready/stats/error lines) — plus
-        // the ring "Send logs to host" uploads.
-        pf_client_core::logring::init_tracing(std::io::stderr, true);
+        // the ring "Send logs to host" uploads. A shell pipes stderr into its log file, so
+        // colour only on a terminal.
+        pf_client_core::logring::init_tracing(
+            std::io::stderr,
+            std::io::IsTerminal::is_terminal(&std::io::stderr()),
+        );
         // SEH last-resort: a driver AV otherwise leaves only an exit code in the shell's log.
         #[cfg(windows)]
         punktfunk_core::crash::install();
@@ -736,6 +760,8 @@ mod session_main {
         // decoder's `auto` path can take Vulkan Video. Windows drivers expose theirs already.
         #[cfg(target_os = "linux")]
         enable_mesa_video_decode();
+        #[cfg(target_os = "linux")]
+        prefer_wayland();
 
         // `--list-adapters`: print the Vulkan physical devices' marketing names (one per
         // line, discrete first) for the desktop shells' GPU picker, then exit.

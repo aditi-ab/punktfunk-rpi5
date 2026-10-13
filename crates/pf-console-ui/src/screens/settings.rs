@@ -63,6 +63,9 @@ pub enum RowId {
     PadForward,
     Pad,
     PadType,
+    /// `trust::Settings::pad_rumble`. Off, the client drops the host's rumble and the
+    /// console's own pulses.
+    PadRumble,
     SystemButtons,
     GuideGesture,
     /// `trust::Settings::pad_haptics`. Negotiated: needs a capable host and a wired DS5.
@@ -100,6 +103,9 @@ pub enum RowId {
     // so the typed struct stays shared; [`row_on`] keeps them off desktop.
     /// Slice-progressive decode plus DSCP. Android-only.
     LowLatency,
+    /// A dual-screen handheld's lower panel carries the companion panel or the picture;
+    /// off leaves a second screen to the system. Android-only.
+    SecondScreen,
     PhoneRumble,
     PhoneGyro,
     /// Raw BLE/USB capture instead of the OS pad.
@@ -129,6 +135,8 @@ pub enum RowId {
     /// Action row: jumps to the Controllers tab.
     Controllers,
     Bluetooth,
+    /// Action row: the stream's keys, chords and gestures, read-only.
+    StreamControls,
     /// Action row: asks the host to open the platform licences screen.
     Licenses,
     /// Action row: the Games tab's sections, in [`super::library::CustomizeScreen`].
@@ -186,6 +194,7 @@ pub fn advanced(id: RowId) -> bool {
 /// the Apple client reads the same keys from its own document.
 mod device_keys {
     pub const LOW_LATENCY: &str = "android.low_latency";
+    pub const SECOND_SCREEN: &str = "android.second_screen";
     pub const PHONE_RUMBLE: &str = "android.rumble_on_phone";
     pub const PHONE_GYRO: &str = "android.gyro_on_phone";
     pub const SC2: &str = "android.sc2_capture";
@@ -249,7 +258,7 @@ pub(crate) fn own_stats_corner(platform: crate::platform::Platform) -> HudCorner
     use crate::platform::Platform;
     match platform {
         Platform::Desktop | Platform::Android => HudCorner::TopLeft,
-        Platform::Apple | Platform::WebOS | Platform::Web => HudCorner::TopRight,
+        Platform::Apple | Platform::WebOS | Platform::Web | Platform::Tizen => HudCorner::TopRight,
     }
 }
 
@@ -343,6 +352,7 @@ impl RowId {
     fn extra(self) -> Option<Extra> {
         Some(match self {
             RowId::LowLatency => Extra::Bool(device_keys::LOW_LATENCY, true),
+            RowId::SecondScreen => Extra::Bool(device_keys::SECOND_SCREEN, true),
             RowId::PhoneRumble => Extra::Bool(device_keys::PHONE_RUMBLE, false),
             RowId::PhoneGyro => Extra::Bool(device_keys::PHONE_GYRO, false),
             RowId::Sc2Passthrough => Extra::Bool(device_keys::SC2, true),
@@ -442,6 +452,7 @@ const TABS: [(&str, &[RowId]); 7] = [
             RowId::Refresh,
             RowId::Bitrate,
             RowId::VideoFit,
+            RowId::SecondScreen,
             RowId::Hdr,
             RowId::PresentPriority,
             RowId::SmoothBuffer,
@@ -483,6 +494,7 @@ const TABS: [(&str, &[RowId]); 7] = [
         &[
             RowId::Controllers,
             RowId::PadType,
+            RowId::PadRumble,
             RowId::PhoneRumble,
             RowId::PhoneGyro,
             RowId::PadForward,
@@ -496,7 +508,10 @@ const TABS: [(&str, &[RowId]); 7] = [
         ],
     ),
     ("Presets", &[]),
-    ("About", &[RowId::Version, RowId::Licenses]),
+    (
+        "About",
+        &[RowId::Version, RowId::StreamControls, RowId::Licenses],
+    ),
 ];
 
 /// The Presets section — catalog-built, not [`TABS`] rows.
@@ -541,7 +556,7 @@ fn family(
 fn has_window(device: &crate::screens::Device) -> bool {
     use crate::platform::Platform;
     match device.platform {
-        Platform::Desktop | Platform::Web => true,
+        Platform::Desktop | Platform::Web | Platform::Tizen => true,
         Platform::Apple => !device.tv,
         Platform::Android | Platform::WebOS => false,
     }
@@ -598,7 +613,8 @@ pub(crate) fn bitrate_ceiling_kbps(platform: crate::platform::Platform) -> u32 {
         crate::platform::Platform::Desktop
         | crate::platform::Platform::Android
         | crate::platform::Platform::Web
-        | crate::platform::Platform::Apple => CUSTOM_MAX_MBPS * 1_000,
+        | crate::platform::Platform::Apple
+        | crate::platform::Platform::Tizen => CUSTOM_MAX_MBPS * 1_000,
     }
 }
 
@@ -628,10 +644,11 @@ const CODECS: [(&str, &str); 5] = [
 ];
 
 /// The codecs this platform decodes. The TV's NDL pipeline takes H.264 and HEVC only:
-/// no AV1 (never presented a picture) and no PyroWave (no Vulkan presentation).
+/// no AV1 (never presented a picture) and no PyroWave (no Vulkan presentation). A Samsung set
+/// is the same pair: its WebCodecs says yes to AV1 without ever having been measured on one.
 fn codecs(platform: crate::platform::Platform) -> &'static [(&'static str, &'static str)] {
     match platform {
-        crate::platform::Platform::WebOS => &CODECS[..3],
+        crate::platform::Platform::WebOS | crate::platform::Platform::Tizen => &CODECS[..3],
         _ => &CODECS,
     }
 }
@@ -1194,18 +1211,21 @@ impl SettingsScreen {
                     ListMsg::None => pulse,
                 };
             }
-            // The console draws the licences with the host's sections. webOS still opens
-            // its own screen: that host sends no sections yet.
-            RowId::Licenses => {
+            RowId::StreamControls => {
                 return match msg {
-                    ListMsg::Activate
-                        if ctx.device.platform == crate::platform::Platform::WebOS =>
-                    {
-                        fx.cmds.push(crate::model::ConsoleCmd::OpenPlatformScreen {
-                            id: crate::platform::PlatformScreen::Licenses.id().to_string(),
-                        });
+                    ListMsg::Activate => {
+                        if let Some(screen) = super::licenses::LicensesScreen::controls(ctx) {
+                            fx.push(Screen::Licenses(screen));
+                        }
                         pulse
                     }
+                    ListMsg::Adjust(_) => Some(MenuPulse::Boundary),
+                    ListMsg::None => pulse,
+                };
+            }
+            // The console draws the licences with the host's sections.
+            RowId::Licenses => {
+                return match msg {
                     ListMsg::Activate => {
                         let screen = super::licenses::LicensesScreen::new(fx);
                         fx.push(Screen::Licenses(screen));
@@ -1282,6 +1302,7 @@ impl SettingsScreen {
             Some(
                 RowId::Bluetooth
                 | RowId::Controllers
+                | RowId::StreamControls
                 | RowId::Licenses
                 | RowId::LibrarySections
                 | RowId::Palette
@@ -1437,6 +1458,8 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
         RowId::ReduceUiResolution => &[Android, WebOS],
         // A MediaCodec decoder flag; nothing else has the knob.
         RowId::LowLatency => &[Android],
+        // Only Android has a second screen to use (a handheld's lower panel, a half-open fold).
+        RowId::SecondScreen => &[Android],
         // The clients whose presenters place the picture through `video_fit`.
         RowId::VideoFit => &[Desktop, Android, Apple],
         // Offered wherever there is a second UI to fall back to: Android's touch home,
@@ -1461,9 +1484,20 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
         | RowId::PadForward
         | RowId::SystemButtons
         | RowId::GuideGesture
-        | RowId::Touch => &[Desktop, Android, Apple, Platform::Web],
+        | RowId::Touch => &[Desktop, Android, Apple, Platform::Web, Platform::Tizen],
         // DualSense voice coils and speaker: no Apple or browser client plays them.
         RowId::PadHaptics | RowId::PadSpeaker => &[Desktop, Android, WebOS],
+        // The clients whose rumble paths read the switch.
+        RowId::PadRumble => &[Desktop, Android, Apple],
+        // Every client binds something mid-stream: keys, chords, or a remote's colour buttons.
+        RowId::StreamControls => &[
+            Desktop,
+            Android,
+            WebOS,
+            Platform::Web,
+            Apple,
+            Platform::Tizen,
+        ],
         // Every client ships third-party code. The browser build has no bundle to list.
         RowId::Licenses => &[Desktop, Android, WebOS, Apple],
         // DualSense capture — the pad reaches webOS over Bluetooth HID, not hidraw, so the
@@ -1471,7 +1505,7 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
         RowId::DsCapture => &[Android, WebOS],
         // Apple reads `UIAccessibility.isReduceMotionEnabled` and follows it, so the shell has
         // nothing to ask. The others carry a row because they cannot see the OS switch.
-        RowId::ReduceMotion => &[Desktop, Android, WebOS, Platform::Web],
+        RowId::ReduceMotion => &[Desktop, Android, WebOS, Platform::Web, Platform::Tizen],
         // Which pad is player 1 — a question only a client that can narrow forwarding to one pad
         // has to answer. Android's router, webOS's slot table and the browser's Gamepad API give
         // every controller its own wire slot, so there is nothing to pick.
@@ -1523,9 +1557,9 @@ pub fn row_applies(id: RowId, ctx: &Ctx) -> bool {
         // ignores the value (`GamepadUi.kt`: the tv term alone satisfies the OR);
         // webOS obeys it — a Magic Remote with no pad is why its cursor UI exists.
         RowId::GamepadUiMode => ctx.device.fallback_ui && RowId::GamepadUi.extra_on(ctx.settings),
-        // The phone's own motor, gyro and SC2 dongle: only a handheld sends its screen
-        // (`ConsoleOptions::screen`), so a TV or a Mac never offers them.
-        RowId::PhoneRumble | RowId::PhoneGyro | RowId::Sc2Passthrough => {
+        // The phone's own motor, gyro and SC2 dongle, and its second screen: only a handheld
+        // sends its screen (`ConsoleOptions::screen`), so a TV or a Mac never offers them.
+        RowId::PhoneRumble | RowId::PhoneGyro | RowId::Sc2Passthrough | RowId::SecondScreen => {
             ctx.device.screen.is_some()
         }
         // A Mac window has no background session; Android and the other Apple devices do.
@@ -1561,7 +1595,7 @@ fn fresh_settings(device: &crate::screens::Device) -> pf_client_core::trust::Set
             s.vsync = false;
             set_extra_bool(&mut s, device_keys::SC2, false);
         }
-        Platform::Desktop | Platform::WebOS | Platform::Web => {}
+        Platform::Desktop | Platform::WebOS | Platform::Web | Platform::Tizen => {}
     }
     s
 }
@@ -1654,7 +1688,7 @@ fn row_icon(id: RowId) -> &'static str {
         }
         RowId::Resolution | RowId::ReduceUiResolution => "monitor",
         RowId::Refresh | RowId::Vsync | RowId::AllowVrr => "refresh-cw",
-        RowId::Bitrate | RowId::PadHaptics | RowId::PhoneRumble => "activity",
+        RowId::Bitrate | RowId::PadRumble | RowId::PadHaptics | RowId::PhoneRumble => "activity",
         RowId::VideoFit => "square",
         RowId::Compositor => "panel-right",
         RowId::Codec => "film",
@@ -1674,6 +1708,7 @@ fn row_icon(id: RowId) -> &'static str {
         | RowId::Controllers => "gamepad-2",
         RowId::SystemButtons | RowId::GuideGesture => "house",
         RowId::PhoneGyro => "rotate-cw",
+        RowId::SecondScreen => "monitor",
         RowId::Touch | RowId::CursorGestures => "pointer",
         RowId::Mouse => "mouse",
         RowId::QuickActions => "ellipsis",
@@ -1694,6 +1729,7 @@ fn row_icon(id: RowId) -> &'static str {
         RowId::ReduceMotion => "eye",
         RowId::AutoWake => "power",
         RowId::Version | RowId::Licenses => "info",
+        RowId::StreamControls => "keyboard",
         RowId::ShowAdvanced | RowId::AdvancedChanged => "wrench",
         RowId::StatsSize => "chart-column",
         RowId::ExitHint => "log-out",
@@ -1839,6 +1875,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         RowId::Controllers => return RowSpec::action("Controllers", true),
         // The count is the tab's; `SettingsScreen::spec` writes it in.
         RowId::AdvancedChanged => return RowSpec::action("Advanced settings changed", true),
+        RowId::StreamControls => return RowSpec::action("Stream controls", true),
         RowId::Licenses => return RowSpec::action("Open-source licences", true),
         RowId::QuickActions => return RowSpec::action("Quick actions", true),
         // Opens the cards: the value names the pick, no ‹ › to step it.
@@ -1871,7 +1908,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         RowId::Version => {
             return RowSpec {
                 label: "Version".into(),
-                value: Some(env!("CARGO_PKG_VERSION").into()),
+                value: Some(ctx.device.version.clone()),
                 ..RowSpec::default()
             };
         }
@@ -2036,6 +2073,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
             "Hold Select for guide",
             label_for(&GUIDE_GESTURE, &s.guide_gesture).into(),
         ),
+        RowId::PadRumble => (None, "Controller rumble", on_off(s.pad_rumble).into()),
         RowId::PadHaptics => (None, "Controller haptics", on_off(s.pad_haptics).into()),
         RowId::PadSpeaker => (
             None,
@@ -2126,6 +2164,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         ),
         RowId::AutoWake => (None, "Auto-wake on connect", on_off(s.auto_wake).into()),
         RowId::LowLatency => (None, "Low-latency mode", extra()),
+        RowId::SecondScreen => (None, "Second screen", extra()),
         RowId::PhoneRumble => (Some("This device"), "Rumble on this phone", extra()),
         RowId::PhoneGyro => (None, "Gyro from this phone", extra()),
         RowId::Sc2Passthrough => (None, "Steam Controller 2 passthrough", extra()),
@@ -2144,6 +2183,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         | RowId::Bluetooth
         | RowId::Controllers
         | RowId::AdvancedChanged
+        | RowId::StreamControls
         | RowId::Licenses
         | RowId::QuickActions
         | RowId::LibrarySections
@@ -2177,6 +2217,7 @@ fn row_enabled(id: RowId, s: &pf_client_core::trust::Settings) -> bool {
         RowId::AudioFormat => s.audio_channels == 2,
         RowId::Pad
         | RowId::PadType
+        | RowId::PadRumble
         | RowId::SystemButtons
         | RowId::GuideGesture
         | RowId::PadHaptics
@@ -2296,6 +2337,9 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
              the host's quick-access menu. Automatic arms it only where the real button \
              can't reach the host. A Select tap still goes through, slightly delayed."
         }
+        RowId::PadRumble => {
+            "Off, controllers don't vibrate from the stream or in the menus, whatever the game sends."
+        }
         RowId::PadHaptics => {
             "Play a DualSense's fine-grained haptics on the pad itself instead of plain \
              rumble. Negotiated — it changes nothing without a capable host and a wired pad."
@@ -2315,7 +2359,11 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
                  Ctrl+Alt+Shift+M switches live while streaming."
             }
             // No live chord to name: none of these hosts binds one.
-            Platform::Android | Platform::WebOS | Platform::Web | Platform::Apple => {
+            Platform::Android
+            | Platform::WebOS
+            | Platform::Web
+            | Platform::Apple
+            | Platform::Tizen => {
                 "How a physical mouse drives the host: Capture locks the pointer (relative, \
                  for games), Desktop leaves it free and sends absolute positions."
             }
@@ -2372,7 +2420,11 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
                 "How much the overlay shows: Compact (one line) → Normal → Detailed. \
                  Ctrl+Alt+Shift+S cycles it live while streaming."
             }
-            Platform::Android | Platform::WebOS | Platform::Web | Platform::Apple => {
+            Platform::Android
+            | Platform::WebOS
+            | Platform::Web
+            | Platform::Apple
+            | Platform::Tizen => {
                 "How much the overlay shows: Compact (one line) → Normal → Detailed."
             }
         },
@@ -2414,6 +2466,11 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
             "Feeds the decoder slice by slice as frames arrive and marks the media sockets \
              for priority. Off if a decoder shows artefacts under it."
         }
+        RowId::SecondScreen => {
+            "A smaller second screen — a dual-screen handheld's lower panel, a foldable half \
+             open — shows the companion panel, or the picture with Screens. Off leaves it to \
+             the system: for a phone on a TV."
+        }
         RowId::PhoneRumble => {
             "Also play controller 1's rumble on this phone's own motor — for a clip-on pad \
              with no motor. Costs battery."
@@ -2441,9 +2498,13 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
              the plain immediate left click."
         }
         RowId::GamepadUi => match platform {
-            // `row_on` offers this to Android, webOS and Apple; Desktop and Web are here
-            // for exhaustiveness, never to be read.
-            Platform::Desktop | Platform::Android | Platform::Web | Platform::Apple => {
+            // `row_on` offers this to Android, webOS and Apple; Desktop, Web and Tizen are
+            // here for exhaustiveness, never to be read.
+            Platform::Desktop
+            | Platform::Android
+            | Platform::Web
+            | Platform::Apple
+            | Platform::Tizen => {
                 "Front the app with this console instead of the touch interface. Off returns \
                  to the touch home immediately — switch it back on there."
             }
@@ -2453,7 +2514,11 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
             }
         },
         RowId::GamepadUiMode => match platform {
-            Platform::Desktop | Platform::Android | Platform::Web | Platform::Apple => {
+            Platform::Desktop
+            | Platform::Android
+            | Platform::Web
+            | Platform::Apple
+            | Platform::Tizen => {
                 "When this console fronts the app: whenever a controller is attached, or \
                  always — for a device that lives docked to a TV. The switch above turns it \
                  off altogether."
@@ -2466,6 +2531,9 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
         },
         RowId::Bluetooth => "Pair, connect or forget Bluetooth devices.",
         RowId::Controllers => "The controllers connected here, their grants and a rumble test.",
+        RowId::StreamControls => {
+            "The keys, controller chords and gestures that work while you stream."
+        }
         RowId::Licenses => "The open-source licences this app ships under.",
         RowId::LibrarySections => "Which sections the Games tab shows, and in what order.",
         RowId::Version => "This console's build.",
@@ -2663,6 +2731,7 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         RowId::PadType => step_str(&pad_types(platform), &mut s.gamepad, delta, wrap),
         RowId::SystemButtons => step_str(&SYSTEM_BUTTONS, &mut s.system_buttons, delta, wrap),
         RowId::GuideGesture => step_str(&GUIDE_GESTURE, &mut s.guide_gesture, delta, wrap),
+        RowId::PadRumble => toggle(&mut s.pad_rumble, delta, wrap),
         RowId::PadHaptics => toggle(&mut s.pad_haptics, delta, wrap),
         RowId::PadSpeaker => {
             // `"mix"` reads Off; a step writes only `"pad"` / `"off"`.
@@ -2721,6 +2790,7 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         }),
         RowId::AutoWake => toggle(&mut s.auto_wake, delta, wrap),
         RowId::LowLatency
+        | RowId::SecondScreen
         | RowId::PhoneRumble
         | RowId::PhoneGyro
         | RowId::Sc2Passthrough
@@ -2771,6 +2841,7 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         | RowId::Bluetooth
         | RowId::Controllers
         | RowId::AdvancedChanged
+        | RowId::StreamControls
         | RowId::Licenses
         | RowId::QuickActions
         | RowId::LibrarySections

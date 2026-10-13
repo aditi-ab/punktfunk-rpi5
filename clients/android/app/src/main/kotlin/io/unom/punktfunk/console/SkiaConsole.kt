@@ -42,6 +42,8 @@ import io.unom.punktfunk.kit.library.LibraryCache
 import io.unom.punktfunk.kit.link.StartScreen
 import io.unom.punktfunk.kit.link.host
 import io.unom.punktfunk.kit.library.GameEntry
+import io.unom.punktfunk.kit.library.InstallAction
+import io.unom.punktfunk.kit.library.InstallOutcome
 import io.unom.punktfunk.kit.library.LibraryClient
 import io.unom.punktfunk.kit.library.LibraryResult
 import io.unom.punktfunk.kit.library.RunningGame
@@ -103,6 +105,8 @@ object SkiaConsole {
     private val main = Handler(Looper.getMainLooper())
     private val ioPool = Executors.newCachedThreadPool { r -> Thread(r, "pf-console-io").apply { isDaemon = true } }
     private val artPool = Executors.newFixedThreadPool(3) { r -> Thread(r, "pf-console-art").apply { isDaemon = true } }
+    /** One thread, so pad lists reach the console in the order they were asked for. */
+    private val padPool = Executors.newSingleThreadExecutor { r -> Thread(r, "pf-console-pads").apply { isDaemon = true } }
     private var eventThread: Thread? = null
     private val running = AtomicBoolean(false)
 
@@ -244,9 +248,8 @@ object SkiaConsole {
             .put("entry", startEntry(initial, pendingLink, presets))
         // A phone's own shape leads the Aspect row; a TV's panel is a standard one.
         if (!io.unom.punktfunk.isTvDevice(app)) {
-            val (nw, nh, _) = io.unom.punktfunk.nativeDisplayMode(app)
-            val (sw, sh, _) = io.unom.punktfunk.safeDisplayMode(app)
-            opts.put("screen", JSONArray(listOf(nw, nh))).put("safe_area", JSONArray(listOf(sw, sh)))
+            val (panel, safe) = io.unom.punktfunk.panelScreens(app)
+            opts.put("screen", JSONArray(panel.toList())).put("safe_area", JSONArray(safe.toList()))
         }
         handle = runCatching { NativeBridge.nativeConsoleCreate(opts.toString()) }.getOrDefault(0L)
         if (handle == 0L) {
@@ -546,19 +549,27 @@ object SkiaConsole {
         }
     }
 
-    /** The connected controllers, for the chip + settings rows, plus pads with no `InputDevice`. */
+    /**
+     * The connected controllers, for the chip + settings rows, plus pads with no `InputDevice`.
+     * Built on [padPool]: each pad's battery and motor reads are binder calls into the input
+     * service, which can stall for seconds and must never hold the main thread.
+     */
     internal fun padsChanged(driving: InputDevice?, extras: List<ConsoleJson.ExtraPad> = emptyList()) {
-        if (handle == 0L) return
-        NativeBridge.nativeConsoleSetPads(
-            handle,
-            ConsoleJson.pads(
-                Gamepad.pads(),
-                driving ?: Gamepad.firstPad(),
-                extras,
-                appContext?.let(::deviceBodyVibrator),
-                ConsoleJson.otherInputs(),
-            ),
-        )
+        val h = handle
+        if (h == 0L) return
+        val app = appContext
+        padPool.execute {
+            NativeBridge.nativeConsoleSetPads(
+                h,
+                ConsoleJson.pads(
+                    Gamepad.pads(),
+                    driving ?: Gamepad.firstPad(),
+                    extras,
+                    app?.let(::deviceBodyVibrator),
+                    ConsoleJson.otherInputs(),
+                ),
+            )
+        }
     }
 
     /**
@@ -830,6 +841,7 @@ object SkiaConsole {
                     c.optJSONObject("SpeedTest")?.let(::speedTest)
                     c.optJSONObject("HostAction")?.let(::hostAction)
                     c.optJSONObject("EndGame")?.let(::endGame)
+                    c.optJSONObject("Install")?.let(::changeInstall)
                     c.optJSONObject("SaveHost")?.let(::saveHost)
                     c.optJSONObject("UpdateHost")?.let(::updateHost)
                     c.optJSONObject("ForgetHost")?.let(::forgetHost)
@@ -1007,8 +1019,31 @@ object SkiaConsole {
                 "Done",
                 JSONObject()
                     .put("throughput_kbps", p.throughputKbps)
-                    .put("loss_pct", p.lossPct)
-                    .put("recommended_kbps", p.recommendedKbps),
+                    .put("wall", p.wall)
+                    .put(
+                        "clean",
+                        p.clean?.let {
+                            JSONObject()
+                                .put("rate_kbps", it.rateKbps)
+                                .put("loss_pct", it.lossPct)
+                                .put("jitter_us", it.jitterUs)
+                        } ?: JSONObject.NULL,
+                    )
+                    .put("recommended_kbps", p.recommendedKbps)
+                    .put(
+                        "findings",
+                        org.json.JSONArray().also { arr ->
+                            p.findings.forEach { f ->
+                                arr.put(
+                                    JSONObject()
+                                        .put("id", f.id)
+                                        .put("severity", f.severity)
+                                        .put("numbers", org.json.JSONArray(f.numbers))
+                                        .put("profile", if (f.profile == 0) JSONObject.NULL else f.profile),
+                                )
+                            }
+                        },
+                    ),
             ).toString()
         }
         NativeBridge.nativeConsoleAdvanceSpeed(handle, key, json)
@@ -1054,6 +1089,30 @@ object SkiaConsole {
             main.post {
                 notice(outcome.notice(title))
                 fetchLibrary(c, refreshOnly = true)
+            }
+        }
+    }
+
+    /**
+     * Start, resume, pause or remove a title's download, say how it went, then re-read the host:
+     * the whole catalog after a removal (the title's tile turns to "not installed"), else `/status`.
+     */
+    private fun changeInstall(c: JSONObject) {
+        val addr = c.optString("addr"); val mgmt = c.optInt("mgmt"); val fp = c.optString("fp_hex")
+        val appId = c.optString("app_id"); val title = c.optString("title")
+        val action = runCatching { InstallAction.valueOf(c.optString("action")) }.getOrNull() ?: return
+        val id = identity
+        if (id == null) {
+            notice(identities.blockedMessage())
+            return
+        }
+        ioPool.execute {
+            val outcome =
+                LibraryClient.changeInstall(addr, mgmt, id.certPem, id.privateKeyPem, fp, appId, action)
+            main.post {
+                notice(outcome.notice(action, title))
+                val removed = outcome == InstallOutcome.Done && action == InstallAction.Remove
+                fetchLibrary(c, refreshOnly = !removed)
             }
         }
     }
@@ -1129,11 +1188,20 @@ object SkiaConsole {
         if (refreshOnly) {
             // Silent path — no notice, but the failed load still gets its retry.
             if (id == null) { identities.blockedMessage(); return }
+            // A newer fetch owns the shelf by the time a slow host answers: not its titles.
+            val gen = fetchGen.get()
             ioPool.execute {
-                val games = LibraryClient.fetchRunning(addr, mgmt, id.certPem, id.privateKeyPem, fp)
+                val status = LibraryClient.fetchStatus(addr, mgmt, id.certPem, id.privateKeyPem, fp)
+                val games = status.games
                 main.post {
                     if (handle == 0L) return@post
-                    NativeBridge.nativeConsoleLibraryRunning(handle, ConsoleJson.runningGames(games))
+                    if (gen == fetchGen.get()) {
+                        NativeBridge.nativeConsoleLibraryDownloads(
+                            handle,
+                            ConsoleJson.downloads(status.downloads, status.grants),
+                        )
+                        NativeBridge.nativeConsoleLibraryRunning(handle, ConsoleJson.runningGames(games))
+                    }
                     // The carousel behind the shelf shows the same fact from its own map; this
                     // answer is fresher than anything its TTL would fetch.
                     nowPlayingAt[fp] = android.os.SystemClock.elapsedRealtime()

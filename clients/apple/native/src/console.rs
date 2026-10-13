@@ -62,6 +62,9 @@ pub const PUNKTFUNK_CONSOLE_PUSH_LIBRARY_CACHED: u8 = 8;
 pub const PUNKTFUNK_CONSOLE_PUSH_LIBRARY_RUNNING: u8 = 9;
 /// `0` fresh, `1` waking, `2` offline.
 pub const PUNKTFUNK_CONSOLE_PUSH_LIBRARY_STALE: u8 = 10;
+/// `[{"app_id", "state", "done_bytes", …}]` — the host's downloads, pushed before the same
+/// read's [`PUNKTFUNK_CONSOLE_PUSH_LIBRARY_RUNNING`].
+pub const PUNKTFUNK_CONSOLE_PUSH_LIBRARY_DOWNLOADS: u8 = 19;
 /// `Settings` changed elsewhere; the shell reads it on its next mutation. Not a save.
 pub const PUNKTFUNK_CONSOLE_PUSH_SETTINGS: u8 = 11;
 /// `[{id, name, overrides}]` — the preset catalog.
@@ -184,8 +187,7 @@ pub unsafe extern "C" fn punktfunk_console_new(
         if mtl_device.is_null() || mtl_queue.is_null() {
             return std::ptr::null_mut();
         }
-        // The shell has no Apple row set yet; Android's is the nearest (touch, pads, phones).
-        let (opts, entry, store) = opts.into_console(Platform::Android);
+        let (opts, entry, store) = opts.into_console(Platform::Apple);
         let cache_bytes = opts.gpu_cache_bytes;
         // SAFETY: a live device and a queue on it, per this function's contract; Skia retains
         // both for the context's lifetime.
@@ -585,6 +587,8 @@ pub unsafe extern "C" fn punktfunk_console_push(
                 json::<Vec<pf_client_core::library::RunningGame>>(text)
                     .map(|v| library.set_running(&v))
             }
+            PUNKTFUNK_CONSOLE_PUSH_LIBRARY_DOWNLOADS => json::<pf_console_ui::DownloadsPush>(text)
+                .map(|p| library.set_downloads(&p.downloads, p.grants)),
             PUNKTFUNK_CONSOLE_PUSH_LIBRARY_STALE => {
                 json::<u8>(text).map(|v| library.set_stale(bridge::stale_code(v)))
             }

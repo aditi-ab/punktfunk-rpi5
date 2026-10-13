@@ -108,7 +108,8 @@ pub fn start(
     counters: Arc<crate::session_status::SessionCounters>,
     life: GameLifetime,
 ) {
-    let _ = std::thread::Builder::new()
+    let exited = media_exited.clone();
+    if std::thread::Builder::new()
         .name("punktfunk-video".into())
         .spawn(move || {
             crate::native::boost_thread_priority(true);
@@ -177,6 +178,7 @@ pub fn start(
                         .unwrap_or_default(),
                     client_name: (!client_label.is_empty()).then(|| client_label.clone()),
                     plane: crate::events::Plane::Gamestream,
+                    wire: 0,
                     hdr: cfg.hdr,
                     ttff_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
                     last_resize_ms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -244,7 +246,13 @@ pub fn start(
             tracing::info!("video stream stopped");
             // After capturer re-pool, lease, marker, events — `/resume` may start successors.
             media_exited.fetch_add(1, Ordering::SeqCst);
-        });
+        })
+        .is_err()
+    {
+        // Never started, so it will not count its exit: count it here, or every later
+        // launch waits out its deadline for this thread.
+        exited.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -320,7 +328,19 @@ fn run(
             claim: launch_claim,
             stamp: launch_stamp,
             prep: _prep,
-        } = crate::session_launch::prepare(target.as_ref(), &owner, &prep_cmds, &prep_env);
+            declined,
+            waiting: _waiting,
+        } = crate::session_launch::prepare(target.as_ref(), &owner, &prep_cmds, &prep_env, &|| {
+            life.quit.load(Ordering::Relaxed)
+        });
+        // The title's files never arrived: Moonlight has no notice channel, so stream without it.
+        let target = match declined {
+            Some(sentence) => {
+                tracing::warn!(reason = %sentence, "streaming without the launched title");
+                None
+            }
+            None => target,
+        };
         // Re-runnable: the encode loop calls it again on a mid-stream capture loss.
         let GsSource {
             mut capturer,
@@ -348,6 +368,7 @@ fn run(
                 isolation: None,
                 audio_sink: Default::default(),
             },
+            None,
         );
         tracing::info!(
             ?compositor,
@@ -873,6 +894,7 @@ fn gs_open_encoder(
                 enc_bps,
                 frame.is_cuda(),
                 gs_bit_depth(frame.format),
+                cfg.hdr,
                 // Stock Moonlight cannot decode 4:4:4.
                 encode::ChromaFormat::Yuv420,
                 cursor_blend,
@@ -1033,8 +1055,9 @@ fn spawn_packetizer(
 /// [`auto_burst_bytes`](crate::send_pacing::auto_burst_bytes); only IDR / scene-change overflow
 /// spreads at ~3× stream rate, bounded to ~2 frame intervals. Chunking is ≤ 12 steps, chunk ≥
 /// 16: every paced step ends in `thread::sleep` whose overshoot must stay bitrate-independent.
-/// Send failure ends the whole session via `on_lost` — audio would otherwise keep streaming at
-/// the dead endpoint.
+/// Moonlight cannot ask for a delivery profile, so `PUNKTFUNK_DELIVERY` is the only way to
+/// one here. Send failure ends the whole session via `on_lost` — audio would otherwise keep
+/// streaming at the dead endpoint.
 #[allow(clippy::too_many_arguments)]
 fn spawn_sender(
     sock: UdpSocket,
@@ -1053,6 +1076,8 @@ fn spawn_sender(
             crate::native::boost_thread_priority(false);
             let mut sent: u64 = 0;
             let mut dropped: u64 = 0;
+            let profile = crate::send_pacing::forced_delivery().unwrap_or_default();
+            let mut pacing = crate::send_pacing::Pacing::new(None);
             while let Ok(mut batch) = rx.recv() {
                 dropped += crate::send_pacing::inject_video_drop(&mut batch);
                 if batch.is_empty() {
@@ -1060,7 +1085,8 @@ fn spawn_sender(
                 }
                 let wire_bytes: usize = batch.iter().map(|p| p.len()).sum();
                 let pace_rate = pace_rate_bps.load(Ordering::Relaxed);
-                let burst_bytes = crate::send_pacing::auto_burst_bytes(pace_rate, wire_bytes);
+                pacing.update(pace_rate, frame_interval * 2, profile);
+                let burst_bytes = pacing.burst_bytes(wire_bytes);
                 let cfg = crate::send_pacing::PaceCfg {
                     burst_bytes: Some(burst_bytes),
                     chunk: crate::send_pacing::ChunkPolicy::Bounded {
@@ -1076,11 +1102,17 @@ fn spawn_sender(
                     overflow_bytes,
                     frame_interval * 2,
                 );
-                let r = crate::send_pacing::pace_frame(&batch, budget, &cfg, |chunk| {
-                    sendmmsg_all(&sock, chunk)?;
-                    sent += chunk.len() as u64;
-                    Ok::<(), std::io::Error>(())
-                });
+                let r = crate::send_pacing::pace_frame(
+                    &batch,
+                    budget,
+                    &cfg,
+                    pacing.clock.as_mut(),
+                    |chunk| {
+                        sendmmsg_all(&sock, chunk)?;
+                        sent += chunk.len() as u64;
+                        Ok::<(), std::io::Error>(())
+                    },
+                );
                 match r {
                     Ok(stat) => {
                         // A stalled reader must not grow this unbounded.
@@ -1769,7 +1801,8 @@ fn stream_body(
         }
         // Absolute clock. Behind a slow frame: resync to now rather than bursting to catch up.
         next_frame += frame_interval;
-        if crate::send_pacing::frame_driven_enabled() && capturer.supports_arrival_wait() {
+        let frame_driven = crate::send_pacing::frame_driven_enabled();
+        if frame_driven && capturer.supports_arrival_wait() {
             // 0.9× floor leaves jitter headroom; credit pins the long-run average so a faster
             // mirrored panel cannot overdrive the wire. +0.5× deadline keeps static-desktop
             // re-encode at ~1.5×interval (client liveness).
@@ -1784,6 +1817,10 @@ fn stream_body(
             capturer.wait_arrival(tick + frame_interval.mul_f32(1.5));
             // Arrivals are the clock; re-anchor so a rebuild back to fixed cadence stays sane.
             next_frame = Instant::now() + frame_interval;
+        } else if frame_driven && enc.ready_aus(next_frame).is_some() {
+            // An encoder that publishes its own access units: one landed or the period ran
+            // out. On its own phase the grid holds a finished AU for up to a period.
+            next_frame = Instant::now();
         } else {
             match next_frame.checked_duration_since(Instant::now()) {
                 Some(d) => std::thread::sleep(d),

@@ -20,8 +20,9 @@
 // Every unsafe block in this module carries a `// SAFETY:` proof (parent module enforces it).
 
 use super::vk_util::{
-    color_range, import_failure_feeds_latch, import_rgb_dmabuf, make_host_buffer, make_plain_image,
-    normalize_cpu_rgb, pixel_to_vk, reject_dmabuf, select_physical_device,
+    color_range, import_failure_feeds_latch, import_rgb_dmabuf, imported_acquire_barrier,
+    imported_release_barrier, make_host_buffer, make_plain_image, normalize_cpu_rgb, pixel_to_vk,
+    reject_dmabuf, select_physical_device,
 };
 use crate::pyrowave_ffi::{packetize, pw_check};
 use crate::pyrowave_wire::{AuStream, FrameBudget};
@@ -1543,10 +1544,11 @@ impl PyroWaveEncoder {
     /// always the right size, because `submit_frame` refuses a frame off the session mode.
     /// `fresh` is true only on first import.
     ///
-    /// One import per slot and no more. RADV lists every resident import in every
-    /// submission, and amdgpu then orders that submission behind whatever paints any of
-    /// them: an import of a buffer the producer is rendering into makes each encode wait on
-    /// that render, and the render on the encode.
+    /// A miss keeps only the imports that frames in flight read; a repeat hits the newest.
+    /// Every other buffer is back with the producer. RADV lists every resident import in
+    /// every submission, and amdgpu orders that submission against whatever paints any of
+    /// them: the producer's next render into a released buffer waits on this encode, or
+    /// this encode on it.
     unsafe fn import_cached(
         &mut self,
         d: &pf_frame::DmabufFrame,
@@ -1560,6 +1562,7 @@ impl PyroWaveEncoder {
             self.import_cache.push(e);
             return Ok((e.2, e.4, false));
         }
+        let t0 = std::time::Instant::now();
         // Deterministic import refusal rebuilds this capture on its safe offer.
         // Transient OOM stays out of the sticky verdict.
         let (img, mem, view) =
@@ -1571,14 +1574,15 @@ impl PyroWaveEncoder {
                 Err(e) => {
                     if import_failure_feeds_latch(&e) {
                         reject_dmabuf(d, &format!("{e:#}"));
+                        return Err(e.context(super::vk_util::ImportRejected));
                     }
                     return Err(e);
                 }
             };
-        // Least recently used first. Every frame in flight read its import after the victim
-        // was last used, so none samples the victim; one found in flight idles the device
-        // before it is destroyed.
-        while self.import_cache.len() >= SLOTS {
+        // Least recently used first. The frames in flight are the last ones submitted, so
+        // their imports are the newest entries and none is evicted; a victim found in flight
+        // still idles the device before it is destroyed.
+        while self.import_cache.len() > self.inflight.len() {
             let (dev, ino, oi, om, ov) = self.import_cache.remove(0);
             if self.inflight.iter().any(|f| f.src_key == Some((dev, ino))) {
                 let _ = self.device.device_wait_idle();
@@ -1590,6 +1594,7 @@ impl PyroWaveEncoder {
         self.import_cache.push((key.0, key.1, img, mem, view));
         tracing::debug!(
             resident = self.import_cache.len(),
+            miss_us = t0.elapsed().as_micros() as u64,
             "pyrowave: imported a new dmabuf buffer"
         );
         Ok((img, view, true))
@@ -1695,34 +1700,25 @@ impl PyroWaveEncoder {
 
             let cursor_pc = self.prep_cursor(slot, frame.cursor.as_ref())?;
 
-            let rgb_view = match &frame.payload {
+            let (rgb_view, imported) = match &frame.payload {
                 FramePayload::Dmabuf(d) => {
                     let (img, view, fresh) = self.import_cached(d, frame.width, frame.height)?;
-                    let (old, src_qf, dst_qf) = if fresh {
-                        (vk::ImageLayout::UNDEFINED, self.foreign_qfi, self.family)
-                    } else {
-                        (
-                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                            vk::QUEUE_FAMILY_IGNORED,
-                            vk::QUEUE_FAMILY_IGNORED,
-                        )
-                    };
-                    let acq = vk::ImageMemoryBarrier2::default()
-                        .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                        .src_access_mask(vk::AccessFlags2::NONE)
-                        .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                        .dst_access_mask(vk::AccessFlags2::SHADER_READ)
-                        .old_layout(old)
-                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                        .src_queue_family_index(src_qf)
-                        .dst_queue_family_index(dst_qf)
-                        .image(img)
-                        .subresource_range(color_range(0));
+                    // Fresh or cached, acquire from the producer's family: it rewrote the
+                    // buffer since. A cached one sits in GENERAL where the release left it.
+                    let acq = imported_acquire_barrier(
+                        img,
+                        fresh,
+                        self.foreign_qfi,
+                        self.family,
+                        vk::PipelineStageFlags2::COMPUTE_SHADER,
+                        vk::AccessFlags2::SHADER_READ,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    );
                     dev.cmd_pipeline_barrier2(
                         cmd,
                         &vk::DependencyInfo::default().image_memory_barriers(&[acq]),
                     );
-                    view
+                    (view, Some(img))
                 }
                 FramePayload::Cpu(bytes) => {
                     // 24-bpp Rgb/Bgr expands 3→4 first (`normalize_cpu_rgb`).
@@ -1781,7 +1777,7 @@ impl PyroWaveEncoder {
                         cmd,
                         &vk::DependencyInfo::default().image_memory_barriers(&[to_read]),
                     );
-                    view
+                    (view, None)
                 }
                 _ => bail!("pyrowave: unsupported FramePayload (need Dmabuf or Cpu RGB)"),
             };
@@ -1831,6 +1827,21 @@ impl PyroWaveEncoder {
                 dev.cmd_dispatch(cmd, w.div_ceil(8), h.div_ceil(8), 1);
             } else {
                 dev.cmd_dispatch(cmd, (w / 2).div_ceil(8), (h / 2).div_ceil(8), 1);
+            }
+            // The CSC was the source's last read: hand it back to the producer's family.
+            if let Some(img) = imported {
+                let rel = imported_release_barrier(
+                    img,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    self.family,
+                    self.foreign_qfi,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::AccessFlags2::SHADER_READ,
+                );
+                dev.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&[rel]),
+                );
             }
             if let Some(pool) = ts_pool {
                 dev.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::ALL_COMMANDS, pool, q0 + 1);

@@ -441,14 +441,16 @@ impl SimpleComponent for AppModel {
         let parked = PENDING_LINKS.with_borrow_mut(std::mem::take);
         // Where a bare launch opens (design/default-host.md). Only a bare one: `--connect`,
         // `--browse` and every headless verb have already exec'd or returned before the
-        // application object exists, and a parked link is explicit intent that wins outright.
+        // application object exists, and a link is explicit intent that wins outright. A link
+        // that launched this process is not parked yet: GApplication's `open` follows startup.
+        let bare = parked.is_empty() && crate::cli::deep_link_arg().is_none();
         let console_home = cfg!(feature = "console")
             && crate::shots::shot_scene().is_none()
             && model.store.settings().gamepad_ui() == GamepadUi::Always;
-        if parked.is_empty() && console_home {
+        if bare && console_home {
             // The console follows Start in itself.
             sender.input(AppMsg::OpenConsole);
-        } else if parked.is_empty() {
+        } else if bare {
             let settings = model.store.settings();
             let known = model.store.hosts();
             let (default, source) = start::default_host_with_source(&settings, &known);
@@ -680,8 +682,11 @@ fn clear_steam_sdl_device_filter() {
 
 pub fn run() -> glib::ExitCode {
     // Logs to stdout and the ring "Send logs to host" uploads. The spawned session's stderr
-    // joins the ring too, so a bundle carries the stream's trail.
-    pf_client_core::logring::init_tracing(std::io::stdout, true);
+    // joins the ring too, so a bundle carries the stream's trail. Colour only on a terminal.
+    pf_client_core::logring::init_tracing(
+        std::io::stdout,
+        std::io::IsTerminal::is_terminal(&std::io::stdout()),
+    );
     // Steam launches its shortcuts with SDL_GAMECONTROLLER_IGNORE_DEVICES naming every
     // physical pad Steam Input has virtualized; the Settings controller list needs the
     // real devices (same rationale as the session binary).
@@ -900,9 +905,18 @@ fn store_health_banner(pages: &[adw::ToolbarView], store: &Store) {
     store.subscribe(move |_| check());
 }
 
-/// The Keyboard Shortcuts dialog: this window's keys, then the session window's, kept here
-/// as discoverable documentation.
+/// The Keyboard Shortcuts dialog: this window's keys, then the session window's, then the
+/// controller chords and touch gestures, which have no accelerator to draw.
 pub fn shortcuts_dialog() -> adw::ShortcutsDialog {
+    let dialog = adw::ShortcutsDialog::new();
+    for section in shortcut_sections() {
+        dialog.add(section);
+    }
+    dialog
+}
+
+fn shortcut_sections() -> Vec<adw::ShortcutsSection> {
+    use pf_client_core::shortcuts;
     let shell = adw::ShortcutsSection::new(Some("This window"));
     for (title, action, _) in ACCELS {
         shell.add(adw::ShortcutsItem::from_action(title, action));
@@ -923,15 +937,50 @@ pub fn shortcuts_dialog() -> adw::ShortcutsDialog {
             "Mute or unmute your microphone (only while the stream sends one)",
             "<Control><Alt><Shift>v",
         ),
-        (
-            "Open the quick actions dial (a pad opens it with Select + A, and aims it with the left stick)",
-            "<Control><Alt><Shift>o",
-        ),
+        ("Open the quick actions dial", "<Control><Alt><Shift>o"),
+        ("Switch the mouse mode", "<Control><Alt><Shift>m"),
     ] {
         stream.add(adw::ShortcutsItem::new(title, accel));
     }
-    let dialog = adw::ShortcutsDialog::new();
-    dialog.add(shell);
-    dialog.add(stream);
-    dialog
+    let mut sections = vec![shell, stream];
+    // The keyboard group is the sections above; the rest read from the shared list.
+    for g in shortcuts::groups(shortcuts::Client::Desktop, true)
+        .into_iter()
+        .filter(|g| g.title != "Keyboard")
+    {
+        let section = adw::ShortcutsSection::new(Some(g.title));
+        for i in g.items {
+            let item = adw::ShortcutsItem::new(i.text, "");
+            item.set_subtitle(i.keys);
+            section.add(item);
+        }
+        sections.push(section);
+    }
+    sections
+}
+
+#[cfg(test)]
+mod shortcuts_tests {
+    /// Every section of the dialog holds items, and the controller chords are in it.
+    /// Needs a display and its own process:
+    /// `cargo test -p punktfunk-client-linux -- --ignored shortcuts_dialog_lists`.
+    #[test]
+    #[ignore = "needs a Wayland/X display"]
+    fn shortcuts_dialog_lists_the_controller_chords() {
+        use adw::prelude::*;
+        assert!(gtk::init().is_ok() && adw::init().is_ok(), "no display");
+        let _ = super::shortcuts_dialog();
+        let mut found = false;
+        for section in super::shortcut_sections() {
+            assert!(section.n_items() > 0, "{:?} is empty", section.title());
+            for i in 0..section.n_items() {
+                let item = section
+                    .item(i)
+                    .and_downcast::<adw::ShortcutsItem>()
+                    .unwrap();
+                found |= item.subtitle() == "Select + A";
+            }
+        }
+        assert!(found, "no Select + A row");
+    }
 }

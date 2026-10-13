@@ -83,7 +83,7 @@ exclude = [
 ndk = { path = "clients/android/native/vendor/ndk" }
 
 [workspace.package]
-version = "0.42.0"
+version = "0.43.1"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -175,6 +175,18 @@ codegen-units = 1
 # (`catch_unwind` → `PunktfunkStatus::Panic`). `panic = "abort"` would make that guard a
 # no-op and let a stray panic abort the embedding application. Unwinding keeps the
 # documented isolation guarantee real.
+
+# Canary CI raises codegen-units for workspace crates (scripts/ci/pf-version.sh). Dependencies
+# stay at 1, so their sccache entries are the ones a release tag build reuses.
+[profile.release.package."*"]
+codegen-units = 1
+
+# CI test builds: release code without LTO, so each test exe links fast. Its own target subdir,
+# so a test run never replaces the release binaries a later step packs.
+[profile.ci-test]
+inherits = "release"
+lto = false
+codegen-units = 16
 
 # The per-frame hot path must stay fast even in dev builds.
 [profile.dev.package."*"]

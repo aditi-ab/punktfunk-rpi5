@@ -39,6 +39,7 @@ restart*.
 | Browser origins | `PUNKTFUNK_WEBTRANSPORT_ORIGINS` | comma list | — | after a restart |
 | Encoder | `PUNKTFUNK_ENCODER` | `auto` · `nvenc` · `vaapi` · `vulkan` · `pyrowave` · `software` | `auto` | next session |
 | 10-bit and HDR | `PUNKTFUNK_10BIT` | `on` · `off` | `on` | next session |
+| Allow 10-bit SDR | `PUNKTFUNK_10BIT_SDR_WIDEN` | `on` · `off` | `off` | next session |
 | Full color 4:4:4 | `PUNKTFUNK_444` | `on` · `off` | `on` | next session |
 | Game frame limit (Linux) | `PUNKTFUNK_MAX_FPS` | 0–240 fps | `0` | next session |
 | Cursor capture (Linux) | `PUNKTFUNK_PORTAL_CURSOR_MODE` | `auto` · `embedded` · `metadata` · `hidden` | `auto` | next session |
@@ -56,7 +57,7 @@ restart*.
 | Voice chat apps (Linux, Windows) | `PUNKTFUNK_AUDIO_VOICE_APPS` | comma list | — | next session |
 | Controller speaker (Linux, Windows) | `PUNKTFUNK_PAD_AUDIO` | `on` · `off` | `on` | next session |
 | Audio redundancy | `PUNKTFUNK_AUDIO_REDUNDANCY` | `auto` · `on` · `off` | `auto` | next session |
-| Default gamepad (Linux, Windows) | `PUNKTFUNK_GAMEPAD` | `auto` · `xbox360` · `xboxone` · `xboxelite` · `dualsense` · `dualsenseedge` · `dualshock4` · `steamdeck` · `steamcontroller` · `steamcontroller2` · `switchpro` | `auto` | next session |
+| Default gamepad (Linux, Windows) | `PUNKTFUNK_GAMEPAD` | `auto` · `xbox360` · `xboxone` · `xboxelite` · `dualsense` · `dualsenseedge` · `dualshock4` · `steamdeck` · `steamcontroller` · `steamcontroller2` · `steamcontroller2puck` · `switchpro` · `joyconpair` · `switch2pro` · `switch2gamecube` · `8bitdoultimate2` · `8bitdopro2` · `8bitdopro3` · `horipadsteam` | `auto` | next session |
 | Pen input (Linux, Windows) | `PUNKTFUNK_PEN` | `on` · `off` | `on` | next session |
 | Steam USB gadget (Linux) | `PUNKTFUNK_STEAM_GADGET` | `auto` · `on` · `off` | `auto` | next session |
 | DualSense over USB/IP (Linux) | `PUNKTFUNK_DUALSENSE_USBIP` | `on` · `off` | `off` | next session |
@@ -66,7 +67,6 @@ restart*.
 | Adaptive sync (Linux) | `PUNKTFUNK_GAMESCOPE_VRR` | `on` · `off` | `on` | next session |
 | SDR brightness (Linux) | `PUNKTFUNK_GAMESCOPE_SDR_NITS` | 1–10000 nits | `203` | next session |
 | Extra refresh rates (Linux) | `PUNKTFUNK_GAMESCOPE_REFRESH_RATES` | comma list | — | next session |
-| Steam integration (Linux) | `PUNKTFUNK_GAMESCOPE_STEAM` | `on` · `off` | `off` | next session |
 | Startup splash (Linux) | `PUNKTFUNK_GAMESCOPE_SPLASH` | `on` · `off` | `on` | next session |
 | Per-session isolation (Linux) | `PUNKTFUNK_GAMESCOPE_ISOLATE` | `on` · `off` | `on` | next session |
 | Grab the cursor (Linux) | `PUNKTFUNK_GAMESCOPE_GRAB_CURSOR` | `on` · `off` | `off` | next session |
@@ -82,7 +82,8 @@ restart*.
 
 The table shows the Linux values. On Windows, **Encoder** takes `auto` · `nvenc` · `amf` · `qsv` ·
 `mf`, and **Default gamepad** takes `auto` · `xbox360` · `xboxone` · `xboxelite` · `dualsense` ·
-`dualsenseedge` · `dualshock4` · `steamdeck` · `steamcontroller2`. Older names still work:
+`dualsenseedge` · `dualshock4` · `steamdeck` · `steamcontroller2` · `switchpro` · `joyconpair` ·
+`8bitdoultimate2` · `8bitdopro2` · `8bitdopro3` · `horipadsteam`. Older names still work:
 `PUNKTFUNK_GS_ENCRYPT`, `PUNKTFUNK_GS_ADAPT`, `PUNKTFUNK_HOST_AUDIO=1` (**Where audio plays** =
 `host_and_client`) and `PUNKTFUNK_KEEP_DEFAULT=1` (= `follow_default`).
 
@@ -170,7 +171,7 @@ Env-only additions to the **Game Mode** rows above. See [gamescope](/docs/gamesc
 | `PUNKTFUNK_FEC_PCT` | `0`–`90` (percent) | Pins error correction and turns adaptive FEC off (normally 5–50 %, starting at 10 %). `0` disables it. On GameStream it sets the starting percent and floor instead. Leave it unset. |
 | `PUNKTFUNK_OH264_THREADS` | number (default `2`) | Software encoder threads. |
 | `PUNKTFUNK_OH264_GOP` | frames (default fps × 600) | Software encoder keyframe interval; `0` lets the encoder decide. |
-| `PUNKTFUNK_VDISPLAY_HZ_MULT` | `1`–`4` (default `1`) | Runs the virtual display at a multiple of the stream rate, so a frame waits less for the compositor's next paint. Costs GPU time. |
+| `PUNKTFUNK_VDISPLAY_HZ_MULT` | `1`–`4` (unset: `2` on Windows for streams up to 500 Hz, else `1`) | Runs the virtual display at a multiple of the stream rate, so a frame waits less for the compositor's next paint and a late frame never displaces the next one. The stream stays at its own rate. A game with V-Sync on renders at the display's rate unless something caps it. `1` turns it off. |
 | `PUNKTFUNK_NVENC_RAW` | `1` · `0` | NVIDIA on Linux: convert the captured buffer straight into NVENC's input, on by default. `0` uses the copy-and-blend path. |
 | `PUNKTFUNK_VULKAN_DIRECT_PLANES` | `1` · `0` | Vulkan Video on Linux: write the converted picture straight into the encoder where the driver allows, on by default. `0` keeps the extra copy. |
 
@@ -216,6 +217,7 @@ Env-only additions to the **Game Mode** rows above. See [gamescope](/docs/gamesc
 | `PUNKTFUNK_DSCP` | `1` · `0` | QoS marking on media packets. Default: on toward private-network clients, off toward internet addresses. `1` always, `0` never. |
 | `PUNKTFUNK_JUMBO` | `1` | Jumbo frames (about 9000-byte packets) on a wired LAN — see below. |
 | `PUNKTFUNK_WIRE_MTU` | on-wire MTU, e.g. `9000` or `1400` | Above 1500: jumbo frames at that size. Below 1500: smaller packets from the start, for a VPN or tunnel. Use the MTU your network adapter reports. |
+| `PUNKTFUNK_PROTOCOL` | `2` | Streams to clients that offer it over the `punktfunk/2` protocol, with video on the QUIC port instead of a second UDP port. A preview; clients that don't offer it keep `punktfunk/1`. |
 
 Jumbo frames need every NIC and switch on the path set to MTU `9000` first. The host probes the path
 and switches mid-session only once the client confirms; a path that can't carry them stays at
@@ -244,7 +246,9 @@ standard size. Native protocol only.
 |---|---|---|
 | `PUNKTFUNK_FRAME_DRIVEN` | `1` · `0` | Encode when a frame arrives instead of on a fixed tick, on by default. `0` restores the tick, which adds about half a frame of latency. |
 | `PUNKTFUNK_GSO` | `1` · `0` | UDP segmentation offload: less send CPU, but bursty on constrained links. On by default on Windows (needed past about 1 Gbps), off on Linux. |
+| `PUNKTFUNK_DELIVERY` | `burst` · `capped` · `smooth` | How each frame's packets leave, for every session. Unset, a client that asks for a paced stream gets one and every other session bursts. `capped` holds the burst under about 0.8 Gbit/s, for a host whose port is faster than the client's; `smooth` spreads every frame, which costs a few milliseconds per frame. |
 | `PUNKTFUNK_SPLIT_ENCODE` | `0` · `1` · `2` · `3` | NVENC split encode for very high pixel rates. Unset splits on its own from about 4K120; `1` forces a split, `2` and `3` force two or three ways, `0` never splits. |
+| `PUNKTFUNK_NVENC_CLOCK_BOOST` | `1` | Windows, NVIDIA: keeps the GPU at full clocks while a session is live. A stream alone leaves the card in its idle clocks, where each frame takes two to three times as long to encode. Off by default: it costs about 40 W on a high-end card for as long as someone is connected. |
 | `PUNKTFUNK_NVENC_SUBFRAME` | `0` · `1` | NVENC sub-frame readback for lower latency, on where the GPU supports it and the stream has more than one slice. `0` never, `1` on every multi-slice stream. |
 | `PUNKTFUNK_NVENC_SPLIT_ARBITRATE` | `1` | Lets NVENC change its split decision mid-session as the pixel rate moves. |
 | `PUNKTFUNK_PHASE_LOCK` | `0` | Stops timing frame submission to the client's display. Try it if frame pacing keeps cycling. |
@@ -281,11 +285,15 @@ Read by the Linux and Windows clients, the Decky plugin and the `punktfunk` CLI 
 | `PUNKTFUNK_CONFIG_DIR` | path | Where this client keeps its identity, saved hosts and settings (default `~/.config/punktfunk`, `%APPDATA%\punktfunk` on Windows). Empty is ignored. Moving it moves that identity, so paired hosts need pairing again. The Flatpak only sees `~/.config/punktfunk`. The private key is readable only by the account that created it. |
 | `PUNKTFUNK_AUDIO_HIRES` | `1` · `48000` · `96000` · `<rate>/<bits>` · `0` | Asks for lossless audio, over the client's audio-format setting: `1` is 96 kHz/24-bit, a bare rate is 24-bit, `48000/16` is the cheapest. `0` or empty forces Opus; anything else is ignored. The host's **Lossless audio** reads the same name as on/off. |
 | `PUNKTFUNK_NO_AEC` | `1` | Turn microphone echo cancellation off for this run. |
-| `PUNKTFUNK_PRESENT_MODE` | `mailbox` · `fifo` · `immediate` · `fifo_relaxed` | Vulkan present mode. With V-sync on the default is `mailbox`, else `fifo` (AMD's Windows driver has no mailbox); with V-sync off `immediate` comes first. |
+| `PUNKTFUNK_PRESENT_MODE` | `mailbox` · `fifo` · `immediate` · `fifo_relaxed` | Vulkan present mode. With V-sync on the default is `mailbox`, else `fifo` (AMD's Windows driver has no mailbox); in fullscreen on a driver whose surface offers `FIFO_LATEST_READY`, that mode comes first. With V-sync off `immediate` comes first, which on Wayland asks the compositor to tear. |
 | `PUNKTFUNK_PRESENTER` | `arrival` | Show frames the moment they decode, bypassing frame pacing. A diagnostic. |
 | `PUNKTFUNK_VRR_FIFO` | `1` | Follow a variable-refresh screen on a driver too old for the modern mode; costs latency on a fixed-refresh screen. The Detailed [stats overlay](/docs/stats) shows `vrr yes` when it works. |
 | `PUNKTFUNK_VRR_PACE` | `0` | Shows each frame as it arrives on a variable-refresh screen, instead of holding it a moment to even out the spacing. Try it if *Lowest latency* feels uneven on such a screen. |
-| `PUNKTFUNK_PRESENT_WAIT2` | `1` | Time frames with the newer `VK_KHR_present_wait2`. An experiment: on AMD's Windows driver it drops frames below the screen's refresh rate. |
+| `PUNKTFUNK_PRESENT_WAIT2` | `1` | Time frames with the newer `VK_KHR_present_wait2` where the driver's on-screen stamps are not in use (Linux turns it on with them). An experiment elsewhere: on AMD's Windows driver it drops frames below the screen's refresh rate. |
+| `PUNKTFUNK_PRESENT_TIMING` | `0` or `1` | Read each frame's on-screen time from the driver (`VK_EXT_present_timing`) instead of timing it from the client. On by default on Linux, where Mesa and NVIDIA offer it; `0` turns it off, `1` tries it elsewhere. The presenter's summary line says `glass=timing` when it is in use. |
+| `PUNKTFUNK_CLIENT_PHASE_LOCK` | `1` | Asks the host to time its frames to this display's refresh (off on desktops). An A/B: the host holds each frame for the lock, so compare end-to-end, not only the display figure. |
+| `PUNKTFUNK_SURFACE_FEEDBACK` | `0` | Linux: stop asking the compositor for its own on-screen time of each frame (`wp_presentation`), which also drops the window's game content tag. On by default; it is what the stats line's `scanout` / `composited` word reads, and what times frames on a Mesa without `VK_EXT_present_timing`. |
+| `PUNKTFUNK_SDR_8BIT` | `1` | Use an 8-bit window buffer for SDR instead of 10-bit. An A/B for compositors that scan out only 8-bit buffers. |
 | `PUNKTFUNK_FULLSCREEN_EXCLUSIVE` | `1` | Windows: take the screen with exclusive fullscreen (`VK_EXT_full_screen_exclusive`), so a variable-refresh screen follows the stream where the desktop would otherwise hold the window. An experiment; switching windows flickers. |
 | `PUNKTFUNK_PRESENT_DEBUG` | `1` | Windows: log the D3D11VA hand-off window every second. The presenter's own summary line is always logged. |
 | `PUNKTFUNK_THREAD_BOOST` | `0` | Leave the video threads (receive, decode, present) at normal priority instead of raising them. An A/B, and the way out if a driver misbehaves under a boosted thread. |
@@ -296,6 +304,7 @@ Read by the Linux and Windows clients, the Decky plugin and the `punktfunk` CLI 
 | `PUNKTFUNK_ABR_PROBE_KBPS` | kbps | Upper limit for the startup link measurement. |
 | `PUNKTFUNK_ABR_PROBE` | `0` | Skip the startup link measurement; Automatic then opens at the starting rate and climbs. |
 | `PUNKTFUNK_ABR_MAX_MBPS` | Mbps | Cap on Automatic's ceiling, for a client whose decoder can't keep up with what the link carries. |
+| `PUNKTFUNK_PROTOCOL` | `1` | Offers the host only `punktfunk/1`. By default the client offers `punktfunk/2` as well and the host picks; the host's own `PUNKTFUNK_PROTOCOL` decides. |
 
 ## Bitrate
 

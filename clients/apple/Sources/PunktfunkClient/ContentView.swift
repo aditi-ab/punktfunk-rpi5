@@ -122,7 +122,8 @@ struct ContentView: View {
     #endif
     /// The quick-action ring (design/touch-client-overlay.md §2), one per session. iOS opens it
     /// with the two-finger twist or the exit disc, tvOS with a short Back on the remote, macOS
-    /// with ⌃⌥⇧O or the Stream menu; a pad opens it with `Select+A` on all three (§2.5, §2.6).
+    /// with ⌃⌥⇧O or the Stream menu, an iPad keyboard with ⌃⌥⇧O; a pad opens it with `Select+A`
+    /// on all three (§2.5, §2.6).
     @StateObject private var ring = RingState()
 
     /// The ring this platform draws. macOS takes the DESKTOP default (no soft keyboard, no
@@ -304,6 +305,7 @@ struct ContentView: View {
                 LaunchHoldView(
                     entry: hold.entry, host: model.activeHost,
                     connecting: model.connection == nil, windowWait: model.launchWindowWait,
+                    download: model.launchDownload,
                     sourceRect: hold.sourceRect,
                     onShow: { model.revealStream() })
                     // Its own view per launch — a reused one keeps the last flight's state.
@@ -505,9 +507,9 @@ struct ContentView: View {
             disconnect: { model.disconnect() }))
         // ⌃⌥⇧A fired while input was CAPTURED (InputCapture's chord path posts it — the menu's
         // identical equivalent can't reach a captured stream). Same toggle either way. It names
-        // its session; iOS's one scene posts none.
+        // its session, so a second window's stream keeps its own mic state.
         .onReceive(NotificationCenter.default.publisher(for: .punktfunkToggleMicMute)) { note in
-            guard note.object == nil || note.object as AnyObject === model.connection else { return }
+            guard note.object as AnyObject === model.connection else { return }
             model.toggleMicMute()
         }
         #endif
@@ -1183,8 +1185,8 @@ struct ContentView: View {
                         name: .punktfunkRingOpen, object: NSNumber(value: open))
                     #endif
                 }
-                #if os(macOS)
-                // ⌃⌥⇧O while input is captured (InputCapture's monitor sees the chord first). It
+                #if !os(tvOS)
+                // ⌃⌥⇧O from InputCapture: the Mac's while captured, the iPad's in both states. It
                 // names its session; the Stream menu's item goes through `sessionFocus` instead.
                 .onReceive(NotificationCenter.default.publisher(
                     for: .punktfunkToggleQuickActions
@@ -1216,7 +1218,7 @@ struct ContentView: View {
                 let i = order.firstIndex(of: TouchInputMode.current(conn.settings)) ?? 0
                 TouchInputMode.sessionOverride = order[(i + 1) % order.count]
             },
-            keyboard: { NotificationCenter.default.post(name: .punktfunkToggleSoftKeyboard, object: nil) },
+            keyboard: { NotificationCenter.default.post(name: .punktfunkToggleSoftKeyboard, object: conn) },
             stats: { [model] in model.statsVerbosity },
             cycleStats: { [model] in model.cycleStats() },
             micAvailable: { [model] in model.micAvailable },

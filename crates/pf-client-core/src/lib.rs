@@ -57,6 +57,8 @@ pub mod library_cache;
 #[cfg(desktop)]
 pub mod art_cache;
 // Host power actions (`design/host-actions.md`). Android gets the row type and labels; ureq stays desktop-gated (Android uses OkHttp).
+/// A network check's findings in words, for every shell.
+pub mod findings;
 #[cfg(portable)]
 pub mod host_actions;
 // Log ring (note/render, std only) on every platform. `send_to_host` stays desktop-gated; Android posts via OkHttp (`SkiaConsole.sendLogs`).
@@ -97,10 +99,12 @@ pub mod overlay_actions;
 // sRGB mixes and WCAG contrast for every client theme, the console's included.
 pub mod rgb;
 pub mod ring;
+// The in-stream keys, chords and gestures, for each client's reference screen.
+pub mod shortcuts;
 // DualSense voice-coil + speaker on the pad's 4-ch device (0xD1 plane): correlation, per-session renderer, tier-A registry the gamepad worker feeds.
 #[cfg(desktop)]
 pub mod pad_audio;
-// Raw HID beside an SDL slot: Steam Controller 2 passthrough and the descriptor log.
+// Raw HID beside an SDL slot: Steam Controller 2 passthrough, the descriptor log, the DualSense Bluetooth audio writer.
 #[cfg(desktop)]
 mod sc2_capture;
 // Override catalog + connect-time resolver (`design/client-settings-profiles.md`). Bindings live on `trust`'s host records.

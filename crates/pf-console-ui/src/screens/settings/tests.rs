@@ -153,6 +153,7 @@ fn catalog_key(id: RowId) -> Option<&'static str> {
         RowId::Compositor => "compositor",
         RowId::Decoder => "decoder",
         RowId::LowLatency => "low_latency",
+        RowId::SecondScreen => "second_screen",
         RowId::Audio => "audio_channels",
         RowId::Mic => "mic_enabled",
         RowId::AudioFormat => "audio_format",
@@ -166,6 +167,7 @@ fn catalog_key(id: RowId) -> Option<&'static str> {
         RowId::QuickActions => "overlay_actions",
         RowId::CursorGestures => "cursor_gestures",
         RowId::PadType => "gamepad",
+        RowId::PadRumble => "pad_rumble",
         RowId::PhoneRumble => "rumble_on_phone",
         RowId::PhoneGyro => "gyro_on_phone",
         RowId::PadForward => "gamepad_forwarding",
@@ -1254,6 +1256,7 @@ fn platform_row_split_hides_only_the_other_platforms_concepts() {
             RowId::GamepadUi,
             RowId::GamepadUiMode,
             RowId::ReduceUiResolution,
+            RowId::SecondScreen,
             RowId::LowLatency,
             RowId::AudioRoute,
             RowId::CursorGestures,
@@ -1308,7 +1311,8 @@ fn every_platform_offers_rows() {
             | Platform::Android
             | Platform::WebOS
             | Platform::Web
-            | Platform::Apple => {}
+            | Platform::Apple
+            | Platform::Tizen => {}
         }
         let n = TABS
             .iter()
@@ -1317,6 +1321,39 @@ fn every_platform_offers_rows() {
             .count();
         assert!(n > 0, "{p:?} offers no settings rows at all");
     }
+}
+
+/// A Samsung set fronts the same page as the browser, so it answers the row tables exactly as
+/// Web does; it is held by a remote and must exit on Back at the root, so those two answers are
+/// the TV's. The codec row offers what the set decodes: no AV1, no PyroWave.
+#[test]
+fn tizen_is_web_with_a_remote_and_an_exit() {
+    use crate::glyphs::GlyphStyle;
+    use crate::platform::Platform;
+    for id in TABS.iter().flat_map(|(_, rows)| rows.iter()) {
+        assert_eq!(
+            row_on(*id, Platform::Tizen),
+            row_on(*id, Platform::Web),
+            "{id:?}: a packaged page offers what the page offers"
+        );
+    }
+    assert!(
+        Platform::Tizen.can_quit(),
+        "Back at the root exits a Samsung app"
+    );
+    assert!(!Platform::Web.can_quit());
+    assert_eq!(GlyphStyle::keys(Platform::Tizen), GlyphStyle::Remote);
+    assert_eq!(GlyphStyle::keys(Platform::Web), GlyphStyle::Keyboard);
+    let offered: Vec<&str> = codecs(Platform::Tizen).iter().map(|(id, _)| *id).collect();
+    assert_eq!(offered, ["auto", "hevc", "h264"]);
+    assert_eq!(
+        own_stats_corner(Platform::Tizen),
+        own_stats_corner(Platform::Web)
+    );
+    assert_eq!(
+        bitrate_ceiling_kbps(Platform::Tizen),
+        bitrate_ceiling_kbps(Platform::Web)
+    );
 }
 
 #[test]
@@ -1487,7 +1524,7 @@ fn every_row_has_exactly_one_tab() {
             seen.push(*id);
         }
     }
-    assert_eq!(seen.len(), 66, "{seen:?}");
+    assert_eq!(seen.len(), 69, "{seen:?}");
     assert!(
         !seen.contains(&RowId::AdvancedChanged),
         "built per tab, never listed"
@@ -1700,6 +1737,39 @@ fn palette_row_names_the_pick_and_opens_the_cards() {
     s.apply_row(ListMsg::Activate, None, &ids, &mut ctx, &mut fx);
     assert!(matches!(fx.nav, Some(crate::screens::Nav::Push(ref b))
         if matches!(**b, Screen::Palette(_))));
+}
+
+/// About lists the stream controls on every platform, and a press opens the read-only screen.
+#[test]
+fn about_opens_the_stream_controls_where_the_client_has_them() {
+    let mut settings = Settings::default();
+    let library = crate::library::LibraryShared::default();
+    let mut ctx = Ctx::test(&mut settings, &library);
+    let mut s = SettingsScreen::with_presets(Vec::new());
+    s.tab = TABS.len() - 1;
+    let ids = s.row_ids(&ctx);
+    s.list.cursor = ids
+        .iter()
+        .position(|r| *r == RowId::StreamControls)
+        .expect("About lists the stream controls");
+    let mut fx = Outbox::default();
+    s.apply_row(ListMsg::Activate, None, &ids, &mut ctx, &mut fx);
+    let Some(crate::screens::Nav::Push(b)) = fx.nav else {
+        panic!("a press opens the screen");
+    };
+    assert!(matches!(*b, Screen::Licenses(ref l) if l.title() == "Stream controls"));
+
+    for platform in crate::platform::Platform::ALL {
+        let mut settings = Settings::default();
+        let mut ctx = Ctx::test(&mut settings, &library);
+        let mut device = ctx.device.clone();
+        device.platform = platform;
+        ctx.device = &device;
+        assert!(
+            s.row_ids(&ctx).contains(&RowId::StreamControls),
+            "{platform:?}"
+        );
+    }
 }
 
 /// The value names where a launch will land, not what the key holds: with no
@@ -1921,4 +1991,34 @@ fn the_tv_pad_type_row_offers_only_what_it_creates() {
     for gone in ["xbox360", "steamdeck", "steamcontroller2"] {
         assert!(!seen.iter().any(|v| v == gone), "{gone} offered on the TV");
     }
+}
+
+/// webOS answers `LoadLicenses` like every other client, so its row opens the console's screen.
+#[test]
+fn the_licences_row_opens_the_console_screen_on_webos() {
+    let mut settings = Settings::default();
+    let library = crate::library::LibraryShared::default();
+    let webos = crate::screens::Device {
+        platform: crate::platform::Platform::WebOS,
+        ..crate::screens::Device::test()
+    };
+    let mut ctx = Ctx {
+        device: &webos,
+        ..Ctx::test(&mut settings, &library)
+    };
+    let mut s = SettingsScreen::with_presets(Vec::new());
+    s.tab = TABS
+        .iter()
+        .position(|(name, _)| *name == "About")
+        .expect("the About section");
+    let ids = s.row_ids(&ctx);
+    s.list.cursor = ids
+        .iter()
+        .position(|r| *r == RowId::Licenses)
+        .expect("webOS lists the licences");
+    let mut fx = Outbox::default();
+    s.apply_row(ListMsg::Activate, None, &ids, &mut ctx, &mut fx);
+    assert!(matches!(fx.nav, Some(crate::screens::Nav::Push(ref b))
+        if matches!(**b, Screen::Licenses(_))));
+    assert_eq!(fx.cmds, vec![crate::model::ConsoleCmd::LoadLicenses]);
 }

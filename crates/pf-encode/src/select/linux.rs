@@ -4,6 +4,8 @@
 
 use super::*;
 
+pub use crate::vk_util::anv_video_encode_flag;
+
 /// [`crate::open_video`]'s backend half.
 pub(crate) fn open(p: &OpenParams) -> Result<(Box<dyn Encoder>, &'static str)> {
     open_video_backend_linux(pf_host_config::config().encoder_pref.as_str(), p)
@@ -87,6 +89,7 @@ fn open_video_backend_linux(
         bitrate_bps,
         cuda,
         bit_depth,
+        hdr,
         chroma,
         ..
     } = *p;
@@ -96,7 +99,7 @@ fn open_video_backend_linux(
         {
             // Worker seam, not the encoder: GPU-priority needs `CAP_SYS_NICE`,
             // which only `punktfunk-encode-worker` may carry. See `pyrowave_remote`.
-            // `format.is_hdr()` marks the BT.2020 PQ capture — 10-bit without it is SDR.
+            // `hdr` is the session's BT.2020 PQ verdict — 10-bit without it is SDR.
             return pyrowave_remote::open_preferring_worker(
                 width,
                 height,
@@ -104,7 +107,7 @@ fn open_video_backend_linux(
                 bitrate_bps,
                 chroma,
                 bit_depth,
-                format.is_hdr(),
+                hdr,
             )
             .map(|e| (e, "pyrowave"));
         }
@@ -114,16 +117,17 @@ fn open_video_backend_linux(
              punktfunk-host/pyrowave (the advertisement bit should not have been set)"
         );
     }
-    // Default VAAPI. With `vulkan-encode` + `PUNKTFUNK_VULKAN_ENCODE`, HEVC/AV1
-    // opens Vulkan Video first; a failed open falls back
-    // so the stream does not die. `format`/`bit_depth`/`chroma` are VAAPI-only
-    // — Vulkan imports the dmabuf and does its own CSC.
-    let open_amd_intel = || -> Result<(Box<dyn Encoder>, &'static str)> {
+    // Default VAAPI. HEVC/AV1 open Vulkan Video first when the probe says yes, or always under
+    // a `vulkan` pin; a failed open falls back so the stream does not die, since the
+    // advertisement counts VAAPI's HEVC. Vulkan imports the dmabuf and does its own CSC.
+    let open_amd_intel = |pinned: bool| -> Result<(Box<dyn Encoder>, &'static str)> {
         // Vulkan when the device probe says yes (same profile query the open makes). Gamescope
         // has no embedded cursor — CSC blend is the only pointer path. A `no` goes to VAAPI here,
         // not a failed open. Vulkan gets `bit_depth`; the rule only picks the arm.
+        #[cfg(not(feature = "vulkan-encode"))]
+        let _ = pinned;
         #[cfg(feature = "vulkan-encode")]
-        if amd_intel_opens_vulkan(codec, bit_depth == 10, format.is_hdr()) {
+        if pinned || amd_intel_opens_vulkan(codec, bit_depth == 10, hdr) {
             match vulkan_video::VulkanVideoEncoder::open(
                 codec,
                 format,
@@ -133,6 +137,7 @@ fn open_video_backend_linux(
                 bitrate_bps,
                 p.cursor_blend,
                 bit_depth,
+                hdr,
             ) {
                 Ok(e) => {
                     tracing::info!(
@@ -149,8 +154,8 @@ fn open_video_backend_linux(
             }
         }
         // The native session takes every capture shape, NV12 dmabufs included.
-        // H.264 and HEVC; AV1 on AMD/Intel is Vulkan Video's. HDR is the packed 10-bit or P010
-        // capture; 10-bit SDR arrives as an 8-bit surface at depth 10.
+        // H.264 and HEVC; AV1 on AMD/Intel is Vulkan Video's. 10-bit SDR arrives as an 8-bit
+        // surface at depth 10, or as gamescope's own P010 / packed 10-bit.
         vaapi_native::NativeVaapiEncoder::open(
             codec,
             width,
@@ -159,7 +164,7 @@ fn open_video_backend_linux(
             bitrate_bps,
             bit_depth,
             chroma,
-            format.is_hdr(),
+            hdr,
         )
         .map(|e| (Box::new(e) as Box<dyn Encoder>, "vaapi-native"))
     };
@@ -167,7 +172,7 @@ fn open_video_backend_linux(
     // Same resolver the capability mirrors consult, so the alias table exists once.
     match resolve_linux_backend(pref, linux_auto_is_vaapi, cuda) {
         Some(LinuxBackend::Nvenc) => open_nvidia(),
-        Some(LinuxBackend::AmdIntel) => open_amd_intel(),
+        Some(LinuxBackend::AmdIntel) => open_amd_intel(false),
         Some(LinuxBackend::Vulkan) => {
             #[cfg(feature = "vulkan-encode")]
             {
@@ -176,17 +181,7 @@ fn open_video_backend_linux(
                         "the Vulkan Video encoder supports HEVC + AV1; the session negotiated {codec:?}"
                     );
                 }
-                vulkan_video::VulkanVideoEncoder::open(
-                    codec,
-                    format,
-                    width,
-                    height,
-                    fps,
-                    bitrate_bps,
-                    p.cursor_blend,
-                    bit_depth,
-                )
-                .map(|e| (Box::new(e) as Box<dyn Encoder>, "vulkan"))
+                open_amd_intel(true)
             }
             #[cfg(not(feature = "vulkan-encode"))]
             {
@@ -216,7 +211,7 @@ fn open_video_backend_linux(
                     bitrate_bps,
                     ChromaFormat::Yuv420,
                     bit_depth,
-                    format.is_hdr(),
+                    hdr,
                 )
                 .map(|e| (e, "pyrowave"))
             }
@@ -270,6 +265,7 @@ fn open_nvenc(p: &OpenParams) -> Result<Box<dyn Encoder>> {
             p.bitrate_bps,
             p.cuda,
             p.bit_depth,
+            p.hdr,
             p.chroma,
             p.cursor_blend,
             p.max_slices,
@@ -293,21 +289,35 @@ fn vulkan_encode_enabled() -> bool {
     pf_host_config::row_bool("PUNKTFUNK_VULKAN_ENCODE")
 }
 
-/// Whether `bit_depth`/`hdr` describes a frame a native planar source can carry: 8-bit SDR is
-/// NV12 and HDR is P010, but 10-bit SDR captures 8-bit packed RGB that must pass through the
-/// BT.709 widening CSC — native NV12 cannot be a P010 source there.
-const fn native_planar_depth_matches(bit_depth: u8, hdr: bool) -> bool {
-    bit_depth < 10 || hdr
+/// Whether a native planar source can carry this depth and colour: 8-bit SDR is NV12, HDR is
+/// P010, and so is 10-bit SDR from a producer that composites it (`sdr10_native`). Any other
+/// 10-bit SDR captures 8-bit packed RGB for the BT.709 widening CSC — native NV12 cannot be a
+/// P010 source there.
+const fn native_planar_depth_matches(bit_depth: u8, hdr: bool, sdr10_native: bool) -> bool {
+    bit_depth < 10 || hdr || sdr10_native
 }
 
 /// Whether this session can ingest a producer's own NV12 without a host pass. Both AMD/Intel
 /// lanes can: Vulkan Video imports it as its picture, the native libva session encodes it as
-/// imported. AV1 is Vulkan Video's alone. The NVENC lane's fused convert reads RGB only.
-pub fn linux_native_nv12_ok(codec: Codec, bit_depth: u8, hdr: bool) -> bool {
-    if !linux_zero_copy_is_vaapi() {
+/// imported. AV1 is Vulkan Video's alone there, and neither has a pass to blend a pointer
+/// into, so a `cursor_blend` session captures RGB. NVENC's raw lane copies the two planes into
+/// its own slot. It blends a pointer into NV12 but not P010, so a P010 session (HDR, or
+/// gamescope's 10-bit SDR) needs no blend.
+pub fn linux_native_nv12_ok(
+    codec: Codec,
+    bit_depth: u8,
+    hdr: bool,
+    cursor_blend: bool,
+    sdr10_native: bool,
+) -> bool {
+    if !native_planar_depth_matches(bit_depth, hdr, sdr10_native) {
         return false;
     }
-    if !native_planar_depth_matches(bit_depth, hdr) {
+    if !linux_zero_copy_is_vaapi() {
+        let p010 = hdr || (bit_depth == 10 && sdr10_native);
+        return !(p010 && cursor_blend) && codec != Codec::PyroWave && linux_nvenc_raw_dmabuf_ok();
+    }
+    if cursor_blend {
         return false;
     }
     match codec {
@@ -654,10 +664,12 @@ pub fn nvenc_codec_support() -> CodecSupport {
 ///
 /// Cached per selected GPU, like [`windows_codec_support`]: a console
 /// preference change moves the render node and the Vulkan device both probes
-/// open.
+/// open. The Vulkan encoding row keys it too: it applies at the next session.
 pub fn vaapi_codec_support() -> CodecSupport {
-    static CACHE: ProbeCache<String, CodecSupport> = OnceLock::new();
-    probe_cached(&CACHE, pf_gpu::selection_key(), probe_vaapi_codec_support)
+    static CACHE: ProbeCache<(String, bool), CodecSupport> = OnceLock::new();
+    let vulkan = pf_host_config::row_bool("PUNKTFUNK_VULKAN_ENCODE");
+    let key = (pf_gpu::selection_key(), vulkan);
+    probe_cached(&CACHE, key, probe_vaapi_codec_support)
 }
 
 /// The uncached half of [`vaapi_codec_support`].
@@ -919,14 +931,15 @@ mod tests {
         );
     }
 
-    /// Native-planar depth parity: 8-bit SDR (NV12) and HDR (P010) may take the
-    /// native source; 10-bit SDR must not — it captures 8-bit packed RGB for the
-    /// widening CSC and native NV12 cannot be a P010 source.
+    /// Native-planar depth parity: 8-bit SDR (NV12), HDR (P010) and a producer's own 10-bit
+    /// SDR (P010) may take the native source; any other 10-bit SDR must not — it captures
+    /// 8-bit packed RGB for the widening CSC and native NV12 cannot be a P010 source.
     #[test]
-    fn native_planar_depth_matches_excludes_ten_bit_sdr() {
-        assert!(native_planar_depth_matches(8, false));
-        assert!(native_planar_depth_matches(10, true));
-        assert!(!native_planar_depth_matches(10, false));
+    fn native_planar_depth_matches_excludes_widened_ten_bit_sdr() {
+        assert!(native_planar_depth_matches(8, false, false));
+        assert!(native_planar_depth_matches(10, true, false));
+        assert!(!native_planar_depth_matches(10, false, false));
+        assert!(native_planar_depth_matches(10, false, true));
     }
 
     /// Linux dispatch through the resolver, GPU-free via the software arm.
@@ -942,6 +955,7 @@ mod tests {
             bitrate_bps: 1_000_000,
             cuda: false,
             bit_depth: 8,
+            hdr: false,
             chroma: ChromaFormat::Yuv420,
             cursor_blend: false,
             max_slices: 4,
@@ -962,6 +976,34 @@ mod tests {
         assert!(err.to_string().contains("H.264"), "{err:#}");
     }
 
+    /// A `vulkan` pin the GPU can't open falls back to VAAPI rather than failing the session.
+    /// GPU-free: without a device the error must be VAAPI's, not Vulkan's.
+    #[cfg(feature = "vulkan-encode")]
+    #[test]
+    fn a_vulkan_pin_falls_back_to_vaapi() {
+        let hevc = OpenParams {
+            codec: Codec::H265,
+            format: PixelFormat::Bgrx,
+            width: 64,
+            height: 64,
+            fps: 30,
+            bitrate_bps: 1_000_000,
+            cuda: false,
+            bit_depth: 8,
+            hdr: false,
+            chroma: ChromaFormat::Yuv420,
+            cursor_blend: false,
+            max_slices: 4,
+        };
+        match open_video_backend_linux("vulkan", &hevc) {
+            Ok((_, label)) => assert!(matches!(label, "vulkan" | "vaapi-native"), "{label}"),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                assert!(msg.contains("libva") || msg.contains("VAAPI"), "{msg}");
+            }
+        }
+    }
+
     /// `auto` on an AMD/Intel box opens the native VAAPI session.
     #[test]
     #[ignore = "needs a real VAAPI device"]
@@ -975,6 +1017,7 @@ mod tests {
             bitrate_bps: 2_000_000,
             cuda: false,
             bit_depth: 8,
+            hdr: false,
             chroma: ChromaFormat::Yuv420,
             cursor_blend: false,
             max_slices: 32,

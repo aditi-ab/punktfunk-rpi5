@@ -46,6 +46,10 @@ export const SETTING_COPY: Record<string, Copy> = {
 		label: m.setting_ten_bit,
 		hint: m.setting_ten_bit_hint,
 	},
+	sdr10_widen: {
+		label: m.setting_sdr10_widen,
+		hint: m.setting_sdr10_widen_hint,
+	},
 	chroma_444: {
 		label: m.setting_chroma_444,
 		hint: m.setting_chroma_444_hint,
@@ -186,6 +190,14 @@ export const SETTING_COPY: Record<string, Copy> = {
 			steamcontroller: m.setting_gamepad_steamcontroller,
 			steamcontroller2: m.setting_gamepad_steamcontroller2,
 			switchpro: m.setting_gamepad_switchpro,
+			steamcontroller2puck: m.setting_gamepad_steamcontroller2puck,
+			joyconpair: m.setting_gamepad_joyconpair,
+			switch2pro: m.setting_gamepad_switch2pro,
+			switch2gamecube: m.setting_gamepad_switch2gamecube,
+			"8bitdoultimate2": m.setting_gamepad_8bitdoultimate2,
+			"8bitdopro2": m.setting_gamepad_8bitdopro2,
+			"8bitdopro3": m.setting_gamepad_8bitdopro3,
+			horipadsteam: m.setting_gamepad_horipadsteam,
 		},
 	},
 	pen: {
@@ -224,10 +236,6 @@ export const SETTING_COPY: Record<string, Copy> = {
 	gamescope_refresh_rates: {
 		label: m.setting_gamescope_refresh_rates,
 		hint: m.setting_gamescope_refresh_rates_hint,
-	},
-	gamescope_steam: {
-		label: m.setting_gamescope_steam,
-		hint: m.setting_gamescope_steam_hint,
 	},
 	gamescope_splash: {
 		label: m.setting_gamescope_splash,

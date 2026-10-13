@@ -300,6 +300,12 @@ const GAMEPADS: &[&str] = &[
     "dualshock4",
     "steamdeck",
     "steamcontroller2",
+    "switchpro",
+    "joyconpair",
+    "8bitdoultimate2",
+    "8bitdopro2",
+    "8bitdopro3",
+    "horipadsteam",
 ];
 #[cfg(not(target_os = "windows"))]
 const GAMEPADS: &[&str] = &[
@@ -313,9 +319,42 @@ const GAMEPADS: &[&str] = &[
     "steamdeck",
     "steamcontroller",
     "steamcontroller2",
+    "steamcontroller2puck",
     "switchpro",
+    "joyconpair",
+    "switch2pro",
+    "switch2gamecube",
+    "8bitdoultimate2",
+    "8bitdopro2",
+    "8bitdopro3",
+    "horipadsteam",
 ];
+// Windows builds the Puck as a cabled pad and both Switch 2 pads as a Switch Pro.
+#[cfg(target_os = "windows")]
 const GAMEPAD_SPELLINGS: &[(&str, &str)] = &[
+    ("steamcontroller2puck", "steamcontroller2"),
+    ("switch2pro", "switchpro"),
+    ("switch2gamecube", "switchpro"),
+    ("xbox", "xbox360"),
+    ("x360", "xbox360"),
+    ("series", "xboxone"),
+    ("ds", "dualsense"),
+    ("ps5", "dualsense"),
+    ("edge", "dualsenseedge"),
+    ("ds4", "dualshock4"),
+    ("ps4", "dualshock4"),
+    ("deck", "steamdeck"),
+    ("switch", "switchpro"),
+    ("sc2", "steamcontroller2"),
+    ("joycons", "joyconpair"),
+    ("hori", "horipadsteam"),
+];
+#[cfg(not(target_os = "windows"))]
+const GAMEPAD_SPELLINGS: &[(&str, &str)] = &[
+    ("joycons", "joyconpair"),
+    ("hori", "horipadsteam"),
+    ("gamecube", "switch2gamecube"),
+    ("sc2puck", "steamcontroller2puck"),
     ("xbox", "xbox360"),
     ("x360", "xbox360"),
     ("series", "xboxone"),
@@ -423,6 +462,7 @@ pub static SETTINGS: &[Setting] = &[
     // --- Video
     row("encoder", "PUNKTFUNK_ENCODER", Kind::Enum(ENCODERS), D::Str("auto"), Video, NextSession, "Encoder", "configuration").spellings(ENCODER_SPELLINGS),
     row("ten_bit", "PUNKTFUNK_10BIT", Kind::Bool, D::Bool(true), Video, NextSession, "10-bit and HDR", "hdr"),
+    row("sdr10_widen", "PUNKTFUNK_10BIT_SDR_WIDEN", Kind::Bool, D::Bool(false), Video, NextSession, "Allow 10-bit SDR", "hdr").advanced(),
     row("chroma_444", "PUNKTFUNK_444", Kind::Bool, D::Bool(true), Video, NextSession, "Full color 4:4:4", "configuration"),
     row("max_fps", "PUNKTFUNK_MAX_FPS", Kind::Int { min: 0, max: 240, unit: "fps" }, D::Int(0), Video, NextSession, "Game frame limit", "gamescope").only(LINUX),
     row("portal_cursor_mode", "PUNKTFUNK_PORTAL_CURSOR_MODE", Kind::Enum(&["auto", "embedded", "metadata", "hidden"]), D::Str("auto"), Video, NextSession, "Cursor capture", "configuration")
@@ -481,7 +521,6 @@ pub static SETTINGS: &[Setting] = &[
     row("gamescope_vrr", "PUNKTFUNK_GAMESCOPE_VRR", Kind::Bool, D::Bool(true), GameMode, NextSession, "Adaptive sync", "gamescope").advanced().only(LINUX),
     row("gamescope_sdr_nits", "PUNKTFUNK_GAMESCOPE_SDR_NITS", Kind::Int { min: 1, max: 10_000, unit: "nits" }, D::Int(203), GameMode, NextSession, "SDR brightness", "hdr").advanced().only(LINUX),
     row("gamescope_refresh_rates", "PUNKTFUNK_GAMESCOPE_REFRESH_RATES", Kind::List, D::List(&[]), GameMode, NextSession, "Extra refresh rates", "gamescope").advanced().only(LINUX),
-    row("gamescope_steam", "PUNKTFUNK_GAMESCOPE_STEAM", Kind::Bool, D::Bool(false), GameMode, NextSession, "Steam integration", "gamescope").advanced().only(LINUX),
     row("gamescope_splash", "PUNKTFUNK_GAMESCOPE_SPLASH", Kind::Bool, D::Bool(true), GameMode, NextSession, "Startup splash", "gamescope").advanced().only(LINUX),
     row("gamescope_isolate", "PUNKTFUNK_GAMESCOPE_ISOLATE", Kind::Bool, D::Bool(true), GameMode, NextSession, "Per-session isolation", "gamescope").advanced().only(LINUX),
     row("gamescope_grab_cursor", "PUNKTFUNK_GAMESCOPE_GRAB_CURSOR", Kind::Bool, D::Bool(false), GameMode, NextSession, "Grab the cursor", "gamescope").advanced().only(LINUX),
@@ -649,6 +688,15 @@ mod tests {
         assert_eq!(s.default.to_value(), Value::Bool(false));
         assert_eq!(s.apply, Apply::NextSession);
         assert_eq!(s.env, "PUNKTFUNK_STEAM_SEAT_SANDBOX");
+    }
+
+    /// No desktop delivers 10-bit SDR, so widening one costs a colour pass for no detail.
+    #[test]
+    fn widening_an_8_bit_desktop_to_10_bit_is_opt_in() {
+        let s = find("sdr10_widen").expect("the row exists");
+        assert_eq!(s.default.to_value(), Value::Bool(false));
+        assert_eq!(s.apply, Apply::NextSession);
+        assert_eq!(s.env, "PUNKTFUNK_10BIT_SDR_WIDEN");
     }
 
     #[test]

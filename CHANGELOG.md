@@ -14,9 +14,124 @@ short; the version-bump commit retitles it. Older sections stay as they are.
 
 ---
 
+## v0.43.1
+
+11 commits since v0.43.0. Wire stays 2, C ABI stays 43, driver protocol floor stays 9. gamescope
+moves to `+pfhdr31`. Windows hosts default to a virtual display at twice the stream rate and send
+mouse and keyboard through the virtual HID device.
+Deep dive: `git log v0.43.0..v0.43.1`
+
+### Versions
+
+| | v0.43.0 | v0.43.1 | Notes |
+|---|---|---|---|
+| Wire protocol | 2 | **2** | unchanged |
+| C ABI | 43 | **43** | unchanged; `include/` has no diff |
+| C headers | — | — | unchanged |
+| Rust edition / MSRV | 2024 / 1.85 | **2024 / 1.85** | unchanged |
+| Workspace crate dirs | 39 | **39** | unchanged |
+| Virtual-display driver protocol | 9 | **9** | unchanged; the driver encodes composed frames under a stream-rate credit and restamps presents toward the content's cadence |
+| Windows virtual-gamepad channel | 3 | **3** | unchanged |
+| Plugin index schema | 1 | **1** | unchanged |
+| Host event schema | 1 | **1** | unchanged |
+| `api/openapi.json` | 0.43.0 | **0.43.1** | version stamp only |
+| gamescope patch level (`+pfhdrN`) | 30 | **31** | patch 0034 aligns the NV12/P010 capture constants; `+pfhdr30` captures zeros on NVIDIA and Intel |
+| `@punktfunk/host` (SDK) | 0.3.3 | **0.3.3** | unchanged |
+| `@punktfunk/plugin-kit` | 0.11.0 | **0.11.0** | unchanged; the `launcher_ui` doc lists `hydra-big-picture` |
+
+### Breaking
+
+- None.
+
+### Knobs
+
+- Windows host: `PUNKTFUNK_VDISPLAY_HZ_MULT` unset is 2 for streams up to 500 Hz, else 1. `1`
+  restores the old display. The wire stays at the stream rate.
+- Windows host: mouse and keyboard go to the `pf_mouse` device as HID reports through a ring in its
+  shared section. A driver without the ring feature keeps SendInput. `PUNKTFUNK_HID_INPUT=0` keeps
+  every event on SendInput.
+- Plugins: `launcher_ui` takes `hydra-big-picture` on Linux and Windows hosts. An older host drops
+  that tile and keeps the games.
+
+---
+
+## v0.43.0
+
+419 commits since v0.42.0. Wire stays 2. **C ABI 43**: `PunktfunkProbeResult` grew. Driver protocol
+floor stays 9. punktfunk/2 arrives as a host opt-in.
+Deep dive: `git log v0.42.0..v0.43.0`
+
+### Versions
+
+| | v0.42.0 | v0.43.0 | Notes |
+|---|---|---|---|
+| Wire protocol | 2 | **2** | unchanged. punktfunk/2 is its own ALPN, `pkf2`: every client offers it beside `pkf1`, and only a host with `PUNKTFUNK_PROTOCOL=2` answers it |
+| C ABI | 42 | **43** | breaking for `punktfunk_connection_probe_result`: `PunktfunkProbeResult` gains `gap_p50_us`, `gap_p99_us`, `reorders` (64 → 72 bytes). Additive: `punktfunk_connection_network_check` with `PunktfunkHealthReport` / `PunktfunkHealthFinding`; `PunktfunkConnectOpts` gains `delivery_profile` and `delivery_flags` behind `struct_size` (120 → 128 bytes on 64-bit) |
+| C headers | — | — | `punktfunk_core.h` gains the delivery, host-facts and health constants and `PUNKTFUNK_GRANT_MANAGE_GAMES` (128); `PUNKTFUNK_GRANT_ALL` is 255. `punktfunk_console.h` gains `PUNKTFUNK_CONSOLE_PUSH_LIBRARY_DOWNLOADS` (19) |
+| Rust edition / MSRV | 2024 / 1.85 | **2024 / 1.85** | unchanged |
+| Workspace crate dirs | 39 | **39** | unchanged |
+| Virtual-display driver protocol | 9 | **9** | unchanged; wide-colour SDR input formats go only to a driver that declares them |
+| Windows virtual-gamepad channel | 3 | **3** | unchanged |
+| Plugin index schema | 1 | **1** | unchanged |
+| Host event schema | 1 | **1** | unchanged; kind `downloads.changed` joins |
+| `api/openapi.json` | 0.42.0 | **0.43.0** | `/downloads`, `/library/install/{id}` (+ `/pause`, `/cancel`), `/library/provider/{provider}/downloads`; `/status` carries the device's `grants`, `downloads` and each session's `wire` |
+| gamescope patch level (`+pfhdrN`) | 24 | **30** | upstream 3.16.31. The `.deb` is built with libei (pkgrel 2) and bundles wlroots for Debian 13 |
+| `@punktfunk/host` (SDK) | 0.3.3 | **0.3.3** | unchanged; the tree's download types, `prepareEmulator` and `sseFrames` abort ship with the next SDK cut |
+| `@punktfunk/plugin-kit` | 0.9.0 | **0.11.0** | `serveUi({ install })`, `downloadReporter`, `ProviderEntry.install`, install handlers on `defineLibraryPlugin`. Peer `@punktfunk/host` stays ^0.3.0 |
+
+### Breaking
+
+- **C ABI 43.** Rebuild against the new header. An app on the 42 header passes a 64-byte
+  `PunktfunkProbeResult`; the version check refuses the 0.43 library instead of overrunning it.
+- **10-bit SDR is a host opt-in.** A client's 10-bit SDR ask gets 8-bit unless the host sets
+  `PUNKTFUNK_10BIT_SDR_WIDEN=on` (Allow 10-bit SDR). Windows 11 24H2 wide colour and gamescope
+  `+pfhdr26` deliver real 10-bit without it.
+- **No legacy RSA native identity (#201).** The host mints `native-cert.pem` when it is missing;
+  native clients of such a host re-pair once. GameStream keeps RSA. The `cert.pem` fallbacks in
+  the tray, `ctl`, the plugin SDK and the runner ACL stay for older hosts.
+- **`PUNKTFUNK_GRANT_ALL` is 255.** A stored 127 (Full control before Manage downloads) is lifted
+  to Full. Compare against the constant, not a literal.
+- **pf-console-ui drops `ConsoleCmd::OpenPlatformScreen` and `PlatformScreen`.** A shell that
+  matched them deletes its arm.
+- **The forced gamescope `--steam` setting is gone.** `PUNKTFUNK_GAMESCOPE_STEAM` is ignored, and
+  a stored value stays in `host-settings.json` unread.
+
+### Knobs
+
+- Host: `PUNKTFUNK_PROTOCOL=2` answers punktfunk/2 (preview). `PUNKTFUNK_DELIVERY=burst|capped|smooth`
+  pins every session's packet delivery; unset, a client's ask decides. `PUNKTFUNK_NVENC_CLOCK_BOOST=1`
+  holds NVIDIA clocks while encoding (about 40 W). `PUNKTFUNK_GAMESCOPE_FLATPAK_SHIM=0` turns off
+  the bwrap shim for Flatpak Steam shortcuts. `PUNKTFUNK_FRAME_DRIVEN=0` also restores the tick for
+  a Windows driver-encoded frame. `PUNKTFUNK_IDD_FLOW=1` logs presents per process against driver
+  frames.
+- Windows driver: `PFVD_AMF_NV12` and `PFVD_QSV_NV12` force the old NV12 input paths.
+- Intel: the host adds `video-encode` to `ANV_DEBUG` on Mesa 26.2 and newer, keeping your flags.
+- Client: `PUNKTFUNK_PROTOCOL=1` offers punktfunk/1 only. `PUNKTFUNK_CLIENT_PHASE_LOCK=1` opts into
+  the host phase lock. `PUNKTFUNK_PRESENT_TIMING` (on by default on Linux) reads on-glass time from
+  `VK_EXT_present_timing`. `PUNKTFUNK_SURFACE_FEEDBACK=1` logs the compositor's stamp beside it;
+  `PUNKTFUNK_SDR_8BIT=1` picks an 8-bit SDR window buffer.
+- CLI: `punktfunk-tray --start-host`; the client's `network-check`; `hosts add --fp` takes only 64
+  hex digits; one-shot `ctl` verbs time out after 15 s.
+- Discovery and status: the native mDNS advert and `probe --discover` carry `wire` (`1,2` or `1`).
+- Management: plain HTTP on the management port answers `GET /api/v1/webtransport` alone, with
+  CORS, while the browser plane runs. The browser plane tunnels the API at `/mgmt` and serves
+  punktfunk/2 at `/pf2`. A host with Browser origins set admits a session that sends no Origin.
+- Android kit JNI: `nativeNetworkCheck(handle): DoubleArray?`, `nativeConsoleLibraryDownloads`,
+  and the dual-screen `nativePictureWindow`, `nativePictureSurfaceSize`, `nativePictureCrop`,
+  `nativePictureShown`, `nativeVideoStatsSample`.
+- pf-console-ui: `ConsoleOptions::version`, `pf_console_ui::VERSION`, `Platform::Tizen` and the
+  bridge's `CreateOptions.tizen`.
+- Packaging: `punktfunk-host` depends on `punktfunk-gamescope` on Arch and recommends it in deb and
+  RPM (not Ubuntu 24.04). Linux packages install a Punktfunk Host launcher. Ubuntu ships an
+  AppArmor profile for the plugin runner; extra paths go in `local/punktfunk-scripting`. The RPM
+  spec has a `debuginfo` bcond. Nix gains `lib.packagesWith` and builds the host, client and
+  gamescope against the system's nixpkgs.
+
+---
+
 ## v0.42.0
 
-98 commits since v0.41.0. Wire stays 2. **C ABI 42**, additive. Driver protocol floor stays 9.
+104 commits since v0.41.0. Wire stays 2. **C ABI 42**, additive. Driver protocol floor stays 9.
 Deep dive: `git log v0.41.0..v0.42.0`
 
 ### Versions

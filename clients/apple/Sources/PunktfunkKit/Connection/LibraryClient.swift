@@ -100,10 +100,12 @@ public struct GameEntry: Codable, Hashable, Identifiable, Sendable {
     public var players: Int?
     /// Host play stats; `nil` until the host has launched the title once.
     public var stats: GameStats?
+    /// A title a plugin installs; `nil` is installed, as every other title is.
+    public var install: TitleInstall?
 
     private enum CodingKeys: String, CodingKey {
         case id, store, title, art, launch, role, icon, platform
-        case developer, publisher, genres, description, tags, players, stats
+        case developer, publisher, genres, description, tags, players, stats, install
         case releaseYear = "release_year"
     }
 
@@ -138,6 +140,126 @@ public struct GameEntry: Codable, Hashable, Identifiable, Sendable {
         case "gog": return "GOG"
         case "xbox": return "Xbox"
         default: return "Game"
+        }
+    }
+}
+
+/// A title's files on the host, from the library entry's `install`.
+public struct TitleInstall: Codable, Hashable, Sendable {
+    /// `installed` or `missing`; a word this build doesn't know reads as installed.
+    public var state: String
+    /// The download size while missing, the size on disk once installed.
+    public var sizeBytes: UInt64?
+    /// Free space where the download goes.
+    public var freeBytes: UInt64?
+
+    public init(state: String, sizeBytes: UInt64? = nil, freeBytes: UInt64? = nil) {
+        self.state = state
+        self.sizeBytes = sizeBytes
+        self.freeBytes = freeBytes
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case state
+        case sizeBytes = "size_bytes"
+        case freeBytes = "free_bytes"
+    }
+
+    public var missing: Bool { state == "missing" }
+}
+
+/// What a title menu offers for a title's files; at most one applies. The rules and words are the
+/// Rust client's (`pf_client_core::library::InstallAction`).
+public enum InstallAction: String, Sendable {
+    case install = "Install", pause = "Pause", resume = "Resume", remove = "Remove"
+
+    /// The one row, if any. `nil` grants (an older host) allow starting a download only.
+    public static func forTitle(
+        _ install: TitleInstall?, download: HostDownload?, grants: UInt32?
+    ) -> InstallAction? {
+        guard let install else { return nil }
+        let launch = grants.map { $0 & PunktfunkConnection.grantLaunch != 0 } ?? true
+        let manage = grants.map { $0 & PunktfunkConnection.grantManageGames != 0 } ?? false
+        let action: InstallAction
+        switch download?.state {
+        case "queued", "downloading": action = .pause
+        case "installing": return nil
+        case "paused": action = .resume
+        case "done": action = .remove
+        default: action = install.missing ? .install : .remove
+        }
+        let allowed = action == .install || action == .resume ? launch : manage
+        return allowed ? action : nil
+    }
+
+    /// The menu row: `Install · 26 GB (212 GB free)`, `Remove download · 26 GB`.
+    public func label(_ install: TitleInstall?) -> String {
+        let size = install?.sizeBytes.map(HostDownload.bytes)
+        switch self {
+        case .install:
+            switch (size, install?.freeBytes.map(HostDownload.bytes)) {
+            case let (size?, free?): return "Install \u{b7} \(size) (\(free) free)"
+            case let (size?, nil): return "Install \u{b7} \(size)"
+            default: return "Install"
+            }
+        case .pause: return "Pause download"
+        case .resume: return "Resume download"
+        case .remove: return size.map { "Remove download \u{b7} \($0)" } ?? "Remove download"
+        }
+    }
+
+    var verb: String { rawValue.lowercased() }
+}
+
+/// A tile's mark for a title's files; an installed title has none. Same words as the Rust tiles.
+public struct TileBadge: Equatable, Sendable {
+    /// `download`, `pause` or `alert`.
+    public var icon: String
+    /// `42 %`, `26 GB`, `Not installed`, `Queued`.
+    public var text: String
+
+    public static func forTitle(_ install: TitleInstall?, download: HostDownload?) -> TileBadge? {
+        let pct = { (d: HostDownload) in
+            d.fraction.map { "\(Int(($0 * 100).rounded(.down))) %" } ?? "Queued"
+        }
+        if let d = download, d.live { return TileBadge(icon: "download", text: pct(d)) }
+        if let d = download, d.state == "paused" { return TileBadge(icon: "pause", text: pct(d)) }
+        if download?.state == "failed" { return TileBadge(icon: "alert", text: "Not installed") }
+        guard let install, install.missing else { return nil }
+        return TileBadge(
+            icon: "download", text: install.sizeBytes.map(HostDownload.bytes) ?? "Not installed")
+    }
+}
+
+/// What asking the host to change a title's files came to. The Rust client's `InstallOutcome`.
+public enum InstallOutcome: Equatable, Sendable {
+    case done
+    /// 403/404/409 with the host's own sentence.
+    case refused(String)
+    /// A host without the route.
+    case unsupported
+    case failed(String)
+
+    /// An answer: the host's sentence when it sent one, else the route is missing.
+    public static func from(status: Int, message: String?) -> InstallOutcome {
+        if (200..<300).contains(status) { return .done }
+        if let message, !message.isEmpty { return .refused(message) }
+        if [401, 404, 405].contains(status) { return .unsupported }
+        return .failed("the host refused it (\(status))")
+    }
+
+    /// The player-facing line.
+    public func notice(_ action: InstallAction, title: String) -> String {
+        switch self {
+        case .done:
+            switch action {
+            case .install, .resume: return "Downloading \(title)."
+            case .pause: return "Paused \(title)'s download."
+            case .remove: return "Removed \(title). Saves stay on the host."
+            }
+        case .refused(let why): return why
+        case .unsupported: return "This host needs an update to manage games from here."
+        case .failed(let why): return "Couldn't \(action.verb) \(title) \u{2014} \(why)"
         }
     }
 }
@@ -188,6 +310,99 @@ public enum LibraryError: LocalizedError {
 /// A deliberately partial mirror of the host's `ActiveGame`: only the fields a client can act on.
 /// The console's own view of this payload carries more (which session, which plane, the grace
 /// countdown), and none of that is a player's business from the library screen.
+/// One title's download, from `GET /api/v1/status` `downloads[]`. Its words match the Rust and
+/// Kotlin shells', so a report quotes one line whichever client it came from.
+public struct HostDownload: Codable, Hashable, Sendable {
+    public var appID: String
+    /// `queued` | `downloading` | `paused` | `installing` | `done` | `failed` | `cancelled`.
+    public var state: String
+    public var doneBytes: UInt64
+    public var totalBytes: UInt64?
+    public var rateBps: UInt64?
+    public var etaS: UInt64?
+    /// The plugin's words: `File 2 of 3`, `Verifying`.
+    public var phase: String?
+    public var error: String?
+
+    public init(
+        appID: String, state: String, doneBytes: UInt64 = 0, totalBytes: UInt64? = nil,
+        rateBps: UInt64? = nil, etaS: UInt64? = nil, phase: String? = nil, error: String? = nil
+    ) {
+        self.appID = appID
+        self.state = state
+        self.doneBytes = doneBytes
+        self.totalBytes = totalBytes
+        self.rateBps = rateBps
+        self.etaS = etaS
+        self.phase = phase
+        self.error = error
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case appID = "app_id"
+        case state
+        case doneBytes = "done_bytes"
+        case totalBytes = "total_bytes"
+        case rateBps = "rate_bps"
+        case etaS = "eta_s"
+        case phase, error
+    }
+
+    /// Making progress, or expected to: a launch waits on it.
+    public var live: Bool { state == "queued" || state == "downloading" || state == "installing" }
+
+    /// 0–1 of the total, when the total is known.
+    public var fraction: Double? {
+        guard let total = totalBytes, total > 0 else { return nil }
+        return min(1, Double(doneBytes) / Double(total))
+    }
+
+    /// `12.3 GB of 26 GB · 48 MB/s · about 4 min left`, `Installing…`.
+    public var line: String {
+        switch state {
+        case "queued": return "Waiting for its turn to download\u{2026}"
+        case "installing": return phase ?? "Installing\u{2026}"
+        default: break
+        }
+        var parts = [
+            totalBytes.flatMap { $0 > 0 ? $0 : nil }.map {
+                "\(HostDownload.bytes(doneBytes)) of \(HostDownload.bytes($0))"
+            } ?? "\(HostDownload.bytes(doneBytes)) so far",
+        ]
+        if state == "downloading" {
+            if let rate = rateBps { parts.append("\(HostDownload.bytes(rate))/s") }
+            if let eta = etaS {
+                parts.append(
+                    eta < 60 ? "less than a minute left"
+                        : eta < 3600 ? "about \((eta + 30) / 60) min left"
+                        : "about \(eta / 3600) h \((eta % 3600) / 60) min left")
+            }
+        }
+        return parts.joined(separator: " \u{b7} ")
+    }
+
+    /// Why a launch that waited on it didn't start the title; nil while it may still.
+    public func stopped(title: String) -> String? {
+        switch state {
+        case "failed": return error.map { "\(title) didn't download \u{2014} \($0)" } ?? "\(title) didn't download."
+        case "cancelled": return "\(title)'s download was cancelled."
+        case "paused": return "\(title)'s download was paused. Start it again to resume."
+        default: return nil
+        }
+    }
+
+    /// Decimal units, as stores count: `12.3 GB`, `48 MB`, `512 kB`.
+    public static func bytes(_ n: UInt64) -> String {
+        let v = Double(n)
+        let (value, unit) = v >= 1e9 ? (v / 1e9, "GB") : v >= 1e6 ? (v / 1e6, "MB") : (v / 1e3, "kB")
+        let rounded = (value * 10).rounded() / 10
+        if value >= 100 || rounded.truncatingRemainder(dividingBy: 1) == 0 {
+            return "\(Int(value.rounded())) \(unit)"
+        }
+        return String(format: "%.1f %@", rounded, unit)
+    }
+}
+
 public struct RunningGame: Codable, Hashable, Sendable {
     /// Store-qualified library id (`steam:570`) — the key that lines this up with a `GameEntry`.
     /// Absent for an operator-typed GameStream command, which has no catalog entry behind it.
@@ -421,14 +636,69 @@ public enum LibraryClient {
         keyPEM: String,
         hostFingerprint: Data?
     ) async -> [RunningGame] {
+        await status(
+            address: address, port: port, certPEM: certPEM, keyPEM: keyPEM,
+            hostFingerprint: hostFingerprint
+        ).games
+    }
+
+    /// `GET /api/v1/status`: the launched titles and the host's downloads, kept apart because a
+    /// launch the host declined over its download has no game row left to carry it. Best-effort,
+    /// as ``running(address:port:certPEM:keyPEM:hostFingerprint:)``.
+    public static func status(
+        address: String,
+        port: UInt16 = punktfunkDefaultMgmtPort,
+        certPEM: String,
+        keyPEM: String,
+        hostFingerprint: Data?
+    ) async -> (games: [RunningGame], downloads: [HostDownload], grants: UInt32?) {
         guard let identity = try? clientIdentity(certPEM: certPEM, keyPEM: keyPEM),
               let response = try? await send(
                   path: "/api/v1/status", address: address, port: port,
                   identity: identity, hostFingerprint: hostFingerprint),
               response.status == 200,
               let status = try? JSONDecoder().decode(HostStatus.self, from: response.body)
-        else { return [] }
-        return status.games ?? []
+        else { return ([], [], nil) }
+        return (status.games ?? [], status.downloads ?? [], status.grants)
+    }
+
+    /// Start, resume, pause or remove a title's download (`/api/v1/library/install/{id}`). Never
+    /// throws: every outcome is something to tell the player.
+    public static func changeInstall(
+        appID: String,
+        action: InstallAction,
+        address: String,
+        port: UInt16 = punktfunkDefaultMgmtPort,
+        certPEM: String,
+        keyPEM: String,
+        hostFingerprint: Data
+    ) async -> InstallOutcome {
+        var allowed = CharacterSet.urlPathAllowed
+        allowed.remove("/")
+        let id = appID.addingPercentEncoding(withAllowedCharacters: allowed) ?? appID
+        let path = "/api/v1/library/install/\(id)"
+        do {
+            let identity = try clientIdentity(certPEM: certPEM, keyPEM: keyPEM)
+            let response: HTTPResponse
+            switch action {
+            case .install, .resume:
+                response = try await send(
+                    path: path, address: address, port: port, identity: identity,
+                    hostFingerprint: hostFingerprint, body: (Data(), "application/json"))
+            case .pause:
+                response = try await send(
+                    path: path + "/pause", address: address, port: port, identity: identity,
+                    hostFingerprint: hostFingerprint, body: (Data(), "application/json"))
+            case .remove:
+                response = try await send(
+                    path: path, address: address, port: port, identity: identity,
+                    hostFingerprint: hostFingerprint, delete: true)
+            }
+            let json = try? JSONSerialization.jsonObject(with: response.body) as? [String: Any]
+            return .from(status: response.status, message: json?["message"] as? String)
+        } catch {
+            return .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+        }
     }
 
     /// Upload this client's recent log (`ClientLogRing`) to the host — `POST /api/v1/client-logs`,
@@ -556,8 +826,11 @@ public enum LibraryClient {
     /// Just the slice of `/status` this client reads. Everything else on that payload is the
     /// operator console's business, and decoding only what we use keeps an unrelated schema change
     /// on the host from breaking the library screen.
-    private struct HostStatus: Decodable {
+    struct HostStatus: Decodable {
         var games: [RunningGame]?
+        var downloads: [HostDownload]?
+        /// This device's live grants; absent from a host that predates the field.
+        var grants: UInt32?
     }
 
     private struct HostActionList: Decodable {
@@ -591,9 +864,15 @@ public enum LibraryClient {
     static func send(
         path: String, address: String, port: UInt16,
         identity: SecIdentity, hostFingerprint: Data?,
-        body: (data: Data, contentType: String)? = nil
+        body: (data: Data, contentType: String)? = nil,
+        delete: Bool = false
     ) async throws -> HTTPResponse {
         do {
+            if delete {
+                return try await MgmtTransport.delete(
+                    host: address, port: port, path: path,
+                    identity: identity, pinnedHostFingerprint: hostFingerprint)
+            }
             if let body {
                 return try await MgmtTransport.post(
                     host: address, port: port, path: path, body: body.data,

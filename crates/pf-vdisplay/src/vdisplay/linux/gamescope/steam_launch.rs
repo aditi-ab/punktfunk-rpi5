@@ -5,7 +5,8 @@ use super::*;
 use std::process::Stdio;
 
 /// Run `cmd` inside the live session (managed / SteamOS / attach — [`spawn()`]'s nesting does not
-/// apply). Best-effort display env from a process already inside; without it, host env (a
+/// apply). `DISPLAY` and gamescope's socket come from a process already inside, Wayland and GTK
+/// from [`shape_flatpak_command`] and [`GDK_X11`]; with no such process, host env (a
 /// `steam steam://…` still reaches the running Steam over its pipe).
 pub fn launch_into_session(
     cmd: &str,
@@ -28,8 +29,10 @@ pub fn launch_into_session(
             );
             Some(hold_launch_until_steam_up(&uri, &log, from))
         });
+    let flatpak = shape_flatpak_command(cmd);
     let mut c = Command::new("sh");
-    c.arg("-c").arg(held.as_deref().unwrap_or(cmd));
+    c.arg("-c")
+        .arg(held.as_deref().or(flatpak.as_deref()).unwrap_or(cmd));
     // Keeps AppImageLauncher's binfmt hook from replacing an .AppImage with its dialog.
     c.env("APPIMAGELAUNCHER_DISABLE", "1");
     // A kept seat's Steam answers on its own `steam.pipe`; without this the forwarder hands the
@@ -48,7 +51,13 @@ pub fn launch_into_session(
             if let Some(d) = x11 {
                 c.env("DISPLAY", d);
             }
-            c.env("WAYLAND_DISPLAY", NESTED_WAYLAND_DISPLAY);
+            if let Some(gs) = gamescope {
+                c.env("GAMESCOPE_WAYLAND_DISPLAY", gs);
+            }
+            c.env_remove("WAYLAND_DISPLAY");
+            if flatpak.is_none() {
+                c.env(GDK_X11.0, GDK_X11.1);
+            }
         }
         None => tracing::warn!(
             command = %cmd,
@@ -171,6 +180,40 @@ fn cgroup_is_punktfunk_owned(cgroup: &str) -> bool {
 /// First token, not a `steam://` URI: a bare `steam -gamepadui` needs the instance free more, not less.
 pub(crate) fn is_steam_launch(cmd: &str) -> bool {
     cmd.split_whitespace().next() == Some("steam")
+}
+
+/// Pins GTK to gamescope's Xwayland. GTK tries Wayland first and, with `WAYLAND_DISPLAY` unset,
+/// opens `wayland-0`: on a desktop box, the desktop's socket, a window the stream never shows.
+pub(super) const GDK_X11: (&str, &str) = ("GDK_BACKEND", "x11");
+
+/// Points a flatpak at gamescope's socket under a `wayland-` name. Flatpak reads an unset
+/// `WAYLAND_DISPLAY` as `wayland-0`, the desktop's; from 1.19 it reads any other name that way too.
+pub(super) const FLATPAK_WAYLAND: &str = "ln -sfn \"$GAMESCOPE_WAYLAND_DISPLAY\" \
+    \"$XDG_RUNTIME_DIR/wayland-$GAMESCOPE_WAYLAND_DISPLAY\" 2>/dev/null; \
+    export WAYLAND_DISPLAY=\"wayland-$GAMESCOPE_WAYLAND_DISPLAY\"; ";
+
+/// `cmd` with gamescope's Wayland socket ([`FLATPAK_WAYLAND`]) and `--socket=x11` on its
+/// `flatpak run`; `None` when it runs no flatpak. Flatpak withholds X11 from a `fallback-x11`
+/// app once any Wayland socket is there.
+///
+/// Every other launch keeps `WAYLAND_DISPLAY` unset, as gamescope does: pressure-vessel rewrites
+/// any value to `wayland-0`, which Proton's Wayland switch and the WSI layer both act on.
+pub(super) fn shape_flatpak_command(cmd: &str) -> Option<String> {
+    // Exec templates single-quote every element; desktop entries name `/usr/bin/flatpak`.
+    let word = |t: &str| t.trim_matches('\'').to_string();
+    let run = cmd
+        .split_whitespace()
+        .skip_while(|t| word(t).rsplit('/').next() != Some("flatpak"))
+        .skip(1)
+        .find(|t| !word(t).starts_with('-'))
+        .filter(|t| word(t) == "run")?;
+    // `run` is a subslice of `cmd`, so its end is a char boundary of `cmd`.
+    let at = run.as_ptr() as usize - cmd.as_ptr() as usize + run.len();
+    Some(format!(
+        "{FLATPAK_WAYLAND}{} --socket=x11{}",
+        &cmd[..at],
+        &cmd[at..]
+    ))
 }
 
 /// May `cmd` take the seat's env? Only a launch that talks to that seat's own Steam. A Lutris,
@@ -478,6 +521,57 @@ mod tests {
         assert!(is_steam_launch("steam"));
         // A command that merely mentions steam elsewhere is not a Steam client launch.
         assert!(!is_steam_launch("mygame --steam-overlay"));
+    }
+
+    #[test]
+    fn only_flatpak_gets_gamescopes_wayland_socket() {
+        let shaped = |cmd| shape_flatpak_command(cmd);
+        let socket = FLATPAK_WAYLAND;
+        assert_eq!(shaped("steam -gamepadui steam://rungameid/1145350"), None);
+        assert_eq!(shaped("lutris lutris:rungameid/42"), None);
+        assert_eq!(shaped("flatpak-spawn --host mygame"), None);
+        assert_eq!(shaped("flatpak update -y"), None);
+        assert_eq!(
+            shaped("flatpak run com.heroicgameslauncher.hgl"),
+            Some(format!(
+                "{socket}flatpak run --socket=x11 com.heroicgameslauncher.hgl"
+            ))
+        );
+        // The export reaches the whole compound command, not only its first word.
+        assert_eq!(
+            shaped("cd '/mnt/games' && 'flatpak' 'run' 'net.rpcs3.RPCS3' '--no-gui'"),
+            Some(format!(
+                "{socket}cd '/mnt/games' && 'flatpak' 'run' --socket=x11 'net.rpcs3.RPCS3' \
+                 '--no-gui'"
+            ))
+        );
+        // A flatpak desktop entry's `Exec=`, field codes stripped, behind a global option.
+        assert_eq!(
+            shaped("/usr/bin/flatpak --user run --branch=stable org.xonotic.Xonotic"),
+            Some(format!(
+                "{socket}/usr/bin/flatpak --user run --socket=x11 --branch=stable \
+                 org.xonotic.Xonotic"
+            ))
+        );
+    }
+
+    /// Flatpak 1.19 honours only a `wayland-*` name: the prefix must leave one that reaches
+    /// gamescope's socket.
+    #[test]
+    fn the_flatpak_prefix_links_a_wayland_name_to_gamescope() {
+        let dir = std::env::temp_dir().join(format!("pf-gs-wl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(format!("{FLATPAK_WAYLAND}printf %s \"$WAYLAND_DISPLAY\""))
+            .env("GAMESCOPE_WAYLAND_DISPLAY", "gamescope-7")
+            .env("XDG_RUNTIME_DIR", &dir)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "wayland-gamescope-7");
+        let link = std::fs::read_link(dir.join("wayland-gamescope-7")).unwrap();
+        assert_eq!(link, std::path::Path::new("gamescope-7"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

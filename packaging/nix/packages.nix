@@ -81,8 +81,7 @@ let
     inherit src version;
     strictDeps = true;
 
-    # One vendor tree for every package, built explicitly: buildPackage would hand
-    # `overrideVendorGitCheckout` (a function) to mkDerivation as an env var.
+    # One vendor tree for every package, built once and shared.
     cargoVendorDir = craneLib.vendorCargoDeps {
       inherit src;
       outputHashes = {
@@ -91,20 +90,6 @@ let
         "git+https://github.com/unom-io/usbfs-iso?rev=f3de1fd62cec271d07f45664dc464f23e423e721#f3de1fd62cec271d07f45664dc464f23e423e721" =
           "sha256-RWQgE6AHnvXKwbBRw0dVavZy0TLngCs3C+OZENqYG2c=";
       };
-      # hermir embeds `catalog/` from its repo root (`../../../catalog`), and crane vendors only
-      # the crate directory. Copy the catalog into the crate and point the includes at the copy.
-      overrideVendorGitCheckout =
-        ps: drv:
-        if lib.any (p: p.name == "hermir") ps then
-          drv.overrideAttrs (old: {
-            postPatch = (old.postPatch or "") + ''
-              cp -r catalog crates/hermir/catalog
-              substituteInPlace crates/hermir/src/catalog.rs \
-                --replace-fail '"../../../catalog/' '"../catalog/'
-            '';
-          })
-        else
-          drv;
     };
 
     # nixpkgs ships CMake ≥ 4, which errors on `cmake_minimum_required(VERSION <3.5)`. Several
@@ -219,6 +204,10 @@ in
         install -Dm0644 packaging/linux/io.unom.Punktfunk.Tray.desktop \
           "$out/etc/xdg/autostart/io.unom.Punktfunk.Tray.desktop"
         substituteInPlace "$out/etc/xdg/autostart/io.unom.Punktfunk.Tray.desktop" \
+          --replace-fail "/usr/bin/punktfunk-tray" "$out/bin/punktfunk-tray"
+        install -Dm0644 packaging/linux/io.unom.Punktfunk.StartHost.desktop \
+          "$out/share/applications/io.unom.Punktfunk.StartHost.desktop"
+        substituteInPlace "$out/share/applications/io.unom.Punktfunk.StartHost.desktop" \
           --replace-fail "/usr/bin/punktfunk-tray" "$out/bin/punktfunk-tray"
         for sz in 22x22 48x48; do
           for png in packaging/linux/icons/hicolor/$sz/apps/*.png; do

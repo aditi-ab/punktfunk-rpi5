@@ -15,11 +15,9 @@
 # derivation is `gamescope.unwrapped` — patching the wrapper would be a no-op, so this asserts on
 # it rather than silently shipping an unpatched binary.
 #
-# Version drift: the patches are applied to whatever gamescope your nixpkgs pins, NOT to the
-# commit `packaging/gamescope/build-punktfunk-gamescope.sh` names. Both hunks sit in code that has
-# been stable across the 3.16 series (`src/pipewire.cpp`'s format builders, `paint_pipewire()` in
-# `src/steamcompmgr.cpp`), so this normally just works — and when it does not, the build fails
-# loudly at `patchPhase` rather than producing a gamescope that quietly cannot do HDR.
+# `gamescope` is the recipe from the flake's pinned nixpkgs, called with the system's libraries
+# (flake.nix). Its NixOS patches and postPatch match the source pinned below; another release's
+# recipe patches files our source does not have, and nixos-26.05's fails at patchPhase.
 #
 # ⚠️ Kept deliberately free of any dependency on the pinned rev. The pin moved past upstream's
 # `vulkan_get_rgb10_capture_format()` (`ff6b924`, after 3.16.25) to fix red/blue on NVIDIA, and it
@@ -55,14 +53,14 @@ let
   #
   # Bumping this: move the rev, then `nix-prefetch-git --url https://github.com/ValveSoftware/gamescope
   # --rev <new> --fetch-submodules` for the hash, and keep packaging/gamescope/README.md in step.
-  pfRev = "5fb8dce4a09d0a68d097b9faf9513782106bc843";
-  pfVersion = "3.16.25-11-g5fb8dce";
+  pfRev = "6867f509874f9bc52e12d6f4c4596cdf0d5be6b4";
+  pfVersion = "3.16.31";
   pfSrc = fetchFromGitHub {
     owner = "ValveSoftware";
     repo = "gamescope";
     rev = pfRev;
     fetchSubmodules = true;
-    hash = "sha256-pGBiO+7LSdIc0k9K+SQnv/Og2DYD/cjvOImxIl91L2A=";
+    hash = "sha256-mCCf/CfKBqxNvmRbaAJsOMrnnRutPr9nEePHmAq/PUM=";
   };
   # As of nixos-unstable (checked 2026-07-28) `gamescope` IS the buildable derivation — pname
   # "gamescope", version 3.16.25, carrying `src`/`patches`/`mesonFlags`. Revisions that wrap it

@@ -50,6 +50,7 @@ struct MsghdrX {
 // Hand-written Darwin `msghdr_x` (`libc` has none). A wrong offset hands the
 // kernel a bad pointer or length. 32-bit fields pad before the following
 // pointers — easy to get wrong silently.
+#[cfg(target_vendor = "apple")]
 const _: () = {
     use std::mem::{offset_of, size_of};
     assert!(size_of::<MsghdrX>() == 56);
@@ -161,4 +162,32 @@ pub(super) fn recv_batch(
         }
     }
     Ok(got)
+}
+
+/// Block until `socket` has a datagram to read or `timeout` passes; `true` when readable. An
+/// interrupted wait reads as a timeout: the caller loops anyway.
+#[cfg(feature = "quic")]
+pub(crate) fn wait_readable(
+    socket: &std::net::UdpSocket,
+    timeout: std::time::Duration,
+) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let mut pfd = libc::pollfd {
+        fd: socket.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+    // SAFETY: `pfd` is one initialised pollfd that outlives the call, and its fd stays open
+    // for the call because `socket` is borrowed.
+    let n = unsafe { libc::poll(&mut pfd, 1, ms) };
+    if n < 0 {
+        let e = std::io::Error::last_os_error();
+        return if e.kind() == std::io::ErrorKind::Interrupted {
+            Ok(false)
+        } else {
+            Err(e)
+        };
+    }
+    Ok(n > 0)
 }

@@ -45,21 +45,28 @@ Android. Most settings can differ per [preset](/docs/presets-and-links); the exc
 | **Bitrate** | Automatic | The whole budget on the wire: video, error correction and audio. **Automatic** starts at 20 Mbps, adapts to the link and never drops below 2 Mbps. A fixed rate holds for the session. | All. iPhone, iPad and Mac: **Automatic bitrate** plus a slider; elsewhere type any rate. |
 | **Render scale** | Native (1×) | The host renders at your resolution times this, 0.5× to 4×; your device scales the picture to the window. Above 1× is sharper and costs bandwidth. | All |
 | **Picture fit** | Fit | When the stream's shape differs from the screen: **Fit** adds black bars, **Crop to fill** cuts the edges, **Stretch to fill** distorts. | All. On Android 9, **Crop to fill** squeezes instead. |
+| **Second screen** | On | A dual-screen handheld's lower panel, or a foldable half open, shows the companion panel — or the picture, with **Screens** ([dual-screen handhelds](/docs/input#dual-screen-handhelds)). Off keeps the stream on this screen and leaves the other to the system: for a phone on a TV. A preset can carry it. | Android |
 | **Video codec** | Automatic | Your pick when the host can encode it, otherwise HEVC, then AV1, then H.264. [PyroWave](/docs/pyrowave) is never picked automatically. | All. Apple and Android hide AV1 and PyroWave when the device can't decode them; the console marks them **(unsupported)**. |
 | **10-bit HDR** | On | Off never sends HDR. On sends 10-bit HDR when the host has HDR content and can encode it. See [HDR](/docs/hdr). | All. Android greys it on a screen without HDR10. |
 | **Full chroma (4:4:4)** | Off | Sharper text and thin lines, at more bandwidth. Needs HEVC or PyroWave and a host that can encode it. | Linux, Windows, Mac, iPhone, iPad, Apple TV |
-| **10-bit SDR** | Off | Smoother gradients without HDR, where the host's encoder supports it. HDR takes over when it engages. | All |
+| **10-bit SDR** | Off | Smoother gradients without HDR, when the host has a 10-bit desktop or allows widening (see [10-bit SDR](/docs/hdr#10-bit-sdr)) and its encoder supports it. HDR takes over when it engages. | All |
 | **Prioritize** | Lowest latency | **Lowest latency** shows each frame at once. **Smoothness** holds a small buffer that evens out network hiccups, at that much delay. | All |
 | **Smoothness buffer** | Automatic (2 frames) | Frames held under **Smoothness**, 1 to 3. Each adds about one screen refresh of delay. | All |
 | **V-Sync** | On (Mac: off) | Off shows each frame as soon as it's ready, with tearing. A driver without a tearing mode stays tear-free. | Linux, Windows, Mac |
-| **Follow variable refresh** | On | A VRR, FreeSync or G-Sync screen refreshes in step with the stream, in fullscreen. | Linux, Windows, Mac, iPhone, iPad |
+| **Follow variable refresh** | On | Prefers the driver's variable-refresh present mode where it offers one. Whether a VRR, FreeSync or G-Sync screen then follows the stream is the compositor's call: Linux desktops want the window fullscreen and focused. | Linux, Windows, Mac, iPhone, iPad |
 | **Host compositor** | Automatic | Which backend a Linux host uses for the virtual display. A host without it picks its own. | All |
 | **Video decoder**, **GPU** | Automatic | The decoder and graphics card this device uses. Change them only to debug; `PUNKTFUNK_DECODER` [overrides](/docs/configuration#client-side-native-clients) the decoder. | Linux, Windows. **GPU**: Windows, and Linux with more than one GPU. |
 | **Low-latency mode** | On | Asks the decoder and system for their low-latency paths. Turn it off if a device misbehaves. | Android |
 
-**Test network speed…** in a host card's menu suggests a bitrate (Android: **Network speed test**;
-Linux and Apple: on the host page). With PyroWave the bitrate row is greyed: the host sets the rate from its
-[bits per pixel](/docs/pyrowave#bits-per-pixel).
+**Test network speed…** in a host card's menu measures the link — what it carries, then loss and
+jitter at half of that, a rate the link holds — and suggests a bitrate (Android: **Network speed
+test**; Linux and Apple: on the host page). On the Linux and Windows session shells it also names
+what the link does: a host port faster than this device's, an adapter that drops the start of each
+burst, a small receive buffer, a link fault, a queue, Wi-Fi. Where one helps, it offers **paced
+delivery** for that host: the host then spreads each frame's packets instead of sending them in one
+burst, which costs a few milliseconds a frame and is remembered per host, never for every host. A
+host that cannot do it streams as it always has. With PyroWave the bitrate row is greyed: the host
+sets the rate from its [bits per pixel](/docs/pyrowave#bits-per-pixel).
 
 ## Audio
 
@@ -82,11 +89,12 @@ Touch modes, mouse modes and the in-stream keys are explained on [Input](/docs/i
 |---|---|---|---|
 | **Forward controllers** | On | Off, this device's controllers aren't sent. Use it when a pad reaches the host another way, such as [USB passthrough](/docs/automation#recipe-full-controller-passthrough-virtualhere). On Linux and Windows, off also disables the [controller exit chord](/docs/input#leaving-with-a-controller). | All |
 | **Controller type** | Automatic | The virtual pad the host creates; Automatic matches each controller. An Xbox pad has no gyro: for motion, pick DualSense, DualShock 4 or Steam Deck. | All. **Steam Controller 2**: Linux, Windows, console. |
+| **Controller rumble** | On | Off, controllers don't vibrate from the stream or in the menus, whatever the game sends. A DualSense's haptics follow **Controller haptics**; a Steam Controller 2 in passthrough follows Steam on the host. | Linux, Windows, Android, Apple |
 | **Use controller** | Automatic (all controllers) | Forward only the controller you pick. | Linux, Windows, Apple, console |
 | **Guide button** | Automatic | Where the guide and quick-access buttons go: **Send to host** or **This device**. Automatic keeps them on the device only in Steam Deck Gaming Mode. See [the guide button](/docs/input#the-guide-button-xbox--ps--steam-and-quick-access). | All |
 | **Hold Select for guide** | Automatic | Hold Select about ⅓ s to press the host's guide button. A Select tap then arrives a beat late. Automatic turns it on in Gaming Mode and on iPhone, iPad and Apple TV. | All |
-| **Controller haptics** | On | Plays a wired DualSense's voice-coil haptics. See [Controller audio](/docs/controller-audio). | Linux, Windows, Android |
-| **Controller speaker** | On (Android: off) | Plays the game's pad audio on a wired DualSense's speaker. | Linux, Windows, Android |
+| **Controller haptics** | On | Plays a DualSense's voice-coil haptics, over USB or Bluetooth (Android: USB). See [Controller audio](/docs/controller-audio). | Linux, Windows, Android |
+| **Controller speaker** | On (Android: off) | Plays the game's pad audio on a DualSense's speaker. | Linux, Windows, Android |
 | **Steam Controller 2 passthrough** | On (Apple: off) | Passes a Steam Controller 2 to a Linux or Windows host as itself, so its trackpads, gyro and haptics work as they do locally. Android and Mac: USB, the Puck or Bluetooth. iPhone, iPad, Apple TV: Bluetooth. | Android, Apple |
 | **DualSense over USB** | On | Drives a USB DualSense or DualShock 4 directly, for adaptive triggers, lightbar and gyro. | Android |
 | **Rumble on this phone**, **Gyro from this phone** | Off | The phone's own motor and gyro stand in for a clip-on pad's. | Android, iPhone |

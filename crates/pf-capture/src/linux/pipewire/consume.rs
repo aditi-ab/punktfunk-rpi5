@@ -119,12 +119,13 @@ impl FenceWaitStats {
 }
 
 /// Run the fallback for a broken raw-passthrough frame: pick the action for
-/// `(reason, ud.modifier)`, emit its once-per-reason line, and act on it.
+/// `(reason, ud.modifier, planar)`, emit its once-per-reason line, and act on it.
 /// `true` = the caller falls through to the mmap de-pad; `false` = the frame
-/// ends here — dropped, or the tiled offer refused and the capture flagged to
-/// rebuild on LINEAR.
+/// ends here — dropped, or the tiled or planar offer refused and the capture
+/// flagged to rebuild without it.
 fn handle_passthrough_fallback(ud: &mut UserData, reason: PassthroughFallback) -> bool {
-    let action = passthrough_fallback_action(reason, ud.modifier);
+    let planar = matches!(ud.format, Some(PixelFormat::Nv12 | PixelFormat::P010));
+    let action = passthrough_fallback_action(reason, ud.modifier, planar);
     // Once per distinct reason (`.process` is per-frame). The running count separates a
     // persistent downgrade from a one-frame hiccup at renegotiation.
     if let Some(frames) = ud.passthrough_fallbacks.note(reason) {
@@ -145,6 +146,10 @@ fn handle_passthrough_fallback(ud: &mut UserData, reason: PassthroughFallback) -
                     "the tiled offer is refused for this capture identity and it rebuilds on \
                      LINEAR"
                 }
+                PassthroughFallbackAction::DropPlanarAndRebuild => {
+                    "the CPU path reads packed RGB only, so the planar offer is refused for \
+                     this capture identity and it rebuilds on packed RGB"
+                }
             },
             reason.hint()
         );
@@ -160,6 +165,11 @@ fn handle_passthrough_fallback(ud: &mut UserData, reason: PassthroughFallback) -
                     reason.as_str()
                 );
             }
+            ud.signals.broken.store(true, Ordering::Relaxed);
+            false
+        }
+        PassthroughFallbackAction::DropPlanarAndRebuild => {
+            ud.signals.health.refuse_planar();
             ud.signals.broken.store(true, Ordering::Relaxed);
             false
         }
@@ -455,6 +465,38 @@ fn render_fence(
     }
 }
 
+/// A producer NV12/P010's chroma `(offset, stride)`: plane 1's chunk, in the same buffer
+/// object as plane 0. BO identity is inode, not fd number. `Err` = a two-BO frame, which
+/// cannot travel the single-fd import; the caller drops it. `Ok(None)` for packed RGB.
+#[allow(clippy::result_unit_err)]
+fn second_plane(
+    fmt: PixelFormat,
+    datas: &[pw::spa::buffer::Data],
+) -> Result<Option<(u32, u32)>, ()> {
+    let planar = matches!(fmt, PixelFormat::Nv12 | PixelFormat::P010);
+    if !planar || datas.len() < 2 || datas[1].fd() <= 0 {
+        return Ok(None);
+    }
+    // SAFETY: zeroed `libc::stat` is a valid POD initializer; both fds are owned by the live
+    // PipeWire buffer for this callback, and `fstat` only writes the out-param structs, whose
+    // fields are read only after the `== 0` success checks.
+    let same_bo = unsafe {
+        let mut s0: libc::stat = std::mem::zeroed();
+        let mut s1: libc::stat = std::mem::zeroed();
+        libc::fstat(datas[0].fd(), &mut s0) == 0
+            && libc::fstat(datas[1].fd(), &mut s1) == 0
+            && (s0.st_dev, s0.st_ino) == (s1.st_dev, s1.st_ino)
+    };
+    if !same_bo {
+        warn_once(
+            "the planes live in different buffer objects — frames dropped (single-fd import only)",
+        );
+        return Err(());
+    }
+    let c1 = datas[1].chunk();
+    Ok(Some((c1.offset(), c1.stride().max(0) as u32)))
+}
+
 /// Raw DMA-BUF passthrough: packed RGB for GPU CSC, or producer NV12/P010 without another
 /// convert. `true` = the frame ends here, published or dropped; `false` = take the CPU de-pad.
 /// A broken frame names its reason: a silent fall-through CPU-touches every frame on a session
@@ -474,34 +516,9 @@ fn try_passthrough(ud: &mut UserData, a: &mut Arrival) -> bool {
         let chunk = datas[0].chunk();
         let offset = chunk.offset();
         let stride = chunk.stride().max(0) as u32;
-        // NV12/P010 are usually two SPA planes on one BO; plane 1's chunk has the real UV
-        // offset/stride. BO identity is inode, not fd number. A two-BO frame cannot
-        // travel the single-fd import — drop it rather than stream garbage chroma.
-        let planar = matches!(fmt, PixelFormat::Nv12 | PixelFormat::P010);
-        let plane1 = if planar && datas.len() >= 2 && datas[1].fd() > 0 {
-            // SAFETY: zeroed `libc::stat` is a valid POD initializer; both fds are
-            // owned by the live PipeWire buffer for this callback, and `fstat`
-            // only writes the out-param structs, whose fields are read only after
-            // the `== 0` success checks.
-            let same_bo = unsafe {
-                let mut s0: libc::stat = std::mem::zeroed();
-                let mut s1: libc::stat = std::mem::zeroed();
-                libc::fstat(datas[0].fd(), &mut s0) == 0
-                    && libc::fstat(datas[1].fd(), &mut s1) == 0
-                    && (s0.st_dev, s0.st_ino) == (s1.st_dev, s1.st_ino)
-            };
-            if !same_bo {
-                warn_once(
-                    "the planes live in different buffer objects — frames \
-                             dropped (single-fd import only)",
-                );
-                // Dropped, not downgraded: de-padding as linear would scramble chroma.
-                return true;
-            }
-            let c1 = datas[1].chunk();
-            Some((c1.offset(), c1.stride().max(0) as u32))
-        } else {
-            None
+        // Dropped, not downgraded: de-padding as linear would scramble chroma.
+        let Ok(plane1) = second_plane(fmt, datas) else {
+            return true;
         };
         // iHD reads a linear import at a pitch rounded to 64 bytes, so an odd pitch shears
         // the picture. Mutter's RENDERING-only GBM buffers pad only for SCANOUT. The
@@ -588,19 +605,22 @@ fn try_passthrough(ud: &mut UserData, a: &mut Arrival) -> bool {
 /// dmabuf + importer: hand the held buffer to the consumer, which imports at its own tick
 /// (`import_held`), so arrivals above the wire rate cost nothing here. A buffer that cannot be
 /// held is dropped while holds are possible at all (every hold is with the encoder) and
-/// imported here only when this pool can never hold. `true` = the frame ends here; `false` =
-/// take the CPU de-pad.
+/// imported here only when this pool can never hold. An in-process importer always imports
+/// here: its GL context is current on this thread. A producer NV12 rides only a hold, with
+/// its chroma plane: the importer reads packed RGB, so an unheld one feeds the raw latch,
+/// which withdraws the planar offer. `true` = the frame ends here; `false` = take the CPU
+/// de-pad.
 fn try_gpu_hold(ud: &mut UserData, a: &mut Arrival) -> bool {
     let (datas, w, h) = (&*a.datas, a.w, a.h);
     let mut gpu_import_broken = false;
     if ud.signals.has_importer.load(Ordering::Relaxed) {
         if let Some(fmt) = ud.format {
-            let hdr_tiled = fmt.is_hdr_rgb10() && ud.modifier != 0;
+            let hdr_tiled = fmt.is_rgb10() && ud.modifier != 0;
             if hdr_tiled && !ud.hdr_tiled_raw {
                 warn_once(
-                    "HDR frame arrived with a tiled modifier — the GPU de-tile blit is 8-bit, so \
-                     this stream falls back to the CPU path (the producer ignored our LINEAR-only \
-                     HDR offer)",
+                    "10-bit frame arrived with a tiled modifier — the GPU de-tile blit is 8-bit, \
+                     so this stream falls back to the CPU path (the producer ignored our \
+                     LINEAR-only 10-bit offer)",
                 );
             }
             if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf
@@ -614,7 +634,12 @@ fn try_gpu_hold(ud: &mut UserData, a: &mut Arrival) -> bool {
                     offset: datas[0].chunk().offset(),
                     stride: datas[0].chunk().stride().max(0) as u32,
                 };
-                if let Some(dup) = dup_data_fd(&datas[0]) {
+                let Ok(plane1) = second_plane(fmt, datas) else {
+                    return true;
+                };
+                // An in-process importer's GL context is current on this thread only.
+                let consumer_imports = !ud.signals.importer_in_process.load(Ordering::Relaxed);
+                if let Some(dup) = consumer_imports.then(|| dup_data_fd(&datas[0])).flatten() {
                     if let Some(hold) = ud.try_defer(a.pw_buf, a.stream) {
                         let frame = CapturedFrame {
                             provenance: Default::default(),
@@ -628,7 +653,7 @@ fn try_gpu_hold(ud: &mut UserData, a: &mut Arrival) -> bool {
                                 modifier: ud.modifier,
                                 offset: plane.offset,
                                 stride: plane.stride,
-                                plane1: None,
+                                plane1,
                                 hold: Some(hold),
                                 health: ud.signals.health.clone(),
                                 rebuild: ud.signals.broken.clone(),
@@ -642,6 +667,13 @@ fn try_gpu_hold(ud: &mut UserData, a: &mut Arrival) -> bool {
                         ud.held_drops += 1;
                         return true;
                     }
+                }
+                if matches!(fmt, PixelFormat::Nv12 | PixelFormat::P010) {
+                    let health = &ud.signals.health;
+                    if health.note_raw_import_failure(ud.modifier, "producer NV12 without a hold") {
+                        ud.signals.broken.store(true, Ordering::Relaxed);
+                    }
+                    return true;
                 }
                 wait_here(a.fence.take());
                 let cell = ud.signals.importer.clone();

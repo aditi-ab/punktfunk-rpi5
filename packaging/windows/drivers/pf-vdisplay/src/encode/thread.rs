@@ -64,11 +64,20 @@ pub fn spec_for(req: &SetEncodeRequest, backend: u32) -> Result<OpenSpec, Fail> 
     let (hdr, chroma444) = (req.hdr == 1, req.chroma == 1);
     // 10-bit SDR (depth 10, HDR off) picks a BT.709 P010 input on AMF; `choose` ignores it elsewhere.
     let ten_bit = req.bit_depth >= 10;
-    let chosen = InputKind::choose(backend, hdr, ten_bit, chroma444);
-    // `PFVD_AMF_NV12` (machine environment, read per open) opens AMF on the video engine's
-    // NV12 at once: the A/B for a VCN whose own colour conversion looks or runs worse.
+    let sdr_fp16 = req.flags & wire::SET_ENCODE_FLAG_SDR_FP16 != 0;
+    // `None`: this backend reads no FP16 SDR desktop, so it never opens on one.
+    let chosen =
+        InputKind::choose(backend, hdr, ten_bit, chroma444, sdr_fp16).ok_or((-4, "fp16"))?;
+    // `PFVD_AMF_NV12` / `PFVD_QSV_NV12` (machine environment, read per open) skip the encoder's
+    // own colour conversion and open on the YUV the driver converts: the A/B for an encoder
+    // whose conversion looks or runs worse.
+    let skip = match backend {
+        backend::AMF => crate::log::knob("PFVD_AMF_NV12"),
+        backend::QSV => crate::log::knob("PFVD_QSV_NV12"),
+        _ => None,
+    };
     let kind = match chosen.fallback(backend) {
-        Some(second) if crate::log::knob("PFVD_AMF_NV12").is_some() => second,
+        Some(second) if skip.is_some() => second,
         _ => chosen,
     };
     Ok(OpenSpec {
@@ -100,10 +109,10 @@ fn caps_wire(c: EncoderCaps) -> EncoderCapsWire {
 }
 
 /// Walk the request's backend list in order; the first that opens wins. A backend that
-/// refuses its input is tried on [`InputKind::fallback`] before the next one. `Err` is the
-/// last failure as the wire reply — no silent fallback past the list. `open_backend` returns
-/// a backend whose session already exists, so `reply.caps` describes the live encoder rather
-/// than its defaults — the host reads those caps once and never asks again.
+/// refuses its input is tried down its [`InputKind::fallback`] chain before the next one.
+/// `Err` is the last failure as the wire reply — no silent fallback past the list.
+/// `open_backend` returns a backend whose session already exists, so `reply.caps` describes
+/// the live encoder rather than its defaults — the host reads those caps once.
 fn open_listed(
     req: &SetEncodeRequest,
     adapter: &AdapterId,
@@ -118,11 +127,10 @@ fn open_listed(
                 continue;
             }
         };
-        let second = first
-            .kind
-            .fallback(backend)
-            .map(|kind| OpenSpec { kind, ..first });
-        for spec in std::iter::once(first).chain(second) {
+        let ladder = std::iter::successors(Some(first), |s| {
+            s.kind.fallback(backend).map(|kind| OpenSpec { kind, ..*s })
+        });
+        for spec in ladder {
             match open_backend(&spec, adapter, device) {
                 Ok(mut enc) => {
                     if req.wire_chunk_bytes != 0 {
@@ -227,7 +235,7 @@ fn run(stop: HANDLE, ctx: ThreadCtx, live: Arc<AtomicBool>) {
     // `PFVD_POOL_BYPASS` (machine environment, read per open): `0` copies every frame.
     let bypass = wire::zero_copy(
         spec.backend,
-        spec.kind == InputKind::Bgra,
+        spec.kind.composed(),
         crate::log::knob("PFVD_POOL_BYPASS").as_deref(),
     );
     let reused = monitor
@@ -251,6 +259,12 @@ fn run(stop: HANDLE, ctx: ThreadCtx, live: Arc<AtomicBool>) {
         },
     };
     let first = pool.first_frame(&monitor.seed());
+    // The requested mode leads the list: the refresh the host created this panel at.
+    let panel_hz = monitor
+        .modes()
+        .first()
+        .and_then(|m| m.refresh_rates.first().copied())
+        .unwrap_or(spec.fps);
     drop(monitor);
     dbglog!(
         "[pf-vd] encode: backend {} open {}x{} {:?} mode={} first_frame={} (target {})",
@@ -284,9 +298,17 @@ fn run(stop: HANDLE, ctx: ThreadCtx, live: Arc<AtomicBool>) {
         // The caller gave up waiting: nothing will install this session.
         return;
     }
-    Drive::new(enc, &pool, &ctx.session, stop, &live, spec.fps, opened_kbps).run();
+    let rates = super::drive::Rates {
+        fps: spec.fps,
+        panel_hz,
+    };
+    Drive::new(enc, &pool, &ctx.session, stop, &live, rates, opened_kbps).run();
     if live.load(Ordering::Acquire) {
         section.store_u32(offset_of!(AuHeader, encoder_state), au::ENCODER_CLOSED);
+        // The encoder is closed, and D3D11 frees what it released only at a flush. The pooled
+        // device outlives the session and is idle after it.
+        // SAFETY: a single call on the pooled device's multithread-protected context.
+        unsafe { ctx.device.device_context.Flush() };
     }
 }
 
@@ -361,7 +383,10 @@ pub fn open_backend(
     let format = pixel_format(spec.kind);
     // P010 serves both HDR and 10-bit SDR; the kind is the only thing that tells them apart, so
     // the backend's colour signalling follows it, not the (identical) P010 pixel label.
-    let hdr = matches!(spec.kind, InputKind::P010 | InputKind::Rgb10);
+    let hdr = matches!(
+        spec.kind,
+        InputKind::P010 | InputKind::Rgb10 | InputKind::Fp16 | InputKind::Planar { hdr: true, .. }
+    );
     let luid = Some(adapter.luid62());
     // NVENC, QSV and PyroWave are x86-64 only (see Cargo.toml); an ARM64 driver refuses their
     // ids here and the host falls through to Media Foundation.
@@ -391,7 +416,7 @@ pub fn open_backend(
         }),
         #[cfg(target_arch = "x86_64")]
         backend::QSV => pf_encode_win::qsv::QsvEncoder::open(
-            spec.codec, format, w, h, fps, bps, depth, chroma, luid,
+            spec.codec, format, w, h, fps, bps, depth, chroma, hdr, luid,
         )
         .and_then(|mut e| {
             e.prepare(device)?;
@@ -407,6 +432,7 @@ pub fn open_backend(
                 bps,
                 chroma,
                 depth,
+                hdr,
                 adapter.vendor_id,
                 adapter.device_id,
             )

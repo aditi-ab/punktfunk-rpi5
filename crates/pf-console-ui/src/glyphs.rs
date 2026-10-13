@@ -54,7 +54,9 @@ impl GlyphStyle {
     /// where this shell's key device is the Siri Remote.
     pub fn keys(platform: Platform) -> GlyphStyle {
         match platform {
-            Platform::Android | Platform::WebOS | Platform::Apple => GlyphStyle::Remote,
+            Platform::Android | Platform::WebOS | Platform::Apple | Platform::Tizen => {
+                GlyphStyle::Remote
+            }
             Platform::Desktop | Platform::Web => GlyphStyle::Keyboard,
         }
     }
@@ -565,34 +567,6 @@ fn draw_glyph(
             );
         }
     }
-}
-
-/// One face button's engraving in a `r`-radius button at `c`. `name` is its Xbox position:
-/// A south, B east, X west, Y north.
-pub(crate) fn draw_face(
-    canvas: &Canvas,
-    fonts: &Fonts,
-    name: &str,
-    style: GlyphStyle,
-    c: Point,
-    r: f32,
-    ink: Color4f,
-) {
-    let face = match name {
-        "A" => Face::A,
-        "B" => Face::B,
-        "X" => Face::X,
-        _ => Face::Y,
-    };
-    if style == GlyphStyle::Shapes {
-        draw_ps_shape(canvas, face, c, r * 0.47, r * 0.16, ink);
-        return;
-    }
-    let letter = face_letter(face, style);
-    let size = f64::from(r) * 1.1;
-    let w = f64::from(fonts.measure(letter, W::SemiBold, size));
-    let (x, y) = (f64::from(c.x) - w / 2.0, f64::from(c.y) + size * 0.36);
-    fonts.draw(canvas, letter, x, y, W::SemiBold, size, ink);
 }
 
 /// DualSense layout: Confirm=✕, Back=○, X-position=□, Y-position=△.
